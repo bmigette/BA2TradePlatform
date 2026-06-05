@@ -44,6 +44,25 @@ def classify_waiting_trigger(parent_status, trigger_status):
     return "wait"
 
 
+def replacement_blocked_by_qty(trigger_status, available_qty, required_qty) -> bool:
+    """Whether a cancel-and-replace order must keep waiting because the broker has
+    not yet released the prior order's held position quantity.
+
+    Only applies to replacements triggered by a prior order's CANCELED status (a
+    trailing-stop raise / OCO swap). Returns False — i.e. proceed — when this isn't
+    a cancel-triggered replacement, when the broker's available qty is unknown
+    (``None``), or when enough qty is already available. This prevents submitting a
+    replacement that the broker would reject with 40310000 "insufficient qty
+    available" and then hard-ERROR (silently dropping the position's protection).
+    """
+    trig = getattr(trigger_status, "value", trigger_status)
+    if str(trig).lower() != OrderStatus.CANCELED.value:
+        return False
+    if available_qty is None or required_qty is None:
+        return False
+    return available_qty < required_qty
+
+
 def rebase_price_to_fill(target_price, reference_price, fill_price):
     """Re-scale a TP/SL target that was computed off a pre-fill reference so it keeps
     the same proportional distance from the order's ACTUAL fill.
@@ -585,6 +604,29 @@ class TradeManager:
                         self.logger.error(f"Account {account_def.id} ({account_def.provider}) is read-only, cannot submit orders")
                         dependent_order.status = OrderStatus.ERROR
                         update_instance(dependent_order)
+                        continue
+
+                    # Gate cancel-and-replace orders (e.g. a trailing-stop OCO swap): only
+                    # submit once the broker has ACTUALLY released the prior order's qty.
+                    # Our DB can mark the prior order CANCELED before the broker frees the
+                    # held qty; submitting too early is rejected (40310000 insufficient qty)
+                    # and hard-ERRORs, silently dropping the position's protection. If the
+                    # qty isn't free yet, leave this order WAITING_TRIGGER to retry next refresh.
+                    available_qty = None
+                    try:
+                        available_qty = account.get_available_position_quantity(dependent_order.symbol)
+                    except Exception:
+                        available_qty = None
+                    if replacement_blocked_by_qty(
+                        dependent_order.depends_order_status_trigger, available_qty,
+                        dependent_order.quantity,
+                    ):
+                        self.logger.info(
+                            f"Deferring replacement order {dependent_order.id} "
+                            f"({dependent_order.symbol}): broker available qty {available_qty} < "
+                            f"required {dependent_order.quantity} — prior order not yet released "
+                            f"at broker; staying WAITING_TRIGGER to retry next refresh."
+                        )
                         continue
 
                     self.logger.info(

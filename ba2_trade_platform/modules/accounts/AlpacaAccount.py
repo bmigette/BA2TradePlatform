@@ -1339,6 +1339,26 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             logger.error(f"Error listing Alpaca positions: {e}", exc_info=True)
             return []
 
+    def get_available_position_quantity(self, symbol: str) -> Optional[float]:
+        """Broker-side AVAILABLE (not held-for-orders) quantity for ``symbol``.
+
+        Used to confirm a prior order has actually released its qty before a
+        cancel-and-replace order is submitted. Returns the absolute available qty
+        (works for long and short), or ``None`` when there's no position or the
+        lookup fails (treated as "unknown" by callers — do not block on it).
+        """
+        try:
+            position = self.client.get_open_position(symbol)
+        except Exception:
+            return None
+        qa = getattr(position, "qty_available", None)
+        if qa is None:
+            return None
+        try:
+            return abs(float(qa))
+        except (TypeError, ValueError):
+            return None
+
     def invalidate_balance_cache(self) -> None:
         """Invalidate the balance cache so the next call fetches a fresh value."""
         with self._balance_cache_lock:
