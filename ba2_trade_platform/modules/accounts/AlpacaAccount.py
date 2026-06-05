@@ -12,6 +12,7 @@ from ...logger import logger
 from ...core.models import TradingOrder, Position, Transaction
 from ...core.types import OrderDirection, OrderStatus, OrderOpenType, OrderType as CoreOrderType, TransactionStatus
 from ...core.interfaces import AccountInterface
+from ...core.interfaces.OptionsAccountInterface import OptionsAccountInterface
 from ...core.db import get_db, get_instance, update_instance, add_instance
 from sqlmodel import Session, select
 
@@ -62,11 +63,14 @@ DEFAULT_TP_PRICE = 9999.0  # Very high TP - effectively "no TP"
 DEFAULT_SL_PRICE = 0.01    # Very low SL - effectively "no SL"
 
 
-class AlpacaAccount(AccountInterface):
+class AlpacaAccount(AccountInterface, OptionsAccountInterface):
     """
     A class that implements the AccountInterface for interacting with Alpaca trading accounts.
     This class provides methods for managing orders, positions, and account information through
     the Alpaca trading API.
+
+    Also implements OptionsAccountInterface (option chain/quote/ATM-IV market data;
+    positions / order submission / close / IV-rank land in later tasks).
     """
     def __init__(self, id: int):
         """
@@ -4377,4 +4381,280 @@ class AlpacaAccount(AccountInterface):
         except Exception as e:
             logger.error(f"[Account {self.id}] Error fetching filled trades: {e}", exc_info=True)
             return []
+
+    # ======================================================================
+    # OptionsAccountInterface — market data (chain / quote / ATM-IV)
+    # ======================================================================
+    def _get_option_data_client(self):
+        """Lazily create & cache an OptionHistoricalDataClient.
+
+        Uses getattr so that a pre-set/monkeypatched ``self._option_data_client``
+        (e.g. in tests) is honored instead of being overwritten.
+        """
+        client = getattr(self, "_option_data_client", None)
+        if client is None:
+            from alpaca.data.historical.option import OptionHistoricalDataClient
+            client = OptionHistoricalDataClient(
+                api_key=self.settings["api_key"],
+                secret_key=self.settings["api_secret"],
+            )
+            self._option_data_client = client
+        return client
+
+    def _options_feed(self):
+        """Return the OptionsFeed to use. Defaults to INDICATIVE unless an OPRA
+        subscription is configured via the optional ``options_feed`` setting."""
+        from alpaca.data.enums import OptionsFeed
+        feed_setting = (self.settings.get("options_feed") or "indicative").lower()
+        if feed_setting == "opra":
+            return OptionsFeed.OPRA
+        return OptionsFeed.INDICATIVE
+
+    @staticmethod
+    def _option_right_to_contract_type(option_type):
+        """Map our OptionRight -> alpaca ContractType (or None for both sides)."""
+        if option_type is None:
+            return None
+        from alpaca.trading.enums import ContractType
+        from ...core.types import OptionRight
+        if option_type == OptionRight.CALL:
+            return ContractType.CALL
+        if option_type == OptionRight.PUT:
+            return ContractType.PUT
+        return None
+
+    @alpaca_api_retry
+    def _get_option_contracts_meta(self, underlying: str, expiry_min, expiry_max,
+                                   option_type=None, strike_min=None, strike_max=None) -> Dict[str, Any]:
+        """Fetch option contract metadata (strike / expiry / type / open interest)
+        for the underlying within the given filters, paging through all results.
+
+        Returns a dict keyed by OCC contract symbol -> alpaca OptionContract.
+        Strike filters must be passed to Alpaca as STRINGS on this request.
+        """
+        from alpaca.trading.requests import GetOptionContractsRequest
+
+        contract_type = self._option_right_to_contract_type(option_type)
+        meta: Dict[str, Any] = {}
+        page_token = None
+
+        while True:
+            request = GetOptionContractsRequest(
+                underlying_symbols=[underlying],
+                expiration_date_gte=expiry_min,
+                expiration_date_lte=expiry_max,
+                type=contract_type,
+                strike_price_gte=(str(strike_min) if strike_min is not None else None),
+                strike_price_lte=(str(strike_max) if strike_max is not None else None),
+                limit=10000,
+                page_token=page_token,
+            )
+            response = self.client.get_option_contracts(request)
+            contracts = getattr(response, "option_contracts", None) or []
+            for contract in contracts:
+                symbol = getattr(contract, "symbol", None)
+                if symbol:
+                    meta[symbol] = contract
+
+            page_token = getattr(response, "next_page_token", None)
+            if not page_token:
+                break
+
+        return meta
+
+    @alpaca_api_retry
+    def get_option_chain(self, underlying: str, expiry_min, expiry_max,
+                         option_type=None, strike_min=None, strike_max=None) -> List[Any]:
+        """Return option-chain rows (quote + Greeks + liquidity) for the underlying
+        within the given expiry / strike / type filters.
+
+        Joins live snapshot data (OptionHistoricalDataClient.get_option_chain) with
+        contract metadata (TradingClient.get_option_contracts) on the OCC symbol.
+        """
+        from alpaca.data.requests import OptionChainRequest
+        from ...core.option_types import OptionContract
+        from ...core.types import OptionRight
+
+        contract_type = self._option_right_to_contract_type(option_type)
+
+        request = OptionChainRequest(
+            underlying_symbol=underlying,
+            feed=self._options_feed(),
+            type=contract_type,
+            strike_price_gte=strike_min,
+            strike_price_lte=strike_max,
+            expiration_date_gte=expiry_min,
+            expiration_date_lte=expiry_max,
+        )
+
+        snapshots = self._get_option_data_client().get_option_chain(request) or {}
+        meta_by_symbol = self._get_option_contracts_meta(
+            underlying, expiry_min, expiry_max,
+            option_type=option_type, strike_min=strike_min, strike_max=strike_max,
+        )
+
+        chain: List[OptionContract] = []
+        for occ_symbol, snapshot in snapshots.items():
+            meta = meta_by_symbol.get(occ_symbol)
+            if meta is None:
+                # No contract metadata (strike/expiry/type) — skip; we cannot build a row.
+                continue
+
+            # --- Contract metadata (guard every field) ---
+            meta_type = getattr(meta, "type", None)
+            type_value = str(getattr(meta_type, "value", meta_type) or "").lower()
+            if type_value == OptionRight.CALL.value:
+                row_type = OptionRight.CALL
+            elif type_value == OptionRight.PUT.value:
+                row_type = OptionRight.PUT
+            else:
+                row_type = None
+
+            strike = getattr(meta, "strike_price", None)
+            expiry = getattr(meta, "expiration_date", None)
+
+            # Defensive filtering (the API already filters, but enforce anyway).
+            if option_type is not None and row_type is not None and row_type != option_type:
+                continue
+            if strike is not None:
+                if strike_min is not None and strike < strike_min:
+                    continue
+                if strike_max is not None and strike > strike_max:
+                    continue
+            if expiry is not None:
+                if expiry_min is not None and expiry < expiry_min:
+                    continue
+                if expiry_max is not None and expiry > expiry_max:
+                    continue
+
+            open_interest = None
+            oi_raw = getattr(meta, "open_interest", None)
+            if oi_raw is not None:
+                try:
+                    open_interest = int(float(oi_raw))
+                except (TypeError, ValueError):
+                    open_interest = None
+
+            # --- Snapshot quote / trade / greeks (guard every field) ---
+            quote = getattr(snapshot, "latest_quote", None)
+            bid = getattr(quote, "bid_price", None) if quote is not None else None
+            ask = getattr(quote, "ask_price", None) if quote is not None else None
+
+            trade = getattr(snapshot, "latest_trade", None)
+            last = getattr(trade, "price", None) if trade is not None else None
+
+            iv = getattr(snapshot, "implied_volatility", None)
+
+            greeks = getattr(snapshot, "greeks", None)
+            delta = getattr(greeks, "delta", None) if greeks is not None else None
+            gamma = getattr(greeks, "gamma", None) if greeks is not None else None
+            theta = getattr(greeks, "theta", None) if greeks is not None else None
+            vega = getattr(greeks, "vega", None) if greeks is not None else None
+
+            chain.append(OptionContract(
+                symbol=occ_symbol,
+                underlying=getattr(meta, "underlying_symbol", None) or underlying,
+                option_type=row_type,
+                strike=strike,
+                expiry=expiry,
+                bid=bid,
+                ask=ask,
+                last=last,
+                implied_volatility=iv,
+                delta=delta,
+                gamma=gamma,
+                theta=theta,
+                vega=vega,
+                open_interest=open_interest,
+            ))
+
+        return chain
+
+    @alpaca_api_retry
+    def get_option_quote(self, contract_symbol: str) -> Optional[Any]:
+        """Return the latest quote + Greeks for a single OCC option contract, or
+        None if no snapshot is available."""
+        from alpaca.data.requests import OptionSnapshotRequest
+        from ...core.option_types import OptionQuote
+
+        request = OptionSnapshotRequest(
+            symbol_or_symbols=contract_symbol,
+            feed=self._options_feed(),
+        )
+        snapshots = self._get_option_data_client().get_option_snapshot(request) or {}
+        snapshot = snapshots.get(contract_symbol)
+        if snapshot is None:
+            return None
+
+        quote = getattr(snapshot, "latest_quote", None)
+        bid = getattr(quote, "bid_price", None) if quote is not None else None
+        ask = getattr(quote, "ask_price", None) if quote is not None else None
+        timestamp = getattr(quote, "timestamp", None) if quote is not None else None
+
+        trade = getattr(snapshot, "latest_trade", None)
+        last = getattr(trade, "price", None) if trade is not None else None
+
+        iv = getattr(snapshot, "implied_volatility", None)
+
+        greeks = getattr(snapshot, "greeks", None)
+        delta = getattr(greeks, "delta", None) if greeks is not None else None
+        gamma = getattr(greeks, "gamma", None) if greeks is not None else None
+        theta = getattr(greeks, "theta", None) if greeks is not None else None
+        vega = getattr(greeks, "vega", None) if greeks is not None else None
+
+        return OptionQuote(
+            symbol=contract_symbol,
+            bid=bid,
+            ask=ask,
+            last=last,
+            implied_volatility=iv,
+            delta=delta,
+            gamma=gamma,
+            theta=theta,
+            vega=vega,
+            timestamp=timestamp,
+        )
+
+    def get_atm_implied_volatility(self, underlying: str) -> Optional[float]:
+        """Return the near-ATM implied volatility for the underlying (0-1), picking
+        the contract whose strike is nearest the current spot price from a
+        near-dated chain. Returns None if no spot or empty chain."""
+        spot = self.get_instrument_current_price(underlying)
+        if spot is None:
+            logger.warning(f"get_atm_implied_volatility: no spot price for {underlying}")
+            return None
+
+        today = datetime.now(timezone.utc).date()
+        expiry_min = today + timedelta(days=20)
+        expiry_max = today + timedelta(days=45)
+
+        chain = self.get_option_chain(underlying, expiry_min, expiry_max) or []
+        candidates = [c for c in chain
+                      if getattr(c, "strike", None) is not None
+                      and getattr(c, "implied_volatility", None) is not None]
+        if not candidates:
+            logger.warning(f"get_atm_implied_volatility: empty/IV-less chain for {underlying}")
+            return None
+
+        nearest = min(candidates, key=lambda c: abs(c.strike - spot))
+        return nearest.implied_volatility
+
+    # ======================================================================
+    # OptionsAccountInterface — TEMPORARY stubs (replaced in later tasks)
+    # ======================================================================
+    def get_option_positions(self):
+        # TODO(Task 8): implement option position retrieval + OCC parsing.
+        raise NotImplementedError("Implemented in Task 8")
+
+    def _submit_option_order_impl(self, trading_order, legs, leg_orders=None):
+        # TODO(Task 9): implement single + multi-leg option order submission.
+        raise NotImplementedError("Implemented in Task 9")
+
+    def close_option_position(self, position, order_type="limit", limit_price=None):
+        # TODO(Task 10): implement closing of held option positions.
+        raise NotImplementedError("Implemented in Task 10")
+
+    def get_iv_rank(self, underlying, lookback_days=252, min_samples=20):
+        # TODO(Task 11): implement IV rank from stored ATM-IV history.
+        raise NotImplementedError("Implemented in Task 11")
 

@@ -1,0 +1,93 @@
+from datetime import date
+from types import SimpleNamespace
+import pytest
+
+from ba2_trade_platform.modules.accounts.AlpacaAccount import AlpacaAccount
+from ba2_trade_platform.core.interfaces import OptionsAccountInterface
+from ba2_trade_platform.core.types import OptionRight
+
+
+def _make_alpaca():
+    acct = AlpacaAccount.__new__(AlpacaAccount)        # bypass __init__/DB
+    acct.id = 999
+    acct._settings_cache = {"api_key": "k", "api_secret": "s", "paper_account": True,
+                            "data_feed": "iex"}
+    return acct
+
+
+def test_alpaca_is_option_capable():
+    assert issubclass(AlpacaAccount, OptionsAccountInterface)
+
+
+def test_get_option_chain_maps_snapshot(monkeypatch):
+    acct = _make_alpaca()
+    greeks = SimpleNamespace(delta=0.55, gamma=0.02, theta=-0.04, vega=0.1, rho=0.01)
+    quote = SimpleNamespace(bid_price=5.0, ask_price=5.4, bid_size=10, ask_size=12, timestamp=None)
+    trade = SimpleNamespace(price=5.2, timestamp=None)
+    snap = SimpleNamespace(symbol="AAPL260116C00150000", latest_quote=quote, latest_trade=trade,
+                           implied_volatility=0.32, greeks=greeks)
+    snapshots = {"AAPL260116C00150000": snap}
+
+    class FakeOptClient:
+        def get_option_chain(self, req):
+            return snapshots
+        def get_option_snapshot(self, req):
+            return snapshots
+
+    occ_meta = SimpleNamespace(symbol="AAPL260116C00150000", underlying_symbol="AAPL",
+                               type=SimpleNamespace(value="call"), strike_price=150.0,
+                               expiration_date=date(2026, 1, 16), open_interest="1200")
+    acct._option_data_client = FakeOptClient()
+    monkeypatch.setattr(acct, "_get_option_contracts_meta",
+                        lambda *a, **k: {"AAPL260116C00150000": occ_meta}, raising=False)
+
+    chain = acct.get_option_chain("AAPL", date(2026, 1, 1), date(2026, 3, 1), OptionRight.CALL)
+    assert len(chain) == 1
+    c = chain[0]
+    assert c.symbol == "AAPL260116C00150000"
+    assert c.underlying == "AAPL"
+    assert c.option_type == OptionRight.CALL
+    assert c.strike == 150.0
+    assert c.expiry == date(2026, 1, 16)
+    assert c.delta == 0.55 and c.implied_volatility == 0.32
+    assert c.bid == 5.0 and c.ask == 5.4 and c.last == 5.2
+    assert c.open_interest == 1200
+
+
+def test_get_option_quote_maps_snapshot(monkeypatch):
+    acct = _make_alpaca()
+    greeks = SimpleNamespace(delta=0.4, gamma=0.01, theta=-0.02, vega=0.05, rho=0.0)
+    quote = SimpleNamespace(bid_price=2.0, ask_price=2.2, bid_size=5, ask_size=7, timestamp=None)
+    trade = SimpleNamespace(price=2.1, timestamp=None)
+    snap = SimpleNamespace(symbol="AAPL260116C00150000", latest_quote=quote, latest_trade=trade,
+                           implied_volatility=0.30, greeks=greeks)
+
+    class FakeOptClient:
+        def get_option_snapshot(self, req):
+            return {"AAPL260116C00150000": snap}
+    acct._option_data_client = FakeOptClient()
+
+    q = acct.get_option_quote("AAPL260116C00150000")
+    assert q is not None
+    assert q.symbol == "AAPL260116C00150000"
+    assert q.bid == 2.0 and q.ask == 2.2 and q.last == 2.1
+    assert q.implied_volatility == 0.30 and q.delta == 0.4
+
+
+def test_get_atm_iv_picks_nearest_strike(monkeypatch):
+    acct = _make_alpaca()
+    # Spot ~150; chain returns strikes 145/150/155 with different IVs; ATM=150 -> iv 0.31
+    from ba2_trade_platform.core.option_types import OptionContract
+    def fake_chain(underlying, emin, emax, option_type=None, strike_min=None, strike_max=None):
+        return [
+            OptionContract(symbol="c145", underlying="AAPL", option_type=OptionRight.CALL,
+                           strike=145.0, expiry=date(2026, 1, 16), implied_volatility=0.40),
+            OptionContract(symbol="c150", underlying="AAPL", option_type=OptionRight.CALL,
+                           strike=150.0, expiry=date(2026, 1, 16), implied_volatility=0.31),
+            OptionContract(symbol="c155", underlying="AAPL", option_type=OptionRight.CALL,
+                           strike=155.0, expiry=date(2026, 1, 16), implied_volatility=0.35),
+        ]
+    monkeypatch.setattr(acct, "get_option_chain", fake_chain, raising=False)
+    monkeypatch.setattr(acct, "get_instrument_current_price", lambda *a, **k: 150.0, raising=False)
+    iv = acct.get_atm_implied_volatility("AAPL")
+    assert iv == 0.31
