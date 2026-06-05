@@ -178,7 +178,21 @@ def get_event_type_documentation() -> dict:
             "type": "boolean",
             "example": "Close position early when new_target_lower (reduced expectations)"
         },
-        
+
+        # Option Position Flags
+        ExpertEventType.F_HAS_OPTION_POSITION.value: {
+            "name": "Has Option Position",
+            "description": "Triggers when this expert already holds an open option position on the underlying symbol.",
+            "type": "boolean",
+            "example": "Guard to avoid stacking option entries (require NOT has_option_position before buy_call)"
+        },
+        ExpertEventType.F_HAS_COVERED_CALL.value: {
+            "name": "Has Covered Call",
+            "description": "Triggers when a short call (covered call) is currently open on the underlying symbol for this expert.",
+            "type": "boolean",
+            "example": "Avoid writing a second covered call (require NOT has_covered_call before sell_covered_call)"
+        },
+
         # Numeric Events (N_ prefix)
         ExpertEventType.N_EXPECTED_PROFIT_TARGET_PERCENT.value: {
             "name": "Expected Profit Target %",
@@ -233,6 +247,26 @@ def get_event_type_documentation() -> dict:
             "description": "For open positions: percentage from the position's open (entry) price to the expert's new target price. Positive = target above entry (profit potential for longs). Use to gate TP adjustments: only adjust if the expert target represents enough profit from your entry.",
             "type": "numeric",
             "example": "Only adjust TP when percent_open_to_new_target >= 2% (expert target at least 2% above entry)"
+        },
+
+        # Option / Price-Extreme Numeric Events
+        ExpertEventType.N_PERCENT_BELOW_RECENT_HIGH.value: {
+            "name": "Percent Below Recent High",
+            "description": "Drawdown percentage of the current price below the ~20-day high (i.e. how deep the dip is). Higher values = deeper dip. Used with numeric comparisons.",
+            "type": "numeric",
+            "example": "Buy the dip when percent_below_recent_high >= 15 (price 15%+ below its recent high)"
+        },
+        ExpertEventType.N_PERCENT_ABOVE_RECENT_LOW.value: {
+            "name": "Percent Above Recent Low",
+            "description": "Percentage the current price has rebounded above the ~20-day low. Higher values = stronger bounce off the lows. Used with numeric comparisons.",
+            "type": "numeric",
+            "example": "Confirm a rebound when percent_above_recent_low >= 15 (price 15%+ above its recent low)"
+        },
+        ExpertEventType.N_IV_RANK.value: {
+            "name": "IV Rank",
+            "description": "Implied-volatility percentile (0-100) over the stored trailing ATM-IV window. Low IV rank favors buying premium (long calls/spreads); high IV rank favors selling premium (covered calls). Used with numeric comparisons.",
+            "type": "numeric",
+            "example": "Buy calls only in cheap volatility: iv_rank <= 30"
         }
     }
 
@@ -325,6 +359,53 @@ def get_action_type_documentation() -> dict:
             ],
             "parameters": "Requires target_percent (e.g., 5.0 for 5% of virtual equity). Keeps minimum 1 share if target > 0%. Automatically calculates quantity to sell.",
             "example": "When instrument_account_share > 15%, decrease_instrument_share to 10% (rebalance)"
+        },
+
+        # Option Actions
+        ExpertActionType.BUY_CALL.value: {
+            "name": "Buy Call",
+            "description": "Open a long call option on the underlying - a directional, leveraged bullish play where the maximum loss is the premium paid (premium-at-risk).",
+            "use_cases": [
+                "Take leveraged bullish exposure with capped downside (premium only)",
+                "Buy the dip in cheap volatility (low iv_rank) for upside convexity",
+                "Express a high-conviction bullish thesis without tying up full share notional"
+            ],
+            "parameters": "strike_method (delta | percent_otm | consensus_target), strike_param, dte_min, dte_max, sizing (pct_equity), min_open_interest, max_spread_pct",
+            "example": "When bullish and iv_rank <= 30 and not has_option_position, buy_call (delta ~0.40, 30-60 DTE, 2% equity)"
+        },
+        ExpertActionType.OPEN_BULL_CALL_SPREAD.value: {
+            "name": "Open Bull Call Spread",
+            "description": "Open a debit call spread (buy a lower-strike call, sell a higher-strike call). Defined-risk bullish structure where maximum loss equals the net debit paid and upside is capped at the short strike.",
+            "use_cases": [
+                "Bullish exposure with strictly defined, smaller cost than an outright call",
+                "Reduce premium outlay by selling upside when targeting a specific price level",
+                "Trade a moderate up-move while capping risk to the net debit"
+            ],
+            "parameters": "long/short strike params (e.g. long delta or percent_otm, short strike width), dte_min, dte_max, max_risk sizing (pct_equity / net debit), min_open_interest, max_spread_pct",
+            "example": "When bullish and percent_to_new_target >= 5%, open_bull_call_spread (long ~0.40 delta / short +5% OTM, 30-60 DTE)"
+        },
+        ExpertActionType.SELL_COVERED_CALL.value: {
+            "name": "Sell Covered Call",
+            "description": "Write (sell) a call against a held equity long as an income overlay. Used in open_positions rules; collects premium while capping upside at the short strike on the covered shares.",
+            "use_cases": [
+                "Generate income on a long equity position during sideways/neutral conditions",
+                "Sell premium when iv_rank is high (expensive volatility)",
+                "Set a soft exit target by writing calls at a strike you'd be happy to sell at"
+            ],
+            "parameters": "strike_method/param (OTM, e.g. percent_otm or delta), dte_min, dte_max, min_open_interest, max_spread_pct",
+            "example": "When has_position and iv_rank >= 60 and not has_covered_call, sell_covered_call (5% OTM, 30-45 DTE)"
+        },
+        ExpertActionType.CLOSE_OPTION.value: {
+            "name": "Close Option",
+            "description": "Close a held option position (long call, spread, or short covered call). Used for take-profit, stop-loss, time-stop, or thesis-flip exits.",
+            "use_cases": [
+                "Take profit when the option's gain reaches a target",
+                "Stop loss when the option's loss exceeds a threshold",
+                "Time-stop to avoid theta decay / assignment risk as expiration nears",
+                "Exit on a thesis flip (e.g. rating downgraded or turns bearish)"
+            ],
+            "parameters": "No additional parameters needed - closes the held option position. Typically gated by profit/loss or days/DTE conditions.",
+            "example": "When profit_loss_percent >= 50% or days_opened >= 21, close_option"
         }
     }
 
