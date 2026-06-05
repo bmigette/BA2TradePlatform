@@ -4645,9 +4645,84 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
     # ======================================================================
     # OptionsAccountInterface — TEMPORARY stubs (replaced in later tasks)
     # ======================================================================
-    def get_option_positions(self):
-        # TODO(Task 8): implement option position retrieval + OCC parsing.
-        raise NotImplementedError("Implemented in Task 8")
+    @staticmethod
+    def _parse_occ_symbol(occ: str):
+        """Parse an OCC option symbol into (underlying, expiry, right, strike).
+
+        OCC format: <ROOT><YYMMDD><C|P><STRIKE*1000 as 8 digits>. The root is
+        variable length (1-6 chars), so parse from the right:
+          - last 8 chars  = strike x 1000
+          - char at -9    = 'C' (call) / 'P' (put)
+          - chars -15:-9  = YYMMDD expiry
+          - everything before -15 = root / underlying
+
+        Example: "AAPL260116C00150000" -> ("AAPL", date(2026,1,16), CALL, 150.0)
+        """
+        from datetime import date
+        from ...core.types import OptionRight
+
+        strike = int(occ[-8:]) / 1000.0
+        right = OptionRight.CALL if occ[-9].upper() == "C" else OptionRight.PUT
+        yymmdd = occ[-15:-9]
+        expiry = date(2000 + int(yymmdd[0:2]), int(yymmdd[2:4]), int(yymmdd[4:6]))
+        root = occ[:-15]
+        return root, expiry, right, strike
+
+    @alpaca_api_retry
+    def get_option_positions(self) -> List["OptionPosition"]:
+        """Return all held option positions as broker-agnostic OptionPosition
+        objects. Equity (and any non-option) positions are filtered out.
+
+        Malformed OCC symbols are logged and skipped rather than crashing the
+        whole call.
+        """
+        from ...core.option_types import OptionPosition
+        from ...core.types import OrderDirection
+
+        raw_positions = self.client.get_all_positions() or []
+        positions: List[OptionPosition] = []
+
+        for pos in raw_positions:
+            asset_class = str(getattr(pos, "asset_class", "")).lower()
+            if "option" not in asset_class:
+                continue
+
+            symbol = getattr(pos, "symbol", None)
+            try:
+                underlying, expiry, right, strike = self._parse_occ_symbol(symbol)
+            except Exception as e:
+                logger.warning(
+                    f"get_option_positions: skipping position with unparseable "
+                    f"OCC symbol {symbol!r}: {e}"
+                )
+                continue
+
+            qty = float(pos.qty)
+            side_str = str(getattr(pos, "side", "")).lower()
+            if "short" in side_str or qty < 0:
+                side = OrderDirection.SELL
+            else:
+                side = OrderDirection.BUY
+
+            def _to_float(value):
+                return float(value) if value is not None else None
+
+            positions.append(OptionPosition(
+                contract_symbol=symbol,
+                underlying=underlying,
+                option_type=right,
+                strike=strike,
+                expiry=expiry,
+                side=side,
+                quantity=abs(qty),
+                avg_entry_price=float(pos.avg_entry_price),
+                current_price=_to_float(getattr(pos, "current_price", None)),
+                market_value=_to_float(getattr(pos, "market_value", None)),
+                unrealized_pl=_to_float(getattr(pos, "unrealized_pl", None)),
+                multiplier=100,
+            ))
+
+        return positions
 
     def _submit_option_order_impl(self, trading_order, legs, leg_orders=None):
         # TODO(Task 9): implement single + multi-leg option order submission.

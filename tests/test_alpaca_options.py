@@ -137,6 +137,50 @@ def test_get_option_chain_join_asymmetry(monkeypatch):
     assert [c.symbol for c in chain] == ["AAPL260116C00150000"]
 
 
+def test_parse_occ_symbol_call_and_put():
+    acct = _make_alpaca()
+    u, e, r, k = acct._parse_occ_symbol("AAPL260116C00150000")
+    assert u == "AAPL" and e == date(2026, 1, 16) and r == OptionRight.CALL and k == 150.0
+    u2, e2, r2, k2 = acct._parse_occ_symbol("SPY260320P00455500")
+    assert u2 == "SPY" and e2 == date(2026, 3, 20) and r2 == OptionRight.PUT and k2 == 455.5
+
+
+def test_get_option_positions_filters_and_maps():
+    from ba2_trade_platform.core.types import OrderDirection
+    acct = _make_alpaca()
+    equity_pos = SimpleNamespace(symbol="AAPL", asset_class="us_equity", qty="10",
+                                 avg_entry_price="150.0", current_price="151.0",
+                                 market_value="1510.0", unrealized_pl="10.0", side="long")
+    opt_pos = SimpleNamespace(symbol="AAPL260116C00150000", asset_class="us_option", qty="2",
+                              avg_entry_price="5.2", current_price="6.0", market_value="1200.0",
+                              unrealized_pl="160.0", side="long")
+    short_opt = SimpleNamespace(symbol="AAPL260116C00160000", asset_class="us_option", qty="-1",
+                                avg_entry_price="2.0", current_price="1.5", market_value="-150.0",
+                                unrealized_pl="50.0", side="short")
+
+    class FakeClient:
+        def get_all_positions(self):
+            return [equity_pos, opt_pos, short_opt]
+    acct.client = FakeClient()
+
+    positions = acct.get_option_positions()
+    assert len(positions) == 2  # equity filtered out
+    by_sym = {p.contract_symbol: p for p in positions}
+    long_p = by_sym["AAPL260116C00150000"]
+    assert long_p.underlying == "AAPL"
+    assert long_p.option_type == OptionRight.CALL
+    assert long_p.strike == 150.0
+    assert long_p.expiry == date(2026, 1, 16)
+    assert long_p.side == OrderDirection.BUY
+    assert long_p.quantity == 2
+    assert long_p.avg_entry_price == 5.2
+    assert long_p.current_price == 6.0
+    assert long_p.multiplier == 100
+    short_p = by_sym["AAPL260116C00160000"]
+    assert short_p.side == OrderDirection.SELL
+    assert short_p.quantity == 1  # absolute value
+
+
 def test_get_option_contracts_meta_paginates(monkeypatch):
     acct = _make_alpaca()
     calls = {"n": 0}
