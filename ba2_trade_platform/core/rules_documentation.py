@@ -434,6 +434,28 @@ def get_action_type_documentation() -> dict:
             "parameters": "strike_method/param (OTM, e.g. percent_otm or delta), dte_min, dte_max, min_open_interest, max_spread_pct",
             "example": "When has_position and percent_below_recent_high >= 5% and not has_protective_put, buy_protective_put (5% OTM, 30-45 DTE)"
         },
+        ExpertActionType.SELL_CASH_SECURED_PUT.value: {
+            "name": "Sell Cash-Secured Put",
+            "description": "Write (sell) a put while reserving cash equal to the assignment cost (strike * 100 per contract). Short-premium income/entry strategy: collect the put premium now; if the underlying closes below the strike at expiry the shares are assigned (put to you) at the strike. The reserved cash is held against available buying power until the position is closed/expires.",
+            "use_cases": [
+                "Generate income from premium while willing to own the underlying at the strike",
+                "Enter a long-equity position at a discount (effective cost = strike - premium) if assigned",
+                "Sell premium when iv_rank is high (expensive volatility) on a name you'd buy"
+            ],
+            "parameters": "strike_method (delta | percent_otm | consensus_target), strike_param, dte_min, dte_max, sizing (pct_equity sized against the strike*100 cash reserve), min_open_interest, max_spread_pct",
+            "example": "When neutral-to-bullish and iv_rank >= 60, sell_cash_secured_put (delta ~0.30, 30-45 DTE). Reserves strike*100 cash; assignment risk if it goes ITM."
+        },
+        ExpertActionType.OPEN_BEAR_CALL_SPREAD.value: {
+            "name": "Open Bear Call Spread",
+            "description": "Open a credit call spread (sell a lower-strike call, buy a higher-strike call). Short-premium, defined-risk bearish/neutral structure: you collect a net credit (short.bid - long.ask) up front and the maximum loss equals (spread width - net credit), which is reserved against buying power. The short leg carries assignment risk if it finishes in the money.",
+            "use_cases": [
+                "Bearish/neutral exposure with strictly defined risk and an up-front credit",
+                "Sell premium above resistance when iv_rank is high (expensive volatility)",
+                "Profit from time decay while the underlying stays below the short strike"
+            ],
+            "parameters": "long/short strike params (short = closer/lower-strike sold leg, long = further-OTM/higher-strike bought leg), dte_min, dte_max, max-loss sizing (pct_equity / (width - net credit)), min_open_interest, max_spread_pct",
+            "example": "When bearish and iv_rank >= 60, open_bear_call_spread (short ~0.30 delta / long +5 strikes, 30-45 DTE). Net credit limit is negative; max-loss (width - credit) is reserved."
+        },
         ExpertActionType.CLOSE_OPTION.value: {
             "name": "Close Option",
             "description": "Close a held option position (long call, spread, or short covered call). Used for take-profit, stop-loss, time-stop, or thesis-flip exits.",

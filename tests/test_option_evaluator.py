@@ -70,6 +70,8 @@ def test_get_action_type_maps_all_option_actions(mock_account, sample_recommenda
         ExpertActionType.SELL_COVERED_CALL: {**_option_cfg(), "action_type": "sell_covered_call"},
         ExpertActionType.BUY_PUT: {**_option_cfg(), "action_type": "buy_put"},
         ExpertActionType.OPEN_BEAR_PUT_SPREAD: {**_option_cfg(), "action_type": "open_bear_put_spread"},
+        ExpertActionType.SELL_CASH_SECURED_PUT: {**_option_cfg(), "action_type": "sell_cash_secured_put"},
+        ExpertActionType.OPEN_BEAR_CALL_SPREAD: {**_option_cfg(), "action_type": "open_bear_call_spread"},
         ExpertActionType.CLOSE_OPTION: {**_option_cfg(), "action_type": "close_option"},
     }
     for enum_member, cfg in cases.items():
@@ -244,4 +246,59 @@ def test_buy_put_option_action_executes(monkeypatch):
     results = ev.execute(submit_to_broker=True)
     assert captured.get("called") is True
     assert captured["option_strategy"] == "long_put"
+    assert any(r.get("success") for r in results)
+
+
+def test_cash_secured_put_option_action_executes(monkeypatch):
+    """A sell_cash_secured_put action in an EventAction is wired and executes."""
+    from datetime import date, timedelta
+    acct_def = create_account_definition()
+    account = MockAccount(acct_def.id)
+    ei = create_expert_instance(account_id=acct_def.id)
+    rec = create_recommendation(instance_id=ei.id, recommended_action=OrderRecommendation.SELL)
+
+    chain = _canned_put_chain()
+    for c in chain:
+        c.expiry = date.today() + timedelta(days=35)
+    monkeypatch.setattr(account, "get_option_chain", lambda *a, **k: chain, raising=False)
+
+    captured = {}
+
+    def fake_submit(legs, quantity, order_type="limit", limit_price=None,
+                    option_strategy=None, expert_recommendation_id=None, transaction_id=None):
+        captured.update(called=True, legs=legs, quantity=quantity,
+                        option_strategy=option_strategy, limit_price=limit_price)
+        order = TradingOrder(account_id=account.id, symbol="AAPL", quantity=quantity,
+                             side=OrderDirection.SELL, order_type=OrderType.SELL_LIMIT,
+                             status=OrderStatus.FILLED)
+        oid = add_instance(order)
+        from ba2_trade_platform.core.db import get_instance
+        return get_instance(TradingOrder, oid)
+
+    monkeypatch.setattr(account, "submit_option_order", fake_submit, raising=False)
+
+    rs = Ruleset(name="Enter via CSP", type=ExpertEventRuleType.TRADING_RECOMMENDATION_RULE,
+                 subtype=AnalysisUseCase.ENTER_MARKET.value)
+    rs_id = add_instance(rs)
+    ea = EventAction(
+        name="Sell CSP on bearish",
+        type=ExpertEventRuleType.TRADING_RECOMMENDATION_RULE,
+        triggers={"trigger_0": {"event_type": ExpertEventType.F_BEARISH.value}},
+        actions={"action_0": {"action_type": "sell_cash_secured_put", "strike_method": "delta",
+                              "strike_param": 0.50, "dte_min": 20, "dte_max": 45,
+                              "sizing": 50.0, "min_open_interest": 100, "max_spread_pct": 20.0}},
+        continue_processing=False,
+    )
+    ea_id = add_instance(ea)
+    link_rule_to_ruleset(rs_id, ea_id, order_index=0)
+
+    ev = TradeActionEvaluator(account=account)
+    summaries = ev.evaluate("AAPL", rec, rs_id)
+    assert len(summaries) > 0
+    assert len(ev.trade_actions) == 1
+
+    results = ev.execute(submit_to_broker=True)
+    assert captured.get("called") is True
+    assert captured["option_strategy"] == "cash_secured_put"
+    assert captured["limit_price"] == 4.9                   # sell at BID
     assert any(r.get("success") for r in results)

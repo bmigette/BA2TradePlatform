@@ -244,6 +244,7 @@ class TradeActionEvaluator:
                                    ExpertActionType.BUY_CALL, ExpertActionType.OPEN_BULL_CALL_SPREAD,
                                    ExpertActionType.SELL_COVERED_CALL, ExpertActionType.BUY_PUT,
                                    ExpertActionType.OPEN_BEAR_PUT_SPREAD, ExpertActionType.BUY_PROTECTIVE_PUT,
+                                   ExpertActionType.SELL_CASH_SECURED_PUT, ExpertActionType.OPEN_BEAR_CALL_SPREAD,
                                    ExpertActionType.CLOSE_OPTION]:
                     # Option actions self-submit (create their own broker order + transaction);
                     # they run in Phase 1 like equity order-creating actions.
@@ -954,7 +955,8 @@ class TradeActionEvaluator:
                 kwargs['target_percent'] = target_val
             elif action_type in (ExpertActionType.BUY_CALL, ExpertActionType.OPEN_BULL_CALL_SPREAD,
                                  ExpertActionType.SELL_COVERED_CALL, ExpertActionType.BUY_PUT,
-                                 ExpertActionType.OPEN_BEAR_PUT_SPREAD, ExpertActionType.BUY_PROTECTIVE_PUT):
+                                 ExpertActionType.OPEN_BEAR_PUT_SPREAD, ExpertActionType.BUY_PROTECTIVE_PUT,
+                                 ExpertActionType.SELL_CASH_SECURED_PUT, ExpertActionType.OPEN_BEAR_CALL_SPREAD):
                 # Option ENTRY actions: pull strike/dte/sizing/liquidity params from config.
                 # Only forward keys that are present so the action's own defaults apply otherwise.
                 # (CLOSE_OPTION takes none of these — it resolves the contract from the position.)
@@ -1006,6 +1008,8 @@ class TradeActionEvaluator:
                 'BuyPutAction': ExpertActionType.BUY_PUT,
                 'OpenBearPutSpreadAction': ExpertActionType.OPEN_BEAR_PUT_SPREAD,
                 'BuyProtectivePutAction': ExpertActionType.BUY_PROTECTIVE_PUT,
+                'SellCashSecuredPutAction': ExpertActionType.SELL_CASH_SECURED_PUT,
+                'OpenBearCallSpreadAction': ExpertActionType.OPEN_BEAR_CALL_SPREAD,
                 'CloseOptionAction': ExpertActionType.CLOSE_OPTION,
             }
             
@@ -1042,6 +1046,8 @@ class TradeActionEvaluator:
                 ExpertActionType.BUY_PUT: 1,
                 ExpertActionType.OPEN_BEAR_PUT_SPREAD: 1,
                 ExpertActionType.BUY_PROTECTIVE_PUT: 1,
+                ExpertActionType.SELL_CASH_SECURED_PUT: 1,
+                ExpertActionType.OPEN_BEAR_CALL_SPREAD: 1,
                 ExpertActionType.CLOSE: 2,
                 ExpertActionType.CLOSE_OPTION: 2,
                 ExpertActionType.ADJUST_TAKE_PROFIT: 3,

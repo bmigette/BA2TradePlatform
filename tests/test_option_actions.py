@@ -236,6 +236,115 @@ def test_buy_call_sizing_respects_virtual_equity_pct(monkeypatch, mock_account_d
     assert cap["quantity"] == 1
 
 
+def _capture_submit_persisted(monkeypatch, account):
+    """Like _capture_submit but PERSISTS the returned order (gives it an id) so
+    the action can store data['option_reserve'] via update_instance and tests can
+    re-fetch it."""
+    captured = {}
+
+    def fake(legs, quantity, order_type="limit", limit_price=None, option_strategy=None,
+             expert_recommendation_id=None, transaction_id=None):
+        captured.update(legs=legs, quantity=quantity, order_type=order_type,
+                        limit_price=limit_price, option_strategy=option_strategy)
+        order = TradingOrder(account_id=account.id, symbol="AAPL", quantity=quantity,
+                             side=OrderDirection.SELL, order_type=OrderType.SELL_LIMIT,
+                             status=OrderStatus.FILLED, asset_class=AssetClass.OPTION,
+                             option_strategy=option_strategy)
+        oid = add_instance(order)
+        from ba2_trade_platform.core.db import get_instance
+        captured["order_id"] = oid
+        return get_instance(TradingOrder, oid)
+
+    monkeypatch.setattr(account, "submit_option_order", fake, raising=False)
+    return captured
+
+
+def test_cash_secured_put_reserves_and_sizes(monkeypatch, mock_account, mock_expert_instance, sample_recommendation):
+    # Sell-to-open a PUT @ BID; reserve = strike*100 per contract.
+    chain = [_put(140, delta=-0.30, bid=3.0, ask=3.2, oi=2000)]
+    monkeypatch.setattr(mock_account, "get_option_chain", lambda *a, **k: chain, raising=False)
+    cap = _capture_submit_persisted(monkeypatch, mock_account)
+    action = create_action(action_type=ExpertActionType.SELL_CASH_SECURED_PUT, instrument_name="AAPL",
+        account=mock_account, order_recommendation=OrderRecommendation.HOLD, existing_order=None,
+        expert_recommendation=sample_recommendation, strike_method="percent_otm", strike_param=5.0,
+        dte_min=20, dte_max=45, sizing=50.0, min_open_interest=100, max_spread_pct=20.0)
+    res = action.execute()
+    assert res["success"] is True
+    assert len(cap["legs"]) == 1
+    leg = cap["legs"][0]
+    assert leg.option_type == OptionRight.PUT and leg.side == OrderDirection.SELL
+    assert leg.position_intent == "sell_to_open"
+    assert leg.strike == 140.0
+    assert cap["option_strategy"] == "cash_secured_put"
+    assert cap["limit_price"] == 3.0                        # sell at BID
+    # budget = 100000 * 100% * 50% = 50000; per-contract reserve = 140*100 = 14000
+    # qty = floor(50000 / 14000) = 3
+    assert cap["quantity"] == 3
+    # reserve persisted on the order: strike*100*qty = 140*100*3 = 42000
+    from ba2_trade_platform.core.db import get_instance
+    order = get_instance(TradingOrder, cap["order_id"])
+    assert (order.data or {}).get("option_reserve") == 140.0 * 100.0 * 3
+
+
+def test_cash_secured_put_insufficient_bp_skips(monkeypatch, mock_account, mock_expert_instance, sample_recommendation):
+    # Seed an existing OPEN option order reserving most of the balance so the CSP
+    # reserve no longer fits in available buying power -> skip, no submit.
+    add_instance(TradingOrder(account_id=mock_account.id, symbol="MSFT", quantity=10,
+        side=OrderDirection.SELL, order_type=OrderType.SELL_LIMIT, status=OrderStatus.FILLED,
+        asset_class=AssetClass.OPTION, option_strategy="cash_secured_put",
+        data={"option_reserve": 95000.0}))
+    chain = [_put(140, delta=-0.30, bid=3.0, ask=3.2, oi=2000)]
+    monkeypatch.setattr(mock_account, "get_option_chain", lambda *a, **k: chain, raising=False)
+    submitted = {}
+    monkeypatch.setattr(mock_account, "submit_option_order",
+                        lambda *a, **k: submitted.update(x=1), raising=False)
+    action = create_action(action_type=ExpertActionType.SELL_CASH_SECURED_PUT, instrument_name="AAPL",
+        account=mock_account, order_recommendation=OrderRecommendation.HOLD, existing_order=None,
+        expert_recommendation=sample_recommendation, strike_method="percent_otm", strike_param=5.0,
+        dte_min=20, dte_max=45, sizing=50.0, min_open_interest=100, max_spread_pct=20.0)
+    res = action.execute()
+    assert res["success"] is False
+    assert "buying power" in res["message"].lower()
+    assert "x" not in submitted                             # never submitted
+
+
+def test_bear_call_spread_credit(monkeypatch, mock_account, mock_expert_instance, sample_recommendation):
+    # Bear CALL credit spread: SHORT the lower strike (150), LONG the higher strike (160).
+    chain = [_call(150, delta=0.35, bid=4.0, ask=4.2, oi=2000),
+             _call(160, delta=0.18, bid=1.8, ask=2.0, oi=2000)]
+    monkeypatch.setattr(mock_account, "get_option_chain", lambda *a, **k: chain, raising=False)
+    cap = _capture_submit_persisted(monkeypatch, mock_account)
+    action = create_action(action_type=ExpertActionType.OPEN_BEAR_CALL_SPREAD, instrument_name="AAPL",
+        account=mock_account, order_recommendation=OrderRecommendation.SELL, existing_order=None,
+        expert_recommendation=sample_recommendation, strike_method="delta",
+        strike_param={"long": 0.18, "short": 0.35}, dte_min=20, dte_max=45,
+        sizing=50.0, min_open_interest=100, max_spread_pct=20.0)
+    res = action.execute()
+    assert res["success"] is True
+    assert len(cap["legs"]) == 2
+    short_leg, long_leg = cap["legs"]
+    # SHORT = lower strike (150), SELL/sell_to_open
+    assert short_leg.strike == 150.0
+    assert short_leg.side == OrderDirection.SELL and short_leg.position_intent == "sell_to_open"
+    assert short_leg.option_type == OptionRight.CALL
+    # LONG = higher strike (160), BUY/buy_to_open (protection)
+    assert long_leg.strike == 160.0
+    assert long_leg.side == OrderDirection.BUY and long_leg.position_intent == "buy_to_open"
+    assert long_leg.option_type == OptionRight.CALL
+    assert cap["option_strategy"] == "bear_call_spread"
+    # net_credit = short.bid - long.ask = 4.0 - 2.0 = 2.0; width = 160 - 150 = 10
+    # limit_price NEGATIVE (credit) = -2.0
+    assert abs(cap["limit_price"] - (-2.0)) < 1e-9
+    # per-spread reserve = (width - net_credit)*100 = (10-2)*100 = 800
+    # budget = 100000 * 50% = 50000; qty = floor(50000/800) = 62
+    qty = cap["quantity"]
+    assert qty == 62
+    # reserve persisted = max_loss = (width - net_credit)*100*qty = 800*62
+    from ba2_trade_platform.core.db import get_instance
+    order = get_instance(TradingOrder, cap["order_id"])
+    assert (order.data or {}).get("option_reserve") == (10.0 - 2.0) * 100.0 * qty
+
+
 def test_close_option_calls_close(monkeypatch, mock_account, mock_expert_instance, sample_recommendation):
     # Seed an OPEN long call option order on a transaction; CloseOption should close it.
     txn_id = add_instance(Transaction(symbol="AAPL", quantity=2, side=OrderDirection.BUY,

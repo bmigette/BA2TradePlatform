@@ -1573,6 +1573,42 @@ class _OptionEntryAction(TradeAction):
         budget = equity * (sizing_pct / 100.0)
         return int(math.floor(budget / (premium * 100.0)))
 
+    def _held_equity_shares(self) -> float:
+        """Sum filled equity BUY quantity across this expert's OPENED transactions for the symbol."""
+        instance_id = self.expert_recommendation.instance_id if self.expert_recommendation else None
+        if not instance_id:
+            return 0.0
+        from sqlmodel import select, Session
+        from .models import Transaction
+        total = 0.0
+        with Session(get_db().bind) as session:
+            txns = session.exec(
+                select(Transaction).where(
+                    Transaction.symbol == self.instrument_name,
+                    Transaction.expert_id == instance_id,
+                    Transaction.status == TransactionStatus.OPENED,
+                )
+            ).all()
+            txn_ids = [t.id for t in txns]
+            if not txn_ids:
+                return 0.0
+            orders = session.exec(
+                select(TradingOrder).where(TradingOrder.transaction_id.in_(txn_ids))
+            ).all()
+            for o in orders:
+                if o.asset_class == AssetClass.OPTION:
+                    continue
+                if o.status not in OrderStatus.get_executed_statuses():
+                    continue
+                qty = o.filled_qty
+                if not qty:
+                    continue
+                if o.side == OrderDirection.BUY:
+                    total += abs(float(qty))
+                else:
+                    total -= abs(float(qty))
+        return total
+
     def _consensus_target(self) -> Optional[float]:
         """Resolve a target price for consensus_target strike selection."""
         rec = self.expert_recommendation
@@ -1598,8 +1634,14 @@ class _OptionEntryAction(TradeAction):
             action_type=self._action_type_value(), success=success, message=message, data=data or {})
 
     def _submit_option_order(self, legs: List[OptionLeg], quantity: int,
-                             limit_price: float, option_strategy: str) -> Dict[str, Any]:
-        """Submit (or defer) the assembled option order, honoring submit_to_broker."""
+                             limit_price: float, option_strategy: str,
+                             option_reserve: Optional[float] = None) -> Dict[str, Any]:
+        """Submit (or defer) the assembled option order, honoring submit_to_broker.
+
+        When `option_reserve` is provided (short-premium strategies: CSP / credit
+        spread), it is persisted on the parent order's `data["option_reserve"]` so
+        `OptionsAccountInterface.reserved_option_buying_power()` can account for it.
+        """
         expert_rec_id = self.expert_recommendation.id if self.expert_recommendation else None
         data = {
             "option_strategy": option_strategy,
@@ -1609,6 +1651,8 @@ class _OptionEntryAction(TradeAction):
                       "position_intent": leg.position_intent, "strike": leg.strike}
                      for leg in legs],
         }
+        if option_reserve is not None:
+            data["option_reserve"] = option_reserve
         if not self.submit_to_broker:
             logger.info(f"_OptionEntryAction: submit disabled for {self.instrument_name} "
                         f"{option_strategy} - recording informational result")
@@ -1622,6 +1666,15 @@ class _OptionEntryAction(TradeAction):
             return self._result(False, f"Failed to submit {option_strategy} for {self.instrument_name}", data)
         order_id = getattr(order, "id", None)
         data["order_id"] = order_id
+        # Persist the short-premium reserve on the order so available BP reflects it.
+        if option_reserve is not None and order_id is not None:
+            try:
+                stored = get_instance(TradingOrder, order_id)
+                if stored is not None:
+                    stored.data = {**(stored.data or {}), "option_reserve": option_reserve}
+                    update_instance(stored)
+            except Exception as e:
+                logger.error(f"Failed to persist option_reserve on order {order_id}: {e}", exc_info=True)
         return self._result(True, f"Submitted {option_strategy} for {self.instrument_name}", data)
 
     def _build_and_submit(self) -> Dict[str, Any]:
@@ -1831,42 +1884,6 @@ class SellCoveredCallAction(_OptionEntryAction):
     def _action_type_value(self) -> str:
         return ExpertActionType.SELL_COVERED_CALL.value
 
-    def _held_equity_shares(self) -> float:
-        """Sum filled equity BUY quantity across this expert's OPENED transactions for the symbol."""
-        instance_id = self.expert_recommendation.instance_id if self.expert_recommendation else None
-        if not instance_id:
-            return 0.0
-        from sqlmodel import select, Session
-        from .models import Transaction
-        total = 0.0
-        with Session(get_db().bind) as session:
-            txns = session.exec(
-                select(Transaction).where(
-                    Transaction.symbol == self.instrument_name,
-                    Transaction.expert_id == instance_id,
-                    Transaction.status == TransactionStatus.OPENED,
-                )
-            ).all()
-            txn_ids = [t.id for t in txns]
-            if not txn_ids:
-                return 0.0
-            orders = session.exec(
-                select(TradingOrder).where(TradingOrder.transaction_id.in_(txn_ids))
-            ).all()
-            for o in orders:
-                if o.asset_class == AssetClass.OPTION:
-                    continue
-                if o.status not in OrderStatus.get_executed_statuses():
-                    continue
-                qty = o.filled_qty
-                if not qty:
-                    continue
-                if o.side == OrderDirection.BUY:
-                    total += abs(float(qty))
-                else:
-                    total -= abs(float(qty))
-        return total
-
     def _build_and_submit(self) -> Dict[str, Any]:
         held = self._held_equity_shares()
         quantity = int(math.floor(held / 100.0)) if held > 0 else 0
@@ -1905,42 +1922,6 @@ class BuyProtectivePutAction(_OptionEntryAction):
     def _action_type_value(self) -> str:
         return ExpertActionType.BUY_PROTECTIVE_PUT.value
 
-    def _held_equity_shares(self) -> float:
-        """Sum filled equity BUY quantity across this expert's OPENED transactions for the symbol."""
-        instance_id = self.expert_recommendation.instance_id if self.expert_recommendation else None
-        if not instance_id:
-            return 0.0
-        from sqlmodel import select, Session
-        from .models import Transaction
-        total = 0.0
-        with Session(get_db().bind) as session:
-            txns = session.exec(
-                select(Transaction).where(
-                    Transaction.symbol == self.instrument_name,
-                    Transaction.expert_id == instance_id,
-                    Transaction.status == TransactionStatus.OPENED,
-                )
-            ).all()
-            txn_ids = [t.id for t in txns]
-            if not txn_ids:
-                return 0.0
-            orders = session.exec(
-                select(TradingOrder).where(TradingOrder.transaction_id.in_(txn_ids))
-            ).all()
-            for o in orders:
-                if o.asset_class == AssetClass.OPTION:
-                    continue
-                if o.status not in OrderStatus.get_executed_statuses():
-                    continue
-                qty = o.filled_qty
-                if not qty:
-                    continue
-                if o.side == OrderDirection.BUY:
-                    total += abs(float(qty))
-                else:
-                    total -= abs(float(qty))
-        return total
-
     def _build_and_submit(self) -> Dict[str, Any]:
         held = self._held_equity_shares()
         quantity = int(math.floor(held / 100.0)) if held > 0 else 0
@@ -1969,6 +1950,154 @@ class BuyProtectivePutAction(_OptionEntryAction):
 
     def get_description(self) -> str:
         return f"Buy protective put on {self.instrument_name}"
+
+
+class SellCashSecuredPutAction(_OptionEntryAction):
+    """Sell a cash-secured put (short premium) and reserve strike*100 per contract.
+
+    Income/entry strategy: collect the put premium (sold at BID); the account must
+    reserve cash equal to the assignment cost (strike * 100) per contract so the
+    position is fully secured. Assignment risk: if the underlying closes below the
+    strike at expiry, the shares are put to the account at the strike.
+    """
+
+    OPTION_TYPE = OptionRight.PUT
+
+    def _action_type_value(self) -> str:
+        return ExpertActionType.SELL_CASH_SECURED_PUT.value
+
+    def _build_and_submit(self) -> Dict[str, Any]:
+        chain = self._chain(self.OPTION_TYPE)
+        if not chain:
+            return self._result(False, f"Empty option chain for {self.instrument_name}")
+        spot = self._spot()
+        contract = select_single(
+            chain, method=self.strike_method, strike_param=self.strike_param, spot=spot,
+            option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
+            today=self._today(), target_price=self._consensus_target(),
+            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct)
+        if contract is None:
+            return self._result(False, f"No liquid put contract for cash-secured put on {self.instrument_name}")
+        if contract.bid is None or contract.bid <= 0:
+            return self._result(False, f"No bid price for {contract.symbol}")
+        if contract.strike is None or contract.strike <= 0:
+            return self._result(False, f"No strike for {contract.symbol}")
+        # Sizing: budget by the cash that must be reserved (strike*100), not the premium.
+        equity = self._virtual_equity()
+        if equity is None or equity <= 0:
+            return self._result(False, f"No virtual equity available for {self.instrument_name}")
+        if not self.sizing or self.sizing <= 0:
+            return self._result(False, f"No sizing configured for cash-secured put on {self.instrument_name}")
+        budget = equity * (self.sizing / 100.0)
+        per_contract_reserve = contract.strike * 100.0
+        quantity = int(math.floor(budget / per_contract_reserve))
+        if quantity < 1:
+            return self._result(False,
+                                f"Insufficient budget to size cash_secured_put for {self.instrument_name} "
+                                f"(strike={contract.strike})")
+        reserve = self.account.option_reserve_required("cash_secured_put", quantity, strike=contract.strike)
+        if not self.account.check_option_buying_power(reserve):
+            return self._result(False,
+                                f"Insufficient buying power to reserve {reserve} for cash_secured_put "
+                                f"on {self.instrument_name} (available="
+                                f"{self.account.available_option_buying_power()})")
+        limit_price = contract.bid                          # sell at BID
+        leg = OptionLeg(contract_symbol=contract.symbol, side=OrderDirection.SELL,
+                        position_intent="sell_to_open", option_type=self.OPTION_TYPE,
+                        strike=contract.strike, expiry=contract.expiry, underlying=contract.underlying)
+        return self._submit_option_order([leg], quantity, limit_price, "cash_secured_put",
+                                         option_reserve=reserve)
+
+    def get_description(self) -> str:
+        return f"Sell cash-secured put on {self.instrument_name}"
+
+
+class OpenBearCallSpreadAction(_OptionEntryAction):
+    """Open a bear call (credit) vertical spread: sell lower strike, buy higher strike.
+
+    Short-premium defined-risk bearish structure. SHORT leg is the lower strike
+    (sold at BID), LONG leg is the higher strike (bought at ASK as protection).
+    net_credit = short.bid - long.ask (must be > 0). The limit price is NEGATIVE
+    (Alpaca MLEG convention: negative = net credit). Max loss = (width - net_credit)
+    is reserved as buying power. Assignment risk on the short leg if it goes ITM.
+    """
+
+    OPTION_TYPE = OptionRight.CALL
+
+    def _action_type_value(self) -> str:
+        return ExpertActionType.OPEN_BEAR_CALL_SPREAD.value
+
+    def _spread_params(self) -> Tuple[Any, Any]:
+        """Split strike_param into (long, short) params for the two legs."""
+        sp = self.strike_param
+        if isinstance(sp, dict):
+            return sp.get("long"), sp.get("short")
+        if isinstance(sp, (list, tuple)) and len(sp) == 2:
+            return sp[0], sp[1]
+        # Single value: use the same param for both legs (selector dedups by strike).
+        return sp, sp
+
+    def _build_and_submit(self) -> Dict[str, Any]:
+        chain = self._chain(self.OPTION_TYPE)
+        if not chain:
+            return self._result(False, f"Empty option chain for {self.instrument_name}")
+        spot = self._spot()
+        long_param, short_param = self._spread_params()
+        pair = select_vertical_spread(
+            chain, method=self.strike_method, long_param=long_param, short_param=short_param,
+            spot=spot, option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
+            today=self._today(), target_price=self._consensus_target(),
+            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct)
+        if pair is None:
+            return self._result(False, f"No liquid bear call spread for {self.instrument_name}")
+        # For a CALL spread the selector returns (lo, hi) ordered by strike.
+        # Bear CALL CREDIT spread: SHORT = lo (lower strike), LONG = hi (higher strike).
+        lo_c, hi_c = pair
+        short_c, long_c = lo_c, hi_c
+        if short_c.bid is None or long_c.ask is None:
+            return self._result(False, f"Missing quote for spread legs on {self.instrument_name}")
+        net_credit = round(short_c.bid - long_c.ask, 4)     # sell short@bid, buy long@ask
+        if net_credit <= 0:
+            return self._result(False,
+                                f"Non-positive net credit ({net_credit}) for {self.instrument_name} "
+                                f"bear call spread")
+        width = round(hi_c.strike - lo_c.strike, 4)
+        if width <= 0:
+            return self._result(False, f"Non-positive spread width ({width}) for {self.instrument_name}")
+        per_spread_reserve = (width - net_credit) * 100.0   # max loss per spread
+        if per_spread_reserve <= 0:
+            return self._result(False,
+                                f"Non-positive max-loss reserve for {self.instrument_name} bear call spread")
+        equity = self._virtual_equity()
+        if equity is None or equity <= 0:
+            return self._result(False, f"No virtual equity available for {self.instrument_name}")
+        if not self.sizing or self.sizing <= 0:
+            return self._result(False, f"No sizing configured for bear call spread on {self.instrument_name}")
+        budget = equity * (self.sizing / 100.0)
+        quantity = int(math.floor(budget / per_spread_reserve))
+        if quantity < 1:
+            return self._result(False,
+                                f"Insufficient budget to size bear_call_spread for {self.instrument_name} "
+                                f"(max_loss={per_spread_reserve})")
+        reserve = self.account.option_reserve_required(
+            "bear_call_spread", quantity, spread_width=width, net_credit=net_credit)
+        if not self.account.check_option_buying_power(reserve):
+            return self._result(False,
+                                f"Insufficient buying power to reserve {reserve} for bear_call_spread "
+                                f"on {self.instrument_name} (available="
+                                f"{self.account.available_option_buying_power()})")
+        short_leg = OptionLeg(contract_symbol=short_c.symbol, side=OrderDirection.SELL,
+                              position_intent="sell_to_open", option_type=self.OPTION_TYPE,
+                              strike=short_c.strike, expiry=short_c.expiry, underlying=short_c.underlying)
+        long_leg = OptionLeg(contract_symbol=long_c.symbol, side=OrderDirection.BUY,
+                             position_intent="buy_to_open", option_type=self.OPTION_TYPE,
+                             strike=long_c.strike, expiry=long_c.expiry, underlying=long_c.underlying)
+        limit_price = -net_credit                           # NEGATIVE = net credit (Alpaca MLEG)
+        return self._submit_option_order([short_leg, long_leg], quantity, limit_price,
+                                         "bear_call_spread", option_reserve=reserve)
+
+    def get_description(self) -> str:
+        return f"Open bear call spread on {self.instrument_name}"
 
 
 class CloseOptionAction(TradeAction):
@@ -2103,6 +2232,8 @@ def create_action(action_type: ExpertActionType, instrument_name: str, account: 
         ExpertActionType.BUY_PUT: BuyPutAction,
         ExpertActionType.OPEN_BEAR_PUT_SPREAD: OpenBearPutSpreadAction,
         ExpertActionType.BUY_PROTECTIVE_PUT: BuyProtectivePutAction,
+        ExpertActionType.SELL_CASH_SECURED_PUT: SellCashSecuredPutAction,
+        ExpertActionType.OPEN_BEAR_CALL_SPREAD: OpenBearCallSpreadAction,
         ExpertActionType.CLOSE_OPTION: CloseOptionAction,
     }
     
