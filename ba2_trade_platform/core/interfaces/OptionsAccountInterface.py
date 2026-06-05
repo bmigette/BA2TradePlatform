@@ -209,6 +209,6 @@ class OptionsAccountInterface(ABC):
                     OptionIVSnapshot.recorded_at >= cutoff,
                 )
             ).all()
-        series = [r.atm_iv for r in rows]
+            series = [r.atm_iv for r in rows]   # read while session is open
         current = self.get_atm_implied_volatility(underlying)
         return self._iv_rank_from_series(series, current, min_samples)
