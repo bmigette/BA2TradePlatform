@@ -1552,10 +1552,270 @@ class InstrumentAccountShareCondition(CompareCondition):
         return f"{self.calculated_value:.2f}%"
 
 
+# Option-related Conditions
+
+class PercentBelowRecentHighCondition(CompareCondition):
+    """Compare how far (in percent) the current price is below the recent high.
+
+    Calculates: (recent_high - current_price) / recent_high * 100
+    A larger positive value means a deeper pullback from the recent high.
+    Useful for "buy the dip" option entries.
+    """
+
+    RECENT_WINDOW = 20  # bars (days) used to compute the recent high
+
+    def evaluate(self) -> bool:
+        try:
+            current_price = self.get_current_price()
+            if current_price is None:
+                logger.error(f"Cannot get current price for {self.instrument_name}")
+                self.calculated_value = None
+                return False
+
+            # Import inside evaluate so tests can monkeypatch the source module
+            from ..modules.dataproviders import get_provider
+
+            df = get_provider("ohlcv", "yfinance").get_ohlcv_data(
+                self.instrument_name, interval="1d",
+                lookback_days=self.RECENT_WINDOW * 2 + 10)
+            if df is None or df.empty:
+                logger.warning(f"No OHLCV data for {self.instrument_name}")
+                self.calculated_value = None
+                return False
+
+            recent_high = float(df.tail(self.RECENT_WINDOW)["High"].max())
+            if recent_high <= 0:
+                logger.warning(f"Invalid recent high for {self.instrument_name}: {recent_high}")
+                self.calculated_value = None
+                return False
+
+            self.calculated_value = (recent_high - current_price) / recent_high * 100
+
+            logger.info(
+                f"Percent below recent high for {self.instrument_name}: "
+                f"current=${current_price:.2f}, recent_high=${recent_high:.2f}, "
+                f"below={self.calculated_value:+.2f}%")
+
+            return self.operator_func(self.calculated_value, self.value)
+
+        except Exception as e:
+            logger.error(f"Error evaluating percent below recent high condition: {e}", exc_info=True)
+            self.calculated_value = None
+            return False
+
+    def get_description(self) -> str:
+        return (f"Check if {self.instrument_name} is {self.operator_str} {self.value}% "
+                f"below its recent {self.RECENT_WINDOW}-day high")
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            return None
+        return f"{self.calculated_value:+.2f}%"
+
+
+class PercentAboveRecentLowCondition(CompareCondition):
+    """Compare how far (in percent) the current price is above the recent low.
+
+    Calculates: (current_price - recent_low) / recent_low * 100
+    A larger positive value means a stronger rebound from the recent low.
+    """
+
+    RECENT_WINDOW = 20  # bars (days) used to compute the recent low
+
+    def evaluate(self) -> bool:
+        try:
+            current_price = self.get_current_price()
+            if current_price is None:
+                logger.error(f"Cannot get current price for {self.instrument_name}")
+                self.calculated_value = None
+                return False
+
+            # Import inside evaluate so tests can monkeypatch the source module
+            from ..modules.dataproviders import get_provider
+
+            df = get_provider("ohlcv", "yfinance").get_ohlcv_data(
+                self.instrument_name, interval="1d",
+                lookback_days=self.RECENT_WINDOW * 2 + 10)
+            if df is None or df.empty:
+                logger.warning(f"No OHLCV data for {self.instrument_name}")
+                self.calculated_value = None
+                return False
+
+            recent_low = float(df.tail(self.RECENT_WINDOW)["Low"].min())
+            if recent_low <= 0:
+                logger.warning(f"Invalid recent low for {self.instrument_name}: {recent_low}")
+                self.calculated_value = None
+                return False
+
+            self.calculated_value = (current_price - recent_low) / recent_low * 100
+
+            logger.info(
+                f"Percent above recent low for {self.instrument_name}: "
+                f"current=${current_price:.2f}, recent_low=${recent_low:.2f}, "
+                f"above={self.calculated_value:+.2f}%")
+
+            return self.operator_func(self.calculated_value, self.value)
+
+        except Exception as e:
+            logger.error(f"Error evaluating percent above recent low condition: {e}", exc_info=True)
+            self.calculated_value = None
+            return False
+
+    def get_description(self) -> str:
+        return (f"Check if {self.instrument_name} is {self.operator_str} {self.value}% "
+                f"above its recent {self.RECENT_WINDOW}-day low")
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            return None
+        return f"{self.calculated_value:+.2f}%"
+
+
+class IVRankCondition(CompareCondition):
+    """Compare the implied-volatility rank (0-100) of the underlying.
+
+    IV rank is the percentile of the current ATM IV against the account's stored
+    trailing ATM-IV history. Requires an options-capable account.
+    """
+
+    # Minimum trailing ATM-IV samples required to compute a rank. Lower than the
+    # account default so a rank is available early in an instrument's history.
+    IV_RANK_MIN_SAMPLES = 5
+
+    def evaluate(self) -> bool:
+        try:
+            from .interfaces.OptionsAccountInterface import OptionsAccountInterface
+
+            if not isinstance(self.account, OptionsAccountInterface):
+                logger.warning(
+                    f"Account does not support options; cannot compute IV rank for "
+                    f"{self.instrument_name}")
+                self.calculated_value = None
+                return False
+
+            rank = self.account.get_iv_rank(
+                self.instrument_name, min_samples=self.IV_RANK_MIN_SAMPLES)
+            if rank is None:
+                logger.warning(f"IV rank unavailable for {self.instrument_name}")
+                self.calculated_value = None
+                return False
+
+            self.calculated_value = rank
+
+            logger.info(f"IV rank for {self.instrument_name}: {rank:.1f}")
+
+            return self.operator_func(rank, self.value)
+
+        except Exception as e:
+            logger.error(f"Error evaluating IV rank condition: {e}", exc_info=True)
+            self.calculated_value = None
+            return False
+
+    def get_description(self) -> str:
+        return (f"Check if the IV rank of {self.instrument_name} is "
+                f"{self.operator_str} {self.value}")
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            return None
+        return f"{self.calculated_value:.1f}"
+
+
+class HasOptionPositionCondition(FlagCondition):
+    """Check if this expert has an open option position for the underlying."""
+
+    def evaluate(self) -> bool:
+        try:
+            from .db import get_db
+            from .models import Transaction, TradingOrder
+            from .types import TransactionStatus, AssetClass, OrderStatus
+            from sqlmodel import select
+
+            expert_id = self.expert_recommendation.instance_id
+            terminal = OrderStatus.get_terminal_statuses()
+
+            with get_db() as session:
+                statement = (
+                    select(TradingOrder)
+                    .join(Transaction, TradingOrder.transaction_id == Transaction.id)
+                    .where(
+                        Transaction.expert_id == expert_id,
+                        Transaction.status == TransactionStatus.OPENED,
+                        TradingOrder.asset_class == AssetClass.OPTION,
+                        TradingOrder.underlying_symbol == self.instrument_name,
+                    )
+                )
+                rows = [o for o in session.exec(statement).all() if o.status not in terminal]
+                self._has = len(rows) > 0
+
+            return self._has
+
+        except Exception as e:
+            logger.error(
+                f"Error checking option position for {self.instrument_name}: {e}", exc_info=True)
+            return False
+
+    def get_description(self) -> str:
+        return f"Check if this expert has an open option position for {self.instrument_name}"
+
+    def get_actual_value_display(self) -> Optional[str]:
+        has = getattr(self, '_has', None)
+        if has is None:
+            return None
+        return f"Option position found: {'Yes' if has else 'No'}"
+
+
+class HasCoveredCallCondition(FlagCondition):
+    """Check if this expert has an open covered call (short CALL) on the underlying."""
+
+    def evaluate(self) -> bool:
+        try:
+            from .db import get_db
+            from .models import Transaction, TradingOrder
+            from .types import TransactionStatus, AssetClass, OrderStatus, OptionRight, OrderDirection
+            from sqlmodel import select
+
+            expert_id = self.expert_recommendation.instance_id
+            terminal = OrderStatus.get_terminal_statuses()
+
+            with get_db() as session:
+                statement = (
+                    select(TradingOrder)
+                    .join(Transaction, TradingOrder.transaction_id == Transaction.id)
+                    .where(
+                        Transaction.expert_id == expert_id,
+                        Transaction.status == TransactionStatus.OPENED,
+                        TradingOrder.asset_class == AssetClass.OPTION,
+                        TradingOrder.underlying_symbol == self.instrument_name,
+                        TradingOrder.option_type == OptionRight.CALL,
+                        TradingOrder.side == OrderDirection.SELL,
+                        TradingOrder.option_strategy == "covered_call",
+                    )
+                )
+                rows = [o for o in session.exec(statement).all() if o.status not in terminal]
+                self._has = len(rows) > 0
+
+            return self._has
+
+        except Exception as e:
+            logger.error(
+                f"Error checking covered call for {self.instrument_name}: {e}", exc_info=True)
+            return False
+
+    def get_description(self) -> str:
+        return f"Check if this expert has an open covered call for {self.instrument_name}"
+
+    def get_actual_value_display(self) -> Optional[str]:
+        has = getattr(self, '_has', None)
+        if has is None:
+            return None
+        return f"Covered call found: {'Yes' if has else 'No'}"
+
+
 # Factory function to create conditions based on event type
 
 
-def create_condition(event_type: ExpertEventType, account: AccountInterface, 
+def create_condition(event_type: ExpertEventType, account: AccountInterface,
                     instrument_name: str, expert_recommendation: ExpertRecommendation,
                     existing_order: Optional[TradingOrder] = None,
                     operator_str: Optional[str] = None, value: Optional[float] = None) -> TradeCondition:
@@ -1610,6 +1870,11 @@ def create_condition(event_type: ExpertEventType, account: AccountInterface,
         ExpertEventType.N_CONFIDENCE: ConfidenceCondition,
         ExpertEventType.N_INSTRUMENT_ACCOUNT_SHARE: InstrumentAccountShareCondition,
         ExpertEventType.N_PERCENT_OPEN_TO_NEW_TARGET: PercentOpenToNewTargetCondition,
+        ExpertEventType.N_PERCENT_BELOW_RECENT_HIGH: PercentBelowRecentHighCondition,
+        ExpertEventType.N_PERCENT_ABOVE_RECENT_LOW: PercentAboveRecentLowCondition,
+        ExpertEventType.N_IV_RANK: IVRankCondition,
+        ExpertEventType.F_HAS_OPTION_POSITION: HasOptionPositionCondition,
+        ExpertEventType.F_HAS_COVERED_CALL: HasCoveredCallCondition,
     }
     condition_class = condition_map.get(event_type)
     if not condition_class:
