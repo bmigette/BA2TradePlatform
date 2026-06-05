@@ -19,6 +19,7 @@ Import all interfaces from this module for easy access:
 # Core platform interfaces
 from .ReadOnlyAccountInterface import ReadOnlyAccountInterface
 from .AccountInterface import AccountInterface
+from .OptionsAccountInterface import OptionsAccountInterface
 from .MarketExpertInterface import MarketExpertInterface
 from .ExtendableSettingsInterface import ExtendableSettingsInterface
 from .SmartRiskExpertInterface import SmartRiskExpertInterface
@@ -41,6 +42,7 @@ __all__ = [
     # Core platform interfaces
     "ReadOnlyAccountInterface",
     "AccountInterface",
+    "OptionsAccountInterface",
     "MarketExpertInterface",
     "ExtendableSettingsInterface",
     "SmartRiskExpertInterface",
