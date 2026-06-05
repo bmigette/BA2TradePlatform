@@ -240,7 +240,11 @@ class TradeActionEvaluator:
 
             for action in sorted_actions:
                 action_type = self._get_action_type_from_action(action)
-                if action_type in [ExpertActionType.BUY, ExpertActionType.SELL, ExpertActionType.CLOSE]:
+                if action_type in [ExpertActionType.BUY, ExpertActionType.SELL, ExpertActionType.CLOSE,
+                                   ExpertActionType.BUY_CALL, ExpertActionType.OPEN_BULL_CALL_SPREAD,
+                                   ExpertActionType.SELL_COVERED_CALL, ExpertActionType.CLOSE_OPTION]:
+                    # Option actions self-submit (create their own broker order + transaction);
+                    # they run in Phase 1 like equity order-creating actions.
                     order_creating_actions.append(action)
                 elif action_type in [ExpertActionType.ADJUST_TAKE_PROFIT, ExpertActionType.ADJUST_STOP_LOSS]:
                     adjustment_actions.append(action)
@@ -346,9 +350,16 @@ class TradeActionEvaluator:
                 logger.info(f"Creating transactions for {len(created_order_ids)} new orders before TP/SL adjustments")
                 from .db import update_instance
                 from .models import TradingOrder
+                from .types import AssetClass
 
                 for order_id in created_order_ids:
                     order = get_instance(TradingOrder, order_id)
+                    # Option actions self-submit via submit_option_order, which already
+                    # creates the order's own Transaction. Such orders arrive here already
+                    # FILLED + linked to a transaction; skip them so we don't double-handle.
+                    if order and order.asset_class == AssetClass.OPTION:
+                        logger.debug(f"Skipping Phase 1.5 transaction creation for self-submitted option order {order_id}")
+                        continue
                     if order and not order.transaction_id:
                         try:
                             # Create transaction for the order using account interface private method
@@ -829,6 +840,12 @@ class TradeActionEvaluator:
                     "value": action_config.get('value'),
                     "instrument": instrument_name
                 }
+                # Option actions are distinguished by their strike/dte/sizing params (not
+                # reference_value/value), so include those when present to avoid two
+                # different option actions hashing to the same key and being deduped.
+                for opt_key in ('strike_method', 'strike_param', 'dte_min', 'dte_max', 'sizing'):
+                    if opt_key in action_config:
+                        action_hash_data[opt_key] = action_config.get(opt_key)
                 action_hash = hashlib.md5(json.dumps(action_hash_data, sort_keys=True).encode()).hexdigest()
                 action_unique_key = f"{action_type.value}_{action_hash}"
                 
@@ -933,7 +950,16 @@ class TradeActionEvaluator:
                 if target_val is None:
                     logger.warning(f"DECREASE_INSTRUMENT_SHARE action has no 'value' configured — target_percent will be None and the action will fail at execution")
                 kwargs['target_percent'] = target_val
-            
+            elif action_type in (ExpertActionType.BUY_CALL, ExpertActionType.OPEN_BULL_CALL_SPREAD,
+                                 ExpertActionType.SELL_COVERED_CALL):
+                # Option ENTRY actions: pull strike/dte/sizing/liquidity params from config.
+                # Only forward keys that are present so the action's own defaults apply otherwise.
+                # (CLOSE_OPTION takes none of these — it resolves the contract from the position.)
+                for opt_key in ('strike_method', 'strike_param', 'dte_min', 'dte_max',
+                                'sizing', 'min_open_interest', 'max_spread_pct'):
+                    if opt_key in action_config:
+                        kwargs[opt_key] = action_config.get(opt_key)
+
             # Create action using factory function, passing expert_recommendation
             action = create_action(
                 action_type=action_type,
@@ -971,6 +997,10 @@ class TradeActionEvaluator:
                 'AdjustStopLossAction': ExpertActionType.ADJUST_STOP_LOSS,
                 'IncreaseInstrumentShareAction': ExpertActionType.INCREASE_INSTRUMENT_SHARE,
                 'DecreaseInstrumentShareAction': ExpertActionType.DECREASE_INSTRUMENT_SHARE,
+                'BuyCallAction': ExpertActionType.BUY_CALL,
+                'OpenBullCallSpreadAction': ExpertActionType.OPEN_BULL_CALL_SPREAD,
+                'SellCoveredCallAction': ExpertActionType.SELL_COVERED_CALL,
+                'CloseOptionAction': ExpertActionType.CLOSE_OPTION,
             }
             
             class_name = action.__class__.__name__
@@ -1000,7 +1030,11 @@ class TradeActionEvaluator:
             priority_map = {
                 ExpertActionType.BUY: 1,
                 ExpertActionType.SELL: 1,
+                ExpertActionType.BUY_CALL: 1,
+                ExpertActionType.OPEN_BULL_CALL_SPREAD: 1,
+                ExpertActionType.SELL_COVERED_CALL: 1,
                 ExpertActionType.CLOSE: 2,
+                ExpertActionType.CLOSE_OPTION: 2,
                 ExpertActionType.ADJUST_TAKE_PROFIT: 3,
                 ExpertActionType.ADJUST_STOP_LOSS: 3,
             }
