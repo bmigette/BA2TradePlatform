@@ -763,3 +763,17 @@ class LLMUsageLog(SQLModel, table=True):
     
     # Error tracking
     error: str | None = Field(default=None, description="Error message if the call failed")
+
+
+class OptionIVSnapshot(SQLModel, table=True):
+    """Trailing ATM implied-volatility sample for an underlying.
+
+    Brokers (e.g. Alpaca) expose no IV history, so we persist our own series
+    and compute IV-rank as a percentile over the stored window.
+    """
+    __tablename__ = "option_iv_snapshot"
+    id: int | None = Field(default=None, primary_key=True)
+    account_id: int = Field(foreign_key="accountdefinition.id", ondelete="CASCADE", index=True)
+    underlying: str = Field(index=True)
+    atm_iv: float
+    recorded_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), index=True)

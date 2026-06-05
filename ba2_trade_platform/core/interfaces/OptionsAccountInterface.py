@@ -168,9 +168,47 @@ class OptionsAccountInterface(ABC):
         ...
 
     # --- IV rank (self-computed from stored ATM-IV history) ----------------
-    @abstractmethod
+    @staticmethod
+    def _iv_rank_from_series(series, current, min_samples: int = 20):
+        """Percentile (0-100) of `current` against `series`, or None.
+
+        None entries in `series` are ignored. Returns None when `current` is
+        None or fewer than `min_samples` valid samples exist. Counts strictly
+        below `current`.
+        """
+        vals = [v for v in series if v is not None]
+        if current is None or len(vals) < min_samples:
+            return None
+        below = sum(1 for v in vals if v < current)
+        return round(below / len(vals) * 100, 2)
+
+    def record_atm_iv(self, underlying: str, iv: Optional[float] = None) -> Optional[int]:
+        """Persist one ATM-IV sample for the trailing series. Returns the row id."""
+        from ...core.db import add_instance
+        from ...core.models import OptionIVSnapshot
+        if iv is None:
+            iv = self.get_atm_implied_volatility(underlying)
+        if iv is None:
+            return None
+        return add_instance(OptionIVSnapshot(account_id=self.id, underlying=underlying, atm_iv=iv))
+
     def get_iv_rank(self, underlying: str, lookback_days: int = 252,
                     min_samples: int = 20) -> Optional[float]:
         """IV percentile (0-100) over the stored trailing window, or None if
         insufficient history."""
-        ...
+        from datetime import datetime, timezone, timedelta
+        from sqlmodel import select
+        from ...core.db import get_db
+        from ...core.models import OptionIVSnapshot
+        cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+        with get_db() as session:
+            rows = session.exec(
+                select(OptionIVSnapshot).where(
+                    OptionIVSnapshot.account_id == self.id,
+                    OptionIVSnapshot.underlying == underlying,
+                    OptionIVSnapshot.recorded_at >= cutoff,
+                )
+            ).all()
+        series = [r.atm_iv for r in rows]
+        current = self.get_atm_implied_volatility(underlying)
+        return self._iv_rank_from_series(series, current, min_samples)

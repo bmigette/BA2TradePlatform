@@ -19,6 +19,7 @@ from ba2_trade_platform.core.models import (
     Ruleset, EventAction, RulesetEventActionLink, AppSetting,
     TradeActionResult, ActivityLog, Instrument, Position,
     AnalysisOutput, PersistedQueueTask, LLMUsageLog, SmartRiskManagerJob,
+    OptionIVSnapshot,
 )
 from ba2_trade_platform.core.types import (
     OrderStatus, OrderDirection, OrderType, OrderOpenType,
@@ -253,9 +254,6 @@ class MockAccount(AccountInterface, OptionsAccountInterface):
                         strike=position.strike, expiry=position.expiry, underlying=position.underlying)
         return self.submit_option_order([leg], int(position.quantity), order_type, limit_price,
                                         option_strategy="close")
-
-    def get_iv_rank(self, underlying, lookback_days=252, min_samples=20):
-        return 50.0  # deterministic stub for tests (Task 11 makes this real)
 
 
 # ---------------------------------------------------------------------------

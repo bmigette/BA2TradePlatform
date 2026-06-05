@@ -4881,7 +4881,3 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         return self.submit_option_order(
             [leg], int(position.quantity), order_type, limit_price, option_strategy="close")
 
-    def get_iv_rank(self, underlying, lookback_days=252, min_samples=20):
-        # TODO(Task 11): implement IV rank from stored ATM-IV history.
-        raise NotImplementedError("Implemented in Task 11")
-
