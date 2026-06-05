@@ -33,6 +33,9 @@ def upgrade():
     op.add_column("tradingorder", sa.Column("position_intent", sa.String(), nullable=True))
     op.add_column("tradingorder", sa.Column("option_strategy", sa.String(), nullable=True))
     op.execute("UPDATE tradingorder SET asset_class = 'equity' WHERE asset_class IS NULL")
+    with op.batch_alter_table("tradingorder") as batch_op:
+        batch_op.alter_column("asset_class", existing_type=sa.String(),
+                              nullable=False, server_default="equity")
     op.create_index("ix_tradingorder_contract_symbol", "tradingorder", ["contract_symbol"])
     op.create_index("ix_tradingorder_underlying_symbol", "tradingorder", ["underlying_symbol"])
     op.create_index("ix_tradingorder_asset_class", "tradingorder", ["asset_class"])
