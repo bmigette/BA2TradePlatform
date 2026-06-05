@@ -505,6 +505,17 @@ Final Confidence = Base Confidence + Avg Boost = {base_confidence:.1f}% + {price
                 risk_level=RiskLevel.MEDIUM,  # Always medium risk
                 time_horizon=TimeHorizon.MEDIUM_TERM,  # Always medium term
                 market_analysis_id=market_analysis_id,
+                # Persist analyst price targets so downstream consumers (e.g. the
+                # option `consensus_target` strike-selection method) can read the
+                # true consensus target. Nested under the expert name by convention.
+                data={
+                    "FMPRating": {
+                        "target_consensus": recommendation_data['target_consensus'],
+                        "target_high": recommendation_data['target_high'],
+                        "target_low": recommendation_data['target_low'],
+                        "target_median": recommendation_data['target_median'],
+                    }
+                },
                 created_at=datetime.now(timezone.utc)
             )
             
