@@ -304,8 +304,8 @@ class Transaction(SQLModel, table=True):
                     price = order.open_price
                     
                     if price:
-                        # Calculate value: quantity × price
-                        equity = abs(order.filled_qty) * price
+                        # Calculate value: quantity × price × multiplier (options use 100)
+                        equity = abs(order.filled_qty) * price * (order.multiplier or 1)
                         total_equity += equity
                         # logger.debug(f"  Order {order.id}: filled_qty={order.filled_qty}, price={price}, equity=${equity:.2f}")
                     # else:
@@ -331,9 +331,10 @@ class Transaction(SQLModel, table=True):
         from .db import get_db
         from sqlmodel import Session, select
         from ..logger import logger
-        
+        from .types import OrderType, AssetClass
+
         total_equity = 0.0
-        
+
         # Get market price if account interface provided
         market_price = None
         if account_interface:
@@ -342,50 +343,53 @@ class Transaction(SQLModel, table=True):
                 # logger.debug(f"Transaction {self.id}.get_pending_open_equity(): Market price for {self.symbol} = ${market_price}")
             except Exception as e:
                 logger.debug(f"Transaction {self.id}.get_pending_open_equity(): Could not get market price: {e}")
-        
-        # If we don't have market price, we can't calculate pending equity accurately
-        if not market_price:
-            # logger.debug(f"Transaction {self.id}.get_pending_open_equity(): No market price available, returning 0")
-            return 0.0
-        
+
         with Session(get_db().bind) as session:
             # Get all orders for this transaction
             statement = select(TradingOrder).where(
                 TradingOrder.transaction_id == self.id
             )
             orders = session.exec(statement).all()
-            
+
             # logger.debug(f"Transaction {self.id}.get_pending_open_equity(): Found {len(orders)} orders")
-            
+
             for order in orders:
                 # Only count unfilled orders (excluding TP/SL orders)
                 if order.status in OrderStatus.get_unfilled_statuses():
-                    # Skip dependent orders (TP/SL orders)
+                    # Skip dependent orders (TP/SL legs)
                     if order.depends_on_order is not None:
                         # logger.debug(f"  Order {order.id}: Skipped (dependent order)")
                         continue
-                    
-                    # Skip exit orders (TP/SL) - these don't use buying power
-                    from .types import OrderType
-                    if order.order_type in [OrderType.SELL_LIMIT, OrderType.BUY_LIMIT, OrderType.OCO, OrderType.SELL_STOP, OrderType.BUY_STOP]:
+
+                    is_option = order.asset_class == AssetClass.OPTION
+                    # Equity TP/SL exit orders don't use buying power; option limit
+                    # orders ARE entries, so they must NOT be skipped.
+                    if (not is_option) and order.order_type in [
+                        OrderType.SELL_LIMIT, OrderType.BUY_LIMIT, OrderType.OCO,
+                        OrderType.SELL_STOP, OrderType.BUY_STOP,
+                    ]:
                         # logger.debug(f"  Order {order.id}: Skipped (exit order, type={order.order_type})")
                         continue
-                    
+
                     # Calculate remaining quantity
                     remaining_qty = order.quantity
                     if order.filled_qty:
                         remaining_qty -= order.filled_qty
-                    
+
                     if remaining_qty > 0:
-                        # Use market price for pending orders
-                        equity = abs(remaining_qty) * market_price
-                        total_equity += equity
-                        # logger.debug(f"  Order {order.id}: remaining_qty={remaining_qty}, market_price=${market_price}, equity=${equity:.2f}")
+                        if is_option:
+                            # Option premium risk = premium × multiplier × contracts.
+                            premium = order.limit_price or order.open_price
+                            if premium:
+                                total_equity += abs(remaining_qty) * premium * (order.multiplier or 100)
+                        elif market_price:
+                            # Equity uses underlying market price for pending orders.
+                            total_equity += abs(remaining_qty) * market_price
                 # else:
                 #     logger.debug(f"  Order {order.id}: Skipped (status={order.status})")
-            
+
             # logger.debug(f"Transaction {self.id}.get_pending_open_equity(): Total = ${total_equity:.2f}")
-        
+
         return total_equity
 
 
