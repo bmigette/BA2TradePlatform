@@ -2,8 +2,8 @@ from sqlmodel import Field, Session, SQLModel, Column, Relationship
 from sqlalchemy import String, Float, JSON, UniqueConstraint, Table, Integer, ForeignKey
 from sqlalchemy.orm import relationship
 from typing import Optional, Dict, Any, List
-from .types import InstrumentType, MarketAnalysisStatus, OrderType, OrderRecommendation, OrderStatus, OrderDirection, OrderOpenType, ExpertEventRuleType, AnalysisUseCase, RiskLevel, TimeHorizon, TransactionStatus, ActivityLogSeverity, ActivityLogType
-from datetime import datetime as DateTime, timezone
+from .types import InstrumentType, MarketAnalysisStatus, OrderType, OrderRecommendation, OrderStatus, OrderDirection, OrderOpenType, ExpertEventRuleType, AnalysisUseCase, RiskLevel, TimeHorizon, TransactionStatus, ActivityLogSeverity, ActivityLogType, AssetClass, OptionRight
+from datetime import datetime as DateTime, timezone, date
 
 # Association table for many-to-many relationship between Ruleset and EventAction
 class RulesetEventActionLink(SQLModel, table=True):
@@ -463,6 +463,17 @@ class TradingOrder(SQLModel, table=True):
             "foreign_keys": "[TradingOrder.parent_order_id]"
         }
     )
+
+    # --- Options fields (nullable; equity orders leave these unset) ---
+    asset_class: AssetClass = Field(default=AssetClass.EQUITY, index=True, description="equity | option")
+    contract_symbol: str | None = Field(default=None, index=True, description="OCC option contract symbol (single-leg)")
+    option_type: OptionRight | None = Field(default=None, description="call | put for option legs")
+    strike: float | None = Field(default=None, description="Option strike price")
+    expiry: date | None = Field(default=None, description="Option expiration date")
+    underlying_symbol: str | None = Field(default=None, index=True, description="Underlying equity symbol for options")
+    multiplier: int | None = Field(default=None, description="Contract multiplier (100 for standard equity options)")
+    position_intent: str | None = Field(default=None, description="Alpaca position intent: buy_to_open/sell_to_open/buy_to_close/sell_to_close")
+    option_strategy: str | None = Field(default=None, description="Strategy tag on parent order: long_call/bull_call_spread/covered_call/...")
 
     def as_string(self) -> str:
         return f"Order(id={self.id}, symbol={self.symbol}, quantity={self.quantity}, side={self.side}, type={self.order_type}, status={self.status})"
