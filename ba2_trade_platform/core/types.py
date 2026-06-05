@@ -220,6 +220,15 @@ class InstrumentType(str, Enum):
     ETF = "etf"
     CRYPTO = "crypto"
 
+class AssetClass(str, Enum):
+    EQUITY = "equity"
+    OPTION = "option"
+
+
+class OptionRight(str, Enum):
+    CALL = "call"
+    PUT = "put"
+
 class OrderType(str, Enum):
     MARKET = "market"
     BUY_LIMIT = "buy_limit"
