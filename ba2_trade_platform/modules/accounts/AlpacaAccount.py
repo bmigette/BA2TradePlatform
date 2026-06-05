@@ -149,6 +149,9 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 "valid_values": ["delayed_sip", "sip", "iex", "otc"],
                 "tooltip": "delayed_sip = 15-min delayed (free tier). sip = real-time consolidated (paid). iex = real-time IEX (paid). otc = OTC data.",
             },
+            "options_feed": {"type": "str", "required": False, "default": "indicative",
+                             "valid_values": ["indicative", "opra"],
+                             "description": "Options market data feed (indicative = free fallback; opra requires subscription)"},
         }
     
     @staticmethod
@@ -4619,7 +4622,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         """Return the near-ATM implied volatility for the underlying (0-1), picking
         the contract whose strike is nearest the current spot price from a
         near-dated chain. Returns None if no spot or empty chain."""
-        spot = self.get_instrument_current_price(underlying)
+        spot = self.get_instrument_current_price(underlying, 'mid')
         if spot is None:
             logger.warning(f"get_atm_implied_volatility: no spot price for {underlying}")
             return None
