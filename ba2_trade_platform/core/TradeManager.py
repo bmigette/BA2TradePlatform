@@ -117,7 +117,11 @@ class TradeManager:
                     if hasattr(account, 'refresh_transactions'):
                         account.refresh_transactions()
                         self.logger.debug(f"Refreshed transactions for {account_def.name}")
-                        
+
+                    # Reconcile option assignment/exercise/expiry events from the
+                    # broker (no-op for non-options accounts). Idempotent.
+                    self._reconcile_account_option_activities(account)
+
                 except Exception as e:
                     self.logger.error(f"Error refreshing account {account_def.name} (ID: {account_def.id}): {e}", exc_info=True)
                     continue
@@ -140,6 +144,45 @@ class TradeManager:
         finally:
             _REFRESH_LOCK.release()
     
+    def _reconcile_account_option_activities(self, account):
+        """Reconcile broker option lifecycle events (assignment / exercise / expiry)
+        against the local Transaction ledger for one account.
+
+        Called once per account during refresh, after broker order/position state has
+        been re-synced. No-op for accounts that are not options-capable or do not
+        expose the reconcile API. The underlying reconcile is idempotent (deduped by
+        OptionActivity rows), so re-running each refresh is safe. Never raises — a
+        broker hiccup here must not break the rest of the refresh cycle.
+        """
+        from .interfaces.OptionsAccountInterface import OptionsAccountInterface
+
+        if not isinstance(account, OptionsAccountInterface):
+            return
+        if not (hasattr(account, "get_option_activities")
+                and hasattr(account, "reconcile_option_assignments")):
+            return
+
+        try:
+            from datetime import datetime, timezone, timedelta
+            # Bounded lookback covers weekend expiry/assignment gaps; idempotency
+            # makes the overlapping windows across refreshes harmless.
+            after = datetime.now(timezone.utc) - timedelta(days=7)
+            activities = account.get_option_activities(after=after)
+            if not activities:
+                return
+            results = account.reconcile_option_assignments(activities)
+            applied = [r for r in (results or [])
+                       if not str(r.get("result", "")).startswith(("already_processed", "skipped"))]
+            self.logger.info(
+                f"[Account {account.id}] Option reconciliation: {len(activities)} activity(ies), "
+                f"{len(applied)} newly applied"
+            )
+        except Exception as e:
+            self.logger.error(
+                f"[Account {getattr(account, 'id', '?')}] Option reconciliation failed: {e}",
+                exc_info=True
+            )
+
     def _check_all_washtrade_locked_orders(self):
         """Re-submit WASHTRADE_LOCKED orders whose symbol no longer has an opposite-side
         order working at the broker.
