@@ -1,4 +1,8 @@
-"""Pure option-contract selection (no DB/network/broker). Operates on OptionContract lists."""
+"""Pure option-contract selection (no DB/network/broker). Operates on OptionContract lists.
+
+Note: the `delta` and `percent_otm` methods require a non-None `strike_param`; callers must
+validate (a None param raises, by design, to surface misconfigured rulesets).
+"""
 from datetime import date
 from typing import List, Optional, Tuple
 
@@ -37,6 +41,7 @@ def _target_strike(method, strike_param, spot, target_price, option_type) -> Opt
             return spot * (1 + strike_param / 100.0)
         return spot * (1 - strike_param / 100.0)
     if method == "consensus_target":
+        # TODO(P2 Task 5): optionally prefer strike <= target for calls / >= target for puts (currently nearest-absolute).
         return target_price
     return None
 
@@ -55,11 +60,11 @@ def _pick_by(method, cands, strike_param, spot, target_price, option_type):
         usable = [c for c in cands if c.delta is not None]
         if not usable:
             return None
-        return min(usable, key=lambda c: abs(abs(c.delta) - abs(strike_param)))
+        return min(usable, key=lambda c: (abs(abs(c.delta) - abs(strike_param)), c.strike))
     ts = _target_strike(method, strike_param, spot, target_price, option_type)
     if ts is None:
         return None
-    return min(cands, key=lambda c: abs(c.strike - ts))
+    return min(cands, key=lambda c: (abs(c.strike - ts), c.strike))
 
 
 def select_single(chain, *, method, strike_param, spot, option_type, dte_min, dte_max, today,
@@ -84,7 +89,7 @@ def select_vertical_spread(chain, *, method, long_param, short_param, spot, opti
         if len(legs) < 2:
             continue
         long_leg = _pick_by(method, legs, long_param, spot, target_price, option_type)
-        short_leg = _pick_by(method, [c for c in legs if c.strike != (long_leg.strike if long_leg else None)],
+        short_leg = _pick_by(method, [c for c in legs if c is not long_leg],
                              short_param, spot, target_price, option_type)
         if not long_leg or not short_leg or long_leg.strike == short_leg.strike:
             continue

@@ -92,3 +92,59 @@ def test_select_vertical_spread_none_when_no_distinct_legs():
                                      spot=100, option_type=OptionRight.CALL,
                                      dte_min=10, dte_max=90, today=TODAY)
     assert res is None
+
+
+def test_select_vertical_spread_put_ordering():
+    # bear/put debit spread: long HIGHER strike, short LOWER strike, both puts, same expiry
+    chain = [_c(95, right=OptionRight.PUT, delta=-0.30),
+             _c(100, right=OptionRight.PUT, delta=-0.45),
+             _c(105, right=OptionRight.PUT, delta=-0.60)]
+    res = sel.select_vertical_spread(chain, method="delta", long_param=0.45, short_param=0.30,
+                                     spot=100, option_type=OptionRight.PUT,
+                                     dte_min=10, dte_max=90, today=TODAY)
+    assert res is not None
+    long_leg, short_leg = res
+    assert long_leg.strike == 100.0 and short_leg.strike == 95.0   # long > short for puts
+    assert long_leg.expiry == short_leg.expiry
+
+
+def test_select_vertical_spread_picks_earliest_expiry_with_two_strikes():
+    # Early expiry has only ONE strike (can't form a spread); later expiry has two -> use later.
+    e_early = date(2026, 1, 20)
+    e_late = date(2026, 2, 20)
+    chain = [_c(100, expiry=e_early, delta=0.50),                  # lone strike, early
+             _c(105, expiry=e_late, delta=0.45),
+             _c(110, expiry=e_late, delta=0.25)]
+    res = sel.select_vertical_spread(chain, method="delta", long_param=0.45, short_param=0.25,
+                                     spot=100, option_type=OptionRight.CALL,
+                                     dte_min=5, dte_max=90, today=TODAY)
+    assert res is not None
+    long_leg, short_leg = res
+    assert long_leg.expiry == e_late and short_leg.expiry == e_late
+    assert long_leg.strike == 105.0 and short_leg.strike == 110.0
+
+
+def test_select_vertical_spread_duplicate_strike_not_substituted():
+    # Two distinct contracts at strike 105; ensure short isn't silently forced to a far strike.
+    e = date(2026, 2, 20)
+    chain = [_c(100, expiry=e, delta=0.30),
+             _c(105, expiry=e, delta=0.45),   # candidate A @105
+             _c(105, expiry=e, delta=0.55),   # candidate B @105 (duplicate strike)
+             _c(110, expiry=e, delta=0.25)]
+    res = sel.select_vertical_spread(chain, method="delta", long_param=0.45, short_param=0.25,
+                                     spot=100, option_type=OptionRight.CALL,
+                                     dte_min=5, dte_max=90, today=TODAY)
+    assert res is not None
+    long_leg, short_leg = res
+    # long ~0.45 -> strike 105; short ~0.25 -> strike 110 (NOT forced down to 100)
+    assert long_leg.strike == 105.0 and short_leg.strike == 110.0
+
+
+def test_pick_is_deterministic_under_input_reorder():
+    a = _c(95, delta=0.50)
+    b = _c(105, delta=0.50)   # equidistant in delta to target 0.50
+    p1 = sel.select_single([a, b], method="delta", strike_param=0.50, spot=100,
+                           option_type=OptionRight.CALL, dte_min=10, dte_max=90, today=TODAY)
+    p2 = sel.select_single([b, a], method="delta", strike_param=0.50, spot=100,
+                           option_type=OptionRight.CALL, dte_min=10, dte_max=90, today=TODAY)
+    assert p1.strike == p2.strike == 95.0   # lower strike wins the tie, regardless of order
