@@ -1555,12 +1555,12 @@ class _OptionEntryAction(TradeAction):
         instance_id = self.expert_recommendation.instance_id if self.expert_recommendation else None
         if instance_id:
             try:
-                from .utils import get_expert_instance_from_id
-                expert = get_expert_instance_from_id(instance_id)
-                if expert is not None:
-                    pct = getattr(expert, "virtual_equity_pct", None) or 100.0
+                from .models import ExpertInstance
+                ei = get_instance(ExpertInstance, instance_id)
+                if ei is not None and ei.virtual_equity_pct is not None:
+                    pct = ei.virtual_equity_pct
             except Exception as e:
-                logger.debug(f"_virtual_equity: could not resolve expert {instance_id}: {e}")
+                logger.debug(f"_virtual_equity: could not load ExpertInstance {instance_id}: {e}")
         return balance * (pct / 100.0)
 
     def _size(self, premium: float, sizing_pct: Optional[float]) -> int:

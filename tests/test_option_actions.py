@@ -132,6 +132,26 @@ def test_sell_covered_call_requires_long(monkeypatch, mock_account, mock_expert_
     assert cap["limit_price"] == 2.0                         # sell at BID
 
 
+def test_buy_call_sizing_respects_virtual_equity_pct(monkeypatch, mock_account_def):
+    from tests.factories import create_expert_instance, create_recommendation
+    from tests.conftest import MockAccount
+    ei = create_expert_instance(account_id=mock_account_def.id, expert="MockExpert",
+                                virtual_equity_pct=50.0)
+    rec = create_recommendation(instance_id=ei.id, symbol="AAPL")
+    chain = [_call(150, delta=0.50, bid=4.9, ask=5.1, oi=2000)]
+    acct = MockAccount(mock_account_def.id)
+    monkeypatch.setattr(acct, "get_option_chain", lambda *a, **k: chain, raising=False)
+    cap = _capture_submit(monkeypatch, acct)
+    action = create_action(action_type=ExpertActionType.BUY_CALL, instrument_name="AAPL",
+        account=acct, order_recommendation=OrderRecommendation.BUY, existing_order=None,
+        expert_recommendation=rec, strike_method="delta", strike_param=0.50,
+        dte_min=20, dte_max=45, sizing=2.0, min_open_interest=100, max_spread_pct=20.0)
+    res = action.execute()
+    assert res["success"] is True
+    # budget = 100000 * 50% * 2% = 1000; qty = floor(1000/(5.1*100)) = 1  (vs 3 at 100%)
+    assert cap["quantity"] == 1
+
+
 def test_close_option_calls_close(monkeypatch, mock_account, mock_expert_instance, sample_recommendation):
     # Seed an OPEN long call option order on a transaction; CloseOption should close it.
     txn_id = add_instance(Transaction(symbol="AAPL", quantity=2, side=OrderDirection.BUY,
