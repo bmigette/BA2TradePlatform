@@ -201,6 +201,7 @@ class MockAccount(AccountInterface, OptionsAccountInterface):
     def get_option_chain(self, underlying, expiry_min, expiry_max, option_type=None,
                          strike_min=None, strike_max=None):
         from ba2_trade_platform.core.types import OptionRight
+        # NOTE: expiry window not modeled; every contract uses expiry_max.
         expiry = expiry_max
         spot = self._prices.get(underlying, 100.0)
         rights = [option_type] if option_type else [OptionRight.CALL, OptionRight.PUT]
@@ -216,6 +217,7 @@ class MockAccount(AccountInterface, OptionsAccountInterface):
 
     def get_option_quote(self, contract_symbol):
         from ba2_trade_platform.core.option_types import OptionQuote
+        # NOTE: canned quote; intentionally not derived from _mk_contract pricing.
         return OptionQuote(symbol=contract_symbol, bid=2.0, ask=2.2, last=2.1,
                            implied_volatility=0.30, delta=0.5, gamma=0.02, theta=-0.03, vega=0.1)
 
@@ -227,14 +229,17 @@ class MockAccount(AccountInterface, OptionsAccountInterface):
 
     def _submit_option_order_impl(self, trading_order, legs, leg_orders=None):
         from ba2_trade_platform.core.types import OrderStatus
+        from ba2_trade_platform.core.db import update_instance
         trading_order.status = OrderStatus.FILLED
         trading_order.filled_qty = trading_order.quantity
         trading_order.broker_order_id = f"mock-opt-{trading_order.id}"
+        update_instance(trading_order)
         if leg_orders:
             for i, lo in enumerate(leg_orders):
                 lo.status = OrderStatus.FILLED
                 lo.filled_qty = lo.quantity
                 lo.broker_order_id = f"mock-opt-{trading_order.id}-leg{i}"
+                update_instance(lo)
         self._submitted_option_orders.append(trading_order)
         return trading_order
 
