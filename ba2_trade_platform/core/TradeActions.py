@@ -5,14 +5,21 @@ This module provides base classes and implementations for executing various trad
 based on expert recommendations and market conditions.
 """
 
+import math
 from abc import ABC, abstractmethod
-from typing import Optional, Dict, Any, List
-from datetime import datetime, timezone
+from typing import Optional, Dict, Any, List, Tuple
+from datetime import datetime, timezone, date, timedelta
 
 from .interfaces import AccountInterface
+from .interfaces.OptionsAccountInterface import OptionsAccountInterface
 from .models import TradingOrder, ExpertRecommendation, TradeActionResult
-from .types import OrderRecommendation, ExpertActionType, OrderDirection, OrderStatus
+from .types import (
+    OrderRecommendation, ExpertActionType, OrderDirection, OrderStatus,
+    OptionRight, AssetClass, TransactionStatus,
+)
 from .db import get_db, add_instance, update_instance, get_instance
+from .option_types import OptionContract, OptionLeg, OptionPosition
+from .option_selector import select_single, select_vertical_spread
 from ..logger import logger
 
 
@@ -1476,6 +1483,426 @@ class DecreaseInstrumentShareAction(TradeAction):
 
 
 # Factory function to create actions based on action type
+class _OptionEntryAction(TradeAction):
+    """Shared base for option-entry actions (BuyCall / BullCallSpread / CoveredCall).
+
+    Provides capability guard, chain fetch, contract selection, pct_equity
+    sizing, and the submit_to_broker gate. Concrete subclasses implement
+    `_build_and_submit()` which selects contract(s), builds legs, computes the
+    limit premium (buy@ask / sell@bid), sizes the order, and submits.
+    """
+
+    OPTION_TYPE: OptionRight = OptionRight.CALL
+
+    def __init__(self, instrument_name: str, account: AccountInterface,
+                 order_recommendation: OrderRecommendation,
+                 existing_order: Optional[TradingOrder] = None,
+                 expert_recommendation: Optional[ExpertRecommendation] = None,
+                 strike_method: Optional[str] = None,
+                 strike_param: Any = None,
+                 dte_min: Optional[int] = None,
+                 dte_max: Optional[int] = None,
+                 sizing: Optional[float] = None,
+                 min_open_interest: Optional[int] = None,
+                 max_spread_pct: Optional[float] = None,
+                 **kwargs):
+        super().__init__(instrument_name, account, order_recommendation,
+                         existing_order, expert_recommendation)
+        self.strike_method = strike_method
+        self.strike_param = strike_param
+        self.dte_min = dte_min
+        self.dte_max = dte_max
+        self.sizing = sizing
+        self.min_open_interest = min_open_interest
+        self.max_spread_pct = max_spread_pct
+
+    # --- helpers ----------------------------------------------------------
+    def _action_type_value(self) -> str:
+        raise NotImplementedError
+
+    def _supports_options(self) -> bool:
+        return isinstance(self.account, OptionsAccountInterface)
+
+    def _today(self) -> date:
+        return date.today()
+
+    def _spot(self) -> Optional[float]:
+        """Underlying mid price; fall back to default current price."""
+        try:
+            price = self.account.get_instrument_current_price(self.instrument_name, 'mid')
+            if price is not None:
+                return price
+        except TypeError:
+            # Mock/account without price_type support
+            pass
+        except Exception as e:
+            logger.debug(f"_spot mid lookup failed for {self.instrument_name}: {e}")
+        return self.get_current_price()
+
+    def _chain(self, option_type: OptionRight) -> List[OptionContract]:
+        today = self._today()
+        expiry_min = today + timedelta(days=self.dte_min) if self.dte_min is not None else today
+        expiry_max = today + timedelta(days=self.dte_max) if self.dte_max is not None else today
+        return self.account.get_option_chain(
+            self.instrument_name, expiry_min, expiry_max, option_type)
+
+    def _virtual_equity(self) -> Optional[float]:
+        """balance * virtual_equity_pct/100 (defaults to balance when unknown)."""
+        balance = self.account.get_balance()
+        if balance is None:
+            return None
+        pct = 100.0
+        instance_id = self.expert_recommendation.instance_id if self.expert_recommendation else None
+        if instance_id:
+            try:
+                from .utils import get_expert_instance_from_id
+                expert = get_expert_instance_from_id(instance_id)
+                if expert is not None:
+                    pct = getattr(expert, "virtual_equity_pct", None) or 100.0
+            except Exception as e:
+                logger.debug(f"_virtual_equity: could not resolve expert {instance_id}: {e}")
+        return balance * (pct / 100.0)
+
+    def _size(self, premium: float, sizing_pct: Optional[float]) -> int:
+        """floor(virtual_equity * sizing% / (premium * 100)); 0 if not sizeable."""
+        if premium is None or premium <= 0 or not sizing_pct or sizing_pct <= 0:
+            return 0
+        equity = self._virtual_equity()
+        if equity is None or equity <= 0:
+            return 0
+        budget = equity * (sizing_pct / 100.0)
+        return int(math.floor(budget / (premium * 100.0)))
+
+    def _consensus_target(self) -> Optional[float]:
+        """Resolve a target price for consensus_target strike selection."""
+        rec = self.expert_recommendation
+        if rec is None:
+            return None
+        data = rec.data or {}
+        fmp = data.get("FMPRating") if isinstance(data, dict) else None
+        if isinstance(fmp, dict) and fmp.get("target_consensus") is not None:
+            return fmp["target_consensus"]
+        price = rec.price_at_date
+        epp = rec.expected_profit_percent
+        if price is None or epp is None:
+            return None
+        action = rec.recommended_action
+        if action in (OrderRecommendation.BUY, OrderRecommendation.OVERWEIGHT):
+            return price * (1 + epp / 100.0)
+        if action in (OrderRecommendation.SELL, OrderRecommendation.UNDERWEIGHT):
+            return price * (1 - epp / 100.0)
+        return None
+
+    def _result(self, success: bool, message: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        return self.create_and_save_action_result(
+            action_type=self._action_type_value(), success=success, message=message, data=data or {})
+
+    def _submit_option_order(self, legs: List[OptionLeg], quantity: int,
+                             limit_price: float, option_strategy: str) -> Dict[str, Any]:
+        """Submit (or defer) the assembled option order, honoring submit_to_broker."""
+        expert_rec_id = self.expert_recommendation.id if self.expert_recommendation else None
+        data = {
+            "option_strategy": option_strategy,
+            "quantity": quantity,
+            "limit_price": limit_price,
+            "legs": [{"contract_symbol": leg.contract_symbol, "side": leg.side.value,
+                      "position_intent": leg.position_intent, "strike": leg.strike}
+                     for leg in legs],
+        }
+        if not self.submit_to_broker:
+            logger.info(f"_OptionEntryAction: submit disabled for {self.instrument_name} "
+                        f"{option_strategy} - recording informational result")
+            return self._result(True,
+                                 f"{option_strategy} for {self.instrument_name} (manual review, not submitted)",
+                                 data)
+        order = self.account.submit_option_order(
+            legs=legs, quantity=quantity, order_type="limit", limit_price=limit_price,
+            option_strategy=option_strategy, expert_recommendation_id=expert_rec_id)
+        if order is None:
+            return self._result(False, f"Failed to submit {option_strategy} for {self.instrument_name}", data)
+        order_id = getattr(order, "id", None)
+        data["order_id"] = order_id
+        return self._result(True, f"Submitted {option_strategy} for {self.instrument_name}", data)
+
+    def _build_and_submit(self) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    def execute(self) -> "TradeActionResult":
+        try:
+            if not self._supports_options():
+                return self._result(False, f"Account does not support options for {self.instrument_name}")
+            return self._build_and_submit()
+        except Exception as e:
+            logger.error(f"Error executing {self._action_type_value()} for {self.instrument_name}: {e}",
+                         exc_info=True)
+            return self._result(False, f"Error executing option action: {str(e)}")
+
+
+class BuyCallAction(_OptionEntryAction):
+    """Buy a single long call (debit) selected from the chain."""
+
+    OPTION_TYPE = OptionRight.CALL
+
+    def _action_type_value(self) -> str:
+        return ExpertActionType.BUY_CALL.value
+
+    def _build_and_submit(self) -> Dict[str, Any]:
+        chain = self._chain(self.OPTION_TYPE)
+        if not chain:
+            return self._result(False, f"Empty option chain for {self.instrument_name}")
+        spot = self._spot()
+        contract = select_single(
+            chain, method=self.strike_method, strike_param=self.strike_param, spot=spot,
+            option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
+            today=self._today(), target_price=self._consensus_target(),
+            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct)
+        if contract is None:
+            return self._result(False, f"No liquid call contract for {self.instrument_name}")
+        if contract.ask is None or contract.ask <= 0:
+            return self._result(False, f"No ask price for {contract.symbol}")
+        limit_price = contract.ask                          # buy at ASK
+        quantity = self._size(limit_price, self.sizing)
+        if quantity < 1:
+            return self._result(False,
+                                f"Insufficient budget to size long_call for {self.instrument_name} "
+                                f"(premium={limit_price})")
+        leg = OptionLeg(contract_symbol=contract.symbol, side=OrderDirection.BUY,
+                        position_intent="buy_to_open", option_type=self.OPTION_TYPE,
+                        strike=contract.strike, expiry=contract.expiry, underlying=contract.underlying)
+        return self._submit_option_order([leg], quantity, limit_price, "long_call")
+
+    def get_description(self) -> str:
+        return f"Buy long call on {self.instrument_name}"
+
+
+class OpenBullCallSpreadAction(_OptionEntryAction):
+    """Open a bull call (debit) vertical spread: buy lower strike, sell higher strike."""
+
+    OPTION_TYPE = OptionRight.CALL
+
+    def _action_type_value(self) -> str:
+        return ExpertActionType.OPEN_BULL_CALL_SPREAD.value
+
+    def _build_and_submit(self) -> Dict[str, Any]:
+        chain = self._chain(self.OPTION_TYPE)
+        if not chain:
+            return self._result(False, f"Empty option chain for {self.instrument_name}")
+        spot = self._spot()
+        long_param, short_param = self._spread_params()
+        pair = select_vertical_spread(
+            chain, method=self.strike_method, long_param=long_param, short_param=short_param,
+            spot=spot, option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
+            today=self._today(), target_price=self._consensus_target(),
+            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct)
+        if pair is None:
+            return self._result(False, f"No liquid bull call spread for {self.instrument_name}")
+        long_c, short_c = pair
+        if long_c.ask is None or short_c.bid is None:
+            return self._result(False, f"Missing quote for spread legs on {self.instrument_name}")
+        net_debit = round(long_c.ask - short_c.bid, 4)      # buy long@ask, sell short@bid
+        if net_debit <= 0:
+            return self._result(False,
+                                f"Non-positive net debit ({net_debit}) for {self.instrument_name} spread")
+        quantity = self._size(net_debit, self.sizing)
+        if quantity < 1:
+            return self._result(False,
+                                f"Insufficient budget to size bull_call_spread for {self.instrument_name} "
+                                f"(net_debit={net_debit})")
+        long_leg = OptionLeg(contract_symbol=long_c.symbol, side=OrderDirection.BUY,
+                             position_intent="buy_to_open", option_type=self.OPTION_TYPE,
+                             strike=long_c.strike, expiry=long_c.expiry, underlying=long_c.underlying)
+        short_leg = OptionLeg(contract_symbol=short_c.symbol, side=OrderDirection.SELL,
+                              position_intent="sell_to_open", option_type=self.OPTION_TYPE,
+                              strike=short_c.strike, expiry=short_c.expiry, underlying=short_c.underlying)
+        return self._submit_option_order([long_leg, short_leg], quantity, net_debit, "bull_call_spread")
+
+    def _spread_params(self) -> Tuple[Any, Any]:
+        """Split strike_param into (long, short) params for the two legs."""
+        sp = self.strike_param
+        if isinstance(sp, dict):
+            return sp.get("long"), sp.get("short")
+        if isinstance(sp, (list, tuple)) and len(sp) == 2:
+            return sp[0], sp[1]
+        # Single value: use the same param for both legs (selector dedups by strike).
+        return sp, sp
+
+    def get_description(self) -> str:
+        return f"Open bull call spread on {self.instrument_name}"
+
+
+class SellCoveredCallAction(_OptionEntryAction):
+    """Sell a covered call against a held equity long (one contract per 100 shares)."""
+
+    OPTION_TYPE = OptionRight.CALL
+
+    def _action_type_value(self) -> str:
+        return ExpertActionType.SELL_COVERED_CALL.value
+
+    def _held_equity_shares(self) -> float:
+        """Sum filled equity BUY quantity across this expert's OPENED transactions for the symbol."""
+        instance_id = self.expert_recommendation.instance_id if self.expert_recommendation else None
+        if not instance_id:
+            return 0.0
+        from sqlmodel import select, Session
+        from .models import Transaction
+        total = 0.0
+        with Session(get_db().bind) as session:
+            txns = session.exec(
+                select(Transaction).where(
+                    Transaction.symbol == self.instrument_name,
+                    Transaction.expert_id == instance_id,
+                    Transaction.status == TransactionStatus.OPENED,
+                )
+            ).all()
+            txn_ids = [t.id for t in txns]
+            if not txn_ids:
+                return 0.0
+            orders = session.exec(
+                select(TradingOrder).where(TradingOrder.transaction_id.in_(txn_ids))
+            ).all()
+            for o in orders:
+                if o.asset_class == AssetClass.OPTION:
+                    continue
+                if o.status not in OrderStatus.get_executed_statuses():
+                    continue
+                qty = o.filled_qty
+                if not qty:
+                    continue
+                if o.side == OrderDirection.BUY:
+                    total += abs(float(qty))
+                else:
+                    total -= abs(float(qty))
+        return total
+
+    def _build_and_submit(self) -> Dict[str, Any]:
+        held = self._held_equity_shares()
+        quantity = int(math.floor(held / 100.0)) if held > 0 else 0
+        if quantity < 1:
+            return self._result(False,
+                                f"No held equity long to cover a call on {self.instrument_name} "
+                                f"(shares={held})")
+        chain = self._chain(self.OPTION_TYPE)
+        if not chain:
+            return self._result(False, f"Empty option chain for {self.instrument_name}")
+        spot = self._spot()
+        contract = select_single(
+            chain, method=self.strike_method, strike_param=self.strike_param, spot=spot,
+            option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
+            today=self._today(), target_price=self._consensus_target(),
+            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct)
+        if contract is None:
+            return self._result(False, f"No liquid call contract for covered call on {self.instrument_name}")
+        if contract.bid is None or contract.bid <= 0:
+            return self._result(False, f"No bid price for {contract.symbol}")
+        limit_price = contract.bid                          # sell at BID
+        leg = OptionLeg(contract_symbol=contract.symbol, side=OrderDirection.SELL,
+                        position_intent="sell_to_open", option_type=self.OPTION_TYPE,
+                        strike=contract.strike, expiry=contract.expiry, underlying=contract.underlying)
+        return self._submit_option_order([leg], quantity, limit_price, "covered_call")
+
+    def get_description(self) -> str:
+        return f"Sell covered call on {self.instrument_name}"
+
+
+class CloseOptionAction(TradeAction):
+    """Close an existing option position via account.close_option_position()."""
+
+    def execute(self) -> "TradeActionResult":
+        try:
+            if not isinstance(self.account, OptionsAccountInterface):
+                return self.create_and_save_action_result(
+                    action_type=ExpertActionType.CLOSE_OPTION.value, success=False,
+                    message=f"Account does not support options for {self.instrument_name}", data={})
+
+            order = self._resolve_option_order()
+            if order is None:
+                return self.create_and_save_action_result(
+                    action_type=ExpertActionType.CLOSE_OPTION.value, success=False,
+                    message=f"No open option position to close for {self.instrument_name}", data={})
+
+            quantity = order.filled_qty or order.quantity
+            avg_entry = order.open_price if order.open_price is not None else order.limit_price
+            position = OptionPosition(
+                contract_symbol=order.contract_symbol,
+                underlying=order.underlying_symbol or order.symbol,
+                option_type=order.option_type,
+                strike=order.strike,
+                expiry=order.expiry,
+                side=order.side,
+                quantity=abs(float(quantity)) if quantity else 0.0,
+                avg_entry_price=avg_entry if avg_entry is not None else 0.0,
+            )
+
+            limit_price = self._close_limit_price(position, order)
+
+            if not self.submit_to_broker:
+                logger.info(f"CloseOptionAction: submit disabled for {position.contract_symbol} "
+                            f"- recording informational result")
+                return self.create_and_save_action_result(
+                    action_type=ExpertActionType.CLOSE_OPTION.value, success=True,
+                    message=f"Close option deferred for {position.contract_symbol} (manual review, not submitted)",
+                    data={"contract_symbol": position.contract_symbol, "limit_price": limit_price,
+                          "status": "PENDING"})
+
+            result = self.account.close_option_position(position, order_type="limit", limit_price=limit_price)
+            if result is None:
+                return self.create_and_save_action_result(
+                    action_type=ExpertActionType.CLOSE_OPTION.value, success=False,
+                    message=f"Failed to close option position {position.contract_symbol}", data={})
+            return self.create_and_save_action_result(
+                action_type=ExpertActionType.CLOSE_OPTION.value, success=True,
+                message=f"Submitted close for {position.contract_symbol}",
+                data={"contract_symbol": position.contract_symbol, "limit_price": limit_price})
+
+        except Exception as e:
+            logger.error(f"Error executing close_option for {self.instrument_name}: {e}", exc_info=True)
+            return self.create_and_save_action_result(
+                action_type=ExpertActionType.CLOSE_OPTION.value, success=False,
+                message=f"Error executing close option: {str(e)}", data={})
+
+    def _resolve_option_order(self) -> Optional[TradingOrder]:
+        """Find the option order to close: prefer existing_order, else the
+        transaction's filled option entry order."""
+        if self.existing_order is not None and self.existing_order.asset_class == AssetClass.OPTION:
+            return self.existing_order
+        # Fall back to the OPENED transaction's option entry order
+        txn_id = self.existing_order.transaction_id if self.existing_order else None
+        if not txn_id:
+            return None
+        from sqlmodel import select, Session
+        with Session(get_db().bind) as session:
+            orders = session.exec(
+                select(TradingOrder).where(
+                    TradingOrder.transaction_id == txn_id,
+                    TradingOrder.asset_class == AssetClass.OPTION,
+                    TradingOrder.contract_symbol.is_not(None),
+                )
+            ).all()
+            for o in orders:
+                if o.status in OrderStatus.get_executed_statuses():
+                    return o
+            return orders[0] if orders else None
+
+    def _close_limit_price(self, position: OptionPosition, order: TradingOrder) -> Optional[float]:
+        """Long(BUY) closes at the bid; short(SELL) closes at the ask. Use a fresh
+        quote when available, else fall back to the entry premium."""
+        quote = None
+        try:
+            quote = self.account.get_option_quote(position.contract_symbol)
+        except Exception as e:
+            logger.debug(f"get_option_quote failed for {position.contract_symbol}: {e}")
+        if position.side == OrderDirection.BUY:
+            if quote is not None and quote.bid is not None:
+                return quote.bid
+        else:
+            if quote is not None and quote.ask is not None:
+                return quote.ask
+        return order.open_price if order.open_price is not None else order.limit_price
+
+    def get_description(self) -> str:
+        return f"Close option position for {self.instrument_name}"
+
+
 def create_action(action_type: ExpertActionType, instrument_name: str, account: AccountInterface,
                  order_recommendation: OrderRecommendation, existing_order: Optional[TradingOrder] = None,
                  expert_recommendation: Optional[ExpertRecommendation] = None,
@@ -1503,6 +1930,10 @@ def create_action(action_type: ExpertActionType, instrument_name: str, account: 
         ExpertActionType.ADJUST_STOP_LOSS: AdjustStopLossAction,
         ExpertActionType.INCREASE_INSTRUMENT_SHARE: IncreaseInstrumentShareAction,
         ExpertActionType.DECREASE_INSTRUMENT_SHARE: DecreaseInstrumentShareAction,
+        ExpertActionType.BUY_CALL: BuyCallAction,
+        ExpertActionType.OPEN_BULL_CALL_SPREAD: OpenBullCallSpreadAction,
+        ExpertActionType.SELL_COVERED_CALL: SellCoveredCallAction,
+        ExpertActionType.CLOSE_OPTION: CloseOptionAction,
     }
     
     action_class = action_map.get(action_type)
