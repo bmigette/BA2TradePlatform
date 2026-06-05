@@ -4662,11 +4662,23 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         from ...core.types import OptionRight
 
         strike = int(occ[-8:]) / 1000.0
-        right = OptionRight.CALL if occ[-9].upper() == "C" else OptionRight.PUT
+        right_char = occ[-9].upper()
+        if right_char == "C":
+            right = OptionRight.CALL
+        elif right_char == "P":
+            right = OptionRight.PUT
+        else:
+            raise ValueError(f"invalid OCC right char {right_char!r} in {occ!r}")
         yymmdd = occ[-15:-9]
+        # OCC YY is 2000-based (00-99 -> 2000-2099)
         expiry = date(2000 + int(yymmdd[0:2]), int(yymmdd[2:4]), int(yymmdd[4:6]))
         root = occ[:-15]
         return root, expiry, right, strike
+
+    @staticmethod
+    def _to_float_or_none(value):
+        """Coerce an optional broker field to float, preserving None."""
+        return float(value) if value is not None else None
 
     @alpaca_api_retry
     def get_option_positions(self) -> List["OptionPosition"]:
@@ -4687,40 +4699,38 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             if "option" not in asset_class:
                 continue
 
-            symbol = getattr(pos, "symbol", None)
+            # The ENTIRE per-position mapping (OCC parse + required numeric
+            # coercions + optional floats + construction) lives inside ONE
+            # try/except so a single malformed broker row is skipped+warned
+            # rather than aborting the whole call. avg_entry_price stays STRICT:
+            # a missing required entry price skips that row (never defaulted).
             try:
-                underlying, expiry, right, strike = self._parse_occ_symbol(symbol)
+                underlying, expiry, right, strike = self._parse_occ_symbol(pos.symbol)
+
+                qty = float(pos.qty)
+                side_str = str(getattr(pos, "side", "")).lower()
+                if "short" in side_str or qty < 0:
+                    side = OrderDirection.SELL
+                else:
+                    side = OrderDirection.BUY
+
+                positions.append(OptionPosition(
+                    contract_symbol=pos.symbol,
+                    underlying=underlying,
+                    option_type=right,
+                    strike=strike,
+                    expiry=expiry,
+                    side=side,
+                    quantity=abs(qty),
+                    avg_entry_price=float(pos.avg_entry_price),
+                    current_price=self._to_float_or_none(getattr(pos, "current_price", None)),
+                    market_value=self._to_float_or_none(getattr(pos, "market_value", None)),
+                    unrealized_pl=self._to_float_or_none(getattr(pos, "unrealized_pl", None)),
+                    multiplier=100,
+                ))
             except Exception as e:
-                logger.warning(
-                    f"get_option_positions: skipping position with unparseable "
-                    f"OCC symbol {symbol!r}: {e}"
-                )
+                logger.warning(f"Skipping option position {getattr(pos, 'symbol', '?')}: {e}")
                 continue
-
-            qty = float(pos.qty)
-            side_str = str(getattr(pos, "side", "")).lower()
-            if "short" in side_str or qty < 0:
-                side = OrderDirection.SELL
-            else:
-                side = OrderDirection.BUY
-
-            def _to_float(value):
-                return float(value) if value is not None else None
-
-            positions.append(OptionPosition(
-                contract_symbol=symbol,
-                underlying=underlying,
-                option_type=right,
-                strike=strike,
-                expiry=expiry,
-                side=side,
-                quantity=abs(qty),
-                avg_entry_price=float(pos.avg_entry_price),
-                current_price=_to_float(getattr(pos, "current_price", None)),
-                market_value=_to_float(getattr(pos, "market_value", None)),
-                unrealized_pl=_to_float(getattr(pos, "unrealized_pl", None)),
-                multiplier=100,
-            ))
 
         return positions
 

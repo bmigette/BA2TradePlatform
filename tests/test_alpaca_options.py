@@ -200,3 +200,48 @@ def test_get_option_contracts_meta_paginates(monkeypatch):
     meta = acct._get_option_contracts_meta("AAPL", date(2026,1,1), date(2026,3,1), OptionRight.CALL)
     assert set(meta.keys()) == {"AAPL260116C00150000", "AAPL260116C00160000"}
     assert calls["n"] == 2
+
+
+import pytest as _pytest
+
+def test_parse_occ_symbol_rejects_invalid_right_char():
+    acct = _make_alpaca()
+    with _pytest.raises(ValueError):
+        acct._parse_occ_symbol("AAPL260116X00150000")
+
+
+def test_get_option_positions_skips_malformed_and_keeps_valid():
+    from ba2_trade_platform.core.types import OrderDirection
+    acct = _make_alpaca()
+    good = SimpleNamespace(symbol="AAPL260116C00150000", asset_class="us_option", qty="2",
+                           avg_entry_price="5.2", current_price="6.0", market_value="1200.0",
+                           unrealized_pl="160.0", side="long")
+    bad_occ = SimpleNamespace(symbol="GARBAGE", asset_class="us_option", qty="1",
+                              avg_entry_price="1.0", current_price="1.0", market_value="1.0",
+                              unrealized_pl="0.0", side="long")
+    bad_price = SimpleNamespace(symbol="AAPL260116C00170000", asset_class="us_option", qty="1",
+                                avg_entry_price=None, current_price="1.0", market_value="1.0",
+                                unrealized_pl="0.0", side="long")
+    class FakeClient:
+        def get_all_positions(self):
+            return [good, bad_occ, bad_price]
+    acct.client = FakeClient()
+    positions = acct.get_option_positions()
+    # only the good row survives; the two malformed rows are skipped, not fatal
+    assert [p.contract_symbol for p in positions] == ["AAPL260116C00150000"]
+
+
+def test_get_option_positions_short_with_positive_qty():
+    from ba2_trade_platform.core.types import OrderDirection
+    acct = _make_alpaca()
+    short = SimpleNamespace(symbol="AAPL260116C00160000", asset_class="us_option", qty="1",
+                            avg_entry_price="2.0", current_price="1.5", market_value="-150.0",
+                            unrealized_pl="50.0", side="short")   # positive qty + side=short
+    class FakeClient:
+        def get_all_positions(self):
+            return [short]
+    acct.client = FakeClient()
+    positions = acct.get_option_positions()
+    assert len(positions) == 1
+    assert positions[0].side == OrderDirection.SELL
+    assert positions[0].quantity == 1
