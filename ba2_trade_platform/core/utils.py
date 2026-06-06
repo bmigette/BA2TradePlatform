@@ -227,21 +227,26 @@ def calculate_transaction_pnl(transaction: Transaction) -> Optional[float]:
     """
     Calculate P&L for a transaction, correctly handling both long and short positions.
 
-    For LONG (BUY): P&L = (close_price - open_price) * quantity
-    For SHORT (SELL): P&L = (open_price - close_price) * quantity
+    For LONG (BUY): P&L = (close_price - open_price) * quantity * multiplier
+    For SHORT (SELL): P&L = (open_price - close_price) * quantity * multiplier
+
+    The contract multiplier (100 for standard options, null/1 for equity) scales the
+    per-share premium to actual cash so option positions are not understated ~100x.
 
     Args:
-        transaction: Transaction with open_price, close_price, quantity, and side fields
+        transaction: Transaction with open_price, close_price, quantity, side and
+            (optional) multiplier fields
 
     Returns:
         P&L as float, or None if required fields are missing
     """
     if not transaction.close_price or not transaction.open_price or not transaction.quantity:
         return None
+    multiplier = getattr(transaction, "multiplier", None) or 1
     if transaction.side == OrderDirection.BUY:
-        return (transaction.close_price - transaction.open_price) * transaction.quantity
+        return (transaction.close_price - transaction.open_price) * transaction.quantity * multiplier
     else:  # Short position
-        return (transaction.open_price - transaction.close_price) * transaction.quantity
+        return (transaction.open_price - transaction.close_price) * transaction.quantity * multiplier
 
 
 def close_transaction_with_logging(

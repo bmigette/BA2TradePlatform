@@ -178,6 +178,9 @@ class Transaction(SQLModel, table=True):
     close_date: DateTime | None = Field(default=None)
     close_reason: str | None = Field(default=None, description="Reason for closing (tp_sl_filled, manual_close, smart_risk_manager, broker_closed, etc.)")
     status: TransactionStatus = Field(default=TransactionStatus.WAITING, index=True)
+    # Contract multiplier for P&L/value math: 100 for standard options, null (=1) for
+    # equity. Populated from the originating order so option premium scales correctly.
+    multiplier: int | None = Field(default=None, description="Contract multiplier (100 for standard options; null/1 for equity)")
     created_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), index=True)
 
     # JSON field for storing additional data (e.g., TradeConditionsData)

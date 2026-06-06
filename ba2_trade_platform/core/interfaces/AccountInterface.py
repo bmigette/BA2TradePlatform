@@ -318,7 +318,10 @@ class AccountInterface(ReadOnlyAccountInterface):
                 open_price=current_price,  # Estimated open price
                 status=TransactionStatus.WAITING,
                 created_at=datetime.now(timezone.utc),
-                expert_id=expert_id  # Link to expert instance
+                expert_id=expert_id,  # Link to expert instance
+                # Carry the contract multiplier (100 for options) so P&L/value math
+                # scales the per-share premium correctly; null for equity.
+                multiplier=getattr(trading_order, "multiplier", None),
             )
             
             # Save transaction to database

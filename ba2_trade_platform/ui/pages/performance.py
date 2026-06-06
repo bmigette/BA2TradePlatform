@@ -158,7 +158,9 @@ class PerformanceTab:
             for txn in txns:
                 pnl = calculate_transaction_pnl(txn)
                 if pnl is not None:
-                    position_value = txn.open_price * txn.quantity
+                    # Scale by the contract multiplier (100 for options) to match the
+                    # multiplier-aware P&L, so the return ratio stays correct.
+                    position_value = txn.open_price * txn.quantity * (getattr(txn, "multiplier", None) or 1)
                     if position_value != 0:
                         returns.append(pnl / position_value)
             
