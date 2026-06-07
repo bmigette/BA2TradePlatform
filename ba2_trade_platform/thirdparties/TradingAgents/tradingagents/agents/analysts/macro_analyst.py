@@ -40,6 +40,7 @@ def create_macro_analyst(llm, toolkit, tools, parallel_tool_calls=False):
         return {
             "messages": [result],
             "macro_report": report,
+            "macro_input": f"{prompt_config['system']}\n\n===== DATA PROVIDED TO ANALYST =====\n\n{human}",
         }
 
     return macro_analyst_node

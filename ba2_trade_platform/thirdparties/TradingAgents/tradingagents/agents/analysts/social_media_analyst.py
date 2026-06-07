@@ -40,6 +40,7 @@ def create_social_media_analyst(llm, toolkit, tools, parallel_tool_calls=False):
         return {
             "messages": [result],
             "sentiment_report": report,
+            "sentiment_input": f"{prompt_config['system']}\n\n===== DATA PROVIDED TO ANALYST =====\n\n{human}",
         }
 
     return social_media_analyst_node

@@ -40,6 +40,7 @@ def create_fundamentals_analyst(llm, toolkit, tools, parallel_tool_calls=False):
         return {
             "messages": [result],
             "fundamentals_report": report,
+            "fundamentals_input": f"{prompt_config['system']}\n\n===== DATA PROVIDED TO ANALYST =====\n\n{human}",
         }
 
     return fundamentals_analyst_node

@@ -78,6 +78,13 @@ class AgentState(MessagesState):
     fundamentals_report: Annotated[str, "Report from the Fundamentals Researcher"]
     macro_report: Annotated[str, "Report from the Macro Economic Analyst"]
 
+    # Captured input prompts for the pre-fetch analysts (the exact data injected),
+    # so the UI can show what each analyst was actually given.
+    fundamentals_input: Annotated[str, "Input data/prompt given to the Fundamentals Analyst"]
+    news_input: Annotated[str, "Input data/prompt given to the News Analyst"]
+    sentiment_input: Annotated[str, "Input data/prompt given to the Social Media Analyst"]
+    macro_input: Annotated[str, "Input data/prompt given to the Macro Analyst"]
+
     # researcher team discussion step
     investment_debate_state: Annotated[
         InvestDebateState, "Current state of the debate on if to invest or not"

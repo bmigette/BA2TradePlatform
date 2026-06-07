@@ -1870,7 +1870,18 @@ Please check back in a few minutes for results."""
                 for key, description in analyst_keys.items():
                     if key in trading_state and trading_state[key]:
                         output_map[key] = description
-                
+
+                # 2b. Captured analyst INPUT data (exact data each pre-fetch analyst was given)
+                input_keys = {
+                    'fundamentals_input': 'Fundamentals — Input Data Provided to Analyst',
+                    'news_input': 'News — Input Data Provided to Analyst',
+                    'sentiment_input': 'Social Sentiment — Input Data Provided to Analyst',
+                    'macro_input': 'Macro — Input Data Provided to Analyst',
+                }
+                for key, description in input_keys.items():
+                    if key in trading_state and trading_state[key]:
+                        output_map[key] = description
+
                 # 3. Investment debate (combined with speaker indications)
                 if 'investment_debate_state' in trading_state:
                     debate_state = trading_state['investment_debate_state']
@@ -1971,7 +1982,9 @@ Please check back in a few minutes for results."""
                 analyst_keys = [
                     'market_report', 'sentiment_report', 'news_report',
                     'fundamentals_report', 'macro_report', 'investment_plan',
-                    'trader_investment_plan', 'final_trade_decision'
+                    'trader_investment_plan', 'final_trade_decision',
+                    # Captured analyst input data (simple text from state)
+                    'fundamentals_input', 'news_input', 'sentiment_input', 'macro_input',
                 ]
                 
                 if output_key in analyst_keys:

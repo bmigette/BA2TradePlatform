@@ -40,6 +40,7 @@ def create_news_analyst(llm, toolkit, tools, parallel_tool_calls=False):
         return {
             "messages": [result],
             "news_report": report,
+            "news_input": f"{prompt_config['system']}\n\n===== DATA PROVIDED TO ANALYST =====\n\n{human}",
         }
 
     return news_analyst_node

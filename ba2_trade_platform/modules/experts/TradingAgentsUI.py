@@ -163,18 +163,22 @@ class TradingAgentsUI:
             with ui.tab_panel(sentiment_tab):
                 self._render_content_panel('sentiment_report', '💬 Social Sentiment Analysis',
                                          'Social media and public sentiment analysis')
-            
+                self._render_input_expander('sentiment_input')
+
             with ui.tab_panel(news_tab):
                 self._render_content_panel('news_report', '📰 News Analysis',
                                          'Latest news analysis and market impact')
-            
+                self._render_input_expander('news_input')
+
             with ui.tab_panel(fundamentals_tab):
                 self._render_content_panel('fundamentals_report', '🏛️ Fundamental Analysis',
                                          'Company financials and fundamental metrics')
-            
+                self._render_input_expander('fundamentals_input')
+
             with ui.tab_panel(macro_tab):
                 self._render_content_panel('macro_report', '🌍 Macroeconomic Analysis',
                                          'Macroeconomic environment and policy analysis')
+                self._render_input_expander('macro_input')
             
             with ui.tab_panel(debate_tab):
                 self._render_debate_panel('investment_debate_state', '🎯 Investment Research Debate',
@@ -230,18 +234,22 @@ class TradingAgentsUI:
             with ui.tab_panel(sentiment_tab):
                 self._render_content_panel('sentiment_report', '💬 Social Sentiment Analysis',
                                          'Social media and public sentiment analysis')
-            
+                self._render_input_expander('sentiment_input')
+
             with ui.tab_panel(news_tab):
                 self._render_content_panel('news_report', '📰 News Analysis',
                                          'Latest news analysis and market impact')
-            
+                self._render_input_expander('news_input')
+
             with ui.tab_panel(fundamentals_tab):
                 self._render_content_panel('fundamentals_report', '🏛️ Fundamental Analysis',
                                          'Company financials and fundamental metrics')
-            
+                self._render_input_expander('fundamentals_input')
+
             with ui.tab_panel(macro_tab):
                 self._render_content_panel('macro_report', '🌍 Macroeconomic Analysis',
                                          'Macroeconomic environment and policy analysis')
+                self._render_input_expander('macro_input')
             
             with ui.tab_panel(debate_tab):
                 self._render_debate_panel('investment_debate_state', '🎯 Investment Research Debate',
@@ -427,6 +435,22 @@ class TradingAgentsUI:
             ui.separator().classes('my-4')
             ui.label('💡 Tip: This page will automatically update as the analysis progresses. Refresh to see the latest results.').classes('text-caption')
     
+    def _render_input_expander(self, input_key: str,
+                               label: str = '🔎 Data provided to this analyst (analyst prompt)') -> None:
+        """Render a collapsible panel showing the exact prompt/data fed to a pre-fetch
+        analyst (so the gathered fundamentals/news/etc. can be inspected). No-op if the
+        analysis predates input capture or the field is empty."""
+        content = self._extract_text_content(self.trading_state.get(input_key, ''))
+        if not content or not content.strip():
+            return
+        with ui.expansion(label, icon='data_object').classes('w-full mt-2'):
+            with ui.scroll_area().classes('w-full h-96'):
+                if self._looks_like_markdown(content):
+                    ui.markdown(content).classes('w-full')
+                else:
+                    with ui.element('pre').classes('whitespace-pre-wrap text-sm p-4 bg-grey-1 rounded font-mono overflow-x-auto'):
+                        ui.html(content, sanitize=False)
+
     def _render_content_panel(self, state_key: str, title: str, description: str) -> None:
         """Render a content panel for text-based analysis results."""
         content_raw = self.trading_state.get(state_key, '')
