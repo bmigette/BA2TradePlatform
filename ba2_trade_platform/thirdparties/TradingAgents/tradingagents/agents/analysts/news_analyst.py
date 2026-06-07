@@ -1,55 +1,41 @@
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-import time
-import json
-from typing import List
+from langchain_core.messages import SystemMessage, HumanMessage
 from ...prompts import format_analyst_prompt, get_prompt
+from ..utils.prefetch_context import gather_news_context
 from ba2_trade_platform.core.text_utils import extract_text_from_llm_response
 
 
 def create_news_analyst(llm, toolkit, tools, parallel_tool_calls=False):
-    """
-    Create news analyst node with pre-defined tools.
-    
-    Args:
-        llm: Language model for the analyst
-        toolkit: Toolkit instance (kept for backward compatibility, not used)
-        tools: List of pre-defined tool objects to use
-        parallel_tool_calls: Whether to enable parallel tool calls (default False)
+    """Create the news analyst node.
+
+    Pre-fetch (non-agentic): company + global news are gathered up-front and
+    injected into the prompt; the LLM produces the report in a single turn.
+    ``tools`` is accepted for signature compatibility but unused.
     """
     def news_analyst_node(state):
         current_date = state["trade_date"]
         ticker = state["company_of_interest"]
 
-        # Get system prompt from centralized prompts
         system_message = get_prompt("news_analyst")
-
-        # Format analyst collaboration prompt
         prompt_config = format_analyst_prompt(
             system_prompt=system_message,
-            tool_names=[tool.name for tool in tools],
+            tool_names=[],
             current_date=current_date,
-            ticker=ticker
+            ticker=ticker,
+            prefetch=True,
         )
 
-        prompt = ChatPromptTemplate.from_messages(
-            [
-                ("system", prompt_config["system"]),
-                MessagesPlaceholder(variable_name="messages"),
-            ]
+        context = gather_news_context(toolkit, ticker, current_date)
+        human = (
+            f"Below is the recent news gathered for {ticker} and the broader market as of "
+            f"{current_date}. Analyze it and produce your news report.\n\n{context}"
         )
 
-        # Google models don't support parallel_tool_calls parameter
-        is_google = "google" in type(llm).__module__.lower()
-        if is_google:
-            chain = prompt | llm.bind_tools(tools)
-        else:
-            chain = prompt | llm.bind_tools(tools, parallel_tool_calls=parallel_tool_calls)
-        result = chain.invoke(state["messages"])
+        result = llm.invoke([
+            SystemMessage(content=prompt_config["system"]),
+            HumanMessage(content=human),
+        ])
 
-        report = ""
-
-        if len(result.tool_calls) == 0:
-            report = extract_text_from_llm_response(result.content)
+        report = extract_text_from_llm_response(result.content)
 
         return {
             "messages": [result],
