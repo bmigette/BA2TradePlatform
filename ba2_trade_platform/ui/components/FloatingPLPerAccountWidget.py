@@ -109,7 +109,7 @@ class _FloatingPLWidgetBase:
                     query = query.where(Transaction.expert_id.in_(account_expert_ids))
                 else:
                     # No experts for selected account - return empty
-                    return {}
+                    return {}, {}
 
             transactions = session.exec(query).all()
 
