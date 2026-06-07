@@ -24,6 +24,9 @@ class _FloatingPLWidgetBase:
     """
 
     _title: str = ""
+    # When True the widget also fetches and displays each account's broker balance
+    # (only meaningful for the per-account view; per-expert balance is not a broker concept).
+    _show_balance: bool = False
 
     def __init__(self):
         """Initialize and render the widget."""
@@ -72,7 +75,7 @@ class _FloatingPLWidgetBase:
         self,
         selected_account_id: Optional[int],
         account_expert_ids: Optional[List[int]],
-    ) -> Dict[str, float]:
+    ) -> Tuple[Dict[str, float], Dict[str, float]]:
         """Synchronous P/L calculation (runs in thread pool to avoid blocking).
 
         Uses bulk price fetching per broker account.
@@ -80,8 +83,13 @@ class _FloatingPLWidgetBase:
         Args:
             selected_account_id: The selected account ID from filter, or None for all.
             account_expert_ids: List of expert IDs belonging to selected account, or None for all.
+
+        Returns:
+            ``(pl_by_name, balance_by_name)`` — floating P/L per display name, and (when
+            ``_show_balance``) the broker balance per display name.
         """
         pl_by_name: Dict[str, float] = {}
+        balance_by_name: Dict[str, float] = {}
 
         session = get_db()
         try:
@@ -115,6 +123,15 @@ class _FloatingPLWidgetBase:
                     account = get_account_instance_from_id(account_id, session=session)
                     if not account:
                         continue
+
+                    # Optionally record the account's broker balance (per-account view).
+                    if self._show_balance and trans_list:
+                        try:
+                            bal = account.get_balance()
+                            if bal is not None:
+                                balance_by_name[trans_list[0][1]] = float(bal)
+                        except Exception as e:
+                            logger.debug(f"Could not fetch balance for account {account_id}: {e}")
 
                     # Get broker positions to use their current_price
                     broker_positions = account.get_positions()
@@ -215,7 +232,7 @@ class _FloatingPLWidgetBase:
         finally:
             session.close()
 
-        return pl_by_name
+        return pl_by_name, balance_by_name
 
     # ------------------------------------------------------------------
     # Async UI rendering (shared)
@@ -231,7 +248,7 @@ class _FloatingPLWidgetBase:
 
             # Run database queries in thread pool to avoid blocking UI
             loop = asyncio.get_event_loop()
-            pl_data = await loop.run_in_executor(
+            pl_data, balance_data = await loop.run_in_executor(
                 None,
                 lambda: self._calculate_pl_sync(selected_account_id, account_expert_ids)
             )
@@ -255,21 +272,28 @@ class _FloatingPLWidgetBase:
                     # Calculate total
                     total_pl = sum(pl_data.values())
 
-                    # Display each entry's P/L
+                    # Display each entry's P/L (and balance when available)
                     for name, pl in sorted_pl:
                         with ui.row().classes('w-full justify-between items-center mb-1'):
-                            ui.label(name).classes('text-sm truncate max-w-[200px]')
-                            pl_color = 'text-green-600' if pl >= 0 else 'text-red-600'
-                            ui.label(f'${pl:,.2f}').classes(f'text-sm font-bold {pl_color}')
+                            ui.label(name).classes('text-sm truncate max-w-[150px]')
+                            with ui.row().classes('items-center gap-3'):
+                                if name in balance_data:
+                                    ui.label(f'Bal: ${balance_data[name]:,.2f}').classes('text-xs text-gray-500')
+                                pl_color = 'text-green-600' if pl >= 0 else 'text-red-600'
+                                ui.label(f'${pl:,.2f}').classes(f'text-sm font-bold {pl_color}')
 
                     # Separator
                     ui.separator().classes('my-2')
 
-                    # Total P/L
+                    # Total balance (when shown) + total P/L
                     with ui.row().classes('w-full justify-between items-center'):
                         ui.label('Total P/L:').classes('text-sm font-bold')
-                        total_color = 'text-green-600' if total_pl >= 0 else 'text-red-600'
-                        ui.label(f'${total_pl:,.2f}').classes(f'text-lg font-bold {total_color}')
+                        with ui.row().classes('items-center gap-3'):
+                            if balance_data:
+                                total_balance = sum(balance_data.values())
+                                ui.label(f'Bal: ${total_balance:,.2f}').classes('text-xs text-gray-500 font-bold')
+                            total_color = 'text-green-600' if total_pl >= 0 else 'text-red-600'
+                            ui.label(f'${total_pl:,.2f}').classes(f'text-lg font-bold {total_color}')
 
             except RuntimeError:
                 return
@@ -291,6 +315,7 @@ class FloatingPLPerAccountWidget(_FloatingPLWidgetBase):
     """Widget component showing floating profit/loss per account."""
 
     _title = '📊 Floating P/L Per Account'
+    _show_balance = True
 
     def _group_transactions(
         self, transactions: List[Transaction], session: Session
