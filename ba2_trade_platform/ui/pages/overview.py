@@ -1545,12 +1545,18 @@ class AccountOverviewTab:
             ui.label('Manage Labels').classes('text-h6')
             ui.label(f"{len(symbols)} instrument(s): {', '.join(symbols)}").classes(
                 'text-sm text-secondary-custom mb-2')
-            label_select = ui.select(
-                existing_labels, label='Label', with_input=True, new_value_mode='add-unique'
+            label_input = ui.input(
+                label='Label', placeholder='Type a new label, or click an existing one below'
             ).classes('w-full')
+            if existing_labels:
+                ui.label('Existing labels (click to use):').classes('text-xs text-secondary-custom mt-2')
+                with ui.row().classes('gap-1 flex-wrap'):
+                    for _lbl in existing_labels:
+                        ui.chip(_lbl, on_click=lambda l=_lbl: label_input.set_value(l)).props(
+                            'clickable dense color=indigo-5 text-color=white')
 
             def _apply(add: bool):
-                label = (label_select.value or '').strip() if label_select.value else ''
+                label = (label_input.value or '').strip()
                 if not label:
                     ui.notify('Enter or pick a label', type='warning')
                     return
