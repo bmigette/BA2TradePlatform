@@ -1069,7 +1069,68 @@ class Toolkit:
         except Exception as e:
             logger.error(f"Error in get_earnings_estimates: {e}")
             return f"Error retrieving earnings estimates: {str(e)}"
-    
+
+    def get_financial_ratios(
+        self,
+        symbol: Annotated[str, "Stock ticker symbol (e.g., 'AAPL', 'MSFT')"],
+        as_of_date: Annotated[str, "Date in YYYY-MM-DD format (uses most recent TTM data as of this date)"],
+    ) -> str:
+        """Valuation / profitability / leverage / growth ratios + quality scores (TTM).
+
+        Aggregates ratios from all configured fundamentals_details providers (P/E,
+        PEG, P/B, P/S, EV/EBITDA, margins, ROE/ROA/ROIC, debt/equity, liquidity,
+        dividend yield/payout, FCF yield, growth, Altman Z / Piotroski where available).
+        """
+        if "fundamentals_details" not in self.provider_map or not self.provider_map["fundamentals_details"]:
+            return "Error: No fundamentals details providers configured"
+        try:
+            as_of_dt = datetime.strptime(as_of_date, "%Y-%m-%d")
+            results = []
+            for provider_class in self.provider_map["fundamentals_details"]:
+                try:
+                    provider = self._instantiate_provider(provider_class)
+                    provider_name = provider.__class__.__name__
+                    markdown_data, _ = self._call_provider_with_both_format(
+                        provider, "get_financial_ratios", symbol=symbol, as_of_date=as_of_dt
+                    )
+                    if markdown_data:
+                        results.append(f"## Ratios from {provider_name.upper()}\n\n{markdown_data}")
+                except Exception as e:
+                    logger.error(f"Error fetching financial ratios from {provider_class.__name__}: {e}")
+                    results.append(f"## {provider_class.__name__} - Error\n\nFailed to fetch ratios: {str(e)}")
+            return "\n\n---\n\n".join(results) if results else "No financial ratio data available"
+        except Exception as e:
+            logger.error(f"Error in get_financial_ratios: {e}")
+            return f"Error retrieving financial ratios: {str(e)}"
+
+    def get_company_profile(
+        self,
+        symbol: Annotated[str, "Stock ticker symbol (e.g., 'AAPL', 'MSFT')"],
+        as_of_date: Annotated[str, "Date in YYYY-MM-DD format"],
+    ) -> str:
+        """Company profile / high-level overview (sector, industry, market cap, business
+        description, beta, 52-week range) aggregated from configured overview providers."""
+        if "fundamentals_overview" not in self.provider_map or not self.provider_map["fundamentals_overview"]:
+            return ""  # overview is optional; absence is not an error
+        try:
+            as_of_dt = datetime.strptime(as_of_date, "%Y-%m-%d")
+            results = []
+            for provider_class in self.provider_map["fundamentals_overview"]:
+                try:
+                    provider = self._instantiate_provider(provider_class)
+                    provider_name = provider.__class__.__name__
+                    markdown_data, _ = self._call_provider_with_both_format(
+                        provider, "get_fundamentals_overview", symbol=symbol, as_of_date=as_of_dt
+                    )
+                    if markdown_data:
+                        results.append(f"## Profile from {provider_name.upper()}\n\n{markdown_data}")
+                except Exception as e:
+                    logger.error(f"Error fetching company profile from {provider_class.__name__}: {e}")
+            return "\n\n---\n\n".join(results) if results else ""
+        except Exception as e:
+            logger.error(f"Error in get_company_profile: {e}")
+            return ""
+
     # ========================================================================
     # OHLCV PROVIDERS - Fallback logic (try first, then second, etc.)
     # ========================================================================

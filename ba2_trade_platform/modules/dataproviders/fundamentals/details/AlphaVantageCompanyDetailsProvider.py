@@ -654,6 +654,21 @@ class AlphaVantageCompanyDetailsProvider(AlphaVantageBaseProvider, CompanyFundam
             analysts = estimate["number_of_analysts"]
             
             md += f"| {date} | {avg} | {high} | {low} | {analysts} |\n"
-        
+
         return md
+
+    def get_financial_ratios(self, symbol, as_of_date, format_type="markdown"):
+        """Placeholder: ratios are not yet implemented for the AlphaVantage *details* provider.
+
+        AlphaVantage exposes these via its OVERVIEW endpoint
+        (``AlphaVantageCompanyOverviewProvider`` already returns P/E, PEG, P/B, P/S,
+        margins, ROE, ROA, growth). A future override here can call OVERVIEW and map
+        it into this shape. Until then, configure FMP or yfinance for ratios; the
+        swappable default keeps aggregation working.
+        """
+        if format_type == "dict":
+            return {"symbol": symbol.upper(), "as_of_date": as_of_date.isoformat(), "metrics": {}}
+        return (f"_AlphaVantage details provider does not yet expose financial ratios for "
+                f"{symbol.upper()}. Use the FMP or yfinance fundamentals provider, or the "
+                f"AlphaVantage *overview* provider, for valuation ratios._")
 

@@ -816,5 +816,85 @@ class YFinanceCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
             analysts = estimate["number_of_analysts"]
             
             md += f"| {date} | {avg} | {high} | {low} | {analysts} |\n"
-        
+
         return md
+
+    def get_financial_ratios(self, symbol, as_of_date, format_type="markdown"):
+        """Valuation / profitability / leverage ratios from Yahoo Finance `.info`.
+
+        yfinance exposes most headline ratios but NOT ROIC, interest coverage, FCF
+        yield, or quality scores — use the FMP provider for those.
+        """
+        try:
+            info = yf.Ticker(symbol.upper()).info or {}
+        except Exception as e:
+            logger.warning(f"yfinance .info failed for {symbol}: {e}")
+            info = {}
+
+        def g(*keys):
+            for k in keys:
+                if info.get(k) is not None:
+                    return info[k]
+            return None
+
+        metrics = {
+            "pe_trailing": g("trailingPE"), "pe_forward": g("forwardPE"),
+            "peg": g("trailingPegRatio", "pegRatio"), "pb": g("priceToBook"),
+            "ps": g("priceToSalesTrailing12Months"), "ev_ebitda": g("enterpriseToEbitda"),
+            "ev_sales": g("enterpriseToRevenue"), "dividend_yield": g("dividendYield"),
+            "payout_ratio": g("payoutRatio"), "gross_margin": g("grossMargins"),
+            "operating_margin": g("operatingMargins"), "net_margin": g("profitMargins"),
+            "roe": g("returnOnEquity"), "roa": g("returnOnAssets"),
+            "debt_to_equity": g("debtToEquity"), "current_ratio": g("currentRatio"),
+            "quick_ratio": g("quickRatio"), "eps_ttm": g("trailingEps"),
+            "book_value_per_share": g("bookValue"), "revenue_per_share": g("revenuePerShare"),
+            "revenue_growth": g("revenueGrowth"), "earnings_growth": g("earningsGrowth"),
+        }
+        dict_response = {"symbol": symbol.upper(), "as_of_date": as_of_date.isoformat(), "metrics": metrics}
+        if format_type == "dict":
+            return dict_response
+        md = self._format_yf_ratios_markdown(symbol.upper(), metrics)
+        if format_type == "both":
+            return {"text": md, "data": dict_response}
+        return md
+
+    @staticmethod
+    def _format_yf_ratios_markdown(symbol, m):
+        def num(v, d=2):
+            return f"{v:.{d}f}" if isinstance(v, (int, float)) else "N/A"
+
+        def pct(v):
+            return f"{v * 100:.1f}%" if isinstance(v, (int, float)) else "N/A"
+
+        return "\n".join([
+            f"# Financial Ratios & Key Metrics: {symbol}", "",
+            "## Valuation",
+            f"- **P/E (trailing):** {num(m['pe_trailing'])}",
+            f"- **P/E (forward):** {num(m['pe_forward'])}",
+            f"- **PEG:** {num(m['peg'])}",
+            f"- **P/B:** {num(m['pb'])}",
+            f"- **P/S:** {num(m['ps'])}",
+            f"- **EV/EBITDA:** {num(m['ev_ebitda'])}",
+            f"- **EV/Sales:** {num(m['ev_sales'])}",
+            f"- **Dividend Yield:** {pct(m['dividend_yield'])}",
+            f"- **Payout Ratio:** {pct(m['payout_ratio'])}",
+            "", "## Profitability",
+            f"- **Gross Margin:** {pct(m['gross_margin'])}",
+            f"- **Operating Margin:** {pct(m['operating_margin'])}",
+            f"- **Net Margin:** {pct(m['net_margin'])}",
+            f"- **ROE:** {pct(m['roe'])}",
+            f"- **ROA:** {pct(m['roa'])}",
+            "", "## Leverage & Liquidity",
+            f"- **Debt/Equity:** {num(m['debt_to_equity'])}",
+            f"- **Current Ratio:** {num(m['current_ratio'])}",
+            f"- **Quick Ratio:** {num(m['quick_ratio'])}",
+            "", "## Per-Share & Growth",
+            f"- **EPS (TTM):** {num(m['eps_ttm'])}",
+            f"- **Book Value / Share:** {num(m['book_value_per_share'])}",
+            f"- **Revenue / Share:** {num(m['revenue_per_share'])}",
+            f"- **Revenue Growth:** {pct(m['revenue_growth'])}",
+            f"- **Earnings Growth:** {pct(m['earnings_growth'])}",
+            "",
+            "_Note: yfinance does not expose ROIC, interest coverage, FCF yield, or quality "
+            "scores (Altman Z / Piotroski) — use FMP for those._",
+        ])

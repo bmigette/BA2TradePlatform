@@ -317,3 +317,27 @@ class CompanyFundamentalsDetailsInterface(DataProviderInterface):
             If format_type='markdown': Formatted markdown table with earnings estimates
         """
         pass
+
+    def get_financial_ratios(
+        self,
+        symbol: Annotated[str, "Stock ticker symbol"],
+        as_of_date: Annotated[datetime, "Date for ratios (most recent TTM data as of this date)"],
+        format_type: Literal["dict", "markdown"] = "markdown"
+    ) -> Dict[str, Any] | str:
+        """Key valuation / profitability / leverage / growth ratios and metrics (TTM where available).
+
+        Concrete default so providers stay swappable: a vendor that hasn't implemented
+        ratios returns an empty placeholder instead of breaking the aggregation. Providers
+        SHOULD override to supply P/E (trailing & forward), PEG, P/B, P/S, EV/EBITDA,
+        EV/Sales, P/FCF, gross/operating/net margins, ROE, ROA, ROIC, debt/equity,
+        net-debt/EBITDA, interest coverage, current & quick ratio, dividend yield & payout,
+        FCF yield, per-share values, growth rates, and any quality scores (Altman Z /
+        Piotroski) or composite ratings they expose.
+
+        Returns:
+            If format_type='dict': {"symbol", "as_of_date", "metrics": {...}}
+            If format_type='markdown': markdown report (or a placeholder note when unsupported)
+        """
+        if format_type == "dict":
+            return {"symbol": symbol, "as_of_date": as_of_date.isoformat(), "metrics": {}}
+        return f"_No financial-ratio data available from {self.get_provider_name()} for {symbol}._"

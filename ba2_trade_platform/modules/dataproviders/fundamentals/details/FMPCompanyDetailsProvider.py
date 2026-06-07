@@ -819,5 +819,192 @@ class FMPCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
             analysts = estimate["number_of_analysts"]
             
             md += f"| {date} | {avg} | {high} | {low} | {analysts} |\n"
-        
+
         return md
+
+    # ------------------------------------------------------------------
+    # Financial ratios / key metrics / quality (TTM)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _rf(value):
+        """Safe float (None on failure)."""
+        if value is None or value == "" or value == "None":
+            return None
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            return None
+
+    def get_financial_ratios(self, symbol, as_of_date, format_type="markdown"):
+        """FMP valuation / profitability / leverage / growth ratios + quality scores (TTM).
+
+        Aggregates several FMP endpoints (each best-effort, so a missing one doesn't
+        break the rest): financial_ratios_ttm, key_metrics_ttm, financial_growth,
+        rating, and the v4 financial-score (Altman Z / Piotroski).
+        """
+        sym = symbol.upper()
+        m: Dict[str, Any] = {}
+
+        def _merge(rows):
+            if rows and isinstance(rows, list) and isinstance(rows[0], dict):
+                m.update(rows[0])
+
+        # TTM ratios + key metrics + growth + rating (fmpsdk, wrapped for FMP error dicts)
+        try:
+            _merge(fmp_list_call(lambda: fmpsdk.financial_ratios_ttm(apikey=self.api_key, symbol=sym),
+                                 symbol=sym, endpoint="financial_ratios_ttm"))
+        except Exception as e:
+            logger.warning(f"FMP financial_ratios_ttm failed for {sym}: {e}")
+        try:
+            _merge(fmp_list_call(lambda: fmpsdk.key_metrics_ttm(apikey=self.api_key, symbol=sym),
+                                 symbol=sym, endpoint="key_metrics_ttm"))
+        except Exception as e:
+            logger.warning(f"FMP key_metrics_ttm failed for {sym}: {e}")
+        growth = {}
+        try:
+            g = fmp_list_call(lambda: fmpsdk.financial_growth(apikey=self.api_key, symbol=sym, period="annual"),
+                              symbol=sym, endpoint="financial_growth")
+            if g and isinstance(g, list):
+                growth = g[0]
+        except Exception as e:
+            logger.warning(f"FMP financial_growth failed for {sym}: {e}")
+        rating = {}
+        try:
+            r = fmp_list_call(lambda: fmpsdk.rating(apikey=self.api_key, symbol=sym),
+                              symbol=sym, endpoint="rating")
+            if r and isinstance(r, list):
+                rating = r[0]
+        except Exception as e:
+            logger.warning(f"FMP rating failed for {sym}: {e}")
+        scores = {}
+        try:
+            resp = requests.get("https://financialmodelingprep.com/api/v4/score",
+                                params={"symbol": sym, "apikey": self.api_key}, timeout=30)
+            if resp.ok:
+                js = resp.json()
+                if isinstance(js, list) and js and isinstance(js[0], dict):
+                    scores = js[0]
+        except Exception as e:
+            logger.warning(f"FMP financial score failed for {sym}: {e}")
+
+        def pick(*keys):
+            for k in keys:
+                if k in m and m[k] is not None:
+                    return self._rf(m[k])
+            return None
+
+        def gpick(*keys):
+            for k in keys:
+                if k in growth and growth[k] is not None:
+                    return self._rf(growth[k])
+            return None
+
+        metrics = {
+            # Valuation
+            "pe_ttm": pick("peRatioTTM", "priceEarningsRatioTTM"),
+            "peg_ttm": pick("pegRatioTTM", "priceEarningsToGrowthRatioTTM"),
+            "pb_ttm": pick("priceToBookRatioTTM", "pbRatioTTM"),
+            "ps_ttm": pick("priceToSalesRatioTTM", "priceSalesRatioTTM"),
+            "pfcf_ttm": pick("priceToFreeCashFlowsRatioTTM", "pfcfRatioTTM"),
+            "ev_ebitda_ttm": pick("enterpriseValueOverEBITDATTM", "evToEBITDATTM"),
+            "ev_sales_ttm": pick("evToSalesTTM"),
+            "dividend_yield_ttm": pick("dividendYieldTTM", "dividendYielTTM"),
+            "payout_ratio_ttm": pick("payoutRatioTTM", "dividendPayoutRatioTTM"),
+            # Profitability
+            "gross_margin_ttm": pick("grossProfitMarginTTM"),
+            "operating_margin_ttm": pick("operatingProfitMarginTTM"),
+            "net_margin_ttm": pick("netProfitMarginTTM"),
+            "roe_ttm": pick("returnOnEquityTTM"),
+            "roa_ttm": pick("returnOnAssetsTTM"),
+            "roic_ttm": pick("roicTTM", "returnOnInvestedCapitalTTM"),
+            # Leverage & liquidity
+            "debt_to_equity_ttm": pick("debtEquityRatioTTM", "debtToEquityTTM"),
+            "net_debt_to_ebitda_ttm": pick("netDebtToEBITDATTM"),
+            "interest_coverage_ttm": pick("interestCoverageTTM"),
+            "current_ratio_ttm": pick("currentRatioTTM"),
+            "quick_ratio_ttm": pick("quickRatioTTM"),
+            # Cash flow / per share
+            "fcf_yield_ttm": pick("freeCashFlowYieldTTM"),
+            "fcf_per_share_ttm": pick("freeCashFlowPerShareTTM"),
+            "eps_ttm": pick("netIncomePerShareTTM", "epsTTM"),
+            "book_value_per_share_ttm": pick("bookValuePerShareTTM"),
+            "revenue_per_share_ttm": pick("revenuePerShareTTM"),
+            # Growth
+            "revenue_growth": gpick("revenueGrowth"),
+            "eps_growth": gpick("epsgrowth", "epsGrowth"),
+            "fcf_growth": gpick("freeCashFlowGrowth"),
+            "revenue_growth_3y": gpick("threeYRevenueGrowthPerShare"),
+            "revenue_growth_5y": gpick("fiveYRevenueGrowthPerShare"),
+            # Quality / rating
+            "fmp_rating": rating.get("rating"),
+            "fmp_rating_recommendation": rating.get("ratingRecommendation"),
+            "fmp_rating_score": rating.get("ratingScore"),
+            "altman_z_score": self._rf(scores.get("altmanZScore")),
+            "piotroski_score": self._rf(scores.get("piotroskiScore")),
+        }
+
+        dict_response = {"symbol": sym, "as_of_date": as_of_date.isoformat(), "metrics": metrics}
+        if format_type == "dict":
+            return dict_response
+        markdown = self._format_ratios_markdown(sym, metrics)
+        if format_type == "both":
+            return {"text": markdown, "data": dict_response}
+        return markdown
+
+    @staticmethod
+    def _format_ratios_markdown(symbol, m):
+        def num(v, d=2):
+            return f"{v:.{d}f}" if isinstance(v, (int, float)) else "N/A"
+
+        def pct(v):
+            return f"{v * 100:.1f}%" if isinstance(v, (int, float)) else "N/A"
+
+        lines = [f"# Financial Ratios & Key Metrics (TTM): {symbol}", ""]
+        lines += [
+            "## Valuation",
+            f"- **P/E (TTM):** {num(m['pe_ttm'])}",
+            f"- **PEG:** {num(m['peg_ttm'])}",
+            f"- **P/B:** {num(m['pb_ttm'])}",
+            f"- **P/S:** {num(m['ps_ttm'])}",
+            f"- **P/FCF:** {num(m['pfcf_ttm'])}",
+            f"- **EV/EBITDA:** {num(m['ev_ebitda_ttm'])}",
+            f"- **EV/Sales:** {num(m['ev_sales_ttm'])}",
+            f"- **Dividend Yield:** {pct(m['dividend_yield_ttm'])}",
+            f"- **Payout Ratio:** {pct(m['payout_ratio_ttm'])}",
+            "",
+            "## Profitability",
+            f"- **Gross Margin:** {pct(m['gross_margin_ttm'])}",
+            f"- **Operating Margin:** {pct(m['operating_margin_ttm'])}",
+            f"- **Net Margin:** {pct(m['net_margin_ttm'])}",
+            f"- **ROE:** {pct(m['roe_ttm'])}",
+            f"- **ROA:** {pct(m['roa_ttm'])}",
+            f"- **ROIC:** {pct(m['roic_ttm'])}",
+            "",
+            "## Leverage & Liquidity",
+            f"- **Debt/Equity:** {num(m['debt_to_equity_ttm'])}",
+            f"- **Net Debt/EBITDA:** {num(m['net_debt_to_ebitda_ttm'])}",
+            f"- **Interest Coverage:** {num(m['interest_coverage_ttm'])}",
+            f"- **Current Ratio:** {num(m['current_ratio_ttm'])}",
+            f"- **Quick Ratio:** {num(m['quick_ratio_ttm'])}",
+            "",
+            "## Cash Flow & Per-Share",
+            f"- **FCF Yield:** {pct(m['fcf_yield_ttm'])}",
+            f"- **FCF / Share:** {num(m['fcf_per_share_ttm'])}",
+            f"- **EPS (TTM):** {num(m['eps_ttm'])}",
+            f"- **Book Value / Share:** {num(m['book_value_per_share_ttm'])}",
+            f"- **Revenue / Share:** {num(m['revenue_per_share_ttm'])}",
+            "",
+            "## Growth",
+            f"- **Revenue Growth (YoY):** {pct(m['revenue_growth'])}",
+            f"- **EPS Growth (YoY):** {pct(m['eps_growth'])}",
+            f"- **FCF Growth (YoY):** {pct(m['fcf_growth'])}",
+            f"- **Revenue/Share 3Y CAGR:** {pct(m['revenue_growth_3y'])}",
+            f"- **Revenue/Share 5Y CAGR:** {pct(m['revenue_growth_5y'])}",
+            "",
+            "## Quality & Rating",
+            f"- **FMP Rating:** {m.get('fmp_rating') or 'N/A'} "
+            f"({m.get('fmp_rating_recommendation') or 'N/A'}, score {m.get('fmp_rating_score') or 'N/A'})",
+            f"- **Altman Z-Score:** {num(m['altman_z_score'])}",
+            f"- **Piotroski Score:** {num(m['piotroski_score'], 0)}",
+        ]
+        return "\n".join(lines)
