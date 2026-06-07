@@ -17,6 +17,84 @@ if TYPE_CHECKING:
     from .interfaces import MarketExpertInterface
 
 
+def get_labels_by_symbol(symbols) -> Dict[str, List[str]]:
+    """Return ``{symbol: [labels]}`` for symbols that have an Instrument row.
+
+    Symbols without an Instrument (or with no labels) are simply omitted, so the
+    caller can default to an empty list.
+    """
+    from .models import Instrument
+    syms = [s for s in {s for s in symbols} if s]
+    if not syms:
+        return {}
+    out: Dict[str, List[str]] = {}
+    with get_db() as session:
+        rows = session.exec(select(Instrument).where(Instrument.name.in_(syms))).all()
+        for inst in rows:
+            out[inst.name] = list(inst.labels or [])
+    return out
+
+
+def get_all_instrument_labels() -> List[str]:
+    """Return the sorted, de-duplicated set of all labels in use across instruments."""
+    from .models import Instrument
+    labels = set()
+    with get_db() as session:
+        for inst in session.exec(select(Instrument)).all():
+            for lbl in (inst.labels or []):
+                labels.add(lbl)
+    return sorted(labels)
+
+
+def add_label_to_instruments(symbols, label: str) -> int:
+    """Add ``label`` to each symbol's Instrument, creating a minimal Instrument row
+    when one doesn't exist. No-op for a blank label or a label already present.
+
+    The labels list is REASSIGNED (not mutated in place) so SQLAlchemy reliably
+    detects the change on the JSON column. Returns the number of instruments
+    created or updated.
+    """
+    from .models import Instrument
+    label = (label or "").strip()
+    if not label:
+        return 0
+    changed = 0
+    with get_db() as session:
+        for sym in {s for s in symbols if s}:
+            inst = session.exec(select(Instrument).where(Instrument.name == sym)).first()
+            if inst is None:
+                session.add(Instrument(name=sym, labels=[label]))
+                changed += 1
+            elif label not in (inst.labels or []):
+                inst.labels = list(inst.labels or []) + [label]
+                session.add(inst)
+                changed += 1
+        if changed:
+            session.commit()
+    return changed
+
+
+def remove_label_from_instruments(symbols, label: str) -> int:
+    """Remove ``label`` from each symbol's Instrument (if present). Returns the
+    number of instruments updated. The labels list is reassigned for change
+    detection on the JSON column."""
+    from .models import Instrument
+    label = (label or "").strip()
+    if not label:
+        return 0
+    changed = 0
+    with get_db() as session:
+        for sym in {s for s in symbols if s}:
+            inst = session.exec(select(Instrument).where(Instrument.name == sym)).first()
+            if inst and label in (inst.labels or []):
+                inst.labels = [l for l in inst.labels if l != label]
+                session.add(inst)
+                changed += 1
+        if changed:
+            session.commit()
+    return changed
+
+
 def get_expert_instance_from_id(expert_instance_id: int, use_cache: bool = True) -> Optional["MarketExpertInterface"]:
     """
     Get an expert instance with the appropriate class instantiated from the database.

@@ -8,6 +8,7 @@ from ...core.db import get_all_instances, get_db, get_instance, update_instance
 from ...core.models import AccountDefinition, MarketAnalysis, ExpertRecommendation, ExpertInstance, AppSetting, TradingOrder, Transaction
 from ...core.types import MarketAnalysisStatus, OrderRecommendation, OrderStatus, OrderOpenType, OrderType
 from ...core.utils import get_expert_instance_from_id, get_market_analysis_id_from_order_id, get_account_instance_from_id, get_expert_options_for_ui, calculate_transaction_pnl
+from ...core.utils import get_labels_by_symbol, add_label_to_instruments, remove_label_from_instruments, get_all_instrument_labels
 from ...core.TransactionHelper import TransactionHelper
 from ...core.ModelBillingUsage import ModelBillingUsage
 from ...modules.accounts import providers
@@ -1372,10 +1373,22 @@ class AccountOverviewTab:
                 except Exception as e:
                     logger.warning(f"Failed to load account {acc.name} (ID: {acc.id}): {e}")
                     # Continue processing other accounts
-            
+
+            # Attach instrument labels (by symbol) for the Labels column.
+            try:
+                labels_by_symbol = get_labels_by_symbol([p.get('symbol') for p in all_positions])
+            except Exception as e:
+                logger.warning(f"Failed to load instrument labels: {e}")
+                labels_by_symbol = {}
+            for p in all_positions:
+                lbls = labels_by_symbol.get(p.get('symbol'), [])
+                p['labels_list'] = lbls               # for chip rendering
+                p['labels'] = ', '.join(lbls)         # for filtering / fallback display
+
             columns = [
                 {'name': 'account', 'label': 'Account', 'field': 'account', 'sortable': True, 'align': 'left'},
                 {'name': 'symbol', 'label': 'Symbol', 'field': 'symbol', 'sortable': True, 'align': 'left'},
+                {'name': 'labels', 'label': 'Labels', 'field': 'labels', 'sortable': True, 'align': 'left'},
                 {'name': 'exchange', 'label': 'Exchange', 'field': 'exchange', 'sortable': True, 'align': 'left'},
                 {'name': 'asset_class', 'label': 'Asset Class', 'field': 'asset_class', 'sortable': True, 'align': 'left'},
                 {'name': 'side', 'label': 'Side', 'field': 'side', 'sortable': True, 'align': 'center'},
@@ -1395,17 +1408,35 @@ class AccountOverviewTab:
                 with ui.row().classes('w-full gap-2 mb-4'):
                     filter_input = ui.input(label='Filter table', placeholder='Type to filter across all columns...').props('stack-label').classes('flex-grow')
                     ui.button('Clear', on_click=lambda: filter_input.set_value('')).props('flat')
-                
-                # Create the table with sortable columns
+
+                # Label management toolbar (operates on the selected rows' instruments)
+                with ui.row().classes('w-full gap-2 mb-2 items-center'):
+                    ui.button('🏷️ Manage Labels',
+                              on_click=lambda: self._show_manage_labels_dialog(positions_table)
+                              ).props('outline color=primary')
+                    ui.label('Tick rows, then add/remove a label for those instruments.').classes('text-xs text-secondary-custom')
+
+                # Create the table with sortable columns (multi-select enabled)
                 positions_table = ui.table(
-                    columns=columns, 
-                    rows=all_positions, 
+                    columns=columns,
+                    rows=all_positions,
                     row_key='_row_key',  # Unique key for each position
+                    selection='multiple',
                     pagination={'rowsPerPage': 20, 'sortBy': 'account', 'descending': False}
                 ).classes('w-full dark-pagination')
-                
+
                 # Bind filter to table after table is created
                 filter_input.bind_value(positions_table, 'filter')
+
+                # Labels column: render each label as a chip
+                positions_table.add_slot('body-cell-labels', r'''
+                    <q-td :props="props">
+                        <q-chip v-for="l in props.row.labels_list" :key="l" dense size="sm"
+                                color="primary" text-color="white" class="q-ma-none q-mr-xs">{{ l }}</q-chip>
+                        <span v-if="!props.row.labels_list || props.row.labels_list.length === 0"
+                              class="text-grey-6">—</span>
+                    </q-td>
+                ''')
                 
                 # Add custom cell rendering for numeric columns with proper formatting
                 # Quantity, prices - format to 2 decimals
@@ -1494,7 +1525,67 @@ class AccountOverviewTab:
                     ui.label('Pending Orders (PENDING, WAITING_TRIGGER, or ERROR)').classes('text-h6 mb-4')
                     ui.button('Clean Pending Orders', icon='delete_sweep', on_click=self._clean_pending_orders_dialog).props('outline color=warning')
                 self._render_pending_orders_table()
-    
+
+    def _show_manage_labels_dialog(self, positions_table):
+        """Add or remove an instrument label across the currently-selected positions.
+
+        Labels live on the Instrument (by symbol), so the action applies to the
+        distinct symbols of the selected rows. Updates the table rows in place
+        afterwards (no full reload).
+        """
+        selected = list(getattr(positions_table, 'selected', None) or [])
+        symbols = sorted({r.get('symbol') for r in selected if r.get('symbol')})
+        if not symbols:
+            ui.notify('Select one or more positions first (tick the checkboxes)', type='warning')
+            return
+
+        existing_labels = get_all_instrument_labels()
+
+        with ui.dialog() as dialog, ui.card().classes('min-w-[420px]'):
+            ui.label('Manage Labels').classes('text-h6')
+            ui.label(f"{len(symbols)} instrument(s): {', '.join(symbols)}").classes(
+                'text-sm text-secondary-custom mb-2')
+            label_select = ui.select(
+                existing_labels, label='Label', with_input=True, new_value_mode='add-unique'
+            ).classes('w-full')
+
+            def _apply(add: bool):
+                label = (label_select.value or '').strip() if label_select.value else ''
+                if not label:
+                    ui.notify('Enter or pick a label', type='warning')
+                    return
+                try:
+                    if add:
+                        n = add_label_to_instruments(symbols, label)
+                        ui.notify(f"Added '{label}' to {n} instrument(s)", type='positive')
+                    else:
+                        n = remove_label_from_instruments(symbols, label)
+                        ui.notify(f"Removed '{label}' from {n} instrument(s)", type='positive')
+                except Exception as e:
+                    logger.error(f"Label update failed: {e}", exc_info=True)
+                    ui.notify(f'Error: {e}', type='negative')
+                    return
+                # Refresh labels on the affected rows in place.
+                try:
+                    refreshed = get_labels_by_symbol(symbols)
+                    for row in positions_table.rows:
+                        if row.get('symbol') in symbols:
+                            lbls = refreshed.get(row.get('symbol'), [])
+                            row['labels_list'] = lbls
+                            row['labels'] = ', '.join(lbls)
+                    positions_table.selected = []
+                    positions_table.update()
+                except Exception as e:
+                    logger.warning(f"Could not refresh label cells in place: {e}")
+                dialog.close()
+
+            with ui.row().classes('w-full justify-end gap-2 mt-4'):
+                ui.button('Cancel', on_click=dialog.close).props('flat')
+                ui.button('Remove', on_click=lambda: _apply(False)).props('outline color=negative')
+                ui.button('Add', on_click=lambda: _apply(True)).props('color=primary')
+
+        dialog.open()
+
     def _render_live_orders_table(self):
         """Render table with recent orders from database (past 15 days) with expert information."""
         session = get_db()
