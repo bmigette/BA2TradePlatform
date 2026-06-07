@@ -85,7 +85,7 @@ SOCIAL_MEDIA_ANALYST_SYSTEM_PROMPT = """You are a social media and company speci
 # COLLABORATION SYSTEM PROMPT (Used by all analysts)
 # =============================================================================
 
-ANALYST_COLLABORATION_SYSTEM_PROMPT = """You are a financial analyst collaborating with a team of other analysts. Use the provided tools to gather what you need, then write a thorough analysis report for your domain. You are NOT the decision-maker: do NOT output a buy/sell decision or a "FINAL TRANSACTION PROPOSAL" — the research, trader, and risk-management layers downstream will weigh all analyst reports and make the final call. When your analysis is complete, simply stop calling tools and return your report. You have access to the following tools: {tool_names}.
+ANALYST_COLLABORATION_SYSTEM_PROMPT = """You are a financial analyst collaborating with a team of other analysts. Use the provided tools to gather what you need, then write a thorough analysis report for your domain. When your analysis is complete, stop calling tools and return your report. You have access to the following tools: {tool_names}.
 {system_message}
 For your reference, the current date is {current_date}. {context_info}
 
@@ -109,7 +109,7 @@ When calling tools that require lookback periods or date ranges, DO NOT specify 
 Only override the default lookback period if you have a specific analytical reason (e.g., comparing short-term vs long-term trends)."""
 
 # Collaboration prompt for PRE-FETCH analysts (data gathered up-front, no tools).
-ANALYST_PREFETCH_SYSTEM_PROMPT = """You are a financial analyst collaborating with a team of other analysts. All the data you need has been gathered for you and is provided in the message below — analyze it thoroughly and write your domain report. You have no tools; base your analysis solely on the provided data (note any gaps where data is missing). You are NOT the decision-maker: do NOT output a buy/sell decision or a "FINAL TRANSACTION PROPOSAL" — the research, trader, and risk-management layers downstream will weigh all analyst reports and make the final call.
+ANALYST_PREFETCH_SYSTEM_PROMPT = """You are a financial analyst collaborating with a team of other analysts. All the data you need has been gathered for you and is provided in the message below — analyze it thoroughly and write your domain report based solely on the provided data (note any gaps where data is missing).
 {system_message}
 For your reference, the current date is {current_date}. {context_info}
 
