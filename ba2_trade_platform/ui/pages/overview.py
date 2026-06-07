@@ -5623,73 +5623,66 @@ class AccountGrowthTab:
         with ui.card().classes('w-full mb-4 p-4'):
             ui.label('Growth by Label').classes('text-md font-bold mb-2')
 
-            def build_chart_options(visible_labels):
+            def build_chart_options(visible_labels, show_total=True, show_dividends=True, show_invested=True):
                 series = []
                 legend_data = []
+                single = len(visible_labels) == 1  # gain/loss band only for a single label (avoid colour mush)
+
                 for i, label in enumerate(visible_labels):
                     color = colors[i % len(colors)]
-                    # Price value line per label
-                    series.append({
-                        'name': label,
-                        'type': 'line',
-                        'data': [round(v, 2) for v in label_daily_values[label]],
-                        'smooth': True,
-                        'lineStyle': {'width': 2, 'color': color},
-                        'itemStyle': {'color': color},
-                        'showSymbol': False,
-                    })
-                    legend_data.append(label)
+                    # Total value = holdings value + cash dividends (DRIP already in value).
+                    total_data = [
+                        round(pv + dv, 2)
+                        for pv, dv in zip(label_daily_values[label], label_cum_cash_divs[label])
+                    ]
+                    inv_data = [round(v, 2) for v in label_cum_invested[label]]
+                    has_div = has_any_dividends and label_cum_divs[label][-1] > 0
+                    has_inv = has_any_invested and label_cum_invested[label][-1] > 0
 
-                if has_any_dividends:
-                    for i, label in enumerate(visible_labels):
-                        color = colors[i % len(colors)]
-                        if label_cum_divs[label][-1] > 0:
-                            # Cumulative dividends line per label (dashed)
-                            div_name = f'{label} (Dividends)'
-                            series.append({
-                                'name': div_name,
-                                'type': 'line',
-                                'data': label_cum_divs[label],
-                                'smooth': True,
-                                'lineStyle': {'width': 1.5, 'color': color, 'type': 'dashed'},
-                                'itemStyle': {'color': color},
-                                'showSymbol': False,
-                            })
-                            legend_data.append(div_name)
+                    # Gain/loss band between Total and Invested (single label only).
+                    # Two stacked bands: green where Total >= Invested, red where Invested > Total.
+                    if single and show_total and show_invested and has_inv:
+                        gain = [round(max(0.0, t - iv), 2) for t, iv in zip(total_data, inv_data)]
+                        loss = [round(max(0.0, iv - t), 2) for t, iv in zip(total_data, inv_data)]
+                        band_base = {'type': 'line', 'smooth': False, 'symbol': 'none', 'silent': True,
+                                     'lineStyle': {'opacity': 0}, 'tooltip': {'show': False}, 'z': 0}
+                        # green band: base = invested, fill up to total
+                        series.append({**band_base, 'name': '__gain_base', 'stack': 'gain', 'data': inv_data})
+                        series.append({**band_base, 'name': '__gain', 'stack': 'gain', 'data': gain,
+                                       'areaStyle': {'color': '#22c55e', 'opacity': 0.18}})
+                        # red band: base = total, fill up to invested
+                        series.append({**band_base, 'name': '__loss_base', 'stack': 'loss', 'data': total_data})
+                        series.append({**band_base, 'name': '__loss', 'stack': 'loss', 'data': loss,
+                                       'areaStyle': {'color': '#ef4444', 'opacity': 0.18}})
 
-                            # Total value line per label (dotted):
-                            # value + cash dividends only (DRIP already in value)
-                            total_name = f'{label} (Total)'
-                            total_data = [
-                                round(pv + dv, 2)
-                                for pv, dv in zip(label_daily_values[label], label_cum_cash_divs[label])
-                            ]
-                            series.append({
-                                'name': total_name,
-                                'type': 'line',
-                                'data': total_data,
-                                'smooth': True,
-                                'lineStyle': {'width': 1.5, 'color': color, 'type': 'dotted'},
-                                'itemStyle': {'color': color},
-                                'showSymbol': False,
-                            })
-                            legend_data.append(total_name)
+                    # Total value line (SOLID headline). smooth=False so band edges align.
+                    if show_total:
+                        series.append({
+                            'name': label, 'type': 'line', 'data': total_data, 'smooth': False,
+                            'lineStyle': {'width': 2, 'color': color}, 'itemStyle': {'color': color},
+                            'showSymbol': False, 'z': 3,
+                        })
+                        legend_data.append(label)
 
-                if has_any_invested:
-                    for i, label in enumerate(visible_labels):
-                        color = colors[i % len(colors)]
-                        if label_cum_invested[label][-1] > 0:
-                            inv_name = f'{label} (Invested)'
-                            series.append({
-                                'name': inv_name,
-                                'type': 'line',
-                                'data': label_cum_invested[label],
-                                'smooth': False,
-                                'lineStyle': {'width': 1.5, 'color': color, 'type': 'dotdash'},
-                                'itemStyle': {'color': color},
-                                'showSymbol': False,
-                            })
-                            legend_data.append(inv_name)
+                    # Cumulative dividends (dashed)
+                    if show_dividends and has_div:
+                        div_name = f'{label} (Dividends)'
+                        series.append({
+                            'name': div_name, 'type': 'line', 'data': label_cum_divs[label], 'smooth': True,
+                            'lineStyle': {'width': 1.5, 'color': color, 'type': 'dashed'},
+                            'itemStyle': {'color': color}, 'showSymbol': False, 'z': 2,
+                        })
+                        legend_data.append(div_name)
+
+                    # Invested capital (DOTTED)
+                    if show_invested and has_inv:
+                        inv_name = f'{label} (Invested)'
+                        series.append({
+                            'name': inv_name, 'type': 'line', 'data': inv_data, 'smooth': False,
+                            'lineStyle': {'width': 1.5, 'color': color, 'type': 'dotted'},
+                            'itemStyle': {'color': color}, 'showSymbol': False, 'z': 2,
+                        })
+                        legend_data.append(inv_name)
 
                 return {
                     'backgroundColor': 'transparent',
@@ -5723,24 +5716,32 @@ class AccountGrowthTab:
             if not default_labels:
                 default_labels = all_labels
 
-            label_select = ui.select(
-                options=all_labels,
-                value=default_labels,
-                label='Visible Labels',
-                multiple=True,
-            ).classes('w-64 mb-2')
+            # Controls: visible labels + per-category show/hide toggles
+            with ui.row().classes('w-full gap-4 items-center mb-2'):
+                label_select = ui.select(
+                    options=all_labels, value=default_labels, label='Visible Labels', multiple=True,
+                ).classes('w-64')
+                show_total_cb = ui.checkbox('Total', value=True)
+                show_div_cb = ui.checkbox('Dividends', value=True)
+                show_inv_cb = ui.checkbox('Invested', value=True)
 
             chart_container = ui.column().classes('w-full')
+
+            def rebuild_label_chart():
+                visible = sorted(list(label_select.value)) if label_select.value else []
+                chart_container.clear()
+                with chart_container:
+                    ui.echart(build_chart_options(
+                        visible, show_total_cb.value, show_div_cb.value, show_inv_cb.value
+                    )).classes('w-full h-80')
+
             with chart_container:
                 ui.echart(build_chart_options(default_labels)).classes('w-full h-80')
 
-            def on_label_filter_change(e):
-                visible = sorted(list(e.value)) if e.value else []
-                chart_container.clear()
-                with chart_container:
-                    ui.echart(build_chart_options(visible)).classes('w-full h-80')
-
-            label_select.on_value_change(on_label_filter_change)
+            label_select.on_value_change(lambda e: rebuild_label_chart())
+            show_total_cb.on_value_change(lambda e: rebuild_label_chart())
+            show_div_cb.on_value_change(lambda e: rebuild_label_chart())
+            show_inv_cb.on_value_change(lambda e: rebuild_label_chart())
 
     def _render_growth_by_position_in_label_charts(self, all_positions, historical_prices=None, all_dividends=None, all_filled_trades=None):
         """Render historical growth line chart for individual positions within a selected label."""
