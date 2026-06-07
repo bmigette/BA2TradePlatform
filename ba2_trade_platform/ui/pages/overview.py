@@ -1432,7 +1432,7 @@ class AccountOverviewTab:
                 positions_table.add_slot('body-cell-labels', r'''
                     <q-td :props="props">
                         <q-chip v-for="l in props.row.labels_list" :key="l" dense size="sm"
-                                color="primary" text-color="white" class="q-ma-none q-mr-xs">{{ l }}</q-chip>
+                                color="indigo-5" text-color="white" class="q-ma-none q-mr-xs">{{ l }}</q-chip>
                         <span v-if="!props.row.labels_list || props.row.labels_list.length === 0"
                               class="text-grey-6">—</span>
                     </q-td>
