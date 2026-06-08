@@ -5132,7 +5132,7 @@ class AccountGrowthTab:
             # Monthly realized income (closed-trade P&L + cash dividends), incl. per-label
             try:
                 months, monthly_income, monthly_by_label, income_labels = await asyncio.to_thread(
-                    self._compute_monthly_realized, selected_account_id, all_dividends
+                    self._compute_monthly_realized, all_filled_trades, all_dividends
                 )
             except Exception as e:
                 logger.warning(f"Could not compute monthly realized income: {e}")
@@ -5158,58 +5158,70 @@ class AccountGrowthTab:
             except RuntimeError:
                 pass
 
-    def _compute_monthly_realized(self, selected_account_id, all_dividends):
-        """Aggregate realized closed-trade P&L and cash dividends by month (and by label).
+    def _compute_monthly_realized(self, all_filled_trades, all_dividends):
+        """Aggregate realized closed-trade P&L and dividend income by month (and by label).
 
-        Reinvested (DRIP) dividends are excluded — they are already reflected in
-        portfolio value, so counting them as income would double-count.
+        Realized P&L is derived from broker FILLS via per-symbol FIFO matching (a SELL
+        realizes against the oldest open BUY lots). This works for read-only broker
+        accounts (e.g. TastyTrade) that have no local platform transactions, as well as
+        trading accounts. The realizing month is the month of the SELL.
 
-        Returns (months, monthly_income, monthly_by_label, labels):
-          months: sorted list of 'YYYY-MM'
-          monthly_income: {month: {'pnl': float, 'div': float}}
-          monthly_by_label: {month: {label: pnl}}
-          labels: sorted list of all labels seen
+        Dividend income includes ALL dividends received (cash + reinvested) — this is the
+        income earned that month. (The portfolio-value chart separately excludes
+        reinvested dividends to avoid double-counting against share value.)
+
+        Returns (months, monthly_income, monthly_by_label, labels).
         """
-        from ...core.types import TransactionStatus
+        from collections import defaultdict, deque
 
-        expert_ids = get_expert_ids_for_account(selected_account_id)
         monthly_income = {}
         monthly_by_label = {}
         labels_set = set()
 
-        # Closed transactions -> realized P&L
-        with get_db() as session:
-            q = select(Transaction).where(
-                Transaction.status == TransactionStatus.CLOSED,
-                Transaction.close_date.isnot(None),
-            )
-            if expert_ids is not None and not expert_ids:
-                closed = []
-            else:
-                if expert_ids:
-                    q = q.where(Transaction.expert_id.in_(expert_ids))
-                closed = session.exec(q).all()
+        # Group fills by symbol
+        trades_by_sym = defaultdict(list)
+        for t in (all_filled_trades or []):
+            sym = t.get('symbol')
+            if sym and t.get('date'):
+                trades_by_sym[sym].append(t)
 
-        symbols = sorted({t.symbol for t in closed if t.symbol})
+        symbols = sorted(trades_by_sym.keys())
         labels_by_symbol = get_labels_by_symbol(symbols) if symbols else {}
 
-        for txn in closed:
-            pnl = calculate_transaction_pnl(txn)
-            if pnl is None:
-                continue
-            cd = txn.close_date
-            month = cd.strftime('%Y-%m') if hasattr(cd, 'strftime') else str(cd)[:7]
-            monthly_income.setdefault(month, {'pnl': 0.0, 'div': 0.0})['pnl'] += pnl
-            lbls = labels_by_symbol.get(txn.symbol) or ['Unlabeled']
-            mlbl = monthly_by_label.setdefault(month, {})
-            for lb in lbls:
-                mlbl[lb] = mlbl.get(lb, 0.0) + pnl
-                labels_set.add(lb)
+        # FIFO realized P&L per symbol
+        for sym, trades in trades_by_sym.items():
+            trades.sort(key=lambda x: str(x.get('date')))
+            lots = deque()  # open BUY lots: [qty, price]
+            for t in trades:
+                side = (t.get('side') or '').upper()
+                qty = abs(float(t.get('qty', 0) or 0))
+                price = float(t.get('price', 0) or 0)
+                if qty <= 0:
+                    continue
+                if side == 'BUY':
+                    lots.append([qty, price])
+                elif side == 'SELL':
+                    remaining, realized = qty, 0.0
+                    while remaining > 1e-9 and lots:
+                        lot = lots[0]
+                        take = min(remaining, lot[0])
+                        realized += take * (price - lot[1])
+                        lot[0] -= take
+                        remaining -= take
+                        if lot[0] <= 1e-9:
+                            lots.popleft()
+                    if abs(realized) < 1e-9 and remaining > 0:
+                        continue  # sell with no matching buy in window — skip
+                    dt = t.get('date')
+                    month = dt.strftime('%Y-%m') if hasattr(dt, 'strftime') else str(dt)[:7]
+                    monthly_income.setdefault(month, {'pnl': 0.0, 'div': 0.0})['pnl'] += realized
+                    mlbl = monthly_by_label.setdefault(month, {})
+                    for lb in (labels_by_symbol.get(sym) or ['Unlabeled']):
+                        mlbl[lb] = mlbl.get(lb, 0.0) + realized
+                        labels_set.add(lb)
 
-        # Cash dividends by month (exclude reinvested/DRIP)
+        # Dividend income by month (all dividends — cash received + reinvested)
         for div in (all_dividends or []):
-            if div.get('drip_quantity'):
-                continue
             dt = div.get('date')
             if not dt:
                 continue
@@ -5227,7 +5239,7 @@ class AccountGrowthTab:
         return months, monthly_income, monthly_by_label, sorted(labels_set)
 
     def _render_monthly_realized_income_chart(self, months, monthly_income):
-        """Histogram of monthly realized income: closed-trade P&L, cash dividends, and net total."""
+        """Histogram of monthly realized income: closed-trade P&L, dividends, and net total."""
         with ui.card().classes('w-full mb-4 p-4'):
             ui.label('Monthly Realized Income').classes('text-md font-bold mb-2')
             if not months:
