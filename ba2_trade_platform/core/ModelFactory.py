@@ -40,6 +40,36 @@ _INLINE_PARAM_RESOLVERS = {
     "reasoning_effort": lambda value: {"reasoning": {"effort": value}},
 }
 
+# Anthropic extended thinking budget_tokens per effort level (classic API)
+_ANTHROPIC_THINKING_BUDGETS = {
+    "low": 1024,
+    "medium": 8000,
+    "high": 16000,
+}
+
+
+def _anthropic_thinking_from_effort(effort: str, thinking_api: str = "budget") -> dict:
+    """Convert a reasoning_effort level to the Anthropic model_kwargs dict.
+
+    Two API variants exist:
+    - "budget"   (classic, e.g. claude-opus-4-20250514): thinking={type,budget_tokens}
+    - "adaptive" (newer, e.g. claude-opus-4-8, claude-sonnet-4-6):
+                 thinking={type:adaptive} + output_config={effort:X}
+    Returns a flat dict that is merged into model_kwargs.
+    """
+    if effort == "none":
+        return {"thinking": {"type": "disabled"}}
+
+    if thinking_api == "adaptive":
+        return {
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": effort},
+        }
+
+    # Classic budget format
+    budget = _ANTHROPIC_THINKING_BUDGETS.get(effort, _ANTHROPIC_THINKING_BUDGETS["medium"])
+    return {"thinking": {"type": "enabled", "budget_tokens": budget}}
+
 
 def _resolve_inline_params(inline_params: dict) -> dict:
     """
@@ -175,7 +205,18 @@ class ModelFactory:
             if not provider:
                 raise ValueError(f"Model {friendly_name} has no native provider defined")
             logger.debug(f"Resolved native provider to: {provider}")
-        
+
+        # Anthropic uses a different parameter for reasoning.
+        # The generic resolver produced reasoning={effort:X}; convert it to the model's
+        # specific thinking API ("budget" for classic models, "adaptive" for newer ones).
+        if provider == PROVIDER_ANTHROPIC and model_kwargs and "reasoning" in model_kwargs:
+            reasoning_obj = model_kwargs.pop("reasoning")
+            effort = reasoning_obj.get("effort", "medium")
+            thinking_api = model_info.get("thinking_api", "budget")
+            thinking_params = _anthropic_thinking_from_effort(effort, thinking_api)
+            model_kwargs.update(thinking_params)
+            logger.debug(f"Converted reasoning_effort='{effort}' ({thinking_api} API) to Anthropic params: {thinking_params}")
+
         # Get the provider-specific model name
         provider_model_name = get_model_for_provider(friendly_name, provider)
         if not provider_model_name:
@@ -244,7 +285,15 @@ class ModelFactory:
         merged_model_kwargs = {**default_kwargs, **(model_kwargs or {})}
         if merged_model_kwargs:
             logger.debug(f"Final merged model_kwargs: {merged_model_kwargs}")
-        
+
+        # Anthropic requires temperature=1 when extended thinking is enabled.
+        # Only override if the model actually accepts temperature (not claude_opus_4_8 etc.)
+        if provider == PROVIDER_ANTHROPIC and not model_info.get("no_temperature", False):
+            thinking = (merged_model_kwargs or {}).get("thinking", {})
+            if isinstance(thinking, dict) and thinking.get("type") == "enabled":
+                effective_temperature = 1.0
+                logger.debug("Forcing temperature=1.0 for Anthropic extended thinking")
+
         # Build LLM based on provider type
         langchain_class = provider_config.get("langchain_class", "ChatOpenAI")
         
@@ -476,12 +525,21 @@ class ModelFactory:
         
         if callbacks:
             llm_params["callbacks"] = callbacks
-        
+
         if model_kwargs:
-            llm_params["model_kwargs"] = model_kwargs
-        
+            # langchain_anthropic supports thinking and output_config as direct kwargs
+            remaining = dict(model_kwargs)
+            thinking = remaining.pop("thinking", None)
+            output_config = remaining.pop("output_config", None)
+            if thinking is not None:
+                llm_params["thinking"] = thinking
+            if output_config is not None:
+                llm_params["output_config"] = output_config
+            if remaining:
+                llm_params["model_kwargs"] = remaining
+
         llm_params.update(extra_kwargs)
-        
+
         logger.info(f"Creating ChatAnthropic: model={model_name}")
         return ChatAnthropic(**llm_params)
     
