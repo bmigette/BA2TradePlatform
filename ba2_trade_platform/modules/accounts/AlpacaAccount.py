@@ -140,7 +140,6 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             "api_key": {"type": 'str', "required": True, "description": "Alpaca API Key ID"},
             "api_secret": {"type": 'str', "required": True, "description": "Alpaca API Secret Key"},
             "paper_account": {"type": 'bool', "required": True, "description": "Is this a paper trading account?"},
-            "drip_enabled": {"type": 'bool', "required": False, "default": False, "description": "Is DRIP (Dividend Reinvestment Plan) enabled?"},
             "data_feed": {
                 "type": "str",
                 "required": False,
@@ -4387,10 +4386,6 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         except Exception as e:
             logger.error(f"[Account {self.id}] Error fetching balance history: {e}", exc_info=True)
             return []
-
-    def is_drip_enabled(self):
-        """Check if DRIP is enabled via account settings."""
-        return bool(self.settings.get("drip_enabled", False))
 
     def get_filled_trades(self, symbol=None, start_date=None, end_date=None):
         """Get filled trade history from Alpaca closed orders."""

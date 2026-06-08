@@ -110,12 +110,6 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
                 "required": False,
                 "default": False,
                 "description": "Use sandbox/test environment"
-            },
-            "drip_enabled": {
-                "type": "bool",
-                "required": False,
-                "default": False,
-                "description": "Is DRIP (Dividend Reinvestment Plan) enabled?"
             }
         }
 
@@ -478,9 +472,6 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
         except Exception as e:
             logger.error(f"[Account {self.id}] Error fetching balance history: {e}", exc_info=True)
             return []
-
-    def is_drip_enabled(self) -> bool:
-        return bool(self.settings.get("drip_enabled", False))
 
     def get_filled_trades(self, symbol=None, start_date=None, end_date=None) -> List[Dict]:
         """Get filled trade history from TastyTrade transaction history."""

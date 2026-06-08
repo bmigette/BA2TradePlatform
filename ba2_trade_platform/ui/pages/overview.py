@@ -5574,7 +5574,9 @@ class AccountGrowthTab:
 
         # Build cumulative invested per label per date:
         # base = qty_at_first_date * (cost_basis / current_qty) for each symbol,
-        # then add/subtract actual BUY/SELL trade costs within the chart window.
+        # then add/subtract actual BUY/SELL trade costs within the chart window,
+        # plus DRIP reinvested money (drip_qty * drip_price) — reinvested dividends
+        # now count as invested capital.
         label_cum_invested = {label: [0.0] * len(all_dates) for label in all_labels}
         for sym, info in symbol_info.items():
             current_qty = info['qty']
@@ -5604,6 +5606,21 @@ class AccountGrowthTab:
                     trade_deltas[idx] += cost
                 elif t.get('side') == 'SELL':
                     trade_deltas[idx] -= cost
+            # DRIP reinvested money counts as invested (detected from dividend logs)
+            for div in (all_dividends or []):
+                if div.get('symbol') != sym:
+                    continue
+                drip_qty = div.get('drip_quantity')
+                drip_price = div.get('drip_price')
+                if not drip_qty or not drip_price:
+                    continue
+                date_val = div.get('date')
+                if not date_val:
+                    continue
+                d_date = date_val.strftime('%Y-%m-%d') if hasattr(date_val, 'strftime') else str(date_val)[:10]
+                if d_date not in date_to_idx:
+                    continue
+                trade_deltas[date_to_idx[d_date]] += float(drip_qty) * float(drip_price)
             # Cumulate
             running = base_invested
             for i in range(len(all_dates)):
@@ -6141,9 +6158,6 @@ class AccountGrowthTab:
             if sym:
                 trades_by_symbol.setdefault(sym, []).append(t)
 
-        # Check drip_enabled once per account (cache by account instance id)
-        drip_cache = {}
-
         with ui.card().classes('w-full mb-4 p-4'):
             ui.label('Per-Position Growth').classes('text-md font-bold mb-2')
 
@@ -6162,11 +6176,6 @@ class AccountGrowthTab:
                     # Use pre-fetched dividends and trades instead of fetching per-symbol
                     dividends = divs_by_symbol.get(symbol, [])
                     filled_trades = trades_by_symbol.get(symbol, [])
-
-                    acc_id = id(account_inst)
-                    if acc_id not in drip_cache:
-                        drip_cache[acc_id] = await asyncio.to_thread(account_inst.is_drip_enabled)
-                    drip_enabled = drip_cache[acc_id]
 
                     # Fetch historical prices from Yahoo Finance
                     import yfinance as yf
@@ -6188,7 +6197,7 @@ class AccountGrowthTab:
                     avg_price = position_avg_price.get(symbol, 0)
                     with container:
                         self._render_position_growth_chart_from_data(
-                            symbol, dividends, drip_enabled, hist_prices, qty,
+                            symbol, dividends, hist_prices, qty,
                             filled_trades=filled_trades, avg_entry_price=avg_price
                         )
                 except RuntimeError:
@@ -6218,10 +6227,15 @@ class AccountGrowthTab:
                 if account_inst:
                     asyncio.create_task(_load_position_chart(chart_container, account_inst, initial_symbol))
 
-    def _render_position_growth_chart_from_data(self, symbol, dividends, drip_enabled,
+    def _render_position_growth_chart_from_data(self, symbol, dividends,
                                                 hist_prices=None, current_qty=0,
                                                 filled_trades=None, avg_entry_price=0):
-        """Render growth chart for a single position from pre-fetched data."""
+        """Render growth chart for a single position from pre-fetched data.
+
+        DRIP is detected purely from transaction logs: the cumulative DRIP-shares
+        line rises only on dates a reinvestment actually posted, so enabling/disabling
+        DRIP at the broker is reflected automatically without any account setting.
+        """
         hist_prices = hist_prices or {}
         has_dividends = bool(dividends)
         has_prices = bool(hist_prices)
@@ -6231,22 +6245,27 @@ class AccountGrowthTab:
             return
 
         # Build dividend data
-        div_map = {}  # date -> {cumulative_div, cumulative_drip}
+        div_map = {}  # date -> {cumulative_div, cumulative_drip, cumulative_drip_cost}
         if has_dividends:
             sorted_divs = sorted(dividends, key=lambda x: str(x.get('date', '')))
             cumulative = 0
             cumulative_drip = 0
+            cumulative_drip_cost = 0.0  # reinvested dollars = drip_qty * drip_price
             for div in sorted_divs:
                 date_val = div.get('date')
                 if date_val:
                     date_str = date_val.strftime('%Y-%m-%d') if hasattr(date_val, 'strftime') else str(date_val)
                     cumulative += float(div.get('amount', 0)) - float(div.get('tax_withheld', 0))
                     drip_qty = div.get('drip_quantity')
+                    drip_price = div.get('drip_price')
                     if drip_qty:
                         cumulative_drip += float(drip_qty)
+                        if drip_price:
+                            cumulative_drip_cost += float(drip_qty) * float(drip_price)
                     div_map[date_str] = {
                         'cumulative_div': round(cumulative, 2),
                         'cumulative_drip': round(cumulative_drip, 4),
+                        'cumulative_drip_cost': round(cumulative_drip_cost, 2),
                     }
 
         # Merge all dates from prices and dividends
@@ -6295,17 +6314,19 @@ class AccountGrowthTab:
                 cost_events[d]['qty_delta'] += float(drip_qty)
 
         # Build aligned series with forward-fill
-        # Position Value = purchased shares only (qty - DRIP shares) × price
-        # Total Value = all shares (qty including DRIP) × price — matches broker Net Liq
+        # Value = all shares (qty including DRIP) × price — matches broker Net Liq.
+        #   DRIP reinvested shares now count as invested, so we show a single value line
+        #   (no separate "purchased only" line) plus a dedicated "DRIP Invested" $ line.
         # P&L % = ((price - running_avg) / running_avg) * 100 — evolves with cost basis
-        position_values = []
-        total_values = []
+        values = []
         pnl_pct_data = []
         cumulative_divs = []
         drip_quantities = []
+        drip_invested = []  # cumulative reinvested dollars (drip_qty × drip_price)
         last_price = None
         last_div = 0
         last_drip = 0
+        last_drip_cost = 0.0
         running_cost = 0.0
         running_shares = 0.0
 
@@ -6316,8 +6337,10 @@ class AccountGrowthTab:
             if d in div_map:
                 last_div = div_map[d]['cumulative_div']
                 last_drip = div_map[d]['cumulative_drip']
+                last_drip_cost = div_map[d]['cumulative_drip_cost']
             cumulative_divs.append(last_div)
             drip_quantities.append(last_drip)
+            drip_invested.append(last_drip_cost)
 
             # Update running cost basis
             if d in cost_events:
@@ -6333,9 +6356,7 @@ class AccountGrowthTab:
 
             qty_at_date = qty_by_date.get(d, 0)
             if qty_at_date > 0 and last_price:
-                purchased_qty = max(qty_at_date - last_drip, 0)
-                position_values.append(round(purchased_qty * last_price, 2))
-                total_values.append(round(qty_at_date * last_price, 2))
+                values.append(round(qty_at_date * last_price, 2))
                 if running_shares > 0:
                     running_avg = running_cost / running_shares
                     pnl_pct = round((last_price - running_avg) / running_avg * 100, 2)
@@ -6343,13 +6364,13 @@ class AccountGrowthTab:
                 else:
                     pnl_pct_data.append(None)
             else:
-                position_values.append(None)
-                total_values.append(None)
+                values.append(None)
                 pnl_pct_data.append(None)
 
         # Check if we have P&L data
         has_pnl = any(v is not None for v in pnl_pct_data)
-        has_drip = drip_enabled and any(q > 0 for q in drip_quantities)
+        # DRIP detected purely from transaction logs (no account setting)
+        has_drip = any(q > 0 for q in drip_quantities)
 
         # Single left axis for all $ values; optional right axis for DRIP shares only
         y_axes = [{
@@ -6359,12 +6380,13 @@ class AccountGrowthTab:
             'splitLine': {'lineStyle': {'color': 'rgba(255, 255, 255, 0.05)'}},
         }]
 
-        # Position Value line
+        # Value line — all shares (incl. DRIP) × price. Single headline line since
+        # reinvested DRIP shares now count as invested (matches broker Net Liq).
         series = [{
-            'name': 'Position Value',
+            'name': 'Value',
             'type': 'line',
             'yAxisIndex': 0,
-            'data': position_values,
+            'data': values,
             'smooth': True,
             'showSymbol': False,
             'lineStyle': {'width': 2, 'color': '#1976D2'},
@@ -6380,16 +6402,16 @@ class AccountGrowthTab:
             },
         }]
 
-        # Total Value (all shares incl. DRIP) — matches broker Net Liq
-        if has_dividends and last_div > 0:
+        # DRIP Invested ($) — cumulative reinvested dollars, on the same $ axis.
+        if has_drip:
             series.append({
-                'name': 'Total Value (incl. DRIP)',
+                'name': 'DRIP Invested',
                 'type': 'line',
                 'yAxisIndex': 0,
-                'data': total_values,
+                'data': drip_invested,
                 'smooth': True,
                 'showSymbol': False,
-                'lineStyle': {'width': 2, 'color': '#AB47BC'},
+                'lineStyle': {'width': 2, 'color': '#AB47BC', 'type': 'dashed'},
                 'itemStyle': {'color': '#AB47BC'},
             })
 

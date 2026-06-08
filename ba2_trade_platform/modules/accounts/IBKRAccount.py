@@ -140,12 +140,6 @@ class IBKRAccount(AccountInterface):
                 "required": True,
                 "default": True,
                 "description": "Whether this is a paper trading account"
-            },
-            "drip_enabled": {
-                "type": "bool",
-                "required": False,
-                "default": False,
-                "description": "Is DRIP (Dividend Reinvestment Plan) enabled?"
             }
         }
     
@@ -615,7 +609,3 @@ class IBKRAccount(AccountInterface):
         """Get filled trade history from IBKR. Returns empty list as IBKR API trade history access is limited."""
         logger.warning(f"[Account {self.id}] IBKR filled trade history retrieval not fully supported via API")
         return []
-
-    def is_drip_enabled(self):
-        """Check if DRIP is enabled via account settings."""
-        return bool(self.settings.get("drip_enabled", False))

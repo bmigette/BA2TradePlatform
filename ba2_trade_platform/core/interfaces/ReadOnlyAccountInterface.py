@@ -781,13 +781,3 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                 - equity_value (float): Equity/positions portion
         """
         pass
-
-    @abstractmethod
-    def is_drip_enabled(self) -> bool:
-        """
-        Check if Dividend Reinvestment Plan (DRIP) is enabled for this account.
-
-        Returns:
-            bool: True if DRIP is enabled, False otherwise
-        """
-        pass

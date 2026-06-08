@@ -184,9 +184,6 @@ class MockAccount(AccountInterface, OptionsAccountInterface):
     def get_balance_history(self, start_date=None, end_date=None):
         return []
 
-    def is_drip_enabled(self):
-        return False
-
     # --- OptionsAccountInterface (canned doubles) ---
     def _mk_contract(self, underlying, right, strike, expiry):
         from ba2_trade_platform.core.option_types import OptionContract
