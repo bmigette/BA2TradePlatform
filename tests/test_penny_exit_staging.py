@@ -7,6 +7,7 @@ as a wash trade. Instead the SELL is staged as a WAITING_TRIGGER order that depe
 on the entry reaching FILLED, and every PennyMomentum exit is stamped
 ``fixed_quantity`` so its deliberate (possibly partial) size is never rewritten.
 """
+from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -175,3 +176,91 @@ def test_exit_submits_immediately_when_entry_filled():
     assert sell.depends_on_order is None
     # Even an immediately-submitted partial exit is flagged so it is never resized.
     assert sell.data and sell.data.get("fixed_quantity") is True
+
+
+# ---------------------------------------------------------------------------
+# execute_exit retry-storm guards (failed-exit cooldown + non-tradable stop)
+# ---------------------------------------------------------------------------
+
+def _all_sells_for(transaction_id):
+    from sqlmodel import select
+    with get_db() as session:
+        return session.exec(
+            select(TradingOrder)
+            .where(TradingOrder.transaction_id == transaction_id)
+            .where(TradingOrder.side == OrderDirection.SELL)
+        ).all()
+
+
+def _setup_open_position(inst_id, account_id, symbol="SUUN"):
+    txn = create_transaction(
+        symbol=symbol, quantity=207.0, status=TransactionStatus.OPENED,
+        expert_id=inst_id,
+    )
+    create_trading_order(
+        account_id=account_id, symbol=symbol, quantity=207.0,
+        side=OrderDirection.BUY, status=OrderStatus.FILLED,
+        filled_qty=207.0, transaction_id=txn.id,
+    )
+    return txn
+
+
+def test_exit_permanently_blocked_when_asset_not_active():
+    """A non-tradable asset (Alpaca 'asset X is not active') must stop retrying."""
+    account = _CapturingAccount()
+    mgr, inst = _make_trade_manager(account)
+    txn = _setup_open_position(inst.id, mgr.account_id)
+    # Prior failed exit rejected by broker as non-tradable.
+    create_trading_order(
+        account_id=mgr.account_id, symbol="SUUN", quantity=207.0,
+        side=OrderDirection.SELL, status=OrderStatus.ERROR,
+        transaction_id=txn.id,
+        comment='PennyMomentum exit: stop loss triggered | Error: '
+                '{"code":40010001,"message":"asset SUUN is not active"}',
+        created_at=datetime.now(timezone.utc),
+    )
+
+    mgr.execute_exit("SUUN", exit_pct=100.0, reason="stop loss triggered")
+
+    # No new broker submission and no new SELL order was created.
+    assert account.submitted == []
+    assert len(_all_sells_for(txn.id)) == 1
+
+
+def test_exit_skipped_during_cooldown_after_transient_error():
+    """A recent transient failure must back off (no immediate re-submit)."""
+    account = _CapturingAccount()
+    mgr, inst = _make_trade_manager(account)
+    txn = _setup_open_position(inst.id, mgr.account_id, symbol="BBAI")
+    create_trading_order(
+        account_id=mgr.account_id, symbol="BBAI", quantity=207.0,
+        side=OrderDirection.SELL, status=OrderStatus.ERROR,
+        transaction_id=txn.id,
+        comment='PennyMomentum exit: stop loss triggered | Error: connection reset',
+        created_at=datetime.now(timezone.utc),  # just failed
+    )
+
+    mgr.execute_exit("BBAI", exit_pct=100.0, reason="stop loss triggered")
+
+    assert account.submitted == []
+    assert len(_all_sells_for(txn.id)) == 1
+
+
+def test_exit_retries_after_cooldown_for_transient_error():
+    """Once the cooldown elapses, a transient failure is retried."""
+    account = _CapturingAccount()
+    mgr, inst = _make_trade_manager(account)
+    txn = _setup_open_position(inst.id, mgr.account_id, symbol="BBAI")
+    create_trading_order(
+        account_id=mgr.account_id, symbol="BBAI", quantity=207.0,
+        side=OrderDirection.SELL, status=OrderStatus.ERROR,
+        transaction_id=txn.id,
+        comment='PennyMomentum exit: stop loss triggered | Error: connection reset',
+        created_at=datetime.now(timezone.utc) - timedelta(hours=2),  # long ago
+    )
+
+    mgr.execute_exit("BBAI", exit_pct=100.0, reason="stop loss triggered")
+
+    # Cooldown elapsed -> a fresh exit is submitted.
+    assert len(account.submitted) == 1
+    assert len(_all_sells_for(txn.id)) == 2

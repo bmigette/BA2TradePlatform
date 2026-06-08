@@ -8,6 +8,7 @@ Manages:
 4. Handling partial and full exits
 """
 
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
 
 from sqlmodel import select
@@ -21,6 +22,21 @@ from ba2_trade_platform.core.types import (
     OrderType, TransactionStatus,
 )
 from ba2_trade_platform.logger import logger
+
+
+# Back-off window before retrying an exit whose previous attempt failed with a
+# transient broker error. Prevents a once-per-monitor-tick retry storm.
+_EXIT_RETRY_COOLDOWN = timedelta(minutes=30)
+
+# Substrings (lowercase) in a rejected exit order's comment that mean the asset is
+# permanently non-tradable (e.g. delisted/halted). When seen, auto-exits stop
+# entirely — retrying can never succeed and only floods the order table.
+_NON_TRADABLE_ERROR_MARKERS = (
+    "not active",
+    "not tradable",
+    "not currently tradable",
+    "is not tradeable",
+)
 
 
 def find_open_entry_buy(session, transaction_id: int):
@@ -293,6 +309,47 @@ class PennyTradeManager:
                 )
                 any_success = True
                 continue
+
+            # Guard against exit retry storms. Inspect the most recent SELL for this
+            # transaction; a terminal ERROR means the previous exit was rejected by
+            # the broker. Two cases:
+            #   * permanently non-tradable asset (delisted/halted) -> stop forever
+            #   * any other (transient) failure -> back off for a cooldown window
+            # Without this, a stop-loss on a frozen symbol re-fires every monitor
+            # tick and floods the order table (see SUUN: 296 ERROR sells in 5h).
+            with get_db() as session:
+                last_sell = session.exec(
+                    select(TradingOrder)
+                    .where(TradingOrder.transaction_id == trans.id)
+                    .where(TradingOrder.side == OrderDirection.SELL)
+                    .order_by(TradingOrder.created_at.desc())
+                ).first()
+            if last_sell is not None and last_sell.status == OrderStatus.ERROR:
+                comment = (last_sell.comment or "").lower()
+                if any(marker in comment for marker in _NON_TRADABLE_ERROR_MARKERS):
+                    logger.error(
+                        f"PennyTradeManager: exit for {symbol} permanently blocked — "
+                        f"broker rejects the asset as non-tradable (last exit order "
+                        f"{last_sell.id}: {last_sell.comment}). No further auto-exit "
+                        f"attempts; transaction {trans.id} needs manual resolution."
+                    )
+                    any_success = True
+                    continue
+                last_ts = last_sell.created_at
+                if last_ts is not None:
+                    if last_ts.tzinfo is None:
+                        last_ts = last_ts.replace(tzinfo=timezone.utc)
+                    age = datetime.now(timezone.utc) - last_ts
+                    if age < _EXIT_RETRY_COOLDOWN:
+                        mins = int(age.total_seconds() // 60)
+                        cd = int(_EXIT_RETRY_COOLDOWN.total_seconds() // 60)
+                        logger.warning(
+                            f"PennyTradeManager: exit for {symbol} skipped — previous "
+                            f"exit order {last_sell.id} failed {mins}m ago (< {cd}m "
+                            f"cooldown). Last error: {last_sell.comment}"
+                        )
+                        any_success = True
+                        continue
 
             exit_qty = int(current_qty * exit_pct / 100.0)
             if exit_qty <= 0:
