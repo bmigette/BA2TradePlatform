@@ -5129,8 +5129,20 @@ class AccountGrowthTab:
                 except Exception as e:
                     logger.warning(f"Could not fetch historical prices: {e}")
 
+            # Monthly realized income (closed-trade P&L + cash dividends), incl. per-label
+            try:
+                months, monthly_income, monthly_by_label, income_labels = await asyncio.to_thread(
+                    self._compute_monthly_realized, selected_account_id, all_dividends
+                )
+            except Exception as e:
+                logger.warning(f"Could not compute monthly realized income: {e}")
+                months, monthly_income, monthly_by_label, income_labels = [], {}, {}, []
+
             try:
                 with charts_container:
+                    # New monthly histograms at the top
+                    self._render_monthly_realized_income_chart(months, monthly_income)
+                    self._render_monthly_profit_by_label_chart(months, monthly_by_label, income_labels)
                     self._render_total_growth_chart(all_balance_history, all_dividends, all_filled_trades)
                     self._render_growth_by_label_charts(all_positions, historical_prices, all_dividends, all_filled_trades)
                     self._render_growth_by_position_in_label_charts(all_positions, historical_prices, all_dividends, all_filled_trades)
@@ -5145,6 +5157,151 @@ class AccountGrowthTab:
                 loading_label.set_text(f'Error loading growth data: {str(e)}')
             except RuntimeError:
                 pass
+
+    def _compute_monthly_realized(self, selected_account_id, all_dividends):
+        """Aggregate realized closed-trade P&L and cash dividends by month (and by label).
+
+        Reinvested (DRIP) dividends are excluded — they are already reflected in
+        portfolio value, so counting them as income would double-count.
+
+        Returns (months, monthly_income, monthly_by_label, labels):
+          months: sorted list of 'YYYY-MM'
+          monthly_income: {month: {'pnl': float, 'div': float}}
+          monthly_by_label: {month: {label: pnl}}
+          labels: sorted list of all labels seen
+        """
+        from ...core.types import TransactionStatus
+
+        expert_ids = get_expert_ids_for_account(selected_account_id)
+        monthly_income = {}
+        monthly_by_label = {}
+        labels_set = set()
+
+        # Closed transactions -> realized P&L
+        with get_db() as session:
+            q = select(Transaction).where(
+                Transaction.status == TransactionStatus.CLOSED,
+                Transaction.close_date.isnot(None),
+            )
+            if expert_ids is not None and not expert_ids:
+                closed = []
+            else:
+                if expert_ids:
+                    q = q.where(Transaction.expert_id.in_(expert_ids))
+                closed = session.exec(q).all()
+
+        symbols = sorted({t.symbol for t in closed if t.symbol})
+        labels_by_symbol = get_labels_by_symbol(symbols) if symbols else {}
+
+        for txn in closed:
+            pnl = calculate_transaction_pnl(txn)
+            if pnl is None:
+                continue
+            cd = txn.close_date
+            month = cd.strftime('%Y-%m') if hasattr(cd, 'strftime') else str(cd)[:7]
+            monthly_income.setdefault(month, {'pnl': 0.0, 'div': 0.0})['pnl'] += pnl
+            lbls = labels_by_symbol.get(txn.symbol) or ['Unlabeled']
+            mlbl = monthly_by_label.setdefault(month, {})
+            for lb in lbls:
+                mlbl[lb] = mlbl.get(lb, 0.0) + pnl
+                labels_set.add(lb)
+
+        # Cash dividends by month (exclude reinvested/DRIP)
+        for div in (all_dividends or []):
+            if div.get('drip_quantity'):
+                continue
+            dt = div.get('date')
+            if not dt:
+                continue
+            month = dt.strftime('%Y-%m') if hasattr(dt, 'strftime') else str(dt)[:7]
+            amount = float(div.get('amount', 0)) - float(div.get('tax_withheld', 0))
+            monthly_income.setdefault(month, {'pnl': 0.0, 'div': 0.0})['div'] += amount
+
+        months = sorted(monthly_income.keys())
+        for m in months:
+            monthly_income[m]['pnl'] = round(monthly_income[m]['pnl'], 2)
+            monthly_income[m]['div'] = round(monthly_income[m]['div'], 2)
+        for m in monthly_by_label:
+            for lb in monthly_by_label[m]:
+                monthly_by_label[m][lb] = round(monthly_by_label[m][lb], 2)
+        return months, monthly_income, monthly_by_label, sorted(labels_set)
+
+    def _render_monthly_realized_income_chart(self, months, monthly_income):
+        """Histogram of monthly realized income: closed-trade P&L, cash dividends, and net total."""
+        with ui.card().classes('w-full mb-4 p-4'):
+            ui.label('Monthly Realized Income').classes('text-md font-bold mb-2')
+            if not months:
+                ui.label('No closed trades or dividend income yet.').classes('text-sm text-gray-500')
+                return
+            pnl = [monthly_income[m]['pnl'] for m in months]
+            div = [monthly_income[m]['div'] for m in months]
+            total = [round(monthly_income[m]['pnl'] + monthly_income[m]['div'], 2) for m in months]
+            ui.echart({
+                'backgroundColor': 'transparent',
+                'tooltip': {'trigger': 'axis', 'axisPointer': {'type': 'shadow'}},
+                'legend': {'data': ['Closed P&L', 'Dividends', 'Total'], 'textStyle': {'color': '#a0aec0'}},
+                'grid': {'left': '3%', 'right': '3%', 'bottom': '3%', 'containLabel': True},
+                'xAxis': {'type': 'category', 'data': months,
+                          'axisLabel': {'color': '#a0aec0'}},
+                'yAxis': {'type': 'value', 'axisLabel': {'color': '#a0aec0', 'formatter': '${value}'},
+                          'splitLine': {'lineStyle': {'color': 'rgba(255,255,255,0.05)'}}},
+                'series': [
+                    {'name': 'Closed P&L', 'type': 'bar', 'data': pnl,
+                     'itemStyle': {'color': '#3b82f6'}},
+                    {'name': 'Dividends', 'type': 'bar', 'data': div,
+                     'itemStyle': {'color': '#22c55e'}},
+                    {'name': 'Total', 'type': 'bar', 'data': total,
+                     'itemStyle': {'color': '#f59e0b'}},
+                ],
+            }).classes('w-full').style('height: 320px')
+
+    def _render_monthly_profit_by_label_chart(self, months, monthly_by_label, labels):
+        """Grouped bars of monthly closed profit per label, with a label selector."""
+        with ui.card().classes('w-full mb-4 p-4'):
+            ui.label('Monthly Closed Profit by Label').classes('text-md font-bold mb-2')
+            if not months or not labels:
+                ui.label('No closed trades yet.').classes('text-sm text-gray-500')
+                return
+
+            colors = ['#1976D2', '#4CAF50', '#FF9800', '#E91E63', '#9C27B0',
+                      '#00BCD4', '#FF5722', '#795548', '#607D8B', '#CDDC39']
+            label_color = {lb: colors[i % len(colors)] for i, lb in enumerate(labels)}
+
+            def build_options(visible):
+                series = []
+                for lb in labels:
+                    if lb not in visible:
+                        continue
+                    series.append({
+                        'name': lb, 'type': 'bar',
+                        'data': [round(monthly_by_label.get(m, {}).get(lb, 0.0), 2) for m in months],
+                        'itemStyle': {'color': label_color[lb]},
+                    })
+                return {
+                    'backgroundColor': 'transparent',
+                    'tooltip': {'trigger': 'axis', 'axisPointer': {'type': 'shadow'}},
+                    'legend': {'data': [s['name'] for s in series], 'textStyle': {'color': '#a0aec0'}},
+                    'grid': {'left': '3%', 'right': '3%', 'bottom': '3%', 'containLabel': True},
+                    'xAxis': {'type': 'category', 'data': months, 'axisLabel': {'color': '#a0aec0'}},
+                    'yAxis': {'type': 'value', 'axisLabel': {'color': '#a0aec0', 'formatter': '${value}'},
+                              'splitLine': {'lineStyle': {'color': 'rgba(255,255,255,0.05)'}}},
+                    'series': series,
+                }
+
+            default_labels = [l for l in labels if l != 'auto_added'] or list(labels)
+            label_select = ui.select(options=list(labels), value=default_labels, multiple=True,
+                                     label='Labels shown').classes('w-72 mb-2')
+            chart_container = ui.column().classes('w-full')
+
+            def rebuild():
+                visible = list(label_select.value) if label_select.value else []
+                chart_container.clear()
+                with chart_container:
+                    ui.echart(build_options(visible)).classes('w-full').style('height: 320px')
+
+            with chart_container:
+                ui.echart(build_options(default_labels)).classes('w-full').style('height: 320px')
+            label_select.on_value_change(lambda e: rebuild())
 
     def _render_total_growth_chart(self, balance_history, dividends, all_filled_trades=None):
         """Render the total account growth line chart with price growth, cumulative dividends, and P/L %."""
@@ -5190,6 +5347,10 @@ class AccountGrowthTab:
                 sorted_divs = sorted(dividends, key=lambda x: str(x.get('date', '')))
                 cumulative = 0
                 for entry in sorted_divs:
+                    # Exclude reinvested (DRIP) dividends — they are already reflected in
+                    # portfolio value (they bought shares); counting them here double-counts.
+                    if entry.get('drip_quantity'):
+                        continue
                     date_val = entry.get('date')
                     if date_val:
                         date_str = date_val.strftime('%Y-%m-%d') if hasattr(date_val, 'strftime') else str(date_val)
@@ -5681,11 +5842,11 @@ class AccountGrowthTab:
                         })
                         legend_data.append(label)
 
-                    # Cumulative dividends (dashed)
+                    # Cumulative cash dividends (dashed) — reinvested DRIP excluded
                     if show_dividends and has_div:
                         div_name = f'{label} (Dividends)'
                         series.append({
-                            'name': div_name, 'type': 'line', 'data': label_cum_divs[label], 'smooth': True,
+                            'name': div_name, 'type': 'line', 'data': label_cum_cash_divs[label], 'smooth': True,
                             'lineStyle': {'width': 1.5, 'color': color, 'type': 'dashed'},
                             'itemStyle': {'color': color}, 'showSymbol': False, 'z': 2,
                         })
