@@ -286,13 +286,14 @@ class ModelFactory:
         if merged_model_kwargs:
             logger.debug(f"Final merged model_kwargs: {merged_model_kwargs}")
 
-        # Anthropic requires temperature=1 when extended thinking is enabled.
+        # Anthropic requires temperature=1 whenever thinking is active — both the
+        # classic "enabled" (budget_tokens) mode and the newer "adaptive" mode.
         # Only override if the model actually accepts temperature (not claude_opus_4_8 etc.)
         if provider == PROVIDER_ANTHROPIC and not model_info.get("no_temperature", False):
             thinking = (merged_model_kwargs or {}).get("thinking", {})
-            if isinstance(thinking, dict) and thinking.get("type") == "enabled":
+            if isinstance(thinking, dict) and thinking.get("type") in ("enabled", "adaptive"):
                 effective_temperature = 1.0
-                logger.debug("Forcing temperature=1.0 for Anthropic extended thinking")
+                logger.debug(f"Forcing temperature=1.0 for Anthropic thinking ({thinking.get('type')})")
 
         # Build LLM based on provider type
         langchain_class = provider_config.get("langchain_class", "ChatOpenAI")
