@@ -627,44 +627,53 @@ class ModelBillingUsage:
     
     @classmethod
     async def get_anthropic_usage_async(cls) -> Dict[str, Any]:
-        """Fetch Anthropic usage data from the API asynchronously.
-        
-        Note: Anthropic's API doesn't provide direct usage/billing endpoints.
-        This returns a placeholder indicating the API key status.
-        
+        """Fetch Anthropic usage data asynchronously.
+
+        If an Admin API key (``anthropic_admin_api_key``, starts with ``sk-ant-admin``)
+        is configured, the organization Cost Report API is queried for week/month spend.
+        Anthropic does not expose a remaining-prepaid-balance endpoint, so
+        ``remaining_credit`` stays ``None`` (check console.anthropic.com for balance).
+
+        Without an admin key, falls back to validating the regular API key.
+
         Returns:
-            Dictionary with usage status
+            Dictionary with usage status / cost
         """
         try:
-            api_key = cls._get_app_setting('anthropic_api_key')
-            
-            if not api_key:
+            admin_key = cls._get_app_setting('anthropic_admin_api_key')
+            regular_key = cls._get_app_setting('anthropic_api_key')
+
+            if admin_key:
+                if not admin_key.startswith('sk-ant-admin'):
+                    return {'error': 'Invalid Anthropic Admin key format (should start with "sk-ant-admin")'}
+                return await cls._get_anthropic_cost_report_async(admin_key)
+
+            if not regular_key:
                 return {'error': 'Anthropic API key not configured in settings'}
-            
-            # Anthropic doesn't have a public usage API - just validate the key
+
+            # No admin key: validate the regular key (no cost data available).
             headers = {
-                'x-api-key': api_key,
+                'x-api-key': regular_key,
                 'anthropic-version': '2023-06-01',
                 'Content-Type': 'application/json'
             }
-            
+
             try:
                 async with aiohttp.ClientSession() as session:
-                    # Try a minimal API call to verify the key works
                     test_url = 'https://api.anthropic.com/v1/messages'
                     test_payload = {
-                        'model': 'claude-3-haiku-20240307',
+                        'model': 'claude-haiku-4-5-20251001',
                         'max_tokens': 1,
                         'messages': [{'role': 'user', 'content': 'test'}]
                     }
-                    
+
                     async with session.post(test_url, headers=headers, json=test_payload, timeout=aiohttp.ClientTimeout(total=10)) as response:
-                        if response.status == 200 or response.status == 400:  # 400 means key is valid but request may be malformed
+                        if response.status in (200, 400):  # 400 = key valid, request shape rejected
                             return {
                                 'provider': 'anthropic',
                                 'provider_display': 'Anthropic',
                                 'status': 'configured',
-                                'note': 'Anthropic does not provide a usage API. Check console.anthropic.com for usage.',
+                                'note': 'Add an Admin API key (sk-ant-admin...) in settings to see spend.',
                                 'last_updated': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                             }
                         elif response.status == 401:
@@ -677,14 +686,89 @@ class ModelBillingUsage:
                                 'note': 'Could not verify API key status',
                                 'last_updated': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                             }
-                            
+
             except aiohttp.ClientError as e:
                 logger.error(f'Network error calling Anthropic API: {e}', exc_info=True)
                 return {'error': f'Network error: {str(e)}'}
-                
+
         except Exception as e:
             logger.error(f'Unexpected error checking Anthropic API: {e}', exc_info=True)
             return {'error': f'Unexpected error: {str(e)}'}
+
+    @classmethod
+    async def _get_anthropic_cost_report_async(cls, admin_key: str) -> Dict[str, Any]:
+        """Query the Anthropic Admin Cost Report API for week/month spend.
+
+        Endpoint: GET https://api.anthropic.com/v1/organizations/cost_report
+        Returns daily cost buckets; amounts are summed into week (7d) and month (30d).
+        """
+        now = datetime.now()
+        week_ago = now - timedelta(days=7)
+        month_ago = now - timedelta(days=30)
+
+        headers = {
+            'x-api-key': admin_key,
+            'anthropic-version': '2023-06-01',
+            'Content-Type': 'application/json',
+        }
+        cost_url = 'https://api.anthropic.com/v1/organizations/cost_report'
+        params = {
+            'starting_at': month_ago.strftime('%Y-%m-%dT00:00:00Z'),
+            'ending_at': now.strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'bucket_width': '1d',
+            'limit': 31,
+        }
+
+        try:
+            week_cost = 0.0
+            month_cost = 0.0
+            async with aiohttp.ClientSession() as session:
+                async with session.get(cost_url, headers=headers, params=params,
+                                       timeout=aiohttp.ClientTimeout(total=30)) as response:
+                    if response.status == 401:
+                        return {'error': 'Invalid Anthropic Admin API key'}
+                    if response.status == 403:
+                        return {'error': 'Anthropic Admin key lacks permission to read cost data'}
+                    if response.status != 200:
+                        error_text = await response.text()
+                        logger.error(f'Anthropic cost_report error {response.status}: {error_text}')
+                        return {'error': f'Anthropic cost API error ({response.status})'}
+
+                    data = await response.json()
+
+                    # Response: {"data": [{"starting_at": ISO, "results": [{"amount": "1.23", "currency": "USD"}]}]}
+                    for bucket in data.get('data', []):
+                        bucket_start = bucket.get('starting_at')
+                        try:
+                            bucket_date = datetime.fromisoformat(str(bucket_start).replace('Z', '+00:00')).replace(tzinfo=None)
+                        except Exception:
+                            bucket_date = now
+
+                        bucket_cost = 0.0
+                        for result in bucket.get('results', []):
+                            amount = result.get('amount', 0)
+                            try:
+                                bucket_cost += float(amount)
+                            except (ValueError, TypeError):
+                                continue
+
+                        month_cost += bucket_cost
+                        if bucket_date >= week_ago:
+                            week_cost += bucket_cost
+
+            return {
+                'provider': 'anthropic',
+                'provider_display': 'Anthropic',
+                'week_cost': week_cost,
+                'month_cost': month_cost,
+                'remaining_credit': None,  # Anthropic has no public balance endpoint
+                'status': 'configured',
+                'last_updated': now.strftime('%Y-%m-%d %H:%M:%S'),
+            }
+
+        except aiohttp.ClientError as e:
+            logger.error(f'Network error calling Anthropic cost API: {e}', exc_info=True)
+            return {'error': f'Network error: {str(e)}'}
     
     # =========================================================================
     # xAI (Grok) Usage Functions

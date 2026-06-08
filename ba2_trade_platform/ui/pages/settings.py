@@ -533,6 +533,7 @@ class AppSettingsTab:
         self.naga_ai_input = None
         self.naga_ai_admin_input = None
         self.anthropic_input = None
+        self.anthropic_admin_input = None
         self.google_input = None
         self.openrouter_input = None
         self.xai_input = None
@@ -566,6 +567,7 @@ class AppSettingsTab:
         naga_ai = session.exec(select(AppSetting).where(AppSetting.key == 'naga_ai_api_key')).first()
         naga_ai_admin = session.exec(select(AppSetting).where(AppSetting.key == 'naga_ai_admin_api_key')).first()
         anthropic = session.exec(select(AppSetting).where(AppSetting.key == 'anthropic_api_key')).first()
+        anthropic_admin = session.exec(select(AppSetting).where(AppSetting.key == 'anthropic_admin_api_key')).first()
         google = session.exec(select(AppSetting).where(AppSetting.key == 'google_api_key')).first()
         openrouter = session.exec(select(AppSetting).where(AppSetting.key == 'openrouter_api_key')).first()
         xai = session.exec(select(AppSetting).where(AppSetting.key == 'xai_api_key')).first()
@@ -617,6 +619,7 @@ class AppSettingsTab:
                     with ui.row().classes('w-full items-center gap-2'):
                         self.anthropic_input = ui.input(label='Anthropic API Key', value=anthropic.value_str if anthropic else '', password=True, password_toggle_button=True).classes('flex-1')
                         ui.link('Get Anthropic Key', 'https://console.anthropic.com/settings/keys', new_tab=True).classes('text-sm text-blue-600 underline')
+                    self.anthropic_admin_input = ui.input(label='Anthropic Admin API Key (sk-ant-admin..., for spend/usage data)', value=anthropic_admin.value_str if anthropic_admin else '', password=True, password_toggle_button=True).classes('w-full')
             
             with ui.expansion('Google (Gemini)', icon='auto_awesome').classes('w-full mb-2'):
                 with ui.column().classes('w-full gap-2'):
@@ -769,6 +772,7 @@ class AppSettingsTab:
 
             # Anthropic API Key
             self._save_app_setting(session, 'anthropic_api_key', self.anthropic_input.value)
+            self._save_app_setting(session, 'anthropic_admin_api_key', self.anthropic_admin_input.value)
             
             # Google API Key
             self._save_app_setting(session, 'google_api_key', self.google_input.value)

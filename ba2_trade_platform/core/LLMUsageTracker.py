@@ -320,13 +320,58 @@ class LLMUsageCallback(BaseCallbackHandler):
                     f"No token usage found in LLM response for {self.model_selection}. "
                     f"llm_output keys: {list(response.llm_output.keys()) if response.llm_output else 'None'}"
                 )
-            
+
+            # Prompt-cache verification: inspect usage_metadata for cache hits/writes.
+            # Runs regardless of which extraction method found the token counts above,
+            # so it works for both OpenAI (auto-cached "cached_tokens") and Anthropic
+            # (explicit cache_read / cache_creation).
+            self._log_cache_usage_from_response(response)
+
             # Log usage
             self._log_usage(input_tokens, output_tokens, duration_ms, error=None)
             
         except Exception as e:
             logger.error(f"Error in LLMUsageCallback.on_llm_end: {e}", exc_info=True)
     
+    def _log_cache_usage_from_response(self, response: LLMResult) -> None:
+        """Log prompt-cache hits/writes from the response's usage_metadata.
+
+        Emits an INFO line so prompt caching can be verified at runtime:
+          - cache_read  > 0  => prefix served from cache (the cost win)
+          - cache_creation > 0 => prefix written to cache this call (first/refresh)
+        Best-effort: never raises into the callback.
+        """
+        try:
+            from .prompt_caching import extract_cache_usage
+
+            if not (hasattr(response, 'generations') and response.generations):
+                return
+
+            for generation_list in response.generations:
+                for generation in generation_list:
+                    msg = getattr(generation, 'message', None)
+                    usage_metadata = getattr(msg, 'usage_metadata', None) if msg else None
+                    if not usage_metadata:
+                        continue
+
+                    cache = extract_cache_usage(usage_metadata)
+                    if cache["cache_read"] or cache["cache_creation"]:
+                        total_in = cache["input_tokens"] or 1
+                        hit_pct = (cache["cache_read"] / total_in) * 100.0
+                        logger.info(
+                            f"[prompt-cache] {self.model_selection} | "
+                            f"read={cache['cache_read']} write={cache['cache_creation']} "
+                            f"of {cache['input_tokens']} input tokens ({hit_pct:.0f}% cached)"
+                        )
+                    else:
+                        logger.debug(
+                            f"[prompt-cache] {self.model_selection} | no cache hit "
+                            f"(input={cache['input_tokens']} tokens)"
+                        )
+                    return  # one generation is enough
+        except Exception as e:
+            logger.debug(f"Could not extract cache usage: {e}")
+
     def on_llm_error(self, error: Exception, **kwargs) -> None:
         """Called when LLM errors."""
         try:

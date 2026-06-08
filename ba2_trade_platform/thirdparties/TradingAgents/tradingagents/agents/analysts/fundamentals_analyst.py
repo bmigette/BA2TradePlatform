@@ -2,6 +2,7 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from ...prompts import format_analyst_prompt, get_prompt
 from ..utils.prefetch_context import gather_fundamentals_context
 from ba2_trade_platform.core.text_utils import extract_text_from_llm_response
+from ba2_trade_platform.core.prompt_caching import apply_anthropic_prompt_caching
 
 
 def create_fundamentals_analyst(llm, toolkit, tools, parallel_tool_calls=False):
@@ -30,10 +31,11 @@ def create_fundamentals_analyst(llm, toolkit, tools, parallel_tool_calls=False):
             f"{current_date}. Analyze it and produce your fundamentals report.\n\n{context}"
         )
 
-        result = llm.invoke([
+        messages = apply_anthropic_prompt_caching([
             SystemMessage(content=prompt_config["system"]),
             HumanMessage(content=human),
-        ])
+        ], llm)
+        result = llm.invoke(messages)
 
         report = extract_text_from_llm_response(result.content)
 

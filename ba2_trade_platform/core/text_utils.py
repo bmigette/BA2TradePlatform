@@ -41,16 +41,22 @@ def extract_text_from_llm_response(content) -> str:
         text_parts = []
         for item in content:
             if isinstance(item, dict):
-                # Handle Gemini format: {'type': 'text', 'text': 'content'}
+                # Skip non-text blocks. Reasoning models (GPT-5.x, o-series) and
+                # tool-calling responses interleave blocks like
+                # {'type': 'reasoning', 'content': [], 'summary': []} or
+                # {'type': 'tool_use', ...} into the content list. These have no
+                # 'text' key and must NOT be stringified into the report.
+                if item.get('type') in ('reasoning', 'thinking', 'tool_use', 'tool_result'):
+                    continue
+                # Handle text block format: {'type': 'text', 'text': 'content'}
                 if 'text' in item:
                     text_parts.append(str(item['text']))
-                else:
-                    # Fallback: convert dict to string
-                    text_parts.append(str(item))
+                # Any other dict without a 'text' key is a non-text block; drop it
+                # rather than leaking its repr into the output.
             else:
                 # Non-dict list items
                 text_parts.append(str(item))
-        
+
         return "\n".join(text_parts)
     
     # Fallback for any other type

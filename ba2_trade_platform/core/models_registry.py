@@ -682,6 +682,42 @@ MODELS: Dict[str, Dict[str, Any]] = {
     # =========================================================================
     # Anthropic Claude Family
     # =========================================================================
+    "claude_opus_4_8": {
+        "native_provider": PROVIDER_ANTHROPIC,
+        "display_name": "Claude Opus 4.8",
+        "description": "Anthropic's most capable model (Opus 4.8) with advanced reasoning",
+        "provider_names": {
+            PROVIDER_ANTHROPIC: "claude-opus-4-8",
+            PROVIDER_NAGAAI: "claude-opus-4-8",
+            PROVIDER_OPENROUTER: "anthropic/claude-opus-4.8",
+        },
+        "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_CODING, LABEL_TOOL_CALLING],
+        "context_size": 200000,
+    },
+    "claude_sonnet_4_6": {
+        "native_provider": PROVIDER_ANTHROPIC,
+        "display_name": "Claude Sonnet 4.6",
+        "description": "Balanced Claude Sonnet 4.6 for most tasks with strong reasoning",
+        "provider_names": {
+            PROVIDER_ANTHROPIC: "claude-sonnet-4-6",
+            PROVIDER_NAGAAI: "claude-sonnet-4-6",
+            PROVIDER_OPENROUTER: "anthropic/claude-sonnet-4.6",
+        },
+        "labels": [LABEL_THINKING, LABEL_CODING, LABEL_TOOL_CALLING],
+        "context_size": 200000,
+    },
+    "claude_haiku_4_5": {
+        "native_provider": PROVIDER_ANTHROPIC,
+        "display_name": "Claude Haiku 4.5",
+        "description": "Fast, lightweight Claude Haiku 4.5",
+        "provider_names": {
+            PROVIDER_ANTHROPIC: "claude-haiku-4-5-20251001",
+            PROVIDER_NAGAAI: "claude-haiku-4-5-20251001",
+            PROVIDER_OPENROUTER: "anthropic/claude-haiku-4.5",
+        },
+        "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_TOOL_CALLING],
+        "context_size": 200000,
+    },
     "claude_opus_4_5": {
         "native_provider": PROVIDER_ANTHROPIC,
         "display_name": "Claude Opus 4.5",
