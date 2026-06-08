@@ -107,6 +107,17 @@ class TradeRiskManagement:
             
             # Step 2: Filter orders based on expert permissions
             filtered_orders = self._filter_orders_by_permissions(pending_orders, enable_buy, enable_sell)
+            # Orders dropped by the permission filter (e.g. a SELL entry created for a
+            # buy-only expert) must be cleaned up — otherwise they leak as permanent
+            # PENDING qty=0 orders with dangling TP/SL legs and a stuck WAITING txn.
+            filtered_ids = {o.id for o in filtered_orders}
+            dropped_by_permission = [o for o in pending_orders if o.id not in filtered_ids]
+            if dropped_by_permission and allow_automated_trade_opening:
+                self.logger.info(
+                    f"Cleaning up {len(dropped_by_permission)} pending order(s) dropped by "
+                    f"buy/sell permission filter for expert {expert_instance_id}"
+                )
+                self._delete_unfunded_orders(dropped_by_permission)
             if not filtered_orders:
                 self.logger.info(f"No orders remain after permission filtering for expert {expert_instance_id}")
                 return updated_orders
@@ -393,12 +404,7 @@ class TradeRiskManagement:
                 orders_by_symbol[symbol] = []
             orders_by_symbol[symbol].append((order, recommendation))
         
-        # Identify top 3 ROI recommendations for special handling
-        top_3_roi = prioritized_orders[:3]
-        top_3_symbols = {order.symbol for order, _ in top_3_roi}
-        
         self.logger.info(f"Processing {len(prioritized_orders)} orders across {len(orders_by_symbol)} instruments")
-        self.logger.info(f"Top 3 ROI symbols: {top_3_symbols}")
         self.logger.debug(f"Available balance: ${remaining_balance:.2f}, Max per instrument: ${max_equity_per_instrument:.2f}")
         
         # Fetch all prices at once (bulk fetching)
@@ -429,12 +435,13 @@ class TradeRiskManagement:
                                f"available_for_instrument=${available_for_instrument:.2f}")
                 self.logger.debug(f"  ROI={recommendation.expected_profit_percent:.2f}%")
                 
-                # EARLY AFFORDABILITY CHECK: Skip if can't afford even 1 share
-                # This prevents creating orders that will immediately fail, avoiding TP/SL creation attempts
-                if (available_for_instrument < current_price and 
-                    symbol not in top_3_symbols):  # Allow top-3 ROI exception to proceed
+                # EARLY AFFORDABILITY CHECK: Skip if can't afford even 1 share within the
+                # per-instrument limit. The order is marked qty=0 -> deleted (transaction
+                # cancelled) rather than left stuck PENDING. Respects the user's limit with
+                # no special-case bypass.
+                if available_for_instrument < current_price:
                     self.logger.warning(f"  ⚡ EARLY SKIP: {symbol} price ${current_price:.2f} exceeds available per-instrument "
-                                      f"${available_for_instrument:.2f} (can't afford 1 share) - marking for deletion")
+                                      f"${available_for_instrument:.2f} (can't afford 1 share within limit) - marking for deletion")
                     order.quantity = 0
                     early_skipped_count += 1
                     updated_orders.append(order)
@@ -457,54 +464,42 @@ class TradeRiskManagement:
                 self.logger.info(f"  Calculated: max_qty_by_instrument={max_quantity_by_instrument:.2f} shares, "
                                f"max_qty_by_balance={max_quantity_by_balance:.2f} shares")
                 
-                # Special case: Top 3 ROI exception
-                if (symbol in top_3_symbols and 
-                    current_price > max_equity_per_instrument and 
-                    current_price <= remaining_balance and
-                    current_allocation == 0):
-                    
-                    # Allow single share purchase for high-value, high-ROI instruments
-                    quantity = 1
-                    total_cost = quantity * current_price
-                    
-                    self.logger.info(f"  TOP 3 ROI EXCEPTION for {symbol}: allocating ${total_cost:.2f} "
-                                   f"(exceeds per-instrument limit but within total balance)")
-                
+                # Standard allocation logic — respect the user's per-instrument limit.
+                # No special-case bypass: a symbol whose 1-share price exceeds the cap is
+                # simply not bought (early-skipped above), never forced through at qty=1.
+                if available_for_instrument <= 0:
+                    quantity = 0
+                    self.logger.info(f"  Result: quantity=0 (no available equity for {symbol}, limit exceeded)")
+                elif remaining_balance <= current_price:
+                    quantity = 0
+                    self.logger.info(f"  Result: quantity=0 (insufficient remaining balance: ${remaining_balance:.2f} < ${current_price:.2f})")
                 else:
-                    # Standard allocation logic
-                    if available_for_instrument <= 0:
-                        quantity = 0
-                        self.logger.info(f"  Result: quantity=0 (no available equity for {symbol}, limit exceeded)")
-                    elif remaining_balance <= current_price:
-                        quantity = 0
-                        self.logger.info(f"  Result: quantity=0 (insufficient remaining balance: ${remaining_balance:.2f} < ${current_price:.2f})")
-                    else:
-                        # Use the minimum of the two constraints
-                        max_quantity = min(max_quantity_by_instrument, max_quantity_by_balance)
-                        self.logger.info(f"  Using min of constraints: max_quantity={max_quantity:.2f} shares")
-                        
-                        # For diversification, prefer smaller positions when multiple instruments available
-                        num_remaining_instruments = len([s for s in orders_by_symbol.keys() 
-                                                       if instrument_allocations.get(s, 0) < max_equity_per_instrument])
-                        
-                        if num_remaining_instruments > 1:
-                            # Reserve some balance for other instruments
-                            diversification_factor = 0.7  # Use 70% of available, save 30% for others
-                            original_max = max_quantity
-                            max_quantity *= diversification_factor
-                            self.logger.info(f"  Diversification ({num_remaining_instruments} remaining instruments): "
-                                          f"applied factor 0.7: {original_max:.2f} -> {max_quantity:.2f} shares")
-                        
-                        # First rounding: float to int
-                        quantity = max(0, int(max_quantity))
-                        self.logger.info(f"  First rounding: {max_quantity:.2f} -> {quantity} shares (int conversion)")
-                        
-                        # Ensure we don't allocate less than 1 share unless we can't afford it
-                        if quantity == 0 and max_quantity_by_balance >= 1 and max_quantity_by_instrument >= 1:
-                            quantity = 1
-                            self.logger.info(f"  Minimum allocation enforced: setting quantity to 1 share "
-                                          f"(had funds: max_by_balance={max_quantity_by_balance:.2f}, "
-                                          f"max_by_instrument={max_quantity_by_instrument:.2f})")
+                    # Use the minimum of the two constraints
+                    max_quantity = min(max_quantity_by_instrument, max_quantity_by_balance)
+                    self.logger.info(f"  Using min of constraints: max_quantity={max_quantity:.2f} shares")
+
+                    # For diversification, prefer smaller positions when multiple instruments available
+                    num_remaining_instruments = len([s for s in orders_by_symbol.keys()
+                                                   if instrument_allocations.get(s, 0) < max_equity_per_instrument])
+
+                    if num_remaining_instruments > 1:
+                        # Reserve some balance for other instruments
+                        diversification_factor = 0.7  # Use 70% of available, save 30% for others
+                        original_max = max_quantity
+                        max_quantity *= diversification_factor
+                        self.logger.info(f"  Diversification ({num_remaining_instruments} remaining instruments): "
+                                      f"applied factor 0.7: {original_max:.2f} -> {max_quantity:.2f} shares")
+
+                    # First rounding: float to int
+                    quantity = max(0, int(max_quantity))
+                    self.logger.info(f"  First rounding: {max_quantity:.2f} -> {quantity} shares (int conversion)")
+
+                    # Ensure we don't allocate less than 1 share unless we can't afford it
+                    if quantity == 0 and max_quantity_by_balance >= 1 and max_quantity_by_instrument >= 1:
+                        quantity = 1
+                        self.logger.info(f"  Minimum allocation enforced: setting quantity to 1 share "
+                                      f"(had funds: max_by_balance={max_quantity_by_balance:.2f}, "
+                                      f"max_by_instrument={max_quantity_by_instrument:.2f})")
                 
                 # Apply instrument weight (formula: result * (weight/100))
                 if quantity > 0 and symbol in instrument_configs:
