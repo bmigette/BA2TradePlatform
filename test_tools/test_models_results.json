@@ -1,277 +1,86 @@
 {
-  "timestamp": "2026-05-07T16:28:44.167271",
+  "timestamp": "2026-06-08T09:56:39.358100",
   "providers": {
-    "openai": {
-      "display_name": "OpenAI",
-      "api_key_configured": true,
-      "total_models": 0,
-      "inference_passed": 0,
-      "inference_failed": 0,
-      "tool_call_passed": 0,
-      "tool_call_failed": 0,
-      "websearch_passed": 0,
-      "websearch_failed": 0,
-      "reasoning_passed": 0,
-      "reasoning_failed": 0,
-      "results": []
-    },
-    "nagaai": {
-      "display_name": "NagaAI",
-      "api_key_configured": true,
-      "total_models": 2,
-      "inference_passed": 1,
-      "inference_failed": 1,
-      "tool_call_passed": 1,
-      "tool_call_failed": 1,
-      "websearch_passed": 0,
-      "websearch_failed": 0,
-      "reasoning_passed": 0,
-      "reasoning_failed": 0,
-      "results": [
-        {
-          "model": "kimi_k2.6",
-          "provider": "nagaai",
-          "provider_model_name": "kimi-k2.6",
-          "test_type": "inference",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 3815.3934478759766,
-          "labels": [
-            "low_cost",
-            "vision",
-            "coding",
-            "websearch",
-            "tool_calling",
-            "thinking"
-          ]
-        },
-        {
-          "model": "kimi_k2.6",
-          "provider": "nagaai",
-          "provider_model_name": "kimi-k2.6",
-          "test_type": "tool_call",
-          "success": true,
-          "response": "Tool: get_weather, Args: {'city': 'San Francisco'}",
-          "error": "",
-          "duration_ms": 2312.1376037597656,
-          "labels": [
-            "low_cost",
-            "vision",
-            "coding",
-            "websearch",
-            "tool_calling",
-            "thinking"
-          ]
-        },
-        {
-          "model": "kimi_k2.6-nonthinking",
-          "provider": "nagaai",
-          "provider_model_name": "kimi-k2.6",
-          "test_type": "inference",
-          "success": false,
-          "response": "",
-          "error": "Error code: 400 - {'error': {'type': 'invalid_request_error', 'message': 'We got a bad response from the source. Status 400. Error message: {\"error\":{\"message\":\"invalid temperature: only 1 is allowed for this model\",\"type\":\"invalid_request_error\"}}'}}",
-          "duration_ms": 0.0,
-          "labels": [
-            "low_cost",
-            "fast",
-            "vision",
-            "coding",
-            "websearch",
-            "tool_calling"
-          ]
-        },
-        {
-          "model": "kimi_k2.6-nonthinking",
-          "provider": "nagaai",
-          "provider_model_name": "kimi-k2.6",
-          "test_type": "tool_call",
-          "success": false,
-          "response": "",
-          "error": "Error code: 400 - {'error': {'type': 'invalid_request_error', 'message': 'We got a bad response from the source. Status 400. Error message: {\"error\":{\"message\":\"invalid temperature: only 1 is allowed for this model\",\"type\":\"invalid_request_error\"}}'}}",
-          "duration_ms": 0.0,
-          "labels": [
-            "low_cost",
-            "fast",
-            "vision",
-            "coding",
-            "websearch",
-            "tool_calling"
-          ]
-        }
-      ]
-    },
-    "google": {
-      "display_name": "Google",
-      "api_key_configured": true,
-      "total_models": 0,
-      "inference_passed": 0,
-      "inference_failed": 0,
-      "tool_call_passed": 0,
-      "tool_call_failed": 0,
-      "websearch_passed": 0,
-      "websearch_failed": 0,
-      "reasoning_passed": 0,
-      "reasoning_failed": 0,
-      "results": []
-    },
     "anthropic": {
       "display_name": "Anthropic",
-      "api_key_configured": false,
-      "total_models": 0,
-      "inference_passed": 0,
-      "inference_failed": 0,
-      "tool_call_passed": 0,
-      "tool_call_failed": 0,
-      "websearch_passed": 0,
-      "websearch_failed": 0,
-      "reasoning_passed": 0,
-      "reasoning_failed": 0,
-      "results": []
-    },
-    "openrouter": {
-      "display_name": "OpenRouter",
-      "api_key_configured": false,
-      "total_models": 0,
-      "inference_passed": 0,
-      "inference_failed": 0,
-      "tool_call_passed": 0,
-      "tool_call_failed": 0,
-      "websearch_passed": 0,
-      "websearch_failed": 0,
-      "reasoning_passed": 0,
-      "reasoning_failed": 0,
-      "results": []
-    },
-    "xai": {
-      "display_name": "xAI",
-      "api_key_configured": true,
-      "total_models": 0,
-      "inference_passed": 0,
-      "inference_failed": 0,
-      "tool_call_passed": 0,
-      "tool_call_failed": 0,
-      "websearch_passed": 0,
-      "websearch_failed": 0,
-      "reasoning_passed": 0,
-      "reasoning_failed": 0,
-      "results": []
-    },
-    "moonshot": {
-      "display_name": "Moonshot",
       "api_key_configured": true,
       "total_models": 2,
       "inference_passed": 2,
       "inference_failed": 0,
-      "tool_call_passed": 2,
+      "tool_call_passed": 0,
       "tool_call_failed": 0,
-      "websearch_passed": 0,
+      "websearch_passed": 2,
       "websearch_failed": 0,
       "reasoning_passed": 0,
       "reasoning_failed": 0,
       "results": [
         {
-          "model": "kimi_k2.6",
-          "provider": "moonshot",
-          "provider_model_name": "kimi-k2.6",
+          "model": "claude_opus_4_8",
+          "provider": "anthropic",
+          "provider_model_name": "claude-opus-4-8",
           "test_type": "inference",
           "success": true,
           "response": "4",
           "error": "",
-          "duration_ms": 3371.7446327209473,
+          "duration_ms": 7846.534967422485,
           "labels": [
-            "low_cost",
-            "vision",
-            "coding",
-            "websearch",
-            "tool_calling",
-            "thinking"
-          ]
-        },
-        {
-          "model": "kimi_k2.6",
-          "provider": "moonshot",
-          "provider_model_name": "kimi-k2.6",
-          "test_type": "tool_call",
-          "success": true,
-          "response": "Tool: get_weather, Args: {'city': 'San Francisco'}",
-          "error": "",
-          "duration_ms": 3267.565965652466,
-          "labels": [
-            "low_cost",
-            "vision",
-            "coding",
-            "websearch",
-            "tool_calling",
-            "thinking"
-          ]
-        },
-        {
-          "model": "kimi_k2.6-nonthinking",
-          "provider": "moonshot",
-          "provider_model_name": "kimi-k2.6",
-          "test_type": "inference",
-          "success": true,
-          "response": "4",
-          "error": "",
-          "duration_ms": 2448.559284210205,
-          "labels": [
-            "low_cost",
-            "fast",
-            "vision",
+            "high_cost",
+            "thinking",
             "coding",
             "websearch",
             "tool_calling"
           ]
         },
         {
-          "model": "kimi_k2.6-nonthinking",
-          "provider": "moonshot",
-          "provider_model_name": "kimi-k2.6",
-          "test_type": "tool_call",
+          "model": "claude_opus_4_8",
+          "provider": "anthropic",
+          "provider_model_name": "claude-opus-4-8",
+          "test_type": "websearch",
           "success": true,
-          "response": "Tool: get_weather, Args: {'city': 'San Francisco'}",
+          "response": "Today's date is June 08, 2026.",
           "error": "",
-          "duration_ms": 2049.391984939575,
+          "duration_ms": 6715.378046035767,
           "labels": [
-            "low_cost",
-            "fast",
-            "vision",
+            "high_cost",
+            "thinking",
+            "coding",
+            "websearch",
+            "tool_calling"
+          ]
+        },
+        {
+          "model": "claude_sonnet_4_6",
+          "provider": "anthropic",
+          "provider_model_name": "claude-sonnet-4-6",
+          "test_type": "inference",
+          "success": true,
+          "response": "4",
+          "error": "",
+          "duration_ms": 1154.320478439331,
+          "labels": [
+            "thinking",
+            "coding",
+            "websearch",
+            "tool_calling"
+          ]
+        },
+        {
+          "model": "claude_sonnet_4_6",
+          "provider": "anthropic",
+          "provider_model_name": "claude-sonnet-4-6",
+          "test_type": "websearch",
+          "success": true,
+          "response": "Today's date is **June 8, 2026**.",
+          "error": "",
+          "duration_ms": 6405.249357223511,
+          "labels": [
+            "thinking",
             "coding",
             "websearch",
             "tool_calling"
           ]
         }
       ]
-    },
-    "deepseek": {
-      "display_name": "DeepSeek",
-      "api_key_configured": true,
-      "total_models": 0,
-      "inference_passed": 0,
-      "inference_failed": 0,
-      "tool_call_passed": 0,
-      "tool_call_failed": 0,
-      "websearch_passed": 0,
-      "websearch_failed": 0,
-      "reasoning_passed": 0,
-      "reasoning_failed": 0,
-      "results": []
-    },
-    "bedrock": {
-      "display_name": "AWS Bedrock",
-      "api_key_configured": false,
-      "total_models": 0,
-      "inference_passed": 0,
-      "inference_failed": 0,
-      "tool_call_passed": 0,
-      "tool_call_failed": 0,
-      "websearch_passed": 0,
-      "websearch_failed": 0,
-      "reasoning_passed": 0,
-      "reasoning_failed": 0,
-      "results": []
     }
   }
 }

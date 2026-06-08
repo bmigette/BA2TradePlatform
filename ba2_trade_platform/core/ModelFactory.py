@@ -892,6 +892,11 @@ class ModelFactory:
                 temperature = fixed_temp
                 logger.debug(f"Using fixed_temperature={temperature} for model '{friendly_name}'")
 
+            # Check if model doesn't support temperature (e.g., claude_opus_4_8)
+            if model_info.get("no_temperature", False):
+                temperature = None
+                logger.debug(f"Disabling temperature for model '{friendly_name}' (no_temperature=True)")
+
             # Check for fixed_top_p (e.g., kimi-k2.5 requires top_p=0.95)
             fixed_top_p = model_info.get("fixed_top_p")
         else:
@@ -941,7 +946,12 @@ class ModelFactory:
             # Get default_model_kwargs for the model (e.g., thinking: {type: "disabled"})
             extra_body = model_info.get("default_model_kwargs") if model_info else None
             return cls._call_kimi_websearch(model_name, prompt, base_url, api_key, max_tokens, temperature, top_p, extra_body)
-        
+
+        elif provider == PROVIDER_ANTHROPIC:
+            # Anthropic Claude uses web_search_20250305 server-side tool
+            api_key = get_app_setting('anthropic_api_key') or "dummy-key"
+            return cls._call_anthropic_websearch(model_name, prompt, api_key, max_tokens, temperature)
+
         else:
             # Model does not support web search - raise error instead of fallback
             from .models_registry import model_supports_websearch
@@ -1122,6 +1132,42 @@ class ModelFactory:
             raise ValueError("Google Gemini support requires google-genai package")
         except Exception as e:
             logger.error(f"Error calling Google Gemini API with search: {e}", exc_info=True)
+            raise
+
+    @classmethod
+    def _call_anthropic_websearch(cls, model: str, prompt: str, api_key: str, max_tokens: int, temperature: Optional[float]) -> str:
+        """Call Anthropic Claude API with the web_search_20250305 server-side tool.
+
+        Anthropic handles search execution server-side; a single API call returns
+        the complete answer with optional tool_use blocks showing which queries were
+        issued. We extract only the text blocks.
+        temperature=None skips the parameter entirely (required for models like Opus 4.8).
+        """
+        from anthropic import Anthropic
+
+        client = Anthropic(api_key=api_key)
+
+        try:
+            create_kwargs = {
+                "model": model,
+                "max_tokens": max_tokens,
+                "tools": [{"type": "web_search_20250305", "name": "web_search"}],
+                "messages": [{"role": "user", "content": prompt}],
+            }
+            if temperature is not None:
+                create_kwargs["temperature"] = temperature
+
+            response = client.messages.create(**create_kwargs)
+
+            result_text = ""
+            for block in response.content:
+                if getattr(block, "type", None) == "text":
+                    result_text += block.text
+
+            return result_text.strip()
+
+        except Exception as e:
+            logger.error(f"Error calling Anthropic API with web search: {e}", exc_info=True)
             raise
 
     @classmethod

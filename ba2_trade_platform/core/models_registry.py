@@ -691,7 +691,8 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_NAGAAI: "claude-opus-4-8",
             PROVIDER_OPENROUTER: "anthropic/claude-opus-4.8",
         },
-        "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_CODING, LABEL_TOOL_CALLING],
+        "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_CODING, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
+        "no_temperature": True,  # Anthropic deprecated temperature for Opus 4.8
         "context_size": 200000,
     },
     "claude_sonnet_4_6": {
@@ -703,7 +704,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_NAGAAI: "claude-sonnet-4-6",
             PROVIDER_OPENROUTER: "anthropic/claude-sonnet-4.6",
         },
-        "labels": [LABEL_THINKING, LABEL_CODING, LABEL_TOOL_CALLING],
+        "labels": [LABEL_THINKING, LABEL_CODING, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
         "context_size": 200000,
     },
     "claude_haiku_4_5": {
@@ -715,7 +716,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_NAGAAI: "claude-haiku-4-5-20251001",
             PROVIDER_OPENROUTER: "anthropic/claude-haiku-4.5",
         },
-        "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_TOOL_CALLING],
+        "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
         "context_size": 200000,
     },
     "claude_opus_4_5": {
@@ -728,7 +729,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "anthropic/claude-opus-4-5-20251101",
             PROVIDER_BEDROCK: "anthropic.claude-opus-4-5-20251101-v1:0",
         },
-        "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_CODING, LABEL_TOOL_CALLING],
+        "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_CODING, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
         "context_size": 200000,
     },
     "claude_4_opus": {
@@ -741,7 +742,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "anthropic/claude-opus-4-20250514",
             PROVIDER_BEDROCK: "anthropic.claude-opus-4-20250514-v1:0",
         },
-        "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_CODING, LABEL_TOOL_CALLING],
+        "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_CODING, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
         "context_size": 200000,
     },
     "claude_4_sonnet": {
@@ -754,7 +755,7 @@ MODELS: Dict[str, Dict[str, Any]] = {
             PROVIDER_OPENROUTER: "anthropic/claude-sonnet-4-20250514",
             PROVIDER_BEDROCK: "anthropic.claude-sonnet-4-20250514-v1:0",
         },
-        "labels": [LABEL_THINKING, LABEL_CODING, LABEL_TOOL_CALLING],
+        "labels": [LABEL_THINKING, LABEL_CODING, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
         "context_size": 200000,
     },
     "claude_3.5_sonnet": {
