@@ -111,7 +111,10 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         # Get model selection strings
         deep_think_selection = self.config["deep_think_llm"]
         quick_think_selection = self.config["quick_think_llm"]
-        
+        # Trade-recommendation (final risk judge) model. Falls back to deep-think for
+        # configs/instances that predate this setting.
+        trade_recommendation_selection = self.config.get("trade_recommendation_llm") or deep_think_selection
+
         # Create LLMs using ModelFactory
         try:
             self.deep_thinking_llm = ModelFactory.create_llm(
@@ -130,6 +133,19 @@ class TradingAgentsGraph(DatabaseStorageMixin):
                 market_analysis_id=self.market_analysis_id,
                 use_case="Market Analysis"
             )
+            # Reuse the deep-think instance when the recommendation model is identical
+            # to avoid constructing a second client for the same selection.
+            if trade_recommendation_selection == deep_think_selection:
+                self.trade_recommendation_llm = self.deep_thinking_llm
+            else:
+                self.trade_recommendation_llm = ModelFactory.create_llm(
+                    trade_recommendation_selection,
+                    streaming=streaming_enabled,
+                    track_usage=True,
+                    expert_instance_id=expert_instance_id_for_logging,
+                    market_analysis_id=self.market_analysis_id,
+                    use_case="Market Analysis"
+                )
         except ValueError as e:
             logger.error(f"Failed to create LLM: {e}")
             raise
@@ -144,6 +160,9 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         logger.info(f"    -> Provider: {deep_info.get('provider', 'N/A')}, Model: {deep_info.get('provider_model_name', 'N/A')}")
         logger.info(f"  Quick Think: {quick_think_selection}")
         logger.info(f"    -> Provider: {quick_info.get('provider', 'N/A')}, Model: {quick_info.get('provider_model_name', 'N/A')}")
+        rec_info = ModelFactory.get_model_info(trade_recommendation_selection)
+        logger.info(f"  Trade Recommendation: {trade_recommendation_selection}")
+        logger.info(f"    -> Provider: {rec_info.get('provider', 'N/A')}, Model: {rec_info.get('provider_model_name', 'N/A')}")
         logger.info(f"  WebSearch Model: {self.provider_args.get('websearch_model', 'N/A')}")
         logger.info(f"  Embedding Model: {self.config.get('embedding_model', 'N/A')}")
         logger.info("=" * 80)
@@ -694,6 +713,7 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             self.risk_manager_memory,
             self.conditional_logic,
             self.config,
+            trade_recommendation_llm=self.trade_recommendation_llm,
         )
 
         # Optional LangGraph checkpointer for crash recovery (per-ticker SQLite).

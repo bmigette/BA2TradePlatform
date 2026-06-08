@@ -92,6 +92,12 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                 "help": "For more information, see [OpenAI Models](https://platform.openai.com/docs/models) and [Naga AI Models](https://naga.ac/models)",
                 "tooltip": "The AI model used for faster analysis tasks like technical indicators and quick data summarization. Use the model selector to browse available models."
             },
+            "trade_recommendation_llm": {
+                "type": "str", "required": True, "default": "OpenAI/gpt-4o-mini",
+                "description": "LLM model for the final trade recommendation (risk judge)",
+                "ui_editor_type": "ModelSelector",
+                "tooltip": "The AI model used by the final risk-management judge that reviews ALL gathered data, analyst reports and the risk debate, then issues the final trade recommendation (BUY/SELL/HOLD). Defaults to a copy of your Deep Think model. Use a strong reasoning model here for the highest-stakes step."
+            },
             "dataprovider_websearch_model": {
                 "type": "str", "required": True, "default": "OpenAI/gpt4o",
                 "description": "Model for data provider web searches",
@@ -316,6 +322,13 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
         # Get model selection strings - pass them directly to trading_graph for ModelFactory
         deep_think_model_str = self.settings.get('deep_think_llm') or settings_def['deep_think_llm']['default']
         quick_think_model_str = self.settings.get('quick_think_llm') or settings_def['quick_think_llm']['default']
+        # Trade recommendation (final risk judge) model. For backward compatibility,
+        # instances that predate this setting fall back to the deep-think model.
+        trade_recommendation_model_str = (
+            self.settings.get('trade_recommendation_llm')
+            or self.settings.get('deep_think_llm')
+            or settings_def['trade_recommendation_llm']['default']
+        )
         embedding_model_str = self.settings.get('embedding_model') or settings_def['embedding_model']['default']
         
         # Apply user settings with defaults from settings definitions
@@ -325,6 +338,7 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
             'max_risk_discuss_rounds': max_risk_discuss_rounds,
             'deep_think_llm': deep_think_model_str,  # Full selection string (e.g., "nagaai/gpt5")
             'quick_think_llm': quick_think_model_str,  # Full selection string (e.g., "nagaai/gpt5_mini")
+            'trade_recommendation_llm': trade_recommendation_model_str,  # Final risk-judge / recommendation model
             'embedding_model': embedding_model_str,  # Full selection string
             'news_lookback_days': int(self.settings.get('news_lookback_days') or settings_def['news_lookback_days']['default']),
             'market_history_days': int(self.settings.get('market_history_days') or settings_def['market_history_days']['default']),
@@ -596,6 +610,7 @@ Expert ID: {self.id}
 Configuration:
 - Deep Think LLM: {expert_settings.get('deep_think_llm') or 'Unknown'}
 - Quick Think LLM: {expert_settings.get('quick_think_llm') or 'Unknown'}
+- Trade Recommendation LLM: {expert_settings.get('trade_recommendation_llm') or expert_settings.get('deep_think_llm') or 'Unknown'}
 - News Lookback: {expert_settings.get('news_lookback_days') or 0} days
 - Market History: {expert_settings.get('market_history_days') or 0} days
 - Economic Data: {expert_settings.get('economic_data_days') or 0} days

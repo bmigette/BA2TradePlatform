@@ -29,10 +29,17 @@ class GraphSetup:
         risk_manager_memory,
         conditional_logic: ConditionalLogic,
         config: Dict[str, Any],
+        trade_recommendation_llm=None,
     ):
-        """Initialize with required components."""
+        """Initialize with required components.
+
+        ``trade_recommendation_llm`` is the model used by the final risk-management
+        judge that issues the trade recommendation. When omitted it falls back to
+        ``deep_thinking_llm`` (the historical behaviour).
+        """
         self.quick_thinking_llm = quick_thinking_llm
         self.deep_thinking_llm = deep_thinking_llm
+        self.trade_recommendation_llm = trade_recommendation_llm or deep_thinking_llm
         self.toolkit = toolkit
         self.tool_nodes = tool_nodes
         self.bull_memory = bull_memory
@@ -139,8 +146,10 @@ class GraphSetup:
         risky_analyst = create_risky_debator(self.quick_thinking_llm)
         neutral_analyst = create_neutral_debator(self.quick_thinking_llm)
         safe_analyst = create_safe_debator(self.quick_thinking_llm)
+        # The risk manager issues the FINAL trade recommendation after reviewing all
+        # data and the risk debate -> use the dedicated trade-recommendation model.
         risk_manager_node = create_risk_manager(
-            self.deep_thinking_llm, self.risk_manager_memory
+            self.trade_recommendation_llm, self.risk_manager_memory
         )
 
         # Create workflow
