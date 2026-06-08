@@ -43,7 +43,6 @@ def build():
     config.update({
         "deep_think_llm": MODEL,
         "quick_think_llm": MODEL,
-        "embedding_model": "native/text-embedding-3-small",
         "max_debate_rounds": 1,
         "max_risk_discuss_rounds": 1,
         "timeframe": "1d",

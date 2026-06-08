@@ -106,26 +106,6 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                 "help": "For more information, see [OpenAI Docs](https://platform.openai.com/docs/models), [Naga AI Web Search](https://docs.naga.ac/features/web-search), and [Gemini Thinking](https://ai.google.dev/gemini-api/docs/thinking)",
                 "tooltip": "The model used by data providers for web search and data gathering. Only models with web search capability are shown."
             },
-            "embedding_model": {
-                "type": "str", "required": True, "default": "Local/all-mpnet-base-v2",
-                "description": "Model for generating embeddings for memories/vector storage",
-                "valid_values": [
-                    # Local embeddings (no API calls, runs on CPU/GPU)
-                    "Local/all-MiniLM-L6-v2",  # Fast, small (80MB), 384 dimensions
-                    "Local/all-mpnet-base-v2",  # Better quality, larger (420MB), 768 dimensions (DEFAULT)
-                    "Local/paraphrase-multilingual-MiniLM-L12-v2",  # Multilingual support
-                    # OpenAI embeddings (direct)
-                    "OpenAI/text-embedding-3-small",
-                    "OpenAI/text-embedding-3-large",
-                    # NagaAI embeddings (same models via Naga AI)
-                    "NagaAI/text-embedding-3-small",
-                    "NagaAI/text-embedding-3-large",
-                ],
-                "allow_custom": True,
-                "help": "**Local models** (prefix: Local/) run on your machine with no API calls or costs. Requires `sentence-transformers` package. **API models** (OpenAI/NagaAI) require API keys. For more info: [sentence-transformers](https://www.sbert.net/), [OpenAI Embeddings](https://platform.openai.com/docs/guides/embeddings)",
-                "tooltip": "Embedding model for vector storage. Local models are free and private but run on your CPU/GPU. API models are faster but cost money. all-mpnet-base-v2 is the default (best quality/performance balance)."
-            },
-            
             # Data Lookback Periods
             "news_lookback_days": {
                 "type": "int", "required": True, "default": 7,
@@ -329,8 +309,6 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
             or self.settings.get('deep_think_llm')
             or settings_def['trade_recommendation_llm']['default']
         )
-        embedding_model_str = self.settings.get('embedding_model') or settings_def['embedding_model']['default']
-        
         # Apply user settings with defaults from settings definitions
         # Pass full model selection strings - ModelFactory will handle parsing
         config.update({
@@ -339,7 +317,6 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
             'deep_think_llm': deep_think_model_str,  # Full selection string (e.g., "nagaai/gpt5")
             'quick_think_llm': quick_think_model_str,  # Full selection string (e.g., "nagaai/gpt5_mini")
             'trade_recommendation_llm': trade_recommendation_model_str,  # Final risk-judge / recommendation model
-            'embedding_model': embedding_model_str,  # Full selection string
             'news_lookback_days': int(self.settings.get('news_lookback_days') or settings_def['news_lookback_days']['default']),
             'market_history_days': int(self.settings.get('market_history_days') or settings_def['market_history_days']['default']),
             'economic_data_days': int(self.settings.get('economic_data_days') or settings_def['economic_data_days']['default']),

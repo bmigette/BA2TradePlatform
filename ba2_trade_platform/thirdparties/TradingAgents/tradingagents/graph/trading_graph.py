@@ -164,7 +164,6 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         logger.info(f"  Trade Recommendation: {trade_recommendation_selection}")
         logger.info(f"    -> Provider: {rec_info.get('provider', 'N/A')}, Model: {rec_info.get('provider_model_name', 'N/A')}")
         logger.info(f"  WebSearch Model: {self.provider_args.get('websearch_model', 'N/A')}")
-        logger.info(f"  Embedding Model: {self.config.get('embedding_model', 'N/A')}")
         logger.info("=" * 80)
         
         # Initialize new toolkit with provider_map
