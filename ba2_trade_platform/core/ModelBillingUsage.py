@@ -712,10 +712,13 @@ class ModelBillingUsage:
             'Content-Type': 'application/json',
         }
         cost_url = 'https://api.anthropic.com/v1/organizations/cost_report'
+        # The Cost API is daily-granularity only and does NOT accept bucket_width.
+        # Amounts are returned as decimal strings in CENTS (lowest USD unit).
+        # Default page size is 7 daily buckets (has_more=true); request 31 to cover
+        # the full ~30-day window in a single page (31 is the daily-granularity max).
         params = {
             'starting_at': month_ago.strftime('%Y-%m-%dT00:00:00Z'),
-            'ending_at': now.strftime('%Y-%m-%dT%H:%M:%SZ'),
-            'bucket_width': '1d',
+            'ending_at': now.strftime('%Y-%m-%dT00:00:00Z'),
             'limit': 31,
         }
 
@@ -728,15 +731,17 @@ class ModelBillingUsage:
                     if response.status == 401:
                         return {'error': 'Invalid Anthropic Admin API key'}
                     if response.status == 403:
-                        return {'error': 'Anthropic Admin key lacks permission to read cost data'}
+                        return {'error': 'Anthropic Admin key lacks permission to read cost data (admin role required)'}
                     if response.status != 200:
                         error_text = await response.text()
                         logger.error(f'Anthropic cost_report error {response.status}: {error_text}')
-                        return {'error': f'Anthropic cost API error ({response.status})'}
+                        return {'error': f'Anthropic cost API error ({response.status}): {error_text[:150]}'}
 
                     data = await response.json()
+                    logger.debug(f'[Anthropic Usage] cost_report buckets: {len(data.get("data", []))}')
 
-                    # Response: {"data": [{"starting_at": ISO, "results": [{"amount": "1.23", "currency": "USD"}]}]}
+                    # Response: {"data": [{"starting_at": ISO, "results": [{"amount": "12.34", "currency": "USD"}]}]}
+                    # amount is a decimal string in CENTS -> divide by 100 for USD.
                     for bucket in data.get('data', []):
                         bucket_start = bucket.get('starting_at')
                         try:
@@ -748,7 +753,7 @@ class ModelBillingUsage:
                         for result in bucket.get('results', []):
                             amount = result.get('amount', 0)
                             try:
-                                bucket_cost += float(amount)
+                                bucket_cost += float(amount) / 100.0  # cents -> USD
                             except (ValueError, TypeError):
                                 continue
 
