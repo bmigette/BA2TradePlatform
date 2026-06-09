@@ -5234,7 +5234,7 @@ class AccountGrowthTab:
             if not dt:
                 continue
             month = dt.strftime('%Y-%m') if hasattr(dt, 'strftime') else str(dt)[:7]
-            amount = float(div.get('amount', 0)) - float(div.get('tax_withheld', 0))
+            amount = float(div.get('amount', 0))
             monthly_income.setdefault(month, {'pnl': 0.0, 'div': 0.0})['div'] += amount
             mlbl = monthly_by_label.setdefault(month, {})
             for lb in (labels_by_symbol.get(div.get('symbol')) or ['Unlabeled']):
@@ -5497,7 +5497,7 @@ class AccountGrowthTab:
                     date_val = entry.get('date')
                     if date_val:
                         date_str = date_val.strftime('%Y-%m-%d') if hasattr(date_val, 'strftime') else str(date_val)
-                        cumulative += float(entry.get('amount', 0)) - float(entry.get('tax_withheld', 0))
+                        cumulative += float(entry.get('amount', 0))
                         div_dates_set.add(date_str)
                         div_by_date[date_str] = round(cumulative, 2)
 
@@ -5561,9 +5561,8 @@ class AccountGrowthTab:
                     continue
                 d = date_val.strftime('%Y-%m-%d') if hasattr(date_val, 'strftime') else str(date_val)[:10]
                 a_id = div.get('account_id', 0)
-                amount = float(div.get('amount', 0))
-                tax = float(div.get('tax_withheld', 0))
-                cash_in = amount - tax
+                amount = float(div.get('amount', 0))   # already net of tax
+                cash_in = amount
                 drip_qty = div.get('drip_quantity')
                 drip_price = div.get('drip_price')
                 cash_out = float(drip_qty) * float(drip_price) if drip_qty and drip_price else 0.0
@@ -5858,7 +5857,7 @@ class AccountGrowthTab:
                 if date_str not in all_dates:
                     continue
                 idx = all_dates.index(date_str)
-                amount = float(div.get('amount', 0)) - float(div.get('tax_withheld', 0))
+                amount = float(div.get('amount', 0))
                 is_drip = bool(div.get('drip_quantity'))
                 labels_for_sym = symbol_info[sym]['labels']
                 for label in labels_for_sym:
@@ -6166,7 +6165,7 @@ class AccountGrowthTab:
                 if date_str not in all_dates:
                     continue
                 idx = all_dates.index(date_str)
-                amount = float(div.get('amount', 0)) - float(div.get('tax_withheld', 0))
+                amount = float(div.get('amount', 0))
                 is_drip = bool(div.get('drip_quantity'))
                 sym_cum_divs[sym][idx] += amount
                 if not is_drip:
@@ -6561,7 +6560,7 @@ class AccountGrowthTab:
                 date_val = div.get('date')
                 if date_val:
                     date_str = date_val.strftime('%Y-%m-%d') if hasattr(date_val, 'strftime') else str(date_val)
-                    cumulative += float(div.get('amount', 0)) - float(div.get('tax_withheld', 0))
+                    cumulative += float(div.get('amount', 0))
                     drip_qty = div.get('drip_quantity')
                     drip_price = div.get('drip_price')
                     if drip_qty:
