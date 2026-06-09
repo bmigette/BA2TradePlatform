@@ -577,14 +577,22 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         """
         Convert an Alpaca order object to a TradingOrder object.
         """
+        # Classify order_class up front: OCO and MLEG (multi-leg option) orders
+        # both legitimately have NO top-level side in Alpaca's response (the side
+        # lives on each leg), so side must be nullable for them.
+        order_class_val = getattr(order, "order_class", None)
+        order_class_str = str(order_class_val).lower() if order_class_val else ""
+        is_oco = "oco" in order_class_str
+        is_mleg = "mleg" in order_class_str
+
         # Sanitize enum fields
         side = self._sanitize_enum_field(
-            getattr(order, "side", None), 
-            OrderDirection, 
-            "side", 
-            nullable=False
+            getattr(order, "side", None),
+            OrderDirection,
+            "side",
+            nullable=is_mleg
         )
-        
+
         # Alpaca's order type is non-directional (market/limit/stop/stop_limit);
         # combine it with side to get our directional OrderType. (A plain
         # _sanitize_enum_field would collapse limit/stop/stop_limit to MARKET
@@ -603,26 +611,16 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         # OCO orders have order_class="oco" in Alpaca response, not a type-based designation
         final_order_type = order_type
         legs_broker_ids = None
-        
-        # Check if order_class contains 'oco' (handles both string and enum representations)
-        order_class_val = getattr(order, 'order_class', None)
-        is_oco = False
-        if order_class_val:
-            order_class_str = str(order_class_val).lower()
-            is_oco = 'oco' in order_class_str
-        
+
         if is_oco:
             final_order_type = CoreOrderType.OCO
-            #logger.debug(f"Order {getattr(order, 'id', 'unknown')} detected as OCO based on order_class field")
-            
-            # Extract OCO leg broker IDs from the legs array (if present in response)
-            if hasattr(order, 'legs') and order.legs:
-                legs_broker_ids = [str(leg.id) for leg in order.legs if hasattr(leg, 'id') and leg.id]
-                #logger.debug(f"OCO order {getattr(order, 'id', 'unknown')} has {len(legs_broker_ids)} legs: {legs_broker_ids}")
-        else:
-            pass
-            #logger.debug(f"Order {getattr(order, 'id', 'unknown')}: order_class check - has attr: {hasattr(order, 'order_class')}, value: {order_class_val}, str: {str(order_class_val).lower() if order_class_val else 'none'}, is oco: {is_oco}")
-        
+
+        # OCO and MLEG orders both carry their child legs in the `legs` array;
+        # capture the broker leg ids for upstream leg tracking.
+        if (is_oco or is_mleg) and getattr(order, "legs", None):
+            legs_broker_ids = [str(leg.id) for leg in order.legs
+                               if getattr(leg, "id", None)]
+
         return TradingOrder(
             broker_order_id=str(getattr(order, "id", None)) if getattr(order, "id", None) else None,  # Set Alpaca order ID as broker_order_id
             symbol=getattr(order, "symbol", None),

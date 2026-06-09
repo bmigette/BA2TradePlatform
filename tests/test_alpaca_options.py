@@ -390,9 +390,10 @@ def test_submit_option_order_impl_multileg_writeback(mock_account_def):
                  SimpleNamespace(id="leg-sell", symbol="AAPL260116C00160000",
                                  side="sell", type="limit", status="accepted",
                                  qty="1", filled_qty="0")]
-    fake_order = SimpleNamespace(id="parent-broker", side="buy", type="limit",
+    # Real Alpaca MLEG parents come back with side=None (side is per-leg).
+    fake_order = SimpleNamespace(id="parent-broker", side=None, type="limit",
                                  status="accepted", qty="1", filled_qty="0",
-                                 legs=fake_legs)
+                                 order_class="mleg", legs=fake_legs)
 
     class FakeClient:
         def submit_order(self, req):
@@ -409,6 +410,25 @@ def test_submit_option_order_impl_multileg_writeback(mock_account_def):
     db_sell = get_instance(TradingOrder, cs_id)
     assert db_buy.broker_order_id == "leg-buy"
     assert db_sell.broker_order_id == "leg-sell"
+
+
+def test_alpaca_order_to_tradingorder_mleg_parent_side_none():
+    """Real Alpaca MLEG (multi-leg option) orders return the PARENT with
+    side=None -- the side lives on each leg, not the parent. The mapper must
+    tolerate this (regression: previously raised "Required enum field 'side'
+    cannot be None", orphaning the spread legs)."""
+    from types import SimpleNamespace
+    from ba2_trade_platform.core.types import OrderStatus
+    acct = _make_alpaca()
+    legs = [SimpleNamespace(id="leg-buy"), SimpleNamespace(id="leg-sell")]
+    mleg_order = SimpleNamespace(id="parent-broker", side=None, type="limit",
+                                 status="accepted", qty="1", filled_qty="0",
+                                 order_class="mleg", legs=legs)
+    result = acct.alpaca_order_to_tradingorder(mleg_order)
+    assert result.broker_order_id == "parent-broker"
+    assert result.side is None
+    assert result.status == OrderStatus.ACCEPTED
+    assert result.legs_broker_ids == ["leg-buy", "leg-sell"]
 
 
 # ---------------------------------------------------------------------------
