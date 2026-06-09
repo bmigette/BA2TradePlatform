@@ -225,19 +225,22 @@ class StockScreener:
 
     @staticmethod
     def _fetch_quotes_chunked(
-        symbols: List[str], chunk_size: int = 50
+        symbols: List[str], chunk_size: int = 50, max_workers: int = 5
     ) -> Dict[str, Dict[str, Any]]:
         """
-        Batch-fetch FMP full quotes in chunks.
+        Batch-fetch FMP full quotes in parallel chunks with backoff retry.
 
         Args:
             symbols: List of ticker symbols to fetch.
             chunk_size: Number of symbols per API call (max 50 for FMP).
+            max_workers: Number of parallel HTTP workers.
 
         Returns:
             Dict mapping uppercase symbol -> quote dict from FMP.
         """
-        import requests
+        import threading
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from ..modules.dataproviders.fmp_common import fmp_http_get, FMPError
 
         api_key = get_app_setting("FMP_API_KEY")
         if not api_key:
@@ -245,40 +248,51 @@ class StockScreener:
             return {}
 
         total = len(symbols)
-        total_chunks = (total + chunk_size - 1) // chunk_size
+        chunks = [symbols[i: i + chunk_size] for i in range(0, total, chunk_size)]
+        total_chunks = len(chunks)
         log_every = max(1, total_chunks // 5)  # log ~5 times across the run
+
         result: Dict[str, Dict[str, Any]] = {}
-        for i in range(0, total, chunk_size):
-            chunk = symbols[i: i + chunk_size]
+        result_lock = threading.Lock()
+        completed_count = 0
+
+        def fetch_chunk(chunk_idx: int, chunk: List[str]):
             joined = ",".join(chunk)
-            chunk_num = i // chunk_size + 1
             try:
-                resp = requests.get(
+                resp = fmp_http_get(
                     f"https://financialmodelingprep.com/api/v3/quote/{joined}",
                     params={"apikey": api_key},
+                    endpoint="quote",
                     timeout=15,
                 )
-                resp.raise_for_status()
                 data = resp.json()
                 if isinstance(data, list):
-                    for item in data:
-                        sym = (item.get("symbol") or "").upper()
-                        if sym:
-                            result[sym] = item
+                    return {
+                        (item.get("symbol") or "").upper(): item
+                        for item in data
+                        if (item.get("symbol") or "").upper()
+                    }
+            except FMPError as e:
+                logger.warning(f"StockScreener: quote chunk {chunk_idx + 1}/{total_chunks} failed after retries: {e}")
             except Exception as e:
-                logger.warning(
-                    f"StockScreener: FMP quote chunk {chunk_num}/{total_chunks} failed: {e}"
-                )
-            if chunk_num % log_every == 0 or chunk_num == total_chunks:
-                logger.info(
-                    f"StockScreener: quote fetch progress — "
-                    f"{min(i + chunk_size, total)}/{total} symbols "
-                    f"({chunk_num}/{total_chunks} chunks, {len(result)} fetched)"
-                )
-        logger.debug(
-            f"StockScreener: fetched FMP quotes for "
-            f"{len(result)}/{total} symbols"
-        )
+                logger.warning(f"StockScreener: quote chunk {chunk_idx + 1}/{total_chunks} failed: {e}")
+            return {}
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(fetch_chunk, i, chunk): i for i, chunk in enumerate(chunks)}
+            for future in as_completed(futures):
+                items = future.result()
+                with result_lock:
+                    result.update(items)
+                    completed_count += 1
+                    if completed_count % log_every == 0 or completed_count == total_chunks:
+                        logger.info(
+                            f"StockScreener: quote fetch progress — "
+                            f"{completed_count}/{total_chunks} chunks done "
+                            f"({len(result)}/{total} symbols fetched)"
+                        )
+
+        logger.debug(f"StockScreener: fetched FMP quotes for {len(result)}/{total} symbols")
         return result
 
     # ------------------------------------------------------------------
@@ -546,10 +560,10 @@ class StockScreener:
         symbols: List[str],
         lookback_days: int,
         chunk_size: int = 5,
+        max_workers: int = 5,
     ) -> Dict[str, List[Dict[str, Any]]]:
         """
-        Batch-fetch daily OHLCV from FMP for multiple symbols with a
-        tight date range (no multi-year caching over-fetch).
+        Batch-fetch daily OHLCV from FMP in parallel chunks with backoff retry.
 
         FMP's /historical-price-full/SYM1,SYM2 endpoint supports
         comma-separated symbols. We chunk to avoid URL-length limits.
@@ -558,7 +572,9 @@ class StockScreener:
             Dict mapping uppercase symbol -> list of bar dicts
             (oldest-first), each with keys: date, open, high, low, close, volume.
         """
-        import requests
+        import threading
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from ..modules.dataproviders.fmp_common import fmp_http_get, FMPError
 
         api_key = get_app_setting("FMP_API_KEY")
         if not api_key:
@@ -568,34 +584,41 @@ class StockScreener:
         now = datetime.now(timezone.utc)
         from_date = (now - timedelta(days=lookback_days + 5)).strftime("%Y-%m-%d")
         to_date = now.strftime("%Y-%m-%d")
+        params_base = {"apikey": api_key, "from": from_date, "to": to_date}
+
+        chunks = [symbols[i: i + chunk_size] for i in range(0, len(symbols), chunk_size)]
 
         result: Dict[str, List[Dict[str, Any]]] = {}
-        for i in range(0, len(symbols), chunk_size):
-            chunk = symbols[i: i + chunk_size]
+        result_lock = threading.Lock()
+
+        def fetch_chunk(chunk: List[str]):
             joined = ",".join(chunk)
             url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{joined}"
-            params = {"apikey": api_key, "from": from_date, "to": to_date}
-
             try:
-                resp = requests.get(url, params=params, timeout=15)
-                resp.raise_for_status()
+                resp = fmp_http_get(url, params=params_base, endpoint="historical-price-full", timeout=15)
                 data = resp.json()
+            except FMPError as e:
+                logger.warning(f"StockScreener: bulk OHLCV fetch failed for {joined} after retries: {e}")
+                return {}
             except Exception as e:
-                logger.warning(
-                    f"StockScreener: bulk OHLCV fetch failed for "
-                    f"{joined}: {e}"
-                )
-                continue
+                logger.warning(f"StockScreener: bulk OHLCV fetch failed for {joined}: {e}")
+                return {}
 
             # Single symbol → {"symbol": ..., "historical": [...]}
             # Multi symbol → {"historicalStockList": [{...}, ...]}
             stock_list = data.get("historicalStockList", [data] if "historical" in data else [])
+            chunk_result = {}
             for entry in stock_list:
                 sym = (entry.get("symbol") or "").upper()
                 bars = entry.get("historical", [])
                 # FMP returns newest-first; reverse to oldest-first
-                bars = list(reversed(bars))
-                result[sym] = bars
+                chunk_result[sym] = list(reversed(bars))
+            return chunk_result
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for chunk_result in executor.map(fetch_chunk, chunks):
+                with result_lock:
+                    result.update(chunk_result)
 
         logger.debug(
             f"StockScreener: bulk OHLCV fetched {len(result)}/{len(symbols)} "
