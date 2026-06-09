@@ -199,6 +199,10 @@ class StockScreener:
                 self._report_progress(
                     f"Checking price history (>={drop_pct}% drop over {drop_days}d)...", 0.8
                 )
+                logger.info(
+                    f"StockScreener: stage 4 — price-drop filter on {len(ranked)} candidates "
+                    f"(>={drop_pct}% over {drop_days}d, target {max_stocks} stocks)"
+                )
                 result, drop_stats = self._filter_by_price_drop_lazy(
                     ranked, drop_pct, max_stocks
                 )
@@ -469,7 +473,6 @@ class StockScreener:
         chunk_size = max(max_results * 3, 30)
         total = len(ranked_candidates)
         total_chunks = (total + chunk_size - 1) // chunk_size
-        log_every = max(1, total_chunks // 5)  # log ~5 times across the run
 
         passed: List[Dict[str, Any]] = []
         checked = 0
@@ -497,12 +500,11 @@ class StockScreener:
                     0.8 + 0.19 * fraction,
                 )
 
-            if chunk_num % log_every == 0 or chunk_num == total_chunks:
-                logger.info(
-                    f"StockScreener: price-drop check progress — "
-                    f"{checked}/{total} symbols checked "
-                    f"({chunk_num}/{total_chunks} chunks, {len(passed)} passed so far)"
-                )
+            logger.info(
+                f"StockScreener: price-drop check — "
+                f"{checked}/{total} symbols checked "
+                f"({chunk_num}/{total_chunks} chunks, {len(passed)} passed so far)"
+            )
 
             for c in chunk:
                 if len(passed) >= max_results:
