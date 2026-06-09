@@ -10,8 +10,6 @@ API Documentation:
 
 from typing import Dict, Any, List
 
-import requests
-
 from ba2_trade_platform.core.interfaces.ScreenerProviderInterface import ScreenerProviderInterface
 from ba2_trade_platform.logger import logger
 from ba2_trade_platform.config import get_app_setting
@@ -62,12 +60,12 @@ class FMPScreenerProvider(ScreenerProviderInterface):
         params = self._build_params(filters)
 
         try:
+            from ba2_trade_platform.modules.dataproviders.fmp_common import fmp_http_get, FMPError
             url = f"{self.BASE_URL}/stock-screener"
             logger.debug(f"FMP screener request: {url} params={params}")
-            response = requests.get(url, params=params, timeout=30)
-            response.raise_for_status()
+            response = fmp_http_get(url, params=params, endpoint="stock-screener", timeout=30)
             data = response.json()
-        except requests.RequestException as e:
+        except Exception as e:
             logger.error(f"FMP screener API request failed: {e}", exc_info=True)
             return []
 
