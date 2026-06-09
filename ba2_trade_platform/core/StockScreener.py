@@ -135,13 +135,13 @@ class StockScreener:
         # --- Stage 1: basic screen via provider ---
         filters = self._build_provider_filters()
         logger.info(
-            f"StockScreener: screening via '{provider_name}' with filters: {filters}"
+            f"StockScreener: stage 1 — screening via '{provider_name}' with filters: {filters}"
         )
         self._report_progress("Fetching candidates from screener...", 0.05)
         candidates = screener.screen_stocks(filters)
         stats["screener_candidates"] = len(candidates)
         logger.info(
-            f"StockScreener: screener returned {len(candidates)} candidates"
+            f"StockScreener: stage 1 done — {len(candidates)} candidates returned"
         )
 
         if not candidates:
@@ -151,16 +151,17 @@ class StockScreener:
         # --- Stage 2: RVOL enrichment + client-side filters ---
         rvol_min = self._settings["screener_relative_volume_min"]
         if rvol_min > 0:
+            logger.info(
+                f"StockScreener: stage 2 — RVOL enrichment on {len(candidates)} candidates "
+                f"(min RVOL={rvol_min})"
+            )
             self._report_progress(
                 f"Fetching live prices for {len(candidates)} candidates (RVOL)...", 0.2
             )
-            candidates, enrich_stats = self._enrich_with_rvol(
-                candidates, rvol_min
-            )
+            candidates, enrich_stats = self._enrich_with_rvol(candidates, rvol_min)
             stats.update(enrich_stats)
             logger.info(
-                f"StockScreener: {len(candidates)} candidates after RVOL "
-                f"enrichment (min RVOL={rvol_min})"
+                f"StockScreener: stage 2 done — {len(candidates)} candidates after RVOL filter"
             )
 
         if not candidates:
@@ -173,12 +174,14 @@ class StockScreener:
         drop_days = self._settings["screener_price_drop_days"]
 
         if metric == "price_drop_pct":
-            # Ranking by price drop: fetch history for ALL candidates, compute
-            # price_drop_pct, then sort by drop descending and trim.
+            # Ranking by price drop: fetch history for ALL candidates, sort by drop descending.
+            logger.info(
+                f"StockScreener: stage 3/4 — price-drop ranking on {len(candidates)} candidates"
+            )
             self._report_progress(
                 f"Fetching price history for {len(candidates)} candidates (sort by drop)...", 0.7
             )
-            result, drop_stats = self._filter_by_price_drop_lazy(
+            result, drop_stats = self._filter_by_price_drop(
                 candidates,
                 min_drop_pct=drop_pct if drop_pct > 0 else 0,
                 max_results=len(candidates),  # fetch all — trim after sorting
@@ -187,30 +190,30 @@ class StockScreener:
             result = sorted(result, key=lambda c: c.get("price_drop_pct") or 0, reverse=True)
             result = result[:max_stocks]
             logger.info(
-                f"StockScreener: {len(result)} stocks ranked by price_drop_pct descending"
+                f"StockScreener: stage 3/4 done — {len(result)} stocks ranked by price_drop_pct"
             )
         else:
             # --- Stage 3: rank ---
+            logger.info(
+                f"StockScreener: stage 3 — ranking {len(candidates)} candidates by {metric}"
+            )
             self._report_progress("Ranking candidates...", 0.7)
             ranked = self._rank(candidates)
+            logger.info(f"StockScreener: stage 3 done")
 
-            # --- Stage 4: price-drop filter (lazy, on ranked list) ---
+            # --- Stage 4: price-drop filter ---
             if drop_pct > 0 and drop_days > 0:
-                self._report_progress(
-                    f"Checking price history (>={drop_pct}% drop over {drop_days}d)...", 0.8
-                )
                 logger.info(
                     f"StockScreener: stage 4 — price-drop filter on {len(ranked)} candidates "
                     f"(>={drop_pct}% over {drop_days}d, target {max_stocks} stocks)"
                 )
-                result, drop_stats = self._filter_by_price_drop_lazy(
-                    ranked, drop_pct, max_stocks
+                self._report_progress(
+                    f"Checking price history (>={drop_pct}% drop over {drop_days}d)...", 0.8
                 )
+                result, drop_stats = self._filter_by_price_drop(ranked, drop_pct, max_stocks)
                 stats.update(drop_stats)
                 logger.info(
-                    f"StockScreener: {len(result)} stocks after price-drop "
-                    f"filter (>={drop_pct}% over {drop_days}d, "
-                    f"sorted by {metric})"
+                    f"StockScreener: stage 4 done — {len(result)} stocks passed price-drop filter"
                 )
             else:
                 result = ranked[:max_stocks]
@@ -218,13 +221,13 @@ class StockScreener:
         stats["final_count"] = len(result)
         self._report_progress(f"Done — {len(result)} stock(s) matched.", 1.0)
         logger.info(
-            f"StockScreener: returning {len(result)} stocks "
+            f"StockScreener: pipeline complete — {len(result)} stocks "
             f"(sorted by {self._settings['screener_sort_metric']})"
         )
         return {"results": result, "stats": stats}
 
     # ------------------------------------------------------------------
-    # Static helper – extracted from PennyMomentumTrader for reuse
+    # Static helpers
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -291,12 +294,95 @@ class StockScreener:
                     completed_count += 1
                     if completed_count % log_every == 0 or completed_count == total_chunks:
                         logger.info(
-                            f"StockScreener: quote fetch progress — "
+                            f"StockScreener: quote fetch — "
                             f"{completed_count}/{total_chunks} chunks done "
                             f"({len(result)}/{total} symbols fetched)"
                         )
 
         logger.debug(f"StockScreener: fetched FMP quotes for {len(result)}/{total} symbols")
+        return result
+
+    @staticmethod
+    def _fetch_history_bulk(
+        symbols: List[str],
+        lookback_days: int,
+        chunk_size: int = 5,
+        max_workers: int = 8,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """
+        Batch-fetch daily OHLCV from FMP in parallel chunks with backoff retry.
+
+        FMP's /historical-price-full/SYM1,SYM2 endpoint supports
+        comma-separated symbols. We chunk to avoid URL-length limits.
+
+        Returns:
+            Dict mapping uppercase symbol -> list of bar dicts
+            (oldest-first), each with keys: date, open, high, low, close, volume.
+        """
+        import threading
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from ..modules.dataproviders.fmp_common import fmp_http_get, FMPError
+
+        api_key = get_app_setting("FMP_API_KEY")
+        if not api_key:
+            logger.warning("StockScreener: FMP_API_KEY not configured")
+            return {}
+
+        now = datetime.now(timezone.utc)
+        from_date = (now - timedelta(days=lookback_days + 5)).strftime("%Y-%m-%d")
+        to_date = now.strftime("%Y-%m-%d")
+        params_base = {"apikey": api_key, "from": from_date, "to": to_date}
+
+        chunks = [symbols[i: i + chunk_size] for i in range(0, len(symbols), chunk_size)]
+        total_chunks = len(chunks)
+        log_every = max(1, total_chunks // 5)  # log ~5 times across the run
+
+        result: Dict[str, List[Dict[str, Any]]] = {}
+        result_lock = threading.Lock()
+        completed_count = 0
+
+        def fetch_chunk(chunk: List[str]):
+            joined = ",".join(chunk)
+            url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{joined}"
+            try:
+                resp = fmp_http_get(url, params=params_base, endpoint="historical-price-full", timeout=15)
+                data = resp.json()
+            except FMPError as e:
+                logger.warning(f"StockScreener: OHLCV chunk failed after retries: {e}")
+                return {}
+            except Exception as e:
+                logger.warning(f"StockScreener: OHLCV chunk failed: {e}")
+                return {}
+
+            # Single symbol → {"symbol": ..., "historical": [...]}
+            # Multi symbol → {"historicalStockList": [{...}, ...]}
+            stock_list = data.get("historicalStockList", [data] if "historical" in data else [])
+            chunk_result = {}
+            for entry in stock_list:
+                sym = (entry.get("symbol") or "").upper()
+                bars = entry.get("historical", [])
+                # FMP returns newest-first; reverse to oldest-first
+                chunk_result[sym] = list(reversed(bars))
+            return chunk_result
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(fetch_chunk, chunk): i for i, chunk in enumerate(chunks)}
+            for future in as_completed(futures):
+                chunk_result = future.result()
+                with result_lock:
+                    result.update(chunk_result)
+                    completed_count += 1
+                    if completed_count % log_every == 0 or completed_count == total_chunks:
+                        logger.info(
+                            f"StockScreener: history fetch — "
+                            f"{completed_count}/{total_chunks} chunks done "
+                            f"({len(result)}/{len(symbols)} symbols fetched)"
+                        )
+
+        logger.debug(
+            f"StockScreener: bulk OHLCV fetched {len(result)}/{len(symbols)} "
+            f"symbols ({from_date} to {to_date})"
+        )
         return result
 
     # ------------------------------------------------------------------
@@ -353,13 +439,6 @@ class StockScreener:
         Enrich candidates with FMP quote data, compute relative volume,
         and apply client-side filters that the screener API does not support
         (float_min, volume_max).
-
-        Args:
-            candidates: Raw screener results.
-            min_rvol: Minimum relative volume threshold (> 0).
-
-        Returns:
-            Tuple of (filtered list, stats dict with per-filter drop counts).
         """
         all_symbols = [
             c["symbol"].upper()
@@ -409,32 +488,25 @@ class StockScreener:
 
             # --- Client-side filters ---
 
-            # Filter: minimum RVOL
             if rvol < min_rvol:
-                logger.debug(
-                    f"StockScreener: dropping {sym} — RVOL {rvol} < {min_rvol}"
-                )
+                logger.debug(f"StockScreener: dropping {sym} — RVOL {rvol} < {min_rvol}")
                 dropped_rvol += 1
                 continue
 
-            # Filter: float_min (not supported by FMP screener API)
-            # A value of 0 means data is unavailable — don't filter those out
+            # float_min: 0 means data unavailable, don't filter those out
             if float_min > 0:
                 stock_float = c.get("float_shares") or 0
                 if stock_float > 0 and stock_float < float_min:
                     logger.debug(
-                        f"StockScreener: dropping {sym} — float "
-                        f"{stock_float:,} < {float_min:,}"
+                        f"StockScreener: dropping {sym} — float {stock_float:,} < {float_min:,}"
                     )
                     dropped_float += 1
                     continue
 
-            # Filter: volume_max (not supported by FMP screener API)
             if volume_max > 0:
                 if volume > volume_max:
                     logger.debug(
-                        f"StockScreener: dropping {sym} — volume "
-                        f"{volume:,} > {volume_max:,}"
+                        f"StockScreener: dropping {sym} — volume {volume:,} > {volume_max:,}"
                     )
                     dropped_volume_max += 1
                     continue
@@ -448,107 +520,76 @@ class StockScreener:
         }
         return enriched, stats
 
-    def _filter_by_price_drop_lazy(
+    def _filter_by_price_drop(
         self,
-        ranked_candidates: List[Dict[str, Any]],
+        candidates: List[Dict[str, Any]],
         min_drop_pct: float,
         max_results: int,
     ) -> tuple:
         """
-        Fetch historical prices in bulk chunks from the ranked list,
-        check price drops, and stop once we have max_results stocks.
-
-        Uses FMP's multi-symbol historical-price-full endpoint directly
-        to avoid the base provider's caching over-fetch.
+        Pre-fetch price history for all candidates in one parallel batch,
+        then filter in memory for stocks with a sufficient recent price drop.
 
         Args:
-            ranked_candidates: Already-sorted candidates (best first).
-            min_drop_pct: Minimum percentage drop required.
-            max_results: Stop once we have this many passing stocks.
+            candidates: Ranked candidates (best first for early-stop).
+            min_drop_pct: Minimum percentage drop required (0 = accept all).
+            max_results: Stop collecting once this many stocks pass.
 
         Returns:
             Tuple of (filtered list, stats dict).
         """
         lookback_days = self._settings["screener_price_drop_days"]
-        chunk_size = max(max_results * 3, 30)
-        total = len(ranked_candidates)
-        total_chunks = (total + chunk_size - 1) // chunk_size
+        total = len(candidates)
+
+        all_symbols = [c["symbol"] for c in candidates if c.get("symbol")]
+        history_map = self._fetch_history_bulk(all_symbols, lookback_days)
+        logger.info(
+            f"StockScreener: history fetched for {len(history_map)}/{total} symbols — filtering..."
+        )
 
         passed: List[Dict[str, Any]] = []
-        checked = 0
         dropped_price_drop = 0
+        checked = 0
 
-        for i in range(0, len(ranked_candidates), chunk_size):
+        for c in candidates:
             if len(passed) >= max_results:
                 break
 
-            chunk = ranked_candidates[i: i + chunk_size]
-            symbols = [c["symbol"] for c in chunk if c.get("symbol")]
-            if not symbols:
+            symbol = (c.get("symbol") or "").upper()
+            bars = history_map.get(symbol, [])
+
+            if not bars:
+                logger.debug(f"StockScreener: no bars for {symbol}")
                 continue
 
-            history_map = self._fetch_history_bulk(symbols, lookback_days)
-            checked += len(symbols)
-            chunk_num = i // chunk_size + 1
+            checked += 1
 
-            # Report progress within the 0.8–1.0 range after each chunk
-            if total > 0:
-                fraction = min(checked / total, 1.0)
-                self._report_progress(
-                    f"Checking price history... {checked}/{total} symbols"
-                    f" ({len(passed)} passed so far)",
-                    0.8 + 0.19 * fraction,
-                )
-
-            logger.info(
-                f"StockScreener: price-drop check — "
-                f"{checked}/{total} symbols checked "
-                f"({chunk_num}/{total_chunks} chunks, {len(passed)} passed so far)"
+            # Find peak price over the lookback window
+            lookback_bars = bars[-lookback_days:] if lookback_days < len(bars) else bars
+            peak_price = max(
+                max(b.get("high") or 0, b.get("low") or 0)
+                for b in lookback_bars
             )
 
-            for c in chunk:
-                if len(passed) >= max_results:
-                    break
+            # Use live price from quote enrichment, fall back to last bar's close
+            current_price = c.get("price") or bars[-1].get("close")
 
-                symbol = (c.get("symbol") or "").upper()
-                bars = history_map.get(symbol, [])
+            if peak_price <= 0 or current_price is None:
+                continue
 
-                if not bars:
-                    logger.debug(
-                        f"StockScreener: no bars for {symbol}"
-                    )
-                    continue
+            drop_pct = round(((peak_price - current_price) / peak_price) * 100, 2)
+            c["price_drop_pct"] = drop_pct
 
-                # Find peak price (max of high and low) over the lookback window
-                lookback_bars = bars[-lookback_days:] if lookback_days < len(bars) else bars
-                peak_price = max(
-                    max(b.get("high") or 0, b.get("low") or 0)
-                    for b in lookback_bars
+            if drop_pct >= min_drop_pct:
+                passed.append(c)
+            else:
+                dropped_price_drop += 1
+                logger.debug(
+                    f"StockScreener: dropping {symbol} — price drop {drop_pct}% < {min_drop_pct}%"
                 )
-
-                # Use live price from quote enrichment (current),
-                # fall back to last bar's close if not available
-                current_price = c.get("price") or bars[-1].get("close")
-
-                if peak_price <= 0 or current_price is None:
-                    continue
-
-                drop_pct = round(
-                    ((peak_price - current_price) / peak_price) * 100, 2
-                )
-                c["price_drop_pct"] = drop_pct
-
-                if drop_pct >= min_drop_pct:
-                    passed.append(c)
-                else:
-                    dropped_price_drop += 1
-                    logger.debug(
-                        f"StockScreener: dropping {symbol} — price drop "
-                        f"{drop_pct}% < {min_drop_pct}%"
-                    )
 
         logger.info(
-            f"StockScreener: price-drop filter checked {checked} symbols, "
+            f"StockScreener: price-drop filter checked {checked}/{total} symbols, "
             f"{len(passed)} passed"
         )
         stats = {
@@ -556,77 +597,6 @@ class StockScreener:
             "dropped_price_drop": dropped_price_drop,
         }
         return passed, stats
-
-    @staticmethod
-    def _fetch_history_bulk(
-        symbols: List[str],
-        lookback_days: int,
-        chunk_size: int = 5,
-        max_workers: int = 5,
-    ) -> Dict[str, List[Dict[str, Any]]]:
-        """
-        Batch-fetch daily OHLCV from FMP in parallel chunks with backoff retry.
-
-        FMP's /historical-price-full/SYM1,SYM2 endpoint supports
-        comma-separated symbols. We chunk to avoid URL-length limits.
-
-        Returns:
-            Dict mapping uppercase symbol -> list of bar dicts
-            (oldest-first), each with keys: date, open, high, low, close, volume.
-        """
-        import threading
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        from ..modules.dataproviders.fmp_common import fmp_http_get, FMPError
-
-        api_key = get_app_setting("FMP_API_KEY")
-        if not api_key:
-            logger.warning("StockScreener: FMP_API_KEY not configured")
-            return {}
-
-        now = datetime.now(timezone.utc)
-        from_date = (now - timedelta(days=lookback_days + 5)).strftime("%Y-%m-%d")
-        to_date = now.strftime("%Y-%m-%d")
-        params_base = {"apikey": api_key, "from": from_date, "to": to_date}
-
-        chunks = [symbols[i: i + chunk_size] for i in range(0, len(symbols), chunk_size)]
-
-        result: Dict[str, List[Dict[str, Any]]] = {}
-        result_lock = threading.Lock()
-
-        def fetch_chunk(chunk: List[str]):
-            joined = ",".join(chunk)
-            url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{joined}"
-            try:
-                resp = fmp_http_get(url, params=params_base, endpoint="historical-price-full", timeout=15)
-                data = resp.json()
-            except FMPError as e:
-                logger.warning(f"StockScreener: bulk OHLCV fetch failed for {joined} after retries: {e}")
-                return {}
-            except Exception as e:
-                logger.warning(f"StockScreener: bulk OHLCV fetch failed for {joined}: {e}")
-                return {}
-
-            # Single symbol → {"symbol": ..., "historical": [...]}
-            # Multi symbol → {"historicalStockList": [{...}, ...]}
-            stock_list = data.get("historicalStockList", [data] if "historical" in data else [])
-            chunk_result = {}
-            for entry in stock_list:
-                sym = (entry.get("symbol") or "").upper()
-                bars = entry.get("historical", [])
-                # FMP returns newest-first; reverse to oldest-first
-                chunk_result[sym] = list(reversed(bars))
-            return chunk_result
-
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            for chunk_result in executor.map(fetch_chunk, chunks):
-                with result_lock:
-                    result.update(chunk_result)
-
-        logger.debug(
-            f"StockScreener: bulk OHLCV fetched {len(result)}/{len(symbols)} "
-            f"symbols ({from_date} to {to_date})"
-        )
-        return result
 
     def _rank(
         self, candidates: List[Dict[str, Any]]
