@@ -338,7 +338,8 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
             try:
                 rd_txns = self._run_async(self._account.get_history(
                     self._session, **_range({"types": ["Receive Deliver"],
-                                             "sub_types": ["Dividend"], "sort": "Asc"})))
+                                             "sub_types": ["Dividend"], "sort": "Asc",
+                                             "page_offset": None})))
                 for txn in rd_txns:
                     sym = getattr(txn, 'underlying_symbol', None) or getattr(txn, 'symbol', None)
                     d = getattr(txn, 'transaction_date', None)
@@ -354,7 +355,8 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
             gross_map = {}  # (symbol, date) -> gross dividend
             tax_map = {}    # (symbol, date) -> tax withheld (positive)
             mm_txns = self._run_async(self._account.get_history(
-                self._session, **_range({"types": ["Money Movement"], "sort": "Asc"})))
+                self._session, **_range({"types": ["Money Movement"], "sort": "Asc",
+                                         "page_offset": None})))
             for mm in mm_txns:
                 if getattr(mm, 'transaction_sub_type', None) != 'Dividend':
                     continue
@@ -369,8 +371,13 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
                 elif net_val < 0:
                     tax_map[key] = tax_map.get(key, 0.0) + abs(net_val)
 
+            # Anchor on the GROSS dividend keys (one positive cash dividend per
+            # symbol+date). Tax is linked back by the SAME (symbol, date) key, so
+            # withholding only ever reduces its own symbol's dividend -- an
+            # unrelated/orphan tax line (no matching gross) is never emitted as a
+            # phantom negative dividend.
             dividends = []
-            for key in sorted(set(gross_map) | set(tax_map), key=lambda k: (str(k[1]), str(k[0]))):
+            for key in sorted(gross_map, key=lambda k: (str(k[1]), str(k[0]))):
                 sym, d = key
                 gross = round(gross_map.get(key, 0.0), 2)
                 tax = round(tax_map.get(key, 0.0), 2)
