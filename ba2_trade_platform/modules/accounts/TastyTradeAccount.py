@@ -300,131 +300,89 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
         return True
 
     def get_dividends(self, symbol=None, start_date=None, end_date=None) -> List[Dict]:
+        """Return one record per dividend the account received.
+
+        Dividends are driven by the CASH event, not the reinvestment. TastyTrade
+        posts each dividend as a group of ``Money Movement`` transactions with
+        ``transaction_sub_type == "Dividend"`` per (symbol, date):
+            +1.57  "TIDAL TRUST II"   gross dividend (positive)
+            -0.24  "TIDAL TRUST II"   tax withheld   (negative)
+        When DRIP is enabled there is additionally:
+            - a ``Money Movement`` / ``Withdrawal`` "Cash dividend reinvested
+              into X" leg (the net cash spent buying shares), and
+            - a ``Receive Deliver`` / ``Dividend`` leg crediting the shares.
+        We anchor on the ``Money Movement`` / ``Dividend`` cash so a dividend
+        shows up whether or not it was reinvested (with DRIP off there is no
+        ``Receive Deliver`` leg at all), and we ENRICH with the share-receipt
+        leg only when present.
+
+        ``amount`` is the NET dividend (gross - tax) — the income actually kept.
+        ``gross_amount`` / ``tax_withheld`` carry the breakdown.
+        ``drip_quantity`` / ``drip_price`` are None for non-reinvested (cash)
+        dividends.
+        """
         if not self._check_authentication():
             return []
         try:
-            params = {
-                "types": ["Receive Deliver"],
-                "sub_types": ["Dividend"],
-                "sort": "Asc",
-            }
-            if symbol:
-                params["symbol"] = symbol
-            if start_date:
-                params["start_date"] = start_date.date() if isinstance(start_date, datetime) else start_date
-            if end_date:
-                params["end_date"] = end_date.date() if isinstance(end_date, datetime) else end_date
-
-            transactions = self._run_async(self._account.get_history(self._session, **params))
-
-            # Also fetch DRIP transactions to correlate
-            drip_params = {
-                "types": ["Receive Deliver"],
-                "sub_types": ["DRIP"],
-                "sort": "Asc",
-            }
-            if start_date:
-                drip_params["start_date"] = params.get("start_date")
-            if end_date:
-                drip_params["end_date"] = params.get("end_date")
-
-            try:
-                drip_transactions = self._run_async(self._account.get_history(self._session, **drip_params))
-            except Exception as e:
-                logger.warning(f"[Account {self.id}] DRIP transaction fetch failed: {e}")
-                drip_transactions = []
-
-            # Build a map of DRIP by date+symbol for correlation
-            drip_map = {}
-            for drip in drip_transactions:
-                key = (
-                    getattr(drip, 'underlying_symbol', None) or getattr(drip, 'symbol', None),
-                    getattr(drip, 'transaction_date', None)
-                )
-                drip_map[key] = drip
-
-            # Fetch Money Movement transactions to find tax withholding and gross
-            # dividend amounts. TastyTrade records dividends as Money Movement
-            # groups per (symbol, date):
-            #   +0.97  "ROUNDHILL ETF TR"                   (gross dividend)
-            #   -0.15  "ROUNDHILL ETF TR"                   (tax withheld)
-            #   -0.82  "Cash dividend reinvested into MAGY" (DRIP cash = gross - tax)
-            # The negative entries with "reinvested" in description are DRIP cash
-            # movements, NOT tax. Only negative entries without "reinvested" are tax.
-            wh_map = {}   # (symbol, date) -> tax withheld
-            gross_map = {}  # (symbol, date) -> gross dividend amount
-            try:
-                mm_params = {
-                    "types": ["Money Movement"],
-                    "sort": "Asc",
-                }
+            def _range(p):
                 if start_date:
-                    mm_params["start_date"] = params.get("start_date")
+                    p["start_date"] = start_date.date() if isinstance(start_date, datetime) else start_date
                 if end_date:
-                    mm_params["end_date"] = params.get("end_date")
-                mm_transactions = self._run_async(self._account.get_history(self._session, **mm_params))
-                for mm in mm_transactions:
-                    mm_symbol = getattr(mm, 'underlying_symbol', None) or getattr(mm, 'symbol', None)
-                    mm_date = getattr(mm, 'transaction_date', None)
-                    if not mm_symbol or not mm_date:
-                        continue
-                    net_val = float(getattr(mm, 'net_value', 0) or 0)
-                    desc = str(getattr(mm, 'description', '') or '').lower()
-                    key = (mm_symbol, mm_date)
-                    if net_val > 0:
-                        # Positive entry = gross dividend
-                        gross_map[key] = gross_map.get(key, 0) + net_val
-                    elif net_val < 0 and 'reinvested' not in desc:
-                        # Negative entry without "reinvested" = tax withholding
-                        wh_map[key] = wh_map.get(key, 0) + abs(net_val)
+                    p["end_date"] = end_date.date() if isinstance(end_date, datetime) else end_date
+                if symbol:
+                    p["symbol"] = symbol
+                return p
+
+            # DRIP share-receipt legs (enrichment only): Receive Deliver / Dividend.
+            drip_map = {}  # (symbol, date) -> (qty, price)
+            try:
+                rd_txns = self._run_async(self._account.get_history(
+                    self._session, **_range({"types": ["Receive Deliver"],
+                                             "sub_types": ["Dividend"], "sort": "Asc"})))
+                for txn in rd_txns:
+                    sym = getattr(txn, 'underlying_symbol', None) or getattr(txn, 'symbol', None)
+                    d = getattr(txn, 'transaction_date', None)
+                    qty = float(getattr(txn, 'quantity', 0) or 0)
+                    if sym and d and qty > 0:
+                        drip_map[(sym, d)] = (qty, float(getattr(txn, 'price', 0) or 0))
             except Exception as e:
-                logger.warning(f"[Account {self.id}] Money movement fetch failed: {e}")
+                logger.warning(f"[Account {self.id}] DRIP share-receipt fetch failed: {e}")
+
+            # Cash dividends + tax: Money Movement transactions, sub_type "Dividend"
+            # only (excludes the "Withdrawal" reinvest leg, ACH deposits, fee
+            # adjustments, etc.). Positive net = gross, negative net = tax.
+            gross_map = {}  # (symbol, date) -> gross dividend
+            tax_map = {}    # (symbol, date) -> tax withheld (positive)
+            mm_txns = self._run_async(self._account.get_history(
+                self._session, **_range({"types": ["Money Movement"], "sort": "Asc"})))
+            for mm in mm_txns:
+                if getattr(mm, 'transaction_sub_type', None) != 'Dividend':
+                    continue
+                sym = getattr(mm, 'underlying_symbol', None) or getattr(mm, 'symbol', None)
+                d = getattr(mm, 'transaction_date', None)
+                if not sym or not d:
+                    continue
+                net_val = float(getattr(mm, 'net_value', 0) or 0)
+                key = (sym, d)
+                if net_val > 0:
+                    gross_map[key] = gross_map.get(key, 0.0) + net_val
+                elif net_val < 0:
+                    tax_map[key] = tax_map.get(key, 0.0) + abs(net_val)
 
             dividends = []
-            for txn in transactions:
-                txn_symbol = getattr(txn, 'underlying_symbol', None) or getattr(txn, 'symbol', None)
-                txn_date = getattr(txn, 'transaction_date', None) or getattr(txn, 'executed_at', None)
-
-                # Extract DRIP shares from the Receive Deliver transaction
-                # itself (e.g. "Received 0.0169 Long MAGY via Dividend").
-                txn_qty = float(getattr(txn, 'quantity', 0) or 0)
-                txn_price = float(getattr(txn, 'price', 0) or 0)
-                if txn_qty > 0:
-                    drip_qty = txn_qty
-                    drip_price = txn_price
-                else:
-                    # Fall back to separate DRIP transaction if available
-                    drip_qty = None
-                    drip_price = None
-                    drip_key = (txn_symbol, getattr(txn, 'transaction_date', None))
-                    if drip_key in drip_map:
-                        drip_txn = drip_map[drip_key]
-                        drip_qty = float(getattr(drip_txn, 'quantity', 0) or 0)
-                        drip_price = float(getattr(drip_txn, 'price', 0) or 0)
-
-                # Compute dividend amount. Prefer the gross amount from Money
-                # Movement if available (it reflects the actual gross dividend
-                # before tax). Otherwise fall back to the Receive Deliver
-                # transaction's net_value/value, or price*qty.
-                txn_date_key = (txn_symbol, getattr(txn, 'transaction_date', None))
-                amount = gross_map.get(txn_date_key, 0)
-                if amount == 0:
-                    net_val = float(getattr(txn, 'net_value', 0) or 0)
-                    val = float(getattr(txn, 'value', 0) or 0)
-                    amount = net_val or val
-                if amount == 0:
-                    amount = txn_price * txn_qty
-
-                # Look up matching tax withholding
-                tax_withheld = wh_map.get((txn_symbol, getattr(txn, 'transaction_date', None)), 0.0)
-
+            for key in sorted(set(gross_map) | set(tax_map), key=lambda k: (str(k[1]), str(k[0]))):
+                sym, d = key
+                gross = round(gross_map.get(key, 0.0), 2)
+                tax = round(tax_map.get(key, 0.0), 2)
+                drip_qty, drip_price = drip_map.get(key, (None, None))
                 dividends.append({
-                    'symbol': txn_symbol,
-                    'amount': amount,
-                    'date': txn_date,
+                    'symbol': sym,
+                    'amount': round(gross - tax, 2),   # NET dividend (income kept)
+                    'gross_amount': gross,
+                    'tax_withheld': tax,
+                    'date': d,
                     'drip_quantity': drip_qty,
                     'drip_price': drip_price,
-                    'tax_withheld': tax_withheld,
                 })
 
             logger.debug(f"[Account {self.id}] Retrieved {len(dividends)} dividend records")

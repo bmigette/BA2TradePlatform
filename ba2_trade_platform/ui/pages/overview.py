@@ -5362,7 +5362,7 @@ class AccountGrowthTab:
                 return {
                     'backgroundColor': 'transparent',
                     'tooltip': {'trigger': 'axis', 'axisPointer': {'type': 'shadow'}},
-                    'legend': {'data': ['Closed P&L', 'Dividends', 'Total'], 'textStyle': {'color': '#a0aec0'}},
+                    'legend': {'data': ['Closed P&L', 'Dividends', 'Total'], 'textStyle': {'color': '#a0aec0'}, 'top': 5},
                     'grid': {'left': '3%', 'right': '3%', 'bottom': '3%', 'containLabel': True},
                     'xAxis': {'type': 'category', 'data': months, 'axisLabel': {'color': '#a0aec0'}},
                     'yAxis': {'type': 'value', 'axisLabel': {'color': '#a0aec0', 'formatter': fmt},
@@ -5423,7 +5423,7 @@ class AccountGrowthTab:
                 return {
                     'backgroundColor': 'transparent',
                     'tooltip': {'trigger': 'axis', 'axisPointer': {'type': 'shadow'}},
-                    'legend': {'data': [s['name'] for s in series], 'textStyle': {'color': '#a0aec0'}},
+                    'legend': {'data': [s['name'] for s in series], 'textStyle': {'color': '#a0aec0'}, 'top': 5},
                     'grid': {'left': '3%', 'right': '3%', 'bottom': '3%', 'containLabel': True},
                     'xAxis': {'type': 'category', 'data': months, 'axisLabel': {'color': '#a0aec0'}},
                     'yAxis': {'type': 'value', 'axisLabel': {'color': '#a0aec0', 'formatter': fmt},
@@ -6385,15 +6385,18 @@ class AccountGrowthTab:
         for i, div in enumerate(filtered):
             date_val = div.get('date')
             date_str = date_val.strftime('%Y-%m-%d') if hasattr(date_val, 'strftime') else str(date_val)
-            gross = round(float(div.get('amount', 0)), 2)
+            net = round(float(div.get('amount', 0)), 2)
             tax = round(float(div.get('tax_withheld', 0)), 2)
+            # `amount` is the NET dividend; gross = net + tax (gross_amount carries
+            # it explicitly, with a legacy fallback for older record shapes).
+            gross = round(float(div.get('gross_amount', net + tax)), 2)
             row = {
                 'id': i,
                 'date': date_str,
                 'symbol': div.get('symbol', ''),
                 'amount': gross,
                 'tax': tax,
-                'net': round(gross - tax, 2),
+                'net': net,
                 'account': div.get('account_name', ''),
             }
             drip_qty = div.get('drip_quantity')

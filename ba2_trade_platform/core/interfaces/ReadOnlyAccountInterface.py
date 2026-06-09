@@ -736,11 +736,14 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         Returns:
             List[Dict]: List of dividend records, each containing:
                 - symbol (str): The stock symbol
-                - amount (float): Dividend amount in account currency
+                - amount (float): NET dividend (gross - tax) in account currency. This is the
+                  income actually kept and the value consumers (income/charts) should use.
+                - gross_amount (float): Gross dividend before tax withholding.
+                - tax_withheld (float): Tax withheld on the dividend (positive number, e.g., 0.12). Defaults to 0.0.
                 - date (datetime): Date the dividend was received
                 - drip_quantity (float | None): Number of shares reinvested via DRIP, if applicable
+                  (None for non-reinvested / cash dividends)
                 - drip_price (float | None): Price per share for DRIP reinvestment, if applicable
-                - tax_withheld (float): Tax withheld on the dividend (positive number, e.g., 0.12). Defaults to 0.0.
         """
         pass
 

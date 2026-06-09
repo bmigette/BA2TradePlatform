@@ -4284,9 +4284,11 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 date_key = str(date_str)[:10] if date_str else None
                 tax_withheld = nra_map.get((act_symbol, date_key), 0.0) if date_key else 0.0
 
+                gross = float(activity.get('net_amount', 0) or 0)
                 div_record = {
                     'symbol': act_symbol,
-                    'amount': float(activity.get('net_amount', 0) or 0),
+                    'amount': round(gross - tax_withheld, 2),   # NET dividend (income kept)
+                    'gross_amount': gross,
                     'date': date_val,
                     'drip_quantity': None,
                     'drip_price': None,
