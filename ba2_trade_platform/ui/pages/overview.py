@@ -5185,7 +5185,9 @@ class AccountGrowthTab:
             if sym and t.get('date'):
                 trades_by_sym[sym].append(t)
 
-        symbols = sorted(trades_by_sym.keys())
+        # Labels are needed for both trade symbols and dividend symbols
+        div_symbols = {d.get('symbol') for d in (all_dividends or []) if d.get('symbol')}
+        symbols = sorted(set(trades_by_sym.keys()) | div_symbols)
         labels_by_symbol = get_labels_by_symbol(symbols) if symbols else {}
 
         # FIFO realized P&L per symbol
@@ -5220,7 +5222,8 @@ class AccountGrowthTab:
                         mlbl[lb] = mlbl.get(lb, 0.0) + realized
                         labels_set.add(lb)
 
-        # Dividend income by month (all dividends — cash received + reinvested)
+        # Dividend income by month (all dividends — cash received + reinvested),
+        # also attributed per-label by the dividend's symbol.
         for div in (all_dividends or []):
             dt = div.get('date')
             if not dt:
@@ -5228,6 +5231,10 @@ class AccountGrowthTab:
             month = dt.strftime('%Y-%m') if hasattr(dt, 'strftime') else str(dt)[:7]
             amount = float(div.get('amount', 0)) - float(div.get('tax_withheld', 0))
             monthly_income.setdefault(month, {'pnl': 0.0, 'div': 0.0})['div'] += amount
+            mlbl = monthly_by_label.setdefault(month, {})
+            for lb in (labels_by_symbol.get(div.get('symbol')) or ['Unlabeled']):
+                mlbl[lb] = mlbl.get(lb, 0.0) + amount
+                labels_set.add(lb)
 
         months = sorted(monthly_income.keys())
         for m in months:
@@ -5268,9 +5275,9 @@ class AccountGrowthTab:
             }).classes('w-full').style('height: 320px')
 
     def _render_monthly_profit_by_label_chart(self, months, monthly_by_label, labels):
-        """Grouped bars of monthly closed profit per label, with a label selector."""
+        """Grouped bars of monthly realized income (closed P&L + dividends) per label."""
         with ui.card().classes('w-full mb-4 p-4'):
-            ui.label('Monthly Closed Profit by Label').classes('text-md font-bold mb-2')
+            ui.label('Monthly Closed Profit + Dividends by Label').classes('text-md font-bold mb-2')
             if not months or not labels:
                 ui.label('No closed trades yet.').classes('text-sm text-gray-500')
                 return
