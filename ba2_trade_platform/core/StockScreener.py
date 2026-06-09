@@ -237,7 +237,7 @@ class StockScreener:
         Returns:
             Dict mapping uppercase symbol -> quote dict from FMP.
         """
-        import fmpsdk
+        import requests
 
         api_key = get_app_setting("FMP_API_KEY")
         if not api_key:
@@ -247,11 +247,18 @@ class StockScreener:
         result: Dict[str, Dict[str, Any]] = {}
         for i in range(0, len(symbols), chunk_size):
             chunk = symbols[i: i + chunk_size]
+            joined = ",".join(chunk)
             try:
-                data = fmpsdk.quote(apikey=api_key, symbol=chunk)
+                resp = requests.get(
+                    f"https://financialmodelingprep.com/api/v3/quote/{joined}",
+                    params={"apikey": api_key},
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                data = resp.json()
                 if isinstance(data, list):
                     for item in data:
-                        sym = item.get("symbol", "").upper()
+                        sym = (item.get("symbol") or "").upper()
                         if sym:
                             result[sym] = item
             except Exception as e:
