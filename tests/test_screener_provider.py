@@ -112,7 +112,7 @@ def test_validate_config_without_key():
 # ---------------------------------------------------------------------------
 
 
-@patch("ba2_trade_platform.modules.dataproviders.screener.FMPScreenerProvider.requests.get")
+@patch("ba2_trade_platform.modules.dataproviders.fmp_common.fmp_http_get")
 def test_screen_stocks_basic(mock_get, provider):
     """Basic screening should return normalised results."""
     mock_response = MagicMock()
@@ -146,7 +146,7 @@ def test_screen_stocks_basic(mock_get, provider):
     assert params["isActivelyTrading"] is True
 
 
-@patch("ba2_trade_platform.modules.dataproviders.screener.FMPScreenerProvider.requests.get")
+@patch("ba2_trade_platform.modules.dataproviders.fmp_common.fmp_http_get")
 def test_screen_stocks_sector_exclusion(mock_get, provider):
     """Sector exclusion should filter results client-side."""
     mock_response = MagicMock()
@@ -164,7 +164,7 @@ def test_screen_stocks_sector_exclusion(mock_get, provider):
     assert results[0]["sector"] == "Technology"
 
 
-@patch("ba2_trade_platform.modules.dataproviders.screener.FMPScreenerProvider.requests.get")
+@patch("ba2_trade_platform.modules.dataproviders.fmp_common.fmp_http_get")
 def test_screen_stocks_sector_exclusion_case_insensitive(mock_get, provider):
     """Sector exclusion should be case-insensitive."""
     mock_response = MagicMock()
@@ -181,7 +181,7 @@ def test_screen_stocks_sector_exclusion_case_insensitive(mock_get, provider):
     assert "ABCD" in symbols
 
 
-@patch("ba2_trade_platform.modules.dataproviders.screener.FMPScreenerProvider.requests.get")
+@patch("ba2_trade_platform.modules.dataproviders.fmp_common.fmp_http_get")
 def test_screen_stocks_empty_response(mock_get, provider):
     """Empty API response should return empty list."""
     mock_response = MagicMock()
@@ -194,7 +194,7 @@ def test_screen_stocks_empty_response(mock_get, provider):
     assert results == []
 
 
-@patch("ba2_trade_platform.modules.dataproviders.screener.FMPScreenerProvider.requests.get")
+@patch("ba2_trade_platform.modules.dataproviders.fmp_common.fmp_http_get")
 def test_screen_stocks_api_error(mock_get, provider):
     """API errors should return empty list, not raise."""
     mock_get.side_effect = requests.RequestException("Connection error")
@@ -204,7 +204,7 @@ def test_screen_stocks_api_error(mock_get, provider):
     assert results == []
 
 
-@patch("ba2_trade_platform.modules.dataproviders.screener.FMPScreenerProvider.requests.get")
+@patch("ba2_trade_platform.modules.dataproviders.fmp_common.fmp_http_get")
 def test_screen_stocks_exchanges_filter(mock_get, provider):
     """Exchanges filter should be comma-joined in the API request."""
     mock_response = MagicMock()
@@ -219,7 +219,7 @@ def test_screen_stocks_exchanges_filter(mock_get, provider):
     assert params["exchange"] == "NASDAQ,NYSE"
 
 
-@patch("ba2_trade_platform.modules.dataproviders.screener.FMPScreenerProvider.requests.get")
+@patch("ba2_trade_platform.modules.dataproviders.fmp_common.fmp_http_get")
 def test_screen_stocks_market_cap_filters(mock_get, provider):
     """Market cap filters should map to correct FMP params."""
     mock_response = MagicMock()

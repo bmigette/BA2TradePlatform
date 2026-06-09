@@ -47,6 +47,22 @@ def test_engine():
 
 
 @pytest.fixture(autouse=True)
+def reset_test_db(test_engine):
+    """Reset the shared in-memory DB to empty tables before EVERY test.
+
+    The engine is session-scoped for speed, but most tests write through the
+    production db helpers (add_instance/update_instance) which commit to the
+    shared DB with no rollback. Without this reset, rows accumulate across tests
+    and leak between them — invisible in the fixed pytest collection order, but
+    a source of order-dependent failures once pytest-randomly shuffles tests.
+    Dropping + recreating the schema gives each test a clean database.
+    """
+    SQLModel.metadata.drop_all(test_engine)
+    SQLModel.metadata.create_all(test_engine)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def patch_db_engine(test_engine):
     """Monkeypatch the production db.engine so all code uses the test DB."""
     with patch("ba2_trade_platform.core.db.engine", test_engine):
