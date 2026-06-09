@@ -5491,10 +5491,9 @@ class AccountGrowthTab:
                 sorted_divs = sorted(dividends, key=lambda x: str(x.get('date', '')))
                 cumulative = 0
                 for entry in sorted_divs:
-                    # Exclude reinvested (DRIP) dividends — they are already reflected in
-                    # portfolio value (they bought shares); counting them here double-counts.
-                    if entry.get('drip_quantity'):
-                        continue
+                    # Show the full dividend amount (cash + reinvested) — this is an
+                    # informational line, separate from Portfolio Value, so it is not
+                    # double-counted. (Reinvested dividends are counted in invested.)
                     date_val = entry.get('date')
                     if date_val:
                         date_str = date_val.strftime('%Y-%m-%d') if hasattr(date_val, 'strftime') else str(date_val)
@@ -5952,11 +5951,11 @@ class AccountGrowthTab:
 
                 for i, label in enumerate(visible_labels):
                     color = colors[i % len(colors)]
-                    # Total value = holdings value + cash dividends (DRIP already in value).
-                    total_data = [
-                        round(pv + dv, 2)
-                        for pv, dv in zip(label_daily_values[label], label_cum_cash_divs[label])
-                    ]
+                    # Total value = holdings value only. Dividends are NOT added: reinvested
+                    # dividends are already in the share value (and counted in invested),
+                    # so adding them would double-count. The dividend amount is shown as its
+                    # own informational line below.
+                    total_data = [round(v, 2) for v in label_daily_values[label]]
                     inv_data = [round(v, 2) for v in label_cum_invested[label]]
                     has_div = has_any_dividends and label_cum_divs[label][-1] > 0
                     has_inv = has_any_invested and label_cum_invested[label][-1] > 0
@@ -5986,11 +5985,12 @@ class AccountGrowthTab:
                         })
                         legend_data.append(label)
 
-                    # Cumulative cash dividends (dashed) — reinvested DRIP excluded
+                    # Cumulative dividends (dashed) — full amount (cash + reinvested) for
+                    # visibility; informational only, not added to the Total line.
                     if show_dividends and has_div:
                         div_name = f'{label} (Dividends)'
                         series.append({
-                            'name': div_name, 'type': 'line', 'data': label_cum_cash_divs[label], 'smooth': True,
+                            'name': div_name, 'type': 'line', 'data': label_cum_divs[label], 'smooth': True,
                             'lineStyle': {'width': 1.5, 'color': color, 'type': 'dashed'},
                             'itemStyle': {'color': color}, 'showSymbol': False, 'z': 2,
                         })
@@ -6266,12 +6266,10 @@ class AccountGrowthTab:
                             })
                             legend_data.append(div_name)
 
-                            # Total = value + cash dividends only (DRIP already in value)
+                            # Total = holdings value only. Dividends are shown separately and
+                            # not added (reinvested dividends are already in value + invested).
                             total_name = f'{sym} (Total)'
-                            total_data = [
-                                round(pv + dv, 2)
-                                for pv, dv in zip(sym_daily_values[sym], sym_cum_cash_divs[sym])
-                            ]
+                            total_data = [round(v, 2) for v in sym_daily_values[sym]]
                             series.append({
                                 'name': total_name,
                                 'type': 'line',
