@@ -244,10 +244,14 @@ class StockScreener:
             logger.warning("StockScreener: FMP_API_KEY not configured, skipping quote fetch")
             return {}
 
+        total = len(symbols)
+        total_chunks = (total + chunk_size - 1) // chunk_size
+        log_every = max(1, total_chunks // 5)  # log ~5 times across the run
         result: Dict[str, Dict[str, Any]] = {}
-        for i in range(0, len(symbols), chunk_size):
+        for i in range(0, total, chunk_size):
             chunk = symbols[i: i + chunk_size]
             joined = ",".join(chunk)
+            chunk_num = i // chunk_size + 1
             try:
                 resp = requests.get(
                     f"https://financialmodelingprep.com/api/v3/quote/{joined}",
@@ -263,12 +267,17 @@ class StockScreener:
                             result[sym] = item
             except Exception as e:
                 logger.warning(
-                    f"StockScreener: FMP quote chunk {i}-{i + len(chunk)} "
-                    f"failed: {e}"
+                    f"StockScreener: FMP quote chunk {chunk_num}/{total_chunks} failed: {e}"
+                )
+            if chunk_num % log_every == 0 or chunk_num == total_chunks:
+                logger.info(
+                    f"StockScreener: quote fetch progress — "
+                    f"{min(i + chunk_size, total)}/{total} symbols "
+                    f"({chunk_num}/{total_chunks} chunks, {len(result)} fetched)"
                 )
         logger.debug(
             f"StockScreener: fetched FMP quotes for "
-            f"{len(result)}/{len(symbols)} symbols"
+            f"{len(result)}/{total} symbols"
         )
         return result
 
@@ -445,6 +454,8 @@ class StockScreener:
         lookback_days = self._settings["screener_price_drop_days"]
         chunk_size = max(max_results * 3, 30)
         total = len(ranked_candidates)
+        total_chunks = (total + chunk_size - 1) // chunk_size
+        log_every = max(1, total_chunks // 5)  # log ~5 times across the run
 
         passed: List[Dict[str, Any]] = []
         checked = 0
@@ -461,6 +472,7 @@ class StockScreener:
 
             history_map = self._fetch_history_bulk(symbols, lookback_days)
             checked += len(symbols)
+            chunk_num = i // chunk_size + 1
 
             # Report progress within the 0.8–1.0 range after each chunk
             if total > 0:
@@ -469,6 +481,13 @@ class StockScreener:
                     f"Checking price history... {checked}/{total} symbols"
                     f" ({len(passed)} passed so far)",
                     0.8 + 0.19 * fraction,
+                )
+
+            if chunk_num % log_every == 0 or chunk_num == total_chunks:
+                logger.info(
+                    f"StockScreener: price-drop check progress — "
+                    f"{checked}/{total} symbols checked "
+                    f"({chunk_num}/{total_chunks} chunks, {len(passed)} passed so far)"
                 )
 
             for c in chunk:
