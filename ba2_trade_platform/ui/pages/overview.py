@@ -5134,15 +5134,20 @@ class AccountGrowthTab:
                 months, monthly_income, monthly_by_label, income_labels = await asyncio.to_thread(
                     self._compute_monthly_realized, all_filled_trades, all_dividends
                 )
+                monthly_global, monthly_label = await asyncio.to_thread(
+                    self._compute_value_denominators, all_balance_history, all_positions,
+                    historical_prices, all_filled_trades, all_dividends, months
+                )
             except Exception as e:
                 logger.warning(f"Could not compute monthly realized income: {e}")
                 months, monthly_income, monthly_by_label, income_labels = [], {}, {}, []
+                monthly_global, monthly_label = {}, {}
 
             try:
                 with charts_container:
                     # New monthly histograms at the top
-                    self._render_monthly_realized_income_chart(months, monthly_income)
-                    self._render_monthly_profit_by_label_chart(months, monthly_by_label, income_labels)
+                    self._render_monthly_realized_income_chart(months, monthly_income, monthly_global)
+                    self._render_monthly_profit_by_label_chart(months, monthly_by_label, income_labels, monthly_label)
                     self._render_total_growth_chart(all_balance_history, all_dividends, all_filled_trades)
                     self._render_growth_by_label_charts(all_positions, historical_prices, all_dividends, all_filled_trades)
                     self._render_growth_by_position_in_label_charts(all_positions, historical_prices, all_dividends, all_filled_trades)
@@ -5245,64 +5250,183 @@ class AccountGrowthTab:
                 monthly_by_label[m][lb] = round(monthly_by_label[m][lb], 2)
         return months, monthly_income, monthly_by_label, sorted(labels_set)
 
-    def _render_monthly_realized_income_chart(self, months, monthly_income):
-        """Histogram of monthly realized income: closed-trade P&L, dividends, and net total."""
+    def _compute_value_denominators(self, all_balance_history, all_positions,
+                                    historical_prices, all_filled_trades, all_dividends, months):
+        """Account value at each month-end, for expressing income as % growth.
+
+        Returns (monthly_global, monthly_label):
+          monthly_global: {month: account NLV at month-end} (from balance history)
+          monthly_label:  {month: {label: per-label market value at month-end}}
+        A month absent from a dict means its value is unavailable (caller shows no %).
+        """
+        monthly_global = {}
+        monthly_label = {}
+
+        # Global NLV by month-end: per-account forward-fill, summed.
+        per_acc = {}
+        bdates = set()
+        for e in (all_balance_history or []):
+            dv = e.get('date')
+            if not dv:
+                continue
+            ds = dv.strftime('%Y-%m-%d') if hasattr(dv, 'strftime') else str(dv)[:10]
+            per_acc.setdefault(e.get('account_id', 0), {})[ds] = float(e.get('net_liquidating_value', 0) or 0)
+            bdates.add(ds)
+        bdates = sorted(bdates)
+        if bdates:
+            ff = {a: 0.0 for a in per_acc}
+            global_by_date = {}
+            for ds in bdates:
+                for a in per_acc:
+                    if ds in per_acc[a]:
+                        ff[a] = per_acc[a][ds]
+                global_by_date[ds] = sum(ff.values())
+            for m in months:
+                in_m = [ds for ds in bdates if ds[:7] == m]
+                before = [ds for ds in bdates if ds[:7] <= m]
+                pick = in_m[-1] if in_m else (before[-1] if before else None)
+                if pick:
+                    monthly_global[m] = round(global_by_date[pick], 2)
+
+        # Per-label market value by month-end (current positions x qty timeline x prices).
+        if historical_prices and all_positions:
+            symbol_labels = get_labels_by_symbol([p.symbol for p in all_positions]) or {}
+            symbol_info = {}
+            for pos in all_positions:
+                lbls = symbol_labels.get(pos.symbol) or ['Unlabeled']
+                si = symbol_info.setdefault(pos.symbol, {'qty': 0.0, 'labels': lbls})
+                si['qty'] += float(getattr(pos, 'qty', 0) or 0)
+            pdates = sorted({d for sp in historical_prices.values() for d in sp.keys()})
+            if pdates:
+                sym_qty = {}
+                for sym, si in symbol_info.items():
+                    strades = [t for t in (all_filled_trades or []) if t.get('symbol') == sym]
+                    sdivs = [d for d in (all_dividends or []) if d.get('symbol') == sym]
+                    qbd, _ = _build_qty_timeline(si['qty'], strades, pdates, dividends=sdivs)
+                    sym_qty[sym] = qbd
+                label_val_by_date = {}
+                last_price = {sym: None for sym in symbol_info}
+                for d in pdates:
+                    day = {}
+                    for sym, si in symbol_info.items():
+                        sp = historical_prices.get(sym, {})
+                        if d in sp:
+                            last_price[sym] = sp[d]
+                        price = last_price[sym]
+                        if price is None:
+                            continue
+                        q = sym_qty[sym].get(d, 0)
+                        if q <= 0:
+                            continue
+                        val = q * price
+                        for lb in si['labels']:
+                            day[lb] = day.get(lb, 0.0) + val
+                    label_val_by_date[d] = day
+                for m in months:
+                    in_m = [d for d in pdates if d[:7] == m]
+                    before = [d for d in pdates if d[:7] <= m]
+                    pick = in_m[-1] if in_m else (before[-1] if before else None)
+                    if pick:
+                        monthly_label[m] = {lb: round(v, 2) for lb, v in label_val_by_date[pick].items()}
+
+        return monthly_global, monthly_label
+
+    def _render_monthly_realized_income_chart(self, months, monthly_income, monthly_global=None):
+        """Histogram of monthly realized income: closed-trade P&L, dividends, net total.
+
+        $ / % toggle: in % mode each value is shown as a percent of the account value
+        at that month (global NLV).
+        """
         with ui.card().classes('w-full mb-4 p-4'):
-            ui.label('Monthly Realized Income').classes('text-md font-bold mb-2')
+            with ui.row().classes('w-full items-center justify-between'):
+                ui.label('Monthly Realized Income').classes('text-md font-bold mb-2')
+                mode = ui.toggle(['$', '%'], value='$').props('dense')
             if not months:
                 ui.label('No closed trades or dividend income yet.').classes('text-sm text-gray-500')
                 return
-            pnl = [monthly_income[m]['pnl'] for m in months]
-            div = [monthly_income[m]['div'] for m in months]
-            total = [round(monthly_income[m]['pnl'] + monthly_income[m]['div'], 2) for m in months]
-            ui.echart({
-                'backgroundColor': 'transparent',
-                'tooltip': {'trigger': 'axis', 'axisPointer': {'type': 'shadow'}},
-                'legend': {'data': ['Closed P&L', 'Dividends', 'Total'], 'textStyle': {'color': '#a0aec0'}},
-                'grid': {'left': '3%', 'right': '3%', 'bottom': '3%', 'containLabel': True},
-                'xAxis': {'type': 'category', 'data': months,
-                          'axisLabel': {'color': '#a0aec0'}},
-                'yAxis': {'type': 'value', 'axisLabel': {'color': '#a0aec0', 'formatter': '${value}'},
-                          'splitLine': {'lineStyle': {'color': 'rgba(255,255,255,0.05)'}}},
-                'series': [
-                    {'name': 'Closed P&L', 'type': 'bar', 'data': pnl,
-                     'itemStyle': {'color': '#3b82f6'}},
-                    {'name': 'Dividends', 'type': 'bar', 'data': div,
-                     'itemStyle': {'color': '#22c55e'}},
-                    {'name': 'Total', 'type': 'bar', 'data': total,
-                     'itemStyle': {'color': '#f59e0b'}},
-                ],
-            }).classes('w-full').style('height: 320px')
+            monthly_global = monthly_global or {}
+            chart_container = ui.column().classes('w-full')
 
-    def _render_monthly_profit_by_label_chart(self, months, monthly_by_label, labels):
-        """Grouped bars of monthly realized income (closed P&L + dividends) per label."""
+            def conv(m, v, pct):
+                if not pct:
+                    return v
+                denom = monthly_global.get(m)
+                return round(v / denom * 100, 2) if denom else None
+
+            def build():
+                pct = mode.value == '%'
+                pnl = [conv(m, monthly_income[m]['pnl'], pct) for m in months]
+                div = [conv(m, monthly_income[m]['div'], pct) for m in months]
+                total = [conv(m, round(monthly_income[m]['pnl'] + monthly_income[m]['div'], 2), pct) for m in months]
+                fmt = '{value}%' if pct else '${value}'
+                return {
+                    'backgroundColor': 'transparent',
+                    'tooltip': {'trigger': 'axis', 'axisPointer': {'type': 'shadow'}},
+                    'legend': {'data': ['Closed P&L', 'Dividends', 'Total'], 'textStyle': {'color': '#a0aec0'}},
+                    'grid': {'left': '3%', 'right': '3%', 'bottom': '3%', 'containLabel': True},
+                    'xAxis': {'type': 'category', 'data': months, 'axisLabel': {'color': '#a0aec0'}},
+                    'yAxis': {'type': 'value', 'axisLabel': {'color': '#a0aec0', 'formatter': fmt},
+                              'splitLine': {'lineStyle': {'color': 'rgba(255,255,255,0.05)'}}},
+                    'series': [
+                        {'name': 'Closed P&L', 'type': 'bar', 'data': pnl, 'itemStyle': {'color': '#3b82f6'}},
+                        {'name': 'Dividends', 'type': 'bar', 'data': div, 'itemStyle': {'color': '#22c55e'}},
+                        {'name': 'Total', 'type': 'bar', 'data': total, 'itemStyle': {'color': '#f59e0b'}},
+                    ],
+                }
+
+            def rebuild():
+                chart_container.clear()
+                with chart_container:
+                    ui.echart(build()).classes('w-full').style('height: 320px')
+
+            with chart_container:
+                ui.echart(build()).classes('w-full').style('height: 320px')
+            mode.on_value_change(lambda e: rebuild())
+
+    def _render_monthly_profit_by_label_chart(self, months, monthly_by_label, labels, monthly_label=None):
+        """Grouped bars of monthly realized income (closed P&L + dividends) per label.
+
+        $ / % toggle: in % mode each label's value is shown as a percent of that
+        label's market value at the month.
+        """
         with ui.card().classes('w-full mb-4 p-4'):
-            ui.label('Monthly Closed Profit + Dividends by Label').classes('text-md font-bold mb-2')
+            with ui.row().classes('w-full items-center justify-between'):
+                ui.label('Monthly Closed Profit + Dividends by Label').classes('text-md font-bold mb-2')
+                mode = ui.toggle(['$', '%'], value='$').props('dense')
             if not months or not labels:
                 ui.label('No closed trades yet.').classes('text-sm text-gray-500')
                 return
 
+            monthly_label = monthly_label or {}
             colors = ['#1976D2', '#4CAF50', '#FF9800', '#E91E63', '#9C27B0',
                       '#00BCD4', '#FF5722', '#795548', '#607D8B', '#CDDC39']
             label_color = {lb: colors[i % len(colors)] for i, lb in enumerate(labels)}
 
-            def build_options(visible):
+            def cell(m, lb, pct):
+                v = monthly_by_label.get(m, {}).get(lb, 0.0)
+                if not pct:
+                    return round(v, 2)
+                denom = monthly_label.get(m, {}).get(lb)
+                return round(v / denom * 100, 2) if denom else None
+
+            def build_options(visible, pct):
                 series = []
                 for lb in labels:
                     if lb not in visible:
                         continue
                     series.append({
                         'name': lb, 'type': 'bar',
-                        'data': [round(monthly_by_label.get(m, {}).get(lb, 0.0), 2) for m in months],
+                        'data': [cell(m, lb, pct) for m in months],
                         'itemStyle': {'color': label_color[lb]},
                     })
+                fmt = '{value}%' if pct else '${value}'
                 return {
                     'backgroundColor': 'transparent',
                     'tooltip': {'trigger': 'axis', 'axisPointer': {'type': 'shadow'}},
                     'legend': {'data': [s['name'] for s in series], 'textStyle': {'color': '#a0aec0'}},
                     'grid': {'left': '3%', 'right': '3%', 'bottom': '3%', 'containLabel': True},
                     'xAxis': {'type': 'category', 'data': months, 'axisLabel': {'color': '#a0aec0'}},
-                    'yAxis': {'type': 'value', 'axisLabel': {'color': '#a0aec0', 'formatter': '${value}'},
+                    'yAxis': {'type': 'value', 'axisLabel': {'color': '#a0aec0', 'formatter': fmt},
                               'splitLine': {'lineStyle': {'color': 'rgba(255,255,255,0.05)'}}},
                     'series': series,
                 }
@@ -5316,11 +5440,12 @@ class AccountGrowthTab:
                 visible = list(label_select.value) if label_select.value else []
                 chart_container.clear()
                 with chart_container:
-                    ui.echart(build_options(visible)).classes('w-full').style('height: 320px')
+                    ui.echart(build_options(visible, mode.value == '%')).classes('w-full').style('height: 320px')
 
             with chart_container:
-                ui.echart(build_options(default_labels)).classes('w-full').style('height: 320px')
+                ui.echart(build_options(default_labels, False)).classes('w-full').style('height: 320px')
             label_select.on_value_change(lambda e: rebuild())
+            mode.on_value_change(lambda e: rebuild())
 
     def _render_total_growth_chart(self, balance_history, dividends, all_filled_trades=None):
         """Render the total account growth line chart with price growth, cumulative dividends, and P/L %."""
