@@ -663,7 +663,7 @@ class JobMonitoringTab:
             elif hasattr(event_data, 'args') and isinstance(event_data.args, int):
                 job_id = event_data.args
             else:
-                logger.error(f"Invalid event data for view_smart_risk_detail: {event_data}", exc_info=True)
+                logger.error(f"Invalid event data for view_smart_risk_detail: {event_data}")
                 ui.notify("Invalid event data", type='negative')
                 return
             
@@ -1686,13 +1686,13 @@ class JobMonitoringTab:
                 elif isinstance(event_data.args, int):
                     analysis_id = event_data.args
                 else:
-                    logger.error(f"Invalid event data args for cancel_analysis: {event_data.args}", exc_info=True)
+                    logger.error(f"Invalid event data args for cancel_analysis: {event_data.args}")
                     ui.notify("Invalid event data", type='negative')
                     return
             elif isinstance(event_data, int):
                 analysis_id = event_data
             else:
-                logger.error(f"Invalid event data for cancel_analysis: {event_data}", exc_info=True)
+                logger.error(f"Invalid event data for cancel_analysis: {event_data}")
                 ui.notify("Invalid event data", type='negative')
                 return
             
@@ -1738,7 +1738,7 @@ class JobMonitoringTab:
             elif hasattr(event_data, 'args') and isinstance(event_data.args, int):
                 analysis_id = event_data.args
             else:
-                logger.error(f"Invalid event data for view_analysis_details: {event_data}", exc_info=True)
+                logger.error(f"Invalid event data for view_analysis_details: {event_data}")
                 ui.notify("Invalid event data", type='negative')
                 return
             
@@ -1763,7 +1763,7 @@ class JobMonitoringTab:
             elif hasattr(event_data, 'args') and isinstance(event_data.args, int):
                 analysis_id = event_data.args
             else:
-                logger.error(f"Invalid event data for troubleshoot_ruleset: {event_data}", exc_info=True)
+                logger.error(f"Invalid event data for troubleshoot_ruleset: {event_data}")
                 ui.notify("Invalid event data", type='negative')
                 return
             
@@ -1786,7 +1786,7 @@ class JobMonitoringTab:
             elif hasattr(event_data, 'args') and isinstance(event_data.args, int):
                 analysis_id = event_data.args
             else:
-                logger.error(f"Invalid event data for view_rule_evaluation: {event_data}", exc_info=True)
+                logger.error(f"Invalid event data for view_rule_evaluation: {event_data}")
                 ui.notify("Invalid event data", type='negative')
                 return
             
@@ -1844,7 +1844,7 @@ class JobMonitoringTab:
             elif hasattr(event_data, 'args') and isinstance(event_data.args, int):
                 analysis_id = event_data.args
             else:
-                logger.error(f"Invalid event data for rerun_analysis: {event_data}", exc_info=True)
+                logger.error(f"Invalid event data for rerun_analysis: {event_data}")
                 ui.notify("Invalid event data", type='negative')
                 return
             
@@ -3343,7 +3343,7 @@ class ScheduledJobsTab:
                 symbol = str(event_data[1])
                 subtype = str(event_data[2])
             else:
-                logger.error(f"Invalid event data for run_analysis_now: {event_data}", exc_info=True)
+                logger.error(f"Invalid event data for run_analysis_now: {event_data}")
                 ui.notify("Invalid event data - missing subtype", type='negative')
                 return
             

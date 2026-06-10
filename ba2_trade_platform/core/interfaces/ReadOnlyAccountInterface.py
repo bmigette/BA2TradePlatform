@@ -508,7 +508,7 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                                 f"for transaction {transaction.id} ({transaction.symbol}, side={transaction.side}), "
                                 f"total_filled_buy={total_filled_buy}, total_filled_sell={total_filled_sell}. "
                                 f"Using abs() as safety measure.",
-                                exc_info=True
+                                
                             )
                             calculated_quantity = abs(calculated_quantity)
                         transaction.quantity = calculated_quantity

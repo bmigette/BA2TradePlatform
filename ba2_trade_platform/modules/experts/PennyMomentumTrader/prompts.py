@@ -514,17 +514,15 @@ CURRENT EXIT CONDITIONS:
 NEW MARKET DATA / NEWS:
 {new_data}
 
-VALID CONDITION TYPES (use ONLY these exact type names and required params):
-  {{"type": "percent_below_entry", "percent": <float>}}   — stop loss: X% below entry
-  {{"type": "percent_above_entry", "percent": <float>}}   — take profit: X% above entry
-  {{"type": "price_above", "value": <float>}}             — price > specific value (value is REQUIRED)
-  {{"type": "price_below", "value": <float>}}             — price < specific value (value is REQUIRED)
-  {{"type": "price_below_vwap", "timeframe": "<1m|5m>"}} — price drops below VWAP
-  {{"type": "price_above_vwap", "timeframe": "<1m|5m>"}} — price breaks above VWAP
-  {{"type": "rsi_above", "threshold": <float>, "period": <int>, "timeframe": "<5m|15m>"}}
-  {{"type": "rsi_below", "threshold": <float>, "period": <int>, "timeframe": "<5m|15m>"}}
-  {{"type": "time_before", "time": "<HH:MM>"}}            — exit before this time (e.g. "15:45")
-  {{"type": "rvol_above", "threshold": <float>}}          — relative volume above threshold
+VALID CONDITION TYPES (use ONLY these exact type names):
+  {_VALID_CONDITION_TYPES}
+
+{_CONDITION_PARAMS_REFERENCE}
+
+END-OF-DAY EXITS: use "time_after" (e.g. {{"type": "time_after", "time": "15:45"}}) — it fires
+AT/after the given time, which is what an EOD exit needs. Do NOT use "time_before" for EOD exits:
+it is true from the open UNTIL that time, so it would exit far too early. (This matches the
+entry-conditions prompt.)
 
 DO NOT invent condition types. "price_at_or_above" does not exist — use "price_above".
 Every condition must have ALL required params listed above.

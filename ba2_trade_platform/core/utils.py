@@ -1052,6 +1052,29 @@ def log_manual_analysis(expert_instance_id: int, symbols: List[str], analysis_ty
         logger.warning(f"Failed to log manual analysis for expert {expert_instance_id}: {e}")
 
 
+def parse_fmp_amount_range(amount_str) -> float:
+    """Parse an FMP congressional-trade amount string to a numeric dollar value.
+
+    FMP reports trade sizes as ranges like ``"$15,001 - $50,000"`` (returns the
+    midpoint) or a single value like ``"$1,000"``. Non-numeric/empty input returns
+    0.0. Extracted (EX-2) to replace the same block duplicated 4x in
+    FMPSenateTraderWeight.
+    """
+    if not amount_str:
+        return 0.0
+    amount_str = str(amount_str)
+    try:
+        if '-' in amount_str:
+            parts = amount_str.split('-')
+            low = ''.join(c for c in parts[0] if c.isdigit() or c == '.')
+            high = ''.join(c for c in parts[1] if c.isdigit() or c == '.')
+            return (float(low) + float(high)) / 2 if low and high else 0.0
+        digits = ''.join(c for c in amount_str if c.isdigit() or c == '.')
+        return float(digits) if digits else 0.0
+    except (ValueError, IndexError):
+        return 0.0
+
+
 def calculate_fmp_trade_metrics(trades: List[dict], all_trader_trades: List[dict] | None = None) -> dict:
     """
     Calculate metrics for FMP Senate/House trades including total money spent

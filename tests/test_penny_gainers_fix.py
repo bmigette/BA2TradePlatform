@@ -130,7 +130,8 @@ class TestUpdatedSettingsDefaults:
     """Verify updated defaults that improve candidate coverage and recall."""
 
     def _src(self):
-        return _read_source("__init__.py")
+        # Settings definitions were extracted to settings.py (EX-4).
+        return _read_source("settings.py")
 
     def test_max_scan_candidates_default_is_100(self):
         """

@@ -19,6 +19,49 @@ if TYPE_CHECKING:
     from .interfaces import MarketExpertInterface
 
 
+def compute_order_priority_score(expected_profit_percent: float | None,
+                                 confidence: float | None) -> float:
+    """Confidence-aware priority score for ranking pending orders (higher = funded first).
+
+    Pure function (no DB/IO) so it can be unit-tested.
+
+    - When the expert provides an expected profit estimate (non-zero), rank by
+      profit weighted by conviction: ``expected_profit_percent * (confidence/100)``.
+      A 40%-confidence / 30%-profit moonshot should not automatically outrank an
+      85%-confidence / 10%-profit setup.
+    - When the expert does NOT estimate profit (e.g. FinnHubRating stores 0.0, RM-3/
+      EX-5), profit-only sorting would push it permanently last. Such orders fall
+      into a reserved band ``[-1, 0)`` ordered by confidence: always below any order
+      with genuine positive expected profit, but still ranked by conviction amongst
+      themselves (so they can get funded rather than being starved indefinitely).
+    """
+    profit = expected_profit_percent or 0.0
+    conf_frac = (confidence or 0.0) / 100.0
+    if profit != 0.0:
+        return profit * conf_frac
+    # No profit estimate available: reserved confidence-ordered band below positive profit.
+    return -1.0 + conf_frac
+
+
+def estimate_transaction_allocation(quantity: float | None,
+                                    open_price: float | None,
+                                    fallback_price: float | None) -> float:
+    """Estimate the capital committed by a transaction (RM-4). Pure function.
+
+    Prefer ``open_price``; when it is absent (e.g. a WAITING transaction created
+    without an estimated fill price), fall back to ``fallback_price`` — typically
+    the linked pending order's limit/stop price — so committed capital is not
+    undercounted (which would open a per-instrument over-allocation window across
+    risk-manager runs). Returns 0.0 only when no price is available at all.
+    """
+    if not quantity:
+        return 0.0
+    price = open_price if open_price else fallback_price
+    if not price:
+        return 0.0
+    return abs(quantity * price)
+
+
 class TradeRiskManagement:
     """
     Risk management system for automated trading orders.
@@ -59,14 +102,14 @@ class TradeRiskManagement:
             expert = get_expert_instance_from_id(expert_instance_id)
             if not expert:
                 error_msg = f"Expert instance {expert_instance_id} not found"
-                self.logger.error(error_msg, exc_info=True)
+                self.logger.error(error_msg)
                 raise ValueError(error_msg)
             
             # Get the expert instance model
             expert_instance = get_instance(ExpertInstance, expert_instance_id)
             if not expert_instance:
                 error_msg = f"Expert instance model {expert_instance_id} not found"
-                self.logger.error(error_msg, exc_info=True)
+                self.logger.error(error_msg)
                 raise ValueError(error_msg)
             
             # Check if automated trade opening is enabled
@@ -90,8 +133,13 @@ class TradeRiskManagement:
                 'max_virtual_equity_per_instrument_percent', log_warning=False
             )
             if max_virtual_equity_per_instrument_percent is None:
-                self.logger.warning(f"Expert {expert_instance_id} has no max_virtual_equity_per_instrument_percent setting, defaulting to 10.0%")
-                max_virtual_equity_per_instrument_percent = 10.0
+                # No hidden money defaults (CLAUDE.md). get_setting_with_interface_default
+                # already supplies the interface default; a None here means a genuine
+                # misconfiguration — fail loudly rather than silently using 10%.
+                raise ValueError(
+                    f"Expert {expert_instance_id} has no max_virtual_equity_per_instrument_percent "
+                    f"setting and the interface provides no default; cannot size orders safely"
+                )
             max_equity_per_instrument_ratio = max_virtual_equity_per_instrument_percent / 100.0
             
             self.logger.info(f"Starting risk management for expert {expert_instance_id}: "
@@ -135,7 +183,7 @@ class TradeRiskManagement:
             available_balance = expert.get_available_balance()
             if available_balance is None:
                 error_msg = f"Could not get available balance for expert {expert_instance_id}"
-                self.logger.error(error_msg, exc_info=True)
+                self.logger.error(error_msg)
                 raise RuntimeError(error_msg)
             
             # Use available balance for calculations
@@ -151,7 +199,7 @@ class TradeRiskManagement:
             account = get_account_instance_from_id(expert_instance.account_id)
             if not account:
                 error_msg = f"Account {expert_instance.account_id} not found for expert {expert_instance_id}"
-                self.logger.error(error_msg, exc_info=True)
+                self.logger.error(error_msg)
                 raise ValueError(error_msg)
             
             # Step 7: Get existing positions to account for current allocations
@@ -169,7 +217,7 @@ class TradeRiskManagement:
             )
 
             # Step 9: Update orders in database
-            self._update_orders_in_database(orders_to_update)
+            updated_in_db, failed_in_db = self._update_orders_in_database(orders_to_update)
 
             # Step 10: Delete orders with quantity=0 if automated trade opening is enabled
             if allow_automated_trade_opening and orders_to_delete:
@@ -185,16 +233,21 @@ class TradeRiskManagement:
                 from .db import log_activity
                 from .types import ActivityLogSeverity, ActivityLogType
                 
+                # Reflect partial DB-update failures in the activity log (RM-5):
+                # don't report SUCCESS if some orders failed to persist.
+                rm_severity = ActivityLogSeverity.WARNING if failed_in_db else ActivityLogSeverity.SUCCESS
+                failure_note = f", {failed_in_db} FAILED to persist" if failed_in_db else ""
                 log_activity(
-                    severity=ActivityLogSeverity.SUCCESS,
+                    severity=rm_severity,
                     activity_type=ActivityLogType.RISK_MANAGER_RAN,
-                    description=f"Classic risk manager: reviewed {len(pending_orders)} pending orders, updated {len(updated_orders)}, deleted {len(orders_to_delete) if orders_to_delete else 0} unfunded orders",
+                    description=f"Classic risk manager: reviewed {len(pending_orders)} pending orders, updated {len(updated_orders)}, deleted {len(orders_to_delete) if orders_to_delete else 0} unfunded orders{failure_note}",
                     data={
                         "mode": "classic",
                         "orders_reviewed": len(pending_orders),
                         "orders_filtered": len(filtered_orders),
                         "orders_with_recommendations": len(orders_with_recommendations),
                         "orders_updated": len(updated_orders),
+                        "orders_failed_to_persist": failed_in_db,
                         "orders_deleted": len(orders_to_delete) if orders_to_delete else 0,
                         "available_balance": total_virtual_balance,
                         "max_per_instrument": max_equity_per_instrument
@@ -234,40 +287,40 @@ class TradeRiskManagement:
         return updated_orders
     
     def _get_pending_orders_for_review(self, expert_instance_id: int) -> List[TradingOrder]:
-        """Get all pending orders with quantity=0 for an expert."""
+        """Get all pending orders for an expert (RM-2: single JOIN, no N+1)."""
         try:
             with get_db() as session:
-                # First get all pending orders with quantity=0 and expert_recommendation_id
-                statement = select(TradingOrder).where(
-                    TradingOrder.status == OrderStatus.PENDING,
-                    TradingOrder.expert_recommendation_id.is_not(None)
+                # Single JOIN filtered by the expert instance, instead of loading every
+                # pending order in the system and issuing one ExpertRecommendation lookup
+                # per order (the previous O(N) pattern). select(TradingOrder) with
+                # sqlmodel returns TradingOrder instances (not Row tuples).
+                statement = (
+                    select(TradingOrder)
+                    .join(
+                        ExpertRecommendation,
+                        TradingOrder.expert_recommendation_id == ExpertRecommendation.id,
+                    )
+                    .where(
+                        TradingOrder.status == OrderStatus.PENDING,
+                        TradingOrder.expert_recommendation_id.is_not(None),
+                        ExpertRecommendation.instance_id == expert_instance_id,
+                    )
                 )
-                
-                all_pending_orders = session.exec(statement).all()
-                
-                # Filter orders that belong to this expert by checking their recommendations
-                # Note: session.exec().all() returns tuples, so we need to unpack them
+
                 expert_orders = []
-                seen_order_ids = set()  # Track order IDs to prevent duplicates
-                
-                for order_tuple in all_pending_orders:
-                    # Properly unpack tuple - SQLModel exec().all() always returns tuples
-                    order = order_tuple[0] if isinstance(order_tuple, tuple) else order_tuple
-                    if order and order.expert_recommendation_id:
-                        # Skip if we've already seen this order ID
-                        if order.id in seen_order_ids:
-                            self.logger.warning(f"Skipping duplicate order {order.id} for {order.symbol}")
-                            continue
-                        
-                        recommendation = session.get(ExpertRecommendation, order.expert_recommendation_id)
-                        if recommendation and recommendation.instance_id == expert_instance_id:
-                            expert_orders.append(order)
-                            seen_order_ids.add(order.id)
-                            self.logger.debug(f"Found pending order {order.id} for {order.symbol} (side: {order.side.value})")
-                
+                seen_order_ids = set()  # Guard against any duplicate rows from the join
+                for order in session.exec(statement).all():
+                    if order.id in seen_order_ids:
+                        continue
+                    seen_order_ids.add(order.id)
+                    expert_orders.append(order)
+                    self.logger.debug(
+                        f"Found pending order {order.id} for {order.symbol} (side: {order.side.value})"
+                    )
+
                 self.logger.info(f"Found {len(expert_orders)} pending orders for review for expert {expert_instance_id}")
                 return expert_orders
-                
+
         except Exception as e:
             self.logger.error(f"Error getting pending orders for expert {expert_instance_id}: {e}", exc_info=True)
             return []
@@ -290,45 +343,68 @@ class TradeRiskManagement:
         return filtered_orders
     
     def _get_orders_with_recommendations(self, orders: List[TradingOrder]) -> List[Tuple[TradingOrder, ExpertRecommendation]]:
-        """Get orders with their linked recommendations."""
+        """Get orders with their linked recommendations.
+
+        RM-2: batch-fetch all recommendations in a single query instead of one
+        ``session.get`` per order (the previous N+1).
+        """
         orders_with_recommendations = []
-        
+
         try:
+            rec_ids = {o.expert_recommendation_id for o in orders if o.expert_recommendation_id}
+            if not rec_ids:
+                return []
+
             with get_db() as session:
-                for order in orders:
-                    if order.expert_recommendation_id:
-                        recommendation = session.get(ExpertRecommendation, order.expert_recommendation_id)
-                        if recommendation and recommendation.expected_profit_percent is not None:
-                            orders_with_recommendations.append((order, recommendation))
-                        else:
-                            self.logger.debug(f"Order {order.id} has no valid recommendation or profit data")
-                    else:
-                        self.logger.debug(f"Order {order.id} has no linked recommendation")
-        
+                rows = session.exec(
+                    select(ExpertRecommendation).where(ExpertRecommendation.id.in_(rec_ids))
+                ).all()
+                recs_by_id = {rec.id: rec for rec in rows}
+
+            for order in orders:
+                recommendation = recs_by_id.get(order.expert_recommendation_id)
+                if recommendation:
+                    # Include even when expected_profit_percent is None/0.0 —
+                    # prioritization is confidence-aware (RM-3/EX-5), so experts
+                    # that don't estimate profit are ranked by conviction, not dropped.
+                    orders_with_recommendations.append((order, recommendation))
+                else:
+                    self.logger.debug(f"Order {order.id} has no linked recommendation")
+
         except Exception as e:
             self.logger.error(f"Error getting recommendations for orders: {e}", exc_info=True)
-        
+
         self.logger.debug(f"Found {len(orders_with_recommendations)} orders with valid recommendations")
         return orders_with_recommendations
     
     def _prioritize_orders_by_profit(self, orders_with_recommendations: List[Tuple[TradingOrder, ExpertRecommendation]]) -> List[Tuple[TradingOrder, ExpertRecommendation]]:
-        """Sort orders by expected profit percentage (descending)."""
+        """Sort orders by a confidence-aware priority score (descending).
+
+        See compute_order_priority_score: profit weighted by confidence, with a
+        confidence-ordered fallback band for experts that don't estimate profit so
+        they are not permanently starved (RM-3/EX-5).
+        """
         try:
-            # Sort by expected profit percentage, highest first
             prioritized = sorted(
                 orders_with_recommendations,
-                key=lambda x: x[1].expected_profit_percent or 0.0,
+                key=lambda x: compute_order_priority_score(
+                    x[1].expected_profit_percent, x[1].confidence
+                ),
                 reverse=True
             )
-            
-            self.logger.debug(f"Prioritized {len(prioritized)} orders by profit potential")
+
+            self.logger.debug(f"Prioritized {len(prioritized)} orders by confidence-aware score")
             for i, (order, rec) in enumerate(prioritized[:5]):  # Log top 5
-                self.logger.debug(f"#{i+1}: {order.symbol} - {rec.expected_profit_percent:.2f}% profit")
-            
+                score = compute_order_priority_score(rec.expected_profit_percent, rec.confidence)
+                self.logger.debug(
+                    f"#{i+1}: {order.symbol} - score={score:.3f} "
+                    f"(profit={rec.expected_profit_percent or 0.0:.2f}%, conf={rec.confidence or 0.0:.0f})"
+                )
+
             return prioritized
-            
+
         except Exception as e:
-            self.logger.error(f"Error prioritizing orders by profit: {e}", exc_info=True)
+            self.logger.error(f"Error prioritizing orders by score: {e}", exc_info=True)
             return orders_with_recommendations
     
     def _get_existing_allocations(self, expert_instance_id: int) -> Dict[str, float]:
@@ -347,18 +423,27 @@ class TradeRiskManagement:
                 
                 for transaction in transactions:
                     symbol = transaction.symbol
-                    # Use open_price for allocation calculation since current_price is not stored
-                    # This represents the capital allocated when the position was opened
-                    if transaction.open_price and transaction.quantity:
-                        current_value = abs(transaction.quantity * transaction.open_price)
-                    else:
-                        # For WAITING transactions, use a nominal value
-                        current_value = 0
-                    
-                    if symbol in allocations:
-                        allocations[symbol] += current_value
-                    else:
-                        allocations[symbol] = current_value
+                    # Prefer open_price (capital allocated when the position opened).
+                    # WAITING transactions may lack open_price; in that case estimate
+                    # committed capital from the linked pending order's limit/stop price
+                    # so the per-instrument cap isn't undercounted (RM-4).
+                    fallback_price = None
+                    if not transaction.open_price and transaction.quantity:
+                        for o in transaction.trading_orders:
+                            fallback_price = o.limit_price or o.open_price or o.stop_price
+                            if fallback_price:
+                                break
+                        if not fallback_price:
+                            self.logger.warning(
+                                f"WAITING transaction {transaction.id} ({symbol}) has no open_price "
+                                f"and no order price; counting allocation as 0 "
+                                f"(may understate committed capital)"
+                            )
+                    current_value = estimate_transaction_allocation(
+                        transaction.quantity, transaction.open_price, fallback_price
+                    )
+
+                    allocations[symbol] = allocations.get(symbol, 0.0) + current_value
                 
                 self.logger.debug(f"Found existing allocations for expert {expert_instance_id}: {allocations}")
                 
@@ -395,6 +480,16 @@ class TradeRiskManagement:
         # Get instrument weight configurations from expert settings
         instrument_configs = expert._get_enabled_instruments_config()
         self.logger.debug(f"Retrieved instrument weight configurations: {len(instrument_configs)} instruments")
+
+        # Diversification factor (RM-5): configurable per expert. Defaults to 1.0 (off)
+        # so diversification is governed by the per-instrument cap; when set < 1.0 and
+        # multiple instruments still have headroom, only this fraction of the available
+        # equity is used for a single instrument, reserving the rest for others.
+        diversification_factor = expert.get_setting_with_interface_default(
+            'diversification_factor', log_warning=False
+        )
+        if diversification_factor is None:
+            diversification_factor = 1.0
         
         # Group orders by symbol for diversity calculation
         orders_by_symbol = {}
@@ -482,13 +577,13 @@ class TradeRiskManagement:
                     num_remaining_instruments = len([s for s in orders_by_symbol.keys()
                                                    if instrument_allocations.get(s, 0) < max_equity_per_instrument])
 
-                    if num_remaining_instruments > 1:
-                        # Reserve some balance for other instruments
-                        diversification_factor = 0.7  # Use 70% of available, save 30% for others
+                    if num_remaining_instruments > 1 and diversification_factor < 1.0:
+                        # Reserve some balance for other instruments (configurable, RM-5;
+                        # default 1.0 = off, so this only runs when explicitly lowered)
                         original_max = max_quantity
                         max_quantity *= diversification_factor
                         self.logger.info(f"  Diversification ({num_remaining_instruments} remaining instruments): "
-                                      f"applied factor 0.7: {original_max:.2f} -> {max_quantity:.2f} shares")
+                                      f"applied factor {diversification_factor}: {original_max:.2f} -> {max_quantity:.2f} shares")
 
                     # First rounding: float to int
                     quantity = max(0, int(max_quantity))
@@ -571,19 +666,26 @@ class TradeRiskManagement:
 
         return orders_to_update, orders_to_delete, symbol_prices
     
-    def _update_orders_in_database(self, orders: List[TradingOrder]) -> None:
+    def _update_orders_in_database(self, orders: List[TradingOrder]) -> Tuple[int, int]:
         """
         Update orders in the database with calculated quantities using TransactionHelper.
-        
+
         For each order, updates its transaction and all related orders (entry + TP/SL) in sync
         to prevent qty mismatches and invalid order states.
+
+        Returns:
+            (updated_count, failed_count). Per-transaction failures are counted and
+            returned (RM-5) so the caller can reflect partial failure in the activity
+            log instead of always reporting SUCCESS. A hard/unexpected error is
+            re-raised so it is not silently swallowed.
         """
         from .TransactionHelper import TransactionHelper
         from .db import get_db
         from sqlmodel import Session, select
-        
+
         try:
             updated_count = 0
+            failed_count = 0
             grouped_by_transaction = {}
             
             # Group orders by transaction
@@ -624,12 +726,24 @@ class TradeRiskManagement:
                             f"and {len(orders_in_txn)} related orders"
                         )
                     else:
+                        failed_count += len(orders_in_txn)
                         self.logger.error(f"Failed to update transaction {txn_id}")
-            
-            self.logger.info(f"Successfully updated {updated_count} orders in database via TransactionHelper")
-            
+
+            if failed_count:
+                self.logger.warning(
+                    f"Updated {updated_count} orders in database via TransactionHelper; "
+                    f"{failed_count} order(s) FAILED to update"
+                )
+            else:
+                self.logger.info(f"Successfully updated {updated_count} orders in database via TransactionHelper")
+
+            return updated_count, failed_count
+
         except Exception as e:
+            # Don't swallow: surface the failure to the caller so the activity log
+            # reflects it rather than reporting SUCCESS over a broken update (RM-5).
             self.logger.error(f"Error updating orders in database: {e}", exc_info=True)
+            raise
     
     def _delete_unfunded_orders(self, orders: List[TradingOrder], symbol_prices: Dict[str, float] = None, max_equity_per_instrument: float = None) -> None:
         """

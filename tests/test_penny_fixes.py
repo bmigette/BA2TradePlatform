@@ -430,10 +430,8 @@ class TestSettingsDefaults:
     """Verify correct defaults for new/changed settings via AST parsing."""
 
     def _get_settings_ast(self):
-        """Parse __init__.py and extract the get_settings_definitions return dict."""
-        source = _read_source("__init__.py")
-        # Search for key setting values in source
-        return source
+        """Read the settings-definitions source (extracted to settings.py, EX-4)."""
+        return _read_source("settings.py")
 
     def test_max_holding_days_default_is_14(self):
         source = self._get_settings_ast()
@@ -732,13 +730,13 @@ class TestExitUpdateIntervalSetting:
     """exit_update_interval_ticks setting should be defined and used in Phase 5."""
 
     def test_setting_exists_with_default_30(self):
-        source = _read_source("__init__.py")
+        source = _read_source("settings.py")
         idx = source.index('"exit_update_interval_ticks"')
         block = source[idx:idx + 300]
         assert '"default": 30,' in block
 
     def test_setting_type_is_int(self):
-        source = _read_source("__init__.py")
+        source = _read_source("settings.py")
         idx = source.index('"exit_update_interval_ticks"')
         block = source[idx:idx + 300]
         assert '"type": "int"' in block
@@ -898,13 +896,13 @@ class TestLivePriceSource:
         assert '"vendor_live_price"' in source
 
     def test_vendor_live_price_default_is_fmp(self):
-        source = _read_source("__init__.py")
+        source = _read_source("settings.py")
         idx = source.index('"vendor_live_price"')
         block = source[idx:idx + 300]
         assert '"default": "fmp"' in block
 
     def test_vendor_live_price_valid_values(self):
-        source = _read_source("__init__.py")
+        source = _read_source("settings.py")
         idx = source.index('"vendor_live_price"')
         block = source[idx:idx + 400]
         assert '"fmp"' in block
@@ -974,7 +972,7 @@ class TestLivePriceSource:
 
     def test_vendor_ohlcv_restricted_to_fmp(self):
         """vendor_ohlcv should only allow FMP for extended-hours data consistency."""
-        source = _read_source("__init__.py")
+        source = _read_source("settings.py")
         idx = source.index('"vendor_ohlcv"')
         block = source[idx:idx + 400]
         assert '"default": ["fmp"]' in block
@@ -1027,17 +1025,17 @@ class TestExitUpdateLLMSetting:
     """exit_update_llm should be a separate, cheaper model setting."""
 
     def test_setting_exists(self):
-        source = _read_source("__init__.py")
+        source = _read_source("settings.py")
         assert '"exit_update_llm"' in source
 
     def test_default_is_gpt4o_mini(self):
-        source = _read_source("__init__.py")
+        source = _read_source("settings.py")
         idx = source.index('"exit_update_llm"')
         block = source[idx:idx + 300]
         assert "gpt-4o-mini" in block
 
     def test_is_separate_from_entry_definition(self):
-        source = _read_source("__init__.py")
+        source = _read_source("settings.py")
         idx_exit = source.index('"exit_update_llm"')
         idx_entry = source.index('"entry_definition_llm"')
         assert idx_exit != idx_entry

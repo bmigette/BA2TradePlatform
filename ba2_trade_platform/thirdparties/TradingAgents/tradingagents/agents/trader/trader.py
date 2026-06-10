@@ -1,5 +1,10 @@
 import functools
-from ...prompts import format_trader_context_prompt, format_trader_system_prompt
+from ...prompts import (
+    format_trader_context_prompt,
+    format_trader_system_prompt,
+    format_past_memories,
+    NO_PAST_MEMORIES_TEXT,
+)
 from ba2_trade_platform.core.text_utils import extract_text_from_llm_response
 from ba2_trade_platform.logger import logger
 from ..utils.structured_outputs import TraderDecision, render_trader_decision
@@ -13,16 +18,16 @@ def create_trader(llm, memory, strategy_notes: str = ""):
         sentiment_report = state["sentiment_report"]
         news_report = state["news_report"]
         fundamentals_report = state["fundamentals_report"]
+        macro_report = state.get("macro_report", "")
 
-        curr_situation = f"{market_research_report}\n\n{sentiment_report}\n\n{news_report}\n\n{fundamentals_report}"
+        # Include the macro report in the situation used for past-lesson matching (PR-4)
+        curr_situation = f"{market_research_report}\n\n{sentiment_report}\n\n{news_report}\n\n{fundamentals_report}\n\n{macro_report}"
 
-        past_memory_str = "No past memories found."
+        past_memory_str = NO_PAST_MEMORIES_TEXT
         if memory is not None:
-            past_memories = memory.get_memories(curr_situation, n_matches=2, aggregate_chunks=False)
-            if past_memories:
-                past_memory_str = ""
-                for i, rec in enumerate(past_memories, 1):
-                    past_memory_str += rec["recommendation"] + "\n\n"
+            past_memory_str = format_past_memories(
+                memory.get_memories(curr_situation, aggregate_chunks=False)
+            )
 
         messages = [
             {

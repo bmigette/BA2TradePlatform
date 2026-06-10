@@ -41,7 +41,7 @@ Volatility Indicators:
 Volume-Based Indicators:
 - vwma: VWMA: A moving average weighted by volume. Usage: Confirm trends by integrating price action with volume data. Tips: Watch for skewed results from volume spikes; use in combination with other volume analyses.
 
-- Select indicators that provide diverse and complementary information. Avoid redundancy (e.g., do not select both rsi and stochrsi). Also briefly explain why they are suitable for the given market context and timeframe. When you tool call, please use the exact name of the indicators provided above as they are defined parameters, otherwise your call will fail. Please make sure to call get_YFin_data first to retrieve the CSV that is needed to generate indicators. Write a very detailed and nuanced report of the trends you observe, considering the timeframe context. Do not simply state the trends are mixed, provide detailed and finegrained analysis and insights that may help traders make decisions.
+- Select indicators that provide diverse and complementary information. Avoid redundancy (e.g., do not select both macd and macds, which carry overlapping information). Also briefly explain why they are suitable for the given market context and timeframe. When you tool call, please use the exact name of the indicators provided above as they are defined parameters, otherwise your call will fail. Call get_ohlcv_data first to retrieve the price history, then call get_indicator_data for each selected indicator. Write a very detailed and nuanced report of the trends you observe, considering the timeframe context. Do not simply state the trends are mixed, provide detailed and finegrained analysis and insights that may help traders make decisions.
 
 **Support, resistance & reversal signals:** Regardless of the prevailing trend, identify concrete key support and resistance levels from the price data (recent swing highs/lows, prior consolidation zones, round numbers, and moving averages such as the 50/200 SMA acting as dynamic support/resistance). Explicitly call out any signs of a potential reversal or stabilization — e.g. bullish/bearish divergence between price and RSI/MACD, declining volume on continued moves in the trend direction, narrowing trading ranges, price reclaiming a key moving average, or candlestick patterns suggesting exhaustion. For a stock in a strong downtrend, state clearly whether there is evidence the decline is stabilizing/reversing or whether momentum shows no sign of slowing — this distinction is critical context for traders evaluating entries, independent of the overall direction.
 
@@ -131,6 +131,7 @@ Key points to focus on:
 - Positive Indicators: Use financial health, industry trends, and recent positive news as evidence.
 - Bear Counterpoints: Critically analyze the bear argument with specific data and sound reasoning, addressing concerns thoroughly and showing why the bull perspective holds stronger merit.
 - Engagement: Present your argument in a conversational style, engaging directly with the bear analyst's points and debating effectively rather than just listing data.
+- Decision space: The research manager will convert this debate into a 5-tier rating — BUY, OVERWEIGHT, HOLD, UNDERWEIGHT, or SELL. Make clear not only *that* the bull case holds but *how strongly* (a full BUY for high conviction vs. a measured OVERWEIGHT), and say which tier you believe is justified and why, so the manager can grade conviction accurately.
 
 Resources available:
 Market research report: {market_research_report}
@@ -152,6 +153,7 @@ Key points to focus on:
 - Negative Indicators: Use evidence from financial data, market trends, or recent adverse news to support your position.
 - Bull Counterpoints: Critically analyze the bull argument with specific data and sound reasoning, exposing weaknesses or over-optimistic assumptions.
 - Engagement: Present your argument in a conversational style, directly engaging with the bull analyst's points and debating effectively rather than simply listing facts.
+- Decision space: The research manager will convert this debate into a 5-tier rating — BUY, OVERWEIGHT, HOLD, UNDERWEIGHT, or SELL. Make clear not only *that* the bear case holds but *how strongly* (a full SELL for high conviction vs. a measured UNDERWEIGHT), and say which tier you believe is justified and why, so the manager can grade conviction accurately.
 
 Resources available:
 Market research report: {market_research_report}
@@ -181,7 +183,16 @@ def _format_strategy_notes_block(strategy_notes: str) -> str:
 
 RESEARCH_MANAGER_PROMPT = """As the portfolio manager and debate facilitator, your role is to critically evaluate this round of debate and make a definitive decision: align with the bear analyst, the bull analyst, or choose Hold only if it is strongly justified based on the arguments presented.
 {strategy_notes}
-Summarize the key points from both sides concisely, focusing on the most compelling evidence or reasoning. Your recommendation—Buy, Sell, or Hold—must be clear and actionable. Avoid defaulting to Hold simply because both sides have valid points; commit to a stance grounded in the debate's strongest arguments.
+Summarize the key points from both sides concisely, focusing on the most compelling evidence or reasoning. Avoid defaulting to Hold simply because both sides have valid points; commit to a stance grounded in the debate's strongest arguments.
+
+**Rating Scale** (your recommendation must be exactly one — the trader and risk judge use this same 5-tier scale):
+- **Buy**: Strong conviction to enter or add to position
+- **Overweight**: Favorable outlook, gradually increase exposure
+- **Hold**: Maintain current position, no action needed
+- **Underweight**: Reduce exposure, take partial profits
+- **Sell**: Exit position or avoid entry
+
+Your recommendation must be clear, actionable, and chosen from the 5-tier scale above.
 
 Additionally, develop a detailed investment plan for the trader. This should include:
 
@@ -306,15 +317,11 @@ Please write a detailed analysis that includes:
 
 Make sure to append a Markdown table at the end summarizing key economic indicators and their current readings."""
 
-# =============================================================================
-# SYSTEM PROMPTS
-# =============================================================================
-
-SIGNAL_PROCESSING_SYSTEM_PROMPT = """You are a signal processing expert that transforms trading decisions into clear, actionable formats. Your role is to extract the core trading signal from complex analysis outputs and present it in a standardized format."""
-
-REFLECTION_SYSTEM_PROMPT = """You are a reflection specialist that analyzes trading decisions and outcomes to extract learning insights. Your role is to identify what worked, what didn't, and how to improve future decision-making based on actual results."""
-
-
+# NOTE: SIGNAL_PROCESSING_SYSTEM_PROMPT and REFLECTION_SYSTEM_PROMPT were
+# previously redefined here with weaker text, silently overriding the strict /
+# detailed versions above (Python keeps the last binding). The duplicates were
+# removed so PROMPT_REGISTRY resolves to the intended versions. See
+# test_prompt_registry_no_duplicates / test_signal_processing_prompt_strict.
 
 # =============================================================================
 # FINAL SUMMARIZATION AGENT PROMPTS
@@ -323,58 +330,11 @@ REFLECTION_SYSTEM_PROMPT = """You are a reflection specialist that analyzes trad
 FINAL_SUMMARIZATION_AGENT_PROMPT = """You are the Final Summarization Agent for TradingAgents. Your PRIMARY role is to extract and format the final_trade_decision from the analysis workflow into a structured JSON recommendation for the BA2 Trade Platform.
 
 ## CRITICAL REQUIREMENTS
-1. **OUTPUT ONLY VALID JSON** - No markdown, explanations, or additional text
-2. **Use EXACT schema provided** - All fields are required
-3. **NO TRAILING COMMAS** - Arrays and objects must NOT have commas after the last element
-4. **FOLLOW THE final_trade_decision EXCLUSIVELY** - The final_trade_decision is the authoritative recommendation
-5. **Use supporting data ONLY for context** - Market, News, Fundamentals, Sentiment, Macro data provide background information only
-6. **NEVER contradict the final_trade_decision** - All outputs must align with and support the final trade decision
+1. **FOLLOW THE final_trade_decision EXCLUSIVELY** - The final_trade_decision is the authoritative recommendation.
+2. **Use supporting data ONLY for context** - Market, News, Fundamentals, Sentiment, Macro data provide background information only.
+3. **NEVER contradict the final_trade_decision** - All outputs must align with and support the final trade decision.
 
-## JSON SCHEMA (REQUIRED OUTPUT FORMAT)
-```json
-{{
-    "symbol": "TICKER",
-    "recommended_action": "BUY|OVERWEIGHT|HOLD|UNDERWEIGHT|SELL",
-    "expected_profit_percent": 0.0,
-    "confidence": 0.0,
-    "details": "Detailed explanation (max 2000 chars)",
-    "risk_level": "LOW|MEDIUM|HIGH",
-    "time_horizon": "SHORT_TERM|MEDIUM_TERM|LONG_TERM",
-    "key_factors": ["factor1", "factor2", "factor3"],
-    "stop_loss": 0.0,
-    "take_profit": 0.0,
-    "analysis_summary": {{
-        "market_trend": "BULLISH|BEARISH|NEUTRAL",
-        "fundamental_strength": "STRONG|MODERATE|WEAK",
-        "macro_environment": "FAVORABLE|NEUTRAL|UNFAVORABLE",
-        "technical_signals": "BUY|SELL|NEUTRAL"
-    }}
-}}
-```
-
-## CRITICAL JSON FORMATTING RULES
-⚠️ **COMMON MISTAKES TO AVOID**:
-1. ❌ NO trailing commas: `["item1", "item2",]` ← INVALID
-2. ✅ Correct format: `["item1", "item2"]` ← VALID
-3. ❌ NO comments in JSON: `"confidence": 50.0,  // high confidence` ← INVALID
-4. ✅ Use only data: `"confidence": 50.0` ← VALID
-5. ⚠️ **DO NOT copy example values** — all numeric fields (confidence, expected_profit_percent, stop_loss, take_profit) are placeholders. You MUST replace them with values derived from your analysis.
-
-**Examples of INVALID JSON (DO NOT OUTPUT)**:
-```
-"key_factors": [
-    "Factor 1",
-    "Factor 2",  ← INVALID TRAILING COMMA
-]
-```
-
-**Examples of VALID JSON (CORRECT FORMAT)**:
-```
-"key_factors": [
-    "Factor 1",
-    "Factor 2"
-]
-```
+The exact output schema (field names, types, and allowed values) is supplied separately as format instructions in the user message — follow it precisely. Do not restate, summarise, or invent a schema here, and do not copy any example/placeholder numbers: every numeric field must be derived from your analysis.
 
 ## DECISION FRAMEWORK - FINAL_TRADE_DECISION PRIORITY
 1. **PRIMARY SOURCE**: Extract recommended_action directly from final_trade_decision (BUY/OVERWEIGHT/HOLD/UNDERWEIGHT/SELL)
@@ -473,6 +433,23 @@ def format_analyst_prompt(system_prompt: str, tool_names: list, current_date: st
     logger.debug(f"\n------------------\nANALYST PROMPT\n-----------------------\n{formatted_system}")
     
     return result
+
+# Injected when no past reflections matched, so the model is told explicitly not to
+# invent lessons rather than receiving an empty quote (PR-6).
+NO_PAST_MEMORIES_TEXT = "No past reflections available — do not fabricate lessons."
+
+
+def format_past_memories(past_memories) -> str:
+    """Join retrieved memory blocks into prompt text, or an explicit no-memory note.
+
+    Returns NO_PAST_MEMORIES_TEXT when there are no memories so prompts never embed
+    an empty quote (which led models to invent past lessons).
+    """
+    if not past_memories:
+        return NO_PAST_MEMORIES_TEXT
+    text = "\n\n".join(rec["recommendation"] for rec in past_memories).strip()
+    return text or NO_PAST_MEMORIES_TEXT
+
 
 def format_bull_researcher_prompt(**kwargs) -> str:
     """Format bull researcher prompt with provided variables"""

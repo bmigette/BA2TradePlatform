@@ -407,7 +407,7 @@ class OverviewTab:
                         if new_qty < 0:
                             logger.error(
                                 f"NEGATIVE QUANTITY DETECTED in manual edit for transaction {txn.id}: {new_qty}",
-                                exc_info=True
+                                
                             )
                         txn.quantity = abs(float(new_qty))
                         update_instance(txn)
@@ -1948,7 +1948,7 @@ class AccountOverviewTab:
                         if new_quantity < 0:
                             logger.error(
                                 f"NEGATIVE QUANTITY DETECTED when updating transaction from order change: {new_quantity}",
-                                exc_info=True
+                                
                             )
                         transaction.quantity = abs(float(new_quantity))
                         update_instance(transaction)

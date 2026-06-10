@@ -184,10 +184,13 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         # Create tool nodes
         self.tool_nodes = self._create_tool_nodes()
 
-        # Initialize components with config values
+        # Initialize components with config values.
+        # These keys are always supplied (DEFAULT_CONFIG + the BA2 config builder), so
+        # access them explicitly (CQ-5 / CLAUDE.md no-hidden-defaults) — a missing key
+        # should fail loudly rather than silently default to 1.
         self.conditional_logic = ConditionalLogic(
-            max_debate_rounds=self.config.get('max_debate_rounds', 1),
-            max_risk_discuss_rounds=self.config.get('max_risk_discuss_rounds', 1)
+            max_debate_rounds=self.config['max_debate_rounds'],
+            max_risk_discuss_rounds=self.config['max_risk_discuss_rounds']
         )
         
         # Store selected_analysts for later graph setup
@@ -197,8 +200,8 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         self.graph_setup = None
         self.graph = None
 
-        # Get recursion limit from config (default 100, can be increased for complex analyses)
-        max_recur_limit = self.config.get('max_recur_limit', 100)
+        # Recursion limit (always supplied by DEFAULT_CONFIG; explicit access, CQ-5)
+        max_recur_limit = self.config['max_recur_limit']
         self.propagator = Propagator(max_recur_limit=max_recur_limit)
         self.reflector = Reflector(self.quick_thinking_llm)
         self.signal_processor = SignalProcessor(self.quick_thinking_llm)

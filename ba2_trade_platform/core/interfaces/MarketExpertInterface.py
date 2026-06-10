@@ -109,6 +109,11 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                     "description": "Maximum virtual equity allocation per instrument (%)",
                     "tooltip": "Maximum percentage of virtual trading balance that can be allocated to a single instrument. This is a NOTIONAL CEILING (a max, not a target) — the risk manager sizes by conviction up to this cap, never beyond it. Recommended: 5-15%. Lower values (5-10%) provide better diversification, higher values (10-15%) allow larger positions in high-confidence trades."
                 },
+                "diversification_factor": {
+                    "type": "float", "required": False, "default": 1.0,
+                    "description": "Fraction of available equity used per instrument when others still have headroom (0-1)",
+                    "tooltip": "Defaults to 1.0 (off): diversification is governed by the per-instrument cap (max_virtual_equity_per_instrument_percent). Lower it (e.g. 0.7) only if you want to reserve cash for lower-priority instruments when the balance can't fund every instrument to its cap — otherwise this just under-deploys capital."
+                },
                 # AI Model Settings
                 "risk_manager_model": {
                     "type": "str", "required": True, "default": "NagaAC/gpt-5.1-2025-11-13",
