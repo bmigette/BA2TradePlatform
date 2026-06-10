@@ -4,7 +4,7 @@ from ba2_trade_platform.logger import logger
 from ..utils.structured_outputs import InvestmentJudgeVerdict, render_investment_judge_verdict
 
 
-def create_research_manager(llm, memory):
+def create_research_manager(llm, memory, strategy_notes: str = ""):
     def research_manager_node(state) -> dict:
         history = state["investment_debate_state"].get("history", "")
         market_research_report = state["market_report"]
@@ -25,6 +25,7 @@ def create_research_manager(llm, memory):
         prompt = format_research_manager_prompt(
             past_memory_str=past_memory_str,
             history=history,
+            strategy_notes=strategy_notes,
         )
 
         structured_verdict = None

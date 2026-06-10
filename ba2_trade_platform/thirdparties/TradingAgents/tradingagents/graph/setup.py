@@ -75,6 +75,12 @@ class GraphSetup:
         parallel_tool_calls = self.config.get("parallel_tool_calls", False)
         logger.info(f"[SETUP] parallel_tool_calls setting from config: {parallel_tool_calls}")
 
+        # Optional user-provided strategy context, injected into the synthesis/
+        # execution agents (research manager, trader, risk manager). The bull/bear
+        # researchers are deliberately left without it so the debate stays an
+        # independent check rather than a rubber stamp.
+        strategy_notes = self.config.get("analysis_strategy_notes", "")
+
         # Create analyst nodes
         analyst_nodes = {}
         delete_nodes = {}
@@ -138,9 +144,9 @@ class GraphSetup:
             self.quick_thinking_llm, self.bear_memory
         )
         research_manager_node = create_research_manager(
-            self.deep_thinking_llm, self.invest_judge_memory
+            self.deep_thinking_llm, self.invest_judge_memory, strategy_notes
         )
-        trader_node = create_trader(self.quick_thinking_llm, self.trader_memory)
+        trader_node = create_trader(self.quick_thinking_llm, self.trader_memory, strategy_notes)
 
         # Create risk analysis nodes
         risky_analyst = create_risky_debator(self.quick_thinking_llm)
@@ -149,7 +155,7 @@ class GraphSetup:
         # The risk manager issues the FINAL trade recommendation after reviewing all
         # data and the risk debate -> use the dedicated trade-recommendation model.
         risk_manager_node = create_risk_manager(
-            self.trade_recommendation_llm, self.risk_manager_memory
+            self.trade_recommendation_llm, self.risk_manager_memory, strategy_notes
         )
 
         # Create workflow

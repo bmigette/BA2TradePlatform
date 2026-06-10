@@ -5,7 +5,7 @@ from ba2_trade_platform.logger import logger
 from ..utils.structured_outputs import TraderDecision, render_trader_decision
 
 
-def create_trader(llm, memory):
+def create_trader(llm, memory, strategy_notes: str = ""):
     def trader_node(state, name):
         company_name = state["company_of_interest"]
         investment_plan = state["investment_plan"]
@@ -27,7 +27,7 @@ def create_trader(llm, memory):
         messages = [
             {
                 "role": "system",
-                "content": format_trader_system_prompt(past_memory_str=past_memory_str),
+                "content": format_trader_system_prompt(past_memory_str=past_memory_str, strategy_notes=strategy_notes),
             },
             {
                 "role": "user",
