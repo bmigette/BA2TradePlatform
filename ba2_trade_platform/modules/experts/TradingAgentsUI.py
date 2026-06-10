@@ -157,9 +157,10 @@ class TradingAgentsUI:
                 self._render_tool_outputs_panel()
             
             with ui.tab_panel(market_tab):
-                self._render_content_panel('market_report', '📈 Market Analysis', 
+                self._render_content_panel('market_report', '📈 Market Analysis',
                                          'Technical analysis and market indicators')
-            
+                self._render_input_expander('market_input')
+
             with ui.tab_panel(sentiment_tab):
                 self._render_content_panel('sentiment_report', '💬 Social Sentiment Analysis',
                                          'Social media and public sentiment analysis')
@@ -179,27 +180,27 @@ class TradingAgentsUI:
                 self._render_content_panel('macro_report', '🌍 Macroeconomic Analysis',
                                          'Macroeconomic environment and policy analysis')
                 self._render_input_expander('macro_input')
-            
+
             with ui.tab_panel(debate_tab):
                 self._render_debate_panel('investment_debate_state', '🎯 Investment Research Debate',
                                         'Multi-agent debate on investment thesis')
-            
+
             with ui.tab_panel(research_tab):
                 self._render_content_panel('investment_plan', '📋 Research Manager Summary',
                                          'Comprehensive investment research summary')
-            
+
             with ui.tab_panel(trader_tab):
                 self._render_content_panel('trader_investment_plan', '💼 Trader Investment Plan',
                                          'Actionable trading plan and recommendations')
-            
+
             with ui.tab_panel(risk_tab):
                 self._render_debate_panel('risk_debate_state', '⚠️ Risk Management Debate',
                                         'Risk assessment and management strategies')
-            
+
             with ui.tab_panel(decision_tab):
                 self._render_content_panel('final_trade_decision', '✅ Final Trading Decision',
                                          'Final recommendation and action plan')
-    
+
     def _render_in_progress_ui(self) -> None:
         """Render in-progress analysis with partial data in tabs."""
         with ui.tabs().classes('w-full') as tabs:
@@ -228,9 +229,10 @@ class TradingAgentsUI:
                 self._render_tool_outputs_panel()
             
             with ui.tab_panel(market_tab):
-                self._render_content_panel('market_report', '📈 Market Analysis', 
+                self._render_content_panel('market_report', '📈 Market Analysis',
                                          'Technical analysis and market indicators')
-            
+                self._render_input_expander('market_input')
+
             with ui.tab_panel(sentiment_tab):
                 self._render_content_panel('sentiment_report', '💬 Social Sentiment Analysis',
                                          'Social media and public sentiment analysis')

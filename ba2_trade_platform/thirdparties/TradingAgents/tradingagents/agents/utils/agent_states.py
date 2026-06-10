@@ -80,6 +80,7 @@ class AgentState(MessagesState):
 
     # Captured input prompts for the pre-fetch analysts (the exact data injected),
     # so the UI can show what each analyst was actually given.
+    market_input: Annotated[str, "Input data/prompt given to the Market Analyst"]
     fundamentals_input: Annotated[str, "Input data/prompt given to the Fundamentals Analyst"]
     news_input: Annotated[str, "Input data/prompt given to the News Analyst"]
     sentiment_input: Annotated[str, "Input data/prompt given to the Social Media Analyst"]

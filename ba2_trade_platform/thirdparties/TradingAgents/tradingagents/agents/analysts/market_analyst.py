@@ -55,6 +55,7 @@ def create_market_analyst(llm, toolkit, tools, parallel_tool_calls=False):
         return {
             "messages": [result],
             "market_report": report,
+            "market_input": prompt_config["system"],
         }
 
     return market_analyst_node
