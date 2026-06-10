@@ -230,6 +230,29 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                 "description": "Use memory system for context-aware analysis",
                 "tooltip": "When enabled, agents retrieve past experiences and recommendations from memory to inform current decisions. Memories are always stored but only used when this is enabled. Disabling may be useful for fresh analysis without historical bias."
             },
+            "memory_injection_scope": {
+                "type": "str", "required": False, "default": "same_symbol",
+                "description": "Memory/Reflection Injection Scope",
+                "valid_values": ["none", "same_symbol", "all_symbols"],
+                "help": "Controls which past trade history and reflections are injected into the bull/bear/trader/judge prompts. 'none' disables memory injection entirely. 'same_symbol' (default) only injects past analyses/outcomes for the same symbol. 'all_symbols' additionally includes a cross-ticker summary of recent wins/losses across the whole account.",
+                "tooltip": "Scope of past-trade memory injected into AI prompts. 'same_symbol' avoids generalizing lessons from unrelated tickers (e.g. a tight-stop loss on ticker A) to every new candidate."
+            },
+            "memory_max_trades": {
+                "type": "int", "required": False, "default": 2,
+                "description": "Max Past Trades Injected per Symbol",
+                "tooltip": "Maximum number of past completed analyses for the same symbol to inject into prompts as memory/reflection context."
+            },
+            "memory_lookback_days": {
+                "type": "int", "required": False, "default": 14,
+                "description": "Memory Lookback Window (days)",
+                "tooltip": "Only past analyses/trades from within this many days are eligible for memory injection (applies to both same-symbol and cross-ticker history). Keeps reflections relevant to the current strategy/market regime."
+            },
+            "analysis_strategy_notes": {
+                "type": "str", "required": False, "default": "",
+                "description": "Trading Strategy Notes for AI Analysts",
+                "help": "Free-form notes describing this instance's intended strategy, injected into the bull/bear researchers, investment judge, trader, and risk manager prompts. Use this to give the AI context that isn't obvious from the data alone — e.g. 'this screener intentionally selects stocks that just dropped >15% as buy-the-dip candidates; a broken short-term chart is the entry condition, not new bearish information.'",
+                "tooltip": "High-level strategy context shared with all analysis/decision agents (separate from the Smart Risk Manager's user instructions, which apply to position management)."
+            },
             "parallel_tool_calls": {
                 "type": "bool", "required": False, "default": True,
                 "description": "TradingAgents Parallel Tool Calls",
