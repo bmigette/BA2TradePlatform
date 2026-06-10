@@ -507,8 +507,7 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                                 f"NEGATIVE calculated_quantity in sync_transaction_orders: {calculated_quantity} "
                                 f"for transaction {transaction.id} ({transaction.symbol}, side={transaction.side}), "
                                 f"total_filled_buy={total_filled_buy}, total_filled_sell={total_filled_sell}. "
-                                f"Using abs() as safety measure.",
-                                
+                                f"Using abs() as safety measure."
                             )
                             calculated_quantity = abs(calculated_quantity)
                         transaction.quantity = calculated_quantity

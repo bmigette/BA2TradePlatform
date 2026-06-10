@@ -1434,222 +1434,222 @@ def action_node(state: SmartRiskManagerState) -> Dict[str, Any]:
         
         # Execute each optimized action using toolkit methods directly (Pure Python - No LLM)
         for idx, action in enumerate(optimized_actions):
-                action_type = action.get("action_type")
-                parameters = action.get("parameters", {})
-                reason = action.get("reason", "Recommended by research node")
-                confidence = action.get("confidence", 0)
-                
-                logger.info(f"Executing recommended action {idx+1}/{len(optimized_actions)}: {action_type} (confidence: {confidence}%)")
-                
-                try:
-                    result = None
-                    
-                    # Execute the appropriate toolkit method based on action_type
-                    if action_type == "close_position":
-                        transaction_id = parameters["transaction_id"]
-                        result = toolkit.close_position(transaction_id, reason)
-                        
-                    elif action_type == "adjust_quantity":
-                        transaction_id = parameters["transaction_id"]
-                        new_quantity = parameters["new_quantity"]
-                        
-                        # CRITICAL: Ensure new_quantity is a whole number (Alpaca requires integers for GTC orders)
-                        if not isinstance(new_quantity, int) and new_quantity != int(new_quantity):
-                            logger.warning(f"⚠️ Fractional quantity detected for transaction {transaction_id}: {new_quantity} - rounding to {int(new_quantity)}")
-                        new_quantity = int(new_quantity)
-                        
-                        result = toolkit.adjust_quantity(transaction_id, new_quantity, reason)
-                        
-                    elif action_type == "update_stop_loss":
-                        transaction_id = parameters["transaction_id"]
-                        new_sl_price = parameters["new_sl_price"]
-                        
-                        # Validate transaction exists
-                        with get_db() as session:
-                            transaction = session.get(Transaction, transaction_id)
-                            if not transaction:
+            action_type = action.get("action_type")
+            parameters = action.get("parameters", {})
+            reason = action.get("reason", "Recommended by research node")
+            confidence = action.get("confidence", 0)
+
+            logger.info(f"Executing recommended action {idx+1}/{len(optimized_actions)}: {action_type} (confidence: {confidence}%)")
+
+            try:
+                result = None
+
+                # Execute the appropriate toolkit method based on action_type
+                if action_type == "close_position":
+                    transaction_id = parameters["transaction_id"]
+                    result = toolkit.close_position(transaction_id, reason)
+
+                elif action_type == "adjust_quantity":
+                    transaction_id = parameters["transaction_id"]
+                    new_quantity = parameters["new_quantity"]
+
+                    # CRITICAL: Ensure new_quantity is a whole number (Alpaca requires integers for GTC orders)
+                    if not isinstance(new_quantity, int) and new_quantity != int(new_quantity):
+                        logger.warning(f"⚠️ Fractional quantity detected for transaction {transaction_id}: {new_quantity} - rounding to {int(new_quantity)}")
+                    new_quantity = int(new_quantity)
+
+                    result = toolkit.adjust_quantity(transaction_id, new_quantity, reason)
+
+                elif action_type == "update_stop_loss":
+                    transaction_id = parameters["transaction_id"]
+                    new_sl_price = parameters["new_sl_price"]
+
+                    # Validate transaction exists
+                    with get_db() as session:
+                        transaction = session.get(Transaction, transaction_id)
+                        if not transaction:
+                            result = {
+                                "success": False,
+                                "message": f"❌ Transaction {transaction_id} not found. Cannot update stop loss on non-existent position. Use tp_price/sl_price parameters when opening NEW positions instead.",
+                                "error_type": "invalid_transaction_id"
+                            }
+                        else:
+                            result = toolkit.update_stop_loss(transaction_id, new_sl_price, reason)
+
+                elif action_type == "update_take_profit":
+                    transaction_id = parameters["transaction_id"]
+                    new_tp_price = parameters["new_tp_price"]
+
+                    # Validate transaction exists
+                    with get_db() as session:
+                        transaction = session.get(Transaction, transaction_id)
+                        if not transaction:
+                            result = {
+                                "success": False,
+                                "message": f"❌ Transaction {transaction_id} not found. Cannot update take profit on non-existent position. Use tp_price/sl_price parameters when opening NEW positions instead.",
+                                "error_type": "invalid_transaction_id"
+                            }
+                        else:
+                            result = toolkit.update_take_profit(transaction_id, new_tp_price, reason)
+
+                elif action_type == "adjust_tp_sl":
+                    # OPTIMIZATION: Combined TP/SL adjustment in single call
+                    transaction_id = parameters["transaction_id"]
+                    new_tp_price = parameters["new_tp_price"]
+                    new_sl_price = parameters["new_sl_price"]
+
+                    # Get transaction for adjust_tp_sl call
+                    with get_db() as session:
+                        transaction = session.get(Transaction, transaction_id)
+                        if transaction:
+                            result = toolkit.account.adjust_tp_sl(transaction, new_tp_price, new_sl_price, source="smart_risk_manager")
+
+                            if result:
+                                # Create success result dict matching other action formats
                                 result = {
-                                    "success": False,
-                                    "message": f"❌ Transaction {transaction_id} not found. Cannot update stop loss on non-existent position. Use tp_price/sl_price parameters when opening NEW positions instead.",
-                                    "error_type": "invalid_transaction_id"
+                                    "success": True,
+                                    "message": f"Updated both TP to ${new_tp_price:.2f} and SL to ${new_sl_price:.2f}",
+                                    "transaction_id": transaction_id,
+                                    "old_tp_price": transaction.take_profit,
+                                    "new_tp_price": new_tp_price,
+                                    "old_sl_price": transaction.stop_loss,
+                                    "new_sl_price": new_sl_price
                                 }
-                            else:
-                                result = toolkit.update_stop_loss(transaction_id, new_sl_price, reason)
-                        
-                    elif action_type == "update_take_profit":
-                        transaction_id = parameters["transaction_id"]
-                        new_tp_price = parameters["new_tp_price"]
-                        
-                        # Validate transaction exists
-                        with get_db() as session:
-                            transaction = session.get(Transaction, transaction_id)
-                            if not transaction:
-                                result = {
-                                    "success": False,
-                                    "message": f"❌ Transaction {transaction_id} not found. Cannot update take profit on non-existent position. Use tp_price/sl_price parameters when opening NEW positions instead.",
-                                    "error_type": "invalid_transaction_id"
-                                }
-                            else:
-                                result = toolkit.update_take_profit(transaction_id, new_tp_price, reason)
-                        
-                    elif action_type == "adjust_tp_sl":
-                        # OPTIMIZATION: Combined TP/SL adjustment in single call
-                        transaction_id = parameters["transaction_id"]
-                        new_tp_price = parameters["new_tp_price"]
-                        new_sl_price = parameters["new_sl_price"]
-                        
-                        # Get transaction for adjust_tp_sl call
-                        with get_db() as session:
-                            transaction = session.get(Transaction, transaction_id)
-                            if transaction:
-                                result = toolkit.account.adjust_tp_sl(transaction, new_tp_price, new_sl_price, source="smart_risk_manager")
-                                
-                                if result:
-                                    # Create success result dict matching other action formats
-                                    result = {
-                                        "success": True,
-                                        "message": f"Updated both TP to ${new_tp_price:.2f} and SL to ${new_sl_price:.2f}",
-                                        "transaction_id": transaction_id,
-                                        "old_tp_price": transaction.take_profit,
-                                        "new_tp_price": new_tp_price,
-                                        "old_sl_price": transaction.stop_loss,
-                                        "new_sl_price": new_sl_price
-                                    }
-                                    logger.info(f"Successfully updated both TP and SL for transaction {transaction_id}")
-                                else:
-                                    result = {
-                                        "success": False,
-                                        "message": f"Failed to update TP/SL for transaction {transaction_id} - likely entry order not yet filled",
-                                        "transaction_id": transaction_id
-                                    }
-                                    logger.warning(f"Failed to update TP/SL for transaction {transaction_id}")
+                                logger.info(f"Successfully updated both TP and SL for transaction {transaction_id}")
                             else:
                                 result = {
                                     "success": False,
-                                    "message": f"❌ Transaction {transaction_id} not found. Cannot adjust TP/SL on non-existent position. This typically happens when trying to modify a position that was just recommended to open but doesn't exist yet.",
-                                    "error_type": "invalid_transaction_id",
+                                    "message": f"Failed to update TP/SL for transaction {transaction_id} - likely entry order not yet filled",
                                     "transaction_id": transaction_id
                                 }
-                        
-                    elif action_type == "open_buy_position":
-                        symbol = parameters["symbol"]
-                        quantity = parameters["quantity"]
-                        tp_price = parameters.get("tp_price")
-                        sl_price = parameters.get("sl_price")
-                        market_analysis_id = parameters.get("market_analysis_id")
-
-                        # CRITICAL: Ensure quantity is a whole number (Alpaca requires integers for GTC orders)
-                        if not isinstance(quantity, int) and quantity != int(quantity):
-                            logger.warning(f"⚠️ Fractional quantity detected for {symbol}: {quantity} - rounding to {int(quantity)}")
-                        quantity = int(quantity)
-
-                        result = toolkit.open_buy_position(symbol, quantity, tp_price, sl_price, reason, confidence, market_analysis_id)
-
-                    elif action_type == "open_sell_position":
-                        symbol = parameters["symbol"]
-                        quantity = parameters["quantity"]
-                        tp_price = parameters.get("tp_price")
-                        sl_price = parameters.get("sl_price")
-                        market_analysis_id = parameters.get("market_analysis_id")
-
-                        # CRITICAL: Ensure quantity is a whole number (Alpaca requires integers for GTC orders)
-                        if not isinstance(quantity, int) and quantity != int(quantity):
-                            logger.warning(f"⚠️ Fractional quantity detected for {symbol}: {quantity} - rounding to {int(quantity)}")
-                        quantity = int(quantity)
-
-                        result = toolkit.open_sell_position(symbol, quantity, tp_price, sl_price, reason, confidence, market_analysis_id)
-                    
-                    else:
-                        logger.warning(f"Unknown action_type: {action_type}")
-                        result = {"success": False, "message": f"Unknown action_type: {action_type}"}
-                    
-                    # Record action in log
-                    # Create a concise summary from the result
-                    if result and result.get("success"):
-                        # Build summary based on action type
-                        if action_type in ["open_buy_position", "open_sell_position"]:
-                            direction = result.get('direction', 'BUY' if action_type == "open_buy_position" else 'SELL')
-                            transaction_id = result.get('transaction_id')
-                            summary = f"Transaction #{transaction_id}: {result.get('symbol')} {direction} {result.get('quantity')} @ ${result.get('entry_price', 0):.2f}"
-                            if result.get('tp_price'):
-                                summary += f" TP@${result.get('tp_price'):.2f}"
-                            if result.get('sl_price'):
-                                summary += f" SL@${result.get('sl_price'):.2f}"
-                        elif action_type == "close_position":
-                            summary = f"Closed transaction #{result.get('transaction_id')}"
-                        elif action_type == "adjust_quantity":
-                            summary = f"Adjusted transaction #{parameters.get('transaction_id')} from {result.get('old_quantity')} to {result.get('new_quantity')}"
-                        elif action_type == "update_stop_loss":
-                            old_sl = result.get('old_sl_price')
-                            new_sl = result.get('new_sl_price', 0)
-                            old_sl_str = f"${old_sl:.2f}" if old_sl is not None else "None"
-                            summary = f"Updated SL for transaction #{parameters.get('transaction_id')} from {old_sl_str} to ${new_sl:.2f}"
-                        elif action_type == "update_take_profit":
-                            old_tp = result.get('old_tp_price')
-                            new_tp = result.get('new_tp_price', 0)
-                            old_tp_str = f"${old_tp:.2f}" if old_tp is not None else "None"
-                            summary = f"Updated TP for transaction #{parameters.get('transaction_id')} from {old_tp_str} to ${new_tp:.2f}"
-                        elif action_type == "adjust_tp_sl":
-                            # Combined TP/SL adjustment summary
-                            old_tp = result.get('old_tp_price')
-                            new_tp = result.get('new_tp_price', 0)
-                            old_sl = result.get('old_sl_price')
-                            new_sl = result.get('new_sl_price', 0)
-                            old_tp_str = f"${old_tp:.2f}" if old_tp is not None else "None"
-                            old_sl_str = f"${old_sl:.2f}" if old_sl is not None else "None"
-                            summary = f"Updated TP/SL for transaction #{parameters.get('transaction_id')} from TP:{old_tp_str}/SL:{old_sl_str} to TP:${new_tp:.2f}/SL:${new_sl:.2f}"
+                                logger.warning(f"Failed to update TP/SL for transaction {transaction_id}")
                         else:
-                            summary = result.get('message', 'Completed')
+                            result = {
+                                "success": False,
+                                "message": f"❌ Transaction {transaction_id} not found. Cannot adjust TP/SL on non-existent position. This typically happens when trying to modify a position that was just recommended to open but doesn't exist yet.",
+                                "error_type": "invalid_transaction_id",
+                                "transaction_id": transaction_id
+                            }
+
+                elif action_type == "open_buy_position":
+                    symbol = parameters["symbol"]
+                    quantity = parameters["quantity"]
+                    tp_price = parameters.get("tp_price")
+                    sl_price = parameters.get("sl_price")
+                    market_analysis_id = parameters.get("market_analysis_id")
+
+                    # CRITICAL: Ensure quantity is a whole number (Alpaca requires integers for GTC orders)
+                    if not isinstance(quantity, int) and quantity != int(quantity):
+                        logger.warning(f"⚠️ Fractional quantity detected for {symbol}: {quantity} - rounding to {int(quantity)}")
+                    quantity = int(quantity)
+
+                    result = toolkit.open_buy_position(symbol, quantity, tp_price, sl_price, reason, confidence, market_analysis_id)
+
+                elif action_type == "open_sell_position":
+                    symbol = parameters["symbol"]
+                    quantity = parameters["quantity"]
+                    tp_price = parameters.get("tp_price")
+                    sl_price = parameters.get("sl_price")
+                    market_analysis_id = parameters.get("market_analysis_id")
+
+                    # CRITICAL: Ensure quantity is a whole number (Alpaca requires integers for GTC orders)
+                    if not isinstance(quantity, int) and quantity != int(quantity):
+                        logger.warning(f"⚠️ Fractional quantity detected for {symbol}: {quantity} - rounding to {int(quantity)}")
+                    quantity = int(quantity)
+
+                    result = toolkit.open_sell_position(symbol, quantity, tp_price, sl_price, reason, confidence, market_analysis_id)
+
+                else:
+                    logger.warning(f"Unknown action_type: {action_type}")
+                    result = {"success": False, "message": f"Unknown action_type: {action_type}"}
+
+                # Record action in log
+                # Create a concise summary from the result
+                if result and result.get("success"):
+                    # Build summary based on action type
+                    if action_type in ["open_buy_position", "open_sell_position"]:
+                        direction = result.get('direction', 'BUY' if action_type == "open_buy_position" else 'SELL')
+                        transaction_id = result.get('transaction_id')
+                        summary = f"Transaction #{transaction_id}: {result.get('symbol')} {direction} {result.get('quantity')} @ ${result.get('entry_price', 0):.2f}"
+                        if result.get('tp_price'):
+                            summary += f" TP@${result.get('tp_price'):.2f}"
+                        if result.get('sl_price'):
+                            summary += f" SL@${result.get('sl_price'):.2f}"
+                    elif action_type == "close_position":
+                        summary = f"Closed transaction #{result.get('transaction_id')}"
+                    elif action_type == "adjust_quantity":
+                        summary = f"Adjusted transaction #{parameters.get('transaction_id')} from {result.get('old_quantity')} to {result.get('new_quantity')}"
+                    elif action_type == "update_stop_loss":
+                        old_sl = result.get('old_sl_price')
+                        new_sl = result.get('new_sl_price', 0)
+                        old_sl_str = f"${old_sl:.2f}" if old_sl is not None else "None"
+                        summary = f"Updated SL for transaction #{parameters.get('transaction_id')} from {old_sl_str} to ${new_sl:.2f}"
+                    elif action_type == "update_take_profit":
+                        old_tp = result.get('old_tp_price')
+                        new_tp = result.get('new_tp_price', 0)
+                        old_tp_str = f"${old_tp:.2f}" if old_tp is not None else "None"
+                        summary = f"Updated TP for transaction #{parameters.get('transaction_id')} from {old_tp_str} to ${new_tp:.2f}"
+                    elif action_type == "adjust_tp_sl":
+                        # Combined TP/SL adjustment summary
+                        old_tp = result.get('old_tp_price')
+                        new_tp = result.get('new_tp_price', 0)
+                        old_sl = result.get('old_sl_price')
+                        new_sl = result.get('new_sl_price', 0)
+                        old_tp_str = f"${old_tp:.2f}" if old_tp is not None else "None"
+                        old_sl_str = f"${old_sl:.2f}" if old_sl is not None else "None"
+                        summary = f"Updated TP/SL for transaction #{parameters.get('transaction_id')} from TP:{old_tp_str}/SL:{old_sl_str} to TP:${new_tp:.2f}/SL:${new_sl:.2f}"
                     else:
-                        summary = result.get('message', 'Failed') if result else 'Failed'
-                    
-                    action_record = {
-                        "iteration": state["iteration_count"],
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "action_type": action_type,
-                        "arguments": parameters,
-                        "reason": reason,
-                        "confidence": confidence,
-                        "source": "research_node_recommendation",
-                        "result": result,
-                        "success": result.get("success", False) if result else False,
-                        "summary": summary
-                    }
-                    actions_log.append(action_record)
-                    
-                    logger.info(f"✅ Recommended action executed: {action_type} - success={result.get('success', False)}")
-                    
-                    detailed_action_reports.append({
-                        "tool": action_type,
-                        "args": parameters,
-                        "reason": reason,
-                        "confidence": confidence,
-                        "result": result,
-                        "source": "research_recommendation"
-                    })
-                    
-                except Exception as e:
-                    logger.error(f"Error executing recommended action {action_type}: {e}", exc_info=True)
-                    action_record = {
-                        "iteration": state["iteration_count"],
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "action_type": action_type,
-                        "arguments": parameters,
-                        "reason": reason,
-                        "confidence": confidence,
-                        "source": "research_node_recommendation",
-                        "error": str(e),
-                        "success": False,
-                        "summary": f"Error: {str(e)}"
-                    }
-                    actions_log.append(action_record)
-                    
-                    detailed_action_reports.append({
-                        "tool": action_type,
-                        "args": parameters,
-                        "error": str(e),
-                        "source": "research_recommendation"
-                    })
+                        summary = result.get('message', 'Completed')
+                else:
+                    summary = result.get('message', 'Failed') if result else 'Failed'
+
+                action_record = {
+                    "iteration": state["iteration_count"],
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "action_type": action_type,
+                    "arguments": parameters,
+                    "reason": reason,
+                    "confidence": confidence,
+                    "source": "research_node_recommendation",
+                    "result": result,
+                    "success": result.get("success", False) if result else False,
+                    "summary": summary
+                }
+                actions_log.append(action_record)
+
+                logger.info(f"✅ Recommended action executed: {action_type} - success={result.get('success', False)}")
+
+                detailed_action_reports.append({
+                    "tool": action_type,
+                    "args": parameters,
+                    "reason": reason,
+                    "confidence": confidence,
+                    "result": result,
+                    "source": "research_recommendation"
+                })
+
+            except Exception as e:
+                logger.error(f"Error executing recommended action {action_type}: {e}", exc_info=True)
+                action_record = {
+                    "iteration": state["iteration_count"],
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "action_type": action_type,
+                    "arguments": parameters,
+                    "reason": reason,
+                    "confidence": confidence,
+                    "source": "research_node_recommendation",
+                    "error": str(e),
+                    "success": False,
+                    "summary": f"Error: {str(e)}"
+                }
+                actions_log.append(action_record)
+
+                detailed_action_reports.append({
+                    "tool": action_type,
+                    "args": parameters,
+                    "error": str(e),
+                    "source": "research_recommendation"
+                })
         
         # Build summary for recommended actions
         optimization_note = f" (optimized from {len(recommended_actions)} recommendations)" if len(optimized_actions) < len(recommended_actions) else ""

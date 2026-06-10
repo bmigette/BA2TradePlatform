@@ -67,8 +67,7 @@ class TransactionHelper:
             # Update transaction quantity with abs() safety
             if new_quantity < 0:
                 logger.error(
-                    f"NEGATIVE QUANTITY DETECTED in adjust_transaction_quantity: {new_quantity}",
-                    
+                    f"NEGATIVE QUANTITY DETECTED in adjust_transaction_quantity: {new_quantity}"
                 )
             transaction.quantity = abs(float(new_quantity))
             
@@ -676,8 +675,7 @@ class TransactionHelper:
                 # Update transaction with abs() safety
                 if remaining_qty < 0:
                     logger.error(
-                        f"NEGATIVE QUANTITY DETECTED in partial close (remaining_qty): {remaining_qty}",
-                        
+                        f"NEGATIVE QUANTITY DETECTED in partial close (remaining_qty): {remaining_qty}"
                     )
                 # Update transaction scalars directly to avoid session conflict
                 # (transaction may have relationship objects loaded from a different session)
@@ -821,8 +819,7 @@ class TransactionHelper:
                 # Update transaction with abs() safety
                 if new_qty < 0:
                     logger.error(
-                        f"NEGATIVE QUANTITY DETECTED in bulk_modify_tp_sl (new_qty): {new_qty}",
-                        
+                        f"NEGATIVE QUANTITY DETECTED in bulk_modify_tp_sl (new_qty): {new_qty}"
                     )
                 # Update transaction scalars directly to avoid session conflict
                 # (transaction may have relationship objects loaded from a different session)

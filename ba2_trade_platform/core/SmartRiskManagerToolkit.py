@@ -2110,8 +2110,7 @@ class SmartRiskManagerToolkit:
             if quantity < 0:
                 logger.error(
                     f"NEGATIVE QUANTITY DETECTED in SmartRiskManager._open_position_internal: {quantity} "
-                    f"for {symbol} {order_direction}. Using abs() as safety measure.",
-                    
+                    f"for {symbol} {order_direction}. Using abs() as safety measure."
                 )
                 quantity = abs(quantity)
             
