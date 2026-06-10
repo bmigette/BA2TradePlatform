@@ -551,15 +551,20 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             logger.error(f"Error calculating virtual balance for expert {self.id}: {e}", exc_info=True)
             return None
     
-    def get_available_balance(self) -> Optional[float]:
+    def get_available_balance(self, exclude_transaction_id: Optional[int] = None) -> Optional[float]:
         """
         Get the available balance for this expert by calculating virtual balance minus used balance.
-        
+
         The used balance calculation logic:
         - For profitable transactions: use open_price * quantity
         - For losing transactions: use (open_price + loss_amount) * quantity
         - This ensures we account for the maximum potential loss
-        
+
+        Args:
+            exclude_transaction_id: Optional transaction ID to exclude from the used-balance
+                calculation, e.g. the WAITING transaction created for the order currently
+                being validated, which would otherwise be double-counted.
+
         Returns:
             Optional[float]: The available balance amount, None if error occurred
         """
@@ -568,23 +573,23 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             virtual_balance = self.get_virtual_balance()
             if virtual_balance is None:
                 return None
-            
+
             # Get expert instance and account instance to fetch current prices
             # Lazy import to avoid circular dependency
             from ..utils import get_account_instance_from_id
-            
+
             expert_instance = get_instance(ExpertInstance, self.id)
             if not expert_instance:
                 logger.error(f"Expert instance {self.id} not found")
                 return None
-                
+
             account = get_account_instance_from_id(expert_instance.account_id)
             if not account:
                 logger.error(f"Account {expert_instance.account_id} not found for expert {self.id}")
                 return None
-            
+
             # Calculate used balance from open transactions
-            used_balance = self._calculate_used_balance(account)
+            used_balance = self._calculate_used_balance(account, exclude_transaction_id=exclude_transaction_id)
             if used_balance is None:
                 return None
             
@@ -656,25 +661,30 @@ class MarketExpertInterface(ExtendableSettingsInterface):
             logger.error(f"Error checking equity sufficiency for expert {self.id}: {e}", exc_info=True)
             return False, f"Error checking equity: {str(e)}"
     
-    def _calculate_used_balance(self, account: AccountInterface) -> Optional[float]:
+    def _calculate_used_balance(self, account: AccountInterface,
+                                 exclude_transaction_id: Optional[int] = None) -> Optional[float]:
         """
         Calculate the used balance from all open transactions for this expert. Uses bulk price fetching.
-        
+
         Args:
             account: The account instance to get current prices
-            
+            exclude_transaction_id: Optional transaction ID to exclude from the calculation,
+                e.g. the WAITING transaction created for the order currently being validated.
+
         Returns:
             Optional[float]: The total used balance, None if error occurred
         """
         try:
             used_balance = 0.0
-            
+
             # Get all open transactions for this expert
             with Session(get_db().bind) as session:
                 statement = select(Transaction).where(
                     Transaction.expert_id == self.id,
                     Transaction.status.in_([TransactionStatus.WAITING, TransactionStatus.OPENED])
                 )
+                if exclude_transaction_id is not None:
+                    statement = statement.where(Transaction.id != exclude_transaction_id)
                 transactions = session.exec(statement).all()
             
             if not transactions:
