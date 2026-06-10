@@ -348,6 +348,10 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
             'tool_vendors': tool_vendors,  # Add tool_vendors to config
             'parallel_tool_calls': self.settings.get('parallel_tool_calls', settings_def['parallel_tool_calls']['default']),
             'enable_streaming': self.settings.get('enable_streaming', settings_def['enable_streaming']['default']),
+            'memory_injection_scope': self.settings.get('memory_injection_scope') or settings_def['memory_injection_scope']['default'],
+            'memory_max_trades': int(self.settings.get('memory_max_trades') or settings_def['memory_max_trades']['default']),
+            'memory_lookback_days': int(self.settings.get('memory_lookback_days') or settings_def['memory_lookback_days']['default']),
+            'analysis_strategy_notes': self.settings.get('analysis_strategy_notes') or settings_def['analysis_strategy_notes']['default'],
         })
         
         return config
