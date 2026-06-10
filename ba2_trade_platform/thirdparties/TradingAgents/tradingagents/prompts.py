@@ -330,58 +330,11 @@ Make sure to append a Markdown table at the end summarizing key economic indicat
 FINAL_SUMMARIZATION_AGENT_PROMPT = """You are the Final Summarization Agent for TradingAgents. Your PRIMARY role is to extract and format the final_trade_decision from the analysis workflow into a structured JSON recommendation for the BA2 Trade Platform.
 
 ## CRITICAL REQUIREMENTS
-1. **OUTPUT ONLY VALID JSON** - No markdown, explanations, or additional text
-2. **Use EXACT schema provided** - All fields are required
-3. **NO TRAILING COMMAS** - Arrays and objects must NOT have commas after the last element
-4. **FOLLOW THE final_trade_decision EXCLUSIVELY** - The final_trade_decision is the authoritative recommendation
-5. **Use supporting data ONLY for context** - Market, News, Fundamentals, Sentiment, Macro data provide background information only
-6. **NEVER contradict the final_trade_decision** - All outputs must align with and support the final trade decision
+1. **FOLLOW THE final_trade_decision EXCLUSIVELY** - The final_trade_decision is the authoritative recommendation.
+2. **Use supporting data ONLY for context** - Market, News, Fundamentals, Sentiment, Macro data provide background information only.
+3. **NEVER contradict the final_trade_decision** - All outputs must align with and support the final trade decision.
 
-## JSON SCHEMA (REQUIRED OUTPUT FORMAT)
-```json
-{{
-    "symbol": "TICKER",
-    "recommended_action": "BUY|OVERWEIGHT|HOLD|UNDERWEIGHT|SELL",
-    "expected_profit_percent": 0.0,
-    "confidence": 0.0,
-    "details": "Detailed explanation (max 2000 chars)",
-    "risk_level": "LOW|MEDIUM|HIGH",
-    "time_horizon": "SHORT_TERM|MEDIUM_TERM|LONG_TERM",
-    "key_factors": ["factor1", "factor2", "factor3"],
-    "stop_loss": 0.0,
-    "take_profit": 0.0,
-    "analysis_summary": {{
-        "market_trend": "BULLISH|BEARISH|NEUTRAL",
-        "fundamental_strength": "STRONG|MODERATE|WEAK",
-        "macro_environment": "FAVORABLE|NEUTRAL|UNFAVORABLE",
-        "technical_signals": "BUY|SELL|NEUTRAL"
-    }}
-}}
-```
-
-## CRITICAL JSON FORMATTING RULES
-⚠️ **COMMON MISTAKES TO AVOID**:
-1. ❌ NO trailing commas: `["item1", "item2",]` ← INVALID
-2. ✅ Correct format: `["item1", "item2"]` ← VALID
-3. ❌ NO comments in JSON: `"confidence": 50.0,  // high confidence` ← INVALID
-4. ✅ Use only data: `"confidence": 50.0` ← VALID
-5. ⚠️ **DO NOT copy example values** — all numeric fields (confidence, expected_profit_percent, stop_loss, take_profit) are placeholders. You MUST replace them with values derived from your analysis.
-
-**Examples of INVALID JSON (DO NOT OUTPUT)**:
-```
-"key_factors": [
-    "Factor 1",
-    "Factor 2",  ← INVALID TRAILING COMMA
-]
-```
-
-**Examples of VALID JSON (CORRECT FORMAT)**:
-```
-"key_factors": [
-    "Factor 1",
-    "Factor 2"
-]
-```
+The exact output schema (field names, types, and allowed values) is supplied separately as format instructions in the user message — follow it precisely. Do not restate, summarise, or invent a schema here, and do not copy any example/placeholder numbers: every numeric field must be derived from your analysis.
 
 ## DECISION FRAMEWORK - FINAL_TRADE_DECISION PRIORITY
 1. **PRIMARY SOURCE**: Extract recommended_action directly from final_trade_decision (BUY/OVERWEIGHT/HOLD/UNDERWEIGHT/SELL)
@@ -480,6 +433,23 @@ def format_analyst_prompt(system_prompt: str, tool_names: list, current_date: st
     logger.debug(f"\n------------------\nANALYST PROMPT\n-----------------------\n{formatted_system}")
     
     return result
+
+# Injected when no past reflections matched, so the model is told explicitly not to
+# invent lessons rather than receiving an empty quote (PR-6).
+NO_PAST_MEMORIES_TEXT = "No past reflections available — do not fabricate lessons."
+
+
+def format_past_memories(past_memories) -> str:
+    """Join retrieved memory blocks into prompt text, or an explicit no-memory note.
+
+    Returns NO_PAST_MEMORIES_TEXT when there are no memories so prompts never embed
+    an empty quote (which led models to invent past lessons).
+    """
+    if not past_memories:
+        return NO_PAST_MEMORIES_TEXT
+    text = "\n\n".join(rec["recommendation"] for rec in past_memories).strip()
+    return text or NO_PAST_MEMORIES_TEXT
+
 
 def format_bull_researcher_prompt(**kwargs) -> str:
     """Format bull researcher prompt with provided variables"""

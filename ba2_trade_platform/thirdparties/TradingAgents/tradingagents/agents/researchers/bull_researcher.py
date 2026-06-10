@@ -1,4 +1,4 @@
-from ...prompts import format_bull_researcher_prompt
+from ...prompts import format_bull_researcher_prompt, format_past_memories, NO_PAST_MEMORIES_TEXT
 from ba2_trade_platform.core.text_utils import extract_text_from_llm_response
 from ba2_trade_platform.logger import logger
 from ..utils.structured_outputs import ResearcherArgument, render_researcher_argument
@@ -19,11 +19,11 @@ def create_bull_researcher(llm, memory):
 
         curr_situation = f"{market_research_report}\n\n{sentiment_report}\n\n{news_report}\n\n{fundamentals_report}\n\n{macro_report}"
 
-        past_memory_str = ""
+        past_memory_str = NO_PAST_MEMORIES_TEXT
         if memory is not None:
-            past_memories = memory.get_memories(curr_situation, n_matches=2, aggregate_chunks=False)
-            for rec in past_memories:
-                past_memory_str += rec["recommendation"] + "\n\n"
+            past_memory_str = format_past_memories(
+                memory.get_memories(curr_situation, aggregate_chunks=False)
+            )
 
         prompt = format_bull_researcher_prompt(
             market_research_report=market_research_report,

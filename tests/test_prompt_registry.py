@@ -12,6 +12,8 @@ from pathlib import Path
 from ba2_trade_platform.thirdparties.TradingAgents.tradingagents import prompts as prompts_mod
 from ba2_trade_platform.thirdparties.TradingAgents.tradingagents.prompts import (
     PROMPT_REGISTRY,
+    NO_PAST_MEMORIES_TEXT,
+    format_past_memories,
     get_prompt,
 )
 
@@ -52,6 +54,31 @@ class TestRegistryServesIntendedPrompts:
     def test_all_registry_values_are_nonempty_strings(self):
         for name, value in PROMPT_REGISTRY.items():
             assert isinstance(value, str) and value.strip(), f"empty prompt: {name}"
+
+
+class TestPastMemoriesFormatting:
+    def test_empty_returns_no_memories_sentinel(self):
+        assert format_past_memories([]) == NO_PAST_MEMORIES_TEXT
+        assert format_past_memories(None) == NO_PAST_MEMORIES_TEXT
+
+    def test_joins_recommendations(self):
+        out = format_past_memories([{"recommendation": "A"}, {"recommendation": "B"}])
+        assert "A" in out and "B" in out
+        assert out != NO_PAST_MEMORIES_TEXT
+
+
+class TestResearchManagerScale:
+    def test_uses_five_tier_scale(self):
+        rm = get_prompt("research_manager")
+        for tier in ("Buy", "Overweight", "Hold", "Underweight", "Sell"):
+            assert tier in rm
+
+
+class TestFinalSummarizationNoDuplicateSchema:
+    def test_schema_owned_by_format_instructions(self):
+        fs = get_prompt("final_summarization")
+        assert "JSON SCHEMA" not in fs
+        assert "DECISION FRAMEWORK" in fs  # decision-framework content retained
 
 
 class TestMarketAnalystToolReferences:
