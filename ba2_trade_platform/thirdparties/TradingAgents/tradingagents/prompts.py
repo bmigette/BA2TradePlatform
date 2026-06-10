@@ -41,7 +41,7 @@ Volatility Indicators:
 Volume-Based Indicators:
 - vwma: VWMA: A moving average weighted by volume. Usage: Confirm trends by integrating price action with volume data. Tips: Watch for skewed results from volume spikes; use in combination with other volume analyses.
 
-- Select indicators that provide diverse and complementary information. Avoid redundancy (e.g., do not select both rsi and stochrsi). Also briefly explain why they are suitable for the given market context and timeframe. When you tool call, please use the exact name of the indicators provided above as they are defined parameters, otherwise your call will fail. Please make sure to call get_YFin_data first to retrieve the CSV that is needed to generate indicators. Write a very detailed and nuanced report of the trends you observe, considering the timeframe context. Do not simply state the trends are mixed, provide detailed and finegrained analysis and insights that may help traders make decisions.
+- Select indicators that provide diverse and complementary information. Avoid redundancy (e.g., do not select both macd and macds, which carry overlapping information). Also briefly explain why they are suitable for the given market context and timeframe. When you tool call, please use the exact name of the indicators provided above as they are defined parameters, otherwise your call will fail. Call get_ohlcv_data first to retrieve the price history, then call get_indicator_data for each selected indicator. Write a very detailed and nuanced report of the trends you observe, considering the timeframe context. Do not simply state the trends are mixed, provide detailed and finegrained analysis and insights that may help traders make decisions.
 
 **Support, resistance & reversal signals:** Regardless of the prevailing trend, identify concrete key support and resistance levels from the price data (recent swing highs/lows, prior consolidation zones, round numbers, and moving averages such as the 50/200 SMA acting as dynamic support/resistance). Explicitly call out any signs of a potential reversal or stabilization — e.g. bullish/bearish divergence between price and RSI/MACD, declining volume on continued moves in the trend direction, narrowing trading ranges, price reclaiming a key moving average, or candlestick patterns suggesting exhaustion. For a stock in a strong downtrend, state clearly whether there is evidence the decline is stabilizing/reversing or whether momentum shows no sign of slowing — this distinction is critical context for traders evaluating entries, independent of the overall direction.
 
@@ -306,15 +306,11 @@ Please write a detailed analysis that includes:
 
 Make sure to append a Markdown table at the end summarizing key economic indicators and their current readings."""
 
-# =============================================================================
-# SYSTEM PROMPTS
-# =============================================================================
-
-SIGNAL_PROCESSING_SYSTEM_PROMPT = """You are a signal processing expert that transforms trading decisions into clear, actionable formats. Your role is to extract the core trading signal from complex analysis outputs and present it in a standardized format."""
-
-REFLECTION_SYSTEM_PROMPT = """You are a reflection specialist that analyzes trading decisions and outcomes to extract learning insights. Your role is to identify what worked, what didn't, and how to improve future decision-making based on actual results."""
-
-
+# NOTE: SIGNAL_PROCESSING_SYSTEM_PROMPT and REFLECTION_SYSTEM_PROMPT were
+# previously redefined here with weaker text, silently overriding the strict /
+# detailed versions above (Python keeps the last binding). The duplicates were
+# removed so PROMPT_REGISTRY resolves to the intended versions. See
+# test_prompt_registry_no_duplicates / test_signal_processing_prompt_strict.
 
 # =============================================================================
 # FINAL SUMMARIZATION AGENT PROMPTS

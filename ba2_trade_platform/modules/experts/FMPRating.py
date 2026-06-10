@@ -269,34 +269,33 @@ class FMPRating(MarketExpertInterface):
         # Base confidence from analyst consensus (0-100 scale)
         base_confidence = (dominant_score / total_weighted * 100) if total_weighted > 0 else 0.0
         
-        # Step 3: Calculate price target boost
+        # Step 3: Calculate price target boost.
+        # boost_to_* is the signed % distance from the current price to each target
+        # (positive when the target is ABOVE the current price). This is the
+        # BUY-oriented magnitude; the directional sign is applied in Step 4.
         price_target_boost = 0.0
         boost_to_lower = 0.0
         boost_to_consensus = 0.0
-        
+
         if current_price and target_low and target_consensus:
-            # Calculate expected profit % if we hit lower target
-            if current_price > target_low:
-                # Current price is above lower target - negative boost (bearish)
-                boost_to_lower = ((target_low - current_price) / current_price) * 100
-            else:
-                # Current price is below lower target - positive boost (bullish)
-                boost_to_lower = ((target_low - current_price) / current_price) * 100
-            
-            # Calculate expected profit % if we hit consensus target
-            if current_price > target_consensus:
-                # Current price is above consensus - negative boost (bearish)
-                boost_to_consensus = ((target_consensus - current_price) / current_price) * 100
-            else:
-                # Current price is below consensus - positive boost (bullish)
-                boost_to_consensus = ((target_consensus - current_price) / current_price) * 100
-            
-            # Average the two boosts
+            boost_to_lower = ((target_low - current_price) / current_price) * 100
+            boost_to_consensus = ((target_consensus - current_price) / current_price) * 100
+            # Average the two boosts (still BUY-oriented at this point)
             price_target_boost = (boost_to_lower + boost_to_consensus) / 2.0
-        
-        # Step 4: Apply price target boost to base confidence
-        # Positive boost increases confidence, negative boost decreases it
-        confidence = base_confidence + price_target_boost
+
+        # Step 4: Apply the price target boost to base confidence, ORIENTED BY SIGNAL.
+        # BUY: upside above the current price (positive boost) increases confidence.
+        # SELL: the short thesis is stronger the further the targets sit BELOW the
+        #       current price, so the sign is flipped — otherwise more downside would
+        #       wrongly REDUCE SELL confidence (the original bug).
+        # HOLD: directional boost is meaningless, so none is applied.
+        if signal == OrderRecommendation.BUY:
+            applied_boost = price_target_boost
+        elif signal == OrderRecommendation.SELL:
+            applied_boost = -price_target_boost
+        else:
+            applied_boost = 0.0
+        confidence = base_confidence + applied_boost
         
         # Step 5: Clamp final confidence to 0-100%
         confidence = max(0.0, min(100.0, confidence))
@@ -413,7 +412,8 @@ Base Confidence = Dominant Score / Total × 100 = {dominant_score:.1f} / {total_
 {boost_calc}
 
 Step 4 - Final Confidence (clamped to 0-100%):
-Final Confidence = Base Confidence + Avg Boost = {base_confidence:.1f}% + {price_target_boost:.1f}% = {confidence:.1f}%
+Final Confidence = Base Confidence + Directional Boost ({signal.value}) = {base_confidence:.1f}% + {applied_boost:+.1f}% = {confidence:.1f}%
+(Boost sign is oriented by signal: BUY adds upside, SELL adds downside, HOLD adds none.)
 
 {profit_calc}
 """
@@ -441,6 +441,7 @@ Final Confidence = Base Confidence + Avg Boost = {base_confidence:.1f}% + {price
             'boost_to_lower': boost_to_lower,
             'boost_to_consensus': boost_to_consensus,
             'price_target_boost': price_target_boost,
+            'applied_boost': applied_boost,
             'target_price': target_price
         }
     
@@ -1006,6 +1007,9 @@ Final Confidence = Base Confidence + Avg Boost = {base_confidence:.1f}% + {price
             if confidence_breakdown:
                 base_confidence = confidence_breakdown.get('base_confidence', 0)
                 price_target_boost = confidence_breakdown.get('price_target_boost', 0)
+                # applied_boost is the directional boost actually added to confidence
+                # (BUY: +raw, SELL: -raw, HOLD: 0). Fall back to raw for old records.
+                applied_boost = confidence_breakdown.get('applied_boost', price_target_boost)
                 boost_to_lower = confidence_breakdown.get('boost_to_lower', 0)
                 boost_to_consensus = confidence_breakdown.get('boost_to_consensus', 0)
                 
@@ -1020,13 +1024,13 @@ Final Confidence = Base Confidence + Avg Boost = {base_confidence:.1f}% + {price
                             ui.label(f'{base_confidence:.1f}%').classes('text-h5').style('color: #63b3ed')
                             ui.label(f'Weighted buy/sell/hold scores').classes('text-xs').style('color: #718096')
                         
-                        # Price Target Boost
-                        boost_color = '#00d4aa' if price_target_boost > 0 else '#ff6b6b' if price_target_boost < 0 else '#a0aec0'
-                        boost_bg = 'rgba(0, 212, 170, 0.15)' if price_target_boost > 0 else 'rgba(255, 107, 107, 0.15)' if price_target_boost < 0 else 'rgba(160, 174, 192, 0.15)'
+                        # Price Target Boost (directional — actually applied to confidence)
+                        boost_color = '#00d4aa' if applied_boost > 0 else '#ff6b6b' if applied_boost < 0 else '#a0aec0'
+                        boost_bg = 'rgba(0, 212, 170, 0.15)' if applied_boost > 0 else 'rgba(255, 107, 107, 0.15)' if applied_boost < 0 else 'rgba(160, 174, 192, 0.15)'
                         with ui.card().style(f'background-color: {boost_bg}'):
-                            ui.label('Price Target Boost').classes('text-caption').style('color: #a0aec0')
-                            ui.label(f'{price_target_boost:+.1f}%').classes('text-h5').style(f'color: {boost_color}')
-                            ui.label(f'Avg of lower & consensus targets').classes('text-xs').style('color: #718096')
+                            ui.label('Price Target Boost (applied)').classes('text-caption').style('color: #a0aec0')
+                            ui.label(f'{applied_boost:+.1f}%').classes('text-h5').style(f'color: {boost_color}')
+                            ui.label(f'Direction-adjusted avg of targets').classes('text-xs').style('color: #718096')
                         
                         # Boost to Lower Target
                         with ui.card().style('background-color: rgba(160, 174, 192, 0.15)'):
@@ -1040,12 +1044,12 @@ Final Confidence = Base Confidence + Avg Boost = {base_confidence:.1f}% + {price
                     
                     ui.separator().classes('my-2')
                     
-                    # Calculate what confidence should be
-                    calculated_confidence = base_confidence + price_target_boost
+                    # Calculate what confidence should be (directional boost)
+                    calculated_confidence = base_confidence + applied_boost
                     clamped_confidence = max(0.0, min(100.0, calculated_confidence))
-                    
+
                     # Show the formula
-                    ui.label(f'Final Confidence = Base + Boost = {base_confidence:.1f}% + {price_target_boost:+.1f}% = {calculated_confidence:.1f}%').classes('text-sm').style('color: #a0aec0')
+                    ui.label(f'Final Confidence = Base + Directional Boost = {base_confidence:.1f}% + {applied_boost:+.1f}% = {calculated_confidence:.1f}%').classes('text-sm').style('color: #a0aec0')
                     
                     # If clamping occurred, show it
                     if calculated_confidence != clamped_confidence:
@@ -1072,6 +1076,7 @@ Final Confidence = Base Confidence + Avg Boost = {base_confidence:.1f}% + {price
                     confidence_breakdown = state.get('confidence_breakdown', {})
                     base_conf = confidence_breakdown.get('base_confidence', 0)
                     price_boost = confidence_breakdown.get('price_target_boost', 0)
+                    applied_boost = confidence_breakdown.get('applied_boost', price_boost)
                     boost_lower = confidence_breakdown.get('boost_to_lower', 0)
                     boost_consensus = confidence_breakdown.get('boost_to_consensus', 0)
                     buy_score = confidence_breakdown.get('buy_score', 0)
@@ -1113,11 +1118,14 @@ All profit calculations use the **Consensus Target** price.
 3. **Price Target Boost**
    - Boost to Lower Target = ((Low Target - Current) / Current) × 100 = {boost_lower:+.1f}%
    - Boost to Consensus = ((Consensus - Current) / Current) × 100 = {boost_consensus:+.1f}%
-   - Avg Price Target Boost = ({boost_lower:+.1f}% + {boost_consensus:+.1f}%) / 2 = {price_boost:+.1f}%
-   - **Logic**: Positive when targets are above current price (more upside potential)
+   - Avg Price Target Boost (raw) = ({boost_lower:+.1f}% + {boost_consensus:+.1f}%) / 2 = {price_boost:+.1f}%
+   - Directional Boost (applied) = {applied_boost:+.1f}%
+   - **Logic**: Raw boost is positive when targets are above current price. The
+     sign is then oriented by signal — BUY adds upside, SELL adds downside
+     (more downside ⇒ higher SELL confidence), HOLD adds none.
 
 4. **Final Confidence (Clamped to 0-100%)**
-   - Final = Base + Boost = {base_conf:.1f}% + {price_boost:+.1f}% = **{confidence:.1f}%**
+   - Final = Base + Directional Boost = {base_conf:.1f}% + {applied_boost:+.1f}% = **{confidence:.1f}%**
 
 ---
 

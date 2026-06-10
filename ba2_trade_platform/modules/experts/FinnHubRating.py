@@ -249,7 +249,11 @@ Confidence (agreement on dominant side): {confidence:.1f}%
                 instance_id=self.id,
                 symbol=symbol,
                 recommended_action=recommendation_data['signal'],
-                expected_profit_percent=0.0,  # FinnHub doesn't provide profit targets
+                # FinnHub doesn't provide price targets, so it cannot estimate profit.
+                # 0.0 is intentional: the classic risk manager prioritizes 0.0-profit
+                # recommendations by CONFIDENCE (compute_order_priority_score, RM-3/EX-5),
+                # so these orders are still funded by conviction rather than starved.
+                expected_profit_percent=0.0,
                 price_at_date=current_price,
                 details=recommendation_data['details'][:100000] if recommendation_data['details'] else None,
                 confidence=round(recommendation_data['confidence'], 1),  # Store as 1-100 scale

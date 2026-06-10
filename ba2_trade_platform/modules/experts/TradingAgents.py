@@ -278,26 +278,39 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
         """Get current UTC timestamp in ISO format."""
         return datetime.now(timezone.utc).isoformat()
     
+    def _int_setting(self, key: str) -> int:
+        """Read an int setting, using the definition default ONLY when unset (None).
+
+        Unlike ``int(self.settings.get(key) or default)``, a legitimately configured
+        ``0`` is honored instead of being treated as missing (RM-1 / B4) — e.g. 0
+        debate rounds or 0 memory trades to disable a stage.
+        """
+        settings_def = self.get_settings_definitions()
+        value = self.settings.get(key)
+        if value is None:
+            value = settings_def[key]['default']
+        return int(value)
+
     def _create_tradingagents_config(self, subtype: str) -> Dict[str, Any]:
         """Create TradingAgents configuration from expert settings."""
         config = DEFAULT_CONFIG.copy()
-        
+
         # Get settings definitions for default values
         settings_def = self.get_settings_definitions()
         
         # Choose debate settings based on analysis subtype
         if subtype == AnalysisUseCase.ENTER_MARKET:
             # For new position analysis, use debates_new_positions setting
-            max_debate_rounds = int(self.settings.get('debates_new_positions') or settings_def['debates_new_positions']['default'])
-            max_risk_discuss_rounds = int(self.settings.get('debates_new_positions') or settings_def['debates_new_positions']['default'])
+            max_debate_rounds = self._int_setting('debates_new_positions')
+            max_risk_discuss_rounds = self._int_setting('debates_new_positions')
         elif subtype == AnalysisUseCase.OPEN_POSITIONS:
             # For existing position analysis, use debates_existing_positions setting
-            max_debate_rounds = int(self.settings.get('debates_existing_positions') or settings_def['debates_existing_positions']['default'])
-            max_risk_discuss_rounds = int(self.settings.get('debates_existing_positions') or settings_def['debates_existing_positions']['default'])
+            max_debate_rounds = self._int_setting('debates_existing_positions')
+            max_risk_discuss_rounds = self._int_setting('debates_existing_positions')
         else:
             # Default fallback
-            max_debate_rounds = int(self.settings.get('debates_new_positions') or settings_def['debates_new_positions']['default'])
-            max_risk_discuss_rounds = int(self.settings.get('debates_existing_positions') or settings_def['debates_existing_positions']['default'])
+            max_debate_rounds = self._int_setting('debates_new_positions')
+            max_risk_discuss_rounds = self._int_setting('debates_existing_positions')
         
         # Build tool_vendors mapping from individual vendor settings
         # Convert list-type vendor settings to comma-separated strings
@@ -340,17 +353,17 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
             'deep_think_llm': deep_think_model_str,  # Full selection string (e.g., "nagaai/gpt5")
             'quick_think_llm': quick_think_model_str,  # Full selection string (e.g., "nagaai/gpt5_mini")
             'trade_recommendation_llm': trade_recommendation_model_str,  # Final risk-judge / recommendation model
-            'news_lookback_days': int(self.settings.get('news_lookback_days') or settings_def['news_lookback_days']['default']),
-            'market_history_days': int(self.settings.get('market_history_days') or settings_def['market_history_days']['default']),
-            'economic_data_days': int(self.settings.get('economic_data_days') or settings_def['economic_data_days']['default']),
-            'social_sentiment_days': int(self.settings.get('social_sentiment_days') or settings_def['social_sentiment_days']['default']),
+            'news_lookback_days': self._int_setting('news_lookback_days'),
+            'market_history_days': self._int_setting('market_history_days'),
+            'economic_data_days': self._int_setting('economic_data_days'),
+            'social_sentiment_days': self._int_setting('social_sentiment_days'),
             'timeframe': self.settings.get('timeframe') or settings_def['timeframe']['default'],
             'tool_vendors': tool_vendors,  # Add tool_vendors to config
             'parallel_tool_calls': self.settings.get('parallel_tool_calls', settings_def['parallel_tool_calls']['default']),
             'enable_streaming': self.settings.get('enable_streaming', settings_def['enable_streaming']['default']),
             'memory_injection_scope': self.settings.get('memory_injection_scope') or settings_def['memory_injection_scope']['default'],
-            'memory_max_trades': int(self.settings.get('memory_max_trades') or settings_def['memory_max_trades']['default']),
-            'memory_lookback_days': int(self.settings.get('memory_lookback_days') or settings_def['memory_lookback_days']['default']),
+            'memory_max_trades': self._int_setting('memory_max_trades'),
+            'memory_lookback_days': self._int_setting('memory_lookback_days'),
             'analysis_strategy_notes': self.settings.get('analysis_strategy_notes') or settings_def['analysis_strategy_notes']['default'],
         })
         
@@ -490,7 +503,12 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                 price_at_date = rec_price
 
             if price_at_date <= 0:
-                self.logger.error(f"No valid price available for {symbol} in graph state!")
+                # Live-data rule (CLAUDE.md): never emit a recommendation with an invalid
+                # price. Raise so run_analysis marks the analysis FAILED instead of storing
+                # a price_at_date=0 recommendation that breaks downstream sizing/risk math.
+                raise ValueError(
+                    f"No valid price available for {symbol} in graph state (price_at_date={price_at_date})"
+                )
 
             return {
                 'signal': expert_recommendation.get('recommended_action', OrderRecommendation.ERROR),
@@ -502,30 +520,16 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                 'time_horizon': expert_recommendation.get('time_horizon', TimeHorizon.SHORT_TERM)
             }
         else:
-            # Fallback to processed signal
-            self.logger.warning(f"No expert_recommendation in graph output for {symbol} - using fallback path")
-
-            if price_at_date <= 0:
-                try:
-                    from ...core.utils import get_account_instance_from_id
-                    account = get_account_instance_from_id(self.instance.account_id)
-                    if account:
-                        current_price = account.get_instrument_current_price(symbol)
-                        if current_price and current_price > 0:
-                            price_at_date = current_price
-                            self.logger.info(f"Using account fallback price for {symbol}: ${price_at_date:.2f}")
-                except Exception as e:
-                    self.logger.error(f"Error fetching account price for {symbol}: {e}", exc_info=True)
-
-            return {
-                'signal': processed_signal if processed_signal in ['BUY', 'OVERWEIGHT', 'HOLD', 'UNDERWEIGHT', 'SELL'] else OrderRecommendation.ERROR,
-                'confidence': 0.0,
-                'expected_profit': 0.0,
-                'details': f"TradingAgents analysis: {processed_signal}",
-                'price_at_date': price_at_date,
-                'risk_level': RiskLevel.MEDIUM,
-                'time_horizon': TimeHorizon.SHORT_TERM
-            }
+            # No structured recommendation was produced by the summarization agent.
+            # Do NOT fabricate a recommendation (confidence=0.0/MEDIUM/SHORT_TERM) from the
+            # raw processed_signal — that would persist synthetic metadata for a failed
+            # analysis. Raise so run_analysis marks the analysis FAILED. (This path is
+            # normally unreachable: run_analysis already guards on empty expert_recommendation
+            # before calling this method.)
+            raise ValueError(
+                f"No expert_recommendation in graph output for {symbol} - marking analysis as FAILED "
+                f"(processed_signal={processed_signal!r})"
+            )
     
     def _create_expert_recommendation(self, recommendation_data: Dict[str, Any], symbol: str, market_analysis_id: int) -> int:
         """Create ExpertRecommendation record in database."""
@@ -742,9 +746,9 @@ Analysis completed at: {self._get_current_timestamp()}"""
         # Get settings with proper None-aware fallback to defaults
         # (settings can be None if not configured in database)
         alpha_vantage_source = self.settings.get('alpha_vantage_source') or settings_def['alpha_vantage_source']['default']
-        economic_data_days = int(self.settings.get('economic_data_days') or settings_def['economic_data_days']['default'])
-        news_lookback_days = int(self.settings.get('news_lookback_days') or settings_def['news_lookback_days']['default'])
-        social_sentiment_days = int(self.settings.get('social_sentiment_days') or settings_def['social_sentiment_days']['default'])
+        economic_data_days = self._int_setting('economic_data_days')
+        news_lookback_days = self._int_setting('news_lookback_days')
+        social_sentiment_days = self._int_setting('social_sentiment_days')
         # Get analyst model context size for enrichment trimming
         # The "deep_think_llm" setting is used for analyst LLMs
         from ba2_trade_platform.core.models_registry import get_model_context_size, parse_model_selection
