@@ -481,14 +481,15 @@ class TradeRiskManagement:
         instrument_configs = expert._get_enabled_instruments_config()
         self.logger.debug(f"Retrieved instrument weight configurations: {len(instrument_configs)} instruments")
 
-        # Diversification factor (RM-5): configurable per expert instead of a hardcoded
-        # 0.7. When multiple instruments still have headroom, only this fraction of the
-        # available equity is used for a single instrument, reserving the rest for others.
+        # Diversification factor (RM-5): configurable per expert. Defaults to 1.0 (off)
+        # so diversification is governed by the per-instrument cap; when set < 1.0 and
+        # multiple instruments still have headroom, only this fraction of the available
+        # equity is used for a single instrument, reserving the rest for others.
         diversification_factor = expert.get_setting_with_interface_default(
             'diversification_factor', log_warning=False
         )
         if diversification_factor is None:
-            diversification_factor = 0.7
+            diversification_factor = 1.0
         
         # Group orders by symbol for diversity calculation
         orders_by_symbol = {}
@@ -576,8 +577,9 @@ class TradeRiskManagement:
                     num_remaining_instruments = len([s for s in orders_by_symbol.keys()
                                                    if instrument_allocations.get(s, 0) < max_equity_per_instrument])
 
-                    if num_remaining_instruments > 1:
-                        # Reserve some balance for other instruments (configurable, RM-5)
+                    if num_remaining_instruments > 1 and diversification_factor < 1.0:
+                        # Reserve some balance for other instruments (configurable, RM-5;
+                        # default 1.0 = off, so this only runs when explicitly lowered)
                         original_max = max_quantity
                         max_quantity *= diversification_factor
                         self.logger.info(f"  Diversification ({num_remaining_instruments} remaining instruments): "
