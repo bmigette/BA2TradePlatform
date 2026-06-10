@@ -145,14 +145,14 @@ class LiveTradesTable(LazyTable):
                     >
                         <q-tooltip>TP/SL defined but no valid orders - Click to recreate</q-tooltip>
                     </q-btn>
-                    <q-btn v-if="props.row.is_open"
+                    <q-btn v-if="props.row.is_open || props.row.is_waiting"
                            icon="edit"
                            size="sm"
                            flat
                            round
                            color="primary"
                            @click="$parent.$emit('edit_transaction', props.row.id)"
-                           title="Adjust TP/SL"
+                           :title="props.row.is_waiting ? 'Set TP/SL (applied when entry fills)' : 'Adjust TP/SL'"
                     />
                     <q-btn v-if="(props.row.is_open || props.row.is_waiting) && !props.row.is_closing"
                            icon="close"

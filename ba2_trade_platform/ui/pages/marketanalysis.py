@@ -3830,10 +3830,34 @@ class OrderRecommendationsTab:
             logger.error(f"Error navigating to market analysis history: {e}", exc_info=True)
 
     def _handle_place_order(self, event_data):
-        """Handle place order for a symbol."""
+        """Handle place order for a symbol (summary-table button).
+
+        Resolves the symbol's latest recommendation (respecting the active account
+        and expert filters) so the resulting order/transaction is linked to an
+        expert. This matches the recommendation shown in the summary row; without
+        it the order's transaction would have a NULL expert_id.
+        """
         try:
             symbol = event_data.args if hasattr(event_data, 'args') else event_data
-            self._show_place_order_dialog(symbol)
+
+            # Resolve the expert scope from the active filters (same scope the summary uses)
+            from ...core.utils import get_latest_recommendation_id_for_symbol
+            expert_scope = get_expert_ids_for_account(get_selected_account_id())
+            if self.expert_filter and self.expert_filter != 'all':
+                try:
+                    expert_scope = [int(self.expert_filter)]
+                except (ValueError, TypeError):
+                    pass
+
+            recommendation_id = get_latest_recommendation_id_for_symbol(
+                symbol, expert_instance_ids=expert_scope
+            )
+            if recommendation_id is None:
+                logger.warning(
+                    f"No recommendation found to link for manual order on {symbol}; "
+                    f"order will not be expert-linked"
+                )
+            self._show_place_order_dialog(symbol, recommendation_id)
         except Exception as e:
             logger.error(f"Error showing place order dialog: {e}", exc_info=True)
 

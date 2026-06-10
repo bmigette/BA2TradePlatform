@@ -129,3 +129,48 @@ class TestHasExistingTransactionsForExpertAndSymbol:
         ei = create_expert_instance(account_id=acct_def.id)
         create_transaction(symbol="MSFT", expert_id=ei.id, status=TransactionStatus.CLOSED)
         assert has_existing_transactions_for_expert_and_symbol(ei.id, "MSFT") is False
+
+
+class TestGetLatestRecommendationIdForSymbol:
+    """Tests for resolving the latest recommendation for a symbol.
+
+    Used by the per-symbol "Place Order" button so a manually-created order is
+    linked back to an expert (via TradingOrder.expert_recommendation_id ->
+    ExpertRecommendation.instance_id -> Transaction.expert_id). Previously that
+    button passed no recommendation, leaving Transaction.expert_id NULL.
+    """
+
+    def test_returns_none_when_no_recommendations(self):
+        from ba2_trade_platform.core.utils import get_latest_recommendation_id_for_symbol
+        assert get_latest_recommendation_id_for_symbol("ZZZZZ") is None
+
+    def test_returns_latest_recommendation_id(self):
+        from ba2_trade_platform.core.utils import get_latest_recommendation_id_for_symbol
+        acct_def = create_account_definition()
+        ei = create_expert_instance(account_id=acct_def.id)
+        create_recommendation(instance_id=ei.id, symbol="BRUN")
+        latest = create_recommendation(instance_id=ei.id, symbol="BRUN")
+
+        assert get_latest_recommendation_id_for_symbol("BRUN") == latest.id
+
+    def test_filters_by_expert_instance_ids(self):
+        from ba2_trade_platform.core.utils import get_latest_recommendation_id_for_symbol
+        acct_def = create_account_definition()
+        ei_a = create_expert_instance(account_id=acct_def.id)
+        ei_b = create_expert_instance(account_id=acct_def.id)
+        rec_a = create_recommendation(instance_id=ei_a.id, symbol="BRUN")
+        # rec_b is newer overall, but we restrict to expert A
+        create_recommendation(instance_id=ei_b.id, symbol="BRUN")
+
+        result = get_latest_recommendation_id_for_symbol("BRUN", expert_instance_ids=[ei_a.id])
+
+        assert result == rec_a.id
+
+    def test_empty_expert_instance_ids_returns_none(self):
+        """An empty (but not None) filter means 'no experts in scope' -> no match."""
+        from ba2_trade_platform.core.utils import get_latest_recommendation_id_for_symbol
+        acct_def = create_account_definition()
+        ei = create_expert_instance(account_id=acct_def.id)
+        create_recommendation(instance_id=ei.id, symbol="BRUN")
+
+        assert get_latest_recommendation_id_for_symbol("BRUN", expert_instance_ids=[]) is None
