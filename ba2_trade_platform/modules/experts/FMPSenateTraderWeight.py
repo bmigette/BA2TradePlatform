@@ -22,6 +22,8 @@ from ...core.db import get_db, update_instance, add_instance
 from ...core.types import MarketAnalysisStatus, OrderRecommendation, RiskLevel, TimeHorizon
 from ...logger import get_expert_logger
 from ...config import get_app_setting
+# NOTE: parse_fmp_amount_range / calculate_fmp_trade_metrics are imported LOCALLY inside
+# methods to avoid a circular import (core.utils -> modules.experts -> ...).
 
 
 class FMPSenateTraderWeight(MarketExpertInterface):
@@ -433,7 +435,17 @@ class FMPSenateTraderWeight(MarketExpertInterface):
         self.logger.info(f"Filtered {len(filtered_trades)} trades from {len(trades)} total")
         return filtered_trades
     
-    def _calculate_trader_confidence(self, trader_history: List[Dict[str, Any]], 
+    @staticmethod
+    def _parse_amount(amount_str) -> float:
+        """Parse an FMP trade amount string to a numeric dollar value.
+
+        Thin wrapper that imports the shared helper lazily to avoid the
+        core.utils -> modules.experts circular import.
+        """
+        from ...core.utils import parse_fmp_amount_range
+        return parse_fmp_amount_range(amount_str)
+
+    def _calculate_trader_confidence(self, trader_history: List[Dict[str, Any]],
                                      current_trade_type: str,
                                      current_symbol: str,
                                      current_price: float,
@@ -506,21 +518,13 @@ class FMPSenateTraderWeight(MarketExpertInterface):
                 # Parse date
                 try:
                     exec_date = datetime.strptime(exec_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                except:
+                except (ValueError, TypeError) as e:
+                    self.logger.warning(f"Skipping trade with unparseable date {exec_date_str!r}: {e}")
                     continue
-                
-                # Parse amount (remove $, commas, extract numeric value)
-                # Format is typically "$15,001 - $50,000" or similar
-                if '-' in amount_str:
-                    # Take the average of the range
-                    parts = amount_str.split('-')
-                    low = ''.join(c for c in parts[0] if c.isdigit() or c == '.')
-                    high = ''.join(c for c in parts[1] if c.isdigit() or c == '.')
-                    amount = (float(low) + float(high)) / 2 if low and high else 0
-                else:
-                    amount_str = ''.join(c for c in amount_str if c.isdigit() or c == '.')
-                    amount = float(amount_str) if amount_str else 0
-                
+
+                # Parse amount (handles "$15,001 - $50,000" ranges and single values)
+                amount = self._parse_amount(amount_str)
+
                 # Classify as buy or sell
                 is_buy = 'purchase' in transaction_type or 'buy' in transaction_type
                 is_sell = 'sale' in transaction_type or 'sell' in transaction_type
@@ -626,12 +630,13 @@ class FMPSenateTraderWeight(MarketExpertInterface):
         
         Formula:
         1. Start at 50% base confidence
-        2. Add trader pattern modifier (-30 to +30)
+        2. Add trader pattern modifier (0 to +10, from the trader's symbol portfolio focus %)
         3. Add investment size boost (up to +20%)
-        
+
         Args:
             trade: Trade record with amount information
-            trader_confidence_modifier: Confidence adjustment based on trader's pattern (-30 to +30)
+            trader_confidence_modifier: Confidence adjustment from the trader's symbol
+                portfolio focus (0 to +10; capped at 10 in _calculate_trader_confidence)
             
         Returns:
             Confidence percentage (0-100)
@@ -644,18 +649,8 @@ class FMPSenateTraderWeight(MarketExpertInterface):
         
         # Add investment size boost (up to +20% for very large trades)
         try:
-            amount_str = trade.get('amount', '0')
-            
-            # Parse amount (handle ranges like "$15,001 - $50,000")
-            if '-' in amount_str:
-                parts = amount_str.split('-')
-                low = ''.join(c for c in parts[0] if c.isdigit() or c == '.')
-                high = ''.join(c for c in parts[1] if c.isdigit() or c == '.')
-                amount = (float(low) + float(high)) / 2 if low and high else 0
-            else:
-                amount_str = ''.join(c for c in amount_str if c.isdigit() or c == '.')
-                amount = float(amount_str) if amount_str else 0
-            
+            amount = self._parse_amount(trade.get('amount', '0'))
+
             # Calculate boost: +10% per $500k, capped at +20%
             investment_boost = min(20.0, (amount / 500000) * 10.0)
             confidence += investment_boost
@@ -760,36 +755,10 @@ class FMPSenateTraderWeight(MarketExpertInterface):
             # Count buy/sell
             if is_buy:
                 buy_count += 1
-                try:
-                    amount_str = trade.get('amount', '0')
-                    # Parse amount range (e.g., "$15,001 - $50,000")
-                    if '-' in amount_str:
-                        parts = amount_str.split('-')
-                        low = ''.join(c for c in parts[0] if c.isdigit() or c == '.')
-                        high = ''.join(c for c in parts[1] if c.isdigit() or c == '.')
-                        amount = (float(low) + float(high)) / 2 if low and high else 0
-                    else:
-                        amount_str = ''.join(c for c in amount_str if c.isdigit() or c == '.')
-                        amount = float(amount_str) if amount_str else 0
-                    total_buy_amount += amount
-                except:
-                    pass
+                total_buy_amount += self._parse_amount(trade.get('amount', '0'))
             elif is_sell:
                 sell_count += 1
-                try:
-                    amount_str = trade.get('amount', '0')
-                    # Parse amount range (e.g., "$15,001 - $50,000")
-                    if '-' in amount_str:
-                        parts = amount_str.split('-')
-                        low = ''.join(c for c in parts[0] if c.isdigit() or c == '.')
-                        high = ''.join(c for c in parts[1] if c.isdigit() or c == '.')
-                        amount = (float(low) + float(high)) / 2 if low and high else 0
-                    else:
-                        amount_str = ''.join(c for c in amount_str if c.isdigit() or c == '.')
-                        amount = float(amount_str) if amount_str else 0
-                    total_sell_amount += amount
-                except:
-                    pass
+                total_sell_amount += self._parse_amount(trade.get('amount', '0'))
         
         # Check minimum traders and trades thresholds
         min_traders = int(self.get_setting_with_interface_default('min_traders'))
