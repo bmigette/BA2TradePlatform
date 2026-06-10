@@ -131,6 +131,7 @@ Key points to focus on:
 - Positive Indicators: Use financial health, industry trends, and recent positive news as evidence.
 - Bear Counterpoints: Critically analyze the bear argument with specific data and sound reasoning, addressing concerns thoroughly and showing why the bull perspective holds stronger merit.
 - Engagement: Present your argument in a conversational style, engaging directly with the bear analyst's points and debating effectively rather than just listing data.
+- Decision space: The research manager will convert this debate into a 5-tier rating — BUY, OVERWEIGHT, HOLD, UNDERWEIGHT, or SELL. Make clear not only *that* the bull case holds but *how strongly* (a full BUY for high conviction vs. a measured OVERWEIGHT), and say which tier you believe is justified and why, so the manager can grade conviction accurately.
 
 Resources available:
 Market research report: {market_research_report}
@@ -152,6 +153,7 @@ Key points to focus on:
 - Negative Indicators: Use evidence from financial data, market trends, or recent adverse news to support your position.
 - Bull Counterpoints: Critically analyze the bull argument with specific data and sound reasoning, exposing weaknesses or over-optimistic assumptions.
 - Engagement: Present your argument in a conversational style, directly engaging with the bull analyst's points and debating effectively rather than simply listing facts.
+- Decision space: The research manager will convert this debate into a 5-tier rating — BUY, OVERWEIGHT, HOLD, UNDERWEIGHT, or SELL. Make clear not only *that* the bear case holds but *how strongly* (a full SELL for high conviction vs. a measured UNDERWEIGHT), and say which tier you believe is justified and why, so the manager can grade conviction accurately.
 
 Resources available:
 Market research report: {market_research_report}
@@ -181,7 +183,16 @@ def _format_strategy_notes_block(strategy_notes: str) -> str:
 
 RESEARCH_MANAGER_PROMPT = """As the portfolio manager and debate facilitator, your role is to critically evaluate this round of debate and make a definitive decision: align with the bear analyst, the bull analyst, or choose Hold only if it is strongly justified based on the arguments presented.
 {strategy_notes}
-Summarize the key points from both sides concisely, focusing on the most compelling evidence or reasoning. Your recommendation—Buy, Sell, or Hold—must be clear and actionable. Avoid defaulting to Hold simply because both sides have valid points; commit to a stance grounded in the debate's strongest arguments.
+Summarize the key points from both sides concisely, focusing on the most compelling evidence or reasoning. Avoid defaulting to Hold simply because both sides have valid points; commit to a stance grounded in the debate's strongest arguments.
+
+**Rating Scale** (your recommendation must be exactly one — the trader and risk judge use this same 5-tier scale):
+- **Buy**: Strong conviction to enter or add to position
+- **Overweight**: Favorable outlook, gradually increase exposure
+- **Hold**: Maintain current position, no action needed
+- **Underweight**: Reduce exposure, take partial profits
+- **Sell**: Exit position or avoid entry
+
+Your recommendation must be clear, actionable, and chosen from the 5-tier scale above.
 
 Additionally, develop a detailed investment plan for the trader. This should include:
 
