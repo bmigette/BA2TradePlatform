@@ -165,8 +165,18 @@ Use this information to deliver a compelling bear argument, refute the bull's cl
 # MANAGER PROMPTS
 # =============================================================================
 
-RESEARCH_MANAGER_PROMPT = """As the portfolio manager and debate facilitator, your role is to critically evaluate this round of debate and make a definitive decision: align with the bear analyst, the bull analyst, or choose Hold only if it is strongly justified based on the arguments presented.
+def _format_strategy_notes_block(strategy_notes: str) -> str:
+    """Render the optional user-provided strategy context block.
 
+    Returns an empty string when no notes are configured, so the
+    `{strategy_notes}` placeholder collapses to nothing in the prompt.
+    """
+    if not strategy_notes:
+        return ""
+    return f"\n**Strategy Context (from user — read carefully, it explains why these candidates look the way they do):**\n{strategy_notes}\n"
+
+RESEARCH_MANAGER_PROMPT = """As the portfolio manager and debate facilitator, your role is to critically evaluate this round of debate and make a definitive decision: align with the bear analyst, the bull analyst, or choose Hold only if it is strongly justified based on the arguments presented.
+{strategy_notes}
 Summarize the key points from both sides concisely, focusing on the most compelling evidence or reasoning. Your recommendation—Buy, Sell, or Hold—must be clear and actionable. Avoid defaulting to Hold simply because both sides have valid points; commit to a stance grounded in the debate's strongest arguments.
 
 Additionally, develop a detailed investment plan for the trader. This should include:
@@ -185,7 +195,7 @@ Debate History:
 {history}"""
 
 RISK_MANAGER_PROMPT = """As the Risk Management Judge, synthesize the risk analysts' debate and deliver the final trading decision.
-
+{strategy_notes}
 **Rating Scale** (use exactly one):
 - **Buy**: Strong conviction to enter or add to position
 - **Overweight**: Favorable outlook, gradually increase exposure
@@ -222,7 +232,7 @@ Proposed Investment Plan: {investment_plan}
 Leverage these insights to make an informed and strategic decision."""
 
 TRADER_SYSTEM_PROMPT = """You are a trading agent analyzing market data to make investment decisions. Based on your analysis, provide a specific recommendation using the five-tier rating scale: BUY, OVERWEIGHT, HOLD, UNDERWEIGHT, or SELL.
-
+{strategy_notes}
 **Rating Scale:**
 - **BUY**: Strong conviction to enter or add to position
 - **OVERWEIGHT**: Favorable outlook, gradually increase exposure
@@ -474,12 +484,16 @@ def format_bear_researcher_prompt(**kwargs) -> str:
 
 def format_research_manager_prompt(**kwargs) -> str:
     """Format research manager prompt with provided variables"""
+    kwargs = dict(kwargs)
+    kwargs["strategy_notes"] = _format_strategy_notes_block(kwargs.get("strategy_notes", ""))
     result = RESEARCH_MANAGER_PROMPT.format(**kwargs)
     logger.debug(f"\n------------------\nRESEARCH MANAGER PROMPT\n-----------------------\n{result}")
     return result
 
 def format_risk_manager_prompt(**kwargs) -> str:
     """Format risk manager prompt with provided variables"""
+    kwargs = dict(kwargs)
+    kwargs["strategy_notes"] = _format_strategy_notes_block(kwargs.get("strategy_notes", ""))
     result = RISK_MANAGER_PROMPT.format(**kwargs)
     logger.debug(f"\n------------------\nRISK MANAGER PROMPT\n-----------------------\n{result}")
     return result
@@ -493,9 +507,12 @@ def format_trader_context_prompt(company_name: str, investment_plan: str) -> str
     logger.debug(f"\n------------------\nTRADER CONTEXT PROMPT\n-----------------------\n{result}")
     return result
 
-def format_trader_system_prompt(past_memory_str: str) -> str:
+def format_trader_system_prompt(past_memory_str: str, strategy_notes: str = "") -> str:
     """Format trader system prompt"""
-    result = TRADER_SYSTEM_PROMPT.format(past_memory_str=past_memory_str)
+    result = TRADER_SYSTEM_PROMPT.format(
+        past_memory_str=past_memory_str,
+        strategy_notes=_format_strategy_notes_block(strategy_notes),
+    )
     logger.debug(f"\n------------------\nTRADER SYSTEM PROMPT\n-----------------------\n{result}")
     return result
 
