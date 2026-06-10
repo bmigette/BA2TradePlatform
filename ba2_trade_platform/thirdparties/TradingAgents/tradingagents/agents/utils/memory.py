@@ -17,8 +17,10 @@ What's stored:
   current MarketAnalysis.state under state["reflections"][<role>]. No new tables.
 - get_memories(): pulls the last N completed analyses for the same
   expert+symbol, joins with closed Transactions to attach realized P&L, and
-  formats a prompt-friendly text block. Also appends a short cross-ticker
-  recent-outcomes section (last 30 days, same expert).
+  formats a prompt-friendly text block. When the configured injection scope is
+  ``all_symbols`` it also appends a short cross-ticker recent-outcomes section.
+  Retrieval scope, the max number of same-symbol analyses, and the lookback
+  window are all driven by the injected ``config`` dict (see __init__).
 """
 
 from typing import Any, Dict, List, Optional
@@ -31,8 +33,14 @@ class FinancialSituationMemory:
     """SQL-backed drop-in replacement for the prior ChromaDB-based memory.
 
     Constructor signature is preserved for compatibility with TradingAgentsGraph.
-    Only `name`, `symbol`, `market_analysis_id`, and `expert_instance_id` are
-    actually used; `config` is accepted but ignored.
+    The injected `config` dict drives three knobs:
+    - ``memory_injection_scope`` (``none`` / ``same_symbol`` / ``all_symbols``):
+      controls which past history is retrieved. ``none`` disables injection,
+      ``same_symbol`` (default) only returns past analyses for the same symbol,
+      ``all_symbols`` additionally appends a cross-ticker recent-outcomes summary.
+    - ``memory_max_trades``: max past same-symbol analyses to inject (default 2).
+    - ``memory_lookback_days``: only history within this many days is eligible
+      (default 14), applied to both same-symbol and cross-ticker lookups.
     """
 
     def __init__(
@@ -47,6 +55,11 @@ class FinancialSituationMemory:
         self.symbol = symbol.upper() if symbol else None
         self.market_analysis_id = market_analysis_id
         self.expert_instance_id = expert_instance_id
+
+        config = config or {}
+        self.scope = config.get("memory_injection_scope", "same_symbol")
+        self.max_trades = config.get("memory_max_trades", 2)
+        self.lookback_days = config.get("memory_lookback_days", 14)
 
     # ------------------------------------------------------------------
     # Reflection persistence
@@ -99,20 +112,24 @@ class FinancialSituationMemory:
         Args:
             current_situation: Ignored (kept for signature compatibility — was
                 used by the prior embedding-based implementation).
-            n_matches: Max number of past analyses to return (per same-symbol).
+            n_matches: Ignored — retained only for call-site compatibility;
+                superseded by ``self.max_trades`` (from config).
             aggregate_chunks: Ignored (compatibility).
 
         Returns:
             List of dicts each containing a 'recommendation' key (the
             formatted text block the agents concatenate into their prompts).
-            Returns an empty list if no expert context is available.
+            Returns an empty list if no expert context is available or the
+            configured injection scope is ``none``.
         """
+        if self.scope == "none":
+            return []
         if self.expert_instance_id is None or self.symbol is None:
             return []
 
         try:
-            past_blocks = self._fetch_same_symbol_blocks(n_matches)
-            cross_block = self._fetch_cross_ticker_summary()
+            past_blocks = self._fetch_same_symbol_blocks(self.max_trades)
+            cross_block = self._fetch_cross_ticker_summary() if self.scope == "all_symbols" else ""
         except Exception as e:
             logger.warning(
                 f"FinancialSituationMemory.get_memories failed for "
@@ -143,7 +160,8 @@ class FinancialSituationMemory:
     # Internal queries
     # ------------------------------------------------------------------
     def _fetch_same_symbol_blocks(self, n_matches: int) -> List[str]:
-        """Format the most recent N completed analyses for this expert+symbol."""
+        """Format the most recent N completed analyses for this expert+symbol,
+        limited to the configured lookback window."""
         from sqlmodel import select, Session
         from ba2_trade_platform.core.db import get_db
         from ba2_trade_platform.core.models import (
@@ -154,13 +172,16 @@ class FinancialSituationMemory:
         from ba2_trade_platform.core.types import MarketAnalysisStatus
 
         blocks: List[str] = []
+        cutoff = datetime.now(timezone.utc) - timedelta(days=self.lookback_days)
         with Session(get_db().bind) as session:
-            # Pull recent completed analyses (excluding the current one)
+            # Pull recent completed analyses (excluding the current one),
+            # restricted to the configured lookback window.
             stmt = (
                 select(MarketAnalysis)
                 .where(MarketAnalysis.expert_instance_id == self.expert_instance_id)
                 .where(MarketAnalysis.symbol == self.symbol)
                 .where(MarketAnalysis.status == MarketAnalysisStatus.COMPLETED)
+                .where(MarketAnalysis.created_at >= cutoff)
             )
             if self.market_analysis_id is not None:
                 stmt = stmt.where(MarketAnalysis.id != self.market_analysis_id)
@@ -187,13 +208,14 @@ class FinancialSituationMemory:
         return blocks
 
     def _fetch_cross_ticker_summary(self) -> str:
-        """Recent closed trades from the same expert across other tickers."""
+        """Recent closed trades from the same expert across other tickers,
+        within the configured lookback window."""
         from sqlmodel import select, Session
         from ba2_trade_platform.core.db import get_db
         from ba2_trade_platform.core.models import Transaction
         from ba2_trade_platform.core.types import TransactionStatus, OrderDirection
 
-        cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=self.lookback_days)
         with Session(get_db().bind) as session:
             stmt = (
                 select(Transaction)
@@ -228,7 +250,7 @@ class FinancialSituationMemory:
         wins_sorted = sorted(wins, key=lambda s: -float(s.split()[1].rstrip('%')))[:5]
         losses_sorted = sorted(losses, key=lambda s: float(s.split()[1].rstrip('%')))[:5]
 
-        lines = ["=== Recent cross-ticker outcomes (this expert, last 30 days) ==="]
+        lines = [f"=== Recent cross-ticker outcomes (this expert, last {self.lookback_days} days) ==="]
         if wins_sorted:
             lines.append("Wins:   " + ", ".join(wins_sorted))
         if losses_sorted:
