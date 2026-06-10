@@ -174,3 +174,30 @@ class TestGetLatestRecommendationIdForSymbol:
         create_recommendation(instance_id=ei.id, symbol="BRUN")
 
         assert get_latest_recommendation_id_for_symbol("BRUN", expert_instance_ids=[]) is None
+
+
+class TestGetAccountIdForRecommendation:
+    """Tests for resolving the owning account of a recommendation.
+
+    A manually-placed order must submit to the account that owns the
+    recommending expert (recommendation -> ExpertInstance -> account_id), not
+    just the first configured account.
+    """
+
+    def test_returns_none_for_missing_recommendation(self):
+        from ba2_trade_platform.core.utils import get_account_id_for_recommendation
+        assert get_account_id_for_recommendation(999999) is None
+
+    def test_returns_none_for_none_id(self):
+        from ba2_trade_platform.core.utils import get_account_id_for_recommendation
+        assert get_account_id_for_recommendation(None) is None
+
+    def test_returns_account_of_recommending_expert(self):
+        from ba2_trade_platform.core.utils import get_account_id_for_recommendation
+        acct_a = create_account_definition(name="Account A")
+        acct_b = create_account_definition(name="Account B")
+        # Expert lives on account B, not the first-created account A
+        ei = create_expert_instance(account_id=acct_b.id)
+        rec = create_recommendation(instance_id=ei.id, symbol="BRUN")
+
+        assert get_account_id_for_recommendation(rec.id) == acct_b.id

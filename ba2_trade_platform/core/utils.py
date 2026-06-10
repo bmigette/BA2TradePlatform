@@ -286,6 +286,34 @@ def get_latest_recommendation_id_for_symbol(symbol: str,
         return None
 
 
+def get_account_id_for_recommendation(recommendation_id: Optional[int]) -> Optional[int]:
+    """Return the account id that owns the expert behind a recommendation.
+
+    Resolves ``ExpertRecommendation.instance_id`` -> ``ExpertInstance.account_id``
+    so a manually-placed order can be submitted to the recommending expert's own
+    account rather than defaulting to the first configured account.
+
+    Args:
+        recommendation_id: The recommendation id, or None.
+
+    Returns:
+        Optional[int]: The owning account id, or None if it can't be resolved.
+    """
+    if recommendation_id is None:
+        return None
+    try:
+        recommendation = get_instance(ExpertRecommendation, recommendation_id)
+        if not recommendation or recommendation.instance_id is None:
+            return None
+        expert_instance = get_instance(ExpertInstance, recommendation.instance_id)
+        if not expert_instance:
+            return None
+        return expert_instance.account_id
+    except Exception as e:
+        logger.error(f"Error resolving account for recommendation {recommendation_id}: {e}", exc_info=True)
+        return None
+
+
 def get_account_instance_from_id(account_id: int, session=None, use_cache: bool = True):
     """
     Get an account instance with the appropriate class instantiated from the database.

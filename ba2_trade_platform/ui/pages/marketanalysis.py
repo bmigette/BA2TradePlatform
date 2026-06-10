@@ -4305,14 +4305,25 @@ class OrderRecommendationsTab:
     def _place_order(self, symbol, side, quantity, order_type, limit_price, dialog, recommendation_id=None):
         """Place an order."""
         try:
-            # Get the first available account for order submission
             accounts = get_all_instances(AccountDefinition)
             if not accounts:
                 ui.notify('No trading accounts configured', type='negative')
                 return
-                
-            account = accounts[0]  # Use first available account
-            
+
+            # Resolve the target account in priority order:
+            #   1. The recommendation's own expert account (correct broker for the trade)
+            #   2. The globally selected account filter (if a specific one is chosen)
+            #   3. The first configured account (legacy fallback for single-account setups)
+            from ...core.utils import get_account_id_for_recommendation
+            account = None
+            account_id = get_account_id_for_recommendation(recommendation_id)
+            if account_id is None:
+                account_id = get_selected_account_id()
+            if account_id is not None:
+                account = get_instance(AccountDefinition, account_id)
+            if account is None:
+                account = accounts[0]
+
             # Create order object with account_id
             # Convert side to uppercase to match OrderDirection enum
             side_upper = side.upper() if isinstance(side, str) else side
