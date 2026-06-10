@@ -174,6 +174,17 @@ class ExtendableSettingsInterface(ABC):
                 setting = setting_model(**{lk_field: self.id, "key": key, "value_json": json_value})
                 add_instance(setting, session)
                 
+        elif value_type == "int":
+            # No dedicated value_int column: store in value_float and clear any
+            # legacy value_str so future reads don't fall back to the string.
+            if setting:
+                setting.value_float = float(int(value))
+                setting.value_str = None
+                update_instance(setting, session)
+            else:
+                setting = setting_model(**{lk_field: self.id, "key": key, "value_float": float(int(value))})
+                add_instance(setting, session)
+
         elif value_type == "float":
             if setting:
                 setting.value_float = float(value)
@@ -346,6 +357,18 @@ class ExtendableSettingsInterface(ABC):
                     except Exception as e:
                         logger.warning(f"Failed to parse boolean setting '{setting.key}': {e}, defaulting to False")
                         settings[setting.key] = False
+                elif value_type == "int":
+                    if setting.value_float is not None:
+                        settings[setting.key] = int(setting.value_float)
+                    elif setting.value_str is not None and setting.value_str != "None":
+                        # Legacy rows saved before "int" was stored in value_float
+                        try:
+                            settings[setting.key] = int(setting.value_str)
+                        except ValueError:
+                            logger.warning(f"Could not parse int setting '{setting.key}' from value_str={setting.value_str!r}")
+                            settings[setting.key] = None
+                    else:
+                        settings[setting.key] = None
                 elif value_type == "float":
                     settings[setting.key] = setting.value_float
                 else:
