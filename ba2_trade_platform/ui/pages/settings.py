@@ -4645,7 +4645,7 @@ class TradeSettingsTab:
     def _add_trigger_row(self, trigger_key=None, trigger_config=None):
         """Add a trigger configuration row."""
         if not hasattr(self, 'triggers_container') or self.triggers_container is None:
-            logger.error("Triggers container not initialized", exc_info=True)
+            logger.error("Triggers container not initialized")
             return
             
         trigger_id = trigger_key or f"trigger_{len(self.triggers)}"
@@ -4732,7 +4732,7 @@ class TradeSettingsTab:
     def _add_action_row(self, action_key=None, action_config=None):
         """Add an action configuration row."""
         if not hasattr(self, 'actions_container') or self.actions_container is None:
-            logger.error("Actions container not initialized", exc_info=True)
+            logger.error("Actions container not initialized")
             return
             
         action_id = action_key or f"action_{len(self.actions)}"

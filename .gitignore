@@ -148,3 +148,11 @@ cython_debug/
 
 # Git worktrees
 .worktrees/
+# macOS
+.DS_Store
+
+# Dead/backup source files must not be committed (use git history instead)
+*.old.py
+
+# Vendored TradingAgents framework runtime output (sample analyses)
+ba2_trade_platform/thirdparties/TradingAgents/results/

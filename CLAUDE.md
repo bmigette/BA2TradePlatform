@@ -44,9 +44,15 @@ python migrate.py current                          # Check current revision
 .venv\Scripts\python.exe -m pytest -x            # Stop on first failure
 .venv\Scripts\python.exe -m pytest -k "test_name" # Run specific test
 
-# Legacy test files
+# Ad-hoc / one-off scripts (NOT collected by pytest)
 .venv\Scripts\python.exe test_files/test_name.py
 ```
+
+**`tests/` vs `test_files/`:** `tests/` is the pytest suite (the only thing
+`pytest` collects — see `pytest.ini` `testpaths = tests`). `test_files/` holds
+ad-hoc investigation/probe scripts and `__main__`-style harnesses that pytest does
+NOT run. When a script under `test_files/` becomes a durable regression test, port it
+into `tests/` (as `test_*.py`) so it runs in CI; keep throwaway probes out of `tests/`.
 
 ### PyTorch / Transformers
 PyTorch is a transitive dependency (via `transformers` used by `langchain_core`). On Windows, use the **CPU-only** build to avoid CUDA DLL issues:

@@ -102,14 +102,14 @@ class TradeRiskManagement:
             expert = get_expert_instance_from_id(expert_instance_id)
             if not expert:
                 error_msg = f"Expert instance {expert_instance_id} not found"
-                self.logger.error(error_msg, exc_info=True)
+                self.logger.error(error_msg)
                 raise ValueError(error_msg)
             
             # Get the expert instance model
             expert_instance = get_instance(ExpertInstance, expert_instance_id)
             if not expert_instance:
                 error_msg = f"Expert instance model {expert_instance_id} not found"
-                self.logger.error(error_msg, exc_info=True)
+                self.logger.error(error_msg)
                 raise ValueError(error_msg)
             
             # Check if automated trade opening is enabled
@@ -183,7 +183,7 @@ class TradeRiskManagement:
             available_balance = expert.get_available_balance()
             if available_balance is None:
                 error_msg = f"Could not get available balance for expert {expert_instance_id}"
-                self.logger.error(error_msg, exc_info=True)
+                self.logger.error(error_msg)
                 raise RuntimeError(error_msg)
             
             # Use available balance for calculations
@@ -199,7 +199,7 @@ class TradeRiskManagement:
             account = get_account_instance_from_id(expert_instance.account_id)
             if not account:
                 error_msg = f"Account {expert_instance.account_id} not found for expert {expert_instance_id}"
-                self.logger.error(error_msg, exc_info=True)
+                self.logger.error(error_msg)
                 raise ValueError(error_msg)
             
             # Step 7: Get existing positions to account for current allocations
