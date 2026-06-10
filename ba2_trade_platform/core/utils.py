@@ -248,6 +248,72 @@ def has_existing_transactions_for_expert_and_symbol(expert_instance_id: int, sym
         return False
 
 
+def get_latest_recommendation_id_for_symbol(symbol: str,
+                                            expert_instance_ids: Optional[List[int]] = None) -> Optional[int]:
+    """Return the id of the most recent ExpertRecommendation for a symbol.
+
+    Used by the per-symbol "Place Order" action so a manually-created order can be
+    linked back to an expert. The order stores this id in
+    ``TradingOrder.expert_recommendation_id``; ``_create_transaction_for_order``
+    then resolves ``Transaction.expert_id`` from ``ExpertRecommendation.instance_id``.
+
+    Recency is by ``ExpertRecommendation.id`` (monotonic), matching how the Trade
+    Recommendations summary picks each symbol's latest row.
+
+    Args:
+        symbol: The instrument symbol to look up.
+        expert_instance_ids: Optional scope of expert instance ids. ``None`` means
+            no expert restriction (overall latest). An explicit empty list means
+            "no experts in scope" and yields ``None`` (no match).
+
+    Returns:
+        Optional[int]: The latest recommendation id, or None if none match.
+    """
+    if expert_instance_ids is not None and not expert_instance_ids:
+        return None
+    try:
+        with get_db() as session:
+            statement = (
+                select(ExpertRecommendation.id)
+                .where(ExpertRecommendation.symbol == symbol)
+            )
+            if expert_instance_ids is not None:
+                statement = statement.where(ExpertRecommendation.instance_id.in_(expert_instance_ids))
+            statement = statement.order_by(ExpertRecommendation.id.desc()).limit(1)
+            return session.exec(statement).first()
+    except Exception as e:
+        logger.error(f"Error resolving latest recommendation for symbol {symbol}: {e}", exc_info=True)
+        return None
+
+
+def get_account_id_for_recommendation(recommendation_id: Optional[int]) -> Optional[int]:
+    """Return the account id that owns the expert behind a recommendation.
+
+    Resolves ``ExpertRecommendation.instance_id`` -> ``ExpertInstance.account_id``
+    so a manually-placed order can be submitted to the recommending expert's own
+    account rather than defaulting to the first configured account.
+
+    Args:
+        recommendation_id: The recommendation id, or None.
+
+    Returns:
+        Optional[int]: The owning account id, or None if it can't be resolved.
+    """
+    if recommendation_id is None:
+        return None
+    try:
+        recommendation = get_instance(ExpertRecommendation, recommendation_id)
+        if not recommendation or recommendation.instance_id is None:
+            return None
+        expert_instance = get_instance(ExpertInstance, recommendation.instance_id)
+        if not expert_instance:
+            return None
+        return expert_instance.account_id
+    except Exception as e:
+        logger.error(f"Error resolving account for recommendation {recommendation_id}: {e}", exc_info=True)
+        return None
+
+
 def get_account_instance_from_id(account_id: int, session=None, use_cache: bool = True):
     """
     Get an account instance with the appropriate class instantiated from the database.

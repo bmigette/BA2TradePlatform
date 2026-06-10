@@ -771,10 +771,6 @@ class AccountInterface(ReadOnlyAccountInterface):
             if not expert_interface:
                 return errors
             
-            available_balance = expert_interface.get_available_balance()
-            if available_balance is None:
-                return errors
-            
             # Check if adding to existing position
             is_adding_to_position = False
             entry_order = self._get_transaction_entry_order(transaction.id)
@@ -782,6 +778,13 @@ class AccountInterface(ReadOnlyAccountInterface):
                 is_adding_to_position = True
 
             if not is_adding_to_position:
+                # New position - exclude this order's own WAITING transaction from used
+                # balance, since it was already persisted before validation runs and
+                # would otherwise be double-counted against itself.
+                available_balance = expert_interface.get_available_balance(exclude_transaction_id=transaction.id)
+                if available_balance is None:
+                    return errors
+
                 # New position - check if order value exceeds available balance
                 order_value = current_price * trading_order.quantity
                 if order_value > available_balance:
@@ -795,6 +798,10 @@ class AccountInterface(ReadOnlyAccountInterface):
                     )
             else:
                 # Adding to position - check if additional value exceeds available balance
+                available_balance = expert_interface.get_available_balance()
+                if available_balance is None:
+                    return errors
+
                 additional_value = trading_order.quantity * current_price
                 if additional_value > available_balance:
                     errors.append(

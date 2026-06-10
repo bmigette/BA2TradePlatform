@@ -289,6 +289,12 @@ class MockExpert(MarketExpertInterface):
                 "required": False,
                 "default": "test_value",
                 "description": "A test setting",
+            },
+            "test_int_setting": {
+                "type": "int",
+                "required": False,
+                "default": 24,
+                "description": "A test integer setting",
             }
         }
 
@@ -312,6 +318,9 @@ class MockExpert(MarketExpertInterface):
 
     def get_enabled_instruments(self):
         return ["AAPL", "MSFT"]
+
+    def render_market_analysis(self, market_analysis):
+        return "Mock market analysis"
 
 
 # ---------------------------------------------------------------------------
