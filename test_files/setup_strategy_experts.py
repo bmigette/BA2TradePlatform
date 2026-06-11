@@ -30,12 +30,16 @@ RULE = ExpertEventRuleType.TRADING_RECOMMENDATION_RULE
 WEEKDAYS = {"monday": True, "tuesday": True, "wednesday": True, "thursday": True,
             "friday": True, "saturday": False, "sunday": False}
 
-# Verified cheap-optionable universe (Alpaca chains checked 2026-06-11);
-# every name's 100-share lot fits the ~$2.5k per-instrument cap.
+# Verified cheap-optionable universe (Alpaca chains checked 2026-06-11).
+# Names whose CSP reserve (strike*100) exceeds the wheel's per-action budget
+# are skipped automatically by the sizing check at run time.
 WHEEL_UNIVERSE = ["GRAB", "NXE", "IBRX", "OWL", "MBLY", "NIO", "AUR", "ITUB", "LYG",
                   "ET", "TAK", "SONY", "NOK", "CMCSA", "NU", "SAN", "PBR"]
 
-WHEEL_TEMPLATE_ID = 28   # OPT-CoveredCall: same universe/caps/FMPRating config
+WHEEL_ACCOUNT_ID = 5     # OptionsTest
+# 11 experts on account 5 at 9% each = 99% — never allocate beyond 100%.
+WHEEL_EQUITY_PCT = 9.0
+WHEEL_TEMPLATE_ID = 28   # OPT-CoveredCall: cloned FMPRating config (caps overridden)
 
 
 def _triggers(*specs):
@@ -170,7 +174,7 @@ def setup_wheel():
                                 AnalysisUseCase.OPEN_POSITIONS, manage_rules)
 
     instance_id = add_instance(ExpertInstance(
-        alias=alias, enabled=True, account_id=5, virtual_equity_pct=10.0,
+        alias=alias, enabled=True, account_id=WHEEL_ACCOUNT_ID, virtual_equity_pct=WHEEL_EQUITY_PCT,
         expert="FMPRating",
         user_description="Wheel: sell cash-secured puts; if assigned, write covered calls until called away",
         enter_market_ruleset_id=entry_id, open_positions_ruleset_id=manage_id,

@@ -43,7 +43,7 @@ from ba2_trade_platform.core.types import (
 
 ACCOUNT_ID = 5                  # OptionsTest Alpaca paper account
 TEMPLATE_EXPERT_ID = 5          # FMP-nas30-cons-hc (Nasdaq-30, consensus target)
-EQUITY_PCT = 10.0               # virtual equity per expert
+EQUITY_PCT = 9.0                # virtual equity per expert (10 strategies + OPT-Wheel = 99%, never >100%)
 ALIAS_PREFIX = "OPT-"
 RULESET_PREFIX = "OPT:"
 RULE = ExpertEventRuleType.TRADING_RECOMMENDATION_RULE
