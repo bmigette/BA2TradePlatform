@@ -186,12 +186,13 @@ class TradeAction(ABC):
             logger.debug(f"Could not copy data from expert recommendation {expert_recommendation_id}: {e}")
             return None
     
-    def create_order_record(self, side: str, quantity: float, order_type: str = "market", 
+    def create_order_record(self, side: str, quantity: float, order_type: str = "market",
                           limit_price: Optional[float] = None, stop_price: Optional[float] = None,
-                          linked_order_id: Optional[int] = None) -> Optional[TradingOrder]:
+                          linked_order_id: Optional[int] = None,
+                          extra_data: Optional[Dict[str, Any]] = None) -> Optional[TradingOrder]:
         """
         Create a TradingOrder database record.
-        
+
         Args:
             side: Order side ("buy" or "sell", case-insensitive)
             quantity: Order quantity
@@ -199,7 +200,9 @@ class TradeAction(ABC):
             limit_price: Limit price for limit orders
             stop_price: Stop price for stop orders
             linked_order_id: ID of linked order (for TP/SL orders)
-            
+            extra_data: Optional keys merged into order.data (e.g. {"lot_size": 100}
+                so the risk manager sizes the order in round lots)
+
         Returns:
             TradingOrder instance or None if creation failed
         """
@@ -245,6 +248,10 @@ class TradeAction(ABC):
                 # Manual order
                 open_type = OrderOpenType.MANUAL
             
+            order_data = self._build_order_data(expert_recommendation_id)  # Copy expert recommendation data
+            if extra_data:
+                order_data = {**(order_data or {}), **extra_data}
+
             order = TradingOrder(
                 account_id=self.account.id,
                 symbol=self.instrument_name,
@@ -259,7 +266,7 @@ class TradeAction(ABC):
                 open_type=open_type,
                 comment=comment,
                 created_at=datetime.now(timezone.utc),
-                data=self._build_order_data(expert_recommendation_id)  # Copy expert recommendation data
+                data=order_data
             )
             
             order_id = add_instance(order)
@@ -407,7 +414,18 @@ class SellAction(TradeAction):
 
 class BuyAction(TradeAction):
     """Create a pending buy order for risk management review."""
-    
+
+    def __init__(self, instrument_name: str, account: AccountInterface,
+                 order_recommendation: OrderRecommendation, existing_order: Optional[TradingOrder] = None,
+                 expert_recommendation: Optional[ExpertRecommendation] = None,
+                 lot_size: Optional[int] = None):
+        super().__init__(instrument_name, account, order_recommendation, existing_order, expert_recommendation)
+        # Optional round-lot constraint: the risk manager sizes the order in
+        # multiples of lot_size and rejects it when not even one lot is fundable.
+        # Used by option-overlay strategies (covered call / protective put) that
+        # need 100-share equity blocks per contract.
+        self.lot_size = lot_size
+
     def execute(self, quantity: Optional[float] = None) -> "TradeActionResult":
         """
         Create a pending buy order for the instrument.
@@ -441,7 +459,8 @@ class BuyAction(TradeAction):
             order_id = self.create_order_record(
                 side="buy",
                 quantity=quantity,
-                order_type="market"
+                order_type="market",
+                extra_data={"lot_size": int(self.lot_size)} if self.lot_size else None
             )
             
             if not order_id:
@@ -1889,8 +1908,9 @@ class SellCoveredCallAction(_OptionEntryAction):
         quantity = int(math.floor(held / 100.0)) if held > 0 else 0
         if quantity < 1:
             return self._result(False,
-                                f"No held equity long to cover a call on {self.instrument_name} "
-                                f"(shares={held})")
+                                f"Held equity below one contract lot for covered call on {self.instrument_name} "
+                                f"(shares={held}, 100 required per contract) - size the equity BUY with "
+                                f"lot_size=100 or pick a cheaper underlying")
         chain = self._chain(self.OPTION_TYPE)
         if not chain:
             return self._result(False, f"Empty option chain for {self.instrument_name}")
@@ -1927,8 +1947,9 @@ class BuyProtectivePutAction(_OptionEntryAction):
         quantity = int(math.floor(held / 100.0)) if held > 0 else 0
         if quantity < 1:
             return self._result(False,
-                                f"No held equity long to protect with a put on {self.instrument_name} "
-                                f"(shares={held})")
+                                f"Held equity below one contract lot for protective put on {self.instrument_name} "
+                                f"(shares={held}, 100 required per contract) - size the equity BUY with "
+                                f"lot_size=100 or pick a cheaper underlying")
         chain = self._chain(self.OPTION_TYPE)
         if not chain:
             return self._result(False, f"Empty option chain for {self.instrument_name}")
@@ -2219,6 +2240,57 @@ class OpenStrangleAction(_OptionEntryAction):
         return f"Open long strangle on {self.instrument_name}"
 
 
+def build_closing_legs(children, parent_quantity: int, quote_fn) -> "tuple[List[OptionLeg], Optional[float]]":
+    """Build reversed legs (and a net limit price) that close a spread's child legs.
+
+    Pure given ``quote_fn`` so it is unit-testable.
+
+    Sign convention matches submit_option_order: net limit >= 0 is a debit (net
+    BUY), negative is a credit (net SELL). Each closing leg contributes +ask when
+    buying back a short leg and -bid when selling a long leg. Returns
+    ``(legs, None)`` when any required quote is missing so the caller can pick a
+    fallback price.
+
+    Args:
+        children: child TradingOrder rows of the spread parent (contract_symbol set).
+        parent_quantity: the parent order quantity (children's ratio is derived from it).
+        quote_fn: ``contract_symbol -> OptionQuote | None``.
+    """
+    legs: List[OptionLeg] = []
+    net: float = 0.0
+    quotes_ok = True
+    for child in children:
+        close_side = OrderDirection.SELL if child.side == OrderDirection.BUY else OrderDirection.BUY
+        intent = "sell_to_close" if child.side == OrderDirection.BUY else "buy_to_close"
+        ratio = 1
+        if child.quantity and parent_quantity:
+            ratio = max(1, int(round(abs(child.quantity) / parent_quantity)))
+        legs.append(OptionLeg(
+            contract_symbol=child.contract_symbol,
+            side=close_side,
+            ratio_qty=ratio,
+            position_intent=intent,
+            option_type=child.option_type,
+            strike=child.strike,
+            expiry=child.expiry,
+            underlying=child.underlying_symbol or child.symbol,
+        ))
+        quote = quote_fn(child.contract_symbol)
+        if close_side == OrderDirection.BUY:
+            # Buying back a short leg: pay the ask.
+            if quote is None or quote.ask is None:
+                quotes_ok = False
+            else:
+                net += quote.ask * ratio
+        else:
+            # Selling a long leg: receive the bid.
+            if quote is None or quote.bid is None:
+                quotes_ok = False
+            else:
+                net -= quote.bid * ratio
+    return legs, (round(net, 4) if quotes_ok else None)
+
+
 class CloseOptionAction(TradeAction):
     """Close an existing option position via account.close_option_position()."""
 
@@ -2234,6 +2306,13 @@ class CloseOptionAction(TradeAction):
                 return self.create_and_save_action_result(
                     action_type=ExpertActionType.CLOSE_OPTION.value, success=False,
                     message=f"No open option position to close for {self.instrument_name}", data={})
+
+            # Multi-leg (spread) positions: the parent order intentionally has no
+            # contract_symbol — closing it as a single leg would submit
+            # LimitOrderRequest(symbol=None), which the broker rejects. Reverse the
+            # child legs and submit one multi-leg closing order instead.
+            if order.contract_symbol is None:
+                return self._close_multi_leg(order)
 
             quantity = order.filled_qty or order.quantity
             avg_entry = order.open_price if order.open_price is not None else order.limit_price
@@ -2313,6 +2392,71 @@ class CloseOptionAction(TradeAction):
             if quote is not None and quote.ask is not None:
                 return quote.ask
         return order.open_price if order.open_price is not None else order.limit_price
+
+    def _close_multi_leg(self, order: TradingOrder) -> "TradeActionResult":
+        """Close a spread position by reversing its child leg orders as one
+        multi-leg order. The parent order carries the strategy/transaction; the
+        legs carry the contract symbols."""
+        from sqlmodel import select, Session
+        with Session(get_db().bind) as session:
+            children = session.exec(
+                select(TradingOrder).where(
+                    TradingOrder.parent_order_id == order.id,
+                    TradingOrder.contract_symbol.is_not(None),
+                )
+            ).all()
+            session.expunge_all()
+
+        if not children:
+            return self.create_and_save_action_result(
+                action_type=ExpertActionType.CLOSE_OPTION.value, success=False,
+                message=f"Spread parent order {order.id} for {self.instrument_name} has no "
+                        f"leg orders with contract symbols - cannot build closing order", data={})
+
+        quantity = int(order.filled_qty or order.quantity or 0)
+        if quantity < 1:
+            return self.create_and_save_action_result(
+                action_type=ExpertActionType.CLOSE_OPTION.value, success=False,
+                message=f"Spread parent order {order.id} for {self.instrument_name} has no quantity to close",
+                data={})
+
+        legs, net_limit = build_closing_legs(
+            children, parent_quantity=quantity, quote_fn=self._safe_option_quote)
+        if net_limit is None:
+            # No usable quotes for one or more legs: close at the negated entry
+            # premium (entry debit -> closing credit and vice versa) as a neutral
+            # fallback rather than refusing to close.
+            entry = order.open_price if order.open_price is not None else order.limit_price
+            net_limit = -entry if entry is not None else None
+
+        contract_syms = [l.contract_symbol for l in legs]
+        if not self.submit_to_broker:
+            logger.info(f"CloseOptionAction: submit disabled for spread {contract_syms} "
+                        f"- recording informational result")
+            return self.create_and_save_action_result(
+                action_type=ExpertActionType.CLOSE_OPTION.value, success=True,
+                message=f"Close spread deferred for {self.instrument_name} (manual review, not submitted)",
+                data={"contract_symbols": contract_syms, "limit_price": net_limit, "status": "PENDING"})
+
+        result = self.account.submit_option_order(
+            legs, quantity, order_type="limit", limit_price=net_limit,
+            option_strategy="close", transaction_id=order.transaction_id)
+        if result is None:
+            return self.create_and_save_action_result(
+                action_type=ExpertActionType.CLOSE_OPTION.value, success=False,
+                message=f"Failed to close spread position for {self.instrument_name} ({contract_syms})",
+                data={"contract_symbols": contract_syms})
+        return self.create_and_save_action_result(
+            action_type=ExpertActionType.CLOSE_OPTION.value, success=True,
+            message=f"Submitted multi-leg close for {self.instrument_name} ({contract_syms})",
+            data={"contract_symbols": contract_syms, "limit_price": net_limit})
+
+    def _safe_option_quote(self, contract_symbol: str):
+        try:
+            return self.account.get_option_quote(contract_symbol)
+        except Exception as e:
+            logger.debug(f"get_option_quote failed for {contract_symbol}: {e}")
+            return None
 
     def get_description(self) -> str:
         return f"Close option position for {self.instrument_name}"

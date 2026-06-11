@@ -931,8 +931,13 @@ class TradeActionEvaluator:
         try:
             # Extract additional parameters for specific action types
             kwargs = {}
-            
-            if action_type == ExpertActionType.ADJUST_TAKE_PROFIT:
+
+            if action_type == ExpertActionType.BUY:
+                # Optional round-lot sizing (e.g. lot_size=100 for option-overlay
+                # strategies whose contracts cover 100 shares each).
+                if 'lot_size' in action_config and action_config.get('lot_size'):
+                    kwargs['lot_size'] = action_config.get('lot_size')
+            elif action_type == ExpertActionType.ADJUST_TAKE_PROFIT:
                 # Extract reference_value and percent (value) for TP calculation
                 kwargs['reference_value'] = action_config.get('reference_value')
                 kwargs['percent'] = action_config.get('value')  # 'value' in config is the percentage

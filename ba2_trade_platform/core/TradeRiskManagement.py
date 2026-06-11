@@ -62,6 +62,28 @@ def estimate_transaction_allocation(quantity: float | None,
     return abs(quantity * price)
 
 
+def apply_lot_size(order_data: dict, quantity: int) -> int | None:
+    """Round a computed quantity DOWN to the order's round-lot multiple. Pure function.
+
+    Orders may carry ``data["lot_size"]`` (e.g. 100 for equity legs of covered
+    calls / protective puts — one option contract covers 100 shares). Sizing
+    such an order to a partial lot produces a position the option overlay can
+    never use, so anything below one lot becomes 0 (order is then deleted as
+    unfunded by the caller).
+
+    Returns:
+        The lot-rounded quantity, or None when no valid lot constraint is set
+        (caller keeps the original quantity).
+    """
+    try:
+        lot = int(order_data.get("lot_size") or 0)
+    except (TypeError, ValueError):
+        return None
+    if lot <= 1:
+        return None
+    return (int(quantity) // lot) * lot
+
+
 class TradeRiskManagement:
     """
     Risk management system for automated trading orders.
@@ -627,9 +649,21 @@ class TradeRiskManagement:
                         else:
                             self.logger.info(f"  Final after weighting: {quantity} shares (cost ${weighted_cost:.2f})")
                 
+                # Round-lot constraint (e.g. lot_size=100 for option-overlay
+                # strategies): size in whole lots; below one lot the order is
+                # unfundable and gets quantity 0 (deleted as unfunded) instead of
+                # buying a useless partial lot.
+                lot_size = apply_lot_size((order.data or {}), quantity)
+                if lot_size is not None and lot_size != quantity:
+                    self.logger.info(
+                        f"  Lot sizing: {quantity} -> {lot_size} shares "
+                        f"(lot_size={(order.data or {}).get('lot_size')})"
+                    )
+                    quantity = lot_size
+
                 # Update order with calculated quantity
                 order.quantity = quantity
-                
+
                 if quantity > 0:
                     total_cost = quantity * current_price
                     remaining_balance -= total_cost
