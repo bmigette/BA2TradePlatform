@@ -1,13 +1,44 @@
 # Comprehensive Platform Review — 2026-06-10
 
 Scope: expert strategies, agent prompts, risk managers (smart + classic), code quality/optimization.
-This document **defines required changes only** — no changes have been implemented. Each item has an ID,
-a severity, the files involved, and a description precise enough to implement in a separate session.
+This document defines the required changes. Each item has an ID, a severity, the files involved, and a
+description precise enough to implement in a separate session.
 
 Severity legend:
 - **P1 — Bug / correctness**: wrong behavior today, fix first.
 - **P2 — Strategy / prompt quality**: affects trading decisions or LLM output quality.
 - **P3 — Code quality / optimization**: maintainability, performance, hygiene.
+
+---
+
+## ✅ Implementation status — ALL 27 ITEMS COMPLETED (2026-06-11)
+
+Implemented across `review-fixes-2026-06-10` (Opus 4.8 sessions 1–8, merged in `afd3f32`) plus two
+follow-up commits from the reviewing session (`a8bc9ba`, `cc84f9d`). Test suite grew from 723 to 777
+passing tests. See `COMPREHENSIVE_REVIEW_2026-06-10.triage.md` for the adversarial-verification
+corrections applied to this doc's claims (notably: the PR-1 "ERROR rows" symptom was latent, not live;
+RM-4 was an edge case, not systematic; RM-8's real count was 21 sites outside except blocks).
+
+| Items | Where implemented |
+|---|---|
+| PR-1, PR-2, EX-1, EX-5, EX-6, RM-1..RM-5, CQ-6 | `4242b74` (sessions 1–3) + `7f8ea89` (diversification factor defaults to 1.0 = off) |
+| PR-3, PR-5 | `f41e40f` |
+| PR-4, PR-6, PR-7, PR-8 | `0b775c9` (session 4) |
+| RM-6, RM-7, CQ-4 (functional) | `ed7f39f` (session 5) — prompts split into `core/SmartRiskManagerPrompts.py` |
+| EX-2 (amount-parser dedup + bug fixes) | `ea36c34` (session 6) — shared `parse_fmp_amount_range` in `core/utils.py` |
+| EX-3, EX-4 (settings extraction) | `03d01d9` (session 7) |
+| CQ-1, CQ-2, CQ-5, RM-8 | `5bcdf08` (session 8) |
+| CQ-4 (cosmetic dedent), RM-8 leftover artifacts | `a8bc9ba` (review pass) |
+| EX-2/CQ-3 (full mixin extraction: `modules/experts/expert_mixins.py`), EX-4 (full split: `screening.py`/`monitoring.py`/`data_gathering.py`) | `cc84f9d` (review pass) |
+
+Notable deviations from the letter of this doc (all justified, see triage doc):
+- **EX-2**: instead of one `FMPCongressTradingBase` class, the dedup landed as composable mixins
+  (`AnalysisStatusRenderMixin`, `FMPApiKeyMixin`, `FMPCongressTradingMixin`) so FMPRating/FinnHubRating
+  could share the render scaffolding (CQ-3) without inheriting congress-trading code.
+- **RM-5**: the hardcoded 0.7 diversification factor became a per-expert setting defaulting to **1.0
+  (off)** rather than 0.7, so the per-instrument cap governs diversification unless explicitly lowered.
+- **EX-4**: methods were moved verbatim into mixins composed by `PennyMomentumTrader` (no
+  delegation layer); `__init__.py` went from 3,531 to 607 lines.
 
 ---
 
