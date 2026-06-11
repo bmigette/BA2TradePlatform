@@ -4,6 +4,7 @@ import json
 import requests
 
 from ...core.interfaces import MarketExpertInterface
+from .expert_mixins import AnalysisStatusRenderMixin
 from ...core.models import MarketAnalysis, AnalysisOutput, ExpertRecommendation
 from ...core.db import get_db, update_instance, add_instance, get_setting
 from ...core.types import MarketAnalysisStatus, OrderRecommendation, RiskLevel, TimeHorizon
@@ -54,7 +55,7 @@ def consensus_from_counts(counts: Dict[str, Any], thresholds: Optional[Dict[str,
     return {"signal": signal, "confidence": confidence, "mean": mean, "total": total}
 
 
-class FinnHubRating(MarketExpertInterface):
+class FinnHubRating(AnalysisStatusRenderMixin, MarketExpertInterface):
     """
     FinnHubRating Expert Implementation
     
@@ -63,6 +64,9 @@ class FinnHubRating(MarketExpertInterface):
     from the buy/sell ratio weighted by strong factor.
     """
     
+    RENDER_PENDING_MESSAGE = 'FinnHubRating analysis for {symbol} is queued'
+    RENDER_RUNNING_MESSAGE = 'Fetching analyst recommendations for {symbol}...'
+
     @classmethod
     def description(cls) -> str:
         return "Finnhub analyst recommendation trends with weighted confidence scoring"
@@ -432,82 +436,6 @@ Confidence (agreement on dominant side): {confidence:.1f}%
                 self.logger.error(f"Failed to store error output: {db_error}", exc_info=True)
             
             raise
-    
-    def render_market_analysis(self, market_analysis: MarketAnalysis) -> None:
-        """
-        Render FinnHubRating market analysis results in the UI.
-        
-        Args:
-            market_analysis: The market analysis instance to render.
-        """
-        from nicegui import ui
-        
-        try:
-            # Handle different analysis states
-            if market_analysis.status == MarketAnalysisStatus.PENDING:
-                self._render_pending(market_analysis)
-            elif market_analysis.status == MarketAnalysisStatus.RUNNING:
-                self._render_running(market_analysis)
-            elif market_analysis.status == MarketAnalysisStatus.FAILED:
-                self._render_failed(market_analysis)
-            elif market_analysis.status == MarketAnalysisStatus.COMPLETED:
-                self._render_completed(market_analysis)
-            elif market_analysis.status == MarketAnalysisStatus.SKIPPED:
-                self._render_skipped(market_analysis)
-            else:
-                with ui.card().classes('w-full p-4'):
-                    ui.label(f"Unknown analysis status: {market_analysis.status}")
-                    
-        except Exception as e:
-            self.logger.error(f"Error rendering market analysis {market_analysis.id}: {e}", exc_info=True)
-            with ui.card().classes('w-full p-8 text-center'):
-                ui.icon('error', size='3rem', color='negative').classes('mb-4')
-                ui.label('Rendering Error').classes('text-h5 text-negative')
-                ui.label(f'Failed to render analysis: {str(e)}').classes('text-grey-7')
-    
-    def _render_pending(self, market_analysis: MarketAnalysis) -> None:
-        """Render pending analysis state."""
-        from nicegui import ui
-        
-        with ui.card().classes('w-full p-8 text-center'):
-            ui.icon('schedule', size='3rem', color='grey').classes('mb-4')
-            ui.label('Analysis Pending').classes('text-h5')
-            ui.label(f'FinnHubRating analysis for {market_analysis.symbol} is queued').classes('text-grey-7')
-    
-    def _render_running(self, market_analysis: MarketAnalysis) -> None:
-        """Render running analysis state."""
-        from nicegui import ui
-        
-        with ui.card().classes('w-full p-8 text-center'):
-            ui.spinner(size='3rem', color='primary').classes('mb-4')
-            ui.label('Analysis Running').classes('text-h5')
-            ui.label(f'Fetching analyst recommendations for {market_analysis.symbol}...').classes('text-grey-7')
-    
-    def _render_failed(self, market_analysis: MarketAnalysis) -> None:
-        """Render failed analysis state."""
-        from nicegui import ui
-        
-        with ui.card().classes('w-full p-4'):
-            with ui.row().classes('items-center mb-4'):
-                ui.icon('error', color='negative', size='2rem')
-                ui.label('Analysis Failed').classes('text-h5 text-negative ml-2')
-            
-            if market_analysis.state and isinstance(market_analysis.state, dict):
-                error_msg = market_analysis.state.get('error', 'Unknown error')
-                ui.label(f'Error: {error_msg}').classes('text-grey-8')
-    
-    def _render_skipped(self, market_analysis: MarketAnalysis) -> None:
-        """Render skipped analysis state."""
-        from nicegui import ui
-        
-        with ui.card().classes('w-full p-4'):
-            with ui.row().classes('items-center mb-4'):
-                ui.icon('skip_next', color='orange', size='2rem')
-                ui.label('Analysis Skipped').classes('text-h5 text-orange ml-2')
-            
-            if market_analysis.state and isinstance(market_analysis.state, dict):
-                skip_reason = market_analysis.state.get('skip_reason', 'Analysis was skipped')
-                ui.label(f'Reason: {skip_reason}').classes('text-grey-8')
     
     def _render_completed(self, market_analysis: MarketAnalysis) -> None:
         """Render completed analysis with beautiful UI."""

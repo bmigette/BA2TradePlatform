@@ -26,9 +26,10 @@ from ...core.db import get_db, get_instance, update_instance, add_instance
 from ...core.types import MarketAnalysisStatus, OrderRecommendation, RiskLevel, TimeHorizon, AnalysisUseCase
 from ...logger import get_expert_logger
 from ...config import get_app_setting
+from .expert_mixins import AnalysisStatusRenderMixin, FMPCongressTradingMixin
 
 
-class FMPSenateTraderCopy(MarketExpertInterface):
+class FMPSenateTraderCopy(AnalysisStatusRenderMixin, FMPCongressTradingMixin, MarketExpertInterface):
     """
     FMPSenateTraderCopy Expert Implementation
     
@@ -43,6 +44,12 @@ class FMPSenateTraderCopy(MarketExpertInterface):
     in a single analysis run.
     """
     
+    RENDER_PENDING_TITLE = 'Copy Trade Analysis Pending'
+    RENDER_PENDING_MESSAGE = 'Searching for followed trader activity on {symbol}...'
+    RENDER_RUNNING_TITLE = 'Copy Trade Analysis Running'
+    RENDER_RUNNING_MESSAGE = 'Fetching trades from followed senators/representatives for {symbol}...'
+    RENDER_FAILED_TITLE = 'Copy Trade Analysis Failed'
+
     @classmethod
     def description(cls) -> str:
         return "Copy trades from specific senators/representatives with 100% confidence"
@@ -72,13 +79,6 @@ class FMPSenateTraderCopy(MarketExpertInterface):
         
         # Initialize expert-specific logger
         self.logger = get_expert_logger("FMPSenateTraderCopy", id)
-    
-    def _get_fmp_api_key(self) -> Optional[str]:
-        """Get FMP API key from app settings."""
-        api_key = get_app_setting('FMP_API_KEY')
-        if not api_key:
-            self.logger.warning("FMP API key not found in app settings")
-        return api_key
     
     @classmethod
     def get_settings_definitions(cls) -> Dict[str, Any]:
@@ -115,108 +115,12 @@ class FMPSenateTraderCopy(MarketExpertInterface):
         }
     
     def _fetch_senate_trades(self, symbol: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
-        """
-        Fetch senate trades from FMP API for a specific symbol or all trades.
-        
-        Args:
-            symbol: Optional stock symbol to query. If None, fetches all trades.
-            
-        Returns:
-            List of trade records or None if error
-        """
-        if not self._api_key:
-            self.logger.error("Cannot fetch senate trades: FMP API key not configured")
-            return None
-        
-        try:
-            # Use different endpoints based on whether symbol is provided
-            if symbol:
-                # Use symbol-specific endpoint
-                url = f"https://financialmodelingprep.com/stable/senate-trades"
-                params = {
-                    "apikey": self._api_key,
-                    "symbol": symbol.upper()
-                }
-                self.logger.debug(f"Fetching FMP senate trades for {symbol}")
-            else:
-                # Use latest disclosures endpoint with pagination for all trades
-                url = f"https://financialmodelingprep.com/stable/senate-latest"
-                params = {
-                    "apikey": self._api_key,
-                    "page": 0,
-                    "limit": 1000  # Maximum allowed per request
-                }
-                self.logger.debug("Fetching all FMP senate trades (latest disclosures)")
-            
-            response = requests.get(url, params=params, timeout=30)
-            response.raise_for_status()
-            
-            data = response.json()
-            symbol_text = f" for {symbol}" if symbol else " (all)"
-            self.logger.debug(f"Received {len(data) if isinstance(data, list) else 0} senate trade records{symbol_text}")
-            
-            return data if isinstance(data, list) else []
-            
-        except requests.exceptions.RequestException as e:
-            symbol_text = f" for {symbol}" if symbol else " (all)"
-            self.logger.error(f"Failed to fetch FMP senate trades{symbol_text}: {e}", exc_info=True)
-            return None
-        except Exception as e:
-            symbol_text = f" for {symbol}" if symbol else " (all)"
-            self.logger.error(f"Unexpected error fetching senate trades{symbol_text}: {e}", exc_info=True)
-            return None
+        """Fetch senate trades for a symbol, or all latest disclosures when symbol is None."""
+        return self._fetch_congress_trades("senate", symbol)
     
     def _fetch_house_trades(self, symbol: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
-        """
-        Fetch house trades from FMP API for a specific symbol or all trades.
-        
-        Args:
-            symbol: Optional stock symbol to query. If None, fetches all trades.
-            
-        Returns:
-            List of trade records or None if error
-        """
-        if not self._api_key:
-            self.logger.error("Cannot fetch house trades: FMP API key not configured")
-            return None
-        
-        try:
-            # Use different endpoints based on whether symbol is provided
-            if symbol:
-                # Use symbol-specific endpoint
-                url = f"https://financialmodelingprep.com/stable/house-trades"
-                params = {
-                    "apikey": self._api_key,
-                    "symbol": symbol.upper()
-                }
-                self.logger.debug(f"Fetching FMP house trades for {symbol}")
-            else:
-                # Use latest disclosures endpoint with pagination for all trades
-                url = f"https://financialmodelingprep.com/stable/house-latest"
-                params = {
-                    "apikey": self._api_key,
-                    "page": 0,
-                    "limit": 1000  # Maximum allowed per request
-                }
-                self.logger.debug("Fetching all FMP house trades (latest disclosures)")
-            
-            response = requests.get(url, params=params, timeout=30)
-            response.raise_for_status()
-            
-            data = response.json()
-            symbol_text = f" for {symbol}" if symbol else " (all)"
-            self.logger.debug(f"Received {len(data) if isinstance(data, list) else 0} house trade records{symbol_text}")
-            
-            return data if isinstance(data, list) else []
-            
-        except requests.exceptions.RequestException as e:
-            symbol_text = f" for {symbol}" if symbol else " (all)"
-            self.logger.error(f"Failed to fetch FMP house trades{symbol_text}: {e}", exc_info=True)
-            return None
-        except Exception as e:
-            symbol_text = f" for {symbol}" if symbol else " (all)"
-            self.logger.error(f"Unexpected error fetching house trades{symbol_text}: {e}", exc_info=True)
-            return None
+        """Fetch house trades for a symbol, or all latest disclosures when symbol is None."""
+        return self._fetch_congress_trades("house", symbol)
     
     def _filter_trades(self, trades: List[Dict[str, Any]], 
                       copy_trade_names: List[str],
@@ -1290,82 +1194,6 @@ Recommendations Generated:"""
             market_analysis.status = MarketAnalysisStatus.FAILED
             update_instance(market_analysis)
             raise
-    
-    def render_market_analysis(self, market_analysis: MarketAnalysis) -> None:
-        """
-        Render FMPSenateTraderCopy market analysis results in the UI.
-        
-        Args:
-            market_analysis: The market analysis instance to render.
-        """
-        from nicegui import ui
-        
-        try:
-            # Handle different analysis states
-            if market_analysis.status == MarketAnalysisStatus.PENDING:
-                self._render_pending(market_analysis)
-            elif market_analysis.status == MarketAnalysisStatus.RUNNING:
-                self._render_running(market_analysis)
-            elif market_analysis.status == MarketAnalysisStatus.FAILED:
-                self._render_failed(market_analysis)
-            elif market_analysis.status == MarketAnalysisStatus.COMPLETED:
-                self._render_completed(market_analysis)
-            elif market_analysis.status == MarketAnalysisStatus.SKIPPED:
-                self._render_skipped(market_analysis)
-            else:
-                with ui.card().classes('w-full p-4'):
-                    ui.label(f"Unknown analysis status: {market_analysis.status}")
-                    
-        except Exception as e:
-            self.logger.error(f"Error rendering market analysis {market_analysis.id}: {e}", exc_info=True)
-            with ui.card().classes('w-full p-8 text-center'):
-                ui.icon('error', size='3rem', color='negative').classes('mb-4')
-                ui.label('Rendering Error').classes('text-h5 text-negative')
-                ui.label(f'Failed to render analysis: {str(e)}').classes('text-grey-7')
-    
-    def _render_pending(self, market_analysis: MarketAnalysis) -> None:
-        """Render pending analysis state."""
-        from nicegui import ui
-        
-        with ui.card().classes('w-full p-8 text-center'):
-            ui.icon('schedule', size='3rem', color='grey').classes('mb-4')
-            ui.label('Copy Trade Analysis Pending').classes('text-h5')
-            ui.label(f'Searching for followed trader activity on {market_analysis.symbol}...').classes('text-grey-7')
-    
-    def _render_running(self, market_analysis: MarketAnalysis) -> None:
-        """Render running analysis state."""
-        from nicegui import ui
-        
-        with ui.card().classes('w-full p-8 text-center'):
-            ui.spinner(size='3rem', color='primary').classes('mb-4')
-            ui.label('Copy Trade Analysis Running').classes('text-h5')
-            ui.label(f'Fetching trades from followed senators/representatives for {market_analysis.symbol}...').classes('text-grey-7')
-    
-    def _render_failed(self, market_analysis: MarketAnalysis) -> None:
-        """Render failed analysis state."""
-        from nicegui import ui
-        
-        with ui.card().classes('w-full p-4'):
-            with ui.row().classes('items-center mb-4'):
-                ui.icon('error', color='negative', size='2rem')
-                ui.label('Copy Trade Analysis Failed').classes('text-h5 text-negative ml-2')
-            
-            if market_analysis.state and isinstance(market_analysis.state, dict):
-                error_msg = market_analysis.state.get('error', 'Unknown error')
-                ui.label(f'Error: {error_msg}').classes('text-grey-8')
-    
-    def _render_skipped(self, market_analysis: MarketAnalysis) -> None:
-        """Render skipped analysis state."""
-        from nicegui import ui
-        
-        with ui.card().classes('w-full p-4'):
-            with ui.row().classes('items-center mb-4'):
-                ui.icon('skip_next', color='orange', size='2rem')
-                ui.label('Analysis Skipped').classes('text-h5 text-orange ml-2')
-            
-            if market_analysis.state and isinstance(market_analysis.state, dict):
-                skip_reason = market_analysis.state.get('skip_reason', 'Analysis was skipped')
-                ui.label(f'Reason: {skip_reason}').classes('text-grey-8')
     
     def _render_completed(self, market_analysis: MarketAnalysis) -> None:
         """Render completed multi-symbol analysis with detailed UI."""

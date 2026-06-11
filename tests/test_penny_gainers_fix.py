@@ -33,7 +33,15 @@ _BASE = os.path.join(
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
+# The expert was split across mixin modules (EX-4). Requesting "__init__.py"
+# returns the assembled class source (mixins + __init__) so source-inspection
+# assertions keep working regardless of which module a method lives in.
+_CLASS_FILES = ("monitoring.py", "screening.py", "data_gathering.py", "__init__.py")
+
+
 def _read_source(filename: str) -> str:
+    if filename == "__init__.py":
+        return "\n".join(open(os.path.join(_BASE, f)).read() for f in _CLASS_FILES)
     return open(os.path.join(_BASE, filename)).read()
 
 
@@ -111,7 +119,10 @@ class TestGainersMarketCapFix:
 
     def test_quote_enrichment_updates_market_cap(self):
         """After fetching live quotes, market_cap should be updated so gainers get their real mcap."""
-        source = _read_source("__init__.py")
+        # The enrichment loop lives in the phase-1 screening module (EX-4 split);
+        # read it directly so the first _fetch_quotes_chunked hit is the right one
+        # (monitoring.py also calls it for single-symbol refreshes).
+        source = _read_source("screening.py")
         # Find the quote enrichment loop (after _fetch_quotes_chunked call)
         idx = source.index("_fetch_quotes_chunked")
         enrich_block = source[idx: idx + 1500]

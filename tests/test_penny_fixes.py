@@ -80,8 +80,16 @@ validate_condition = _conditions_mod.validate_condition
 # Source code reading helpers (for tests that inspect code rather than run it)
 # ---------------------------------------------------------------------------
 
+# The expert was split across mixin modules (EX-4). Requesting "__init__.py"
+# returns the assembled class source (mixins + __init__) so source-inspection
+# assertions keep working regardless of which module a method lives in.
+_CLASS_FILES = ("monitoring.py", "screening.py", "data_gathering.py", "__init__.py")
+
+
 def _read_source(filename: str) -> str:
-    """Read a PennyMomentumTrader source file."""
+    """Read a PennyMomentumTrader source file (assembled class for __init__.py)."""
+    if filename == "__init__.py":
+        return "\n".join(open(os.path.join(_BASE, f)).read() for f in _CLASS_FILES)
     return open(os.path.join(_BASE, filename)).read()
 
 
