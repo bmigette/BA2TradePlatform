@@ -1783,6 +1783,14 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                         updated_count += 1
                         logger.debug(f"Updated database order {db_order.id} with changes from Alpaca order {broker_order_id}")
 
+                        # A cancel that raced a live fill leaves the order CANCELED with
+                        # filled_qty > 0: those shares really traded at the broker, so fold
+                        # them back into the transaction (otherwise the book over-counts the
+                        # position -> "Quantity Mismatch" warning). Idempotent no-op otherwise.
+                        if db_order.status == OrderStatus.CANCELED and (db_order.filled_qty or 0) > 0:
+                            from ba2_trade_platform.core.TransactionHelper import TransactionHelper
+                            TransactionHelper.reconcile_canceled_partial_fill(db_order)
+
                     # Step 3a: Update or insert OCO order legs if this is an OCO order
                     if db_order.order_type == CoreOrderType.OCO:
                         legs_inserted = 0
@@ -1901,8 +1909,17 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                                 fresh_order = get_instance(TradingOrder, db_order.id)
                                 if fresh_order:
                                     fresh_order.status = OrderStatus.CANCELED
+                                    # Copy any partial execution that happened before the cancel
+                                    if broker_order.filled_qty:
+                                        fresh_order.filled_qty = float(broker_order.filled_qty)
+                                    if broker_order.open_price:
+                                        fresh_order.open_price = broker_order.open_price
                                     update_instance(fresh_order)
                                     canceled_count += 1
+                                    # Fold a cancel-raced partial fill back into the transaction
+                                    if (fresh_order.filled_qty or 0) > 0:
+                                        from ba2_trade_platform.core.TransactionHelper import TransactionHelper
+                                        TransactionHelper.reconcile_canceled_partial_fill(fresh_order)
                                 continue
                             else:
                                 # Order exists at broker with other status - update only if changed

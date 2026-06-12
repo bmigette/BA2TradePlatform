@@ -25,7 +25,114 @@ if TYPE_CHECKING:
 
 class TransactionHelper:
     """Helper class for transaction-related business logic."""
-    
+
+    @staticmethod
+    def reconcile_canceled_partial_fill(order: TradingOrder) -> bool:
+        """Fold a canceled-but-partially-filled CLOSING order back into its transaction.
+
+        A cancel-and-replace (e.g. a TP/SL rebase) can race a live fill: the broker
+        executes part of the order before honoring the cancel, leaving the order
+        CANCELED with ``filled_qty > 0``. Those shares are genuinely sold/bought at
+        the broker, but nothing used to reduce the transaction — producing the
+        "Quantity Mismatch" warning (broker < sum of open transactions).
+
+        Conditions (all must hold, otherwise no-op):
+        - order.status is CANCELED with filled_qty > 0
+        - order belongs to an OPENED transaction and is a CLOSING order
+          (side opposite to the transaction side)
+        - not already reconciled (idempotent via ``order.data['partial_fill_reconciled']``)
+
+        Effect: transaction.quantity -= filled_qty (audit note in meta_data); active
+        dependent TP/SL orders are resynced via adjust-like logic; a fully-consumed
+        transaction is marked CLOSED at the order's average fill price.
+
+        Returns True when a reconciliation was applied.
+        """
+        order_id = order.id
+        try:
+            with Session(get_db().bind) as session:
+                # The caller's instance may be detached — work on a fresh row.
+                db_order = session.get(TradingOrder, order_id)
+                if db_order is None or db_order.status != OrderStatus.CANCELED:
+                    return False
+                filled = float(db_order.filled_qty or 0)
+                if filled <= 0 or not db_order.transaction_id:
+                    return False
+                if (db_order.data or {}).get("partial_fill_reconciled"):
+                    return False
+
+                txn = session.get(Transaction, db_order.transaction_id)
+                if txn is None or txn.status != TransactionStatus.OPENED:
+                    return False
+                if txn.side is None or db_order.side == txn.side:
+                    # Entry-side partial cancel is a different case (position smaller
+                    # than recorded entry) — out of scope here.
+                    return False
+
+                old_qty = float(txn.quantity or 0)
+                new_qty = max(0.0, old_qty - filled)
+                fill_price = db_order.open_price or db_order.stop_price or db_order.limit_price
+                symbol, txn_id = db_order.symbol, txn.id
+
+                meta = dict(txn.meta_data or {})
+                notes = list(meta.get("partial_fill_reconciliations") or [])
+                notes.append({
+                    "date": datetime.now(timezone.utc).isoformat(),
+                    "order_id": order_id,
+                    "filled_qty": filled,
+                    "fill_price": fill_price,
+                    "qty_before": old_qty,
+                    "qty_after": new_qty,
+                    "reason": "order canceled after partial fill (cancel/replace race)",
+                })
+                meta["partial_fill_reconciliations"] = notes
+                txn.meta_data = meta
+                txn.quantity = new_qty
+
+                if new_qty <= 0:
+                    txn.status = TransactionStatus.CLOSED
+                    txn.close_price = fill_price
+                    txn.close_date = datetime.now(timezone.utc)
+                    txn.close_reason = "partial fill on canceled order consumed position"
+                session.add(txn)
+
+                # Resync still-inactive dependent TP/SL orders (PENDING/WAITING_TRIGGER,
+                # not deliberately-partial ones) so they can't oversell the remainder.
+                dependents = session.exec(select(TradingOrder).where(
+                    TradingOrder.transaction_id == txn.id,
+                    TradingOrder.id != order_id,
+                )).all()
+                for dep in dependents:
+                    if dep.depends_on_order is None:
+                        continue
+                    if (dep.data or {}).get("fixed_quantity"):
+                        continue
+                    if dep.status in (OrderStatus.PENDING, OrderStatus.WAITING_TRIGGER) and dep.quantity:
+                        if float(dep.quantity) > new_qty:
+                            logger.info(
+                                f"reconcile_canceled_partial_fill: resizing dependent order "
+                                f"{dep.id} {dep.quantity} -> {new_qty}")
+                            dep.quantity = new_qty
+                            session.add(dep)
+
+                # Idempotency flag on the canceled order
+                odata = dict(db_order.data or {})
+                odata["partial_fill_reconciled"] = True
+                db_order.data = odata
+                session.add(db_order)
+
+                session.commit()
+
+            logger.warning(
+                f"Reconciled canceled partial fill: order {order_id} ({symbol}) filled "
+                f"{filled} before cancel; transaction {txn_id} qty {old_qty} -> {new_qty}"
+                + (" (transaction CLOSED)" if new_qty <= 0 else ""))
+            return True
+
+        except Exception as e:
+            logger.error(f"Error reconciling canceled partial fill for order {order_id}: {e}", exc_info=True)
+            return False
+
     @staticmethod
     def adjust_qty(
         transaction: Transaction,
