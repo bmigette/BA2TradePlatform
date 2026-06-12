@@ -936,7 +936,22 @@ class LiveTradesTab:
                 return
 
             account = account_class(acc_def.id)
-            
+
+            # Direction-aware TP/SL sanity check BEFORE touching anything: catches
+            # swapped values (e.g. TP below entry / SL above it on a long), which
+            # the broker would reject anyway (Alpaca 42210000) or fill instantly.
+            if tp_price or sl_price:
+                try:
+                    ref_price = account.get_instrument_current_price(txn.symbol)
+                except Exception:
+                    ref_price = None
+                ok, reason = TransactionHelper.validate_tp_sl_prices(
+                    txn.side, tp_price or None, sl_price or None,
+                    reference_price=ref_price or txn.open_price)
+                if not ok:
+                    ui.notify(reason, type='negative', timeout=10000)
+                    return
+
             # Check for quantity change
             old_quantity = txn.quantity
             qty_changed = new_quantity != old_quantity

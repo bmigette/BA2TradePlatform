@@ -27,6 +27,66 @@ class TransactionHelper:
     """Helper class for transaction-related business logic."""
 
     @staticmethod
+    def validate_tp_sl_prices(side: OrderDirection,
+                              tp_price: Optional[float],
+                              sl_price: Optional[float],
+                              reference_price: Optional[float] = None) -> tuple:
+        """Direction-aware sanity check for (manual) TP/SL prices. Pure function.
+
+        Catches inverted values before they reach the broker (Alpaca rejects a
+        sell-side OCO with ``take_profit.limit_price <= stop_loss.stop_price``,
+        error 42210000 — and the inverse for shorts).
+
+        Rules (only applied to the values that are provided):
+        - LONG (BUY):  TP must be above SL; vs the reference price (current or
+          entry): TP above it, SL below it.
+        - SHORT (SELL): mirrored — TP below SL; TP below the reference, SL above.
+
+        Args:
+            side: transaction direction (BUY = long, SELL = short).
+            tp_price / sl_price: the candidate values (None = not being set).
+            reference_price: current price (preferred) or entry price; when None
+                only the TP-vs-SL ordering is checked.
+
+        Returns:
+            (True, "") when valid, else (False, "human-readable reason").
+        """
+        tp = float(tp_price) if tp_price else None
+        sl = float(sl_price) if sl_price else None
+        ref = float(reference_price) if reference_price else None
+        if tp is None and sl is None:
+            return True, ""
+
+        is_long = side == OrderDirection.BUY
+        direction = "long" if is_long else "short"
+
+        if tp is not None and sl is not None:
+            if is_long and tp <= sl:
+                return False, (f"Invalid TP/SL for a {direction} position: take-profit ({tp:g}) must be "
+                               f"ABOVE stop-loss ({sl:g}) — the values look swapped")
+            if not is_long and tp >= sl:
+                return False, (f"Invalid TP/SL for a {direction} position: take-profit ({tp:g}) must be "
+                               f"BELOW stop-loss ({sl:g}) — the values look swapped")
+
+        if ref is not None:
+            if tp is not None:
+                if is_long and tp <= ref:
+                    return False, (f"Take-profit {tp:g} is at/below the {direction} position's price "
+                                   f"({ref:g}) — it would fill immediately; expected a value above it")
+                if not is_long and tp >= ref:
+                    return False, (f"Take-profit {tp:g} is at/above the {direction} position's price "
+                                   f"({ref:g}) — it would fill immediately; expected a value below it")
+            if sl is not None:
+                if is_long and sl >= ref:
+                    return False, (f"Stop-loss {sl:g} is at/above the {direction} position's price "
+                                   f"({ref:g}) — it would trigger immediately; expected a value below it")
+                if not is_long and sl <= ref:
+                    return False, (f"Stop-loss {sl:g} is at/below the {direction} position's price "
+                                   f"({ref:g}) — it would trigger immediately; expected a value above it")
+
+        return True, ""
+
+    @staticmethod
     def reconcile_canceled_partial_fill(order: TradingOrder) -> bool:
         """Fold a canceled-but-partially-filled CLOSING order back into its transaction.
 
