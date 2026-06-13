@@ -56,6 +56,9 @@ class StockScreener:
         "screener_price_drop_days": 1,
         "screener_max_stocks": 10,
         "screener_sort_metric": "market_cap",
+        # Weinstein Stage 2 filter (0 = off): keep only stocks in an advancing
+        # stage (price above a rising 30-week SMA).
+        "screener_weinstein_stage2_only": 0,
     }
 
     # Metrics that can be used for ranking
@@ -167,6 +170,24 @@ class StockScreener:
         if not candidates:
             self._report_progress("No candidates after RVOL filter.", 1.0)
             return {"results": [], "stats": stats}
+
+        # --- Stage 2.5: Weinstein Stage 2 filter (optional) ---
+        if self._settings.get("screener_weinstein_stage2_only"):
+            logger.info(
+                f"StockScreener: Weinstein filter — keeping only Stage 2 of "
+                f"{len(candidates)} candidates"
+            )
+            self._report_progress(
+                f"Checking Weinstein stage for {len(candidates)} candidates...", 0.55
+            )
+            candidates, w_stats = self._filter_by_weinstein_stage2(candidates)
+            stats.update(w_stats)
+            logger.info(
+                f"StockScreener: Weinstein filter done — {len(candidates)} in Stage 2"
+            )
+            if not candidates:
+                self._report_progress("No candidates in Weinstein Stage 2.", 1.0)
+                return {"results": [], "stats": stats}
 
         metric = self._settings["screener_sort_metric"]
         max_stocks = self._settings["screener_max_stocks"]
@@ -425,6 +446,11 @@ class StockScreener:
         if float_max > 0:
             filters["float_max"] = float_max
 
+        # Restrict to US exchanges — all BA2 broker accounts are US (Alpaca), so
+        # foreign listings (e.g. *.TO Toronto) are never tradable. US-listed ADRs
+        # (TSM, ASML, NVS, ...) trade on NASDAQ/NYSE and are kept.
+        filters["exchanges"] = ["NASDAQ", "NYSE", "AMEX"]
+
         # Request a high limit to avoid FMP's default cap of 1000
         filters["limit"] = 10_000
 
@@ -597,6 +623,49 @@ class StockScreener:
             "dropped_price_drop": dropped_price_drop,
         }
         return passed, stats
+
+    def _filter_by_weinstein_stage2(self, candidates: List[Dict[str, Any]]) -> tuple:
+        """Keep only candidates in Weinstein Stage 2 (price above a rising 30-week SMA).
+
+        Fetches ~220 calendar days of daily history (enough for the 150-day /
+        30-week SMA plus slope lookback) in one parallel batch, then classifies
+        each symbol. Annotates survivors with weinstein_stage / weinstein_slope_pct.
+        """
+        from .weinstein import classify_weinstein_stage
+
+        # 30-week SMA (150 sessions) + 4-week slope (20) -> ~170 sessions -> ~240 cal days.
+        lookback_days = 250
+        all_symbols = [c["symbol"] for c in candidates if c.get("symbol")]
+        history_map = self._fetch_history_bulk(all_symbols, lookback_days)
+
+        passed: List[Dict[str, Any]] = []
+        checked = 0
+        dropped = 0
+        for c in candidates:
+            symbol = (c.get("symbol") or "").upper()
+            bars = history_map.get(symbol, [])
+            if not bars:
+                continue
+            checked += 1
+            closes = [b.get("close") for b in bars if b.get("close") is not None]
+            res = classify_weinstein_stage(closes)
+            if res.get("stage") == 2:
+                c["weinstein_stage"] = 2
+                c["weinstein_slope_pct"] = res.get("slope_pct")
+                passed.append(c)
+            else:
+                dropped += 1
+                logger.debug(
+                    f"StockScreener: {symbol} not Stage 2 "
+                    f"(stage={res.get('stage')}, {res.get('reason','')})"
+                )
+
+        logger.info(
+            f"StockScreener: Weinstein checked {checked}/{len(candidates)} symbols, "
+            f"{len(passed)} in Stage 2"
+        )
+        return passed, {"weinstein_checked": checked, "weinstein_dropped": dropped,
+                        "weinstein_stage2": len(passed)}
 
     def _rank(
         self, candidates: List[Dict[str, Any]]

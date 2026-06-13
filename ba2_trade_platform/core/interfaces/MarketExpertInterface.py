@@ -377,6 +377,14 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                     "valid_values": ["market_cap", "volume", "float_shares", "relative_volume", "composite", "price_drop_pct"],
                     "tooltip": "How to rank and select stocks when more match than the limit. 'composite' uses market_cap * volume * float_shares. 'price_drop_pct' ranks by largest recent price drop first (requires price drop filter or fetches history for all candidates)."
                 },
+                "screener_weinstein_stage2_only": {
+                    "type": "bool", "required": False, "default": False,
+                    "description": "Keep only Weinstein Stage 2 stocks (advancing trend)",
+                    "tooltip": "When enabled, the screener keeps only stocks in Weinstein Stage 2 — "
+                               "price above a RISING 30-week SMA (the classic 'only buy in Stage 2' rule). "
+                               "Filters out basing (Stage 1), topping (Stage 3) and declining (Stage 4) names. "
+                               "Adds an OHLCV history fetch (~250 days) for the candidates."
+                },
 
             }
 
