@@ -135,6 +135,74 @@ def compute_risk_based_quantity(
     return out
 
 
+def derive_stop_for_quantity(
+    equity: float,
+    entry_price: float,
+    quantity: int,
+    risk_per_trade_pct: float,
+    is_long: bool,
+    *,
+    min_stop_pct: float = 7.0,
+) -> dict:
+    """Synthesize a stop-loss for an order that has an explicit quantity but no SL.
+
+    The stop is placed at the price where the loss equals risk_per_trade_pct of
+    equity for the given quantity:
+
+        stop_distance = (equity * risk%/100) / quantity
+        sl_price      = entry - stop_distance   (long)  /  entry + stop_distance (short)
+
+    If that stop would be TIGHTER than ``min_stop_pct`` of price (i.e. the quantity
+    is so large that a 2%-account stop sits inside the noise), the quantity is
+    reduced — a wider stop at the same dollar risk needs fewer shares — down to the
+    largest size whose stop is at least ``min_stop_pct``. When even 1 share cannot
+    keep the stop ≥ min_stop_pct within the risk budget, the order is REJECTED.
+
+    Returns dict: sl_price, quantity (possibly reduced), rejected (bool), reason,
+    stop_pct.
+    """
+    out = {"sl_price": None, "quantity": int(quantity or 0), "rejected": False,
+           "reason": "", "stop_pct": None}
+    if not equity or equity <= 0 or not entry_price or entry_price <= 0:
+        out["rejected"] = True
+        out["reason"] = "invalid equity/price"
+        return out
+    if not quantity or quantity < 1:
+        out["rejected"] = True
+        out["reason"] = "no quantity"
+        return out
+    if not risk_per_trade_pct or risk_per_trade_pct <= 0:
+        out["rejected"] = True
+        out["reason"] = "risk_per_trade_pct not set"
+        return out
+
+    risk_dollars = equity * (risk_per_trade_pct / 100.0)
+    min_stop_dist = entry_price * (min_stop_pct / 100.0) if min_stop_pct and min_stop_pct > 0 else 0.0
+
+    qty = int(quantity)
+    if min_stop_dist > 0:
+        # Largest qty whose 2%-account stop is still ≥ the min stop distance.
+        max_qty = int(risk_dollars // min_stop_dist)
+        if max_qty < 1:
+            out["rejected"] = True
+            out["reason"] = (f"even 1 share risks more than {risk_per_trade_pct:g}% of equity "
+                             f"at a {min_stop_pct:g}% stop — order rejected")
+            return out
+        if qty > max_qty:
+            qty = max_qty  # reduce so the stop widens to >= min_stop_pct
+
+    stop_dist = risk_dollars / qty                 # loss = exactly risk_dollars here
+    sl = entry_price - stop_dist if is_long else entry_price + stop_dist
+    if sl <= 0:
+        out["rejected"] = True
+        out["reason"] = "computed stop price <= 0"
+        return out
+    out["quantity"] = qty
+    out["sl_price"] = round(sl, 2)
+    out["stop_pct"] = round(stop_dist / entry_price * 100.0, 2)
+    return out
+
+
 def get_latest_atr(symbol: str, period: int = 14, interval: str = "1d") -> Optional[float]:
     """Fetch the latest ATR for a symbol via PandasIndicatorCalc. Returns None on failure.
 

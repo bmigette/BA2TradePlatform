@@ -4,7 +4,10 @@ the dollar loss per trade and lets the stop distance set the share count
 
 import pytest
 
-from ba2_trade_platform.core.position_sizing import compute_risk_based_quantity as size
+from ba2_trade_platform.core.position_sizing import (
+    compute_risk_based_quantity as size,
+    derive_stop_for_quantity,
+)
 
 
 class TestStopBasedSizing:
@@ -115,3 +118,38 @@ class TestGuards:
         r = size(equity=10_000, current_price=50.0, risk_per_trade_pct=1.0,
                  stop_price=50.0, atr=2.5, atr_multiplier=2.0)
         assert r["quantity"] == 20  # zero distance -> ATR path
+
+
+class TestDeriveStopForQuantity:
+    def test_stop_at_2pct_loss_price(self):
+        # 100 shares @ $50, 2% of 10k = $200 risk -> stop_dist $2 -> SL $48 (4% > 7%? no, 4% < 7%)
+        # 4% < 7% min -> qty reduced. risk$200 / (7%*50=3.5) = 57 shares.
+        d = derive_stop_for_quantity(10_000, 50.0, 100, 2.0, is_long=True, min_stop_pct=7.0)
+        assert d["quantity"] == 57
+        assert d["stop_pct"] == pytest.approx(7.02, abs=0.1)
+        assert d["sl_price"] < 50
+
+    def test_small_qty_keeps_wide_stop(self):
+        # 10 shares @ $50, $200 risk -> stop_dist $20 -> 40% stop (> 7%) -> keep qty 10
+        d = derive_stop_for_quantity(10_000, 50.0, 10, 2.0, is_long=True, min_stop_pct=7.0)
+        assert d["quantity"] == 10
+        assert d["sl_price"] == pytest.approx(30.0)  # 50 - 20
+
+    def test_short_stop_above_entry(self):
+        d = derive_stop_for_quantity(10_000, 50.0, 10, 2.0, is_long=False, min_stop_pct=7.0)
+        assert d["sl_price"] == pytest.approx(70.0)  # 50 + 20
+
+    def test_reject_when_one_share_too_risky(self):
+        # equity 100, 2% = $2 budget; min stop 7% of $50 = $3.5 > $2 even for 1 share -> reject
+        d = derive_stop_for_quantity(100, 50.0, 1, 2.0, is_long=True, min_stop_pct=7.0)
+        assert d["rejected"] is True and "rejected" in d["reason"]
+
+    def test_no_min_stop_uses_exact_2pct(self):
+        d = derive_stop_for_quantity(10_000, 50.0, 100, 2.0, is_long=True, min_stop_pct=0.0)
+        assert d["quantity"] == 100
+        assert d["sl_price"] == pytest.approx(48.0)  # 50 - 2
+
+    def test_invalid_inputs_rejected(self):
+        assert derive_stop_for_quantity(0, 50, 10, 2.0, True)["rejected"]
+        assert derive_stop_for_quantity(10_000, 0, 10, 2.0, True)["rejected"]
+        assert derive_stop_for_quantity(10_000, 50, 0, 2.0, True)["rejected"]

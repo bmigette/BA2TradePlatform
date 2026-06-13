@@ -1902,6 +1902,12 @@ class SmartRiskManagerToolkit:
             )
             result["detail"] = (f"risk ${result['risk_dollars']:.0f}, risk/share ${result['risk_per_share']:.2f}"
                                  if result["risk_per_share"] else result["reason"])
+            # Implied protective stop so an auto-sized position is never left unprotected:
+            # entry ∓ risk_per_share (the same distance used to size it).
+            if result.get("risk_per_share"):
+                rps = result["risk_per_share"]
+                result["implied_sl"] = round(
+                    current_price - rps if order_direction == OrderDirection.BUY else current_price + rps, 2)
             return result
         except Exception as e:
             self.logger.warning(f"_auto_size_by_risk failed for {symbol}: {e}")
@@ -1937,23 +1943,50 @@ class SmartRiskManagerToolkit:
         try:
             direction = order_direction.value
 
-            # Auto-size by risk when the caller didn't provide a quantity (the smart
-            # risk manager omits it so the system sizes by the stop distance). Also
-            # triggers when the expert is configured for risk_atr sizing mode.
+            # Risk-based sizing / stop synthesis (risk_atr mode or no quantity given).
             sizing_mode = self.expert.get_setting_with_interface_default("sizing_mode", log_warning=False) or "notional"
-            if quantity is None or (quantity and quantity <= 0) or sizing_mode == "risk_atr":
-                auto = self._auto_size_by_risk(symbol, order_direction, sl_price)
-                if auto.get("quantity", 0) > 0:
-                    quantity = auto["quantity"]
-                    self.logger.info(f"Auto-sized {direction} {symbol}: {quantity} shares ({auto.get('detail','')})")
-                elif quantity is None or quantity <= 0:
-                    return {
-                        "success": False,
-                        "message": f"Could not auto-size {direction} {symbol}: {auto.get('reason', 'unknown')}. "
-                                   f"Provide an sl_price so the system can size by risk.",
-                        "transaction_id": None, "order_id": None,
-                        "symbol": symbol, "quantity": 0, "direction": direction,
-                    }
+            no_qty = quantity is None or quantity <= 0
+            if no_qty or sizing_mode == "risk_atr":
+                if no_qty:
+                    # No quantity -> size by risk; adopt the implied stop if none given.
+                    auto = self._auto_size_by_risk(symbol, order_direction, sl_price)
+                    if auto.get("quantity", 0) > 0:
+                        quantity = auto["quantity"]
+                        if not sl_price and auto.get("implied_sl"):
+                            sl_price = auto["implied_sl"]
+                        self.logger.info(f"Auto-sized {direction} {symbol}: {quantity} shares ({auto.get('detail','')})")
+                    else:
+                        return {
+                            "success": False,
+                            "message": f"Could not auto-size {direction} {symbol}: {auto.get('reason', 'unknown')}. "
+                                       f"Provide an sl_price so the system can size by risk.",
+                            "transaction_id": None, "order_id": None,
+                            "symbol": symbol, "quantity": 0, "direction": direction,
+                        }
+                elif sl_price is None:
+                    # Explicit quantity but no stop: synthesize the SL at the
+                    # risk_per_trade_pct loss price, reducing qty if it would be
+                    # tighter than min_stop_loss_pct, rejecting if 1 share still risks too much.
+                    from .position_sizing import derive_stop_for_quantity
+                    cur = self.get_current_price(symbol)
+                    equity = self.expert.get_virtual_balance()
+                    risk_pct = float(self.expert.get_setting_with_interface_default("risk_per_trade_pct", log_warning=False) or 1.0)
+                    min_stop = float(self.expert.get_setting_with_interface_default("min_stop_loss_pct", log_warning=False) or 7.0)
+                    d = derive_stop_for_quantity(equity, cur, int(quantity), risk_pct,
+                                                 is_long=(order_direction == OrderDirection.BUY),
+                                                 min_stop_pct=min_stop)
+                    if d["rejected"]:
+                        return {
+                            "success": False,
+                            "message": f"Rejected {direction} {symbol}: {d['reason']}",
+                            "transaction_id": None, "order_id": None,
+                            "symbol": symbol, "quantity": 0, "direction": direction,
+                        }
+                    if d["quantity"] != quantity:
+                        self.logger.info(f"Reduced {direction} {symbol} qty {quantity} -> {d['quantity']} "
+                                         f"to keep stop >= {min_stop:g}% (synthesized SL ${d['sl_price']}, {d['stop_pct']}%)")
+                    quantity = d["quantity"]
+                    sl_price = d["sl_price"]
 
             # Validate quantity is greater than 0
             if quantity is None or quantity <= 0:
