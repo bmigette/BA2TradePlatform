@@ -1866,6 +1866,47 @@ class SmartRiskManagerToolkit:
         """
         return self._open_position_internal(symbol, OrderDirection.SELL, quantity, tp_price, sl_price, reason, confidence, market_analysis_id)
     
+    def _auto_size_by_risk(self, symbol: str, order_direction: OrderDirection,
+                           sl_price: Optional[float]) -> Dict[str, Any]:
+        """Risk-based share count for the smart risk manager. Returns {quantity, ...}.
+
+        Mirrors the classic risk manager: cap the dollar loss at risk_per_trade_pct
+        of equity; share count = risk$ / distance-to-stop, where the stop distance
+        is |price - sl_price| when an SL is given, else atr_multiplier * ATR. The
+        per-instrument %% cap and available balance still apply as ceilings.
+        """
+        from .position_sizing import compute_risk_based_quantity, get_latest_atr
+        try:
+            current_price = self.get_current_price(symbol)
+            if not current_price or current_price <= 0:
+                return {"quantity": 0, "reason": f"no current price for {symbol}"}
+
+            equity = self.expert.get_virtual_balance()
+            risk_pct = float(self.expert.get_setting_with_interface_default("risk_per_trade_pct", log_warning=False) or 1.0)
+            atr_mult = float(self.expert.get_setting_with_interface_default("atr_multiplier", log_warning=False) or 2.0)
+            atr_period = int(self.expert.get_setting_with_interface_default("atr_period", log_warning=False) or 14)
+            min_stop_pct = float(self.expert.get_setting_with_interface_default("min_stop_loss_pct", log_warning=False) or 0.0)
+            max_pos_pct = float(self.expert.get_setting_with_interface_default("max_virtual_equity_per_instrument_percent", log_warning=False) or 10.0)
+            max_position_value = (equity or 0) * (max_pos_pct / 100.0)
+
+            atr = None if sl_price else get_latest_atr(symbol, period=atr_period)
+            try:
+                available = self.expert.get_available_balance()
+            except Exception:
+                available = None
+
+            result = compute_risk_based_quantity(
+                equity=equity, current_price=current_price, risk_per_trade_pct=risk_pct,
+                stop_price=sl_price, atr=atr, atr_multiplier=atr_mult, min_stop_pct=min_stop_pct,
+                max_position_value=max_position_value, available_balance=available,
+            )
+            result["detail"] = (f"risk ${result['risk_dollars']:.0f}, risk/share ${result['risk_per_share']:.2f}"
+                                 if result["risk_per_share"] else result["reason"])
+            return result
+        except Exception as e:
+            self.logger.warning(f"_auto_size_by_risk failed for {symbol}: {e}")
+            return {"quantity": 0, "reason": str(e)}
+
     def _open_position_internal(
         self,
         symbol: str,
@@ -1895,9 +1936,27 @@ class SmartRiskManagerToolkit:
         """
         try:
             direction = order_direction.value
-            
+
+            # Auto-size by risk when the caller didn't provide a quantity (the smart
+            # risk manager omits it so the system sizes by the stop distance). Also
+            # triggers when the expert is configured for risk_atr sizing mode.
+            sizing_mode = self.expert.get_setting_with_interface_default("sizing_mode", log_warning=False) or "notional"
+            if quantity is None or (quantity and quantity <= 0) or sizing_mode == "risk_atr":
+                auto = self._auto_size_by_risk(symbol, order_direction, sl_price)
+                if auto.get("quantity", 0) > 0:
+                    quantity = auto["quantity"]
+                    self.logger.info(f"Auto-sized {direction} {symbol}: {quantity} shares ({auto.get('detail','')})")
+                elif quantity is None or quantity <= 0:
+                    return {
+                        "success": False,
+                        "message": f"Could not auto-size {direction} {symbol}: {auto.get('reason', 'unknown')}. "
+                                   f"Provide an sl_price so the system can size by risk.",
+                        "transaction_id": None, "order_id": None,
+                        "symbol": symbol, "quantity": 0, "direction": direction,
+                    }
+
             # Validate quantity is greater than 0
-            if quantity <= 0:
+            if quantity is None or quantity <= 0:
                 return {
                     "success": False,
                     "message": f"Invalid quantity: {quantity}. Quantity must be greater than 0",

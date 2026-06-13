@@ -512,6 +512,11 @@ class TradeRiskManagement:
         )
         if diversification_factor is None:
             diversification_factor = 1.0
+
+        # Position sizing mode (risk_atr -> size by distance-to-stop; B2 doc #1).
+        sizing_mode = expert.get_setting_with_interface_default('sizing_mode', log_warning=False) or 'notional'
+        if sizing_mode == 'risk_atr':
+            self.logger.info("Sizing mode: risk_atr (risk-based ATR position sizing)")
         
         # Group orders by symbol for diversity calculation
         orders_by_symbol = {}
@@ -572,82 +577,95 @@ class TradeRiskManagement:
                     updated_orders.append(order)
                     continue
                 
-                # Calculate maximum affordable quantity based on available equity per instrument
-                max_quantity_by_instrument = max(0, available_for_instrument / current_price) if current_price > 0 else 0
-                
-                # Calculate maximum affordable quantity based on remaining total balance
-                max_quantity_by_balance = max(0, remaining_balance / current_price) if current_price > 0 else 0
-                
-                self.logger.info(f"  Calculated: max_qty_by_instrument={max_quantity_by_instrument:.2f} shares, "
-                               f"max_qty_by_balance={max_quantity_by_balance:.2f} shares")
-                
-                # Standard allocation logic — respect the user's per-instrument limit.
-                # No special-case bypass: a symbol whose 1-share price exceeds the cap is
-                # simply not bought (early-skipped above), never forced through at qty=1.
-                if available_for_instrument <= 0:
-                    quantity = 0
-                    self.logger.info(f"  Result: quantity=0 (no available equity for {symbol}, limit exceeded)")
-                elif remaining_balance <= current_price:
-                    quantity = 0
-                    self.logger.info(f"  Result: quantity=0 (insufficient remaining balance: ${remaining_balance:.2f} < ${current_price:.2f})")
-                else:
-                    # Use the minimum of the two constraints
-                    max_quantity = min(max_quantity_by_instrument, max_quantity_by_balance)
-                    self.logger.info(f"  Using min of constraints: max_quantity={max_quantity:.2f} shares")
+                # RISK-BASED SIZING (risk_atr): size by the distance to the stop so the
+                # dollar loss if stopped out is capped at risk_per_trade_pct of equity.
+                sized_by_risk = False
+                quantity = 0
+                if sizing_mode == 'risk_atr':
+                    sized_by_risk = True
+                    quantity = self._risk_atr_quantity(
+                        order, symbol, current_price, expert,
+                        max_position_value=available_for_instrument,
+                        available_balance=remaining_balance,
+                    )
 
-                    # For diversification, prefer smaller positions when multiple instruments available
-                    num_remaining_instruments = len([s for s in orders_by_symbol.keys()
-                                                   if instrument_allocations.get(s, 0) < max_equity_per_instrument])
-
-                    if num_remaining_instruments > 1 and diversification_factor < 1.0:
-                        # Reserve some balance for other instruments (configurable, RM-5;
-                        # default 1.0 = off, so this only runs when explicitly lowered)
-                        original_max = max_quantity
-                        max_quantity *= diversification_factor
-                        self.logger.info(f"  Diversification ({num_remaining_instruments} remaining instruments): "
-                                      f"applied factor {diversification_factor}: {original_max:.2f} -> {max_quantity:.2f} shares")
-
-                    # First rounding: float to int
-                    quantity = max(0, int(max_quantity))
-                    self.logger.info(f"  First rounding: {max_quantity:.2f} -> {quantity} shares (int conversion)")
-
-                    # Ensure we don't allocate less than 1 share unless we can't afford it
-                    if quantity == 0 and max_quantity_by_balance >= 1 and max_quantity_by_instrument >= 1:
-                        quantity = 1
-                        self.logger.info(f"  Minimum allocation enforced: setting quantity to 1 share "
-                                      f"(had funds: max_by_balance={max_quantity_by_balance:.2f}, "
-                                      f"max_by_instrument={max_quantity_by_instrument:.2f})")
+                if not sized_by_risk:
+                    # Calculate maximum affordable quantity based on available equity per instrument
+                    max_quantity_by_instrument = max(0, available_for_instrument / current_price) if current_price > 0 else 0
                 
-                # Apply instrument weight (formula: result * (weight/100))
-                if quantity > 0 and symbol in instrument_configs:
-                    instrument_weight = instrument_configs[symbol].get('weight', 100.0)
-                    if instrument_weight != 100.0:  # Only apply if weight is non-default
-                        original_quantity = quantity
-                        weighted_quantity = quantity * (instrument_weight / 100.0)
-                        self.logger.info(f"  Instrument weight {instrument_weight}%: "
-                                       f"{original_quantity} shares * {instrument_weight/100:.2f} = {weighted_quantity:.2f} shares")
-                        
-                        # Second rounding: weighted quantity to int
-                        quantity = max(0, int(weighted_quantity))
-                        self.logger.info(f"  Second rounding: {weighted_quantity:.2f} -> {quantity} shares (int conversion)")
-                        
-                        # CRITICAL: Ensure minimum quantity of 1 if we have funds for at least 1 share
-                        # This covers the case where weighting reduces quantity below 1 after rounding
-                        if quantity == 0 and max_quantity_by_balance >= 1:
+                    # Calculate maximum affordable quantity based on remaining total balance
+                    max_quantity_by_balance = max(0, remaining_balance / current_price) if current_price > 0 else 0
+                
+                    self.logger.info(f"  Calculated: max_qty_by_instrument={max_quantity_by_instrument:.2f} shares, "
+                                   f"max_qty_by_balance={max_quantity_by_balance:.2f} shares")
+                
+                    # Standard allocation logic — respect the user's per-instrument limit.
+                    # No special-case bypass: a symbol whose 1-share price exceeds the cap is
+                    # simply not bought (early-skipped above), never forced through at qty=1.
+                    if available_for_instrument <= 0:
+                        quantity = 0
+                        self.logger.info(f"  Result: quantity=0 (no available equity for {symbol}, limit exceeded)")
+                    elif remaining_balance <= current_price:
+                        quantity = 0
+                        self.logger.info(f"  Result: quantity=0 (insufficient remaining balance: ${remaining_balance:.2f} < ${current_price:.2f})")
+                    else:
+                        # Use the minimum of the two constraints
+                        max_quantity = min(max_quantity_by_instrument, max_quantity_by_balance)
+                        self.logger.info(f"  Using min of constraints: max_quantity={max_quantity:.2f} shares")
+
+                        # For diversification, prefer smaller positions when multiple instruments available
+                        num_remaining_instruments = len([s for s in orders_by_symbol.keys()
+                                                       if instrument_allocations.get(s, 0) < max_equity_per_instrument])
+
+                        if num_remaining_instruments > 1 and diversification_factor < 1.0:
+                            # Reserve some balance for other instruments (configurable, RM-5;
+                            # default 1.0 = off, so this only runs when explicitly lowered)
+                            original_max = max_quantity
+                            max_quantity *= diversification_factor
+                            self.logger.info(f"  Diversification ({num_remaining_instruments} remaining instruments): "
+                                          f"applied factor {diversification_factor}: {original_max:.2f} -> {max_quantity:.2f} shares")
+
+                        # First rounding: float to int
+                        quantity = max(0, int(max_quantity))
+                        self.logger.info(f"  First rounding: {max_quantity:.2f} -> {quantity} shares (int conversion)")
+
+                        # Ensure we don't allocate less than 1 share unless we can't afford it
+                        if quantity == 0 and max_quantity_by_balance >= 1 and max_quantity_by_instrument >= 1:
                             quantity = 1
-                            self.logger.info(f"  Minimum allocation enforced after weighting: setting quantity to 1 share "
-                                          f"(weighted calc gave 0 but max_by_balance={max_quantity_by_balance:.2f})")
+                            self.logger.info(f"  Minimum allocation enforced: setting quantity to 1 share "
+                                          f"(had funds: max_by_balance={max_quantity_by_balance:.2f}, "
+                                          f"max_by_instrument={max_quantity_by_instrument:.2f})")
+                
+                    # Apply instrument weight (formula: result * (weight/100))
+                    if quantity > 0 and symbol in instrument_configs:
+                        instrument_weight = instrument_configs[symbol].get('weight', 100.0)
+                        if instrument_weight != 100.0:  # Only apply if weight is non-default
+                            original_quantity = quantity
+                            weighted_quantity = quantity * (instrument_weight / 100.0)
+                            self.logger.info(f"  Instrument weight {instrument_weight}%: "
+                                           f"{original_quantity} shares * {instrument_weight/100:.2f} = {weighted_quantity:.2f} shares")
                         
-                        # Check if we can afford the weighted quantity
-                        weighted_cost = quantity * current_price
-                        if weighted_cost > remaining_balance or weighted_cost > available_for_instrument:
-                            # Revert to original quantity if weighted amount exceeds limits
-                            quantity = original_quantity
-                            self.logger.info(f"  Weight {instrument_weight}% would exceed limits "
-                                          f"(cost ${weighted_cost:.2f} > remaining ${remaining_balance:.2f} or available ${available_for_instrument:.2f}), "
-                                          f"keeping original quantity {quantity}")
-                        else:
-                            self.logger.info(f"  Final after weighting: {quantity} shares (cost ${weighted_cost:.2f})")
+                            # Second rounding: weighted quantity to int
+                            quantity = max(0, int(weighted_quantity))
+                            self.logger.info(f"  Second rounding: {weighted_quantity:.2f} -> {quantity} shares (int conversion)")
+                        
+                            # CRITICAL: Ensure minimum quantity of 1 if we have funds for at least 1 share
+                            # This covers the case where weighting reduces quantity below 1 after rounding
+                            if quantity == 0 and max_quantity_by_balance >= 1:
+                                quantity = 1
+                                self.logger.info(f"  Minimum allocation enforced after weighting: setting quantity to 1 share "
+                                              f"(weighted calc gave 0 but max_by_balance={max_quantity_by_balance:.2f})")
+                        
+                            # Check if we can afford the weighted quantity
+                            weighted_cost = quantity * current_price
+                            if weighted_cost > remaining_balance or weighted_cost > available_for_instrument:
+                                # Revert to original quantity if weighted amount exceeds limits
+                                quantity = original_quantity
+                                self.logger.info(f"  Weight {instrument_weight}% would exceed limits "
+                                              f"(cost ${weighted_cost:.2f} > remaining ${remaining_balance:.2f} or available ${available_for_instrument:.2f}), "
+                                              f"keeping original quantity {quantity}")
+                            else:
+                                self.logger.info(f"  Final after weighting: {quantity} shares (cost ${weighted_cost:.2f})")
                 
                 # Round-lot constraint (e.g. lot_size=100 for option-overlay
                 # strategies): size in whole lots; below one lot the order is
@@ -699,7 +717,45 @@ class TradeRiskManagement:
             self.logger.info(f"Found {len(orders_to_delete)} orders with quantity=0 that will be deleted")
 
         return orders_to_update, orders_to_delete, symbol_prices
-    
+
+    def _risk_atr_quantity(self, order, symbol: str, current_price: float, expert,
+                           max_position_value: float, available_balance: float) -> int:
+        """Risk-based share count for one order (risk_atr sizing mode).
+
+        Stop distance comes from the order's explicit SL price when present, else
+        atr_multiplier * ATR. Result is clamped by the per-instrument cap and the
+        remaining balance (passed in), and respects any lot_size on the order.
+        Returns 0 (order will be deleted as unfunded) when it can't be sized.
+        """
+        from .position_sizing import compute_risk_based_quantity, get_latest_atr
+
+        equity = expert.get_virtual_balance()
+        risk_pct = float(expert.get_setting_with_interface_default('risk_per_trade_pct', log_warning=False) or 1.0)
+        atr_mult = float(expert.get_setting_with_interface_default('atr_multiplier', log_warning=False) or 2.0)
+        atr_period = int(expert.get_setting_with_interface_default('atr_period', log_warning=False) or 14)
+        min_stop_pct = float(expert.get_setting_with_interface_default('min_stop_loss_pct', log_warning=False) or 0.0)
+
+        # Prefer an explicit stop price on the order (limit/stop columns or
+        # tpsl_reference data); otherwise fall back to ATR for the stop distance.
+        stop_price = order.stop_price
+        atr = None if stop_price else get_latest_atr(symbol, period=atr_period)
+
+        lot = (order.data or {}).get('lot_size') if order.data else None
+        result = compute_risk_based_quantity(
+            equity=equity, current_price=current_price, risk_per_trade_pct=risk_pct,
+            stop_price=stop_price, atr=atr, atr_multiplier=atr_mult, min_stop_pct=min_stop_pct,
+            max_position_value=max_position_value, available_balance=available_balance,
+            lot_size=int(lot) if lot else None,
+        )
+        if result["quantity"] <= 0:
+            self.logger.warning(f"  risk_atr sizing -> 0 for {symbol}: {result['reason']}")
+        else:
+            cap = f" (capped by {result['capped_by']})" if result["capped_by"] else ""
+            self.logger.info(
+                f"  risk_atr sizing -> {result['quantity']} shares for {symbol} "
+                f"(risk ${result['risk_dollars']:.2f}, risk/share ${result['risk_per_share']:.2f}){cap}")
+        return int(result["quantity"])
+
     def _update_orders_in_database(self, orders: List[TradingOrder]) -> Tuple[int, int]:
         """
         Update orders in the database with calculated quantities using TransactionHelper.

@@ -1533,29 +1533,31 @@ def action_node(state: SmartRiskManagerState) -> Dict[str, Any]:
 
                 elif action_type == "open_buy_position":
                     symbol = parameters["symbol"]
-                    quantity = parameters["quantity"]
+                    quantity = parameters.get("quantity")
                     tp_price = parameters.get("tp_price")
                     sl_price = parameters.get("sl_price")
                     market_analysis_id = parameters.get("market_analysis_id")
 
-                    # CRITICAL: Ensure quantity is a whole number (Alpaca requires integers for GTC orders)
-                    if not isinstance(quantity, int) and quantity != int(quantity):
-                        logger.warning(f"⚠️ Fractional quantity detected for {symbol}: {quantity} - rounding to {int(quantity)}")
-                    quantity = int(quantity)
+                    # quantity may be None -> toolkit auto-sizes by risk. Only coerce
+                    # to int when the agent supplied an explicit number.
+                    if quantity is not None:
+                        if not isinstance(quantity, int) and quantity != int(quantity):
+                            logger.warning(f"⚠️ Fractional quantity detected for {symbol}: {quantity} - rounding to {int(quantity)}")
+                        quantity = int(quantity)
 
                     result = toolkit.open_buy_position(symbol, quantity, tp_price, sl_price, reason, confidence, market_analysis_id)
 
                 elif action_type == "open_sell_position":
                     symbol = parameters["symbol"]
-                    quantity = parameters["quantity"]
+                    quantity = parameters.get("quantity")
                     tp_price = parameters.get("tp_price")
                     sl_price = parameters.get("sl_price")
                     market_analysis_id = parameters.get("market_analysis_id")
 
-                    # CRITICAL: Ensure quantity is a whole number (Alpaca requires integers for GTC orders)
-                    if not isinstance(quantity, int) and quantity != int(quantity):
-                        logger.warning(f"⚠️ Fractional quantity detected for {symbol}: {quantity} - rounding to {int(quantity)}")
-                    quantity = int(quantity)
+                    if quantity is not None:
+                        if not isinstance(quantity, int) and quantity != int(quantity):
+                            logger.warning(f"⚠️ Fractional quantity detected for {symbol}: {quantity} - rounding to {int(quantity)}")
+                        quantity = int(quantity)
 
                     result = toolkit.open_sell_position(symbol, quantity, tp_price, sl_price, reason, confidence, market_analysis_id)
 
@@ -2101,17 +2103,18 @@ class SmartRiskManagerGraph:
         @smart_risk_manager_tool
         def recommend_open_buy_position(
             symbol: Annotated[str, "Instrument symbol to buy"],
-            quantity: Annotated[int, "Number of shares/units (MUST be a whole number, e.g., 10, not 10.5)"],
             reason: Annotated[str, "Clear explanation based on research"],
             confidence: Annotated[int, "Your confidence level as an INTEGER from 1-100 (e.g., 85 for 85% confidence, NOT 0.85)"],
-            tp_price: Annotated[Optional[float], "Take profit price (optional)"] = None,
-            sl_price: Annotated[Optional[float], "Stop loss price (optional)"] = None
+            tp_price: Annotated[Optional[float], "Take profit price"] = None,
+            sl_price: Annotated[Optional[float], "Stop loss price (required when sizing is automatic)"] = None,
+            quantity: Annotated[Optional[int], "Number of shares — OMIT to let the system auto-size by risk"] = None
         ) -> str:
             """Recommend opening a new BUY (long) position.
-            
-            IMPORTANT: 
-            - quantity must be a whole number (integer) like 10, not 10.5
-            - confidence must be an integer from 1-100 (e.g., 85), not a decimal (not 0.85)
+
+            POSITION SIZING IS AUTOMATIC: do NOT pass quantity unless you have a
+            specific reason. Provide sl_price (and tp_price) — the system computes
+            the share count from the stop distance so the risk per trade is capped.
+            confidence must be an integer from 1-100 (e.g., 85), not a decimal.
             """
             action = {
                 "action_type": "open_buy_position",
@@ -2125,23 +2128,25 @@ class SmartRiskManagerGraph:
                 "confidence": confidence
             }
             self.recommended_actions_list.append(action)
-            return f"Recorded buy position recommendation for {symbol} ({quantity} shares). Total actions: {len(self.recommended_actions_list)}"
+            qty_txt = f"{quantity} shares" if quantity else "auto-sized"
+            return f"Recorded buy position recommendation for {symbol} ({qty_txt}). Total actions: {len(self.recommended_actions_list)}"
         
         @tool
         @smart_risk_manager_tool
         def recommend_open_sell_position(
             symbol: Annotated[str, "Instrument symbol to sell short"],
-            quantity: Annotated[int, "Number of shares/units (MUST be a whole number, e.g., 10, not 10.5)"],
             reason: Annotated[str, "Clear explanation based on research"],
             confidence: Annotated[int, "Your confidence level as an INTEGER from 1-100 (e.g., 85 for 85% confidence, NOT 0.85)"],
-            tp_price: Annotated[Optional[float], "Take profit price (optional)"] = None,
-            sl_price: Annotated[Optional[float], "Stop loss price (optional)"] = None
+            tp_price: Annotated[Optional[float], "Take profit price"] = None,
+            sl_price: Annotated[Optional[float], "Stop loss price (required when sizing is automatic)"] = None,
+            quantity: Annotated[Optional[int], "Number of shares — OMIT to let the system auto-size by risk"] = None
         ) -> str:
             """Recommend opening a new SELL (short) position.
-            
-            IMPORTANT: 
-            - quantity must be a whole number (integer) like 10, not 10.5
-            - confidence must be an integer from 1-100 (e.g., 85), not a decimal (not 0.85)
+
+            POSITION SIZING IS AUTOMATIC: do NOT pass quantity unless you have a
+            specific reason. Provide sl_price (and tp_price) — the system computes
+            the share count from the stop distance so the risk per trade is capped.
+            confidence must be an integer from 1-100 (e.g., 85), not a decimal.
             """
             action = {
                 "action_type": "open_sell_position",
@@ -2155,7 +2160,8 @@ class SmartRiskManagerGraph:
                 "confidence": confidence
             }
             self.recommended_actions_list.append(action)
-            return f"Recorded sell position recommendation for {symbol} ({quantity} shares). Total actions: {len(self.recommended_actions_list)}"
+            qty_txt = f"{quantity} shares" if quantity else "auto-sized"
+            return f"Recorded sell position recommendation for {symbol} ({qty_txt}). Total actions: {len(self.recommended_actions_list)}"
         
         return [
             get_analysis_outputs_tool,

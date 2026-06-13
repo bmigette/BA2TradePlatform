@@ -114,6 +114,43 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                     "description": "Fraction of available equity used per instrument when others still have headroom (0-1)",
                     "tooltip": "Defaults to 1.0 (off): diversification is governed by the per-instrument cap (max_virtual_equity_per_instrument_percent). Lower it (e.g. 0.7) only if you want to reserve cash for lower-priority instruments when the balance can't fund every instrument to its cap — otherwise this just under-deploys capital."
                 },
+                # Position sizing mode (applies to both classic and smart risk managers)
+                "sizing_mode": {
+                    "type": "str", "required": False, "default": "notional",
+                    "valid_values": ["notional", "risk_atr"],
+                    "description": "How position size is computed",
+                    "tooltip": "notional (default) = size by conviction up to the per-instrument %% cap. "
+                               "risk_atr = institutional risk-based sizing: never lose more than "
+                               "risk_per_trade_pct of equity if the stop triggers; the share count is "
+                               "(equity*risk%%) / distance-to-stop, where the stop distance comes from the "
+                               "explicit SL price or atr_multiplier*ATR. Volatile names get smaller lots; "
+                               "the per-instrument cap and balance still apply as ceilings."
+                },
+                "risk_per_trade_pct": {
+                    "type": "float", "required": False, "default": 1.0,
+                    "description": "Max %% of equity to risk per trade (risk_atr mode)",
+                    "tooltip": "Only used when sizing_mode=risk_atr. The maximum fraction of equity lost if the "
+                               "stop-loss triggers. Institutional rule of thumb: 1%% (conservative) to 2%% (moderate)."
+                },
+                "atr_multiplier": {
+                    "type": "float", "required": False, "default": 2.0,
+                    "description": "ATR multiple for the implied stop distance (risk_atr mode)",
+                    "tooltip": "Only used when sizing_mode=risk_atr and no explicit SL price is available. The stop "
+                               "is placed atr_multiplier*ATR from entry; 1.5–2.0 is typical (absorbs normal noise)."
+                },
+                "atr_period": {
+                    "type": "int", "required": False, "default": 14,
+                    "description": "ATR lookback period in bars (risk_atr mode)",
+                    "tooltip": "Only used when sizing_mode=risk_atr. Standard ATR period is 14."
+                },
+                "min_stop_loss_pct": {
+                    "type": "float", "required": False, "default": 7.0,
+                    "description": "Minimum stop distance as %% of price (risk_atr mode)",
+                    "tooltip": "Only used when sizing_mode=risk_atr. Floors the stop distance used for "
+                               "sizing at this %% of price, so a too-tight SL or low ATR cannot oversize "
+                               "the position. Also used to synthesize an SL when only an explicit quantity "
+                               "is supplied. Default 7%%."
+                },
                 # AI Model Settings
                 "risk_manager_model": {
                     "type": "str", "required": True, "default": "NagaAC/gpt-5.1-2025-11-13",
