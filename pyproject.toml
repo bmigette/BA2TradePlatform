@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ba2trade-app"
+version = "0.1.0"
+description = "BA2 Trade Platform — live trading application (provides the `ba2-trade` console command)"
+requires-python = ">=3.11"
+# NOTE: runtime dependencies are intentionally NOT listed here — they are heavy
+# (nicegui, langchain, torch, the vendored TradingAgents tree) and continue to be
+# managed via requirements.txt + the ba2trade-* package chain (install.ps1/.sh in
+# BA2TradeCommon). This packaging exists ONLY to register the `ba2-trade` console
+# entry point and put the source tree on the path (editable install), so it adds
+# the command without triggering a full dependency resolution.
+
+[project.scripts]
+ba2-trade = "ba2_trade_platform.cli:main"
+
+[tool.setuptools]
+# Only the top package is declared; the editable path-finder makes every submodule
+# (incl. the vendored thirdparties/TradingAgents tree) importable at runtime.
+packages = ["ba2_trade_platform"]
+
+[tool.setuptools.package-data]
+"*" = []
