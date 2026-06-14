@@ -47,6 +47,15 @@ def initialize_system():
     from ba2_trade_platform.logger import logger
     import ba2_trade_platform.config as config
 
+    # Phase 6: wire the extracted-package seams (ba2_common / ba2_providers /
+    # ba2_experts) to the live implementations BEFORE any DB / provider / expert /
+    # LLM / instance resolution. This MUST precede the core.db import below and the
+    # worker-queue / smart-risk-manager-queue / job-manager imports, any of which
+    # may touch a seam at import time. wire_all_seams() is idempotent.
+    logger.info("Wiring ba2_common/providers/experts seams...")
+    from ba2_trade_platform.core.seam_wiring import wire_all_seams
+    wire_all_seams()
+
     # Import these after config has been updated from command-line args
     logger.info("Loading database module...")
     from ba2_trade_platform.core.db import init_db, get_db
