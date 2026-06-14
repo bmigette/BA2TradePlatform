@@ -5,12 +5,12 @@ It runs the repo-root ``main.py`` as ``__main__`` so the existing argument parsi
 and ``initialize_system()`` startup execute unchanged — the command is a thin,
 behaviour-preserving wrapper, not a second entry path.
 
-Works for an editable/source install (the dev setup): the repo root is resolved
-from this module's location. All CLI args are forwarded untouched to ``main.py``'s
-``parse_arguments()`` — so the command takes the SAME options as ``python main.py``
-does today, e.g.::
-
-    ba2-trade --db-file ./prod.sqlite --cache-folder ./cache --port 8081
+The repo root (and thus ``main.py``) is resolved from this module's location, so
+``ba2-trade`` always runs the code of the install it belongs to — the editable
+dev clone. Prod runs the same code with prod data simply by passing prod paths:
+``ba2-trade --db-file <prod.sqlite> --cache-folder <prod cache> --port 8081``.
+All CLI args are forwarded untouched to ``main.py``'s ``parse_arguments()`` — so
+the command takes the SAME options as ``python main.py`` does today.
 """
 from __future__ import annotations
 
