@@ -61,9 +61,9 @@ tzlocal
 # re-export shims. Installed editable into the live venv during development
 # (BA2TradeCommon/install.sh --editable); pinned here to the git/SSH form that
 # install.sh uses for non-editable deploys.
-ba2trade-common @ git+ssh://git@github.com/bmigette/BA2TradeCommon.git@main
-ba2trade-providers @ git+ssh://git@github.com/bmigette/BA2TradeProviders.git@main
-ba2trade-experts[ui] @ git+ssh://git@github.com/bmigette/BA2TradeExperts.git@main
+ba2trade-common @ git+ssh://git@github.com/bmigette/BA2TradeCommon.git@dev
+ba2trade-providers @ git+ssh://git@github.com/bmigette/BA2TradeProviders.git@dev
+ba2trade-experts[ui] @ git+ssh://git@github.com/bmigette/BA2TradeExperts.git@dev
 
 # Testing
 pytest>=8.0
