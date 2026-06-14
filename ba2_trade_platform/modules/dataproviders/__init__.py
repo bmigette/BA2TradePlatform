@@ -1,188 +1,78 @@
+"""Live provider registry (Phase 6 merge-shim).
+
+The provider implementations now live in ``ba2_providers`` (single source of
+truth). ``get_provider`` delegates to ``ba2_providers.get_provider`` for every
+category/name, with an OVERLAY for the three live-only AI providers that stayed in
+BA2TradePlatform (they need the live ModelFactory LLM stack and so were never
+extracted):
+
+    ("news", "ai")                 -> AINewsProvider
+    ("fundamentals_overview", "ai") -> AICompanyOverviewProvider
+    ("socialmedia", "ai")          -> AISocialMediaSentiment
+
+All provider classes the live ``__all__`` named are re-exported here so existing
+``from ba2_trade_platform.modules.dataproviders import X`` imports keep resolving.
+The package registry adds screener['fmp_historical'] (Phase 3) and the StockTwits
+socialmedia providers — preserved automatically by delegating to the package
+get_provider. The package get_provider's instantiate-then-TypeError-fallback logic
+is byte-identical to the original live registry.
 """
-BA2 Trade Platform - Data Providers Module
-
-This module contains all data provider implementations for the BA2 Trade Platform.
-Providers are organized by data type (indicators, fundamentals, news, macro, insider).
-
-Provider Registry:
-    Each subdirectory contains a registry mapping provider names to provider classes.
-    Use the get_provider() function to instantiate providers dynamically.
-
-Usage:
-    from ba2_trade_platform.modules.dataproviders import get_provider
-    
-    # Get a news provider
-    alpaca_news = get_provider("news", "alpaca")
-    news = alpaca_news.get_company_news("AAPL", end_date=datetime.now(), lookback_days=7)
-    
-    # Get an indicators provider (requires OHLCV provider)
-    from ba2_trade_platform.modules.dataproviders import YFinanceDataProvider
-    ohlcv_provider = YFinanceDataProvider()
-    pandas_indicators = get_provider("indicators", "pandas")(ohlcv_provider)
-    rsi = pandas_indicators.get_indicator("AAPL", "rsi", end_date=datetime.now(), lookback_days=30)
-"""
-
 from ba2_trade_platform.logger import logger
 
-from typing import Type, Dict
-from ba2_trade_platform.core.interfaces import (
-    DataProviderInterface,
-    MarketIndicatorsInterface,
-    CompanyFundamentalsOverviewInterface,
-    CompanyFundamentalsDetailsInterface,
-    MarketNewsInterface,
-    MacroEconomicsInterface,
-    CompanyInsiderInterface,
-    SocialMediaDataProviderInterface,
-    ScreenerProviderInterface
+# Package provider classes + helper (the non-AI providers, single source of truth).
+# ba2_providers has __all__, so `*` is bounded to its public provider classes.
+from ba2_providers import *  # noqa: F401,F403
+from ba2_providers import get_provider as _pkg_get_provider  # noqa: F401
+
+# The package's registry dicts are NOT in its __all__ but some live callers import
+# them by name (e.g. ``from ...dataproviders import OHLCV_PROVIDERS``). Re-export
+# them explicitly so those imports keep resolving.
+from ba2_providers import (  # noqa: F401
+    OHLCV_PROVIDERS,
+    INDICATORS_PROVIDERS,
+    FUNDAMENTALS_OVERVIEW_PROVIDERS,
+    FUNDAMENTALS_DETAILS_PROVIDERS,
+    NEWS_PROVIDERS,
+    MACRO_PROVIDERS,
+    INSIDER_PROVIDERS,
+    SOCIALMEDIA_PROVIDERS,
+    SCREENER_PROVIDERS,
 )
 
-# Legacy data provider (to be migrated)
-from .ohlcv.YFinanceDataProvider import YFinanceDataProvider
-from .ohlcv.AlphaVantageOHLCVProvider import AlphaVantageOHLCVProvider
-from .ohlcv.AlpacaOHLCVProvider import AlpacaOHLCVProvider
-from .ohlcv.FMPOHLCVProvider import FMPOHLCVProvider
+# Live-only AI providers (stayed in BA2TradePlatform; need ModelFactory):
+from .news.AINewsProvider import AINewsProvider
+from .fundamentals.overview.AICompanyOverviewProvider import AICompanyOverviewProvider
+from .socialmedia.AISocialMediaSentiment import AISocialMediaSentiment
 
-# Import provider implementations
-from .news import AlpacaNewsProvider, AlphaVantageNewsProvider, GoogleNewsProvider, AINewsProvider, FMPNewsProvider, FinnhubNewsProvider
-from .indicators import PandasIndicatorCalc, AlphaVantageIndicatorsProvider
-from .fundamentals import (
-    AlphaVantageCompanyOverviewProvider,
-    AICompanyOverviewProvider,
-    FMPCompanyOverviewProvider,
-    AlphaVantageCompanyDetailsProvider,
-    YFinanceCompanyDetailsProvider,
-    FMPCompanyDetailsProvider
-)
-from .macro import FREDMacroProvider
-from .insider import FMPInsiderProvider
-from .socialmedia import AISocialMediaSentiment
-from .screener import FMPScreenerProvider
-
-# Provider registries - will be populated as providers are implemented
-OHLCV_PROVIDERS: Dict[str, Type[DataProviderInterface]] = {
-    "yfinance": YFinanceDataProvider,
-    "alphavantage": AlphaVantageOHLCVProvider,
-    "alpaca": AlpacaOHLCVProvider,
-    "fmp": FMPOHLCVProvider,
-}
-INDICATORS_PROVIDERS: Dict[str, Type[MarketIndicatorsInterface]] = {
-    "pandas": PandasIndicatorCalc,
-    "alphavantage": AlphaVantageIndicatorsProvider,
-}
-
-FUNDAMENTALS_OVERVIEW_PROVIDERS: Dict[str, Type[CompanyFundamentalsOverviewInterface]] = {
-    "alphavantage": AlphaVantageCompanyOverviewProvider,
-    "ai": AICompanyOverviewProvider,
-    "fmp": FMPCompanyOverviewProvider,
-}
-
-FUNDAMENTALS_DETAILS_PROVIDERS: Dict[str, Type[CompanyFundamentalsDetailsInterface]] = {
-    "alphavantage": AlphaVantageCompanyDetailsProvider,
-    "yfinance": YFinanceCompanyDetailsProvider,
-    "fmp": FMPCompanyDetailsProvider,
-    # "simfin": SimFinFundamentalsDetailsProvider,
-}
-
-NEWS_PROVIDERS: Dict[str, Type[MarketNewsInterface]] = {
-    "alpaca": AlpacaNewsProvider,
-    "alphavantage": AlphaVantageNewsProvider,
-    "google": GoogleNewsProvider,
-    "ai": AINewsProvider,
-    "fmp": FMPNewsProvider,
-    "finnhub": FinnhubNewsProvider,
-    # "reddit": RedditNewsProvider,
-}
-
-MACRO_PROVIDERS: Dict[str, Type[MacroEconomicsInterface]] = {
-    "fred": FREDMacroProvider,
-}
-
-INSIDER_PROVIDERS: Dict[str, Type[CompanyInsiderInterface]] = {
-    "fmp": FMPInsiderProvider,
-    # "alphavantage": AlphaVantageInsiderProvider,
-    # "yfinance": YFinanceInsiderProvider,
-    # "finnhub": FinnhubInsiderProvider,
-}
-
-SOCIALMEDIA_PROVIDERS: Dict[str, Type[SocialMediaDataProviderInterface]] = {
-    "ai": AISocialMediaSentiment,
-}
-
-SCREENER_PROVIDERS: Dict[str, Type[ScreenerProviderInterface]] = {
-    "fmp": FMPScreenerProvider,
+# Overlay of the live-only AI providers keyed by (category, provider_name). The
+# keys mirror the original live registry exactly (note: 'fundamentals_overview',
+# NOT 'fundamentals').
+_LIVE_AI = {
+    ("news", "ai"): AINewsProvider,
+    ("fundamentals_overview", "ai"): AICompanyOverviewProvider,
+    ("socialmedia", "ai"): AISocialMediaSentiment,
 }
 
 
-def get_provider(category: str, provider_name: str, **kwargs) -> DataProviderInterface:
+def get_provider(category: str, provider_name: str, **kwargs):
+    """Get a provider instance by category and name.
+
+    Live-only AI providers are served from the overlay; everything else delegates
+    to the package registry. Mirrors the original instantiate-then-TypeError
+    fallback for both paths so kwargs-incompatible providers degrade identically.
     """
-    Get a provider instance by category and name.
-    
-    Args:
-        category: Provider category - one of:
-                 - 'ohlcv': OHLCV stock price data
-                 - 'indicators': Technical indicators
-                 - 'fundamentals': Complete fundamentals (overview + statements)
-                 - 'fundamentals_overview': Company fundamentals overview
-                 - 'fundamentals_details': Detailed financial statements
-                 - 'news': Market and company news
-                 - 'macro': Macroeconomic data
-                 - 'insider': Insider trading data
-                 - 'socialmedia': Social media sentiment analysis
-        provider_name: Provider name (e.g., 'alpaca', 'yfinance', 'alphavantage', 'openai')
-        **kwargs: Additional arguments to pass to the provider constructor
-                 (e.g., source='trading_agents' for Alpha Vantage providers)
-    
-    Returns:
-        DataProviderInterface: Instantiated provider
-    
-    Raises:
-        ValueError: If category or provider_name is not found
-    
-    Example:
-        >>> news_provider = get_provider("news", "alpaca")
-        >>> news = news_provider.get_company_news("AAPL", end_date=datetime.now(), lookback_days=7)
-        
-        >>> # With custom source for Alpha Vantage
-        >>> av_news = get_provider("news", "alphavantage", source="trading_agents")
-    """
-    registries = {
-        "ohlcv": OHLCV_PROVIDERS,
-        "indicators": INDICATORS_PROVIDERS,
-        "fundamentals_overview": FUNDAMENTALS_OVERVIEW_PROVIDERS,
-        "fundamentals_details": FUNDAMENTALS_DETAILS_PROVIDERS,
-        "news": NEWS_PROVIDERS,
-        "macro": MACRO_PROVIDERS,
-        "insider": INSIDER_PROVIDERS,
-        "socialmedia": SOCIALMEDIA_PROVIDERS,
-        "screener": SCREENER_PROVIDERS,
-    }
-
-    if category not in registries:
-        raise ValueError(
-            f"Unknown provider category: {category}. "
-            f"Available categories: {', '.join(registries.keys())}"
-        )
-    
-    provider_class = registries[category].get(provider_name)
-    if not provider_class:
-        available = ', '.join(registries[category].keys()) or 'none'
-        raise ValueError(
-            f"Provider '{provider_name}' not found in category '{category}'. "
-            f"Available providers: {available}"
-        )
-    
-    # Try to instantiate with kwargs, fall back to no-arg constructor for compatibility
-    try:
-        return provider_class(**kwargs)
-    except TypeError:
-        # Provider doesn't accept these kwargs, use default constructor
-        if kwargs:
-            logger.warning(
-                f"Provider {provider_name} in category {category} doesn't accept "
-                f"constructor arguments: {list(kwargs.keys())}. Using default constructor."
-            )
-        return provider_class()
+    cls = _LIVE_AI.get((category, provider_name))
+    if cls is not None:
+        try:
+            return cls(**kwargs)
+        except TypeError:
+            if kwargs:
+                logger.warning(
+                    f"Provider {provider_name} in category {category} doesn't accept "
+                    f"constructor arguments: {list(kwargs.keys())}. Using default constructor."
+                )
+            return cls()
+    return _pkg_get_provider(category, provider_name, **kwargs)
 
 
 __all__ = [
@@ -196,6 +86,7 @@ __all__ = [
     "GoogleNewsProvider",
     "AINewsProvider",
     "FMPNewsProvider",
+    "FinnhubNewsProvider",
     "PandasIndicatorCalc",
     "AlphaVantageIndicatorsProvider",
     "AlphaVantageCompanyOverviewProvider",
@@ -207,7 +98,10 @@ __all__ = [
     "FREDMacroProvider",
     "FMPInsiderProvider",
     "AISocialMediaSentiment",
+    "StockTwitsSentiment",
+    "StockTwitsTrending",
     "FMPScreenerProvider",
+    "FMPHistoricalScreenerProvider",
 
     # Helper functions
     "get_provider",

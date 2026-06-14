@@ -1,23 +1,11 @@
-"""
-Company Fundamentals Details Providers
+"""Alias shim: this in-tree module IS ba2_providers.fundamentals.details (Phase 6 migration).
 
-Providers for detailed financial statements (balance sheets, income statements, cash flow)
+The in-tree path is aliased to the package module object in sys.modules so
+existing ``from ba2_trade_platform...`` imports resolve unchanged AND
+``unittest.mock.patch`` / ``inspect.getsource`` targeting the in-tree path
+operate on the real package module. Single source of truth: ba2_providers.fundamentals.details."""
+import importlib as _importlib
+import sys as _sys
 
-Available Providers:
-    - AlphaVantage: Financial statements from Alpha Vantage API
-    - YFinance: Financial statements from Yahoo Finance
-    - SimFin: Financial statements from SimFin API
-"""
-
-from .AlphaVantageCompanyDetailsProvider import AlphaVantageCompanyDetailsProvider
-from .YFinanceCompanyDetailsProvider import YFinanceCompanyDetailsProvider
-from .FMPCompanyDetailsProvider import FMPCompanyDetailsProvider
-
-# TODO: Import additional provider implementations as they are created
-# from .SimFinFundamentalsDetailsProvider import SimFinFundamentalsDetailsProvider
-
-__all__ = [
-    "AlphaVantageCompanyDetailsProvider",
-    "YFinanceCompanyDetailsProvider",
-    "FMPCompanyDetailsProvider",
-]
+_pkg = _importlib.import_module("ba2_providers.fundamentals.details")
+_sys.modules[__name__] = _pkg

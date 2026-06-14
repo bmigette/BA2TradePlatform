@@ -1,21 +1,11 @@
-"""
-Company Insider Trading Data Providers
+"""Alias shim: this in-tree module IS ba2_providers.insider (Phase 6 migration).
 
-Providers for insider transactions and sentiment analysis
+The in-tree path is aliased to the package module object in sys.modules so
+existing ``from ba2_trade_platform...`` imports resolve unchanged AND
+``unittest.mock.patch`` / ``inspect.getsource`` targeting the in-tree path
+operate on the real package module. Single source of truth: ba2_providers.insider."""
+import importlib as _importlib
+import sys as _sys
 
-Available Providers:
-    - FMP: Financial Modeling Prep insider trading data
-    - AlphaVantage: Insider transactions from Alpha Vantage API (Not yet implemented)
-    - YFinance: Insider transactions from Yahoo Finance (Not yet implemented)
-    - Finnhub: Insider trading from Finnhub API (Not yet implemented)
-"""
-
-# Import provider implementations
-from .FMPInsiderProvider import FMPInsiderProvider
-# from .AlphaVantageInsiderProvider import AlphaVantageInsiderProvider
-# from .YFinanceInsiderProvider import YFinanceInsiderProvider
-# from .FinnhubInsiderProvider import FinnhubInsiderProvider
-
-__all__ = [
-    "FMPInsiderProvider",
-]
+_pkg = _importlib.import_module("ba2_providers.insider")
+_sys.modules[__name__] = _pkg

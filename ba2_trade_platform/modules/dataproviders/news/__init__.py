@@ -1,22 +1,22 @@
+"""Market News Data Providers (Phase 6 merge-shim).
+
+The non-AI news providers come from the package (single source of truth):
+``ba2_providers.news.{AlpacaNewsProvider, AlphaVantageNewsProvider,
+GoogleNewsProvider, FMPNewsProvider, FinnhubNewsProvider}``.
+The AI news provider (AINewsProvider) is live-only (it needs the live ModelFactory
+LLM stack), so it stays in this in-tree file and is re-exported here.
 """
-Market News Data Providers
+# Non-AI providers from the package:
+from ba2_providers.news import (  # noqa: F401
+    AlpacaNewsProvider,
+    AlphaVantageNewsProvider,
+    GoogleNewsProvider,
+    FMPNewsProvider,
+    FinnhubNewsProvider,
+)
 
-Providers for company-specific and global market news
-
-Available Providers:
-    - Alpaca: News from Alpaca Markets API
-    - AlphaVantage: News from Alpha Vantage API
-    - AI: AI-powered news search and analysis (supports OpenAI, NagaAI, etc.)
-    - Google: Google News scraping
-    - Finnhub: News from Finnhub API
-"""
-
-from .AlpacaNewsProvider import AlpacaNewsProvider
-from .AlphaVantageNewsProvider import AlphaVantageNewsProvider
-from .AINewsProvider import AINewsProvider
-from .GoogleNewsProvider import GoogleNewsProvider
-from .FMPNewsProvider import FMPNewsProvider
-from .FinnhubNewsProvider import FinnhubNewsProvider
+# Live-only AI provider (stays in BA2TradePlatform; needs ModelFactory):
+from .AINewsProvider import AINewsProvider  # noqa: F401
 
 __all__ = [
     "AlpacaNewsProvider",

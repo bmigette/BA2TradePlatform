@@ -1,17 +1,19 @@
+"""Company Fundamentals Overview Providers (Phase 6 merge-shim).
+
+The non-AI overview providers come from the package (single source of truth):
+``ba2_providers.fundamentals.overview.{AlphaVantageCompanyOverviewProvider,
+FMPCompanyOverviewProvider}``.
+The AI overview provider (AICompanyOverviewProvider) is live-only (it needs the
+live ModelFactory LLM stack), so it stays in this in-tree file and is re-exported.
 """
-Company Fundamentals Overview Providers
+# Non-AI providers from the package:
+from ba2_providers.fundamentals.overview import (  # noqa: F401
+    AlphaVantageCompanyOverviewProvider,
+    FMPCompanyOverviewProvider,
+)
 
-Providers for high-level company fundamentals (P/E ratio, market cap, EPS, etc.)
-
-Available Providers:
-    - AlphaVantage: Company overview from Alpha Vantage API
-    - AI: AI-powered company fundamentals (supports OpenAI, NagaAI, etc.)
-    - FMP: Company profile from Financial Modeling Prep API
-"""
-
-from .AlphaVantageCompanyOverviewProvider import AlphaVantageCompanyOverviewProvider
-from .AICompanyOverviewProvider import AICompanyOverviewProvider
-from .FMPCompanyOverviewProvider import FMPCompanyOverviewProvider
+# Live-only AI provider (stays in BA2TradePlatform; needs ModelFactory):
+from .AICompanyOverviewProvider import AICompanyOverviewProvider  # noqa: F401
 
 __all__ = [
     "AlphaVantageCompanyOverviewProvider",

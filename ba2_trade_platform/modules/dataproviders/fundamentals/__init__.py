@@ -12,6 +12,11 @@ Available Providers:
 - AlphaVantageCompanyDetailsProvider: Financial statements from Alpha Vantage
 - YFinanceCompanyDetailsProvider: Financial statements from Yahoo Finance
 - FMPCompanyDetailsProvider: Financial statements from Financial Modeling Prep
+
+Phase 6 note: ``overview``/``details`` below are now shims to ``ba2_providers``
+(``overview`` is a merge-shim that adds the live AICompanyOverviewProvider). This
+aggregator keeps re-exporting from the local sub-packages, so all names resolve
+unchanged.
 """
 
 from .overview import (

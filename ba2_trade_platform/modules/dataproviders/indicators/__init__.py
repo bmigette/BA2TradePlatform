@@ -1,18 +1,11 @@
-"""
-Indicators Data Providers
+"""Alias shim: this in-tree module IS ba2_providers.indicators (Phase 6 migration).
 
-Providers for technical indicators (RSI, MACD, SMA, EMA, etc.)
+The in-tree path is aliased to the package module object in sys.modules so
+existing ``from ba2_trade_platform...`` imports resolve unchanged AND
+``unittest.mock.patch`` / ``inspect.getsource`` targeting the in-tree path
+operate on the real package module. Single source of truth: ba2_providers.indicators."""
+import importlib as _importlib
+import sys as _sys
 
-Available Providers:
-    - AlphaVantage: Technical indicators from Alpha Vantage API
-    - PandasIndicatorCalc: Technical indicators calculated from any OHLCV data provider
-"""
-
-# Import provider implementations
-from .PandasIndicatorCalc import PandasIndicatorCalc
-from .AlphaVantageIndicatorsProvider import AlphaVantageIndicatorsProvider
-
-__all__ = [
-    "PandasIndicatorCalc",
-    "AlphaVantageIndicatorsProvider"
-]
+_pkg = _importlib.import_module("ba2_providers.indicators")
+_sys.modules[__name__] = _pkg

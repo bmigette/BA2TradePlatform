@@ -40,14 +40,14 @@ import pytest
 # Direct module loading (avoids triggering full package init chain)
 # ---------------------------------------------------------------------------
 
-_BASE = os.path.join(
-    os.path.dirname(__file__),
-    "..",
-    "ba2_trade_platform",
-    "modules",
-    "experts",
-    "PennyMomentumTrader",
-)
+# Phase 6: PennyMomentumTrader's implementation now lives in the ba2_experts
+# package (the in-tree modules/experts/PennyMomentumTrader/*.py are alias shims).
+# These tests load the source files directly + assert on their bodies, so point
+# _BASE at the package directory — the single source of truth. Use import_module
+# (not ``import ba2_experts.PennyMomentumTrader``) because the package __init__
+# binds the same-named *class* onto its namespace, shadowing the subpackage module.
+_penny_pkg = importlib.import_module("ba2_experts.PennyMomentumTrader")  # noqa: E402
+_BASE = os.path.dirname(_penny_pkg.__file__)
 
 # Ensure parent package path is loadable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))

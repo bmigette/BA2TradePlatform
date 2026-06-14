@@ -53,11 +53,25 @@ def test_run_analysis_ranks_and_rebalances():
          patch("ba2_trade_platform.modules.experts.FactorRanker.FactorPortfolioManager", return_value=pm_instance) as PM:
         expert.run_analysis("EXPERT", ma)
 
-    # Disabled factors must not be fetched.
-    fetch_px.assert_called_once()
+    # Disabled factors must not be fetched. Phase 6: the package FactorRanker's
+    # _gather fetches close prices twice — once for the momentum factor
+    # (_compute_factor) and once for the rebalance price snapshot — so it's the
+    # only price-fetching factor active (value/quality/pead disabled here). The
+    # pre-extraction in-tree code fetched once; the count is an internal detail of
+    # the (golden-verified) package _gather/_process split.
+    assert fetch_px.call_count == 2
+    for call in fetch_px.call_args_list:
+        assert call.args[0] == ["A", "B", "C"]
 
-    # Rebalanced to the equal-weight top-2 by momentum.
-    PM.assert_called_once_with(inst.id)
+    # Rebalanced to the equal-weight top-2 by momentum. Phase 6: the package
+    # FactorRanker constructs FactorPortfolioManager(self.id) twice — once in
+    # _gather_holdings() to read current holdings, once in run_analysis to rebalance
+    # — both keyed by the expert-instance id. (Pre-extraction in-tree code built it
+    # once; this is an internal detail of the golden-verified _gather/_process split.)
+    assert PM.call_count == 2
+    for call in PM.call_args_list:
+        assert call.args == (inst.id,)
+    pm_instance.rebalance.assert_called_once()
     (targets,), _ = pm_instance.rebalance.call_args
     assert set(targets) == {"A", "B"}
     assert round(targets["A"], 6) == round(targets["B"], 6) == 0.5
@@ -100,7 +114,12 @@ def test_run_analysis_skips_when_universe_empty():
     ma = create_market_analysis(symbol="EXPERT", expert_instance_id=inst.id)
     expert = _make_expert(inst.id, enabled_instruments={})
 
-    with patch("ba2_trade_platform.modules.experts.FactorRanker.FactorPortfolioManager") as PM:
+    # Phase 6: the package _gather computes the momentum factor (which builds an
+    # OHLCV provider) before the skip decision, so patch fetch_close_prices to keep
+    # the empty-universe path off the network. The subject under test is the SKIP
+    # decision (empty universe -> no portfolio manager, status SKIPPED).
+    with patch("ba2_trade_platform.modules.experts.FactorRanker.data.fetch_close_prices", return_value={}), \
+         patch("ba2_trade_platform.modules.experts.FactorRanker.FactorPortfolioManager") as PM:
         expert.run_analysis("EXPERT", ma)
 
     PM.assert_not_called()

@@ -21,14 +21,13 @@ import pytest
 # Direct module loading helpers (mirrors test_penny_fixes.py pattern)
 # ---------------------------------------------------------------------------
 
-_BASE = os.path.join(
-    os.path.dirname(__file__),
-    "..",
-    "ba2_trade_platform",
-    "modules",
-    "experts",
-    "PennyMomentumTrader",
-)
+# Phase 6: PennyMomentumTrader's implementation now lives in the ba2_experts
+# package (the in-tree modules are alias shims). Point _BASE at the package dir.
+# Use import_module (not ``import ba2_experts.PennyMomentumTrader``) because the
+# package __init__ binds the same-named *class*, shadowing the subpackage module.
+import importlib as _il
+_penny_pkg = _il.import_module("ba2_experts.PennyMomentumTrader")
+_BASE = os.path.dirname(_penny_pkg.__file__)
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 

@@ -62,11 +62,61 @@ def reset_test_db(test_engine):
     yield
 
 
+# ---------------------------------------------------------------------------
+# Phase 6 seam wiring (done at conftest import time, BEFORE any test module is
+# collected). The shimmed in-tree experts/interfaces now execute the *package*
+# code, which resolves expert/account instances via
+# ``ba2_common.core.instance_resolver.get_instance_resolver()`` and routes
+# TradeConditions provider lookups via ``set_provider_resolver``. Production wires
+# these in ``core/seam_wiring.wire_all_seams()`` at startup; the test process must
+# do the equivalent so package code does not raise *NotConfigured.
+#
+# This runs at MODULE IMPORT (not in a fixture) on purpose: some test modules
+# replace ``sys.modules['ba2_trade_platform']`` with a MagicMock at collection
+# time (direct-file-load tests). Wiring here, before collection, captures the real
+# get_provider/resolver while the package is still intact. The DB seam is handled
+# per-test by ``patch_db_engine``. The LLM-service seam is intentionally NOT wired
+# (it would import the heavy langchain ModelFactory; LLM-touching tests mock it).
+# ---------------------------------------------------------------------------
+def _wire_package_seams_for_tests():
+    from ba2_common.core.instance_resolver import set_instance_resolver
+    from ba2_trade_platform.core.instance_registry import LiveInstanceResolver
+    set_instance_resolver(LiveInstanceResolver())
+
+    from ba2_common.core import TradeConditions
+    from ba2_trade_platform.modules import dataproviders as _dp
+    # Use a dynamic resolver that looks up dataproviders.get_provider on each call,
+    # so tests that ``monkeypatch.setattr(dataproviders, "get_provider", ...)`` to
+    # inject a fake provider still take effect (the package TradeConditions holds
+    # the resolver, not the module attribute). Production wires get_provider
+    # directly; behaviour is identical for the unpatched case.
+    TradeConditions.set_provider_resolver(
+        lambda category, name, **kw: _dp.get_provider(category, name, **kw)
+    )
+
+
+_wire_package_seams_for_tests()
+
+
 @pytest.fixture(autouse=True)
 def patch_db_engine(test_engine):
-    """Monkeypatch the production db.engine so all code uses the test DB."""
-    with patch("ba2_trade_platform.core.db.engine", test_engine):
+    """Point the DB engine at the in-memory test DB so all code uses it.
+
+    Phase 6: the DB implementation now lives in the package (ba2_common.core.db),
+    which serves every helper (add_instance/get_db/...) from its own lazily-built
+    ``get_engine()`` (memoized in ``ba2_common.core.db._engine``). The in-tree
+    ``ba2_trade_platform.core.db`` is a re-export shim and no longer owns a real
+    ``engine`` global. So we seed the PACKAGE engine with the test engine for the
+    duration of each test (restoring the previous value afterwards), which is what
+    the package helpers actually consult.
+    """
+    import ba2_common.core.db as _pkg_db
+    _saved = _pkg_db._engine
+    _pkg_db._engine = test_engine
+    try:
         yield
+    finally:
+        _pkg_db._engine = _saved
 
 
 @pytest.fixture

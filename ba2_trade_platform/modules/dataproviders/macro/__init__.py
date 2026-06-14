@@ -1,14 +1,11 @@
-"""
-Macroeconomic Data Providers
+"""Alias shim: this in-tree module IS ba2_providers.macro (Phase 6 migration).
 
-Providers for macroeconomic indicators, yield curves, and Fed calendar data
+The in-tree path is aliased to the package module object in sys.modules so
+existing ``from ba2_trade_platform...`` imports resolve unchanged AND
+``unittest.mock.patch`` / ``inspect.getsource`` targeting the in-tree path
+operate on the real package module. Single source of truth: ba2_providers.macro."""
+import importlib as _importlib
+import sys as _sys
 
-Available Providers:
-    - FRED: Federal Reserve Economic Data (FRED) API
-"""
-
-from .FREDMacroProvider import FREDMacroProvider
-
-__all__ = [
-    "FREDMacroProvider",
-]
+_pkg = _importlib.import_module("ba2_providers.macro")
+_sys.modules[__name__] = _pkg

@@ -1,18 +1,18 @@
+"""Social Media Sentiment Data Providers (Phase 6 merge-shim).
+
+The StockTwits providers come from the package (single source of truth):
+``ba2_providers.socialmedia.{StockTwitsSentiment, StockTwitsTrending}``.
+The AI sentiment provider (AISocialMediaSentiment) is live-only (it needs the live
+ModelFactory LLM stack), so it stays in this in-tree file and is re-exported here.
 """
-Social Media Sentiment Data Providers
+# Non-AI providers from the package:
+from ba2_providers.socialmedia import (  # noqa: F401
+    StockTwitsSentiment,
+    StockTwitsTrending,
+)
 
-Providers for social media sentiment analysis across various platforms.
-
-Available Providers:
-    - AI: AI-powered sentiment analysis using web search across multiple platforms
-          Supports both OpenAI and NagaAI models with automatic API selection.
-    - StockTwits: Real-time StockTwits sentiment from public message stream
-                  Uses curl_cffi for Cloudflare bypass. No API key required.
-"""
-
-from .AISocialMediaSentiment import AISocialMediaSentiment
-from .StockTwitsSentiment import StockTwitsSentiment
-from .StockTwitsTrending import StockTwitsTrending
+# Live-only AI provider (stays in BA2TradePlatform; needs ModelFactory):
+from .AISocialMediaSentiment import AISocialMediaSentiment  # noqa: F401
 
 __all__ = [
     "AISocialMediaSentiment",

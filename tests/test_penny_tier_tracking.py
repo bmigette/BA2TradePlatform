@@ -12,14 +12,14 @@ refresh. Tiers are tracked by a stable id instead of by list index.
 import importlib.util
 import os
 
-_BASE = os.path.join(
-    os.path.dirname(__file__),
-    "..",
-    "ba2_trade_platform",
-    "modules",
-    "experts",
-    "PennyMomentumTrader",
-)
+# Phase 6: the leaf module now lives in the ba2_experts package (the in-tree
+# PennyMomentumTrader/tier_tracking.py is an alias shim). Load from the package.
+# Use import_module (not ``import ba2_experts.PennyMomentumTrader``) because the
+# package __init__ binds the same-named *class* onto its namespace, shadowing the
+# subpackage module on a plain import.
+import importlib as _il
+_penny_pkg = _il.import_module("ba2_experts.PennyMomentumTrader")
+_BASE = os.path.dirname(_penny_pkg.__file__)
 
 
 def _load(name, filepath):

@@ -65,8 +65,13 @@ def test_build_quality_inputs():
 
 AS_OF = datetime(2026, 6, 2, tzinfo=timezone.utc)
 
-OVERVIEW_MOD = "ba2_trade_platform.modules.dataproviders.fundamentals.overview.FMPCompanyOverviewProvider.FMPCompanyOverviewProvider"
-DETAILS_MOD = "ba2_trade_platform.modules.dataproviders.fundamentals.details.FMPCompanyDetailsProvider.FMPCompanyDetailsProvider"
+# Phase 6: FactorRanker.data now imports these providers from ba2_providers
+# (the in-tree dataproviders modules are alias shims). Patch the package paths —
+# the source of truth the package data.py actually constructs. (The class objects
+# are identical via the alias, but the package path resolves unambiguously to the
+# submodule, avoiding the submodule-vs-class shadow on the in-tree path.)
+OVERVIEW_MOD = "ba2_providers.fundamentals.overview.FMPCompanyOverviewProvider.FMPCompanyOverviewProvider"
+DETAILS_MOD = "ba2_providers.fundamentals.details.FMPCompanyDetailsProvider.FMPCompanyDetailsProvider"
 
 
 def _income(eps, net_income, gross_profit):
