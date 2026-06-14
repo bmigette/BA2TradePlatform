@@ -92,6 +92,29 @@ ba2_trade_platform/
 └── logger.py                # Centralized logging
 ```
 
+> **Phase 6 packages (source of truth for shared code).** As of the Phase 6
+> migration, the *implementation* of most pure/shared code under
+> `ba2_trade_platform/core`, `modules/dataproviders`, and `modules/experts` now
+> lives in three installable sibling packages — `ba2_common`
+> (`BA2TradeCommon`), `ba2_providers` (`BA2TradeProviders`), and `ba2_experts`
+> (`BA2TradeExperts`). The matching in-tree modules are now thin **re-export
+> shims** (e.g. `core/types.py`, `core/db.py`, `core/position_sizing.py`,
+> `core/TradeConditions.py`, the `core/interfaces/*`, the non-AI data providers,
+> and the clean experts), so every existing `from ba2_trade_platform...` import
+> keeps working unchanged. **When adding or changing shared code, contribute it
+> to the relevant package — not to the in-tree shim.** The shims only re-export;
+> edits to them are overwritten by the package source. Live-only pieces stay
+> real in-tree: `AlpacaAccount`/`IBKRAccount`/`TastyTradeAccount`, the Smart Risk
+> Manager stack, `TradingAgents`/`TradingAgentsUI`, the 3 AI providers
+> (`AINewsProvider`, `AICompanyOverviewProvider`, `AISocialMediaSentiment`),
+> `ModelFactory`/LLM stack, `JobManager`/`WorkerQueue`/`TradeManager`, the
+> instance caches, `InstrumentAutoAdder`, the UI, and `MarketAnalysisPDFExport`.
+> The packages are consumed via seams wired at startup by
+> `core/seam_wiring.py:wire_all_seams()` (called first in
+> `main.initialize_system()`): instance resolver, LLM service, DB config,
+> `TradeConditions` provider resolver, the instrument-auto-adder hook, and the
+> classic-RM ATR indicator provider.
+
 ### Database
 - SQLite at `~/Documents/ba2_trade_platform/db.sqlite`
 - Key models: `AccountDefinition`, `ExpertInstance`, `ExpertRecommendation`, `MarketAnalysis`, `TradingOrder`, `Transaction`, `Ruleset`, `EventAction`
@@ -108,8 +131,17 @@ Located in `ba2_trade_platform/thirdparties/TradingAgents/`. Multi-agent system 
 Check `core/utils.py` for existing helpers before writing new code. Key functions:
 - `close_transaction_with_logging()` - Transaction closures with P&L
 - `log_close_order_activity()` - Activity logging for orders
-- `get_expert_instance_from_id()` - Cached expert instance retrieval
-- `get_account_instance_from_id()` - Cached account instance retrieval
+- `get_expert_instance_from_id()` - Cached expert instance retrieval (live-only factory)
+- `get_account_instance_from_id()` - Cached account instance retrieval (live-only factory)
+
+After Phase 6, `core/utils.py` is a **split shim**: the shared pure helpers are
+re-exported from `ba2_common.core.utils` (the source of truth — add new shared
+helpers there), while the 3 instance-factory functions
+(`get_expert_instance_from_id`, `get_account_instance_from_id`,
+`get_account_instance_from_transaction`) stay live in-tree because they depend on
+the live registries and instance caches. New *shared* code belongs in the
+packages (`ba2_common`/`ba2_providers`/`ba2_experts`); new *live-only* code
+(broker/Smart-RM/TradingAgents/UI/LLM) belongs in-tree.
 
 ### Database Operations
 ```python
