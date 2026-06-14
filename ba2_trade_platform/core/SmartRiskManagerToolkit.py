@@ -1889,7 +1889,20 @@ class SmartRiskManagerToolkit:
             max_pos_pct = float(self.expert.get_setting_with_interface_default("max_virtual_equity_per_instrument_percent", log_warning=False) or 10.0)
             max_position_value = (equity or 0) * (max_pos_pct / 100.0)
 
-            atr = None if sl_price else get_latest_atr(symbol, period=atr_period)
+            # get_latest_atr now lives in ba2_common.core.position_sizing (Phase 6
+            # shim) and requires an injected MarketIndicatorsInterface provider
+            # (ba2_common never imports ba2_providers). Thread the live host's
+            # default indicator provider, mirroring the classic RM's
+            # _risk_atr_quantity. Best-effort: a provider-build failure degrades to
+            # None, which get_latest_atr already handles by returning None.
+            indicator_provider = None
+            if not sl_price:
+                try:
+                    from .seam_helpers import get_default_indicator_provider
+                    indicator_provider = get_default_indicator_provider()
+                except Exception as e:
+                    self.logger.warning(f"could not build indicator provider for ATR sizing of {symbol}: {e}")
+            atr = None if sl_price else get_latest_atr(symbol, indicator_provider, period=atr_period)
             try:
                 available = self.expert.get_available_balance()
             except Exception:
