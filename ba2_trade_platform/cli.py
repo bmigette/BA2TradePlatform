@@ -6,8 +6,11 @@ and ``initialize_system()`` startup execute unchanged — the command is a thin,
 behaviour-preserving wrapper, not a second entry path.
 
 Works for an editable/source install (the dev setup): the repo root is resolved
-from this module's location. Forward any CLI args (``ba2-trade --port 9090`` …) —
-they reach ``parse_arguments()`` untouched.
+from this module's location. All CLI args are forwarded untouched to ``main.py``'s
+``parse_arguments()`` — so the command takes the SAME options as ``python main.py``
+does today, e.g.::
+
+    ba2-trade --db-file ./prod.sqlite --cache-folder ./cache --port 8081
 """
 from __future__ import annotations
 
