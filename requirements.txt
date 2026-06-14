@@ -55,6 +55,16 @@ google-generativeai
 
 tzlocal
 
+# --- Extracted BA2 packages (Phase 6 migration) ---
+# Implementation of core interfaces/providers/clean-experts now lives in these
+# three sibling packages; the in-tree ba2_trade_platform.* modules become thin
+# re-export shims. Installed editable into the live venv during development
+# (BA2TradeCommon/install.sh --editable); pinned here to the git/SSH form that
+# install.sh uses for non-editable deploys.
+ba2trade-common @ git+ssh://git@github.com/bmigette/BA2TradeCommon.git@main
+ba2trade-providers @ git+ssh://git@github.com/bmigette/BA2TradeProviders.git@main
+ba2trade-experts[ui] @ git+ssh://git@github.com/bmigette/BA2TradeExperts.git@main
+
 # Testing
 pytest>=8.0
 pytest-cov>=5.0
