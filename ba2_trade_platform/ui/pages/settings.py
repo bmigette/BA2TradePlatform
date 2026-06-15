@@ -1759,6 +1759,74 @@ class ExpertSettingsTab:
                                     ui.label('%').classes('text-sm')
                                 ui.label('Minimum available balance percentage required to enter new market positions. Lower values (5-10%) allow more aggressive trading, higher values (15-25%) provide more conservative risk management.').classes('text-body2 text-grey-7 ml-2')
 
+                                # Risk-based (ATR) sizing builtins - visible/editable for every expert.
+                                # Pull defaults/descriptions/valid_values from the builtin definitions.
+                                from ...core.interfaces.MarketExpertInterface import MarketExpertInterface
+                                MarketExpertInterface._ensure_builtin_settings()
+
+                                sizing_mode_def = MarketExpertInterface._builtin_settings.get('sizing_mode', {})
+                                sizing_mode_default = sizing_mode_def.get('default', 'notional')
+                                sizing_mode_values = sizing_mode_def.get('valid_values', ['notional', 'risk_atr'])
+
+                                risk_per_trade_pct_def = MarketExpertInterface._builtin_settings.get('risk_per_trade_pct', {})
+                                risk_per_trade_pct_default = risk_per_trade_pct_def.get('default', 1.0)
+
+                                atr_multiplier_def = MarketExpertInterface._builtin_settings.get('atr_multiplier', {})
+                                atr_multiplier_default = atr_multiplier_def.get('default', 2.0)
+
+                                atr_period_def = MarketExpertInterface._builtin_settings.get('atr_period', {})
+                                atr_period_default = atr_period_def.get('default', 14)
+
+                                min_stop_loss_pct_def = MarketExpertInterface._builtin_settings.get('min_stop_loss_pct', {})
+                                min_stop_loss_pct_default = min_stop_loss_pct_def.get('default', 7.0)
+
+                                # Sizing mode select - always shown
+                                with ui.row().classes('items-center gap-2 mt-2'):
+                                    ui.label('Sizing mode:').classes('text-sm font-medium')
+                                    self.sizing_mode_select = ui.select(
+                                        options={v: v for v in sizing_mode_values},
+                                        value=sizing_mode_default,
+                                        on_change=lambda e: self.risk_atr_settings_container.set_visibility(e.value == 'risk_atr')
+                                    ).classes('w-40')
+                                ui.label(sizing_mode_def.get('description', 'How position size is computed')).classes('text-body2 text-grey-7 ml-2')
+
+                                # risk_atr knobs - only visible when sizing_mode == risk_atr
+                                with ui.column().classes('w-full gap-2') as self.risk_atr_settings_container:
+                                    with ui.row().classes('items-center gap-2 mt-2'):
+                                        ui.label('Risk per trade (%):').classes('text-sm font-medium')
+                                        self.risk_per_trade_pct_input = ui.input(
+                                            value=str(risk_per_trade_pct_default),
+                                            placeholder=str(risk_per_trade_pct_default)
+                                        ).classes('w-20')
+                                        ui.label('%').classes('text-sm')
+
+                                    with ui.row().classes('items-center gap-2 mt-2'):
+                                        ui.label('ATR multiplier:').classes('text-sm font-medium')
+                                        self.atr_multiplier_input = ui.input(
+                                            value=str(atr_multiplier_default),
+                                            placeholder=str(atr_multiplier_default)
+                                        ).classes('w-20')
+
+                                    with ui.row().classes('items-center gap-2 mt-2'):
+                                        ui.label('ATR period (bars):').classes('text-sm font-medium')
+                                        self.atr_period_input = ui.input(
+                                            value=str(atr_period_default),
+                                            placeholder=str(atr_period_default)
+                                        ).classes('w-20')
+
+                                    with ui.row().classes('items-center gap-2 mt-2'):
+                                        ui.label('Min stop loss (%):').classes('text-sm font-medium')
+                                        self.min_stop_loss_pct_input = ui.input(
+                                            value=str(min_stop_loss_pct_default),
+                                            placeholder=str(min_stop_loss_pct_default)
+                                        ).classes('w-20')
+                                        ui.label('%').classes('text-sm')
+
+                                    ui.label('Risk-based sizing: quantity = (equity × risk_per_trade_pct%) ÷ stop-distance-per-share. risk_per_trade_pct is the $ budget (max % of EQUITY to lose per trade). The stop distance is |entry − stop| when an SL is known, else atr_multiplier × ATR. min_stop_loss_pct floors the stop distance (as % of price) so a tiny ATR can\'t oversize the lot. Only used when sizing_mode = risk_atr.').classes('text-body2 text-grey-7 ml-2')
+
+                                # Set initial visibility based on the default; load handler updates it when editing.
+                                self.risk_atr_settings_container.set_visibility(sizing_mode_default == 'risk_atr')
+
                         # Risk manager section - hidden for experts that manage their own risk
                         with ui.column().classes('w-full') as self.risk_manager_section:
                             ui.separator().classes('my-4')
@@ -2424,6 +2492,46 @@ class ExpertSettingsTab:
 
             if hasattr(self, 'min_available_balance_pct_input'):
                 self.min_available_balance_pct_input.value = str(min_available_balance_pct)
+
+            # Load risk_atr (risk-based) sizing builtins. As above, a stored None
+            # means "use the interface default" (settings_source pre-fills None).
+            from ...core.interfaces.MarketExpertInterface import MarketExpertInterface
+            MarketExpertInterface._ensure_builtin_settings()
+
+            sizing_mode = settings_source.get('sizing_mode')
+            if sizing_mode is None:
+                sizing_mode = MarketExpertInterface._builtin_settings.get('sizing_mode', {}).get('default', 'notional')
+            if hasattr(self, 'sizing_mode_select'):
+                self.sizing_mode_select.value = sizing_mode
+
+            risk_per_trade_pct = settings_source.get('risk_per_trade_pct')
+            if risk_per_trade_pct is None:
+                risk_per_trade_pct = MarketExpertInterface._builtin_settings.get('risk_per_trade_pct', {}).get('default', 1.0)
+            if hasattr(self, 'risk_per_trade_pct_input'):
+                self.risk_per_trade_pct_input.value = str(risk_per_trade_pct)
+
+            atr_multiplier = settings_source.get('atr_multiplier')
+            if atr_multiplier is None:
+                atr_multiplier = MarketExpertInterface._builtin_settings.get('atr_multiplier', {}).get('default', 2.0)
+            if hasattr(self, 'atr_multiplier_input'):
+                self.atr_multiplier_input.value = str(atr_multiplier)
+
+            atr_period = settings_source.get('atr_period')
+            if atr_period is None:
+                atr_period = MarketExpertInterface._builtin_settings.get('atr_period', {}).get('default', 14)
+            if hasattr(self, 'atr_period_input'):
+                self.atr_period_input.value = str(atr_period)
+
+            min_stop_loss_pct = settings_source.get('min_stop_loss_pct')
+            if min_stop_loss_pct is None:
+                min_stop_loss_pct = MarketExpertInterface._builtin_settings.get('min_stop_loss_pct', {}).get('default', 7.0)
+            if hasattr(self, 'min_stop_loss_pct_input'):
+                self.min_stop_loss_pct_input.value = str(min_stop_loss_pct)
+
+            # Set risk_atr container visibility from the loaded sizing_mode so an
+            # expert already in risk_atr shows the knobs when the dialog opens.
+            if hasattr(self, 'risk_atr_settings_container'):
+                self.risk_atr_settings_container.set_visibility(sizing_mode == 'risk_atr')
 
             # Load AI model settings
             risk_manager_model = settings_source.get('risk_manager_model', 'nagaai/gpt5')
@@ -3993,6 +4101,32 @@ class ExpertSettingsTab:
             min_balance_value = float(self.min_available_balance_pct_input.value or 10.0)
             expert.save_setting('min_available_balance_pct', min_balance_value, setting_type="float")
             logger.debug(f'Saved risk management: min_available_balance_pct={min_balance_value}%')
+
+        # Save risk_atr (risk-based) sizing builtins
+        if hasattr(self, 'sizing_mode_select'):
+            sizing_mode_value = str(self.sizing_mode_select.value or 'notional')
+            expert.save_setting('sizing_mode', sizing_mode_value, setting_type="str")
+            logger.debug(f'Saved risk management: sizing_mode={sizing_mode_value}')
+
+        if hasattr(self, 'risk_per_trade_pct_input'):
+            risk_per_trade_pct_value = float(self.risk_per_trade_pct_input.value or 1.0)
+            expert.save_setting('risk_per_trade_pct', risk_per_trade_pct_value, setting_type="float")
+            logger.debug(f'Saved risk management: risk_per_trade_pct={risk_per_trade_pct_value}%')
+
+        if hasattr(self, 'atr_multiplier_input'):
+            atr_multiplier_value = float(self.atr_multiplier_input.value or 2.0)
+            expert.save_setting('atr_multiplier', atr_multiplier_value, setting_type="float")
+            logger.debug(f'Saved risk management: atr_multiplier={atr_multiplier_value}')
+
+        if hasattr(self, 'atr_period_input'):
+            atr_period_value = int(float(self.atr_period_input.value or 14))
+            expert.save_setting('atr_period', atr_period_value, setting_type="int")
+            logger.debug(f'Saved risk management: atr_period={atr_period_value}')
+
+        if hasattr(self, 'min_stop_loss_pct_input'):
+            min_stop_loss_pct_value = float(self.min_stop_loss_pct_input.value or 7.0)
+            expert.save_setting('min_stop_loss_pct', min_stop_loss_pct_value, setting_type="float")
+            logger.debug(f'Saved risk management: min_stop_loss_pct={min_stop_loss_pct_value}%')
 
         # Save AI model settings
         if hasattr(self, 'risk_manager_model_input'):
