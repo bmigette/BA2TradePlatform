@@ -9,7 +9,7 @@ from ...core.db import get_db, get_all_instances, delete_instance, add_instance,
 from ...modules.accounts import providers
 from ...core.interfaces import AccountInterface
 from ...core.utils import get_account_instance_from_id, get_expert_instance_from_id
-from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_numeric_event, is_adjustment_action, is_share_adjustment_action, is_option_action, AnalysisUseCase, MarketAnalysisStatus, get_action_type_display_label
+from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_numeric_event, is_adjustment_action, is_share_adjustment_action, is_option_action, AnalysisUseCase, MarketAnalysisStatus, get_action_type_display_label, get_operator_options
 from ...core.cleanup import preview_cleanup, execute_cleanup, get_cleanup_statistics
 from yahooquery import Ticker, search as yq_search
 from nicegui.events import UploadEventArguments
@@ -4835,7 +4835,7 @@ class TradeSettingsTab:
                         with value_container:
                             nonlocal operator_select, value_input
                             operator_select = ui.select(
-                                options=['<', '>', '=', '!=', '<=', '>='],
+                                options=get_operator_options(),
                                 label='Op',
                                 value=trigger_config.get('operator', '>') if trigger_config else '>'
                             ).classes('w-32').props('dense')
