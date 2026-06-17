@@ -1901,7 +1901,7 @@ class SmartRiskManagerToolkit:
                     from .seam_helpers import get_default_indicator_provider
                     indicator_provider = get_default_indicator_provider()
                 except Exception as e:
-                    self.logger.warning(f"could not build indicator provider for ATR sizing of {symbol}: {e}")
+                    logger.warning(f"could not build indicator provider for ATR sizing of {symbol}: {e}")
             atr = None if sl_price else get_latest_atr(symbol, indicator_provider, period=atr_period)
             try:
                 available = self.expert.get_available_balance()
@@ -1923,7 +1923,7 @@ class SmartRiskManagerToolkit:
                     current_price - rps if order_direction == OrderDirection.BUY else current_price + rps, 2)
             return result
         except Exception as e:
-            self.logger.warning(f"_auto_size_by_risk failed for {symbol}: {e}")
+            logger.warning(f"_auto_size_by_risk failed for {symbol}: {e}")
             return {"quantity": 0, "reason": str(e)}
 
     def _open_position_internal(
@@ -1967,7 +1967,7 @@ class SmartRiskManagerToolkit:
                         quantity = auto["quantity"]
                         if not sl_price and auto.get("implied_sl"):
                             sl_price = auto["implied_sl"]
-                        self.logger.info(f"Auto-sized {direction} {symbol}: {quantity} shares ({auto.get('detail','')})")
+                        logger.info(f"Auto-sized {direction} {symbol}: {quantity} shares ({auto.get('detail','')})")
                     else:
                         return {
                             "success": False,
@@ -1996,7 +1996,7 @@ class SmartRiskManagerToolkit:
                             "symbol": symbol, "quantity": 0, "direction": direction,
                         }
                     if d["quantity"] != quantity:
-                        self.logger.info(f"Reduced {direction} {symbol} qty {quantity} -> {d['quantity']} "
+                        logger.info(f"Reduced {direction} {symbol} qty {quantity} -> {d['quantity']} "
                                          f"to keep stop >= {min_stop:g}% (synthesized SL ${d['sl_price']}, {d['stop_pct']}%)")
                     quantity = d["quantity"]
                     sl_price = d["sl_price"]
@@ -2051,7 +2051,7 @@ class SmartRiskManagerToolkit:
                                 "direction": direction
                             }
                         # Hedging is allowed - continue with position opening
-                        self.logger.info(f"Hedging enabled: Opening {direction} position while {existing_direction.value} position exists for {symbol}")
+                        logger.info(f"Hedging enabled: Opening {direction} position while {existing_direction.value} position exists for {symbol}")
             
             # Check if symbol is enabled in expert settings
             # Skip check for dynamic/expert/screener instrument selection modes (runtime-determined)
