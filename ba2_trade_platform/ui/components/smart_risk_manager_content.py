@@ -282,12 +282,12 @@ class SmartRiskManagerContentRenderer:
                 
                 # Display each action with full details
                 for i, action in enumerate(actions_log):
-                    self._render_single_action(i, action)
+                    self._render_single_action(i, action, job)
                 
         except (json.JSONDecodeError, TypeError, AttributeError) as e:
             logger.debug(f"Could not extract actions_log from graph_state: {e}")
     
-    def _render_single_action(self, index: int, action: dict) -> None:
+    def _render_single_action(self, index: int, action: dict, job: SmartRiskManagerJob = None) -> None:
         """Render a single action from the actions log."""
         # Extract symbol from arguments or result
         symbol = None
@@ -381,7 +381,96 @@ class SmartRiskManagerContentRenderer:
                 if action.get('error'):
                     ui.label('Error:').classes(f'text-sm font-bold mt-2 {self._text_class("negative")}').style(self._text_style("negative"))
                     ui.label(action['error']).classes(f'text-sm whitespace-pre-wrap {self._text_class("negative")}').style(self._text_style("negative"))
-    
+
+                # Manual Retry — only for FAILED, re-executable open actions. Rebuilds the
+                # toolkit from the job's expert/account and re-runs the same open with the
+                # original arguments (the toolkit guards duplicates internally).
+                _retryable = action_name in ('open_buy_position', 'open_sell_position')
+                if job is not None and not success and _retryable:
+                    ui.button(
+                        'Retry',
+                        icon='refresh',
+                        on_click=lambda a=action, j=job: self._retry_action(a, j),
+                    ).props('color=primary outline size=sm').classes('mt-2')
+
+    async def _retry_action(self, action: dict, job: SmartRiskManagerJob) -> None:
+        """Manually re-execute a failed open action from the UI.
+
+        Rebuilds a SmartRiskManagerToolkit for the job's expert+account and re-runs the
+        same open_buy/sell_position with the action's saved arguments. The toolkit handles
+        duplicate/hedging guards. The broker call runs off the event loop; the outcome is
+        appended to the job's actions_log and the page reloads to show it."""
+        from nicegui import run
+
+        action_type = action.get('action_type') or action.get('action')
+        args = dict(action.get('arguments') or {})
+        symbol = args.get('symbol') or (action.get('result') or {}).get('symbol')
+        if action_type not in ('open_buy_position', 'open_sell_position'):
+            ui.notify(f"Retry not supported for '{action_type}'", type='warning')
+            return
+        try:
+            from ...core.SmartRiskManagerToolkit import SmartRiskManagerToolkit
+            toolkit = SmartRiskManagerToolkit(job.expert_instance_id, job.account_id)
+            quantity = args.get('quantity')
+            if quantity is not None:
+                quantity = int(quantity)
+            tp_price = args.get('tp_price')
+            sl_price = args.get('sl_price')
+            reason = action.get('reason') or action.get('reasoning') or 'Manual retry from UI'
+            confidence = action.get('confidence') or 0.0
+            market_analysis_id = args.get('market_analysis_id')
+
+            ui.notify(f"Retrying {action_type} for {symbol}…", type='ongoing')
+            fn = (toolkit.open_buy_position if action_type == 'open_buy_position'
+                  else toolkit.open_sell_position)
+            # Run the (blocking, broker-bound) open off the event loop so the UI stays live.
+            result = await run.io_bound(
+                fn, symbol, quantity, tp_price, sl_price, reason, confidence, market_analysis_id
+            )
+
+            self._append_retry_to_log(job, action_type, args, result)
+            if result and result.get('success'):
+                ui.notify(f"Retry succeeded: {result.get('message', '')}", type='positive', timeout=8000)
+                ui.navigate.reload()
+            else:
+                msg = (result or {}).get('message', 'unknown error')
+                ui.notify(f"Retry failed: {msg}", type='negative', timeout=10000)
+                ui.navigate.reload()
+        except Exception as e:  # noqa: BLE001 — surface any retry failure to the user
+            logger.error(f"Manual retry failed for {symbol}: {e}", exc_info=True)
+            ui.notify(f"Retry error: {e}", type='negative', timeout=10000)
+
+    def _append_retry_to_log(self, job: SmartRiskManagerJob, action_type: str,
+                             args: dict, result: dict) -> None:
+        """Append the manual-retry outcome to the job's graph_state actions_log so the
+        history reflects it. Best-effort: a persistence hiccup must not break the retry."""
+        try:
+            from ...core.db import get_db
+            with get_db() as session:
+                fresh = session.get(SmartRiskManagerJob, job.id)
+                if not fresh:
+                    return
+                state = fresh.graph_state
+                if isinstance(state, str):
+                    state = json.loads(state) if state else {}
+                elif not isinstance(state, dict):
+                    state = {}
+                log = list(state.get('actions_log') or [])
+                log.append({
+                    'action_type': action_type,
+                    'arguments': args,
+                    'success': bool(result and result.get('success')),
+                    'result': result,
+                    'reason': 'Manual retry from UI',
+                    'source': 'manual_retry',
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                })
+                fresh.graph_state = {**state, 'actions_log': log}  # new dict -> JSON dirty
+                session.add(fresh)
+                session.commit()
+        except Exception as e:  # noqa: BLE001 — logging the retry is non-critical
+            logger.warning(f"could not append manual retry to actions_log: {e}")
+
     def _render_action_result(self, result: dict) -> None:
         """Render action result details."""
         ui.label('Result:').classes(f'text-sm font-bold mt-2 {self._text_class("secondary")}').style(self._text_style("secondary"))
