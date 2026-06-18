@@ -8,7 +8,9 @@ HOME = os.path.abspath(os.path.join(os.path.dirname(__file__)))
 HOME_PARENT = os.path.abspath(os.path.join(HOME, ".."))
 
 # Default paths - can be overridden via command-line arguments / env.
-LOG_FOLDER = os.path.join(HOME_PARENT, 'logs')
+# Logs go under the trade/ data bucket (NOT the repo); per-instance runs relocate to
+# <db folder>/logs via configure_db. --log-folder / LOG_FOLDER env still override.
+LOG_FOLDER = os.getenv("LOG_FOLDER", os.path.join(_TRADE_DIR, 'logs'))
 # Live trade DB is DATA -> lives in the trade/ bucket (NOT common). main.py wires
 # ba2_common.core.db to this at startup so the engine points here. Env still wins.
 DB_FILE = os.getenv("DB_FILE", os.path.join(_TRADE_DIR, "db.sqlite"))
