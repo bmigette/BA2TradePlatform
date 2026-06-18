@@ -7,7 +7,7 @@ python-dotenv
 yahooquery
 APScheduler
 alembic
-reportlab
+reportlab<5  # pin: reportlab 5.0 untested on live trade app (PDF export) — keep on 4.x
 plotly
 fmpsdk
 ib_async
@@ -19,7 +19,7 @@ langchain-experimental
 langchain_core
 langchain_anthropic
 langchain-text-splitters
-pandas
+pandas<3  # pin: pandas 3.0 (CoW default, dtype changes) untested on live trade app — keep on 2.x
 yfinance
 praw
 feedparser
