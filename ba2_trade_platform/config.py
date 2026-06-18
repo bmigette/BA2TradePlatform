@@ -1,12 +1,19 @@
 import os
 from typing import Optional
-HOME = os.path.abspath(os.path.join(os.path.dirname(__file__))) 
-HOME_PARENT = os.path.abspath(os.path.join(HOME, "..")) 
+# Shared BA2 data layout (single source of truth in ba2_common.config):
+#   trade/  -> this live platform's instance DB (DATA, per-platform)
+#   common/cache -> shared raw provider cache (OHLCV/fmp_history/screener/options)
+from ba2_common.config import TRADE_DIR as _TRADE_DIR, CACHE_FOLDER as _COMMON_CACHE
+HOME = os.path.abspath(os.path.join(os.path.dirname(__file__)))
+HOME_PARENT = os.path.abspath(os.path.join(HOME, ".."))
 
-# Default paths - can be overridden via command-line arguments
+# Default paths - can be overridden via command-line arguments / env.
 LOG_FOLDER = os.path.join(HOME_PARENT, 'logs')
-DB_FILE = os.path.join(os.path.expanduser("~"), "Documents", "ba2_trade_platform", "db.sqlite")
-CACHE_FOLDER = os.path.join(os.path.expanduser("~"), "Documents", "ba2_trade_platform", "cache")
+# Live trade DB is DATA -> lives in the trade/ bucket (NOT common). main.py wires
+# ba2_common.core.db to this at startup so the engine points here. Env still wins.
+DB_FILE = os.getenv("DB_FILE", os.path.join(_TRADE_DIR, "db.sqlite"))
+# Shared raw provider cache lives in common/ (shared with the test platform).
+CACHE_FOLDER = os.getenv("CACHE_FOLDER", _COMMON_CACHE)
 
 # Default HTTP port for the web interface
 HTTP_PORT = 8080

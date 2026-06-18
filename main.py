@@ -158,6 +158,15 @@ if __name__ in {"__main__", "__mp_main__"}:
     config.CACHE_FOLDER = args.cache_folder
     config.LOG_FOLDER = args.log_folder
     config.HTTP_PORT = args.port
+
+    # Propagate the --db-file / --cache-folder overrides to ba2_common so the
+    # shared packages follow them too: ba2_providers reads ba2_common.config.
+    # CACHE_FOLDER at call-time (not the live config), and any ba2_common.config.
+    # DB_FILE reads must match. configure_db(config.DB_FILE) (in seam_wiring)
+    # already repoints the engine; this keeps the module-level constants in sync.
+    import ba2_common.config as _cc
+    _cc.DB_FILE = args.db_file
+    _cc.CACHE_FOLDER = args.cache_folder
     
     # Suppress NiceGUI RuntimeWarning for unawaited coroutines in input.py
     # This is expected behavior in NiceGUI when synchronously updating input values
