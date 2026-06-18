@@ -1060,3 +1060,51 @@ Project that uses *TradingAgents*  https://github.com/TauricResearch/TradingAgen
       url={https://arxiv.org/abs/2412.20138}, 
 }
 ```
+
+## Install / first run
+
+The live trader shares its core packages (editable installs) with the rest of
+the BA2 stack:
+
+```bash
+# from the live venv (.venv)
+.venv/bin/pip install -e ../BA2TradeCommon -e ../BA2TradeProviders -e ../BA2TradeExperts
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python main.py            # serves the NiceGUI UI on :8080
+```
+
+API keys (FMP, Finnhub, ...) live in the **shared** app-settings DB and are read
+by both the live trader and the backtester (BA2TestPlatform).
+
+## Data & cache layout
+
+Nothing is cached inside the code repos. Shared cache/data lives under a single
+root, **`BA2_HOME`** (env-overridable, default `~/Documents/ba2`):
+
+```
+BA2_HOME  (default ~/Documents/ba2)
+├── common/                 # SHARED with the backtester
+│   ├── cache/              # raw provider cache: OHLCV parquet, as_of cache, fmp_history   (CACHE_FOLDER)
+│   ├── db.sqlite           # shared app-settings / API-keys DB (FMP, Finnhub, ...)         (DB_FILE)
+│   └── options/            # options-history cache
+└── trade/                  # screener caches + your live trade instance DBs
+    └── screener/           # metric_store/ (parquet) + screener_history.sqlite
+```
+
+- The **shared app-settings/keys DB** (`ba2_common.config.DB_FILE`, default
+  `~/Documents/ba2/common/db.sqlite`) is read by both test + live.
+- A **live trade instance DB** is separate per run: point `--db-file` at a file
+  under `trade/` (e.g. `python main.py --db-file ~/Documents/ba2/trade/dev.db`).
+
+Defined in `ba2_common/config.py`. `BA2_HOME` relocates the whole tree;
+`CACHE_FOLDER` / `DB_FILE` still win when set explicitly (backward-compatible).
+
+### Migrating from the old layout
+
+The old layout used `~/Documents/ba2_trade_platform`. Migrate the shared
+cache/DB with the script in BA2TestPlatform, then restart the live app so it
+reads the relocated `common/db.sqlite`:
+
+```bash
+../BA2TestPlatform/backend/venv/bin/python ../BA2TestPlatform/scripts/migrate_cache_layout.py [--apply]
+```
