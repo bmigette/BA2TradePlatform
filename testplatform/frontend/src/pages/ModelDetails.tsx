@@ -1,3 +1,4 @@
+import { API_BASE } from '../lib/config';
 import React, { useEffect, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import {
@@ -132,7 +133,6 @@ interface PredictionsResponse {
   predictions: PredictionResult[];
 }
 
-const API_BASE = 'http://localhost:8000/api';
 
 const ModelDetails: React.FC = () => {
   const { id } = useParams<{ id: string }>();

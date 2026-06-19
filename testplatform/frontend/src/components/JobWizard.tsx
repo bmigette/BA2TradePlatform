@@ -1,3 +1,4 @@
+import { API_BASE } from '../lib/config';
 import React, { useState, useEffect, useCallback } from 'react';
 import { X, Database, Cpu, Target, Trash2, Split, Save, FolderOpen, Play, AlertTriangle, ChevronRight, ChevronLeft, Loader2, Activity, Zap, Info, Layers, Sliders } from 'lucide-react';
 import type { TargetConfig } from '../types/targets';
@@ -271,7 +272,7 @@ const JobWizard: React.FC<JobWizardProps> = ({
   const fetchTargetSets = useCallback(async () => {
     setTargetSetsLoading(true);
     try {
-      const response = await fetch('http://localhost:8000/api/target-sets');
+      const response = await fetch(`${API_BASE}/target-sets`);
       if (response.ok) {
         const data = await response.json();
         setTargetSets(data.target_sets || []);
@@ -288,8 +289,8 @@ const JobWizard: React.FC<JobWizardProps> = ({
     setModelsLoading(true);
     try {
       const endpoint = jobType === 'classification'
-        ? 'http://localhost:8000/api/ml/classification-models'
-        : 'http://localhost:8000/api/ml/models';
+        ? `${API_BASE}/ml/classification-models`
+        : `${API_BASE}/ml/models`;
       const response = await fetch(endpoint);
       if (response.ok) {
         const data = await response.json();
@@ -363,7 +364,7 @@ const JobWizard: React.FC<JobWizardProps> = ({
 
     try {
       // Use the new calculate-targets endpoint with target configs
-      const response = await fetch(`http://localhost:8000/api/datasets/${state.selectedDatasetIds[0]}/calculate-targets`, {
+      const response = await fetch(`${API_BASE}/datasets/${state.selectedDatasetIds[0]}/calculate-targets`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -437,7 +438,7 @@ const JobWizard: React.FC<JobWizardProps> = ({
       return;
     }
     try {
-      const resp = await fetch('http://localhost:8000/api/datasets/check-compatibility', {
+      const resp = await fetch(`${API_BASE}/datasets/check-compatibility`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ dataset_ids: ids })
@@ -673,7 +674,7 @@ const JobWizard: React.FC<JobWizardProps> = ({
         // Submit one independent job per dataset in parallel
         const results = await Promise.allSettled(
           state.selectedDatasetIds.map(datasetId =>
-            fetch('http://localhost:8000/api/jobs', {
+            fetch(`${API_BASE}/jobs`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ ...basePayload, datasetIds: [datasetId] }),
@@ -693,7 +694,7 @@ const JobWizard: React.FC<JobWizardProps> = ({
         }
       } else {
         // Single job: multi-series or single dataset
-        const response = await fetch('http://localhost:8000/api/jobs', {
+        const response = await fetch(`${API_BASE}/jobs`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({

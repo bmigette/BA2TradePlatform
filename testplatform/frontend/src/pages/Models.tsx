@@ -1,3 +1,4 @@
+import { API_BASE } from '../lib/config';
 import React, { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
@@ -49,7 +50,6 @@ interface Model {
   };
 }
 
-const API_BASE = 'http://localhost:8000/api';
 
 type ViewMode = 'grid' | 'list';
 type SortField = 'date' | 'accuracy' | 'name' | 'fitness';

@@ -1,3 +1,4 @@
+import { API_BASE } from '../lib/config';
 import React, { useState, useEffect, useCallback } from 'react';
 import {
   Server, Plus, Trash2, Edit2, X, RefreshCw, Cpu, HardDrive,
@@ -54,7 +55,6 @@ interface CredentialKey {
   masked_value: string | null;
 }
 
-const API_BASE = 'http://localhost:8000/api';
 
 const Settings: React.FC = () => {
   const [workers, setWorkers] = useState<Worker[]>([]);

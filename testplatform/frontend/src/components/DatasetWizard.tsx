@@ -1,3 +1,4 @@
+import { API_BASE } from '../lib/config';
 import React, { useState, useEffect } from 'react';
 import { X, MessageSquare, TrendingUp, BarChart3, FileText, Settings, CheckCircle, Plus, Trash2, Save, ChevronDown, ChevronRight, FolderOpen, Upload } from 'lucide-react';
 
@@ -297,7 +298,7 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
 
   const fetchCollections = async () => {
     try {
-      const response = await fetch('http://localhost:8000/api/indicator-collections');
+      const response = await fetch(`${API_BASE}/indicator-collections`);
       if (response.ok) {
         const data = await response.json();
         setCollections(data.collections);
@@ -510,7 +511,7 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
     }
 
     try {
-      const response = await fetch('http://localhost:8000/api/indicator-collections', {
+      const response = await fetch(`${API_BASE}/indicator-collections`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -615,7 +616,7 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
 
       if (mode === 'duplicate' && initialData) {
         // Duplicate: POST to /{id}/duplicate
-        response = await fetch(`http://localhost:8000/api/datasets/${initialData.id}/duplicate`, {
+        response = await fetch(`${API_BASE}/datasets/${initialData.id}/duplicate`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -625,7 +626,7 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
         });
       } else if (mode === 'edit' && initialData) {
         // Edit: PUT to /{id}
-        response = await fetch(`http://localhost:8000/api/datasets/${initialData.id}`, {
+        response = await fetch(`${API_BASE}/datasets/${initialData.id}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -642,7 +643,7 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
         });
       } else if (batchMode && batchSymbols.length > 0) {
         // Batch Create: POST to /batch
-        response = await fetch('http://localhost:8000/api/datasets/batch', {
+        response = await fetch(`${API_BASE}/datasets/batch`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -660,7 +661,7 @@ const DatasetWizard: React.FC<DatasetWizardProps> = ({ isOpen, onClose, onComple
         });
       } else {
         // Single Create: POST to /
-        response = await fetch('http://localhost:8000/api/datasets', {
+        response = await fetch(`${API_BASE}/datasets`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({

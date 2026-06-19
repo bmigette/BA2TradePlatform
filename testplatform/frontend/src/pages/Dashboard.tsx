@@ -1,3 +1,4 @@
+import { API_BASE } from '../lib/config';
 import React, { useEffect, useState } from 'react';
 import {
   Activity,
@@ -51,7 +52,6 @@ interface DashboardData {
   systemResources: SystemResources;
 }
 
-const API_BASE = 'http://localhost:8000/api';
 
 const Dashboard: React.FC = () => {
   const [data, setData] = useState<DashboardData | null>(null);

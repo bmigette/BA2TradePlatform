@@ -1,3 +1,4 @@
+import { API_BASE } from '../lib/config';
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import {
   Target, BarChart3, Trash2, RefreshCw, ChevronDown, ChevronRight,
@@ -31,7 +32,6 @@ interface BacktestStrategy {
   updatedAt: string | null;
 }
 
-const API_BASE = 'http://localhost:8000/api';
 const ITEMS_PER_PAGE = 10;
 
 const SavedData: React.FC = () => {

@@ -1,3 +1,4 @@
+import { API_BASE } from '../lib/config';
 import React, { useState, useEffect, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import {
@@ -200,7 +201,7 @@ const JobDetails: React.FC = () => {
   const fetchJob = useCallback(async () => {
     if (!id) return;
     try {
-      const response = await fetch(`http://localhost:8000/api/jobs/${id}/progress`);
+      const response = await fetch(`${API_BASE}/jobs/${id}/progress`);
       if (!response.ok) throw new Error('Failed to fetch job');
       const data = await response.json();
       // Limit allIndividuals to prevent memory bloat (full list available via individuals endpoint)
@@ -221,7 +222,7 @@ const JobDetails: React.FC = () => {
   const fetchGenerations = useCallback(async () => {
     if (!id) return;
     try {
-      const response = await fetch(`http://localhost:8000/api/jobs/${id}/generations`);
+      const response = await fetch(`${API_BASE}/jobs/${id}/generations`);
       if (response.ok) {
         const data: GenerationsData = await response.json();
         setGenerationsData(data);
@@ -234,7 +235,7 @@ const JobDetails: React.FC = () => {
   const fetchIndividuals = useCallback(async () => {
     if (!id) return;
     try {
-      const response = await fetch(`http://localhost:8000/api/jobs/${id}/individuals`);
+      const response = await fetch(`${API_BASE}/jobs/${id}/individuals`);
       if (response.ok) {
         const data: IndividualsData = await response.json();
         // Limit individuals in memory - keep most recent generations
@@ -258,7 +259,7 @@ const JobDetails: React.FC = () => {
 
   const fetchResources = useCallback(async () => {
     try {
-      const response = await fetch('http://localhost:8000/api/dashboard/stats');
+      const response = await fetch(`${API_BASE}/dashboard/stats`);
       if (response.ok) {
         const data = await response.json();
         setResources(data.systemResources);
@@ -271,7 +272,7 @@ const JobDetails: React.FC = () => {
   const fetchEliteModels = useCallback(async () => {
     if (!id) return;
     try {
-      const response = await fetch(`http://localhost:8000/api/jobs/${id}/elite-models`);
+      const response = await fetch(`${API_BASE}/jobs/${id}/elite-models`);
       if (response.ok) {
         const data = await response.json();
         setEliteModels(data.elite_models || []);
@@ -365,7 +366,7 @@ const JobDetails: React.FC = () => {
     if (!id) return;
     setSavingModel(rank);
     try {
-      const response = await fetch(`http://localhost:8000/api/jobs/${id}/elite-models/${rank}/save-to-inventory`, {
+      const response = await fetch(`${API_BASE}/jobs/${id}/elite-models/${rank}/save-to-inventory`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({})
@@ -389,7 +390,7 @@ const JobDetails: React.FC = () => {
     if (!id || !job) return;
     setSavingRetrainResult(true);
     try {
-      const response = await fetch(`http://localhost:8000/api/jobs/${id}/retrain-save`, {
+      const response = await fetch(`${API_BASE}/jobs/${id}/retrain-save`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -494,7 +495,7 @@ const JobDetails: React.FC = () => {
 
   const handlePause = async () => {
     try {
-      await fetch(`http://localhost:8000/api/jobs/${id}/pause`, { method: 'POST' });
+      await fetch(`${API_BASE}/jobs/${id}/pause`, { method: 'POST' });
       fetchJob();
     } catch (err) {
       console.error('Failed to pause job:', err);
@@ -503,7 +504,7 @@ const JobDetails: React.FC = () => {
 
   const handleResume = async () => {
     try {
-      await fetch(`http://localhost:8000/api/jobs/${id}/resume`, { method: 'POST' });
+      await fetch(`${API_BASE}/jobs/${id}/resume`, { method: 'POST' });
       fetchJob();
     } catch (err) {
       console.error('Failed to resume job:', err);
@@ -518,7 +519,7 @@ const JobDetails: React.FC = () => {
       variant: 'warning',
       onConfirm: async () => {
         try {
-          await fetch(`http://localhost:8000/api/jobs/${id}/cancel`, { method: 'POST' });
+          await fetch(`${API_BASE}/jobs/${id}/cancel`, { method: 'POST' });
           fetchJob();
         } catch (err) {
           console.error('Failed to cancel job:', err);
@@ -819,7 +820,7 @@ const JobDetails: React.FC = () => {
             <div className="flex items-center space-x-2">
               <span className="text-xs text-purple-600 dark:text-purple-400 font-medium w-20">LSTM/GRU:</span>
               <a
-                href={`http://localhost:8000/api/jobs/${job.id}/datasets/train_rnn.csv`}
+                href={`${API_BASE}/jobs/${job.id}/datasets/train_rnn.csv`}
                 download
                 className="inline-flex items-center px-2 py-1 text-xs font-medium rounded bg-purple-100 text-purple-700 hover:bg-purple-200 dark:bg-purple-900/30 dark:text-purple-400 dark:hover:bg-purple-900/50 transition-colors"
               >
@@ -827,7 +828,7 @@ const JobDetails: React.FC = () => {
                 Train
               </a>
               <a
-                href={`http://localhost:8000/api/jobs/${job.id}/datasets/test_rnn.csv`}
+                href={`${API_BASE}/jobs/${job.id}/datasets/test_rnn.csv`}
                 download
                 className="inline-flex items-center px-2 py-1 text-xs font-medium rounded bg-purple-100 text-purple-700 hover:bg-purple-200 dark:bg-purple-900/30 dark:text-purple-400 dark:hover:bg-purple-900/50 transition-colors"
               >
@@ -841,7 +842,7 @@ const JobDetails: React.FC = () => {
             <div className="flex items-center space-x-2">
               <span className="text-xs text-green-600 dark:text-green-400 font-medium w-20">Multi-step:</span>
               <a
-                href={`http://localhost:8000/api/jobs/${job.id}/datasets/train_multistep.csv`}
+                href={`${API_BASE}/jobs/${job.id}/datasets/train_multistep.csv`}
                 download
                 className="inline-flex items-center px-2 py-1 text-xs font-medium rounded bg-green-100 text-green-700 hover:bg-green-200 dark:bg-green-900/30 dark:text-green-400 dark:hover:bg-green-900/50 transition-colors"
               >
@@ -849,7 +850,7 @@ const JobDetails: React.FC = () => {
                 Train
               </a>
               <a
-                href={`http://localhost:8000/api/jobs/${job.id}/datasets/test_multistep.csv`}
+                href={`${API_BASE}/jobs/${job.id}/datasets/test_multistep.csv`}
                 download
                 className="inline-flex items-center px-2 py-1 text-xs font-medium rounded bg-green-100 text-green-700 hover:bg-green-200 dark:bg-green-900/30 dark:text-green-400 dark:hover:bg-green-900/50 transition-colors"
               >
@@ -863,7 +864,7 @@ const JobDetails: React.FC = () => {
             <div className="flex items-center space-x-2">
               <span className="text-xs text-gray-500 dark:text-gray-400 font-medium w-20">Debug:</span>
               <a
-                href={`http://localhost:8000/api/jobs/${job.id}/datasets/combined_dataset.csv`}
+                href={`${API_BASE}/jobs/${job.id}/datasets/combined_dataset.csv`}
                 download
                 className="inline-flex items-center px-2 py-1 text-xs font-medium rounded bg-gray-100 text-gray-700 hover:bg-gray-200 dark:bg-gray-700 dark:text-gray-300 dark:hover:bg-gray-600 transition-colors"
               >
@@ -871,7 +872,7 @@ const JobDetails: React.FC = () => {
                 Combined
               </a>
               <a
-                href={`http://localhost:8000/api/jobs/${job.id}/datasets/metadata.json`}
+                href={`${API_BASE}/jobs/${job.id}/datasets/metadata.json`}
                 download
                 className="inline-flex items-center px-2 py-1 text-xs font-medium rounded bg-gray-100 text-gray-700 hover:bg-gray-200 dark:bg-gray-700 dark:text-gray-300 dark:hover:bg-gray-600 transition-colors"
               >

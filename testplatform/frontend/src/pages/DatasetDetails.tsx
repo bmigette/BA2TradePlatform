@@ -1,3 +1,4 @@
+import { API_BASE } from '../lib/config';
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { ArrowLeft, Calendar, TrendingUp, Database, Download, MessageSquare, Target, X, RefreshCw, AlertCircle, CheckCircle, Loader, Settings, ChevronDown, ChevronUp, Eye, EyeOff } from 'lucide-react';
@@ -196,7 +197,7 @@ const DatasetDetails: React.FC = () => {
   const fetchDatasetColumns = async (datasetId: number) => {
     setColumnsLoading(true);
     try {
-      const response = await fetch(`http://localhost:8000/api/datasets/${datasetId}/columns`);
+      const response = await fetch(`${API_BASE}/datasets/${datasetId}/columns`);
       if (response.ok) {
         const data = await response.json();
         setDatasetColumns(data);
@@ -221,7 +222,7 @@ const DatasetDetails: React.FC = () => {
         fast_period: config.fast_period.toString(),
         slow_period: config.slow_period.toString(),
       });
-      const response = await fetch(`http://localhost:8000/api/datasets/${datasetId}/trends?${params}`);
+      const response = await fetch(`${API_BASE}/datasets/${datasetId}/trends?${params}`);
       if (response.ok) {
         const data = await response.json();
         setTrendData(data.trends || []);
@@ -277,7 +278,7 @@ const DatasetDetails: React.FC = () => {
     setError(null);
 
     try {
-      const response = await fetch(`http://localhost:8000/api/datasets/${dataset.id}/regenerate`, {
+      const response = await fetch(`${API_BASE}/datasets/${dataset.id}/regenerate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(regenOptions),
@@ -289,7 +290,7 @@ const DatasetDetails: React.FC = () => {
 
         // Refetch chart data if successful - load all rows (max_rows=0 means no limit)
         if (updatedDataset.status === 'ready') {
-          const csvResponse = await fetch(`http://localhost:8000/api/datasets/${dataset.id}/preview?max_rows=0`);
+          const csvResponse = await fetch(`${API_BASE}/datasets/${dataset.id}/preview?max_rows=0`);
           if (csvResponse.ok) {
             const csvData = await csvResponse.json();
             console.log(`Preview refresh: ${csvData.returned_rows} rows of ${csvData.total_rows} total`);
@@ -302,7 +303,7 @@ const DatasetDetails: React.FC = () => {
         const errorData = await response.json();
         setError(errorData.detail || 'Failed to regenerate dataset');
         // Refetch dataset to get updated status
-        const refreshResponse = await fetch(`http://localhost:8000/api/datasets/${dataset.id}`);
+        const refreshResponse = await fetch(`${API_BASE}/datasets/${dataset.id}`);
         if (refreshResponse.ok) {
           setDataset(await refreshResponse.json());
         }
@@ -340,7 +341,7 @@ const DatasetDetails: React.FC = () => {
       ]);
 
       const response = await fetch(
-        `http://localhost:8000/api/ml/datasets/${dataset.id}/preview-targets`,
+        `${API_BASE}/ml/datasets/${dataset.id}/preview-targets`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -374,7 +375,7 @@ const DatasetDetails: React.FC = () => {
       ]);
 
       const response = await fetch(
-        `http://localhost:8000/api/ml/datasets/${dataset.id}/generate-training-data`,
+        `${API_BASE}/ml/datasets/${dataset.id}/generate-training-data`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -439,7 +440,7 @@ const DatasetDetails: React.FC = () => {
         });
 
         if (indicatorsToFetch.length > 0) {
-          const response = await fetch(`http://localhost:8000/api/datasets/${dataset.id}/calculate-indicators`, {
+          const response = await fetch(`${API_BASE}/datasets/${dataset.id}/calculate-indicators`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ indicators: indicatorsToFetch }),
@@ -628,7 +629,7 @@ const DatasetDetails: React.FC = () => {
       setError(null);
       try {
         // Fetch dataset metadata
-        const response = await fetch(`http://localhost:8000/api/datasets/${id}`);
+        const response = await fetch(`${API_BASE}/datasets/${id}`);
         if (!response.ok) {
           throw new Error('Failed to fetch dataset details');
         }
@@ -639,7 +640,7 @@ const DatasetDetails: React.FC = () => {
         // Note: Preview endpoint requires backend restart to be available
         try {
           console.time('fetchPreview');
-          const csvResponse = await fetch(`http://localhost:8000/api/datasets/${id}/preview?max_rows=0`);
+          const csvResponse = await fetch(`${API_BASE}/datasets/${id}/preview?max_rows=0`);
           console.timeEnd('fetchPreview');
           if (csvResponse.ok) {
             console.time('parsePreview');
@@ -754,7 +755,7 @@ const DatasetDetails: React.FC = () => {
 
   const handleExport = async () => {
     try {
-      const response = await fetch(`http://localhost:8000/api/datasets/${id}/export`);
+      const response = await fetch(`${API_BASE}/datasets/${id}/export`);
       if (!response.ok) {
         throw new Error('Failed to export dataset');
       }
@@ -781,7 +782,7 @@ const DatasetDetails: React.FC = () => {
 
   const handleExportParquet = async () => {
     try {
-      const response = await fetch(`http://localhost:8000/api/datasets/${id}/export/parquet`);
+      const response = await fetch(`${API_BASE}/datasets/${id}/export/parquet`);
       if (!response.ok) {
         throw new Error('Failed to export dataset to Parquet');
       }
