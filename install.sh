@@ -84,8 +84,8 @@ if [ "$DO_TRADE" = "1" ]; then
 fi
 if [ "$DO_TEST" = "1" ]; then
   echo "==== TEST venv ===="
-  new_app_venv "$VENV_ROOT/test" "$HERE/packages/testplatform" \
-               "$HERE/packages/testplatform/backend/requirements.txt" 0 "ba2_common" "$TEST_PY"
+  new_app_venv "$VENV_ROOT/test" "$HERE/testplatform" \
+               "$HERE/testplatform/backend/requirements.txt" 0 "ba2_common" "$TEST_PY"
 fi
 
 echo ">> done."

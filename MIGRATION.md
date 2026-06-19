@@ -6,13 +6,14 @@ package with its own `pyproject.toml` — they just live under `packages/` now:
 
 ```
 BA2TradePlatform/                 (this repo)
-  ba2_trade_platform/             live trade app  (package: ba2trade-app)   ← at the root, unchanged
-  packages/
-    common/                       package: ba2trade-common  (ba2_common)
+  ba2_trade_platform/             live trade APP  (package: ba2trade-app)   ← root level
+  testplatform/                   test/backtest APP (package: ba2test-app)  ← root level
+                                    (backend/ + frontend/ + ba2test_launcher.py)
+  packages/                       shared LIBRARIES (used by both apps)
+    common/                       package: ba2trade-common   (ba2_common)
     providers/                    package: ba2trade-providers (ba2_providers)
-    experts/                      package: ba2trade-experts  (ba2_experts)
-    testplatform/                 package: ba2test-app  (backend/ + frontend/ + ba2test_launcher.py)
-  install.sh                      builds both venvs from packages/ (editable chain)
+    experts/                      package: ba2trade-experts   (ba2_experts)
+  install.sh                      builds both venvs (editable: chain from packages/, apps from root + testplatform/)
 ```
 
 The 4 former repos — **BA2TradeCommon, BA2TradeProviders, BA2TradeExperts, BA2TestPlatform** — are now
@@ -33,8 +34,8 @@ happens in this repo, on `dev`.
    ```
    This recreates `~/ba2-venvs/{trade,test}` with the `common → providers → experts` chain installed
    editable from `packages/`, the trade app (`ba2-trade`) from the repo root, and the test app
-   (`ba2-test`) from `packages/testplatform`. Windows: run under Git Bash / WSL, or replicate the
-   `uv pip install -e packages/common packages/providers packages/experts packages/testplatform` +
+   (`ba2-test`) from `testplatform/`. Windows: run under Git Bash / WSL, or replicate the
+   `uv pip install -e packages/common packages/providers packages/experts testplatform` +
    `-e .` (root) steps.
 3. **Verify**: `~/ba2-venvs/test/bin/ba2-test --help` and `~/ba2-venvs/trade/bin/python -c "import ba2_trade_platform"`.
 4. **Delete the old sibling clones** (`BA2TradeCommon/`, `BA2TradeProviders/`, `BA2TradeExperts/`,
