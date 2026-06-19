@@ -120,6 +120,19 @@ if ($doTest) {
               -AppDir (Join-Path $Here "testplatform") `
               -ReqPath (Join-Path $Here "testplatform\backend\requirements.txt") `
               -TorchCpu $false -VerifyImport "ba2_common" -BasePy $TestPy
+  # Test-platform frontend (Vite/React UI) deps — so `ba2-test serve` can start the UI.
+  $fe = Join-Path $Here "testplatform\frontend"
+  if (Test-Path (Join-Path $fe "package.json")) {
+    $npm = (Get-Command npm.cmd -ErrorAction SilentlyContinue).Source
+    if (-not $npm -and (Test-Path "C:\Program Files\nodejs\npm.cmd")) { $npm = "C:\Program Files\nodejs\npm.cmd" }
+    if ($npm) {
+      Write-Host ">> installing test frontend deps (npm install in testplatform/frontend)"
+      Push-Location $fe; & $npm install; $rc = $LASTEXITCODE; Pop-Location
+      if ($rc -ne 0) { Write-Host ">> npm install failed (rc=$rc) — run it manually in $fe" }
+    } else {
+      Write-Host ">> npm not found — skipping frontend deps (install Node.js, then 'npm install' in $fe)"
+    }
+  }
 }
 
 Write-Host ">> done."

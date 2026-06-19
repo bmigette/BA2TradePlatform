@@ -78,6 +78,16 @@ if [ "$DO_TEST" = "1" ]; then
   echo "==== TEST venv ===="
   new_app_venv "$VENV_ROOT/test" "$HERE/testplatform" \
                "$HERE/testplatform/backend/requirements.txt" 0 "ba2_common" "$TEST_PY"
+  # Test-platform frontend (Vite/React UI) deps — so `ba2-test serve` can start the UI.
+  FE="$HERE/testplatform/frontend"
+  if [ -f "$FE/package.json" ]; then
+    if command -v npm >/dev/null 2>&1; then
+      echo ">> installing test frontend deps (npm install in testplatform/frontend)"
+      ( cd "$FE" && npm install ) || echo ">> npm install failed — run it manually in $FE"
+    else
+      echo ">> npm not found — skipping frontend deps (install Node.js, then 'npm install' in $FE)"
+    fi
+  fi
 fi
 
 echo ">> done."
