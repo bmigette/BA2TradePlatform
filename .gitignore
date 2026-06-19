@@ -23,6 +23,11 @@ eggs/
 .eggs/
 lib/
 lib64/
+# The generic Python `lib/` rule above also matched the frontend's application SOURCE dir
+# (testplatform/frontend/src/lib/ — btApi.ts, symbols.ts, …), silently excluding it from the
+# monorepo so a fresh clone could not build. It is source, not a build dir — keep it tracked.
+!testplatform/frontend/src/lib/
+!testplatform/frontend/src/lib/**
 parts/
 sdist/
 var/
