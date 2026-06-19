@@ -29,18 +29,10 @@ TRADE_PY="$BOTH_PY"; TEST_PY="$BOTH_PY"
 
 UP=(); [ "$UPGRADE" = "1" ] && UP=(--upgrade)
 
-install_chain() {  # $1=uv $2=vpy ; --no-sources so our explicit chain install beats the git pins
+install_chain() {  # $1=uv $2=vpy ; in-repo packages ONLY (self-contained monorepo, no external git)
   local UV="$1" VPY="$2"; local ef=(); [ "$EDITABLE" = "1" ] && ef=(-e)
-  local common prov exp
-  if [ "$EDITABLE" = "1" ]; then
-    common="$HERE/packages/common"; prov="$HERE/packages/providers"
-    exp="$HERE/packages/experts"; [ "$UI" = "1" ] && exp="${exp}[ui]"
-  else
-    common="git+ssh://git@github.com/$OWNER/BA2TradeCommon.git@$BRANCH"
-    prov="git+ssh://git@github.com/$OWNER/BA2TradeProviders.git@$BRANCH"
-    if [ "$UI" = "1" ]; then exp="ba2trade-experts[ui] @ git+ssh://git@github.com/$OWNER/BA2TradeExperts.git@$BRANCH"
-    else exp="git+ssh://git@github.com/$OWNER/BA2TradeExperts.git@$BRANCH"; fi
-  fi
+  local common="$HERE/packages/common" prov="$HERE/packages/providers" exp="$HERE/packages/experts"
+  [ "$UI" = "1" ] && exp="${exp}[ui]"
   "$UV" pip install --python "$VPY" --no-sources ${UP[@]+"${UP[@]}"} ${ef[@]+"${ef[@]}"} "$common"
   "$UV" pip install --python "$VPY" --no-sources ${UP[@]+"${UP[@]}"} ${ef[@]+"${ef[@]}"} "$prov"
   "$UV" pip install --python "$VPY" --no-sources ${UP[@]+"${UP[@]}"} ${ef[@]+"${ef[@]}"} "$exp"

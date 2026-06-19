@@ -1,18 +1,16 @@
 param(
-  [switch]$Editable,    # install the in-repo packages editable (default: git install over SSH @branch)
+  [switch]$Editable,    # install the in-repo packages as -e (live source); default = built copy
   [switch]$Ui,          # include the experts [ui] extra (nicegui) in the package chain
   [switch]$Upgrade,     # pass --upgrade so an existing install is re-resolved/updated
   [switch]$TradeOnly,   # only build the trade venv (ba2-trade)
   [switch]$TestOnly,    # only build the test venv (ba2-test)
-  [string]$Branch = "dev",
   [string]$BasePath,    # base folder for the venvs (default: home). Venvs live OUTSIDE the repo.
   [string]$Python      # force ONE interpreter for both venvs (default: per-app, see below)
 )
-# Monorepo install: everything ships from THIS repo (BA2TradePlatform). Editable mode installs the
-# in-repo packages (packages/common -> providers -> experts), the trade app (repo root), and the
-# test app (testplatform/) into two venvs. Non-editable falls back to the @branch git installs.
+# Self-contained monorepo install: EVERYTHING ships from THIS repo (BA2TradePlatform) — the chain
+# packages (packages/common -> providers -> experts), the trade app (repo root) and the test app
+# (testplatform/). NO external git / sibling clones are referenced.
 $ErrorActionPreference = "Stop"
-$Owner  = "bmigette"
 $Here   = (Resolve-Path $PSScriptRoot).Path                      # the BA2TradePlatform monorepo root
 if (-not $BasePath) { $BasePath = $HOME }
 $VenvRoot = Join-Path $BasePath "ba2-venvs"                       # <home>/ba2-venvs/{trade,test}
@@ -53,16 +51,12 @@ function Install-One {
 
 function Install-Chain {
   param([string]$Uv, [string]$Vpy, [bool]$Up)
-  if ($Editable) {
-    $common = Join-Path $Here "packages\common"
-    $prov   = Join-Path $Here "packages\providers"
-    if ($Ui) { $exp = (Join-Path $Here "packages\experts") + "[ui]" } else { $exp = Join-Path $Here "packages\experts" }
-  } else {
-    $common = "git+ssh://git@github.com/$Owner/BA2TradeCommon.git@$Branch"
-    $prov   = "git+ssh://git@github.com/$Owner/BA2TradeProviders.git@$Branch"
-    if ($Ui) { $exp = "ba2trade-experts[ui] @ git+ssh://git@github.com/$Owner/BA2TradeExperts.git@$Branch" }
-    else     { $exp = "git+ssh://git@github.com/$Owner/BA2TradeExperts.git@$Branch" }
-  }
+  # Self-contained monorepo: the chain packages ALWAYS ship in-repo under packages/. We never
+  # install from an external git (the old sibling repos are gone). -Editable just toggles the
+  # -e flag (handled in Install-One); without it the packages install as a built copy.
+  $common = Join-Path $Here "packages\common"
+  $prov   = Join-Path $Here "packages\providers"
+  if ($Ui) { $exp = (Join-Path $Here "packages\experts") + "[ui]" } else { $exp = Join-Path $Here "packages\experts" }
   Install-One -Uv $Uv -Vpy $Vpy -Up $Up -Target $common
   Install-One -Uv $Uv -Vpy $Vpy -Up $Up -Target $prov
   Install-One -Uv $Uv -Vpy $Vpy -Up $Up -Target $exp

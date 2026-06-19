@@ -258,7 +258,29 @@ All API keys should be configured through the **Web Interface** (Recommended):
    cd BA2TradePlatform
    ```
 
-2. **Choose your package manager**:
+   This is a **self-contained monorepo** — the shared packages (`packages/common`,
+   `packages/providers`, `packages/experts`), the live trade app (repo root → `ba2-trade`), and the
+   backtest/optimization platform (`testplatform/` → `ba2-test`) all live here. **No external or
+   sibling repositories are required.**
+
+2. **Recommended — install script (builds both venvs from this repo)**:
+
+   The install script creates two isolated venvs under `~/ba2-venvs/{trade,test}` from the in-repo
+   `packages/` chain + each app's `requirements.txt`, and registers the `ba2-trade` / `ba2-test`
+   console commands. Everything is installed **from this repo — no other git is referenced**.
+
+   **Windows**:
+   ```powershell
+   .\install.ps1 -Editable        # -e in-repo packages for development
+   ```
+   **Linux/macOS**:
+   ```bash
+   ./install.sh --editable
+   ```
+   Useful flags: `-TradeOnly`/`-TestOnly` (`--trade-only`/`--test-only`) to build just one venv,
+   `-Ui` (`--ui`) for the NiceGUI extra, `-Upgrade` (`--upgrade`) to re-resolve deps.
+
+3. **Alternative — manual single-venv setup** (trade app only):
 
    #### Option A: Using `uv` (⚡ RECOMMENDED - Much Faster!)
    
