@@ -71,7 +71,7 @@ export function createEmptyCondition(): ConditionNode {
     id: generateId(),
     field: '',
     fieldType: 'model_probability',
-    comparison: 'gt',
+    comparison: '>',
     value: 0.5,
     optimizeEnabled: false,
   };
@@ -106,14 +106,16 @@ const defaultFields: AvailableField[] = [
   { field: 'price:change_pct', fieldType: 'price', description: 'Price change % from previous bar', category: 'Price', label: 'Price Change %' },
 ];
 
-// Comparison operators for numeric fields
+// Comparison operators for numeric fields. VALUES are the engine symbols ('>=' etc.) — the
+// single canonical comparison vocabulary shared with storage, the export, and the shared engine
+// (TradeConditions). Legacy word-forms ('gte') are normalised to symbols on import.
 const comparisonOperators = [
-  { value: 'gt', label: '>' },
-  { value: 'gte', label: '>=' },
-  { value: 'lt', label: '<' },
-  { value: 'lte', label: '<=' },
-  { value: 'eq', label: '==' },
-  { value: 'neq', label: '!=' },
+  { value: '>', label: '>' },
+  { value: '>=', label: '>=' },
+  { value: '<', label: '<' },
+  { value: '<=', label: '<=' },
+  { value: '==', label: '==' },
+  { value: '!=', label: '!=' },
   { value: 'between', label: 'between' },
 ];
 
@@ -404,7 +406,7 @@ const ConditionBuilder: React.FC<ConditionBuilderProps> = ({
       delete newCondition.valueStep;
     } else if (['is_true', 'is_false'].includes(condition.comparison)) {
       // Becoming numeric from a flag: restore a numeric comparison + value.
-      newCondition.comparison = numericOperators[0]?.value ?? 'gt';
+      newCondition.comparison = numericOperators[0]?.value ?? '>';
       newCondition.value = 0.5;
     }
     onChange(newCondition);

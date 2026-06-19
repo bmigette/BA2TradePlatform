@@ -1,5 +1,5 @@
 // frontend/src/components/UniversePicker.tsx
-import { useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { parseSymbols } from '../lib/symbols';
 
 // Per-field optimization range for a screener metric the GA can tune. Keyed (in
@@ -49,6 +49,23 @@ const rangeInputClass = "w-20 px-1.5 py-0.5 text-xs border border-gray-300 dark:
 
 export function UniversePicker({ value, onChange }: { value: UniverseValue; onChange: (v: UniverseValue) => void; }) {
   const fileRef = useRef<HTMLInputElement>(null);
+  // Raw text the user is editing. Kept SEPARATE from value.symbols.join() so typing a
+  // separator (',', space, newline) or a symbol char ('.', '/' as in BRK.B / BRK/B) is not
+  // clobbered by re-deriving the textarea from the parsed array on every keystroke (which
+  // dropped the trailing separator, making it impossible to start a second symbol).
+  const [symbolsText, setSymbolsText] = useState(
+    value.mode === 'static' ? value.symbols.join(', ') : '',
+  );
+  // Re-sync from props ONLY on external changes (import / Quick Load / clear). During typing
+  // our own onChange already set symbols = parseSymbols(text), so the parsed-vs-props check
+  // matches and we leave the user's raw text (and trailing separators) intact.
+  useEffect(() => {
+    if (value.mode !== 'static') return;
+    if (parseSymbols(symbolsText).join(',') !== value.symbols.join(',')) {
+      setSymbolsText(value.symbols.join(', '));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value]);
   const onFile = (f: File | undefined) => {
     if (!f) return;
     f.text().then((t) => onChange({ mode: 'static', symbols: parseSymbols(t) }));
@@ -104,9 +121,9 @@ export function UniversePicker({ value, onChange }: { value: UniverseValue; onCh
 
       {value.mode === 'static' ? (
         <div className="space-y-2">
-          <textarea className={`${inputClass} w-full`} rows={3} placeholder="AAPL, MSFT, NVDA …"
-            value={value.symbols.join(', ')}
-            onChange={(e) => onChange({ mode: 'static', symbols: parseSymbols(e.target.value) })} />
+          <textarea className={`${inputClass} w-full`} rows={3} placeholder="AAPL, MSFT, BRK.B …"
+            value={symbolsText}
+            onChange={(e) => { setSymbolsText(e.target.value); onChange({ mode: 'static', symbols: parseSymbols(e.target.value) }); }} />
           <div className="flex items-center gap-2">
             <button type="button" onClick={() => fileRef.current?.click()}
               className="px-3 py-1.5 text-sm text-gray-600 dark:text-gray-400 border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-50 dark:hover:bg-gray-700 flex items-center gap-1">

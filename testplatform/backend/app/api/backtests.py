@@ -6,7 +6,7 @@ Manages backtesting of trained models against historical data.
 
 import logging
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, List, Optional
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from sqlalchemy.orm import Session, defer
@@ -429,6 +429,39 @@ def _create_daily_expert_backtest(backtest: "BacktestCreate", db: Session) -> di
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    # Persist the run's full strategy + settings onto the row so it ROUND-TRIPS through the
+    # export endpoints (Quick Load / ruleset + expert-settings export). Without this,
+    # strategy_params stays NULL and a reloaded run restores only the expert NAME — the
+    # conditions, TP/SL, expert settings, universe and interval are all lost. Keys mirror what
+    # _derive_export_payload reads (camelCase structured shape).
+    strategy_params: dict = {}
+    if backtest.buy_entry_conditions is not None:
+        strategy_params["buyEntryConditions"] = backtest.buy_entry_conditions
+    if backtest.sell_entry_conditions is not None:
+        strategy_params["sellEntryConditions"] = backtest.sell_entry_conditions
+    if backtest.enable_short is not None:
+        strategy_params["enableShort"] = bool(backtest.enable_short)
+    if backtest.exit_conditions is not None:
+        strategy_params["exitConditions"] = backtest.exit_conditions
+    if backtest.initial_tp_percent is not None:
+        strategy_params["initialTpPercent"] = backtest.initial_tp_percent
+    if backtest.initial_sl_percent is not None:
+        strategy_params["initialSlPercent"] = backtest.initial_sl_percent
+    if backtest.initial_tp_reference is not None:
+        strategy_params["initialTpReference"] = backtest.initial_tp_reference
+    elif backtest.initial_tp_ref is not None:
+        strategy_params["initialTpReference"] = backtest.initial_tp_ref
+    if expert_settings:
+        strategy_params["expertSettings"] = expert_settings
+    # Universe + interval are not otherwise persisted on the row; store them so Quick Load can
+    # restore them for STANDALONE runs (optimization-derived runs recover these from the opt).
+    strategy_params["universe"] = (
+        screener_universe if screener_universe is not None
+        else {"mode": "static", "symbols": list(symbols)}
+    )
+    if backtest.execution_interval:
+        strategy_params["executionInterval"] = backtest.execution_interval
+
     db_backtest = Backtest(
         name=backtest.name,
         model_id=None,  # daily expert runs are not model-driven
@@ -441,6 +474,7 @@ def _create_daily_expert_backtest(backtest: "BacktestCreate", db: Session) -> di
         fitness_metric=backtest.fitness_metric,
         status="pending",
         engine_type="daily_expert",
+        strategy_params=strategy_params or None,
     )
 
     db.add(db_backtest)
@@ -648,7 +682,65 @@ async def delete_backtest(
     return {"message": f"Backtest {backtest_id} deleted"}
 
 
-def _derive_export_payload(backtest: Backtest, kind: str) -> dict:
+def _opt_backtest_block(backtest: Backtest, db: Any):
+    """Return (bt_block, strategy) for an optimization-derived backtest, else (None, None).
+
+    bt_block is the optimization's run-level ``optimization_config['backtest']`` dict (carries the
+    full execution config: enabled_instruments, seed, warmup_days, execution_interval,
+    account_settings, run_schedule_override, initial_tp_reference, base expert specs). This is the
+    authoritative source for reproducing an opt-derived run faithfully (the optimizer used the
+    SAME block via _build_daily_trial_config)."""
+    if db is None or backtest.optimization_id is None:
+        return None, None
+    try:
+        from app.models.strategy_optimization import StrategyOptimization
+        from app.models.strategy import Strategy
+        so = db.query(StrategyOptimization).filter(
+            StrategyOptimization.id == backtest.optimization_id
+        ).first()
+        if so is None:
+            return None, None
+        bt_block = (so.optimization_config or {}).get("backtest")
+        strat = db.query(Strategy).filter(Strategy.id == so.strategy_id).first()
+        return (bt_block if isinstance(bt_block, dict) else None), strat
+    except Exception:  # noqa: BLE001
+        return None, None
+
+
+def _reconstruct_opt_ruleset(backtest: Backtest, db: Any):
+    """FALLBACK for older optimization-derived runs that stored only the flat genes (no concrete
+    trees): overlay the run's tuned ``cond:``/``exit:`` genes onto the optimization's base
+    Strategy tree via ``decode_params`` to rebuild the concrete buy/sell/exit ruleset.
+
+    New top-N runs persist the concrete trees directly (``buyEntryConditions`` etc.), so this is
+    only used when those are absent. Returns (buy_tree, sell_tree, exit_rules) or (None, None,
+    None) when reconstruction isn't possible (no optimization link / base strategy / db)."""
+    sp = backtest.strategy_params or {}
+    has_genes = isinstance(sp, dict) and any(
+        isinstance(k, str) and (k.startswith("cond:") or k.startswith("exit:")) for k in sp
+    )
+    if db is None or backtest.optimization_id is None or not has_genes:
+        return None, None, None
+    try:
+        from app.models.strategy_optimization import StrategyOptimization
+        from app.models.strategy import Strategy
+        from app.services.strategy_param_space import decode_params
+
+        so = db.query(StrategyOptimization).filter(
+            StrategyOptimization.id == backtest.optimization_id
+        ).first()
+        if so is None:
+            return None, None, None
+        strat = db.query(Strategy).filter(Strategy.id == so.strategy_id).first()
+        if strat is None:
+            return None, None, None
+        decoded = decode_params(strat, sp)
+        return decoded.get("buy_tree"), decoded.get("sell_tree"), decoded.get("exit_rules") or []
+    except Exception:  # noqa: BLE001 — reconstruction is best-effort; never break the export
+        return None, None, None
+
+
+def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dict:
     """Build the chosen read-only export payload from a backtest's strategy_params.
 
     Two ``kind`` values are supported:
@@ -674,10 +766,51 @@ def _derive_export_payload(backtest: Backtest, kind: str) -> dict:
         return None
 
     if kind == "expert_settings":
-        model_genes = (
-            {k: v for k, v in sp.items() if isinstance(k, str) and k.startswith("model:")}
+        # GA flat model:* genes stripped of the prefix = the optimized expert decision settings.
+        model_overrides = (
+            {k[len("model:"):]: v for k, v in sp.items()
+             if isinstance(k, str) and k.startswith("model:")}
             if isinstance(sp, dict) else {}
         )
+        bt_block, _strat = _opt_backtest_block(backtest, db)
+        # FULL expert settings = the optimization's base expert spec settings overlaid with the
+        # optimized overrides (faithful reproduction); falls back to a standalone run's stored
+        # expertSettings, then to the bare overrides.
+        if bt_block is not None:
+            base_specs = bt_block.get("experts") or []
+            base_settings = {}
+            for spec in base_specs:
+                if isinstance(spec, dict) and spec.get("class") == backtest.expert_name:
+                    base_settings = dict(spec.get("settings") or {})
+                    break
+            expert_params = {**base_settings, **model_overrides}
+            acct = bt_block.get("account_settings") or {}
+            universe = {"mode": "static", "symbols": list(bt_block.get("enabled_instruments") or [])}
+            execution = {
+                "seed": bt_block.get("seed"),
+                "fill_model": acct.get("fill_model"),
+                "warmup_days": bt_block.get("warmup_days"),
+                "commission": acct.get("commission_per_trade"),
+                "slippage": acct.get("slippage_bps"),
+                "enable_short": bool(bt_block.get("enable_short")),
+                "run_schedule_override": bt_block.get("run_schedule_override"),
+                "initial_tp_reference": bt_block.get("initial_tp_reference"),
+            }
+            interval = bt_block.get("execution_interval")
+        else:
+            expert_params = model_overrides or _pick("expertSettings", "expert_settings") or {}
+            universe = _pick("universe")
+            execution = {
+                "seed": _pick("seed"),
+                "fill_model": _pick("fillModel", "fill_model"),
+                "warmup_days": _pick("warmupDays", "warmup_days"),
+                "commission": _pick("commission"),
+                "slippage": _pick("slippage"),
+                "enable_short": _pick("enableShort", "enable_short"),
+                "run_schedule_override": _pick("runScheduleOverride", "run_schedule_override"),
+                "initial_tp_reference": _pick("initialTpReference", "initial_tp_reference"),
+            }
+            interval = _pick("executionInterval", "execution_interval")
         return {
             "backtest_id": backtest.id,
             "name": backtest.name,
@@ -686,8 +819,14 @@ def _derive_export_payload(backtest: Backtest, kind: str) -> dict:
             "settings": {
                 "initial_tp_percent": _pick("initialTpPercent", "initial_tp_percent", "tp"),
                 "initial_sl_percent": _pick("initialSlPercent", "initial_sl_percent", "sl"),
-                "expert_params": model_genes,
+                "expert_params": expert_params,
             },
+            # Execution config (seed/fill_model/warmup/commission/slippage/enable_short/
+            # run_schedule/tp_reference) + universe + interval so a saved run can be reproduced
+            # faithfully from the exports alone (the reproducibility goal).
+            "execution": execution,
+            "universe": universe,
+            "execution_interval": interval,
         }
 
     if kind == "ruleset":
@@ -696,12 +835,27 @@ def _derive_export_payload(backtest: Backtest, kind: str) -> dict:
              if isinstance(k, str) and (k.startswith("cond:") or k.startswith("exit:"))}
             if isinstance(sp, dict) else {}
         )
+        buy = _pick("buyEntryConditions", "buy_entry_conditions")
+        sell = _pick("sellEntryConditions", "sell_entry_conditions")
+        exits = _pick("exitConditions", "exit_conditions")
+        # Older optimization runs stored only the flat genes — reconstruct the concrete trees
+        # from the optimization's base strategy + those genes so Load still restores conditions.
+        if buy is None and sell is None and not exits and cond_genes:
+            r_buy, r_sell, r_exits = _reconstruct_opt_ruleset(backtest, db)
+            buy = buy if buy is not None else r_buy
+            sell = sell if sell is not None else r_sell
+            exits = exits if exits else r_exits
+        # Normalise to the SINGLE canonical condition format (operator groups, symbol comparison,
+        # inferred fieldType) via the shared model so Load pre-fills the builder cleanly regardless
+        # of how the tree was stored (builder camel / storage type+op / optimizer-decoded). This is
+        # the boundary — the engine/optimizer keep reading their own (still-present) snake keys.
+        from ba2_common.core.rule_models import normalize_tree, normalize_exit_rules
         return {
             "backtest_id": backtest.id,
             "name": backtest.name,
-            "buy_entry_conditions": _pick("buyEntryConditions", "buy_entry_conditions"),
-            "sell_entry_conditions": _pick("sellEntryConditions", "sell_entry_conditions"),
-            "exit_conditions": _pick("exitConditions", "exit_conditions") or [],
+            "buy_entry_conditions": normalize_tree(buy),
+            "sell_entry_conditions": normalize_tree(sell),
+            "exit_conditions": normalize_exit_rules(exits or []),
             "optimized_genes": cond_genes,
         }
 
@@ -726,7 +880,7 @@ async def export_backtest_json(
     backtest = db.query(Backtest).filter(Backtest.id == backtest_id).first()
     if not backtest:
         raise HTTPException(status_code=404, detail=f"Backtest {backtest_id} not found")
-    return _derive_export_payload(backtest, kind)
+    return _derive_export_payload(backtest, kind, db)
 
 
 @router.post("/{backtest_id}/export")

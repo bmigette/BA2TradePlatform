@@ -587,8 +587,12 @@ class MemoizedOHLCVProvider:
 
         try:
             from ba2_common.core import native_cache
-            p = native_cache.timeseries_path(type(self._inner).__name__, symbol, interval)
-            if os.path.exists(p):
+            # Resolve any interval-alias spelling on disk (canonical "5m" + legacy "5min", etc.).
+            # MUST use find_timeseries_path, not timeseries_path: the latter returns only the
+            # canonical write path, so a legacy-spelled cache file ("<SYM>_5min.parquet") would
+            # be a false miss -> a spurious BacktestCacheMiss on data that is actually cached.
+            p = native_cache.find_timeseries_path(type(self._inner).__name__, symbol, interval)
+            if p is not None:
                 return pd.read_parquet(p)
         except Exception:  # pragma: no cover
             pass
