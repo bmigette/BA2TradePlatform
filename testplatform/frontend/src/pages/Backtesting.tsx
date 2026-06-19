@@ -49,13 +49,14 @@ import { ExpertSettingsForm } from '../components/ExpertSettingsForm';
 import type { ExpertSettingsValue } from '../components/ExpertSettingsForm';
 import { UniversePicker } from '../components/UniversePicker';
 import type { UniverseValue } from '../components/UniversePicker';
+import { CollapsibleSection } from '../components/CollapsibleSection';
 import { RuleIO } from '../components/RuleIO';
 import TradeChartModal from '../components/TradeChartModal';
 import { GeneCountPreview } from '../components/GeneCountPreview';
 import { RunHistoryTable } from '../components/RunHistoryTable';
 import ResolvedRulesetView from '../components/ResolvedRulesetView';
 import type { BestParams } from '../lib/resolveRuleset';
-import { getRulesetVocabulary, importLiveEnterMarket, importLiveRuleset, convertLiveRuleset, listTasks, listBacktests, fetchOptSettingsExport, listExperts, optimizeBatch, listRunningOptimizations } from '../lib/btApi';
+import { getRulesetVocabulary, importLiveEnterMarket, importLiveRuleset, convertLiveRuleset, listTasks, listBacktests, fetchOptSettingsExport, listExperts, optimizeBatch, listRunningOptimizations, fetchBacktestExport } from '../lib/btApi';
 import type { ExpertInfo, OptimizeBatchJob, OptimizeBatchBody, RunningOpt } from '../lib/btApi';
 import { RunningJobsPanel } from '../components/RunningJobsPanel';
 import { OptimizationJobsTable, OptJobSettingsDetail } from '../components/OptimizationJobsTable';
@@ -380,12 +381,21 @@ const serializeConditionTree = (node: ConditionTree): Record<string, unknown> =>
 // may carry the backend leaf vocabulary (event_type->field, operator->comparison) and snake
 // optimize keys; map them so the camelCase ConditionBuilder populates correctly. Tolerant of
 // either casing (already-camel files pass through unchanged).
+// Legacy builder word-forms -> the canonical engine symbol (single comparison vocabulary).
+const WORD_TO_SYMBOL: Record<string, string> = {
+  gt: '>', gte: '>=', lt: '<', lte: '<=', eq: '==', neq: '!=', ne: '!=',
+};
 const normalizeLeaf = (raw: Record<string, unknown>): ConditionTree => {
-  // Group node: recurse into conditions.
-  if (Array.isArray(raw.conditions) && (raw.operator === 'AND' || raw.operator === 'OR')) {
+  // Group node: detect by conditions[] + an AND/OR on EITHER 'operator' (builder/canonical) or
+  // 'type' (storage / optimizer-decoded). Reading only 'operator' before was the cause of
+  // "Empty field" when a storage-format ('type') group was parsed as a leaf.
+  const grpOp = (raw.operator === 'AND' || raw.operator === 'OR') ? (raw.operator as 'AND' | 'OR')
+    : (raw.type === 'AND' || raw.type === 'OR') ? (raw.type as 'AND' | 'OR')
+    : null;
+  if (Array.isArray(raw.conditions) && grpOp) {
     return {
       id: (raw.id as string) ?? createEmptyGroup('AND').id,
-      operator: raw.operator as 'AND' | 'OR',
+      operator: grpOp,
       conditions: (raw.conditions as Record<string, unknown>[]).map(normalizeLeaf),
     } as ConditionGroup;
   }
@@ -393,12 +403,24 @@ const normalizeLeaf = (raw: Record<string, unknown>): ConditionTree => {
     for (const k of keys) if (raw[k] !== undefined) return raw[k];
     return undefined;
   };
+  const rawComp = pick('comparison', 'op', 'operator') as string | undefined;
+  const explicitType = pick('fieldType', 'field_type') as string | undefined;
+  // Infer fieldType when absent (storage format carries none): a flag has no numeric value AND no
+  // comparison/op (storage flags are bare {id, field}); 'is_true'/'is_false' is an explicit flag
+  // sentinel. Numerics have a comparison or value. Truly-empty leaves keep the ML default.
+  const isFlag = explicitType === 'flag' || rawComp === 'is_true' || rawComp === 'is_false'
+    || (explicitType == null && raw.value == null && rawComp == null);
+  const fieldType = explicitType
+    ?? (isFlag ? 'flag' : (rawComp != null || raw.value != null ? 'numeric' : 'model_probability'));
   return {
     id: (raw.id as string) ?? createEmptyCondition().id,
     field: (pick('field', 'event_type') as string) ?? '',
-    fieldType: (pick('fieldType', 'field_type') as string) ?? 'model_probability',
-    comparison: (pick('comparison', 'operator') as string) ?? 'gt',
-    value: (raw.value as ConditionNode['value']) ?? 0,
+    fieldType,
+    // Flag triggers (e.g. has_position / bullish) carry NO operator; give them the sentinel
+    // comparison ('is_true'). Numeric leaves map any word-form (gte) to the canonical symbol (>=);
+    // default '>'.
+    comparison: isFlag ? 'is_true' : (rawComp != null ? (WORD_TO_SYMBOL[String(rawComp).toLowerCase()] ?? rawComp) : '>'),
+    value: (raw.value as ConditionNode['value']) ?? (isFlag ? 1 : 0),
     optimizeEnabled: (pick('optimizeEnabled', 'optimize') as boolean) ?? false,
     toggleOptimize: pick('toggleOptimize', 'toggle_optimize') as boolean | undefined,
     valueMin: pick('valueMin', 'value_min') as number | undefined,
@@ -496,10 +518,12 @@ const Backtesting: React.FC = () => {
       setAllowShort(sellCount > 0);
       const exitRules = Array.isArray(rules) ? rules : [];
       setExitConditions(
-        exitRules.map((r, i) => ({
-          ...exitConditionFromStored(r as Record<string, unknown>),
-          id: `exit-live-${Date.now()}-${i}`,
-        })),
+        exitRules.map((r, i) => {
+          const rec = r as Record<string, unknown>;
+          const ec = exitConditionFromStored(rec);
+          const conds = rec.conditions ? normalizeEntryTree(rec.conditions) : ec.conditions;
+          return { ...ec, conditions: conds, id: `exit-live-${Date.now()}-${i}` };
+        }),
       );
       setLiveImportNote({
         kind: 'ok',
@@ -518,6 +542,10 @@ const Backtesting: React.FC = () => {
     }
   }, [liveExpertId]);
   const [initialTpPercent, setInitialTpPercent] = useState(5.0);
+  // TP reference mode (null/'' -> percent-off-entry; 'expert_target_price' -> anchor on the
+  // recommendation target). Threaded through Load->Run so an optimized run that used the
+  // expert-target bracket reproduces faithfully. No dedicated UI field; carried on load.
+  const [initialTpReference, setInitialTpReference] = useState<string | null>(null);
   const [initialSlPercent, setInitialSlPercent] = useState(2.0);
   const [initialTpOptimize, setInitialTpOptimize] = useState(false);
   const [initialSlOptimize, setInitialSlOptimize] = useState(false);
@@ -740,9 +768,12 @@ const Backtesting: React.FC = () => {
       setImportNote({ kind: 'err', text: 'Invalid JSON — could not parse the expert settings file.' });
       return;
     }
-    const settings = (parsed.expert_settings ?? {}) as Record<string, unknown>;
-    if (!parsed.expert_type && !parsed.expert_settings) {
-      setImportNote({ kind: 'err', text: 'Unrecognized format. Expected an expert settings JSON exported from the live trade platform.' });
+    // Accept BOTH the live-platform shape ({expert_type, expert_settings}) AND the saved-backtest
+    // export shape ({expert, settings:{initial_tp_percent, initial_sl_percent, expert_params}}), so a
+    // file exported from the Saved tab round-trips back in here.
+    const settings = (parsed.expert_settings ?? parsed.settings ?? {}) as Record<string, unknown>;
+    if (!parsed.expert_type && !parsed.expert && !parsed.expert_settings && !parsed.settings) {
+      setImportNote({ kind: 'err', text: 'Unrecognized format. Expected an expert-settings / saved-backtest export JSON.' });
       return;
     }
     applyIndividualParams(settings);
@@ -767,11 +798,20 @@ const Backtesting: React.FC = () => {
         /* offline / no experts list: leave the picker for manual selection */
       }
     }
+    // Pre-fill the expert's CONCRETE settings from the exported expert_params (the optimized model:*
+    // genes), so a saved/optimized run loads its tuned params. The ExpertSettingsForm's defaults
+    // effect MERGES (only seeds keys not already set), so these survive. Strip the model: prefix.
+    const ep = (settings.expert_params ?? {}) as Record<string, unknown>;
+    if (ep && typeof ep === 'object' && Object.keys(ep).length) {
+      const concrete: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(ep)) concrete[k.startsWith('model:') ? k.slice(6) : k] = v;
+      setExpertSettings((prev) => ({ settings: { ...prev.settings, ...concrete }, expert_params: prev.expert_params }));
+    }
     setImportNote({
       kind: 'ok',
       text: matched
-        ? `Imported expert settings for "${matched}": selected the expert and pre-filled TP/SL and other params.`
-        : `Imported expert settings${expertType ? ` from "${expertType}" (not a known expert — select it manually)` : ''}: pre-filled TP/SL and other params.`,
+        ? `Imported expert settings for "${matched}": selected the expert and pre-filled TP/SL + params.`
+        : `Imported expert settings${expertType ? ` from "${expertType}" (not a known expert — select it manually)` : ''}: pre-filled TP/SL + params.`,
     });
   };
   const handleExpertSettingsFile = (file: File | undefined) => {
@@ -826,10 +866,15 @@ const Backtesting: React.FC = () => {
         setAllowShort(sellCount > 0);
         const exitRules = Array.isArray(res.exit_conditions) ? res.exit_conditions : [];
         setExitConditions(
-          exitRules.map((r, i) => ({
-            ...exitConditionFromStored(r as Record<string, unknown>),
-            id: `exit-live-${Date.now()}-${i}`,
-          })),
+          exitRules.map((r, i) => {
+            const rec = r as Record<string, unknown>;
+            const ec = exitConditionFromStored(rec);
+            // exitConditionFromStored passes `conditions` RAW; normalize them like the non-live
+            // path so flag triggers get the sentinel comparison (else "Empty comparison in Exit
+            // Rule …" on run) and numeric leaves get camelCase keys (so they render).
+            const conds = rec.conditions ? normalizeEntryTree(rec.conditions) : ec.conditions;
+            return { ...ec, conditions: conds, id: `exit-live-${Date.now()}-${i}` };
+          }),
         );
         const skipped = res.summary?.skipped_rules ?? 0;
         setLiveImportNote({
@@ -1178,6 +1223,7 @@ const Backtesting: React.FC = () => {
             ...(runSchedule === 'weekly'
               ? { run_schedule: 'weekly', run_schedule_day: runScheduleDay }
               : {}),
+            ...(initialTpReference ? { initial_tp_reference: initialTpReference } : {}),
           })
         });
 
@@ -1338,6 +1384,17 @@ const Backtesting: React.FC = () => {
   // Round-trips the schema produced by part 4 (lib/btExport.ts). Switches to the New tab so the
   // user sees the populated fields.
   const importSettingsJson = (raw: string) => {
+    // A saved-backtest RULESET export ({buy_entry_conditions, sell_entry_conditions, exit_conditions,
+    // …}) isn't an opt-settings/opt-individual schema — route it to the ruleset importer so it
+    // round-trips (the conditions load into the builders).
+    try {
+      const probe = JSON.parse(raw) as Record<string, unknown>;
+      if (probe && (probe.buy_entry_conditions !== undefined || probe.sell_entry_conditions !== undefined
+        || probe.exit_conditions !== undefined || probe.export_type !== undefined)) {
+        void importRulesetJson(raw);
+        return;
+      }
+    } catch { /* fall through to parseExport, which reports a clear error */ }
     let parsed;
     try {
       parsed = parseExport(raw);
@@ -1390,6 +1447,66 @@ const Backtesting: React.FC = () => {
     file.text().then(importSettingsJson).catch(() =>
       setImportNote({ kind: 'err', text: 'Could not read the selected file.' }),
     );
+  };
+
+  // Quick Load: pre-fill a NEW backtest from a saved/historical run in one click — expert + tuned
+  // settings (TP/SL + model:*), conditions, dates, capital, and (from the originating optimization)
+  // the universe + interval. Reuses the import handlers so the field-mapping stays in one place.
+  const loadBacktestIntoForm = async (id: number) => {
+    try {
+      const res = await fetch(`${API_BASE}/backtests/${id}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const bt = await res.json();
+      setSource('expert');
+      setBacktestCardTab('new');
+      if (bt.startDate) setStartDate(String(bt.startDate).slice(0, 10));
+      if (bt.endDate) setEndDate(String(bt.endDate).slice(0, 10));
+      if (typeof bt.initialCapital === 'number') setInitialCapital(bt.initialCapital);
+      // Expert + concrete settings (TP/SL + the optimized expert_params) via the expert-settings export.
+      // Keep the parsed payload so we can also recover the standalone run's universe + interval below.
+      let expertExport: Record<string, unknown> | null = null;
+      try {
+        expertExport = await fetchBacktestExport(id, 'expert_settings');
+        await importExpertSettingsJson(JSON.stringify(expertExport));
+      } catch { /* ignore */ }
+      // Conditions via the ruleset export (structured trees load directly; for opt-derived runs the
+      // conditions are flat cond:/exit: genes and don't render as trees — the expert/RM params above
+      // still load).
+      try { await importRulesetJson(JSON.stringify(await fetchBacktestExport(id, 'ruleset'))); } catch { /* ignore */ }
+      // Universe + interval + the full execution config (seed/fill_model/warmup/enable_short/
+      // run_schedule/tp_reference) — the expert_settings export now carries these for BOTH
+      // opt-derived runs (sourced from the optimization) and standalone runs (persisted on the
+      // row). Restoring them is what makes Run reproduce the saved result faithfully.
+      if (expertExport) {
+        applyImportedUniverse(expertExport.universe as ExportUniverse | undefined);
+        const iv = expertExport.execution_interval;
+        if (typeof iv === 'string') setExecutionInterval(iv);
+        const ex = (expertExport.execution ?? {}) as Record<string, unknown>;
+        if (typeof ex.seed === 'number') setRunSeed(ex.seed);
+        if (typeof ex.fill_model === 'string') setFillModel(ex.fill_model);
+        if (ex.warmup_days != null) setWarmupDays(String(ex.warmup_days));
+        if (typeof ex.enable_short === 'boolean') setAllowShort(ex.enable_short);
+        if (typeof ex.initial_tp_reference === 'string') setInitialTpReference(ex.initial_tp_reference);
+        else setInitialTpReference(null);
+        // run_schedule_override {days:{monday:bool,...}, times:[...]} -> the form's daily/weekly +
+        // weekday. One weekday true -> weekly on that day; otherwise daily (analyse every bar).
+        const rso = ex.run_schedule_override as { days?: Record<string, boolean> } | null | undefined;
+        const days = rso?.days ?? null;
+        const onDays = days ? Object.entries(days).filter(([, v]) => v).map(([k]) => k) : [];
+        if (onDays.length === 1) {
+          setRunSchedule('weekly');
+          setRunScheduleDay(onDays[0].charAt(0).toUpperCase() + onDays[0].slice(1));
+        } else {
+          setRunSchedule('daily');
+        }
+      }
+      setImportNote({
+        kind: 'ok',
+        text: `Loaded "${bt.name ?? `#${id}`}" — expert, settings, conditions, universe, interval, seed & schedule restored. Run to reproduce.`,
+      });
+    } catch (e) {
+      setImportNote({ kind: 'err', text: `Could not load backtest #${id}: ${e instanceof Error ? e.message : ''}` });
+    }
   };
 
   const getFilteredTrades = () => {
@@ -1665,6 +1782,64 @@ const Backtesting: React.FC = () => {
   // top individual's persisted backtest renders identically. The param shadows the outer
   // `selectedBacktest` state with a non-null Backtest so all references inside stay valid.
   function renderBacktestResult(selectedBacktest: Backtest) {
+    // A failed run has no metrics/curves — show the backend error instead of an empty
+    // dashboard (which previously read as "ran fine but produced nothing").
+    if (selectedBacktest.status === 'failed') {
+      return (
+        <>
+          <div className="flex items-start justify-between flex-wrap gap-2">
+            <div className="min-w-0">
+              <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100 truncate">
+                {selectedBacktest.name}
+              </h3>
+              <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                {selectedBacktest.startDate} → {selectedBacktest.endDate}
+              </p>
+            </div>
+            <span className="px-2 py-0.5 text-xs font-medium rounded-full bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300">
+              Failed
+            </span>
+          </div>
+          <div className="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg p-4">
+            <p className="text-sm font-medium text-red-800 dark:text-red-300 mb-1">Backtest failed</p>
+            <pre className="text-xs text-red-700 dark:text-red-400 whitespace-pre-wrap break-words font-mono">
+              {selectedBacktest.errorMessage || 'No error message recorded.'}
+            </pre>
+          </div>
+        </>
+      );
+    }
+    // A pending/running run has no results yet — show a live "running" state with a spinner
+    // (the panel polls every 2s and swaps to the full dashboard on completion) instead of an
+    // empty metrics dashboard, which read as "finished with nothing".
+    if (selectedBacktest.status === 'pending' || selectedBacktest.status === 'running') {
+      return (
+        <>
+          <div className="flex items-start justify-between flex-wrap gap-2">
+            <div className="min-w-0">
+              <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100 truncate">
+                {selectedBacktest.name}
+              </h3>
+              <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                {selectedBacktest.startDate} → {selectedBacktest.endDate}
+              </p>
+            </div>
+            <span className="px-2 py-0.5 text-xs font-medium rounded-full bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300">
+              {selectedBacktest.status === 'pending' ? 'Queued' : 'Running'}
+            </span>
+          </div>
+          <div className="flex flex-col items-center justify-center gap-3 py-16 text-center">
+            <Loader2 className="w-10 h-10 animate-spin text-blue-500" />
+            <p className="text-sm font-medium text-gray-700 dark:text-gray-300">
+              {selectedBacktest.status === 'pending' ? 'Queued — waiting for a worker…' : 'Running the backtest…'}
+            </p>
+            <p className="text-xs text-gray-500 dark:text-gray-400 max-w-sm">
+              Results, equity curve and trades will appear here automatically when the run completes.
+            </p>
+          </div>
+        </>
+      );
+    }
     return (
             <>
               {/* Header: name + engine-type badge (daily expert = multi-asset; ml = model-driven) */}
@@ -1690,6 +1865,22 @@ const Backtesting: React.FC = () => {
                   </span>
                 )}
               </div>
+              {/* Open-positions note: total_trades counts CLOSED round-trips, so a buy-and-hold
+                  (no exit rule) shows 0 trades while equity still moved (entry commission + the
+                  held position's mark-to-market). Surface the open count so that isn't confusing. */}
+              {(() => {
+                const openPos = (selectedBacktest.results as { open_positions?: Array<{ symbol?: string }> } | undefined)?.open_positions;
+                if (!openPos || openPos.length === 0) return null;
+                const syms = openPos.map(p => p.symbol).filter(Boolean).slice(0, 12).join(', ');
+                return (
+                  <div className="bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-lg p-3 text-xs text-amber-800 dark:text-amber-300">
+                    <span className="font-medium">{openPos.length} position(s) still open</span> at the end of the run
+                    {syms ? ` (${syms}${openPos.length > 12 ? '…' : ''})` : ''}. “Total Trades” counts only
+                    closed round-trips, so these aren’t included — but their mark-to-market <em>is</em> in equity & return.
+                    {(selectedBacktest.totalTrades ?? 0) === 0 && ' This is why a run with 0 trades can still show a P&L.'}
+                  </div>
+                );
+              })()}
               {/* Metrics Summary */}
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                 <div className="bg-white dark:bg-gray-800 rounded-lg shadow p-4">
@@ -2284,19 +2475,13 @@ const Backtesting: React.FC = () => {
                     <ExpertPicker value={expertClass} onChange={(cls, info) => { setExpertClass(cls); setExpertBypassesRm(info?.bypasses_classic_rm ?? false); }} />
                   </div>
                   {expertClass && (
-                    <div className="border border-gray-200 dark:border-gray-700 rounded-lg p-3">
-                      <h4 className="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider mb-2">
-                        Expert Settings
-                      </h4>
+                    <CollapsibleSection title="Expert Settings">
                       <ExpertSettingsForm expertClass={expertClass} value={expertSettings} onChange={setExpertSettings} usesRiskManager={!expertBypassesRm} />
-                    </div>
+                    </CollapsibleSection>
                   )}
-                  <div className="border border-gray-200 dark:border-gray-700 rounded-lg p-3">
-                    <h4 className="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider mb-2">
-                      Universe
-                    </h4>
+                  <CollapsibleSection title="Universe">
                     <UniversePicker value={universe} onChange={setUniverse} />
-                  </div>
+                  </CollapsibleSection>
                   <div className="grid grid-cols-2 gap-3">
                     <div>
                       <label className="block text-xs text-gray-500 dark:text-gray-400 mb-1">Fill model</label>
@@ -2511,6 +2696,7 @@ const Backtesting: React.FC = () => {
               )}
 
               {/* Date Range */}
+              <CollapsibleSection title="Date Range" icon={<Calendar className="w-4 h-4 text-gray-500" />}>
               <div className="grid grid-cols-2 gap-3">
                 <div>
                   <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
@@ -2536,14 +2722,10 @@ const Backtesting: React.FC = () => {
                   />
                 </div>
               </div>
+              </CollapsibleSection>
 
-              {/* Strategy Selection */}
-              <div className="border-t border-gray-200 dark:border-gray-700 pt-4">
-                <h3 className="text-sm font-semibold mb-3 flex items-center gap-2 text-gray-900 dark:text-gray-100">
-                  <Layers className="w-4 h-4 text-purple-500" />
-                  Strategy
-                </h3>
-
+              {/* Strategy (load + conditions) — one foldable block */}
+              <CollapsibleSection title="Strategy" icon={<Layers className="w-4 h-4 text-purple-500" />}>
                 {/* Load Strategy Dropdown */}
                 <div className="flex items-center gap-2 mb-3">
                   <div className="relative flex-1">
@@ -2565,7 +2747,6 @@ const Backtesting: React.FC = () => {
                     </select>
                   </div>
                 </div>
-              </div>
 
               {/* Entry/Exit Condition Buttons */}
               <div className="space-y-2 border border-gray-200 dark:border-gray-700 rounded-lg p-3">
@@ -2710,124 +2891,8 @@ const Backtesting: React.FC = () => {
                     exitRules={exitConditions}
                   />
                 </div>
+              </CollapsibleSection>
 
-              {/* Position protection (TP / SL) — engine-applied protective bracket (risk infra,
-                  not entry logic). Hidden for bypass experts (e.g. FactorRanker) which rebalance
-                  to target weights instead of applying per-position TP/SL. */}
-              {source === 'expert' && expertBypassesRm ? (
-                <div className="bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded p-2 text-sm text-amber-800 dark:text-amber-200">
-                  FactorRanker rebalances to target weights, so per-position TP/SL brackets aren't applied. Downside protection is a per-name stop that reuses <code>risk_per_trade_pct</code>: a holding is sold once its loss reaches that % of total equity (set it in the expert's risk settings). The stop fires between rebalances.
-                </div>
-              ) : (
-              <div className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg shadow p-4">
-                <h4 className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2 flex items-center gap-1.5">
-                  <Shield className="w-4 h-4 text-blue-500" />
-                  Position protection (TP / SL)
-                  </h4>
-                    <div className="grid grid-cols-2 gap-3">
-                      <div>
-                        <label className="block text-xs text-gray-500 dark:text-gray-400 mb-1">Take Profit %</label>
-                        <div className="flex items-center gap-2">
-                          <input
-                            type="number"
-                            step="0.5"
-                            value={initialTpPercent}
-                            onChange={e => setInitialTpPercent(parseFloat(e.target.value))}
-                            className="flex-1 px-2 py-1.5 text-sm border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
-                          />
-                          <label className="flex items-center gap-1 text-xs">
-                            <input
-                              type="checkbox"
-                              checked={initialTpOptimize}
-                              onChange={e => setInitialTpOptimize(e.target.checked)}
-                              className="rounded"
-                            />
-                            Opt
-                          </label>
-                        </div>
-                        {initialTpOptimize && (
-                          <div className="flex items-center gap-1 mt-1">
-                            <input
-                              type="number"
-                              step="0.5"
-                              value={initialTpMin}
-                              onChange={e => setInitialTpMin(parseFloat(e.target.value))}
-                              className="w-14 px-1 py-0.5 text-xs border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700"
-                              placeholder="Min"
-                            />
-                            <span className="text-xs text-gray-500">-</span>
-                            <input
-                              type="number"
-                              step="0.5"
-                              value={initialTpMax}
-                              onChange={e => setInitialTpMax(parseFloat(e.target.value))}
-                              className="w-14 px-1 py-0.5 text-xs border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700"
-                              placeholder="Max"
-                            />
-                            <input
-                              type="number"
-                              step="0.1"
-                              value={initialTpStep}
-                              onChange={e => setInitialTpStep(parseFloat(e.target.value))}
-                              className="w-12 px-1 py-0.5 text-xs border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700"
-                              placeholder="Step"
-                            />
-                          </div>
-                        )}
-                      </div>
-                      <div>
-                        <label className="block text-xs text-gray-500 dark:text-gray-400 mb-1">Stop Loss %</label>
-                        <div className="flex items-center gap-2">
-                          <input
-                            type="number"
-                            step="0.5"
-                            value={initialSlPercent}
-                            onChange={e => setInitialSlPercent(parseFloat(e.target.value))}
-                            className="flex-1 px-2 py-1.5 text-sm border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
-                          />
-                          <label className="flex items-center gap-1 text-xs">
-                            <input
-                              type="checkbox"
-                              checked={initialSlOptimize}
-                              onChange={e => setInitialSlOptimize(e.target.checked)}
-                              className="rounded"
-                            />
-                            Opt
-                          </label>
-                        </div>
-                        {initialSlOptimize && (
-                          <div className="flex items-center gap-1 mt-1">
-                            <input
-                              type="number"
-                              step="0.5"
-                              value={initialSlMin}
-                              onChange={e => setInitialSlMin(parseFloat(e.target.value))}
-                              className="w-14 px-1 py-0.5 text-xs border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700"
-                              placeholder="Min"
-                            />
-                            <span className="text-xs text-gray-500">-</span>
-                            <input
-                              type="number"
-                              step="0.5"
-                              value={initialSlMax}
-                              onChange={e => setInitialSlMax(parseFloat(e.target.value))}
-                              className="w-14 px-1 py-0.5 text-xs border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700"
-                              placeholder="Max"
-                            />
-                            <input
-                              type="number"
-                              step="0.1"
-                              value={initialSlStep}
-                              onChange={e => setInitialSlStep(parseFloat(e.target.value))}
-                              className="w-12 px-1 py-0.5 text-xs border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700"
-                              placeholder="Step"
-                            />
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                </div>
-              )}
 
               {/* Save Strategy + Optimize (single joint, or batch across experts) */}
               <div className="flex items-center gap-2 border-t border-gray-200 dark:border-gray-700 pt-4">
@@ -3004,7 +3069,7 @@ const Backtesting: React.FC = () => {
             ) : backtestCardTab === 'history' ? (
               /* History Tab — all runs (fills the viewport height) */
               <div className="h-[calc(100vh-15rem)] overflow-y-auto pr-4 [scrollbar-gutter:stable]">
-                <RunHistoryTable savedOnly={false} onSelect={viewBacktest} />
+                <RunHistoryTable savedOnly={false} onSelect={viewBacktest} onLoad={loadBacktestIntoForm} />
               </div>
             ) : backtestCardTab === 'jobs' ? (
               /* Running Jobs Tab — live per-generation + total progress */
@@ -3037,7 +3102,7 @@ const Backtesting: React.FC = () => {
             ) : (
               /* Saved Backtests Tab — fills the viewport height like History */
               <div className="h-[calc(100vh-15rem)] overflow-y-auto pr-4 [scrollbar-gutter:stable]">
-                <RunHistoryTable savedOnly={true} onSelect={viewBacktest} />
+                <RunHistoryTable savedOnly={true} onSelect={viewBacktest} onLoad={loadBacktestIntoForm} />
               </div>
             )}
           </div>

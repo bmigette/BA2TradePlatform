@@ -745,19 +745,23 @@ def _build_experts(
                 bypass_settings[k] = (v, _setting_type(v))
             expert.save_settings(bypass_settings)
         else:
-            # Enable the RM gates (interface defaults are restrictive) + persist the decision
-            # settings so any self.settings read in the inherited path is consistent with the
-            # dict the engine passes to _process.
-            gate_settings: Dict[str, Any] = {
-                "allow_automated_trade_opening": (True, "bool"),
-                "enable_buy": (True, "bool"),
-                # Live gates open-positions management (Adjust TP/SL/Close) on this flag.
-                "allow_automated_trade_modification": (True, "bool"),
-                # SHORT entries (the SELL enter rule) are gated by the RM on enable_sell.
-                "enable_sell": (bool(config.get("enable_short")), "bool"),
-            }
+            # Persist the decision settings, THEN force the RM trade-permission gates so they
+            # ALWAYS win. These are backtest INVARIANTS: a backtest simulates automated trading,
+            # so opening/modification must be enabled and buys allowed. The interface defaults
+            # (and the UI settings panel) default these to False — and decision_settings carries
+            # whatever the payload sent — so applying the gates AFTER the merge is essential.
+            # Applying them BEFORE (the previous order) let a form-sent
+            # allow_automated_trade_opening=False overwrite the gate and silently drop EVERY
+            # order -> 0 trades for any UI-started backtest. enable_sell follows enable_short.
+            gate_settings: Dict[str, Any] = {}
             for k, v in decision_settings.items():
                 gate_settings[k] = (v, _setting_type(v))
+            gate_settings["allow_automated_trade_opening"] = (True, "bool")
+            gate_settings["enable_buy"] = (True, "bool")
+            # Live gates open-positions management (Adjust TP/SL/Close) on this flag.
+            gate_settings["allow_automated_trade_modification"] = (True, "bool")
+            # SHORT entries (the SELL enter rule) are gated by the RM on enable_sell.
+            gate_settings["enable_sell"] = (bool(config.get("enable_short")), "bool")
             expert.save_settings(gate_settings)
 
         resolver.register_expert(expert_id, expert)

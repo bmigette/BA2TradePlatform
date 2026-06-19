@@ -1265,16 +1265,32 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5) -> int:
 
         persisted = 0
         for rank, params in enumerate(ranked, start=1):
-            trial_cfg = _build_daily_trial_config(bt_block, decode_params(strat, params))
+            decoded = decode_params(strat, params)
+            trial_cfg = _build_daily_trial_config(bt_block, decoded)
             trial_cfg["name"] = f"TOP{rank}-{opt.name or expert}"
             # Persist this top-N run's trading DB (orders/transactions/recommendations) to disk
             # for post-mortem inspection — the GA trials run RAM-only for speed.
             trial_cfg["persist_trading_db"] = True
             results = run_daily_backtest(trial_cfg)
+            # Store the raw optimized genes (for the "Optimized Parameters" display) AND the
+            # CONCRETE decoded ruleset that actually ran (buy/sell/exit trees + TP/SL). The
+            # latter lets Load/export restore the optimized conditions directly — no need to
+            # reconstruct from genes + base tree. Keys mirror what _derive_export_payload reads.
+            strategy_params = dict(params)
+            if decoded.get("buy_tree") is not None:
+                strategy_params["buyEntryConditions"] = decoded["buy_tree"]
+            if decoded.get("sell_tree") is not None:
+                strategy_params["sellEntryConditions"] = decoded["sell_tree"]
+            if decoded.get("exit_rules") is not None:
+                strategy_params["exitConditions"] = decoded["exit_rules"]
+            if decoded.get("tp") is not None:
+                strategy_params["initialTpPercent"] = decoded["tp"]
+            if decoded.get("sl") is not None:
+                strategy_params["initialSlPercent"] = decoded["sl"]
             bt = Backtest(
                 name=trial_cfg["name"], model_id=None, engine_type="daily_expert",
                 expert_name=expert, optimization_id=opt_id,
-                strategy_params=params,
+                strategy_params=strategy_params,
                 start_date=_dt.fromisoformat(str(bt_block["start_date"])),
                 end_date=_dt.fromisoformat(str(bt_block["end_date"])),
                 initial_capital=float(bt_block["initial_capital"]),

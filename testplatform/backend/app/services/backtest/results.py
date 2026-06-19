@@ -69,7 +69,32 @@ def build_results(account: Any, config: Dict[str, Any]) -> Dict[str, Any]:
     metrics["equity_curve"] = equity_curve
     metrics["drawdown_curve"] = drawdown_curve
     metrics["trades"] = trades
+    # Positions still OPEN at the end of the run. total_trades counts CLOSED round-trips, so a
+    # buy-and-hold (no exit rule) shows 0 trades while equity still moves (entry commission +
+    # the held position's mark-to-market). Surfacing these explains "0 trades but P&L changed".
+    metrics["open_positions"] = _open_positions(account)
     return metrics
+
+
+def _open_positions(account: Any) -> List[Dict[str, Any]]:
+    """JSON-safe snapshot of positions still open at run end (empty if the account/stub
+    doesn't expose get_positions)."""
+    if not hasattr(account, "get_positions"):
+        return []
+    out: List[Dict[str, Any]] = []
+    try:
+        for p in account.get_positions():
+            get = (lambda k: p.get(k)) if isinstance(p, dict) else (lambda k: getattr(p, k, None))
+            out.append({
+                "symbol": get("symbol"),
+                "qty": _safe_float(get("qty")),
+                "avg_price": _safe_float(get("avg_price")),
+                "current_price": _safe_float(get("current_price")),
+                "unrealized_pl": _safe_float(get("unrealized_pl")),
+            })
+    except Exception:  # noqa: BLE001 — open-position surfacing must never fail the run
+        return out
+    return out
 
 
 # ---------------------------------------------------------------------------

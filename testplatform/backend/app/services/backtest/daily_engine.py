@@ -594,17 +594,14 @@ class DailyBacktestEngine:
             #     there. Early American assignment is NOT modelled — options resolve at expiry.
             self._apply_option_expiry(as_of_dt)
 
-            # 4b. attach the strategy's initial TP/SL OCO bracket to every freshly-OPENED
-            #     transaction that has no protective leg yet. Without this the entry market
-            #     order fills and the position is held forever (buy-and-hold) — no exit order
-            #     ever closes it, so win_rate/profit_factor are 0 and the "return" is just
-            #     mark-to-market. The legs are WAITING_TRIGGER on the (already-FILLED) entry,
-            #     so they activate next bar and fill on a later bar (no intrabar look-ahead).
-            #     Only reachable when something filled this bar (a fresh OPEN requires a fill).
+            # 4b. (removed) The engine no longer attaches a baseline "Position protection" TP/SL
+            #     bracket on entry. Exits are driven SOLELY by the strategy's exit conditions
+            #     (adjust_take_profit / adjust_stop_loss / close / sell), evaluated by the SAME
+            #     shared engine the LIVE platform uses — where TP/SL are CREATED on demand when an
+            #     adjust rule fires (AlpacaAccount.adjust_tp_sl creates/updates), not pre-bracketed.
+            #     A strategy with no exit conditions therefore holds (matches live). If the roll
+            #     touched orders this bar, reload the cache so the next bar's fill engine sees them.
             if filled:
-                self._apply_initial_brackets()
-                # The bracket attach created new WAITING_TRIGGER OCO legs (and the roll may have
-                # touched orders); reload the cache so the next bar's fill engine sees them.
                 self.account.invalidate_order_cache()
 
             # 5. record per-bar equity / drawdown point.
@@ -1036,127 +1033,6 @@ class DailyBacktestEngine:
                 except Exception as e:  # noqa: BLE001
                     self._log(f"submit_order failed for order {order.id}: {e}")
 
-    # -- initial TP/SL brackets ---------------------------------------------
-    def _apply_initial_brackets(self) -> None:
-        """Attach the run's initial TP/SL OCO bracket to newly-OPENED transactions.
-
-        Reads ``initial_tp_percent`` / ``initial_sl_percent`` off the run config (the
-        optimizer's ``tp``/``sl`` genes, forwarded by ``_build_daily_trial_config``; the CLI
-        / API standalone path may set them directly). For each OPENED transaction that does
-        NOT yet carry a take-profit/stop-loss, the engine derives the absolute TP/SL prices
-        from the FILLED entry price and calls ``account.adjust_tp_sl`` — which stages the
-        protective leg(s) WAITING_TRIGGER on the entry order's FILL. The fill engine then
-        activates + fills them on later bars (first-leg-wins close).
-
-        A no-op when neither percent is configured (legacy buy-and-hold behaviour, but the
-        optimizer / CLI always set at least one so positions close). Per-transaction failures
-        are logged and skipped (one bad bracket must not abort the bar).
-
-        TP REFERENCE (``initial_tp_reference`` config, S1 fidelity):
-          * default / anything but ``"expert_target_price"`` -> the LEGACY percent-off-entry
-            TP (``entry_px * (1 +- initial_tp_percent/100)``); byte-identical to before.
-          * ``"expert_target_price"`` -> anchor the TP on the recommendation that opened the
-            position. The reference target is the linked ``ExpertRecommendation.target_price``;
-            if None, ``entry_px * (1 + expected_profit_percent/100)`` (every expert populates
-            expected_profit_percent); if THAT is also unavailable, the configured
-            ``initial_tp_percent`` off entry. ``initial_tp_percent`` is REUSED as the
-            optimizable offset-from-target: ``TP = target * (1 +- offset/100)`` (offset 0 ->
-            TP exactly at the target; +offset above for a long, below for a short).
-        SL keeps the configured ``initial_sl_percent`` percent-off-entry behaviour in BOTH modes.
-        """
-        tp_pct = self.config.get("initial_tp_percent")
-        sl_pct = self.config.get("initial_sl_percent")
-        if not tp_pct and not sl_pct:
-            return
-        tp_reference = self.config.get("initial_tp_reference")
-        use_expert_target = tp_reference == "expert_target_price"
-
-        for txn in self._open_transactions_without_brackets():
-            entry = self.account._entry_order_for_transaction(txn)
-            # Only bracket a transaction whose entry has actually FILLED (open_price set) —
-            # the TP/SL anchor is the realised entry price, not the pre-fill estimate.
-            if entry is None or not entry.open_price:
-                continue
-            entry_px = float(entry.open_price)
-            is_long = entry.side == OrderDirection.BUY
-            tp_price = sl_price = None
-            if use_expert_target:
-                # Resolve the expert reference target (linked rec.target_price, else derived
-                # from expected_profit_percent, else None -> fall through to the percent path).
-                target = self._expert_reference_target(entry, entry_px, is_long)
-                if target is not None:
-                    # initial_tp_percent is the offset-from-target in this mode (0 -> at target).
-                    off = (float(tp_pct) / 100.0) if tp_pct else 0.0
-                    tp_price = target * (1.0 + off) if is_long else target * (1.0 - off)
-                elif tp_pct:
-                    # No target/profit available -> legacy percent-off-entry fallback.
-                    frac = float(tp_pct) / 100.0
-                    tp_price = entry_px * (1.0 + frac) if is_long else entry_px * (1.0 - frac)
-            elif tp_pct:
-                frac = float(tp_pct) / 100.0
-                tp_price = entry_px * (1.0 + frac) if is_long else entry_px * (1.0 - frac)
-            if sl_pct:
-                frac = float(sl_pct) / 100.0
-                sl_price = entry_px * (1.0 - frac) if is_long else entry_px * (1.0 + frac)
-            try:
-                self.account.adjust_tp_sl(
-                    txn, new_tp_price=tp_price, new_sl_price=sl_price, source="initial-bracket"
-                )
-            except Exception as e:  # noqa: BLE001 — one bad bracket must not abort the bar
-                self._log(f"initial bracket failed for txn {txn.id}: {e}")
-
-    def _expert_reference_target(
-        self, entry: Any, entry_px: float, is_long: bool
-    ) -> Optional[float]:
-        """The expert TP reference price for an opened transaction's entry order.
-
-        Priority (S1 fidelity, works for EVERY expert):
-          1. the linked ``ExpertRecommendation.target_price`` (FMPRating surfaces it);
-          2. else ``entry_px * (1 +- expected_profit_percent/100)`` derived from the same
-             recommendation (long: above entry; short: below) — every clean expert populates
-             expected_profit_percent;
-          3. else ``None`` -> caller falls back to the configured percent-off-entry TP.
-
-        Returns None on any lookup failure (missing link / row) so the bracket degrades to the
-        percent path rather than skipping the protective leg.
-        """
-        rec_id = getattr(entry, "expert_recommendation_id", None)
-        if not rec_id:
-            return None
-        from ba2_common.core.db import get_instance as _get_instance
-
-        rec = _get_instance(ExpertRecommendation, rec_id)
-        if rec is None:
-            return None
-        target = getattr(rec, "target_price", None)
-        if target is not None:
-            return float(target)
-        epp = getattr(rec, "expected_profit_percent", None)
-        if epp:  # non-zero -> derive a target from the expected move off the entry.
-            frac = float(epp) / 100.0
-            return entry_px * (1.0 + frac) if is_long else entry_px * (1.0 - frac)
-        return None
-
-    def _open_transactions_without_brackets(self) -> List[Any]:
-        """OPENED transactions for this account's experts that have no TP/SL set yet.
-
-        ``adjust_tp_sl`` stamps ``take_profit``/``stop_loss`` on the transaction, so a row
-        with neither set is one the engine has not yet bracketed. Restricted to OPENED (the
-        entry filled) — a WAITING transaction has no entry price to anchor the bracket.
-        """
-        from sqlmodel import select, Session
-        from ba2_common.core.db import get_db
-
-        expert_ids = {eid for (_, eid, _, _) in self.experts}
-        with Session(get_db().bind) as session:
-            rows = session.exec(
-                select(Transaction).where(
-                    Transaction.status == TransactionStatus.OPENED,
-                    Transaction.take_profit.is_(None),
-                    Transaction.stop_loss.is_(None),
-                )
-            ).all()
-        return [t for t in rows if t.expert_id in expert_ids]
 
     # -- helpers ------------------------------------------------------------
     def _provider_bundle(self) -> Any:

@@ -25,8 +25,8 @@ function fmtDrawdown(v: unknown): string {
   return Number.isFinite(n) ? `${n.toFixed(1)}%` : '—';
 }
 
-export function RunHistoryTable({ savedOnly, onSelect }:
-  { savedOnly: boolean; onSelect: (id: number) => void; }) {
+export function RunHistoryTable({ savedOnly, onSelect, onLoad }:
+  { savedOnly: boolean; onSelect: (id: number) => void; onLoad?: (id: number) => void; }) {
   const [rows, setRows] = useState<any[]>([]);
   const [expert, setExpert] = useState('');
   const [optId, setOptId] = useState('');
@@ -152,6 +152,16 @@ export function RunHistoryTable({ savedOnly, onSelect }:
                   >
                     {(r.isSaved ?? r.is_saved) ? '★ Saved' : '★ Save'}
                   </button>
+                  {onLoad && (
+                    <button
+                      type="button"
+                      onClick={(e) => { e.stopPropagation(); onLoad(r.id); }}
+                      title="Load this run's settings into a New Backtest"
+                      className="px-2 py-1 text-xs border border-blue-300 dark:border-blue-700 rounded text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20"
+                    >
+                      Load
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={(e) => { e.stopPropagation(); setExportRow(r); }}

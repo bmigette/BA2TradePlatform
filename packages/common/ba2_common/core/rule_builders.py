@@ -75,9 +75,20 @@ EXIT_ACTION: Dict[str, Tuple[ExpertActionType, bool]] = {
 }
 
 
+# Builder word-form comparison -> engine symbol. The shared engine (TradeConditions.CompareCondition)
+# accepts ONLY symbols and ValueErrors on 'gte'/'lte' — so normalise here, the single point where a
+# leaf's operator becomes the trigger operator. This protects pre-existing strategies/rulesets that
+# stored the builder word-form, and is once-per-leaf at seed time (zero per-bar cost).
+_WORD_TO_SYMBOL = {
+    "gt": ">", "gte": ">=", "lt": "<", "lte": "<=", "eq": "==", "neq": "!=", "ne": "!=",
+}
+
+
 def _operator_of(leaf: dict) -> str:
-    # Reconcile API 'comparison' with seeding 'op'/'operator'.
-    return leaf.get("operator") or leaf.get("op") or leaf.get("comparison") or ">"
+    # Reconcile API 'comparison' with seeding 'op'/'operator', then map any word-form to the
+    # engine symbol so '>=' and 'gte' both resolve to '>='.
+    raw = leaf.get("operator") or leaf.get("op") or leaf.get("comparison") or ">"
+    return _WORD_TO_SYMBOL.get(str(raw).strip().lower(), raw)
 
 
 def tree_leaves(node: Any) -> Iterable[dict]:
