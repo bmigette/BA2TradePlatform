@@ -1,0 +1,1075 @@
+{
+  "expert": "FMPRating",
+  "live_instance_id": 5,
+  "buy_entry_conditions": {
+    "id": "grp-or",
+    "operator": "OR",
+    "conditions": [
+      {
+        "id": "grp-22",
+        "operator": "AND",
+        "conditions": [
+          {
+            "id": "c0",
+            "field": "bullish",
+            "field_type": "flag"
+          },
+          {
+            "id": "c1",
+            "field": "confidence",
+            "field_type": "numeric",
+            "comparison": ">=",
+            "value": 80.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 40.0,
+            "value_max": 120.0,
+            "value_step": 16.0
+          },
+          {
+            "id": "c2",
+            "field": "expected_profit_target_percent",
+            "field_type": "numeric",
+            "comparison": ">=",
+            "value": 10.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 5.0,
+            "value_max": 15.0,
+            "value_step": 2.0
+          },
+          {
+            "id": "c3",
+            "field": "long_term",
+            "field_type": "flag"
+          },
+          {
+            "id": "c4",
+            "field": "lowrisk",
+            "field_type": "flag"
+          },
+          {
+            "id": "c5",
+            "field": "has_no_position",
+            "field_type": "flag"
+          }
+        ]
+      },
+      {
+        "id": "grp-23",
+        "operator": "AND",
+        "conditions": [
+          {
+            "id": "c0",
+            "field": "bullish",
+            "field_type": "flag"
+          },
+          {
+            "id": "c1",
+            "field": "confidence",
+            "field_type": "numeric",
+            "comparison": ">=",
+            "value": 78.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 39.0,
+            "value_max": 117.0,
+            "value_step": 15.6
+          },
+          {
+            "id": "c2",
+            "field": "expected_profit_target_percent",
+            "field_type": "numeric",
+            "comparison": ">=",
+            "value": 8.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 4.0,
+            "value_max": 12.0,
+            "value_step": 1.6
+          },
+          {
+            "id": "c3",
+            "field": "medium_term",
+            "field_type": "flag"
+          },
+          {
+            "id": "c4",
+            "field": "mediumrisk",
+            "field_type": "flag"
+          },
+          {
+            "id": "c5",
+            "field": "has_no_position",
+            "field_type": "flag"
+          }
+        ]
+      },
+      {
+        "id": "grp-24",
+        "operator": "AND",
+        "conditions": [
+          {
+            "id": "c0",
+            "field": "bullish",
+            "field_type": "flag"
+          },
+          {
+            "id": "c1",
+            "field": "confidence",
+            "field_type": "numeric",
+            "comparison": ">=",
+            "value": 85.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 42.5,
+            "value_max": 127.5,
+            "value_step": 17.0
+          },
+          {
+            "id": "c2",
+            "field": "expected_profit_target_percent",
+            "field_type": "numeric",
+            "comparison": ">=",
+            "value": 5.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 2.5,
+            "value_max": 7.5,
+            "value_step": 1.0
+          },
+          {
+            "id": "c3",
+            "field": "short_term",
+            "field_type": "flag"
+          },
+          {
+            "id": "c4",
+            "field": "has_no_position",
+            "field_type": "flag"
+          }
+        ]
+      },
+      {
+        "id": "grp-25",
+        "operator": "AND",
+        "conditions": [
+          {
+            "id": "c0",
+            "field": "bullish",
+            "field_type": "flag"
+          },
+          {
+            "id": "c1",
+            "field": "confidence",
+            "field_type": "numeric",
+            "comparison": ">=",
+            "value": 75.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 37.5,
+            "value_max": 112.5,
+            "value_step": 15.0
+          },
+          {
+            "id": "c2",
+            "field": "expected_profit_target_percent",
+            "field_type": "numeric",
+            "comparison": ">=",
+            "value": 12.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 6.0,
+            "value_max": 18.0,
+            "value_step": 2.4
+          },
+          {
+            "id": "c3",
+            "field": "has_no_position",
+            "field_type": "flag"
+          }
+        ]
+      }
+    ]
+  },
+  "sell_entry_conditions": {
+    "id": "grp-or",
+    "operator": "OR",
+    "conditions": [
+      {
+        "id": "grp-26",
+        "operator": "AND",
+        "conditions": [
+          {
+            "id": "c0",
+            "field": "bearish",
+            "field_type": "flag"
+          },
+          {
+            "id": "c1",
+            "field": "confidence",
+            "field_type": "numeric",
+            "comparison": ">=",
+            "value": 80.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 40.0,
+            "value_max": 120.0,
+            "value_step": 16.0
+          },
+          {
+            "id": "c2",
+            "field": "expected_profit_target_percent",
+            "field_type": "numeric",
+            "comparison": ">=",
+            "value": 10.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 5.0,
+            "value_max": 15.0,
+            "value_step": 2.0
+          },
+          {
+            "id": "c3",
+            "field": "long_term",
+            "field_type": "flag"
+          },
+          {
+            "id": "c4",
+            "field": "lowrisk",
+            "field_type": "flag"
+          },
+          {
+            "id": "c5",
+            "field": "has_no_position",
+            "field_type": "flag"
+          }
+        ]
+      },
+      {
+        "id": "grp-27",
+        "operator": "AND",
+        "conditions": [
+          {
+            "id": "c0",
+            "field": "bearish",
+            "field_type": "flag"
+          },
+          {
+            "id": "c1",
+            "field": "confidence",
+            "field_type": "numeric",
+            "comparison": ">=",
+            "value": 78.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 39.0,
+            "value_max": 117.0,
+            "value_step": 15.6
+          },
+          {
+            "id": "c2",
+            "field": "expected_profit_target_percent",
+            "field_type": "numeric",
+            "comparison": ">=",
+            "value": 8.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 4.0,
+            "value_max": 12.0,
+            "value_step": 1.6
+          },
+          {
+            "id": "c3",
+            "field": "medium_term",
+            "field_type": "flag"
+          },
+          {
+            "id": "c4",
+            "field": "mediumrisk",
+            "field_type": "flag"
+          },
+          {
+            "id": "c5",
+            "field": "has_no_position",
+            "field_type": "flag"
+          }
+        ]
+      },
+      {
+        "id": "grp-28",
+        "operator": "AND",
+        "conditions": [
+          {
+            "id": "c0",
+            "field": "bearish",
+            "field_type": "flag"
+          },
+          {
+            "id": "c1",
+            "field": "confidence",
+            "field_type": "numeric",
+            "comparison": ">=",
+            "value": 85.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 42.5,
+            "value_max": 127.5,
+            "value_step": 17.0
+          },
+          {
+            "id": "c2",
+            "field": "expected_profit_target_percent",
+            "field_type": "numeric",
+            "comparison": ">=",
+            "value": 5.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 2.5,
+            "value_max": 7.5,
+            "value_step": 1.0
+          },
+          {
+            "id": "c3",
+            "field": "short_term",
+            "field_type": "flag"
+          },
+          {
+            "id": "c4",
+            "field": "has_no_position",
+            "field_type": "flag"
+          }
+        ]
+      },
+      {
+        "id": "grp-29",
+        "operator": "AND",
+        "conditions": [
+          {
+            "id": "c0",
+            "field": "bearish",
+            "field_type": "flag"
+          },
+          {
+            "id": "c1",
+            "field": "confidence",
+            "field_type": "numeric",
+            "comparison": ">=",
+            "value": 75.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 37.5,
+            "value_max": 112.5,
+            "value_step": 15.0
+          },
+          {
+            "id": "c2",
+            "field": "expected_profit_target_percent",
+            "field_type": "numeric",
+            "comparison": ">=",
+            "value": 12.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 6.0,
+            "value_max": 18.0,
+            "value_step": 2.4
+          },
+          {
+            "id": "c3",
+            "field": "has_no_position",
+            "field_type": "flag"
+          }
+        ]
+      }
+    ]
+  },
+  "exit_conditions": [
+    {
+      "id": "live-30",
+      "name": "Trail_Stop_When_Profit_10pct",
+      "conditions": {
+        "id": "grp-30",
+        "operator": "AND",
+        "conditions": [
+          {
+            "id": "c0",
+            "field": "has_position",
+            "field_type": "flag"
+          },
+          {
+            "id": "c1",
+            "field": "profit_loss_percent",
+            "field_type": "numeric",
+            "comparison": ">=",
+            "value": 10.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 5.0,
+            "value_max": 15.0,
+            "value_step": 2.0
+          }
+        ]
+      },
+      "action": "adjust_stop_loss",
+      "toggle_optimize": true,
+      "reference_value": "order_open_price",
+      "action_value": 5.0,
+      "action_value_optimize": true,
+      "action_value_min": 2.5,
+      "action_value_max": 7.5,
+      "action_value_step": 1.0
+    },
+    {
+      "id": "live-31",
+      "name": "Trail_Stop_When_Profit_15pct",
+      "conditions": {
+        "id": "grp-31",
+        "operator": "AND",
+        "conditions": [
+          {
+            "id": "c0",
+            "field": "has_position",
+            "field_type": "flag"
+          },
+          {
+            "id": "c1",
+            "field": "profit_loss_percent",
+            "field_type": "numeric",
+            "comparison": ">=",
+            "value": 15.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 7.5,
+            "value_max": 22.5,
+            "value_step": 3.0
+          }
+        ]
+      },
+      "action": "adjust_stop_loss",
+      "toggle_optimize": true,
+      "reference_value": "order_open_price",
+      "action_value": 8.0,
+      "action_value_optimize": true,
+      "action_value_min": 4.0,
+      "action_value_max": 12.0,
+      "action_value_step": 1.6
+    },
+    {
+      "id": "live-32",
+      "name": "Trail_Stop_When_Profit_20pct",
+      "conditions": {
+        "id": "grp-32",
+        "operator": "AND",
+        "conditions": [
+          {
+            "id": "c0",
+            "field": "has_position",
+            "field_type": "flag"
+          },
+          {
+            "id": "c1",
+            "field": "profit_loss_percent",
+            "field_type": "numeric",
+            "comparison": ">=",
+            "value": 20.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 10.0,
+            "value_max": 30.0,
+            "value_step": 4.0
+          }
+        ]
+      },
+      "action": "adjust_stop_loss",
+      "toggle_optimize": true,
+      "reference_value": "order_open_price",
+      "action_value": 12.0,
+      "action_value_optimize": true,
+      "action_value_min": 6.0,
+      "action_value_max": 18.0,
+      "action_value_step": 2.4
+    },
+    {
+      "id": "live-33",
+      "name": "Trail_Stop_When_Profit_25pct",
+      "conditions": {
+        "id": "grp-33",
+        "operator": "AND",
+        "conditions": [
+          {
+            "id": "c0",
+            "field": "has_position",
+            "field_type": "flag"
+          },
+          {
+            "id": "c1",
+            "field": "profit_loss_percent",
+            "field_type": "numeric",
+            "comparison": ">=",
+            "value": 25.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 12.5,
+            "value_max": 37.5,
+            "value_step": 5.0
+          }
+        ]
+      },
+      "action": "adjust_stop_loss",
+      "toggle_optimize": true,
+      "reference_value": "order_open_price",
+      "action_value": 15.0,
+      "action_value_optimize": true,
+      "action_value_min": 7.5,
+      "action_value_max": 22.5,
+      "action_value_step": 3.0
+    },
+    {
+      "id": "live-34",
+      "name": "Raise_TP_When_Target_Higher",
+      "conditions": {
+        "id": "grp-34",
+        "operator": "AND",
+        "conditions": [
+          {
+            "id": "c0",
+            "field": "has_position",
+            "field_type": "flag"
+          },
+          {
+            "id": "c1",
+            "field": "new_target_higher",
+            "field_type": "flag"
+          },
+          {
+            "id": "c2",
+            "field": "current_rating_positive",
+            "field_type": "flag"
+          }
+        ]
+      },
+      "action": "adjust_take_profit",
+      "toggle_optimize": true,
+      "reference_value": "expert_target_price",
+      "action_value": -5.0,
+      "action_value_optimize": true,
+      "action_value_min": -7.5,
+      "action_value_max": -2.5,
+      "action_value_step": 1.0
+    },
+    {
+      "id": "live-35",
+      "name": "Early_Exit_Sentiment_Reversal_Profitable",
+      "conditions": {
+        "id": "grp-35",
+        "operator": "AND",
+        "conditions": [
+          {
+            "id": "c0",
+            "field": "has_position",
+            "field_type": "flag"
+          },
+          {
+            "id": "c1",
+            "field": "rating_positive_to_negative",
+            "field_type": "flag"
+          },
+          {
+            "id": "c2",
+            "field": "profit_loss_percent",
+            "field_type": "numeric",
+            "comparison": ">=",
+            "value": 3.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 1.5,
+            "value_max": 4.5,
+            "value_step": 0.6
+          }
+        ]
+      },
+      "action": "close",
+      "toggle_optimize": true
+    },
+    {
+      "id": "live-36",
+      "name": "Early_Exit_Sentiment_Reversal_Small_Loss",
+      "conditions": {
+        "id": "grp-36",
+        "operator": "AND",
+        "conditions": [
+          {
+            "id": "c0",
+            "field": "has_position",
+            "field_type": "flag"
+          },
+          {
+            "id": "c1",
+            "field": "rating_positive_to_negative",
+            "field_type": "flag"
+          },
+          {
+            "id": "c2",
+            "field": "profit_loss_percent",
+            "field_type": "numeric",
+            "comparison": ">=",
+            "value": -3.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": -4.5,
+            "value_max": -1.5,
+            "value_step": 0.6
+          },
+          {
+            "id": "c3",
+            "field": "days_opened",
+            "field_type": "numeric",
+            "comparison": "<",
+            "value": 14.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 7.0,
+            "value_max": 21.0,
+            "value_step": 2.8
+          }
+        ]
+      },
+      "action": "close",
+      "toggle_optimize": true
+    },
+    {
+      "id": "live-37",
+      "name": "Exit_Neutral_Rating_With_Profit",
+      "conditions": {
+        "id": "grp-37",
+        "operator": "AND",
+        "conditions": [
+          {
+            "id": "c0",
+            "field": "has_position",
+            "field_type": "flag"
+          },
+          {
+            "id": "c1",
+            "field": "rating_positive_to_neutral",
+            "field_type": "flag"
+          },
+          {
+            "id": "c2",
+            "field": "profit_loss_percent",
+            "field_type": "numeric",
+            "comparison": ">=",
+            "value": 5.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 2.5,
+            "value_max": 7.5,
+            "value_step": 1.0
+          }
+        ]
+      },
+      "action": "close",
+      "toggle_optimize": true
+    },
+    {
+      "id": "live-38",
+      "name": "Move_SL_BreakEven_After_4pct_Profit",
+      "conditions": {
+        "id": "grp-38",
+        "operator": "AND",
+        "conditions": [
+          {
+            "id": "c0",
+            "field": "has_position",
+            "field_type": "flag"
+          },
+          {
+            "id": "c1",
+            "field": "profit_loss_percent",
+            "field_type": "numeric",
+            "comparison": ">=",
+            "value": 4.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 2.0,
+            "value_max": 6.0,
+            "value_step": 0.8
+          }
+        ]
+      },
+      "action": "adjust_stop_loss",
+      "toggle_optimize": true,
+      "reference_value": "order_open_price",
+      "action_value": 0.5,
+      "action_value_optimize": true,
+      "action_value_min": 0.25,
+      "action_value_max": 0.75,
+      "action_value_step": 0.1
+    },
+    {
+      "id": "live-39",
+      "name": "Hard_Stop_Loss_12pct",
+      "conditions": {
+        "id": "grp-39",
+        "operator": "AND",
+        "conditions": [
+          {
+            "id": "c0",
+            "field": "has_position",
+            "field_type": "flag"
+          },
+          {
+            "id": "c1",
+            "field": "profit_loss_percent",
+            "field_type": "numeric",
+            "comparison": "<=",
+            "value": -12.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": -18.0,
+            "value_max": -6.0,
+            "value_step": 2.4
+          }
+        ]
+      },
+      "action": "close",
+      "toggle_optimize": true
+    },
+    {
+      "id": "live-40",
+      "name": "Time_Decay_30Days_Tighten_TP",
+      "conditions": {
+        "id": "grp-40",
+        "operator": "AND",
+        "conditions": [
+          {
+            "id": "c0",
+            "field": "has_position",
+            "field_type": "flag"
+          },
+          {
+            "id": "c1",
+            "field": "days_opened",
+            "field_type": "numeric",
+            "comparison": ">=",
+            "value": 30.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 15.0,
+            "value_max": 45.0,
+            "value_step": 6.0
+          },
+          {
+            "id": "c2",
+            "field": "days_opened",
+            "field_type": "numeric",
+            "comparison": "<",
+            "value": 60.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 30.0,
+            "value_max": 90.0,
+            "value_step": 12.0
+          },
+          {
+            "id": "c3",
+            "field": "profit_loss_percent",
+            "field_type": "numeric",
+            "comparison": "<",
+            "value": 5.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 2.5,
+            "value_max": 7.5,
+            "value_step": 1.0
+          }
+        ]
+      },
+      "action": "adjust_take_profit",
+      "toggle_optimize": true,
+      "reference_value": "expert_target_price",
+      "action_value": -7.0,
+      "action_value_optimize": true,
+      "action_value_min": -10.5,
+      "action_value_max": -3.5,
+      "action_value_step": 1.4
+    },
+    {
+      "id": "live-41",
+      "name": "Time_Decay_60Days_BreakEven_TP",
+      "conditions": {
+        "id": "grp-41",
+        "operator": "AND",
+        "conditions": [
+          {
+            "id": "c0",
+            "field": "has_position",
+            "field_type": "flag"
+          },
+          {
+            "id": "c1",
+            "field": "days_opened",
+            "field_type": "numeric",
+            "comparison": ">=",
+            "value": 60.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 30.0,
+            "value_max": 90.0,
+            "value_step": 12.0
+          },
+          {
+            "id": "c2",
+            "field": "profit_loss_percent",
+            "field_type": "numeric",
+            "comparison": "<",
+            "value": 5.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 2.5,
+            "value_max": 7.5,
+            "value_step": 1.0
+          }
+        ]
+      },
+      "action": "adjust_take_profit",
+      "toggle_optimize": true,
+      "reference_value": "order_open_price",
+      "action_value": 1.0,
+      "action_value_optimize": true,
+      "action_value_min": 0.5,
+      "action_value_max": 1.5,
+      "action_value_step": 0.2
+    },
+    {
+      "id": "live-42",
+      "name": "Long_Term_Exit_90Days_No_Progress",
+      "conditions": {
+        "id": "grp-42",
+        "operator": "AND",
+        "conditions": [
+          {
+            "id": "c0",
+            "field": "has_position",
+            "field_type": "flag"
+          },
+          {
+            "id": "c1",
+            "field": "days_opened",
+            "field_type": "numeric",
+            "comparison": ">=",
+            "value": 90.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 45.0,
+            "value_max": 135.0,
+            "value_step": 18.0
+          },
+          {
+            "id": "c2",
+            "field": "profit_loss_percent",
+            "field_type": "numeric",
+            "comparison": ">=",
+            "value": 0.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": -1.0,
+            "value_max": 1.0,
+            "value_step": 0.2
+          },
+          {
+            "id": "c3",
+            "field": "profit_loss_percent",
+            "field_type": "numeric",
+            "comparison": "<",
+            "value": 3.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 1.5,
+            "value_max": 4.5,
+            "value_step": 0.6
+          },
+          {
+            "id": "c4",
+            "field": "current_rating_neutral",
+            "field_type": "flag"
+          }
+        ]
+      },
+      "action": "close",
+      "toggle_optimize": true
+    },
+    {
+      "id": "live-43",
+      "name": "Cut_Loss_Negative_Rating_Under_10pct",
+      "conditions": {
+        "id": "grp-43",
+        "operator": "AND",
+        "conditions": [
+          {
+            "id": "c0",
+            "field": "has_position",
+            "field_type": "flag"
+          },
+          {
+            "id": "c1",
+            "field": "current_rating_negative",
+            "field_type": "flag"
+          },
+          {
+            "id": "c2",
+            "field": "profit_loss_percent",
+            "field_type": "numeric",
+            "comparison": ">=",
+            "value": -10.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": -15.0,
+            "value_max": -5.0,
+            "value_step": 2.0
+          },
+          {
+            "id": "c3",
+            "field": "profit_loss_percent",
+            "field_type": "numeric",
+            "comparison": "<",
+            "value": 0.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": -1.0,
+            "value_max": 1.0,
+            "value_step": 0.2
+          }
+        ]
+      },
+      "action": "close",
+      "toggle_optimize": true
+    },
+    {
+      "id": "live-44",
+      "name": "Exit_120Days_Still_Negative",
+      "conditions": {
+        "id": "grp-44",
+        "operator": "AND",
+        "conditions": [
+          {
+            "id": "c0",
+            "field": "has_position",
+            "field_type": "flag"
+          },
+          {
+            "id": "c1",
+            "field": "days_opened",
+            "field_type": "numeric",
+            "comparison": ">=",
+            "value": 120.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 60.0,
+            "value_max": 180.0,
+            "value_step": 24.0
+          },
+          {
+            "id": "c2",
+            "field": "current_rating_negative",
+            "field_type": "flag"
+          }
+        ]
+      },
+      "action": "close",
+      "toggle_optimize": true
+    },
+    {
+      "id": "live-45",
+      "name": "Lower_Target_Reduce_Exposure",
+      "conditions": {
+        "id": "grp-45",
+        "operator": "AND",
+        "conditions": [
+          {
+            "id": "c0",
+            "field": "has_position",
+            "field_type": "flag"
+          },
+          {
+            "id": "c1",
+            "field": "new_target_lower",
+            "field_type": "flag"
+          },
+          {
+            "id": "c2",
+            "field": "instrument_account_share",
+            "field_type": "numeric",
+            "comparison": ">",
+            "value": 10.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 5.0,
+            "value_max": 15.0,
+            "value_step": 2.0
+          }
+        ]
+      },
+      "action": "decrease_instrument_share",
+      "toggle_optimize": true
+    },
+    {
+      "id": "live-46",
+      "name": "Scale_Into_Winner",
+      "conditions": {
+        "id": "grp-46",
+        "operator": "AND",
+        "conditions": [
+          {
+            "id": "c0",
+            "field": "has_position",
+            "field_type": "flag"
+          },
+          {
+            "id": "c1",
+            "field": "new_target_higher",
+            "field_type": "flag"
+          },
+          {
+            "id": "c2",
+            "field": "profit_loss_percent",
+            "field_type": "numeric",
+            "comparison": ">=",
+            "value": 8.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 4.0,
+            "value_max": 12.0,
+            "value_step": 1.6
+          },
+          {
+            "id": "c3",
+            "field": "confidence",
+            "field_type": "numeric",
+            "comparison": ">=",
+            "value": 80.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 40.0,
+            "value_max": 120.0,
+            "value_step": 16.0
+          },
+          {
+            "id": "c4",
+            "field": "instrument_account_share",
+            "field_type": "numeric",
+            "comparison": "<",
+            "value": 12.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 6.0,
+            "value_max": 18.0,
+            "value_step": 2.4
+          }
+        ]
+      },
+      "action": "increase_instrument_share",
+      "toggle_optimize": true
+    }
+  ]
+}

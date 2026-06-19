@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ba2trade-experts"
+version = "0.1.0"
+description = "BA2 Trade — expert implementations"
+requires-python = ">=3.11"
+dependencies = [
+    "ba2trade-common",
+    "ba2trade-providers",
+    "pandas>=2.2.0,<3.0.0",
+    "numpy>=2.0.0",
+    "requests>=2.32.0",
+    "pytz>=2024.1",
+    "sqlmodel>=0.0.22",
+    "fmpsdk>=20230123",
+]
+
+[project.optional-dependencies]
+ui = ["nicegui>=3.0.0"]
+dev = ["pytest>=8.0", "pytest-cov>=5.0", "import-linter>=2.0", "libcst>=1.4"]
+
+[tool.uv.sources]
+ba2trade-common = { git = "ssh://git@github.com/bmigette/BA2TradeCommon.git", branch = "dev" }
+ba2trade-providers = { git = "ssh://git@github.com/bmigette/BA2TradeProviders.git", branch = "dev" }
+
+[tool.hatch.build.targets.wheel]
+packages = ["ba2_experts"]

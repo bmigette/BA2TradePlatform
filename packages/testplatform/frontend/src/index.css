@@ -1,0 +1,540 @@
+@import "tailwindcss";
+
+:root {
+  --background: 0 0% 100%;
+  --foreground: 222.2 84% 4.9%;
+  --card: 0 0% 100%;
+  --card-foreground: 222.2 84% 4.9%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 222.2 84% 4.9%;
+  --primary: 222.2 47.4% 11.2%;
+  --primary-foreground: 210 40% 98%;
+  --secondary: 210 40% 96.1%;
+  --secondary-foreground: 222.2 47.4% 11.2%;
+  --muted: 210 40% 96.1%;
+  --muted-foreground: 215.4 16.3% 46.9%;
+  --accent: 210 40% 96.1%;
+  --accent-foreground: 222.2 47.4% 11.2%;
+  --destructive: 0 84.2% 60.2%;
+  --destructive-foreground: 210 40% 98%;
+  --border: 214.3 31.8% 91.4%;
+  --input: 214.3 31.8% 91.4%;
+  --ring: 222.2 84% 4.9%;
+  --radius: 0.5rem;
+  --chart-1: 12 76% 61%;
+  --chart-2: 173 58% 39%;
+  --chart-3: 197 37% 24%;
+  --chart-4: 43 74% 66%;
+  --chart-5: 27 87% 67%;
+}
+
+.dark {
+  --background: 222.2 84% 4.9%;
+  --foreground: 0 0% 95%;
+  --card: 222.2 84% 4.9%;
+  --card-foreground: 0 0% 95%;
+  --popover: 222.2 84% 4.9%;
+  --popover-foreground: 0 0% 95%;
+  --primary: 0 0% 95%;
+  --primary-foreground: 222.2 47.4% 11.2%;
+  --secondary: 217.2 32.6% 17.5%;
+  --secondary-foreground: 0 0% 95%;
+  --muted: 217.2 32.6% 17.5%;
+  --muted-foreground: 215 20.2% 80%;
+  --accent: 217.2 32.6% 17.5%;
+  --accent-foreground: 0 0% 95%;
+  --destructive: 0 62.8% 30.6%;
+  --destructive-foreground: 0 0% 95%;
+  --border: 217.2 32.6% 17.5%;
+  --input: 217.2 32.6% 17.5%;
+  --ring: 212.7 26.8% 83.9%;
+  --chart-1: 220 70% 50%;
+  --chart-2: 160 60% 45%;
+  --chart-3: 30 80% 55%;
+  --chart-4: 280 65% 60%;
+  --chart-5: 340 75% 55%;
+}
+
+* {
+  border-color: hsl(var(--border));
+}
+
+body {
+  background-color: hsl(var(--background));
+  color: hsl(var(--foreground));
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+@keyframes slide-in {
+  from {
+    transform: translateX(100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+.animate-slide-in {
+  animation: slide-in 0.3s ease-out;
+}
+
+/* ============================================================================
+   Improved text visibility for dark mode
+   Override gray text colors to be lighter in dark mode for better contrast
+   ============================================================================ */
+
+/* Gray text overrides - make text lighter in dark mode */
+.dark .text-gray-400 {
+  color: rgb(156 163 175) !important; /* gray-400 stays same */
+}
+
+.dark .text-gray-500 {
+  color: rgb(156 163 175) !important; /* gray-400 equivalent - lighter */
+}
+
+.dark .text-gray-600 {
+  color: rgb(156 163 175) !important; /* gray-400 equivalent - lighter */
+}
+
+.dark .text-gray-700 {
+  color: rgb(209 213 219) !important; /* gray-300 equivalent - lighter */
+}
+
+.dark .text-gray-800 {
+  color: rgb(229 231 235) !important; /* gray-200 equivalent - lighter */
+}
+
+.dark .text-gray-900 {
+  color: rgb(243 244 246) !important; /* gray-100 equivalent - lighter */
+}
+
+/* Tailwind v4 dark: prefixed utility overrides */
+.dark .dark\:text-gray-300 {
+  color: rgb(209 213 219) !important; /* gray-300 */
+}
+
+.dark .dark\:text-gray-400 {
+  color: rgb(156 163 175) !important; /* gray-400 */
+}
+
+/* Ensure font-medium and font-semibold text is visible in dark mode on gray backgrounds */
+.dark .bg-gray-50 .text-gray-500,
+.dark .bg-gray-50 .text-gray-600 {
+  color: rgb(107 114 128) !important; /* gray-500 - keep readable on light gray-50 in dark */
+}
+
+.dark .bg-gray-700 .font-medium,
+.dark .bg-gray-700\/50 .font-medium {
+  color: rgb(243 244 246) !important; /* gray-100 */
+}
+
+/* ============================================================================
+   Fix colored text values in dark mode - use lighter variants
+   ============================================================================ */
+.dark .text-blue-600 {
+  color: rgb(96 165 250) !important; /* blue-400 */
+}
+
+.dark .text-blue-700 {
+  color: rgb(147 197 253) !important; /* blue-300 */
+}
+
+.dark .text-green-600 {
+  color: rgb(74 222 128) !important; /* green-400 */
+}
+
+.dark .text-green-700 {
+  color: rgb(134 239 172) !important; /* green-300 */
+}
+
+.dark .text-red-600 {
+  color: rgb(248 113 113) !important; /* red-400 */
+}
+
+.dark .text-red-700 {
+  color: rgb(252 165 165) !important; /* red-300 */
+}
+
+.dark .text-yellow-600 {
+  color: rgb(250 204 21) !important; /* yellow-400 */
+}
+
+.dark .text-yellow-700 {
+  color: rgb(253 224 71) !important; /* yellow-300 */
+}
+
+.dark .text-purple-600 {
+  color: rgb(192 132 252) !important; /* purple-400 */
+}
+
+.dark .text-purple-700 {
+  color: rgb(216 180 254) !important; /* purple-300 */
+}
+
+.dark .text-orange-600 {
+  color: rgb(251 146 60) !important; /* orange-400 */
+}
+
+.dark .text-orange-700 {
+  color: rgb(253 186 116) !important; /* orange-300 */
+}
+
+.dark .text-indigo-600 {
+  color: rgb(129 140 248) !important; /* indigo-400 */
+}
+
+.dark .text-cyan-600 {
+  color: rgb(34 211 238) !important; /* cyan-400 */
+}
+
+.dark .text-pink-600 {
+  color: rgb(244 114 182) !important; /* pink-400 */
+}
+
+/* ============================================================================
+   Fix headings and titles in dark mode
+   ============================================================================ */
+
+/* Make headings visible in dark mode */
+.dark h1,
+.dark h2,
+.dark h3,
+.dark h4,
+.dark h5,
+.dark h6 {
+  color: rgb(243 244 246) !important; /* gray-100 */
+}
+
+/* Ensure bold/semibold text is visible in dark mode */
+.dark .font-bold {
+  color: rgb(243 244 246); /* gray-100 - no !important to allow overrides */
+}
+
+.dark .font-semibold {
+  color: rgb(243 244 246); /* gray-100 */
+}
+
+.dark .font-medium {
+  color: rgb(229 231 235); /* gray-200 */
+}
+
+/* ============================================================================
+   Fix placeholder text visibility in dark mode
+   ============================================================================ */
+
+/* Global placeholder fix for dark mode - must be very specific */
+.dark input::placeholder {
+  color: rgb(156 163 175) !important; /* gray-400 */
+  opacity: 1 !important;
+}
+
+.dark textarea::placeholder {
+  color: rgb(156 163 175) !important; /* gray-400 */
+  opacity: 1 !important;
+}
+
+.dark select::placeholder {
+  color: rgb(156 163 175) !important; /* gray-400 */
+  opacity: 1 !important;
+}
+
+/* Even more specific selectors for stubborn placeholders */
+.dark input[type="text"]::placeholder,
+.dark input[type="search"]::placeholder,
+.dark input[type="email"]::placeholder,
+.dark input[type="password"]::placeholder,
+.dark input[type="number"]::placeholder {
+  color: rgb(156 163 175) !important; /* gray-400 */
+  opacity: 1 !important;
+}
+
+/* Target inputs within dark backgrounds */
+.dark .bg-gray-800 input::placeholder,
+.dark .bg-gray-900 input::placeholder,
+.dark .dark\:bg-gray-800 input::placeholder {
+  color: rgb(156 163 175) !important;
+  opacity: 1 !important;
+}
+
+.dark .placeholder-gray-400::placeholder,
+.dark .placeholder-gray-500::placeholder {
+  color: rgb(156 163 175) !important; /* gray-400 */
+  opacity: 1 !important;
+}
+
+/* ============================================================================
+   Fix specific component text colors in dark mode
+   ============================================================================ */
+
+/* Fix card titles */
+.dark .bg-white h3,
+.dark .bg-gray-800 h3 {
+  color: rgb(243 244 246) !important;
+}
+
+/* Fix table header text */
+.dark th {
+  color: rgb(209 213 219) !important; /* gray-300 */
+}
+
+/* Fix table cell text */
+.dark td {
+  color: rgb(229 231 235); /* gray-200 */
+}
+
+/* Fix label text */
+.dark label {
+  color: rgb(209 213 219) !important; /* gray-300 */
+}
+
+/* Fix select dropdown text */
+.dark select {
+  color: rgb(229 231 235) !important; /* gray-200 */
+}
+
+.dark select option {
+  color: rgb(17 24 39); /* gray-900 for dropdown options */
+  background-color: rgb(255 255 255);
+}
+
+/* Fix input text in dark mode */
+.dark input:not([type="checkbox"]):not([type="radio"]) {
+  color: rgb(229 231 235) !important; /* gray-200 */
+}
+
+.dark textarea {
+  color: rgb(229 231 235) !important; /* gray-200 */
+}
+
+/* Fix truncated text that might be too dark */
+.dark .truncate {
+  color: inherit;
+}
+
+/* ============================================================================
+   Additional comprehensive dark mode text fixes
+   ============================================================================ */
+
+/* Ensure all paragraph text is visible in dark mode */
+.dark p {
+  color: rgb(209 213 219); /* gray-300 */
+}
+
+/* ============================================================================
+   FORCE dark BACKGROUNDS/borders/inputs — components use light utility classes
+   (bg-white, bg-gray-50, border-gray-200, ...) without dark: variants, so the
+   panels render white with light text (unreadable). These !important overrides
+   darken the surfaces so the existing light text is legible.
+   ============================================================================ */
+.dark .bg-white { background-color: rgb(30 41 59) !important; }     /* slate-800 panels/cards */
+.dark .bg-gray-50 { background-color: rgb(17 24 39) !important; }   /* page/section bg */
+.dark .bg-gray-100 { background-color: rgb(30 41 59) !important; }
+.dark .bg-gray-200 { background-color: rgb(51 65 85) !important; }
+.dark .hover\:bg-gray-50:hover { background-color: rgb(30 41 59) !important; }
+.dark .hover\:bg-gray-100:hover { background-color: rgb(51 65 85) !important; }
+
+/* ----------------------------------------------------------------------------
+   Colored light backgrounds (bg-<color>-50) in dark mode.
+   This app's dark mode is driven by `.dark .<light-class>` overrides, NOT by
+   Tailwind's native `dark:` variant (which is media-query gated and never fires
+   while the app toggles a `.dark` class). Components pair a light `bg-blue-50`
+   with a `dark:bg-blue-900/NN` that does nothing here — so the light `-50`
+   surface bleeds through and selected/toggle/import buttons render near-white,
+   breaking the dark theme. Darken every colored `-50` surface (and its hover
+   form) to a subtle tint matching the intended `dark:bg-<color>-900/20-30` look
+   (≈ the color-900 blended over the slate-800 panel). The existing
+   `.dark .bg-<color>-50 p/span` text rules already assume a dark surface here. */
+.dark .bg-blue-50    { background-color: rgb(30 46 83)  !important; }
+.dark .bg-green-50   { background-color: rgb(27 54 55)  !important; }
+.dark .bg-purple-50  { background-color: rgb(47 37 82)  !important; }
+.dark .bg-red-50     { background-color: rgb(59 37 50)  !important; }
+.dark .bg-amber-50   { background-color: rgb(57 45 46)  !important; }
+.dark .bg-yellow-50  { background-color: rgb(55 48 47)  !important; }
+.dark .bg-orange-50  { background-color: rgb(58 42 47)  !important; }
+.dark .bg-indigo-50  { background-color: rgb(36 43 80)  !important; }
+.dark .bg-cyan-50    { background-color: rgb(28 52 71)  !important; }
+.dark .bg-pink-50    { background-color: rgb(60 36 61)  !important; }
+.dark .bg-teal-50    { background-color: rgb(27 52 64)  !important; }
+.dark .bg-sky-50     { background-color: rgb(25 51 74)  !important; }
+.dark .bg-violet-50  { background-color: rgb(44 37 86)  !important; }
+.dark .bg-rose-50    { background-color: rgb(62 34 57)  !important; }
+.dark .bg-lime-50    { background-color: rgb(37 54 47)  !important; }
+.dark .bg-fuchsia-50 { background-color: rgb(55 37 76)  !important; }
+
+.dark .hover\:bg-blue-50:hover    { background-color: rgb(30 46 83)  !important; }
+.dark .hover\:bg-green-50:hover   { background-color: rgb(27 54 55)  !important; }
+.dark .hover\:bg-purple-50:hover  { background-color: rgb(47 37 82)  !important; }
+.dark .hover\:bg-red-50:hover     { background-color: rgb(59 37 50)  !important; }
+.dark .hover\:bg-amber-50:hover   { background-color: rgb(57 45 46)  !important; }
+.dark .hover\:bg-yellow-50:hover  { background-color: rgb(55 48 47)  !important; }
+.dark .hover\:bg-orange-50:hover  { background-color: rgb(58 42 47)  !important; }
+.dark .hover\:bg-indigo-50:hover  { background-color: rgb(36 43 80)  !important; }
+
+.dark .border-gray-100,
+.dark .border-gray-200,
+.dark .border-gray-300 { border-color: rgb(51 65 85) !important; } /* slate-700 borders */
+
+/* Inputs / selects / textareas: dark field, light text, readable border */
+.dark input:not([type="checkbox"]):not([type="radio"]),
+.dark select,
+.dark textarea {
+  background-color: rgb(15 23 42) !important;   /* slate-900 */
+  color: rgb(226 232 240) !important;
+  border-color: rgb(51 65 85) !important;
+}
+
+/* Light gray body text -> readable on the now-dark surfaces */
+.dark .text-gray-400,
+.dark .text-gray-500,
+.dark .text-gray-600,
+.dark .text-gray-700,
+.dark .text-gray-800,
+.dark .text-black { color: rgb(203 213 225) !important; } /* slate-300 */
+
+/* Fix span elements that inherit dark colors */
+.dark span {
+  color: inherit;
+}
+
+/* Specific fixes for spans with gray text classes */
+.dark span.text-gray-500,
+.dark span.text-gray-600 {
+  color: rgb(156 163 175) !important; /* gray-400 */
+}
+
+/* Fix text in modals and dialogs */
+.dark .fixed p,
+.dark .fixed span,
+.dark [role="dialog"] p,
+.dark [role="dialog"] span {
+  color: rgb(209 213 219); /* gray-300 */
+}
+
+/* Fix description text + small field labels in forms (e.g. the condition-builder
+   Min/Max/Step/Confirm labels) — gray-400 reads weak on the dark condition rows, so
+   lift small gray helper text to gray-300 for better dark-mode contrast. */
+.dark .text-xs.text-gray-500,
+.dark .text-sm.text-gray-500,
+.dark .text-xs.text-gray-600,
+.dark .text-sm.text-gray-600 {
+  color: rgb(209 213 219) !important; /* gray-300 */
+}
+
+/* Fix text in cards and panels */
+.dark .bg-gray-50 p,
+.dark .bg-gray-100 p {
+  color: rgb(55 65 81); /* gray-700 - dark text on light bg in dark mode */
+}
+
+.dark .bg-gray-700 p,
+.dark .bg-gray-800 p,
+.dark .bg-gray-900 p {
+  color: rgb(209 213 219) !important; /* gray-300 */
+}
+
+/* Fix secondary text colors */
+.dark .text-muted-foreground {
+  color: rgb(156 163 175) !important; /* gray-400 */
+}
+
+/* Fix form helper text */
+.dark .mt-1.text-xs,
+.dark .mt-2.text-xs,
+.dark .mt-1.text-sm,
+.dark .mt-2.text-sm {
+  color: rgb(156 163 175); /* gray-400 */
+}
+
+/* Fix capitalize and other text transforms */
+.dark .capitalize {
+  color: inherit;
+}
+
+/* Fix border colors being too dark */
+.dark .border-gray-200 {
+  border-color: rgb(55 65 81); /* gray-700 */
+}
+
+.dark .border-gray-300 {
+  border-color: rgb(75 85 99); /* gray-600 */
+}
+
+/* Fix divide colors */
+.dark .divide-gray-200 > * + * {
+  border-color: rgb(55 65 81); /* gray-700 */
+}
+
+/* Fix text on colored backgrounds in dark mode - use light text for dark backgrounds */
+.dark .bg-blue-50 p,
+.dark .bg-blue-50 span {
+  color: rgb(219 234 254); /* blue-100 - light blue text */
+}
+
+.dark .bg-green-50 p,
+.dark .bg-green-50 span {
+  color: rgb(220 252 231); /* green-100 - light green text */
+}
+
+.dark .bg-purple-50 p,
+.dark .bg-purple-50 span {
+  color: rgb(243 232 255); /* purple-100 - light purple text */
+}
+
+/* Fix dark mode colored section backgrounds to use darker variants */
+.dark .bg-blue-900\/20 p,
+.dark .bg-blue-900\/20 span,
+.dark .bg-blue-900\/30 p,
+.dark .bg-blue-900\/30 span {
+  color: rgb(219 234 254) !important; /* blue-100 */
+}
+
+.dark .bg-green-900\/20 p,
+.dark .bg-green-900\/20 span,
+.dark .bg-green-900\/30 p,
+.dark .bg-green-900\/30 span {
+  color: rgb(220 252 231) !important; /* green-100 */
+}
+
+.dark .bg-purple-900\/20 p,
+.dark .bg-purple-900\/20 span,
+.dark .bg-purple-900\/30 p,
+.dark .bg-purple-900\/30 span {
+  color: rgb(243 232 255) !important; /* purple-100 */
+}
+
+/* Fix code blocks in dark mode */
+.dark code {
+  color: rgb(209 213 219); /* gray-300 */
+  background-color: rgb(55 65 81); /* gray-700 */
+}
+
+/* Fix text in info boxes */
+.dark .bg-blue-900\/20 p,
+.dark .bg-green-900\/20 p,
+.dark .bg-purple-900\/20 p {
+  color: rgb(209 213 219) !important; /* gray-300 */
+}
+
+/* Fix button text */
+.dark button:not(.bg-blue-500):not(.bg-red-500):not(.bg-green-500) {
+  color: inherit;
+}
+
+/* Fix list items */
+.dark li {
+  color: rgb(209 213 219); /* gray-300 */
+}
+
+/* Fix disabled state text */
+.dark .opacity-50 {
+  color: inherit;
+}
+
+/* Fix tooltip text */
+.dark [data-tooltip] {
+  color: rgb(209 213 219); /* gray-300 */
+}

@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#1e3a5f"/>
+      <stop offset="100%" style="stop-color:#0d1b2a"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#00d4aa"/>
+      <stop offset="100%" style="stop-color:#00b894"/>
+    </linearGradient>
+    <linearGradient id="chart" x1="0%" y1="100%" x2="0%" y2="0%">
+      <stop offset="0%" style="stop-color:#e74c3c"/>
+      <stop offset="50%" style="stop-color:#f39c12"/>
+      <stop offset="100%" style="stop-color:#27ae60"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background circle -->
+  <circle cx="32" cy="32" r="30" fill="url(#bg)" stroke="url(#accent)" stroke-width="2"/>
+
+  <!-- Candlestick chart -->
+  <!-- Candle 1 - red/down -->
+  <rect x="14" y="28" width="4" height="12" fill="#e74c3c" rx="1"/>
+  <line x1="16" y1="24" x2="16" y2="44" stroke="#e74c3c" stroke-width="1.5"/>
+
+  <!-- Candle 2 - green/up -->
+  <rect x="22" y="22" width="4" height="14" fill="#27ae60" rx="1"/>
+  <line x1="24" y1="18" x2="24" y2="40" stroke="#27ae60" stroke-width="1.5"/>
+
+  <!-- Candle 3 - green/up (tall) -->
+  <rect x="30" y="16" width="4" height="18" fill="#27ae60" rx="1"/>
+  <line x1="32" y1="12" x2="32" y2="38" stroke="#27ae60" stroke-width="1.5"/>
+
+  <!-- AI Brain network nodes -->
+  <circle cx="44" cy="20" r="3" fill="url(#accent)"/>
+  <circle cx="52" cy="28" r="3" fill="url(#accent)"/>
+  <circle cx="48" cy="38" r="3" fill="url(#accent)"/>
+  <circle cx="42" cy="46" r="2.5" fill="url(#accent)"/>
+
+  <!-- Neural connections -->
+  <line x1="34" y1="20" x2="41" y2="20" stroke="#00d4aa" stroke-width="1.5" opacity="0.8"/>
+  <line x1="44" y1="23" x2="52" y2="25" stroke="#00d4aa" stroke-width="1" opacity="0.6"/>
+  <line x1="44" y1="23" x2="48" y2="35" stroke="#00d4aa" stroke-width="1" opacity="0.6"/>
+  <line x1="52" y1="31" x2="48" y2="35" stroke="#00d4aa" stroke-width="1" opacity="0.6"/>
+  <line x1="48" y1="41" x2="42" y2="44" stroke="#00d4aa" stroke-width="1" opacity="0.6"/>
+  <line x1="34" y1="34" x2="42" y2="44" stroke="#00d4aa" stroke-width="1.5" opacity="0.8"/>
+
+  <!-- Trend line -->
+  <path d="M12 42 L24 30 L32 18 L42 22" stroke="url(#accent)" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

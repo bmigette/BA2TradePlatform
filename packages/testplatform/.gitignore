@@ -1,0 +1,133 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+# Anchored to repo root so the Python-template ``lib/`` doesn't snag frontend/src/lib/
+# (the backend venv's lib is already covered by the ``venv/`` rule below).
+/lib/
+/lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# Claude Code session + agent worktrees (never commit)
+.claude/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/
+
+# Database
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+
+# Cache
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Coverage
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+
+# ML/Data
+*.h5
+*.hdf5
+*.npy
+*.npz
+
+# Datasets (large files)
+backend/datasets/*.csv
+backend/datasets/*.parquet
+!backend/datasets/.gitkeep
+
+# News exports (user data)
+news_exports/
+
+# Model files (large)
+backend/models/*.pt
+backend/models/*.pth
+backend/models/*.onnx
+!backend/models/.gitkeep
+
+# Node (frontend)
+node_modules/
+dist/
+dist-ssr/
+*.local
+package-lock.json
+
+# Build artifacts
+*.egg-info/
+*.manifest
+*.spec
+
+# Secrets
+*.pem
+*.key
+credentials.json
+
+# Screenshots (temporary)
+after-refresh
+chart-test
+dataset-page
+
+# Test result files (machine-specific)
+backend/tests/*_report.json
+backend/tests/*_results.json
+
+# Cache directories
+backend/datasets/cache/
+backend/test_output/
+backend/trained_models/
+
+# Accidental duplicate directories
+backend/backend/
+
+# Brainstorming visual-companion artifacts
+.superpowers/

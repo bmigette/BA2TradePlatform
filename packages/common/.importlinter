@@ -1,0 +1,14 @@
+[importlinter]
+root_packages =
+    ba2_common
+include_external_packages = True
+
+[importlinter:contract:common-is-self-contained]
+name = ba2_common must not import providers, experts, or live-only modules
+type = forbidden
+source_modules =
+    ba2_common
+forbidden_modules =
+    ba2_providers
+    ba2_experts
+    ba2_trade_platform

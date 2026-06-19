@@ -1,0 +1,64 @@
+{
+  "expert": "FMPEarningsDrift",
+  "live_instance_id": 38,
+  "buy_entry_conditions": {
+    "id": "grp-123",
+    "operator": "AND",
+    "conditions": [
+      {
+        "id": "c0",
+        "field": "has_no_position",
+        "field_type": "flag"
+      },
+      {
+        "id": "c1",
+        "field": "current_rating_positive",
+        "field_type": "flag"
+      },
+      {
+        "id": "c2",
+        "field": "confidence",
+        "field_type": "numeric",
+        "comparison": ">=",
+        "value": 60.0,
+        "optimize": true,
+        "optimize_enabled": true,
+        "value_min": 30.0,
+        "value_max": 90.0,
+        "value_step": 12.0
+      }
+    ]
+  },
+  "sell_entry_conditions": null,
+  "exit_conditions": [
+    {
+      "id": "live-124",
+      "name": "Drift Window Over: Close",
+      "conditions": {
+        "id": "grp-124",
+        "operator": "AND",
+        "conditions": [
+          {
+            "id": "c0",
+            "field": "has_buy_position",
+            "field_type": "flag"
+          },
+          {
+            "id": "c1",
+            "field": "days_opened",
+            "field_type": "numeric",
+            "comparison": ">=",
+            "value": 15.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 7.5,
+            "value_max": 22.5,
+            "value_step": 3.0
+          }
+        ]
+      },
+      "action": "close",
+      "toggle_optimize": true
+    }
+  ]
+}

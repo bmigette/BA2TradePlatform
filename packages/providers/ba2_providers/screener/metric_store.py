@@ -1,0 +1,323 @@
+"""Precomputed, exportable screener METRIC STORE for screener-settings optimization.
+
+The FMP screener universe (current actively-trading US names — survivorship-biased by design)
+is enumerated once, then each symbol's per-day screen metrics are computed VECTORISED from the
+already-disk-cached OHLCV and written as date-partitioned parquet (exportable; extend by adding
+partitions). At optimize time the store loads into pandas and each GA individual filters it
+per day. No server.
+"""
+from __future__ import annotations
+import os
+from typing import Any, Dict, List, Optional
+
+import pandas as pd
+
+from ba2_providers.fmp_common import fmp_http_get
+
+_SCREENER_URL = "https://financialmodelingprep.com/api/v3/stock-screener"
+
+
+def _fetch_screener_rows(api_key: str) -> List[Dict[str, Any]]:
+    """One call to the FMP screener for the current actively-trading US universe."""
+    resp = fmp_http_get(
+        _SCREENER_URL,
+        params={"limit": 10000, "exchange": "nasdaq,nyse,amex",
+                "isActivelyTrading": "true", "apikey": api_key},
+        endpoint="stock-screener",
+    )
+    rows = resp.json()
+    return rows if isinstance(rows, list) else []
+
+
+def enumerate_universe(api_key: str, market_cap_min: float, price_min: float,
+                       volume_min: float) -> List[Dict[str, Any]]:
+    """Return screener rows passing the LOOSEST static bounds (the shortlist superset).
+
+    Uses the screener's own current marketCap/price/volume fields (one call). These bounds are
+    the loosest of every static gene's range, so no individual's looser threshold can admit a
+    symbol we didn't include.
+    """
+    out = []
+    for r in _fetch_screener_rows(api_key):
+        cap = r.get("marketCap") or 0
+        px = r.get("price") or 0
+        vol = r.get("volume") or 0
+        if cap >= market_cap_min and px >= price_min and vol >= volume_min:
+            out.append(r)
+    return out
+
+
+def weinstein_stage_series(close: "pd.Series", sma_period: int = 150,
+                           slope_lookback: int = 20,
+                           flat_threshold_pct: float = 0.5) -> "pd.Series":
+    """Vectorised Weinstein stage (1-4, NaN=insufficient history) for a close series.
+
+    1:1 port of ``ba2_common.core.weinstein.classify_weinstein_stage`` applied to EVERY bar via
+    rolling ops (no per-day Python loop). For each bar D:
+
+      sma_now   = mean of the trailing ``sma_period`` closes ending at D
+                  -> ``close.rolling(sma_period).mean()`` (min_periods == sma_period so it is
+                  NaN until there are exactly ``sma_period`` bars, like the classifier's
+                  ``len < period -> None``).
+      sma_prior = the SMA as it stood ``slope_lookback`` bars earlier
+                  -> ``sma_now.shift(slope_lookback)``. This equals the classifier's
+                  ``_sma(closes[:-slope_lookback], sma_period)`` exactly, because the SMA at bar
+                  D-slope_lookback is the mean of the ``sma_period`` closes ending there.
+      slope_pct = (sma_now - sma_prior) / sma_prior * 100
+      above     = close > sma_now
+      rising    = slope_pct >  flat_threshold_pct
+      falling   = slope_pct < -flat_threshold_pct
+
+    Stage mapping (identical to the classifier):
+      2  above and rising            (advancing — the buy zone)
+      4  not above and falling       (declining)
+      3  above and not rising        (topping)
+      1  otherwise                   (basing)
+
+    A bar has a stage only once it has ``sma_period + slope_lookback`` bars of history (the
+    classifier's guard) AND ``sma_prior > 0`` — otherwise NaN (the classifier's None). Returned
+    as a float Series (so NaN is representable); callers compare ``== 2``.
+    """
+    close = close.astype(float)
+    sma_now = close.rolling(sma_period, min_periods=sma_period).mean()
+    sma_prior = sma_now.shift(slope_lookback)
+    # Guard: classifier returns None unless sma_prior is computable AND > 0 (avoids /0 and the
+    # "could not compute SMA" branch). shift already makes the first slope_lookback valid SMAs
+    # NaN, which together with min_periods enforces the >= sma_period + slope_lookback history.
+    valid = sma_prior > 0
+    slope_pct = (sma_now - sma_prior) / sma_prior * 100.0
+    above = close > sma_now
+    rising = slope_pct > flat_threshold_pct
+    falling = slope_pct < -flat_threshold_pct
+    stage = pd.Series(1.0, index=close.index)          # default: basing
+    stage = stage.where(~(above & rising), 2.0)
+    stage = stage.where(~((~above) & falling), 4.0)
+    stage = stage.where(~(above & ~rising), 3.0)
+    # NB: the four branches are mutually exclusive (same if/elif order as the classifier:
+    # 2 wins over 3 because rising excludes "not rising"; 4 is the only not-above branch chained
+    # before the above-only 3), so .where overwrites are non-overlapping.
+    return stage.where(valid, float("nan"))
+
+
+def compute_daily_metrics(ohlcv: "pd.DataFrame", shares: Optional[float],
+                          rvol_window: int = 20, drop_days: int = 1) -> "pd.DataFrame":
+    """Per-day screen metrics for ONE symbol, vectorised over its full history.
+
+    ``ohlcv`` is indexed by date with columns Open/High/Low/Close/Volume (the shape the as-of
+    OHLCV cache returns). Returns a DataFrame indexed by date with columns:
+    close, market_cap, relative_volume, price_drop_pct, weinstein_stage. NaN rows (insufficient
+    lookback) are kept — callers drop them. Point-in-time safe: every value at row D uses only
+    bars <= D.
+    """
+    close = ohlcv["Close"].astype(float)
+    vol = ohlcv["Volume"].astype(float)
+    # RVOL: today's volume / trailing average of the PRIOR rvol_window days (EXCLUDES today via
+    # shift(1) — point-in-time: today is the spike measured against its prior baseline). The
+    # first row's avg is NaN -> .where(avg_vol > 0) leaves RVOL 0.
+    avg_vol = vol.shift(1).rolling(rvol_window, min_periods=1).mean()
+    rvol = (vol / avg_vol).where(avg_vol > 0, 0.0)
+    # Price drop %: peak of the trailing window (inclusive) vs today's close.
+    peak = close.rolling(max(1, drop_days), min_periods=1).max()
+    drop_pct = ((peak - close) / peak * 100.0).where(peak > 0, 0.0)
+    mcap = (close * shares) if shares else pd.Series(float("nan"), index=close.index)
+    # Weinstein stage (price vs RISING 150-session/30-week SMA) — vectorised 1:1 with
+    # ba2_common.core.weinstein.classify_weinstein_stage so the fast screener path agrees with
+    # the slow StockScreener Stage-2 filter. NaN until enough history (matches classifier None).
+    stage = weinstein_stage_series(close)
+    return pd.DataFrame({
+        "close": close,
+        "market_cap": mcap,
+        "relative_volume": rvol.round(4),
+        "price_drop_pct": drop_pct.round(4),
+        "weinstein_stage": stage,
+    })
+
+
+def existing_months(store_dir: str) -> set:
+    """Year-months (``YYYY-MM``) already materialised in the store (for incremental skip)."""
+    if not os.path.isdir(store_dir):
+        return set()
+    return {d[len("ym="):] for d in os.listdir(store_dir) if d.startswith("ym=")}
+
+
+def write_partitions(store_dir: str, df: "pd.DataFrame") -> None:
+    """Write rows to ``<store>/ym=YYYY-MM/part.parquet`` (one file per month). Overwrites the
+    month's file (idempotent re-build of a month); never touches other months."""
+    os.makedirs(store_dir, exist_ok=True)
+    ym = df["date"].astype(str).str.slice(0, 7)
+    for month, chunk in df.groupby(ym):
+        d = os.path.join(store_dir, f"ym={month}")
+        os.makedirs(d, exist_ok=True)
+        tmp = os.path.join(d, "part.parquet.tmp")
+        chunk.to_parquet(tmp, index=False)
+        os.replace(tmp, os.path.join(d, "part.parquet"))
+
+
+def scan_dates(start: str, end: str, cadence_days: int) -> "pd.DatetimeIndex":
+    """The common scan-date grid: every ``cadence_days`` CALENDAR days from start..end.
+    Default cadence 7 = one scan per week. Shared across symbols so scan dates are consistent."""
+    return pd.date_range(start=start, end=end, freq=f"{int(cadence_days)}D")
+
+
+def build_store(store_dir: str, api_key: str, start: str, end: str, *,
+                market_cap_min: float, price_min: float, volume_min: float,
+                ohlcv_get, shares_get, cadence_days: int = 7,
+                rvol_window: int = 20, drop_days: int = 1) -> Dict[str, Any]:
+    """Build/extend the metric store for [start,end] at ``cadence_days`` (default 7 = weekly).
+    SKIPS months already present (incremental). ``ohlcv_get(symbol, end_date)`` -> OHLCV up to
+    end_date (as-of cache); ``shares_get(symbol)`` -> latest-filing shares. For each symbol the
+    daily metrics are computed then sampled AS-OF each scan date (latest trading day <= scan
+    date via ffill), so each row is point-in-time for its scan date. Returns
+    {symbols, months_written, months_skipped, cadence_days}."""
+    grid = scan_dates(start, end, cadence_days)
+    want_months = sorted({d.strftime("%Y-%m") for d in grid})
+    have = existing_months(store_dir)
+    todo_months = [m for m in want_months if m not in have]
+    if not todo_months:
+        return {"symbols": 0, "months_written": 0, "months_skipped": len(want_months), "cadence_days": cadence_days}
+    grid_todo = grid[[d.strftime("%Y-%m") in set(todo_months) for d in grid]]
+    universe = enumerate_universe(api_key, market_cap_min, price_min, volume_min)
+    static_by_sym = {r["symbol"]: r for r in universe}
+    frames = []
+    for sym, srow in static_by_sym.items():
+        df = ohlcv_get(sym, end)
+        if df is None or df.empty:
+            continue
+        m = compute_daily_metrics(df, shares=shares_get(sym), rvol_window=rvol_window, drop_days=drop_days)
+        m = m.reindex(grid_todo, method="ffill")             # value AS-OF each scan date
+        m = m.dropna(subset=["close"]).reset_index().rename(columns={"index": "date"})
+        m["date"] = m["date"].astype(str).str.slice(0, 10)
+        if m.empty:
+            continue
+        m["symbol"] = sym
+        m["sector"] = srow.get("sector")
+        m["volume"] = m["close"] * 0 + (srow.get("volume") or 0)  # static screener volume ride-along
+        m["price"] = m["close"]
+        # weinstein_stage rides along from compute_daily_metrics (reindex carried it as-of each
+        # scan date); persisted so the fast path can honor weinstein_stage2_only without reloading
+        # OHLCV. Rows with insufficient history hold NaN (won't match the == 2 filter).
+        frames.append(m)
+    if frames:
+        write_partitions(store_dir, pd.concat(frames, ignore_index=True))
+    return {"symbols": len(static_by_sym), "months_written": len(todo_months),
+            "months_skipped": len(set(have) & set(want_months)), "cadence_days": cadence_days}
+
+
+_STORE_MEMO: Dict[str, "pd.DataFrame"] = {}
+_SCAN_DATES_MEMO: Dict[str, List[str]] = {}
+
+
+def scan_dates(store_df: "pd.DataFrame", store_key: str = "") -> List[str]:
+    """Sorted unique scan-date strings ('YYYY-MM-DD'), memoised by ``store_key`` (the store dir).
+
+    Lets the per-bar as-of resolve be an O(log n) bisect over this list instead of an O(rows)
+    object-array comparison (``store_df['date'] <= day``) on EVERY 5-min bar — the latter was the
+    dominant CPU cost of a screener backtest (re-scanning the whole ~160k-row store per bar)."""
+    if store_key and store_key in _SCAN_DATES_MEMO:
+        return _SCAN_DATES_MEMO[store_key]
+    ds = sorted({str(d) for d in store_df["date"].unique()})
+    if store_key:
+        _SCAN_DATES_MEMO[store_key] = ds
+    return ds
+
+
+def load_store(store_dir: str) -> "pd.DataFrame":
+    """Load all month partitions into one DataFrame, memoised by store path (per process —
+    GA workers stay alive across trials, so the store loads ~once per worker)."""
+    import glob
+    hit = _STORE_MEMO.get(store_dir)
+    if hit is not None:
+        return hit
+    parts = sorted(glob.glob(os.path.join(store_dir, "ym=*", "part.parquet")))
+    if not parts:
+        raise FileNotFoundError(f"empty screener metric store: {store_dir}")
+    df = pd.concat((pd.read_parquet(p) for p in parts), ignore_index=True)
+    _STORE_MEMO[store_dir] = df
+    return df
+
+
+def clear_store_memo() -> None:
+    _STORE_MEMO.clear()
+    _SCAN_DATES_MEMO.clear()
+
+
+def screen_universe_for_day(store_df: "pd.DataFrame", day: str,
+                            settings: Dict[str, Any]) -> List[str]:
+    """The dynamic per-day universe for one individual's screener thresholds.
+
+    ``day`` is 'YYYY-MM-DD'. ``settings`` keys (all optional; absent => not enforced):
+    market_cap_min/max, price_min/max, volume_min/max, relative_volume_min, price_drop_pct
+    (min drop to qualify a 'dip'), weinstein_stage2_only (truthy => keep only Weinstein Stage 2
+    rows, matching the slow StockScreener Stage-2 filter), max_stocks, sort_metric ('market_cap'|
+    'relative_volume'|'price_drop_pct'). Returns the selected symbols (<= max_stocks), sorted by
+    sort_metric desc. Pure in-memory filter over the precomputed row values — microseconds."""
+    d = store_df[store_df["date"] == day]
+    if d.empty:
+        return []
+    def _ge(col, key):
+        nonlocal d
+        v = settings.get(key)
+        if v is not None and float(v) > 0:
+            d = d[d[col] >= float(v)]
+    def _le(col, key):
+        nonlocal d
+        v = settings.get(key)
+        if v is not None and float(v) > 0:
+            d = d[d[col] <= float(v)]
+    _ge("market_cap", "market_cap_min"); _le("market_cap", "market_cap_max")
+    _ge("price", "price_min"); _le("price", "price_max")
+    _ge("volume", "volume_min"); _le("volume", "volume_max")
+    _ge("relative_volume", "relative_volume_min")
+    _ge("price_drop_pct", "price_drop_pct")
+    # Weinstein Stage 2 gate (price above a RISING 30-week/150-session SMA). Truthy => keep only
+    # precomputed stage-2 rows, agreeing with StockScreener._filter_by_weinstein_stage2. Absent/0
+    # => no-op (existing screener-opt runs behave identically). Tolerates a missing column (an
+    # older store built before this metric) by skipping the gate.
+    w = settings.get("weinstein_stage2_only")
+    if w is not None and float(w) > 0 and "weinstein_stage" in d.columns:
+        d = d[d["weinstein_stage"] == 2]
+    if d.empty:
+        return []
+    sort_col = settings.get("sort_metric") or "market_cap"
+    if sort_col not in d.columns:
+        sort_col = "market_cap"
+    d = d.sort_values(sort_col, ascending=False)
+    n = int(settings.get("max_stocks") or 0)
+    if n > 0:
+        d = d.head(n)
+    return list(d["symbol"])
+
+
+def screen_universe_as_of(store_df: "pd.DataFrame", as_of_day: str,
+                          settings: Dict[str, Any]) -> List[str]:
+    """Same as ``screen_universe_for_day`` but resolves to the LATEST scan date <= as_of_day,
+    so a bar between scan dates gets the held universe (the cadence is weekly by default). Empty
+    if no scan date is on/before as_of_day."""
+    dates = store_df["date"]
+    prior = dates[dates <= as_of_day]
+    if prior.empty:
+        return []
+    return screen_universe_for_day(store_df, prior.max(), settings)
+
+
+def screened_symbol_union(store_df: "pd.DataFrame", start_day: str, end_day: str,
+                          settings: Dict[str, Any]) -> List[str]:
+    """Union of symbols ``settings`` can EVER select over a backtest window — the complete set of
+    symbols the per-bar ``screen_universe_as_of`` gate can return for any bar in [start, end].
+
+    Used to BOUND the OHLCV preload to the symbols a screener run actually touches (vs the whole
+    store, which is the loosest-bound superset of every gene — e.g. 868 symbols when only ~26 are
+    ever selected). Unions ``screen_universe_for_day`` over every store scan date in
+    ``[latest scan <= start_day, end_day]`` (bars before the first in-range scan resolve to that
+    prior scan, so it must be included). Returns sorted symbols (empty if the store has none).
+    """
+    dates = sorted({str(d) for d in store_df["date"].unique()})
+    if not dates:
+        return []
+    prior = [d for d in dates if d <= start_day]
+    lo = prior[-1] if prior else dates[0]
+    relevant = [d for d in dates if lo <= d <= end_day]
+    union: set = set()
+    for d in relevant:
+        union.update(screen_universe_for_day(store_df, d, settings))
+    return sorted(union)

@@ -1,0 +1,12 @@
+[importlinter]
+root_packages =
+    ba2_experts
+include_external_packages = True
+
+[importlinter:contract:experts-layering]
+name = ba2_experts may use ba2_common and ba2_providers but not the live platform
+type = forbidden
+source_modules =
+    ba2_experts
+forbidden_modules =
+    ba2_trade_platform

@@ -1,0 +1,3043 @@
+[
+  {
+    "category": "functional",
+    "description": "Copy dataproviders package from BA2TradePlatform and verify structure",
+    "steps": [
+      "Navigate to C:\\Users\\basti\\OneDrive\\Documents\\dev\\BA2TradePlatform\\ba2_trade_platform\\modules\\dataproviders",
+      "Copy the dataproviders directory to the project backend folder",
+      "Verify all API-based providers are present (Alpha Vantage, Yahoo Finance, Polygon.io, EODHD)",
+      "Verify AI providers are excluded from the copied package",
+      "Check that all necessary __init__.py files are present"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Refactor dataproviders into standalone reusable package",
+    "steps": [
+      "Review dataproviders package structure",
+      "Remove any BA2TradePlatform-specific dependencies",
+      "Create a consistent API interface across all providers",
+      "Add proper error handling and logging to each provider",
+      "Verify package can be imported independently",
+      "Test basic import statements work"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Configure .env file with API keys for data providers",
+    "steps": [
+      "Create .env file in project root",
+      "Add placeholder entries for ALPHA_VANTAGE_API_KEY",
+      "Add placeholder entries for POLYGON_API_KEY",
+      "Add placeholder entries for EODHD_API_KEY",
+      "Add database configuration entries",
+      "Add Redis configuration for Celery",
+      "Verify .env is in .gitignore"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Initialize FastAPI backend with basic project structure",
+    "steps": [
+      "Create backend directory",
+      "Initialize Python virtual environment",
+      "Create requirements.txt with FastAPI, uvicorn, and core dependencies",
+      "Install dependencies",
+      "Create main.py with basic FastAPI app",
+      "Test server starts successfully with uvicorn"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Initialize React frontend with TypeScript and Vite",
+    "steps": [
+      "Create frontend directory",
+      "Run npm create vite@latest with React + TypeScript template",
+      "Install dependencies",
+      "Configure Tailwind CSS",
+      "Install shadcn/ui components library",
+      "Test dev server starts successfully"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Set up SQLite database with initial schema",
+    "steps": [
+      "Create database directory in backend",
+      "Define SQLAlchemy models for datasets table",
+      "Define SQLAlchemy models for optimization_jobs table",
+      "Define SQLAlchemy models for models table",
+      "Define SQLAlchemy models for backtests table",
+      "Define SQLAlchemy models for optimization_profiles table",
+      "Define SQLAlchemy models for api_keys table",
+      "Run database migration to create all tables",
+      "Verify tables exist in database"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Set up database-backed task queue (replaces Celery/Redis)",
+    "steps": [
+      "Create TaskQueue SQLAlchemy model with status, priority, progress tracking",
+      "Create TaskQueueService with worker thread pool",
+      "Implement task queuing, claiming, and processing logic",
+      "Add retry logic with configurable max_retries and delay",
+      "Create REST API endpoints for task management",
+      "Initialize task queue on application startup",
+      "Test task creation and status retrieval"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Alpha Vantage provider fetches 1 year historical OHLC data",
+    "steps": [
+      "Configure Alpha Vantage API key in .env",
+      "Import Alpha Vantage provider",
+      "Call fetch method with ticker='AAPL' and timeframe='1d'",
+      "Specify date range for 1 year of data",
+      "Verify response contains OHLC columns",
+      "Verify data covers approximately 252 trading days",
+      "Check for no missing critical data"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Yahoo Finance provider fetches 1 year historical OHLC data",
+    "steps": [
+      "Import Yahoo Finance provider",
+      "Call fetch method with ticker='MSFT' and timeframe='1d'",
+      "Specify date range for 1 year of data",
+      "Verify response contains OHLC columns",
+      "Verify data covers approximately 252 trading days",
+      "Check for no missing critical data"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Polygon.io provider fetches 1 year historical OHLC data",
+    "steps": [
+      "Configure Polygon.io API key in .env",
+      "Import Polygon.io provider",
+      "Call fetch method with ticker='GOOGL' and timeframe='1d'",
+      "Specify date range for 1 year of data",
+      "Verify response contains OHLC columns",
+      "Verify data covers approximately 252 trading days",
+      "Check for no missing critical data"
+    ],
+    "passes": false
+  },
+  {
+    "category": "functional",
+    "description": "EODHD provider fetches 1 year historical OHLC data",
+    "steps": [
+      "Configure EODHD API key in .env",
+      "Import EODHD provider",
+      "Call fetch method with ticker='TSLA' and timeframe='1d'",
+      "Specify date range for 1 year of data",
+      "Verify response contains OHLC columns",
+      "Verify data covers approximately 252 trading days",
+      "Check for no missing critical data"
+    ],
+    "passes": false
+  },
+  {
+    "category": "functional",
+    "description": "Data provider supports multiple timeframes (1h, 4h, D1)",
+    "steps": [
+      "Select any working data provider",
+      "Fetch data with timeframe='1h' for 1 month",
+      "Verify hourly data is returned",
+      "Fetch data with timeframe='4h' for 3 months",
+      "Verify 4-hour data is returned",
+      "Fetch data with timeframe='1d' for 1 year",
+      "Verify daily data is returned"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Create dataset API endpoint returns dataset with metadata",
+    "steps": [
+      "Start FastAPI server",
+      "Send POST request to /api/datasets with ticker='AAPL'",
+      "Include timeframe='1d' and date range in request",
+      "Verify response contains dataset ID",
+      "Verify response contains metadata (rows_count, date range)",
+      "Verify dataset is saved to database",
+      "Verify dataset file is created on disk"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "List datasets API endpoint returns all created datasets",
+    "steps": [
+      "Create 3 different datasets via API",
+      "Send GET request to /api/datasets",
+      "Verify response contains all 3 datasets",
+      "Verify each dataset has ID, name, ticker, timeframe",
+      "Verify date range and row count are included"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Get dataset details API endpoint returns full dataset info",
+    "steps": [
+      "Create a dataset via API",
+      "Note the dataset ID from response",
+      "Send GET request to /api/datasets/:id",
+      "Verify response contains all dataset fields",
+      "Verify technical_indicators config is returned",
+      "Verify fundamentals_config is returned",
+      "Verify sentiment_config is returned"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Delete dataset API endpoint removes dataset and files",
+    "steps": [
+      "Create a dataset via API",
+      "Note the dataset ID and file path",
+      "Send DELETE request to /api/datasets/:id",
+      "Verify response confirms deletion",
+      "Verify dataset is removed from database",
+      "Verify dataset file is deleted from disk"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Calculate SMA technical indicator for dataset",
+    "steps": [
+      "Fetch OHLC data for a ticker",
+      "Configure SMA with period=20",
+      "Calculate SMA on close prices",
+      "Verify SMA column is added to dataset",
+      "Verify SMA values are correct (rolling average)",
+      "Check first 19 rows have NaN for SMA"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Calculate EMA technical indicator for dataset",
+    "steps": [
+      "Fetch OHLC data for a ticker",
+      "Configure EMA with period=20",
+      "Calculate EMA on close prices",
+      "Verify EMA column is added to dataset",
+      "Verify EMA values are correct (exponential average)",
+      "Compare EMA with SMA to verify different values"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Calculate RSI technical indicator for dataset",
+    "steps": [
+      "Fetch OHLC data for a ticker",
+      "Configure RSI with period=14",
+      "Calculate RSI on close prices",
+      "Verify RSI column is added to dataset",
+      "Verify RSI values are between 0 and 100",
+      "Check for reasonable RSI values on known data"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Calculate MACD technical indicator for dataset",
+    "steps": [
+      "Fetch OHLC data for a ticker",
+      "Configure MACD with fast=12, slow=26, signal=9",
+      "Calculate MACD on close prices",
+      "Verify MACD line column is added",
+      "Verify MACD signal line column is added",
+      "Verify MACD histogram column is added"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Calculate Bollinger Bands technical indicator for dataset",
+    "steps": [
+      "Fetch OHLC data for a ticker",
+      "Configure Bollinger Bands with period=20, std=2",
+      "Calculate Bollinger Bands on close prices",
+      "Verify upper band column is added",
+      "Verify middle band (SMA) column is added",
+      "Verify lower band column is added",
+      "Check upper band > middle band > lower band"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Calculate ATR technical indicator for dataset",
+    "steps": [
+      "Fetch OHLC data for a ticker",
+      "Configure ATR with period=14",
+      "Calculate ATR using high, low, close prices",
+      "Verify ATR column is added to dataset",
+      "Verify ATR values are positive",
+      "Check ATR reflects volatility"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Calculate Stochastic oscillator for dataset",
+    "steps": [
+      "Fetch OHLC data for a ticker",
+      "Configure Stochastic with k_period=14, d_period=3",
+      "Calculate Stochastic using high, low, close",
+      "Verify %K column is added",
+      "Verify %D column is added",
+      "Verify values are between 0 and 100"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Calculate multi-timeframe technical indicators (15m, 1h, 4h, D1)",
+    "steps": [
+      "Fetch hourly OHLC data for a ticker",
+      "Calculate SMA on 15m resampled data",
+      "Calculate SMA on 1h data",
+      "Calculate SMA on 4h resampled data",
+      "Calculate SMA on daily resampled data",
+      "Verify all timeframe columns are added with proper naming",
+      "Verify higher timeframe values align correctly"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Fetch fundamental data (FCF, P/E, EPS, Revenue) for ticker",
+    "steps": [
+      "Configure data provider with fundamentals support",
+      "Fetch fundamental data for ticker='AAPL'",
+      "Verify FCF (Free Cash Flow) is returned",
+      "Verify P/E ratio is returned",
+      "Verify EPS (Earnings Per Share) is returned",
+      "Verify Revenue is returned",
+      "Check data has proper date/period information"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Create fundamental features: days_to_last_FCF",
+    "steps": [
+      "Fetch fundamental FCF data with quarterly values",
+      "For each row in OHLC dataset, calculate days since last FCF event",
+      "Add 'days_to_last_FCF' column to dataset",
+      "Verify column contains positive integer values",
+      "Verify values increase until next FCF event",
+      "Verify values reset after new FCF data point"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Create fundamental features: last_FCF value",
+    "steps": [
+      "Fetch fundamental FCF data with quarterly values",
+      "For each row in OHLC dataset, get the most recent FCF value",
+      "Add 'last_FCF' column to dataset",
+      "Verify column contains the actual FCF values",
+      "Verify value remains constant until next FCF event",
+      "Verify value updates when new FCF data is available"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Create fundamental features: last_FCF_percent change",
+    "steps": [
+      "Fetch fundamental FCF data with quarterly values",
+      "Calculate percentage change between last and previous FCF",
+      "Add 'last_FCF_percent' column to dataset",
+      "Verify column contains percentage change values",
+      "Verify positive values indicate growth",
+      "Verify negative values indicate decline"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Create fundamental features: days_to_next_FCF",
+    "steps": [
+      "Fetch fundamental FCF data with quarterly values",
+      "For each row, calculate days until next FCF event",
+      "Add 'days_to_next_FCF' column to dataset",
+      "Verify column contains countdown values",
+      "Verify values decrease as event approaches",
+      "Verify values are reasonable (e.g., 0-90 days for quarterly)"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Create fundamental features: next_FCF_forecast",
+    "steps": [
+      "Fetch fundamental FCF data with quarterly values",
+      "For each row, get forecast for next FCF value",
+      "Add 'next_FCF_forecast' column to dataset",
+      "Verify column contains projected FCF values",
+      "Verify forecasts are reasonable based on trends"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Fetch macro economic data (interest rates, GDP, inflation)",
+    "steps": [
+      "Configure data provider with macro data support",
+      "Fetch interest rate data for date range",
+      "Fetch GDP data for date range",
+      "Fetch inflation (CPI) data for date range",
+      "Verify all macro indicators are returned",
+      "Check data has proper date information"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Integrate macro data with OHLC dataset using forward-fill",
+    "steps": [
+      "Fetch OHLC daily data for 1 year",
+      "Fetch macro data (typically monthly/quarterly)",
+      "Merge macro data with OHLC dataset",
+      "Forward-fill macro values for dates without updates",
+      "Verify macro columns are added to dataset",
+      "Verify no missing values in macro columns"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Set up Transformers library with financial sentiment model",
+    "steps": [
+      "Install transformers library",
+      "Download pre-trained financial sentiment model",
+      "Create sentiment analyzer wrapper class",
+      "Test sentiment analysis on sample financial text",
+      "Verify model returns sentiment label and confidence",
+      "Verify labels include Positive, Neutral, Negative"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Fetch news articles for a ticker in date range",
+    "steps": [
+      "Configure news API provider",
+      "Fetch news for ticker='AAPL' for past 6 months",
+      "Verify articles are returned with dates",
+      "Verify articles have title and content",
+      "Check articles are relevant to the ticker"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Run sentiment analysis on news articles",
+    "steps": [
+      "Fetch news articles for a ticker",
+      "For each article, run sentiment analysis",
+      "Extract sentiment label (Positive/Neutral/Negative)",
+      "Extract confidence score",
+      "Extract impact timeframe (Short/Medium/Long-term)",
+      "Store results with article metadata"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Create sentiment feature: news_1d_positive_short",
+    "steps": [
+      "Process news with sentiment analysis",
+      "For each row in dataset, count positive short-term news in past 1 day",
+      "Add 'news_1d_positive_short' column",
+      "Verify column contains integer counts",
+      "Verify counts are accurate for sample dates"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Create sentiment feature: news_1w_negative_long",
+    "steps": [
+      "Process news with sentiment analysis",
+      "For each row in dataset, count negative long-term news in past 1 week",
+      "Add 'news_1w_negative_long' column",
+      "Verify column contains integer counts",
+      "Verify counts are accurate for sample dates"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Create all sentiment features (1d, 1w, 1m, 6m combinations)",
+    "steps": [
+      "Process news with sentiment analysis",
+      "Create features for all time periods: 1d, 1w, 1m, 6m",
+      "Create features for all sentiment types: Positive, Neutral, Negative",
+      "Create features for all impact timeframes: Short, Medium, Long",
+      "Verify 36 sentiment columns are added (4 periods \u00c3\u2014 3 sentiments \u00c3\u2014 3 impacts)",
+      "Verify all columns contain valid count values"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Export dataset to CSV format",
+    "steps": [
+      "Create a dataset with OHLC and indicators",
+      "Call export function with format='csv'",
+      "Verify CSV file is created",
+      "Open CSV and verify headers are present",
+      "Verify data rows are correctly formatted",
+      "Verify file can be re-imported"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Export dataset to Parquet format",
+    "steps": [
+      "Create a dataset with OHLC and indicators",
+      "Call export function with format='parquet'",
+      "Verify Parquet file is created",
+      "Read Parquet file and verify schema",
+      "Verify data is correctly stored",
+      "Verify file size is smaller than CSV"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Dataset preview API returns sample data for visualization",
+    "steps": [
+      "Create a dataset via API",
+      "Send GET request to /api/datasets/:id/preview",
+      "Verify response contains sample rows (e.g., first 100 and last 100)",
+      "Verify OHLC data is included",
+      "Verify indicator values are included",
+      "Verify data is suitable for charting"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Dataset statistics API returns comprehensive stats",
+    "steps": [
+      "Create a dataset with various features",
+      "Send GET request to /api/datasets/:id/stats",
+      "Verify response contains total row count",
+      "Verify response contains column count",
+      "Verify response contains date range",
+      "Verify response contains missing data percentage per column",
+      "Verify response contains basic statistics (mean, std, min, max)"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Configure PyTorch with CUDA for GPU acceleration",
+    "steps": [
+      "Install PyTorch with CUDA support",
+      "Write test script to check torch.cuda.is_available()",
+      "Verify GPU is detected",
+      "Create simple tensor on GPU",
+      "Perform operation on GPU tensor",
+      "Verify operation completes successfully"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Install and configure Darts library for timeseries models",
+    "steps": [
+      "Install darts library",
+      "Import darts and verify no errors",
+      "Import LSTM model from darts",
+      "Import N-BEATS model from darts",
+      "Import RNN model from darts",
+      "Verify all model classes are available"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Create LSTM model architecture with Darts",
+    "steps": [
+      "Import LSTM model from darts",
+      "Configure LSTM with hidden_dim=64, n_rnn_layers=2",
+      "Create model instance",
+      "Verify model is created without errors",
+      "Print model architecture",
+      "Verify architecture matches configuration"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Create N-BEATS model architecture with Darts",
+    "steps": [
+      "Import N-BEATS model from darts",
+      "Configure N-BEATS with num_blocks=3, num_layers=4",
+      "Create model instance",
+      "Verify model is created without errors",
+      "Print model architecture",
+      "Verify architecture matches configuration"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Create RNN model architecture with Darts",
+    "steps": [
+      "Import RNN model from darts",
+      "Configure RNN with hidden_dim=32, n_rnn_layers=3",
+      "Create model instance",
+      "Verify model is created without errors",
+      "Print model architecture",
+      "Verify architecture matches configuration"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Calculate prediction target: price_up_10pct_5dd_7d",
+    "steps": [
+      "Load OHLC dataset",
+      "For each row, look forward 7 days",
+      "Check if price goes up 10% with max 5% drawdown",
+      "Set target to 1 if condition met, 0 otherwise",
+      "Add 'price_up_10pct_5dd_7d' column to dataset",
+      "Verify column contains binary values (0 or 1)"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Calculate prediction target: price_down_10pct_5dd_7d",
+    "steps": [
+      "Load OHLC dataset",
+      "For each row, look forward 7 days",
+      "Check if price goes down 10% with max 5% drawdown",
+      "Set target to 1 if condition met, 0 otherwise",
+      "Add 'price_down_10pct_5dd_7d' column to dataset",
+      "Verify column contains binary values (0 or 1)",
+      "Verify symmetry with price_up target"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Calculate prediction target: price_up_20pct_10dd_30d",
+    "steps": [
+      "Load OHLC dataset",
+      "For each row, look forward 30 days",
+      "Check if price goes up 20% with max 10% drawdown",
+      "Set target to 1 if condition met, 0 otherwise",
+      "Add 'price_up_20pct_10dd_30d' column to dataset",
+      "Verify column contains binary values (0 or 1)"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Calculate prediction target: price_down_20pct_10dd_30d",
+    "steps": [
+      "Load OHLC dataset",
+      "For each row, look forward 30 days",
+      "Check if price goes down 20% with max 10% drawdown",
+      "Set target to 1 if condition met, 0 otherwise",
+      "Add 'price_down_20pct_10dd_30d' column to dataset",
+      "Verify column contains binary values (0 or 1)",
+      "Verify symmetry with price_up target"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Verify prediction target symmetry constraint",
+    "steps": [
+      "Define output targets with up scenarios: 10%/5%/7d, 20%/10%/30d",
+      "Calculate up targets",
+      "Automatically generate down targets with same parameters",
+      "Verify both up and down columns exist",
+      "Verify columns are balanced (same number of up and down)",
+      "Check that UI prevents asymmetric target definitions"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Split dataset into train and test sets with configurable ratio",
+    "steps": [
+      "Load dataset with 1 year of data",
+      "Configure train_test_split ratio to 80/20",
+      "Split dataset chronologically (no shuffling)",
+      "Verify train set contains 80% of rows",
+      "Verify test set contains 20% of rows",
+      "Verify no overlap between train and test",
+      "Verify temporal order is preserved"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Train LSTM model on dataset with prediction targets",
+    "steps": [
+      "Prepare dataset with features and targets",
+      "Split into train and test sets",
+      "Create LSTM model",
+      "Train model on train set for 10 epochs",
+      "Verify training completes without errors",
+      "Verify training loss decreases over epochs",
+      "Calculate validation loss on test set"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Evaluate trained model on test set",
+    "steps": [
+      "Train a model on train set",
+      "Run predictions on test set",
+      "Calculate accuracy metric",
+      "Calculate precision and recall",
+      "Calculate F1 score",
+      "Generate confusion matrix",
+      "Verify all metrics are within expected ranges"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Save trained model to disk as PyTorch checkpoint",
+    "steps": [
+      "Train a model",
+      "Save model weights and architecture to file",
+      "Verify checkpoint file is created",
+      "Load model from checkpoint",
+      "Run predictions with loaded model",
+      "Verify predictions match original model"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Install and configure DEAP genetic algorithm library",
+    "steps": [
+      "Install deap library",
+      "Import deap modules",
+      "Create toolbox for genetic algorithm",
+      "Define individual and population",
+      "Verify basic GA components work"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Define chromosome encoding for model hyperparameters",
+    "steps": [
+      "Create gene for number of layers (range 1-5)",
+      "Create gene for layer size (range 32-512)",
+      "Create gene for learning rate (range 0.0001-0.01)",
+      "Create gene for batch size (choices: 16, 32, 64, 128)",
+      "Create gene for dropout rate (range 0.0-0.5)",
+      "Create gene for activation function (choices: relu, tanh, sigmoid)",
+      "Encode all genes into chromosome",
+      "Verify chromosome can be decoded back to hyperparameters"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Implement fitness function for model evaluation",
+    "steps": [
+      "Define fitness function that takes chromosome",
+      "Decode chromosome to hyperparameters",
+      "Create model with hyperparameters",
+      "Train model on train set",
+      "Evaluate on validation set",
+      "Return validation accuracy as fitness score",
+      "Verify fitness function runs without errors"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Implement crossover operator for genetic algorithm",
+    "steps": [
+      "Define crossover function for two parent chromosomes",
+      "Implement single-point or two-point crossover",
+      "Verify offspring inherit genes from both parents",
+      "Test crossover maintains valid gene ranges",
+      "Verify crossover produces diverse offspring"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Implement mutation operator for genetic algorithm",
+    "steps": [
+      "Define mutation function for chromosome",
+      "Implement random gene mutation with probability",
+      "Verify mutated genes stay within valid ranges",
+      "Test mutation introduces variation",
+      "Verify mutation rate is configurable"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Run genetic algorithm optimization for 5 generations",
+    "steps": [
+      "Initialize population of 10 random chromosomes",
+      "Evaluate fitness for each individual",
+      "Run selection (tournament or roulette)",
+      "Apply crossover and mutation",
+      "Create next generation",
+      "Repeat for 5 generations",
+      "Verify best fitness improves over generations",
+      "Retrieve best individual (hyperparameters)"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Implement early stopping for genetic optimization",
+    "steps": [
+      "Track best fitness over generations",
+      "Check if fitness hasn't improved for N generations",
+      "Trigger early stopping when convergence detected",
+      "Return best model found so far",
+      "Verify optimization stops before max generations if converged"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Create optimization job in database",
+    "steps": [
+      "Prepare optimization configuration",
+      "Send POST request to /api/jobs",
+      "Include dataset_id, model_types, parameter_ranges",
+      "Include prediction_targets configuration",
+      "Verify job is created with status='pending'",
+      "Verify job_id is returned",
+      "Verify job is saved in database"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Queue optimization job with Celery",
+    "steps": [
+      "Create optimization job via API",
+      "Verify job is added to Celery queue",
+      "Verify job status changes to 'queued'",
+      "Start Celery worker",
+      "Verify worker picks up the job",
+      "Verify job status changes to 'running'"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Run optimization job in background with Celery",
+    "steps": [
+      "Create and queue optimization job",
+      "Celery worker starts job execution",
+      "Verify job runs genetic algorithm",
+      "Verify models are trained in background",
+      "Verify job status updates periodically",
+      "Verify job completes and status changes to 'completed'",
+      "Verify best model is saved"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Pause running optimization job",
+    "steps": [
+      "Start optimization job",
+      "Wait for job to be running",
+      "Send POST request to /api/jobs/:id/pause",
+      "Verify job status changes to 'paused'",
+      "Verify training stops",
+      "Verify current state is saved"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Resume paused optimization job",
+    "steps": [
+      "Pause a running optimization job",
+      "Send POST request to /api/jobs/:id/resume",
+      "Verify job status changes back to 'running'",
+      "Verify training resumes from saved state",
+      "Verify generation counter continues correctly"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Cancel running optimization job",
+    "steps": [
+      "Start optimization job",
+      "Wait for job to be running",
+      "Send DELETE request to /api/jobs/:id",
+      "Verify job status changes to 'cancelled'",
+      "Verify training stops immediately",
+      "Verify partial results are saved"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Get live optimization progress via SSE endpoint",
+    "steps": [
+      "Start optimization job",
+      "Open SSE connection to /api/jobs/:id/progress",
+      "Verify connection is established",
+      "Receive progress updates as events",
+      "Verify updates include current generation",
+      "Verify updates include current fitness score",
+      "Verify updates include estimated time remaining"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Get optimization job training logs",
+    "steps": [
+      "Start optimization job",
+      "Send GET request to /api/jobs/:id/logs",
+      "Verify response contains log entries",
+      "Verify logs include timestamps",
+      "Verify logs show training progress",
+      "Verify logs include error messages if any"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "List all optimization jobs with status",
+    "steps": [
+      "Create multiple optimization jobs",
+      "Send GET request to /api/jobs",
+      "Verify response contains all jobs",
+      "Verify each job has status field",
+      "Verify jobs can be in pending, queued, running, completed, failed, cancelled states",
+      "Verify response includes job metadata"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Create optimization profile and save to database",
+    "steps": [
+      "Configure optimization settings (model types, parameter ranges)",
+      "Configure prediction targets",
+      "Send POST request to /api/profiles",
+      "Verify profile is created",
+      "Verify profile_id is returned",
+      "Verify profile is saved in database"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Load optimization profile and apply to new job",
+    "steps": [
+      "Create and save an optimization profile",
+      "Create new optimization job",
+      "Specify profile_id in job creation request",
+      "Verify job inherits all settings from profile",
+      "Verify model_types match profile",
+      "Verify parameter_ranges match profile",
+      "Verify prediction_targets match profile"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Update existing optimization profile",
+    "steps": [
+      "Create an optimization profile",
+      "Send PUT request to /api/profiles/:id",
+      "Include updated parameter ranges",
+      "Verify profile is updated in database",
+      "Load profile and verify changes are saved"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Delete optimization profile",
+    "steps": [
+      "Create an optimization profile",
+      "Send DELETE request to /api/profiles/:id",
+      "Verify profile is removed from database",
+      "Verify GET request returns 404 for deleted profile"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Export optimization profile to JSON",
+    "steps": [
+      "Create an optimization profile",
+      "Send POST request to /api/profiles/:id/export",
+      "Verify JSON file is generated",
+      "Verify JSON contains all profile settings",
+      "Verify file can be downloaded"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Import optimization profile from JSON",
+    "steps": [
+      "Create a valid profile JSON file",
+      "Send POST request to /api/profiles/import",
+      "Include JSON file in request",
+      "Verify profile is created in database",
+      "Verify all settings are correctly imported",
+      "Verify new profile_id is returned"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "List all trained models in database",
+    "steps": [
+      "Train multiple models via optimization jobs",
+      "Send GET request to /api/models",
+      "Verify response contains all models",
+      "Verify each model has id, model_type, accuracy, loss",
+      "Verify models are sorted by creation date"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Get model details including architecture and hyperparameters",
+    "steps": [
+      "Train and save a model",
+      "Send GET request to /api/models/:id",
+      "Verify response contains model_type",
+      "Verify response contains architecture JSON",
+      "Verify response contains hyperparameters JSON",
+      "Verify response contains training_metrics",
+      "Verify response contains file_path to saved model"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Get model predictions on test data",
+    "steps": [
+      "Train a model",
+      "Send GET request to /api/models/:id/predictions",
+      "Verify response contains prediction values",
+      "Verify response includes actual target values",
+      "Verify response includes timestamps",
+      "Verify predictions can be plotted"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Delete model from database and disk",
+    "steps": [
+      "Train and save a model",
+      "Note model file_path",
+      "Send DELETE request to /api/models/:id",
+      "Verify model is removed from database",
+      "Verify model file is deleted from disk",
+      "Verify GET request returns 404 for deleted model"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Export model to PyTorch checkpoint format",
+    "steps": [
+      "Train and save a model",
+      "Send POST request to /api/models/:id/export",
+      "Specify format='pytorch'",
+      "Verify checkpoint file is generated",
+      "Verify file contains model weights",
+      "Verify file can be loaded with torch.load()"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Export model to ONNX format",
+    "steps": [
+      "Train and save a model",
+      "Send POST request to /api/models/:id/export",
+      "Specify format='onnx'",
+      "Verify ONNX file is generated",
+      "Verify file can be loaded with onnx library",
+      "Verify model can run inference in ONNX runtime"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Filter models by dataset",
+    "steps": [
+      "Train models on multiple datasets",
+      "Send GET request to /api/models?dataset_id=X",
+      "Verify response contains only models from dataset X",
+      "Verify other models are excluded"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Sort models by accuracy descending",
+    "steps": [
+      "Train multiple models with different accuracies",
+      "Send GET request to /api/models?sort=accuracy&order=desc",
+      "Verify models are sorted by accuracy",
+      "Verify highest accuracy model is first",
+      "Verify lowest accuracy model is last"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Install and configure Backtesting.py library",
+    "steps": [
+      "Install backtesting library",
+      "Import Backtest and Strategy classes",
+      "Create simple test strategy",
+      "Run backtest on sample data",
+      "Verify backtest completes without errors"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Create strategy class that uses model predictions",
+    "steps": [
+      "Load trained model",
+      "Create Strategy subclass",
+      "In next() method, get current model prediction",
+      "If prediction > threshold, buy",
+      "If prediction < threshold, sell",
+      "Verify strategy compiles without errors"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Run backtest with model-based strategy",
+    "steps": [
+      "Load OHLC data for backtest period",
+      "Load trained model",
+      "Create model-based strategy",
+      "Configure Backtest with data and strategy",
+      "Run backtest",
+      "Verify backtest completes",
+      "Verify results are returned"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Configure strategy with take profit and stop loss",
+    "steps": [
+      "Create model-based strategy",
+      "Add take_profit parameter (e.g., 10%)",
+      "Add stop_loss parameter (e.g., 5%)",
+      "Implement logic to exit at TP or SL",
+      "Run backtest",
+      "Verify trades exit at TP/SL levels"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Configure strategy with trailing stop",
+    "steps": [
+      "Create model-based strategy",
+      "Add trailing_stop parameter (e.g., 3%)",
+      "Implement logic to move stop loss as price moves favorably",
+      "Run backtest",
+      "Verify trailing stop protects profits"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Configure strategy with position sizing",
+    "steps": [
+      "Create model-based strategy",
+      "Add position_size parameter (e.g., 0.1 = 10% of capital)",
+      "Implement position sizing in buy orders",
+      "Run backtest",
+      "Verify position sizes match configuration"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Configure strategy with maximum concurrent positions",
+    "steps": [
+      "Create model-based strategy",
+      "Add max_positions parameter (e.g., 3)",
+      "Implement logic to limit concurrent trades",
+      "Run backtest with multiple buy signals",
+      "Verify no more than max_positions are open simultaneously"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Configure strategy with commission and slippage",
+    "steps": [
+      "Create Backtest instance",
+      "Set commission parameter (e.g., 0.001 = 0.1%)",
+      "Set slippage parameter (e.g., 0.0005 = 0.05%)",
+      "Run backtest",
+      "Verify P&L accounts for commission and slippage"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Calculate backtest performance metrics",
+    "steps": [
+      "Run backtest with strategy",
+      "Extract results object",
+      "Verify total_return is calculated",
+      "Verify sharpe_ratio is calculated",
+      "Verify max_drawdown is calculated",
+      "Verify win_rate is calculated",
+      "Verify profit_factor is calculated"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Generate trade list from backtest results",
+    "steps": [
+      "Run backtest with strategy",
+      "Extract trades from results",
+      "Verify each trade has entry_time, exit_time",
+      "Verify each trade has entry_price, exit_price",
+      "Verify each trade has P&L",
+      "Verify each trade has duration"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Create backtest via API endpoint",
+    "steps": [
+      "Send POST request to /api/backtests",
+      "Include model_id, start_date, end_date",
+      "Include strategy configuration",
+      "Verify backtest is created and queued",
+      "Verify backtest_id is returned",
+      "Wait for backtest to complete",
+      "Verify status changes to 'completed'"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Get backtest results via API endpoint",
+    "steps": [
+      "Create and run a backtest",
+      "Send GET request to /api/backtests/:id",
+      "Verify response contains results JSON",
+      "Verify response contains performance metrics",
+      "Verify response contains trade list",
+      "Verify response contains equity curve data"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "List all backtests for a model",
+    "steps": [
+      "Run multiple backtests for same model",
+      "Send GET request to /api/backtests?model_id=X",
+      "Verify response contains all backtests for model X",
+      "Verify each backtest has summary metrics",
+      "Verify backtests are sorted by date"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Compare multiple backtests side-by-side",
+    "steps": [
+      "Create 3 backtests with different strategies",
+      "Send POST request to /api/backtests/compare",
+      "Include array of backtest_ids",
+      "Verify response contains comparison table",
+      "Verify metrics are shown for each backtest",
+      "Verify best performing backtest is highlighted"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Export backtest results to CSV",
+    "steps": [
+      "Run a backtest",
+      "Send POST request to /api/backtests/:id/export",
+      "Specify format='csv'",
+      "Verify CSV file is generated",
+      "Verify CSV contains trade list",
+      "Verify CSV contains equity curve"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Optimize strategy parameters with genetic algorithm",
+    "steps": [
+      "Define parameter ranges for strategy (TP, SL, threshold)",
+      "Create genetic algorithm for strategy optimization",
+      "Define fitness function (Sharpe ratio)",
+      "Run optimization for 10 generations",
+      "Verify best parameters are found",
+      "Verify best parameters improve Sharpe ratio"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Implement walk-forward optimization",
+    "steps": [
+      "Split data into multiple in-sample and out-of-sample periods",
+      "For each period, optimize on in-sample data",
+      "Test optimized parameters on out-of-sample data",
+      "Aggregate results across all periods",
+      "Verify walk-forward results are more realistic than single optimization"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Configure API keys via settings API",
+    "steps": [
+      "Send POST request to /api/settings/api-keys",
+      "Include provider_name='alpha_vantage'",
+      "Include api_key value",
+      "Verify API key is saved (encrypted)",
+      "Verify GET /api/settings returns masked key"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Test data provider connection via API",
+    "steps": [
+      "Configure API key for provider",
+      "Send POST request to /api/providers/test",
+      "Include provider_name",
+      "Verify connection test runs",
+      "Verify response indicates success or failure",
+      "If failure, verify error message is descriptive"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Get GPU information via settings API",
+    "steps": [
+      "Send GET request to /api/settings/gpu-info",
+      "Verify response contains GPU availability",
+      "If GPU available, verify device name is returned",
+      "Verify memory info is returned",
+      "If no GPU, verify response indicates CPU only"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Enable/disable GPU acceleration via settings",
+    "steps": [
+      "Send PUT request to /api/settings",
+      "Include gpu_enabled=false",
+      "Verify setting is saved",
+      "Run optimization job",
+      "Verify job runs on CPU",
+      "Enable GPU again and verify GPU is used"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Configure maximum concurrent jobs via settings",
+    "steps": [
+      "Send PUT request to /api/settings",
+      "Include max_concurrent_jobs=2",
+      "Verify setting is saved",
+      "Queue 5 optimization jobs",
+      "Verify only 2 jobs run concurrently",
+      "Verify remaining jobs wait in queue"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "React router navigates to dashboard page",
+    "steps": [
+      "Start frontend dev server",
+      "Open browser to http://localhost:5173",
+      "Verify dashboard page loads",
+      "Check URL is /dashboard or /",
+      "Verify dashboard content is visible"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "React router navigates to datasets page",
+    "steps": [
+      "Open frontend application",
+      "Click on Datasets link in navigation",
+      "Verify URL changes to /datasets",
+      "Verify datasets page content loads",
+      "Verify page title shows 'Datasets'"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "React router navigates to model training page",
+    "steps": [
+      "Open frontend application",
+      "Click on Training link in navigation",
+      "Verify URL changes to /training",
+      "Verify training page content loads",
+      "Verify page shows optimization job list"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "React router navigates to model library page",
+    "steps": [
+      "Open frontend application",
+      "Click on Models link in navigation",
+      "Verify URL changes to /models",
+      "Verify models library page loads",
+      "Verify model grid/list is displayed"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "React router navigates to backtesting page",
+    "steps": [
+      "Open frontend application",
+      "Click on Backtesting link in navigation",
+      "Verify URL changes to /backtesting",
+      "Verify backtesting page loads",
+      "Verify backtest configuration form is shown"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "React router navigates to settings page",
+    "steps": [
+      "Open frontend application",
+      "Click on Settings link in navigation",
+      "Verify URL changes to /settings",
+      "Verify settings page loads",
+      "Verify settings form is displayed"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Dashboard displays overview of optimization jobs",
+    "steps": [
+      "Create several optimization jobs with different statuses",
+      "Navigate to dashboard",
+      "Verify dashboard shows count of running jobs",
+      "Verify dashboard shows count of completed jobs",
+      "Verify dashboard shows count of failed jobs"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Dashboard displays recent activity timeline",
+    "steps": [
+      "Create datasets, jobs, and backtests",
+      "Navigate to dashboard",
+      "Verify recent activity section is displayed",
+      "Verify activities are listed in chronological order",
+      "Verify each activity shows type and timestamp"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Dashboard displays system resource usage",
+    "steps": [
+      "Navigate to dashboard",
+      "Verify GPU usage indicator is shown",
+      "Verify CPU usage indicator is shown",
+      "Verify memory usage indicator is shown",
+      "Run optimization job and see resource usage update"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Create new dataset via wizard - Step 1: Select ticker and timeframe",
+    "steps": [
+      "Navigate to Datasets page",
+      "Click 'Create New Dataset' button",
+      "Verify wizard opens on Step 1",
+      "Enter ticker symbol 'AAPL'",
+      "Select timeframe '1d' from dropdown",
+      "Select date range (1 year)",
+      "Click 'Next' button",
+      "Verify wizard advances to Step 2"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Create new dataset via wizard - Step 2: Select data providers",
+    "steps": [
+      "Complete Step 1 of dataset wizard",
+      "On Step 2, verify available providers are listed",
+      "Select 'Yahoo Finance' checkbox",
+      "Select 'Alpha Vantage' checkbox",
+      "Click 'Next' button",
+      "Verify wizard advances to Step 3"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Create new dataset via wizard - Step 3: Configure technical indicators",
+    "steps": [
+      "Complete Steps 1-2 of dataset wizard",
+      "On Step 3, verify indicator list is displayed",
+      "Select 'SMA' checkbox and configure period=20",
+      "Select 'RSI' checkbox and configure period=14",
+      "Select 'MACD' checkbox with default settings",
+      "Click 'Next' button",
+      "Verify wizard advances to Step 4"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Create new dataset via wizard - Step 4: Configure sentiment analysis",
+    "steps": [
+      "Complete Steps 1-3 of dataset wizard",
+      "On Step 4, toggle 'Enable Sentiment Analysis' switch",
+      "Configure sentiment model selection",
+      "Select news lookback periods (1d, 1w, 1m, 6m)",
+      "Click 'Next' button",
+      "Verify wizard advances to Step 5"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Create new dataset via wizard - Step 5: Configure fundamentals/macro",
+    "steps": [
+      "Complete Steps 1-4 of dataset wizard",
+      "On Step 5, select fundamental indicators (FCF, P/E, EPS)",
+      "Select macro indicators (Interest rates, GDP, Inflation)",
+      "Click 'Next' button",
+      "Verify wizard advances to Step 6"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Create new dataset via wizard - Step 6: Review and create",
+    "steps": [
+      "Complete Steps 1-5 of dataset wizard",
+      "On Step 6, verify configuration summary is displayed",
+      "Review ticker, timeframe, providers, indicators",
+      "Enter dataset name",
+      "Click 'Create Dataset' button",
+      "Verify dataset creation job starts",
+      "Verify wizard closes on success"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Dataset list shows all created datasets with metadata",
+    "steps": [
+      "Create multiple datasets",
+      "Navigate to Datasets page",
+      "Verify all datasets are listed",
+      "Verify each shows name, ticker, timeframe",
+      "Verify each shows row count and date range",
+      "Verify each shows creation date"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Click on dataset to view details and preview",
+    "steps": [
+      "Navigate to Datasets page",
+      "Click on a dataset card/row",
+      "Verify dataset details page opens",
+      "Verify OHLC chart is displayed",
+      "Verify technical indicators are overlaid",
+      "Verify dataset statistics are shown"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Dataset preview shows interactive candlestick chart",
+    "steps": [
+      "Open dataset details page",
+      "Verify candlestick chart is rendered with Recharts",
+      "Hover over candle and verify tooltip shows OHLC values",
+      "Verify x-axis shows dates",
+      "Verify y-axis shows price scale",
+      "Verify chart is responsive to window resize"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Dataset preview chart allows zoom and pan",
+    "steps": [
+      "Open dataset details page with chart",
+      "Use mouse wheel to zoom in on chart",
+      "Verify chart zooms into selected date range",
+      "Click and drag to pan chart",
+      "Verify chart scrolls to show different time period",
+      "Verify zoom level and position are maintained"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Dataset preview overlays technical indicators on chart",
+    "steps": [
+      "Open dataset details page",
+      "Verify SMA line is overlaid on price chart",
+      "Verify MACD is shown in separate panel below",
+      "Toggle indicator visibility checkboxes",
+      "Verify indicators show/hide when toggled",
+      "Verify legend shows indicator names and colors"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Dataset preview shows news sentiment markers on timeline",
+    "steps": [
+      "Open dataset with sentiment analysis",
+      "Verify news markers appear on chart timeline",
+      "Verify markers are color-coded by sentiment (green/yellow/red)",
+      "Hover over marker and verify tooltip shows news summary",
+      "Verify marker shows date and sentiment label"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Delete dataset from list view",
+    "steps": [
+      "Navigate to Datasets page",
+      "Hover over dataset card",
+      "Click delete icon/button",
+      "Verify confirmation dialog appears",
+      "Click 'Confirm' button",
+      "Verify dataset is removed from list",
+      "Verify success message is shown"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Export dataset to CSV from details page",
+    "steps": [
+      "Open dataset details page",
+      "Click 'Export' button",
+      "Select 'CSV' format from dropdown",
+      "Click 'Download' button",
+      "Verify CSV file downloads",
+      "Open CSV and verify data is correct"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Create optimization job form - Select dataset",
+    "steps": [
+      "Navigate to Training page",
+      "Click 'Create New Job' button",
+      "Verify job creation form opens",
+      "Verify dataset dropdown is populated",
+      "Select a dataset from dropdown",
+      "Verify dataset details are displayed below"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Create optimization job form - Select model types",
+    "steps": [
+      "Open job creation form",
+      "Verify model types section shows checkboxes",
+      "Select 'LSTM' checkbox",
+      "Select 'N-BEATS' checkbox",
+      "Verify 'All Models' checkbox selects all",
+      "Verify individual selection updates 'All Models' state"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Create optimization job form - Configure parameter ranges",
+    "steps": [
+      "Open job creation form",
+      "Navigate to parameter configuration section",
+      "Set number of layers range: 2-4",
+      "Set layer size range: 32-128",
+      "Set learning rate range: 0.001-0.01",
+      "Select activation functions: relu, tanh",
+      "Verify all parameters are validated"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Create optimization job form - Define prediction targets with presets",
+    "steps": [
+      "Open job creation form",
+      "Navigate to prediction targets section",
+      "Click 'Add Preset' button",
+      "Select preset '10% profit, 5% DD, 7 days'",
+      "Verify up and down targets are auto-generated",
+      "Verify output field names are shown (price_up_10pct_5dd_7d, price_down_10pct_5dd_7d)"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Create optimization job form - Define custom prediction targets",
+    "steps": [
+      "Open job creation form",
+      "Navigate to prediction targets section",
+      "Click 'Add Custom Target' button",
+      "Enter profit percentage: 15",
+      "Enter max drawdown: 7",
+      "Enter time period: 14 days",
+      "Verify symmetric down target is auto-generated",
+      "Verify output field names are displayed"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Create optimization job form - Verify symmetry constraint",
+    "steps": [
+      "Open job creation form",
+      "Add prediction target for price_up scenario",
+      "Verify UI automatically creates matching price_down scenario",
+      "Try to delete only down scenario",
+      "Verify error message: 'Targets must be symmetric'",
+      "Verify both up and down must be deleted together"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Create optimization job form - Set train/test split",
+    "steps": [
+      "Open job creation form",
+      "Navigate to train/test split section",
+      "Use slider to set split to 80/20",
+      "Verify split percentages are displayed",
+      "Verify split is visually represented",
+      "Verify split can be set to other values (70/30, 90/10)"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Create optimization job form - Load from profile",
+    "steps": [
+      "Open job creation form",
+      "Click 'Load Profile' button",
+      "Verify profile selection dialog opens",
+      "Select a saved profile",
+      "Verify all form fields are populated from profile",
+      "Verify user can still modify loaded settings"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Create optimization job form - Save configuration as profile",
+    "steps": [
+      "Open job creation form",
+      "Configure all optimization settings",
+      "Click 'Save as Profile' button",
+      "Enter profile name in dialog",
+      "Click 'Save' button",
+      "Verify profile is created",
+      "Verify success message is shown"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Submit optimization job and start training",
+    "steps": [
+      "Complete job creation form",
+      "Click 'Start Optimization' button",
+      "Verify form validation passes",
+      "Verify job is created and queued",
+      "Verify redirect to job monitoring page",
+      "Verify job appears in jobs list"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Job monitoring page shows live training progress",
+    "steps": [
+      "Start an optimization job",
+      "Navigate to job monitoring page",
+      "Verify current generation number is displayed",
+      "Verify best fitness score is displayed",
+      "Wait for update",
+      "Verify values update in real-time via SSE"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Job monitoring page displays real-time loss chart",
+    "steps": [
+      "Start an optimization job",
+      "Navigate to job monitoring page",
+      "Verify loss chart is displayed",
+      "Verify x-axis shows generation number",
+      "Verify y-axis shows loss value",
+      "Wait for training progress",
+      "Verify chart updates with new data points"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Job monitoring page displays real-time accuracy chart",
+    "steps": [
+      "Start an optimization job",
+      "Navigate to job monitoring page",
+      "Verify accuracy chart is displayed",
+      "Verify x-axis shows generation number",
+      "Verify y-axis shows accuracy percentage",
+      "Wait for training progress",
+      "Verify chart updates with new data points"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Job monitoring page shows GPU utilization",
+    "steps": [
+      "Start an optimization job with GPU enabled",
+      "Navigate to job monitoring page",
+      "Verify GPU utilization widget is displayed",
+      "Verify GPU memory usage is shown",
+      "Verify GPU usage updates periodically",
+      "Verify usage is shown as percentage and graph"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Job monitoring page shows estimated time remaining",
+    "steps": [
+      "Start an optimization job",
+      "Navigate to job monitoring page",
+      "Verify ETA is displayed",
+      "Verify ETA format is human-readable (e.g., '2h 15m')",
+      "Wait for progress",
+      "Verify ETA updates and decreases"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Pause optimization job from monitoring page",
+    "steps": [
+      "Start an optimization job",
+      "Navigate to job monitoring page",
+      "Click 'Pause' button",
+      "Verify confirmation dialog appears",
+      "Click 'Confirm'",
+      "Verify job status changes to 'Paused'",
+      "Verify training progress stops updating"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Resume paused job from monitoring page",
+    "steps": [
+      "Pause a running optimization job",
+      "Verify 'Resume' button is displayed",
+      "Click 'Resume' button",
+      "Verify job status changes to 'Running'",
+      "Verify training progress resumes updating"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Cancel optimization job from monitoring page",
+    "steps": [
+      "Start an optimization job",
+      "Navigate to job monitoring page",
+      "Click 'Cancel' button",
+      "Verify confirmation dialog with warning appears",
+      "Click 'Confirm Cancel'",
+      "Verify job status changes to 'Cancelled'",
+      "Verify partial results are saved"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "View training logs on monitoring page",
+    "steps": [
+      "Start an optimization job",
+      "Navigate to job monitoring page",
+      "Click 'View Logs' button or tab",
+      "Verify logs panel opens",
+      "Verify log entries are displayed with timestamps",
+      "Verify logs update in real-time",
+      "Verify logs can be scrolled"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Model library shows grid view of all models",
+    "steps": [
+      "Train several models",
+      "Navigate to Models page",
+      "Verify grid view is default layout",
+      "Verify each model card shows model_type",
+      "Verify each card shows accuracy metric",
+      "Verify each card shows thumbnail/icon"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Model library switches to list view",
+    "steps": [
+      "Navigate to Models page",
+      "Click 'List View' toggle button",
+      "Verify view changes to list layout",
+      "Verify models are shown in rows",
+      "Verify more details are visible per model",
+      "Switch back to grid and verify it works"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Filter models by dataset",
+    "steps": [
+      "Navigate to Models page",
+      "Click 'Filter' dropdown",
+      "Select 'Dataset' filter option",
+      "Choose a specific dataset",
+      "Verify only models from that dataset are shown",
+      "Verify model count updates"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Filter models by model type",
+    "steps": [
+      "Navigate to Models page",
+      "Click 'Filter' dropdown",
+      "Select 'Model Type' filter option",
+      "Choose 'LSTM' model type",
+      "Verify only LSTM models are shown",
+      "Select 'N-BEATS' and verify filtering updates"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Sort models by accuracy",
+    "steps": [
+      "Navigate to Models page",
+      "Click 'Sort' dropdown",
+      "Select 'Accuracy' sort option",
+      "Verify models are sorted by accuracy descending",
+      "Click sort direction toggle",
+      "Verify models are sorted by accuracy ascending"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Sort models by date created",
+    "steps": [
+      "Navigate to Models page",
+      "Click 'Sort' dropdown",
+      "Select 'Date Created' sort option",
+      "Verify models are sorted by date (newest first)",
+      "Toggle sort direction",
+      "Verify models are sorted oldest first"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Click on model to view details page",
+    "steps": [
+      "Navigate to Models page",
+      "Click on a model card",
+      "Verify model details page opens",
+      "Verify URL changes to /models/:id",
+      "Verify model name and type are displayed",
+      "Verify navigation breadcrumb shows path"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Model details page shows architecture diagram",
+    "steps": [
+      "Open model details page",
+      "Verify architecture section is displayed",
+      "Verify layer structure is visualized",
+      "Verify layer sizes are shown",
+      "Verify connections between layers are shown",
+      "Verify diagram is readable and well-formatted"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Model details page shows hyperparameters table",
+    "steps": [
+      "Open model details page",
+      "Verify hyperparameters section is displayed",
+      "Verify table shows parameter names and values",
+      "Verify learning rate is displayed",
+      "Verify batch size is displayed",
+      "Verify all GA-optimized parameters are shown"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Model details page shows training history chart",
+    "steps": [
+      "Open model details page",
+      "Verify training history chart is displayed",
+      "Verify chart shows loss over epochs",
+      "Verify chart shows both train and validation loss",
+      "Verify legend distinguishes train vs validation",
+      "Verify chart is interactive (hover for values)"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Model details page shows performance metrics",
+    "steps": [
+      "Open model details page",
+      "Verify metrics section is displayed",
+      "Verify accuracy is shown",
+      "Verify precision is shown",
+      "Verify recall is shown",
+      "Verify F1 score is shown",
+      "Verify all metrics are formatted as percentages"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Model details page shows confusion matrix",
+    "steps": [
+      "Open model details page for classification model",
+      "Verify confusion matrix is displayed",
+      "Verify matrix shows true positives, false positives",
+      "Verify matrix shows true negatives, false negatives",
+      "Verify matrix is color-coded (heatmap)",
+      "Verify matrix values are readable"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Model details page shows predictions visualization",
+    "steps": [
+      "Open model details page",
+      "Verify predictions chart is displayed",
+      "Verify chart shows actual vs predicted values",
+      "Verify x-axis shows time",
+      "Verify y-axis shows target values",
+      "Verify two lines: actual (solid), predicted (dashed)"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Delete model from details page",
+    "steps": [
+      "Open model details page",
+      "Click 'Delete Model' button",
+      "Verify confirmation dialog appears",
+      "Click 'Confirm Delete'",
+      "Verify model is deleted",
+      "Verify redirect to models library",
+      "Verify success message is shown"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Export model from details page",
+    "steps": [
+      "Open model details page",
+      "Click 'Export' button",
+      "Verify export format options appear (PyTorch, ONNX)",
+      "Select 'PyTorch' format",
+      "Click 'Download'",
+      "Verify file download starts",
+      "Verify downloaded file has correct extension (.pth)"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Clone model with different parameters",
+    "steps": [
+      "Open model details page",
+      "Click 'Clone and Retrain' button",
+      "Verify job creation form opens",
+      "Verify form is pre-filled with current model's parameters",
+      "Modify learning rate parameter",
+      "Submit form",
+      "Verify new job starts with modified parameters"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Backtesting page - Select model for backtest",
+    "steps": [
+      "Navigate to Backtesting page",
+      "Verify model selection dropdown is displayed",
+      "Click dropdown",
+      "Verify list of trained models appears",
+      "Select a model",
+      "Verify model details are displayed below"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Backtesting page - Configure backtest date range",
+    "steps": [
+      "Navigate to Backtesting page",
+      "Select a model",
+      "Verify date range picker is displayed",
+      "Select start date",
+      "Select end date",
+      "Verify date range is at least 1 month",
+      "Verify validation prevents invalid ranges"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Backtesting page - Configure strategy parameters",
+    "steps": [
+      "Navigate to Backtesting page",
+      "Select a model",
+      "Verify strategy parameters form is displayed",
+      "Set prediction confidence threshold: 0.7",
+      "Set take profit: 10%",
+      "Set stop loss: 5%",
+      "Set position size: 0.1 (10% of capital)",
+      "Verify all parameters are validated"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Backtesting page - Configure advanced strategy options",
+    "steps": [
+      "Navigate to Backtesting page",
+      "Click 'Advanced Options' toggle",
+      "Set trailing stop: 3%",
+      "Set max concurrent positions: 3",
+      "Set commission: 0.1%",
+      "Set slippage: 0.05%",
+      "Verify all options are saved"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Backtesting page - Run backtest and view results",
+    "steps": [
+      "Configure backtest with model and parameters",
+      "Click 'Run Backtest' button",
+      "Verify backtest starts",
+      "Verify loading indicator is shown",
+      "Wait for backtest to complete",
+      "Verify results page is displayed",
+      "Verify equity curve chart is shown"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Backtest results - Display equity curve chart",
+    "steps": [
+      "Run a backtest",
+      "View results page",
+      "Verify equity curve chart is displayed",
+      "Verify x-axis shows dates",
+      "Verify y-axis shows portfolio value",
+      "Verify chart starts at initial capital",
+      "Verify chart shows growth/decline over time"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Backtest results - Display drawdown chart",
+    "steps": [
+      "Run a backtest",
+      "View results page",
+      "Verify drawdown chart is displayed",
+      "Verify drawdown is shown as percentage",
+      "Verify maximum drawdown is highlighted",
+      "Verify chart is synchronized with equity curve"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Backtest results - Display price chart with trade markers",
+    "steps": [
+      "Run a backtest",
+      "View results page",
+      "Verify price chart is displayed",
+      "Verify buy markers (green) show entry points",
+      "Verify sell markers (red) show exit points",
+      "Hover over marker and verify tooltip shows trade details",
+      "Verify markers align with trade list"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Backtest results - Display performance metrics summary",
+    "steps": [
+      "Run a backtest",
+      "View results page",
+      "Verify metrics summary panel is displayed",
+      "Verify total return is shown",
+      "Verify Sharpe ratio is shown",
+      "Verify maximum drawdown is shown",
+      "Verify win rate is shown",
+      "Verify profit factor is shown",
+      "Verify number of trades is shown"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Backtest results - Display trade list table",
+    "steps": [
+      "Run a backtest",
+      "View results page",
+      "Verify trade list table is displayed",
+      "Verify each row shows entry date, exit date",
+      "Verify each row shows entry price, exit price",
+      "Verify each row shows P&L amount and percentage",
+      "Verify each row shows trade duration"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Backtest results - Filter trade list by profit/loss",
+    "steps": [
+      "Run a backtest",
+      "View results page",
+      "Click 'Filter' on trade list",
+      "Select 'Profitable Trades' option",
+      "Verify only winning trades are shown",
+      "Select 'Losing Trades' option",
+      "Verify only losing trades are shown"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Backtest results - Sort trade list by P&L",
+    "steps": [
+      "Run a backtest",
+      "View results page",
+      "Click 'P&L' column header",
+      "Verify trades are sorted by P&L descending",
+      "Click header again",
+      "Verify trades are sorted by P&L ascending"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Backtest results - Export results to CSV",
+    "steps": [
+      "Run a backtest",
+      "View results page",
+      "Click 'Export' button",
+      "Select 'CSV' format",
+      "Click 'Download'",
+      "Verify CSV file downloads",
+      "Open CSV and verify trade data is present"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Compare multiple backtests side-by-side",
+    "steps": [
+      "Run 3 different backtests",
+      "Navigate to Backtesting page",
+      "Click 'Compare Backtests' button",
+      "Select 3 backtests from list",
+      "Click 'Compare' button",
+      "Verify comparison table is displayed",
+      "Verify metrics are shown for each backtest",
+      "Verify best values are highlighted"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Save backtest strategy configuration",
+    "steps": [
+      "Configure backtest parameters",
+      "Click 'Save Strategy' button",
+      "Enter strategy name in dialog",
+      "Click 'Save' button",
+      "Verify strategy is saved",
+      "Navigate away and return",
+      "Load saved strategy and verify parameters are restored"
+    ],
+    "passes": true
+  },
+  {
+    "category": "style",
+    "description": "Application uses modern, clean design throughout",
+    "steps": [
+      "Navigate through all pages of the application",
+      "Take screenshots of Dashboard, Datasets, Training, Models, Backtesting pages",
+      "Verify consistent color scheme across pages",
+      "Verify modern UI components (shadcn/ui style)",
+      "Verify adequate whitespace and padding",
+      "Verify typography is clean and readable"
+    ],
+    "passes": true
+  },
+  {
+    "category": "style",
+    "description": "Navigation sidebar is consistent and intuitive",
+    "steps": [
+      "Open application",
+      "Verify sidebar is present on left side",
+      "Verify all main sections are listed with icons",
+      "Verify current page is highlighted in sidebar",
+      "Hover over items and verify hover states",
+      "Verify sidebar can collapse (if responsive design)"
+    ],
+    "passes": true
+  },
+  {
+    "category": "style",
+    "description": "Dashboard cards use consistent styling",
+    "steps": [
+      "Navigate to Dashboard",
+      "Take screenshot",
+      "Verify all stat cards use same design pattern",
+      "Verify cards have consistent padding",
+      "Verify cards have subtle shadows",
+      "Verify card titles are clearly visible",
+      "Verify card values are prominent"
+    ],
+    "passes": true
+  },
+  {
+    "category": "style",
+    "description": "Forms have consistent input styling",
+    "steps": [
+      "Navigate to dataset creation form",
+      "Navigate to job creation form",
+      "Take screenshots",
+      "Verify text inputs have consistent border style",
+      "Verify dropdowns have consistent styling",
+      "Verify checkboxes and radio buttons are styled consistently",
+      "Verify form labels are clear and aligned"
+    ],
+    "passes": true
+  },
+  {
+    "category": "style",
+    "description": "Buttons use consistent primary/secondary styling",
+    "steps": [
+      "Navigate through application",
+      "Identify primary action buttons (Create, Submit, Save)",
+      "Verify primary buttons use accent color",
+      "Identify secondary buttons (Cancel, Back)",
+      "Verify secondary buttons use neutral color",
+      "Verify button hover states are visible",
+      "Verify disabled buttons are clearly styled"
+    ],
+    "passes": true
+  },
+  {
+    "category": "style",
+    "description": "Charts use consistent color scheme and styling",
+    "steps": [
+      "View multiple charts across the application",
+      "Verify all charts use same color palette",
+      "Verify chart axes are clearly labeled",
+      "Verify chart legends are consistent",
+      "Verify tooltips have consistent design",
+      "Verify charts have smooth animations"
+    ],
+    "passes": true
+  },
+  {
+    "category": "style",
+    "description": "Application is responsive on desktop (1920x1080)",
+    "steps": [
+      "Set browser window to 1920x1080",
+      "Navigate through all pages",
+      "Verify layouts use full screen appropriately",
+      "Verify no horizontal scrolling on any page",
+      "Verify content is not too wide or narrow",
+      "Verify charts scale properly"
+    ],
+    "passes": true
+  },
+  {
+    "category": "style",
+    "description": "Application is responsive on laptop (1366x768)",
+    "steps": [
+      "Set browser window to 1366x768",
+      "Navigate through all pages",
+      "Verify layouts adapt to smaller width",
+      "Verify sidebar still functions properly",
+      "Verify content remains readable",
+      "Verify no layout breaking"
+    ],
+    "passes": true
+  },
+  {
+    "category": "style",
+    "description": "Application is responsive on tablet (768x1024)",
+    "steps": [
+      "Set browser window to 768x1024",
+      "Navigate through all pages",
+      "Verify sidebar collapses or becomes hamburger menu",
+      "Verify grid layouts adjust to fewer columns",
+      "Verify forms remain usable",
+      "Verify charts adapt to smaller width"
+    ],
+    "passes": true
+  },
+  {
+    "category": "style",
+    "description": "Dark theme is implemented and looks good",
+    "steps": [
+      "Navigate to Settings page",
+      "Toggle theme to Dark mode",
+      "Navigate through all pages",
+      "Verify dark theme is applied consistently",
+      "Verify text is readable on dark backgrounds",
+      "Verify charts adapt to dark theme",
+      "Verify no bright white elements remain"
+    ],
+    "passes": true
+  },
+  {
+    "category": "style",
+    "description": "Light theme is clean and easy on the eyes",
+    "steps": [
+      "Navigate to Settings page",
+      "Toggle theme to Light mode",
+      "Navigate through all pages",
+      "Verify light theme is applied consistently",
+      "Verify backgrounds are not too bright",
+      "Verify text contrast is sufficient",
+      "Verify colors are pleasant"
+    ],
+    "passes": true
+  },
+  {
+    "category": "style",
+    "description": "Loading states show appropriate spinners/skeletons",
+    "steps": [
+      "Trigger dataset creation (long operation)",
+      "Verify loading spinner is shown",
+      "Trigger backtest run",
+      "Verify loading indicator is shown",
+      "Navigate to list pages while loading",
+      "Verify skeleton loaders are shown for lists"
+    ],
+    "passes": true
+  },
+  {
+    "category": "style",
+    "description": "Error messages are clearly styled and visible",
+    "steps": [
+      "Trigger form validation error",
+      "Verify error message is shown in red",
+      "Verify error message is near the invalid field",
+      "Trigger API error (disconnect backend)",
+      "Verify error toast/notification appears",
+      "Verify error styling is not too harsh"
+    ],
+    "passes": true
+  },
+  {
+    "category": "style",
+    "description": "Success messages use appropriate green styling",
+    "steps": [
+      "Successfully create a dataset",
+      "Verify success message appears",
+      "Verify success message uses green color",
+      "Verify success message has checkmark icon",
+      "Verify success message auto-dismisses after delay",
+      "Verify multiple success messages stack properly"
+    ],
+    "passes": true
+  },
+  {
+    "category": "style",
+    "description": "Icons are used consistently throughout the UI",
+    "steps": [
+      "Navigate through application",
+      "Verify icons are used for common actions (edit, delete, download)",
+      "Verify icons are same size and style",
+      "Verify icons have tooltips on hover",
+      "Verify icon meanings are intuitive"
+    ],
+    "passes": true
+  },
+  {
+    "category": "style",
+    "description": "Tables have clean styling with hover effects",
+    "steps": [
+      "View trade list table",
+      "View dataset list table",
+      "Verify table headers are styled distinctly",
+      "Verify table rows have subtle borders",
+      "Hover over table rows",
+      "Verify hover effect highlights row",
+      "Verify alternating row colors if applicable"
+    ],
+    "passes": true
+  },
+  {
+    "category": "style",
+    "description": "Modal dialogs are centered and well-styled",
+    "steps": [
+      "Trigger confirmation dialog (delete action)",
+      "Verify modal appears centered on screen",
+      "Verify backdrop darkens background",
+      "Verify modal has clear title and message",
+      "Verify action buttons are clearly visible",
+      "Close modal and verify it disappears smoothly"
+    ],
+    "passes": true
+  },
+  {
+    "category": "style",
+    "description": "Tooltips appear on hover with helpful information",
+    "steps": [
+      "Hover over info icons throughout the application",
+      "Verify tooltips appear after short delay",
+      "Verify tooltip content is helpful",
+      "Verify tooltip positioning is smart (doesn't go off screen)",
+      "Verify tooltip disappears when hover ends"
+    ],
+    "passes": true
+  },
+  {
+    "category": "style",
+    "description": "Page transitions are smooth and not jarring",
+    "steps": [
+      "Navigate between pages multiple times",
+      "Verify page transitions are smooth",
+      "Verify no flash of unstyled content",
+      "Verify loading states appear quickly",
+      "Verify animations are subtle and professional"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "WebSocket connection establishes for live updates",
+    "steps": [
+      "Start an optimization job",
+      "Open browser developer tools, Network tab",
+      "Filter for WebSocket connections",
+      "Verify WebSocket connection is established",
+      "Verify messages are received with progress updates",
+      "Verify connection stays alive during training"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Handle WebSocket disconnection and reconnection",
+    "steps": [
+      "Start an optimization job with live updates",
+      "Manually close WebSocket connection (browser tools)",
+      "Verify UI shows 'Connection lost' message",
+      "Wait for automatic reconnection",
+      "Verify connection is re-established",
+      "Verify updates resume"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Comprehensive error handling for API failures",
+    "steps": [
+      "Stop backend server",
+      "Try to create a dataset via UI",
+      "Verify error message: 'Cannot connect to server'",
+      "Start backend server",
+      "Trigger validation error (invalid input)",
+      "Verify specific validation error message is shown",
+      "Verify UI remains usable after errors"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Form validation prevents invalid submissions",
+    "steps": [
+      "Open dataset creation form",
+      "Try to submit without ticker",
+      "Verify error: 'Ticker is required'",
+      "Enter invalid ticker format",
+      "Verify error: 'Invalid ticker format'",
+      "Set start date after end date",
+      "Verify error: 'Start date must be before end date'"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Secure API key storage with encryption",
+    "steps": [
+      "Configure API key via settings",
+      "Check database directly",
+      "Verify API key is not stored in plaintext",
+      "Retrieve API key via API",
+      "Verify API returns masked key (e.g., 'abc***xyz')",
+      "Verify backend can decrypt and use key"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "GPU memory management prevents OOM errors",
+    "steps": [
+      "Start multiple optimization jobs with large models",
+      "Monitor GPU memory usage",
+      "Verify GPU memory is allocated efficiently",
+      "Verify GPU memory is freed after job completes",
+      "Verify no out-of-memory crashes occur",
+      "Verify jobs queue if GPU memory is full"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Job creation form supports selecting multiple datasets",
+    "steps": [
+      "Navigate to Training page",
+      "Click 'Create New Job' button",
+      "Verify dataset selection allows multiple selections",
+      "Select 2+ datasets from the list",
+      "Verify all selected datasets are shown in summary",
+      "Verify selected datasets can be removed individually"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Multi-dataset API endpoint validates dataset compatibility",
+    "steps": [
+      "Create two datasets with same columns and timeframe",
+      "Create one dataset with different columns",
+      "Send POST to /api/jobs with compatible datasets",
+      "Verify request succeeds for compatible datasets",
+      "Send POST to /api/jobs with incompatible datasets",
+      "Verify error message explains incompatibility"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Multi-dataset training combines data chronologically",
+    "steps": [
+      "Create datasets for AAPL (2023) and AAPL (2024)",
+      "Select both datasets in job creation",
+      "Start training job",
+      "Verify combined dataset is sorted by date",
+      "Verify no duplicate dates exist",
+      "Verify total rows equals sum of both datasets"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Multi-dataset training handles different tickers",
+    "steps": [
+      "Create datasets for AAPL and MSFT with same timeframe",
+      "Select both datasets in job creation",
+      "Verify ticker column is added to distinguish data",
+      "Start training job",
+      "Verify model receives data from both tickers",
+      "Verify model performance metrics shown per ticker"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Multi-dataset preview shows combined statistics",
+    "steps": [
+      "Select multiple datasets in job creation form",
+      "View combined preview section",
+      "Verify total row count is sum of all datasets",
+      "Verify date range spans all datasets",
+      "Verify column intersection is shown",
+      "Verify warnings for missing columns in any dataset"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Dataset compatibility check for timeframe matching",
+    "steps": [
+      "Create datasets with 1h timeframe",
+      "Create dataset with 1d timeframe",
+      "Attempt to select both in job creation",
+      "Verify warning about timeframe mismatch",
+      "Verify option to resample to common timeframe",
+      "Verify resample preview shows expected row counts"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Multi-dataset job stores source dataset references",
+    "steps": [
+      "Create job with 3 datasets selected",
+      "Submit job and note job ID",
+      "Query job details via API",
+      "Verify response contains array of dataset IDs",
+      "Verify each dataset ID is valid",
+      "Verify dataset names are included in job details"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Training with multiple datasets uses cross-validation",
+    "steps": [
+      "Create job with multiple datasets",
+      "Configure cross-validation settings",
+      "Start training job",
+      "Verify each dataset is used as hold-out in turn",
+      "Verify metrics reported per fold",
+      "Verify aggregate metrics across all folds"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Multi-dataset job progress shows per-dataset status",
+    "steps": [
+      "Start training job with 3 datasets",
+      "Navigate to job details page",
+      "Verify progress bar shows overall completion",
+      "Verify each dataset shows individual status",
+      "Verify current dataset being processed is highlighted",
+      "Verify completed datasets show checkmark"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Saved job configuration includes multi-dataset settings",
+    "steps": [
+      "Create job with multiple datasets selected",
+      "Save job configuration as template",
+      "Load saved configuration",
+      "Verify all dataset selections are restored",
+      "Verify dataset order is preserved",
+      "Verify other job settings are also restored"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Settings page has worker configuration section",
+    "steps": [
+      "Navigate to Settings page",
+      "Verify 'Workers' section is displayed",
+      "Verify list of configured workers is shown",
+      "Verify local worker is shown by default",
+      "Verify 'Add Worker' button is visible",
+      "Verify status indicator for each worker (online/offline/busy)"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Add new remote worker configuration",
+    "steps": [
+      "Navigate to Settings > Workers",
+      "Click 'Add Worker' button",
+      "Verify form modal opens",
+      "Enter worker name: 'GPU Server 1'",
+      "Enter URL: 'http://192.168.1.100:8001'",
+      "Select capabilities (train/infer/both)",
+      "Click 'Save'",
+      "Verify new worker appears in list",
+      "Verify health check runs automatically"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Edit existing worker configuration",
+    "steps": [
+      "Navigate to Settings > Workers",
+      "Click edit button on existing worker",
+      "Verify form shows current values",
+      "Update the URL field",
+      "Click 'Save'",
+      "Verify changes are persisted",
+      "Verify connection is re-tested"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Delete worker configuration",
+    "steps": [
+      "Navigate to Settings > Workers",
+      "Click delete button on a remote worker",
+      "Verify confirmation dialog appears",
+      "Confirm deletion",
+      "Verify worker is removed from list",
+      "Verify cannot delete the local worker"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Enable and disable workers",
+    "steps": [
+      "Navigate to Settings > Workers",
+      "Click disable toggle on an enabled worker",
+      "Verify worker shows as disabled",
+      "Verify disabled worker is not used for new jobs",
+      "Click enable toggle",
+      "Verify worker shows as enabled"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Worker health check shows connection status",
+    "steps": [
+      "Configure a worker with valid URL",
+      "Verify green status indicator appears",
+      "Configure a worker with invalid URL",
+      "Verify red status indicator appears",
+      "Verify last heartbeat timestamp is shown",
+      "Click refresh button to re-check health"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Worker displays GPU and CPU information",
+    "steps": [
+      "Navigate to Settings > Workers",
+      "View worker details card",
+      "Verify GPU info is shown (name, memory, count)",
+      "Verify CPU info is shown (cores)",
+      "Verify current utilization is displayed",
+      "Verify active jobs count is shown"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Local worker runs on backend host",
+    "steps": [
+      "Start backend server",
+      "Navigate to Settings > Workers",
+      "Verify local worker is automatically configured",
+      "Verify local worker shows correct GPU info",
+      "Verify local worker can process training jobs",
+      "Verify local worker URL is localhost"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Worker configuration persists in database",
+    "steps": [
+      "Add 2 remote worker configurations",
+      "Enable/disable workers as desired",
+      "Restart backend server",
+      "Verify all worker configs are restored",
+      "Verify enabled/disabled states are preserved"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Export and import worker configurations",
+    "steps": [
+      "Configure multiple workers",
+      "Click 'Export Workers' button",
+      "Verify JSON file downloads",
+      "Delete all remote workers",
+      "Click 'Import Workers'",
+      "Select the exported file",
+      "Verify all configurations are restored"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "User can define custom increment steps for optimization parameters",
+    "steps": [
+      "Open job creation form",
+      "Navigate to parameter ranges section",
+      "Verify each numeric parameter has a 'Step' input field",
+      "Set layers step to 1 (default)",
+      "Set layer size step to 16 (instead of default 8)",
+      "Set learning rate step to 0.001 (instead of default 0.0001)",
+      "Verify step values are validated (must be positive)",
+      "Verify estimated combinations count updates based on steps",
+      "Submit form and verify steps are saved with job configuration"
+    ],
+    "passes": true
+  },
+  {
+    "category": "technical",
+    "description": "Configure Python logging with separate log files for debug, info, and error levels",
+    "steps": [
+      "Create logging configuration module in backend",
+      "Configure debug.log handler for DEBUG level messages",
+      "Configure info.log handler for INFO level messages",
+      "Configure error.log handler for ERROR level messages",
+      "Add log format with timestamp, level, module, and message",
+      "Configure log rotation for production use",
+      "Ensure all modules use logging instead of print statements",
+      "Test logging works across all backend modules"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Create abstraction layer for genetic optimization libraries",
+    "steps": [
+      "Create GeneticOptimizer interface/abstract base class",
+      "Define common methods: initialize, evolve, get_best, etc.",
+      "Create adapter pattern for each library",
+      "Support library selection in job configuration",
+      "Persist library choice in optimization profiles"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Install and configure shinkaEvolve evolutionary library",
+    "steps": [
+      "Install shinkaEvolve package",
+      "Configure GPU support if available",
+      "Create shinkaEvolve adapter implementing GeneticOptimizer interface",
+      "Implement chromosome encoding for shinkaEvolve",
+      "Test with sample optimization problem"
+    ],
+    "passes": true
+  },
+  {
+    "category": "functional",
+    "description": "Add genetic library selector in optimization job UI",
+    "steps": [
+      "Add dropdown to select genetic library (DEAP, PyGAD, shinkaEvolve)",
+      "Show library description and capabilities",
+      "Store selection in job configuration",
+      "Display current library in job list and details",
+      "Include library in optimization profiles"
+    ],
+    "passes": true
+  }
+]

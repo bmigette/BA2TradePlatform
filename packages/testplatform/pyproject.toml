@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ba2test-app"
+version = "0.1.0"
+description = "BA2 Test Platform — ML/backtest application (provides the `ba2-test` console command)"
+requires-python = ">=3.11"
+# Runtime deps (fastapi, uvicorn, darts/tsai/chronos, the ba2trade-* chain, ...) are
+# managed via backend/requirements.txt + the package chain — NOT here. This packaging
+# only registers the `ba2-test` console entry point + the launcher module.
+
+[project.scripts]
+ba2-test = "ba2test_launcher:main"
+
+[tool.setuptools]
+py-modules = ["ba2test_launcher"]

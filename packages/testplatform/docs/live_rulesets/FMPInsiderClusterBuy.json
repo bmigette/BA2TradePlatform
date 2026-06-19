@@ -1,0 +1,86 @@
+{
+  "expert": "FMPInsiderClusterBuy",
+  "live_instance_id": 37,
+  "buy_entry_conditions": {
+    "id": "grp-120",
+    "operator": "AND",
+    "conditions": [
+      {
+        "id": "c0",
+        "field": "has_no_position",
+        "field_type": "flag"
+      },
+      {
+        "id": "c1",
+        "field": "current_rating_positive",
+        "field_type": "flag"
+      },
+      {
+        "id": "c2",
+        "field": "confidence",
+        "field_type": "numeric",
+        "comparison": ">=",
+        "value": 60.0,
+        "optimize": true,
+        "optimize_enabled": true,
+        "value_min": 30.0,
+        "value_max": 90.0,
+        "value_step": 12.0
+      }
+    ]
+  },
+  "sell_entry_conditions": null,
+  "exit_conditions": [
+    {
+      "id": "live-121",
+      "name": "Cluster Faded: Close",
+      "conditions": {
+        "id": "grp-121",
+        "operator": "AND",
+        "conditions": [
+          {
+            "id": "c0",
+            "field": "has_buy_position",
+            "field_type": "flag"
+          },
+          {
+            "id": "c1",
+            "field": "rating_positive_to_neutral",
+            "field_type": "flag"
+          }
+        ]
+      },
+      "action": "close",
+      "toggle_optimize": true
+    },
+    {
+      "id": "live-122",
+      "name": "Max Holding Period: Close",
+      "conditions": {
+        "id": "grp-122",
+        "operator": "AND",
+        "conditions": [
+          {
+            "id": "c0",
+            "field": "has_buy_position",
+            "field_type": "flag"
+          },
+          {
+            "id": "c1",
+            "field": "days_opened",
+            "field_type": "numeric",
+            "comparison": ">=",
+            "value": 40.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 20.0,
+            "value_max": 60.0,
+            "value_step": 8.0
+          }
+        ]
+      },
+      "action": "close",
+      "toggle_optimize": true
+    }
+  ]
+}
