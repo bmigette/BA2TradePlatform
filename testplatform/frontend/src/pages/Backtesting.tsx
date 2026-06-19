@@ -1,3 +1,4 @@
+import { API_BASE } from '../lib/config';
 import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
@@ -240,7 +241,6 @@ interface Backtest {
   completedAt: string | null;
 }
 
-const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000/api';  // override via frontend/.env.local
 
 // Human-readable trade duration. The stored avg_trade_duration / per-trade duration are in
 // fill-clock BARS (meaningless to read on a 5min clock — "30010 bars"), so we derive the real

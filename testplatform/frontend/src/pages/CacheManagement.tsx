@@ -1,3 +1,4 @@
+import { API_BASE } from '../lib/config';
 import React, { useState, useEffect } from 'react';
 import {
   HardDrive,
@@ -53,7 +54,7 @@ interface ClearResult {
   skipped?: string;
 }
 
-const API = 'http://localhost:8000/api/cache';
+const API = `${API_BASE}/cache`;
 
 const TYPE_META: Record<string, { label: string; icon: React.ComponentType<{ size?: number; className?: string }>; description: string }> = {
   ohlcv: { label: 'OHLCV', icon: HardDrive, description: 'Per-provider price-bar CSV/parquet cache (24h TTL).' },

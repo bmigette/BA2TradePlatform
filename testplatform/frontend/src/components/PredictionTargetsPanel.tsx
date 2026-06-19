@@ -1,3 +1,4 @@
+import { API_BASE } from '../lib/config';
 import React, { useState, useCallback, useEffect } from 'react';
 import {
   Target,
@@ -164,7 +165,7 @@ const PredictionTargetsPanel: React.FC<PredictionTargetsPanelProps> = ({
       const calculateLoadedTargets = async () => {
         setIsCalculating(true);
         try {
-          const response = await fetch(`http://localhost:8000/api/datasets/${datasetId}/calculate-targets`, {
+          const response = await fetch(`${API_BASE}/datasets/${datasetId}/calculate-targets`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -342,7 +343,7 @@ const PredictionTargetsPanel: React.FC<PredictionTargetsPanelProps> = ({
 
     setIsCalculating(true);
     try {
-      const response = await fetch(`http://localhost:8000/api/datasets/${datasetId}/calculate-targets`, {
+      const response = await fetch(`${API_BASE}/datasets/${datasetId}/calculate-targets`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

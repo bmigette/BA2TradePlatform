@@ -1,3 +1,4 @@
+import { API_BASE } from '../lib/config';
 import React, { useState, useEffect } from 'react';
 import { Wrench, Newspaper, Search, Loader, CheckCircle, XCircle, AlertCircle, MessageSquare, Download, DollarSign, TrendingUp, Trash2, HardDrive, Database, Upload, ChevronDown, ChevronRight } from 'lucide-react';
 import ConfirmDialog from '../components/ConfirmDialog';
@@ -212,7 +213,7 @@ const OHLCVCacheTool: React.FC = () => {
     setCheckingGaps(true);
     setGapReport(null);
     try {
-      const resp = await fetch('http://localhost:8000/api/tools/ohlcv/check-gaps');
+      const resp = await fetch(`${API_BASE}/tools/ohlcv/check-gaps`);
       if (resp.ok) {
         const data = await resp.json();
         setGapReport(data);
@@ -253,8 +254,8 @@ const OHLCVCacheTool: React.FC = () => {
     (async () => {
       try {
         const responses = await Promise.all([
-          fetch('http://localhost:8000/api/tasks?task_type=ohlcv_cache_fetch&status=running'),
-          fetch('http://localhost:8000/api/tasks?task_type=ohlcv_cache_fetch&status=queued'),
+          fetch(`${API_BASE}/tasks?task_type=ohlcv_cache_fetch&status=running`),
+          fetch(`${API_BASE}/tasks?task_type=ohlcv_cache_fetch&status=queued`),
         ]);
         const restored: FetchTask[] = [];
         for (const r of responses) {
@@ -285,7 +286,7 @@ const OHLCVCacheTool: React.FC = () => {
         tasks.map(async (task) => {
           if (terminalStatuses.includes(task.status || '')) return task;
           try {
-            const resp = await fetch(`http://localhost:8000/api/tasks/${task.task_id}/progress`);
+            const resp = await fetch(`${API_BASE}/tasks/${task.task_id}/progress`);
             if (resp.ok) {
               const data = await resp.json();
               return { ...task, status: data.status, progress: data.progress, progress_message: data.progress_message };
@@ -309,7 +310,7 @@ const OHLCVCacheTool: React.FC = () => {
 
   const fetchProviders = async () => {
     try {
-      const resp = await fetch('http://localhost:8000/api/tools/ohlcv/providers');
+      const resp = await fetch(`${API_BASE}/tools/ohlcv/providers`);
       if (resp.ok) {
         const data = await resp.json();
         setProviders(data.providers || []);
@@ -321,7 +322,7 @@ const OHLCVCacheTool: React.FC = () => {
 
   const fetchCacheStatus = async () => {
     try {
-      const resp = await fetch('http://localhost:8000/api/tools/ohlcv/cache-status');
+      const resp = await fetch(`${API_BASE}/tools/ohlcv/cache-status`);
       if (resp.ok) {
         const data = await resp.json();
         setCacheFiles(data.cache_files || []);
@@ -383,7 +384,7 @@ const OHLCVCacheTool: React.FC = () => {
     setMessage(null);
 
     try {
-      const resp = await fetch('http://localhost:8000/api/tools/ohlcv/fetch-cache', {
+      const resp = await fetch(`${API_BASE}/tools/ohlcv/fetch-cache`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ provider, symbols, timeframes, start_date: startDate, end_date: endDate, parallel_jobs: parallelJobs, executor_workers: executorWorkers })
@@ -846,8 +847,8 @@ const NewsBatchFetchTool: React.FC = () => {
     try {
       // Check for running or queued news_batch_fetch tasks
       const responses = await Promise.all([
-        fetch('http://localhost:8000/api/tasks?task_type=news_batch_fetch&status=running'),
-        fetch('http://localhost:8000/api/tasks?task_type=news_batch_fetch&status=queued'),
+        fetch(`${API_BASE}/tasks?task_type=news_batch_fetch&status=running`),
+        fetch(`${API_BASE}/tasks?task_type=news_batch_fetch&status=queued`),
       ]);
       const allTasks: NewsBatchTask[] = [];
       for (const r of responses) {
@@ -880,7 +881,7 @@ const NewsBatchFetchTool: React.FC = () => {
       const updatedTasks = await Promise.all(
         activeTasks.map(async t => {
           try {
-            const r = await fetch(`http://localhost:8000/api/tasks/${t.task_id}/progress`);
+            const r = await fetch(`${API_BASE}/tasks/${t.task_id}/progress`);
             if (r.ok) {
               const d = await r.json();
               return { ...t, status: d.status, progress: d.progress, progress_message: d.progress_message };
@@ -908,7 +909,7 @@ const NewsBatchFetchTool: React.FC = () => {
 
   const fetchProviders = async () => {
     try {
-      const r = await fetch('http://localhost:8000/api/tools/news/providers');
+      const r = await fetch(`${API_BASE}/tools/news/providers`);
       if (r.ok) {
         const d = await r.json();
         // Filter providers that support company news (exclude localfiles)
@@ -919,7 +920,7 @@ const NewsBatchFetchTool: React.FC = () => {
 
   const fetchCacheStats = async () => {
     try {
-      const r = await fetch('http://localhost:8000/api/tools/news/cache-status');
+      const r = await fetch(`${API_BASE}/tools/news/cache-status`);
       if (r.ok) {
         const d = await r.json();
         setCacheStats(d);
@@ -963,7 +964,7 @@ const NewsBatchFetchTool: React.FC = () => {
     setActiveTasks([]);
 
     try {
-      const resp = await fetch('http://localhost:8000/api/tools/news/batch-fetch', {
+      const resp = await fetch(`${API_BASE}/tools/news/batch-fetch`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ provider, symbols, start_date: startDate, end_date: endDate })
@@ -1266,7 +1267,7 @@ const NewsProviderTester: React.FC = () => {
   useEffect(() => {
     const fetchProviders = async () => {
       try {
-        const response = await fetch('http://localhost:8000/api/tools/news/providers');
+        const response = await fetch(`${API_BASE}/tools/news/providers`);
         if (response.ok) {
           const data = await response.json();
           setProviders(data.providers || []);
@@ -1299,7 +1300,7 @@ const NewsProviderTester: React.FC = () => {
         params.set('symbol', symbol);
       }
 
-      const response = await fetch(`http://localhost:8000/api/tools/news/fetch?${params}`);
+      const response = await fetch(`${API_BASE}/tools/news/fetch?${params}`);
 
       if (response.ok) {
         const data = await response.json();
@@ -1327,7 +1328,7 @@ const NewsProviderTester: React.FC = () => {
         content: article.summary || article.content || ''
       });
 
-      const response = await fetch(`http://localhost:8000/api/tools/news/analyze-single?${params}`, {
+      const response = await fetch(`${API_BASE}/tools/news/analyze-single?${params}`, {
         method: 'POST'
       });
 
@@ -1387,7 +1388,7 @@ const NewsProviderTester: React.FC = () => {
       }
 
       setExportMessage('Fetching all articles...');
-      const fetchResponse = await fetch(`http://localhost:8000/api/tools/news/fetch?${fetchParams}`);
+      const fetchResponse = await fetch(`${API_BASE}/tools/news/fetch?${fetchParams}`);
 
       if (!fetchResponse.ok) {
         const errorData = await fetchResponse.json();
@@ -1415,7 +1416,7 @@ const NewsProviderTester: React.FC = () => {
       }
 
       const response = await fetch(
-        `http://localhost:8000/api/tools/news/export?${exportParams}`,
+        `${API_BASE}/tools/news/export?${exportParams}`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1849,7 +1850,7 @@ const FundamentalsTester: React.FC = () => {
         params.set('end_date', endDate);
       }
 
-      const response = await fetch(`http://localhost:8000/api/tools/fundamentals/fetch?${params}`);
+      const response = await fetch(`${API_BASE}/tools/fundamentals/fetch?${params}`);
 
       if (response.ok) {
         const data = await response.json();
@@ -2251,7 +2252,7 @@ const MacroTester: React.FC = () => {
         end_date: endDate,
       });
 
-      const response = await fetch(`http://localhost:8000/api/tools/macro/fetch?${params}`);
+      const response = await fetch(`${API_BASE}/tools/macro/fetch?${params}`);
 
       if (response.ok) {
         const data = await response.json();
@@ -2465,7 +2466,7 @@ const MaintenancePanel: React.FC = () => {
     setMessage(null);
 
     try {
-      const response = await fetch('http://localhost:8000/api/tools/maintenance/orphan-models');
+      const response = await fetch(`${API_BASE}/tools/maintenance/orphan-models`);
       if (response.ok) {
         const data = await response.json();
         setOrphanModels(data.orphan_models || []);
@@ -2489,7 +2490,7 @@ const MaintenancePanel: React.FC = () => {
 
     try {
       const response = await fetch(
-        `http://localhost:8000/api/tools/maintenance/orphan-models?dry_run=${dryRun}`,
+        `${API_BASE}/tools/maintenance/orphan-models?dry_run=${dryRun}`,
         { method: 'DELETE' }
       );
       if (response.ok) {

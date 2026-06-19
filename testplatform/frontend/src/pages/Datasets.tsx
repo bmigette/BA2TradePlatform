@@ -1,3 +1,4 @@
+import { API_BASE } from '../lib/config';
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Plus, Trash2, RefreshCw, Copy, Edit, CheckCircle, AlertCircle, Loader } from 'lucide-react';
@@ -44,7 +45,7 @@ const Datasets: React.FC = () => {
     setIsLoading(true);
     setError(null);
     try {
-      const response = await fetch('http://localhost:8000/api/datasets');
+      const response = await fetch(`${API_BASE}/datasets`);
       if (!response.ok) {
         throw new Error('Failed to fetch datasets');
       }
@@ -71,7 +72,7 @@ const Datasets: React.FC = () => {
     if (datasetToDelete === null) return;
 
     try {
-      const response = await fetch(`http://localhost:8000/api/datasets/${datasetToDelete}`, {
+      const response = await fetch(`${API_BASE}/datasets/${datasetToDelete}`, {
         method: 'DELETE',
       });
 
@@ -99,7 +100,7 @@ const Datasets: React.FC = () => {
     await Promise.all(
       ids.map(async (id) => {
         try {
-          const response = await fetch(`http://localhost:8000/api/datasets/${id}`, { method: 'DELETE' });
+          const response = await fetch(`${API_BASE}/datasets/${id}`, { method: 'DELETE' });
           if (response.ok) successCount++;
           else failCount++;
         } catch {
@@ -121,7 +122,7 @@ const Datasets: React.FC = () => {
     const ids = Array.from(selectedIds);
 
     try {
-      const response = await fetch('http://localhost:8000/api/datasets/batch-regenerate', {
+      const response = await fetch(`${API_BASE}/datasets/batch-regenerate`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ dataset_ids: ids, regenerate_options: options }),
@@ -166,7 +167,7 @@ const Datasets: React.FC = () => {
 
   const handleEdit = async (dataset: Dataset) => {
     try {
-      const response = await fetch(`http://localhost:8000/api/datasets/${dataset.id}`);
+      const response = await fetch(`${API_BASE}/datasets/${dataset.id}`);
       if (response.ok) {
         const freshDataset = await response.json();
         setSelectedDataset(freshDataset);

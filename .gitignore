@@ -117,6 +117,9 @@ celerybeat.pid
 .env
 .env.*
 *.env
+# ...but keep this ONE verified-secret-free template tracked (frontend API base config).
+# Do NOT broaden this: testplatform/.env.example contains real secrets and must stay ignored.
+!testplatform/frontend/.env.example
 .venv
 venv/
 ENV/

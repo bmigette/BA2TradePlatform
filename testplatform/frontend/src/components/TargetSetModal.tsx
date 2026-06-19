@@ -1,3 +1,4 @@
+import { API_BASE } from '../lib/config';
 import React, { useState, useEffect } from 'react';
 import { X, Save, Trash2, FolderOpen } from 'lucide-react';
 import type { TargetConfig, TargetSet } from '../types/targets';
@@ -41,7 +42,7 @@ const TargetSetModal: React.FC<TargetSetModalProps> = ({
     setIsLoading(true);
     setError(null);
     try {
-      const response = await fetch('http://localhost:8000/api/target-sets');
+      const response = await fetch(`${API_BASE}/target-sets`);
       if (!response.ok) throw new Error('Failed to fetch target sets');
       const data = await response.json();
       setTargetSets(data.target_sets || []);
@@ -61,7 +62,7 @@ const TargetSetModal: React.FC<TargetSetModalProps> = ({
     setIsLoading(true);
     setError(null);
     try {
-      const response = await fetch('http://localhost:8000/api/target-sets', {
+      const response = await fetch(`${API_BASE}/target-sets`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -93,7 +94,7 @@ const TargetSetModal: React.FC<TargetSetModalProps> = ({
     setIsLoading(true);
     setError(null);
     try {
-      const response = await fetch(`http://localhost:8000/api/target-sets/${id}`, {
+      const response = await fetch(`${API_BASE}/target-sets/${id}`, {
         method: 'DELETE',
       });
 

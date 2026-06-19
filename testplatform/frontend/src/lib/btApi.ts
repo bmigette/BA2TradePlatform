@@ -1,6 +1,6 @@
+import { API_BASE } from './config';
 // Backend URL. Defaults to :8000; override locally with VITE_API_BASE in frontend/.env.local
 // (e.g. http://localhost:8088/api when :8000 is taken by Docker).
-const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8001/api';
 
 export interface ExpertInfo { class: string; label: string; bypasses_classic_rm: boolean; uses_risk_manager: boolean; }
 export interface SettingDef { type: string; default?: unknown; choices?: unknown[]; valid_values?: unknown[]; description?: string; tooltip?: string; }
