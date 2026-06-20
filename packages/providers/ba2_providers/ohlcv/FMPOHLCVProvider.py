@@ -164,20 +164,27 @@ class FMPOHLCVProvider(MarketDataProviderInterface):
 
         # Shared FMP GET with backoff retry on 429/5xx + transient errors.
         from ba2_providers.fmp_common import fmp_http_get
-        response = fmp_http_get(url, params=params, symbol=symbol, endpoint="historical-price-full")
+        import time as _time
+        _empty = pd.DataFrame(columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume'])
 
-        data = response.json()
-
-        # Extract historical data from response
-        if "historical" not in data:
-            logger.warning(f"No 'historical' key in FMP response for {symbol}")
-            return pd.DataFrame(columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume'])
-        
-        historical = data["historical"]
-        
+        # FMP intermittently returns HTTP 200 with NO 'historical' key (or an empty list) for a
+        # symbol — a transient under-load hiccup, not a real "no data" (it usually succeeds on a
+        # re-request). fmp_http_get only backs off on HTTP errors (429/5xx), so the empty-200 isn't
+        # retried there; do a few backoff'd re-GETs here (each reuses fmp_http_get's own 429/5xx
+        # backoff + global rate-limit gate) before giving up.
+        historical = None
+        for _attempt in range(3):
+            response = fmp_http_get(url, params=params, symbol=symbol, endpoint="historical-price-full")
+            data = response.json()
+            if isinstance(data, dict) and data.get("historical"):
+                historical = data["historical"]
+                break
+            if _attempt < 2:
+                logger.warning(f"No/empty 'historical' for {symbol} (attempt {_attempt + 1}/3) — backing off")
+                _time.sleep(2.0 * (_attempt + 1))  # 2s, 4s
         if not historical:
-            logger.warning(f"Empty historical data from FMP for {symbol}")
-            return pd.DataFrame(columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume'])
+            logger.warning(f"No 'historical' data from FMP for {symbol} after 3 attempts")
+            return _empty
         
         # Convert to DataFrame
         df = pd.DataFrame(historical)

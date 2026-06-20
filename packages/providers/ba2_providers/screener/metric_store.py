@@ -8,11 +8,13 @@ per day. No server.
 """
 from __future__ import annotations
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
 from ba2_providers.fmp_common import fmp_http_get
+from ba2_common.logger import logger
 
 _SCREENER_URL = "https://financialmodelingprep.com/api/v3/stock-screener"
 # Point-in-time fundamentals (fetched ONCE at build time, baked into the store, disk-cached):
@@ -320,7 +322,7 @@ def build_store(store_dir: str, api_key: str, start: str, end: str, *,
                 market_cap_min: float, price_min: float, volume_min: float,
                 ohlcv_get, mcap_get=None, float_get=None, shares_get=None,
                 cadence_days: int = 7, rvol_window: int = 20, drop_days: int = 1,
-                max_workers: int = 8) -> Dict[str, Any]:
+                max_workers: int = 8, symbol_retries: int = 2) -> Dict[str, Any]:
     """Build/extend the metric store for [start,end] at ``cadence_days`` (default 7 = weekly).
     SKIPS months already present (incremental).
 
@@ -349,7 +351,7 @@ def build_store(store_dir: str, api_key: str, start: str, end: str, *,
     universe = enumerate_universe(api_key, market_cap_min, price_min, volume_min)
     static_by_sym = {r["symbol"]: r for r in universe}
 
-    def _build_one(sym: str, srow: Dict[str, Any]):
+    def _build_one_once(sym: str, srow: Dict[str, Any]):
         df = ohlcv_get(sym, end)
         if df is None or df.empty:
             return None
@@ -370,6 +372,23 @@ def build_store(store_dir: str, api_key: str, start: str, end: str, *,
         # compute_daily_metrics (the reindex carried them as-of each scan date) — point-in-time,
         # baked into the store so the per-day screen needs no OHLCV/network at read time.
         return m
+
+    def _build_one(sym: str, srow: Dict[str, Any]):
+        # RESILIENT + RETRY: a single symbol's fetch failure (e.g. an FMP response with no
+        # 'historical' key for a thin SPAC/unit, or a transient network/5xx error) must NOT abort
+        # the whole build — ``ex.map`` below would otherwise re-raise it and discard every frame
+        # built so far (partitions are written only at the end). Retry a few times with backoff
+        # (most such failures are transient), then skip the symbol if it still fails.
+        last_err = None
+        for attempt in range(symbol_retries + 1):
+            try:
+                return _build_one_once(sym, srow)
+            except Exception as e:  # noqa: BLE001 — one symbol must never kill the build
+                last_err = e
+                if attempt < symbol_retries:
+                    time.sleep(1.5 * (attempt + 1))  # 1.5s, 3.0s, ... brief backoff before retry
+        logger.warning(f"metric-store: skipping {sym} after {symbol_retries + 1} attempts ({last_err})")
+        return None
 
     frames: List["pd.DataFrame"] = []
     from concurrent.futures import ThreadPoolExecutor
