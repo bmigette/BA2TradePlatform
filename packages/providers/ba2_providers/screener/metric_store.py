@@ -153,9 +153,12 @@ def write_partitions(store_dir: str, df: "pd.DataFrame") -> None:
         os.replace(tmp, os.path.join(d, "part.parquet"))
 
 
-def scan_dates(start: str, end: str, cadence_days: int) -> "pd.DatetimeIndex":
+def scan_date_grid(start: str, end: str, cadence_days: int) -> "pd.DatetimeIndex":
     """The common scan-date grid: every ``cadence_days`` CALENDAR days from start..end.
-    Default cadence 7 = one scan per week. Shared across symbols so scan dates are consistent."""
+    Default cadence 7 = one scan per week. Shared across symbols so scan dates are consistent.
+
+    NOTE: distinct from the read-time ``scan_dates(store_df, store_key)`` below — this builds the
+    grid at store-BUILD time; that one lists the dates already present in a built store."""
     return pd.date_range(start=start, end=end, freq=f"{int(cadence_days)}D")
 
 
@@ -169,7 +172,7 @@ def build_store(store_dir: str, api_key: str, start: str, end: str, *,
     daily metrics are computed then sampled AS-OF each scan date (latest trading day <= scan
     date via ffill), so each row is point-in-time for its scan date. Returns
     {symbols, months_written, months_skipped, cadence_days}."""
-    grid = scan_dates(start, end, cadence_days)
+    grid = scan_date_grid(start, end, cadence_days)
     want_months = sorted({d.strftime("%Y-%m") for d in grid})
     have = existing_months(store_dir)
     todo_months = [m for m in want_months if m not in have]
