@@ -2,19 +2,28 @@
 # Build two venvs — one for the trade app (ba2-trade), one for the test app (ba2-test) —
 # each with the common -> providers -> experts chain + that app's requirements.txt.
 #   ./install.sh [--editable] [--ui] [--upgrade] [--trade-only|--test-only] \
-#                [--branch dev|main] [--base PATH] [--python PY]
+#                [--branch dev|main] [--base PATH] [--python PY] [--no-db]
 #     --editable/-e : install the sibling clones editable (default: git install over SSH @branch)
 #     --ui          : include the experts [ui] extra (nicegui) in the chain
 #     --upgrade     : pass --upgrade so an existing install is re-resolved/updated
 #     --trade-only  : only build the trade venv ; --test-only : only build the test venv
 #     --branch      : git branch to install from in non-editable mode (default: dev)
 #     --base        : base folder for the venvs (default: $HOME). Venvs live OUTSIDE the git repos.
+#     --no-db       : skip the DB step (copy old DB -> new location + run migrations)
 # Venvs: <base>/ba2-venvs/{trade,test}. Uses uv (bootstrapped into each venv).
+#
+# DB step (after the venvs are built): for each platform, if the app's DB is NOT yet at its
+# current (consolidated) location, copy a pre-existing OLD DB there (the OLD file is left in
+# place as a backup), then apply that platform's migrations to the target. Paths are derived
+# from BA2_HOME (default ~/Documents/ba2) and overridable via env:
+#   BA2_OLD_TRADE_DB (default ~/Documents/ba2_trade_platform/db.sqlite)
+#   BA2_OLD_TEST_DB  (default ~/Documents/ba2_ml_test_platform/dl_forecasting.db)
+# Migrations are idempotent (alembic upgrade head / db_migrate runner) — safe to re-run.
 set -euo pipefail
-EDITABLE=0; UI=0; UPGRADE=0; TRADE_ONLY=0; TEST_ONLY=0; BRANCH="dev"; BASE=""; BASE_PY="${PYTHON:-python3}"
+EDITABLE=0; UI=0; UPGRADE=0; TRADE_ONLY=0; TEST_ONLY=0; BRANCH="dev"; BASE=""; BASE_PY="${PYTHON:-python3}"; NO_DB=0
 while [ $# -gt 0 ]; do case "$1" in
   --editable|-e) EDITABLE=1 ;; --ui) UI=1 ;; --upgrade) UPGRADE=1 ;;
-  --trade-only) TRADE_ONLY=1 ;; --test-only) TEST_ONLY=1 ;;
+  --trade-only) TRADE_ONLY=1 ;; --test-only) TEST_ONLY=1 ;; --no-db) NO_DB=1 ;;
   --branch) shift; BRANCH="$1" ;; --base) shift; BASE="$1" ;; --python) shift; BASE_PY="$1" ;;
   *) echo "unknown arg: $1" >&2; exit 2 ;; esac; shift; done
 OWNER="bmigette"
@@ -87,6 +96,48 @@ if [ "$DO_TEST" = "1" ]; then
     else
       echo ">> npm not found — skipping frontend deps (install Node.js, then 'npm install' in $FE)"
     fi
+  fi
+fi
+
+# ---- DB step: copy a pre-existing OLD db to the app's current location (keep source as a
+#      backup) + apply that platform's migrations to the target. Idempotent / safe to re-run.
+BA2_HOME_DIR="${BA2_HOME:-$HOME/Documents/ba2}"
+OLD_TRADE_DB="${BA2_OLD_TRADE_DB:-$HOME/Documents/ba2_trade_platform/db.sqlite}"
+OLD_TEST_DB="${BA2_OLD_TEST_DB:-$HOME/Documents/ba2_ml_test_platform/dl_forecasting.db}"
+NEW_TRADE_DB="$BA2_HOME_DIR/trade/db.sqlite"
+NEW_TEST_DB="$BA2_HOME_DIR/test/dl_forecasting.db"
+
+copy_db_if_needed() {  # $1=label $2=old $3=new — copies old->new only when new is absent
+  local label="$1" old="$2" new="$3"
+  mkdir -p "$(dirname "$new")"
+  if [ -f "$new" ]; then
+    echo ">> $label: target DB already at $new — keeping it (no copy)"
+  elif [ -f "$old" ] && [ "$old" != "$new" ]; then
+    echo ">> $label: copying $old -> $new (source left in place as backup)"
+    cp -p "$old" "$new"
+  else
+    echo ">> $label: no old DB at $old — target created on first app run"
+  fi
+}
+
+if [ "$NO_DB" != "1" ] && [ "$DO_TRADE" = "1" ]; then
+  echo "==== TRADE DB ===="
+  copy_db_if_needed "TRADE" "$OLD_TRADE_DB" "$NEW_TRADE_DB"
+  if [ -f "$NEW_TRADE_DB" ]; then
+    AL="$VENV_ROOT/trade/bin/alembic"; [ -x "$AL" ] || AL="$VENV_ROOT/trade/Scripts/alembic.exe"
+    echo ">> migrating TRADE db -> head ($NEW_TRADE_DB)"
+    ( cd "$HERE" && BA2_DB_FILE="$NEW_TRADE_DB" "$AL" upgrade head ) \
+      && echo ">> TRADE migrations applied" || echo ">> TRADE migration FAILED (see above) — continuing"
+  fi
+fi
+if [ "$NO_DB" != "1" ] && [ "$DO_TEST" = "1" ]; then
+  echo "==== TEST DB ===="
+  copy_db_if_needed "TEST" "$OLD_TEST_DB" "$NEW_TEST_DB"
+  if [ -f "$NEW_TEST_DB" ]; then
+    PYV="$VENV_ROOT/test/bin/python"; [ -x "$PYV" ] || PYV="$VENV_ROOT/test/Scripts/python.exe"
+    echo ">> migrating TEST db ($NEW_TEST_DB)"
+    ( cd "$HERE/testplatform/backend" && DATABASE_PATH="$NEW_TEST_DB" "$PYV" scripts/migrate_db.py ) \
+      && echo ">> TEST migrations applied" || echo ">> TEST migration FAILED (see above) — continuing"
   fi
 fi
 
