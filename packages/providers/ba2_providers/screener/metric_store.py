@@ -134,11 +134,17 @@ def fetch_historical_float(symbol: str, api_key: str, start: str, end: str) -> "
 
 
 def _fetch_screener_rows(api_key: str) -> List[Dict[str, Any]]:
-    """One call to the FMP screener for the current actively-trading US universe."""
+    """One call to the FMP screener for the current actively-trading US universe.
+
+    ETFs/mutual funds are excluded server-side (``isEtf=false&isFund=false``, matching the live
+    FMPScreenerProvider) — the grade/earnings/insider experts don't apply to them, and excluding
+    them server-side lets the 10k row cap fill with real equities instead of funds.
+    """
     resp = fmp_http_get(
         _SCREENER_URL,
         params={"limit": 10000, "exchange": "nasdaq,nyse,amex",
-                "isActivelyTrading": "true", "apikey": api_key},
+                "isActivelyTrading": "true", "isEtf": "false", "isFund": "false",
+                "apikey": api_key},
         endpoint="stock-screener",
     )
     rows = resp.json()
@@ -152,9 +158,15 @@ def enumerate_universe(api_key: str, market_cap_min: float, price_min: float,
     Uses the screener's own current marketCap/price/volume fields (one call). These bounds are
     the loosest of every static gene's range, so no individual's looser threshold can admit a
     symbol we didn't include.
+
+    ETFs/mutual funds (``isEtf``/``isFund``) are ALWAYS excluded — the grade/earnings/insider
+    experts don't apply to them and trading them isn't the intent, matching the LIVE
+    ``FMPScreenerProvider`` (``isEtf=false&isFund=false`` server-side).
     """
     out = []
     for r in _fetch_screener_rows(api_key):
+        if r.get("isEtf") or r.get("isFund"):
+            continue
         cap = r.get("marketCap") or 0
         px = r.get("price") or 0
         vol = r.get("volume") or 0
