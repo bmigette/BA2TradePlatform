@@ -375,11 +375,24 @@ def _cmd_build_screener_metrics(args) -> int:
     def _shares(sym):
         return _shares_by_sym.get(sym)
 
+    # Point-in-time fundamentals — fetched ONCE here, disk-cached by the metric_store helpers, and
+    # baked into the store so the optimizer's per-day screen stays a pure in-memory filter:
+    #  * market cap: FMP historical-market-capitalization (correct across buybacks/issuance/splits)
+    #  * free float: FMP v4 historical/shares_float
+    # ``shares_get`` stays only as the legacy mcap fallback for a symbol with no historical series.
+    def _mcap(sym):
+        return ms.fetch_historical_market_cap(sym, api_key, args.start, args.end)
+
+    def _float(sym):
+        return ms.fetch_historical_float(sym, api_key, args.start, args.end)
+
     os.makedirs(args.store, exist_ok=True)
     summary = ms.build_store(
         args.store, api_key, args.start, args.end,
         market_cap_min=args.market_cap_min, price_min=args.price_min, volume_min=args.volume_min,
-        ohlcv_get=_ohlcv, shares_get=_shares, cadence_days=args.cadence_days, drop_days=args.drop_days)
+        ohlcv_get=_ohlcv, mcap_get=_mcap, float_get=_float, shares_get=_shares,
+        cadence_days=args.cadence_days, drop_days=args.drop_days,
+        max_workers=getattr(args, "workers", 8) or 8)
     print(f"build-screener-metrics: {summary}")
     return 0
 
@@ -1481,6 +1494,9 @@ def main(argv: "list | None" = None) -> int:
     bm.add_argument("--volume-min", type=float, default=0.0)
     bm.add_argument("--cadence-days", type=int, default=7, help="Scan cadence in days (default 7 = weekly). Match the analysis schedule.")
     bm.add_argument("--drop-days", type=int, default=1)
+    bm.add_argument("--workers", type=int, default=8,
+                    help="Parallel per-symbol fetch threads (default 8). Historical market-cap + "
+                         "float fetches are disk-cached, so re-builds are fast regardless.")
 
     fo = sub.add_parser("fetch-options", help="Build the offline options cache from Alpaca.")
     fo.add_argument("--underlyings", required=True, help="Comma-separated symbols, or @file.")

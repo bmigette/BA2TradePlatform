@@ -164,3 +164,86 @@ def test_screen_universe_as_of_holds_between_scans():
     # a Thursday with no scan row resolves to the Monday scan
     assert ms.screen_universe_as_of(df, "2023-03-09", {"market_cap_min": 1e9}) == ["AAA"]
     assert ms.screen_universe_as_of(df, "2023-03-01", {"market_cap_min": 1e9}) == []  # before first scan
+
+
+# --- point-in-time fundamentals (volume / market_cap / float) -----------------
+
+def test_volume_is_trailing_average_point_in_time():
+    """volume = trailing-avg daily volume ENDING at each bar (point-in-time), NOT a single static
+    value, and never depends on future bars (no lookahead)."""
+    idx = pd.date_range("2024-01-01", periods=6, freq="D")
+    df = pd.DataFrame({"Close": [10.0] * 6,
+                       "Volume": [100, 200, 300, 400, 500, 600.0]}, index=idx)
+    out = ms.compute_daily_metrics(df, vol_window=3, rvol_window=3)
+    # bar 3 (0-idx 2): mean(100,200,300)=200; bar 5: mean(400,500,600)=500 -> trailing, not static
+    assert out["volume"].iloc[2] == 200.0
+    assert out["volume"].iloc[4] == 400.0
+    # no-lookahead: truncating the future leaves earlier bars' volume unchanged
+    out_trunc = ms.compute_daily_metrics(df.iloc[:3], vol_window=3, rvol_window=3)
+    assert out["volume"].iloc[2] == out_trunc["volume"].iloc[2]
+
+
+def test_market_cap_from_historical_series_as_of():
+    """market_cap comes from the historical series sampled AS-OF (ffill), overriding the legacy
+    close x static-shares path; updates only on/after each series date (no lookahead)."""
+    idx = pd.date_range("2024-01-01", periods=6, freq="D")
+    df = pd.DataFrame({"Close": [10.0] * 6, "Volume": [1e6] * 6}, index=idx)
+    mcap = pd.Series([1e9, 2e9], index=pd.to_datetime(["2024-01-01", "2024-01-04"]))
+    out = ms.compute_daily_metrics(df, market_cap_series=mcap, shares=999)  # series wins over shares
+    assert out["market_cap"].iloc[2] == 1e9          # 01-03: pre-update value held
+    assert out["market_cap"].iloc[3] == 2e9          # 01-04: as-of update
+    assert out["market_cap"].iloc[0] != 10.0 * 999   # NOT close x static shares
+
+
+def test_float_series_as_of_and_min_max_filter():
+    """float_shares is sampled as-of from the historical series and gated by float_min/float_max."""
+    idx = pd.date_range("2024-01-01", periods=5, freq="D")
+    df = pd.DataFrame({"Close": [10.0] * 5, "Volume": [1e6] * 5}, index=idx)
+    flt = pd.Series([5e7, 8e7], index=pd.to_datetime(["2024-01-01", "2024-01-03"]))
+    out = ms.compute_daily_metrics(df, float_series=flt)
+    assert out["float_shares"].iloc[1] == 5e7        # 01-02: pre-update held
+    assert out["float_shares"].iloc[2] == 8e7        # 01-03: as-of update
+    store = pd.DataFrame({"symbol": ["LOW", "HIGH"], "date": ["2024-01-05"] * 2,
+                          "close": [10, 20.0], "market_cap": [1e9, 2e9], "price": [10, 20.0],
+                          "relative_volume": [1.0, 1.0], "price_drop_pct": [0.0, 0.0],
+                          "volume": [1e6, 1e6], "float_shares": [2e7, 8e7]})
+    assert ms.screen_universe_for_day(store, "2024-01-05", {"float_min": 5e7}) == ["HIGH"]
+    assert ms.screen_universe_for_day(store, "2024-01-05", {"float_max": 5e7}) == ["LOW"]
+
+
+def test_float_gate_is_nan_tolerant_for_mixed_schema_store():
+    """An incrementally-rebuilt MIXED-schema store has NaN float on legacy-month rows (no
+    float_shares before the column existed). The float gate must NOT silently drop those rows
+    (graceful degradation): unknown float passes."""
+    store = pd.DataFrame({
+        "symbol": ["OLD", "NEW", "LOWF"], "date": ["2024-01-08"] * 3,
+        "close": [10, 20, 5.0], "market_cap": [2e9, 3e9, 1e9], "price": [10, 20, 5.0],
+        "relative_volume": [1.0, 1.0, 1.0], "price_drop_pct": [0.0, 0.0, 0.0],
+        "volume": [1e6, 2e6, 5e5], "float_shares": [float("nan"), 8e7, 2e7]})
+    sel = ms.screen_universe_for_day(store, "2024-01-08", {"float_min": 5e7})
+    assert set(sel) == {"OLD", "NEW"}                # OLD (NaN) kept; NEW passes; LOWF excluded
+
+
+def test_screen_legacy_store_without_float_column_skips_float_gate():
+    """A pure legacy store (no float_shares column at all) screens with the float gate as a no-op."""
+    store = pd.DataFrame({"symbol": ["AAA"], "date": ["2024-01-08"], "close": [10.0],
+                          "market_cap": [2e9], "price": [10.0], "relative_volume": [1.0],
+                          "price_drop_pct": [0.0], "volume": [1e6]})
+    assert ms.screen_universe_for_day(store, "2024-01-08", {"float_min": 1e9}) == ["AAA"]
+
+
+def test_float_series_built_lookahead_safe_effective_dated(monkeypatch):
+    """fetch_historical_float indexes by the EFFECTIVE (publication) date — period-end + reporting
+    lag — so a float is never exposed before it was public (no filing-lag lookahead)."""
+    import ba2_providers.screener.metric_store as _ms
+
+    class _Resp:
+        @staticmethod
+        def json():
+            return [{"date": "2024-01-01", "floatShares": 5e7}]  # period-end only (no filing date)
+    monkeypatch.setattr(_ms, "fmp_http_get", lambda *a, **k: _Resp())
+    monkeypatch.setattr(_ms, "_fund_cache_path", lambda kind, sym: "/nonexistent/no.parquet")
+    s = _ms.fetch_historical_float("AAA", "key", "2023-01-01", "2024-12-31")
+    assert len(s) == 1
+    # the period-end 2024-01-01 must surface only ~75 days later (the reporting lag), not on 01-01
+    assert s.index[0] > pd.Timestamp("2024-02-01")
