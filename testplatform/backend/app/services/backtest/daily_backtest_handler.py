@@ -263,7 +263,8 @@ def handle_daily_backtest(task_id: str, payload: Dict[str, Any]) -> Dict[str, An
 # (float_*/price_drop_days) — map to the recognized subset so the per-bar gate gets a clean dict.
 _METRIC_STORE_KEYS = (
     "market_cap_min", "market_cap_max", "price_min", "price_max",
-    "volume_min", "volume_max", "relative_volume_min", "price_drop_pct",
+    "volume_min", "volume_max", "float_min", "float_max",
+    "relative_volume_min", "price_drop_pct",
     "weinstein_stage2_only", "max_stocks", "sort_metric",
 )
 

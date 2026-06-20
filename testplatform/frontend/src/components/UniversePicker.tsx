@@ -26,18 +26,20 @@ export type UniverseValue =
 const SCREENER_NUMBER_FIELDS: [string, string][] = [
   ['screener_market_cap_min', 'Market cap min'], ['screener_market_cap_max', 'Market cap max'],
   ['screener_volume_min', 'Volume min'], ['screener_volume_max', 'Volume max'],
+  ['screener_float_min', 'Free float min'], ['screener_float_max', 'Free float max'],
   ['screener_price_min', 'Price min'], ['screener_price_max', 'Price max'],
   ['screener_relative_volume_min', 'RVOL min'],
   ['screener_price_drop_pct', 'Price drop % (dip min)'],
   ['screener_max_stocks', 'Max stocks'],
 ];
 
-const SORT_METRIC_CHOICES: string[] = ['market_cap', 'relative_volume', 'price_drop_pct'];
+const SORT_METRIC_CHOICES: string[] = ['market_cap', 'relative_volume', 'price_drop_pct', 'float_shares'];
 
 // Fields the GA can tune (mirrors the CLI _SCREENER_OPT). Each entry: unprefixed
 // metric-store key (the screener_param_ranges key), a label, and a default range.
 const SCREENER_OPT_FIELDS: { key: string; label: string; def: ScreenerOptRange }[] = [
   { key: 'market_cap_min', label: 'Market cap min', def: { min: 1e9, max: 1e11, step: 1e10, optimize: true } },
+  { key: 'float_min', label: 'Free float min', def: { min: 1e7, max: 5e8, step: 5e7, optimize: true } },
   { key: 'relative_volume_min', label: 'RVOL min', def: { min: 1.0, max: 5.0, step: 0.5, optimize: true } },
   { key: 'price_drop_pct', label: 'Price drop %', def: { min: 1.0, max: 15.0, step: 1.0, optimize: true } },
   { key: 'max_stocks', label: 'Max stocks', def: { min: 5, max: 50, step: 5, optimize: true } },

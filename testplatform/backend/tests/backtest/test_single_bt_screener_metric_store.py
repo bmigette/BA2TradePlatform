@@ -38,16 +38,19 @@ def _build_store(tmp_path) -> str:
 
 
 def test_metric_store_settings_maps_and_filters_keys():
-    # Strips the screener_ prefix and drops keys metric_store doesn't use (price_drop_days/float_*).
+    # Strips the screener_ prefix and drops keys metric_store doesn't use (e.g. price_drop_days).
+    # float_min/float_max ARE supported (point-in-time free-float gate baked into the store).
     out = _metric_store_settings({
         "screener_market_cap_min": 1e9,
         "market_cap_max": 0,
         "screener_price_drop_days": 5,   # unsupported -> dropped
-        "screener_float_min": 1e6,       # unsupported -> dropped
+        "screener_float_min": 1e6,       # supported -> mapped
+        "screener_float_max": 5e8,       # supported -> mapped
         "sort_metric": "market_cap",
         "missing": None,                 # None -> dropped
     })
-    assert out == {"market_cap_min": 1e9, "market_cap_max": 0, "sort_metric": "market_cap"}
+    assert out == {"market_cap_min": 1e9, "market_cap_max": 0, "sort_metric": "market_cap",
+                   "float_min": 1e6, "float_max": 5e8}
 
 
 def test_single_bt_screener_union_runtime_and_no_lookahead(tmp_path):

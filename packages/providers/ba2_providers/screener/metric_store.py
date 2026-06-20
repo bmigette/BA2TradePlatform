@@ -15,6 +15,122 @@ import pandas as pd
 from ba2_providers.fmp_common import fmp_http_get
 
 _SCREENER_URL = "https://financialmodelingprep.com/api/v3/stock-screener"
+# Point-in-time fundamentals (fetched ONCE at build time, baked into the store, disk-cached):
+#  * historical-market-capitalization -> daily market cap (correct across buybacks/issuance/splits)
+#  * v4 historical/shares_float        -> free float over time
+_HIST_MCAP_URL = "https://financialmodelingprep.com/api/v3/historical-market-capitalization"
+_HIST_FLOAT_URL = "https://financialmodelingprep.com/api/v4/historical/shares_float"
+
+
+def _fund_cache_path(kind: str, symbol: str) -> str:
+    """Disk-cache path for a per-symbol historical fundamentals series (so a re-build never
+    re-fetches). ``kind`` in {'market_cap','float'}. Under CACHE_FOLDER/screener_fundamentals."""
+    import ba2_common.config as _cfg  # read at call time so tests rebinding CACHE_FOLDER win
+    d = os.path.join(_cfg.CACHE_FOLDER, "screener_fundamentals", kind)
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, f"{symbol.upper()}.parquet")
+
+
+def _write_parquet_atomic(df: "pd.DataFrame", path: str) -> None:
+    # Process+thread-unique temp so two concurrent builders (separate processes) writing the same
+    # symbol's cache never clobber each other's half-written .tmp; os.replace is atomic on POSIX.
+    import threading
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    df.to_parquet(tmp, index=False)
+    os.replace(tmp, path)
+
+
+def _series_from_cache_df(df: "pd.DataFrame", col: str) -> "pd.Series":
+    """A tz-naive, date-indexed, ascending Series from a cached [date, <col>] frame (empty-safe)."""
+    if df is None or df.empty or "date" not in df.columns or col not in df.columns:
+        return pd.Series(dtype="float64")
+    idx = pd.to_datetime(df["date"], errors="coerce")
+    if getattr(idx.dt, "tz", None) is not None:
+        idx = idx.dt.tz_localize(None)
+    s = pd.Series(pd.to_numeric(df[col], errors="coerce").values, index=idx).dropna()
+    s = s[~s.index.isna()].sort_index()
+    # Drop duplicate dates (keep the last) — a duplicated source index makes the downstream
+    # reindex(method='ffill') raise ("cannot reindex on an axis with duplicate labels").
+    return s[~s.index.duplicated(keep="last")]
+
+
+def fetch_historical_market_cap(symbol: str, api_key: str, start: str, end: str) -> "pd.Series":
+    """Daily historical market cap for ``symbol`` over [start,end], as a tz-naive date-indexed
+    Series. DISK-CACHED (parquet) — a re-build reads the cache instead of re-hitting FMP. Each
+    row's date is the market date, so an as-of (ffill <= scan date) read is point-in-time."""
+    path = _fund_cache_path("market_cap", symbol)
+    if os.path.exists(path):
+        try:
+            return _series_from_cache_df(pd.read_parquet(path), "market_cap")
+        except Exception:  # noqa: BLE001 — corrupt cache -> re-fetch
+            pass
+    rows: list = []
+    try:
+        r = fmp_http_get(f"{_HIST_MCAP_URL}/{symbol}",
+                         params={"apikey": api_key, "from": start, "to": end, "limit": 100000},
+                         endpoint="historical-market-cap", timeout=30)
+        j = r.json()
+        rows = j if isinstance(j, list) else []
+    except Exception:  # noqa: BLE001 — per-symbol fetch failure -> empty (mcap NaN, dropped by filter)
+        rows = []
+    df = pd.DataFrame(
+        [{"date": x.get("date"), "market_cap": x.get("marketCap")}
+         for x in rows if isinstance(x, dict) and x.get("date")]
+    )
+    if not df.empty:
+        try:
+            _write_parquet_atomic(df, path)
+        except Exception:  # noqa: BLE001 — cache write best-effort
+            pass
+    return _series_from_cache_df(df, "market_cap")
+
+
+def fetch_historical_float(symbol: str, api_key: str, start: str, end: str) -> "pd.Series":
+    """Historical FREE FLOAT (share count) for ``symbol`` as a tz-naive Series, indexed by the
+    float's EFFECTIVE (publication) date. DISK-CACHED.
+
+    LOOKAHEAD-SAFE: FMP v4 ``historical/shares_float`` rows carry a fiscal/value ``date`` (and an
+    SEC filing as ``source``) — that ``date`` is the period-end, NOT when the float became public.
+    Filing it forward by the raw ``date`` would leak a not-yet-announced float to screens run
+    between period-end and the filing. We therefore index each row on
+    ``statement_effective_date`` (fillingDate/acceptedDate, else ``date`` + the standard ~75-day
+    reporting lag) — the SAME gate ``FMPHistoricalScreenerProvider._shares_at`` uses for shares.
+    An as-of (ffill) read then only exposes a float on/after its likely public date. The cache
+    stores the already-effective-dated series. Empty Series when the plan/endpoint returns
+    nothing (the float filter then degrades gracefully — unknown float passes the gate)."""
+    path = _fund_cache_path("float", symbol)
+    if os.path.exists(path):
+        try:
+            return _series_from_cache_df(pd.read_parquet(path), "float_shares")
+        except Exception:  # noqa: BLE001
+            pass
+    rows: list = []
+    try:
+        r = fmp_http_get(_HIST_FLOAT_URL, params={"symbol": symbol, "apikey": api_key},
+                         endpoint="historical-shares-float", timeout=30)
+        j = r.json()
+        rows = j if isinstance(j, list) else []
+    except Exception:  # noqa: BLE001
+        rows = []
+    from ba2_common.core.provider_utils import statement_effective_date
+    recs = []
+    for x in rows:
+        if not isinstance(x, dict):
+            continue
+        fs = x.get("floatShares")
+        if fs is None:
+            continue
+        eff = statement_effective_date(x)  # publication date (filing/accepted, else date + lag)
+        if eff is None:
+            continue
+        recs.append({"date": eff.strftime("%Y-%m-%d"), "float_shares": fs})
+    df = pd.DataFrame(recs)
+    if not df.empty:
+        try:
+            _write_parquet_atomic(df, path)
+        except Exception:  # noqa: BLE001
+            pass
+    return _series_from_cache_df(df, "float_shares")
 
 
 def _fetch_screener_rows(api_key: str) -> List[Dict[str, Any]]:
@@ -99,37 +215,63 @@ def weinstein_stage_series(close: "pd.Series", sma_period: int = 150,
     return stage.where(valid, float("nan"))
 
 
-def compute_daily_metrics(ohlcv: "pd.DataFrame", shares: Optional[float],
-                          rvol_window: int = 20, drop_days: int = 1) -> "pd.DataFrame":
+def compute_daily_metrics(ohlcv: "pd.DataFrame",
+                          market_cap_series: Optional["pd.Series"] = None,
+                          float_series: Optional["pd.Series"] = None,
+                          shares: Optional[float] = None,
+                          rvol_window: int = 20, drop_days: int = 1,
+                          vol_window: int = 20) -> "pd.DataFrame":
     """Per-day screen metrics for ONE symbol, vectorised over its full history.
 
     ``ohlcv`` is indexed by date with columns Open/High/Low/Close/Volume (the shape the as-of
     OHLCV cache returns). Returns a DataFrame indexed by date with columns:
-    close, market_cap, relative_volume, price_drop_pct, weinstein_stage. NaN rows (insufficient
-    lookback) are kept — callers drop them. Point-in-time safe: every value at row D uses only
-    bars <= D.
+    close, market_cap, volume, relative_volume, price_drop_pct, weinstein_stage, float_shares.
+    NaN rows (insufficient lookback) are kept — callers drop them.
+
+    POINT-IN-TIME safe: every value at row D uses only data <= D.
+      * volume        = trailing ``vol_window``-session AVERAGE daily volume ending at D (the
+                        "typical daily volume" level the screener's volume_min/max gates — was
+                        previously a single CURRENT static value copied to every date: the bug).
+      * market_cap    = ``market_cap_series`` as-of D (ffill from the FMP historical-market-cap
+                        series) — NOT close x CURRENT shares. Falls back to close x ``shares``
+                        only if no series is supplied (legacy).
+      * float_shares  = ``float_series`` as-of D (ffill from the FMP historical free-float series).
     """
     close = ohlcv["Close"].astype(float)
     vol = ohlcv["Volume"].astype(float)
     # RVOL: today's volume / trailing average of the PRIOR rvol_window days (EXCLUDES today via
-    # shift(1) — point-in-time: today is the spike measured against its prior baseline). The
-    # first row's avg is NaN -> .where(avg_vol > 0) leaves RVOL 0.
-    avg_vol = vol.shift(1).rolling(rvol_window, min_periods=1).mean()
-    rvol = (vol / avg_vol).where(avg_vol > 0, 0.0)
+    # shift(1) — point-in-time: today is the spike measured against its prior baseline).
+    avg_vol_prior = vol.shift(1).rolling(rvol_window, min_periods=1).mean()
+    rvol = (vol / avg_vol_prior).where(avg_vol_prior > 0, 0.0)
+    # Typical daily volume LEVEL: trailing average INCLUDING today (point-in-time, ending at D).
+    volume = vol.rolling(vol_window, min_periods=1).mean()
     # Price drop %: peak of the trailing window (inclusive) vs today's close.
     peak = close.rolling(max(1, drop_days), min_periods=1).max()
     drop_pct = ((peak - close) / peak * 100.0).where(peak > 0, 0.0)
-    mcap = (close * shares) if shares else pd.Series(float("nan"), index=close.index)
+    # Market cap: point-in-time from the historical series (as-of each bar via ffill). Falls back
+    # to close x static shares only when no series is available.
+    if market_cap_series is not None and len(market_cap_series):
+        mcap = market_cap_series.reindex(close.index, method="ffill")
+    elif shares:
+        mcap = close * shares
+    else:
+        mcap = pd.Series(float("nan"), index=close.index)
+    # Free float: point-in-time from the historical series (held as-of via ffill); NaN otherwise.
+    if float_series is not None and len(float_series):
+        flt = float_series.reindex(close.index, method="ffill")
+    else:
+        flt = pd.Series(float("nan"), index=close.index)
     # Weinstein stage (price vs RISING 150-session/30-week SMA) — vectorised 1:1 with
-    # ba2_common.core.weinstein.classify_weinstein_stage so the fast screener path agrees with
-    # the slow StockScreener Stage-2 filter. NaN until enough history (matches classifier None).
+    # ba2_common.core.weinstein.classify_weinstein_stage. NaN until enough history.
     stage = weinstein_stage_series(close)
     return pd.DataFrame({
         "close": close,
         "market_cap": mcap,
+        "volume": volume.round(2),
         "relative_volume": rvol.round(4),
         "price_drop_pct": drop_pct.round(4),
         "weinstein_stage": stage,
+        "float_shares": flt,
     })
 
 
@@ -164,14 +306,27 @@ def scan_date_grid(start: str, end: str, cadence_days: int) -> "pd.DatetimeIndex
 
 def build_store(store_dir: str, api_key: str, start: str, end: str, *,
                 market_cap_min: float, price_min: float, volume_min: float,
-                ohlcv_get, shares_get, cadence_days: int = 7,
-                rvol_window: int = 20, drop_days: int = 1) -> Dict[str, Any]:
+                ohlcv_get, mcap_get=None, float_get=None, shares_get=None,
+                cadence_days: int = 7, rvol_window: int = 20, drop_days: int = 1,
+                max_workers: int = 8) -> Dict[str, Any]:
     """Build/extend the metric store for [start,end] at ``cadence_days`` (default 7 = weekly).
-    SKIPS months already present (incremental). ``ohlcv_get(symbol, end_date)`` -> OHLCV up to
-    end_date (as-of cache); ``shares_get(symbol)`` -> latest-filing shares. For each symbol the
-    daily metrics are computed then sampled AS-OF each scan date (latest trading day <= scan
-    date via ffill), so each row is point-in-time for its scan date. Returns
-    {symbols, months_written, months_skipped, cadence_days}."""
+    SKIPS months already present (incremental).
+
+    Per-symbol POINT-IN-TIME inputs (each disk-cached so a re-build never re-fetches):
+      * ``ohlcv_get(symbol, end_date)`` -> OHLCV up to end_date (as-of cache).
+      * ``mcap_get(symbol)``  -> date-indexed historical market-cap Series (optional).
+      * ``float_get(symbol)`` -> date-indexed historical free-float Series (optional).
+      * ``shares_get(symbol)``-> latest-filing shares (legacy mcap fallback only).
+
+    Each symbol's daily metrics (volume/market_cap/float_shares/RVOL/price-drop/Weinstein) are
+    computed then sampled AS-OF each scan date (latest trading day <= scan date via ffill), so
+    every row is point-in-time. These values are BAKED into the parquet store, so the optimizer's
+    per-day screen stays a pure in-memory filter (no fetching at optimize time).
+
+    The per-symbol fetch+compute runs in a thread pool (``max_workers``); the OHLCV reads are
+    disk-IO and the mcap/float fetches go through ``fmp_http_get`` (global rate-limit gate), so
+    threads overlap IO/network safely. Returns {symbols, months_written, months_skipped, cadence_days}.
+    """
     grid = scan_date_grid(start, end, cadence_days)
     want_months = sorted({d.strftime("%Y-%m") for d in grid})
     have = existing_months(store_dir)
@@ -181,25 +336,36 @@ def build_store(store_dir: str, api_key: str, start: str, end: str, *,
     grid_todo = grid[[d.strftime("%Y-%m") in set(todo_months) for d in grid]]
     universe = enumerate_universe(api_key, market_cap_min, price_min, volume_min)
     static_by_sym = {r["symbol"]: r for r in universe}
-    frames = []
-    for sym, srow in static_by_sym.items():
+
+    def _build_one(sym: str, srow: Dict[str, Any]):
         df = ohlcv_get(sym, end)
         if df is None or df.empty:
-            continue
-        m = compute_daily_metrics(df, shares=shares_get(sym), rvol_window=rvol_window, drop_days=drop_days)
+            return None
+        mcap_s = mcap_get(sym) if mcap_get is not None else None
+        flt_s = float_get(sym) if float_get is not None else None
+        shares = shares_get(sym) if shares_get is not None else None
+        m = compute_daily_metrics(df, market_cap_series=mcap_s, float_series=flt_s,
+                                  shares=shares, rvol_window=rvol_window, drop_days=drop_days)
         m = m.reindex(grid_todo, method="ffill")             # value AS-OF each scan date
         m = m.dropna(subset=["close"]).reset_index().rename(columns={"index": "date"})
         m["date"] = m["date"].astype(str).str.slice(0, 10)
         if m.empty:
-            continue
+            return None
         m["symbol"] = sym
         m["sector"] = srow.get("sector")
-        m["volume"] = m["close"] * 0 + (srow.get("volume") or 0)  # static screener volume ride-along
         m["price"] = m["close"]
-        # weinstein_stage rides along from compute_daily_metrics (reindex carried it as-of each
-        # scan date); persisted so the fast path can honor weinstein_stage2_only without reloading
-        # OHLCV. Rows with insufficient history hold NaN (won't match the == 2 filter).
-        frames.append(m)
+        # volume / market_cap / float_shares / weinstein_stage all ride along from
+        # compute_daily_metrics (the reindex carried them as-of each scan date) — point-in-time,
+        # baked into the store so the per-day screen needs no OHLCV/network at read time.
+        return m
+
+    frames: List["pd.DataFrame"] = []
+    from concurrent.futures import ThreadPoolExecutor
+    items = list(static_by_sym.items())
+    with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as ex:
+        for res in ex.map(lambda kv: _build_one(kv[0], kv[1]), items):
+            if res is not None and not res.empty:
+                frames.append(res)
     if frames:
         write_partitions(store_dir, pd.concat(frames, ignore_index=True))
     return {"symbols": len(static_by_sym), "months_written": len(todo_months),
@@ -270,6 +436,18 @@ def screen_universe_for_day(store_df: "pd.DataFrame", day: str,
     _ge("market_cap", "market_cap_min"); _le("market_cap", "market_cap_max")
     _ge("price", "price_min"); _le("price", "price_max")
     _ge("volume", "volume_min"); _le("volume", "volume_max")
+    # Free float (point-in-time, baked into the store). A row with UNKNOWN float (NaN) PASSES the
+    # gate (graceful degradation): this matches the column-absent skip for a pure legacy store AND
+    # avoids silently dropping legacy-month symbols in an incrementally-rebuilt MIXED-schema store
+    # (old months have no float_shares -> NaN after concat). A full rebuild gives every symbol a
+    # real float. Absent column entirely -> no-op (older stores behave exactly as before).
+    if "float_shares" in d.columns:
+        _fmin = settings.get("float_min")
+        if _fmin is not None and float(_fmin) > 0:
+            d = d[(d["float_shares"] >= float(_fmin)) | d["float_shares"].isna()]
+        _fmax = settings.get("float_max")
+        if _fmax is not None and float(_fmax) > 0:
+            d = d[(d["float_shares"] <= float(_fmax)) | d["float_shares"].isna()]
     _ge("relative_volume", "relative_volume_min")
     _ge("price_drop_pct", "price_drop_pct")
     # Weinstein Stage 2 gate (price above a RISING 30-week/150-session SMA). Truthy => keep only
