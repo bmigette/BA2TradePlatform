@@ -296,17 +296,21 @@ def existing_months(store_dir: str) -> set:
     return {d[len("ym="):] for d in os.listdir(store_dir) if d.startswith("ym=")}
 
 
-def write_partitions(store_dir: str, df: "pd.DataFrame") -> None:
-    """Write rows to ``<store>/ym=YYYY-MM/part.parquet`` (one file per month). Overwrites the
-    month's file (idempotent re-build of a month); never touches other months."""
+def write_partitions(store_dir: str, df: "pd.DataFrame", part_name: str = "part.parquet") -> None:
+    """Write rows to ``<store>/ym=YYYY-MM/<part_name>`` (one file per month, atomic tmp+replace).
+
+    ``part_name`` defaults to ``part.parquet`` (the classic single-file-per-month layout). PERIODIC
+    builds pass a UNIQUE name per flush (e.g. ``part-00001.parquet``) so successive flushes ACCUMULATE
+    within each month's dir instead of clobbering — ``load_store`` reads every ``*.parquet`` in the
+    month dir. Never touches other months."""
     os.makedirs(store_dir, exist_ok=True)
     ym = df["date"].astype(str).str.slice(0, 7)
     for month, chunk in df.groupby(ym):
         d = os.path.join(store_dir, f"ym={month}")
         os.makedirs(d, exist_ok=True)
-        tmp = os.path.join(d, "part.parquet.tmp")
+        tmp = os.path.join(d, part_name + ".tmp")
         chunk.to_parquet(tmp, index=False)
-        os.replace(tmp, os.path.join(d, "part.parquet"))
+        os.replace(tmp, os.path.join(d, part_name))
 
 
 def scan_date_grid(start: str, end: str, cadence_days: int) -> "pd.DatetimeIndex":
@@ -322,7 +326,8 @@ def build_store(store_dir: str, api_key: str, start: str, end: str, *,
                 market_cap_min: float, price_min: float, volume_min: float,
                 ohlcv_get, mcap_get=None, float_get=None, shares_get=None,
                 cadence_days: int = 7, rvol_window: int = 20, drop_days: int = 1,
-                max_workers: int = 8, symbol_retries: int = 2) -> Dict[str, Any]:
+                max_workers: int = 8, symbol_retries: int = 2,
+                flush_every: int = 250) -> Dict[str, Any]:
     """Build/extend the metric store for [start,end] at ``cadence_days`` (default 7 = weekly).
     SKIPS months already present (incremental).
 
@@ -390,15 +395,37 @@ def build_store(store_dir: str, api_key: str, start: str, end: str, *,
         logger.warning(f"metric-store: skipping {sym} after {symbol_retries + 1} attempts ({last_err})")
         return None
 
-    frames: List["pd.DataFrame"] = []
+    # PERIODIC WRITE: flush accumulated frames to disk every ``flush_every`` symbols (each flush
+    # is a uniquely-named part file per month, so flushes accumulate — see write_partitions). This
+    # persists progress incrementally, so a crash/kill keeps everything built so far instead of
+    # losing the whole run (partitions used to be written only at the very end). Set flush_every<=0
+    # to restore the single write-at-end behaviour.
     from concurrent.futures import ThreadPoolExecutor
     items = list(static_by_sym.items())
+    frames: List["pd.DataFrame"] = []
+    written = 0          # symbols whose rows have been flushed
+    flush_seq = 0
+    fe = int(flush_every)
+
+    def _flush() -> None:
+        nonlocal frames, flush_seq, written
+        if not frames:
+            return
+        flush_seq += 1
+        write_partitions(store_dir, pd.concat(frames, ignore_index=True),
+                         part_name=f"part-{flush_seq:05d}.parquet")
+        written += len(frames)
+        logger.info(f"metric-store: flushed {len(frames)} symbols "
+                    f"(part-{flush_seq:05d}, {written} total) to {store_dir}")
+        frames = []
+
     with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as ex:
         for res in ex.map(lambda kv: _build_one(kv[0], kv[1]), items):
             if res is not None and not res.empty:
                 frames.append(res)
-    if frames:
-        write_partitions(store_dir, pd.concat(frames, ignore_index=True))
+                if fe > 0 and len(frames) >= fe:
+                    _flush()
+    _flush()  # final remainder
     return {"symbols": len(static_by_sym), "months_written": len(todo_months),
             "months_skipped": len(set(have) & set(want_months)), "cadence_days": cadence_days}
 
@@ -428,7 +455,9 @@ def load_store(store_dir: str) -> "pd.DataFrame":
     hit = _STORE_MEMO.get(store_dir)
     if hit is not None:
         return hit
-    parts = sorted(glob.glob(os.path.join(store_dir, "ym=*", "part.parquet")))
+    # Read EVERY parquet in each month dir — classic single `part.parquet` AND the periodic-build
+    # `part-NNNNN.parquet` flush files (which accumulate within a month). Both layouts load the same.
+    parts = sorted(glob.glob(os.path.join(store_dir, "ym=*", "*.parquet")))
     if not parts:
         raise FileNotFoundError(f"empty screener metric store: {store_dir}")
     df = pd.concat((pd.read_parquet(p) for p in parts), ignore_index=True)
