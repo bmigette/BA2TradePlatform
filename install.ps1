@@ -5,8 +5,16 @@ param(
   [switch]$TradeOnly,   # only build the trade venv (ba2-trade)
   [switch]$TestOnly,    # only build the test venv (ba2-test)
   [string]$BasePath,    # base folder for the venvs (default: home). Venvs live OUTSIDE the repo.
-  [string]$Python      # force ONE interpreter for both venvs (default: per-app, see below)
+  [string]$Python,     # force ONE interpreter for both venvs (default: per-app, see below)
+  [switch]$NoDb         # skip the DB step (copy old DB -> new location + run migrations)
 )
+# DB step (after the venvs are built): for each platform, if the app's DB is NOT yet at its
+# current (consolidated) location, copy a pre-existing OLD DB there (the OLD file is left in
+# place as a backup), then apply that platform's migrations to the target. Paths derive from
+# BA2_HOME (default ~/Documents/ba2) and are overridable via env:
+#   $env:BA2_OLD_TRADE_DB (default ~/Documents/ba2_trade_platform/db.sqlite)
+#   $env:BA2_OLD_TEST_DB  (default ~/Documents/ba2_ml_test_platform/dl_forecasting.db)
+# Migrations are idempotent (alembic upgrade head / db_migrate runner) — safe to re-run.
 # Self-contained monorepo install: EVERYTHING ships from THIS repo (BA2TradePlatform) — the chain
 # packages (packages/common -> providers -> experts), the trade app (repo root) and the test app
 # (testplatform/). NO external git / sibling clones are referenced.
@@ -132,6 +140,53 @@ if ($doTest) {
     } else {
       Write-Host ">> npm not found — skipping frontend deps (install Node.js, then 'npm install' in $fe)"
     }
+  }
+}
+
+# ---- DB step: copy a pre-existing OLD db to the app's current location (keep source as a
+#      backup) + apply that platform's migrations to the target. Idempotent / safe to re-run.
+$Ba2Home    = if ($env:BA2_HOME) { $env:BA2_HOME } else { Join-Path $HOME "Documents\ba2" }
+$OldTradeDb = if ($env:BA2_OLD_TRADE_DB) { $env:BA2_OLD_TRADE_DB } else { Join-Path $HOME "Documents\ba2_trade_platform\db.sqlite" }
+$OldTestDb  = if ($env:BA2_OLD_TEST_DB)  { $env:BA2_OLD_TEST_DB }  else { Join-Path $HOME "Documents\ba2_ml_test_platform\dl_forecasting.db" }
+$NewTradeDb = Join-Path $Ba2Home "trade\db.sqlite"
+$NewTestDb  = Join-Path $Ba2Home "test\dl_forecasting.db"
+
+function Copy-DbIfNeeded {
+  param([string]$Label, [string]$Old, [string]$New)
+  $dir = Split-Path -Parent $New
+  if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+  if (Test-Path $New) {
+    Write-Host ">> $Label`: target DB already at $New — keeping it (no copy)"
+  } elseif ((Test-Path $Old) -and ($Old -ne $New)) {
+    Write-Host ">> $Label`: copying $Old -> $New (source left in place as backup)"
+    Copy-Item -Path $Old -Destination $New
+  } else {
+    Write-Host ">> $Label`: no old DB at $Old — target created on first app run"
+  }
+}
+
+if (-not $NoDb -and $doTrade) {
+  Write-Host "==== TRADE DB ===="
+  Copy-DbIfNeeded -Label "TRADE" -Old $OldTradeDb -New $NewTradeDb
+  if (Test-Path $NewTradeDb) {
+    $al = Join-Path $VenvRoot "trade\Scripts\alembic.exe"; if (-not (Test-Path $al)) { $al = Join-Path $VenvRoot "trade\bin\alembic" }
+    Write-Host ">> migrating TRADE db -> head ($NewTradeDb)"
+    $env:BA2_DB_FILE = $NewTradeDb
+    Push-Location $Here; & $al upgrade head; $rc = $LASTEXITCODE; Pop-Location
+    Remove-Item Env:\BA2_DB_FILE -ErrorAction SilentlyContinue
+    if ($rc -eq 0) { Write-Host ">> TRADE migrations applied" } else { Write-Host ">> TRADE migration FAILED (rc=$rc) — continuing" }
+  }
+}
+if (-not $NoDb -and $doTest) {
+  Write-Host "==== TEST DB ===="
+  Copy-DbIfNeeded -Label "TEST" -Old $OldTestDb -New $NewTestDb
+  if (Test-Path $NewTestDb) {
+    $pyv = Join-Path $VenvRoot "test\Scripts\python.exe"; if (-not (Test-Path $pyv)) { $pyv = Join-Path $VenvRoot "test\bin\python" }
+    Write-Host ">> migrating TEST db ($NewTestDb)"
+    $env:DATABASE_PATH = $NewTestDb
+    Push-Location (Join-Path $Here "testplatform\backend"); & $pyv "scripts\migrate_db.py"; $rc = $LASTEXITCODE; Pop-Location
+    Remove-Item Env:\DATABASE_PATH -ErrorAction SilentlyContinue
+    if ($rc -eq 0) { Write-Host ">> TEST migrations applied" } else { Write-Host ">> TEST migration FAILED (rc=$rc) — continuing" }
   }
 }
 
