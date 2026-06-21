@@ -115,6 +115,24 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str) -> Dict[str, Any]
                 "fatal": fatal}
 
 
+def _resolve_workers(db: Any, worker_ids: Optional[list]) -> list:
+    """Resolve selected worker ids -> plain dicts ``{id,name,url,password}`` for the dispatchers.
+
+    Only enabled, non-local workers are eligible (the local machine is always a worker via the
+    pool). Returns [] when nothing is selected -> the handler keeps the local-only path. Plain
+    dicts (not ORM rows) so they can cross into the dispatcher threads without a session.
+    """
+    if not worker_ids:
+        return []
+    from app.models import Worker
+    rows = (db.query(Worker)
+            .filter(Worker.id.in_(list(worker_ids)),
+                    Worker.is_local == False,  # noqa: E712
+                    Worker.is_enabled == True)  # noqa: E712
+            .all())
+    return [{"id": w.id, "name": w.name, "url": w.url, "password": w.password} for w in rows]
+
+
 def _fail(opt_id: int, db: Any, msg: str) -> Dict[str, Any]:
     """Mark the StrategyOptimization row failed + return the failure dict."""
     logger.error(f"strategy_optimization {opt_id} failed: {msg}")
@@ -474,21 +492,22 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 initargs=(_BACKEND_DIR, _env),
             )
             try:
-                from app.services.distributed_eval import (
-                    DistributedEvaluator, has_online_remote_workers,
-                )
-                _distribute = has_online_remote_workers(db)
+                _workers = _resolve_workers(db, opt.worker_ids)
             except Exception as e:  # noqa: BLE001 — distribution is optional; never block a run
-                logger.warning(f"distributed-worker check failed, running local-only: {e}")
-                _distribute = False
-            if _distribute:
+                logger.warning(f"worker resolution failed, running local-only: {e}")
+                _workers = []
+            if _workers:
+                from app.services.distributed_eval import DistributedEvaluator
+                from app.services.self_update import get_version_info
+                _master_commit = get_version_info().get("git_commit")
                 _evaluator = DistributedEvaluator(
                     _pool, opt.fitness_metric, parallel, opt_id,
+                    workers=_workers, master_commit=_master_commit,
                 )
-                _evaluator.start()
+                _evaluator.start()  # pre-flight: version-match + cache-push each worker
                 batch_fitness = make_batch_fitness(_evaluator.execute_jobs)
-                logger.info(f"strategy_optimization {opt_id}: DISTRIBUTED mode "
-                            f"(remote workers online; master + remotes share trials)")
+                logger.warning(f"strategy_optimization {opt_id}: DISTRIBUTED across "
+                               f"{len(_workers)} selected worker(s) + local")
             else:
                 batch_fitness = make_batch_fitness(_local_execute_jobs)
         try:

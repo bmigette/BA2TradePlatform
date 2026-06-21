@@ -452,6 +452,9 @@ class OptimizeRequest(BaseModel):
     # separate rm: namespace. The handler folds these into the model:* search space and the RM
     # reads them off the expert. Shape: {param: {optimize: bool, min, max, step, type}}.
     expert_params: Optional[dict] = None     # {param:{optimize,min,max,step,type}}
+    # Distributed execution: remote Worker ids to fan trials out to (the master is always a
+    # worker too). Empty/omitted = local only.
+    worker_ids: Optional[List[int]] = None
     # SCREENER-settings optimization (OPTIONAL — omit for a static/explicit universe). When
     # present, this is woven into the optimization in two places, exactly like the CLI
     # (_cmd_optimize --screener):
@@ -492,14 +495,6 @@ async def optimize_strategy(
     if req.screener_opt is not None:
         _merge_screener_opt(cfg, req.screener_opt)
 
-    row = StrategyOptimization(
-        strategy_id=strategy_id,
-        name=req.name,
-        fitness_metric=req.fitness_metric,
-        optimization_type=req.optimization_type,
-        optimization_config=cfg,
-        status="pending",
-    )
     row, task_id = _enqueue_optimization(
         db,
         strategy_id=strategy_id,
@@ -507,6 +502,7 @@ async def optimize_strategy(
         fitness_metric=req.fitness_metric,
         optimization_type=req.optimization_type,
         cfg=cfg,
+        worker_ids=req.worker_ids,
         description=f"Joint genetic optimization for strategy {strategy_id}",
         task_name=req.name or f"Optimize strategy {strategy.name} ({req.fitness_metric})",
     )
@@ -523,6 +519,7 @@ def _enqueue_optimization(
     cfg: dict,
     description: str,
     task_name: str,
+    worker_ids: Optional[List[int]] = None,
 ):
     """Persist ONE StrategyOptimization row and enqueue its 'strategy_optimization' task.
 
@@ -536,6 +533,7 @@ def _enqueue_optimization(
         fitness_metric=fitness_metric,
         optimization_type=optimization_type,
         optimization_config=cfg,
+        worker_ids=(worker_ids or None),
         status="pending",
     )
     db.add(row)
@@ -574,6 +572,7 @@ class OptimizeBatchRequest(BaseModel):
     optimization_config: dict                # GA params + backtest{} template (experts injected per job)
     expert_params: Optional[dict] = None     # applied to every job (incl. RM genes by real ba2 name)
     screener_opt: Optional[dict] = None      # applied to every job (see OptimizeRequest.screener_opt)
+    worker_ids: Optional[List[int]] = None   # remote workers for every job (empty = local only)
     name_prefix: Optional[str] = None        # job name = f"{name_prefix}-{expert}" (default "batch")
 
 
@@ -626,6 +625,7 @@ async def optimize_batch(req: OptimizeBatchRequest, db: Session = Depends(get_db
             fitness_metric=req.fitness_metric,
             optimization_type=req.optimization_type,
             cfg=cfg,
+            worker_ids=req.worker_ids,
             description=f"Batch optimization ({expert}) for strategy {req.strategy_id}",
             task_name=job_name,
         )

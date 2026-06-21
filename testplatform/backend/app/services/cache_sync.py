@@ -1,4 +1,4 @@
-"""HTTP cache synchronisation — the "avoid redownload" core for remote workers.
+"""Cache mirroring primitives — the "avoid redownload" core for remote workers.
 
 Everything under ``CACHE_FOLDER`` is immutable provider history (OHLCV parquet, fmp_history,
 the screener metric_store + fundamentals, the options/screener sqlite caches). It is therefore
@@ -6,18 +6,22 @@ safe to sync ONE-WAY master -> worker: a worker mirrors the master's cache and t
 hermetic backtest with zero provider/network calls (the backtest contract raises
 ``BacktestCacheMiss`` rather than fetching).
 
-This module is both the SERVER side (``build_manifest`` / ``safe_resolve``, used by
-``app/api/cache_sync.py``) and the worker CLIENT side (``sync_cache``, used by
-``ba2-test worker`` / ``ba2-test sync-cache``). Dedup is by ``(rel_path, size)`` — immutable
-history means a size match is an identity match, so re-syncs only fetch genuinely new files.
+PUSH model: the MASTER builds the list of files a worker is missing (``diff_missing`` against the
+worker's manifest) and streams them as ONE tar (``iter_tar``); the WORKER extracts that stream
+(``extract_tar``). ``build_manifest`` / ``safe_resolve`` are used on both ends. Dedup is by
+``(rel_path, size)`` — immutable history means a size match is an identity match, so re-pushes
+only send genuinely new files.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import shutil
+import tarfile
+import threading
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Iterable, Iterator, List, Optional
 
 from ba2_common.config import CACHE_FOLDER
 
@@ -83,80 +87,91 @@ def safe_resolve(rel_path: str, root: Optional[str] = None) -> Path:
 
 
 # --------------------------------------------------------------------------------------------
-# Worker CLIENT side
+# Push primitives (tar stream)
 # --------------------------------------------------------------------------------------------
-def sync_cache(master_url: str, token: str, dest: Optional[str] = None,
-               max_workers: int = 8, log: Callable[[str], None] = logger.info) -> dict:
-    """Mirror the master's cache into *dest* (default local ``CACHE_FOLDER``).
+def diff_missing(local_files: List[dict], remote_manifest: dict) -> List[str]:
+    """Return the rel_paths present in *local_files* that the remote is missing or has at a
+    different size (immutable history ⇒ size match = identity match). *local_files* and
+    ``remote_manifest['files']`` are manifest entries (``{rel_path, size, ...}``)."""
+    remote = {f["rel_path"]: f["size"] for f in remote_manifest.get("files", [])}
+    return [f["rel_path"] for f in local_files if remote.get(f["rel_path"]) != f["size"]]
 
-    Fetches the master manifest, downloads only files that are missing locally or whose size
-    differs (immutable history ⇒ size-match = skip), in parallel, with atomic temp+rename so an
-    interrupted download never leaves a half file that a later size-check would treat as
-    complete. Returns ``{total, downloaded, skipped, bytes, failed}``.
+
+def iter_tar(rel_paths: Iterable[str], root: Optional[str] = None,
+             chunk: int = 1 << 20) -> Iterator[bytes]:
+    """Yield a single uncompressed tar STREAM of *rel_paths* (resolved under *root*).
+
+    Truly streaming: a background thread writes the tar to an OS pipe while this generator reads
+    + yields from the other end, so an arbitrarily large file (e.g. the options sqlite) never
+    buffers fully in memory. Each member is stored under its rel_path (traversal-guarded via
+    ``safe_resolve``). Cache parquet is already compressed, so the tar is uncompressed for speed.
     """
-    import httpx
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    base = cache_root(root)
+    paths = [p for p in rel_paths]
+    r_fd, w_fd = os.pipe()
 
-    base_url = master_url.rstrip("/")
-    dest_root = Path(dest or CACHE_FOLDER)
-    headers = {"Authorization": f"Bearer {token}"}
-
-    with httpx.Client(timeout=60.0) as client:
-        resp = client.get(f"{base_url}/api/cache/manifest", headers=headers)
-        resp.raise_for_status()
-        manifest = resp.json()
-
-    files = manifest.get("files", [])
-    todo = []
-    for f in files:
-        local = dest_root / f["rel_path"]
+    def _build() -> None:
         try:
-            up_to_date = local.is_file() and local.stat().st_size == f["size"]
-        except OSError:
-            up_to_date = False
-        if not up_to_date:
-            todo.append(f)
+            with os.fdopen(w_fd, "wb") as wf:
+                with tarfile.open(fileobj=wf, mode="w|") as tar:
+                    for rel in paths:
+                        try:
+                            p = safe_resolve(rel, str(base))
+                        except ValueError:
+                            continue
+                        if p.is_file():
+                            tar.add(str(p), arcname=rel, recursive=False)
+        except (OSError, BrokenPipeError):
+            pass  # reader went away; nothing more to do
 
-    log(f"cache sync: {len(files)} files on master, {len(todo)} to download "
-        f"({manifest.get('total_bytes', 0) / 1e6:.0f} MB total)")
+    t = threading.Thread(target=_build, daemon=True, name="cache-tar-build")
+    t.start()
+    try:
+        with os.fdopen(r_fd, "rb") as rf:
+            while True:
+                data = rf.read(chunk)
+                if not data:
+                    break
+                yield data
+    finally:
+        # Always join, even if the consumer abandons the generator early or raises (the build
+        # thread sees BrokenPipe when the read end closes, so this won't hang).
+        t.join()
 
-    downloaded = 0
-    bytes_dl = 0
-    failed: List[dict] = []
 
-    def _download(f: dict) -> int:
-        local = safe_resolve(f["rel_path"], str(dest_root))
-        local.parent.mkdir(parents=True, exist_ok=True)
-        tmp = local.with_name(local.name + ".part")
-        with httpx.Client(timeout=600.0) as client:
-            with client.stream("GET", f"{base_url}/api/cache/download",
-                               params={"path": f["rel_path"]}, headers=headers) as r:
-                r.raise_for_status()
-                with open(tmp, "wb") as fh:
-                    for chunk in r.iter_bytes(1 << 20):
-                        fh.write(chunk)
-        os.replace(tmp, local)  # atomic on same filesystem
-        return f["size"]
+def extract_tar(fileobj, dest: Optional[str] = None) -> dict:
+    """Extract a tar STREAM (*fileobj*, a binary readable) into *dest* (default ``CACHE_FOLDER``).
 
-    if todo:
-        with ThreadPoolExecutor(max_workers=max(1, max_workers)) as ex:
-            futs = {ex.submit(_download, f): f for f in todo}
-            n = 0
-            for fut in as_completed(futs):
-                f = futs[fut]
-                try:
-                    bytes_dl += fut.result()
-                    downloaded += 1
-                except Exception as e:  # noqa: BLE001 — one bad file must not abort the sync
-                    failed.append({"path": f["rel_path"], "error": str(e)})
-                n += 1
-                if n % 50 == 0 or n == len(todo):
-                    log(f"cache sync: {n}/{len(todo)} downloaded ({len(failed)} failed)")
-
-    return {
-        "total": len(files),
-        "downloaded": downloaded,
-        "skipped": len(files) - len(todo),
-        "bytes": bytes_dl,
-        "failed": failed,
-    }
+    Streaming read (``mode='r|'``). Every member path is traversal-guarded via ``safe_resolve``
+    (a malicious ``../`` member is skipped, not written outside the cache). Atomic temp+rename per
+    file. Returns ``{extracted, bytes, skipped}``.
+    """
+    dest_root = cache_root(dest)
+    dest_root.mkdir(parents=True, exist_ok=True)
+    extracted = 0
+    total = 0
+    skipped = 0
+    with tarfile.open(fileobj=fileobj, mode="r|") as tar:
+        for member in tar:
+            if not member.isfile():
+                continue
+            try:
+                target = safe_resolve(member.name, str(dest_root))
+            except ValueError:
+                skipped += 1
+                continue
+            src = tar.extractfile(member)
+            if src is None:
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            tmp = target.with_name(target.name + ".part")
+            try:
+                with open(tmp, "wb") as out:
+                    shutil.copyfileobj(src, out, 1 << 20)
+                os.replace(tmp, target)
+            except BaseException:
+                tmp.unlink(missing_ok=True)  # never orphan a .part on disk-full / I/O error
+                raise
+            extracted += 1
+            total += member.size
+    return {"extracted": extracted, "bytes": total, "skipped": skipped}

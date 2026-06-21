@@ -32,6 +32,7 @@ class WorkerCreate(BaseModel):
     description: Optional[str] = None
     workerType: str = "remote"
     capabilities: WorkerCapabilities = WorkerCapabilities()
+    password: Optional[str] = None  # write-only; the master sends it to authenticate to the worker
 
 
 class WorkerUpdate(BaseModel):
@@ -40,6 +41,7 @@ class WorkerUpdate(BaseModel):
     description: Optional[str] = None
     capabilities: Optional[WorkerCapabilities] = None
     isEnabled: Optional[bool] = None
+    password: Optional[str] = None  # write-only; omit to leave unchanged
 
 
 class GpuInfo(BaseModel):
@@ -60,6 +62,7 @@ class WorkerResponse(BaseModel):
     description: Optional[str]
     workerType: str
     capabilities: dict
+    hasPassword: bool = False
     isEnabled: bool
     isLocal: bool
     status: str
@@ -105,6 +108,11 @@ def get_local_hardware_info():
         pass
 
     return cpu_info, gpu_info
+
+
+def _worker_dict(worker: Worker) -> dict:
+    """Plain dict the master-side ``worker_client`` uses (carries the per-worker password)."""
+    return {"id": worker.id, "name": worker.name, "url": worker.url, "password": worker.password}
 
 
 def ensure_local_worker(db: Session):
@@ -156,6 +164,7 @@ async def create_worker(worker: WorkerCreate, db: Session = Depends(get_db)):
         description=worker.description,
         worker_type=worker.workerType,
         capabilities=worker.capabilities.dict(),
+        password=worker.password,
         is_enabled=True,
         is_local=False,
         status="offline"
@@ -197,6 +206,9 @@ async def update_worker(worker_id: int, updates: WorkerUpdate, db: Session = Dep
         worker.capabilities = updates.capabilities.dict()
     if updates.isEnabled is not None:
         worker.is_enabled = updates.isEnabled
+    if updates.password is not None:
+        # Empty string clears the password; any other value sets it.
+        worker.password = updates.password or None
 
     db.commit()
     db.refresh(worker)
@@ -332,29 +344,23 @@ async def health_check_worker(worker_id: int, db: Session = Depends(get_db)):
             "cpuInfo": cpu_info
         }
 
-    # For remote workers, attempt to connect
-    import httpx
+    # For remote workers, call the worker's /health with its password (push-model worker server).
+    from app.services import worker_client
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.get(f"{worker.url}/health")
-            if response.status_code == 200:
-                data = response.json()
-                worker.status = "online"
-                worker.last_heartbeat = datetime.utcnow()
-                if "gpuInfo" in data:
-                    worker.gpu_info = data["gpuInfo"]
-                if "cpuInfo" in data:
-                    worker.cpu_info = data["cpuInfo"]
-                db.commit()
-                return {"status": "online", "message": "Worker is healthy", **data}
+        data = worker_client.health(_worker_dict(worker), timeout=5.0)
+        worker.status = "online"
+        worker.last_heartbeat = datetime.utcnow()
+        # The worker reports {cpu, gpu, capacity, version}; mirror hardware onto the row.
+        if data.get("cpu"):
+            worker.cpu_info = data["cpu"]
+        if data.get("gpu"):
+            worker.gpu_info = data["gpu"]
+        db.commit()
+        return {"status": "online", "message": "Worker is healthy", **data}
     except Exception as e:
         worker.status = "offline"
         db.commit()
         return {"status": "offline", "message": str(e)}
-
-    worker.status = "offline"
-    db.commit()
-    return {"status": "offline", "message": "Worker health check failed"}
 
 
 @router.post("/export", response_model=WorkerExport)
@@ -407,3 +413,33 @@ async def import_workers(data: WorkerExport, db: Session = Depends(get_db)):
     logger.info(f"Imported {imported} workers")
 
     return {"message": f"Imported {imported} workers", "count": imported}
+
+
+@router.post("/{worker_id}/sync-cache")
+async def sync_worker_cache(worker_id: int, db: Session = Depends(get_db)):
+    """Push the master's cache (diff, as one tar stream) to a remote worker."""
+    worker = db.query(Worker).filter(Worker.id == worker_id).first()
+    if not worker:
+        raise HTTPException(status_code=404, detail="Worker not found")
+    if worker.is_local:
+        return {"status": "skipped", "message": "Local worker shares the master cache"}
+    from app.services import worker_client
+    try:
+        res = worker_client.push_cache(_worker_dict(worker))
+        return {"status": "ok", **res}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"cache push failed: {e}")
+
+
+@router.post("/{worker_id}/update")
+async def update_worker_code(worker_id: int, db: Session = Depends(get_db)):
+    """Bring a remote worker's code up to the master's version (git pull + reinstall + restart)."""
+    worker = db.query(Worker).filter(Worker.id == worker_id).first()
+    if not worker:
+        raise HTTPException(status_code=404, detail="Worker not found")
+    if worker.is_local:
+        return {"status": "skipped", "message": "Local worker updates with the master"}
+    from app.services import worker_client, self_update
+    master_commit = self_update.get_version_info().get("git_commit")
+    ok = worker_client.ensure_synced(_worker_dict(worker), master_commit, max_wait=180.0)
+    return {"status": "ok" if ok else "failed", "synced": ok, "masterCommit": master_commit}

@@ -57,8 +57,8 @@ import { GeneCountPreview } from '../components/GeneCountPreview';
 import { RunHistoryTable } from '../components/RunHistoryTable';
 import ResolvedRulesetView from '../components/ResolvedRulesetView';
 import type { BestParams } from '../lib/resolveRuleset';
-import { getRulesetVocabulary, importLiveEnterMarket, importLiveRuleset, convertLiveRuleset, listTasks, listBacktests, fetchOptSettingsExport, listExperts, optimizeBatch, listRunningOptimizations, fetchBacktestExport } from '../lib/btApi';
-import type { ExpertInfo, OptimizeBatchJob, OptimizeBatchBody, RunningOpt } from '../lib/btApi';
+import { getRulesetVocabulary, importLiveEnterMarket, importLiveRuleset, convertLiveRuleset, listTasks, listBacktests, fetchOptSettingsExport, listExperts, optimizeBatch, listRunningOptimizations, fetchBacktestExport, listWorkers } from '../lib/btApi';
+import type { ExpertInfo, OptimizeBatchJob, OptimizeBatchBody, RunningOpt, WorkerLite } from '../lib/btApi';
 import { RunningJobsPanel } from '../components/RunningJobsPanel';
 import { OptimizationJobsTable, OptJobSettingsDetail } from '../components/OptimizationJobsTable';
 import { TopIndividualsTable } from '../components/TopIndividualsTable';
@@ -575,6 +575,9 @@ const Backtesting: React.FC = () => {
   const [optSeed, setOptSeed] = useState(42);
   const [launchingOpt, setLaunchingOpt] = useState(false);
   const [optNotice, setOptNotice] = useState<string | null>(null);
+  // Distributed workers to fan trials out to (the master is always a worker too; empty = local).
+  const [availableWorkers, setAvailableWorkers] = useState<WorkerLite[]>([]);
+  const [selectedWorkerIds, setSelectedWorkerIds] = useState<Set<number>>(new Set());
 
   // Optimize-batch dialog (P3.8): launch one optimization per selected expert against the loaded
   // strategy, reusing the same GA config + fitness + screener_opt assembly as runOptimization.
@@ -591,6 +594,51 @@ const Backtesting: React.FC = () => {
     if (!showBatchDialog || batchExperts.length) return;
     listExperts().then(setBatchExperts).catch(() => setBatchExperts([]));
   }, [showBatchDialog, batchExperts.length]);
+  // Load configured remote workers when either optimize dialog opens (for the worker multi-select).
+  useEffect(() => {
+    if (!showOptimizeDialog && !showBatchDialog) return;
+    listWorkers().then(setAvailableWorkers).catch(() => setAvailableWorkers([]));
+  }, [showOptimizeDialog, showBatchDialog]);
+
+  // Worker multi-select shared by the single + batch optimize dialogs. None selected => local only.
+  const renderWorkerSelector = () => (
+    <div className="border border-gray-200 dark:border-gray-700 rounded-lg p-3 space-y-2">
+      <h4 className="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
+        Distributed workers
+      </h4>
+      {availableWorkers.length === 0 ? (
+        <p className="text-xs text-gray-500 dark:text-gray-400">
+          No remote workers configured (add them in Settings → Workers). Trials run on this machine only.
+        </p>
+      ) : (
+        <>
+          <div className="flex flex-wrap gap-2">
+            {availableWorkers.map(w => {
+              const on = selectedWorkerIds.has(w.id);
+              return (
+                <button key={w.id} type="button"
+                  onClick={() => setSelectedWorkerIds(prev => {
+                    const next = new Set(prev);
+                    if (next.has(w.id)) next.delete(w.id); else next.add(w.id);
+                    return next;
+                  })}
+                  className={`px-2 py-1 text-xs rounded border ${on
+                    ? 'bg-blue-500 text-white border-blue-500'
+                    : 'bg-white dark:bg-gray-700 text-gray-700 dark:text-gray-300 border-gray-300 dark:border-gray-600'}`}>
+                  {w.name}{!w.isEnabled ? ' (disabled)' : ''}
+                </button>
+              );
+            })}
+          </div>
+          <p className="text-xs text-gray-500 dark:text-gray-400">
+            {selectedWorkerIds.size
+              ? `${selectedWorkerIds.size} worker(s) + this machine. Cache is pushed & versions matched before trials run.`
+              : 'None selected → runs on this machine only.'}
+          </p>
+        </>
+      )}
+    </div>
+  );
 
   const runBatchOptimization = async () => {
     if (loadedStrategyId == null) { setBatchNotice('Load or save a strategy first.'); return; }
@@ -627,6 +675,7 @@ const Backtesting: React.FC = () => {
           backtest: backtestBlock,
         },
         name_prefix: `Batch ${loadedStrategyName}`,
+        ...(selectedWorkerIds.size ? { worker_ids: [...selectedWorkerIds] } : {}),
       };
       if (universe.mode === 'screener' && universe.screener_param_ranges
           && Object.values(universe.screener_param_ranges).some(r => r.optimize)) {
@@ -1727,6 +1776,7 @@ const Backtesting: React.FC = () => {
           seed: optSeed,
           backtest: backtestBlock,
         },
+        ...(selectedWorkerIds.size ? { worker_ids: [...selectedWorkerIds] } : {}),
       };
 
       // Screener-settings optimization (P1.4): only when the universe is a screener AND at least
@@ -3494,6 +3544,8 @@ const Backtesting: React.FC = () => {
                   </div>
                 )}
 
+                {renderWorkerSelector()}
+
                 <p className="text-xs text-gray-500 dark:text-gray-400">
                   Backtest window {startDate} → {endDate}, capital ${initialCapital.toLocaleString()},
                   engine {selectedModel ? 'ML (model-driven)' : 'daily expert (multi-asset)'}.
@@ -3599,6 +3651,7 @@ const Backtesting: React.FC = () => {
                   ))}
                 </div>
               )}
+              <div className="mb-3">{renderWorkerSelector()}</div>
               <div className="flex justify-end gap-3">
                 <button onClick={() => setShowBatchDialog(false)}
                   className="px-4 py-2 bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600">

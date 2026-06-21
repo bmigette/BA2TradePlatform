@@ -24,6 +24,10 @@ class Worker(Base):
     worker_type = Column(String(20), default="remote")  # "local" or "remote"
     capabilities = Column(JSON, default={"train": True, "infer": True})
 
+    # Per-worker auth password — the master sends it (bearer) to authenticate to this worker's
+    # HTTP server. Write-only via the API: to_dict() exposes only ``hasPassword``, never the value.
+    password = Column(String(255), nullable=True)
+
     # Status
     is_enabled = Column(Boolean, default=True)
     is_local = Column(Boolean, default=False)
@@ -51,6 +55,7 @@ class Worker(Base):
             "description": self.description,
             "workerType": self.worker_type,
             "capabilities": self.capabilities,
+            "hasPassword": bool(self.password),
             "isEnabled": self.is_enabled,
             "isLocal": self.is_local,
             "status": self.status,

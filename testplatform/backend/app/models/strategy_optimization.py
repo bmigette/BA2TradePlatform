@@ -31,6 +31,9 @@ class StrategyOptimization(Base):
     best_fitness = Column(Float, nullable=True)
     all_results = Column(JSON, nullable=True)  # All tested combinations with fitness
 
+    # Distributed execution: remote Worker ids selected for this run (empty/None = local only).
+    worker_ids = Column(JSON, nullable=True)
+
     # Progress
     progress = Column(Float, default=0)
     error_message = Column(String(1000), nullable=True)
@@ -54,6 +57,7 @@ class StrategyOptimization(Base):
             "fitnessMetric": self.fitness_metric,
             "optimizationType": self.optimization_type,
             "optimizationConfig": self.optimization_config,
+            "workerIds": self.worker_ids,
             "parameterRanges": self.parameter_ranges,
             "bestParams": self.best_params,
             "bestFitness": self.best_fitness,

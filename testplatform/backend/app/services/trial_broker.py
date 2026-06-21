@@ -1,19 +1,14 @@
-"""In-memory trial broker — fans individual GA trials out to local + remote consumers.
+"""In-memory trial broker — fans a generation's GA trials out to local + remote consumers.
 
-The strategy-optimization handler runs IN-PROCESS on the FastAPI MainTaskQueue thread, so this
-broker singleton (``get_broker()``) is shared with the HTTP worker endpoints with no IPC: the
-GA coordinator ``submit``s a generation's trials, then BOTH the master's local consumer threads
-(``distributed_eval.DistributedEvaluator``) AND remote workers (``/api/worker/claim-trial``)
+Each ``DistributedEvaluator`` owns ONE broker instance (per-optimization isolation — the
+strategy_optimization task queue runs up to 4 concurrently). The GA coordinator ``submit``s a
+generation's trials, then the master's local consumer threads AND remote dispatcher threads
 atomically ``claim`` from the same queue — so no trial is ever evaluated twice. Results
 (``post_result``) are keyed by trial id; the coordinator reassembles them in GA input order.
 
 Determinism is preserved because a trial config is hermetic + seeded: its fitness is identical
-no matter WHICH host runs it. ``requeue_stale`` puts a claimed-but-never-answered trial (dead
-worker) back on the queue for fault tolerance.
-
-Only ONE optimization runs at a time (the strategy_optimization task queue is max_workers=1),
-but trial ids are unique (uuid4) and every structure is keyed per optimization, so a future
-concurrent run would not collide and ``clear(optimization_id)`` scopes cleanup.
+no matter WHICH host runs it. ``requeue_one`` (a failed remote worker) and ``requeue_stale`` (a
+vanished worker) return a claimed trial to the queue for fault tolerance.
 """
 
 from __future__ import annotations
@@ -84,6 +79,17 @@ class TrialBroker:
                     return {}
                 self._cv.wait(remaining)
 
+    def requeue_one(self, trial_id: str) -> bool:
+        """Move a specific claimed trial back to the FRONT of pending (e.g. a remote worker that
+        failed mid-trial). Returns False if it wasn't claimed or already has a result."""
+        with self._cv:
+            claim = self._claimed.pop(trial_id, None)
+            if claim is None or trial_id in self._seen:
+                return False
+            self._pending.appendleft(claim["trial"])
+            self._cv.notify_all()
+            return True
+
     def requeue_stale(self, claim_timeout: float = 300.0) -> int:
         """Re-queue trials claimed longer than *claim_timeout* ago (dead worker). Returns count."""
         now = time.time()
@@ -117,16 +123,3 @@ class TrialBroker:
                 self._results.pop(tid, None)
                 self._seen.discard(tid)
                 self._opt_of.pop(tid, None)
-
-
-_broker: Optional[TrialBroker] = None
-_broker_lock = threading.Lock()
-
-
-def get_broker() -> TrialBroker:
-    """Process-wide broker singleton (shared by the GA coordinator and the HTTP endpoints)."""
-    global _broker
-    with _broker_lock:
-        if _broker is None:
-            _broker = TrialBroker()
-        return _broker

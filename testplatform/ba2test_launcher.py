@@ -1090,13 +1090,16 @@ def _cmd_optimize(args) -> int:
                               else {**spec["expert_params"], **_RM_OPT, **screener_genes}),
             "backtest": backtest_block,
         }
+        _worker_ids = _worker_ids_from_args(args)
         opt = StrategyOptimization(
             strategy_id=strat.id, name=args.name or f"opt-{expert}",
             fitness_metric=args.fitness, optimization_type="genetic",
-            optimization_config=cfg, status="pending",
+            optimization_config=cfg, worker_ids=(_worker_ids or None), status="pending",
         )
         db.add(opt); db.commit(); db.refresh(opt)
         opt_id = opt.id
+        if _worker_ids:
+            print(f"optimize: distributing across worker ids {_worker_ids} + local")
         print(f"optimize: strategy #{strat.id} + StrategyOptimization #{opt_id} "
               f"({expert} x {len(universe)} syms, pop={args.population} gen={args.generations} "
               f"parallel={args.parallel} fitness={args.fitness})")
@@ -1161,6 +1164,9 @@ def _cmd_optimize_batch(args) -> int:
 
     experts = [e.strip() for e in args.experts.split(",") if e.strip()]
     strategies = [s.strip() for s in args.strategies.split(",") if s.strip()]
+    batch_worker_ids = _worker_ids_from_args(args)  # resolved once; applied to every job
+    if batch_worker_ids:
+        print(f"optimize-batch: distributing across worker ids {batch_worker_ids} + local")
     universe = [s.strip().upper() for s in args.universe.split(",") if s.strip()]
     if not universe:
         sys.exit("optimize-batch: --universe must list at least one symbol")
@@ -1236,7 +1242,8 @@ def _cmd_optimize_batch(args) -> int:
             }
             opt = StrategyOptimization(
                 strategy_id=strat.id, name=name, fitness_metric=args.fitness,
-                optimization_type="genetic", optimization_config=cfg, status="pending",
+                optimization_type="genetic", optimization_config=cfg,
+                worker_ids=(batch_worker_ids or None), status="pending",
             )
             db.add(opt); db.commit(); db.refresh(opt)
             opt_id = opt.id
@@ -1493,185 +1500,64 @@ def _cmd_runs(args) -> int:
         db.close()
 
 
-# --- remote worker (distributed GA trials) -------------------------------------------------
-def _worker_token(args) -> str:
-    token = getattr(args, "token", None) or os.getenv("BA2_WORKER_TOKEN") or os.getenv("BA2_ADMIN_TOKEN")
-    if not token:
-        sys.exit("ba2-test: --token or $BA2_WORKER_TOKEN / $BA2_ADMIN_TOKEN is required.")
-    return token
+# --- remote worker (PUSH model: the master dispatches trials to this server) ----------------
+def _resolve_worker_names(names: list) -> list:
+    """Resolve worker NAMES to {id,name,url,password} dicts against the local Worker table.
 
-
-def _maybe_self_update(master_ver: dict, log=print) -> bool:
-    """If this worker's git commit differs from the master's, pull + reinstall + RESTART.
-
-    Distributed trials must run the IDENTICAL code as the master, else a trial's fitness depends
-    on where it ran. ``restart_now`` re-execs the worker and does not return; a one-shot env guard
-    (``BA2_WORKER_TRIED_UPDATE``) prevents an infinite restart loop if the pull can't converge.
-    Returns False when already in sync (or update was skipped).
-    """
-    from app.services import self_update
-    local = self_update.get_version_info()
-    mc = (master_ver or {}).get("git_commit")
-    lc = local.get("git_commit")
-    if not mc or not lc or mc == lc:
-        return False
-    if os.environ.get("BA2_WORKER_TRIED_UPDATE") == mc:
-        log(f"!! self-update did not converge to master {mc} (still {lc}); running anyway")
-        return False
-    log(f">> worker self-update: {lc} -> {mc} (git pull + reinstall + restart)")
+    The CLI runs on the master, so it reads the same DB the serve process configured. Exits if a
+    name is unknown or has no URL/password (a worker must be added in the UI/API first)."""
+    import app.models  # noqa: F401 — register ORM models
+    from app.models.database import SessionLocal, init_db
+    from app.models import Worker
+    init_db()
+    db = SessionLocal()
     try:
-        report = self_update.perform_update()
-        log(f"   pull: {report.get('git_pull')}; reinstalled={report.get('reinstalled')}")
-    except Exception as e:  # noqa: BLE001 — never get stuck; run with a warning
-        log(f"!! self-update failed: {e}; running anyway")
-        return False
-    os.environ["BA2_WORKER_TRIED_UPDATE"] = mc
-    self_update.restart_now()  # re-exec — does not return
-    return True
+        out = []
+        for n in names:
+            w = db.query(Worker).filter(Worker.name == n, Worker.is_local == False).first()  # noqa: E712
+            if not w:
+                sys.exit(f"ba2-test: worker '{n}' not found (add it in Settings/the API first).")
+            out.append({"id": w.id, "name": w.name, "url": w.url, "password": w.password})
+        return out
+    finally:
+        db.close()
+
+
+def _worker_ids_from_args(args) -> list:
+    """Collect --worker (repeatable) + --workers a,b,c into a list of Worker ids (or [])."""
+    names: list = []
+    for n in (getattr(args, "worker", None) or []):
+        names.append(n.strip())
+    if getattr(args, "workers_csv", None):
+        names.extend(s.strip() for s in args.workers_csv.split(",") if s.strip())
+    names = [n for n in names if n]
+    if not names:
+        return []
+    return [w["id"] for w in _resolve_worker_names(names)]
 
 
 def _cmd_sync_cache(args) -> int:
-    """One-shot: mirror the master's immutable cache into the local CACHE_FOLDER."""
-    from app.services import cache_sync
-    token = _worker_token(args)
-    res = cache_sync.sync_cache(args.master.rstrip("/"), token, dest=args.dest,
-                                max_workers=args.workers, log=print)
+    """Push the master's cache (diff, one tar stream) to a configured remote worker."""
+    from app.services import worker_client
+    worker = _resolve_worker_names([args.worker])[0]
+    res = worker_client.push_cache(worker, log=print)
     print(json.dumps(res, indent=2, default=str))
-    return 0 if not res["failed"] else 1
+    return 0
 
 
 def _cmd_worker(args) -> int:
-    """Run a remote worker: register, sync cache, then claim + run GA trials for the master.
+    """Run THIS machine as a remote worker SERVER the master pushes trials to.
 
-    DB-less — it only talks HTTP to the master: claims a trial config, runs the hermetic backtest
-    in its own process pool (all local cores), and posts the fitness back. Syncs the cache up
-    front (and re-syncs once on a cache miss) so it never re-downloads market data, and keeps its
-    code in lock-step with the master (self-update on version mismatch).
+    DB-less: exposes /run-trial (runs the hermetic backtest in a local process pool), /cache/push
+    (receive the master's cache as a tar), /version + /update (stay in lock-step with the master),
+    all gated by --password. The master dispatches trials and pushes cache to it.
     """
-    import multiprocessing as _mp
-    import platform
-    import socket
-    import threading
-    import time
-    from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait as fwait
-
-    import httpx
-
-    from app.services import cache_sync, self_update
-    from app.services.strategy_optimization_handler import (
-        _BACKEND_DIR, _WORKER_ENV_KEYS, _trial_worker, _worker_init,
-    )
-
-    master = args.master.rstrip("/")
-    token = _worker_token(args)
-    name = args.name or socket.gethostname()
+    from app.worker_server import run_worker_server
+    password = args.password or os.getenv("BA2_WORKER_PASSWORD")
+    if not password:
+        sys.exit("ba2-test worker: --password (or $BA2_WORKER_PASSWORD) is required.")
     n_workers = args.workers or max(1, (os.cpu_count() or 2) - 1)
-    headers = {"Authorization": f"Bearer {token}"}
-    log = print
-
-    def _post(path: str, **kw):
-        with httpx.Client(timeout=60.0) as c:
-            return c.post(f"{master}{path}", headers=headers, **kw)
-
-    # 1) Register with the master (returns our worker id + the master's code version).
-    try:
-        r = _post("/api/worker/register", json={
-            "name": name, "capabilities": {"backtest": True},
-            "cpu_info": {"cores": os.cpu_count(), "model": platform.processor() or platform.machine()},
-        })
-        r.raise_for_status()
-    except Exception as e:  # noqa: BLE001
-        sys.exit(f"ba2-test worker: cannot reach master at {master}: {e}")
-    reg = r.json()
-    worker_id = reg["worker_id"]
-    master_ver = reg.get("version") or {}
-    log(f">> registered as worker #{worker_id} '{name}'  master={master_ver.get('git_commit')} "
-        f"local={self_update.get_version_info().get('git_commit')}")
-
-    # 2) Keep code in lock-step with the master (restarts on mismatch unless disabled).
-    if not args.no_self_update:
-        _maybe_self_update(master_ver, log)  # may re-exec and not return
-
-    # 3) Mirror the master's cache so trials run hermetically (no re-download).
-    if not args.no_cache_sync:
-        try:
-            res = cache_sync.sync_cache(master, token, max_workers=args.sync_workers, log=log)
-            log(f">> cache sync: {res['downloaded']} downloaded, {res['skipped']} up-to-date, "
-                f"{len(res['failed'])} failed")
-        except Exception as e:  # noqa: BLE001 — trials will surface a cache miss if data is absent
-            log(f"!! cache sync failed (continuing): {e}")
-
-    # 4) Heartbeat on a timer; auto-update if the master upgrades mid-run.
-    stop = threading.Event()
-    inflight_count = {"n": 0}
-
-    def _heartbeat() -> None:
-        while not stop.wait(args.heartbeat):
-            try:
-                hr = _post("/api/worker/heartbeat",
-                           json={"worker_id": worker_id, "active_jobs": inflight_count["n"]})
-                mv = hr.json().get("version") if hr.status_code == 200 else None
-                if mv and not args.no_self_update:
-                    cur = self_update.get_version_info().get("git_commit")
-                    if mv.get("git_commit") and cur and mv["git_commit"] != cur:
-                        log(f">> master upgraded to {mv['git_commit']}; self-updating...")
-                        _maybe_self_update(mv, log)  # re-execs if it can update
-            except Exception as e:  # noqa: BLE001
-                log(f"!! heartbeat failed: {e}")
-
-    threading.Thread(target=_heartbeat, daemon=True, name="worker-heartbeat").start()
-
-    # 5) Claim + run trials in a process pool (all local cores), posting results back.
-    _env = {k: os.environ[k] for k in _WORKER_ENV_KEYS if os.environ.get(k)}
-    pool = ProcessPoolExecutor(max_workers=n_workers, mp_context=_mp.get_context("spawn"),
-                               initializer=_worker_init, initargs=(_BACKEND_DIR, _env))
-    inflight: dict = {}  # future -> trial job
-    resynced = False
-    log(f">> worker running: {n_workers} processes, claiming trials from {master}")
-    try:
-        while True:
-            # Keep the pool saturated: claim up to n_workers trials in flight.
-            while len(inflight) < n_workers:
-                cr = _post("/api/worker/claim-trial", params={"worker_id": worker_id})
-                if cr.status_code == 204:
-                    break
-                if cr.status_code != 200:
-                    log(f"!! claim failed: {cr.status_code} {cr.text[:160]}")
-                    break
-                job = cr.json()
-                inflight[pool.submit(_trial_worker, job["config"], job["fitness_metric"])] = job
-            inflight_count["n"] = len(inflight)
-            if not inflight:
-                time.sleep(args.poll)
-                continue
-            done, _ = fwait(list(inflight), timeout=args.poll, return_when=FIRST_COMPLETED)
-            for fut in done:
-                job = inflight.pop(fut)
-                try:
-                    out = fut.result()
-                except Exception as e:  # noqa: BLE001
-                    out = {"ok": False, "fitness": 0.0, "trades": 0, "error": repr(e), "fatal": False}
-                try:
-                    _post("/api/worker/trial-result", json={
-                        "trial_id": job["trial_id"], "ok": bool(out["ok"]),
-                        "fitness": float(out["fitness"]), "trades": int(out["trades"]),
-                        "error": out.get("error"), "fatal": bool(out.get("fatal")),
-                    })
-                except Exception as e:  # noqa: BLE001 — master will requeue on stale-claim timeout
-                    log(f"!! trial-result post failed (will be requeued): {e}")
-                if out.get("fatal") and not resynced and not args.no_cache_sync:
-                    log(">> trial hit a cache miss; re-syncing cache once...")
-                    try:
-                        cache_sync.sync_cache(master, token, max_workers=args.sync_workers, log=log)
-                        resynced = True
-                    except Exception as e:  # noqa: BLE001
-                        log(f"!! resync failed: {e}")
-            inflight_count["n"] = len(inflight)
-    except KeyboardInterrupt:
-        log(">> worker stopping (Ctrl-C)")
-    finally:
-        stop.set()
-        pool.shutdown(wait=False, cancel_futures=True)
+    run_worker_server(host=args.host, port=args.port, password=password, n_workers=n_workers)
     return 0
 
 
@@ -1826,6 +1712,10 @@ def main(argv: "list | None" = None) -> int:
                     help="Enqueue on the running serve queue (live in the UI Running-jobs strip) "
                          "instead of running in-process. Submit jobs one at a time to avoid "
                          "process-pool oversubscription (the serve queue has 4 workers).")
+    op.add_argument("--worker", action="append", default=None, metavar="NAME",
+                    help="Remote worker NAME to fan trials out to (repeatable). Default: local only.")
+    op.add_argument("--workers", dest="workers_csv", default=None, metavar="A,B,C",
+                    help="Comma-separated remote worker names (alternative to repeated --worker).")
 
     ob = sub.add_parser("optimize-batch",
                         help="Self-advancing batch: submit each expert's optimization to the serve "
@@ -1855,27 +1745,23 @@ def main(argv: "list | None" = None) -> int:
     ob.add_argument("--run-schedule-day", default="monday")
     ob.add_argument("--name-prefix", default=None, help="Strategy/opt name prefix (default phase1-).")
     ob.add_argument("--poll", type=int, default=15, help="Poll interval seconds (default 15).")
+    ob.add_argument("--worker", action="append", default=None, metavar="NAME",
+                    help="Remote worker NAME to fan trials out to (repeatable). Default: local only.")
+    ob.add_argument("--workers", dest="workers_csv", default=None, metavar="A,B,C",
+                    help="Comma-separated remote worker names (alternative to repeated --worker).")
 
-    # worker: run a remote distributed-trial worker for a master serve instance.
-    wk = sub.add_parser("worker", help="Run a remote worker that claims + runs GA trials for a master.")
-    wk.add_argument("--master", required=True, help="Master base URL, e.g. http://HOST:8000")
-    wk.add_argument("--token", default=None, help="Auth token (else $BA2_WORKER_TOKEN / $BA2_ADMIN_TOKEN).")
-    wk.add_argument("--name", default=None, help="Worker name shown on the master (default: hostname).")
+    # worker: run THIS machine as a worker SERVER the master pushes trials to.
+    wk = sub.add_parser("worker", help="Run a worker server the master pushes GA trials to.")
+    wk.add_argument("--host", default="0.0.0.0", help="Bind host (default 0.0.0.0).")
+    wk.add_argument("--port", type=int, default=8100, help="Worker server port (default 8100).")
+    wk.add_argument("--password", default=None,
+                    help="Auth password the master must present (else $BA2_WORKER_PASSWORD).")
     wk.add_argument("--workers", type=int, default=None,
-                    help="Trial processes (default: CPU count - 1).")
-    wk.add_argument("--poll", type=float, default=1.0, help="Claim/poll interval seconds (default 1).")
-    wk.add_argument("--heartbeat", type=float, default=15.0, help="Heartbeat interval seconds (default 15).")
-    wk.add_argument("--sync-workers", type=int, default=8, help="Parallel cache-download threads (default 8).")
-    wk.add_argument("--no-cache-sync", action="store_true", help="Skip the up-front cache sync.")
-    wk.add_argument("--no-self-update", action="store_true",
-                    help="Do NOT auto git-pull+restart on a version mismatch with the master.")
+                    help="Trial process slots / capacity (default: CPU count - 1).")
 
-    # sync-cache: one-shot mirror of the master's immutable cache into the local CACHE_FOLDER.
-    sc = sub.add_parser("sync-cache", help="Mirror the master's cache locally (no trials).")
-    sc.add_argument("--master", required=True, help="Master base URL, e.g. http://HOST:8000")
-    sc.add_argument("--token", default=None, help="Auth token (else $BA2_WORKER_TOKEN / $BA2_ADMIN_TOKEN).")
-    sc.add_argument("--dest", default=None, help="Destination cache dir (default: local CACHE_FOLDER).")
-    sc.add_argument("--workers", type=int, default=8, help="Parallel download threads (default 8).")
+    # sync-cache: push the master's cache (diff, one tar) to a configured remote worker.
+    sc = sub.add_parser("sync-cache", help="Push the master's cache to a configured worker.")
+    sc.add_argument("--worker", required=True, help="Worker NAME (as configured on the master).")
 
     # Split out the backtest passthrough before full parsing.
     if argv and argv[0] == "backtest":

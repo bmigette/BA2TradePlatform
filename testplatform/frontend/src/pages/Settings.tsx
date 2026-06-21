@@ -30,6 +30,7 @@ interface Worker {
   description: string | null;
   workerType: 'local' | 'remote';
   capabilities: WorkerCapabilities;
+  hasPassword?: boolean;
   isEnabled: boolean;
   isLocal: boolean;
   status: 'online' | 'offline' | 'busy';
@@ -47,6 +48,7 @@ interface WorkerFormData {
   url: string;
   description: string;
   capabilities: WorkerCapabilities;
+  password: string;
 }
 
 interface CredentialKey {
@@ -63,6 +65,7 @@ const Settings: React.FC = () => {
   const [showAddModal, setShowAddModal] = useState(false);
   const [editingWorker, setEditingWorker] = useState<Worker | null>(null);
   const [healthChecking, setHealthChecking] = useState<number | null>(null);
+  const [workerAction, setWorkerAction] = useState<{ id: number; kind: string } | null>(null);
   const [importingKeys, setImportingKeys] = useState(false);
   const [keyImportMessage, setKeyImportMessage] = useState<string | null>(null);
 
@@ -84,7 +87,8 @@ const Settings: React.FC = () => {
     name: '',
     url: '',
     description: '',
-    capabilities: { train: true, infer: true }
+    capabilities: { train: true, infer: true },
+    password: ''
   });
 
   const fetchWorkers = useCallback(async () => {
@@ -192,12 +196,13 @@ const Settings: React.FC = () => {
           url: formData.url,
           description: formData.description || null,
           workerType: 'remote',
-          capabilities: formData.capabilities
+          capabilities: formData.capabilities,
+          ...(formData.password ? { password: formData.password } : {})
         })
       });
       if (!response.ok) throw new Error('Failed to add worker');
       setShowAddModal(false);
-      setFormData({ name: '', url: '', description: '', capabilities: { train: true, infer: true } });
+      setFormData({ name: '', url: '', description: '', capabilities: { train: true, infer: true }, password: '' });
       fetchWorkers();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to add worker');
@@ -214,12 +219,13 @@ const Settings: React.FC = () => {
           name: formData.name,
           url: formData.url,
           description: formData.description || null,
-          capabilities: formData.capabilities
+          capabilities: formData.capabilities,
+          ...(formData.password ? { password: formData.password } : {})
         })
       });
       if (!response.ok) throw new Error('Failed to update worker');
       setEditingWorker(null);
-      setFormData({ name: '', url: '', description: '', capabilities: { train: true, infer: true } });
+      setFormData({ name: '', url: '', description: '', capabilities: { train: true, infer: true }, password: '' });
       fetchWorkers();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to update worker');
@@ -252,6 +258,23 @@ const Settings: React.FC = () => {
       fetchWorkers();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to toggle worker');
+    }
+  };
+
+  const handleWorkerAction = async (workerId: number, action: 'sync-cache' | 'update') => {
+    setWorkerAction({ id: workerId, kind: action });
+    try {
+      const response = await fetch(`${API_BASE}/workers/${workerId}/${action}`, { method: 'POST' });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.detail || `${action} failed`);
+      setError(action === 'sync-cache'
+        ? `Cache sync: ${data.pushed ?? 0} file(s) pushed`
+        : `Update: ${data.synced ? 'worker now matches master' : 'did not converge'}`);
+      fetchWorkers();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : `${action} failed`);
+    } finally {
+      setWorkerAction(null);
     }
   };
 
@@ -310,7 +333,8 @@ const Settings: React.FC = () => {
       name: worker.name,
       url: worker.url,
       description: worker.description || '',
-      capabilities: worker.capabilities
+      capabilities: worker.capabilities,
+      password: ''  // write-only: blank means "keep existing"
     });
   };
 
@@ -614,6 +638,24 @@ const Settings: React.FC = () => {
                       {!worker.isLocal && (
                         <>
                           <button
+                            onClick={() => handleWorkerAction(worker.id, 'sync-cache')}
+                            disabled={workerAction?.id === worker.id}
+                            className="p-2 text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg disabled:opacity-50"
+                            title="Push cache to this worker"
+                          >
+                            {workerAction?.id === worker.id && workerAction.kind === 'sync-cache'
+                              ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
+                          </button>
+                          <button
+                            onClick={() => handleWorkerAction(worker.id, 'update')}
+                            disabled={workerAction?.id === worker.id}
+                            className="p-2 text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg disabled:opacity-50"
+                            title="Update worker to master version (git pull + restart)"
+                          >
+                            {workerAction?.id === worker.id && workerAction.kind === 'update'
+                              ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
+                          </button>
+                          <button
                             onClick={() => openEditModal(worker)}
                             className="p-2 text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg"
                             title="Edit"
@@ -650,7 +692,7 @@ const Settings: React.FC = () => {
                 onClick={() => {
                   setShowAddModal(false);
                   setEditingWorker(null);
-                  setFormData({ name: '', url: '', description: '', capabilities: { train: true, infer: true } });
+                  setFormData({ name: '', url: '', description: '', capabilities: { train: true, infer: true }, password: '' });
                 }}
                 className="text-gray-500 hover:text-gray-700"
               >
@@ -689,6 +731,20 @@ const Settings: React.FC = () => {
                 />
               </div>
               <div>
+                <label className="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">
+                  Password{editingWorker?.hasPassword ? ' (set — leave blank to keep)' : ''}
+                </label>
+                <input
+                  type="password"
+                  value={formData.password}
+                  onChange={e => setFormData({ ...formData, password: e.target.value })}
+                  placeholder={editingWorker?.hasPassword ? '••••••••' : 'Worker auth password'}
+                  autoComplete="new-password"
+                  className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 placeholder:text-gray-400 focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                />
+                <p className="text-xs text-gray-500 mt-1">The master sends this to authenticate to the worker. Must match the worker's <code>--password</code>.</p>
+              </div>
+              <div>
                 <label className="block text-sm font-medium mb-2 text-gray-700 dark:text-gray-300">Capabilities</label>
                 <div className="flex gap-4">
                   <label className="flex items-center gap-2">
@@ -723,7 +779,7 @@ const Settings: React.FC = () => {
                 onClick={() => {
                   setShowAddModal(false);
                   setEditingWorker(null);
-                  setFormData({ name: '', url: '', description: '', capabilities: { train: true, infer: true } });
+                  setFormData({ name: '', url: '', description: '', capabilities: { train: true, infer: true }, password: '' });
                 }}
                 className="px-4 py-2 text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg"
               >

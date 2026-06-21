@@ -239,8 +239,14 @@ export interface OptimizeBatchBody {
   optimization_config: Record<string, unknown>;
   expert_params?: Record<string, unknown>;
   screener_opt?: Record<string, unknown>;
+  worker_ids?: number[];
   name_prefix?: string;
 }
 export interface OptimizeBatchJob { expert: string; optimizationId: number; taskId: string; name: string; }
 export const optimizeBatch = (b: OptimizeBatchBody) =>
   jpost<{ jobs: OptimizeBatchJob[]; count: number }>('/strategies/optimize-batch', b);
+
+// Remote workers (for per-optimization selection). Master is always a worker; selecting none = local.
+export interface WorkerLite { id: number; name: string; isEnabled: boolean; isLocal: boolean; status: string; }
+export const listWorkers = () =>
+  jget<WorkerLite[]>('/workers').then(ws => ws.filter(w => !w.isLocal));

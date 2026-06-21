@@ -5,11 +5,7 @@ without ever running a trial twice; these tests pin that invariant + the fault-t
 """
 import threading
 
-from app.services.trial_broker import TrialBroker, get_broker
-
-
-def test_singleton():
-    assert get_broker() is get_broker()
+from app.services.trial_broker import TrialBroker
 
 
 def test_submit_claim_result_wait():
@@ -58,6 +54,20 @@ def test_duplicate_result_ignored():
     # a requeue race could post a second result — first wins, second ignored
     assert b.post_result(tid, {"fitness": 2.0}) is False
     assert b.wait_ready({tid}, timeout=1.0)[tid]["fitness"] == 1.0
+
+
+def test_requeue_one():
+    b = TrialBroker()
+    tid = b.submit_one("opt", {"v": 1}, "m")
+    job = b.claim("remote-worker")
+    assert job["trial_id"] == tid and b.stats()["claimed"] == 1
+    # a failing remote worker pushes the trial back -> re-claimable (by local/another worker)
+    assert b.requeue_one(tid) is True
+    assert b.stats()["pending"] == 1 and b.stats()["claimed"] == 0
+    assert b.claim("local")["trial_id"] == tid
+    # once a result exists, requeue_one is a no-op (can't resurrect a finished trial)
+    b.post_result(tid, {"fitness": 1.0})
+    assert b.requeue_one(tid) is False
 
 
 def test_requeue_stale():
