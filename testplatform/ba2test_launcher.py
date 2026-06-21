@@ -1039,6 +1039,31 @@ def _cmd_optimize(args) -> int:
             if not enabled:
                 sys.exit(f"optimize: --screener-store {args.screener_store!r} selected zero symbols "
                          f"for {args.start}..{args.end} under the loosest gene settings")
+            # Drop screened symbols with NO cached OHLCV for the run interval. The backtest is
+            # hermetic (never fetches mid-run), so preloading a symbol without bars hard-fails the
+            # whole run. The metric store (built from DAILY) legitimately contains names with no
+            # INTRADAY series — preferred shares / baby bonds (e.g. AQNB, DUKB, ELC) and a few thin
+            # tickers. The screener can still rank them; we just can't fill what has no bars. Match
+            # the native cache file CACHE_FOLDER/FMPOHLCVProvider/<SYM>_<interval>.parquet (with the
+            # provider's symbol sanitisation: '-' -> '_'/'.').
+            import os as _os
+            from ba2_common.config import CACHE_FOLDER as _CF
+            _cdir = _os.path.join(_CF, "FMPOHLCVProvider")
+            _iv = args.interval
+            def _has_bars(sym: str) -> bool:
+                for cand in (sym, sym.replace("-", "_"), sym.replace("-", ".")):
+                    if _os.path.exists(_os.path.join(_cdir, f"{cand}_{_iv}.parquet")):
+                        return True
+                return False
+            _before = len(enabled)
+            enabled = [s for s in enabled if _has_bars(s)]
+            _dropped = _before - len(enabled)
+            if _dropped:
+                print(f"optimize: dropped {_dropped}/{_before} screened symbols with no cached "
+                      f"{_iv} OHLCV (e.g. preferred/baby-bond tickers) -> {len(enabled)} tradeable.")
+            if not enabled:
+                sys.exit(f"optimize: 0 of the screened union has cached {_iv} OHLCV — fetch it first "
+                         f"(ba2-test fetch-cache --timeframes {_iv} ...) or pick a different interval.")
             backtest_block["enabled_instruments"] = enabled
             universe = enabled  # for the progress line / submit description below
             screener_genes = {f"screener:{k}": v for k, v in _scr_opt.items()}
