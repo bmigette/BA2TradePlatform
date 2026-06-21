@@ -645,6 +645,18 @@ _SCREENER_OPT = {
     "screener_weinstein_stage2_only": {"min": 0, "max": 1, "step": 1, "type": "int", "optimize": True},
 }
 
+# Per-cap-band jobs (small/mid/large): run the SAME screener gene set on a DISJOINT cap universe per
+# band, so 5min stays feasible (each band's screened union is far smaller than the whole store) and
+# small/mid/large get their own optimized settings. Only the market-cap gene RANGE + a fixed
+# market_cap_max change per band; every other gene (RVOL / price-drop / max_stocks / weinstein) is
+# unchanged. Selected via --screener-cap-band. Bands (current-cap $): small $50M-$2B, mid $2B-$10B,
+# large >=$10B. The cap-min gene optimizes the floor WITHIN the band; market_cap_max pins the ceiling.
+_SCREENER_CAP_BANDS = {
+    "small": {"min": 5e7,  "max": 2e9,  "step": 1e8,  "cap_max": 2e9},
+    "mid":   {"min": 2e9,  "max": 1e10, "step": 1e9,  "cap_max": 1e10},
+    "large": {"min": 1e10, "max": 2e11, "step": 1e10, "cap_max": None},
+}
+
 
 def _build_strategy_row(name: str):
     """A Strategy whose TP/SL + the 5 classic-RM params (the RM's sizing/stop conditions &
@@ -978,6 +990,19 @@ def _cmd_optimize(args) -> int:
             if not args.screener_store:
                 sys.exit("optimize: --screener requires --screener-store")
             base = json.load(open(args.screener_base_json)) if args.screener_base_json else {}
+            # Cap-band job: override the market-cap gene RANGE for the band and pin market_cap_max in
+            # the base settings, so each band optimizes a DISJOINT, smaller cap universe (5min-feasible).
+            # Other genes unchanged. Default (no band) keeps the original large-cap-floor behaviour.
+            _scr_opt = _SCREENER_OPT
+            _cap_band = getattr(args, "screener_cap_band", None)
+            if _cap_band:
+                _b = _SCREENER_CAP_BANDS[_cap_band]
+                _scr_opt = dict(_SCREENER_OPT)
+                _scr_opt["screener_market_cap_min"] = {"min": _b["min"], "max": _b["max"],
+                                                       "step": _b["step"], "type": "float", "optimize": True}
+                base = dict(base)
+                if _b.get("cap_max") is not None:
+                    base["market_cap_max"] = _b["cap_max"]
             backtest_block["screener_opt"] = {
                 "store": args.screener_store,
                 "base_settings": base,
@@ -1002,13 +1027,13 @@ def _cmd_optimize(args) -> int:
             # subset) and is far smaller than the raw store union (e.g. ~26-150 vs 868), so the
             # OHLCV preload doesn't load/hold ~800 never-selected symbols. The per-bar
             # screener_runtime gate still applies each individual's actual thresholds.
-            _loosest = dict(base)
+            _loosest = dict(base)   # base carries market_cap_max for a cap-band job
             _loosest.update({
-                "market_cap_min": _SCREENER_OPT["screener_market_cap_min"]["min"],
-                "relative_volume_min": _SCREENER_OPT["screener_relative_volume_min"]["min"],
-                "price_drop_pct": _SCREENER_OPT["screener_price_drop_pct"]["min"],
+                "market_cap_min": _scr_opt["screener_market_cap_min"]["min"],
+                "relative_volume_min": _scr_opt["screener_relative_volume_min"]["min"],
+                "price_drop_pct": _scr_opt["screener_price_drop_pct"]["min"],
                 "weinstein_stage2_only": 0,
-                "max_stocks": _SCREENER_OPT["screener_max_stocks"]["max"],
+                "max_stocks": _scr_opt["screener_max_stocks"]["max"],
             })
             enabled = _ms.screened_symbol_union(_store_df, args.start, args.end, _loosest)
             if not enabled:
@@ -1016,7 +1041,7 @@ def _cmd_optimize(args) -> int:
                          f"for {args.start}..{args.end} under the loosest gene settings")
             backtest_block["enabled_instruments"] = enabled
             universe = enabled  # for the progress line / submit description below
-            screener_genes = {f"screener:{k}": v for k, v in _SCREENER_OPT.items()}
+            screener_genes = {f"screener:{k}": v for k, v in _scr_opt.items()}
 
         cfg = {
             "populationSize": int(args.population),
@@ -1573,6 +1598,11 @@ def main(argv: "list | None" = None) -> int:
     op.add_argument("--screener-cadence-days", type=int, default=7,
                     help="Scan cadence in days (default 7 = weekly). Must match the metric store's "
                          "build cadence; align with --run-schedule.")
+    op.add_argument("--screener-cap-band", choices=["small", "mid", "large"], default=None,
+                    help="Constrain the screener universe to a cap band (small $50M-$2B / mid $2B-$10B "
+                         "/ large >=$10B): overrides the market-cap gene range + pins market_cap_max so "
+                         "each band optimizes a smaller, disjoint universe (keeps 5min feasible). Other "
+                         "genes unchanged. Run one job per band.")
     op.add_argument("--submit", action="store_true",
                     help="Enqueue on the running serve queue (live in the UI Running-jobs strip) "
                          "instead of running in-process. Submit jobs one at a time to avoid "
