@@ -76,6 +76,10 @@ def main() -> int:
     ap.add_argument("--cadence-days", type=int, default=7)
     ap.add_argument("--include-no-data", action="store_true",
                     help="Also run EarningsDrift/Insider on the large band (default: skip — no data).")
+    ap.add_argument("--workers", default=None,
+                    help="Comma-separated remote worker NAMES to distribute each job's GA trials to "
+                         "(e.g. 'remote150'); trials spread across these + local. Workers must be "
+                         "registered + cache-synced first.")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -106,6 +110,8 @@ def main() -> int:
                "--run-schedule", "weekly", "--name", name]
         if strat is not None:
             cmd += ["--strategy", strat]
+        if args.workers:
+            cmd += ["--workers", args.workers]   # distribute trials across remote workers + local
         print(f"[{i}/{len(jobs)}] RUN  {name} ...", flush=True)
         rc = subprocess.run(cmd, env=os.environ.copy()).returncode
         print(f"[{i}/{len(jobs)}] {name} exit={rc}", flush=True)
