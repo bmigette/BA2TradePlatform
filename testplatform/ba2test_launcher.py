@@ -956,7 +956,11 @@ def _cmd_optimize(args) -> int:
     init_db()
     db = SessionLocal()
     try:
-        strat = _build_strategy_row(args.name or f"opt-{expert}")
+        bypass = bool(spec.get("bypass"))
+        _sname = args.name or f"opt-{expert}-{args.strategy}"
+        # Bypass experts (FactorRanker) have no S1-S4 variants — they size their own portfolio, so
+        # they use the minimal strategy and ignore --strategy. Classic experts build the chosen variant.
+        strat = _build_strategy_minimal(_sname) if bypass else _build_strategy(args.strategy, _sname, expert)
         db.add(strat); db.commit(); db.refresh(strat)
 
         backtest_block = {
@@ -1068,6 +1072,10 @@ def _cmd_optimize(args) -> int:
             universe = enabled  # for the progress line / submit description below
             screener_genes = {f"screener:{k}": v for k, v in _scr_opt.items()}
 
+        # Target-anchored variant (S4): the initial TP bracket references the expert's analyst target
+        # price (the initial_tp gene becomes the offset-from-target). Not applicable to bypass experts.
+        if (not bypass) and args.strategy in _TARGET_ANCHORED_STRATEGIES:
+            backtest_block["initial_tp_reference"] = "expert_target_price"
         cfg = {
             "populationSize": int(args.population),
             "generations": int(args.generations),
@@ -1075,10 +1083,11 @@ def _cmd_optimize(args) -> int:
             "earlyStoppingGenerations": int(args.early_stop),
             "elitismPercent": 0.1, "seed": int(args.seed),
             "parallelIndividuals": int(args.parallel),
-            # Expert decision params + the classic-RM sizing params (model:* namespace, real ba2
-            # setting names). Without the RM block the RM stays fixed at its interface defaults.
-            # Screener genes (screener:* namespace) are merged in ONLY when --screener is set.
-            "expert_params": {**spec["expert_params"], **_RM_OPT, **screener_genes},
+            # Expert decision params (+ classic-RM sizing for ruleset experts; bypass experts size
+            # their own portfolio so they carry NO RM block). Screener genes (screener:* namespace)
+            # are merged in ONLY when --screener is set.
+            "expert_params": ({**spec["expert_params"], **screener_genes} if bypass
+                              else {**spec["expert_params"], **_RM_OPT, **screener_genes}),
             "backtest": backtest_block,
         }
         opt = StrategyOptimization(
@@ -1592,6 +1601,9 @@ def main(argv: "list | None" = None) -> int:
 
     op = sub.add_parser("optimize", help="Joint genetic optimization (expert + RM params + TP/SL).")
     op.add_argument("--expert", required=True, help="Expert class (FMPRating/FMPEarningsDrift/...).")
+    op.add_argument("--strategy", choices=["S1", "S2", "S3", "S4"], default="S2",
+                    help="Strategy/exit variant for a ruleset expert: S1 live-import / S2 bracket / "
+                         "S3 trailing / S4 target-anchored. Ignored for bypass experts (FactorRanker).")
     op.add_argument("--universe", required=True, help="Comma-separated symbols.")
     op.add_argument("--start", required=True, help="ISO start date.")
     op.add_argument("--end", required=True, help="ISO end date.")
