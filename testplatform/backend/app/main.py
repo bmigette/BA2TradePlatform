@@ -399,7 +399,7 @@ async def global_exception_handler(request, exc):
 
 
 # Import and include routers
-from app.api import datasets, jobs, workers, dashboard, models, backtests, ml, settings, websocket, tasks, indicator_collections, tools, target_sets, strategies, admin, cache, experts, rules, ruleset_meta, data_build
+from app.api import datasets, jobs, workers, dashboard, models, backtests, ml, settings, websocket, tasks, indicator_collections, tools, target_sets, strategies, admin, cache, experts, rules, ruleset_meta, data_build, cache_sync, distributed
 
 app.include_router(datasets.router, prefix="/api/datasets", tags=["datasets"])
 app.include_router(tools.router, prefix="/api/tools", tags=["tools"])
@@ -420,6 +420,9 @@ app.include_router(rules.router)
 app.include_router(strategies.router, prefix="/api/strategies", tags=["strategies"])
 app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
 app.include_router(cache.router, prefix="/api/cache", tags=["cache"])
+# Remote-worker support: cache sync (master->worker) + distributed GA-trial fan-out.
+app.include_router(cache_sync.router, prefix="/api/cache", tags=["cache-sync"])
+app.include_router(distributed.router, prefix="/api/worker", tags=["distributed-workers"])
 app.include_router(data_build.router, prefix="/api/data", tags=["data-build"])
 app.include_router(experts.router, tags=["experts"])
 # ruleset_meta carries its own /api prefix -> /api/ruleset/vocabulary, /api/ruleset/exit-presets

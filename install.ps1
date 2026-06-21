@@ -38,6 +38,25 @@ Write-Host ">> venv root     : $VenvRoot"
 Write-Host ">> trade python  : $TradePy"
 Write-Host ">> test  python  : $TestPy"
 
+# torch wheel selection for the TRADE venv. $env:BA2_TORCH_VARIANT: auto (default) | cpu | cuXXX.
+# auto = install the CUDA build when an NVIDIA GPU responds to nvidia-smi, else CPU-only (see
+# CLAUDE.md WinError 1114 note for the CPU pin rationale).
+$TorchVariant   = if ($env:BA2_TORCH_VARIANT) { $env:BA2_TORCH_VARIANT } else { "auto" }
+$CudaWhlDefault = "cu124"
+
+function Get-TorchIndex {
+  $variant = $TorchVariant
+  if ($variant -eq "auto") {
+    $hasGpu = $false
+    if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
+      & nvidia-smi *> $null
+      if ($LASTEXITCODE -eq 0) { $hasGpu = $true }
+    }
+    $variant = if ($hasGpu) { $CudaWhlDefault } else { "cpu" }
+  }
+  return "https://download.pytorch.org/whl/$variant"
+}
+
 # One uv install with explicit args (no array splatting / multiline-if — those mangled args).
 function Invoke-Uv {
   param([string]$Uv, [string]$Vpy, [string[]]$Rest)
@@ -96,10 +115,11 @@ function New-AppVenv {
   $Up = [bool]$Upgrade
 
   if ($TorchCpu) {
-    # CPU-only torch wheel (Windows) — see CLAUDE.md WinError 1114 note. Pre-install so the
-    # bare `torch` line in requirements.txt is already satisfied with a +cpu build.
-    Write-Host ">> installing CPU-only torch"
-    Invoke-Uv -Uv $Uv -Vpy $Vpy -Rest @("torch", "--index-url", "https://download.pytorch.org/whl/cpu")
+    # Pre-install torch so the bare `torch` line in requirements.txt is already satisfied with the
+    # right build. Variant auto-detected (CUDA cu124 if an NVIDIA GPU is present, else +cpu).
+    $idx = Get-TorchIndex
+    Write-Host ">> installing torch from $idx"
+    Invoke-Uv -Uv $Uv -Vpy $Vpy -Rest @("torch", "--index-url", $idx)
   }
 
   Install-Chain -Uv $Uv -Vpy $Vpy -Up $Up

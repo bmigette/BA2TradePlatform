@@ -354,9 +354,24 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         # backtests run in worker PROCESSES (no GIL); the GA loop, the trial memo, all_results
         # and best stay here in the main process. Only plain-dict configs go out and a tiny
         # {ok,fitness,trades} summary comes back, so nothing un-picklable crosses the boundary.
-        def make_batch_fitness(pool):
+        #
+        # The execution backend is pluggable via *execute_jobs*: a callable taking the list of
+        # ``(idx, flat, key, config)`` jobs and YIELDING ``(idx, flat, key, out)`` as each
+        # finishes. The LOCAL backend (``_local_execute_jobs``) submits to the process pool; the
+        # DISTRIBUTED backend (DistributedEvaluator.execute_jobs) fans trials out to the broker
+        # (master-as-worker pool consumers + remote HTTP workers). The memo/progress/persist
+        # collection loop below is identical for both — only WHERE a trial runs differs.
+        def _local_execute_jobs(jobs):
             from concurrent.futures import as_completed
+            futures = {
+                _pool.submit(_trial_worker, cfg, opt.fitness_metric): (i, flat, key)
+                for (i, flat, key, cfg) in jobs
+            }
+            for fut in as_completed(futures):
+                i, flat, key = futures[fut]
+                yield (i, flat, key, fut.result())
 
+        def make_batch_fitness(execute_jobs):
             def batch_fitness(param_dicts: list) -> list:
                 if tq.is_task_paused(task_id):
                     raise InterruptedError("paused/cancelled")
@@ -394,13 +409,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 done = total_in_batch - len(jobs)  # cached individuals are already evaluated
                 _emit_intra(done)
 
-                futures = {
-                    pool.submit(_trial_worker, cfg, opt.fitness_metric): (i, flat, key)
-                    for (i, flat, key, cfg) in jobs
-                }
-                for fut in as_completed(futures):
-                    i, flat, key = futures[fut]
-                    out = fut.result()
+                for i, flat, key, out in execute_jobs(jobs):
                     fit = float(out["fitness"])
                     fits[i] = fit
                     memo.put(key, fit)
@@ -446,9 +455,13 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         _logging.disable(_logging.INFO)
 
         # Spin up the process pool once for the whole run (spawn -> each worker pays the
-        # import cost once). batch_fitness routes the per-generation batch through it.
+        # import cost once). batch_fitness routes the per-generation batch through it — either
+        # straight to the pool (local), or through the TrialBroker so remote workers can help
+        # (distributed). Distribution engages ONLY when a remote worker is online, so the default
+        # path is byte-identical to the local-only behaviour (zero overhead / zero risk).
         _pool = None
         batch_fitness = None
+        _evaluator = None
         if parallel > 1:
             import multiprocessing as _mp
             from concurrent.futures import ProcessPoolExecutor
@@ -460,7 +473,24 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 initializer=_worker_init,
                 initargs=(_BACKEND_DIR, _env),
             )
-            batch_fitness = make_batch_fitness(_pool)
+            try:
+                from app.services.distributed_eval import (
+                    DistributedEvaluator, has_online_remote_workers,
+                )
+                _distribute = has_online_remote_workers(db)
+            except Exception as e:  # noqa: BLE001 — distribution is optional; never block a run
+                logger.warning(f"distributed-worker check failed, running local-only: {e}")
+                _distribute = False
+            if _distribute:
+                _evaluator = DistributedEvaluator(
+                    _pool, opt.fitness_metric, parallel, opt_id,
+                )
+                _evaluator.start()
+                batch_fitness = make_batch_fitness(_evaluator.execute_jobs)
+                logger.info(f"strategy_optimization {opt_id}: DISTRIBUTED mode "
+                            f"(remote workers online; master + remotes share trials)")
+            else:
+                batch_fitness = make_batch_fitness(_local_execute_jobs)
         try:
             result = optimizer.optimize(
                 fitness_function=fitness_function,
@@ -473,6 +503,8 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             )
         finally:
             _logging.disable(_prior_disable)
+            if _evaluator is not None:
+                _evaluator.stop()
             if _pool is not None:
                 _pool.shutdown(wait=True, cancel_futures=True)
 

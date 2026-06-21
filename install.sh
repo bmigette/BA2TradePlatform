@@ -38,6 +38,24 @@ TRADE_PY="$BOTH_PY"; TEST_PY="$BOTH_PY"
 
 UP=(); [ "$UPGRADE" = "1" ] && UP=(--upgrade)
 
+# torch wheel selection for the TRADE venv. BA2_TORCH_VARIANT: auto (default) | cpu | cuXXX.
+# auto = install the CUDA build when an NVIDIA GPU responds to nvidia-smi, else CPU-only
+# (a Mac / GPU-less box has no nvidia-smi -> CPU; see CLAUDE.md WinError note for the CPU pin).
+TORCH_VARIANT="${BA2_TORCH_VARIANT:-auto}"
+CUDA_WHL_DEFAULT="cu124"
+
+torch_index() {  # echo the torch wheel --index-url for the resolved variant
+  local variant="$TORCH_VARIANT"
+  if [ "$variant" = "auto" ]; then
+    if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+      variant="$CUDA_WHL_DEFAULT"
+    else
+      variant="cpu"
+    fi
+  fi
+  echo "https://download.pytorch.org/whl/$variant"
+}
+
 install_chain() {  # $1=uv $2=vpy ; in-repo packages ONLY (self-contained monorepo, no external git)
   local UV="$1" VPY="$2"; local ef=(); [ "$EDITABLE" = "1" ] && ef=(-e)
   local common="$HERE/packages/common" prov="$HERE/packages/providers" exp="$HERE/packages/experts"
@@ -65,8 +83,9 @@ new_app_venv() {  # $1=venv $2=appdir $3=reqpath $4=torch_cpu(0/1) $5=verify_imp
   "$VPY" -m pip install --upgrade pip uv >/dev/null 2>&1 || true
   local UV="$VENV/bin/uv"; [ -x "$UV" ] || UV="$VENV/Scripts/uv.exe"
   if [ "$TORCH" = "1" ]; then
-    echo ">> installing CPU-only torch"
-    "$UV" pip install --python "$VPY" torch --index-url https://download.pytorch.org/whl/cpu
+    local idx; idx="$(torch_index)"
+    echo ">> installing torch from $idx"
+    "$UV" pip install --python "$VPY" torch --index-url "$idx"
   fi
   install_chain "$UV" "$VPY"
   install_reqs  "$UV" "$VPY" "$REQ"

@@ -1,29 +1,33 @@
 """
 Admin API endpoints.
 
-Provides secure endpoints for CLI-driven server updates (git pull + restart)
-and log file reading.
+Provides secure endpoints for CLI-driven server updates (git pull + reinstall + restart),
+a version probe (used by remote workers to detect a code mismatch), and log file reading.
 Protected by a bearer token configured via BA2_ADMIN_TOKEN environment variable.
+
+The update/restart mechanics live in ``app.services.self_update`` (monorepo-aware, shared with
+the ``ba2-test worker`` CLI) so the master and a remote worker update + restart identically.
 """
 
 import collections
 import hmac
 import logging
 import os
-import subprocess
-import sys
-import threading
 from typing import Optional
 
 from fastapi import APIRouter, Header, HTTPException, Query
 from pathlib import Path
 
+from app.services import self_update
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Project root is three levels up from this file: admin.py -> api/ -> app/ -> backend/
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+# The git repository root is the MONOREPO root (the dir holding .git), NOT this app's sub-dir.
+# self_update.resolve_repo_root walks up to find it (post-consolidation the .git lives one level
+# above testplatform/, so the old "three levels up" assumption pointed at the wrong directory).
+PROJECT_ROOT = self_update.resolve_repo_root()
 
 # Backend root (where logs/ directory lives)
 BACKEND_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -63,110 +67,55 @@ def verify_admin_token(authorization: str):
         )
 
 
-def _schedule_restart():
-    """Replace the current process after a short delay to allow the response to be sent."""
-    import time
-    import signal
-    time.sleep(2)
-    logger.info("Restarting server...")
+@router.get("/version")
+async def get_version(authorization: str = Header(default=None)):
+    """Report the running code identity (app version + git commit + repo root).
 
-    # Stop all task queues (terminates subprocess workers)
-    try:
-        from app.services.task_queue import get_task_queue, get_training_task_queue, get_backtest_task_queue, get_ohlcv_task_queue
-        for queue_getter in [get_training_task_queue, get_backtest_task_queue, get_task_queue, get_ohlcv_task_queue]:
-            try:
-                q = queue_getter()
-                q.stop()
-            except Exception:
-                pass
-        logger.info("All task queues stopped")
-    except Exception as e:
-        logger.warning(f"Failed to stop task queues: {e}")
-
-    # Kill any remaining child processes (orphan prevention)
-    import psutil
-    try:
-        current = psutil.Process()
-        children = current.children(recursive=True)
-        for child in children:
-            logger.info(f"Terminating child process {child.pid}: {child.name()}")
-            child.terminate()
-        # Wait briefly for graceful termination
-        psutil.wait_procs(children, timeout=5)
-        # Force kill any survivors
-        for child in current.children(recursive=True):
-            logger.warning(f"Force killing child process {child.pid}")
-            child.kill()
-    except ImportError:
-        # psutil not available — fall back to no child cleanup
-        logger.warning("psutil not available — child processes may survive restart")
-    except Exception as e:
-        logger.warning(f"Child process cleanup error: {e}")
-
-    # Rebuild the command using -m uvicorn to work on both Windows and Unix.
-    uvicorn_args = []
-    skip_next = False
-    for i, arg in enumerate(sys.argv):
-        if skip_next:
-            skip_next = False
-            continue
-        if i == 0:
-            continue
-        uvicorn_args.append(arg)
-
-    cmd = [sys.executable, "-m", "uvicorn"] + uvicorn_args
-    logger.info("Restart command: %s", " ".join(cmd))
-    os.execv(sys.executable, cmd)
+    Remote workers poll this to detect a code mismatch with the master: a distributed GA trial
+    must run the IDENTICAL code, so a worker self-updates when its git commit differs.
+    """
+    verify_admin_token(authorization)
+    return self_update.get_version_info(PROJECT_ROOT)
 
 
 @router.post("/update")
-async def update_server(authorization: str = Header(default=None)):
+async def update_server(
+    authorization: str = Header(default=None),
+    reinstall: str = Query(
+        default="auto",
+        description="Reinstall the shared package chain after pull: 'auto' (only when "
+                    "non-editable), 'true' (always), or 'false' (never).",
+    ),
+):
     """
-    Pull latest code from git and schedule a server restart.
+    Pull latest code (+ reinstall the shared packages when non-editable) and restart.
 
     Requires BA2_ADMIN_TOKEN to be set in the environment.
     The request must include an Authorization: Bearer <token> header.
     """
     verify_admin_token(authorization)
 
-    # Run git pull in the project root
-    logger.info(f"Running git pull in {PROJECT_ROOT}")
-    try:
-        result = subprocess.run(
-            ["git", "pull"],
-            cwd=str(PROJECT_ROOT),
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        git_output = result.stdout.strip() or result.stderr.strip()
-        if result.returncode != 0:
-            raise HTTPException(
-                status_code=500,
-                detail="git pull failed (exit code {}): {}".format(
-                    result.returncode, result.stderr.strip() or git_output
-                ),
-            )
-    except subprocess.TimeoutExpired:
-        raise HTTPException(
-            status_code=504,
-            detail="git pull timed out after 30 seconds.",
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"git pull failed: {str(e)}",
-        )
+    reinstall_mode: "str | bool" = {"true": True, "false": False}.get(reinstall.lower(), "auto")
+    logger.info(f"admin update: git pull in {PROJECT_ROOT} (reinstall={reinstall_mode})")
+    report = self_update.perform_update(reinstall=reinstall_mode, root=PROJECT_ROOT)
+    if not report.get("ok"):
+        step = report.get("step", "update")
+        detail = report.get("git_pull") or report.get("reinstall_logs") or "update failed"
+        raise HTTPException(status_code=500, detail=f"update failed at {step}: {detail}")
 
-    logger.info(f"git pull output: {git_output}")
+    logger.info(f"admin update ok: {report.get('git_pull')}")
 
-    # Schedule restart in a background thread so the response can be sent first
-    threading.Thread(target=_schedule_restart, daemon=True).start()
+    # Restart in a background thread so this response can flush first. Stop the task queues
+    # (terminating their subprocess workers) before re-exec'ing.
+    self_update.schedule_restart(delay=2.0, on_before_restart=self_update.stop_task_queues)
 
     return {
-        "git_pull": git_output,
+        "git_pull": report.get("git_pull"),
+        "reinstalled": report.get("reinstalled"),
+        "editable": report.get("editable"),
+        "version": report.get("version"),
         "restart": "scheduled",
-        "message": "Server will restart in ~1 second.",
+        "message": "Server will restart shortly.",
     }
 
 
