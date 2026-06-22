@@ -59,7 +59,7 @@ import ResolvedRulesetView from '../components/ResolvedRulesetView';
 import type { BestParams } from '../lib/resolveRuleset';
 import { getRulesetVocabulary, importLiveEnterMarket, importLiveRuleset, convertLiveRuleset, listTasks, listBacktests, fetchOptSettingsExport, listExperts, optimizeBatch, listRunningOptimizations, fetchBacktestExport, listWorkers } from '../lib/btApi';
 import type { ExpertInfo, OptimizeBatchJob, OptimizeBatchBody, RunningOpt, WorkerLite } from '../lib/btApi';
-import { RunningJobsPanel } from '../components/RunningJobsPanel';
+import { RunningJobsPanel, RunningJobProgress } from '../components/RunningJobsPanel';
 import { OptimizationJobsTable, OptJobSettingsDetail } from '../components/OptimizationJobsTable';
 import { TopIndividualsTable } from '../components/TopIndividualsTable';
 import type { Vocabulary, OptimizationJob, OptimizationDetail, OptIndividual } from '../lib/btApi';
@@ -385,6 +385,47 @@ const serializeConditionTree = (node: ConditionTree): Record<string, unknown> =>
 const WORD_TO_SYMBOL: Record<string, string> = {
   gt: '>', gte: '>=', lt: '<', lte: '<=', eq: '==', neq: '!=', ne: '!=',
 };
+
+// Read-only one-liner for a stored condition leaf/group. Mirrors normalizeLeaf's key tolerance
+// (field|event_type, comparison|op|operator) so the Strategy tab doesn't print "undefined": flag
+// triggers (has_position, rating_positive_to_negative — no operator/value) render as just the
+// field; numeric leaves render "field op value"; nested groups join their children by operator.
+function fmtConditionLeaf(c: any): string {
+  if (!c || typeof c !== 'object') return '';
+  if (Array.isArray(c.conditions)) {
+    const op = c.operator === 'OR' || c.type === 'OR' ? 'OR' : 'AND';
+    const inner = c.conditions.map(fmtConditionLeaf).filter(Boolean).join(` ${op} `);
+    return inner ? (c.conditions.length > 1 ? `(${inner})` : inner) : '';
+  }
+  const field = c.field ?? c.event_type ?? c.eventType ?? '';
+  if (!field) return '';
+  const rawOp = c.comparison ?? c.op ?? c.operator;
+  const val = c.value ?? c.threshold;
+  const isFlag = rawOp === 'is_true' || rawOp === 'is_false' || (rawOp == null && val == null);
+  if (isFlag) return String(field);
+  const op = rawOp != null ? (WORD_TO_SYMBOL[String(rawOp).toLowerCase()] ?? String(rawOp)) : '';
+  return [field, op, val].filter(x => x !== '' && x != null).join(' ');
+}
+
+// Render a condition GROUP with its boolean structure made explicit: a single condition renders
+// inline; multiple conditions render one-per-line with the joining operator (AND/OR) shown in the
+// gutter — so "one rule with several ANDed conditions" reads differently from separate rules.
+function ConditionGroupLines({ group }: { group: any }) {
+  const conds: any[] = group?.conditions ?? [];
+  if (conds.length === 0) return <span className="opacity-60 italic">always</span>;
+  if (conds.length === 1) return <span className="font-mono">{fmtConditionLeaf(conds[0]) || '—'}</span>;
+  const op = group?.operator === 'OR' || group?.type === 'OR' ? 'OR' : 'AND';
+  return (
+    <div className="mt-0.5 space-y-0.5">
+      {conds.map((c, i) => (
+        <div key={i} className="flex items-baseline gap-2">
+          <span className="text-[10px] uppercase w-7 shrink-0 text-right opacity-50">{i === 0 ? '' : op}</span>
+          <span className="font-mono">{fmtConditionLeaf(c) || '—'}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
 const normalizeLeaf = (raw: Record<string, unknown>): ConditionTree => {
   // Group node: detect by conditions[] + an AND/OR on EITHER 'operator' (builder/canonical) or
   // 'type' (storage / optimizer-decoded). Reading only 'operator' before was the cause of
@@ -1886,6 +1927,7 @@ const Backtesting: React.FC = () => {
             <p className="text-xs text-gray-500 dark:text-gray-400 max-w-sm">
               Results, equity curve and trades will appear here automatically when the run completes.
             </p>
+            <RunningJobProgress name={selectedBacktest.name} />
           </div>
         </>
       );
@@ -2279,36 +2321,41 @@ const Backtesting: React.FC = () => {
                             {buyConditions.length > 0 && (
                               <div>
                                 <h4 className="text-sm font-semibold text-green-600 mb-2">Entry Conditions ({buyConditions.length})</h4>
-                                <div className="space-y-1">
-                                  {buyConditions.map((c: any, i: number) => (
-                                    <div key={i} className="text-sm bg-green-50 dark:bg-green-900/20 rounded px-3 py-1.5 text-green-800 dark:text-green-300">
-                                      {c.field} <span className="font-mono">{c.comparison}</span> {c.value}
-                                    </div>
-                                  ))}
+                                <div className="text-sm bg-green-50 dark:bg-green-900/20 rounded px-3 py-2 text-green-800 dark:text-green-300">
+                                  <ConditionGroupLines group={sp.buyEntryConditions} />
                                 </div>
                               </div>
                             )}
                             {sellConditions.length > 0 && (
                               <div>
                                 <h4 className="text-sm font-semibold text-red-600 mb-2">Short Entry Conditions ({sellConditions.length})</h4>
-                                <div className="space-y-1">
-                                  {sellConditions.map((c: any, i: number) => (
-                                    <div key={i} className="text-sm bg-red-50 dark:bg-red-900/20 rounded px-3 py-1.5 text-red-800 dark:text-red-300">
-                                      {c.field} <span className="font-mono">{c.comparison}</span> {c.value}
-                                    </div>
-                                  ))}
+                                <div className="text-sm bg-red-50 dark:bg-red-900/20 rounded px-3 py-2 text-red-800 dark:text-red-300">
+                                  <ConditionGroupLines group={sp.sellEntryConditions} />
                                 </div>
                               </div>
                             )}
                             {exitConditions.length > 0 && !bestParams && (
                               <div>
-                                <h4 className="text-sm font-semibold text-yellow-600 mb-2">Exit Conditions ({exitConditions.length})</h4>
-                                <div className="space-y-1">
-                                  {exitConditions.map((rule: any, i: number) => (
-                                    <div key={i} className="text-sm bg-yellow-50 dark:bg-yellow-900/20 rounded px-3 py-1.5 text-yellow-800 dark:text-yellow-300">
-                                      {rule.name || `Exit Rule ${i + 1}`}: {rule.conditions?.conditions?.map((c: any) => `${c.field} ${c.comparison} ${c.value}`).join(' AND ') || 'N/A'}
-                                    </div>
-                                  ))}
+                                <div className="flex items-baseline gap-2 mb-2">
+                                  <h4 className="text-sm font-semibold text-yellow-600">Exit Conditions ({exitConditions.length})</h4>
+                                  {exitConditions.length > 1 && (
+                                    <span className="text-[11px] text-gray-500 dark:text-gray-400">— any rule triggers an exit</span>
+                                  )}
+                                </div>
+                                <div className="space-y-1.5">
+                                  {exitConditions.map((rule: any, i: number) => {
+                                    const nConds = (rule.conditions?.conditions ?? []).length;
+                                    const grpOp = rule.conditions?.operator === 'OR' || rule.conditions?.type === 'OR' ? 'any of' : 'all of';
+                                    return (
+                                      <div key={i} className="text-sm bg-yellow-50 dark:bg-yellow-900/20 rounded px-3 py-2 text-yellow-800 dark:text-yellow-300">
+                                        <div className="flex items-baseline gap-2">
+                                          <span className="font-semibold">{rule.name || `Exit Rule ${i + 1}`}</span>
+                                          {nConds > 1 && <span className="text-[10px] uppercase tracking-wide rounded px-1 bg-yellow-100 dark:bg-yellow-800/40 text-yellow-700 dark:text-yellow-300">{grpOp}</span>}
+                                        </div>
+                                        <ConditionGroupLines group={rule.conditions} />
+                                      </div>
+                                    );
+                                  })}
                                 </div>
                               </div>
                             )}

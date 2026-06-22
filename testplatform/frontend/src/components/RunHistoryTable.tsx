@@ -35,6 +35,16 @@ export function RunHistoryTable({ savedOnly, onSelect, onLoad }:
   const [refresh, setRefresh] = useState(0);
   // The run whose Export dialog is open (null = closed).
   const [exportRow, setExportRow] = useState<any | null>(null);
+  // Collapsible filter menu + numeric thresholds (client-side; expert/optId stay server-side).
+  const [showFilters, setShowFilters] = useState(false);
+  const [minSharpe, setMinSharpe] = useState('');
+  const [minTrades, setMinTrades] = useState('');
+  const [minRet, setMinRet] = useState('');
+  const [maxDD, setMaxDD] = useState('');
+  const [minWin, setMinWin] = useState('');
+  // Sort state: column key + direction. Default newest-first (id desc).
+  const [sortKey, setSortKey] = useState<string>('id');
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
 
   useEffect(() => {
     listBacktests({
@@ -96,40 +106,131 @@ export function RunHistoryTable({ savedOnly, onSelect, onLoad }:
     () => Array.from(new Set(rows.map(r => r.optimizationId ?? r.optimization_id).filter((x: any) => x != null))),
     [rows],
   );
-  const filtered = rows.filter(r => !q || (r.name || '').toLowerCase().includes(q.toLowerCase()));
+
+  // Tolerant numeric coercion (camelCase + snake_case fields). Returns NaN when absent.
+  const num = (v: unknown): number => { const n = typeof v === 'number' ? v : Number(v); return Number.isFinite(n) ? n : NaN; };
+  // Column accessors keyed by header — used for both sorting and (numeric) display ordering.
+  const accessors: Record<string, (r: any) => number | string> = {
+    id: r => num(r.id),
+    expert: r => String((r.expertName ?? r.expert_name) ?? (r.modelName ?? r.model_name) ?? r.engineType ?? '').toLowerCase(),
+    opt: r => num(r.optimizationId ?? r.optimization_id),
+    ret: r => num(r.totalReturn ?? r.total_return),
+    sharpe: r => num(r.sharpeRatio ?? r.sharpe_ratio),
+    trades: r => num(r.totalTrades ?? r.total_trades),
+    dd: r => num(r.maxDrawdown ?? r.max_drawdown),
+    win: r => num(r.winRate ?? r.win_rate),
+    saved: r => ((r.isSaved ?? r.is_saved) ? 1 : 0),
+    name: r => String(r.name ?? '').toLowerCase(),
+  };
+
+  // Number of active filter-menu thresholds (drives the "Filters (N)" badge + Clear button).
+  const activeFilters = [expert, optId, minSharpe, minTrades, minRet, maxDD, minWin].filter(v => v !== '').length;
+  const clearFilters = () => { setExpert(''); setOptId(''); setMinSharpe(''); setMinTrades(''); setMinRet(''); setMaxDD(''); setMinWin(''); };
+
+  const filtered = rows.filter(r => {
+    if (q && !(r.name || '').toLowerCase().includes(q.toLowerCase())) return false;
+    if (minSharpe !== '' && !(num(r.sharpeRatio ?? r.sharpe_ratio) >= Number(minSharpe))) return false;
+    if (minTrades !== '' && !(num(r.totalTrades ?? r.total_trades) >= Number(minTrades))) return false;
+    if (minRet !== '' && !(num(r.totalReturn ?? r.total_return) >= Number(minRet))) return false;
+    // DD is stored signed-negative; "max drawdown %" caps the magnitude.
+    if (maxDD !== '' && !(Math.abs(num(r.maxDrawdown ?? r.max_drawdown)) <= Number(maxDD))) return false;
+    if (minWin !== '' && !(num(r.winRate ?? r.win_rate) >= Number(minWin))) return false;
+    return true;
+  });
+
+  const sorted = [...filtered].sort((a, b) => {
+    const av = accessors[sortKey](a), bv = accessors[sortKey](b);
+    let cmp: number;
+    if (typeof av === 'string' || typeof bv === 'string') {
+      cmp = String(av).localeCompare(String(bv));
+    } else {
+      const aN = Number.isFinite(av as number), bN = Number.isFinite(bv as number);
+      if (!aN && !bN) return 0;       // both missing
+      if (!aN) return 1;              // missing values always sink to the bottom
+      if (!bN) return -1;
+      cmp = (av as number) - (bv as number);
+    }
+    return sortDir === 'asc' ? cmp : -cmp;
+  });
+
+  const toggleSort = (key: string) => {
+    if (sortKey === key) { setSortDir(d => (d === 'asc' ? 'desc' : 'asc')); }
+    else { setSortKey(key); setSortDir(key === 'name' || key === 'expert' ? 'asc' : 'desc'); }  // numbers high-first, text A-Z
+  };
+
+  const columns: { key: string; label: string }[] = [
+    { key: 'id', label: 'id' }, { key: 'expert', label: 'expert' }, { key: 'opt', label: 'opt#' },
+    { key: 'ret', label: 'ret%' }, { key: 'sharpe', label: 'sharpe' }, { key: 'trades', label: 'trades' },
+    { key: 'dd', label: 'DD%' }, { key: 'win', label: 'win%' }, { key: 'saved', label: 'saved' }, { key: 'name', label: 'name' },
+  ];
 
   return (
     <>
     <div className="border border-gray-200 dark:border-gray-700 rounded-lg overflow-hidden">
-      <div className="flex gap-2 p-3 bg-gray-50 dark:bg-gray-700/50 border-b border-gray-200 dark:border-gray-700">
-        <select value={expert} onChange={(e) => setExpert(e.target.value)} className={inputClass}>
-          <option value="">All experts</option>
-          {experts.map(x => <option key={x}>{x}</option>)}
-        </select>
-        <select value={optId} onChange={(e) => setOptId(e.target.value)} className={inputClass}>
-          <option value="">All opt jobs</option>
-          {optIds.map(x => <option key={x} value={x}>#{x}</option>)}
-        </select>
+      <div className="flex flex-wrap items-center gap-2 p-3 bg-gray-50 dark:bg-gray-700/50 border-b border-gray-200 dark:border-gray-700">
         <input placeholder="search name" value={q} onChange={(e) => setQ(e.target.value)} className={inputClass} />
+        <button
+          type="button"
+          onClick={() => setShowFilters(s => !s)}
+          className={`px-2 py-1.5 text-sm border rounded ${activeFilters > 0
+            ? 'border-blue-400 dark:border-blue-600 text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-900/20'
+            : 'border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200 bg-white dark:bg-gray-700'} hover:bg-gray-50 dark:hover:bg-gray-600`}
+        >
+          {showFilters ? '▾' : '▸'} Filters{activeFilters > 0 ? ` (${activeFilters})` : ''}
+        </button>
+        {activeFilters > 0 && (
+          <button type="button" onClick={clearFilters}
+            className="px-2 py-1.5 text-sm border border-gray-300 dark:border-gray-600 rounded text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-600">
+            Clear
+          </button>
+        )}
+        <span className="ml-auto text-xs text-gray-500 dark:text-gray-400 self-center">{sorted.length} run{sorted.length === 1 ? '' : 's'}</span>
       </div>
+      {showFilters && (
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3 p-3 bg-gray-50 dark:bg-gray-800/40 border-b border-gray-200 dark:border-gray-700">
+          <label className="flex flex-col gap-1 text-xs text-gray-600 dark:text-gray-300">expert
+            <select value={expert} onChange={(e) => setExpert(e.target.value)} className={inputClass}>
+              <option value="">All experts</option>
+              {experts.map(x => <option key={x}>{x}</option>)}
+            </select>
+          </label>
+          <label className="flex flex-col gap-1 text-xs text-gray-600 dark:text-gray-300">opt job
+            <select value={optId} onChange={(e) => setOptId(e.target.value)} className={inputClass}>
+              <option value="">All opt jobs</option>
+              {optIds.map(x => <option key={x} value={x}>#{x}</option>)}
+            </select>
+          </label>
+          <label className="flex flex-col gap-1 text-xs text-gray-600 dark:text-gray-300">min sharpe
+            <input type="number" step="0.1" placeholder="any" value={minSharpe} onChange={(e) => setMinSharpe(e.target.value)} className={inputClass} />
+          </label>
+          <label className="flex flex-col gap-1 text-xs text-gray-600 dark:text-gray-300">min trades
+            <input type="number" step="1" placeholder="any" value={minTrades} onChange={(e) => setMinTrades(e.target.value)} className={inputClass} />
+          </label>
+          <label className="flex flex-col gap-1 text-xs text-gray-600 dark:text-gray-300">min ret %
+            <input type="number" step="1" placeholder="any" value={minRet} onChange={(e) => setMinRet(e.target.value)} className={inputClass} />
+          </label>
+          <label className="flex flex-col gap-1 text-xs text-gray-600 dark:text-gray-300">max drawdown %
+            <input type="number" step="1" placeholder="any" value={maxDD} onChange={(e) => setMaxDD(e.target.value)} className={inputClass} />
+          </label>
+          <label className="flex flex-col gap-1 text-xs text-gray-600 dark:text-gray-300">min win %
+            <input type="number" step="1" placeholder="any" value={minWin} onChange={(e) => setMinWin(e.target.value)} className={inputClass} />
+          </label>
+        </div>
+      )}
       <table className="w-full text-sm">
         <thead className="bg-gray-50 dark:bg-gray-700 border-b border-gray-200 dark:border-gray-600">
           <tr>
-            <th className="px-3 py-2 text-left text-xs font-medium text-gray-700 dark:text-gray-300">id</th>
-            <th className="px-3 py-2 text-left text-xs font-medium text-gray-700 dark:text-gray-300">expert</th>
-            <th className="px-3 py-2 text-left text-xs font-medium text-gray-700 dark:text-gray-300">opt#</th>
-            <th className="px-3 py-2 text-left text-xs font-medium text-gray-700 dark:text-gray-300">ret%</th>
-            <th className="px-3 py-2 text-left text-xs font-medium text-gray-700 dark:text-gray-300">sharpe</th>
-            <th className="px-3 py-2 text-left text-xs font-medium text-gray-700 dark:text-gray-300">trades</th>
-            <th className="px-3 py-2 text-left text-xs font-medium text-gray-700 dark:text-gray-300">DD%</th>
-            <th className="px-3 py-2 text-left text-xs font-medium text-gray-700 dark:text-gray-300">win%</th>
-            <th className="px-3 py-2 text-left text-xs font-medium text-gray-700 dark:text-gray-300">saved</th>
-            <th className="px-3 py-2 text-left text-xs font-medium text-gray-700 dark:text-gray-300">name</th>
+            {columns.map(c => (
+              <th key={c.key} onClick={() => toggleSort(c.key)}
+                className="px-3 py-2 text-left text-xs font-medium text-gray-700 dark:text-gray-300 cursor-pointer select-none hover:text-gray-900 dark:hover:text-gray-100 whitespace-nowrap">
+                {c.label}<span className="text-blue-500">{sortKey === c.key ? (sortDir === 'asc' ? ' ▲' : ' ▼') : ''}</span>
+              </th>
+            ))}
             <th className="px-3 py-2 text-left text-xs font-medium text-gray-700 dark:text-gray-300">Actions</th>
           </tr>
         </thead>
         <tbody>
-          {filtered.map(r => (
+          {sorted.map(r => (
             <tr key={r.id} onClick={() => onSelect(r.id)}
               className="border-b border-gray-200 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-700 cursor-pointer transition-colors">
               <td className="px-3 py-2 text-sm text-gray-900 dark:text-gray-100">{r.id}</td>

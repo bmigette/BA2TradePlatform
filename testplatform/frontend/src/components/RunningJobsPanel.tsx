@@ -188,6 +188,70 @@ function fmt(v?: number, n = 2): string {
   return typeof v === 'number' && isFinite(v) ? v.toFixed(n) : '–';
 }
 
+/**
+ * Compact live progress for ONE running job, matched by name — rendered in the right-hand detail
+ * pane (next to the "Running the backtest…" spinner) so the % bar isn't only on the Running tab.
+ * Polls every 2s; renders nothing until a matching running task/optimization with a progress value
+ * is found.
+ */
+export function RunningJobProgress({ name }: { name?: string }) {
+  const [job, setJob] = useState<TaskInfo | null>(null);
+  const [opt, setOpt] = useState<RunningOpt | null>(null);
+  useEffect(() => {
+    if (!name) return;
+    let alive = true;
+    const tick = async () => {
+      try {
+        const [tasks, opts] = await Promise.all([
+          listTasks('running'),
+          listRunningOptimizations().catch(() => [] as RunningOpt[]),
+        ]);
+        if (!alive) return;
+        setJob(tasks.find(t => t.name === name) ?? null);
+        setOpt(opts.find(o => o.name === name) ?? null);
+      } catch { /* keep last known progress */ }
+    };
+    tick();
+    const id = setInterval(tick, 2000);
+    return () => { alive = false; clearInterval(id); };
+  }, [name]);
+
+  const rawPct = job?.progress ?? opt?.progress;
+  if (rawPct == null) return null;
+  const pct = Math.max(0, Math.min(100, Math.round(rawPct)));
+  const { gen, total, ind, indTotal, best } = parseProgress(job?.progress_message);
+  const genPct = ind != null && indTotal ? Math.round((ind / indTotal) * 100) : null;
+  return (
+    <div className="w-full max-w-sm mt-2 text-left">
+      <div className="flex items-center justify-between text-xs text-gray-500 dark:text-gray-400 mb-1">
+        <span>Total{gen != null && total != null ? ` · generation ${gen} / ${total}` : ''}</span>
+        <span className="font-medium text-gray-700 dark:text-gray-300">{pct}%</span>
+      </div>
+      <div className="bg-gray-200 dark:bg-gray-700 rounded-full h-2.5">
+        <div className="bg-blue-500 h-2.5 rounded-full transition-all" style={{ width: `${pct}%` }} />
+      </div>
+      {genPct != null && (
+        <div className="mt-2">
+          <div className="flex items-center justify-between text-xs text-gray-500 dark:text-gray-400 mb-1">
+            <span>Generation {gen ?? ''} · individual {ind} / {indTotal}</span>
+            <span className="font-medium text-gray-700 dark:text-gray-300">{genPct}%</span>
+          </div>
+          <div className="bg-gray-200 dark:bg-gray-700 rounded-full h-1.5">
+            <div className="bg-indigo-400 h-1.5 rounded-full transition-all" style={{ width: `${genPct}%` }} />
+          </div>
+        </div>
+      )}
+      {(best != null || (gen == null && job?.progress_message)) && (
+        <div className="mt-2 text-xs text-gray-600 dark:text-gray-400">
+          {best != null
+            ? <>Best fitness <span className="font-semibold text-emerald-600 dark:text-emerald-400">{best}</span></>
+            : <span className="truncate">{job?.progress_message}</span>}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /** Live best-metric + top-individuals table for a running optimization (matched to its job). */
 function OptimizationDetail({ opt }: { opt?: RunningOpt }) {
   if (!opt) return null;
