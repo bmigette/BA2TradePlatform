@@ -5,9 +5,11 @@ function fmt(v?: number | null, n = 3): string {
   return typeof v === 'number' && isFinite(v) ? v.toFixed(n) : '–';
 }
 
-/** Render a single gene value compactly (round floats; pass through ints/strings/bools). */
+/** Render a single gene value compactly (round floats, compact large magnitudes; pass through bools). */
 function fmtVal(v: unknown): string {
   if (typeof v === 'number') {
+    if (Math.abs(v) >= 1e9) return `${(v / 1e9).toFixed(v % 1e9 === 0 ? 0 : 1)}B`;
+    if (Math.abs(v) >= 1e6) return `${(v / 1e6).toFixed(v % 1e6 === 0 ? 0 : 1)}M`;
     return Number.isInteger(v) ? String(v) : v.toFixed(2);
   }
   if (typeof v === 'boolean') return v ? 'on' : 'off';
@@ -15,20 +17,21 @@ function fmtVal(v: unknown): string {
 }
 
 /**
- * Compact view of the genes that distinguish individuals: the strategy-level tp/sl plus a
- * couple of expert `model:*` genes (the RM/decision settings). Other namespaces (cond:*,
- * exit:*) are skipped to keep the cell readable. Returns '' when there's nothing to show.
+ * View of the genes that distinguish individuals: strategy-level tp/sl, then ALL tuned
+ * `model:*` (expert/decision) and `screener:*` genes. The many `cond:*`/`exit:*` toggles are
+ * skipped here (shown structured in the Strategy tab) to keep the cell scannable. Returns ''
+ * when there's nothing to show.
  */
 function paramsPreview(params?: Record<string, unknown>): string {
   if (!params) return '';
   const bits: string[] = [];
   if ('tp' in params) bits.push(`tp ${fmtVal(params.tp)}`);
   if ('sl' in params) bits.push(`sl ${fmtVal(params.sl)}`);
-  const modelGenes = Object.keys(params)
-    .filter(k => k.startsWith('model:'))
-    .slice(0, 2);
-  for (const k of modelGenes) {
-    bits.push(`${k.slice('model:'.length)} ${fmtVal(params[k])}`);
+  for (const k of Object.keys(params)) {
+    if (k.startsWith('model:')) bits.push(`${k.slice('model:'.length)} ${fmtVal(params[k])}`);
+  }
+  for (const k of Object.keys(params)) {
+    if (k.startsWith('screener:')) bits.push(`${k.slice('screener:'.length).replace(/^screener_/, '')} ${fmtVal(params[k])}`);
   }
   return bits.join(' · ');
 }
