@@ -80,6 +80,10 @@ def main() -> int:
                     help="Comma-separated remote worker NAMES to distribute each job's GA trials to "
                          "(e.g. 'remote150'); trials spread across these + local. Workers must be "
                          "registered + cache-synced first.")
+    ap.add_argument("--parallel", type=int, default=2,
+                    help="Local trial consumers per job (ThreadPoolExecutor). Keep low when "
+                         "distributing to remote workers — each local consumer holds the OHLCV "
+                         "cache in RAM (~5GB at 5min), so 4 saturates a 64GB host. Default 2.")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -107,7 +111,7 @@ def main() -> int:
                "--start", args.start, "--end", args.end, "--fitness", args.fitness,
                "--interval", args.interval, "--population", str(args.population),
                "--generations", str(args.generations), "--screener-cadence-days", str(args.cadence_days),
-               "--run-schedule", "weekly", "--name", name]
+               "--run-schedule", "weekly", "--name", name, "--parallel", str(args.parallel)]
         if strat is not None:
             cmd += ["--strategy", strat]
         if args.workers:
