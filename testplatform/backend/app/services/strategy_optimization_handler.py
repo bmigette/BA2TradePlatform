@@ -499,10 +499,10 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             if _workers:
                 from app.services.distributed_eval import DistributedEvaluator
                 from app.services.self_update import get_version_info
-                _master_commit = get_version_info().get("git_commit")
+                _master_version = get_version_info().get("app_version")
                 _evaluator = DistributedEvaluator(
                     _pool, opt.fitness_metric, parallel, opt_id,
-                    workers=_workers, master_commit=_master_commit,
+                    workers=_workers, master_version=_master_version,
                 )
                 _evaluator.start()  # pre-flight: version-match + cache-push each worker
                 batch_fitness = make_batch_fitness(_evaluator.execute_jobs)

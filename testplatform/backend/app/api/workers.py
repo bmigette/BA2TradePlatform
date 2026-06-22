@@ -440,6 +440,6 @@ async def update_worker_code(worker_id: int, db: Session = Depends(get_db)):
     if worker.is_local:
         return {"status": "skipped", "message": "Local worker updates with the master"}
     from app.services import worker_client, self_update
-    master_commit = self_update.get_version_info().get("git_commit")
-    ok = worker_client.ensure_synced(_worker_dict(worker), master_commit, max_wait=180.0)
-    return {"status": "ok" if ok else "failed", "synced": ok, "masterCommit": master_commit}
+    master_version = self_update.get_version_info().get("app_version")
+    ok = worker_client.ensure_synced(_worker_dict(worker), master_version, max_wait=180.0)
+    return {"status": "ok" if ok else "failed", "synced": ok, "masterVersion": master_version}

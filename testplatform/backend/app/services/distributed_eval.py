@@ -10,8 +10,8 @@ On a worker error the dispatcher REQUEUES the trial (a local consumer or another
 up) and backs off; after repeated failures it gives up on that worker — graceful degradation to
 local-only.
 
-Pre-flight per selected worker: ``ensure_synced`` (auto-update+wait so it runs identical code —
-the determinism requirement) then ``push_cache`` (stream the missing cache as one tar). Workers
+Pre-flight per selected worker: ``ensure_synced`` (auto-update+wait so it runs a compatible build,
+matched on app version) then ``push_cache`` (stream the missing cache as one tar). Workers
 that can't be reached/synced are dropped with a warning.
 
 Determinism: a trial config is hermetic + seeded, so its fitness is independent of WHERE it ran;
@@ -41,20 +41,20 @@ class DistributedEvaluator:
     """Bridges the GA batch loop to local + remote workers via a per-optimization TrialBroker.
 
     *submit_pool* is the master's ``ProcessPoolExecutor`` (local consumers run trials through it).
-    *workers* is a list of resolved worker dicts ``{id,name,url,password,capacity}``. *master_commit*
-    is the master's git commit (workers are version-matched to it before use).
+    *workers* is a list of resolved worker dicts ``{id,name,url,password,capacity}``. *master_version*
+    is the master's app version (workers are version-matched to it before use).
     """
 
     def __init__(self, submit_pool, fitness_metric: str, n_consumers: int,
                  optimization_id: Any, workers: Optional[List[dict]] = None,
-                 master_commit: Optional[str] = None, log=logger.warning,
+                 master_version: Optional[str] = None, log=logger.warning,
                  requeue_timeout: float = 1800.0):
         self.pool = submit_pool
         self.fitness_metric = fitness_metric
         self.n_consumers = max(1, n_consumers)
         self.optimization_id = optimization_id
         self.workers = workers or []
-        self.master_commit = master_commit
+        self.master_version = master_version
         self.log = log
         self.requeue_timeout = requeue_timeout  # safety net: re-queue a trial whose worker vanished
         self.broker = TrialBroker()  # OWN broker (per-optimization isolation; queue is max_workers=4)
@@ -70,7 +70,7 @@ class DistributedEvaluator:
                 if not w.get("password"):
                     self.log(f"worker {w.get('name')} has no password configured; excluding")
                     continue
-                if not worker_client.ensure_synced(w, self.master_commit, log=self.log):
+                if not worker_client.ensure_synced(w, self.master_version, log=self.log):
                     continue
                 worker_client.push_cache(w, log=self.log)
                 try:

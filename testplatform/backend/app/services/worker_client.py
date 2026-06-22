@@ -81,19 +81,24 @@ def push_cache(worker: dict, log: Callable[[str], None] = logger.info) -> dict:
     return {"pushed": len(missing), **res}
 
 
-def ensure_synced(worker: dict, master_commit: Optional[str],
+def ensure_synced(worker: dict, master_version: Optional[str],
                   log: Callable[[str], None] = logger.info, max_wait: float = 300.0) -> bool:
-    """Make the worker run identical code to the master: if its git commit differs, trigger its
-    /update and wait (polling /version) until it matches. Returns True if usable, False to exclude.
+    """Make the worker run a compatible build: if its app version differs from the master's,
+    trigger its /update and wait (polling /version) until it matches. Returns True if usable,
+    False to exclude.
+
+    Compatibility is keyed on ``app_version`` (not the git commit) so that ordinary pushes —
+    docs, scratch scripts, unrelated fixes — don't force every connected worker to self-update
+    mid-run. A worker only needs to re-sync when the app version is intentionally bumped.
     """
     try:
-        wc = version(worker).get("git_commit")
+        wv = version(worker).get("app_version")
     except Exception as e:  # noqa: BLE001
         log(f"worker {worker['name']} unreachable ({e}); excluding")
         return False
-    if not master_commit or not wc or wc == master_commit:
+    if not master_version or not wv or wv == master_version:
         return True
-    log(f"worker {worker['name']} version {wc} != master {master_commit}; updating + waiting...")
+    log(f"worker {worker['name']} version {wv} != master {master_version}; updating + waiting...")
     try:
         with httpx.Client(timeout=120.0) as c:
             c.post(f"{_base(worker)}/update", headers=_headers(worker))
@@ -103,10 +108,10 @@ def ensure_synced(worker: dict, master_commit: Optional[str],
     while time.time() < deadline:
         time.sleep(3.0)
         try:
-            if version(worker).get("git_commit") == master_commit:
-                log(f"worker {worker['name']} updated to {master_commit}")
+            if version(worker).get("app_version") == master_version:
+                log(f"worker {worker['name']} updated to {master_version}")
                 return True
         except Exception:  # noqa: BLE001 — still restarting
             continue
-    log(f"worker {worker['name']} did not converge to {master_commit} in {max_wait:.0f}s; excluding")
+    log(f"worker {worker['name']} did not converge to {master_version} in {max_wait:.0f}s; excluding")
     return False
