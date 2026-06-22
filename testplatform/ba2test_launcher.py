@@ -704,9 +704,24 @@ def _build_strategy_row(name: str):
     # evaluates via the real TradeActionEvaluator on the analysis cadence (identical to live).
     # Every rule is on/off-toggleable (toggle_optimize -> exit:<id>:enabled gene); numeric
     # condition thresholds (cond:<id>:value) and adjust-action %s (exit:<id>:action_value) are
-    # value-optimized with steps. (The immediate initial TP/SL bracket stays via the tp/sl genes;
-    # these rules ADJUST/CLOSE on top of it.)
+    # value-optimized with steps. (The initial SL bracket stays via the sl gene; TAKE-PROFIT is a
+    # toggleable profit_loss_percent CLOSE rule below — not a global initial-TP bracket, which never
+    # fired in practice.)
     exit_conditions = [
+        # Protective stop (condition form, matches live): while holding, set the SL at entry -X%
+        # (adjust_stop_loss ref=order_open_price, negative offset). Value-optimized + toggleable.
+        # Replaces the global SL bracket so exits are 100% condition-driven like the live engine.
+        {"id": "exit_stoploss", "action_type": "adjust_stop_loss", "reference_value": "order_open_price",
+         "action_value": -6.0, "action_value_optimize": True,
+         "action_value_min": -20.0, "action_value_max": -3.0, "action_value_step": 2.0,
+         "toggle_optimize": True,
+         "conditions": {"type": "AND", "conditions": [{"id": "sl_hold", "field": "has_position"}]}},
+        # Take-profit (condition form): close once up +X%. Value-optimized + on/off-toggleable so the
+        # GA tunes or disables it — replaces the dead global initial-TP bracket.
+        {"id": "exit_takeprofit", "action_type": "close", "toggle_optimize": True,
+         "conditions": {"type": "AND", "conditions": [
+             {"id": "xtp", "field": "profit_loss_percent", "op": ">", "value": 20,
+              "optimize": True, "value_min": 8, "value_max": 60, "value_step": 4}]}},
         # Close the position when the expert turns bearish (sell signal).
         {"id": "exit_bearish", "action_type": "close", "toggle_optimize": True,
          "conditions": {"type": "AND", "conditions": [{"id": "xb", "field": "bearish"}]}},
@@ -731,10 +746,11 @@ def _build_strategy_row(name: str):
         name=name,
         buy_entry_conditions=buy_entry_conditions,
         exit_conditions=exit_conditions,
-        # TP capped at 25%: wider TPs (33-40%) only pay off in a bull market and drag the win
-        # rate down to ~30%. Cap forces more frequent profit-taking (plan: TP 5->25 step 2).
-        initial_tp_percent=10.0, initial_tp_optimize=True, initial_tp_min=5.0, initial_tp_max=25.0, initial_tp_step=2.0,
-        initial_sl_percent=6.0, initial_sl_optimize=True, initial_sl_min=3.0, initial_sl_max=20.0, initial_sl_step=2.0,
+        # No global TP/SL brackets — exits are 100% condition-driven, matching the live engine
+        # (which attaches no baseline bracket on entry). TP = the exit_takeprofit CLOSE rule; SL =
+        # the exit_stoploss adjust_stop_loss rule above (both optimized + toggleable).
+        initial_tp_percent=200.0, initial_tp_optimize=False,
+        initial_sl_percent=200.0, initial_sl_optimize=False,
     )
 
 
@@ -759,6 +775,13 @@ def _build_strategy_S3(name: str):
     # Staged trailing stop: as profit crosses each tier, raise the stop to entry +lock%. Tiers and
     # locks are optimized; rules toggle on/off. The time exit caps dead-money holds.
     exit_conditions = [
+        # Initial protective stop (condition form, matches live): set SL at entry -X% while holding.
+        # The trailing tiers below only ratchet it UP in profit, so this is the floor before them.
+        {"id": "exit_stoploss", "action_type": "adjust_stop_loss", "reference_value": "order_open_price",
+         "action_value": -8.0, "action_value_optimize": True,
+         "action_value_min": -20.0, "action_value_max": -3.0, "action_value_step": 2.0,
+         "toggle_optimize": True,
+         "conditions": {"type": "AND", "conditions": [{"id": "sl_hold", "field": "has_position"}]}},
         {"id": "trail_t1", "action_type": "adjust_stop_loss", "reference_value": "order_open_price",
          "action_value": 1.0, "action_value_optimize": True,
          "action_value_min": -2.0, "action_value_max": 6.0, "action_value_step": 1.0, "toggle_optimize": True,
@@ -786,10 +809,10 @@ def _build_strategy_S3(name: str):
         name=name,
         buy_entry_conditions=buy_entry_conditions,
         exit_conditions=exit_conditions,
-        # No fixed TP (wide, NOT optimized) — let winners run under the trail. A protective initial
-        # stop IS optimized; the trailing tiers ratchet it up from there.
+        # No global TP/SL brackets — exits are 100% condition-driven (matches live). The protective
+        # stop is the exit_stoploss adjust_stop_loss rule above; the trailing tiers ratchet it up.
         initial_tp_percent=200.0, initial_tp_optimize=False,
-        initial_sl_percent=8.0, initial_sl_optimize=True, initial_sl_min=4.0, initial_sl_max=20.0, initial_sl_step=2.0,
+        initial_sl_percent=200.0, initial_sl_optimize=False,
     )
 
 
@@ -868,8 +891,9 @@ def _build_strategy_S1(name: str, expert: str):
     """S1 — the expert's LIVE dev-account ruleset (exported to docs/live_rulesets/{expert}.json),
     normalized to the canonical Strategy shape with optimize flags on every threshold + adjust-%.
     Faithful to the live enter (buy/sell trees, OR groups preserved) + open_positions (exit) rules.
-    An optimizable initial TP/SL bracket (TP<=25) is added like live (the live entry sets one via
-    expert_target_price)."""
+    An optimizable initial SL bracket is added; the entry-anchored global TP is left off (it never
+    fires in practice — TP for FMPRating lives in the exit conditions, and S4 re-anchors TP on the
+    analyst target price)."""
     import json as _json
     from app.models.strategy import Strategy
     repo_root = os.path.dirname(os.path.abspath(__file__))
@@ -887,8 +911,10 @@ def _build_strategy_S1(name: str, expert: str):
         name=name,
         buy_entry_conditions=buy,
         exit_conditions=exits,
-        initial_tp_percent=12.0, initial_tp_optimize=True, initial_tp_min=5.0, initial_tp_max=25.0, initial_tp_step=2.0,
-        initial_sl_percent=8.0, initial_sl_optimize=True, initial_sl_min=3.0, initial_sl_max=20.0, initial_sl_step=2.0,
+        # No global TP/SL brackets — S1 runs the LIVE ruleset's conditions verbatim (its
+        # adjust_stop_loss / adjust_take_profit / close rules), exactly like the live engine.
+        initial_tp_percent=200.0, initial_tp_optimize=False,
+        initial_sl_percent=200.0, initial_sl_optimize=False,
     )
 
 
@@ -901,12 +927,18 @@ def _build_strategy_S4(name: str, expert: str):
     NVDA to +1065% and exited via take_profit (~2.3x the entry-anchored return). Pairs with the
     optimizable target_price_type (which analyst reference price to anchor on)."""
     strat = _build_strategy_S1(name, expert)
-    # Re-anchor the initial TP as a NEGATIVE-CAPABLE offset-from-target (the GA samples
-    # uniform(min,max) + clips, so a negative min is fine — only the RANGE had to open up).
-    strat.initial_tp_percent = 0.0
-    strat.initial_tp_min = -20.0
-    strat.initial_tp_max = 10.0
-    strat.initial_tp_step = 2.0
+    # Conditions-only target-anchoring (no global bracket — matches live): add an always-on rule
+    # that sets the TP to the analyst target price while holding. The NEGATIVE-CAPABLE offset is the
+    # optimizable gene — TP = target * (1 + offset/100), so e.g. -10 -> TP at 90% of target. This is
+    # S4's distinguishing mechanism, now expressed as an exit condition (like live-34) rather than a
+    # global initial-TP bracket. (Validated entry-anchored ~2.3x: rode NVDA to +1065% via take_profit.)
+    strat.exit_conditions = list(strat.exit_conditions or []) + [
+        {"id": "tp_target", "action_type": "adjust_take_profit", "reference_value": "expert_target_price",
+         "action_value": 0.0, "action_value_optimize": True,
+         "action_value_min": -20.0, "action_value_max": 10.0, "action_value_step": 2.0,
+         "toggle_optimize": True,
+         "conditions": {"type": "AND", "conditions": [{"id": "tp_hold", "field": "has_position"}]}},
+    ]
     return strat
 
 
