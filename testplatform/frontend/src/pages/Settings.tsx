@@ -430,11 +430,11 @@ const Settings: React.FC = () => {
                     <label className="sm:w-64 flex-shrink-0 text-sm font-medium text-gray-700 dark:text-gray-300 flex items-center gap-2">
                       <span className="truncate">{ck.key}</span>
                       {ck.is_set ? (
-                        <span className="px-2 py-0.5 text-xs font-medium rounded-full bg-green-100 text-green-800 border border-green-300 dark:bg-green-700/40 dark:text-green-100 dark:border-green-600/50">
+                        <span className="px-2 py-0.5 text-xs font-medium rounded-full bg-emerald-600 text-white border border-emerald-600">
                           set
                         </span>
                       ) : (
-                        <span className="px-2 py-0.5 text-xs font-medium rounded-full bg-gray-100 text-gray-600 border border-gray-300 dark:bg-gray-600/40 dark:text-gray-200 dark:border-gray-500/50">
+                        <span className="px-2 py-0.5 text-xs font-medium rounded-full bg-slate-500 text-white border border-slate-500">
                           unset
                         </span>
                       )}
@@ -554,7 +554,7 @@ const Settings: React.FC = () => {
                         <div className="flex items-center gap-2">
                           <h3 className="font-semibold text-gray-900 dark:text-gray-100">{worker.name}</h3>
                           {worker.isLocal && (
-                            <span className="px-2 py-0.5 text-xs font-medium rounded-full bg-blue-100 text-blue-800 border border-blue-300 dark:bg-blue-700/40 dark:text-blue-100 dark:border-blue-600/50">
+                            <span className="px-2 py-0.5 text-xs font-medium rounded-full bg-blue-600 text-white border border-blue-600">
                               Local
                             </span>
                           )}
@@ -599,12 +599,12 @@ const Settings: React.FC = () => {
                         {/* Capabilities */}
                         <div className="flex gap-2 mt-2">
                           {worker.capabilities.train && (
-                            <span className="px-2 py-0.5 text-xs font-medium rounded-full bg-purple-100 text-purple-800 border border-purple-300 dark:bg-purple-700/40 dark:text-purple-100 dark:border-purple-600/50">
+                            <span className="px-2 py-0.5 text-xs font-medium rounded-full bg-purple-600 text-white border border-purple-600">
                               Training
                             </span>
                           )}
                           {worker.capabilities.infer && (
-                            <span className="px-2 py-0.5 text-xs font-medium rounded-full bg-green-100 text-green-800 border border-green-300 dark:bg-green-700/40 dark:text-green-100 dark:border-green-600/50">
+                            <span className="px-2 py-0.5 text-xs font-medium rounded-full bg-teal-600 text-white border border-teal-600">
                               Inference
                             </span>
                           )}

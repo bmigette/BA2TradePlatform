@@ -52,10 +52,20 @@ class SystemResources(BaseModel):
     gpuMemoryTotalMB: Optional[int] = None
 
 
+class WorkerStat(BaseModel):
+    name: str
+    status: str  # online / offline / busy / disabled
+    isLocal: bool
+    isEnabled: bool
+    activeJobs: int
+    cores: Optional[int] = None
+
+
 class DashboardResponse(BaseModel):
     jobStats: JobStats
     recentActivity: List[ActivityItem]
     systemResources: SystemResources
+    workers: List[WorkerStat] = []
 
 
 @router.get("/stats", response_model=DashboardResponse)
@@ -82,6 +92,24 @@ async def get_dashboard_stats(db: Session = Depends(get_db)):
         if status in job_stats:
             job_stats[status] += 1
         job_stats["total"] += 1
+
+    # Strategy/expert optimizations (the GA optimizer jobs) live in the DB, not jobs_store, so the
+    # overview must count them too — otherwise the new expert optimizations never show. Map their
+    # status to the same buckets (pending -> queued). Counts use a cheap GROUP BY over ALL rows.
+    _OPT_BUCKET = {"running": "running", "completed": "completed", "failed": "failed",
+                   "paused": "paused", "pending": "queued", "queued": "queued",
+                   "cancelled": "cancelled"}
+    try:
+        from sqlalchemy import func
+        from app.models.strategy_optimization import StrategyOptimization
+        for st, n in (db.query(StrategyOptimization.status, func.count())
+                      .group_by(StrategyOptimization.status).all()):
+            bucket = _OPT_BUCKET.get(st or "pending")
+            if bucket:
+                job_stats[bucket] += n
+            job_stats["total"] += n
+    except Exception as e:
+        logger.warning(f"Could not count strategy optimizations: {e}")
 
     # Get recent activity from jobs and datasets
     activities: List[ActivityItem] = []
@@ -170,9 +198,46 @@ async def get_dashboard_stats(db: Session = Depends(get_db)):
     except Exception as e:
         logger.warning(f"Could not fetch backtests for activity: {e}")
 
+    # Add strategy/expert optimization activities (the GA optimizer jobs themselves).
+    try:
+        from app.models.strategy_optimization import StrategyOptimization
+        _OPT_ACTION = {"running": "started", "completed": "completed", "failed": "failed"}
+        opts = (db.query(StrategyOptimization)
+                .order_by(StrategyOptimization.created_at.desc()).limit(20).all())
+        for opt in opts:
+            st = opt.status or "pending"
+            ts = (opt.completed_at or opt.started_at or opt.created_at)
+            activities.append(ActivityItem(
+                id=f"opt-{opt.id}",
+                type="job",
+                action=_OPT_ACTION.get(st, "created"),
+                title=f"Optimization '{opt.name or ('#' + str(opt.id))}'",
+                timestamp=ts.isoformat() if ts else datetime.now().isoformat(),
+                status=st,
+            ))
+    except Exception as e:
+        logger.warning(f"Could not fetch strategy optimizations for activity: {e}")
+
     # Sort by timestamp descending and limit to 20
     activities.sort(key=lambda x: x.timestamp, reverse=True)
     activities = activities[:20]
+
+    # Worker fleet summary (local + remote). Local worker is always reachable from here, so report
+    # it online; remote status is whatever the last health-check/optimization pre-flight stored.
+    worker_stats: List[WorkerStat] = []
+    try:
+        for w in db.query(Worker).order_by(Worker.is_local.desc(), Worker.name).all():
+            cores = w.cpu_info.get("cores") if isinstance(w.cpu_info, dict) else None
+            worker_stats.append(WorkerStat(
+                name=w.name,
+                status=("online" if w.is_local else (w.status or "offline")),
+                isLocal=bool(w.is_local),
+                isEnabled=bool(w.is_enabled),
+                activeJobs=w.active_jobs_count or 0,
+                cores=cores,
+            ))
+    except Exception as e:
+        logger.warning(f"Could not fetch workers for dashboard: {e}")
 
     # Get system resources
     cpu_percent = psutil.cpu_percent()
@@ -222,5 +287,6 @@ async def get_dashboard_stats(db: Session = Depends(get_db)):
     return DashboardResponse(
         jobStats=JobStats(**job_stats),
         recentActivity=activities,
-        systemResources=system_resources
+        systemResources=system_resources,
+        workers=worker_stats,
     )

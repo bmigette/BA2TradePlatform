@@ -14,7 +14,8 @@ import {
   Brain,
   BarChart3,
   AlertCircle,
-  RefreshCw
+  RefreshCw,
+  Server
 } from 'lucide-react';
 
 interface JobStats {
@@ -46,10 +47,20 @@ interface SystemResources {
   gpuMemoryTotalMB: number | null;
 }
 
+interface WorkerStat {
+  name: string;
+  status: string;
+  isLocal: boolean;
+  isEnabled: boolean;
+  activeJobs: number;
+  cores: number | null;
+}
+
 interface DashboardData {
   jobStats: JobStats;
   recentActivity: ActivityItem[];
   systemResources: SystemResources;
+  workers?: WorkerStat[];
 }
 
 
@@ -147,6 +158,7 @@ const Dashboard: React.FC = () => {
   }
 
   const { jobStats, recentActivity, systemResources } = data!;
+  const workers = data!.workers ?? [];
 
   return (
     <div className="p-6 space-y-6">
@@ -250,11 +262,14 @@ const Dashboard: React.FC = () => {
                       {formatTimestamp(item.timestamp)}
                     </p>
                   </div>
+                  {/* Badge contract: SOLID mid-tone bg + white text (the app's dark theme makes
+                      `dark:` variants inert and force-lightens pill text, so light `-100` pills
+                      render as invisible text). */}
                   <span className={`text-xs font-semibold px-2 py-0.5 rounded-full border ${
-                    item.type === 'job' ? 'bg-blue-100 text-blue-800 border-blue-200 dark:bg-blue-700/40 dark:text-blue-100 dark:border-blue-600/50' :
-                    item.type === 'dataset' ? 'bg-purple-100 text-purple-800 border-purple-200 dark:bg-purple-700/40 dark:text-purple-100 dark:border-purple-600/50' :
-                    item.type === 'model' ? 'bg-green-100 text-green-800 border-green-200 dark:bg-green-700/40 dark:text-green-100 dark:border-green-600/50' :
-                    'bg-amber-100 text-amber-800 border-amber-200 dark:bg-amber-700/40 dark:text-amber-100 dark:border-amber-600/50'
+                    item.type === 'job' ? 'bg-blue-600 text-white border-blue-600' :
+                    item.type === 'dataset' ? 'bg-purple-600 text-white border-purple-600' :
+                    item.type === 'model' ? 'bg-emerald-600 text-white border-emerald-600' :
+                    'bg-amber-600 text-white border-amber-600'
                   }`}>
                     {item.type}
                   </span>
@@ -380,6 +395,49 @@ const Dashboard: React.FC = () => {
                 <p className="text-xs text-gray-500">Success Rate</p>
               </div>
             </div>
+          </div>
+
+          {/* Workers */}
+          <div className="mt-6 pt-4 border-t border-gray-200 dark:border-gray-700">
+            <h3 className="text-sm font-medium mb-3 flex items-center gap-2">
+              <Server className="w-4 h-4 text-blue-500" />
+              Workers
+              <span className="text-xs text-gray-500">
+                ({workers.filter(w => w.isEnabled && w.status === 'online').length} online / {workers.length} total)
+              </span>
+            </h3>
+            {workers.length === 0 ? (
+              <p className="text-xs text-gray-500">No workers configured.</p>
+            ) : (
+              <div className="space-y-2">
+                {workers.map((w) => (
+                  <div key={w.name} className="flex items-center justify-between gap-2 p-2 bg-gray-50 dark:bg-gray-700/50 rounded-lg">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span className="text-sm font-medium truncate text-gray-800 dark:text-gray-100">{w.name}</span>
+                      {w.isLocal && (
+                        <span className="px-2 py-0.5 text-xs font-medium rounded-full bg-blue-600 text-white">Local</span>
+                      )}
+                      {/* Badge contract: solid mid-tone bg + white text (dark theme makes `dark:`
+                          variants inert and force-lightens pill text). */}
+                      <span className={`px-2 py-0.5 text-xs font-medium rounded-full ${
+                        !w.isEnabled ? 'bg-slate-500 text-white' :
+                        w.status === 'online' ? 'bg-emerald-600 text-white' :
+                        w.status === 'busy' ? 'bg-amber-600 text-white' :
+                        'bg-red-600 text-white'
+                      }`}>
+                        {w.isEnabled ? w.status : 'disabled'}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-3 text-xs text-gray-500 dark:text-gray-400 flex-shrink-0">
+                      {w.cores != null && (
+                        <span className="flex items-center gap-1"><Cpu className="w-3 h-3" />{w.cores}</span>
+                      )}
+                      <span className="flex items-center gap-1"><Activity className="w-3 h-3" />{w.activeJobs} jobs</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         </section>
       </div>
