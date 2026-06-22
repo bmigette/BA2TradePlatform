@@ -57,6 +57,29 @@ def _verify(authorization: Optional[str]) -> None:
 class RunTrialReq(BaseModel):
     config: dict
     fitness_metric: str
+    cache_root: Optional[str] = None  # the MASTER's CACHE_FOLDER, for path localization
+
+
+def _localize_paths(obj, master_root: str, local_root: str):
+    """Recursively rewrite any string under the MASTER's cache root to THIS worker's cache root.
+
+    Trial configs embed absolute cache paths computed on the master (screener_store,
+    screener_runtime.store, options_cache_db, ...). The master and worker don't share a filesystem
+    layout, so a verbatim path would miss the locally-synced cache. This remaps the master prefix
+    to the local one; non-cache strings pass through unchanged. OS-separator tolerant.
+    """
+    mr = master_root.replace("\\", "/").rstrip("/")
+    if isinstance(obj, str):
+        v = obj.replace("\\", "/")
+        if v == mr or v.startswith(mr + "/"):
+            rel = v[len(mr):].lstrip("/")
+            return os.path.join(local_root, *rel.split("/")) if rel else local_root
+        return obj
+    if isinstance(obj, dict):
+        return {k: _localize_paths(val, master_root, local_root) for k, val in obj.items()}
+    if isinstance(obj, list):
+        return [_localize_paths(x, master_root, local_root) for x in obj]
+    return obj
 
 
 def _hardware() -> dict:
@@ -123,8 +146,12 @@ def run_trial(req: RunTrialReq, authorization: str = Header(default=None)):
     from app.services.strategy_optimization_handler import _trial_worker
     if _POOL is None:
         raise HTTPException(status_code=503, detail="Worker pool not initialized.")
+    config = req.config
+    if req.cache_root:
+        from ba2_common.config import CACHE_FOLDER
+        config = _localize_paths(req.config, req.cache_root, CACHE_FOLDER)
     try:
-        return _POOL.submit(_trial_worker, req.config, req.fitness_metric).result()
+        return _POOL.submit(_trial_worker, config, req.fitness_metric).result()
     except Exception as e:  # noqa: BLE001 — surface as a failed trial, never 500 the dispatcher
         return {"ok": False, "fitness": 0.0, "trades": 0, "error": repr(e), "fatal": False}
 

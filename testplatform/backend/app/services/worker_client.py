@@ -41,10 +41,17 @@ def version(worker: dict, timeout: float = 10.0) -> dict:
 
 
 def run_trial(worker: dict, config: dict, fitness_metric: str, timeout: float = 1800.0) -> dict:
-    """Push ONE trial to the worker and return its ``{ok,fitness,trades,error,fatal}`` summary."""
+    """Push ONE trial to the worker and return its ``{ok,fitness,trades,error,fatal}`` summary.
+
+    Sends the master's ``cache_root`` so the worker can remap absolute cache paths embedded in the
+    config (screener_store, options_cache_db, ...) to ITS OWN local cache — the master and worker
+    don't share a filesystem path.
+    """
+    from ba2_common.config import CACHE_FOLDER
     with httpx.Client(timeout=timeout) as c:
         r = c.post(f"{_base(worker)}/run-trial", headers=_headers(worker),
-                   json={"config": config, "fitness_metric": fitness_metric})
+                   json={"config": config, "fitness_metric": fitness_metric,
+                         "cache_root": CACHE_FOLDER})
         r.raise_for_status()
         return r.json()
 

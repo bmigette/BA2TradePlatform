@@ -1,6 +1,6 @@
 import logging
 from logging.handlers import RotatingFileHandler
-from ba2_common.config import STDOUT_LOGGING, FILE_LOGGING, HOME, HOME_PARENT
+from ba2_common.config import STDOUT_LOGGING, FILE_LOGGING, HOME, HOME_PARENT, LOG_FOLDER
 import os
 import io
 import sys
@@ -17,7 +17,11 @@ logger.propagate = False
 
 # Shared constants
 LOG_FORMAT = '%(asctime)s - %(name)s - %(module)s - %(levelname)s - %(message)s'
-LOGS_DIR = os.path.join(HOME_PARENT, "logs")
+# Import-time default lives under the BA2 data root (LOG_FOLDER = <BA2_HOME>/test/logs), NEVER in
+# the code repo. Per-platform startup then relocates to <db folder>/logs via
+# reconfigure_file_logging() (serve/live). The old `HOME_PARENT/logs` default wrote into
+# packages/common/logs/ in the repo, which also signalled a process that hadn't resolved BA2_HOME.
+LOGS_DIR = LOG_FOLDER
 
 # Configure our handlers
 formatter = logging.Formatter(LOG_FORMAT)

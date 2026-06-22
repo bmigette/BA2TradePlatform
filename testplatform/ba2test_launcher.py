@@ -49,8 +49,20 @@ def _enter_backend() -> str:
         load_dotenv(os.path.join(repo_root, ".env"))
     except Exception:  # noqa: BLE001 — dotenv optional
         pass
+    # Point the shared ba2_common engine at the test DB (DATABASE_URL -> test/dl_forecasting.db),
+    # exactly like app.main does at serve startup, so get_app_setting (API keys / settings) resolves
+    # from the SAME DB for EVERY ba2-test command (worker, build-screener-metrics, ...). Without it a
+    # fresh CLI process reads ba2_common's neutral default DB (BA2_HOME/db.sqlite) and keys come back
+    # empty — which is why `ba2-test worker` failed with "FMP API key not configured".
+    try:
+        from app.models.database import DATABASE_URL as _DB_URL
+        if _DB_URL.startswith("sqlite:///"):
+            from ba2_common.core import db as _ba2_db
+            _ba2_db.configure_db(_DB_URL.replace("sqlite:///", "", 1))
+    except Exception:  # noqa: BLE001 — non-fatal; key reads would surface their own error later
+        pass
     # The test platform's legacy OHLCV providers read FMP_API_KEY from the ENV, but the key is
-    # configured in the trade app-settings DB (ba2_common). Mirror it into the env (in-process
+    # configured in the app-settings DB (ba2_common). Mirror it into the env (in-process
     # only — never written to disk) so fetch-cache/build-screener-metrics resolve it, matching how the
     # backtest path forwards the key. No-op if already set or unavailable.
     if not os.getenv("FMP_API_KEY"):

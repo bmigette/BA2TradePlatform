@@ -67,6 +67,24 @@ def test_cache_push_extracts(client, tmp_path, monkeypatch):
     assert (dst / "FMPOHLCVProvider" / "AAPL_1d.parquet").read_bytes() == b"data" * 100
 
 
+def test_localize_paths_remaps_master_cache_to_local():
+    cfg = {
+        "universe": {"mode": "screener",
+                     "screener_store": r"C:\Users\basti\Documents\ba2\common\cache\screener\metric_store"},
+        "screener_runtime": {"store": r"C:\Users\basti\Documents\ba2\common\cache\screener\metric_store"},
+        "options_cache_db": r"C:\Users\basti\Documents\ba2\common\cache\options\options_history.sqlite",
+        "experts": [{"class": "FMPRating"}],  # non-path data untouched
+        "seed": 42,
+    }
+    out = ws._localize_paths(cfg, r"C:\Users\basti\Documents\ba2\common\cache", "/local/ba2/common/cache")
+    assert out["universe"]["screener_store"] == "/local/ba2/common/cache/screener/metric_store"
+    assert out["screener_runtime"]["store"] == "/local/ba2/common/cache/screener/metric_store"
+    assert out["options_cache_db"] == "/local/ba2/common/cache/options/options_history.sqlite"
+    assert out["experts"] == [{"class": "FMPRating"}] and out["seed"] == 42  # untouched
+    # a path NOT under the master cache root is left alone
+    assert ws._localize_paths("/some/other/path", r"C:\Users\basti\Documents\ba2\common\cache", "/local/c") == "/some/other/path"
+
+
 def test_cache_push_rejects_traversal(client, tmp_path, monkeypatch):
     import tarfile
     dst = tmp_path / "worker_cache"
