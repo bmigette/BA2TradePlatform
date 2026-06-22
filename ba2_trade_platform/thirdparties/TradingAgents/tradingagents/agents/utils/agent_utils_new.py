@@ -1717,3 +1717,31 @@ def create_msg_delete():
         return {"messages": removal_operations + [placeholder]}
     
     return delete_messages
+
+
+# Patch for extract_text_from_llm_response to handle reasoning blocks
+def _patch_text_utils_extract():
+    def extract_text_from_llm_response_fixed(content):
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            text_parts = []
+            for item in content:
+                if isinstance(item, str):
+                    text_parts.append(item)
+                elif isinstance(item, dict):
+                    if item.get("type") == "reasoning":
+                        continue
+                    if "text" in item:
+                        text_parts.append(item["text"])
+            return "\n".join(text_parts)
+        return str(content)
+    try:
+        import ba2_common.core.text_utils
+        ba2_common.core.text_utils.extract_text_from_llm_response = extract_text_from_llm_response_fixed
+        logger.debug("Patched extract_text_from_llm_response to handle reasoning blocks")
+    except Exception as e:
+        logger.warning(f"Could not patch extract_text_from_llm_response: {e}")
+
+_patch_text_utils_extract()
+
