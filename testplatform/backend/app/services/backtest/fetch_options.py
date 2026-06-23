@@ -21,10 +21,14 @@ WHAT this builds:
 """
 from __future__ import annotations
 import argparse
+import logging
 import re
+import time as _time
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from .options_cache import OptionsHistoryCache
+
+logger = logging.getLogger(__name__)
 
 # Alpaca options-history floor: no chain/bar data exists before this date.
 _OPTIONS_HISTORY_FLOOR = date(2024, 2, 1)
@@ -174,17 +178,54 @@ def discover_contracts(tc: Any, underlying: str, *, expiry_gte: str, expiry_lte:
     return merged
 
 
+def _is_transient(e: Exception) -> bool:
+    """A retryable network/server condition (Alpaca's option endpoint drops connections under
+    load) vs a permanent error (bad symbol/auth) that should fail fast."""
+    s = repr(e)
+    return any(m in s for m in (
+        "RemoteDisconnected", "Connection aborted", "ConnectionError", "ConnectionResetError",
+        "timed out", "Timeout", "Max retries", "TooManyRequests", "429",
+        "502", "503", "504", "Temporarily"))
+
+
+def _with_retry(fn, *, what: str, delays=(5, 15, 30, 60)):
+    """Call ``fn()`` with exponential backoff on transient Alpaca/connection errors (mirrors the
+    FMP ``fmp_http_get`` retry contract). Non-transient errors raise immediately; transient ones
+    raise only after the delays are exhausted."""
+    last: Optional[Exception] = None
+    for attempt in range(len(delays) + 1):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001
+            last = e
+            if not _is_transient(e) or attempt == len(delays):
+                raise
+            d = delays[attempt]
+            logger.warning(f"options fetch {what}: transient error "
+                           f"(attempt {attempt + 1}/{len(delays) + 1}): {e}; retry in {d}s")
+            _time.sleep(d)
+    raise last  # unreachable
+
+
 def build_cache(cache_db: str, underlyings: List[str], start: date, end: date,
                 feed: str = "indicative", *,
                 strike_min: Optional[float] = None, strike_max: Optional[float] = None,
                 max_contracts: Optional[int] = None,
-                api_key: Optional[str] = None, api_secret: Optional[str] = None) -> Dict[str, int]:
+                api_key: Optional[str] = None, api_secret: Optional[str] = None,
+                max_workers: Optional[int] = None, resume: bool = True) -> Dict[str, int]:
     """Build a HISTORICAL options cache (expired contracts + metadata chain + daily bars).
 
-    Returns a small stats dict ``{"chain_rows", "bar_rows", "contracts"}`` for reporting.
-    Selection downstream is %OTM/DTE (no greeks). Pass ``api_key``/``api_secret`` to inject
-    credentials (e.g. from the live DB) without env. ``strike_min``/``strike_max``/``max_contracts``
-    keep the build bounded."""
+    Resilient like the FMP fetcher: underlyings are fetched CONCURRENTLY (ThreadPoolExecutor,
+    ``max_workers`` or $OPTIONS_FETCH_WORKERS, default 6) and every Alpaca call backs off + retries
+    on transient drops, so one ``RemoteDisconnected`` can't abort a 2000-symbol run. ``resume=True``
+    skips underlyings already fully cached (present in option_chain, written LAST per symbol). A
+    symbol that still fails after retries is logged + skipped (counted in ``failed``), not fatal.
+
+    Returns ``{"chain_rows","bar_rows","contracts","symbols_done","symbols_failed","skipped"}``.
+    Selection downstream is %OTM/DTE (no greeks). Pass ``api_key``/``api_secret`` to inject creds."""
+    import os as _os
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
     from alpaca.trading.client import TradingClient
     from alpaca.data.historical.option import OptionHistoricalDataClient
     from alpaca.data.requests import OptionBarsRequest
@@ -193,52 +234,87 @@ def build_cache(cache_db: str, underlyings: List[str], start: date, end: date,
         raise ValueError(
             f"Alpaca options history starts {_OPTIONS_HISTORY_FLOOR.isoformat()}; pick a later --start")
     key, secret = _alpaca_keys(api_key, api_secret)
-    tc = TradingClient(key, secret, paper=True)
-    dc = OptionHistoricalDataClient(key, secret)
     cache = OptionsHistoryCache(cache_db)
 
     expiry_gte = start.isoformat()
     expiry_lte = (end + timedelta(days=_EXPIRY_TAIL_DAYS)).isoformat()
-
     start_iso = start.isoformat()
-    stats = {"chain_rows": 0, "bar_rows": 0, "contracts": 0}
-    for u in underlyings:
-        contracts = discover_contracts(
-            tc, u, expiry_gte=expiry_gte, expiry_lte=expiry_lte,
-            strike_min=strike_min, strike_max=strike_max, max_contracts=max_contracts)
-        stats["contracts"] += len(contracts)
+    end_iso = end.isoformat()
 
-        # Fetch per-contract daily bars FIRST. We need them anyway (the tradeable premium
-        # series) AND to derive each contract's as-of premium so the chain row carries a
-        # usable bid/ask/last (the option ENTRY action requires a non-None ask to size/price).
-        # as_of_premium = the contract's CLOSE on the chain as-of date (run start); if it did
-        # not trade exactly that day, fall back to its EARLIEST available bar close in the
-        # window (still a real historical premium, and the as-of clamp keeps it no-lookahead
-        # because the chain is keyed at start).
-        rows: List[Dict[str, Any]] = []
-        for c in contracts:
-            opt_type = c.type.value if hasattr(c.type, "value") else str(c.type)
-            expiry = (c.expiration_date.isoformat()
-                      if hasattr(c.expiration_date, "isoformat") else str(c.expiration_date))
-            resp = dc.get_option_bars(OptionBarsRequest(
-                symbol_or_symbols=c.symbol, timeframe=TimeFrame.Day,
-                start=start_iso, end=end.isoformat()))
-            bars = (resp.data or {}).get(c.symbol, [])
-            bar_rows = [bar_to_row(c.symbol, b.timestamp.date().isoformat(), b, u,
-                                   opt_type, float(c.strike_price), expiry) for b in bars]
-            cache.write_bar_rows(bar_rows)
-            stats["bar_rows"] += len(bar_rows)
+    pending = list(underlyings)
+    skipped = 0
+    if resume:
+        done = cache.cached_underlyings()
+        pending = [u for u in underlyings if u not in done]
+        skipped = len(underlyings) - len(pending)
+    logger.info(f"options fetch: {len(underlyings)} requested, {skipped} already cached, "
+                f"{len(pending)} to fetch")
 
-            as_of_premium: Optional[float] = None
-            if bar_rows:
-                on_start = next((r for r in bar_rows if r["date"] == start_iso), None)
-                as_of_premium = (on_start or bar_rows[0]).get("close")
-            rows.append(contract_to_metadata_chain_row(c, u, as_of_premium))
+    stats = {"chain_rows": 0, "bar_rows": 0, "contracts": 0,
+             "symbols_done": 0, "symbols_failed": 0, "skipped": skipped}
+    write_lock = threading.Lock()
+    stats_lock = threading.Lock()
+    # Per-thread Alpaca clients (requests.Session under the hood isn't guaranteed thread-safe).
+    _tl = threading.local()
 
-        # Chain rows from CONTRACT METADATA (greeks/iv/oi None; bid/ask/last = as-of premium),
-        # keyed at the run start date.
-        cache.write_chain_rows(u, start_iso, rows)
-        stats["chain_rows"] += len(rows)
+    def _clients():
+        if not hasattr(_tl, "tc"):
+            _tl.tc = TradingClient(key, secret, paper=True)
+            _tl.dc = OptionHistoricalDataClient(key, secret)
+        return _tl.tc, _tl.dc
+
+    def _process(u: str) -> None:
+        try:
+            tc, dc = _clients()
+            contracts = _with_retry(
+                lambda: discover_contracts(tc, u, expiry_gte=expiry_gte, expiry_lte=expiry_lte,
+                                           strike_min=strike_min, strike_max=strike_max,
+                                           max_contracts=max_contracts),
+                what=f"discover {u}")
+            rows: List[Dict[str, Any]] = []
+            bar_total = 0
+            for c in contracts:
+                opt_type = c.type.value if hasattr(c.type, "value") else str(c.type)
+                expiry = (c.expiration_date.isoformat()
+                          if hasattr(c.expiration_date, "isoformat") else str(c.expiration_date))
+                resp = _with_retry(
+                    lambda c=c: dc.get_option_bars(OptionBarsRequest(
+                        symbol_or_symbols=c.symbol, timeframe=TimeFrame.Day,
+                        start=start_iso, end=end_iso)),
+                    what=f"bars {c.symbol}")
+                bars = (resp.data or {}).get(c.symbol, [])
+                bar_rows = [bar_to_row(c.symbol, b.timestamp.date().isoformat(), b, u,
+                                       opt_type, float(c.strike_price), expiry) for b in bars]
+                with write_lock:
+                    cache.write_bar_rows(bar_rows)
+                bar_total += len(bar_rows)
+                as_of_premium: Optional[float] = None
+                if bar_rows:
+                    on_start = next((r for r in bar_rows if r["date"] == start_iso), None)
+                    as_of_premium = (on_start or bar_rows[0]).get("close")
+                rows.append(contract_to_metadata_chain_row(c, u, as_of_premium))
+            # Chain rows LAST (their presence marks this underlying complete for resume).
+            with write_lock:
+                cache.write_chain_rows(u, start_iso, rows)
+            with stats_lock:
+                stats["contracts"] += len(contracts)
+                stats["bar_rows"] += bar_total
+                stats["chain_rows"] += len(rows)
+                stats["symbols_done"] += 1
+                if stats["symbols_done"] % 25 == 0:
+                    logger.info(f"options fetch: {stats['symbols_done']}/{len(pending)} done "
+                                f"({stats['symbols_failed']} failed)")
+        except Exception as e:  # noqa: BLE001 — give up on THIS symbol, keep the run going
+            logger.error(f"options fetch: giving up on {u} after retries: {e}")
+            with stats_lock:
+                stats["symbols_failed"] += 1
+
+    workers = max_workers or int(_os.environ.get("OPTIONS_FETCH_WORKERS", "6"))
+    workers = max(1, min(workers, len(pending) or 1))
+    if pending:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            list(ex.map(_process, pending))
+    logger.info(f"options fetch DONE: {stats}")
     return stats
 
 

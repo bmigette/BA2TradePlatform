@@ -419,8 +419,10 @@ def _cmd_fetch_options(args) -> int:
     _parent = os.path.dirname(args.cache_db)
     if _parent:
         os.makedirs(_parent, exist_ok=True)
-    fetch_options.build_cache(args.cache_db, unders, date.fromisoformat(args.start),
-                              date.fromisoformat(args.end), args.feed)
+    stats = fetch_options.build_cache(
+        args.cache_db, unders, date.fromisoformat(args.start), date.fromisoformat(args.end),
+        args.feed, max_workers=args.workers, resume=not args.no_resume)
+    print(json.dumps(stats, indent=2))
     return 0
 
 
@@ -1714,6 +1716,12 @@ def main(argv: "list | None" = None) -> int:
     fo.add_argument("--cache-db", default=_DEFAULT_OPTIONS_CACHE_DB,
                     help=f"Path to the options-history SQLite cache (default {_DEFAULT_OPTIONS_CACHE_DB}).")
     fo.add_argument("--feed", default="indicative", help="Option chain feed (default indicative).")
+    fo.add_argument("--workers", type=int, default=None,
+                    help="Parallel underlyings (ThreadPoolExecutor; default $OPTIONS_FETCH_WORKERS or 6). "
+                         "Each Alpaca call backs off + retries on transient drops.")
+    fo.add_argument("--no-resume", action="store_true",
+                    help="Re-fetch every underlying even if already cached (default: resume — skip "
+                         "underlyings already in option_chain).")
 
     cc = sub.add_parser("cache-clear", help="Clear cache (all, or one type).")
     cc.add_argument("--type", default=None, help="Cache type to clear (omit = all).")

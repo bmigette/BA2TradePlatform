@@ -44,6 +44,14 @@ class OptionsHistoryCache:
                 f"VALUES({','.join('?'*len(_BAR_COLS))})",
                 [tuple(r.get(c) for c in _BAR_COLS) for r in rows])
 
+    def cached_underlyings(self) -> set:
+        """Underlyings that completed a build (have at least one chain row — chain is written LAST
+        per underlying, so its presence means the underlying's bars finished). Used to RESUME a
+        partial fetch: skip these, re-do the rest (incl. one that crashed mid-bars before its chain).
+        """
+        with self._conn() as cx:
+            return {r[0] for r in cx.execute("SELECT DISTINCT underlying FROM option_chain")}
+
     def read_chain(self, underlying: str, as_of: str) -> List[Dict[str, Any]]:
         with self._conn() as cx:
             return [dict(r) for r in cx.execute(
