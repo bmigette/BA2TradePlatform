@@ -2005,21 +2005,26 @@ const Backtesting: React.FC = () => {
                   <div className="flex items-center justify-between">
                     <div>
                       <p className="text-sm text-gray-500 dark:text-gray-400">Total Return</p>
-                      <p className={`text-2xl font-bold ${(selectedBacktest.totalReturn || 0) >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-                        {(selectedBacktest.totalReturn || 0) >= 0 ? '+' : ''}{selectedBacktest.totalReturn?.toFixed(1)}%
-                      </p>
-                      {/* Profit-capped return: each trade's gain limited to a multiple of its cost
-                          basis, so one lucky mega-winner doesn't inflate the headline. Shown only
-                          when a cap was applied (adjusted differs from raw). */}
-                      {selectedBacktest.adjustedTotalReturn != null &&
-                       Math.abs((selectedBacktest.adjustedTotalReturn ?? 0) - (selectedBacktest.totalReturn ?? 0)) > 0.05 && (
-                        <p className="text-xs text-amber-600 dark:text-amber-400 mt-0.5"
-                           title="Total return with each trade's gain capped at the optimization's profit cap (per-trade % of cost basis). Excludes one-off lucky mega-winners.">
-                          adj {(selectedBacktest.adjustedTotalReturn || 0) >= 0 ? '+' : ''}{selectedBacktest.adjustedTotalReturn?.toFixed(1)}%
-                        </p>
-                      )}
+                      {/* Profit-capped (adjusted) return is the HEADLINE — each trade's gain limited
+                          to a multiple of its cost basis so one lucky mega-winner can't inflate it.
+                          Raw shown smaller below when a cap changed it. */}
+                      {(() => {
+                        const raw = selectedBacktest.totalReturn ?? 0;
+                        const adj = selectedBacktest.adjustedTotalReturn;
+                        const hasAdj = adj != null && Math.abs(adj - raw) > 0.05;
+                        const primary = hasAdj ? (adj as number) : raw;
+                        return (<>
+                          <p className={`text-2xl font-bold ${primary >= 0 ? 'text-green-600' : 'text-red-600'}`}
+                             title={hasAdj ? 'Adjusted: each trade capped at the profit cap (per-trade % of cost basis), excludes one-off lucky mega-winners.' : undefined}>
+                            {primary >= 0 ? '+' : ''}{primary.toFixed(1)}%
+                          </p>
+                          {hasAdj && (
+                            <p className="text-xs text-gray-400 dark:text-gray-500 mt-0.5">raw {raw >= 0 ? '+' : ''}{raw.toFixed(1)}%</p>
+                          )}
+                        </>);
+                      })()}
                     </div>
-                    {(selectedBacktest.totalReturn || 0) >= 0 ? (
+                    {(selectedBacktest.adjustedTotalReturn ?? selectedBacktest.totalReturn ?? 0) >= 0 ? (
                       <TrendingUp className="w-8 h-8 text-green-500" />
                     ) : (
                       <TrendingDown className="w-8 h-8 text-red-500" />
@@ -2062,10 +2067,16 @@ const Backtesting: React.FC = () => {
               <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
                 <div className="bg-white dark:bg-gray-800 rounded-lg shadow p-3 text-center">
                   <p className="text-xs text-gray-500 dark:text-gray-400">Profit Factor</p>
-                  <p className="text-lg font-bold text-gray-900 dark:text-gray-100">{selectedBacktest.profitFactor?.toFixed(2)}</p>
-                  {(() => { const a = (selectedBacktest.results as Record<string, number> | undefined)?.adjusted_profit_factor;
-                    return a != null && Math.abs(a - (selectedBacktest.profitFactor ?? 0)) > 0.05
-                      ? <p className="text-[11px] text-amber-600 dark:text-amber-400" title="Profit factor with each trade's gain capped (excludes one-off lucky mega-winners).">adj {a.toFixed(2)}</p> : null; })()}
+                  {(() => {
+                    const raw = selectedBacktest.profitFactor ?? 0;
+                    const a = (selectedBacktest.results as Record<string, number> | undefined)?.adjusted_profit_factor;
+                    const hasAdj = a != null && Math.abs(a - raw) > 0.05;
+                    return (<>
+                      <p className="text-lg font-bold text-gray-900 dark:text-gray-100"
+                         title={hasAdj ? 'Adjusted: profit factor with each trade capped (excludes one-off lucky mega-winners).' : undefined}>{(hasAdj ? a! : raw).toFixed(2)}</p>
+                      {hasAdj && <p className="text-[11px] text-gray-400 dark:text-gray-500">raw {raw.toFixed(2)}</p>}
+                    </>);
+                  })()}
                 </div>
                 <div className="bg-white dark:bg-gray-800 rounded-lg shadow p-3 text-center">
                   <p className="text-xs text-gray-500 dark:text-gray-400">Total Trades</p>
@@ -2081,10 +2092,17 @@ const Backtesting: React.FC = () => {
                 </div>
                 <div className="bg-white dark:bg-gray-800 rounded-lg shadow p-3 text-center">
                   <p className="text-xs text-gray-500 dark:text-gray-400">Best Trade</p>
-                  <p className="text-lg font-bold text-green-600">+{selectedBacktest.bestTrade?.toFixed(1)}%</p>
-                  {(() => { const a = (selectedBacktest.results as Record<string, number> | undefined)?.adjusted_best_trade;
-                    return a != null && Math.abs(a - (selectedBacktest.bestTrade ?? 0)) > 0.05
-                      ? <p className="text-[11px] text-amber-600 dark:text-amber-400" title="Best trade % with its gain capped at the profit cap (excludes one-off luck).">adj {a >= 0 ? '+' : ''}{a.toFixed(1)}%</p> : null; })()}
+                  {(() => {
+                    const raw = selectedBacktest.bestTrade ?? 0;
+                    const a = (selectedBacktest.results as Record<string, number> | undefined)?.adjusted_best_trade;
+                    const hasAdj = a != null && Math.abs(a - raw) > 0.05;
+                    const primary = hasAdj ? a! : raw;
+                    return (<>
+                      <p className="text-lg font-bold text-green-600"
+                         title={hasAdj ? 'Adjusted: best trade with its gain capped at the profit cap (excludes one-off luck).' : undefined}>{primary >= 0 ? '+' : ''}{primary.toFixed(1)}%</p>
+                      {hasAdj && <p className="text-[11px] text-gray-400 dark:text-gray-500">raw {raw >= 0 ? '+' : ''}{raw.toFixed(1)}%</p>}
+                    </>);
+                  })()}
                 </div>
                 <div className="bg-white dark:bg-gray-800 rounded-lg shadow p-3 text-center">
                   <p className="text-xs text-gray-500 dark:text-gray-400">Worst Trade</p>
