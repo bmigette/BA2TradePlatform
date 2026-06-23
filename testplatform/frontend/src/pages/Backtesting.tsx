@@ -401,10 +401,35 @@ function fmtConditionLeaf(c: any): string {
   if (!field) return '';
   const rawOp = c.comparison ?? c.op ?? c.operator;
   const val = c.value ?? c.threshold;
-  const isFlag = rawOp === 'is_true' || rawOp === 'is_false' || (rawOp == null && val == null);
+  // A leaf with no comparison operator is a flag/event trigger (has_position, rating_positive_to_
+  // negative, ...): render JUST the field and ignore any stray value. Numeric thresholds always
+  // carry an operator, so this also suppresses bogus values that older runs leaked onto flags.
+  const isFlag = rawOp === 'is_true' || rawOp === 'is_false' || rawOp == null;
   if (isFlag) return String(field);
   const op = rawOp != null ? (WORD_TO_SYMBOL[String(rawOp).toLowerCase()] ?? String(rawOp)) : '';
   return [field, op, val].filter(x => x !== '' && x != null).join(' ');
+}
+
+// Human-readable description of what an exit rule DOES (its action), separate from WHEN it fires
+// (its conditions). Without this the Strategy tab showed only the gating condition (e.g.
+// "has_position") and dropped the action, making a stop-loss adjustment look like a bare trigger.
+const _EXIT_REF_LABEL: Record<string, string> = {
+  order_open_price: 'entry',
+  expert_target_price: 'analyst target',
+  current_price: 'price',
+};
+function fmtExitAction(rule: any): string {
+  const action = rule?.action_type ?? rule?.action ?? '';
+  const ref = rule?.reference_value ? (_EXIT_REF_LABEL[rule.reference_value] ?? rule.reference_value) : '';
+  const v = rule?.action_value;
+  const pct = typeof v === 'number' ? `${v >= 0 ? '+' : ''}${v}%` : (v != null ? String(v) : '');
+  const target = [ref, pct].filter(Boolean).join(' ');
+  switch (action) {
+    case 'close': return 'Close position';
+    case 'adjust_stop_loss': return `Move stop loss → ${target || 'reference'}`;
+    case 'adjust_take_profit': return `Move take profit → ${target || 'reference'}`;
+    default: return action ? String(action).replace(/_/g, ' ') : 'Exit';
+  }
 }
 
 // Render a condition GROUP with its boolean structure made explicit: a single condition renders
@@ -2311,11 +2336,19 @@ const Backtesting: React.FC = () => {
                             <div className="grid grid-cols-2 gap-4">
                               <div className="bg-gray-50 dark:bg-gray-700/50 rounded-lg p-3">
                                 <div className="text-xs text-gray-500 dark:text-gray-400 mb-1">Take Profit</div>
-                                <div className="text-lg font-bold text-green-600">{tp != null ? `${tp}%` : 'None'}</div>
+                                {tp != null && tp < 200 ? (
+                                  <div className="text-lg font-bold text-green-600">{tp}%</div>
+                                ) : (
+                                  <div><span className="text-lg font-bold text-gray-400">Off</span><span className="text-[11px] text-gray-500 dark:text-gray-400 ml-1">· via exit rules</span></div>
+                                )}
                               </div>
                               <div className="bg-gray-50 dark:bg-gray-700/50 rounded-lg p-3">
                                 <div className="text-xs text-gray-500 dark:text-gray-400 mb-1">Stop Loss</div>
-                                <div className="text-lg font-bold text-red-600">{sl != null ? `${sl}%` : 'None'}</div>
+                                {sl != null && sl < 200 ? (
+                                  <div className="text-lg font-bold text-red-600">{sl}%</div>
+                                ) : (
+                                  <div><span className="text-lg font-bold text-gray-400">Off</span><span className="text-[11px] text-gray-500 dark:text-gray-400 ml-1">· via exit rules</span></div>
+                                )}
                               </div>
                             </div>
                             {buyConditions.length > 0 && (
@@ -2348,11 +2381,15 @@ const Backtesting: React.FC = () => {
                                     const grpOp = rule.conditions?.operator === 'OR' || rule.conditions?.type === 'OR' ? 'any of' : 'all of';
                                     return (
                                       <div key={i} className="text-sm bg-yellow-50 dark:bg-yellow-900/20 rounded px-3 py-2 text-yellow-800 dark:text-yellow-300">
-                                        <div className="flex items-baseline gap-2">
+                                        <div className="flex items-baseline gap-2 flex-wrap">
                                           <span className="font-semibold">{rule.name || `Exit Rule ${i + 1}`}</span>
+                                          <span className="text-[11px] font-semibold rounded px-1.5 py-0.5 bg-yellow-200/70 dark:bg-yellow-700/40 text-yellow-900 dark:text-yellow-200">{fmtExitAction(rule)}</span>
                                           {nConds > 1 && <span className="text-[10px] uppercase tracking-wide rounded px-1 bg-yellow-100 dark:bg-yellow-800/40 text-yellow-700 dark:text-yellow-300">{grpOp}</span>}
                                         </div>
-                                        <ConditionGroupLines group={rule.conditions} />
+                                        <div className="flex items-baseline gap-2 mt-0.5">
+                                          <span className="text-[10px] uppercase opacity-50 shrink-0">when</span>
+                                          <ConditionGroupLines group={rule.conditions} />
+                                        </div>
                                       </div>
                                     );
                                   })}

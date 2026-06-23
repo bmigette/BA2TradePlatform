@@ -887,6 +887,37 @@ def _s1_norm_exit_rule(rule: dict) -> dict:
     return out
 
 
+def _uniquify_condition_ids(buy_tree, exit_rules) -> None:
+    """Make every condition-node id globally unique across the buy tree + all exit-rule condition
+    sub-trees. IN PLACE.
+
+    Live rulesets restart leaf ids (c0,c1,c2,...) in EVERY rule and in the buy tree, so an id like
+    `c3` names many unrelated leaves (the buy tree's `long_term` flag, an exit's `days_opened`
+    numeric, ...). But the optimizer keys condition genes by bare id in ONE global namespace
+    (strategy_param_space.decode_params builds a single cond_by_id and applies it to the buy tree
+    AND every exit rule). With colliding ids, a single `cond:c3:value` gene was sprayed onto all of
+    them at once — an exit's numeric range bled onto the buy tree's flag (e.g. `long_term 112`), and
+    one `cond:cN:enabled=0` toggle silently dropped every same-id leaf, deleting the live `close`
+    rules so trades never exited. Rewriting each node id to be unique makes every gene map to exactly
+    one leaf. The exit RULE ids (live-30, ...) are PRESERVED — `exit:<id>` genes and decode match on
+    them; only the condition nodes *inside* each rule are relabelled."""
+    ctr = [0]
+
+    def relabel(node):
+        if not isinstance(node, dict):
+            return
+        ctr[0] += 1
+        node["id"] = f"u{ctr[0]}"
+        for child in (node.get("conditions") or []):
+            relabel(child)
+
+    relabel(buy_tree)
+    for rule in (exit_rules or []):
+        conds = rule.get("conditions") if isinstance(rule, dict) else None
+        if conds:
+            relabel(conds)
+
+
 def _build_strategy_S1(name: str, expert: str):
     """S1 — the expert's LIVE dev-account ruleset (exported to docs/live_rulesets/{expert}.json),
     normalized to the canonical Strategy shape with optimize flags on every threshold + adjust-%.
@@ -904,6 +935,11 @@ def _build_strategy_S1(name: str, expert: str):
         data = _json.load(f)
     buy = _s1_norm_tree(data.get("buy_entry_conditions"))
     exits = [_s1_norm_exit_rule(r) for r in (data.get("exit_conditions") or [])]
+    # Live rulesets reuse leaf ids (c0,c1,...) across every rule + the buy tree; the optimizer keys
+    # condition genes by bare id in one global namespace, so colliding ids cross-contaminate (an
+    # exit's numeric range leaking onto a buy-tree flag, one toggle dropping unrelated leaves). Make
+    # them globally unique so each gene maps to exactly one leaf.
+    _uniquify_condition_ids(buy, exits)
     # NOTE: the launcher's Strategy has no separate sell tree — shorts are mirrored from the buy
     # gates via the engine's enable_short flag. The live sell_entry_conditions (if any) is dropped;
     # these experts are long-only in practice, so S1 runs long.
