@@ -59,6 +59,7 @@ class WorkerStat(BaseModel):
     isEnabled: bool
     activeJobs: int
     cores: Optional[int] = None
+    capacity: Optional[int] = None  # remote: trial-slot count from live /health (None if offline)
 
 
 class DashboardResponse(BaseModel):
@@ -226,6 +227,10 @@ async def get_dashboard_stats(db: Session = Depends(get_db)):
     # it online; remote status is whatever the last health-check/optimization pre-flight stored.
     worker_stats: List[WorkerStat] = []
     try:
+        # Live-probe remote workers so the badge reflects reachability NOW (the CLI/distributed path
+        # never writes status back to the DB), and surface each worker's true slot capacity.
+        from app.services.worker_fleet import refresh_remote_status
+        caps = refresh_remote_status(db)
         for w in db.query(Worker).order_by(Worker.is_local.desc(), Worker.name).all():
             cores = w.cpu_info.get("cores") if isinstance(w.cpu_info, dict) else None
             worker_stats.append(WorkerStat(
@@ -235,6 +240,7 @@ async def get_dashboard_stats(db: Session = Depends(get_db)):
                 isEnabled=bool(w.is_enabled),
                 activeJobs=w.active_jobs_count or 0,
                 cores=cores,
+                capacity=(cores if w.is_local else caps.get(w.id)),
             ))
     except Exception as e:
         logger.warning(f"Could not fetch workers for dashboard: {e}")

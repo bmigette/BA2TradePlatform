@@ -71,6 +71,7 @@ class WorkerResponse(BaseModel):
     lastHeartbeat: Optional[str]
     activeJobsCount: int
     totalJobsCompleted: int
+    capacity: Optional[int] = None  # remote: trial-slot count from live /health (None if offline)
     createdAt: Optional[str]
     updatedAt: Optional[str]
 
@@ -148,8 +149,19 @@ async def list_workers(db: Session = Depends(get_db)):
     # Ensure local worker exists
     ensure_local_worker(db)
 
+    # Live-probe remote workers so the status badge is accurate (the CLI/distributed path never
+    # writes status back to the DB) and surface each worker's true slot capacity.
+    from app.services.worker_fleet import refresh_remote_status
+    caps = refresh_remote_status(db)
+
     workers = db.query(Worker).order_by(Worker.is_local.desc(), Worker.name).all()
-    return [WorkerResponse(**w.to_dict()) for w in workers]
+    out = []
+    for w in workers:
+        d = w.to_dict()
+        cores = w.cpu_info.get("cores") if isinstance(w.cpu_info, dict) else None
+        d["capacity"] = cores if w.is_local else caps.get(w.id)
+        out.append(WorkerResponse(**d))
+    return out
 
 
 @router.post("", response_model=WorkerResponse, status_code=201)

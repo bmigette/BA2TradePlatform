@@ -93,6 +93,36 @@ class DistributedEvaluator:
                 self._spawn(lambda w=w: self._dispatch_remote(w), f"remote-{w['name']}-{i}")
         self.log(f"distributed evaluator (opt {self.optimization_id}): {self.n_consumers} local + "
                  f"{remote_slots} remote slot(s) across {len(self._active_workers)} worker(s)")
+        # Surface the engaged fleet in the UI: each remote worker's active_jobs_count = its slot
+        # count, the local worker's = the local consumer count. (The CLI path never updates these,
+        # so without this the dashboard shows "0 jobs" + "offline" while a run is in flight.)
+        self._report_fleet_state(active=True)
+
+    def _report_fleet_state(self, active: bool) -> None:
+        """Write engaged-slot counts (and online status) for the participating workers to the DB so
+        the dashboard/workers panels reflect reality. Best-effort: never raises."""
+        try:
+            from datetime import datetime
+            from app.models.database import SessionLocal
+            from app.models import Worker
+            db = SessionLocal()
+            try:
+                for w in self._active_workers:
+                    row = db.query(Worker).filter(Worker.id == w.get("id")).first()
+                    if not row:
+                        continue
+                    row.active_jobs_count = int(w.get("capacity") or 1) if active else 0
+                    if active:
+                        row.status = "online"
+                        row.last_heartbeat = datetime.utcnow()
+                local = db.query(Worker).filter(Worker.is_local == True).first()  # noqa: E712
+                if local:
+                    local.active_jobs_count = self.n_consumers if active else 0
+                db.commit()
+            finally:
+                db.close()
+        except Exception as e:  # noqa: BLE001 — fleet reporting must never affect the run
+            self.log(f"fleet-state report (active={active}) skipped: {e}")
 
     def _spawn(self, target, name: str) -> None:
         t = threading.Thread(target=target, name=name, daemon=True)
@@ -158,3 +188,5 @@ class DistributedEvaluator:
         for t in self._threads:
             t.join(timeout=2.0)
         self.broker.clear(self.optimization_id)
+        # Release the engaged-slot counts so the panel doesn't show stale "busy" between jobs.
+        self._report_fleet_state(active=False)

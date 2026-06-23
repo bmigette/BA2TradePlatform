@@ -40,6 +40,21 @@ def version(worker: dict, timeout: float = 10.0) -> dict:
         return r.json()
 
 
+def quick_status(worker: dict, timeout: float = 1.5) -> tuple:
+    """Live one-shot reachability probe. Returns ``(status, capacity)`` where status is
+    ``"online"``/``"offline"`` and capacity is the worker's reported slot count (or None).
+
+    Never raises — a timeout/unreachable host maps to ``("offline", None)``. Used by the
+    dashboard/workers API to show the TRUE badge instead of the last value the DB happened to
+    store (the CLI/distributed path talks to workers directly and never writes status back)."""
+    try:
+        h = health(worker, timeout=timeout)
+        cap = h.get("capacity")
+        return ("online", int(cap) if cap else None)
+    except Exception:  # noqa: BLE001 — unreachable / timeout / auth -> offline
+        return ("offline", None)
+
+
 def run_trial(worker: dict, config: dict, fitness_metric: str, timeout: float = 1800.0) -> dict:
     """Push ONE trial to the worker and return its ``{ok,fitness,trades,error,fatal}`` summary.
 

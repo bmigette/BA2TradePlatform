@@ -54,6 +54,7 @@ interface WorkerStat {
   isEnabled: boolean;
   activeJobs: number;
   cores: number | null;
+  capacity: number | null;  // trial-slot count (remote: live /health; local: cores)
 }
 
 interface DashboardData {
@@ -432,7 +433,13 @@ const Dashboard: React.FC = () => {
                       {w.cores != null && (
                         <span className="flex items-center gap-1"><Cpu className="w-3 h-3" />{w.cores}</span>
                       )}
-                      <span className="flex items-center gap-1"><Activity className="w-3 h-3" />{w.activeJobs} jobs</span>
+                      {/* Show engaged trial slots out of capacity when known (e.g. "10/10 slots"
+                          while a distributed run has the worker fully busy), else fall back to a
+                          plain active-jobs count. */}
+                      <span className="flex items-center gap-1">
+                        <Activity className="w-3 h-3" />
+                        {w.capacity != null ? `${w.activeJobs}/${w.capacity} slots` : `${w.activeJobs} jobs`}
+                      </span>
                     </div>
                   </div>
                 ))}
