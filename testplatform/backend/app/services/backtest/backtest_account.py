@@ -1054,7 +1054,14 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             )
             gross = (exit_px - entry_px) * size * direction * mult
             pnl = gross - comm
-            pnl_pct = ((exit_px / entry_px - 1.0) * 100.0 * direction) if entry_px else 0.0
+            # P&L % = realised dollar P&L (commission included) as a fraction of ACCOUNT EQUITY at
+            # the time the position opened — the trade's true impact on the account, NOT the bare
+            # price move (exit/entry). The price-ratio form ignored commission (so a +0.8% price
+            # move with a net loss showed green) and size, and made a microcap's 90x price return
+            # dominate Best-Trade though it barely moved the account. Equity-at-entry keeps the sign
+            # consistent with ``pnl`` and makes Best/Worst/Expectancy account-relative.
+            equity_at_entry = self._equity_at(entry_dt)
+            pnl_pct = (pnl / equity_at_entry * 100.0) if equity_at_entry else 0.0
             bars_held = self._bars_between(entry_dt, exit_dt)
             trades.append(
                 {
@@ -1086,6 +1093,21 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         if sl is not None:
             return "stop_loss"
         return "exit"
+
+    def _equity_at(self, as_of: Optional[datetime]) -> float:
+        """Account equity (net liquidating value) at/just-before ``as_of`` — the capital base a
+        trade opened then was sized against. Bisects the ascending snapshot dates (O(log n)).
+        Falls back to the first snapshot (initial capital) for a pre-curve entry, or the live
+        equity if no snapshots exist yet."""
+        snaps = self._equity_snapshots
+        if not snaps:
+            return self.equity()
+        if as_of is None:
+            return snaps[0]["net_liquidating_value"]
+        idx = bisect.bisect_right(self._snapshot_dates, as_of) - 1
+        if idx < 0:
+            idx = 0
+        return snaps[idx]["net_liquidating_value"]
 
     def _bars_between(self, start: Optional[datetime], end: Optional[datetime]) -> int:
         """Number of equity-curve bars between two simulated timestamps (>=0)."""
