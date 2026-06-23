@@ -62,6 +62,14 @@ def compute_fitness(fitness_metric: str, results: dict) -> float:
             f"Unknown fitness_metric: {fitness_metric!r}. "
             f"Valid: {sorted(set(_FITNESS_KEYS) | {'max_drawdown'})}"
         )
+    # Profit-cap-aware: when a per-trade cap was applied (profit_cap_pct set), the GA must rank on
+    # the ADJUSTED return-based metric so one lucky, non-reproducible mega-winner can't win the
+    # search. Only return-based metrics have an adjusted variant; the rest fall back to raw.
+    if results.get("profit_cap_pct"):
+        adj_key = {"calmar_ratio": "adjusted_calmar_ratio",
+                   "total_return": "adjusted_total_return"}.get(key)
+        if adj_key is not None and results.get(adj_key) is not None:
+            key = adj_key
     val = results.get(key)
     if val is None or (isinstance(val, float) and (math.isnan(val) or math.isinf(val))):
         return ZERO_TRADE_SENTINEL

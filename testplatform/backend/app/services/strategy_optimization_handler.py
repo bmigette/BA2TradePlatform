@@ -813,6 +813,10 @@ def _build_daily_trial_config(
         # Cadence (weekly entry) + intraday fill clock carry through to each trial's engine.
         "run_schedule_override": backtest_cfg.get("run_schedule_override"),
         "execution_interval": backtest_cfg.get("execution_interval", "1d"),
+        # Per-trade profit cap (% of cost basis): the GA ranks on the ADJUSTED fitness so one
+        # lucky, non-reproducible mega-winner can't win the search. None = no cap. Carried from
+        # the run-level optimize backtest block into every trial.
+        "profit_cap_pct": backtest_cfg.get("profit_cap_pct"),
         # Optimizer-decoded condition trees: the engine builds the enter ruleset FROM buy_tree
         # (seed_ruleset_from_tree) so cond:<id>:value thresholds + on/off toggles drive entries.
         "buy_tree": decoded.get("buy_tree"),

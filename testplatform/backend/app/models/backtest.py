@@ -120,6 +120,9 @@ class Backtest(Base):
 
     # Performance metrics (from backtesting.py)
     total_return = Column(Float, nullable=True)
+    # Total return % with each trade's gain capped at profit_cap_pct of its cost basis (so one
+    # lucky mega-winner can't dominate). NULL when the run had no cap; raw total_return is kept.
+    adjusted_total_return = Column(Float, nullable=True)
     sharpe_ratio = Column(Float, nullable=True)
     max_drawdown = Column(Float, nullable=True)
     win_rate = Column(Float, nullable=True)
@@ -209,6 +212,7 @@ class Backtest(Base):
             "fitnessMetric": self.fitness_metric,
             "status": self.status,
             "totalReturn": self.total_return,
+            "adjustedTotalReturn": self.adjusted_total_return,
             "sharpeRatio": self.sharpe_ratio,
             "maxDrawdown": self.max_drawdown,
             "winRate": self.win_rate,
@@ -267,6 +271,7 @@ class Backtest(Base):
             "equityCurve": equity_curve,
             "drawdownCurve": drawdown_curve,
             "totalReturn": self.total_return,
+            "adjustedTotalReturn": self.adjusted_total_return,
             "sharpeRatio": self.sharpe_ratio,
             "maxDrawdown": self.max_drawdown,
             "winRate": self.win_rate,

@@ -1060,6 +1060,7 @@ def _cmd_optimize(args) -> int:
             "subtype": "daily_expert",
             "run_schedule_override": run_sched,
             "execution_interval": args.interval,
+            "profit_cap_pct": (float(args.profit_cap_pct) if args.profit_cap_pct else None),
             "backtest_id": int(_dt.now().timestamp()),
             "name": f"opt-{expert}-trial",
         }
@@ -1299,6 +1300,7 @@ def _cmd_optimize_batch(args) -> int:
                 "subtype": "daily_expert",
                 "run_schedule_override": run_sched,
                 "execution_interval": args.interval,
+                "profit_cap_pct": (float(args.profit_cap_pct) if args.profit_cap_pct else None),
                 "backtest_id": int(_dt.now().timestamp()),
                 "name": f"{name}-trial",
             }
@@ -1764,6 +1766,10 @@ def main(argv: "list | None" = None) -> int:
                     help="Persist the top-N distinct param sets as saved Backtests (default 5).")
     op.add_argument("--seed", type=int, default=42, help="RNG seed (determinism).")
     op.add_argument("--initial-capital", type=float, default=10000.0)
+    op.add_argument("--profit-cap-pct", type=float, default=None,
+                    help="Cap each trade's gain at this %% of its cost basis when computing the "
+                         "ADJUSTED fitness/return (e.g. 2000 = a trade can't count as more than "
+                         "20x its cost). Stops one lucky mega-winner dominating the GA. Default: off.")
     op.add_argument("--commission", type=float, default=1.0)
     op.add_argument("--slippage", type=float, default=0.0)
     op.add_argument("--fill-model", default="next_bar_open")
@@ -1816,6 +1822,9 @@ def main(argv: "list | None" = None) -> int:
     ob.add_argument("--save-top", type=int, default=5)
     ob.add_argument("--seed", type=int, default=42)
     ob.add_argument("--initial-capital", type=float, default=10000.0)
+    ob.add_argument("--profit-cap-pct", type=float, default=None,
+                    help="Cap each trade's gain at this %% of its cost basis for the ADJUSTED "
+                         "fitness/return (e.g. 2000). Stops one lucky mega-winner dominating the GA.")
     ob.add_argument("--commission", type=float, default=1.0)
     ob.add_argument("--slippage", type=float, default=0.0)
     ob.add_argument("--fill-model", default="next_bar_open")

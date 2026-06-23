@@ -225,6 +225,7 @@ interface Backtest {
   status: string;
   isSaved: boolean;
   totalReturn: number | null;
+  adjustedTotalReturn?: number | null;
   sharpeRatio: number | null;
   maxDrawdown: number | null;
   winRate: number | null;
@@ -2007,6 +2008,16 @@ const Backtesting: React.FC = () => {
                       <p className={`text-2xl font-bold ${(selectedBacktest.totalReturn || 0) >= 0 ? 'text-green-600' : 'text-red-600'}`}>
                         {(selectedBacktest.totalReturn || 0) >= 0 ? '+' : ''}{selectedBacktest.totalReturn?.toFixed(1)}%
                       </p>
+                      {/* Profit-capped return: each trade's gain limited to a multiple of its cost
+                          basis, so one lucky mega-winner doesn't inflate the headline. Shown only
+                          when a cap was applied (adjusted differs from raw). */}
+                      {selectedBacktest.adjustedTotalReturn != null &&
+                       Math.abs((selectedBacktest.adjustedTotalReturn ?? 0) - (selectedBacktest.totalReturn ?? 0)) > 0.05 && (
+                        <p className="text-xs text-amber-600 dark:text-amber-400 mt-0.5"
+                           title="Total return with each trade's gain capped at the optimization's profit cap (per-trade % of cost basis). Excludes one-off lucky mega-winners.">
+                          adj {(selectedBacktest.adjustedTotalReturn || 0) >= 0 ? '+' : ''}{selectedBacktest.adjustedTotalReturn?.toFixed(1)}%
+                        </p>
+                      )}
                     </div>
                     {(selectedBacktest.totalReturn || 0) >= 0 ? (
                       <TrendingUp className="w-8 h-8 text-green-500" />

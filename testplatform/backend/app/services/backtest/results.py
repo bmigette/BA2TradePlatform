@@ -238,6 +238,30 @@ def _compute_metrics(
     # --- benchmark (no per-symbol B&H reconstruction in v1) ----------------
     buy_hold_return = 0.0  # multi-asset B&H benchmark is Phase 3 (universe reconstruction)
 
+    # --- profit cap (optimization robustness) ------------------------------
+    # A single once-in-a-lifetime winner (e.g. a sub-$1 stock that 90x'd and never closed) can be
+    # ~97% of P&L and dominate the fitness, so the GA overfits to one lucky, non-reproducible
+    # trade. The optional ``profit_cap_pct`` caps EACH trade's gain at that % of the capital
+    # deployed in it (cost basis = entry_price x size). We deduct the excess from the real total
+    # to get an ADJUSTED return/calmar that reflects reproducible edge — raw metrics are unchanged,
+    # and with no cap the adjusted values equal the raw ones exactly.
+    cap_pct = config.get("profit_cap_pct")
+    adjusted_total_return = total_return
+    adjusted_annualized_return = annualized_return
+    adjusted_calmar = calmar
+    if cap_pct is not None and float(cap_pct) > 0:
+        cap_frac = float(cap_pct) / 100.0
+        excess = 0.0
+        for t in trades:
+            p = t.get("pnl") or 0.0
+            cost = (t.get("entry_price") or 0.0) * (t.get("size") or 0.0)
+            if p > 0 and cost > 0:
+                excess += max(0.0, p - cost * cap_frac)
+        adj_final = final - excess
+        adjusted_total_return = ((adj_final - initial) / initial * 100.0) if initial else 0.0
+        adjusted_annualized_return = _annualized_return(initial, adj_final, years)
+        adjusted_calmar = (adjusted_annualized_return / abs(max_drawdown)) if max_drawdown else 0.0
+
     return {
         # Basic trade metrics
         "total_trades": total_trades,
@@ -248,6 +272,12 @@ def _compute_metrics(
         "total_return": round(_safe_float(total_return), 2),
         "annualized_return": round(_safe_float(annualized_return), 2),
         "buy_hold_return": round(_safe_float(buy_hold_return), 2),
+        # Profit-capped (per-trade) variants — equal to the raw values when no cap is set. The
+        # optimizer uses the adjusted fitness so one lucky mega-winner can't dominate the search.
+        "profit_cap_pct": (float(cap_pct) if cap_pct is not None and float(cap_pct) > 0 else None),
+        "adjusted_total_return": round(_safe_float(adjusted_total_return), 2),
+        "adjusted_annualized_return": round(_safe_float(adjusted_annualized_return), 2),
+        "adjusted_calmar_ratio": round(_safe_float(adjusted_calmar), 2),
         # Risk metrics
         "sharpe_ratio": round(_safe_float(sharpe), 2),
         "sortino_ratio": round(_safe_float(sortino), 2),

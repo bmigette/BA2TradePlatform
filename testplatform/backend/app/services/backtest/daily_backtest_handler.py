@@ -828,6 +828,7 @@ def _persist_results(db: Any, bt: Backtest, results: Dict[str, Any]) -> None:
 
     # Return metrics
     bt.total_return = results["total_return"]
+    bt.adjusted_total_return = results.get("adjusted_total_return")
     bt.annualized_return = results.get("annualized_return")
     bt.buy_hold_return = results.get("buy_hold_return")
 

@@ -84,6 +84,10 @@ def main() -> int:
                     help="Local trial consumers per job (ThreadPoolExecutor). Keep low when "
                          "distributing to remote workers — each local consumer holds the OHLCV "
                          "cache in RAM (~5GB at 5min), so 4 saturates a 64GB host. Default 2.")
+    ap.add_argument("--profit-cap-pct", type=float, default=2000.0,
+                    help="Cap each trade's gain at this %% of its cost basis for the ADJUSTED "
+                         "fitness/return, so one lucky non-reproducible mega-winner (e.g. a sub-$1 "
+                         "stock that 90x'd) can't dominate the GA. Default 2000. Pass 0 to disable.")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -112,6 +116,8 @@ def main() -> int:
                "--interval", args.interval, "--population", str(args.population),
                "--generations", str(args.generations), "--screener-cadence-days", str(args.cadence_days),
                "--run-schedule", "weekly", "--name", name, "--parallel", str(args.parallel)]
+        if args.profit_cap_pct and args.profit_cap_pct > 0:
+            cmd += ["--profit-cap-pct", str(args.profit_cap_pct)]
         if strat is not None:
             cmd += ["--strategy", strat]
         if args.workers:
