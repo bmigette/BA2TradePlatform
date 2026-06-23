@@ -249,18 +249,49 @@ def _compute_metrics(
     adjusted_total_return = total_return
     adjusted_annualized_return = annualized_return
     adjusted_calmar = calmar
+    # Trade-quality metrics also distorted by a mega-winner — recomputed on the capped pnls below.
+    adjusted_profit_factor = profit_factor
+    adjusted_expectancy = expectancy
+    adjusted_avg_trade = avg_trade
+    adjusted_best_trade = best_trade
+    adjusted_worst_trade = worst_trade
+    adjusted_sqn = sqn
     if cap_pct is not None and float(cap_pct) > 0:
         cap_frac = float(cap_pct) / 100.0
         excess = 0.0
+        adj_pnls: List[float] = []
+        adj_pcts: List[float] = []
         for t in trades:
             p = t.get("pnl") or 0.0
             cost = (t.get("entry_price") or 0.0) * (t.get("size") or 0.0)
-            if p > 0 and cost > 0:
-                excess += max(0.0, p - cost * cap_frac)
+            cp = min(p, cost * cap_frac) if (p > 0 and cost > 0) else p
+            excess += max(0.0, p - cp)
+            adj_pnls.append(cp)
+            # pnl_pct is equity-relative (pnl / equity_at_entry); scale it by the same factor the
+            # dollar pnl was capped so best/worst/expectancy reflect the capped trade.
+            pct = t.get("pnl_pct") or 0.0
+            adj_pcts.append(pct * (cp / p) if p else pct)
         adj_final = final - excess
         adjusted_total_return = ((adj_final - initial) / initial * 100.0) if initial else 0.0
         adjusted_annualized_return = _annualized_return(initial, adj_final, years)
         adjusted_calmar = (adjusted_annualized_return / abs(max_drawdown)) if max_drawdown else 0.0
+        # Trade-quality on capped pnls (mirrors the raw block above).
+        a_wins = [p for p in adj_pnls if p > 0]
+        a_losses = [p for p in adj_pnls if p < 0]
+        a_gp, a_gl = sum(a_wins), abs(sum(a_losses))
+        if a_gl > 0:
+            adjusted_profit_factor = a_gp / a_gl
+        elif a_gp > 0:
+            adjusted_profit_factor = _PROFIT_FACTOR_CAP
+        else:
+            adjusted_profit_factor = 0.0
+        if adjusted_profit_factor > 999:
+            adjusted_profit_factor = _PROFIT_FACTOR_CAP
+        adjusted_expectancy = (sum(adj_pcts) / total_trades) if total_trades else 0.0
+        adjusted_avg_trade = adjusted_expectancy
+        adjusted_best_trade = max(adj_pcts) if adj_pcts else 0.0
+        adjusted_worst_trade = min(adj_pcts) if adj_pcts else 0.0
+        adjusted_sqn = _sqn(adj_pnls)
 
     return {
         # Basic trade metrics
@@ -278,6 +309,12 @@ def _compute_metrics(
         "adjusted_total_return": round(_safe_float(adjusted_total_return), 2),
         "adjusted_annualized_return": round(_safe_float(adjusted_annualized_return), 2),
         "adjusted_calmar_ratio": round(_safe_float(adjusted_calmar), 2),
+        "adjusted_profit_factor": round(_safe_float(adjusted_profit_factor), 2),
+        "adjusted_expectancy": round(_safe_float(adjusted_expectancy), 2),
+        "adjusted_avg_trade": round(_safe_float(adjusted_avg_trade), 2),
+        "adjusted_best_trade": round(_safe_float(adjusted_best_trade), 2),
+        "adjusted_worst_trade": round(_safe_float(adjusted_worst_trade), 2),
+        "adjusted_sqn": round(_safe_float(adjusted_sqn), 2),
         # Risk metrics
         "sharpe_ratio": round(_safe_float(sharpe), 2),
         "sortino_ratio": round(_safe_float(sortino), 2),

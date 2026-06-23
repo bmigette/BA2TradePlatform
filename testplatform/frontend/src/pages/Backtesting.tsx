@@ -2063,6 +2063,9 @@ const Backtesting: React.FC = () => {
                 <div className="bg-white dark:bg-gray-800 rounded-lg shadow p-3 text-center">
                   <p className="text-xs text-gray-500 dark:text-gray-400">Profit Factor</p>
                   <p className="text-lg font-bold text-gray-900 dark:text-gray-100">{selectedBacktest.profitFactor?.toFixed(2)}</p>
+                  {(() => { const a = (selectedBacktest.results as Record<string, number> | undefined)?.adjusted_profit_factor;
+                    return a != null && Math.abs(a - (selectedBacktest.profitFactor ?? 0)) > 0.05
+                      ? <p className="text-[11px] text-amber-600 dark:text-amber-400" title="Profit factor with each trade's gain capped (excludes one-off lucky mega-winners).">adj {a.toFixed(2)}</p> : null; })()}
                 </div>
                 <div className="bg-white dark:bg-gray-800 rounded-lg shadow p-3 text-center">
                   <p className="text-xs text-gray-500 dark:text-gray-400">Total Trades</p>
@@ -2079,6 +2082,9 @@ const Backtesting: React.FC = () => {
                 <div className="bg-white dark:bg-gray-800 rounded-lg shadow p-3 text-center">
                   <p className="text-xs text-gray-500 dark:text-gray-400">Best Trade</p>
                   <p className="text-lg font-bold text-green-600">+{selectedBacktest.bestTrade?.toFixed(1)}%</p>
+                  {(() => { const a = (selectedBacktest.results as Record<string, number> | undefined)?.adjusted_best_trade;
+                    return a != null && Math.abs(a - (selectedBacktest.bestTrade ?? 0)) > 0.05
+                      ? <p className="text-[11px] text-amber-600 dark:text-amber-400" title="Best trade % with its gain capped at the profit cap (excludes one-off luck).">adj {a >= 0 ? '+' : ''}{a.toFixed(1)}%</p> : null; })()}
                 </div>
                 <div className="bg-white dark:bg-gray-800 rounded-lg shadow p-3 text-center">
                   <p className="text-xs text-gray-500 dark:text-gray-400">Worst Trade</p>

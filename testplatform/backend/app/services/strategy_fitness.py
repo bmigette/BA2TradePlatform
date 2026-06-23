@@ -67,9 +67,13 @@ def compute_fitness(fitness_metric: str, results: dict) -> float:
     # search. Only return-based metrics have an adjusted variant; the rest fall back to raw.
     if results.get("profit_cap_pct"):
         adj_key = {"calmar_ratio": "adjusted_calmar_ratio",
-                   "total_return": "adjusted_total_return"}.get(key)
+                   "total_return": "adjusted_total_return",
+                   "profit_factor": "adjusted_profit_factor",
+                   "sqn": "adjusted_sqn"}.get(key)
         if adj_key is not None and results.get(adj_key) is not None:
             key = adj_key
+    # NOTE: sharpe_ratio / sortino_ratio have no adjusted variant yet (they need an adjusted equity
+    # curve, not just capped trade pnls), so they fall back to raw even under a cap.
     val = results.get(key)
     if val is None or (isinstance(val, float) and (math.isnan(val) or math.isinf(val))):
         return ZERO_TRADE_SENTINEL
