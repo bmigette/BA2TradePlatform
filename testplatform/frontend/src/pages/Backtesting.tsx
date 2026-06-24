@@ -1704,6 +1704,37 @@ const Backtesting: React.FC = () => {
         (selectedBacktest.results.trades as any[]).filter(t => !hiddenTradeIds.has(t.id)),
         selectedBacktest.initialCapital)
     : null;
+  // Adjust the equity + drawdown CURVES for the hidden trades: subtract each hidden trade's realised
+  // P&L from every curve point at/after its exit (ISO dates sort lexically, same format both sides).
+  // Approximate — it removes the realised step, not the intra-trade mark-to-market shape.
+  const hiddenCuts = (hiding && selectedBacktest?.results?.trades)
+    ? (selectedBacktest.results.trades as any[])
+        .filter(t => hiddenTradeIds.has(t.id))
+        .map(t => ({ d: String(t.exitDate || ''), pnl: Number(t.pnl) || 0 }))
+    : [];
+  const adjEquityCurve = (rc && selectedBacktest?.results?.equityCurve)
+    ? (selectedBacktest.results.equityCurve as any[]).map(pt => {
+        const d = String(pt.date || '');
+        let sub = 0;
+        for (const c of hiddenCuts) if (c.d && c.d <= d) sub += c.pnl;
+        return { ...pt, equity: (Number(pt.equity) || 0) - sub };
+      })
+    : null;
+  const adjDrawdownCurve = adjEquityCurve
+    ? (() => {
+        let peak = -Infinity;
+        return adjEquityCurve.map((pt: any) => {
+          const eq = Number(pt.equity) || 0;
+          if (eq > peak) peak = eq;
+          const dd = peak && isFinite(peak) ? ((eq - peak) / peak) * 100 : 0;
+          return { date: pt.date, drawdown: dd };
+        });
+      })()
+    : null;
+  // Max drawdown from the adjusted per-bar curve (more accurate than the trade-stepped rc value).
+  const adjMaxDD = adjDrawdownCurve
+    ? adjDrawdownCurve.reduce((m: number, p: any) => Math.min(m, Number(p.drawdown) || 0), 0)
+    : null;
 
   const getFilteredTrades = () => {
     if (!selectedBacktest?.results?.trades) return [];
@@ -2142,8 +2173,8 @@ const Backtesting: React.FC = () => {
                   <div className="flex items-center justify-between">
                     <div>
                       <p className="text-sm text-gray-500 dark:text-gray-400">Max Drawdown</p>
-                      <p className="text-2xl font-bold text-red-600" title={rc ? 'Approximate (≈): from a trade-stepped equity curve of the remaining trades.' : undefined}>
-                        {rc ? `≈ -${Math.abs(rc.maxDrawdown).toFixed(1)}%` : `-${selectedBacktest.maxDrawdown?.toFixed(1)}%`}
+                      <p className="text-2xl font-bold text-red-600" title={rc ? 'Approximate (≈): max of the adjusted equity curve with the hidden trades removed.' : undefined}>
+                        {rc ? `≈ -${Math.abs(adjMaxDD ?? rc.maxDrawdown).toFixed(1)}%` : `-${selectedBacktest.maxDrawdown?.toFixed(1)}%`}
                       </p>
                       {rc && <p className="text-xs text-gray-400 dark:text-gray-500 mt-0.5">full -{selectedBacktest.maxDrawdown?.toFixed(1)}%</p>}
                     </div>
@@ -2251,8 +2282,11 @@ const Backtesting: React.FC = () => {
                 <div className="p-4">
                   {activeTab === 'equity' && selectedBacktest.results?.equityCurve && (
                     <div className="h-80">
+                      {adjEquityCurve && (
+                        <p className="text-[11px] text-amber-600 dark:text-amber-400 mb-1">≈ adjusted — {hiddenTradeIds.size} hidden trade{hiddenTradeIds.size !== 1 ? 's' : ''} removed from the curve</p>
+                      )}
                       <ResponsiveContainer width="100%" height="100%">
-                        <AreaChart data={selectedBacktest.results.equityCurve}>
+                        <AreaChart data={adjEquityCurve ?? selectedBacktest.results.equityCurve}>
                           <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
                           <XAxis
                             dataKey="date"
@@ -2285,8 +2319,11 @@ const Backtesting: React.FC = () => {
 
                   {activeTab === 'drawdown' && selectedBacktest.results?.drawdownCurve && (
                     <div className="h-80">
+                      {adjDrawdownCurve && (
+                        <p className="text-[11px] text-amber-600 dark:text-amber-400 mb-1">≈ adjusted — recomputed from the equity curve with {hiddenTradeIds.size} hidden trade{hiddenTradeIds.size !== 1 ? 's' : ''} removed</p>
+                      )}
                       <ResponsiveContainer width="100%" height="100%">
-                        <AreaChart data={selectedBacktest.results.drawdownCurve}>
+                        <AreaChart data={adjDrawdownCurve ?? selectedBacktest.results.drawdownCurve}>
                           <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
                           <XAxis
                             dataKey="date"
