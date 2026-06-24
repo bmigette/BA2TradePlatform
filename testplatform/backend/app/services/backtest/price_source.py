@@ -548,6 +548,37 @@ def clear_ohlcv_memo() -> None:
     _FULL_SERIES_MEMO.clear()
 
 
+# Signature of the OHLCV working set (universe + window + interval) currently held in the memo, per
+# PROCESS. Used by evict_memo_if_working_set_changed to free the previous job's series instead of
+# accumulating them. None until the first run in this process.
+_MEMO_WORKING_SET_SIG: Any = None
+
+
+def evict_memo_if_working_set_changed(sig: Any) -> bool:
+    """Clear the process-global OHLCV memo when the working set ``sig`` differs from the one whose
+    series are currently cached, and run a gc pass to actually release the (multi-GB) DataFrames.
+
+    WHY: ``_FULL_SERIES_MEMO`` is intentionally kept across a whole optimization job (the full
+    per-symbol series is loaded once and reused across the entire GA population — the dominant perf
+    win). But the pool workers AND the master process are LONG-LIVED across jobs, so without
+    eviction the memo accumulates EVERY job's universe (e.g. the 504-symbol large-cap band, then the
+    different 814-symbol mid-cap band, then small-cap, ...) and is never freed — the worker memory
+    leak. Calling this at the start of each run (the ``run_daily_backtest`` chokepoint) keeps the
+    in-job reuse (same ``sig`` -> no-op) but drops the prior job's series the moment a run with a
+    DIFFERENT universe/window/interval begins, bounding the footprint to one working set at a time.
+
+    Returns True if it evicted. Idempotent and cheap when the working set is unchanged."""
+    global _MEMO_WORKING_SET_SIG
+    if sig == _MEMO_WORKING_SET_SIG:
+        return False
+    if _FULL_SERIES_MEMO:
+        _FULL_SERIES_MEMO.clear()
+        import gc
+        gc.collect()
+    _MEMO_WORKING_SET_SIG = sig
+    return True
+
+
 class MemoizedOHLCVProvider:
     """Wrap an OHLCV provider so each symbol's full [bounds] series is fetched ONCE per worker
     process and every ``get_ohlcv_data`` call is served by an in-memory date-range slice.

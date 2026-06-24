@@ -97,6 +97,10 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str) -> Dict[str, Any]
     Only the CPU-bound backtest runs here (no GIL contention with the GA loop); the result is
     reduced to ``{ok, fitness, trades, error}`` so the pickled payload back to the parent is
     small (the full equity/trade blobs are re-derived later for the persisted top-N only).
+
+    The cross-job OHLCV-memo eviction (the remote/local worker memory leak fix) lives in
+    ``run_daily_backtest`` — the single chokepoint EVERY path goes through — so it covers the pool
+    workers here AND the master's in-process top-N persist / parallel=1 runs uniformly.
     """
     try:
         from app.services.backtest.daily_backtest_handler import run_daily_backtest

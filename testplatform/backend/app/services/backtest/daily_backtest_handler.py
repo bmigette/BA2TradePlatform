@@ -534,6 +534,20 @@ def run_daily_backtest(
         "screener_runtime": config.get("screener_runtime"),
     }
 
+    # Free the PREVIOUS run's OHLCV memo if this run's working set (universe + window + interval)
+    # differs. The memo is kept across one job's GA population (the big perf win) but the pool
+    # workers + the master process are long-lived across jobs, so without this they accumulate every
+    # band's universe (504-symbol large-cap, then 814-symbol mid-cap, then small-cap, ...) and never
+    # free it — the worker memory leak. This chokepoint covers ALL callers (remote/local pool
+    # workers, the master's in-process top-N persist, parallel=1, standalone) in one place.
+    from app.services.backtest.price_source import evict_memo_if_working_set_changed
+    evict_memo_if_working_set_changed((
+        tuple(sorted(config.get("enabled_instruments") or [])),
+        config.get("execution_interval", "1d"),
+        str(config["start_date"]), str(config["end_date"]),
+        int(config.get("warmup_days") or 0),
+    ))
+
     # Options seam: a present ``options_cache_db`` flags an options run. Build the as-of
     # clamped HistoricalOptionsProvider from it and inject it into the account; a missing
     # cache fails fast (OptionsCacheMiss is raised by the cache reader, not swallowed).
