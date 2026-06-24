@@ -853,6 +853,12 @@ const Backtesting: React.FC = () => {
   // Per-trade "hide" toggle (Trade List): excluded trade ids, for the on-the-fly what-if recompute
   // of the headline metrics. Session-only; cleared whenever a different backtest is selected.
   const [hiddenTradeIds, setHiddenTradeIds] = useState<Set<string>>(new Set());
+  // Backend EXACT recompute of the hidden-trade what-if (curves + metrics reconstructed from the
+  // trade ledger + OHLCV cache — see backend/app/services/backtest/whatif.py). Keyed by the sorted
+  // excluded-id list so a stale response for a different selection is ignored. The client-side
+  // approximation below stays as an instant fallback while this request is in flight / on error.
+  const [whatIf, setWhatIf] = useState<{ key: string; equityCurve: any[]; drawdownCurve: any[]; metrics: any } | null>(null);
+  const [whatIfLoading, setWhatIfLoading] = useState(false);
   // Opt-History: the currently-selected optimization job. When set (and no backtest is
   // selected), the RIGHT panel shows this job's settings + top individuals. Selecting a
   // backtest from the job's saved-backtests table clears this and shows the full result.
@@ -1689,6 +1695,36 @@ const Backtesting: React.FC = () => {
   // Reset the per-trade hide set whenever a different backtest is opened.
   useEffect(() => { setHiddenTradeIds(new Set()); }, [selectedBacktest?.id]);
 
+  // Ask the backend for an EXACT what-if recompute whenever the hidden-trade set changes (debounced).
+  // The backend reconstructs the curve from the ledger + OHLCV cache, so it's accurate where the
+  // client-side approximation isn't (back-loaded winners). Keyed by the sorted id list; a stale
+  // response is dropped. Cleared (revert to full curve) when nothing is hidden.
+  useEffect(() => {
+    const bt = selectedBacktest;
+    if (!bt?.id || hiddenTradeIds.size === 0) { setWhatIf(null); setWhatIfLoading(false); return; }
+    const ids = Array.from(hiddenTradeIds).map(Number).filter(n => Number.isFinite(n)).sort((a, b) => a - b);
+    const key = ids.join(',');
+    let cancelled = false;
+    setWhatIfLoading(true);
+    const h = setTimeout(async () => {
+      try {
+        const res = await fetch(`${API_BASE}/backtests/${bt.id}/whatif`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ exclude_trade_ids: ids }),
+        });
+        if (!res.ok) throw new Error(`whatif ${res.status}`);
+        const data = await res.json();
+        if (!cancelled) setWhatIf({ key, equityCurve: data.equityCurve, drawdownCurve: data.drawdownCurve, metrics: data.metrics });
+      } catch {
+        if (!cancelled) setWhatIf(null);   // fall back to the client-side approximation
+      } finally {
+        if (!cancelled) setWhatIfLoading(false);
+      }
+    }, 250);
+    return () => { cancelled = true; clearTimeout(h); };
+  }, [hiddenTradeIds, selectedBacktest?.id]);
+
   const toggleHideTrade = (id: string) => {
     setHiddenTradeIds(prev => {
       const next = new Set(prev);
@@ -1699,11 +1735,28 @@ const Backtesting: React.FC = () => {
 
   // When any trade is hidden, recompute the headline metrics from the remaining trades (what-if).
   const hiding = hiddenTradeIds.size > 0;
-  const rc: RecomputedMetrics | null = (hiding && selectedBacktest?.results?.trades)
+  // Backend EXACT result, if it matches the CURRENT hidden set (else null -> use the JS fallback).
+  const hiddenKey = Array.from(hiddenTradeIds).map(Number).filter(n => Number.isFinite(n)).sort((a, b) => a - b).join(',');
+  const wf = (hiding && whatIf && whatIf.key === hiddenKey) ? whatIf : null;
+  const rcJs: RecomputedMetrics | null = (hiding && selectedBacktest?.results?.trades)
     ? recomputeTradeMetrics(
         (selectedBacktest.results.trades as any[]).filter(t => !hiddenTradeIds.has(t.id)),
         selectedBacktest.initialCapital)
     : null;
+  // Prefer the backend's exact metrics when available; otherwise the instant client-side approx.
+  const rc: RecomputedMetrics | null = wf
+    ? {
+        n: Number(wf.metrics.total_trades ?? rcJs?.n ?? 0),
+        totalReturn: Number(wf.metrics.total_return ?? 0),
+        winRate: Number(wf.metrics.win_rate ?? 0),
+        profitFactor: Number(wf.metrics.profit_factor ?? 0),
+        best: Number(wf.metrics.best_trade ?? 0),
+        worst: Number(wf.metrics.worst_trade ?? 0),
+        avgDurMs: rcJs?.avgDurMs ?? 0,
+        maxDrawdown: Number(wf.metrics.max_drawdown ?? 0),
+        sharpe: Number(wf.metrics.sharpe_ratio ?? 0),
+      }
+    : rcJs;
   // Adjust the equity + drawdown CURVES for the hidden trades. A position's P&L accrues GRADUALLY
   // as mark-to-market over its hold (net-liq rises while it's held), so subtracting the whole P&L
   // at the exit alone leaves the pre-exit bulge AND drops a spurious cliff. But a plain LINEAR-IN-
@@ -1731,7 +1784,10 @@ const Backtesting: React.FC = () => {
       }
     }
   }
-  const adjEquityCurve = (rc && selectedBacktest?.results?.equityCurve)
+  // Prefer the backend's EXACT reconstructed curve; otherwise the client-side approximation.
+  const adjEquityCurve = wf
+    ? wf.equityCurve
+    : (rcJs && selectedBacktest?.results?.equityCurve)
     ? (selectedBacktest.results.equityCurve as any[]).map(pt => {
         const dms = Date.parse(String(pt.date || ''));
         const eq = Number(pt.equity) || 0;
@@ -1751,7 +1807,9 @@ const Backtesting: React.FC = () => {
         return { ...pt, equity: Math.max(0, eq - sub) };                   // a cash balance can't go < 0
       })
     : null;
-  const adjDrawdownCurve = adjEquityCurve
+  const adjDrawdownCurve = wf
+    ? wf.drawdownCurve
+    : adjEquityCurve
     ? (() => {
         let peak = -Infinity;
         return adjEquityCurve.map((pt: any) => {
@@ -1762,8 +1820,10 @@ const Backtesting: React.FC = () => {
         });
       })()
     : null;
-  // Max drawdown from the adjusted per-bar curve (more accurate than the trade-stepped rc value).
-  const adjMaxDD = adjDrawdownCurve
+  // Max drawdown: exact from the backend, else from the approximated per-bar curve.
+  const adjMaxDD = wf
+    ? Number(wf.metrics.max_drawdown ?? 0)
+    : adjDrawdownCurve
     ? adjDrawdownCurve.reduce((m: number, p: any) => Math.min(m, Number(p.drawdown) || 0), 0)
     : null;
 
@@ -2148,7 +2208,12 @@ const Backtesting: React.FC = () => {
               {hiding && rc && (
                 <div className="flex items-center justify-between gap-2 px-3 py-2 rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 text-sm">
                   <span className="text-amber-800 dark:text-amber-300">
-                    What-if: <strong>{hiddenTradeIds.size}</strong> trade{hiddenTradeIds.size !== 1 ? 's' : ''} hidden — metrics recomputed from the remaining {rc.n} (full-run value shown under each). Sharpe/Max DD are approximate (≈).
+                    What-if: <strong>{hiddenTradeIds.size}</strong> trade{hiddenTradeIds.size !== 1 ? 's' : ''} hidden — metrics recomputed from the remaining {rc.n} (full-run value shown under each).{' '}
+                    {wf
+                      ? 'Curve & metrics reconstructed exactly on the backend (ledger + OHLCV).'
+                      : whatIfLoading
+                      ? 'Computing exact curve on the backend…'
+                      : 'Sharpe/Max DD are approximate (≈, client-side).'}
                   </span>
                   <button type="button" onClick={() => setHiddenTradeIds(new Set())}
                           className="flex items-center gap-1 shrink-0 px-2 py-1 text-xs rounded border border-amber-300 dark:border-amber-700 text-amber-800 dark:text-amber-300 hover:bg-amber-100 dark:hover:bg-amber-800/40">
@@ -2191,8 +2256,8 @@ const Backtesting: React.FC = () => {
                   <div className="flex items-center justify-between">
                     <div>
                       <p className="text-sm text-gray-500 dark:text-gray-400">Sharpe Ratio</p>
-                      <p className="text-2xl font-bold text-blue-600" title={rc ? 'Approximate (≈): annualised per-trade Sharpe from the remaining trades.' : undefined}>
-                        {rc ? `≈ ${rc.sharpe.toFixed(2)}` : selectedBacktest.sharpeRatio?.toFixed(2)}
+                      <p className="text-2xl font-bold text-blue-600" title={rc ? (wf ? 'Exact: Sharpe of the backend-reconstructed equity curve with the hidden trades removed.' : 'Approximate (≈): annualised per-trade Sharpe from the remaining trades.') : undefined}>
+                        {rc ? `${wf ? '' : '≈ '}${rc.sharpe.toFixed(2)}` : selectedBacktest.sharpeRatio?.toFixed(2)}
                       </p>
                       {rc && <p className="text-xs text-gray-400 dark:text-gray-500 mt-0.5">full {selectedBacktest.sharpeRatio?.toFixed(2)}</p>}
                     </div>
@@ -2204,8 +2269,8 @@ const Backtesting: React.FC = () => {
                   <div className="flex items-center justify-between">
                     <div>
                       <p className="text-sm text-gray-500 dark:text-gray-400">Max Drawdown</p>
-                      <p className="text-2xl font-bold text-red-600" title={rc ? 'Approximate (≈): max of the adjusted equity curve with the hidden trades removed.' : undefined}>
-                        {rc ? `≈ -${Math.abs(adjMaxDD ?? rc.maxDrawdown).toFixed(1)}%` : `-${Math.abs(selectedBacktest.maxDrawdown ?? 0).toFixed(1)}%`}
+                      <p className="text-2xl font-bold text-red-600" title={rc ? (wf ? 'Exact: max drawdown of the backend-reconstructed equity curve with the hidden trades removed.' : 'Approximate (≈): max of the adjusted equity curve with the hidden trades removed.') : undefined}>
+                        {rc ? `${wf ? '' : '≈ '}-${Math.abs(adjMaxDD ?? rc.maxDrawdown).toFixed(1)}%` : `-${Math.abs(selectedBacktest.maxDrawdown ?? 0).toFixed(1)}%`}
                       </p>
                       {rc && <p className="text-xs text-gray-400 dark:text-gray-500 mt-0.5">full -{Math.abs(selectedBacktest.maxDrawdown ?? 0).toFixed(1)}%</p>}
                     </div>
@@ -2314,7 +2379,7 @@ const Backtesting: React.FC = () => {
                   {activeTab === 'equity' && selectedBacktest.results?.equityCurve && (
                     <div className="h-80">
                       {adjEquityCurve && (
-                        <p className="text-[11px] text-amber-600 dark:text-amber-400 mb-1">≈ adjusted — {hiddenTradeIds.size} hidden trade{hiddenTradeIds.size !== 1 ? 's' : ''} removed from the curve</p>
+                        <p className="text-[11px] text-amber-600 dark:text-amber-400 mb-1">{wf ? 'adjusted (exact)' : '≈ adjusted'} — {hiddenTradeIds.size} hidden trade{hiddenTradeIds.size !== 1 ? 's' : ''} removed from the curve{wf ? '' : whatIfLoading ? ' (computing exact…)' : ''}</p>
                       )}
                       <ResponsiveContainer width="100%" height="100%">
                         <AreaChart data={adjEquityCurve ?? selectedBacktest.results.equityCurve}>
@@ -2351,7 +2416,7 @@ const Backtesting: React.FC = () => {
                   {activeTab === 'drawdown' && selectedBacktest.results?.drawdownCurve && (
                     <div className="h-80">
                       {adjDrawdownCurve && (
-                        <p className="text-[11px] text-amber-600 dark:text-amber-400 mb-1">≈ adjusted — recomputed from the equity curve with {hiddenTradeIds.size} hidden trade{hiddenTradeIds.size !== 1 ? 's' : ''} removed</p>
+                        <p className="text-[11px] text-amber-600 dark:text-amber-400 mb-1">{wf ? 'adjusted (exact)' : '≈ adjusted'} — recomputed from the equity curve with {hiddenTradeIds.size} hidden trade{hiddenTradeIds.size !== 1 ? 's' : ''} removed</p>
                       )}
                       <ResponsiveContainer width="100%" height="100%">
                         <AreaChart data={adjDrawdownCurve ?? selectedBacktest.results.drawdownCurve}>

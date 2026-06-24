@@ -665,6 +665,50 @@ async def get_backtest(
     return backtest.to_dict()
 
 
+class WhatIfRequest(BaseModel):
+    """Body for the hidden-trade what-if: 1-based trade ids to EXCLUDE (matching the trade ids the
+    list endpoint assigns, id = index+1)."""
+    exclude_trade_ids: List[int] = []
+
+
+@router.post("/{backtest_id}/whatif")
+async def backtest_whatif(
+    backtest_id: int,
+    body: WhatIfRequest,
+    db: Session = Depends(get_db),
+):
+    """Recompute the equity/drawdown curves + headline metrics with the given trades EXCLUDED,
+    WITHOUT re-running the backtest. Reconstructs net-liq per bar from the trade ledger + the OHLCV
+    cache (see services/backtest/whatif.py), so hiding a trade is exact at bar-close granularity and
+    can't produce the cliffs/negative equity the old client-side approximation did. With an empty
+    exclude list it reproduces the stored curve (a built-in correctness check)."""
+    backtest = db.query(Backtest).filter(Backtest.id == backtest_id).first()
+    if not backtest:
+        raise HTTPException(status_code=404, detail=f"Backtest {backtest_id} not found")
+    if not backtest.equity_curve or not backtest.trades:
+        raise HTTPException(status_code=400,
+                            detail="Backtest has no stored equity_curve/trades to recompute")
+    from app.services.backtest.whatif import recompute_curves
+    try:
+        res = recompute_curves(
+            initial_capital=backtest.initial_capital,
+            trades=backtest.trades,
+            equity_curve=backtest.equity_curve,
+            start=backtest.start_date,
+            end=backtest.end_date,
+            exclude_ids=body.exclude_trade_ids,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"whatif recompute failed for backtest {backtest_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Recompute failed: {e}")
+    return {
+        "excludedTradeIds": body.exclude_trade_ids,
+        "equityCurve": res.pop("equity_curve"),
+        "drawdownCurve": res.pop("drawdown_curve"),
+        "metrics": res,
+    }
+
+
 @router.delete("/{backtest_id}")
 async def delete_backtest(
     backtest_id: int,
