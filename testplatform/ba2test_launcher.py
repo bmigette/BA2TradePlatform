@@ -419,9 +419,23 @@ def _cmd_fetch_options(args) -> int:
     _parent = os.path.dirname(args.cache_db)
     if _parent:
         os.makedirs(_parent, exist_ok=True)
+    # Resolve Alpaca MARKET-DATA creds from the app-settings DB (stored lowercase, e.g.
+    # alpaca_market_api_key) and pass them explicitly, mirroring the FMP_API_KEY mirror in
+    # _bootstrap. Without this, build_cache only finds creds if the launching SHELL happened to
+    # export ALPACA_MARKET_API_KEY/_SECRET — which a fresh CLI/background relaunch does not.
+    _ak = _as = None
+    try:
+        from ba2_common.config import get_app_setting
+        _ak = (get_app_setting("alpaca_market_api_key") or get_app_setting("alpaca_api_key")
+               or os.getenv("ALPACA_MARKET_API_KEY") or os.getenv("ALPACA_API_KEY"))
+        _as = (get_app_setting("alpaca_market_api_secret") or get_app_setting("alpaca_api_secret")
+               or os.getenv("ALPACA_MARKET_API_SECRET") or os.getenv("ALPACA_SECRET_KEY"))
+    except Exception:  # noqa: BLE001 — fall back to build_cache's own env-based resolution
+        pass
     stats = fetch_options.build_cache(
         args.cache_db, unders, date.fromisoformat(args.start), date.fromisoformat(args.end),
-        args.feed, max_workers=args.workers, resume=not args.no_resume)
+        args.feed, api_key=_ak, api_secret=_as,
+        max_workers=args.workers, resume=not args.no_resume)
     print(json.dumps(stats, indent=2))
     return 0
 
