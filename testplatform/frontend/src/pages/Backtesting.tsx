@@ -1704,19 +1704,28 @@ const Backtesting: React.FC = () => {
         (selectedBacktest.results.trades as any[]).filter(t => !hiddenTradeIds.has(t.id)),
         selectedBacktest.initialCapital)
     : null;
-  // Adjust the equity + drawdown CURVES for the hidden trades: subtract each hidden trade's realised
-  // P&L from every curve point at/after its exit (ISO dates sort lexically, same format both sides).
-  // Approximate — it removes the realised step, not the intra-trade mark-to-market shape.
+  // Adjust the equity + drawdown CURVES for the hidden trades. A position's P&L accrues GRADUALLY
+  // as mark-to-market over its hold (the curve rose while it was held), so subtracting the whole
+  // P&L at the exit alone would leave the pre-exit bulge AND drop a spurious cliff at exit (a big
+  // winner would look like a crash). Instead RAMP the removal linearly across each trade's hold:
+  // 0 at entry -> full P&L at/after exit. Approximate (real MTM isn't linear) but smooth, and the
+  // endpoint matches the recomputed Total Return.
   const hiddenCuts = (hiding && selectedBacktest?.results?.trades)
     ? (selectedBacktest.results.trades as any[])
         .filter(t => hiddenTradeIds.has(t.id))
-        .map(t => ({ d: String(t.exitDate || ''), pnl: Number(t.pnl) || 0 }))
+        .map(t => ({ t0: Date.parse(t.entryDate), t1: Date.parse(t.exitDate), pnl: Number(t.pnl) || 0 }))
     : [];
   const adjEquityCurve = (rc && selectedBacktest?.results?.equityCurve)
     ? (selectedBacktest.results.equityCurve as any[]).map(pt => {
-        const d = String(pt.date || '');
+        const dms = Date.parse(String(pt.date || ''));
         let sub = 0;
-        for (const c of hiddenCuts) if (c.d && c.d <= d) sub += c.pnl;
+        for (const c of hiddenCuts) {
+          if (!isFinite(c.t1)) continue;
+          if (dms >= c.t1) sub += c.pnl;                                   // fully removed after exit
+          else if (isFinite(c.t0) && c.t1 > c.t0 && dms > c.t0)            // ramping during the hold
+            sub += c.pnl * ((dms - c.t0) / (c.t1 - c.t0));
+          // before entry: 0
+        }
         return { ...pt, equity: (Number(pt.equity) || 0) - sub };
       })
     : null;
@@ -2174,9 +2183,9 @@ const Backtesting: React.FC = () => {
                     <div>
                       <p className="text-sm text-gray-500 dark:text-gray-400">Max Drawdown</p>
                       <p className="text-2xl font-bold text-red-600" title={rc ? 'Approximate (≈): max of the adjusted equity curve with the hidden trades removed.' : undefined}>
-                        {rc ? `≈ -${Math.abs(adjMaxDD ?? rc.maxDrawdown).toFixed(1)}%` : `-${selectedBacktest.maxDrawdown?.toFixed(1)}%`}
+                        {rc ? `≈ -${Math.abs(adjMaxDD ?? rc.maxDrawdown).toFixed(1)}%` : `-${Math.abs(selectedBacktest.maxDrawdown ?? 0).toFixed(1)}%`}
                       </p>
-                      {rc && <p className="text-xs text-gray-400 dark:text-gray-500 mt-0.5">full -{selectedBacktest.maxDrawdown?.toFixed(1)}%</p>}
+                      {rc && <p className="text-xs text-gray-400 dark:text-gray-500 mt-0.5">full -{Math.abs(selectedBacktest.maxDrawdown ?? 0).toFixed(1)}%</p>}
                     </div>
                     <ArrowDownRight className="w-8 h-8 text-red-500" />
                   </div>
