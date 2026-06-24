@@ -26,7 +26,10 @@ import {
   Sliders,
   Shield,
   Download,
-  Upload
+  Upload,
+  Eye,
+  EyeOff,
+  RotateCcw
 } from 'lucide-react';
 import Tooltip from '../components/Tooltip';
 import ConfirmDialog from '../components/ConfirmDialog';
@@ -269,6 +272,61 @@ const tradeDurationMs = (t: { entryDate?: string; exitDate?: string }): number =
   if (!t?.entryDate || !t?.exitDate) return NaN;
   return Date.parse(t.exitDate) - Date.parse(t.entryDate);
 };
+
+// Recompute the headline metrics from a (possibly trimmed) set of trades — used by the per-trade
+// "hide" toggle to show, on the fly, what the result looks like with some trades excluded.
+// IMPORTANT: this is a P&L-ATTRIBUTION what-if (removes the hidden trades' realised P&L), NOT a
+// re-simulation — it can't change the position-sizing/capital the other trades actually used.
+// Return/win-rate/profit-factor/best/worst/avg-duration are EXACT; sharpe + maxDrawdown are
+// APPROXIMATE (derived from a trade-stepped equity curve, not the per-bar curve).
+type RecomputedMetrics = {
+  n: number; totalReturn: number; winRate: number; profitFactor: number;
+  best: number; worst: number; avgDurMs: number; maxDrawdown: number; sharpe: number;
+};
+function recomputeTradeMetrics(trades: any[], initialCapital: number): RecomputedMetrics {
+  const initial = initialCapital || 10000;
+  const n = trades.length;
+  const pnls = trades.map(t => Number(t.pnl) || 0);
+  const pcts = trades.map(t => Number(t.pnlPercent) || 0);
+  const wins = pnls.filter(p => p > 0);
+  const losses = pnls.filter(p => p < 0);
+  const grossProfit = wins.reduce((a, b) => a + b, 0);
+  const grossLoss = Math.abs(losses.reduce((a, b) => a + b, 0));
+  const totalPnl = pnls.reduce((a, b) => a + b, 0);
+  const totalReturn = initial ? (totalPnl / initial) * 100 : 0;
+  const winRate = n ? (wins.length / n) * 100 : 0;
+  const profitFactor = grossLoss > 0 ? grossProfit / grossLoss : (grossProfit > 0 ? 999.99 : 0);
+  const best = pcts.length ? Math.max(...pcts) : 0;
+  const worst = pcts.length ? Math.min(...pcts) : 0;
+  const durs = trades.map(tradeDurationMs).filter((ms: number) => isFinite(ms) && ms > 0);
+  const avgDurMs = durs.length ? durs.reduce((a: number, b: number) => a + b, 0) / durs.length : 0;
+  // Trade-stepped equity curve (ordered by exit) for the APPROX maxDD + annualised trade-Sharpe.
+  const ordered = [...trades].sort((a, b) => String(a.exitDate || '').localeCompare(String(b.exitDate || '')));
+  let eq = initial, peak = initial, maxDrawdown = 0;
+  const rets: number[] = [];
+  for (const t of ordered) {
+    const prev = eq;
+    eq += Number(t.pnl) || 0;
+    if (eq > peak) peak = eq;
+    const dd = peak ? ((eq - peak) / peak) * 100 : 0;
+    if (dd < maxDrawdown) maxDrawdown = dd;
+    if (prev) rets.push((Number(t.pnl) || 0) / prev);
+  }
+  const mean = rets.length ? rets.reduce((a, b) => a + b, 0) / rets.length : 0;
+  const variance = rets.length > 1 ? rets.reduce((a, b) => a + (b - mean) ** 2, 0) / (rets.length - 1) : 0;
+  const std = Math.sqrt(variance);
+  // Annualise the per-trade Sharpe by trades-per-year (from the trade date span) so it's roughly
+  // comparable to the bar-level Sharpe.
+  let yrs = 1;
+  if (ordered.length > 1) {
+    const t0 = Date.parse(ordered[0].entryDate || ordered[0].exitDate);
+    const t1 = Date.parse(ordered[ordered.length - 1].exitDate || ordered[ordered.length - 1].entryDate);
+    if (isFinite(t0) && isFinite(t1) && t1 > t0) yrs = (t1 - t0) / (365.25 * 24 * 3600 * 1000);
+  }
+  const tradesPerYear = yrs > 0 ? n / yrs : n;
+  const sharpe = std > 0 ? (mean / std) * Math.sqrt(Math.max(1, tradesPerYear)) : 0;
+  return { n, totalReturn, winRate, profitFactor, best, worst, avgDurMs, maxDrawdown, sharpe };
+}
 
 // Generate random backtest name
 const generateBacktestName = (): string => {
@@ -792,6 +850,9 @@ const Backtesting: React.FC = () => {
 
   // Results view
   const [selectedBacktest, setSelectedBacktest] = useState<Backtest | null>(null);
+  // Per-trade "hide" toggle (Trade List): excluded trade ids, for the on-the-fly what-if recompute
+  // of the headline metrics. Session-only; cleared whenever a different backtest is selected.
+  const [hiddenTradeIds, setHiddenTradeIds] = useState<Set<string>>(new Set());
   // Opt-History: the currently-selected optimization job. When set (and no backtest is
   // selected), the RIGHT panel shows this job's settings + top individuals. Selecting a
   // backtest from the job's saved-backtests table clears this and shows the full result.
@@ -1625,6 +1686,25 @@ const Backtesting: React.FC = () => {
     }
   };
 
+  // Reset the per-trade hide set whenever a different backtest is opened.
+  useEffect(() => { setHiddenTradeIds(new Set()); }, [selectedBacktest?.id]);
+
+  const toggleHideTrade = (id: string) => {
+    setHiddenTradeIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+
+  // When any trade is hidden, recompute the headline metrics from the remaining trades (what-if).
+  const hiding = hiddenTradeIds.size > 0;
+  const rc: RecomputedMetrics | null = (hiding && selectedBacktest?.results?.trades)
+    ? recomputeTradeMetrics(
+        (selectedBacktest.results.trades as any[]).filter(t => !hiddenTradeIds.has(t.id)),
+        selectedBacktest.initialCapital)
+    : null;
+
   const getFilteredTrades = () => {
     if (!selectedBacktest?.results?.trades) return [];
 
@@ -2000,31 +2080,44 @@ const Backtesting: React.FC = () => {
                 );
               })()}
               {/* Metrics Summary */}
+              {/* When trades are hidden in the Trade List, the tiles below show the WHAT-IF metrics
+                  (full-run value shown small underneath). This is a P&L-attribution recompute, not a
+                  re-simulation; Sharpe + Max DD are approximate (≈, trade-stepped). */}
+              {hiding && rc && (
+                <div className="flex items-center justify-between gap-2 px-3 py-2 rounded-lg bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 text-sm">
+                  <span className="text-amber-800 dark:text-amber-300">
+                    What-if: <strong>{hiddenTradeIds.size}</strong> trade{hiddenTradeIds.size !== 1 ? 's' : ''} hidden — metrics recomputed from the remaining {rc.n} (full-run value shown under each). Sharpe/Max DD are approximate (≈).
+                  </span>
+                  <button type="button" onClick={() => setHiddenTradeIds(new Set())}
+                          className="flex items-center gap-1 shrink-0 px-2 py-1 text-xs rounded border border-amber-300 dark:border-amber-700 text-amber-800 dark:text-amber-300 hover:bg-amber-100 dark:hover:bg-amber-800/40">
+                    <RotateCcw className="w-3 h-3" /> Reset
+                  </button>
+                </div>
+              )}
+
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                 <div className="bg-white dark:bg-gray-800 rounded-lg shadow p-4">
                   <div className="flex items-center justify-between">
                     <div>
                       <p className="text-sm text-gray-500 dark:text-gray-400">Total Return</p>
-                      {/* Profit-capped (adjusted) return is the HEADLINE — each trade's gain limited
-                          to a multiple of its cost basis so one lucky mega-winner can't inflate it.
-                          Raw shown smaller below when a cap changed it. */}
                       {(() => {
-                        const raw = selectedBacktest.totalReturn ?? 0;
+                        const fullRaw = selectedBacktest.totalReturn ?? 0;
                         const adj = selectedBacktest.adjustedTotalReturn;
-                        const hasAdj = adj != null && Math.abs(adj - raw) > 0.05;
-                        const primary = hasAdj ? (adj as number) : raw;
+                        const hasAdj = !hiding && adj != null && Math.abs(adj - fullRaw) > 0.05;
+                        const primary = rc ? rc.totalReturn : (hasAdj ? (adj as number) : fullRaw);
                         return (<>
-                          <p className={`text-2xl font-bold ${primary >= 0 ? 'text-green-600' : 'text-red-600'}`}
-                             title={hasAdj ? 'Adjusted: each trade capped at the profit cap (per-trade % of cost basis), excludes one-off lucky mega-winners.' : undefined}>
+                          <p className={`text-2xl font-bold ${primary >= 0 ? 'text-green-600' : 'text-red-600'}`}>
                             {primary >= 0 ? '+' : ''}{primary.toFixed(1)}%
                           </p>
-                          {hasAdj && (
-                            <p className="text-xs text-gray-400 dark:text-gray-500 mt-0.5">raw {raw >= 0 ? '+' : ''}{raw.toFixed(1)}%</p>
-                          )}
+                          {rc ? (
+                            <p className="text-xs text-gray-400 dark:text-gray-500 mt-0.5">full {fullRaw >= 0 ? '+' : ''}{fullRaw.toFixed(1)}%</p>
+                          ) : hasAdj ? (
+                            <p className="text-xs text-gray-400 dark:text-gray-500 mt-0.5">raw {fullRaw >= 0 ? '+' : ''}{fullRaw.toFixed(1)}%</p>
+                          ) : null}
                         </>);
                       })()}
                     </div>
-                    {(selectedBacktest.adjustedTotalReturn ?? selectedBacktest.totalReturn ?? 0) >= 0 ? (
+                    {((rc ? rc.totalReturn : (selectedBacktest.adjustedTotalReturn ?? selectedBacktest.totalReturn ?? 0)) >= 0) ? (
                       <TrendingUp className="w-8 h-8 text-green-500" />
                     ) : (
                       <TrendingDown className="w-8 h-8 text-red-500" />
@@ -2036,7 +2129,10 @@ const Backtesting: React.FC = () => {
                   <div className="flex items-center justify-between">
                     <div>
                       <p className="text-sm text-gray-500 dark:text-gray-400">Sharpe Ratio</p>
-                      <p className="text-2xl font-bold text-blue-600">{selectedBacktest.sharpeRatio?.toFixed(2)}</p>
+                      <p className="text-2xl font-bold text-blue-600" title={rc ? 'Approximate (≈): annualised per-trade Sharpe from the remaining trades.' : undefined}>
+                        {rc ? `≈ ${rc.sharpe.toFixed(2)}` : selectedBacktest.sharpeRatio?.toFixed(2)}
+                      </p>
+                      {rc && <p className="text-xs text-gray-400 dark:text-gray-500 mt-0.5">full {selectedBacktest.sharpeRatio?.toFixed(2)}</p>}
                     </div>
                     <Activity className="w-8 h-8 text-blue-500" />
                   </div>
@@ -2046,7 +2142,10 @@ const Backtesting: React.FC = () => {
                   <div className="flex items-center justify-between">
                     <div>
                       <p className="text-sm text-gray-500 dark:text-gray-400">Max Drawdown</p>
-                      <p className="text-2xl font-bold text-red-600">-{selectedBacktest.maxDrawdown?.toFixed(1)}%</p>
+                      <p className="text-2xl font-bold text-red-600" title={rc ? 'Approximate (≈): from a trade-stepped equity curve of the remaining trades.' : undefined}>
+                        {rc ? `≈ -${Math.abs(rc.maxDrawdown).toFixed(1)}%` : `-${selectedBacktest.maxDrawdown?.toFixed(1)}%`}
+                      </p>
+                      {rc && <p className="text-xs text-gray-400 dark:text-gray-500 mt-0.5">full -{selectedBacktest.maxDrawdown?.toFixed(1)}%</p>}
                     </div>
                     <ArrowDownRight className="w-8 h-8 text-red-500" />
                   </div>
@@ -2056,7 +2155,8 @@ const Backtesting: React.FC = () => {
                   <div className="flex items-center justify-between">
                     <div>
                       <p className="text-sm text-gray-500 dark:text-gray-400">Win Rate</p>
-                      <p className="text-2xl font-bold text-purple-600">{selectedBacktest.winRate?.toFixed(1)}%</p>
+                      <p className="text-2xl font-bold text-purple-600">{(rc ? rc.winRate : (selectedBacktest.winRate ?? 0)).toFixed(1)}%</p>
+                      {rc && <p className="text-xs text-gray-400 dark:text-gray-500 mt-0.5">full {selectedBacktest.winRate?.toFixed(1)}%</p>}
                     </div>
                     <Award className="w-8 h-8 text-purple-500" />
                   </div>
@@ -2068,23 +2168,26 @@ const Backtesting: React.FC = () => {
                 <div className="bg-white dark:bg-gray-800 rounded-lg shadow p-3 text-center">
                   <p className="text-xs text-gray-500 dark:text-gray-400">Profit Factor</p>
                   {(() => {
-                    const raw = selectedBacktest.profitFactor ?? 0;
+                    const fullRaw = selectedBacktest.profitFactor ?? 0;
                     const a = (selectedBacktest.results as Record<string, number> | undefined)?.adjusted_profit_factor;
-                    const hasAdj = a != null && Math.abs(a - raw) > 0.05;
+                    const hasAdj = !hiding && a != null && Math.abs(a - fullRaw) > 0.05;
+                    const primary = rc ? rc.profitFactor : (hasAdj ? a! : fullRaw);
                     return (<>
-                      <p className="text-lg font-bold text-gray-900 dark:text-gray-100"
-                         title={hasAdj ? 'Adjusted: profit factor with each trade capped (excludes one-off lucky mega-winners).' : undefined}>{(hasAdj ? a! : raw).toFixed(2)}</p>
-                      {hasAdj && <p className="text-[11px] text-gray-400 dark:text-gray-500">raw {raw.toFixed(2)}</p>}
+                      <p className="text-lg font-bold text-gray-900 dark:text-gray-100">{primary.toFixed(2)}</p>
+                      {rc ? <p className="text-[11px] text-gray-400 dark:text-gray-500">full {fullRaw.toFixed(2)}</p>
+                          : hasAdj ? <p className="text-[11px] text-gray-400 dark:text-gray-500">raw {fullRaw.toFixed(2)}</p> : null}
                     </>);
                   })()}
                 </div>
                 <div className="bg-white dark:bg-gray-800 rounded-lg shadow p-3 text-center">
                   <p className="text-xs text-gray-500 dark:text-gray-400">Total Trades</p>
-                  <p className="text-lg font-bold text-gray-900 dark:text-gray-100">{selectedBacktest.totalTrades}</p>
+                  <p className="text-lg font-bold text-gray-900 dark:text-gray-100">{rc ? rc.n : selectedBacktest.totalTrades}</p>
+                  {rc && <p className="text-[11px] text-gray-400 dark:text-gray-500">of {selectedBacktest.totalTrades}</p>}
                 </div>
                 <div className="bg-white dark:bg-gray-800 rounded-lg shadow p-3 text-center">
                   <p className="text-xs text-gray-500 dark:text-gray-400">Avg Duration</p>
                   <p className="text-lg font-bold text-gray-900 dark:text-gray-100">{(() => {
+                    if (rc) return rc.avgDurMs ? formatDuration(rc.avgDurMs) : '—';
                     const ts = (selectedBacktest.results?.trades || [])
                       .map(tradeDurationMs).filter(ms => isFinite(ms) && ms > 0);
                     return ts.length ? formatDuration(ts.reduce((a, b) => a + b, 0) / ts.length) : '—';
@@ -2093,20 +2196,21 @@ const Backtesting: React.FC = () => {
                 <div className="bg-white dark:bg-gray-800 rounded-lg shadow p-3 text-center">
                   <p className="text-xs text-gray-500 dark:text-gray-400">Best Trade</p>
                   {(() => {
-                    const raw = selectedBacktest.bestTrade ?? 0;
+                    const fullRaw = selectedBacktest.bestTrade ?? 0;
                     const a = (selectedBacktest.results as Record<string, number> | undefined)?.adjusted_best_trade;
-                    const hasAdj = a != null && Math.abs(a - raw) > 0.05;
-                    const primary = hasAdj ? a! : raw;
+                    const hasAdj = !hiding && a != null && Math.abs(a - fullRaw) > 0.05;
+                    const primary = rc ? rc.best : (hasAdj ? a! : fullRaw);
                     return (<>
-                      <p className="text-lg font-bold text-green-600"
-                         title={hasAdj ? 'Adjusted: best trade with its gain capped at the profit cap (excludes one-off luck).' : undefined}>{primary >= 0 ? '+' : ''}{primary.toFixed(1)}%</p>
-                      {hasAdj && <p className="text-[11px] text-gray-400 dark:text-gray-500">raw {raw >= 0 ? '+' : ''}{raw.toFixed(1)}%</p>}
+                      <p className="text-lg font-bold text-green-600">{primary >= 0 ? '+' : ''}{primary.toFixed(1)}%</p>
+                      {rc ? <p className="text-[11px] text-gray-400 dark:text-gray-500">full {fullRaw >= 0 ? '+' : ''}{fullRaw.toFixed(1)}%</p>
+                          : hasAdj ? <p className="text-[11px] text-gray-400 dark:text-gray-500">raw {fullRaw >= 0 ? '+' : ''}{fullRaw.toFixed(1)}%</p> : null}
                     </>);
                   })()}
                 </div>
                 <div className="bg-white dark:bg-gray-800 rounded-lg shadow p-3 text-center">
                   <p className="text-xs text-gray-500 dark:text-gray-400">Worst Trade</p>
-                  <p className="text-lg font-bold text-red-600">{selectedBacktest.worstTrade?.toFixed(1)}%</p>
+                  <p className="text-lg font-bold text-red-600">{(rc ? rc.worst : (selectedBacktest.worstTrade ?? 0)).toFixed(1)}%</p>
+                  {rc && <p className="text-[11px] text-gray-400 dark:text-gray-500">full {selectedBacktest.worstTrade?.toFixed(1)}%</p>}
                 </div>
               </div>
 
@@ -2256,6 +2360,7 @@ const Backtesting: React.FC = () => {
                         <table className="w-full text-sm">
                           <thead className="bg-gray-50 dark:bg-gray-700/50 sticky top-0">
                             <tr>
+                              <th className="px-2 py-2 text-center text-gray-700 dark:text-gray-300" title="Hide a trade to recompute the metrics without it (what-if)"></th>
                               <th className="px-3 py-2 text-left text-gray-700 dark:text-gray-300">Symbol</th>
                               <th className="px-3 py-2 text-left text-gray-700 dark:text-gray-300">Entry</th>
                               <th className="px-3 py-2 text-left text-gray-700 dark:text-gray-300">Exit</th>
@@ -2270,12 +2375,21 @@ const Backtesting: React.FC = () => {
                             </tr>
                           </thead>
                           <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
-                            {getFilteredTrades().map(trade => (
+                            {getFilteredTrades().map(trade => {
+                              const isHidden = hiddenTradeIds.has(trade.id);
+                              return (
                               <tr key={trade.id}
                                   onClick={() => setChartTrade(trade)}
                                   title="Click to view the daily chart with entry/exit markers"
-                                  className="cursor-pointer hover:bg-blue-50 dark:hover:bg-blue-900/20">
-                                <td className="px-3 py-2 font-medium text-gray-900 dark:text-gray-100">{trade.symbol || '—'}</td>
+                                  className={`cursor-pointer hover:bg-blue-50 dark:hover:bg-blue-900/20 ${isHidden ? 'opacity-40' : ''}`}>
+                                <td className="px-2 py-2 text-center" onClick={(e) => { e.stopPropagation(); toggleHideTrade(trade.id); }}>
+                                  <button type="button"
+                                          title={isHidden ? 'Show: include this trade in the metrics again' : 'Hide: exclude this trade and recompute the metrics'}
+                                          className="text-gray-400 hover:text-amber-600 dark:hover:text-amber-400">
+                                    {isHidden ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                                  </button>
+                                </td>
+                                <td className={`px-3 py-2 font-medium text-gray-900 dark:text-gray-100 ${isHidden ? 'line-through' : ''}`}>{trade.symbol || '—'}</td>
                                 <td className="px-3 py-2 text-gray-900 dark:text-gray-100">{trade.entryDate}</td>
                                 <td className="px-3 py-2 text-gray-900 dark:text-gray-100">{trade.exitDate}</td>
                                 <td className="px-3 py-2 text-right text-gray-900 dark:text-gray-100">${trade.entryPrice.toFixed(2)}</td>
@@ -2301,7 +2415,8 @@ const Backtesting: React.FC = () => {
                                   </span>
                                 </td>
                               </tr>
-                            ))}
+                              );
+                            })}
                           </tbody>
                         </table>
                       </div>
