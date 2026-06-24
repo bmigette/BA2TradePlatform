@@ -119,6 +119,22 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str) -> Dict[str, Any]
                 "fatal": fatal}
 
 
+def _persist_trial_worker(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Run a TOP-N re-run and return the FULL results dict (equity curve / trades / metrics) for
+    the master to persist as a tagged Backtest.
+
+    Distinct from ``_trial_worker``, which returns only the scalar fitness: the top-N persist needs
+    the whole results blob. Used by ``_persist_top_backtests`` to fan the independent re-runs across
+    a bounded local process pool (the re-runs are the slow post-GA phase). On error returns
+    ``{ok: False, error}`` so one bad re-run never poisons the pool or aborts the others.
+    """
+    try:
+        from app.services.backtest.daily_backtest_handler import run_daily_backtest
+        return {"ok": True, "results": run_daily_backtest(config)}
+    except Exception as e:  # noqa: BLE001 — surface as a failed re-run, keep the others going
+        return {"ok": False, "error": repr(e)}
+
+
 def _resolve_workers(db: Any, worker_ids: Optional[list]) -> list:
     """Resolve selected worker ids -> plain dicts ``{id,name,url,password}`` for the dispatchers.
 

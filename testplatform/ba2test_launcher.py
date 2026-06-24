@@ -1233,7 +1233,7 @@ def _cmd_optimize(args) -> int:
         print(f"optimize: done. best_fitness={opt.best_fitness} best_params={json.dumps(opt.best_params, default=str)}")
     finally:
         db.close()
-    nsaved = _persist_top_backtests(opt_id, expert, n=int(args.save_top))
+    nsaved = _persist_top_backtests(opt_id, expert, n=int(args.save_top), parallel=int(args.parallel))
     print(f"optimize: top {nsaved} persisted as tagged, saved Backtests (optimization_id={opt_id}); "
           f"run `ba2-test runs list --group {opt_id}` or `ba2-test report`.")
     return 0
@@ -1378,7 +1378,7 @@ def _cmd_optimize_batch(args) -> int:
             continue
 
         try:
-            nsaved = _persist_top_backtests(opt_id, expert, n=int(args.save_top))
+            nsaved = _persist_top_backtests(opt_id, expert, n=int(args.save_top), parallel=int(args.parallel))
             print(f"[{n}/{len(jobs)}] {expert} opt#{opt_id} COMPLETE; persisted top {nsaved} backtests.")
         except Exception as exc:  # noqa: BLE001
             print(f"[{n}/{len(jobs)}] persist top-N failed for opt#{opt_id}: {exc}")
@@ -1392,10 +1392,16 @@ def _cmd_optimize_batch(args) -> int:
     return 0
 
 
-def _persist_top_backtests(opt_id: int, expert: str, n: int = 5) -> int:
+def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int = 1) -> int:
     """Re-run the optimization's TOP-N distinct param sets and persist each as a tagged,
     saved Backtest (best params + their metrics) so the top performers are kept for
-    comparison and to warm-start future optimizations. Returns how many were persisted."""
+    comparison and to warm-start future optimizations. Returns how many were persisted.
+
+    The re-runs are the slow post-GA phase (~minutes each at 5min/multi-year). They are
+    INDEPENDENT, so with ``parallel`` > 1 they fan out across a bounded local process pool
+    (each worker returns the full results blob; the master does all the DB writes through its
+    single session). Bounded to ``parallel`` to respect the per-run ~2.5GB universe-memo
+    footprint — the same local cap the GA uses."""
     import json as _json
     from datetime import datetime as _dt
     import app.models  # noqa: F401
@@ -1404,7 +1410,7 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5) -> int:
     from app.models.strategy import Strategy
     from app.models.strategy_optimization import StrategyOptimization
     from app.services.strategy_optimization_handler import _build_daily_trial_config  # noqa: SLF001
-    from app.services.backtest.daily_backtest_handler import run_daily_backtest, _persist_results
+    from app.services.backtest.daily_backtest_handler import _persist_results  # re-run via _persist_trial_worker
     from app.services.strategy_param_space import decode_params
 
     # The top-N re-runs invoke the full run_daily_backtest per saved backtest — the same
@@ -1440,19 +1446,19 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5) -> int:
         if not ranked and opt.best_params:
             ranked = [opt.best_params]
 
-        persisted = 0
+        # 1) Build every re-run's spec in the MASTER (cheap: decode + config + display params).
+        #    Store the raw optimized genes (for the "Optimized Parameters" display) AND the CONCRETE
+        #    decoded ruleset that actually ran (buy/sell/exit trees + TP/SL) so Load/export can
+        #    restore the optimized conditions directly. Keys mirror what _derive_export_payload reads.
+        specs = []  # (rank, trial_cfg, strategy_params)
         for rank, params in enumerate(ranked, start=1):
             decoded = decode_params(strat, params)
             trial_cfg = _build_daily_trial_config(bt_block, decoded)
             trial_cfg["name"] = f"TOP{rank}-{opt.name or expert}"
             # Persist this top-N run's trading DB (orders/transactions/recommendations) to disk
-            # for post-mortem inspection — the GA trials run RAM-only for speed.
+            # for post-mortem inspection — the GA trials run RAM-only for speed. The path is keyed
+            # by the trial's UNIQUE backtest_id, so concurrent re-runs never collide.
             trial_cfg["persist_trading_db"] = True
-            results = run_daily_backtest(trial_cfg)
-            # Store the raw optimized genes (for the "Optimized Parameters" display) AND the
-            # CONCRETE decoded ruleset that actually ran (buy/sell/exit trees + TP/SL). The
-            # latter lets Load/export restore the optimized conditions directly — no need to
-            # reconstruct from genes + base tree. Keys mirror what _derive_export_payload reads.
             strategy_params = dict(params)
             if decoded.get("buy_tree") is not None:
                 strategy_params["buyEntryConditions"] = decoded["buy_tree"]
@@ -1464,6 +1470,41 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5) -> int:
                 strategy_params["initialTpPercent"] = decoded["tp"]
             if decoded.get("sl") is not None:
                 strategy_params["initialSlPercent"] = decoded["sl"]
+            specs.append((rank, trial_cfg, strategy_params))
+
+        # 2) Run the re-runs — the slow part. Fan out across a bounded local process pool when
+        #    parallel > 1 (each worker returns the full results blob); else run in-process.
+        from app.services.strategy_optimization_handler import _persist_trial_worker
+        results_by_rank: dict = {}
+        n_workers = max(1, min(int(parallel or 1), len(specs)))
+        if n_workers > 1 and len(specs) > 1:
+            import multiprocessing as _mp
+            import os as _os
+            from concurrent.futures import ProcessPoolExecutor, as_completed
+            from app.services.strategy_optimization_handler import (
+                _BACKEND_DIR, _WORKER_ENV_KEYS, _worker_init,
+            )
+            env = {k: _os.environ[k] for k in _WORKER_ENV_KEYS if _os.environ.get(k)}
+            print(f"    persisting top {len(specs)} in parallel ({n_workers} local workers)...")
+            with ProcessPoolExecutor(
+                max_workers=n_workers, mp_context=_mp.get_context("spawn"),
+                initializer=_worker_init, initargs=(_BACKEND_DIR, env),
+            ) as ex:
+                futs = {ex.submit(_persist_trial_worker, cfg): rk for rk, cfg, _ in specs}
+                for fut in as_completed(futs):
+                    results_by_rank[futs[fut]] = fut.result()
+        else:
+            for rk, cfg, _ in specs:
+                results_by_rank[rk] = _persist_trial_worker(cfg)
+
+        # 3) Persist each as a tagged, saved Backtest — MASTER-only DB writes, in rank order.
+        persisted = 0
+        for rank, trial_cfg, strategy_params in specs:
+            out = results_by_rank.get(rank)
+            if not out or not out.get("ok"):
+                print(f"    TOP{rank} re-run failed: {(out or {}).get('error', 'no result')}")
+                continue
+            results = out["results"]
             bt = Backtest(
                 name=trial_cfg["name"], model_id=None, engine_type="daily_expert",
                 expert_name=expert, optimization_id=opt_id,
