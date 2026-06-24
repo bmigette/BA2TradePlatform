@@ -35,6 +35,10 @@ _OPTIONS_HISTORY_FLOOR = date(2024, 2, 1)
 # How far past `end` to still pull contracts (so a position opened near `end` can pick an
 # expiry that lands after the window). Matches the handler's DTE windows comfortably.
 _EXPIRY_TAIL_DAYS = 60
+# Contracts per get_option_bars request. Alpaca accepts a list of symbols per call (paginating
+# internally), so batching collapses thousands of per-contract round-trips into dozens. Kept
+# modest so the request URL and per-response payload stay well within limits.
+_OPTION_BARS_BATCH = 100
 # Standard OCC option-symbol pattern Alpaca's market-data API validates against. Corporate-
 # action ADJUSTED contracts come back with a non-standard root (e.g. "1AAPL240429P00170000")
 # that the bars endpoint REJECTS (400 invalid symbol). They are not normally tradeable on the
@@ -271,30 +275,43 @@ def build_cache(cache_db: str, underlyings: List[str], start: date, end: date,
                                            strike_min=strike_min, strike_max=strike_max,
                                            max_contracts=max_contracts),
                 what=f"discover {u}")
+            # Daily bars: Alpaca's get_option_bars accepts a LIST of symbols per request (and
+            # paginates internally), so fetch in BATCHES instead of one HTTP round-trip per
+            # contract. A wide window yields thousands of contracts/underlying; per-contract calls
+            # made this ~100x slower than necessary. _OPTION_BARS_BATCH symbols/call keeps the
+            # request URL/response bounded while collapsing thousands of round-trips into dozens.
+            syms = [c.symbol for c in contracts]
+            bars_by_sym: Dict[str, List[Any]] = {}
+            for i in range(0, len(syms), _OPTION_BARS_BATCH):
+                chunk = syms[i:i + _OPTION_BARS_BATCH]
+                resp = _with_retry(
+                    lambda chunk=chunk: dc.get_option_bars(OptionBarsRequest(
+                        symbol_or_symbols=chunk, timeframe=TimeFrame.Day,
+                        start=start_iso, end=end_iso)),
+                    what=f"bars {u} [{i // _OPTION_BARS_BATCH + 1}]")
+                for s, blist in (resp.data or {}).items():
+                    bars_by_sym[s] = blist
             rows: List[Dict[str, Any]] = []
-            bar_total = 0
+            all_bar_rows: List[Dict[str, Any]] = []
             for c in contracts:
                 opt_type = c.type.value if hasattr(c.type, "value") else str(c.type)
                 expiry = (c.expiration_date.isoformat()
                           if hasattr(c.expiration_date, "isoformat") else str(c.expiration_date))
-                resp = _with_retry(
-                    lambda c=c: dc.get_option_bars(OptionBarsRequest(
-                        symbol_or_symbols=c.symbol, timeframe=TimeFrame.Day,
-                        start=start_iso, end=end_iso)),
-                    what=f"bars {c.symbol}")
-                bars = (resp.data or {}).get(c.symbol, [])
+                bars = bars_by_sym.get(c.symbol, [])
                 bar_rows = [bar_to_row(c.symbol, b.timestamp.date().isoformat(), b, u,
                                        opt_type, float(c.strike_price), expiry) for b in bars]
-                with write_lock:
-                    cache.write_bar_rows(bar_rows)
-                bar_total += len(bar_rows)
+                all_bar_rows.extend(bar_rows)
                 as_of_premium: Optional[float] = None
                 if bar_rows:
                     on_start = next((r for r in bar_rows if r["date"] == start_iso), None)
                     as_of_premium = (on_start or bar_rows[0]).get("close")
                 rows.append(contract_to_metadata_chain_row(c, u, as_of_premium))
-            # Chain rows LAST (their presence marks this underlying complete for resume).
+            bar_total = len(all_bar_rows)
+            # One batched write of all bars, then chain rows LAST (their presence marks this
+            # underlying complete for resume).
             with write_lock:
+                if all_bar_rows:
+                    cache.write_bar_rows(all_bar_rows)
                 cache.write_chain_rows(u, start_iso, rows)
             with stats_lock:
                 stats["contracts"] += len(contracts)
