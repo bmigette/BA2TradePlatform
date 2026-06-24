@@ -1705,28 +1705,50 @@ const Backtesting: React.FC = () => {
         selectedBacktest.initialCapital)
     : null;
   // Adjust the equity + drawdown CURVES for the hidden trades. A position's P&L accrues GRADUALLY
-  // as mark-to-market over its hold (the curve rose while it was held), so subtracting the whole
-  // P&L at the exit alone would leave the pre-exit bulge AND drop a spurious cliff at exit (a big
-  // winner would look like a crash). Instead RAMP the removal linearly across each trade's hold:
-  // 0 at entry -> full P&L at/after exit. Approximate (real MTM isn't linear) but smooth, and the
-  // endpoint matches the recomputed Total Return.
-  const hiddenCuts = (hiding && selectedBacktest?.results?.trades)
-    ? (selectedBacktest.results.trades as any[])
-        .filter(t => hiddenTradeIds.has(t.id))
-        .map(t => ({ t0: Date.parse(t.entryDate), t1: Date.parse(t.exitDate), pnl: Number(t.pnl) || 0 }))
-    : [];
+  // as mark-to-market over its hold (net-liq rises while it's held), so subtracting the whole P&L
+  // at the exit alone leaves the pre-exit bulge AND drops a spurious cliff. But a plain LINEAR-IN-
+  // TIME ramp is also wrong for a back-loaded mega-winner (e.g. CVNA, bought near its bottom: most
+  // of the +$109k accrues in the final months): at mid-hold the time-ramp removes ~half the P&L
+  // while the real equity is still small -> adjusted equity goes NEGATIVE. Instead, remove the P&L
+  // in proportion to how much the AGGREGATE equity curve has actually RISEN over the trade's hold
+  // window (frac = (equity_now - equity_at_entry) / (equity_at_exit - equity_at_entry)). This ties
+  // each removal to realized curve growth, so it tracks the back-loaded shape and can't over-
+  // subtract. Still approximate (the aggregate includes other trades) but smooth and non-negative.
+  const hiddenCuts: { t0: number; t1: number; pnl: number; base: number; exitEq: number }[] =
+    (hiding && selectedBacktest?.results?.trades)
+      ? (selectedBacktest.results.trades as any[])
+          .filter(t => hiddenTradeIds.has(t.id))
+          .map(t => ({ t0: Date.parse(t.entryDate), t1: Date.parse(t.exitDate), pnl: Number(t.pnl) || 0, base: NaN, exitEq: NaN }))
+      : [];
+  // One ascending pass to capture the aggregate equity at each hidden trade's entry/exit instants.
+  if (hiddenCuts.length && selectedBacktest?.results?.equityCurve) {
+    for (const pt of selectedBacktest.results.equityCurve as any[]) {
+      const d = Date.parse(String(pt.date || '')); const e = Number(pt.equity) || 0;
+      if (!isFinite(d)) continue;
+      for (const c of hiddenCuts) {
+        if (isFinite(c.t0) && d <= c.t0) c.base = e;
+        if (isFinite(c.t1) && d <= c.t1) c.exitEq = e;
+      }
+    }
+  }
   const adjEquityCurve = (rc && selectedBacktest?.results?.equityCurve)
     ? (selectedBacktest.results.equityCurve as any[]).map(pt => {
         const dms = Date.parse(String(pt.date || ''));
+        const eq = Number(pt.equity) || 0;
         let sub = 0;
         for (const c of hiddenCuts) {
           if (!isFinite(c.t1)) continue;
-          if (dms >= c.t1) sub += c.pnl;                                   // fully removed after exit
-          else if (isFinite(c.t0) && c.t1 > c.t0 && dms > c.t0)            // ramping during the hold
-            sub += c.pnl * ((dms - c.t0) / (c.t1 - c.t0));
-          // before entry: 0
+          if (dms >= c.t1) { sub += c.pnl; continue; }                     // fully removed after exit
+          if (!(isFinite(c.t0) && c.t1 > c.t0 && dms > c.t0)) continue;    // before entry: 0
+          const base = isFinite(c.base) ? c.base : 0;
+          const denom = (isFinite(c.exitEq) ? c.exitEq : eq) - base;
+          // Curve-rise attribution when the curve grew over the window; else fall back to time-ramp.
+          const frac = denom > 0
+            ? Math.min(1, Math.max(0, (eq - base) / denom))
+            : (dms - c.t0) / (c.t1 - c.t0);
+          sub += c.pnl * frac;
         }
-        return { ...pt, equity: (Number(pt.equity) || 0) - sub };
+        return { ...pt, equity: Math.max(0, eq - sub) };                   // a cash balance can't go < 0
       })
     : null;
   const adjDrawdownCurve = adjEquityCurve
