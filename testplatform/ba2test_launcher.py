@@ -207,6 +207,14 @@ def _cmd_prewarm(args) -> int:
     if not key:
         sys.exit("ba2-test prewarm: FMP_API_KEY not configured (set it in .env or the app-settings DB).")
 
+    # FinnHub key (only required when warming FinnHubRating) — resolved like the expert does
+    # (get_setting('finnhub_api_key')), with an env fallback.
+    try:
+        from ba2_common.core.db import get_setting as _get_setting
+        finnhub_key = os.getenv("FINNHUB_API_KEY") or _get_setting("finnhub_api_key")
+    except Exception:  # noqa: BLE001
+        finnhub_key = os.getenv("FINNHUB_API_KEY")
+
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
     experts = [e.strip() for e in args.experts.split(",") if e.strip()]
     if not symbols:
@@ -278,11 +286,58 @@ def _cmd_prewarm(args) -> int:
         _fr_data.fetch_pead_inputs([sym], as_of=end_date)     # past_earnings + earnings_estimates quarterly
         _fr_data.fetch_close_prices([sym], as_of=end_date)    # momentum: 1d OHLCV parquet
 
+    # FMPSenateTraderWeight: warm the SAME fmp_history namespaces _gather reads — per-symbol
+    # senate/house trades (congress_{chamber}_trades) + the symbol's full daily price history
+    # (historical_price_full), plus each DISCLOSED trader's full history (congress_trader_history,
+    # keyed by trader name, discovered from the trades). A bare instance (no DB row) carries just
+    # the FMP key + a logger — all the fetch methods need. (The OHLCV current-price leg of _gather
+    # is served by the fetch-cache parquet, not fmp_history, so it's out of prewarm's scope.)
+    _senate_expert = None
+
+    def _do_senate(sym: str) -> None:
+        nonlocal _senate_expert
+        if _senate_expert is None:
+            import logging as _lg
+            from ba2_experts.FMPSenateTraderWeight import FMPSenateTraderWeight
+            s = FMPSenateTraderWeight.__new__(FMPSenateTraderWeight)
+            s._api_key = key
+            s.logger = _lg.getLogger("senate-prewarm")
+            _senate_expert = s
+        s = _senate_expert
+        trades = (s._fetch_senate_trades(sym) or []) + (s._fetch_house_trades(sym) or [])
+        s._get_price_at_date(sym, end_date)  # warms historical_price_full (full history, once)
+        seen = set()
+        for trade in trades:
+            name = s._trader_name(trade)
+            if name and name not in seen:
+                seen.add(name)
+                s._fetch_trader_history(name)  # warms congress_trader_history per trader
+
+    # FinnHubRating: warm the per-symbol finnhub_reco_trends namespace. Bare instance carries the
+    # Finnhub key + a logger (all _fetch_recommendation_trends needs).
+    _finnhub_expert = None
+
+    def _do_finnhub(sym: str) -> None:
+        nonlocal _finnhub_expert
+        if _finnhub_expert is None:
+            if not finnhub_key:
+                sys.exit("ba2-test prewarm: finnhub_api_key not configured (set FINNHUB_API_KEY or "
+                         "the app-setting) — required to warm FinnHubRating.")
+            import logging as _lg
+            from ba2_experts.FinnHubRating import FinnHubRating
+            e = FinnHubRating.__new__(FinnHubRating)
+            e._api_key = finnhub_key
+            e.logger = _lg.getLogger("finnhub-prewarm")
+            _finnhub_expert = e
+        _finnhub_expert._fetch_recommendation_trends(sym)
+
     _EXPERT_FETCHERS = {
         "FMPRating": _do_fmprating,
         "FMPEarningsDrift": _do_earnings_drift,
         "FMPInsiderClusterBuy": _do_insider,
         "FactorRanker": _do_factorranker,
+        "FMPSenateTraderWeight": _do_senate,
+        "FinnHubRating": _do_finnhub,
     }
 
     work = []  # list of (expert, symbol, fetch_callable)
@@ -1751,8 +1806,10 @@ def main(argv: "list | None" = None) -> int:
                              "(ratings/earnings/insider) before the GA pool spawns.")
     pw.add_argument("--symbols", required=True, help="Comma-separated symbols.")
     pw.add_argument("--experts", default="FMPRating,FMPEarningsDrift,FMPInsiderClusterBuy",
-                    help="Comma-separated experts to pre-warm (FactorRanker is skipped — not "
-                         "disk-cached). Default: the 3 disk-cached history experts.")
+                    help="Comma-separated experts to pre-warm. Supported: FMPRating, "
+                         "FMPEarningsDrift, FMPInsiderClusterBuy, FactorRanker, "
+                         "FMPSenateTraderWeight, FinnHubRating. Default: the 3 core rating/signal "
+                         "experts (pass the others explicitly).")
     pw.add_argument("--workers", type=int, default=5, help="Parallel fetch threads (default 5).")
     pw.add_argument("--end", default=None,
                     help="ISO end date for the earnings/insider in-Python filter (default today).")
