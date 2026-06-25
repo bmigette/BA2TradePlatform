@@ -85,6 +85,20 @@ def _worker_init(backend_dir: str, env: Dict[str, str]) -> None:
     for k, v in (env or {}).items():
         if v is not None:
             os.environ.setdefault(k, v)
+    # Point ba2_common's DB at the SAME test DB the master uses, so THIS pool worker's
+    # get_app_setting() (FMP_API_KEY / finnhub_api_key / alpaca_*) resolves from the test DB
+    # instead of ba2_common's neutral default home DB (which has no keys). The FMP/FinnHub experts
+    # construct their providers INSIDE the worker, and provider __init__ reads the key via
+    # get_app_setting — without this the worker raises "FMP API key not configured" on every trial.
+    # Mirrors the launcher's _bootstrap, which only runs in the MASTER process, not in spawned pool
+    # workers. Best-effort: a failure here surfaces later as the same clear provider error.
+    try:
+        from app.models.database import DATABASE_URL as _DB_URL
+        if _DB_URL.startswith("sqlite:///"):
+            from ba2_common.core import db as _ba2_db
+            _ba2_db.configure_db(_DB_URL.replace("sqlite:///", "", 1))
+    except Exception:  # noqa: BLE001 — non-fatal; the provider's own error is the fallback
+        pass
     import logging as _lg
     _lg.disable(_lg.ERROR)  # workers are silent; the parent process logs the run summary
     for n in ("ba2_common", "ba2_providers", "ba2_experts", "app.services.backtest"):

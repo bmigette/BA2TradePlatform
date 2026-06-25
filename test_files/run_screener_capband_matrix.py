@@ -51,15 +51,22 @@ def _completed_names() -> set:
         return set()
 
 
-def _jobs(bands, strategies, include_no_data):
-    """Yield (name, expert, strategy_or_None, band) in priority order."""
+def _jobs(bands, strategies, include_no_data, skip_experts=frozenset()):
+    """Yield (name, expert, strategy_or_None, band) in priority order.
+
+    ``skip_experts`` (a set of expert class names) drops those experts entirely — used to defer
+    an expert that is too slow for the matrix (e.g. FMPInsiderClusterBuy: ~1.5h/backtest) without
+    editing the expert list."""
     for band in bands:
         for expert in _CLASSIC:
+            if expert in skip_experts:
+                continue
             if expert in _NO_LARGE_CAP and band == "large" and not include_no_data:
                 continue
             for s in strategies:
                 yield (f"scr-{band}-{expert}-{s}", expert, s, band)
-        yield (f"scr-{band}-{_RANKER}", _RANKER, None, band)  # bypass: one job per band
+        if _RANKER not in skip_experts:
+            yield (f"scr-{band}-{_RANKER}", _RANKER, None, band)  # bypass: one job per band
 
 
 def main() -> int:
@@ -76,6 +83,9 @@ def main() -> int:
     ap.add_argument("--cadence-days", type=int, default=7)
     ap.add_argument("--include-no-data", action="store_true",
                     help="Also run EarningsDrift/Insider on the large band (default: skip — no data).")
+    ap.add_argument("--skip-experts", default="",
+                    help="Comma list of expert class names to EXCLUDE entirely (e.g. "
+                         "'FMPInsiderClusterBuy' — too slow at ~1.5h/backtest; defer it).")
     ap.add_argument("--workers", default=None,
                     help="Comma-separated remote worker NAMES to distribute each job's GA trials to "
                          "(e.g. 'remote150'); trials spread across these + local. Workers must be "
@@ -97,7 +107,8 @@ def main() -> int:
     if not os.path.exists(exe):
         exe = os.path.join(os.path.dirname(sys.executable), "ba2-test")
 
-    jobs = list(_jobs(bands, strategies, args.include_no_data))
+    skip_experts = frozenset(e.strip() for e in args.skip_experts.split(",") if e.strip())
+    jobs = list(_jobs(bands, strategies, args.include_no_data, skip_experts))
     done = _completed_names()
     print(f"matrix: {len(jobs)} jobs (bands={bands}, strategies={strategies}); "
           f"{sum(1 for j in jobs if j[0] in done)} already completed.")
