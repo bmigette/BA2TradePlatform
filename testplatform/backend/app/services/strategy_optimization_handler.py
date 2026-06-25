@@ -114,7 +114,7 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str) -> Dict[str, Any]
         # A cache miss is FATAL (a data/config problem, not a bad-parameter trial): every trial
         # will hit the same gap, so flag it so the parent can abort with the actionable message
         # instead of grinding the whole population to 0 fitness.
-        fatal = type(e).__name__ == "BacktestCacheMiss"
+        fatal = type(e).__name__ in ("BacktestCacheMiss", "FMPHistoryCacheMiss")
         return {"ok": False, "fitness": 0.0, "trades": 0, "error": str(e) if fatal else repr(e),
                 "fatal": fatal}
 

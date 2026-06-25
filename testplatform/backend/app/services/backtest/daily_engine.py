@@ -698,6 +698,12 @@ class DailyBacktestEngine:
             try:
                 rec = expert.analyze_as_of(as_of, ctx)
             except Exception as e:  # noqa: BLE001 — one symbol must not abort the bar
+                # A hermetic cache miss (un-prewarmed data) must ABORT loudly, NOT be silently
+                # skipped per-symbol — otherwise a missing pre-warm degrades results invisibly.
+                from app.services.backtest.price_source import BacktestCacheMiss
+                from ba2_providers.fmp_common import FMPHistoryCacheMiss
+                if isinstance(e, (BacktestCacheMiss, FMPHistoryCacheMiss)):
+                    raise
                 self._log(f"analyze_as_of failed for {symbol} @ {as_of:%Y-%m-%d}: {e}")
                 continue
 

@@ -53,6 +53,36 @@ def frozen_ttl_cache():
         _TTL_FROZEN = prev
 
 
+# --- hermetic FMP-history (backtest) ---------------------------------------
+# A backtest must run from PRE-WARMED caches only — ZERO network fetches. OHLCV already enforces
+# this (BacktestCacheMiss). When hermetic is on, ``fmp_history_disk_cached`` serves an existing
+# per-symbol file (ignoring age — historical data doesn't go stale) and RAISES on a miss instead
+# of silently network-fetching mid-run. Prewarm / fetch-cache run WITHOUT hermetic so they can
+# populate the cache. Separate from the freeze flag because prewarm also freezes (to write disk).
+_HERMETIC_FMP_HISTORY = False
+
+
+class FMPHistoryCacheMiss(RuntimeError):
+    """A per-symbol FMP history was absent from the cache during a hermetic backtest.
+
+    Means a required dataset wasn't pre-warmed. The run aborts loudly (no live fetch) so the
+    gap is fixed via ``ba2-test prewarm`` rather than silently network-fetching / skipping.
+    """
+
+
+@contextmanager
+def hermetic_fmp_history():
+    """Within this context ``fmp_history_disk_cached`` never network-fetches: a cache miss raises
+    ``FMPHistoryCacheMiss``. The backtest run enters this; prewarm/fetch-cache do NOT."""
+    global _HERMETIC_FMP_HISTORY
+    prev = _HERMETIC_FMP_HISTORY
+    _HERMETIC_FMP_HISTORY = True
+    try:
+        yield
+    finally:
+        _HERMETIC_FMP_HISTORY = prev
+
+
 # --- backtest-only disk cache for per-symbol FMP history payloads -----------
 # A spawned GA optimization worker pool starts each worker with EMPTY module-level TTLCaches,
 # so every fresh worker re-fetches the same per-symbol full-history payloads from FMP — the
@@ -108,13 +138,23 @@ def _fmp_history_disk_read_or_fetch(namespace: str, symbol: str, fetch_fn: Calla
     path = _os.path.join(d, f"{namespace}__{symbol.upper()}.json")
 
     # 1. Disk read (best-effort). A corrupt/unreadable/stale file falls through to a fresh fetch
-    #    rather than being served.
+    #    rather than being served — EXCEPT in hermetic mode, where age is ignored (historical data
+    #    doesn't go stale) and a miss raises instead of fetching.
     try:
-        if _os.path.exists(path) and (_time.time() - _os.path.getmtime(path)) / 86400.0 <= max_age_days:
+        if _os.path.exists(path) and (_HERMETIC_FMP_HISTORY
+                                      or (_time.time() - _os.path.getmtime(path)) / 86400.0 <= max_age_days):
             with open(path, "r") as fh:
                 return _json.load(fh)
-    except Exception:  # corrupt / partial / unreadable -> re-fetch
+    except Exception:  # corrupt / partial / unreadable -> re-fetch (or raise, hermetic)
         pass
+
+    # HERMETIC backtest: NEVER network-fetch — a miss means the data wasn't pre-warmed. Raise a
+    # clear, actionable error (0-fetch guarantee) instead of a silent multi-minute network grind.
+    if _HERMETIC_FMP_HISTORY:
+        raise FMPHistoryCacheMiss(
+            f"fmp_history '{namespace}/{symbol}' not pre-warmed (hermetic backtest, 0 fetch). "
+            f"Run `ba2-test prewarm` for this universe before backtesting."
+        )
 
     # 2. Fetch. Any error PROPAGATES to the caller and is NEVER cached, so the failure is
     #    retried on the next run instead of poisoning the cache with a bad value.

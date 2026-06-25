@@ -495,7 +495,7 @@ def run_daily_backtest(
     """
     from ba2_common.core.db import activity_logging_disabled
     from ba2_providers import get_provider
-    from ba2_providers.fmp_common import frozen_ttl_cache
+    from ba2_providers.fmp_common import frozen_ttl_cache, hermetic_fmp_history
 
     from app.services.backtest.backtest_account import BacktestAccount
     from app.services.backtest.backtest_db import (
@@ -575,8 +575,10 @@ def run_daily_backtest(
     # The per-run trading DB is RAM-only by default (fast GA fitness path); a tagged top-N
     # re-run sets ``persist_trading_db`` so its full instance/analysis rows are kept on disk.
     _persist_db = bool(config.get("persist_trading_db", False))
+    # hermetic_fmp_history(): a backtest must run from PRE-WARMED caches only (0 network fetches);
+    # a missing per-symbol history raises FMPHistoryCacheMiss instead of silently fetching mid-run.
     with backtest_trading_db(config["backtest_id"], in_memory=not _persist_db), \
-            frozen_ttl_cache(), activity_logging_disabled():
+            frozen_ttl_cache(), hermetic_fmp_history(), activity_logging_disabled():
         seed_account_definition(account_id, config["account_settings"])
 
         # Time-machine price source backed by the FMP OHLCV provider (as_of-aware).
