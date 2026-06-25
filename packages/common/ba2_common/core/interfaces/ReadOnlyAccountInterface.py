@@ -485,12 +485,20 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                     # Check if we have a filled closing order (dependent order that closes position)
                     filled_closing_orders = [o for o in dependent_orders if o.status == OrderStatus.FILLED]
 
-                    # Sum ALL filled buy and sell orders to determine position quantity
+                    # Sum ALL filled buy and sell orders to determine position quantity.
+                    # A cancel-and-replace (TP/SL rebase) can race a live fill: the broker
+                    # executes part of the order before honoring the cancel, leaving it
+                    # CANCELED with filled_qty > 0. Those shares really traded, so count
+                    # them even though CANCELED isn't in executed_statuses - otherwise this
+                    # recalculation re-inflates the transaction back to the pre-fill
+                    # quantity on every refresh, overwriting reconcile_canceled_partial_fill
+                    # (and any manual correction) every cycle.
                     total_filled_buy = 0.0
                     total_filled_sell = 0.0
                     for order in orders:
-                        if order.status in executed_statuses:
-                            qty = order.filled_qty if order.filled_qty else order.quantity
+                        filled_qty = order.filled_qty or 0
+                        if order.status in executed_statuses or filled_qty > 0:
+                            qty = filled_qty if filled_qty else order.quantity
                             if qty:
                                 if order.side == OrderDirection.BUY:
                                     total_filled_buy += float(qty)

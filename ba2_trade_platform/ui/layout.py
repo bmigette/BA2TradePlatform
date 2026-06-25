@@ -109,11 +109,15 @@ def _render_account_filter_dropdown():
         # Convert "all" back to None for storage
         account_id = None if new_value == "all" else new_value
         set_selected_account_id(account_id)
-        # Soft reload via NiceGUI navigation (faster than full browser reload).
-        # Preserve the hash (active tab) so switching accounts stays on the current
-        # tab instead of resetting to the first one.
-        current_path = await ui.run_javascript('window.location.pathname + window.location.hash')
-        ui.navigate.to(current_path)
+        # Reload the page so every tab re-reads the new selection. We must use a
+        # real reload (history.go(0)) rather than navigate.to(current_path):
+        # navigating to the URL we're already on — which always carries the active
+        # tab's hash (e.g. "/#account_growth") — is a same-fragment no-op in the
+        # browser (nicegui issues window.open(url, "_self")), so the page never
+        # rebuilt and the account filter silently stopped applying. reload() re-runs
+        # the page at the current URL *including* the hash, so the active tab is
+        # still restored by setup_tab_navigation while the filter actually refreshes.
+        ui.navigate.reload()
     
     with ui.row().classes('items-center gap-1 mr-4'):
         ui.icon('account_circle', size='xs').classes('text-secondary-custom')

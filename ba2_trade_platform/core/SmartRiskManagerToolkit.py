@@ -1969,10 +1969,19 @@ class SmartRiskManagerToolkit:
                             sl_price = auto["implied_sl"]
                         logger.info(f"Auto-sized {direction} {symbol}: {quantity} shares ({auto.get('detail','')})")
                     else:
+                        # Only suggest supplying an sl_price when one wasn't already
+                        # given - if it WAS given and sizing still failed, the reason
+                        # string already says what to do (wider risk% / tighter stop);
+                        # repeating "provide an sl_price" would contradict the call
+                        # the agent just made.
+                        hint = (
+                            "Provide an sl_price so the system can size by risk."
+                            if not sl_price else
+                            "Try a wider risk_per_trade_pct, a tighter stop, or specify an explicit quantity instead."
+                        )
                         return {
                             "success": False,
-                            "message": f"Could not auto-size {direction} {symbol}: {auto.get('reason', 'unknown')}. "
-                                       f"Provide an sl_price so the system can size by risk.",
+                            "message": f"Could not auto-size {direction} {symbol}: {auto.get('reason', 'unknown')}. {hint}",
                             "transaction_id": None, "order_id": None,
                             "symbol": symbol, "quantity": 0, "direction": direction,
                         }
