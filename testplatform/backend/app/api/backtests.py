@@ -829,7 +829,26 @@ def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dic
                     break
             expert_params = {**base_settings, **model_overrides}
             acct = bt_block.get("account_settings") or {}
-            universe = {"mode": "static", "symbols": list(bt_block.get("enabled_instruments") or [])}
+            # Universe: a SCREENER-settings run (``backtest.screener_opt`` present) must export the
+            # screener block — store + the EFFECTIVE settings (run-level base overlaid with this
+            # individual's optimized ``screener:*`` genes, mirroring _build_daily_trial_config's
+            # ``eff``) — NOT the static candidate list (``enabled_instruments``, the whole metric-
+            # store union). Otherwise Load drops the screener config and pins a static universe.
+            screener_opt = bt_block.get("screener_opt")
+            if isinstance(screener_opt, dict) and screener_opt.get("store"):
+                screener_overrides = {
+                    k[len("screener:"):]: v for k, v in sp.items()
+                    if isinstance(k, str) and k.startswith("screener:")
+                } if isinstance(sp, dict) else {}
+                eff_screener = {**(screener_opt.get("base_settings") or {}), **screener_overrides}
+                universe = {
+                    "mode": "screener",
+                    "screener_store": screener_opt["store"],
+                    "screener_settings": eff_screener,
+                    "screener_cadence_days": int(screener_opt.get("cadence_days", 7)),
+                }
+            else:
+                universe = {"mode": "static", "symbols": list(bt_block.get("enabled_instruments") or [])}
             execution = {
                 "seed": bt_block.get("seed"),
                 "fill_model": acct.get("fill_model"),

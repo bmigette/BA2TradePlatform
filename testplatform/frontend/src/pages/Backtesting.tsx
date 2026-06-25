@@ -1549,6 +1549,12 @@ const Backtesting: React.FC = () => {
       setUniverse({ mode: 'static', symbols: (u as any).symbols });
     } else if (u.mode === 'screener') {
       setUniverse({ mode: 'screener', screener_settings: (u as any).screener_settings ?? {} });
+      // Also restore the metric store + cadence (held as separate form state) so Run reproduces
+      // the screener-settings run faithfully instead of falling back to defaults.
+      const st = (u as any).screener_store;
+      if (typeof st === 'string' && st.trim()) setScreenerStore(st);
+      const cad = (u as any).screener_cadence_days;
+      if (typeof cad === 'number' && cad > 0) setScreenerCadenceDays(cad);
     }
   };
 
