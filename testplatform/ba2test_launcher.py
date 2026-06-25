@@ -1472,39 +1472,18 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
                 strategy_params["initialSlPercent"] = decoded["sl"]
             specs.append((rank, trial_cfg, strategy_params))
 
-        # 2) Run the re-runs — the slow part. Fan out across a bounded local process pool when
-        #    parallel > 1 (each worker returns the full results blob); else run in-process.
+        # 2) Run the re-runs (the slow part) and persist each as a tagged, saved Backtest the moment
+        #    it finishes — MASTER-only DB writes. Committing INCREMENTALLY (not collect-then-commit)
+        #    keeps progress visible (1/N, 2/N, ...) so the persist phase doesn't look stalled, lets a
+        #    crash keep the done ones, frees each (large) result blob as we go, and unblocks the next
+        #    matrix job as soon as the last one lands. Fan the re-runs across a bounded local process
+        #    pool when parallel > 1; else run in-process.
         from app.services.strategy_optimization_handler import _persist_trial_worker
-        results_by_rank: dict = {}
-        n_workers = max(1, min(int(parallel or 1), len(specs)))
-        if n_workers > 1 and len(specs) > 1:
-            import multiprocessing as _mp
-            import os as _os
-            from concurrent.futures import ProcessPoolExecutor, as_completed
-            from app.services.strategy_optimization_handler import (
-                _BACKEND_DIR, _WORKER_ENV_KEYS, _worker_init,
-            )
-            env = {k: _os.environ[k] for k in _WORKER_ENV_KEYS if _os.environ.get(k)}
-            print(f"    persisting top {len(specs)} in parallel ({n_workers} local workers)...")
-            with ProcessPoolExecutor(
-                max_workers=n_workers, mp_context=_mp.get_context("spawn"),
-                initializer=_worker_init, initargs=(_BACKEND_DIR, env),
-            ) as ex:
-                futs = {ex.submit(_persist_trial_worker, cfg): rk for rk, cfg, _ in specs}
-                for fut in as_completed(futs):
-                    results_by_rank[futs[fut]] = fut.result()
-        else:
-            for rk, cfg, _ in specs:
-                results_by_rank[rk] = _persist_trial_worker(cfg)
 
-        # 3) Persist each as a tagged, saved Backtest — MASTER-only DB writes, in rank order.
-        persisted = 0
-        for rank, trial_cfg, strategy_params in specs:
-            out = results_by_rank.get(rank)
+        def _persist_one(rank, trial_cfg, strategy_params, out) -> bool:
             if not out or not out.get("ok"):
                 print(f"    TOP{rank} re-run failed: {(out or {}).get('error', 'no result')}")
-                continue
-            results = out["results"]
+                return False
             bt = Backtest(
                 name=trial_cfg["name"], model_id=None, engine_type="daily_expert",
                 expert_name=expert, optimization_id=opt_id,
@@ -1515,11 +1494,39 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
                 status="running", started_at=_dt.now(),
             )
             db.add(bt); db.commit(); db.refresh(bt)
-            _persist_results(db, bt, results)
+            _persist_results(db, bt, out["results"])
             bt.status = "completed"; bt.completed_at = _dt.now()
             bt.is_saved = True  # top performers of a job are kept
             db.commit()
-            persisted += 1
+            return True
+
+        persisted = 0
+        n_workers = max(1, min(int(parallel or 1), len(specs)))
+        if n_workers > 1 and len(specs) > 1:
+            import multiprocessing as _mp
+            import os as _os
+            from concurrent.futures import ProcessPoolExecutor, as_completed
+            from app.services.strategy_optimization_handler import (
+                _BACKEND_DIR, _WORKER_ENV_KEYS, _worker_init,
+            )
+            env = {k: _os.environ[k] for k in _WORKER_ENV_KEYS if _os.environ.get(k)}
+            spec_by_rank = {rk: (rk, tc, sp2) for rk, tc, sp2 in specs}
+            print(f"    persisting top {len(specs)} in parallel ({n_workers} local workers)...")
+            with ProcessPoolExecutor(
+                max_workers=n_workers, mp_context=_mp.get_context("spawn"),
+                initializer=_worker_init, initargs=(_BACKEND_DIR, env),
+            ) as ex:
+                futs = {ex.submit(_persist_trial_worker, cfg): rk for rk, cfg, _ in specs}
+                for fut in as_completed(futs):
+                    rk, tc, sp2 = spec_by_rank[futs[fut]]
+                    if _persist_one(rk, tc, sp2, fut.result()):
+                        persisted += 1
+                        print(f"    persisted TOP{rk} ({persisted}/{len(specs)})")
+        else:
+            for rk, cfg, sp2 in specs:
+                if _persist_one(rk, cfg, sp2, _persist_trial_worker(cfg)):
+                    persisted += 1
+                    print(f"    persisted TOP{rk} ({persisted}/{len(specs)})")
         return persisted
     finally:
         db.close()
