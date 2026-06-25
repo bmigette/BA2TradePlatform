@@ -1,16 +1,47 @@
 <!doctype html><meta charset='utf-8'><title>BA2 Backtest Report</title>
 <style>body{font:14px/1.5 system-ui,Segoe UI,Arial;margin:24px;color:#1e293b}h1{margin:0 0 4px}h2{margin:24px 0 8px;border-bottom:2px solid #e2e8f0;padding-bottom:4px}table{border-collapse:collapse;width:100%;margin:8px 0}th,td{border:1px solid #e2e8f0;padding:6px 10px;text-align:right}th:first-child,td:first-child,td.l{text-align:left}th{background:#f1f5f9}tr:nth-child(even){background:#f8fafc}.pos{color:#16a34a}.neg{color:#dc2626}.muted{color:#64748b}</style>
 <h1>BA2 Backtest Optimization Report</h1>
-<div class='muted'>Generated 2026-06-16 07:40 · 1 completed run(s) · 1 expert(s)</div>
+<div class='muted'>Generated 2026-06-20 05:14 · 50 completed run(s) · 4 expert(s)</div>
 <h2>Per-expert summary (best by Sharpe)</h2>
 <table><tr><th>Expert</th><th>Runs</th><th>Best Sharpe</th><th>Best Return %</th><th>Best run</th><th>Trades</th></tr>
-<tr><td class='l'>FMPRating</td><td>1</td><td>2.29</td><td class='pos'>143.90</td><td class='l'>#83 TOP1-FMPRating-nasdaq30-10k-exits</td><td>222</td></tr>
+<tr><td class='l'>FMPEarningsDrift</td><td>15</td><td>2.07</td><td class='pos'>30.15</td><td class='l'>#22 TOP2-phase1-FMPEarningsDrift-S2-calmar_ratio</td><td>98</td></tr>
+<tr><td class='l'>FMPInsiderClusterBuy</td><td>15</td><td>1.69</td><td class='pos'>23.33</td><td class='l'>#31 TOP1-phase1-FMPInsiderClusterBuy-S1-calmar_ratio</td><td>23</td></tr>
+<tr><td class='l'>FMPRating</td><td>15</td><td>2.79</td><td class='pos'>296.90</td><td class='l'>#1 TOP1-phase1-FMPRating-S1-calmar_ratio</td><td>307</td></tr>
+<tr><td class='l'>FactorRanker</td><td>5</td><td>2.20</td><td class='pos'>93.01</td><td class='l'>#46 TOP1-phase1-FactorRanker-FACTOR-calmar_ratio</td><td>133</td></tr>
 </table>
 <h2>Leaderboard (top 20 by Sharpe)</h2>
 <table><tr><th>#</th><th>Expert</th><th>Opt</th><th>Sharpe</th><th>Return %</th><th>MaxDD %</th><th>Win %</th><th>PF</th><th>Trades</th><th>Saved</th><th>Name</th></tr>
-<tr><td>83</td><td class='l'>FMPRating</td><td>1</td><td>2.29</td><td class='pos'>143.90</td><td>-15.53</td><td>27.5</td><td>3.33</td><td>222</td><td>★</td><td class='l'>TOP1-FMPRating-nasdaq30-10k-exits</td></tr>
+<tr><td>1</td><td class='l'>FMPRating</td><td>1</td><td>2.79</td><td class='pos'>296.90</td><td>-9.37</td><td>62.9</td><td>3.18</td><td>307</td><td>★</td><td class='l'>TOP1-phase1-FMPRating-S1-calmar_ratio</td></tr>
+<tr><td>2</td><td class='l'>FMPRating</td><td>1</td><td>2.70</td><td class='pos'>259.47</td><td>-9.02</td><td>63.2</td><td>3.13</td><td>356</td><td>★</td><td class='l'>TOP2-phase1-FMPRating-S1-calmar_ratio</td></tr>
+<tr><td>4</td><td class='l'>FMPRating</td><td>1</td><td>2.63</td><td class='pos'>264.00</td><td>-9.19</td><td>62.0</td><td>2.95</td><td>395</td><td>★</td><td class='l'>TOP4-phase1-FMPRating-S1-calmar_ratio</td></tr>
+<tr><td>3</td><td class='l'>FMPRating</td><td>1</td><td>2.61</td><td class='pos'>260.40</td><td>-9.04</td><td>60.9</td><td>2.58</td><td>401</td><td>★</td><td class='l'>TOP3-phase1-FMPRating-S1-calmar_ratio</td></tr>
+<tr><td>5</td><td class='l'>FMPRating</td><td>1</td><td>2.61</td><td class='pos'>250.98</td><td>-8.99</td><td>60.7</td><td>2.59</td><td>382</td><td>★</td><td class='l'>TOP5-phase1-FMPRating-S1-calmar_ratio</td></tr>
+<tr><td>7</td><td class='l'>FMPRating</td><td>2</td><td>2.43</td><td class='pos'>376.43</td><td>-17.72</td><td>76.4</td><td>9.36</td><td>55</td><td>★</td><td class='l'>TOP2-phase1-FMPRating-S2-calmar_ratio</td></tr>
+<tr><td>8</td><td class='l'>FMPRating</td><td>2</td><td>2.34</td><td class='pos'>413.28</td><td>-19.10</td><td>64.1</td><td>3.56</td><td>117</td><td>★</td><td class='l'>TOP3-phase1-FMPRating-S2-calmar_ratio</td></tr>
+<tr><td>6</td><td class='l'>FMPRating</td><td>2</td><td>2.33</td><td class='pos'>467.14</td><td>-20.18</td><td>66.4</td><td>3.92</td><td>119</td><td>★</td><td class='l'>TOP1-phase1-FMPRating-S2-calmar_ratio</td></tr>
+<tr><td>9</td><td class='l'>FMPRating</td><td>2</td><td>2.20</td><td class='pos'>435.15</td><td>-20.38</td><td>67.7</td><td>5.01</td><td>99</td><td>★</td><td class='l'>TOP4-phase1-FMPRating-S2-calmar_ratio</td></tr>
+<tr><td>46</td><td class='l'>FactorRanker</td><td>10</td><td>2.20</td><td class='pos'>93.01</td><td>-8.80</td><td>57.1</td><td>4.15</td><td>133</td><td>★</td><td class='l'>TOP1-phase1-FactorRanker-FACTOR-calmar_ratio</td></tr>
+<tr><td>10</td><td class='l'>FMPRating</td><td>2</td><td>2.19</td><td class='pos'>389.28</td><td>-20.07</td><td>69.8</td><td>3.46</td><td>116</td><td>★</td><td class='l'>TOP5-phase1-FMPRating-S2-calmar_ratio</td></tr>
+<tr><td>47</td><td class='l'>FactorRanker</td><td>10</td><td>2.16</td><td class='pos'>94.77</td><td>-9.28</td><td>54.8</td><td>4.28</td><td>115</td><td>★</td><td class='l'>TOP2-phase1-FactorRanker-FACTOR-calmar_ratio</td></tr>
+<tr><td>48</td><td class='l'>FactorRanker</td><td>10</td><td>2.14</td><td class='pos'>90.37</td><td>-9.21</td><td>56.6</td><td>4.21</td><td>113</td><td>★</td><td class='l'>TOP3-phase1-FactorRanker-FACTOR-calmar_ratio</td></tr>
+<tr><td>49</td><td class='l'>FactorRanker</td><td>10</td><td>2.09</td><td class='pos'>87.88</td><td>-9.31</td><td>55.6</td><td>4.08</td><td>115</td><td>★</td><td class='l'>TOP4-phase1-FactorRanker-FACTOR-calmar_ratio</td></tr>
+<tr><td>22</td><td class='l'>FMPEarningsDrift</td><td>5</td><td>2.07</td><td class='pos'>30.15</td><td>-3.46</td><td>67.3</td><td>3.44</td><td>98</td><td>★</td><td class='l'>TOP2-phase1-FMPEarningsDrift-S2-calmar_ratio</td></tr>
+<tr><td>50</td><td class='l'>FactorRanker</td><td>10</td><td>2.04</td><td class='pos'>78.34</td><td>-8.72</td><td>54.5</td><td>3.18</td><td>187</td><td>★</td><td class='l'>TOP5-phase1-FactorRanker-FACTOR-calmar_ratio</td></tr>
+<tr><td>21</td><td class='l'>FMPEarningsDrift</td><td>5</td><td>2.00</td><td class='pos'>52.13</td><td>-5.29</td><td>62.0</td><td>3.32</td><td>108</td><td>★</td><td class='l'>TOP1-phase1-FMPEarningsDrift-S2-calmar_ratio</td></tr>
+<tr><td>11</td><td class='l'>FMPRating</td><td>3</td><td>1.95</td><td class='pos'>566.24</td><td>-36.76</td><td>100.0</td><td>999.99</td><td>5</td><td>★</td><td class='l'>TOP1-phase1-FMPRating-S3-calmar_ratio</td></tr>
+<tr><td>12</td><td class='l'>FMPRating</td><td>3</td><td>1.95</td><td class='pos'>564.77</td><td>-36.72</td><td>100.0</td><td>999.99</td><td>4</td><td>★</td><td class='l'>TOP2-phase1-FMPRating-S3-calmar_ratio</td></tr>
+<tr><td>23</td><td class='l'>FMPEarningsDrift</td><td>5</td><td>1.95</td><td class='pos'>43.00</td><td>-5.16</td><td>65.3</td><td>3.16</td><td>95</td><td>★</td><td class='l'>TOP3-phase1-FMPEarningsDrift-S2-calmar_ratio</td></tr>
 </table>
 <h2>Per optimization job</h2>
 <table><tr><th>Opt #</th><th>Expert</th><th>Trials</th><th>Best Sharpe</th><th>Avg Sharpe</th><th>Best Return %</th></tr>
-<tr><td>1</td><td class='l'>FMPRating</td><td>1</td><td>2.29</td><td>2.29</td><td>143.90</td></tr>
+<tr><td>1</td><td class='l'>FMPRating</td><td>5</td><td>2.79</td><td>2.67</td><td>296.90</td></tr>
+<tr><td>2</td><td class='l'>FMPRating</td><td>5</td><td>2.43</td><td>2.30</td><td>467.14</td></tr>
+<tr><td>3</td><td class='l'>FMPRating</td><td>5</td><td>1.95</td><td>1.92</td><td>586.18</td></tr>
+<tr><td>4</td><td class='l'>FMPEarningsDrift</td><td>5</td><td>1.58</td><td>1.52</td><td>23.47</td></tr>
+<tr><td>5</td><td class='l'>FMPEarningsDrift</td><td>5</td><td>2.07</td><td>1.92</td><td>52.13</td></tr>
+<tr><td>6</td><td class='l'>FMPEarningsDrift</td><td>5</td><td>1.20</td><td>1.16</td><td>56.06</td></tr>
+<tr><td>7</td><td class='l'>FMPInsiderClusterBuy</td><td>5</td><td>1.69</td><td>1.54</td><td>23.33</td></tr>
+<tr><td>8</td><td class='l'>FMPInsiderClusterBuy</td><td>5</td><td>1.56</td><td>1.49</td><td>101.91</td></tr>
+<tr><td>9</td><td class='l'>FMPInsiderClusterBuy</td><td>5</td><td>1.54</td><td>1.52</td><td>103.26</td></tr>
+<tr><td>10</td><td class='l'>FactorRanker</td><td>5</td><td>2.20</td><td>2.13</td><td>94.77</td></tr>
 </table>

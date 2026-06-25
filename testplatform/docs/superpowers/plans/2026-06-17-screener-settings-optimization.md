@@ -14,6 +14,7 @@
 - **Scan cadence is an OPTIMIZATION config option, default 1 week (7 days).** It sets both how often the metric store materializes a scan and how often the engine re-screens; align it with the analysis schedule (set 1 for daily analysis). Threaded: optimize config → store build → engine resolution.
 - **Store raw metric VALUES** (not pass/fail) so any threshold in the opti range filters at query time. Keep the **static** gene range small (its loosest bound sizes the shortlist superset); dynamic gene ranges may be wide.
 - **No server** (no Redis): parquet on disk (export + incremental) → in-process pandas per worker.
+- **Broad store, per-cap-band jobs (2026-06-20):** the metric store is built **BROAD** (`--market-cap-min 1e7`, all caps — every tradeable US name in the broad OHLCV universe) as a single shared **superset**. Cap-band targeting (small / mid / large) is done by running **separate optimization jobs**, one per band — **NOT** by editing the `_SCREENER_OPT` gene ranges. The gene spec stays fixed (the default `screener_market_cap_min` range `[2e9, 1e10]` is the *large-cap* job); the small/mid jobs constrain their band via their own per-job base settings / gene range overrides. Point-in-time `market_cap` (FMP historical-market-cap) + `free_float` (v4 shares_float) are baked into the store so each per-day screen stays a pure in-memory filter. Per-expert analysis history (FMPRating/EarningsDrift/Insider) for the store's universe is pre-cached via `ba2-test prewarm` (see `test_files/precache_screener_universe.py`) before the jobs run.
 
 ---
 
