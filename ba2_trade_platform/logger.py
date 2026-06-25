@@ -1,6 +1,6 @@
 import logging
 from logging.handlers import RotatingFileHandler
-from .config import STDOUT_LOGGING, FILE_LOGGING, HOME, HOME_PARENT
+from .config import STDOUT_LOGGING, FILE_LOGGING, HOME, HOME_PARENT, LOG_FOLDER
 import os
 import io
 import sys
@@ -17,7 +17,12 @@ logger.propagate = False
 
 # Shared constants
 LOG_FORMAT = '%(asctime)s - %(name)s - %(module)s - %(levelname)s - %(message)s'
-LOGS_DIR = os.path.join(HOME_PARENT, "logs")
+# Import-time default = configured LOG_FOLDER (under the BA2 data root), NEVER the code repo.
+# Per-instance startup relocates this to <db folder>/logs via reconfigure_file_logging()
+# (called from main.initialize_system, mirroring ba2_common.core.db.configure_db) so the
+# app/UI logs land next to this instance's DB — the SAME folder ba2_common writes to — instead
+# of the old HOME_PARENT/logs (the code repo, shared across every instance).
+LOGS_DIR = LOG_FOLDER
 
 # Configure our handlers
 formatter = logging.Formatter(LOG_FORMAT)
@@ -25,26 +30,9 @@ formatter = logging.Formatter(LOG_FORMAT)
 if STDOUT_LOGGING:
     # Create a safe StreamHandler that handles Unicode characters
     handler = logging.StreamHandler(io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace'))
-    handler.setLevel(logging.DEBUG) 
+    handler.setLevel(logging.DEBUG)
     handler.setFormatter(formatter)
     logger.addHandler(handler)
-
-if FILE_LOGGING:
-    # Ensure logs directory exists
-    os.makedirs(LOGS_DIR, exist_ok=True)
-
-    handlerfile = RotatingFileHandler(
-        os.path.join(LOGS_DIR, "app.debug.log"), maxBytes=(1024*1024*10), backupCount=7, encoding='utf-8'
-    )
-    handlerfile.setFormatter(formatter)
-    handlerfile.setLevel(logging.DEBUG)
-    logger.addHandler(handlerfile)
-    handlerfile2 = RotatingFileHandler(
-        os.path.join(LOGS_DIR, "app.log"), maxBytes=(1024*1024*10), backupCount=7, encoding='utf-8'
-    )
-    handlerfile2.setFormatter(formatter)
-    handlerfile2.setLevel(logging.INFO)
-    logger.addHandler(handlerfile2)
 
 
 # Create shared handlers for all loggers (app + expert specific)
@@ -116,15 +104,37 @@ def _get_all_error_handler() -> Optional[RotatingFileHandler]:
     
     return _all_error_handler
 
-# Add the shared handlers to the main app logger
-if FILE_LOGGING:
-    all_debug_handler = _get_all_debug_handler()
-    if all_debug_handler:
-        logger.addHandler(all_debug_handler)
-    
-    all_error_handler = _get_all_error_handler()
-    if all_error_handler:
-        logger.addHandler(all_error_handler)
+def _install_app_file_handlers() -> None:
+    """Attach the rotating FILE handlers to the app logger under the CURRENT ``LOGS_DIR``:
+    app.debug.log @ DEBUG, app.log @ INFO, plus the shared all.debug.log / all.error.log.
+    No-op when FILE_LOGGING is off. Caller is responsible for removing any stale file handlers
+    first (see ``reconfigure_file_logging``)."""
+    if not FILE_LOGGING:
+        return
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    fmt = logging.Formatter(LOG_FORMAT)
+    debug_fh = RotatingFileHandler(
+        os.path.join(LOGS_DIR, "app.debug.log"), maxBytes=(1024*1024*10), backupCount=7, encoding='utf-8'
+    )
+    debug_fh.setFormatter(fmt)
+    debug_fh.setLevel(logging.DEBUG)
+    logger.addHandler(debug_fh)
+    info_fh = RotatingFileHandler(
+        os.path.join(LOGS_DIR, "app.log"), maxBytes=(1024*1024*10), backupCount=7, encoding='utf-8'
+    )
+    info_fh.setFormatter(fmt)
+    info_fh.setLevel(logging.INFO)
+    logger.addHandler(info_fh)
+    adh = _get_all_debug_handler()
+    if adh:
+        logger.addHandler(adh)
+    aeh = _get_all_error_handler()
+    if aeh:
+        logger.addHandler(aeh)
+
+
+# Add the file handlers to the main app logger at import (default LOGS_DIR).
+_install_app_file_handlers()
 
 
 # Cache for expert loggers to avoid recreation
@@ -226,7 +236,62 @@ def get_expert_logger(expert_class: str, expert_id: int) -> logging.Logger:
     
     # Cache the logger
     _expert_loggers[cache_key] = expert_logger
-    
+
     return expert_logger
+
+
+def reconfigure_file_logging(log_dir: str) -> None:
+    """Repoint the rotating FILE handlers at ``log_dir`` (created if missing).
+
+    Mirrors ``ba2_common.logger.reconfigure_file_logging``. Call ONCE per process after the
+    instance's DB path is known (from ``main.initialize_system``, using the same
+    ``<db folder>/logs`` that ``ba2_common.core.db.configure_db`` relocates ba2_common to) so
+    the app/UI (``ba2_trade_platform``) logs land next to this instance's DB instead of the
+    code repo's ``HOME_PARENT/logs``.
+
+    No-op when FILE_LOGGING is off or already pointed at ``log_dir``. STDOUT handlers untouched.
+    """
+    global LOGS_DIR, _all_debug_handler, _all_error_handler
+    if not FILE_LOGGING:
+        return
+    log_dir = os.path.abspath(log_dir)
+    if log_dir == os.path.abspath(LOGS_DIR):
+        return
+
+    # Detach + close every rotating file handler on the app logger and any already-created
+    # expert loggers (the shared all.* singletons are among them).
+    for lg in [logger, *_expert_loggers.values()]:
+        for h in [h for h in lg.handlers if isinstance(h, RotatingFileHandler)]:
+            lg.removeHandler(h)
+            try:
+                h.close()
+            except Exception:  # noqa: BLE001
+                pass
+    # Drop the shared singletons so they are rebuilt under the new dir.
+    _all_debug_handler = None
+    _all_error_handler = None
+
+    LOGS_DIR = log_dir
+    _install_app_file_handlers()
+
+    # Rebuild each already-created expert logger's own file handler + reattach the shared ones.
+    adh = _get_all_debug_handler()
+    aeh = _get_all_error_handler()
+    for cache_key, elog in list(_expert_loggers.items()):
+        expert_class, _, expert_id = cache_key.rpartition("-")
+        if not expert_class:
+            continue
+        efmt = ExpertFormatter(expert_class, expert_id, LOG_FORMAT)
+        efh = RotatingFileHandler(
+            os.path.join(LOGS_DIR, f"{expert_class}-exp{expert_id}.log"),
+            maxBytes=(1024*1024*10), backupCount=7, encoding='utf-8'
+        )
+        efh.setLevel(logging.DEBUG)
+        efh.setFormatter(efmt)
+        elog.addHandler(efh)
+        if adh:
+            elog.addHandler(adh)
+        if aeh:
+            elog.addHandler(aeh)
 
 

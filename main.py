@@ -56,6 +56,17 @@ def initialize_system():
     from ba2_trade_platform.core.seam_wiring import wire_all_seams
     wire_all_seams()
 
+    # Relocate the app/UI (ba2_trade_platform) file logs next to THIS instance's DB — the
+    # same <db folder>/logs that wire_all_seams()->configure_db() points ba2_common at — so
+    # all of an instance's logs live together in its data folder (e.g. the prod state folder),
+    # not in the code repo's logs/ dir shared across every instance. Mirrors ba2_common.
+    try:
+        from ba2_trade_platform.logger import reconfigure_file_logging as _reconfigure_app_logs
+        _reconfigure_app_logs(os.path.join(os.path.dirname(os.path.abspath(config.DB_FILE)), "logs"))
+        logger.info(f"App logs relocated next to DB: {os.path.join(os.path.dirname(os.path.abspath(config.DB_FILE)), 'logs')}")
+    except Exception as e:
+        logger.warning(f"could not relocate app logs next to DB: {e}")
+
     # Import these after config has been updated from command-line args
     logger.info("Loading database module...")
     from ba2_trade_platform.core.db import init_db, get_db
