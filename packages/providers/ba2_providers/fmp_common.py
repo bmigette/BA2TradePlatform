@@ -84,6 +84,22 @@ def fmp_history_disk_cached(namespace: str, symbol: str, fetch_fn: Callable[[], 
     """
     if not _TTL_FROZEN:
         return fetch_fn()  # live path: never cache to disk; always pull fresh from the API
+    # BACKTEST in-process layer: hold the loaded payload in memory for the (frozen) run so each
+    # (namespace, symbol) is read+parsed from disk ONCE per worker, not once per analysis bar.
+    # Without this, per-bar experts (insider/earnings/senate/finnhub) re-`json.load`ed the whole
+    # per-symbol history every bar — the dominant backtest bottleneck (FMPRating sidestepped it
+    # with its own TTLCache; this generalises that to every disk-cached history). Returns the SAME
+    # object across calls, so callers' per-row date memoization (e.g. ``_pd``/``_td_memo``) sticks.
+    return _HISTORY_MEM_CACHE.get_or_call(
+        f"{namespace}__{symbol.upper()}",
+        lambda: _fmp_history_disk_read_or_fetch(namespace, symbol, fetch_fn, max_age_days),
+    )
+
+
+def _fmp_history_disk_read_or_fetch(namespace: str, symbol: str, fetch_fn: Callable[[], Any],
+                                    max_age_days: float) -> Any:
+    """Disk read (if fresh) else fetch + persist — the original ``fmp_history_disk_cached`` body,
+    now invoked once per (namespace, symbol) per process via the in-process cache above."""
     import json as _json
     import os as _os
     import time as _time
@@ -153,6 +169,13 @@ class TTLCache:
         with self._lock:
             self._store[key] = (value, self._clock() + self._ttl)
         return value
+
+
+# In-process layer for fmp_history_disk_cached (defined above; resolved at call time). TTL is
+# irrelevant — it's only consulted on the frozen (backtest) path, where entries never expire — so
+# any value works; reuse the disk freshness window. Thread-safe (used by the parallel prewarm).
+_HISTORY_MEM_CACHE = TTLCache(_FMP_HISTORY_DISK_MAX_AGE_DAYS * 86400.0)
+
 
 # FMP error responses use one of these keys in a 200-status JSON dict.
 _FMP_ERROR_KEYS = ("Error Message", "error", "message")

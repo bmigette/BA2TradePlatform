@@ -19,6 +19,8 @@ from ba2_common.core.provider_utils import (
 from ba2_common.config import get_app_setting
 from ba2_common.logger import logger
 
+_UNPARSED = object()  # sentinel: "date not yet parsed for this row" (distinct from a parsed None)
+
 
 class FMPInsiderProvider(CompanyInsiderInterface):
     """
@@ -158,9 +160,12 @@ class FMPInsiderProvider(CompanyInsiderInterface):
             # spawned GA workers read it from disk instead of re-fetching. Namespace bumped
             # insider -> insider_v2 so stale single-page caches (latest ~14 months only) from
             # before the pagination fix are not reused.
+            # In-process cache (added inside fmp_history_disk_cached) -> backtest-only disk cache
+            # -> paginated FMP fetch. The in-process layer holds the loaded rows in memory so the
+            # per-bar filter below neither re-reads disk nor re-parses the full history (date
+            # parsing memoizes on the SAME row objects across bars).
             insider_data = fmp_history_disk_cached(
-                "insider_v2", symbol,
-                lambda: self._fetch_insider_history(symbol),
+                "insider_v2", symbol, lambda: self._fetch_insider_history(symbol)
             )
 
             if not insider_data:
@@ -173,25 +178,33 @@ class FMPInsiderProvider(CompanyInsiderInterface):
             total_sale_value = 0.0
             
             for transaction in insider_data:
-                # Parse transaction date
-                trans_date_str = transaction.get("transactionDate", "")
-                if not trans_date_str:
-                    continue
-                    
-                try:
-                    trans_date = datetime.fromisoformat(trans_date_str.split("T")[0])
-                    # Ensure all dates are timezone-aware for comparison
-                    if trans_date.tzinfo is None:
-                        trans_date = trans_date.replace(tzinfo=timezone.utc)
-                except (ValueError, AttributeError):
+                # Parse transaction date — MEMOIZED on the row (``_td_memo``) so a multi-bar
+                # backtest parses each row's date once instead of every analysis bar (the rows are
+                # the SAME objects held in the in-process cache above). Mirrors FMPRating._pd.
+                trans_date = transaction.get("_td_memo", _UNPARSED)
+                if trans_date is _UNPARSED:
+                    trans_date_str = transaction.get("transactionDate", "")
+                    try:
+                        td = datetime.fromisoformat(trans_date_str.split("T")[0]) if trans_date_str else None
+                        if td is not None and td.tzinfo is None:
+                            td = td.replace(tzinfo=timezone.utc)
+                    except (ValueError, AttributeError):
+                        td = None
+                    trans_date = td
+                    transaction["_td_memo"] = td
+                if trans_date is None:
                     continue
 
                 # No-lookahead anchor (LOOKAHEAD BUG FIX): when as_of is set, a trade
                 # is only knowable once its Form-4 filingDate (effective date) <= as_of.
                 # When as_of is None (live) this branch is skipped, preserving the
-                # original transactionDate-range-only behaviour byte-for-byte.
+                # original transactionDate-range-only behaviour byte-for-byte. The effective
+                # date is likewise memoized per row (``_eff_memo``).
                 if as_of is not None:
-                    eff = insider_effective_date(transaction)
+                    eff = transaction.get("_eff_memo", _UNPARSED)
+                    if eff is _UNPARSED:
+                        eff = insider_effective_date(transaction)
+                        transaction["_eff_memo"] = eff
                     if eff is None or eff > as_of:
                         continue
 
