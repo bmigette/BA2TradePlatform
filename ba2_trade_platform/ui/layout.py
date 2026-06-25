@@ -109,15 +109,19 @@ def _render_account_filter_dropdown():
         # Convert "all" back to None for storage
         account_id = None if new_value == "all" else new_value
         set_selected_account_id(account_id)
-        # Reload the page so every tab re-reads the new selection. We must use a
-        # real reload (history.go(0)) rather than navigate.to(current_path):
-        # navigating to the URL we're already on — which always carries the active
-        # tab's hash (e.g. "/#account_growth") — is a same-fragment no-op in the
-        # browser (nicegui issues window.open(url, "_self")), so the page never
-        # rebuilt and the account filter silently stopped applying. reload() re-runs
-        # the page at the current URL *including* the hash, so the active tab is
-        # still restored by setup_tab_navigation while the filter actually refreshes.
-        ui.navigate.reload()
+        # Reload the page so every tab re-reads the new selection. Use an explicit
+        # window.location.reload() rather than ui.navigate.to(current_path) or
+        # ui.navigate.reload():
+        #   - navigate.to(current_path) targets the URL we're already on (it always
+        #     carries the active tab's hash, e.g. "/#account_growth"), which the
+        #     browser treats as a same-fragment no-op — the page never rebuilt and
+        #     the account filter silently stopped applying.
+        #   - ui.navigate.reload() issues history.go(0), which is an unreliable
+        #     reload (a soft no-op in several browsers / SPA contexts).
+        # window.location.reload() forces a real document reload of the current URL
+        # *including* the hash, so the active tab is still restored by
+        # setup_tab_navigation while the filter actually refreshes.
+        ui.run_javascript('window.location.reload()')
     
     with ui.row().classes('items-center gap-1 mr-4'):
         ui.icon('account_circle', size='xs').classes('text-secondary-custom')
