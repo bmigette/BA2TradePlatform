@@ -159,3 +159,73 @@ class TestRulesImporter:
         imported_id, _ = RulesImporter.import_ruleset(exported)
         re_exported = RulesExporter.export_ruleset(imported_id)
         assert len(re_exported["ruleset"]["rules"]) == len(exported["ruleset"]["rules"])
+
+
+class TestContentAwareDedup:
+    """Same name + identical content -> reuse; same name + DIFFERENT content -> import as a new
+    variant (so the imported rule isn't silently dropped onto the pre-existing one)."""
+
+    def _rule(self, name, event_type):
+        return {"rule": {
+            "name": name,
+            "type": ExpertEventRuleType.TRADING_RECOMMENDATION_RULE.value,
+            "triggers": {"t0": {"event_type": event_type}},
+            "actions": {"a0": {"action_type": ExpertActionType.BUY.value}},
+            "continue_processing": False,
+        }}
+
+    def test_same_name_identical_content_reused(self):
+        rd = self._rule("DedupSame", ExpertEventType.F_BULLISH.value)
+        id1, _ = RulesImporter.import_rule(rd)
+        id2, warnings = RulesImporter.import_rule(rd)
+        assert id1 == id2
+        assert any("identical content" in w for w in warnings)
+
+    def test_same_name_different_content_creates_variant(self):
+        id1, _ = RulesImporter.import_rule(self._rule("DedupDiff", ExpertEventType.F_BULLISH.value))
+        id2, warnings = RulesImporter.import_rule(self._rule("DedupDiff", ExpertEventType.F_BEARISH.value))
+        assert id1 != id2
+        assert get_instance(EventAction, id2).name == "DedupDiff-1"
+        assert any("DIFFERENT content" in w for w in warnings)
+        # Re-importing the SAME different-content rule reuses the -1 variant (idempotent).
+        id3, _ = RulesImporter.import_rule(self._rule("DedupDiff", ExpertEventType.F_BEARISH.value))
+        assert id3 == id2
+
+
+class TestNameGeneration:
+    """Readable auto-names are a FALLBACK for unnamed/generic rules; real names are preserved."""
+
+    def test_generate_numeric_token(self):
+        from ba2_common.core.rules_export_import import generate_rule_name
+        assert generate_rule_name({"c0": {"event_type": "days_opened", "operator": ">", "value": 10}}) == "openD_gt_10"
+
+    def test_generate_multi_and_cap(self):
+        from ba2_common.core.rules_export_import import generate_rule_name
+        n = generate_rule_name({f"c{i}": {"event_type": "confidence", "operator": ">=", "value": 70 + i} for i in range(8)})
+        assert len(n) <= 40 and "more" in n
+
+    def test_is_generic_name(self):
+        from ba2_common.core.rules_export_import import _is_generic_rule_name
+        assert _is_generic_rule_name("cond_0") and _is_generic_rule_name("") and _is_generic_rule_name("Rule 5")
+        assert not _is_generic_rule_name("BUY_Longterm_70pctConfidence_10pctProfit")
+
+    def test_export_unnamed_rule_gets_generated_name(self):
+        ea = EventAction(
+            name="cond_0",
+            type=ExpertEventRuleType.TRADING_RECOMMENDATION_RULE,
+            triggers={"c0": {"event_type": ExpertEventType.N_DAYS_OPENED.value, "operator": ">", "value": 10}},
+            actions={"a0": {"action_type": ExpertActionType.BUY.value}},
+        )
+        eid = add_instance(ea)
+        data = RulesExporter.export_rule(eid)
+        assert data["rule"]["name"] == "openD_gt_10"
+
+    def test_export_named_rule_preserved(self):
+        ea = EventAction(
+            name="BUY_Longterm_70pctConfidence",
+            type=ExpertEventRuleType.TRADING_RECOMMENDATION_RULE,
+            triggers={"c0": {"event_type": ExpertEventType.F_BULLISH.value}},
+            actions={"a0": {"action_type": ExpertActionType.BUY.value}},
+        )
+        eid = add_instance(ea)
+        assert RulesExporter.export_rule(eid)["rule"]["name"] == "BUY_Longterm_70pctConfidence"
