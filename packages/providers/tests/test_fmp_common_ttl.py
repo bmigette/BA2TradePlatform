@@ -45,6 +45,6 @@ def test_frozen_context_is_reentrant_safe():
         with frozen_ttl_cache():
             pass
         from ba2_providers import fmp_common
-        assert fmp_common._TTL_FROZEN is True  # restored to prior (True), not forced False
+        assert fmp_common._is_ttl_frozen() is True  # restored to prior (True), not forced False
     finally:
         set_ttl_frozen(False)

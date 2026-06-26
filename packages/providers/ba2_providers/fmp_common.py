@@ -30,27 +30,41 @@ from ba2_common.logger import logger
 # times. Each FMP cache is keyed by symbol and stores the full history; the no-lookahead
 # as_of filtering runs after the fetch, so reusing one fetch across all as_of dates is
 # correct. The LIVE path never enters frozen mode, so it keeps normal TTL expiry.
-_TTL_FROZEN = False
+# THREAD-LOCAL freeze/hermetic state. These were module GLOBALS, which is unsafe when several
+# backtests run as THREADS in one process (e.g. the re-run worker pool / the main task queue):
+# one run's ``frozen_ttl_cache()``/``hermetic_fmp_history()`` exit would reset the flag to False
+# WHILE a concurrent run was still going, dropping it out of frozen/hermetic mode mid-run — so its
+# ``fmp_history_disk_cached`` calls silently became LIVE passthroughs (thousands of network fetches,
+# minutes of grind, non-hermetic). Per-thread state isolates concurrent runs. The GA's PROCESS pool
+# was unaffected (separate globals per process); this generalises the guarantee to threaded runs.
+_tls = threading.local()
+
+
+def _is_ttl_frozen() -> bool:
+    return getattr(_tls, "ttl_frozen", False)
+
+
+def _is_hermetic_fmp_history() -> bool:
+    return getattr(_tls, "hermetic_fmp_history", False)
 
 
 def set_ttl_frozen(frozen: bool) -> None:
-    """Set the global TTLCache freeze flag. Prefer the ``frozen_ttl_cache()`` context
+    """Set the (thread-local) TTLCache freeze flag. Prefer the ``frozen_ttl_cache()`` context
     manager; this setter exists for explicit teardown in tests."""
-    global _TTL_FROZEN
-    _TTL_FROZEN = bool(frozen)
+    _tls.ttl_frozen = bool(frozen)
 
 
 @contextmanager
 def frozen_ttl_cache():
     """Within this context every ``TTLCache`` entry is non-expiring (one fetch per key for
-    the whole backtest). Restores the prior flag on exit (re-entrant safe)."""
-    global _TTL_FROZEN
-    prev = _TTL_FROZEN
-    _TTL_FROZEN = True
+    the whole backtest). Per-thread + restores the prior flag on exit (re-entrant + concurrency
+    safe — a sibling thread's run never clobbers this thread's freeze state)."""
+    prev = _is_ttl_frozen()
+    _tls.ttl_frozen = True
     try:
         yield
     finally:
-        _TTL_FROZEN = prev
+        _tls.ttl_frozen = prev
 
 
 # --- hermetic FMP-history (backtest) ---------------------------------------
@@ -59,9 +73,6 @@ def frozen_ttl_cache():
 # per-symbol file (ignoring age — historical data doesn't go stale) and RAISES on a miss instead
 # of silently network-fetching mid-run. Prewarm / fetch-cache run WITHOUT hermetic so they can
 # populate the cache. Separate from the freeze flag because prewarm also freezes (to write disk).
-_HERMETIC_FMP_HISTORY = False
-
-
 class FMPHistoryCacheMiss(RuntimeError):
     """A per-symbol FMP history was absent from the cache during a hermetic backtest.
 
@@ -73,14 +84,14 @@ class FMPHistoryCacheMiss(RuntimeError):
 @contextmanager
 def hermetic_fmp_history():
     """Within this context ``fmp_history_disk_cached`` never network-fetches: a cache miss raises
-    ``FMPHistoryCacheMiss``. The backtest run enters this; prewarm/fetch-cache do NOT."""
-    global _HERMETIC_FMP_HISTORY
-    prev = _HERMETIC_FMP_HISTORY
-    _HERMETIC_FMP_HISTORY = True
+    ``FMPHistoryCacheMiss``. The backtest run enters this; prewarm/fetch-cache do NOT. Per-thread
+    (concurrency safe — a sibling backtest thread never drops this thread out of hermetic mode)."""
+    prev = _is_hermetic_fmp_history()
+    _tls.hermetic_fmp_history = True
     try:
         yield
     finally:
-        _HERMETIC_FMP_HISTORY = prev
+        _tls.hermetic_fmp_history = prev
 
 
 # --- persist-empty sentinel (prewarm) --------------------------------------
@@ -137,7 +148,7 @@ def fmp_history_disk_cached(namespace: str, symbol: str, fetch_fn: Callable[[], 
     cache problem can never break a run. The atomic tmp+replace write means concurrent workers
     never read a half-written file.
     """
-    if not _TTL_FROZEN:
+    if not _is_ttl_frozen():
         return fetch_fn()  # live path: never cache to disk; always pull fresh from the API
     # BACKTEST in-process layer: hold the loaded payload in memory for the (frozen) run so each
     # (namespace, symbol) is read+parsed from disk ONCE per worker, not once per analysis bar.
@@ -166,7 +177,7 @@ def _fmp_history_disk_read_or_fetch(namespace: str, symbol: str, fetch_fn: Calla
     #    rather than being served — EXCEPT in hermetic mode, where age is ignored (historical data
     #    doesn't go stale) and a miss raises instead of fetching.
     try:
-        if _os.path.exists(path) and (_HERMETIC_FMP_HISTORY
+        if _os.path.exists(path) and (_is_hermetic_fmp_history()
                                       or (_time.time() - _os.path.getmtime(path)) / 86400.0 <= max_age_days):
             with open(path, "r") as fh:
                 return _json.load(fh)
@@ -175,7 +186,7 @@ def _fmp_history_disk_read_or_fetch(namespace: str, symbol: str, fetch_fn: Calla
 
     # HERMETIC backtest: NEVER network-fetch — a miss means the data wasn't pre-warmed. Raise a
     # clear, actionable error (0-fetch guarantee) instead of a silent multi-minute network grind.
-    if _HERMETIC_FMP_HISTORY:
+    if _is_hermetic_fmp_history():
         raise FMPHistoryCacheMiss(
             f"fmp_history '{namespace}/{symbol}' not pre-warmed (hermetic backtest, 0 fetch). "
             f"Run `ba2-test prewarm` for this universe before backtesting."
@@ -233,7 +244,7 @@ class TTLCache:
     def get_or_call(self, key, fn: Callable[[], Any]) -> Any:
         with self._lock:
             item = self._store.get(key)
-            if item is not None and (_TTL_FROZEN or self._clock() < item[1]):
+            if item is not None and (_is_ttl_frozen() or self._clock() < item[1]):
                 return item[0]
         value = fn()  # network call outside the lock
         with self._lock:
