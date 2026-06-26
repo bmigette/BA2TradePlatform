@@ -1518,7 +1518,7 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
     from app.models.backtest import Backtest
     from app.models.strategy import Strategy
     from app.models.strategy_optimization import StrategyOptimization
-    from app.services.strategy_optimization_handler import _build_daily_trial_config  # noqa: SLF001
+    from app.services.strategy_optimization_handler import _build_daily_trial_config, _build_hoisted_state  # noqa: SLF001
     from app.services.backtest.daily_backtest_handler import _persist_results  # re-run via _persist_trial_worker
     from app.services.strategy_param_space import decode_params
 
@@ -1536,6 +1536,11 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
         strat = db.query(Strategy).filter_by(id=opt.strategy_id).first()
         cfg = opt.optimization_config or {}
         bt_block = dict(cfg["backtest"])
+        # Apply the SAME screener hoisted state the GA scored each individual with, so the persisted
+        # top-N are the actual optimized SCREENER runs (universe_source=screener + the per-individual
+        # screener genes) — not static-universe runs. Without this the persisted top-N silently
+        # diverge from their fitness (and from the UI "Load + run" / the in-place re-run).
+        hoisted = _build_hoisted_state(bt_block) if bt_block.get("screener_opt") else None
 
         # Top-N param sets by DISTINCT fitness (fall back to best_params if all_results is thin).
         # Dedup on fitness, not raw params: a converged GA yields many param sets that differ only
@@ -1562,7 +1567,7 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
         specs = []  # (rank, trial_cfg, strategy_params)
         for rank, params in enumerate(ranked, start=1):
             decoded = decode_params(strat, params)
-            trial_cfg = _build_daily_trial_config(bt_block, decoded)
+            trial_cfg = _build_daily_trial_config(bt_block, decoded, hoisted)
             trial_cfg["name"] = f"TOP{rank}-{opt.name or expert}"
             # Persist this top-N run's trading DB (orders/transactions/recommendations) to disk
             # for post-mortem inspection — the GA trials run RAM-only for speed. The path is keyed

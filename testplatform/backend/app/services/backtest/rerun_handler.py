@@ -61,10 +61,22 @@ def _gene_params(strategy_params: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _build_optimization_rerun_config(db: Any, bt: Backtest) -> Dict[str, Any]:
-    """Rebuild an opt-derived row's run config (mirrors _persist_top_backtests)."""
+    """Rebuild an opt-derived row's run config.
+
+    Builds the SAME config the GA SCORED the individual with: ``_build_daily_trial_config`` fed the
+    ``hoisted`` state so the per-individual screener genes are applied (universe_source=screener +
+    the optimized thresholds), matching the UI "Load + run". (Note: the CLI ``_persist_top_backtests``
+    historically built this WITHOUT hoisted, persisting the top-N as static-universe runs — so a
+    re-run intentionally CORRECTS that and re-runs the actual optimized screener config.)
+    """
+    import os
+    from ba2_common.config import SCREENER_STORE_DIR
     from app.models.strategy import Strategy
     from app.models.strategy_optimization import StrategyOptimization
-    from app.services.strategy_optimization_handler import _build_daily_trial_config
+    from app.services.strategy_optimization_handler import (
+        _build_daily_trial_config,
+        _build_hoisted_state,
+    )
     from app.services.strategy_param_space import decode_params
 
     opt = db.query(StrategyOptimization).filter(
@@ -82,8 +94,18 @@ def _build_optimization_rerun_config(db: Any, bt: Backtest) -> Dict[str, Any]:
         )
     strat = db.query(Strategy).filter(Strategy.id == opt.strategy_id).first()
     bt_block = dict(cfg["backtest"])
+
+    # The optimization may have run on another machine (e.g. a Windows store path) or the store may
+    # have moved — remap a missing screener store to this machine's local SCREENER_STORE_DIR so the
+    # re-run reads the current metric_store (and picks up any rebuild, e.g. the price_drop fix).
+    so = bt_block.get("screener_opt")
+    if isinstance(so, dict) and so.get("store") and not os.path.isdir(so["store"]):
+        bt_block["screener_opt"] = {**so, "store": SCREENER_STORE_DIR}
+
     decoded = decode_params(strat, _gene_params(bt.strategy_params))
-    trial_cfg = _build_daily_trial_config(bt_block, decoded)
+    # hoisted applies the screener (genes + store) exactly as the GA did; None for non-screener opts.
+    hoisted = _build_hoisted_state(bt_block) if bt_block.get("screener_opt") else None
+    trial_cfg = _build_daily_trial_config(bt_block, decoded, hoisted)
     # Overwrite the SAME row; persist the trial sub-DB for post-mortem (matches _persist_top_backtests).
     trial_cfg["backtest_id"] = bt.id
     trial_cfg["name"] = bt.name
