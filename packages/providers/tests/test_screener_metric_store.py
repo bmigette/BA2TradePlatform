@@ -247,3 +247,99 @@ def test_float_series_built_lookahead_safe_effective_dated(monkeypatch):
     assert len(s) == 1
     # the period-end 2024-01-01 must surface only ~75 days later (the reporting lag), not on 01-01
     assert s.index[0] > pd.Timestamp("2024-02-01")
+
+
+# --- optimizable price-drop lookback (multi-window) ---------------------------
+
+def test_compute_daily_metrics_emits_per_window_drop_columns():
+    """compute_daily_metrics writes a per-window price_drop_pct_<W> for W=2..max_lookback (plus the
+    legacy single-window price_drop_pct), so the lookback Y is optimizable from ONE store. A bigger
+    window can only see an equal-or-higher trailing peak, so its drop is monotonically >= a smaller
+    window's at the same bar."""
+    idx = pd.date_range("2024-01-01", periods=40, freq="B")
+    close = pd.Series(np.concatenate([np.linspace(100, 130, 20), np.linspace(130, 110, 20)]), index=idx)
+    df = pd.DataFrame({"Open": close, "High": close, "Low": close, "Close": close,
+                       "Volume": [1e6] * 40})
+    out = ms.compute_daily_metrics(df, max_lookback=30)
+    wcols = [c for c in out.columns if c.startswith("price_drop_pct_")]
+    assert len(wcols) == 29                                   # 2..30 inclusive
+    assert "price_drop_pct" in out.columns                    # legacy column retained
+    last = out.iloc[-1]
+    assert last["price_drop_pct_30"] >= last["price_drop_pct_2"] >= 0.0   # wider window >= drop
+    assert last["price_drop_pct_30"] > 0.0                                # the late dip is captured
+    # legacy column equals its drop_days window (default 5)
+    assert round(float(last["price_drop_pct"]), 4) == round(float(last["price_drop_pct_5"]), 4)
+
+
+def test_screen_universe_for_day_selects_window_column_from_price_drop_days():
+    """price_drop_days (Y) picks the price_drop_pct_<Y> column; the price_drop_pct setting is the
+    threshold. AAA only dips on the wide (20d) window, BBB on both — so Y=5 selects BBB, Y=20 both."""
+    df = pd.DataFrame({
+        "symbol": ["AAA", "BBB"], "date": ["2024-01-31"] * 2,
+        "close": [10, 20.0], "market_cap": [5e9, 5e9], "relative_volume": [2.0, 2.0],
+        "sector": ["Tech"] * 2, "volume": [2e6] * 2, "price": [10, 20.0],
+        "price_drop_pct": [1.0, 12.0],          # legacy (== 5d) column
+        "price_drop_pct_5": [1.0, 12.0],
+        "price_drop_pct_20": [18.0, 12.0]})
+    # Y=5, threshold 10 -> only BBB (AAA 5d-drop is 1)
+    assert ms.screen_universe_for_day(df, "2024-01-31", {"price_drop_days": 5, "price_drop_pct": 10.0}) == ["BBB"]
+    # Y=20, threshold 10 -> both (AAA 20d-drop is 18)
+    assert set(ms.screen_universe_for_day(df, "2024-01-31", {"price_drop_days": 20, "price_drop_pct": 10.0})) == {"AAA", "BBB"}
+    # fractional Y (a float gene) truncates to the int column
+    assert ms.screen_universe_for_day(df, "2024-01-31", {"price_drop_days": 5.7, "price_drop_pct": 10.0}) == ["BBB"]
+
+
+def test_screen_universe_for_day_falls_back_to_legacy_when_window_absent():
+    """A legacy store (only price_drop_pct, no per-window columns) still screens on the threshold —
+    price_drop_days is ignored when its column is missing (back-compat)."""
+    df = pd.DataFrame({
+        "symbol": ["AAA", "BBB"], "date": ["2024-01-31"] * 2,
+        "close": [10, 20.0], "market_cap": [5e9, 5e9], "relative_volume": [2.0, 2.0],
+        "sector": ["Tech"] * 2, "volume": [2e6] * 2, "price": [10, 20.0],
+        "price_drop_pct": [3.0, 12.0]})
+    assert ms.screen_universe_for_day(df, "2024-01-31", {"price_drop_days": 20, "price_drop_pct": 10.0}) == ["BBB"]
+
+
+def test_recompute_price_drop_columns_cache_only_inplace(tmp_path):
+    """recompute_price_drop_columns rebuilds ONLY the drop columns from a (cache-only) daily OHLCV
+    getter, in place, leaving every other column untouched and skipping uncached symbols."""
+    store = str(tmp_path / "mstore")
+    # Two weekly scan rows for AAA (price_drop_pct seeded WRONG = 0, the bug) + BBB (no OHLCV cache).
+    seed = pd.DataFrame({
+        "symbol": ["AAA", "AAA", "BBB"],
+        "date": ["2024-01-31", "2024-02-29", "2024-01-31"],
+        "close": [120.0, 110.0, 50.0], "market_cap": [5e9, 5e9, 1e9],
+        "relative_volume": [2.0, 2.0, 1.0], "price_drop_pct": [0.0, 0.0, 0.0],
+        "sector": ["Tech", "Tech", "Energy"], "volume": [2e6, 2e6, 1e6], "price": [120.0, 110.0, 50.0]})
+    ms.write_partitions(store, seed)
+
+    # Daily OHLCV only for AAA: rises to 130 then dips to 110 by end of Feb.
+    aaa_idx = pd.date_range("2024-01-01", "2024-02-29", freq="B")
+    aaa_close = pd.Series(np.concatenate([
+        np.linspace(100, 130, len(aaa_idx) // 2),
+        np.linspace(130, 110, len(aaa_idx) - len(aaa_idx) // 2)]), index=aaa_idx)
+    aaa = pd.DataFrame({"Open": aaa_close, "High": aaa_close, "Low": aaa_close,
+                        "Close": aaa_close, "Volume": [1e6] * len(aaa_idx)})
+
+    def _getter(sym):
+        return aaa if sym == "AAA" else None      # BBB has no cache -> skipped
+
+    res = ms.recompute_price_drop_columns(store, _getter, max_lookback=30, drop_days=5)
+    assert res["recomputed"] == 1 and res["skipped"] == 1 and res["skipped_symbols"] == ["BBB"]
+
+    ms.clear_store_memo()
+    out = ms.load_store(store)
+    # windowed columns exist; AAA's Feb dip is now non-zero; other columns intact.
+    assert "price_drop_pct_30" in out.columns and "price_drop_pct_5" in out.columns
+    aaa_feb = out[(out["symbol"] == "AAA") & (out["date"] == "2024-02-29")].iloc[0]
+    assert aaa_feb["price_drop_pct_30"] > 0.0                 # was 0 (the bug), now real
+    assert aaa_feb["market_cap"] == 5e9                       # untouched
+    # BBB skipped -> its legacy drop stays as seeded, windowed columns are NaN.
+    bbb = out[out["symbol"] == "BBB"].iloc[0]
+    assert bbb["price_drop_pct"] == 0.0
+    assert pd.isna(bbb["price_drop_pct_30"])
+    # consolidation: exactly one part.parquet per month (stale flush files removed).
+    import glob
+    for m in ("2024-01", "2024-02"):
+        parts = glob.glob(os.path.join(store, f"ym={m}", "*.parquet"))
+        assert parts == [os.path.join(store, f"ym={m}", "part.parquet")]

@@ -229,12 +229,44 @@ def weinstein_stage_series(close: "pd.Series", sma_period: int = 150,
     return stage.where(valid, float("nan"))
 
 
+def _drop_pct(close: "pd.Series", window: int) -> "pd.Series":
+    """Pullback % from the trailing-``window`` peak (inclusive) to today's close:
+    ``(rolling_max(window) - close) / rolling_max * 100`` (0 where peak<=0). Point-in-time —
+    every value at D uses only closes <= D. Window 1 ⇒ peak==close ⇒ always 0 (the old bug)."""
+    peak = close.rolling(max(1, int(window)), min_periods=1).max()
+    return ((peak - close) / peak * 100.0).where(peak > 0, 0.0)
+
+
+def _drop_pct_windows(close: "pd.Series", max_window: int) -> Dict[int, "pd.Series"]:
+    """Pullback % from the trailing-W peak for EVERY window W=1..max_window, in ONE incremental
+    pass: ``peak_W = max(peak_{W-1}, close shifted by W-1)`` (window W just adds the one older bar
+    to window W-1). ~K cheap numpy ``fmax`` ops instead of K pandas ``rolling().max()`` calls
+    (~6x faster for K=30). ``fmax`` ignores the leading NaNs from the shift, matching
+    ``rolling(min_periods=1)``. Point-in-time; identical values to ``_drop_pct`` per window."""
+    import numpy as _np
+    arr = close.to_numpy(dtype=float)
+    n = arr.shape[0]
+    peak = arr.copy()                                    # W=1: peak == today's close
+    out: Dict[int, "pd.Series"] = {}
+    for w in range(1, max(1, int(max_window)) + 1):
+        if w >= 2:
+            k = w - 1
+            shifted = _np.full(n, _np.nan)
+            if k < n:                                    # else the bar W-1 back doesn't exist yet
+                shifted[k:] = arr[:n - k]
+            peak = _np.fmax(peak, shifted)
+        with _np.errstate(invalid="ignore", divide="ignore"):
+            dp = _np.where(peak > 0, (peak - arr) / peak * 100.0, 0.0)
+        out[w] = pd.Series(dp, index=close.index)
+    return out
+
+
 def compute_daily_metrics(ohlcv: "pd.DataFrame",
                           market_cap_series: Optional["pd.Series"] = None,
                           float_series: Optional["pd.Series"] = None,
                           shares: Optional[float] = None,
-                          rvol_window: int = 20, drop_days: int = 20,
-                          vol_window: int = 20) -> "pd.DataFrame":
+                          rvol_window: int = 20, drop_days: int = 5,
+                          vol_window: int = 20, max_lookback: int = 30) -> "pd.DataFrame":
     """Per-day screen metrics for ONE symbol, vectorised over its full history.
 
     ``ohlcv`` is indexed by date with columns Open/High/Low/Close/Volume (the shape the as-of
@@ -259,9 +291,15 @@ def compute_daily_metrics(ohlcv: "pd.DataFrame",
     rvol = (vol / avg_vol_prior).where(avg_vol_prior > 0, 0.0)
     # Typical daily volume LEVEL: trailing average INCLUDING today (point-in-time, ending at D).
     volume = vol.rolling(vol_window, min_periods=1).mean()
-    # Price drop %: peak of the trailing window (inclusive) vs today's close.
-    peak = close.rolling(max(1, drop_days), min_periods=1).max()
-    drop_pct = ((peak - close) / peak * 100.0).where(peak > 0, 0.0)
+    # Price drop %: pullback from the trailing-window peak. The legacy single-window column
+    # (``price_drop_pct`` == the ``drop_days`` window) is kept for back-compat with older stores /
+    # screens; the per-window columns ``price_drop_pct_2..max_lookback`` let the optimizer search
+    # the lookback Y from ONE store without rebuilding per value (screen_universe_for_day picks the
+    # column from the ``price_drop_days`` setting). All point-in-time (rolling max over closes <= D).
+    _dw = _drop_pct_windows(close, max(int(max_lookback), int(drop_days), 1))
+    drop_pct = _dw[max(1, int(drop_days))]
+    windowed = {f"price_drop_pct_{w}": _dw[w].round(4)
+                for w in range(2, max(2, int(max_lookback)) + 1)}
     # Market cap: point-in-time from the historical series (as-of each bar via ffill). Falls back
     # to close x static shares only when no series is available.
     if market_cap_series is not None and len(market_cap_series):
@@ -278,7 +316,7 @@ def compute_daily_metrics(ohlcv: "pd.DataFrame",
     # Weinstein stage (price vs RISING 150-session/30-week SMA) — vectorised 1:1 with
     # ba2_common.core.weinstein.classify_weinstein_stage. NaN until enough history.
     stage = weinstein_stage_series(close)
-    return pd.DataFrame({
+    out = pd.DataFrame({
         "close": close,
         "market_cap": mcap,
         "volume": volume.round(2),
@@ -287,6 +325,9 @@ def compute_daily_metrics(ohlcv: "pd.DataFrame",
         "weinstein_stage": stage,
         "float_shares": flt,
     })
+    for _col, _ser in windowed.items():
+        out[_col] = _ser
+    return out
 
 
 def existing_months(store_dir: str) -> set:
@@ -325,8 +366,8 @@ def scan_date_grid(start: str, end: str, cadence_days: int) -> "pd.DatetimeIndex
 def build_store(store_dir: str, api_key: str, start: str, end: str, *,
                 market_cap_min: float, price_min: float, volume_min: float,
                 ohlcv_get, mcap_get=None, float_get=None, shares_get=None,
-                cadence_days: int = 7, rvol_window: int = 20, drop_days: int = 20,
-                max_workers: int = 8, symbol_retries: int = 2,
+                cadence_days: int = 7, rvol_window: int = 20, drop_days: int = 5,
+                max_lookback: int = 30, max_workers: int = 8, symbol_retries: int = 2,
                 flush_every: int = 250) -> Dict[str, Any]:
     """Build/extend the metric store for [start,end] at ``cadence_days`` (default 7 = weekly).
     SKIPS months already present (incremental).
@@ -364,7 +405,8 @@ def build_store(store_dir: str, api_key: str, start: str, end: str, *,
         flt_s = float_get(sym) if float_get is not None else None
         shares = shares_get(sym) if shares_get is not None else None
         m = compute_daily_metrics(df, market_cap_series=mcap_s, float_series=flt_s,
-                                  shares=shares, rvol_window=rvol_window, drop_days=drop_days)
+                                  shares=shares, rvol_window=rvol_window, drop_days=drop_days,
+                                  max_lookback=max_lookback)
         m = m.reindex(grid_todo, method="ffill")             # value AS-OF each scan date
         m = m.dropna(subset=["close"]).reset_index().rename(columns={"index": "date"})
         m["date"] = m["date"].astype(str).str.slice(0, 10)
@@ -470,6 +512,82 @@ def clear_store_memo() -> None:
     _SCAN_DATES_MEMO.clear()
 
 
+def recompute_price_drop_columns(store_dir: str, ohlcv_get, *,
+                                 max_lookback: int = 30, drop_days: int = 5) -> Dict[str, Any]:
+    """CACHE-ONLY in-place rebuild of ONLY the price-drop columns of an existing store.
+
+    For each symbol already in the store, reads its DAILY OHLCV via ``ohlcv_get(symbol)`` (the
+    caller wires a cache-only getter — e.g. under ``frozen_ttl_cache()`` so a miss raises rather
+    than hitting the network), recomputes the legacy ``price_drop_pct`` (window ``drop_days``) and
+    the per-window ``price_drop_pct_2..max_lookback`` columns on the daily close, samples them
+    AS-OF each existing store date (latest daily <= date via ffill), and writes them back —
+    consolidating each ``ym=`` month into a single ``part.parquet`` (stale flush files removed).
+    Every OTHER column (market_cap/volume/float/weinstein/close/...) is left untouched.
+
+    Symbols whose daily OHLCV is not cached (getter raises / empty) are SKIPPED with a warning;
+    their drop columns keep whatever they had (windowed columns added as NaN). Returns a summary.
+    """
+    import glob
+    drop_cols = ["price_drop_pct"] + [f"price_drop_pct_{w}" for w in range(2, int(max_lookback) + 1)]
+    parts = sorted(glob.glob(os.path.join(store_dir, "ym=*", "*.parquet")))
+    if not parts:
+        raise FileNotFoundError(f"empty screener metric store: {store_dir}")
+    store = pd.concat((pd.read_parquet(p) for p in parts), ignore_index=True)
+    store["date"] = store["date"].astype(str).str.slice(0, 10)
+    symbols = sorted(store["symbol"].unique())
+
+    updates: List["pd.DataFrame"] = []
+    skipped: List[str] = []
+    for sym in symbols:
+        sdates = sorted(store.loc[store["symbol"] == sym, "date"].unique())
+        try:
+            ohlcv = ohlcv_get(sym)
+        except Exception as e:  # noqa: BLE001 — cache miss / thin symbol must not abort the pass
+            skipped.append(sym)
+            logger.warning(f"recompute-drops: skipping {sym} ({type(e).__name__}: {e})")
+            continue
+        if ohlcv is None or getattr(ohlcv, "empty", True) or "Close" not in ohlcv.columns:
+            skipped.append(sym)
+            continue
+        close = ohlcv["Close"].astype(float)
+        close.index = pd.to_datetime(close.index)
+        close = close.sort_index()
+        _dw = _drop_pct_windows(close, max(int(max_lookback), int(drop_days), 1))
+        per = {f"price_drop_pct_{w}": _dw[w].round(4) for w in range(2, int(max_lookback) + 1)}
+        per["price_drop_pct"] = _dw[max(1, int(drop_days))].round(4)
+        daily = pd.DataFrame(per).sort_index()
+        target = pd.to_datetime(sdates)
+        asof = daily.reindex(target, method="ffill")          # value AS-OF each store date
+        u = pd.DataFrame({"symbol": sym, "date": [d.strftime("%Y-%m-%d") for d in target]})
+        for c in drop_cols:
+            u[c] = asof[c].to_numpy()
+        updates.append(u)
+
+    store = store.set_index(["symbol", "date"])
+    for c in drop_cols:                                       # ensure target columns exist
+        if c not in store.columns:
+            store[c] = float("nan")
+    if updates:
+        upd = pd.concat(updates, ignore_index=True).set_index(["symbol", "date"])
+        store.update(upd)                                     # overwrites only matching, non-NaN cells
+    store = store.reset_index()
+
+    # Consolidate each month to a single part.parquet, then drop the stale flush files so
+    # load_store (reads every *.parquet) doesn't double-count rows.
+    write_partitions(store_dir, store, part_name="part.parquet")
+    for m in sorted(store["date"].str.slice(0, 7).unique()):
+        d = os.path.join(store_dir, f"ym={m}")
+        for p in glob.glob(os.path.join(d, "*.parquet")):
+            if os.path.basename(p) != "part.parquet":
+                os.remove(p)
+    clear_store_memo()
+    logger.info(f"recompute-drops: {len(symbols) - len(skipped)}/{len(symbols)} symbols "
+                f"recomputed ({len(skipped)} skipped) in {store_dir}")
+    return {"symbols": len(symbols), "recomputed": len(symbols) - len(skipped),
+            "skipped": len(skipped), "skipped_symbols": skipped,
+            "max_lookback": int(max_lookback), "drop_days": int(drop_days)}
+
+
 def screen_universe_for_day(store_df: "pd.DataFrame", day: str,
                             settings: Dict[str, Any]) -> List[str]:
     """The dynamic per-day universe for one individual's screener thresholds.
@@ -509,7 +627,16 @@ def screen_universe_for_day(store_df: "pd.DataFrame", day: str,
         if _fmax is not None and float(_fmax) > 0:
             d = d[(d["float_shares"] <= float(_fmax)) | d["float_shares"].isna()]
     _ge("relative_volume", "relative_volume_min")
-    _ge("price_drop_pct", "price_drop_pct")
+    # Price-drop gate over an OPTIMIZABLE lookback window. ``price_drop_days`` (Y) selects the
+    # precomputed per-window column ``price_drop_pct_<Y>`` (a multi-window store holds Y=2..max);
+    # the ``price_drop_pct`` setting is the threshold. Falls back to the legacy single-window
+    # ``price_drop_pct`` column when Y is unset or the windowed column is absent (older store) — so
+    # the per-bar cost is unchanged (one >= on one column) and old stores behave exactly as before.
+    _drop_col = "price_drop_pct"
+    _y = settings.get("price_drop_days")
+    if _y is not None and int(float(_y)) >= 2 and f"price_drop_pct_{int(float(_y))}" in d.columns:
+        _drop_col = f"price_drop_pct_{int(float(_y))}"
+    _ge(_drop_col, "price_drop_pct")
     # Weinstein Stage 2 gate (price above a RISING 30-week/150-session SMA). Truthy => keep only
     # precomputed stage-2 rows, agreeing with StockScreener._filter_by_weinstein_stage2. Absent/0
     # => no-op (existing screener-opt runs behave identically). Tolerates a missing column (an

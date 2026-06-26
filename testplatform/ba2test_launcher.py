@@ -8,6 +8,7 @@ covers the platform's operations without the API:
   ba2-test backtest <run_daily_backtest args>  run a daily expert backtest (full passthrough)
   ba2-test fetch-cache --symbols .. [...]       populate the as-of OHLCV cache
   ba2-test build-screener-metrics --store .. [..] build the screener metric_store (parquet)
+  ba2-test recompute-screener-drops [--store ..]  cache-only rebuild of price-drop columns (no FMP)
   ba2-test fetch-options --underlyings .. [...]  build the offline options cache from Alpaca
   ba2-test cache-usage                          show cache disk usage per type
   ba2-test cache-clear [--type T] [--before D]  clear cache (all, or one type, optional date)
@@ -463,8 +464,51 @@ def _cmd_build_screener_metrics(args) -> int:
         market_cap_min=args.market_cap_min, price_min=args.price_min, volume_min=args.volume_min,
         ohlcv_get=_ohlcv, mcap_get=_mcap, float_get=_float, shares_get=_shares,
         cadence_days=args.cadence_days, drop_days=args.drop_days,
+        max_lookback=getattr(args, "max_lookback", 30) or 30,
         max_workers=getattr(args, "workers", 8) or 8)
     print(f"build-screener-metrics: {summary}")
+    return 0
+
+
+def _cmd_recompute_screener_drops(args) -> int:
+    """CACHE-ONLY rebuild of ONLY the price-drop columns of an existing screener store — no FMP.
+
+    Reads each store symbol's DAILY OHLCV straight from the native parquet cache
+    (CACHE_FOLDER/FMPOHLCVProvider/<SYM>_1d.parquet) — NEVER calls the network — recomputes the
+    legacy ``price_drop_pct`` (window --drop-days) AND the per-window ``price_drop_pct_2..max``
+    columns, and writes them back in place (other metrics untouched). Use it to (1) fix a store
+    built with a degenerate window (the old drop_days=1 -> all-zero bug) and (2) add the
+    multi-window columns needed to OPTIMIZE the price-drop lookback Y, without re-fetching."""
+    import app.models  # noqa: F401 — register ORM models on Base
+    import pandas as _pd
+    import ba2_common.config as _cfg
+    from app.models.database import init_db
+    from ba2_providers.screener import metric_store as ms
+    init_db()
+    store = args.store or _cfg.SCREENER_STORE_DIR
+    if not os.path.isdir(store):
+        sys.exit(f"recompute-screener-drops: store not found: {store}")
+    ohlcv_dir = os.path.join(_cfg.CACHE_FOLDER, "FMPOHLCVProvider")
+
+    def _ohlcv_cached(sym):
+        # Direct parquet read = guaranteed offline (bypasses the provider's fetch-on-miss). Same
+        # normalization the build's _ohlcv applies: tz-naive, ascending, date-indexed.
+        p = os.path.join(ohlcv_dir, f"{sym}_1d.parquet")
+        if not os.path.isfile(p):
+            return None
+        df = _pd.read_parquet(p)
+        if df is None or len(df) == 0 or "Date" not in df.columns:
+            return None
+        idx = _pd.to_datetime(df["Date"])
+        if idx.dt.tz is not None:
+            idx = idx.dt.tz_localize(None)
+        return df.set_index(idx).sort_index()
+
+    summary = ms.recompute_price_drop_columns(
+        store, _ohlcv_cached,
+        max_lookback=getattr(args, "max_lookback", 30) or 30,
+        drop_days=getattr(args, "drop_days", 5) or 5)
+    print(f"recompute-screener-drops: {summary}")
     return 0
 
 
@@ -725,6 +769,10 @@ _SCREENER_OPT = {
     "screener_market_cap_min": {"min": 2e9, "max": 1e10, "step": 1e9, "type": "float", "optimize": True},
     "screener_relative_volume_min": {"min": 1.0, "max": 3.0, "step": 0.1, "type": "float", "optimize": True},
     "screener_price_drop_pct": {"min": 0.0, "max": 25.0, "step": 1.0, "type": "float", "optimize": True},
+    # Lookback window Y (trading days) for the price-drop gate: selects the precomputed
+    # price_drop_pct_<Y> column in a multi-window store (build with --max-lookback >= this max).
+    # Decodes to a bare `price_drop_days` screener override. Cap 30 matches the default max_lookback.
+    "screener_price_drop_days": {"min": 2, "max": 30, "step": 1, "type": "int", "optimize": True},
     "screener_max_stocks": {"min": 10, "max": 50, "step": 10, "type": "int", "optimize": True},
     # Weinstein stage-2 gate (price above a rising 30-week SMA = confirmed uptrend). Optimized
     # as a 0/1 toggle: the GA decides whether requiring Stage-2 helps. (A richer "which stage(s)"
@@ -1829,14 +1877,27 @@ def main(argv: "list | None" = None) -> int:
     bm.add_argument("--price-min", type=float, default=0.0)
     bm.add_argument("--volume-min", type=float, default=0.0)
     bm.add_argument("--cadence-days", type=int, default=7, help="Scan cadence in days (default 7 = weekly). Match the analysis schedule.")
-    bm.add_argument("--drop-days", type=int, default=20,
+    bm.add_argument("--drop-days", type=int, default=5,
                     help="Lookback window (trading days) for the price_drop_pct metric = drop from the "
                          "trailing-window peak. MUST be >= 2 — with 1 the peak window is just today, so "
                          "price_drop_pct is always 0 and any price_drop_pct>0 screen selects nothing "
-                         "(default 20 ~= 1 month).")
+                         "(default 5 ~= 1 week).")
+    bm.add_argument("--max-lookback", type=int, default=30,
+                    help="Max lookback window (trading days) for the OPTIMIZABLE price-drop metric: "
+                         "stores price_drop_pct_2..max columns so the GA can search the window Y<=max "
+                         "from ONE store (no rebuild per value). Default 30 (~6 weeks).")
     bm.add_argument("--workers", type=int, default=8,
                     help="Parallel per-symbol fetch threads (default 8). Historical market-cap + "
                          "float fetches are disk-cached, so re-builds are fast regardless.")
+
+    rs = sub.add_parser("recompute-screener-drops",
+                        help="CACHE-ONLY rebuild of an existing store's price-drop columns (no FMP).")
+    rs.add_argument("--store", default=_DEFAULT_SCREENER_STORE_DIR,
+                    help=f"Path to the parquet metric-store dir (default {_DEFAULT_SCREENER_STORE_DIR}).")
+    rs.add_argument("--max-lookback", type=int, default=30,
+                    help="Max lookback window for the price_drop_pct_2..max columns (default 30).")
+    rs.add_argument("--drop-days", type=int, default=5,
+                    help="Window for the legacy price_drop_pct column (default 5; MUST be >= 2).")
 
     fo = sub.add_parser("fetch-options", help="Build the offline options cache from Alpaca.")
     fo.add_argument("--underlyings", required=True, help="Comma-separated symbols, or @file.")
@@ -2008,6 +2069,7 @@ def main(argv: "list | None" = None) -> int:
         "fetch-cache": lambda: _cmd_fetch_cache(args),
         "prewarm": lambda: _cmd_prewarm(args),
         "build-screener-metrics": lambda: _cmd_build_screener_metrics(args),
+        "recompute-screener-drops": lambda: _cmd_recompute_screener_drops(args),
         "fetch-options": lambda: _cmd_fetch_options(args),
         "cache-usage": lambda: _cmd_cache_usage(args),
         "cache-clear": lambda: _cmd_cache_clear(args),

@@ -30,6 +30,7 @@ const SCREENER_NUMBER_FIELDS: [string, string][] = [
   ['screener_price_min', 'Price min'], ['screener_price_max', 'Price max'],
   ['screener_relative_volume_min', 'RVOL min'],
   ['screener_price_drop_pct', 'Price drop % (dip min)'],
+  ['screener_price_drop_days', 'Price drop lookback (days)'],
   ['screener_max_stocks', 'Max stocks'],
 ];
 
@@ -42,6 +43,7 @@ const SCREENER_OPT_FIELDS: { key: string; label: string; def: ScreenerOptRange }
   { key: 'float_min', label: 'Free float min', def: { min: 1e7, max: 5e8, step: 5e7, optimize: true } },
   { key: 'relative_volume_min', label: 'RVOL min', def: { min: 1.0, max: 5.0, step: 0.5, optimize: true } },
   { key: 'price_drop_pct', label: 'Price drop %', def: { min: 1.0, max: 15.0, step: 1.0, optimize: true } },
+  { key: 'price_drop_days', label: 'Price drop lookback (days)', def: { min: 2, max: 30, step: 1, optimize: true } },
   { key: 'max_stocks', label: 'Max stocks', def: { min: 5, max: 50, step: 5, optimize: true } },
   { key: 'weinstein_stage2_only', label: 'Weinstein stage-2 only', def: { min: 0, max: 1, step: 1, optimize: true } },
 ];

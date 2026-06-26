@@ -260,11 +260,14 @@ def handle_daily_backtest(task_id: str, payload: Dict[str, Any]) -> Dict[str, An
 # metric_store.screen_universe_as_of reads these UNPREFIXED keys (see ba2_providers.screener
 # .metric_store.screen_universe_for_day). The UI / saved screener_settings may carry a
 # ``screener_`` prefix (base-interface naming) and extra keys metric_store doesn't use
-# (float_*/price_drop_days) — map to the recognized subset so the per-bar gate gets a clean dict.
+# (float_* mapped above) — map to the recognized subset so the per-bar gate gets a clean dict.
+# ``price_drop_days`` is the OPTIMIZABLE lookback window Y: it selects the precomputed
+# ``price_drop_pct_<Y>`` column in a multi-window store (falls back to the legacy single-window
+# ``price_drop_pct`` column when absent), with ``price_drop_pct`` as the threshold.
 _METRIC_STORE_KEYS = (
     "market_cap_min", "market_cap_max", "price_min", "price_max",
     "volume_min", "volume_max", "float_min", "float_max",
-    "relative_volume_min", "price_drop_pct",
+    "relative_volume_min", "price_drop_pct", "price_drop_days",
     "weinstein_stage2_only", "max_stocks", "sort_metric",
 )
 
