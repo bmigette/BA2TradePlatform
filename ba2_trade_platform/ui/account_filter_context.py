@@ -63,31 +63,54 @@ def get_accounts_for_filter() -> List[Tuple[str, int]]:
     return options
 
 
+# Process-wide mirror of the per-session selection. app.storage.user is per-session and ONLY
+# accessible inside a UI/client context, but several dashboard widgets compute their data in
+# asyncio.to_thread (no UI context) and need the filter too. We mirror the last value seen/set
+# in a UI context here so those threaded callers fall back to it instead of dropping the filter
+# (which made them aggregate ALL accounts). This is a single-user app, so a process-global
+# mirror is correct; app.storage.user remains the source of truth that persists across restarts.
+_last_known_account_id: Optional[int] = None
+
+
+def _coerce_account_id(account_id) -> Optional[int]:
+    """Normalize a stored value to int id or None ('All'). Handles "None"/"" strings."""
+    if account_id is None or account_id == "None" or account_id == "":
+        return None
+    return int(account_id)
+
+
 def get_selected_account_id() -> Optional[int]:
     """
     Get the currently selected account ID from session storage.
-    
+
+    Falls back to the last value seen in a UI context when called outside one
+    (e.g. from asyncio.to_thread), so background widgets still honor the filter.
+
     Returns:
         The selected account ID, or None if "All" is selected.
     """
+    global _last_known_account_id
     try:
-        account_id = app.storage.user.get(ACCOUNT_FILTER_KEY, None)
-        # Handle string "None" or empty string
-        if account_id is None or account_id == "None" or account_id == "":
-            return None
-        return int(account_id)
+        account_id = _coerce_account_id(app.storage.user.get(ACCOUNT_FILTER_KEY, None))
+        _last_known_account_id = account_id  # keep the thread-readable mirror fresh
+        return account_id
     except Exception as e:
-        logger.warning(f"Error getting selected account ID: {e}")
-        return None
+        # Outside a UI context app.storage.user is unavailable. Use the cached mirror rather
+        # than silently returning None (which dropped the account filter). DEBUG, not WARNING:
+        # this is the expected path for threaded/background callers.
+        logger.debug(f"get_selected_account_id: storage unavailable ({e}); using cached {_last_known_account_id}")
+        return _last_known_account_id
 
 
 def set_selected_account_id(account_id: Optional[int]) -> None:
     """
     Set the selected account ID in session storage.
-    
+
     Args:
         account_id: The account ID to filter by, or None for "All".
     """
+    global _last_known_account_id
+    _last_known_account_id = _coerce_account_id(account_id)  # mirror first (always succeeds)
     try:
         app.storage.user[ACCOUNT_FILTER_KEY] = account_id
         logger.debug(f"Set account filter to: {account_id}")
