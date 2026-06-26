@@ -1,6 +1,7 @@
 import { API_BASE } from '../lib/config';
 import React, { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { usePersistentState } from '../lib/usePersistentState';
 import {
   Brain,
   Loader2,
@@ -60,12 +61,13 @@ const Models: React.FC = () => {
   const [models, setModels] = useState<Model[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [searchQuery, setSearchQuery] = useState('');
-  const [filterType, setFilterType] = useState<string>('all');
-  const [filterDataset, setFilterDataset] = useState<string>('all');
-  const [viewMode, setViewMode] = useState<ViewMode>('grid');
-  const [sortField, setSortField] = useState<SortField>('date');
-  const [sortDirection, setSortDirection] = useState<SortDirection>('desc');
+  // Search / filters / view / sort persist for the session (survive reloads + nav).
+  const [searchQuery, setSearchQuery] = usePersistentState('models:search', '');
+  const [filterType, setFilterType] = usePersistentState<string>('models:filterType', 'all');
+  const [filterDataset, setFilterDataset] = usePersistentState<string>('models:filterDataset', 'all');
+  const [viewMode, setViewMode] = usePersistentState<ViewMode>('models:viewMode', 'grid');
+  const [sortField, setSortField] = usePersistentState<SortField>('models:sortField', 'date');
+  const [sortDirection, setSortDirection] = usePersistentState<SortDirection>('models:sortDirection', 'desc');
   const [confirmDialog, setConfirmDialog] = useState<{
     isOpen: boolean;
     title: string;

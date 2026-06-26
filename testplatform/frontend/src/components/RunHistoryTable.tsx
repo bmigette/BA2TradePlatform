@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { listBacktests, saveBacktest, fetchBacktestExport, deleteBacktest } from '../lib/btApi';
 import type { ExportKind } from '../lib/btApi';
 import { ExportDialog } from './ExportDialog';
+import { usePersistentState } from '../lib/usePersistentState';
 
 // Trigger a browser download of a JSON object via a Blob + temporary <a download>.
 // No server filesystem write — the bytes are produced entirely client-side.
@@ -28,23 +29,27 @@ function fmtDrawdown(v: unknown): string {
 export function RunHistoryTable({ savedOnly, onSelect, onLoad }:
   { savedOnly: boolean; onSelect: (id: number) => void; onLoad?: (id: number) => void; }) {
   const [rows, setRows] = useState<any[]>([]);
-  const [expert, setExpert] = useState('');
-  const [optId, setOptId] = useState('');
-  const [q, setQ] = useState('');
+  // Filters / search / sort persist for the session (sessionStorage) — survive reloads + tab
+  // switches. The Saved tab and the BT-History tab are separate instances; key by `savedOnly` so
+  // each keeps its own sticky filters.
+  const ns = `bt:runhist:${savedOnly ? 'saved' : 'all'}:`;
+  const [expert, setExpert] = usePersistentState(ns + 'expert', '');
+  const [optId, setOptId] = usePersistentState(ns + 'optId', '');
+  const [q, setQ] = usePersistentState(ns + 'q', '');
   // Bumped after a save/delete to re-run the fetch effect below.
   const [refresh, setRefresh] = useState(0);
   // The run whose Export dialog is open (null = closed).
   const [exportRow, setExportRow] = useState<any | null>(null);
   // Collapsible filter menu + numeric thresholds (client-side; expert/optId stay server-side).
-  const [showFilters, setShowFilters] = useState(false);
-  const [minSharpe, setMinSharpe] = useState('');
-  const [minTrades, setMinTrades] = useState('');
-  const [minRet, setMinRet] = useState('');
-  const [maxDD, setMaxDD] = useState('');
-  const [minWin, setMinWin] = useState('');
+  const [showFilters, setShowFilters] = usePersistentState(ns + 'showFilters', false);
+  const [minSharpe, setMinSharpe] = usePersistentState(ns + 'minSharpe', '');
+  const [minTrades, setMinTrades] = usePersistentState(ns + 'minTrades', '');
+  const [minRet, setMinRet] = usePersistentState(ns + 'minRet', '');
+  const [maxDD, setMaxDD] = usePersistentState(ns + 'maxDD', '');
+  const [minWin, setMinWin] = usePersistentState(ns + 'minWin', '');
   // Sort state: column key + direction. Default newest-first (id desc).
-  const [sortKey, setSortKey] = useState<string>('id');
-  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
+  const [sortKey, setSortKey] = usePersistentState<string>(ns + 'sortKey', 'id');
+  const [sortDir, setSortDir] = usePersistentState<'asc' | 'desc'>(ns + 'sortDir', 'desc');
 
   useEffect(() => {
     listBacktests({

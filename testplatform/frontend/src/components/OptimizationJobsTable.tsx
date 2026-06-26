@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { listOptimizationJobs, getOptimization, listBacktests } from '../lib/btApi';
 import type { OptimizationJob, OptJobSettings, OptimizationDetail } from '../lib/btApi';
+import { usePersistentState } from '../lib/usePersistentState';
 
 const inputClass = "px-2 py-1.5 text-sm border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-blue-500 focus:border-blue-500";
 
@@ -246,8 +247,9 @@ export function OptimizationJobsTable({
 }) {
   const [rows, setRows] = useState<OptimizationJob[]>([]);
   const [loaded, setLoaded] = useState(false);
-  const [status, setStatus] = useState('');
-  const [q, setQ] = useState('');
+  // Status filter + search persist for the session (survive reloads + tab switches).
+  const [status, setStatus] = usePersistentState('bt:optjobs:status', '');
+  const [q, setQ] = usePersistentState('bt:optjobs:q', '');
   // Lazily-fetched per-job detail (top individuals + config), cached by job id.
   const [details, setDetails] = useState<Record<number, OptimizationDetail | 'loading'>>({});
 

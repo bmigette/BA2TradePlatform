@@ -538,3 +538,45 @@ body {
 .dark [data-tooltip] {
   color: rgb(209 213 219); /* gray-300 */
 }
+
+/* ----------------------------------------------------------------------------
+ * Themed scrollbars (light + dark) — replaces the default white/native bar so
+ * overflow areas (tables, panels, modals) match the app chrome. Firefox uses
+ * scrollbar-width/color; WebKit/Blink use the ::-webkit-scrollbar pseudos.
+ * Thumb is a rounded slate pill on a transparent track; darker on the .dark root.
+ * ------------------------------------------------------------------------- */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgb(203 213 225) transparent; /* slate-300 thumb / transparent track */
+}
+.dark * {
+  scrollbar-color: rgb(71 85 105) transparent; /* slate-600 */
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background-color: rgb(203 213 225); /* slate-300 */
+  border-radius: 9999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background-color: rgb(148 163 184); /* slate-400 */
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+.dark ::-webkit-scrollbar-thumb {
+  background-color: rgb(71 85 105); /* slate-600 */
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+.dark ::-webkit-scrollbar-thumb:hover {
+  background-color: rgb(100 116 139); /* slate-500 */
+}
