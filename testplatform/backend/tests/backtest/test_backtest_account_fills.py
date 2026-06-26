@@ -138,6 +138,26 @@ def test_cash_secured_buy_clamped_to_affordable():
         ctx.__exit__(None, None, None)
 
 
+def test_cash_secured_buy_canceled_when_unaffordable():
+    """When not even 1 share is affordable, the BUY is CANCELED (not filled, cash untouched) —
+    exercises the affordable<1 branch of the safeguard."""
+    from ba2_common.core.types import OrderDirection, OrderStatus
+
+    cfg = {**CFG, "starting_cash": 50.0}  # < one $102 share
+    acct, ctx, ps = _acct([(D1, 100, 101, 99, 100), (D2, 102, 103, 101, 102)], cfg=cfg)
+    try:
+        ps.set_clock(D1)
+        o = _market("AAPL", 10, OrderDirection.BUY)
+        acct.submit_order(o)
+        acct.refresh_orders()
+        filled = acct.get_order(o.broker_order_id)
+        assert filled.status == OrderStatus.CANCELED
+        assert acct.get_balance() == pytest.approx(50.0)  # cash untouched
+        assert acct.get_positions() == []
+    finally:
+        ctx.__exit__(None, None, None)
+
+
 def test_affordable_buy_not_clamped():
     """A BUY within cash is untouched (the safeguard must not false-trigger on normal sizing)."""
     from ba2_common.core.types import OrderDirection, OrderStatus

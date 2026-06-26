@@ -1723,7 +1723,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                     order.symbol, qty, fill_px, signed * fill_px, self._cash, max(0, affordable),
                 )
                 if affordable < 1:
-                    order.status = OrderStatus.CANCELLED
+                    order.status = OrderStatus.CANCELED
                     order.quantity = 0
                     update_instance(order)
                     self._cancel_oco_sibling(order)
