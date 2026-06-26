@@ -26,8 +26,8 @@ function fmtDrawdown(v: unknown): string {
   return Number.isFinite(n) ? `${n.toFixed(1)}%` : '—';
 }
 
-export function RunHistoryTable({ savedOnly, onSelect, onLoad }:
-  { savedOnly: boolean; onSelect: (id: number) => void; onLoad?: (id: number) => void; }) {
+export function RunHistoryTable({ savedOnly, onSelect, onLoad, selectedId }:
+  { savedOnly: boolean; onSelect: (id: number) => void; onLoad?: (id: number) => void; selectedId?: number | null; }) {
   const [rows, setRows] = useState<any[]>([]);
   // Filters / search / sort persist for the session (sessionStorage) — survive reloads + tab
   // switches. The Saved tab and the BT-History tab are separate instances; key by `savedOnly` so
@@ -237,7 +237,10 @@ export function RunHistoryTable({ savedOnly, onSelect, onLoad }:
         <tbody>
           {sorted.map(r => (
             <tr key={r.id} onClick={() => onSelect(r.id)}
-              className="border-b border-gray-200 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-700 cursor-pointer transition-colors">
+              className={`border-b border-gray-200 dark:border-gray-600 cursor-pointer transition-colors ${
+                r.id === selectedId
+                  ? 'bg-blue-50 dark:bg-blue-900/30 ring-1 ring-inset ring-blue-400 dark:ring-blue-600'
+                  : 'hover:bg-gray-50 dark:hover:bg-gray-700'}`}>
               <td className="px-2 py-1 text-sm text-gray-900 dark:text-gray-100">{r.id}</td>
               <td className="px-2 py-1 text-sm text-gray-900 dark:text-gray-100">{(r.expertName ?? r.expert_name) ?? (r.modelName ?? r.model_name) ?? r.engineType ?? '—'}</td>
               <td className="px-2 py-1 text-sm text-gray-900 dark:text-gray-100">{(r.optimizationId ?? r.optimization_id) ?? '—'}</td>

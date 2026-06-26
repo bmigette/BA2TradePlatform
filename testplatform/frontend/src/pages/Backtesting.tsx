@@ -3516,7 +3516,7 @@ const Backtesting: React.FC = () => {
             ) : backtestCardTab === 'history' ? (
               /* History Tab — all runs (fills the viewport height) */
               <div className="h-[calc(100vh-15rem)] overflow-y-auto pr-4 [scrollbar-gutter:stable]">
-                <RunHistoryTable savedOnly={false} onSelect={viewBacktest} onLoad={loadBacktestIntoForm} />
+                <RunHistoryTable savedOnly={false} onSelect={viewBacktest} onLoad={loadBacktestIntoForm} selectedId={selectedBacktest?.id ?? null} />
               </div>
             ) : backtestCardTab === 'jobs' ? (
               /* Running Jobs Tab — live per-generation + total progress */
@@ -3549,7 +3549,7 @@ const Backtesting: React.FC = () => {
             ) : (
               /* Saved Backtests Tab — fills the viewport height like History */
               <div className="h-[calc(100vh-15rem)] overflow-y-auto pr-4 [scrollbar-gutter:stable]">
-                <RunHistoryTable savedOnly={true} onSelect={viewBacktest} onLoad={loadBacktestIntoForm} />
+                <RunHistoryTable savedOnly={true} onSelect={viewBacktest} onLoad={loadBacktestIntoForm} selectedId={selectedBacktest?.id ?? null} />
               </div>
             )}
           </div>
