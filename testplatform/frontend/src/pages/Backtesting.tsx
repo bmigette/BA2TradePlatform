@@ -273,6 +273,15 @@ const tradeDurationMs = (t: { entryDate?: string; exitDate?: string }): number =
   return Date.parse(t.exitDate) - Date.parse(t.entryDate);
 };
 
+// Compact trade-list timestamp: "2025-10-27T09:30:00+00:00" -> "2025-10-27 09:30". Pure string
+// slice (no Date parse) so the original wall-clock value is preserved — NOT shifted to local tz —
+// and the seconds + "+00:00" are dropped so the column stays one line in the narrow results panel.
+const formatTradeDate = (s?: string): string => {
+  if (!s) return '—';
+  const [date, time] = s.split('T');
+  return time ? `${date} ${time.slice(0, 5)}` : date;
+};
+
 // Recompute the headline metrics from a (possibly trimmed) set of trades — used by the per-trade
 // "hide" toggle to show, on the fly, what the result looks like with some trades excluded.
 // IMPORTANT: this is a P&L-ATTRIBUTION what-if (removes the hidden trades' realised P&L), NOT a
@@ -2515,17 +2524,17 @@ const Backtesting: React.FC = () => {
                           <thead className="bg-gray-50 dark:bg-gray-700/50 sticky top-0">
                             <tr>
                               <th className="px-2 py-2 text-center text-gray-700 dark:text-gray-300" title="Hide a trade to recompute the metrics without it (what-if)"></th>
-                              <th className="px-3 py-2 text-left text-gray-700 dark:text-gray-300">Symbol</th>
-                              <th className="px-3 py-2 text-left text-gray-700 dark:text-gray-300">Entry</th>
-                              <th className="px-3 py-2 text-left text-gray-700 dark:text-gray-300">Exit</th>
-                              <th className="px-3 py-2 text-right text-gray-700 dark:text-gray-300">Entry $</th>
-                              <th className="px-3 py-2 text-right text-gray-700 dark:text-gray-300">Exit $</th>
-                              <th className="px-3 py-2 text-center text-gray-700 dark:text-gray-300">Dir</th>
-                              <th className="px-3 py-2 text-right text-gray-700 dark:text-gray-300">Size</th>
-                              <th className="px-3 py-2 text-right text-gray-700 dark:text-gray-300">P&L</th>
-                              <th className="px-3 py-2 text-right text-gray-700 dark:text-gray-300">P&L %</th>
-                              <th className="px-3 py-2 text-center text-gray-700 dark:text-gray-300">Duration</th>
-                              <th className="px-3 py-2 text-center text-gray-700 dark:text-gray-300">Reason</th>
+                              <th className="px-2 py-1.5 text-left text-gray-700 dark:text-gray-300">Symbol</th>
+                              <th className="px-2 py-1.5 text-left text-gray-700 dark:text-gray-300">Entry</th>
+                              <th className="px-2 py-1.5 text-left text-gray-700 dark:text-gray-300">Exit</th>
+                              <th className="px-2 py-1.5 text-right text-gray-700 dark:text-gray-300">Entry $</th>
+                              <th className="px-2 py-1.5 text-right text-gray-700 dark:text-gray-300">Exit $</th>
+                              <th className="px-2 py-1.5 text-center text-gray-700 dark:text-gray-300">Dir</th>
+                              <th className="px-2 py-1.5 text-right text-gray-700 dark:text-gray-300">Size</th>
+                              <th className="px-2 py-1.5 text-right text-gray-700 dark:text-gray-300">P&L</th>
+                              <th className="px-2 py-1.5 text-right text-gray-700 dark:text-gray-300">P&L %</th>
+                              <th className="px-2 py-1.5 text-center text-gray-700 dark:text-gray-300">Duration</th>
+                              <th className="px-2 py-1.5 text-center text-gray-700 dark:text-gray-300">Reason</th>
                             </tr>
                           </thead>
                           <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
@@ -2543,27 +2552,27 @@ const Backtesting: React.FC = () => {
                                     {isHidden ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                                   </button>
                                 </td>
-                                <td className={`px-3 py-2 font-medium text-gray-900 dark:text-gray-100 ${isHidden ? 'line-through' : ''}`}>{trade.symbol || '—'}</td>
-                                <td className="px-3 py-2 text-gray-900 dark:text-gray-100">{trade.entryDate}</td>
-                                <td className="px-3 py-2 text-gray-900 dark:text-gray-100">{trade.exitDate}</td>
-                                <td className="px-3 py-2 text-right text-gray-900 dark:text-gray-100">${trade.entryPrice.toFixed(2)}</td>
-                                <td className="px-3 py-2 text-right text-gray-900 dark:text-gray-100">${trade.exitPrice.toFixed(2)}</td>
-                                <td className="px-3 py-2 text-center">
+                                <td className={`px-2 py-1.5 font-medium text-gray-900 dark:text-gray-100 ${isHidden ? 'line-through' : ''}`}>{trade.symbol || '—'}</td>
+                                <td className="px-2 py-1.5 whitespace-nowrap text-gray-900 dark:text-gray-100">{formatTradeDate(trade.entryDate)}</td>
+                                <td className="px-2 py-1.5 whitespace-nowrap text-gray-900 dark:text-gray-100">{formatTradeDate(trade.exitDate)}</td>
+                                <td className="px-2 py-1.5 text-right text-gray-900 dark:text-gray-100">${trade.entryPrice.toFixed(2)}</td>
+                                <td className="px-2 py-1.5 text-right text-gray-900 dark:text-gray-100">${trade.exitPrice.toFixed(2)}</td>
+                                <td className="px-2 py-1.5 text-center">
                                   <span className={`px-2 py-0.5 rounded text-xs font-semibold text-white ${
                                     trade.direction === 'long' ? 'bg-green-600' : 'bg-red-600'
                                   }`}>
                                     {trade.direction}
                                   </span>
                                 </td>
-                                <td className="px-3 py-2 text-right text-gray-900 dark:text-gray-100">{trade.size}</td>
-                                <td className={`px-3 py-2 text-right font-medium ${trade.pnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                                <td className="px-2 py-1.5 text-right text-gray-900 dark:text-gray-100">{trade.size}</td>
+                                <td className={`px-2 py-1.5 text-right font-medium ${trade.pnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
                                   {trade.pnl >= 0 ? '+' : ''}${trade.pnl.toFixed(2)}
                                 </td>
-                                <td className={`px-3 py-2 text-right font-medium ${trade.pnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                                <td className={`px-2 py-1.5 text-right font-medium ${trade.pnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
                                   {trade.pnl >= 0 ? '+' : ''}{trade.pnlPercent.toFixed(2)}%
                                 </td>
-                                <td className="px-3 py-2 text-center text-gray-900 dark:text-gray-100">{formatDuration(tradeDurationMs(trade))}</td>
-                                <td className="px-3 py-2 text-center">
+                                <td className="px-2 py-1.5 text-center whitespace-nowrap text-gray-900 dark:text-gray-100">{formatDuration(tradeDurationMs(trade))}</td>
+                                <td className="px-2 py-1.5 text-center">
                                   <span className="px-2 py-0.5 rounded bg-gray-100 dark:bg-gray-700 text-xs text-gray-700 dark:text-gray-300">
                                     {trade.exitReason}
                                   </span>
