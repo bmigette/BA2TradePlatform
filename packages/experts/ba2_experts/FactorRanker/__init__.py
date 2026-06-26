@@ -355,7 +355,14 @@ class FactorRanker(MarketExpertInterface):
         2. otherwise ``universe_source`` (default ``static``) — the existing behaviour, so the
            live ``expert``-pinned path and the ``--screener`` flow are unchanged.
         """
-        ism = (self.get_setting_with_interface_default("instrument_selection_method") or "").lower()
+        # Read the RAW instance setting (NOT get_setting_with_interface_default): the base-interface
+        # DEFAULT for instrument_selection_method is "static", so falling back to it would silently
+        # OVERRIDE this expert's own universe_source whenever ism isn't EXPLICITLY chosen. That is
+        # exactly the optimize / persist / re-run path (which never sets ism) — it was forcing a
+        # static universe and silently disabling the screener (universe_source="screener" + the
+        # optimized screener genes). Only an EXPLICIT static/screener wins here; an unset ism (incl.
+        # the live-pinned "expert", which isn't static/screener) defers to universe_source.
+        ism = (self.settings.get("instrument_selection_method") or "").lower()
         if ism in ("static", "screener"):
             return ism
         return (self.get_setting_with_interface_default("universe_source") or "static").lower()
