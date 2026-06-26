@@ -51,12 +51,16 @@ def _completed_names() -> set:
         return set()
 
 
-def _jobs(bands, strategies, include_no_data, skip_experts=frozenset()):
+def _jobs(bands, strategies, include_no_data, skip_experts=frozenset(), name_suffix=""):
     """Yield (name, expert, strategy_or_None, band) in priority order.
 
     ``skip_experts`` (a set of expert class names) drops those experts entirely — used to defer
     an expert that is too slow for the matrix (e.g. FMPInsiderClusterBuy: ~1.5h/backtest) without
-    editing the expert list."""
+    editing the expert list.
+
+    ``name_suffix`` is appended to every job NAME (e.g. ``-pd``) — used to re-run the whole matrix
+    under fresh names WITHOUT clobbering the prior runs: the new names aren't in the completed set,
+    so all jobs re-run, and the existing tagged Backtests (old names) are left untouched."""
     for band in bands:
         for expert in _CLASSIC:
             if expert in skip_experts:
@@ -64,9 +68,9 @@ def _jobs(bands, strategies, include_no_data, skip_experts=frozenset()):
             if expert in _NO_LARGE_CAP and band == "large" and not include_no_data:
                 continue
             for s in strategies:
-                yield (f"scr-{band}-{expert}-{s}", expert, s, band)
+                yield (f"scr-{band}-{expert}-{s}{name_suffix}", expert, s, band)
         if _RANKER not in skip_experts:
-            yield (f"scr-{band}-{_RANKER}", _RANKER, None, band)  # bypass: one job per band
+            yield (f"scr-{band}-{_RANKER}{name_suffix}", _RANKER, None, band)  # bypass: one job per band
 
 
 def main() -> int:
@@ -86,6 +90,11 @@ def main() -> int:
     ap.add_argument("--skip-experts", default="",
                     help="Comma list of expert class names to EXCLUDE entirely (e.g. "
                          "'FMPInsiderClusterBuy' — too slow at ~1.5h/backtest; defer it).")
+    ap.add_argument("--name-suffix", default="",
+                    help="Suffix appended to every job name (e.g. '-pd'). Re-runs the whole matrix "
+                         "under FRESH names so prior runs' tagged Backtests are kept untouched — "
+                         "used after a screener fix (e.g. the price-drop rebuild) to re-explore the "
+                         "now-meaningful dimension without overwriting the old results.")
     ap.add_argument("--workers", default=None,
                     help="Comma-separated remote worker NAMES to distribute each job's GA trials to "
                          "(e.g. 'remote150'); trials spread across these + local. Workers must be "
@@ -113,7 +122,7 @@ def main() -> int:
         exe = os.path.join(os.path.dirname(sys.executable), "ba2-test")
 
     skip_experts = frozenset(e.strip() for e in args.skip_experts.split(",") if e.strip())
-    jobs = list(_jobs(bands, strategies, args.include_no_data, skip_experts))
+    jobs = list(_jobs(bands, strategies, args.include_no_data, skip_experts, args.name_suffix))
     done = _completed_names()
     print(f"matrix: {len(jobs)} jobs (bands={bands}, strategies={strategies}); "
           f"{sum(1 for j in jobs if j[0] in done)} already completed.")
