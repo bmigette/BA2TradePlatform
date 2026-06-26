@@ -1288,7 +1288,22 @@ const Backtesting: React.FC = () => {
       }
     };
 
-    const buyError = validateConditions(buyEntryConditions, 'Buy Entry');
+    // Drop FULLY-empty placeholder conditions (no field) before validating/sending. createEmptyGroup()
+    // seeds one empty row for editing UX, but an expert backtest needs no manual entry gate — a
+    // leftover empty row must not block the run ("Empty field in Buy Entry[0]"). A condition the user
+    // partially filled (field set, comparison missing) is KEPT and still fails validation below.
+    const pruneEmpty = (tree: ConditionTree): ConditionTree => {
+      if (!isConditionGroup(tree)) return tree;
+      const kept = tree.conditions
+        .map(pruneEmpty)
+        .filter(c => (isConditionGroup(c) ? c.conditions.length > 0 : !!(c.field && c.field.trim())));
+      return { ...tree, conditions: kept };
+    };
+    const prunedBuy = pruneEmpty(buyEntryConditions) as ConditionGroup;
+    const prunedSell = pruneEmpty(sellEntryConditions) as ConditionGroup;
+    const prunedExit = exitConditions.map(ec => ({ ...ec, conditions: pruneEmpty(ec.conditions) as ConditionGroup }));
+
+    const buyError = validateConditions(prunedBuy, 'Buy Entry');
     if (buyError) {
       setError(buyError);
       return;
@@ -1297,18 +1312,18 @@ const Backtesting: React.FC = () => {
     // Short entry is only validated/sent when "Allow short" is on. When off, an empty group is
     // sent so the backend seeds no SELL/short enter rule.
     if (allowShort) {
-      const sellError = validateConditions(sellEntryConditions, 'Short Entry');
+      const sellError = validateConditions(prunedSell, 'Short Entry');
       if (sellError) {
         setError(sellError);
         return;
       }
     }
     const effectiveSellEntryConditions: ConditionGroup = allowShort
-      ? sellEntryConditions
+      ? prunedSell
       : createEmptyGroup('AND');
 
-    for (let i = 0; i < exitConditions.length; i++) {
-      const exitError = validateConditions(exitConditions[i].conditions, `Exit Rule "${exitConditions[i].name}"`);
+    for (let i = 0; i < prunedExit.length; i++) {
+      const exitError = validateConditions(prunedExit[i].conditions, `Exit Rule "${prunedExit[i].name}"`);
       if (exitError) {
         setError(exitError);
         return;
@@ -1319,11 +1334,11 @@ const Backtesting: React.FC = () => {
       setRunning(true);
       setError(null);
 
-      // Build strategy params from current form state
+      // Build strategy params from current form state (pruned of empty placeholder conditions)
       const strategyParams = {
-        buyEntryConditions,
+        buyEntryConditions: prunedBuy,
         sellEntryConditions: effectiveSellEntryConditions,
-        exitConditions: exitConditions.map(ec => ({
+        exitConditions: prunedExit.map(ec => ({
           id: ec.id,
           name: ec.name,
           conditions: ec.conditions,
@@ -2733,9 +2748,9 @@ const Backtesting: React.FC = () => {
         </div>
       )}
 
-      <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
-        {/* Configuration Panel */}
-        <div className="xl:col-span-1 space-y-4">
+      <div className="grid grid-cols-1 xl:grid-cols-5 gap-6">
+        {/* Configuration Panel (60% — wider so the runs table isn't cramped) */}
+        <div className="xl:col-span-3 space-y-4">
           {/* New Backtest Form */}
           <div className="bg-white dark:bg-gray-800 rounded-lg shadow p-4">
             {/* Tabs for New Backtest vs Saved Backtests */}
@@ -3531,8 +3546,8 @@ const Backtesting: React.FC = () => {
           </div>
         </div>
 
-        {/* Results Panel */}
-        <div className="xl:col-span-1 space-y-4">
+        {/* Results Panel (40%) */}
+        <div className="xl:col-span-2 space-y-4">
           {selectedOptJob ? (
             /* Opt-History: 2 sub-tabs — "Optimization" (settings + top individuals) and
                "Individual Backtest" (the selected top individual's full backtest result). */

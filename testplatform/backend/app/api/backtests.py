@@ -389,13 +389,12 @@ def _create_daily_expert_backtest(backtest: "BacktestCreate", db: Session) -> di
     screener_universe = None
     symbols: list = []
     if mode == "screener":
-        screener_store = universe.get("screener_store")
-        if not screener_store:
-            raise HTTPException(
-                status_code=400,
-                detail="universe.screener_store is required for universe.mode='screener' "
-                       "(the metric_store dir built via ba2-test build-screener-metrics)",
-            )
+        # Default to the canonical metric_store dir (where build-screener-metrics writes) when the
+        # caller omits it — the task's _resolve_screener_store validates it actually exists and
+        # fails with an actionable "build it first" message otherwise. Matches _build_config so a
+        # screener BT 'just works' against the built store without re-specifying the path.
+        from ba2_common.config import SCREENER_STORE_DIR
+        screener_store = universe.get("screener_store") or SCREENER_STORE_DIR
         screener_universe = {
             "mode": "screener",
             "screener_store": screener_store,
