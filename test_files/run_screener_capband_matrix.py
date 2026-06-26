@@ -60,12 +60,30 @@ def _jobs(bands, strategies, include_no_data, skip_experts=frozenset(), name_suf
 
     ``name_suffix`` is appended to every job NAME (e.g. ``-pd``) — used to re-run the whole matrix
     under fresh names WITHOUT clobbering the prior runs: the new names aren't in the completed set,
-    so all jobs re-run, and the existing tagged Backtests (old names) are left untouched."""
+    so all jobs re-run, and the existing tagged Backtests (old names) are left untouched.
+
+    ORDER: FMPRating runs across ALL bands FIRST (large -> mid -> small), so its full optimization
+    completes before any other expert starts; then the remaining classic experts + FactorRanker run
+    band-by-band. (FMPRating is the most general rating expert, so prioritising it surfaces its
+    results first.)"""
+    def _eligible(band, expert):
+        if expert in skip_experts:
+            return False
+        if expert in _NO_LARGE_CAP and band == "large" and not include_no_data:
+            return False
+        return True
+
+    # 1) FMPRating across every band first.
+    if "FMPRating" not in skip_experts:
+        for band in bands:
+            if not _eligible(band, "FMPRating"):
+                continue
+            for s in strategies:
+                yield (f"scr-{band}-FMPRating-{s}{name_suffix}", "FMPRating", s, band)
+    # 2) then the remaining classic experts + FactorRanker, band by band.
     for band in bands:
         for expert in _CLASSIC:
-            if expert in skip_experts:
-                continue
-            if expert in _NO_LARGE_CAP and band == "large" and not include_no_data:
+            if expert == "FMPRating" or not _eligible(band, expert):
                 continue
             for s in strategies:
                 yield (f"scr-{band}-{expert}-{s}{name_suffix}", expert, s, band)

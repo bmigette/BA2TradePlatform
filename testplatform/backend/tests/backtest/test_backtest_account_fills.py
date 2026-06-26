@@ -115,6 +115,48 @@ def _stop(symbol, qty, side, order_type, stop):
 
 
 # ---------------------------------------------------------------------------
+# CASH-SECURED safeguard (no leverage)
+# ---------------------------------------------------------------------------
+def test_cash_secured_buy_clamped_to_affordable():
+    """A BUY sized beyond available cash is CLAMPED to the affordable share count so the backtest
+    can never silently run on leverage (regression guard for the over-deployment safeguard)."""
+    from ba2_common.core.types import OrderDirection, OrderStatus
+
+    cfg = {**CFG, "starting_cash": 1000.0}
+    acct, ctx, ps = _acct([(D1, 100, 101, 99, 100), (D2, 102, 103, 101, 102)], cfg=cfg)
+    try:
+        ps.set_clock(D1)
+        o = _market("AAPL", 100, OrderDirection.BUY)  # 100*102 = $10,200 >> $1000 cash
+        acct.submit_order(o)
+        acct.refresh_orders()  # fills at D2 open = 102, clamped to affordable
+        filled = acct.get_order(o.broker_order_id)
+        assert filled.status == OrderStatus.FILLED
+        assert filled.filled_qty == 9  # floor(1000 / 102)
+        assert acct.get_balance() == pytest.approx(1000.0 - 9 * 102.0)
+        assert acct.get_balance() >= 0  # never negative — cash-secured
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_affordable_buy_not_clamped():
+    """A BUY within cash is untouched (the safeguard must not false-trigger on normal sizing)."""
+    from ba2_common.core.types import OrderDirection, OrderStatus
+
+    cfg = {**CFG, "starting_cash": 1000.0}
+    acct, ctx, ps = _acct([(D1, 100, 101, 99, 100), (D2, 102, 103, 101, 102)], cfg=cfg)
+    try:
+        ps.set_clock(D1)
+        o = _market("AAPL", 5, OrderDirection.BUY)  # 5*102 = $510 < $1000
+        acct.submit_order(o)
+        acct.refresh_orders()
+        filled = acct.get_order(o.broker_order_id)
+        assert filled.status == OrderStatus.FILLED and filled.filled_qty == 5
+        assert acct.get_balance() == pytest.approx(1000.0 - 5 * 102.0)
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+# ---------------------------------------------------------------------------
 # MARKET
 # ---------------------------------------------------------------------------
 def test_market_buy_fills_next_bar_open():

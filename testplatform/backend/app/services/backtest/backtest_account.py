@@ -74,6 +74,10 @@ from ba2_common.core.db import get_db, get_instance, add_instance, update_instan
 from .price_source import AsOfPriceSource
 from .options_provider import HistoricalOptionsProvider
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 class _AttrDict(dict):
     """A dict whose keys are also attribute-accessible.
@@ -1702,6 +1706,31 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         qty = float(order.quantity) if order.quantity is not None else 0.0
         signed = qty if order.side == OrderDirection.BUY else -qty
         commission = float(self._cfg["commission_per_trade"])
+        # CASH-SECURED safeguard (O(1)): a BUY that OPENS/ADDS to a long must never drive cash
+        # negative — the backtest must not silently run on leverage. The classic RM already
+        # self-limits (get_available_balance goes negative once capital is deployed, so it sizes
+        # 0), so in a correct run this NEVER fires; it's a regression guard. If it ever trips we
+        # log it LOUDLY and clamp the fill to the affordable share count (cancel if not even 1),
+        # so a future sizing regression fails visibly + stays cash-secured instead of leveraging.
+        if signed > 0 and fill_px > 0:
+            cur = self._positions.get(order.symbol)
+            if (cur.qty if cur else 0.0) >= 0 and signed * fill_px + commission > self._cash + 1e-6:
+                affordable = int((self._cash - commission) / fill_px)
+                logger.error(
+                    "BACKTEST cash-secured safeguard TRIPPED on %s: BUY %g @ %.4f (cost $%.2f) "
+                    "exceeds cash $%.2f -> clamping to %d share(s). A sizing regression let the RM "
+                    "over-size; the engine should bound deployment to available cash.",
+                    order.symbol, qty, fill_px, signed * fill_px, self._cash, max(0, affordable),
+                )
+                if affordable < 1:
+                    order.status = OrderStatus.CANCELLED
+                    order.quantity = 0
+                    update_instance(order)
+                    self._cancel_oco_sibling(order)
+                    return
+                qty = float(affordable)
+                signed = qty
+                order.quantity = qty
         # Buying spends cash (signed>0 -> cash decreases); selling adds cash.
         self._cash -= signed * fill_px
         self._cash -= commission
