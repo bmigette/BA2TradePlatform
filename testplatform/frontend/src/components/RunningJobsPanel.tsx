@@ -207,7 +207,11 @@ export function RunningJobProgress({ name }: { name?: string }) {
           listRunningOptimizations().catch(() => [] as RunningOpt[]),
         ]);
         if (!alive) return;
-        setJob(tasks.find(t => t.name === name) ?? null);
+        // A daily-backtest task is named "Daily Backtest: <name>" (see backtests.py), while the
+        // detail header is the bare backtest name — so an exact match never finds a running BT
+        // (only optimizations, whose task name == the opt name). Match the bare name OR the
+        // prefixed task name so the % bar shows for backtests too.
+        setJob(tasks.find(t => t.name === name || t.name === `Daily Backtest: ${name}`) ?? null);
         setOpt(opts.find(o => o.name === name) ?? null);
       } catch { /* keep last known progress */ }
     };
