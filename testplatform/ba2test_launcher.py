@@ -1132,6 +1132,7 @@ def _cmd_optimize(args) -> int:
             "run_schedule_override": run_sched,
             "execution_interval": args.interval,
             "profit_cap_pct": (float(args.profit_cap_pct) if args.profit_cap_pct else None),
+            "profit_share_cap_pct": (float(args.profit_share_cap_pct) if args.profit_share_cap_pct else None),
             "backtest_id": int(_dt.now().timestamp()),
             "name": f"opt-{expert}-trial",
         }
@@ -1372,6 +1373,7 @@ def _cmd_optimize_batch(args) -> int:
                 "run_schedule_override": run_sched,
                 "execution_interval": args.interval,
                 "profit_cap_pct": (float(args.profit_cap_pct) if args.profit_cap_pct else None),
+                "profit_share_cap_pct": (float(args.profit_share_cap_pct) if args.profit_share_cap_pct else None),
                 "backtest_id": int(_dt.now().timestamp()),
                 "name": f"{name}-trial",
             }
@@ -1897,6 +1899,11 @@ def main(argv: "list | None" = None) -> int:
                     help="Cap each trade's gain at this %% of its cost basis when computing the "
                          "ADJUSTED fitness/return (e.g. 2000 = a trade can't count as more than "
                          "20x its cost). Stops one lucky mega-winner dominating the GA. Default: off.")
+    op.add_argument("--profit-share-cap-pct", type=float, default=None,
+                    help="Cap each trade's gain at this %% of the run's NET profit for the ADJUSTED "
+                         "fitness/return (e.g. 25 = no single trade may contribute >25%% of total "
+                         "return). Complements --profit-cap-pct: a trade can pass the cost-basis cap "
+                         "yet still dominate the book's return; this bounds that. Default: off.")
     op.add_argument("--commission", type=float, default=1.0)
     op.add_argument("--slippage", type=float, default=0.0)
     op.add_argument("--fill-model", default="next_bar_open")
@@ -1952,6 +1959,10 @@ def main(argv: "list | None" = None) -> int:
     ob.add_argument("--profit-cap-pct", type=float, default=None,
                     help="Cap each trade's gain at this %% of its cost basis for the ADJUSTED "
                          "fitness/return (e.g. 2000). Stops one lucky mega-winner dominating the GA.")
+    ob.add_argument("--profit-share-cap-pct", type=float, default=None,
+                    help="Cap each trade's gain at this %% of the run's NET profit for the ADJUSTED "
+                         "fitness/return (e.g. 25 = no single trade may contribute >25%% of total "
+                         "return). Complements --profit-cap-pct. Default: off.")
     ob.add_argument("--commission", type=float, default=1.0)
     ob.add_argument("--slippage", type=float, default=0.0)
     ob.add_argument("--fill-model", default="next_bar_open")

@@ -241,11 +241,21 @@ def _compute_metrics(
     # --- profit cap (optimization robustness) ------------------------------
     # A single once-in-a-lifetime winner (e.g. a sub-$1 stock that 90x'd and never closed) can be
     # ~97% of P&L and dominate the fitness, so the GA overfits to one lucky, non-reproducible
-    # trade. The optional ``profit_cap_pct`` caps EACH trade's gain at that % of the capital
-    # deployed in it (cost basis = entry_price x size). We deduct the excess from the real total
-    # to get an ADJUSTED return/calmar that reflects reproducible edge — raw metrics are unchanged,
-    # and with no cap the adjusted values equal the raw ones exactly.
+    # trade. TWO complementary caps build the ADJUSTED return/calmar (raw metrics untouched; with
+    # neither cap set the adjusted values equal the raw ones exactly):
+    #   1. ``profit_cap_pct`` — caps EACH trade's gain at that % of the capital deployed in it
+    #      (cost basis = entry_price x size). Stops a low-priced name's huge %-move from counting.
+    #   2. ``profit_share_cap_pct`` — caps each trade's gain at that % of the run's NET profit, so
+    #      no single trade contributes more than (say) 25% of total return even if its %-on-basis
+    #      is modest. A trade can pass cap #1 (508% of a $14k basis = $69k) yet still be 60% of the
+    #      book's profit; cap #2 is what bounds THAT. Applied as a single pass against the net
+    #      profit AFTER cap #1 (no iteration — capping the top trade shrinks net, which would spiral
+    #      if re-applied; one pass deducts the dominant trade's excess and is stable/monotone).
+    # The excess removed by both caps is deducted from final equity to get adjusted_*.
     cap_pct = config.get("profit_cap_pct")
+    share_cap_pct = config.get("profit_share_cap_pct")
+    has_basis_cap = cap_pct is not None and float(cap_pct) > 0
+    has_share_cap = share_cap_pct is not None and float(share_cap_pct) > 0
     adjusted_total_return = total_return
     adjusted_annualized_return = annualized_return
     adjusted_calmar = calmar
@@ -256,15 +266,33 @@ def _compute_metrics(
     adjusted_best_trade = best_trade
     adjusted_worst_trade = worst_trade
     adjusted_sqn = sqn
-    if cap_pct is not None and float(cap_pct) > 0:
-        cap_frac = float(cap_pct) / 100.0
+    if has_basis_cap or has_share_cap:
+        cap_frac = (float(cap_pct) / 100.0) if has_basis_cap else None
+        # Stage 1 — per-trade basis cap (cp1 == raw pnl when cap #1 is off).
+        cp1: List[float] = []
+        for t in trades:
+            p = t.get("pnl") or 0.0
+            if has_basis_cap:
+                cost = (t.get("entry_price") or 0.0) * (t.get("size") or 0.0)
+                cp1.append(min(p, cost * cap_frac) if (p > 0 and cost > 0) else p)
+            else:
+                cp1.append(p)
+        # Stage 2 — portfolio-share cap: bound each trade at share% of NET profit after stage 1.
+        # Only meaningful when the book is net-profitable; for a net-losing run "% of total return"
+        # is undefined, so we skip it (leaving cp1 as the adjusted pnls).
+        share_abs = None
+        if has_share_cap:
+            net_after_basis = sum(cp1)
+            if net_after_basis > 0:
+                share_abs = (float(share_cap_pct) / 100.0) * net_after_basis
         excess = 0.0
         adj_pnls: List[float] = []
         adj_pcts: List[float] = []
-        for t in trades:
+        for t, p1 in zip(trades, cp1):
             p = t.get("pnl") or 0.0
-            cost = (t.get("entry_price") or 0.0) * (t.get("size") or 0.0)
-            cp = min(p, cost * cap_frac) if (p > 0 and cost > 0) else p
+            cp = p1
+            if share_abs is not None and cp > share_abs:
+                cp = share_abs
             excess += max(0.0, p - cp)
             adj_pnls.append(cp)
             # pnl_pct is equity-relative (pnl / equity_at_entry); scale it by the same factor the
@@ -305,7 +333,8 @@ def _compute_metrics(
         "buy_hold_return": round(_safe_float(buy_hold_return), 2),
         # Profit-capped (per-trade) variants — equal to the raw values when no cap is set. The
         # optimizer uses the adjusted fitness so one lucky mega-winner can't dominate the search.
-        "profit_cap_pct": (float(cap_pct) if cap_pct is not None and float(cap_pct) > 0 else None),
+        "profit_cap_pct": (float(cap_pct) if has_basis_cap else None),
+        "profit_share_cap_pct": (float(share_cap_pct) if has_share_cap else None),
         "adjusted_total_return": round(_safe_float(adjusted_total_return), 2),
         "adjusted_annualized_return": round(_safe_float(adjusted_annualized_return), 2),
         "adjusted_calmar_ratio": round(_safe_float(adjusted_calmar), 2),

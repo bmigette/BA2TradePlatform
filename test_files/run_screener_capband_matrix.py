@@ -98,6 +98,11 @@ def main() -> int:
                     help="Cap each trade's gain at this %% of its cost basis for the ADJUSTED "
                          "fitness/return, so one lucky non-reproducible mega-winner (e.g. a sub-$1 "
                          "stock that 90x'd) can't dominate the GA. Default 2000. Pass 0 to disable.")
+    ap.add_argument("--profit-share-cap-pct", type=float, default=25.0,
+                    help="Cap each trade's gain at this %% of the run's NET profit for the ADJUSTED "
+                         "fitness/return, so no single trade contributes more than this share of "
+                         "total return (a trade can pass --profit-cap-pct yet still be 60%% of the "
+                         "book). Default 25. Pass 0 to disable.")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -129,6 +134,8 @@ def main() -> int:
                "--run-schedule", "weekly", "--name", name, "--parallel", str(args.parallel)]
         if args.profit_cap_pct and args.profit_cap_pct > 0:
             cmd += ["--profit-cap-pct", str(args.profit_cap_pct)]
+        if args.profit_share_cap_pct and args.profit_share_cap_pct > 0:
+            cmd += ["--profit-share-cap-pct", str(args.profit_share_cap_pct)]
         if strat is not None:
             cmd += ["--strategy", strat]
         if args.workers:

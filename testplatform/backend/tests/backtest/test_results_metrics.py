@@ -166,6 +166,51 @@ def test_annualized_return_is_calendar_based_not_point_count():
     assert r_dense["annualized_return"] > 50.0
 
 
+class TestProfitShareCap:
+    """``profit_share_cap_pct`` bounds any single trade's contribution to NET profit for the
+    ADJUSTED return, even when the trade passes the per-cost-basis ``profit_cap_pct`` cap."""
+
+    # 100k -> 110k (a +10% / +10k net-profit run). One trade dominates that profit.
+    SNAPS = [_snap(datetime(2024, 1, 2), 100_000.0), _snap(datetime(2024, 1, 31), 110_000.0)]
+    # Net profit = 8000 + 1000 + 1000 = 10_000. Trade A is 80% of it.
+    TRADES = [
+        {"symbol": "AAA", "side": "buy", "pnl": 8000.0, "pnl_pct": 80.0, "bars_held": 5,
+         "date": datetime(2024, 1, 3), "price": 2.0, "qty": 1000},
+        {"symbol": "BBB", "side": "buy", "pnl": 1000.0, "pnl_pct": 4.0, "bars_held": 2,
+         "date": datetime(2024, 1, 10), "price": 50.0, "qty": 20},
+        {"symbol": "CCC", "side": "buy", "pnl": 1000.0, "pnl_pct": 3.0, "bars_held": 3,
+         "date": datetime(2024, 1, 20), "price": 100.0, "qty": 10},
+    ]
+
+    def _run(self, cfg):
+        return build_results(_AccountStub(self.SNAPS, self.TRADES), cfg)
+
+    def test_share_cap_bounds_dominant_trade(self):
+        # 25% share cap: trade A (8000) capped to 0.25*10_000 = 2500; excess 5500 removed.
+        r = self._run({"initial_capital": 100_000.0, "profit_share_cap_pct": 25.0})
+        assert r["total_return"] == pytest.approx(10.0)          # raw untouched
+        # adj final = 110_000 - 5500 = 104_500 -> +4.5%.
+        assert r["adjusted_total_return"] == pytest.approx(4.5, abs=0.01)
+        assert r["profit_share_cap_pct"] == pytest.approx(25.0)
+        assert r["profit_cap_pct"] is None
+
+    def test_no_cap_means_adjusted_equals_raw(self):
+        r = self._run({"initial_capital": 100_000.0})
+        assert r["adjusted_total_return"] == pytest.approx(r["total_return"])
+        assert r["profit_share_cap_pct"] is None
+
+    def test_share_cap_skipped_when_net_losing(self):
+        # A net-losing book: "% of total return" is undefined, so the share cap is a no-op.
+        losing = [{"symbol": "AAA", "side": "buy", "pnl": 500.0, "pnl_pct": 5.0, "bars_held": 1,
+                   "date": datetime(2024, 1, 3), "price": 10.0, "qty": 50},
+                  {"symbol": "BBB", "side": "buy", "pnl": -3000.0, "pnl_pct": -30.0, "bars_held": 2,
+                   "date": datetime(2024, 1, 10), "price": 10.0, "qty": 50}]
+        snaps = [_snap(datetime(2024, 1, 2), 100_000.0), _snap(datetime(2024, 1, 31), 97_500.0)]
+        r = build_results(_AccountStub(snaps, losing),
+                          {"initial_capital": 100_000.0, "profit_share_cap_pct": 25.0})
+        assert r["adjusted_total_return"] == pytest.approx(r["total_return"])
+
+
 def test_empty_run_is_safe():
     """No snapshots / no trades -> all-zero metrics, equity defaults to initial capital."""
     r = build_results(_AccountStub([], []), CONFIG)

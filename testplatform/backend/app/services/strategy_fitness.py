@@ -62,10 +62,11 @@ def compute_fitness(fitness_metric: str, results: dict) -> float:
             f"Unknown fitness_metric: {fitness_metric!r}. "
             f"Valid: {sorted(set(_FITNESS_KEYS) | {'max_drawdown'})}"
         )
-    # Profit-cap-aware: when a per-trade cap was applied (profit_cap_pct set), the GA must rank on
-    # the ADJUSTED return-based metric so one lucky, non-reproducible mega-winner can't win the
-    # search. Only return-based metrics have an adjusted variant; the rest fall back to raw.
-    if results.get("profit_cap_pct"):
+    # Profit-cap-aware: when EITHER cap was applied (per-trade basis cap ``profit_cap_pct`` or
+    # portfolio-share cap ``profit_share_cap_pct``), the GA must rank on the ADJUSTED return-based
+    # metric so one lucky, non-reproducible mega-winner (or one trade dominating total return) can't
+    # win the search. Only return-based metrics have an adjusted variant; the rest fall back to raw.
+    if results.get("profit_cap_pct") or results.get("profit_share_cap_pct"):
         adj_key = {"calmar_ratio": "adjusted_calmar_ratio",
                    "total_return": "adjusted_total_return",
                    "profit_factor": "adjusted_profit_factor",
