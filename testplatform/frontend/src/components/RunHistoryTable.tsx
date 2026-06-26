@@ -222,43 +222,43 @@ export function RunHistoryTable({ savedOnly, onSelect, onLoad }:
           <tr>
             {columns.map(c => (
               <th key={c.key} onClick={() => toggleSort(c.key)}
-                className="px-3 py-2 text-left text-xs font-medium text-gray-700 dark:text-gray-300 cursor-pointer select-none hover:text-gray-900 dark:hover:text-gray-100 whitespace-nowrap">
+                className="px-2 py-1 text-left text-xs font-medium text-gray-700 dark:text-gray-300 cursor-pointer select-none hover:text-gray-900 dark:hover:text-gray-100 whitespace-nowrap">
                 {c.label}<span className="text-blue-500">{sortKey === c.key ? (sortDir === 'asc' ? ' ▲' : ' ▼') : ''}</span>
               </th>
             ))}
-            <th className="px-3 py-2 text-left text-xs font-medium text-gray-700 dark:text-gray-300">Actions</th>
+            <th className="px-2 py-1 text-left text-xs font-medium text-gray-700 dark:text-gray-300">Actions</th>
           </tr>
         </thead>
         <tbody>
           {sorted.map(r => (
             <tr key={r.id} onClick={() => onSelect(r.id)}
               className="border-b border-gray-200 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-700 cursor-pointer transition-colors">
-              <td className="px-3 py-2 text-sm text-gray-900 dark:text-gray-100">{r.id}</td>
-              <td className="px-3 py-2 text-sm text-gray-900 dark:text-gray-100">{(r.expertName ?? r.expert_name) ?? (r.modelName ?? r.model_name) ?? r.engineType ?? '—'}</td>
-              <td className="px-3 py-2 text-sm text-gray-900 dark:text-gray-100">{(r.optimizationId ?? r.optimization_id) ?? '—'}</td>
-              <td className="px-3 py-2 text-sm text-gray-900 dark:text-gray-100">{(r.totalReturn ?? r.total_return) ?? '—'}</td>
-              <td className="px-3 py-2 text-sm text-gray-900 dark:text-gray-100">{(r.sharpeRatio ?? r.sharpe_ratio) ?? '—'}</td>
-              <td className="px-3 py-2 text-sm text-gray-900 dark:text-gray-100">{(r.totalTrades ?? r.total_trades) ?? '—'}</td>
-              <td className="px-3 py-2 text-sm text-red-600 dark:text-red-400">{fmtDrawdown(r.maxDrawdown ?? r.max_drawdown)}</td>
-              <td className="px-3 py-2 text-sm text-gray-900 dark:text-gray-100">{(() => { const w = r.winRate ?? r.win_rate; return w != null ? `${Number(w).toFixed(1)}%` : '—'; })()}</td>
-              <td className="px-3 py-2 text-sm text-gray-900 dark:text-gray-100">{(r.isSaved ?? r.is_saved) ? '★' : ''}</td>
-              <td className="px-3 py-2 text-sm text-gray-900 dark:text-gray-100">{r.name}</td>
-              <td className="px-3 py-2 text-sm text-gray-900 dark:text-gray-100">
-                <div className="flex gap-1" onClick={(e) => e.stopPropagation()}>
+              <td className="px-2 py-1 text-sm text-gray-900 dark:text-gray-100">{r.id}</td>
+              <td className="px-2 py-1 text-sm text-gray-900 dark:text-gray-100">{(r.expertName ?? r.expert_name) ?? (r.modelName ?? r.model_name) ?? r.engineType ?? '—'}</td>
+              <td className="px-2 py-1 text-sm text-gray-900 dark:text-gray-100">{(r.optimizationId ?? r.optimization_id) ?? '—'}</td>
+              <td className="px-2 py-1 text-sm text-gray-900 dark:text-gray-100">{(r.totalReturn ?? r.total_return) ?? '—'}</td>
+              <td className="px-2 py-1 text-sm text-gray-900 dark:text-gray-100">{(r.sharpeRatio ?? r.sharpe_ratio) ?? '—'}</td>
+              <td className="px-2 py-1 text-sm text-gray-900 dark:text-gray-100">{(r.totalTrades ?? r.total_trades) ?? '—'}</td>
+              <td className="px-2 py-1 text-sm text-red-600 dark:text-red-400">{fmtDrawdown(r.maxDrawdown ?? r.max_drawdown)}</td>
+              <td className="px-2 py-1 text-sm text-gray-900 dark:text-gray-100">{(() => { const w = r.winRate ?? r.win_rate; return w != null ? `${Number(w).toFixed(1)}%` : '—'; })()}</td>
+              <td className="px-2 py-1 text-sm text-gray-900 dark:text-gray-100">{(r.isSaved ?? r.is_saved) ? '★' : ''}</td>
+              <td className="px-2 py-1 text-sm text-gray-900 dark:text-gray-100"><div className="max-w-[9rem] truncate" title={r.name}>{r.name}</div></td>
+              <td className="px-2 py-1 text-sm text-gray-900 dark:text-gray-100">
+                <div className="flex gap-0.5" onClick={(e) => e.stopPropagation()}>
                   <button
                     type="button"
                     onClick={(e) => { e.stopPropagation(); handleSave(r); }}
                     title={(r.isSaved ?? r.is_saved) ? 'Saved — rename / re-save' : 'Save this run'}
-                    className="px-2 py-1 text-xs border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-50 dark:hover:bg-gray-700"
+                    className={`px-1.5 py-0.5 text-xs border rounded whitespace-nowrap hover:bg-gray-50 dark:hover:bg-gray-700 ${(r.isSaved ?? r.is_saved) ? 'border-amber-400 dark:border-amber-600 text-amber-500' : 'border-gray-300 dark:border-gray-600'}`}
                   >
-                    {(r.isSaved ?? r.is_saved) ? '★ Saved' : '★ Save'}
+                    ★
                   </button>
                   {onLoad && (
                     <button
                       type="button"
                       onClick={(e) => { e.stopPropagation(); onLoad(r.id); }}
                       title="Load this run's settings into a New Backtest"
-                      className="px-2 py-1 text-xs border border-blue-300 dark:border-blue-700 rounded text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-900/20"
+                      className="px-1.5 py-0.5 text-xs border border-blue-300 dark:border-blue-700 rounded text-blue-600 dark:text-blue-400 whitespace-nowrap hover:bg-blue-50 dark:hover:bg-blue-900/20"
                     >
                       Load
                     </button>
@@ -267,7 +267,7 @@ export function RunHistoryTable({ savedOnly, onSelect, onLoad }:
                     type="button"
                     onClick={(e) => { e.stopPropagation(); setExportRow(r); }}
                     title="Export this run"
-                    className="px-2 py-1 text-xs border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-50 dark:hover:bg-gray-700"
+                    className="px-1.5 py-0.5 text-xs border border-gray-300 dark:border-gray-600 rounded whitespace-nowrap hover:bg-gray-50 dark:hover:bg-gray-700"
                   >
                     Export
                   </button>
@@ -275,7 +275,7 @@ export function RunHistoryTable({ savedOnly, onSelect, onLoad }:
                     type="button"
                     onClick={(e) => { e.stopPropagation(); handleDelete(r); }}
                     title="Delete this run"
-                    className="px-2 py-1 text-xs border border-red-300 dark:border-red-700 rounded text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-900/20"
+                    className="px-1.5 py-0.5 text-xs border border-red-300 dark:border-red-700 rounded text-red-600 dark:text-red-400 whitespace-nowrap hover:bg-red-50 dark:hover:bg-red-900/20"
                   >
                     Delete
                   </button>

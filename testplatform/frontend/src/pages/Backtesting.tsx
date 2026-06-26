@@ -2757,9 +2757,9 @@ const Backtesting: React.FC = () => {
         </div>
       )}
 
-      <div className="grid grid-cols-1 xl:grid-cols-5 gap-6">
-        {/* Configuration Panel (60% — wider so the runs table isn't cramped) */}
-        <div className="xl:col-span-3 space-y-4">
+      <div className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+        {/* Configuration Panel */}
+        <div className="xl:col-span-1 space-y-4">
           {/* New Backtest Form */}
           <div className="bg-white dark:bg-gray-800 rounded-lg shadow p-4">
             {/* Tabs for New Backtest vs Saved Backtests */}
@@ -3555,8 +3555,8 @@ const Backtesting: React.FC = () => {
           </div>
         </div>
 
-        {/* Results Panel (40%) */}
-        <div className="xl:col-span-2 space-y-4">
+        {/* Results Panel */}
+        <div className="xl:col-span-1 space-y-4">
           {selectedOptJob ? (
             /* Opt-History: 2 sub-tabs — "Optimization" (settings + top individuals) and
                "Individual Backtest" (the selected top individual's full backtest result). */

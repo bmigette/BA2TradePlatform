@@ -233,7 +233,7 @@ def compute_daily_metrics(ohlcv: "pd.DataFrame",
                           market_cap_series: Optional["pd.Series"] = None,
                           float_series: Optional["pd.Series"] = None,
                           shares: Optional[float] = None,
-                          rvol_window: int = 20, drop_days: int = 1,
+                          rvol_window: int = 20, drop_days: int = 20,
                           vol_window: int = 20) -> "pd.DataFrame":
     """Per-day screen metrics for ONE symbol, vectorised over its full history.
 
@@ -325,7 +325,7 @@ def scan_date_grid(start: str, end: str, cadence_days: int) -> "pd.DatetimeIndex
 def build_store(store_dir: str, api_key: str, start: str, end: str, *,
                 market_cap_min: float, price_min: float, volume_min: float,
                 ohlcv_get, mcap_get=None, float_get=None, shares_get=None,
-                cadence_days: int = 7, rvol_window: int = 20, drop_days: int = 1,
+                cadence_days: int = 7, rvol_window: int = 20, drop_days: int = 20,
                 max_workers: int = 8, symbol_retries: int = 2,
                 flush_every: int = 250) -> Dict[str, Any]:
     """Build/extend the metric store for [start,end] at ``cadence_days`` (default 7 = weekly).
