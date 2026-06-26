@@ -1343,6 +1343,9 @@ const Backtesting: React.FC = () => {
     try {
       setRunning(true);
       setError(null);
+      // The Run button sits at the bottom of a long form; scroll back to the top so the result
+      // panel (and the running/queued state) is in view instead of leaving the user at the button.
+      window.scrollTo({ top: 0, behavior: 'smooth' });
 
       // Build strategy params from current form state (pruned of empty placeholder conditions)
       const strategyParams = {
@@ -2053,6 +2056,7 @@ const Backtesting: React.FC = () => {
     try {
       setLaunchingOpt(true);
       setOptNotice(null);
+      window.scrollTo({ top: 0, behavior: 'smooth' });  // bring the run/result panel into view
       // Backend OptimizeRequest folds top-level expert_params into optimization_config.
       // The backtest block is source-aware: expert sends expert/universe; ml sends model/datasets.
       const backtestBlock: Record<string, unknown> = source === 'expert'
