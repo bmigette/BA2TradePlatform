@@ -53,6 +53,40 @@ def test_prewarm_fetches_then_hermetic_serves(temp_cache, monkeypatch):
     assert out == [{"x": 1}] and calls["n"] == 0  # served from disk, 0 fetch
 
 
+def test_empty_not_persisted_without_sentinel(temp_cache, monkeypatch):
+    """Default: a genuinely-empty FMP payload is NOT cached (retried next run). The absent file
+    then reads back as a fatal 'not pre-warmed' miss in hermetic mode."""
+    with fc.frozen_ttl_cache():
+        out = fc.fmp_history_disk_cached("past_earnings_quarterly", "BNH", lambda: [])
+    assert out == []
+    monkeypatch.setattr(fc, "_HISTORY_MEM_CACHE", fc.TTLCache(999999))
+    with fc.frozen_ttl_cache(), fc.hermetic_fmp_history():
+        with pytest.raises(fc.FMPHistoryCacheMiss):
+            fc.fmp_history_disk_cached("past_earnings_quarterly", "BNH", lambda: [{"x": 1}])
+
+
+def test_prewarm_persists_empty_as_sentinel(temp_cache, monkeypatch):
+    """Under persist_empty_sentinel() (prewarm), a genuine empty is cached as ``[]`` so the next
+    hermetic read serves it as 'checked, no data' (no signal) instead of raising 'not pre-warmed'.
+    fmp_list_call RAISES on real FMP errors, so a falsy result here is a true no-data."""
+    calls = {"n": 0}
+
+    def empty_fetch():
+        calls["n"] += 1
+        return []
+
+    with fc.frozen_ttl_cache(), fc.persist_empty_sentinel():
+        out = fc.fmp_history_disk_cached("past_earnings_quarterly", "BNH", empty_fetch)
+    assert out == [] and calls["n"] == 1
+
+    # new process: the sentinel file is served, hermetic does NOT raise, 0 fetch
+    monkeypatch.setattr(fc, "_HISTORY_MEM_CACHE", fc.TTLCache(999999))
+    calls["n"] = 0
+    with fc.frozen_ttl_cache(), fc.hermetic_fmp_history():
+        out2 = fc.fmp_history_disk_cached("past_earnings_quarterly", "BNH", empty_fetch)
+    assert out2 == [] and calls["n"] == 0
+
+
 def test_live_path_is_passthrough(temp_cache):
     """Outside a frozen backtest the cache is bypassed entirely (live always pulls fresh)."""
     calls = {"n": 0}

@@ -64,6 +64,10 @@ class DistributedEvaluator:
 
     # -- lifecycle ---------------------------------------------------------------------------
     def start(self) -> None:
+        # Credential app-settings to mirror onto each (DB-less) worker so its hermetic trials
+        # resolve them via get_app_setting — survives the worker's self-update restart, which drops
+        # env-only keys (the recurring 'FMP API key not configured' on remote trials).
+        secrets = self._resolve_master_secrets()
         # Pre-flight: version-match + cache-push each selected worker; drop the unusable ones.
         for w in self.workers:
             try:
@@ -73,6 +77,7 @@ class DistributedEvaluator:
                 if not worker_client.ensure_synced(w, self.master_version, log=self.log):
                     continue
                 worker_client.push_cache(w, log=self.log)
+                worker_client.push_secrets(w, secrets, log=self.log)
                 try:
                     w["capacity"] = max(1, int(worker_client.health(w).get("capacity") or 1))
                 except Exception:  # noqa: BLE001 — fall back to 1 slot if /health didn't report
@@ -97,6 +102,20 @@ class DistributedEvaluator:
         # count, the local worker's = the local consumer count. (The CLI path never updates these,
         # so without this the dashboard shows "0 jobs" + "offline" while a run is in flight.)
         self._report_fleet_state(active=True)
+
+    def _resolve_master_secrets(self) -> dict:
+        """Read the credential app-settings to mirror onto workers from the MASTER's DB. Keys absent
+        on the master are simply omitted (the worker keeps whatever it had). Never raises."""
+        out: dict = {}
+        try:
+            from ba2_common.config import get_app_setting
+            for k in ("FMP_API_KEY", "finnhub_api_key"):
+                v = get_app_setting(k)
+                if v:
+                    out[k] = v
+        except Exception as e:  # noqa: BLE001 — best-effort; a missing key fails loudly at the worker
+            self.log(f"master secret resolution failed (non-fatal): {e}")
+        return out
 
     def _report_fleet_state(self, active: bool) -> None:
         """Write engaged-slot counts (and online status) for the participating workers to the DB so

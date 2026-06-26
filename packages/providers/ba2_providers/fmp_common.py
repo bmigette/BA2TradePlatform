@@ -83,6 +83,31 @@ def hermetic_fmp_history():
         _HERMETIC_FMP_HISTORY = prev
 
 
+# --- persist-empty sentinel (prewarm) --------------------------------------
+# Normally a falsy FMP payload (None/[]/{}) is NOT cached (it could be a transient hiccup, and we
+# want a retry next run). But that makes a symbol FMP genuinely has NO data for (a baby bond /
+# preferred / note with no earnings, e.g. BNH) indistinguishable from one that was never warmed:
+# both leave NO file, so the next hermetic read reports "not pre-warmed". When this flag is on
+# (PREWARM only — fmp_list_call RAISES on real FMP errors, so a falsy result here is a genuine
+# "no data"), a genuine empty IS persisted as an EMPTY-LIST SENTINEL ``[]``. Then a sentinel file
+# means "checked, FMP has nothing" (no signal, NO error) while an ABSENT file still means "never
+# warmed" -> fatal in a hermetic backtest. This keeps fail-loud for real prewarm gaps.
+_PERSIST_EMPTY_SENTINEL = False
+
+
+@contextmanager
+def persist_empty_sentinel():
+    """Within this context a genuinely-empty FMP history is cached as ``[]`` (prewarm sentinel).
+    Used by ``ba2-test prewarm`` so no-data symbols don't perpetually look 'not pre-warmed'."""
+    global _PERSIST_EMPTY_SENTINEL
+    prev = _PERSIST_EMPTY_SENTINEL
+    _PERSIST_EMPTY_SENTINEL = True
+    try:
+        yield
+    finally:
+        _PERSIST_EMPTY_SENTINEL = prev
+
+
 # --- backtest-only disk cache for per-symbol FMP history payloads -----------
 # A spawned GA optimization worker pool starts each worker with EMPTY module-level TTLCaches,
 # so every fresh worker re-fetches the same per-symbol full-history payloads from FMP — the
@@ -160,17 +185,22 @@ def _fmp_history_disk_read_or_fetch(namespace: str, symbol: str, fetch_fn: Calla
     #    retried on the next run instead of poisoning the cache with a bad value.
     data = fetch_fn()
 
-    # 3. Persist (best-effort) ONLY a non-empty, valid result. A falsy payload (None/[]/{}) —
-    #    which may also be an error the provider swallowed into an empty result — is left
-    #    uncached so it is retried next run. The atomic tmp+replace means a concurrent reader
-    #    never sees a half-written file; a failed write cleans up its tmp and never breaks the run.
-    if data:
+    # 3. Persist (best-effort). Normally ONLY a non-empty result is cached — a falsy payload
+    #    (None/[]/{}) is left uncached so it's retried next run (and, in hermetic mode, surfaces as
+    #    a clear "not pre-warmed" miss). EXCEPTION: under ``persist_empty_sentinel()`` (PREWARM), a
+    #    genuine empty is persisted as an EMPTY-LIST SENTINEL ``[]`` — fmp_list_call RAISES on real
+    #    FMP errors, so a falsy result here is a true "FMP has no data for this symbol". A sentinel
+    #    file then means "checked, no data" (no signal) while an ABSENT file still means "never
+    #    warmed" (fatal in a hermetic backtest), so no-data instruments stop looking like prewarm
+    #    gaps. The atomic tmp+replace means a concurrent reader never sees a half-written file.
+    to_persist = data if data else ([] if _PERSIST_EMPTY_SENTINEL else None)
+    if to_persist is not None:
         tmp = None
         try:
             _os.makedirs(d, exist_ok=True)
             tmp = f"{path}.{_os.getpid()}.tmp"
             with open(tmp, "w") as fh:
-                _json.dump(data, fh)
+                _json.dump(to_persist, fh)
             _os.replace(tmp, path)  # atomic
         except Exception:
             if tmp:

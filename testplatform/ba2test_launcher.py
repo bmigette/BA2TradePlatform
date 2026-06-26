@@ -194,7 +194,9 @@ def _cmd_prewarm(args) -> int:
     """
     import time
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    from ba2_providers.fmp_common import frozen_ttl_cache, _fmp_history_cache_dir
+    from ba2_providers.fmp_common import (
+        frozen_ttl_cache, _fmp_history_cache_dir, persist_empty_sentinel,
+    )
 
     # Resolve the FMP key the same way the providers / fetch-cache do.
     key = os.getenv("FMP_API_KEY")
@@ -357,7 +359,9 @@ def _cmd_prewarm(args) -> int:
     errors = 0
     t0 = time.time()
     # The freeze gate engages the BACKTEST-ONLY disk cache (live would pass through).
-    with frozen_ttl_cache():
+    # persist_empty_sentinel(): a symbol FMP genuinely has no data for is cached as ``[]`` so it
+    # reads back as "checked, no data" (not the fatal "not pre-warmed" of an absent file).
+    with frozen_ttl_cache(), persist_empty_sentinel():
         with ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
             futures = {ex.submit(fn, sym): (expert, sym) for (expert, sym, fn) in work}
             for fut in as_completed(futures):

@@ -96,6 +96,30 @@ def push_cache(worker: dict, log: Callable[[str], None] = logger.info) -> dict:
     return {"pushed": len(missing), **res}
 
 
+def push_secrets(worker: dict, settings: dict, log: Callable[[str], None] = logger.info) -> dict:
+    """Push credential app-settings (FMP_API_KEY, finnhub_api_key) into the DB-less worker so its
+    hermetic trials resolve them via get_app_setting.
+
+    The worker keeps no app-settings DB of its own, and a self-update restart drops env-only keys —
+    the recurring 'FMP API key not configured' on remote trials. Writing them to the worker's DB
+    (persisted on disk) survives restarts. Best-effort: never blocks a run; values are never logged.
+    """
+    settings = {k: v for k, v in (settings or {}).items() if v}
+    if not settings:
+        return {"set": 0}
+    try:
+        with httpx.Client(timeout=15.0) as c:
+            r = c.post(f"{_base(worker)}/secrets", headers=_headers(worker),
+                       json={"settings": settings})
+            r.raise_for_status()
+            res = r.json()
+        log(f"secrets push -> {worker['name']}: set {res.get('set')} key(s) {res.get('keys')}")
+        return res
+    except Exception as e:  # noqa: BLE001 — a missing key surfaces as the provider's own clear error
+        log(f"secrets push -> {worker['name']} failed (non-fatal): {e}")
+        return {"set": 0, "error": repr(e)}
+
+
 def ensure_synced(worker: dict, master_version: Optional[str],
                   log: Callable[[str], None] = logger.info, max_wait: float = 300.0) -> bool:
     """Make the worker run a compatible build: if its app version differs from the master's,

@@ -60,6 +60,10 @@ class RunTrialReq(BaseModel):
     cache_root: Optional[str] = None  # the MASTER's CACHE_FOLDER, for path localization
 
 
+class SecretsReq(BaseModel):
+    settings: dict  # {app_setting_key: value_str}, e.g. {"FMP_API_KEY": "...", "finnhub_api_key": "..."}
+
+
 def _localize_paths(obj, master_root: str, local_root: str):
     """Recursively rewrite any string under the MASTER's cache root to THIS worker's cache root.
 
@@ -154,6 +158,41 @@ def run_trial(req: RunTrialReq, authorization: str = Header(default=None)):
         return _POOL.submit(_trial_worker, config, req.fitness_metric).result()
     except Exception as e:  # noqa: BLE001 — surface as a failed trial, never 500 the dispatcher
         return {"ok": False, "fitness": 0.0, "trades": 0, "error": repr(e), "fatal": False}
+
+
+@worker_app.post("/secrets")
+def set_secrets(req: SecretsReq, authorization: str = Header(default=None)):
+    """Upsert credential app-settings (FMP_API_KEY, finnhub_api_key) into THIS worker's ba2_common
+    DB so its hermetic trials resolve them via get_app_setting.
+
+    The worker is otherwise DB-less for app data, but ``_enter_backend`` configured ba2_common at the
+    worker's on-disk default DB at startup; trial pool workers (``_worker_init``) point at the SAME
+    file. Writing the keys here persists them across restarts (unlike env, which a self-update drops
+    — the recurring 'FMP API key not configured' on remote trials). Idempotent upsert; values are
+    never logged.
+    """
+    _verify(authorization)
+    from sqlmodel import Session, select
+    from ba2_common.core.db import get_engine, init_db
+    from ba2_common.core.models import AppSetting
+    n = 0
+    try:
+        init_db()  # ensure the AppSetting table exists in the worker's (possibly fresh) DB
+        with Session(get_engine()) as s:
+            for k, v in (req.settings or {}).items():
+                if not v:
+                    continue
+                row = s.exec(select(AppSetting).where(AppSetting.key == k)).first()
+                if row:
+                    row.value_str = v
+                    s.add(row)
+                else:
+                    s.add(AppSetting(key=k, value_str=v))
+                n += 1
+            s.commit()
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"set_secrets failed: {e!r}")
+    return {"set": n, "keys": sorted((req.settings or {}).keys())}
 
 
 @worker_app.post("/update")
