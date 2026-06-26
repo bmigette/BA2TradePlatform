@@ -460,6 +460,16 @@ def _create_daily_expert_backtest(backtest: "BacktestCreate", db: Session) -> di
     )
     if backtest.execution_interval:
         strategy_params["executionInterval"] = backtest.execution_interval
+    # Run knobs needed to RE-RUN this standalone row exactly later (POST /backtests/{id}/rerun):
+    # not otherwise persisted on the row, so a re-run would have to guess them. Store them now.
+    if backtest.seed is not None:
+        strategy_params["seed"] = backtest.seed
+    if backtest.fill_model:
+        strategy_params["fillModel"] = backtest.fill_model
+    if backtest.warmup_days is not None:
+        strategy_params["warmupDays"] = backtest.warmup_days
+    if run_schedule_override is not None:
+        strategy_params["runScheduleOverride"] = run_schedule_override
 
     db_backtest = Backtest(
         name=backtest.name,
@@ -569,6 +579,43 @@ async def update_backtest(
         backtest.name = update['name']
     db.commit()
     return {"status": "updated", "id": backtest_id}
+
+
+@router.post("/{backtest_id}/rerun")
+async def rerun_backtest(backtest_id: int, db: Session = Depends(get_db)):
+    """Re-run a saved daily-expert backtest IN PLACE: re-execute its ORIGINAL config against the
+    CURRENT data/code and overwrite this row's results (same id/name/optimization link).
+
+    Runs on the dedicated re-run queue (own worker pool) so it never competes with running
+    optimizations for the main queue's workers. Rejects non-daily-expert rows and rows already
+    running/pending. Returns the queued task id (also usable directly via this backend call)."""
+    bt = db.query(Backtest).filter(Backtest.id == backtest_id).first()
+    if not bt:
+        raise HTTPException(status_code=404, detail=f"Backtest {backtest_id} not found")
+    if bt.engine_type != "daily_expert":
+        raise HTTPException(
+            status_code=400,
+            detail=f"re-run is only supported for daily_expert backtests (this is '{bt.engine_type}')",
+        )
+    if bt.status in ("running", "pending"):
+        raise HTTPException(status_code=400, detail=f"backtest {backtest_id} is already {bt.status}")
+
+    # Reset the row so the UI immediately reflects a queued re-run; the handler flips it to
+    # running -> completed/failed and overwrites the metrics on the SAME row.
+    bt.status = "pending"
+    bt.error_message = None
+    bt.started_at = None
+    bt.completed_at = None
+    db.commit()
+
+    from app.services.task_queue import get_rerun_task_queue
+    task_id = get_rerun_task_queue().queue_task(
+        task_type="rerun_backtest",
+        name=f"Re-run: {bt.name}",
+        payload={"backtest_id": backtest_id},
+    )
+    logger.info(f"Queued re-run for backtest {backtest_id} (task {task_id})")
+    return {"status": "queued", "task_id": task_id, "backtest_id": backtest_id}
 
 
 @router.post("/daily")

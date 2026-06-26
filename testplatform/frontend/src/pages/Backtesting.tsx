@@ -4,6 +4,7 @@ import { useNavigate } from 'react-router-dom';
 import {
   Play,
   Loader2,
+  RotateCw,
   AlertCircle,
   TrendingUp,
   TrendingDown,
@@ -60,7 +61,7 @@ import { GeneCountPreview } from '../components/GeneCountPreview';
 import { RunHistoryTable } from '../components/RunHistoryTable';
 import ResolvedRulesetView from '../components/ResolvedRulesetView';
 import type { BestParams } from '../lib/resolveRuleset';
-import { getRulesetVocabulary, importLiveEnterMarket, importLiveRuleset, convertLiveRuleset, listTasks, listBacktests, fetchOptSettingsExport, listExperts, optimizeBatch, listRunningOptimizations, fetchBacktestExport, listWorkers } from '../lib/btApi';
+import { getRulesetVocabulary, importLiveEnterMarket, importLiveRuleset, convertLiveRuleset, listTasks, listBacktests, fetchOptSettingsExport, listExperts, optimizeBatch, listRunningOptimizations, fetchBacktestExport, listWorkers, rerunBacktest } from '../lib/btApi';
 import type { ExpertInfo, OptimizeBatchJob, OptimizeBatchBody, RunningOpt, WorkerLite } from '../lib/btApi';
 import { RunningJobsPanel, RunningJobProgress } from '../components/RunningJobsPanel';
 import { OptimizationJobsTable, OptJobSettingsDetail } from '../components/OptimizationJobsTable';
@@ -1510,6 +1511,28 @@ const Backtesting: React.FC = () => {
     }
   };
 
+  // Re-run a saved daily-expert backtest IN PLACE: re-execute its original config against the
+  // CURRENT data/code and overwrite the same row. Confirm first (it replaces the stored results),
+  // then optimistically flip the panel to the running view — the 2s poll swaps in fresh metrics
+  // when the dedicated re-run worker finishes.
+  const handleRerun = (bt: Backtest) => {
+    setConfirmDialog({
+      isOpen: true,
+      title: 'Re-run backtest',
+      message: `Re-run "${bt.name}" against the current data and engine code? This overwrites this backtest's stored results, equity curve and trades in place.`,
+      variant: 'warning',
+      onConfirm: async () => {
+        setConfirmDialog(prev => ({ ...prev, isOpen: false }));
+        try {
+          await rerunBacktest(bt.id);
+          setSelectedBacktest(prev => (prev && prev.id === bt.id ? { ...prev, status: 'pending' } : prev));
+        } catch (err) {
+          setError(`Re-run failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      },
+    });
+  };
+
   // Opt-History: a top-individual row was clicked. Only the top-N (~5) individuals are persisted
   // as full Backtest rows (optimization_id == job.id, named `TOP{rank}-...`). Match the clicked
   // individual to its persisted backtest by the TOP{rank} name (primary) or strategy_params
@@ -2205,15 +2228,26 @@ const Backtesting: React.FC = () => {
                     )}
                   </p>
                 </div>
-                {selectedBacktest.engineType === 'daily_expert' ? (
-                  <span className="px-2 py-0.5 text-xs font-medium rounded-full bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300">
-                    Daily expert &middot; multi-asset
-                  </span>
-                ) : (
-                  <span className="px-2 py-0.5 text-xs font-medium rounded-full bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300">
-                    ML strategy{selectedBacktest.modelId != null ? ` · Model #${selectedBacktest.modelId}` : ''}
-                  </span>
-                )}
+                <div className="flex items-center gap-2 shrink-0">
+                  {selectedBacktest.engineType === 'daily_expert' && (
+                    <button
+                      type="button"
+                      onClick={() => handleRerun(selectedBacktest)}
+                      title="Re-run this backtest with its original config against the current data/code (overwrites these results in place)"
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded border border-blue-300 dark:border-blue-700 text-blue-700 dark:text-blue-300 bg-blue-50 dark:bg-blue-900/20 hover:bg-blue-100 dark:hover:bg-blue-900/40">
+                      <RotateCw className="w-3.5 h-3.5" /> Re-run
+                    </button>
+                  )}
+                  {selectedBacktest.engineType === 'daily_expert' ? (
+                    <span className="px-2 py-0.5 text-xs font-medium rounded-full bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-300">
+                      Daily expert &middot; multi-asset
+                    </span>
+                  ) : (
+                    <span className="px-2 py-0.5 text-xs font-medium rounded-full bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300">
+                      ML strategy{selectedBacktest.modelId != null ? ` · Model #${selectedBacktest.modelId}` : ''}
+                    </span>
+                  )}
+                </div>
               </div>
               {/* Open-positions note: total_trades counts CLOSED round-trips, so a buy-and-hold
                   (no exit rule) shows 0 trades while equity still moved (entry commission + the

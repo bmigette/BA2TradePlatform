@@ -874,6 +874,42 @@ def init_backtest_task_queue(max_workers: int = 2):
     return _backtest_task_queue
 
 
+# Dedicated RE-RUN task queue — saved-backtest re-runs run on their OWN pool so they never consume
+# the main queue's worker slots (which would starve / queue behind running optimizations). Worker
+# count is set at startup (BACKTEST_RERUN_WORKERS, default 2) so it can be bounded vs the CPU the
+# optimizations need.
+_rerun_task_queue: Optional[TaskQueueService] = None
+
+
+def get_rerun_task_queue() -> TaskQueueService:
+    """Get the dedicated backtest re-run task queue instance."""
+    global _rerun_task_queue
+    if _rerun_task_queue is None:
+        _rerun_task_queue = TaskQueueService(
+            max_workers=2,
+            task_types=['rerun_backtest'],
+            name="RerunTaskQueue",
+        )
+    return _rerun_task_queue
+
+
+def init_rerun_task_queue(max_workers: int = 2):
+    """Initialize and start the dedicated backtest re-run task queue (own pool, isolated from the
+    main queue so re-runs don't compete with running optimizations for worker slots)."""
+    import os
+    global _rerun_task_queue
+    _rerun_task_queue = TaskQueueService(
+        max_workers=max(1, int(max_workers)),
+        task_types=['rerun_backtest'],
+        name="RerunTaskQueue",
+    )
+    if os.getenv('PYTEST_CURRENT_TEST') is None:
+        _rerun_task_queue.start()
+    else:
+        logger.info("Test mode detected - skipping re-run task queue worker startup")
+    return _rerun_task_queue
+
+
 # Dedicated OHLCV task queue — isolated so it can be resized without affecting
 # training jobs, backtests, or other task types.
 _ohlcv_task_queue: Optional[TaskQueueService] = None

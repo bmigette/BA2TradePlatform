@@ -28,6 +28,11 @@ export const getOhlcvBars = (symbol: string, start: string, end: string, interva
     `/tools/ohlcv/bars?symbol=${encodeURIComponent(symbol)}&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}&interval=${encodeURIComponent(interval)}`,
   );
 
+/** Re-run a saved daily-expert backtest IN PLACE (overwrites the same row's results). Returns the
+ * queued task id on the dedicated re-run worker pool. */
+export const rerunBacktest = (id: number) =>
+  jpost<{ status: string; task_id: string; backtest_id: number }>(`/backtests/${id}/rerun`, {});
+
 export const listExperts = () => jget<{ experts: ExpertInfo[] }>('/experts').then(r => r.experts);
 export const getExpertSettings = (cls: string) => jget<{ definitions: Record<string, SettingDef> }>(`/experts/${cls}/settings-definitions`).then(r => r.definitions);
 export const importRules = (json: unknown, which: 'enter' | 'exit') => jpost<{ tree: unknown }>('/strategies/import-rules', { json, which }).then(r => r.tree);

@@ -270,9 +270,9 @@ async def startup_event():
         logger.warning(f"Could not initialize default collections: {e}")
 
     # Initialize task queue
-    from app.services.task_queue import init_task_queue, get_task_queue, init_ohlcv_task_queue, get_ohlcv_task_queue, init_training_task_queue, get_training_task_queue, init_backtest_task_queue, get_backtest_task_queue
+    from app.services.task_queue import init_task_queue, get_task_queue, init_ohlcv_task_queue, get_ohlcv_task_queue, init_training_task_queue, get_training_task_queue, init_backtest_task_queue, get_backtest_task_queue, init_rerun_task_queue, get_rerun_task_queue
     # Main queue: lightweight I/O tasks only (datasets, news)
-    init_task_queue(max_workers=4, exclude_task_types=['ohlcv_cache_fetch', 'training_job', 'backtest'])
+    init_task_queue(max_workers=4, exclude_task_types=['ohlcv_cache_fetch', 'training_job', 'backtest', 'rerun_backtest'])
     logger.info("Main task queue initialized with 4 workers (excludes ohlcv, training, backtest)")
 
     # Register task handlers on the main queue
@@ -317,6 +317,16 @@ async def startup_event():
     backtest_queue = get_backtest_task_queue()
     backtest_queue.register_handler('backtest', handle_backtest)
     logger.info("Backtest task queue initialized with 2 workers (subprocess mode)")
+
+    # Initialize dedicated RE-RUN queue (own pool so saved-backtest re-runs don't consume the main
+    # queue's workers / starve running optimizations). Worker count via BACKTEST_RERUN_WORKERS.
+    import os as _os
+    from app.services.backtest.rerun_handler import handle_rerun_backtest
+    _rerun_workers = int(_os.getenv('BACKTEST_RERUN_WORKERS', '2'))
+    init_rerun_task_queue(max_workers=_rerun_workers)
+    rerun_queue = get_rerun_task_queue()
+    rerun_queue.register_handler('rerun_backtest', handle_rerun_backtest)
+    logger.info(f"Re-run task queue initialized with {_rerun_workers} workers")
 
     # Initialize dedicated OHLCV queue (isolated, resizable, won't affect other task types)
     from app.services.ohlcv_cache_handler import handle_ohlcv_cache_fetch
