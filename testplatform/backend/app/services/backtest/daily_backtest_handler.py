@@ -279,6 +279,23 @@ def _metric_store_settings(screener_settings: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _resolve_screener_store(universe: Dict[str, Any]) -> str:
+    """The metric-store dir for a screener run: the explicit ``universe.screener_store`` if given,
+    else the canonical default ``SCREENER_STORE_DIR`` (where ``ba2-test build-screener-metrics``
+    writes). Validates the dir exists so a missing store fails with an actionable message instead
+    of a cryptic empty-union error — and so a single screener BT 'just works' against the default
+    store without the caller having to pass the path."""
+    from ba2_common.config import SCREENER_STORE_DIR
+    store = universe.get("screener_store") or SCREENER_STORE_DIR
+    if not os.path.isdir(store):
+        raise ValueError(
+            f"screener metric_store not found at {store!r} — build it first, e.g.: "
+            f"ba2-test build-screener-metrics --store {store} --start <YYYY-MM-DD> "
+            f"--end <YYYY-MM-DD> --market-cap-min <N>"
+        )
+    return store
+
+
 def _build_screener_runtime(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """For a ``universe.mode=='screener'`` run, build the per-bar gate config the engine reads.
 
@@ -291,11 +308,8 @@ def _build_screener_runtime(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]
     universe = payload.get("universe") or {}
     if universe.get("mode") != "screener":
         return None
-    store = universe.get("screener_store")
-    if not store:
-        return None
     return {
-        "store": store,
+        "store": _resolve_screener_store(universe),
         "settings": _metric_store_settings(universe.get("screener_settings") or {}),
         "cadence_days": int(universe.get("screener_cadence_days") or 7),
     }
@@ -432,9 +446,7 @@ def _resolve_enabled_instruments(
     if mode == "screener":
         from ba2_providers.screener import metric_store as ms
 
-        store = universe.get("screener_store")
-        if not store:
-            raise ValueError("universe.screener_store is required for screener mode")
+        store = _resolve_screener_store(universe)  # explicit path, else default SCREENER_STORE_DIR
         # Candidate universe = the symbols THIS run's screen can ever select (the union of the
         # per-bar screen over the window), NOT the whole store. The store is the loosest-bound
         # superset of every gene (e.g. 868 symbols) but a given run selects far fewer (~26) —

@@ -90,14 +90,35 @@ def test_single_bt_screener_union_runtime_and_no_lookahead(tmp_path):
     assert "A" in late and "B" in late
 
 
-def test_screener_mode_requires_store(tmp_path):
+def test_screener_mode_defaults_to_store_dir(tmp_path, monkeypatch):
+    """Omitting universe.screener_store now DEFAULTS to SCREENER_STORE_DIR (where
+    build-screener-metrics writes), so a single screener BT 'just works' against the built store
+    without the caller passing the path."""
+    store = _build_store(tmp_path)
+    import ba2_common.config as _cfg
+    monkeypatch.setattr(_cfg, "SCREENER_STORE_DIR", store)
+    payload = {
+        "backtest_id": 2, "start_date": "2024-01-01", "end_date": "2024-03-01",
+        "experts": ["FMPRating"], "initial_capital": 100000.0, "commission": 1.0,
+        "slippage": 0.0, "fill_model": "next_bar_open", "seed": 42,
+        "universe": {"mode": "screener", "screener_settings": {"market_cap_min": 1e9}},  # no store
+    }
+    cfg = _build_config(payload)
+    assert cfg["enabled_instruments"] == ["A", "B"]            # resolved from the default store
+    assert cfg["screener_runtime"]["store"] == store
+
+
+def test_screener_mode_missing_store_dir_errors(tmp_path, monkeypatch):
+    """If neither an explicit store nor the default dir exists, fail with an actionable message."""
+    import ba2_common.config as _cfg
+    monkeypatch.setattr(_cfg, "SCREENER_STORE_DIR", str(tmp_path / "does-not-exist"))
     payload = {
         "backtest_id": 2, "start_date": "2024-01-01", "end_date": "2024-03-01",
         "experts": ["FMPRating"], "initial_capital": 100000.0, "commission": 1.0,
         "slippage": 0.0, "fill_model": "next_bar_open", "seed": 42,
         "universe": {"mode": "screener", "screener_settings": {"market_cap_min": 1e9}},
     }
-    with pytest.raises(ValueError, match="screener_store"):
+    with pytest.raises(ValueError, match="metric_store not found"):
         _build_config(payload)
 
 
