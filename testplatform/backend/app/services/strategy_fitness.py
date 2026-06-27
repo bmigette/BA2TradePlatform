@@ -78,4 +78,13 @@ def compute_fitness(fitness_metric: str, results: dict) -> float:
     val = results.get(key)
     if val is None or (isinstance(val, float) and (math.isnan(val) or math.isinf(val))):
         return ZERO_TRADE_SENTINEL
-    return float(val)
+    val = float(val)
+    # Optional TRADE-FREQUENCY scale (``fitness_trade_scale``): multiply the fitness by
+    # avg_trades_per_year / 100, so a statistically thin config (few trades over the run) is
+    # down-weighted and a high-frequency one is up-weighted. ~100 trades/yr is the break-even
+    # (factor 1.0); a 16-trade/3yr config (~5/yr) is scaled x0.05, crushing lottery winners.
+    # Applied only to a POSITIVE fitness — scaling a losing (<=0) fitness toward 0 would wrongly
+    # FAVOUR a thin loser, so those are left unchanged (the GA discards them either way).
+    if results.get("fitness_trade_scale") and val > 0:
+        val *= (results.get("avg_trades_per_year") or 0.0) / 100.0
+    return val

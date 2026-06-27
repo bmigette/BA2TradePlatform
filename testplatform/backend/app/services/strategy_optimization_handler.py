@@ -854,6 +854,8 @@ def _build_daily_trial_config(
         # Portfolio-share cap (% of net profit any single trade may contribute) — same robustness
         # role as profit_cap_pct, bounding one trade's share of TOTAL return. Carried per-trial.
         "profit_share_cap_pct": backtest_cfg.get("profit_share_cap_pct"),
+        # Optional trade-frequency fitness scale (down-weight statistically thin few-trade configs).
+        "fitness_trade_scale": backtest_cfg.get("fitness_trade_scale"),
         # Optimizer-decoded condition trees: the engine builds the enter ruleset FROM buy_tree
         # (seed_ruleset_from_tree) so cond:<id>:value thresholds + on/off toggles drive entries.
         "buy_tree": decoded.get("buy_tree"),

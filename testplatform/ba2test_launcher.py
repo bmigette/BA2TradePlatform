@@ -1185,6 +1185,7 @@ def _cmd_optimize(args) -> int:
             "execution_interval": args.interval,
             "profit_cap_pct": (float(args.profit_cap_pct) if args.profit_cap_pct else None),
             "profit_share_cap_pct": (float(args.profit_share_cap_pct) if args.profit_share_cap_pct else None),
+            "fitness_trade_scale": bool(getattr(args, "fitness_trade_scale", False)),
             "backtest_id": int(_dt.now().timestamp()),
             "name": f"opt-{expert}-trial",
         }
@@ -1426,6 +1427,7 @@ def _cmd_optimize_batch(args) -> int:
                 "execution_interval": args.interval,
                 "profit_cap_pct": (float(args.profit_cap_pct) if args.profit_cap_pct else None),
                 "profit_share_cap_pct": (float(args.profit_share_cap_pct) if args.profit_share_cap_pct else None),
+                "fitness_trade_scale": bool(getattr(args, "fitness_trade_scale", False)),
                 "backtest_id": int(_dt.now().timestamp()),
                 "name": f"{name}-trial",
             }
@@ -1978,6 +1980,11 @@ def main(argv: "list | None" = None) -> int:
                          "fitness/return (e.g. 25 = no single trade may contribute >25%% of total "
                          "return). Complements --profit-cap-pct: a trade can pass the cost-basis cap "
                          "yet still dominate the book's return; this bounds that. Default: off.")
+    op.add_argument("--fitness-trade-scale", action="store_true",
+                    help="Multiply each trial's fitness by avg_trades_per_year/100, so statistically "
+                         "thin (few-trade) configs are down-weighted and high-frequency ones up-"
+                         "weighted (~100 trades/yr = break-even). Stops a 16-trade lottery winner from "
+                         "topping the search on calmar. Default: off.")
     op.add_argument("--commission", type=float, default=1.0)
     op.add_argument("--slippage", type=float, default=0.0)
     op.add_argument("--fill-model", default="next_bar_open")

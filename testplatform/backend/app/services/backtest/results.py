@@ -324,6 +324,11 @@ def _compute_metrics(
     return {
         # Basic trade metrics
         "total_trades": total_trades,
+        # Trade FREQUENCY: trades / calendar-year of the run. Used by the optional fitness
+        # trade-frequency scale (``fitness_trade_scale``) so the GA can down-weight statistically
+        # thin (few-trade) configs that win on a handful of lucky trades.
+        "avg_trades_per_year": round(_safe_float((total_trades / years) if years else 0.0), 2),
+        "fitness_trade_scale": bool(config.get("fitness_trade_scale")),
         "winning_trades": winning_trades,
         "losing_trades": losing_trades,
         "win_rate": round(_safe_float(win_rate), 2),

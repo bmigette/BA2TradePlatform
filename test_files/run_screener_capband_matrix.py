@@ -130,6 +130,10 @@ def main() -> int:
                          "fitness/return, so no single trade contributes more than this share of "
                          "total return (a trade can pass --profit-cap-pct yet still be 60%% of the "
                          "book). Default 25. Pass 0 to disable.")
+    ap.add_argument("--fitness-trade-scale", action="store_true",
+                    help="Scale each trial's fitness by avg_trades_per_year/100 so statistically thin "
+                         "(few-trade) configs are down-weighted (stops a 16-trade lottery winner from "
+                         "topping the search). Default: OFF.")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -163,6 +167,8 @@ def main() -> int:
             cmd += ["--profit-cap-pct", str(args.profit_cap_pct)]
         if args.profit_share_cap_pct and args.profit_share_cap_pct > 0:
             cmd += ["--profit-share-cap-pct", str(args.profit_share_cap_pct)]
+        if args.fitness_trade_scale:
+            cmd += ["--fitness-trade-scale"]
         if strat is not None:
             cmd += ["--strategy", strat]
         if args.workers:
