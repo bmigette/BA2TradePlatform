@@ -13,6 +13,7 @@ import {
   Settings,
   ChevronDown,
   ChevronUp,
+  ChevronsUpDown,
   BarChart3,
   Activity,
   Brain,
@@ -246,6 +247,15 @@ interface Backtest {
   completedAt: string | null;
 }
 
+
+// Sortable trade-list columns (click a header to sort by it). Numeric columns default to
+// descending on first click (biggest first); text/date columns default to ascending.
+type TradeSortField =
+  | 'symbol' | 'entryDate' | 'exitDate' | 'entryPrice' | 'exitPrice'
+  | 'direction' | 'size' | 'pnl' | 'pnlPercent' | 'duration' | 'exitReason';
+const NUMERIC_TRADE_FIELDS = new Set<TradeSortField>([
+  'entryPrice', 'exitPrice', 'size', 'pnl', 'pnlPercent', 'duration',
+]);
 
 // Human-readable trade duration. The stored avg_trade_duration / per-trade duration are in
 // fill-clock BARS (meaningless to read on a 5min clock — "30010 bars"), so we derive the real
@@ -860,6 +870,10 @@ const Backtesting: React.FC = () => {
 
   // Results view
   const [selectedBacktest, setSelectedBacktest] = useState<Backtest | null>(null);
+  // Live "a worker is actually executing this run" flag, reported by RunningJobProgress from the
+  // task queue. Lets the panel show "Running" the moment a worker picks the job up, instead of
+  // staying on "Queued — waiting for a worker" until the backtest row's own status poll catches up.
+  const [liveRunning, setLiveRunning] = useState(false);
   // Per-trade "hide" toggle (Trade List): excluded trade ids, for the on-the-fly what-if recompute
   // of the headline metrics. Session-only; cleared whenever a different backtest is selected.
   const [hiddenTradeIds, setHiddenTradeIds] = useState<Set<string>>(new Set());
@@ -886,7 +900,8 @@ const Backtesting: React.FC = () => {
   const [individualNoBacktest, setIndividualNoBacktest] = useState<OptIndividual | null>(null);
   const [activeTab, setActiveTab] = useState<'equity' | 'drawdown' | 'trades' | 'strategy'>('equity');
   const [tradeFilter, setTradeFilter] = useState<'all' | 'profit' | 'loss'>('all');
-  const [tradeSortField, setTradeSortField] = useState<'pnl' | 'date' | 'duration'>('date');
+  // Trade-list sort: any column is sortable by clicking its header (toggles direction on re-click).
+  const [tradeSortField, setTradeSortField] = useState<TradeSortField>('entryDate');
   const [tradeSortAsc, setTradeSortAsc] = useState(false);
   const [chartTrade, setChartTrade] = useState<Trade | null>(null);  // trade-list click -> daily chart
 
@@ -1750,6 +1765,9 @@ const Backtesting: React.FC = () => {
 
   // Reset the per-trade hide set whenever a different backtest is opened.
   useEffect(() => { setHiddenTradeIds(new Set()); }, [selectedBacktest?.id]);
+  // Drop the stale live-running flag when switching backtests; RunningJobProgress re-reports for
+  // the newly selected run on its next poll.
+  useEffect(() => { setLiveRunning(false); }, [selectedBacktest?.id]);
 
   // Ask the backend for an EXACT what-if recompute whenever the hidden-trade set changes (debounced).
   // The backend reconstructs the curve from the ledger + OHLCV cache, so it's accurate where the
@@ -1895,20 +1913,64 @@ const Backtesting: React.FC = () => {
       trades = trades.filter(t => t.pnl < 0);
     }
 
-    // Sort
+    // Sort. Numbers compared numerically (NaN sinks to the bottom of the chosen direction);
+    // dates/text via locale compare. Duration uses the same entry→exit elapsed time the column
+    // displays (not the bar-count `duration`), so the sort matches what's on screen.
+    const num = (v: number) => (Number.isFinite(v) ? v : Number.NEGATIVE_INFINITY);
+    const str = (v: unknown) => String(v ?? '');
     trades.sort((a, b) => {
       let cmp = 0;
-      if (tradeSortField === 'pnl') {
-        cmp = a.pnl - b.pnl;
-      } else if (tradeSortField === 'date') {
-        cmp = a.entryDate.localeCompare(b.entryDate);
-      } else if (tradeSortField === 'duration') {
-        cmp = a.duration - b.duration;
+      switch (tradeSortField) {
+        case 'symbol': cmp = str(a.symbol).localeCompare(str(b.symbol)); break;
+        case 'entryDate': cmp = str(a.entryDate).localeCompare(str(b.entryDate)); break;
+        case 'exitDate': cmp = str(a.exitDate).localeCompare(str(b.exitDate)); break;
+        case 'entryPrice': cmp = num(a.entryPrice) - num(b.entryPrice); break;
+        case 'exitPrice': cmp = num(a.exitPrice) - num(b.exitPrice); break;
+        case 'direction': cmp = str(a.direction).localeCompare(str(b.direction)); break;
+        case 'size': cmp = num(a.size) - num(b.size); break;
+        case 'pnl': cmp = num(a.pnl) - num(b.pnl); break;
+        case 'pnlPercent': cmp = num(a.pnlPercent) - num(b.pnlPercent); break;
+        case 'duration': cmp = num(tradeDurationMs(a)) - num(tradeDurationMs(b)); break;
+        case 'exitReason': cmp = str(a.exitReason).localeCompare(str(b.exitReason)); break;
       }
       return tradeSortAsc ? cmp : -cmp;
     });
 
     return trades;
+  };
+
+  // Click a trade-list header: toggle direction if it's the active column, else switch to it
+  // (numeric columns start descending = biggest first; text/date columns start ascending).
+  const handleTradeSort = (field: TradeSortField) => {
+    if (tradeSortField === field) {
+      setTradeSortAsc(a => !a);
+    } else {
+      setTradeSortField(field);
+      setTradeSortAsc(!NUMERIC_TRADE_FIELDS.has(field));
+    }
+  };
+
+  // A sortable trade-list header cell: clickable label + a direction arrow (active column) or a
+  // faint up/down hint (inactive — signals the column is sortable).
+  const tradeSortTh = (field: TradeSortField, label: string, align: 'left' | 'right' | 'center' = 'left') => {
+    const active = tradeSortField === field;
+    const alignCls = align === 'right' ? 'text-right' : align === 'center' ? 'text-center' : 'text-left';
+    const justifyCls = align === 'right' ? 'justify-end' : align === 'center' ? 'justify-center' : 'justify-start';
+    return (
+      <th className={`px-2 py-1.5 ${alignCls} text-gray-700 dark:text-gray-300`}>
+        <button
+          type="button"
+          onClick={() => handleTradeSort(field)}
+          title={`Sort by ${label}`}
+          className={`inline-flex items-center gap-1 w-full ${justifyCls} select-none hover:text-gray-900 dark:hover:text-gray-100 ${active ? 'font-semibold text-gray-900 dark:text-gray-100' : ''}`}
+        >
+          {label}
+          {active
+            ? (tradeSortAsc ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />)
+            : <ChevronsUpDown className="w-3 h-3 opacity-30" />}
+        </button>
+      </th>
+    );
   };
 
   const saveStrategy = async () => {
@@ -2170,6 +2232,9 @@ const Backtesting: React.FC = () => {
               </h3>
               <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
                 {selectedBacktest.startDate} → {selectedBacktest.endDate}
+                {(selectedBacktest.completedAt || selectedBacktest.createdAt) && (
+                  <> &middot; ran {new Date((selectedBacktest.completedAt || selectedBacktest.createdAt) as string).toLocaleString()}</>
+                )}
               </p>
             </div>
             <div className="flex items-center gap-2 shrink-0">
@@ -2200,6 +2265,10 @@ const Backtesting: React.FC = () => {
     // (the panel polls every 2s and swaps to the full dashboard on completion) instead of an
     // empty metrics dashboard, which read as "finished with nothing".
     if (selectedBacktest.status === 'pending' || selectedBacktest.status === 'running') {
+      // A worker may already be executing the run (live progress reported by RunningJobProgress)
+      // before the backtest row's own status poll flips pending->running — treat that as running so
+      // the panel doesn't keep saying "Queued — waiting for a worker" while the % bar advances.
+      const isRunning = selectedBacktest.status === 'running' || liveRunning;
       return (
         <>
           <div className="flex items-start justify-between flex-wrap gap-2">
@@ -2209,21 +2278,24 @@ const Backtesting: React.FC = () => {
               </h3>
               <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
                 {selectedBacktest.startDate} → {selectedBacktest.endDate}
+                {selectedBacktest.createdAt && (
+                  <> &middot; created {new Date(selectedBacktest.createdAt).toLocaleString()}</>
+                )}
               </p>
             </div>
             <span className="px-2 py-0.5 text-xs font-medium rounded-full bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300">
-              {selectedBacktest.status === 'pending' ? 'Queued' : 'Running'}
+              {isRunning ? 'Running' : 'Queued'}
             </span>
           </div>
           <div className="flex flex-col items-center justify-center gap-3 py-16 text-center">
             <Loader2 className="w-10 h-10 animate-spin text-blue-500" />
             <p className="text-sm font-medium text-gray-700 dark:text-gray-300">
-              {selectedBacktest.status === 'pending' ? 'Queued — waiting for a worker…' : 'Running the backtest…'}
+              {isRunning ? 'Running the backtest…' : 'Queued — waiting for a worker…'}
             </p>
             <p className="text-xs text-gray-500 dark:text-gray-400 max-w-sm">
               Results, equity curve and trades will appear here automatically when the run completes.
             </p>
-            <RunningJobProgress name={selectedBacktest.name} />
+            <RunningJobProgress name={selectedBacktest.name} onActive={setLiveRunning} />
           </div>
         </>
       );
@@ -2545,24 +2617,7 @@ const Backtesting: React.FC = () => {
                             <option value="loss">Losing</option>
                           </select>
                         </div>
-                        <div className="flex items-center gap-2">
-                          <span className="text-sm text-gray-500 dark:text-gray-400">Sort:</span>
-                          <select
-                            value={tradeSortField}
-                            onChange={e => setTradeSortField(e.target.value as 'pnl' | 'date' | 'duration')}
-                            className="text-sm border border-gray-300 dark:border-gray-600 rounded px-2 py-1 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
-                          >
-                            <option value="date">Date</option>
-                            <option value="pnl">P&L</option>
-                            <option value="duration">Duration</option>
-                          </select>
-                          <button
-                            onClick={() => setTradeSortAsc(!tradeSortAsc)}
-                            className="p-1 hover:bg-gray-100 dark:hover:bg-gray-700 rounded"
-                          >
-                            {tradeSortAsc ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
-                          </button>
-                        </div>
+                        <span className="text-xs text-gray-400 dark:text-gray-500">Click a column header to sort</span>
                       </div>
 
                       {/* Trade Table — fills the viewport height down to the bottom of the
@@ -2573,17 +2628,17 @@ const Backtesting: React.FC = () => {
                           <thead className="bg-gray-50 dark:bg-gray-700/50 sticky top-0">
                             <tr>
                               <th className="px-2 py-2 text-center text-gray-700 dark:text-gray-300" title="Hide a trade to recompute the metrics without it (what-if)"></th>
-                              <th className="px-2 py-1.5 text-left text-gray-700 dark:text-gray-300">Symbol</th>
-                              <th className="px-2 py-1.5 text-left text-gray-700 dark:text-gray-300">Entry</th>
-                              <th className="px-2 py-1.5 text-left text-gray-700 dark:text-gray-300">Exit</th>
-                              <th className="px-2 py-1.5 text-right text-gray-700 dark:text-gray-300">Entry $</th>
-                              <th className="px-2 py-1.5 text-right text-gray-700 dark:text-gray-300">Exit $</th>
-                              <th className="px-2 py-1.5 text-center text-gray-700 dark:text-gray-300">Dir</th>
-                              <th className="px-2 py-1.5 text-right text-gray-700 dark:text-gray-300">Size</th>
-                              <th className="px-2 py-1.5 text-right text-gray-700 dark:text-gray-300">P&L</th>
-                              <th className="px-2 py-1.5 text-right text-gray-700 dark:text-gray-300">P&L %</th>
-                              <th className="px-2 py-1.5 text-center text-gray-700 dark:text-gray-300">Duration</th>
-                              <th className="px-2 py-1.5 text-center text-gray-700 dark:text-gray-300">Reason</th>
+                              {tradeSortTh('symbol', 'Symbol', 'left')}
+                              {tradeSortTh('entryDate', 'Entry', 'left')}
+                              {tradeSortTh('exitDate', 'Exit', 'left')}
+                              {tradeSortTh('entryPrice', 'Entry $', 'right')}
+                              {tradeSortTh('exitPrice', 'Exit $', 'right')}
+                              {tradeSortTh('direction', 'Dir', 'center')}
+                              {tradeSortTh('size', 'Size', 'right')}
+                              {tradeSortTh('pnl', 'P&L', 'right')}
+                              {tradeSortTh('pnlPercent', 'P&L %', 'right')}
+                              {tradeSortTh('duration', 'Duration', 'center')}
+                              {tradeSortTh('exitReason', 'Reason', 'center')}
                             </tr>
                           </thead>
                           <tbody className="divide-y divide-gray-200 dark:divide-gray-700">

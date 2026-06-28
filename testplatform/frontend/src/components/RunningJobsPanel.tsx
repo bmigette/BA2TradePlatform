@@ -194,7 +194,7 @@ function fmt(v?: number, n = 2): string {
  * Polls every 2s; renders nothing until a matching running task/optimization with a progress value
  * is found.
  */
-export function RunningJobProgress({ name }: { name?: string }) {
+export function RunningJobProgress({ name, onActive }: { name?: string; onActive?: (active: boolean) => void }) {
   const [job, setJob] = useState<TaskInfo | null>(null);
   const [opt, setOpt] = useState<RunningOpt | null>(null);
   useEffect(() => {
@@ -211,15 +211,20 @@ export function RunningJobProgress({ name }: { name?: string }) {
         // detail header is the bare backtest name — so an exact match never finds a running BT
         // (only optimizations, whose task name == the opt name). Match the bare name OR a known
         // prefixed task name so the % bar shows for backtests + re-runs too.
-        setJob(tasks.find(t =>
-          t.name === name || t.name === `Daily Backtest: ${name}` || t.name === `Re-run: ${name}`) ?? null);
-        setOpt(opts.find(o => o.name === name) ?? null);
+        const j = tasks.find(t =>
+          t.name === name || t.name === `Daily Backtest: ${name}` || t.name === `Re-run: ${name}`) ?? null;
+        const o = opts.find(o => o.name === name) ?? null;
+        setJob(j);
+        setOpt(o);
+        // Tell the parent a live worker is actually executing this run, so the detail panel can
+        // say "Running" instead of "Queued" even before the backtest row's own status flips.
+        onActive?.(Boolean(j || o));
       } catch { /* keep last known progress */ }
     };
     tick();
     const id = setInterval(tick, 2000);
-    return () => { alive = false; clearInterval(id); };
-  }, [name]);
+    return () => { alive = false; clearInterval(id); onActive?.(false); };
+  }, [name, onActive]);
 
   const rawPct = job?.progress ?? opt?.progress;
   if (rawPct == null) return null;
