@@ -157,3 +157,68 @@ def test_backtest_db_fresh_per_run_and_seed_account():
         from ba2_common.core.db import get_all_instances
 
         assert get_all_instances(AccountDefinition) == []
+
+
+def test_resolver_registry_is_thread_local():
+    """Concurrent backtests register the SAME ids (account_id=1 / expert_id=1) but must NOT see
+    each other's instances. The serve runs re-runs in worker threads; a process-global registry let
+    run B's BacktestAccount overwrite run A's under id=1 -> cross-run balance corruption (negative
+    equity / divergent re-runs). Each thread must resolve only what it registered."""
+    import threading
+    from app.services.backtest.seam_wiring import wire_backtest_seams
+    from ba2_common.core.instance_resolver import get_instance_resolver
+
+    wire_backtest_seams()
+    start = threading.Barrier(3)
+    seen = {}
+
+    def worker(tag):
+        r = get_instance_resolver()
+        r.get_account_instance  # noqa: B018 — ensure attr access works per-thread
+        # Each thread registers a DIFFERENT object under the SAME id=1.
+        from app.services.backtest.seam_wiring import get_backtest_resolver
+        get_backtest_resolver().register_account(1, f"account-{tag}")
+        get_backtest_resolver().register_expert(1, f"expert-{tag}")
+        start.wait()  # all threads have registered id=1 before anyone reads
+        seen[tag] = (
+            get_instance_resolver().get_account_instance(1),
+            get_instance_resolver().get_expert_instance(1),
+        )
+
+    threads = [threading.Thread(target=worker, args=(t,)) for t in ("a", "b", "c")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # Every thread saw ITS OWN registration, not a neighbour's (no cross-thread clobber).
+    assert seen["a"] == ("account-a", "expert-a")
+    assert seen["b"] == ("account-b", "expert-b")
+    assert seen["c"] == ("account-c", "expert-c")
+
+
+def test_ohlcv_override_is_thread_local():
+    """The per-run OHLCV override must be thread-local: concurrent runs setting different overrides
+    must not clobber each other (a global override made run A read run B's prices)."""
+    import threading
+    from app.services.backtest.seam_wiring import (
+        set_backtest_ohlcv_override,
+        _current_ohlcv_override,
+    )
+
+    start = threading.Barrier(3)
+    seen = {}
+
+    def worker(tag):
+        set_backtest_ohlcv_override(f"provider-{tag}")
+        start.wait()  # all threads set their override before anyone reads
+        seen[tag] = _current_ohlcv_override()
+        set_backtest_ohlcv_override(None)
+
+    threads = [threading.Thread(target=worker, args=(t,)) for t in ("a", "b", "c")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert seen == {"a": "provider-a", "b": "provider-b", "c": "provider-c"}

@@ -21,6 +21,7 @@ Confirmed against the installed Phase-0 packages (NOT the plan's draft guesses):
 """
 from __future__ import annotations
 
+import threading
 from typing import Any, Dict, Optional
 
 from ba2_common.core.instance_resolver import (
@@ -41,18 +42,45 @@ class BacktestInstanceResolver:
     constructs the ``BacktestAccount`` + expert instances and registers them here so
     the inherited AccountInterface / TradeManager-equivalent code (which calls
     ``get_instance_resolver().get_account_instance(...)`` etc.) finds them.
+
+    Registrations are THREAD-LOCAL: the resolver is a process-wide singleton (registered
+    once into ba2_common), but every backtest registers the SAME ids (account_id=1 /
+    expert_id=1). When the serve runs re-runs CONCURRENTLY in worker threads, a process-global
+    registry would let run B's BacktestAccount overwrite run A's under id=1 — so run A's
+    inherited code resolves run B's account (its balance/positions) and the two runs corrupt
+    each other (garbage / negative-equity results). Keying the registry by thread isolates
+    concurrent runs; sequential trials in one thread are unaffected (each re-registers id=1).
     """
 
     def __init__(self) -> None:
-        self._accounts: Dict[int, Any] = {}
-        self._experts: Dict[int, Any] = {}
+        self._tl = threading.local()
+
+    def _accounts_map(self) -> Dict[int, Any]:
+        m = getattr(self._tl, "accounts", None)
+        if m is None:
+            m = self._tl.accounts = {}
+        return m
+
+    def _experts_map(self) -> Dict[int, Any]:
+        m = getattr(self._tl, "experts", None)
+        if m is None:
+            m = self._tl.experts = {}
+        return m
+
+    @property
+    def _accounts(self) -> Dict[int, Any]:
+        return self._accounts_map()
+
+    @property
+    def _experts(self) -> Dict[int, Any]:
+        return self._experts_map()
 
     # -- registration (host fills these in before driving the loop) -------------
     def register_account(self, account_id: int, instance: Any) -> None:
-        self._accounts[int(account_id)] = instance
+        self._accounts_map()[int(account_id)] = instance
 
     def register_expert(self, expert_id: int, instance: Any) -> None:
-        self._experts[int(expert_id)] = instance
+        self._experts_map()[int(expert_id)] = instance
 
     # -- InstanceResolver Protocol ----------------------------------------------
     def get_account_instance(self, account_id: int) -> Any:
@@ -128,19 +156,27 @@ def wire_backtest_seams() -> BacktestInstanceResolver:
     return _resolver
 
 
-# Per-run OHLCV provider override (process-global; set by run_daily_backtest at the start of
+# Per-run OHLCV provider override (THREAD-LOCAL; set by run_daily_backtest at the start of
 # each trial and cleared at the end). When set, the TradeConditions provider resolver returns
 # THIS provider for any ("ohlcv", *) request — so the expert's price_at_date / data-condition
 # OHLCV fetches go through the run's MemoizedOHLCVProvider (one in-memory load per worker,
-# shared across the whole GA population) instead of re-reading the disk cache every bar. Trials
-# run sequentially within a worker process, so a single global is safe.
-_ohlcv_override: Optional[Any] = None
+# shared across the whole GA population) instead of re-reading the disk cache every bar.
+#
+# Thread-local, NOT a process-global: the serve runs re-runs CONCURRENTLY in worker threads, and
+# a single global override let run B's MemoizedOHLCVProvider clobber run A's mid-run — so run A's
+# expert read run B's prices (wrong fills, negative-equity garbage). Per-thread isolates them;
+# sequential trials in one worker thread are unaffected (set at start, cleared at end).
+_ohlcv_override_tl = threading.local()
+
+
+def _current_ohlcv_override() -> Optional[Any]:
+    return getattr(_ohlcv_override_tl, "provider", None)
 
 
 def set_backtest_ohlcv_override(provider: Optional[Any]) -> None:
-    """Install (or clear, with None) the per-run OHLCV provider the resolver hands experts."""
-    global _ohlcv_override
-    _ohlcv_override = provider
+    """Install (or clear, with None) the per-run OHLCV provider the resolver hands experts.
+    Thread-local — only affects the calling thread's backtest."""
+    _ohlcv_override_tl.provider = provider
 
 
 def _wire_provider_resolver() -> None:
@@ -155,8 +191,9 @@ def _wire_provider_resolver() -> None:
     from ba2_providers import get_provider  # ba2_providers is allowed here (host side)
 
     def _resolve(category: str, name: str, **kwargs: Any) -> Any:
-        if category == "ohlcv" and _ohlcv_override is not None:
-            return _ohlcv_override
+        override = _current_ohlcv_override()
+        if category == "ohlcv" and override is not None:
+            return override
         return get_provider(category, name, **kwargs)
 
     TradeConditions.set_provider_resolver(_resolve)

@@ -509,6 +509,7 @@ def run_daily_backtest(
         trades.
     """
     from ba2_common.core.db import activity_logging_disabled
+    from ba2_common.logger import file_logging_disabled
     from ba2_providers import get_provider
     from ba2_providers.fmp_common import frozen_ttl_cache, hermetic_fmp_history
 
@@ -592,8 +593,12 @@ def run_daily_backtest(
     _persist_db = bool(config.get("persist_trading_db", False))
     # hermetic_fmp_history(): a backtest must run from PRE-WARMED caches only (0 network fetches);
     # a missing per-symbol history raises FMPHistoryCacheMiss instead of silently fetching mid-run.
+    # file_logging_disabled(): file logging is LIVE-only — suppress the rotating FILE handlers for
+    # this run so in-process re-run worker THREADS (serve) never race on RotatingFileHandler
+    # rollover/close ("I/O operation on closed file"). STDOUT still logs.
     with backtest_trading_db(config["backtest_id"], in_memory=not _persist_db), \
-            frozen_ttl_cache(), hermetic_fmp_history(), activity_logging_disabled():
+            frozen_ttl_cache(), hermetic_fmp_history(), activity_logging_disabled(), \
+            file_logging_disabled():
         seed_account_definition(account_id, config["account_settings"])
 
         # Time-machine price source backed by the FMP OHLCV provider (as_of-aware).

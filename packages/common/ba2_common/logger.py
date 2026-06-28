@@ -4,6 +4,8 @@ from ba2_common.config import STDOUT_LOGGING, FILE_LOGGING, HOME, HOME_PARENT, L
 import os
 import io
 import sys
+import threading
+from contextlib import contextmanager
 from typing import Optional
 
 logger = logging.getLogger("ba2_common")
@@ -25,6 +27,49 @@ LOGS_DIR = LOG_FOLDER
 
 # Configure our handlers
 formatter = logging.Formatter(LOG_FORMAT)
+
+# --- Thread-scoped file-logging suppression (backtests) --------------------------------------
+# File logging is for LIVE only. A backtest emits very high-throughput per-bar/per-expert logs; in
+# the long-lived serve process re-runs execute in WORKER THREADS that share the rotating file
+# handlers (app.log + the shared all.debug/all.error attached to every expert logger). Python's
+# Logger.callHandlers iterates a logger's handlers WITHOUT the module lock, so when one thread's
+# RotatingFileHandler rollover (or reconfigure_file_logging) CLOSES a handler stream while another
+# re-run thread is mid-emit, that thread writes to a closed stream -> "I/O operation on closed file"
+# (the exact failure that killed the persisted top-N re-runs). Rather than make the handlers
+# multiprocess/thread rollover-safe, we simply skip FILE emission for the duration of a backtest on
+# the CURRENT thread (STDOUT is untouched — it's captured in the serve log). Spawned GA pool workers
+# already disable file logging entirely via BA2_FILE_LOGGING=0; this covers the in-process path.
+_file_suppress = threading.local()
+
+
+class _SuppressFileDuringBacktest(logging.Filter):
+    """Drops a record from a FILE handler while the current thread is inside file_logging_disabled()."""
+    def filter(self, record: logging.LogRecord) -> bool:  # True => keep, False => drop
+        return not getattr(_file_suppress, "on", False)
+
+
+# One shared filter instance attached to every rotating FILE handler we create (below).
+_FILE_SUPPRESS_FILTER = _SuppressFileDuringBacktest()
+
+
+@contextmanager
+def file_logging_disabled():
+    """Thread-scoped: suppress emission to the rotating FILE handlers for the duration (STDOUT keeps
+    logging). Wrap backtest execution with this so in-process worker threads never race on
+    RotatingFileHandler rollover/close. Nests safely; no-op cost when FILE_LOGGING is already off."""
+    prev = getattr(_file_suppress, "on", False)
+    _file_suppress.on = True
+    try:
+        yield
+    finally:
+        _file_suppress.on = prev
+
+
+def _attach_suppress(handler: RotatingFileHandler) -> RotatingFileHandler:
+    """Attach the backtest file-suppression filter to a rotating file handler (idempotent)."""
+    if _FILE_SUPPRESS_FILTER not in handler.filters:
+        handler.addFilter(_FILE_SUPPRESS_FILTER)
+    return handler
 
 if STDOUT_LOGGING:
     # Create a safe StreamHandler that handles Unicode characters
@@ -64,10 +109,11 @@ def _get_all_debug_handler() -> Optional[RotatingFileHandler]:
         backupCount=7,
         encoding='utf-8'
     )
-    
+
     _all_debug_handler.setFormatter(logging.Formatter(LOG_FORMAT))
     _all_debug_handler.setLevel(logging.DEBUG)
-    
+    _attach_suppress(_all_debug_handler)
+
     return _all_debug_handler
 
 def _get_all_error_handler() -> Optional[RotatingFileHandler]:
@@ -96,10 +142,11 @@ def _get_all_error_handler() -> Optional[RotatingFileHandler]:
         backupCount=7,
         encoding='utf-8'
     )
-    
+
     _all_error_handler.setFormatter(logging.Formatter(LOG_FORMAT))
     _all_error_handler.setLevel(logging.ERROR)  # Only ERROR and above
-    
+    _attach_suppress(_all_error_handler)
+
     return _all_error_handler
 
 def _install_app_file_handlers() -> None:
@@ -116,12 +163,14 @@ def _install_app_file_handlers() -> None:
     )
     debug_fh.setFormatter(fmt)
     debug_fh.setLevel(logging.DEBUG)
+    _attach_suppress(debug_fh)
     logger.addHandler(debug_fh)
     info_fh = RotatingFileHandler(
         os.path.join(LOGS_DIR, "app.log"), maxBytes=(1024*1024*10), backupCount=7, encoding='utf-8'
     )
     info_fh.setFormatter(fmt)
     info_fh.setLevel(logging.INFO)
+    _attach_suppress(info_fh)
     logger.addHandler(info_fh)
     adh = _get_all_debug_handler()
     if adh:
@@ -220,6 +269,7 @@ def get_expert_logger(expert_class: str, expert_id: int) -> logging.Logger:
         )
         file_handler.setLevel(logging.DEBUG)
         file_handler.setFormatter(file_formatter)
+        _attach_suppress(file_handler)
         expert_logger.addHandler(file_handler)
         
         # Add the shared all.debug.log handler to this expert logger
@@ -287,6 +337,7 @@ def reconfigure_file_logging(log_dir: str) -> None:
         )
         efh.setLevel(logging.DEBUG)
         efh.setFormatter(efmt)
+        _attach_suppress(efh)
         elog.addHandler(efh)
         if adh:
             elog.addHandler(adh)
