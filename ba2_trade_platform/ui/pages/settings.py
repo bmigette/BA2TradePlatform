@@ -3717,9 +3717,19 @@ class ExpertSettingsTab:
                     expert_settings = import_data.get('expert_settings', {})
                     expert_type = import_data.get('expert_type')
                     instruments_data = import_data.get('instruments', {})
-                    
+
+                    # Accept a SAVED-BACKTEST expert-settings export (test platform): it names the
+                    # class as ``expert`` and nests the tuned params under ``settings.expert_params``
+                    # (with tp/sl alongside). Map those onto the live import fields so a backtested
+                    # strategy's expert settings import directly.
+                    if not expert_type:
+                        expert_type = import_data.get('expert') or import_data.get('expert_class')
+                    if not expert_settings:
+                        _bt_settings = import_data.get('settings') or {}
+                        expert_settings = dict(_bt_settings.get('expert_params') or {})
+
                     logger.info(f'Extracted expert_type: {expert_type}')
-                    
+
                     if not expert_type:
                         logger.error(f'Import file missing expert_type field. Available keys: {list(import_data.keys())}')
                         ui.notify('Import file missing expert_type field', type='negative')

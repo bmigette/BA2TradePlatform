@@ -143,6 +143,20 @@ class RulesExportImportUI:
                             
                         data = json.loads(content)
 
+                        # A SAVED-BACKTEST ruleset export (test platform) carries condition TREES
+                        # (buy/sell/exit) and no ``export_type`` — convert it to the live rulesets
+                        # export format via the shared converter so it imports like a native export.
+                        if data.get('export_type') is None and any(
+                            k in data for k in ('buy_entry_conditions', 'sell_entry_conditions', 'exit_conditions')
+                        ):
+                            from ba2_common.core.rules_convert import strategy_to_live_export
+                            data = strategy_to_live_export(
+                                buy_tree=data.get('buy_entry_conditions'),
+                                sell_tree=data.get('sell_entry_conditions'),
+                                exit_rules=data.get('exit_conditions') or [],
+                                name=data.get('name') or 'backtest-strategy',
+                            )
+
                         # Determine import type
                         import_type = data.get('export_type')
                         if import_type in ['ruleset', 'rulesets', 'rule', 'rules']:
