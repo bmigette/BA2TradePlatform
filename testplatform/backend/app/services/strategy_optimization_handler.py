@@ -818,13 +818,19 @@ def _build_daily_trial_config(
     # runs -> the engine's gating is a no-op and the config is byte-identical to before.
     screener_runtime = None
     if hoisted and hoisted.get("screener_store"):
+        from ba2_providers.screener.metric_store import normalize_screener_settings
         eff = {
             **(hoisted.get("screener_base") or {}),
             **(decoded.get("screener_overrides") or {}),
         }
+        # NORMALIZE the effective settings to the metric store's unprefixed keys. The merged
+        # base+gene dict carries ``screener_``-prefixed keys (gene namespace); without this the
+        # engine's per-bar gate (metric_store.screen_universe_for_day, which reads UNPREFIXED keys)
+        # silently ignored every criterion except ``market_cap_max`` — the screener-settings-opt
+        # bug. This makes the optimizer gate apply the SAME criteria as the standalone/UI path.
         screener_runtime = {
             "store": hoisted["screener_store"],
-            "settings": eff,
+            "settings": normalize_screener_settings(eff),
             "cadence_days": hoisted.get("screener_cadence_days", 7),
         }
 

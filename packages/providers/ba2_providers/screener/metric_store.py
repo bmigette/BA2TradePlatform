@@ -588,6 +588,34 @@ def recompute_price_drop_columns(store_dir: str, ohlcv_get, *,
             "max_lookback": int(max_lookback), "drop_days": int(drop_days)}
 
 
+# The UNPREFIXED keys ``screen_universe_for_day`` (below) actually reads. The UI / optimizer /
+# saved ``screener_settings`` may carry a ``screener_`` prefix (base-interface naming) and extra
+# keys the metric store doesn't use — ``normalize_screener_settings`` maps an arbitrary settings
+# dict to exactly this recognized, unprefixed subset so the per-bar gate gets a clean dict. This is
+# the SINGLE source of truth for the recognized key vocabulary (the gate and the normalizer live
+# together so they can't drift). Callers: daily_backtest_handler (UI/standalone path) AND
+# strategy_optimization_handler (optimizer path) — both must normalize before the gate, else the
+# prefixed keys are silently ignored and only ``market_cap_max`` filters.
+_METRIC_STORE_KEYS = (
+    "market_cap_min", "market_cap_max", "price_min", "price_max",
+    "volume_min", "volume_max", "float_min", "float_max",
+    "relative_volume_min", "price_drop_pct", "price_drop_days",
+    "weinstein_stage2_only", "max_stocks", "sort_metric",
+)
+
+
+def normalize_screener_settings(screener_settings: Dict[str, Any]) -> Dict[str, Any]:
+    """Map an arbitrary ``screener_settings`` dict to the metric store's recognized, UNPREFIXED key
+    subset: strip a leading ``screener_`` prefix, drop keys the store doesn't use and ``None``
+    values. The result is what ``screen_universe_for_day`` / ``screen_universe_as_of`` expect."""
+    out: Dict[str, Any] = {}
+    for k, v in (screener_settings or {}).items():
+        key = k[len("screener_"):] if k.startswith("screener_") else k
+        if key in _METRIC_STORE_KEYS and v is not None:
+            out[key] = v
+    return out
+
+
 def screen_universe_for_day(store_df: "pd.DataFrame", day: str,
                             settings: Dict[str, Any]) -> List[str]:
     """The dynamic per-day universe for one individual's screener thresholds.

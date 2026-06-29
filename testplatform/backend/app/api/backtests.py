@@ -393,8 +393,16 @@ def _create_daily_expert_backtest(backtest: "BacktestCreate", db: Session) -> di
         # caller omits it — the task's _resolve_screener_store validates it actually exists and
         # fails with an actionable "build it first" message otherwise. Matches _build_config so a
         # screener BT 'just works' against the built store without re-specifying the path.
+        import os
         from ba2_common.config import SCREENER_STORE_DIR
         screener_store = universe.get("screener_store") or SCREENER_STORE_DIR
+        # Portability: an EXPORTED screener backtest bakes in the absolute store path of the machine
+        # it was created on (e.g. a Windows 'C:\\Users\\...\\metric_store'). Importing/Loading it on
+        # another box would fail with 'metric_store not found'. Remap a missing store to THIS box's
+        # canonical SCREENER_STORE_DIR (mirrors rerun_handler._build_optimization_rerun_config). The
+        # task's _resolve_screener_store still fails loudly if the local store is also absent.
+        if not os.path.isdir(screener_store):
+            screener_store = SCREENER_STORE_DIR
         screener_universe = {
             "mode": "screener",
             "screener_store": screener_store,

@@ -257,29 +257,10 @@ def handle_daily_backtest(task_id: str, payload: Dict[str, Any]) -> Dict[str, An
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-# metric_store.screen_universe_as_of reads these UNPREFIXED keys (see ba2_providers.screener
-# .metric_store.screen_universe_for_day). The UI / saved screener_settings may carry a
-# ``screener_`` prefix (base-interface naming) and extra keys metric_store doesn't use
-# (float_* mapped above) — map to the recognized subset so the per-bar gate gets a clean dict.
-# ``price_drop_days`` is the OPTIMIZABLE lookback window Y: it selects the precomputed
-# ``price_drop_pct_<Y>`` column in a multi-window store (falls back to the legacy single-window
-# ``price_drop_pct`` column when absent), with ``price_drop_pct`` as the threshold.
-_METRIC_STORE_KEYS = (
-    "market_cap_min", "market_cap_max", "price_min", "price_max",
-    "volume_min", "volume_max", "float_min", "float_max",
-    "relative_volume_min", "price_drop_pct", "price_drop_days",
-    "weinstein_stage2_only", "max_stocks", "sort_metric",
-)
-
-
-def _metric_store_settings(screener_settings: Dict[str, Any]) -> Dict[str, Any]:
-    """Map a universe ``screener_settings`` dict to metric_store's unprefixed key subset."""
-    out: Dict[str, Any] = {}
-    for k, v in (screener_settings or {}).items():
-        key = k[len("screener_"):] if k.startswith("screener_") else k
-        if key in _METRIC_STORE_KEYS and v is not None:
-            out[key] = v
-    return out
+# The metric-store key normalizer now lives in ba2_providers.screener.metric_store (next to the
+# gate that consumes the keys — single source of truth, so the optimizer path can reuse it too).
+# Kept as a thin re-export so existing call sites in this module are unchanged.
+from ba2_providers.screener.metric_store import normalize_screener_settings as _metric_store_settings
 
 
 def _resolve_screener_store(universe: Dict[str, Any]) -> str:

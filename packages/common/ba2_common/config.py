@@ -67,6 +67,14 @@ OPENAI_BACKEND_URL="https://api.openai.com/v1"  # Default OpenAI API endpoint
 # Price cache duration in seconds
 PRICE_CACHE_TIME = 60  # Default to 60 seconds
 
+# Backtest in-memory OHLCV residency window (months). The backtest walks time forward and never
+# needs future bars, so the price source holds only a rolling window of recent bars per symbol and
+# loads the next window lazily as the clock consumes it — bounding worker memory by TIME instead of
+# loading every symbol's full multi-year series at once (which OOM'd whole-universe experts like
+# FactorRanker). Must comfortably exceed the largest runtime indicator lookback + warmup (~60d).
+# Env-overridable; raise it to trade memory for fewer parquet re-reads.
+BACKTEST_OHLCV_WINDOW_MONTHS = int(os.getenv("BACKTEST_OHLCV_WINDOW_MONTHS", "6"))
+
 # Database performance logging threshold in milliseconds
 # Only log DB operations (queries, lock waits) exceeding this threshold
 # Set DB_PERF_LOG_THRESHOLD_MS in .env to override

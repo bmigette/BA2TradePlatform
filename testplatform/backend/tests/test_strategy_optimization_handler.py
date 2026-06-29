@@ -567,9 +567,62 @@ def test_build_daily_trial_config_non_bypass_screener_untouched():
     assert "universe_source" not in settings
     assert "screener_store" not in settings
     assert "screener_market_cap_min" not in settings
-    # The classic gate still carries the screener for the non-bypass path.
+    # The classic gate still carries the screener for the non-bypass path — and its settings are
+    # NORMALIZED to the metric store's UNPREFIXED keys (the screener-settings-opt bug fix: the gate
+    # reads unprefixed keys, so a prefixed key here would be silently ignored).
     assert cfg["screener_runtime"] is not None
-    assert cfg["screener_runtime"]["settings"]["screener_market_cap_min"] == 5e9
+    assert cfg["screener_runtime"]["settings"]["market_cap_min"] == 5e9
+    assert "screener_market_cap_min" not in cfg["screener_runtime"]["settings"]
+
+
+def test_build_daily_trial_config_screener_gate_applies_all_criteria():
+    """Regression for the screener-settings-opt bug: every optimized screener criterion must reach
+    the per-bar gate as an UNPREFIXED key (base overlaid with per-individual genes). Previously only
+    ``market_cap_max`` survived because the prefixed keys were passed through verbatim."""
+    backtest_cfg = {
+        "backtest_id": 13,
+        "start_date": "2024-01-02",
+        "end_date": "2024-01-08",
+        "enabled_instruments": ["AAPL", "MSFT"],
+        "experts": [{"class": "FMPRating", "settings": {}}],
+        "initial_capital": 100000.0,
+        "account_settings": {"starting_cash": 100000.0},
+        "warmup_days": 30,
+        "seed": 42,
+        "screener_opt": {"store": "/tmp/mstore_unit", "base_settings": {"market_cap_max": 1e10}, "cadence_days": 7},
+    }
+    hoisted = {
+        "backtest_cfg": backtest_cfg,
+        "screener_store": "/tmp/mstore_unit",
+        "screener_base": {"market_cap_max": 1e10},  # run-level base (unprefixed here)
+        "screener_cadence_days": 7,
+        "screener_apply_to_expert_settings": False,
+    }
+    decoded = {
+        "tp": 8.0, "sl": 3.0, "expert_overrides": {},
+        "screener_overrides": {
+            "screener_market_cap_min": 6e9, "screener_relative_volume_min": 1.9,
+            "screener_price_drop_pct": 12.0, "screener_max_stocks": 20,
+        },
+        "buy_tree": None, "sell_tree": None, "exit_rules": [],
+    }
+    gate = H._build_daily_trial_config(backtest_cfg, decoded, hoisted)["screener_runtime"]["settings"]
+    assert gate == {
+        "market_cap_max": 1e10, "market_cap_min": 6e9,
+        "relative_volume_min": 1.9, "price_drop_pct": 12.0, "max_stocks": 20,
+    }
+    assert not any(k.startswith("screener_") for k in gate)
+
+
+def test_normalize_screener_settings_strips_prefix_and_drops_unknown():
+    """The shared normalizer: strip ``screener_`` prefix, keep only recognized keys, drop None."""
+    from ba2_providers.screener.metric_store import normalize_screener_settings
+    out = normalize_screener_settings({
+        "screener_market_cap_min": 6e9, "market_cap_max": 1e10,
+        "screener_max_stocks": 20, "screener_relative_volume_min": None,  # None dropped
+        "bogus_key": 123, "screener_unknown": 1,                          # unknown dropped
+    })
+    assert out == {"market_cap_min": 6e9, "market_cap_max": 1e10, "max_stocks": 20}
 
 
 def test_all_trials_failing_marks_optimization_failed():

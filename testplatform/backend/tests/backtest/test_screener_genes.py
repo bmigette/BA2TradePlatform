@@ -77,10 +77,13 @@ def test_trial_config_carries_screener_runtime(tmp_path):
     rt = cfg["screener_runtime"]
     assert rt["store"] == store
     assert rt["cadence_days"] == 7
-    # The per-individual override wins over the base; base-only keys survive.
-    assert rt["settings"]["screener_market_cap_min"] == 2.5e9
-    assert rt["settings"]["screener_relative_volume_min"] == 1.5   # override beats base 1.2
-    assert rt["settings"]["screener_max_stocks"] == 10             # base-only, preserved
+    # The per-individual override wins over the base; base-only keys survive. Gate settings are
+    # NORMALIZED to the metric store's UNPREFIXED keys (screener-settings-opt fix) — a prefixed key
+    # would be silently ignored by screen_universe_for_day.
+    assert rt["settings"]["market_cap_min"] == 2.5e9
+    assert rt["settings"]["relative_volume_min"] == 1.5   # override beats base 1.2
+    assert rt["settings"]["max_stocks"] == 10             # base-only, preserved
+    assert not any(k.startswith("screener_") for k in rt["settings"])
 
     # A run WITHOUT screener_opt -> hoisted has no store -> screener_runtime is None (no-op).
     plain = {k: v for k, v in backtest_cfg.items() if k != "screener_opt"}
