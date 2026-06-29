@@ -46,6 +46,15 @@ def initialize_system():
     """Initialize the system components."""
     from ba2_trade_platform.logger import logger
     import ba2_trade_platform.config as config
+    from ba2_trade_platform.version import APP_VERSION
+
+    # Print the running build up-front so it's unambiguous which version/instance is
+    # live (port + db) — the editable install means a process keeps the code it was
+    # started with until restarted, so this is the source of truth for "what's running".
+    logger.info(
+        f"========== BA2 Trade Platform v{APP_VERSION} starting "
+        f"(port {config.HTTP_PORT}, db {config.DB_FILE}) =========="
+    )
 
     # Phase 6: wire the extracted-package seams (ba2_common / ba2_providers /
     # ba2_experts) to the live implementations BEFORE any DB / provider / expert /
