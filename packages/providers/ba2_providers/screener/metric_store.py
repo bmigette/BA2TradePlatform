@@ -261,6 +261,24 @@ def _drop_pct_windows(close: "pd.Series", max_window: int) -> Dict[int, "pd.Seri
     return out
 
 
+def momentum_12_1_series(close: "pd.Series", lookback: int = 252, skip: int = 21) -> "pd.Series":
+    """Per-bar 12-1 momentum, vectorised 1:1 with ``ba2_experts.FactorRanker.factors.momentum_12_1``.
+
+    That factor, on a series ending at bar D, is ``P[-skip-1] / P[-lookback] - 1`` (skip the most
+    recent ``skip`` days to dodge short-term reversal), 0.0 when fewer than ``lookback`` bars or the
+    start price <= 0. ``iloc[-lookback]`` == ``shift(lookback-1)`` and ``iloc[-skip-1]`` ==
+    ``shift(skip)``, so at every bar D this is ``close.shift(skip) / close.shift(lookback-1) - 1``.
+    NaN until ``lookback`` bars exist (the factor's <lookback -> 0.0 case); the consumer maps NaN
+    AND non-positive-start to 0.0 so the precomputed value is byte-identical to the runtime factor.
+    Precomputing it lets FactorRanker read momentum point-in-time from the store instead of fetching
+    ~400 days of daily closes per symbol per rebalance (the dominant FactorRanker memory + CPU cost)."""
+    c = close.astype(float)
+    p_start = c.shift(lookback - 1)
+    p_end = c.shift(skip)
+    mom = p_end / p_start - 1.0
+    return mom.where(p_start > 0)  # NaN where insufficient history or non-positive start
+
+
 def compute_daily_metrics(ohlcv: "pd.DataFrame",
                           market_cap_series: Optional["pd.Series"] = None,
                           float_series: Optional["pd.Series"] = None,
@@ -316,6 +334,8 @@ def compute_daily_metrics(ohlcv: "pd.DataFrame",
     # Weinstein stage (price vs RISING 150-session/30-week SMA) — vectorised 1:1 with
     # ba2_common.core.weinstein.classify_weinstein_stage. NaN until enough history.
     stage = weinstein_stage_series(close)
+    # 12-1 momentum, precomputed so FactorRanker reads it point-in-time (no per-rebalance OHLCV fetch).
+    momentum = momentum_12_1_series(close)
     out = pd.DataFrame({
         "close": close,
         "market_cap": mcap,
@@ -323,6 +343,7 @@ def compute_daily_metrics(ohlcv: "pd.DataFrame",
         "relative_volume": rvol.round(4),
         "price_drop_pct": drop_pct.round(4),
         "weinstein_stage": stage,
+        "momentum_12_1": momentum.round(6),
         "float_shares": flt,
     })
     for _col, _ser in windowed.items():
