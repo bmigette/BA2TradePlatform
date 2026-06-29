@@ -342,6 +342,23 @@ def _entry_rule(name: str, side_action: str, tree: dict, order_index: int) -> Op
     }
 
 
+def _or_branches(tree: Optional[dict]) -> List[dict]:
+    """Top-level OR branches of an entry tree, each an AND-group -> ONE live rule.
+
+    The live model expresses OR via MULTIPLE rules in a ruleset (any rule's ANDed triggers match
+    -> enter); within a rule triggers are ANDed. ``triggers_from_condition_tree`` flattens ALL
+    leaves of a tree into one ANDed dict, so a top-level OR of N AND-groups MUST be split into N
+    rules here — otherwise the whole strategy collapses into one rule with every trigger ANDed,
+    which never matches. Mirrors the forward ``groups_to_tree`` (which OR-combines N groups).
+    AND/leaf trees yield a single branch (the tree itself)."""
+    if not tree:
+        return []
+    op = str(tree.get("operator") or tree.get("type") or "AND").upper()
+    if op == "OR":
+        return [b for b in (tree.get("conditions") or []) if b]
+    return [tree]
+
+
 def strategy_to_live_export(
     buy_tree: Optional[dict] = None,
     sell_tree: Optional[dict] = None,
@@ -356,14 +373,15 @@ def strategy_to_live_export(
     Rulesets/rules with no usable content are omitted.
     """
     enter_rules: List[dict] = []
-    if buy_tree:
-        r = _entry_rule(f"{name}-buy", BUY_ACTION, buy_tree, len(enter_rules))
-        if r is not None:
-            enter_rules.append(r)
-    if sell_tree:
-        r = _entry_rule(f"{name}-sell", SELL_ACTION, sell_tree, len(enter_rules))
-        if r is not None:
-            enter_rules.append(r)
+    for side_tree, side_action, side in ((buy_tree, BUY_ACTION, "buy"), (sell_tree, SELL_ACTION, "sell")):
+        branches = _or_branches(side_tree)
+        for j, branch in enumerate(branches):
+            # One live rule PER OR-branch (suffix only when there's more than one, to keep names
+            # stable for single-group strategies).
+            rname = f"{name}-{side}" + (f"-{j + 1}" if len(branches) > 1 else "")
+            r = _entry_rule(rname, side_action, branch, len(enter_rules))
+            if r is not None:
+                enter_rules.append(r)
 
     op_rules: List[dict] = []
     for i, rule in enumerate(exit_rules or []):

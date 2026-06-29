@@ -149,6 +149,35 @@ def test_strategy_to_live_export_roundtrips():
     assert again["exit_conditions"][0]["action"] == "close"
 
 
+def test_strategy_to_live_export_splits_or_branches_into_rules():
+    """A top-level OR of N AND-groups must export as N separate enter rules (live ORs rules within a
+    ruleset). Regression: it used to collapse into ONE rule with every trigger ANDed -> never
+    matched."""
+    buy_tree = {
+        "operator": "OR",
+        "conditions": [
+            {"operator": "AND", "conditions": [
+                {"field": "bullish", "fieldType": "flag"},
+                {"field": "confidence", "comparison": ">=", "value": 64, "fieldType": "number"},
+                {"field": "long_term", "fieldType": "flag"},
+            ]},
+            {"operator": "AND", "conditions": [
+                {"field": "bullish", "fieldType": "flag"},
+                {"field": "short_term", "fieldType": "flag"},
+            ]},
+        ],
+    }
+    exported = strategy_to_live_export(buy_tree=buy_tree, sell_tree=None, exit_rules=[], name="s")
+    enter = next(rs for rs in exported["rulesets"] if rs["subtype"] == "enter_market")
+    assert len(enter["rules"]) == 2  # one rule per OR branch, NOT one mega-ANDed rule
+    # branch 1 has 3 ANDed triggers, branch 2 has 2 — never merged
+    assert {len(r["triggers"]) for r in enter["rules"]} == {3, 2}
+    # round-trips back to an OR with 2 branches
+    again = live_export_to_strategy(exported)
+    assert again["buy_entry_conditions"]["operator"] == "OR"
+    assert len(again["buy_entry_conditions"]["conditions"]) == 2
+
+
 def test_unknown_event_type_does_not_raise():
     payload = {"export_type": "rule", "rule": {
         "name": "BUY", "subtype": "enter_market",
