@@ -817,7 +817,9 @@ def _build_daily_trial_config(
     # screened universe (latest scan <= bar; cadence held between scans). Absent for non-screener
     # runs -> the engine's gating is a no-op and the config is byte-identical to before.
     screener_runtime = None
+    screener_candidate: Optional[List[str]] = None
     if hoisted and hoisted.get("screener_store"):
+        from ba2_providers.screener import metric_store as _ms
         from ba2_providers.screener.metric_store import normalize_screener_settings
         eff = {
             **(hoisted.get("screener_base") or {}),
@@ -828,11 +830,28 @@ def _build_daily_trial_config(
         # engine's per-bar gate (metric_store.screen_universe_for_day, which reads UNPREFIXED keys)
         # silently ignored every criterion except ``market_cap_max`` — the screener-settings-opt
         # bug. This makes the optimizer gate apply the SAME criteria as the standalone/UI path.
+        eff_norm = normalize_screener_settings(eff)
         screener_runtime = {
             "store": hoisted["screener_store"],
-            "settings": normalize_screener_settings(eff),
+            "settings": eff_norm,
             "cadence_days": hoisted.get("screener_cadence_days", 7),
         }
+        # CANDIDATE BOUND (non-bypass): restrict the loaded universe to the symbols THIS trial's
+        # screen can EVER select over [start,end] (screened_symbol_union with the trial's own eff
+        # settings), intersected with the band. The per-bar gate already restricts ENTRIES to a
+        # subset of this, so results are IDENTICAL — but the engine no longer preloads/analyses the
+        # whole band (e.g. 814 -> ~150 symbols), the dominant screener-opt memory + CPU cost. Matches
+        # the standalone path's _resolve_enabled_instruments. Bypass experts keep the full band (they
+        # rank the whole universe). Exact per-trial bound — no gene-tightening assumption.
+        if not bypass:
+            try:
+                _df = _ms.load_store(hoisted["screener_store"])
+                _sd = str(backtest_cfg["start_date"])[:10]
+                _ed = str(backtest_cfg["end_date"])[:10]
+                _union = set(_ms.screened_symbol_union(_df, _sd, _ed, eff_norm))
+                screener_candidate = [s for s in backtest_cfg["enabled_instruments"] if s in _union]
+            except Exception:  # noqa: BLE001 — never break a trial on the optimization; fall back to full band
+                screener_candidate = None
 
     # UNIQUE per-trial id: parallel trials each name their OWN per-run sqlite, so they never
     # collide on the same file (WinError 32 / cross-thread session). The run-level id is a base.
@@ -843,7 +862,10 @@ def _build_daily_trial_config(
         "name": backtest_cfg.get("name", f"opt-trial-{trial_id}"),
         "start_date": backtest_cfg["start_date"],
         "end_date": backtest_cfg["end_date"],
-        "enabled_instruments": list(backtest_cfg["enabled_instruments"]),
+        "enabled_instruments": (
+            list(screener_candidate) if screener_candidate is not None
+            else list(backtest_cfg["enabled_instruments"])
+        ),
         "experts": experts_out,
         "initial_capital": float(backtest_cfg["initial_capital"]),
         "account_settings": backtest_cfg["account_settings"],

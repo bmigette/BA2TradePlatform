@@ -249,12 +249,18 @@ class AsOfPriceSource:
             # (hermetic mode); collect those and fail once, loudly, after the loop (the user asked
             # for a hard error naming what to cache — never a silent skip).
             try:
-                df = self._ohlcv.get_ohlcv_data(
-                    sym,
-                    start_date=fetch_start,
-                    end_date=end,
-                    interval=self._interval,
-                )
+                # Prefer a NON-memoizing read so preload doesn't also stuff every symbol's full
+                # series into _FULL_SERIES_MEMO (the columnar store below + _WORKER_BAR_CACHE already
+                # provide the per-symbol cache + cross-individual reuse). Double-caching the whole
+                # universe was the screener/FactorRanker OOM. Fixture providers lack read_window ->
+                # fall back to get_ohlcv_data.
+                _reader = getattr(self._ohlcv, "read_window", None)
+                if _reader is not None:
+                    df = _reader(sym, fetch_start, end, self._interval)
+                else:
+                    df = self._ohlcv.get_ohlcv_data(
+                        sym, start_date=fetch_start, end_date=end, interval=self._interval,
+                    )
             except BacktestCacheMiss:
                 missing.append(sym)
                 continue
@@ -629,61 +635,77 @@ class MemoizedOHLCVProvider:
             pass
         return None
 
-    def _full(self, symbol: str, interval: str):
+    def read_window(self, symbol: str, start_date: Any, end_date: Any, interval: str):
+        """Load+slice a symbol's series WITHOUT populating the persistent ``_FULL_SERIES_MEMO``.
+
+        ``AsOfPriceSource.preload`` uses this: it builds its OWN columnar store (and reuses it
+        across GA individuals via ``_WORKER_BAR_CACHE``), so also caching every symbol's FULL
+        series in ``_FULL_SERIES_MEMO`` was redundant double-caching that loaded the whole
+        universe twice and OOM'd whole-universe experts (e.g. FactorRanker). The memo still fills
+        LAZILY for genuine expert ``get_ohlcv_data`` requests (indicators/ATR), preserving its
+        cross-individual reuse for those — preload just stops bloating it."""
+        df, dates = self._load(symbol, interval)
+        return self._slice(df, dates, start_date, end_date)
+
+    def _load(self, symbol: str, interval: str):
+        """Read + parse a symbol's bounded series -> (df, dates). No memoization (caller decides)."""
         import numpy as np
         import pandas as pd
 
-        key = (symbol, interval, _to_utc(self._bs).isoformat(), _to_utc(self._be).isoformat())
-        hit = _FULL_SERIES_MEMO.get(key)
-        if hit is None:
-            if self._cached_only:
-                # Hermetic: read from the on-disk caches only (both layouts). Absent from every
-                # layout -> hard error (aggregated by preload), never a silent skip or live fetch.
-                df = self._read_cached_df(symbol, interval)
-                if df is None:
-                    # Only a REAL, network-backed provider (FMPOHLCVProvider et al — they expose
-                    # get_provider_name) must error on miss; an in-memory test/synthetic provider
-                    # (no get_provider_name, no network) is served directly so fixtures still work.
-                    if hasattr(self._inner, "get_provider_name"):
-                        raise BacktestCacheMiss(symbol)
-                    df = self._inner.get_ohlcv_data(
-                        symbol, start_date=self._bs, end_date=self._be, interval=interval
-                    )
-                elif len(df) and "Date" in df.columns:
-                    # _read_cached_df returns the WHOLE on-disk series; clamp to [bounds] so the
-                    # memo matches the live path (get_ohlcv_data(start,end)) and memory stays bounded.
-                    _d = pd.to_datetime(df["Date"], utc=True).dt.tz_localize(None)
-                    _bs = _to_utc(self._bs).replace(tzinfo=None)
-                    _be = _to_utc(self._be).replace(tzinfo=None)
-                    df = df[(_d >= _bs) & (_d <= _be)]
-            else:
+        if self._cached_only:
+            # Hermetic: read from the on-disk caches only (both layouts). Absent from every
+            # layout -> hard error (aggregated by preload), never a silent skip or live fetch.
+            df = self._read_cached_df(symbol, interval)
+            if df is None:
+                # Only a REAL, network-backed provider (FMPOHLCVProvider et al — they expose
+                # get_provider_name) must error on miss; an in-memory test/synthetic provider
+                # (no get_provider_name, no network) is served directly so fixtures still work.
+                if hasattr(self._inner, "get_provider_name"):
+                    raise BacktestCacheMiss(symbol)
                 df = self._inner.get_ohlcv_data(
                     symbol, start_date=self._bs, end_date=self._be, interval=interval
                 )
-            if df is None or len(df) == 0:
-                import pandas as _pd
-                df = _pd.DataFrame() if df is None else df
-                dates = np.array([], dtype="datetime64[ns]")
-            else:
-                df = df.reset_index(drop=True)
-                dates = (
-                    pd.to_datetime(df["Date"], utc=True).dt.tz_localize(None).values
-                ).astype("datetime64[ns]")
-                order = np.argsort(dates, kind="stable")
-                df = df.iloc[order].reset_index(drop=True)
-                dates = dates[order]
-            hit = (df, dates)
+            elif len(df) and "Date" in df.columns:
+                # _read_cached_df returns the WHOLE on-disk series; clamp to [bounds] so the
+                # memo matches the live path (get_ohlcv_data(start,end)) and memory stays bounded.
+                _d = pd.to_datetime(df["Date"], utc=True).dt.tz_localize(None)
+                _bs = _to_utc(self._bs).replace(tzinfo=None)
+                _be = _to_utc(self._be).replace(tzinfo=None)
+                df = df[(_d >= _bs) & (_d <= _be)]
+        else:
+            df = self._inner.get_ohlcv_data(
+                symbol, start_date=self._bs, end_date=self._be, interval=interval
+            )
+        if df is None or len(df) == 0:
+            import pandas as _pd
+            df = _pd.DataFrame() if df is None else df
+            dates = np.array([], dtype="datetime64[ns]")
+        else:
+            df = df.reset_index(drop=True)
+            dates = (
+                pd.to_datetime(df["Date"], utc=True).dt.tz_localize(None).values
+            ).astype("datetime64[ns]")
+            order = np.argsort(dates, kind="stable")
+            df = df.iloc[order].reset_index(drop=True)
+            dates = dates[order]
+        return (df, dates)
+
+    def _full(self, symbol: str, interval: str):
+        """Memoized variant of ``_load`` — the persistent per-symbol series cache shared across GA
+        individuals. Populated LAZILY by genuine ``get_ohlcv_data`` requests (NOT by preload)."""
+        key = (symbol, interval, _to_utc(self._bs).isoformat(), _to_utc(self._be).isoformat())
+        hit = _FULL_SERIES_MEMO.get(key)
+        if hit is None:
+            hit = self._load(symbol, interval)
             _FULL_SERIES_MEMO[key] = hit
         return hit
 
-    def get_ohlcv_data(self, symbol, start_date=None, end_date=None, interval="1d", **kwargs):
+    @staticmethod
+    def _slice(df, dates, start_date, end_date):
         import numpy as np
-
-        df, dates = self._full(symbol, interval)
         if len(df) == 0:
             return df
-        lo = 0
-        hi = len(df)
+        lo, hi = 0, len(df)
         if start_date is not None:
             s = np.datetime64(_to_utc(start_date).replace(tzinfo=None))
             lo = int(np.searchsorted(dates, s, side="left"))
@@ -691,6 +713,10 @@ class MemoizedOHLCVProvider:
             e = np.datetime64(_to_utc(end_date).replace(tzinfo=None))
             hi = int(np.searchsorted(dates, e, side="right"))
         return df.iloc[lo:hi].reset_index(drop=True)
+
+    def get_ohlcv_data(self, symbol, start_date=None, end_date=None, interval="1d", **kwargs):
+        df, dates = self._full(symbol, interval)
+        return self._slice(df, dates, start_date, end_date)
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
