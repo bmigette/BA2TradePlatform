@@ -152,6 +152,26 @@ class TradeManager:
                         account.refresh_transactions()
                         self.logger.debug(f"Refreshed transactions for {account_def.name}")
 
+                    # Reconcile positions closed DIRECTLY at the broker (outside the
+                    # platform): the order-driven refresh above can't detect those (no
+                    # filled close order in our ledger), so a manually-closed position
+                    # would otherwise stay OPENED forever. Closes OPENED transactions
+                    # whose symbol the broker no longer holds. No-op on a positions-fetch
+                    # error (never mass-closes the book). Live-only — the backtest engine
+                    # does not call this refresh path.
+                    if hasattr(account, 'reconcile_externally_closed_transactions'):
+                        try:
+                            closed = account.reconcile_externally_closed_transactions()
+                            if closed:
+                                self.logger.info(
+                                    f"Reconciled {closed} externally-closed transaction(s) for {account_def.name}"
+                                )
+                        except Exception as e:
+                            self.logger.error(
+                                f"Error reconciling externally-closed transactions for {account_def.name}: {e}",
+                                exc_info=True,
+                            )
+
                     # Reconcile option assignment/exercise/expiry events from the
                     # broker (no-op for non-options accounts). Idempotent.
                     self._reconcile_account_option_activities(account)

@@ -1,6 +1,6 @@
 from abc import abstractmethod
 from typing import Any, Dict, Optional, List
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from threading import Lock
 from ba2_common.logger import logger
 from ba2_common.core.models import AccountSetting
@@ -735,6 +735,129 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         except Exception as e:
             logger.error(f"Error refreshing transactions for account {self.id}: {e}", exc_info=True)
             return False
+
+    def reconcile_externally_closed_transactions(self, grace_period_minutes: int = 5) -> int:
+        """Close OPENED transactions whose symbol no longer has a position at the broker.
+
+        ``refresh_transactions`` is order-driven: it closes a transaction only when the
+        platform's OWN orders fill/balance/terminate. A position closed DIRECTLY at the
+        broker (outside the platform) leaves the entry order FILLED (which is NOT a
+        terminal status) and the protective SELL/OCO orders CANCELED, with no filled
+        sell — so the order-driven logic can never close it and the trade shows "alive"
+        forever. This reconciles against the broker's ACTUAL positions: if the broker
+        holds no position for a symbol that still has OPENED transaction(s), close them
+        as ``position_not_at_broker`` and cancel any still-resting orders.
+
+        Safeguards:
+          - If broker positions can't be fetched, do NOTHING (never close on an API error
+            — an empty/failed fetch must not mass-close the book).
+          - Only close when the broker has ZERO position for the symbol. A non-zero but
+            smaller position (partial manual close) is a quantity mismatch handled by the
+            Overview "Adjust Quantities" flow, not here.
+          - Skip transactions opened within ``grace_period_minutes`` — a just-filled entry
+            may not have settled into a reported broker position yet.
+
+        Returns the number of transactions closed.
+        """
+        from sqlmodel import select, Session
+        from ba2_common.core.db import get_db, update_instance
+        from ba2_common.core.models import TradingOrder, Transaction
+        from ba2_common.core.types import OrderStatus, TransactionStatus, AssetClass
+        from ba2_common.core.utils import close_transaction_with_logging
+
+        # 1) Fetch the broker's real positions. NEVER reconcile on a failure — that would
+        #    risk closing the entire book if the broker API hiccups.
+        try:
+            positions = self.get_positions()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[Account {self.id}] reconcile: could not fetch broker positions ({e}); skipping")
+            return 0
+        if positions is None:
+            return 0
+
+        broker_symbols = set()
+        for pos in positions:
+            pos_dict = pos if isinstance(pos, dict) else dict(pos)
+            sym = pos_dict.get('symbol')
+            qty = pos_dict.get('qty', 0)
+            try:
+                has_qty = abs(float(qty or 0)) > 1e-6
+            except (TypeError, ValueError):
+                has_qty = bool(qty)
+            if sym and has_qty:
+                broker_symbols.add(sym)
+
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=grace_period_minutes)
+        terminal_statuses = OrderStatus.get_terminal_statuses()
+        closed_count = 0
+
+        with Session(get_db().bind) as session:
+            # OPENED transactions belonging to THIS account (transactions link to an
+            # account only through their orders), mirroring refresh_transactions' join.
+            statement = select(Transaction).join(TradingOrder).where(
+                TradingOrder.account_id == self.id,
+                Transaction.status == TransactionStatus.OPENED,
+            ).distinct()
+            open_txns = session.exec(statement).all()
+
+            for txn in open_txns:
+                if not txn.symbol or txn.symbol in broker_symbols:
+                    continue
+                # Grace period: skip a freshly-opened entry that may not have settled.
+                open_date = txn.open_date
+                if open_date is not None:
+                    if open_date.tzinfo is None:
+                        open_date = open_date.replace(tzinfo=timezone.utc)
+                    if open_date > cutoff:
+                        continue
+
+                txn_orders = session.exec(
+                    select(TradingOrder).where(
+                        TradingOrder.transaction_id == txn.id,
+                        TradingOrder.account_id == self.id,
+                    )
+                ).all()
+
+                # OPTIONS GUARD: get_positions() reports EQUITY positions only, so an
+                # option transaction's symbol would never match and we'd wrongly close it.
+                # Option lifecycle (assignment/exercise/expiry) is reconciled separately
+                # (see TradeManager._reconcile_account_option_activities). Skip options here.
+                if any(o.asset_class == AssetClass.OPTION for o in txn_orders):
+                    continue
+
+                # Stamp a close price from the last known market price (best-effort, so P&L
+                # is recorded). Leave it unset if unavailable rather than guessing.
+                try:
+                    price = self.get_instrument_current_price(txn.symbol)
+                    if price:
+                        txn.close_price = float(price)
+                except Exception:  # noqa: BLE001
+                    pass
+
+                # Cancel any still-resting orders for this transaction (the broker has
+                # already released the position, so these can never fill correctly).
+                for o in txn_orders:
+                    if o.status not in terminal_statuses:
+                        o.status = OrderStatus.CANCELED
+                        session.add(o)
+
+                logger.info(
+                    f"[Account {self.id}] reconcile: {txn.symbol} no longer held at broker — "
+                    f"closing OPENED transaction {txn.id} (external close)"
+                )
+                close_transaction_with_logging(
+                    transaction=txn,
+                    account_id=self.id,
+                    close_reason="position_not_at_broker",
+                    session=session,
+                )
+                session.add(txn)
+                closed_count += 1
+
+            if closed_count:
+                session.commit()
+
+        return closed_count
 
     @abstractmethod
     def get_dividends(self, symbol: Optional[str] = None, start_date: Optional[datetime] = None, end_date: Optional[datetime] = None) -> List[Dict]:
