@@ -30,6 +30,11 @@ _UPGRADE_CACHE = TTLCache(_FMP_CACHE_TTL_SECONDS)
 # in the pure reconstruction calculators on the cached full history.
 _GRADES_HISTORICAL_CACHE = TTLCache(_FMP_CACHE_TTL_SECONDS)
 _PRICE_TARGET_HISTORY_CACHE = TTLCache(_FMP_CACHE_TTL_SECONDS)
+_ANALYST_GRADES_CACHE = TTLCache(_FMP_CACHE_TTL_SECONDS)
+
+# ~30 days/month — the coarse calendar used to convert max_analyst_age_months to a
+# trailing day-window for the rating-recency filter (the gene steps in 3-month units).
+_DAYS_PER_MONTH = 30
 
 # FMP's price-target CONSENSUS endpoint windows to ~the last quarter, so the count
 # of price targets behind a live consensus is measured over this trailing window.
@@ -115,6 +120,34 @@ def fetch_price_target_history_cached(api_key: str, symbol: str) -> list:
         symbol, lambda: fmp_history_disk_cached("price_target", symbol, _do_fetch))
 
 
+def fetch_analyst_grades_cached(api_key: str, symbol: str) -> list:
+    """Fetch the FULL dated INDIVIDUAL analyst-grade history for a symbol (rating recency),
+    WITHOUT needing an FMPRating instance.
+
+    Endpoint: ``stable/grades?symbol=`` — one row per analyst action carrying ``date`` +
+    ``gradingCompany`` (+ previous/new grade, action). UNLIKE the aggregate
+    upgrades-downgrades-consensus / grades-historical bucket counts (which are undated or
+    monthly snapshots and can be inflated by long-stale ratings), these per-analyst dated rows
+    let ``_count_recent_analysts`` count DISTINCT analysts active within a recency window
+    (``max_analyst_age_months``), as-of, no-lookahead. Cached per symbol (full history is
+    time-invariant within the TTL window); reusable by the optimization pre-warm + GA workers."""
+    def _do_fetch():
+        url = "https://financialmodelingprep.com/stable/grades"
+        params = {"symbol": symbol, "apikey": api_key}
+        _logger.debug(f"Fetching FMP analyst grades for {symbol}")
+        try:
+            response = fmp_http_get(url, params, symbol=symbol,
+                                    endpoint="grades", timeout=60)
+        except FMPError as e:
+            raise ValueError(str(e)) from e
+        data = response.json()
+        return data if isinstance(data, list) else []
+
+    # In-process TTLCache -> backtest-only disk cache -> FMP network (see grades-historical).
+    return _ANALYST_GRADES_CACHE.get_or_call(
+        symbol, lambda: fmp_history_disk_cached("analyst_grades", symbol, _do_fetch))
+
+
 class FMPRating(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExpertInterface):
     """
     FMPRating Expert Implementation
@@ -180,6 +213,13 @@ class FMPRating(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExpertInterface
                 "default": 3,
                 "description": "Minimum analyst price targets behind the consensus (0 = no check)",
                 "tooltip": "FMP's price-target CONSENSUS is windowed to ~the last quarter, so a thinly-targeted name (e.g. a single recent analyst) yields a DEGENERATE consensus where high==low==median==consensus. This requires at least N price targets behind the consensus before acting; below it the analysis is skipped. This is DISTINCT from min_analysts, which counts RATINGS (Strong Buy..Strong Sell — a much larger pool that can be plentiful even when only 1 analyst set a price target). Live: counts targets in the trailing ~quarter (matching FMP's consensus window); backtest: counts the targets behind the reconstructed consensus (the price_target_window_days window). Default 3. Set 0 to disable the check."
+            },
+            "max_analyst_age_months": {
+                "type": "int",
+                "required": True,
+                "default": 0,
+                "description": "Recency window (months) for an analyst rating to count toward min_analysts (0 = no filter)",
+                "tooltip": "Applies a recency filter to the analyst count BEFORE the min_analysts gate. When > 0, min_analysts counts only DISTINCT analysts who issued or affirmed a rating within this many months — read from FMP's DATED individual 'grades' endpoint, as-of the analysis date (no lookahead). So 'max_analyst_age_months=6, min_analysts=10' means 'at least 10 analysts active within 6 months'. When 0, the recency filter is OFF and the count falls back to FMP's full standing-analyst bucket sum (the undated upgrades-downgrades-consensus / grades-historical count), which can be inflated by long-stale ratings (e.g. ASC shows 17 standing vs ~2-4 active). Optimized in the grid as {0,3,6,9,12}."
             }
         }
     
@@ -210,7 +250,8 @@ class FMPRating(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExpertInterface
     # snapshot/lookahead distinction so the design rationale is never silently lost.
     # ------------------------------------------------------------------
     _SETTING_KEYS = ("profit_ratio", "min_analysts", "target_price_type",
-                     "price_target_window_days", "min_price_targets_per_quarter")
+                     "price_target_window_days", "min_price_targets_per_quarter",
+                     "max_analyst_age_months")
 
     @staticmethod
     def _count_analysts(upgrade_data: Optional[list]) -> int:
@@ -252,6 +293,31 @@ class FMPRating(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExpertInterface
                 n += 1
         return n
 
+    @staticmethod
+    def _count_recent_analysts(grades: Optional[list], ref_date: datetime,
+                               window_months: int) -> int:
+        """Count DISTINCT analysts (``gradingCompany``) with a grade dated within
+        ``window_months`` (≈30 days/month) on/before ``ref_date`` — the recency-filtered
+        coverage count for the ``min_analysts`` gate.
+
+        NO-LOOKAHEAD: rows dated after ``ref_date``, or older than the trailing window, are
+        ignored. Distinct by ``gradingCompany`` so an analyst who re-affirmed several times in
+        the window counts once. Reads FMP's dated individual ``grades`` rows (see
+        ``fetch_analyst_grades_cached``). Returns 0 for an empty list or ``window_months<=0``."""
+        if not grades or window_months <= 0:
+            return 0
+        from datetime import timedelta
+        floor = ref_date - timedelta(days=int(window_months) * _DAYS_PER_MONTH)
+        seen = set()
+        for r in grades:
+            d = _memo_provider_date(r, "date")
+            if d is None or d > ref_date or d < floor:
+                continue
+            company = r.get("gradingCompany")
+            if company:
+                seen.add(company)
+        return len(seen)
+
     def _gather(self, providers: ProviderBundle, as_of: Optional[datetime]) -> Dict[str, Any]:
         """Fetch (live) or reconstruct (backtest) the consensus + upgrade inputs and
         the as_of close.
@@ -268,6 +334,11 @@ class FMPRating(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExpertInterface
         The reconstructed dicts are shaped identically to the live snapshots.
         """
         symbol = self._gather_symbol
+        # Rating-recency: only fetch the dated individual grades when the recency filter is
+        # active (max_analyst_age_months > 0), so a run that leaves it OFF needs no extra fetch
+        # (and a hermetic backtest without the gene never requires the grades cache).
+        max_age = int(getattr(self, "_gather_max_analyst_age", 0) or 0)
+        analyst_grades = None
         if as_of is None:
             # LIVE path — unchanged: current consensus snapshots.
             consensus_data = self._fetch_price_target_consensus(symbol)
@@ -276,6 +347,8 @@ class FMPRating(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExpertInterface
             # upgrades when consensus is None).
             upgrade_data = (self._fetch_upgrade_downgrade(symbol)
                             if consensus_data is not None else None)
+            if consensus_data is not None and max_age > 0:
+                analyst_grades = self._fetch_analyst_grades(symbol)
             # Count the price targets behind FMP's live consensus (windowed to ~the last
             # quarter) so _process can reject a thinly-targeted DEGENERATE consensus. The
             # consensus endpoint exposes no count, so derive it from the individual
@@ -298,9 +371,12 @@ class FMPRating(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExpertInterface
             # coverage as-of the date (no consensus target => no coverage => skip).
             upgrade_data = (self._counts_as_of(grades_history, as_of)
                             if consensus_data is not None else None)
+            if consensus_data is not None and max_age > 0:
+                analyst_grades = self._fetch_analyst_grades(symbol)
             current_price = providers.price_at_date(symbol, as_of)
         return {"consensus_data": consensus_data, "upgrade_data": upgrade_data,
-                "current_price": current_price, "symbol": symbol}
+                "current_price": current_price, "symbol": symbol,
+                "analyst_grades": analyst_grades}
 
     def _process(self, data_bundle: Dict[str, Any], settings: Dict[str, Any],
                  as_of: Optional[datetime] = None) -> Recommendation:
@@ -338,12 +414,26 @@ class FMPRating(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExpertInterface
 
         upgrade_data = data_bundle["upgrade_data"]
         min_analysts = int(settings["min_analysts"])
-        analyst_count = self._count_analysts(upgrade_data)
+        # Rating-recency filter (kicks BEFORE the min_analysts gate): when
+        # max_analyst_age_months > 0, count only DISTINCT analysts who issued/affirmed a rating
+        # within that window (from the dated individual `grades`), as-of the analysis date — so
+        # "6mo + min_analysts 10" means 10 analysts active within 6 months. 0 = no recency
+        # filter: fall back to FMP's full standing-analyst bucket sum (which can be inflated by
+        # long-stale ratings). The buckets still drive the signal direction/confidence below.
+        max_age = int(settings.get("max_analyst_age_months", 0) or 0)
+        if max_age > 0:
+            ref_date = as_of if as_of is not None else datetime.now(timezone.utc)
+            analyst_count = self._count_recent_analysts(
+                data_bundle.get("analyst_grades"), ref_date, max_age)
+            count_desc = f"{analyst_count} active within {max_age}mo"
+        else:
+            analyst_count = self._count_analysts(upgrade_data)
+            count_desc = str(analyst_count)
         if analyst_count < min_analysts:
             return Recommendation(
                 signal=OrderRecommendation.HOLD, confidence=0.0,
                 current_price=current_price,
-                details=f"Insufficient analysts ({analyst_count} < {min_analysts})",
+                details=f"Insufficient analysts ({count_desc} < {min_analysts})",
                 expected_profit_percent=0.0,
                 skip=True, skip_reason="insufficient analysts")
 
@@ -373,6 +463,7 @@ class FMPRating(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExpertInterface
         settings['price_target_window_days'] (default 90)."""
         self._gather_symbol = context.extra.get("symbol", getattr(self, "_gather_symbol", None))
         self._gather_window_days = int(context.settings.get("price_target_window_days", 90))
+        self._gather_max_analyst_age = int(context.settings.get("max_analyst_age_months", 0) or 0)
         bundle = self._gather(context.providers, as_of)
         return self._process(bundle, context.settings, as_of)
 
@@ -508,6 +599,18 @@ class FMPRating(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExpertInterface
         # Delegate to the module-level fetcher (reusable by the optimization pre-warm).
         # Behaviour is byte-identical to the prior inline _do_fetch + cache wrapping.
         return fetch_price_target_history_cached(self._api_key, symbol)
+
+    def _fetch_analyst_grades(self, symbol: str) -> list:
+        """Fetch the FULL dated INDIVIDUAL analyst-grade history (rating-recency path).
+
+        Endpoint: ``stable/grades?symbol=`` — one row per analyst action (``date`` +
+        ``gradingCompany``). Returns the raw list (the no-lookahead window filtering +
+        distinct-analyst counting happen in ``_count_recent_analysts``). Cached per symbol via
+        the module-level fetcher (reusable by the optimization pre-warm)."""
+        if not self._api_key:
+            self.logger.error("Cannot fetch analyst grades: FMP API key not configured")
+            return []
+        return fetch_analyst_grades_cached(self._api_key, symbol)
 
     @classmethod
     def _counts_as_of(cls, grades_history: list, as_of: datetime) -> Optional[list]:
@@ -1020,6 +1123,7 @@ Final Confidence = Base Confidence + Directional Boost ({signal.value}) = {base_
             # the backtest reconstruction path, but is threaded for consistency.
             self._gather_symbol = symbol
             self._gather_window_days = int(settings.get("price_target_window_days", 90))
+            self._gather_max_analyst_age = int(settings.get("max_analyst_age_months", 0) or 0)
             providers = self._live_providers()
             bundle = self._gather(providers, as_of=None)
             current_price = bundle["current_price"]

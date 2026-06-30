@@ -210,6 +210,7 @@ def handle_prewarm(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         from ba2_experts.FMPRating import (
             fetch_grades_historical_cached,
             fetch_price_target_history_cached,
+            fetch_analyst_grades_cached,
         )
         from ba2_providers.fundamentals.details.FMPCompanyDetailsProvider import (
             FMPCompanyDetailsProvider,
@@ -222,6 +223,7 @@ def handle_prewarm(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         def _do_fmprating(sym: str) -> None:
             fetch_grades_historical_cached(key, sym)
             fetch_price_target_history_cached(key, sym)
+            fetch_analyst_grades_cached(key, sym)   # dated individual grades (rating-recency)
 
         def _do_earnings_drift(sym: str) -> None:
             if _details_provider["p"] is None:
