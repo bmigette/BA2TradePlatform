@@ -10,12 +10,31 @@ from ba2_common.core.TradeConditions import TradeCondition, create_condition
 from ba2_common.core.TradeActions import TradeAction, create_action, AdjustTakeProfitAction, AdjustStopLossAction, IncreaseInstrumentShareAction, DecreaseInstrumentShareAction
 from ba2_common.core.interfaces import AccountInterface
 from ba2_common.core.models import Ruleset, EventAction, TradingOrder, TradeActionResult, ExpertRecommendation
-from ba2_common.core.types import OrderRecommendation, ExpertEventType, ExpertActionType
+from ba2_common.core.types import (
+    OrderRecommendation, ExpertEventType, ExpertActionType, get_option_action_values,
+)
 from ba2_common.core.db import get_db, get_instance
 from ba2_common.logger import logger
 from sqlmodel import select
 import enum
 import datetime
+
+
+# Canonical option action-type sets, derived from get_option_action_values() so a new
+# option action added there is automatically routed by the evaluator (no more silently
+# dropped actions). ``_OPTION_ENTRY_ACTION_TYPES`` excludes CLOSE_OPTION (which resolves
+# its contract from the held position and takes no selection params).
+_ALL_OPTION_ACTION_TYPES = frozenset(ExpertActionType(v) for v in get_option_action_values())
+_OPTION_ENTRY_ACTION_TYPES = _ALL_OPTION_ACTION_TYPES - {ExpertActionType.CLOSE_OPTION}
+
+# Selection-param keys forwarded from an option action config to the _OptionEntryAction
+# ctor. ``wing_width_pct`` is required by the 4-/3-leg structures (iron condor, jade
+# lizard, butterfly, ratio spread); only keys present in the config are forwarded so each
+# action's own defaults apply otherwise.
+_OPTION_ENTRY_PARAM_KEYS = (
+    'strike_method', 'strike_param', 'dte_min', 'dte_max',
+    'sizing', 'min_open_interest', 'max_spread_pct', 'wing_width_pct',
+)
 
 
 def _sanitize_for_json(obj):
@@ -240,15 +259,12 @@ class TradeActionEvaluator:
 
             for action in sorted_actions:
                 action_type = self._get_action_type_from_action(action)
-                if action_type in [ExpertActionType.BUY, ExpertActionType.SELL, ExpertActionType.CLOSE,
-                                   ExpertActionType.BUY_CALL, ExpertActionType.OPEN_BULL_CALL_SPREAD,
-                                   ExpertActionType.SELL_COVERED_CALL, ExpertActionType.BUY_PUT,
-                                   ExpertActionType.OPEN_BEAR_PUT_SPREAD, ExpertActionType.BUY_PROTECTIVE_PUT,
-                                   ExpertActionType.SELL_CASH_SECURED_PUT, ExpertActionType.OPEN_BEAR_CALL_SPREAD,
-                                   ExpertActionType.OPEN_STRADDLE, ExpertActionType.OPEN_STRANGLE,
-                                   ExpertActionType.CLOSE_OPTION]:
+                if (action_type in (ExpertActionType.BUY, ExpertActionType.SELL, ExpertActionType.CLOSE)
+                        or action_type in _ALL_OPTION_ACTION_TYPES):
                     # Option actions self-submit (create their own broker order + transaction);
-                    # they run in Phase 1 like equity order-creating actions.
+                    # they run in Phase 1 like equity order-creating actions. The option set is
+                    # the canonical get_option_action_values() (incl. CLOSE_OPTION + all the
+                    # multi-leg credit/debit structures) so no option action is silently dropped.
                     order_creating_actions.append(action)
                 elif action_type in [ExpertActionType.ADJUST_TAKE_PROFIT, ExpertActionType.ADJUST_STOP_LOSS]:
                     adjustment_actions.append(action)
@@ -959,16 +975,11 @@ class TradeActionEvaluator:
                 if target_val is None:
                     logger.warning(f"DECREASE_INSTRUMENT_SHARE action has no 'value' configured — target_percent will be None and the action will fail at execution")
                 kwargs['target_percent'] = target_val
-            elif action_type in (ExpertActionType.BUY_CALL, ExpertActionType.OPEN_BULL_CALL_SPREAD,
-                                 ExpertActionType.SELL_COVERED_CALL, ExpertActionType.BUY_PUT,
-                                 ExpertActionType.OPEN_BEAR_PUT_SPREAD, ExpertActionType.BUY_PROTECTIVE_PUT,
-                                 ExpertActionType.SELL_CASH_SECURED_PUT, ExpertActionType.OPEN_BEAR_CALL_SPREAD,
-                                 ExpertActionType.OPEN_STRADDLE, ExpertActionType.OPEN_STRANGLE):
-                # Option ENTRY actions: pull strike/dte/sizing/liquidity params from config.
+            elif action_type in _OPTION_ENTRY_ACTION_TYPES:
+                # Option ENTRY actions: pull strike/dte/sizing/liquidity/wing params from config.
                 # Only forward keys that are present so the action's own defaults apply otherwise.
                 # (CLOSE_OPTION takes none of these — it resolves the contract from the position.)
-                for opt_key in ('strike_method', 'strike_param', 'dte_min', 'dte_max',
-                                'sizing', 'min_open_interest', 'max_spread_pct'):
+                for opt_key in _OPTION_ENTRY_PARAM_KEYS:
                     if opt_key in action_config:
                         kwargs[opt_key] = action_config.get(opt_key)
 
@@ -1019,6 +1030,12 @@ class TradeActionEvaluator:
                 'OpenBearCallSpreadAction': ExpertActionType.OPEN_BEAR_CALL_SPREAD,
                 'OpenStraddleAction': ExpertActionType.OPEN_STRADDLE,
                 'OpenStrangleAction': ExpertActionType.OPEN_STRANGLE,
+                'OpenShortStraddleAction': ExpertActionType.OPEN_SHORT_STRADDLE,
+                'OpenShortStrangleAction': ExpertActionType.OPEN_SHORT_STRANGLE,
+                'OpenIronCondorAction': ExpertActionType.OPEN_IRON_CONDOR,
+                'OpenJadeLizardAction': ExpertActionType.OPEN_JADE_LIZARD,
+                'OpenCallButterflyAction': ExpertActionType.OPEN_CALL_BUTTERFLY,
+                'OpenPutRatioSpreadAction': ExpertActionType.OPEN_PUT_RATIO_SPREAD,
                 'CloseOptionAction': ExpertActionType.CLOSE_OPTION,
             }
             

@@ -2309,12 +2309,14 @@ class OpenShortStraddleAction(_OptionEntryAction):
         net_credit = round(call_c.bid + put_c.bid, 4)        # sell both at BID
         if net_credit <= 0:
             return self._result(False, f"Non-positive credit for {self.instrument_name} short straddle")
-        per_contract_reserve = call_c.strike * 100.0
+        # NAKED both sides: reserve Reg-T naked margin (not full strike*100 cash) so the
+        # structure is sizeable on a realistic account.
+        per_contract_reserve = self.account.naked_margin_per_contract(call_c.strike, spot=spot)
         quantity = self._size_by_reserve(per_contract_reserve, self.sizing)
         if quantity < 1:
             return self._result(False, f"Insufficient budget to size short straddle for {self.instrument_name}")
         reserve = self.account.option_reserve_required(
-            "short_straddle", quantity, strike=call_c.strike)
+            "short_straddle", quantity, strike=call_c.strike, spot=spot)
         if not self.account.check_option_buying_power(reserve):
             return self._result(False, f"Insufficient BP for short straddle on {self.instrument_name}")
         call_leg = OptionLeg(contract_symbol=call_c.symbol, side=OrderDirection.SELL,
@@ -2376,12 +2378,14 @@ class OpenShortStrangleAction(_OptionEntryAction):
         net_credit = round(call_c.bid + put_c.bid, 4)
         if net_credit <= 0:
             return self._result(False, f"Non-positive credit for {self.instrument_name} short strangle")
-        per_contract_reserve = put_c.strike * 100.0
+        # NAKED both sides: reserve Reg-T naked margin on the (richer) put side, not full
+        # strike*100 cash, so the structure is sizeable on a realistic account.
+        per_contract_reserve = self.account.naked_margin_per_contract(put_c.strike, spot=spot)
         quantity = self._size_by_reserve(per_contract_reserve, self.sizing)
         if quantity < 1:
             return self._result(False, f"Insufficient budget to size short strangle for {self.instrument_name}")
         reserve = self.account.option_reserve_required(
-            "short_strangle", quantity, strike=put_c.strike)
+            "short_strangle", quantity, strike=put_c.strike, spot=spot)
         if not self.account.check_option_buying_power(reserve):
             return self._result(False, f"Insufficient BP for short strangle on {self.instrument_name}")
         call_leg = OptionLeg(contract_symbol=call_c.symbol, side=OrderDirection.SELL,
@@ -2511,11 +2515,13 @@ class OpenJadeLizardAction(_OptionEntryAction):
         net_credit = round(sc.bid + sp.bid - lc.ask, 4)
         if net_credit <= 0:
             return self._result(False, f"Non-positive credit for {self.instrument_name} jade lizard")
-        per_contract_reserve = sp.strike * 100.0       # put side naked
+        # Put side is NAKED: reserve Reg-T naked margin (not full strike*100 cash) so the
+        # structure is sizeable on a realistic account. (Call side is wing-capped.)
+        per_contract_reserve = self.account.naked_margin_per_contract(sp.strike, spot=spot)
         quantity = self._size_by_reserve(per_contract_reserve, self.sizing)
         if quantity < 1:
             return self._result(False, f"Insufficient budget to size jade lizard for {self.instrument_name}")
-        reserve = self.account.option_reserve_required("naked_put", quantity, strike=sp.strike)
+        reserve = self.account.option_reserve_required("naked_put", quantity, strike=sp.strike, spot=spot)
         if not self.account.check_option_buying_power(reserve):
             return self._result(False, f"Insufficient BP for jade lizard on {self.instrument_name}")
         legs = [
@@ -2629,13 +2635,14 @@ class OpenPutRatioSpreadAction(_OptionEntryAction):
         if long_p.ask is None or short_p.bid is None:
             return self._result(False, f"Missing quotes for ratio spread on {self.instrument_name}")
         net = round(long_p.ask - 2 * short_p.bid, 4)   # usually negative (credit)
-        # Reserve the 1 net naked short put.
-        per_contract_reserve = short_p.strike * 100.0
+        # Reserve the 1 net naked short put at Reg-T naked margin (not full strike*100 cash)
+        # so the structure is sizeable on a realistic account.
+        per_contract_reserve = self.account.naked_margin_per_contract(short_p.strike, spot=spot)
         quantity = self._size_by_reserve(per_contract_reserve, self.sizing)
         if quantity < 1:
             return self._result(False, f"Insufficient budget to size ratio spread for {self.instrument_name}")
         reserve = self.account.option_reserve_required(
-            "put_ratio_spread", quantity, strike=short_p.strike)
+            "put_ratio_spread", quantity, strike=short_p.strike, spot=spot)
         if not self.account.check_option_buying_power(reserve):
             return self._result(False, f"Insufficient BP for ratio spread on {self.instrument_name}")
         legs = [

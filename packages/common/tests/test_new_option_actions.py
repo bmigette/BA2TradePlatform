@@ -188,3 +188,92 @@ def test_put_ratio_spread_buy1_sell2():
     assert len(buys) == 1 and buys[0].ratio_qty == 1
     assert len(sells) == 1 and sells[0].ratio_qty == 2
     assert buys[0].strike > sells[0].strike
+
+
+# --------------------------------------------------------------------------- #
+# Evaluator wiring: the REAL backtest/live path runs option actions through
+# TradeActionEvaluator, NOT create_action directly. Three hardcoded action-type
+# lists in the evaluator (the execute() routing list, the _create_trade_action
+# option branch, and the _get_action_type_from_action class map) silently DROPPED
+# the 6 new action types — so they never submitted, producing zero fills (-1e9
+# sentinel) in the optimizer even though the action classes themselves work.
+# These tests lock the wiring so a new option action can never be added to the
+# action classes without also being routed by the evaluator.
+# --------------------------------------------------------------------------- #
+_NEW_OPTION_ACTION_CLASSES = {
+    "OpenShortStraddleAction": ExpertActionType.OPEN_SHORT_STRADDLE,
+    "OpenShortStrangleAction": ExpertActionType.OPEN_SHORT_STRANGLE,
+    "OpenIronCondorAction": ExpertActionType.OPEN_IRON_CONDOR,
+    "OpenJadeLizardAction": ExpertActionType.OPEN_JADE_LIZARD,
+    "OpenCallButterflyAction": ExpertActionType.OPEN_CALL_BUTTERFLY,
+    "OpenPutRatioSpreadAction": ExpertActionType.OPEN_PUT_RATIO_SPREAD,
+}
+
+
+@pytest.mark.parametrize("class_name,expected_type", list(_NEW_OPTION_ACTION_CLASSES.items()))
+def test_evaluator_maps_new_option_action_classes(class_name, expected_type):
+    """_get_action_type_from_action must resolve every new option action class to its
+    ExpertActionType. If it returns None, execute() routes the action to the
+    'unknown type' branch and silently drops it (the root cause of the zero-fill bug)."""
+    import ba2_common.core.TradeActions as TA
+    from ba2_common.core.TradeActionEvaluator import TradeActionEvaluator
+
+    action_cls = getattr(TA, class_name)
+    inst = action_cls.__new__(action_cls)  # don't need a fully-constructed action
+    ev = TradeActionEvaluator.__new__(TradeActionEvaluator)
+    resolved = ev._get_action_type_from_action(inst)
+    assert resolved == expected_type, (
+        f"{class_name} resolved to {resolved}, expected {expected_type}; the evaluator "
+        f"would drop this action as 'unknown type' and it would never submit/fill"
+    )
+
+
+def test_evaluator_option_type_lists_cover_all_option_actions():
+    """Every option ExpertActionType in the canonical get_option_action_values() must be
+    routed by the evaluator's execute() order-creating list (so the action submits)."""
+    from ba2_common.core.types import get_option_action_values
+    from ba2_common.core.TradeActionEvaluator import _OPTION_ENTRY_ACTION_TYPES
+
+    canonical = {ExpertActionType(v) for v in get_option_action_values()}
+    # CLOSE_OPTION is routed too but is not an "entry"; entry list = canonical - {CLOSE_OPTION}
+    expected_entries = canonical - {ExpertActionType.CLOSE_OPTION}
+    assert expected_entries.issubset(_OPTION_ENTRY_ACTION_TYPES), (
+        f"missing from evaluator entry list: {expected_entries - _OPTION_ENTRY_ACTION_TYPES}"
+    )
+
+
+def test_evaluator_forwards_wing_width_pct():
+    """_create_trade_action must forward wing_width_pct to the option action ctor so
+    iron condor / jade lizard / butterfly / ratio-spread get their configured wing."""
+    from ba2_common.core.TradeActionEvaluator import _OPTION_ENTRY_PARAM_KEYS
+    assert "wing_width_pct" in _OPTION_ENTRY_PARAM_KEYS
+
+
+# --------------------------------------------------------------------------- #
+# Naked short-premium reserve = Reg-T margin, NOT full strike*100 cash. The old
+# full-cash proxy ($22k for one AAPL contract) made short straddle/strangle, jade
+# lizard, and put ratio spread impossible to size on a realistic account, so they
+# never opened. The margin model (~20% of notional) reserves what a broker actually
+# does for a naked short, making the structures sizeable.
+# --------------------------------------------------------------------------- #
+def test_naked_margin_far_below_full_cash():
+    """Reg-T naked margin per contract must be a fraction (not the full strike*100)."""
+    acct = FakeAccount(spot=250.0)
+    full_cash = 225.0 * 100.0
+    margin = acct.naked_margin_per_contract(225.0, spot=250.0)
+    assert 0 < margin < full_cash
+    # With spot 250 / strike 225 (25 OTM): max(0.20*250-25, 0.10*250)*100 = max(25,25)*100 = 2500
+    assert margin == pytest.approx(2500.0)
+    # Without a spot, falls back to 0.20*strike*100 = 4500 (still << full 22500 cash).
+    assert acct.naked_margin_per_contract(225.0) == pytest.approx(4500.0)
+
+
+def test_naked_reserve_uses_margin_not_full_cash():
+    """option_reserve_required for naked structures must use the margin model."""
+    acct = FakeAccount(spot=250.0)
+    full_cash = 225.0 * 100.0 * 2
+    for strat in ("short_straddle", "short_strangle", "naked_put", "put_ratio_spread"):
+        r = acct.option_reserve_required(strat, 2, strike=225.0, spot=250.0)
+        assert 0 < r < full_cash, f"{strat} reserve {r} should be margin (< full cash {full_cash})"
+    # cash-secured put stays fully secured (full strike*100 by design).
+    assert acct.option_reserve_required("cash_secured_put", 1, strike=225.0) == pytest.approx(22500.0)

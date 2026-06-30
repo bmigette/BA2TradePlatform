@@ -214,13 +214,42 @@ class OptionsAccountInterface(ABC):
         return self._iv_rank_from_series(series, current, min_samples)
 
     # --- Cash / buying-power reserve (short-premium defense-in-depth) -------
-    @staticmethod
-    def option_reserve_required(strategy: str, quantity: int, *, strike: float | None = None,
-                               spread_width: float | None = None, net_credit: float | None = None) -> float:
+    #: Reg-T / CBOE naked-option initial-margin fraction of the underlying notional.
+    #: A NAKED short option is NOT cash-secured (only an assigned cash-secured PUT is);
+    #: brokers margin it at ~20% of notional less OTM amount, floored at ~10%. Reserving
+    #: the FULL strike*100 (cash-secured proxy) made naked structures (short straddle/
+    #: strangle, jade lizard, put ratio spread) impossible to size on a realistic account
+    #: ($10k can't reserve $22k for one AAPL contract), so they never opened. The margin
+    #: model below mirrors how a broker actually reserves a naked short.
+    NAKED_MARGIN_FRACTION = 0.20
+    NAKED_MARGIN_FLOOR_FRACTION = 0.10
+
+    @classmethod
+    def naked_margin_per_contract(cls, strike: float, *, spot: float | None = None) -> float:
+        """Reg-T naked single-option initial margin for ONE contract (x100 multiplier).
+
+        ``max(0.20*underlying - OTM, 0.10*underlying) * 100`` using ``spot`` when known
+        (OTM amount = |spot - strike|). Without a spot, falls back to ``0.20*strike*100``
+        (OTM term dropped) — still ~5x cheaper than the old full strike*100 cash proxy."""
+        if strike is None or strike <= 0:
+            return 0.0
+        if spot is None or spot <= 0:
+            return cls.NAKED_MARGIN_FRACTION * strike * 100.0
+        otm = abs(spot - strike)
+        primary = cls.NAKED_MARGIN_FRACTION * spot - otm
+        floor = cls.NAKED_MARGIN_FLOOR_FRACTION * spot
+        return max(primary, floor) * 100.0
+
+    @classmethod
+    def option_reserve_required(cls, strategy: str, quantity: int, *, strike: float | None = None,
+                               spread_width: float | None = None, net_credit: float | None = None,
+                               spot: float | None = None) -> float:
         """Cash/BP that a short-premium strategy must reserve. 0 for long/debit strategies."""
         if quantity <= 0:
             return 0.0
         if strategy == "cash_secured_put":
+            # A CSP is fully cash-secured by definition (the cash to buy the assigned
+            # shares is set aside): reserve the full assignment cost.
             if strike is None:
                 return 0.0
             return strike * 100.0 * quantity
@@ -230,9 +259,10 @@ class OptionsAccountInterface(ABC):
             max_loss = (spread_width - net_credit)
             return max(0.0, max_loss) * 100.0 * quantity
         if strategy in ("short_straddle", "short_strangle", "naked_put", "put_ratio_spread"):
+            # NAKED short premium: reserve the Reg-T naked-option margin, not full cash.
             if strike is None:
                 return 0.0
-            return strike * 100.0 * quantity
+            return cls.naked_margin_per_contract(strike, spot=spot) * quantity
         if strategy in ("iron_condor", "jade_lizard", "call_butterfly", "debit_spread"):
             if spread_width is None:
                 return 0.0
