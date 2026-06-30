@@ -134,12 +134,12 @@ def test_consensus_target_as_of_rolling_window_average():
     # 130/150/140 rows qualify -> mean 140, max 150, min 130, median 140.
     c = FMPRating._consensus_target_as_of(PRICE_TARGET_HISTORY, AS_OF_LATE, 90)
     assert c == {"targetConsensus": 140.0, "targetHigh": 150.0,
-                 "targetLow": 130.0, "targetMedian": 140.0}
+                 "targetLow": 130.0, "targetMedian": 140.0, "targetCount": 3}
     # EARLY window (90d back from 2026-03-15 -> floor 2025-12-15): only the
     # 80/90/85 rows qualify -> mean 85, max 90, min 80, median 85.
     c_early = FMPRating._consensus_target_as_of(PRICE_TARGET_HISTORY, AS_OF_EARLY, 90)
     assert c_early == {"targetConsensus": 85.0, "targetHigh": 90.0,
-                       "targetLow": 80.0, "targetMedian": 85.0}
+                       "targetLow": 80.0, "targetMedian": 85.0, "targetCount": 3}
 
 
 def test_consensus_target_as_of_ignores_future_and_pre_window_rows():

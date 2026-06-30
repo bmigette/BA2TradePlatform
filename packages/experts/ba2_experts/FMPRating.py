@@ -31,6 +31,10 @@ _UPGRADE_CACHE = TTLCache(_FMP_CACHE_TTL_SECONDS)
 _GRADES_HISTORICAL_CACHE = TTLCache(_FMP_CACHE_TTL_SECONDS)
 _PRICE_TARGET_HISTORY_CACHE = TTLCache(_FMP_CACHE_TTL_SECONDS)
 
+# FMP's price-target CONSENSUS endpoint windows to ~the last quarter, so the count
+# of price targets behind a live consensus is measured over this trailing window.
+_QUARTER_DAYS = 90
+
 # Module logger for the standalone cached fetchers (used when there is no expert
 # instance, e.g. the optimization pre-warm). The instance methods keep using their
 # per-instance expert logger.
@@ -169,6 +173,13 @@ class FMPRating(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExpertInterface
                 "default": 90,
                 "description": "Backtest-only: trailing window (days) for the reconstructed consensus price target",
                 "tooltip": "Used ONLY on the backtest (as_of) path. FMP exposes only the CURRENT consensus, so for a past as_of date the consensus price target is reconstructed as the rolling average of individual analyst price-target rows whose publishedDate is within this many days on/before the as_of date. Has no effect on the live (as_of=None) path, which keeps using FMP's current consensus endpoint. Default 90 days."
+            },
+            "min_price_targets_per_quarter": {
+                "type": "int",
+                "required": True,
+                "default": 3,
+                "description": "Minimum analyst price targets behind the consensus (0 = no check)",
+                "tooltip": "FMP's price-target CONSENSUS is windowed to ~the last quarter, so a thinly-targeted name (e.g. a single recent analyst) yields a DEGENERATE consensus where high==low==median==consensus. This requires at least N price targets behind the consensus before acting; below it the analysis is skipped. This is DISTINCT from min_analysts, which counts RATINGS (Strong Buy..Strong Sell — a much larger pool that can be plentiful even when only 1 analyst set a price target). Live: counts targets in the trailing ~quarter (matching FMP's consensus window); backtest: counts the targets behind the reconstructed consensus (the price_target_window_days window). Default 3. Set 0 to disable the check."
             }
         }
     
@@ -199,7 +210,7 @@ class FMPRating(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExpertInterface
     # snapshot/lookahead distinction so the design rationale is never silently lost.
     # ------------------------------------------------------------------
     _SETTING_KEYS = ("profit_ratio", "min_analysts", "target_price_type",
-                     "price_target_window_days")
+                     "price_target_window_days", "min_price_targets_per_quarter")
 
     @staticmethod
     def _count_analysts(upgrade_data: Optional[list]) -> int:
@@ -217,6 +228,29 @@ class FMPRating(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExpertInterface
             latest.get('hold', 0) + latest.get('sell', 0) +
             latest.get('strongSell', 0)
         )
+
+    @staticmethod
+    def _count_targets_in_window(price_target_history: Optional[list],
+                                 ref_date: datetime, window_days: int) -> int:
+        """Count individual analyst price targets published within ``window_days``
+        on/before ``ref_date`` (the pool behind a windowed consensus).
+
+        Mirrors the no-lookahead filter in ``_consensus_target_as_of`` (a row counts
+        only when its ``publishedDate`` is in (ref_date - window_days, ref_date] and it
+        carries a non-null ``priceTarget``). Used to guard against a degenerate
+        thinly-targeted consensus (see ``min_price_targets_per_quarter``)."""
+        if not price_target_history:
+            return 0
+        from datetime import timedelta
+        floor = ref_date - timedelta(days=int(window_days))
+        n = 0
+        for r in price_target_history:
+            d = _memo_provider_date(r, "publishedDate")
+            if d is None or d > ref_date or d < floor:
+                continue
+            if r.get("priceTarget") is not None:
+                n += 1
+        return n
 
     def _gather(self, providers: ProviderBundle, as_of: Optional[datetime]) -> Dict[str, Any]:
         """Fetch (live) or reconstruct (backtest) the consensus + upgrade inputs and
@@ -242,6 +276,16 @@ class FMPRating(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExpertInterface
             # upgrades when consensus is None).
             upgrade_data = (self._fetch_upgrade_downgrade(symbol)
                             if consensus_data is not None else None)
+            # Count the price targets behind FMP's live consensus (windowed to ~the last
+            # quarter) so _process can reject a thinly-targeted DEGENERATE consensus. The
+            # consensus endpoint exposes no count, so derive it from the individual
+            # price-target history over the trailing quarter. Copy the cached consensus
+            # dict before annotating so the shared TTLCache entry is never mutated.
+            if consensus_data is not None:
+                consensus_data = dict(consensus_data)
+                pt_history = self._fetch_price_target_history(symbol)
+                consensus_data["targetCount"] = self._count_targets_in_window(
+                    pt_history, datetime.now(timezone.utc), _QUARTER_DAYS)
             current_price = self._get_current_price(symbol)
         else:
             # BACKTEST path — no-lookahead reconstruction from dated history.
@@ -272,6 +316,25 @@ class FMPRating(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExpertInterface
                 current_price=current_price, details="No analyst coverage",
                 expected_profit_percent=0.0,
                 skip=True, skip_reason="no consensus data")
+
+        # Guard against a DEGENERATE thinly-targeted consensus: FMP windows its
+        # price-target consensus to ~the last quarter, so a name with a single recent
+        # analyst yields high==low==median (a one-analyst "consensus"). Require at least
+        # min_price_targets_per_quarter targets behind the consensus; 0 disables the
+        # check (the value the grid explores as "no check"). Distinct from min_analysts,
+        # which counts RATINGS (a much larger pool).
+        min_targets = int(settings.get("min_price_targets_per_quarter", 0) or 0)
+        if min_targets > 0:
+            target_count = consensus.get("targetCount")
+            if target_count is None or target_count < min_targets:
+                return Recommendation(
+                    signal=OrderRecommendation.HOLD, confidence=0.0,
+                    current_price=current_price,
+                    details=(f"Insufficient price targets behind consensus "
+                             f"({target_count if target_count is not None else 'unknown'} "
+                             f"< {min_targets})"),
+                    expected_profit_percent=0.0,
+                    skip=True, skip_reason="insufficient price targets")
 
         upgrade_data = data_bundle["upgrade_data"]
         min_analysts = int(settings["min_analysts"])
@@ -518,6 +581,10 @@ class FMPRating(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExpertInterface
             "targetHigh": max(targets),
             "targetLow": min(targets),
             "targetMedian": median,
+            # Number of analyst targets behind THIS reconstructed consensus (the pool
+            # over the trailing window) — guards a degenerate thinly-targeted consensus
+            # (see min_price_targets_per_quarter in _process).
+            "targetCount": n,
         }
 
     def _calculate_recommendation(self, consensus_data: Dict[str, Any],
