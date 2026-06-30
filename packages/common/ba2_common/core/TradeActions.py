@@ -19,7 +19,7 @@ from ba2_common.core.types import (
 )
 from ba2_common.core.db import get_db, add_instance, update_instance, get_instance
 from ba2_common.core.option_types import OptionContract, OptionLeg, OptionPosition
-from ba2_common.core.option_selector import select_single, select_vertical_spread
+from ba2_common.core.option_selector import select_single, select_vertical_spread, select_wing
 from ba2_common.logger import logger
 
 
@@ -2397,6 +2397,79 @@ class OpenShortStrangleAction(_OptionEntryAction):
         return f"Open short strangle on {self.instrument_name}"
 
 
+class OpenIronCondorAction(_OptionEntryAction):
+    """Iron condor (4 legs, credit, defined risk): SELL OTM put + BUY farther-OTM put
+    + SELL OTM call + BUY farther-OTM call. Short legs at ``strike_param`` %OTM; wings
+    ``wing_width_pct`` farther OTM. Credit = short bids - long asks (limit negative).
+    Max loss = (wing width - credit); reserved per contract."""
+
+    DEFAULT_OTM_PCT = 10.0
+    DEFAULT_WING_PCT = 5.0
+
+    def _action_type_value(self) -> str:
+        return ExpertActionType.OPEN_IRON_CONDOR.value
+
+    def _build_and_submit(self) -> Dict[str, Any]:
+        call_chain = self._chain(OptionRight.CALL)
+        put_chain = self._chain(OptionRight.PUT)
+        if not call_chain or not put_chain:
+            return self._result(False, f"Empty option chain for {self.instrument_name}")
+        spot = self._spot()
+        otm = self.strike_param if self.strike_param is not None else self.DEFAULT_OTM_PCT
+        wing = self.wing_width_pct if self.wing_width_pct is not None else self.DEFAULT_WING_PCT
+        sc = select_single(call_chain, method="percent_otm", strike_param=otm, spot=spot,
+                           option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
+                           today=self._today(), min_open_interest=self.min_open_interest,
+                           max_spread_pct=self.max_spread_pct)
+        sp = select_single(put_chain, method="percent_otm", strike_param=otm, spot=spot,
+                           option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
+                           today=self._today(), min_open_interest=self.min_open_interest,
+                           max_spread_pct=self.max_spread_pct)
+        if sc is None or sp is None:
+            return self._result(False, f"No liquid short legs for iron condor on {self.instrument_name}")
+        # Wings farther OTM, same expiry as the matching short leg.
+        lc = select_wing(call_chain, center_strike=sc.strike, width_pct=wing,
+                         option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
+                         today=self._today(), expiry=sc.expiry,
+                         min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct)
+        lp = select_wing(put_chain, center_strike=sp.strike, width_pct=wing,
+                         option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
+                         today=self._today(), expiry=sp.expiry,
+                         min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct)
+        if lc is None or lp is None or lc.strike <= sc.strike or lp.strike >= sp.strike:
+            return self._result(False, f"No valid wings for iron condor on {self.instrument_name}")
+        if None in (sc.bid, sp.bid, lc.ask, lp.ask):
+            return self._result(False, f"Missing quotes for iron condor on {self.instrument_name}")
+        net_credit = round(sc.bid + sp.bid - lc.ask - lp.ask, 4)
+        if net_credit <= 0:
+            return self._result(False, f"Non-positive credit for {self.instrument_name} iron condor")
+        width = max(lc.strike - sc.strike, sp.strike - lp.strike)
+        max_loss = max(0.0, width - net_credit)
+        per_contract_reserve = max_loss * 100.0
+        quantity = self._size_by_reserve(per_contract_reserve, self.sizing) if per_contract_reserve > 0 else 0
+        if quantity < 1:
+            return self._result(False, f"Insufficient budget to size iron condor for {self.instrument_name}")
+        reserve = self.account.option_reserve_required(
+            "iron_condor", quantity, spread_width=width, net_credit=net_credit)
+        if not self.account.check_option_buying_power(reserve):
+            return self._result(False, f"Insufficient BP for iron condor on {self.instrument_name}")
+        legs = [
+            OptionLeg(contract_symbol=sp.symbol, side=OrderDirection.SELL, position_intent="sell_to_open",
+                      option_type=OptionRight.PUT, strike=sp.strike, expiry=sp.expiry, underlying=sp.underlying),
+            OptionLeg(contract_symbol=lp.symbol, side=OrderDirection.BUY, position_intent="buy_to_open",
+                      option_type=OptionRight.PUT, strike=lp.strike, expiry=lp.expiry, underlying=lp.underlying),
+            OptionLeg(contract_symbol=sc.symbol, side=OrderDirection.SELL, position_intent="sell_to_open",
+                      option_type=OptionRight.CALL, strike=sc.strike, expiry=sc.expiry, underlying=sc.underlying),
+            OptionLeg(contract_symbol=lc.symbol, side=OrderDirection.BUY, position_intent="buy_to_open",
+                      option_type=OptionRight.CALL, strike=lc.strike, expiry=lc.expiry, underlying=lc.underlying),
+        ]
+        return self._submit_option_order(legs, quantity, -net_credit, "iron_condor",
+                                         option_reserve=reserve)
+
+    def get_description(self) -> str:
+        return f"Open iron condor on {self.instrument_name}"
+
+
 def build_closing_legs(children, parent_quantity: int, quote_fn) -> "tuple[List[OptionLeg], Optional[float]]":
     """Build reversed legs (and a net limit price) that close a spread's child legs.
 
@@ -2658,6 +2731,7 @@ def create_action(action_type: ExpertActionType, instrument_name: str, account: 
         ExpertActionType.OPEN_STRANGLE: OpenStrangleAction,
         ExpertActionType.OPEN_SHORT_STRADDLE: OpenShortStraddleAction,
         ExpertActionType.OPEN_SHORT_STRANGLE: OpenShortStrangleAction,
+        ExpertActionType.OPEN_IRON_CONDOR: OpenIronCondorAction,
         ExpertActionType.CLOSE_OPTION: CloseOptionAction,
     }
     

@@ -40,12 +40,21 @@ class FakeAccount(OptionsAccountInterface):
     # chain: strikes around spot for both rights, 30 DTE
     def get_option_chain(self, underlying, expiry_min, expiry_max, option_type,
                          strike_min=None, strike_max=None):
+        # Premium decays with OTM distance from spot so farther-OTM wings are
+        # cheaper than the shorts (required for a defined-risk net credit, e.g.
+        # iron condor). ATM stays richest (short straddle credit).
         out = []
         for s in range(80, 121, 5):
+            if option_type == OptionRight.CALL:
+                otm_dist = max(float(s) - self._spot, 0.0)
+            else:
+                otm_dist = max(self._spot - float(s), 0.0)
+            bid = max(0.2, 5.0 - 0.08 * otm_dist)
+            ask = round(bid + 0.2, 4)
             out.append(OptionContract(
                 symbol=f"{underlying}{s}{'C' if option_type==OptionRight.CALL else 'P'}",
                 underlying=underlying, option_type=option_type, strike=float(s),
-                expiry=date(2024, 6, 21), bid=2.0, ask=2.2, last=2.1,
+                expiry=date(2024, 6, 21), bid=round(bid, 4), ask=ask, last=round(bid, 4),
                 open_interest=1000, delta=None, implied_volatility=None))
         return out
     def submit_option_order(self, *, legs, quantity, order_type, limit_price,
@@ -105,3 +114,19 @@ def test_short_straddle_same_strike_both_short():
     assert len(legs) == 2 and legs[0].strike == legs[1].strike
     assert all(l.side == OrderDirection.SELL for l in legs)
     assert sub["limit_price"] < 0
+
+
+def test_iron_condor_four_legs_credit_defined_risk():
+    acct, act = _mk("open_iron_condor", strike_method="percent_otm",
+                    strike_param=10.0, dte_min=20, dte_max=40, sizing=20.0,
+                    wing_width_pct=5.0)
+    res = act.execute()
+    assert res["success"], res["message"]
+    sub = acct.submitted[0]
+    assert sub["strategy"] == "iron_condor"
+    legs = sub["legs"]
+    assert len(legs) == 4
+    sells = [l for l in legs if l.side == OrderDirection.SELL]
+    buys = [l for l in legs if l.side == OrderDirection.BUY]
+    assert len(sells) == 2 and len(buys) == 2
+    assert sub["limit_price"] < 0  # net credit
