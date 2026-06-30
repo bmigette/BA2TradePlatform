@@ -130,3 +130,18 @@ def test_iron_condor_four_legs_credit_defined_risk():
     buys = [l for l in legs if l.side == OrderDirection.BUY]
     assert len(sells) == 2 and len(buys) == 2
     assert sub["limit_price"] < 0  # net credit
+
+
+def test_jade_lizard_three_legs_credit():
+    acct, act = _mk("open_jade_lizard", strike_method="percent_otm",
+                    strike_param=10.0, dte_min=20, dte_max=40, sizing=20.0,
+                    wing_width_pct=5.0)
+    res = act.execute()
+    assert res["success"], res["message"]
+    sub = acct.submitted[0]
+    assert sub["strategy"] == "jade_lizard"
+    legs = sub["legs"]
+    assert len(legs) == 3
+    assert sum(1 for l in legs if l.side == OrderDirection.SELL) == 2
+    assert sum(1 for l in legs if l.side == OrderDirection.BUY) == 1
+    assert sub["limit_price"] < 0

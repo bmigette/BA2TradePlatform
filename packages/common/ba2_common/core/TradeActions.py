@@ -2470,6 +2470,69 @@ class OpenIronCondorAction(_OptionEntryAction):
         return f"Open iron condor on {self.instrument_name}"
 
 
+class OpenJadeLizardAction(_OptionEntryAction):
+    """Jade lizard (3 legs, credit): SELL OTM put + SELL OTM call + BUY farther-OTM
+    call (caps call-side risk). Short legs at ``strike_param`` %OTM; call wing
+    ``wing_width_pct`` farther OTM. Put side remains naked (reserve strike*100).
+    Credit = sp.bid + sc.bid - lc.ask (limit negative)."""
+
+    DEFAULT_OTM_PCT = 10.0
+    DEFAULT_WING_PCT = 5.0
+
+    def _action_type_value(self) -> str:
+        return ExpertActionType.OPEN_JADE_LIZARD.value
+
+    def _build_and_submit(self) -> Dict[str, Any]:
+        call_chain = self._chain(OptionRight.CALL)
+        put_chain = self._chain(OptionRight.PUT)
+        if not call_chain or not put_chain:
+            return self._result(False, f"Empty option chain for {self.instrument_name}")
+        spot = self._spot()
+        otm = self.strike_param if self.strike_param is not None else self.DEFAULT_OTM_PCT
+        wing = self.wing_width_pct if self.wing_width_pct is not None else self.DEFAULT_WING_PCT
+        sc = select_single(call_chain, method="percent_otm", strike_param=otm, spot=spot,
+                           option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
+                           today=self._today(), min_open_interest=self.min_open_interest,
+                           max_spread_pct=self.max_spread_pct)
+        sp = select_single(put_chain, method="percent_otm", strike_param=otm, spot=spot,
+                           option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
+                           today=self._today(), min_open_interest=self.min_open_interest,
+                           max_spread_pct=self.max_spread_pct)
+        if sc is None or sp is None:
+            return self._result(False, f"No liquid short legs for jade lizard on {self.instrument_name}")
+        lc = select_wing(call_chain, center_strike=sc.strike, width_pct=wing,
+                         option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
+                         today=self._today(), expiry=sc.expiry,
+                         min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct)
+        if lc is None or lc.strike <= sc.strike:
+            return self._result(False, f"No valid call wing for jade lizard on {self.instrument_name}")
+        if None in (sc.bid, sp.bid, lc.ask):
+            return self._result(False, f"Missing quotes for jade lizard on {self.instrument_name}")
+        net_credit = round(sc.bid + sp.bid - lc.ask, 4)
+        if net_credit <= 0:
+            return self._result(False, f"Non-positive credit for {self.instrument_name} jade lizard")
+        per_contract_reserve = sp.strike * 100.0       # put side naked
+        quantity = self._size_by_reserve(per_contract_reserve, self.sizing)
+        if quantity < 1:
+            return self._result(False, f"Insufficient budget to size jade lizard for {self.instrument_name}")
+        reserve = self.account.option_reserve_required("naked_put", quantity, strike=sp.strike)
+        if not self.account.check_option_buying_power(reserve):
+            return self._result(False, f"Insufficient BP for jade lizard on {self.instrument_name}")
+        legs = [
+            OptionLeg(contract_symbol=sp.symbol, side=OrderDirection.SELL, position_intent="sell_to_open",
+                      option_type=OptionRight.PUT, strike=sp.strike, expiry=sp.expiry, underlying=sp.underlying),
+            OptionLeg(contract_symbol=sc.symbol, side=OrderDirection.SELL, position_intent="sell_to_open",
+                      option_type=OptionRight.CALL, strike=sc.strike, expiry=sc.expiry, underlying=sc.underlying),
+            OptionLeg(contract_symbol=lc.symbol, side=OrderDirection.BUY, position_intent="buy_to_open",
+                      option_type=OptionRight.CALL, strike=lc.strike, expiry=lc.expiry, underlying=lc.underlying),
+        ]
+        return self._submit_option_order(legs, quantity, -net_credit, "jade_lizard",
+                                         option_reserve=reserve)
+
+    def get_description(self) -> str:
+        return f"Open jade lizard on {self.instrument_name}"
+
+
 def build_closing_legs(children, parent_quantity: int, quote_fn) -> "tuple[List[OptionLeg], Optional[float]]":
     """Build reversed legs (and a net limit price) that close a spread's child legs.
 
@@ -2732,6 +2795,7 @@ def create_action(action_type: ExpertActionType, instrument_name: str, account: 
         ExpertActionType.OPEN_SHORT_STRADDLE: OpenShortStraddleAction,
         ExpertActionType.OPEN_SHORT_STRANGLE: OpenShortStrangleAction,
         ExpertActionType.OPEN_IRON_CONDOR: OpenIronCondorAction,
+        ExpertActionType.OPEN_JADE_LIZARD: OpenJadeLizardAction,
         ExpertActionType.CLOSE_OPTION: CloseOptionAction,
     }
     
