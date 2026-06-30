@@ -229,6 +229,15 @@ class OptionsAccountInterface(ABC):
                 return 0.0
             max_loss = (spread_width - net_credit)
             return max(0.0, max_loss) * 100.0 * quantity
+        if strategy in ("short_straddle", "short_strangle", "naked_put", "put_ratio_spread"):
+            if strike is None:
+                return 0.0
+            return strike * 100.0 * quantity
+        if strategy in ("iron_condor", "jade_lizard", "call_butterfly", "debit_spread"):
+            if spread_width is None:
+                return 0.0
+            credit = net_credit if net_credit is not None else 0.0
+            return max(0.0, (spread_width - credit)) * 100.0 * quantity
         return 0.0
 
     def reserved_option_buying_power(self) -> float:
