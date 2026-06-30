@@ -19,7 +19,7 @@ from ba2_common.core.types import (
 )
 from ba2_common.core.db import get_db, add_instance, update_instance, get_instance
 from ba2_common.core.option_types import OptionContract, OptionLeg, OptionPosition
-from ba2_common.core.option_selector import select_single, select_vertical_spread, select_wing
+from ba2_common.core.option_selector import select_single, select_vertical_spread, select_wing, passes_liquidity
 from ba2_common.logger import logger
 
 
@@ -2533,6 +2533,68 @@ class OpenJadeLizardAction(_OptionEntryAction):
         return f"Open jade lizard on {self.instrument_name}"
 
 
+class OpenCallButterflyAction(_OptionEntryAction):
+    """Long call butterfly (debit, 1-2-1): BUY 1 lower call + SELL 2 body calls +
+    BUY 1 upper call. Body at ``strike_param`` %OTM (~ATM at 0); wings
+    ``wing_width_pct`` below/above the body. Net debit = lower.ask + upper.ask
+    - 2*body.bid (limit positive). Size off the debit."""
+
+    DEFAULT_BODY_PCT = 0.0
+    DEFAULT_WING_PCT = 10.0
+
+    def _action_type_value(self) -> str:
+        return ExpertActionType.OPEN_CALL_BUTTERFLY.value
+
+    def _build_and_submit(self) -> Dict[str, Any]:
+        chain = self._chain(OptionRight.CALL)
+        if not chain:
+            return self._result(False, f"Empty option chain for {self.instrument_name}")
+        spot = self._spot()
+        body_otm = self.strike_param if self.strike_param is not None else self.DEFAULT_BODY_PCT
+        wing = self.wing_width_pct if self.wing_width_pct is not None else self.DEFAULT_WING_PCT
+        body = select_single(chain, method="percent_otm", strike_param=body_otm, spot=spot,
+                             option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
+                             today=self._today(), min_open_interest=self.min_open_interest,
+                             max_spread_pct=self.max_spread_pct)
+        if body is None:
+            return self._result(False, f"No liquid body call for butterfly on {self.instrument_name}")
+        upper = select_wing(chain, center_strike=body.strike, width_pct=wing,
+                            option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
+                            today=self._today(), expiry=body.expiry,
+                            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct)
+        # Lower wing: a call BELOW the body. Reuse select_wing with a PUT-style downward
+        # target by searching for strike nearest body*(1 - wing%).
+        lower_target = body.strike * (1 - wing / 100.0)
+        lower_cands = [c for c in chain if c.expiry == body.expiry and c.strike < body.strike
+                       and passes_liquidity(c, self.min_open_interest, self.max_spread_pct)]
+        lower = min(lower_cands, key=lambda c: abs(c.strike - lower_target)) if lower_cands else None
+        if upper is None or lower is None or upper.strike <= body.strike or lower.strike >= body.strike:
+            return self._result(False, f"No valid wings for butterfly on {self.instrument_name}")
+        if None in (lower.ask, upper.ask, body.bid):
+            return self._result(False, f"Missing quotes for butterfly on {self.instrument_name}")
+        net_debit = round(lower.ask + upper.ask - 2 * body.bid, 4)
+        if net_debit <= 0:
+            return self._result(False, f"Non-positive debit for {self.instrument_name} butterfly")
+        quantity = self._size(net_debit, self.sizing)
+        if quantity < 1:
+            return self._result(False, f"Insufficient budget to size butterfly for {self.instrument_name}")
+        legs = [
+            OptionLeg(contract_symbol=lower.symbol, side=OrderDirection.BUY, ratio_qty=1,
+                      position_intent="buy_to_open", option_type=OptionRight.CALL,
+                      strike=lower.strike, expiry=lower.expiry, underlying=lower.underlying),
+            OptionLeg(contract_symbol=body.symbol, side=OrderDirection.SELL, ratio_qty=2,
+                      position_intent="sell_to_open", option_type=OptionRight.CALL,
+                      strike=body.strike, expiry=body.expiry, underlying=body.underlying),
+            OptionLeg(contract_symbol=upper.symbol, side=OrderDirection.BUY, ratio_qty=1,
+                      position_intent="buy_to_open", option_type=OptionRight.CALL,
+                      strike=upper.strike, expiry=upper.expiry, underlying=upper.underlying),
+        ]
+        return self._submit_option_order(legs, quantity, net_debit, "call_butterfly")
+
+    def get_description(self) -> str:
+        return f"Open call butterfly on {self.instrument_name}"
+
+
 def build_closing_legs(children, parent_quantity: int, quote_fn) -> "tuple[List[OptionLeg], Optional[float]]":
     """Build reversed legs (and a net limit price) that close a spread's child legs.
 
@@ -2796,6 +2858,7 @@ def create_action(action_type: ExpertActionType, instrument_name: str, account: 
         ExpertActionType.OPEN_SHORT_STRANGLE: OpenShortStrangleAction,
         ExpertActionType.OPEN_IRON_CONDOR: OpenIronCondorAction,
         ExpertActionType.OPEN_JADE_LIZARD: OpenJadeLizardAction,
+        ExpertActionType.OPEN_CALL_BUTTERFLY: OpenCallButterflyAction,
         ExpertActionType.CLOSE_OPTION: CloseOptionAction,
     }
     

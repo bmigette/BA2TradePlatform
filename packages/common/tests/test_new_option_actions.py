@@ -40,16 +40,26 @@ class FakeAccount(OptionsAccountInterface):
     # chain: strikes around spot for both rights, 30 DTE
     def get_option_chain(self, underlying, expiry_min, expiry_max, option_type,
                          strike_min=None, strike_max=None):
-        # Premium decays with OTM distance from spot so farther-OTM wings are
-        # cheaper than the shorts (required for a defined-risk net credit, e.g.
-        # iron condor). ATM stays richest (short straddle credit).
+        # Premium = intrinsic value + time value. Time value decays with OTM
+        # distance from spot so farther-OTM wings are cheaper than the shorts
+        # (required for a defined-risk net credit, e.g. iron condor); ATM stays
+        # richest in time value (short straddle credit). Intrinsic value
+        # (max(spot-strike,0) for calls, max(strike-spot,0) for puts) is added
+        # for ITM contracts. This makes the premium curve CONVEX in strike, which
+        # is what makes a long butterfly cost a small net debit
+        # (lower.ask + upper.ask > 2*body.bid). Without intrinsic the model is a
+        # symmetric V around spot and a butterfly comes out as a credit, which is
+        # unrealistic. The OTM-only credit structures are unaffected because none
+        # of their legs are ITM (intrinsic == 0 there).
         out = []
         for s in range(80, 121, 5):
             if option_type == OptionRight.CALL:
                 otm_dist = max(float(s) - self._spot, 0.0)
+                intrinsic = max(self._spot - float(s), 0.0)
             else:
                 otm_dist = max(self._spot - float(s), 0.0)
-            bid = max(0.2, 5.0 - 0.08 * otm_dist)
+                intrinsic = max(float(s) - self._spot, 0.0)
+            bid = max(0.2, 5.0 - 0.08 * otm_dist) + intrinsic
             ask = round(bid + 0.2, 4)
             out.append(OptionContract(
                 symbol=f"{underlying}{s}{'C' if option_type==OptionRight.CALL else 'P'}",
@@ -145,3 +155,20 @@ def test_jade_lizard_three_legs_credit():
     assert sum(1 for l in legs if l.side == OrderDirection.SELL) == 2
     assert sum(1 for l in legs if l.side == OrderDirection.BUY) == 1
     assert sub["limit_price"] < 0
+
+
+def test_call_butterfly_three_strikes_ratio_121_debit():
+    acct, act = _mk("open_call_butterfly", strike_method="percent_otm",
+                    strike_param=0.0, dte_min=20, dte_max=40, sizing=10.0,
+                    wing_width_pct=10.0)
+    res = act.execute()
+    assert res["success"], res["message"]
+    sub = acct.submitted[0]
+    assert sub["strategy"] == "call_butterfly"
+    legs = sub["legs"]
+    assert len(legs) == 3
+    body = [l for l in legs if l.side == OrderDirection.SELL]
+    wings = [l for l in legs if l.side == OrderDirection.BUY]
+    assert len(body) == 1 and body[0].ratio_qty == 2
+    assert len(wings) == 2 and all(w.ratio_qty == 1 for w in wings)
+    assert sub["limit_price"] > 0  # net debit
