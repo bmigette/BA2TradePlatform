@@ -1027,6 +1027,55 @@ Final Confidence = Base Confidence + Directional Boost ({signal.value}) = {base_
             self.logger.error(f"Failed to create ExpertRecommendation for {symbol}: {e}", exc_info=True)
             raise
     
+    def _format_analyst_details_md(self, symbol: str, limit: int = 15) -> Optional[str]:
+        """Markdown of the most recent INDIVIDUAL analyst ratings + price targets, for the UI.
+
+        LIVE-ONLY (called from _store_analysis_outputs, which the backtest never invokes), so it
+        has NO effect on the backtest/_process decision path. Reads the dated grades + price-target
+        history caches (both already warmed); best-effort — any fetch error returns None so it can
+        never break analysis persistence. Returns None when neither source has data."""
+        try:
+            grades = self._fetch_analyst_grades(symbol) or []
+            targets = self._fetch_price_target_history(symbol) or []
+        except Exception as e:  # noqa: BLE001 — detail block is best-effort, never fatal
+            self.logger.debug(f"Analyst details unavailable for {symbol}: {e}")
+            return None
+        if not grades and not targets:
+            return None
+
+        _floor = datetime.min.replace(tzinfo=timezone.utc)
+
+        def _ds(row, key):
+            d = _memo_provider_date(row, key)
+            return d.strftime("%Y-%m-%d") if d is not None else "?"
+
+        def _money(v):
+            return f"${v:.2f}" if isinstance(v, (int, float)) else "?"
+
+        parts: list = []
+        if grades:
+            recent = sorted(grades, key=lambda r: _memo_provider_date(r, "date") or _floor,
+                            reverse=True)[:limit]
+            parts.append(f"**Recent Analyst Ratings** ({len(grades)} total)\n")
+            parts.append("| Date | Analyst | Action | Grade |")
+            parts.append("|---|---|---|---|")
+            for r in recent:
+                parts.append(f"| {_ds(r, 'date')} | {r.get('gradingCompany', '?')} | "
+                             f"{r.get('action', '')} | {r.get('newGrade', '')} |")
+            parts.append("")
+        if targets:
+            recent = sorted(targets, key=lambda r: _memo_provider_date(r, "publishedDate") or _floor,
+                            reverse=True)[:limit]
+            parts.append(f"**Recent Price Targets** ({len(targets)} total)\n")
+            parts.append("| Date | Analyst | Price Target | Price When Posted |")
+            parts.append("|---|---|---|---|")
+            for r in recent:
+                company = r.get("analystCompany") or r.get("analystName") or "?"
+                parts.append(f"| {_ds(r, 'publishedDate')} | {company} | "
+                             f"{_money(r.get('priceTarget'))} | {_money(r.get('priceWhenPosted'))} |")
+            parts.append("")
+        return "\n".join(parts)
+
     def _store_analysis_outputs(self, market_analysis_id: int, symbol: str,
                                recommendation_data: Dict[str, Any],
                                consensus_data: Dict[str, Any],
@@ -1086,7 +1135,18 @@ Final Confidence = Base Confidence + Directional Boost ({signal.value}) = {base_
                     text=json.dumps(upgrade_data, indent=2)
                 )
                 session.add(upgrade_output)
-            
+
+            # Per-analyst grades + price targets (markdown) so the UI shows WHO rated and WHEN,
+            # and the individual targets behind the consensus. Best-effort (None -> omit).
+            analyst_details_md = self._format_analyst_details_md(symbol)
+            if analyst_details_md:
+                session.add(AnalysisOutput(
+                    market_analysis_id=market_analysis_id,
+                    name="Analyst Grades & Price Targets",
+                    type="fmp_analyst_details",
+                    text=analyst_details_md,
+                ))
+
             session.commit()
             
         except Exception as e:

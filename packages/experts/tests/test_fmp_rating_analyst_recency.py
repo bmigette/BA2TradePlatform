@@ -103,3 +103,37 @@ def test_process_recency_skips_when_no_grades():
     assert rec.skip is True
     assert rec.skip_reason == "insufficient analysts"
     assert "0 active within 6mo" in rec.details
+
+
+# --------------------------------------------------------------------------- #
+# _format_analyst_details_md (LIVE-only UI detail; best-effort)
+# --------------------------------------------------------------------------- #
+import logging
+
+
+def _detail_expert(grades, targets):
+    e = FMPRating.__new__(FMPRating)
+    e.logger = logging.getLogger("t")
+    e._fetch_analyst_grades = lambda s: grades
+    e._fetch_price_target_history = lambda s: targets
+    return e
+
+
+def test_format_analyst_details_md_builds_both_tables():
+    targets = [{"publishedDate": "2026-06-01", "analystCompany": "Evercore",
+                "priceTarget": 120.0, "priceWhenPosted": 100.0}]
+    md = _detail_expert(GRADES, targets)._format_analyst_details_md("ASC")
+    assert "Recent Analyst Ratings" in md and "Recent Price Targets" in md
+    assert "Alpha" in md and "Evercore" in md and "$120.00" in md
+
+
+def test_format_analyst_details_md_none_when_empty():
+    assert _detail_expert([], [])._format_analyst_details_md("ASC") is None
+
+
+def test_format_analyst_details_md_swallows_fetch_errors():
+    def boom(_s):
+        raise RuntimeError("fetch failed")
+    e = _detail_expert(None, [])
+    e._fetch_analyst_grades = boom
+    assert e._format_analyst_details_md("ASC") is None   # best-effort, never raises
