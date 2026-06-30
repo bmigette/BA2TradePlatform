@@ -329,6 +329,9 @@ def _compute_metrics(
         # thin (few-trade) configs that win on a handful of lucky trades.
         "avg_trades_per_year": round(_safe_float((total_trades / years) if years else 0.0), 2),
         "fitness_trade_scale": bool(config.get("fitness_trade_scale")),
+        # Cap (trades/year) for the scale: avg_trades_per_year is clamped to this before scaling so
+        # the GA is not rewarded for over-trading. None -> the fitness default (100 = factor <= 1.0).
+        "fitness_trade_scale_cap": config.get("fitness_trade_scale_cap"),
         "winning_trades": winning_trades,
         "losing_trades": losing_trades,
         "win_rate": round(_safe_float(win_rate), 2),

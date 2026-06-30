@@ -884,6 +884,7 @@ def _build_daily_trial_config(
         "profit_share_cap_pct": backtest_cfg.get("profit_share_cap_pct"),
         # Optional trade-frequency fitness scale (down-weight statistically thin few-trade configs).
         "fitness_trade_scale": backtest_cfg.get("fitness_trade_scale"),
+        "fitness_trade_scale_cap": backtest_cfg.get("fitness_trade_scale_cap"),
         # Optimizer-decoded condition trees: the engine builds the enter ruleset FROM buy_tree
         # (seed_ruleset_from_tree) so cond:<id>:value thresholds + on/off toggles drive entries.
         "buy_tree": decoded.get("buy_tree"),

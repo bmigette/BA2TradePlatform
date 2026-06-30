@@ -80,11 +80,16 @@ def compute_fitness(fitness_metric: str, results: dict) -> float:
         return ZERO_TRADE_SENTINEL
     val = float(val)
     # Optional TRADE-FREQUENCY scale (``fitness_trade_scale``): multiply the fitness by
-    # avg_trades_per_year / 100, so a statistically thin config (few trades over the run) is
-    # down-weighted and a high-frequency one is up-weighted. ~100 trades/yr is the break-even
-    # (factor 1.0); a 16-trade/3yr config (~5/yr) is scaled x0.05, crushing lottery winners.
-    # Applied only to a POSITIVE fitness — scaling a losing (<=0) fitness toward 0 would wrongly
-    # FAVOUR a thin loser, so those are left unchanged (the GA discards them either way).
+    # min(avg_trades_per_year, cap) / 100, so a statistically thin config (few trades over the run)
+    # is down-weighted. ~100 trades/yr is the break-even (factor 1.0); a 16-trade/3yr config (~5/yr)
+    # is scaled x0.05, crushing lottery winners. The CAP (``fitness_trade_scale_cap``, default 100)
+    # clamps avg_trades_per_year BEFORE scaling so the factor stops growing above it — the GA is
+    # therefore NOT rewarded for over-trading (a scalper aiming for the multiplier). With the
+    # default cap=100 the factor maxes at 1.0 (a pure thinness penalty); a higher cap allows some
+    # up-weighting up to that rate. Applied only to a POSITIVE fitness — scaling a losing (<=0)
+    # fitness toward 0 would wrongly FAVOUR a thin loser, so those are left unchanged.
     if results.get("fitness_trade_scale") and val > 0:
-        val *= (results.get("avg_trades_per_year") or 0.0) / 100.0
+        cap = float(results.get("fitness_trade_scale_cap") or 100.0)
+        tpy = results.get("avg_trades_per_year") or 0.0
+        val *= min(float(tpy), cap) / 100.0
     return val
