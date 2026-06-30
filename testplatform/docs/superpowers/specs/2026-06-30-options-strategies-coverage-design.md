@@ -47,6 +47,60 @@ greeks/IV**, so delta selection is unsupported.
   negative: retry a few times, verify it is not a bug, try a different cached
   window; if still negative, report it for revisit. No forcing.
 
+## Entry-option-action mechanism (engine change — discovered in planning)
+
+The backtest entry path is hardcoded to open an **equity** position:
+`seed_ruleset_from_tree` / `_entry_actions` (`default_rulesets.py`) emit a fixed
+equity `BUY`/`SELL`, and `_run_expert_bar` (`daily_engine.py`) executes entry
+rules with `submit_to_broker=False` → the classic RM sizes the qty=0 PENDING
+order and submits it later (`_size_and_submit`). Option actions today only fire
+via the **OPEN_POSITIONS overlay** path (`_manage_open_positions`, executed with
+`submit_to_broker=True`) on an already-held equity position.
+
+For **pure-option** strategies (long call, short strangle, condor, lizard,
+butterfly, ratio, vertical) we must let the **enter_market** ruleset fire the
+option action directly — no equity leg. **User-confirmed approach.** Changes:
+
+1. **Strategy/config carries an entry action.** A `Strategy` may declare an
+   `entry_action` (option action config: action_type + strike/dte/wing/sizing).
+   The launcher builds it; the handler threads it into `config["entry_action"]`.
+2. **Entry seeder emits it.** `_entry_actions` / `seed_ruleset_from_tree` accept
+   an `entry_action` and, when present, emit that option action (via
+   `rule_builders.action_from_rule` shape) instead of equity `BUY`. Triggers
+   stay `bullish + has_no_position + gates`.
+3. **Engine submits it directly.** `_run_expert_bar` detects an option entry
+   action (per-expert flag derived from the enter ruleset / config) and calls
+   `evaluator.execute(submit_to_broker=True)` so the `_OptionEntryAction`
+   sizes + submits itself (mirrors `_manage_open_positions`). `_size_and_submit`
+   stays a safe no-op (no PENDING qty=0 equity orders exist for option entries).
+4. **Detection.** `strategy_uses_options` must also return True when the
+   **entry** action is an option action (today it scans exit rules only), so the
+   handler injects the `HistoricalOptionsProvider` + options cache.
+5. **Re-entry guard.** Confirm `F_HAS_NO_POSITION` counts a held OPTION position
+   (so the entry rule doesn't re-fire while an option is open); fix if it only
+   counts equity.
+
+**Covered call (`O_CC`) stays on the overlay path** (it genuinely needs the
+equity long first): equity entry + a `sell_covered_call` OPEN_POSITIONS rule.
+**Stock (`O_STK`)** is plain equity entry. All other strategies use the new
+entry-option path.
+
+## Performance constraint (hard requirement)
+
+The per-bar option open/fill/marking path MUST reuse the existing optimized
+machinery — **no new per-bar DB churn**:
+- Option entry orders are created during the cadence-gated analysis pass (already
+  sets `book_dirty=True`), so the existing single `invalidate_order_cache()` +
+  in-memory `refresh_orders()` fill path picks them up — no extra DB reads on
+  no-event bars.
+- `_apply_option_expiry` / `get_option_positions()` already short-circuit to `[]`
+  when no options provider is present (equity runs stay byte-identical / free).
+- Honor the existing `frozen_ttl_cache` / `activity_logging_disabled` /
+  no-op-gating context managers; option fills read premium from the in-memory
+  options cache (no per-bar sqlite hit beyond the existing as-of clamp).
+- A perf-verification task asserts an option run does not add per-bar DB queries
+  vs. the equity baseline pattern.
+
 ## Architecture
 
 Mirror the existing **one explicit action class per strategy** pattern
