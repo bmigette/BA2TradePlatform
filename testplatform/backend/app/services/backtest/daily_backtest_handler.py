@@ -109,11 +109,16 @@ def default_options_cache_db() -> str:
     backtest_cache_dir = os.environ.get("BACKTEST_CACHE_DIR")
     if backtest_cache_dir:
         cache_dir = pathlib.Path(backtest_cache_dir)
-    else:
-        from ba2_common.config import OPTIONS_CACHE_DB
-        cache_dir = pathlib.Path(OPTIONS_CACHE_DB).parent
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    return str(cache_dir / _DEFAULT_OPTIONS_CACHE_FILENAME)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return str(cache_dir / _DEFAULT_OPTIONS_CACHE_FILENAME)
+    # Canonical shared options cache: the SAME file ``ba2-test fetch-options`` writes and the
+    # distributed workers expect (``ba2_common.config.OPTIONS_CACHE_DB`` ->
+    # ``.../options/options_history.sqlite``). Previously this returned a sibling
+    # ``options_cache.sqlite`` in the same dir, so a locally-built cache was never found by a
+    # local optimize run — reconciled here to one canonical path.
+    from ba2_common.config import OPTIONS_CACHE_DB
+    pathlib.Path(OPTIONS_CACHE_DB).parent.mkdir(parents=True, exist_ok=True)
+    return OPTIONS_CACHE_DB
 
 
 # Payload keys the handler REQUIRES (validated fail-early, no defaults).
