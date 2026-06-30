@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from ba2_providers.screener import metric_store as ms
 
@@ -343,3 +344,41 @@ def test_recompute_price_drop_columns_cache_only_inplace(tmp_path):
     for m in ("2024-01", "2024-02"):
         parts = glob.glob(os.path.join(store, f"ym={m}", "*.parquet"))
         assert parts == [os.path.join(store, f"ym={m}", "part.parquet")]
+
+
+def test_recompute_momentum_column_cache_only_inplace(tmp_path):
+    """recompute_momentum_column ADDS only the momentum_12_1 column from a (cache-only) daily OHLCV
+    getter, in place: present + sampled as-of for a covered symbol, NaN for an uncached one, every
+    other column untouched, and the value matches momentum_12_1_series at the store date."""
+    store = str(tmp_path / "mstore")
+    seed = pd.DataFrame({
+        "symbol": ["AAA", "BBB"], "date": ["2024-12-31", "2024-12-31"],
+        "close": [130.0, 50.0], "market_cap": [5e9, 1e9],
+        "relative_volume": [2.0, 1.0], "price_drop_pct": [0.1, 0.0],
+        "sector": ["Tech", "Energy"], "volume": [2e6, 1e6], "price": [130.0, 50.0]})
+    ms.write_partitions(store, seed)
+
+    # ~2 years of daily closes for AAA (enough history for a real 12-1 momentum); none for BBB.
+    aaa_idx = pd.date_range("2023-01-02", "2024-12-31", freq="B")
+    aaa_close = pd.Series(np.linspace(80, 130, len(aaa_idx)), index=aaa_idx)
+    aaa = pd.DataFrame({"Open": aaa_close, "High": aaa_close, "Low": aaa_close,
+                        "Close": aaa_close, "Volume": [1e6] * len(aaa_idx)})
+
+    def _getter(sym):
+        return aaa if sym == "AAA" else None      # BBB has no cache -> skipped (momentum NaN)
+
+    res = ms.recompute_momentum_column(store, _getter)
+    assert res["recomputed"] == 1 and res["skipped"] == 1 and res["skipped_symbols"] == ["BBB"]
+
+    ms.clear_store_memo()
+    out = ms.load_store(store)
+    assert "momentum_12_1" in out.columns
+    aaa_row = out[out["symbol"] == "AAA"].iloc[0]
+    # value matches the series sampled as-of the store date (ffill to latest daily <= date).
+    expected = (ms.momentum_12_1_series(aaa_close)
+                .round(6).reindex(pd.to_datetime(["2024-12-31"]), method="ffill").iloc[0])
+    assert aaa_row["momentum_12_1"] == pytest.approx(expected)
+    assert aaa_row["momentum_12_1"] > 0.0                     # rising series -> positive momentum
+    assert aaa_row["market_cap"] == 5e9                       # untouched
+    # BBB skipped -> momentum stays NaN (consumer maps NaN -> 0.0).
+    assert pd.isna(out[out["symbol"] == "BBB"].iloc[0]["momentum_12_1"])

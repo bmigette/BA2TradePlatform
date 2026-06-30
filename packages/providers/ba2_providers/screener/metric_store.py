@@ -609,6 +609,78 @@ def recompute_price_drop_columns(store_dir: str, ohlcv_get, *,
             "max_lookback": int(max_lookback), "drop_days": int(drop_days)}
 
 
+def recompute_momentum_column(store_dir: str, ohlcv_get, *,
+                              lookback: int = 252, skip: int = 21) -> Dict[str, Any]:
+    """CACHE-ONLY in-place add/rebuild of ONLY the ``momentum_12_1`` column of an existing store.
+
+    Mirrors ``recompute_price_drop_columns`` but for the precomputed 12-1 momentum factor: for each
+    symbol already in the store, reads its DAILY OHLCV via ``ohlcv_get(symbol)`` (a cache-only
+    getter — e.g. a direct parquet read so a miss is offline, never a network fetch), computes the
+    per-bar momentum (``momentum_12_1_series``), samples it AS-OF each existing store date (latest
+    daily <= date via ffill), and writes it back — consolidating each ``ym=`` month into a single
+    ``part.parquet`` (stale flush files removed). Every OTHER column is left untouched.
+
+    Used to ADD ``momentum_12_1`` to a store built before the column existed, so FactorRanker reads
+    momentum point-in-time from the store instead of fetching ~400 days of daily OHLCV per symbol per
+    rebalance. Insufficient-history momentum stays NaN (byte-identical to the build path
+    ``compute_daily_metrics``; the FactorRanker consumer maps NaN -> 0.0). Symbols whose daily OHLCV
+    is not cached (getter raises / empty) are SKIPPED with a warning (their momentum stays NaN)."""
+    import glob
+    parts = sorted(glob.glob(os.path.join(store_dir, "ym=*", "*.parquet")))
+    if not parts:
+        raise FileNotFoundError(f"empty screener metric store: {store_dir}")
+    store = pd.concat((pd.read_parquet(p) for p in parts), ignore_index=True)
+    store["date"] = store["date"].astype(str).str.slice(0, 10)
+    symbols = sorted(store["symbol"].unique())
+
+    updates: List["pd.DataFrame"] = []
+    skipped: List[str] = []
+    for sym in symbols:
+        sdates = sorted(store.loc[store["symbol"] == sym, "date"].unique())
+        try:
+            ohlcv = ohlcv_get(sym)
+        except Exception as e:  # noqa: BLE001 — cache miss / thin symbol must not abort the pass
+            skipped.append(sym)
+            logger.warning(f"recompute-momentum: skipping {sym} ({type(e).__name__}: {e})")
+            continue
+        if ohlcv is None or getattr(ohlcv, "empty", True) or "Close" not in ohlcv.columns:
+            skipped.append(sym)
+            continue
+        close = ohlcv["Close"].astype(float)
+        close.index = pd.to_datetime(close.index)
+        close = close.sort_index()
+        mom = momentum_12_1_series(close, lookback=lookback, skip=skip).round(6)
+        daily = pd.DataFrame({"momentum_12_1": mom}).sort_index()
+        target = pd.to_datetime(sdates)
+        asof = daily.reindex(target, method="ffill")          # value AS-OF each store date
+        u = pd.DataFrame({"symbol": sym, "date": [d.strftime("%Y-%m-%d") for d in target]})
+        u["momentum_12_1"] = asof["momentum_12_1"].to_numpy()
+        updates.append(u)
+
+    store = store.set_index(["symbol", "date"])
+    if "momentum_12_1" not in store.columns:                  # ensure the target column exists
+        store["momentum_12_1"] = float("nan")
+    if updates:
+        upd = pd.concat(updates, ignore_index=True).set_index(["symbol", "date"])
+        store.update(upd)                                     # overwrites only matching, non-NaN cells
+    store = store.reset_index()
+
+    # Consolidate each month to a single part.parquet, then drop the stale flush files so
+    # load_store (reads every *.parquet) doesn't double-count rows.
+    write_partitions(store_dir, store, part_name="part.parquet")
+    for m in sorted(store["date"].str.slice(0, 7).unique()):
+        d = os.path.join(store_dir, f"ym={m}")
+        for p in glob.glob(os.path.join(d, "*.parquet")):
+            if os.path.basename(p) != "part.parquet":
+                os.remove(p)
+    clear_store_memo()
+    logger.info(f"recompute-momentum: {len(symbols) - len(skipped)}/{len(symbols)} symbols "
+                f"recomputed ({len(skipped)} skipped) in {store_dir}")
+    return {"symbols": len(symbols), "recomputed": len(symbols) - len(skipped),
+            "skipped": len(skipped), "skipped_symbols": skipped,
+            "lookback": int(lookback), "skip": int(skip)}
+
+
 # The UNPREFIXED keys ``screen_universe_for_day`` (below) actually reads. The UI / optimizer /
 # saved ``screener_settings`` may carry a ``screener_`` prefix (base-interface naming) and extra
 # keys the metric store doesn't use — ``normalize_screener_settings`` maps an arbitrary settings
