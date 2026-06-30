@@ -179,8 +179,11 @@ def test_gather_skips_zero_weight_factor(monkeypatch):
     # quality/pead/momentum fetchers were never called in the factor loop
     assert "quality_as_of" not in captured
     assert "pead_as_of" not in captured
-    # fetch_close_prices is STILL called once for the bundle "prices" entry
-    assert captured["prices_as_of"] == NOW
+    # fetch_close_prices is NOT called at all here: momentum is 0-weight (so no momentum fetch) AND
+    # the bundle no longer does a separate whole-universe price fetch (it was unused; removed to
+    # stop bloating the OHLCV memo). The bundle's prices entry is empty.
+    assert "prices_as_of" not in captured
+    assert bundle["prices"] == {}
 
 
 # --------------------------------------------------------------------------- #

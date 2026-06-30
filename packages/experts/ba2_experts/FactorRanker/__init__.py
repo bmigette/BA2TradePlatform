@@ -445,6 +445,44 @@ class FactorRanker(MarketExpertInterface):
         pm = FactorPortfolioManager(self.id)
         return list(pm.get_holdings()[0])
 
+    def _store_factor_inputs(self, universe: List[str], as_of: Optional[datetime]):
+        """``(precomputed_momentum, price_as_of)`` read point-in-time from the screener metric store,
+        or ``(None, None)`` to fall back to OHLCV fetches.
+
+        Lets FactorRanker read 12-1 momentum and the as_of close from the store instead of fetching
+        ~400 days of daily OHLCV per symbol per rebalance — so it holds NO price history in memory.
+        Used ONLY when a ``screener_store`` is configured AND it covers every universe symbol with
+        the needed columns (the screener universe always does; an incomplete/old store -> full
+        OHLCV fallback, results unchanged). The values are read AS-OF (latest scan <= as_of): with a
+        DAILY store the read lands on the exact analysis bar -> byte-identical to the runtime factor
+        (daily ranking); with a weekly store they refresh on the scan cadence (held, like the
+        universe). Momentum NaN / non-positive-start -> 0.0 (matches ``factors.momentum_12_1``)."""
+        if not universe or as_of is None:
+            return None, None
+        store = (self.get_setting_with_interface_default("screener_store") or "").strip()
+        if not store:
+            return None, None
+        try:
+            import pandas as pd
+            from ba2_providers.screener import metric_store as ms
+            df = ms.load_store(store)
+            rows = ms.metrics_as_of(df, as_of.strftime("%Y-%m-%d"), ["momentum_12_1", "close"])
+        except Exception:  # noqa: BLE001 — any store issue -> safe OHLCV fallback
+            return None, None
+        if not rows or not all(s in rows for s in universe):
+            return None, None  # incomplete coverage -> full fallback (results identical)
+
+        def _num(v):
+            return None if v is None or pd.isna(v) else float(v)
+
+        momentum = None
+        if all("momentum_12_1" in rows[s] for s in universe):
+            momentum = {s: (_num(rows[s].get("momentum_12_1")) or 0.0) for s in universe}
+        price_as_of = None
+        if all(_num(rows[s].get("close")) is not None for s in universe):
+            price_as_of = {s: _num(rows[s].get("close")) for s in universe}
+        return momentum, price_as_of
+
     def _gather(self, providers: ProviderBundle, as_of: Optional[datetime]) -> Dict[str, Any]:
         """Resolve the universe, fetch + compute each enabled factor (threading
         as_of), read current holdings, and fetch as_of closes. Returns the
@@ -464,23 +502,31 @@ class FactorRanker(MarketExpertInterface):
         ohlcv_provider = providers.ohlcv()
 
         universe = self._resolve_universe(as_of)
+
+        # Precomputed point-in-time inputs from the metric store (when configured + built with them):
+        # momentum_12_1 and the as_of close, so the momentum + value factors need NO OHLCV history.
+        precomputed_momentum, price_as_of = self._store_factor_inputs(universe, as_of)
+
         factors: Dict[str, Dict[str, float]] = {}
         for name, (fetch_name, calc) in _FACTOR_PIPELINE.items():
             if float(weights.get(name, 0.0)) == 0.0:
                 continue
+            if name == "momentum" and precomputed_momentum is not None:
+                factors[name] = {s: precomputed_momentum.get(s, 0.0) for s in universe}
+                continue
             factors[name] = self._compute_factor(
                 name, fetch_name, calc, universe, as_of=as_of,
-                pead_drift_window_days=pead_window, ohlcv_provider=ohlcv_provider)
+                pead_drift_window_days=pead_window, ohlcv_provider=ohlcv_provider,
+                price_as_of=(price_as_of if name == "value" else None))
 
         holdings = self._gather_holdings() if universe else []
-        prices = (data.fetch_close_prices(universe, as_of=as_of,
-                                          ohlcv_provider=ohlcv_provider)
-                  if universe else {})
         return {
             "universe": universe,
             "factors": factors,
             "holdings": holdings,
-            "prices": prices,
+            # ``prices`` is not consumed downstream (the portfolio reads live prices off the account);
+            # it was a whole-universe OHLCV fetch that bloated the memo, so we no longer fetch it.
+            "prices": {},
             "current_price": None,   # FactorRanker is basket-level (cross-sectional)
         }
 
@@ -552,7 +598,8 @@ class FactorRanker(MarketExpertInterface):
         return self._process(bundle, settings, as_of)
 
     def _compute_factor(self, name, fetch_name, calc, universe, as_of=None,
-                        pead_drift_window_days=None, ohlcv_provider=None) -> Dict[str, float]:
+                        pead_drift_window_days=None, ohlcv_provider=None,
+                        price_as_of=None) -> Dict[str, float]:
         """Fetch a factor's inputs in bulk and run its calculator.
 
         The fetcher is looked up on the ``data`` module at call time so it stays
@@ -576,6 +623,10 @@ class FactorRanker(MarketExpertInterface):
         fetch_kwargs = {"as_of": as_of}
         if ohlcv_provider is not None and _accepts_kwarg(fetcher, "ohlcv_provider"):
             fetch_kwargs["ohlcv_provider"] = ohlcv_provider
+        # Precomputed point-in-time prices from the metric store (value factor): use them instead of
+        # an OHLCV fetch so FactorRanker holds no per-symbol price series in memory.
+        if price_as_of is not None and _accepts_kwarg(fetcher, "price_as_of"):
+            fetch_kwargs["price_as_of"] = price_as_of
         inputs = fetcher(universe, **fetch_kwargs)
         if name == "pead":
             if pead_drift_window_days is None:

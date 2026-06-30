@@ -181,7 +181,8 @@ def fetch_close_prices(symbols, lookback_days: int = 400,
 
 
 def fetch_value_inputs(symbols, as_of: Optional[datetime] = None,
-                       ohlcv_provider=None) -> Dict[str, dict]:
+                       ohlcv_provider=None,
+                       price_as_of: Optional[Dict[str, float]] = None) -> Dict[str, dict]:
     """{symbol: {eps_ttm, price, fcf_ttm, enterprise_value}} from latest annual fundamentals.
 
     NO-LOOKAHEAD: ``price`` and ``market_cap`` are computed from AS_OF-correct sources,
@@ -231,7 +232,10 @@ def fetch_value_inputs(symbols, as_of: Optional[datetime] = None,
             )
             # AS_OF price = the OHLCV close at as_of (no lookahead). Anchored at
             # end_date=as_of; the last bar (sorted ascending) is the as_of close.
-            price = _as_of_close(ohlcv, sym, as_of)
+            # When the caller supplies ``price_as_of`` (the metric store's precomputed point-in-time
+            # ``close`` as-of), use it instead of an OHLCV fetch — same value (store close == the
+            # as_of close at an aligned scan date), but no per-symbol 400-day series in memory.
+            price = price_as_of.get(sym) if price_as_of is not None else _as_of_close(ohlcv, sym, as_of)
             if not price or price <= 0:
                 logger.warning(
                     f"FactorRanker: dropping {sym} from value inputs "

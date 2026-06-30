@@ -717,6 +717,26 @@ def screen_universe_as_of(store_df: "pd.DataFrame", as_of_day: str,
     return screen_universe_for_day(store_df, prior.max(), settings)
 
 
+def metrics_as_of(store_df: "pd.DataFrame", as_of_day: str,
+                  columns: "List[str]") -> Dict[str, Dict[str, Any]]:
+    """Per-symbol precomputed metric VALUES as-of ``as_of_day`` (latest scan date <= the day).
+
+    Returns ``{symbol: {col: value, ...}}`` for the requested ``columns`` (only those present in
+    the store). Mirrors ``screen_universe_as_of``'s held-as-of semantics (the scan grid is shared
+    across symbols, so the latest scan <= the day is one shared date). Lets a consumer read a
+    precomputed factor (e.g. ``momentum_12_1``) or the point-in-time ``close`` point-in-time
+    instead of re-fetching/re-deriving it from OHLCV. Empty if no scan date is on/before the day."""
+    dates = store_df["date"]
+    prior = dates[dates <= as_of_day]
+    if prior.empty:
+        return {}
+    d = store_df[store_df["date"] == prior.max()]
+    cols = [c for c in columns if c in d.columns]
+    if not cols:
+        return {}
+    return d.set_index("symbol")[cols].to_dict("index")
+
+
 def screened_symbol_union(store_df: "pd.DataFrame", start_day: str, end_day: str,
                           settings: Dict[str, Any]) -> List[str]:
     """Union of symbols ``settings`` can EVER select over a backtest window — the complete set of
