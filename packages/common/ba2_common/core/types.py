@@ -399,6 +399,12 @@ class ExpertActionType(str, Enum):
     OPEN_BEAR_CALL_SPREAD = "open_bear_call_spread"
     OPEN_STRADDLE = "open_straddle"
     OPEN_STRANGLE = "open_strangle"
+    OPEN_SHORT_STRADDLE = "open_short_straddle"
+    OPEN_SHORT_STRANGLE = "open_short_strangle"
+    OPEN_IRON_CONDOR = "open_iron_condor"
+    OPEN_JADE_LIZARD = "open_jade_lizard"
+    OPEN_CALL_BUTTERFLY = "open_call_butterfly"
+    OPEN_PUT_RATIO_SPREAD = "open_put_ratio_spread"
     CLOSE_OPTION = "close_option"
 
 class MarketAnalysisStatus(str, Enum):
@@ -524,6 +530,12 @@ def get_option_action_values():
         ExpertActionType.OPEN_BEAR_CALL_SPREAD.value,
         ExpertActionType.OPEN_STRADDLE.value,
         ExpertActionType.OPEN_STRANGLE.value,
+        ExpertActionType.OPEN_SHORT_STRADDLE.value,
+        ExpertActionType.OPEN_SHORT_STRANGLE.value,
+        ExpertActionType.OPEN_IRON_CONDOR.value,
+        ExpertActionType.OPEN_JADE_LIZARD.value,
+        ExpertActionType.OPEN_CALL_BUTTERFLY.value,
+        ExpertActionType.OPEN_PUT_RATIO_SPREAD.value,
         ExpertActionType.CLOSE_OPTION.value,
     ]
 

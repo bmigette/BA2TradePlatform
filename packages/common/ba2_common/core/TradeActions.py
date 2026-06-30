@@ -19,7 +19,7 @@ from ba2_common.core.types import (
 )
 from ba2_common.core.db import get_db, add_instance, update_instance, get_instance
 from ba2_common.core.option_types import OptionContract, OptionLeg, OptionPosition
-from ba2_common.core.option_selector import select_single, select_vertical_spread
+from ba2_common.core.option_selector import select_single, select_vertical_spread, select_wing, passes_liquidity
 from ba2_common.logger import logger
 
 
@@ -1524,6 +1524,7 @@ class _OptionEntryAction(TradeAction):
                  sizing: Optional[float] = None,
                  min_open_interest: Optional[int] = None,
                  max_spread_pct: Optional[float] = None,
+                 wing_width_pct: Optional[float] = None,
                  **kwargs):
         super().__init__(instrument_name, account, order_recommendation,
                          existing_order, expert_recommendation)
@@ -1534,6 +1535,7 @@ class _OptionEntryAction(TradeAction):
         self.sizing = sizing
         self.min_open_interest = min_open_interest
         self.max_spread_pct = max_spread_pct
+        self.wing_width_pct = wing_width_pct
 
     # --- helpers ----------------------------------------------------------
     def _action_type_value(self) -> str:
@@ -1608,6 +1610,19 @@ class _OptionEntryAction(TradeAction):
             return 0
         budget = equity * (sizing_pct / 100.0)
         return int(math.floor(budget / (premium * 100.0)))
+
+    def _size_by_reserve(self, reserve_per_contract: float,
+                         sizing_pct: Optional[float]) -> int:
+        """floor(virtual_equity * sizing% / reserve_per_contract). For credit/naked
+        structures where net premium is negative (can't size off premium)."""
+        if not reserve_per_contract or reserve_per_contract <= 0:
+            return 0
+        if not sizing_pct or sizing_pct <= 0:
+            return 0
+        equity = self._virtual_equity()
+        if equity is None or equity <= 0:
+            return 0
+        return int(math.floor((equity * (sizing_pct / 100.0)) / reserve_per_contract))
 
     def _held_equity_shares(self) -> float:
         """Sum filled equity BUY quantity across this expert's OPENED transactions for the symbol."""
@@ -2257,6 +2272,394 @@ class OpenStrangleAction(_OptionEntryAction):
         return f"Open long strangle on {self.instrument_name}"
 
 
+class OpenShortStraddleAction(_OptionEntryAction):
+    """Short straddle: SELL an ATM call AND an ATM put at the SAME strike (credit).
+
+    Short-volatility: collect both premiums (sold at BID). Net premium is a CREDIT
+    (limit price negative). Naked on both sides; reserve a conservative strike*100
+    per contract proxy and size off it."""
+
+    def _action_type_value(self) -> str:
+        return ExpertActionType.OPEN_SHORT_STRADDLE.value
+
+    def _build_and_submit(self) -> Dict[str, Any]:
+        call_chain = self._chain(OptionRight.CALL)
+        put_chain = self._chain(OptionRight.PUT)
+        if not call_chain or not put_chain:
+            return self._result(False, f"Empty option chain for {self.instrument_name}")
+        spot = self._spot()
+        call_c = select_single(
+            call_chain, method="percent_otm", strike_param=0, spot=spot,
+            option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
+            today=self._today(), min_open_interest=self.min_open_interest,
+            max_spread_pct=self.max_spread_pct)
+        if call_c is None:
+            return self._result(False, f"No liquid ATM call for short straddle on {self.instrument_name}")
+        put_candidates = [c for c in put_chain
+                          if c.strike == call_c.strike and c.expiry == call_c.expiry]
+        put_c = select_single(
+            put_candidates, method="percent_otm", strike_param=0, spot=spot,
+            option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
+            today=self._today(), min_open_interest=self.min_open_interest,
+            max_spread_pct=self.max_spread_pct)
+        if put_c is None:
+            return self._result(False, f"No liquid ATM put for short straddle on {self.instrument_name}")
+        if call_c.bid is None or put_c.bid is None:
+            return self._result(False, f"Missing bid for short straddle legs on {self.instrument_name}")
+        net_credit = round(call_c.bid + put_c.bid, 4)        # sell both at BID
+        if net_credit <= 0:
+            return self._result(False, f"Non-positive credit for {self.instrument_name} short straddle")
+        # NAKED both sides: reserve Reg-T naked margin (not full strike*100 cash) so the
+        # structure is sizeable on a realistic account.
+        per_contract_reserve = self.account.naked_margin_per_contract(call_c.strike, spot=spot)
+        quantity = self._size_by_reserve(per_contract_reserve, self.sizing)
+        if quantity < 1:
+            return self._result(False, f"Insufficient budget to size short straddle for {self.instrument_name}")
+        reserve = self.account.option_reserve_required(
+            "short_straddle", quantity, strike=call_c.strike, spot=spot)
+        if not self.account.check_option_buying_power(reserve):
+            return self._result(False, f"Insufficient BP for short straddle on {self.instrument_name}")
+        call_leg = OptionLeg(contract_symbol=call_c.symbol, side=OrderDirection.SELL,
+                             position_intent="sell_to_open", option_type=OptionRight.CALL,
+                             strike=call_c.strike, expiry=call_c.expiry, underlying=call_c.underlying)
+        put_leg = OptionLeg(contract_symbol=put_c.symbol, side=OrderDirection.SELL,
+                            position_intent="sell_to_open", option_type=OptionRight.PUT,
+                            strike=put_c.strike, expiry=put_c.expiry, underlying=put_c.underlying)
+        return self._submit_option_order([call_leg, put_leg], quantity, -net_credit,
+                                         "short_straddle", option_reserve=reserve)
+
+    def get_description(self) -> str:
+        return f"Open short straddle on {self.instrument_name}"
+
+
+class OpenShortStrangleAction(_OptionEntryAction):
+    """Short strangle: SELL an OTM call AND an OTM put at DIFFERENT strikes (credit).
+
+    Both legs OTM by ``strike_param`` percent (default 10%), sold at BID. Net credit
+    (limit negative). Naked both sides; reserve strike*100 of the SHORT PUT per
+    contract proxy and size off it."""
+
+    DEFAULT_OTM_PCT = 10.0
+
+    def _action_type_value(self) -> str:
+        return ExpertActionType.OPEN_SHORT_STRANGLE.value
+
+    def _build_and_submit(self) -> Dict[str, Any]:
+        call_chain = self._chain(OptionRight.CALL)
+        put_chain = self._chain(OptionRight.PUT)
+        if not call_chain or not put_chain:
+            return self._result(False, f"Empty option chain for {self.instrument_name}")
+        spot = self._spot()
+        otm = self.strike_param if self.strike_param is not None else self.DEFAULT_OTM_PCT
+        call_c = select_single(
+            call_chain, method="percent_otm", strike_param=otm, spot=spot,
+            option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
+            today=self._today(), min_open_interest=self.min_open_interest,
+            max_spread_pct=self.max_spread_pct)
+        put_c = select_single(
+            put_chain, method="percent_otm", strike_param=otm, spot=spot,
+            option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
+            today=self._today(), min_open_interest=self.min_open_interest,
+            max_spread_pct=self.max_spread_pct)
+        if call_c is None or put_c is None:
+            return self._result(False, f"No liquid OTM legs for short strangle on {self.instrument_name}")
+        # Pin both legs to the same expiry (use the call's expiry).
+        if put_c.expiry != call_c.expiry:
+            put_c = select_single(
+                [c for c in put_chain if c.expiry == call_c.expiry],
+                method="percent_otm", strike_param=otm, spot=spot,
+                option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
+                today=self._today(), min_open_interest=self.min_open_interest,
+                max_spread_pct=self.max_spread_pct)
+            if put_c is None:
+                return self._result(False, f"No same-expiry OTM put for short strangle on {self.instrument_name}")
+        if call_c.bid is None or put_c.bid is None:
+            return self._result(False, f"Missing bid for short strangle legs on {self.instrument_name}")
+        net_credit = round(call_c.bid + put_c.bid, 4)
+        if net_credit <= 0:
+            return self._result(False, f"Non-positive credit for {self.instrument_name} short strangle")
+        # NAKED both sides: reserve Reg-T naked margin on the (richer) put side, not full
+        # strike*100 cash, so the structure is sizeable on a realistic account.
+        per_contract_reserve = self.account.naked_margin_per_contract(put_c.strike, spot=spot)
+        quantity = self._size_by_reserve(per_contract_reserve, self.sizing)
+        if quantity < 1:
+            return self._result(False, f"Insufficient budget to size short strangle for {self.instrument_name}")
+        reserve = self.account.option_reserve_required(
+            "short_strangle", quantity, strike=put_c.strike, spot=spot)
+        if not self.account.check_option_buying_power(reserve):
+            return self._result(False, f"Insufficient BP for short strangle on {self.instrument_name}")
+        call_leg = OptionLeg(contract_symbol=call_c.symbol, side=OrderDirection.SELL,
+                             position_intent="sell_to_open", option_type=OptionRight.CALL,
+                             strike=call_c.strike, expiry=call_c.expiry, underlying=call_c.underlying)
+        put_leg = OptionLeg(contract_symbol=put_c.symbol, side=OrderDirection.SELL,
+                            position_intent="sell_to_open", option_type=OptionRight.PUT,
+                            strike=put_c.strike, expiry=put_c.expiry, underlying=put_c.underlying)
+        return self._submit_option_order([call_leg, put_leg], quantity, -net_credit,
+                                         "short_strangle", option_reserve=reserve)
+
+    def get_description(self) -> str:
+        return f"Open short strangle on {self.instrument_name}"
+
+
+class OpenIronCondorAction(_OptionEntryAction):
+    """Iron condor (4 legs, credit, defined risk): SELL OTM put + BUY farther-OTM put
+    + SELL OTM call + BUY farther-OTM call. Short legs at ``strike_param`` %OTM; wings
+    ``wing_width_pct`` farther OTM. Credit = short bids - long asks (limit negative).
+    Max loss = (wing width - credit); reserved per contract."""
+
+    DEFAULT_OTM_PCT = 10.0
+    DEFAULT_WING_PCT = 5.0
+
+    def _action_type_value(self) -> str:
+        return ExpertActionType.OPEN_IRON_CONDOR.value
+
+    def _build_and_submit(self) -> Dict[str, Any]:
+        call_chain = self._chain(OptionRight.CALL)
+        put_chain = self._chain(OptionRight.PUT)
+        if not call_chain or not put_chain:
+            return self._result(False, f"Empty option chain for {self.instrument_name}")
+        spot = self._spot()
+        otm = self.strike_param if self.strike_param is not None else self.DEFAULT_OTM_PCT
+        wing = self.wing_width_pct if self.wing_width_pct is not None else self.DEFAULT_WING_PCT
+        sc = select_single(call_chain, method="percent_otm", strike_param=otm, spot=spot,
+                           option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
+                           today=self._today(), min_open_interest=self.min_open_interest,
+                           max_spread_pct=self.max_spread_pct)
+        sp = select_single(put_chain, method="percent_otm", strike_param=otm, spot=spot,
+                           option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
+                           today=self._today(), min_open_interest=self.min_open_interest,
+                           max_spread_pct=self.max_spread_pct)
+        if sc is None or sp is None:
+            return self._result(False, f"No liquid short legs for iron condor on {self.instrument_name}")
+        # Wings farther OTM, same expiry as the matching short leg.
+        lc = select_wing(call_chain, center_strike=sc.strike, width_pct=wing,
+                         option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
+                         today=self._today(), expiry=sc.expiry,
+                         min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct)
+        lp = select_wing(put_chain, center_strike=sp.strike, width_pct=wing,
+                         option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
+                         today=self._today(), expiry=sp.expiry,
+                         min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct)
+        if lc is None or lp is None or lc.strike <= sc.strike or lp.strike >= sp.strike:
+            return self._result(False, f"No valid wings for iron condor on {self.instrument_name}")
+        if None in (sc.bid, sp.bid, lc.ask, lp.ask):
+            return self._result(False, f"Missing quotes for iron condor on {self.instrument_name}")
+        net_credit = round(sc.bid + sp.bid - lc.ask - lp.ask, 4)
+        if net_credit <= 0:
+            return self._result(False, f"Non-positive credit for {self.instrument_name} iron condor")
+        width = max(lc.strike - sc.strike, sp.strike - lp.strike)
+        max_loss = max(0.0, width - net_credit)
+        per_contract_reserve = max_loss * 100.0
+        quantity = self._size_by_reserve(per_contract_reserve, self.sizing) if per_contract_reserve > 0 else 0
+        if quantity < 1:
+            return self._result(False, f"Insufficient budget to size iron condor for {self.instrument_name}")
+        reserve = self.account.option_reserve_required(
+            "iron_condor", quantity, spread_width=width, net_credit=net_credit)
+        if not self.account.check_option_buying_power(reserve):
+            return self._result(False, f"Insufficient BP for iron condor on {self.instrument_name}")
+        legs = [
+            OptionLeg(contract_symbol=sp.symbol, side=OrderDirection.SELL, position_intent="sell_to_open",
+                      option_type=OptionRight.PUT, strike=sp.strike, expiry=sp.expiry, underlying=sp.underlying),
+            OptionLeg(contract_symbol=lp.symbol, side=OrderDirection.BUY, position_intent="buy_to_open",
+                      option_type=OptionRight.PUT, strike=lp.strike, expiry=lp.expiry, underlying=lp.underlying),
+            OptionLeg(contract_symbol=sc.symbol, side=OrderDirection.SELL, position_intent="sell_to_open",
+                      option_type=OptionRight.CALL, strike=sc.strike, expiry=sc.expiry, underlying=sc.underlying),
+            OptionLeg(contract_symbol=lc.symbol, side=OrderDirection.BUY, position_intent="buy_to_open",
+                      option_type=OptionRight.CALL, strike=lc.strike, expiry=lc.expiry, underlying=lc.underlying),
+        ]
+        return self._submit_option_order(legs, quantity, -net_credit, "iron_condor",
+                                         option_reserve=reserve)
+
+    def get_description(self) -> str:
+        return f"Open iron condor on {self.instrument_name}"
+
+
+class OpenJadeLizardAction(_OptionEntryAction):
+    """Jade lizard (3 legs, credit): SELL OTM put + SELL OTM call + BUY farther-OTM
+    call (caps call-side risk). Short legs at ``strike_param`` %OTM; call wing
+    ``wing_width_pct`` farther OTM. Put side remains naked (reserve strike*100).
+    Credit = sp.bid + sc.bid - lc.ask (limit negative)."""
+
+    DEFAULT_OTM_PCT = 10.0
+    DEFAULT_WING_PCT = 5.0
+
+    def _action_type_value(self) -> str:
+        return ExpertActionType.OPEN_JADE_LIZARD.value
+
+    def _build_and_submit(self) -> Dict[str, Any]:
+        call_chain = self._chain(OptionRight.CALL)
+        put_chain = self._chain(OptionRight.PUT)
+        if not call_chain or not put_chain:
+            return self._result(False, f"Empty option chain for {self.instrument_name}")
+        spot = self._spot()
+        otm = self.strike_param if self.strike_param is not None else self.DEFAULT_OTM_PCT
+        wing = self.wing_width_pct if self.wing_width_pct is not None else self.DEFAULT_WING_PCT
+        sc = select_single(call_chain, method="percent_otm", strike_param=otm, spot=spot,
+                           option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
+                           today=self._today(), min_open_interest=self.min_open_interest,
+                           max_spread_pct=self.max_spread_pct)
+        sp = select_single(put_chain, method="percent_otm", strike_param=otm, spot=spot,
+                           option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
+                           today=self._today(), min_open_interest=self.min_open_interest,
+                           max_spread_pct=self.max_spread_pct)
+        if sc is None or sp is None:
+            return self._result(False, f"No liquid short legs for jade lizard on {self.instrument_name}")
+        lc = select_wing(call_chain, center_strike=sc.strike, width_pct=wing,
+                         option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
+                         today=self._today(), expiry=sc.expiry,
+                         min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct)
+        if lc is None or lc.strike <= sc.strike:
+            return self._result(False, f"No valid call wing for jade lizard on {self.instrument_name}")
+        if None in (sc.bid, sp.bid, lc.ask):
+            return self._result(False, f"Missing quotes for jade lizard on {self.instrument_name}")
+        net_credit = round(sc.bid + sp.bid - lc.ask, 4)
+        if net_credit <= 0:
+            return self._result(False, f"Non-positive credit for {self.instrument_name} jade lizard")
+        # Put side is NAKED: reserve Reg-T naked margin (not full strike*100 cash) so the
+        # structure is sizeable on a realistic account. (Call side is wing-capped.)
+        per_contract_reserve = self.account.naked_margin_per_contract(sp.strike, spot=spot)
+        quantity = self._size_by_reserve(per_contract_reserve, self.sizing)
+        if quantity < 1:
+            return self._result(False, f"Insufficient budget to size jade lizard for {self.instrument_name}")
+        reserve = self.account.option_reserve_required("naked_put", quantity, strike=sp.strike, spot=spot)
+        if not self.account.check_option_buying_power(reserve):
+            return self._result(False, f"Insufficient BP for jade lizard on {self.instrument_name}")
+        legs = [
+            OptionLeg(contract_symbol=sp.symbol, side=OrderDirection.SELL, position_intent="sell_to_open",
+                      option_type=OptionRight.PUT, strike=sp.strike, expiry=sp.expiry, underlying=sp.underlying),
+            OptionLeg(contract_symbol=sc.symbol, side=OrderDirection.SELL, position_intent="sell_to_open",
+                      option_type=OptionRight.CALL, strike=sc.strike, expiry=sc.expiry, underlying=sc.underlying),
+            OptionLeg(contract_symbol=lc.symbol, side=OrderDirection.BUY, position_intent="buy_to_open",
+                      option_type=OptionRight.CALL, strike=lc.strike, expiry=lc.expiry, underlying=lc.underlying),
+        ]
+        return self._submit_option_order(legs, quantity, -net_credit, "jade_lizard",
+                                         option_reserve=reserve)
+
+    def get_description(self) -> str:
+        return f"Open jade lizard on {self.instrument_name}"
+
+
+class OpenCallButterflyAction(_OptionEntryAction):
+    """Long call butterfly (debit, 1-2-1): BUY 1 lower call + SELL 2 body calls +
+    BUY 1 upper call. Body at ``strike_param`` %OTM (~ATM at 0); wings
+    ``wing_width_pct`` below/above the body. Net debit = lower.ask + upper.ask
+    - 2*body.bid (limit positive). Size off the debit."""
+
+    DEFAULT_BODY_PCT = 0.0
+    DEFAULT_WING_PCT = 10.0
+
+    def _action_type_value(self) -> str:
+        return ExpertActionType.OPEN_CALL_BUTTERFLY.value
+
+    def _build_and_submit(self) -> Dict[str, Any]:
+        chain = self._chain(OptionRight.CALL)
+        if not chain:
+            return self._result(False, f"Empty option chain for {self.instrument_name}")
+        spot = self._spot()
+        body_otm = self.strike_param if self.strike_param is not None else self.DEFAULT_BODY_PCT
+        wing = self.wing_width_pct if self.wing_width_pct is not None else self.DEFAULT_WING_PCT
+        body = select_single(chain, method="percent_otm", strike_param=body_otm, spot=spot,
+                             option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
+                             today=self._today(), min_open_interest=self.min_open_interest,
+                             max_spread_pct=self.max_spread_pct)
+        if body is None:
+            return self._result(False, f"No liquid body call for butterfly on {self.instrument_name}")
+        upper = select_wing(chain, center_strike=body.strike, width_pct=wing,
+                            option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
+                            today=self._today(), expiry=body.expiry,
+                            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct)
+        # Lower wing: a call BELOW the body. Reuse select_wing with a PUT-style downward
+        # target by searching for strike nearest body*(1 - wing%).
+        lower_target = body.strike * (1 - wing / 100.0)
+        lower_cands = [c for c in chain if c.expiry == body.expiry and c.strike < body.strike
+                       and passes_liquidity(c, self.min_open_interest, self.max_spread_pct)]
+        lower = min(lower_cands, key=lambda c: abs(c.strike - lower_target)) if lower_cands else None
+        if upper is None or lower is None or upper.strike <= body.strike or lower.strike >= body.strike:
+            return self._result(False, f"No valid wings for butterfly on {self.instrument_name}")
+        if None in (lower.ask, upper.ask, body.bid):
+            return self._result(False, f"Missing quotes for butterfly on {self.instrument_name}")
+        net_debit = round(lower.ask + upper.ask - 2 * body.bid, 4)
+        if net_debit <= 0:
+            return self._result(False, f"Non-positive debit for {self.instrument_name} butterfly")
+        quantity = self._size(net_debit, self.sizing)
+        if quantity < 1:
+            return self._result(False, f"Insufficient budget to size butterfly for {self.instrument_name}")
+        legs = [
+            OptionLeg(contract_symbol=lower.symbol, side=OrderDirection.BUY, ratio_qty=1,
+                      position_intent="buy_to_open", option_type=OptionRight.CALL,
+                      strike=lower.strike, expiry=lower.expiry, underlying=lower.underlying),
+            OptionLeg(contract_symbol=body.symbol, side=OrderDirection.SELL, ratio_qty=2,
+                      position_intent="sell_to_open", option_type=OptionRight.CALL,
+                      strike=body.strike, expiry=body.expiry, underlying=body.underlying),
+            OptionLeg(contract_symbol=upper.symbol, side=OrderDirection.BUY, ratio_qty=1,
+                      position_intent="buy_to_open", option_type=OptionRight.CALL,
+                      strike=upper.strike, expiry=upper.expiry, underlying=upper.underlying),
+        ]
+        return self._submit_option_order(legs, quantity, net_debit, "call_butterfly")
+
+    def get_description(self) -> str:
+        return f"Open call butterfly on {self.instrument_name}"
+
+
+class OpenPutRatioSpreadAction(_OptionEntryAction):
+    """Put front-ratio spread (1-2): BUY 1 put near ``strike_param`` %OTM + SELL 2
+    puts ``wing_width_pct`` farther OTM. Typically a small credit/even with extra
+    downside risk below the short strike. limit = long.ask - 2*short.bid (sign per
+    result). The naked short put (1 net short) is reserved at short.strike*100."""
+
+    DEFAULT_OTM_PCT = 5.0
+    DEFAULT_WING_PCT = 5.0
+
+    def _action_type_value(self) -> str:
+        return ExpertActionType.OPEN_PUT_RATIO_SPREAD.value
+
+    def _build_and_submit(self) -> Dict[str, Any]:
+        chain = self._chain(OptionRight.PUT)
+        if not chain:
+            return self._result(False, f"Empty option chain for {self.instrument_name}")
+        spot = self._spot()
+        otm = self.strike_param if self.strike_param is not None else self.DEFAULT_OTM_PCT
+        wing = self.wing_width_pct if self.wing_width_pct is not None else self.DEFAULT_WING_PCT
+        long_p = select_single(chain, method="percent_otm", strike_param=otm, spot=spot,
+                               option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
+                               today=self._today(), min_open_interest=self.min_open_interest,
+                               max_spread_pct=self.max_spread_pct)
+        if long_p is None:
+            return self._result(False, f"No liquid long put for ratio spread on {self.instrument_name}")
+        short_p = select_wing(chain, center_strike=long_p.strike, width_pct=wing,
+                              option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
+                              today=self._today(), expiry=long_p.expiry,
+                              min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct)
+        if short_p is None or short_p.strike >= long_p.strike:
+            return self._result(False, f"No valid short put wing for ratio spread on {self.instrument_name}")
+        if long_p.ask is None or short_p.bid is None:
+            return self._result(False, f"Missing quotes for ratio spread on {self.instrument_name}")
+        net = round(long_p.ask - 2 * short_p.bid, 4)   # usually negative (credit)
+        # Reserve the 1 net naked short put at Reg-T naked margin (not full strike*100 cash)
+        # so the structure is sizeable on a realistic account.
+        per_contract_reserve = self.account.naked_margin_per_contract(short_p.strike, spot=spot)
+        quantity = self._size_by_reserve(per_contract_reserve, self.sizing)
+        if quantity < 1:
+            return self._result(False, f"Insufficient budget to size ratio spread for {self.instrument_name}")
+        reserve = self.account.option_reserve_required(
+            "put_ratio_spread", quantity, strike=short_p.strike, spot=spot)
+        if not self.account.check_option_buying_power(reserve):
+            return self._result(False, f"Insufficient BP for ratio spread on {self.instrument_name}")
+        legs = [
+            OptionLeg(contract_symbol=long_p.symbol, side=OrderDirection.BUY, ratio_qty=1,
+                      position_intent="buy_to_open", option_type=OptionRight.PUT,
+                      strike=long_p.strike, expiry=long_p.expiry, underlying=long_p.underlying),
+            OptionLeg(contract_symbol=short_p.symbol, side=OrderDirection.SELL, ratio_qty=2,
+                      position_intent="sell_to_open", option_type=OptionRight.PUT,
+                      strike=short_p.strike, expiry=short_p.expiry, underlying=short_p.underlying),
+        ]
+        return self._submit_option_order(legs, quantity, net, "put_ratio_spread",
+                                         option_reserve=reserve)
+
+    def get_description(self) -> str:
+        return f"Open put ratio spread on {self.instrument_name}"
+
+
 def build_closing_legs(children, parent_quantity: int, quote_fn) -> "tuple[List[OptionLeg], Optional[float]]":
     """Build reversed legs (and a net limit price) that close a spread's child legs.
 
@@ -2516,6 +2919,12 @@ def create_action(action_type: ExpertActionType, instrument_name: str, account: 
         ExpertActionType.OPEN_BEAR_CALL_SPREAD: OpenBearCallSpreadAction,
         ExpertActionType.OPEN_STRADDLE: OpenStraddleAction,
         ExpertActionType.OPEN_STRANGLE: OpenStrangleAction,
+        ExpertActionType.OPEN_SHORT_STRADDLE: OpenShortStraddleAction,
+        ExpertActionType.OPEN_SHORT_STRANGLE: OpenShortStrangleAction,
+        ExpertActionType.OPEN_IRON_CONDOR: OpenIronCondorAction,
+        ExpertActionType.OPEN_JADE_LIZARD: OpenJadeLizardAction,
+        ExpertActionType.OPEN_CALL_BUTTERFLY: OpenCallButterflyAction,
+        ExpertActionType.OPEN_PUT_RATIO_SPREAD: OpenPutRatioSpreadAction,
         ExpertActionType.CLOSE_OPTION: CloseOptionAction,
     }
     

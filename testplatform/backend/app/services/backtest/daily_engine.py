@@ -376,6 +376,18 @@ class DailyBacktestEngine:
         self._bypass_pm: Dict[int, Any] = {}
         self._bypass_veq_pct: Dict[int, float] = {}
 
+        # Entry-option path: when the run's enter_market action IS an option action (pure-option
+        # entry, no equity leg), the option action must size + submit itself — so the entry runs
+        # with ``submit_to_broker=True`` (like the open-positions path), unlike the equity entry
+        # which stages a PENDING qty=0 order the RM sizes next. ONE strategy per run, so a single
+        # global flag derived from ``config["entry_action"]`` is sufficient + unambiguous.
+        self._entry_is_option = False
+        ea = config.get("entry_action")
+        if isinstance(ea, dict):
+            from ba2_common.core.types import is_option_action
+            a = ea.get("action_type") or ea.get("action") or ea.get("option_strategy")
+            self._entry_is_option = bool(a and is_option_action(str(a)))
+
     def _bypass_manager(self, expert_id: int) -> Any:
         """Lazily build + cache the FactorPortfolioManager for a bypass expert (run-constant).
 
@@ -736,8 +748,10 @@ class DailyBacktestEngine:
                 if not action_summaries or any("error" in s for s in action_summaries):
                     continue  # conditions not met / evaluation error -> no order this symbol.
 
-                # Create PENDING qty=0 orders (NOT submitted: RM sizes + submits next).
-                results = evaluator.execute(submit_to_broker=False)
+                # Equity entry: create PENDING qty=0 orders (NOT submitted; RM sizes + submits
+                # next). Option entry: the option action sizes + submits ITSELF, so submit
+                # directly (like the open-positions path) — there is no equity leg.
+                results = evaluator.execute(submit_to_broker=self._entry_is_option)
                 if any(r.get("success") and (r.get("data") or {}).get("order_id") for r in results):
                     created_any = True
             except Exception as e:  # noqa: BLE001

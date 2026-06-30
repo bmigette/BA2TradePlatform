@@ -99,3 +99,22 @@ def select_vertical_spread(chain, *, method, long_param, short_param, spot, opti
             return (lo, hi)   # buy lower, sell higher (debit)
         return (hi, lo)       # put debit spread: buy higher strike, sell lower
     return None
+
+
+def select_wing(chain, *, center_strike, width_pct, option_type,
+                dte_min, dte_max, today, expiry=None,
+                min_open_interest=None, max_spread_pct=None) -> Optional[OptionContract]:
+    """Pick the wing contract nearest ``center_strike`` moved ``width_pct`` percent
+    farther OTM (calls: up; puts: down). When ``expiry`` is given, restrict to that
+    expiry (wings must share the short leg's expiry)."""
+    cands = _candidates(chain, option_type, dte_min, dte_max, today,
+                        min_open_interest, max_spread_pct)
+    if expiry is not None:
+        cands = [c for c in cands if c.expiry == expiry]
+    if not cands:
+        return None
+    if option_type == OptionRight.CALL:
+        target = center_strike * (1 + width_pct / 100.0)
+    else:
+        target = center_strike * (1 - width_pct / 100.0)
+    return min(cands, key=lambda c: (abs(c.strike - target), c.strike))

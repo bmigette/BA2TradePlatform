@@ -66,6 +66,12 @@ class ExitCondition(BaseModel):
     option_dte_min_range: Optional[int] = None
     option_dte_max_range: Optional[int] = None
     option_dte_step: Optional[int] = None
+    # WING WIDTH for multi-leg option strategies (iron condor / jade lizard / butterfly / ratio)
+    option_wing_width: Optional[float] = None
+    option_wing_width_optimize: bool = False
+    option_wing_width_min: Optional[float] = None
+    option_wing_width_max: Optional[float] = None
+    option_wing_width_step: Optional[float] = None
 
 
 class StrategyCreate(BaseModel):

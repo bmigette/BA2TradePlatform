@@ -69,7 +69,16 @@ def strategy_uses_options(cfg: Dict[str, Any]) -> bool:
     The option action can live under the canonical evaluator key ``action_type``, the API/UI
     alias ``action``, or the (forward-compat) ``option_strategy`` key — checked in that
     precedence. Rules are read from ``exit_rules`` (the canonical handler key) else the
-    API-shaped ``exit_conditions`` alias. Non-dict rules are ignored (no crash)."""
+    API-shaped ``exit_conditions`` alias. Non-dict rules are ignored (no crash).
+
+    ALSO True when ``cfg["entry_action"]`` names an option action — a pure-option ENTRY (the
+    enter_market ruleset fires the option directly, no equity leg), which is an options run even
+    when no exit rule names an option."""
+    ea = cfg.get("entry_action")
+    if isinstance(ea, dict):
+        a = ea.get("option_strategy") or ea.get("action_type") or ea.get("action")
+        if a and is_option_action(str(a)):
+            return True
     for rule in (cfg.get("exit_rules") or cfg.get("exit_conditions") or []):
         if not isinstance(rule, dict):
             continue
@@ -100,11 +109,16 @@ def default_options_cache_db() -> str:
     backtest_cache_dir = os.environ.get("BACKTEST_CACHE_DIR")
     if backtest_cache_dir:
         cache_dir = pathlib.Path(backtest_cache_dir)
-    else:
-        from ba2_common.config import OPTIONS_CACHE_DB
-        cache_dir = pathlib.Path(OPTIONS_CACHE_DB).parent
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    return str(cache_dir / _DEFAULT_OPTIONS_CACHE_FILENAME)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return str(cache_dir / _DEFAULT_OPTIONS_CACHE_FILENAME)
+    # Canonical shared options cache: the SAME file ``ba2-test fetch-options`` writes and the
+    # distributed workers expect (``ba2_common.config.OPTIONS_CACHE_DB`` ->
+    # ``.../options/options_history.sqlite``). Previously this returned a sibling
+    # ``options_cache.sqlite`` in the same dir, so a locally-built cache was never found by a
+    # local optimize run — reconciled here to one canonical path.
+    from ba2_common.config import OPTIONS_CACHE_DB
+    pathlib.Path(OPTIONS_CACHE_DB).parent.mkdir(parents=True, exist_ok=True)
+    return OPTIONS_CACHE_DB
 
 
 # Payload keys the handler REQUIRES (validated fail-early, no defaults).
@@ -692,10 +706,14 @@ def _build_experts(
     # enter ruleset therefore needs no bracket plumbing. enable_short adds the symmetric SELL/short
     # entry rule + the RM enable_sell gate.
     enable_short = bool(config.get("enable_short"))
+    # Pure-option ENTRY: when set, the enter_market ruleset fires this option action directly
+    # (no equity leg) — the engine submits it directly (``_entry_is_option``).
+    entry_action = config.get("entry_action")
 
     def _seed_enter(nm: str) -> int:
-        if buy_tree:
-            return seed_ruleset_from_tree(buy_tree, name=nm, enable_short=enable_short)
+        if buy_tree or entry_action:
+            return seed_ruleset_from_tree(buy_tree, name=nm, enable_short=enable_short,
+                                          entry_action=entry_action)
         return (seed_enter_long_short_ruleset(name=nm) if enable_short
                 else seed_enter_long_ruleset(name=nm))
 

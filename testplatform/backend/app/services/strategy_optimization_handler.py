@@ -755,9 +755,13 @@ def _build_daily_trial_config(
         validate_options_window,
     )
 
+    # A pure-option ENTRY (the enter_market ruleset fires an option action directly, no equity leg)
+    # is carried run-level on backtest_cfg['entry_action'] and is also an options run — include it in
+    # the options-seam detection so the cache is derived even when no EXIT rule names an option.
+    entry_action = backtest_cfg.get("entry_action")
     options_cache_db = backtest_cfg.get("options_cache_db")
     if not options_cache_db and strategy_uses_options(
-        {"exit_rules": decoded.get("exit_rules")}
+        {"exit_rules": decoded.get("exit_rules"), "entry_action": entry_action}
     ):
         options_cache_db = default_options_cache_db()
     validate_options_window(backtest_cfg["start_date"], bool(options_cache_db))
@@ -890,6 +894,9 @@ def _build_daily_trial_config(
         "buy_tree": decoded.get("buy_tree"),
         "sell_tree": decoded.get("sell_tree"),
         "exit_rules": decoded.get("exit_rules"),
+        # Pure-option ENTRY action (no equity leg): forwarded run-level so daily_backtest_handler.
+        # _build_experts seeds the enter ruleset with it. None for equity strategies (unchanged).
+        "entry_action": entry_action,
         # "Allow short" -> seed the symmetric SHORT enter rule + RM sell gate (mirrors the
         # single-backtest path). Carried from the run-level optimize backtest block.
         "enable_short": bool(backtest_cfg.get("enable_short")),
