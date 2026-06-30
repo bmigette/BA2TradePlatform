@@ -1883,7 +1883,9 @@ def main(argv: "list | None" = None) -> int:
     bm.add_argument("--market-cap-min", type=float, required=True, help="LOOSEST cap bound (shortlist superset).")
     bm.add_argument("--price-min", type=float, default=0.0)
     bm.add_argument("--volume-min", type=float, default=0.0)
-    bm.add_argument("--cadence-days", type=int, default=7, help="Scan cadence in days (default 7 = weekly). Match the analysis schedule.")
+    bm.add_argument("--cadence-days", "--cadence", dest="cadence_days", type=int, default=7,
+                    help="Scan cadence in days (default 7 = weekly; use 1 for a DAILY store, e.g. for "
+                         "FactorRanker byte-identical daily ranking). Match the analysis schedule.")
     bm.add_argument("--drop-days", type=int, default=5,
                     help="Lookback window (trading days) for the price_drop_pct metric = drop from the "
                          "trailing-window peak. MUST be >= 2 — with 1 the peak window is just today, so "
