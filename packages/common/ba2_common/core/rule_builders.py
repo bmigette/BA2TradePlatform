@@ -140,6 +140,7 @@ _OPTION_ACTION_PARAM_KEYS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("sizing", ("option_sizing",)),
     ("min_open_interest", ("option_min_oi", "option_min_open_interest")),
     ("max_spread_pct", ("option_max_spread_pct", "option_max_spread")),
+    ("wing_width_pct", ("option_wing_width_pct", "option_wing_width")),
 )
 
 
