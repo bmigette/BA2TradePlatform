@@ -131,9 +131,16 @@ def main() -> int:
                          "total return (a trade can pass --profit-cap-pct yet still be 60%% of the "
                          "book). Default 25. Pass 0 to disable.")
     ap.add_argument("--fitness-trade-scale", action="store_true",
-                    help="Scale each trial's fitness by avg_trades_per_year/100 so statistically thin "
-                         "(few-trade) configs are down-weighted (stops a 16-trade lottery winner from "
-                         "topping the search). Default: OFF.")
+                    help="Scale each trial's fitness by min(avg_trades_per_year, cap)/100 so "
+                         "statistically thin (few-trade) configs are down-weighted (stops a 16-trade "
+                         "lottery winner from topping the search). Default: OFF.")
+    ap.add_argument("--fitness-trade-scale-cap", type=float, default=100.0,
+                    help="Cap (trades/year) for --fitness-trade-scale so the GA is not rewarded for "
+                         "over-trading (scalping). Default 100 = factor maxes at 1.0.")
+    ap.add_argument("--fmp-population-bonus", type=int, default=10,
+                    help="Extra GA population for FMPRating jobs ONLY (its search space grew with the "
+                         "price-target + analyst-recency genes). Added to --population for FMPRating. "
+                         "Default 10.")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -157,10 +164,13 @@ def main() -> int:
         if name in _completed_names():   # re-read each loop (resumable)
             print(f"[{i}/{len(jobs)}] SKIP {name} (already completed)", flush=True)
             continue
+        # FMPRating's search space grew (price-target + analyst-recency genes), so give it extra
+        # population to explore the larger space; other experts use the base --population.
+        population = args.population + (args.fmp_population_bonus if expert == "FMPRating" else 0)
         cmd = [exe, "optimize", "--expert", expert, "--universe", _PLACEHOLDER_UNIVERSE,
                "--screener", "--screener-store", args.store, "--screener-cap-band", band,
                "--start", args.start, "--end", args.end, "--fitness", args.fitness,
-               "--interval", args.interval, "--population", str(args.population),
+               "--interval", args.interval, "--population", str(population),
                "--generations", str(args.generations), "--screener-cadence-days", str(args.cadence_days),
                "--run-schedule", "weekly", "--name", name, "--parallel", str(args.parallel)]
         if args.profit_cap_pct and args.profit_cap_pct > 0:
@@ -168,7 +178,8 @@ def main() -> int:
         if args.profit_share_cap_pct and args.profit_share_cap_pct > 0:
             cmd += ["--profit-share-cap-pct", str(args.profit_share_cap_pct)]
         if args.fitness_trade_scale:
-            cmd += ["--fitness-trade-scale"]
+            cmd += ["--fitness-trade-scale",
+                    "--fitness-trade-scale-cap", str(args.fitness_trade_scale_cap)]
         if strat is not None:
             cmd += ["--strategy", strat]
         if args.workers:

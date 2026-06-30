@@ -239,6 +239,7 @@ def _cmd_prewarm(args) -> int:
     # Build the (expert, symbol) work items. Each item is a callable doing the cached fetch.
     from ba2_experts.FMPRating import (
         fetch_grades_historical_cached, fetch_price_target_history_cached,
+        fetch_analyst_grades_cached,
     )
     from ba2_providers.fundamentals.details.FMPCompanyDetailsProvider import FMPCompanyDetailsProvider
     from ba2_providers.insider.FMPInsiderProvider import FMPInsiderProvider
@@ -251,6 +252,7 @@ def _cmd_prewarm(args) -> int:
     def _do_fmprating(sym: str) -> None:
         fetch_grades_historical_cached(key, sym)
         fetch_price_target_history_cached(key, sym)
+        fetch_analyst_grades_cached(key, sym)   # dated individual grades (rating-recency filter)
 
     def _do_earnings_drift(sym: str) -> None:
         nonlocal _details_provider
@@ -693,6 +695,14 @@ _EXPERT_OPT = {
             "profit_ratio": {"optimize": True, "min": 0.5, "max": 1.5, "step": 0.1, "type": "float"},
             "min_analysts": {"optimize": True, "min": 5, "max": 25, "step": 5, "type": "int"},
             "price_target_window_days": {"optimize": True, "min": 30, "max": 180, "step": 30, "type": "int"},
+            # Min analyst price targets behind the consensus (degenerate-consensus guard). Range
+            # INCLUDES 0 ("no check") so the GA compares gating thinly-targeted names (e.g. the ASC
+            # 1-analyst $19 consensus) against not gating. Grid searches {0,3,6}.
+            "min_price_targets_per_quarter": {"optimize": True, "min": 0, "max": 6, "step": 3, "type": "int"},
+            # Rating-recency window (months): when >0, min_analysts counts only analysts active
+            # within this many months (from dated individual grades). 0 = no recency filter (full
+            # standing-analyst count). Grid searches {0,3,6,9,12}.
+            "max_analyst_age_months": {"optimize": True, "min": 0, "max": 12, "step": 3, "type": "int"},
             # CATEGORICAL: which analyst reference price the rating + the (S4) target-anchored TP
             # use. Optimized as a choice; the offset-from-target is the initial_tp gene (S4).
             "target_price_type": {"optimize": True, "type": "choice",
@@ -1186,6 +1196,8 @@ def _cmd_optimize(args) -> int:
             "profit_cap_pct": (float(args.profit_cap_pct) if args.profit_cap_pct else None),
             "profit_share_cap_pct": (float(args.profit_share_cap_pct) if args.profit_share_cap_pct else None),
             "fitness_trade_scale": bool(getattr(args, "fitness_trade_scale", False)),
+            "fitness_trade_scale_cap": (float(args.fitness_trade_scale_cap)
+                                        if getattr(args, "fitness_trade_scale_cap", None) else None),
             "backtest_id": int(_dt.now().timestamp()),
             "name": f"opt-{expert}-trial",
         }
@@ -1428,6 +1440,8 @@ def _cmd_optimize_batch(args) -> int:
                 "profit_cap_pct": (float(args.profit_cap_pct) if args.profit_cap_pct else None),
                 "profit_share_cap_pct": (float(args.profit_share_cap_pct) if args.profit_share_cap_pct else None),
                 "fitness_trade_scale": bool(getattr(args, "fitness_trade_scale", False)),
+                "fitness_trade_scale_cap": (float(args.fitness_trade_scale_cap)
+                                            if getattr(args, "fitness_trade_scale_cap", None) else None),
                 "backtest_id": int(_dt.now().timestamp()),
                 "name": f"{name}-trial",
             }
@@ -1983,10 +1997,16 @@ def main(argv: "list | None" = None) -> int:
                          "return). Complements --profit-cap-pct: a trade can pass the cost-basis cap "
                          "yet still dominate the book's return; this bounds that. Default: off.")
     op.add_argument("--fitness-trade-scale", action="store_true",
-                    help="Multiply each trial's fitness by avg_trades_per_year/100, so statistically "
-                         "thin (few-trade) configs are down-weighted and high-frequency ones up-"
-                         "weighted (~100 trades/yr = break-even). Stops a 16-trade lottery winner from "
-                         "topping the search on calmar. Default: off.")
+                    help="Multiply each trial's fitness by min(avg_trades_per_year, cap)/100, so "
+                         "statistically thin (few-trade) configs are down-weighted (~100 trades/yr = "
+                         "break-even). The cap (--fitness-trade-scale-cap) bounds the factor so the GA "
+                         "is NOT rewarded for over-trading (scalping). Stops a 16-trade lottery winner "
+                         "from topping the search on calmar. Default: off.")
+    op.add_argument("--fitness-trade-scale-cap", type=float, default=100.0,
+                    help="Cap (trades/year) for --fitness-trade-scale: avg_trades_per_year is clamped "
+                         "to this before scaling, so above it the factor stops growing (no scalper "
+                         "incentive). Default 100 = factor maxes at 1.0 (pure thinness penalty); a "
+                         "higher value allows some up-weighting up to that rate.")
     op.add_argument("--commission", type=float, default=1.0)
     op.add_argument("--slippage", type=float, default=0.0)
     op.add_argument("--fill-model", default="next_bar_open")
