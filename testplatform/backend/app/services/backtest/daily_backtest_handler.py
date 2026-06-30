@@ -69,7 +69,16 @@ def strategy_uses_options(cfg: Dict[str, Any]) -> bool:
     The option action can live under the canonical evaluator key ``action_type``, the API/UI
     alias ``action``, or the (forward-compat) ``option_strategy`` key — checked in that
     precedence. Rules are read from ``exit_rules`` (the canonical handler key) else the
-    API-shaped ``exit_conditions`` alias. Non-dict rules are ignored (no crash)."""
+    API-shaped ``exit_conditions`` alias. Non-dict rules are ignored (no crash).
+
+    ALSO True when ``cfg["entry_action"]`` names an option action — a pure-option ENTRY (the
+    enter_market ruleset fires the option directly, no equity leg), which is an options run even
+    when no exit rule names an option."""
+    ea = cfg.get("entry_action")
+    if isinstance(ea, dict):
+        a = ea.get("option_strategy") or ea.get("action_type") or ea.get("action")
+        if a and is_option_action(str(a)):
+            return True
     for rule in (cfg.get("exit_rules") or cfg.get("exit_conditions") or []):
         if not isinstance(rule, dict):
             continue
@@ -692,10 +701,14 @@ def _build_experts(
     # enter ruleset therefore needs no bracket plumbing. enable_short adds the symmetric SELL/short
     # entry rule + the RM enable_sell gate.
     enable_short = bool(config.get("enable_short"))
+    # Pure-option ENTRY: when set, the enter_market ruleset fires this option action directly
+    # (no equity leg) — the engine submits it directly (``_entry_is_option``).
+    entry_action = config.get("entry_action")
 
     def _seed_enter(nm: str) -> int:
-        if buy_tree:
-            return seed_ruleset_from_tree(buy_tree, name=nm, enable_short=enable_short)
+        if buy_tree or entry_action:
+            return seed_ruleset_from_tree(buy_tree, name=nm, enable_short=enable_short,
+                                          entry_action=entry_action)
         return (seed_enter_long_short_ruleset(name=nm) if enable_short
                 else seed_enter_long_ruleset(name=nm))
 

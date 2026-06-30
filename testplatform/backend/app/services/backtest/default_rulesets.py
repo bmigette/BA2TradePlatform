@@ -163,22 +163,35 @@ def _gate_trigger_groups(tree) -> list:
     return [_gate_triggers(tree)]
 
 
-def _entry_actions(side: str) -> dict:
-    """The BUY (long) or SELL (short) open action for an entry rule.
+def _entry_actions(side: str, entry_action: "dict | None" = None) -> dict:
+    """The open action for an entry rule.
 
-    NOTE: the entry TP/SL bracket is NOT emitted here as Adjust actions. At enter_market time the
-    BUY/SELL only stages a PENDING order (the RM sizes + submits it later), so there is no
-    transaction yet for an Adjust action to attach an OCO leg to — emitting Adjust here sets the
-    transaction's tp/sl field with no working leg AND suppresses the fallback, so nothing closes.
-    The engine applies the (reference-aware, optimizable) initial bracket at transaction-OPEN
-    instead (``_apply_initial_brackets``), which is the same net effect as the live entry Adjust.
+    Equity BUY (long) / SELL (short) by default. When ``entry_action`` (an OPTION action
+    config dict in the rule_builders shape — ``action_type`` + ``option_strike_*`` /
+    ``option_dte_*`` / ``option_sizing`` / ``option_wing_width*`` keys) is given, emit THAT as
+    the entry action instead, so the enter_market ruleset fires an OPTION action DIRECTLY (a
+    pure-option entry — no equity leg). The option action sizes + submits itself (the engine
+    runs the option entry with ``submit_to_broker=True``); the equity BUY/SELL stays a PENDING
+    qty=0 order the RM sizes later.
+
+    NOTE (equity path): the entry TP/SL bracket is NOT emitted here as Adjust actions. At
+    enter_market time the BUY/SELL only stages a PENDING order (the RM sizes + submits it
+    later), so there is no transaction yet for an Adjust action to attach an OCO leg to —
+    emitting Adjust here sets the transaction's tp/sl field with no working leg AND suppresses
+    the fallback, so nothing closes. The engine applies the (reference-aware, optimizable)
+    initial bracket at transaction-OPEN instead (``_apply_initial_brackets``).
     """
+    if entry_action:
+        built = action_from_rule(entry_action, key=side)
+        if built:
+            return built
     open_act = ExpertActionType.BUY.value if side == "buy" else ExpertActionType.SELL.value
     return {side: {"action_type": open_act}}
 
 
 def seed_ruleset_from_tree(buy_tree, name: str = "backtest-enter-tree",
-                           enable_short: bool = False) -> int:
+                           enable_short: bool = False,
+                           entry_action: "dict | None" = None) -> int:
     """Seed an enter_market ruleset from a Strategy buy-entry condition TREE; return its id.
 
     The base "BUY when bullish and flat" triggers are kept, AND each leaf condition in the tree
@@ -188,6 +201,11 @@ def seed_ruleset_from_tree(buy_tree, name: str = "backtest-enter-tree",
     applied at transaction-open by the engine (``_apply_initial_brackets``), NOT as an entry Adjust
     action (see ``_entry_actions``) — so the entry seeder carries no bracket plumbing. Unknown
     fields are skipped; falls back to bullish+flat when the tree adds nothing.
+
+    When ``entry_action`` (an OPTION action config) is given, the open action is the OPTION
+    action (a pure-option entry — no equity leg; see ``_entry_actions``). If ``buy_tree`` is
+    None in that case, a single permissive gate group is used so the option fires on the base
+    bullish+flat triggers alone (the entry condition is just "expert is bullish & flat").
     """
     ruleset = Ruleset(
         name=name,
@@ -199,7 +217,12 @@ def seed_ruleset_from_tree(buy_tree, name: str = "backtest-enter-tree",
 
     # One BUY rule per top-level OR group (faithful OR: ANY group enters); a single rule for an
     # AND / leaf tree. has_no_position keeps it to one entry even if several groups match.
-    groups = _gate_trigger_groups(buy_tree)
+    # When there's no tree but an option entry_action is set, use a single permissive gate
+    # (the option fires on bullish+flat alone — the base triggers ARE the entry condition).
+    if buy_tree is None and entry_action:
+        groups = [{}]
+    else:
+        groups = _gate_trigger_groups(buy_tree)
     multi = len(groups) > 1
     eas = []
     for gi, gate in enumerate(groups):
@@ -212,7 +235,7 @@ def seed_ruleset_from_tree(buy_tree, name: str = "backtest-enter-tree",
         eas.append(_make_event_action(
             name=f"{name}-enter-long{suffix}",
             triggers=buy_triggers,
-            actions=_entry_actions("buy"),
+            actions=_entry_actions("buy", entry_action),
         ))
         if enable_short:
             sell_triggers = {
@@ -223,7 +246,7 @@ def seed_ruleset_from_tree(buy_tree, name: str = "backtest-enter-tree",
             eas.append(_make_event_action(
                 name=f"{name}-enter-short{suffix}",
                 triggers=sell_triggers,
-                actions=_entry_actions("sell"),
+                actions=_entry_actions("sell", entry_action),
             ))
     _link(ruleset_id, eas)
     return ruleset_id
