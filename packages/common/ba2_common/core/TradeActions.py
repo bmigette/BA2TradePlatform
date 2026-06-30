@@ -2595,6 +2595,64 @@ class OpenCallButterflyAction(_OptionEntryAction):
         return f"Open call butterfly on {self.instrument_name}"
 
 
+class OpenPutRatioSpreadAction(_OptionEntryAction):
+    """Put front-ratio spread (1-2): BUY 1 put near ``strike_param`` %OTM + SELL 2
+    puts ``wing_width_pct`` farther OTM. Typically a small credit/even with extra
+    downside risk below the short strike. limit = long.ask - 2*short.bid (sign per
+    result). The naked short put (1 net short) is reserved at short.strike*100."""
+
+    DEFAULT_OTM_PCT = 5.0
+    DEFAULT_WING_PCT = 5.0
+
+    def _action_type_value(self) -> str:
+        return ExpertActionType.OPEN_PUT_RATIO_SPREAD.value
+
+    def _build_and_submit(self) -> Dict[str, Any]:
+        chain = self._chain(OptionRight.PUT)
+        if not chain:
+            return self._result(False, f"Empty option chain for {self.instrument_name}")
+        spot = self._spot()
+        otm = self.strike_param if self.strike_param is not None else self.DEFAULT_OTM_PCT
+        wing = self.wing_width_pct if self.wing_width_pct is not None else self.DEFAULT_WING_PCT
+        long_p = select_single(chain, method="percent_otm", strike_param=otm, spot=spot,
+                               option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
+                               today=self._today(), min_open_interest=self.min_open_interest,
+                               max_spread_pct=self.max_spread_pct)
+        if long_p is None:
+            return self._result(False, f"No liquid long put for ratio spread on {self.instrument_name}")
+        short_p = select_wing(chain, center_strike=long_p.strike, width_pct=wing,
+                              option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
+                              today=self._today(), expiry=long_p.expiry,
+                              min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct)
+        if short_p is None or short_p.strike >= long_p.strike:
+            return self._result(False, f"No valid short put wing for ratio spread on {self.instrument_name}")
+        if long_p.ask is None or short_p.bid is None:
+            return self._result(False, f"Missing quotes for ratio spread on {self.instrument_name}")
+        net = round(long_p.ask - 2 * short_p.bid, 4)   # usually negative (credit)
+        # Reserve the 1 net naked short put.
+        per_contract_reserve = short_p.strike * 100.0
+        quantity = self._size_by_reserve(per_contract_reserve, self.sizing)
+        if quantity < 1:
+            return self._result(False, f"Insufficient budget to size ratio spread for {self.instrument_name}")
+        reserve = self.account.option_reserve_required(
+            "put_ratio_spread", quantity, strike=short_p.strike)
+        if not self.account.check_option_buying_power(reserve):
+            return self._result(False, f"Insufficient BP for ratio spread on {self.instrument_name}")
+        legs = [
+            OptionLeg(contract_symbol=long_p.symbol, side=OrderDirection.BUY, ratio_qty=1,
+                      position_intent="buy_to_open", option_type=OptionRight.PUT,
+                      strike=long_p.strike, expiry=long_p.expiry, underlying=long_p.underlying),
+            OptionLeg(contract_symbol=short_p.symbol, side=OrderDirection.SELL, ratio_qty=2,
+                      position_intent="sell_to_open", option_type=OptionRight.PUT,
+                      strike=short_p.strike, expiry=short_p.expiry, underlying=short_p.underlying),
+        ]
+        return self._submit_option_order(legs, quantity, net, "put_ratio_spread",
+                                         option_reserve=reserve)
+
+    def get_description(self) -> str:
+        return f"Open put ratio spread on {self.instrument_name}"
+
+
 def build_closing_legs(children, parent_quantity: int, quote_fn) -> "tuple[List[OptionLeg], Optional[float]]":
     """Build reversed legs (and a net limit price) that close a spread's child legs.
 
@@ -2859,6 +2917,7 @@ def create_action(action_type: ExpertActionType, instrument_name: str, account: 
         ExpertActionType.OPEN_IRON_CONDOR: OpenIronCondorAction,
         ExpertActionType.OPEN_JADE_LIZARD: OpenJadeLizardAction,
         ExpertActionType.OPEN_CALL_BUTTERFLY: OpenCallButterflyAction,
+        ExpertActionType.OPEN_PUT_RATIO_SPREAD: OpenPutRatioSpreadAction,
         ExpertActionType.CLOSE_OPTION: CloseOptionAction,
     }
     

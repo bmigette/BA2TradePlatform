@@ -172,3 +172,19 @@ def test_call_butterfly_three_strikes_ratio_121_debit():
     assert len(body) == 1 and body[0].ratio_qty == 2
     assert len(wings) == 2 and all(w.ratio_qty == 1 for w in wings)
     assert sub["limit_price"] > 0  # net debit
+
+
+def test_put_ratio_spread_buy1_sell2():
+    acct, act = _mk("open_put_ratio_spread", strike_method="percent_otm",
+                    strike_param=5.0, dte_min=20, dte_max=40, sizing=20.0,
+                    wing_width_pct=5.0)
+    res = act.execute()
+    assert res["success"], res["message"]
+    sub = acct.submitted[0]
+    assert sub["strategy"] == "put_ratio_spread"
+    legs = sub["legs"]
+    buys = [l for l in legs if l.side == OrderDirection.BUY]
+    sells = [l for l in legs if l.side == OrderDirection.SELL]
+    assert len(buys) == 1 and buys[0].ratio_qty == 1
+    assert len(sells) == 1 and sells[0].ratio_qty == 2
+    assert buys[0].strike > sells[0].strike
