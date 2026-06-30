@@ -153,6 +153,14 @@ def _collect_conditions(strategy) -> Dict[str, Any]:
                 exit_rule.get("option_dte_max_range"),
                 exit_rule.get("option_dte_step"), is_int=True,
             )
+        # WING WIDTH for multi-leg option strategies (iron condor / jade lizard /
+        # butterfly / ratio): a float % the optimizer can tune for the spread width.
+        if eid and exit_rule.get("option_wing_width_optimize"):
+            out[f"exit:{eid}:option_wing_width"] = _range_entry(
+                exit_rule.get("option_wing_width_min"),
+                exit_rule.get("option_wing_width_max"),
+                exit_rule.get("option_wing_width_step"), is_int=False,
+            )
         # ON/OFF toggle for the whole exit rule (optimizer can drop it entirely).
         if eid and exit_rule.get("toggle_optimize"):
             out[f"exit:{eid}:enabled"] = _range_entry(0, 1, 1, is_int=True)
@@ -259,6 +267,7 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
     exit_enabled_by_id: Dict[str, Any] = {}
     exit_option_delta_by_id: Dict[str, Any] = {}
     exit_option_dte_by_id: Dict[str, Any] = {}
+    exit_option_wing_by_id: Dict[str, Any] = {}
     expert_overrides: Dict[str, Any] = {}
     screener_overrides: Dict[str, Any] = {}
     tp = getattr(strategy, "initial_tp_percent", None)
@@ -277,13 +286,15 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
             _, cid, field = key.split(":", 2)
             cond_by_id.setdefault(cid, {})[field] = val
         elif key.startswith("exit:"):
-            _, eid, field = key.split(":", 2)  # 'action_value'|'enabled'|'option_delta'|'option_dte'
+            _, eid, field = key.split(":", 2)  # 'action_value'|'enabled'|'option_delta'|'option_dte'|'option_wing_width'
             if field == "enabled":
                 exit_enabled_by_id[eid] = val
             elif field == "option_delta":
                 exit_option_delta_by_id[eid] = val
             elif field == "option_dte":
                 exit_option_dte_by_id[eid] = val
+            elif field == "option_wing_width":
+                exit_option_wing_by_id[eid] = val
             else:
                 exit_action_by_id[eid] = val
         else:
@@ -323,6 +334,10 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
             hw = max(base_hw, 7)  # at least +/-7 days so a weekly expiry falls in-window
             rule["option_dte_min"] = max(0, center - hw)
             rule["option_dte_max"] = center + hw
+        # WING WIDTH: applied directly as the rule_builders key option_wing_width_pct
+        # (mirrors option_strike_param; no window logic — it's a plain float %).
+        if eid in exit_option_wing_by_id:
+            rule["option_wing_width_pct"] = exit_option_wing_by_id[eid]
         if rule.get("conditions"):
             rule["conditions"] = _apply_to_tree(rule["conditions"], cond_by_id)
         exit_rules.append(rule)
