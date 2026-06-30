@@ -1111,11 +1111,152 @@ def _build_strategy_S4(name: str, expert: str):
     return strat
 
 
+# --- Option strategy entry-action configs (pure-option entries) -----------------------------------
+# Each maps a strategy key -> the option ACTION config the enter_market ruleset fires directly (no
+# equity leg; the engine's entry-option path submits it). Carries optimizable ranges (strike_param /
+# dte / wing) so the GA searches them via the option_* genes. DTE/%OTM windows are tastytrade-ish
+# (~25-45 DTE, sell ~10-20% OTM, wings 3-8%). The action_type maps to an _OptionEntryAction subclass
+# in ba2_common.core.TradeActions; rule_builders.action_from_rule consumes these option_* keys.
+_OPTION_STRATS = {
+    "O_LC": {  # long call (debit)
+        "action_type": "buy_call", "option_strike_method": "percent_otm",
+        "option_strike_param": 2.0, "option_dte_min": 25, "option_dte_max": 45,
+        "option_sizing": 5.0,
+        "option_strike_param_optimize": True, "option_strike_param_min": 0.0,
+        "option_strike_param_max": 8.0, "option_strike_param_step": 2.0,
+        "option_dte_optimize": True, "option_dte_min_range": 20,
+        "option_dte_max_range": 60, "option_dte_step": 5},
+    "O_VERT": {  # bear put vertical (debit)
+        "action_type": "open_bear_put_spread", "option_strike_method": "percent_otm",
+        "option_strike_param": 2.0, "option_dte_min": 25, "option_dte_max": 45,
+        "option_sizing": 5.0,
+        "option_strike_param_optimize": True, "option_strike_param_min": 0.0,
+        "option_strike_param_max": 6.0, "option_strike_param_step": 2.0,
+        "option_dte_optimize": True, "option_dte_min_range": 20,
+        "option_dte_max_range": 60, "option_dte_step": 5},
+    "O_SSTG": {  # short strangle (credit)
+        "action_type": "open_short_strangle", "option_strike_method": "percent_otm",
+        "option_strike_param": 12.0, "option_dte_min": 25, "option_dte_max": 45,
+        "option_sizing": 20.0,
+        "option_strike_param_optimize": True, "option_strike_param_min": 6.0,
+        "option_strike_param_max": 20.0, "option_strike_param_step": 2.0,
+        "option_dte_optimize": True, "option_dte_min_range": 20,
+        "option_dte_max_range": 50, "option_dte_step": 5},
+    "O_SSTD": {  # short straddle (credit)
+        "action_type": "open_short_straddle", "option_strike_method": "percent_otm",
+        "option_strike_param": 0.0, "option_dte_min": 25, "option_dte_max": 45,
+        "option_sizing": 20.0,
+        "option_dte_optimize": True, "option_dte_min_range": 20,
+        "option_dte_max_range": 50, "option_dte_step": 5},
+    "O_IC": {  # iron condor (credit, defined risk)
+        "action_type": "open_iron_condor", "option_strike_method": "percent_otm",
+        "option_strike_param": 12.0, "option_dte_min": 25, "option_dte_max": 45,
+        "option_sizing": 20.0, "option_wing_width_pct": 5.0,
+        "option_strike_param_optimize": True, "option_strike_param_min": 8.0,
+        "option_strike_param_max": 20.0, "option_strike_param_step": 2.0,
+        "option_wing_width_optimize": True, "option_wing_width_min": 3.0,
+        "option_wing_width_max": 8.0, "option_wing_width_step": 1.0},
+    "O_JL": {  # jade lizard (credit)
+        "action_type": "open_jade_lizard", "option_strike_method": "percent_otm",
+        "option_strike_param": 10.0, "option_dte_min": 25, "option_dte_max": 45,
+        "option_sizing": 20.0, "option_wing_width_pct": 5.0,
+        "option_strike_param_optimize": True, "option_strike_param_min": 6.0,
+        "option_strike_param_max": 16.0, "option_strike_param_step": 2.0,
+        "option_wing_width_optimize": True, "option_wing_width_min": 3.0,
+        "option_wing_width_max": 8.0, "option_wing_width_step": 1.0},
+    "O_BF": {  # long call butterfly (debit)
+        "action_type": "open_call_butterfly", "option_strike_method": "percent_otm",
+        "option_strike_param": 0.0, "option_dte_min": 25, "option_dte_max": 45,
+        "option_sizing": 8.0, "option_wing_width_pct": 10.0,
+        "option_wing_width_optimize": True, "option_wing_width_min": 5.0,
+        "option_wing_width_max": 15.0, "option_wing_width_step": 2.5},
+    "O_RS": {  # put ratio spread (credit/even)
+        "action_type": "open_put_ratio_spread", "option_strike_method": "percent_otm",
+        "option_strike_param": 5.0, "option_dte_min": 25, "option_dte_max": 45,
+        "option_sizing": 15.0, "option_wing_width_pct": 5.0,
+        "option_strike_param_optimize": True, "option_strike_param_min": 2.0,
+        "option_strike_param_max": 10.0, "option_strike_param_step": 2.0,
+        "option_wing_width_optimize": True, "option_wing_width_min": 3.0,
+        "option_wing_width_max": 8.0, "option_wing_width_step": 1.0},
+}
+
+# Pure-option strategy keys (entry is the option action; no equity leg). O_CC/O_STK are equity.
+_PURE_OPTION_STRATEGIES = set(_OPTION_STRATS)
+# All launcher option/equity strategy keys handled by the option builders.
+_OPTION_STRATEGY_KEYS = set(_OPTION_STRATS) | {"O_CC", "O_STK"}
+
+
+def _option_entry_action_for(kind: str) -> dict:
+    """The option ENTRY action config for a pure-option strategy key (a fresh copy)."""
+    return dict(_OPTION_STRATS[kind])
+
+
+def _option_exit_rules(kind: str):
+    """Close the held option at +50% premium profit, plus a time exit — both optimizable +
+    on/off-toggleable. (CLOSE on the held option position via ``close_option``.)"""
+    return [
+        {"id": "opt_tp", "action_type": "close_option", "toggle_optimize": True,
+         "conditions": {"type": "AND", "conditions": [
+             {"id": "tp", "field": "profit_loss_percent", "op": ">", "value": 50,
+              "optimize": True, "value_min": 25, "value_max": 75, "value_step": 5}]}},
+        {"id": "opt_time", "action_type": "close_option", "toggle_optimize": True,
+         "conditions": {"type": "AND", "conditions": [
+             {"id": "td", "field": "days_opened", "op": ">", "value": 21,
+              "optimize": True, "value_min": 10, "value_max": 35, "value_step": 5}]}},
+    ]
+
+
+def _build_strategy_option(kind: str):
+    """A pure-option Strategy: ``entry_action`` = the option action config (carried as a transient
+    in-memory attribute on the SQLAlchemy Strategy instance — it is NOT a mapped column, so it is
+    never persisted; the launcher reads it back via ``getattr`` and threads it into the run config);
+    exit = close at +50% / time. No equity TP/SL brackets (the option closes via close_option)."""
+    from app.models.strategy import Strategy
+    s = Strategy(
+        name=kind,
+        buy_entry_conditions={"id": "root", "type": "AND", "conditions": [
+            {"id": "gate_confidence", "field": "confidence", "op": ">", "value": 50,
+             "optimize": True, "value_min": 40, "value_max": 75, "value_step": 5,
+             "toggle_optimize": True}]},
+        exit_conditions=_option_exit_rules(kind),
+        initial_tp_percent=500.0, initial_tp_optimize=False,
+        initial_sl_percent=500.0, initial_sl_optimize=False,
+    )
+    # Carry the entry option action so the run-config assembly picks it up (transient attr; not
+    # a mapped column => not persisted, survives db.refresh which only reloads mapped columns).
+    s.entry_action = _option_entry_action_for(kind)  # type: ignore[attr-defined]
+    return s
+
+
+def _build_strategy_covered_call(kind: str):
+    """O_CC — equity entry (the S2 baseline) + a ``sell_covered_call`` OPEN_POSITIONS overlay rule
+    (sell a ~5% OTM call against the held shares). Equity-entry, so NO entry_action."""
+    from app.models.strategy import Strategy  # noqa: F401 — keep import parity with siblings
+    s = _build_strategy_S2(kind)  # reuse equity entry + base exits
+    s.exit_conditions = list(s.exit_conditions or []) + [{
+        "id": "cc_sell", "action_type": "sell_covered_call",
+        "option_strike_method": "percent_otm", "option_strike_param": 5.0,
+        "option_dte_min": 25, "option_dte_max": 45,
+        "conditions": {"type": "AND", "conditions": [{"id": "cc_hold", "field": "has_position"}]}}]
+    return s
+
+
+def _build_strategy_stock(kind: str):
+    """O_STK — plain equity long (the S2 baseline)."""
+    return _build_strategy_S2(kind)
+
+
 _STRATEGY_BUILDERS = {
     "S1": _build_strategy_S1,   # (name, expert)
     "S2": _build_strategy_S2,   # (name)
     "S3": _build_strategy_S3,   # (name)
     "S4": _build_strategy_S4,   # (name, expert) — target-anchored TP (expert_target_price)
+    # Option/equity strategies (dispatch by `kind`, not `name`; see _build_strategy):
+    "O_LC": _build_strategy_option, "O_VERT": _build_strategy_option,
+    "O_SSTG": _build_strategy_option, "O_SSTD": _build_strategy_option,
+    "O_IC": _build_strategy_option, "O_JL": _build_strategy_option,
+    "O_BF": _build_strategy_option, "O_RS": _build_strategy_option,
+    "O_CC": _build_strategy_covered_call, "O_STK": _build_strategy_stock,
 }
 
 # Strategy kinds whose INITIAL TP anchors on the expert's analyst target price (the
@@ -1124,9 +1265,13 @@ _TARGET_ANCHORED_STRATEGIES = {"S4"}
 
 
 def _build_strategy(kind: str, name: str, expert: str):
-    """Dispatch to the right strategy builder. S1/S4 are expert-specific (load the live JSON)."""
+    """Dispatch to the right strategy builder. S1/S4 are expert-specific (load the live JSON).
+    Option/equity strategies (O_*) dispatch by `kind` (the builder names the Strategy off the kind
+    and, for pure-option kinds, carries the entry_action)."""
     if kind in ("S1", "S4"):
         return _STRATEGY_BUILDERS[kind](name, expert)
+    if kind in _OPTION_STRATEGY_KEYS:
+        return _STRATEGY_BUILDERS[kind](kind)
     builder = _STRATEGY_BUILDERS.get(kind)
     if builder is None:
         sys.exit(f"optimize: unknown strategy {kind!r}; have {sorted(_STRATEGY_BUILDERS)}")
@@ -1174,6 +1319,11 @@ def _cmd_optimize(args) -> int:
         # Bypass experts (FactorRanker) have no S1-S4 variants — they size their own portfolio, so
         # they use the minimal strategy and ignore --strategy. Classic experts build the chosen variant.
         strat = _build_strategy_minimal(_sname) if bypass else _build_strategy(args.strategy, _sname, expert)
+        # Pure-option strategies carry a transient `entry_action` (the option ENTRY action config).
+        # Capture it BEFORE commit/refresh so a db.refresh (which reloads only mapped columns) can't
+        # affect it, then thread it into the run config below so the handler's _build_experts (and
+        # the optimization handler's _build_daily_trial_config) seed the enter ruleset with it.
+        strat_entry_action = getattr(strat, "entry_action", None)
         db.add(strat); db.commit(); db.refresh(strat)
 
         backtest_block = {
@@ -1294,6 +1444,12 @@ def _cmd_optimize(args) -> int:
         # price (the initial_tp gene becomes the offset-from-target). Not applicable to bypass experts.
         if (not bypass) and args.strategy in _TARGET_ANCHORED_STRATEGIES:
             backtest_block["initial_tp_reference"] = "expert_target_price"
+        # Pure-option strategy: thread the option ENTRY action onto the run config. The optimization
+        # handler's _build_daily_trial_config forwards backtest['entry_action'] into every trial
+        # config, and daily_backtest_handler._build_experts reads config['entry_action'] to seed the
+        # enter ruleset with the option action (no equity leg). Equity strategies leave it unset.
+        if strat_entry_action:
+            backtest_block["entry_action"] = strat_entry_action
         cfg = {
             "populationSize": int(args.population),
             "generations": int(args.generations),
@@ -1419,6 +1575,8 @@ def _cmd_optimize_batch(args) -> int:
         db = SessionLocal()
         try:
             strat = _build_strategy_minimal(name) if bypass else _build_strategy(strat_kind, name, expert)
+            # Pure-option kinds carry a transient `entry_action`; capture before commit/refresh.
+            strat_entry_action = getattr(strat, "entry_action", None)
             db.add(strat); db.commit(); db.refresh(strat)
             backtest_block = {
                 "engine": "daily",
@@ -1450,6 +1608,10 @@ def _cmd_optimize_batch(args) -> int:
             # offset-from-target. Other kinds keep the default percent-off-entry TP.
             if strat_kind in _TARGET_ANCHORED_STRATEGIES:
                 backtest_block["initial_tp_reference"] = "expert_target_price"
+            # Pure-option strategy: thread the option ENTRY action onto the run config so every trial
+            # seeds the enter ruleset with the option action (forwarded by _build_daily_trial_config).
+            if strat_entry_action:
+                backtest_block["entry_action"] = strat_entry_action
             cfg = {
                 "populationSize": int(args.population),
                 "generations": int(args.generations),
@@ -1972,9 +2134,13 @@ def main(argv: "list | None" = None) -> int:
 
     op = sub.add_parser("optimize", help="Joint genetic optimization (expert + RM params + TP/SL).")
     op.add_argument("--expert", required=True, help="Expert class (FMPRating/FMPEarningsDrift/...).")
-    op.add_argument("--strategy", choices=["S1", "S2", "S3", "S4"], default="S2",
+    op.add_argument("--strategy", choices=sorted(_STRATEGY_BUILDERS), default="S2",
                     help="Strategy/exit variant for a ruleset expert: S1 live-import / S2 bracket / "
-                         "S3 trailing / S4 target-anchored. Ignored for bypass experts (FactorRanker).")
+                         "S3 trailing / S4 target-anchored; or an option/equity strategy "
+                         "(O_LC long-call, O_VERT bear-put, O_SSTG short-strangle, O_SSTD "
+                         "short-straddle, O_IC iron-condor, O_JL jade-lizard, O_BF call-butterfly, "
+                         "O_RS put-ratio-spread, O_CC covered-call, O_STK equity). "
+                         "Ignored for bypass experts (FactorRanker).")
     op.add_argument("--universe", required=True, help="Comma-separated symbols.")
     op.add_argument("--start", required=True, help="ISO start date.")
     op.add_argument("--end", required=True, help="ISO end date.")
@@ -2047,7 +2213,9 @@ def main(argv: "list | None" = None) -> int:
                     help="Comma-separated expert classes (default: the 3 in-scope equity experts).")
     ob.add_argument("--strategies", default="S1,S2,S3",
                     help="Comma-separated strategy variants per ruleset expert (S1 live-import / "
-                         "S2 bracket / S3 trailing). Bypass experts (FactorRanker) ignore this.")
+                         "S2 bracket / S3 trailing / S4 target-anchored; or option/equity strategies "
+                         "O_LC,O_VERT,O_SSTG,O_SSTD,O_IC,O_JL,O_BF,O_RS,O_CC,O_STK). Each is "
+                         "dispatched through _build_strategy. Bypass experts (FactorRanker) ignore this.")
     ob.add_argument("--universe", required=True, help="Comma-separated symbols (shared by all jobs).")
     ob.add_argument("--start", required=True, help="ISO start date.")
     ob.add_argument("--end", required=True, help="ISO end date.")
