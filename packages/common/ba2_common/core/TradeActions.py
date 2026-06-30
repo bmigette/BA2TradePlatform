@@ -1524,6 +1524,7 @@ class _OptionEntryAction(TradeAction):
                  sizing: Optional[float] = None,
                  min_open_interest: Optional[int] = None,
                  max_spread_pct: Optional[float] = None,
+                 wing_width_pct: Optional[float] = None,
                  **kwargs):
         super().__init__(instrument_name, account, order_recommendation,
                          existing_order, expert_recommendation)
@@ -1534,6 +1535,7 @@ class _OptionEntryAction(TradeAction):
         self.sizing = sizing
         self.min_open_interest = min_open_interest
         self.max_spread_pct = max_spread_pct
+        self.wing_width_pct = wing_width_pct
 
     # --- helpers ----------------------------------------------------------
     def _action_type_value(self) -> str:
