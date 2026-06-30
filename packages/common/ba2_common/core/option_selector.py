@@ -103,7 +103,7 @@ def select_vertical_spread(chain, *, method, long_param, short_param, spot, opti
 
 def select_wing(chain, *, center_strike, width_pct, option_type,
                 dte_min, dte_max, today, expiry=None,
-                min_open_interest=None, max_spread_pct=None):
+                min_open_interest=None, max_spread_pct=None) -> Optional[OptionContract]:
     """Pick the wing contract nearest ``center_strike`` moved ``width_pct`` percent
     farther OTM (calls: up; puts: down). When ``expiry`` is given, restrict to that
     expiry (wings must share the short leg's expiry)."""
