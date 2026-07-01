@@ -164,3 +164,4 @@ cython_debug/
 
 # Vendored TradingAgents framework runtime output (sample analyses)
 ba2_trade_platform/thirdparties/TradingAgents/results/
+.aider*

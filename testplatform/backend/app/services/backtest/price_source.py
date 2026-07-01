@@ -28,6 +28,7 @@ from __future__ import annotations
 import bisect
 import logging
 import os
+from collections import OrderedDict
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from typing import Any, Dict, List, Optional
@@ -55,7 +56,18 @@ class BacktestCacheMiss(Exception):
 # Keyed by (symbol, interval, window) — NOT the per-run provider instance — so every individual in
 # the worker reuses the parsed index built by the first one. Bytewise-identical bars (same parquet,
 # same parse). Cleared via clear_worker_bar_cache() (between unrelated optimizations / in tests).
-_WORKER_BAR_CACHE: Dict[Any, Any] = {}
+#
+# LRU-BOUNDED: a LONG-LIVED worker (e.g. the remote distributed-GA server) runs trials for MANY
+# optimizations back-to-back WITHOUT restarting. Those share the same window+interval but DIFFERENT
+# universes (e.g. the large/mid/small screener bands ~= 2000 distinct symbols), so an unbounded dict
+# accumulated every band's ~3MB/symbol columnar arrays and grew to multi-GB / OOM over a run. The
+# cap is an OrderedDict LRU: it holds the current optimization's working set (>= the largest single
+# band so there is no within-band re-parse churn) and evicts the least-recently-used symbols of
+# PRIOR optimizations. Eviction is result-neutral — a later miss re-parses the identical parquet.
+_WORKER_BAR_CACHE: "OrderedDict[Any, Any]" = OrderedDict()
+# Max distinct (symbol, window) series held. ~1500 covers the largest screener band (~1100 symbols)
+# with headroom; at ~3MB/symbol (3yr 5min) that bounds the cache near a single band's working set.
+_WORKER_BAR_CACHE_MAX = 1500
 
 
 def clear_worker_bar_cache() -> None:
@@ -240,6 +252,7 @@ class AsOfPriceSource:
             # symbol's bar index for the same window -> adopt it (no re-fetch, no re-parse).
             cached = _WORKER_BAR_CACHE.get((sym, *win))
             if cached is not None:
+                _WORKER_BAR_CACHE.move_to_end((sym, *win))  # LRU: mark most-recently-used
                 (self._keys[sym], self._o[sym], self._h[sym],
                  self._l[sym], self._c[sym], self._v[sym]) = cached
                 continue
@@ -269,6 +282,10 @@ class AsOfPriceSource:
                 self._keys[sym], self._o[sym], self._h[sym],
                 self._l[sym], self._c[sym], self._v[sym],
             )
+            # LRU bound: evict the least-recently-used series so a long-lived worker running many
+            # optimizations (different universes, same window) can't accumulate every band and OOM.
+            while len(_WORKER_BAR_CACHE) > _WORKER_BAR_CACHE_MAX:
+                _WORKER_BAR_CACHE.popitem(last=False)
 
         if missing:
             interval = self._interval
