@@ -500,10 +500,17 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         reproducing a full Reg-T long-side schedule.
         """
         req = 0.0
+        # Contracts that belong to a DEFINED-RISK combo — their short legs are COVERED by the
+        # combo's long legs (defined risk), so they carry NO naked-margin requirement and must be
+        # excluded here (otherwise a butterfly's short body / an iron condor's short legs inflate
+        # the requirement and trigger a false margin call that breaks the combo).
+        defined_risk = self._defined_risk_contracts()
         # Short option legs.
         for lot in self._option_positions.values():
             if lot.qty >= 0:
                 continue  # only SHORT legs carry naked-margin risk here
+            if lot.contract_symbol in defined_risk:
+                continue  # covered short leg of a defined-risk combo -> no naked margin
             strike, spot = self._lot_strike_and_spot(lot.contract_symbol)
             if strike is None:
                 continue
@@ -520,6 +527,26 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             if px:
                 req += self.SHORT_STOCK_MAINTENANCE_FRACTION * abs(p.qty) * float(px)
         return req
+
+    def _defined_risk_contracts(self) -> set:
+        """Set of currently-held contract_symbols that belong to a DEFINED-RISK combo.
+
+        Uses the same ``_option_group_bounds`` grouping as the MTM clamp. A leg is defined-risk
+        when its group's ``option_strategy`` is one of the defined-risk structures (debit or
+        credit) — its short exposure is covered by the combo's long legs, so it carries no naked
+        margin and must never be liquidated in isolation (that would break the combo and leave a
+        permanent cash imbalance beyond the defined risk).
+        """
+        contract_group, group_bounds = self._option_group_bounds()
+        out: set = set()
+        for cs, gkey in contract_group.items():
+            gb = group_bounds.get(gkey)
+            if gb and (
+                gb["strategy"] in self.DEFINED_RISK_LONG_STRATEGIES
+                or gb["strategy"] in self.DEFINED_RISK_SHORT_STRATEGIES
+            ):
+                out.add(cs)
+        return out
 
     def _lot_strike_and_spot(self, contract_symbol: str):
         """(strike, underlying_spot) for a held option lot, resolved from its FILLED order.
@@ -561,12 +588,20 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             return False
 
         liquidated = False
-        # Unwind short OPTION legs first (the naked, unbounded-risk exposure), largest lot first,
+        # DEFINED-RISK combo legs are covered (defined risk) — never liquidate them in isolation
+        # (that orphans the combo's long legs and leaves a permanent cash imbalance). Only unwind
+        # genuinely NAKED short legs (short strangle/straddle/jade_lizard/put_ratio, single-leg
+        # naked short).
+        defined_risk = self._defined_risk_contracts()
+        # Unwind naked short OPTION legs first (the unbounded-risk exposure), largest lot first,
         # re-checking the breach after each close so we stop as soon as margin is satisfied.
         while True:
             if self.equity() >= self.maintenance_margin_requirement() and self.equity() >= 0:
                 break
-            short_lots = [l for l in self._option_positions.values() if l.qty < 0]
+            short_lots = [
+                l for l in self._option_positions.values()
+                if l.qty < 0 and l.contract_symbol not in defined_risk
+            ]
             if not short_lots:
                 break
             lot = max(short_lots, key=lambda l: abs(l.qty))
