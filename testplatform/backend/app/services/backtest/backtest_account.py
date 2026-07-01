@@ -302,6 +302,13 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # Resolve each held lot's structure (group key + option_strategy + strike) once from the
         # in-memory order cache (no per-bar DB churn; the same leg-grouping used elsewhere).
         meta = self._option_lot_metadata()
+        import os as _os
+        if _os.environ.get("BT_MTM_DUMP"):
+            _live = [(l.contract_symbol, l.qty) for l in self._option_positions.values() if l.qty != 0]
+            if len(_live) >= 3:
+                logger.warning("[MTM_DUMP] lots=%s", _live)
+                logger.warning("[MTM_DUMP] meta=%s", meta)
+                _os.environ["BT_MTM_DUMP"] = ""  # once
         # Accumulate ungrouped/undefined-risk lots directly; group defined-risk lots to clamp.
         total = 0.0
         groups: Dict[Any, Dict[str, Any]] = {}
@@ -316,6 +323,10 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
 
             m = meta.get(lot.contract_symbol)
             strategy = m["strategy"] if m else None
+            import os as _os
+            if _os.environ.get("BT_MTM_DEBUG") and abs(contribution) > 20000:
+                logger.warning("[MTM_DEBUG] lot=%s qty=%s px=%.2f contrib=%.0f meta=%s",
+                               lot.contract_symbol, lot.qty, px, contribution, m)
             if strategy in self.DEFINED_RISK_LONG_STRATEGIES or strategy in self.DEFINED_RISK_SHORT_STRATEGIES:
                 g = groups.setdefault(
                     m["group_key"],
@@ -470,7 +481,13 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         in-memory ledger close paths (no per-bar DB churn on healthy bars). Long positions are
         left untouched (their risk is bounded and already funded); only the unbounded SHORT risk
         is unwound. Logs a ``margin_call_liquidation`` line per closed position.
+
+        OPTIONS-ONLY: this is a naked short-PREMIUM defense. Equity-only backtests (no options
+        provider) never had a margin-call path — short-circuit here so their behaviour stays
+        byte-identical and they pay zero per-bar cost (one attribute check).
         """
+        if self._options is None:
+            return False
         if self.equity() >= self.maintenance_margin_requirement() and self.equity() >= 0:
             return False
 
