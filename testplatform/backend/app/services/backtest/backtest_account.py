@@ -981,6 +981,12 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 fill_px = self._option_fill_price(o, as_of)
                 if fill_px is None:
                     continue
+                # CASH-SECURED guard for a lone LONG (debit) option entry: cap the contract count
+                # to what current cash affords at the ACTUAL fill premium so a debit buy can never
+                # drive cash below zero (the debit analog of the margin-call liquidation). A
+                # sell-to-open (credit) leg receives cash and is left to the margin path.
+                if not self._cap_single_leg_option_entry(o, fill_px):
+                    continue  # unaffordable at >=1 contract -> entry did not open
                 self._apply_option_fill(o, fill_px, as_of)
                 self._cancel_oco_sibling(o)
                 filled = True
@@ -1078,6 +1084,53 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             and o.status != OrderStatus.FILLED
         ]
 
+    def _cap_single_leg_option_entry(self, order, fill_px: float) -> bool:
+        """Cash-secured cap for a lone LONG (debit) single-leg option ENTRY.
+
+        Caps ``order.quantity`` to ``floor(cash / (fill_px * multiplier + commission))`` so a
+        debit buy can never drive cash below zero. Returns False (and CANCELs the order) when not
+        even one contract is affordable, so the caller skips the fill.
+
+        Only a BUY that OPENS (``position_intent`` starts with "buy_to_open", or is unset) is
+        capped — a SELL-to-open (credit) leg receives cash, and a BUY/SELL-to-CLOSE is a
+        legitimate close that must not be blocked. Returns True (no cap) for those.
+        """
+        if order.side != OrderDirection.BUY:
+            return True
+        intent = (getattr(order, "position_intent", None) or "").lower()
+        if intent and "open" not in intent:
+            return True  # a close (buy_to_close) — never block a close
+        qty = float(order.quantity) if order.quantity is not None else 0.0
+        if qty <= 0:
+            return True
+        multiplier = float(order.multiplier or 100)
+        commission = float(self._cfg["commission_per_trade"])
+        per_contract = fill_px * multiplier + commission
+        if per_contract <= 0:
+            return True
+        cost = qty * fill_px * multiplier + commission
+        if cost <= self._cash + 1e-6:
+            return True  # affordable at full size -> no cap
+        affordable = int(self._cash // per_contract)
+        if affordable < 1:
+            logger.error(
+                "BACKTEST option cash-secured: LONG %s %g @ %.4f (cost $%.2f) exceeds cash "
+                "$%.2f -> entry NOT opened.",
+                order.contract_symbol, qty, fill_px, cost, self._cash,
+            )
+            order.status = OrderStatus.CANCELED
+            order.quantity = 0
+            update_instance(order)
+            self._cancel_oco_sibling(order)
+            return False
+        logger.error(
+            "BACKTEST option cash-secured: LONG %s sized %g @ %.4f exceeds cash $%.2f -> "
+            "capping to %d contract(s).",
+            order.contract_symbol, qty, fill_px, self._cash, affordable,
+        )
+        order.quantity = float(affordable)
+        return True
+
     def _fill_multi_leg_parent(self, parent, as_of: datetime) -> None:
         """ALL-OR-NONE fill of a multi-leg option parent (spread/straddle/...).
 
@@ -1098,6 +1151,62 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             if px is None:
                 return  # all-or-none: one leg can't price -> fill none this bar
             priced.append((leg, px))
+
+        # CASH-SECURED guard for DEBIT combos (defense-in-depth, the debit analog of the
+        # margin-call liquidation for credit shorts). Options are sized from ANALYSIS-time quotes
+        # but fill at the sparse cache's next-bar premiums, which can diverge sharply upward, so a
+        # debit combo could otherwise buy far more debit than the account holds and drive cash
+        # persistently negative. Compute the ACTUAL per-structure net debit from the FILL premiums
+        # and cap the number of STRUCTURES that fill to what current cash can afford. All legs
+        # scale together by the capped count (respecting each leg's ratio) so the combo stays
+        # balanced/defined-risk. A CREDIT combo (net premium <= 0 -> cash inflow) is left alone
+        # (its risk is bounded by the margin path, not cash spend).
+        structures = abs(float(parent.quantity or 0.0))
+        if structures <= 0:
+            return
+        commission = float(self._cfg["commission_per_trade"])
+        debit_per_structure = 0.0
+        for leg, px in priced:
+            ratio = abs(float(leg.quantity or 0.0)) / structures if structures else 0.0
+            mult = float(leg.multiplier or 100)
+            signed = px if leg.side == OrderDirection.BUY else -px
+            debit_per_structure += signed * ratio * mult
+        # + per-leg commission for one structure's worth of legs (flat charge per leg fill).
+        per_structure_cost = debit_per_structure + commission * len(priced)
+        capped = structures
+        if per_structure_cost > 0:
+            affordable = int((self._cash) // per_structure_cost)
+            if affordable < structures:
+                if affordable < 1:
+                    # Not even one structure affordable -> the combo does NOT open this bar. Cancel
+                    # the parent + legs so it isn't retried forever (mirrors the equity guard).
+                    logger.error(
+                        "BACKTEST option cash-secured: DEBIT combo %s per-structure cost $%.2f "
+                        "exceeds cash $%.2f -> entry NOT opened.",
+                        getattr(parent, "option_strategy", None), per_structure_cost, self._cash,
+                    )
+                    for leg, _ in priced:
+                        leg.status = OrderStatus.CANCELED
+                        leg.quantity = 0
+                        update_instance(leg)
+                    parent.status = OrderStatus.CANCELED
+                    parent.quantity = 0
+                    update_instance(parent)
+                    return
+                logger.error(
+                    "BACKTEST option cash-secured: DEBIT combo %s sized %g structures @ $%.2f "
+                    "each exceeds cash $%.2f -> capping to %d.",
+                    getattr(parent, "option_strategy", None), structures, per_structure_cost,
+                    self._cash, affordable,
+                )
+                capped = float(affordable)
+
+        # Rescale each leg's quantity to the capped structure count (ratio preserved).
+        if capped != structures:
+            for leg, _ in priced:
+                ratio = abs(float(leg.quantity or 0.0)) / structures
+                leg.quantity = ratio * capped
+            parent.quantity = capped
 
         net = 0.0
         for leg, px in priced:
