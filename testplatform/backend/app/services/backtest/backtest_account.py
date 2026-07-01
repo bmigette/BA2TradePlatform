@@ -454,13 +454,14 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             px = self._price.close_asof(pos.symbol)
         if px is None:
             return False
+        closed_qty = abs(pos.qty)
         signed = -pos.qty  # opposite sign closes the position
         # Selling (signed<0) credits cash; buying-to-cover (signed>0) debits cash.
         self._cash -= signed * float(px)
         self._update_position(pos.symbol, signed, float(px))
         logger.warning(
             "[backtest] margin_call_liquidation: closed STOCK %g x %s @ %.4f to satisfy "
-            "maintenance margin.", abs(pos.qty), pos.symbol, float(px),
+            "maintenance margin.", closed_qty, pos.symbol, float(px),
         )
         return True
 
@@ -1157,21 +1158,44 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             oid = o.id or 0
             return (0, fd, oid) if fd is not None else (1, oid, oid)
 
-        # Group FILLED orders (with a usable price) by transaction.
-        by_txn: Dict[int, List[Any]] = {}
+        # Group FILLED orders (with a usable price) into round-trips. For a MULTI-LEG option
+        # spread (strangle/straddle/spread) each leg is its own per-contract round-trip: the legs
+        # share ONE transaction but trade DIFFERENT contracts, so grouping the whole transaction
+        # together (and using the PARENT's net-credit ``symbol``/``open_price``) produced one
+        # garbage row per spread — the reported entry~0 / pnl=-market*100*qty defect. The group key
+        # is therefore ``(transaction_id, contract_symbol)`` for an option leg carrying a contract,
+        # and ``(transaction_id, None)`` for single-leg options + equities. The multi-leg PARENT
+        # (asset_class OPTION, NO contract_symbol, net-only) lands alone under ``(txn, None)`` and
+        # is dropped below (it moves no cash; its legs carry the real P&L).
+        by_group: Dict[tuple, List[Any]] = {}
         for o in self.get_orders():
             if o.transaction_id is None:
                 continue
             if o.status not in executed or not (o.filled_qty or o.quantity):
                 continue
-            if not o.open_price:
+            if not o.open_price and o.open_price != 0.0:
                 continue
-            by_txn.setdefault(o.transaction_id, []).append(o)
+            is_option_leg = (
+                getattr(o, "asset_class", None) == AssetClass.OPTION
+                and bool(getattr(o, "contract_symbol", None))
+            )
+            key = (o.transaction_id, o.contract_symbol) if is_option_leg else (o.transaction_id, None)
+            by_group.setdefault(key, []).append(o)
 
         trades: List[Dict[str, Any]] = []
-        for txn_id, orders in by_txn.items():
+        for (txn_id, _grp_contract), orders in by_group.items():
             if not orders:
                 continue
+            # Drop a lone multi-leg PARENT group (option, no contract, net-only): its legs carry
+            # the real per-contract P&L, so a parent-only group is not a real round-trip.
+            if all(
+                getattr(o, "asset_class", None) == AssetClass.OPTION
+                and not getattr(o, "contract_symbol", None)
+                for o in orders
+            ):
+                continue
+            # A worthless-close leg has open_price 0 on BOTH sides after netting; keep it (it is a
+            # real, fully-realised round-trip) — the ``!= 0.0`` guard above already let it through.
             # The opening order is the earliest-filled one; its side opens the position.
             orders_by_fill = sorted(orders, key=_fill_key)
             opening = orders_by_fill[0]
@@ -1409,29 +1433,54 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         return out
 
     def _multi_leg_positions(self, parent) -> List[OptionPosition]:
-        """One OptionPosition per FILLED child leg of a multi-leg option parent.
+        """One OptionPosition per STILL-OPEN per-contract leg of a multi-leg option parent.
 
-        Each leg is its own per-contract lot (buy leg -> long, sell leg -> short) priced at
-        the leg's own fill premium (``open_price`` per share). Legs that have not filled yet
-        (all-or-none means this is all-or-nothing, but a closed/canceled leg is skipped) are
-        omitted.
+        Each opening child leg (linked by ``parent_order_id``) is a per-contract lot (buy leg ->
+        long, sell leg -> short) at its own fill premium. CLOSING fills — the synthetic orders
+        recorded by ``_record_option_expiry_close`` at expiry/liquidation, which share the
+        transaction + contract but carry NO ``parent_order_id`` — are NETTED against the opening
+        leg on the SAME contract, so a leg that has been settled/liquidated is NO LONGER reported
+        as held. Without this netting a resolved leg was re-processed by ``_apply_option_expiry``
+        every bar (re-assigning shares repeatedly -> the -256%/-8974% blow-up).
         """
         executed = OrderStatus.get_executed_statuses()
-        out: List[OptionPosition] = []
-        for leg in self.get_orders():
-            if leg.parent_order_id != parent.id:
+        # Net signed contract qty per OCC across ALL executed option orders on this transaction
+        # (opening child legs + synthetic closing orders), plus a template of the opening leg for
+        # the per-contract metadata (strike/expiry/type/premium).
+        net: Dict[str, float] = {}
+        opening: Dict[str, Any] = {}
+        for o in self.get_orders():
+            if o.transaction_id != parent.transaction_id:
                 continue
-            if leg.status not in executed or not leg.filled_qty:
+            if getattr(o, "asset_class", None) != AssetClass.OPTION:
+                continue
+            if not o.contract_symbol:  # skip the parent (net-only, no contract)
+                continue
+            if o.status not in executed or not (o.filled_qty or o.quantity):
+                continue
+            qty = float(o.filled_qty or o.quantity)
+            signed = qty if o.side == OrderDirection.BUY else -qty
+            net[o.contract_symbol] = net.get(o.contract_symbol, 0.0) + signed
+            # The OPENING leg is a child of the parent; keep it as the metadata template.
+            if o.parent_order_id == parent.id:
+                opening[o.contract_symbol] = o
+
+        out: List[OptionPosition] = []
+        for cs, signed_qty in net.items():
+            if abs(signed_qty) < 1e-9:
+                continue  # fully closed leg -> not held
+            leg = opening.get(cs)
+            if leg is None:
                 continue
             out.append(
                 OptionPosition(
-                    contract_symbol=leg.contract_symbol,
+                    contract_symbol=cs,
                     underlying=leg.underlying_symbol,
                     option_type=leg.option_type,
                     strike=leg.strike,
                     expiry=leg.expiry,
-                    side=leg.side,
-                    quantity=abs(float(leg.filled_qty)),
+                    side=(OrderDirection.BUY if signed_qty > 0 else OrderDirection.SELL),
+                    quantity=abs(signed_qty),
                     avg_entry_price=leg.open_price or 0.0,
                     multiplier=leg.multiplier or 100,
                 )

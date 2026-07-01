@@ -230,3 +230,49 @@ def test_strangle_assignment_loss_persists(engine_short_strangle):
 
     assert equity_next < CFG["starting_cash"] - 1000
     assert equity_next == pytest.approx(equity_expiry, abs=1.0)
+
+
+def test_strangle_settled_leg_not_reassigned(engine_short_strangle):
+    """A settled leg must NOT be reported as held on later bars: running expiry again must
+    NOT re-assign more shares (the phantom re-assignment behind the -8974% blow-up)."""
+    engine, acct, ps = engine_short_strangle
+    ps.set_clock(datetime(2024, 3, 15))
+    engine._apply_option_expiry(datetime(2024, 3, 15))
+
+    aapl_after_first = [p for p in acct.get_positions() if p["symbol"] == "AAPL"]
+    assert aapl_after_first[0]["qty"] == -100
+
+    # Re-run expiry on the NEXT bar. The call leg is already settled + netted, so no option
+    # position should remain and the AMD/AAPL short must NOT double.
+    ps.set_clock(datetime(2024, 3, 18))
+    assert acct.get_option_positions() == []
+    engine._apply_option_expiry(datetime(2024, 3, 18))
+
+    aapl_after_second = [p for p in acct.get_positions() if p["symbol"] == "AAPL"]
+    assert aapl_after_second[0]["qty"] == -100  # unchanged — NOT -200
+
+
+def test_strangle_round_trip_per_leg_entry_not_zero(engine_short_strangle):
+    """The multi-leg strangle must produce a PER-LEG round-trip whose entry is the leg's
+    premium (NOT ~0) and whose pnl is bounded (NOT -market*100*qty). This is the
+    entry_price~0 / pnl=-(stock*100*qty) reporting defect from Backtest id=299."""
+    engine, acct, ps = engine_short_strangle
+    ps.set_clock(datetime(2024, 3, 15))
+    engine._apply_option_expiry(datetime(2024, 3, 15))
+
+    trips = acct.get_round_trip_trades()
+    # One round-trip per leg (call + put), keyed by the OCC contract symbol — NOT one lumped
+    # underlying-symbol row.
+    call = [t for t in trips if t["symbol"] == _CALL_OCC]
+    put = [t for t in trips if t["symbol"] == _PUT_OCC]
+    assert len(call) == 1
+    assert len(put) == 1
+
+    # Call leg: sold @4.0 (premium), settled at intrinsic 20 -> loss ~ (4-20)*100 = -1600.
+    assert call[0]["entry_price"] == pytest.approx(4.0, abs=0.5)   # NOT ~0
+    assert call[0]["pnl"] == pytest.approx(-1600.0, abs=100.0)
+    assert call[0]["pnl"] > -100_000                                # NOT -market*100*qty
+
+    # Put leg: sold @2.5, expired worthless -> small profit (kept the premium).
+    assert put[0]["entry_price"] == pytest.approx(2.5, abs=0.5)     # NOT ~0
+    assert put[0]["pnl"] == pytest.approx(250.0, abs=50.0)
