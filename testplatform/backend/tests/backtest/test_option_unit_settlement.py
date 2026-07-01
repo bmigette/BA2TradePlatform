@@ -232,3 +232,134 @@ def test_iron_condor_call_side_breach_bounded(tmp_path):
         assert acct._cash >= -1.0
     finally:
         ctx.__exit__(None, None, None)
+
+
+# ---------------------------------------------------------------------------
+# 2-LEG VERTICAL (bear_put_spread) — the O_VERT regression: spot BETWEEN strikes
+# at expiry (long higher-strike put ITM, short lower-strike put OTM). Must unit-settle
+# to the bounded net, NEVER leave an unhedged short-stock leg. Not special-cased by
+# leg count — a 2-leg vertical settles exactly like the 3-4-leg combos.
+# ---------------------------------------------------------------------------
+_V_LONG = "AAPL240315P00180000"   # long 180 put (higher strike)
+_V_SHORT = "AAPL240315P00170000"  # short 170 put (lower strike); width 10
+
+
+def _open_bear_put_spread(acct, qty):
+    from ba2_common.core.option_types import OptionLeg
+    long_leg = OptionLeg(contract_symbol=_V_LONG, side=OrderDirection.BUY, position_intent="buy_to_open",
+                         option_type=OptionRight.PUT, strike=180.0, expiry=date(2024, 3, 15), underlying="AAPL")
+    short_leg = OptionLeg(contract_symbol=_V_SHORT, side=OrderDirection.SELL, position_intent="sell_to_open",
+                          option_type=OptionRight.PUT, strike=170.0, expiry=date(2024, 3, 15), underlying="AAPL")
+    acct.submit_option_order(legs=[long_leg, short_leg], quantity=qty, order_type="market",
+                             option_strategy="bear_put_spread")
+    acct.refresh_orders()
+    acct.refresh_transactions()
+
+
+def test_bear_put_spread_between_strikes_unit_settled(tmp_path):
+    """spot 175 at expiry (between 170 and 180): long 180 put ITM 5/sh, short 170 put OTM.
+    Must unit-settle to net +5/sh with NO unhedged short stock; equity bounded and >= 0."""
+    bars = _bars(175)
+    chain = [_chain_put(_V_LONG, 180.0), _chain_put(_V_SHORT, 170.0)]
+    # Entry debit: buy 180p @5 - sell 170p @2 = 3/share -> $300/structure. 5 structures -> $1500.
+    bar_rows = [_bar_row(_V_LONG, 5.0, "put", 180.0), _bar_row(_V_SHORT, 2.0, "put", 170.0)]
+    acct, ps, eng, ctx = _account(tmp_path, chain, bar_rows, bars)
+    try:
+        _open_bear_put_spread(acct, 5)
+        assert acct._cash == pytest.approx(8500.0, abs=1.0)  # -1500 debit
+
+        ps.set_clock(datetime(2024, 3, 15))
+        eng._apply_option_expiry(datetime(2024, 3, 15))
+
+        # NO stock (the O_VERT bug was an unhedged short-stock leg from exercising the long put),
+        # combo fully resolved, bounded.
+        assert [p for p in acct.get_positions() if p["symbol"] == "AAPL"] == []
+        assert acct.get_option_positions() == []
+        assert acct._cash >= -1.0
+        # net payoff = +5/sh * 100 * 5 = +2500; equity = 8500 + 2500 = 11000 (within
+        # [entry-debit-loss, entry+max_width_profit]).
+        eq = acct.equity()
+        assert eq == pytest.approx(11_000.0, abs=5.0)
+        # persists next bar (no phantom stock marking)
+        ps.set_clock(datetime(2024, 3, 18))
+        assert acct.equity() == pytest.approx(11_000.0, abs=5.0)
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_bear_put_spread_worst_case_bounded(tmp_path):
+    """spot 250 at expiry (above both strikes): both puts OTM -> the spread expires worthless,
+    realizing exactly the debit loss (-$1500 on 5 structures). Never worse than -debit, no stock."""
+    bars = _bars(250)
+    chain = [_chain_put(_V_LONG, 180.0), _chain_put(_V_SHORT, 170.0)]
+    bar_rows = [_bar_row(_V_LONG, 5.0, "put", 180.0), _bar_row(_V_SHORT, 2.0, "put", 170.0)]
+    acct, ps, eng, ctx = _account(tmp_path, chain, bar_rows, bars)
+    try:
+        _open_bear_put_spread(acct, 5)
+        ps.set_clock(datetime(2024, 3, 15))
+        eng._apply_option_expiry(datetime(2024, 3, 15))
+        assert [p for p in acct.get_positions() if p["symbol"] == "AAPL"] == []
+        assert acct.get_option_positions() == []
+        eq = acct.equity()
+        # worst case = lose the debit only: 10000 - 1500 = 8500. Bounded, positive.
+        assert eq == pytest.approx(8500.0, abs=5.0)
+        assert eq >= CFG["starting_cash"] - 1500.0 - 1.0
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_bear_put_spread_closed_midlife_no_unhedged_stock(tmp_path):
+    """A vertical CLOSED mid-life (exit rule -> reversed multi-leg close order) must close BOTH
+    legs atomically the same bar, leaving NO unhedged stock and bounded cash."""
+    from ba2_common.core.option_types import OptionLeg
+    # bars: entry 03-06, mid-life close on 03-08, next bar 03-09 (premiums present on all).
+    bars = [
+        {"Date": datetime(2024, 3, 5), "Open": 180, "High": 181, "Low": 179, "Close": 180, "Volume": 100},
+        {"Date": datetime(2024, 3, 6), "Open": 180, "High": 181, "Low": 179, "Close": 180, "Volume": 100},
+        {"Date": datetime(2024, 3, 8), "Open": 175, "High": 176, "Low": 174, "Close": 175, "Volume": 100},
+        {"Date": datetime(2024, 3, 9), "Open": 175, "High": 176, "Low": 174, "Close": 175, "Volume": 100},
+    ]
+    chain = [_chain_put(_V_LONG, 180.0), _chain_put(_V_SHORT, 170.0)]
+    bar_rows = []
+    for d in ("2024-03-06", "2024-03-08", "2024-03-09"):
+        bar_rows.append({"occ_symbol": _V_LONG, "date": d, "open": 6.0, "high": 6.0, "low": 6.0, "close": 6.0,
+                         "volume": 100, "underlying": "AAPL", "option_type": "put", "strike": 180.0, "expiry": "2024-03-15"})
+        bar_rows.append({"occ_symbol": _V_SHORT, "date": d, "open": 2.5, "high": 2.5, "low": 2.5, "close": 2.5,
+                         "volume": 100, "underlying": "AAPL", "option_type": "put", "strike": 170.0, "expiry": "2024-03-15"})
+    acct, ps, eng, ctx = _account(tmp_path, chain, bar_rows, bars)
+    try:
+        _open_bear_put_spread(acct, 5)
+        # Locate the spread parent + build a reversed closing combo (mirrors CloseOptionAction._close_multi_leg).
+        from ba2_common.core.models import TradingOrder
+        from ba2_common.core.db import get_db
+        from sqlmodel import select, Session
+        with Session(get_db().bind) as sn:
+            parent = [o for o in sn.exec(select(TradingOrder)).all()
+                      if o.parent_order_id is None and o.option_strategy == "bear_put_spread"][0]
+            pq = int(parent.quantity)
+            txn_id = parent.transaction_id
+
+        ps.set_clock(datetime(2024, 3, 8))
+        close_legs = [
+            OptionLeg(contract_symbol=_V_LONG, side=OrderDirection.SELL, position_intent="sell_to_close",
+                      option_type=OptionRight.PUT, strike=180.0, expiry=date(2024, 3, 15), underlying="AAPL"),
+            OptionLeg(contract_symbol=_V_SHORT, side=OrderDirection.BUY, position_intent="buy_to_close",
+                      option_type=OptionRight.PUT, strike=170.0, expiry=date(2024, 3, 15), underlying="AAPL"),
+        ]
+        acct.submit_option_order(legs=close_legs, quantity=pq, order_type="limit", limit_price=-3.5,
+                                 option_strategy="close", transaction_id=txn_id)
+        acct.refresh_orders()
+        acct.refresh_transactions()
+
+        # BOTH legs closed the same bar -> no option lots, NO unhedged stock, equity bounded.
+        assert [l for l in acct._option_positions.values() if l.qty] == []
+        assert [p for p in acct.get_positions() if p["symbol"] == "AAPL"] == []
+        assert acct._cash >= -1.0
+        eq = acct.equity()
+        assert eq >= 0.0
+        assert eq == pytest.approx(10_000.0, abs=100.0)  # closed near flat (small round-trip)
+        ps.set_clock(datetime(2024, 3, 9))
+        acct.refresh_orders()
+        assert [p for p in acct.get_positions() if p["symbol"] == "AAPL"] == []
+    finally:
+        ctx.__exit__(None, None, None)
