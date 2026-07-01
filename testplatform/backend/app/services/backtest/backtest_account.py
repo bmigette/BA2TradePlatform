@@ -1349,6 +1349,12 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
 
         This is a deterministic AT-EXPIRY settlement (no next-bar fill, no slippage/commission):
         the option simply resolves on its expiry bar. Returns True if the position was settled.
+
+        MULTI-LEG (strangle/straddle/spread) note: the two/four legs of a spread SHARE one
+        ``Transaction`` whose ENTRY is the multi-leg PARENT (which carries NO ``contract_symbol``).
+        Each leg is settled INDEPENDENTLY here (its own lot -> its own share conversion + its own
+        closing fill for round-trip P&L); the shared transaction is closed ONLY once every leg has
+        resolved (``_all_legs_resolved``), so settling the first leg does not orphan the second.
         """
         from ba2_common.core.utils import close_transaction_with_logging
 
@@ -1356,34 +1362,128 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         if txn is None:
             return False
 
-        # 1. Close the option transaction at the resolved premium (0 = worthless, else intrinsic).
-        txn.close_price = float(close_premium)
-        if not txn.close_date:
-            txn.close_date = self._price.now()
-        close_transaction_with_logging(
-            txn,
-            account_id=self.id,
-            close_reason="option_expiry",
-            additional_data={"contract_symbol": position.contract_symbol},
-        )
-        update_instance(txn)
+        # 1. Record a synthetic CLOSING fill on THIS leg at the resolved premium (intrinsic, or 0
+        #    for worthless) so round-trip P&L can pair open<->close. This moves NO cash: the option
+        #    premium was already settled at entry and the exercise/assignment cash is the share leg
+        #    (step 3). Without this closing order the option round-trip is missing (single-leg) or
+        #    mis-paired (the reported entry~0 / pnl=-market*100*qty defect in Backtest id=299).
+        self._record_option_expiry_close(txn, position, float(close_premium))
 
-        # 2. Remove the option lot from the option ledger (its cash was settled at entry; the
+        # 2. Remove THIS leg's option lot from the option ledger (its cash was settled at entry; the
         #    conversion below moves the share-leg cash). Worthless simply zeroes it out.
         lot = self._option_positions.get(position.contract_symbol)
         if lot is not None:
             lot.qty = 0.0
             lot.avg_price = 0.0
 
-        # 3. Exercise/assignment -> create the resulting SHARE position settled at the strike.
+        # 3. Exercise/assignment -> create the resulting SHARE position settled at the STRIKE (NOT
+        #    the market — the option holder transacts stock at the strike). The share cost basis is
+        #    therefore the strike; the position then marks-to-market at the underlying close so an
+        #    ITM assignment loss is real and PERSISTS.
         if share_side is not None and shares and share_price is not None:
             signed = float(shares) if share_side == OrderDirection.BUY else -float(shares)
             self._cash -= signed * float(share_price)  # buy debits, sell credits — at strike.
             self._update_position(position.underlying, signed, float(share_price))
+
+        # 4. Close the SHARED transaction only once every option leg on it has resolved. For a
+        #    single-leg option this is immediate; for a multi-leg spread the transaction stays
+        #    OPENED until the last leg settles so each leg can still find it in step 1.
+        if self._all_legs_resolved(txn):
+            txn.close_price = float(close_premium)
+            if not txn.close_date:
+                txn.close_date = self._price.now()
+            close_transaction_with_logging(
+                txn,
+                account_id=self.id,
+                close_reason="option_expiry",
+                additional_data={"contract_symbol": position.contract_symbol},
+            )
+            update_instance(txn)
         return True
 
+    def _record_option_expiry_close(
+        self, txn: Transaction, position: OptionPosition, close_premium: float
+    ) -> None:
+        """Persist a synthetic FILLED closing order for an expiring option leg.
+
+        The closing side is the opposite of how the leg was opened (a SHORT leg is bought back,
+        a LONG leg is sold), the fill quantity is the leg's contract count, and ``open_price`` is
+        the per-share settlement premium (intrinsic, or 0 for worthless). This is a BOOK-KEEPING
+        order only: it records the round-trip close so ``get_round_trip_trades`` pairs the option's
+        open and close with the correct realised premium P&L. It moves NO cash (the premium was
+        settled at entry; the exercise/assignment share leg carries the intrinsic value).
+        """
+        close_side = (
+            OrderDirection.BUY if position.side == OrderDirection.SELL else OrderDirection.SELL
+        )
+        as_of = self._price.now()
+        # Link the closing order to the transaction's ENTRY (depends_on_order) so it is classified
+        # as a DEPENDENT leg — never as an entry. ``_entry_order_for_transaction`` returns the
+        # earliest order with ``depends_on_order IS NULL``; without this link the closing order
+        # (whose SIM created_at predates the real entry's WALL-clock created_at) would be mistaken
+        # for the entry and break the sibling leg's transaction lookup on a multi-leg spread.
+        entry = self._entry_order_for_transaction(txn)
+        order = TradingOrder(
+            account_id=self.id,
+            symbol=position.contract_symbol,
+            underlying_symbol=position.underlying,
+            quantity=abs(float(position.quantity)),
+            filled_qty=abs(float(position.quantity)),
+            side=close_side,
+            order_type=OrderType.MARKET,
+            status=OrderStatus.FILLED,
+            open_price=float(close_premium),
+            asset_class=AssetClass.OPTION,
+            multiplier=position.multiplier or 100,
+            contract_symbol=position.contract_symbol,
+            option_type=position.option_type,
+            strike=position.strike,
+            expiry=position.expiry,
+            transaction_id=txn.id,
+            depends_on_order=(entry.id if entry is not None else None),
+            open_type=OrderOpenType.AUTOMATIC,
+            broker_order_id=self._next_broker_id(),
+            comment="option_expiry_close",
+            created_at=as_of,
+        )
+        new_id = add_instance(order)
+        if new_id is not None:
+            self._fill_dates[new_id] = as_of
+        self.invalidate_order_cache()
+
+    def _all_legs_resolved(self, txn: Transaction) -> bool:
+        """True when every FILLED option leg on ``txn`` now has a matching closing fill.
+
+        A leg is "resolved" once its opening fill is offset by a closing fill on the SAME
+        contract (recorded by ``_record_option_expiry_close``). For a single-leg option this is
+        true as soon as the one leg settles; for a multi-leg spread it becomes true only after the
+        last leg has settled — which is when the shared transaction may be closed.
+        """
+        executed = OrderStatus.get_executed_statuses()
+        net: Dict[str, float] = {}
+        for o in self.get_orders():
+            if o.transaction_id != txn.id:
+                continue
+            if getattr(o, "asset_class", None) != AssetClass.OPTION:
+                continue
+            if not o.contract_symbol:  # skip the multi-leg PARENT (net-only, no contract)
+                continue
+            if o.status not in executed or not (o.filled_qty or o.quantity):
+                continue
+            qty = float(o.filled_qty or o.quantity)
+            signed = qty if o.side == OrderDirection.BUY else -qty
+            net[o.contract_symbol] = net.get(o.contract_symbol, 0.0) + signed
+        return all(abs(v) < 1e-9 for v in net.values())
+
     def _option_transaction_for_contract(self, contract_symbol: str) -> Optional[Transaction]:
-        """The OPENED option transaction whose entry order carries ``contract_symbol``."""
+        """The OPENED option transaction that TRADES ``contract_symbol``.
+
+        Matches the single-leg case (the transaction's ENTRY order IS the contract) AND the
+        multi-leg case (the entry is the PARENT with no ``contract_symbol``, and the contract is
+        carried by one of its FILLED child legs). Without the child-leg match a spread leg's
+        expiry settlement could not find its transaction, so the legs never settled (the strangle
+        assignment defect: option lots persisted, no share conversion, equity mis-marked).
+        """
         from sqlmodel import select, Session
 
         with Session(get_db().bind) as session:
@@ -1394,12 +1494,19 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             )
         for t in txns:
             entry = self._entry_order_for_transaction(t)
-            if (
-                entry is not None
-                and getattr(entry, "asset_class", None) == AssetClass.OPTION
-                and entry.contract_symbol == contract_symbol
-            ):
+            if entry is None or getattr(entry, "asset_class", None) != AssetClass.OPTION:
+                continue
+            # single-leg: the entry itself carries the contract.
+            if entry.contract_symbol == contract_symbol:
                 return t
+            # multi-leg: the entry is the parent (no contract) -> match a child leg's contract.
+            if not entry.contract_symbol:
+                for leg in self.get_orders():
+                    if (
+                        leg.parent_order_id == entry.id
+                        and leg.contract_symbol == contract_symbol
+                    ):
+                        return t
         return None
 
     # ======================================================================
