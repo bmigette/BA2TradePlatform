@@ -279,6 +279,49 @@ def momentum_12_1_series(close: "pd.Series", lookback: int = 252, skip: int = 21
     return mom.where(p_start > 0)  # NaN where insufficient history or non-positive start
 
 
+# ATR periods precomputed into the store — matches the atr_period optimizer gene's range
+# ({7,14,21,28} in the launcher), so every value the GA can request is available offline.
+ATR_PERIODS = (7, 14, 21, 28)
+
+
+def atr_series(high: "pd.Series", low: "pd.Series", close: "pd.Series",
+               period: int = 14) -> "pd.Series":
+    """Per-bar Average True Range (Wilder's smoothing), vectorised over full history.
+
+    True range at bar D = max(high-low, |high-prev_close|, |low-prev_close|) (the first bar has
+    no prev_close, so TR there is just high-low). ATR is Wilder's exponential smoothing of TR:
+    ``atr[0] = mean(TR[:period])``, ``atr[i] = (atr[i-1]*(period-1) + TR[i]) / period`` — the SAME
+    smoothing used by every conventional ATR (equivalent to ``ewm(alpha=1/period, adjust=False)``
+    seeded by the first simple average). NaN until ``period`` bars exist. Precomputing this lets
+    the backtest's risk-based (ATR) position sizing read ATR point-in-time from the store instead
+    of fetching live indicator data mid-run (which the GA/optimize trial-worker path has no
+    hermetic route to — see ``recompute_atr_columns``)."""
+    h, l, c = high.astype(float), low.astype(float), close.astype(float)
+    prev_close = c.shift(1)
+    tr = pd.concat([
+        h - l,
+        (h - prev_close).abs(),
+        (l - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    tr.iloc[0] = (h - l).iloc[0]  # no prev_close on the first bar
+    # Wilder smoothing == an EWM with alpha=1/period seeded by the first `period` bars' simple
+    # mean; pandas' ewm(adjust=False) recurrence matches this exactly once seeded, so compute the
+    # seed then run the recurrence via ewm on the POST-seed tail and stitch them together.
+    if len(tr) < period:
+        return pd.Series(float("nan"), index=tr.index)
+    seed = tr.iloc[:period].mean()
+    out = pd.Series(float("nan"), index=tr.index)
+    out.iloc[period - 1] = seed
+    tail = tr.iloc[period:]
+    if len(tail):
+        smoothed = tail.ewm(alpha=1.0 / period, adjust=False).mean()
+        # ewm(adjust=False) with NO explicit seed starts from tail.iloc[0]; blend the true seed in
+        # by prepending it as bar 0 of the recurrence, then dropping that synthetic first output.
+        seeded = pd.concat([pd.Series([seed]), tail]).ewm(alpha=1.0 / period, adjust=False).mean()
+        out.iloc[period:] = seeded.iloc[1:].to_numpy()
+    return out
+
+
 def compute_daily_metrics(ohlcv: "pd.DataFrame",
                           market_cap_series: Optional["pd.Series"] = None,
                           float_series: Optional["pd.Series"] = None,
@@ -336,6 +379,17 @@ def compute_daily_metrics(ohlcv: "pd.DataFrame",
     stage = weinstein_stage_series(close)
     # 12-1 momentum, precomputed so FactorRanker reads it point-in-time (no per-rebalance OHLCV fetch).
     momentum = momentum_12_1_series(close)
+    # ATR (all ATR_PERIODS), precomputed so risk-based (ATR) position sizing reads it point-in-time
+    # from the store — the GA/optimize trial-worker path has no hermetic route to live indicator
+    # data mid-run, so this is the ONLY way ATR-based sizing/stops function there (see
+    # position_sizing.synthesize_safeguard_stop + TradeRiskManagement._risk_atr_quantity). Needs
+    # High/Low (real OHLCV always has them); a Close-only caller (e.g. a minimal test fixture)
+    # gets NaN ATR columns rather than a crash.
+    if "High" in ohlcv.columns and "Low" in ohlcv.columns:
+        atr_cols = {f"atr_{p}": atr_series(ohlcv["High"], ohlcv["Low"], close, period=p).round(4)
+                   for p in ATR_PERIODS}
+    else:
+        atr_cols = {f"atr_{p}": pd.Series(float("nan"), index=close.index) for p in ATR_PERIODS}
     out = pd.DataFrame({
         "close": close,
         "market_cap": mcap,
@@ -344,6 +398,7 @@ def compute_daily_metrics(ohlcv: "pd.DataFrame",
         "price_drop_pct": drop_pct.round(4),
         "weinstein_stage": stage,
         "momentum_12_1": momentum.round(6),
+        **atr_cols,
         "float_shares": flt,
     })
     for _col, _ser in windowed.items():
@@ -679,6 +734,86 @@ def recompute_momentum_column(store_dir: str, ohlcv_get, *,
     return {"symbols": len(symbols), "recomputed": len(symbols) - len(skipped),
             "skipped": len(skipped), "skipped_symbols": skipped,
             "lookback": int(lookback), "skip": int(skip)}
+
+
+def recompute_atr_columns(store_dir: str, ohlcv_get, *,
+                          periods: "tuple" = ATR_PERIODS) -> Dict[str, Any]:
+    """CACHE-ONLY in-place add/rebuild of the ``atr_<period>`` columns of an existing store.
+
+    Mirrors ``recompute_momentum_column`` but for precomputed ATR (one column per period in
+    ``periods``, default ``ATR_PERIODS``): for each symbol already in the store, reads its DAILY
+    OHLCV via ``ohlcv_get(symbol)`` (a cache-only getter — e.g. a direct parquet read so a miss is
+    offline, never a network fetch), computes per-bar ATR (``atr_series``) for every period, samples
+    each AS-OF each existing store date (latest daily <= date via ffill), and writes them back —
+    consolidating each ``ym=`` month into a single ``part.parquet`` (stale flush files removed).
+    Every OTHER column is left untouched.
+
+    Used to ADD ATR to a store built before the columns existed, so risk-based (ATR) position
+    sizing/stops read ATR point-in-time from the store instead of needing a live indicator fetch
+    (the GA/optimize trial-worker path has no hermetic route to one — see
+    ``TradeRiskManagement._risk_atr_quantity``). Insufficient-history ATR stays NaN (byte-identical
+    to the build path ``compute_daily_metrics``). Symbols whose daily OHLCV lacks High/Low/Close (or
+    isn't cached — getter raises/empty) are SKIPPED with a warning (their ATR columns stay NaN)."""
+    import glob
+    parts = sorted(glob.glob(os.path.join(store_dir, "ym=*", "*.parquet")))
+    if not parts:
+        raise FileNotFoundError(f"empty screener metric store: {store_dir}")
+    store = pd.concat((pd.read_parquet(p) for p in parts), ignore_index=True)
+    store["date"] = store["date"].astype(str).str.slice(0, 10)
+    symbols = sorted(store["symbol"].unique())
+    cols = [f"atr_{p}" for p in periods]
+
+    updates: List["pd.DataFrame"] = []
+    skipped: List[str] = []
+    for sym in symbols:
+        sdates = sorted(store.loc[store["symbol"] == sym, "date"].unique())
+        try:
+            ohlcv = ohlcv_get(sym)
+        except Exception as e:  # noqa: BLE001 — cache miss / thin symbol must not abort the pass
+            skipped.append(sym)
+            logger.warning(f"recompute-atr: skipping {sym} ({type(e).__name__}: {e})")
+            continue
+        if (ohlcv is None or getattr(ohlcv, "empty", True)
+                or not {"High", "Low", "Close"}.issubset(ohlcv.columns)):
+            skipped.append(sym)
+            continue
+        idx = pd.to_datetime(ohlcv.index)
+        high = ohlcv["High"].astype(float); high.index = idx
+        low = ohlcv["Low"].astype(float); low.index = idx
+        close = ohlcv["Close"].astype(float); close.index = idx
+        order = idx.argsort()
+        high, low, close = high.iloc[order], low.iloc[order], close.iloc[order]
+        daily = pd.DataFrame({f"atr_{p}": atr_series(high, low, close, period=p).round(4)
+                              for p in periods}).sort_index()
+        target = pd.to_datetime(sdates)
+        asof = daily.reindex(target, method="ffill")           # value AS-OF each store date
+        u = pd.DataFrame({"symbol": sym, "date": [d.strftime("%Y-%m-%d") for d in target]})
+        for c in cols:
+            u[c] = asof[c].to_numpy()
+        updates.append(u)
+
+    store = store.set_index(["symbol", "date"])
+    for c in cols:                                              # ensure target columns exist
+        if c not in store.columns:
+            store[c] = float("nan")
+    if updates:
+        upd = pd.concat(updates, ignore_index=True).set_index(["symbol", "date"])
+        store.update(upd)                                       # overwrites only matching, non-NaN cells
+    store = store.reset_index()
+
+    # Consolidate each month to a single part.parquet, then drop the stale flush files so
+    # load_store (reads every *.parquet) doesn't double-count rows.
+    write_partitions(store_dir, store, part_name="part.parquet")
+    for m in sorted(store["date"].str.slice(0, 7).unique()):
+        d = os.path.join(store_dir, f"ym={m}")
+        for p in glob.glob(os.path.join(d, "*.parquet")):
+            if os.path.basename(p) != "part.parquet":
+                os.remove(p)
+    clear_store_memo()
+    logger.info(f"recompute-atr: {len(symbols) - len(skipped)}/{len(symbols)} symbols "
+                f"recomputed ({len(skipped)} skipped) in {store_dir}")
+    return {"symbols": len(symbols), "recomputed": len(symbols) - len(skipped),
+            "skipped": len(skipped), "skipped_symbols": skipped, "periods": list(periods)}
 
 
 # The UNPREFIXED keys ``screen_universe_for_day`` (below) actually reads. The UI / optimizer /

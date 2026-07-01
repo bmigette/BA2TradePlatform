@@ -91,6 +91,11 @@ class _CadencedHoldExpert(_HoldExpert):
         # Read by DailyBacktestEngine._entry_schedule via
         # get_setting_with_interface_default("execution_schedule_enter_market").
         self.settings["execution_schedule_enter_market"] = _THURSDAY_ONLY_SCHEDULE
+        # Management now runs on its OWN cadence (execution_schedule_open_positions), separate
+        # from entry — it defaults to daily (mirrors live), which would defeat this test's
+        # "most bars are no-event" premise. Pin it to the SAME Thursday-only cadence so the
+        # perf-guard still isolates "book-dirtying only on schedule days".
+        self.settings["execution_schedule_open_positions"] = _THURSDAY_ONLY_SCHEDULE
 
 
 def _build_perf_engine():

@@ -381,6 +381,9 @@ def _build_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         # Entry cadence (optimizer/CLI seam): {"days": {weekday: bool}, "times": [...]}.
         # None/absent -> analyse every bar (legacy). The engine's _entry_schedule honours it.
         "run_schedule_override": payload.get("run_schedule_override"),
+        # Open-positions MANAGEMENT cadence (separate from entry, mirrors live). The engine's
+        # _manage_schedule honours it; None/absent -> falls back to the entry schedule (legacy).
+        "manage_schedule_override": payload.get("manage_schedule_override"),
         # Optimizer/API condition trees: when a buy-entry tree is present the engine builds the
         # enter ruleset FROM it (_build_experts -> seed_ruleset_from_tree) so the condition
         # thresholds + on/off toggles gate entries; else it falls back to the bullish+flat

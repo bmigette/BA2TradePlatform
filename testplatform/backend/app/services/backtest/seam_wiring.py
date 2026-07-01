@@ -218,3 +218,64 @@ def make_indicator_provider(ohlcv_provider: Any = None) -> Any:
     if ohlcv_provider is None:
         ohlcv_provider = get_provider("ohlcv", "fmp")
     return get_provider("indicators", "pandas", ohlcv_provider=ohlcv_provider)
+
+
+class MetricStoreATRProvider:
+    """ATR-only indicator provider that reads PRECOMPUTED ``atr_<period>`` columns from the
+    screener metric store — fully offline (no network, no live OHLCV fetch), so it is hermetic
+    and safe for the GA/optimize trial-worker path, which has no route to a live/as-of-clamped
+    indicator provider (unlike the single-backtest handler's ``AsOfClampedOHLCVProvider`` path).
+
+    Only understands ``indicator="atr"`` with a ``period`` in the store's precomputed
+    ``metric_store.ATR_PERIODS``; anything else returns no values (the caller,
+    ``position_sizing.get_latest_atr``, then logs "no ATR value returned" and the safeguard falls
+    back to its risk%-only floor — the SAME safe behaviour as today, just narrower in scope).
+
+    ``end_date`` MUST be the backtest's SIMULATED as-of date (threaded from
+    ``TradeRiskManagement(as_of=...)`` -> ``get_latest_atr(end_date=...)``) — using wall-clock
+    would resolve to the store's MOST RECENT row regardless of the historical bar being sized, a
+    lookahead bug. The store is loaded via ``metric_store.load_store`` (memoised per worker), so
+    repeated construction is cheap.
+    """
+
+    def __init__(self, store_dir: str):
+        self._store_dir = store_dir
+
+    def get_indicator(self, symbol: str, indicator: str, start_date: Any = None,
+                      end_date: Any = None, lookback_days: Any = None, interval: str = "1d",
+                      format_type: str = "dict", period: Any = None) -> Dict[str, Any]:
+        from ba2_providers.screener import metric_store as ms
+
+        empty = {"values": [], "dates": [], "symbol": symbol.upper(), "indicator": indicator}
+        if indicator != "atr" or not period or int(period) not in ms.ATR_PERIODS:
+            return empty
+        if end_date is None:
+            return empty  # never fall back to wall-clock here — see class docstring
+        col = f"atr_{int(period)}"
+        try:
+            df = ms.load_store(self._store_dir)
+            day = end_date.strftime("%Y-%m-%d") if hasattr(end_date, "strftime") else str(end_date)[:10]
+            rows = ms.metrics_as_of(df, day, [col])
+        except Exception:  # noqa: BLE001 — any store issue -> safe empty (caller's no-ATR fallback)
+            return empty
+        row = rows.get(symbol.upper()) or rows.get(symbol)
+        if not row:
+            return empty
+        val = row.get(col)
+        try:
+            import math
+            if val is None or (isinstance(val, float) and math.isnan(val)):
+                return empty
+            return {"values": [float(val)], "dates": [day], "symbol": symbol.upper(),
+                   "indicator": indicator}
+        except (TypeError, ValueError):
+            return empty
+
+
+def make_atr_cache_indicator_provider(screener_store: Optional[str]) -> Optional[Any]:
+    """``MetricStoreATRProvider`` bound to ``screener_store``, or ``None`` when no store is
+    configured for this run (caller falls back to ``make_indicator_provider()``, the existing
+    — currently non-hermetic in the GA path — live provider)."""
+    if not screener_store:
+        return None
+    return MetricStoreATRProvider(screener_store)

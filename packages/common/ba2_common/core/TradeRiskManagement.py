@@ -96,7 +96,7 @@ class TradeRiskManagement:
     - Update orders with calculated quantities
     """
     
-    def __init__(self, indicator_provider=None):
+    def __init__(self, indicator_provider=None, as_of=None):
         """Initialize the risk management system.
 
         Args:
@@ -106,11 +106,17 @@ class TradeRiskManagement:
                 host (live platform / backtest) injects the provider here. When None,
                 the ATR fall-back path is skipped — risk sizing then requires an
                 explicit stop price on the order (Phase-6 wiring point).
+            as_of: the reference "now" for ATR fetches (``get_latest_atr``'s ``end_date``).
+                LIVE callers omit it (defaults to wall-clock ``datetime.now()`` inside
+                ``get_latest_atr``, correct for live). The BACKTEST must pass its SIMULATED
+                clock here — using wall-clock now() for a historical bar would leak future
+                (today's) ATR into that bar's sizing/stop (a lookahead bug).
         """
         # Use the parent logger directly instead of getChild to avoid double logging
         # The parent logger already has all necessary handlers configured
         self.logger = logger
         self.indicator_provider = indicator_provider
+        self.as_of = as_of
     
     def review_and_prioritize_pending_orders(self, expert_instance_id: int) -> List[TradingOrder]:
         """
@@ -737,7 +743,8 @@ class TradeRiskManagement:
         remaining balance (passed in), and respects any lot_size on the order.
         Returns 0 (order will be deleted as unfunded) when it can't be sized.
         """
-        from ba2_common.core.position_sizing import compute_risk_based_quantity, get_latest_atr
+        from ba2_common.core.position_sizing import (
+            compute_risk_based_quantity, get_latest_atr, synthesize_safeguard_stop)
 
         equity = expert.get_virtual_balance()
         risk_pct = float(expert.get_setting_with_interface_default('risk_per_trade_pct', log_warning=False) or 1.0)
@@ -751,7 +758,8 @@ class TradeRiskManagement:
         # ba2_providers). When no provider is injected, the ATR path is skipped and
         # compute_risk_based_quantity handles "no stop and no usable ATR" by returning 0.
         stop_price = order.stop_price
-        atr = None if stop_price else get_latest_atr(symbol, self.indicator_provider, period=atr_period)
+        atr = None if stop_price else get_latest_atr(
+            symbol, self.indicator_provider, period=atr_period, end_date=self.as_of)
 
         lot = (order.data or {}).get('lot_size') if order.data else None
         result = compute_risk_based_quantity(
@@ -760,14 +768,36 @@ class TradeRiskManagement:
             max_position_value=max_position_value, available_balance=available_balance,
             lot_size=int(lot) if lot else None,
         )
-        if result["quantity"] <= 0:
+        qty = int(result["quantity"])
+        if qty <= 0:
             self.logger.warning(f"  risk_atr sizing -> 0 for {symbol}: {result['reason']}")
-        else:
-            cap = f" (capped by {result['capped_by']})" if result["capped_by"] else ""
-            self.logger.info(
-                f"  risk_atr sizing -> {result['quantity']} shares for {symbol} "
-                f"(risk ${result['risk_dollars']:.2f}, risk/share ${result['risk_per_share']:.2f}){cap}")
-        return int(result["quantity"])
+            return qty
+        cap = f" (capped by {result['capped_by']})" if result["capped_by"] else ""
+        self.logger.info(
+            f"  risk_atr sizing -> {qty} shares for {symbol} "
+            f"(risk ${result['risk_dollars']:.2f}, risk/share ${result['risk_per_share']:.2f}){cap}")
+        # SAFEGUARD SL: when the order has NO explicit stop (order.stop_price is None — the
+        # strategy's exit conditions set none), place a hard protective stop at the TIGHTER of
+        # (ATR×atr_multiplier, risk_per_trade_pct%), floored at min_stop_loss_pct — so a rule-/
+        # trailing-exit strategy can never ride a loss unprotected. Written to order.stop_price
+        # (the SAME field TradingOrder already uses for an explicit stop, per the "prefer an
+        # explicit stop price on the order" comment above); the caller (live TradeManager /
+        # backtest daily_engine, both share this method) must pass it as submit_order(...,
+        # sl_price=order.stop_price) — the EXISTING bracket mechanism (used by the AI risk
+        # manager's open_buy_position, implemented in both AlpacaAccount and BacktestAccount) —
+        # for the WAITING_TRIGGER protective SL order to actually be created.
+        if not order.stop_price:
+            sl_atr = atr if atr is not None else get_latest_atr(
+                symbol, self.indicator_provider, period=atr_period, end_date=self.as_of)
+            sl = synthesize_safeguard_stop(
+                current_price, order.side == OrderDirection.BUY, risk_pct,
+                atr=sl_atr, atr_multiplier=atr_mult, min_stop_pct=min_stop_pct)
+            if sl:
+                order.stop_price = sl
+                self.logger.info(
+                    f"  safeguard SL for {symbol}: ${sl:.2f} "
+                    f"(min of ATR×{atr_mult:g} / {risk_pct:g}% risk, floor {min_stop_pct:g}%)")
+        return qty
 
     def _update_orders_in_database(self, orders: List[TradingOrder]) -> Tuple[int, int]:
         """

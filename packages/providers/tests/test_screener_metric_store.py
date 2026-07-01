@@ -382,3 +382,80 @@ def test_recompute_momentum_column_cache_only_inplace(tmp_path):
     assert aaa_row["market_cap"] == 5e9                       # untouched
     # BBB skipped -> momentum stays NaN (consumer maps NaN -> 0.0).
     assert pd.isna(out[out["symbol"] == "BBB"].iloc[0]["momentum_12_1"])
+
+
+def test_atr_series_constant_true_range_converges():
+    """A constant true range (flat high-low spread) makes Wilder's ATR converge to that value
+    after the seed period, and stays NaN before period-1 bars exist."""
+    idx = pd.date_range("2024-01-01", periods=30, freq="D")
+    high = pd.Series([102.0] * 30, index=idx)
+    low = pd.Series([100.0] * 30, index=idx)
+    close = pd.Series([101.0] * 30, index=idx)
+    a = ms.atr_series(high, low, close, period=14)
+    assert a.iloc[:13].isna().all()
+    assert a.iloc[13] == pytest.approx(2.0)   # seed = simple mean of the first 14 TRs
+    assert a.iloc[-1] == pytest.approx(2.0)   # converged (TR constant -> ATR constant)
+
+
+def test_atr_series_matches_naive_wilder_reference():
+    """Cross-check the vectorised atr_series against an independent, non-vectorised Wilder ATR
+    (the textbook recurrence) on a random series — must match to float precision."""
+    rng = np.random.default_rng(42)
+    n = 60
+    h = 100 + np.cumsum(rng.standard_normal(n)) + rng.random(n) * 3
+    l = h - rng.random(n) * 2 - 0.5
+    c = l + rng.random(n) * (h - l)
+
+    def _naive_wilder_atr(hh, ll, cc, period):
+        tr = [hh[0] - ll[0]] + [max(hh[i] - ll[i], abs(hh[i] - cc[i - 1]), abs(ll[i] - cc[i - 1]))
+                                for i in range(1, len(hh))]
+        out = [None] * len(tr)
+        out[period - 1] = sum(tr[:period]) / period
+        for i in range(period, len(tr)):
+            out[i] = (out[i - 1] * (period - 1) + tr[i]) / period
+        return out
+
+    mine = ms.atr_series(pd.Series(h), pd.Series(l), pd.Series(c), period=14)
+    ref = _naive_wilder_atr(h, l, c, 14)
+    for i in range(13, n):
+        assert mine.iloc[i] == pytest.approx(ref[i], abs=1e-9)
+
+
+def test_recompute_atr_columns_cache_only_inplace(tmp_path):
+    """recompute_atr_columns ADDS atr_<period> columns from a (cache-only) daily OHLCV getter, in
+    place: present + sampled as-of for a covered symbol, NaN for an uncached one, every other
+    column untouched."""
+    store = str(tmp_path / "mstore")
+    seed = pd.DataFrame({
+        "symbol": ["AAA", "BBB"], "date": ["2024-12-31", "2024-12-31"],
+        "close": [130.0, 50.0], "market_cap": [5e9, 1e9],
+        "relative_volume": [2.0, 1.0], "price_drop_pct": [0.1, 0.0],
+        "sector": ["Tech", "Energy"], "volume": [2e6, 1e6], "price": [130.0, 50.0]})
+    ms.write_partitions(store, seed)
+
+    aaa_idx = pd.date_range("2024-01-02", "2024-12-31", freq="B")
+    rng = np.random.default_rng(7)
+    aaa_high = pd.Series(100 + np.cumsum(rng.standard_normal(len(aaa_idx))) + 2, index=aaa_idx)
+    aaa_low = aaa_high - 2.0
+    aaa_close = aaa_low + 1.0
+    aaa = pd.DataFrame({"Open": aaa_close, "High": aaa_high, "Low": aaa_low,
+                        "Close": aaa_close, "Volume": [1e6] * len(aaa_idx)})
+
+    def _getter(sym):
+        return aaa if sym == "AAA" else None      # BBB has no cache -> skipped (ATR NaN)
+
+    res = ms.recompute_atr_columns(store, _getter, periods=(7, 14))
+    assert res["recomputed"] == 1 and res["skipped"] == 1 and res["skipped_symbols"] == ["BBB"]
+
+    ms.clear_store_memo()
+    out = ms.load_store(store)
+    assert "atr_7" in out.columns and "atr_14" in out.columns
+    aaa_row = out[out["symbol"] == "AAA"].iloc[0]
+    expected14 = (ms.atr_series(aaa_high, aaa_low, aaa_close, period=14)
+                 .round(4).reindex(pd.to_datetime(["2024-12-31"]), method="ffill").iloc[0])
+    assert aaa_row["atr_14"] == pytest.approx(expected14)
+    assert aaa_row["atr_14"] > 0.0
+    assert aaa_row["market_cap"] == 5e9                        # untouched
+    # BBB skipped -> ATR columns stay NaN (consumer treats missing ATR as "no ATR available").
+    bbb_row = out[out["symbol"] == "BBB"].iloc[0]
+    assert pd.isna(bbb_row["atr_7"]) and pd.isna(bbb_row["atr_14"])

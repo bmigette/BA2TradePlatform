@@ -1198,7 +1198,11 @@ class TradeManager:
                             if order.quantity and order.quantity > 0:
                                 try:
                                     self.logger.info(f"Auto-submitting order {order.id} for {order.symbol}: {order.quantity} shares")
-                                    submitted_order = account.submit_order(order)
+                                    # order.stop_price carries the RM's safeguard SL (min ATR×mult
+                                    # / risk%, floored at min_stop_loss_pct) when no exit condition
+                                    # set a stop of its own — pass it so submit_order creates the
+                                    # protective WAITING_TRIGGER SL leg (mirrors the backtest).
+                                    submitted_order = account.submit_order(order, sl_price=order.stop_price or None)
                                     if submitted_order:
                                         submitted_count += 1
                                         self.logger.info(f"Successfully submitted order {order.id} to broker")

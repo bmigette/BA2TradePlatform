@@ -175,7 +175,10 @@ class PandasIndicatorCalc(MarketIndicatorsInterface):
         end_date: Annotated[Optional[datetime], "End date for data (inclusive, mutually exclusive with lookback_days)"] = None,
         lookback_days: Annotated[Optional[int], "Days to look back from end_date (mutually exclusive with start_date/end_date)"] = None,
         interval: Annotated[str, "Data interval (1d, 1h, etc.)"] = "1d",
-        format_type: Literal["dict", "markdown", "both"] = "markdown"
+        format_type: Literal["dict", "markdown", "both"] = "markdown",
+        period: Annotated[Optional[int], "Indicator period (e.g. ATR window); accepted for "
+                          "signature compat with offline cache-backed providers, IGNORED here "
+                          "(stockstats-driven indicators use their own fixed defaults)."] = None,
     ) -> Dict[str, Any] | str:
         """
         Get technical indicator data for a symbol.

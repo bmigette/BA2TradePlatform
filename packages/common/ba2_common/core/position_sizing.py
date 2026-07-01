@@ -89,8 +89,16 @@ def compute_risk_based_quantity(
     if risk_per_share is None:
         if atr and atr > 0 and atr_multiplier > 0:
             risk_per_share = atr_multiplier * atr
+        elif min_stop_pct and min_stop_pct > 0:
+            # No explicit stop AND no usable ATR (e.g. ATR is unavailable in the hermetic backtest,
+            # where get_latest_atr can't serve as-of daily ATR): fall back to the MIN-STOP distance
+            # so risk-based sizing still works and the position gets a protective stop. Size so a
+            # hit at this stop == risk_per_trade_pct of equity. This is the risk%-only side of the
+            # safeguard's "min of two" (ATR just tightens it further when available).
+            risk_per_share = current_price * (min_stop_pct / 100.0)
+            out["stop_from_min_pct"] = True
         else:
-            out["reason"] = "no stop price and no usable ATR — cannot size by risk"
+            out["reason"] = "no stop price, no usable ATR, and no min_stop_pct — cannot size by risk"
             return out
 
     # Floor the stop distance so an unrealistically tight stop (or tiny ATR) can't
@@ -203,13 +211,60 @@ def derive_stop_for_quantity(
     return out
 
 
-def get_latest_atr(symbol: str, indicator_provider, period: int = 14, interval: str = "1d") -> Optional[float]:
+def synthesize_safeguard_stop(
+    current_price: float,
+    is_long: bool,
+    risk_per_trade_pct: float,
+    *,
+    atr: Optional[float] = None,
+    atr_multiplier: float = 2.0,
+    min_stop_pct: float = 7.0,
+) -> Optional[float]:
+    """Safeguard stop-loss PRICE to place when an order has NO explicit SL from its conditions.
+
+    The stop distance is the TIGHTER (``min``) of:
+      * the ATR-based distance  ``atr_multiplier * atr``   (volatility-adaptive), and
+      * the fixed risk distance ``risk_per_trade_pct% * current_price``,
+    then floored at ``min_stop_pct%`` of price so it can't sit inside the noise. Taking the min
+    keeps the loss cap never looser than ``risk_per_trade_pct`` while ATR tightens it for calm
+    names. Returns the SL price (rounded), or ``None`` when inputs are unusable / the stop would be
+    non-positive. Pure function — no IO; ``atr`` is passed in (fetch via ``get_latest_atr``).
+
+    Mirrors the SmartRiskManager's auto-SL so the classic RM — and the backtest, which shares the
+    same sizing path — never leaves a position without a hard stop when the strategy's exit
+    conditions set none (e.g. trailing rules that only fire once in profit)."""
+    if not current_price or current_price <= 0:
+        return None
+    if not risk_per_trade_pct or risk_per_trade_pct <= 0:
+        return None
+    risk_dist = current_price * (risk_per_trade_pct / 100.0)
+    candidates = [risk_dist]
+    if atr and atr > 0 and atr_multiplier and atr_multiplier > 0:
+        candidates.append(atr_multiplier * atr)
+    stop_dist = min(candidates)                                    # the tighter stop
+    if min_stop_pct and min_stop_pct > 0:
+        stop_dist = max(stop_dist, current_price * (min_stop_pct / 100.0))   # floor
+    if stop_dist <= 0:
+        return None
+    sl = current_price - stop_dist if is_long else current_price + stop_dist
+    return round(sl, 2) if sl > 0 else None
+
+
+def get_latest_atr(symbol: str, indicator_provider, period: int = 14, interval: str = "1d",
+                   end_date: Optional[datetime] = None) -> Optional[float]:
     """Fetch the latest ATR via an injected MarketIndicatorsInterface provider.
 
     indicator_provider: a ba2_common.core.interfaces.MarketIndicatorsInterface impl
         (the live host / backtest passes a ba2_providers PandasIndicatorCalc, or a
         pre-fetched cache adapter). Returns None on failure. ba2_common never imports
         ba2_providers, so the data source is injected rather than imported here.
+
+    end_date: the reference "now" the ATR is fetched as-of. LIVE callers omit it (defaults to
+        wall-clock ``datetime.now(timezone.utc)``, correct for live). The BACKTEST caller
+        (TradeRiskManagement, threaded from the engine's simulated clock) MUST pass the
+        SIMULATED as-of date here — using wall-clock now() for a historical bar would leak
+        today's ATR into that bar's sizing/stop (a lookahead bug), which is exactly what an
+        offline/cache-backed indicator_provider would otherwise return without this.
 
     Kept separate from the pure sizing math so the calculation stays testable and
     callers can supply a cached/pre-fetched ATR instead.
@@ -221,8 +276,8 @@ def get_latest_atr(symbol: str, indicator_provider, period: int = 14, interval: 
         # Pull a window comfortably longer than the ATR period for a stable value.
         lookback = max(period * 4, 60)
         result = indicator_provider.get_indicator(
-            symbol, "atr", end_date=datetime.now(timezone.utc),
-            lookback_days=lookback, interval=interval, format_type="dict",
+            symbol, "atr", end_date=end_date or datetime.now(timezone.utc),
+            lookback_days=lookback, interval=interval, format_type="dict", period=period,
         )
         # The indicator dict format exposes a flat float list under "values".
         values = (result or {}).get("values") or []

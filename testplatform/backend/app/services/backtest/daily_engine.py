@@ -58,7 +58,7 @@ from ba2_common.core.types import (
 )
 from ba2_common.logger import logger
 
-from app.services.backtest.seam_wiring import make_indicator_provider
+from app.services.backtest.seam_wiring import make_indicator_provider, make_atr_cache_indicator_provider
 
 
 # ---------------------------------------------------------------------------
@@ -427,9 +427,18 @@ class DailyBacktestEngine:
 
         # ATR injection seam: build once, reuse across bars/experts (also stashed on self so
         # _manage_open_positions can size any Sell orders the exit ruleset produces).
+        #
+        # PREFER the metric-store-backed ATR cache when this run carries a screener store: the
+        # GA/optimize trial-worker path has no hermetic route to a live/as-of-clamped indicator
+        # provider (unlike the single-backtest handler's AsOfClampedOHLCVProvider), so the plain
+        # make_indicator_provider() fallback below would either hit the network mid-run or
+        # silently return no ATR — the cache read is offline, hermetic, and as-of correct (see
+        # MetricStoreATRProvider). Falls back to the live provider when no store is configured
+        # (unchanged behaviour for static-universe runs).
         indicator_provider = self._indicator_provider
         if indicator_provider is None:
-            indicator_provider = make_indicator_provider()
+            store = (self._screener_runtime or {}).get("store") if self._screener_runtime else None
+            indicator_provider = make_atr_cache_indicator_provider(store) or make_indicator_provider()
         self._indicator_provider = indicator_provider
 
         days = trading_days(self.config["start_date"], self.config["end_date"], self.price)
@@ -554,32 +563,43 @@ class DailyBacktestEngine:
                 # scheduled entry bars (execution_schedule_enter_market). Between run
                 # bars the loop still advances — fills + open-position management below
                 # run every bar — but the expert no-ops (no new analysis/orders).
-                if not _schedule_allows_entry(
-                    as_of_dt, self._entry_schedule(expert), self.price.is_intraday, _date_ctx
-                ):
+                # SEPARATE cadences (mirrors live, which schedules enter_market and
+                # open_positions independently): ENTRY runs on the entry schedule (e.g. weekly),
+                # MANAGEMENT of open positions on its own schedule (e.g. DAILY). A bar runs the pass
+                # if EITHER gate allows; each sub-pass is then guarded by its own gate below.
+                entry_ok = _schedule_allows_entry(
+                    as_of_dt, self._entry_schedule(expert), self.price.is_intraday, _date_ctx)
+                manage_ok = _schedule_allows_entry(
+                    as_of_dt, self._manage_schedule(expert), self.price.is_intraday, _date_ctx)
+                if not (entry_ok or manage_ok):
                     continue
-                # Safety net: if the schedule pins weekdays but no `times`, the gate above is
-                # True for EVERY intraday bar of the day — run the (expensive) analyse+manage
-                # pass at most ONCE per (expert, calendar day) so 5min runs don't re-analyse 78x.
-                # (When `times` IS set, only one bar/day passes the gate, so this never triggers.)
+                # Safety net: if a schedule pins weekdays but no `times`, the gate is True for EVERY
+                # intraday bar of the day — run the (expensive) analyse+manage pass at most ONCE per
+                # (expert, calendar day) so 5min runs don't re-analyse 78x. (When `times` IS set,
+                # only one bar/day passes, so this never triggers.)
                 _day_key = (expert_id, as_of_dt.date())
                 if self.price.is_intraday and _day_key in analyzed_days:
                     continue
                 analyzed_days.add(_day_key)
                 book_dirty = True  # an analysis/management pass runs -> orders may be created
                 if getattr(expert, "bypasses_classic_rm", False):
-                    self._run_bypass_expert_bar(expert, expert_id, settings, as_of_dt)
+                    # Bypass experts (FactorRanker) rebalance the whole book on their ENTRY cadence;
+                    # the rebalance IS the management, so run it only on entry bars.
+                    if entry_ok:
+                        self._run_bypass_expert_bar(expert, expert_id, settings, as_of_dt)
                     continue
-                created_any = self._run_expert_bar(
-                    expert, expert_id, settings, ruleset_id, entry_universe, as_of_dt
-                )
-                if created_any:
-                    self._size_and_submit(expert_id, indicator_provider)
+                if entry_ok:
+                    created_any = self._run_expert_bar(
+                        expert, expert_id, settings, ruleset_id, entry_universe, as_of_dt
+                    )
+                    if created_any:
+                        self._size_and_submit(expert_id, indicator_provider, as_of_dt)
 
-                # Manage EXISTING positions through the OPEN_POSITIONS ruleset (real RM/evaluator,
-                # on the analysis cadence — identical to live). Adjust-TP/SL/Close/Sell per the
-                # exit conditions; no-op when the expert has no open_positions ruleset configured.
-                self._manage_open_positions(expert, expert_id, settings, as_of_dt)
+                # Manage EXISTING positions through the OPEN_POSITIONS ruleset (real RM/evaluator) on
+                # the MANAGE cadence — identical to live. Adjust-TP/SL/Close/Sell per the exit
+                # conditions; no-op when the expert has no open_positions ruleset configured.
+                if manage_ok:
+                    self._manage_open_positions(expert, expert_id, settings, as_of_dt)
 
             # The analysis/bypass passes above create orders via ba2_common's DB-backed RM/submit
             # path; reload the account's order cache so the fill engine sees them this bar.
@@ -669,6 +689,24 @@ class DailyBacktestEngine:
             return expert.get_setting_with_interface_default("execution_schedule_enter_market")
         except Exception:  # noqa: BLE001 — a stub/unschedulable expert -> run every bar
             return None
+
+    def _manage_schedule(self, expert: Any) -> Optional[Dict[str, Any]]:
+        """The open-positions MANAGEMENT cadence, separate from entry — mirrors live, which
+        schedules ``open_positions`` independently (typically far more often, e.g. DAILY).
+
+        A ``manage_schedule_override`` on the run config wins (the optimizer drives it daily); else
+        the expert's ``execution_schedule_open_positions``; else falls back to the ENTRY schedule
+        (legacy: manage on the same cadence as entry, preserving old single-backtest behaviour)."""
+        override = self.config.get("manage_schedule_override")
+        if override:
+            return override
+        try:
+            sched = expert.get_setting_with_interface_default("execution_schedule_open_positions")
+            if sched:
+                return sched
+        except Exception:  # noqa: BLE001
+            pass
+        return self._entry_schedule(expert)
 
     # -- per-expert, per-bar ------------------------------------------------
     def _run_expert_bar(
@@ -839,7 +877,7 @@ class DailyBacktestEngine:
                 continue
 
         if created_any:
-            self._size_and_submit(expert_id, self._indicator_provider)
+            self._size_and_submit(expert_id, self._indicator_provider, as_of)
 
     def _held_transactions(self, expert_id: int) -> Dict[str, List[Any]]:
         """{symbol: [OPENED Transaction, ...]} for this expert.
@@ -1028,7 +1066,8 @@ class DailyBacktestEngine:
                     f"option expiry failed for {pos.contract_symbol} @ {as_of_date}: {e}"
                 )
 
-    def _size_and_submit(self, expert_id: int, indicator_provider: Any) -> None:
+    def _size_and_submit(self, expert_id: int, indicator_provider: Any,
+                         as_of_dt: Optional[datetime] = None) -> None:
         """Classic RM sizes the PENDING orders, then submit each sized order to the sim.
 
         This is the live ``process_expert_recommendations_after_analysis`` tail (lines
@@ -1036,10 +1075,14 @@ class DailyBacktestEngine:
         order's quantity (via ``compute_risk_based_quantity`` / ``get_latest_atr`` using the
         injected indicator provider), then ``account.submit_order(order)`` sends the sized
         ones. ATR injection is the exact Phase-0 seam: ``TradeRiskManagement(indicator_provider=...)``.
+
+        ``as_of_dt`` is the SIMULATED bar clock, passed as ``TradeRiskManagement(as_of=...)`` so
+        any ATR fetch is as-of this bar (not wall-clock now()) — required for an offline/cache-
+        backed indicator_provider to resolve the correct historical ATR row, not today's.
         """
         from ba2_common.core.TradeRiskManagement import TradeRiskManagement
 
-        rm = TradeRiskManagement(indicator_provider=indicator_provider)
+        rm = TradeRiskManagement(indicator_provider=indicator_provider, as_of=as_of_dt)
         try:
             updated_orders = rm.review_and_prioritize_pending_orders(expert_id)
         except Exception as e:  # noqa: BLE001 — RM failure for one expert must not kill the run
@@ -1049,7 +1092,11 @@ class DailyBacktestEngine:
         for order in updated_orders:
             if order.quantity and order.quantity > 0:
                 try:
-                    self.account.submit_order(order)
+                    # order.stop_price carries the RM's safeguard SL (min ATR×mult / risk%, floored
+                    # at min_stop_loss_pct) when the strategy's conditions set no stop of their own
+                    # — pass it as sl_price so submit_order creates the protective WAITING_TRIGGER
+                    # SL leg (mirrors the live TradeManager call below).
+                    self.account.submit_order(order, sl_price=order.stop_price or None)
                 except Exception as e:  # noqa: BLE001
                     self._log(f"submit_order failed for order {order.id}: {e}")
 

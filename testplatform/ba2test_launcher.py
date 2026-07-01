@@ -687,6 +687,17 @@ def _cmd_report(args) -> int:
     return 0
 
 
+def _daily_manage_schedule() -> dict:
+    """Open-positions MANAGEMENT schedule for the backtest: EVERY weekday at the open bar.
+
+    Mirrors live, where ``open_positions`` is scheduled independently of (and far more often than)
+    ``enter_market``. Used as ``manage_schedule_override`` so the engine evaluates exit/trailing/
+    days_opened rules each trading day even when ENTRY is weekly. (Weekends are off — no session.)"""
+    wk = ("monday", "tuesday", "wednesday", "thursday", "friday")
+    days = {d: (d in wk) for d in (*wk, "saturday", "sunday")}
+    return {"days": days, "times": ["09:30"]}
+
+
 # Per-expert optimizable numeric decision settings (model:*) + the fixed (non-optimized)
 # settings each expert still needs. RM params + TP/SL ranges are set on the Strategy below.
 _EXPERT_OPT = {
@@ -708,21 +719,21 @@ _EXPERT_OPT = {
             "target_price_type": {"optimize": True, "type": "choice",
                                   "choices": ["low", "consensus", "median", "high", "low_consensus_avg"]},
         },
-        "fixed_settings": {},
+        "fixed_settings": {"sizing_mode": "risk_atr"},
     },
     "FMPEarningsDrift": {
         "expert_params": {
             "surprise_min_pct": {"optimize": True, "min": 2.0, "max": 15.0, "step": 1.0, "type": "float"},
             "max_days_since_report": {"optimize": True, "min": 5, "max": 45, "step": 5, "type": "int"},
         },
-        "fixed_settings": {},
+        "fixed_settings": {"sizing_mode": "risk_atr"},
     },
     "FMPInsiderClusterBuy": {
         "expert_params": {
             "lookback_days": {"optimize": True, "min": 30, "max": 120, "step": 15, "type": "int"},
             "min_insiders": {"optimize": True, "min": 2, "max": 6, "step": 1, "type": "int"},
         },
-        "fixed_settings": {},
+        "fixed_settings": {"sizing_mode": "risk_atr"},
     },
     # NOTE: FinnHubRating is intentionally NOT optimized — it is REDUNDANT with FMPRating (both
     # are analyst-consensus rating experts on the same large-cap universe).
@@ -739,7 +750,7 @@ _EXPERT_OPT = {
             "min_traders": {"optimize": True, "min": 1, "max": 4, "step": 1, "type": "int"},
             "min_trades": {"optimize": True, "min": 1, "max": 4, "step": 1, "type": "int"},
         },
-        "fixed_settings": {},
+        "fixed_settings": {"sizing_mode": "risk_atr"},
     },
     # FactorRanker is a BYPASS expert: it ignores enter/exit rulesets and the classic RM, and
     # rebalances a portfolio by factor score. So its optimization searches ONLY the factor-model
@@ -766,6 +777,7 @@ _EXPERT_OPT = {
 _RM_OPT = {
     "risk_per_trade_pct": {"optimize": True, "min": 0.5, "max": 5.0, "step": 0.5, "type": "float"},
     "atr_multiplier": {"optimize": True, "min": 1.5, "max": 4.0, "step": 0.5, "type": "float"},
+    "atr_period": {"optimize": True, "min": 7, "max": 28, "step": 7, "type": "int"},
     "min_stop_loss_pct": {"optimize": True, "min": 3.0, "max": 10.0, "step": 1.0, "type": "float"},
     "max_virtual_equity_per_instrument_percent": {"optimize": True, "min": 5.0, "max": 30.0, "step": 5.0, "type": "float"},
 }
@@ -882,8 +894,13 @@ def _build_strategy_row(name: str):
         # No global TP/SL brackets — exits are 100% condition-driven, matching the live engine
         # (which attaches no baseline bracket on entry). TP = the exit_takeprofit CLOSE rule; SL =
         # the exit_stoploss adjust_stop_loss rule above (both optimized + toggleable).
-        initial_tp_percent=200.0, initial_tp_optimize=False,
-        initial_sl_percent=200.0, initial_sl_optimize=False,
+        # NO global initial TP/SL bracket (the old 200% dummies are gone). SL is placed by the
+        # max-risk SAFEGUARD on entry (min ATR×mult / risk%, floored at min_stop_loss_pct — shared
+        # classic RM, so backtest == live); TP comes from the exit CONDITIONS (S4 anchors on the
+        # analyst target; S1's live ruleset trails). None keeps order.stop_loss None so the
+        # safeguard fires — exactly like live, no dummy bracket masking the conditions.
+        initial_tp_percent=None, initial_tp_optimize=False,
+        initial_sl_percent=None, initial_sl_optimize=False,
     )
 
 
@@ -944,8 +961,13 @@ def _build_strategy_S3(name: str):
         exit_conditions=exit_conditions,
         # No global TP/SL brackets — exits are 100% condition-driven (matches live). The protective
         # stop is the exit_stoploss adjust_stop_loss rule above; the trailing tiers ratchet it up.
-        initial_tp_percent=200.0, initial_tp_optimize=False,
-        initial_sl_percent=200.0, initial_sl_optimize=False,
+        # NO global initial TP/SL bracket (the old 200% dummies are gone). SL is placed by the
+        # max-risk SAFEGUARD on entry (min ATR×mult / risk%, floored at min_stop_loss_pct — shared
+        # classic RM, so backtest == live); TP comes from the exit CONDITIONS (S4 anchors on the
+        # analyst target; S1's live ruleset trails). None keeps order.stop_loss None so the
+        # safeguard fires — exactly like live, no dummy bracket masking the conditions.
+        initial_tp_percent=None, initial_tp_optimize=False,
+        initial_sl_percent=None, initial_sl_optimize=False,
     )
 
 
@@ -1082,8 +1104,13 @@ def _build_strategy_S1(name: str, expert: str):
         exit_conditions=exits,
         # No global TP/SL brackets — S1 runs the LIVE ruleset's conditions verbatim (its
         # adjust_stop_loss / adjust_take_profit / close rules), exactly like the live engine.
-        initial_tp_percent=200.0, initial_tp_optimize=False,
-        initial_sl_percent=200.0, initial_sl_optimize=False,
+        # NO global initial TP/SL bracket (the old 200% dummies are gone). SL is placed by the
+        # max-risk SAFEGUARD on entry (min ATR×mult / risk%, floored at min_stop_loss_pct — shared
+        # classic RM, so backtest == live); TP comes from the exit CONDITIONS (S4 anchors on the
+        # analyst target; S1's live ruleset trails). None keeps order.stop_loss None so the
+        # safeguard fires — exactly like live, no dummy bracket masking the conditions.
+        initial_tp_percent=None, initial_tp_optimize=False,
+        initial_sl_percent=None, initial_sl_optimize=False,
     )
 
 
@@ -1310,6 +1337,10 @@ def _cmd_optimize(args) -> int:
         # expert analyses ONCE/day (at market open) instead of every intraday bar. FMP bars are
         # stamped in market-local 09:30-15:55, so "09:30" is the first regular-session bar.
         run_sched = {"days": days, "times": ["09:30"]}
+    # Open-positions MANAGEMENT runs DAILY (mirrors live, which schedules open_positions far more
+    # often than enter_market): every weekday at the open bar, regardless of the (weekly) entry day.
+    # So trailing-SL / close / days_opened exit rules are evaluated each trading day, not weekly.
+    manage_sched = _daily_manage_schedule()
 
     init_db()
     db = SessionLocal()
@@ -1342,6 +1373,7 @@ def _cmd_optimize(args) -> int:
             "seed": int(args.seed),
             "subtype": "daily_expert",
             "run_schedule_override": run_sched,
+            "manage_schedule_override": manage_sched,
             "execution_interval": args.interval,
             "profit_cap_pct": (float(args.profit_cap_pct) if args.profit_cap_pct else None),
             "profit_share_cap_pct": (float(args.profit_share_cap_pct) if args.profit_share_cap_pct else None),
@@ -1594,6 +1626,7 @@ def _cmd_optimize_batch(args) -> int:
                 "seed": int(args.seed),
                 "subtype": "daily_expert",
                 "run_schedule_override": run_sched,
+                "manage_schedule_override": _daily_manage_schedule(),
                 "execution_interval": args.interval,
                 "profit_cap_pct": (float(args.profit_cap_pct) if args.profit_cap_pct else None),
                 "profit_share_cap_pct": (float(args.profit_share_cap_pct) if args.profit_share_cap_pct else None),
