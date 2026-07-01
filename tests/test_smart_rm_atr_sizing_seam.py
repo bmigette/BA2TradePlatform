@@ -32,6 +32,7 @@ class _StubExpert:
             "atr_period": 14,
             "min_stop_loss_pct": 0.0,
             "max_virtual_equity_per_instrument_percent": 10.0,
+            "use_atr_stop": True,  # interface default — ATR-based stop leg enabled
         }.get(key)
 
 

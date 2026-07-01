@@ -162,6 +162,15 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                                "the position. Also used to synthesize an SL when only an explicit quantity "
                                "is supplied. Default 7%%."
                 },
+                "use_atr_stop": {
+                    "type": "bool", "required": False, "default": True,
+                    "description": "Use ATR for the implied stop distance (risk_atr mode)",
+                    "tooltip": "Only used when sizing_mode=risk_atr. When on (default), the stop distance "
+                               "is the TIGHTER of atr_multiplier*ATR and risk_per_trade_pct%%, floored at "
+                               "min_stop_loss_pct%%. When off, ATR is ignored entirely and the stop is sized "
+                               "purely from risk_per_trade_pct%% (still floored at min_stop_loss_pct%%) — "
+                               "useful when ATR-implied stops are too tight and causing frequent whipsaw."
+                },
                 # AI Model Settings
                 "risk_manager_model": {
                     "type": "str", "required": True, "default": "NagaAC/gpt-5.1-2025-11-13",

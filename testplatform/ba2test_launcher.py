@@ -772,13 +772,23 @@ _EXPERT_OPT = {
 
 # Classic-RM sizing/stop params the RM reads off the expert. The optimizer now searches RM
 # through the model:* namespace (keyed by the REAL ba2 setting names), merged into each
-# expert's expert_params — there is no separate rm:* namespace. risk_per_trade_pct spans
-# 0.5%..5%. (max_concurrent_positions is omitted: the engine has no enforcement hook for it.)
+# expert's expert_params — there is no separate rm:* namespace. (max_concurrent_positions is
+# omitted: the engine has no enforcement hook for it.)
+#
+# Widened for the "aggressive" pass (2026-07-01): the -tpsl grid's real safeguard stop cut
+# both drawdown AND return vs the old (effectively-unprotected) baseline. risk_per_trade_pct
+# max raised 5%->10% (bigger dollar risk per trade), atr_multiplier floor raised 1.5->3.0
+# (a tight ATR multiple was the likely whipsaw driver — 50-71% of exits were stop_loss) with
+# its ceiling extended 4.0->6.0, and min_stop_loss_pct ceiling raised 10%->15% so the floor
+# itself can sit wider when ATR is disabled. use_atr_stop lets the GA drop the ATR leg of the
+# stop entirely and rely purely on risk_per_trade_pct% (still floored at min_stop_loss_pct%),
+# for symbols/regimes where ATR-implied stops are tighter than the risk% budget would allow.
 _RM_OPT = {
-    "risk_per_trade_pct": {"optimize": True, "min": 0.5, "max": 5.0, "step": 0.5, "type": "float"},
-    "atr_multiplier": {"optimize": True, "min": 1.5, "max": 4.0, "step": 0.5, "type": "float"},
+    "risk_per_trade_pct": {"optimize": True, "min": 0.5, "max": 10.0, "step": 0.5, "type": "float"},
+    "atr_multiplier": {"optimize": True, "min": 3.0, "max": 6.0, "step": 0.5, "type": "float"},
     "atr_period": {"optimize": True, "min": 7, "max": 28, "step": 7, "type": "int"},
-    "min_stop_loss_pct": {"optimize": True, "min": 3.0, "max": 10.0, "step": 1.0, "type": "float"},
+    "min_stop_loss_pct": {"optimize": True, "min": 3.0, "max": 15.0, "step": 1.0, "type": "float"},
+    "use_atr_stop": {"optimize": True, "min": 0, "max": 1, "step": 1, "type": "int"},
     "max_virtual_equity_per_instrument_percent": {"optimize": True, "min": 5.0, "max": 30.0, "step": 5.0, "type": "float"},
 }
 
