@@ -309,37 +309,91 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
 
         total = 0.0
         group_mtm: Dict[Any, float] = {}
+        # Track, per defined-risk group, whether any SHORT leg is CURRENTLY held. The clamp
+        # DIRECTION depends on the live composition, NOT the static strategy label: an iron condor
+        # is a credit combo ([-width, 0]) only while its short legs are held; once the shorts are
+        # closed/settled the surviving LONG legs are worth [0, +width] and their positive residual
+        # must NOT be clamped to 0 (the O_IC id=449 1-bar transient: leftover long value erased ->
+        # equity dipped negative for one bar).
+        group_has_short: Dict[Any, bool] = {}
         for lot in self._option_positions.values():
             if lot.qty == 0:
                 continue
+            gkey = contract_group.get(lot.contract_symbol)
+            gb = group_bounds.get(gkey) if gkey is not None else None
+            is_defined_risk = gb is not None and (
+                gb["strategy"] in self.DEFINED_RISK_LONG_STRATEGIES
+                or gb["strategy"] in self.DEFINED_RISK_SHORT_STRATEGIES
+            )
+
             bar = self._options.get_bar(lot.contract_symbol, self._as_of_date())
-            px = bar["close"] if (bar and bar.get("close") is not None) else lot.avg_price
+            if bar and bar.get("close") is not None:
+                px = bar["close"]
+            elif is_defined_risk:
+                # (2a) NO premium bar for a defined-risk leg on this bar -> mark at INTRINSIC (not
+                # the stale entry premium / 0) so an open combo whose sparse cache lacks a bar this
+                # tick is not understated (the offsetting leftover-long value is preserved).
+                px = self._leg_intrinsic(lot.contract_symbol, gb)
+                if px is None:
+                    px = lot.avg_price
+            else:
+                px = lot.avg_price
             if px is None:
                 continue
             contribution = lot.qty * px * lot.multiplier
 
-            gkey = contract_group.get(lot.contract_symbol)
-            gb = group_bounds.get(gkey) if gkey is not None else None
-            if gb and (
-                gb["strategy"] in self.DEFINED_RISK_LONG_STRATEGIES
-                or gb["strategy"] in self.DEFINED_RISK_SHORT_STRATEGIES
-            ):
+            if is_defined_risk:
                 group_mtm[gkey] = group_mtm.get(gkey, 0.0) + contribution
+                if lot.qty < 0:
+                    group_has_short[gkey] = True
             else:
                 total += contribution
 
-        # Clamp each defined-risk group's net contribution to its no-arb range.
+        # Clamp each defined-risk group's net contribution to its no-arb range. (2b) The bound is
+        # composition-aware: while a SHORT leg is held the combo carries credit downside so it is
+        # bounded [-width, 0]; once only LONG legs remain (shorts closed/settled) the residual is a
+        # net-long asset bounded [0, +width] — never floored below its true minimum, never erased.
         for gkey, mtm in group_mtm.items():
             gb = group_bounds[gkey]
             width = gb["width"]
-            _raw = mtm
             if width is not None:
-                if gb["strategy"] in self.DEFINED_RISK_LONG_STRATEGIES:
-                    mtm = min(max(mtm, 0.0), width)          # long combo: [0, width]
+                is_credit = gb["strategy"] in self.DEFINED_RISK_SHORT_STRATEGIES
+                # A DEBIT/long structure (butterfly, verticals) is a net-long asset worth
+                # [0, width] regardless of its internal short legs. A CREDIT structure (iron
+                # condor, credit/bear-call spread) is worth [-width, 0] ONLY WHILE its short legs
+                # are still held; once the shorts are closed/settled the surviving LONG legs are a
+                # net-long asset worth [0, width] — so their positive residual is preserved, not
+                # erased (the O_IC id=449 1-bar transient).
+                if is_credit and group_has_short.get(gkey, False):
+                    mtm = max(min(mtm, 0.0), -width)          # credit exposure live: [-width, 0]
                 else:
-                    mtm = max(min(mtm, 0.0), -width)          # short/credit combo: [-width, 0]
+                    mtm = min(max(mtm, 0.0), width)           # long / long-only remainder: [0, width]
             total += mtm
         return total
+
+    def _leg_intrinsic(self, contract_symbol: str, group_bound: Dict[str, Any]) -> Optional[float]:
+        """Per-share INTRINSIC value of an option leg at the current underlying close.
+
+        Used to mark a held DEFINED-RISK leg when the sparse cache has no premium bar this tick:
+        ``max(0, spot-strike)`` for a call, ``max(0, strike-spot)`` for a put. Resolves the leg's
+        strike / option_type / underlying from its order; returns None if unresolvable (caller
+        then falls back to the entry premium).
+        """
+        for o in self.get_orders():
+            if getattr(o, "contract_symbol", None) != contract_symbol:
+                continue
+            if o.strike is None or o.option_type is None:
+                return None
+            underlying = getattr(o, "underlying_symbol", None) or o.symbol
+            spot = self._price.close_at(underlying)
+            if spot is None:
+                spot = self._price.close_asof(underlying)
+            if spot is None:
+                return None
+            if o.option_type == OptionRight.CALL:
+                return max(0.0, float(spot) - float(o.strike))
+            return max(0.0, float(o.strike) - float(spot))
+        return None
 
     def _option_group_bounds(self):
         """Resolve, from the order set, the defined-risk structure bounds for held option lots.
