@@ -95,61 +95,94 @@ def _getter(responses):
     return _get
 
 
+@pytest.fixture
+def gate_clock(monkeypatch):
+    """Virtual clock for the GLOBAL rate-limit gate (fmp_common._GATE_UNTIL).
+
+    Backoff waits now go through the shared gate, which slices each wait into <=2.0s chunks
+    (+0-0.4s jitter/slice) and re-reads the remaining cooldown from the module clock — so a
+    fake ``sleep`` must ADVANCE that clock or the gate busy-loops on wall time. Yields
+    ``make_sleep(sleeps)``: a sleep that records into ``sleeps`` and advances the virtual
+    clock. Also resets the (module-global) gate so tests don't leak cooldowns into each other.
+    """
+    from ba2_providers import fmp_common as fc
+
+    t = {"now": 0.0}
+    monkeypatch.setattr(fc, "_now", lambda: t["now"])
+    monkeypatch.setattr(fc, "_GATE_UNTIL", 0.0)
+
+    def make_sleep(sleeps):
+        def _sleep(s):
+            sleeps.append(s)
+            t["now"] += s
+        return _sleep
+
+    return make_sleep
+
+
+def _total(sleeps):
+    return sum(sleeps)
+
+
 class TestFmpHttpGet:
-    def test_returns_response_on_200(self):
+    def test_returns_response_on_200(self, gate_clock):
         resp = _Resp(200)
         sleeps = []
-        out = fmp_http_get("u", getter=_getter([resp]), sleep=sleeps.append)
+        out = fmp_http_get("u", getter=_getter([resp]), sleep=gate_clock(sleeps))
         assert out is resp
         assert sleeps == []  # no retries on success
 
-    def test_retries_on_429_then_succeeds(self):
+    def test_retries_on_429_then_succeeds(self, gate_clock):
         ok = _Resp(200)
         sleeps = []
         out = fmp_http_get("u", delays=(5, 15, 30), getter=_getter([_Resp(429), ok]),
-                           sleep=sleeps.append)
+                           sleep=gate_clock(sleeps))
         assert out is ok
-        assert sleeps == [5]  # slept once before the successful retry
+        # One 5s cooldown armed on the 429, served in <=2s slices with 0-0.4s jitter each:
+        # total slept covers the delay without wildly overshooting (3 slices * <=0.4 jitter).
+        assert 5 <= _total(sleeps) <= 5 + 0.4 * len(sleeps)
 
-    def test_persistent_429_raises_fmperror_after_retries(self):
+    def test_persistent_429_raises_fmperror_after_retries(self, gate_clock):
         sleeps = []
         with pytest.raises(FMPError):
             fmp_http_get("u", symbol="MSFT", endpoint="price-target-consensus",
                          delays=(1, 2, 3),
                          getter=_getter([_Resp(429), _Resp(429), _Resp(429), _Resp(429)]),
-                         sleep=sleeps.append)
-        assert sleeps == [1, 2, 3]  # one sleep per delay
+                         sleep=gate_clock(sleeps))
+        # Cooldowns 1+2+3 armed sequentially through the gate.
+        assert 6 <= _total(sleeps) <= 6 + 0.4 * len(sleeps)
 
-    def test_retries_on_500(self):
+    def test_retries_on_500(self, gate_clock):
         ok = _Resp(200)
         out = fmp_http_get("u", delays=(1, 2), getter=_getter([_Resp(503), ok]),
-                           sleep=lambda s: None)
+                           sleep=gate_clock([]))
         assert out is ok
 
-    def test_non_retryable_status_raises_immediately(self):
+    def test_non_retryable_status_raises_immediately(self, gate_clock):
         sleeps = []
         with pytest.raises(requests.exceptions.HTTPError):
             fmp_http_get("u", delays=(1, 2), getter=_getter([_Resp(401)]),
-                         sleep=sleeps.append)
+                         sleep=gate_clock(sleeps))
         assert sleeps == []  # 401 is not retried
 
-    def test_respects_retry_after_header(self):
+    def test_respects_retry_after_header(self, gate_clock):
         ok = _Resp(200)
         sleeps = []
         out = fmp_http_get("u", delays=(2, 5),
                            getter=_getter([_Resp(429, {"Retry-After": "10"}), ok]),
-                           sleep=sleeps.append)
+                           sleep=gate_clock(sleeps))
         assert out is ok
-        assert sleeps == [10]  # max(delay=2, Retry-After=10)
+        # max(delay=2, Retry-After=10) armed on the gate.
+        assert 10 <= _total(sleeps) <= 10 + 0.4 * len(sleeps)
 
-    def test_retries_on_connection_error(self):
+    def test_retries_on_connection_error(self, gate_clock):
         ok = _Resp(200)
         sleeps = []
         out = fmp_http_get("u", delays=(1, 2),
                            getter=_getter([requests.exceptions.ConnectionError("down"), ok]),
-                           sleep=sleeps.append)
+                           sleep=gate_clock(sleeps))
         assert out is ok
-        assert sleeps == [1]
+        assert 1 <= _total(sleeps) <= 1 + 0.4 * len(sleeps)
 
 
 def test_list_passes_through():

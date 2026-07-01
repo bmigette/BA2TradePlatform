@@ -294,12 +294,17 @@ import threading as _threading
 _GATE_LOCK = _threading.Lock()
 _GATE_UNTIL = 0.0  # monotonic timestamp; no FMP request fires before this
 
+# Injectable clock (tests monkeypatch this together with their fake ``sleep`` so the gate's
+# remaining-time reads advance with the virtual sleeps; a wall-clock gate would busy-loop
+# against a fake sleep that doesn't consume real time). Production: time.monotonic.
+_now = time.monotonic
+
 
 def _gate_wait(sleep: Callable[[float], None]) -> None:
     import random as _random
     while True:
         with _GATE_LOCK:
-            remaining = _GATE_UNTIL - time.monotonic()
+            remaining = _GATE_UNTIL - _now()
         if remaining <= 0:
             return
         # cap each wait slice (so a later, shorter gate is re-read) + jitter to stagger resume
@@ -309,7 +314,7 @@ def _gate_wait(sleep: Callable[[float], None]) -> None:
 def _gate_arm(delay: float) -> None:
     global _GATE_UNTIL
     with _GATE_LOCK:
-        _GATE_UNTIL = max(_GATE_UNTIL, time.monotonic() + max(0.0, delay))
+        _GATE_UNTIL = max(_GATE_UNTIL, _now() + max(0.0, delay))
 
 
 def fmp_http_get(
