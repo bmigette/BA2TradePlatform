@@ -292,26 +292,22 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         DEFINED-RISK multi-leg groups (butterflies / vertical spreads / iron condors) are
         marked as a GROUP and their net contribution is CLAMPED to the structure's theoretical
         no-arbitrage range (``[0, width]`` for a debit combo, ``[-width, 0]`` for a credit combo,
-        ``width = (max_strike - min_strike) x 100 x contracts``). This stops a single outlier
+        ``width = widest_adjacent_strike_gap x 100 x structures``). This stops a single outlier
         premium print in the sparse cache from swinging recorded equity/drawdown outside what the
         structure can actually be worth. The clamp is a MARK-TO-MARKET display bound ONLY — it
         never moves cash, so realized P&L at expiry is unchanged.
         """
         if self._options is None:
             return 0.0
-        # Resolve each held lot's structure (group key + option_strategy + strike) once from the
-        # in-memory order cache (no per-bar DB churn; the same leg-grouping used elsewhere).
-        meta = self._option_lot_metadata()
-        import os as _os
-        if _os.environ.get("BT_MTM_DUMP"):
-            _live = [(l.contract_symbol, l.qty) for l in self._option_positions.values() if l.qty != 0]
-            if len(_live) >= 3:
-                logger.warning("[MTM_DUMP] lots=%s", _live)
-                logger.warning("[MTM_DUMP] meta=%s", meta)
-                _os.environ["BT_MTM_DUMP"] = ""  # once
-        # Accumulate ungrouped/undefined-risk lots directly; group defined-risk lots to clamp.
+        # Per-GROUP structure bounds (strategy, ALL opening-leg strikes, structure count) resolved
+        # once from the order set. The width MUST come from the ORIGINAL structure, not the
+        # currently-held lots: once a leg is assigned/settled (e.g. the butterfly body converts to
+        # short stock at expiry) the surviving lots alone give a wrong/loose width. Contract->group
+        # mapping ties each held lot to its structure.
+        contract_group, group_bounds = self._option_group_bounds()
+
         total = 0.0
-        groups: Dict[Any, Dict[str, Any]] = {}
+        group_mtm: Dict[Any, float] = {}
         for lot in self._option_positions.values():
             if lot.qty == 0:
                 continue
@@ -321,88 +317,106 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 continue
             contribution = lot.qty * px * lot.multiplier
 
-            m = meta.get(lot.contract_symbol)
-            strategy = m["strategy"] if m else None
-            import os as _os
-            if _os.environ.get("BT_MTM_DEBUG") and abs(contribution) > 20000:
-                logger.warning("[MTM_DEBUG] lot=%s qty=%s px=%.2f contrib=%.0f meta=%s",
-                               lot.contract_symbol, lot.qty, px, contribution, m)
-            if strategy in self.DEFINED_RISK_LONG_STRATEGIES or strategy in self.DEFINED_RISK_SHORT_STRATEGIES:
-                g = groups.setdefault(
-                    m["group_key"],
-                    {"strategy": strategy, "mtm": 0.0, "strikes": [], "contracts": 0.0,
-                     "multiplier": lot.multiplier},
-                )
-                g["mtm"] += contribution
-                if m["strike"] is not None:
-                    g["strikes"].append(float(m["strike"]))
-                g["contracts"] = max(g["contracts"], abs(lot.qty))
-                g["multiplier"] = lot.multiplier
+            gkey = contract_group.get(lot.contract_symbol)
+            gb = group_bounds.get(gkey) if gkey is not None else None
+            if gb and (
+                gb["strategy"] in self.DEFINED_RISK_LONG_STRATEGIES
+                or gb["strategy"] in self.DEFINED_RISK_SHORT_STRATEGIES
+            ):
+                group_mtm[gkey] = group_mtm.get(gkey, 0.0) + contribution
             else:
                 total += contribution
 
         # Clamp each defined-risk group's net contribution to its no-arb range.
-        for g in groups.values():
-            strikes = g["strikes"]
-            if len(strikes) >= 2 and g["contracts"] > 0:
-                # Widest ADJACENT strike gap = the structure's max spread width (a safe no-arb
-                # bound): for a vertical the single gap; for a butterfly/condor the widest wing.
-                # Using (max-min) would double-count a condor's two wings and over-loosen the
-                # clamp, so bound on the largest consecutive gap of the sorted strikes.
-                uniq = sorted(set(strikes))
-                widest_gap = max((b - a) for a, b in zip(uniq, uniq[1:])) if len(uniq) >= 2 else 0.0
-                width = widest_gap * g["multiplier"] * g["contracts"]
-            else:
-                width = None  # can't bound without >=2 strikes -> leave unclamped (rare)
-            mtm = g["mtm"]
+        for gkey, mtm in group_mtm.items():
+            gb = group_bounds[gkey]
+            width = gb["width"]
+            _raw = mtm
             if width is not None:
-                if g["strategy"] in self.DEFINED_RISK_LONG_STRATEGIES:
+                if gb["strategy"] in self.DEFINED_RISK_LONG_STRATEGIES:
                     mtm = min(max(mtm, 0.0), width)          # long combo: [0, width]
                 else:
                     mtm = max(min(mtm, 0.0), -width)          # short/credit combo: [-width, 0]
             total += mtm
         return total
 
-    def _option_lot_metadata(self) -> Dict[str, Dict[str, Any]]:
-        """Map ``contract_symbol -> {group_key, strategy, strike}`` for currently-held lots.
+    def _option_group_bounds(self):
+        """Resolve, from the order set, the defined-risk structure bounds for held option lots.
 
-        The group key ties the legs of one structure together so their MTM can be clamped as a
-        group: for a MULTI-LEG spread it is the parent order id; for a SINGLE-LEG option it is the
-        contract itself. ``strategy`` is the parent's (or single-leg's) ``option_strategy`` tag,
-        and ``strike`` is the leg's strike (used to bound the group's width). Built from the
-        in-memory order set (``get_orders``) so no per-bar DB query is added on the hot path
-        beyond the existing order cache.
+        Returns ``(contract_group, group_bounds)`` where:
+          * ``contract_group``: ``contract_symbol -> group_key`` for every held lot (group_key is
+            the parent order id for a multi-leg spread, else the contract itself for single-leg).
+          * ``group_bounds``: ``group_key -> {strategy, width}`` where ``width`` is the structure's
+            theoretical max value = ``widest_adjacent_strike_gap x 100 x structures`` (None when it
+            cannot be bounded, e.g. <2 distinct strikes). ``structures`` is the parent order's
+            ``quantity`` (number of structures), NOT a leg's contract count — a butterfly's body
+            leg carries 2x the structure count, so using a leg qty would over-loosen the clamp.
+
+        Width is derived from the FULL set of the structure's OPENING legs (all strikes), so it is
+        stable even after a leg has been assigned/settled and dropped out of the held lots.
         """
-        # parent order id -> option_strategy (from the multi-leg PARENT / single-leg order).
-        strat_by_parent: Dict[int, str] = {}
-        for o in self.get_orders():
-            if getattr(o, "asset_class", None) != AssetClass.OPTION:
-                continue
-            if o.parent_order_id is None and getattr(o, "option_strategy", None):
-                if o.id is not None:
-                    strat_by_parent[o.id] = o.option_strategy
-
-        meta: Dict[str, Dict[str, Any]] = {}
         held = self._option_positions
+        # parent order id -> (strategy, structure quantity, [opening strikes], multiplier)
+        parent_info: Dict[int, Dict[str, Any]] = {}
+        single_info: Dict[str, Dict[str, Any]] = {}
+        # collect opening legs' strikes per parent + parent strategy/qty
         for o in self.get_orders():
             if getattr(o, "asset_class", None) != AssetClass.OPTION:
                 continue
-            cs = getattr(o, "contract_symbol", None)
-            if not cs or cs not in held:
+            if o.parent_order_id is None:
+                # multi-leg PARENT (no contract) or a single-leg option order.
+                if o.id is not None and getattr(o, "option_strategy", None):
+                    if not getattr(o, "contract_symbol", None):
+                        parent_info.setdefault(
+                            o.id,
+                            {"strategy": o.option_strategy,
+                             "qty": abs(float(o.quantity or 0.0)) or 1.0,
+                             "strikes": [], "multiplier": float(o.multiplier or 100)},
+                        )
+                    else:  # single-leg option (its own group)
+                        single_info[o.contract_symbol] = {
+                            "strategy": o.option_strategy,
+                            "qty": abs(float(o.quantity or 0.0)) or 1.0,
+                            "strikes": [float(o.strike)] if o.strike is not None else [],
+                            "multiplier": float(o.multiplier or 100),
+                        }
+        # opening child legs contribute their strikes to the parent group
+        for o in self.get_orders():
+            if getattr(o, "asset_class", None) != AssetClass.OPTION:
                 continue
-            if o.parent_order_id is not None:
-                group_key = o.parent_order_id
-                strategy = strat_by_parent.get(o.parent_order_id) or getattr(o, "option_strategy", None)
+            if o.parent_order_id is not None and o.parent_order_id in parent_info and o.strike is not None:
+                parent_info[o.parent_order_id]["strikes"].append(float(o.strike))
+
+        def _width(info):
+            uniq = sorted(set(info["strikes"]))
+            if len(uniq) < 2 or info["qty"] <= 0:
+                return None
+            widest_gap = max((b - a) for a, b in zip(uniq, uniq[1:]))
+            return widest_gap * info["multiplier"] * info["qty"]
+
+        contract_group: Dict[str, Any] = {}
+        group_bounds: Dict[Any, Dict[str, Any]] = {}
+        for cs in held:
+            # find the order that owns this contract to route it to its group
+            owner = None
+            for o in self.get_orders():
+                if getattr(o, "contract_symbol", None) == cs and getattr(o, "asset_class", None) == AssetClass.OPTION:
+                    owner = o
+                    break
+            if owner is None:
+                continue
+            if owner.parent_order_id is not None and owner.parent_order_id in parent_info:
+                gkey = owner.parent_order_id
+                info = parent_info[gkey]
+            elif cs in single_info:
+                gkey = cs
+                info = single_info[cs]
             else:
-                group_key = cs
-                strategy = getattr(o, "option_strategy", None)
-            # First writer wins per contract (the opening leg carries the strike); don't let a
-            # synthetic closing order (which shares the contract) overwrite the strike.
-            if cs not in meta and o.strike is not None:
-                meta[cs] = {"group_key": group_key, "strategy": strategy, "strike": o.strike}
-            elif cs not in meta:
-                meta[cs] = {"group_key": group_key, "strategy": strategy, "strike": None}
-        return meta
+                continue
+            contract_group[cs] = gkey
+            if gkey not in group_bounds:
+                group_bounds[gkey] = {"strategy": info["strategy"], "width": _width(info)}
+        return contract_group, group_bounds
 
     def equity(self) -> float:
         """Net liquidating value = cash + mark-to-market of open positions."""
