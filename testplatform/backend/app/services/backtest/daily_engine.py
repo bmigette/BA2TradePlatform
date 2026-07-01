@@ -1044,10 +1044,47 @@ class DailyBacktestEngine:
         caught + logged so one bad expiry cannot abort the run (matching the per-bar style).
         """
         as_of_date = as_of.date() if isinstance(as_of, datetime) else as_of
-        for pos in self.account.get_option_positions():
+        positions = self.account.get_option_positions()
+
+        # DEFINED-RISK multi-leg combos (butterfly / verticals / iron condor) must settle as a
+        # UNIT — leg-by-leg share assignment does NOT preserve the combo's bounded payoff and
+        # blows equity past defined risk (the -473%/-171% O_BF blow-up). Group the EXPIRING legs
+        # by their transaction and settle each defined-risk combo once via the net-payoff path;
+        # everything else (single-leg + undefined-risk legs) keeps the per-leg share path below.
+        combo_groups: Dict[Any, list] = {}
+        per_leg: list = []
+        for pos in positions:
+            if pos.expiry is None or pos.expiry > as_of_date:
+                continue
+            strat = None
             try:
-                if pos.expiry is None or pos.expiry > as_of_date:
+                strat = self.account.defined_risk_combo_strategy(pos)
+            except Exception:  # noqa: BLE001 — classification failure -> fall back to per-leg
+                strat = None
+            if strat is not None:
+                txn = self.account._option_transaction_for_contract(pos.contract_symbol)
+                key = getattr(txn, "id", None)
+                if key is not None:
+                    combo_groups.setdefault(key, []).append(pos)
                     continue
+            per_leg.append(pos)
+
+        # Unit-settle each defined-risk combo once.
+        for legs in combo_groups.values():
+            try:
+                spot = self.price.close_at(legs[0].underlying)
+                if spot is None:
+                    self._log(
+                        f"option expiry: no underlying close for {legs[0].underlying} "
+                        f"(combo {legs[0].contract_symbol}) @ {as_of_date} — skipped"
+                    )
+                    continue
+                self.account.settle_defined_risk_combo_expiry(legs, float(spot))
+            except Exception as e:  # noqa: BLE001 — one bad expiry must not abort the run
+                self._log(f"combo option expiry failed @ {as_of_date}: {e}")
+
+        for pos in per_leg:
+            try:
                 spot = self.price.close_at(pos.underlying)
                 if spot is None:
                     self._log(

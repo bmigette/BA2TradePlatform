@@ -67,6 +67,7 @@ from ba2_common.core.types import (
     OrderOpenType,
     TransactionStatus,
     AssetClass,
+    OptionRight,
 )
 from ba2_common.core.option_types import OptionPosition
 from ba2_common.core.db import get_db, get_instance, add_instance, update_instance
@@ -1871,6 +1872,100 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 additional_data={"contract_symbol": position.contract_symbol},
             )
             update_instance(txn)
+        return True
+
+    def defined_risk_combo_strategy(self, position: OptionPosition) -> Optional[str]:
+        """Return the DEFINED-RISK ``option_strategy`` of the combo a leg belongs to, else None.
+
+        A position qualifies when its transaction's PARENT order is a multi-leg option whose
+        ``option_strategy`` is one of the defined-risk structures (debit or credit). Single-leg
+        options, equities, and UNDEFINED-risk structures (short strangle/straddle, jade_lizard,
+        put_ratio_spread) return None so they keep the per-leg share-assignment path.
+        """
+        txn = self._option_transaction_for_contract(position.contract_symbol)
+        if txn is None:
+            return None
+        entry = self._entry_order_for_transaction(txn)
+        if entry is None or getattr(entry, "contract_symbol", None):
+            return None  # single-leg (entry carries a contract) -> not a multi-leg combo
+        strat = getattr(entry, "option_strategy", None)
+        if strat in self.DEFINED_RISK_LONG_STRATEGIES or strat in self.DEFINED_RISK_SHORT_STRATEGIES:
+            return strat
+        return None
+
+    def settle_defined_risk_combo_expiry(self, positions: List[OptionPosition], spot: float) -> bool:
+        """UNIT settlement of a DEFINED-RISK multi-leg combo at expiry.
+
+        Settling a spread/butterfly/condor leg-by-leg into SHARES at each strike does NOT preserve
+        the combo's bounded payoff — the deep-ITM legs' gross cash flows (e.g. buy 100 sh @325 =
+        -$32.5k) dwarf the account before the offsetting legs net back, blowing equity past the
+        defined-risk bound. Instead we settle the WHOLE combo ONCE:
+
+          net_payoff = Σ legs ( sign * intrinsic_per_share * multiplier * contracts )
+          where sign = +1 for a LONG leg, -1 for a SHORT leg, and
+          intrinsic = max(0, spot-strike) for a call / max(0, strike-spot) for a put.
+
+        This net is mathematically bounded to the structure's defined risk. We apply it directly to
+        CASH (the entry premium is already in cash), record a synthetic closing fill per leg (so
+        round-trip P&L pairs), zero all leg lots, and create NO per-leg stock positions. A safety
+        clamp bounds the realized net to the theoretical [min,max] so data noise can't exceed
+        defined risk. ``positions`` are the combo's still-held legs; ``spot`` is the underlying
+        close at expiry. Returns True when settled.
+        """
+        from ba2_common.core.utils import close_transaction_with_logging
+
+        if not positions:
+            return False
+        txn = self._option_transaction_for_contract(positions[0].contract_symbol)
+        if txn is None:
+            return False
+
+        # Net intrinsic payoff across the legs (bounded to defined risk by construction).
+        net_payoff = 0.0
+        strikes: List[float] = []
+        contracts_per_structure = 0.0
+        for pos in positions:
+            is_call = pos.option_type == OptionRight.CALL
+            intrinsic = max(0.0, spot - float(pos.strike)) if is_call else max(0.0, float(pos.strike) - spot)
+            sign = 1.0 if pos.side == OrderDirection.BUY else -1.0
+            mult = float(pos.multiplier or 100)
+            net_payoff += sign * intrinsic * mult * float(pos.quantity)
+            strikes.append(float(pos.strike))
+            contracts_per_structure = max(contracts_per_structure, float(pos.quantity))
+
+        # Safety clamp: a defined-risk combo's expiry payoff magnitude can never exceed the widest
+        # adjacent strike gap x 100 x contracts (the structure's max spread value). Bound both
+        # directions so rounding / bad cache data cannot leak past defined risk.
+        uniq = sorted(set(strikes))
+        if len(uniq) >= 2 and contracts_per_structure > 0:
+            widest_gap = max((b - a) for a, b in zip(uniq, uniq[1:]))
+            bound = widest_gap * 100.0 * contracts_per_structure
+            net_payoff = max(-bound, min(net_payoff, bound))
+
+        # Apply the net payoff to cash and book each leg's synthetic close (moves no extra cash).
+        self._cash += net_payoff
+        for pos in positions:
+            is_call = pos.option_type == OptionRight.CALL
+            intrinsic = max(0.0, spot - float(pos.strike)) if is_call else max(0.0, float(pos.strike) - spot)
+            self._record_option_expiry_close(txn, pos, float(intrinsic))
+            lot = self._option_positions.get(pos.contract_symbol)
+            if lot is not None:
+                lot.qty = 0.0
+                lot.avg_price = 0.0
+
+        if self._all_legs_resolved(txn):
+            txn.close_price = 0.0
+            if not txn.close_date:
+                txn.close_date = self._price.now()
+            close_transaction_with_logging(
+                txn, account_id=self.id, close_reason="option_expiry_combo",
+                additional_data={"strategy": self.defined_risk_combo_strategy(positions[0])},
+            )
+            update_instance(txn)
+        logger.info(
+            "[backtest] defined-risk combo unit-settled at expiry: net payoff $%.2f (bounded).",
+            net_payoff,
+        )
         return True
 
     def _record_option_expiry_close(
