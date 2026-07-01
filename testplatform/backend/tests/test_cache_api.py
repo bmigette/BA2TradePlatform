@@ -11,15 +11,37 @@ from fastapi.testclient import TestClient
 
 @pytest.fixture
 def seeded_cache(tmp_path, monkeypatch):
-    """Point every cache root at a throwaway tree and seed a few files."""
-    monkeypatch.setenv("CACHE_FOLDER", str(tmp_path / "cache"))
-    from app.services import cache_manager
-    importlib.reload(cache_manager)  # re-read CACHE_FOLDER + rebuild CACHE_TYPES
+    """Point every cache root at a throwaway tree and seed a few files.
 
-    # seed ohlcv (provider subfolder + SYMBOL_interval file)
+    INCIDENT (see cache_manager._is_safe_delete_root's docstring): ``monkeypatch.setenv(
+    "CACHE_FOLDER", ...)`` + ``importlib.reload(cache_manager)`` alone ONLY re-binds
+    ``cache_manager``'s own module-level ``CACHE_FOLDER`` (used for the "datasets"/"models"
+    types). The "ohlcv"/"fmp_history"/"screener" types resolve via ``ba2_common.config.
+    CACHE_FOLDER`` — a module-level constant frozen at ``ba2_common.config``'s first import
+    (already imported by countless other test files by the time this fixture runs) — so the env
+    var alone never reaches it, and those types silently kept pointing at the REAL cache. This
+    wiped ~15,000 real files when the "clear" tests below ran. Fix: ALSO monkeypatch the
+    ``ba2_common.config.CACHE_FOLDER`` ATTRIBUTE directly (not just the env var) — this is the
+    contract ``ba2_providers.fmp_common._fmp_history_cache_dir`` already documents ("tests that
+    rebind CACHE_FOLDER win") and ``cache_manager``'s per-call ``from ba2_common.config import
+    CACHE_FOLDER`` re-imports already honour once the attribute is actually rebound. A hard
+    safety guard (_is_safe_delete_root) now ALSO refuses any real-path delete under pytest
+    regardless of this fixture's correctness, as defense in depth.
+    """
+    monkeypatch.setenv("CACHE_FOLDER", str(tmp_path / "cache"))
+    import ba2_common.config as _ba2_cfg
+    monkeypatch.setattr(_ba2_cfg, "CACHE_FOLDER", str(tmp_path / "cache"))
+
+    # Seed ohlcv (provider subfolder + SYMBOL_interval file) BEFORE the reload below:
+    # cache_manager._ohlcv_roots() takes a ONE-TIME snapshot (base.iterdir(), matched into the
+    # module-level _OHLCV_ROOTS constant) at RELOAD time — a provider dir created AFTER the
+    # reload is never picked up, silently leaving "ohlcv" empty (not wrong-pathed, just blind).
     ohlcv = tmp_path / "cache" / "FMPOHLCVProvider"
     ohlcv.mkdir(parents=True)
     (ohlcv / "AAPL_1d.csv").write_text("Date,Open\n2020-01-01,1\n")
+
+    from app.services import cache_manager
+    importlib.reload(cache_manager)  # re-read CACHE_FOLDER + rebuild CACHE_TYPES (scans the seed above)
 
     # seed datasets (destructive type) — override its root onto the temp tree
     cache_manager.CACHE_TYPES["datasets"]["roots"] = [tmp_path / "datasets"]
@@ -32,6 +54,17 @@ def seeded_cache(tmp_path, monkeypatch):
     cache_manager.CACHE_TYPES["models"]["roots"] = [tmp_path / "trained_models"]
     (tmp_path / "trained_models" / "job123").mkdir(parents=True)
     (tmp_path / "trained_models" / "job123" / "model.pt").write_text("weights")
+
+    # "jobs"/"news"/"exports" all resolve via app.paths.* constants — frozen at app.paths' own
+    # first import, the SAME isolation gap as CACHE_FOLDER/ba2_common.config. Override every one
+    # onto the temp tree, else clean_all would try to clear the REAL test-platform caches (now
+    # refused outright by the hard safety guard in cache_manager._is_safe_delete_root rather than
+    # silently deleted, but each still needs a proper isolated root for clean_all to exercise
+    # correctly end-to-end).
+    for _type, _dirname in (("jobs", "jobs"), ("news", "news"), ("exports", "exports")):
+        d = tmp_path / _dirname
+        d.mkdir()
+        cache_manager.CACHE_TYPES[_type]["roots"] = [d]
 
     return cache_manager
 

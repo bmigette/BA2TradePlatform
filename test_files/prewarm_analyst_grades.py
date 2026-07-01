@@ -36,23 +36,34 @@ def main() -> int:
     print(f"prewarm-analyst-grades: warming {len(symbols)} symbols (workers={args.workers})...",
           flush=True)
 
+    # frozen_ttl_cache()/persist_empty_sentinel() are THREAD-LOCAL (ba2_providers.fmp_common
+    # uses threading.local() so concurrent backtests don't stomp each other's freeze state) —
+    # entering them on the MAIN thread has NO EFFECT on a ThreadPoolExecutor's worker threads,
+    # which are separate OS/Python threads that never see the main thread's flags. Each worker
+    # must enter its OWN context, else fmp_history_disk_cached silently thinks it's in the
+    # normal (live, non-persisting) mode and never writes to disk — the fetch still SUCCEEDS
+    # (so ok/err counts look fine), it just writes nothing (discovered when a bulk run reported
+    # ok=4977 err=0 yet zero analyst_grades__*.json files existed afterward).
+    def _fetch_one(sym: str):
+        with frozen_ttl_cache(), persist_empty_sentinel():
+            return fetch_analyst_grades_cached(key, sym)
+
     ok = err = 0
     t0 = time.time()
-    with frozen_ttl_cache(), persist_empty_sentinel():
-        with ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
-            futs = {ex.submit(fetch_analyst_grades_cached, key, s): s for s in symbols}
-            for i, fut in enumerate(as_completed(futs), 1):
-                sym = futs[fut]
-                try:
-                    fut.result()
-                    ok += 1
-                except Exception as e:  # noqa: BLE001 — one bad symbol must not abort the warm
-                    err += 1
-                    if err <= 20:
-                        print(f"  ERR {sym}: {type(e).__name__}: {e}", flush=True)
-                if i % 500 == 0:
-                    print(f"  {i}/{len(symbols)}  ok={ok} err={err}  ({time.time()-t0:.0f}s)",
-                          flush=True)
+    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
+        futs = {ex.submit(_fetch_one, s): s for s in symbols}
+        for i, fut in enumerate(as_completed(futs), 1):
+            sym = futs[fut]
+            try:
+                fut.result()
+                ok += 1
+            except Exception as e:  # noqa: BLE001 — one bad symbol must not abort the warm
+                err += 1
+                if err <= 20:
+                    print(f"  ERR {sym}: {type(e).__name__}: {e}", flush=True)
+            if i % 500 == 0:
+                print(f"  {i}/{len(symbols)}  ok={ok} err={err}  ({time.time()-t0:.0f}s)",
+                      flush=True)
     print(f"prewarm-analyst-grades: done ok={ok} err={err} in {time.time()-t0:.0f}s")
     return 0
 

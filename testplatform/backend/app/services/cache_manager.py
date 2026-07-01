@@ -349,6 +349,36 @@ def _is_tmp(f: Path) -> bool:
     return f.suffix == ".tmp" or f.name.endswith(".tmp")
 
 
+def _is_safe_delete_root(root: Path) -> bool:
+    """Defense-in-depth guard for EVERY destructive path in this module (the single choke point
+    is ``_delete_tree`` below).
+
+    INCIDENT: a test-fixture isolation gap let ``test_cache_api.py``'s "clear" tests run against
+    the REAL production cache instead of an isolated ``tmp_path`` — ``ba2_common.config.
+    CACHE_FOLDER`` is a module-level constant frozen at first import, so ``monkeypatch.setenv(
+    "CACHE_FOLDER", ...)`` + ``importlib.reload(cache_manager)`` alone never actually rebinds it
+    (only ``monkeypatch.setattr(ba2_common.config, "CACHE_FOLDER", ...)`` does — see
+    ``ba2_providers.fmp_common._fmp_history_cache_dir``'s "tests that rebind CACHE_FOLDER win"
+    comment, which documents the INTENDED contract the fixture didn't follow). Running the test
+    suite wiped ~15,000 real FMP/OHLCV/screener cache files with no backup for most of it.
+
+    This guard makes that class of bug UNABLE to touch real data again, regardless of whatever
+    isolation gap a CURRENT or FUTURE fixture has: when running under pytest (``PYTEST_CURRENT_
+    TEST`` is set — a standard pytest env var during test execution), any delete root that is NOT
+    inside the OS temp directory is refused. Production/CLI usage (no pytest) is unaffected.
+    """
+    if "PYTEST_CURRENT_TEST" not in os.environ:
+        return True  # not under pytest -> normal production/CLI operation, unrestricted
+    if os.environ.get("BA2_ALLOW_REAL_CACHE_DELETE") == "1":
+        return True  # explicit, deliberate opt-in for a test that intentionally needs the real path
+    import tempfile
+    try:
+        tmp_root = str(Path(tempfile.gettempdir()).resolve())
+        return str(root.resolve()).startswith(tmp_root)
+    except OSError:
+        return False  # can't resolve -> fail closed (refuse), never fail open on a delete guard
+
+
 def _safe_unlink(f: Path) -> int:
     """Delete one file, skipping .tmp atomic-write staging files. Returns bytes freed."""
     if _is_tmp(f):
@@ -379,6 +409,12 @@ def _delete_tree(
     Empty directories left behind by deletions are pruned (best-effort).
     """
     root = Path(root)
+    if not _is_safe_delete_root(root):
+        raise RuntimeError(
+            f"cache_manager: refusing to delete under pytest outside the OS temp dir: {root} "
+            f"(test isolation is likely broken — see _is_safe_delete_root; set "
+            f"BA2_ALLOW_REAL_CACHE_DELETE=1 only if this test deliberately needs the real path)"
+        )
     freed = 0
     removed = 0
     if not root.exists():
