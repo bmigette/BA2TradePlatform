@@ -137,10 +137,15 @@ class TestSubmitOrderGate:
 
 
 class _PromotingAccount(MockAccount):
-    """MockAccount whose submit_order records calls and persists FILLED."""
+    """MockAccount whose submit_order records calls and persists FILLED.
+
+    Signature matches the AccountInterface template (tp_price/sl_price/is_closing_order):
+    the washtrade unlock path now re-threads the safeguard SL via ``sl_price=`` (a locked
+    entry never had its protective leg created — the original submit early-returned at the
+    lock), so the stub must accept the interface kwargs like a real account."""
     submitted = []
 
-    def submit_order(self, order, is_closing_order=False):
+    def submit_order(self, order, tp_price=None, sl_price=None, is_closing_order=False):
         _PromotingAccount.submitted.append(order.id)
         order.status = OrderStatus.FILLED
         update_instance(order)

@@ -1070,6 +1070,31 @@ class AdjustStopLossAction(_AdjustPriceLevelAction):
         self.stop_loss_price = self.target_price  # backward-compat alias
 
     def _call_broker(self, transaction) -> bool:
+        # RATCHET-ONLY: a ruleset-driven stop-loss may only TIGHTEN, never loosen. Without this,
+        # an always-true SL rule (e.g. condition `has_position`) re-fires every management run and
+        # (a) REPLACES the risk manager's safeguard stop with a looser one — the position was
+        # SIZED off the safeguard distance, so the realized loss at stop exceeds risk_per_trade_pct
+        # — and (b) UN-TRAILS profit-lock tiers: when price falls back under a tier threshold the
+        # tier rule stops firing but the base SL rule still does, dropping the stop back below the
+        # locked level. Long: never move the stop DOWN once set; short: never UP. Scope is the
+        # ruleset path only — manual UI edits and the SmartRM call account.adjust_sl directly with
+        # their own source and stay free to loosen deliberately.
+        existing = getattr(transaction, "stop_loss", None)
+        if existing and existing > 0 and self.target_price:
+            side = getattr(transaction, "side", None) or (
+                self.existing_order.side if self.existing_order else None)
+            side_str = str(side.value if hasattr(side, "value") else side or "").upper()
+            is_long = side_str == "BUY"
+            loosens = (self.target_price < existing) if is_long else (self.target_price > existing)
+            if loosens:
+                logger.info(
+                    f"SL ratchet: keeping existing stop ${existing:.2f} for transaction "
+                    f"{transaction.id} — ruleset asked for ${self.target_price:.2f}, which would "
+                    f"LOOSEN the {'long' if is_long else 'short'} stop"
+                )
+                self.target_price = existing  # result/data reflect the kept (tighter) stop
+                self.stop_loss_price = existing
+                return True  # no-op success: the tighter stop stands
         return self.account.adjust_sl(transaction, self.target_price, source="ruleset")
 
     def _post_broker_hook(self, transaction) -> None:

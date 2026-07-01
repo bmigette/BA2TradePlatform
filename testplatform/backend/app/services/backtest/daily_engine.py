@@ -453,11 +453,15 @@ class DailyBacktestEngine:
         # Once-per-scheduled-DAY dedup for the expensive analyse+manage pass. On an intraday
         # clock with a weekday schedule but no explicit `times`, _schedule_allows_entry is True
         # for EVERY bar of an enabled day, which re-ran the expert analysis + open-position
-        # management ~78x/day (profiled: ~90k date-parses, the dominant 5min cost). We run that
-        # block once per (expert, calendar day); the OCO TP/SL fills still run EVERY bar via
+        # management ~78x/day (profiled: ~90k date-parses, the dominant 5min cost). We run each
+        # SUB-PASS once per (expert, calendar day); the OCO TP/SL fills still run EVERY bar via
         # refresh_orders below, so trade closes stay 5min-precise. Matches live (RM manages on
-        # the analysis cadence, fills are continuous).
-        analyzed_days: set = set()
+        # the analysis cadence, fills are continuous). SEPARATE sets per sub-pass: with one
+        # shared set, whichever gate fired first in the day claimed the (expert, day) key and
+        # STARVED the other pass whenever the entry and manage schedules pin different times
+        # (benign while both pin 09:30, but a one-line trap for any future schedule change).
+        analyzed_entry_days: set = set()
+        analyzed_manage_days: set = set()
 
         # ----- skip-flat-bars -------------------------------------------------------------------
         # When NOTHING is open and NO order is working, no fill is possible until the next ANALYSIS
@@ -574,13 +578,22 @@ class DailyBacktestEngine:
                 if not (entry_ok or manage_ok):
                     continue
                 # Safety net: if a schedule pins weekdays but no `times`, the gate is True for EVERY
-                # intraday bar of the day — run the (expensive) analyse+manage pass at most ONCE per
+                # intraday bar of the day — run each (expensive) sub-pass at most ONCE per
                 # (expert, calendar day) so 5min runs don't re-analyse 78x. (When `times` IS set,
-                # only one bar/day passes, so this never triggers.)
+                # only one bar/day passes, so this never triggers.) Dedup PER SUB-PASS: a manage
+                # bar earlier in the day must not consume the entry pass's slot (or vice versa).
                 _day_key = (expert_id, as_of_dt.date())
-                if self.price.is_intraday and _day_key in analyzed_days:
-                    continue
-                analyzed_days.add(_day_key)
+                if self.price.is_intraday:
+                    if entry_ok and _day_key in analyzed_entry_days:
+                        entry_ok = False
+                    if manage_ok and _day_key in analyzed_manage_days:
+                        manage_ok = False
+                    if not (entry_ok or manage_ok):
+                        continue
+                if entry_ok:
+                    analyzed_entry_days.add(_day_key)
+                if manage_ok:
+                    analyzed_manage_days.add(_day_key)
                 book_dirty = True  # an analysis/management pass runs -> orders may be created
                 if getattr(expert, "bypasses_classic_rm", False):
                     # Bypass experts (FactorRanker) rebalance the whole book on their ENTRY cadence;

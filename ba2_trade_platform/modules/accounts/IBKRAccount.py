@@ -26,10 +26,19 @@ from sqlmodel import Session, select
 class IBKRAccount(AccountInterface):
     """
     Interactive Brokers account implementation using ib_async.
-    
-    Provides true order modification capabilities and flexible TP/SL management
-    that can be updated on accepted and filled orders without canceling.
-    
+
+    *** TRADING DISABLED — BROKEN (audit 2026-07-01, reports/audit_2026-07-01_live_vs_test.md A1) ***
+    ``submit_order`` below OVERRIDES the AccountInterface template method with a
+    ``(self, order)`` signature instead of implementing ``_submit_order_impl(...)``:
+    every TradeManager call passing the interface kwargs (``sl_price=`` on auto-submit,
+    ``is_closing_order=`` on washtrade re-submit) raises TypeError, and even a plain call
+    bypasses ALL base-class logic — order validation, transaction creation, the wash-trade
+    lock, and TP/SL protective-bracket creation (``adjust_tp_sl``). ``adjust_tp/sl/tp_sl``
+    are also not implemented. Until the class is reworked onto ``_submit_order_impl`` +
+    the adjust methods, it is READ-ONLY: ``supports_trading = False`` makes TradeManager
+    refuse to route orders here, and ``submit_order`` raises immediately rather than
+    half-submitting.
+
     Configuration settings required:
     - host: TWS/Gateway host (default: '127.0.0.1')
     - port: TWS port (paper: 7497, live: 7496) or Gateway port (paper: 4002, live: 4001)
@@ -37,7 +46,10 @@ class IBKRAccount(AccountInterface):
     - account: Account number (optional for single account)
     - paper_account: Boolean flag for paper trading
     """
-    
+
+    # Trading disabled — see class docstring (submit path broken; read-only data access OK).
+    supports_trading = False
+
     def __init__(self, id: int):
         """
         Initialize IBKRAccount with connection to TWS/IB Gateway.
@@ -287,16 +299,29 @@ class IBKRAccount(AccountInterface):
             logger.error(f"Error getting IBKR positions: {e}", exc_info=True)
             return []
     
-    def submit_order(self, order: TradingOrder) -> TradingOrder:
+    def submit_order(self, order: TradingOrder, tp_price: Optional[float] = None,
+                     sl_price: Optional[float] = None, is_closing_order: bool = False) -> TradingOrder:
         """
         Submit an order to IBKR.
-        
+
+        *** DISABLED — BROKEN (see class docstring / audit A1). *** This method wrongly
+        overrides the AccountInterface TEMPLATE (skipping validation / transactions /
+        washtrade lock / TP-SL bracket creation) and previously TypeError'd on the
+        interface kwargs. It now accepts them for signature compatibility but refuses to
+        run until the class is reworked onto ``_submit_order_impl``.
+
         Args:
             order: TradingOrder object to submit
-            
+
         Returns:
             Updated TradingOrder with broker_order_id
         """
+        raise NotImplementedError(
+            "IBKRAccount trading is disabled: submit_order bypasses the AccountInterface "
+            "template (no validation/transaction/washtrade/TP-SL bracket handling) — see "
+            "reports/audit_2026-07-01_live_vs_test.md finding A1. Rework onto "
+            "_submit_order_impl before re-enabling (supports_trading is False)."
+        )
         try:
             self._ensure_connected()
             

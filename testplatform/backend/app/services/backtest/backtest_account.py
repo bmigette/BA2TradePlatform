@@ -593,6 +593,17 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             )
         return px
 
+    def _is_washtrade_lock_candidate(self, trading_order) -> bool:
+        """Wash-trade friction is a LIVE-broker rejection risk, deliberately NOT modeled here.
+
+        The inherited check would mark an order WASHTRADE_LOCKED when an opposing order is
+        working — but the sim has no TradeManager unlock loop, and the fill engine's
+        active-status working set includes WASHTRADE_LOCKED anyway, so a "locked" order used
+        to just fill regardless (a confusing half-state: live delays/holds, backtest fills).
+        Disabling the check makes the divergence explicit and the order state consistent:
+        the backtest behaves as live-after-unlock (the order executes)."""
+        return False
+
     def submit_order(self, trading_order, tp_price=None, sl_price=None, is_closing_order=False):
         """Submit an order through the inherited path, then drop the in-memory order cache.
 

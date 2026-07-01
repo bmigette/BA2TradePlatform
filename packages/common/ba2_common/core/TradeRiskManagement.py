@@ -751,20 +751,42 @@ class TradeRiskManagement:
         atr_mult = float(expert.get_setting_with_interface_default('atr_multiplier', log_warning=False) or 2.0)
         atr_period = int(expert.get_setting_with_interface_default('atr_period', log_warning=False) or 14)
         min_stop_pct = float(expert.get_setting_with_interface_default('min_stop_loss_pct', log_warning=False) or 0.0)
+        # use_atr_stop off -> ignore ATR entirely and size purely off risk_per_trade_pct%
+        # (still floored at min_stop_loss_pct%). Lets the GA/user drop ATR when its implied
+        # stops are too tight and causing frequent whipsaw (see synthesize_safeguard_stop).
+        use_atr_stop = bool(expert.get_setting_with_interface_default('use_atr_stop', log_warning=False))
 
-        # Prefer an explicit stop price on the order (limit/stop columns or
-        # tpsl_reference data); otherwise fall back to ATR for the stop distance.
-        # The ATR fetch needs an injected indicator provider (ba2_common never imports
-        # ba2_providers). When no provider is injected, the ATR path is skipped and
-        # compute_risk_based_quantity handles "no stop and no usable ATR" by returning 0.
-        stop_price = order.stop_price
-        atr = None if stop_price else get_latest_atr(
-            symbol, self.indicator_provider, period=atr_period, end_date=self.as_of)
+        # SAFEGUARD SL FIRST, then size off it — ONE stop distance for both. When the order has
+        # NO explicit stop (the strategy's exit conditions set none), synthesize the hard
+        # protective stop (TIGHTER of ATR×atr_multiplier / risk_per_trade_pct%, floored at
+        # min_stop_loss_pct; ATR leg skipped when use_atr_stop is off) and write it to
+        # order.stop_price BEFORE sizing, so compute_risk_based_quantity keys the share count off
+        # the ACTUAL stop that will protect the position. Previously sizing and safeguard computed
+        # their distances independently (sizing: ATR-or-min_stop fallback; safeguard: min-of-two
+        # floored) — when they disagreed (e.g. use_atr_stop=0 with risk% > min_stop%) the realized
+        # loss at the stop exceeded risk_per_trade_pct by up to risk%/min_stop%. The caller (live
+        # TradeManager / backtest daily_engine, both share this method) must pass it as
+        # submit_order(..., sl_price=order.stop_price) — the EXISTING bracket mechanism — for the
+        # WAITING_TRIGGER protective SL leg to actually be created.
+        if not order.stop_price:
+            sl_atr = None
+            if use_atr_stop:
+                sl_atr = get_latest_atr(
+                    symbol, self.indicator_provider, period=atr_period, end_date=self.as_of)
+            sl = synthesize_safeguard_stop(
+                current_price, order.side == OrderDirection.BUY, risk_pct,
+                atr=sl_atr, atr_multiplier=atr_mult, min_stop_pct=min_stop_pct)
+            if sl:
+                order.stop_price = sl
+                self.logger.info(
+                    f"  safeguard SL for {symbol}: ${sl:.2f} "
+                    f"(min of ATR×{atr_mult:g} / {risk_pct:g}% risk, floor {min_stop_pct:g}%)")
 
         lot = (order.data or {}).get('lot_size') if order.data else None
         result = compute_risk_based_quantity(
             equity=equity, current_price=current_price, risk_per_trade_pct=risk_pct,
-            stop_price=stop_price, atr=atr, atr_multiplier=atr_mult, min_stop_pct=min_stop_pct,
+            stop_price=order.stop_price, atr=None, atr_multiplier=atr_mult,
+            min_stop_pct=min_stop_pct,
             max_position_value=max_position_value, available_balance=available_balance,
             lot_size=int(lot) if lot else None,
         )
@@ -776,27 +798,6 @@ class TradeRiskManagement:
         self.logger.info(
             f"  risk_atr sizing -> {qty} shares for {symbol} "
             f"(risk ${result['risk_dollars']:.2f}, risk/share ${result['risk_per_share']:.2f}){cap}")
-        # SAFEGUARD SL: when the order has NO explicit stop (order.stop_price is None — the
-        # strategy's exit conditions set none), place a hard protective stop at the TIGHTER of
-        # (ATR×atr_multiplier, risk_per_trade_pct%), floored at min_stop_loss_pct — so a rule-/
-        # trailing-exit strategy can never ride a loss unprotected. Written to order.stop_price
-        # (the SAME field TradingOrder already uses for an explicit stop, per the "prefer an
-        # explicit stop price on the order" comment above); the caller (live TradeManager /
-        # backtest daily_engine, both share this method) must pass it as submit_order(...,
-        # sl_price=order.stop_price) — the EXISTING bracket mechanism (used by the AI risk
-        # manager's open_buy_position, implemented in both AlpacaAccount and BacktestAccount) —
-        # for the WAITING_TRIGGER protective SL order to actually be created.
-        if not order.stop_price:
-            sl_atr = atr if atr is not None else get_latest_atr(
-                symbol, self.indicator_provider, period=atr_period, end_date=self.as_of)
-            sl = synthesize_safeguard_stop(
-                current_price, order.side == OrderDirection.BUY, risk_pct,
-                atr=sl_atr, atr_multiplier=atr_mult, min_stop_pct=min_stop_pct)
-            if sl:
-                order.stop_price = sl
-                self.logger.info(
-                    f"  safeguard SL for {symbol}: ${sl:.2f} "
-                    f"(min of ATR×{atr_mult:g} / {risk_pct:g}% risk, floor {min_stop_pct:g}%)")
         return qty
 
     def _update_orders_in_database(self, orders: List[TradingOrder]) -> Tuple[int, int]:

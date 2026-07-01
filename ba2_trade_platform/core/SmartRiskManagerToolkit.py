@@ -1888,6 +1888,9 @@ class SmartRiskManagerToolkit:
             min_stop_pct = float(self.expert.get_setting_with_interface_default("min_stop_loss_pct", log_warning=False) or 0.0)
             max_pos_pct = float(self.expert.get_setting_with_interface_default("max_virtual_equity_per_instrument_percent", log_warning=False) or 10.0)
             max_position_value = (equity or 0) * (max_pos_pct / 100.0)
+            # use_atr_stop off -> ignore ATR entirely, size purely off risk_per_trade_pct%
+            # (still floored at min_stop_loss_pct%). Mirrors the classic RM's toggle.
+            use_atr_stop = bool(self.expert.get_setting_with_interface_default("use_atr_stop", log_warning=False))
 
             # get_latest_atr now lives in ba2_common.core.position_sizing (Phase 6
             # shim) and requires an injected MarketIndicatorsInterface provider
@@ -1896,28 +1899,42 @@ class SmartRiskManagerToolkit:
             # _risk_atr_quantity. Best-effort: a provider-build failure degrades to
             # None, which get_latest_atr already handles by returning None.
             indicator_provider = None
-            if not sl_price:
+            if not sl_price and use_atr_stop:
                 try:
                     from .seam_helpers import get_default_indicator_provider
                     indicator_provider = get_default_indicator_provider()
                 except Exception as e:
                     logger.warning(f"could not build indicator provider for ATR sizing of {symbol}: {e}")
-            atr = None if sl_price else get_latest_atr(symbol, indicator_provider, period=atr_period)
+            atr = None if (sl_price or not use_atr_stop) else get_latest_atr(symbol, indicator_provider, period=atr_period)
             try:
                 available = self.expert.get_available_balance()
             except Exception:
                 available = None
 
+            # SAFEGUARD SL FIRST, then size off it — ONE stop distance for both (mirrors the
+            # classic RM's _risk_atr_quantity). When the agent gave no SL, synthesize the hard
+            # protective stop (TIGHTER of ATR×mult / risk%, floored at min_stop_loss_pct) and
+            # size against THAT price, so the realized loss at the stop equals risk_per_trade_pct
+            # instead of drifting when the sizing fallback distance and the safeguard disagreed.
+            effective_sl = sl_price
+            if not effective_sl:
+                from .position_sizing import synthesize_safeguard_stop
+                effective_sl = synthesize_safeguard_stop(
+                    current_price, order_direction == OrderDirection.BUY, risk_pct,
+                    atr=atr, atr_multiplier=atr_mult, min_stop_pct=min_stop_pct)
+
             result = compute_risk_based_quantity(
                 equity=equity, current_price=current_price, risk_per_trade_pct=risk_pct,
-                stop_price=sl_price, atr=atr, atr_multiplier=atr_mult, min_stop_pct=min_stop_pct,
+                stop_price=effective_sl, atr=atr, atr_multiplier=atr_mult, min_stop_pct=min_stop_pct,
                 max_position_value=max_position_value, available_balance=available,
             )
             result["detail"] = (f"risk ${result['risk_dollars']:.0f}, risk/share ${result['risk_per_share']:.2f}"
                                  if result["risk_per_share"] else result["reason"])
-            # Implied protective stop so an auto-sized position is never left unprotected:
-            # entry ∓ risk_per_share (the same distance used to size it).
-            if result.get("risk_per_share"):
+            # Implied protective stop so an auto-sized position is never left unprotected: the
+            # synthesized safeguard when one was computed, else entry ∓ risk_per_share.
+            if not sl_price and effective_sl:
+                result["implied_sl"] = effective_sl
+            elif result.get("risk_per_share"):
                 rps = result["risk_per_share"]
                 result["implied_sl"] = round(
                     current_price - rps if order_direction == OrderDirection.BUY else current_price + rps, 2)

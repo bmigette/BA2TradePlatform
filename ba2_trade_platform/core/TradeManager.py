@@ -304,7 +304,18 @@ class TradeManager:
                 )
                 order.status = OrderStatus.PENDING
                 update_instance(order)
-                account.submit_order(order, is_closing_order=is_closing)
+                # Re-thread the safeguard SL: the ORIGINAL submit early-returned at the washtrade
+                # lock BEFORE the TP/SL bracket block ran, so no protective leg exists yet. For a
+                # MARKET entry, order.stop_price carries the risk manager's safeguard SL (see
+                # _risk_atr_quantity) — pass it as sl_price so the WAITING_TRIGGER protective leg
+                # is created now, exactly like the first submit would have. Restricted to MARKET
+                # non-closing primaries: on stop/stop-limit types stop_price is the entry TRIGGER,
+                # not a protective stop, and closing orders need no bracket.
+                sl_price = None
+                if (order.order_type == OrderType.MARKET and not is_closing
+                        and not order.depends_on_order):
+                    sl_price = order.stop_price or None
+                account.submit_order(order, sl_price=sl_price, is_closing_order=is_closing)
             except Exception as e:
                 self.logger.error(f"Error processing WASHTRADE_LOCKED order {order_id}: {e}", exc_info=True)
 
@@ -1602,16 +1613,42 @@ class TradeManager:
                     ExpertRecommendation.instance_id == expert_instance_id,
                     ExpertRecommendation.created_at >= cutoff_time
                 ).order_by(ExpertRecommendation.created_at.desc())
-                
+
                 all_recommendations = session.exec(statement).all()
-                
+
                 if not all_recommendations:
                     self.logger.info(f"No recommendations found for expert {expert_instance_id}")
                     return created_orders
-                
+
+                # Prefer recommendations from OPEN_POSITIONS-subtype analyses: without this, a
+                # NEWER enter-market rec (e.g. this morning's entry scan for a held symbol)
+                # shadows the open-positions assessment and the exit rules are evaluated against
+                # an entry thesis. Experts don't stamp ExpertRecommendation.subtype, but the
+                # linked MarketAnalysis carries the use case (JobManager sets it on every
+                # scheduled/dynamic analysis). Falls back to ALL recs when none link to an
+                # open-positions analysis (manual analyses / legacy rows), preserving the old
+                # behaviour rather than silently managing nothing. The backtest engine always
+                # evaluates a fresh OPEN_POSITIONS rec, so this also closes a live/backtest gap.
+                from .models import MarketAnalysis
+                open_pos_rec_ids = set()
+                ma_ids = {r.market_analysis_id for r in all_recommendations if r.market_analysis_id}
+                if ma_ids:
+                    ma_rows = session.exec(
+                        select(MarketAnalysis).where(MarketAnalysis.id.in_(ma_ids))
+                    ).all()
+                    open_pos_ma = {m.id for m in ma_rows
+                                   if m.subtype == AnalysisUseCase.OPEN_POSITIONS}
+                    open_pos_rec_ids = {r.id for r in all_recommendations
+                                        if r.market_analysis_id in open_pos_ma}
+                if open_pos_rec_ids:
+                    candidate_recommendations = [r for r in all_recommendations
+                                                 if r.id in open_pos_rec_ids]
+                else:
+                    candidate_recommendations = all_recommendations
+
                 # Filter to get only the latest recommendation per instrument
                 latest_per_instrument = {}
-                for rec in all_recommendations:
+                for rec in candidate_recommendations:
                     if rec.symbol not in latest_per_instrument:
                         latest_per_instrument[rec.symbol] = rec
                 
