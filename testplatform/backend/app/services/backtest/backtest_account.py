@@ -264,6 +264,22 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 total += p.qty * px
         return total + self._option_positions_mtm()
 
+    #: Option strategies whose leg combination is DEFINED-RISK: the structure can only ever be
+    #: worth a bounded amount, so its mid-life mark-to-market has a theoretical no-arbitrage
+    #: range. Marking each leg independently off the sparse/noisy options cache lets a single
+    #: outlier premium print (x contracts x 100) blow the recorded equity/drawdown far outside
+    #: that range (the O_BF -473% max_drawdown from a body-leg outlier); we clamp the GROUP's net
+    #: MTM contribution to that range. NET-LONG (debit) combos are worth [0, width]; NET-SHORT
+    #: (credit) combos are worth [-width, 0]. Undefined-risk structures (short strangle/straddle,
+    #: put ratio, jade lizard — an uncovered short leg) are NOT clamped (the margin-liquidation
+    #: path bounds those); single-leg and equity marks are unchanged.
+    DEFINED_RISK_LONG_STRATEGIES = frozenset(
+        {"bull_call_spread", "bear_put_spread", "call_butterfly", "debit_spread"}
+    )
+    DEFINED_RISK_SHORT_STRATEGIES = frozenset(
+        {"bear_call_spread", "iron_condor", "credit_spread"}
+    )
+
     def _option_positions_mtm(self) -> float:
         """Mark-to-market value of open OPTION lots at the current bar's premium close.
 
@@ -272,18 +288,110 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         When no premium bar exists for the lot's contract on the current bar, the lot is
         valued at its entry premium (``avg_price``) so a held option is never silently
         dropped to zero on a day the cache lacks a bar.
+
+        DEFINED-RISK multi-leg groups (butterflies / vertical spreads / iron condors) are
+        marked as a GROUP and their net contribution is CLAMPED to the structure's theoretical
+        no-arbitrage range (``[0, width]`` for a debit combo, ``[-width, 0]`` for a credit combo,
+        ``width = (max_strike - min_strike) x 100 x contracts``). This stops a single outlier
+        premium print in the sparse cache from swinging recorded equity/drawdown outside what the
+        structure can actually be worth. The clamp is a MARK-TO-MARKET display bound ONLY — it
+        never moves cash, so realized P&L at expiry is unchanged.
         """
         if self._options is None:
             return 0.0
+        # Resolve each held lot's structure (group key + option_strategy + strike) once from the
+        # in-memory order cache (no per-bar DB churn; the same leg-grouping used elsewhere).
+        meta = self._option_lot_metadata()
+        # Accumulate ungrouped/undefined-risk lots directly; group defined-risk lots to clamp.
         total = 0.0
+        groups: Dict[Any, Dict[str, Any]] = {}
         for lot in self._option_positions.values():
             if lot.qty == 0:
                 continue
             bar = self._options.get_bar(lot.contract_symbol, self._as_of_date())
             px = bar["close"] if (bar and bar.get("close") is not None) else lot.avg_price
-            if px is not None:
-                total += lot.qty * px * lot.multiplier
+            if px is None:
+                continue
+            contribution = lot.qty * px * lot.multiplier
+
+            m = meta.get(lot.contract_symbol)
+            strategy = m["strategy"] if m else None
+            if strategy in self.DEFINED_RISK_LONG_STRATEGIES or strategy in self.DEFINED_RISK_SHORT_STRATEGIES:
+                g = groups.setdefault(
+                    m["group_key"],
+                    {"strategy": strategy, "mtm": 0.0, "strikes": [], "contracts": 0.0,
+                     "multiplier": lot.multiplier},
+                )
+                g["mtm"] += contribution
+                if m["strike"] is not None:
+                    g["strikes"].append(float(m["strike"]))
+                g["contracts"] = max(g["contracts"], abs(lot.qty))
+                g["multiplier"] = lot.multiplier
+            else:
+                total += contribution
+
+        # Clamp each defined-risk group's net contribution to its no-arb range.
+        for g in groups.values():
+            strikes = g["strikes"]
+            if len(strikes) >= 2 and g["contracts"] > 0:
+                # Widest ADJACENT strike gap = the structure's max spread width (a safe no-arb
+                # bound): for a vertical the single gap; for a butterfly/condor the widest wing.
+                # Using (max-min) would double-count a condor's two wings and over-loosen the
+                # clamp, so bound on the largest consecutive gap of the sorted strikes.
+                uniq = sorted(set(strikes))
+                widest_gap = max((b - a) for a, b in zip(uniq, uniq[1:])) if len(uniq) >= 2 else 0.0
+                width = widest_gap * g["multiplier"] * g["contracts"]
+            else:
+                width = None  # can't bound without >=2 strikes -> leave unclamped (rare)
+            mtm = g["mtm"]
+            if width is not None:
+                if g["strategy"] in self.DEFINED_RISK_LONG_STRATEGIES:
+                    mtm = min(max(mtm, 0.0), width)          # long combo: [0, width]
+                else:
+                    mtm = max(min(mtm, 0.0), -width)          # short/credit combo: [-width, 0]
+            total += mtm
         return total
+
+    def _option_lot_metadata(self) -> Dict[str, Dict[str, Any]]:
+        """Map ``contract_symbol -> {group_key, strategy, strike}`` for currently-held lots.
+
+        The group key ties the legs of one structure together so their MTM can be clamped as a
+        group: for a MULTI-LEG spread it is the parent order id; for a SINGLE-LEG option it is the
+        contract itself. ``strategy`` is the parent's (or single-leg's) ``option_strategy`` tag,
+        and ``strike`` is the leg's strike (used to bound the group's width). Built from the
+        in-memory order set (``get_orders``) so no per-bar DB query is added on the hot path
+        beyond the existing order cache.
+        """
+        # parent order id -> option_strategy (from the multi-leg PARENT / single-leg order).
+        strat_by_parent: Dict[int, str] = {}
+        for o in self.get_orders():
+            if getattr(o, "asset_class", None) != AssetClass.OPTION:
+                continue
+            if o.parent_order_id is None and getattr(o, "option_strategy", None):
+                if o.id is not None:
+                    strat_by_parent[o.id] = o.option_strategy
+
+        meta: Dict[str, Dict[str, Any]] = {}
+        held = self._option_positions
+        for o in self.get_orders():
+            if getattr(o, "asset_class", None) != AssetClass.OPTION:
+                continue
+            cs = getattr(o, "contract_symbol", None)
+            if not cs or cs not in held:
+                continue
+            if o.parent_order_id is not None:
+                group_key = o.parent_order_id
+                strategy = strat_by_parent.get(o.parent_order_id) or getattr(o, "option_strategy", None)
+            else:
+                group_key = cs
+                strategy = getattr(o, "option_strategy", None)
+            # First writer wins per contract (the opening leg carries the strike); don't let a
+            # synthetic closing order (which shares the contract) overwrite the strike.
+            if cs not in meta and o.strike is not None:
+                meta[cs] = {"group_key": group_key, "strategy": strategy, "strike": o.strike}
+            elif cs not in meta:
+                meta[cs] = {"group_key": group_key, "strategy": strategy, "strike": None}
+        return meta
 
     def equity(self) -> float:
         """Net liquidating value = cash + mark-to-market of open positions."""
