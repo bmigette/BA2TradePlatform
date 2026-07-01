@@ -289,6 +289,181 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         """Net liquidating value = cash + mark-to-market of open positions."""
         return self._cash + self._open_positions_mtm()
 
+    # ======================================================================
+    # Maintenance margin + forced liquidation (broker-style, bounds equity)
+    # ======================================================================
+    #: Reg-T maintenance margin fraction for a SHORT stock position (~30% of notional).
+    SHORT_STOCK_MAINTENANCE_FRACTION = 0.30
+
+    def maintenance_margin_requirement(self) -> float:
+        """Total maintenance-margin dollars this book must hold against its SHORT risk.
+
+        The requirement is the sum of the (unbounded-risk) short positions' broker
+        maintenance margins:
+
+          * short OPTION legs -> ``naked_margin_per_contract(strike, spot)`` x contracts
+            (Reg-T naked ~20% of notional less OTM, floored 10%) — the SAME model the entry
+            reserve uses, so the maintenance check is consistent with sizing.
+          * short STOCK       -> ``SHORT_STOCK_MAINTENANCE_FRACTION`` (30%) x |qty| x price.
+
+        LONG stock/options require NO extra maintenance here: their value is already funded and
+        marked into equity (their downside is bounded by going to zero, which the mark reflects).
+        This deliberately targets the naked-short blow-up (the -256% drawdown) rather than
+        reproducing a full Reg-T long-side schedule.
+        """
+        req = 0.0
+        # Short option legs.
+        for lot in self._option_positions.values():
+            if lot.qty >= 0:
+                continue  # only SHORT legs carry naked-margin risk here
+            strike, spot = self._lot_strike_and_spot(lot.contract_symbol)
+            if strike is None:
+                continue
+            req += self.naked_margin_per_contract(strike, spot=spot) * abs(lot.qty)
+        # Short stock.
+        for p in self._positions.values():
+            if p.qty >= 0:
+                continue
+            px = self._price.close_at(p.symbol)
+            if px is None:
+                px = self._price.close_asof(p.symbol)
+            if px is None:
+                px = p.avg_price
+            if px:
+                req += self.SHORT_STOCK_MAINTENANCE_FRACTION * abs(p.qty) * float(px)
+        return req
+
+    def _lot_strike_and_spot(self, contract_symbol: str):
+        """(strike, underlying_spot) for a held option lot, resolved from its FILLED order.
+
+        The lot ledger keeps only qty/premium; the strike + underlying live on the option
+        ``TradingOrder``. Returns (None, None) when the order/strike cannot be resolved (the
+        caller then skips that lot's margin contribution rather than guessing).
+        """
+        for o in self.get_orders():
+            if o.contract_symbol == contract_symbol and o.strike is not None:
+                spot = None
+                if o.underlying_symbol:
+                    spot = self._price.close_at(o.underlying_symbol)
+                    if spot is None:
+                        spot = self._price.close_asof(o.underlying_symbol)
+                return float(o.strike), (float(spot) if spot is not None else None)
+        return None, None
+
+    def maybe_margin_call_liquidation(self) -> bool:
+        """Force-liquidate SHORT positions when equity breaches maintenance margin.
+
+        Mirrors a broker margin call: if net-liquidating-value (equity) is below the total
+        maintenance requirement (or below zero), close the highest-margin SHORT positions at the
+        current bar's premium/close — booking the realised loss to cash — until the requirement is
+        satisfied or the book is flat. Returns True if ANY position was liquidated.
+
+        Deterministic and cheap: it runs only after the (rare) breach check trips, and reuses the
+        in-memory ledger close paths (no per-bar DB churn on healthy bars). Long positions are
+        left untouched (their risk is bounded and already funded); only the unbounded SHORT risk
+        is unwound. Logs a ``margin_call_liquidation`` line per closed position.
+        """
+        if self.equity() >= self.maintenance_margin_requirement() and self.equity() >= 0:
+            return False
+
+        liquidated = False
+        # Unwind short OPTION legs first (the naked, unbounded-risk exposure), largest lot first,
+        # re-checking the breach after each close so we stop as soon as margin is satisfied.
+        while True:
+            if self.equity() >= self.maintenance_margin_requirement() and self.equity() >= 0:
+                break
+            short_lots = [l for l in self._option_positions.values() if l.qty < 0]
+            if not short_lots:
+                break
+            lot = max(short_lots, key=lambda l: abs(l.qty))
+            if not self._liquidate_option_lot(lot):
+                break
+            liquidated = True
+
+        # Then unwind short STOCK if still breaching.
+        while True:
+            if self.equity() >= self.maintenance_margin_requirement() and self.equity() >= 0:
+                break
+            shorts = [p for p in self._positions.values() if p.qty < 0]
+            if not shorts:
+                break
+            pos = max(shorts, key=lambda p: abs(p.qty))
+            if not self._liquidate_stock_position(pos):
+                break
+            liquidated = True
+
+        return liquidated
+
+    def _liquidate_option_lot(self, lot: "_OptionLot") -> bool:
+        """Buy back a SHORT option lot at the current premium close; book cash + close the txn."""
+        bar = self._options.get_bar(lot.contract_symbol, self._as_of_date()) if self._options else None
+        premium = bar["close"] if (bar and bar.get("close") is not None) else lot.avg_price
+        if premium is None:
+            return False
+        txn = self._option_transaction_for_contract(lot.contract_symbol)
+        contracts = abs(lot.qty)
+        multiplier = lot.multiplier
+        # Buying back a short lot DEBITS cash (premium x contracts x multiplier).
+        self._cash -= contracts * float(premium) * multiplier
+        if txn is not None:
+            # Build the OptionPosition view for this leg so the close is recorded like an expiry
+            # settlement (synthetic FILLED closing order for round-trip pairing).
+            pos = self._option_position_for_lot(lot, txn)
+            if pos is not None:
+                self._record_option_expiry_close(txn, pos, float(premium))
+        lot.qty = 0.0
+        lot.avg_price = 0.0
+        if txn is not None and self._all_legs_resolved(txn):
+            from ba2_common.core.utils import close_transaction_with_logging
+
+            txn.close_price = float(premium)
+            if not txn.close_date:
+                txn.close_date = self._price.now()
+            close_transaction_with_logging(
+                txn, account_id=self.id, close_reason="margin_call_liquidation",
+                additional_data={"contract_symbol": lot.contract_symbol},
+            )
+            update_instance(txn)
+        logger.warning(
+            "[backtest] margin_call_liquidation: bought back SHORT %g x %s @ %.4f (premium) "
+            "to satisfy maintenance margin.", contracts, lot.contract_symbol, float(premium),
+        )
+        return True
+
+    def _option_position_for_lot(self, lot: "_OptionLot", txn) -> Optional[OptionPosition]:
+        """An OptionPosition describing a held lot (for recording its liquidation close)."""
+        for o in self.get_orders():
+            if o.contract_symbol == lot.contract_symbol and o.strike is not None:
+                return OptionPosition(
+                    contract_symbol=lot.contract_symbol,
+                    underlying=o.underlying_symbol,
+                    option_type=o.option_type,
+                    strike=o.strike,
+                    expiry=o.expiry,
+                    side=(OrderDirection.BUY if lot.qty > 0 else OrderDirection.SELL),
+                    quantity=abs(lot.qty),
+                    avg_entry_price=lot.avg_price,
+                    multiplier=lot.multiplier,
+                )
+        return None
+
+    def _liquidate_stock_position(self, pos: "_Position") -> bool:
+        """Close a stock position at the current close; book cash + realise P&L via the ledger."""
+        px = self._price.close_at(pos.symbol)
+        if px is None:
+            px = self._price.close_asof(pos.symbol)
+        if px is None:
+            return False
+        signed = -pos.qty  # opposite sign closes the position
+        # Selling (signed<0) credits cash; buying-to-cover (signed>0) debits cash.
+        self._cash -= signed * float(px)
+        self._update_position(pos.symbol, signed, float(px))
+        logger.warning(
+            "[backtest] margin_call_liquidation: closed STOCK %g x %s @ %.4f to satisfy "
+            "maintenance margin.", abs(pos.qty), pos.symbol, float(px),
+        )
+        return True
+
     def snapshot_equity(self, as_of: datetime) -> Dict[str, Any]:
         """Append an equity-curve snapshot for ``as_of`` and return it.
 

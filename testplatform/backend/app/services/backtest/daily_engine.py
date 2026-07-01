@@ -626,6 +626,22 @@ class DailyBacktestEngine:
             #     there. Early American assignment is NOT modelled — options resolve at expiry.
             self._apply_option_expiry(as_of_dt)
 
+            # 4a-bis. Broker-style maintenance-margin check + forced liquidation. After marking
+            #     this bar, if net-liquidating-value has fallen below the book's maintenance-margin
+            #     requirement (or below zero), force-close the unbounded SHORT exposure at the
+            #     current bar so equity cannot blow arbitrarily negative (the -256% drawdown).
+            #     Gated behind the account's own breach check (no work on healthy bars), so it adds
+            #     no per-bar DB churn on the common no-breach path. Runs BEFORE snapshot_equity so
+            #     the bounded post-liquidation equity is what the curve records.
+            if getattr(self.account, "supports_options", False) and hasattr(
+                self.account, "maybe_margin_call_liquidation"
+            ):
+                try:
+                    if self.account.maybe_margin_call_liquidation():
+                        self.account.invalidate_order_cache()
+                except Exception as e:  # noqa: BLE001 — a liquidation failure must not abort the run
+                    self._log(f"margin-call liquidation failed @ {as_of_dt}: {e}")
+
             # 4b. (removed) The engine no longer attaches a baseline "Position protection" TP/SL
             #     bracket on entry. Exits are driven SOLELY by the strategy's exit conditions
             #     (adjust_take_profit / adjust_stop_loss / close / sell), evaluated by the SAME
