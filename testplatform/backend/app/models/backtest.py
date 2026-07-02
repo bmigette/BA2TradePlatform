@@ -162,6 +162,10 @@ class Backtest(Base):
     def __repr__(self):
         return f"<Backtest(id={self.id}, name='{self.name}', return={self.total_return})>"
 
+    # RobustnessRun is defined at module end (after Backtest) to keep the FK target
+    # ("backtests") resolvable; see class RobustnessRun below.
+
+
     def _transform_trades_for_frontend(self):
         """Transform trade data to match frontend expected format."""
         if not self.trades:
@@ -301,5 +305,66 @@ class Backtest(Base):
             "isSaved": self.is_saved or False,
             "createdAt": self.created_at.isoformat() if self.created_at else None,
             "startedAt": self.started_at.isoformat() if self.started_at else None,
+            "completedAt": self.completed_at.isoformat() if self.completed_at else None,
+        }
+
+
+class RobustnessRun(Base):
+    """A robustness stress-test attached to a parent Backtest.
+
+    Two kinds:
+      - 'monte_carlo': pure-function MC over the parent's persisted ``trades`` (bootstrap /
+        shuffle / drop-K / jitter). ``results`` holds the percentile bands + probabilities +
+        drop-K table; ``variant_backtest_ids`` is empty (MC creates no new rows).
+      - 'schedule': re-runs the parent's config with shifted analysis day/time, writing N NEW
+        variant Backtest rows (never in place). ``variant_backtest_ids`` records those row ids;
+        ``results`` holds the schedule spread summary once all variants reach a terminal state.
+
+    JSON columns use SQLAlchemy ``JSON`` (same idiom as ``Backtest.results`` / ``.trades``) so
+    dicts/lists round-trip transparently. Timestamps mirror ``Backtest`` (``server_default``
+    now() for created_at; nullable completed_at).
+    """
+
+    __tablename__ = "robustness_runs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    # Parent backtest this robustness run stress-tests.
+    backtest_id = Column(Integer, ForeignKey("backtests.id"), nullable=False, index=True)
+
+    # 'monte_carlo' | 'schedule'
+    kind = Column(String(50), nullable=False)
+
+    # Request config (methods, n_paths, seed, drop_k, jitter_bp, schedule variants, ...).
+    params = Column(JSON, nullable=True)
+    # Computed outputs (MC bands/probabilities/drop-K table, or schedule spread summary).
+    results = Column(JSON, nullable=True)
+    # For kind='schedule': ids of the NEW variant Backtest rows this run spawned.
+    variant_backtest_ids = Column(JSON, nullable=True)
+
+    # 'pending' | 'running' | 'completed' | 'failed'
+    status = Column(String(50), default="pending")
+    error_message = Column(String(1000), nullable=True)
+
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+    def __repr__(self):
+        return (
+            f"<RobustnessRun(id={self.id}, backtest_id={self.backtest_id}, "
+            f"kind='{self.kind}', status='{self.status}')>"
+        )
+
+    def to_dict(self):
+        """Serialize for API responses (camelCase, matching the Backtest convention)."""
+        return {
+            "id": self.id,
+            "backtestId": self.backtest_id,
+            "kind": self.kind,
+            "params": self.params,
+            "results": self.results,
+            "variantBacktestIds": self.variant_backtest_ids,
+            "status": self.status,
+            "errorMessage": self.error_message,
+            "createdAt": self.created_at.isoformat() if self.created_at else None,
             "completedAt": self.completed_at.isoformat() if self.completed_at else None,
         }

@@ -10,7 +10,7 @@ from .training_checkpoint import TrainingCheckpoint
 from .news_cache import NewsCache
 from .target_set import TargetSet
 from .model import TrainedModel
-from .backtest import Backtest
+from .backtest import Backtest, RobustnessRun
 from .strategy import Strategy
 from .strategy_optimization import StrategyOptimization
 
@@ -26,6 +26,7 @@ __all__ = [
     "TargetSet",
     "TrainedModel",
     "Backtest",
+    "RobustnessRun",
     "Strategy",
     "StrategyOptimization"
 ]
