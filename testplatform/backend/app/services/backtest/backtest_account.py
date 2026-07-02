@@ -293,7 +293,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         DEFINED-RISK multi-leg groups (butterflies / vertical spreads / iron condors) are
         marked as a GROUP and their net contribution is CLAMPED to the structure's theoretical
         no-arbitrage range (``[0, width]`` for a debit combo, ``[-width, 0]`` for a credit combo,
-        ``width = widest_adjacent_strike_gap x 100 x structures``). This stops a single outlier
+        ``width = strategy-aware defined-risk width x 100 x structures`` — see
+        ``_defined_risk_width_per_structure``). This stops a single outlier
         premium print in the sparse cache from swinging recorded equity/drawdown outside what the
         structure can actually be worth. The clamp is a MARK-TO-MARKET display bound ONLY — it
         never moves cash, so realized P&L at expiry is unchanged.
@@ -395,6 +396,36 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             return max(0.0, float(o.strike) - float(spot))
         return None
 
+    @staticmethod
+    def _defined_risk_width_per_structure(strategy: Optional[str], strikes) -> Optional[float]:
+        """Defined-risk width PER STRUCTURE, PER SHARE, for a combo's strike set.
+
+        This is the span both the mid-life MTM clamp and the expiry safety clamp scale by
+        ``multiplier x structures``, so it must be the structure's TRUE defined risk:
+
+          * ``iron_condor`` (4 strikes k1<k2<k3<k4): ``max(k2-k1, k4-k3)`` — the wider WING.
+            The widest adjacent gap is usually the BODY ``k3-k2``, which is not risk (both
+            short strikes sit inside it) and made the bound ~2x too loose.
+          * 2-strike verticals (bull_call/bear_put/bear_call spread): the single gap.
+          * ``call_butterfly`` (3 strikes k1<k2<k3): ``min(k2-k1, k3-k2)`` — the binding wing
+            of a (possibly broken-wing) fly; equal wings unchanged.
+          * any other shape/strategy: the widest adjacent gap (defensive fallback — the
+            pre-strategy-aware rule, looser but never tighter than a known shape's risk).
+
+        Returns None when fewer than 2 distinct strikes (the structure cannot be bounded).
+        """
+        uniq = sorted({float(s) for s in strikes})
+        if len(uniq) < 2:
+            return None
+        gaps = [b - a for a, b in zip(uniq, uniq[1:])]
+        if strategy == "iron_condor" and len(uniq) == 4:
+            return max(gaps[0], gaps[2])
+        if strategy == "call_butterfly" and len(uniq) == 3:
+            return min(gaps)
+        if len(uniq) == 2:
+            return gaps[0]
+        return max(gaps)
+
     def _option_group_bounds(self):
         """Resolve, from the order set, the defined-risk structure bounds for held option lots.
 
@@ -402,10 +433,11 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
           * ``contract_group``: ``contract_symbol -> group_key`` for every held lot (group_key is
             the parent order id for a multi-leg spread, else the contract itself for single-leg).
           * ``group_bounds``: ``group_key -> {strategy, width}`` where ``width`` is the structure's
-            theoretical max value = ``widest_adjacent_strike_gap x 100 x structures`` (None when it
-            cannot be bounded, e.g. <2 distinct strikes). ``structures`` is the parent order's
-            ``quantity`` (number of structures), NOT a leg's contract count — a butterfly's body
-            leg carries 2x the structure count, so using a leg qty would over-loosen the clamp.
+            theoretical max value = ``strategy-aware width x 100 x structures`` (see
+            ``_defined_risk_width_per_structure``; None when it cannot be bounded, e.g. <2
+            distinct strikes). ``structures`` is the parent order's ``quantity`` (number of
+            structures), NOT a leg's contract count — a butterfly's body leg carries 2x the
+            structure count, so using a leg qty would over-loosen the clamp.
 
         Width is derived from the FULL set of the structure's OPENING legs (all strikes), so it is
         stable even after a leg has been assigned/settled and dropped out of the held lots.
@@ -443,11 +475,12 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 parent_info[o.parent_order_id]["strikes"].append(float(o.strike))
 
         def _width(info):
-            uniq = sorted(set(info["strikes"]))
-            if len(uniq) < 2 or info["qty"] <= 0:
+            if info["qty"] <= 0:
                 return None
-            widest_gap = max((b - a) for a, b in zip(uniq, uniq[1:]))
-            return widest_gap * info["multiplier"] * info["qty"]
+            per = self._defined_risk_width_per_structure(info["strategy"], info["strikes"])
+            if per is None:
+                return None
+            return per * info["multiplier"] * info["qty"]
 
         contract_group: Dict[str, Any] = {}
         group_bounds: Dict[Any, Dict[str, Any]] = {}
@@ -505,12 +538,17 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # excluded here (otherwise a butterfly's short body / an iron condor's short legs inflate
         # the requirement and trigger a false margin call that breaks the combo).
         defined_risk = self._defined_risk_contracts()
+        # Short CALLs fully covered by long underlying shares (covered calls) carry ~zero
+        # classic maintenance — exempt them like defined-risk legs.
+        covered_calls = self._covered_short_call_contracts()
         # Short option legs.
         for lot in self._option_positions.values():
             if lot.qty >= 0:
                 continue  # only SHORT legs carry naked-margin risk here
             if lot.contract_symbol in defined_risk:
                 continue  # covered short leg of a defined-risk combo -> no naked margin
+            if lot.contract_symbol in covered_calls:
+                continue  # short call covered by long shares -> no naked margin
             strike, spot = self._lot_strike_and_spot(lot.contract_symbol)
             if strike is None:
                 continue
@@ -548,22 +586,62 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 out.add(cs)
         return out
 
-    def _lot_strike_and_spot(self, contract_symbol: str):
-        """(strike, underlying_spot) for a held option lot, resolved from its FILLED order.
+    def _lot_order(self, contract_symbol: str) -> Optional[TradingOrder]:
+        """The option ``TradingOrder`` carrying a held lot's contract terms.
 
-        The lot ledger keeps only qty/premium; the strike + underlying live on the option
-        ``TradingOrder``. Returns (None, None) when the order/strike cannot be resolved (the
-        caller then skips that lot's margin contribution rather than guessing).
+        The lot ledger keeps only qty/premium; the strike / option_type / underlying live on
+        the option ``TradingOrder``. Returns None when no order with a strike resolves (callers
+        then skip or fall back rather than guessing).
         """
         for o in self.get_orders():
             if o.contract_symbol == contract_symbol and o.strike is not None:
-                spot = None
-                if o.underlying_symbol:
-                    spot = self._price.close_at(o.underlying_symbol)
-                    if spot is None:
-                        spot = self._price.close_asof(o.underlying_symbol)
-                return float(o.strike), (float(spot) if spot is not None else None)
-        return None, None
+                return o
+        return None
+
+    def _lot_strike_and_spot(self, contract_symbol: str):
+        """(strike, underlying_spot) for a held option lot, resolved from its FILLED order.
+
+        Returns (None, None) when the order/strike cannot be resolved (the caller then skips
+        that lot's margin contribution rather than guessing).
+        """
+        o = self._lot_order(contract_symbol)
+        if o is None:
+            return None, None
+        spot = None
+        if o.underlying_symbol:
+            spot = self._price.close_at(o.underlying_symbol)
+            if spot is None:
+                spot = self._price.close_asof(o.underlying_symbol)
+        return float(o.strike), (float(spot) if spot is not None else None)
+
+    def _covered_short_call_contracts(self) -> set:
+        """Contract symbols of held SHORT CALL lots fully covered by LONG underlying shares.
+
+        A short call covered share-for-share (long shares >= contracts x multiplier) has ~zero
+        classic maintenance requirement — charging it naked margin overstates the requirement
+        (false breach) and lets the margin call buy back a fully covered call. Covered lots are
+        exempt from BOTH the requirement sum and the liquidation candidate set. When several
+        short-call lots share one underlying, the shares are allocated GREEDILY (largest lot
+        first) so the same shares never cover two lots; a lot is exempt only when FULLY covered.
+        """
+        by_underlying: Dict[str, List[_OptionLot]] = {}
+        for lot in self._option_positions.values():
+            if lot.qty >= 0:
+                continue
+            o = self._lot_order(lot.contract_symbol)
+            if o is None or o.option_type != OptionRight.CALL or not o.underlying_symbol:
+                continue
+            by_underlying.setdefault(o.underlying_symbol, []).append(lot)
+        covered: set = set()
+        for underlying, lots in by_underlying.items():
+            pos = self._positions.get(underlying)
+            available = float(pos.qty) if (pos is not None and pos.qty > 0) else 0.0
+            for lot in sorted(lots, key=lambda l: abs(l.qty), reverse=True):
+                needed = abs(lot.qty) * float(lot.multiplier or 100)
+                if needed <= available:
+                    covered.add(lot.contract_symbol)
+                    available -= needed
+        return covered
 
     def maybe_margin_call_liquidation(self) -> bool:
         """Force-liquidate SHORT positions when equity breaches maintenance margin.
@@ -593,6 +671,10 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # genuinely NAKED short legs (short strangle/straddle/jade_lizard/put_ratio, single-leg
         # naked short).
         defined_risk = self._defined_risk_contracts()
+        # Covered short CALLs are not naked either — never buy back a fully covered call to fix
+        # a breach. The cover set is stable during the option loop (only option lots change
+        # there, and long shares are never unwound — the stock loop below touches SHORT stock).
+        covered_calls = self._covered_short_call_contracts()
         # Unwind naked short OPTION legs first (the unbounded-risk exposure), largest lot first,
         # re-checking the breach after each close so we stop as soon as margin is satisfied.
         while True:
@@ -600,7 +682,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 break
             short_lots = [
                 l for l in self._option_positions.values()
-                if l.qty < 0 and l.contract_symbol not in defined_risk
+                if l.qty < 0
+                and l.contract_symbol not in defined_risk
+                and l.contract_symbol not in covered_calls
             ]
             if not short_lots:
                 break
@@ -626,7 +710,29 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
     def _liquidate_option_lot(self, lot: "_OptionLot") -> bool:
         """Buy back a SHORT option lot at the current premium close; book cash + close the txn."""
         bar = self._options.get_bar(lot.contract_symbol, self._as_of_date()) if self._options else None
-        premium = bar["close"] if (bar and bar.get("close") is not None) else lot.avg_price
+        if bar and bar.get("close") is not None:
+            premium = float(bar["close"])
+        else:
+            # No premium bar on the liquidation bar. The entry premium books the buyback at
+            # break-even — understating the loss at exactly the moment a breach implies the
+            # premium moved against the short. Use INTRINSIC, floored at the entry premium
+            # (a forced buyback is never booked BELOW entry mid-blow-up); the entry premium
+            # remains the last resort when strike/spot/right are unresolvable.
+            premium = lot.avg_price
+            o = self._lot_order(lot.contract_symbol)
+            if o is not None and o.option_type is not None:
+                spot = None
+                if o.underlying_symbol:
+                    spot = self._price.close_at(o.underlying_symbol)
+                    if spot is None:
+                        spot = self._price.close_asof(o.underlying_symbol)
+                if spot is not None:
+                    intrinsic = (
+                        max(0.0, float(spot) - float(o.strike))
+                        if o.option_type == OptionRight.CALL
+                        else max(0.0, float(o.strike) - float(spot))
+                    )
+                    premium = max(intrinsic, lot.avg_price)
         if premium is None:
             return False
         txn = self._option_transaction_for_contract(lot.contract_symbol)
@@ -684,15 +790,78 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         if px is None:
             return False
         closed_qty = abs(pos.qty)
+        was_long = pos.qty > 0
         signed = -pos.qty  # opposite sign closes the position
         # Selling (signed<0) credits cash; buying-to-cover (signed>0) debits cash.
         self._cash -= signed * float(px)
         self._update_position(pos.symbol, signed, float(px))
+        # Persist a synthetic FILLED closing order (the option-lot path already records one via
+        # _record_option_expiry_close) so the equity jump shows up as a trade in
+        # get_round_trip_trades/reports instead of an unexplained cash move.
+        self._record_stock_liquidation_close(pos.symbol, closed_qty, was_long, float(px))
         logger.warning(
             "[backtest] margin_call_liquidation: closed STOCK %g x %s @ %.4f to satisfy "
             "maintenance margin.", closed_qty, pos.symbol, float(px),
         )
         return True
+
+    def _record_stock_liquidation_close(
+        self, symbol: str, qty: float, was_long: bool, px: float
+    ) -> None:
+        """Persist a synthetic FILLED closing order for a margin-call STOCK liquidation.
+
+        BOOK-KEEPING only (the caller already moved cash + ledger). Linked to the symbol's
+        OPENED equity transaction when one resolves — the entry order's side must match the
+        liquidated direction — carrying ``depends_on_order`` so the sim-dated close is never
+        mistaken for the entry by ``_entry_order_for_transaction`` (same guard as
+        ``_record_option_expiry_close``). When no transaction resolves the order is persisted
+        unlinked; a transaction is never invented.
+        """
+        from sqlmodel import select, Session
+
+        want_side = OrderDirection.BUY if was_long else OrderDirection.SELL
+        txn_id = None
+        entry_id = None
+        with Session(get_db().bind) as session:
+            txns = list(
+                session.exec(
+                    select(Transaction).where(
+                        Transaction.status == TransactionStatus.OPENED,
+                        Transaction.symbol == symbol,
+                    )
+                ).all()
+            )
+        for t in txns:
+            entry = self._entry_order_for_transaction(t)  # account-scoped lookup
+            if (
+                entry is not None
+                and getattr(entry, "asset_class", None) != AssetClass.OPTION
+                and entry.side == want_side
+            ):
+                txn_id = t.id
+                entry_id = entry.id
+                break
+        as_of = self._price.now()
+        order = TradingOrder(
+            account_id=self.id,
+            symbol=symbol,
+            quantity=abs(float(qty)),
+            filled_qty=abs(float(qty)),
+            side=(OrderDirection.SELL if was_long else OrderDirection.BUY),
+            order_type=OrderType.MARKET,
+            status=OrderStatus.FILLED,
+            open_price=float(px),
+            transaction_id=txn_id,
+            depends_on_order=entry_id,
+            open_type=OrderOpenType.AUTOMATIC,
+            broker_order_id=self._next_broker_id(),
+            comment="margin_call_liquidation",
+            created_at=as_of,
+        )
+        new_id = add_instance(order)
+        if new_id is not None:
+            self._fill_dates[new_id] = as_of
+        self.invalidate_order_cache()
 
     def snapshot_equity(self, as_of: datetime) -> Dict[str, Any]:
         """Append an equity-curve snapshot for ``as_of`` and return it.
@@ -2023,7 +2192,6 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # Net intrinsic payoff across the legs (bounded to defined risk by construction).
         net_payoff = 0.0
         strikes: List[float] = []
-        contracts_per_structure = 0.0
         for pos in positions:
             is_call = pos.option_type == OptionRight.CALL
             intrinsic = max(0.0, spot - float(pos.strike)) if is_call else max(0.0, float(pos.strike) - spot)
@@ -2031,15 +2199,12 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             mult = float(pos.multiplier or 100)
             net_payoff += sign * intrinsic * mult * float(pos.quantity)
             strikes.append(float(pos.strike))
-            contracts_per_structure = max(contracts_per_structure, float(pos.quantity))
 
-        # Safety clamp: a defined-risk combo's expiry payoff magnitude can never exceed the widest
-        # adjacent strike gap x 100 x contracts (the structure's max spread value). Bound both
-        # directions so rounding / bad cache data cannot leak past defined risk.
-        uniq = sorted(set(strikes))
-        if len(uniq) >= 2 and contracts_per_structure > 0:
-            widest_gap = max((b - a) for a, b in zip(uniq, uniq[1:]))
-            bound = widest_gap * 100.0 * contracts_per_structure
+        # Safety clamp: a defined-risk combo's expiry payoff magnitude can never exceed the
+        # structure's defined risk. Bound both directions so rounding / bad cache data cannot
+        # leak past it.
+        bound = self._combo_expiry_bound(txn, positions, strikes)
+        if bound is not None:
             net_payoff = max(-bound, min(net_payoff, bound))
 
         # Apply the net payoff to cash and book each leg's synthetic close (moves no extra cash).
@@ -2067,6 +2232,30 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             net_payoff,
         )
         return True
+
+    def _combo_expiry_bound(self, txn: Transaction, positions: List[OptionPosition],
+                            strikes: List[float]) -> Optional[float]:
+        """Max |net payoff| a defined-risk combo can realise at expiry.
+
+        ``strategy-aware width x multiplier x structures`` (the same width rule the MTM clamp
+        uses — ``_defined_risk_width_per_structure``). ``structures`` comes from the combo's
+        PARENT order quantity (the same source ``_option_group_bounds`` uses): ``max(leg qty)``
+        counted a 1-2-1 butterfly's 2x body as the structure count, doubling the bound.
+        Falls back to ``min(leg quantities)`` when the parent is unresolvable. The multiplier
+        is the legs' (not a hardcoded 100). Returns None when the structure cannot be bounded.
+        """
+        entry = self._entry_order_for_transaction(txn)
+        strategy = getattr(entry, "option_strategy", None) if entry is not None else None
+        width_per = self._defined_risk_width_per_structure(strategy, strikes)
+        if width_per is None:
+            return None
+        structures = abs(float(entry.quantity)) if (entry is not None and entry.quantity) else 0.0
+        if structures <= 0:
+            structures = min(float(p.quantity) for p in positions)
+        if structures <= 0:
+            return None
+        multiplier = float(positions[0].multiplier or 100)
+        return width_per * multiplier * structures
 
     def _record_option_expiry_close(
         self, txn: Transaction, position: OptionPosition, close_premium: float
