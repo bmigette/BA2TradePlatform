@@ -19,6 +19,7 @@ from ba2_common.core.interfaces.LLMServiceInterface import get_llm_service
 
 from ba2_experts.PennyMomentumTrader.conditions import ConditionEvaluator, get_condition_types_for_llm, validate_condition_set
 from ba2_experts.PennyMomentumTrader.tier_tracking import merge_tier_update, migrate_triggered_state
+from ba2_experts.PennyMomentumTrader.trailing import apply_trailing_ratchet, update_high_watermark
 from ba2_experts.PennyMomentumTrader.prompts import (
     build_conditions_fix_prompt,
     build_exit_generate_prompt,
@@ -39,6 +40,14 @@ class MonitoringPhasesMixin:
         max_holding = int(self.get_setting_with_interface_default(
             "max_holding_days", log_warning=False
         ))
+        trail_after_max_holding = self.get_setting_with_interface_default(
+            "trail_after_max_holding", log_warning=False
+        )
+        trailing_pct = float(self.get_setting_with_interface_default(
+            "trailing_stop_pct", log_warning=False
+        ))
+
+        aged_positions = []
         for pos in open_positions:
             try:
                 with get_db() as session:
@@ -49,20 +58,52 @@ class MonitoringPhasesMixin:
                         created = trans.created_at.replace(tzinfo=timezone.utc) if trans.created_at.tzinfo is None else trans.created_at
                         age_days = (datetime.now(timezone.utc) - created).days
                         if age_days >= max_holding:
-                            self.logger.info(
-                                f"Position {pos['symbol']} held for {age_days} days "
-                                f"(max {max_holding}), forcing exit"
-                            )
-                            trade_mgr.execute_exit(
-                                pos["symbol"],
-                                exit_pct=100.0,
-                                reason=f"max holding period ({max_holding} days) exceeded",
-                            )
+                            aged_positions.append((pos, age_days))
             except Exception as e:
                 self.logger.error(
                     f"Error checking position age for {pos['symbol']}: {e}",
                     exc_info=True,
                 )
+
+        if aged_positions:
+            # One batch quote call for all aged positions (profit/loss decision)
+            live_prices = self._get_live_prices([p["symbol"] for p, _ in aged_positions])
+            for pos, age_days in aged_positions:
+                symbol = pos["symbol"]
+                entry_price = pos["entry_price"]
+                current_price = live_prices.get(symbol)
+                at_profit = (
+                    current_price is not None
+                    and entry_price is not None
+                    and current_price > entry_price
+                )
+                if trail_after_max_holding and at_profit:
+                    # Winner past the time stop: do NOT market-close (SKYQ was
+                    # flattened right before a +56% run). Record a trailing
+                    # directive — phase 5 activates a ratchet-only trailing stop
+                    # at hwm × (1 - trailing_stop_pct/100) and re-tightens it
+                    # every monitoring tick.
+                    self._mark_position_for_trailing(
+                        market_analysis, symbol, age_days, current_price
+                    )
+                    self.logger.info(
+                        f"Position {symbol} held {age_days} days (max {max_holding}) "
+                        f"but at a PROFIT (entry=${entry_price:.4f}, "
+                        f"now=${current_price:.4f}) — trailing "
+                        f"{trailing_pct:.1f}% below high-watermark instead of flat close"
+                    )
+                else:
+                    # At a loss (or profit unverifiable — no live price): keep
+                    # the flat-close time stop for dead money.
+                    self.logger.info(
+                        f"Position {symbol} held for {age_days} days "
+                        f"(max {max_holding}), forcing exit"
+                    )
+                    trade_mgr.execute_exit(
+                        symbol,
+                        exit_pct=100.0,
+                        reason=f"max holding period ({max_holding} days) exceeded",
+                    )
 
         self._update_state(
             market_analysis,
@@ -77,6 +118,56 @@ class MonitoringPhasesMixin:
                 ],
             },
         )
+
+    def _mark_position_for_trailing(
+        self,
+        market_analysis: MarketAnalysis,
+        symbol: str,
+        age_days: int,
+        current_price: float,
+    ):
+        """Record a trailing directive for a profitable position past max_holding.
+
+        Stored under state["trailing"] (NOT monitored_symbols — phase 0 runs
+        before phase 4's carry-over, and seeding monitored_symbols here would
+        make phase 4 skip carrying over the previous day's watch list). Phase 5
+        picks the directive up on its first tick, sets trail_active on the
+        symbol's monitored info, and applies the ratchet every tick.
+        """
+        with get_db() as session:
+            ma = session.get(MarketAnalysis, market_analysis.id)
+            if not ma:
+                return
+            from sqlalchemy.orm import attributes
+            state = ma.state or {}
+            trailing = dict(state.get("trailing", {}))
+            trailing[symbol] = {
+                "activated_at": datetime.now(timezone.utc).isoformat(),
+                "age_days": age_days,
+                "price_at_activation": current_price,
+            }
+            state["trailing"] = trailing
+            ma.state = state
+            attributes.flag_modified(ma, "state")
+            session.add(ma)
+            session.commit()
+            market_analysis.state = state
+
+        try:
+            from ba2_common.core.db import log_activity
+            from ba2_common.core.types import ActivityLogSeverity, ActivityLogType
+            log_activity(
+                severity=ActivityLogSeverity.INFO,
+                activity_type=ActivityLogType.ANALYSIS_COMPLETED,
+                description=(
+                    f"PennyMomentumTrader: {symbol} reached max holding at a profit "
+                    f"— switching to ratchet-only trailing stop instead of flat close"
+                ),
+                data={"symbol": symbol, "age_days": age_days, "price": current_price},
+                source_expert_id=self.instance.id,
+            )
+        except Exception:
+            pass
 
     def _phase_5_monitor(self, market_analysis: MarketAnalysis):
         """Monitor conditions and execute trades until market close."""
@@ -181,13 +272,15 @@ class MonitoringPhasesMixin:
                 self.logger.info("Market closed, exiting monitor loop")
                 break
 
-            # Reload monitored symbols from state
+            # Reload monitored symbols (and trailing directives from phase 0) from state
             with get_db() as session:
                 ma = session.get(MarketAnalysis, market_analysis.id)
                 if ma and ma.state:
                     monitored = dict(ma.state.get("monitored_symbols", {}))
+                    trailing_directives = dict(ma.state.get("trailing", {}))
                 else:
                     monitored = {}
+                    trailing_directives = {}
 
             evaluator = ConditionEvaluator(
                 ohlcv_provider, market_timezone=market_tz_str
@@ -291,6 +384,33 @@ class MonitoringPhasesMixin:
                         )
                         entry_price = pos["entry_price"]
                         info["entry_price"] = entry_price
+
+                        # High-watermark tracking + trailing ratchet for positions
+                        # past max_holding at a profit (phase 0 directive).
+                        # Ratchet-only: the stop can only tighten, never loosen —
+                        # even if the exit-update LLM rewrites stop_loss, the
+                        # recorded trail_stop_price is re-applied as a floor here
+                        # on every tick.
+                        update_high_watermark(info, current_price)
+                        if info.get("trail_active") or symbol in trailing_directives:
+                            info["trail_active"] = True
+                            trailing_pct = float(self.get_setting_with_interface_default(
+                                "trailing_stop_pct", log_warning=False
+                            ))
+                            new_stop = apply_trailing_ratchet(
+                                info,
+                                trailing_pct,
+                                entry_price=entry_price,
+                                current_price=current_price,
+                            )
+                            if new_stop is not None and new_stop != info.get("last_logged_trail_stop"):
+                                info["last_logged_trail_stop"] = new_stop
+                                hwm = info.get("high_watermark")
+                                hwm_str = f", hwm=${hwm:.4f}" if hwm is not None else ""
+                                self.logger.info(
+                                    f"{symbol}: trailing stop ratcheted to ${new_stop:.4f}"
+                                    f" ({trailing_pct:.1f}% below high-watermark{hwm_str})"
+                                )
 
                         exit_conds = info.get("exit_conditions", {})
 
@@ -707,6 +827,28 @@ class MonitoringPhasesMixin:
         """End-of-day wrap-up: mark analysis complete, update state."""
         self.logger.info("Phase 6: EOD wrap-up")
 
+        # Opt-in day-trade mode: flatten ALL open positions before the close
+        # (overnight gap control — e.g. AZI gapped -15% through a 7% stop).
+        eod_flat = self.get_setting_with_interface_default(
+            "eod_flat", log_warning=False
+        )
+        if eod_flat:
+            try:
+                self._eod_flat_close_all(market_analysis)
+            except Exception as e:
+                self.logger.error(f"eod_flat close-all failed: {e}", exc_info=True)
+
+        # Automated filter post-mortem — MUST be fail-soft: any error is logged
+        # and never breaks the pipeline wrap-up.
+        postmortem_enabled = self.get_setting_with_interface_default(
+            "filter_postmortem_enabled", log_warning=False
+        )
+        if postmortem_enabled:
+            try:
+                self.run_filter_postmortem(market_analysis)
+            except Exception as e:
+                self.logger.warning(f"Filter post-mortem failed (non-fatal): {e}")
+
         with get_db() as session:
             ma = session.get(MarketAnalysis, market_analysis.id)
             if ma:
@@ -723,6 +865,64 @@ class MonitoringPhasesMixin:
                 market_analysis.status = MarketAnalysisStatus.COMPLETED
 
         self.logger.info("Pipeline completed")
+
+    def _eod_flat_close_all(self, market_analysis: MarketAnalysis):
+        """Market-close every open position of this expert (eod_flat mode)."""
+        trade_mgr = self._trade_mgr
+        open_positions = trade_mgr.get_open_positions()
+        if not open_positions:
+            self.logger.debug("eod_flat: no open positions to close")
+            return
+
+        closed_symbols = []
+        for pos in open_positions:
+            symbol = pos["symbol"]
+            ok = trade_mgr.execute_exit(
+                symbol,
+                exit_pct=100.0,
+                reason="eod_flat: overnight gap control",
+            )
+            if ok:
+                closed_symbols.append(symbol)
+                self._record_trade(
+                    market_analysis, symbol, "exit", "eod_flat: overnight gap control"
+                )
+            else:
+                self.logger.error(f"eod_flat: exit failed for {symbol}")
+
+        # Mark the closed positions in monitored state so monitoring stops
+        if closed_symbols:
+            with get_db() as session:
+                ma = session.get(MarketAnalysis, market_analysis.id)
+                if ma and ma.state:
+                    from sqlalchemy.orm import attributes
+                    state = ma.state
+                    monitored = state.get("monitored_symbols", {})
+                    for symbol in closed_symbols:
+                        if symbol in monitored:
+                            monitored[symbol]["status"] = "closed"
+                    state["monitored_symbols"] = monitored
+                    ma.state = state
+                    attributes.flag_modified(ma, "state")
+                    session.add(ma)
+                    session.commit()
+                    market_analysis.state = state
+
+            self.logger.info(
+                f"eod_flat: closed {len(closed_symbols)} position(s): {closed_symbols}"
+            )
+            from ba2_common.core.db import log_activity
+            from ba2_common.core.types import ActivityLogSeverity, ActivityLogType
+            log_activity(
+                severity=ActivityLogSeverity.INFO,
+                activity_type=ActivityLogType.ORDER_SUBMITTED,
+                description=(
+                    f"PennyMomentumTrader eod_flat: market-closed "
+                    f"{len(closed_symbols)} position(s) at EOD: {', '.join(closed_symbols)}"
+                ),
+                data={"symbols": closed_symbols},
+                source_expert_id=self.instance.id,
+            )
 
     # ------------------------------------------------------------------
     # Live exit condition updates

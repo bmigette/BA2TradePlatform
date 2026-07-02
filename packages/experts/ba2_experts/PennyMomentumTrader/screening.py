@@ -194,6 +194,36 @@ class ScreeningPhasesMixin:
             q_mcap = quote.get("marketCap")
             if q_mcap and q_mcap > 0:
                 c["market_cap"] = q_mcap
+            # Thread through fields used by the split guard (previousClose) and
+            # the quick-filter reversal lane (yearLow/yearHigh) — FMP /v3/quote
+            # carries all three.
+            q_prev_close = quote.get("previousClose")
+            if q_prev_close and q_prev_close > 0:
+                c["previous_close"] = q_prev_close
+            q_year_low = quote.get("yearLow")
+            if q_year_low and q_year_low > 0:
+                c["year_low"] = q_year_low
+            q_year_high = quote.get("yearHigh")
+            if q_year_high and q_year_high > 0:
+                c["year_high"] = q_year_high
+
+        # Split-transition guard: drop symbols with a split effective within
+        # ±1 calendar day (bogus prints on transition days, e.g. ALIT shown at
+        # $0.56 on its 1:20 reverse-split day) plus a defensive price-continuity
+        # check. Runs BEFORE the RVOL filter/cap so corrupted rows never consume
+        # candidate slots or reach the LLM stages.
+        split_guard_enabled = self.get_setting_with_interface_default(
+            "split_guard_enabled", log_warning=False
+        )
+        if split_guard_enabled and candidates:
+            today = datetime.now(timezone.utc).date()
+            split_symbols = self._fetch_split_symbols(
+                (today - timedelta(days=1)).isoformat(),
+                (today + timedelta(days=1)).isoformat(),
+            )
+            candidates = self._apply_split_guard(
+                candidates, filtered_stocks, split_symbols
+            )
 
         # Filter by minimum relative volume
         if min_rvol > 0:
@@ -304,6 +334,75 @@ class ScreeningPhasesMixin:
             )
 
         return candidates
+
+    def _apply_split_guard(
+        self,
+        candidates: List[Dict[str, Any]],
+        filtered_stocks: Dict[str, Dict[str, Any]],
+        split_symbols: set,
+    ) -> List[Dict[str, Any]]:
+        """Drop split-transition candidates and price-discontinuity rows.
+
+        Two layers (June-2026 post-mortem: ALIT 1:20 and RMTI 1:10 reverse
+        splits produced bogus penny-range prints and fake +784% moves):
+
+        1. Split calendar: any symbol in ``split_symbols`` (splits effective
+           within ±1 day of today) is dropped — transition-day quotes mix
+           pre/post-split bases and cannot be trusted.
+        2. Price continuity: if the row carries a previousClose and the price
+           is more than 50% away from it while the row's own day-change claims
+           < 20%, the price series is internally inconsistent (typical split
+           data artifact) — flag and drop.
+
+        Mutates ``filtered_stocks`` with per-symbol reasons; returns survivors.
+        """
+        survivors: List[Dict[str, Any]] = []
+        for c in candidates:
+            sym = (c.get("symbol") or "").upper()
+            if not sym:
+                continue
+
+            if sym in split_symbols:
+                filtered_stocks[sym] = {
+                    "phase": "screen",
+                    "reason": "split_transition",
+                    "details": (
+                        "Stock split effective within ±1 day of today — "
+                        "transition-day prices are unreliable (pre/post-split mix)"
+                    ),
+                }
+                continue
+
+            price = c.get("price")
+            prev_close = c.get("previous_close")
+            chg_pct = c.get("change_percent")
+            if price and prev_close:
+                implied_move = abs(price / prev_close - 1)
+                reported_move = abs(chg_pct or 0)
+                # >50% off previousClose while the quote claims <20% day change:
+                # the two fields disagree — a data discontinuity, not a real move.
+                if implied_move > 0.5 and reported_move < 20:
+                    filtered_stocks[sym] = {
+                        "phase": "screen",
+                        "reason": "price_discontinuity",
+                        "details": (
+                            f"Price ${price:.4f} is {implied_move * 100:.0f}% away from "
+                            f"previousClose ${prev_close:.4f} but reported day change is "
+                            f"only {reported_move:.1f}% — inconsistent price series "
+                            f"(likely split/data artifact)"
+                        ),
+                    }
+                    continue
+
+            survivors.append(c)
+
+        dropped = len(candidates) - len(survivors)
+        if dropped:
+            self.logger.info(
+                f"Split guard dropped {dropped} candidate(s): "
+                f"{[s for s in filtered_stocks if filtered_stocks[s]['reason'] in ('split_transition', 'price_discontinuity')]}"
+            )
+        return survivors
 
     def _get_previously_monitored_symbols(self, current_market_analysis_id: int) -> set:
         """Return symbols from the most recent prior MarketAnalysis that has monitored data."""

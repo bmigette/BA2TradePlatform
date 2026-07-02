@@ -103,6 +103,7 @@ def build_quick_filter_prompt(
         # RVOL and change % (enriched during phase 1 screening)
         rvol = c.get("rvol")
         chg_pct = c.get("change_percent")
+        year_low = c.get("year_low")
 
         industry = c.get("industry", "")
         sector_industry = f"{sector}/{industry}" if industry and industry != sector else (sector or "?")
@@ -114,6 +115,10 @@ def build_quick_filter_prompt(
             line += f", rvol={rvol:.1f}x"
         if chg_pct is not None and chg_pct != 0:
             line += f", chg={chg_pct:+.1f}%"
+        # Distance above the 52-week low (reversal-lane signal)
+        if year_low and price and year_low > 0:
+            low_dist = (price / year_low - 1) * 100
+            line += f", 52wLow={low_dist:+.0f}%"
         if st_wl is not None:
             wl_str = f"{st_wl:,}"
             line += f", st_watchlist={wl_str}"
@@ -141,9 +146,19 @@ Use these as confirmation signals — high watchlist + high bull% + trending str
 
     return f"""{_SYSTEM_PREAMBLE}
 
-You are filtering penny-stock momentum candidates. From the list below, select up to {max_survivors} stocks most likely to produce a profitable momentum trade today or this week. Only include stocks that genuinely meet the criteria — do NOT pad to reach {max_survivors} if fewer stocks qualify.
+You are filtering penny-stock candidates. From the list below, select up to {max_survivors} stocks most likely to produce a profitable trade today or this week. Only include stocks that genuinely meet the criteria — do NOT pad to reach {max_survivors} if fewer stocks qualify.
+
+Select through TWO independent lanes (a candidate qualifies via either):
+
+LANE "momentum" — continuation setups meeting the FILTER CRITERIA below.
+
+LANE "reversal" — bottoming/reversal setups. A stock that is DOWN is not automatically a reject: select it when ALL of these hold:
+- High relative volume: rvol >= 3.0x (heavy accumulation interest)
+- Beaten down: within ~15% of its 52-week low (52wLow field <= +15%) OR down >= 30% over the past month
+- Reversal signature: a green day after a decline streak, or a strong bounce off the lows (positive chg% today despite the drawdown)
+Do NOT reject these as "decliner, no catalyst" — the volume surge IS the signal that a catalyst/reversal is underway.
 {stocktwits_note}
-FILTER CRITERIA (apply all):
+FILTER CRITERIA (momentum lane — apply all):
 1. Sector quality: The "sector" field may show "Healthcare/Biotechnology" or "Healthcare/Pharmaceuticals" — these carry binary-event risk and warrant extra scrutiny. FDA trial readouts and clinical data events are high-risk. However, use your judgment: Healthcare/Biotech stocks with clear business catalysts (such as earnings beats, strategic transactions, M&A, partnership agreements, contract wins, or product launches) can be strong momentum setups. This list of example catalysts is not exhaustive — if a confirmed, material catalyst exists, weigh it accordingly. Avoid energy stocks unless oil prices are trending up. Favor Technology, Consumer, and Industrial sectors with clear momentum drivers.
 2. Volume/momentum: Use the "rvol" field (relative volume vs 20-day average) when available. rvol >= 2.0 is a strong signal; rvol < 1.0 means below-average activity — deprioritize. Also factor in "chg" (price change %) as a momentum indicator.
 3. Market cap sweet spot: Favor $50M–$500M market cap. Too small (<$10M) means illiquid and manipulable; too large (>$1B) means less explosive moves.
@@ -157,6 +172,7 @@ CANDIDATES:
 RESPOND with a JSON object containing two keys:
 - "selected": array of up to {max_survivors} candidates to keep (only include genuinely strong setups), each with:
   - "symbol": the stock ticker (string)
+  - "lane": "momentum" or "reversal" (string)
   - "reasoning": one sentence explaining why this candidate was selected (string)
 - "dropped": array of ALL remaining candidates that were NOT selected, each with:
   - "symbol": the stock ticker (string)
@@ -165,8 +181,8 @@ RESPOND with a JSON object containing two keys:
 Example response format:
 {{
   "selected": [
-    {{"symbol": "ABCD", "reasoning": "High volume surge in tech sector, 85% bullish on StockTwits with 45k watchers"}},
-    {{"symbol": "EFGH", "reasoning": "Consumer sector breakout with 3x average volume and strong price action"}}
+    {{"symbol": "ABCD", "lane": "momentum", "reasoning": "High volume surge in tech sector, 85% bullish on StockTwits with 45k watchers"}},
+    {{"symbol": "EFGH", "lane": "reversal", "reasoning": "5x volume green day 8% off 52-week low after 40% monthly decline - accumulation reversal"}}
   ],
   "dropped": [
     {{"symbol": "IJKL", "reason": "Biotech with pending FDA decision - binary risk too high"}},

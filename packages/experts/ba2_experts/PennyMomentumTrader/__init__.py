@@ -37,12 +37,14 @@ from ba2_experts.PennyMomentumTrader.settings import SETTINGS_DEFINITIONS
 from ba2_experts.PennyMomentumTrader.screening import ScreeningPhasesMixin
 from ba2_experts.PennyMomentumTrader.monitoring import MonitoringPhasesMixin
 from ba2_experts.PennyMomentumTrader.data_gathering import DataGatheringMixin
+from ba2_experts.PennyMomentumTrader.postmortem import PostmortemMixin
 
 
 class PennyMomentumTrader(
     ScreeningPhasesMixin,
     MonitoringPhasesMixin,
     DataGatheringMixin,
+    PostmortemMixin,
     LiveExpertInterface,
 ):
     """

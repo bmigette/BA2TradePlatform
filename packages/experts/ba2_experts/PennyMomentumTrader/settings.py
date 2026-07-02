@@ -120,6 +120,21 @@ SETTINGS_DEFINITIONS: Dict[str, Any] = {
                 "valid_values": ["fmp"],
                 "tooltip": "Stock screener data source.",
             },
+            "split_guard_enabled": {
+                "type": "bool",
+                "required": False,
+                "default": True,
+                "description": "Drop scan candidates with a stock split effective within ±1 day",
+                "tooltip": (
+                    "Reverse-split transition days produce bogus screener prints (e.g. a ~$11 "
+                    "stock shown at $0.56 on its 1:20 split day), admitting mid-caps into the "
+                    "penny scan and faking huge gains. When enabled, the FMP split calendar is "
+                    "fetched once per scan and any symbol with a split effective within ±1 "
+                    "calendar day of today is filtered out. A second price-continuity layer "
+                    "drops rows whose price is >50% away from previousClose while the quoted "
+                    "day-change is <20% (a data-discontinuity signature)."
+                ),
+            },
             # Triage/monitoring limits
             "max_scan_candidates": {
                 "type": "int",
@@ -185,6 +200,31 @@ SETTINGS_DEFINITIONS: Dict[str, Any] = {
                 "default": 14,
                 "description": "Maximum days to hold a position before forced exit",
                 "tooltip": "Safety net: positions held longer than this are closed automatically. Set high enough to ride multi-day trends; exit conditions handle normal exits.",
+            },
+            "trail_after_max_holding": {
+                "type": "bool",
+                "required": False,
+                "default": True,
+                "description": "Trail profitable positions at max_holding_days instead of flat-closing",
+                "tooltip": (
+                    "When a position reaches max_holding_days AT A PROFIT, do not market-close "
+                    "it. Instead the stop is tightened to max(current stop, high-watermark × "
+                    "(1 - trailing_stop_pct/100)) and the position keeps running, re-tightening "
+                    "on every monitoring tick (ratchet-only — the stop never loosens). "
+                    "Positions at a LOSS at max_holding_days are still flat-closed (time stop "
+                    "for dead money). Prevents the time stop from flattening winners."
+                ),
+            },
+            "trailing_stop_pct": {
+                "type": "float",
+                "required": False,
+                "default": 8.0,
+                "description": "Trailing stop distance (%) below the high-watermark",
+                "tooltip": (
+                    "Distance of the ratcheting trailing stop below the position's highest "
+                    "observed price, used once trail_after_max_holding activates. "
+                    "8.0 = stop trails 8% below the high-watermark."
+                ),
             },
             "min_confidence_threshold": {
                 "type": "int",
@@ -341,6 +381,34 @@ SETTINGS_DEFINITIONS: Dict[str, Any] = {
                     "from yesterday's close, the entry is skipped. "
                     "25.0 = skip if stock is up more than 25% on the day. "
                     "Set to 0.0 to disable the guard."
+                ),
+            },
+            # EOD / retrospective
+            "filter_postmortem_enabled": {
+                "type": "bool",
+                "required": False,
+                "default": True,
+                "description": "Run the automated filter post-mortem during EOD wrap-up",
+                "tooltip": (
+                    "Each EOD, the analysis run from ~5 trading days ago is re-examined: "
+                    "5-day forward returns are computed per funnel stage (scanned, "
+                    "quick-filter rejected, triage rejected, triaged, entered, expired) "
+                    "against current FMP quotes, excluding split-affected symbols. Results "
+                    "are persisted as a 'filter_postmortem' output on the current analysis "
+                    "and missed winners (rejected/expired symbols that ran >= +25%) are "
+                    "highlighted. Fail-soft: errors never break the scan pipeline."
+                ),
+            },
+            "eod_flat": {
+                "type": "bool",
+                "required": False,
+                "default": False,
+                "description": "Close ALL open positions at EOD wrap-up (day-trade mode)",
+                "tooltip": (
+                    "Opt-in overnight gap control: when enabled, phase 6 EOD wrap-up "
+                    "market-closes every open position of this expert, eliminating "
+                    "overnight gap-through-stop risk (e.g. a -15% gap through a 7% stop). "
+                    "Default off — swing positions are held overnight."
                 ),
             },
 }

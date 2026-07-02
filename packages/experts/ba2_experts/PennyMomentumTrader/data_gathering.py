@@ -36,6 +36,44 @@ class DataGatheringMixin:
         data = resp.json()
         return data if isinstance(data, list) else []
 
+    def _fetch_split_symbols(self, from_date: str, to_date: str) -> set:
+        """Fetch symbols with a stock split effective in [from_date, to_date] (inclusive).
+
+        Uses FMP /api/v3/stock_split_calendar. Dates are "YYYY-MM-DD" strings.
+        Fail-soft by design: any error (missing key, HTTP failure, bad payload)
+        logs a warning and returns an empty set so callers simply skip the
+        split-based filtering instead of breaking the scan pipeline.
+        """
+        from ba2_common.config import get_app_setting
+        from ba2_providers.fmp_common import fmp_http_get
+
+        try:
+            api_key = get_app_setting("FMP_API_KEY")
+            if not api_key:
+                self.logger.warning(
+                    "FMP_API_KEY not configured — split calendar unavailable"
+                )
+                return set()
+            resp = fmp_http_get(
+                "https://financialmodelingprep.com/api/v3/stock_split_calendar",
+                {"from": from_date, "to": to_date, "apikey": api_key},
+                endpoint="stock_split_calendar",
+                timeout=15,
+            )
+            data = resp.json()
+            if not isinstance(data, list):
+                return set()
+            return {
+                (item.get("symbol") or "").upper()
+                for item in data
+                if isinstance(item, dict) and item.get("symbol")
+            }
+        except Exception as e:
+            self.logger.warning(
+                f"Split calendar fetch failed ({from_date}..{to_date}): {e}"
+            )
+            return set()
+
     def _fetch_quotes_chunked(
         self, symbols: List[str], chunk_size: int = 50
     ) -> Dict[str, Dict[str, Any]]:
