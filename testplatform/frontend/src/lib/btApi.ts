@@ -344,3 +344,27 @@ export const listRobustnessRuns = (backtestId: number) =>
   jget<{ runs: RobustnessRun[] }>(`/backtests/robustness?backtest_id=${backtestId}`).then(r => r.runs);
 export const getRobustnessRun = (runId: number) =>
   jget<RobustnessRun>(`/backtests/robustness/${runId}`);
+
+// Fitness-metrics catalog (Task 5/7). Single source of truth for the optimization form's fitness
+// controls — the metric list (with tooltips + trade-scale gating) + the four cap/scale knob
+// defaults. Backend: GET /api/optimization/fitness-options (app/api/strategies.py:optimization_router
+// + app/services/strategy_fitness.py METRICS_CATALOG). The four knobs ride in the optimize request's
+// optimization_config.backtest block; fitness_metric is top-level (see /{id}/optimize).
+export interface FitnessMetricOption {
+  key: string;                       // canonical metric name accepted by compute_fitness
+  aliases: string[];                 // additional accepted fitness_metric spellings
+  label: string;                     // human-friendly UI label
+  description: string;               // one-line tooltip
+  supports_trade_scale: boolean;     // whether the fitness_trade_scale multiplier applies
+  uses_adjusted_under_caps: boolean; // whether an adjusted (cap-aware) variant is ranked under caps
+}
+export interface FitnessKnobDef<T> { default: T; }
+export interface FitnessKnobs {
+  profit_cap_pct: FitnessKnobDef<number>;
+  profit_share_cap_pct: FitnessKnobDef<number>;
+  fitness_trade_scale: FitnessKnobDef<boolean>;
+  fitness_trade_scale_cap: FitnessKnobDef<number>;
+}
+export interface FitnessOptions { metrics: FitnessMetricOption[]; knobs: FitnessKnobs; }
+export const getFitnessOptions = () =>
+  jget<FitnessOptions>('/optimization/fitness-options');

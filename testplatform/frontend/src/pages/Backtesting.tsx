@@ -64,8 +64,8 @@ import RobustnessDialog from '../components/RobustnessDialog';
 import RobustnessResults from '../components/RobustnessResults';
 import ResolvedRulesetView from '../components/ResolvedRulesetView';
 import type { BestParams } from '../lib/resolveRuleset';
-import { getRulesetVocabulary, importLiveEnterMarket, importLiveRuleset, convertLiveRuleset, listTasks, listBacktests, fetchOptSettingsExport, listExperts, optimizeBatch, listRunningOptimizations, fetchBacktestExport, listWorkers, rerunBacktest } from '../lib/btApi';
-import type { ExpertInfo, OptimizeBatchJob, OptimizeBatchBody, RunningOpt, WorkerLite } from '../lib/btApi';
+import { getRulesetVocabulary, importLiveEnterMarket, importLiveRuleset, convertLiveRuleset, listTasks, listBacktests, fetchOptSettingsExport, listExperts, optimizeBatch, listRunningOptimizations, fetchBacktestExport, listWorkers, rerunBacktest, getFitnessOptions } from '../lib/btApi';
+import type { ExpertInfo, OptimizeBatchJob, OptimizeBatchBody, RunningOpt, WorkerLite, FitnessMetricOption, FitnessOptions } from '../lib/btApi';
 import { RunningJobsPanel, RunningJobProgress } from '../components/RunningJobsPanel';
 import { OptimizationJobsTable, OptJobSettingsDetail } from '../components/OptimizationJobsTable';
 import { TopIndividualsTable } from '../components/TopIndividualsTable';
@@ -722,6 +722,27 @@ const Backtesting: React.FC = () => {
   const [optSeed, setOptSeed] = useState(42);
   const [launchingOpt, setLaunchingOpt] = useState(false);
   const [optNotice, setOptNotice] = useState<string | null>(null);
+  // Fitness-metrics catalog + cap/scale knobs (Task 7). The metric list, tooltips and trade-scale
+  // gating come from GET /api/optimization/fitness-options so the UI can never drift from the
+  // backend strategy_fitness catalog. Knob defaults are seeded from the endpoint's knobs block; the
+  // four knobs thread into optimization_config.backtest and fitness_metric stays top-level.
+  const [fitnessOptions, setFitnessOptions] = useState<FitnessMetricOption[] | null>(null);
+  const [optProfitCapPct, setOptProfitCapPct] = useState(2000);
+  const [optProfitShareCapPct, setOptProfitShareCapPct] = useState(25);
+  const [optFitnessTradeScale, setOptFitnessTradeScale] = useState(false);
+  const [optFitnessTradeScaleCap, setOptFitnessTradeScaleCap] = useState(100);
+  // Metrics list actually rendered: prefer the backend catalog, fall back to the static list until
+  // it loads (or if the fetch fails).
+  const fitnessMetricList = fitnessOptions && fitnessOptions.length
+    ? fitnessOptions.map(m => ({ value: m.key, label: m.label, description: m.description }))
+    : FITNESS_METRICS.map(m => ({ value: m.value, label: m.label, description: undefined as string | undefined }));
+  // The catalog entry for the currently-selected metric (matched by canonical key OR any alias).
+  const selectedFitnessOption = fitnessOptions?.find(
+    m => m.key === optFitnessMetric || m.aliases.includes(optFitnessMetric),
+  );
+  // Trade-scale controls are disabled when the selected metric doesn't support the multiplier
+  // (e.g. max_drawdown, consistent_annual_return). Until the catalog loads we allow it (enabled).
+  const tradeScaleSupported = selectedFitnessOption ? selectedFitnessOption.supports_trade_scale : true;
   // Distributed workers to fan trials out to (the master is always a worker too; empty = local).
   const [availableWorkers, setAvailableWorkers] = useState<WorkerLite[]>([]);
   const [selectedWorkerIds, setSelectedWorkerIds] = useState<Set<number>>(new Set());
@@ -746,6 +767,19 @@ const Backtesting: React.FC = () => {
     if (!showOptimizeDialog && !showBatchDialog) return;
     listWorkers().then(setAvailableWorkers).catch(() => setAvailableWorkers([]));
   }, [showOptimizeDialog, showBatchDialog]);
+  // Fetch the fitness-metrics catalog + knob defaults once, when either optimize dialog first opens.
+  useEffect(() => {
+    if ((!showOptimizeDialog && !showBatchDialog) || fitnessOptions) return;
+    getFitnessOptions()
+      .then((opts: FitnessOptions) => {
+        setFitnessOptions(opts.metrics);
+        setOptProfitCapPct(opts.knobs.profit_cap_pct.default);
+        setOptProfitShareCapPct(opts.knobs.profit_share_cap_pct.default);
+        setOptFitnessTradeScale(opts.knobs.fitness_trade_scale.default);
+        setOptFitnessTradeScaleCap(opts.knobs.fitness_trade_scale_cap.default);
+      })
+      .catch(() => setFitnessOptions([]));
+  }, [showOptimizeDialog, showBatchDialog, fitnessOptions]);
 
   // Worker multi-select shared by the single + batch optimize dialogs. None selected => local only.
   const renderWorkerSelector = () => (
@@ -787,6 +821,70 @@ const Backtesting: React.FC = () => {
     </div>
   );
 
+  // Profit-cap / portfolio-share-cap / trade-frequency-scale knobs (Task 7). Shared by the single +
+  // batch optimize dialogs. Values default from GET /api/optimization/fitness-options knobs; they
+  // thread into optimization_config.backtest. Trade-scale controls auto-disable when the selected
+  // metric's supports_trade_scale is false (e.g. max_drawdown, consistent_annual_return).
+  const renderFitnessKnobs = () => (
+    <div className="border border-gray-200 dark:border-gray-700 rounded-lg p-3 space-y-3">
+      <h4 className="text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
+        Fitness caps &amp; trade-scale
+      </h4>
+      <div className="grid grid-cols-2 gap-3">
+        <div>
+          <label className="block text-xs text-gray-500 dark:text-gray-400 mb-1"
+            title="Per-trade profit cap (% of cost basis). Ranks on the adjusted, cap-aware return-based metric.">
+            Profit cap %
+          </label>
+          <input
+            type="number" min="0" step="10" value={optProfitCapPct}
+            onChange={e => setOptProfitCapPct(parseFloat(e.target.value) || 0)}
+            className="w-full px-2 py-1.5 text-sm border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+          />
+        </div>
+        <div>
+          <label className="block text-xs text-gray-500 dark:text-gray-400 mb-1"
+            title="Portfolio-share cap: max % of net profit any single trade may contribute.">
+            Profit share cap %
+          </label>
+          <input
+            type="number" min="0" max="100" step="1" value={optProfitShareCapPct}
+            onChange={e => setOptProfitShareCapPct(parseFloat(e.target.value) || 0)}
+            className="w-full px-2 py-1.5 text-sm border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+          />
+        </div>
+      </div>
+      <div>
+        <label className={`flex items-center gap-2 text-sm ${tradeScaleSupported ? 'text-gray-700 dark:text-gray-300' : 'text-gray-400 dark:text-gray-500 cursor-not-allowed'}`}
+          title="Down-weight statistically thin, few-trade configs by an avg-trades-per-year scale.">
+          <input
+            type="checkbox"
+            className="rounded"
+            checked={tradeScaleSupported && optFitnessTradeScale}
+            disabled={!tradeScaleSupported}
+            onChange={e => setOptFitnessTradeScale(e.target.checked)}
+          />
+          Scale fitness by trade frequency
+        </label>
+        {!tradeScaleSupported && (
+          <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">Not applicable for this metric.</p>
+        )}
+      </div>
+      <div>
+        <label className={`block text-xs mb-1 ${tradeScaleSupported ? 'text-gray-500 dark:text-gray-400' : 'text-gray-400 dark:text-gray-500'}`}
+          title="Clamp on avg trades/year before scaling (100/yr = factor 1.0 break-even).">
+          Trade-scale cap (trades/yr)
+        </label>
+        <input
+          type="number" min="1" step="1" value={optFitnessTradeScaleCap}
+          disabled={!tradeScaleSupported || !optFitnessTradeScale}
+          onChange={e => setOptFitnessTradeScaleCap(parseInt(e.target.value) || 0)}
+          className="w-full px-2 py-1.5 text-sm border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 disabled:opacity-50 disabled:cursor-not-allowed"
+        />
+      </div>
+    </div>
+  );
+
   const runBatchOptimization = async () => {
     if (loadedStrategyId == null) { setBatchNotice('Load or save a strategy first.'); return; }
     if (batchSelected.size === 0) { setBatchNotice('Select at least one expert.'); return; }
@@ -804,6 +902,12 @@ const Backtesting: React.FC = () => {
         commission,
         slippage,
         enable_short: allowShort,  // seed symmetric short entry + RM sell gate when shorting on
+        // Fitness cap/scale knobs (Task 5/7) — read per-trial by strategy_optimization_handler.
+        // Trade-scale is force-off for metrics that don't support it (max_drawdown / CAR).
+        profit_cap_pct: optProfitCapPct,
+        profit_share_cap_pct: optProfitShareCapPct,
+        fitness_trade_scale: tradeScaleSupported ? optFitnessTradeScale : false,
+        fitness_trade_scale_cap: optFitnessTradeScaleCap,
       };
       const body: OptimizeBatchBody = {
         experts: [...batchSelected],
@@ -2132,6 +2236,15 @@ const Backtesting: React.FC = () => {
       window.scrollTo({ top: 0, behavior: 'smooth' });  // bring the run/result panel into view
       // Backend OptimizeRequest folds top-level expert_params into optimization_config.
       // The backtest block is source-aware: expert sends expert/universe; ml sends model/datasets.
+      // Fitness cap/scale knobs (Task 5/7) — ride in optimization_config.backtest, read per-trial by
+      // strategy_optimization_handler using these exact keys. Trade-scale is force-off for metrics
+      // that don't support the multiplier (max_drawdown / consistent_annual_return).
+      const fitnessKnobs = {
+        profit_cap_pct: optProfitCapPct,
+        profit_share_cap_pct: optProfitShareCapPct,
+        fitness_trade_scale: tradeScaleSupported ? optFitnessTradeScale : false,
+        fitness_trade_scale_cap: optFitnessTradeScaleCap,
+      };
       const backtestBlock: Record<string, unknown> = source === 'expert'
         ? {
             engine: 'daily',
@@ -2144,6 +2257,7 @@ const Backtesting: React.FC = () => {
             commission,
             slippage,
             enable_short: allowShort,  // seed symmetric short entry + RM sell gate when shorting on
+            ...fitnessKnobs,
           }
         : {
             engine: 'ml',
@@ -2157,6 +2271,7 @@ const Backtesting: React.FC = () => {
             position_sizing_value: positionSizingValue,
             commission,
             slippage,
+            ...fitnessKnobs,
           };
       const body: Record<string, unknown> = {
         name: `Optimize ${loadedStrategyName} (${optFitnessMetric})`,
@@ -3991,12 +4106,16 @@ const Backtesting: React.FC = () => {
                     <select
                       value={optFitnessMetric}
                       onChange={e => setOptFitnessMetric(e.target.value)}
+                      title={selectedFitnessOption?.description}
                       className="w-full px-2 py-1.5 text-sm border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
                     >
-                      {FITNESS_METRICS.map(m => (
-                        <option key={m.value} value={m.value}>{m.label}</option>
+                      {fitnessMetricList.map(m => (
+                        <option key={m.value} value={m.value} title={m.description}>{m.label}</option>
                       ))}
                     </select>
+                    {selectedFitnessOption?.description && (
+                      <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">{selectedFitnessOption.description}</p>
+                    )}
                   </div>
                   <div>
                     <label className="block text-xs text-gray-500 dark:text-gray-400 mb-1">Search</label>
@@ -4074,6 +4193,8 @@ const Backtesting: React.FC = () => {
                     </div>
                   </div>
                 </div>
+
+                {renderFitnessKnobs()}
 
                 {/* Screener-settings optimization (P1.4). Shown when the universe is a screener
                     with at least one metric range toggled to Opt — an OPTIONAL metric-store path
@@ -4176,8 +4297,9 @@ const Backtesting: React.FC = () => {
                 <div>
                   <label className="block text-xs text-gray-500 dark:text-gray-400 mb-1">Fitness Metric</label>
                   <select value={optFitnessMetric} onChange={e => setOptFitnessMetric(e.target.value)}
+                    title={selectedFitnessOption?.description}
                     className="w-full px-2 py-1.5 text-sm border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
-                    {FITNESS_METRICS.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
+                    {fitnessMetricList.map(m => <option key={m.value} value={m.value} title={m.description}>{m.label}</option>)}
                   </select>
                 </div>
                 <div>
@@ -4217,6 +4339,7 @@ const Backtesting: React.FC = () => {
                   ))}
                 </div>
               )}
+              <div className="mb-3">{renderFitnessKnobs()}</div>
               <div className="mb-3">{renderWorkerSelector()}</div>
               <div className="flex justify-end gap-3">
                 <button onClick={() => setShowBatchDialog(false)}
