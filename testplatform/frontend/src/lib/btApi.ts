@@ -255,3 +255,92 @@ export const optimizeBatch = (b: OptimizeBatchBody) =>
 export interface WorkerLite { id: number; name: string; isEnabled: boolean; isLocal: boolean; status: string; }
 export const listWorkers = () =>
   jget<WorkerLite[]>('/workers').then(ws => ws.filter(w => !w.isLocal));
+
+// ---------------------------------------------------------------------------
+// Robustness suite (Task 6): Monte-Carlo over saved trades + schedule variants.
+// Shapes confirmed EXACTLY against backend/app/api/backtests.py (_robustness_run_out,
+// MonteCarloConfig/ScheduleConfig/RobustnessRequest) and services/backtest/monte_carlo.py
+// (run_monte_carlo output) + robustness_handler.collect_schedule_results (schedule_summary).
+// The GET/POST routes serialise snake_case (NOT the model's camelCase to_dict).
+// ---------------------------------------------------------------------------
+export interface RobustnessRequestBody {
+  backtest_ids: number[];
+  monte_carlo: {
+    enabled: boolean;
+    n_paths: number;
+    seed: number;
+    methods: string[];      // subset of "bootstrap" | "shuffle" | "jitter"
+    drop_k: number[];       // e.g. [1,2,3]
+    jitter_bp: number;
+  };
+  schedule: {
+    enabled: boolean;
+    day_variants: boolean;
+    time_variants: string[]; // ["10:30","12:30","15:00"]
+  };
+}
+export interface RobustnessLaunchRun {
+  backtest_id: number;
+  kind: 'monte_carlo' | 'schedule';
+  robustness_run_id: number;
+  status: string;
+}
+// summarize_paths(...) band: percentile keys per metric.
+export interface McBand { p5: number; p25: number; p50: number; p75: number; p95: number; }
+// One method summary (bands per metric + probabilities). consistency is optional (soft-dep).
+export interface McMethodSummary {
+  annualized_return: McBand;
+  max_drawdown: McBand;
+  calmar: McBand;
+  n_paths: number;
+  prob_target_annual: number; // fraction 0..1 (ann >= target, default target 30%)
+  prob_dd_breach: number;     // fraction 0..1 (dd <= -limit, default limit 20%)
+  consistency?: number;
+}
+export interface McDropKRow {
+  k: number;
+  dropped: number[];          // dropped trade pnl_pct values (highest first)
+  final_equity: number;
+  annualized_return: number;
+  max_drawdown: number;
+  calmar: number;
+}
+export interface McResults {
+  methods: Record<string, McMethodSummary>;
+  drop_k: McDropKRow[];
+  n_trades: number;
+  years: number;
+}
+export interface ScheduleVariantRow {
+  backtest_id: number;
+  name: string;
+  status: string;
+  annualized_return: number | null;
+  total_return: number | null;
+  max_drawdown: number | null;
+  calmar: number | null;
+  sharpe: number | null;
+  total_trades: number | null;
+}
+export interface ScheduleResults {
+  schedule_summary?: ScheduleVariantRow[];
+  ann_return_spread?: number;
+}
+export interface RobustnessRun {
+  robustness_run_id: number;
+  backtest_id: number;
+  kind: 'monte_carlo' | 'schedule';
+  status: string;             // pending | running | completed | failed
+  params: Record<string, unknown> | null;
+  results: (McResults & ScheduleResults) | null;
+  variant_backtest_ids: number[];
+  error_message: string | null;
+  created_at: string | null;
+  completed_at: string | null;
+}
+export const launchRobustness = (body: RobustnessRequestBody) =>
+  jpost<{ runs: RobustnessLaunchRun[] }>('/backtests/robustness', body);
+export const listRobustnessRuns = (backtestId: number) =>
+  jget<{ runs: RobustnessRun[] }>(`/backtests/robustness?backtest_id=${backtestId}`).then(r => r.runs);
+export const getRobustnessRun = (runId: number) =>
+  jget<RobustnessRun>(`/backtests/robustness/${runId}`);

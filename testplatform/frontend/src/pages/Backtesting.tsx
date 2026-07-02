@@ -60,6 +60,8 @@ import { RuleIO } from '../components/RuleIO';
 import TradeChartModal from '../components/TradeChartModal';
 import { GeneCountPreview } from '../components/GeneCountPreview';
 import { RunHistoryTable } from '../components/RunHistoryTable';
+import RobustnessDialog from '../components/RobustnessDialog';
+import RobustnessResults from '../components/RobustnessResults';
 import ResolvedRulesetView from '../components/ResolvedRulesetView';
 import type { BestParams } from '../lib/resolveRuleset';
 import { getRulesetVocabulary, importLiveEnterMarket, importLiveRuleset, convertLiveRuleset, listTasks, listBacktests, fetchOptSettingsExport, listExperts, optimizeBatch, listRunningOptimizations, fetchBacktestExport, listWorkers, rerunBacktest } from '../lib/btApi';
@@ -913,6 +915,15 @@ const Backtesting: React.FC = () => {
 
   // Tab state for New Backtest card
   const [backtestCardTab, setBacktestCardTab] = useState<'new' | 'history' | 'saved' | 'jobs' | 'optjobs'>('new');
+  // Robustness (Task 6): multi-select of saved rows in the Saved tab -> a "Robustness…" dialog.
+  // `robustnessSelected` holds selected backtest ids; `robustnessNames` maps id->name for the dialog.
+  // `robustnessLaunched` holds the ids that have (at least one) launched run -> their results panels
+  // render + poll. `robustnessRefresh` is bumped on launch to force an immediate refetch.
+  const [robustnessSelected, setRobustnessSelected] = useState<Set<number>>(new Set());
+  const [robustnessNames, setRobustnessNames] = useState<Record<number, string>>({});
+  const [showRobustnessDialog, setShowRobustnessDialog] = useState(false);
+  const [robustnessLaunched, setRobustnessLaunched] = useState<Set<number>>(new Set());
+  const [robustnessRefresh, setRobustnessRefresh] = useState(0);
   const [runningJobCount, setRunningJobCount] = useState(0);
   useEffect(() => {
     let alive = true;
@@ -3651,9 +3662,63 @@ const Backtesting: React.FC = () => {
                 />
               </div>
             ) : (
-              /* Saved Backtests Tab — fills the viewport height like History */
-              <div className="h-[calc(100vh-15rem)] overflow-y-auto pr-4 [scrollbar-gutter:stable]">
-                <RunHistoryTable savedOnly={true} onSelect={viewBacktest} onLoad={loadBacktestIntoForm} selectedId={selectedBacktest?.id ?? null} />
+              /* Saved Backtests Tab — fills the viewport height like History. Adds a robustness
+                 toolbar + row checkboxes (saved/completed daily_expert rows only) + per-backtest
+                 results panels for any launched runs. */
+              <div className="h-[calc(100vh-15rem)] overflow-y-auto pr-4 [scrollbar-gutter:stable] space-y-3">
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowRobustnessDialog(true)}
+                    disabled={robustnessSelected.size === 0}
+                    className="px-3 py-1.5 text-sm rounded-md bg-blue-600 hover:bg-blue-700 text-white disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+                    title={robustnessSelected.size === 0 ? 'Select ≥1 saved daily_expert row first' : 'Stress-test the selected backtests'}
+                  >
+                    <Shield size={15} />
+                    Robustness…{robustnessSelected.size > 0 ? ` (${robustnessSelected.size})` : ''}
+                  </button>
+                  {robustnessSelected.size > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setRobustnessSelected(new Set())}
+                      className="px-2 py-1.5 text-sm border border-gray-300 dark:border-gray-600 rounded text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700"
+                    >
+                      Clear selection
+                    </button>
+                  )}
+                  <span className="text-xs text-gray-500 dark:text-gray-400 ml-auto">
+                    Only saved + completed daily_expert runs are selectable.
+                  </span>
+                </div>
+                <RunHistoryTable
+                  savedOnly={true}
+                  onSelect={viewBacktest}
+                  onLoad={loadBacktestIntoForm}
+                  selectedId={selectedBacktest?.id ?? null}
+                  selectable
+                  selectedIds={robustnessSelected}
+                  isSelectable={(r) =>
+                    (r.isSaved ?? r.is_saved) &&
+                    (r.engineType ?? r.engine_type) === 'daily_expert' &&
+                    ((r.status ?? '') === 'completed')
+                  }
+                  onToggleSelect={(r) => {
+                    setRobustnessSelected(prev => {
+                      const next = new Set(prev);
+                      if (next.has(r.id)) next.delete(r.id); else next.add(r.id);
+                      return next;
+                    });
+                    setRobustnessNames(prev => ({ ...prev, [r.id]: r.name }));
+                  }}
+                />
+                {[...robustnessLaunched].map(id => (
+                  <RobustnessResults
+                    key={id}
+                    backtestId={id}
+                    backtestName={robustnessNames[id]}
+                    refreshKey={robustnessRefresh}
+                  />
+                ))}
               </div>
             )}
           </div>
@@ -4376,6 +4441,18 @@ const Backtesting: React.FC = () => {
         message={confirmDialog.message}
         variant={confirmDialog.variant}
         confirmText="Delete"
+      />
+
+      <RobustnessDialog
+        isOpen={showRobustnessDialog}
+        backtestIds={[...robustnessSelected]}
+        backtestNames={robustnessNames}
+        onClose={() => setShowRobustnessDialog(false)}
+        onLaunched={(ids) => {
+          setRobustnessLaunched(prev => new Set([...prev, ...ids]));
+          setRobustnessRefresh(n => n + 1);
+          setShowRobustnessDialog(false);
+        }}
       />
     </div>
   );

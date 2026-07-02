@@ -26,8 +26,12 @@ function fmtDrawdown(v: unknown): string {
   return Number.isFinite(n) ? `${n.toFixed(1)}%` : '—';
 }
 
-export function RunHistoryTable({ savedOnly, onSelect, onLoad, selectedId }:
-  { savedOnly: boolean; onSelect: (id: number) => void; onLoad?: (id: number) => void; selectedId?: number | null; }) {
+export function RunHistoryTable({ savedOnly, onSelect, onLoad, selectedId, selectable, selectedIds, onToggleSelect, isSelectable }:
+  { savedOnly: boolean; onSelect: (id: number) => void; onLoad?: (id: number) => void; selectedId?: number | null;
+    // Robustness multi-select (Task 6). When `selectable` is on, a leading checkbox column appears;
+    // `isSelectable(row)` gates which rows can be checked (e.g. saved+completed daily_expert only).
+    selectable?: boolean; selectedIds?: Set<number>; onToggleSelect?: (row: any) => void;
+    isSelectable?: (row: any) => boolean; }) {
   const [rows, setRows] = useState<any[]>([]);
   // Filters / search / sort persist for the session (sessionStorage) — survive reloads + tab
   // switches. The Saved tab and the BT-History tab are separate instances; key by `savedOnly` so
@@ -225,6 +229,7 @@ export function RunHistoryTable({ savedOnly, onSelect, onLoad, selectedId }:
       <table className="w-full text-sm">
         <thead className="bg-gray-50 dark:bg-gray-700 border-b border-gray-200 dark:border-gray-600">
           <tr>
+            {selectable && <th className="px-2 py-1 w-6" />}
             {columns.map(c => (
               <th key={c.key} onClick={() => toggleSort(c.key)}
                 className="px-2 py-1 text-left text-xs font-medium text-gray-700 dark:text-gray-300 cursor-pointer select-none hover:text-gray-900 dark:hover:text-gray-100 whitespace-nowrap">
@@ -241,6 +246,20 @@ export function RunHistoryTable({ savedOnly, onSelect, onLoad, selectedId }:
                 r.id === selectedId
                   ? 'bg-blue-50 dark:bg-blue-900/30 ring-1 ring-inset ring-blue-400 dark:ring-blue-600'
                   : 'hover:bg-gray-50 dark:hover:bg-gray-700'}`}>
+              {selectable && (
+                <td className="px-2 py-1 w-6" onClick={(e) => e.stopPropagation()}>
+                  {(!isSelectable || isSelectable(r)) ? (
+                    <input
+                      type="checkbox"
+                      checked={selectedIds?.has(r.id) ?? false}
+                      onChange={() => onToggleSelect?.(r)}
+                      title="Select for robustness stress-test"
+                    />
+                  ) : (
+                    <input type="checkbox" disabled title="Only saved/completed daily_expert runs are selectable" />
+                  )}
+                </td>
+              )}
               <td className="px-2 py-1 text-sm text-gray-900 dark:text-gray-100">{r.id}</td>
               <td className="px-2 py-1 text-sm text-gray-900 dark:text-gray-100">{(r.expertName ?? r.expert_name) ?? (r.modelName ?? r.model_name) ?? r.engineType ?? '—'}</td>
               <td className="px-2 py-1 text-sm text-gray-900 dark:text-gray-100">{(r.optimizationId ?? r.optimization_id) ?? '—'}</td>
