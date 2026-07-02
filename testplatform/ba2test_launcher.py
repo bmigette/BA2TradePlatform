@@ -2187,7 +2187,11 @@ def main(argv: "list | None" = None) -> int:
     op.add_argument("--universe", required=True, help="Comma-separated symbols.")
     op.add_argument("--start", required=True, help="ISO start date.")
     op.add_argument("--end", required=True, help="ISO end date.")
-    op.add_argument("--fitness", default="sharpe_ratio", help="Fitness metric (default sharpe_ratio).")
+    op.add_argument("--fitness", default="sharpe_ratio",
+                    help="Fitness metric (default sharpe_ratio). 'consistent_annual_return' (aliases "
+                         "'car'/'goal') targets ~30%%/yr EVERY year: (adjusted) annualized return, "
+                         "hard >=30 trades/yr gate, soft drawdown penalty beyond 20%%, x worst-year/"
+                         "mean-year consistency (--fitness-trade-scale is a no-op for it).")
     op.add_argument("--generations", type=int, default=6)
     op.add_argument("--population", type=int, default=10)
     op.add_argument("--parallel", type=int, default=4, help="Parallel trials (ThreadPoolExecutor).")
@@ -2262,7 +2266,9 @@ def main(argv: "list | None" = None) -> int:
     ob.add_argument("--universe", required=True, help="Comma-separated symbols (shared by all jobs).")
     ob.add_argument("--start", required=True, help="ISO start date.")
     ob.add_argument("--end", required=True, help="ISO end date.")
-    ob.add_argument("--fitness", default="calmar_ratio", help="Fitness metric (default calmar_ratio).")
+    ob.add_argument("--fitness", default="calmar_ratio",
+                    help="Fitness metric (default calmar_ratio). See optimize --fitness for "
+                         "'consistent_annual_return' ('car'/'goal').")
     ob.add_argument("--generations", type=int, default=8)
     ob.add_argument("--population", type=int, default=40)
     ob.add_argument("--parallel", type=int, default=6, help="Process-pool workers per job.")
