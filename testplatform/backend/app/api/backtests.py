@@ -706,6 +706,48 @@ async def create_daily_backtest(
     return {"taskId": task_id, "backtestId": db_backtest.id, **db_backtest.to_dict()}
 
 
+# Robustness GET routes are declared BEFORE the catch-all ``/{backtest_id}`` so that the literal
+# path segment ``robustness`` is matched here rather than tried (and rejected 422) as an int id.
+@router.get("/robustness")
+async def list_robustness(backtest_id: int, db: Session = Depends(get_db)):
+    """List the robustness runs (status + results) for a backtest, newest first."""
+    from app.models.backtest import RobustnessRun
+
+    bt = db.query(Backtest).filter(Backtest.id == backtest_id).first()
+    if not bt:
+        raise HTTPException(status_code=404, detail=f"Backtest {backtest_id} not found")
+
+    runs = (
+        db.query(RobustnessRun)
+        .filter(RobustnessRun.backtest_id == backtest_id)
+        .order_by(RobustnessRun.id.desc())
+        .all()
+    )
+    return {"runs": [_robustness_run_out(r) for r in runs]}
+
+
+@router.get("/robustness/{run_id}")
+async def get_robustness_run(run_id: int, db: Session = Depends(get_db)):
+    """Get one robustness run's status + results.
+
+    For a ``schedule`` run we first call ``collect_schedule_results`` lazily so a polling client sees
+    completion (once every variant row is terminal, its headline metrics are snapshotted into
+    ``results``) before we serialise the row."""
+    from app.models.backtest import RobustnessRun
+    from app.services import robustness_handler
+
+    run = db.query(RobustnessRun).filter(RobustnessRun.id == run_id).first()
+    if not run:
+        raise HTTPException(status_code=404, detail=f"Robustness run {run_id} not found")
+
+    if run.kind == "schedule" and run.status not in ("completed", "failed"):
+        # Lazily collect (idempotent, fail-soft, uses its own session); refresh to see any update.
+        robustness_handler.collect_schedule_results(run.id)
+        db.refresh(run)
+
+    return _robustness_run_out(run)
+
+
 @router.get("/{backtest_id}")
 async def get_backtest(
     backtest_id: int,
@@ -760,6 +802,138 @@ async def backtest_whatif(
         "equityCurve": res.pop("equity_curve"),
         "drawdownCurve": res.pop("drawdown_curve"),
         "metrics": res,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Robustness (Task 4): Monte-Carlo over saved trades + schedule-variant re-runs.
+# ---------------------------------------------------------------------------
+class MonteCarloConfig(BaseModel):
+    """Monte-Carlo knobs (only read when ``enabled``). ``methods`` is the subset of the
+    path-resampling methods (bootstrap/shuffle/jitter); ``drop_k`` drives the separate drop-K-best
+    table. Explicit values (no hidden defaults on the load-bearing ones)."""
+    enabled: bool = False
+    n_paths: int = 1000
+    seed: int = 42
+    methods: List[str] = ["bootstrap", "shuffle"]
+    drop_k: List[int] = [1, 2, 3]
+    jitter_bp: float = 0.0
+
+
+class ScheduleConfig(BaseModel):
+    """Schedule-variant knobs (only read when ``enabled``): weekly entry-DAY sweep (Mon..Fri) and/or
+    a list of entry-TIME shifts."""
+    enabled: bool = False
+    day_variants: bool = True
+    time_variants: List[str] = []
+
+
+class RobustnessRequest(BaseModel):
+    """Launch one or more robustness stress-tests over a set of saved backtests.
+
+    Per (backtest_id, enabled-kind) ONE ``RobustnessRun`` is created. Monte-Carlo runs INLINE in the
+    request (it is sub-second over the parent's persisted trades) so a polling client sees the
+    result on the first GET. Schedule variants are queued on the dedicated re-run pool (the variant
+    Backtest rows run asynchronously; the GET path collects their headline metrics lazily)."""
+    backtest_ids: List[int]
+    monte_carlo: MonteCarloConfig = MonteCarloConfig()
+    schedule: ScheduleConfig = ScheduleConfig()
+
+
+@router.post("/robustness")
+async def launch_robustness(request: RobustnessRequest, db: Session = Depends(get_db)):
+    """Create + launch robustness runs for the requested backtests.
+
+    Guards (fail-early): 404 for an unknown backtest_id; 400 when schedule is enabled for a
+    non-``daily_expert`` backtest; 400 when Monte-Carlo is enabled but the backtest has no persisted
+    trades. Returns the created run ids: ``{"runs": [{backtest_id, kind, robustness_run_id,
+    status}...]}``.
+    """
+    from app.models.backtest import RobustnessRun
+    from app.services import robustness_handler
+
+    # Validate ALL requested backtests + their enabled-kind preconditions BEFORE creating any row,
+    # so a bad request never leaves half-created runs behind.
+    backtests: dict = {}
+    for bid in request.backtest_ids:
+        bt = db.query(Backtest).filter(Backtest.id == bid).first()
+        if not bt:
+            raise HTTPException(status_code=404, detail=f"Backtest {bid} not found")
+        if request.monte_carlo.enabled and not (bt.trades or []):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Backtest {bid} has no trades to Monte-Carlo",
+            )
+        if request.schedule.enabled and bt.engine_type != "daily_expert":
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"schedule variants are only supported for daily_expert backtests "
+                    f"(backtest {bid} is '{bt.engine_type}')"
+                ),
+            )
+        backtests[bid] = bt
+
+    runs_out: List[dict] = []
+    for bid in request.backtest_ids:
+        if request.monte_carlo.enabled:
+            mc_cfg = {
+                "n_paths": request.monte_carlo.n_paths,
+                "seed": request.monte_carlo.seed,
+                "methods": request.monte_carlo.methods,
+                "drop_k": request.monte_carlo.drop_k,
+                "jitter_bp": request.monte_carlo.jitter_bp,
+            }
+            run = RobustnessRun(backtest_id=bid, kind="monte_carlo", params=mc_cfg, status="pending")
+            db.add(run)
+            db.commit()
+            db.refresh(run)
+            # MC is sub-second over persisted trades -> run inline (fail-soft inside the handler,
+            # which opens its own session and sets status completed/failed).
+            robustness_handler.run_monte_carlo_for_backtest(run.id)
+            db.refresh(run)
+            runs_out.append({
+                "backtest_id": bid,
+                "kind": "monte_carlo",
+                "robustness_run_id": run.id,
+                "status": run.status,
+            })
+
+        if request.schedule.enabled:
+            sc_cfg = {
+                "day_variants": request.schedule.day_variants,
+                "time_variants": request.schedule.time_variants,
+            }
+            run = RobustnessRun(backtest_id=bid, kind="schedule", params=sc_cfg, status="pending")
+            db.add(run)
+            db.commit()
+            db.refresh(run)
+            # Creates + queues the variant Backtest rows on the re-run pool (fail-soft inside).
+            robustness_handler.launch_schedule_variants(run.id)
+            db.refresh(run)
+            runs_out.append({
+                "backtest_id": bid,
+                "kind": "schedule",
+                "robustness_run_id": run.id,
+                "status": run.status,
+            })
+
+    return {"runs": runs_out}
+
+
+def _robustness_run_out(run) -> dict:
+    """Serialise a RobustnessRun for the API (snake_case, matching this router's other payloads)."""
+    return {
+        "robustness_run_id": run.id,
+        "backtest_id": run.backtest_id,
+        "kind": run.kind,
+        "status": run.status,
+        "params": run.params,
+        "results": run.results,
+        "variant_backtest_ids": run.variant_backtest_ids or [],
+        "error_message": run.error_message,
+        "created_at": run.created_at.isoformat() if run.created_at else None,
+        "completed_at": run.completed_at.isoformat() if run.completed_at else None,
     }
 
 
