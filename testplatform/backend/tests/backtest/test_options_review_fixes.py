@@ -1,4 +1,4 @@
-"""Review fixes F1-F5 from reports/options_backtest_review_2026-07-01.md.
+"""Review fixes F1-F9 from reports/options_backtest_review_2026-07-01.md.
 
   F1  strategy-aware defined-risk widths: an iron condor's bound is the wider WING
       (max(k2-k1, k4-k3)), not the widest adjacent gap (usually the body); a
@@ -11,6 +11,16 @@
   F4  a forced STOCK liquidation persists a synthetic FILLED closing order.
   F5  an option-lot liquidation with no premium bar books max(intrinsic, entry),
       never break-even at the very moment of a margin blow-up.
+  F6  the per-bar option-book scans (_option_group_bounds / _lot_order) are memoized
+      on a generation counter — byte-identical results, no per-bar full-order scans.
+  F7  a fill-time cash-secured cap (single-leg or debit-combo rescale) syncs the
+      shared Transaction row's quantity.
+  F8  Alpaca-mirror expiry: a long ITM leg auto-exercises ONLY when cash/shares/margin
+      support it (else sold to close at the expiry premium — no shares); a short ITM
+      leg is ALWAYS physically assigned, with a next-bar broker cleanup sale when the
+      assignment leaves cash negative.
+  F9  combo expiry writes the net payoff per contract-share to txn.close_price
+      (was hardcoded 0.0).
 
 Run from the backend dir:
     ./venv/bin/python -m pytest tests/backtest/test_options_review_fixes.py -q
@@ -60,7 +70,7 @@ def _make_ps(symbol, bars, clock):
     return ps
 
 
-def _account(tmp_path, tag, ps, chain_underlying, chain, bar_rows):
+def _account(tmp_path, tag, ps, chain_underlying, chain, bar_rows, cfg=CFG):
     from app.services.backtest.backtest_db import backtest_trading_db, seed_account_definition
     from app.services.backtest.seam_wiring import wire_backtest_seams
     from app.services.backtest.backtest_account import BacktestAccount
@@ -77,8 +87,8 @@ def _account(tmp_path, tag, ps, chain_underlying, chain, bar_rows):
     wire_backtest_seams()
     ctx = backtest_trading_db(tag)
     ctx.__enter__()
-    seed_account_definition(1, CFG)
-    acct = BacktestAccount(1, ps, CFG, options_provider=prov)
+    seed_account_definition(1, cfg)
+    acct = BacktestAccount(1, ps, cfg, options_provider=prov)
     wire_backtest_seams().register_account(1, acct)
     return acct, ctx
 
@@ -456,3 +466,344 @@ def test_option_liquidation_no_bar_floored_at_entry(tmp_path):
         assert acct._cash == pytest.approx(10_000.0, abs=1.0)
     finally:
         ctx.__exit__(None, None, None)
+
+
+# ---------------------------------------------------------------------------
+# F6 — option-book scan memoization (generation-keyed, byte-identical)
+# ---------------------------------------------------------------------------
+def test_group_bounds_memoized_and_invalidation_recomputes(acct_asym_iron_condor):
+    """Repeated calls serve the SAME memoized objects; invalidate_order_cache() forces a
+    recompute whose result is value-identical."""
+    acct, ps = acct_asym_iron_condor
+    cg1, gb1 = acct._option_group_bounds()
+    cg2, gb2 = acct._option_group_bounds()
+    assert cg2 is cg1 and gb2 is gb1          # memo hit — no rescan
+    acct.invalidate_order_cache()
+    cg3, gb3 = acct._option_group_bounds()
+    assert cg3 is not cg1                     # recomputed after invalidation...
+    assert cg3 == cg1 and gb3 == gb1          # ...and byte-identical
+
+    # _lot_order is served from the generation-keyed index (same instance back).
+    o1 = acct._lot_order(_IC_SC)
+    assert o1 is acct._lot_order(_IC_SC)
+    assert o1 is not None and o1.strike == 105.0
+
+
+def test_group_bounds_refresh_when_fill_creates_new_lot(tmp_path):
+    """A fill mutates orders IN PLACE (no invalidate_order_cache), yet creates a NEW held
+    lot that _option_group_bounds must report — the new-lot generation bump covers the gap."""
+    ps = _make_ps("AAPL", _aapl_180_bars(), datetime(2024, 3, 5))
+    acct, ctx = _account(tmp_path, "f6nl", ps, "AAPL",
+                         [_c(_CC_A, 200.0)], [_bar(_CC_A, "2024-03-06", 3.0, "call", 200.0)])
+    try:
+        acct.submit_option_order(
+            legs=[_leg(_CC_A, OrderDirection.SELL, OptionRight.CALL, 200.0)],
+            quantity=1, order_type="market", option_strategy="naked_call",
+        )
+        cg_before, _ = acct._option_group_bounds()   # memoize BEFORE the fill
+        assert _CC_A not in cg_before                # not held yet
+        acct.refresh_orders()                        # fill -> new lot, in-place mutation only
+        cg_after, _ = acct._option_group_bounds()
+        assert _CC_A in cg_after                     # memo refreshed without an invalidate call
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+# ---------------------------------------------------------------------------
+# F7 — fill-time caps sync Transaction.quantity
+# ---------------------------------------------------------------------------
+def test_cap_single_leg_syncs_transaction_quantity(tmp_path):
+    """A LONG single-leg entry capped at fill time (10 -> 6 contracts affordable) must write
+    the capped CONTRACT count to the shared Transaction row."""
+    ps = _make_ps("AAPL", _aapl_180_bars(), datetime(2024, 3, 5))
+    acct, ctx = _account(tmp_path, "f7sl", ps, "AAPL",
+                         [_c(_CC_A, 200.0)], [_bar(_CC_A, "2024-03-06", 15.0, "call", 200.0)])
+    try:
+        acct.submit_option_order(
+            legs=[_leg(_CC_A, OrderDirection.BUY, OptionRight.CALL, 200.0)],
+            quantity=10, order_type="market", option_strategy="long_call",
+        )
+        acct.refresh_orders()       # cost 10 x 15 x 100 = 15,000 > 10,000 -> capped to 6
+        acct.refresh_transactions()
+
+        assert acct._option_positions[_CC_A].qty == 6
+        txn = acct._option_transaction_for_contract(_CC_A)
+        assert txn is not None
+        assert txn.quantity == pytest.approx(6.0)   # was left at 10 before the fix
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_debit_combo_rescale_syncs_transaction_quantity(tmp_path):
+    """A DEBIT combo rescaled at fill time (50 -> 33 structures affordable) must write the
+    capped STRUCTURE count to the shared Transaction row."""
+    lc, sc = "AAPL240315C00180000", "AAPL240315C00190000"
+    ps = _make_ps("AAPL", _aapl_180_bars(), datetime(2024, 3, 5))
+    chain = [_c(lc, 180.0), _c(sc, 190.0)]
+    bar_rows = [_bar(lc, "2024-03-06", 5.0, "call", 180.0),
+                _bar(sc, "2024-03-06", 2.0, "call", 190.0)]
+    acct, ctx = _account(tmp_path, "f7ml", ps, "AAPL", chain, bar_rows)
+    try:
+        acct.submit_option_order(
+            legs=[_leg(lc, OrderDirection.BUY, OptionRight.CALL, 180.0),
+                  _leg(sc, OrderDirection.SELL, OptionRight.CALL, 190.0)],
+            quantity=50, order_type="market", option_strategy="bull_call_spread",
+        )
+        acct.refresh_orders()   # debit 3.0/share = $300/structure; 10,000 // 300 = 33
+        acct.refresh_transactions()
+
+        assert acct._option_positions[lc].qty == 33
+        txn = acct._option_transaction_for_contract(lc)
+        assert txn is not None
+        assert txn.quantity == pytest.approx(33.0)  # was left at 50 before the fix
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+# ---------------------------------------------------------------------------
+# F8 — Alpaca-mirror expiry policy (supportability-gated exercise / physical
+#      assignment with next-bar cleanup)
+# ---------------------------------------------------------------------------
+_LC180 = "AAPL240315C00180000"
+_LP180 = "AAPL240315P00180000"
+
+
+def _f8_bars(expiry_close, next_open):
+    return [
+        {"Date": datetime(2024, 3, 5), "Open": 180, "High": 181, "Low": 179, "Close": 180, "Volume": 100},
+        {"Date": datetime(2024, 3, 6), "Open": 180, "High": 181, "Low": 179, "Close": 180, "Volume": 100},
+        {"Date": datetime(2024, 3, 15), "Open": expiry_close, "High": expiry_close + 1,
+         "Low": expiry_close - 1, "Close": expiry_close, "Volume": 100},
+        {"Date": datetime(2024, 3, 18), "Open": next_open, "High": next_open + 1,
+         "Low": next_open - 1, "Close": next_open, "Volume": 100},
+    ]
+
+
+def _f8_engine(acct, ps):
+    from app.services.backtest.daily_engine import DailyBacktestEngine
+
+    eng = DailyBacktestEngine.__new__(DailyBacktestEngine)
+    eng.account = acct
+    eng.price = ps
+    eng.config = CFG
+    return eng
+
+
+def _f8_open(acct, sym, side, ot, strike, qty, strategy):
+    acct.submit_option_order(legs=[_leg(sym, side, ot, strike)], quantity=qty,
+                             order_type="market", option_strategy=strategy)
+    acct.refresh_orders()
+    acct.refresh_transactions()
+
+
+def test_long_itm_call_affordable_exercises_to_shares(tmp_path):
+    """(a) Exercise cost (18,000) fits in cash (100k) -> PHYSICAL: 100 shares at the strike."""
+    ps = _make_ps("AAPL", _f8_bars(200, 200), datetime(2024, 3, 5))
+    acct, ctx = _account(tmp_path, "f8a", ps, "AAPL", [_c(_LC180, 180.0)],
+                         [_bar(_LC180, "2024-03-06", 4.0, "call", 180.0)],
+                         cfg=dict(CFG, starting_cash=100_000.0))
+    try:
+        _f8_open(acct, _LC180, OrderDirection.BUY, OptionRight.CALL, 180.0, 1, "long_call")
+        cash_after_entry = acct._cash
+        ps.set_clock(datetime(2024, 3, 15))
+        _f8_engine(acct, ps)._apply_option_expiry(datetime(2024, 3, 15))
+
+        assert acct.get_option_positions() == []
+        aapl = [p for p in acct.get_positions() if p["symbol"] == "AAPL"]
+        assert len(aapl) == 1 and aapl[0]["qty"] == 100
+        assert aapl[0]["avg_price"] == pytest.approx(180.0)
+        assert acct._cash == pytest.approx(cash_after_entry - 18_000.0, abs=1.0)
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_long_itm_call_unaffordable_sold_to_close_at_premium(tmp_path):
+    """(b) Exercise cost (18,000) exceeds cash (~9,600) -> sold to close at the expiry bar's
+    premium close; cash credited, NO share position."""
+    ps = _make_ps("AAPL", _f8_bars(200, 200), datetime(2024, 3, 5))
+    bar_rows = [_bar(_LC180, "2024-03-06", 4.0, "call", 180.0),
+                _bar(_LC180, "2024-03-15", 20.5, "call", 180.0)]
+    acct, ctx = _account(tmp_path, "f8b1", ps, "AAPL", [_c(_LC180, 180.0)], bar_rows)
+    try:
+        _f8_open(acct, _LC180, OrderDirection.BUY, OptionRight.CALL, 180.0, 1, "long_call")
+        assert acct._cash == pytest.approx(9_600.0, abs=1.0)
+        ps.set_clock(datetime(2024, 3, 15))
+        _f8_engine(acct, ps)._apply_option_expiry(datetime(2024, 3, 15))
+
+        assert acct.get_option_positions() == []
+        assert [p for p in acct.get_positions() if p["symbol"] == "AAPL"] == []  # NO shares
+        assert acct._cash == pytest.approx(9_600.0 + 20.5 * 100.0, abs=1.0)
+        closes = [o for o in acct.get_orders() if o.comment == "option_expiry_close"]
+        assert len(closes) == 1
+        assert closes[0].open_price == pytest.approx(20.5)  # synthetic close at the premium
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_long_itm_call_unaffordable_no_bar_settles_intrinsic_same_nlv(tmp_path):
+    """(b) No expiry premium bar -> sold to close at INTRINSIC; net-liquidating value equals
+    what PHYSICAL settlement would have produced at the expiry bar (no free leverage lost or
+    gained), with no share position."""
+    ps = _make_ps("AAPL", _f8_bars(200, 200), datetime(2024, 3, 5))
+    acct, ctx = _account(tmp_path, "f8b2", ps, "AAPL", [_c(_LC180, 180.0)],
+                         [_bar(_LC180, "2024-03-06", 4.0, "call", 180.0)])
+    try:
+        _f8_open(acct, _LC180, OrderDirection.BUY, OptionRight.CALL, 180.0, 1, "long_call")
+        cash_after_entry = acct._cash                       # 9,600
+        ps.set_clock(datetime(2024, 3, 15))
+        _f8_engine(acct, ps)._apply_option_expiry(datetime(2024, 3, 15))
+
+        assert [p for p in acct.get_positions() if p["symbol"] == "AAPL"] == []
+        # intrinsic 20/share -> +2,000 cash.
+        assert acct._cash == pytest.approx(cash_after_entry + 2_000.0, abs=1.0)
+        # PHYSICAL equivalent NLV at the expiry bar: cash - strike*100 + spot*100.
+        physical_nlv = cash_after_entry - 180.0 * 100.0 + 200.0 * 100.0
+        assert acct.equity() == pytest.approx(physical_nlv, abs=1.0)
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_long_itm_put_with_held_shares_delivers_at_strike(tmp_path):
+    """(c) Protective put: held 100 shares cover the delivery -> PHYSICAL: shares sold at
+    the strike (position flat, cash credited at strike)."""
+    ps = _make_ps("AAPL", _f8_bars(170, 170), datetime(2024, 3, 5))
+    acct, ctx = _account(tmp_path, "f8c", ps, "AAPL", [_p(_LP180, 180.0)],
+                         [_bar(_LP180, "2024-03-06", 5.0, "put", 180.0)])
+    try:
+        acct._update_position("AAPL", 100, 180.0)  # the protected shares
+        _f8_open(acct, _LP180, OrderDirection.BUY, OptionRight.PUT, 180.0, 1, "protective_put")
+        cash_after_entry = acct._cash              # 9,500
+        ps.set_clock(datetime(2024, 3, 15))
+        _f8_engine(acct, ps)._apply_option_expiry(datetime(2024, 3, 15))
+
+        assert acct.get_option_positions() == []
+        assert [p for p in acct.get_positions() if p["symbol"] == "AAPL"] == []  # delivered
+        assert acct._cash == pytest.approx(cash_after_entry + 18_000.0, abs=1.0)
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_long_itm_put_no_shares_equity_supports_short(tmp_path):
+    """(d) No held shares but equity covers the short's 30% maintenance (5,400 <= ~10,000)
+    -> PHYSICAL: a SHORT stock position at the strike is created."""
+    ps = _make_ps("AAPL", _f8_bars(170, 170), datetime(2024, 3, 5))
+    acct, ctx = _account(tmp_path, "f8d1", ps, "AAPL", [_p(_LP180, 180.0)],
+                         [_bar(_LP180, "2024-03-06", 5.0, "put", 180.0)])
+    try:
+        _f8_open(acct, _LP180, OrderDirection.BUY, OptionRight.PUT, 180.0, 1, "long_put")
+        cash_after_entry = acct._cash              # 9,500
+        ps.set_clock(datetime(2024, 3, 15))
+        _f8_engine(acct, ps)._apply_option_expiry(datetime(2024, 3, 15))
+
+        aapl = [p for p in acct.get_positions() if p["symbol"] == "AAPL"]
+        assert len(aapl) == 1 and aapl[0]["qty"] == -100
+        assert aapl[0]["avg_price"] == pytest.approx(180.0)
+        assert acct._cash == pytest.approx(cash_after_entry + 18_000.0, abs=1.0)
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_long_itm_put_no_shares_no_support_sold_to_close(tmp_path):
+    """(d) 3 contracts: the short's maintenance (30% x 180 x 300 = 16,200) exceeds equity
+    (~10,000) -> sold to close at intrinsic; NO short stock is created."""
+    ps = _make_ps("AAPL", _f8_bars(170, 170), datetime(2024, 3, 5))
+    acct, ctx = _account(tmp_path, "f8d2", ps, "AAPL", [_p(_LP180, 180.0)],
+                         [_bar(_LP180, "2024-03-06", 5.0, "put", 180.0)])
+    try:
+        _f8_open(acct, _LP180, OrderDirection.BUY, OptionRight.PUT, 180.0, 3, "long_put")
+        cash_after_entry = acct._cash              # 8,500
+        ps.set_clock(datetime(2024, 3, 15))
+        _f8_engine(acct, ps)._apply_option_expiry(datetime(2024, 3, 15))
+
+        assert [p for p in acct.get_positions() if p["symbol"] == "AAPL"] == []  # NO short
+        # intrinsic 10/share x 3 x 100 = +3,000 cash.
+        assert acct._cash == pytest.approx(cash_after_entry + 3_000.0, abs=1.0)
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_short_put_assignment_negative_cash_cleaned_up_next_bar(tmp_path):
+    """(e) A short-put assignment ALWAYS delivers (cash goes negative), then the broker
+    cleanup sells just enough of the ASSIGNED shares at the NEXT bar's open to restore
+    cash >= 0, persisting an ``assignment_liquidation`` closing order."""
+    ps = _make_ps("AAPL", _f8_bars(170, 170), datetime(2024, 3, 5))
+    acct, ctx = _account(tmp_path, "f8e", ps, "AAPL", [_p(_LP180, 180.0)],
+                         [_bar(_LP180, "2024-03-06", 2.5, "put", 180.0)])
+    try:
+        _f8_open(acct, _LP180, OrderDirection.SELL, OptionRight.PUT, 180.0, 2, "naked_put")
+        assert acct._cash == pytest.approx(10_500.0, abs=1.0)  # +500 credit
+        ps.set_clock(datetime(2024, 3, 15))
+        _f8_engine(acct, ps)._apply_option_expiry(datetime(2024, 3, 15))
+
+        # PHYSICAL assignment: +200 shares @180 -> cash 10,500 - 36,000 = -25,500.
+        aapl = [p for p in acct.get_positions() if p["symbol"] == "AAPL"]
+        assert aapl[0]["qty"] == 200
+        assert aapl[0]["avg_price"] == pytest.approx(180.0)
+        assert acct._cash == pytest.approx(-25_500.0, abs=1.0)
+
+        # NEXT bar (open 170): sell ceil(25,500 / 170) = 150 of the 200 assigned shares.
+        ps.set_clock(datetime(2024, 3, 18))
+        assert acct.process_pending_assignment_liquidations() is True
+        assert acct._cash >= 0.0
+        assert acct._cash == pytest.approx(0.0, abs=1.0)
+        aapl = [p for p in acct.get_positions() if p["symbol"] == "AAPL"]
+        assert aapl[0]["qty"] == 50                       # 200 assigned - 150 sold
+        closes = [o for o in acct.get_orders() if o.comment == "assignment_liquidation"]
+        assert len(closes) == 1
+        assert closes[0].status == OrderStatus.FILLED
+        assert closes[0].side == OrderDirection.SELL
+        assert closes[0].filled_qty == pytest.approx(150.0)
+        assert closes[0].open_price == pytest.approx(170.0)  # the next bar's OPEN
+        # Once satisfied, nothing stays pending.
+        assert acct.process_pending_assignment_liquidations() is False
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_short_call_assignment_bounded_by_maintenance_path(tmp_path):
+    """(f) A naked short-call assignment still creates SHORT stock (physical, unchanged);
+    the resulting short is governed by the existing 30% maintenance path — no duplicate
+    cleanup is scheduled and no liquidation fires while equity covers it."""
+    ps = _make_ps("AAPL", _f8_bars(200, 200), datetime(2024, 3, 5))
+    acct, ctx = _account(tmp_path, "f8f", ps, "AAPL", [_c(_LC180, 180.0)],
+                         [_bar(_LC180, "2024-03-06", 4.0, "call", 180.0)])
+    try:
+        _f8_open(acct, _LC180, OrderDirection.SELL, OptionRight.CALL, 180.0, 1, "naked_call")
+        ps.set_clock(datetime(2024, 3, 15))
+        _f8_engine(acct, ps)._apply_option_expiry(datetime(2024, 3, 15))
+
+        aapl = [p for p in acct.get_positions() if p["symbol"] == "AAPL"]
+        assert aapl[0]["qty"] == -100
+        assert acct._pending_assignment_sells == {}       # sale credits cash: no cleanup
+        # Short stock carries the 30% maintenance requirement; equity covers it -> no call.
+        assert acct.maintenance_margin_requirement() == pytest.approx(0.30 * 200.0 * 100.0)
+        assert acct.maybe_margin_call_liquidation() is False
+        assert acct._positions["AAPL"].qty == -100        # untouched
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+# ---------------------------------------------------------------------------
+# F9 — combo expiry writes the net payoff per contract-share to txn.close_price
+# ---------------------------------------------------------------------------
+def test_combo_expiry_close_price_carries_net_payoff(acct_asym_iron_condor):
+    """The condor settles at net -5.0/contract-share at spot 130 (call wing breached) —
+    txn.close_price must carry that, not a hardcoded 0.0."""
+    from ba2_common.core.db import get_instance
+    from ba2_common.core.models import Transaction
+    from app.services.backtest.daily_engine import DailyBacktestEngine
+
+    acct, ps = acct_asym_iron_condor
+    txn = acct._option_transaction_for_contract(_IC_SC)
+    assert txn is not None
+
+    eng = DailyBacktestEngine.__new__(DailyBacktestEngine)
+    eng.account = acct
+    eng.price = ps
+    eng.config = CFG
+    ps.set_clock(datetime(2024, 3, 15))
+    eng._apply_option_expiry(datetime(2024, 3, 15))
+
+    settled = get_instance(Transaction, txn.id)
+    # net payoff -500 over 100 x 1 structure -> -5.0 per contract-share.
+    assert settled.close_price == pytest.approx(-5.0)

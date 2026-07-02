@@ -53,6 +53,7 @@ Field/enum names verified against the installed ba2_common:
 from __future__ import annotations
 
 import bisect
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -202,6 +203,26 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # opened_position_snapshot. Empty dict means "nothing cached yet".
         self._opened_txn_snapshot: Dict[int, Dict[str, List[tuple]]] = {}
 
+        # Generation counter for the OPTIONS memoizations below (_option_group_bounds and the
+        # _lot_order index) — the per-bar equity mark + margin check re-ran full get_orders()
+        # scans O(orders x lots) on options runs. Bumped by invalidate_order_cache() (every
+        # order-CREATION site already calls it) AND at the in-place mutation points the order
+        # cache deliberately skips: a NEW option lot appearing at fill time
+        # (_update_option_position) and a fill-time quantity cap/rescale
+        # (_cap_single_leg_option_entry / _fill_multi_leg_parent) — those change what the
+        # memos must report without any new order row.
+        self._option_memo_gen: int = 0
+        # (generation, contract_group, group_bounds) memo for _option_group_bounds.
+        self._group_bounds_memo: Optional[tuple] = None
+        # contract_symbol -> the order carrying the contract's terms (first row with a strike,
+        # same first-match rule the un-memoized scan used). Rebuilt when the generation moves.
+        self._lot_order_index: Optional[Dict[str, TradingOrder]] = None
+        self._lot_order_index_gen: int = -1
+        # F8 (Alpaca-mirror expiry): symbol -> share count ASSIGNED by a short-put expiry that
+        # left cash negative; process_pending_assignment_liquidations sells just enough of them
+        # at the NEXT bar's open to restore cash >= 0 (broker post-assignment liquidation).
+        self._pending_assignment_sells: Dict[str, float] = {}
+
     # ======================================================================
     # Settings
     # ======================================================================
@@ -274,11 +295,13 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
     #: (credit) combos are worth [-width, 0]. Undefined-risk structures (short strangle/straddle,
     #: put ratio, jade lizard — an uncovered short leg) are NOT clamped (the margin-liquidation
     #: path bounds those); single-leg and equity marks are unchanged.
+    # Only strategies an action actually emits belong here — "debit_spread"/"credit_spread"
+    # were dead entries (no builder emits them) implying coverage that didn't exist.
     DEFINED_RISK_LONG_STRATEGIES = frozenset(
-        {"bull_call_spread", "bear_put_spread", "call_butterfly", "debit_spread"}
+        {"bull_call_spread", "bear_put_spread", "call_butterfly"}
     )
     DEFINED_RISK_SHORT_STRATEGIES = frozenset(
-        {"bear_call_spread", "iron_condor", "credit_spread"}
+        {"bear_call_spread", "iron_condor"}
     )
 
     def _option_positions_mtm(self) -> float:
@@ -377,24 +400,22 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
 
         Used to mark a held DEFINED-RISK leg when the sparse cache has no premium bar this tick:
         ``max(0, spot-strike)`` for a call, ``max(0, strike-spot)`` for a put. Resolves the leg's
-        strike / option_type / underlying from its order; returns None if unresolvable (caller
-        then falls back to the entry premium).
+        strike / option_type / underlying from its order (via the ``_lot_order`` index — no
+        per-bar full-order scan); returns None if unresolvable (caller then falls back to the
+        entry premium).
         """
-        for o in self.get_orders():
-            if getattr(o, "contract_symbol", None) != contract_symbol:
-                continue
-            if o.strike is None or o.option_type is None:
-                return None
-            underlying = getattr(o, "underlying_symbol", None) or o.symbol
-            spot = self._price.close_at(underlying)
-            if spot is None:
-                spot = self._price.close_asof(underlying)
-            if spot is None:
-                return None
-            if o.option_type == OptionRight.CALL:
-                return max(0.0, float(spot) - float(o.strike))
-            return max(0.0, float(o.strike) - float(spot))
-        return None
+        o = self._lot_order(contract_symbol)
+        if o is None or o.option_type is None:
+            return None
+        underlying = getattr(o, "underlying_symbol", None) or o.symbol
+        spot = self._price.close_at(underlying)
+        if spot is None:
+            spot = self._price.close_asof(underlying)
+        if spot is None:
+            return None
+        if o.option_type == OptionRight.CALL:
+            return max(0.0, float(spot) - float(o.strike))
+        return max(0.0, float(o.strike) - float(spot))
 
     @staticmethod
     def _defined_risk_width_per_structure(strategy: Optional[str], strikes) -> Optional[float]:
@@ -441,13 +462,23 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
 
         Width is derived from the FULL set of the structure's OPENING legs (all strikes), so it is
         stable even after a leg has been assigned/settled and dropped out of the held lots.
+
+        MEMOIZED on ``_option_memo_gen`` (the equity mark + margin check call this every bar;
+        the full order scans dominated options-run profiles). Every input change moves the
+        generation: order rows via invalidate_order_cache(), new held lots / fill-time quantity
+        caps via their own bumps (see __init__). Pure caching — results are byte-identical.
         """
+        memo = self._group_bounds_memo
+        if memo is not None and memo[0] == self._option_memo_gen:
+            return memo[1], memo[2]
+
         held = self._option_positions
+        orders = self.get_orders()  # ONE fetch reused by all three passes below
         # parent order id -> (strategy, structure quantity, [opening strikes], multiplier)
         parent_info: Dict[int, Dict[str, Any]] = {}
         single_info: Dict[str, Dict[str, Any]] = {}
         # collect opening legs' strikes per parent + parent strategy/qty
-        for o in self.get_orders():
+        for o in orders:
             if getattr(o, "asset_class", None) != AssetClass.OPTION:
                 continue
             if o.parent_order_id is None:
@@ -468,7 +499,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                             "multiplier": float(o.multiplier or 100),
                         }
         # opening child legs contribute their strikes to the parent group
-        for o in self.get_orders():
+        for o in orders:
             if getattr(o, "asset_class", None) != AssetClass.OPTION:
                 continue
             if o.parent_order_id is not None and o.parent_order_id in parent_info and o.strike is not None:
@@ -487,7 +518,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         for cs in held:
             # find the order that owns this contract to route it to its group
             owner = None
-            for o in self.get_orders():
+            for o in orders:
                 if getattr(o, "contract_symbol", None) == cs and getattr(o, "asset_class", None) == AssetClass.OPTION:
                     owner = o
                     break
@@ -504,6 +535,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             contract_group[cs] = gkey
             if gkey not in group_bounds:
                 group_bounds[gkey] = {"strategy": info["strategy"], "width": _width(info)}
+        self._group_bounds_memo = (self._option_memo_gen, contract_group, group_bounds)
         return contract_group, group_bounds
 
     def equity(self) -> float:
@@ -551,6 +583,14 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 continue  # short call covered by long shares -> no naked margin
             strike, spot = self._lot_strike_and_spot(lot.contract_symbol)
             if strike is None:
+                # An unresolvable strike UNDERSTATES the requirement (this short leg
+                # contributes nothing) — never silently.
+                logger.warning(
+                    "[backtest] maintenance margin: no order resolves a strike for held "
+                    "short option lot %s — its margin contribution is SKIPPED "
+                    "(requirement understated).",
+                    lot.contract_symbol,
+                )
                 continue
             req += self.naked_margin_per_contract(strike, spot=spot) * abs(lot.qty)
         # Short stock.
@@ -592,11 +632,20 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         The lot ledger keeps only qty/premium; the strike / option_type / underlying live on
         the option ``TradingOrder``. Returns None when no order with a strike resolves (callers
         then skip or fall back rather than guessing).
+
+        Served from a ``contract_symbol -> order`` index built ONCE per ``_option_memo_gen``
+        (the per-lot full-order scan was O(orders x lots) per bar on options runs). Same
+        first-row-with-a-strike rule as the un-indexed scan, so results are byte-identical.
         """
-        for o in self.get_orders():
-            if o.contract_symbol == contract_symbol and o.strike is not None:
-                return o
-        return None
+        if self._lot_order_index is None or self._lot_order_index_gen != self._option_memo_gen:
+            idx: Dict[str, TradingOrder] = {}
+            for o in self.get_orders():
+                cs = o.contract_symbol
+                if cs and o.strike is not None and cs not in idx:
+                    idx[cs] = o
+            self._lot_order_index = idx
+            self._lot_order_index_gen = self._option_memo_gen
+        return self._lot_order_index.get(contract_symbol)
 
     def _lot_strike_and_spot(self, contract_symbol: str):
         """(strike, underlying_spot) for a held option lot, resolved from its FILLED order.
@@ -662,7 +711,11 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         """
         if self._options is None:
             return False
-        if self.equity() >= self.maintenance_margin_requirement() and self.equity() >= 0:
+        # Compute equity + requirement ONCE per breach check (each re-runs the option-book
+        # scans; the old inline check computed equity twice and both run EVERY bar).
+        eq = self.equity()
+        req = self.maintenance_margin_requirement()
+        if eq >= req and eq >= 0:
             return False
 
         liquidated = False
@@ -677,8 +730,10 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         covered_calls = self._covered_short_call_contracts()
         # Unwind naked short OPTION legs first (the unbounded-risk exposure), largest lot first,
         # re-checking the breach after each close so we stop as soon as margin is satisfied.
+        # eq/req are recomputed ONCE per liquidation (each close changes both), not per
+        # comparison.
         while True:
-            if self.equity() >= self.maintenance_margin_requirement() and self.equity() >= 0:
+            if eq >= req and eq >= 0:
                 break
             short_lots = [
                 l for l in self._option_positions.values()
@@ -692,10 +747,12 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             if not self._liquidate_option_lot(lot):
                 break
             liquidated = True
+            eq = self.equity()
+            req = self.maintenance_margin_requirement()
 
         # Then unwind short STOCK if still breaching.
         while True:
-            if self.equity() >= self.maintenance_margin_requirement() and self.equity() >= 0:
+            if eq >= req and eq >= 0:
                 break
             shorts = [p for p in self._positions.values() if p.qty < 0]
             if not shorts:
@@ -704,6 +761,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             if not self._liquidate_stock_position(pos):
                 break
             liquidated = True
+            eq = self.equity()
+            req = self.maintenance_margin_requirement()
 
         return liquidated
 
@@ -767,20 +826,20 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
 
     def _option_position_for_lot(self, lot: "_OptionLot", txn) -> Optional[OptionPosition]:
         """An OptionPosition describing a held lot (for recording its liquidation close)."""
-        for o in self.get_orders():
-            if o.contract_symbol == lot.contract_symbol and o.strike is not None:
-                return OptionPosition(
-                    contract_symbol=lot.contract_symbol,
-                    underlying=o.underlying_symbol,
-                    option_type=o.option_type,
-                    strike=o.strike,
-                    expiry=o.expiry,
-                    side=(OrderDirection.BUY if lot.qty > 0 else OrderDirection.SELL),
-                    quantity=abs(lot.qty),
-                    avg_entry_price=lot.avg_price,
-                    multiplier=lot.multiplier,
-                )
-        return None
+        o = self._lot_order(lot.contract_symbol)
+        if o is None:
+            return None
+        return OptionPosition(
+            contract_symbol=lot.contract_symbol,
+            underlying=o.underlying_symbol,
+            option_type=o.option_type,
+            strike=o.strike,
+            expiry=o.expiry,
+            side=(OrderDirection.BUY if lot.qty > 0 else OrderDirection.SELL),
+            quantity=abs(lot.qty),
+            avg_entry_price=lot.avg_price,
+            multiplier=lot.multiplier,
+        )
 
     def _liquidate_stock_position(self, pos: "_Position") -> bool:
         """Close a stock position at the current close; book cash + realise P&L via the ledger."""
@@ -806,9 +865,11 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         return True
 
     def _record_stock_liquidation_close(
-        self, symbol: str, qty: float, was_long: bool, px: float
+        self, symbol: str, qty: float, was_long: bool, px: float,
+        comment: str = "margin_call_liquidation",
     ) -> None:
-        """Persist a synthetic FILLED closing order for a margin-call STOCK liquidation.
+        """Persist a synthetic FILLED closing order for a forced STOCK liquidation
+        (margin call, or the Alpaca-mirror post-assignment cleanup — ``comment`` names which).
 
         BOOK-KEEPING only (the caller already moved cash + ledger). Linked to the symbol's
         OPENED equity transaction when one resolves — the entry order's side must match the
@@ -855,7 +916,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             depends_on_order=entry_id,
             open_type=OrderOpenType.AUTOMATIC,
             broker_order_id=self._next_broker_id(),
-            comment="margin_call_liquidation",
+            comment=comment,
             created_at=as_of,
         )
         new_id = add_instance(order)
@@ -992,6 +1053,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         """
         self._order_cache = None
         self._active_order_cache = None
+        # Any order-set change also invalidates the options memos (_option_group_bounds /
+        # the _lot_order index) — they are keyed on this generation, not recomputed per bar.
+        self._option_memo_gen += 1
 
     def opened_position_snapshot(self, expert_id: int) -> Dict[str, List[tuple]]:
         """Expert-scoped snapshot of this account's OPENED transactions, cached + invalidated on
@@ -1391,6 +1455,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             order.status = OrderStatus.CANCELED
             order.quantity = 0
             update_instance(order)
+            self._option_memo_gen += 1  # in-place quantity mutation: refresh the F6 memos
             self._cancel_oco_sibling(order)
             return False
         logger.error(
@@ -1399,7 +1464,27 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             order.contract_symbol, qty, fill_px, self._cash, affordable,
         )
         order.quantity = float(affordable)
+        self._option_memo_gen += 1  # in-place quantity mutation: refresh the F6 memos
+        # Keep the shared Transaction row in sync (it was created at the pre-cap contract
+        # count and otherwise over-reports the position size forever).
+        self._sync_transaction_quantity(order.transaction_id, float(affordable))
         return True
+
+    def _sync_transaction_quantity(self, transaction_id: Optional[int], quantity: float) -> None:
+        """Write a fill-time quantity cap back to the shared Transaction row.
+
+        ``_cap_single_leg_option_entry`` / the debit-combo rescale mutate order quantities at
+        FILL time, after the Transaction was created at the ANALYSIS-time size; without this
+        the transactions table over-reports the position (structures for a combo parent,
+        contracts for a single leg). No-op when the order carries no transaction.
+        """
+        if transaction_id is None:
+            return
+        txn = get_instance(Transaction, transaction_id)
+        if txn is None:
+            return
+        txn.quantity = float(quantity)
+        update_instance(txn)
 
     def _fill_multi_leg_parent(self, parent, as_of: datetime) -> None:
         """ALL-OR-NONE fill of a multi-leg option parent (spread/straddle/...).
@@ -1462,6 +1547,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                     parent.status = OrderStatus.CANCELED
                     parent.quantity = 0
                     update_instance(parent)
+                    self._option_memo_gen += 1  # in-place quantity mutation: refresh F6 memos
                     return
                 logger.error(
                     "BACKTEST option cash-secured: DEBIT combo %s sized %g structures @ $%.2f "
@@ -1477,6 +1563,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 ratio = abs(float(leg.quantity or 0.0)) / structures
                 leg.quantity = ratio * capped
             parent.quantity = capped
+            self._option_memo_gen += 1  # in-place quantity mutation: refresh F6 memos
+            # Keep the shared Transaction row (created at the pre-cap STRUCTURE count) in sync.
+            self._sync_transaction_quantity(parent.transaction_id, float(capped))
 
         net = 0.0
         for leg, px in priced:
@@ -2091,6 +2180,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
 
         This is a deterministic AT-EXPIRY settlement (no next-bar fill, no slippage/commission):
         the option simply resolves on its expiry bar. Returns True if the position was settled.
+        This is the settlement MECHANISM; whether a leg exercises physically or is sold to
+        close is decided by the Alpaca-mirror policy in ``settle_single_leg_expiry``.
 
         MULTI-LEG (strangle/straddle/spread) note: the two/four legs of a spread SHARE one
         ``Transaction`` whose ENTRY is the multi-leg PARENT (which carries NO ``contract_symbol``).
@@ -2142,6 +2233,156 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             )
             update_instance(txn)
         return True
+
+    def settle_single_leg_expiry(self, position: OptionPosition, spot: float) -> bool:
+        """Alpaca-mirror expiry for a SINGLE-LEG (non-defined-risk-combo) option position.
+
+        Mirrors Alpaca's actual expiration handling (docs/support): an ITM long is
+        auto-exercised (>= $0.01 ITM) ONLY IF buying power / shares support it; if not,
+        Alpaca sells the option to close ~1h before expiry while still ITM. ITM shorts are
+        PHYSICALLY assigned after the close; unsupportable resulting positions are then
+        liquidated by the broker. Concretely:
+
+          * OTM -> worthless (transaction closed at premium 0) — unchanged.
+          * LONG CALL ITM: exercise (BUY shares at strike) if ``strike x multiplier x
+            contracts <= cash``; otherwise SELL-TO-CLOSE at the expiry bar's premium close
+            (intrinsic when the sparse cache has no bar — near expiry premium ~ intrinsic).
+            NO share position, cash credited at the premium.
+          * LONG PUT ITM: exercise (SELL shares at strike). Supportable when held long
+            shares cover the delivery (protective put), OR — when it would create SHORT
+            stock — when equity covers the short's maintenance
+            (``SHORT_STOCK_MAINTENANCE_FRACTION x strike x multiplier x contracts``).
+            Otherwise SELL-TO-CLOSE like the call.
+          * SHORT ITM (call or put): ALWAYS physical assignment at the strike, covered or
+            naked. A short-put assignment that leaves cash NEGATIVE schedules a broker-style
+            cleanup: ``process_pending_assignment_liquidations`` sells just enough of the
+            ASSIGNED shares at the NEXT bar's open to restore cash >= 0. (Assigned SHORT
+            stock from a short call is already bounded by the 30% maintenance path.)
+
+        Exercise/assignment cash always moves at the STRIKE; the sell-to-close credit is the
+        only premium-priced leg. Deterministic at-expiry settlement — no slippage/commission,
+        matching ``settle_option_expiry``. Defined-risk combos must NOT be routed here (they
+        unit-settle via ``settle_defined_risk_combo_expiry``).
+        """
+        strike = float(position.strike)
+        is_call = position.option_type == OptionRight.CALL
+        itm = (spot > strike) if is_call else (spot < strike)
+        if not itm:
+            return self.settle_option_expiry(position, close_premium=0.0)
+
+        contracts = float(position.quantity)
+        multiplier = float(position.multiplier or 100)
+        shares = int(position.quantity) * int(multiplier)
+        intrinsic = (spot - strike) if is_call else (strike - spot)
+
+        if position.side == OrderDirection.SELL:
+            # SHORT ITM -> ALWAYS physically assigned (called away / put to us) at the strike.
+            share_side = OrderDirection.SELL if is_call else OrderDirection.BUY
+            ok = self.settle_option_expiry(
+                position, close_premium=intrinsic,
+                share_side=share_side, shares=shares, share_price=strike,
+            )
+            if ok and share_side == OrderDirection.BUY and self._cash < 0:
+                # Assigned short put bought shares the account cannot fund: schedule the
+                # broker cleanup sale of (up to) the assigned shares at the next bar's open.
+                self._pending_assignment_sells[position.underlying] = (
+                    self._pending_assignment_sells.get(position.underlying, 0.0) + shares
+                )
+                logger.warning(
+                    "[backtest] short-put assignment of %d x %s left cash $%.2f — scheduling "
+                    "assignment_liquidation of up to %d shares at the next bar's open.",
+                    shares, position.underlying, self._cash, shares,
+                )
+            return ok
+
+        # LONG ITM: exercise only if the resulting position is supportable (Alpaca rule).
+        if is_call:
+            supported = strike * shares <= self._cash + 1e-6  # exercise cost fits in cash
+            share_side = OrderDirection.BUY
+        else:
+            pos = self._positions.get(position.underlying)
+            held = float(pos.qty) if (pos is not None and pos.qty > 0) else 0.0
+            if held >= shares:
+                supported = True  # protective put: delivers already-held shares
+            else:
+                # Exercising would create SHORT stock: supportable only when equity covers
+                # its maintenance requirement (the existing 30% short-stock rule).
+                supported = (
+                    self.equity()
+                    >= self.SHORT_STOCK_MAINTENANCE_FRACTION * strike * shares
+                )
+            share_side = OrderDirection.SELL
+        if supported:
+            return self.settle_option_expiry(
+                position, close_premium=intrinsic,
+                share_side=share_side, shares=shares, share_price=strike,
+            )
+
+        # NOT supportable -> Alpaca sells the long option to close shortly before expiry.
+        # Price at the expiry bar's premium close; intrinsic when the cache has no bar
+        # (near expiry the premium converges to intrinsic). Cash is credited at the premium;
+        # NO share position is created.
+        bar = self._options.get_bar(position.contract_symbol, self._as_of_date()) if self._options else None
+        premium = float(bar["close"]) if (bar and bar.get("close") is not None) else float(intrinsic)
+        self._cash += premium * multiplier * contracts
+        logger.warning(
+            "[backtest] long %s %s ITM at expiry is NOT supportable (exercise needs %s) — "
+            "sold to close at %.4f (Alpaca pre-expiry liquidation).",
+            "call" if is_call else "put", position.contract_symbol,
+            f"${strike * shares:,.2f} cash" if is_call else "share/margin support", premium,
+        )
+        return self.settle_option_expiry(position, close_premium=premium)
+
+    def process_pending_assignment_liquidations(self) -> bool:
+        """Broker-style cleanup of an unsupported short-put assignment (Alpaca-mirror).
+
+        A short put is ALWAYS physically assigned at expiry, even when buying the shares at
+        the strike drives cash negative; the broker then liquidates enough of the resulting
+        position to restore buying power. Mirror that on the NEXT bar: sell just enough of
+        the ASSIGNED shares at this bar's OPEN to restore cash >= 0 — never more than were
+        assigned, never more than are still held. Each sale persists a synthetic FILLED
+        closing order (comment ``assignment_liquidation``) so the equity move is a visible
+        trade. A symbol with no bar this tick stays pending for the next bar. One dict check
+        when nothing is pending; equity-only runs never schedule anything.
+
+        Returns True when any shares were sold.
+        """
+        if not self._pending_assignment_sells:
+            return False
+        sold_any = False
+        for symbol in list(self._pending_assignment_sells.keys()):
+            if self._cash >= 0:
+                self._pending_assignment_sells.pop(symbol)
+                continue
+            assigned = self._pending_assignment_sells[symbol]
+            pos = self._positions.get(symbol)
+            held = float(pos.qty) if pos is not None else 0.0
+            if held <= 0 or assigned <= 0:
+                self._pending_assignment_sells.pop(symbol)  # nothing left to clean up
+                continue
+            bar = self._price.bar_at(symbol)
+            if bar is None or bar.get("open") is None:
+                continue  # no bar this tick -> retry next bar
+            px = float(bar["open"])
+            if px <= 0:
+                continue
+            to_sell = float(min(assigned, held, float(math.ceil(-self._cash / px))))
+            if to_sell <= 0:
+                self._pending_assignment_sells.pop(symbol)
+                continue
+            self._cash += to_sell * px
+            self._update_position(symbol, -to_sell, px)
+            self._record_stock_liquidation_close(
+                symbol, to_sell, was_long=True, px=px, comment="assignment_liquidation"
+            )
+            logger.warning(
+                "[backtest] assignment_liquidation: sold %g x %s @ %.4f (next-bar open) to "
+                "restore cash >= 0 after short-put assignment; cash now $%.2f.",
+                to_sell, symbol, px, self._cash,
+            )
+            self._pending_assignment_sells.pop(symbol)
+            sold_any = True
+        return sold_any
 
     def defined_risk_combo_strategy(self, position: OptionPosition) -> Optional[str]:
         """Return the DEFINED-RISK ``option_strategy`` of the combo a leg belongs to, else None.
@@ -2219,7 +2460,10 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 lot.avg_price = 0.0
 
         if self._all_legs_resolved(txn):
-            txn.close_price = 0.0
+            # Carry the NET payoff per contract-share on the transaction row (a hardcoded 0.0
+            # threw the realised settlement value away; round-trips had to be consulted).
+            denom = float(positions[0].multiplier or 100) * self._combo_structure_count(txn, positions)
+            txn.close_price = (net_payoff / denom) if denom > 0 else 0.0
             if not txn.close_date:
                 txn.close_date = self._price.now()
             close_transaction_with_logging(
@@ -2249,13 +2493,26 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         width_per = self._defined_risk_width_per_structure(strategy, strikes)
         if width_per is None:
             return None
-        structures = abs(float(entry.quantity)) if (entry is not None and entry.quantity) else 0.0
-        if structures <= 0:
-            structures = min(float(p.quantity) for p in positions)
+        structures = self._combo_structure_count(txn, positions, entry=entry)
         if structures <= 0:
             return None
         multiplier = float(positions[0].multiplier or 100)
         return width_per * multiplier * structures
+
+    def _combo_structure_count(self, txn: Transaction, positions: List[OptionPosition],
+                               entry: Optional[TradingOrder] = None) -> float:
+        """Structure count of a multi-leg combo: the PARENT order's quantity.
+
+        Falls back to ``min(leg quantities)`` when the parent is unresolvable (never
+        ``max`` — that counts a 1-2-1 butterfly's 2x body as the structure count). ``entry``
+        skips the transaction lookup when the caller already resolved it.
+        """
+        if entry is None:
+            entry = self._entry_order_for_transaction(txn)
+        structures = abs(float(entry.quantity)) if (entry is not None and entry.quantity) else 0.0
+        if structures <= 0:
+            structures = min(float(p.quantity) for p in positions)
+        return structures
 
     def _record_option_expiry_close(
         self, txn: Transaction, position: OptionPosition, close_premium: float
@@ -2744,6 +3001,10 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         if lot is None:
             lot = _OptionLot(contract_symbol=contract_symbol, multiplier=multiplier)
             self._option_positions[contract_symbol] = lot
+            # A NEW held contract changes _option_group_bounds' contract->group mapping, but a
+            # fill mutates in place (no invalidate_order_cache) — bump the memo generation so
+            # the F6 memos refresh. Adds to an EXISTING lot change nothing the memos read.
+            self._option_memo_gen += 1
         lot.multiplier = multiplier
         old_qty = lot.qty
         new_qty = old_qty + signed_qty

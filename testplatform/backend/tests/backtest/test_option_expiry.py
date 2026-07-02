@@ -4,8 +4,12 @@ At expiry the engine resolves every held single-leg option position:
 
   * OTM  -> expires worthless (option transaction closed at premium 0).
   * ITM long  -> exercised  (option closed at intrinsic; a SHARE position is created
-                 in the equity ledger, settled at the STRIKE).
-  * ITM short -> assigned   (same conversion, opposite share side).
+                 in the equity ledger, settled at the STRIKE) — WHEN cash/shares/margin
+                 support it (the Alpaca-mirror policy, see
+                 BacktestAccount.settle_single_leg_expiry; an unsupportable long is sold
+                 to close instead — covered in test_options_review_fixes.py). The
+                 integration test below holds ample cash, so it exercises physically.
+  * ITM short -> assigned   (same conversion, opposite share side — always physical).
 
 ITM is decided off the underlying's bar close: a CALL is ITM when spot > strike, a
 PUT when spot < strike. Early American assignment is NOT modelled (at-expiry only).

@@ -233,8 +233,14 @@ def _schedule_allows_entry(as_of_dt: datetime, schedule: Optional[Dict[str, Any]
 # Option expiry / exercise / assignment
 # ---------------------------------------------------------------------------
 def option_expiry_outcome(opt_type, side, *, strike, spot, qty, multiplier=100):
-    """Resolve one option position at expiry. Pure. Long ITM -> exercise; short ITM -> assigned;
-    OTM -> worthless. ITM: call when spot>strike, put when spot<strike."""
+    """THEORETICAL outcome of one option position at expiry. Pure. Long ITM -> exercise;
+    short ITM -> assigned; OTM -> worthless. ITM: call when spot>strike, put when spot<strike.
+
+    NOTE: the engine settles through ``BacktestAccount.settle_single_leg_expiry``, which
+    applies the Alpaca-mirror SUPPORTABILITY policy on top of this theoretical outcome
+    (auto-exercise a long only if cash/shares/margin support it, else sell-to-close at the
+    expiry premium; shorts always physically assign, with a next-bar broker cleanup when an
+    assignment leaves cash negative). This helper remains the pure ITM/side contract."""
     from ba2_common.core.types import OptionRight, OrderDirection
     itm = (spot > strike) if opt_type == OptionRight.CALL else (spot < strike)
     if not itm:
@@ -629,14 +635,30 @@ class DailyBacktestEngine:
             if filled:
                 self.account.refresh_transactions()
 
-            # 4a. resolve any option positions reaching expiry on THIS bar: OTM -> worthless;
-            #     ITM long -> exercise; ITM short -> assigned (converting to a SHARE position in
-            #     the equity ledger settled at the strike). Runs after the transaction roll (so
-            #     freshly-OPENED option positions are visible) and before snapshot_equity (so the
-            #     resulting equity position is marked this bar). Date-driven (an option can expire
-            #     on a no-fill bar), so it runs every bar — but get_option_positions() short-
-            #     circuits to [] for equity-only runs (no options provider), so this is ~free
-            #     there. Early American assignment is NOT modelled — options resolve at expiry.
+            # 4a-pre. Alpaca-mirror post-assignment cleanup from a PRIOR bar's expiry: a short
+            #     put is always PHYSICALLY assigned, which can leave cash negative; the broker
+            #     then liquidates enough of the assigned shares to restore buying power. Sell
+            #     just enough of them at THIS bar's open (before this bar's expiries settle).
+            #     One dict check when nothing is pending; equity-only runs never schedule any.
+            if hasattr(self.account, "process_pending_assignment_liquidations"):
+                try:
+                    self.account.process_pending_assignment_liquidations()
+                except Exception as e:  # noqa: BLE001 — cleanup failure must not abort the run
+                    self._log(f"assignment liquidation failed @ {as_of_dt}: {e}")
+
+            # 4a. resolve any option positions reaching expiry on THIS bar (Alpaca-mirror
+            #     policy — see BacktestAccount.settle_single_leg_expiry): OTM -> worthless;
+            #     ITM long -> auto-exercised into a SHARE position at the strike ONLY IF
+            #     cash/shares/margin support it, else sold to close at the expiry premium;
+            #     ITM short -> ALWAYS physically assigned (shares at the strike), with a
+            #     next-bar broker cleanup when the assignment leaves cash negative.
+            #     Defined-risk combos unit-settle as a group instead. Runs after the
+            #     transaction roll (so freshly-OPENED option positions are visible) and before
+            #     snapshot_equity (so the resulting equity position is marked this bar).
+            #     Date-driven (an option can expire on a no-fill bar), so it runs every bar —
+            #     but get_option_positions() short-circuits to [] for equity-only runs (no
+            #     options provider), so this is ~free there. Early American assignment is NOT
+            #     modelled — options resolve at expiry.
             self._apply_option_expiry(as_of_dt)
 
             # 4a-bis. Broker-style maintenance-margin check + forced liquidation. After marking
@@ -1041,15 +1063,20 @@ class DailyBacktestEngine:
 
     # -- option expiry / exercise / assignment ------------------------------
     def _apply_option_expiry(self, as_of: datetime) -> None:
-        """Resolve every held single-leg option position that has reached its expiry.
+        """Resolve every held option position that has reached its expiry.
 
-        For each held option whose ``expiry <= as_of.date()`` the engine reads the underlying's
-        bar CLOSE and resolves the outcome via the pure ``option_expiry_outcome`` helper:
+        For each held option whose ``expiry <= as_of.date()`` the engine reads the
+        underlying's bar CLOSE; defined-risk combos unit-settle as a group, everything else
+        settles per leg via ``BacktestAccount.settle_single_leg_expiry`` (the Alpaca-mirror
+        policy):
 
           * worthless -> close the option transaction at premium 0 (realise the entry P&L).
-          * exercise/assignment -> close the option at its intrinsic value AND create the
-            resulting SHARE position in the equity ledger, settled at the STRIKE; the new
-            equity position then marks-to-market on every subsequent bar.
+          * ITM long -> auto-exercised into the SHARE position at the STRIKE only if
+            cash/shares/margin SUPPORT it; otherwise sold to close at the expiry premium
+            (Alpaca liquidates unsupportable longs shortly before expiry) — no shares.
+          * ITM short -> ALWAYS physically assigned (shares at the STRIKE); an assignment
+            that leaves cash negative schedules a next-bar broker cleanup sale of the
+            assigned shares.
 
         Early American assignment is NOT modelled — options resolve at expiry only.
 
@@ -1105,28 +1132,10 @@ class DailyBacktestEngine:
                         f"({pos.contract_symbol}) @ {as_of_date} — skipped"
                     )
                     continue
-                out = option_expiry_outcome(
-                    pos.option_type,
-                    pos.side,
-                    strike=pos.strike,
-                    spot=spot,
-                    qty=pos.quantity,
-                    multiplier=pos.multiplier,
-                )
-                if out["action"] == "worthless":
-                    self.account.settle_option_expiry(pos, close_premium=0.0)
-                else:
-                    intrinsic = abs(float(spot) - float(pos.strike))  # per-share intrinsic value
-                    share_side = (
-                        OrderDirection.BUY if out["side"] == "buy" else OrderDirection.SELL
-                    )
-                    self.account.settle_option_expiry(
-                        pos,
-                        close_premium=intrinsic,
-                        share_side=share_side,
-                        shares=int(out["shares"]),
-                        share_price=float(out["price"]),
-                    )
+                # The account applies the Alpaca-mirror policy (supportability-gated exercise
+                # for longs / physical assignment + next-bar cleanup for shorts) — see
+                # BacktestAccount.settle_single_leg_expiry.
+                self.account.settle_single_leg_expiry(pos, float(spot))
             except Exception as e:  # noqa: BLE001 — one bad expiry must not abort the run
                 self._log(
                     f"option expiry failed for {pos.contract_symbol} @ {as_of_date}: {e}"
