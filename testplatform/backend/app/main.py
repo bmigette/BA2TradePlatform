@@ -428,6 +428,8 @@ app.include_router(target_sets.router, prefix="/api/target-sets", tags=["target-
 # router so its literal import-rules/export-rules segments win over /{strategy_id}.
 app.include_router(rules.router)
 app.include_router(strategies.router, prefix="/api/strategies", tags=["strategies"])
+# Optimization UI-metadata router carries its own /api/optimization prefix (fitness-options, etc.)
+app.include_router(strategies.optimization_router)
 app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
 app.include_router(cache.router, prefix="/api/cache", tags=["cache"])
 app.include_router(data_build.router, prefix="/api/data", tags=["data-build"])

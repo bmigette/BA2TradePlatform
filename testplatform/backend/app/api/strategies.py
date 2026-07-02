@@ -17,6 +17,36 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+# Separate router mounted at /api/optimization (registered in app.main). Carries UI-metadata
+# endpoints that logically belong to the optimizer but need a different path than /api/strategies.
+optimization_router = APIRouter(prefix="/api/optimization", tags=["optimization"])
+
+
+@optimization_router.get("/fitness-options")
+def get_fitness_options():
+    """UI single source of truth for the optimization form's fitness controls.
+
+    Returns the fitness-metrics catalog (derived from strategy_fitness so the UI can never drift
+    from the backend) plus the four cap/scale knob definitions with their defaults. The four knobs
+    ride in the optimize request's ``optimization_config.backtest`` block (see /{id}/optimize) and
+    are threaded per-trial by strategy_optimization_handler using these exact keys.
+    """
+    from app.services.strategy_fitness import METRICS_CATALOG
+
+    return {
+        "metrics": METRICS_CATALOG,
+        "knobs": {
+            # Per-trade profit cap (% of cost basis). Ranks on the ADJUSTED return-based metric.
+            "profit_cap_pct": {"default": 2000},
+            # Portfolio-share cap (% of net profit any single trade may contribute).
+            "profit_share_cap_pct": {"default": 25},
+            # Trade-frequency fitness scale (down-weight statistically thin few-trade configs).
+            "fitness_trade_scale": {"default": False},
+            # Clamp on avg_trades_per_year before scaling (100/yr = factor 1.0 break-even).
+            "fitness_trade_scale_cap": {"default": 100},
+        },
+    }
+
 
 # Pydantic models
 class ConditionBase(BaseModel):

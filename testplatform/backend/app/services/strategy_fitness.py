@@ -52,6 +52,164 @@ _FITNESS_KEYS = {
 }
 
 
+# --- UI single source of truth: fitness-metrics catalog ---------------------------------------
+# One entry per SELECTABLE fitness metric. The optimization UI reads this (via
+# GET /api/optimization/fitness-options) so its metric list, tooltips and trade-scale gating can
+# never drift from this module. Metrics that share a results-dict key but differ only in spelling
+# (e.g. "sharpe" / "sharpe_ratio") are collapsed to ONE canonical entry — but every alias is still
+# an accepted compute_fitness input.
+#
+# Fields:
+#   key                       canonical metric name accepted by compute_fitness (lower-case)
+#   label                     human-friendly UI label
+#   description               one-line tooltip
+#   supports_trade_scale      whether the fitness_trade_scale multiplier applies to this metric.
+#                             False for max_drawdown (negated, not return-based) and for
+#                             consistent_annual_return (compute_fitness returns before the scale
+#                             block — the hard >=30/yr gate replaces it).
+#   uses_adjusted_under_caps  whether an ADJUSTED (cap-aware) variant of the metric is ranked when a
+#                             profit cap is active (only return-based metrics have one).
+
+# Per-canonical-key metadata. compute_fitness collapses aliases onto these canonical keys, so the
+# catalog carries one entry per DISTINCT metric behaviour, not one per alias.
+_CATALOG_META = {
+    "sharpe_ratio": {
+        "label": "Sharpe Ratio",
+        "description": "Risk-adjusted return (mean/stdev). No adjusted variant under caps.",
+        "supports_trade_scale": True,
+        "uses_adjusted_under_caps": False,
+    },
+    "total_return": {
+        "label": "Total Return",
+        "description": "Total return over the run. Ranks on the capped (adjusted) return when a "
+                       "profit cap is active.",
+        "supports_trade_scale": True,
+        "uses_adjusted_under_caps": True,
+    },
+    "profit_factor": {
+        "label": "Profit Factor",
+        "description": "Gross profit / gross loss. Cap-aware (adjusted) variant used under caps.",
+        "supports_trade_scale": True,
+        "uses_adjusted_under_caps": True,
+    },
+    "win_rate": {
+        "label": "Win Rate",
+        "description": "Share of winning trades. No adjusted variant under caps.",
+        "supports_trade_scale": True,
+        "uses_adjusted_under_caps": False,
+    },
+    "sortino_ratio": {
+        "label": "Sortino Ratio",
+        "description": "Downside-risk-adjusted return. No adjusted variant under caps.",
+        "supports_trade_scale": True,
+        "uses_adjusted_under_caps": False,
+    },
+    "calmar_ratio": {
+        "label": "Calmar Ratio",
+        "description": "Annualized return / max drawdown. Cap-aware (adjusted) variant under caps.",
+        "supports_trade_scale": True,
+        "uses_adjusted_under_caps": True,
+    },
+    "sqn": {
+        "label": "System Quality Number",
+        "description": "Van Tharp SQN (expectancy x sqrt(N)). Cap-aware (adjusted) variant under caps.",
+        "supports_trade_scale": True,
+        "uses_adjusted_under_caps": True,
+    },
+}
+
+# Canonical key for the two specials (handled outside _FITNESS_KEYS in compute_fitness).
+_MAX_DRAWDOWN_KEY = "max_drawdown"
+_CAR_KEY = _CAR_ALIASES[0]  # "consistent_annual_return"
+
+_SPECIAL_META = {
+    _MAX_DRAWDOWN_KEY: {
+        "label": "Max Drawdown",
+        "description": "Largest peak-to-trough equity drop (minimized: fitness is the negated dd).",
+        # Negated, not return-based: the trade-frequency scale doesn't apply.
+        "supports_trade_scale": False,
+        "uses_adjusted_under_caps": False,
+    },
+    _CAR_KEY: {
+        "label": "Consistent Annual Return",
+        "description": "Goal metric: ~30%/yr EVERY year, >=30 trades/yr, dd<=20% ok. The hard "
+                       "trade-rate gate replaces the trade-scale multiplier.",
+        # Early-return in compute_fitness: fitness_trade_scale is a structural no-op here.
+        "supports_trade_scale": False,
+        "uses_adjusted_under_caps": True,
+    },
+}
+
+
+def _build_metrics_catalog() -> list:
+    """Build the catalog by iterating the canonical metrics + specials, REQUIRING metadata for each.
+
+    Because the catalog is DERIVED from _FITNESS_KEYS (+ specials) and demands a metadata row for
+    every canonical key, a new metric added to _FITNESS_KEYS without a matching _CATALOG_META entry
+    raises here at import time (and via assert_catalog_complete in tests) — the drift guard.
+
+    Each entry's ``key`` is the canonical metric name; ``aliases`` lists every additional
+    compute_fitness input that maps to it (e.g. "sharpe" -> "sharpe_ratio"). The union of every
+    entry's {key} + aliases is exactly the set of accepted fitness_metric strings.
+    """
+    catalog = []
+    # Canonical return/ratio metrics: collapse _FITNESS_KEYS aliases to their distinct target keys,
+    # then require metadata per canonical key. Aliases are every _FITNESS_KEYS name (other than the
+    # canonical itself) that maps to the same target.
+    seen_canonical = []
+    for canonical in _FITNESS_KEYS.values():
+        if canonical not in seen_canonical:
+            seen_canonical.append(canonical)
+    for canonical in seen_canonical:
+        meta = _CATALOG_META.get(canonical)
+        if meta is None:
+            raise KeyError(
+                f"strategy_fitness METRICS_CATALOG drift: _FITNESS_KEYS maps to {canonical!r} but "
+                f"_CATALOG_META has no metadata for it. Add a _CATALOG_META entry."
+            )
+        aliases = sorted(a for a, tgt in _FITNESS_KEYS.items() if tgt == canonical and a != canonical)
+        catalog.append({"key": canonical, "aliases": aliases, **meta})
+    # Specials (max_drawdown + consistent_annual_return). max_drawdown's aliases mirror the
+    # compute_fitness special-case list; CAR carries its _CAR_ALIASES.
+    special_aliases = {
+        _MAX_DRAWDOWN_KEY: ["drawdown", "max_dd"],
+        _CAR_KEY: sorted(a for a in _CAR_ALIASES if a != _CAR_KEY),
+    }
+    for special in (_MAX_DRAWDOWN_KEY, _CAR_KEY):
+        meta = _SPECIAL_META.get(special)
+        if meta is None:
+            raise KeyError(f"strategy_fitness METRICS_CATALOG drift: no metadata for {special!r}.")
+        catalog.append({"key": special, "aliases": special_aliases[special], **meta})
+    return catalog
+
+
+METRICS_CATALOG = _build_metrics_catalog()
+
+
+def catalog_accepted_metrics() -> set:
+    """Every fitness_metric string the catalog claims to cover (canonical keys + all aliases)."""
+    accepted = set()
+    for m in _build_metrics_catalog():
+        accepted.add(m["key"])
+        accepted.update(m.get("aliases", ()))
+    return accepted
+
+
+def assert_catalog_complete() -> None:
+    """Drift guard: rebuild the catalog and assert it covers EVERY _FITNESS_KEYS entry + specials.
+
+    Rebuilding (rather than reading the module-level list) means a metric added to _FITNESS_KEYS at
+    runtime — or, in practice, in source — without metadata raises here (via _build_metrics_catalog
+    when the new metric's canonical target lacks _CATALOG_META, or here when a new alias/target is
+    not covered). Called from the unit test; safe to call anywhere.
+    """
+    accepted = catalog_accepted_metrics()  # raises if any canonical/special lacks metadata
+    expected = set(_FITNESS_KEYS) | {_MAX_DRAWDOWN_KEY} | set(_CAR_ALIASES)
+    missing = expected - accepted
+    if missing:
+        raise AssertionError(f"METRICS_CATALOG does not cover fitness inputs: {sorted(missing)}")
+
+
 def compute_fitness(fitness_metric: str, results: dict) -> float:
     """Return the scalar fitness for a metric from a backtest results dict.
 
