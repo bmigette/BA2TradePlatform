@@ -165,16 +165,41 @@ def _build_standalone_rerun_config(bt: Backtest) -> Dict[str, Any]:
     return _build_config(payload)
 
 
-def build_rerun_config(db: Any, bt: Backtest) -> Dict[str, Any]:
-    """Return a ``run_daily_backtest`` config that reproduces ``bt``'s run, targeting its own id."""
+def rebuild_config_for_backtest(bt: Backtest, db: Any = None) -> Dict[str, Any]:
+    """Reconstruct the ``run_daily_backtest`` config that reproduces ``bt``'s ORIGINAL run.
+
+    This is the SINGLE reconstruction path shared by BOTH the ``/rerun`` handler (which
+    re-executes a row in place) AND the robustness schedule-variant launcher (which clones this
+    config and overrides ``run_schedule_override`` per variant). Do NOT re-implement the
+    reconstruction elsewhere — call this.
+
+    ``db`` is only needed for OPTIMIZATION-derived rows (``optimization_id`` set), whose config is
+    rebuilt from the parent ``StrategyOptimization`` row. Standalone rows reconstruct purely from
+    the row's own ``strategy_params`` and need no session; when ``db`` is None here a short-lived
+    ``SessionLocal`` is opened only if the row turns out to be optimization-derived.
+    """
     if bt.engine_type != "daily_expert":
         raise ValueError(
             f"re-run is only supported for daily_expert backtests (backtest {bt.id} is "
             f"'{bt.engine_type}')"
         )
     if bt.optimization_id:
-        return _build_optimization_rerun_config(db, bt)
+        if db is not None:
+            return _build_optimization_rerun_config(db, bt)
+        session = SessionLocal()
+        try:
+            return _build_optimization_rerun_config(session, bt)
+        finally:
+            session.close()
     return _build_standalone_rerun_config(bt)
+
+
+def build_rerun_config(db: Any, bt: Backtest) -> Dict[str, Any]:
+    """Return a ``run_daily_backtest`` config that reproduces ``bt``'s run, targeting its own id.
+
+    Thin back-compat wrapper over the shared ``rebuild_config_for_backtest`` (the reconstruction
+    used to live here inline; it was extracted so the robustness launcher can reuse it verbatim)."""
+    return rebuild_config_for_backtest(bt, db)
 
 
 def handle_rerun_backtest(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
