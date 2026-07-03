@@ -393,17 +393,18 @@ def _build_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         "buy_tree": payload.get("buy_tree"),
         "sell_tree": payload.get("sell_tree"),
         "exit_rules": payload.get("exit_rules"),
-        # Initial TP/SL bracket percents applied per opened position so trades close (the
-        # engine's _apply_initial_brackets reads these). Optional on the standalone path;
-        # the optimizer always supplies them via the tp/sl genes.
+        # Initial TP/SL bracket percents — STALE: the engine's baseline entry bracket (formerly
+        # ``_apply_initial_brackets``) was removed (see daily_engine.py's per-bar loop comment:
+        # "the engine no longer attaches a baseline 'Position protection' TP/SL bracket on
+        # entry"). Carried through here for payload-shape compatibility only; the current engine
+        # does not read them. Positions close via the strategy's own exit conditions + the
+        # classic RM's safeguard stop (TradeRiskManagement -> submit_order(sl_price=...)).
         "initial_tp_percent": payload.get("initial_tp_percent"),
         "initial_sl_percent": payload.get("initial_sl_percent"),
-        # CANONICAL take-profit reference key. ``_apply_initial_brackets`` reads
-        # ``initial_tp_reference``: unset / anything but "expert_target_price" -> the legacy
-        # percent-off-entry TP (default); "expert_target_price" -> anchor the TP on the
-        # recommendation's target_price (RE4). This is the SINGLE TP-reference vocabulary —
-        # the legacy ``initial_tp_ref`` name is accepted here as an ALIAS (the only place the
-        # alias is collapsed) so both spellings reach the one canonical config key + code path.
+        # CANONICAL take-profit reference key — also unread by the current engine (no baseline
+        # bracket left to anchor on "expert_target_price" vs percent-off-entry). Kept only as an
+        # alias-collapse point (legacy ``initial_tp_ref`` -> ``initial_tp_reference``) in case a
+        # future bracket mechanism is reintroduced.
         "initial_tp_reference": (
             payload.get("initial_tp_reference")
             if payload.get("initial_tp_reference") is not None
@@ -702,12 +703,14 @@ def _build_experts(
     # reference_value, action_value, enabled} — seeded into the per-expert OPEN_POSITIONS
     # ruleset so the engine manages held positions via the real RM/evaluator (Adjust TP/SL/Close).
     exit_rules = config.get("exit_rules")
-    # The initial TP/SL bracket is applied at transaction-OPEN by the engine's
-    # ``_apply_initial_brackets`` (driven by ``initial_tp_percent``/``initial_sl_percent`` and the
-    # canonical ``initial_tp_reference`` key) — NOT as an entry Adjust action, because at
-    # enter_market time the BUY/SELL only stages a PENDING order (see ``_entry_actions``). The
-    # enter ruleset therefore needs no bracket plumbing. enable_short adds the symmetric SELL/short
-    # entry rule + the RM enable_sell gate.
+    # No initial TP/SL bracket is applied at transaction-OPEN — that mechanism (formerly
+    # ``_apply_initial_brackets``, driven by ``initial_tp_percent``/``initial_sl_percent``/
+    # ``initial_tp_reference``) was removed from the engine. It's also NOT emitted as an entry
+    # Adjust action, because at enter_market time the BUY/SELL only stages a PENDING order (see
+    # ``_entry_actions``). The enter ruleset therefore needs no bracket plumbing at all; a
+    # position's real protection is the strategy's own exit conditions plus the classic RM's
+    # safeguard stop (TradeRiskManagement -> submit_order(sl_price=...)). enable_short adds the
+    # symmetric SELL/short entry rule + the RM enable_sell gate.
     enable_short = bool(config.get("enable_short"))
     # Pure-option ENTRY: when set, the enter_market ruleset fires this option action directly
     # (no equity leg) — the engine submits it directly (``_entry_is_option``).

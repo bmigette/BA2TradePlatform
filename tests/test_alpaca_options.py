@@ -19,6 +19,36 @@ def test_alpaca_is_option_capable():
     assert issubclass(AlpacaAccount, OptionsAccountInterface)
 
 
+def test_get_positions_returns_none_on_fetch_failure():
+    """Regression for the 2026-07-03 prod incident: a transient DNS outage made
+    client.get_all_positions() raise, which get_positions() must surface as None (a
+    fetch-failure sentinel) — NOT [] (a real-empty-book sentinel) — so that
+    reconcile_externally_closed_transactions()'s "never close on a fetch failure" guard
+    (which checks `is None`) actually fires instead of reading the swallowed failure as
+    "broker confirmed zero positions" and mass-closing every open transaction."""
+    acct = _make_alpaca()
+
+    class FakeClient:
+        def get_all_positions(self):
+            raise RuntimeError("Failed to resolve 'api.alpaca.markets' (DNS outage)")
+    acct.client = FakeClient()
+
+    assert acct.get_positions() is None
+
+
+def test_get_positions_returns_empty_list_for_real_flat_account():
+    """A genuinely flat account (broker confirms zero positions) must stay distinguishable
+    from a fetch failure: [] , not None."""
+    acct = _make_alpaca()
+
+    class FakeClient:
+        def get_all_positions(self):
+            return []
+    acct.client = FakeClient()
+
+    assert acct.get_positions() == []
+
+
 def test_get_option_chain_maps_snapshot(monkeypatch):
     acct = _make_alpaca()
     greeks = SimpleNamespace(delta=0.55, gamma=0.02, theta=-0.04, vega=0.1, rho=0.01)

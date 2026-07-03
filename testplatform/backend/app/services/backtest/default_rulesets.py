@@ -178,8 +178,11 @@ def _entry_actions(side: str, entry_action: "dict | None" = None) -> dict:
     enter_market time the BUY/SELL only stages a PENDING order (the RM sizes + submits it
     later), so there is no transaction yet for an Adjust action to attach an OCO leg to —
     emitting Adjust here sets the transaction's tp/sl field with no working leg AND suppresses
-    the fallback, so nothing closes. The engine applies the (reference-aware, optimizable)
-    initial bracket at transaction-OPEN instead (``_apply_initial_brackets``).
+    the fallback, so nothing closes. The engine does NOT apply any bracket at transaction-OPEN
+    either — that mechanism (formerly ``_apply_initial_brackets``) was removed. Position closure
+    relies entirely on the strategy's own exit conditions plus the classic RM's safeguard stop
+    (TradeRiskManagement -> submit_order(sl_price=...)); a strategy with no exit conditions holds
+    indefinitely (matches live).
     """
     if entry_action:
         built = action_from_rule(entry_action, key=side)
@@ -197,10 +200,12 @@ def seed_ruleset_from_tree(buy_tree, name: str = "backtest-enter-tree",
     The base "BUY when bullish and flat" triggers are kept, AND each leaf condition in the tree
     is added as an extra trigger (ANDed) — exactly what the optimizer's cond:<id>:value / on-off
     genes tune. When ``enable_short`` a symmetric SELL rule (bearish + flat + the SAME gates) is
-    added so the strategy can short (gated by the RM's enable_sell). The initial TP/SL bracket is
-    applied at transaction-open by the engine (``_apply_initial_brackets``), NOT as an entry Adjust
-    action (see ``_entry_actions``) — so the entry seeder carries no bracket plumbing. Unknown
-    fields are skipped; falls back to bullish+flat when the tree adds nothing.
+    added so the strategy can short (gated by the RM's enable_sell). No initial TP/SL bracket is
+    applied anywhere (the former ``_apply_initial_brackets`` mechanism was removed from the
+    engine), and none is emitted here as an entry Adjust action either (see ``_entry_actions``) —
+    so the entry seeder carries no bracket plumbing at all; closure is via the strategy's exit
+    conditions + the RM safeguard stop. Unknown fields are skipped; falls back to bullish+flat
+    when the tree adds nothing.
 
     When ``entry_action`` (an OPTION action config) is given, the open action is the OPTION
     action (a pure-option entry — no equity leg; see ``_entry_actions``). If ``buy_tree`` is

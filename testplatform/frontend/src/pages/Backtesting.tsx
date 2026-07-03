@@ -970,6 +970,24 @@ const Backtesting: React.FC = () => {
   // UI state
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [showConditionModal, setShowConditionModal] = useState<'buy' | 'sell' | 'exit' | null>(null);
+  // Snapshot taken when the condition modal OPENS so X / backdrop-click can discard edits
+  // made while it was open (ConditionBuilder/ExitConditionsBuilder mutate the page-level
+  // state live via onChange, so without this a "cancel" had no state to revert to).
+  const conditionModalSnapshot = useRef<{
+    buy: ConditionGroup;
+    sell: ConditionGroup;
+    exit: ExitConditionSet[];
+  } | null>(null);
+  const cancelConditionModal = useCallback(() => {
+    const snap = conditionModalSnapshot.current;
+    if (snap) {
+      setBuyEntryConditions(snap.buy);
+      setSellEntryConditions(snap.sell);
+      setExitConditions(snap.exit);
+    }
+    conditionModalSnapshot.current = null;
+    setShowConditionModal(null);
+  }, []);
   const [loading, setLoading] = useState(true);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -1006,6 +1024,12 @@ const Backtesting: React.FC = () => {
   const [individualNoBacktest, setIndividualNoBacktest] = useState<OptIndividual | null>(null);
   const [activeTab, setActiveTab] = useState<'equity' | 'drawdown' | 'trades' | 'strategy'>('equity');
   const [tradeFilter, setTradeFilter] = useState<'all' | 'profit' | 'loss'>('all');
+  // trade.pnlPercent is EQUITY-relative (pnl / total account equity at entry — see
+  // backtest_account.py's pnl_pct), which is what Monte Carlo compounds on but reads as
+  // misleadingly tiny per-trade numbers next to TP/SL settings, which are TRADE-relative
+  // (price move %). This toggle switches the Trade List display between the two; 'equity'
+  // is the default so nothing changes for existing users until they opt in.
+  const [pnlPctMode, setPnlPctMode] = useState<'equity' | 'trade'>('equity');
   // Trade-list sort: any column is sortable by clicking its header (toggles direction on re-click).
   const [tradeSortField, setTradeSortField] = useState<TradeSortField>('entryDate');
   const [tradeSortAsc, setTradeSortAsc] = useState(false);
@@ -2016,6 +2040,19 @@ const Backtesting: React.FC = () => {
     ? adjDrawdownCurve.reduce((m: number, p: any) => Math.min(m, Number(p.drawdown) || 0), 0)
     : null;
 
+  // Trade-relative % (price move, same basis as TP/SL settings): (exit-entry)/entry for a
+  // long, (entry-exit)/entry for a short. Computed client-side from entry/exit price — the
+  // backend doesn't send this separately, only the equity-relative pnlPercent.
+  const tradeRelativePct = (trade: Trade): number => {
+    if (!trade.entryPrice) return 0;
+    const raw = trade.direction === 'short'
+      ? (trade.entryPrice - trade.exitPrice) / trade.entryPrice
+      : (trade.exitPrice - trade.entryPrice) / trade.entryPrice;
+    return raw * 100;
+  };
+  const displayPnlPct = (trade: Trade): number =>
+    pnlPctMode === 'trade' ? tradeRelativePct(trade) : trade.pnlPercent;
+
   const getFilteredTrades = () => {
     if (!selectedBacktest?.results?.trades) return [];
 
@@ -2044,7 +2081,7 @@ const Backtesting: React.FC = () => {
         case 'direction': cmp = str(a.direction).localeCompare(str(b.direction)); break;
         case 'size': cmp = num(a.size) - num(b.size); break;
         case 'pnl': cmp = num(a.pnl) - num(b.pnl); break;
-        case 'pnlPercent': cmp = num(a.pnlPercent) - num(b.pnlPercent); break;
+        case 'pnlPercent': cmp = num(displayPnlPct(a)) - num(displayPnlPct(b)); break;
         case 'duration': cmp = num(tradeDurationMs(a)) - num(tradeDurationMs(b)); break;
         case 'exitReason': cmp = str(a.exitReason).localeCompare(str(b.exitReason)); break;
       }
@@ -2743,6 +2780,30 @@ const Backtesting: React.FC = () => {
                             <option value="loss">Losing</option>
                           </select>
                         </div>
+                        <div className="flex items-center gap-1 text-xs"
+                             title="Equity: P&L as % of total account equity at entry (what Monte Carlo compounds on). Trade: P&L as % price move on the trade itself (same basis as TP/SL settings).">
+                          <span className="text-gray-500 dark:text-gray-400">P&amp;L %:</span>
+                          <div className="inline-flex rounded border border-gray-300 dark:border-gray-600 overflow-hidden">
+                            <button
+                              type="button"
+                              onClick={() => setPnlPctMode('equity')}
+                              className={`px-2 py-1 ${pnlPctMode === 'equity'
+                                ? 'bg-blue-500 text-white'
+                                : 'bg-white dark:bg-gray-700 text-gray-700 dark:text-gray-300'}`}
+                            >
+                              Equity
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setPnlPctMode('trade')}
+                              className={`px-2 py-1 ${pnlPctMode === 'trade'
+                                ? 'bg-blue-500 text-white'
+                                : 'bg-white dark:bg-gray-700 text-gray-700 dark:text-gray-300'}`}
+                            >
+                              Trade
+                            </button>
+                          </div>
+                        </div>
                         <span className="text-xs text-gray-400 dark:text-gray-500">Click a column header to sort</span>
                       </div>
 
@@ -2799,7 +2860,7 @@ const Backtesting: React.FC = () => {
                                   {trade.pnl >= 0 ? '+' : ''}${trade.pnl.toFixed(2)}
                                 </td>
                                 <td className={`px-2 py-1.5 text-right font-medium ${trade.pnl >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-                                  {trade.pnl >= 0 ? '+' : ''}{trade.pnlPercent.toFixed(2)}%
+                                  {displayPnlPct(trade) >= 0 ? '+' : ''}{displayPnlPct(trade).toFixed(2)}%
                                 </td>
                                 <td className="px-2 py-1.5 text-center whitespace-nowrap text-gray-900 dark:text-gray-100">{formatDuration(tradeDurationMs(trade))}</td>
                                 <td className="px-2 py-1.5 text-center">
@@ -3498,7 +3559,10 @@ const Backtesting: React.FC = () => {
                   </div>
 
                   <button
-                    onClick={() => setShowConditionModal('buy')}
+                    onClick={() => {
+                      conditionModalSnapshot.current = { buy: buyEntryConditions, sell: sellEntryConditions, exit: exitConditions };
+                      setShowConditionModal('buy');
+                    }}
                     className="flex items-center gap-2 text-sm font-semibold text-white w-full p-2 bg-green-700 hover:bg-green-800 rounded-lg border border-green-800 shadow-sm"
                   >
                     <TrendingUp className="w-4 h-4 text-white" />
@@ -3516,7 +3580,10 @@ const Backtesting: React.FC = () => {
                   {allowShort && (
                     <>
                       <button
-                        onClick={() => setShowConditionModal('sell')}
+                        onClick={() => {
+                          conditionModalSnapshot.current = { buy: buyEntryConditions, sell: sellEntryConditions, exit: exitConditions };
+                          setShowConditionModal('sell');
+                        }}
                         className="flex items-center gap-2 text-sm font-semibold text-white w-full p-2 bg-red-700 hover:bg-red-800 rounded-lg border border-red-800 shadow-sm"
                       >
                         <TrendingDown className="w-4 h-4 text-white" />
@@ -3534,7 +3601,10 @@ const Backtesting: React.FC = () => {
                     </>
                   )}
                   <button
-                    onClick={() => setShowConditionModal('exit')}
+                    onClick={() => {
+                      conditionModalSnapshot.current = { buy: buyEntryConditions, sell: sellEntryConditions, exit: exitConditions };
+                      setShowConditionModal('exit');
+                    }}
                     className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300 w-full p-2 bg-gray-50 dark:bg-gray-700/50 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg border border-gray-200 dark:border-gray-600"
                   >
                     <Target className="w-4 h-4 text-orange-500" />
@@ -4361,7 +4431,7 @@ const Backtesting: React.FC = () => {
         <div className="fixed inset-0 z-50 overflow-y-auto">
           <div
             className="fixed inset-0 bg-black bg-opacity-50 transition-opacity"
-            onClick={() => setShowConditionModal(null)}
+            onClick={() => cancelConditionModal()}
           />
           <div className="flex min-h-full items-center justify-center p-4">
             <div className="relative bg-white dark:bg-gray-800 rounded-lg shadow-xl max-w-3xl w-full max-h-[80vh] flex flex-col">
@@ -4387,7 +4457,8 @@ const Backtesting: React.FC = () => {
                   )}
                 </h3>
                 <button
-                  onClick={() => setShowConditionModal(null)}
+                  onClick={() => cancelConditionModal()}
+                  title="Cancel (discards changes made since opening)"
                   className="p-1 hover:bg-gray-100 dark:hover:bg-gray-700 rounded text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
                 >
                   <X className="w-5 h-5" />
@@ -4542,9 +4613,15 @@ const Backtesting: React.FC = () => {
                 )}
               </div>
 
-              <div className="flex justify-end p-4 border-t border-gray-200 dark:border-gray-700">
+              <div className="flex justify-end gap-2 p-4 border-t border-gray-200 dark:border-gray-700">
                 <button
-                  onClick={() => setShowConditionModal(null)}
+                  onClick={() => cancelConditionModal()}
+                  className="px-4 py-2 bg-gray-200 dark:bg-gray-600 text-gray-800 dark:text-gray-100 rounded-lg hover:bg-gray-300 dark:hover:bg-gray-500"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={() => { conditionModalSnapshot.current = null; setShowConditionModal(null); }}
                   className="px-4 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600"
                 >
                   Done

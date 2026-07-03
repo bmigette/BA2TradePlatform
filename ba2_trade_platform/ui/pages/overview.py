@@ -1348,8 +1348,9 @@ class AccountOverviewTab:
                     provider_obj = get_account_instance_from_id(acc.id)
                     if provider_obj:
                         positions = provider_obj.get_positions()
-                        # Attach account name to each position for clarity
-                        for pos in positions:
+                        # get_positions() returns None (not []) on a fetch failure — a real
+                        # empty portfolio is [] and iterates fine; guard the failure case.
+                        for pos in (positions or []):
                             pos_dict = pos if isinstance(pos, dict) else dict(pos)
                             pos_dict['account'] = acc.name
                             # Add unique row key combining account and symbol
@@ -2779,9 +2780,12 @@ class AccountOverviewTab:
                                 f"avg_price=${data['avg_price']:.2f}"
                             )
                     
-                    # Compare broker positions with our positions
+                    # Compare broker positions with our positions. get_positions() returns None
+                    # (not []) when the fetch itself failed — keep `broker_positions` as-is (the
+                    # `is not None` guard below gates the auto-close), only default to [] here
+                    # for iteration/len() so a fetch failure doesn't crash this account's pass.
                     broker_symbols = set()
-                    for broker_pos in broker_positions:
+                    for broker_pos in (broker_positions or []):
                         pos_dict = broker_pos if isinstance(broker_pos, dict) else dict(broker_pos)
                         symbol = pos_dict.get('symbol')
                         broker_qty = float(pos_dict.get('qty', 0))
@@ -2881,7 +2885,7 @@ class AccountOverviewTab:
                     account_discrepancies = [d for d in discrepancies if d['account'] == account.name]
                     account_orphans = [o for o in orphaned_orders if o['account'] == account.name]
                     logger.info(
-                        f"Account '{account.name}': {len(broker_positions)} broker positions, "
+                        f"Account '{account.name}': {len(broker_positions or [])} broker positions, "
                         f"{len(our_positions)} our positions, "
                         f"{len(account_discrepancies)} discrepancies, "
                         f"{len(account_orphans)} orphaned orders found"

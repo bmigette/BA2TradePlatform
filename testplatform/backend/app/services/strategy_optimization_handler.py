@@ -766,11 +766,16 @@ def _build_daily_trial_config(
         options_cache_db = default_options_cache_db()
     validate_options_window(backtest_cfg["start_date"], bool(options_cache_db))
 
-    # Initial TP/SL the engine applies as an OCO bracket on each opened position. These are
-    # NOT expert settings (the experts don't declare them, so they'd be dropped by
-    # _expert_decision_settings) — they ride on the run config and the daily engine's
-    # _apply_initial_brackets reads them to stage the protective leg(s). Without this the
-    # position never closes (buy-and-hold) and every trade metric is bogus.
+    # STALE MECHANISM (kept only for backward-compat payload shape): these ride on the run
+    # config as "tp"/"sl" genes, but the daily engine's baseline entry bracket
+    # (formerly ``_apply_initial_brackets``) was REMOVED — see daily_engine.py's per-bar loop
+    # comment ("the engine no longer attaches a baseline 'Position protection' TP/SL bracket on
+    # entry"). Positions now close SOLELY via the strategy's own exit conditions plus the classic
+    # RM's safeguard stop (TradeRiskManagement -> submit_order(sl_price=...), daily_engine.py
+    # ~line 1160-1174), which is unrelated to these percents. initial_tp/initial_sl below are
+    # therefore forwarded but NOT consumed by daily_backtest_handler for the daily_expert engine —
+    # do not rely on them to protect a position; a strategy needs a real exit condition (or the
+    # RM stop) or it will hold indefinitely (matches live).
     initial_tp = None if bypass else decoded.get("tp")
     initial_sl = None if bypass else decoded.get("sl")
 
@@ -901,13 +906,14 @@ def _build_daily_trial_config(
         # "Allow short" -> seed the symmetric SHORT enter rule + RM sell gate (mirrors the
         # single-backtest path). Carried from the run-level optimize backtest block.
         "enable_short": bool(backtest_cfg.get("enable_short")),
-        # Initial TP/SL bracket percents (the tp/sl genes) — applied per opened position by
-        # the daily engine so trades actually close.
+        # Initial TP/SL bracket percents (the tp/sl genes) — DEAD as of the removal of the
+        # engine's baseline entry bracket (see the note above ``initial_tp = ...``); forwarded
+        # only for payload-shape compatibility. Real position closure is via exit conditions +
+        # the RM safeguard stop.
         "initial_tp_percent": initial_tp,
         "initial_sl_percent": initial_sl,
-        # Canonical TP-reference mode forwarded from the run-level config so every trial uses
-        # the same reference (None -> engine's default percent path; "expert_target_price" ->
-        # RE4 expert-target bracket). The single ``initial_tp_reference`` key + ``_apply_initial_brackets``.
+        # Canonical TP-reference mode, forwarded for the same compatibility reason — also unread
+        # by the current daily engine (no baseline bracket to anchor).
         "initial_tp_reference": backtest_cfg.get("initial_tp_reference"),
         # OPTIONS seam: a non-None path here flags an options trial — run_daily_backtest builds
         # the HistoricalOptionsProvider from it and injects it into the BacktestAccount so the

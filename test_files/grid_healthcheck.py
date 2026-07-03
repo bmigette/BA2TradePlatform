@@ -1,11 +1,11 @@
-"""One-shot grid health snapshot for the -tpsl screener matrix. Prints a concise status + a
-HEALTH: OK | ATTENTION line so the caller can decide whether to alert. No sleeping here — the
-caller schedules the cadence."""
+"""One-shot grid health snapshot for the -goal screener matrix (consistent_annual_return
+fitness, all experts). Prints a concise status + a HEALTH: OK | ATTENTION line so the caller
+can decide whether to alert. No sleeping here — the caller schedules the cadence."""
 import json
 import sqlite3
 
 DB = r"C:\Users\basti\Documents\ba2\test\dl_forecasting.db"
-SUFFIX = "-aggr"
+SUFFIX = "-goal"
 TOTAL_PLANNED = 31
 
 

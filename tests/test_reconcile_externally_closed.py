@@ -87,6 +87,23 @@ class TestReconcileExternallyClosed:
         assert closed == 0  # never close on an API error
         assert get_instance(Transaction, txn.id).status == TransactionStatus.OPENED
 
+    def test_does_not_close_when_fetch_returns_none(self):
+        """The 2026-07-03 prod incident: AlpacaAccount.get_positions() doesn't raise on a
+        network/DNS failure, it CATCHES and returns a sentinel — so the "never close on a
+        fetch failure" guard must trigger on that sentinel (None), not rely on an exception
+        that never comes. A real empty book is `[]` and DOES reconcile; only `None` (fetch
+        failed) must be a no-op. Regression test for the 8-transaction false mass-close during
+        a local DNS outage where the broker held the positions the entire time."""
+        acct = create_account_definition()
+        account = MockAccount(acct.id)
+        account._positions = None  # fetch failed but returned normally (no exception)
+        txn = _open_txn(acct.id, "AMPX")
+
+        closed = account.reconcile_externally_closed_transactions()
+
+        assert closed == 0
+        assert get_instance(Transaction, txn.id).status == TransactionStatus.OPENED
+
     def test_skips_fresh_transaction_within_grace(self):
         acct = create_account_definition()
         account = MockAccount(acct.id)

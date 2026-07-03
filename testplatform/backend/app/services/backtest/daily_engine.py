@@ -1016,8 +1016,8 @@ class DailyBacktestEngine:
         risk_per_trade_pct as a max-loss-per-name cap (% of equity). Sells any held name
         whose unrealized loss has reached that % of equity. Runs only on NON-rebalance bars
         (the rebalance pass owns the book on its scheduled bars). Lookahead-safe: submits a
-        MARKET sell that fills on a later bar per the fill model (same discipline as
-        _apply_initial_brackets). A per-bar failure is logged and swallowed.
+        MARKET sell that fills on a later bar per the fill model (same next-bar-fill discipline
+        as every other order in this engine). A per-bar failure is logged and swallowed.
 
         Returns True iff at least one stop SELL was actually submitted, so the caller can mark
         the order cache dirty ONLY when there is a new order for the fill engine to see. When it

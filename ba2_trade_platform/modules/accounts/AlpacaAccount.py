@@ -1328,9 +1328,18 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
     def get_positions(self):
         """
         Retrieve all current positions in the Alpaca account.
-        
+
         Returns:
-            list: A list of position objects if successful, empty list if an error occurs.
+            list: A list of position objects if the fetch succeeded (empty list is a REAL flat
+            account). None if the fetch itself failed (network/DNS/auth/API error) — distinct
+            from a real empty list so callers that gate auto-close logic on "we actually
+            confirmed the broker's book" (e.g. ReadOnlyAccountInterface.
+            reconcile_externally_closed_transactions, overview._compare_positions_with_broker)
+            can skip rather than mistake a fetch failure for a fully-flat account and mass-close
+            real open positions. See the 2026-07-03 incident: a transient local DNS outage
+            (`getaddrinfo failed` resolving api.alpaca.markets) made this swallow to `[]`, which
+            reconcile read as "broker holds nothing" and closed 8 real open transactions in the
+            DB while they remained open at the broker the whole time.
         """
         try:
             positions = self.client.get_all_positions()
@@ -1338,7 +1347,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             return [self.alpaca_position_to_position(position) for position in positions]
         except Exception as e:
             logger.error(f"Error listing Alpaca positions: {e}", exc_info=True)
-            return []
+            return None
 
     def get_available_position_quantity(self, symbol: str) -> Optional[float]:
         """Broker-side AVAILABLE (not held-for-orders) quantity for ``symbol``.
@@ -1628,6 +1637,9 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         """
         try:
             positions = self.get_positions()
+            if positions is None:
+                logger.error("Error refreshing positions from Alpaca: fetch failed")
+                return False
             logger.info(f"Successfully refreshed {len(positions)} positions from Alpaca")
             return True
         except Exception as e:

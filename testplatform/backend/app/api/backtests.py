@@ -531,12 +531,14 @@ def _create_daily_expert_backtest(backtest: "BacktestCreate", db: Session) -> di
         payload['enabled_instruments'] = list(symbols)
         universe_desc = f"{len(symbols)} instruments"
 
-    # Forward the strategy's conditions + initial TP/SL bracket into the daily-engine payload
-    # using the EXACT keys the handler reads: the buy-entry tree -> ``buy_tree`` (consumed by
-    # _build_experts -> seed_ruleset_from_tree), ``sell_tree`` / ``exit_rules``, and the
-    # ``initial_tp_percent`` / ``initial_sl_percent`` bracket percents (read by _build_config /
-    # daily_engine._apply_initial_brackets). Only include provided (non-None) keys so we never
-    # override the handler's own defaults with None (fail-early/no-silent-defaults rule).
+    # Forward the strategy's conditions into the daily-engine payload using the EXACT keys the
+    # handler reads: the buy-entry tree -> ``buy_tree`` (consumed by _build_experts ->
+    # seed_ruleset_from_tree), ``sell_tree`` / ``exit_rules``. ``initial_tp_percent`` /
+    # ``initial_sl_percent`` are also forwarded for payload-shape compatibility, but the engine's
+    # baseline entry bracket that used to read them (formerly ``_apply_initial_brackets``) was
+    # removed — a saved backtest's real protection is its exit conditions + the classic RM's
+    # safeguard stop. Only include provided (non-None) keys so we never override the handler's
+    # own defaults with None (fail-early/no-silent-defaults rule).
     if backtest.buy_entry_conditions is not None:
         payload['buy_tree'] = backtest.buy_entry_conditions
     if backtest.sell_entry_conditions is not None:
