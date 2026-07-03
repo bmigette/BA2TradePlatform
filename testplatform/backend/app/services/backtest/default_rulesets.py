@@ -193,6 +193,12 @@ def _entry_actions(side: str, entry_action: "dict | None" = None,
     When BOTH ``entry_tp_percent``/``entry_sl_percent`` are left at their default ``None``
     (every historical/default call site), this returns EXACTLY the same dict as before —
     no Adjust keys at all — so existing seeded rulesets stay byte-identical.
+
+    CAVEAT: the TP/SL bracket logic below runs unconditionally, including when ``entry_action``
+    is an OPTION action (e.g. ``buy_call``) — combining an option entry with
+    ``entry_tp_percent``/``entry_sl_percent`` would silently attach equity-style adjust actions
+    onto an option entry. No caller wires this combination today (Task 1 only wires equity
+    strategies), so it is untested and unsupported.
     """
     out = None
     if entry_action:

@@ -5,10 +5,7 @@ EventAction with action_0=buy + adjust actions), and emits NOTHING extra when
 they are None (backward compat: every historical config stays byte-identical)."""
 import json
 
-import pytest
-
 from app.services.backtest.default_rulesets import seed_ruleset_from_tree
-from ba2_common.core.db import get_instance
 from ba2_common.core.models import EventAction, Ruleset
 from ba2_common.core.types import ExpertActionType, ReferenceValue
 

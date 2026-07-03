@@ -11,6 +11,12 @@ Locks in two properties the optimizer's S1/entry path depends on:
   2. **``enable_short`` adds a symmetric SELL/short rule** (bearish + flat + the SAME gates) so a
      strategy can short — gated downstream by the RM's ``enable_sell`` permission.
 
+NOTE: the opt-in entry-bracket path (``entry_tp_percent``/``entry_sl_percent``, see
+``test_entry_bracket_seeding.py``) deliberately emits Adjust actions in the entry rule too — that
+is the safe, deliberate exception to rule 1 above, made possible by the shared
+``TradeActionEvaluator``'s Phase 1.5, which eagerly creates the transaction before the RM
+sizes/fills the order so the Adjust has something to attach to.
+
 Run from the backend dir:
     ./venv/bin/python -m pytest tests/backtest/test_entry_ruleset_seed.py -v
 """
