@@ -1605,6 +1605,12 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 continue
             trigger = leg.depends_order_status_trigger or OrderStatus.FILLED
             if parent.status == trigger:
+                # Entry-rule brackets are created while the parent is still PENDING qty=0
+                # (the RM sizes it afterwards) — sync the leg to the parent's real filled
+                # size at promotion so the bracket closes the whole position.
+                parent_qty = parent.filled_qty or parent.quantity
+                if parent_qty and leg.quantity != parent_qty:
+                    leg.quantity = parent_qty
                 leg.status = OrderStatus.ACCEPTED
                 update_instance(leg)
 
