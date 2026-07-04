@@ -867,10 +867,13 @@ def _build_strategy_row(name: str):
         # Protective stop (condition form, matches live): while holding, set the SL at entry -X%
         # (adjust_stop_loss ref=order_open_price, negative offset). Value-optimized + toggleable.
         # Replaces the global SL bracket so exits are 100% condition-driven like the live engine.
+        # ALWAYS ON (no toggle_optimize): this is S2's only condition-based floor protection before
+        # exit_belock's break-even lock kicks in at +profit. Same class of vulnerability found in
+        # S3 (the GA could disable its only floor stop to game the fitness) — tightness
+        # (action_value_*) stays optimizable, only the on/off toggle is removed.
         {"id": "exit_stoploss", "action_type": "adjust_stop_loss", "reference_value": "order_open_price",
          "action_value": -6.0, "action_value_optimize": True,
          "action_value_min": -20.0, "action_value_max": -3.0, "action_value_step": 2.0,
-         "toggle_optimize": True,
          "conditions": {"type": "AND", "conditions": [{"id": "sl_hold", "field": "has_position"}]}},
         # Take-profit (condition form): close once up +X%. Value-optimized + on/off-toggleable so the
         # GA tunes or disables it — replaces the dead global initial-TP bracket.
@@ -937,10 +940,14 @@ def _build_strategy_S3(name: str):
     exit_conditions = [
         # Initial protective stop (condition form, matches live): set SL at entry -X% while holding.
         # The trailing tiers below only ratchet it UP in profit, so this is the floor before them.
+        # ALWAYS ON (no toggle_optimize): this is S3's only condition-based floor protection before
+        # the trailing tiers below have a chance to ratchet the stop up in profit. Letting the GA
+        # disable it let it "win" by simply not protecting the downside (near-zero trade counts on
+        # large-cap, -55% max drawdown on small-cap) — the tightness (action_value_*) stays optimizable,
+        # only the on/off toggle is removed.
         {"id": "exit_stoploss", "action_type": "adjust_stop_loss", "reference_value": "order_open_price",
          "action_value": -8.0, "action_value_optimize": True,
          "action_value_min": -20.0, "action_value_max": -3.0, "action_value_step": 2.0,
-         "toggle_optimize": True,
          "conditions": {"type": "AND", "conditions": [{"id": "sl_hold", "field": "has_position"}]}},
         {"id": "trail_t1", "action_type": "adjust_stop_loss", "reference_value": "order_open_price",
          "action_value": 1.0, "action_value_optimize": True,
