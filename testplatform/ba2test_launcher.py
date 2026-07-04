@@ -925,15 +925,7 @@ def _build_strategy_S3(name: str):
     """S3 — momentum / trailing. Light entry gate (confidence + expected-profit, optimized) and a
     STAGED TRAILING STOP exit (3 profit-tiers that ratchet the stop up, all optimized) + a time
     exit. NO fixed TP (a very wide, non-optimized cap) so winners run under the trail. Every value
-    is optimizable and every rule is on/off-toggleable — no statics.
-
-    Also carries S2's two signal-based exits (exit_bearish, exit_downgrade — same shape,
-    toggle_optimize=True, GA-optional): S3's exit menu was otherwise 100% price-reactive (a floor
-    stop + trailing tiers that only engage once already profitable, plus a time exit), which was
-    the real driver of S3's worst observed drawdown — a broad, correlated small-cap dip during
-    which every REALIZED trade loss stayed tiny but mark-to-market equity sagged hard (-55.45% max
-    drawdown on S3-small) because nothing could de-risk ahead of price. These give S3 the same fast,
-    non-price-reactive early-warning mechanism S2 already had."""
+    is optimizable and every rule is on/off-toggleable — no statics."""
     from app.models.strategy import Strategy
     buy_entry_conditions = {
         "id": "root", "type": "AND", "conditions": [
@@ -957,21 +949,6 @@ def _build_strategy_S3(name: str):
          "action_value": -8.0, "action_value_optimize": True,
          "action_value_min": -20.0, "action_value_max": -3.0, "action_value_step": 2.0,
          "conditions": {"type": "AND", "conditions": [{"id": "sl_hold", "field": "has_position"}]}},
-        # Signal-based early de-risking (mirrors S2's exit_bearish/exit_downgrade exactly): close
-        # the instant the expert turns bearish or its rating goes negative, with NO price threshold.
-        # Added because S3's exit menu was otherwise 100% price-reactive (floor stop + trailing
-        # tiers that only ratchet up once already profitable + a time exit) — during a broad,
-        # correlated small-cap dip the trailing tiers never engage (positions never got profitable
-        # enough to arm them) and the floor stop lags price, so mark-to-market equity sagged hard
-        # (S3-small's worst individual: -55.45% max drawdown) even though every REALIZED trade loss
-        # was tiny. S2 never showed this failure mode because these two fast signal exits let it
-        # de-risk across every held position the moment sentiment turned, well before price moved
-        # against it. Optional/GA-toggleable (toggle_optimize=True), same as in S2 — an available
-        # tool the GA can choose to use, not a forced always-on rule.
-        {"id": "exit_bearish", "action_type": "close", "toggle_optimize": True,
-         "conditions": {"type": "AND", "conditions": [{"id": "xb", "field": "bearish"}]}},
-        {"id": "exit_downgrade", "action_type": "close", "toggle_optimize": True,
-         "conditions": {"type": "AND", "conditions": [{"id": "xd", "field": "current_rating_negative"}]}},
         {"id": "trail_t1", "action_type": "adjust_stop_loss", "reference_value": "order_open_price",
          "action_value": 1.0, "action_value_optimize": True,
          "action_value_min": -2.0, "action_value_max": 6.0, "action_value_step": 1.0, "toggle_optimize": True,
