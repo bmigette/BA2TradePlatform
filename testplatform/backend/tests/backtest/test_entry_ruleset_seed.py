@@ -2,20 +2,22 @@
 
 Locks in two properties the optimizer's S1/entry path depends on:
 
-  1. **No Adjust actions in the entry rule.** At enter_market time the BUY/SELL only stages a
-     PENDING order — there is no transaction yet for an Adjust to attach an OCO leg to. Emitting
-     an Adjust here sets the transaction's tp/sl field with no working leg AND suppresses the
-     engine's ``_apply_initial_brackets`` fallback, so nothing ever closes (100% win rate,
-     ``with_TPSL_exit=0``). The entry rule must therefore carry ONLY the open action; the engine
-     applies the optimizable initial bracket at transaction-open.
+  1. **No Adjust actions in the entry rule by default.** At enter_market time the BUY/SELL only
+     stages a PENDING order — there is no transaction yet for an Adjust to attach an OCO leg to.
+     Emitting an Adjust here with nothing to attach it to would set the transaction's tp/sl field
+     with no working leg, so closure would never trigger (100% win rate, ``with_TPSL_exit=0``).
+     Absent an opt-in ``entry_actions`` list, the entry rule therefore carries ONLY the open
+     action; management/closure of the resulting position is entirely via the strategy's
+     ``exit_conditions`` rules (and the RM's safeguard stop), evaluated on the OPEN_POSITIONS
+     cadence — there is no separate global/automatic initial-bracket fallback in the engine.
   2. **``enable_short`` adds a symmetric SELL/short rule** (bearish + flat + the SAME gates) so a
      strategy can short — gated downstream by the RM's ``enable_sell`` permission.
 
-NOTE: the opt-in entry-bracket path (``entry_tp_percent``/``entry_sl_percent``, see
-``test_entry_bracket_seeding.py``) deliberately emits Adjust actions in the entry rule too — that
-is the safe, deliberate exception to rule 1 above, made possible by the shared
-``TradeActionEvaluator``'s Phase 1.5, which eagerly creates the transaction before the RM
-sizes/fills the order so the Adjust has something to attach to.
+NOTE: the opt-in entry-bracket path (``entry_actions``, see ``test_entry_bracket_seeding.py``)
+deliberately emits Adjust actions in the entry rule too — that is the safe, deliberate exception
+to rule 1 above, made possible by the shared ``TradeActionEvaluator``'s Phase 1.5, which eagerly
+creates the transaction before the RM sizes/fills the order so the Adjust has something to
+attach to.
 
 Run from the backend dir:
     ./venv/bin/python -m pytest tests/backtest/test_entry_ruleset_seed.py -v
@@ -109,8 +111,10 @@ def test_or_group_entry_tree_emits_one_rule_per_group(_trading_db):
 
 
 def test_seed_ruleset_from_tree_has_no_entry_bracket_param():
-    """The dead ``entry_bracket`` kwarg was removed: the engine's ``_apply_initial_brackets``
-    is the single bracket path, so the entry seeder no longer accepts a forward-compat bracket.
+    """There is no separate ``entry_bracket`` boolean/flag kwarg: an entry-time TP/SL bracket is
+    opted into purely by passing a non-empty ``entry_actions`` rule list (mirroring how a
+    non-empty ``exit_conditions`` list is already the only "exit management enabled" signal) —
+    so the seeder must not carry a dead forward-compat flag alongside it.
     """
     import inspect
 
