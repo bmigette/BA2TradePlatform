@@ -14,6 +14,12 @@ Pre-flight per selected worker: ``ensure_synced`` (auto-update+wait so it runs a
 matched on app version) then ``push_cache`` (stream the missing cache as one tar). Workers
 that can't be reached/synced are dropped with a warning.
 
+Re-admission: a worker that failed pre-flight (or gave up mid-run) is not excluded for the rest
+of the job. Every ``n_consumers`` individuals completed, one background re-check re-runs the same
+pre-flight against the down worker list; a worker that now syncs is re-admitted with fresh
+dispatcher threads. The check runs off the result-consuming thread (non-blocking, one in flight
+at a time) so a still-dead worker's timeout never stalls trial throughput.
+
 Determinism: a trial config is hermetic + seeded, so its fitness is independent of WHERE it ran;
 ``execute_jobs`` reassembles results by the GA's input index. With no workers selected the caller
 keeps the plain local-pool path (byte-identical to before).
@@ -61,6 +67,10 @@ class DistributedEvaluator:
         self._stop = threading.Event()
         self._threads: List[threading.Thread] = []
         self._active_workers: List[dict] = []
+        self._down_workers: List[dict] = []  # excluded at pre-flight or gave up mid-run; retried
+        self._worker_lock = threading.Lock()  # guards _active_workers/_down_workers mutations
+        self._recheck_lock = threading.Lock()  # at most one re-admission pre-flight in flight
+        self._secrets: dict = {}
 
     # -- lifecycle ---------------------------------------------------------------------------
     def start(self) -> None:
@@ -68,23 +78,19 @@ class DistributedEvaluator:
         # resolve them via get_app_setting — survives the worker's self-update restart, which drops
         # env-only keys (the recurring 'FMP API key not configured' on remote trials).
         secrets = self._resolve_master_secrets()
+        self._secrets = secrets  # kept for later re-admission pre-flight retries
         # Pre-flight: version-match + cache-push each selected worker; drop the unusable ones.
+        # Workers with no password are a static misconfiguration (never resolves mid-run) and are
+        # excluded outright; anything else is a transient failure candidate, tracked in
+        # _down_workers so _recheck_down_workers can retry it periodically.
         for w in self.workers:
-            try:
-                if not w.get("password"):
-                    self.log(f"worker {w.get('name')} has no password configured; excluding")
-                    continue
-                if not worker_client.ensure_synced(w, self.master_version, log=self.log):
-                    continue
-                worker_client.push_cache(w, log=self.log)
-                worker_client.push_secrets(w, secrets, log=self.log)
-                try:
-                    w["capacity"] = max(1, int(worker_client.health(w).get("capacity") or 1))
-                except Exception:  # noqa: BLE001 — fall back to 1 slot if /health didn't report
-                    w["capacity"] = max(1, int(w.get("capacity") or 1))
+            if not w.get("password"):
+                self.log(f"worker {w.get('name')} has no password configured; excluding")
+                continue
+            if self._preflight_worker(w, secrets):
                 self._active_workers.append(w)
-            except Exception as e:  # noqa: BLE001 — a bad worker must never abort the run
-                self.log(f"worker {w.get('name')} pre-flight failed: {e}; excluding")
+            else:
+                self._down_workers.append(w)
 
         # Local consumers (master-as-worker).
         for i in range(self.n_consumers):
@@ -92,10 +98,7 @@ class DistributedEvaluator:
         # Remote dispatchers: one thread per worker slot.
         remote_slots = 0
         for w in self._active_workers:
-            cap = max(1, int(w.get("capacity") or 1))
-            remote_slots += cap
-            for i in range(cap):
-                self._spawn(lambda w=w: self._dispatch_remote(w), f"remote-{w['name']}-{i}")
+            remote_slots += self._spawn_remote_dispatchers(w)
         self.log(f"distributed evaluator (opt {self.optimization_id}): {self.n_consumers} local + "
                  f"{remote_slots} remote slot(s) across {len(self._active_workers)} worker(s)")
         # Surface the engaged fleet in the UI: each remote worker's active_jobs_count = its slot
@@ -148,6 +151,61 @@ class DistributedEvaluator:
         t.start()
         self._threads.append(t)
 
+    def _preflight_worker(self, w: dict, secrets: dict) -> bool:
+        """Version-match + cache/secrets-push one worker. Returns True if it's usable now."""
+        try:
+            if not worker_client.ensure_synced(w, self.master_version, log=self.log):
+                return False
+            worker_client.push_cache(w, log=self.log)
+            worker_client.push_secrets(w, secrets, log=self.log)
+            try:
+                w["capacity"] = max(1, int(worker_client.health(w).get("capacity") or 1))
+            except Exception:  # noqa: BLE001 — fall back to 1 slot if /health didn't report
+                w["capacity"] = max(1, int(w.get("capacity") or 1))
+            return True
+        except Exception as e:  # noqa: BLE001 — a bad worker must never abort the run
+            self.log(f"worker {w.get('name')} pre-flight failed: {e}; excluding")
+            return False
+
+    def _spawn_remote_dispatchers(self, w: dict) -> int:
+        cap = max(1, int(w.get("capacity") or 1))
+        for i in range(cap):
+            self._spawn(lambda w=w, i=i: self._dispatch_remote(w), f"remote-{w['name']}-{i}")
+        return cap
+
+    def _recheck_down_workers(self) -> None:
+        """Re-run pre-flight against previously-excluded/failed workers; re-admit any that
+        recover. Best-effort and never raises — called off a background thread so a still-dead
+        worker's connect timeout can't stall trial throughput."""
+        with self._worker_lock:
+            candidates = list(self._down_workers)
+        for w in candidates:
+            if self._stop.is_set():
+                return
+            if not self._preflight_worker(w, self._secrets):
+                continue
+            with self._worker_lock:
+                if w in self._down_workers:
+                    self._down_workers.remove(w)
+                self._active_workers.append(w)
+            cap = self._spawn_remote_dispatchers(w)
+            self.log(f"worker {w['name']} recovered; re-admitted with {cap} slot(s)")
+            self._report_fleet_state(active=True)
+
+    def _maybe_recheck_async(self) -> None:
+        """Kick off a re-admission pre-flight in the background if one isn't already running."""
+        with self._worker_lock:
+            if not self._down_workers:
+                return
+        if not self._recheck_lock.acquire(blocking=False):
+            return  # a recheck is already in flight; don't pile up
+        def _run():
+            try:
+                self._recheck_down_workers()
+            finally:
+                self._recheck_lock.release()
+        self._spawn(_run, "worker-recheck")
+
     # -- workers -----------------------------------------------------------------------------
     def _consume_local(self) -> None:
         from app.services.strategy_optimization_handler import _trial_worker
@@ -179,6 +237,10 @@ class DistributedEvaluator:
                 self.log(f"worker {w['name']} run_trial failed ({failures}/{_MAX_WORKER_FAILURES}): {e}")
                 if failures >= _MAX_WORKER_FAILURES:
                     self.log(f"worker {w['name']} giving up (dead); trials fall back to local/others")
+                    with self._worker_lock:
+                        if w in self._active_workers:
+                            self._active_workers.remove(w)
+                        self._down_workers.append(w)
                     return
                 self._stop.wait(2.0)
 
@@ -190,6 +252,7 @@ class DistributedEvaluator:
             tid = self.broker.submit_one(self.optimization_id, cfg, self.fitness_metric)
             trial_map[tid] = (i, flat, key)
         remaining = set(trial_map)
+        completed = 0
         while remaining:
             ready = self.broker.wait_ready(remaining, timeout=2.0)
             if not ready:
@@ -200,6 +263,11 @@ class DistributedEvaluator:
             for tid, out in ready.items():
                 i, flat, key = trial_map[tid]
                 remaining.discard(tid)
+                completed += 1
+                # Re-admission cadence: every n_consumers individuals, give previously-excluded/
+                # failed workers a chance to rejoin (see _maybe_recheck_async — no-op if none down).
+                if completed % self.n_consumers == 0:
+                    self._maybe_recheck_async()
                 yield (i, flat, key, out)
 
     def stop(self) -> None:
