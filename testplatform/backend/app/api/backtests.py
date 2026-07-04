@@ -67,10 +67,12 @@ class BacktestCreate(BaseModel):
     # daily_expert-engine fields (required only when engine == "daily_expert").
     expert: Optional[dict] = None  # {"class": "FMPRating", "settings": {...}}
     universe: Optional[dict] = None  # static: {"mode":"static","symbols":[...]} | screener: {"mode":"screener","screener_store":<metric_store dir>,"screener_settings":{...},"screener_cadence_days"?:int}
-    # Strategy conditions + initial TP/SL bracket (daily_expert path). When supplied, the
-    # buy-entry condition TREE seeds the enter ruleset (seed_ruleset_from_tree) and the TP/SL
-    # percents apply per opened position so trades close. All optional: omitted -> the handler
-    # falls back to its defaults (the bullish+flat enter ruleset / no brackets).
+    # Strategy conditions + entry-time TP/SL bracket (daily_expert path). When supplied, the
+    # buy-entry condition TREE seeds the enter ruleset (seed_ruleset_from_tree), and the entry
+    # TP/SL bracket is expressed as rule actions (entry_actions below -> config "entry_rules")
+    # that fire on the same gate as the buy/sell action, rather than a flat percent bracket.
+    # All optional: omitted -> the handler falls back to its defaults (the bullish+flat enter
+    # ruleset / no entry-time bracket).
     buy_entry_conditions: Optional[dict] = None   # AND/OR condition tree -> config "buy_tree"
     sell_entry_conditions: Optional[dict] = None  # -> config "sell_tree"
     enable_short: Optional[bool] = None           # -> config "enable_short": seed the symmetric
@@ -1100,7 +1102,7 @@ def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dic
                 "expert_params": expert_params,
             },
             # Execution config (seed/fill_model/warmup/commission/slippage/enable_short/
-            # run_schedule/tp_reference) + universe + interval so a saved run can be reproduced
+            # run_schedule) + universe + interval so a saved run can be reproduced
             # faithfully from the exports alone (the reproducibility goal).
             "execution": execution,
             "universe": universe,
