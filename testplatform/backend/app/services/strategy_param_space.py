@@ -188,14 +188,17 @@ def collect_param_space(
 ) -> Dict[str, Any]:
     """Return the flat joint param_ranges dict for GeneticOptimizer.
 
-    Merges expert (model:*, including RM sizing settings) + tp/sl + condition
-    (cond:*/exit:*) ranges. Key order is deterministic (model, tp/sl, conditions)
-    so the gene list is stable across runs — required for reproducibility.
+    Merges expert (model:*, including RM sizing settings) + condition/exit/entry-action
+    (cond:*/exit:*/entry:*) ranges. Key order is deterministic (model, conditions) so
+    the gene list is stable across runs — required for reproducibility. There is no
+    bespoke tp/sl gene namespace: the decoded ``tp``/``sl`` keys are a legacy
+    pass-through only (see module docstring) — entry TP/SL is optimized via the
+    ``entry:<id>:*`` namespace instead.
 
     BYPASS experts (piece 1c): when ``bypass`` is True the strategy/expert does NOT use
     the classic RM or the enter/exit ruleset (e.g. FactorRanker rebalances to target weights
     via its own portfolio manager). For such an expert the search space is restricted to the
-    expert's OWN params (model:*) ONLY — the tp, sl, cond:* and exit:* namespaces are
+    expert's OWN params (model:*) ONLY — the cond:*, exit:* and entry:* namespaces are
     EXCLUDED (they have no effect on the rebalance path, so optimizing them would be noise).
     """
     space: Dict[str, Any] = {}
@@ -210,7 +213,8 @@ def collect_param_space(
                 "a bypass expert searches only its own params — mark at least one expert "
                 "param optimize=True."
                 if bypass
-                else "mark at least one of expert/TP/SL/condition fields optimize=True."
+                else "mark at least one of expert settings, entry/exit rule conditions "
+                "or actions optimize=True."
             )
         )
     logger.info(
