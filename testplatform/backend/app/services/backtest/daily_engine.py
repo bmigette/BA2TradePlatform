@@ -47,7 +47,7 @@ from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple
 import numpy as np
 
 from ba2_common.core.backtest_context import BacktestContext, LiveProviderBundle
-from ba2_common.core.db import add_instance
+from ba2_common.core.db import add_instance, get_instance
 from ba2_common.core.models import ExpertRecommendation, Transaction
 from ba2_common.core.types import (
     OrderDirection,
@@ -1167,11 +1167,21 @@ class DailyBacktestEngine:
         for order in updated_orders:
             if order.quantity and order.quantity > 0:
                 try:
-                    # order.stop_price carries the RM's safeguard SL (min ATR×mult / risk%, floored
-                    # at min_stop_loss_pct) when the strategy's conditions set no stop of their own
-                    # — pass it as sl_price so submit_order creates the protective WAITING_TRIGGER
-                    # SL leg (mirrors the live TradeManager call below).
-                    self.account.submit_order(order, sl_price=order.stop_price or None)
+                    # Effective protective stop: the RULESET entry-bracket SL (attached to
+                    # the transaction by the entry rule's adjust_stop_loss action in Phase 2)
+                    # vs the RM SAFEGUARD (order.stop_price, what the position was SIZED
+                    # off). TIGHTER WINS — long: the higher stop; short: the lower — so
+                    # realized risk can never exceed risk_per_trade_pct, while a tighter
+                    # strategy stop is respected. No ruleset SL -> safeguard as before.
+                    sl_price = order.stop_price or None
+                    txn = get_instance(Transaction, order.transaction_id) if order.transaction_id else None
+                    ruleset_sl = txn.stop_loss if txn else None
+                    if ruleset_sl and sl_price:
+                        is_long = order.side == OrderDirection.BUY
+                        sl_price = max(ruleset_sl, sl_price) if is_long else min(ruleset_sl, sl_price)
+                    elif ruleset_sl:
+                        sl_price = None  # ruleset SL already attached; nothing tighter to add
+                    self.account.submit_order(order, sl_price=sl_price)
                 except Exception as e:  # noqa: BLE001
                     self._log(f"submit_order failed for order {order.id}: {e}")
 
