@@ -14,14 +14,6 @@ def _strategy(**kw):
     return types.SimpleNamespace(**base)
 
 
-def test_collect_tp_sl_only_when_optimize():
-    s = _strategy(initial_tp_optimize=True, initial_tp_min=2.0, initial_tp_max=10.0,
-                  initial_tp_step=0.5)
-    space = collect_param_space(s)
-    assert space["tp"] == {"type": "float", "min": 2.0, "max": 10.0, "step": 0.5}
-    assert "sl" not in space
-
-
 def test_rm_sizing_via_expert_model_namespace():
     """RM sizing is optimized through the expert model:* path keyed by the REAL ba2 setting
     names (e.g. risk_per_trade_pct); there is no separate rm:* namespace anymore."""
@@ -108,15 +100,18 @@ def test_bypass_excludes_tp_sl_cond_exit_keeps_only_model():
 
 def test_bypass_vs_non_bypass_same_inputs_differ():
     """The SAME strategy/expert inputs yield a strictly smaller space under bypass=True
-    (tp/sl present without bypass, gone with it)."""
-    s = _strategy(initial_tp_optimize=True, initial_tp_min=2.0, initial_tp_max=10.0,
-                  initial_tp_step=0.5)
+    (entry/exit/cond genes present without bypass, gone with it)."""
+    s = _strategy(exit_conditions=[
+        {"id": "e1", "action": "adjust_sl", "action_value": 1.0, "action_value_optimize": True,
+         "action_value_min": 0.5, "action_value_max": 3.0, "action_value_step": 0.5,
+         "conditions": {}},
+    ])
     expert = {"top_n": {"optimize": True, "min": 5, "max": 30, "step": 5, "type": "int"}}
 
     classic = collect_param_space(s, expert_cfg=expert, bypass=False)
     bypass = collect_param_space(s, expert_cfg=expert, bypass=True)
 
-    assert "tp" in classic and "model:top_n" in classic
+    assert "exit:e1:action_value" in classic and "model:top_n" in classic
     assert set(bypass) == {"model:top_n"}
     assert set(bypass) < set(classic)
 

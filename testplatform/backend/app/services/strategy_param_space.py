@@ -3,19 +3,24 @@
 Collects ONE flat param_ranges dict (the GeneticOptimizer shape
 {name: {'type','min','max','step'}}) from a Strategy row + expert numeric
 settings, and decodes a flat decoded-params dict back into
-(tp, sl, expert_overrides, buy_tree, sell_tree, exit_rules) by
+(tp, sl, expert_overrides, buy_tree, sell_tree, exit_rules, entry_rules) by
 deep-copying the condition trees and substituting node value/confirmation_bars/
 action_value by id. The Strategy row is never mutated.
 
 RM sizing is optimized through the expert ``model:*`` path keyed by the REAL ba2
 setting names (e.g. ``risk_per_trade_pct``); there is no separate rm namespace.
+Entry TP/SL is likewise NOT a bespoke tp/sl gene namespace: it rides on
+``Strategy.entry_actions`` (adjust_take_profit/adjust_stop_loss rules, same shape
+as ``exit_conditions``), collected/decoded via the ``entry:<id>:*`` namespace below
+(mirrors ``exit:<id>:*`` exactly). ``tp``/``sl`` decode keys are a legacy pass-through
+only (no genes are collected for them anymore).
 
 Namespacing (design §5):
   model:<p>                       expert numeric decision settings (incl. RM sizing)
-  tp | sl                         initial TP/SL percent
   cond:<id>:value                 a buy/sell condition node's threshold
   cond:<id>:confirmation_bars     that node's confirmation bars
   exit:<id>:action_value          an exit rule's action value
+  entry:<id>:action_value         an entry action's (TP/SL adjust) action value
 """
 import copy
 import logging
@@ -34,18 +39,6 @@ def _range_entry(min_v, max_v, step_v, is_int: bool) -> Dict[str, Any]:
         "max": int(max_v) if is_int else float(max_v),
         "step": int(step_v) if is_int else float(step_v),
     }
-
-
-def _collect_tp_sl(strategy) -> Dict[str, Any]:
-    """tp/sl ranges from Strategy.initial_{tp,sl}_{optimize,min,max,step}."""
-    out: Dict[str, Any] = {}
-    if getattr(strategy, "initial_tp_optimize", False):
-        out["tp"] = _range_entry(strategy.initial_tp_min, strategy.initial_tp_max,
-                                 strategy.initial_tp_step, is_int=False)
-    if getattr(strategy, "initial_sl_optimize", False):
-        out["sl"] = _range_entry(strategy.initial_sl_min, strategy.initial_sl_max,
-                                 strategy.initial_sl_step, is_int=False)
-    return out
 
 
 def _collect_expert(expert_cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -124,12 +117,30 @@ def _walk_condition_nodes(cond: Optional[Dict[str, Any]], out: Dict[str, Any]) -
 
 
 def _collect_conditions(strategy) -> Dict[str, Any]:
-    """cond:<id>:* across buy + sell trees and exit:<id>:action_value across exits."""
+    """cond:<id>:* across buy + sell trees, exit:<id>:action_value across exits,
+    and entry:<id>:action_value across strategy.entry_actions."""
     out: Dict[str, Any] = {}
     _walk_condition_nodes(getattr(strategy, "buy_entry_conditions", None), out)
     _walk_condition_nodes(getattr(strategy, "sell_entry_conditions", None), out)
     # legacy single entry tree (backwards compat)
     _walk_condition_nodes(getattr(strategy, "entry_conditions", None), out)
+    # entry_actions: adjust_take_profit/adjust_stop_loss rules seeded onto the enter
+    # rule (live parity — action_0=buy/action_1=adjust_take_profit sharing one gate).
+    # Same action_value_optimize/toggle_optimize fields as exit_conditions, but no
+    # option-selection branches and no nested 'conditions' sub-tree (entry actions
+    # fire on the SAME gate as the buy/sell action, they have no condition of their own).
+    for entry_rule in (getattr(strategy, "entry_actions", None) or []):
+        if not isinstance(entry_rule, dict):
+            continue
+        eid = entry_rule.get("id")
+        if eid and entry_rule.get("action_value_optimize"):
+            out[f"entry:{eid}:action_value"] = _range_entry(
+                entry_rule.get("action_value_min"), entry_rule.get("action_value_max"),
+                entry_rule.get("action_value_step"), is_int=False,
+            )
+        # ON/OFF toggle for the whole entry action (optimizer can drop it entirely).
+        if eid and entry_rule.get("toggle_optimize"):
+            out[f"entry:{eid}:enabled"] = _range_entry(0, 1, 1, is_int=True)
     for exit_rule in (getattr(strategy, "exit_conditions", None) or []):
         if not isinstance(exit_rule, dict):
             continue
@@ -190,7 +201,6 @@ def collect_param_space(
     space: Dict[str, Any] = {}
     space.update(_collect_expert(expert_cfg))
     if not bypass:
-        space.update(_collect_tp_sl(strategy))
         space.update(_collect_conditions(strategy))
     space.update(_collect_screener(screener_cfg))  # screener genes apply on BOTH paths
     if not space:
@@ -251,12 +261,13 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
 
     The flat dict comes from GeneticOptimizer.decode_individual (namespaced keys:
     tp | sl | model:<p> | cond:<id>:value | cond:<id>:confirmation_bars |
-    exit:<id>:action_value). Returns::
+    exit:<id>:action_value | entry:<id>:action_value). Returns::
 
       {
         'tp': float, 'sl': float,                 # falls back to strategy defaults
         'expert_overrides': {param: value},       # model:* stripped of prefix (incl. RM sizing)
         'buy_tree': dict|None, 'sell_tree': dict|None, 'exit_rules': list,
+        'entry_rules': list,                      # from strategy.entry_actions
       }
 
     The source Strategy is NEVER mutated (trees are deep-copied).
@@ -268,6 +279,8 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
     exit_option_delta_by_id: Dict[str, Any] = {}
     exit_option_dte_by_id: Dict[str, Any] = {}
     exit_option_wing_by_id: Dict[str, Any] = {}
+    entry_action_by_id: Dict[str, Any] = {}
+    entry_enabled_by_id: Dict[str, Any] = {}
     expert_overrides: Dict[str, Any] = {}
     screener_overrides: Dict[str, Any] = {}
     tp = getattr(strategy, "initial_tp_percent", None)
@@ -297,6 +310,12 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
                 exit_option_wing_by_id[eid] = val
             else:
                 exit_action_by_id[eid] = val
+        elif key.startswith("entry:"):
+            _, eid, field = key.split(":", 2)  # 'action_value'|'enabled'
+            if field == "enabled":
+                entry_enabled_by_id[eid] = val
+            else:
+                entry_action_by_id[eid] = val
         else:
             raise ValueError(f"Unknown decoded param namespace: {key!r}")
 
@@ -342,9 +361,26 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
             rule["conditions"] = _apply_to_tree(rule["conditions"], cond_by_id)
         exit_rules.append(rule)
 
+    # entry_actions: adjust_take_profit/adjust_stop_loss rules seeded onto the enter
+    # rule. Mirrors exit_rules exactly (drop on toggle-off, apply decoded action_value)
+    # minus the option-selection-param handling (not applicable to entry actions).
+    entry_rules = []
+    for rule in copy.deepcopy(getattr(strategy, "entry_actions", None) or []):
+        if not isinstance(rule, dict):
+            entry_rules.append(rule)
+            continue
+        eid = rule.get("id")
+        # ON/OFF toggle: an entry action whose 'enabled' gene decoded to 0 is dropped.
+        if eid in entry_enabled_by_id and entry_enabled_by_id[eid] == 0:
+            continue
+        if eid in entry_action_by_id:
+            rule["action_value"] = entry_action_by_id[eid]
+        entry_rules.append(rule)
+
     return {
         "tp": tp, "sl": sl,
         "expert_overrides": expert_overrides,
         "screener_overrides": screener_overrides,
         "buy_tree": buy_tree, "sell_tree": sell_tree, "exit_rules": exit_rules,
+        "entry_rules": entry_rules,
     }
