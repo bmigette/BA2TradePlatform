@@ -247,9 +247,15 @@ async def startup_event():
     # Run pending database migrations (ALTER TABLE etc.)
     try:
         import subprocess as _sp
-        _sp.run([sys.executable, "scripts/migrate_db.py"], timeout=30,
-                capture_output=True, text=True, cwd=str(Path(__file__).parent.parent))
-        logger.info("Database migrations checked")
+        _migration_result = _sp.run([sys.executable, "scripts/migrate_db.py"], timeout=30,
+                                     capture_output=True, text=True, cwd=str(Path(__file__).parent.parent))
+        if _migration_result.returncode == 0:
+            logger.info("Database migrations checked")
+        else:
+            logger.error(
+                f"Database migration script failed (exit code {_migration_result.returncode}): "
+                f"stdout={_migration_result.stdout!r} stderr={_migration_result.stderr!r}"
+            )
     except Exception as e:
         logger.warning(f"Migration check failed (non-fatal): {e}")
 

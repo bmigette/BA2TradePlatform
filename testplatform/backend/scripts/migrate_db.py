@@ -23,8 +23,20 @@ from pathlib import Path
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Database path
-DB_PATH = os.getenv("DATABASE_PATH", "dl_forecasting.db")
+# Database path — resolve it the SAME way the running app does (app.models.database),
+# instead of duplicating the default-path logic under a different env var name. That
+# duplication previously caused this script to read DATABASE_PATH (default: cwd-relative
+# "dl_forecasting.db") while the app reads DATABASE_URL (default: absolute
+# TEST_DIR/dl_forecasting.db) — two different files, so auto-migrate silently migrated
+# the wrong (often nonexistent) database. See scripts/migrate_profiles.py for the same
+# import pattern already used elsewhere in this repo.
+from app.models.database import DATABASE_URL
+
+if not DATABASE_URL.startswith("sqlite:///"):
+    print(f"Error: migrate_db.py only supports sqlite DATABASE_URL, got: {DATABASE_URL}")
+    sys.exit(1)
+
+DB_PATH = DATABASE_URL[len("sqlite:///"):]
 
 # Migrations folder
 MIGRATIONS_DIR = Path(__file__).parent.parent / "db_migrate"
