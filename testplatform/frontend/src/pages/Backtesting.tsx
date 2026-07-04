@@ -4598,6 +4598,26 @@ const Backtesting: React.FC = () => {
                       showOptimization={true}
                       vocabulary={source === 'expert' ? rulesetVocabulary : undefined}
                     />
+
+                    {/* Entry Actions (TP/SL) live on ONE shared list (see the note in the Entry
+                        Conditions modal) — don't duplicate the editable builder here, just make
+                        it visible that a bracket may already be attached and where to edit it. */}
+                    <div className="mt-6 pt-4 border-t border-gray-200 dark:border-gray-700">
+                      <div className="flex items-center gap-2 mb-1">
+                        <Shield className="w-4 h-4 text-blue-500" />
+                        <h4 className="text-sm font-semibold text-gray-900 dark:text-gray-100">Entry Actions (TP/SL)</h4>
+                      </div>
+                      <div className="p-3 bg-blue-50 dark:bg-blue-900/20 rounded-lg border border-blue-200 dark:border-blue-800">
+                        <p className="text-xs text-blue-700 dark:text-blue-300">
+                          {entryActions.length > 0
+                            ? `${entryActions.length} entry action${entryActions.length !== 1 ? 's' : ''} attached`
+                            : 'No entry actions attached'} — shared with Entry Conditions, applies to both long and short entries.
+                        </p>
+                        <p className="text-xs text-blue-600 dark:text-blue-400 mt-1">
+                          Edit this bracket from the Entry Conditions modal (it fires on the same gate for both directions).
+                        </p>
+                      </div>
+                    </div>
                   </div>
                 )}
 

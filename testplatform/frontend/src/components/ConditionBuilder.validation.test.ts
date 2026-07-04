@@ -64,6 +64,24 @@ describe('validateExitRule', () => {
     expect(w).toContain('No conditions — fires every bar');
   });
 
+  it('still warns "fires every bar" when skipConditionsWarning is explicitly false', () => {
+    const w = validateExitRule(
+      rule({ action: 'adjust_take_profit', conditions: createEmptyGroup('AND'), actionValue: 1 }),
+      vocab,
+      { skipConditionsWarning: false },
+    );
+    expect(w).toContain('No conditions — fires every bar');
+  });
+
+  it('does NOT warn "fires every bar" when skipConditionsWarning is set (entry actions have no condition tree)', () => {
+    const w = validateExitRule(
+      rule({ action: 'adjust_take_profit', conditions: createEmptyGroup('AND'), actionValue: 1 }),
+      vocab,
+      { skipConditionsWarning: true },
+    );
+    expect(w).not.toContain('No conditions — fires every bar');
+  });
+
   it('does NOT warn always-fires for the unconditional close action', () => {
     const w = validateExitRule(rule({ action: 'close', conditions: createEmptyGroup('AND') }), vocab);
     expect(w).not.toContain('No conditions — fires every bar');
