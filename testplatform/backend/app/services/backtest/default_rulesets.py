@@ -43,7 +43,6 @@ from ba2_common.core.types import (
     ExpertActionType,
     ExpertEventRuleType,
     ExpertEventType,
-    ReferenceValue,
 )
 
 # Backward-compat aliases for modules that import the (previously local) maps/helpers by name.
@@ -165,9 +164,7 @@ def _gate_trigger_groups(tree) -> list:
 
 
 def _entry_actions(side: str, entry_action: "dict | None" = None,
-                   entry_tp_percent: "float | None" = None,
-                   entry_sl_percent: "float | None" = None,
-                   entry_tp_reference: "str | None" = None) -> dict:
+                   entry_actions: "list[dict] | None" = None) -> dict:
     """The open action (plus optional TP/SL adjust actions) for an entry rule.
 
     Equity BUY (long) / SELL (short) by default. When ``entry_action`` (an OPTION action
@@ -178,27 +175,27 @@ def _entry_actions(side: str, entry_action: "dict | None" = None,
     runs the option entry with ``submit_to_broker=True``); the equity BUY/SELL stays a PENDING
     qty=0 order the RM sizes later.
 
-    ENTRY BRACKET (opt-in): when ``entry_tp_percent`` / ``entry_sl_percent`` are given,
-    emit adjust_take_profit / adjust_stop_loss actions ALONGSIDE the open action — the
-    exact live pattern (BUY_Longterm_70pctConfidence_10pctProfit: action_0=buy +
-    action_1=adjust_take_profit). The shared TradeActionEvaluator then runs its
-    Phase 1.5 (eager Transaction creation) + Phase 2 (compute + adjust_tp_sl), which
-    the backtest entry path already drives — so the bracket attaches at entry with
-    live-identical semantics. Sign convention (TradeActions.compute_price):
-    long = ref*(1+value/100), short = ref*(1-value/100) — so TP carries
-    +entry_tp_percent and SL carries -abs(entry_sl_percent) and both work for both
-    sides. With entry_tp_reference="expert_target_price" the TP value passes through
-    SIGNED as-is (offset-from-target, negative = below target).
+    ENTRY BRACKET (opt-in): when ``entry_actions`` (a list of rule dicts in the SAME shape
+    ``Strategy.exit_conditions`` rows already use — ``{id, action_type, reference_value,
+    action_value, ...}``) is given, each rule is converted via the SHARED
+    ``action_from_rule`` (the same conversion ``seed_open_positions_ruleset`` already applies
+    to exit rules) and merged alongside the open action — the exact live pattern
+    (BUY_Longterm_70pctConfidence_10pctProfit: action_0=buy + action_1=adjust_take_profit).
+    The shared TradeActionEvaluator then runs its Phase 1.5 (eager Transaction creation) +
+    Phase 2 (compute + adjust_tp_sl), which the backtest entry path already drives — so the
+    bracket attaches at entry with live-identical semantics. The sign convention
+    (TradeActions.compute_price: long = ref*(1+value/100), short = ref*(1-value/100)) is
+    entirely ``action_from_rule``/``compute_price``'s job — the caller supplies a correctly
+    signed ``action_value`` (positive TP, negative SL), same as exit rules already do.
 
-    When BOTH ``entry_tp_percent``/``entry_sl_percent`` are left at their default ``None``
-    (every historical/default call site), this returns EXACTLY the same dict as before —
-    no Adjust keys at all — so existing seeded rulesets stay byte-identical.
+    When ``entry_actions`` is left at its default ``None``/empty (every historical/default
+    call site), this returns EXACTLY the same dict as before — no Adjust keys at all — so
+    existing seeded rulesets stay byte-identical.
 
-    CAVEAT: the TP/SL bracket logic below runs unconditionally, including when ``entry_action``
-    is an OPTION action (e.g. ``buy_call``) — combining an option entry with
-    ``entry_tp_percent``/``entry_sl_percent`` would silently attach equity-style adjust actions
-    onto an option entry. No caller wires this combination today (Task 1 only wires equity
-    strategies), so it is untested and unsupported.
+    CAVEAT: an entry rule whose action is unrecognized by ``action_from_rule`` (returns
+    ``None``) is silently skipped — same convention ``seed_open_positions_ruleset`` uses for
+    exit rules. No caller wires option-entry + equity-bracket together today, so that
+    combination is untested and unsupported.
     """
     out = None
     if entry_action:
@@ -207,30 +204,18 @@ def _entry_actions(side: str, entry_action: "dict | None" = None,
         open_act = ExpertActionType.BUY.value if side == "buy" else ExpertActionType.SELL.value
         out = {side: {"action_type": open_act}}
 
-    if entry_tp_percent is not None:
-        tp_ref = entry_tp_reference or ReferenceValue.ORDER_OPEN_PRICE.value
-        tp_value = float(entry_tp_percent) if tp_ref == ReferenceValue.EXPERT_TARGET_PRICE.value \
-            else abs(float(entry_tp_percent))
-        out[f"{side}_tp"] = {
-            "action_type": ExpertActionType.ADJUST_TAKE_PROFIT.value,
-            "reference_value": tp_ref,
-            "value": tp_value,
-        }
-    if entry_sl_percent is not None:
-        out[f"{side}_sl"] = {
-            "action_type": ExpertActionType.ADJUST_STOP_LOSS.value,
-            "reference_value": ReferenceValue.ORDER_OPEN_PRICE.value,
-            "value": -abs(float(entry_sl_percent)),
-        }
+    for rule in entry_actions or []:
+        action = action_from_rule(rule, key=f"{side}_{rule['id']}")
+        if action is None:
+            continue
+        out.update(action)
     return out
 
 
 def seed_ruleset_from_tree(buy_tree, name: str = "backtest-enter-tree",
                            enable_short: bool = False,
                            entry_action: "dict | None" = None,
-                           entry_tp_percent: "float | None" = None,
-                           entry_sl_percent: "float | None" = None,
-                           entry_tp_reference: "str | None" = None) -> int:
+                           entry_actions: "list[dict] | None" = None) -> int:
     """Seed an enter_market ruleset from a Strategy buy-entry condition TREE; return its id.
 
     The base "BUY when bullish and flat" triggers are kept, AND each leaf condition in the tree
@@ -239,12 +224,14 @@ def seed_ruleset_from_tree(buy_tree, name: str = "backtest-enter-tree",
     added so the strategy can short (gated by the RM's enable_sell). Unknown fields are skipped;
     falls back to bullish+flat when the tree adds nothing.
 
-    ENTRY BRACKET (opt-in, off by default): when ``entry_tp_percent`` / ``entry_sl_percent`` are
-    given, the enter rule ALSO carries adjust_take_profit / adjust_stop_loss actions alongside
-    the open action — the exact live pattern (see ``_entry_actions`` for the full mechanism and
-    sign convention). Left at their default ``None`` (every existing call site), the entry rule
-    carries ONLY the open action, byte-identical to before this bracket support was added;
-    closure is then via the strategy's exit conditions + the RM safeguard stop, same as always.
+    ENTRY BRACKET (opt-in, off by default): when ``entry_actions`` (a list of rule dicts in the
+    SAME shape ``Strategy.exit_conditions`` rows use) is given, the enter rule ALSO carries the
+    adjust_take_profit / adjust_stop_loss actions those rules convert to via the shared
+    ``action_from_rule`` — the exact live pattern (see ``_entry_actions`` for the full mechanism
+    and sign convention). Left at its default ``None``/empty (every existing call site), the
+    entry rule carries ONLY the open action, byte-identical to before this bracket support was
+    added; closure is then via the strategy's exit conditions + the RM safeguard stop, same as
+    always.
 
     When ``entry_action`` (an OPTION action config) is given, the open action is the OPTION
     action (a pure-option entry — no equity leg; see ``_entry_actions``). If ``buy_tree`` is
@@ -279,8 +266,7 @@ def seed_ruleset_from_tree(buy_tree, name: str = "backtest-enter-tree",
         eas.append(_make_event_action(
             name=f"{name}-enter-long{suffix}",
             triggers=buy_triggers,
-            actions=_entry_actions("buy", entry_action, entry_tp_percent, entry_sl_percent,
-                                   entry_tp_reference),
+            actions=_entry_actions("buy", entry_action, entry_actions),
         ))
         if enable_short:
             sell_triggers = {
@@ -291,8 +277,7 @@ def seed_ruleset_from_tree(buy_tree, name: str = "backtest-enter-tree",
             eas.append(_make_event_action(
                 name=f"{name}-enter-short{suffix}",
                 triggers=sell_triggers,
-                actions=_entry_actions("sell", entry_action, entry_tp_percent, entry_sl_percent,
-                                       entry_tp_reference),
+                actions=_entry_actions("sell", entry_action, entry_actions),
             ))
     _link(ruleset_id, eas)
     return ruleset_id

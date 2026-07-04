@@ -1,8 +1,10 @@
 """Entry-bracket seeding: seed_ruleset_from_tree emits adjust_take_profit /
-adjust_stop_loss actions on the enter rule when entry TP/SL percents are given
-(mirroring the live BUY_Longterm_70pctConfidence_10pctProfit pattern: one
-EventAction with action_0=buy + adjust actions), and emits NOTHING extra when
-they are None (backward compat: every historical config stays byte-identical)."""
+adjust_stop_loss actions on the enter rule when an ``entry_actions`` rule list is given
+(mirroring the live BUY_Longterm_70pctConfidence_10pctProfit pattern: one EventAction with
+action_0=buy + action_1=adjust_take_profit), built via the SAME shared ``action_from_rule``
+conversion ``seed_open_positions_ruleset`` already uses for exit rules — and emits NOTHING
+extra when ``entry_actions`` is None (backward compat: every historical config stays
+byte-identical)."""
 import json
 
 from app.services.backtest.default_rulesets import seed_ruleset_from_tree
@@ -33,7 +35,12 @@ def test_no_bracket_by_default():
 def test_bracket_emits_tp_and_sl_actions():
     rid = seed_ruleset_from_tree(
         None, name="t-bracket", entry_action={"action_type": "buy"},
-        entry_tp_percent=8.0, entry_sl_percent=3.0,
+        entry_actions=[
+            {"id": "e_tp", "action_type": "adjust_take_profit",
+             "reference_value": "order_open_price", "action_value": 8.0},
+            {"id": "e_sl", "action_type": "adjust_stop_loss",
+             "reference_value": "order_open_price", "action_value": -3.0},
+        ],
     )
     actions = _actions_of_first_rule(rid)
     by_type = {cfg["action_type"]: cfg for cfg in actions.values()}
@@ -41,6 +48,7 @@ def test_bracket_emits_tp_and_sl_actions():
     sl = by_type[ExpertActionType.ADJUST_STOP_LOSS.value]
     # Sign convention per TradeActions.compute_price: long price = ref*(1+value/100),
     # so TP is +8.0 (above entry) and SL is -3.0 (below entry); shorts invert automatically.
+    # The GA/strategy author supplies the correctly-signed action_value, exactly like exit rules.
     assert tp["value"] == 8.0
     assert sl["value"] == -3.0
     assert tp["reference_value"] == ReferenceValue.ORDER_OPEN_PRICE.value
@@ -51,11 +59,16 @@ def test_bracket_emits_tp_and_sl_actions():
 
 def test_bracket_tp_reference_expert_target_passes_value_signed():
     # S4 semantics: TP anchored on the analyst target; the value is a SIGNED
-    # offset-from-target (live example: -5.0 = 5% below target), passed through as-is.
+    # offset-from-target (live example: -5.0 = 5% below target), passed through as-is by
+    # action_from_rule/compute_price (not seeder math).
     rid = seed_ruleset_from_tree(
         None, name="t-bracket-ref", entry_action={"action_type": "buy"},
-        entry_tp_percent=-5.0, entry_sl_percent=3.0,
-        entry_tp_reference=ReferenceValue.EXPERT_TARGET_PRICE.value,
+        entry_actions=[
+            {"id": "e_tp", "action_type": "adjust_take_profit",
+             "reference_value": ReferenceValue.EXPERT_TARGET_PRICE.value, "action_value": -5.0},
+            {"id": "e_sl", "action_type": "adjust_stop_loss",
+             "reference_value": "order_open_price", "action_value": -3.0},
+        ],
     )
     actions = _actions_of_first_rule(rid)
     by_type = {cfg["action_type"]: cfg for cfg in actions.values()}
@@ -67,7 +80,10 @@ def test_bracket_tp_reference_expert_target_passes_value_signed():
 def test_sl_only_bracket():
     rid = seed_ruleset_from_tree(
         None, name="t-slonly", entry_action={"action_type": "buy"},
-        entry_sl_percent=4.0,
+        entry_actions=[
+            {"id": "e_sl", "action_type": "adjust_stop_loss",
+             "reference_value": "order_open_price", "action_value": -4.0},
+        ],
     )
     actions = _actions_of_first_rule(rid)
     types = {cfg["action_type"] for cfg in actions.values()}

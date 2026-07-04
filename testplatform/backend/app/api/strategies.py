@@ -113,16 +113,11 @@ class StrategyCreate(BaseModel):
     buy_entry_conditions: Optional[dict] = None
     sell_entry_conditions: Optional[dict] = None
     exit_conditions: Optional[List[dict]] = None
-    initial_tp_percent: float = 5.0
-    initial_tp_optimize: bool = False
-    initial_tp_min: Optional[float] = None
-    initial_tp_max: Optional[float] = None
-    initial_tp_step: Optional[float] = None
-    initial_sl_percent: float = 2.0
-    initial_sl_optimize: bool = False
-    initial_sl_min: Optional[float] = None
-    initial_sl_max: Optional[float] = None
-    initial_sl_step: Optional[float] = None
+    # Entry TP/SL is a rule list, in the SAME shape as exit_conditions rows (minus a nested
+    # `conditions` sub-tree — an entry action fires on the same gate as the buy/sell action).
+    # Replaces the deleted initial_tp_*/initial_sl_* dedicated fields; see
+    # docs/plans/2026-07-03-entry-tp-sl-bracket-actions.md (REVISION 2026-07-04).
+    entry_actions: Optional[List[dict]] = None
 
 
 class StrategyUpdate(BaseModel):
@@ -132,16 +127,7 @@ class StrategyUpdate(BaseModel):
     buy_entry_conditions: Optional[dict] = None
     sell_entry_conditions: Optional[dict] = None
     exit_conditions: Optional[List[dict]] = None
-    initial_tp_percent: Optional[float] = None
-    initial_tp_optimize: Optional[bool] = None
-    initial_tp_min: Optional[float] = None
-    initial_tp_max: Optional[float] = None
-    initial_tp_step: Optional[float] = None
-    initial_sl_percent: Optional[float] = None
-    initial_sl_optimize: Optional[bool] = None
-    initial_sl_min: Optional[float] = None
-    initial_sl_max: Optional[float] = None
-    initial_sl_step: Optional[float] = None
+    entry_actions: Optional[List[dict]] = None
 
 
 def extract_required_fields(
@@ -229,16 +215,7 @@ async def create_strategy(
         buy_entry_conditions=strategy.buy_entry_conditions,
         sell_entry_conditions=strategy.sell_entry_conditions,
         exit_conditions=strategy.exit_conditions or [],
-        initial_tp_percent=strategy.initial_tp_percent,
-        initial_tp_optimize=strategy.initial_tp_optimize,
-        initial_tp_min=strategy.initial_tp_min,
-        initial_tp_max=strategy.initial_tp_max,
-        initial_tp_step=strategy.initial_tp_step,
-        initial_sl_percent=strategy.initial_sl_percent,
-        initial_sl_optimize=strategy.initial_sl_optimize,
-        initial_sl_min=strategy.initial_sl_min,
-        initial_sl_max=strategy.initial_sl_max,
-        initial_sl_step=strategy.initial_sl_step,
+        entry_actions=strategy.entry_actions or [],
     )
 
     db.add(db_strategy)

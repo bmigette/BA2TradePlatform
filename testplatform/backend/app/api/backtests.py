@@ -301,8 +301,7 @@ async def create_backtest(
     strategy_params = backtest.strategy_params or {}
     if strategy and not strategy_params:
         strategy_params = {
-            'initialTpPercent': strategy.initial_tp_percent,
-            'initialSlPercent': strategy.initial_sl_percent,
+            'entryActions': strategy.entry_actions or [],
             'buyEntryConditions': strategy.buy_entry_conditions,
             'sellEntryConditions': strategy.sell_entry_conditions,
             'exitConditions': strategy.exit_conditions,

@@ -1079,9 +1079,13 @@ def handle_backtest(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
                 buy_entry_conditions = strategy.buy_entry_conditions
                 sell_entry_conditions = strategy.sell_entry_conditions
                 exit_conditions = strategy.exit_conditions
+                # initial_tp_percent/initial_sl_percent were removed from the Strategy model
+                # (entry TP/SL is now expressed via entry_actions rules) — this legacy 'ml'
+                # engine path is untouched/out of scope for that rework, so keep it working
+                # with getattr fallbacks to the same historical defaults (5.0/2.0).
                 strategy_base_params = {
-                    'initial_tp_percent': strategy.initial_tp_percent or 5.0,
-                    'initial_sl_percent': strategy.initial_sl_percent or 2.0,
+                    'initial_tp_percent': getattr(strategy, 'initial_tp_percent', None) or 5.0,
+                    'initial_sl_percent': getattr(strategy, 'initial_sl_percent', None) or 2.0,
                 }
                 strategy_params = {**strategy_base_params, **strategy_params}
         else:

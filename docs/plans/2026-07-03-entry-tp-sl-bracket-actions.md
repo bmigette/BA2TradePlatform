@@ -2,29 +2,42 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Make the test platform attach TP/SL at entry the same way the live platform does — as `adjust_take_profit`/`adjust_stop_loss` actions on the ENTER_MARKET rule (live example: `BUY_Longterm_70pctConfidence_10pctProfit`, eventaction id=1 in the prod DB) — reusing the existing-but-dead `tp`/`sl` GA genes and frontend fields, behind an explicit opt-in flag so no historical config changes behavior.
+**Goal:** Make the test platform attach TP/SL at entry the same way the live platform does — as `adjust_take_profit`/`adjust_stop_loss` **actions on the entry rule itself** (live example: `BUY_Longterm_70pctConfidence_10pctProfit`, eventaction id=1 in the prod DB: `action_0=buy`, `action_1=adjust_take_profit`) — using the SAME rule/action representation and the SAME `action_from_rule` conversion exit rules already use, NOT a bespoke set of test-platform-only scalar fields.
 
-**Architecture:** The live platform's `TradeActionEvaluator` already implements the whole mechanism: Phase 1 creates the PENDING entry order, **Phase 1.5 eagerly creates the `Transaction`** (`TradeActionEvaluator.py:368-391` — `self.account._create_transaction_for_order(order)`), and Phase 2 computes TP/SL prices (`TradeActions.py:903 compute_price`) and calls `account.adjust_tp_sl(...)`. The backtest entry path (`daily_engine.py:826-843 _run_expert_entry`) already drives this exact evaluator — so the ONLY missing pieces are: (1) the enter-ruleset seeder never emits adjust actions, (2) the `BacktestAccount` protective leg copies `entry.quantity` at creation time (which is 0 pre-RM-sizing) and never re-syncs, (3) the RM safeguard SL at submit would silently overwrite the ruleset SL. Everything upstream (GA genes `tp`/`sl` via `initial_tp_optimize`, `decode_params`, trial-config forwarding as `initial_tp_percent`/`initial_sl_percent`/`initial_tp_reference`, and the full frontend UI) already exists and currently no-ops.
+**Architecture:** The live platform's `TradeActionEvaluator` already implements the whole mechanism: Phase 1 creates the PENDING entry order, **Phase 1.5 eagerly creates the `Transaction`** (`TradeActionEvaluator.py:368-391` — `self.account._create_transaction_for_order(order)`), and Phase 2 computes TP/SL prices (`TradeActions.py:903 compute_price`) and calls `account.adjust_tp_sl(...)`. The backtest entry path (`daily_engine.py:826-843 _run_expert_entry`) already drives this exact evaluator.
+
+**REVISION (2026-07-04) — unify the config surface, don't bolt on new fields:** Tasks 1-3 below are DONE and committed (`9f28fee`, `32631b8`, `e3894e1`, and Task 3's WIP) and remain valid at the engine level. But the ORIGINAL Tasks 4-7 (superseded, struck through further down) would have fed the seeder from brand-new test-platform-only `Strategy` columns (`entry_bracket` boolean + reusing the already-dead `initial_tp_percent`/`initial_sl_percent`/`initial_tp_reference`). The user explicitly rejected this: *"TP/SL should be set via rules not via another field specific to test. Rules should be unified... delete those tp/sl fields, they're leftover causing confusion."* The corrected design:
+
+- **Delete** `Strategy.initial_tp_percent/_optimize/_min/_max/_step`, `initial_sl_percent/_optimize/_min/_max/_step` (10 columns) and every dead reference to them (frontend fields, `_collect_tp_sl`, `initial_tp_reference`/`initial_tp_ref` config keys, the `tp`/`sl` GA gene namespace). These were the "5.0/2.0 dead defaults" load-bearing on nothing since `_apply_initial_brackets` was removed; the entry-bracket feature must NOT resurrect them under a new name.
+- **Add** `Strategy.entry_actions` — a JSON column, list of rule dicts, in the **EXACT SAME SHAPE** `exit_conditions` rows already use (`{id, action_type, reference_value, action_value, action_value_optimize, action_value_min, action_value_max, action_value_step, enabled, toggle_optimize}`), minus a nested `conditions` sub-tree (an entry action fires on the SAME gate as the buy/sell action — it has no condition of its own, exactly like live's `action_0`/`action_1` sharing one `triggers` dict).
+- **Revise Task 1's seeder** (`_entry_actions`/`seed_ruleset_from_tree`) to accept `entry_actions: list[dict] | None` and build each adjust action via `action_from_rule(rule, key=...)` — the SAME shared function `seed_open_positions_ruleset` already calls for exit rules (`rule_builders.py:165`, whose own docstring already says "for one exit/**entry** rule" — it was built generic, just never called from the entry path). This deletes the hand-rolled sign-math `_entry_actions` grew in Task 1 (the sign convention is `action_from_rule`'s/`compute_price`'s job, same as it already is for exit rules — the GA/user supplies a correctly-signed `action_value`, exactly like S3's exit rules already do).
+- **Gene collection**: extend `_collect_conditions`/`decode_params` in `strategy_param_space.py` to walk `strategy.entry_actions` with an `entry:<id>:*` namespace, MIRRORING the existing `exit:<id>:*` handling line-for-line (same field names: `action_value_optimize`/`action_value_min/max/step`/`toggle_optimize`/`enabled`). Delete `_collect_tp_sl` entirely — it's superseded by this, not run alongside it.
+- **No `entry_bracket` boolean.** Presence of a non-empty `entry_actions` list on a Strategy IS the opt-in signal — exactly how a non-empty `exit_conditions` list is already the only "exit management enabled" signal (no separate flag exists for that either). Every historical Strategy has `entry_actions` absent/empty by construction (new column), so nothing changes for it — the safety goal from the original plan is met MORE simply, with no new flag.
 
 **Tech Stack:** Python (FastAPI backend, SQLModel, pytest), shared `ba2_common` package (evaluator/actions/rule-builders), React+TS frontend (Backtesting.tsx).
 
-**Critical safety constraint:** Every saved strategy/backtest config in the DB carries `initialTpPercent: 5.0, initialSlPercent: 2.0` (dead defaults). Resurrecting them **unconditionally would clamp every re-run at +5%/-2%** and destroy existing strategies (e.g. the `-goal` grid winners). Therefore the whole feature is gated behind a NEW explicit boolean config key `entry_bracket` (default False → byte-identical behavior to today).
-
-**Sign conventions (nail these — they come from `TradeActions.py:936-947 compute_price`):** for a long, price = reference × (1 + value/100); for a short, reference × (1 − value/100). So the seeder must emit `value = +initial_tp_percent` for the TP action and `value = −abs(initial_sl_percent)` for the SL action, and both then work for BOTH sides automatically. When `initial_tp_reference == "expert_target_price"`, the TP value passes through SIGNED as-is (offset-from-target; live's example uses −5.0 = 5% below the analyst target — and note the S4 launcher template was DESIGNED for exactly this and has been silently no-op since `_apply_initial_brackets` was removed).
+**Sign convention** (unchanged fact, now enforced entirely by the EXISTING `action_from_rule`/`compute_price` path, not by bespoke seeder math): for a long, price = reference × (1 + value/100); for a short, reference × (1 − value/100) (`TradeActions.py:936-947`). A TP action's `action_value` should be positive (e.g. `8.0`), an SL action's negative (e.g. `-3.0`) — same convention the GA already applies to exit-rule `action_value`s (see S3's `trail_t1`/`exit_stoploss` values in `ba2test_launcher.py`). With `reference_value="expert_target_price"`, the value is a signed offset-from-target (live's example: `-5.0` = 5% below the analyst target).
 
 **Key files (read these first):**
 - `packages/common/ba2_common/core/TradeActionEvaluator.py:314-540` — Phases 1/1.5/2 (shared, DO NOT MODIFY — it already works)
-- `packages/common/ba2_common/core/rule_builders.py:165-187` — `action_from_rule` (already supports adjust actions; DO NOT MODIFY)
-- `testplatform/backend/app/services/backtest/default_rulesets.py:166-257` — `_entry_actions` + `seed_ruleset_from_tree` (MODIFY: emit adjust actions)
-- `testplatform/backend/app/services/backtest/daily_backtest_handler.py:393-411, ~695-722` — config keys + `_build_experts` seeding call (MODIFY: plumb through)
-- `testplatform/backend/app/services/backtest/backtest_account.py:1584-1609` (`WAITING_TRIGGER` promotion), `3059-3105` (`_replace_leg`) (MODIFY: qty sync)
-- `testplatform/backend/app/services/backtest/daily_engine.py:~1149-1174` — RM sizing + `submit_order(order, sl_price=order.stop_price)` (MODIFY: precedence)
-- `testplatform/backend/app/services/strategy_optimization_handler.py:769-786, ~904-917` — trial-config forwarding (MODIFY: forward `entry_bracket`, un-stale comments)
-- `testplatform/backend/app/services/strategy_param_space.py:39-48` — `_collect_tp_sl` genes (NO CHANGE — already emits `tp`/`sl` genes when `initial_tp_optimize`/`initial_sl_optimize`)
-- `testplatform/frontend/src/pages/Backtesting.tsx:691-704, 1542-1552` — existing TP/SL fields (MODIFY: add `entryBracket` toggle)
+- `packages/common/ba2_common/core/rule_builders.py:165-187` — `action_from_rule` (already supports adjust actions AND is already documented as entry-capable; DO NOT MODIFY)
+- `testplatform/backend/app/models/strategy.py:30-41` — the columns to DELETE; `exit_conditions = Column(JSON, nullable=True)` (line 28) is the pattern to mirror for the new `entry_actions` column
+- `testplatform/backend/db_migrate/022_drop_strategy_rm_columns.py` — the exact rebuild-table pattern to copy for the new migration (SQLite can't DROP COLUMN reliably)
+- `testplatform/backend/app/services/backtest/default_rulesets.py` — `_entry_actions` + `seed_ruleset_from_tree` (REVISE Task 1's version: swap scalar kwargs for `entry_actions: list[dict]` + `action_from_rule`); `seed_open_positions_ruleset` (line 92) is the exit-side pattern to mirror
+- `testplatform/backend/app/services/strategy_param_space.py:39-48 _collect_tp_sl` (DELETE), `:126-169 _collect_conditions` (EXTEND with `entry:<id>:*`, mirroring `exit:<id>:*`)
+- `testplatform/backend/app/services/backtest/daily_backtest_handler.py`, `testplatform/backend/app/services/strategy_optimization_handler.py`, `testplatform/backend/app/api/backtests.py`, `testplatform/backend/app/services/backtest/rerun_handler.py` — grep-and-delete every `initial_tp_percent`/`initial_sl_percent`/`initial_tp_reference`/`initial_tp_ref` reference; wire `entry_actions`/decoded `entry_rules` through instead (mirror the existing `exit_rules` plumbing exactly)
+- `testplatform/ba2test_launcher.py` — S4 template (`_build_strategy_S4`): replace `initial_tp_percent=...,initial_tp_optimize=...` with an `entry_actions=[...]` row
+- `testplatform/frontend/src/pages/Backtesting.tsx:691-704 (state), 1542-1552 (serialize), ~2180 (load)` — DELETE the `initialTp*`/`initialSl*` state/UI entirely; ADD an entry-actions builder (reuse `ExitConditionsBuilder`'s pieces)
+- `testplatform/backend/app/services/backtest/backtest_account.py:1584-1609` (`WAITING_TRIGGER` promotion — Task 2, DONE), `daily_engine.py` submit call site (Task 3, DONE) — unaffected by this revision, they operate on `Transaction.stop_loss`/`take_profit` regardless of how those got set
 
 Run backend tests from `testplatform/backend` with the TEST venv:
 `C:\Users\basti\ba2-venvs\test\Scripts\python.exe -m pytest tests/<file> -v`
+
+---
+
+## Superseded tasks (kept below for history — DO NOT IMPLEMENT AS WRITTEN)
+
+Tasks 4-7 as originally written (entry_bracket flag, `initial_tp_percent`/`initial_sl_percent`/`initial_tp_reference` plumbing, a flat toggle in the frontend) are REPLACED by Tasks 4-8 further below. Task 1's original implementation (scalar `entry_tp_percent`/`entry_sl_percent`/`entry_tp_reference` kwargs) is also being revised in new Task 4. Skip straight to "Task 4: Delete dead TP/SL fields..." below.
 
 ---
 
@@ -302,211 +315,180 @@ git add testplatform/backend/app/services/backtest/daily_engine.py testplatform/
 git commit -m "feat(backtest): tighter-wins precedence between entry-bracket SL and RM safeguard"
 ```
 
----### Task 4: Plumb the opt-in flag + TP/SL config through the handler chain
+---
+
+### Task 4: Delete dead TP/SL fields; add `entry_actions`; revise Task 1's seeder to consume it via `action_from_rule`
 
 **Files:**
-- Modify: `testplatform/backend/app/services/backtest/daily_backtest_handler.py:393-411` (config block) and `~695-722` (`_build_experts` seeding call)
-- Modify: `testplatform/backend/app/services/strategy_optimization_handler.py:769-786` (decoded tp/sl block) and `~904-917` (trial-config keys)
-- Modify: `testplatform/backend/app/api/backtests.py:534-552` (single-run payload forward — it already forwards `initial_tp_percent`/`initial_sl_percent`/`initial_tp_reference`; add `entry_bracket`)
-- Test: extend `testplatform/backend/tests/backtest/test_entry_bracket_engine.py` (end-to-end: config in → bracketed trade out)
+- Modify: `testplatform/backend/app/models/strategy.py` — delete lines 30-41 (10 columns); add `entry_actions = Column(JSON, nullable=True)` next to `exit_conditions` (line 28); update `to_dict()` (delete the 10 `initialTp*`/`initialSl*` keys, add `"entryActions": self.entry_actions or []`)
+- Create: `testplatform/backend/db_migrate/026_entry_actions_replace_tpsl_fields.py` — copy the rebuild-table pattern from `022_drop_strategy_rm_columns.py` EXACTLY (SQLite can't reliably `DROP COLUMN`/`ADD COLUMN` together across versions, so rebuild): new DDL keeps `id/name/description/required_fields/entry_conditions/buy_entry_conditions/sell_entry_conditions/exit_conditions/created_at/updated_at`, ADDS `entry_actions JSON`, DROPS the 10 `initial_tp_*`/`initial_sl_*` columns. Idempotent (no-op if `initial_tp_percent` isn't a column, matching 022's `if not rm_columns: return False` pattern).
+- Modify: `testplatform/backend/app/services/backtest/default_rulesets.py` — REVISE (not append to) Task 1's `_entry_actions`/`seed_ruleset_from_tree`: replace the `entry_tp_percent`/`entry_sl_percent`/`entry_tp_reference` scalar kwargs with a single `entry_actions: list[dict] | None` kwarg. For each rule in `entry_actions`, call `action_from_rule(rule, key=f"{side}_{rule['id']}")` (import from `ba2_common.core.rule_builders`, same import `seed_open_positions_ruleset` already has) and merge the returned dict into the action set alongside the buy/sell action. This DELETES the hand-rolled sign-math added in Task 1 — `action_from_rule` + `compute_price` already handle it (same as exit rules).
+- Modify: `testplatform/backend/tests/backtest/test_entry_bracket_seeding.py` — REWRITE the 4 Task-1 tests to pass `entry_actions=[{...}]` instead of the 3 scalar kwargs (same assertions on the resulting `EventAction.actions` dict; the sign-convention tests keep the SAME expected values, only the call shape changes — the strategy-level author still supplies a signed `action_value` exactly as before, it just arrives via a rule dict instead of a bare float).
 
-**Step 1: Write the failing end-to-end test**
+**Step 1: Update the seeding tests first (TDD on the revised signature)**
 
+Rewrite the 4 tests in `test_entry_bracket_seeding.py` to the new call shape, e.g.:
 ```python
-def test_entry_bracket_config_end_to_end(bt_engine_fixture):
-    """config {entry_bracket: True, initial_tp_percent: 6, initial_sl_percent: 3}
-    -> the seeded enter ruleset carries the adjust actions -> a filled entry's
-    transaction has take_profit ~= entry*1.06 and stop_loss ~= entry*0.97 and an
-    OCO leg exists -> the trade eventually closes via the TP or SL leg (exit_reason
-    contains 'OCO' / tp_sl_filled)."""
-
-def test_entry_bracket_default_off_is_noop(bt_engine_fixture):
-    """Same config WITHOUT entry_bracket: transaction.take_profit/stop_loss stay
-    None at entry (current behavior, byte-identical) even though
-    initial_tp_percent=5/initial_sl_percent=2 are present (the dead legacy defaults
-    every historical config carries)."""
+def test_bracket_emits_tp_and_sl_actions():
+    rid = seed_ruleset_from_tree(
+        None, name="t-bracket", entry_action={"action_type": "buy"},
+        entry_actions=[
+            {"id": "e_tp", "action_type": "adjust_take_profit", "reference_value": "order_open_price", "action_value": 8.0},
+            {"id": "e_sl", "action_type": "adjust_stop_loss", "reference_value": "order_open_price", "action_value": -3.0},
+        ],
+    )
+    actions = _actions_of_first_rule(rid)
+    by_type = {cfg["action_type"]: cfg for cfg in actions.values()}
+    assert by_type[ExpertActionType.ADJUST_TAKE_PROFIT.value]["value"] == 8.0
+    assert by_type[ExpertActionType.ADJUST_STOP_LOSS.value]["value"] == -3.0
 ```
+(`action_from_rule` reads `rule.get("value")` first, else `rule.get("action_value")` — use whichever the exit-rule convention already uses consistently elsewhere, check `seed_open_positions_ruleset`'s callers to match.) Keep `test_no_bracket_by_default` (now `entry_actions=None`) and `test_sl_only_bracket` (now a 1-item list). The `expert_target_price` test keeps its assertion (value passed through signed, unchanged) since that's `compute_price`'s behavior, not the seeder's.
 
-**Step 2: Run to verify both fail** (first one: no adjust actions seeded; second one passes trivially — keep it as the regression lock).
+**Step 2: Run to verify failures**, then **Step 3: implement** the seeder revision described above, **Step 4: run tests** (`pytest tests/backtest/test_entry_bracket_seeding.py tests/backtest/test_entry_ruleset_seed.py tests/backtest/test_entry_bracket_engine.py -v` — Task 2/3's tests must still pass unmodified, since they only depend on the RESULT (a `Transaction.stop_loss` being set), not on which kwarg shape produced it).
 
-**Step 3: Implement**
+**Step 5: DB migration + model change.** Write `026_...py`, run it against a scratch copy of the dev DB first to sanity-check (`C:\Users\basti\Documents\ba2\test\dl_forecasting.db` — COPY it, don't run against the live one blind), then apply for real via however this repo's migrations are invoked (check `testplatform/backend/db_migrate/__init__.py` or a `run_migrations.py`/similar entrypoint — grep for how 025 gets invoked in CI/docs). Update `strategy.py`'s model + `to_dict()`.
 
-`daily_backtest_handler.py` config block (line ~396): replace the STALE-mechanism comment with the live one and add the flag:
-
-```python
-        # ENTRY BRACKET (opt-in): when entry_bracket is True the enter ruleset carries
-        # adjust_take_profit/adjust_stop_loss actions built from initial_tp_percent /
-        # initial_sl_percent / initial_tp_reference — attached at entry through the SAME
-        # shared TradeActionEvaluator Phase 1.5/2 path live uses. Default False: every
-        # historical config (which carries dead 5.0/2.0 legacy defaults) stays byte-identical.
-        "entry_bracket": bool(payload.get("entry_bracket", False)),
-        "initial_tp_percent": payload.get("initial_tp_percent"),
-        "initial_sl_percent": payload.get("initial_sl_percent"),
-        ...
-```
-
-`_build_experts` (line ~700-722): compute the seeder kwargs once:
-
-```python
-    entry_bracket = bool(config.get("entry_bracket"))
-    entry_tp = config.get("initial_tp_percent") if entry_bracket else None
-    entry_sl = config.get("initial_sl_percent") if entry_bracket else None
-    entry_tp_ref = config.get("initial_tp_reference") if entry_bracket else None
-```
-
-and pass `entry_tp_percent=entry_tp, entry_sl_percent=entry_sl, entry_tp_reference=entry_tp_ref` into the `seed_ruleset_from_tree(...)` call. Update the "No initial TP/SL bracket is applied at transaction-OPEN" comment (line ~705-712) to describe the new opt-in path.
-
-`strategy_optimization_handler.py`: line 769-786 — rewrite the "STALE MECHANISM" comment: the tp/sl genes are LIVE again when `entry_bracket` is on (decoded `tp`/`sl` -> `initial_tp_percent`/`initial_sl_percent` -> enter-ruleset adjust actions). Add to the trial-config dict (line ~904):
-
-```python
-        "entry_bracket": bool(backtest_cfg.get("entry_bracket", False)),
-```
-
-`api/backtests.py` (line ~548): forward `entry_bracket` from the Backtest row's strategy_params (`sp.get("entryBracket")`) into the payload, same non-None-only pattern as its neighbors. Check `rerun_handler.py:159-164` forwards it too (same shape).
-
-**Step 4: Run** — both tests PASS; then the full backend suite:
-`C:\Users\basti\ba2-venvs\test\Scripts\python.exe -m pytest -q` from `testplatform/backend` — expect the SAME pre-existing failures as baseline (10 as of 2026-07-03), zero NEW ones.
-
-**Step 5: Commit**
-
+**Step 6: Full regression + commit.**
 ```bash
-git add testplatform/backend/app/services/backtest/daily_backtest_handler.py testplatform/backend/app/services/strategy_optimization_handler.py testplatform/backend/app/api/backtests.py testplatform/backend/tests/backtest/test_entry_bracket_engine.py
-git commit -m "feat(backtest): opt-in entry_bracket flag plumbs entry TP/SL through single-run + optimizer paths"
+cd testplatform/backend && C:\Users\basti\ba2-venvs\test\Scripts\python.exe -m pytest tests/backtest/ -q
+git add testplatform/backend/app/models/strategy.py testplatform/backend/db_migrate/026_entry_actions_replace_tpsl_fields.py testplatform/backend/app/services/backtest/default_rulesets.py testplatform/backend/tests/backtest/test_entry_bracket_seeding.py
+git commit -m "refactor(backtest): entry TP/SL via unified entry_actions rules, not bespoke Strategy fields"
 ```
+
+**Note:** the ORIGINAL Task 1 commits (`9f28fee`, `32631b8`) already exist in history with the OLD scalar-kwarg signature — that's fine, this task's commit supersedes them going forward; don't rewrite history, just land the correction as a new commit.
 
 ---
 
-### Task 5: GA integration — genes only enter the space when the bracket is on
-
-`_collect_tp_sl` (`strategy_param_space.py:39-48`) already emits `tp`/`sl` genes from `initial_tp_optimize`/`initial_sl_optimize` — but a gene that varies a DEAD parameter wastes two dimensions (that's today's silent behavior). Gate it.
+### Task 5: Gene collection for `entry_actions` — mirror the existing `exit:<id>:*` handling exactly
 
 **Files:**
-- Modify: `testplatform/backend/app/services/strategy_param_space.py:39-48`
-- Test: `testplatform/backend/tests/test_param_space_entry_bracket.py` (create)
+- Modify: `testplatform/backend/app/services/strategy_param_space.py` — DELETE `_collect_tp_sl` (lines 39-48) and its call site in `collect_param_space`; EXTEND `_collect_conditions` (~line 126-169) to walk `getattr(strategy, "entry_actions", None) or []` with the exact same logic already used for `exit_conditions` (action_value_optimize → `entry:<id>:action_value` range; toggle_optimize → `entry:<id>:enabled` 0/1 gene) but WITHOUT the option-selection-param branches (those are exit/option-entry specific, not needed here) and WITHOUT a nested `conditions` walk (entry actions have no sub-tree).
+- Modify: `testplatform/backend/app/services/strategy_param_space.py::decode_params` (~line 249-330) — mirror the `exit:` branch: add an `entry:` branch building `entry_action_by_id`/`entry_enabled_by_id`, then build a decoded `entry_rules` list from `copy.deepcopy(getattr(strategy, "entry_actions", None) or [])` the same way `exit_rules` is built (drop a rule whose `enabled` gene decoded to 0; else apply the decoded `action_value`). Return it in the decoded dict as `entry_rules` (new key, alongside the existing `buy_tree`/`sell_tree`/`exit_rules`).
+- Test: `testplatform/backend/tests/test_strategy_param_space_entry_actions.py` (create)
 
-**Step 1: Failing tests**
-
+**Step 1: Failing tests** (mirror whatever `tests/test_strategy_param_space_decode.py`/`tests/test_param_space_roundtrip.py` already do for `exit_conditions`, just for `entry_actions`):
 ```python
-from app.services.strategy_param_space import collect_param_space
-
-class _Strat:  # minimal strategy shim, same style as tests/test_param_space_no_rm.py
-    initial_tp_optimize = True
-    initial_tp_min, initial_tp_max, initial_tp_step = 4.0, 20.0, 2.0
-    initial_sl_optimize = True
-    initial_sl_min, initial_sl_max, initial_sl_step = 2.0, 10.0, 1.0
+class _Strat:
     buy_entry_conditions = None; sell_entry_conditions = None
     entry_conditions = None; exit_conditions = []
+    entry_actions = [
+        {"id": "e_sl", "action_type": "adjust_stop_loss", "reference_value": "order_open_price",
+         "action_value": -5.0, "action_value_optimize": True,
+         "action_value_min": -15.0, "action_value_max": -2.0, "action_value_step": 1.0},
+    ]
 
-def test_tp_sl_genes_absent_without_entry_bracket():
-    space = collect_param_space(_Strat(), expert_cfg=None, entry_bracket=False)
-    assert "tp" not in space and "sl" not in space
+def test_entry_action_value_gene_collected():
+    space = collect_param_space(_Strat(), expert_cfg=None)
+    assert space["entry:e_sl:action_value"] == {"type": "float", "min": -15.0, "max": -2.0, "step": 1.0}
 
-def test_tp_sl_genes_present_with_entry_bracket():
-    space = collect_param_space(_Strat(), expert_cfg=None, entry_bracket=True)
-    assert "tp" in space and "sl" in space
+def test_entry_rules_decoded_with_ga_value():
+    decoded = decode_params(_Strat(), {"entry:e_sl:action_value": -9.0})
+    rule = next(r for r in decoded["entry_rules"] if r["id"] == "e_sl")
+    assert rule["action_value"] == -9.0
+
+def test_entry_rule_dropped_when_toggled_off():
+    strat = _Strat()
+    strat.entry_actions[0]["toggle_optimize"] = True
+    decoded = decode_params(strat, {"entry:e_sl:enabled": 0})
+    assert not any(r["id"] == "e_sl" for r in decoded["entry_rules"])
 ```
+Check the EXACT existing test file for exit-rule gene collection/decode first and match its fixture style precisely (don't guess `_Strat`'s other required attributes — copy them).
 
-Check `collect_param_space`'s actual signature (line 172) first and match the existing kwargs (screener_cfg etc.); `entry_bracket` becomes a new keyword with default... **decide by call sites**: the optimizer handler is the only caller — pass `entry_bracket=bool(backtest_cfg.get("entry_bracket", False))` there. Default the kwarg to `True` in the function ONLY if existing tests construct spaces relying on tp/sl — run the existing param-space tests to see; otherwise default `False` (safer).
-
-**Step 2: Run — fail** (unexpected kwarg).
-
-**Step 3: Implement** — `_collect_tp_sl(strategy, entry_bracket)`: return `{}` unless `entry_bracket`; thread the kwarg through `collect_param_space`. Update the optimizer call site.
-
-**Step 4: Run** new tests + `pytest tests/test_param_space_roundtrip.py tests/test_strategy_param_space_decode.py tests/test_param_space_no_rm.py -q` — no regressions.
+**Step 2-4:** Run (fail) → implement (mirroring exit's code, don't reinvent) → run (pass) + `pytest tests/test_param_space_roundtrip.py tests/test_strategy_param_space_decode.py tests/test_param_space_no_rm.py -q` (no regressions).
 
 **Step 5: Commit**
-
 ```bash
-git commit -am "feat(optimizer): tp/sl genes gated behind entry_bracket (no dead gene dimensions)"
+git add testplatform/backend/app/services/strategy_param_space.py testplatform/backend/tests/test_strategy_param_space_entry_actions.py
+git commit -m "feat(optimizer): entry_actions gene collection + decode, mirroring exit_conditions"
 ```
 
 ---
 
-### Task 6: Launcher + S4 template — restore the intended target-anchored TP
-
-`ba2test_launcher.py` S4 template (line ~1122-1131, 1486-1488, 1650-1653) was designed around `initial_tp_reference="expert_target_price"` + the tp gene as offset-from-target — silently dead since `_apply_initial_brackets` was removed. Wire it to the new mechanism.
+### Task 6: Wire `entry_rules` through the handler + optimizer chain (delete every dead `initial_tp_*`/`initial_sl_*` reference)
 
 **Files:**
-- Modify: `testplatform/ba2test_launcher.py` — S4 strategy template: set `entry_bracket=True` in its backtest block (the same place lines 1486-1488 set `initial_tp_reference`); leave S1-S3 untouched (their exits are condition-driven by design). Also forward `entry_bracket` from the strategy/backtest block into the optimize request payload wherever `initial_tp_reference` is already forwarded (grep `initial_tp_reference` in the file — 3 sites).
-- Test: none new (Task 4's end-to-end covers the mechanism; the launcher change is config plumbing verified in Step 2).
+- Modify: `testplatform/backend/app/services/backtest/daily_backtest_handler.py` — grep `initial_tp_percent|initial_sl_percent|initial_tp_reference|initial_tp_ref` in this file and DELETE every hit (config-block keys AND the `_apply_initial_brackets`-history comments around them — replace with a short note that entry TP/SL is now just another rule, seeded exactly like exit rules). Add an `entry_rules` config key (list, default `[]`/`None`) forwarded into `_build_experts`'s `seed_ruleset_from_tree(..., entry_actions=config.get("entry_rules"))` call.
+- Modify: `testplatform/backend/app/services/strategy_optimization_handler.py` — DELETE the `initial_tp`/`initial_sl` decoded block (~769-786, the "STALE MECHANISM" comment block) entirely — `decode_params` (Task 5) now returns `entry_rules` directly, no separate tp/sl extraction needed. Forward `decoded.get("entry_rules")` into the trial-config dict as `"entry_rules": decoded.get("entry_rules")` (mirroring the existing `"exit_rules": decoded.get("exit_rules")` line right next to it).
+- Modify: `testplatform/backend/app/api/backtests.py` — grep `initial_tp_percent|initial_sl_percent|initial_tp_reference` and delete; forward `backtest.entry_actions` (renamed from whatever the Backtest model's saved-strategy-params field is — check `app/models/backtest.py` for how `exit_conditions`/`exitConditions` round-trips there and mirror it exactly for `entry_actions`/`entryActions`) into the rerun/single-run payload as `entry_rules`.
+- Modify: `testplatform/backend/app/services/backtest/rerun_handler.py` — same grep-and-delete + mirror the `exit_rules` forwarding pattern for `entry_rules`.
+- Modify: `testplatform/backend/app/models/backtest.py` — check whether `Backtest` has its own `initial_tp_percent`-style columns/dict keys (grep) mirroring `Strategy`'s dead ones; if so, apply the same delete + `entry_actions`/`entryActions` addition there, consistent with however `exit_conditions`/`exitConditions` already round-trips on this model.
+- Test: extend `testplatform/backend/tests/backtest/test_entry_bracket_engine.py` with ONE end-to-end test: config carrying `entry_rules=[{adjust_stop_loss...}]` → `_build_experts` seeds the ruleset → a filled entry's transaction has `stop_loss` set → the RM-safeguard-precedence test from Task 3 already proves the interaction from there.
 
-**Step 1: Make the edit** (no TDD — config template).
+**Step 1-4:** TDD as usual. **Step 5:** full backend suite (`pytest -q` from `testplatform/backend`, expect only the pre-existing ~10 unrelated failures), then commit:
+```bash
+git commit -am "feat(backtest): wire entry_rules through single-run + optimizer trial-config paths; delete dead initial_tp/sl plumbing"
+```
 
-**Step 2: Verify by dry-run**
+---
 
-Run: `C:\Users\basti\ba2-venvs\test\Scripts\python.exe test_files/run_screener_capband_matrix.py --dry-run --strategies S4 --bands large 2>&1 | head -20`
-Then grep the printed/constructed command or add a temporary `--dry-run` print of the backtest block — confirm `entry_bracket: True` + `initial_tp_reference: expert_target_price` appear for S4 and NOT for S1-S3. (Check how `--dry-run` prints jobs first; adapt.)
+### Task 7: Launcher — S4 template attaches its TP via an `entry_actions` rule (delete its `initial_tp_*` usage)
+
+`ba2test_launcher.py`'s S4 template was designed around `initial_tp_reference="expert_target_price"` + an offset-from-target tp gene — dead since `_apply_initial_brackets` was removed, now expressed as a rule instead of a field.
+
+**Files:**
+- Modify: `testplatform/ba2test_launcher.py` — grep `initial_tp_percent|initial_tp_optimize|initial_tp_reference|initial_tp_ref|initial_sl_percent|initial_sl_optimize` across the WHOLE file (not just S4 — S1/S2/S3/minimal templates all currently pass `initial_tp_percent=None, initial_tp_optimize=False` etc. per the plan's original research; these calls must be updated to match the new `Strategy` constructor, which no longer has those kwargs at all — for S1/S2/S3 that just means DELETING the now-nonexistent kwargs from the `Strategy(...)` calls). For S4 specifically, replace its `initial_tp_*` kwargs with:
+```python
+entry_actions=[
+    {"id": "s4_tp", "action_type": "adjust_take_profit",
+     "reference_value": "expert_target_price", "action_value": -5.0,
+     "action_value_optimize": True, "action_value_min": -15.0, "action_value_max": 5.0,
+     "action_value_step": 1.0},
+],
+```
+(pick concrete min/max/step matching the ORIGINAL S4 tp-gene bounds — check the pre-`_apply_initial_brackets`-removal git history or the current dead `initial_tp_min/max/step` values for S4 specifically before they're deleted in Task 4, so the restored behavior matches original intent, not an arbitrary new range).
+
+**Step 1: Make the edits** (config templates, no TDD — but re-run `pytest tests/` in `testplatform/backend` since `Strategy(...)` constructor signature changed in Task 4, so EVERY template call site in this file must compile).
+
+**Step 2: Verify** — run the launcher's own `--dry-run` (or equivalent smallest smoke check) for S1-S4 to confirm no `TypeError: unexpected keyword argument`.
 
 **Step 3: Commit**
-
 ```bash
 git add testplatform/ba2test_launcher.py
-git commit -m "feat(launcher): S4 opts into entry_bracket — target-anchored TP restored"
+git commit -m "feat(launcher): S4 TP restored via entry_actions rule; S1-S3 updated for the deleted initial_tp/sl kwargs"
 ```
 
 ---
 
-### Task 7: Frontend — expose the toggle
-
-All the fields exist (`Backtesting.tsx:691-704`: percent/optimize/min/max/step + `initialTpReference`). Add the single missing control: an "Attach TP/SL at entry" toggle mapped to `entryBracket` in strategy_params, and grey-out the TP/SL fields when off (they're inert then).
+### Task 8: Frontend — delete the dead TP/SL fields, add an entry-actions builder (reuse the exit builder)
 
 **Files:**
-- Modify: `testplatform/frontend/src/pages/Backtesting.tsx`
-  - state: `const [entryBracket, setEntryBracket] = useState(false);` next to line 691
-  - serialize: add `entryBracket` wherever `initialTpPercent` is serialized (lines ~1542-1552, the strategy-save path ~2111+, and the optimize request payload — grep `initialTpPercent` in the file, mirror every site)
-  - load: set it back in the strategy-load path (`setInitialTpPercent` call sites, ~line 2180 area)
-  - UI: checkbox + explanatory tooltip ("Attaches TP/SL as entry-rule actions (live-parity). RM safeguard still applies; tighter stop wins. Off = TP/SL fields inert.") above the existing TP/SL inputs; `disabled={!entryBracket}` on those inputs
-- Modify: `testplatform/backend/app/api/backtests.py` / `strategies.py` — accept `entryBracket` in the strategy_params passthrough (check whether strategy_params is schemaless JSON — if so, zero backend change; verify by grep `initialTpPercent` in `api/strategies.py`)
+- Modify: `testplatform/frontend/src/pages/Backtesting.tsx`:
+  - DELETE all `initialTp*`/`initialSl*` state (lines ~691-704), every serialize site (~1542-1552, strategy-save ~2111+, optimize payload), every load site (~2180 area) — grep `initialTp|initialSl|InitialTp|InitialSl` in this file and remove all of it (the Strategy interface fields at ~138-147 too).
+  - ADD `entryActions` state (`ConditionGroup`-adjacent but action-only — check exactly what shape `ExitConditionsBuilder`'s `value`/`onChange` props expect, likely `ExitConditionSet[]` per the existing `exitConditions` state at line 626) and an "Entry Actions" section inside the existing Entry Conditions modal (the one just fixed for Cancel semantics), reusing `ExitConditionsBuilder` (or a thin wrapper around it) so the SAME action-type dropdown (Close/Sell/Adjust TP/Adjust SL/…), reference-value picker, and optimize-range controls exit rules already have work for entry too — filtered to just the adjust_take_profit/adjust_stop_loss action types (entry doesn't need close/sell actions, those ARE the entry).
+  - Wire `entryActions` into: the condition-modal snapshot/cancel logic just added (include it in `conditionModalSnapshot`), the strategy save/load payload (`entryActions`/`entry_actions` mirroring how `exitConditions`/`exit_conditions` round-trips), and the optimize request payload (`entry_rules` key, matching Task 6's backend field name).
+- Modify: any other frontend file referencing `initialTpPercent`/`initialSlPercent` (grep the whole `testplatform/frontend/src` — check `RuleIO`/export-import components too, since strategies can be exported/imported as JSON).
 
-**Step 1: Implement** (UI change, no TDD; typecheck is the gate).
-
-**Step 2: Verify**
-
-Run: `cd testplatform/frontend && npx tsc --noEmit -p .` → clean.
-Manual: dev server (already running, port 5173) — toggle off: fields greyed; toggle on + save strategy: saved strategy_params contain `"entryBracket": true`; run a small single backtest with bracket on and confirm trades close with OCO exit reasons and the transaction rows carry TP/SL.
+**Step 1: Implement.** **Step 2: Verify** — `npx tsc --noEmit -p .` clean; manually: add an "Adjust Take Profit" entry action in the UI, save a strategy, confirm the saved payload has `entryActions` (not `initialTpPercent`), run a tiny backtest and confirm the transaction gets a real `take_profit`.
 
 **Step 3: Commit**
-
 ```bash
 git add testplatform/frontend/src/pages/Backtesting.tsx
-git commit -m "feat(ui): entry-bracket toggle wires the existing TP/SL fields to the new mechanism"
+git commit -m "feat(ui): entry-actions builder (reuses exit builder) replaces the dead initial-TP/SL fields"
 ```
 
 ---
 
-### Task 8: Docs/comments sweep + version bump
+### Task 9: Docs sweep + version bump
 
 **Files:**
-- Modify: the 4 comment sites updated on 2026-07-03 to say the fields were DEAD — they're now ALIVE behind `entry_bracket`:
-  - `testplatform/backend/app/services/strategy_optimization_handler.py:769` block (done in Task 4 — verify)
-  - `testplatform/backend/app/services/backtest/daily_backtest_handler.py:396` + `~705` blocks (done in Task 4 — verify)
-  - `testplatform/backend/app/services/backtest/default_rulesets.py:177-186` + `200-208` docstrings (done in Task 1 — verify)
-  - `testplatform/backend/app/api/backtests.py:534` comment (done in Task 4 — verify)
-- Modify: `ba2_trade_platform/version.py` — bump build number by 1 (repo convention: bump before every push).
+- Re-check every comment site touched across Tasks 1/4/6 for leftover stale phrasing (search for "entry_bracket", "STALE", "DEAD" across the touched files — none of that language should survive; the mechanism is just "entry rules can carry adjust actions" now, no separate flag concept to explain).
+- `ba2_trade_platform/version.py` — bump build number by 1.
 
-**Step 1:** Re-read each site; fix any leftover "removed/DEAD/STALE" phrasing that contradicts the new opt-in reality (keep the history note: unconditional revival was rejected because historical configs carry dead 5.0/2.0 defaults).
-
-**Step 2:** Full test suites one last time:
-- Backend: `cd testplatform/backend && C:\Users\basti\ba2-venvs\test\Scripts\python.exe -m pytest -q` → same pre-existing failures only.
-- Root: `cd <repo root> && C:\Users\basti\ba2-venvs\trade\Scripts\python.exe -m pytest -q` → same as baseline.
-- Frontend: `npx tsc --noEmit -p .` → clean.
-
-**Step 3: Commit**
-
+**Step 1:** sweep. **Step 2:** full suites (backend `pytest -q`, root `pytest -q`, frontend `tsc --noEmit`) — same baselines as before. **Step 3:**
 ```bash
 git add -A
-git commit -m "docs(backtest): entry-bracket comment sweep + version bump"
+git commit -m "docs(backtest): entry-actions comment sweep + version bump"
 ```
 
 ---
 
 ## Explicitly OUT of scope (YAGNI)
 
-- **Arbitrary actions on entry rules in the UI** (generic action list like the live rule editor): the bracket (TP+SL, one reference choice) covers the actual optimization goal; a generic entry-action builder is a separate feature.
-- **Live-platform changes**: live already works (evaluator is shared, in `ba2_common`); nothing to change there. Do NOT touch `TradeActionEvaluator.py`/`TradeActions.py`/`rule_builders.py` — any behavior gap found in them is a STOP-and-report, not a local patch, since live trades through that code.
-- **Migrating S1-S3 templates** to the bracket: their condition-driven exits are the design; only S4 had dead bracket intent.
-- **The legacy 'ml' engine** (`backtest_handler.py` MLStrategy tp/sl): untouched, it has its own working bracket.
+- **A generic entry-action builder for action types other than adjust_take_profit/adjust_stop_loss** (e.g. letting an entry rule also fire a `close`/`sell`): not requested, no use case yet — `ExitConditionsBuilder` reuse should be filtered/scoped to just the two adjust actions for now; widening it is a separate ask if it comes up.
+- **Live-platform changes**: live already works (evaluator is shared, in `ba2_common`); nothing to change there. Do NOT touch `TradeActionEvaluator.py`/`TradeActions.py`/`rule_builders.py` — any behavior gap found in them (e.g. `TradeManager.py:1216`'s identical unconditional-safeguard-overwrite, found during Task 3 review) is a STOP-and-report, not a local patch, since live trades through that code.
+- **Migrating S1-S3 templates** to carry an entry action: their condition-driven exits are the design; only S4 had dead bracket intent (Task 7 covers exactly that).
+- **The legacy 'ml' engine** (`backtest_handler.py` MLStrategy tp/sl): untouched, it has its own working bracket, unrelated to `Strategy.entry_actions`.
 
-## Verification of live parity (manual, after Task 4)
+## Verification of live parity (manual, after Task 6)
 
-Run one tiny backtest with `entry_bracket=True, initial_tp_percent=10, initial_sl_percent=5` and compare the seeded EventAction JSON against the live prod row (eventaction id=1 in `C:\Users\basti\Documents\ba2_trade_platform-prod\db.sqlite`): same action_type strings, same reference_value vocabulary, adjust configs parse through the same `action_from_rule`/evaluator path. The transaction after entry must carry `take_profit`/`stop_loss` exactly like live's `adjust_tp_sl(source="ruleset")` writes them.
+Run one tiny backtest with an `entry_rules`/`entryActions` list carrying an `adjust_stop_loss` rule and compare the seeded EventAction JSON against the live prod row (eventaction id=1, `BUY_Longterm_70pctConfidence_10pctProfit`, in `C:\Users\basti\Documents\ba2_trade_platform-prod\db.sqlite`): same action_type strings, same reference_value vocabulary, same `action_from_rule` conversion — because it's now LITERALLY the same function, not a parallel implementation. The transaction after entry must carry `take_profit`/`stop_loss` exactly like live's `adjust_tp_sl(source="ruleset")` writes them.

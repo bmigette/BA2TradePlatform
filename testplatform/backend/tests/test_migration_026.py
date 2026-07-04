@@ -1,27 +1,21 @@
 """
-Test for migration 022: drop the retired `Strategy.rm_*` columns.
+Test for migration 026: replace the dead `Strategy.initial_tp_*`/`initial_sl_*` columns
+with a single `entry_actions` JSON column.
 
-Builds a legacy `strategies` table containing a few `rm_*` columns alongside the
-kept columns + one row, loads `db_migrate/022_drop_strategy_rm_columns.py` via
-importlib, runs its migration against an open sqlite3 connection (the real runner
-contract: `upgrade(cursor, conn)`), then asserts NO column starts with `rm_` and
-the kept row (name, initial_tp_percent, id) survives.
+Builds a legacy `strategies` table containing the 10 `initial_tp_*`/`initial_sl_*` columns
+(no `entry_actions`) alongside the kept columns + one row, loads
+`db_migrate/026_entry_actions_replace_tpsl_fields.py` via importlib, runs its migration
+against an open sqlite3 connection (the real runner contract: `upgrade(cursor, conn)`), then
+asserts NO `initial_tp_*`/`initial_sl_*` column survives, `entry_actions` is present, and the
+kept row (name, id, exit_conditions) survives.
 """
 
 import importlib.util
+import json
 import sqlite3
 from pathlib import Path
 
 MIGRATION_PATH = (
-    Path(__file__).resolve().parent.parent
-    / "db_migrate"
-    / "022_drop_strategy_rm_columns.py"
-)
-# Migration 026 (entry_actions replaces initial_tp_*/initial_sl_*) — chained after 022 in the
-# ORM-insert test below so the rebuilt table matches the CURRENT Strategy model (which no
-# longer declares initial_tp_*/initial_sl_*), exactly like the real migration runner applies
-# migrations in sequence.
-MIGRATION_026_PATH = (
     Path(__file__).resolve().parent.parent
     / "db_migrate"
     / "026_entry_actions_replace_tpsl_fields.py"
@@ -30,16 +24,7 @@ MIGRATION_026_PATH = (
 
 def _load_migration():
     spec = importlib.util.spec_from_file_location(
-        "migration_022", MIGRATION_PATH
-    )
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def _load_migration_026():
-    spec = importlib.util.spec_from_file_location(
-        "migration_026", MIGRATION_026_PATH
+        "migration_026", MIGRATION_PATH
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -52,7 +37,8 @@ def _table_columns(cursor, table):
 
 
 def _build_legacy_strategies(conn):
-    """Create a legacy strategies table with rm_* + kept columns and one row."""
+    """Create a legacy strategies table (post-022, pre-026) with initial_tp_*/initial_sl_*
+    columns + kept columns + one row, matching the real DB shape this migration targets."""
     cursor = conn.cursor()
     cursor.execute(
         """
@@ -75,16 +61,6 @@ def _build_legacy_strategies(conn):
             initial_sl_min FLOAT,
             initial_sl_max FLOAT,
             initial_sl_step FLOAT,
-            rm_risk_per_trade_pct FLOAT DEFAULT 1.0,
-            rm_risk_per_trade_pct_optimize BOOLEAN DEFAULT 0,
-            rm_risk_per_trade_pct_min FLOAT,
-            rm_risk_per_trade_pct_max FLOAT,
-            rm_risk_per_trade_pct_step FLOAT,
-            rm_max_concurrent_positions INTEGER DEFAULT 5,
-            rm_max_concurrent_positions_optimize BOOLEAN DEFAULT 0,
-            rm_max_concurrent_positions_min INTEGER,
-            rm_max_concurrent_positions_max INTEGER,
-            rm_max_concurrent_positions_step INTEGER,
             created_at DATETIME,
             updated_at DATETIME
         )
@@ -92,61 +68,52 @@ def _build_legacy_strategies(conn):
     )
     cursor.execute(
         """
-        INSERT INTO strategies (name, initial_tp_percent, rm_risk_per_trade_pct)
+        INSERT INTO strategies (name, initial_tp_percent, exit_conditions)
         VALUES (?, ?, ?)
         """,
-        ("Legacy Strat", 7.5, 1.0),
+        ("Legacy Strat", 7.5, json.dumps([{"id": "e1", "action_type": "close"}])),
     )
     conn.commit()
 
 
-def test_migration_drops_all_rm_columns_and_keeps_data():
+def test_migration_drops_tpsl_columns_and_adds_entry_actions():
     conn = sqlite3.connect(":memory:")
     try:
         _build_legacy_strategies(conn)
         cursor = conn.cursor()
 
-        # Sanity: rm_* columns exist before migration.
         before = _table_columns(cursor, "strategies")
-        assert any(c.startswith("rm_") for c in before)
+        assert any(c.startswith("initial_tp_") or c.startswith("initial_sl_") for c in before)
+        assert "entry_actions" not in before
 
         migration = _load_migration()
-        migration.upgrade(cursor, conn)
+        result = migration.upgrade(cursor, conn)
+        assert result
 
         after = _table_columns(cursor, "strategies")
-        # No column starts with rm_ anymore.
-        assert not any(c.startswith("rm_") for c in after), after
-        # Kept columns survive.
+        assert not any(c.startswith("initial_tp_") or c.startswith("initial_sl_") for c in after), after
+        assert "entry_actions" in after
         assert "name" in after
-        assert "initial_tp_percent" in after
         assert "id" in after
+        assert "exit_conditions" in after
 
-        # The kept row (and its id/name/tp) survived.
-        cursor.execute(
-            "SELECT id, name, initial_tp_percent FROM strategies"
-        )
+        cursor.execute("SELECT id, name, exit_conditions, entry_actions FROM strategies")
         rows = cursor.fetchall()
         assert len(rows) == 1
         assert rows[0][0] == 1
         assert rows[0][1] == "Legacy Strat"
-        assert rows[0][2] == 7.5
+        assert json.loads(rows[0][2]) == [{"id": "e1", "action_type": "close"}]
+        assert rows[0][3] is None
     finally:
         conn.close()
 
 
 def _pk_columns(cursor, table):
     cursor.execute(f"PRAGMA table_info({table})")
-    # row = (cid, name, type, notnull, dflt_value, pk)
     return {row[1]: row[5] for row in cursor.fetchall()}
 
 
 def test_migration_preserves_pk_and_autoincrement():
-    """Regression for C1: the rebuilt table must keep id as an autoincrement PK.
-
-    The old CTAS rebuild (`CREATE TABLE ... AS SELECT`) produced a PK-less,
-    AUTOINCREMENT-less table; a fresh insert without an explicit id failed to
-    autoincrement and `id` was not a PRIMARY KEY. This asserts both properties.
-    """
     conn = sqlite3.connect(":memory:")
     try:
         _build_legacy_strategies(conn)
@@ -155,30 +122,24 @@ def test_migration_preserves_pk_and_autoincrement():
         migration = _load_migration()
         migration.upgrade(cursor, conn)
 
-        # id is the PRIMARY KEY on the rebuilt table.
         pks = _pk_columns(cursor, "strategies")
         assert pks.get("id") == 1, pks
 
-        # Existing max id (the migrated legacy row).
         cursor.execute("SELECT MAX(id) FROM strategies")
         existing_max = cursor.fetchone()[0]
         assert existing_max == 1
 
-        # Insert a row WITHOUT specifying id -> must get a working autoincrement.
         cursor.execute(
-            "INSERT INTO strategies (name, initial_tp_percent) VALUES (?, ?)",
-            ("Brand New", 3.0),
+            "INSERT INTO strategies (name, entry_actions) VALUES (?, ?)",
+            ("Brand New", json.dumps([{"id": "e_tp", "action_type": "adjust_take_profit"}])),
         )
         conn.commit()
         new_id = cursor.lastrowid
         assert new_id is not None
         assert new_id > existing_max, (new_id, existing_max)
 
-        # name NOT NULL constraint survived the rebuild.
         try:
-            cursor.execute(
-                "INSERT INTO strategies (initial_tp_percent) VALUES (?)", (1.0,)
-            )
+            cursor.execute("INSERT INTO strategies (entry_actions) VALUES (?)", ("[]",))
             inserted_null_name = True
         except sqlite3.IntegrityError:
             inserted_null_name = False
@@ -190,30 +151,22 @@ def test_migration_preserves_pk_and_autoincrement():
 
 
 def test_migration_preserves_pk_via_orm_insert():
-    """Regression for C1 through the real SQLAlchemy Strategy model.
-
-    Build a legacy table, run the migration on the same DBAPI connection, then
-    insert a new Strategy through the ORM the way the app does and confirm it
-    gets an autoincrement id assigned by the DB.
-    """
-    from sqlalchemy import create_engine, event
+    """Through the real SQLAlchemy Strategy model: build a legacy table, run the migration on
+    the same DBAPI connection, then insert a new Strategy via the ORM (the way the app does)
+    and confirm it gets an autoincrement id and the new entry_actions column round-trips."""
+    from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
 
     from app.models.strategy import Strategy
 
     engine = create_engine("sqlite://")  # in-memory, single shared connection
 
-    # Run the legacy-table build + migration 022, THEN migration 026 (in the real order
-    # migrations get applied), on the engine's connection — so the final schema matches the
-    # CURRENT Strategy ORM model (which no longer declares initial_tp_*/initial_sl_*).
     raw = engine.raw_connection()
     try:
         _build_legacy_strategies(raw)
         cursor = raw.cursor()
         migration = _load_migration()
         migration.upgrade(cursor, raw)
-        migration_026 = _load_migration_026()
-        migration_026.upgrade(cursor, raw)
         raw.commit()
     finally:
         raw.close()
@@ -221,19 +174,29 @@ def test_migration_preserves_pk_via_orm_insert():
     SessionLocal = sessionmaker(bind=engine)
     session = SessionLocal()
     try:
-        strat = Strategy(name="ORM Strat", entry_actions=[{"id": "e_sl", "action_type": "adjust_stop_loss"}])
+        strat = Strategy(
+            name="ORM Strat",
+            entry_actions=[{"id": "e_sl", "action_type": "adjust_stop_loss", "action_value": -3.0}],
+        )
         assert strat.id is None
         session.add(strat)
         session.commit()
         session.refresh(strat)
         assert strat.id is not None
         assert strat.id > 1  # greater than the migrated legacy row's id (1)
+        assert strat.entry_actions == [
+            {"id": "e_sl", "action_type": "adjust_stop_loss", "action_value": -3.0}
+        ]
+        d = strat.to_dict()
+        assert d["entryActions"] == strat.entry_actions
+        assert "initialTpPercent" not in d
+        assert "initialSlPercent" not in d
     finally:
         session.close()
         engine.dispose()
 
 
-def test_migration_is_idempotent_noop_when_no_rm_columns():
+def test_migration_is_idempotent_noop_when_already_migrated():
     conn = sqlite3.connect(":memory:")
     try:
         cursor = conn.cursor()
@@ -242,24 +205,24 @@ def test_migration_is_idempotent_noop_when_no_rm_columns():
             CREATE TABLE strategies (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name VARCHAR(255) NOT NULL,
-                initial_tp_percent FLOAT DEFAULT 5.0
+                entry_actions JSON
             )
             """
         )
         cursor.execute(
-            "INSERT INTO strategies (name, initial_tp_percent) VALUES (?, ?)",
-            ("No RM", 5.0),
+            "INSERT INTO strategies (name, entry_actions) VALUES (?, ?)",
+            ("Already Migrated", "[]"),
         )
         conn.commit()
 
         migration = _load_migration()
         result = migration.upgrade(cursor, conn)
-        # No rm_* columns -> migration is a no-op (falsy return).
         assert not result
 
         after = _table_columns(cursor, "strategies")
-        assert not any(c.startswith("rm_") for c in after)
+        assert not any(c.startswith("initial_tp_") or c.startswith("initial_sl_") for c in after)
+        assert "entry_actions" in after
         cursor.execute("SELECT name FROM strategies")
-        assert cursor.fetchone()[0] == "No RM"
+        assert cursor.fetchone()[0] == "Already Migrated"
     finally:
         conn.close()
