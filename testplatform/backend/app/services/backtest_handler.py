@@ -1082,7 +1082,11 @@ def handle_backtest(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
                 # initial_tp_percent/initial_sl_percent were removed from the Strategy model
                 # (entry TP/SL is now expressed via entry_actions rules) — this legacy 'ml'
                 # engine path is untouched/out of scope for that rework, so keep it working
-                # with getattr fallbacks to the same historical defaults (5.0/2.0).
+                # with getattr fallbacks to the same historical defaults (5.0/2.0). No longer
+                # optimizable for this engine (the GA "tp"/"sl" gene family that used to feed
+                # this via _collect_tp_sl is gone too — see strategy_param_space.decode_params);
+                # strategy_optimization_handler._run_ml_trial_backtest uses this SAME static
+                # fallback for its GA-trial call site, so both 'ml'-engine paths agree.
                 strategy_base_params = {
                     'initial_tp_percent': getattr(strategy, 'initial_tp_percent', None) or 5.0,
                     'initial_sl_percent': getattr(strategy, 'initial_sl_percent', None) or 2.0,

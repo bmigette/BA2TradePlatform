@@ -939,9 +939,21 @@ def _run_ml_trial_backtest(
         for df in (pred_df, exec_df):
             if "Date" in df.columns:
                 df["Date"] = pd.to_datetime(df["Date"])
+        # decoded['tp']/['sl'] are a legacy pass-through ONLY (see strategy_param_space's
+        # module/decode_params docstrings): collect_param_space no longer emits a "tp"/"sl"
+        # gene namespace for any real (DB-backed) Strategy — that GA gene family (formerly
+        # built by the deleted _collect_tp_sl) was removed along with the
+        # initial_tp_percent/initial_sl_percent scalar columns when entry TP/SL moved to
+        # entry_actions (docs/plans/2026-07-03-entry-tp-sl-bracket-actions.md). The legacy 'ml'
+        # engine was explicitly OUT OF SCOPE for that migration and was never wired onto
+        # entry_actions, so decoded["tp"]/["sl"] always resolve to None here now and this path
+        # is no longer GA-optimized. Fall back to the SAME static historical defaults (5.0/2.0)
+        # backtest_handler.run_backtest's single-run path already uses for this exact reason,
+        # so behavior is at least consistent across both 'ml'-engine call sites instead of
+        # silently degrading to a 0%/0% (disabled) bracket.
         strategy_params = {
-            "initial_tp_percent": decoded["tp"],
-            "initial_sl_percent": decoded["sl"],
+            "initial_tp_percent": decoded["tp"] if decoded["tp"] is not None else 5.0,
+            "initial_sl_percent": decoded["sl"] if decoded["sl"] is not None else 2.0,
         }
         return run_backtest(
             model=model,
