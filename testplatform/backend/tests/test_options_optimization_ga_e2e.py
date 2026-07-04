@@ -65,10 +65,6 @@ def _seed_option_strategy() -> int:
     try:
         s = Strategy(
             name="opt-options-e2e",
-            initial_tp_percent=5.0,
-            initial_tp_optimize=False,
-            initial_sl_percent=2.0,
-            initial_sl_optimize=False,
             exit_conditions=[dict(_OPTION_EXIT)],
         )
         db.add(s)

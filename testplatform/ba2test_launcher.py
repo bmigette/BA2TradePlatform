@@ -904,13 +904,12 @@ def _build_strategy_row(name: str):
         # No global TP/SL brackets — exits are 100% condition-driven, matching the live engine
         # (which attaches no baseline bracket on entry). TP = the exit_takeprofit CLOSE rule; SL =
         # the exit_stoploss adjust_stop_loss rule above (both optimized + toggleable).
-        # NO global initial TP/SL bracket (the old 200% dummies are gone). SL is placed by the
-        # max-risk SAFEGUARD on entry (min ATR×mult / risk%, floored at min_stop_loss_pct — shared
-        # classic RM, so backtest == live); TP comes from the exit CONDITIONS (S4 anchors on the
-        # analyst target; S1's live ruleset trails). None keeps order.stop_loss None so the
-        # safeguard fires — exactly like live, no dummy bracket masking the conditions.
-        initial_tp_percent=None, initial_tp_optimize=False,
-        initial_sl_percent=None, initial_sl_optimize=False,
+        # No entry_actions either (the old initial_tp_percent/initial_sl_percent scalar fields
+        # are gone from the Strategy model entirely). SL is placed by the max-risk SAFEGUARD on
+        # entry (min ATR×mult / risk%, floored at min_stop_loss_pct — shared classic RM, so
+        # backtest == live); TP comes from the exit CONDITIONS (S4 anchors on the analyst target
+        # via entry_actions; S1's live ruleset trails). No bracket masks the conditions — the
+        # safeguard fires exactly like live.
     )
 
 
@@ -971,13 +970,12 @@ def _build_strategy_S3(name: str):
         exit_conditions=exit_conditions,
         # No global TP/SL brackets — exits are 100% condition-driven (matches live). The protective
         # stop is the exit_stoploss adjust_stop_loss rule above; the trailing tiers ratchet it up.
-        # NO global initial TP/SL bracket (the old 200% dummies are gone). SL is placed by the
-        # max-risk SAFEGUARD on entry (min ATR×mult / risk%, floored at min_stop_loss_pct — shared
-        # classic RM, so backtest == live); TP comes from the exit CONDITIONS (S4 anchors on the
-        # analyst target; S1's live ruleset trails). None keeps order.stop_loss None so the
-        # safeguard fires — exactly like live, no dummy bracket masking the conditions.
-        initial_tp_percent=None, initial_tp_optimize=False,
-        initial_sl_percent=None, initial_sl_optimize=False,
+        # No entry_actions either (the old initial_tp_percent/initial_sl_percent scalar fields
+        # are gone from the Strategy model entirely). SL is placed by the max-risk SAFEGUARD on
+        # entry (min ATR×mult / risk%, floored at min_stop_loss_pct — shared classic RM, so
+        # backtest == live); TP comes from the exit CONDITIONS (S4 anchors on the analyst target
+        # via entry_actions; S1's live ruleset trails). No bracket masks the conditions — the
+        # safeguard fires exactly like live.
     )
 
 
@@ -1114,36 +1112,36 @@ def _build_strategy_S1(name: str, expert: str):
         exit_conditions=exits,
         # No global TP/SL brackets — S1 runs the LIVE ruleset's conditions verbatim (its
         # adjust_stop_loss / adjust_take_profit / close rules), exactly like the live engine.
-        # NO global initial TP/SL bracket (the old 200% dummies are gone). SL is placed by the
-        # max-risk SAFEGUARD on entry (min ATR×mult / risk%, floored at min_stop_loss_pct — shared
-        # classic RM, so backtest == live); TP comes from the exit CONDITIONS (S4 anchors on the
-        # analyst target; S1's live ruleset trails). None keeps order.stop_loss None so the
-        # safeguard fires — exactly like live, no dummy bracket masking the conditions.
-        initial_tp_percent=None, initial_tp_optimize=False,
-        initial_sl_percent=None, initial_sl_optimize=False,
+        # No entry_actions either (the old initial_tp_percent/initial_sl_percent scalar fields
+        # are gone from the Strategy model entirely). SL is placed by the max-risk SAFEGUARD on
+        # entry (min ATR×mult / risk%, floored at min_stop_loss_pct — shared classic RM, so
+        # backtest == live); TP comes from the exit CONDITIONS (S4 anchors on the analyst target
+        # via entry_actions; S1's live ruleset trails). No bracket masks the conditions — the
+        # safeguard fires exactly like live.
     )
 
 
 def _build_strategy_S4(name: str, expert: str):
     """S4 — TARGET-TRAIL. Same live trailing ruleset as S1 (trail-TP-to-target rule live-34 +
-    the trailing-SL ladder), but the INITIAL TP is ANCHORED on the expert's analyst target
-    price (optimize-batch sets initial_tp_reference="expert_target_price" for S4) instead of
-    off entry. The optimizable initial_tp gene becomes the OFFSET-FROM-TARGET and is allowed
-    NEGATIVE (TP below target, e.g. -10 -> TP = target*0.90). Validated: target-anchoring rode
-    NVDA to +1065% and exited via take_profit (~2.3x the entry-anchored return). Pairs with the
-    optimizable target_price_type (which analyst reference price to anchor on)."""
+    the trailing-SL ladder), but the ENTRY TP is ANCHORED on the expert's analyst target price
+    instead of off the entry price. This is expressed as an ``entry_actions`` rule (an
+    adjust_take_profit action fired ONCE at entry by the shared TradeActionEvaluator's
+    Phase 1.5/2 — the same mechanism live uses, see
+    docs/plans/2026-07-03-entry-tp-sl-bracket-actions.md), not a recurring exit condition and
+    not the old bespoke Strategy.initial_tp_* scalar fields (deleted entirely from the model).
+    The optimizable gene is the OFFSET-FROM-TARGET and is allowed NEGATIVE (TP below target,
+    e.g. -10 -> TP = target*0.90). Validated: target-anchoring rode NVDA to +1065% and exited
+    via take_profit (~2.3x the entry-anchored return). Pairs with the optimizable
+    target_price_type (which analyst reference price to anchor on). Bounds below are carried
+    over unchanged from the original mechanism's range (action_value=0.0,
+    min=-20.0, max=10.0, step=2.0 — same values the deleted
+    initial_tp_percent/_min/_max/_step carried for S4)."""
     strat = _build_strategy_S1(name, expert)
-    # Conditions-only target-anchoring (no global bracket — matches live): add an always-on rule
-    # that sets the TP to the analyst target price while holding. The NEGATIVE-CAPABLE offset is the
-    # optimizable gene — TP = target * (1 + offset/100), so e.g. -10 -> TP at 90% of target. This is
-    # S4's distinguishing mechanism, now expressed as an exit condition (like live-34) rather than a
-    # global initial-TP bracket. (Validated entry-anchored ~2.3x: rode NVDA to +1065% via take_profit.)
-    strat.exit_conditions = list(strat.exit_conditions or []) + [
-        {"id": "tp_target", "action_type": "adjust_take_profit", "reference_value": "expert_target_price",
+    strat.entry_actions = [
+        {"id": "s4_tp", "action_type": "adjust_take_profit", "reference_value": "expert_target_price",
          "action_value": 0.0, "action_value_optimize": True,
          "action_value_min": -20.0, "action_value_max": 10.0, "action_value_step": 2.0,
-         "toggle_optimize": True,
-         "conditions": {"type": "AND", "conditions": [{"id": "tp_hold", "field": "has_position"}]}},
+         "toggle_optimize": True},
     ]
     return strat
 
@@ -1256,8 +1254,6 @@ def _build_strategy_option(kind: str):
              "optimize": True, "value_min": 40, "value_max": 75, "value_step": 5,
              "toggle_optimize": True}]},
         exit_conditions=_option_exit_rules(kind),
-        initial_tp_percent=500.0, initial_tp_optimize=False,
-        initial_sl_percent=500.0, initial_sl_optimize=False,
     )
     # Carry the entry option action so the run-config assembly picks it up (transient attr; not
     # a mapped column => not persisted, survives db.refresh which only reloads mapped columns).
@@ -1295,10 +1291,6 @@ _STRATEGY_BUILDERS = {
     "O_BF": _build_strategy_option, "O_RS": _build_strategy_option,
     "O_CC": _build_strategy_covered_call, "O_STK": _build_strategy_stock,
 }
-
-# Strategy kinds whose INITIAL TP anchors on the expert's analyst target price (the
-# optimize-batch run config sets initial_tp_reference="expert_target_price" for these).
-_TARGET_ANCHORED_STRATEGIES = {"S4"}
 
 
 def _build_strategy(kind: str, name: str, expert: str):
@@ -1482,10 +1474,9 @@ def _cmd_optimize(args) -> int:
             universe = enabled  # for the progress line / submit description below
             screener_genes = {f"screener:{k}": v for k, v in _scr_opt.items()}
 
-        # Target-anchored variant (S4): the initial TP bracket references the expert's analyst target
-        # price (the initial_tp gene becomes the offset-from-target). Not applicable to bypass experts.
-        if (not bypass) and args.strategy in _TARGET_ANCHORED_STRATEGIES:
-            backtest_block["initial_tp_reference"] = "expert_target_price"
+        # Target-anchored variant (S4): the TP-on-target anchoring lives on the Strategy row itself
+        # (strat.entry_actions, seeded by _build_strategy_S4 with reference_value=
+        # "expert_target_price") — nothing to thread onto the run config here.
         # Pure-option strategy: thread the option ENTRY action onto the run config. The optimization
         # handler's _build_daily_trial_config forwards backtest['entry_action'] into every trial
         # config, and daily_backtest_handler._build_experts reads config['entry_action'] to seed the
@@ -1646,11 +1637,9 @@ def _cmd_optimize_batch(args) -> int:
                 "backtest_id": int(_dt.now().timestamp()),
                 "name": f"{name}-trial",
             }
-            # Target-anchored variants (S4): the INITIAL TP bracket references the expert's
-            # analyst target price; the optimizable initial_tp gene is the (negative-capable)
-            # offset-from-target. Other kinds keep the default percent-off-entry TP.
-            if strat_kind in _TARGET_ANCHORED_STRATEGIES:
-                backtest_block["initial_tp_reference"] = "expert_target_price"
+            # Target-anchored variants (S4): the TP-on-target anchoring lives on the Strategy row
+            # itself (strat.entry_actions, seeded by _build_strategy_S4) — nothing to thread onto
+            # the run config here.
             # Pure-option strategy: thread the option ENTRY action onto the run config so every trial
             # seeds the enter ruleset with the option action (forwarded by _build_daily_trial_config).
             if strat_entry_action:
