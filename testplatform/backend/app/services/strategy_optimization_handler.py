@@ -697,9 +697,10 @@ def _run_trial_backtest(
         RM sizing such as ``risk_per_trade_pct``) is MERGED into each expert's settings dict
         (the engine feeds settings to ``_process``; the RM reads its sizing params off the
         expert via ``get_setting_with_interface_default``);
-      * ``decoded['tp']`` / ``decoded['sl']`` set the initial TP/SL the ruleset applies;
-      * ``decoded['buy_tree']`` / ``decoded['sell_tree']`` / ``decoded['exit_rules']`` are
-        the substituted condition trees.
+      * ``decoded['buy_tree']`` / ``decoded['sell_tree']`` / ``decoded['exit_rules']`` /
+        ``decoded['entry_rules']`` are the substituted condition trees + rule lists
+        (``entry_rules`` seeds the enter ruleset's opt-in TP/SL bracket, mirroring
+        ``exit_rules`` exactly).
 
     The legacy ML-expert single-asset path (``backtest_handler.run_backtest``) is kept as a
     lazily-imported fallback for ``engine == 'ml'`` so it never pulls torch unless explicitly
@@ -734,10 +735,9 @@ def _build_daily_trial_config(
     ``risk_per_trade_pct``), so the classic RM sizes against the trial's risk config
     with no separate mapping needed.
 
-    BYPASS expert (piece 1c): for an expert that declares ``bypasses_classic_rm`` the param
-    space already excludes tp/sl, so ``decoded`` carries none; but we ALSO refuse to inject
-    any tp/sl override defensively (the bypass rebalance path ignores them), forwarding ONLY
-    the expert's own model:* overrides.
+    BYPASS expert (piece 1c): for an expert that declares ``bypasses_classic_rm``, ``bypass``
+    below gates the screener-settings wiring further down — it has no tp/sl implications since
+    entry TP/SL rides on ``entry_rules`` (Strategy.entry_actions), not a bespoke gene.
     """
     bypass = _is_bypass_expert(backtest_cfg)
     overrides = dict(decoded.get("expert_overrides") or {})
@@ -765,19 +765,6 @@ def _build_daily_trial_config(
     ):
         options_cache_db = default_options_cache_db()
     validate_options_window(backtest_cfg["start_date"], bool(options_cache_db))
-
-    # STALE MECHANISM (kept only for backward-compat payload shape): these ride on the run
-    # config as "tp"/"sl" genes, but the daily engine's baseline entry bracket
-    # (formerly ``_apply_initial_brackets``) was REMOVED — see daily_engine.py's per-bar loop
-    # comment ("the engine no longer attaches a baseline 'Position protection' TP/SL bracket on
-    # entry"). Positions now close SOLELY via the strategy's own exit conditions plus the classic
-    # RM's safeguard stop (TradeRiskManagement -> submit_order(sl_price=...), daily_engine.py
-    # ~line 1160-1174), which is unrelated to these percents. initial_tp/initial_sl below are
-    # therefore forwarded but NOT consumed by daily_backtest_handler for the daily_expert engine —
-    # do not rely on them to protect a position; a strategy needs a real exit condition (or the
-    # RM stop) or it will hold indefinitely (matches live).
-    initial_tp = None if bypass else decoded.get("tp")
-    initial_sl = None if bypass else decoded.get("sl")
 
     # BYPASS-expert screener wiring: a bypass expert (e.g. FactorRanker) builds its DYNAMIC
     # universe from the fast metric_store by reading ``universe_source`` / ``screener_store`` /
@@ -900,21 +887,16 @@ def _build_daily_trial_config(
         "buy_tree": decoded.get("buy_tree"),
         "sell_tree": decoded.get("sell_tree"),
         "exit_rules": decoded.get("exit_rules"),
+        # Entry-time TP/SL bracket rules (adjust_take_profit/adjust_stop_loss actions on the
+        # enter rule) — decoded from Strategy.entry_actions via the entry:<id>:* genes, mirrors
+        # exit_rules exactly. Opt-in: empty/absent means no bracket for this trial.
+        "entry_rules": decoded.get("entry_rules"),
         # Pure-option ENTRY action (no equity leg): forwarded run-level so daily_backtest_handler.
         # _build_experts seeds the enter ruleset with it. None for equity strategies (unchanged).
         "entry_action": entry_action,
         # "Allow short" -> seed the symmetric SHORT enter rule + RM sell gate (mirrors the
         # single-backtest path). Carried from the run-level optimize backtest block.
         "enable_short": bool(backtest_cfg.get("enable_short")),
-        # Initial TP/SL bracket percents (the tp/sl genes) — DEAD as of the removal of the
-        # engine's baseline entry bracket (see the note above ``initial_tp = ...``); forwarded
-        # only for payload-shape compatibility. Real position closure is via exit conditions +
-        # the RM safeguard stop.
-        "initial_tp_percent": initial_tp,
-        "initial_sl_percent": initial_sl,
-        # Canonical TP-reference mode, forwarded for the same compatibility reason — also unread
-        # by the current daily engine (no baseline bracket to anchor).
-        "initial_tp_reference": backtest_cfg.get("initial_tp_reference"),
         # OPTIONS seam: a non-None path here flags an options trial — run_daily_backtest builds
         # the HistoricalOptionsProvider from it and injects it into the BacktestAccount so the
         # option exit rule (and its option_delta/option_dte genes) can fetch a chain. None for an

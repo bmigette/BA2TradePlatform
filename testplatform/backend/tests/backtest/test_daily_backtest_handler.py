@@ -129,31 +129,25 @@ def test_build_config_rejects_bad_date_order():
 
 
 # ---------------------------------------------------------------------------
-# TP-reference: single canonical key (initial_tp_reference) + legacy alias
+# Entry-time TP/SL bracket (entry_rules) — Task 6. Replaces the deleted
+# initial_tp_percent/initial_sl_percent/initial_tp_reference/initial_tp_ref scalar-field
+# mechanism entirely: the bracket now rides on a rule list, the SAME shape exit_rules uses,
+# forwarded unchanged (mirrors exit_rules' own forwarding immediately above in _build_config).
 # ---------------------------------------------------------------------------
-def test_build_config_forwards_canonical_tp_reference():
-    """The canonical ``initial_tp_reference`` flows through to the engine config."""
-    cfg = H._build_config(_payload(1, initial_tp_reference="expert_target_price"))
-    assert cfg["initial_tp_reference"] == "expert_target_price"
+def test_build_config_forwards_entry_rules():
+    """``entry_rules`` flows through to the engine config unchanged."""
+    entry_rules = [
+        {"id": "e_tp", "action_type": "adjust_take_profit",
+         "reference_value": "expert_target_price", "action_value": 10.0},
+    ]
+    cfg = H._build_config(_payload(1, entry_rules=entry_rules))
+    assert cfg["entry_rules"] == entry_rules
 
 
-def test_build_config_aliases_legacy_initial_tp_ref():
-    """The legacy ``initial_tp_ref`` name is accepted and maps to the canonical key."""
-    cfg = H._build_config(_payload(1, initial_tp_ref="expert_target_price"))
-    assert cfg["initial_tp_reference"] == "expert_target_price"
-
-
-def test_build_config_canonical_wins_over_legacy_alias():
-    """When BOTH names are present the canonical key takes precedence."""
-    cfg = H._build_config(_payload(
-        1, initial_tp_reference="expert_target_price", initial_tp_ref="percent"))
-    assert cfg["initial_tp_reference"] == "expert_target_price"
-
-
-def test_build_config_tp_reference_absent_is_none():
-    """No reference supplied -> None (the engine's default percent-off-entry path)."""
+def test_build_config_entry_rules_absent_is_none():
+    """No entry_rules supplied -> None (no entry-time bracket for this run)."""
     cfg = H._build_config(_payload(1))
-    assert cfg.get("initial_tp_reference") is None
+    assert cfg.get("entry_rules") is None
 
 
 # ---------------------------------------------------------------------------

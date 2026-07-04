@@ -103,9 +103,10 @@ def test_create_daily_expert_static_universe(client, db):
 
 
 def test_create_daily_expert_forwards_conditions_and_tp_sl(client, db, monkeypatch):
-    """A daily_expert create WITH a buy-entry tree + TP/SL forwards them into the enqueued
-    task payload using the handler's exact keys (buy_tree / sell_tree / exit_rules /
-    initial_tp_percent / initial_sl_percent)."""
+    """A daily_expert create WITH a buy-entry tree + an entry-time TP/SL bracket forwards them
+    into the enqueued task payload using the handler's exact keys (buy_tree / sell_tree /
+    exit_rules / entry_rules — the entry TP/SL bracket rides on entry_rules now, a rule list in
+    the same shape as exit_rules, not the deleted initial_tp_percent/initial_sl_percent fields)."""
     from app.services import task_queue as tq
 
     captured: dict = {}
@@ -125,6 +126,12 @@ def test_create_daily_expert_forwards_conditions_and_tp_sl(client, db, monkeypat
         "conditions": [{"field": "confidence", "op": "<", "value": 0.3}],
     }
     exit_rules = [{"id": "exit-1", "action": "close", "conditions": {}}]
+    entry_actions = [
+        {"id": "entry_tp", "action_type": "adjust_take_profit",
+         "reference_value": "order_open_price", "action_value": 8.0},
+        {"id": "entry_sl", "action_type": "adjust_stop_loss",
+         "reference_value": "order_open_price", "action_value": -4.0},
+    ]
 
     payload = {
         "name": "daily-conditions-test",
@@ -141,8 +148,7 @@ def test_create_daily_expert_forwards_conditions_and_tp_sl(client, db, monkeypat
         "buy_entry_conditions": buy_tree,
         "sell_entry_conditions": sell_tree,
         "exit_conditions": exit_rules,
-        "initial_tp_percent": 8.0,
-        "initial_sl_percent": 4.0,
+        "entry_actions": entry_actions,
     }
     resp = client.post("/api/backtests", json=payload)
     assert resp.status_code in (200, 201), resp.text
@@ -150,12 +156,11 @@ def test_create_daily_expert_forwards_conditions_and_tp_sl(client, db, monkeypat
     enqueued = captured["payload"]
     assert enqueued is not None, "queue_task was not called with a payload"
     # The handler reads the buy-entry tree from "buy_tree" (seed_ruleset_from_tree),
-    # and the bracket from "initial_tp_percent"/"initial_sl_percent".
+    # and the entry-time TP/SL bracket from "entry_rules".
     assert enqueued["buy_tree"] == buy_tree
     assert enqueued["sell_tree"] == sell_tree
     assert enqueued["exit_rules"] == exit_rules
-    assert enqueued["initial_tp_percent"] == 8.0
-    assert enqueued["initial_sl_percent"] == 4.0
+    assert enqueued["entry_rules"] == entry_actions
 
 
 def test_create_daily_expert_omits_unset_conditions(client, db, monkeypatch):
@@ -189,7 +194,7 @@ def test_create_daily_expert_omits_unset_conditions(client, db, monkeypatch):
 
     enqueued = captured["payload"]
     assert enqueued is not None
-    for k in ("buy_tree", "sell_tree", "exit_rules", "initial_tp_percent", "initial_sl_percent"):
+    for k in ("buy_tree", "sell_tree", "exit_rules", "entry_rules"):
         assert k not in enqueued, f"unset {k} must be omitted from the payload"
 
 

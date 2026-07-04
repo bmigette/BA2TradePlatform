@@ -77,14 +77,12 @@ class BacktestCreate(BaseModel):
                                                   # SHORT/sell enter rule + enable the RM sell gate
                                                   # (the "Allow short" UI toggle). Default long-only.
     exit_conditions: Optional[list] = None        # -> config "exit_rules"
-    initial_tp_percent: Optional[float] = None    # -> config "initial_tp_percent"
-    initial_sl_percent: Optional[float] = None    # -> config "initial_sl_percent"
-    # CANONICAL take-profit reference key. None / "percent" -> the legacy percent-off-entry TP;
-    # "expert_target_price" -> anchor the TP on the recommendation's target_price (RE4). The
-    # legacy ``initial_tp_ref`` spelling is still accepted (aliased to this canonical key in the
-    # handler's _build_config). -> config "initial_tp_reference".
-    initial_tp_reference: Optional[str] = None
-    initial_tp_ref: Optional[str] = None          # legacy alias -> "initial_tp_reference"
+    # Entry-time TP/SL bracket: a rule list in the SAME shape as exit_conditions rows (minus a
+    # nested conditions sub-tree — an entry action fires on the same gate as the buy/sell
+    # action), converted via the shared action_from_rule (same as exit rules). Replaces the
+    # deleted initial_tp_percent/initial_sl_percent/initial_tp_reference scalar fields.
+    # -> config "entry_rules"
+    entry_actions: Optional[list] = None
     # Shared trading parameters.
     start_date: str
     end_date: str
@@ -449,14 +447,8 @@ def _create_daily_expert_backtest(backtest: "BacktestCreate", db: Session) -> di
         strategy_params["enableShort"] = bool(backtest.enable_short)
     if backtest.exit_conditions is not None:
         strategy_params["exitConditions"] = backtest.exit_conditions
-    if backtest.initial_tp_percent is not None:
-        strategy_params["initialTpPercent"] = backtest.initial_tp_percent
-    if backtest.initial_sl_percent is not None:
-        strategy_params["initialSlPercent"] = backtest.initial_sl_percent
-    if backtest.initial_tp_reference is not None:
-        strategy_params["initialTpReference"] = backtest.initial_tp_reference
-    elif backtest.initial_tp_ref is not None:
-        strategy_params["initialTpReference"] = backtest.initial_tp_ref
+    if backtest.entry_actions is not None:
+        strategy_params["entryActions"] = backtest.entry_actions
     if expert_settings:
         strategy_params["expertSettings"] = expert_settings
     # Universe + interval are not otherwise persisted on the row; store them so Quick Load can
@@ -532,12 +524,10 @@ def _create_daily_expert_backtest(backtest: "BacktestCreate", db: Session) -> di
 
     # Forward the strategy's conditions into the daily-engine payload using the EXACT keys the
     # handler reads: the buy-entry tree -> ``buy_tree`` (consumed by _build_experts ->
-    # seed_ruleset_from_tree), ``sell_tree`` / ``exit_rules``. ``initial_tp_percent`` /
-    # ``initial_sl_percent`` are also forwarded for payload-shape compatibility, but the engine's
-    # baseline entry bracket that used to read them (formerly ``_apply_initial_brackets``) was
-    # removed — a saved backtest's real protection is its exit conditions + the classic RM's
-    # safeguard stop. Only include provided (non-None) keys so we never override the handler's
-    # own defaults with None (fail-early/no-silent-defaults rule).
+    # seed_ruleset_from_tree), ``sell_tree`` / ``exit_rules`` / ``entry_rules`` (the entry-time
+    # TP/SL bracket, seeded onto the enter ruleset alongside the buy/sell action — same
+    # action_from_rule conversion exit rules use). Only include provided (non-None) keys so we
+    # never override the handler's own defaults with None (fail-early/no-silent-defaults rule).
     if backtest.buy_entry_conditions is not None:
         payload['buy_tree'] = backtest.buy_entry_conditions
     if backtest.sell_entry_conditions is not None:
@@ -546,16 +536,8 @@ def _create_daily_expert_backtest(backtest: "BacktestCreate", db: Session) -> di
         payload['enable_short'] = bool(backtest.enable_short)
     if backtest.exit_conditions is not None:
         payload['exit_rules'] = backtest.exit_conditions
-    if backtest.initial_tp_percent is not None:
-        payload['initial_tp_percent'] = backtest.initial_tp_percent
-    if backtest.initial_sl_percent is not None:
-        payload['initial_sl_percent'] = backtest.initial_sl_percent
-    # TP-reference mode: forward the canonical key, else the legacy alias (the handler's
-    # _build_config collapses the alias to ``initial_tp_reference`` in one place).
-    if backtest.initial_tp_reference is not None:
-        payload['initial_tp_reference'] = backtest.initial_tp_reference
-    elif backtest.initial_tp_ref is not None:
-        payload['initial_tp_ref'] = backtest.initial_tp_ref
+    if backtest.entry_actions is not None:
+        payload['entry_rules'] = backtest.entry_actions
 
     from app.services.task_queue import get_task_queue
     task_queue = get_task_queue()
@@ -960,7 +942,7 @@ def _opt_backtest_block(backtest: Backtest, db: Any):
 
     bt_block is the optimization's run-level ``optimization_config['backtest']`` dict (carries the
     full execution config: enabled_instruments, seed, warmup_days, execution_interval,
-    account_settings, run_schedule_override, initial_tp_reference, base expert specs). This is the
+    account_settings, run_schedule_override, entry_rules, base expert specs). This is the
     authoritative source for reproducing an opt-derived run faithfully (the optimizer used the
     SAME block via _build_daily_trial_config)."""
     if db is None or backtest.optimization_id is None:
@@ -982,18 +964,20 @@ def _opt_backtest_block(backtest: Backtest, db: Any):
 
 def _reconstruct_opt_ruleset(backtest: Backtest, db: Any):
     """FALLBACK for older optimization-derived runs that stored only the flat genes (no concrete
-    trees): overlay the run's tuned ``cond:``/``exit:`` genes onto the optimization's base
-    Strategy tree via ``decode_params`` to rebuild the concrete buy/sell/exit ruleset.
+    trees): overlay the run's tuned ``cond:``/``exit:``/``entry:`` genes onto the optimization's
+    base Strategy tree via ``decode_params`` to rebuild the concrete buy/sell/exit/entry ruleset.
 
     New top-N runs persist the concrete trees directly (``buyEntryConditions`` etc.), so this is
-    only used when those are absent. Returns (buy_tree, sell_tree, exit_rules) or (None, None,
-    None) when reconstruction isn't possible (no optimization link / base strategy / db)."""
+    only used when those are absent. Returns (buy_tree, sell_tree, exit_rules, entry_rules) or
+    (None, None, None, None) when reconstruction isn't possible (no optimization link / base
+    strategy / db)."""
     sp = backtest.strategy_params or {}
     has_genes = isinstance(sp, dict) and any(
-        isinstance(k, str) and (k.startswith("cond:") or k.startswith("exit:")) for k in sp
+        isinstance(k, str) and (k.startswith("cond:") or k.startswith("exit:") or k.startswith("entry:"))
+        for k in sp
     )
     if db is None or backtest.optimization_id is None or not has_genes:
-        return None, None, None
+        return None, None, None, None
     try:
         from app.models.strategy_optimization import StrategyOptimization
         from app.models.strategy import Strategy
@@ -1003,14 +987,17 @@ def _reconstruct_opt_ruleset(backtest: Backtest, db: Any):
             StrategyOptimization.id == backtest.optimization_id
         ).first()
         if so is None:
-            return None, None, None
+            return None, None, None, None
         strat = db.query(Strategy).filter(Strategy.id == so.strategy_id).first()
         if strat is None:
-            return None, None, None
+            return None, None, None, None
         decoded = decode_params(strat, sp)
-        return decoded.get("buy_tree"), decoded.get("sell_tree"), decoded.get("exit_rules") or []
+        return (
+            decoded.get("buy_tree"), decoded.get("sell_tree"),
+            decoded.get("exit_rules") or [], decoded.get("entry_rules") or [],
+        )
     except Exception:  # noqa: BLE001 — reconstruction is best-effort; never break the export
-        return None, None, None
+        return None, None, None, None
 
 
 def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dict:
@@ -1019,14 +1006,17 @@ def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dic
     Two ``kind`` values are supported:
 
       * ``expert_settings`` — the expert this run used + its decision/RM settings. We surface
-        the expert class name (``Backtest.expert_name``) and the settings we can recover from
-        ``strategy_params``: the TP/SL bracket (structured ``initialTpPercent``/``initialSlPercent``
-        OR the GA's flat ``tp``/``sl`` genes) plus any flat optimized ``model:*`` genes (the
-        expert/RM decision settings an optimization tunes).
-      * ``ruleset`` — the conditions ruleset (buy/sell entry trees + exit conditions). Structured
-        runs carry ``buyEntryConditions``/``sellEntryConditions``/``exitConditions``; optimization
-        TOP-N runs instead carry the flat ``cond:*``/``exit:*`` genes, which we pass through so the
-        export is still self-describing.
+        the expert class name (``Backtest.expert_name``) and the flat optimized ``model:*`` genes
+        recoverable from ``strategy_params`` (the expert/RM decision settings an optimization
+        tunes). The entry-time TP/SL bracket is NOT part of this kind anymore — it rides on
+        ``entryActions``/``entry_rules`` rule lists (same shape as exit conditions), surfaced
+        under the ``ruleset`` kind below instead of the deleted ``initialTpPercent``/
+        ``initialSlPercent`` scalar fields.
+      * ``ruleset`` — the conditions ruleset (buy/sell entry trees + exit conditions + the
+        entry-time TP/SL bracket). Structured runs carry ``buyEntryConditions``/
+        ``sellEntryConditions``/``exitConditions``/``entryActions``; optimization TOP-N runs
+        instead carry the flat ``cond:*``/``exit:*``/``entry:*`` genes, which we pass through so
+        the export is still self-describing.
 
     Pure derivation from the persisted ``strategy_params`` — NO server filesystem writes.
     """
@@ -1086,7 +1076,6 @@ def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dic
                 "slippage": acct.get("slippage_bps"),
                 "enable_short": bool(bt_block.get("enable_short")),
                 "run_schedule_override": bt_block.get("run_schedule_override"),
-                "initial_tp_reference": bt_block.get("initial_tp_reference"),
             }
             interval = bt_block.get("execution_interval")
         else:
@@ -1100,7 +1089,6 @@ def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dic
                 "slippage": _pick("slippage"),
                 "enable_short": _pick("enableShort", "enable_short"),
                 "run_schedule_override": _pick("runScheduleOverride", "run_schedule_override"),
-                "initial_tp_reference": _pick("initialTpReference", "initial_tp_reference"),
             }
             interval = _pick("executionInterval", "execution_interval")
         return {
@@ -1109,8 +1097,6 @@ def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dic
             "expert": backtest.expert_name,
             "engine_type": backtest.engine_type or "ml",
             "settings": {
-                "initial_tp_percent": _pick("initialTpPercent", "initial_tp_percent", "tp"),
-                "initial_sl_percent": _pick("initialSlPercent", "initial_sl_percent", "sl"),
                 "expert_params": expert_params,
             },
             # Execution config (seed/fill_model/warmup/commission/slippage/enable_short/
@@ -1124,23 +1110,27 @@ def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dic
     if kind == "ruleset":
         cond_genes = (
             {k: v for k, v in sp.items()
-             if isinstance(k, str) and (k.startswith("cond:") or k.startswith("exit:"))}
+             if isinstance(k, str) and (k.startswith("cond:") or k.startswith("exit:") or k.startswith("entry:"))}
             if isinstance(sp, dict) else {}
         )
         buy = _pick("buyEntryConditions", "buy_entry_conditions")
         sell = _pick("sellEntryConditions", "sell_entry_conditions")
         exits = _pick("exitConditions", "exit_conditions")
+        entries = _pick("entryActions", "entry_actions", "entry_rules")
         # Older optimization runs stored only the flat genes — reconstruct the concrete trees
         # from the optimization's base strategy + those genes so Load still restores conditions.
-        if buy is None and sell is None and not exits and cond_genes:
-            r_buy, r_sell, r_exits = _reconstruct_opt_ruleset(backtest, db)
+        if buy is None and sell is None and not exits and not entries and cond_genes:
+            r_buy, r_sell, r_exits, r_entries = _reconstruct_opt_ruleset(backtest, db)
             buy = buy if buy is not None else r_buy
             sell = sell if sell is not None else r_sell
             exits = exits if exits else r_exits
+            entries = entries if entries else r_entries
         # Normalise to the SINGLE canonical condition format (operator groups, symbol comparison,
         # inferred fieldType) via the shared model so Load pre-fills the builder cleanly regardless
         # of how the tree was stored (builder camel / storage type+op / optimizer-decoded). This is
         # the boundary — the engine/optimizer keep reading their own (still-present) snake keys.
+        # entry_actions is the SAME rule shape as exit_conditions (minus a nested conditions
+        # sub-tree), so the shared normalize_exit_rules applies unchanged.
         from ba2_common.core.rule_models import normalize_tree, normalize_exit_rules
         return {
             "backtest_id": backtest.id,
@@ -1148,6 +1138,7 @@ def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dic
             "buy_entry_conditions": normalize_tree(buy),
             "sell_entry_conditions": normalize_tree(sell),
             "exit_conditions": normalize_exit_rules(exits or []),
+            "entry_actions": normalize_exit_rules(entries or []),
             "optimized_genes": cond_genes,
         }
 

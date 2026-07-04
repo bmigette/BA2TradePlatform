@@ -33,11 +33,23 @@ def _host_db():
     yield
 
 
+def _tp_sl_from_decoded(decoded):
+    """Extract (tp, sl) from a decode_params() result, supporting BOTH shapes exercised in this
+    file: the entry_actions-based Strategy (``decoded['entry_rules']`` carries adjust_take_profit
+    /adjust_stop_loss rules, Task 6) used by the DB-backed handler tests, and the raw ``tp``/``sl``
+    flat-gene shortcut ``test_seeded_run_is_reproducible`` uses (it builds its own param space
+    directly, bypassing collect_param_space/entry_actions entirely). sl is returned as a positive
+    magnitude either way (entry_rules carries it signed negative per the sign convention)."""
+    rules = {r.get("action_type"): r for r in (decoded.get("entry_rules") or []) if isinstance(r, dict)}
+    if rules:
+        return rules["adjust_take_profit"]["action_value"], abs(rules["adjust_stop_loss"]["action_value"])
+    return decoded["tp"], decoded["sl"]
+
+
 def _deterministic_stub(backtest_cfg, hoisted, decoded):
     """A pure deterministic 'backtest': results are a fixed function of tp/sl so the
     SAME params always produce the SAME results (no RNG, no I/O). Peak at tp=8, sl=3."""
-    tp = decoded["tp"]
-    sl = decoded["sl"]
+    tp, sl = _tp_sl_from_decoded(decoded)
     score = 10.0 - abs(tp - 8.0) - abs(sl - 3.0)
     return {
         "total_trades": 5,
@@ -104,20 +116,29 @@ def test_seeded_run_is_reproducible():
 # DB-backed handler tests (real Strategy + StrategyOptimization rows)
 # ---------------------------------------------------------------------------
 def _seed_strategy() -> int:
+    """A Strategy whose entry-time TP/SL bracket rides on ``entry_actions`` (adjust_take_profit
+    /adjust_stop_loss rules with ``action_value_optimize``), mirroring how ``exit_conditions``
+    rules are optimized — NOT the deleted scalar ``initial_tp_percent``/``initial_sl_percent``
+    fields. Ranges chosen so the GA searches the SAME grid the old tp(2..12)/sl(1..6) genes did
+    (11*6=66 distinct points), just keyed as ``entry:<id>:action_value`` now."""
     db = SessionLocal()
     try:
         s = Strategy(
             name="opt-test",
-            initial_tp_percent=5.0,
-            initial_tp_optimize=True,
-            initial_tp_min=2.0,
-            initial_tp_max=12.0,
-            initial_tp_step=1.0,
-            initial_sl_percent=2.0,
-            initial_sl_optimize=True,
-            initial_sl_min=1.0,
-            initial_sl_max=6.0,
-            initial_sl_step=1.0,
+            entry_actions=[
+                {
+                    "id": "e_tp", "action_type": "adjust_take_profit",
+                    "reference_value": "order_open_price", "action_value": 5.0,
+                    "action_value_optimize": True,
+                    "action_value_min": 2.0, "action_value_max": 12.0, "action_value_step": 1.0,
+                },
+                {
+                    "id": "e_sl", "action_type": "adjust_stop_loss",
+                    "reference_value": "order_open_price", "action_value": -2.0,
+                    "action_value_optimize": True,
+                    "action_value_min": -6.0, "action_value_max": -1.0, "action_value_step": 1.0,
+                },
+            ],
         )
         db.add(s)
         db.commit()
@@ -196,14 +217,14 @@ def test_handler_completes_and_persists_best(monkeypatch):
     assert row.progress == 100.0
     assert row.best_params is not None
     assert row.best_fitness is not None
-    assert row.parameter_ranges and "tp" in row.parameter_ranges
+    assert row.parameter_ranges and "entry:e_tp:action_value" in row.parameter_ranges
     # The deterministic stub peaks at tp=8, sl=3 -> max score 10.0. A small GA
     # (pop=8/gen=4) is a heuristic, not exhaustive, so it converges NEAR the peak;
     # assert it found a high-fitness, in-range individual (exact global optimum is the
     # brute_force test's job). all_results recorded one entry per evaluated trial.
     assert row.best_fitness >= 8.0
-    assert 2.0 <= row.best_params["tp"] <= 12.0
-    assert 1.0 <= row.best_params["sl"] <= 6.0
+    assert 2.0 <= row.best_params["entry:e_tp:action_value"] <= 12.0
+    assert -6.0 <= row.best_params["entry:e_sl:action_value"] <= -1.0
     assert row.all_results and all("fitness" in r for r in row.all_results)
 
 
@@ -265,7 +286,9 @@ def test_brute_force_finds_global_optimum(monkeypatch):
     out = H.handle_strategy_optimization("t-bf", {"optimization_id": opt_id})
     assert out["status"] == "completed"
     assert out["best_fitness"] == pytest.approx(10.0)
-    assert out["best_params"] == {"tp": 8.0, "sl": 3.0}
+    assert out["best_params"] == {
+        "entry:e_tp:action_value": 8.0, "entry:e_sl:action_value": -3.0,
+    }
 
 
 def test_max_drawdown_metric_negated_through_handler(monkeypatch):
@@ -273,7 +296,8 @@ def test_max_drawdown_metric_negated_through_handler(monkeypatch):
 
     def _dd_stub(backtest_cfg, hoisted, decoded):
         # drawdown is smaller (better) near tp=8: dd = 2 + |tp-8|
-        return {"total_trades": 5, "max_drawdown": 2.0 + abs(decoded["tp"] - 8.0)}
+        tp, _sl = _tp_sl_from_decoded(decoded)
+        return {"total_trades": 5, "max_drawdown": 2.0 + abs(tp - 8.0)}
 
     monkeypatch.setattr(H, "_run_trial_backtest", _dd_stub)
     monkeypatch.setattr(H, "_build_hoisted_state", lambda cfg: {})
@@ -283,7 +307,7 @@ def test_max_drawdown_metric_negated_through_handler(monkeypatch):
     assert out["status"] == "completed"
     # best (max fitness) = least drawdown = -2.0 at tp=8 (GA maximizes -dd).
     assert out["best_fitness"] == pytest.approx(-2.0)
-    assert out["best_params"]["tp"] == 8.0
+    assert out["best_params"]["entry:e_tp:action_value"] == 8.0
 
 
 def test_zero_trade_sentinel_through_handler(monkeypatch):
@@ -354,6 +378,7 @@ def test_build_daily_trial_config_maps_rm_and_overrides():
         "buy_tree": None,
         "sell_tree": None,
         "exit_rules": [],
+        "entry_rules": [],
     }
     cfg = H._build_daily_trial_config(backtest_cfg, decoded)
     settings = cfg["experts"][0]["settings"]
@@ -362,10 +387,9 @@ def test_build_daily_trial_config_maps_rm_and_overrides():
     assert settings["atr_multiplier"] == 3.0
     assert settings["min_stop_loss_pct"] == 1.5
     assert settings["max_virtual_equity_per_instrument_percent"] == 25.0
-    # tp/sl ride on the top-level run config (NOT expert settings) — the daily engine's
-    # _apply_initial_brackets reads them from there to stage the protective leg(s).
-    assert cfg["initial_tp_percent"] == 8.0
-    assert cfg["initial_sl_percent"] == 3.0
+    # entry_rules (the entry-time TP/SL bracket, Task 6) rides through unchanged, mirroring
+    # exit_rules exactly — no separate initial_tp_percent/initial_sl_percent keys anymore.
+    assert cfg["entry_rules"] == []
     # The run-level backtest_cfg must NOT be mutated.
     assert backtest_cfg["experts"][0]["settings"] == {"surprise_min_pct": 5.0}
     # Config shape matches what run_daily_backtest reads.
@@ -374,9 +398,12 @@ def test_build_daily_trial_config_maps_rm_and_overrides():
         assert k in cfg
 
 
-def test_build_daily_trial_config_forwards_tp_reference():
-    """The run-level ``initial_tp_reference`` rides through to each trial's engine config so
-    every optimizer trial uses the same TP-reference mode (e.g. expert_target_price)."""
+def test_build_daily_trial_config_forwards_entry_rules():
+    """decoded['entry_rules'] (the entry-time TP/SL bracket, Task 6 — adjust_take_profit/
+    adjust_stop_loss actions decoded from Strategy.entry_actions) rides through to each trial's
+    engine config unchanged, mirroring exit_rules forwarding exactly. Replaces the deleted
+    run-level ``initial_tp_reference`` mechanism: the TP/SL reference now lives PER-RULE
+    (``reference_value``) inside each entry_rules entry, not as a separate top-level key."""
     backtest_cfg = {
         "backtest_id": 11,
         "start_date": "2024-01-02",
@@ -387,16 +414,19 @@ def test_build_daily_trial_config_forwards_tp_reference():
         "account_settings": {"starting_cash": 100000.0},
         "warmup_days": 30,
         "seed": 42,
-        "initial_tp_reference": "expert_target_price",
     }
+    entry_rules = [
+        {"id": "e_tp", "action_type": "adjust_take_profit",
+         "reference_value": "expert_target_price", "action_value": -5.0},
+    ]
     decoded = {"tp": 8.0, "sl": 3.0, "expert_overrides": {},
-               "buy_tree": None, "sell_tree": None, "exit_rules": []}
+               "buy_tree": None, "sell_tree": None, "exit_rules": [], "entry_rules": entry_rules}
     cfg = H._build_daily_trial_config(backtest_cfg, decoded)
-    assert cfg["initial_tp_reference"] == "expert_target_price"
+    assert cfg["entry_rules"] == entry_rules
 
 
-def test_build_daily_trial_config_tp_reference_absent_is_none():
-    """No run-level reference -> the trial config carries None (engine default percent path)."""
+def test_build_daily_trial_config_entry_rules_absent_is_none():
+    """No decoded entry_rules -> the trial config carries None (no bracket for this trial)."""
     backtest_cfg = {
         "backtest_id": 12,
         "start_date": "2024-01-02",
@@ -411,7 +441,7 @@ def test_build_daily_trial_config_tp_reference_absent_is_none():
     decoded = {"tp": 8.0, "sl": 3.0, "expert_overrides": {},
                "buy_tree": None, "sell_tree": None, "exit_rules": []}
     cfg = H._build_daily_trial_config(backtest_cfg, decoded)
-    assert cfg.get("initial_tp_reference") is None
+    assert cfg.get("entry_rules") is None
 
 
 # ---------------------------------------------------------------------------

@@ -47,14 +47,26 @@ from app.services import strategy_optimization_handler as H
 # ---------------------------------------------------------------------------
 # Shared deterministic stub backtest + strategy stub
 # ---------------------------------------------------------------------------
+def _tp_sl_from_decoded(decoded):
+    """Extract (tp, sl) from a decode_params() result, supporting BOTH shapes exercised in this
+    file: the entry_actions-based Strategy (``decoded['entry_rules']`` carries adjust_take_profit
+    /adjust_stop_loss rules, Task 6) used by the DB-backed handler gates, and the raw ``tp``/``sl``
+    flat-gene shortcut several gates below use directly (bypassing collect_param_space/
+    entry_actions entirely via ``_strategy_stub`` + ``_TPSL_SPACE``). sl is returned as a positive
+    magnitude either way (entry_rules carries it signed negative per the sign convention)."""
+    rules = {r.get("action_type"): r for r in (decoded.get("entry_rules") or []) if isinstance(r, dict)}
+    if rules:
+        return rules["adjust_take_profit"]["action_value"], abs(rules["adjust_stop_loss"]["action_value"])
+    return decoded["tp"], decoded["sl"]
+
+
 def _deterministic_stub(backtest_cfg, hoisted, decoded):
     """A pure, deterministic 'backtest': results are a fixed function of tp/sl.
 
     Peak at tp=8, sl=3 => sharpe/return == 10.0. Always >0 trades so the no-trade
     sentinel never fires. No RNG, no I/O => same params always yield same results.
     """
-    tp = decoded["tp"]
-    sl = decoded["sl"]
+    tp, sl = _tp_sl_from_decoded(decoded)
     score = 10.0 - abs(tp - 8.0) - abs(sl - 3.0)
     return {
         "total_trades": 5,
@@ -83,6 +95,24 @@ _TPSL_SPACE = {
     "tp": {"type": "float", "min": 2, "max": 12, "step": 1},
     "sl": {"type": "float", "min": 1, "max": 6, "step": 1},
 }
+
+# entry_actions equivalent of _TPSL_SPACE's range (Task 6): the SAME tp(2..12)/sl(1..6) grid,
+# expressed as adjust_take_profit/adjust_stop_loss rules with action_value_optimize, for the
+# DB-backed handler gates that need a real Strategy row.
+_ENTRY_TPSL_ACTIONS = [
+    {
+        "id": "e_tp", "action_type": "adjust_take_profit",
+        "reference_value": "order_open_price", "action_value": 5.0,
+        "action_value_optimize": True,
+        "action_value_min": 2.0, "action_value_max": 12.0, "action_value_step": 1.0,
+    },
+    {
+        "id": "e_sl", "action_type": "adjust_stop_loss",
+        "reference_value": "order_open_price", "action_value": -2.0,
+        "action_value_optimize": True,
+        "action_value_min": -6.0, "action_value_max": -1.0, "action_value_step": 1.0,
+    },
+]
 
 
 # ===========================================================================
@@ -128,11 +158,11 @@ def test_decode_by_id_deep_copy_source_unmutated():
 
 def test_joint_space_is_real_with_every_family(seed_strategy):
     """collect_param_space emits namespaced keys across every family
-    (tp/sl + model:* + cond:*/exit:*) in one flat dict.
+    (entry:*/model:*/cond:*/exit:*) in one flat dict.
 
-    Uses the conftest seed_strategy (real Strategy row) for tp/sl, plus an
-    expert_cfg + condition tree to exercise model:/cond:/exit: namespaces. RM
-    sizing rides on the expert model:* path (real ba2 setting names), so it is
+    Uses the conftest seed_strategy (real Strategy row) for the entry-time TP/SL bracket
+    (entry_actions), plus an expert_cfg + condition tree to exercise model:/cond:/exit:
+    namespaces. RM sizing rides on the expert model:* path (real ba2 setting names), so it is
     part of expert_cfg now — there is no separate rm:* namespace.
     """
     s = seed_strategy
@@ -156,7 +186,7 @@ def test_joint_space_is_real_with_every_family(seed_strategy):
                                "type": "float"},
     }
     space = collect_param_space(s, expert_cfg=expert_cfg)
-    assert "tp" in space and "sl" in space
+    assert "entry:e_tp:action_value" in space and "entry:e_sl:action_value" in space
     assert "model:risk_per_trade_pct" in space
     assert not any(k.startswith("rm:") for k in space)
     assert "model:surprise_min_pct" in space
@@ -246,12 +276,7 @@ def test_seeded_run_reproducible_through_handler(monkeypatch):
     def _seed_strategy_id():
         db = SessionLocal()
         try:
-            s = Strategy(
-                name="gate-rep", initial_tp_percent=5.0, initial_tp_optimize=True,
-                initial_tp_min=2.0, initial_tp_max=12.0, initial_tp_step=1.0,
-                initial_sl_percent=2.0, initial_sl_optimize=True, initial_sl_min=1.0,
-                initial_sl_max=6.0, initial_sl_step=1.0,
-            )
+            s = Strategy(name="gate-rep", entry_actions=_ENTRY_TPSL_ACTIONS)
             db.add(s)
             db.commit()
             db.refresh(s)
@@ -354,12 +379,7 @@ def test_handler_memo_collapses_duplicate_trials(monkeypatch):
 
     db = SessionLocal()
     try:
-        s = Strategy(
-            name="gate-memo", initial_tp_percent=5.0, initial_tp_optimize=True,
-            initial_tp_min=2.0, initial_tp_max=12.0, initial_tp_step=1.0,
-            initial_sl_percent=2.0, initial_sl_optimize=True, initial_sl_min=1.0,
-            initial_sl_max=6.0, initial_sl_step=1.0,
-        )
+        s = Strategy(name="gate-memo", entry_actions=_ENTRY_TPSL_ACTIONS)
         db.add(s)
         db.commit()
         db.refresh(s)
@@ -439,19 +459,15 @@ def test_max_drawdown_negated_end_to_end(monkeypatch):
     Base.metadata.create_all(bind=engine)
 
     def _dd_stub(cfg, h, d):
-        return {"total_trades": 5, "max_drawdown": 2.0 + abs(d["tp"] - 8.0)}
+        tp, _sl = _tp_sl_from_decoded(d)
+        return {"total_trades": 5, "max_drawdown": 2.0 + abs(tp - 8.0)}
 
     monkeypatch.setattr(H, "_run_trial_backtest", _dd_stub)
     monkeypatch.setattr(H, "_build_hoisted_state", lambda cfg: {})
 
     db = SessionLocal()
     try:
-        s = Strategy(
-            name="gate-dd", initial_tp_percent=5.0, initial_tp_optimize=True,
-            initial_tp_min=2.0, initial_tp_max=12.0, initial_tp_step=1.0,
-            initial_sl_percent=2.0, initial_sl_optimize=True, initial_sl_min=1.0,
-            initial_sl_max=6.0, initial_sl_step=1.0,
-        )
+        s = Strategy(name="gate-dd", entry_actions=_ENTRY_TPSL_ACTIONS)
         db.add(s)
         db.commit()
         db.refresh(s)
@@ -483,7 +499,7 @@ def test_max_drawdown_negated_end_to_end(monkeypatch):
     assert out["status"] == "completed"
     # least drawdown is 2.0 at tp=8 -> max fitness = -2.0
     assert out["best_fitness"] == pytest.approx(-2.0)
-    assert out["best_params"]["tp"] == 8.0
+    assert out["best_params"]["entry:e_tp:action_value"] == 8.0
 
 
 # ===========================================================================

@@ -144,8 +144,20 @@ def sample_strategy(test_db):
                 "action": "close"
             }
         ],
-        initial_tp_percent=5.0,
-        initial_sl_percent=2.0
+        entry_actions=[
+            {
+                "id": "entry_tp",
+                "action_type": "adjust_take_profit",
+                "reference_value": "order_open_price",
+                "action_value": 5.0
+            },
+            {
+                "id": "entry_sl",
+                "action_type": "adjust_stop_loss",
+                "reference_value": "order_open_price",
+                "action_value": -2.0
+            }
+        ]
     )
     test_db.add(strategy)
     test_db.commit()
@@ -274,13 +286,14 @@ class TestStrategyModelSerialization:
         assert result["exitConditions"][0]["action"] == "close"
 
     def test_strategy_to_dict_tp_sl(self, sample_strategy):
-        """Test TP/SL fields are properly serialized."""
+        """Entry-time TP/SL now rides on entryActions (adjust_take_profit/adjust_stop_loss
+        rules), not the deleted initialTpPercent/initialSlPercent scalar fields."""
         result = sample_strategy.to_dict()
 
-        assert result["initialTpPercent"] == 5.0
-        assert result["initialSlPercent"] == 2.0
-        assert result["initialTpOptimize"] is False
-        assert result["initialSlOptimize"] is False
+        assert "entryActions" in result
+        by_type = {a["action_type"]: a for a in result["entryActions"]}
+        assert by_type["adjust_take_profit"]["action_value"] == 5.0
+        assert by_type["adjust_stop_loss"]["action_value"] == -2.0
 
     def test_strategy_to_dict_timestamps(self, sample_strategy):
         """Test timestamp serialization."""
@@ -515,8 +528,20 @@ class TestStrategyAPIEndpoints:
                     "action": "close"
                 }
             ],
-            "initial_tp_percent": 10.0,
-            "initial_sl_percent": 5.0
+            "entry_actions": [
+                {
+                    "id": "entry_tp",
+                    "action_type": "adjust_take_profit",
+                    "reference_value": "order_open_price",
+                    "action_value": 10.0
+                },
+                {
+                    "id": "entry_sl",
+                    "action_type": "adjust_stop_loss",
+                    "reference_value": "order_open_price",
+                    "action_value": -5.0
+                }
+            ]
         }
 
         response = test_client.post("/api/strategies", json=strategy_data)
@@ -525,8 +550,9 @@ class TestStrategyAPIEndpoints:
         data = response.json()
         assert data["name"] == "API Test Strategy"
         assert data["description"] == "Created via API"
-        assert data["initialTpPercent"] == 10.0
-        assert data["initialSlPercent"] == 5.0
+        by_type = {a["action_type"]: a for a in data["entryActions"]}
+        assert by_type["adjust_take_profit"]["action_value"] == 10.0
+        assert by_type["adjust_stop_loss"]["action_value"] == -5.0
         assert "bull_signal" in data["requiredFields"]
 
         # Store ID for later tests
@@ -553,7 +579,14 @@ class TestStrategyAPIEndpoints:
         strategy_id = TestStrategyAPIEndpoints.created_strategy_id
         update_data = {
             "name": "Updated Strategy Name",
-            "initial_tp_percent": 15.0
+            "entry_actions": [
+                {
+                    "id": "entry_tp",
+                    "action_type": "adjust_take_profit",
+                    "reference_value": "order_open_price",
+                    "action_value": 15.0
+                }
+            ]
         }
 
         response = test_client.put(f"/api/strategies/{strategy_id}", json=update_data)
@@ -561,9 +594,8 @@ class TestStrategyAPIEndpoints:
 
         data = response.json()
         assert data["name"] == "Updated Strategy Name"
-        assert data["initialTpPercent"] == 15.0
-        # Original values should remain
-        assert data["initialSlPercent"] == 5.0
+        by_type = {a["action_type"]: a for a in data["entryActions"]}
+        assert by_type["adjust_take_profit"]["action_value"] == 15.0
 
     def test_update_strategy_conditions(self, test_client):
         """Test updating strategy conditions recalculates required_fields."""

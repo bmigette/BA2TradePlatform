@@ -393,23 +393,13 @@ def _build_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         "buy_tree": payload.get("buy_tree"),
         "sell_tree": payload.get("sell_tree"),
         "exit_rules": payload.get("exit_rules"),
-        # Initial TP/SL bracket percents — STALE: the engine's baseline entry bracket (formerly
-        # ``_apply_initial_brackets``) was removed (see daily_engine.py's per-bar loop comment:
-        # "the engine no longer attaches a baseline 'Position protection' TP/SL bracket on
-        # entry"). Carried through here for payload-shape compatibility only; the current engine
-        # does not read them. Positions close via the strategy's own exit conditions + the
-        # classic RM's safeguard stop (TradeRiskManagement -> submit_order(sl_price=...)).
-        "initial_tp_percent": payload.get("initial_tp_percent"),
-        "initial_sl_percent": payload.get("initial_sl_percent"),
-        # CANONICAL take-profit reference key — also unread by the current engine (no baseline
-        # bracket left to anchor on "expert_target_price" vs percent-off-entry). Kept only as an
-        # alias-collapse point (legacy ``initial_tp_ref`` -> ``initial_tp_reference``) in case a
-        # future bracket mechanism is reintroduced.
-        "initial_tp_reference": (
-            payload.get("initial_tp_reference")
-            if payload.get("initial_tp_reference") is not None
-            else payload.get("initial_tp_ref")
-        ),
+        # Entry-time TP/SL bracket: a list of rule dicts in the SAME shape ``exit_rules`` rows
+        # use (adjust_take_profit/adjust_stop_loss actions gated on the SAME condition as the
+        # buy/sell action, live parity with BUY_Longterm_70pctConfidence_10pctProfit). Seeded
+        # onto the enter ruleset via ``seed_ruleset_from_tree(..., entry_actions=...)`` —
+        # opt-in: absent/empty means no bracket, exactly like an empty exit_rules list means no
+        # exit management.
+        "entry_rules": payload.get("entry_rules"),
         # Intraday fill clock (e.g. "1h"/"15m"); 1d default. Decoupled from entry cadence.
         "execution_interval": payload.get("execution_interval", "1d"),
         # Options seam: path to the offline OptionsHistoryCache sqlite (built via
@@ -703,23 +693,22 @@ def _build_experts(
     # reference_value, action_value, enabled} — seeded into the per-expert OPEN_POSITIONS
     # ruleset so the engine manages held positions via the real RM/evaluator (Adjust TP/SL/Close).
     exit_rules = config.get("exit_rules")
-    # No initial TP/SL bracket is applied at transaction-OPEN — that mechanism (formerly
-    # ``_apply_initial_brackets``, driven by ``initial_tp_percent``/``initial_sl_percent``/
-    # ``initial_tp_reference``) was removed from the engine. It's also NOT emitted as an entry
-    # Adjust action, because at enter_market time the BUY/SELL only stages a PENDING order (see
-    # ``_entry_actions``). The enter ruleset therefore needs no bracket plumbing at all; a
-    # position's real protection is the strategy's own exit conditions plus the classic RM's
+    # Entry-time TP/SL bracket: a list of rule dicts (same shape as ``exit_rules``) seeded
+    # alongside the buy/sell action via ``action_from_rule`` — the SAME conversion exit rules
+    # already use. Opt-in: absent/empty means the enter ruleset carries no bracket at all, and a
+    # position's protection is just the strategy's own exit conditions plus the classic RM's
     # safeguard stop (TradeRiskManagement -> submit_order(sl_price=...)). enable_short adds the
     # symmetric SELL/short entry rule + the RM enable_sell gate.
+    entry_rules = config.get("entry_rules")
     enable_short = bool(config.get("enable_short"))
     # Pure-option ENTRY: when set, the enter_market ruleset fires this option action directly
     # (no equity leg) — the engine submits it directly (``_entry_is_option``).
     entry_action = config.get("entry_action")
 
     def _seed_enter(nm: str) -> int:
-        if buy_tree or entry_action:
+        if buy_tree or entry_action or entry_rules:
             return seed_ruleset_from_tree(buy_tree, name=nm, enable_short=enable_short,
-                                          entry_action=entry_action)
+                                          entry_action=entry_action, entry_actions=entry_rules)
         return (seed_enter_long_short_ruleset(name=nm) if enable_short
                 else seed_enter_long_ruleset(name=nm))
 

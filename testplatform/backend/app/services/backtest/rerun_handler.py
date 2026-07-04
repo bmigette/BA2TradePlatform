@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 # Gene namespaces decode_params accepts (it RAISES on anything else). The stored strategy_params
 # mixes these raw genes with camelCase display keys (buyEntryConditions, ...), so filter first.
-_GENE_PREFIXES = ("model", "screener", "cond", "exit")
+_GENE_PREFIXES = ("model", "screener", "cond", "exit", "entry")
 
 # Legacy-row fallbacks: standalone rows created before the run knobs were persisted don't carry a
 # seed / fill model. The re-run uses these so it can still execute (may differ slightly from the
@@ -147,7 +147,7 @@ def _build_standalone_rerun_config(bt: Backtest) -> Dict[str, Any]:
         payload["universe"] = universe
     else:
         payload["enabled_instruments"] = list(universe.get("symbols") or [])
-    # Strategy trees + initial brackets.
+    # Strategy trees + the entry-time TP/SL bracket (entry_rules).
     if sp.get("buyEntryConditions") is not None:
         payload["buy_tree"] = sp["buyEntryConditions"]
     if sp.get("sellEntryConditions") is not None:
@@ -156,12 +156,8 @@ def _build_standalone_rerun_config(bt: Backtest) -> Dict[str, Any]:
         payload["enable_short"] = bool(sp["enableShort"])
     if sp.get("exitConditions") is not None:
         payload["exit_rules"] = sp["exitConditions"]
-    if sp.get("initialTpPercent") is not None:
-        payload["initial_tp_percent"] = sp["initialTpPercent"]
-    if sp.get("initialSlPercent") is not None:
-        payload["initial_sl_percent"] = sp["initialSlPercent"]
-    if sp.get("initialTpReference") is not None:
-        payload["initial_tp_reference"] = sp["initialTpReference"]
+    if sp.get("entryActions") is not None:
+        payload["entry_rules"] = sp["entryActions"]
     return _build_config(payload)
 
 

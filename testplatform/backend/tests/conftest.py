@@ -78,21 +78,27 @@ def db(gate_engine):
 
 @pytest.fixture
 def seed_strategy(db):
-    """A Strategy row with TP/SL under optimization."""
+    """A Strategy row with entry-time TP/SL under optimization — rides on entry_actions
+    (adjust_take_profit/adjust_stop_loss rules with action_value_optimize), NOT the deleted
+    initial_tp_*/initial_sl_* scalar fields."""
     from app.models.strategy import Strategy
 
     s = Strategy(
         name="gate-opt-test",
-        initial_tp_percent=5.0,
-        initial_tp_optimize=True,
-        initial_tp_min=2.0,
-        initial_tp_max=12.0,
-        initial_tp_step=1.0,
-        initial_sl_percent=2.0,
-        initial_sl_optimize=True,
-        initial_sl_min=1.0,
-        initial_sl_max=6.0,
-        initial_sl_step=1.0,
+        entry_actions=[
+            {
+                "id": "e_tp", "action_type": "adjust_take_profit",
+                "reference_value": "order_open_price", "action_value": 5.0,
+                "action_value_optimize": True,
+                "action_value_min": 2.0, "action_value_max": 12.0, "action_value_step": 1.0,
+            },
+            {
+                "id": "e_sl", "action_type": "adjust_stop_loss",
+                "reference_value": "order_open_price", "action_value": -2.0,
+                "action_value_optimize": True,
+                "action_value_min": -6.0, "action_value_max": -1.0, "action_value_step": 1.0,
+            },
+        ],
     )
     db.add(s)
     db.commit()

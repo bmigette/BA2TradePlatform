@@ -30,6 +30,9 @@ from datetime import datetime, timezone
 
 import pytest
 
+from ba2_common.core.interfaces.MarketExpertInterface import MarketExpertInterface
+from ba2_common.core.types import OrderRecommendation, Recommendation
+
 # No slippage / no commission so price/quantity assertions are exact.
 CFG = {
     "starting_cash": 100_000.0,
@@ -41,6 +44,41 @@ CFG = {
 D1 = datetime(2024, 1, 2)
 D2 = datetime(2024, 1, 3)
 D3 = datetime(2024, 1, 4)
+
+
+class _ConfigWiredStubExpert(MarketExpertInterface):
+    """Module-level (constructible as ``expert_cls(expert_id)``, matching
+    ``daily_backtest_handler._build_experts``'s plain-construction contract) BUY-every-bar stub.
+
+    Used ONLY by ``test_config_entry_rules_reach_build_experts_and_set_stop_loss`` (Task 6) to
+    prove ``config['entry_rules']`` reaches the REAL ``_build_experts`` ->
+    ``seed_ruleset_from_tree(entry_actions=...)`` wiring end-to-end — not just the seeder in
+    isolation (Task 4/5's ``test_entry_bracket_seeding.py``)."""
+
+    @classmethod
+    def description(cls) -> str:
+        return "Stub expert for the entry_rules config-wiring test (Task 6)."
+
+    @classmethod
+    def get_settings_definitions(cls) -> dict:
+        # No decision settings of its own (no ``_SETTING_KEYS`` either) — _build_experts'
+        # _expert_decision_settings just needs a dict (not None) back from this call.
+        return {}
+
+    def render_market_analysis(self, market_analysis) -> str:
+        return ""
+
+    def run_analysis(self, symbol: str, market_analysis) -> None:
+        return None
+
+    def analyze_as_of(self, as_of, context):
+        return Recommendation(
+            signal=OrderRecommendation.BUY,
+            confidence=80.0,
+            current_price=100.0,
+            details="config-wiring test buy",
+            expected_profit_percent=10.0,
+        )
 
 
 def _bars(rows):
@@ -335,5 +373,86 @@ def test_safeguard_tighter_than_ruleset_sl_wins():
         engine._size_and_submit(202, indicator_provider=None, as_of_dt=datetime(2024, 1, 2))
         txn = get_instance(Transaction, txn_id)
         assert txn.stop_loss == pytest.approx(92.0)  # $100 - 8% RM safeguard
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+# ---------------------------------------------------------------------------
+# Task 6: config['entry_rules'] wired through daily_backtest_handler._build_experts.
+# ---------------------------------------------------------------------------
+def test_config_entry_rules_reach_build_experts_and_set_stop_loss(monkeypatch):
+    """A config carrying ``entry_rules=[{adjust_stop_loss...}]`` reaches the REAL
+    ``daily_backtest_handler._build_experts`` -> ``seed_ruleset_from_tree(entry_actions=...)``
+    wiring, and the seeded action attaches ``Transaction.stop_loss`` once the entry fills.
+    The leg-qty-sync (Task 2) and RM-safeguard-precedence (Task 3) mechanics are already
+    proven above by the two tests just before this one; this test's only job is the
+    config-to-engine plumbing Task 6 adds (daily_backtest_handler/optimizer forwarding
+    ``entry_rules`` into ``_build_experts``)."""
+    from app.services.backtest import daily_backtest_handler as H
+    from app.services.backtest.seam_wiring import wire_backtest_seams
+    from app.services.backtest.daily_engine import DailyBacktestEngine
+    from ba2_common.core.types import OrderDirection, OrderStatus
+    from ba2_common.core.models import Transaction
+    from ba2_common.core.db import get_instance
+
+    # Register the module-level stub under a fake "supported expert" name so _build_experts'
+    # real importlib-based construction path runs against it (no live provider/API key needed).
+    monkeypatch.setitem(
+        H._SUPPORTED_EXPERTS, "_ConfigWiredStubExpert",
+        "tests.backtest.test_entry_bracket_engine",
+    )
+
+    account_id = 301
+    account, ctx, ps = _acct(
+        [
+            (D1, 100, 101, 99, 100),
+            (D2, 102, 103, 101, 102),
+            (D3, 104, 107, 103, 106),
+        ],
+        account_id=account_id,
+    )
+    try:
+        ps.set_clock(D1)
+        resolver = wire_backtest_seams()  # idempotent, same resolver _acct already registered on
+
+        config = {
+            "experts": ["_ConfigWiredStubExpert"],
+            "enabled_instruments": ["AAPL"],
+            "entry_rules": [
+                {"id": "e_sl", "action_type": "adjust_stop_loss",
+                 "reference_value": "order_open_price", "action_value": -5.0},
+            ],
+        }
+        built = H._build_experts(config, resolver, account_id)
+        assert len(built) == 1
+        expert, expert_id, decision_settings, ruleset_id = built[0]
+
+        engine = DailyBacktestEngine(
+            account=account,
+            experts=[(expert, expert_id, decision_settings, ruleset_id)],
+            price_source=ps,
+            config={
+                "start_date": D1, "end_date": D3,
+                "enabled_instruments": ["AAPL"], "seed": 42,
+            },
+            indicator_provider=None,  # notional sizing -> ATR not needed
+        )
+        engine._indicator_provider = object()  # never touched by notional sizing
+        engine.run()
+
+        filled = [
+            o for o in account.get_orders()
+            if o.symbol == "AAPL" and o.side == OrderDirection.BUY
+            and o.depends_on_order is None and o.status == OrderStatus.FILLED
+        ]
+        assert len(filled) == 1, "the entry order did not fill"
+        entry = filled[0]
+        txn = get_instance(Transaction, entry.transaction_id)
+        # The adjust_stop_loss action runs in Phase 2, right after the entry order is
+        # CREATED (still PENDING/unfilled) — so ``order_open_price`` falls back to the
+        # CURRENT market price at evaluation time (D1's ~100, see TradeActions.py's
+        # "falling back to current market price" path), not the eventual D2-open fill
+        # price. -5% of 100 -> 95.0.
+        assert txn.stop_loss == pytest.approx(95.0)
     finally:
         ctx.__exit__(None, None, None)
