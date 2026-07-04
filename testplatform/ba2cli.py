@@ -136,6 +136,24 @@ def extract_list(data):
     return []
 
 
+def _with_action_counts(rows):
+    """Annotate strategy rows with entry/exit rule counts for the ``list`` table.
+
+    Replaces the old TP%/SL% columns, which read the now-deleted
+    ``initialTpPercent``/``initialSlPercent`` scalar fields (always absent since entry TP/SL
+    moved to the ``entryActions`` rule list — see docs/plans/2026-07-03-entry-tp-sl-bracket-
+    actions.md), so those columns rendered permanently blank.
+    """
+    out = []
+    for row in rows:
+        if isinstance(row, dict):
+            row = dict(row)
+            row["entryActionsCount"] = len(row.get("entryActions") or [])
+            row["exitConditionsCount"] = len(row.get("exitConditions") or [])
+        out.append(row)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # JSON argument helper
 # ---------------------------------------------------------------------------
@@ -1034,16 +1052,7 @@ def register_strategies_commands(subparsers):
     p.add_argument("--sell-conditions", help="JSON string or @file")
     p.add_argument("--exit-conditions", help="JSON array string or @file")
     p.add_argument("--conditions-file", help="Path to JSON file with all condition fields")
-    p.add_argument("--tp", type=float, help="Initial take-profit percent")
-    p.add_argument("--sl", type=float, help="Initial stop-loss percent")
-    p.add_argument("--tp-optimize", action="store_true", help="Enable TP optimization")
-    p.add_argument("--sl-optimize", action="store_true", help="Enable SL optimization")
-    p.add_argument("--tp-min", type=float)
-    p.add_argument("--tp-max", type=float)
-    p.add_argument("--tp-step", type=float)
-    p.add_argument("--sl-min", type=float)
-    p.add_argument("--sl-max", type=float)
-    p.add_argument("--sl-step", type=float)
+    _add_entry_action_args(p)
 
     # update
     p = actions.add_parser("update", help="Update a strategy")
@@ -1054,16 +1063,7 @@ def register_strategies_commands(subparsers):
     p.add_argument("--sell-conditions", help="JSON string or @file")
     p.add_argument("--exit-conditions", help="JSON array string or @file")
     p.add_argument("--conditions-file", help="Path to JSON file with all condition fields")
-    p.add_argument("--tp", type=float, help="Initial take-profit percent")
-    p.add_argument("--sl", type=float, help="Initial stop-loss percent")
-    p.add_argument("--tp-optimize", action="store_true", help="Enable TP optimization")
-    p.add_argument("--sl-optimize", action="store_true", help="Enable SL optimization")
-    p.add_argument("--tp-min", type=float)
-    p.add_argument("--tp-max", type=float)
-    p.add_argument("--tp-step", type=float)
-    p.add_argument("--sl-min", type=float)
-    p.add_argument("--sl-max", type=float)
-    p.add_argument("--sl-step", type=float)
+    _add_entry_action_args(p)
 
     # delete
     p = actions.add_parser("delete", help="Delete a strategy")
@@ -1075,6 +1075,98 @@ def register_strategies_commands(subparsers):
 
     # fields
     actions.add_parser("fields", help="Show condition field reference")
+
+
+def _add_entry_action_args(p):
+    """Register the entry-TP/SL flags shared by ``strategies create``/``update``.
+
+    Strategy.initial_tp_percent/initial_sl_percent/initial_tp_optimize/initial_sl_optimize
+    (and their _min/_max/_step siblings) were deleted from the Strategy model entirely — entry
+    TP/SL is now expressed as ``entry_actions`` rules (adjust_take_profit/adjust_stop_loss,
+    evaluated once at entry against reference_value="order_open_price"), the SAME rule shape
+    exit_conditions rows use. See docs/plans/2026-07-03-entry-tp-sl-bracket-actions.md and the
+    S4 template in ba2test_launcher.py._build_strategy_S4 for a concrete worked example.
+    """
+    p.add_argument(
+        "--entry-tp", type=float,
+        help="Entry take-profit, %% above entry price (builds an adjust_take_profit entry_action)",
+    )
+    p.add_argument("--entry-tp-optimize", action="store_true",
+                    help="GA-optimize --entry-tp (also makes the rule toggleable)")
+    p.add_argument("--entry-tp-min", type=float, help="--entry-tp GA search lower bound (%%)")
+    p.add_argument("--entry-tp-max", type=float, help="--entry-tp GA search upper bound (%%)")
+    p.add_argument("--entry-tp-step", type=float, help="--entry-tp GA search step (%%)")
+    p.add_argument(
+        "--entry-sl", type=float,
+        help="Entry stop-loss, %% BELOW entry price as a positive distance (e.g. 5 = stop at "
+             "-5%%); builds an adjust_stop_loss entry_action with a negative action_value",
+    )
+    p.add_argument("--entry-sl-optimize", action="store_true",
+                    help="GA-optimize --entry-sl (also makes the rule toggleable)")
+    p.add_argument("--entry-sl-min", type=float,
+                    help="--entry-sl GA search lower bound, as a positive distance (%%)")
+    p.add_argument("--entry-sl-max", type=float,
+                    help="--entry-sl GA search upper bound, as a positive distance (%%)")
+    p.add_argument("--entry-sl-step", type=float, help="--entry-sl GA search step (%%)")
+    p.add_argument(
+        "--entry-actions-json",
+        help="JSON array string or @file of raw entry_actions rule dicts (advanced escape "
+             "hatch; overrides --entry-tp/--entry-sl entirely if given)",
+    )
+
+
+def _build_entry_actions(args):
+    """Build the ``entry_actions`` list from the simple --entry-tp/--entry-sl flags, or return
+    the explicit --entry-actions-json override verbatim. Returns None if nothing was given (so
+    the caller can omit the key and leave the strategy's existing entry_actions untouched on
+    update, or default to [] on create)."""
+    raw_json = getattr(args, "entry_actions_json", None)
+    if raw_json is not None:
+        return parse_json_arg(raw_json)
+
+    rules = []
+
+    tp = getattr(args, "entry_tp", None)
+    if tp is not None:
+        rule = {
+            "id": "entry_tp",
+            "action_type": "adjust_take_profit",
+            "reference_value": "order_open_price",
+            "action_value": tp,
+        }
+        if getattr(args, "entry_tp_optimize", False):
+            rule["action_value_optimize"] = True
+            rule["toggle_optimize"] = True
+        if getattr(args, "entry_tp_min", None) is not None:
+            rule["action_value_min"] = args.entry_tp_min
+        if getattr(args, "entry_tp_max", None) is not None:
+            rule["action_value_max"] = args.entry_tp_max
+        if getattr(args, "entry_tp_step", None) is not None:
+            rule["action_value_step"] = args.entry_tp_step
+        rules.append(rule)
+
+    sl = getattr(args, "entry_sl", None)
+    if sl is not None:
+        rule = {
+            "id": "entry_sl",
+            "action_type": "adjust_stop_loss",
+            "reference_value": "order_open_price",
+            "action_value": -abs(sl),
+        }
+        if getattr(args, "entry_sl_optimize", False):
+            rule["action_value_optimize"] = True
+            rule["toggle_optimize"] = True
+        # --entry-sl-min/-max are positive distances; the underlying action_value is negative,
+        # so the LARGER distance is the more-negative (lower) bound.
+        if getattr(args, "entry_sl_max", None) is not None:
+            rule["action_value_min"] = -abs(args.entry_sl_max)
+        if getattr(args, "entry_sl_min", None) is not None:
+            rule["action_value_max"] = -abs(args.entry_sl_min)
+        if getattr(args, "entry_sl_step", None) is not None:
+            rule["action_value_step"] = args.entry_sl_step
+        rules.append(rule)
+
+    return rules or None
 
 
 def _build_strategy_body(args, require_name=False):
@@ -1102,26 +1194,9 @@ def _build_strategy_body(args, require_name=False):
     exit_conditions = getattr(args, "exit_conditions", None)
     if exit_conditions is not None:
         body["exit_conditions"] = parse_json_arg(exit_conditions)
-    if getattr(args, "tp", None) is not None:
-        body["initial_tp_percent"] = args.tp
-    if getattr(args, "sl", None) is not None:
-        body["initial_sl_percent"] = args.sl
-    if getattr(args, "tp_optimize", False):
-        body["initial_tp_optimize"] = True
-    if getattr(args, "sl_optimize", False):
-        body["initial_sl_optimize"] = True
-    if getattr(args, "tp_min", None) is not None:
-        body["tp_min"] = args.tp_min
-    if getattr(args, "tp_max", None) is not None:
-        body["tp_max"] = args.tp_max
-    if getattr(args, "tp_step", None) is not None:
-        body["tp_step"] = args.tp_step
-    if getattr(args, "sl_min", None) is not None:
-        body["sl_min"] = args.sl_min
-    if getattr(args, "sl_max", None) is not None:
-        body["sl_max"] = args.sl_max
-    if getattr(args, "sl_step", None) is not None:
-        body["sl_step"] = args.sl_step
+    entry_actions = _build_entry_actions(args)
+    if entry_actions is not None:
+        body["entry_actions"] = entry_actions
     return body
 
 
@@ -1161,13 +1236,13 @@ def handle_strategies(args):
             data,
             human=args.human,
             table_fn=lambda d: print_table(
-                extract_list(d),
+                _with_action_counts(extract_list(d)),
                 [
                     ("ID", "id", 6),
                     ("Name", "name", 28),
                     ("Description", "description", 30),
-                    ("TP%", "initialTpPercent", 8),
-                    ("SL%", "initialSlPercent", 8),
+                    ("Entry#", "entryActionsCount", 7),
+                    ("Exit#", "exitConditionsCount", 7),
                 ],
             ),
         )
