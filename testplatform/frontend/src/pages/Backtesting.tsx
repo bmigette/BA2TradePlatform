@@ -135,16 +135,11 @@ interface Strategy {
   buyEntryConditions?: ConditionTree;
   sellEntryConditions?: ConditionTree;
   exitConditions: ExitConditionSet[];
-  initialTpPercent: number;
-  initialTpOptimize: boolean;
-  initialTpMin: number | null;
-  initialTpMax: number | null;
-  initialTpStep: number | null;
-  initialSlPercent: number;
-  initialSlOptimize: boolean;
-  initialSlMin: number | null;
-  initialSlMax: number | null;
-  initialSlStep: number | null;
+  // Entry-time TP/SL bracket, in the SAME shape as exitConditions rows (minus a nested
+  // conditions sub-tree — an entry action fires on the same gate as the buy/sell entry
+  // condition). Replaces the deleted initialTp*/initialSl* scalar fields; see
+  // docs/plans/2026-07-03-entry-tp-sl-bracket-actions.md (REVISION 2026-07-04).
+  entryActions: ExitConditionSet[];
   // Classic-RM params with optimization ranges (Phase 4 joint optimizer)
   rmRiskPerTradePct?: number;
   rmRiskPerTradePctOptimize?: boolean;
@@ -426,6 +421,23 @@ const exitConditionFromStored = (raw: Record<string, unknown>): ExitConditionSet
   };
 };
 
+// Entry actions are the SAME rule shape as exit conditions minus a nested `conditions`
+// sub-tree (an entry action fires on the same gate as the buy/sell entry condition it's
+// attached to — there's no separate trigger to configure). Reuse the exit-rule
+// (de)serializers and just drop/ignore the conditions field.
+const entryActionToSnake = (ec: ExitConditionSet): Record<string, unknown> => {
+  const snake = exitConditionToSnake(ec);
+  delete snake.conditions;
+  return snake;
+};
+
+const entryActionFromStored = (raw: Record<string, unknown>): ExitConditionSet => ({
+  ...exitConditionFromStored(raw),
+  // The editor's ExitConditionSet type still carries `conditions` (shared shape with exit
+  // rules), but the entry-actions builder never renders/edits it — seed an empty group.
+  conditions: createEmptyGroup('AND'),
+});
+
 // Serialize a ConditionBuilder tree to the shape the optimizer reads: it walks each
 // leaf and adds the snake_case optimize-metadata keys the strategy_param_space builder
 // consumes (optimize, value_min/max/step, toggle_optimize, confirmation_bars_min/max/step)
@@ -624,6 +636,11 @@ const Backtesting: React.FC = () => {
   // frontend without a backend change. Gating the sell tree is the supported lever here.
   const [allowShort, setAllowShort] = useState(false);
   const [exitConditions, setExitConditions] = useState<ExitConditionSet[]>([]);
+  // Entry-time TP/SL bracket: adjust_take_profit/adjust_stop_loss rules that fire on the
+  // same gate as the buy/sell entry condition (no separate trigger of their own) — the
+  // SAME rule shape exitConditions uses, minus the nested conditions sub-tree. Replaces
+  // the deleted initialTpPercent/initialSlPercent scalar fields.
+  const [entryActions, setEntryActions] = useState<ExitConditionSet[]>([]);
   // Import-from-live-expert control (B8): the backtest UI picks an expert CLASS, but live import
   // needs a live expert INSTANCE id, so we collect it explicitly. Graceful on 503 (live DB not
   // configured) / 404 / any error — surfaces the JSON-paste fallback hint instead of crashing.
@@ -688,21 +705,6 @@ const Backtesting: React.FC = () => {
       setLiveImporting(false);
     }
   }, [liveExpertId]);
-  const [initialTpPercent, setInitialTpPercent] = useState(5.0);
-  // TP reference mode (null/'' -> percent-off-entry; 'expert_target_price' -> anchor on the
-  // recommendation target). Threaded through Load->Run so an optimized run that used the
-  // expert-target bracket reproduces faithfully. No dedicated UI field; carried on load.
-  const [initialTpReference, setInitialTpReference] = useState<string | null>(null);
-  const [initialSlPercent, setInitialSlPercent] = useState(2.0);
-  const [initialTpOptimize, setInitialTpOptimize] = useState(false);
-  const [initialSlOptimize, setInitialSlOptimize] = useState(false);
-  const [initialTpMin, setInitialTpMin] = useState(2.0);
-  const [initialTpMax, setInitialTpMax] = useState(15.0);
-  const [initialTpStep, setInitialTpStep] = useState(1.0);
-  const [initialSlMin, setInitialSlMin] = useState(1.0);
-  const [initialSlMax, setInitialSlMax] = useState(10.0);
-  const [initialSlStep, setInitialSlStep] = useState(0.5);
-
   // The saved strategy currently loaded into the editor — required to target
   // POST /api/strategies/{id}/optimize. Cleared whenever the editor is edited away
   // from a saved strategy is NOT tracked (optimization always runs against the saved row).
@@ -977,6 +979,7 @@ const Backtesting: React.FC = () => {
     buy: ConditionGroup;
     sell: ConditionGroup;
     exit: ExitConditionSet[];
+    entry: ExitConditionSet[];
   } | null>(null);
   const cancelConditionModal = useCallback(() => {
     const snap = conditionModalSnapshot.current;
@@ -984,6 +987,7 @@ const Backtesting: React.FC = () => {
       setBuyEntryConditions(snap.buy);
       setSellEntryConditions(snap.sell);
       setExitConditions(snap.exit);
+      setEntryActions(snap.entry);
     }
     conditionModalSnapshot.current = null;
     setShowConditionModal(null);
@@ -1116,14 +1120,14 @@ const Backtesting: React.FC = () => {
       return;
     }
     // Accept BOTH the live-platform shape ({expert_type, expert_settings}) AND the saved-backtest
-    // export shape ({expert, settings:{initial_tp_percent, initial_sl_percent, expert_params}}), so a
-    // file exported from the Saved tab round-trips back in here.
+    // export shape ({expert, settings:{expert_params}} — the entry-time TP/SL bracket rides on
+    // the "ruleset" export's entryActions now, not on this "expert_settings" shape), so a file
+    // exported from the Saved tab round-trips back in here.
     const settings = (parsed.expert_settings ?? parsed.settings ?? {}) as Record<string, unknown>;
     if (!parsed.expert_type && !parsed.expert && !parsed.expert_settings && !parsed.settings) {
       setImportNote({ kind: 'err', text: 'Unrecognized format. Expected an expert-settings / saved-backtest export JSON.' });
       return;
     }
-    applyIndividualParams(settings);
     // The expert class may be exported under expert_type (test-platform export) or expert
     // (live settings_export_import). Select it in the ExpertPicker (which keys on the expert CLASS).
     const expertType = (['expert_type', 'expert', 'expert_class']
@@ -1157,8 +1161,8 @@ const Backtesting: React.FC = () => {
     setImportNote({
       kind: 'ok',
       text: matched
-        ? `Imported expert settings for "${matched}": selected the expert and pre-filled TP/SL + params.`
-        : `Imported expert settings${expertType ? ` from "${expertType}" (not a known expert — select it manually)` : ''}: pre-filled TP/SL + params.`,
+        ? `Imported expert settings for "${matched}": selected the expert and pre-filled its params.`
+        : `Imported expert settings${expertType ? ` from "${expertType}" (not a known expert — select it manually)` : ''}: pre-filled params.`,
     });
   };
   const handleExpertSettingsFile = (file: File | undefined) => {
@@ -1241,6 +1245,7 @@ const Backtesting: React.FC = () => {
       const buyRaw = parsed.buy_entry_conditions ?? parsed.buyEntryConditions;
       const sellRaw = parsed.sell_entry_conditions ?? parsed.sellEntryConditions;
       const exitRaw = (parsed.exit_rules ?? parsed.exit_conditions ?? parsed.rules ?? parsed.exitConditions) as unknown;
+      const entryRaw = (parsed.entry_actions ?? parsed.entryActions ?? parsed.entry_rules) as unknown;
       let buyCount = 0;
       let sellCount = 0;
       if (buyRaw) { const g = normalizeEntryTree(buyRaw); setBuyEntryConditions(g); buyCount = g.conditions.length; }
@@ -1260,9 +1265,19 @@ const Backtesting: React.FC = () => {
           return { ...ec, action, conditions: conds, id: ec.id ?? `exit-import-${Date.now()}-${i}` };
         }));
       }
+      const entryArr = Array.isArray(entryRaw) ? (entryRaw as Record<string, unknown>[]) : [];
+      if (entryArr.length) {
+        setEntryActions(entryArr.map((r, i) => {
+          // entryActionFromStored already maps action/action_value*/reference_value and drops
+          // conditions (entry actions have no gate of their own); just resolve action_type.
+          const ec = entryActionFromStored(r);
+          const action = (ec.action ?? (r.action_type as ExitConditionSet['action'])) as ExitConditionSet['action'];
+          return { ...ec, action, id: ec.id ?? `entry-import-${Date.now()}-${i}` };
+        }));
+      }
       setLiveImportNote({
         kind: 'ok',
-        text: `Imported ruleset JSON: ${buyCount} buy / ${sellCount} sell condition(s), ${exitArr.length} exit rule(s).`,
+        text: `Imported ruleset JSON: ${buyCount} buy / ${sellCount} sell condition(s), ${exitArr.length} exit rule(s), ${entryArr.length} entry action(s).`,
       });
     } catch (e) {
       setLiveImportNote({ kind: 'err', text: e instanceof Error ? e.message : 'Failed to apply the ruleset JSON.' });
@@ -1539,16 +1554,11 @@ const Backtesting: React.FC = () => {
           option_dte_step: ec.optionDteStep,
           option_sizing: ec.optionSizing
         })),
-        initialTpPercent,
-        initialTpOptimize,
-        initialTpMin: initialTpOptimize ? initialTpMin : null,
-        initialTpMax: initialTpOptimize ? initialTpMax : null,
-        initialTpStep: initialTpOptimize ? initialTpStep : null,
-        initialSlPercent,
-        initialSlOptimize,
-        initialSlMin: initialSlOptimize ? initialSlMin : null,
-        initialSlMax: initialSlOptimize ? initialSlMax : null,
-        initialSlStep: initialSlOptimize ? initialSlStep : null
+        // NOTE: the entry-time TP/SL bracket (entryActions) is NOT forwarded here — this
+        // strategyParams object only feeds the legacy ML engine's own bracket mechanism
+        // (backtest_handler.py reads strategy_params.initial_tp_percent/initial_sl_percent,
+        // untouched by the entry_actions unification), which the UI no longer has fields
+        // for. The daily_expert engine below sends entry_actions directly instead.
       };
 
       let lastBacktest: Backtest | null = null;
@@ -1574,8 +1584,9 @@ const Backtesting: React.FC = () => {
             // snake_case so the daily-engine rule builder (action_from_rule) reads
             // the action + reference_value + option_* selection params.
             exit_conditions: exitConditions.map(exitConditionToSnake),
-            initial_tp_percent: initialTpPercent,
-            initial_sl_percent: initialSlPercent,
+            // Entry-time TP/SL bracket: same shape as exit_conditions (minus the nested
+            // conditions sub-tree), converted server-side via the shared action_from_rule.
+            entry_actions: entryActions.map(entryActionToSnake),
             fill_model: fillModel,
             execution_interval: executionInterval,
             seed: runSeed,
@@ -1588,7 +1599,6 @@ const Backtesting: React.FC = () => {
             ...(runSchedule === 'weekly'
               ? { run_schedule: 'weekly', run_schedule_day: runScheduleDay }
               : {}),
-            ...(initialTpReference ? { initial_tp_reference: initialTpReference } : {}),
           })
         });
 
@@ -1762,17 +1772,6 @@ const Backtesting: React.FC = () => {
     }
   };
 
-  // Map the flat gene dict {tp, sl, model:*, ...} of an individual export onto the form's TP/SL.
-  const applyIndividualParams = (params: Record<string, unknown>) => {
-    const tp = params.tp ?? params.initialTpPercent ?? params.initial_tp_percent;
-    const sl = params.sl ?? params.initialSlPercent ?? params.initial_sl_percent;
-    if (typeof tp === 'number' && isFinite(tp)) setInitialTpPercent(tp);
-    if (typeof sl === 'number' && isFinite(sl)) setInitialSlPercent(sl);
-    // An individual carries concrete (resolved) values, not ranges — turn opt toggles off.
-    setInitialTpOptimize(false);
-    setInitialSlOptimize(false);
-  };
-
   // Part 5: read an exported opt-settings / individual JSON and populate the New-Backtest form.
   // Round-trips the schema produced by part 4 (lib/btExport.ts). Switches to the New tab so the
   // user sees the populated fields.
@@ -1783,7 +1782,8 @@ const Backtesting: React.FC = () => {
     try {
       const probe = JSON.parse(raw) as Record<string, unknown>;
       if (probe && (probe.buy_entry_conditions !== undefined || probe.sell_entry_conditions !== undefined
-        || probe.exit_conditions !== undefined || probe.export_type !== undefined)) {
+        || probe.exit_conditions !== undefined || probe.entry_actions !== undefined
+        || probe.export_type !== undefined)) {
         void importRulesetJson(raw);
         return;
       }
@@ -1806,27 +1806,12 @@ const Backtesting: React.FC = () => {
     applyImportedUniverse(d.universe);
     if (parsed.kind === 'individual') {
       const ind = parsed.data;
-      applyIndividualParams(ind.params ?? {});
       setImportNote({
         kind: 'ok',
-        text: `Imported individual #${ind.rank} from optimization #${ind.optimizationId}: pre-filled dates, universe, capital, and concrete TP/SL. Set the expert before running (exported params don't carry the expert class).`,
+        text: `Imported individual #${ind.rank} from optimization #${ind.optimizationId}: pre-filled dates, universe, and capital. Set the expert before running (exported params don't carry the expert class).`,
       });
     } else {
       const opt = parsed.data;
-      // Opt-settings carry RANGES (min/max/step), not concrete values — pre-fill TP/SL ranges if
-      // the export's expertRanges include them; otherwise leave the form's current TP/SL.
-      const tpR = opt.expertRanges?.['tp'] ?? opt.expertRanges?.['initialTpPercent'];
-      const slR = opt.expertRanges?.['sl'] ?? opt.expertRanges?.['initialSlPercent'];
-      if (tpR && tpR.min != null && tpR.max != null) {
-        setInitialTpOptimize(true);
-        setInitialTpMin(Number(tpR.min)); setInitialTpMax(Number(tpR.max));
-        if (tpR.step != null) setInitialTpStep(Number(tpR.step));
-      }
-      if (slR && slR.min != null && slR.max != null) {
-        setInitialSlOptimize(true);
-        setInitialSlMin(Number(slR.min)); setInitialSlMax(Number(slR.max));
-        if (slR.step != null) setInitialSlStep(Number(slR.step));
-      }
       const nRanges = Object.keys(opt.expertRanges ?? {}).length;
       setImportNote({
         kind: 'ok',
@@ -1867,9 +1852,11 @@ const Backtesting: React.FC = () => {
       // still load).
       try { await importRulesetJson(JSON.stringify(await fetchBacktestExport(id, 'ruleset'))); } catch { /* ignore */ }
       // Universe + interval + the full execution config (seed/fill_model/warmup/enable_short/
-      // run_schedule/tp_reference) — the expert_settings export now carries these for BOTH
-      // opt-derived runs (sourced from the optimization) and standalone runs (persisted on the
-      // row). Restoring them is what makes Run reproduce the saved result faithfully.
+      // run_schedule) — the expert_settings export now carries these for BOTH opt-derived runs
+      // (sourced from the optimization) and standalone runs (persisted on the row). Restoring
+      // them is what makes Run reproduce the saved result faithfully. The entry-time TP/SL
+      // bracket (entryActions) rides on the "ruleset" export instead — loaded above via
+      // importRulesetJson.
       if (expertExport) {
         applyImportedUniverse(expertExport.universe as ExportUniverse | undefined);
         const iv = expertExport.execution_interval;
@@ -1879,8 +1866,6 @@ const Backtesting: React.FC = () => {
         if (typeof ex.fill_model === 'string') setFillModel(ex.fill_model);
         if (ex.warmup_days != null) setWarmupDays(String(ex.warmup_days));
         if (typeof ex.enable_short === 'boolean') setAllowShort(ex.enable_short);
-        if (typeof ex.initial_tp_reference === 'string') setInitialTpReference(ex.initial_tp_reference);
-        else setInitialTpReference(null);
         // run_schedule_override {days:{monday:bool,...}, times:[...]} -> the form's daily/weekly +
         // weekday. One weekday true -> weekly on that day; otherwise daily (analyse every bar).
         const rso = ex.run_schedule_override as { days?: Record<string, boolean> } | null | undefined;
@@ -2178,16 +2163,10 @@ const Backtesting: React.FC = () => {
             option_dte_step: ec.optionDteStep,
             option_sizing: ec.optionSizing
           })),
-          initial_tp_percent: initialTpPercent,
-          initial_tp_optimize: initialTpOptimize,
-          initial_tp_min: initialTpOptimize ? initialTpMin : null,
-          initial_tp_max: initialTpOptimize ? initialTpMax : null,
-          initial_tp_step: initialTpOptimize ? initialTpStep : null,
-          initial_sl_percent: initialSlPercent,
-          initial_sl_optimize: initialSlOptimize,
-          initial_sl_min: initialSlOptimize ? initialSlMin : null,
-          initial_sl_max: initialSlOptimize ? initialSlMax : null,
-          initial_sl_step: initialSlOptimize ? initialSlStep : null
+          // Entry-time TP/SL bracket: same rule shape as exit_conditions (minus the nested
+          // conditions sub-tree), converted server-side via the shared action_from_rule.
+          // Replaces the deleted initial_tp_*/initial_sl_* scalar fields.
+          entry_actions: entryActions.map(entryActionToSnake),
         })
       });
 
@@ -2242,17 +2221,14 @@ const Backtesting: React.FC = () => {
       )
     );
 
-    // Load TP/SL settings
-    setInitialTpPercent(strategy.initialTpPercent ?? 5.0);
-    setInitialTpOptimize(strategy.initialTpOptimize ?? false);
-    setInitialTpMin(strategy.initialTpMin ?? 2.0);
-    setInitialTpMax(strategy.initialTpMax ?? 15.0);
-    setInitialTpStep(strategy.initialTpStep ?? 1.0);
-    setInitialSlPercent(strategy.initialSlPercent ?? 2.0);
-    setInitialSlOptimize(strategy.initialSlOptimize ?? false);
-    setInitialSlMin(strategy.initialSlMin ?? 1.0);
-    setInitialSlMax(strategy.initialSlMax ?? 10.0);
-    setInitialSlStep(strategy.initialSlStep ?? 0.5);
+    // Load the entry-time TP/SL bracket. Stored rules carry snake_case fields (same
+    // round-trip as exitConditions above) — minus a conditions sub-tree, which
+    // entryActionFromStored always seeds empty (entry actions have no gate of their own).
+    setEntryActions(
+      (strategy.entryActions || []).map((ec) =>
+        entryActionFromStored(ec as unknown as Record<string, unknown>)
+      )
+    );
 
     // Track which saved strategy is loaded so "Run Joint Optimization" can target it
     setLoadedStrategyId(strategy.id);
@@ -2887,8 +2863,7 @@ const Backtesting: React.FC = () => {
                           const strat = strategies.find(s => s.id === selectedBacktest.strategyId);
                           if (strat) {
                             sp = {
-                              initialTpPercent: strat.initialTpPercent,
-                              initialSlPercent: strat.initialSlPercent,
+                              entryActions: strat.entryActions,
                               buyEntryConditions: strat.buyEntryConditions,
                               sellEntryConditions: strat.sellEntryConditions,
                               exitConditions: strat.exitConditions,
@@ -2899,22 +2874,25 @@ const Backtesting: React.FC = () => {
                         if (!sp && !selectedBacktest.strategyId) {
                           return <p className="text-sm text-gray-500 dark:text-gray-400">No strategy information available for this backtest.</p>;
                         }
-                        // Optimization-derived backtests store the GA's flat gene dict
-                        // ({tp, sl, model:*, cond:*, exit:*}) in strategyParams, not the
-                        // structured {initialTpPercent, buyEntryConditions} shape — so fall
-                        // back to the flat tp/sl keys.
-                        const tp = sp?.initialTpPercent ?? sp?.initial_tp_percent ?? sp?.tp;
-                        const sl = sp?.initialSlPercent ?? sp?.initial_sl_percent ?? sp?.sl;
+                        // The entry-time TP/SL bracket now rides on entryActions (a rule list,
+                        // same shape as exitConditions) instead of the deleted scalar
+                        // initialTpPercent/initialSlPercent fields. Pull the adjust_take_profit /
+                        // adjust_stop_loss rule's value for the quick-glance cards below.
+                        const entryActionsList = (sp?.entryActions ?? sp?.entry_actions ?? sp?.entry_rules ?? []) as any[];
+                        const tpRule = entryActionsList.find((r) => (r?.action ?? r?.action_type) === 'adjust_take_profit');
+                        const slRule = entryActionsList.find((r) => (r?.action ?? r?.action_type) === 'adjust_stop_loss');
+                        const tp = tpRule ? (tpRule.actionValue ?? tpRule.action_value) : undefined;
+                        const sl = slRule ? (slRule.actionValue ?? slRule.action_value) : undefined;
                         const buyConditions = sp?.buyEntryConditions?.conditions || [];
                         const sellConditions = sp?.sellEntryConditions?.conditions || [];
                         const exitConditions = sp?.exitConditions || [];
                         const stratName = sp?.strategyName;
-                        // Flat optimized genes (model:*/cond:*/exit:*) — surfaced as a readable
-                        // list so the tab is informative for optimization runs (which carry no
-                        // structured buy/sell/exit conditions).
+                        // Flat optimized genes (model:*/cond:*/exit:*/entry:*) — surfaced as a
+                        // readable list so the tab is informative for optimization runs (which
+                        // carry no structured buy/sell/exit/entry-action conditions).
                         const optimizedGenes = sp && typeof sp === 'object'
                           ? Object.entries(sp as Record<string, unknown>)
-                              .filter(([k]) => /^(model:|cond:|exit:)/.test(k))
+                              .filter(([k]) => /^(model:|cond:|exit:|entry:)/.test(k))
                               .map(([k, v]) => [k, typeof v === 'number' ? (Number.isInteger(v) ? String(v) : (v as number).toFixed(2)) : String(v)] as [string, string])
                           : [];
                         // Resolved-ruleset read-back (B10): when this run came from a
@@ -2971,6 +2949,18 @@ const Backtesting: React.FC = () => {
                                 </div>
                               </div>
                             )}
+                            {entryActionsList.length > 0 && (
+                              <div>
+                                <h4 className="text-sm font-semibold text-blue-600 mb-2">Entry Actions ({entryActionsList.length})</h4>
+                                <div className="space-y-1.5">
+                                  {entryActionsList.map((rule: any, i: number) => (
+                                    <div key={i} className="text-sm bg-blue-50 dark:bg-blue-900/20 rounded px-3 py-2 text-blue-800 dark:text-blue-300">
+                                      {fmtExitAction(rule)}
+                                    </div>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
                             {exitConditions.length > 0 && !bestParams && (
                               <div>
                                 <div className="flex items-baseline gap-2 mb-2">
@@ -3005,7 +2995,8 @@ const Backtesting: React.FC = () => {
                                 <ResolvedRulesetView exitRules={exitConditions} bestParams={bestParams} />
                               </div>
                             )}
-                            {buyConditions.length === 0 && sellConditions.length === 0 && exitConditions.length === 0 && optimizedGenes.length > 0 && (
+                            {buyConditions.length === 0 && sellConditions.length === 0 && exitConditions.length === 0
+                              && entryActionsList.length === 0 && optimizedGenes.length > 0 && (
                               <div>
                                 <h4 className="text-sm font-semibold text-gray-600 dark:text-gray-300 mb-2">Optimized Parameters ({optimizedGenes.length})</h4>
                                 <div className="grid grid-cols-2 gap-x-4 gap-y-1">
@@ -3560,7 +3551,7 @@ const Backtesting: React.FC = () => {
 
                   <button
                     onClick={() => {
-                      conditionModalSnapshot.current = { buy: buyEntryConditions, sell: sellEntryConditions, exit: exitConditions };
+                      conditionModalSnapshot.current = { buy: buyEntryConditions, sell: sellEntryConditions, exit: exitConditions, entry: entryActions };
                       setShowConditionModal('buy');
                     }}
                     className="flex items-center gap-2 text-sm font-semibold text-white w-full p-2 bg-green-700 hover:bg-green-800 rounded-lg border border-green-800 shadow-sm"
@@ -3568,6 +3559,9 @@ const Backtesting: React.FC = () => {
                     <TrendingUp className="w-4 h-4 text-white" />
                     <span className="flex-1 text-left">Entry Conditions</span>
                     <span className="text-xs font-medium text-green-100">{buyEntryConditions.conditions.length} condition{buyEntryConditions.conditions.length !== 1 ? 's' : ''}</span>
+                    {entryActions.length > 0 && (
+                      <span className="text-xs font-medium text-green-100">· {entryActions.length} entry action{entryActions.length !== 1 ? 's' : ''}</span>
+                    )}
                     <ChevronDown className="w-4 h-4 text-white" />
                   </button>
                   <div className="flex justify-end gap-1 text-xs">
@@ -3581,7 +3575,7 @@ const Backtesting: React.FC = () => {
                     <>
                       <button
                         onClick={() => {
-                          conditionModalSnapshot.current = { buy: buyEntryConditions, sell: sellEntryConditions, exit: exitConditions };
+                          conditionModalSnapshot.current = { buy: buyEntryConditions, sell: sellEntryConditions, exit: exitConditions, entry: entryActions };
                           setShowConditionModal('sell');
                         }}
                         className="flex items-center gap-2 text-sm font-semibold text-white w-full p-2 bg-red-700 hover:bg-red-800 rounded-lg border border-red-800 shadow-sm"
@@ -3602,7 +3596,7 @@ const Backtesting: React.FC = () => {
                   )}
                   <button
                     onClick={() => {
-                      conditionModalSnapshot.current = { buy: buyEntryConditions, sell: sellEntryConditions, exit: exitConditions };
+                      conditionModalSnapshot.current = { buy: buyEntryConditions, sell: sellEntryConditions, exit: exitConditions, entry: entryActions };
                       setShowConditionModal('exit');
                     }}
                     className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300 w-full p-2 bg-gray-50 dark:bg-gray-700/50 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg border border-gray-200 dark:border-gray-600"
@@ -4102,7 +4096,7 @@ const Backtesting: React.FC = () => {
                     <span>Entry conditions: {buyEntryConditions.conditions.length}</span>
                     {allowShort && <span>Short conditions: {sellEntryConditions.conditions.length}</span>}
                     <span>Exit rules: {exitConditions.length}</span>
-                    <span>TP: {initialTpPercent}% / SL: {initialSlPercent}%</span>
+                    <span>Entry actions: {entryActions.length}</span>
                   </div>
                 </div>
               </div>
@@ -4562,6 +4556,29 @@ const Backtesting: React.FC = () => {
                       // prediction-field-only boundary.
                       vocabulary={source === 'expert' ? rulesetVocabulary : undefined}
                     />
+
+                    <div className="mt-6 pt-4 border-t border-gray-200 dark:border-gray-700">
+                      <div className="flex items-center gap-2 mb-1">
+                        <Shield className="w-4 h-4 text-blue-500" />
+                        <h4 className="text-sm font-semibold text-gray-900 dark:text-gray-100">Entry Actions (TP/SL)</h4>
+                      </div>
+                      <p className="text-xs text-gray-500 dark:text-gray-400 mb-3">
+                        Attach a take-profit / stop-loss bracket that fires the moment this entry
+                        fills — the SAME gate as the entry conditions above, no separate trigger
+                        to configure (mirrors the live platform's action_0=buy + action_1=adjust_
+                        take_profit pattern). Applies to both long and short entries.
+                      </p>
+                      <ExitConditionsBuilder
+                        value={entryActions}
+                        onChange={setEntryActions}
+                        showOptimization={true}
+                        vocabulary={rulesetVocabulary}
+                        actionFilter={['adjust_take_profit', 'adjust_stop_loss']}
+                        showConditions={false}
+                        addLabel="Add Entry Action"
+                        ruleNamePrefix="Entry Action"
+                      />
+                    </div>
                   </div>
                 )}
 

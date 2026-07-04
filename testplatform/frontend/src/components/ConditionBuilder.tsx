@@ -709,6 +709,7 @@ function collectLeaves(node: ConditionTree): ConditionNode[] {
 export function validateExitRule(
   rule: ExitConditionSet,
   vocab: Vocabulary | undefined,
+  opts?: { skipConditionsWarning?: boolean },
 ): string[] {
   const warnings: string[] = [];
 
@@ -742,9 +743,15 @@ export function validateExitRule(
 
   // Always-fires: no condition leaves AND the action is not deliberately
   // unconditional. A leaf with an empty field counts as "no real condition".
-  const hasRealLeaf = collectLeaves(rule.conditions).some((l) => !!l.field);
-  if (!hasRealLeaf && !UNCONDITIONAL_ACTIONS.has(rule.action)) {
-    warnings.push('No conditions — fires every bar');
+  // Callers that hide the conditions sub-tree entirely (entry actions, which
+  // fire on the same gate as the buy/sell entry rule and carry no condition
+  // of their own) opt out via skipConditionsWarning — there is no "every bar"
+  // concept to warn about when there's no condition editor to begin with.
+  if (!opts?.skipConditionsWarning) {
+    const hasRealLeaf = collectLeaves(rule.conditions).some((l) => !!l.field);
+    if (!hasRealLeaf && !UNCONDITIONAL_ACTIONS.has(rule.action)) {
+      warnings.push('No conditions — fires every bar');
+    }
   }
 
   // Invalid optimize ranges. A range is bad when min >= max or step <= 0.
@@ -806,6 +813,26 @@ interface ExitConditionsBuilderProps {
   showOptimization?: boolean;
   /** Exit-ruleset vocabulary threaded to each rule's ConditionBuilder. */
   vocabulary?: Vocabulary;
+  /**
+   * Restrict the action dropdown (and the option/position optgroups) to just these
+   * action values. Used by the entry-actions builder (Backtesting.tsx) to scope the
+   * shared component to adjust_take_profit/adjust_stop_loss only — entry actions have
+   * no close/sell of their own (the entry itself IS that). Undefined -> all vocabulary
+   * actions (the exit-rule default).
+   */
+  actionFilter?: string[];
+  /**
+   * Render the "When these conditions are met" sub-tree editor. Entry actions fire on
+   * the SAME gate as the buy/sell entry rule they're attached to and carry no condition
+   * of their own, so the entry-actions builder passes false to hide it (and suppress the
+   * resulting "no conditions" warning, which would otherwise fire on every entry action).
+   * Default true (the exit-rule behaviour).
+   */
+  showConditions?: boolean;
+  /** Label for the "add rule" button. Default "Add Exit Rule". */
+  addLabel?: string;
+  /** Default name prefix for a newly-added rule (e.g. "Exit Rule 1" vs "Entry Action 1"). */
+  ruleNamePrefix?: string;
 }
 
 export const ExitConditionsBuilder: React.FC<ExitConditionsBuilderProps> = ({
@@ -814,6 +841,10 @@ export const ExitConditionsBuilder: React.FC<ExitConditionsBuilderProps> = ({
   availableFields = [],
   showOptimization = true,
   vocabulary,
+  actionFilter,
+  showConditions = true,
+  addLabel = 'Add Exit Rule',
+  ruleNamePrefix = 'Exit Rule',
 }) => {
   // Fallback fetch: if the caller did not thread a vocabulary prop, load it once
   // so the action picker (actions/reference_values) is still vocabulary-driven.
@@ -828,7 +859,9 @@ export const ExitConditionsBuilder: React.FC<ExitConditionsBuilderProps> = ({
     return () => { cancelled = true; };
   }, [vocabulary]);
   const effectiveVocab = vocabulary ?? fetchedVocab;
-  const actions = effectiveVocab?.actions ?? [];
+  const actions = (effectiveVocab?.actions ?? []).filter(
+    (a) => !actionFilter || actionFilter.includes(a.value),
+  );
   const positionActions = actions.filter((a) => !a.is_option);
   const optionActions = actions.filter((a) => a.is_option);
   const referenceValues = effectiveVocab?.reference_values ?? {};
@@ -836,9 +869,9 @@ export const ExitConditionsBuilder: React.FC<ExitConditionsBuilderProps> = ({
   const addExitCondition = () => {
     const newExit: ExitConditionSet = {
       id: generateId(),
-      name: `Exit Rule ${value.length + 1}`,
+      name: `${ruleNamePrefix} ${value.length + 1}`,
       conditions: createEmptyGroup('AND'),
-      action: 'close',
+      action: (actionFilter?.[0] as ExitConditionSet['action']) ?? 'close',
     };
     onChange([...value, newExit]);
   };
@@ -938,7 +971,9 @@ export const ExitConditionsBuilder: React.FC<ExitConditionsBuilderProps> = ({
               red "reject" chips; everything else as amber warning chips. The
               user can still run the backtest — these never hard-block. */}
           {(() => {
-            const warnings = validateExitRule(exitCond, effectiveVocab);
+            const warnings = validateExitRule(exitCond, effectiveVocab, {
+              skipConditionsWarning: !showConditions,
+            });
             if (warnings.length === 0) return null;
             return (
               <div className="flex flex-wrap gap-1 mb-3">
@@ -958,21 +993,25 @@ export const ExitConditionsBuilder: React.FC<ExitConditionsBuilderProps> = ({
             );
           })()}
 
-          {/* Conditions */}
-          <div className="mb-3">
-            <label className="text-xs text-gray-500 dark:text-gray-400 mb-1 block">
-              When these conditions are met:
-            </label>
-            <ConditionBuilder
-              value={exitCond.conditions}
-              onChange={(conds) =>
-                updateExitCondition(index, { conditions: conds as ConditionGroup })
-              }
-              availableFields={availableFields}
-              showOptimization={showOptimization}
-              vocabulary={effectiveVocab}
-            />
-          </div>
+          {/* Conditions — hidden for entry actions (showConditions=false), which fire on the
+              same gate as the buy/sell entry rule they're attached to and have no condition
+              of their own. */}
+          {showConditions && (
+            <div className="mb-3">
+              <label className="text-xs text-gray-500 dark:text-gray-400 mb-1 block">
+                When these conditions are met:
+              </label>
+              <ConditionBuilder
+                value={exitCond.conditions}
+                onChange={(conds) =>
+                  updateExitCondition(index, { conditions: conds as ConditionGroup })
+                }
+                availableFields={availableFields}
+                showOptimization={showOptimization}
+                vocabulary={effectiveVocab}
+              />
+            </div>
+          )}
 
           {/* Action */}
           <div className="flex flex-wrap items-center gap-3 pt-3 border-t border-gray-200 dark:border-gray-600">
@@ -1320,7 +1359,7 @@ export const ExitConditionsBuilder: React.FC<ExitConditionsBuilderProps> = ({
         className="flex items-center gap-1.5 px-3 py-2 text-sm text-gray-600 dark:text-gray-400 border border-dashed border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700 w-full justify-center"
       >
         <Plus className="w-4 h-4" />
-        Add Exit Rule
+        {addLabel}
       </button>
     </div>
   );

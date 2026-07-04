@@ -72,7 +72,7 @@ export interface IndividualExport {
   executionInterval?: string | null;
   initialCapital?: number | null;
   universe?: ExportUniverse;
-  /** Concrete gene dict: tp/sl + model:* / cond:* / exit:* / screener:* (whatever the GA tuned). */
+  /** Concrete gene dict: model:* / cond:* / exit:* / entry:* / screener:* (whatever the GA tuned). */
   params: Record<string, unknown>;
 }
 
