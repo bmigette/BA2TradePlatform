@@ -715,7 +715,8 @@ _EXPERT_OPT = {
             # standing-analyst count). Grid searches {0,3,6,9,12}.
             "max_analyst_age_months": {"optimize": True, "min": 0, "max": 12, "step": 3, "type": "int"},
             # CATEGORICAL: which analyst reference price the rating + the (S4) target-anchored TP
-            # use. Optimized as a choice; the offset-from-target is the initial_tp gene (S4).
+            # use. Optimized as a choice; the offset-from-target is S4's entry_actions TP gene
+            # (entry:s4_tp:action_value).
             "target_price_type": {"optimize": True, "type": "choice",
                                   "choices": ["low", "consensus", "median", "high", "low_consensus_avg"]},
         },
