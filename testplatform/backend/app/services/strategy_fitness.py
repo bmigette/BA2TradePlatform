@@ -19,16 +19,16 @@ from datetime import date, datetime
 # confused with a crashed trial, and is always worse than any real config.
 ZERO_TRADE_SENTINEL = -1.0e9
 
-# consistent_annual_return trade-floor sentinel: a config trading BELOW the 30/yr floor is
-# disqualified, but with a value distinct from ZERO_TRADE_SENTINEL so a below-floor config is
-# distinguishable from a no-trade config in logs/all_results, and (deliberately) ranks ABOVE a
-# no-trade config — "trades too little" is less broken than "never trades". Both are always
-# worse than any real (non-disqualified) fitness.
+# consistent_annual_return: returned when avg_trades_per_year is genuinely UNDERIVABLE (no
+# avg_trades_per_year key AND no equity-curve-derivable years) — a data problem, not a thin-trading
+# config (those are now scored via a proportional ramp, not disqualified; see _consistent_annual_return).
+# Distinct from ZERO_TRADE_SENTINEL so it's distinguishable from a no-trade config in logs/all_results,
+# and (deliberately) ranks ABOVE a no-trade config. Both are always worse than any real fitness.
 LOW_TRADE_SENTINEL = -1.0e8
 
 # --- consistent_annual_return metric constants -------------------------------------------------
 # Goal: ~30% return EVERY year — not 50% one year / 10% the next.
-_CAR_MIN_TRADES_PER_YEAR = 30.0   # hard gate: below this the config is disqualified
+_CAR_MIN_TRADES_PER_YEAR = 30.0   # trade_gate ramp target: full credit at/above this, linear below
 _CAR_DD_SOFT_CAP = 20.0           # % drawdown tolerated at full credit; beyond it, soft penalty
 _CAR_CONSISTENCY_FLOOR = 0.25     # worst_year/mean_year clamp lower bound
 _CAR_PARTIAL_YEAR_MIN_DAYS = 182.62  # ~6 months: shorter partial start/end years merge into neighbor
@@ -280,17 +280,21 @@ def compute_fitness(fitness_metric: str, results: dict) -> float:
 # consistent_annual_return ("car" / "goal")
 # ---------------------------------------------------------------------------
 def _consistent_annual_return(results: dict) -> float:
-    """Fitness aligned with the trading goal: ~30%/yr EVERY year, >=30 trades/yr, dd <= 20% ok.
+    """Fitness aligned with the trading goal: ~30%/yr EVERY year, ~30 trades/yr, dd <= 20% ok.
 
-    fitness = base x dd_guard x consistency, where:
+    fitness = base x dd_guard x consistency x trade_gate, where:
 
     * base — ``adjusted_annualized_return`` when a profit cap is active (same adjusted-metric
       switch as the other return metrics: a lucky mega-winner must not win the search), else
       ``annualized_return``. Both are %/yr.
-    * trade gate — ``avg_trades_per_year`` must be >= 30 or the config is DISQUALIFIED with
-      ``LOW_TRADE_SENTINEL`` (distinct from ZERO_TRADE_SENTINEL; see its comment). When the key
-      is absent, derived as total_trades / calendar-years spanned by the equity curve; if that
-      too is underivable the config is disqualified (no hidden defaults).
+    * trade_gate — a PROPORTIONAL ramp, ``clamp(avg_trades_per_year / 30, 0.0, 1.0)``, not a hard
+      cliff: a 15-trades/yr config scores at 0.5x, a 3-trades/yr config at 0.1x, full credit only
+      at >=30/yr. This gives the GA a gradient to climb toward the trade-frequency target instead
+      of a flat disqualification, where every below-floor config (29/yr or 0.3/yr alike) scored
+      identically and crossover/mutation had no signal to distinguish "close" from "nowhere
+      close". ``avg_trades_per_year`` missing is derived as total_trades / calendar-years spanned
+      by the equity curve; if that too is underivable, the config is disqualified with
+      ``LOW_TRADE_SENTINEL`` (a genuine data problem, not a thin-trading config).
     * dd_guard — 1.0 while |max_drawdown| <= 20%; beyond that 20/|dd| (soft penalty, e.g.
       -30% dd -> x0.667), because up to 20% drawdown is explicitly acceptable.
     * consistency — clamp(worst_year / mean_year, 0.25, 1.0) over CALENDAR-YEAR returns from
@@ -303,11 +307,11 @@ def _consistent_annual_return(results: dict) -> float:
       run's start/end shorter than ~6 months are merged into their neighbor year so a 2-week
       stub can't fake a "bad year".
 
-    A NEGATIVE base is returned unfactored: multiplying a negative by <1.0 factors would
-    IMPROVE a losing config, flipping the penalty's sign.
+    A NEGATIVE base is returned unfactored: multiplying a negative by <1.0 factors (dd_guard,
+    consistency, OR trade_gate) would IMPROVE a losing config, flipping the penalty's sign.
 
     NOTE: the external ``fitness_trade_scale`` multiplier is intentionally NOT applied to this
-    metric (compute_fitness returns before that block) — the hard 30/yr gate replaces it.
+    metric (compute_fitness returns before that block) — trade_gate replaces it.
     """
     # --- base: (adjusted) annualized return, %/yr ---------------------------------------------
     if results.get("profit_cap_pct") or results.get("profit_share_cap_pct"):
@@ -320,14 +324,15 @@ def _consistent_annual_return(results: dict) -> float:
         return ZERO_TRADE_SENTINEL
     base = float(base)
 
-    # --- trade gate: >= 30 trades/yr or disqualified -------------------------------------------
+    # --- trade gate: proportional ramp toward 30 trades/yr (no hard cliff) --------------------
     tpy = results.get("avg_trades_per_year")
     if tpy is None:
         years = _years_spanned_by_curve(results.get("equity_curve"))
         total = int(results.get("total_trades", 0) or 0)
         tpy = (total / years) if years > 0 else None
-    if tpy is None or float(tpy) < _CAR_MIN_TRADES_PER_YEAR:
-        return LOW_TRADE_SENTINEL
+    if tpy is None:
+        return LOW_TRADE_SENTINEL  # genuinely no trade-frequency data to score against
+    trade_gate = min(max(float(tpy) / _CAR_MIN_TRADES_PER_YEAR, 0.0), 1.0)
 
     if base <= 0:
         return base  # unfactored: penalty factors on a negative would flip its sign
@@ -338,7 +343,7 @@ def _consistent_annual_return(results: dict) -> float:
 
     # --- yearly consistency ----------------------------------------------------------------------
     consistency = _consistency_factor(_calendar_year_returns(results.get("equity_curve")))
-    return base * dd_guard * consistency
+    return base * dd_guard * consistency * trade_gate
 
 
 def _consistency_factor(year_returns: list) -> float:

@@ -154,24 +154,42 @@ def test_dd_30_soft_penalty():
 
 
 # ---------------------------------------------------------------------------
-# 4. Trade gate (>= 30/yr)
+# 4. Trade gate (proportional ramp toward 30/yr, no hard cliff)
 # ---------------------------------------------------------------------------
-def test_25_trades_per_year_disqualified():
-    assert compute_fitness("consistent_annual_return", _r(avg_trades_per_year=25.0)) == LOW_TRADE_SENTINEL
+def test_25_trades_per_year_ramped_not_disqualified():
+    # 25/30 = 0.8333x, not a flat disqualification.
+    assert compute_fitness("consistent_annual_return", _r(avg_trades_per_year=25.0)) == pytest.approx(
+        30.0 * (25.0 / 30.0))
+
+
+def test_15_trades_per_year_half_credit():
+    assert compute_fitness("consistent_annual_return", _r(avg_trades_per_year=15.0)) == pytest.approx(30.0 * 0.5)
+
+
+def test_zero_point_three_trades_per_year_tiny_but_nonzero():
+    # Thin (near-zero) trading is heavily discounted, but proportionally -- not sentinel-flattened.
+    assert compute_fitness("consistent_annual_return", _r(avg_trades_per_year=0.3)) == pytest.approx(
+        30.0 * (0.3 / 30.0))
 
 
 def test_30_trades_per_year_passes():
     assert compute_fitness("consistent_annual_return", _r(avg_trades_per_year=30.0)) == pytest.approx(30.0)
 
 
+def test_60_trades_per_year_capped_at_full_credit():
+    # Ramp clamps at 1.0 -- no reward for over-trading past the 30/yr target.
+    assert compute_fitness("consistent_annual_return", _r(avg_trades_per_year=60.0)) == pytest.approx(30.0)
+
+
 def test_gate_derives_trades_per_year_from_curve_when_key_missing():
     curve = _curve([("2020-01-02", 100_000.0), ("2022-12-30", 219_700.0)])  # ~3 years
-    r = _r(equity_curve=curve, total_trades=95)  # ~31.8/yr -> passes
+    r = _r(equity_curve=curve, total_trades=95)  # ~31.8/yr -> full credit
     r.pop("avg_trades_per_year")
     assert compute_fitness("consistent_annual_return", r) > 0
-    r2 = _r(equity_curve=curve, total_trades=60)  # ~20/yr -> disqualified
+    r2 = _r(equity_curve=curve, total_trades=60)  # ~20/yr -> ramped down, not disqualified
     r2.pop("avg_trades_per_year")
-    assert compute_fitness("consistent_annual_return", r2) == LOW_TRADE_SENTINEL
+    f2 = compute_fitness("consistent_annual_return", r2)
+    assert 0 < f2 < 30.0
 
 
 def test_gate_underivable_disqualifies():
@@ -181,7 +199,7 @@ def test_gate_underivable_disqualifies():
 
 
 def test_sentinels_are_distinct_and_ordered():
-    # no-trade (existing top-of-function guard) is WORSE than a below-floor config.
+    # no-trade (existing top-of-function guard) is WORSE than an underivable-trade-data config.
     assert compute_fitness("consistent_annual_return", _r(total_trades=0)) == ZERO_TRADE_SENTINEL
     assert ZERO_TRADE_SENTINEL < LOW_TRADE_SENTINEL < 0.0
 
