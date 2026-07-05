@@ -5,8 +5,8 @@ import json
 import sqlite3
 
 DB = r"C:\Users\basti\Documents\ba2\test\dl_forecasting.db"
-SUFFIX = "-goal"
-TOTAL_PLANNED = 31
+SUFFIX = "-goal4"
+TOTAL_PLANNED = 28
 
 
 def main():

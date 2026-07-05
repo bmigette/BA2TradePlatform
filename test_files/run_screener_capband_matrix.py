@@ -99,6 +99,8 @@ def main() -> int:
     ap.add_argument("--end", default="2026-01-01")
     ap.add_argument("--population", type=int, default=40)
     ap.add_argument("--generations", type=int, default=8)
+    ap.add_argument("--mutation-prob", type=float, default=None,
+                    help="Per-gene mutation probability passthrough (default: launcher's 0.3).")
     ap.add_argument("--interval", default="5min")
     ap.add_argument("--fitness", default="calmar_ratio")
     ap.add_argument("--store", default=_STORE)
@@ -173,6 +175,8 @@ def main() -> int:
                "--interval", args.interval, "--population", str(population),
                "--generations", str(args.generations), "--screener-cadence-days", str(args.cadence_days),
                "--run-schedule", "weekly", "--name", name, "--parallel", str(args.parallel)]
+        if args.mutation_prob is not None:
+            cmd += ["--mutation-prob", str(args.mutation_prob)]
         if args.profit_cap_pct and args.profit_cap_pct > 0:
             cmd += ["--profit-cap-pct", str(args.profit_cap_pct)]
         if args.profit_share_cap_pct and args.profit_share_cap_pct > 0:

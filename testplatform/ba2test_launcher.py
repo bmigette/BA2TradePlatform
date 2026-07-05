@@ -1494,7 +1494,7 @@ def _cmd_optimize(args) -> int:
         cfg = {
             "populationSize": int(args.population),
             "generations": int(args.generations),
-            "crossoverProb": 0.6, "mutationProb": 0.3,
+            "crossoverProb": 0.6, "mutationProb": float(args.mutation_prob),
             "earlyStoppingGenerations": int(args.early_stop),
             "elitismPercent": 0.1, "seed": int(args.seed),
             "parallelIndividuals": int(args.parallel),
@@ -1655,7 +1655,7 @@ def _cmd_optimize_batch(args) -> int:
             cfg = {
                 "populationSize": int(args.population),
                 "generations": int(args.generations),
-                "crossoverProb": 0.6, "mutationProb": 0.3,
+                "crossoverProb": 0.6, "mutationProb": float(args.mutation_prob),
                 "earlyStoppingGenerations": int(args.early_stop),
                 "elitismPercent": 0.1, "seed": int(args.seed),
                 "parallelIndividuals": int(args.parallel),
@@ -2193,6 +2193,8 @@ def main(argv: "list | None" = None) -> int:
     op.add_argument("--population", type=int, default=10)
     op.add_argument("--parallel", type=int, default=4, help="Parallel trials (ThreadPoolExecutor).")
     op.add_argument("--early-stop", type=int, default=4)
+    op.add_argument("--mutation-prob", type=float, default=0.3,
+                    help="Per-gene mutation probability (higher = more exploration). Default 0.3.")
     op.add_argument("--save-top", type=int, default=5,
                     help="Persist the top-N distinct param sets as saved Backtests (default 5).")
     op.add_argument("--seed", type=int, default=42, help="RNG seed (determinism).")
@@ -2270,6 +2272,8 @@ def main(argv: "list | None" = None) -> int:
     ob.add_argument("--population", type=int, default=40)
     ob.add_argument("--parallel", type=int, default=6, help="Process-pool workers per job.")
     ob.add_argument("--early-stop", type=int, default=4)
+    ob.add_argument("--mutation-prob", type=float, default=0.3,
+                    help="Per-gene mutation probability (higher = more exploration). Default 0.3.")
     ob.add_argument("--save-top", type=int, default=5)
     ob.add_argument("--seed", type=int, default=42)
     ob.add_argument("--initial-capital", type=float, default=10000.0)
