@@ -34,6 +34,11 @@ _CLASSIC = ["FMPRating", "FMPEarningsDrift", "FMPInsiderClusterBuy"]
 _RANKER = "FactorRanker"
 # Experts with no usable data in the large-cap band (skipped on `large` unless --include-no-data).
 _NO_LARGE_CAP = {"FMPEarningsDrift", "FMPInsiderClusterBuy"}
+# Strategies that only make sense for experts producing a REAL, updating analyst price target.
+# S4 anchors its TP on expert_target_price; EarningsDrift/Insider have no analyst target (their
+# expected_profit_percent is a static setting), so S4 degenerates to a fixed-% TP there — skip it.
+_TARGET_PRICE_STRATEGIES = {"S4"}
+_TARGET_PRICE_EXPERTS = {"FMPRating"}
 
 
 def _db_path() -> str:
@@ -86,6 +91,8 @@ def _jobs(bands, strategies, include_no_data, skip_experts=frozenset(), name_suf
             if expert == "FMPRating" or not _eligible(band, expert):
                 continue
             for s in strategies:
+                if s in _TARGET_PRICE_STRATEGIES and expert not in _TARGET_PRICE_EXPERTS:
+                    continue  # S4 needs a real analyst target; these experts have none
                 yield (f"scr-{band}-{expert}-{s}{name_suffix}", expert, s, band)
         if _RANKER not in skip_experts:
             yield (f"scr-{band}-{_RANKER}{name_suffix}", _RANKER, None, band)  # bypass: one job per band

@@ -987,6 +987,121 @@ def _build_strategy_S3(name: str):
     )
 
 
+def _build_strategy_S5(name: str):
+    """S5 — S2/S3 HYBRID: signal exits + trailing ladder. Data-driven design from the -goal grids:
+    the best S2 config (186% archived S2-large winner) entered on nearly every signal (all gates
+    off) and managed purely by exits — but capped every winner at a FIXED +32% TP while its trades
+    included names that ran far higher. S5 keeps S2's proven core (bearish/downgrade signal exits,
+    breakeven lock, no cooldown gates) but replaces the fixed TP with S3's staged trailing tiers,
+    plus a very WIDE optimizable profit cap (40-80%) as the only hard ceiling — testing whether
+    tail-capture beats the fixed target. Entry gate stays light like S3 (confidence +
+    expected_profit only, both toggleable)."""
+    from app.models.strategy import Strategy
+    buy_entry_conditions = {
+        "id": "root", "type": "AND", "conditions": [
+            {"id": "gate_confidence", "field": "confidence", "op": ">", "value": 50,
+             "optimize": True, "value_min": 40, "value_max": 80, "value_step": 5,
+             "toggle_optimize": True},
+            {"id": "gate_expected_profit", "field": "expected_profit", "op": ">", "value": 3,
+             "optimize": True, "value_min": 0, "value_max": 15, "value_step": 1,
+             "toggle_optimize": True},
+        ],
+    }
+    exit_conditions = [
+        # Floor stop (always on, tightness optimized) — same hygiene as S2/S3.
+        {"id": "exit_stoploss", "action_type": "adjust_stop_loss", "reference_value": "order_open_price",
+         "action_value": -6.0, "action_value_optimize": True,
+         "action_value_min": -20.0, "action_value_max": -3.0, "action_value_step": 2.0,
+         "conditions": {"type": "AND", "conditions": [{"id": "sl_hold", "field": "has_position"}]}},
+        # S2's signal-based exits: close when the expert turns bearish / rating goes negative.
+        {"id": "exit_bearish", "action_type": "close", "toggle_optimize": True,
+         "conditions": {"type": "AND", "conditions": [{"id": "xb", "field": "bearish"}]}},
+        {"id": "exit_downgrade", "action_type": "close", "toggle_optimize": True,
+         "conditions": {"type": "AND", "conditions": [{"id": "xd", "field": "current_rating_negative"}]}},
+        # S2's breakeven lock: once +X% in profit, move the stop to entry +lock%.
+        {"id": "exit_belock", "action_type": "adjust_stop_loss", "reference_value": "order_open_price",
+         "action_value": 0.0, "action_value_optimize": True,
+         "action_value_min": -2.0, "action_value_max": 8.0, "action_value_step": 2.0,
+         "toggle_optimize": True,
+         "conditions": {"type": "AND", "conditions": [
+             {"id": "xlk", "field": "profit_loss_percent", "op": ">", "value": 5,
+              "optimize": True, "value_min": 3, "value_max": 20, "value_step": 2}]}},
+        # S3's staged trailing tiers replace the fixed TP: ratchet the stop up as profit grows.
+        {"id": "trail_t1", "action_type": "adjust_stop_loss", "reference_value": "order_open_price",
+         "action_value": 4.0, "action_value_optimize": True,
+         "action_value_min": 1.0, "action_value_max": 8.0, "action_value_step": 1.0, "toggle_optimize": True,
+         "conditions": {"type": "AND", "conditions": [
+             {"id": "t1", "field": "profit_loss_percent", "op": ">", "value": 10,
+              "optimize": True, "value_min": 6, "value_max": 16, "value_step": 2}]}},
+        {"id": "trail_t2", "action_type": "adjust_stop_loss", "reference_value": "order_open_price",
+         "action_value": 12.0, "action_value_optimize": True,
+         "action_value_min": 6.0, "action_value_max": 18.0, "action_value_step": 2.0, "toggle_optimize": True,
+         "conditions": {"type": "AND", "conditions": [
+             {"id": "t2", "field": "profit_loss_percent", "op": ">", "value": 20,
+              "optimize": True, "value_min": 14, "value_max": 28, "value_step": 2}]}},
+        {"id": "trail_t3", "action_type": "adjust_stop_loss", "reference_value": "order_open_price",
+         "action_value": 24.0, "action_value_optimize": True,
+         "action_value_min": 16.0, "action_value_max": 32.0, "action_value_step": 2.0, "toggle_optimize": True,
+         "conditions": {"type": "AND", "conditions": [
+             {"id": "t3", "field": "profit_loss_percent", "op": ">", "value": 32,
+              "optimize": True, "value_min": 24, "value_max": 45, "value_step": 3}]}},
+        # WIDE hard cap — the only fixed TP, far above the 186%-winner's +32% ceiling so the
+        # trailing ladder (not the cap) normally decides the exit. Toggleable + optimized.
+        {"id": "exit_cap", "action_type": "close", "toggle_optimize": True,
+         "conditions": {"type": "AND", "conditions": [
+             {"id": "xcap", "field": "profit_loss_percent", "op": ">", "value": 60,
+              "optimize": True, "value_min": 40, "value_max": 80, "value_step": 5}]}},
+    ]
+    return Strategy(name=name, buy_entry_conditions=buy_entry_conditions,
+                    exit_conditions=exit_conditions)
+
+
+def _build_strategy_S6(name: str):
+    """S6 — HIGH-FREQUENCY QUICK-CYCLE. Data-driven: the -tpsl S2-large run hit 519 trades
+    (173/yr), calmar 3.21 and only -5.5% dd — many small, fast, diversified positions beat few
+    concentrated ones on every risk metric, and the goal fitness (consistency x dd_guard) rewards
+    exactly that regime. S6 bets on fast rotation: TIGHT take-profit (6-16%), SHORT time exit
+    (10-30 days), no cooldown gates, plus the signal exits for protection. Position sizing stays
+    in the RM genes (the GA can shrink max_virtual_equity to fit more concurrent names)."""
+    from app.models.strategy import Strategy
+    buy_entry_conditions = {
+        "id": "root", "type": "AND", "conditions": [
+            {"id": "gate_confidence", "field": "confidence", "op": ">", "value": 50,
+             "optimize": True, "value_min": 40, "value_max": 80, "value_step": 5,
+             "toggle_optimize": True},
+            {"id": "gate_expected_profit", "field": "expected_profit", "op": ">", "value": 3,
+             "optimize": True, "value_min": 0, "value_max": 15, "value_step": 1,
+             "toggle_optimize": True},
+        ],
+    }
+    exit_conditions = [
+        # Floor stop (always on, tightness optimized) — tighter range than S2/S5: quick cycles
+        # should cut losers fast, not sit through -20%.
+        {"id": "exit_stoploss", "action_type": "adjust_stop_loss", "reference_value": "order_open_price",
+         "action_value": -5.0, "action_value_optimize": True,
+         "action_value_min": -10.0, "action_value_max": -2.0, "action_value_step": 1.0,
+         "conditions": {"type": "AND", "conditions": [{"id": "sl_hold", "field": "has_position"}]}},
+        # TIGHT take-profit: bank small wins quickly and recycle the capital.
+        {"id": "exit_takeprofit", "action_type": "close",
+         "conditions": {"type": "AND", "conditions": [
+             {"id": "xtp", "field": "profit_loss_percent", "op": ">", "value": 10,
+              "optimize": True, "value_min": 6, "value_max": 16, "value_step": 1}]}},
+        # Signal exits for protection (same as S2/S5).
+        {"id": "exit_bearish", "action_type": "close", "toggle_optimize": True,
+         "conditions": {"type": "AND", "conditions": [{"id": "xb", "field": "bearish"}]}},
+        {"id": "exit_downgrade", "action_type": "close", "toggle_optimize": True,
+         "conditions": {"type": "AND", "conditions": [{"id": "xd", "field": "current_rating_negative"}]}},
+        # SHORT time exit (always on, length optimized): a quick-cycle position that hasn't hit
+        # TP within ~2-6 weeks is dead money — free the slot.
+        {"id": "exit_time", "action_type": "close",
+         "conditions": {"type": "AND", "conditions": [
+             {"id": "xt", "field": "days_opened", "op": ">", "value": 20,
+              "optimize": True, "value_min": 10, "value_max": 30, "value_step": 5}]}},
+    ]
+    return Strategy(name=name, buy_entry_conditions=buy_entry_conditions,
+                    exit_conditions=exit_conditions)
+
+
 def _build_strategy_minimal(name: str):
     """A placeholder Strategy for BYPASS experts (FactorRanker) that ignore enter/exit rulesets and
     rebalance by factor score. The optimization still needs a Strategy row; this one carries no
@@ -1292,6 +1407,8 @@ _STRATEGY_BUILDERS = {
     "S2": _build_strategy_S2,   # (name)
     "S3": _build_strategy_S3,   # (name)
     "S4": _build_strategy_S4,   # (name, expert) — target-anchored TP (expert_target_price)
+    "S5": _build_strategy_S5,   # (name) — S2/S3 hybrid: signal exits + trailing ladder
+    "S6": _build_strategy_S6,   # (name) — high-frequency quick-cycle (tight TP + short time exit)
     # Option/equity strategies (dispatch by `kind`, not `name`; see _build_strategy):
     "O_LC": _build_strategy_option, "O_VERT": _build_strategy_option,
     "O_SSTG": _build_strategy_option, "O_SSTD": _build_strategy_option,
