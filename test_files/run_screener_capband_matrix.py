@@ -39,6 +39,14 @@ _NO_LARGE_CAP = {"FMPEarningsDrift", "FMPInsiderClusterBuy"}
 # expected_profit_percent is a static setting), so S4 degenerates to a fixed-% TP there — skip it.
 _TARGET_PRICE_STRATEGIES = {"S4"}
 _TARGET_PRICE_EXPERTS = {"FMPRating"}
+# Per-expert entry-scan cadence override (--run-schedule-day, comma-separated days). Experts whose
+# signal decays fast benefit from scanning more than once/week: FMPEarningsDrift's default
+# max_days_since_report window is ~10 days, and a Monday-only scan can burn over half that window
+# before a mid-week earnings beat is even seen. Unlisted experts keep the driver's single-day
+# default (monday).
+_SCHEDULE_DAY_OVERRIDE = {
+    "FMPEarningsDrift": "monday,thursday",
+}
 
 
 def _db_path() -> str:
@@ -182,6 +190,8 @@ def main() -> int:
                "--interval", args.interval, "--population", str(population),
                "--generations", str(args.generations), "--screener-cadence-days", str(args.cadence_days),
                "--run-schedule", "weekly", "--name", name, "--parallel", str(args.parallel)]
+        if expert in _SCHEDULE_DAY_OVERRIDE:
+            cmd += ["--run-schedule-day", _SCHEDULE_DAY_OVERRIDE[expert]]
         if args.mutation_prob is not None:
             cmd += ["--mutation-prob", str(args.mutation_prob)]
         if args.profit_cap_pct and args.profit_cap_pct > 0:

@@ -1458,7 +1458,11 @@ def _cmd_optimize(args) -> int:
         sys.exit("ba2-test: --universe must list at least one symbol")
     run_sched = None
     if args.run_schedule == "weekly":
-        days = {d: (d == args.run_schedule_day) for d in
+        # --run-schedule-day accepts a comma-separated list (e.g. "monday,thursday") so a
+        # signal that decays fast (e.g. FMPEarningsDrift's ~10-day freshness window) can scan
+        # more than once/week without going fully daily. A single day still works unchanged.
+        sched_days = {d.strip().lower() for d in args.run_schedule_day.split(",") if d.strip()}
+        days = {d: (d in sched_days) for d in
                 ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")}
         # `times` pins the ANALYSIS to the scheduled time-of-day so on a 5min fill clock the
         # expert analyses ONCE/day (at market open) instead of every intraday bar. FMP bars are
@@ -1715,8 +1719,11 @@ def _cmd_optimize_batch(args) -> int:
             jobs.extend((e, k) for k in strategies)
     run_sched = None
     if args.run_schedule == "weekly":
+        # --run-schedule-day accepts a comma-separated list (e.g. "monday,thursday") so a
+        # signal that decays fast can scan more than once/week without going fully daily.
+        sched_days = {d.strip().lower() for d in args.run_schedule_day.split(",") if d.strip()}
         # `times` pins ANALYSIS to market open so a 5min fill clock analyses once/day, not per bar.
-        run_sched = {"days": {d: (d == args.run_schedule_day) for d in
+        run_sched = {"days": {d: (d in sched_days) for d in
                               ("monday", "tuesday", "wednesday", "thursday", "friday",
                                "saturday", "sunday")},
                      "times": ["09:30"]}
@@ -2342,7 +2349,9 @@ def main(argv: "list | None" = None) -> int:
     op.add_argument("--interval", default="5min", help="Execution/fill clock interval (default 5min for "
                     "precise intraday TP/SL; analysis cadence is set by --run-schedule).")
     op.add_argument("--run-schedule", default="weekly", choices=["daily", "weekly"])
-    op.add_argument("--run-schedule-day", default="monday")
+    op.add_argument("--run-schedule-day", default="monday",
+                    help="Comma-separated day(s) for weekly --run-schedule (e.g. 'monday,thursday' "
+                         "for a fast-decaying signal). Default 'monday' (single day).")
     op.add_argument("--name", default=None)
     op.add_argument("--screener", action="store_true",
                     help="Optimize a screener-selected dynamic universe (screener:* genes). "
@@ -2407,7 +2416,8 @@ def main(argv: "list | None" = None) -> int:
     ob.add_argument("--interval", default="5min",
                     help="Fill-clock interval (default 5min for precise intraday TP/SL).")
     ob.add_argument("--run-schedule", default="weekly", choices=["daily", "weekly"])
-    ob.add_argument("--run-schedule-day", default="monday")
+    ob.add_argument("--run-schedule-day", default="monday",
+                    help="Comma-separated day(s) for weekly --run-schedule (e.g. 'monday,thursday').")
     ob.add_argument("--name-prefix", default=None, help="Strategy/opt name prefix (default phase1-).")
     ob.add_argument("--poll", type=int, default=15, help="Poll interval seconds (default 15).")
     ob.add_argument("--worker", action="append", default=None, metavar="NAME",

@@ -10,10 +10,23 @@ The exit is time-boxed by the paired ruleset (close after the drift window),
 not by this expert: it keeps emitting HOLD once the report is stale.
 
 Data: FMPCompanyDetailsProvider.get_past_earnings (quarterly, dict format).
+
+LIVE-ONLY optimization: a screener universe scan schedules one analysis per symbol, and
+today each one makes its own per-symbol ``historical_earning_calendar`` call regardless of
+whether that symbol reported recently at all. ``fmpsdk.earning_calendar(from_date, to_date)``
+is a market-wide, DATE-RANGE call (no symbol parameter, no batching/chunking needed) that
+returns every company reporting in the window in ONE request; a module-level TTLCache shares
+that single fetch across every symbol analyzed within the window. Most symbols either aren't
+in the result at all (definitively no signal, zero per-symbol calls) or are, and about ~30%
+of the time the calendar row already carries both actual + estimated EPS (no per-symbol call
+needed either) — only the remainder falls back to the existing per-symbol detail fetch.
+Backtest (``as_of`` set) is completely unchanged: same per-symbol fetch as before.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
+
+import fmpsdk
 
 from ba2_common.core.interfaces import MarketExpertInterface
 from ba2_common.core.models import AnalysisOutput, ExpertRecommendation, MarketAnalysis
@@ -25,6 +38,47 @@ from ba2_common.core.backtest_context import ProviderBundle
 from ba2_common.logger import get_expert_logger
 from ba2_experts.expert_mixins import AnalysisStatusRenderMixin
 from ba2_providers.cache.cached_get import past_earnings_get
+from ba2_providers.fmp_common import TTLCache
+from ba2_providers.fundamentals.details.FMPCompanyDetailsProvider import FMPCompanyDetailsProvider
+
+# 4h TTL: long enough that every symbol in one scheduled scan cycle (all analyzed within
+# minutes of each other) shares the SAME calendar fetch, short enough to pick up same-day
+# report updates on the next cycle. Keyed on (from_date, to_date), so a new calendar day
+# naturally busts the cache without needing explicit invalidation.
+_CALENDAR_CACHE_TTL_SECONDS = 4 * 3600
+_CALENDAR_CACHE = TTLCache(_CALENDAR_CACHE_TTL_SECONDS)
+
+
+def _fetch_earnings_calendar_by_symbol(api_key: str, from_date: str, to_date: str) -> Dict[str, dict]:
+    """Market-wide earnings calendar for [from_date, to_date], deduped to the LATEST row per
+    symbol, keyed upper-case. ONE API call regardless of universe size — no symbol list, so
+    no chunking is needed (unlike e.g. a batch quote/profile endpoint)."""
+    def _do_fetch() -> Dict[str, dict]:
+        rows = fmpsdk.earning_calendar(apikey=api_key, from_date=from_date, to_date=to_date) or []
+        by_symbol: Dict[str, dict] = {}
+        for row in rows:
+            sym = (row.get("symbol") or "").upper()
+            if not sym:
+                continue
+            prior = by_symbol.get(sym)
+            if prior is None or (row.get("date") or "") > (prior.get("date") or ""):
+                by_symbol[sym] = row
+        return by_symbol
+    return _CALENDAR_CACHE.get_or_call((from_date, to_date), _do_fetch)
+
+
+def _calendar_row_to_latest_earnings(row: dict) -> Optional[Dict[str, Any]]:
+    """Map a bulk-calendar row to the ``get_past_earnings()`` 'latest_earnings' row shape —
+    ONLY when both actual and estimated EPS are present (about ~30% of calendar rows in
+    practice; the rest need the per-symbol detail fetch since the bulk calendar doesn't
+    always carry the analyst estimate). Returns None when the estimate is missing."""
+    if row.get("eps") is None or row.get("epsEstimated") is None:
+        return None
+    return {
+        "report_date": row.get("date"),
+        "reported_eps": row.get("eps"),
+        "estimated_eps": row.get("epsEstimated"),
+    }
 
 
 def evaluate_earnings_drift(latest_earnings: Optional[Dict[str, Any]],
@@ -143,13 +197,42 @@ class FMPEarningsDrift(AnalysisStatusRenderMixin, MarketExpertInterface):
     def _gather(self, providers: ProviderBundle, as_of: Optional[datetime]) -> Dict[str, Any]:
         symbol = self._gather_symbol
         details_provider = providers.fundamentals_details()
-        data = past_earnings_get(
-            details_provider, symbol, as_of=as_of,
-            frequency="quarterly", lookback_periods=1, format_type="dict")
         latest = None
-        if isinstance(data, dict):
-            earnings = data.get("earnings") or []
-            latest = earnings[0] if earnings else None
+        skip_detail_fetch = False
+        # LIVE-ONLY calendar shortcut (see module docstring). Backtest (as_of set) never enters
+        # this branch, so grid/backtest results are byte-identical to before this change.
+        if as_of is None and isinstance(details_provider, FMPCompanyDetailsProvider):
+            try:
+                api_key = details_provider.api_key
+                max_days = int(self._gather_max_days_since_report)
+                now = datetime.now(timezone.utc)
+                from_date = (now - timedelta(days=max_days)).date().isoformat()
+                to_date = now.date().isoformat()
+                calendar = _fetch_earnings_calendar_by_symbol(api_key, from_date, to_date)
+                row = calendar.get(symbol.upper())
+                if row is None:
+                    # No report in the lookback window at all -> definitively no signal;
+                    # evaluate_earnings_drift(None, ...) -> "no earnings data" -> HOLD.
+                    skip_detail_fetch = True
+                else:
+                    mapped = _calendar_row_to_latest_earnings(row)
+                    if mapped is not None:
+                        latest = mapped
+                        skip_detail_fetch = True
+                    # else: report exists but the calendar is missing the analyst estimate ->
+                    # fall through to the per-symbol detail fetch below.
+            except Exception as e:  # noqa: BLE001 -- best-effort optimization; never break the run
+                self.logger.debug(
+                    f"Earnings calendar shortcut failed for {symbol}, falling back to "
+                    f"per-symbol fetch: {e}")
+
+        if not skip_detail_fetch:
+            data = past_earnings_get(
+                details_provider, symbol, as_of=as_of,
+                frequency="quarterly", lookback_periods=1, format_type="dict")
+            if isinstance(data, dict):
+                earnings = data.get("earnings") or []
+                latest = earnings[0] if earnings else None
         # Live (as_of=None) reads the account/broker quote (the original live
         # source); backtest (as_of set) reads the OHLCV close-at-as_of.
         current_price = (self._get_current_price(symbol) if as_of is None
@@ -205,6 +288,7 @@ Confidence: {confidence:.1f}%
 
             settings = self._resolve_settings(self._SETTING_KEYS)
             self._gather_symbol = symbol
+            self._gather_max_days_since_report = settings["max_days_since_report"]
             providers = self._live_providers()
             bundle = self._gather(providers, as_of=None)
             if not bundle.get("current_price"):
