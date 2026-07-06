@@ -1149,14 +1149,19 @@ const Backtesting: React.FC = () => {
         /* offline / no experts list: leave the picker for manual selection */
       }
     }
-    // Pre-fill the expert's CONCRETE settings from the exported expert_params (the optimized model:*
-    // genes), so a saved/optimized run loads its tuned params. The ExpertSettingsForm's defaults
-    // effect MERGES (only seeds keys not already set), so these survive. Strip the model: prefix.
+    // Pre-fill the expert's CONCRETE settings from the flat export dict and from expert_params
+    // (the optimized model:* genes). The ExpertSettingsForm's defaults effect only seeds keys not
+    // already set, so values set here survive. expert_params keys strip the model: prefix.
+    const flatSettings: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(settings)) { if (k !== 'expert_params') flatSettings[k] = v; }
     const ep = (settings.expert_params ?? {}) as Record<string, unknown>;
-    if (ep && typeof ep === 'object' && Object.keys(ep).length) {
-      const concrete: Record<string, unknown> = {};
+    const concrete: Record<string, unknown> = {};
+    if (ep && typeof ep === 'object') {
       for (const [k, v] of Object.entries(ep)) concrete[k.startsWith('model:') ? k.slice(6) : k] = v;
-      setExpertSettings((prev) => ({ settings: { ...prev.settings, ...concrete }, expert_params: prev.expert_params }));
+    }
+    const merged = { ...flatSettings, ...concrete };
+    if (Object.keys(merged).length) {
+      setExpertSettings((prev) => ({ settings: { ...prev.settings, ...merged }, expert_params: prev.expert_params }));
     }
     applyImportedUniverse(parsed.universe as ExportUniverse | undefined);
     // Date range + capital + interval + the full execution config (seed/fill_model/warmup/
