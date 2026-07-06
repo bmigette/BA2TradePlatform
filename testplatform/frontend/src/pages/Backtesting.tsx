@@ -1159,6 +1159,7 @@ const Backtesting: React.FC = () => {
     if (ep && typeof ep === 'object') {
       for (const [k, v] of Object.entries(ep)) concrete[k.startsWith('model:') ? k.slice(6) : k] = v;
     }
+    const merged: Record<string, unknown> = { ...flatSettings, ...concrete };
     // If run_schedule_override is present and the expert's execution schedule settings are not
     // explicitly exported (they often aren't — the export omits default-value fields), seed them
     // from run_schedule_override so the imported schedule is honoured rather than replaced by the
