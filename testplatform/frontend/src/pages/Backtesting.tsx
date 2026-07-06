@@ -1158,6 +1158,7 @@ const Backtesting: React.FC = () => {
       for (const [k, v] of Object.entries(ep)) concrete[k.startsWith('model:') ? k.slice(6) : k] = v;
       setExpertSettings((prev) => ({ settings: { ...prev.settings, ...concrete }, expert_params: prev.expert_params }));
     }
+    applyImportedUniverse(parsed.universe as ExportUniverse | undefined);
     setImportNote({
       kind: 'ok',
       text: matched
@@ -1762,12 +1763,17 @@ const Backtesting: React.FC = () => {
     if (u.mode === 'static' && Array.isArray((u as any).symbols)) {
       setUniverse({ mode: 'static', symbols: (u as any).symbols });
     } else if (u.mode === 'screener') {
-      setUniverse({ mode: 'screener', screener_settings: (u as any).screener_settings ?? {} });
-      // Also restore the metric store + cadence (held as separate form state) so Run reproduces
-      // the screener-settings run faithfully instead of falling back to defaults.
       const st = (u as any).screener_store;
-      if (typeof st === 'string' && st.trim()) setScreenerStore(st);
       const cad = (u as any).screener_cadence_days;
+      setUniverse({
+        mode: 'screener',
+        screener_settings: (u as any).screener_settings ?? {},
+        ...(typeof st === 'string' && st.trim() ? { screener_store: st } : {}),
+        ...(typeof cad === 'number' && cad > 0 ? { screener_cadence_days: cad } : {}),
+      });
+      // Also keep the separate page-level screenerStore/screenerCadenceDays in sync
+      // (used by the screener-opt section when sending screener_opt.store).
+      if (typeof st === 'string' && st.trim()) setScreenerStore(st);
       if (typeof cad === 'number' && cad > 0) setScreenerCadenceDays(cad);
     }
   };

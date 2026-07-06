@@ -1,6 +1,7 @@
 // frontend/src/components/UniversePicker.tsx
 import { useEffect, useRef, useState } from 'react';
 import { parseSymbols } from '../lib/symbols';
+import { API_BASE } from '../lib/config';
 
 // Per-field optimization range for a screener metric the GA can tune. Keyed (in
 // screener_param_ranges) by the UNPREFIXED metric-store name (e.g. market_cap_min).
@@ -48,21 +49,23 @@ const SCREENER_OPT_FIELDS: { key: string; label: string; def: ScreenerOptRange }
   { key: 'weinstein_stage2_only', label: 'Weinstein stage-2 only', def: { min: 0, max: 1, step: 1, optimize: true } },
 ];
 
+// Map from screener_ prefixed key to opt definition for inline Opt rendering.
+const OPT_BY_SCREENER_KEY = new Map(
+  SCREENER_OPT_FIELDS.map((f) => [`screener_${f.key}`, f]),
+);
+
+interface ScreenerStore { name: string; path: string; is_default: boolean; }
+
 const inputClass = "px-2 py-1.5 text-sm border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-blue-500 focus:border-blue-500";
 const rangeInputClass = "w-20 px-1.5 py-0.5 text-xs border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100";
 
 export function UniversePicker({ value, onChange }: { value: UniverseValue; onChange: (v: UniverseValue) => void; }) {
   const fileRef = useRef<HTMLInputElement>(null);
-  // Raw text the user is editing. Kept SEPARATE from value.symbols.join() so typing a
-  // separator (',', space, newline) or a symbol char ('.', '/' as in BRK.B / BRK/B) is not
-  // clobbered by re-deriving the textarea from the parsed array on every keystroke (which
-  // dropped the trailing separator, making it impossible to start a second symbol).
   const [symbolsText, setSymbolsText] = useState(
     value.mode === 'static' ? value.symbols.join(', ') : '',
   );
-  // Re-sync from props ONLY on external changes (import / Quick Load / clear). During typing
-  // our own onChange already set symbols = parseSymbols(text), so the parsed-vs-props check
-  // matches and we leave the user's raw text (and trailing separators) intact.
+  const [availableStores, setAvailableStores] = useState<ScreenerStore[]>([]);
+
   useEffect(() => {
     if (value.mode !== 'static') return;
     if (parseSymbols(symbolsText).join(',') !== value.symbols.join(',')) {
@@ -70,19 +73,24 @@ export function UniversePicker({ value, onChange }: { value: UniverseValue; onCh
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [value]);
+
+  useEffect(() => {
+    fetch(`${API_BASE}/backtests/screener-stores`)
+      .then((r) => r.ok ? r.json() : null)
+      .then((data) => { if (data?.stores) setAvailableStores(data.stores); })
+      .catch(() => {});
+  }, []);
+
   const onFile = (f: File | undefined) => {
     if (!f) return;
     f.text().then((t) => onChange({ mode: 'static', symbols: parseSymbols(t) }));
   };
 
-  // Snapshot the screener variant for the helpers below. Each helper rebuilds the
-  // discriminated-union value so existing callers keep getting a typed UniverseValue.
   const screenerStore = value.mode === 'screener' ? (value.screener_store ?? '') : '';
   const screenerCadence = value.mode === 'screener' ? value.screener_cadence_days : undefined;
   const screenerSettings = value.mode === 'screener' ? value.screener_settings : {};
   const screenerRanges = value.mode === 'screener' ? (value.screener_param_ranges ?? {}) : {};
 
-  // Rebuild the screener value, preserving store/cadence/settings/ranges, applying overrides.
   const emitScreener = (over: Partial<Extract<UniverseValue, { mode: 'screener' }>> = {}) =>
     onChange({
       mode: 'screener',
@@ -110,6 +118,26 @@ export function UniversePicker({ value, onChange }: { value: UniverseValue; onCh
       delete ranges[key];
     }
     emitScreener({ screener_param_ranges: Object.keys(ranges).length ? ranges : undefined });
+  };
+
+  const renderOptInline = (screenerKey: string) => {
+    const optDef = OPT_BY_SCREENER_KEY.get(screenerKey);
+    if (!optDef) return null;
+    const r = screenerRanges[optDef.key];
+    return (
+      <label className="flex items-center gap-1 text-xs text-gray-600 dark:text-gray-400 shrink-0">
+        <input type="checkbox" className="rounded" checked={!!r}
+          onChange={(e) => setRange(optDef.key, e.target.checked, undefined, optDef.def)} /> Opt
+        {r && (<>
+          <input type="number" placeholder="min" value={r.min} className={rangeInputClass}
+            onChange={(e) => setRange(optDef.key, true, { ...r, min: Number(e.target.value) })} />
+          <input type="number" placeholder="max" value={r.max} className={rangeInputClass}
+            onChange={(e) => setRange(optDef.key, true, { ...r, max: Number(e.target.value) })} />
+          <input type="number" placeholder="step" value={r.step} className={rangeInputClass}
+            onChange={(e) => setRange(optDef.key, true, { ...r, step: Number(e.target.value) })} />
+        </>)}
+      </label>
+    );
   };
 
   return (
@@ -140,16 +168,31 @@ export function UniversePicker({ value, onChange }: { value: UniverseValue; onCh
         </div>
       ) : (
         <div className="space-y-2">
-          {/* metric_store dir: the candidate universe + per-bar (point-in-time) screen source. */}
+          {/* metric_store dir: dropdown of available stores */}
           <div className="flex items-center justify-between gap-3 p-2 bg-gray-50 dark:bg-gray-700/50 rounded border border-gray-200 dark:border-gray-600">
             <span className="flex-1 text-sm text-gray-700 dark:text-gray-300">
-              Metric store dir
+              Metric store
               <span className="block text-xs text-gray-500 dark:text-gray-400">built by <code>ba2-test build-screener-metrics</code></span>
             </span>
-            <input type="text" className={`${inputClass} w-64`} placeholder="/path/to/metric_store"
-              value={screenerStore}
-              onChange={(e) => emitScreener({ screener_store: e.target.value })} />
+            {availableStores.length > 0 ? (
+              <select className={`${inputClass} w-64`}
+                value={screenerStore}
+                onChange={(e) => emitScreener({ screener_store: e.target.value })}>
+                {screenerStore && !availableStores.find(s => s.path === screenerStore) && (
+                  <option value={screenerStore}>{screenerStore}</option>
+                )}
+                {availableStores.map((s) => (
+                  <option key={s.path} value={s.path}>{s.name}{s.is_default ? ' (default)' : ''}</option>
+                ))}
+              </select>
+            ) : (
+              <input type="text" className={`${inputClass} w-64`} placeholder="/path/to/metric_store"
+                value={screenerStore}
+                onChange={(e) => emitScreener({ screener_store: e.target.value })} />
+            )}
           </div>
+
+          {/* Screen cadence */}
           <div className="flex items-center justify-between gap-3 p-2 bg-gray-50 dark:bg-gray-700/50 rounded border border-gray-200 dark:border-gray-600">
             <span className="flex-1 text-sm text-gray-700 dark:text-gray-300">Screen cadence (days)</span>
             <input type="number" className={`${inputClass} w-24`} placeholder="7"
@@ -157,23 +200,26 @@ export function UniversePicker({ value, onChange }: { value: UniverseValue; onCh
               onChange={(e) => emitScreener({ screener_cadence_days: e.target.value === '' ? undefined : Number(e.target.value) })} />
           </div>
 
+          {/* Number fields — inline Opt checkbox for GA-tunable ones */}
           {SCREENER_NUMBER_FIELDS.map(([k, label]) => (
             <div key={k} className="flex items-center justify-between gap-3 p-2 bg-gray-50 dark:bg-gray-700/50 rounded border border-gray-200 dark:border-gray-600">
               <span className="flex-1 text-sm text-gray-700 dark:text-gray-300">{label}</span>
               <input type="number" className={`${inputClass} w-24`} value={Number(screenerSettings[k] ?? 0)}
                 onChange={(e) => setSetting(k, Number(e.target.value))} />
+              {renderOptInline(k)}
             </div>
           ))}
 
-          {/* Weinstein stage-2 only (checkbox -> 0/1) */}
+          {/* Weinstein stage-2 only (checkbox -> 0/1) — inline Opt */}
           <div className="flex items-center justify-between gap-3 p-2 bg-gray-50 dark:bg-gray-700/50 rounded border border-gray-200 dark:border-gray-600">
             <span className="flex-1 text-sm text-gray-700 dark:text-gray-300">Weinstein stage-2 only</span>
             <input type="checkbox" className="rounded"
               checked={Number(screenerSettings['screener_weinstein_stage2_only'] ?? 0) === 1}
               onChange={(e) => setSetting('screener_weinstein_stage2_only', e.target.checked ? 1 : 0)} />
+            {renderOptInline('screener_weinstein_stage2_only')}
           </div>
 
-          {/* Sort metric (select) */}
+          {/* Sort metric */}
           <div className="flex items-center justify-between gap-3 p-2 bg-gray-50 dark:bg-gray-700/50 rounded border border-gray-200 dark:border-gray-600">
             <span className="flex-1 text-sm text-gray-700 dark:text-gray-300">Sort metric</span>
             <select className={inputClass}
@@ -181,31 +227,6 @@ export function UniversePicker({ value, onChange }: { value: UniverseValue; onCh
               onChange={(e) => setSetting('screener_sort_metric', e.target.value)}>
               {SORT_METRIC_CHOICES.map((c) => <option key={c} value={c}>{c}</option>)}
             </select>
-          </div>
-
-          {/* Optimize ranges (GA-tunable screener metrics) */}
-          <div className="pt-1 space-y-1">
-            <div className="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wide">Optimize ranges</div>
-            {SCREENER_OPT_FIELDS.map(({ key, label, def }) => {
-              const r = screenerRanges[key];
-              return (
-                <div key={key} className="flex items-center justify-between gap-2 p-2 bg-gray-50 dark:bg-gray-700/50 rounded border border-gray-200 dark:border-gray-600">
-                  <span className="flex-1 text-sm text-gray-700 dark:text-gray-300">{label}</span>
-                  <label className="flex items-center gap-1 text-xs text-gray-600 dark:text-gray-400">
-                    <input type="checkbox" className="rounded" checked={!!r}
-                      onChange={(e) => setRange(key, e.target.checked, undefined, def)} /> Opt
-                    {r && (<>
-                      <input type="number" placeholder="min" value={r.min} className={rangeInputClass}
-                        onChange={(e) => setRange(key, true, { ...r, min: Number(e.target.value) })} />
-                      <input type="number" placeholder="max" value={r.max} className={rangeInputClass}
-                        onChange={(e) => setRange(key, true, { ...r, max: Number(e.target.value) })} />
-                      <input type="number" placeholder="step" value={r.step} className={rangeInputClass}
-                        onChange={(e) => setRange(key, true, { ...r, step: Number(e.target.value) })} />
-                    </>)}
-                  </label>
-                </div>
-              );
-            })}
           </div>
         </div>
       )}

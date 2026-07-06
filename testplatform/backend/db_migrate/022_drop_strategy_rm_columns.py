@@ -41,16 +41,7 @@ CREATE TABLE strategies_new (
     buy_entry_conditions JSON,
     sell_entry_conditions JSON,
     exit_conditions JSON,
-    initial_tp_percent FLOAT DEFAULT 5.0,
-    initial_tp_optimize BOOLEAN DEFAULT 0,
-    initial_tp_min FLOAT,
-    initial_tp_max FLOAT,
-    initial_tp_step FLOAT,
-    initial_sl_percent FLOAT DEFAULT 2.0,
-    initial_sl_optimize BOOLEAN DEFAULT 0,
-    initial_sl_min FLOAT,
-    initial_sl_max FLOAT,
-    initial_sl_step FLOAT,
+    entry_actions JSON,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME
 )

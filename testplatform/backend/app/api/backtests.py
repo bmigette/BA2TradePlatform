@@ -17,6 +17,22 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+
+@router.get("/screener-stores")
+def list_screener_stores():
+    """List metric_store directories available under the configured screener cache folder."""
+    import os
+    from ba2_common.config import SCREENER_STORE_DIR
+    parent = os.path.dirname(SCREENER_STORE_DIR)
+    stores = []
+    if os.path.isdir(parent):
+        for name in sorted(os.listdir(parent)):
+            full = os.path.join(parent, name)
+            if os.path.isdir(full):
+                stores.append({"name": name, "path": full, "is_default": os.path.normpath(full) == os.path.normpath(SCREENER_STORE_DIR)})
+    return {"stores": stores, "default": SCREENER_STORE_DIR}
+
+
 # Weekday names the engine's _entry_schedule recognises (matches the CLI launcher's set).
 _WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 
