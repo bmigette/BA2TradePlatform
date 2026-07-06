@@ -67,6 +67,19 @@ def test_cache_push_extracts(client, tmp_path, monkeypatch):
     assert (dst / "FMPOHLCVProvider" / "AAPL_1d.parquet").read_bytes() == b"data" * 100
 
 
+def test_cache_manifest_with_hash(client, tmp_path, monkeypatch):
+    dst = tmp_path / "worker_cache"
+    (dst).mkdir(parents=True)
+    (dst / "a.parquet").write_bytes(b"content")
+    monkeypatch.setattr(cache_sync, "CACHE_FOLDER", str(dst))
+
+    r = client.get("/cache/manifest", headers=H)
+    assert r.status_code == 200 and "sha256" not in r.json()["files"][0]
+
+    r = client.get("/cache/manifest", headers=H, params={"with_hash": "true"})
+    assert r.status_code == 200 and "sha256" in r.json()["files"][0]
+
+
 def test_cache_prune_deletes_stale_leftovers(client, tmp_path, monkeypatch):
     dst = tmp_path / "worker_cache"
     (dst / "screener" / "metric_store" / "ym=2024-01").mkdir(parents=True)

@@ -110,6 +110,33 @@ def push_cache(worker: dict, log: Callable[[str], None] = logger.info) -> dict:
     return res
 
 
+def check_cache_integrity(worker: dict, timeout: float = 600.0) -> dict:
+    """Deep, content-hash-based comparison of the master's cache against *worker*'s.
+
+    Unlike ``push_cache`` (fast, size-only — the normal per-job pre-flight path), this reads +
+    sha256-hashes every file on BOTH ends to catch the drift ``(rel_path, size)`` structurally
+    can't see: a rebuild that rewrites a file's content at its OLD byte size. Slow (full cache
+    read on both machines) — meant for a periodic/manual health check, not the hot GA path.
+
+    Returns ``{ok, missing, stale, content_mismatch, local_count, remote_count}`` — ``ok`` is
+    True only when all three lists are empty.
+    """
+    base, headers = _base(worker), _headers(worker)
+    with httpx.Client(timeout=timeout) as c:
+        r = c.get(f"{base}/cache/manifest", headers=headers, params={"with_hash": "true"})
+        r.raise_for_status()
+        remote = r.json()
+    local = cache_sync.build_manifest(with_hash=True)
+    missing = cache_sync.diff_missing(local["files"], remote)
+    stale = cache_sync.diff_stale(local["files"], remote)
+    mismatch = cache_sync.diff_content_mismatch(local["files"], remote)
+    return {
+        "ok": not (missing or stale or mismatch),
+        "missing": missing, "stale": stale, "content_mismatch": mismatch,
+        "local_count": local["count"], "remote_count": remote["count"],
+    }
+
+
 def push_secrets(worker: dict, settings: dict, log: Callable[[str], None] = logger.info) -> dict:
     """Push credential app-settings (FMP_API_KEY, finnhub_api_key) into the DB-less worker so its
     hermetic trials resolve them via get_app_setting.

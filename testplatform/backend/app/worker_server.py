@@ -114,9 +114,9 @@ def version(authorization: str = Header(default=None)):
 
 
 @worker_app.get("/cache/manifest")
-def cache_manifest(authorization: str = Header(default=None)):
+def cache_manifest(with_hash: bool = False, authorization: str = Header(default=None)):
     _verify(authorization)
-    return cache_sync.build_manifest()
+    return cache_sync.build_manifest(with_hash=with_hash)
 
 
 @worker_app.post("/cache/push")
