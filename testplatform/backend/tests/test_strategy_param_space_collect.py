@@ -126,6 +126,28 @@ def test_bypass_with_no_expert_params_raises():
         collect_param_space(s, expert_cfg=None, bypass=True)
 
 
+def test_collect_schedule_days_namespaced():
+    s = _strategy()
+    schedule = {"monday": {"optimize": True}, "thursday": {"optimize": True},
+               "tuesday": {"optimize": False}}
+    space = collect_param_space(s, expert_cfg={"x": {"optimize": True, "min": 0, "max": 1,
+                                                     "step": 1, "type": "int"}},
+                                schedule_cfg=schedule)
+    assert space["schedule:monday"] == {"type": "int", "min": 0, "max": 1, "step": 1}
+    assert space["schedule:thursday"] == {"type": "int", "min": 0, "max": 1, "step": 1}
+    assert "schedule:tuesday" not in space  # optimize=False
+
+
+def test_bypass_excludes_schedule_days():
+    """Bypass experts (FactorRanker) don't use the classic per-day entry-scan gate — schedule:*
+    genes are excluded even when a schedule_cfg is passed."""
+    s = _strategy()
+    schedule = {"monday": {"optimize": True}}
+    expert = {"top_n": {"optimize": True, "min": 5, "max": 30, "step": 5, "type": "int"}}
+    space = collect_param_space(s, expert_cfg=expert, bypass=True, schedule_cfg=schedule)
+    assert not any(k.startswith("schedule:") for k in space)
+
+
 def test_collect_expert_choice_param_emits_choice_range():
     """A categorical expert param (type='choice') -> a model:<name> choice gene the GA can
     evolve as an int index and decode back to the string (e.g. FMPRating target_price_type)."""

@@ -51,3 +51,22 @@ def test_decode_falls_back_to_strategy_defaults():
     assert out["tp"] == 5.0 and out["sl"] == 2.0
     assert out["expert_overrides"] == {}
     assert "rm" not in out
+    assert out["schedule_days"] is None  # no schedule:* genes this run -> caller keeps the static override
+
+
+def test_decode_schedule_days_all_seven_keys_present():
+    s = _strategy()
+    out = decode_params(s, {"schedule:monday": 1, "schedule:thursday": 0})
+    assert out["schedule_days"] == {
+        "monday": True, "tuesday": False, "wednesday": False, "thursday": False,
+        "friday": False, "saturday": False, "sunday": False,
+    }
+
+
+def test_decode_schedule_days_repairs_all_off_to_first_day():
+    """An all-days-OFF individual is a dead config (never scans for entries) -- repaired to
+    Monday rather than wasting a trial evaluating it."""
+    s = _strategy()
+    out = decode_params(s, {"schedule:monday": 0, "schedule:tuesday": 0, "schedule:wednesday": 0})
+    assert out["schedule_days"]["monday"] is True
+    assert sum(out["schedule_days"].values()) == 1

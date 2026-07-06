@@ -21,12 +21,16 @@ Namespacing (design §5):
   cond:<id>:confirmation_bars     that node's confirmation bars
   exit:<id>:action_value          an exit rule's action value
   entry:<id>:action_value         an entry action's (TP/SL adjust) action value
+  schedule:<day>                  ON/OFF toggle for that weekday's entry scan
 """
 import copy
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+# Fixed order so the gene list (and therefore reproducibility) is stable across runs.
+SCHEDULE_DAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 
 
 def _range_entry(min_v, max_v, step_v, is_int: bool) -> Dict[str, Any]:
@@ -81,6 +85,21 @@ def _collect_screener(screener_cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         is_int = spec.get("type") == "int"
         out[f"screener:{name}"] = _range_entry(spec.get("min"), spec.get("max"),
                                                spec.get("step"), is_int=is_int)
+    return out
+
+
+def _collect_schedule_days(schedule_cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """schedule:<day> ON/OFF toggle genes from a schedule_cfg ({day: {optimize: bool}}).
+
+    One boolean gene per weekday the GA can independently flip, replacing a single fixed
+    --run-schedule-day pin with a per-individual, per-day search (e.g. a fast-decaying signal
+    can discover "monday+thursday" itself instead of a hand-picked cadence). ``decode_params``
+    enforces at least one day stays ON (an all-OFF individual would never scan for entries at
+    all — a dead config, not a legitimately weak one)."""
+    out: Dict[str, Any] = {}
+    for day, spec in (schedule_cfg or {}).items():
+        if day in SCHEDULE_DAYS and spec and spec.get("optimize"):
+            out[f"schedule:{day}"] = _range_entry(0, 1, 1, is_int=True)
     return out
 
 
@@ -185,6 +204,7 @@ def collect_param_space(
     expert_cfg: Optional[Dict[str, Any]] = None,
     bypass: bool = False,
     screener_cfg: Optional[Dict[str, Any]] = None,
+    schedule_cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Return the flat joint param_ranges dict for GeneticOptimizer.
 
@@ -200,11 +220,14 @@ def collect_param_space(
     via its own portfolio manager). For such an expert the search space is restricted to the
     expert's OWN params (model:*) ONLY — the cond:*, exit:* and entry:* namespaces are
     EXCLUDED (they have no effect on the rebalance path, so optimizing them would be noise).
+    ``schedule_cfg`` (entry-scan weekday toggles) is likewise excluded for bypass experts —
+    they don't use the classic per-day entry-scan gate at all.
     """
     space: Dict[str, Any] = {}
     space.update(_collect_expert(expert_cfg))
     if not bypass:
         space.update(_collect_conditions(strategy))
+        space.update(_collect_schedule_days(schedule_cfg))
     space.update(_collect_screener(screener_cfg))  # screener genes apply on BOTH paths
     if not space:
         raise ValueError(
@@ -265,11 +288,12 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
 
     The flat dict comes from GeneticOptimizer.decode_individual (namespaced keys:
     tp | sl | model:<p> | cond:<id>:value | cond:<id>:confirmation_bars |
-    exit:<id>:action_value | entry:<id>:action_value). Returns::
+    exit:<id>:action_value | entry:<id>:action_value | schedule:<day>). Returns::
 
       {
         'tp': float, 'sl': float,                 # falls back to strategy defaults
         'expert_overrides': {param: value},       # model:* stripped of prefix (incl. RM sizing)
+        'schedule_days': {day: bool}|None,        # None when no schedule:* genes were collected
         'buy_tree': dict|None, 'sell_tree': dict|None, 'exit_rules': list,
         'entry_rules': list,                      # from strategy.entry_actions
       }
@@ -287,6 +311,7 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
     entry_enabled_by_id: Dict[str, Any] = {}
     expert_overrides: Dict[str, Any] = {}
     screener_overrides: Dict[str, Any] = {}
+    schedule_by_day: Dict[str, Any] = {}
     tp = getattr(strategy, "initial_tp_percent", None)
     sl = getattr(strategy, "initial_sl_percent", None)
 
@@ -299,6 +324,8 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
             expert_overrides[key[len("model:"):]] = val
         elif key.startswith("screener:"):
             screener_overrides[key[len("screener:"):]] = val
+        elif key.startswith("schedule:"):
+            schedule_by_day[key[len("schedule:"):]] = bool(val)
         elif key.startswith("cond:"):
             _, cid, field = key.split(":", 2)
             cond_by_id.setdefault(cid, {})[field] = val
@@ -381,10 +408,20 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
             rule["action_value"] = entry_action_by_id[eid]
         entry_rules.append(rule)
 
+    # Repair, don't reject: an all-days-OFF individual would never scan for entries at all (a
+    # dead config the fitness function can't even distinguish from "just unlucky"), so force the
+    # first weekday (fixed SCHEDULE_DAYS order) back ON rather than wasting a trial evaluating it.
+    schedule_days: Optional[Dict[str, bool]] = None
+    if schedule_by_day:
+        schedule_days = {day: schedule_by_day.get(day, False) for day in SCHEDULE_DAYS}
+        if not any(schedule_days.values()):
+            schedule_days[SCHEDULE_DAYS[0]] = True
+
     return {
         "tp": tp, "sl": sl,
         "expert_overrides": expert_overrides,
         "screener_overrides": screener_overrides,
+        "schedule_days": schedule_days,
         "buy_tree": buy_tree, "sell_tree": sell_tree, "exit_rules": exit_rules,
         "entry_rules": entry_rules,
     }

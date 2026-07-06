@@ -222,19 +222,27 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             )
         expert_cfg = ga.get("expert_params")  # may be None (expert frozen)
 
-        # SCREENER genes share the expert_params dict (the launcher merges them in pre-namespaced
-        # with ``screener:``). Split them out so they route to the screener namespace instead of
-        # being mis-prefixed as ``model:screener:*`` by _collect_expert: the model space gets the
-        # non-screener keys, and a screener_cfg (prefix stripped back to the bare setting name) is
-        # passed alongside so collect_param_space emits the ``screener:<setting>`` genes.
+        # SCREENER + SCHEDULE genes share the expert_params dict (the launcher merges them in
+        # pre-namespaced with ``screener:``/``schedule:``). Split them out so they route to their
+        # own namespace instead of being mis-prefixed as ``model:screener:*``/``model:schedule:*``
+        # by _collect_expert: the model space gets the remaining keys, and a screener_cfg/
+        # schedule_cfg (prefix stripped back to the bare name) is passed alongside so
+        # collect_param_space emits the ``screener:<setting>``/``schedule:<day>`` genes.
         model_cfg = None
         screener_cfg = None
+        schedule_cfg = None
         if expert_cfg:
-            model_cfg = {k: v for k, v in expert_cfg.items() if not k.startswith("screener:")}
+            model_cfg = {k: v for k, v in expert_cfg.items()
+                        if not k.startswith("screener:") and not k.startswith("schedule:")}
             screener_cfg = {
                 k[len("screener:"):]: v
                 for k, v in expert_cfg.items()
                 if k.startswith("screener:")
+            } or None
+            schedule_cfg = {
+                k[len("schedule:"):]: v
+                for k, v in expert_cfg.items()
+                if k.startswith("schedule:")
             } or None
 
         # BYPASS expert (piece 1c): if the backtest's expert declares ``bypasses_classic_rm``
@@ -247,7 +255,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         try:
             param_space = collect_param_space(
                 strategy, expert_cfg=model_cfg, bypass=bypass_expert,
-                screener_cfg=screener_cfg,
+                screener_cfg=screener_cfg, schedule_cfg=schedule_cfg,
             )
         except ValueError as e:
             return _fail(opt_id, db, str(e))
@@ -853,6 +861,20 @@ def _build_daily_trial_config(
     # collide on the same file (WinError 32 / cross-thread session). The run-level id is a base.
     import uuid as _uuid
     trial_id = f"{backtest_cfg['backtest_id']}-{_uuid.uuid4().hex[:8]}"
+
+    # SCHEDULE-DAY genes (schedule:<day>): when the param space collected them, THIS individual's
+    # decoded per-day toggles replace the run-level static days entirely — time-of-day stays
+    # static (pulled from the run-level override, unaffected by the genes) since only the day
+    # selection is being optimized for now.
+    base_run_sched = backtest_cfg.get("run_schedule_override")
+    if decoded.get("schedule_days"):
+        run_schedule_override = {
+            "days": decoded["schedule_days"],
+            "times": (base_run_sched or {}).get("times") or ["09:30"],
+        }
+    else:
+        run_schedule_override = base_run_sched
+
     return {
         "backtest_id": trial_id,
         "name": backtest_cfg.get("name", f"opt-trial-{trial_id}"),
@@ -869,7 +891,7 @@ def _build_daily_trial_config(
         "seed": int(backtest_cfg["seed"]),
         "subtype": backtest_cfg.get("subtype"),
         # Cadence (weekly entry) + intraday fill clock carry through to each trial's engine.
-        "run_schedule_override": backtest_cfg.get("run_schedule_override"),
+        "run_schedule_override": run_schedule_override,
         "manage_schedule_override": backtest_cfg.get("manage_schedule_override"),
         "execution_interval": backtest_cfg.get("execution_interval", "1d"),
         # Per-trade profit cap (% of cost basis): the GA ranks on the ADJUSTED fitness so one

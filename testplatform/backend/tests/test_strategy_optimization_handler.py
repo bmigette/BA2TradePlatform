@@ -398,6 +398,52 @@ def test_build_daily_trial_config_maps_rm_and_overrides():
         assert k in cfg
 
 
+def test_build_daily_trial_config_schedule_days_override_static_days_keep_static_times():
+    """schedule:<day> genes (decoded['schedule_days']) replace the run-level static DAYS
+    entirely, but time-of-day stays static (pulled from the run-level override) — only the day
+    selection is optimized for now."""
+    backtest_cfg = {
+        "backtest_id": 7, "start_date": "2024-01-02", "end_date": "2024-01-08",
+        "enabled_instruments": ["AAPL"],
+        "experts": [{"class": "FMPRating", "settings": {}}],
+        "initial_capital": 100000.0, "account_settings": {"starting_cash": 100000.0},
+        "warmup_days": 30, "seed": 42,
+        "run_schedule_override": {
+            "days": {"monday": True, "tuesday": False, "wednesday": False, "thursday": False,
+                     "friday": False, "saturday": False, "sunday": False},
+            "times": ["09:30"],
+        },
+    }
+    decoded = {
+        "expert_overrides": {}, "buy_tree": None, "sell_tree": None,
+        "exit_rules": [], "entry_rules": [],
+        "schedule_days": {"monday": False, "tuesday": False, "wednesday": True,
+                          "thursday": True, "friday": False, "saturday": False, "sunday": False},
+    }
+    cfg = H._build_daily_trial_config(backtest_cfg, decoded)
+    assert cfg["run_schedule_override"]["days"] == decoded["schedule_days"]
+    assert cfg["run_schedule_override"]["times"] == ["09:30"]  # static, unaffected by the genes
+
+
+def test_build_daily_trial_config_no_schedule_genes_keeps_static_override():
+    """When the param space didn't collect schedule:* genes (schedule_days is None), the
+    run-level static run_schedule_override passes through unchanged (backward compatible)."""
+    backtest_cfg = {
+        "backtest_id": 7, "start_date": "2024-01-02", "end_date": "2024-01-08",
+        "enabled_instruments": ["AAPL"],
+        "experts": [{"class": "FMPRating", "settings": {}}],
+        "initial_capital": 100000.0, "account_settings": {"starting_cash": 100000.0},
+        "warmup_days": 30, "seed": 42,
+        "run_schedule_override": {"days": {"monday": True}, "times": ["09:30"]},
+    }
+    decoded = {
+        "expert_overrides": {}, "buy_tree": None, "sell_tree": None,
+        "exit_rules": [], "entry_rules": [], "schedule_days": None,
+    }
+    cfg = H._build_daily_trial_config(backtest_cfg, decoded)
+    assert cfg["run_schedule_override"] == backtest_cfg["run_schedule_override"]
+
+
 def test_build_daily_trial_config_forwards_entry_rules():
     """decoded['entry_rules'] (the entry-time TP/SL bracket, Task 6 — adjust_take_profit/
     adjust_stop_loss actions decoded from Strategy.entry_actions) rides through to each trial's

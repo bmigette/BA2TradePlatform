@@ -39,14 +39,6 @@ _NO_LARGE_CAP = {"FMPEarningsDrift", "FMPInsiderClusterBuy"}
 # expected_profit_percent is a static setting), so S4 degenerates to a fixed-% TP there — skip it.
 _TARGET_PRICE_STRATEGIES = {"S4"}
 _TARGET_PRICE_EXPERTS = {"FMPRating"}
-# Per-expert entry-scan cadence override (--run-schedule-day, comma-separated days). Experts whose
-# signal decays fast benefit from scanning more than once/week: FMPEarningsDrift's default
-# max_days_since_report window is ~10 days, and a Monday-only scan can burn over half that window
-# before a mid-week earnings beat is even seen. Unlisted experts keep the driver's single-day
-# default (monday).
-_SCHEDULE_DAY_OVERRIDE = {
-    "FMPEarningsDrift": "monday,thursday",
-}
 # Per-strategy population/generations override: S7 is a NARROW refinement around a known-good
 # point (the archived 186% S2-large winner), not a broad from-scratch search, so it needs far
 # fewer individuals/generations to converge. Unlisted strategies keep the driver's --population/
@@ -203,9 +195,13 @@ def main() -> int:
                "--start", args.start, "--end", args.end, "--fitness", args.fitness,
                "--interval", args.interval, "--population", str(population),
                "--generations", str(generations), "--screener-cadence-days", str(args.cadence_days),
+               # --run-schedule-day now only seeds the STATIC fallback (used as a base for the
+               # scan time-of-day, and for any bypass expert that skips the per-day genes
+               # entirely) -- every non-bypass strategy (S1-S7) searches WHICH day(s) itself via
+               # the schedule:<day> genes (see _SCHEDULE_DAY_OPT in ba2test_launcher.py), so a
+               # fast-decaying signal like FMPEarningsDrift discovers its own best cadence instead
+               # of a hand-picked "monday,thursday" pin.
                "--run-schedule", "weekly", "--name", name, "--parallel", str(args.parallel)]
-        if expert in _SCHEDULE_DAY_OVERRIDE:
-            cmd += ["--run-schedule-day", _SCHEDULE_DAY_OVERRIDE[expert]]
         if args.mutation_prob is not None:
             cmd += ["--mutation-prob", str(args.mutation_prob)]
         if args.profit_cap_pct and args.profit_cap_pct > 0:

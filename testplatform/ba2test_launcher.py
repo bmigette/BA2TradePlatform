@@ -793,6 +793,19 @@ _RM_OPT = {
     "max_virtual_equity_per_instrument_percent": {"optimize": True, "min": 5.0, "max": 30.0, "step": 5.0, "type": "float"},
 }
 
+# Per-weekday entry-scan ON/OFF toggle genes (schedule:<day>): merged into expert_params
+# pre-namespaced with `schedule:` so collect_param_space/decode_params route them to the schedule
+# namespace (see _collect_schedule_days/decode_params in strategy_param_space.py). Replaces a
+# single fixed --run-schedule-day pin with a per-individual, per-day search — the GA discovers
+# which day(s) work best (e.g. a fast-decaying signal might want monday+thursday) instead of a
+# hand-picked cadence. decode_params enforces at least one day stays ON. Applies to every
+# non-bypass strategy (S1-S7); bypass experts (FactorRanker) don't use the classic per-day
+# entry-scan gate at all, so they never get this merged in (see _cmd_optimize/_cmd_optimize_batch).
+_SCHEDULE_DAY_OPT = {
+    day: {"optimize": True}
+    for day in ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+}
+
 # Screener-settings genes (only added to the search when --screener is passed). The STATIC cap
 # range is kept small — its loosest bound sizes the metric store's shortlist superset — while the
 # dynamic ranges (RVOL / price-drop / max_stocks) may be wide. These are merged into expert_params
@@ -1678,6 +1691,9 @@ def _cmd_optimize(args) -> int:
         # enter ruleset with the option action (no equity leg). Equity strategies leave it unset.
         if strat_entry_action:
             backtest_block["entry_action"] = strat_entry_action
+        # Per-weekday entry-scan toggle genes (schedule:<day>) for every non-bypass strategy
+        # (S1-S7) — FactorRanker (bypass) has no per-day entry-scan gate, so it never gets these.
+        schedule_genes = {} if bypass else {f"schedule:{k}": v for k, v in _SCHEDULE_DAY_OPT.items()}
         cfg = {
             "populationSize": int(args.population),
             "generations": int(args.generations),
@@ -1689,7 +1705,7 @@ def _cmd_optimize(args) -> int:
             # their own portfolio so they carry NO RM block). Screener genes (screener:* namespace)
             # are merged in ONLY when --screener is set.
             "expert_params": ({**spec["expert_params"], **screener_genes} if bypass
-                              else {**spec["expert_params"], **_RM_OPT, **screener_genes}),
+                              else {**spec["expert_params"], **_RM_OPT, **screener_genes, **schedule_genes}),
             "backtest": backtest_block,
         }
         _worker_ids = _worker_ids_from_args(args)
@@ -1850,9 +1866,11 @@ def _cmd_optimize_batch(args) -> int:
                 "elitismPercent": 0.1, "seed": int(args.seed),
                 "parallelIndividuals": int(args.parallel),
                 # Bypass experts (FactorRanker) carry no classic-RM block (they size their own
-                # portfolio); ruleset experts get the expert params + the RM sizing/stop params.
+                # portfolio) and no per-day schedule genes; ruleset experts get the expert params +
+                # the RM sizing/stop params + per-weekday entry-scan toggle genes.
                 "expert_params": (dict(spec["expert_params"]) if bypass
-                                  else {**spec["expert_params"], **_RM_OPT}),
+                                  else {**spec["expert_params"], **_RM_OPT,
+                                        **{f"schedule:{k}": v for k, v in _SCHEDULE_DAY_OPT.items()}}),
                 "backtest": backtest_block,
             }
             opt = StrategyOptimization(
@@ -2417,7 +2435,12 @@ def main(argv: "list | None" = None) -> int:
     op.add_argument("--run-schedule", default="weekly", choices=["daily", "weekly"])
     op.add_argument("--run-schedule-day", default="monday",
                     help="Comma-separated day(s) for weekly --run-schedule (e.g. 'monday,thursday' "
-                         "for a fast-decaying signal). Default 'monday' (single day).")
+                         "for a fast-decaying signal). Default 'monday' (single day). NOTE: for a "
+                         "non-bypass expert this only seeds the static fallback (time-of-day + a "
+                         "starting point) — every strategy (S1-S7) searches WHICH day(s) itself "
+                         "via the schedule:<day> GA genes; this flag has no effect on the day "
+                         "selection for those runs. Bypass experts (FactorRanker) don't get the "
+                         "schedule genes, so this flag still fully controls their day(s).")
     op.add_argument("--name", default=None)
     op.add_argument("--screener", action="store_true",
                     help="Optimize a screener-selected dynamic universe (screener:* genes). "
@@ -2483,7 +2506,9 @@ def main(argv: "list | None" = None) -> int:
                     help="Fill-clock interval (default 5min for precise intraday TP/SL).")
     ob.add_argument("--run-schedule", default="weekly", choices=["daily", "weekly"])
     ob.add_argument("--run-schedule-day", default="monday",
-                    help="Comma-separated day(s) for weekly --run-schedule (e.g. 'monday,thursday').")
+                    help="Comma-separated day(s) for weekly --run-schedule (e.g. 'monday,thursday'). "
+                         "NOTE: for a non-bypass expert this only seeds the static fallback — every "
+                         "strategy searches WHICH day(s) itself via the schedule:<day> GA genes.")
     ob.add_argument("--name-prefix", default=None, help="Strategy/opt name prefix (default phase1-).")
     ob.add_argument("--poll", type=int, default=15, help="Poll interval seconds (default 15).")
     ob.add_argument("--worker", action="append", default=None, metavar="NAME",
