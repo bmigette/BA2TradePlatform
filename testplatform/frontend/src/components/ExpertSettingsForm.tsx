@@ -39,14 +39,21 @@ export function ExpertSettingsForm({ expertClass, value, onChange, usesRiskManag
     // BYPASS experts (e.g. FactorRanker) ignore classic RM — pass false to hide the RM section.
     usesRiskManager?: boolean; }) {
   const [defs, setDefs] = useState<Record<string, SettingDef>>({});
+  // Ref so the async getExpertSettings callback always reads the latest value, not a stale closure.
+  const valueRef = useRef(value);
+  useEffect(() => { valueRef.current = value; });
   useEffect(() => {
     if (!expertClass) return;
     getExpertSettings(expertClass).then((d) => {
       setDefs(d);
-      // seed defaults for any setting not yet set
-      const settings = { ...value.settings };
-      for (const [k, def] of Object.entries(d)) if (!HIDDEN_KEYS.has(k) && !(k in settings) && def.default !== undefined) settings[k] = def.default;
-      onChange({ ...value, settings });
+      // Seed defaults only for keys not already set. Use the ref so we see the latest settings
+      // even if the import set them after this effect was scheduled (avoids stale-closure overwrite).
+      const v = valueRef.current;
+      const newDefaults: Record<string, unknown> = {};
+      for (const [k, def] of Object.entries(d)) {
+        if (!HIDDEN_KEYS.has(k) && !(k in v.settings) && def.default !== undefined) newDefaults[k] = def.default;
+      }
+      if (Object.keys(newDefaults).length > 0) onChange({ ...v, settings: { ...v.settings, ...newDefaults } });
     }).catch(() => setDefs({}));
   }, [expertClass]);
 
