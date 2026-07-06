@@ -72,9 +72,10 @@ def run_trial(worker: dict, config: dict, fitness_metric: str, timeout: float = 
 
 
 def push_cache(worker: dict, log: Callable[[str], None] = logger.info) -> dict:
-    """Diff the master's cache against the worker's manifest and stream the missing files as ONE tar.
-
-    Returns ``{pushed, ...}``. No-op (pushed=0) when the worker is already in sync.
+    """Diff the master's cache against the worker's manifest and stream the missing files as ONE
+    tar, THEN prune anything the worker has that the master's CURRENT manifest no longer lists
+    (leftovers from a local rebuild/compaction, e.g. old screener metric_store fragments — see
+    ``cache_sync.diff_stale``). Returns ``{pushed, pruned, ...}``.
     """
     base, headers = _base(worker), _headers(worker)
     with httpx.Client(timeout=60.0) as c:
@@ -83,17 +84,30 @@ def push_cache(worker: dict, log: Callable[[str], None] = logger.info) -> dict:
         remote = r.json()
     local = cache_sync.build_manifest()
     missing = cache_sync.diff_missing(local["files"], remote)
+    res = {"pushed": 0, "extracted": 0}
     if not missing:
         log(f"cache push -> {worker['name']}: already in sync ({local['count']} files)")
-        return {"pushed": 0, "extracted": 0}
-    log(f"cache push -> {worker['name']}: streaming {len(missing)} file(s)...")
-    stream = cache_sync.iter_tar(missing, local["root"])
-    with httpx.Client(timeout=None) as c:  # large upload: no read timeout
-        r = c.post(f"{base}/cache/push", headers=headers, content=stream)
-        r.raise_for_status()
-        res = r.json()
-    log(f"cache push -> {worker['name']}: {res}")
-    return {"pushed": len(missing), **res}
+    else:
+        log(f"cache push -> {worker['name']}: streaming {len(missing)} file(s)...")
+        stream = cache_sync.iter_tar(missing, local["root"])
+        with httpx.Client(timeout=None) as c:  # large upload: no read timeout
+            r = c.post(f"{base}/cache/push", headers=headers, content=stream)
+            r.raise_for_status()
+            res = {"pushed": len(missing), **r.json()}
+        log(f"cache push -> {worker['name']}: {res}")
+
+    stale = cache_sync.diff_stale(local["files"], remote)
+    if stale:
+        log(f"cache prune -> {worker['name']}: removing {len(stale)} stale leftover file(s)...")
+        with httpx.Client(timeout=120.0) as c:
+            r = c.post(f"{base}/cache/prune", headers=headers, json={"rel_paths": stale})
+            r.raise_for_status()
+            prune_res = r.json()
+        log(f"cache prune -> {worker['name']}: {prune_res}")
+        res["pruned"] = prune_res.get("pruned", 0)
+    else:
+        res["pruned"] = 0
+    return res
 
 
 def push_secrets(worker: dict, settings: dict, log: Callable[[str], None] = logger.info) -> dict:

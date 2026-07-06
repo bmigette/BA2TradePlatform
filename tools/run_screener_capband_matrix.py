@@ -15,7 +15,7 @@ named `scr-<band>-<expert>[-<S?>]` and are IDEMPOTENT/RESUMABLE: a job whose Str
 row is already `completed` is skipped, so the driver can be killed and re-run to continue.
 
 Usage (test venv; FMP_API_KEY/DB_FILE in env):
-    ba2-venvs/test/Scripts/python.exe test_files/run_screener_capband_matrix.py \
+    ba2-venvs/test/Scripts/python.exe tools/run_screener_capband_matrix.py \
         [--bands large,mid,small] [--strategies S1,S2,S3,S4] \
         [--start 2023-01-01] [--end 2026-01-01] [--population 40] [--generations 8] \
         [--interval 5min] [--fitness calmar_ratio] [--include-no-data] [--dry-run]
@@ -141,10 +141,10 @@ def main() -> int:
                     help="Comma-separated remote worker NAMES to distribute each job's GA trials to "
                          "(e.g. 'remote150'); trials spread across these + local. Workers must be "
                          "registered + cache-synced first.")
-    ap.add_argument("--parallel", type=int, default=2,
+    ap.add_argument("--parallel", type=int, default=4,
                     help="Local trial consumers per job (ThreadPoolExecutor). Keep low when "
                          "distributing to remote workers — each local consumer holds the OHLCV "
-                         "cache in RAM (~5GB at 5min), so 4 saturates a 64GB host. Default 2.")
+                         "cache in RAM (~5GB at 5min), so 4 saturates a 64GB host. Default 4.")
     ap.add_argument("--profit-cap-pct", type=float, default=2000.0,
                     help="Cap each trade's gain at this %% of its cost basis for the ADJUSTED "
                          "fitness/return, so one lucky non-reproducible mega-winner (e.g. a sub-$1 "

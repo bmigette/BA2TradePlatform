@@ -1,16 +1,21 @@
 """Cache mirroring primitives — the "avoid redownload" core for remote workers.
 
-Everything under ``CACHE_FOLDER`` is immutable provider history (OHLCV parquet, fmp_history,
-the screener metric_store + fundamentals, the options/screener sqlite caches). It is therefore
-safe to sync ONE-WAY master -> worker: a worker mirrors the master's cache and then runs the
-hermetic backtest with zero provider/network calls (the backtest contract raises
-``BacktestCacheMiss`` rather than fetching).
+Almost everything under ``CACHE_FOLDER`` is immutable provider history (OHLCV parquet,
+fmp_history, the options/screener sqlite caches), so it's safe to sync ONE-WAY master -> worker:
+a worker mirrors the master's cache and then runs the hermetic backtest with zero provider/network
+calls (the backtest contract raises ``BacktestCacheMiss`` rather than fetching). The screener
+metric_store is the one exception: it DOES get rebuilt/compacted in place (e.g. replacing many
+``part-NNNNN.parquet`` fragments with one ``part.parquet`` per month), so a worker's copy can go
+stale even though nothing looks "missing" — see ``diff_stale``/``prune_paths``.
 
 PUSH model: the MASTER builds the list of files a worker is missing (``diff_missing`` against the
 worker's manifest) and streams them as ONE tar (``iter_tar``); the WORKER extracts that stream
 (``extract_tar``). ``build_manifest`` / ``safe_resolve`` are used on both ends. Dedup is by
 ``(rel_path, size)`` — immutable history means a size match is an identity match, so re-pushes
-only send genuinely new files.
+only send genuinely new files. ``diff_stale``/``prune_paths`` are the reverse direction: a rel_path
+the worker has that the master's CURRENT manifest no longer lists is a leftover from before a
+rebuild — a partition-globbing reader (e.g. the screener metric_store's ``load_store``) would
+otherwise keep ingesting it alongside the fresh file, silently corrupting that worker's results.
 """
 
 from __future__ import annotations
@@ -97,6 +102,18 @@ def diff_missing(local_files: List[dict], remote_manifest: dict) -> List[str]:
     return [f["rel_path"] for f in local_files if remote.get(f["rel_path"]) != f["size"]]
 
 
+def diff_stale(local_files: List[dict], remote_manifest: dict) -> List[str]:
+    """Return the rel_paths the remote has that *local_files* no longer has at all.
+
+    The mirror of ``diff_missing``: a worker file with no matching rel_path on the master is a
+    LEFTOVER from before a local rebuild/compaction (e.g. the screener metric_store replacing many
+    ``part-NNNNN.parquet`` fragments with one ``part.parquet`` per month) — ``push_cache`` alone
+    never removes it, so a partition-globbing reader on the worker keeps ingesting the stale
+    fragment alongside the fresh file, corrupting that worker's results silently."""
+    local = {f["rel_path"] for f in local_files}
+    return [f["rel_path"] for f in remote_manifest.get("files", []) if f["rel_path"] not in local]
+
+
 def iter_tar(rel_paths: Iterable[str], root: Optional[str] = None,
              chunk: int = 1 << 20) -> Iterator[bytes]:
     """Yield a single uncompressed tar STREAM of *rel_paths* (resolved under *root*).
@@ -175,3 +192,24 @@ def extract_tar(fileobj, dest: Optional[str] = None) -> dict:
             extracted += 1
             total += member.size
     return {"extracted": extracted, "bytes": total, "skipped": skipped}
+
+
+def prune_paths(rel_paths: Iterable[str], root: Optional[str] = None) -> dict:
+    """Delete *rel_paths* under *root* (default ``CACHE_FOLDER``). Traversal-guarded via
+    ``safe_resolve``; a path outside the root is skipped, not deleted. Missing files are a
+    no-op (already gone). Returns ``{pruned, skipped}``."""
+    base = str(cache_root(root))
+    pruned = 0
+    skipped = 0
+    for rel in rel_paths:
+        try:
+            target = safe_resolve(rel, base)
+        except ValueError:
+            skipped += 1
+            continue
+        try:
+            target.unlink()
+            pruned += 1
+        except FileNotFoundError:
+            pass
+    return {"pruned": pruned, "skipped": skipped}

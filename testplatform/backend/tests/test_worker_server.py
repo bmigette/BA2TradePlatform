@@ -67,6 +67,24 @@ def test_cache_push_extracts(client, tmp_path, monkeypatch):
     assert (dst / "FMPOHLCVProvider" / "AAPL_1d.parquet").read_bytes() == b"data" * 100
 
 
+def test_cache_prune_deletes_stale_leftovers(client, tmp_path, monkeypatch):
+    dst = tmp_path / "worker_cache"
+    (dst / "screener" / "metric_store" / "ym=2024-01").mkdir(parents=True)
+    stale = dst / "screener" / "metric_store" / "ym=2024-01" / "part-00001.parquet"
+    stale.write_bytes(b"old fragment")
+    fresh = dst / "screener" / "metric_store" / "ym=2024-01" / "part.parquet"
+    fresh.write_bytes(b"current")
+    monkeypatch.setattr(cache_sync, "CACHE_FOLDER", str(dst))
+
+    r = client.post("/cache/prune", headers=H,
+                    json={"rel_paths": ["screener/metric_store/ym=2024-01/part-00001.parquet"]})
+    assert r.status_code == 200 and r.json() == {"pruned": 1, "skipped": 0}
+    assert not stale.exists()
+    assert fresh.exists()
+    # auth still enforced
+    assert client.post("/cache/prune", json={"rel_paths": []}).status_code == 401
+
+
 def test_localize_paths_remaps_master_cache_to_local():
     cfg = {
         "universe": {"mode": "screener",

@@ -48,6 +48,38 @@ def test_diff_missing():
     assert sorted(cache_sync.diff_missing(local, remote)) == ["b", "c"]
 
 
+def test_diff_stale():
+    # Master rebuilt/compacted the screener store: old per-generation fragments are gone locally,
+    # but a worker synced before the rebuild still has them (same rel_path, any size).
+    local = [{"rel_path": "screener/metric_store/ym=2024-01/part.parquet", "size": 100}]
+    remote = {"files": [
+        {"rel_path": "screener/metric_store/ym=2024-01/part.parquet", "size": 100},
+        {"rel_path": "screener/metric_store/ym=2024-01/part-00001.parquet", "size": 40},
+        {"rel_path": "screener/metric_store/ym=2024-01/part-00002.parquet", "size": 41},
+    ]}
+    assert sorted(cache_sync.diff_stale(local, remote)) == [
+        "screener/metric_store/ym=2024-01/part-00001.parquet",
+        "screener/metric_store/ym=2024-01/part-00002.parquet",
+    ]
+
+
+def test_prune_paths_deletes_and_guards_traversal(tmp_path):
+    _write(tmp_path / "screener" / "metric_store" / "ym=2024-01" / "part-00001.parquet", b"x")
+    _write(tmp_path / "screener" / "metric_store" / "ym=2024-01" / "part.parquet", b"y")
+
+    res = cache_sync.prune_paths(
+        [
+            "screener/metric_store/ym=2024-01/part-00001.parquet",  # deleted
+            "screener/metric_store/ym=2024-01/does-not-exist.parquet",  # missing -> no-op
+            "../escape.parquet",  # traversal -> skipped
+        ],
+        str(tmp_path),
+    )
+    assert res == {"pruned": 1, "skipped": 1}
+    assert not (tmp_path / "screener" / "metric_store" / "ym=2024-01" / "part-00001.parquet").exists()
+    assert (tmp_path / "screener" / "metric_store" / "ym=2024-01" / "part.parquet").exists()
+
+
 def test_tar_roundtrip_and_traversal(tmp_path):
     src = tmp_path / "master"
     dst = tmp_path / "worker"

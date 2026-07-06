@@ -11,6 +11,7 @@ Endpoints (every one bearer-checked against the worker password):
   GET  /version        -> {app_version, git_commit, ...}
   GET  /cache/manifest -> {files:[{rel_path,size,...}], ...}   (what this worker already has)
   POST /cache/push     -> accept a tar STREAM, extract into CACHE_FOLDER
+  POST /cache/prune    -> {rel_paths} -> delete leftovers from a master-side rebuild/compaction
   POST /run-trial      -> {config, fitness_metric} -> {ok, fitness, trades, error, fatal}
   POST /update         -> git pull + reinstall + restart (self_update)
 """
@@ -62,6 +63,10 @@ class RunTrialReq(BaseModel):
 
 class SecretsReq(BaseModel):
     settings: dict  # {app_setting_key: value_str}, e.g. {"FMP_API_KEY": "...", "finnhub_api_key": "..."}
+
+
+class PruneReq(BaseModel):
+    rel_paths: list[str]  # worker-relative cache paths the master's manifest no longer lists
 
 
 def _localize_paths(obj, master_root: str, local_root: str):
@@ -158,6 +163,14 @@ def run_trial(req: RunTrialReq, authorization: str = Header(default=None)):
         return _POOL.submit(_trial_worker, config, req.fitness_metric).result()
     except Exception as e:  # noqa: BLE001 — surface as a failed trial, never 500 the dispatcher
         return {"ok": False, "fitness": 0.0, "trades": 0, "error": repr(e), "fatal": False}
+
+
+@worker_app.post("/cache/prune")
+def cache_prune(req: PruneReq, authorization: str = Header(default=None)):
+    """Delete rel_paths the master's CURRENT manifest no longer lists (leftovers from a rebuild/
+    compaction, e.g. old screener metric_store fragments) — the reverse of ``/cache/push``."""
+    _verify(authorization)
+    return cache_sync.prune_paths(req.rel_paths)
 
 
 @worker_app.post("/secrets")

@@ -1,6 +1,6 @@
 """CACHE-ONLY in-place add of the ``atr_<period>`` columns to an existing screener metric store.
 
-The GA/optimize trial-worker path (test_files/run_screener_capband_matrix.py) has no hermetic
+The GA/optimize trial-worker path (tools/run_screener_capband_matrix.py) has no hermetic
 route to a live indicator provider for ATR-based risk sizing (TradeRiskManagement._risk_atr_quantity
 -> position_sizing.get_latest_atr): the plain PandasIndicatorCalc fallback would either hit the
 network mid-run or silently return no ATR, so the safeguard SL (synthesize_safeguard_stop) fell

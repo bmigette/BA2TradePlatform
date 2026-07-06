@@ -56,17 +56,18 @@ export function RunHistoryTable({ savedOnly, onSelect, onLoad, selectedId, selec
   const [sortDir, setSortDir] = usePersistentState<'asc' | 'desc'>(ns + 'sortDir', 'desc');
 
   useEffect(() => {
+    // expert/optId are filtered CLIENT-side (see `filtered` below) so the dropdown options —
+    // derived from these same `rows` — always list every expert/job for this tab, not just the
+    // one currently selected (fetching server-filtered rows made the other options vanish).
     listBacktests({
       saved: savedOnly ? true : undefined,
       // BT History (savedOnly=false) lists STANDALONE backtests only — the optimization-derived
       // TOP-N rows live under the Opt History tab. Saved tab is unfiltered (shows all saved).
       single: savedOnly ? undefined : true,
-      expert: expert || undefined,
-      optimization_id: optId ? Number(optId) : undefined,
     })
       .then(setRows)
       .catch(() => setRows([]));
-  }, [savedOnly, expert, optId, refresh]);
+  }, [savedOnly, refresh]);
 
   const handleSave = async (r: any) => {
     const name = window.prompt('Save backtest as:', r.name || '');
@@ -137,6 +138,8 @@ export function RunHistoryTable({ savedOnly, onSelect, onLoad, selectedId, selec
   const clearFilters = () => { setExpert(''); setOptId(''); setMinSharpe(''); setMinTrades(''); setMinRet(''); setMaxDD(''); setMinWin(''); };
 
   const filtered = rows.filter(r => {
+    if (expert && (r.expertName ?? r.expert_name) !== expert) return false;
+    if (optId && String(r.optimizationId ?? r.optimization_id ?? '') !== optId) return false;
     if (q && !(r.name || '').toLowerCase().includes(q.toLowerCase())) return false;
     if (minSharpe !== '' && !(num(r.sharpeRatio ?? r.sharpe_ratio) >= Number(minSharpe))) return false;
     if (minTrades !== '' && !(num(r.totalTrades ?? r.total_trades) >= Number(minTrades))) return false;
