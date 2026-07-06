@@ -1102,6 +1102,71 @@ def _build_strategy_S6(name: str):
                     exit_conditions=exit_conditions)
 
 
+def _build_strategy_S7(name: str):
+    """S7 — REFINEMENT around the best -goal result found to date: the archived pre-tp/sl-rework
+    S2-large winner (backtest #91, opt 23: 186.53% return, 181.07% adjusted, 149 trades/49.78
+    per yr, calmar 3.66, dd -11.52% -- reproduced byte-identically against today's code, so the
+    peak is real and still reachable, just not rediscovered by a fresh S2 search).
+
+    Unlike S2 (wide, general-purpose ranges), S7 mirrors that winner's EXACT structure and
+    NARROWS every range to a tight neighborhood around its winning values, so a SMALL
+    population/generations budget is enough to fine-tune rather than re-explore from scratch:
+      - entry gate: ONLY the cooldown the winner used (days_since_last_profitable_close), no
+        confidence/expected-profit gate at all (the winner had both disabled -- omitted here
+        entirely rather than carried as dead toggleable weight).
+      - TP/SL AT ENTRY (entry_actions, the same Phase-1.5 mechanism S4 uses): the winner's
+        exit_conditions-based stop/take-profit only get evaluated on the daily manage schedule,
+        leaving a position UNPROTECTED between fill and the first scheduled check. entry_actions
+        fire in the SAME step as order creation, so the bracket is live from the moment of fill --
+        a genuine improvement over the winner's design, not just a replica of it. Narrow ranges
+        centered on the winning +32% TP / -8% SL.
+      - exit_belock: kept as an exit_condition (not entry_actions) because it's a DYNAMIC
+        ratchet -- it needs to re-fire as profit accrues, which a one-time entry action can't do.
+        Narrow range around the winning +4%-at-+16%.
+      - exit_bearish / exit_downgrade: same signal exits the winner used.
+      - no exit_time (the winner had it disabled).
+    Meant to run with a much smaller --population/--generations than the broad-search strategies
+    (see run_screener_capband_matrix.py's per-strategy override) -- this is fine-tuning around a
+    known point, not exploring a 20-dimensional space from a cold start.
+    """
+    from app.models.strategy import Strategy
+    buy_entry_conditions = {
+        "id": "root", "type": "AND", "conditions": [
+            {"id": "gate_days_since_profit", "field": "days_since_last_profitable_close", "op": ">",
+             "value": 5, "optimize": True, "value_min": 2, "value_max": 10, "value_step": 1},
+        ],
+    }
+    entry_actions = [
+        # TP/SL set the instant the order fills (Phase 1.5) -- closes the "unprotected until the
+        # next scheduled exit-check" gap the winner's exit-condition-only design had.
+        {"id": "entry_tp", "action_type": "adjust_take_profit", "reference_value": "order_open_price",
+         "action_value": 32.0, "action_value_optimize": True,
+         "action_value_min": 24.0, "action_value_max": 42.0, "action_value_step": 3.0,
+         "toggle_optimize": True},
+        {"id": "entry_sl", "action_type": "adjust_stop_loss", "reference_value": "order_open_price",
+         "action_value": -8.0, "action_value_optimize": True,
+         "action_value_min": -14.0, "action_value_max": -4.0, "action_value_step": 2.0,
+         "toggle_optimize": True},
+    ]
+    exit_conditions = [
+        {"id": "exit_bearish", "action_type": "close", "toggle_optimize": True,
+         "conditions": {"type": "AND", "conditions": [{"id": "xb", "field": "bearish"}]}},
+        {"id": "exit_downgrade", "action_type": "close", "toggle_optimize": True,
+         "conditions": {"type": "AND", "conditions": [{"id": "xd", "field": "current_rating_negative"}]}},
+        # DYNAMIC ratchet -- re-fires as profit grows, so it stays an exit_condition (entry_actions
+        # only fire once, at entry).
+        {"id": "exit_belock", "action_type": "adjust_stop_loss", "reference_value": "order_open_price",
+         "action_value": 4.0, "action_value_optimize": True,
+         "action_value_min": 0.0, "action_value_max": 8.0, "action_value_step": 1.0,
+         "toggle_optimize": True,
+         "conditions": {"type": "AND", "conditions": [
+             {"id": "xlk", "field": "profit_loss_percent", "op": ">", "value": 16,
+              "optimize": True, "value_min": 10, "value_max": 22, "value_step": 2}]}},
+    ]
+    return Strategy(name=name, buy_entry_conditions=buy_entry_conditions,
+                    exit_conditions=exit_conditions, entry_actions=entry_actions)
+
+
 def _build_strategy_minimal(name: str):
     """A placeholder Strategy for BYPASS experts (FactorRanker) that ignore enter/exit rulesets and
     rebalance by factor score. The optimization still needs a Strategy row; this one carries no
@@ -1409,6 +1474,7 @@ _STRATEGY_BUILDERS = {
     "S4": _build_strategy_S4,   # (name, expert) — target-anchored TP (expert_target_price)
     "S5": _build_strategy_S5,   # (name) — S2/S3 hybrid: signal exits + trailing ladder
     "S6": _build_strategy_S6,   # (name) — high-frequency quick-cycle (tight TP + short time exit)
+    "S7": _build_strategy_S7,   # (name) — tight refinement around the archived 186% S2-large winner
     # Option/equity strategies (dispatch by `kind`, not `name`; see _build_strategy):
     "O_LC": _build_strategy_option, "O_VERT": _build_strategy_option,
     "O_SSTG": _build_strategy_option, "O_SSTD": _build_strategy_option,

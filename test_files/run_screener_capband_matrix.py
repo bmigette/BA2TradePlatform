@@ -47,6 +47,13 @@ _TARGET_PRICE_EXPERTS = {"FMPRating"}
 _SCHEDULE_DAY_OVERRIDE = {
     "FMPEarningsDrift": "monday,thursday",
 }
+# Per-strategy population/generations override: S7 is a NARROW refinement around a known-good
+# point (the archived 186% S2-large winner), not a broad from-scratch search, so it needs far
+# fewer individuals/generations to converge. Unlisted strategies keep the driver's --population/
+# --generations args unchanged.
+_STRATEGY_BUDGET_OVERRIDE = {
+    "S7": {"population": 20, "generations": 5},
+}
 
 
 def _db_path() -> str:
@@ -184,11 +191,18 @@ def main() -> int:
         # FMPRating's search space grew (price-target + analyst-recency genes), so give it extra
         # population to explore the larger space; other experts use the base --population.
         population = args.population + (args.fmp_population_bonus if expert == "FMPRating" else 0)
+        generations = args.generations
+        budget = _STRATEGY_BUDGET_OVERRIDE.get(strat)
+        if budget:
+            # A refinement strategy (e.g. S7) ignores the FMPRating bonus too -- it's a narrow
+            # neighborhood search regardless of expert, not exploring the full space.
+            population = budget["population"]
+            generations = budget["generations"]
         cmd = [exe, "optimize", "--expert", expert, "--universe", _PLACEHOLDER_UNIVERSE,
                "--screener", "--screener-store", args.store, "--screener-cap-band", band,
                "--start", args.start, "--end", args.end, "--fitness", args.fitness,
                "--interval", args.interval, "--population", str(population),
-               "--generations", str(args.generations), "--screener-cadence-days", str(args.cadence_days),
+               "--generations", str(generations), "--screener-cadence-days", str(args.cadence_days),
                "--run-schedule", "weekly", "--name", name, "--parallel", str(args.parallel)]
         if expert in _SCHEDULE_DAY_OVERRIDE:
             cmd += ["--run-schedule-day", _SCHEDULE_DAY_OVERRIDE[expert]]
