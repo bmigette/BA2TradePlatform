@@ -1192,9 +1192,10 @@ const Backtesting: React.FC = () => {
   };
   const handleExpertSettingsFile = (file: File | undefined) => {
     if (!file) return;
-    file.text().then(importExpertSettingsJson).catch(() =>
-      setImportNote({ kind: 'err', text: 'Could not read the selected expert settings file.' }),
-    );
+    file.text().then(importExpertSettingsJson).catch((err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err ?? 'unknown error');
+      setImportNote({ kind: 'err', text: `Import failed: ${msg}` });
+    });
   };
 
   // Import-JSON ruleset (#159): load an expert ruleset JSON file (buy/sell enter trees + exit
@@ -3158,8 +3159,17 @@ const Backtesting: React.FC = () => {
                   <button
                     type="button"
                     onClick={() => {
-                      const txt = window.prompt('Paste exported opt-settings / individual JSON:');
-                      if (txt != null && txt.trim()) importSettingsJson(txt);
+                      const txt = window.prompt('Paste exported JSON (opt-settings, individual, or expert-settings):');
+                      if (txt == null || !txt.trim()) return;
+                      try {
+                        const probe = JSON.parse(txt) as Record<string, unknown>;
+                        // Expert-settings format: has `expert` or `expert_type` or `expert_settings` key
+                        if (probe.expert || probe.expert_type || probe.expert_settings) {
+                          void importExpertSettingsJson(txt);
+                        } else {
+                          importSettingsJson(txt);
+                        }
+                      } catch { importSettingsJson(txt); }
                     }}
                     className="px-2.5 py-1 text-sm rounded border border-gray-300 dark:border-gray-500 text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-700"
                   >
@@ -3183,7 +3193,7 @@ const Backtesting: React.FC = () => {
                 {importNote && (
                   <p className={`mt-2 text-xs ${importNote.kind === 'ok'
                     ? 'text-green-600 dark:text-green-400'
-                    : 'text-amber-600 dark:text-amber-400'}`}>
+                    : 'text-red-600 dark:text-red-400'}`}>
                     {importNote.text}
                   </p>
                 )}
