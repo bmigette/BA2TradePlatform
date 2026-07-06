@@ -13,6 +13,7 @@ Endpoints (every one bearer-checked against the worker password):
   POST /cache/push     -> accept a tar STREAM, extract into CACHE_FOLDER
   POST /cache/prune    -> {rel_paths} -> delete leftovers from a master-side rebuild/compaction
   POST /run-trial      -> {config, fitness_metric} -> {ok, fitness, trades, error, fatal}
+  POST /run-trial-full -> {config, fitness_metric} -> {ok, results:{...full backtest results}}
   POST /update         -> git pull + reinstall + restart (self_update)
 """
 
@@ -163,6 +164,23 @@ def run_trial(req: RunTrialReq, authorization: str = Header(default=None)):
         return _POOL.submit(_trial_worker, config, req.fitness_metric).result()
     except Exception as e:  # noqa: BLE001 — surface as a failed trial, never 500 the dispatcher
         return {"ok": False, "fitness": 0.0, "trades": 0, "error": repr(e), "fatal": False}
+
+
+@worker_app.post("/run-trial-full")
+def run_trial_full(req: RunTrialReq, authorization: str = Header(default=None)):
+    """Like ``/run-trial`` but returns the FULL results dict (equity curve, metrics, ...) instead
+    of the trimmed ``{ok,fitness,trades,error}`` summary — for diagnosing a fitness mismatch
+    against a master-side result field-by-field. Not on the hot GA path (that stays on
+    ``/run-trial``'s small payload); this is an operator/debug tool."""
+    _verify(authorization)
+    from app.services.strategy_optimization_handler import _persist_trial_worker
+    if _POOL is None:
+        raise HTTPException(status_code=503, detail="Worker pool not initialized.")
+    config = req.config
+    if req.cache_root:
+        from ba2_common.config import CACHE_FOLDER
+        config = _localize_paths(req.config, req.cache_root, CACHE_FOLDER)
+    return _POOL.submit(_persist_trial_worker, config).result()
 
 
 @worker_app.post("/cache/prune")

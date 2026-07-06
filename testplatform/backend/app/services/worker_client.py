@@ -71,6 +71,19 @@ def run_trial(worker: dict, config: dict, fitness_metric: str, timeout: float = 
         return r.json()
 
 
+def run_trial_full(worker: dict, config: dict, fitness_metric: str, timeout: float = 1800.0) -> dict:
+    """Like ``run_trial`` but returns ``{ok, results:{...}}`` (the full backtest results dict)
+    instead of the trimmed summary — an operator/debug tool for diagnosing a fitness mismatch
+    against a master-side result field-by-field, not the hot GA path."""
+    from ba2_common.config import CACHE_FOLDER
+    with httpx.Client(timeout=timeout) as c:
+        r = c.post(f"{_base(worker)}/run-trial-full", headers=_headers(worker),
+                   json={"config": config, "fitness_metric": fitness_metric,
+                         "cache_root": CACHE_FOLDER})
+        r.raise_for_status()
+        return r.json()
+
+
 def push_cache(worker: dict, log: Callable[[str], None] = logger.info) -> dict:
     """Diff the master's cache against the worker's manifest and stream the missing files as ONE
     tar, THEN prune anything the worker has that the master's CURRENT manifest no longer lists

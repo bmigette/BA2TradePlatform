@@ -16,7 +16,9 @@ class _FakeFuture:
 
 
 class _FakePool:
-    def submit(self, _fn, config, metric):
+    def submit(self, _fn, *args):
+        if _fn.__name__ == "_persist_trial_worker":
+            return _FakeFuture({"ok": True, "results": {"total_return": 12.3, "total_trades": 5}})
         return _FakeFuture({"ok": True, "fitness": 42.0, "trades": 3, "error": None})
 
 
@@ -78,6 +80,14 @@ def test_cache_manifest_with_hash(client, tmp_path, monkeypatch):
 
     r = client.get("/cache/manifest", headers=H, params={"with_hash": "true"})
     assert r.status_code == 200 and "crc32" in r.json()["files"][0]
+
+
+def test_run_trial_full_returns_complete_results(client):
+    r = client.post("/run-trial-full", headers=H,
+                    json={"config": {"v": 1}, "fitness_metric": "sharpe"})
+    assert r.status_code == 200
+    assert r.json() == {"ok": True, "results": {"total_return": 12.3, "total_trades": 5}}
+    assert client.post("/run-trial-full", json={"config": {}, "fitness_metric": "x"}).status_code == 401
 
 
 def test_cache_prune_deletes_stale_leftovers(client, tmp_path, monkeypatch):
