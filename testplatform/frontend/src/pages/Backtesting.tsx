@@ -1159,7 +1159,16 @@ const Backtesting: React.FC = () => {
     if (ep && typeof ep === 'object') {
       for (const [k, v] of Object.entries(ep)) concrete[k.startsWith('model:') ? k.slice(6) : k] = v;
     }
-    const merged = { ...flatSettings, ...concrete };
+    // If run_schedule_override is present and the expert's execution schedule settings are not
+    // explicitly exported (they often aren't — the export omits default-value fields), seed them
+    // from run_schedule_override so the imported schedule is honoured rather than replaced by the
+    // expert's default (all Mon-Fri).
+    const rso = (parsed.execution as Record<string, unknown> | undefined)?.run_schedule_override as
+      { days?: Record<string, boolean>; times?: string[] } | undefined;
+    if (rso?.days && !merged.execution_schedule_enter_market && !merged.execution_schedule_open_positions) {
+      merged.execution_schedule_enter_market = { days: rso.days, times: rso.times ?? ['09:30'] };
+      merged.execution_schedule_open_positions = { days: rso.days, times: rso.times ?? ['09:30'] };
+    }
     if (Object.keys(merged).length) {
       setExpertSettings((prev) => ({ settings: { ...prev.settings, ...merged }, expert_params: prev.expert_params }));
     }
