@@ -1,5 +1,5 @@
 // frontend/src/components/ExpertSettingsForm.tsx
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { getExpertSettings } from '../lib/btApi';
 import type { SettingDef } from '../lib/btApi';
 import { ScheduleEditor } from './ScheduleEditor';
