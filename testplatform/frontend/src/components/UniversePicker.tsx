@@ -129,11 +129,11 @@ export function UniversePicker({ value, onChange }: { value: UniverseValue; onCh
         <input type="checkbox" className="rounded" checked={!!r}
           onChange={(e) => setRange(optDef.key, e.target.checked, undefined, optDef.def)} /> Opt
         {r && (<>
-          <input type="number" placeholder="min" value={r.min} className={rangeInputClass}
+          <input type="number" placeholder="min" value={r.min ?? 0} className={rangeInputClass}
             onChange={(e) => setRange(optDef.key, true, { ...r, min: Number(e.target.value) })} />
-          <input type="number" placeholder="max" value={r.max} className={rangeInputClass}
+          <input type="number" placeholder="max" value={r.max ?? 0} className={rangeInputClass}
             onChange={(e) => setRange(optDef.key, true, { ...r, max: Number(e.target.value) })} />
-          <input type="number" placeholder="step" value={r.step} className={rangeInputClass}
+          <input type="number" placeholder="step" value={r.step ?? 0} className={rangeInputClass}
             onChange={(e) => setRange(optDef.key, true, { ...r, step: Number(e.target.value) })} />
         </>)}
       </label>
