@@ -6,7 +6,7 @@ import sqlite3
 
 DB = r"C:\Users\basti\Documents\ba2\test\dl_forecasting.db"
 SUFFIX = "-goal4"
-TOTAL_PLANNED = 28
+TOTAL_PLANNED = 45  # S1-S7 x 3 bands, FMPRating-only S4, FactorRanker skipped (2026-07-06 restart)
 
 
 def main():
