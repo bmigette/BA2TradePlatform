@@ -1159,10 +1159,20 @@ const Backtesting: React.FC = () => {
       setExpertSettings((prev) => ({ settings: { ...prev.settings, ...concrete }, expert_params: prev.expert_params }));
     }
     applyImportedUniverse(parsed.universe as ExportUniverse | undefined);
+    // Date range + capital + interval + the full execution config (seed/fill_model/warmup/
+    // enable_short/run_schedule) — without these a file-based import silently keeps whatever the
+    // form already had (e.g. the default DAILY schedule instead of the original's weekly-Monday
+    // cadence), producing a materially different run despite "matching" expert settings.
+    if (typeof parsed.start_date === 'string') setStartDate(parsed.start_date.slice(0, 10));
+    if (typeof parsed.end_date === 'string') setEndDate(parsed.end_date.slice(0, 10));
+    if (typeof parsed.initial_capital === 'number') setInitialCapital(parsed.initial_capital);
+    const iv = parsed.execution_interval;
+    if (typeof iv === 'string') setExecutionInterval(iv);
+    applyImportedExecution(parsed.execution as Record<string, unknown> | undefined);
     setImportNote({
       kind: 'ok',
       text: matched
-        ? `Imported expert settings for "${matched}": selected the expert and pre-filled its params.`
+        ? `Imported expert settings for "${matched}": selected the expert, pre-filled its params, and restored dates/universe/interval/seed/schedule.`
         : `Imported expert settings${expertType ? ` from "${expertType}" (not a known expert — select it manually)` : ''}: pre-filled params.`,
     });
   };
@@ -1778,6 +1788,29 @@ const Backtesting: React.FC = () => {
     }
   };
 
+  // Shared by importExpertSettingsJson (file upload) and loadBacktestIntoForm (by-ID Load): applies
+  // an exported "execution" block (seed/fill_model/warmup_days/enable_short/run_schedule_override)
+  // to the form. Extracted so both restore paths reproduce a saved run identically instead of
+  // silently drifting (the file-upload path used to skip this block entirely).
+  const applyImportedExecution = (ex: Record<string, unknown> | undefined) => {
+    if (!ex) return;
+    if (typeof ex.seed === 'number') setRunSeed(ex.seed);
+    if (typeof ex.fill_model === 'string') setFillModel(ex.fill_model);
+    if (ex.warmup_days != null) setWarmupDays(String(ex.warmup_days));
+    if (typeof ex.enable_short === 'boolean') setAllowShort(ex.enable_short);
+    // run_schedule_override {days:{monday:bool,...}, times:[...]} -> the form's daily/weekly +
+    // weekday. One weekday true -> weekly on that day; otherwise daily (analyse every bar).
+    const rso = ex.run_schedule_override as { days?: Record<string, boolean> } | null | undefined;
+    const days = rso?.days ?? null;
+    const onDays = days ? Object.entries(days).filter(([, v]) => v).map(([k]) => k) : [];
+    if (onDays.length === 1) {
+      setRunSchedule('weekly');
+      setRunScheduleDay(onDays[0].charAt(0).toUpperCase() + onDays[0].slice(1));
+    } else {
+      setRunSchedule('daily');
+    }
+  };
+
   // Part 5: read an exported opt-settings / individual JSON and populate the New-Backtest form.
   // Round-trips the schema produced by part 4 (lib/btExport.ts). Switches to the New tab so the
   // user sees the populated fields.
@@ -1846,44 +1879,17 @@ const Backtesting: React.FC = () => {
       if (bt.startDate) setStartDate(String(bt.startDate).slice(0, 10));
       if (bt.endDate) setEndDate(String(bt.endDate).slice(0, 10));
       if (typeof bt.initialCapital === 'number') setInitialCapital(bt.initialCapital);
-      // Expert + concrete settings (TP/SL + the optimized expert_params) via the expert-settings export.
-      // Keep the parsed payload so we can also recover the standalone run's universe + interval below.
-      let expertExport: Record<string, unknown> | null = null;
+      // Expert + concrete settings (TP/SL + the optimized expert_params) + universe/interval/dates/
+      // execution config (seed/fill_model/warmup/enable_short/run_schedule) all restored in one call
+      // — importExpertSettingsJson applies the FULL export now (see its own restoration logic).
       try {
-        expertExport = await fetchBacktestExport(id, 'expert_settings');
+        const expertExport = await fetchBacktestExport(id, 'expert_settings');
         await importExpertSettingsJson(JSON.stringify(expertExport));
       } catch { /* ignore */ }
       // Conditions via the ruleset export (structured trees load directly; for opt-derived runs the
       // conditions are flat cond:/exit: genes and don't render as trees — the expert/RM params above
-      // still load).
+      // still load). The entry-time TP/SL bracket (entryActions) rides on this export too.
       try { await importRulesetJson(JSON.stringify(await fetchBacktestExport(id, 'ruleset'))); } catch { /* ignore */ }
-      // Universe + interval + the full execution config (seed/fill_model/warmup/enable_short/
-      // run_schedule) — the expert_settings export now carries these for BOTH opt-derived runs
-      // (sourced from the optimization) and standalone runs (persisted on the row). Restoring
-      // them is what makes Run reproduce the saved result faithfully. The entry-time TP/SL
-      // bracket (entryActions) rides on the "ruleset" export instead — loaded above via
-      // importRulesetJson.
-      if (expertExport) {
-        applyImportedUniverse(expertExport.universe as ExportUniverse | undefined);
-        const iv = expertExport.execution_interval;
-        if (typeof iv === 'string') setExecutionInterval(iv);
-        const ex = (expertExport.execution ?? {}) as Record<string, unknown>;
-        if (typeof ex.seed === 'number') setRunSeed(ex.seed);
-        if (typeof ex.fill_model === 'string') setFillModel(ex.fill_model);
-        if (ex.warmup_days != null) setWarmupDays(String(ex.warmup_days));
-        if (typeof ex.enable_short === 'boolean') setAllowShort(ex.enable_short);
-        // run_schedule_override {days:{monday:bool,...}, times:[...]} -> the form's daily/weekly +
-        // weekday. One weekday true -> weekly on that day; otherwise daily (analyse every bar).
-        const rso = ex.run_schedule_override as { days?: Record<string, boolean> } | null | undefined;
-        const days = rso?.days ?? null;
-        const onDays = days ? Object.entries(days).filter(([, v]) => v).map(([k]) => k) : [];
-        if (onDays.length === 1) {
-          setRunSchedule('weekly');
-          setRunScheduleDay(onDays[0].charAt(0).toUpperCase() + onDays[0].slice(1));
-        } else {
-          setRunSchedule('daily');
-        }
-      }
       setImportNote({
         kind: 'ok',
         text: `Loaded "${bt.name ?? `#${id}`}" — expert, settings, conditions, universe, interval, seed & schedule restored. Run to reproduce.`,

@@ -1123,6 +1123,11 @@ def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dic
             "execution": execution,
             "universe": universe,
             "execution_interval": interval,
+            # Date range + capital: without these a file-based import silently falls back to
+            # whatever the form happens to have typed in, diverging from the original run.
+            "start_date": backtest.start_date.isoformat() if backtest.start_date else None,
+            "end_date": backtest.end_date.isoformat() if backtest.end_date else None,
+            "initial_capital": backtest.initial_capital,
         }
 
     if kind == "ruleset":
