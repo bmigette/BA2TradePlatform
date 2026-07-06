@@ -49,25 +49,27 @@ def _is_syncable(p: Path) -> bool:
     return not any(name.endswith(s) for s in _SKIP_SUFFIXES)
 
 
-def _sha256_file(p: Path, chunk: int = 1 << 20) -> str:
-    import hashlib
-    h = hashlib.sha256()
+def _crc32_file(p: Path, chunk: int = 1 << 20) -> int:
+    import zlib
+    crc = 0
     with open(p, "rb") as f:
         for block in iter(lambda: f.read(chunk), b""):
-            h.update(block)
-    return h.hexdigest()
+            crc = zlib.crc32(block, crc)
+    return crc
 
 
 def build_manifest(root: Optional[str] = None, with_hash: bool = False) -> dict:
     """Enumerate every syncable cache file under *root* (default ``CACHE_FOLDER``).
 
-    Returns ``{root, count, total_bytes, files:[{rel_path, size, mtime[, sha256]}]}`` with
+    Returns ``{root, count, total_bytes, files:[{rel_path, size, mtime[, crc32]}]}`` with
     POSIX-style relative paths (stable across OSes). Recurses the whole cache tree so newly-added
     buckets are covered automatically (no allowlist to drift).
 
-    ``with_hash=True`` adds a ``sha256`` per file (read+hashed LOCALLY, so no extra network
-    transfer — only the 64-char digest crosses the wire). Off by default: the hot ``push_cache``
-    path only needs ``(rel_path, size)`` and hashing every file is disk-IO-heavy; use it for the
+    ``with_hash=True`` adds a ``crc32`` per file (read LOCALLY, so no extra network transfer —
+    only the checksum crosses the wire). CRC32 (not sha256): this is corruption/staleness
+    detection over a possibly-tens-of-GB cache, not a security boundary, so the much faster
+    non-cryptographic checksum is the right tradeoff. Off by default: the hot ``push_cache`` path
+    only needs ``(rel_path, size)`` and reading every file is disk-IO-heavy; use it for the
     periodic cache-integrity check, which needs to catch a same-size-different-content drift that
     (rel_path, size) alone can't see (e.g. a rebuild that rewrites a file at its old byte size).
     """
@@ -88,7 +90,7 @@ def build_manifest(root: Optional[str] = None, with_hash: bool = False) -> dict:
             }
             if with_hash:
                 try:
-                    entry["sha256"] = _sha256_file(p)
+                    entry["crc32"] = _crc32_file(p)
                 except OSError:
                     continue
             files.append(entry)
@@ -136,15 +138,15 @@ def diff_stale(local_files: List[dict], remote_manifest: dict) -> List[str]:
 
 
 def diff_content_mismatch(local_files: List[dict], remote_manifest: dict) -> List[str]:
-    """Return rel_paths that match on (rel_path, size) but have a DIFFERENT ``sha256`` — the one
+    """Return rel_paths that match on (rel_path, size) but have a DIFFERENT ``crc32`` — the one
     drift ``diff_missing``/``diff_stale`` structurally cannot see (a rebuild that rewrites a file
     at its old byte size). Both manifests must have been built with ``with_hash=True``; entries
-    missing a ``sha256`` are skipped (can't compare)."""
-    remote = {f["rel_path"]: f.get("sha256") for f in remote_manifest.get("files", [])}
+    missing a ``crc32`` are skipped (can't compare)."""
+    remote = {f["rel_path"]: f.get("crc32") for f in remote_manifest.get("files", [])}
     out = []
     for f in local_files:
         rh = remote.get(f["rel_path"])
-        lh = f.get("sha256")
+        lh = f.get("crc32")
         if rh is not None and lh is not None and rh != lh:
             out.append(f["rel_path"])
     return out

@@ -114,9 +114,11 @@ def check_cache_integrity(worker: dict, timeout: float = 600.0) -> dict:
     """Deep, content-hash-based comparison of the master's cache against *worker*'s.
 
     Unlike ``push_cache`` (fast, size-only — the normal per-job pre-flight path), this reads +
-    sha256-hashes every file on BOTH ends to catch the drift ``(rel_path, size)`` structurally
+    CRC32-checksums every file on BOTH ends to catch the drift ``(rel_path, size)`` structurally
     can't see: a rebuild that rewrites a file's content at its OLD byte size. Slow (full cache
     read on both machines) — meant for a periodic/manual health check, not the hot GA path.
+    CRC32, not sha256: this is corruption/staleness detection, not a security boundary, so the
+    much faster non-cryptographic checksum is the right tradeoff at cache-wide scale.
 
     Returns ``{ok, missing, stale, content_mismatch, local_count, remote_count}`` — ``ok`` is
     True only when all three lists are empty.

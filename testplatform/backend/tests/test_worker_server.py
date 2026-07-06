@@ -74,10 +74,10 @@ def test_cache_manifest_with_hash(client, tmp_path, monkeypatch):
     monkeypatch.setattr(cache_sync, "CACHE_FOLDER", str(dst))
 
     r = client.get("/cache/manifest", headers=H)
-    assert r.status_code == 200 and "sha256" not in r.json()["files"][0]
+    assert r.status_code == 200 and "crc32" not in r.json()["files"][0]
 
     r = client.get("/cache/manifest", headers=H, params={"with_hash": "true"})
-    assert r.status_code == 200 and "sha256" in r.json()["files"][0]
+    assert r.status_code == 200 and "crc32" in r.json()["files"][0]
 
 
 def test_cache_prune_deletes_stale_leftovers(client, tmp_path, monkeypatch):

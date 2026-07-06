@@ -66,19 +66,19 @@ def test_diff_stale():
 def test_build_manifest_with_hash(tmp_path):
     _write(tmp_path / "a.parquet", b"same content")
     man = cache_sync.build_manifest(str(tmp_path), with_hash=True)
-    assert man["files"][0]["sha256"] == cache_sync._sha256_file(tmp_path / "a.parquet")
-    # without with_hash, no sha256 key at all (fast path unaffected)
+    assert man["files"][0]["crc32"] == cache_sync._crc32_file(tmp_path / "a.parquet")
+    # without with_hash, no crc32 key at all (fast path unaffected)
     man2 = cache_sync.build_manifest(str(tmp_path))
-    assert "sha256" not in man2["files"][0]
+    assert "crc32" not in man2["files"][0]
 
 
 def test_diff_content_mismatch_catches_same_size_different_content():
     # A rebuild rewrote the file at its OLD byte size — (rel_path, size) alone can't see this.
-    local = [{"rel_path": "screener/metric_store/ym=2024-01/part.parquet", "size": 100, "sha256": "new-hash"},
-             {"rel_path": "unchanged.parquet", "size": 50, "sha256": "same-hash"}]
+    local = [{"rel_path": "screener/metric_store/ym=2024-01/part.parquet", "size": 100, "crc32": 111},
+             {"rel_path": "unchanged.parquet", "size": 50, "crc32": 222}]
     remote = {"files": [
-        {"rel_path": "screener/metric_store/ym=2024-01/part.parquet", "size": 100, "sha256": "old-hash"},
-        {"rel_path": "unchanged.parquet", "size": 50, "sha256": "same-hash"},
+        {"rel_path": "screener/metric_store/ym=2024-01/part.parquet", "size": 100, "crc32": 999},
+        {"rel_path": "unchanged.parquet", "size": 50, "crc32": 222},
     ]}
     assert cache_sync.diff_content_mismatch(local, remote) == [
         "screener/metric_store/ym=2024-01/part.parquet"

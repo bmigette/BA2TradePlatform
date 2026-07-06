@@ -1,8 +1,10 @@
-"""Content-hash cache integrity check for configured remote workers.
+"""Content-checksum cache integrity check for configured remote workers.
 
-Slow by design: reads + sha256-hashes EVERY file in the master's cache and the worker's cache to
-catch the one drift (rel_path, size)-based sync can't see — a local rebuild that rewrites a file's
-content at its OLD byte size (e.g. the screener metric_store recomputing a column in place). This
+Slow-ish by design: reads + CRC32-checksums EVERY file in the master's cache and the worker's
+cache to catch the one drift (rel_path, size)-based sync can't see — a local rebuild that rewrites
+a file's content at its OLD byte size (e.g. the screener metric_store recomputing a column in
+place). CRC32, not a cryptographic hash: this is corruption/staleness detection over a possibly
+tens-of-GB cache, not a security boundary, so the much faster checksum is the right tradeoff. This
 is a periodic/manual gate, NOT the per-job pre-flight (that's the fast, size-only push_cache,
 already run automatically at the start of every optimization job).
 
@@ -10,7 +12,7 @@ Usage (test venv):
     ba2-venvs/test/Scripts/python.exe tools/cache_health_check.py [--worker NAME] [--fix]
 
 --fix removes anything `push_cache` already handles (missing + stale) via the normal push/prune,
-then force-repushes any CONTENT-MISMATCH file (same rel_path/size, different sha256) — the one
+then force-repushes any CONTENT-MISMATCH file (same rel_path/size, different crc32) — the one
 case `push_cache`'s size-only diff cannot detect or fix on its own.
 """
 import argparse
@@ -75,7 +77,7 @@ def main() -> int:
         print(f"  remote files: {res['remote_count']}")
         print(f"  missing (master has, worker doesn't/wrong size): {len(res['missing'])}")
         print(f"  stale   (worker has, master no longer does):     {len(res['stale'])}")
-        print(f"  content mismatch (same rel_path+size, different sha256): {len(res['content_mismatch'])}")
+        print(f"  content mismatch (same rel_path+size, different crc32): {len(res['content_mismatch'])}")
         for label in ("missing", "stale", "content_mismatch"):
             for rel in res[label][:5]:
                 print(f"    [{label}] {rel}")
