@@ -57,11 +57,6 @@ def alpaca_api_retry(func):
     return wrapper
 
 
-# Default TP/SL prices for OCO orders when user doesn't specify one
-# Using extreme values so the order essentially never triggers
-DEFAULT_TP_PRICE = 9999.0  # Very high TP - effectively "no TP"
-DEFAULT_SL_PRICE = 0.01    # Very low SL - effectively "no SL"
-
 
 class AlpacaAccount(AccountInterface, OptionsAccountInterface):
     """
@@ -2711,6 +2706,10 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 # Manual-override lock enforcement: if the user has locked a side,
                 # drop any non-manual update to that side BEFORE any work happens.
                 # Manual updates always pass through and also set/keep the lock.
+                # NOTE: a call with BOTH prices None from the start is a RECONCILE
+                # request — it falls through so the standing exit order gets rebuilt
+                # (or cancelled) to match the transaction's current TP/SL values.
+                requested_any = new_tp_price is not None or new_sl_price is not None
                 if source == "manual":
                     if new_tp_price is not None:
                         transaction_in_session.tp_manual_override = True
@@ -2729,23 +2728,40 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                             f"to ${new_sl_price:.2f} — SL is manually locked (current ${transaction_in_session.stop_loss})"
                         )
                         new_sl_price = None
-                    if new_tp_price is None and new_sl_price is None:
+                    if requested_any and new_tp_price is None and new_sl_price is None:
                         logger.debug(
                             f"Transaction {transaction.id}: all sides of {source or 'auto'} TP/SL "
                             f"adjustment are manually locked — nothing to do"
                         )
                         return True  # Not a failure — caller asked for changes that are blocked by policy
 
-                # 2. Early skip check: if values unchanged and valid orders exist WITH CORRECT PRICES, skip adjustment
-                tp_unchanged = (new_tp_price is None or 
-                               (transaction_in_session.take_profit is not None and 
+                # 2. Get entry order (first market/limit order for this transaction, not TP/SL)
+                entry_order = session.exec(
+                    select(TradingOrder).where(
+                        TradingOrder.transaction_id == transaction.id,
+                        TradingOrder.order_type.in_([
+                            CoreOrderType.MARKET,
+                            CoreOrderType.BUY_LIMIT,
+                            CoreOrderType.SELL_LIMIT
+                        ])
+                    ).order_by(TradingOrder.created_at)
+                ).first()
+
+                if not entry_order:
+                    logger.error(f"No entry order found for transaction {transaction.id}")
+                    return False
+
+                # 3. Early skip check: if values unchanged and the existing exit orders already
+                # have the right STRUCTURE (OCO vs plain limit vs plain stop) and prices, skip.
+                tp_unchanged = (new_tp_price is None or
+                               (transaction_in_session.take_profit is not None and
                                 abs(transaction_in_session.take_profit - new_tp_price) < 0.01))
-                sl_unchanged = (new_sl_price is None or 
-                               (transaction_in_session.stop_loss is not None and 
+                sl_unchanged = (new_sl_price is None or
+                               (transaction_in_session.stop_loss is not None and
                                 abs(transaction_in_session.stop_loss - new_sl_price) < 0.01))
-                
+
                 if tp_unchanged and sl_unchanged:
-                    # Check if we have valid (non-error/non-canceled) TP/SL orders WITH MATCHING PRICES
+                    target_spec = self._target_exit_spec(transaction_in_session, entry_order)
                     valid_tpsl_orders = session.exec(
                         select(TradingOrder).where(
                             TradingOrder.transaction_id == transaction.id,
@@ -2755,76 +2771,52 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                                 CoreOrderType.SELL_STOP, CoreOrderType.BUY_STOP
                             ]),
                             TradingOrder.status.notin_([
-                                OrderStatus.CANCELED, OrderStatus.EXPIRED, 
+                                OrderStatus.CANCELED, OrderStatus.EXPIRED,
                                 OrderStatus.ERROR, OrderStatus.REJECTED
                             ])
                         )
                     ).all()
-                    
-                    if valid_tpsl_orders:
-                        # Verify that existing orders have correct prices
-                        orders_have_correct_prices = True
-                        for order in valid_tpsl_orders:
-                            if order.order_type == CoreOrderType.OCO:
-                                # OCO order has both TP (limit_price) and SL (stop_price)
-                                if new_tp_price is not None and order.limit_price is not None:
-                                    if abs(order.limit_price - new_tp_price) >= 0.01:
-                                        logger.debug(f"OCO order {order.id} has TP=${order.limit_price:.2f}, expected ${new_tp_price:.2f}")
-                                        orders_have_correct_prices = False
-                                        break
-                                if new_sl_price is not None and order.stop_price is not None:
-                                    if abs(order.stop_price - new_sl_price) >= 0.01:
-                                        logger.debug(f"OCO order {order.id} has SL=${order.stop_price:.2f}, expected ${new_sl_price:.2f}")
-                                        orders_have_correct_prices = False
-                                        break
-                            elif order.order_type in [CoreOrderType.SELL_LIMIT, CoreOrderType.BUY_LIMIT]:
-                                # Limit order is TP
-                                if new_tp_price is not None and order.limit_price is not None:
-                                    if abs(order.limit_price - new_tp_price) >= 0.01:
-                                        logger.debug(f"TP order {order.id} has price=${order.limit_price:.2f}, expected ${new_tp_price:.2f}")
-                                        orders_have_correct_prices = False
-                                        break
-                            elif order.order_type in [CoreOrderType.SELL_STOP, CoreOrderType.BUY_STOP]:
-                                # Stop order is SL
-                                if new_sl_price is not None and order.stop_price is not None:
-                                    if abs(order.stop_price - new_sl_price) >= 0.01:
-                                        logger.debug(f"SL order {order.id} has price=${order.stop_price:.2f}, expected ${new_sl_price:.2f}")
-                                        orders_have_correct_prices = False
-                                        break
-                        
-                        if orders_have_correct_prices:
+
+                    if target_spec is None:
+                        if not valid_tpsl_orders:
                             logger.info(f"Skipping TP/SL adjustment for transaction {transaction.id}: "
-                                       f"values unchanged and {len(valid_tpsl_orders)} valid order(s) already exist with correct prices")
+                                       f"no TP/SL set and no exit orders exist")
+                            return True
+                        # else: fall through to cancel the leftover exit orders
+                    elif valid_tpsl_orders:
+                        target_type, want_tp, want_sl, _ = target_spec
+                        orders_match = True
+                        for order in valid_tpsl_orders:
+                            if order.order_type != target_type:
+                                logger.debug(f"Exit order {order.id} is {order.order_type}, target structure is {target_type}")
+                                orders_match = False
+                                break
+                            if want_tp is not None and (order.limit_price is None or abs(order.limit_price - want_tp) >= 0.01):
+                                logger.debug(f"Exit order {order.id} has TP={order.limit_price}, expected ${want_tp:.2f}")
+                                orders_match = False
+                                break
+                            if want_sl is not None and (order.stop_price is None or abs(order.stop_price - want_sl) >= 0.01):
+                                logger.debug(f"Exit order {order.id} has SL={order.stop_price}, expected ${want_sl:.2f}")
+                                orders_match = False
+                                break
+
+                        if orders_match:
+                            logger.info(f"Skipping TP/SL adjustment for transaction {transaction.id}: "
+                                       f"values unchanged and {len(valid_tpsl_orders)} valid order(s) already exist with correct structure and prices")
                             return True
                         else:
                             logger.info(f"Proceeding with TP/SL adjustment for transaction {transaction.id}: "
-                                       f"existing orders have incorrect prices")
-                
-                # 2. Update transaction (source of truth)
+                                       f"existing orders have wrong structure or prices")
+
+                # 4. Update transaction (source of truth)
                 if new_tp_price is not None:
                     transaction_in_session.take_profit = new_tp_price
                 if new_sl_price is not None:
                     transaction_in_session.stop_loss = new_sl_price
                 session.add(transaction_in_session)
                 session.commit()
-                
-                # 3. Get entry order (first market/limit order for this transaction, not TP/SL)
-                entry_order = session.exec(
-                    select(TradingOrder).where(
-                        TradingOrder.transaction_id == transaction.id,
-                        TradingOrder.order_type.in_([
-                            CoreOrderType.MARKET, 
-                            CoreOrderType.BUY_LIMIT, 
-                            CoreOrderType.SELL_LIMIT
-                        ])
-                    ).order_by(TradingOrder.created_at)
-                ).first()
-                
-                if not entry_order:
-                    logger.error(f"No entry order found for transaction {transaction.id}")
-                    return False
-                
-                # 3. Find existing TP/SL/OCO orders
+
+                # 5. Find existing exit orders (everything non-terminal that isn't the entry)
                 all_orders = session.exec(
                     select(TradingOrder).where(
                         TradingOrder.transaction_id == transaction.id,
@@ -2832,61 +2824,31 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                         TradingOrder.id != entry_order.id
                     )
                 ).all()
-                
-                existing_tp = None
-                existing_sl = None
-                existing_oco = None
-                
-                for order in all_orders:
-                    if order.order_type == CoreOrderType.OCO and order.limit_price and order.stop_price:
-                        existing_oco = order
-                    elif self._is_tp_order(order, entry_order):
-                        existing_tp = order
-                    elif self._is_sl_order(order, entry_order):
-                        existing_sl = order
-                
-                # ALWAYS use OCO orders - apply defaults if TP or SL not specified
-                # This simplifies order management: always replace OCO, never manage separate orders
-                effective_tp = transaction_in_session.take_profit if (transaction_in_session.take_profit and transaction_in_session.take_profit > 0) else DEFAULT_TP_PRICE
-                effective_sl = transaction_in_session.stop_loss if (transaction_in_session.stop_loss and transaction_in_session.stop_loss > 0) else DEFAULT_SL_PRICE
-                
-                # Always need OCO since we always have both TP and SL (with defaults)
-                need_oco = True
-                
+
+                # 6. Decide target structure from what's actually set (see _target_exit_spec):
+                # both -> OCO, TP-only -> plain limit, SL-only -> plain stop, neither -> no exit order.
+                spec = self._target_exit_spec(transaction_in_session, entry_order)
+
+                spec_desc = f"{spec[0].value} TP={spec[1]} SL={spec[2]}" if spec else "none (cancel exits)"
                 logger.debug(f"Entry order {entry_order.id} status: {entry_order.status}, "
-                           f"existing_tp: {existing_tp.id if existing_tp else None}, "
-                           f"existing_sl: {existing_sl.id if existing_sl else None}, "
-                           f"existing_oco: {existing_oco.id if existing_oco else None}, "
-                           f"effective_tp: ${effective_tp:.2f}, effective_sl: ${effective_sl:.2f}")
-                
-                # 4. Determine action based on entry order state
+                           f"existing exit orders: {[o.id for o in all_orders]}, "
+                           f"target exit structure: {spec_desc}")
+
+                # 7. Determine action based on entry order state
                 result = False
-                if entry_order.status in OrderStatus.get_unsent_statuses():
-                    # Entry not sent to broker yet - create/update pending orders
-                    result = self._handle_pending_entry_tpsl_oco(
-                        session, transaction_in_session, entry_order, 
-                        effective_tp, effective_sl,
-                        existing_tp, existing_sl, existing_oco
+                if entry_order.status in (OrderStatus.get_unsent_statuses() | OrderStatus.get_unfilled_statuses()):
+                    # Entry not filled yet - maintain a WAITING_TRIGGER exit order that
+                    # fires when the entry fills
+                    result = self._handle_unfilled_entry_exit(
+                        session, transaction_in_session, entry_order, spec, all_orders
                     )
-                
-                elif entry_order.status in OrderStatus.get_unfilled_statuses():
-                    # Entry sent to broker but not filled yet - create triggered orders (OTO/OCO)
-                    result = self._handle_submitted_entry_tpsl_oco(
-                        session, transaction_in_session, entry_order,
-                        effective_tp, effective_sl,
-                        existing_tp, existing_sl, existing_oco,
-                        all_orders
-                    )
-                
+
                 elif entry_order.status in OrderStatus.get_executed_statuses():
                     # Entry filled - work with broker
-                    result = self._handle_filled_entry_tpsl_oco(
-                        session, transaction_in_session, entry_order,
-                        effective_tp, effective_sl,
-                        existing_tp, existing_sl, existing_oco,
-                        all_orders
+                    result = self._handle_filled_entry_exit(
+                        session, transaction_in_session, entry_order, spec, all_orders
                     )
-                
+
                 else:
                     logger.warning(f"Entry order {entry_order.id} in unexpected state: {entry_order.status.value}")
                     result = False
@@ -3388,101 +3350,36 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
     # These simplified handlers ALWAYS use OCO orders with default TP/SL values
     # This eliminates the complexity of managing separate limit/stop orders
     
-    def _handle_pending_entry_tpsl_oco(
+    def _handle_unfilled_entry_exit(
         self,
         session: Session,
         transaction: Transaction,
         entry_order: TradingOrder,
-        effective_tp: float,
-        effective_sl: float,
-        existing_tp: TradingOrder | None,
-        existing_sl: TradingOrder | None,
-        existing_oco: TradingOrder | None
-    ) -> bool:
-        """Handle TP/SL adjustment when entry order is pending - ALWAYS uses OCO."""
-        
-        logger.info(f"[OCO-Only] Creating/updating pending OCO order for transaction {transaction.id}: TP=${effective_tp:.2f}, SL=${effective_sl:.2f}")
-        
-        # Cancel any separate TP/SL orders - we only use OCO now
-        if existing_tp:
-            existing_tp.status = OrderStatus.CANCELED
-            session.add(existing_tp)
-            logger.info(f"Cancelled separate TP order {existing_tp.id} - switching to OCO-only")
-        if existing_sl:
-            existing_sl.status = OrderStatus.CANCELED
-            session.add(existing_sl)
-            logger.info(f"Cancelled separate SL order {existing_sl.id} - switching to OCO-only")
-        
-        if existing_oco:
-            # Update existing OCO order
-            existing_oco.limit_price = effective_tp
-            existing_oco.stop_price = effective_sl
-            session.add(existing_oco)
-            session.commit()
-            logger.info(f"Updated pending OCO order {existing_oco.id}: TP=${effective_tp:.2f}, SL=${effective_sl:.2f}")
-        else:
-            # Create new OCO order
-            oco_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
-            oco_comment = self._generate_tpsl_comment("TPSL", self.id, transaction.id, entry_order.id)
-            
-            oco_order = TradingOrder(
-                account_id=self.id,
-                symbol=entry_order.symbol,
-                quantity=entry_order.quantity,
-                side=oco_side,
-                order_type=CoreOrderType.OCO,
-                limit_price=effective_tp,
-                stop_price=effective_sl,
-                transaction_id=transaction.id,
-                status=OrderStatus.WAITING_TRIGGER,  # Dependent order should wait for trigger
-                depends_on_order=entry_order.id,
-                depends_order_status_trigger=OrderStatus.FILLED,
-                open_type=OrderOpenType.AUTOMATIC,
-                comment=oco_comment,
-                data={
-                    "tp_percent_target": self._calculate_tp_percent(entry_order, effective_tp) if effective_tp != DEFAULT_TP_PRICE else 0,
-                    "sl_percent_target": self._calculate_sl_percent(entry_order, effective_sl) if effective_sl != DEFAULT_SL_PRICE else 0,
-                    "is_default_tp": effective_tp == DEFAULT_TP_PRICE,
-                    "is_default_sl": effective_sl == DEFAULT_SL_PRICE
-                },
-                created_at=datetime.now(timezone.utc)
-            )
-            session.add(oco_order)
-            session.commit()
-            logger.info(f"Created pending OCO order {oco_order.id}: TP=${effective_tp:.2f}, SL=${effective_sl:.2f}")
-        
-        return True
-    
-    def _handle_submitted_entry_tpsl_oco(
-        self,
-        session: Session,
-        transaction: Transaction,
-        entry_order: TradingOrder,
-        effective_tp: float,
-        effective_sl: float,
-        existing_tp: TradingOrder | None,
-        existing_sl: TradingOrder | None,
-        existing_oco: TradingOrder | None,
+        spec: tuple | None,
         all_orders: list
     ) -> bool:
-        """Handle TP/SL adjustment when entry is submitted but not filled - ALWAYS uses OCO."""
-        
-        logger.info(f"[OCO-Only] Creating triggered OCO order for submitted entry {entry_order.id}: TP=${effective_tp:.2f}, SL=${effective_sl:.2f}")
-        
-        # Cancel ALL existing TP/SL/OCO orders
-        orders_to_cancel = []
-        if existing_tp:
-            orders_to_cancel.append(existing_tp)
-        if existing_sl:
-            orders_to_cancel.append(existing_sl)
-        if existing_oco:
-            orders_to_cancel.append(existing_oco)
-        
+        """Handle TP/SL adjustment while the entry order is not filled yet
+        (unsent OR submitted-but-unfilled).
+
+        Maintains at most ONE exit order in WAITING_TRIGGER state that fires when
+        the entry fills, shaped by the target spec (OCO / plain limit / plain stop).
+        spec=None means no TP and no SL -> no exit order at all.
+        """
+        spec_desc = f"{spec[0].value} TP={spec[1]} SL={spec[2]}" if spec else "none"
+        logger.info(f"[Exit] Maintaining exit order for unfilled entry {entry_order.id} "
+                    f"(transaction {transaction.id}): target {spec_desc}")
+
+        # Keep one existing DB-only WAITING_TRIGGER order if it already has the
+        # target type (update prices in place); cancel everything else.
+        keep: TradingOrder | None = None
         for order in all_orders:
-            if order not in orders_to_cancel:
-                orders_to_cancel.append(order)
-        
-        for order in orders_to_cancel:
+            if (spec and keep is None
+                    and order.order_type == spec[0]
+                    and order.status == OrderStatus.WAITING_TRIGGER
+                    and not order.broker_order_id
+                    and order.depends_on_order == entry_order.id):
+                keep = order
+                continue
             if order.broker_order_id:
                 try:
                     self.cancel_order(order.id)
@@ -3493,73 +3390,57 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 order.status = OrderStatus.CANCELED
                 session.add(order)
         session.commit()
-        
-        # Create triggered OCO order
-        oco_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
-        oco_comment = self._generate_tpsl_comment("TPSL", self.id, transaction.id, entry_order.id)
-        
-        oco_order = TradingOrder(
-            account_id=self.id,
-            symbol=entry_order.symbol,
-            quantity=entry_order.quantity,
-            side=oco_side,
-            order_type=CoreOrderType.OCO,
-            limit_price=effective_tp,
-            stop_price=effective_sl,
-            transaction_id=transaction.id,
-            status=OrderStatus.WAITING_TRIGGER,
-            depends_on_order=entry_order.id,
-            depends_order_status_trigger=OrderStatus.FILLED,
-            open_type=OrderOpenType.AUTOMATIC,
-            comment=oco_comment,
-            data={
-                "tp_percent_target": self._calculate_tp_percent(entry_order, effective_tp) if effective_tp != DEFAULT_TP_PRICE else 0,
-                "sl_percent_target": self._calculate_sl_percent(entry_order, effective_sl) if effective_sl != DEFAULT_SL_PRICE else 0,
-                "is_default_tp": effective_tp == DEFAULT_TP_PRICE,
-                "is_default_sl": effective_sl == DEFAULT_SL_PRICE
-            },
-            created_at=datetime.now(timezone.utc)
-        )
-        session.add(oco_order)
-        session.commit()
-        logger.info(f"Created triggered OCO order {oco_order.id} waiting for entry {entry_order.id} to fill")
-        
+
+        if spec is None:
+            logger.info(f"No TP/SL set for transaction {transaction.id} — no exit order created")
+            return True
+
+        order_type, tp_price, sl_price, label = spec
+        if keep:
+            keep.limit_price = tp_price
+            keep.stop_price = sl_price
+            session.add(keep)
+            session.commit()
+            logger.info(f"Updated pending {order_type.value} exit order {keep.id}: TP={tp_price}, SL={sl_price}")
+        else:
+            exit_order = self._build_exit_order(
+                transaction, entry_order, spec,
+                quantity=entry_order.quantity,
+                depends_on=entry_order.id,
+                trigger_status=OrderStatus.FILLED
+            )
+            session.add(exit_order)
+            session.commit()
+            logger.info(f"Created pending {order_type.value} exit order {exit_order.id} "
+                        f"waiting for entry {entry_order.id} to fill: TP={tp_price}, SL={sl_price}")
+
         return True
-    
-    def _handle_filled_entry_tpsl_oco(
+
+    def _handle_filled_entry_exit(
         self,
         session: Session,
         transaction: Transaction,
         entry_order: TradingOrder,
-        effective_tp: float,
-        effective_sl: float,
-        existing_tp: TradingOrder | None,
-        existing_sl: TradingOrder | None,
-        existing_oco: TradingOrder | None,
+        spec: tuple | None,
         all_orders: list
     ) -> bool:
-        """Handle TP/SL adjustment when entry is filled - ALWAYS uses OCO at broker.
+        """Handle TP/SL adjustment when entry is filled - maintain the target exit
+        structure at the broker (OCO / plain limit / plain stop / none).
 
-        When an existing live broker order needs to be replaced, we don't
-        submit the new OCO inline (Alpaca would reject with 'insufficient qty
-        / held_for_orders' until the cancel fully clears). Instead we create
-        the new OCO in WAITING_TRIGGER state linked to the cancellation of the
+        When an existing live broker order needs to be replaced, we don't submit
+        the new exit order inline (Alpaca would reject with 'insufficient qty /
+        held_for_orders' until the cancel fully clears). Instead we create the
+        new order in WAITING_TRIGGER state linked to the cancellation of the
         outgoing order — TradeManager will submit it on the next refresh once
         the parent reaches CANCELED.
         """
-        logger.info(f"[OCO-Only] Adjusting broker OCO for filled entry {entry_order.id}: TP=${effective_tp:.2f}, SL=${effective_sl:.2f}")
+        spec_desc = f"{spec[0].value} TP={spec[1]} SL={spec[2]}" if spec else "none"
+        logger.info(f"[Exit] Adjusting broker exit order for filled entry {entry_order.id} "
+                    f"(transaction {transaction.id}): target {spec_desc}")
 
-        # Gather all existing TP/SL/OCO orders that need to go away
-        existing_set: list[TradingOrder] = []
-        for o in (existing_tp, existing_sl, existing_oco):
-            if o is not None and o not in existing_set:
-                existing_set.append(o)
-        for order in all_orders:
-            if order is not entry_order and order not in existing_set:
-                existing_set.append(order)
-
-        # Split into "live at broker" vs "DB-only / already terminal"
+        # Split existing exit orders into "live at broker" vs "DB-only / already terminal"
         terminal_statuses = OrderStatus.get_terminal_statuses()
+        existing_set = [o for o in all_orders if o is not entry_order]
         live_broker_orders = [
             o for o in existing_set
             if o.broker_order_id and o.status not in terminal_statuses
@@ -3574,44 +3455,51 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         if db_only_orders:
             session.commit()
 
-        # 2. No live broker order — straight path, submit immediately
-        if not live_broker_orders:
-            return self._create_broker_oco_order(session, transaction, entry_order, effective_tp, effective_sl)
+        # 2. No TP and no SL -> just cancel whatever is live; no standing exit order.
+        #    (A leftover placeholder SELL would wash-trade-block new BUYs on the symbol.)
+        if spec is None:
+            for order in live_broker_orders:
+                try:
+                    self.cancel_order(order.id)
+                    logger.info(f"Cancelled broker exit order {order.id} — transaction has no TP/SL")
+                except Exception as e:
+                    logger.warning(f"Failed to cancel broker order {order.id}: {e}")
+            return True
 
-        # 3. Live broker order(s) — chain the new OCO behind the cancellation
+        order_type, tp_price, sl_price, label = spec
+
+        # 3. No live broker order — straight path, submit immediately
+        if not live_broker_orders:
+            if order_type == CoreOrderType.OCO:
+                return self._create_broker_oco_order(session, transaction, entry_order, tp_price, sl_price)
+            elif tp_price:
+                return self._create_broker_tp_order(session, transaction, entry_order, tp_price)
+            else:
+                return self._create_broker_sl_order(session, transaction, entry_order, sl_price)
+
+        # 4. Live broker order(s) — chain the new exit order behind the cancellation
         #    of the most recent (highest-id) live order, then cancel all live
-        #    orders. TradeManager's _check_order_status_changes_and_trigger_dependents
-        #    will submit the new OCO once that parent reaches CANCELED.
+        #    orders. TradeManager's _check_all_waiting_trigger_orders will submit
+        #    the new order once that parent reaches CANCELED.
         live_broker_orders.sort(key=lambda o: o.id, reverse=True)
         parent_for_trigger = live_broker_orders[0]
 
         order_quantity = transaction.quantity
         if not order_quantity or order_quantity <= 0:
-            logger.error(f"Cannot stage replacement OCO for transaction {transaction.id}: invalid quantity {order_quantity}")
+            logger.error(f"Cannot stage replacement exit order for transaction {transaction.id}: invalid quantity {order_quantity}")
             return False
 
-        new_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
-        comment = self._generate_tpsl_comment("TPSL", self.id, transaction.id, entry_order.id)
-        waiting_oco = TradingOrder(
-            account_id=self.id,
-            symbol=entry_order.symbol,
+        waiting_exit = self._build_exit_order(
+            transaction, entry_order, spec,
             quantity=order_quantity,
-            side=new_side,
-            order_type=CoreOrderType.OCO,
-            limit_price=effective_tp,
-            stop_price=effective_sl,
-            transaction_id=transaction.id,
-            status=OrderStatus.WAITING_TRIGGER,
-            depends_on_order=parent_for_trigger.id,
-            depends_order_status_trigger=OrderStatus.CANCELED,
-            open_type=OrderOpenType.AUTOMATIC,
-            comment=comment + f" (chained on cancel of {parent_for_trigger.id})",
-            created_at=datetime.now(timezone.utc),
+            depends_on=parent_for_trigger.id,
+            trigger_status=OrderStatus.CANCELED,
+            comment_suffix=f" (chained on cancel of {parent_for_trigger.id})"
         )
-        session.add(waiting_oco)
+        session.add(waiting_exit)
         session.commit()
         logger.info(
-            f"Staged replacement OCO {waiting_oco.id} (WAITING_TRIGGER) for "
+            f"Staged replacement {order_type.value} exit order {waiting_exit.id} (WAITING_TRIGGER) for "
             f"transaction {transaction.id} — will submit when order {parent_for_trigger.id} "
             f"reaches CANCELED at broker"
         )
@@ -3625,8 +3513,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 logger.warning(f"Failed to cancel broker order {order.id}: {e}")
 
         return True
-    
-    # ==================== END OCO-ONLY HANDLERS ====================
+
+    # ==================== END EXIT-ORDER HANDLERS ====================
     
     def adjust_tp(self, transaction: Transaction, new_tp_price: float, source: str = "") -> bool:
         """
@@ -3894,7 +3782,77 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             return self.get_instrument_current_price(entry_order.symbol)
         except Exception:
             return None
-    
+
+    def _target_exit_spec(self, transaction: Transaction, entry_order: TradingOrder):
+        """Decide which exit-order structure a transaction needs at the broker.
+
+        Exactly one standing exit order per position, shaped by what is actually set:
+          - TP and SL set  -> OCO (limit leg = TP, stop leg = SL)
+          - TP only        -> plain limit order (no stop leg)
+          - SL only        -> plain stop order (no limit leg)
+          - neither        -> None (no standing exit order at all)
+
+        Alpaca's OCO requires BOTH legs, and a placeholder leg is not an option:
+        besides price-reasonability rejections on far-away limits, any standing
+        SELL blocks new BUY orders on the same symbol with a wash-trade rejection
+        (code 40310000) — so a position without TP/SL must have no resting exit
+        order at the broker.
+
+        Returns (order_type, limit_price, stop_price, comment_label) or None.
+        """
+        has_tp = transaction.take_profit is not None and transaction.take_profit > 0
+        has_sl = transaction.stop_loss is not None and transaction.stop_loss > 0
+        exit_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
+        if has_tp and has_sl:
+            return (CoreOrderType.OCO, transaction.take_profit, transaction.stop_loss, "TPSL")
+        if has_tp:
+            order_type = CoreOrderType.SELL_LIMIT if exit_side == OrderDirection.SELL else CoreOrderType.BUY_LIMIT
+            return (order_type, transaction.take_profit, None, "TP")
+        if has_sl:
+            order_type = CoreOrderType.SELL_STOP if exit_side == OrderDirection.SELL else CoreOrderType.BUY_STOP
+            return (order_type, None, transaction.stop_loss, "SL")
+        return None
+
+    def _build_exit_order(
+        self,
+        transaction: Transaction,
+        entry_order: TradingOrder,
+        spec: tuple,
+        quantity: float,
+        depends_on: int,
+        trigger_status: OrderStatus,
+        comment_suffix: str = ""
+    ) -> TradingOrder:
+        """Build (not persist) a WAITING_TRIGGER exit order for the given spec."""
+        order_type, tp_price, sl_price, label = spec
+        exit_side = OrderDirection.SELL if entry_order.side == OrderDirection.BUY else OrderDirection.BUY
+        comment = self._generate_tpsl_comment(label, self.id, transaction.id, entry_order.id) + comment_suffix
+        data = {}
+        if tp_price:
+            data["tp_percent_target"] = self._calculate_tp_percent(entry_order, tp_price)
+        if sl_price:
+            data["sl_percent_target"] = self._calculate_sl_percent(entry_order, sl_price)
+        ref_price = self._tpsl_reference_price(entry_order)
+        if ref_price:
+            data["tpsl_reference_price"] = ref_price
+        return TradingOrder(
+            account_id=self.id,
+            symbol=entry_order.symbol,
+            quantity=quantity,
+            side=exit_side,
+            order_type=order_type,
+            limit_price=tp_price,
+            stop_price=sl_price,
+            transaction_id=transaction.id,
+            status=OrderStatus.WAITING_TRIGGER,
+            depends_on_order=depends_on,
+            depends_order_status_trigger=trigger_status,
+            open_type=OrderOpenType.AUTOMATIC,
+            comment=comment,
+            data=data,
+            created_at=datetime.now(timezone.utc)
+        )
+
     def _create_broker_oco_order(self, session: Session, transaction: Transaction, entry_order: TradingOrder, tp_price: float, sl_price: float) -> bool:
         """Create new OCO order at broker with both TP and SL."""
         try:
