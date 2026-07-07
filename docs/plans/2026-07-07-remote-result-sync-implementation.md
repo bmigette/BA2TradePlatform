@@ -800,7 +800,7 @@ def test_push_optimization_syncs_parent_strategy_first(db):
     db.commit()
     opt = StrategyOptimization(
         name="opt1", strategy_id=strat.id, created_at=datetime.now(timezone.utc),
-        status="running",
+        status="running", fitness_metric="sharpe", optimization_type="genetic",
     )
     db.add(opt)
     db.commit()
@@ -825,12 +825,14 @@ def test_push_backtest_syncs_both_parents(db):
     db.commit()
     opt = StrategyOptimization(
         name="opt1", strategy_id=strat.id, created_at=datetime.now(timezone.utc), status="completed",
+        fitness_metric="sharpe", optimization_type="genetic",
     )
     db.add(opt)
     db.commit()
     bt = Backtest(
         name="TOP1-opt1", engine_type="daily_expert", strategy_id=strat.id, optimization_id=opt.id,
         created_at=datetime.now(timezone.utc),
+        start_date=datetime(2024, 1, 1), end_date=datetime(2024, 6, 1),
     )
     db.add(bt)
     db.commit()
