@@ -2019,6 +2019,7 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
         #    matrix job as soon as the last one lands. Fan the re-runs across a bounded local process
         #    pool when parallel > 1; else run in-process.
         from app.services.strategy_optimization_handler import _persist_trial_worker
+        from app.services.sync_client import push_backtest
 
         def _persist_one(rank, trial_cfg, strategy_params, out) -> bool:
             if not out or not out.get("ok"):
@@ -2038,6 +2039,7 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
             bt.status = "completed"; bt.completed_at = _dt.now()
             bt.is_saved = True  # top performers of a job are kept
             db.commit()
+            push_backtest(bt, db)
             return True
 
         persisted = 0
