@@ -1,0 +1,72 @@
+name: parity-and-coverage
+
+# Continuous live<->backtest PARITY GATE (Phase 5 of the engine-unification plan) + a coverage
+# artifact for the shared decision path. The golden parity test replays recorded live decisions
+# through the backtest engine and asserts decision identity; wiring it here makes any change that
+# breaks live<->backtest parity fail the build.
+#
+# IMPORTANT: this installs ba2_common/ba2_providers/ba2_experts from the MONOREPO (packages/*),
+# NOT the stale sibling repos that testplatform/backend/requirements.txt lines 6-8 reference. The
+# canonical-import guard step fails fast if the wrong tree ever gets installed.
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [dev, main]
+
+jobs:
+  parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install monorepo packages (canonical, not the stale siblings)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e packages/common -e packages/providers -e packages/experts
+          # Backend runtime deps EXCEPT the stale-sibling editable installs (lines that point at
+          # ../../BA2Trade*): those are replaced by the packages/* installs above.
+          grep -vE '^\s*-e\s+\.\./\.\./BA2Trade' testplatform/backend/requirements.txt > /tmp/be-reqs.txt || true
+          pip install -r /tmp/be-reqs.txt
+          pip install pytest pytest-cov coverage
+
+      - name: Guard — ba2_common resolves to the monorepo (not the stale sibling)
+        run: |
+          python -c "import ba2_common, os; p = os.path.realpath(ba2_common.__file__); assert 'packages/common' in p, p; print('canonical ba2_common:', p)"
+
+      - name: PARITY GATE — golden live↔backtest decision identity (blocking)
+        working-directory: testplatform/backend
+        # test_golden_fixture_is_committed asserts (not skips) when the committed fixture is missing,
+        # and the parity tests carry no skipif — so a broken/missing fixture FAILS here (non-zero exit
+        # fails the job). No junit skip-parsing needed.
+        run: python -m pytest tests/backtest/test_parity_golden.py -v -p no:cacheprovider
+
+      - name: Backtest engine + shared decision suite (blocking)
+        working-directory: testplatform/backend
+        run: python -m pytest tests/backtest -q
+
+      - name: Shared decision-path branch coverage (artifact, non-blocking)
+        working-directory: testplatform/backend
+        continue-on-error: true
+        run: |
+          python -m pytest tests/backtest \
+            --cov=ba2_common.core.TradeActionEvaluator \
+            --cov=ba2_common.core.TradeActions \
+            --cov=ba2_common.core.TradeConditions \
+            --cov=ba2_common.core.TradeRiskManagement \
+            --cov=ba2_common.core.position_sizing \
+            --cov-branch --cov-report=xml:coverage-decision.xml --cov-report=term-missing
+
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-decision
+          path: testplatform/backend/coverage-decision.xml
+          if-no-files-found: ignore

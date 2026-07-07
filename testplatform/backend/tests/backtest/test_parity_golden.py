@@ -23,14 +23,19 @@ from __future__ import annotations
 
 import os
 
-import pytest
-
 from app.services.backtest.parity_harness import default_fixture, run_parity
 
 _FIXTURE = default_fixture(13)  # live instance 13 = FMPRating, classic-RM, enter ruleset 10
 
 
-@pytest.mark.skipif(not os.path.exists(_FIXTURE), reason="parity fixture not captured")
+def test_golden_fixture_is_committed():
+    # The fixture is git-tracked, so its ABSENCE is a real CI failure — not a skip. This makes the
+    # parity gate blocking: a broken/missing fixture (or import) cannot silently pass CI green.
+    assert os.path.exists(_FIXTURE), (
+        f"committed golden parity fixture missing: {_FIXTURE} — re-capture with "
+        f"tools/capture_live_parity_fixture.py")
+
+
 def test_golden_live_backtest_entry_parity():
     report = run_parity(_FIXTURE)
     print("\n" + report.summary())
@@ -50,7 +55,6 @@ def test_golden_live_backtest_entry_parity():
     assert report.ok
 
 
-@pytest.mark.skipif(not os.path.exists(_FIXTURE), reason="parity fixture not captured")
 def test_golden_expert_is_classic_rm_in_scope():
     # Sanity: the golden fixture is an in-scope (classic-RM) expert, per the locked parity scope.
     report = run_parity(_FIXTURE)
