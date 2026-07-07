@@ -48,10 +48,12 @@ import numpy as np
 
 from ba2_common.core.backtest_context import BacktestContext, LiveProviderBundle
 from ba2_common.core.db import add_instance, get_instance
-from ba2_common.core.models import ExpertRecommendation, Transaction
+from ba2_common.core.models import ExpertRecommendation, TradingOrder, Transaction
 from ba2_common.core.types import (
     OrderDirection,
     OrderRecommendation,
+    OrderStatus,
+    OrderType,
     RiskLevel,
     TimeHorizon,
     TransactionStatus,
@@ -608,11 +610,12 @@ class DailyBacktestEngine:
                         self._run_bypass_expert_bar(expert, expert_id, settings, as_of_dt)
                     continue
                 if entry_ok:
-                    created_any = self._run_expert_bar(
+                    # _run_expert_bar now self-sizes + submits equity entries via the temp-list flow
+                    # (_size_and_submit_candidates) — only funded orders are persisted + submitted, so
+                    # there is no separate _size_and_submit DB pass over qty=0 rows here anymore.
+                    self._run_expert_bar(
                         expert, expert_id, settings, ruleset_id, entry_universe, as_of_dt
                     )
-                    if created_any:
-                        self._size_and_submit(expert_id, indicator_provider, as_of_dt)
 
                 # Manage EXISTING positions through the OPEN_POSITIONS ruleset (real RM/evaluator) on
                 # the MANAGE cadence — identical to live. Adjust-TP/SL/Close/Sell per the exit
@@ -779,6 +782,11 @@ class DailyBacktestEngine:
 
         providers = self._provider_bundle()
         created_any = False
+        # TEMP-ORDER-LIST FLOW (equity entries): instead of persisting a qty=0 PENDING order per
+        # passing symbol and letting the RM size + DELETE the unfunded (churn), we build a transient
+        # candidate per passing symbol, size them ALL in one in-memory RM pass, then persist + submit
+        # ONLY the funded ones. Each entry: (transient_candidate_order, evaluator, symbol, recommendation).
+        equity_candidates: List[Any] = []
 
         for symbol in universe:
             # The per-symbol expert decision: ``analyze_as_of`` -> ``_gather`` reads
@@ -869,15 +877,36 @@ class DailyBacktestEngine:
                                   f"@ {as_of:%Y-%m-%d} — {equity_reason}")
                         continue
 
-                # Equity entry: create PENDING qty=0 orders (NOT submitted; RM sizes + submits
-                # next). Option entry: the option action sizes + submits ITSELF, so submit
-                # directly (like the open-positions path) — there is no equity leg.
-                results = evaluator.execute(submit_to_broker=self._entry_is_option)
-                if any(r.get("success") and (r.get("data") or {}).get("order_id") for r in results):
-                    created_any = True
+                if self._entry_is_option:
+                    # OPTION entry: the option action sizes + submits ITSELF in execute (no equity
+                    # leg, no RM candidate sizing) — submit directly, like the open-positions path.
+                    results = evaluator.execute(submit_to_broker=True)
+                    if any(r.get("success") and (r.get("data") or {}).get("order_id") for r in results):
+                        created_any = True
+                    continue
+
+                # EQUITY entry: stage a TRANSIENT candidate (NOT persisted) for the temp-list RM
+                # pass. Side comes from the recommendation direction (bullish -> buy, bearish ->
+                # sell short-entry), matching which order-creating action the ruleset fired.
+                side = (OrderDirection.SELL
+                        if recommendation.recommended_action in (OrderRecommendation.SELL,
+                                                                 OrderRecommendation.UNDERWEIGHT)
+                        else OrderDirection.BUY)
+                candidate = TradingOrder(
+                    account_id=self.account.id, symbol=symbol, quantity=0.0, side=side,
+                    order_type=OrderType.MARKET, status=OrderStatus.PENDING,
+                    expert_recommendation_id=recommendation.id, data=(recommendation.data or None))
+                equity_candidates.append((candidate, evaluator, symbol, recommendation))
             except Exception as e:  # noqa: BLE001
                 self._log(f"ruleset eval/execute failed for {symbol} @ {as_of:%Y-%m-%d}: {e}")
                 continue
+
+        # Temp-list RM sizing for the bar's equity candidates: size ALL in one in-memory pass, then
+        # persist + submit ONLY the funded (qty>0). Unfunded candidates are never written to the DB
+        # (no qty=0 churn, no delete) — the requested order-flow redesign.
+        if equity_candidates:
+            created_any = self._size_and_submit_candidates(
+                expert_id, equity_candidates, as_of) or created_any
 
         return created_any
 
@@ -1238,6 +1267,65 @@ class DailyBacktestEngine:
                 except Exception as e:  # noqa: BLE001
                     self._log(f"submit_order failed for order {order.id}: {e}")
 
+    def _size_and_submit_candidates(self, expert_id: int, candidates: List[Any],
+                                    as_of: datetime) -> bool:
+        """Temp-order-list entry flow: size the bar's TRANSIENT equity candidates in ONE in-memory
+        RM pass, then persist + submit ONLY the funded ones — no qty=0 DB churn, no unfunded deletes.
+
+        ``candidates`` is a list of ``(candidate_order, evaluator, symbol, recommendation)``. The
+        RM (``size_candidate_orders``) sets ``candidate.quantity`` (+ ``candidate.stop_price`` for
+        risk_atr sizing) on the funded transient orders. For each funded symbol we then run the SAME
+        ``evaluator.execute()`` that the DB path used (persisting the real order + transaction + TP/SL
+        legs), stamp the pre-computed funded quantity + tighter-wins protective stop onto the persisted
+        order, and submit. Unfunded candidates are dropped by the RM and never touch the DB.
+
+        Returns True iff at least one order was funded, persisted and submitted.
+        """
+        from ba2_common.core.TradeRiskManagement import TradeRiskManagement
+
+        by_symbol = {c[2]: c for c in candidates}
+        rm = TradeRiskManagement(indicator_provider=self._indicator_provider, as_of=as_of)
+        try:
+            funded = rm.size_candidate_orders(expert_id, [(c[0], c[3]) for c in candidates])
+        except Exception as e:  # noqa: BLE001 — RM failure for one expert must not kill the run
+            self._log(f"candidate risk manager failed for expert {expert_id}: {e}")
+            return False
+
+        created_any = False
+        for cand in funded:
+            entry = by_symbol.get(cand.symbol)
+            if entry is None or not (cand.quantity and cand.quantity > 0):
+                continue
+            _cand, evaluator, symbol, _rec = entry
+            try:
+                # Persist the real order + transaction + TP/SL bracket (execute is byte-identical to
+                # the old flow; we just call it ONLY for funded symbols now).
+                results = evaluator.execute(submit_to_broker=False)
+                order_id = next((r["data"]["order_id"] for r in results
+                                 if r.get("success") and (r.get("data") or {}).get("order_id")), None)
+                if not order_id:
+                    continue
+                order = get_instance(TradingOrder, order_id)
+                if order is None:
+                    continue
+                order.quantity = cand.quantity  # the RM-sized quantity computed on the candidate
+                # TIGHTER-WINS protective stop: RM safeguard (cand.stop_price, what the size was
+                # keyed off) vs the ruleset entry-bracket SL (on the transaction). Long: higher wins;
+                # short: lower. No ruleset SL -> safeguard as before (identical to the DB _size_and_submit).
+                sl_price = cand.stop_price or None
+                txn = get_instance(Transaction, order.transaction_id) if order.transaction_id else None
+                ruleset_sl = txn.stop_loss if txn else None
+                if ruleset_sl and sl_price:
+                    is_long = order.side == OrderDirection.BUY
+                    sl_price = max(ruleset_sl, sl_price) if is_long else min(ruleset_sl, sl_price)
+                elif ruleset_sl:
+                    sl_price = None
+                self.account.submit_order(order, sl_price=sl_price)
+                created_any = True
+            except Exception as e:  # noqa: BLE001
+                self._log(f"funded submit failed for {symbol} @ {as_of:%Y-%m-%d}: {e}")
+                continue
+        return created_any
 
     # -- helpers ------------------------------------------------------------
     def _provider_bundle(self) -> Any:

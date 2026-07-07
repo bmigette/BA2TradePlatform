@@ -96,10 +96,10 @@ def _build(expert_id=8801, account_id=8801, held_qty=0.0):
     return engine, account, expert, expert_id, ruleset_id, ctx
 
 
-def _pending_aapl(account):
-    from ba2_common.core.types import OrderStatus
-    return [o for o in account.get_orders()
-            if o.symbol == "AAPL" and o.status in (OrderStatus.NEW, OrderStatus.PENDING)]
+def _aapl_orders(account):
+    # After the temp-list flow, a funded entry is SIZED + SUBMITTED (qty>0), not left as a qty=0
+    # PENDING order — so we assert on any AAPL order the bar created (funded => quantity>0).
+    return [o for o in account.get_orders() if o.symbol == "AAPL"]
 
 
 def test_equity_sufficient_when_flat_opens_entry():
@@ -109,7 +109,9 @@ def test_equity_sufficient_when_flat_opens_entry():
         assert ok is True, reason  # flat account: available == 100% of virtual >> 5%
         created = engine._run_expert_bar(expert, expert_id, {}, ruleset_id, ["AAPL"], _D)
         assert created is True
-        assert _pending_aapl(account), "a flat, funded account should stage the AAPL entry"
+        aapl = _aapl_orders(account)
+        assert aapl, "a flat, funded account should create the AAPL entry"
+        assert any(o.quantity and o.quantity > 0 for o in aapl), "entry must be RM-sized (qty>0)"
     finally:
         ctx.__exit__(None, None, None)
 
@@ -122,6 +124,7 @@ def test_equity_insufficient_blocks_entry():
         assert ok is False and "threshold" in reason
         created = engine._run_expert_bar(expert, expert_id, {}, ruleset_id, ["AAPL"], _D)
         assert created is False
-        assert not _pending_aapl(account), "insufficient equity must skip the entry (no staged order)"
+        # temp-list flow: an unfunded/blocked entry is NEVER persisted (no qty=0 churn either).
+        assert not _aapl_orders(account), "insufficient equity must skip the entry (no order created)"
     finally:
         ctx.__exit__(None, None, None)
