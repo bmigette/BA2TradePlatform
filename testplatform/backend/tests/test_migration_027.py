@@ -23,6 +23,8 @@ def _table_columns(cursor, table):
 
 
 def _build_legacy_workers(conn):
+    """Create a legacy workers table (pre-027) matching the real Worker model's full column
+    set minus sync_results_enabled, so ORM round-trip reads work after the migration runs."""
     cursor = conn.cursor()
     cursor.execute(
         """
@@ -30,7 +32,20 @@ def _build_legacy_workers(conn):
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name VARCHAR(100) NOT NULL,
             url VARCHAR(500) NOT NULL,
-            is_enabled BOOLEAN DEFAULT 1
+            description TEXT,
+            worker_type VARCHAR(20) DEFAULT 'remote',
+            capabilities JSON,
+            password VARCHAR(255),
+            is_enabled BOOLEAN DEFAULT 1,
+            is_local BOOLEAN DEFAULT 0,
+            status VARCHAR(20) DEFAULT 'offline',
+            gpu_info JSON,
+            cpu_info JSON,
+            last_heartbeat DATETIME,
+            active_jobs_count INTEGER DEFAULT 0,
+            total_jobs_completed INTEGER DEFAULT 0,
+            created_at DATETIME,
+            updated_at DATETIME
         )
         """
     )
@@ -59,6 +74,38 @@ def test_migration_adds_column_and_backfills_existing_rows():
 
     finally:
         conn.close()
+
+
+def test_migration_preserves_default_via_orm_read():
+    """Through the real SQLAlchemy Worker model: build a legacy table, run the migration on
+    the same DBAPI connection, then read the migrated+backfilled row via the ORM and confirm
+    sync_results_enabled deserializes as an actual Python bool and to_dict() wires it through."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from app.models.worker import Worker
+
+    engine = create_engine("sqlite://")  # in-memory, single shared connection
+
+    raw = engine.raw_connection()
+    try:
+        _build_legacy_workers(raw)
+        cursor = raw.cursor()
+        migration = _load_migration()
+        migration.upgrade(cursor, raw)
+        raw.commit()
+    finally:
+        raw.close()
+
+    SessionLocal = sessionmaker(bind=engine)
+    session = SessionLocal()
+    try:
+        worker = session.query(Worker).filter_by(name="existing-worker").one()
+        assert worker.sync_results_enabled is True
+        assert worker.to_dict()["syncResultsEnabled"] is True
+    finally:
+        session.close()
+        engine.dispose()
 
 
 def test_migration_is_idempotent():
