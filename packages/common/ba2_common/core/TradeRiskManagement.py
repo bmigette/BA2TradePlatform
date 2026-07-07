@@ -214,45 +214,12 @@ class TradeRiskManagement:
                 self.logger.warning(f"No orders with valid recommendations found for expert {expert_instance_id}")
                 return updated_orders
             
-            # Step 4: Sort orders by expected profit (descending)
-            prioritized_orders = self._prioritize_orders_by_profit(orders_with_recommendations)
-            
-            # Step 5: Get available balance from expert interface
-            available_balance = expert.get_available_balance()
-            if available_balance is None:
-                error_msg = f"Could not get available balance for expert {expert_instance_id}"
-                self.logger.error(error_msg)
-                raise RuntimeError(error_msg)
-            
-            # Use available balance for calculations
-            total_virtual_balance = available_balance
-            max_equity_per_instrument = total_virtual_balance * max_equity_per_instrument_ratio
-            
-            self.logger.info(f"Virtual balance: ${total_virtual_balance:.2f}, "
-                           f"max per instrument: ${max_equity_per_instrument:.2f} "
-                           f"(ratio: {max_equity_per_instrument_ratio:.3f})")
-            
-            # Step 6: Get account instance for price lookups (via the injected host resolver)
-            from ba2_common.core.instance_resolver import get_instance_resolver
-            account = get_instance_resolver().get_account_instance(expert_instance.account_id)
-            if not account:
-                error_msg = f"Account {expert_instance.account_id} not found for expert {expert_instance_id}"
-                self.logger.error(error_msg)
-                raise ValueError(error_msg)
-            
-            # Step 7: Get existing positions to account for current allocations
-            existing_allocations = self._get_existing_allocations(expert_instance_id)
-            self.logger.debug(f"Existing allocations for expert {expert_instance_id}: {existing_allocations}")
-            
-            # Step 8: Calculate quantities for prioritized orders
-            orders_to_update, orders_to_delete, symbol_prices = self._calculate_order_quantities(
-                prioritized_orders,
-                total_virtual_balance,
-                max_equity_per_instrument,
-                existing_allocations,
-                account,
-                expert
-            )
+            # Steps 4-8: prioritize + resolve balance/account/allocations + size (SHARED with the
+            # in-memory candidate path, size_candidate_orders — see _size_prioritized_orders).
+            (orders_to_update, orders_to_delete, symbol_prices,
+             total_virtual_balance, max_equity_per_instrument) = self._size_prioritized_orders(
+                expert, expert_instance, expert_instance_id,
+                orders_with_recommendations, max_equity_per_instrument_ratio)
 
             # Step 9: Update orders in database
             updated_in_db, failed_in_db = self._update_orders_in_database(orders_to_update)
@@ -323,7 +290,123 @@ class TradeRiskManagement:
             raise  # Re-raise the exception to allow UI to handle it
         
         return updated_orders
-    
+
+    # ------------------------------------------------------------------------------------------
+    # Shared sizing core + in-memory candidate path (temp-order-list order flow)
+    # ------------------------------------------------------------------------------------------
+    def _size_prioritized_orders(self, expert, expert_instance, expert_instance_id,
+                                 orders_with_recommendations, max_equity_per_instrument_ratio):
+        """Steps 4-8 of the classic RM sizing: prioritize by expected profit, resolve available
+        balance + account + existing allocations, and compute per-order quantities.
+
+        PURE of DB writes/deletes — it only reads (balance, prices, allocations) and sets
+        ``order.quantity``/``order.stop_price`` on the passed order objects (which may be
+        persisted OR transient/in-memory). Shared by both the DB path
+        (``review_and_prioritize_pending_orders``) and the in-memory candidate path
+        (``size_candidate_orders``). Returns
+        ``(orders_to_update, orders_to_delete, symbol_prices, total_virtual_balance,
+        max_equity_per_instrument)``.
+        """
+        # Step 4: Sort orders by expected profit (descending)
+        prioritized_orders = self._prioritize_orders_by_profit(orders_with_recommendations)
+
+        # Step 5: Get available balance from expert interface
+        available_balance = expert.get_available_balance()
+        if available_balance is None:
+            error_msg = f"Could not get available balance for expert {expert_instance_id}"
+            self.logger.error(error_msg)
+            raise RuntimeError(error_msg)
+        total_virtual_balance = available_balance
+        max_equity_per_instrument = total_virtual_balance * max_equity_per_instrument_ratio
+        self.logger.info(f"Virtual balance: ${total_virtual_balance:.2f}, "
+                         f"max per instrument: ${max_equity_per_instrument:.2f} "
+                         f"(ratio: {max_equity_per_instrument_ratio:.3f})")
+
+        # Step 6: Get account instance for price lookups (via the injected host resolver)
+        from ba2_common.core.instance_resolver import get_instance_resolver
+        account = get_instance_resolver().get_account_instance(expert_instance.account_id)
+        if not account:
+            error_msg = f"Account {expert_instance.account_id} not found for expert {expert_instance_id}"
+            self.logger.error(error_msg)
+            raise ValueError(error_msg)
+
+        # Step 7: Get existing positions to account for current allocations
+        existing_allocations = self._get_existing_allocations(expert_instance_id)
+        self.logger.debug(f"Existing allocations for expert {expert_instance_id}: {existing_allocations}")
+
+        # Step 8: Calculate quantities for prioritized orders
+        orders_to_update, orders_to_delete, symbol_prices = self._calculate_order_quantities(
+            prioritized_orders, total_virtual_balance, max_equity_per_instrument,
+            existing_allocations, account, expert)
+        return (orders_to_update, orders_to_delete, symbol_prices,
+                total_virtual_balance, max_equity_per_instrument)
+
+    def size_candidate_orders(self, expert_instance_id: int, candidates):
+        """Size a list of IN-MEMORY candidate (TradingOrder, ExpertRecommendation) pairs and return
+        the funded subset — the temp-order-list order flow.
+
+        Instead of persisting qty=0 PENDING orders and deleting the unfunded ones (the churn the
+        DB path ``review_and_prioritize_pending_orders`` does), the enter path builds candidate
+        orders IN MEMORY and calls this. It runs the SAME permission filter + sizing core the DB
+        path uses (``_size_prioritized_orders`` → ``_calculate_order_quantities``) but performs NO
+        DB writes and NO deletes: unfunded candidates are simply dropped (logged). The caller then
+        persists + submits ONLY the returned funded candidates (quantity > 0, ``stop_price`` set
+        for risk_atr sizing).
+
+        Returns the funded candidate ``TradingOrder`` objects (each with ``.quantity`` set),
+        already ordered by the RM's profit prioritization. Returns [] when automated trade opening
+        is disabled or nothing is fundable.
+        """
+        from ba2_common.core.instance_resolver import get_instance_resolver
+
+        if not candidates:
+            return []
+
+        expert = get_instance_resolver().get_expert_instance(expert_instance_id)
+        if not expert:
+            raise ValueError(f"Expert instance {expert_instance_id} not found")
+        expert_instance = get_instance(ExpertInstance, expert_instance_id)
+        if not expert_instance:
+            raise ValueError(f"Expert instance model {expert_instance_id} not found")
+
+        allow_automated_trade_opening = expert.get_setting_with_interface_default(
+            'allow_automated_trade_opening', log_warning=False)
+        if not allow_automated_trade_opening:
+            self.logger.debug(f"Automated trade opening disabled for expert {expert_instance_id}, "
+                              f"skipping candidate sizing")
+            return []
+
+        enable_buy = expert.get_setting_with_interface_default('enable_buy', log_warning=False)
+        enable_sell = expert.get_setting_with_interface_default('enable_sell', log_warning=False)
+        max_pct = expert.get_setting_with_interface_default(
+            'max_virtual_equity_per_instrument_percent', log_warning=False)
+        if max_pct is None:
+            raise ValueError(
+                f"Expert {expert_instance_id} has no max_virtual_equity_per_instrument_percent "
+                f"setting and the interface provides no default; cannot size orders safely")
+        ratio = max_pct / 100.0
+
+        # Permission filter (buy/sell). Candidate orders are transient (no .id) so match by identity.
+        orders = [o for (o, _rec) in candidates]
+        filtered = self._filter_orders_by_permissions(orders, enable_buy, enable_sell)
+        filtered_ids = {id(o) for o in filtered}
+        pairs = [(o, rec) for (o, rec) in candidates if id(o) in filtered_ids]
+        for o, _rec in candidates:
+            if id(o) not in filtered_ids:
+                self.logger.debug(f"candidate {o.symbol} {o.side} dropped by buy/sell permission filter")
+        if not pairs:
+            return []
+
+        orders_to_update, orders_to_delete, _prices, _bal, _cap = self._size_prioritized_orders(
+            expert, expert_instance, expert_instance_id, pairs, ratio)
+        for o in (orders_to_delete or []):
+            self.logger.debug(f"candidate {o.symbol} {o.side} not funded by RM (qty=0) — dropped "
+                              f"(temp-list flow: never persisted)")
+        funded = [o for o in orders_to_update if o.quantity and o.quantity > 0]
+        self.logger.info(f"Candidate sizing for expert {expert_instance_id}: {len(funded)} funded "
+                         f"of {len(pairs)} candidate(s)")
+        return funded
+
     def _get_pending_orders_for_review(self, expert_instance_id: int) -> List[TradingOrder]:
         """Get all pending orders for an expert (RM-2: single JOIN, no N+1)."""
         try:
