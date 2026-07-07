@@ -139,3 +139,32 @@ def test_cache_push_rejects_traversal(client, tmp_path, monkeypatch):
     r = client.post("/cache/push", headers=H, content=tb.getvalue())
     assert r.status_code == 200 and r.json()["skipped"] == 1
     assert not (tmp_path / "evil.txt").exists()
+
+
+def test_sync_strategy_inserts_row(client, monkeypatch, tmp_path):
+    db_path = tmp_path / "sync_test.sqlite"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+    import importlib
+    import app.models.database as dbmod
+    importlib.reload(dbmod)
+    monkeypatch.setattr(ws, "SessionLocal", dbmod.SessionLocal, raising=False)
+
+    payload = {"id": 999, "name": "synced-strategy", "created_at": "2026-01-01T00:00:00+00:00"}
+    r = client.post("/sync/strategy", headers=H, json=payload)
+    assert r.status_code == 200 and r.json()["ok"] is True
+
+    from app.models.strategy import Strategy
+    s = dbmod.SessionLocal()
+    try:
+        rows = s.query(Strategy).all()
+        assert len(rows) == 1
+        assert rows[0].name == "synced-strategy"
+        assert rows[0].id != 999
+    finally:
+        s.close()
+
+
+def test_sync_endpoints_require_auth(client):
+    assert client.post("/sync/strategy", json={"name": "x", "created_at": "2026-01-01T00:00:00"}).status_code == 401
+    assert client.post("/sync/optimization", json={"name": "x", "created_at": "2026-01-01T00:00:00"}).status_code == 401
+    assert client.post("/sync/backtest", json={"name": "x", "created_at": "2026-01-01T00:00:00"}).status_code == 401

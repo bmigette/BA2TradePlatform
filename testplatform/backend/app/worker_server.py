@@ -14,6 +14,9 @@ Endpoints (every one bearer-checked against the worker password):
   POST /cache/prune    -> {rel_paths} -> delete leftovers from a master-side rebuild/compaction
   POST /run-trial      -> {config, fitness_metric} -> {ok, fitness, trades, error, fatal}
   POST /run-trial-full -> {config, fitness_metric} -> {ok, results:{...full backtest results}}
+  POST /sync/strategy    -> {...Strategy row + natural keys} -> upsert by (name, created_at)
+  POST /sync/optimization-> {...StrategyOptimization row + strategy natural key} -> upsert
+  POST /sync/backtest    -> {...Backtest row + strategy/optimization natural keys} -> upsert
   POST /update         -> git pull + reinstall + restart (self_update)
 """
 
@@ -29,7 +32,7 @@ from typing import Optional
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel
 
-from app.services import cache_sync, self_update
+from app.services import cache_sync, self_update, sync_receiver
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +44,10 @@ worker_app = FastAPI(title="BA2 Remote Worker", docs_url=None, redoc_url=None, o
 _PASSWORD: Optional[str] = None
 _CAPACITY: int = 1
 _POOL: Optional[ProcessPoolExecutor] = None
+
+# Bound lazily on first sync request (see _sync_session()) so tests can monkeypatch it to an
+# isolated DB, and so importing this module doesn't eagerly touch app.models.database.
+SessionLocal = None
 
 
 def _verify(authorization: Optional[str]) -> None:
@@ -224,6 +231,102 @@ def set_secrets(req: SecretsReq, authorization: str = Header(default=None)):
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"set_secrets failed: {e!r}")
     return {"set": n, "keys": sorted((req.settings or {}).keys())}
+
+
+def _sync_session():
+    """Lazily bind SessionLocal to app.models.database's session factory, and ensure the
+    strategies/strategy_optimizations/backtests tables exist on whatever engine SessionLocal is
+    CURRENTLY bound to.
+
+    Module-level (not per-call) SessionLocal binding so tests can monkeypatch ``ws.SessionLocal``
+    to an isolated engine — but the table-existence check runs on every call (like ``/secrets``'s
+    ``init_db()``), not just the first: a test can point ``SessionLocal`` at a freshly-created,
+    schema-less engine (see test_sync_strategy_inserts_row's ``importlib.reload`` +
+    ``monkeypatch.setattr(ws, "SessionLocal", ...)`` dance), and that engine needs its tables
+    created too. Table creation goes through the model classes' own metadata
+    (``Strategy.metadata``) rather than ``app.models.database.Base`` directly: ``app.models`` (the
+    package) imports every model at package-import time against ONE shared Base, so
+    Strategy/StrategyOptimization/Backtest stay registered there even if
+    ``app.models.database`` itself gets reloaded later elsewhere — a reload rebinds that module's
+    ``Base``/``engine`` names to fresh objects but does NOT retroactively move already-imported
+    model classes onto the new Base, so ``app.models.database.Base.metadata.create_all(...)``
+    would silently create zero of the tables we need in that scenario.
+    """
+    global SessionLocal
+    if SessionLocal is None:
+        from app.models.database import SessionLocal as _SessionLocal
+        SessionLocal = _SessionLocal
+    from app.models.strategy import Strategy
+    import app.models  # noqa: F401 — registers StrategyOptimization/Backtest alongside Strategy
+    session = SessionLocal()
+    Strategy.metadata.create_all(bind=session.get_bind())
+    return session
+
+
+@worker_app.post("/sync/strategy")
+def sync_strategy(payload: dict, authorization: str = Header(default=None)):
+    """Upsert a replicated Strategy row, matched by (name, created_at)."""
+    _verify(authorization)
+    from app.models.strategy import Strategy
+    s = _sync_session()
+    try:
+        row = sync_receiver.upsert_by_natural_key(s, Strategy, payload)
+        return {"ok": True, "skipped": row is None}
+    finally:
+        s.close()
+
+
+@worker_app.post("/sync/optimization")
+def sync_optimization(payload: dict, authorization: str = Header(default=None)):
+    """Upsert a replicated StrategyOptimization row, matched by (name, created_at).
+
+    ``payload`` carries strategy_name/strategy_created_at alongside the master's strategy_id
+    so the FK can be remapped to this worker's own local Strategy id (see sync_receiver).
+    ``strategy_id`` is NOT NULL on this table, so a missing parent means
+    ``upsert_by_natural_key`` skips the write (returns None) rather than raising — reported
+    back as ``{"skipped": true}``, still HTTP 200 (expected/benign, self-heals on retry).
+    """
+    _verify(authorization)
+    from app.models.strategy import Strategy
+    from app.models.strategy_optimization import StrategyOptimization
+    s = _sync_session()
+    try:
+        row = sync_receiver.upsert_by_natural_key(
+            s, StrategyOptimization, payload,
+            parent_fk={"strategy_id": (Strategy, "strategy_name", "strategy_created_at")},
+        )
+        return {"ok": True, "skipped": row is None}
+    finally:
+        s.close()
+
+
+@worker_app.post("/sync/backtest")
+def sync_backtest(payload: dict, authorization: str = Header(default=None)):
+    """Upsert a replicated Backtest row, matched by (name, created_at).
+
+    ``payload`` carries both strategy_name/strategy_created_at and
+    optimization_name/optimization_created_at so both FKs remap to local ids. Both FK columns
+    on this table are nullable, so a missing parent resolves to None and the row is still
+    written (unlike StrategyOptimization.strategy_id) — ``skipped`` should always be false here
+    in practice, but the return is handled the same way for consistency with the other two
+    endpoints.
+    """
+    _verify(authorization)
+    from app.models.strategy import Strategy
+    from app.models.strategy_optimization import StrategyOptimization
+    from app.models.backtest import Backtest
+    s = _sync_session()
+    try:
+        row = sync_receiver.upsert_by_natural_key(
+            s, Backtest, payload,
+            parent_fk={
+                "strategy_id": (Strategy, "strategy_name", "strategy_created_at"),
+                "optimization_id": (StrategyOptimization, "optimization_name", "optimization_created_at"),
+            },
+        )
+        return {"ok": True, "skipped": row is None}
+    finally:
+        s.close()
 
 
 @worker_app.post("/update")
