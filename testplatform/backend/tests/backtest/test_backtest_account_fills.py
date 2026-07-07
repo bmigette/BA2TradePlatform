@@ -399,134 +399,104 @@ def _open_long_with_legs(acct, ps, txn_lookup_after=None):
     return o, txn
 
 
-def test_adjust_tp_creates_waiting_trigger_leg():
-    from ba2_common.core.types import OrderStatus, OrderType, OrderDirection
+def test_adjust_tp_sets_transaction_take_profit():
+    """LEAN simulator: adjust_tp records the level on the TRANSACTION — no WAITING_TRIGGER leg order
+    is materialised (that live-broker mechanism is gone; the fill engine checks the level directly)."""
+    from ba2_common.core.models import Transaction
+    from ba2_common.core.db import get_instance
 
     acct, ctx, ps = _acct([(D1, 100, 101, 99, 100), (D2, 102, 103, 101, 102)])
     try:
         ps.set_clock(D1)
         entry, txn = _open_long_with_legs(acct, ps)
-        ok = acct.adjust_tp(txn, 120.0)
-        assert ok is True
-        legs = [o for o in acct.get_orders() if o.depends_on_order == entry.id]
-        assert len(legs) == 1
-        leg = legs[0]
-        assert leg.order_type == OrderType.SELL_LIMIT  # TP on a long
-        assert leg.side == OrderDirection.SELL
-        assert leg.limit_price == 120.0
-        assert leg.status == OrderStatus.WAITING_TRIGGER
-        assert "OCO-TP" in (leg.comment or "")
+        assert acct.adjust_tp(txn, 120.0) is True
+        assert get_instance(Transaction, txn.id).take_profit == 120.0
+        assert [o for o in acct.get_orders() if o.depends_on_order == entry.id] == []  # no leg row
     finally:
         ctx.__exit__(None, None, None)
 
 
-def test_adjust_sl_creates_sell_stop_leg_for_long():
-    from ba2_common.core.types import OrderStatus, OrderType, OrderDirection
+def test_adjust_sl_sets_transaction_stop_loss():
+    """LEAN simulator: adjust_sl records the level on the transaction — no SELL_STOP leg order."""
+    from ba2_common.core.models import Transaction
+    from ba2_common.core.db import get_instance
 
     acct, ctx, ps = _acct([(D1, 100, 101, 99, 100), (D2, 102, 103, 101, 102)])
     try:
         ps.set_clock(D1)
         entry, txn = _open_long_with_legs(acct, ps)
         assert acct.adjust_sl(txn, 90.0) is True
-        legs = [o for o in acct.get_orders() if o.depends_on_order == entry.id]
-        assert len(legs) == 1
-        leg = legs[0]
-        assert leg.order_type == OrderType.SELL_STOP
-        assert leg.side == OrderDirection.SELL
-        assert leg.stop_price == 90.0
+        assert get_instance(Transaction, txn.id).stop_loss == 90.0
+        assert [o for o in acct.get_orders() if o.depends_on_order == entry.id] == []
     finally:
         ctx.__exit__(None, None, None)
 
 
-def test_tp_leg_activates_after_entry_fills_then_fills():
-    """Full lifecycle: entry fills, TP leg activates next bar, TP fills when price hits it."""
+def test_tp_closes_position_when_price_crosses():
+    """OUTCOME: after the entry fills, a bar crossing the TP closes the position AT the TP price
+    (take_profit), via the direct bracket check (no WAITING_TRIGGER leg)."""
     from ba2_common.core.types import OrderStatus
 
-    # D1 placed; D2 entry fills @102; D3 TP @106 — high 107 crosses -> TP fills @106.
+    # D2 entry fills @102; D3 high 107 crosses TP @106 -> closes @106.
     acct, ctx, ps = _acct(
-        [
-            (D1, 100, 101, 99, 100),
-            (D2, 102, 103, 101, 102),
-            (D3, 104, 107, 103, 106),
-        ]
+        [(D1, 100, 101, 99, 100), (D2, 102, 103, 101, 102), (D3, 104, 107, 103, 106)]
     )
     try:
         ps.set_clock(D1)
         entry, txn = _open_long_with_legs(acct, ps)
         acct.adjust_tp(txn, 106.0)
-
-        # Bar D1->D2: entry MARKET fills at D2 open.
-        ps.set_clock(D1)
-        acct.refresh_orders()
+        ps.set_clock(D1); acct.refresh_orders(); acct.refresh_transactions()  # entry fills @102, OPENED
         assert acct.get_order(entry.broker_order_id).status == OrderStatus.FILLED
-
-        # Bar at D2: activate TP (parent now FILLED), then it evaluates against D3.
-        ps.set_clock(D2)
-        acct.refresh_orders()
-        legs = [o for o in acct.get_orders() if o.depends_on_order == entry.id]
-        tp = legs[0]
-        assert acct.get_order(tp.broker_order_id).status == OrderStatus.FILLED
-        assert acct.get_order(tp.broker_order_id).open_price == 106.0
-        # Position closed: bought 10 then sold 10.
+        ps.set_clock(D2); acct.refresh_orders(); acct.refresh_transactions()  # bracket vs D3 -> TP @106
         assert acct.get_positions() == []
+        rts = acct.get_round_trip_trades()
+        assert len(rts) == 1
+        assert rts[0]["exit_price"] == pytest.approx(106.0)
+        assert rts[0]["exit_reason"] == "take_profit"
     finally:
         ctx.__exit__(None, None, None)
 
 
 # ---------------------------------------------------------------------------
-# OCO (paired TP+SL)
+# Paired TP+SL (no OCO leg — both stored on the transaction)
 # ---------------------------------------------------------------------------
-def test_adjust_tp_sl_creates_single_oco_leg():
-    from ba2_common.core.types import OrderStatus, OrderType
+def test_adjust_tp_sl_sets_both_on_transaction():
+    from ba2_common.core.models import Transaction
+    from ba2_common.core.db import get_instance
 
     acct, ctx, ps = _acct([(D1, 100, 101, 99, 100), (D2, 102, 103, 101, 102)])
     try:
         ps.set_clock(D1)
         entry, txn = _open_long_with_legs(acct, ps)
         assert acct.adjust_tp_sl(txn, new_tp_price=120.0, new_sl_price=90.0) is True
-        legs = [o for o in acct.get_orders() if o.depends_on_order == entry.id]
-        assert len(legs) == 1  # ONE OCO leg, not two
-        oco = legs[0]
-        assert oco.order_type == OrderType.OCO
-        assert oco.limit_price == 120.0  # TP
-        assert oco.stop_price == 90.0  # SL
-        assert oco.status == OrderStatus.WAITING_TRIGGER
+        t = get_instance(Transaction, txn.id)
+        assert t.take_profit == 120.0 and t.stop_loss == 90.0
+        assert [o for o in acct.get_orders() if o.depends_on_order == entry.id] == []  # no OCO leg row
     finally:
         ctx.__exit__(None, None, None)
 
 
-def test_oco_tp_side_fills_and_closes_position():
-    """OCO bracket: price rises to TP -> OCO fills at TP, position closes."""
-    from ba2_common.core.types import OrderStatus, TransactionStatus
+def test_oco_tp_side_closes_at_take_profit():
+    """Paired TP+SL: price rises to TP -> position closes at TP, transaction CLOSED."""
+    from ba2_common.core.types import TransactionStatus
     from ba2_common.core.models import Transaction
     from ba2_common.core.db import get_instance
 
-    # D2 entry fills @102; D3 high 125 crosses TP @120 (low 103 above SL 90) -> TP fills.
+    # D2 entry fills @102; D3 high 125 crosses TP @120 (low 103 above SL 90) -> TP closes.
     acct, ctx, ps = _acct(
-        [
-            (D1, 100, 101, 99, 100),
-            (D2, 102, 103, 101, 102),
-            (D3, 104, 125, 103, 120),
-        ]
+        [(D1, 100, 101, 99, 100), (D2, 102, 103, 101, 102), (D3, 104, 125, 103, 120)]
     )
     try:
         ps.set_clock(D1)
         entry, txn = _open_long_with_legs(acct, ps)
         acct.adjust_tp_sl(txn, new_tp_price=120.0, new_sl_price=90.0)
-
-        ps.set_clock(D1)
-        acct.refresh_orders()  # entry fills @102 (D2)
-        ps.set_clock(D2)
-        acct.refresh_orders()  # activate OCO, evaluate vs D3 -> TP @120 fills
-        acct.refresh_transactions()
-
-        oco = [o for o in acct.get_orders() if o.depends_on_order == entry.id][0]
-        oco = acct.get_order(oco.broker_order_id)
-        assert oco.status == OrderStatus.FILLED
-        assert oco.open_price == 120.0
+        ps.set_clock(D1); acct.refresh_orders(); acct.refresh_transactions()  # entry fills @102, OPENED
+        ps.set_clock(D2); acct.refresh_orders(); acct.refresh_transactions()  # bracket vs D3 -> TP @120
         assert acct.get_positions() == []
-        # Inherited refresh_transactions recognises the OCO close.
         assert get_instance(Transaction, txn.id).status == TransactionStatus.CLOSED
+        rts = acct.get_round_trip_trades()
+        assert len(rts) == 1 and rts[0]["exit_price"] == pytest.approx(120.0)
+        assert rts[0]["exit_reason"] == "take_profit"
     finally:
         ctx.__exit__(None, None, None)
 
@@ -620,94 +590,46 @@ def test_open_date_sim_stamp_survives_close():
 
 
 def test_oco_sl_side_fills_when_both_straddled():
-    """When a single bar straddles BOTH legs, the STOP (loss) side fills (conservative)."""
-    from ba2_common.core.types import OrderStatus
-
-    # D3 range 85..125 crosses TP@120 AND SL@90 -> SL side wins, fills at 90.
+    """When a single bar straddles BOTH levels, the STOP (loss) side wins (conservative) — the
+    position closes at the SL price, not the TP. Direct bracket check, no OCO leg."""
+    # D3 range 85..125 crosses TP@120 AND SL@90 -> SL wins, closes at 90.
     acct, ctx, ps = _acct(
-        [
-            (D1, 100, 101, 99, 100),
-            (D2, 102, 103, 101, 102),
-            (D3, 104, 125, 85, 100),
-        ]
+        [(D1, 100, 101, 99, 100), (D2, 102, 103, 101, 102), (D3, 104, 125, 85, 100)]
     )
     try:
         ps.set_clock(D1)
         entry, txn = _open_long_with_legs(acct, ps)
         acct.adjust_tp_sl(txn, new_tp_price=120.0, new_sl_price=90.0)
-
-        ps.set_clock(D1)
-        acct.refresh_orders()  # entry fills
-        ps.set_clock(D2)
-        acct.refresh_orders()  # OCO activates + evaluates vs D3 -> SL @90 fills
-
-        oco = [o for o in acct.get_orders() if o.depends_on_order == entry.id][0]
-        oco = acct.get_order(oco.broker_order_id)
-        assert oco.status == OrderStatus.FILLED
-        assert oco.open_price == 90.0  # SL, not TP
+        ps.set_clock(D1); acct.refresh_orders(); acct.refresh_transactions()  # entry fills, OPENED
+        ps.set_clock(D2); acct.refresh_orders(); acct.refresh_transactions()  # bracket vs D3 -> SL @90
         assert acct.get_positions() == []
+        rts = acct.get_round_trip_trades()
+        assert len(rts) == 1
+        assert rts[0]["exit_price"] == pytest.approx(90.0)  # SL, not TP
+        assert rts[0]["exit_reason"] == "stop_loss"
     finally:
         ctx.__exit__(None, None, None)
 
 
-def test_separate_tp_sl_legs_sibling_cancelled_on_fill():
-    """Two separate legs (TP then SL via adjust_sl after adjust_tp would replace);
-    to keep both, build them directly so we can prove sibling-cancel on fill."""
-    from ba2_common.core.types import (
-        OrderStatus,
-        OrderType,
-        OrderDirection,
-        OrderOpenType,
-    )
-    from ba2_common.core.models import TradingOrder
-    from ba2_common.core.db import add_instance
-
-    # D2 entry fills @102; D3 high 125 hits TP@120 -> TP fills, SL sibling cancelled.
+def test_paired_bracket_closes_once_no_double_close():
+    """With BOTH a TP and an SL set, a bar crossing (only) the TP closes the position EXACTLY once
+    at the TP — the lean bracket never double-closes (the old model relied on OCO sibling-cancel;
+    here a single close per transaction per bar is enforced by construction)."""
+    # D2 entry fills @102; D3 high 125 hits TP@120 (low 103 above SL@90) -> closes once at TP.
     acct, ctx, ps = _acct(
-        [
-            (D1, 100, 101, 99, 100),
-            (D2, 102, 103, 101, 102),
-            (D3, 104, 125, 103, 120),
-        ]
+        [(D1, 100, 101, 99, 100), (D2, 102, 103, 101, 102), (D3, 104, 125, 103, 120)]
     )
     try:
         ps.set_clock(D1)
         entry, txn = _open_long_with_legs(acct, ps)
-
-        # Build a TP leg and an SL leg sharing the same parent (separate, not OCO).
-        # Capture broker_order_id as a plain string BEFORE add_instance detaches the row.
-        def _leg(order_type, limit, stop, label):
-            bid = acct._next_broker_id()
-            leg = TradingOrder(
-                account_id=1,
-                symbol="AAPL",
-                quantity=10,
-                side=OrderDirection.SELL,
-                order_type=order_type,
-                limit_price=limit,
-                stop_price=stop,
-                transaction_id=txn.id,
-                status=OrderStatus.WAITING_TRIGGER,
-                depends_on_order=entry.id,
-                depends_order_status_trigger=OrderStatus.FILLED,
-                open_type=OrderOpenType.AUTOMATIC,
-                broker_order_id=bid,
-                comment=f"x-OCO-{label}-[PARENT:{entry.id}]",
-            )
-            add_instance(leg)
-            return bid
-
-        tp_bid = _leg(OrderType.SELL_LIMIT, 120.0, None, "TP")
-        sl_bid = _leg(OrderType.SELL_STOP, None, 90.0, "SL")
-
-        ps.set_clock(D1)
-        acct.refresh_orders()  # entry fills
-        ps.set_clock(D2)
-        acct.refresh_orders()  # legs activate + TP fills vs D3 -> SL cancelled
-
-        assert acct.get_order(tp_bid).status == OrderStatus.FILLED
-        assert acct.get_order(sl_bid).status == OrderStatus.CANCELED
-        assert acct.get_positions() == []
+        acct.adjust_tp_sl(txn, new_tp_price=120.0, new_sl_price=90.0)
+        ps.set_clock(D1); acct.refresh_orders(); acct.refresh_transactions()  # entry fills, OPENED
+        ps.set_clock(D2); acct.refresh_orders(); acct.refresh_transactions()  # bracket vs D3 -> TP @120
+        assert acct.get_positions() == []  # flat, not net-short (no double close)
+        rts = acct.get_round_trip_trades()
+        assert len(rts) == 1  # exactly one round-trip
+        assert rts[0]["exit_price"] == pytest.approx(120.0)
+        assert rts[0]["exit_reason"] == "take_profit"
     finally:
         ctx.__exit__(None, None, None)
 

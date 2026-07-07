@@ -115,75 +115,54 @@ def _acct(rows, cfg=CFG, symbol="AAPL", account_id=1):
     return acct, ctx, ps
 
 
-def test_waiting_leg_quantity_syncs_to_parent_fill():
-    """A protective leg created while the entry was PENDING qty=0 (entry-rule bracket)
-    must inherit the parent's SIZED quantity when promoted at fill — otherwise the
-    bracket closes 0 shares."""
+def test_bracket_closes_full_sized_position_even_if_set_before_sizing():
+    """The lean bracket closes the FULL filled quantity even when TP/SL were recorded while the
+    entry was still PENDING qty=0 (entry-rule bracket, sized by the RM afterwards). Because the
+    exit reads the actual held NET position at close time, it can never close 0 (or a stale) qty —
+    the invariant the old WAITING_TRIGGER qty-sync guarded, now true by construction."""
     from ba2_common.core.types import OrderDirection, OrderType, OrderStatus, OrderOpenType
     from ba2_common.core.models import TradingOrder, Transaction
     from ba2_common.core.db import add_instance, get_instance, update_instance
 
     acct, ctx, ps = _acct(
-        [
-            (D1, 100, 101, 99, 100),
-            (D2, 102, 103, 101, 102),
-            (D3, 104, 107, 103, 106),
-        ]
+        [(D1, 100, 101, 99, 100), (D2, 102, 103, 101, 102), (D3, 104, 107, 103, 106)]
     )
     try:
         ps.set_clock(D1)
-
-        # 1. Entry order PENDING qty=0 + its transaction — the Phase 1 / Phase 1.5
-        #    analog (BuyAction.execute() creates the order via add_instance with
-        #    quantity=0.0, status=PENDING; TradeActionEvaluator's Phase 1.5 then calls
-        #    account._create_transaction_for_order(order) BEFORE the RM sizes it).
+        # 1. Entry PENDING qty=0 + its transaction (Phase 1.5 analog, BEFORE the RM sizes it).
         entry = TradingOrder(
-            account_id=1,
-            symbol="AAPL",
-            side=OrderDirection.BUY,
-            quantity=0.0,
-            order_type=OrderType.MARKET,
-            status=OrderStatus.PENDING,
-            open_type=OrderOpenType.AUTOMATIC,
-            comment="entry-bracket-test",
-            created_at=datetime.now(timezone.utc),
-        )
+            account_id=1, symbol="AAPL", side=OrderDirection.BUY, quantity=0.0,
+            order_type=OrderType.MARKET, status=OrderStatus.PENDING,
+            open_type=OrderOpenType.AUTOMATIC, comment="entry-bracket-test",
+            created_at=datetime.now(timezone.utc))
         entry_id = add_instance(entry)
         entry = get_instance(TradingOrder, entry_id)
         acct._create_transaction_for_order(entry)
         update_instance(entry)
         txn = get_instance(Transaction, entry.transaction_id)
 
-        # 2. adjust_tp_sl(txn, tp, sl) -> OCO leg, quantity copied from the still-unsized
-        #    entry (quantity == 0) — this is the bug this test guards against.
-        assert acct.adjust_tp_sl(txn, new_tp_price=120.0, new_sl_price=90.0) is True
-        legs = [o for o in acct.get_orders() if o.depends_on_order == entry.id]
-        assert len(legs) == 1
-        leg = legs[0]
-        assert leg.status == OrderStatus.WAITING_TRIGGER
-        assert leg.quantity == 0
+        # 2. Record TP/SL while the entry is still qty=0 — stored on the transaction, no leg order.
+        assert acct.adjust_tp_sl(txn, new_tp_price=106.0, new_sl_price=90.0) is True
+        assert [o for o in acct.get_orders() if o.depends_on_order == entry.id] == []
 
-        # 3. Size the entry (risk-manager analog: quantity=7), submit + fill it on the
-        #    next bar (D1 -> D2 open).
+        # 3. RM sizes the entry (quantity=7), submit + fill on the next bar.
         entry.quantity = 7.0
         update_instance(entry)
         acct.submit_order(entry)
         ps.set_clock(D1)
-        acct.refresh_orders()  # entry MARKET fills at D2 open
-        filled_entry = acct.get_order(entry.broker_order_id)
-        assert filled_entry.status == OrderStatus.FILLED
-        assert filled_entry.filled_qty == 7
+        acct.refresh_orders()
+        acct.refresh_transactions()  # entry fills 7 @102, WAITING -> OPENED
+        assert acct.get_order(entry.broker_order_id).filled_qty == 7
 
-        # 4. Run the promotion pass: WAITING_TRIGGER -> ACCEPTED runs inside
-        #    refresh_orders() (_activate_triggered_dependents), exactly when the parent
-        #    entry reaches its trigger status (FILLED).
+        # 4. Bar D3 crosses TP@106 -> the bracket closes the FULL 7 shares.
         ps.set_clock(D2)
         acct.refresh_orders()
-
-        # 5. The leg is ACCEPTED and picked up the parent's REAL filled quantity.
-        promoted = acct.get_order(leg.broker_order_id)
-        assert promoted.status in (OrderStatus.ACCEPTED, OrderStatus.FILLED)
-        assert promoted.quantity == 7
+        acct.refresh_transactions()
+        assert acct.get_positions() == []  # fully flat (not 0-share, not partial)
+        rts = acct.get_round_trip_trades()
+        assert len(rts) == 1
+        assert rts[0]["size"] == 7.0
+        assert rts[0]["exit_reason"] == "take_profit"
     finally:
         ctx.__exit__(None, None, None)
 

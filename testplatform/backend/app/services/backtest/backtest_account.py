@@ -1291,16 +1291,12 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         the common case on a fine fill clock (5-minute) and a large share of per-bar runtime.
         """
         as_of = self._price.now()
-        self._activate_triggered_dependents()
 
         active = OrderStatus.get_active_statuses()
-        # Re-read AFTER activation so newly-activated legs are seen this bar. SQL-filtered to
-        # active statuses so terminal orders (the bulk after a while) aren't materialised.
-        working = [
-            o
-            for o in self._orders_filtered(statuses=active)
-            if o.status != OrderStatus.WAITING_TRIGGER
-        ]
+        # Working orders: entries (MARKET/LIMIT/STOP), plain exit sells, and option legs. TP/SL
+        # brackets are NO LONGER order rows — they are checked directly in _apply_bracket_exits
+        # below (lean simulator). SQL-filtered to active statuses so terminal orders aren't materialised.
+        working = list(self._orders_filtered(statuses=active))
         # SL-before-TP: when a single bar's range spans BOTH the take-profit (limit) and the
         # stop-loss (stop) leg of an OCO pair, the intrabar order is ambiguous — fill the STOP
         # FIRST so the conservative worst-case (stop-loss) wins and cancels the TP sibling. A
@@ -1322,7 +1318,6 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 if not self._cap_single_leg_option_entry(o, fill_px):
                     continue  # unaffordable at >=1 contract -> entry did not open
                 self._apply_option_fill(o, fill_px, as_of)
-                self._cancel_oco_sibling(o)
                 filled = True
                 continue
             if getattr(o, "asset_class", None) == AssetClass.OPTION:
@@ -1348,7 +1343,11 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             if fill_px is None:
                 continue
             self._apply_fill(o, fill_px, as_of)
-            self._cancel_oco_sibling(o)
+            filled = True
+
+        # LEAN bracket exits: check each OPEN transaction's take_profit/stop_loss directly against
+        # this bar and synthesize the closing order when crossed (replaces WAITING_TRIGGER/OCO legs).
+        if self._apply_bracket_exits(as_of):
             filled = True
         return filled
 
@@ -1580,39 +1579,94 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         if parent.id is not None:
             self._fill_dates[parent.id] = as_of
 
-    def _activate_triggered_dependents(self) -> None:
-        """Promote WAITING_TRIGGER legs to ACCEPTED once their parent hits the trigger.
+    def _apply_bracket_exits(self, as_of) -> bool:
+        """Lean TP/SL bracket exits — the replacement for WAITING_TRIGGER/OCO leg orders.
 
-        A leg created by ``adjust_tp``/``adjust_sl``/``adjust_tp_sl`` waits with
-        ``depends_on_order`` = the entry order id and ``depends_order_status_trigger`` =
-        FILLED. When the parent reaches that status the leg goes live (ACCEPTED) so the
-        fill engine evaluates it. Legs with no parent / unmet trigger are left waiting.
+        For each OPEN transaction of THIS account carrying a ``take_profit`` and/or ``stop_loss``,
+        if the current bar crosses the level, synthesize the closing order at that level (STOP wins
+        on a straddle — the conservative worst case) for the full held quantity and fill it through
+        the SAME fill path (``_evaluate_fill``/``_apply_fill``), so exit price + slippage are
+        byte-identical to the old leg-based bracket. The closing order carries ``depends_on_order`` +
+        an ``OCO-`` comment marker so the inherited ``refresh_transactions`` recognises the TP/SL
+        close (and ``get_round_trip_trades._exit_reason`` labels take_profit/stop_loss from the
+        stop/limit price). No pre-staged leg rows are ever created — that is the ORM-churn saving.
+
+        Runs AFTER the working-order loop, so a plain ruleset-close SELL that already filled this bar
+        balances the position and the ``net == 0`` guard skips the bracket (no double close).
         """
-        waiting = self._orders_filtered(statuses=[OrderStatus.WAITING_TRIGGER])
-        if not waiting:
-            return
-        # Look the parent up FRESH per waiting leg. The parent is usually the entry order, which
-        # by the time a leg waits is typically FILLED (TERMINAL) — so it is NOT in the active
-        # working set, and a cached ``_all_orders`` instance of it may be STALE (the fill engine
-        # persists fills on the separate active instances). ``get_instance`` reads the current
-        # persisted status. Only runs when waiting legs exist (a handful per run), so the per-leg
-        # read is negligible.
-        for leg in waiting:
-            if leg.depends_on_order is None:
+        from sqlmodel import select, Session
+
+        # Read the OPEN transactions' (id, tp, sl) into plain tuples INSIDE the session so the
+        # rows don't become detached/expired when the session closes (SQLAlchemy expire_on_commit).
+        with Session(get_db().bind) as session:
+            opened = [
+                (t.id, t.take_profit, t.stop_loss)
+                for t in session.exec(
+                    select(Transaction).where(Transaction.status == TransactionStatus.OPENED)
+                ).all()
+            ]
+
+        filled_any = False
+        _min_dt = datetime.min.replace(tzinfo=timezone.utc)
+        for txn_id, tp, sl in opened:
+            if not tp and not sl:
                 continue
-            parent = get_instance(TradingOrder, leg.depends_on_order)
-            if parent is None:
+            # Use the account's cache-safe order accessor (as refresh_orders does) — never the
+            # detached Session rows. The ENTRY is the order with depends_on_order IS NULL (oldest);
+            # NET filled position = filled buys - sells. Zero net => already flat (e.g. a plain
+            # ruleset-close SELL filled this bar in the working loop) -> skip to avoid a double close.
+            entry = None
+            net = 0.0
+            for o in self._orders_filtered(transaction_id=txn_id):
+                if o.account_id != self.id:
+                    continue
+                if o.depends_on_order is None:
+                    if entry is None or ((o.created_at or _min_dt), (o.id or 0)) < (
+                            (entry.created_at or _min_dt), (entry.id or 0)):
+                        entry = o
+                if o.status == OrderStatus.FILLED and o.filled_qty:
+                    net += o.filled_qty if o.side == OrderDirection.BUY else -o.filled_qty
+            if entry is None or abs(net) < 1e-9:
                 continue
-            trigger = leg.depends_order_status_trigger or OrderStatus.FILLED
-            if parent.status == trigger:
-                # Entry-rule brackets are created while the parent is still PENDING qty=0
-                # (the RM sizes it afterwards) — sync the leg to the parent's real filled
-                # size at promotion so the bracket closes the whole position.
-                parent_qty = parent.filled_qty or parent.quantity
-                if parent_qty and leg.quantity != parent_qty:
-                    leg.quantity = parent_qty
-                leg.status = OrderStatus.ACCEPTED
-                update_instance(leg)
+            is_long = net > 0
+            held = abs(net)
+            close_side = OrderDirection.SELL if is_long else OrderDirection.BUY
+            # SL first (conservative on a straddle), then TP.
+            for leg, price, otype in (
+                ("SL", sl, OrderType.SELL_STOP if is_long else OrderType.BUY_STOP),
+                ("TP", tp, OrderType.SELL_LIMIT if is_long else OrderType.BUY_LIMIT),
+            ):
+                if not price:
+                    continue
+                # Transient probe (NOT persisted): reuse _evaluate_fill so the crossing test + fill
+                # price (stop∓slip / limit) are identical to a real leg. Only persist if it crosses.
+                probe = TradingOrder(
+                    account_id=self.id, symbol=entry.symbol, quantity=held, side=close_side,
+                    order_type=otype,
+                    stop_price=(price if leg == "SL" else None),
+                    limit_price=(price if leg == "TP" else None),
+                )
+                fill_px = self._evaluate_fill(probe, as_of)
+                if fill_px is None:
+                    continue  # not crossed this bar
+                ts = int(as_of.timestamp()) if hasattr(as_of, "timestamp") else 0
+                probe.transaction_id = txn_id
+                probe.depends_on_order = entry.id
+                probe.status = OrderStatus.ACCEPTED
+                probe.open_type = OrderOpenType.AUTOMATIC
+                probe.broker_order_id = self._next_broker_id()
+                probe.expert_recommendation_id = entry.expert_recommendation_id
+                probe.comment = f"{ts}-OCO-{leg}-[PARENT:{entry.id}/BROKER:{entry.broker_order_id}]"
+                probe.created_at = as_of
+                oid = add_instance(probe)
+                # add_instance leaves `probe` detached/expired (expire_on_commit); re-fetch a loaded
+                # instance so _apply_fill can read its attributes without a lazy-load.
+                persisted = get_instance(TradingOrder, oid) or probe
+                self._apply_fill(persisted, fill_px, as_of)
+                self.invalidate_order_cache()  # a close order was persisted -> reload next bar
+                filled_any = True
+                break  # SL-first: at most one bracket close per txn per bar
+        return filled_any
 
     def refresh_transactions(self) -> bool:
         """Roll order state into transactions, then fix ``open_date``/``close_date`` to sim time.
@@ -2689,60 +2743,34 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         return o
 
     def adjust_tp(self, transaction: Transaction, new_tp_price: float, source: str = "") -> bool:
-        """Create/replace a TP leg for a transaction.
+        """Record a take-profit level on the transaction (LEAN SIMULATOR — no leg order).
 
-        TP for a LONG (BUY) transaction is a SELL_LIMIT above entry; for a SHORT (SELL)
-        transaction it is a BUY_LIMIT below entry. The leg is created WAITING_TRIGGER on
-        the entry order's FILL (mirrors AlpacaAccount). Returns False if the entry order
-        cannot be found or the price is invalid.
+        The fill engine's ``_apply_bracket_exits`` checks ``transaction.take_profit`` directly
+        against each bar and synthesizes the closing order when it is crossed — there is NO
+        pre-staged WAITING_TRIGGER/OCO leg order (that live-broker mechanism is not modelled in the
+        backtest; it only cost ORM churn with no economic effect). TP for a LONG closes with a
+        SELL_LIMIT at ``new_tp_price``; for a SHORT a BUY_LIMIT. Idempotent — safe to re-issue every
+        manage bar (a trailing/updated level just overwrites the stored value). Returns False if the
+        entry order can't be found or the price is invalid.
         """
         if not new_tp_price or new_tp_price <= 0:
             return False
-        entry = self._entry_order_for_transaction(transaction)
-        if entry is None:
+        if self._entry_order_for_transaction(transaction) is None:
             return False
-        # PRESERVE the existing SL: the protective bracket is a SINGLE OCO order, and
-        # _replace_leg cancels ALL existing legs before creating the one passed in. Issuing a
-        # TP-only leg here would silently DROP the stop-loss. If the transaction still carries a
-        # stop_loss, re-issue a full OCO (new TP + existing SL) so moving one leg never nukes the
-        # other. (Symmetric to adjust_sl preserving the TP — the bug behind inflated open_at_end
-        # winners: a break-even-lock adjust_sl was dropping the take-profit.)
-        existing_sl = getattr(transaction, "stop_loss", None)
-        if existing_sl and existing_sl > 0:
-            return self.adjust_tp_sl(transaction, new_tp_price=new_tp_price,
-                                     new_sl_price=existing_sl, source=source)
-        is_long = entry.side == OrderDirection.BUY
-        leg_type = OrderType.SELL_LIMIT if is_long else OrderType.BUY_LIMIT
-        self._replace_leg(transaction, entry, leg="TP", order_type=leg_type,
-                          limit_price=new_tp_price, stop_price=None, source=source)
         transaction.take_profit = new_tp_price
         update_instance(transaction)
         return True
 
     def adjust_sl(self, transaction: Transaction, new_sl_price: float, source: str = "") -> bool:
-        """Create/replace an SL leg for a transaction.
+        """Record a stop-loss level on the transaction (LEAN SIMULATOR — no leg order).
 
-        SL for a LONG (BUY) transaction is a SELL_STOP below entry; for a SHORT (SELL)
-        transaction it is a BUY_STOP above entry. WAITING_TRIGGER on the entry's FILL.
+        Mirror of ``adjust_tp``: ``_apply_bracket_exits`` closes with a SELL_STOP (long) / BUY_STOP
+        (short) at ``new_sl_price`` when a bar crosses it. No WAITING_TRIGGER leg; idempotent.
         """
         if not new_sl_price or new_sl_price <= 0:
             return False
-        entry = self._entry_order_for_transaction(transaction)
-        if entry is None:
+        if self._entry_order_for_transaction(transaction) is None:
             return False
-        # PRESERVE the existing TP: _replace_leg cancels ALL legs (the bracket is a single OCO),
-        # so an SL-only leg here would DROP the take-profit. This was THE bug behind the inflated
-        # open_at_end winners: a break-even-lock (adjust_sl) cancelled the OCO and re-issued an
-        # SL-only stop, leaving the position with NO take-profit so it rode past +TP% unbounded.
-        # If a take_profit is still set, re-issue a full OCO (existing TP + new SL).
-        existing_tp = getattr(transaction, "take_profit", None)
-        if existing_tp and existing_tp > 0:
-            return self.adjust_tp_sl(transaction, new_tp_price=existing_tp,
-                                     new_sl_price=new_sl_price, source=source)
-        is_long = entry.side == OrderDirection.BUY
-        leg_type = OrderType.SELL_STOP if is_long else OrderType.BUY_STOP
-        self._replace_leg(transaction, entry, leg="SL", order_type=leg_type,
-                          limit_price=None, stop_price=new_sl_price, source=source)
         transaction.stop_loss = new_sl_price
         update_instance(transaction)
         return True
@@ -2754,27 +2782,13 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         new_sl_price: Optional[float] = None,
         source: str = "",
     ) -> bool:
-        """Set a paired TP+SL as an OCO bracket (one-cancels-other).
+        """Record a paired TP+SL on the transaction (LEAN SIMULATOR — no OCO leg order).
 
-        When BOTH prices are given we create a single ``OrderType.OCO`` leg carrying both
-        ``limit_price`` (TP) and ``stop_price`` (SL); the fill engine fills it at whichever
-        side the bar crosses first and ``refresh_transactions`` recognises the close via
-        the ``OrderType.OCO`` / ``"OCO-"`` marker. When only one price is given we fall
-        back to a single TP or SL leg.
+        Both levels live independently as ``transaction.take_profit``/``stop_loss``;
+        ``_apply_bracket_exits`` fills whichever the bar crosses first (STOP wins on a straddle,
+        the conservative worst case) and closes the trade. No single ``OrderType.OCO`` leg is
+        materialised.
         """
-        if new_tp_price is not None and new_sl_price is not None:
-            if new_tp_price <= 0 or new_sl_price <= 0:
-                return False
-            entry = self._entry_order_for_transaction(transaction)
-            if entry is None:
-                return False
-            self._replace_leg(transaction, entry, leg="TPSL", order_type=OrderType.OCO,
-                              limit_price=new_tp_price, stop_price=new_sl_price, source=source)
-            transaction.take_profit = new_tp_price
-            transaction.stop_loss = new_sl_price
-            update_instance(transaction)
-            return True
-
         ok = True
         if new_tp_price is not None:
             ok &= self.adjust_tp(transaction, new_tp_price, source=source)
@@ -3049,66 +3063,10 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         rows.sort(key=lambda o: (o.created_at or datetime.min.replace(tzinfo=timezone.utc), o.id or 0))
         return rows[0]
 
-    def _existing_legs(self, transaction: Transaction) -> List[TradingOrder]:
-        """All non-terminal dependent (TP/SL/OCO) legs for a transaction.
-
-        SQL-scoped to this transaction's orders — scanning ALL account orders here (once per
-        bracket, with thousands accumulated) was the dominant super-linear cost of a long run.
-        """
-        terminal = OrderStatus.get_terminal_statuses()
-        return [
-            o
-            for o in self._orders_filtered(transaction_id=transaction.id)
-            if o.depends_on_order is not None and o.status not in terminal
-        ]
-
-    def _replace_leg(
-        self,
-        transaction: Transaction,
-        entry: TradingOrder,
-        leg: str,
-        order_type: OrderType,
-        limit_price: Optional[float],
-        stop_price: Optional[float],
-        source: str,
-    ) -> TradingOrder:
-        """Cancel any existing protective leg(s) and create a fresh WAITING_TRIGGER leg.
-
-        The new leg is the side that CLOSES the position (opposite the entry side), carries
-        an ``OCO-`` comment marker + (for paired) ``OrderType.OCO`` so the inherited
-        ``refresh_transactions`` recognises a TP/SL close, and depends on the entry order
-        reaching FILLED before going live. Quantity is synced to the entry order's quantity.
-        """
-        # Cancel any existing non-terminal legs (single TP/SL replaced; OCO supersedes both).
-        for old in self._existing_legs(transaction):
-            old.status = OrderStatus.CANCELED
-            update_instance(old)
-
-        close_side = OrderDirection.SELL if entry.side == OrderDirection.BUY else OrderDirection.BUY
-        ts = int(datetime.now(timezone.utc).timestamp())
-        comment = f"{ts}-OCO-{leg}-[PARENT:{entry.id}/BROKER:{entry.broker_order_id}]"
-
-        leg_order = TradingOrder(
-            account_id=self.id,
-            symbol=entry.symbol,
-            quantity=entry.quantity,
-            side=close_side,
-            order_type=order_type,
-            limit_price=limit_price,
-            stop_price=stop_price,
-            transaction_id=transaction.id,
-            status=OrderStatus.WAITING_TRIGGER,
-            depends_on_order=entry.id,
-            depends_order_status_trigger=OrderStatus.FILLED,
-            open_type=OrderOpenType.AUTOMATIC,
-            broker_order_id=self._next_broker_id(),
-            expert_recommendation_id=entry.expert_recommendation_id,
-            comment=comment,
-            created_at=datetime.now(timezone.utc),
-        )
-        add_instance(leg_order)
-        self.invalidate_order_cache()  # a new leg was persisted -> fill engine must reload
-        return leg_order
+    # NOTE: the WAITING_TRIGGER/OCO leg factory (_replace_leg) + its helper (_existing_legs) were
+    # REMOVED — the lean simulator stores TP/SL on the transaction and closes directly via
+    # _apply_bracket_exits (no pre-staged dependent-leg orders). The live broker accounts still use
+    # the real leg mechanism; that lives in AlpacaAccount, not here.
 
     def _cancel_oco_sibling(self, filled_order) -> None:
         """When an OCO/TP/SL leg fills, cancel the sibling protective leg(s).
