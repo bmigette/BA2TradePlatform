@@ -756,6 +756,22 @@ def _build_experts(
         # FactorPortfolioManager (the engine routes its analyze_as_of targets there directly).
         bypass = bool(getattr(expert_cls, "bypasses_classic_rm", False))
 
+        # LIVE-PARITY (gap #4): the LIVE RM-skip decision keys off
+        # ``expert_uses_risk_manager`` (WorkerQueue.py:1473), while the backtest routes off
+        # ``bypasses_classic_rm``. For the LOCKED parity scope (classic-RM + bypass only) these two
+        # signals MUST agree — a self-executing expert (uses_risk_manager=False) must also declare
+        # bypasses_classic_rm, and vice-versa. Fail loud if they diverge, so a future expert that
+        # sets only one flag can't silently run a different policy in backtest vs live.
+        from ba2_common.core.utils import expert_uses_risk_manager
+        self_executes = not expert_uses_risk_manager(expert_cls)
+        if bypass != self_executes:
+            raise ValueError(
+                f"Expert '{class_name}' has inconsistent RM-routing flags: "
+                f"bypasses_classic_rm={bypass} but expert_uses_risk_manager="
+                f"{not self_executes}. Backtest routes on bypasses_classic_rm while live's RM-skip "
+                f"keys off expert_uses_risk_manager — they must agree (set both). See "
+                f"docs/plans/2026-07-02-live-backtest-engine-unification.md gap #4.")
+
         if bypass:
             ruleset_id: Optional[int] = None
             expert_id = seed_expert_instance(
