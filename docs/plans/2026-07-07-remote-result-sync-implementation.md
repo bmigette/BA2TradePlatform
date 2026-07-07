@@ -591,16 +591,39 @@ Add a small lazy-session helper, right before the `/sync/*` routes:
 ```python
 def _sync_session():
     """Lazily bind SessionLocal to app.models.database's session factory, and ensure the
-    strategies/strategy_optimizations/backtests tables exist. Module-level (not per-call)
-    import so tests can monkeypatch ``ws.SessionLocal`` to an isolated engine."""
+    strategies/strategy_optimizations/backtests tables exist on whatever engine SessionLocal is
+    CURRENTLY bound to.
+
+    Module-level (not per-call) SessionLocal binding so tests can monkeypatch ``ws.SessionLocal``
+    to an isolated engine — but the table-existence check runs on every call (like ``/secrets``'s
+    ``init_db()``), not just the first: a test can point ``SessionLocal`` at a freshly-created,
+    schema-less engine, and that engine needs its tables created too. Table creation goes through
+    the model classes' own metadata (``Strategy.metadata``) rather than ``app.models.database.Base``
+    directly: ``app.models`` (the package) imports every model at package-import time against ONE
+    shared Base, so Strategy/StrategyOptimization/Backtest stay registered there even if
+    ``app.models.database`` itself gets reloaded later elsewhere — a reload rebinds that module's
+    ``Base``/``engine`` names to fresh objects but does NOT retroactively move already-imported
+    model classes onto the new Base, so ``app.models.database.Base.metadata.create_all(...)``
+    would silently create zero of the tables we need in that scenario.
+    """
     global SessionLocal
     if SessionLocal is None:
-        from app.models.database import SessionLocal as _SessionLocal, init_db
-        import app.models  # noqa: F401 — registers Strategy/StrategyOptimization/Backtest on Base
-        init_db()
+        from app.models.database import SessionLocal as _SessionLocal
         SessionLocal = _SessionLocal
-    return SessionLocal()
+    from app.models.strategy import Strategy
+    import app.models  # noqa: F401 — registers StrategyOptimization/Backtest alongside Strategy
+    session = SessionLocal()
+    Strategy.metadata.create_all(bind=session.get_bind())
+    return session
 ```
+
+(Original plan draft only called `init_db()` inside the `if SessionLocal is None:` branch — that
+breaks the moment a test monkeypatches `SessionLocal` directly, since the branch never runs and
+`init_db()` never fires for that engine. The version above ensures tables exist on every call, and
+uses `Strategy.metadata` specifically because a test that reloads `app.models.database` (to point
+at an isolated temp DB) gets a fresh `Base`/`engine` that already-imported model classes are NOT
+retroactively re-registered on — found and fixed during Task 3's implementation, verified
+empirically before the fix.)
 
 Add the three endpoints (after `/secrets`, before `/update`):
 
