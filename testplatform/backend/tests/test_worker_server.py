@@ -164,6 +164,46 @@ def test_sync_strategy_inserts_row(client, monkeypatch, tmp_path):
         s.close()
 
 
+def test_sync_optimization_resolves_parent_strategy_id(client, monkeypatch, tmp_path):
+    """End-to-end: seed a parent Strategy via a real /sync/strategy POST, then push a
+    StrategyOptimization whose strategy_name/strategy_created_at match it, and confirm the FK
+    resolves to the LOCAL strategy id (not the master's), matching the parent_fk contract
+    exercised at the unit level in test_sync_receiver.py."""
+    db_path = tmp_path / "sync_test_opt.sqlite"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+    import importlib
+    import app.models.database as dbmod
+    importlib.reload(dbmod)
+    monkeypatch.setattr(ws, "SessionLocal", dbmod.SessionLocal, raising=False)
+
+    strategy_created_at = "2026-01-01T00:00:00+00:00"
+    strat_payload = {"id": 111, "name": "opt-parent-strategy", "created_at": strategy_created_at}
+    r = client.post("/sync/strategy", headers=H, json=strat_payload)
+    assert r.status_code == 200 and r.json() == {"ok": True, "skipped": False}
+
+    opt_created_at = "2026-01-02T00:00:00+00:00"
+    opt_payload = {
+        "id": 222, "name": "opt-1", "created_at": opt_created_at,
+        "strategy_id": 111,  # the MASTER's id — must NOT end up on the local row verbatim
+        "strategy_name": "opt-parent-strategy", "strategy_created_at": strategy_created_at,
+        "status": "running", "fitness_metric": "sharpe", "optimization_type": "genetic",
+    }
+    r = client.post("/sync/optimization", headers=H, json=opt_payload)
+    assert r.status_code == 200 and r.json() == {"ok": True, "skipped": False}
+
+    from app.models.strategy import Strategy
+    from app.models.strategy_optimization import StrategyOptimization
+    s = dbmod.SessionLocal()
+    try:
+        strategy = s.query(Strategy).one()
+        opt = s.query(StrategyOptimization).one()
+        assert opt.name == "opt-1"
+        assert opt.strategy_id == strategy.id
+        assert opt.strategy_id != 111
+    finally:
+        s.close()
+
+
 def test_sync_endpoints_require_auth(client):
     assert client.post("/sync/strategy", json={"name": "x", "created_at": "2026-01-01T00:00:00"}).status_code == 401
     assert client.post("/sync/optimization", json={"name": "x", "created_at": "2026-01-01T00:00:00"}).status_code == 401

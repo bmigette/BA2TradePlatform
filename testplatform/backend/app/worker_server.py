@@ -14,9 +14,9 @@ Endpoints (every one bearer-checked against the worker password):
   POST /cache/prune    -> {rel_paths} -> delete leftovers from a master-side rebuild/compaction
   POST /run-trial      -> {config, fitness_metric} -> {ok, fitness, trades, error, fatal}
   POST /run-trial-full -> {config, fitness_metric} -> {ok, results:{...full backtest results}}
-  POST /sync/strategy    -> {...Strategy row + natural keys} -> upsert by (name, created_at)
-  POST /sync/optimization-> {...StrategyOptimization row + strategy natural key} -> upsert
-  POST /sync/backtest    -> {...Backtest row + strategy/optimization natural keys} -> upsert
+  POST /sync/strategy     -> {...Strategy row + natural keys} -> upsert by (name, created_at)
+  POST /sync/optimization -> {...StrategyOptimization row + strategy natural key} -> upsert
+  POST /sync/backtest     -> {...Backtest row + strategy/optimization natural keys} -> upsert
   POST /update         -> git pull + reinstall + restart (self_update)
 """
 
@@ -30,7 +30,7 @@ from concurrent.futures import ProcessPoolExecutor
 from typing import Optional
 
 from fastapi import FastAPI, Header, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from app.services import cache_sync, self_update, sync_receiver
 
@@ -75,6 +75,23 @@ class SecretsReq(BaseModel):
 
 class PruneReq(BaseModel):
     rel_paths: list[str]  # worker-relative cache paths the master's manifest no longer lists
+
+
+class SyncRowReq(BaseModel):
+    """Body for the 3 ``/sync/*`` endpoints: a replicated model row plus natural-key sidecar
+    fields (e.g. ``strategy_name``/``strategy_created_at`` for FK resolution).
+
+    Only ``name``/``created_at`` (the natural key every target table is matched by) are declared
+    — everything else legitimately varies per target model (every other column on
+    Strategy/StrategyOptimization/Backtest, plus the FK-parent natural-key sidecar fields), so
+    this deliberately does NOT enumerate a rigid schema of every possible field. ``extra="allow"``
+    lets those pass through to ``sync_receiver.upsert_by_natural_key`` unchanged; declaring the
+    two required fields turns a malformed payload (missing ``name``/``created_at``) into a clean
+    422 at the FastAPI boundary instead of a ``None`` silently propagating deep into the upsert.
+    """
+    model_config = ConfigDict(extra="allow")
+    name: str
+    created_at: str
 
 
 def _localize_paths(obj, master_root: str, local_root: str):
@@ -233,54 +250,87 @@ def set_secrets(req: SecretsReq, authorization: str = Header(default=None)):
     return {"set": n, "keys": sorted((req.settings or {}).keys())}
 
 
+# Engine ids (per Python object identity) whose tables we've already ensured exist, so
+# _ensure_tables() only pays the create_all()/has_table() round-trips once per distinct engine
+# rather than once per request.
+_ensured_engine_ids: set = set()
+
+
+def _ensure_tables(session) -> None:
+    """Create the app's tables on ``session``'s engine if we haven't already done so for it.
+
+    ``Strategy.metadata`` **is** ``app.models.database.Base.metadata`` — every model in this app
+    (``Worker``, ``TaskQueue``, ``Dataset``, ``Strategy``, ``StrategyOptimization``, ``Backtest``,
+    ...) is registered on that ONE shared Base, so this call creates the entire app schema
+    (~14 tables), not just the 3 sync tables the callers care about. That's harmless — creating
+    tables that already exist is a no-op — but it's a `has_table` round-trip per table, so it's
+    cached per engine (by ``id()``) rather than repeated on every request.
+    """
+    engine = session.get_bind()
+    if id(engine) in _ensured_engine_ids:
+        return
+    from app.models.strategy import Strategy
+    import app.models  # noqa: F401 — registers StrategyOptimization/Backtest alongside Strategy
+    Strategy.metadata.create_all(bind=engine)
+    _ensured_engine_ids.add(id(engine))
+
+
 def _sync_session():
-    """Lazily bind SessionLocal to app.models.database's session factory, and ensure the
-    strategies/strategy_optimizations/backtests tables exist on whatever engine SessionLocal is
-    CURRENTLY bound to.
+    """Lazily bind SessionLocal to app.models.database's session factory, and ensure the tables
+    exist on whatever engine SessionLocal is CURRENTLY bound to (see ``_ensure_tables``).
 
     Module-level (not per-call) SessionLocal binding so tests can monkeypatch ``ws.SessionLocal``
-    to an isolated engine — but the table-existence check runs on every call (like ``/secrets``'s
-    ``init_db()``), not just the first: a test can point ``SessionLocal`` at a freshly-created,
-    schema-less engine (see test_sync_strategy_inserts_row's ``importlib.reload`` +
-    ``monkeypatch.setattr(ws, "SessionLocal", ...)`` dance), and that engine needs its tables
-    created too. Table creation goes through the model classes' own metadata
-    (``Strategy.metadata``) rather than ``app.models.database.Base`` directly: ``app.models`` (the
-    package) imports every model at package-import time against ONE shared Base, so
-    Strategy/StrategyOptimization/Backtest stay registered there even if
-    ``app.models.database`` itself gets reloaded later elsewhere — a reload rebinds that module's
-    ``Base``/``engine`` names to fresh objects but does NOT retroactively move already-imported
-    model classes onto the new Base, so ``app.models.database.Base.metadata.create_all(...)``
-    would silently create zero of the tables we need in that scenario.
+    to an isolated engine. ``_ensure_tables`` is called (and, per engine, only actually runs
+    ``create_all`` once) rather than skipped after the first bind, because a test can point
+    ``SessionLocal`` at a freshly-created, schema-less engine (see
+    test_sync_strategy_inserts_row's ``importlib.reload`` + ``monkeypatch.setattr(ws,
+    "SessionLocal", ...)`` dance), and that DIFFERENT engine needs its tables created too — the
+    per-engine cache in ``_ensure_tables`` handles exactly this: a new engine (new ``id()``) still
+    gets ensured, a repeat call on the same engine is a no-op.
     """
     global SessionLocal
     if SessionLocal is None:
         from app.models.database import SessionLocal as _SessionLocal
         SessionLocal = _SessionLocal
-    from app.models.strategy import Strategy
-    import app.models  # noqa: F401 — registers StrategyOptimization/Backtest alongside Strategy
     session = SessionLocal()
-    Strategy.metadata.create_all(bind=session.get_bind())
+    _ensure_tables(session)
     return session
 
 
+def _do_sync(model_cls, payload: dict, parent_fk: Optional[dict] = None) -> dict:
+    """Shared body for the three ``/sync/*`` endpoints: session lifecycle, upsert, error handling.
+
+    Mirrors ``/secrets``'s try/except/finally shape (open session -> upsert -> HTTPException on
+    any failure -> always close), so a malformed payload or a DB-level error surfaces as a clean
+    500 with a logged, descriptive detail instead of propagating as an unhandled exception into
+    FastAPI's default handler.
+    """
+    s = None
+    try:
+        s = _sync_session()
+        row = sync_receiver.upsert_by_natural_key(s, model_cls, payload, parent_fk=parent_fk)
+        return {"ok": True, "skipped": row is None}
+    except Exception as e:  # noqa: BLE001
+        logger.error("sync failed for %s: %s", model_cls.__name__, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"sync failed: {e!r}")
+    finally:
+        if s is not None:
+            s.close()
+
+
 @worker_app.post("/sync/strategy")
-def sync_strategy(payload: dict, authorization: str = Header(default=None)):
+def sync_strategy(req: SyncRowReq, authorization: str = Header(default=None)):
     """Upsert a replicated Strategy row, matched by (name, created_at)."""
     _verify(authorization)
     from app.models.strategy import Strategy
-    s = _sync_session()
-    try:
-        row = sync_receiver.upsert_by_natural_key(s, Strategy, payload)
-        return {"ok": True, "skipped": row is None}
-    finally:
-        s.close()
+    return _do_sync(Strategy, req.model_dump())
 
 
 @worker_app.post("/sync/optimization")
-def sync_optimization(payload: dict, authorization: str = Header(default=None)):
+def sync_optimization(req: SyncRowReq, authorization: str = Header(default=None)):
     """Upsert a replicated StrategyOptimization row, matched by (name, created_at).
 
-    ``payload`` carries strategy_name/strategy_created_at alongside the master's strategy_id
+    ``req`` carries strategy_name/strategy_created_at alongside the master's strategy_id
     so the FK can be remapped to this worker's own local Strategy id (see sync_receiver).
     ``strategy_id`` is NOT NULL on this table, so a missing parent means
     ``upsert_by_natural_key`` skips the write (returns None) rather than raising — reported
@@ -289,22 +339,17 @@ def sync_optimization(payload: dict, authorization: str = Header(default=None)):
     _verify(authorization)
     from app.models.strategy import Strategy
     from app.models.strategy_optimization import StrategyOptimization
-    s = _sync_session()
-    try:
-        row = sync_receiver.upsert_by_natural_key(
-            s, StrategyOptimization, payload,
-            parent_fk={"strategy_id": (Strategy, "strategy_name", "strategy_created_at")},
-        )
-        return {"ok": True, "skipped": row is None}
-    finally:
-        s.close()
+    return _do_sync(
+        StrategyOptimization, req.model_dump(),
+        parent_fk={"strategy_id": (Strategy, "strategy_name", "strategy_created_at")},
+    )
 
 
 @worker_app.post("/sync/backtest")
-def sync_backtest(payload: dict, authorization: str = Header(default=None)):
+def sync_backtest(req: SyncRowReq, authorization: str = Header(default=None)):
     """Upsert a replicated Backtest row, matched by (name, created_at).
 
-    ``payload`` carries both strategy_name/strategy_created_at and
+    ``req`` carries both strategy_name/strategy_created_at and
     optimization_name/optimization_created_at so both FKs remap to local ids. Both FK columns
     on this table are nullable, so a missing parent resolves to None and the row is still
     written (unlike StrategyOptimization.strategy_id) — ``skipped`` should always be false here
@@ -315,18 +360,13 @@ def sync_backtest(payload: dict, authorization: str = Header(default=None)):
     from app.models.strategy import Strategy
     from app.models.strategy_optimization import StrategyOptimization
     from app.models.backtest import Backtest
-    s = _sync_session()
-    try:
-        row = sync_receiver.upsert_by_natural_key(
-            s, Backtest, payload,
-            parent_fk={
-                "strategy_id": (Strategy, "strategy_name", "strategy_created_at"),
-                "optimization_id": (StrategyOptimization, "optimization_name", "optimization_created_at"),
-            },
-        )
-        return {"ok": True, "skipped": row is None}
-    finally:
-        s.close()
+    return _do_sync(
+        Backtest, req.model_dump(),
+        parent_fk={
+            "strategy_id": (Strategy, "strategy_name", "strategy_created_at"),
+            "optimization_id": (StrategyOptimization, "optimization_name", "optimization_created_at"),
+        },
+    )
 
 
 @worker_app.post("/update")
