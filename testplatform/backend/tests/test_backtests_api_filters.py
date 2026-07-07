@@ -278,13 +278,17 @@ def test_create_ml_still_works(client, db, monkeypatch):
 
 # --- Part C: save endpoint pushes the backtest to synced workers -----------
 def test_save_endpoint_pushes_backtest(client, db, monkeypatch):
+    """push_backtest is dispatched via BackgroundTasks (not called inline), which the TestClient
+    runs synchronously before .post() returns. Recording (id, is_saved, name) rather than just id
+    catches a regression where the dispatch is moved to BEFORE db.commit() — bt.id alone wouldn't
+    change with commit ordering, but is_saved/name would still be pre-commit values."""
     from app.api import backtests as backtests_api
     calls = []
-    monkeypatch.setattr(backtests_api, "push_backtest", lambda bt, db: calls.append(bt.id))
+    monkeypatch.setattr(backtests_api, "push_backtest", lambda bt, db: calls.append((bt.id, bt.is_saved, bt.name)))
 
     bt = _seed_backtest(db, name="unsaved-run", expert_name="FMPRating", optimization_id=None, is_saved=False)
 
     resp = client.post(f"/api/backtests/{bt.id}/save", json={"name": "kept-run"})
 
     assert resp.status_code == 200, resp.text
-    assert calls == [bt.id]
+    assert calls == [(bt.id, True, "kept-run")]

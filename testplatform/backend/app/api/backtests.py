@@ -7,7 +7,7 @@ Manages backtesting of trained models against historical data.
 import logging
 from datetime import datetime
 from typing import Any, List, Optional
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks
 from pydantic import BaseModel
 from sqlalchemy.orm import Session, defer
 
@@ -1331,9 +1331,20 @@ class BacktestSave(BaseModel):
 async def save_backtest(
     backtest_id: int,
     save_data: BacktestSave,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db)
 ):
-    """Save a backtest with a custom name (marks it as saved)."""
+    """Save a backtest with a custom name (marks it as saved).
+
+    ``push_backtest`` is synchronous (blocking ``httpx.Client`` calls, up to 3 rounds of 30s-timeout
+    POSTs per sync-enabled worker via ``push_optimization``/``push_strategy``). Calling it directly
+    here would block the ENTIRE asyncio event loop — every other concurrent request — for up to
+    ~90+ seconds per offline/slow worker. Dispatch it via ``BackgroundTasks`` instead: FastAPI runs
+    sync callables through ``run_in_threadpool`` (off the event loop) and only starts them AFTER the
+    response has already been sent. Reusing the request-scoped ``db`` session is safe here because
+    ``get_db`` (app/models/database.py) is the standard generator/yield pattern — background tasks
+    run before the dependency's post-yield ``db.close()`` fires.
+    """
     backtest = db.query(Backtest).filter(Backtest.id == backtest_id).first()
     if not backtest:
         raise HTTPException(status_code=404, detail=f"Backtest {backtest_id} not found")
@@ -1342,7 +1353,7 @@ async def save_backtest(
     backtest.is_saved = True
     db.commit()
     db.refresh(backtest)
-    push_backtest(backtest, db)
+    background_tasks.add_task(push_backtest, backtest, db)
 
     logger.info(f"Saved backtest: {backtest.name} (id={backtest_id})")
     return backtest.to_dict()
