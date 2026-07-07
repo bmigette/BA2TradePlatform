@@ -39,7 +39,10 @@ def upsert_by_natural_key(
     (e.g. the next generation) retries the parent first and self-heals.
 
     Returns the local row (existing, updated in place, or newly inserted), or None if the write
-    was skipped because a required parent hasn't synced yet. Never raises.
+    was skipped because a required parent hasn't synced yet. Does not raise for an unresolved
+    parent — that's the expected, self-healing case. A genuinely malformed payload (wrong type,
+    missing a required non-FK column, etc.) still raises, since that indicates a real bug on the
+    sender's side that should surface rather than be silently swallowed.
     """
     data = dict(payload)
     data.pop("id", None)  # never trust the master's id
@@ -70,6 +73,14 @@ def upsert_by_natural_key(
                 # the NOT NULL constraint. Nothing is lost: the next full-state push retries.
                 return None
             data[fk_col] = resolved_id
+
+    # Drop any key that isn't a real column on model_cls. Without this, the insert path
+    # (model_cls(**data)) raises TypeError on an unknown key while the update path
+    # (setattr(existing, key, value)) would silently set an inert, never-persisted attribute for
+    # the exact same malformed payload — filtering uniformly here keeps both paths behaving the
+    # same way for the same input.
+    valid_columns = set(model_cls.__table__.columns.keys())
+    data = {key: value for key, value in data.items() if key in valid_columns}
 
     existing = (
         session.query(model_cls)

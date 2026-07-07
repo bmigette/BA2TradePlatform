@@ -140,6 +140,43 @@ def test_nullable_parent_fk_missing_locally_resolves_to_none(session):
     assert session.query(Backtest).count() == 1
 
 
+def test_self_healing_sequence_skip_then_resolve_after_parent_syncs(session):
+    """The design's whole self-healing story: a StrategyOptimization pushed before its
+    Strategy has synced gets skipped (no row persisted); once the Strategy arrives, a re-push
+    of the SAME optimization payload succeeds and the FK resolves correctly — proving a
+    temporarily-unresolved required parent doesn't permanently lose the row, it just waits for
+    the next full-state push."""
+    opt_created = datetime(2026, 1, 2, tzinfo=timezone.utc)
+    opt_payload = {
+        "id": 7, "name": "opt-1", "created_at": _iso(opt_created),
+        "strategy_id": 42,
+        "strategy_name": "parent-strat", "strategy_created_at": _iso(datetime(2026, 1, 1, tzinfo=timezone.utc)),
+        "status": "running", "fitness_metric": "sharpe", "optimization_type": "genetic",
+    }
+    parent_fk = {"strategy_id": (Strategy, "strategy_name", "strategy_created_at")}
+
+    # First push: Strategy hasn't synced yet -> skipped, no row.
+    # (No dict() copy needed here: upsert_by_natural_key's very first line is
+    # `data = dict(payload)`, so it only ever mutates its own internal copy — the caller's
+    # opt_payload dict is never touched, and reusing it below for the re-push is safe.)
+    result = upsert_by_natural_key(session, StrategyOptimization, opt_payload, parent_fk=parent_fk)
+    assert result is None
+    assert session.query(StrategyOptimization).count() == 0
+
+    # Strategy syncs (e.g. push_strategy succeeded on a subsequent push_optimization call).
+    upsert_by_natural_key(
+        session, Strategy,
+        {"id": 42, "name": "parent-strat", "created_at": _iso(datetime(2026, 1, 1, tzinfo=timezone.utc))},
+    )
+    local_strategy_id = session.query(Strategy).one().id
+
+    # Re-push the SAME optimization payload -> now resolves and persists correctly.
+    opt = upsert_by_natural_key(session, StrategyOptimization, opt_payload, parent_fk=parent_fk)
+    assert opt is not None
+    assert opt.strategy_id == local_strategy_id
+    assert session.query(StrategyOptimization).count() == 1
+
+
 def test_backtest_dual_parent_fk_resolution(session):
     strat_created = datetime(2026, 1, 1, tzinfo=timezone.utc)
     upsert_by_natural_key(session, Strategy, {"id": 1, "name": "s", "created_at": _iso(strat_created)})
