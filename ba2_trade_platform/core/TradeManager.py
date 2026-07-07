@@ -1632,28 +1632,31 @@ class TradeManager:
                 # Prefer recommendations from OPEN_POSITIONS-subtype analyses: without this, a
                 # NEWER enter-market rec (e.g. this morning's entry scan for a held symbol)
                 # shadows the open-positions assessment and the exit rules are evaluated against
-                # an entry thesis. Experts don't stamp ExpertRecommendation.subtype, but the
-                # linked MarketAnalysis carries the use case (JobManager sets it on every
-                # scheduled/dynamic analysis). Falls back to ALL recs when none link to an
-                # open-positions analysis (manual analyses / legacy rows), preserving the old
-                # behaviour rather than silently managing nothing. The backtest engine always
-                # evaluates a fresh OPEN_POSITIONS rec, so this also closes a live/backtest gap.
-                from .models import MarketAnalysis
-                open_pos_rec_ids = set()
-                ma_ids = {r.market_analysis_id for r in all_recommendations if r.market_analysis_id}
-                if ma_ids:
-                    ma_rows = session.exec(
-                        select(MarketAnalysis).where(MarketAnalysis.id.in_(ma_ids))
-                    ).all()
-                    open_pos_ma = {m.id for m in ma_rows
-                                   if m.subtype == AnalysisUseCase.OPEN_POSITIONS}
-                    open_pos_rec_ids = {r.id for r in all_recommendations
-                                        if r.market_analysis_id in open_pos_ma}
-                if open_pos_rec_ids:
-                    candidate_recommendations = [r for r in all_recommendations
-                                                 if r.id in open_pos_rec_ids]
-                else:
-                    candidate_recommendations = all_recommendations
+                # an entry thesis. Selection precedence (each falls back to the next), always
+                # ending at ALL recs so a legacy/unstamped set is never silently dropped:
+                #   1. ExpertRecommendation.subtype == OPEN_POSITIONS  (the direct column, gap #5 —
+                #      preferred; writers now stamp it, and the backtest always evaluates a fresh
+                #      OPEN_POSITIONS rec, so this closes the live/backtest selection gap);
+                #   2. linked MarketAnalysis.subtype == OPEN_POSITIONS (audit-A3 heuristic, for
+                #      rows written before the column existed but with a stamped analysis);
+                #   3. ALL recs (manual analyses / legacy NULL-subtype rows) — preserve old behaviour.
+                candidate_recommendations = [r for r in all_recommendations
+                                             if r.subtype == AnalysisUseCase.OPEN_POSITIONS]
+                if not candidate_recommendations:
+                    from .models import MarketAnalysis
+                    ma_ids = {r.market_analysis_id for r in all_recommendations if r.market_analysis_id}
+                    open_pos_rec_ids = set()
+                    if ma_ids:
+                        ma_rows = session.exec(
+                            select(MarketAnalysis).where(MarketAnalysis.id.in_(ma_ids))
+                        ).all()
+                        open_pos_ma = {m.id for m in ma_rows
+                                       if m.subtype == AnalysisUseCase.OPEN_POSITIONS}
+                        open_pos_rec_ids = {r.id for r in all_recommendations
+                                            if r.market_analysis_id in open_pos_ma}
+                    candidate_recommendations = (
+                        [r for r in all_recommendations if r.id in open_pos_rec_ids]
+                        if open_pos_rec_ids else all_recommendations)
 
                 # Filter to get only the latest recommendation per instrument
                 latest_per_instrument = {}

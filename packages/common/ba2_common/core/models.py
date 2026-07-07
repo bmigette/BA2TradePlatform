@@ -102,9 +102,14 @@ class ExpertRecommendation(SQLModel, table=True):
     confidence: float | None
     risk_level: RiskLevel = Field(description="LOW|MEDIUM|HIGH")
     time_horizon: TimeHorizon = Field(description="SHORT_TERM|MEDIUM_TERM|LONG_TERM")
+    # Which analysis use-case produced this rec (ENTER_MARKET vs OPEN_POSITIONS). Nullable for
+    # backward-compat: legacy rows + writers that don't stamp it read as None, so the live
+    # OPEN_POSITIONS manage-pass selection MUST keep its all-rec fallback for those. Mirrors
+    # MarketAnalysis.subtype (stored by enum NAME). See unification plan gap #5/#15.
+    subtype: AnalysisUseCase | None = Field(default=None)
     data: Dict[str, Any] | None = Field(default=None, sa_column=Column(JSON), description="Expert-specific data (nested by expert name)")
     created_at: DateTime | None = Field(default_factory=lambda: DateTime.now(timezone.utc), index=True)
-    
+
     # Relationship back to market analysis
     market_analysis: Optional["MarketAnalysis"] = Relationship(back_populates="expert_recommendations")
     

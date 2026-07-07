@@ -50,6 +50,7 @@ from ba2_common.core.backtest_context import BacktestContext, LiveProviderBundle
 from ba2_common.core.db import add_instance, get_instance
 from ba2_common.core.models import ExpertRecommendation, TradingOrder, Transaction
 from ba2_common.core.types import (
+    AnalysisUseCase,
     OrderDirection,
     OrderRecommendation,
     OrderStatus,
@@ -266,6 +267,7 @@ def _recommendation_to_expert_recommendation(
     symbol: str,
     as_of: datetime,
     allow_hold: bool = False,
+    subtype: Optional["AnalysisUseCase"] = None,
 ) -> Optional[int]:
     """Persist a Phase-1 ``Recommendation`` value object as an ``ExpertRecommendation`` row
     in the backtest DB and return its id (or ``None`` if not actionable).
@@ -313,6 +315,10 @@ def _recommendation_to_expert_recommendation(
         confidence=(None if rec.confidence is None else float(rec.confidence)),
         risk_level=RiskLevel.MEDIUM,
         time_horizon=TimeHorizon.MEDIUM_TERM,
+        # Stamp which use-case produced this rec so the OPEN_POSITIONS manage pass can select it
+        # by subtype (gap #5). None for un-stamped callers -> the manage selection's all-rec
+        # fallback still finds it.
+        subtype=subtype,
         data=(dict(rec.raw_outputs) if rec.raw_outputs else None),
         created_at=as_of,
     )
@@ -817,7 +823,8 @@ class DailyBacktestEngine:
                 continue
 
             rec_id = _recommendation_to_expert_recommendation(
-                rec, expert_instance_id=expert_id, symbol=symbol, as_of=as_of
+                rec, expert_instance_id=expert_id, symbol=symbol, as_of=as_of,
+                subtype=AnalysisUseCase.ENTER_MARKET,
             )
             if rec_id is None:
                 continue  # SKIP / HOLD / ERROR — nothing to stage.
@@ -960,7 +967,8 @@ class DailyBacktestEngine:
                 self._log(f"open-pos analyze failed for {symbol} @ {as_of:%Y-%m-%d}: {e}")
                 continue
             rec_id = _recommendation_to_expert_recommendation(
-                rec, expert_instance_id=expert_id, symbol=symbol, as_of=as_of, allow_hold=True
+                rec, expert_instance_id=expert_id, symbol=symbol, as_of=as_of, allow_hold=True,
+                subtype=AnalysisUseCase.OPEN_POSITIONS,
             )
             if rec_id is None:
                 continue
