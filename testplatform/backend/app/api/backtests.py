@@ -12,6 +12,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session, defer
 
 from app.models import get_db, Backtest, Strategy, TrainedModel, Dataset
+from app.services.sync_client import push_backtest
 
 logger = logging.getLogger(__name__)
 
@@ -1341,6 +1342,7 @@ async def save_backtest(
     backtest.is_saved = True
     db.commit()
     db.refresh(backtest)
+    push_backtest(backtest, db)
 
     logger.info(f"Saved backtest: {backtest.name} (id={backtest_id})")
     return backtest.to_dict()

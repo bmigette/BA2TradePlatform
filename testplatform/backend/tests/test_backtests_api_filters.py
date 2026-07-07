@@ -274,3 +274,17 @@ def test_create_ml_still_works(client, db, monkeypatch):
     assert resp.status_code in (200, 201), resp.text
     body = resp.json()
     assert body["engineType"] == "ml"
+
+
+# --- Part C: save endpoint pushes the backtest to synced workers -----------
+def test_save_endpoint_pushes_backtest(client, db, monkeypatch):
+    from app.api import backtests as backtests_api
+    calls = []
+    monkeypatch.setattr(backtests_api, "push_backtest", lambda bt, db: calls.append(bt.id))
+
+    bt = _seed_backtest(db, name="unsaved-run", expert_name="FMPRating", optimization_id=None, is_saved=False)
+
+    resp = client.post(f"/api/backtests/{bt.id}/save", json={"name": "kept-run"})
+
+    assert resp.status_code == 200, resp.text
+    assert calls == [bt.id]
