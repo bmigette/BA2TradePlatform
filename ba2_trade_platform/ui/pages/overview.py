@@ -6904,7 +6904,7 @@ def content() -> None:
         # So we use await to properly handle the async nature
         from nicegui import context
         await context.client.connected()
-        await ui.run_javascript('''
+        await ui.run_javascript(r'''
             (function() {
                 let isPopstateNavigation = false;
                 
