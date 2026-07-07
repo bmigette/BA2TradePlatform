@@ -51,8 +51,10 @@ One migration, following the existing house pattern
 (`db_migrate/023_add_worker_password_and_optimization_workers.py`): idempotent
 `ALTER TABLE workers ADD COLUMN`, guarded by a column-existence check, plus an explicit
 `UPDATE workers SET sync_results_enabled = 1 WHERE sync_results_enabled IS NULL` so every
-worker that already existed before this feature ships starts with sync **on** — don't rely solely
-on SQLite's column-default backfill.
+worker that already existed before this feature ships starts with sync **on** — belt-and-suspenders
+alongside SQLite's own column-default backfill, in case a future migration author copies this
+pattern onto a database engine where `ALTER TABLE ... ADD COLUMN ... DEFAULT` doesn't backfill
+existing rows.
 
 No schema changes needed on `Strategy`, `StrategyOptimization`, or `Backtest` — all three already
 carry `name` and `created_at`, which is all the matching logic needs.
