@@ -4094,9 +4094,17 @@ class OrderRecommendationsTab:
                     
                     def on_order_type_change():
                         limit_price_input.visible = order_type_select.value == 'limit'
-                    
+
                     order_type_select.on_value_change(on_order_type_change)
-                    
+
+                    # Optional protective bracket (A4): if a Stop-Loss / Take-Profit price is given,
+                    # the order is submitted WITH it so the account creates the protective
+                    # WAITING_TRIGGER leg(s) — same mechanism the automated path uses. Left blank
+                    # (0) -> no bracket (unchanged legacy behavior). These do NOT re-size the order:
+                    # the user's quantity is preserved (we attach the bracket, we don't route through RM).
+                    sl_price_input = ui.number('Stop-Loss Price (optional)', value=0, min=0, step=0.01).classes('w-full mb-2')
+                    tp_price_input = ui.number('Take-Profit Price (optional)', value=0, min=0, step=0.01).classes('w-full mb-4')
+
                     with ui.row().classes('w-full justify-end gap-2'):
                         ui.button('Cancel', on_click=order_dialog.close).props('flat')
                         ui.button('Place Order', on_click=lambda: self._place_order(
@@ -4106,7 +4114,9 @@ class OrderRecommendationsTab:
                             order_type=order_type_select.value,
                             limit_price=limit_price_input.value if order_type_select.value == 'limit' else None,
                             dialog=order_dialog,
-                            recommendation_id=recommendation_id
+                            recommendation_id=recommendation_id,
+                            sl_price=(sl_price_input.value or None) or None,
+                            tp_price=(tp_price_input.value or None) or None,
                         )).props('color=primary')
             
             order_dialog.open()
@@ -4302,8 +4312,14 @@ class OrderRecommendationsTab:
             logger.error(f"Error getting recommendation details: {e}", exc_info=True)
             return None
 
-    def _place_order(self, symbol, side, quantity, order_type, limit_price, dialog, recommendation_id=None):
-        """Place an order."""
+    def _place_order(self, symbol, side, quantity, order_type, limit_price, dialog, recommendation_id=None,
+                     sl_price=None, tp_price=None):
+        """Place a manual order, optionally with a protective SL/TP bracket (A4).
+
+        When ``sl_price``/``tp_price`` are given they are passed to the account's
+        ``submit_order`` so the protective WAITING_TRIGGER leg(s) are created — the same
+        bracket mechanism the automated enter path uses. The user's ``quantity`` is used
+        verbatim (this path does NOT run the risk manager, so it never re-sizes the order)."""
         try:
             accounts = get_all_instances(AccountDefinition)
             if not accounts:
@@ -4352,7 +4368,9 @@ class OrderRecommendationsTab:
                 try:
                     provider_obj = get_account_instance_from_id(account.id)
                     if provider_obj:
-                        submitted_order = provider_obj.submit_order(order)
+                        # Attach the optional protective bracket (A4). None -> no bracket (legacy).
+                        submitted_order = provider_obj.submit_order(
+                            order, tp_price=tp_price, sl_price=sl_price)
                         if submitted_order:
                             ui.notify(f'Order {order_id} submitted successfully to {account.provider}', type='positive')
                         else:
