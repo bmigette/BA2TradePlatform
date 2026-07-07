@@ -2,6 +2,7 @@
 process) worker_server.py instance, then a SEPARATE session against that same DB file confirms
 the rows are queryable with correctly remapped local ids — proving the cross-reference resolution
 in docs/plans/2026-07-07-remote-result-sync-design.md end to end."""
+import urllib.parse
 from datetime import datetime, timezone
 from unittest.mock import patch
 
@@ -29,11 +30,13 @@ def worker_client(monkeypatch, worker_db_path):
     monkeypatch.setattr(ws, "_PASSWORD", "secret")
     monkeypatch.setattr(ws, "_CAPACITY", 1)
     monkeypatch.setattr(ws, "_POOL", object())  # unused by /sync/* endpoints
+    monkeypatch.setattr(ws, "_ensured_engine_ids", set())  # avoid id()-reuse collisions across tests
 
     eng = create_engine(f"sqlite:///{worker_db_path}")
     Session = sessionmaker(bind=eng)
     monkeypatch.setattr(ws, "SessionLocal", Session)
-    return TestClient(ws.worker_app)
+    yield TestClient(ws.worker_app)
+    eng.dispose()
 
 
 @pytest.fixture()
@@ -61,8 +64,8 @@ def _fake_worker_url_client(worker_client):
             return False
 
         def post(self, url, headers=None, json=None):
-            path = url.split("://", 1)[1].split("/", 1)[1]
-            return self._tc.post(f"/{path}", headers=headers, json=json)
+            path = urllib.parse.urlsplit(url).path
+            return self._tc.post(path, headers=headers, json=json)
 
     return _Adapter(worker_client)
 
