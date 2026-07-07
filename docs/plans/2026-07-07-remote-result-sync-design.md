@@ -39,6 +39,16 @@ routing.
 automatic backfill of historical rows on deploy (see Migration & Rollout — a manual script covers
 this instead).
 
+**Known limitation:** `Backtest` has two engine types — `daily_expert` (the current expert-engine
+path, and the only one this feature targets) and legacy `ml` (model-driven). A synced `ml`-engine
+row still carries its raw `model_id`/`prediction_dataset_id`/`execution_dataset_id` columns
+(the push client dumps every column on the row), but this feature doesn't sync `TrainedModel` or
+`Dataset` — those ids are meaningless/dangling on the worker for that row. Deliberately not fixed:
+building a sync path for the legacy `ml` engine's dependency graph is out of proportion to a path
+that isn't the active target of this feature. If `ml`-engine backtests start getting synced in
+practice (e.g. someone saves one via the API), revisit — either filter those columns out of the
+payload for non-`daily_expert` rows, or extend replication to `TrainedModel`/`Dataset`.
+
 ## Data Model Changes
 
 One new column, `testplatform/backend/app/models/worker.py`:
