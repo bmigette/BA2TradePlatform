@@ -98,6 +98,18 @@ parent alongside the raw id: syncing a `Backtest` includes `optimization_name` a
 `optimization_id`/`strategy_id` by looking up the parent locally via its natural key and
 substitutes the local id. No id-mapping table required.
 
+Not every such column tolerates a missing parent the same way: `Backtest.strategy_id` and
+`Backtest.optimization_id` are nullable (a standalone backtest legitimately has no optimization),
+but `StrategyOptimization.strategy_id` is `NOT NULL` in the schema — every optimization requires
+a strategy. If the referenced parent hasn't synced yet (the strategy-first ordering below is meant
+to prevent this, but a single push is fire-and-forget per worker, so a narrow race is possible: the
+`Strategy` POST to a worker fails while the very next `StrategyOptimization` POST to the same
+worker succeeds), resolving a required column to `None` would violate the column's constraint.
+The worker-side upsert must check whether the column is nullable: if it is, substitute `None`
+(exactly as above); if it isn't and the parent can't be resolved, skip the write entirely rather
+than raise, logging that it was skipped. Nothing is lost — the next full-state push (next
+generation, in this case) retries the parent first and self-heals.
+
 This requires strict ordering on the master side: a parent is always synced before, or in the
 same request as, its child. `push_strategy` runs before `push_optimization`; `push_optimization`
 (and transitively `push_strategy`) runs before `push_backtest`.

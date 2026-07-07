@@ -324,7 +324,7 @@ def test_parent_fk_resolves_to_local_id_not_master_id(session):
             "id": 7, "name": "opt-1", "created_at": _iso(opt_created),
             "strategy_id": 42,  # the MASTER's id — must NOT end up on the local row verbatim
             "strategy_name": "parent-strat", "strategy_created_at": _iso(strat_created),
-            "status": "running",
+            "status": "running", "fitness_metric": "sharpe", "optimization_type": "genetic",
         },
         parent_fk={"strategy_id": (Strategy, "strategy_name", "strategy_created_at")},
     )
@@ -334,20 +334,47 @@ def test_parent_fk_resolves_to_local_id_not_master_id(session):
     assert opt.strategy_id != 42
 
 
-def test_parent_fk_missing_locally_resolves_to_none_not_error(session):
+def test_required_parent_fk_missing_locally_skips_the_write(session):
+    """StrategyOptimization.strategy_id is NOT NULL in the schema — unlike Backtest's FKs,
+    which are nullable. If the referenced Strategy hasn't synced to this worker yet (the
+    strategy-first push ordering is meant to prevent this, but a single push is fire-and-forget
+    per worker, so a narrow race is possible), inserting with strategy_id=None would violate
+    the column's constraint. The upsert must skip the write entirely rather than raise — the
+    next full-state push (e.g. next generation) retries the parent first and self-heals."""
     opt_created = datetime(2026, 1, 2, tzinfo=timezone.utc)
-    upsert_by_natural_key(
+    result = upsert_by_natural_key(
         session, StrategyOptimization,
         {
             "id": 7, "name": "opt-1", "created_at": _iso(opt_created),
             "strategy_id": 42,
             "strategy_name": "never-synced", "strategy_created_at": _iso(datetime(2026, 1, 1, tzinfo=timezone.utc)),
-            "status": "running",
+            "status": "running", "fitness_metric": "sharpe", "optimization_type": "genetic",
         },
         parent_fk={"strategy_id": (Strategy, "strategy_name", "strategy_created_at")},
     )
-    opt = session.query(StrategyOptimization).one()
-    assert opt.strategy_id is None  # never crashes, never keeps the master's dangling id
+    assert result is None  # signals "skipped", not an error
+    assert session.query(StrategyOptimization).count() == 0  # no partial/invalid row persisted
+
+
+def test_nullable_parent_fk_missing_locally_resolves_to_none(session):
+    """Contrast with the required-FK case above: Backtest.strategy_id IS nullable (a standalone
+    backtest legitimately has no optimization/strategy row), so a missing parent resolves to
+    None and the row is still written — it is not skipped."""
+    bt_created = datetime(2026, 1, 3, tzinfo=timezone.utc)
+    bt = upsert_by_natural_key(
+        session, Backtest,
+        {
+            "id": 1, "name": "standalone-run", "created_at": _iso(bt_created),
+            "engine_type": "daily_expert",
+            "strategy_id": 42, "strategy_name": "never-synced",
+            "strategy_created_at": _iso(datetime(2026, 1, 1, tzinfo=timezone.utc)),
+            "start_date": _iso(datetime(2024, 1, 1)), "end_date": _iso(datetime(2024, 6, 1)),
+        },
+        parent_fk={"strategy_id": (Strategy, "strategy_name", "strategy_created_at")},
+    )
+    assert bt is not None
+    assert bt.strategy_id is None
+    assert session.query(Backtest).count() == 1
 
 
 def test_backtest_dual_parent_fk_resolution(session):
@@ -361,6 +388,7 @@ def test_backtest_dual_parent_fk_resolution(session):
         {
             "id": 1, "name": "opt", "created_at": _iso(opt_created),
             "strategy_id": 1, "strategy_name": "s", "strategy_created_at": _iso(strat_created),
+            "fitness_metric": "sharpe", "optimization_type": "genetic",
         },
         parent_fk={"strategy_id": (Strategy, "strategy_name", "strategy_created_at")},
     )
@@ -374,6 +402,7 @@ def test_backtest_dual_parent_fk_resolution(session):
             "engine_type": "daily_expert",
             "strategy_id": 1, "strategy_name": "s", "strategy_created_at": _iso(strat_created),
             "optimization_id": 1, "optimization_name": "opt", "optimization_created_at": _iso(opt_created),
+            "start_date": _iso(datetime(2024, 1, 1)), "end_date": _iso(datetime(2024, 6, 1)),
         },
         parent_fk={
             "strategy_id": (Strategy, "strategy_name", "strategy_created_at"),
@@ -419,16 +448,21 @@ def upsert_by_natural_key(
     model_cls: Type,
     payload: dict,
     parent_fk: Optional[dict[str, tuple]] = None,
-) -> Any:
+) -> Optional[Any]:
     """Insert or update ``model_cls`` matched by ``(name, created_at)``.
 
     ``parent_fk`` maps ``{fk_column_name: (parent_model_cls, name_key, created_at_key)}``.
     For each entry, the parent's natural key is popped out of ``payload`` (it isn't a real
-    column on ``model_cls``), the parent is looked up locally by that natural key, and
-    ``fk_column_name`` is set to the parent's LOCAL id — or None if that parent hasn't been
-    synced yet (never raises, never keeps the master's id).
+    column on ``model_cls``), and the parent is looked up locally by that natural key. If found,
+    ``fk_column_name`` is set to the parent's LOCAL id. If not found (parent hasn't synced yet):
+    a NULLABLE fk column resolves to None and the row is still written (e.g. a standalone
+    Backtest legitimately has no optimization); a NOT NULL fk column (e.g.
+    StrategyOptimization.strategy_id) can't take None without violating the schema, so the
+    entire write is skipped instead — the caller gets None back, and the next full-state push
+    (e.g. the next generation) retries the parent first and self-heals. Never raises.
 
-    Returns the local row (existing, updated in place, or newly inserted).
+    Returns the local row (existing, updated in place, or newly inserted), or None if the write
+    was skipped because a required parent hasn't synced yet.
     """
     data = dict(payload)
     data.pop("id", None)  # never trust the master's id
@@ -441,15 +475,19 @@ def upsert_by_natural_key(
         for fk_col, (parent_cls, name_key, created_key) in parent_fk.items():
             parent_name = data.pop(name_key, None)
             parent_created = _parse_iso(data.pop(created_key, None))
-            if parent_name is None or parent_created is None:
-                data[fk_col] = None
-                continue
-            parent = (
-                session.query(parent_cls)
-                .filter(parent_cls.name == parent_name, parent_cls.created_at == parent_created)
-                .first()
-            )
-            data[fk_col] = parent.id if parent else None
+            resolved_id = None
+            if parent_name is not None and parent_created is not None:
+                parent = (
+                    session.query(parent_cls)
+                    .filter(parent_cls.name == parent_name, parent_cls.created_at == parent_created)
+                    .first()
+                )
+                resolved_id = parent.id if parent else None
+            if resolved_id is None and not model_cls.__table__.columns[fk_col].nullable:
+                # Required parent not yet synced to this worker — skip rather than violate
+                # the NOT NULL constraint. Nothing is lost: the next full-state push retries.
+                return None
+            data[fk_col] = resolved_id
 
     existing = (
         session.query(model_cls)
@@ -473,7 +511,7 @@ def upsert_by_natural_key(
 **Step 4: Run tests to verify they pass**
 
 Run: `cd testplatform/backend && ./venv/bin/python -m pytest tests/test_sync_receiver.py -v`
-Expected: PASS (7 tests)
+Expected: PASS (8 tests)
 
 **Step 5: Commit**
 
@@ -574,8 +612,8 @@ def sync_strategy(payload: dict, authorization: str = Header(default=None)):
     from app.models.strategy import Strategy
     s = _sync_session()
     try:
-        sync_receiver.upsert_by_natural_key(s, Strategy, payload)
-        return {"ok": True}
+        row = sync_receiver.upsert_by_natural_key(s, Strategy, payload)
+        return {"ok": True, "skipped": row is None}
     finally:
         s.close()
 
@@ -586,17 +624,20 @@ def sync_optimization(payload: dict, authorization: str = Header(default=None)):
 
     ``payload`` carries strategy_name/strategy_created_at alongside the master's strategy_id
     so the FK can be remapped to this worker's own local Strategy id (see sync_receiver).
+    ``strategy_id`` is NOT NULL on this table, so a missing parent means
+    ``upsert_by_natural_key`` skips the write (returns None) rather than raising — reported
+    back as ``{"skipped": true}``, still HTTP 200 (expected/benign, self-heals on retry).
     """
     _verify(authorization)
     from app.models.strategy import Strategy
     from app.models.strategy_optimization import StrategyOptimization
     s = _sync_session()
     try:
-        sync_receiver.upsert_by_natural_key(
+        row = sync_receiver.upsert_by_natural_key(
             s, StrategyOptimization, payload,
             parent_fk={"strategy_id": (Strategy, "strategy_name", "strategy_created_at")},
         )
-        return {"ok": True}
+        return {"ok": True, "skipped": row is None}
     finally:
         s.close()
 
@@ -606,7 +647,11 @@ def sync_backtest(payload: dict, authorization: str = Header(default=None)):
     """Upsert a replicated Backtest row, matched by (name, created_at).
 
     ``payload`` carries both strategy_name/strategy_created_at and
-    optimization_name/optimization_created_at so both FKs remap to local ids.
+    optimization_name/optimization_created_at so both FKs remap to local ids. Both FK columns
+    on this table are nullable, so a missing parent resolves to None and the row is still
+    written (unlike StrategyOptimization.strategy_id) — ``skipped`` should always be false here
+    in practice, but the return is handled the same way for consistency with the other two
+    endpoints.
     """
     _verify(authorization)
     from app.models.strategy import Strategy
@@ -614,14 +659,14 @@ def sync_backtest(payload: dict, authorization: str = Header(default=None)):
     from app.models.backtest import Backtest
     s = _sync_session()
     try:
-        sync_receiver.upsert_by_natural_key(
+        row = sync_receiver.upsert_by_natural_key(
             s, Backtest, payload,
             parent_fk={
                 "strategy_id": (Strategy, "strategy_name", "strategy_created_at"),
                 "optimization_id": (StrategyOptimization, "optimization_name", "optimization_created_at"),
             },
         )
-        return {"ok": True}
+        return {"ok": True, "skipped": row is None}
     finally:
         s.close()
 ```
