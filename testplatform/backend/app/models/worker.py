@@ -33,6 +33,10 @@ class Worker(Base):
     is_local = Column(Boolean, default=False)
     status = Column(String(20), default="offline")  # "online", "offline", "busy"
 
+    # Result-replication: push saved Backtest/StrategyOptimization rows to this worker so it
+    # can browse/replay them independently of the master. On by default.
+    sync_results_enabled = Column(Boolean, default=True)
+
     # Hardware info (populated by worker heartbeat)
     gpu_info = Column(JSON, nullable=True)  # {name, memory, count}
     cpu_info = Column(JSON, nullable=True)  # {cores, model}
@@ -59,6 +63,7 @@ class Worker(Base):
             "isEnabled": self.is_enabled,
             "isLocal": self.is_local,
             "status": self.status,
+            "syncResultsEnabled": self.sync_results_enabled,
             "gpuInfo": self.gpu_info,
             "cpuInfo": self.cpu_info,
             "lastHeartbeat": self.last_heartbeat.isoformat() if self.last_heartbeat else None,
