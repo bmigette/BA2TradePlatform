@@ -119,25 +119,34 @@ class TradeActionEvaluator:
             self.instrument_name = instrument_name
             self.expert_recommendation = expert_recommendation
             
-            # Get the ruleset
-            ruleset = get_instance(Ruleset, ruleset_id)
-            if not ruleset:
-                logger.error(f"Ruleset with ID {ruleset_id} not found")
-                return []
-            
-            logger.info(f"Evaluating ruleset '{ruleset.name}' for {instrument_name}")
-            
-            # Get all event actions for this ruleset
-            with get_db() as session:
-                    from ba2_common.core.models import RulesetEventActionLink
+            # Load the ruleset + its ordered event-actions. These are STATIC within a backtest run
+            # but this evaluate() is called per (symbol, bar), so the join was re-run thousands of
+            # times per run — cached_ruleset_eventactions memoises it per-thread FOR THE BACKTEST
+            # ONLY (live always reloads, since a user can edit a ruleset between analyses). The
+            # cached EventAction rows are read-only here.
+            from ba2_common.core.db import cached_ruleset_eventactions
+
+            def _load_ruleset_and_actions():
+                rs = get_instance(Ruleset, ruleset_id)
+                if not rs:
+                    return None, []
+                from ba2_common.core.models import RulesetEventActionLink
+                with get_db() as session:
                     statement = (
                         select(EventAction)
                         .join(RulesetEventActionLink, EventAction.id == RulesetEventActionLink.eventaction_id)
                         .where(RulesetEventActionLink.ruleset_id == ruleset_id)
                         .order_by(RulesetEventActionLink.order_index)
                     )
-                    event_actions = session.exec(statement).all()
-            
+                    return rs, session.exec(statement).all()
+
+            ruleset, event_actions = cached_ruleset_eventactions(ruleset_id, _load_ruleset_and_actions)
+            if not ruleset:
+                logger.error(f"Ruleset with ID {ruleset_id} not found")
+                return []
+
+            logger.info(f"Evaluating ruleset '{ruleset.name}' for {instrument_name}")
+
             if not event_actions:
                 logger.info(f"No event actions found for ruleset {ruleset_id}")
                 return []

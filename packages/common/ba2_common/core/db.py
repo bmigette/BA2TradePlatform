@@ -108,6 +108,7 @@ def configure_db_threadlocal(db_file: str) -> None:
             pass
     _tls.db_file = db_file
     _tls.engine = None
+    _tls.ruleset_cache = None  # fresh run on this thread -> drop any prior run's ruleset cache
 
 
 def clear_threadlocal_db() -> None:
@@ -120,6 +121,29 @@ def clear_threadlocal_db() -> None:
             pass
     _tls.db_file = None
     _tls.engine = None
+    _tls.ruleset_cache = None  # drop the per-run ruleset cache (see cached_ruleset_eventactions)
+
+
+def cached_ruleset_eventactions(ruleset_id, loader):
+    """Per-thread, per-run cache of a ruleset's ``(ruleset, event_actions)`` — the evaluator loads
+    these on EVERY evaluate() via a join, but they are STATIC within a backtest run, so re-loading
+    them per (symbol, bar) is pure overhead.
+
+    Only caches when a thread-local BT DB is active (``configure_db_threadlocal``); in LIVE (no
+    thread-local DB) it always calls ``loader()`` fresh, because a user can edit a ruleset between
+    analyses. The cache lives on the thread-local and is cleared by ``configure_db_threadlocal`` /
+    ``clear_threadlocal_db``, so parallel GA trials + reruns (each on their own :memory: DB, reusing
+    the same ruleset ids) never share entries. Cached rows are read-only in the evaluator.
+    """
+    if not getattr(_tls, "db_file", None):  # live (no thread-local DB) -> never cache
+        return loader()
+    cache = getattr(_tls, "ruleset_cache", None)
+    if cache is None:
+        cache = {}
+        _tls.ruleset_cache = cache
+    if ruleset_id not in cache:
+        cache[ruleset_id] = loader()
+    return cache[ruleset_id]
 
 
 def get_engine():
