@@ -1087,18 +1087,21 @@ def _build_strategy_S6(name: str):
              "toggle_optimize": True},
         ],
     }
-    exit_conditions = [
-        # Floor stop (always on, tightness optimized) — tighter range than S2/S5: quick cycles
-        # should cut losers fast, not sit through -20%.
-        {"id": "exit_stoploss", "action_type": "adjust_stop_loss", "reference_value": "order_open_price",
+    # TP/SL AT ENTRY (entry_actions, Phase 1.5) — the tight quick-cycle bracket is now set the
+    # instant the order fills, closing the "unprotected until the first scheduled manage check"
+    # gap the exit-condition form had. Both GA-toggleable; the RM max-risk safeguard stop remains
+    # the always-on floor even if the entry SL is toggled off.
+    entry_actions = [
+        {"id": "entry_tp", "action_type": "adjust_take_profit", "reference_value": "order_open_price",
+         "action_value": 10.0, "action_value_optimize": True,
+         "action_value_min": 6.0, "action_value_max": 16.0, "action_value_step": 1.0,
+         "toggle_optimize": True},
+        {"id": "entry_sl", "action_type": "adjust_stop_loss", "reference_value": "order_open_price",
          "action_value": -5.0, "action_value_optimize": True,
          "action_value_min": -10.0, "action_value_max": -2.0, "action_value_step": 1.0,
-         "conditions": {"type": "AND", "conditions": [{"id": "sl_hold", "field": "has_position"}]}},
-        # TIGHT take-profit: bank small wins quickly and recycle the capital.
-        {"id": "exit_takeprofit", "action_type": "close",
-         "conditions": {"type": "AND", "conditions": [
-             {"id": "xtp", "field": "profit_loss_percent", "op": ">", "value": 10,
-              "optimize": True, "value_min": 6, "value_max": 16, "value_step": 1}]}},
+         "toggle_optimize": True},
+    ]
+    exit_conditions = [
         # Signal exits for protection (same as S2/S5).
         {"id": "exit_bearish", "action_type": "close", "toggle_optimize": True,
          "conditions": {"type": "AND", "conditions": [{"id": "xb", "field": "bearish"}]}},
@@ -1112,7 +1115,7 @@ def _build_strategy_S6(name: str):
               "optimize": True, "value_min": 10, "value_max": 30, "value_step": 5}]}},
     ]
     return Strategy(name=name, buy_entry_conditions=buy_entry_conditions,
-                    exit_conditions=exit_conditions)
+                    exit_conditions=exit_conditions, entry_actions=entry_actions)
 
 
 def _build_strategy_S7(name: str):
@@ -1283,12 +1286,24 @@ def _uniquify_condition_ids(buy_tree, exit_rules) -> None:
 
 
 def _build_strategy_S1(name: str, expert: str):
-    """S1 — the expert's LIVE dev-account ruleset (exported to docs/live_rulesets/{expert}.json),
-    normalized to the canonical Strategy shape with optimize flags on every threshold + adjust-%.
+    """S1 — the expert's LIVE dev-account "high conviction" ruleset (exported to
+    docs/live_rulesets/{expert}.json), normalized to the canonical Strategy shape with optimize
+    flags on every threshold + adjust-%, PLUS an entry-time TP/SL bracket that mirrors the live
+    "Optimized Entry - High Conviction" ruleset (which sets a target-anchored take-profit and a
+    protective stop AT ENTRY — see the enter ruleset's adjust_take_profit/adjust_stop_loss actions).
+
     Faithful to the live enter (buy/sell trees, OR groups preserved) + open_positions (exit) rules.
-    An optimizable initial SL bracket is added; the entry-anchored global TP is left off (it never
-    fires in practice — TP for FMPRating lives in the exit conditions, and S4 re-anchors TP on the
-    analyst target price)."""
+
+    S4 (the old target-anchored-TP variant) is now MERGED here: S1 carries the target-anchored
+    take-profit as an ``entry_actions`` rule (fired ONCE at entry by the shared
+    TradeActionEvaluator's Phase 1.5/2, the same mechanism live uses — see
+    docs/plans/2026-07-03-entry-tp-sl-bracket-actions.md), plus an entry stop-loss. Both entry
+    actions are GA on/off-TOGGLEABLE (``toggle_optimize`` → ``entry:<id>:enabled`` gene), so the
+    optimizer decides whether the entry bracket helps — and the target-anchored TP self-disables
+    for experts with no real analyst target (FMPEarningsDrift / FMPInsiderClusterBuy, whose
+    ``expert_target_price`` is a static setting). The RM max-risk SAFEGUARD stop is ALWAYS placed
+    on entry regardless (shared classic RM), so a toggled-off entry SL never leaves the position
+    unprotected — the entry SL is an additional, tighter, optional bracket."""
     import json as _json
     from app.models.strategy import Strategy
     repo_root = os.path.dirname(os.path.abspath(__file__))
@@ -1307,44 +1322,38 @@ def _build_strategy_S1(name: str, expert: str):
     # NOTE: the launcher's Strategy has no separate sell tree — shorts are mirrored from the buy
     # gates via the engine's enable_short flag. The live sell_entry_conditions (if any) is dropped;
     # these experts are long-only in practice, so S1 runs long.
-    return Strategy(
+    strat = Strategy(
         name=name,
         buy_entry_conditions=buy,
         exit_conditions=exits,
-        # No global TP/SL brackets — S1 runs the LIVE ruleset's conditions verbatim (its
-        # adjust_stop_loss / adjust_take_profit / close rules), exactly like the live engine.
-        # No entry_actions either (the old initial_tp_percent/initial_sl_percent scalar fields
-        # are gone from the Strategy model entirely). SL is placed by the max-risk SAFEGUARD on
-        # entry (min ATR×mult / risk%, floored at min_stop_loss_pct — shared classic RM, so
-        # backtest == live); TP comes from the exit CONDITIONS (S4 anchors on the analyst target
-        # via entry_actions; S1's live ruleset trails). No bracket masks the conditions — the
-        # safeguard fires exactly like live.
     )
-
-
-def _build_strategy_S4(name: str, expert: str):
-    """S4 — TARGET-TRAIL. Same live trailing ruleset as S1 (trail-TP-to-target rule live-34 +
-    the trailing-SL ladder), but the ENTRY TP is ANCHORED on the expert's analyst target price
-    instead of off the entry price. This is expressed as an ``entry_actions`` rule (an
-    adjust_take_profit action fired ONCE at entry by the shared TradeActionEvaluator's
-    Phase 1.5/2 — the same mechanism live uses, see
-    docs/plans/2026-07-03-entry-tp-sl-bracket-actions.md), not a recurring exit condition and
-    not the old bespoke Strategy.initial_tp_* scalar fields (deleted entirely from the model).
-    The optimizable gene is the OFFSET-FROM-TARGET and is allowed NEGATIVE (TP below target,
-    e.g. -10 -> TP = target*0.90). Validated: target-anchoring rode NVDA to +1065% and exited
-    via take_profit (~2.3x the entry-anchored return). Pairs with the optimizable
-    target_price_type (which analyst reference price to anchor on). Bounds below are carried
-    over unchanged from the original mechanism's range (action_value=0.0,
-    min=-20.0, max=10.0, step=2.0 — same values the deleted
-    initial_tp_percent/_min/_max/_step carried for S4)."""
-    strat = _build_strategy_S1(name, expert)
+    # Entry-time TP/SL bracket mirroring the live "high conviction" ruleset (was BUGGED — S1 used
+    # to drop the enter ruleset's adjust_take_profit/adjust_stop_loss entry actions entirely). Both
+    # GA-toggleable so the optimizer can disable either. The target-anchored TP is centred on the
+    # live value (-5% below the analyst target) and searched as an offset-from-target (negative =
+    # below target); the entry SL is anchored off the fill price. Merged from the old S4.
     strat.entry_actions = [
-        {"id": "s4_tp", "action_type": "adjust_take_profit", "reference_value": "expert_target_price",
-         "action_value": 0.0, "action_value_optimize": True,
+        {"id": "s1_tp_target", "action_type": "adjust_take_profit",
+         "reference_value": "expert_target_price",
+         "action_value": -5.0, "action_value_optimize": True,
          "action_value_min": -20.0, "action_value_max": 10.0, "action_value_step": 2.0,
+         "toggle_optimize": True},
+        {"id": "s1_sl_entry", "action_type": "adjust_stop_loss",
+         "reference_value": "order_open_price",
+         "action_value": -8.0, "action_value_optimize": True,
+         "action_value_min": -20.0, "action_value_max": -3.0, "action_value_step": 2.0,
          "toggle_optimize": True},
     ]
     return strat
+
+
+# S4 is MERGED into S1 (target-anchored entry TP is now an S1 entry_action). The builder is kept
+# as a thin deprecated alias so any external reference still resolves to the merged strategy, but
+# S4 is REMOVED from _STRATEGY_BUILDERS below so it is no longer selectable in the grid.
+def _build_strategy_S4(name: str, expert: str):
+    """DEPRECATED — S4 merged into S1 (S1 now carries the target-anchored entry take-profit as a
+    GA-toggleable entry_action). Retained only as an alias; not registered in _STRATEGY_BUILDERS."""
+    return _build_strategy_S1(name, expert)
 
 
 # --- Option strategy entry-action configs (pure-option entries) -----------------------------------
@@ -1481,12 +1490,13 @@ def _build_strategy_stock(kind: str):
 
 
 _STRATEGY_BUILDERS = {
-    "S1": _build_strategy_S1,   # (name, expert)
+    "S1": _build_strategy_S1,   # (name, expert) — live "high conviction" ruleset + entry TP/SL
+                                #                  bracket (target-anchored TP, merged from S4)
     "S2": _build_strategy_S2,   # (name)
     "S3": _build_strategy_S3,   # (name)
-    "S4": _build_strategy_S4,   # (name, expert) — target-anchored TP (expert_target_price)
+    # S4 MERGED into S1 (its target-anchored entry TP is now an S1 entry_action) — no longer selectable.
     "S5": _build_strategy_S5,   # (name) — S2/S3 hybrid: signal exits + trailing ladder
-    "S6": _build_strategy_S6,   # (name) — high-frequency quick-cycle (tight TP + short time exit)
+    "S6": _build_strategy_S6,   # (name) — high-frequency quick-cycle (tight TP/SL AT ENTRY + time exit)
     "S7": _build_strategy_S7,   # (name) — tight refinement around the archived 186% S2-large winner
     # Option/equity strategies (dispatch by `kind`, not `name`; see _build_strategy):
     "O_LC": _build_strategy_option, "O_VERT": _build_strategy_option,
@@ -1496,12 +1506,21 @@ _STRATEGY_BUILDERS = {
     "O_CC": _build_strategy_covered_call, "O_STK": _build_strategy_stock,
 }
 
+# Per-strategy GA population multiplier applied on top of --population in optimize-batch. S1 is the
+# richest strategy (live "high conviction" conditions + entry TP/SL bracket + target-anchored TP +
+# exit rules => the largest gene space), so it gets a bit more population to search it; unlisted
+# strategies use --population unchanged (factor 1.0).
+_STRATEGY_POP_FACTOR = {"S1": 1.5}
+
 
 def _build_strategy(kind: str, name: str, expert: str):
-    """Dispatch to the right strategy builder. S1/S4 are expert-specific (load the live JSON).
+    """Dispatch to the right strategy builder. S1 is expert-specific (loads the live JSON).
     Option/equity strategies (O_*) dispatch by `kind` (the builder names the Strategy off the kind
     and, for pure-option kinds, carries the entry_action)."""
-    if kind in ("S1", "S4"):
+    if kind == "S4":
+        sys.exit("optimize: S4 is merged into S1 (target-anchored entry TP is now an S1 "
+                 "entry_action, GA-toggleable). Use S1 instead.")
+    if kind == "S1":
         return _STRATEGY_BUILDERS[kind](name, expert)
     if kind in _OPTION_STRATEGY_KEYS:
         return _STRATEGY_BUILDERS[kind](kind)
@@ -1858,8 +1877,9 @@ def _cmd_optimize_batch(args) -> int:
             # seeds the enter ruleset with the option action (forwarded by _build_daily_trial_config).
             if strat_entry_action:
                 backtest_block["entry_action"] = strat_entry_action
+            pop_for_strat = int(round(args.population * _STRATEGY_POP_FACTOR.get(strat_kind, 1.0)))
             cfg = {
-                "populationSize": int(args.population),
+                "populationSize": pop_for_strat,
                 "generations": int(args.generations),
                 "crossoverProb": 0.6, "mutationProb": float(args.mutation_prob),
                 "earlyStoppingGenerations": int(args.early_stop),
@@ -1886,7 +1906,7 @@ def _cmd_optimize_batch(args) -> int:
         task_id = tq.queue_task(
             task_type="strategy_optimization", name=name,
             payload={"optimization_id": opt_id},
-            description=f"{expert} {strat_kind} x {len(universe)} syms, {args.fitness}, pop={args.population}",
+            description=f"{expert} {strat_kind} x {len(universe)} syms, {args.fitness}, pop={pop_for_strat}",
         )
         print(f"[{n}/{len(jobs)}] SUBMITTED {expert}/{strat_kind} opt#{opt_id} (task {task_id}); polling every {args.poll}s...")
 

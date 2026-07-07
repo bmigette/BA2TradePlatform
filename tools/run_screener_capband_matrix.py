@@ -34,16 +34,19 @@ _CLASSIC = ["FMPRating", "FMPEarningsDrift", "FMPInsiderClusterBuy"]
 _RANKER = "FactorRanker"
 # Experts with no usable data in the large-cap band (skipped on `large` unless --include-no-data).
 _NO_LARGE_CAP = {"FMPEarningsDrift", "FMPInsiderClusterBuy"}
-# Strategies that only make sense for experts producing a REAL, updating analyst price target.
-# S4 anchors its TP on expert_target_price; EarningsDrift/Insider have no analyst target (their
-# expected_profit_percent is a static setting), so S4 degenerates to a fixed-% TP there — skip it.
-_TARGET_PRICE_STRATEGIES = {"S4"}
+# Strategies restricted to experts producing a REAL, updating analyst price target. S4 (which
+# anchored TP on expert_target_price) is now MERGED into S1, and S1's target-anchored TP is a
+# GA-TOGGLEABLE entry_action that self-disables for experts without a real analyst target — so no
+# strategy needs the restriction anymore. Kept (empty) for the _jobs() gating call site.
+_TARGET_PRICE_STRATEGIES: set = set()
 _TARGET_PRICE_EXPERTS = {"FMPRating"}
-# Per-strategy population/generations override: S7 is a NARROW refinement around a known-good
-# point (the archived 186% S2-large winner), not a broad from-scratch search, so it needs far
-# fewer individuals/generations to converge. Unlisted strategies keep the driver's --population/
-# --generations args unchanged.
+# Per-strategy population/generations override. S7 is a NARROW refinement around a known-good point
+# (the archived 186% S2-large winner) so it converges with far fewer individuals/generations. S1 is
+# the RICHEST strategy (live "high conviction" conditions + entry TP/SL bracket + target-anchored TP
+# + exit rules => largest gene space), so it gets a bit MORE population. Unlisted strategies keep the
+# driver's --population/--generations args unchanged.
 _STRATEGY_BUDGET_OVERRIDE = {
+    "S1": {"population": 60},
     "S7": {"population": 20, "generations": 5},
 }
 
@@ -108,7 +111,7 @@ def _jobs(bands, strategies, include_no_data, skip_experts=frozenset(), name_suf
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--bands", default="large,mid,small")
-    ap.add_argument("--strategies", default="S1,S2,S3,S4")
+    ap.add_argument("--strategies", default="S1,S2,S3")  # S4 merged into S1
     ap.add_argument("--start", default="2023-01-01")
     ap.add_argument("--end", default="2026-01-01")
     ap.add_argument("--population", type=int, default=40)
