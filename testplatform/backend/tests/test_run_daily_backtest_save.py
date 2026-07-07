@@ -62,8 +62,19 @@ def _config(name: str) -> dict:
 
 def test_persist_tracked_pushes_when_saved(monkeypatch, tmp_path):
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'cli_save.sqlite'}")
+    import app.models.database as dbmod
+    importlib.reload(dbmod)
+    # Reloading app.models.database builds a brand-new (EMPTY) Base/metadata -- Backtest and
+    # every other model class stay bound to the ORIGINAL Base from whenever app.models was
+    # first imported this session, so `_persist_tracked`'s own `init_db()` call (which does
+    # `Base.metadata.create_all()` against the freshly reloaded, empty Base) is a no-op and
+    # would leave this fresh sqlite file with no tables. Pre-create the schema through
+    # `Backtest.metadata` instead -- it IS the original, fully-populated metadata (every model
+    # shares one MetaData object), so this creates all tables against the new engine. Mirrors
+    # `_ensure_tables`'s `Strategy.metadata.create_all(bind=engine)` in app/worker_server.py.
+    from app.models.backtest import Backtest
+    Backtest.metadata.create_all(bind=dbmod.engine)
     import scripts.run_daily_backtest as script
-    importlib.reload(script)
 
     calls = []
     monkeypatch.setattr(script, "push_backtest", lambda bt, db: calls.append(bt.is_saved))
@@ -76,8 +87,13 @@ def test_persist_tracked_pushes_when_saved(monkeypatch, tmp_path):
 
 def test_persist_tracked_does_not_push_when_not_saved(monkeypatch, tmp_path):
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'cli_track_only.sqlite'}")
+    import app.models.database as dbmod
+    importlib.reload(dbmod)
+    # See test_persist_tracked_pushes_when_saved for why this pre-create is required after
+    # reloading app.models.database.
+    from app.models.backtest import Backtest
+    Backtest.metadata.create_all(bind=dbmod.engine)
     import scripts.run_daily_backtest as script
-    importlib.reload(script)
 
     calls = []
     monkeypatch.setattr(script, "push_backtest", lambda bt, db: calls.append(bt.is_saved))
