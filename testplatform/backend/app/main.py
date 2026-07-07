@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from starlette.middleware.base import BaseHTTPMiddleware
 from pathlib import Path
+from datetime import datetime
 import sys
 import time
 import json
@@ -402,16 +403,21 @@ def _recover_interrupted_optimizations(db, crashed_task_rows) -> None:
         opt_id = (job.payload or {}).get("optimization_id")
         if not opt_id:
             continue
-        opt = db.query(StrategyOptimization).filter(StrategyOptimization.id == opt_id).first()
-        if opt is None or opt.status != "running":
-            continue
-        opt.status = "failed"
-        opt.error_message = "Interrupted by server restart"
-        db.commit()
-        logger.warning(
-            f"StrategyOptimization {opt_id} was stuck 'running' after a crash — marked 'failed'"
-        )
-        push_optimization(opt, db)
+        try:
+            opt = db.query(StrategyOptimization).filter(StrategyOptimization.id == opt_id).first()
+            if opt is None or opt.status != "running":
+                continue
+            opt.status = "failed"
+            opt.error_message = "Interrupted by server restart"
+            opt.completed_at = datetime.now()
+            db.commit()
+            logger.warning(
+                f"StrategyOptimization {opt_id} was stuck 'running' after a crash — marked 'failed'"
+            )
+            push_optimization(opt, db)
+        except Exception as e:  # noqa: BLE001 — one bad row must not strand every row after it
+            logger.error(f"Failed to recover StrategyOptimization {opt_id}: {e}")
+            db.rollback()
 
 
 @app.on_event("shutdown")
