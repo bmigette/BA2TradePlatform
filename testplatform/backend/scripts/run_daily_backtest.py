@@ -55,6 +55,8 @@ from pathlib import Path
 BACKEND_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BACKEND_ROOT))
 
+from app.services.sync_client import push_backtest
+
 # Load .env so a configured FMP_API_KEY (project root or backend/.env) is picked up before
 # any provider resolution. Mirrors scripts/test_amgn_gaps.py. Absent files are a no-op.
 try:
@@ -408,6 +410,8 @@ def _persist_tracked(config: dict, results: dict, *, saved: bool) -> int:
         bt.completed_at = datetime.now()
         bt.is_saved = bool(saved)
         db.commit()
+        if bt.is_saved:
+            push_backtest(bt, db)
         return bt.id
     finally:
         db.close()
