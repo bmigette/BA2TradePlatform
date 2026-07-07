@@ -848,6 +848,27 @@ class DailyBacktestEngine:
                               f"{expert_id} @ {as_of:%Y-%m-%d} — skip")
                     continue
 
+                # LIVE-PARITY EQUITY GATE (mirrors TradeManager.process_expert_recommendations_
+                # after_analysis:1146-1155): before staging an entry, skip if the expert lacks
+                # sufficient available equity (available_balance >= minimum_equity_threshold_percent
+                # of virtual balance, default 5%). Calls the SAME shared
+                # MarketExpertInterface.has_sufficient_equity_for_trading the live path uses — no
+                # re-implementation. Note: BacktestAccount.get_balance() is cash (not NLV), which is
+                # the same balance BT sizing already uses (TradeRiskManagement), so the gate stays
+                # consistent with BT sizing. Stub experts without the method are treated as allowed.
+                equity_check = getattr(expert, "has_sufficient_equity_for_trading", None)
+                if callable(equity_check):
+                    try:
+                        ok_equity, equity_reason = equity_check()
+                    except Exception as e:  # noqa: BLE001 — a wiring gap must not silently over-block
+                        self._log(f"equity-gate check errored for {symbol} @ {as_of:%Y-%m-%d} "
+                                  f"(treating as allowed): {e}")
+                        ok_equity = True
+                    if not ok_equity:
+                        self._log(f"entry equity-gate: {symbol} skipped for expert {expert_id} "
+                                  f"@ {as_of:%Y-%m-%d} — {equity_reason}")
+                        continue
+
                 # Equity entry: create PENDING qty=0 orders (NOT submitted; RM sizes + submits
                 # next). Option entry: the option action sizes + submits ITSELF, so submit
                 # directly (like the open-positions path) — there is no equity leg.
