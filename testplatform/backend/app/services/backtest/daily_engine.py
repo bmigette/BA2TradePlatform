@@ -837,6 +837,17 @@ class DailyBacktestEngine:
                 if not action_summaries or any("error" in s for s in action_summaries):
                     continue  # conditions not met / evaluation error -> no order this symbol.
 
+                # LIVE-PARITY DUP-POSITION GATE (mirrors TradeManager.process_expert_recommendations_
+                # after_analysis:1130-1144): after the enter ruleset passes but BEFORE executing,
+                # skip if an OPENED/WAITING transaction already exists for this (expert, symbol).
+                # The ruleset's has_no_position flag only counts OPENED, so a not-yet-filled WAITING
+                # entry from a prior bar could otherwise stack a duplicate the live engine blocks.
+                # (No-op for standard strategies whose entries fill before the next analysis bar.)
+                if self._has_open_or_waiting_position(expert_id, symbol):
+                    self._log(f"entry dup-gate: {symbol} already OPENED/WAITING for expert "
+                              f"{expert_id} @ {as_of:%Y-%m-%d} — skip")
+                    continue
+
                 # Equity entry: create PENDING qty=0 orders (NOT submitted; RM sizes + submits
                 # next). Option entry: the option action sizes + submits ITSELF, so submit
                 # directly (like the open-positions path) — there is no equity leg.
@@ -954,6 +965,27 @@ class DailyBacktestEngine:
         for t in rows:
             out.setdefault(t.symbol, []).append(t)
         return out
+
+    def _has_open_or_waiting_position(self, expert_id: int, symbol: str) -> bool:
+        """True if this expert already holds an OPENED or WAITING transaction for ``symbol``.
+
+        The live-parity duplicate-position gate (mirrors TradeManager's enter_market safety
+        check, which queries OPENED+WAITING). Unlike ``_held_transactions`` (OPENED-only, for
+        MANAGEMENT), the dup gate must also count a WAITING (not-yet-filled) entry so a second
+        entry can't stack on it before it fills — exactly as live blocks it."""
+        from sqlmodel import select, Session
+        from ba2_common.core.db import get_db
+        from ba2_common.core.types import TransactionStatus
+
+        with Session(get_db().bind) as session:
+            row = session.exec(
+                select(Transaction).where(
+                    Transaction.expert_id == expert_id,
+                    Transaction.symbol == symbol,
+                    Transaction.status.in_([TransactionStatus.OPENED, TransactionStatus.WAITING]),
+                )
+            ).first()
+        return row is not None
 
     def _oldest_entry_order(self, txns: List[Any]) -> Optional[Any]:
         """The FILLED entry order of the oldest transaction (for DaysOpened-style conditions)."""
