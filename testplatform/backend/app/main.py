@@ -58,6 +58,7 @@ class NaNSafeJSONResponse(JSONResponse):
 
 # Import and initialize logging configuration
 from app.logging_config import setup_logging, get_logger
+from app.services.sync_client import push_optimization
 
 # Set up logging with separate files for debug, info, and error
 setup_logging(
@@ -374,11 +375,43 @@ def recover_interrupted_jobs():
         else:
             logger.info("No interrupted jobs found")
 
+        _recover_interrupted_optimizations(db, running_jobs)
+
     except Exception as e:
         logger.error(f"Failed to recover interrupted jobs: {e}")
         db.rollback()
     finally:
         db.close()
+
+
+def _recover_interrupted_optimizations(db, crashed_task_rows) -> None:
+    """Correct StrategyOptimization.status for crashed 'strategy_optimization' TaskQueue rows.
+
+    The TaskQueue-level recovery above only fixes the task row itself; it never touches the
+    PARENT StrategyOptimization, which is left reporting status='running' forever after a
+    crash — both locally and, before this fix, forever on any synced remote copy too. Only
+    rows genuinely still 'running' are touched, so an optimization that had already reached a
+    terminal state before the crash (e.g. the crash happened during an unrelated later step)
+    is left alone.
+    """
+    from app.models.strategy_optimization import StrategyOptimization
+
+    for job in crashed_task_rows:
+        if job.task_type != "strategy_optimization":
+            continue
+        opt_id = (job.payload or {}).get("optimization_id")
+        if not opt_id:
+            continue
+        opt = db.query(StrategyOptimization).filter(StrategyOptimization.id == opt_id).first()
+        if opt is None or opt.status != "running":
+            continue
+        opt.status = "failed"
+        opt.error_message = "Interrupted by server restart"
+        db.commit()
+        logger.warning(
+            f"StrategyOptimization {opt_id} was stuck 'running' after a crash — marked 'failed'"
+        )
+        push_optimization(opt, db)
 
 
 @app.on_event("shutdown")
