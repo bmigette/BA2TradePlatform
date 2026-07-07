@@ -57,6 +57,28 @@ def validate_options_window(start, uses_options: bool) -> None:
             f"(Alpaca options history floor); got {d.isoformat()}.")
 
 
+def assert_backtestable_risk_mode(class_name: str, resolved_settings: Dict[str, Any]) -> None:
+    """Fail loud if a classic-path expert is configured for the SMART (agentic) risk manager.
+
+    Parity scope is LOCKED to classic-RM + bypass experts (see
+    ``docs/plans/2026-07-02-live-backtest-engine-unification.md``): the backtest has no
+    faithful, deterministic emulation of the live SmartRiskManager, so silently running a
+    ``smart`` expert through the classic sizing/entry path would model a DIFFERENT policy
+    than live. Refuse with a clear error instead of producing misleading results.
+    (AI-driven / LLM experts — e.g. TradingAgents — are already excluded upstream by
+    ``_SUPPORTED_EXPERTS``; this guards the one remaining silent case: a supported classic
+    expert whose ``risk_manager_mode`` setting is ``smart``.)
+    """
+    mode = str((resolved_settings or {}).get("risk_manager_mode") or "classic").strip().lower()
+    if mode == "smart":
+        raise ValueError(
+            f"Backtest does not model the Smart (agentic) risk manager for '{class_name}' "
+            f"(risk_manager_mode='smart'). Backtest parity scope is classic-RM + bypass "
+            f"experts only — set risk_manager_mode='classic' to backtest this expert. See "
+            f"docs/plans/2026-07-02-live-backtest-engine-unification.md."
+        )
+
+
 def strategy_uses_options(cfg: Dict[str, Any]) -> bool:
     """True iff ANY exit/RM rule names an OPTION action (``is_option_action``).
 
@@ -759,6 +781,11 @@ def _build_experts(
 
         # The expert's declared decision settings: its own defaults + payload overrides.
         decision_settings = _expert_decision_settings(expert_cls, overrides)
+
+        # LOCKED parity scope: refuse a Smart-RM (agentic) classic-path expert — no faithful
+        # backtest emulation exists (bypass experts skip the RM entirely, so smart is moot there).
+        if not bypass:
+            assert_backtestable_risk_mode(class_name, decision_settings)
 
         expert = expert_cls(expert_id)
         if bypass:
