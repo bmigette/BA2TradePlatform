@@ -967,7 +967,12 @@ class TradeManager:
         
         # We have the lock - make sure we release it when done
         created_orders = []
-        
+        # TEMP-ORDER-LIST FLOW: instead of persisting a qty=0 PENDING order per passing rec and then
+        # letting the RM size + DELETE the unfunded (churn), we stage a TRANSIENT candidate per passing
+        # rec, size them ALL in one in-memory RM pass, then persist + submit ONLY the funded ones.
+        # Each entry: (transient_candidate_order, evaluator, recommendation).
+        entry_candidates = []
+
         try:
             self.logger.debug(f"Acquired processing lock for expert {expert_instance_id} (enter_market)")
             
@@ -1154,75 +1159,79 @@ class TradeManager:
                             )
                             continue
                         
-                        # Execute the actions using TradeActionEvaluator
-                        # Actions are already sorted by priority (BUY/SELL first, then TP/SL)
-                        # Thanks to _sort_actions_by_priority in execute() method
-                        execution_results = evaluator.execute()
-                        
-                        # Track the main order (BUY/SELL) that was created so we can use it for TP/SL
-                        main_order = None
-                        
-                        # Process execution results
-                        for result in execution_results:
-                            if result.get('success', False):
-                                self.logger.info(f"Action executed successfully: {result.get('description', 'Unknown action')}")
-                                
-                                # Check if a TradingOrder was created (data field should contain order_id)
-                                if result.get('data') and isinstance(result['data'], dict):
-                                    order_id = result['data'].get('order_id')
-                                    if order_id:
-                                        # Query the order from the current session (not using get_instance)
-                                        # to ensure it's attached to this session before expunge
-                                        from sqlmodel import select
-                                        statement = select(TradingOrder).where(TradingOrder.id == order_id)
-                                        order = session.exec(statement).first()
-                                        if order:
-                                            session.expunge(order)
-                                            created_orders.append(order)
-                                            # Track the main order (first BUY/SELL order created)
-                                            # This will be the pending order that TP/SL can reference
-                                            if main_order is None and order.side in [OrderDirection.BUY, OrderDirection.SELL]:
-                                                main_order = order
-                                                self.logger.debug(f"Main order {order_id} will be used for TP/SL actions")
-                                            self.logger.info(f"Created order {order_id} for {recommendation.symbol}")
-                            else:
-                                self.logger.warning(f"Action execution failed: {result.get('message', 'Unknown error')}")
-                        
+                        # TEMP-ORDER-LIST FLOW: do NOT execute (persist) yet. Stage a TRANSIENT
+                        # candidate order for the in-memory RM sizing pass below; only the funded
+                        # subset will be executed + submitted (no qty=0 churn, no unfunded deletes).
+                        # Side comes from the recommendation direction (bullish -> buy, bearish ->
+                        # sell short-entry), matching which order-creating action the ruleset fired.
+                        side = (OrderDirection.SELL
+                                if recommendation.recommended_action in (OrderRecommendation.SELL,
+                                                                         OrderRecommendation.UNDERWEIGHT)
+                                else OrderDirection.BUY)
+                        candidate = TradingOrder(
+                            account_id=account.id, symbol=recommendation.symbol, quantity=0.0,
+                            side=side, order_type=OrderType.MARKET, status=OrderStatus.PENDING,
+                            expert_recommendation_id=recommendation.id,
+                            data=(recommendation.data or None))
+                        entry_candidates.append((candidate, evaluator, recommendation))
+
                     except Exception as e:
                         self.logger.error(f"Error processing recommendation {recommendation.id}: {e}", exc_info=True)
                         continue
-                
-                self.logger.info(f"Created {len(created_orders)} orders from {len(recommendations)} recommendations for expert {expert_instance_id}")
-                
-                # If we created orders and automated trading is enabled, run risk management
-                if created_orders and allow_automated_trade_opening:
-                    self.logger.info(f"Running risk management for {len(created_orders)} pending orders")
+
+                # TEMP-ORDER-LIST RM SIZING: size ALL the bar's candidates in one in-memory pass; only
+                # the funded (qty>0) get persisted (execute) + submitted. Unfunded candidates never
+                # touch the DB — the requested order-flow redesign (was: persist qty=0 -> RM DB pass ->
+                # delete unfunded). The funded set + quantities are identical to the old DB path
+                # (size_candidate_orders == review_and_prioritize_pending_orders; proven by tests).
+                submitted_count = 0
+                if entry_candidates and allow_automated_trade_opening:
+                    self.logger.info(f"Sizing {len(entry_candidates)} entry candidate(s) for expert {expert_instance_id}")
                     try:
                         from .TradeRiskManagement import get_risk_management
                         risk_management = get_risk_management()
-                        updated_orders = risk_management.review_and_prioritize_pending_orders(expert_instance_id)
-                        self.logger.info(f"Risk management completed: updated {len(updated_orders)} orders with quantities")
-                        
-                        # Auto-submit orders with quantity > 0 to broker
-                        submitted_count = 0
-                        for order in updated_orders:
-                            if order.quantity and order.quantity > 0:
-                                try:
-                                    self.logger.info(f"Auto-submitting order {order.id} for {order.symbol}: {order.quantity} shares")
-                                    # order.stop_price carries the RM's safeguard SL (min ATR×mult
-                                    # / risk%, floored at min_stop_loss_pct) when no exit condition
-                                    # set a stop of its own — pass it so submit_order creates the
-                                    # protective WAITING_TRIGGER SL leg (mirrors the backtest).
-                                    submitted_order = account.submit_order(order, sl_price=order.stop_price or None)
-                                    if submitted_order:
-                                        submitted_count += 1
-                                        self.logger.info(f"Successfully submitted order {order.id} to broker")
-                                    else:
-                                        self.logger.warning(f"Failed to submit order {order.id} to broker")
-                                except Exception as submit_error:
-                                    self.logger.error(f"Error submitting order {order.id}: {submit_error}", exc_info=True)
-                        
-                        self.logger.info(f"Auto-submitted {submitted_count}/{len(updated_orders)} orders to broker")
+                        funded = risk_management.size_candidate_orders(
+                            expert_instance_id, [(c, rec) for (c, _e, rec) in entry_candidates])
+                        funded_by_symbol = {o.symbol: o for o in funded}
+                        self.logger.info(f"RM funded {len(funded)} of {len(entry_candidates)} candidate(s)")
+
+                        for candidate, evaluator, recommendation in entry_candidates:
+                            fo = funded_by_symbol.get(candidate.symbol)
+                            if fo is None or not (fo.quantity and fo.quantity > 0):
+                                continue  # unfunded — never persisted (no churn / delete)
+                            try:
+                                # Persist the real order + transaction + TP/SL bracket (execute is
+                                # byte-identical to the old flow; now called ONLY for funded symbols).
+                                execution_results = evaluator.execute()
+                                order = None
+                                for result in execution_results:
+                                    if result.get('success') and isinstance(result.get('data'), dict):
+                                        oid = result['data'].get('order_id')
+                                        if oid:
+                                            from sqlmodel import select as _select
+                                            o = session.exec(_select(TradingOrder).where(TradingOrder.id == oid)).first()
+                                            if o and o.side in (OrderDirection.BUY, OrderDirection.SELL) and order is None:
+                                                order = o
+                                if order is None:
+                                    self.logger.warning(f"No main order created for funded {candidate.symbol}")
+                                    continue
+                                order.quantity = fo.quantity  # RM-sized quantity from the candidate pass
+                                # Live parity: submit with the RM safeguard SL (fo.stop_price) — the
+                                # live path does NOT apply the backtest's tighter-wins merge (that is a
+                                # separate, not-yet-approved live change), so behavior is preserved.
+                                self.logger.info(f"Auto-submitting order {order.id} for {order.symbol}: {order.quantity} shares")
+                                submitted_order = account.submit_order(order, sl_price=fo.stop_price or None)
+                                if submitted_order:
+                                    submitted_count += 1
+                                    session.expunge(order)
+                                    created_orders.append(order)
+                                    self.logger.info(f"Successfully submitted order {order.id} to broker")
+                                else:
+                                    self.logger.warning(f"Failed to submit order {order.id} to broker")
+                            except Exception as submit_error:
+                                self.logger.error(f"Error executing/submitting funded {candidate.symbol}: {submit_error}", exc_info=True)
+
+                        self.logger.info(f"Created + auto-submitted {submitted_count}/{len(entry_candidates)} orders to broker")
                         
                         # Refresh order statuses from broker to detect if any orders are already FILLED
                         # This is important for market orders which fill immediately
