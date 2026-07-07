@@ -291,6 +291,26 @@ def test_brute_force_finds_global_optimum(monkeypatch):
     }
 
 
+def test_brute_force_completion_pushes_optimization(monkeypatch):
+    """brute_force has its OWN completion logic entirely separate from the GA path (no
+    per-generation callback either), so it needs its own sync wiring — prove it pushes on
+    completion with the final status='completed' state, same pattern as
+    test_brute_force_finds_global_optimum but asserting the sync call instead of the result."""
+    monkeypatch.setattr(H, "_run_trial_backtest", _deterministic_stub)
+    monkeypatch.setattr(H, "_build_hoisted_state", lambda cfg: {})
+    calls = []
+    monkeypatch.setattr(H, "push_optimization", lambda opt, db: calls.append(opt.status))
+
+    sid = _seed_strategy()
+    opt_id = _seed_opt(sid, optimization_type="brute_force")
+    out = H.handle_strategy_optimization("t-bf-sync", {"optimization_id": opt_id})
+
+    assert out["status"] == "completed"
+    assert len(calls) >= 1
+    assert calls[-1] == "completed"
+    assert _load_opt(opt_id).status == "completed"
+
+
 def test_max_drawdown_metric_negated_through_handler(monkeypatch):
     """fitness_metric=max_drawdown is negated end-to-end (gate #4)."""
 

@@ -137,3 +137,96 @@ def test_push_failure_is_logged_and_swallowed_not_raised(db):
     with patch("httpx.Client") as mock_client_cls:
         mock_client_cls.return_value.__enter__.side_effect = ConnectionError("offline")
         sync_client.push_strategy(strat, db)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# A DB-read failure (not just the HTTP layer) must also be swallowed: push_strategy/
+# push_optimization/push_backtest wrap their FULL body, not just the httpx call inside _post.
+# This is the exact scenario Task 5 introduced risk for: ga_callback calls push_optimization
+# from inside a live GA generation loop, so any DB read failing here (stale/locked SQLite
+# connection, detached-instance error, etc.) must never propagate and fail a healthy run.
+# ---------------------------------------------------------------------------
+class _RaisingQuery:
+    def filter(self, *a, **kw):
+        raise RuntimeError("simulated DB read failure")
+
+
+def test_push_strategy_swallows_db_query_failure(db, caplog):
+    """A raising db.query(...) inside push_strategy's own body (not the HTTP layer) must not
+    propagate — _dump()/_sync_targets() both call db.query, so breaking .query itself proves the
+    whole function body is guarded, not just _post."""
+    strat = Strategy(name="s1", created_at=datetime.now(timezone.utc))
+    db.add(strat)
+    db.commit()
+
+    db.query = MagicMock(side_effect=RuntimeError("simulated DB read failure"))
+    with caplog.at_level("WARNING"):
+        sync_client.push_strategy(strat, db)  # must not raise
+    assert any("push_strategy failed" in r.message for r in caplog.records)
+
+
+def test_push_optimization_swallows_db_query_failure(db, caplog):
+    """Same guarantee for push_optimization: its own Strategy lookup (db.query(Strategy)...)
+    raising must be caught at push_optimization's boundary, exactly like ga_callback relies on."""
+    strat = Strategy(name="s1", created_at=datetime.now(timezone.utc))
+    db.add(strat)
+    db.commit()
+    opt = StrategyOptimization(
+        name="opt1", strategy_id=strat.id, created_at=datetime.now(timezone.utc),
+        status="running", fitness_metric="sharpe", optimization_type="genetic",
+    )
+    db.add(opt)
+    db.commit()
+
+    db.query = MagicMock(side_effect=RuntimeError("simulated DB read failure"))
+    with caplog.at_level("WARNING"):
+        sync_client.push_optimization(opt, db)  # must not raise
+    assert any("push_optimization failed" in r.message for r in caplog.records)
+
+
+def test_push_backtest_swallows_db_query_failure(db, caplog):
+    """Same guarantee for push_backtest: its own Strategy/StrategyOptimization lookups raising
+    must be caught at push_backtest's boundary."""
+    strat = Strategy(name="s1", created_at=datetime.now(timezone.utc))
+    db.add(strat)
+    db.commit()
+    bt = Backtest(
+        name="bt1", engine_type="daily_expert", strategy_id=strat.id,
+        created_at=datetime.now(timezone.utc),
+        start_date=datetime.now(timezone.utc), end_date=datetime.now(timezone.utc),
+    )
+    db.add(bt)
+    db.commit()
+
+    db.query = MagicMock(side_effect=RuntimeError("simulated DB read failure"))
+    with caplog.at_level("WARNING"):
+        sync_client.push_backtest(bt, db)  # must not raise
+    assert any("push_backtest failed" in r.message for r in caplog.records)
+
+
+def test_push_optimization_swallows_sync_targets_query_failure(db, caplog):
+    """A raising db.query(Worker)... inside _sync_targets (called AFTER the Strategy lookup
+    succeeds) must also be swallowed by push_optimization's own guard, not just _post's."""
+    strat = Strategy(name="s1", created_at=datetime.now(timezone.utc))
+    db.add(strat)
+    db.commit()
+    opt = StrategyOptimization(
+        name="opt1", strategy_id=strat.id, created_at=datetime.now(timezone.utc),
+        status="running", fitness_metric="sharpe", optimization_type="genetic",
+    )
+    db.add(opt)
+    db.commit()
+
+    from app.models import Worker as WorkerModel
+
+    real_query = db.query
+
+    def _flaky_query(model, *a, **kw):
+        if model is WorkerModel:
+            raise RuntimeError("simulated Worker query failure")
+        return real_query(model, *a, **kw)
+
+    db.query = _flaky_query
+    with caplog.at_level("WARNING"):
+        sync_client.push_optimization(opt, db)  # must not raise
+    assert any("push_optimization failed" in r.message for r in caplog.records)

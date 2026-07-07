@@ -62,48 +62,68 @@ def _dump(row: Any) -> dict:
 
 
 def push_strategy(strat: Optional[Any], db: Any) -> None:
+    """Replicate ``strat`` to every sync-enabled worker. NEVER RAISES: the whole body (DB
+    reads included, not just the HTTP layer) is guarded so a caller in a live job loop (e.g.
+    ``ga_callback``) can call this unconditionally without risking the job itself."""
     if strat is None:
         return
-    payload = _dump(strat)
-    for worker in _sync_targets(db):
-        _post(worker, "/sync/strategy", payload)
+    try:
+        payload = _dump(strat)
+        for worker in _sync_targets(db):
+            _post(worker, "/sync/strategy", payload)
+    except Exception as e:  # noqa: BLE001 — fire-and-forget: never block the caller
+        logger.warning(f"push_strategy failed (swallowed): {e!r}")
 
 
 def push_optimization(opt: Optional[Any], db: Any) -> None:
+    """Replicate ``opt`` (+ its parent Strategy) to every sync-enabled worker. NEVER RAISES:
+    the whole body (including the ``Strategy`` lookup and the worker-list query) is guarded, not
+    just the HTTP layer — ``ga_callback`` calls this from inside the live GA generation loop, so
+    a DB hiccup here must never fail an otherwise-healthy optimization."""
     if opt is None:
         return
-    from app.models.strategy import Strategy
-    strat = db.query(Strategy).filter(Strategy.id == opt.strategy_id).first() if opt.strategy_id else None
-    push_strategy(strat, db)  # dependency first
+    try:
+        from app.models.strategy import Strategy
+        strat = db.query(Strategy).filter(Strategy.id == opt.strategy_id).first() if opt.strategy_id else None
+        push_strategy(strat, db)  # dependency first
 
-    payload = _dump(opt)
-    payload["strategy_name"] = strat.name if strat else None
-    payload["strategy_created_at"] = _iso(strat.created_at) if strat else None
-    for worker in _sync_targets(db):
-        _post(worker, "/sync/optimization", payload)
+        payload = _dump(opt)
+        payload["strategy_name"] = strat.name if strat else None
+        payload["strategy_created_at"] = _iso(strat.created_at) if strat else None
+        for worker in _sync_targets(db):
+            _post(worker, "/sync/optimization", payload)
+    except Exception as e:  # noqa: BLE001 — fire-and-forget: never block the caller
+        logger.warning(f"push_optimization failed (swallowed): {e!r}")
 
 
 def push_backtest(bt: Optional[Any], db: Any) -> None:
+    """Replicate ``bt`` (+ its parent Strategy/StrategyOptimization) to every sync-enabled
+    worker. NEVER RAISES: the whole body (including both parent lookups and the worker-list
+    query) is guarded, not just the HTTP layer, same guarantee as ``push_strategy``/
+    ``push_optimization``."""
     if bt is None:
         return
-    from app.models.strategy import Strategy
-    from app.models.strategy_optimization import StrategyOptimization
+    try:
+        from app.models.strategy import Strategy
+        from app.models.strategy_optimization import StrategyOptimization
 
-    opt = None
-    if bt.optimization_id:
-        opt = db.query(StrategyOptimization).filter(StrategyOptimization.id == bt.optimization_id).first()
-        push_optimization(opt, db)  # transitively pushes opt's own Strategy dependency too
+        opt = None
+        if bt.optimization_id:
+            opt = db.query(StrategyOptimization).filter(StrategyOptimization.id == bt.optimization_id).first()
+            push_optimization(opt, db)  # transitively pushes opt's own Strategy dependency too
 
-    strat = db.query(Strategy).filter(Strategy.id == bt.strategy_id).first() if bt.strategy_id else None
-    if strat is not None and not (opt is not None and opt.strategy_id == bt.strategy_id):
-        # Only push directly when push_optimization above hasn't already covered this exact
-        # Strategy — otherwise this is a redundant second push per worker.
-        push_strategy(strat, db)
+        strat = db.query(Strategy).filter(Strategy.id == bt.strategy_id).first() if bt.strategy_id else None
+        if strat is not None and not (opt is not None and opt.strategy_id == bt.strategy_id):
+            # Only push directly when push_optimization above hasn't already covered this exact
+            # Strategy — otherwise this is a redundant second push per worker.
+            push_strategy(strat, db)
 
-    payload = _dump(bt)
-    payload["strategy_name"] = strat.name if strat else None
-    payload["strategy_created_at"] = _iso(strat.created_at) if strat else None
-    payload["optimization_name"] = opt.name if opt else None
-    payload["optimization_created_at"] = _iso(opt.created_at) if opt else None
-    for worker in _sync_targets(db):
-        _post(worker, "/sync/backtest", payload)
+        payload = _dump(bt)
+        payload["strategy_name"] = strat.name if strat else None
+        payload["strategy_created_at"] = _iso(strat.created_at) if strat else None
+        payload["optimization_name"] = opt.name if opt else None
+        payload["optimization_created_at"] = _iso(opt.created_at) if opt else None
+        for worker in _sync_targets(db):
+            _post(worker, "/sync/backtest", payload)
+    except Exception as e:  # noqa: BLE001 — fire-and-forget: never block the caller
+        logger.warning(f"push_backtest failed (swallowed): {e!r}")

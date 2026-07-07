@@ -1010,7 +1010,16 @@ def _run_brute_force(
     fitness_function,
     all_results: list,
 ) -> Dict[str, Any]:
-    """Exhaustive search over the stepped ranges (itertools.product) for tiny spaces."""
+    """Exhaustive search over the stepped ranges (itertools.product) for tiny spaces.
+
+    Has its own completion logic entirely separate from the GA path (no per-generation
+    callback either — it's a flat loop, not generational), so the completion push below is
+    this path's ONLY sync point; a brute-force run's failure path is NOT separate from the
+    GA's, though: ``fitness_function`` raising here propagates straight out to
+    ``handle_strategy_optimization``'s own try/except, which already routes any failure
+    through the shared ``_fail()`` helper (itself already wired to push_optimization) — so no
+    separate failure-push is needed here.
+    """
     import itertools
 
     axes: Dict[str, list] = {}
@@ -1034,6 +1043,7 @@ def _run_brute_force(
     opt.best_fitness = best["fitness"]
     opt.all_results = all_results
     db.commit()
+    push_optimization(opt, db)
     return {
         "status": "completed",
         "optimization_id": opt.id,
