@@ -118,7 +118,11 @@ def test_push_backtest_syncs_both_parents(db):
         sync_client.push_backtest(bt, db)
 
         paths = [c.args[0] for c in mock_client.post.call_args_list]
-        assert paths[-1] == "http://w1:8100/sync/backtest"
+        assert paths == [
+            "http://w1:8100/sync/strategy",
+            "http://w1:8100/sync/optimization",
+            "http://w1:8100/sync/backtest",
+        ]
         bt_call = mock_client.post.call_args_list[-1]
         assert bt_call.kwargs["json"]["strategy_name"] == "s1"
         assert bt_call.kwargs["json"]["optimization_name"] == "opt1"

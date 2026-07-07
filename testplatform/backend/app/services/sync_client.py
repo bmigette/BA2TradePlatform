@@ -89,13 +89,16 @@ def push_backtest(bt: Optional[Any], db: Any) -> None:
     from app.models.strategy import Strategy
     from app.models.strategy_optimization import StrategyOptimization
 
-    strat = db.query(Strategy).filter(Strategy.id == bt.strategy_id).first() if bt.strategy_id else None
-    push_strategy(strat, db)
-
     opt = None
     if bt.optimization_id:
         opt = db.query(StrategyOptimization).filter(StrategyOptimization.id == bt.optimization_id).first()
-        push_optimization(opt, db)  # also syncs opt's own Strategy dependency, harmlessly redundant
+        push_optimization(opt, db)  # transitively pushes opt's own Strategy dependency too
+
+    strat = db.query(Strategy).filter(Strategy.id == bt.strategy_id).first() if bt.strategy_id else None
+    if strat is not None and not (opt is not None and opt.strategy_id == bt.strategy_id):
+        # Only push directly when push_optimization above hasn't already covered this exact
+        # Strategy — otherwise this is a redundant second push per worker.
+        push_strategy(strat, db)
 
     payload = _dump(bt)
     payload["strategy_name"] = strat.name if strat else None
