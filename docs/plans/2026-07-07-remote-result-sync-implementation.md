@@ -511,7 +511,7 @@ def upsert_by_natural_key(
 **Step 4: Run tests to verify they pass**
 
 Run: `cd testplatform/backend && ./venv/bin/python -m pytest tests/test_sync_receiver.py -v`
-Expected: PASS (8 tests)
+Expected: PASS (7 tests)
 
 **Step 5: Commit**
 
