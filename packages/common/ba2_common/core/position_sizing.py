@@ -250,6 +250,30 @@ def synthesize_safeguard_stop(
     return round(sl, 2) if sl > 0 else None
 
 
+def reconcile_protective_stop(ruleset_sl: Optional[float], safeguard_sl: Optional[float],
+                             is_long: bool) -> Optional[float]:
+    """The TIGHTER-WINS reconciliation between a strategy's ruleset entry-bracket stop and the RM
+    safeguard stop, returning the stop PRICE to attach at submit (or None to attach nothing extra).
+
+    Both present  -> the TIGHTER stop: for a long the HIGHER price, for a short the LOWER price, so
+                     realized risk can never exceed risk_per_trade_pct while a tighter strategy stop
+                     is still respected.
+    Only safeguard -> the safeguard (no ruleset SL: attach the RM's protective leg).
+    Only ruleset   -> None: the ruleset SL is already attached as its own dependent leg, so there is
+                     nothing tighter to add.
+    Neither        -> None.
+
+    Pure function. Shared by the backtest submit tails (daily_engine) so the tighter-wins policy is
+    defined once. (Live currently attaches only the safeguard and does NOT call this — that policy
+    change is intentionally out of scope until separately approved + paper-validated.)
+    """
+    if ruleset_sl and safeguard_sl:
+        return max(ruleset_sl, safeguard_sl) if is_long else min(ruleset_sl, safeguard_sl)
+    if safeguard_sl and not ruleset_sl:
+        return safeguard_sl
+    return None
+
+
 def get_latest_atr(symbol: str, indicator_provider, period: int = 14, interval: str = "1d",
                    end_date: Optional[datetime] = None) -> Optional[float]:
     """Fetch the latest ATR via an injected MarketIndicatorsInterface provider.

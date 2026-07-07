@@ -1249,20 +1249,15 @@ class DailyBacktestEngine:
         for order in updated_orders:
             if order.quantity and order.quantity > 0:
                 try:
-                    # Effective protective stop: the RULESET entry-bracket SL (attached to
-                    # the transaction by the entry rule's adjust_stop_loss action in Phase 2)
-                    # vs the RM SAFEGUARD (order.stop_price, what the position was SIZED
-                    # off). TIGHTER WINS — long: the higher stop; short: the lower — so
-                    # realized risk can never exceed risk_per_trade_pct, while a tighter
-                    # strategy stop is respected. No ruleset SL -> safeguard as before.
-                    sl_price = order.stop_price or None
+                    # Effective protective stop: shared TIGHTER-WINS reconciliation of the RULESET
+                    # entry-bracket SL (on the transaction) vs the RM SAFEGUARD (order.stop_price,
+                    # what the position was SIZED off). See position_sizing.reconcile_protective_stop.
+                    from ba2_common.core.position_sizing import reconcile_protective_stop
                     txn = get_instance(Transaction, order.transaction_id) if order.transaction_id else None
-                    ruleset_sl = txn.stop_loss if txn else None
-                    if ruleset_sl and sl_price:
-                        is_long = order.side == OrderDirection.BUY
-                        sl_price = max(ruleset_sl, sl_price) if is_long else min(ruleset_sl, sl_price)
-                    elif ruleset_sl:
-                        sl_price = None  # ruleset SL already attached; nothing tighter to add
+                    sl_price = reconcile_protective_stop(
+                        ruleset_sl=(txn.stop_loss if txn else None),
+                        safeguard_sl=(order.stop_price or None),
+                        is_long=(order.side == OrderDirection.BUY))
                     self.account.submit_order(order, sl_price=sl_price)
                 except Exception as e:  # noqa: BLE001
                     self._log(f"submit_order failed for order {order.id}: {e}")
@@ -1309,17 +1304,14 @@ class DailyBacktestEngine:
                 if order is None:
                     continue
                 order.quantity = cand.quantity  # the RM-sized quantity computed on the candidate
-                # TIGHTER-WINS protective stop: RM safeguard (cand.stop_price, what the size was
-                # keyed off) vs the ruleset entry-bracket SL (on the transaction). Long: higher wins;
-                # short: lower. No ruleset SL -> safeguard as before (identical to the DB _size_and_submit).
-                sl_price = cand.stop_price or None
+                # Shared TIGHTER-WINS reconciliation: RM safeguard (cand.stop_price, what the size
+                # was keyed off) vs the ruleset entry-bracket SL (on the transaction).
+                from ba2_common.core.position_sizing import reconcile_protective_stop
                 txn = get_instance(Transaction, order.transaction_id) if order.transaction_id else None
-                ruleset_sl = txn.stop_loss if txn else None
-                if ruleset_sl and sl_price:
-                    is_long = order.side == OrderDirection.BUY
-                    sl_price = max(ruleset_sl, sl_price) if is_long else min(ruleset_sl, sl_price)
-                elif ruleset_sl:
-                    sl_price = None
+                sl_price = reconcile_protective_stop(
+                    ruleset_sl=(txn.stop_loss if txn else None),
+                    safeguard_sl=(cand.stop_price or None),
+                    is_long=(order.side == OrderDirection.BUY))
                 self.account.submit_order(order, sl_price=sl_price)
                 created_any = True
             except Exception as e:  # noqa: BLE001
