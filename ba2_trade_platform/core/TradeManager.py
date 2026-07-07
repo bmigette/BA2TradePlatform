@@ -1160,19 +1160,11 @@ class TradeManager:
                             continue
                         
                         # TEMP-ORDER-LIST FLOW: do NOT execute (persist) yet. Stage a TRANSIENT
-                        # candidate order for the in-memory RM sizing pass below; only the funded
-                        # subset will be executed + submitted (no qty=0 churn, no unfunded deletes).
-                        # Side comes from the recommendation direction (bullish -> buy, bearish ->
-                        # sell short-entry), matching which order-creating action the ruleset fired.
-                        side = (OrderDirection.SELL
-                                if recommendation.recommended_action in (OrderRecommendation.SELL,
-                                                                         OrderRecommendation.UNDERWEIGHT)
-                                else OrderDirection.BUY)
-                        candidate = TradingOrder(
-                            account_id=account.id, symbol=recommendation.symbol, quantity=0.0,
-                            side=side, order_type=OrderType.MARKET, status=OrderStatus.PENDING,
-                            expert_recommendation_id=recommendation.id,
-                            data=(recommendation.data or None))
+                        # candidate order (via the shared trade_cycle builder — same shape the
+                        # backtest uses) for the in-memory RM sizing pass below; only the funded
+                        # subset is executed + submitted (no qty=0 churn, no unfunded deletes).
+                        from .trade_cycle import build_entry_candidate
+                        candidate = build_entry_candidate(recommendation, account.id)
                         entry_candidates.append((candidate, evaluator, recommendation))
 
                     except Exception as e:

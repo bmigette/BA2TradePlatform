@@ -893,16 +893,9 @@ class DailyBacktestEngine:
                     continue
 
                 # EQUITY entry: stage a TRANSIENT candidate (NOT persisted) for the temp-list RM
-                # pass. Side comes from the recommendation direction (bullish -> buy, bearish ->
-                # sell short-entry), matching which order-creating action the ruleset fired.
-                side = (OrderDirection.SELL
-                        if recommendation.recommended_action in (OrderRecommendation.SELL,
-                                                                 OrderRecommendation.UNDERWEIGHT)
-                        else OrderDirection.BUY)
-                candidate = TradingOrder(
-                    account_id=self.account.id, symbol=symbol, quantity=0.0, side=side,
-                    order_type=OrderType.MARKET, status=OrderStatus.PENDING,
-                    expert_recommendation_id=recommendation.id, data=(recommendation.data or None))
+                # pass via the shared trade_cycle builder (same shape live uses).
+                from ba2_common.core.trade_cycle import build_entry_candidate
+                candidate = build_entry_candidate(recommendation, self.account.id)
                 equity_candidates.append((candidate, evaluator, symbol, recommendation))
             except Exception as e:  # noqa: BLE001
                 self._log(f"ruleset eval/execute failed for {symbol} @ {as_of:%Y-%m-%d}: {e}")
