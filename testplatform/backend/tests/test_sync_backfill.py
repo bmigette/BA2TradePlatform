@@ -61,10 +61,29 @@ def test_backfill_pushes_saved_backtests_and_terminal_optimizations(db):
 
     with patch.object(sync_backfill, "push_optimization") as mock_push_opt, \
          patch.object(sync_backfill, "push_backtest") as mock_push_bt:
-        sync_backfill.run(db)
+        sync_backfill.run(db, dry_run=False)
 
         pushed_opt_names = [c.args[0].name for c in mock_push_opt.call_args_list]
         assert pushed_opt_names == ["done-opt"]
 
         pushed_bt_names = [c.args[0].name for c in mock_push_bt.call_args_list]
         assert pushed_bt_names == ["saved-run"]
+
+
+def test_dry_run_does_not_push(db):
+    strat = Strategy(name="s1", created_at=datetime.now(timezone.utc))
+    db.add(strat)
+    db.commit()
+    opt = StrategyOptimization(
+        name="done-opt", strategy_id=strat.id, status="completed",
+        fitness_metric="sharpe", optimization_type="genetic", created_at=datetime.now(timezone.utc),
+    )
+    db.add(opt)
+    db.commit()
+
+    from scripts import sync_backfill
+    with patch.object(sync_backfill, "push_optimization") as mock_push_opt, \
+         patch.object(sync_backfill, "push_backtest") as mock_push_bt:
+        sync_backfill.run(db, dry_run=True)
+        mock_push_opt.assert_not_called()
+        mock_push_bt.assert_not_called()
