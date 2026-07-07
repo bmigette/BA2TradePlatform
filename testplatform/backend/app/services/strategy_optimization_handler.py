@@ -39,6 +39,7 @@ from app.services.task_queue import get_task_queue
 from app.services.strategy_param_space import collect_param_space, decode_params
 from app.services.strategy_fitness import compute_fitness, ZERO_TRADE_SENTINEL
 from app.services.trial_memo import trial_key, TrialMemo
+from app.services.sync_client import push_optimization
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +177,7 @@ def _fail(opt_id: int, db: Any, msg: str) -> Dict[str, Any]:
         row.error_message = msg[:1000]
         row.completed_at = datetime.now()
         db.commit()
+        push_optimization(row, db)
     return {"status": "failed", "error": msg}
 
 
@@ -388,6 +390,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             row.best_params = best_params
             row.all_results = all_results
             db.commit()
+            push_optimization(row, db)
             if tq.is_task_paused(task_id):
                 raise InterruptedError("paused/cancelled")
 
@@ -592,6 +595,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         opt.best_fitness = result["best_fitness"]
         opt.all_results = all_results
         db.commit()
+        push_optimization(opt, db)
         logger.info(
             f"strategy_optimization {opt_id} done: "
             f"best_fitness={result['best_fitness']:.4f} "

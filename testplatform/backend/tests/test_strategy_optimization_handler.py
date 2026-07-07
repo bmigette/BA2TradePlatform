@@ -709,3 +709,60 @@ def test_all_trials_failing_marks_optimization_failed():
     res = H.handle_strategy_optimization("t-allfail", {"optimization_id": oid})
     assert res["status"] == "failed", f"expected failed, got {res}"
     assert _load_opt(oid).status == "failed"
+
+
+# ---------------------------------------------------------------------------
+# Remote result sync (Task 5): push_optimization wired into ga_callback / completion / _fail
+# ---------------------------------------------------------------------------
+def test_generation_sync_pushes_optimization_each_generation(monkeypatch):
+    """ga_callback must push the optimization row after every generation boundary, not just
+    at the very end — so a remote worker's copy shows live progress, not just a final state."""
+    monkeypatch.setattr(H, "_run_trial_backtest", _deterministic_stub)
+    monkeypatch.setattr(H, "_build_hoisted_state", lambda cfg: {})
+    calls = []
+    monkeypatch.setattr(H, "push_optimization", lambda opt, db: calls.append(opt.status))
+
+    sid = _seed_strategy()
+    opt_id = _seed_opt(sid)  # _ga_config() default = 4 generations
+    out = H.handle_strategy_optimization("t-gensync", {"optimization_id": opt_id})
+
+    assert out["status"] == "completed"
+    # 4 generation-boundary pushes + 1 final completion push = 5 total.
+    assert len(calls) == 5
+    assert calls[:4] == ["running", "running", "running", "running"]
+    assert calls[-1] == "completed"
+
+
+def test_completion_pushes_final_completed_state(monkeypatch):
+    """The LAST push_optimization call after a successful run reflects status='completed',
+    not just the last generation's 'running' snapshot — proves the completion-path push
+    (Step 4 above) fires in addition to, not instead of, the per-generation pushes."""
+    monkeypatch.setattr(H, "_run_trial_backtest", _deterministic_stub)
+    monkeypatch.setattr(H, "_build_hoisted_state", lambda cfg: {})
+    calls = []
+    monkeypatch.setattr(H, "push_optimization", lambda opt, db: calls.append(opt.status))
+
+    sid = _seed_strategy()
+    opt_id = _seed_opt(sid)
+    H.handle_strategy_optimization("t-completesync", {"optimization_id": opt_id})
+
+    assert calls[-1] == "completed"
+    assert _load_opt(opt_id).status == "completed"  # confirms the pushed row IS the real DB state
+
+
+def test_failure_path_pushes_failed_status(monkeypatch):
+    """A config-validation failure (routed through _fail) must push status='failed' too, so a
+    remote worker's copy doesn't keep showing 'running' forever for a run that never really ran."""
+    monkeypatch.setattr(H, "_run_trial_backtest", _deterministic_stub)
+    monkeypatch.setattr(H, "_build_hoisted_state", lambda cfg: {})
+    calls = []
+    monkeypatch.setattr(H, "push_optimization", lambda opt, db: calls.append(opt.status))
+
+    sid = _seed_strategy()
+    cfg = _ga_config()
+    del cfg["backtest"]  # triggers the "optimization_config.backtest is required" _fail path
+    opt_id = _seed_opt(sid, config=cfg)
+    out = H.handle_strategy_optimization("t-failsync", {"optimization_id": opt_id})
+
+    assert out["status"] == "failed"
+    assert calls == ["failed"]  # exactly one push, from _fail
