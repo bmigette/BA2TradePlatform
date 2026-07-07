@@ -2006,6 +2006,8 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
                 strategy_params["sellEntryConditions"] = decoded["sell_tree"]
             if decoded.get("exit_rules") is not None:
                 strategy_params["exitConditions"] = decoded["exit_rules"]
+            if decoded.get("entry_rules") is not None:
+                strategy_params["entryActions"] = decoded["entry_rules"]
             if decoded.get("tp") is not None:
                 strategy_params["initialTpPercent"] = decoded["tp"]
             if decoded.get("sl") is not None:
