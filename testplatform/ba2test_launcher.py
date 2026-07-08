@@ -540,7 +540,7 @@ def _cmd_fetch_options(args) -> int:
     stats = fetch_options.build_cache(
         args.cache_db, unders, date.fromisoformat(args.start), date.fromisoformat(args.end),
         args.feed, api_key=_ak, api_secret=_as,
-        max_workers=args.workers, resume=not args.no_resume)
+        max_workers=args.workers, resume=not args.no_resume, paper=not args.live)
     print(json.dumps(stats, indent=2))
     return 0
 
@@ -2369,6 +2369,11 @@ def main(argv: "list | None" = None) -> int:
     fo.add_argument("--no-resume", action="store_true",
                     help="Re-fetch every underlying even if already cached (default: resume — skip "
                          "underlyings already in option_chain).")
+    fo.add_argument("--live", action="store_true",
+                    help="Authenticate contract discovery against the LIVE Alpaca environment "
+                         "instead of paper — required when the resolved key is a live-only "
+                         "account's (paper=True gets 40110000 'request is not authorized'). "
+                         "Read-only (GetOptionContractsRequest), places no orders.")
 
     cc = sub.add_parser("cache-clear", help="Clear cache (all, or one type).")
     cc.add_argument("--type", default=None, help="Cache type to clear (omit = all).")

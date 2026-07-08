@@ -334,7 +334,8 @@ def build_cache(cache_db: str, underlyings: List[str], start: date, end: date,
                 strike_min: Optional[float] = None, strike_max: Optional[float] = None,
                 max_contracts: Optional[int] = None,
                 api_key: Optional[str] = None, api_secret: Optional[str] = None,
-                max_workers: Optional[int] = None, resume: bool = True) -> Dict[str, int]:
+                max_workers: Optional[int] = None, resume: bool = True,
+                paper: bool = True) -> Dict[str, int]:
     """Build a HISTORICAL options cache (expired contracts + metadata chain + daily bars).
 
     Resilient like the FMP fetcher: underlyings are fetched CONCURRENTLY (ThreadPoolExecutor,
@@ -346,7 +347,13 @@ def build_cache(cache_db: str, underlyings: List[str], start: date, end: date,
     Returns ``{"chain_rows","bar_rows","contracts","symbols_done","symbols_failed","skipped"}``.
     iv/delta/gamma/theta/vega are computed via Black-Scholes inversion of each bar's own close
     (see ``option_greeks.py``) — real point-in-time greeks, not vendor data. Pass
-    ``api_key``/``api_secret`` to inject creds."""
+    ``api_key``/``api_secret`` to inject creds.
+
+    ``paper`` (default True) selects which Alpaca environment the TradingClient (contract
+    discovery) authenticates against. A LIVE-only key has no paper-account counterpart and is
+    REJECTED (40110000 "request is not authorized") if paper=True — pass paper=False when
+    ``api_key``/``api_secret`` are a live account's keys. Contract discovery is read-only
+    (GetOptionContractsRequest), so paper=False here places no live orders."""
     import os as _os
     import threading
     from concurrent.futures import ThreadPoolExecutor
@@ -389,7 +396,7 @@ def build_cache(cache_db: str, underlyings: List[str], start: date, end: date,
 
     def _clients():
         if not hasattr(_tl, "tc"):
-            _tl.tc = TradingClient(key, secret, paper=True)
+            _tl.tc = TradingClient(key, secret, paper=paper)
             _tl.dc = OptionHistoricalDataClient(key, secret)
             _tl.ohlcv = get_provider("ohlcv", "fmp")
         return _tl.tc, _tl.dc, _tl.ohlcv
@@ -488,11 +495,15 @@ def main(argv=None) -> int:
     ap.add_argument("--strike-max", type=float, default=None, help="narrow strikes <= this")
     ap.add_argument("--max-contracts", type=int, default=None,
                     help="cap contracts fetched (nearest the strike-band centre)")
+    ap.add_argument("--live", action="store_true",
+                    help="Authenticate contract discovery against the LIVE Alpaca environment "
+                         "instead of paper (required for a live-only key; read-only, places no "
+                         "orders).")
     a = ap.parse_args(argv)
     unders = (open(a.underlyings[1:]).read().split() if a.underlyings.startswith("@")
               else [s.strip() for s in a.underlyings.split(",") if s.strip()])
     stats = build_cache(a.cache_db, unders, date.fromisoformat(a.start), date.fromisoformat(a.end),
                         a.feed, strike_min=a.strike_min, strike_max=a.strike_max,
-                        max_contracts=a.max_contracts)
+                        max_contracts=a.max_contracts, paper=not a.live)
     print(f"built options cache: {stats}")
     return 0
