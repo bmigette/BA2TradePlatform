@@ -84,6 +84,32 @@ historical greeks are dedicated options-data shops, not Alpaca/FMP:
 None of these are integrated today; adding one would be a new provider
 (`packages/providers`) plus a `fetch-options`-equivalent cache builder.
 
+## Price comparison (2026-07-08, from vendor sites/search — verify before buying)
+
+Goal: historical, point-in-time greeks/IV for a broad screener universe
+(hundreds of symbols, multi-year window) — the workload `fetch-options` runs
+today, just with real historical greeks instead of None.
+
+| Vendor | Entry price | Historical depth | Greeks/IV historical? | Fits our bulk-universe workload? |
+|---|---|---|---|---|
+| **Alpaca** (current) | Free / $99/mo (Algo Trader Plus) | since 2024-02-01 (bars only) | **No** — snapshot-only at any tier | Bars yes, greeks no — can't be fixed by upgrading |
+| **Polygon.io / Massive** | Free (EOD, 2yr) → $29/mo Starter (2yr) → **$79/mo Developer (4yr)** → $199/mo Advanced (full history, ~2014+, realtime) | 2–10 yrs by tier | Yes, part of the options product line (tier-gating on greeks specifically not confirmed — verify before buying) | Good — REST + flat-file bulk downloads, reputable data quality |
+| **EODHD** (Unicorn Bay marketplace add-on) | **$29.99/mo promo → $39.99/mo** regular | 2 yrs | Yes — delta/gamma/theta/vega + IV listed in the field set | Best headline price; unclear if it needs a separate EODHD base plan on top — verify |
+| **ORATS** | $99–$299/mo (direct API) | full history since 2007 | Yes — this is their core product | Good, but pricier than EODHD/Polygon for similar recency |
+| **IVolatility** | Pay-per-use: $0.20 (underlying)/$0.40 (option price)/$0.60 (IV) **per ticker-day**, no subscription | back to 2005 | Yes | **Bad fit for bulk building.** Example: 300 symbols × ~630 trading days (2.5 yrs) × $0.40 ≈ **$75,600** one-time to backfill option prices alone, before the $0.60 IV dataset. Fine for one-off single-symbol research, not for a screener-wide cache. |
+
+**Read**: for the actual workload (`fetch-options`-style bulk historical build
+across a screener universe), **EODHD's ~$30–40/mo add-on and Polygon/Massive's
+$79/mo Developer tier** are the realistic options — both roughly Alpaca
+Algo-Trader-Plus money, but they actually deliver historical greeks/IV, which
+Alpaca structurally cannot at any price. ORATS is solid but costs more for
+similar depth. IVolatility's per-ticker-day pricing only works for narrow,
+targeted research, not a universe-wide cache.
+
+None of the pricing above was verified by hitting a live account/checkout —
+treat it as a starting point and confirm current numbers + whether historical
+greeks are actually tier-gated before committing spend.
+
 ## Implication for current work
 
 - `option_selector.select_*` methods that take `method="delta"` will return
@@ -106,7 +132,9 @@ None of these are integrated today; adding one would be a new provider
 2. Restrict initial option strategies to `percent_otm`/`consensus_target`
    selection (delta selection is a dead end with this data).
 3. If vol-timing/premium-selling strategies matter, budget for a dedicated
-   options-data vendor (IVolatility/Polygon/EODHD) — Alpaca/FMP cannot supply
-   historical greeks/IV no matter the subscription tier.
+   options-data vendor — Alpaca/FMP cannot supply historical greeks/IV no
+   matter the subscription tier. EODHD (~$30–40/mo) and Polygon/Massive
+   Developer ($79/mo) are the best-value fits for a screener-wide historical
+   build; see the price comparison above.
 4. Add a configurable synthetic spread cost on option fills (e.g. bps of
    premium) so combo/short-premium backtest P&L isn't fills-at-mid fantasy.
