@@ -2,6 +2,12 @@
 
 Note: the `delta` and `percent_otm` methods require a non-None `strike_param`; callers must
 validate (a None param raises, by design, to surface misconfigured rulesets).
+
+`delta` selection needs `OptionContract.delta` populated. For the offline historical backtest
+cache this is computed via Black-Scholes inversion of each contract's own daily close (see
+`testplatform/backend/app/services/backtest/option_greeks.py` +
+`HistoricalOptionsProvider.get_chain`'s per-as-of-date bar overlay) — not vendor-supplied, but
+real point-in-time delta, not a snapshot fixed at the cache build's start date.
 """
 from datetime import date
 from typing import List, Optional, Tuple

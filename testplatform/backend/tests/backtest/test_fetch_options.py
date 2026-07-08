@@ -1,9 +1,10 @@
 # backend/tests/backtest/test_fetch_options.py
 """Pure (no-network) unit tests for the historical options-cache builder.
 
-Covers the back-compat snapshot mapper, the NEW metadata→chain-row mapper (greeks/iv None —
-selection is %OTM/DTE, not delta), and the INACTIVE+ACTIVE contract merge/dedup logic that
-makes the cache include EXPIRED contracts."""
+Covers the back-compat snapshot mapper, the metadata→chain-row mapper (iv/greeks None by
+default; COMPUTED via Black-Scholes inversion when underlying_close+as_of_date are supplied —
+see option_greeks.py), and the INACTIVE+ACTIVE contract merge/dedup logic that makes the cache
+include EXPIRED contracts."""
 from datetime import date
 
 from app.services.backtest.fetch_options import (
@@ -12,6 +13,7 @@ from app.services.backtest.fetch_options import (
     contract_to_metadata_chain_row,
     is_standard_occ,
     merge_contracts_by_symbol,
+    _nearest_on_or_before,
 )
 
 
@@ -42,6 +44,18 @@ def test_bar_to_row():
     class B: open=2.0; high=2.5; low=1.9; close=2.3; volume=100
     row = bar_to_row("AAPL240315C00180000", "2024-03-05", B(), "AAPL", "call", 180.0, "2024-03-15")
     assert row["close"] == 2.3 and row["underlying"] == "AAPL"
+    assert row["iv"] is None, "no underlying_close supplied -> greeks not computed"
+
+
+def test_bar_to_row_computes_greeks_when_underlying_close_supplied():
+    """With underlying_close supplied, iv/delta/gamma/theta/vega are Black-Scholes-inverted from
+    THIS bar's own close — real point-in-time greeks, not vendor data (option_greeks.py)."""
+    class B: open=9.5; high=10.5; low=9.0; close=10.45; volume=100
+    row = bar_to_row("AAPL250305C00100000", "2024-03-05", B(), "AAPL", "call", 100.0,
+                     "2025-03-05", underlying_close=100.0, risk_free_rate=0.05)
+    assert row["iv"] is not None and abs(row["iv"] - 0.20) < 0.01, \
+        "textbook S=K=100,T=1,r=5%,call=10.45 -> iv should recover ~20%"
+    assert row["delta"] is not None and 0.6 < row["delta"] < 0.7
 
 
 # --------------------------------------------------------------------------- #
@@ -59,16 +73,16 @@ class _Contract:
 
 
 def test_contract_to_metadata_chain_row_has_no_greeks_and_no_quotes_without_premium():
-    """A historical chain row carries occ/type/strike/expiry; greeks/iv/oi are ALWAYS None
-    (Alpaca has no as-of greeks → selection is %OTM/DTE, not delta). With no as-of premium the
-    bid/ask/last are None too (contract not selectable that day)."""
+    """A historical chain row carries occ/type/strike/expiry; open_interest/volume are ALWAYS
+    None (Alpaca has no as-of OI/volume for a past date — nothing can derive those from price
+    alone). With no as-of premium, greeks can't be Black-Scholes-inverted either (no price to
+    invert), and bid/ask/last stay None too (contract not selectable that day)."""
     c = _Contract("AAPL240315C00180000", "call", "180", "2024-03-15")
     row = contract_to_metadata_chain_row(c, "AAPL")
     assert row["occ_symbol"] == "AAPL240315C00180000"
     assert row["option_type"] == "call"
     assert row["strike"] == 180.0 and isinstance(row["strike"], float)
     assert row["expiry"] == "2024-03-15"
-    # NO as-of greeks / IV / OI ever; with no premium, no quotes either.
     for k in ("iv", "delta", "gamma", "theta", "vega", "open_interest", "volume",
               "bid", "ask", "last"):
         assert row[k] is None, f"expected {k} None in a historical chain row (no premium)"
@@ -77,12 +91,38 @@ def test_contract_to_metadata_chain_row_has_no_greeks_and_no_quotes_without_prem
 def test_contract_to_metadata_chain_row_fills_quotes_from_as_of_premium():
     """When the as-of premium (the start-date bar close) is supplied, bid/ask/last are set to it
     (a zero-spread historical-premium proxy) so the option ENTRY action — which requires a
-    non-None ask to size+price — can trade; greeks/iv/oi STAY None (no as-of greeks)."""
+    non-None ask to size+price — can trade. Greeks/iv/oi STAY None here because as_of_date/
+    underlying_close are NOT supplied (see the next test for the computed path) and
+    open_interest/volume are always None regardless (no as-of OI/volume exists to derive)."""
     c = _Contract("AAPL240315C00180000", "call", "180", "2024-03-15")
     row = contract_to_metadata_chain_row(c, "AAPL", as_of_premium=4.6)
     assert row["bid"] == 4.6 and row["ask"] == 4.6 and row["last"] == 4.6
     for k in ("iv", "delta", "gamma", "theta", "vega", "open_interest", "volume"):
-        assert row[k] is None, f"expected {k} None even WITH a premium (no as-of greeks)"
+        assert row[k] is None, f"expected {k} None without as_of_date+underlying_close"
+
+
+def test_contract_to_metadata_chain_row_computes_greeks_when_asked():
+    """With as_of_date + underlying_close supplied, the chain row's iv/greeks are computed from
+    the as-of premium via Black-Scholes inversion (option_greeks.py) — real point-in-time
+    greeks, not vendor-supplied and not None-by-default."""
+    c = _Contract("AAPL250305C00100000", "call", "100", "2025-03-05")
+    row = contract_to_metadata_chain_row(
+        c, "AAPL", as_of_premium=10.4506, as_of_date=date(2024, 3, 5),
+        underlying_close=100.0, risk_free_rate=0.05)
+    assert row["iv"] is not None and abs(row["iv"] - 0.20) < 0.01
+    assert row["delta"] is not None and 0.6 < row["delta"] < 0.7
+    # open_interest/volume are STILL always None — no as-of OI/volume to derive from price.
+    assert row["open_interest"] is None and row["volume"] is None
+
+
+def test_nearest_on_or_before_finds_prior_date_within_window():
+    series = {"2024-03-01": 100.0, "2024-03-04": 103.0}
+    # Exact hit.
+    assert _nearest_on_or_before(series, date(2024, 3, 4)) == 103.0
+    # Weekend/holiday gap -> falls back to the nearest PRIOR date.
+    assert _nearest_on_or_before(series, date(2024, 3, 3)) == 100.0
+    # Outside the lookback window -> None, not a stale value from further back.
+    assert _nearest_on_or_before(series, date(2024, 3, 20), max_back_days=7) is None
 
 
 def test_contract_to_metadata_chain_row_accepts_string_type_and_expiry():

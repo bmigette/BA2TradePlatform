@@ -3,19 +3,29 @@ Run with the editable venv (~/ba2-venvs/test) which has alpaca-py installed.
 
 WHY a metadata-driven historical cache (NOT the chain snapshot):
   Alpaca's option CHAIN endpoint (`get_option_chain`) is a CURRENT snapshot only — it has
-  no as-of greeks / IV / OI for a past date, and it does NOT return EXPIRED contracts. A
-  trustworthy historical cache therefore CANNOT carry as-of greeks/IV, so option selection
-  at backtest time is by **%OTM (strike vs spot) + DTE**, NOT by delta. (`option_selector`'s
-  delta method would return nothing here because `delta` is None — documented limitation.)
+  no as-of greeks / IV / OI for a past date, and it does NOT return EXPIRED contracts. So
+  contract METADATA (occ/type/strike/expiry) comes from contract discovery, not the chain
+  snapshot.
+
+  IV/GREEKS ARE COMPUTED, NOT FETCHED: IV isn't an independently-observed quantity a vendor
+  uniquely holds — it's the volatility that makes Black-Scholes reproduce the option's own
+  traded price. We already fetch that price (the per-contract daily bar close, below) plus
+  the underlying's close and a risk-free rate, so `option_greeks.py` inverts Black-Scholes
+  per bar to get real point-in-time iv/delta/gamma/theta/vega — no vendor needed. See
+  `docs/plans/2026-07-08-options-backtest-data-gap-analysis.md` for the full rationale.
+  Caveat: pure Black-Scholes (European); equity options are American, so deep-ITM puts near
+  ex-dividend have a small known bias. Open interest/volume are still always None (Alpaca has
+  no as-of OI/volume for a past date; no way to derive those from price alone).
 
 WHAT this builds:
   1. CONTRACT DISCOVERY incl. EXPIRED: `get_option_contracts` defaults to status=ACTIVE and
      MISSES expired contracts, so for a historical window we query BOTH status=INACTIVE and
      status=ACTIVE and merge by OCC symbol (dedup). Expiries are bounded to the run window.
-  2. CHAIN ROWS from CONTRACT METADATA (occ/type/strike/expiry), greeks/iv/oi/volume = None,
-     keyed at the run `start` date (a single as-of snapshot; acceptable for a short window).
+  2. CHAIN ROWS from CONTRACT METADATA (occ/type/strike/expiry) + computed iv/greeks for the
+     run `start` date (a single as-of snapshot — the PER-DAY greeks live on the bars, below;
+     `HistoricalOptionsProvider.get_chain` overlays the as-of bar's greeks onto this row).
   3. PER-CONTRACT DAILY BARS via `get_option_bars` (this DOES work for historical dates) →
-     the premium series the fill engine reads.
+     the premium series the fill engine reads, each carrying its OWN computed iv/greeks.
   4. PRACTICALITY NARROWING: --strike-min/--strike-max and --max-contracts so a build stays
      bounded (a wide window can otherwise be thousands of contracts).
 """
@@ -26,6 +36,8 @@ import re
 import time as _time
 from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
+from ba2_common.core.types import OptionRight
+from .option_greeks import compute_iv_and_greeks
 from .options_cache import OptionsHistoryCache
 
 logger = logging.getLogger(__name__)
@@ -74,12 +86,18 @@ def contract_to_chain_row(occ: str, underlying: str, opt_type: str, strike: floa
 
 
 def contract_to_metadata_chain_row(c: Any, underlying: str,
-                                   as_of_premium: Optional[float] = None) -> Dict[str, Any]:
+                                   as_of_premium: Optional[float] = None, *,
+                                   as_of_date: Optional[date] = None,
+                                   underlying_close: Optional[float] = None,
+                                   risk_free_rate: float = 0.0) -> Dict[str, Any]:
     """Map an Alpaca OptionContract (metadata) to a HISTORICAL chain row.
 
-    Pure (no network). greeks/iv/open_interest/volume are ALWAYS None — a historical cache has
-    no as-of greeks/IV; selection at backtest time is %OTM (strike vs spot) + DTE, which needs
-    only occ_symbol/option_type/strike/expiry.
+    Pure (no network). open_interest/volume are ALWAYS None — Alpaca has no as-of OI/volume for
+    a past date. iv/delta/gamma/theta/vega are computed OURSELVES via Black-Scholes inversion
+    (see ``option_greeks.py``) when BOTH ``as_of_date`` and ``underlying_close`` are supplied —
+    IV is derived from the option's own price, not an independently-observed vendor quantity, so
+    we don't need Alpaca (or anyone) to hand us historical greeks. Omit either kwarg (as the old
+    call sites and most tests do) to get the prior None-filled behaviour unchanged.
 
     ``as_of_premium`` (the contract's CLOSE on the chain's as-of date, taken from the daily bar
     we already fetch) is used to fill bid/ask/last so the option ENTRY action — which requires a
@@ -95,10 +113,16 @@ def contract_to_metadata_chain_row(c: Any, underlying: str,
     exp = c.expiration_date
     expiry = exp.isoformat() if hasattr(exp, "isoformat") else str(exp)
     px = float(as_of_premium) if as_of_premium is not None else None
+    greeks_out = {"iv": None, "delta": None, "gamma": None, "theta": None, "vega": None}
+    if px is not None and as_of_date is not None and underlying_close is not None:
+        expiry_d = exp if isinstance(exp, date) else date.fromisoformat(str(expiry))
+        T = (expiry_d - as_of_date).days / 365.0
+        greeks_out.update(compute_iv_and_greeks(
+            px, underlying_close, float(c.strike_price), T, risk_free_rate,
+            OptionRight(opt_type)))
     return {"occ_symbol": c.symbol, "option_type": opt_type, "strike": float(c.strike_price),
             "expiry": expiry, "bid": px, "ask": px, "last": px,
-            "iv": None, "delta": None, "gamma": None, "theta": None, "vega": None,
-            "open_interest": None, "volume": None}
+            **greeks_out, "open_interest": None, "volume": None}
 
 
 def merge_contracts_by_symbol(*contract_lists: List[Any]) -> List[Any]:
@@ -120,10 +144,23 @@ def merge_contracts_by_symbol(*contract_lists: List[Any]) -> List[Any]:
 
 
 def bar_to_row(occ: str, d: str, bar: Any, underlying: str, opt_type: str, strike: float,
-               expiry: str) -> Dict[str, Any]:
+               expiry: str, *, underlying_close: Optional[float] = None,
+               risk_free_rate: float = 0.0) -> Dict[str, Any]:
+    """Map one daily option bar to a row. iv/delta/gamma/theta/vega are computed via
+    Black-Scholes inversion of THIS bar's close (see ``option_greeks.py``) when
+    ``underlying_close`` is supplied — the POINT-IN-TIME greeks for this specific trading day,
+    not a single build-time snapshot. Omit it (as the pre-existing tests do) for the prior
+    None-filled behaviour."""
+    close = _g(bar, "close")
+    greeks_out = {"iv": None, "delta": None, "gamma": None, "theta": None, "vega": None}
+    if close is not None and underlying_close is not None:
+        T = (date.fromisoformat(expiry) - date.fromisoformat(d)).days / 365.0
+        greeks_out.update(compute_iv_and_greeks(
+            float(close), underlying_close, strike, T, risk_free_rate, OptionRight(opt_type)))
     return {"occ_symbol": occ, "date": d, "open": _g(bar, "open"), "high": _g(bar, "high"),
-            "low": _g(bar, "low"), "close": _g(bar, "close"), "volume": _g(bar, "volume"),
-            "underlying": underlying, "option_type": opt_type, "strike": strike, "expiry": expiry}
+            "low": _g(bar, "low"), "close": close, "volume": _g(bar, "volume"),
+            "underlying": underlying, "option_type": opt_type, "strike": strike, "expiry": expiry,
+            **greeks_out}
 
 
 def _alpaca_keys(key: Optional[str] = None, secret: Optional[str] = None) -> Tuple[str, str]:
@@ -143,6 +180,87 @@ def _alpaca_keys(key: Optional[str] = None, secret: Optional[str] = None) -> Tup
             "ALPACA_MARKET_API_KEY/ALPACA_MARKET_API_SECRET (or ALPACA_API_KEY/"
             "ALPACA_SECRET_KEY) in the environment / .env.")
     return key, secret
+
+
+# Default risk-free rate used when FRED is unreachable/unconfigured. Rho (rate sensitivity) is
+# the smallest-impact Greek for short-dated equity options, so a rough constant is a far smaller
+# error source than the close-price-based IV itself — this is a documented fallback, not a
+# silently-wrong default (a warning is logged when it's used).
+_FALLBACK_RISK_FREE_RATE = 0.045
+
+
+def fetch_risk_free_rate_series(start: date, end: date) -> Dict[str, float]:
+    """Daily risk-free rate (3-month Treasury, FRED series DGS3MO) as {date_iso: rate_decimal}
+    over [start, end], forward-filled across weekends/holidays (FRED only publishes business
+    days). One HTTP call for the whole build (shared across every underlying/contract) — this is
+    the SAME external input `FREDMacroProvider` already exposes elsewhere in the codebase, called
+    directly here (env var key, not the DB-backed AppSetting) so this script stays a
+    self-contained CLI like its Alpaca creds handling.
+
+    Falls back to `_FALLBACK_RISK_FREE_RATE` (with a logged warning) when FRED_API_KEY is unset
+    or the request fails — rho is a minor Greek, so this does not block the build."""
+    import os
+    import requests
+    api_key = os.environ.get("FRED_API_KEY")
+    if not api_key:
+        logger.warning(
+            "FRED_API_KEY not set; using a flat %.2f%% risk-free rate for option greeks "
+            "(rho is a minor Greek, this does not materially affect delta/gamma/theta/vega).",
+            _FALLBACK_RISK_FREE_RATE * 100)
+        return {}
+    try:
+        resp = requests.get(
+            "https://api.stlouisfed.org/fred/series/observations",
+            params={"series_id": "DGS3MO", "api_key": api_key, "file_type": "json",
+                    "observation_start": start.isoformat(), "observation_end": end.isoformat(),
+                    "sort_order": "asc", "limit": 10000},
+            timeout=30)
+        resp.raise_for_status()
+        obs = resp.json().get("observations", [])
+    except Exception as e:  # noqa: BLE001 — never block the build on a macro-data hiccup
+        logger.warning(f"FRED risk-free-rate fetch failed ({e}); using flat "
+                       f"{_FALLBACK_RISK_FREE_RATE * 100:.2f}% fallback.")
+        return {}
+    series: Dict[str, float] = {}
+    last: Optional[float] = None
+    for o in obs:
+        v = o.get("value")
+        if v and v != ".":
+            last = float(v) / 100.0
+        if last is not None:
+            series[o["date"]] = last
+    return series
+
+
+def fetch_underlying_close_series(ohlcv_provider: Any, underlying: str,
+                                  start: date, end: date) -> Dict[str, float]:
+    """Daily underlying close as {date_iso: close} over [start, end] via the SAME cached
+    ba2_providers OHLCV path the backtest engine reads (`get_ohlcv_data` — parquet-cached, so a
+    warm cache costs no network call). Returns {} on any read failure (missing symbol, provider
+    error) rather than aborting the whole underlying's options build."""
+    from datetime import datetime as _dt
+    try:
+        df = ohlcv_provider.get_ohlcv_data(
+            underlying, start_date=_dt.combine(start, _dt.min.time()),
+            end_date=_dt.combine(end, _dt.min.time()), interval="1d")
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"underlying close fetch failed for {underlying} ({e}); "
+                       f"greeks will be skipped for this underlying.")
+        return {}
+    if df is None or df.empty:
+        return {}
+    return {row["Date"].strftime("%Y-%m-%d") if hasattr(row["Date"], "strftime") else str(row["Date"])[:10]:
+            float(row["Close"]) for _, row in df.iterrows()}
+
+
+def _nearest_on_or_before(series: Dict[str, float], d: date, max_back_days: int = 7) -> Optional[float]:
+    """Value at ``d`` if present, else the nearest PRIOR date within ``max_back_days`` (as-of
+    clamp for a sparse daily series — weekends/holidays have no Treasury/equity print)."""
+    for i in range(max_back_days + 1):
+        key = (d - timedelta(days=i)).isoformat()
+        if key in series:
+            return series[key]
+    return None
 
 
 def discover_contracts(tc: Any, underlying: str, *, expiry_gte: str, expiry_lte: str,
@@ -226,7 +344,9 @@ def build_cache(cache_db: str, underlyings: List[str], start: date, end: date,
     symbol that still fails after retries is logged + skipped (counted in ``failed``), not fatal.
 
     Returns ``{"chain_rows","bar_rows","contracts","symbols_done","symbols_failed","skipped"}``.
-    Selection downstream is %OTM/DTE (no greeks). Pass ``api_key``/``api_secret`` to inject creds."""
+    iv/delta/gamma/theta/vega are computed via Black-Scholes inversion of each bar's own close
+    (see ``option_greeks.py``) — real point-in-time greeks, not vendor data. Pass
+    ``api_key``/``api_secret`` to inject creds."""
     import os as _os
     import threading
     from concurrent.futures import ThreadPoolExecutor
@@ -234,6 +354,7 @@ def build_cache(cache_db: str, underlyings: List[str], start: date, end: date,
     from alpaca.data.historical.option import OptionHistoricalDataClient
     from alpaca.data.requests import OptionBarsRequest
     from alpaca.data.timeframe import TimeFrame
+    from ba2_providers import get_provider
     if start < _OPTIONS_HISTORY_FLOOR:
         raise ValueError(
             f"Alpaca options history starts {_OPTIONS_HISTORY_FLOOR.isoformat()}; pick a later --start")
@@ -244,6 +365,11 @@ def build_cache(cache_db: str, underlyings: List[str], start: date, end: date,
     expiry_lte = (end + timedelta(days=_EXPIRY_TAIL_DAYS)).isoformat()
     start_iso = start.isoformat()
     end_iso = end.isoformat()
+
+    # Risk-free rate: ONE FRED call for the whole build (read-only dict, safe to share across
+    # threads). Underlying close series is fetched PER-UNDERLYING inside _process (below) since
+    # it needs a per-thread OHLCV provider instance, mirroring the per-thread Alpaca clients.
+    risk_free_series = fetch_risk_free_rate_series(start, end)
 
     pending = list(underlyings)
     skipped = 0
@@ -265,11 +391,16 @@ def build_cache(cache_db: str, underlyings: List[str], start: date, end: date,
         if not hasattr(_tl, "tc"):
             _tl.tc = TradingClient(key, secret, paper=True)
             _tl.dc = OptionHistoricalDataClient(key, secret)
-        return _tl.tc, _tl.dc
+            _tl.ohlcv = get_provider("ohlcv", "fmp")
+        return _tl.tc, _tl.dc, _tl.ohlcv
+
+    def _rate_at(d: date) -> float:
+        r = _nearest_on_or_before(risk_free_series, d)
+        return r if r is not None else _FALLBACK_RISK_FREE_RATE
 
     def _process(u: str) -> None:
         try:
-            tc, dc = _clients()
+            tc, dc, ohlcv = _clients()
             contracts = _with_retry(
                 lambda: discover_contracts(tc, u, expiry_gte=expiry_gte, expiry_lte=expiry_lte,
                                            strike_min=strike_min, strike_max=strike_max,
@@ -291,6 +422,11 @@ def build_cache(cache_db: str, underlyings: List[str], start: date, end: date,
                     what=f"bars {u} [{i // _OPTION_BARS_BATCH + 1}]")
                 for s, blist in (resp.data or {}).items():
                     bars_by_sym[s] = blist
+            # Underlying daily close, ONE fetch per underlying (cached parquet — the same path the
+            # backtest engine reads), reused for every contract/bar so we can Black-Scholes-invert
+            # each bar's OWN close into point-in-time iv/delta/gamma/theta/vega (see
+            # option_greeks.py) — no vendor greeks needed, we derive them from data we already pull.
+            underlying_close = fetch_underlying_close_series(ohlcv, u, start, end)
             rows: List[Dict[str, Any]] = []
             all_bar_rows: List[Dict[str, Any]] = []
             for c in contracts:
@@ -298,14 +434,22 @@ def build_cache(cache_db: str, underlyings: List[str], start: date, end: date,
                 expiry = (c.expiration_date.isoformat()
                           if hasattr(c.expiration_date, "isoformat") else str(c.expiration_date))
                 bars = bars_by_sym.get(c.symbol, [])
-                bar_rows = [bar_to_row(c.symbol, b.timestamp.date().isoformat(), b, u,
-                                       opt_type, float(c.strike_price), expiry) for b in bars]
+                bar_rows = []
+                for b in bars:
+                    bar_date = b.timestamp.date()
+                    S = _nearest_on_or_before(underlying_close, bar_date)
+                    bar_rows.append(bar_to_row(
+                        c.symbol, bar_date.isoformat(), b, u, opt_type, float(c.strike_price),
+                        expiry, underlying_close=S, risk_free_rate=_rate_at(bar_date)))
                 all_bar_rows.extend(bar_rows)
                 as_of_premium: Optional[float] = None
                 if bar_rows:
                     on_start = next((r for r in bar_rows if r["date"] == start_iso), None)
                     as_of_premium = (on_start or bar_rows[0]).get("close")
-                rows.append(contract_to_metadata_chain_row(c, u, as_of_premium))
+                rows.append(contract_to_metadata_chain_row(
+                    c, u, as_of_premium, as_of_date=start,
+                    underlying_close=_nearest_on_or_before(underlying_close, start),
+                    risk_free_rate=_rate_at(start)))
             bar_total = len(all_bar_rows)
             # One batched write of all bars, then chain rows LAST (their presence marks this
             # underlying complete for resume).

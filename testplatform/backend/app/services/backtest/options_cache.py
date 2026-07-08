@@ -15,11 +15,12 @@ _CHAIN_DDL = """CREATE TABLE IF NOT EXISTS option_chain(
   open_interest INTEGER, volume INTEGER, PRIMARY KEY(underlying, as_of, occ_symbol))"""
 _BAR_DDL = """CREATE TABLE IF NOT EXISTS option_bar(
   occ_symbol TEXT, date TEXT, open REAL, high REAL, low REAL, close REAL, volume REAL,
-  underlying TEXT, option_type TEXT, strike REAL, expiry TEXT, PRIMARY KEY(occ_symbol, date))"""
+  underlying TEXT, option_type TEXT, strike REAL, expiry TEXT,
+  iv REAL, delta REAL, gamma REAL, theta REAL, vega REAL, PRIMARY KEY(occ_symbol, date))"""
 _CHAIN_COLS = ["occ_symbol","option_type","strike","expiry","bid","ask","last","iv",
                "delta","gamma","theta","vega","open_interest","volume"]
 _BAR_COLS = ["occ_symbol","date","open","high","low","close","volume","underlying",
-             "option_type","strike","expiry"]
+             "option_type","strike","expiry","iv","delta","gamma","theta","vega"]
 
 class OptionsHistoryCache:
     def __init__(self, db_path: str):
@@ -77,3 +78,17 @@ class OptionsHistoryCache:
             row = cx.execute("SELECT MAX(as_of) AS d FROM option_chain "
                              "WHERE underlying=? AND as_of<=?", (underlying, on_or_before)).fetchone()
             return row["d"] if row and row["d"] else None
+
+    def latest_bar_on_or_before(self, occ_symbol: str, on_or_before: str) -> Optional[Dict[str, Any]]:
+        """Most recent cached bar for ``occ_symbol`` with date <= on_or_before (as-of clamp).
+
+        Used to attach POINT-IN-TIME iv/greeks to a contract at an arbitrary as-of date — the
+        static chain snapshot only carries greeks for the build's start date, but a backtest
+        entry can land weeks/months later, so selection needs THIS bar's computed greeks, not
+        the chain row's. Falls back to the nearest PRIOR trading day on a no-trade day, same
+        sparsity every other bar-driven read (fills/MTM) already tolerates."""
+        with self._conn() as cx:
+            row = cx.execute(
+                "SELECT * FROM option_bar WHERE occ_symbol=? AND date<=? "
+                "ORDER BY date DESC LIMIT 1", (occ_symbol, on_or_before)).fetchone()
+            return dict(row) if row else None
