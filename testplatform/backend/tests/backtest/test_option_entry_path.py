@@ -184,16 +184,14 @@ def test_buy_call_entry_opens_option_no_equity():
         assert _OCC_180 in occ, f"expected the ~ATM strike-180 call selected, got {occ}"
 
         # NO equity position was opened — the entry-option path must not open equity.
-        from sqlmodel import Session, select
-        from ba2_common.core.db import get_db
+        # Inspect via the store-aware accessors so this works whether orders/txns live in the
+        # in-memory "dict trades" store (default in_memory runs) or SQLite.
+        from ba2_common.core.trade_store import transactions_where, orders_where
         from ba2_common.core.models import Transaction, TradingOrder
         from ba2_common.core.types import AssetClass, TransactionStatus
 
-        with Session(get_db().bind) as s:
-            txns = s.exec(
-                select(Transaction).where(Transaction.expert_id == expert_id)
-            ).all()
-            orders = s.exec(select(TradingOrder)).all()
+        txns = transactions_where(expert_id=expert_id)
+        orders = orders_where()
 
         # Equity orders are those that are NOT options (no option asset_class / contract).
         equity_orders = [

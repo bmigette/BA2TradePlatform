@@ -67,6 +67,16 @@ class RunTrialReq(BaseModel):
     config: dict
     fitness_metric: str
     cache_root: Optional[str] = None  # the MASTER's CACHE_FOLDER, for path localization
+    inmem_trades: Optional[bool] = None  # master's sql-less "dict trades" flag (None = worker default)
+
+
+def _apply_inmem_trades_flag(inmem_trades: Optional[bool]) -> None:
+    """Honor the master's sql-less "dict trades" flag on this worker so distributed trials use the
+    SAME order/transaction backend (and thus byte-identical economics) as the master. Sets the
+    process env consulted by ``backtest_db._inmem_trades_enabled()``; None leaves the worker's own
+    default (ON). Process-global, but the flag is uniform across a GA run so pooled trials agree."""
+    if inmem_trades is not None:
+        os.environ["BT_INMEM_TRADES"] = "1" if inmem_trades else "0"
 
 
 class SecretsReq(BaseModel):
@@ -177,6 +187,7 @@ def run_trial(req: RunTrialReq, authorization: str = Header(default=None)):
     ``capacity`` concurrent calls to saturate the pool.
     """
     _verify(authorization)
+    _apply_inmem_trades_flag(req.inmem_trades)
     from app.services.strategy_optimization_handler import _trial_worker
     if _POOL is None:
         raise HTTPException(status_code=503, detail="Worker pool not initialized.")
@@ -197,6 +208,7 @@ def run_trial_full(req: RunTrialReq, authorization: str = Header(default=None)):
     against a master-side result field-by-field. Not on the hot GA path (that stays on
     ``/run-trial``'s small payload); this is an operator/debug tool."""
     _verify(authorization)
+    _apply_inmem_trades_flag(req.inmem_trades)
     from app.services.strategy_optimization_handler import _persist_trial_worker
     if _POOL is None:
         raise HTTPException(status_code=503, detail="Worker pool not initialized.")

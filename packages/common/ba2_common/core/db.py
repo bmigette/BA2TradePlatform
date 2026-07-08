@@ -343,6 +343,19 @@ def _stop_activity_log_worker():
 atexit.register(_stop_activity_log_worker)
 
 
+def _inmem_route(instance_or_model) -> bool:
+    """True iff this (instance or model class) should be routed to the sql-less in-memory trade
+    store instead of SQLite. Only ever True inside a backtest's ``inmem_trades()`` block
+    (thread-local flag). Live NEVER enters that block, so this is always False in live -> the db
+    helpers take the unchanged SQLite path. Imported lazily to avoid a db<->models<->trade_store
+    import cycle."""
+    from ba2_common.core import trade_store as _ts
+    if not _ts.inmem_trades_active():
+        return False
+    model = instance_or_model if isinstance(instance_or_model, type) else type(instance_or_model)
+    return _ts.is_inmem_model(model)
+
+
 def init_db():
     """
     Import models and create all database tables if they do not exist.
@@ -424,6 +437,11 @@ def add_instance(instance, session: Session | None = None, expunge_after_flush: 
     Returns:
         The ID of the added instance.
     """
+    # Backtest sql-less store (flag-gated, BT-only): TradingOrder/Transaction live in RAM dicts
+    # during a run (no ORM compile/flush/commit). Live never sets the flag -> falls through.
+    if _inmem_route(instance):
+        from ba2_common.core import trade_store as _ts
+        return _ts.store_add(instance)
     start = time.perf_counter()
     instance_class = instance.__class__.__name__
     try:
@@ -474,6 +492,11 @@ def update_instance(instance, session: Session | None = None):
     Returns:
         True if update was successful.
     """
+    # Backtest sql-less store: the store holds the SAME object by identity, so a caller that
+    # mutated it in place is already reflected — persist is a no-op (BT-only; live falls through).
+    if _inmem_route(instance):
+        from ba2_common.core import trade_store as _ts
+        return _ts.store_update(instance)
     start = time.perf_counter()
     instance_class = instance.__class__.__name__
     try:
@@ -544,6 +567,10 @@ def delete_instance(instance, session: Session | None = None):
     Returns:
         True if deletion was successful.
     """
+    # Backtest sql-less store: drop the row from the in-mem dict (BT-only; live falls through).
+    if _inmem_route(instance):
+        from ba2_common.core import trade_store as _ts
+        return _ts.store_delete(instance)
     with _db_write_lock:
         try:
             instance_id = instance.id
@@ -588,6 +615,15 @@ def get_instance(model_class, instance_id, session: Session | None = None):
     Returns:
         The instance if found, otherwise None.
     """
+    # Backtest sql-less store: return the stored object by id (same identity, no ORM round-trip).
+    # Match the SQLite path's "raise if not found" contract (BT-only; live falls through).
+    if _inmem_route(model_class):
+        from ba2_common.core import trade_store as _ts
+        instance = _ts.store_get(model_class, instance_id)
+        if not instance:
+            logger.error(f"Instance with id {instance_id}/{model_class} not found.")
+            raise Exception(f"Instance with id {instance_id}/{model_class} not found.")
+        return instance
     start = time.perf_counter()
     try:
         if session:
@@ -621,6 +657,10 @@ def get_all_instances(model_class, session: Session | None = None):
     Returns:
         List of all instances of the model class.
     """
+    # Backtest sql-less store: return all stored rows of this model (BT-only; live falls through).
+    if _inmem_route(model_class):
+        from ba2_common.core import trade_store as _ts
+        return _ts.store_all(model_class)
     start = time.perf_counter()
     try:
         if session:

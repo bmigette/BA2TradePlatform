@@ -331,13 +331,11 @@ def test_bear_put_spread_closed_midlife_no_unhedged_stock(tmp_path):
         _open_bear_put_spread(acct, 5)
         # Locate the spread parent + build a reversed closing combo (mirrors CloseOptionAction._close_multi_leg).
         from ba2_common.core.models import TradingOrder
-        from ba2_common.core.db import get_db
-        from sqlmodel import select, Session
-        with Session(get_db().bind) as sn:
-            parent = [o for o in sn.exec(select(TradingOrder)).all()
-                      if o.parent_order_id is None and o.option_strategy == "bear_put_spread"][0]
-            pq = int(parent.quantity)
-            txn_id = parent.transaction_id
+        from ba2_common.core.trade_store import orders_where
+        parent = [o for o in orders_where()
+                  if o.parent_order_id is None and o.option_strategy == "bear_put_spread"][0]
+        pq = int(parent.quantity)
+        txn_id = parent.transaction_id
 
         ps.set_clock(datetime(2024, 3, 8))
         close_legs = [

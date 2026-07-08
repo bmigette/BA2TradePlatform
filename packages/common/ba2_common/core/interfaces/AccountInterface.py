@@ -1221,10 +1221,17 @@ class AccountInterface(ReadOnlyAccountInterface):
                 - deleted_count: int (orders deleted)
                 - close_order_id: int (closing order ID if created/retried)
         """
+        from contextlib import nullcontext
+        from datetime import datetime, timezone
         from sqlmodel import select, Session
-        from ba2_common.core.db import get_db, delete_instance
+        from ba2_common.core.db import get_db, delete_instance, update_instance
         from ba2_common.core.types import OrderDirection, OrderType, TransactionStatus, OrderStatus
-        
+        from ba2_common.core import trade_store as _ts
+
+        # BT sql-less store (flag-on): read/persist orders+txn through the in-memory store, no SQLite
+        # session for them. LIVE (flag-off) keeps the exact session + query + batched-commit path.
+        inmem = _ts.inmem_trades_active()
+
         result = {
             'success': False,
             'message': '',
@@ -1252,13 +1259,14 @@ class AccountInterface(ReadOnlyAccountInterface):
                 logger.info(f"Set transaction {transaction_id} status to CLOSING")
             
             # Query for ALL orders associated with this transaction
-            with Session(get_db().bind) as session:
-                all_orders_statement = select(TradingOrder).where(
-                    TradingOrder.transaction_id == transaction_id,
-                    TradingOrder.account_id == self.id
-                ).order_by(TradingOrder.created_at)
-                all_orders = list(session.exec(all_orders_statement).all())
-                
+            session_cm = nullcontext(None) if inmem else Session(get_db().bind)
+            with session_cm as session:
+                all_orders = _ts.orders_where(
+                    account_id=self.id, transaction_id=transaction_id, session=session)
+                all_orders = sorted(
+                    all_orders,
+                    key=lambda o: o.created_at or datetime.min.replace(tzinfo=timezone.utc))
+
                 if not all_orders:
                     result['message'] = 'No orders found for this transaction'
                     return result
@@ -1294,7 +1302,10 @@ class AccountInterface(ReadOnlyAccountInterface):
                     if order.status in unsent_statuses:
                         try:
                             order.status = OrderStatus.CLOSED
-                            session.add(order)  # Use the existing session
+                            if inmem:
+                                update_instance(order)
+                            else:
+                                session.add(order)  # Use the existing session
                             result['deleted_count'] += 1
                             logger.info(f"Marked unsent order {order.id} as CLOSED for transaction {transaction_id}")
                         except Exception as e:
@@ -1338,8 +1349,6 @@ class AccountInterface(ReadOnlyAccountInterface):
                                         )
                                         # Mark the ERROR order as CANCELED (not needed anymore)
                                         existing_close_order.status = OrderStatus.CANCELED
-                                        session.add(existing_close_order)
-                                        
                                         # Mark transaction as CLOSED with logging
                                         from ba2_common.core.utils import close_transaction_with_logging
                                         close_transaction_with_logging(
@@ -1348,8 +1357,13 @@ class AccountInterface(ReadOnlyAccountInterface):
                                             close_reason="position_not_at_broker",
                                             session=session
                                         )
-                                        session.add(transaction)
-                                        session.commit()
+                                        if inmem:
+                                            update_instance(existing_close_order)
+                                            update_instance(transaction)
+                                        else:
+                                            session.add(existing_close_order)
+                                            session.add(transaction)
+                                            session.commit()
                                         
                                         result['success'] = True
                                         result['message'] = f'Transaction closed (position no longer at broker)'
@@ -1372,8 +1386,11 @@ class AccountInterface(ReadOnlyAccountInterface):
                                 # Mark the errored order as CANCELED and create a fresh one
                                 # via the helper (which handles TP/SL deferred submission)
                                 existing_close_order.status = OrderStatus.CANCELED
-                                session.add(existing_close_order)
-                                session.commit()
+                                if inmem:
+                                    update_instance(existing_close_order)
+                                else:
+                                    session.add(existing_close_order)
+                                    session.commit()
 
                                 close_result = self.submit_close_order_for_transaction(
                                     transaction, last_broker_canceled_order_id
@@ -1445,11 +1462,15 @@ class AccountInterface(ReadOnlyAccountInterface):
                             "close_date": transaction.close_date.isoformat() if transaction.close_date else None
                         }
                     )
-                    session.add(transaction)
+                    if inmem:
+                        update_instance(transaction)
+                    else:
+                        session.add(transaction)
                     result['message'] += ' (transaction closed)'
-                
-                session.commit()
-            
+
+                if not inmem:
+                    session.commit()
+
             return result
             
         except Exception as e:

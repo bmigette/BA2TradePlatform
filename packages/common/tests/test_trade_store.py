@@ -58,6 +58,31 @@ def test_orders_where_filters():
         assert ts.orders_where(broker_order_id="b3")[0].account_id == 2
 
 
+def test_enum_and_datetime_coercion_matches_sqlite():
+    """The store must present objects like a SQLite round-trip: enum columns coerced from raw str
+    to the enum (SQLModel table models DON'T validate on assignment, so ``TradingOrder(side="BUY")``
+    keeps a str), and naive DateTime columns stripped of tzinfo (SQLite ``DateTime`` is tz-naive).
+    Without this ``o.side.value`` breaks and ``min()`` over mixed naive/aware datetimes raises."""
+    from datetime import datetime, timezone
+    with ts.inmem_trades():
+        oid = ts.store_add(TradingOrder(
+            account_id=1, symbol="AAPL", quantity=10.0, side="BUY",  # raw str side
+            order_type=OrderType.MARKET, status=OrderStatus.NEW,
+            created_at=datetime.now(timezone.utc)))  # aware datetime
+        o = ts.store_get(TradingOrder, oid)
+        assert o.side is OrderDirection.BUY          # str -> enum (o.side.value now works)
+        assert o.side.value == "BUY"
+        assert o.created_at.tzinfo is None           # aware -> naive (like SQLite)
+
+
+def test_get_or_none():
+    with ts.inmem_trades():
+        assert ts.get_or_none(TradingOrder, 999) is None    # absent -> None, never raises
+        oid = ts.store_add(_order())
+        assert ts.get_or_none(TradingOrder, oid).id == oid
+        assert ts.get_or_none(TradingOrder, None) is None
+
+
 def test_transactions_where_and_join():
     with ts.inmem_trades():
         t_open = ts.store_add(_txn(status=TransactionStatus.OPENED))

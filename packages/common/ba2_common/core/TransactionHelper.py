@@ -329,22 +329,11 @@ class TransactionHelper:
         Returns:
             TradingOrder: The entry order if found, None otherwise
         """
-        close_session = False
-        if session is None:
-            session = Session(get_db().bind)
-            close_session = True
-        
-        try:
-            statement = select(TradingOrder).where(
-                TradingOrder.transaction_id == transaction.id,
-                TradingOrder.depends_on_order.is_(None),
-                TradingOrder.status.notin_(OrderStatus.get_terminal_statuses())
-            )
-            entry_order = session.exec(statement).first()
-            return entry_order
-        finally:
-            if close_session:
-                session.close()
+        from ba2_common.core.trade_store import orders_where
+        matches = orders_where(
+            transaction_id=transaction.id, depends_on_order=None,
+            not_statuses=OrderStatus.get_terminal_statuses(), session=session)
+        return matches[0] if matches else None
     
     @staticmethod
     def is_tpsl_order(order: TradingOrder) -> bool:

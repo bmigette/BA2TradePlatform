@@ -793,16 +793,15 @@ class MarketExpertInterface(ExtendableSettingsInterface):
         try:
             used_balance = 0.0
 
-            # Get all open transactions for this expert
-            with Session(get_db().bind) as session:
-                statement = select(Transaction).where(
-                    Transaction.expert_id == self.id,
-                    Transaction.status.in_([TransactionStatus.WAITING, TransactionStatus.OPENED])
-                )
-                if exclude_transaction_id is not None:
-                    statement = statement.where(Transaction.id != exclude_transaction_id)
-                transactions = session.exec(statement).all()
-            
+            # Get all open transactions for this expert (dual-path: the in-memory store in a
+            # backtest, SQLite in live — same rows either way).
+            from ba2_common.core.trade_store import transactions_where
+            transactions = transactions_where(
+                expert_id=self.id,
+                statuses=[TransactionStatus.WAITING, TransactionStatus.OPENED])
+            if exclude_transaction_id is not None:
+                transactions = [t for t in transactions if t.id != exclude_transaction_id]
+
             if not transactions:
                 return used_balance
             

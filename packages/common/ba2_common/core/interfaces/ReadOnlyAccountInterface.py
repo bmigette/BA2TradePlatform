@@ -422,11 +422,13 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
             bool: True if refresh was successful, False otherwise
         """
         try:
+            from contextlib import nullcontext
             from sqlmodel import select, Session
             from ba2_common.core.db import get_db
             from ba2_common.core.models import TradingOrder, Transaction
             from ba2_common.core.types import OrderStatus, OrderDirection, OrderType, TransactionStatus
-            from ba2_common.core.db import update_instance
+            from ba2_common.core.db import update_instance, delete_instance
+            from ba2_common.core import trade_store as _ts
 
             # Get terminal and executed order states from OrderStatus
             terminal_statuses = OrderStatus.get_terminal_statuses()
@@ -434,30 +436,36 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
 
             updated_count = 0
 
-            with Session(get_db().bind) as session:
+            # BT sql-less "dict trades" (flag-on): read/write TradingOrder+Transaction through the
+            # in-memory store; no SQLite session for them. LIVE (flag-off) keeps the exact session +
+            # join + batched-commit path below, byte-for-byte unchanged.
+            inmem = _ts.inmem_trades_active()
+            session_cm = nullcontext(None) if inmem else Session(get_db().bind)
+            with session_cm as session:
                 # Get all NON-terminal transactions for this account. A CLOSED transaction is
                 # terminal — all its orders are already terminal and its status/prices never
                 # change again — so re-deriving its state every refresh is pure waste. Skipping
                 # CLOSED ones is behaviour-preserving (no CLOSED->other transition exists) and,
                 # in a backtest that refreshes every bar with hundreds of accumulated closed
                 # transactions, removes the dominant per-bar O(transactions) re-query cost.
-                statement = select(Transaction).join(TradingOrder).where(
-                    TradingOrder.account_id == self.id,
-                    Transaction.status != TransactionStatus.CLOSED,
-                ).distinct()
-
-                transactions = session.exec(statement).all()
+                if inmem:
+                    transactions = _ts.transactions_with_orders(
+                        lambda o: o.account_id == self.id,
+                        lambda t: t.status != TransactionStatus.CLOSED)
+                else:
+                    statement = select(Transaction).join(TradingOrder).where(
+                        TradingOrder.account_id == self.id,
+                        Transaction.status != TransactionStatus.CLOSED,
+                    ).distinct()
+                    transactions = session.exec(statement).all()
 
                 for transaction in transactions:
                     original_status = transaction.status
                     has_changes = False
 
                     # Get all orders for this transaction
-                    orders_statement = select(TradingOrder).where(
-                        TradingOrder.transaction_id == transaction.id,
-                        TradingOrder.account_id == self.id
-                    )
-                    orders = session.exec(orders_statement).all()
+                    orders = _ts.orders_where(
+                        account_id=self.id, transaction_id=transaction.id, session=session)
 
                     if not orders:
                         continue
@@ -572,7 +580,10 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                             f"Deleting never-opened transaction {transaction.id} "
                             f"({transaction.symbol}): {len(orders)} terminal order(s), no fills"
                         )
-                        session.delete(transaction)
+                        if inmem:
+                            delete_instance(transaction)
+                        else:
+                            session.delete(transaction)
                         updated_count += 1
                         continue
 
@@ -720,14 +731,21 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                     # Update transaction status if changed
                     if new_status and new_status != original_status:
                         transaction.status = new_status
-                        session.add(transaction)
+                        if inmem:
+                            update_instance(transaction)
+                        else:
+                            session.add(transaction)
                         updated_count += 1
                         logger.info(f"Updated transaction {transaction.id} status: {original_status.value} -> {new_status.value}")
                     elif has_changes:
-                        session.add(transaction)
+                        if inmem:
+                            update_instance(transaction)
+                        else:
+                            session.add(transaction)
                         updated_count += 1
 
-                session.commit()
+                if not inmem:
+                    session.commit()
 
             logger.info(f"Successfully refreshed transactions for account {self.id}: {updated_count} transactions updated")
             return True

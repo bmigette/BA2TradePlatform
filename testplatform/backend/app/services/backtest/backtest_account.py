@@ -72,6 +72,7 @@ from ba2_common.core.types import (
 )
 from ba2_common.core.option_types import OptionPosition
 from ba2_common.core.db import get_db, get_instance, add_instance, update_instance
+from ba2_common.core.trade_store import orders_where, transactions_where
 
 from .price_source import AsOfPriceSource
 from .options_provider import HistoricalOptionsProvider
@@ -878,20 +879,10 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         ``_record_option_expiry_close``). When no transaction resolves the order is persisted
         unlinked; a transaction is never invented.
         """
-        from sqlmodel import select, Session
-
         want_side = OrderDirection.BUY if was_long else OrderDirection.SELL
         txn_id = None
         entry_id = None
-        with Session(get_db().bind) as session:
-            txns = list(
-                session.exec(
-                    select(Transaction).where(
-                        Transaction.status == TransactionStatus.OPENED,
-                        Transaction.symbol == symbol,
-                    )
-                ).all()
-            )
+        txns = transactions_where(status=TransactionStatus.OPENED, symbol=symbol)
         for t in txns:
             entry = self._entry_order_for_transaction(t)  # account-scoped lookup
             if (
@@ -1031,13 +1022,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
 
         ``status`` filters by OrderStatus when provided (ALL / None returns everything).
         """
-        from sqlmodel import select, Session
-
-        with Session(get_db().bind) as session:
-            stmt = select(TradingOrder).where(TradingOrder.account_id == self.id)
-            if status is not None and status != OrderStatus.ALL:
-                stmt = stmt.where(TradingOrder.status == status)
-            return list(session.exec(stmt).all())
+        statuses = ([status] if (status is not None and status != OrderStatus.ALL) else None)
+        return orders_where(account_id=self.id, statuses=statuses)
 
     def invalidate_order_cache(self) -> None:
         """Drop the in-memory order cache so the next read reloads from the DB.
@@ -1078,21 +1064,14 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         if cached is not None:
             return cached
 
-        from sqlmodel import select, Session
-
         snapshot: Dict[str, List[tuple]] = {}
-        with Session(get_db().bind) as session:
-            txns = session.exec(
-                select(Transaction)
-                .where(Transaction.expert_id == expert_id)
-                .where(Transaction.status == TransactionStatus.OPENED)
-            ).all()
-            # Build inside the session so attribute access is safe; get_current_open_qty opens its
-            # own session (keyed by txn id) and is computed ONCE here, not per bar.
-            for t in txns:
-                snapshot.setdefault(t.symbol, []).append(
-                    (t.id, t.open_price, t.get_current_open_qty())
-                )
+        txns = transactions_where(expert_id=expert_id, status=TransactionStatus.OPENED)
+        # Attributes are read immediately into plain tuples (safe for both the store objects and
+        # the flag-off session-loaded rows); get_current_open_qty is computed ONCE here, not per bar.
+        for t in txns:
+            snapshot.setdefault(t.symbol, []).append(
+                (t.id, t.open_price, t.get_current_open_qty())
+            )
 
         self._opened_txn_snapshot[expert_id] = snapshot
         return snapshot
@@ -1106,14 +1085,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         instances, instances in THIS cache may be stale for orders that filled this run; callers
         that need current state must read fresh (see ``_active_orders``' instance note)."""
         if self._order_cache is None:
-            from sqlmodel import select, Session
-
-            with Session(get_db().bind) as session:
-                self._order_cache = list(
-                    session.exec(
-                        select(TradingOrder).where(TradingOrder.account_id == self.id)
-                    ).all()
-                )
+            self._order_cache = orders_where(account_id=self.id)
         return self._order_cache
 
     def _active_orders(self) -> List[TradingOrder]:
@@ -1139,17 +1111,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         if self._active_order_cache is None:
             if self._active_set is None:
                 self._active_set = frozenset(OrderStatus.get_active_statuses())
-            from sqlmodel import select, Session
-
-            with Session(get_db().bind) as session:
-                self._active_order_cache = list(
-                    session.exec(
-                        select(TradingOrder).where(
-                            TradingOrder.account_id == self.id,
-                            TradingOrder.status.in_(OrderStatus.get_active_statuses()),
-                        )
-                    ).all()
-                )
+            self._active_order_cache = orders_where(
+                account_id=self.id, statuses=OrderStatus.get_active_statuses())
         return self._active_order_cache
 
     def _orders_filtered(self, statuses=None, transaction_id=None) -> List[TradingOrder]:
@@ -1177,40 +1140,30 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             else:
                 # Terminal-needing: read fresh so persisted terminal state is reflected (the
                 # cached full set may be stale). Rare path.
-                from sqlmodel import select, Session
-
-                with Session(get_db().bind) as session:
-                    rows = session.exec(
-                        select(TradingOrder).where(TradingOrder.account_id == self.id)
-                    ).all()
+                rows = orders_where(account_id=self.id)
                 orders = [o for o in rows if o.status in sset]
         else:
             # Transaction-only (no status filter): fresh read for current persisted state. Push
-            # transaction_id into SQL so this loads ONLY the (few) legs of this transaction, not
-            # every order ever created — keeps the rare adjust/cancel path O(legs), not O(total).
-            from sqlmodel import select, Session
-
-            with Session(get_db().bind) as session:
-                stmt = select(TradingOrder).where(TradingOrder.account_id == self.id)
-                if transaction_id is not None:
-                    stmt = stmt.where(TradingOrder.transaction_id == transaction_id)
-                orders = list(session.exec(stmt).all())
-            return orders
+            # transaction_id into the filter so this loads ONLY the (few) legs of this transaction,
+            # not every order ever created — keeps the rare adjust/cancel path O(legs).
+            return orders_where(account_id=self.id, transaction_id=transaction_id)
         if transaction_id is not None:
             orders = [o for o in orders if o.transaction_id == transaction_id]
         return orders
 
     def get_order(self, order_id: str) -> Any:
         """Look up an order by broker_order_id, then by numeric PK as a fallback."""
-        from sqlmodel import select, Session
-
-        with Session(get_db().bind) as session:
-            row = session.exec(
-                select(TradingOrder).where(TradingOrder.broker_order_id == str(order_id))
-            ).first()
-            if row is None and str(order_id).isdigit():
-                row = session.get(TradingOrder, int(order_id))
-            return row
+        matches = orders_where(broker_order_id=str(order_id))
+        if matches:
+            return matches[0]
+        if str(order_id).isdigit():
+            from ba2_common.core import trade_store as _ts
+            if _ts.inmem_trades_active():
+                return _ts.store_get(TradingOrder, int(order_id))
+            from sqlmodel import Session
+            with Session(get_db().bind) as session:
+                return session.get(TradingOrder, int(order_id))
+        return None
 
     def symbols_exist(self, symbols: List[str]) -> Dict[str, bool]:
         """A symbol "exists" iff the backtest price store has bars for it."""
@@ -1594,17 +1547,12 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         Runs AFTER the working-order loop, so a plain ruleset-close SELL that already filled this bar
         balances the position and the ``net == 0`` guard skips the bracket (no double close).
         """
-        from sqlmodel import select, Session
-
-        # Read the OPEN transactions' (id, tp, sl) into plain tuples INSIDE the session so the
-        # rows don't become detached/expired when the session closes (SQLAlchemy expire_on_commit).
-        with Session(get_db().bind) as session:
-            opened = [
-                (t.id, t.take_profit, t.stop_loss)
-                for t in session.exec(
-                    select(Transaction).where(Transaction.status == TransactionStatus.OPENED)
-                ).all()
-            ]
+        # Read the OPEN transactions' (id, tp, sl) into plain tuples immediately (safe for both the
+        # store objects and the flag-off session-loaded rows — plain columns, no lazy load).
+        opened = [
+            (t.id, t.take_profit, t.stop_loss)
+            for t in transactions_where(status=TransactionStatus.OPENED)
+        ]
 
         filled_any = False
         _min_dt = datetime.min.replace(tzinfo=timezone.utc)
@@ -1724,16 +1672,11 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         of our passes still gets its open_date corrected (the close pass no longer touches it).
         Filters already-stamped ids in SQL so the scan stays cheap on long runs.
         """
-        from sqlmodel import select, Session
         from ba2_common.core.types import TransactionStatus
 
-        with Session(get_db().bind) as session:
-            stmt = select(Transaction).where(
-                Transaction.status.in_([TransactionStatus.OPENED, TransactionStatus.CLOSED])
-            )
-            if self._stamped_open_ids:
-                stmt = stmt.where(Transaction.id.not_in(self._stamped_open_ids))
-            return list(session.exec(stmt).all())
+        return transactions_where(
+            statuses=[TransactionStatus.OPENED, TransactionStatus.CLOSED],
+            exclude_ids=(self._stamped_open_ids or None))
 
     def _closed_transactions(self) -> List[Transaction]:
         """CLOSED transactions not yet re-stamped (single-account backtest DB).
@@ -1741,14 +1684,11 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         Filters out already-stamped ids in SQL so the scan returns only the few freshly-closed
         rows each bar instead of every accumulated closed transaction.
         """
-        from sqlmodel import select, Session
         from ba2_common.core.types import TransactionStatus
 
-        with Session(get_db().bind) as session:
-            stmt = select(Transaction).where(Transaction.status == TransactionStatus.CLOSED)
-            if self._stamped_closed_ids:
-                stmt = stmt.where(Transaction.id.not_in(self._stamped_closed_ids))
-            return list(session.exec(stmt).all())
+        return transactions_where(
+            status=TransactionStatus.CLOSED,
+            exclude_ids=(self._stamped_closed_ids or None))
 
     def get_dividends(
         self,
@@ -2064,15 +2004,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         if self._options is None:
             return []
 
-        from sqlmodel import select, Session
-
         out: List[OptionPosition] = []
-        with Session(get_db().bind) as session:
-            txns = list(
-                session.exec(
-                    select(Transaction).where(Transaction.status == TransactionStatus.OPENED)
-                ).all()
-            )
+        txns = transactions_where(status=TransactionStatus.OPENED)
         for t in txns:
             entry = self._entry_order_for_transaction(t)
             if entry is None or getattr(entry, "asset_class", None) != AssetClass.OPTION:
@@ -2657,14 +2590,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         expiry settlement could not find its transaction, so the legs never settled (the strangle
         assignment defect: option lots persisted, no share conversion, equity mis-marked).
         """
-        from sqlmodel import select, Session
-
-        with Session(get_db().bind) as session:
-            txns = list(
-                session.exec(
-                    select(Transaction).where(Transaction.status == TransactionStatus.OPENED)
-                ).all()
-            )
+        txns = transactions_where(status=TransactionStatus.OPENED)
         for t in txns:
             entry = self._entry_order_for_transaction(t)
             if entry is None or getattr(entry, "asset_class", None) != AssetClass.OPTION:
@@ -3048,16 +2974,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         ``depends_on_order IS NULL``. If several exist — e.g. scaled entries — the oldest
         is returned so legs depend on the original entry.)
         """
-        from sqlmodel import select, Session
-
-        with Session(get_db().bind) as session:
-            rows = session.exec(
-                select(TradingOrder).where(
-                    TradingOrder.transaction_id == transaction.id,
-                    TradingOrder.account_id == self.id,
-                    TradingOrder.depends_on_order.is_(None),
-                )
-            ).all()
+        rows = orders_where(account_id=self.id, transaction_id=transaction.id,
+                            depends_on_order=None)
         if not rows:
             return None
         rows.sort(key=lambda o: (o.created_at or datetime.min.replace(tzinfo=timezone.utc), o.id or 0))

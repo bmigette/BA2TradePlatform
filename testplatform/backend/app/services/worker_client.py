@@ -63,10 +63,14 @@ def run_trial(worker: dict, config: dict, fitness_metric: str, timeout: float = 
     don't share a filesystem path.
     """
     from ba2_common.config import CACHE_FOLDER
+    from app.services.backtest.backtest_db import _inmem_trades_enabled
     with httpx.Client(timeout=timeout) as c:
         r = c.post(f"{_base(worker)}/run-trial", headers=_headers(worker),
                    json={"config": config, "fitness_metric": fitness_metric,
-                         "cache_root": CACHE_FOLDER})
+                         "cache_root": CACHE_FOLDER,
+                         # Propagate the sql-less "dict trades" flag so distributed trials use the
+                         # SAME backend (and thus byte-identical economics) as the master.
+                         "inmem_trades": _inmem_trades_enabled()})
         r.raise_for_status()
         return r.json()
 
@@ -76,10 +80,12 @@ def run_trial_full(worker: dict, config: dict, fitness_metric: str, timeout: flo
     instead of the trimmed summary — an operator/debug tool for diagnosing a fitness mismatch
     against a master-side result field-by-field, not the hot GA path."""
     from ba2_common.config import CACHE_FOLDER
+    from app.services.backtest.backtest_db import _inmem_trades_enabled
     with httpx.Client(timeout=timeout) as c:
         r = c.post(f"{_base(worker)}/run-trial-full", headers=_headers(worker),
                    json={"config": config, "fitness_metric": fitness_metric,
-                         "cache_root": CACHE_FOLDER})
+                         "cache_root": CACHE_FOLDER,
+                         "inmem_trades": _inmem_trades_enabled()})
         r.raise_for_status()
         return r.json()
 

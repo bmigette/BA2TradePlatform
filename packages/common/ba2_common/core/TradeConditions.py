@@ -168,24 +168,17 @@ class TradeCondition(ABC):
             True if expert has open transactions for this instrument, False otherwise
         """
         try:
-            from ba2_common.core.db import get_db
-            from ba2_common.core.models import Transaction
+            from ba2_common.core.trade_store import transactions_where
             from ba2_common.core.types import TransactionStatus
-            from sqlmodel import select
-            
+
             expert_id = self.expert_recommendation.instance_id
-            
-            with get_db() as session:
-                # Check for open transactions for this expert and instrument
-                statement = select(Transaction).where(
-                    Transaction.expert_id == expert_id,
-                    Transaction.symbol == self.instrument_name,
-                    Transaction.status == TransactionStatus.OPENED
-                )
-                open_transactions = session.exec(statement).all()
-                
-                return len(open_transactions) > 0
-                
+
+            # Check for open transactions for this expert and instrument
+            open_transactions = transactions_where(
+                expert_id=expert_id, symbol=self.instrument_name,
+                status=TransactionStatus.OPENED)
+            return len(open_transactions) > 0
+
         except Exception as e:
             logger.error(f"Error checking expert position for {self.instrument_name}: {e}", exc_info=True)
             return False
@@ -1249,7 +1242,7 @@ class PercentOpenToNewTargetCondition(CompareCondition):
                 return False
 
             # Get open price from transaction
-            from ba2_common.core.db import get_db
+            from ba2_common.core.trade_store import get_or_none
             from ba2_common.core.models import Transaction
 
             transaction_id = getattr(self.existing_order, 'transaction_id', None)
@@ -1258,8 +1251,7 @@ class PercentOpenToNewTargetCondition(CompareCondition):
                 self.calculated_value = None
                 return False
 
-            with get_db() as session:
-                transaction = session.get(Transaction, transaction_id)
+            transaction = get_or_none(Transaction, transaction_id)
 
             if not transaction or not transaction.open_price:
                 logger.warning(f"Transaction {transaction_id} not found or has no open_price")
@@ -1331,8 +1323,8 @@ def _get_pnl_via_transaction(existing_order, current_price) -> Optional[Dict]:
         return None
 
     try:
-        with get_db() as session:
-            transaction = session.get(Transaction, transaction_id)
+        from ba2_common.core.trade_store import get_or_none
+        transaction = get_or_none(Transaction, transaction_id)
     except Exception as e:
         logger.error(f"Error fetching transaction {transaction_id}: {e}", exc_info=True)
         return None

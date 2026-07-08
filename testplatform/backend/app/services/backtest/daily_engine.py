@@ -1001,18 +1001,11 @@ class DailyBacktestEngine:
         because there a limit entry can genuinely sit working; here only a filled position is a
         real open position to manage.
         """
-        from sqlmodel import select, Session
-        from ba2_common.core.db import get_db
+        from ba2_common.core.trade_store import transactions_where
         from ba2_common.core.types import TransactionStatus
 
         out: Dict[str, List[Any]] = {}
-        with Session(get_db().bind) as session:
-            rows = session.exec(
-                select(Transaction).where(
-                    Transaction.expert_id == expert_id,
-                    Transaction.status == TransactionStatus.OPENED,
-                )
-            ).all()
+        rows = transactions_where(expert_id=expert_id, status=TransactionStatus.OPENED)
         for t in rows:
             out.setdefault(t.symbol, []).append(t)
         return out
@@ -1024,19 +1017,13 @@ class DailyBacktestEngine:
         check, which queries OPENED+WAITING). Unlike ``_held_transactions`` (OPENED-only, for
         MANAGEMENT), the dup gate must also count a WAITING (not-yet-filled) entry so a second
         entry can't stack on it before it fills — exactly as live blocks it."""
-        from sqlmodel import select, Session
-        from ba2_common.core.db import get_db
+        from ba2_common.core.trade_store import transactions_where
         from ba2_common.core.types import TransactionStatus
 
-        with Session(get_db().bind) as session:
-            row = session.exec(
-                select(Transaction).where(
-                    Transaction.expert_id == expert_id,
-                    Transaction.symbol == symbol,
-                    Transaction.status.in_([TransactionStatus.OPENED, TransactionStatus.WAITING]),
-                )
-            ).first()
-        return row is not None
+        rows = transactions_where(
+            expert_id=expert_id, symbol=symbol,
+            statuses=[TransactionStatus.OPENED, TransactionStatus.WAITING])
+        return len(rows) > 0
 
     def _oldest_entry_order(self, txns: List[Any]) -> Optional[Any]:
         """The FILLED entry order of the oldest transaction (for DaysOpened-style conditions)."""

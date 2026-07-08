@@ -294,19 +294,13 @@ def test_open_positions_rule_fires_and_buys_an_option_off_the_cache():
         # Sanity: the seeded equity long is held in the SAME DB source _manage_open_positions
         # queries (Transaction.status == OPENED) — so the open_positions ruleset had a position
         # to evaluate the buy_call rule against.
-        from sqlmodel import Session, select
-        from ba2_common.core.db import get_db
-        from ba2_common.core.models import Transaction
+        from ba2_common.core.trade_store import transactions_where
         from ba2_common.core.types import OrderDirection, TransactionStatus
-        with Session(get_db().bind) as s:
-            held_equity = s.exec(
-                select(Transaction).where(
-                    Transaction.symbol == "AAPL",
-                    Transaction.expert_id == expert_id,
-                    Transaction.status == TransactionStatus.OPENED,
-                    Transaction.side == OrderDirection.BUY,
-                )
-            ).all()
+        held_equity = [
+            t for t in transactions_where(
+                expert_id=expert_id, symbol="AAPL", status=TransactionStatus.OPENED)
+            if t.side == OrderDirection.BUY
+        ]
         assert held_equity, "expected the seeded AAPL equity long held so open_positions evaluates"
 
         # THE assertion: the rule-driven option path worked end-to-end — the buy_call rule

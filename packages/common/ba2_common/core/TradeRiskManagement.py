@@ -410,6 +410,27 @@ class TradeRiskManagement:
     def _get_pending_orders_for_review(self, expert_instance_id: int) -> List[TradingOrder]:
         """Get all pending orders for an expert (RM-2: single JOIN, no N+1)."""
         try:
+            from ba2_common.core.trade_store import inmem_trades_active, orders_where
+            if inmem_trades_active():
+                # BT store: PENDING orders live in the in-memory store; their ExpertRecommendation
+                # rows are still in SQLite (not an in-mem model), so correlate the two by id and
+                # keep only this expert's (rec.instance_id == expert_instance_id).
+                from ba2_common.core.db import get_instance
+                expert_orders = []
+                seen_order_ids = set()
+                for order in orders_where(statuses=[OrderStatus.PENDING]):
+                    if order.id in seen_order_ids or not order.expert_recommendation_id:
+                        continue
+                    try:
+                        rec = get_instance(ExpertRecommendation, order.expert_recommendation_id)
+                    except Exception:  # noqa: BLE001 — a missing rec just excludes the order
+                        rec = None
+                    if rec is None or rec.instance_id != expert_instance_id:
+                        continue
+                    seen_order_ids.add(order.id)
+                    expert_orders.append(order)
+                self.logger.info(f"Found {len(expert_orders)} pending orders for review for expert {expert_instance_id}")
+                return expert_orders
             with get_db() as session:
                 # Single JOIN filtered by the expert instance, instead of loading every
                 # pending order in the system and issuing one ExpertRecommendation lookup
@@ -531,47 +552,49 @@ class TradeRiskManagement:
     def _get_existing_allocations(self, expert_instance_id: int) -> Dict[str, float]:
         """Get existing allocations per instrument for the expert."""
         allocations = {}
-        
-        try:
-            with get_db() as session:
-                # Get existing transactions for this expert that are still open
-                statement = select(Transaction).where(
-                    Transaction.expert_id == expert_instance_id,
-                    Transaction.status.in_([TransactionStatus.WAITING, TransactionStatus.OPENED])
-                )
-                
-                transactions = session.exec(statement).all()
-                
-                for transaction in transactions:
-                    symbol = transaction.symbol
-                    # Prefer open_price (capital allocated when the position opened).
-                    # WAITING transactions may lack open_price; in that case estimate
-                    # committed capital from the linked pending order's limit/stop price
-                    # so the per-instrument cap isn't undercounted (RM-4).
-                    fallback_price = None
-                    if not transaction.open_price and transaction.quantity:
-                        for o in transaction.trading_orders:
-                            fallback_price = o.limit_price or o.open_price or o.stop_price
-                            if fallback_price:
-                                break
-                        if not fallback_price:
-                            self.logger.warning(
-                                f"WAITING transaction {transaction.id} ({symbol}) has no open_price "
-                                f"and no order price; counting allocation as 0 "
-                                f"(may understate committed capital)"
-                            )
-                    current_value = estimate_transaction_allocation(
-                        transaction.quantity, transaction.open_price, fallback_price
-                    )
 
-                    allocations[symbol] = allocations.get(symbol, 0.0) + current_value
-                
-                self.logger.debug(f"Found existing allocations for expert {expert_instance_id}: {allocations}")
-                
+        try:
+            from ba2_common.core.trade_store import transactions_where, orders_where, inmem_trades_active
+
+            # Get existing transactions for this expert that are still open (dual-path: the
+            # in-memory store in a backtest, SQLite in live — same rows either way).
+            transactions = transactions_where(
+                expert_id=expert_instance_id,
+                statuses=[TransactionStatus.WAITING, TransactionStatus.OPENED])
+
+            for transaction in transactions:
+                symbol = transaction.symbol
+                # Prefer open_price (capital allocated when the position opened).
+                # WAITING transactions may lack open_price; in that case estimate
+                # committed capital from the linked pending order's limit/stop price
+                # so the per-instrument cap isn't undercounted (RM-4).
+                fallback_price = None
+                if not transaction.open_price and transaction.quantity:
+                    # Use the store/SQLite accessor rather than the ORM relationship: store objects
+                    # aren't session-bound, so ``transaction.trading_orders`` can't lazy-load.
+                    txn_orders = orders_where(transaction_id=transaction.id)
+                    for o in txn_orders:
+                        fallback_price = o.limit_price or o.open_price or o.stop_price
+                        if fallback_price:
+                            break
+                    if not fallback_price:
+                        self.logger.warning(
+                            f"WAITING transaction {transaction.id} ({symbol}) has no open_price "
+                            f"and no order price; counting allocation as 0 "
+                            f"(may understate committed capital)"
+                        )
+                current_value = estimate_transaction_allocation(
+                    transaction.quantity, transaction.open_price, fallback_price
+                )
+
+                allocations[symbol] = allocations.get(symbol, 0.0) + current_value
+
+            self.logger.debug(f"Found existing allocations for expert {expert_instance_id}: {allocations}")
+
         except Exception as e:
             self.logger.error(f"Error getting existing allocations for expert {expert_instance_id}: {e}", exc_info=True)
             raise  # Re-raise to propagate error to caller
-        
+
         return allocations
     
     def _calculate_order_quantities(

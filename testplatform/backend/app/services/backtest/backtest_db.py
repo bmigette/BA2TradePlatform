@@ -24,12 +24,22 @@ draft's account_type/enabled, which do not exist on the model).
 """
 from __future__ import annotations
 
+import os
 import pathlib
 import tempfile
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any, Dict, Iterator, Optional
 
 from ba2_common.core import db as common_db
+from ba2_common.core import trade_store
+
+
+def _inmem_trades_enabled() -> bool:
+    """Opt-in for the sql-less in-memory order/transaction store ("dict trades"). ON by default;
+    set ``BT_INMEM_TRADES=0`` to fall back to the SQLite path (the escape hatch). Only ever
+    consulted for ``in_memory`` runs (the GA fitness hot path) — file-backed runs always use
+    SQLite so their rows survive on disk. This is a BACKTEST switch; live never calls this module."""
+    return os.environ.get("BT_INMEM_TRADES", "1").strip().lower() not in ("0", "false", "no", "")
 
 
 def backtest_db_root() -> pathlib.Path:
@@ -124,8 +134,15 @@ def backtest_trading_db(run_id: int | str, in_memory: bool = True) -> Iterator[s
     common_db.configure_db_threadlocal(target)      # per-thread engine -> this run's DB
     common_db.init_db()                             # SQLModel.metadata.create_all(get_engine())
     _seed_carry_settings(carried_settings)
+    # sql-less "dict trades": for in-memory runs, hold TradingOrder/Transaction in RAM dicts for the
+    # duration of the run (no per-op SQLModel compile/flush/commit). The store is THREAD-LOCAL and
+    # reset per run by inmem_trades(); results are extracted from the account before teardown, so
+    # nothing needs persisting. File-backed runs stay on SQLite (rows must survive on disk).
+    store_ctx = (trade_store.inmem_trades()
+                 if (in_memory and _inmem_trades_enabled()) else nullcontext())
     try:
-        yield target
+        with store_ctx:
+            yield target
     finally:
         # Drop THIS thread's override so the backtest DB never leaks into subsequent (live) code
         # paths or other trials on this thread. (A file DB is left on disk for post-mortem; the
