@@ -4508,7 +4508,7 @@ class TradeSettingsTab:
                         ui.button('Export Rules', on_click=self.rules_export_import_ui.show_export_rules_dialog, icon='download').props('flat')
                     
                     ui.button('Add Rule', on_click=lambda: self.show_rule_dialog(), icon='add').classes('mb-4')
-                    
+
                     self.rules_table = ui.table(
                         columns=[
                             {'name': 'name', 'label': 'Name', 'field': 'name', 'sortable': True},
@@ -4519,9 +4519,21 @@ class TradeSettingsTab:
                             {'name': 'actions', 'label': 'Actions', 'field': 'actions'}
                         ],
                         rows=self._get_all_rules(),
-                        row_key='id'
+                        row_key='id',
+                        selection='multiple'
                     ).classes('w-full')
-                    
+                    self.rules_table.selected = []
+
+                    with self.rules_table.add_slot('top-left'):
+                        with ui.row().classes('items-center gap-4'):
+                            ui.button('Delete Selected', icon='delete',
+                                      on_click=lambda: self._handle_delete_selected_rules(self.rules_table.selected)) \
+                                .props('color=negative') \
+                                .bind_enabled_from(self.rules_table, 'selected', backward=lambda val: bool(val))
+                            ui.label().bind_text_from(self.rules_table, 'selected',
+                                                       backward=lambda val: f'{len(val)} selected' if val else '') \
+                                .classes('text-sm text-grey-6')
+
                     self.rules_table.add_slot('body-cell-continue_processing', '''
                         <q-td :props="props">
                             <q-icon :name="props.value ? 'check_circle' : 'cancel'" 
@@ -4556,7 +4568,7 @@ class TradeSettingsTab:
                         ui.button('Export Rulesets', on_click=self.rules_export_import_ui.show_export_rulesets_dialog, icon='download').props('flat')
                     
                     ui.button('Add Ruleset', on_click=lambda: self.show_ruleset_dialog(), icon='add').classes('mb-4')
-                    
+
                     self.rulesets_table = ui.table(
                         columns=[
                             {'name': 'name', 'label': 'Name', 'field': 'name', 'sortable': True},
@@ -4566,9 +4578,21 @@ class TradeSettingsTab:
                             {'name': 'actions', 'label': 'Actions', 'field': 'actions'}
                         ],
                         rows=self._get_all_rulesets(),
-                        row_key='id'
+                        row_key='id',
+                        selection='multiple'
                     ).classes('w-full')
-                    
+                    self.rulesets_table.selected = []
+
+                    with self.rulesets_table.add_slot('top-left'):
+                        with ui.row().classes('items-center gap-4'):
+                            ui.button('Delete Selected', icon='delete',
+                                      on_click=lambda: self._handle_delete_selected_rulesets(self.rulesets_table.selected)) \
+                                .props('color=negative') \
+                                .bind_enabled_from(self.rulesets_table, 'selected', backward=lambda val: bool(val))
+                            ui.label().bind_text_from(self.rulesets_table, 'selected',
+                                                       backward=lambda val: f'{len(val)} selected' if val else '') \
+                                .classes('text-sm text-grey-6')
+
                     self.rulesets_table.add_slot('body-cell-actions', """
                         <q-td :props="props">
                             <q-btn @click="$parent.$emit('test', props)" icon="science" flat dense color='green' title="Test Ruleset"/>
@@ -5452,7 +5476,60 @@ class TradeSettingsTab:
             logger.warning(f'Rule with id {rule_id} not found')
             ui.notify('Rule not found', type='error')
         dialog.close()
-    
+
+    def _handle_delete_selected_rules(self, selected_rows):
+        """Show confirmation dialog for bulk-deleting selected rules."""
+        if not selected_rows:
+            ui.notify('No rules selected', type='warning')
+            return
+
+        rule_ids = [row['id'] for row in selected_rows]
+        names = [row['name'] for row in selected_rows]
+
+        with ui.dialog() as dialog, ui.card():
+            ui.label(f'Delete {len(rule_ids)} rule(s)?').classes('text-h6 mb-2')
+            ui.label('This action cannot be undone.').classes('text-grey-6 mb-2')
+            with ui.column().classes('gap-0 max-h-48 overflow-auto'):
+                for name in names:
+                    ui.label(f'• {name}').classes('text-sm')
+            with ui.row().classes('w-full justify-end gap-2 mt-4'):
+                ui.button('Cancel', on_click=dialog.close).props('flat')
+                ui.button('Delete', on_click=lambda: self._confirm_delete_selected_rules(rule_ids, dialog)) \
+                    .props('flat color=negative')
+        dialog.open()
+
+    def _confirm_delete_selected_rules(self, rule_ids, dialog):
+        """Bulk-delete the confirmed set of rules, mirroring _confirm_delete_rule's error handling."""
+        deleted_count = 0
+        errors = []
+        for rule_id in rule_ids:
+            rule = get_instance(EventAction, rule_id)
+            if not rule:
+                errors.append(f'Rule {rule_id} not found')
+                continue
+            try:
+                logger.debug(f'Deleting rule {rule_id}')
+                delete_instance(rule)
+                deleted_count += 1
+                logger.info(f'Rule {rule_id} deleted')
+            except Exception as e:
+                logger.error(f'Error deleting rule {rule_id}: {e}', exc_info=True)
+                errors.append(f'Rule {rule_id}: {e}')
+
+        if deleted_count:
+            ui.notify(f'Deleted {deleted_count} rule(s)', type='positive')
+        if errors:
+            error_msg = '; '.join(errors[:3])
+            if len(errors) > 3:
+                error_msg += f'... and {len(errors) - 3} more errors'
+            ui.notify(f'Errors: {error_msg}', type='negative')
+
+        dialog.close()
+        self.rules_table.selected = []
+        self._update_rules_table()
+        # Rule counts on rulesets may have changed
+        self._update_rulesets_table()
+
     def _on_rule_duplicate_click(self, msg):
         """Handle duplicate button click for rules."""
         logger.debug(f'Duplicate rule table click: {msg}')
@@ -5558,7 +5635,69 @@ class TradeSettingsTab:
             logger.warning(f'Ruleset with id {ruleset_id} not found')
             ui.notify('Ruleset not found', type='error')
         dialog.close()
-    
+
+    def _handle_delete_selected_rulesets(self, selected_rows):
+        """Show confirmation dialog for bulk-deleting selected rulesets."""
+        if not selected_rows:
+            ui.notify('No rulesets selected', type='warning')
+            return
+
+        ruleset_ids = [row['id'] for row in selected_rows]
+        names = [row['name'] for row in selected_rows]
+
+        with ui.dialog() as dialog, ui.card():
+            ui.label(f'Delete {len(ruleset_ids)} ruleset(s)?').classes('text-h6 mb-2')
+            ui.label('This will also delete all rule associations. This action cannot be undone.') \
+                .classes('text-grey-6 mb-2')
+            with ui.column().classes('gap-0 max-h-48 overflow-auto'):
+                for name in names:
+                    ui.label(f'• {name}').classes('text-sm')
+            with ui.row().classes('w-full justify-end gap-2 mt-4'):
+                ui.button('Cancel', on_click=dialog.close).props('flat')
+                ui.button('Delete', on_click=lambda: self._confirm_delete_selected_rulesets(ruleset_ids, dialog)) \
+                    .props('flat color=negative')
+        dialog.open()
+
+    def _confirm_delete_selected_rulesets(self, ruleset_ids, dialog):
+        """Bulk-delete the confirmed set of rulesets, mirroring _confirm_delete_ruleset's
+        link-cleanup and error handling."""
+        from sqlmodel import delete
+        from ...core.models import RulesetEventActionLink
+
+        deleted_count = 0
+        errors = []
+        for ruleset_id in ruleset_ids:
+            ruleset = get_instance(Ruleset, ruleset_id)
+            if not ruleset:
+                errors.append(f'Ruleset {ruleset_id} not found')
+                continue
+            try:
+                logger.debug(f'Deleting ruleset {ruleset_id}')
+                session = get_db()
+                stmt = delete(RulesetEventActionLink).where(RulesetEventActionLink.ruleset_id == ruleset_id)
+                session.exec(stmt)
+                session.commit()
+                session.close()
+
+                delete_instance(ruleset)
+                deleted_count += 1
+                logger.info(f'Ruleset {ruleset_id} deleted')
+            except Exception as e:
+                logger.error(f'Error deleting ruleset {ruleset_id}: {e}', exc_info=True)
+                errors.append(f'Ruleset {ruleset_id}: {e}')
+
+        if deleted_count:
+            ui.notify(f'Deleted {deleted_count} ruleset(s)', type='positive')
+        if errors:
+            error_msg = '; '.join(errors[:3])
+            if len(errors) > 3:
+                error_msg += f'... and {len(errors) - 3} more errors'
+            ui.notify(f'Errors: {error_msg}', type='negative')
+
+        dialog.close()
+        self.rulesets_table.selected = []
+        self._update_rulesets_table()
+
     def _on_ruleset_duplicate_click(self, msg):
         """Handle duplicate button click for rulesets."""
         logger.debug(f'Duplicate ruleset table click: {msg}')
