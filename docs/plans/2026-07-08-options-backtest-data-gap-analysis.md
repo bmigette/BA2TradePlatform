@@ -1,8 +1,49 @@
 # Options backtest/optimization readiness — data-gap analysis
 
-Date: 2026-07-08
+Date: 2026-07-08 (updated same day — see "Build vs buy" section, which
+supersedes the vendor-purchase recommendation below)
 
-## TL;DR
+## Update: we can compute historical IV/greeks ourselves — no vendor needed
+
+IV is not an independent observed quantity — it is **derived from the
+option's own traded price** (the volatility that makes Black-Scholes
+reproduce that price). Everything needed to compute it historically is
+already in this codebase for free:
+
+| Black-Scholes input | Source (already have it) |
+|---|---|
+| Option price | `fetch_options.py` → `get_option_bars` daily close (already fetched) |
+| Strike / expiry / type | chain metadata (already fetched) |
+| Underlying price | cached equity OHLCV (already fetched) |
+| Risk-free rate | `ba2_providers.macro.FREDMacroProvider` — `DGS1MO`/`DGS3MO` Treasury yields (already integrated) |
+| Dividend yield | minor input; default 0 or pull from FMP fundamentals |
+
+Method: invert Black-Scholes numerically (`scipy.optimize.brentq` —
+scipy is already a dependency) against the option's close price to solve
+for IV, then read delta/gamma/theta/vega/rho **analytically** off the same
+BS formula once IV is known. No new data source, no per-symbol cost.
+
+Caveats (manageable, not blocking):
+- Derived from trade **close**, not NBBO mid — noisier than a true quote-
+  based IV, but no worse than the fill-price assumption the engine already
+  makes.
+- Equity options are American-style; pure Black-Scholes has a known bias
+  (worse for puts). Barone-Adesi-Whaley is the standard fix and not much
+  harder to implement than plain BS.
+- No trade that day → no bar → no IV that day (same sparsity we already
+  accept for fills).
+- Needs bounds/sanity-checks at extreme moneyness / very short DTE where
+  the root-find gets numerically unstable.
+
+**This changes the recommendation**: building a small IV-solver module
+(reusing option bars we already cache) unlocks delta-based strike selection
+and `IVRankCondition` backtesting for free, and should be tried BEFORE
+spending money on EODHD/Polygon/ORATS. The vendor price comparison below
+is kept for reference in case the self-computed IV proves too noisy in
+practice (e.g. compare our computed IV against a vendor's on a sample and
+decide from there) — but it's no longer the default next step.
+
+## TL;DR (original — see update above)
 
 The options **engine** (strategy actions, chain selection, fills, expiry/assignment
 settlement, margin, GA gene space) is complete and production-quality. The
@@ -125,16 +166,23 @@ greeks are actually tier-gated before committing spend.
   as of this check) must be populated via `ba2-test fetch-options` before any
   options backtest can run at all.
 
-## Recommended next steps (unchanged priority from the verbal review)
+## Recommended next steps (revised after the build-vs-buy finding above)
 
 1. Run `ba2-test fetch-options` for the screener universe to populate the
    cache — nothing else matters until this exists.
-2. Restrict initial option strategies to `percent_otm`/`consensus_target`
-   selection (delta selection is a dead end with this data).
-3. If vol-timing/premium-selling strategies matter, budget for a dedicated
-   options-data vendor — Alpaca/FMP cannot supply historical greeks/IV no
-   matter the subscription tier. EODHD (~$30–40/mo) and Polygon/Massive
-   Developer ($79/mo) are the best-value fits for a screener-wide historical
-   build; see the price comparison above.
-4. Add a configurable synthetic spread cost on option fills (e.g. bps of
-   premium) so combo/short-premium backtest P&L isn't fills-at-mid fantasy.
+2. Build a small Black-Scholes IV-solver (`scipy.optimize.brentq` + FRED
+   risk-free rate) that backfills `iv`/`delta`/`gamma`/`theta`/`vega` on the
+   option_chain rows from the bar closes we already fetch. Try this BEFORE
+   paying for vendor data — it's free and uses only already-integrated
+   pieces (scipy, `FREDMacroProvider`, existing option bars).
+3. Once computed IV/greeks exist, `delta` strike selection and
+   `IVRankCondition` become backtestable — validate them against a small
+   sample (e.g. spot-check computed IV against a live Alpaca snapshot on a
+   recent date) before trusting them at scale.
+4. Only if the self-computed IV proves too noisy in practice, fall back to
+   a vendor: EODHD (~$30–40/mo) and Polygon/Massive Developer ($79/mo) are
+   the best-value fits for a screener-wide historical build; see the price
+   comparison above.
+5. Add a configurable synthetic spread cost on option fills (e.g. bps of
+   premium) so combo/short-premium backtest P&L isn't fills-at-mid fantasy —
+   independent of the IV question, still needed either way.
