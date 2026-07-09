@@ -158,6 +158,40 @@ def test_screen_universe_for_day_applies_thresholds_sort_and_cap():
     assert ms.screen_universe_for_day(df, "2023-02-01", {"market_cap_min": 0}) == []
 
 
+def test_screened_symbol_union_matches_per_day_loop_and_bounds_to_window():
+    """screened_symbol_union is a vectorized rewrite of unioning screen_universe_for_day over every
+    scan date in the window — this pins that equivalence (incl. a per-date max_stocks cap that
+    picks DIFFERENT top symbols on different days) so the fast path can't silently diverge."""
+    df = pd.DataFrame({
+        "symbol": ["AAA", "BBB", "CCC", "DDD"] * 3,
+        "date": ["2023-01-31"] * 4 + ["2023-02-28"] * 4 + ["2023-03-31"] * 4,
+        # day1: AAA is the top-cap qualifier; day2: BBB overtakes; day3: CCC does, DDD never qualifies
+        "market_cap": [9e9, 3e9, 2e9, 5e8,
+                       3e9, 9e9, 2e9, 5e8,
+                       3e9, 2e9, 9e9, 5e8],
+        "price": [10.0] * 12, "volume": [2e6] * 12, "relative_volume": [1.0] * 12,
+        "price_drop_pct": [0.0] * 12, "sector": ["Tech"] * 12,
+    })
+    settings = {"market_cap_min": 1e9, "max_stocks": 1, "sort_metric": "market_cap"}
+
+    # per-day reference union (the OLD implementation's logic, inlined)
+    ref = set()
+    for d in ("2023-01-31", "2023-02-28", "2023-03-31"):
+        ref.update(ms.screen_universe_for_day(df, d, settings))
+    assert ref == {"AAA", "BBB", "CCC"}          # top-cap qualifier differs by day; DDD never wins
+
+    union = ms.screened_symbol_union(df, "2023-01-01", "2023-12-31", settings)
+    assert union == sorted(ref)
+
+    # window bound: excluding March's scan date drops CCC even though CCC alone would qualify then
+    narrow = ms.screened_symbol_union(df, "2023-01-01", "2023-02-28", settings)
+    assert narrow == ["AAA", "BBB"]
+
+    # a start_day AFTER every scan date still resolves to the latest prior scan (held-as-of), not empty
+    held = ms.screened_symbol_union(df, "2023-06-01", "2023-06-30", settings)
+    assert held == ["CCC"]                        # holds March's pick forward
+
+
 def test_screen_universe_as_of_holds_between_scans():
     df = pd.DataFrame({"symbol": ["AAA"], "date": ["2023-03-06"], "close": [10.0],
         "market_cap": [5e9], "relative_volume": [2.0], "price_drop_pct": [20.0],

@@ -951,17 +951,70 @@ def screened_symbol_union(store_df: "pd.DataFrame", start_day: str, end_day: str
 
     Used to BOUND the OHLCV preload to the symbols a screener run actually touches (vs the whole
     store, which is the loosest-bound superset of every gene — e.g. 868 symbols when only ~26 are
-    ever selected). Unions ``screen_universe_for_day`` over every store scan date in
-    ``[latest scan <= start_day, end_day]`` (bars before the first in-range scan resolve to that
-    prior scan, so it must be included). Returns sorted symbols (empty if the store has none).
+    ever selected). Semantically equal to unioning ``screen_universe_for_day`` over every store
+    scan date in ``[latest scan <= start_day, end_day]`` (bars before the first in-range scan
+    resolve to that prior scan, so it must be included) — but implemented as ONE vectorized pass
+    over the windowed slice instead of one full-store re-filter per date. The per-row threshold
+    filters (market_cap/price/volume/float/relative_volume/price_drop/weinstein) don't depend on
+    grouping, so they can be applied once across the whole window; only the max_stocks cap needs a
+    per-date top-N, done via ``groupby(...).head(n)`` on the sort-order. This was previously a
+    Python-level loop calling a full ``store_df[store_df["date"] == day]`` scan per date (~750
+    dates for a 3-year window) — ~7.5s/call on a 946k-row store, paid once per GA individual, i.e.
+    once per trial config build in the master process before dispatch (~17.5 min/generation at
+    population=140). Threading was tried and made it WORSE (measured: 8 calls threaded took 84s vs
+    60s sequential — this workload's Python-loop overhead dominates, so GIL contention from more
+    threads only adds cost); this vectorized rewrite instead cuts the per-call cost directly, see
+    ``testplatform/backend/tests/backtest`` for the equivalence test against the old logic.
+    Returns sorted symbols (empty if the store has none).
     """
     dates = sorted({str(d) for d in store_df["date"].unique()})
     if not dates:
         return []
     prior = [d for d in dates if d <= start_day]
     lo = prior[-1] if prior else dates[0]
-    relevant = [d for d in dates if lo <= d <= end_day]
-    union: set = set()
-    for d in relevant:
-        union.update(screen_universe_for_day(store_df, d, settings))
-    return sorted(union)
+    d = store_df[(store_df["date"] >= lo) & (store_df["date"] <= end_day)]
+    if d.empty:
+        return []
+
+    def _ge(col: str, key: str) -> None:
+        nonlocal d
+        v = settings.get(key)
+        if v is not None and float(v) > 0:
+            d = d[d[col] >= float(v)]
+
+    def _le(col: str, key: str) -> None:
+        nonlocal d
+        v = settings.get(key)
+        if v is not None and float(v) > 0:
+            d = d[d[col] <= float(v)]
+
+    _ge("market_cap", "market_cap_min"); _le("market_cap", "market_cap_max")
+    _ge("price", "price_min"); _le("price", "price_max")
+    _ge("volume", "volume_min"); _le("volume", "volume_max")
+    if "float_shares" in d.columns:
+        _fmin = settings.get("float_min")
+        if _fmin is not None and float(_fmin) > 0:
+            d = d[(d["float_shares"] >= float(_fmin)) | d["float_shares"].isna()]
+        _fmax = settings.get("float_max")
+        if _fmax is not None and float(_fmax) > 0:
+            d = d[(d["float_shares"] <= float(_fmax)) | d["float_shares"].isna()]
+    _ge("relative_volume", "relative_volume_min")
+    _drop_col = "price_drop_pct"
+    _y = settings.get("price_drop_days")
+    if _y is not None and int(float(_y)) >= 2 and f"price_drop_pct_{int(float(_y))}" in d.columns:
+        _drop_col = f"price_drop_pct_{int(float(_y))}"
+    _ge(_drop_col, "price_drop_pct")
+    w = settings.get("weinstein_stage2_only")
+    if w is not None and float(w) > 0 and "weinstein_stage" in d.columns:
+        d = d[d["weinstein_stage"] == 2]
+    if d.empty:
+        return []
+
+    sort_col = settings.get("sort_metric") or "market_cap"
+    if sort_col not in d.columns:
+        sort_col = "market_cap"
+    d = d.sort_values(sort_col, ascending=False)
+    n = int(settings.get("max_stocks") or 0)
+    if n > 0:
+        d = d.groupby("date", sort=False).head(n)
+    return sorted(set(d["symbol"]))
