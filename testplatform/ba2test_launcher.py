@@ -1603,12 +1603,40 @@ _OPTION_STRATS = {
         "option_strike_param_max": 10.0, "option_strike_param_step": 2.0,
         "option_wing_width_optimize": True, "option_wing_width_min": 3.0,
         "option_wing_width_max": 8.0, "option_wing_width_step": 1.0},
+    "O_LP": {  # long put (debit) — the bearish mirror of O_LC; entry gates on the BEARISH
+        # signal (see _OPTION_ENTRY_GATE), matching the live OPT-LongPut example which fired
+        # on current_rating_negative. Needs the expert's sell signals enabled to ever trade.
+        "action_type": "buy_put", "option_strike_method": "percent_otm",
+        "option_strike_param": 2.0, "option_dte_min": 25, "option_dte_max": 45,
+        "option_sizing": 5.0,
+        "option_strike_param_optimize": True, "option_strike_param_min": 0.0,
+        "option_strike_param_max": 8.0, "option_strike_param_step": 2.0,
+        "option_dte_optimize": True, "option_dte_min_range": 20,
+        "option_dte_max_range": 60, "option_dte_step": 5},
+}
+
+# Directional entry gate per pure-option strategy: which signal flag the entry rule requires.
+# Every original O_* key fires on the expert's BULLISH signal (including O_VERT — a bearish
+# STRUCTURE opened on a bullish signal as a hedge-shaped premium play, the original grid
+# semantics, kept unchanged). O_LP is the one true bearish-signal entry.
+_OPTION_ENTRY_GATE = {k: "bullish" for k in _OPTION_STRATS}
+_OPTION_ENTRY_GATE["O_LP"] = "bearish"
+
+# GROUPED option strategies: ONE optimize job searching a FAMILY of similar structures.
+# Each member becomes its own toggleable entry TradeRule (entry:<member>-entry:enabled gene)
+# carrying its own option action + option_* genes, so the GA can turn structures on/off and
+# tune each independently — top-5 individuals can land on DIFFERENT structures, giving the
+# saved top-N variety instead of 5 near-clones of one structure.
+_OPTION_GROUPS = {
+    "OS1": ["O_LC", "O_LP", "O_VERT", "O_BF"],   # directional DEBIT (long premium / defined)
+    "OS2": ["O_SSTG", "O_SSTD", "O_IC"],          # neutral CREDIT (short premium)
+    "OS3": ["O_JL", "O_RS"],                      # skewed CREDIT (asymmetric short premium)
 }
 
 # Pure-option strategy keys (entry is the option action; no equity leg). O_CC/O_STK are equity.
-_PURE_OPTION_STRATEGIES = set(_OPTION_STRATS)
+_PURE_OPTION_STRATEGIES = set(_OPTION_STRATS) | set(_OPTION_GROUPS)
 # All launcher option/equity strategy keys handled by the option builders.
-_OPTION_STRATEGY_KEYS = set(_OPTION_STRATS) | {"O_CC", "O_STK"}
+_OPTION_STRATEGY_KEYS = _PURE_OPTION_STRATEGIES | {"O_CC", "O_STK"}
 
 
 def _option_entry_action_for(kind: str) -> dict:
@@ -1642,21 +1670,55 @@ def _build_strategy_option(kind: str):
     from ba2_common.core.rule_models import normalize_trade_rules, trade_rules_from_legacy
 
     option_action = _option_entry_action_for(kind)
-    entry_rules = normalize_trade_rules([{
-        "id": f"{kind.lower()}-entry",
-        "name": f"{kind}-entry",
-        "conditions": {"id": "root", "type": "AND", "conditions": [
-            {"id": "opt-bullish", "field": "bullish", "field_type": "flag"},
-            {"id": "opt-flat", "field": "has_no_position", "field_type": "flag"},
-            {"id": "gate_confidence", "field": "confidence", "op": ">", "value": 50,
-             "optimize": True, "value_min": 40, "value_max": 75, "value_step": 5,
-             "toggle_optimize": True}]},
-        "actions": [option_action],
-        "continue_processing": False,
-    }])
+    entry_rules = normalize_trade_rules([_option_entry_rule(kind)])
     exit_rules = trade_rules_from_legacy(exit_conditions=_option_exit_rules(kind))["exit_rules"]
     s = Strategy(name=kind, entry_rules=entry_rules, exit_rules=exit_rules)
     s.entry_action = option_action  # type: ignore[attr-defined]
+    return s
+
+
+def _option_entry_rule(member: str, *, toggleable: bool = False) -> dict:
+    """The entry TradeRule dict for one pure-option strategy key: directional signal gate
+    (bullish for every original key, bearish for O_LP — see _OPTION_ENTRY_GATE) + flat +
+    optimizable confidence gate, action = the member's option action config. Rule/condition
+    ids are prefixed with the member key so a GROUP of these rules yields uniquely-keyed
+    genes per member. ``toggleable`` adds the rule-level enabled gene (group members only —
+    a single-strategy job keeps its one entry always-on)."""
+    m = member.lower()
+    rule = {
+        "id": f"{m}-entry",
+        "name": f"{member}-entry",
+        "conditions": {"id": f"{m}-root", "type": "AND", "conditions": [
+            {"id": f"{m}-signal", "field": _OPTION_ENTRY_GATE[member], "field_type": "flag"},
+            {"id": f"{m}-flat", "field": "has_no_position", "field_type": "flag"},
+            {"id": f"{m}-gate_confidence", "field": "confidence", "op": ">", "value": 50,
+             "optimize": True, "value_min": 40, "value_max": 75, "value_step": 5,
+             "toggle_optimize": True}]},
+        "actions": [_option_entry_action_for(member)],
+        "continue_processing": False,
+    }
+    if toggleable:
+        rule["toggle_optimize"] = True
+    return rule
+
+
+def _build_strategy_option_group(kind: str):
+    """A GROUPED pure-option Strategy (OS1/OS2/...): one toggleable entry TradeRule per member
+    structure, all sharing the option exit rules. First-match semantics pick the first ENABLED
+    member whose gate matches, and the GA's per-rule enabled genes search which structure(s)
+    to run — so one job explores the whole family and the persisted top-5 can differ in
+    STRUCTURE, not just parameters. ``entry_action`` (the engine's option-entry-path flag) is
+    set from the first member: every member is an option action, so the flag is identical
+    whichever member fires."""
+    from app.models.strategy import Strategy
+    from ba2_common.core.rule_models import normalize_trade_rules, trade_rules_from_legacy
+
+    members = _OPTION_GROUPS[kind]
+    entry_rules = normalize_trade_rules(
+        [_option_entry_rule(m, toggleable=True) for m in members])
+    exit_rules = trade_rules_from_legacy(exit_conditions=_option_exit_rules(kind))["exit_rules"]
+    s = Strategy(name=kind, entry_rules=entry_rules, exit_rules=exit_rules)
+    s.entry_action = _option_entry_action_for(members[0])  # type: ignore[attr-defined]
     return s
 
 
@@ -1696,7 +1758,11 @@ _STRATEGY_BUILDERS = {
     "O_SSTG": _build_strategy_option, "O_SSTD": _build_strategy_option,
     "O_IC": _build_strategy_option, "O_JL": _build_strategy_option,
     "O_BF": _build_strategy_option, "O_RS": _build_strategy_option,
+    "O_LP": _build_strategy_option,
     "O_CC": _build_strategy_covered_call, "O_STK": _build_strategy_stock,
+    # Grouped option families (one job searches the whole family; see _OPTION_GROUPS):
+    "OS1": _build_strategy_option_group, "OS2": _build_strategy_option_group,
+    "OS3": _build_strategy_option_group,
 }
 
 # Per-strategy GA population multiplier applied on top of --population in optimize-batch. S1 is the
