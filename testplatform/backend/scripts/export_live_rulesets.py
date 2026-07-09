@@ -48,6 +48,7 @@ def main(argv: list[str] | None = None) -> int:
     from app.api.ruleset_meta import (
         _read_live_enter_market_trees,
         _read_live_open_positions_rules,
+        _read_live_trade_rules,
     )
 
     repo_root = os.path.dirname(_enter_backend())
@@ -73,9 +74,15 @@ def main(argv: list[str] | None = None) -> int:
     for label, instance_id in experts.items():
         trees = _read_live_enter_market_trees(args.live_db, instance_id)
         exit_rules = _read_live_open_positions_rules(args.live_db, instance_id)
+        # UNIFIED RULE MODEL (lossless): TradeRule lists preserving per-rule brackets,
+        # multi-action rules, continue_processing and rule order — the S1 builder prefers
+        # these; the legacy tree/row keys stay for older readers.
+        trade_rules = _read_live_trade_rules(args.live_db, instance_id)
         payload = {
             "expert": label,
             "live_instance_id": instance_id,
+            "entry_rules": trade_rules["entry_rules"],
+            "exit_rules": trade_rules["exit_rules"],
             "buy_entry_conditions": trees.get("buy_entry_conditions"),
             "sell_entry_conditions": trees.get("sell_entry_conditions"),
             "exit_conditions": exit_rules,
@@ -86,7 +93,9 @@ def main(argv: list[str] | None = None) -> int:
         n_buy = len((trees.get("buy_entry_conditions") or {}).get("conditions", []) or [])
         n_sell = len((trees.get("sell_entry_conditions") or {}).get("conditions", []) or [])
         print(f"  {label:<22} instance {instance_id:>2}: "
-              f"buy_gates={n_buy} sell_gates={n_sell} exit_rules={len(exit_rules)} -> {path}")
+              f"entry_rules={len(trade_rules['entry_rules'])} "
+              f"exit_rules={len(trade_rules['exit_rules'])} "
+              f"(legacy: buy_gates={n_buy} sell_gates={n_sell} rows={len(exit_rules)}) -> {path}")
         written.append(path)
 
     print(f"\nexport-rulesets: wrote {len(written)} file(s) to {args.out}")

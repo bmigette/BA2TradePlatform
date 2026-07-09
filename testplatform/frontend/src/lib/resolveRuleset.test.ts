@@ -92,3 +92,32 @@ describe('applyBestParams', () => {
     expect(out.sellTree).toBeUndefined();
   });
 });
+
+describe('applyBestParams — unified rule model per-action genes', () => {
+  it('reads exit:<id>:a0:action_value the same as the legacy exit:<id>:action_value', () => {
+    const r = rule('r1', group('g1', [leaf('c1', 5)]), { actionValue: 0 });
+    const out = applyBestParams([r], undefined, undefined, { 'exit:r1:a0:action_value': -8 });
+    expect(out.exitRules[0].actionValue).toBe(-8);
+  });
+
+  it('exit:<id>:a0:enabled 0 drops the (single-action) rule for display', () => {
+    const r = rule('r1', group('g1', [leaf('c1', 5)]));
+    const out = applyBestParams([r], undefined, undefined, { 'exit:r1:a0:enabled': 0 });
+    expect(out.exitRules[0]._dropped).toBe(true);
+  });
+
+  it('ignores a1+ (multi-action rules only surface their first action here)', () => {
+    const r = rule('r1', group('g1', [leaf('c1', 5)]), { actionValue: 0 });
+    const out = applyBestParams([r], undefined, undefined, {
+      'exit:r1:a0:action_value': -8, 'exit:r1:a1:action_value': 50,
+    });
+    expect(out.exitRules[0].actionValue).toBe(-8); // a1's value never surfaces
+  });
+
+  it('rule-level exit:<id>:enabled and per-action a0:enabled are independent buckets', () => {
+    const r = rule('r1', group('g1', [leaf('c1', 5)]));
+    // Both present; either alone still drops the rule (approximation is fine either way).
+    const out = applyBestParams([r], undefined, undefined, { 'exit:r1:enabled': 1, 'exit:r1:a0:enabled': 0 });
+    expect(out.exitRules[0]._dropped).toBe(true);
+  });
+});

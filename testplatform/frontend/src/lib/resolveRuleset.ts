@@ -2,14 +2,18 @@
 // editor's rule shapes so a finished optimization can be read back as the
 // ruleset that ACTUALLY ran. Mirrors the backend decode_params resolution in
 // backend/app/services/strategy_param_space.py (decode_params, ~L215-283) and
-// the gene namespaces emitted by geneCount.ts / strategy_param_space.py:
+// the gene namespaces it emits on the UNIFIED RULE MODEL (migration 028):
 //
-//   cond:<id>:value     -> leaf threshold value
-//   cond:<id>:enabled   -> 0 marks the leaf _dropped (kept for display, greyed)
-//   exit:<id>:enabled   -> 0 marks the whole rule _dropped (kept, greyed/struck)
-//   exit:<id>:action_value -> rule.actionValue
-//   exit:<id>:option_delta -> rule.optionStrikeParam
-//   exit:<id>:option_dte   -> rule.optionDteMin = optionDteMax (int)
+//   cond:<id>:value           -> leaf threshold value
+//   cond:<id>:enabled         -> 0 marks the leaf _dropped (kept for display, greyed)
+//   exit:<id>:enabled         -> 0 marks the whole rule _dropped (kept, greyed/struck)
+//   exit:<id>:a<i>:action_value / :enabled / :option_delta / :option_dte
+//                             -> per-action genes; this resolver (backed by the legacy
+//                                single-action ExitConditionSet shape) reads ONLY a0 —
+//                                the sole action of a rule built through the current
+//                                editor. Multi-action rules (e.g. S4's tiers) only
+//                                surface their FIRST action here; see tradeRules.ts's
+//                                resolveTradeRules for the full multi-action resolver.
 //
 // Pure & dependency-free: never mutates its inputs (deep-clones), returns new
 // trees/rules. Unit-tested in resolveRuleset.test.ts.
@@ -54,17 +58,32 @@ function partition(bestParams: BestParams): Buckets {
   };
   for (const [key, val] of Object.entries(bestParams ?? {})) {
     const parts = key.split(':');
-    if (parts.length !== 3) continue; // ignore tp/sl/model:* and malformed keys
-    const [ns, id, field] = parts;
-    if (ns === 'cond') {
-      if (field === 'value') b.condValue[id] = val;
-      else if (field === 'enabled') b.condEnabled[id] = val;
-    } else if (ns === 'exit') {
+    if (parts.length === 3) {
+      // Legacy 3-part namespace: cond:<id>:field | exit:<id>:field (single-action rule).
+      const [ns, id, field] = parts;
+      if (ns === 'cond') {
+        if (field === 'value') b.condValue[id] = val;
+        else if (field === 'enabled') b.condEnabled[id] = val;
+      } else if (ns === 'exit') {
+        if (field === 'enabled') b.exitEnabled[id] = val;
+        else if (field === 'action_value') b.exitActionValue[id] = val;
+        else if (field === 'option_delta') b.exitOptionDelta[id] = val;
+        else if (field === 'option_dte') b.exitOptionDte[id] = val;
+      }
+    } else if (parts.length === 4 && parts[0] === 'exit') {
+      // Unified rule model: exit:<id>:a<i>:field (per-action). This resolver only
+      // surfaces the FIRST action (a0) of a rule — see the module docstring. a0's own
+      // :enabled is treated as dropping the whole (single-action) rule display-wise;
+      // for a genuinely multi-action rule this under-represents what changed (a1+
+      // aren't shown at all here), which is the documented limitation.
+      const [, id, actionIdx, field] = parts;
+      if (actionIdx !== 'a0') continue;
       if (field === 'enabled') b.exitEnabled[id] = val;
       else if (field === 'action_value') b.exitActionValue[id] = val;
       else if (field === 'option_delta') b.exitOptionDelta[id] = val;
       else if (field === 'option_dte') b.exitOptionDte[id] = val;
     }
+    // else: ignore tp/sl/model:*/entry:*/malformed keys (entry rules aren't modeled here).
   }
   return b;
 }

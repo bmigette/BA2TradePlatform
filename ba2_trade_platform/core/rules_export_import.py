@@ -143,17 +143,29 @@ class RulesExportImportUI:
                             
                         data = json.loads(content)
 
-                        # A SAVED-BACKTEST ruleset export (test platform) carries condition TREES
-                        # (buy/sell/exit) and no ``export_type`` — convert it to the live rulesets
-                        # export format via the shared converter so it imports like a native export.
-                        if data.get('export_type') is None and any(
+                        # A SAVED-BACKTEST ruleset export (test platform) carries strategy rules
+                        # and no ``export_type`` — convert it to the live rulesets export format
+                        # via the shared converters so it imports like a native export.
+                        # Import from rule_builders (the canonical SINGLE import point for all
+                        # rules/ruleset conversion) — NOT rules_convert directly: the two modules
+                        # form an intentional cycle that only resolves cleanly when rule_builders
+                        # is imported first, so importing rules_convert cold here raised an
+                        # ImportError (ACTION_VALUES partially initialized).
+                        if data.get('export_type') is None and (
+                            'entry_rules' in data or 'exit_rules' in data
+                        ):
+                            # UNIFIED RULE MODEL export (TradeRule lists): LOSSLESS conversion —
+                            # every action per rule, continue_processing, rule order.
+                            from ba2_common.core.rule_builders import trade_rules_to_live_export
+                            data = trade_rules_to_live_export(
+                                entry_rules=data.get('entry_rules') or [],
+                                exit_rules=data.get('exit_rules') or [],
+                                name=data.get('name') or 'backtest-strategy',
+                            )
+                        elif data.get('export_type') is None and any(
                             k in data for k in ('buy_entry_conditions', 'sell_entry_conditions', 'exit_conditions')
                         ):
-                            # Import from rule_builders (the canonical SINGLE import point for all
-                            # rules/ruleset conversion) — NOT rules_convert directly: the two modules
-                            # form an intentional cycle that only resolves cleanly when rule_builders
-                            # is imported first, so importing rules_convert cold here raised an
-                            # ImportError (ACTION_VALUES partially initialized).
+                            # LEGACY export shape (condition trees + single-action exit rows).
                             from ba2_common.core.rule_builders import strategy_to_live_export
                             data = strategy_to_live_export(
                                 buy_tree=data.get('buy_entry_conditions'),

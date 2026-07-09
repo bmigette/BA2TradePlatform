@@ -122,7 +122,8 @@ def _expert_ruleset_eas(db_path: str, expert_id: int, ruleset_id_column: str) ->
         if ruleset_id is None:
             return []  # expert exists but has no such ruleset configured
         ea_rows = conn.execute(
-            "SELECT ea.id AS id, ea.name AS name, ea.triggers AS triggers, ea.actions AS actions "
+            "SELECT ea.id AS id, ea.name AS name, ea.triggers AS triggers, ea.actions AS actions, "
+            "ea.continue_processing AS continue_processing "
             "FROM eventaction ea "
             "JOIN ruleset_eventaction_link link ON link.eventaction_id = ea.id "
             "WHERE link.ruleset_id = ? "
@@ -140,6 +141,7 @@ def _expert_ruleset_eas(db_path: str, expert_id: int, ruleset_id_column: str) ->
                 "name": ea["name"],
                 "triggers": json.loads(ea["triggers"]) if ea["triggers"] else {},
                 "actions": json.loads(ea["actions"]) if ea["actions"] else {},
+                "continue_processing": bool(ea["continue_processing"]),
             }
         )
     return eas
@@ -184,6 +186,32 @@ def get_open_positions_ruleset(expert_id: int):
             detail="could not read live DB; paste the ruleset JSON instead",
         )
     return {"rules": rules}
+
+
+def _read_live_trade_rules(db_path: str, expert_id: int) -> dict:
+    """READ-ONLY read of an expert's BOTH rulesets as unified TradeRule lists — LOSSLESS.
+
+    Wraps the ordered EventActions in a live-export-shaped payload and converts via the shared
+    ``live_export_to_trade_rules``, so every action per rule (per-tier TP/SL brackets,
+    multi-action exits), ``continue_processing`` and rule ORDER survive — unlike the legacy
+    tree readers, which flatten per-rule brackets and drop 2nd+ actions."""
+    from ba2_common.core.rule_builders import live_export_to_trade_rules
+
+    rulesets = []
+    for col, subtype in (("enter_market_ruleset_id", "enter_market"),
+                         ("open_positions_ruleset_id", "open_positions")):
+        eas = _expert_ruleset_eas(db_path, expert_id, col)
+        rulesets.append({
+            "subtype": subtype,
+            "rules": [
+                {"name": ea["name"], "subtype": subtype, "order_index": i,
+                 "triggers": ea["triggers"], "actions": ea["actions"],
+                 "continue_processing": ea.get("continue_processing", False)}
+                for i, ea in enumerate(eas)
+            ],
+        })
+    out = live_export_to_trade_rules({"export_type": "rulesets", "rulesets": rulesets})
+    return {"entry_rules": out["entry_rules"], "exit_rules": out["exit_rules"]}
 
 
 # --- enter_market import (uses the shared ba2_common converters) ---------------------------

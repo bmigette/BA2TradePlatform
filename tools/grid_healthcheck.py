@@ -5,8 +5,9 @@ import json
 import sqlite3
 
 DB = r"C:\Users\basti\Documents\ba2\test\dl_forecasting.db"
-SUFFIX = "-goal4"
-TOTAL_PLANNED = 45  # S1-S7 x 3 bands, FMPRating-only S4, FactorRanker skipped (2026-07-06 restart)
+SUFFIX = "-goal5"
+TOTAL_PLANNED = 48  # S1-S7 x 3 bands on the unified rule model (S4 reborn, FMPRating-only),
+                    # FactorRanker included once per band (2026-07-09 restart)
 
 
 def main():

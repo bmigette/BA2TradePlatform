@@ -1148,32 +1148,42 @@ def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dic
              if isinstance(k, str) and (k.startswith("cond:") or k.startswith("exit:") or k.startswith("entry:"))}
             if isinstance(sp, dict) else {}
         )
-        buy = _pick("buyEntryConditions", "buy_entry_conditions")
-        sell = _pick("sellEntryConditions", "sell_entry_conditions")
-        exits = _pick("exitConditions", "exit_conditions")
-        entries = _pick("entryActions", "entry_actions", "entry_rules")
-        # Older optimization runs stored only the flat genes — reconstruct the concrete trees
-        # from the optimization's base strategy + those genes so Load still restores conditions.
-        if buy is None and sell is None and not exits and not entries and cond_genes:
-            r_buy, r_sell, r_exits, r_entries = _reconstruct_opt_ruleset(backtest, db)
-            buy = buy if buy is not None else r_buy
-            sell = sell if sell is not None else r_sell
-            exits = exits if exits else r_exits
-            entries = entries if entries else r_entries
-        # Normalise to the SINGLE canonical condition format (operator groups, symbol comparison,
-        # inferred fieldType) via the shared model so Load pre-fills the builder cleanly regardless
-        # of how the tree was stored (builder camel / storage type+op / optimizer-decoded). This is
-        # the boundary — the engine/optimizer keep reading their own (still-present) snake keys.
-        # entry_actions is the SAME rule shape as exit_conditions (minus a nested conditions
-        # sub-tree), so the shared normalize_exit_rules applies unchanged.
-        from ba2_common.core.rule_models import normalize_tree, normalize_exit_rules
+        from ba2_common.core.rule_models import normalize_trade_rules, trade_rules_from_legacy
+
+        # UNIFIED RULE MODEL rows (post-migration-028 saves): the concrete TradeRule lists.
+        entry_rules = _pick("entryRules", "entry_rules")
+        exit_rules = _pick("exitRules", "exit_rules")
+
+        if entry_rules is None and exit_rules is None:
+            # LEGACY rows: buy/sell trees + single-action exit rows + flat entry bracket —
+            # lift them through the shared converter so every saved backtest exports the
+            # same canonical shape.
+            buy = _pick("buyEntryConditions", "buy_entry_conditions")
+            sell = _pick("sellEntryConditions", "sell_entry_conditions")
+            exits = _pick("exitConditions", "exit_conditions")
+            entries = _pick("entryActions", "entry_actions")
+            # Older optimization runs stored only the flat genes — reconstruct the concrete
+            # trees from the optimization's base strategy + those genes so Load still
+            # restores conditions.
+            if buy is None and sell is None and not exits and not entries and cond_genes:
+                r_buy, r_sell, r_exits, r_entries = _reconstruct_opt_ruleset(backtest, db)
+                buy = buy if buy is not None else r_buy
+                sell = sell if sell is not None else r_sell
+                exits = exits if exits else r_exits
+                entries = entries if entries else r_entries
+            converted = trade_rules_from_legacy(
+                buy_tree=buy, sell_tree=sell, entry_actions=entries, exit_conditions=exits,
+            )
+            entry_rules = converted["entry_rules"]
+            exit_rules = converted["exit_rules"]
+
         return {
             "backtest_id": backtest.id,
             "name": backtest.name,
-            "buy_entry_conditions": normalize_tree(buy),
-            "sell_entry_conditions": normalize_tree(sell),
-            "exit_conditions": normalize_exit_rules(exits or []),
-            "entry_actions": normalize_exit_rules(entries or []),
+            # Canonical TradeRule lists (conditions + actions[] + continue_processing per
+            # rule) — what the live import dialog and the builder consume.
+            "entry_rules": normalize_trade_rules(entry_rules or []),
+            "exit_rules": normalize_trade_rules(exit_rules or []),
             "optimized_genes": cond_genes,
         }
 

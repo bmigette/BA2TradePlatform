@@ -77,6 +77,8 @@ import {
   parseExport,
 } from '../lib/btExport';
 import type { OptSettingsExport, IndividualExport, BtExportCommon, ExportUniverse } from '../lib/btExport';
+import { legacyToTradeRules, tradeRulesToLegacyEditor } from '../lib/tradeRules';
+import type { TradeRule } from '../lib/tradeRules';
 import {
   XAxis,
   YAxis,
@@ -1268,11 +1270,56 @@ const Backtesting: React.FC = () => {
       }
       return;
     }
+    // UNIFIED RULE MODEL export (migration 028): entry_rules/exit_rules are TradeRule lists
+    // (each item carries an `actions` array), the canonical shape backend export now emits
+    // (kind=ruleset). Detected by the `actions` array on the first rule of either list —
+    // distinguishes it from the legacy exit_rules/entry_rules aliases the fallback below
+    // still reads (single-action rows / flat bracket list, no `actions` array).
+    const isTradeRuleList = (v: unknown): v is TradeRule[] =>
+      Array.isArray(v) && v.length > 0 && v.every(
+        (r) => r && typeof r === 'object' && Array.isArray((r as Record<string, unknown>).actions),
+      );
+    const entryRulesRaw = parsed.entry_rules as unknown;
+    const exitRulesRaw = parsed.exit_rules as unknown;
+    if (isTradeRuleList(entryRulesRaw) || isTradeRuleList(exitRulesRaw)) {
+      try {
+        const entryRules = isTradeRuleList(entryRulesRaw) ? entryRulesRaw : [];
+        const exitRules = isTradeRuleList(exitRulesRaw) ? exitRulesRaw : [];
+        const legacy = tradeRulesToLegacyEditor(entryRules, exitRules);
+        let buyCount = 0;
+        let sellCount = 0;
+        if (legacy.buyTree) { const g = normalizeEntryTree(legacy.buyTree); setBuyEntryConditions(g); buyCount = g.conditions.length; }
+        else { setBuyEntryConditions(createEmptyGroup('AND')); }
+        if (legacy.sellTree) { const g = normalizeEntryTree(legacy.sellTree); setSellEntryConditions(g); sellCount = g.conditions.length; }
+        else { setSellEntryConditions(createEmptyGroup('AND')); }
+        setAllowShort(sellCount > 0);
+        setExitConditions(legacy.exitRules.map((r, i) => {
+          const ec = exitConditionFromStored(r);
+          const conds = r.conditions ? normalizeEntryTree(r.conditions) : ec.conditions;
+          return { ...ec, conditions: conds, id: ec.id ?? `exit-import-${Date.now()}-${i}` };
+        }));
+        setEntryActions(legacy.entryActions.map((r, i) => {
+          const ec = entryActionFromStored(r);
+          return { ...ec, id: ec.id ?? `entry-import-${Date.now()}-${i}` };
+        }));
+        setLiveImportNote({
+          kind: legacy.warnings.length ? 'err' : 'ok',
+          text: `Imported ruleset JSON: ${buyCount} buy / ${sellCount} sell condition(s), `
+            + `${legacy.exitRules.length} exit rule(s), ${legacy.entryActions.length} entry action(s).`
+            + (legacy.warnings.length
+              ? ` NOTE — this editor can't fully represent the source rules: ${legacy.warnings.join('; ')}.`
+              : ''),
+        });
+      } catch (e) {
+        setLiveImportNote({ kind: 'err', text: e instanceof Error ? e.message : 'Failed to apply the ruleset JSON.' });
+      }
+      return;
+    }
     try {
       const buyRaw = parsed.buy_entry_conditions ?? parsed.buyEntryConditions;
       const sellRaw = parsed.sell_entry_conditions ?? parsed.sellEntryConditions;
-      const exitRaw = (parsed.exit_rules ?? parsed.exit_conditions ?? parsed.rules ?? parsed.exitConditions) as unknown;
-      const entryRaw = (parsed.entry_actions ?? parsed.entryActions ?? parsed.entry_rules) as unknown;
+      const exitRaw = (parsed.exit_conditions ?? parsed.rules ?? parsed.exitConditions) as unknown;
+      const entryRaw = (parsed.entry_actions ?? parsed.entryActions) as unknown;
       let buyCount = 0;
       let sellCount = 0;
       if (buyRaw) { const g = normalizeEntryTree(buyRaw); setBuyEntryConditions(g); buyCount = g.conditions.length; }
@@ -1536,6 +1583,15 @@ const Backtesting: React.FC = () => {
       }
     }
 
+    // UNIFIED RULE MODEL (migration 028): the canonical TradeRule lists derived from the
+    // editor's legacy state — sent alongside the legacy fields below (the backend prefers
+    // entry_rules/exit_rules when present, converting the legacy fields itself otherwise).
+    const tradeRules = legacyToTradeRules(
+      prunedBuy, allowShort ? effectiveSellEntryConditions : null,
+      prunedExit as unknown as Parameters<typeof legacyToTradeRules>[2],
+      entryActions as unknown as Parameters<typeof legacyToTradeRules>[3],
+    );
+
     try {
       setRunning(true);
       setError(null);
@@ -1605,6 +1661,12 @@ const Backtesting: React.FC = () => {
             initial_capital: initialCapital,
             commission,
             slippage,
+            // UNIFIED RULE MODEL (preferred by the backend when present): the concrete
+            // TradeRule lists — one entry rule per OR branch (base gates explicit, bracket
+            // replicated per rule), exit rows lifted to one-action rules.
+            entry_rules: tradeRules.entry_rules,
+            exit_rules: tradeRules.exit_rules,
+            // Legacy fields (kept for the strategy_params display mirror + older readers).
             buy_entry_conditions: buyEntryConditions,
             sell_entry_conditions: effectiveSellEntryConditions,
             enable_short: allowShort,  // seed symmetric short entry + RM sell gate when shorting on
@@ -2148,16 +2210,26 @@ const Backtesting: React.FC = () => {
       setSavingStrategy(true);
       setError(null);
 
+      // UNIFIED RULE MODEL: the canonical TradeRule lists (preferred by the backend when
+      // present — see app/api/strategies.py's _resolve_rule_lists).
+      const saveTradeRules = legacyToTradeRules(
+        serializeConditionTree(buyEntryConditions) as unknown as ConditionGroup,
+        allowShort ? (serializeConditionTree(sellEntryConditions) as unknown as ConditionGroup) : null,
+        exitConditions as unknown as Parameters<typeof legacyToTradeRules>[2],
+        entryActions as unknown as Parameters<typeof legacyToTradeRules>[3],
+      );
       const res = await fetch(`${API_BASE}/strategies`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           name: saveStrategyName,
           description: saveStrategyDescription || null,
-          // Serialize the entry trees so each leaf carries the snake_case optimize metadata
-          // (optimize / value_min/max/step / toggle_optimize / confirmation_bars_*) the
-          // optimizer's strategy_param_space reads. camelCase keys are preserved too so the
-          // editor round-trips on reload.
+          entry_rules: saveTradeRules.entry_rules,
+          exit_rules: saveTradeRules.exit_rules,
+          // Legacy fields kept for older readers. Serialize the entry trees so each leaf
+          // carries the snake_case optimize metadata (optimize / value_min/max/step /
+          // toggle_optimize / confirmation_bars_*) the optimizer's strategy_param_space
+          // reads. camelCase keys are preserved too so the editor round-trips on reload.
           buy_entry_conditions: serializeConditionTree(buyEntryConditions),
           // When "Allow short" is off, persist an empty short tree so the saved strategy is
           // long-only (and round-trips with allowShort=false on reload).

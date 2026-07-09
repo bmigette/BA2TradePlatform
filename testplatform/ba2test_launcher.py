@@ -1356,6 +1356,51 @@ def _build_strategy_S1(name: str, expert: str):
         sys.exit(f"optimize: S1 needs {path}; run `python backend/scripts/export_live_rulesets.py` first.")
     with open(path, encoding="utf-8") as f:
         data = _json.load(f)
+
+    # LOSSLESS file shape (re-exported via export_live_rulesets.py on the unified model):
+    # TradeRule lists carrying live's OWN per-rule brackets / multi-action rules /
+    # continue_processing / rule order. Preferred when present; the legacy tree shape below
+    # keeps working for older files.
+    if data.get("entry_rules"):
+        entry_rules = data["entry_rules"]
+        exit_rules = data.get("exit_rules") or []
+        # Unique condition ids across every rule (live restarts c0,c1,... per rule; the
+        # optimizer keys cond genes by bare id in ONE global namespace).
+        ctr = [0]
+        def _relabel(node):
+            if not isinstance(node, dict):
+                return
+            ctr[0] += 1
+            node["id"] = f"u{ctr[0]}"
+            for child in (node.get("conditions") or []):
+                _relabel(child)
+        for rule in entry_rules + exit_rules:
+            if isinstance(rule, dict) and rule.get("conditions"):
+                _relabel(rule["conditions"])
+        # Rules WITHOUT their own bracket get the default S1 target-anchored TP + entry SL
+        # (merged-S4 behavior); rules that brought live's own bracket keep it untouched.
+        for rule in entry_rules:
+            kinds = {str(a.get("action_type")) for a in (rule.get("actions") or [])
+                     if isinstance(a, dict)}
+            if "adjust_take_profit" not in kinds:
+                rule["actions"] = list(rule.get("actions") or []) + [
+                    {"id": "s1_tp_target", "action_type": "adjust_take_profit",
+                     "reference_value": "expert_target_price",
+                     "action_value": -5.0, "action_value_optimize": True,
+                     "action_value_min": -20.0, "action_value_max": 10.0,
+                     "action_value_step": 2.0, "toggle_optimize": True},
+                    {"id": "s1_sl_entry", "action_type": "adjust_stop_loss",
+                     "reference_value": "order_open_price",
+                     "action_value": -8.0, "action_value_optimize": True,
+                     "action_value_min": -20.0, "action_value_max": -3.0,
+                     "action_value_step": 2.0, "toggle_optimize": True},
+                ]
+            rule["toggle_optimize"] = True  # GA can retire a whole conviction tier
+        from app.models.strategy import Strategy
+        from ba2_common.core.rule_models import normalize_trade_rules
+        return Strategy(name=name, entry_rules=normalize_trade_rules(entry_rules),
+                        exit_rules=normalize_trade_rules(exit_rules))
+
     buy = _s1_norm_tree(data.get("buy_entry_conditions"))
     exits = [_s1_norm_exit_rule(r) for r in (data.get("exit_conditions") or [])]
     # Live rulesets reuse leaf ids (c0,c1,...) across every rule + the buy tree; the optimizer keys
