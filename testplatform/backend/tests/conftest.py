@@ -78,27 +78,28 @@ def db(gate_engine):
 
 @pytest.fixture
 def seed_strategy(db):
-    """A Strategy row with entry-time TP/SL under optimization — rides on entry_actions
-    (adjust_take_profit/adjust_stop_loss rules with action_value_optimize), NOT the deleted
-    initial_tp_*/initial_sl_* scalar fields."""
+    """A Strategy row with entry-time TP/SL under optimization — unified rule model
+    (migration 028): ONE entry TradeRule carrying buy + adjust_take_profit +
+    adjust_stop_loss actions with action_value_optimize."""
     from app.models.strategy import Strategy
 
     s = Strategy(
         name="gate-opt-test",
-        entry_actions=[
-            {
-                "id": "e_tp", "action_type": "adjust_take_profit",
-                "reference_value": "order_open_price", "action_value": 5.0,
-                "action_value_optimize": True,
-                "action_value_min": 2.0, "action_value_max": 12.0, "action_value_step": 1.0,
-            },
-            {
-                "id": "e_sl", "action_type": "adjust_stop_loss",
-                "reference_value": "order_open_price", "action_value": -2.0,
-                "action_value_optimize": True,
-                "action_value_min": -6.0, "action_value_max": -1.0, "action_value_step": 1.0,
-            },
-        ],
+        entry_rules=[{
+            "id": "bracket", "conditions": None, "continue_processing": False,
+            "actions": [
+                {"action_type": "buy"},
+                {"id": "e_tp", "action_type": "adjust_take_profit",
+                 "reference_value": "order_open_price", "action_value": 5.0,
+                 "action_value_optimize": True,
+                 "action_value_min": 2.0, "action_value_max": 12.0, "action_value_step": 1.0},
+                {"id": "e_sl", "action_type": "adjust_stop_loss",
+                 "reference_value": "order_open_price", "action_value": -2.0,
+                 "action_value_optimize": True,
+                 "action_value_min": -6.0, "action_value_max": -1.0, "action_value_step": 1.0},
+            ],
+        }],
+        exit_rules=[],
     )
     db.add(s)
     db.commit()

@@ -839,10 +839,48 @@ _SCREENER_CAP_BANDS = {
 }
 
 
+def _strategy_from_parts(name: str, buy_tree=None, exit_conditions=None, entry_actions=None):
+    """Build a Strategy row on the UNIFIED RULE MODEL (migration 028) from the launcher's
+    declarative legacy parts: the buy condition tree, single-action exit rows and the flat
+    entry-bracket list convert via the shared ``trade_rules_from_legacy`` (one entry TradeRule
+    per OR branch, base bullish+flat gates made explicit, bracket replicated per rule, exit
+    rows lifted to one-action rules) — semantically identical to what the old seeder did
+    implicitly, now explicit in the stored rules."""
+    from app.models.strategy import Strategy
+    from ba2_common.core.rule_models import trade_rules_from_legacy
+
+    converted = trade_rules_from_legacy(
+        buy_tree=buy_tree, entry_actions=entry_actions, exit_conditions=exit_conditions,
+    )
+    return Strategy(name=name, entry_rules=converted["entry_rules"],
+                    exit_rules=converted["exit_rules"])
+
+
+def _first_match_order(exit_conditions, order):
+    """Reorder exit rules for the engine's FIRST-MATCH semantics (a matching rule stops
+    evaluation unless continue_processing).
+
+    The post-tp/sl-rework S2/S3/S5 lists put the always-matching floor stop (condition: just
+    ``has_position``) FIRST — which silently shadowed every rule after it (take-profit, signal
+    closes, trailing tiers, time exit could never fire). Correct first-match layout: signal/
+    profit CLOSES first (they only match on their trigger), trailing tiers DEEPEST-first (the
+    most aggressive applicable stop wins), break-even lock next, and the always-matching floor
+    stop LAST as the pure fallback. ``order`` lists rule ids in the intended sequence; ids not
+    listed keep their relative order after the listed ones (fail-loud on a listed id that
+    doesn't exist, so a renamed rule can't silently fall out of order)."""
+    by_id = {r.get("id"): r for r in exit_conditions if isinstance(r, dict)}
+    missing = [rid for rid in order if rid not in by_id]
+    if missing:
+        raise ValueError(f"_first_match_order: unknown exit rule id(s) {missing}")
+    ordered = [by_id[rid] for rid in order]
+    ordered += [r for r in exit_conditions
+                if isinstance(r, dict) and r.get("id") not in set(order)]
+    return ordered
+
+
 def _build_strategy_row(name: str):
     """A Strategy whose TP/SL + the 5 classic-RM params (the RM's sizing/stop conditions &
     actions) are marked optimizable with ranges — the numeric RM space the optimizer searches."""
-    from app.models.strategy import Strategy
     # Entry-gate tree: confidence + expected-profit thresholds, each value-optimizable AND
     # on/off-toggleable. The engine builds the enter ruleset from this (seed_ruleset_from_tree),
     # so these are the optimizer's "RM/entry conditions" — tuned thresholds + steps turned on/off.
@@ -914,20 +952,15 @@ def _build_strategy_row(name: str):
              {"id": "xt", "field": "days_opened", "op": ">", "value": 60,
               "optimize": True, "value_min": 20, "value_max": 120, "value_step": 20}]}},
     ]
-    return Strategy(
-        name=name,
-        buy_entry_conditions=buy_entry_conditions,
-        exit_conditions=exit_conditions,
-        # No global TP/SL brackets — exits are 100% condition-driven, matching the live engine
-        # (which attaches no baseline bracket on entry). TP = the exit_takeprofit CLOSE rule; SL =
-        # the exit_stoploss adjust_stop_loss rule above (both optimized + toggleable).
-        # No entry_actions either (the old initial_tp_percent/initial_sl_percent scalar fields
-        # are gone from the Strategy model entirely). SL is placed by the max-risk SAFEGUARD on
-        # entry (min ATR×mult / risk%, floored at min_stop_loss_pct — shared classic RM, so
-        # backtest == live); TP comes from the exit CONDITIONS (S4 anchors on the analyst target
-        # via entry_actions; S1's live ruleset trails). No bracket masks the conditions — the
-        # safeguard fires exactly like live.
-    )
+    # No entry bracket — exits are 100% condition-driven, matching the live engine. SL is
+    # placed by the max-risk SAFEGUARD on entry (shared classic RM, so backtest == live).
+    # FIRST-MATCH order: closes first, lock next, always-matching floor stop LAST (it used to
+    # sit first and shadowed every other exit rule — see _first_match_order).
+    exit_conditions = _first_match_order(exit_conditions, [
+        "exit_bearish", "exit_downgrade", "exit_takeprofit", "exit_time",
+        "exit_belock", "exit_stoploss"])
+    return _strategy_from_parts(name, buy_tree=buy_entry_conditions,
+                                exit_conditions=exit_conditions)
 
 
 # S2 is the canonical "bracket + light exits" strategy above; alias it for the strategy grid.
@@ -985,19 +1018,14 @@ def _build_strategy_S3(name: str):
              {"id": "xt", "field": "days_opened", "op": ">", "value": 90,
               "optimize": True, "value_min": 30, "value_max": 150, "value_step": 30}]}},
     ]
-    return Strategy(
-        name=name,
-        buy_entry_conditions=buy_entry_conditions,
-        exit_conditions=exit_conditions,
-        # No global TP/SL brackets — exits are 100% condition-driven (matches live). The protective
-        # stop is the exit_stoploss adjust_stop_loss rule above; the trailing tiers ratchet it up.
-        # No entry_actions either (the old initial_tp_percent/initial_sl_percent scalar fields
-        # are gone from the Strategy model entirely). SL is placed by the max-risk SAFEGUARD on
-        # entry (min ATR×mult / risk%, floored at min_stop_loss_pct — shared classic RM, so
-        # backtest == live); TP comes from the exit CONDITIONS (S4 anchors on the analyst target
-        # via entry_actions; S1's live ruleset trails). No bracket masks the conditions — the
-        # safeguard fires exactly like live.
-    )
+    # No entry bracket — exits are 100% condition-driven (matches live); the protective stop
+    # is the exit_stoploss rule and the trailing tiers ratchet it up. FIRST-MATCH order: time
+    # close first, tiers DEEPEST-first (t1 first used to win at ANY profit level, so t2/t3
+    # never applied), floor stop LAST (it used to sit first and shadowed everything).
+    exit_conditions = _first_match_order(exit_conditions, [
+        "exit_time", "trail_t3", "trail_t2", "trail_t1", "exit_stoploss"])
+    return _strategy_from_parts(name, buy_tree=buy_entry_conditions,
+                                exit_conditions=exit_conditions)
 
 
 def _build_strategy_S5(name: str):
@@ -1065,8 +1093,13 @@ def _build_strategy_S5(name: str):
              {"id": "xcap", "field": "profit_loss_percent", "op": ">", "value": 60,
               "optimize": True, "value_min": 40, "value_max": 80, "value_step": 5}]}},
     ]
-    return Strategy(name=name, buy_entry_conditions=buy_entry_conditions,
-                    exit_conditions=exit_conditions)
+    # FIRST-MATCH order: signal closes + wide cap first, trailing tiers DEEPEST-first,
+    # break-even lock, always-matching floor stop LAST (see _first_match_order).
+    exit_conditions = _first_match_order(exit_conditions, [
+        "exit_bearish", "exit_downgrade", "exit_cap", "trail_t3", "trail_t2", "trail_t1",
+        "exit_belock", "exit_stoploss"])
+    return _strategy_from_parts(name, buy_tree=buy_entry_conditions,
+                                exit_conditions=exit_conditions)
 
 
 def _build_strategy_S6(name: str):
@@ -1114,63 +1147,64 @@ def _build_strategy_S6(name: str):
              {"id": "xt", "field": "days_opened", "op": ">", "value": 20,
               "optimize": True, "value_min": 10, "value_max": 30, "value_step": 5}]}},
     ]
-    return Strategy(name=name, buy_entry_conditions=buy_entry_conditions,
-                    exit_conditions=exit_conditions, entry_actions=entry_actions)
+    return _strategy_from_parts(name, buy_tree=buy_entry_conditions,
+                                exit_conditions=exit_conditions, entry_actions=entry_actions)
 
 
 def _build_strategy_S7(name: str):
-    """S7 — REFINEMENT around the best -goal result found to date: the archived pre-tp/sl-rework
-    S2-large winner (backtest #91, opt 23: 186.53% return, 181.07% adjusted, 149 trades/49.78
-    per yr, calmar 3.66, dd -11.52% -- reproduced byte-identically against today's code, so the
-    peak is real and still reachable, just not rediscovered by a fresh S2 search).
+    """S7 — FAITHFUL REPLICA of the archived pre-tp/sl-rework S2-large winner (backtest #91,
+    opt 23: 186.53% return, 181.07% adjusted, 149 trades/49.78 per yr, calmar 3.66, dd -11.52%
+    -- reproduced byte-identically against today's code, so the peak is real).
 
-    Unlike S2 (wide, general-purpose ranges), S7 mirrors that winner's EXACT structure and
-    NARROWS every range to a tight neighborhood around its winning values, so a SMALL
-    population/generations budget is enough to fine-tune rather than re-explore from scratch:
-      - entry gate: ONLY the cooldown the winner used (days_since_last_profitable_close), no
-        confidence/expected-profit gate at all (the winner had both disabled -- omitted here
-        entirely rather than carried as dead toggleable weight).
-      - TP/SL AT ENTRY (entry_actions, the same Phase-1.5 mechanism S4 uses): the winner's
-        exit_conditions-based stop/take-profit only get evaluated on the daily manage schedule,
-        leaving a position UNPROTECTED between fill and the first scheduled check. entry_actions
-        fire in the SAME step as order creation, so the bracket is live from the moment of fill --
-        a genuine improvement over the winner's design, not just a replica of it. Narrow ranges
-        centered on the winning +32% TP / -8% SL.
-      - exit_belock: kept as an exit_condition (not entry_actions) because it's a DYNAMIC
-        ratchet -- it needs to re-fire as profit accrues, which a one-time entry action can't do.
-        Narrow range around the winning +4%-at-+16%.
-      - exit_bearish / exit_downgrade: same signal exits the winner used.
+    The FIRST S7 (58% max across only 21 distinct genomes) failed because it was NOT a replica:
+    it swapped the winner's schedule-evaluated exit-condition TP/SL for an immediate entry-time
+    hard bracket (a -8% stop live from the fill cuts volatile large-cap winners the winner's
+    schedule-checked stop tolerated), dropped the confidence/expected-profit gates entirely, and
+    its narrow steps collapsed the GA into near-total duplication. This rebuild restores the
+    winner's exact structure:
+      - entry: the cooldown gate the winner used (days_since_last_profitable_close) PLUS the
+        confidence/expected-profit gates as TOGGLEABLE (the winner ran them disabled — carrying
+        them lets the GA rediscover that rather than forcing it), NO entry-time bracket.
+      - exits, ordered for the engine's FIRST-MATCH semantics (a matching rule stops evaluation
+        unless continue_processing — so an always-matching floor stop placed first would shadow
+        every rule after it, which is exactly what the post-rework S2/S3/S5 lists did):
+          1-2. signal closes (bearish / downgrade) — match only on signal, shadow nothing;
+          3.   fixed take-profit CLOSE at +32% (the winner's ceiling), value searched 24..42;
+          4.   break-even lock: at +16% profit move the stop to entry +4% (dynamic ratchet);
+          5.   floor stop entry -8% LAST — the always-matching fallback protects only when no
+               deeper rule applied.
       - no exit_time (the winner had it disabled).
-    Meant to run with a much smaller --population/--generations than the broad-search strategies
-    (see run_screener_capband_matrix.py's per-strategy override) -- this is fine-tuning around a
-    known point, not exploring a 20-dimensional space from a cold start.
+    Ranges are wide enough to actually search (step-1 cooldown, step-2 TP/SL/lock => thousands
+    of distinct genomes, not 21) — see run_screener_capband_matrix.py's budget override.
     """
-    from app.models.strategy import Strategy
     buy_entry_conditions = {
         "id": "root", "type": "AND", "conditions": [
             {"id": "gate_days_since_profit", "field": "days_since_last_profitable_close", "op": ">",
-             "value": 5, "optimize": True, "value_min": 2, "value_max": 10, "value_step": 1},
+             "value": 5, "optimize": True, "value_min": 2, "value_max": 10, "value_step": 1,
+             "toggle_optimize": True},
+            # The winner ran with BOTH of these disabled; keep them toggleable so the GA can
+            # verify that finding instead of us hard-coding it.
+            {"id": "gate_confidence", "field": "confidence", "op": ">", "value": 50,
+             "optimize": True, "value_min": 40, "value_max": 80, "value_step": 5,
+             "toggle_optimize": True},
+            {"id": "gate_expected_profit", "field": "expected_profit", "op": ">", "value": 3,
+             "optimize": True, "value_min": 0, "value_max": 15, "value_step": 1,
+             "toggle_optimize": True},
         ],
     }
-    entry_actions = [
-        # TP/SL set the instant the order fills (Phase 1.5) -- closes the "unprotected until the
-        # next scheduled exit-check" gap the winner's exit-condition-only design had.
-        {"id": "entry_tp", "action_type": "adjust_take_profit", "reference_value": "order_open_price",
-         "action_value": 32.0, "action_value_optimize": True,
-         "action_value_min": 24.0, "action_value_max": 42.0, "action_value_step": 3.0,
-         "toggle_optimize": True},
-        {"id": "entry_sl", "action_type": "adjust_stop_loss", "reference_value": "order_open_price",
-         "action_value": -8.0, "action_value_optimize": True,
-         "action_value_min": -14.0, "action_value_max": -4.0, "action_value_step": 2.0,
-         "toggle_optimize": True},
-    ]
     exit_conditions = [
+        # Signal closes FIRST (first-match: they only match on their signal, shadow nothing).
         {"id": "exit_bearish", "action_type": "close", "toggle_optimize": True,
          "conditions": {"type": "AND", "conditions": [{"id": "xb", "field": "bearish"}]}},
         {"id": "exit_downgrade", "action_type": "close", "toggle_optimize": True,
          "conditions": {"type": "AND", "conditions": [{"id": "xd", "field": "current_rating_negative"}]}},
-        # DYNAMIC ratchet -- re-fires as profit grows, so it stays an exit_condition (entry_actions
-        # only fire once, at entry).
+        # The winner's fixed +32% take-profit as the schedule-evaluated CLOSE it actually was.
+        {"id": "exit_takeprofit", "action_type": "close", "toggle_optimize": True,
+         "conditions": {"type": "AND", "conditions": [
+             {"id": "xtp", "field": "profit_loss_percent", "op": ">", "value": 32,
+              "optimize": True, "value_min": 24, "value_max": 42, "value_step": 2}]}},
+        # Break-even lock BEFORE the floor stop: at +16% the stop ratchets to entry +4%; while
+        # it matches, first-match picks it over the floor (the tighter, correct stop).
         {"id": "exit_belock", "action_type": "adjust_stop_loss", "reference_value": "order_open_price",
          "action_value": 4.0, "action_value_optimize": True,
          "action_value_min": 0.0, "action_value_max": 8.0, "action_value_step": 1.0,
@@ -1178,9 +1212,19 @@ def _build_strategy_S7(name: str):
          "conditions": {"type": "AND", "conditions": [
              {"id": "xlk", "field": "profit_loss_percent", "op": ">", "value": 16,
               "optimize": True, "value_min": 10, "value_max": 22, "value_step": 2}]}},
+        # Floor stop LAST — always matches while holding, so anywhere earlier it would shadow
+        # every rule after it. As the final fallback it protects exactly when nothing else did.
+        # TOGGLEABLE (unlike S2/S3's always-on floors): the WINNER ran with NO floor rule at
+        # all — its downside protection was the RM max-risk safeguard stop, which is ALWAYS
+        # placed on entry regardless, so disabling this never leaves a position unprotected.
+        {"id": "exit_stoploss", "action_type": "adjust_stop_loss", "reference_value": "order_open_price",
+         "action_value": -8.0, "action_value_optimize": True,
+         "action_value_min": -14.0, "action_value_max": -4.0, "action_value_step": 2.0,
+         "toggle_optimize": True,
+         "conditions": {"type": "AND", "conditions": [{"id": "sl_hold", "field": "has_position"}]}},
     ]
-    return Strategy(name=name, buy_entry_conditions=buy_entry_conditions,
-                    exit_conditions=exit_conditions, entry_actions=entry_actions)
+    return _strategy_from_parts(name, buy_tree=buy_entry_conditions,
+                                exit_conditions=exit_conditions)
 
 
 def _build_strategy_minimal(name: str):
@@ -1188,7 +1232,7 @@ def _build_strategy_minimal(name: str):
     rebalance by factor score. The optimization still needs a Strategy row; this one carries no
     conditions and no TP/SL genes — all search lives in the expert's factor model:* params."""
     from app.models.strategy import Strategy
-    return Strategy(name=name, buy_entry_conditions=None, exit_conditions=[])
+    return Strategy(name=name, entry_rules=[], exit_rules=[])
 
 
 # --- S1: the expert's LIVE ruleset (exported JSON), normalized to the launcher's canonical shape ---
@@ -1322,17 +1366,15 @@ def _build_strategy_S1(name: str, expert: str):
     # NOTE: the launcher's Strategy has no separate sell tree — shorts are mirrored from the buy
     # gates via the engine's enable_short flag. The live sell_entry_conditions (if any) is dropped;
     # these experts are long-only in practice, so S1 runs long.
-    strat = Strategy(
-        name=name,
-        buy_entry_conditions=buy,
-        exit_conditions=exits,
-    )
-    # Entry-time TP/SL bracket mirroring the live "high conviction" ruleset (was BUGGED — S1 used
-    # to drop the enter ruleset's adjust_take_profit/adjust_stop_loss entry actions entirely). Both
-    # GA-toggleable so the optimizer can disable either. The target-anchored TP is centred on the
-    # live value (-5% below the analyst target) and searched as an offset-from-target (negative =
-    # below target); the entry SL is anchored off the fill price. Merged from the old S4.
-    strat.entry_actions = [
+    #
+    # Entry-time TP/SL bracket mirroring the live "high conviction" ruleset. Both GA-toggleable
+    # so the optimizer can disable either. The target-anchored TP is centred on the live value
+    # (-5% below the analyst target) and searched as an offset-from-target (negative = below
+    # target); the entry SL is anchored off the fill price. Merged from the old S4. On the
+    # unified rule model the bracket is replicated onto EVERY entry rule (one per live OR
+    # branch) — each branch's copy optimizes via its own entry:<rid>:a<i>:* genes, live's
+    # per-tier-bracket shape.
+    entry_actions = [
         {"id": "s1_tp_target", "action_type": "adjust_take_profit",
          "reference_value": "expert_target_price",
          "action_value": -5.0, "action_value_optimize": True,
@@ -1344,16 +1386,109 @@ def _build_strategy_S1(name: str, expert: str):
          "action_value_min": -20.0, "action_value_max": -3.0, "action_value_step": 2.0,
          "toggle_optimize": True},
     ]
+    strat = _strategy_from_parts(name, buy_tree=buy, exit_conditions=exits,
+                                 entry_actions=entry_actions)
+    # NEW-STRUCTURE upgrade: each entry rule (one per live conviction tier / OR branch) is
+    # GA-droppable as a WHOLE (rule-level toggle -> entry:<rid>:enabled gene) — the old split
+    # model could only toggle individual leaves, never retire a tier outright. Combined with
+    # the per-rule bracket genes this lets the GA discover e.g. "the fallback tier hurts" or
+    # "tier 3 wants a looser stop than tier 1".
+    for rule in strat.entry_rules:
+        rule["toggle_optimize"] = True
     return strat
 
 
-# S4 is MERGED into S1 (target-anchored entry TP is now an S1 entry_action). The builder is kept
-# as a thin deprecated alias so any external reference still resolves to the merged strategy, but
-# S4 is REMOVED from _STRATEGY_BUILDERS below so it is no longer selectable in the grid.
-def _build_strategy_S4(name: str, expert: str):
-    """DEPRECATED — S4 merged into S1 (S1 now carries the target-anchored entry take-profit as a
-    GA-toggleable entry_action). Retained only as an alias; not registered in _STRATEGY_BUILDERS."""
-    return _build_strategy_S1(name, expert)
+# S4 (REBORN, 2026-07-09): the old target-anchored-TP S4 was merged into S1. This NEW S4 is a
+# STRUCTURE-NATIVE explorer for the two capabilities only the unified rule model can express:
+#   1. MULTI-ACTION tier rules — each profit tier ratchets the STOP up AND extends the TP
+#      ceiling in ONE rule (one action per rule was a hard limit before), so winners keep
+#      running while the downside locks in.
+#   2. continue_processing — the TP-follow rule (raise the TP when the analyst target moves
+#      up) fires AND lets evaluation continue to the SL ladder in the same cycle; under pure
+#      first-match it would shadow the ratchet every cycle the target moved.
+def _build_strategy_S4(name: str):
+    """S4 — structure-native trailing: multi-action tiers (SL ratchet + TP extension per
+    tier) + a continue_processing TP-follow on target raises + the S7-replica entry/signal
+    core. Exit order honors first-match: signal closes first, TP-follow (continue=True),
+    tiers DEEPEST-first, toggleable floor stop LAST. Everything optimizable/toggleable."""
+    from app.models.strategy import Strategy
+    from ba2_common.core.rule_models import normalize_trade_rules
+
+    entry_rules = [{
+        "id": "s4-entry", "name": f"{name}-entry",
+        "conditions": {"id": "root", "type": "AND", "conditions": [
+            {"id": "s4-bullish", "field": "bullish", "field_type": "flag"},
+            {"id": "s4-flat", "field": "has_no_position", "field_type": "flag"},
+            {"id": "gate_days_since_profit", "field": "days_since_last_profitable_close",
+             "op": ">", "value": 5, "optimize": True, "value_min": 2, "value_max": 10,
+             "value_step": 1, "toggle_optimize": True},
+            {"id": "gate_confidence", "field": "confidence", "op": ">", "value": 50,
+             "optimize": True, "value_min": 40, "value_max": 80, "value_step": 5,
+             "toggle_optimize": True},
+        ]},
+        "actions": [{"action_type": "buy"}],
+        "continue_processing": False,
+    }]
+
+    def _tier(rid, gate, gate_rng, sl_lock, sl_rng, tp_ext, tp_rng):
+        """One multi-action tier: at profit > gate, move SL to entry+sl_lock AND TP to
+        entry+tp_ext — both values optimizable, whole tier toggleable."""
+        return {
+            "id": rid, "toggle_optimize": True, "continue_processing": False,
+            "conditions": {"type": "AND", "conditions": [
+                {"id": f"{rid}_gate", "field": "profit_loss_percent", "op": ">",
+                 "value": gate, "optimize": True,
+                 "value_min": gate_rng[0], "value_max": gate_rng[1], "value_step": gate_rng[2]}]},
+            "actions": [
+                {"id": f"{rid}_sl", "action_type": "adjust_stop_loss",
+                 "reference_value": "order_open_price", "action_value": sl_lock,
+                 "action_value_optimize": True, "action_value_min": sl_rng[0],
+                 "action_value_max": sl_rng[1], "action_value_step": sl_rng[2]},
+                {"id": f"{rid}_tp", "action_type": "adjust_take_profit",
+                 "reference_value": "order_open_price", "action_value": tp_ext,
+                 "action_value_optimize": True, "action_value_min": tp_rng[0],
+                 "action_value_max": tp_rng[1], "action_value_step": tp_rng[2],
+                 "toggle_optimize": True},
+            ],
+        }
+
+    exit_rules = [
+        # Signal closes FIRST (match only on their trigger, shadow nothing).
+        {"id": "exit_bearish", "toggle_optimize": True, "continue_processing": False,
+         "conditions": {"type": "AND", "conditions": [{"id": "xb", "field": "bearish"}]},
+         "actions": [{"action_type": "close"}]},
+        {"id": "exit_downgrade", "toggle_optimize": True, "continue_processing": False,
+         "conditions": {"type": "AND", "conditions": [{"id": "xd", "field": "current_rating_negative"}]},
+         "actions": [{"action_type": "close"}]},
+        # TP-FOLLOW with continue_processing: when the analyst target moved up >X% vs the
+        # current TP, raise the TP toward the new target — and KEEP EVALUATING so the SL
+        # ladder below still ratchets in the same cycle (pure first-match would shadow it).
+        {"id": "tp_follow", "toggle_optimize": True, "continue_processing": True,
+         "conditions": {"type": "AND", "conditions": [
+             {"id": "tf_gate", "field": "percent_to_new_target", "op": ">", "value": 5,
+              "optimize": True, "value_min": 2, "value_max": 12, "value_step": 2}]},
+         "actions": [
+             {"id": "tf_tp", "action_type": "adjust_take_profit",
+              "reference_value": "expert_target_price", "action_value": -5.0,
+              "action_value_optimize": True, "action_value_min": -15.0,
+              "action_value_max": 5.0, "action_value_step": 2.0}]},
+        # Multi-action tiers, DEEPEST-first (first-match picks the most aggressive
+        # applicable tier; both its actions fire).
+        _tier("tier3", 30, (22, 40, 3), 20.0, (14.0, 26.0, 2.0), 50.0, (38.0, 60.0, 4.0)),
+        _tier("tier2", 18, (12, 26, 2), 10.0, (6.0, 16.0, 2.0), 36.0, (28.0, 44.0, 4.0)),
+        _tier("tier1", 8, (4, 14, 2), 2.0, (-2.0, 6.0, 1.0), 28.0, (20.0, 34.0, 2.0)),
+        # Floor stop LAST (always matches while holding); toggleable — the RM max-risk
+        # safeguard stop is always placed regardless, so off never means unprotected.
+        {"id": "exit_stoploss", "toggle_optimize": True, "continue_processing": False,
+         "conditions": {"type": "AND", "conditions": [{"id": "sl_hold", "field": "has_position"}]},
+         "actions": [
+             {"id": "floor_sl", "action_type": "adjust_stop_loss",
+              "reference_value": "order_open_price", "action_value": -8.0,
+              "action_value_optimize": True, "action_value_min": -14.0,
+              "action_value_max": -4.0, "action_value_step": 2.0}]},
+    ]
+    return Strategy(name=name, entry_rules=normalize_trade_rules(entry_rules),
+                    exit_rules=normalize_trade_rules(exit_rules))
 
 
 # --- Option strategy entry-action configs (pure-option entries) -----------------------------------
@@ -1452,22 +1587,31 @@ def _option_exit_rules(kind: str):
 
 
 def _build_strategy_option(kind: str):
-    """A pure-option Strategy: ``entry_action`` = the option action config (carried as a transient
-    in-memory attribute on the SQLAlchemy Strategy instance — it is NOT a mapped column, so it is
-    never persisted; the launcher reads it back via ``getattr`` and threads it into the run config);
-    exit = close at +50% / time. No equity TP/SL brackets (the option closes via close_option)."""
+    """A pure-option Strategy on the unified rule model: ONE entry TradeRule whose action IS
+    the option action config (bullish+flat+confidence gate; no equity leg — the engine's
+    entry-option path submits the option directly), exits = close at +50% / time. The option
+    action config is ALSO carried as the transient ``entry_action`` attribute (not a mapped
+    column, never persisted): the run-config assembly threads it into the backtest block,
+    where the engine's ``_entry_is_option`` flag keys off ``config["entry_action"]``."""
     from app.models.strategy import Strategy
-    s = Strategy(
-        name=kind,
-        buy_entry_conditions={"id": "root", "type": "AND", "conditions": [
+    from ba2_common.core.rule_models import normalize_trade_rules, trade_rules_from_legacy
+
+    option_action = _option_entry_action_for(kind)
+    entry_rules = normalize_trade_rules([{
+        "id": f"{kind.lower()}-entry",
+        "name": f"{kind}-entry",
+        "conditions": {"id": "root", "type": "AND", "conditions": [
+            {"id": "opt-bullish", "field": "bullish", "field_type": "flag"},
+            {"id": "opt-flat", "field": "has_no_position", "field_type": "flag"},
             {"id": "gate_confidence", "field": "confidence", "op": ">", "value": 50,
              "optimize": True, "value_min": 40, "value_max": 75, "value_step": 5,
              "toggle_optimize": True}]},
-        exit_conditions=_option_exit_rules(kind),
-    )
-    # Carry the entry option action so the run-config assembly picks it up (transient attr; not
-    # a mapped column => not persisted, survives db.refresh which only reloads mapped columns).
-    s.entry_action = _option_entry_action_for(kind)  # type: ignore[attr-defined]
+        "actions": [option_action],
+        "continue_processing": False,
+    }])
+    exit_rules = trade_rules_from_legacy(exit_conditions=_option_exit_rules(kind))["exit_rules"]
+    s = Strategy(name=kind, entry_rules=entry_rules, exit_rules=exit_rules)
+    s.entry_action = option_action  # type: ignore[attr-defined]
     return s
 
 
@@ -1476,11 +1620,13 @@ def _build_strategy_covered_call(kind: str):
     (sell a ~5% OTM call against the held shares). Equity-entry, so NO entry_action."""
     from app.models.strategy import Strategy  # noqa: F401 — keep import parity with siblings
     s = _build_strategy_S2(kind)  # reuse equity entry + base exits
-    s.exit_conditions = list(s.exit_conditions or []) + [{
-        "id": "cc_sell", "action_type": "sell_covered_call",
-        "option_strike_method": "percent_otm", "option_strike_param": 5.0,
-        "option_dte_min": 25, "option_dte_max": 45,
-        "conditions": {"type": "AND", "conditions": [{"id": "cc_hold", "field": "has_position"}]}}]
+    s.exit_rules = list(s.exit_rules or []) + [{
+        "id": "cc_sell",
+        "conditions": {"type": "AND", "conditions": [{"id": "cc_hold", "field": "has_position"}]},
+        "actions": [{"action_type": "sell_covered_call",
+                     "option_strike_method": "percent_otm", "option_strike_param": 5.0,
+                     "option_dte_min": 25, "option_dte_max": 45}],
+        "continue_processing": False}]
     return s
 
 
@@ -1494,7 +1640,9 @@ _STRATEGY_BUILDERS = {
                                 #                  bracket (target-anchored TP, merged from S4)
     "S2": _build_strategy_S2,   # (name)
     "S3": _build_strategy_S3,   # (name)
-    # S4 MERGED into S1 (its target-anchored entry TP is now an S1 entry_action) — no longer selectable.
+    "S4": _build_strategy_S4,   # (name) — structure-native explorer: multi-action trailing tiers
+                                #          (SL ratchet + TP extension per tier) + continue_processing
+                                #          TP-follow on target raises
     "S5": _build_strategy_S5,   # (name) — S2/S3 hybrid: signal exits + trailing ladder
     "S6": _build_strategy_S6,   # (name) — high-frequency quick-cycle (tight TP/SL AT ENTRY + time exit)
     "S7": _build_strategy_S7,   # (name) — tight refinement around the archived 186% S2-large winner
@@ -1517,9 +1665,6 @@ def _build_strategy(kind: str, name: str, expert: str):
     """Dispatch to the right strategy builder. S1 is expert-specific (loads the live JSON).
     Option/equity strategies (O_*) dispatch by `kind` (the builder names the Strategy off the kind
     and, for pure-option kinds, carries the entry_action)."""
-    if kind == "S4":
-        sys.exit("optimize: S4 is merged into S1 (target-anchored entry TP is now an S1 "
-                 "entry_action, GA-toggleable). Use S1 instead.")
     if kind == "S1":
         return _STRATEGY_BUILDERS[kind](name, expert)
     if kind in _OPTION_STRATEGY_KEYS:
@@ -2020,18 +2165,13 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
             # by the trial's UNIQUE backtest_id, so concurrent re-runs never collide.
             trial_cfg["persist_trading_db"] = True
             strategy_params = dict(params)
-            if decoded.get("buy_tree") is not None:
-                strategy_params["buyEntryConditions"] = decoded["buy_tree"]
-            if decoded.get("sell_tree") is not None:
-                strategy_params["sellEntryConditions"] = decoded["sell_tree"]
-            if decoded.get("exit_rules") is not None:
-                strategy_params["exitConditions"] = decoded["exit_rules"]
+            # Unified rule model (migration 028): the CONCRETE decoded TradeRule lists that
+            # actually ran (genes applied, disabled rules/actions pruned) — what Load/export
+            # restores.
             if decoded.get("entry_rules") is not None:
-                strategy_params["entryActions"] = decoded["entry_rules"]
-            if decoded.get("tp") is not None:
-                strategy_params["initialTpPercent"] = decoded["tp"]
-            if decoded.get("sl") is not None:
-                strategy_params["initialSlPercent"] = decoded["sl"]
+                strategy_params["entryRules"] = decoded["entry_rules"]
+            if decoded.get("exit_rules") is not None:
+                strategy_params["exitRules"] = decoded["exit_rules"]
             specs.append((rank, trial_cfg, strategy_params))
 
         # 2) Run the re-runs (the slow part) and persist each as a tagged, saved Backtest the moment

@@ -59,6 +59,9 @@ __all__ = [
     "groups_to_tree",
     "live_export_to_strategy",
     "strategy_to_live_export",
+    "live_export_to_trade_rules",
+    "trade_rules_to_live_export",
+    "live_actions_from_trade_rule",
 ]
 
 
@@ -325,8 +328,205 @@ def live_export_to_strategy(payload: dict) -> dict:
     }
 
 
-def _entry_rule(name: str, side_action: str, tree: dict, order_index: int) -> Optional[dict]:
-    """Build one enter_market export rule from a condition tree, or None if it has no triggers."""
+# ---------------------------------------------------------------------------
+# Unified TradeRule converters (EventAction-shaped, LOSSLESS in both directions).
+# Unlike live_export_to_strategy/strategy_to_live_export (the legacy split-shape pair kept
+# for not-yet-migrated callers), these preserve EVERY action on a rule, the rule ORDER, and
+# ``continue_processing`` — a live ruleset round-trips byte-equivalently.
+# ---------------------------------------------------------------------------
+def _live_action_to_action_cfg(cfg: dict) -> Optional[dict]:
+    """One live EventAction actions-cfg entry -> canonical ActionCfg dict, or None if the
+    action_type is unknown (skipped, so a partial/edited file still converts)."""
+    at = cfg.get("action_type") or cfg.get("type")
+    if at not in ACTION_VALUES:
+        return None
+    out: dict = {"action_type": at}
+    # Preserve everything else the live cfg carries (option selection params, etc.).
+    for k, v in cfg.items():
+        if k in ("action_type", "type", "value", "reference_value"):
+            continue
+        out[k] = v
+    if cfg.get("reference_value") is not None:
+        out["reference_value"] = cfg["reference_value"]
+    if cfg.get("value") is not None:
+        out["action_value"] = cfg["value"]
+    if at in ADJUST_ACTIONS:
+        av = cfg.get("value")
+        amin, amax, astep = opt_range(av)
+        out.setdefault("action_value_optimize", True)
+        out.setdefault("action_value_min", amin)
+        out.setdefault("action_value_max", amax)
+        out.setdefault("action_value_step", astep)
+    return out
+
+
+def live_export_to_trade_rules(payload: dict) -> dict:
+    """Convert a live ruleset EXPORT FILE into unified TradeRule lists — LOSSLESS.
+
+    Returns ``{"entry_rules": [...], "exit_rules": [...], "summary": {...}}`` where each rule
+    is the canonical TradeRule shape (conditions tree + ORDERED actions list +
+    continue_processing). Every action on a rule survives (open + adjust_* brackets,
+    stop_processing guards, multi-action exits), rule order follows ``order_index`` when
+    present, and numeric leaves / adjust values get default optimize ranges. Routing by
+    effective subtype matches ``live_export_to_strategy``.
+    """
+    from ba2_common.core.rule_models import normalize_trade_rules
+
+    entry_rules: List[dict] = []
+    exit_rules: List[dict] = []
+    n_rulesets = n_rules = skipped = 0
+
+    for rs in _iter_export_rulesets(payload or {}):
+        n_rulesets += 1
+        rs_sub = rs.get("subtype")
+        rules = [r for r in (rs.get("rules") or []) if isinstance(r, dict)]
+        rules.sort(key=lambda r: (r.get("order_index") is None, r.get("order_index", 0)))
+        for ridx, rule in enumerate(rules):
+            n_rules += 1
+            subtype = rule.get("subtype") or rs_sub
+            triggers = rule.get("triggers") or {}
+            actions = rule.get("actions") or {}
+            name = rule.get("name") or f"rule-{ridx}"
+            ea_id = rule.get("order_index", ridx)
+
+            action_list = []
+            for cfg in actions.values():
+                if isinstance(cfg, dict):
+                    converted = _live_action_to_action_cfg(cfg)
+                    if converted is not None:
+                        action_list.append(converted)
+            if not action_list:
+                skipped += 1
+                continue
+
+            leaves = _leaves_from_triggers(triggers)
+            conditions = (
+                {"id": f"grp-{ea_id}", "operator": "AND", "conditions": leaves}
+                if leaves else None
+            )
+            tr = {
+                "id": f"live-{ea_id}",
+                "name": name,
+                "conditions": conditions,
+                "actions": action_list,
+                "continue_processing": bool(rule.get("continue_processing", False)),
+                "toggle_optimize": True,
+            }
+            if subtype == AnalysisUseCase.OPEN_POSITIONS.value or (
+                subtype is None and entry_action_side(actions) is None
+            ):
+                exit_rules.append(tr)
+            else:
+                entry_rules.append(tr)
+
+    return {
+        "entry_rules": normalize_trade_rules(entry_rules),
+        "exit_rules": normalize_trade_rules(exit_rules),
+        "summary": {
+            "rulesets": n_rulesets,
+            "rules": n_rules,
+            "entry_rules": len(entry_rules),
+            "exit_rules": len(exit_rules),
+            "skipped_rules": skipped,
+        },
+    }
+
+
+def _action_cfg_to_live(action: dict, key: str) -> Optional[Dict[str, dict]]:
+    """One canonical ActionCfg -> a live actions-dict entry. Open (buy/sell) and
+    stop_processing actions convert directly; everything else goes through the shared
+    ``action_from_rule`` so option params and adjust references stay consistent with the
+    forward builders."""
+    at = str(action.get("action_type") or action.get("action") or "")
+    if at in (BUY_ACTION, SELL_ACTION) and at not in ADJUST_ACTIONS:
+        # 'sell' is also a close-flavored EXIT_ACTION; as a TradeRule action we emit the
+        # bare open/close action with no reference baggage — identical either way.
+        return {key: {"action_type": at}}
+    if at == ExpertActionType.STOP_PROCESSING.value:
+        return {key: {"action_type": at}}
+    return action_from_rule(action, key=key)
+
+
+def live_actions_from_trade_rule(rule: dict) -> Optional[Dict[str, dict]]:
+    """A TradeRule's ordered ``actions`` list -> ONE live EventAction ``actions`` dict
+    (keys ``a0``..``aN``), or None when nothing converts. Shared by the export path AND the
+    backtest seeder so both build byte-identical action configs."""
+    actions: Dict[str, dict] = {}
+    for ai, action in enumerate(a for a in (rule.get("actions") or []) if isinstance(a, dict)):
+        converted = _action_cfg_to_live(action, key=f"a{ai}")
+        if converted is not None:
+            actions.update(converted)
+    return actions or None
+
+
+def trade_rules_to_live_export(
+    entry_rules: Optional[List[dict]] = None,
+    exit_rules: Optional[List[dict]] = None,
+    name: str = "backtest-strategy",
+) -> dict:
+    """Reverse of ``live_export_to_trade_rules``: TradeRule lists -> a live export-file dict.
+
+    One live rule per TradeRule, ALL actions preserved in order (keys ``a0``..``aN``),
+    ``continue_processing`` carried through, rule order becomes ``order_index``. Rules whose
+    actions all fail to convert are dropped (counted nowhere — same convention as the legacy
+    exporter's silent skip).
+    """
+    def _rules_for(rules: Optional[List[dict]], subtype: str) -> List[dict]:
+        out: List[dict] = []
+        for i, rule in enumerate(rules or []):
+            if not isinstance(rule, dict):
+                continue
+            actions = live_actions_from_trade_rule(rule)
+            if not actions:
+                continue
+            conds = rule.get("conditions")
+            triggers = triggers_from_condition_tree(conds) if conds else {}
+            out.append({
+                "name": rule.get("name") or f"{name}-{subtype}-{i}",
+                "type": ExpertEventRuleType.TRADING_RECOMMENDATION_RULE.value,
+                "subtype": subtype,
+                "triggers": triggers,
+                "actions": actions,
+                "extra_parameters": {},
+                "continue_processing": bool(rule.get("continue_processing")
+                                            or rule.get("continueProcessing") or False),
+                "order_index": len(out),
+            })
+        return out
+
+    enter = _rules_for(entry_rules, AnalysisUseCase.ENTER_MARKET.value)
+    op = _rules_for(exit_rules, AnalysisUseCase.OPEN_POSITIONS.value)
+
+    rulesets: List[dict] = []
+    if enter:
+        rulesets.append({
+            "name": f"{name} enter_market",
+            "type": ExpertEventRuleType.TRADING_RECOMMENDATION_RULE.value,
+            "subtype": AnalysisUseCase.ENTER_MARKET.value,
+            "rules": enter,
+        })
+    if op:
+        rulesets.append({
+            "name": f"{name} open_positions",
+            "type": ExpertEventRuleType.TRADING_RECOMMENDATION_RULE.value,
+            "subtype": AnalysisUseCase.OPEN_POSITIONS.value,
+            "rules": op,
+        })
+    return {"export_version": "1.0", "export_type": "rulesets", "rulesets": rulesets}
+
+
+def _entry_rule(
+    name: str,
+    side_action: str,
+    tree: dict,
+    order_index: int,
+    extra_actions: Optional[Dict[str, dict]] = None,
+) -> Optional[dict]:
+    """Build one enter_market export rule from a condition tree, or None if it has no triggers.
+
+    ``extra_actions`` (e.g. entry-time ``adjust_take_profit``/``adjust_stop_loss`` brackets)
+    are attached alongside the open action — live's per-rule bracket shape: each enter_market
+    EventAction carries its own buy/sell + adjust_* actions."""
     triggers = triggers_from_condition_tree(tree)
     if not triggers:
         return None
@@ -335,7 +535,7 @@ def _entry_rule(name: str, side_action: str, tree: dict, order_index: int) -> Op
         "type": ExpertEventRuleType.TRADING_RECOMMENDATION_RULE.value,
         "subtype": AnalysisUseCase.ENTER_MARKET.value,
         "triggers": triggers,
-        "actions": {"act": {"action_type": side_action}},
+        "actions": {"act": {"action_type": side_action}, **(extra_actions or {})},
         "extra_parameters": {},
         "continue_processing": False,
         "order_index": order_index,
@@ -364,6 +564,7 @@ def strategy_to_live_export(
     sell_tree: Optional[dict] = None,
     exit_rules: Optional[List[dict]] = None,
     name: str = "backtest-strategy",
+    entry_actions: Optional[List[dict]] = None,
 ) -> dict:
     """Reverse of ``live_export_to_strategy``: strategy trees/rules -> a live export-file dict.
 
@@ -371,7 +572,25 @@ def strategy_to_live_export(
     (buy/sell rules) and an ``open_positions`` ruleset (exit rules). Delegates trigger/action
     building to ``rule_builders`` (the forward direction) so export stays consistent with import.
     Rulesets/rules with no usable content are omitted.
+
+    ``entry_actions`` (the strategy's entry-time TP/SL bracket, same rule shape as exit rules
+    minus a conditions sub-tree) are attached to EVERY enter_market rule — entry actions are
+    per-rule (per condition branch) in the live model, and the backtester applies its single
+    flat list on every entry regardless of which branch fired, so replicating the bracket onto
+    each rule is the faithful live representation. Actions with ``enabled`` explicitly False
+    (GA-disabled) are skipped.
     """
+    entry_action_cfgs: Dict[str, dict] = {}
+    for i, ea in enumerate(entry_actions or []):
+        if not isinstance(ea, dict) or ea.get("enabled") is False:
+            continue
+        key = str(ea.get("id") or f"entry-{i}")
+        if key == "act":  # reserved for the open action
+            key = f"entry-{i}"
+        converted = action_from_rule(ea, key=key)
+        if converted is not None:
+            entry_action_cfgs.update(converted)
+
     enter_rules: List[dict] = []
     for side_tree, side_action, side in ((buy_tree, BUY_ACTION, "buy"), (sell_tree, SELL_ACTION, "sell")):
         branches = _or_branches(side_tree)
@@ -379,7 +598,7 @@ def strategy_to_live_export(
             # One live rule PER OR-branch (suffix only when there's more than one, to keep names
             # stable for single-group strategies).
             rname = f"{name}-{side}" + (f"-{j + 1}" if len(branches) > 1 else "")
-            r = _entry_rule(rname, side_action, branch, len(enter_rules))
+            r = _entry_rule(rname, side_action, branch, len(enter_rules), entry_action_cfgs)
             if r is not None:
                 enter_rules.append(r)
 

@@ -3,21 +3,25 @@ from app.services.strategy_param_space import collect_param_space
 
 
 def _strategy(**kw):
-    """Minimal Strategy-like object with the columns collect_param_space reads."""
-    base = dict(
-        initial_tp_optimize=False, initial_tp_min=None, initial_tp_max=None, initial_tp_step=None,
-        initial_sl_optimize=False, initial_sl_min=None, initial_sl_max=None, initial_sl_step=None,
-        buy_entry_conditions=None, sell_entry_conditions=None, entry_conditions=None,
-        exit_conditions=[],
-    )
+    """Minimal Strategy-like object with the columns collect_param_space reads
+    (unified rule model: entry_rules/exit_rules TradeRule lists)."""
+    base = dict(entry_rules=[], exit_rules=[])
     base.update(kw)
     return types.SimpleNamespace(**base)
+
+
+def _entry_rule(rid="r1", conditions=None, actions=None, **kw):
+    rule = {"id": rid, "conditions": conditions,
+            "actions": actions if actions is not None else [{"action_type": "buy"}],
+            "continue_processing": False}
+    rule.update(kw)
+    return rule
 
 
 def test_rm_sizing_via_expert_model_namespace():
     """RM sizing is optimized through the expert model:* path keyed by the REAL ba2 setting
     names (e.g. risk_per_trade_pct); there is no separate rm:* namespace anymore."""
-    s = _strategy(initial_tp_optimize=True, initial_tp_min=1, initial_tp_max=2, initial_tp_step=0.5)
+    s = _strategy()
     expert = {"risk_per_trade_pct": {"optimize": True, "min": 0.5, "max": 3.0, "step": 0.25,
                                      "type": "float"}}
     space = collect_param_space(s, expert_cfg=expert)
@@ -26,7 +30,7 @@ def test_rm_sizing_via_expert_model_namespace():
 
 
 def test_collect_expert_namespaced():
-    s = _strategy(initial_sl_optimize=True, initial_sl_min=1, initial_sl_max=5, initial_sl_step=0.5)
+    s = _strategy()
     expert = {"surprise_min_pct": {"optimize": True, "min": 1.0, "max": 20.0, "step": 1.0, "type": "float"},
               "max_days_since_report": {"optimize": False, "min": 1, "max": 30, "step": 1, "type": "int"}}
     space = collect_param_space(s, expert_cfg=expert)
@@ -34,27 +38,60 @@ def test_collect_expert_namespaced():
     assert "model:max_days_since_report" not in space  # optimize=False
 
 
-def test_collect_condition_value_and_confirmation():
-    buy = {"operator": "AND", "conditions": [
+def test_collect_condition_value_and_confirmation_inside_entry_rule():
+    conds = {"operator": "AND", "conditions": [
         {"id": "c1", "field": "model:probability", "comparison": ">=", "value": 0.6,
          "optimize": True, "value_min": 0.5, "value_max": 0.9, "value_step": 0.05,
          "confirmation_bars_min": 1, "confirmation_bars_max": 5, "confirmation_bars_step": 1},
     ]}
-    s = _strategy(buy_entry_conditions=buy,
-                  initial_tp_optimize=True, initial_tp_min=1, initial_tp_max=2, initial_tp_step=0.5)
+    s = _strategy(entry_rules=[_entry_rule(conditions=conds)])
     space = collect_param_space(s)
     assert space["cond:c1:value"] == {"type": "float", "min": 0.5, "max": 0.9, "step": 0.05}
     assert space["cond:c1:confirmation_bars"] == {"type": "int", "min": 1, "max": 5, "step": 1}
 
 
-def test_collect_exit_action_value():
-    s = _strategy(exit_conditions=[
-        {"id": "e1", "action": "adjust_sl", "action_value": 1.0, "action_value_optimize": True,
-         "action_value_min": 0.5, "action_value_max": 3.0, "action_value_step": 0.5,
-         "conditions": {}},
+def test_collect_exit_action_value_per_action():
+    s = _strategy(exit_rules=[
+        {"id": "e1", "actions": [
+            {"action_type": "adjust_stop_loss", "action_value": 1.0,
+             "action_value_optimize": True, "action_value_min": 0.5,
+             "action_value_max": 3.0, "action_value_step": 0.5},
+        ], "conditions": {}},
     ])
     space = collect_param_space(s)
-    assert space["exit:e1:action_value"]["min"] == 0.5
+    assert space["exit:e1:a0:action_value"]["min"] == 0.5
+
+
+def test_collect_rule_toggle_and_per_action_toggle():
+    """rule.toggle_optimize -> <ns>:<rid>:enabled; action.toggle_optimize -> per-action
+    toggle EXCEPT open (buy/sell) actions, which are never droppable."""
+    s = _strategy(entry_rules=[_entry_rule(
+        rid="tier1", toggle_optimize=True,
+        actions=[
+            {"action_type": "buy", "toggle_optimize": True},  # ignored: undroppable
+            {"action_type": "adjust_take_profit", "reference_value": "expert_target_price",
+             "action_value": -2, "toggle_optimize": True},
+        ])])
+    space = collect_param_space(s)
+    assert space["entry:tier1:enabled"] == {"type": "int", "min": 0, "max": 1, "step": 1}
+    assert "entry:tier1:a0:enabled" not in space  # buy can't be toggled off
+    assert space["entry:tier1:a1:enabled"] == {"type": "int", "min": 0, "max": 1, "step": 1}
+
+
+def test_per_rule_brackets_optimize_independently():
+    """Two entry rules with their own TP action each -> two independent gene keys (the
+    per-tier bracket the flat entry_actions design couldn't express)."""
+    def tier(rid, tp):
+        return _entry_rule(rid=rid, actions=[
+            {"action_type": "buy"},
+            {"action_type": "adjust_take_profit", "action_value": tp,
+             "action_value_optimize": True, "action_value_min": tp - 5,
+             "action_value_max": tp + 5, "action_value_step": 1},
+        ])
+    s = _strategy(entry_rules=[tier("t1", -5.0), tier("t2", 0.0)])
+    space = collect_param_space(s)
+    assert space["entry:t1:a1:action_value"]["min"] == -10.0
+    assert space["entry:t2:a1:action_value"]["min"] == -5.0
 
 
 def test_empty_space_raises():
@@ -63,65 +100,43 @@ def test_empty_space_raises():
         collect_param_space(_strategy())
 
 
-def test_bypass_excludes_tp_sl_cond_exit_keeps_only_model():
-    """BYPASS expert (piece 1c): the param space drops tp/sl/cond:*/exit:* and keeps
-    ONLY the expert's own model:* params (FactorRanker rebalances via its own portfolio
-    manager, so the ruleset namespaces have no effect)."""
-    buy = {"operator": "AND", "conditions": [
-        {"id": "c1", "field": "model:probability", "comparison": ">=", "value": 0.6,
-         "optimize": True, "value_min": 0.5, "value_max": 0.9, "value_step": 0.05},
-    ]}
+def test_bypass_keeps_only_model():
+    """BYPASS expert (FactorRanker): the param space drops cond:*/entry:*/exit:* and keeps
+    ONLY the expert's own model:* params."""
     s = _strategy(
-        buy_entry_conditions=buy,
-        initial_tp_optimize=True, initial_tp_min=2.0, initial_tp_max=10.0, initial_tp_step=0.5,
-        initial_sl_optimize=True, initial_sl_min=1.0, initial_sl_max=5.0, initial_sl_step=0.5,
-        exit_conditions=[
-            {"id": "e1", "action": "adjust_sl", "action_value": 1.0,
-             "action_value_optimize": True, "action_value_min": 0.5, "action_value_max": 3.0,
-             "action_value_step": 0.5, "conditions": {}},
-        ],
+        entry_rules=[_entry_rule(conditions={"operator": "AND", "conditions": [
+            {"id": "c1", "field": "model:probability", "comparison": ">=", "value": 0.6,
+             "optimize": True, "value_min": 0.5, "value_max": 0.9, "value_step": 0.05}]})],
+        exit_rules=[{"id": "e1", "actions": [
+            {"action_type": "adjust_stop_loss", "action_value": 1.0,
+             "action_value_optimize": True, "action_value_min": 0.5,
+             "action_value_max": 3.0, "action_value_step": 0.5}], "conditions": {}}],
     )
-    # FactorRanker's own params (factor weights / top_n / winsorize_pct).
     expert = {"top_n": {"optimize": True, "min": 5, "max": 30, "step": 5, "type": "int"},
               "winsorize_pct": {"optimize": True, "min": 0.0, "max": 0.1, "step": 0.01,
                                 "type": "float"}}
-
     space = collect_param_space(s, expert_cfg=expert, bypass=True)
-
-    # ONLY model:* survives.
     assert set(space) == {"model:top_n", "model:winsorize_pct"}
-    assert all(k.startswith("model:") for k in space)
-    # None of the excluded namespaces leak in.
-    assert "tp" not in space and "sl" not in space
-    assert not any(k.startswith("rm:") for k in space)
-    assert not any(k.startswith("cond:") for k in space)
-    assert not any(k.startswith("exit:") for k in space)
 
 
 def test_bypass_vs_non_bypass_same_inputs_differ():
-    """The SAME strategy/expert inputs yield a strictly smaller space under bypass=True
-    (entry/exit/cond genes present without bypass, gone with it)."""
-    s = _strategy(exit_conditions=[
-        {"id": "e1", "action": "adjust_sl", "action_value": 1.0, "action_value_optimize": True,
-         "action_value_min": 0.5, "action_value_max": 3.0, "action_value_step": 0.5,
-         "conditions": {}},
-    ])
+    s = _strategy(exit_rules=[{"id": "e1", "actions": [
+        {"action_type": "adjust_stop_loss", "action_value": 1.0,
+         "action_value_optimize": True, "action_value_min": 0.5,
+         "action_value_max": 3.0, "action_value_step": 0.5}], "conditions": {}}])
     expert = {"top_n": {"optimize": True, "min": 5, "max": 30, "step": 5, "type": "int"}}
 
     classic = collect_param_space(s, expert_cfg=expert, bypass=False)
     bypass = collect_param_space(s, expert_cfg=expert, bypass=True)
 
-    assert "exit:e1:action_value" in classic and "model:top_n" in classic
+    assert "exit:e1:a0:action_value" in classic and "model:top_n" in classic
     assert set(bypass) == {"model:top_n"}
     assert set(bypass) < set(classic)
 
 
 def test_bypass_with_no_expert_params_raises():
-    """A bypass expert with NO optimizable expert params has an empty space -> fail-early
-    (the rm/tp/sl/cond it might have are excluded, so there is genuinely nothing to search)."""
     import pytest
-    s = _strategy(initial_tp_optimize=True, initial_tp_min=2.0, initial_tp_max=10.0,
-                  initial_tp_step=0.5)
+    s = _strategy(entry_rules=[_entry_rule(toggle_optimize=True)])
     with pytest.raises(ValueError):
         collect_param_space(s, expert_cfg=None, bypass=True)
 
@@ -139,8 +154,6 @@ def test_collect_schedule_days_namespaced():
 
 
 def test_bypass_excludes_schedule_days():
-    """Bypass experts (FactorRanker) don't use the classic per-day entry-scan gate — schedule:*
-    genes are excluded even when a schedule_cfg is passed."""
     s = _strategy()
     schedule = {"monday": {"optimize": True}}
     expert = {"top_n": {"optimize": True, "min": 5, "max": 30, "step": 5, "type": "int"}}

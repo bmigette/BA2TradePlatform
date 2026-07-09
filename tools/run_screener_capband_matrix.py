@@ -38,7 +38,9 @@ _NO_LARGE_CAP = {"FMPEarningsDrift", "FMPInsiderClusterBuy"}
 # anchored TP on expert_target_price) is now MERGED into S1, and S1's target-anchored TP is a
 # GA-TOGGLEABLE entry_action that self-disables for experts without a real analyst target — so no
 # strategy needs the restriction anymore. Kept (empty) for the _jobs() gating call site.
-_TARGET_PRICE_STRATEGIES: set = set()
+# S4 anchors its TP-follow on expert_target_price / percent_to_new_target — only
+# meaningful for experts with a REAL analyst target (FMPRating).
+_TARGET_PRICE_STRATEGIES: set = {"S4"}
 _TARGET_PRICE_EXPERTS = {"FMPRating"}
 # Per-strategy population/generations override. S7 is a NARROW refinement around a known-good point
 # (the archived 186% S2-large winner) so it converges with far fewer individuals/generations. S1 is
@@ -46,8 +48,15 @@ _TARGET_PRICE_EXPERTS = {"FMPRating"}
 # + exit rules => largest gene space), so it gets a bit MORE population. Unlisted strategies keep the
 # driver's --population/--generations args unchanged.
 _STRATEGY_BUDGET_OVERRIDE = {
-    "S1": {"population": 60},
-    "S7": {"population": 20, "generations": 5},
+    # S1 absorbed S4's entry TP/SL genes (entry:s1_tp_target:*, entry:s1_sl_entry:*) on top of
+    # its existing ~90+ condition/exit/model genes, so it now searches a LARGER space than a
+    # plain FMPRating job (base --population + --fmp-population-bonus = 90) -- bump above that
+    # baseline rather than below it.
+    "S1": {"population": 140},
+    # S7 rebuilt as a FAITHFUL replica of the archived 186% winner (correct first-match exit
+    # order, winner's gates restored as toggleable, step-1/2 ranges): the search space is a
+    # real neighborhood now (thousands of distinct genomes, not 21) — budget accordingly.
+    "S7": {"population": 60, "generations": 8},
 }
 
 
@@ -190,9 +199,12 @@ def main() -> int:
         budget = _STRATEGY_BUDGET_OVERRIDE.get(strat)
         if budget:
             # A refinement strategy (e.g. S7) ignores the FMPRating bonus too -- it's a narrow
-            # neighborhood search regardless of expert, not exploring the full space.
-            population = budget["population"]
-            generations = budget["generations"]
+            # neighborhood search regardless of expert, not exploring the full space. An override
+            # may specify only ONE of population/generations (e.g. S1's population-only bump) --
+            # fall back to the driver's own value (population still gets the FMP bonus above) for
+            # whichever key is absent.
+            population = budget.get("population", population)
+            generations = budget.get("generations", generations)
         cmd = [exe, "optimize", "--expert", expert, "--universe", _PLACEHOLDER_UNIVERSE,
                "--screener", "--screener-store", args.store, "--screener-cap-band", band,
                "--start", args.start, "--end", args.end, "--fitness", args.fitness,

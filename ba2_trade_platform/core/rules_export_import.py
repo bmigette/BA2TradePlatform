@@ -160,6 +160,7 @@ class RulesExportImportUI:
                                 sell_tree=data.get('sell_entry_conditions'),
                                 exit_rules=data.get('exit_conditions') or [],
                                 name=data.get('name') or 'backtest-strategy',
+                                entry_actions=data.get('entry_actions') or [],
                             )
 
                         # Determine import type

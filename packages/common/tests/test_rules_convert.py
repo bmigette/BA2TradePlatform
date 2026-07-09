@@ -178,6 +178,57 @@ def test_strategy_to_live_export_splits_or_branches_into_rules():
     assert len(again["buy_entry_conditions"]["conditions"]) == 2
 
 
+def test_strategy_to_live_export_attaches_entry_actions_to_every_enter_rule():
+    """Entry-time TP/SL bracket actions (Strategy.entry_actions) must reach the live export as
+    adjust_* actions on EACH enter_market rule (entry actions are per rule/condition in live,
+    and the backtester applies its flat list on every entry). Regression: they used to be
+    silently dropped -> live imports had no TP/SL on entries."""
+    buy_tree = {
+        "operator": "OR",
+        "conditions": [
+            {"operator": "AND", "conditions": [
+                {"field": "bullish", "fieldType": "flag"},
+                {"field": "long_term", "fieldType": "flag"},
+            ]},
+            {"operator": "AND", "conditions": [
+                {"field": "bullish", "fieldType": "flag"},
+                {"field": "confidence", "comparison": ">=", "value": 90, "fieldType": "number"},
+            ]},
+        ],
+    }
+    entry_actions = [
+        {"id": "s1_tp_target", "action": "adjust_take_profit",
+         "reference_value": "expert_target_price", "action_value": -2},
+        {"id": "s1_sl_entry", "action": "adjust_stop_loss",
+         "reference_value": "order_open_price", "action_value": -10},
+        {"id": "disabled_one", "action": "adjust_take_profit",
+         "reference_value": "order_open_price", "action_value": 5, "enabled": False},
+    ]
+    exported = strategy_to_live_export(
+        buy_tree=buy_tree, sell_tree=None, exit_rules=[], name="s", entry_actions=entry_actions,
+    )
+    enter = next(rs for rs in exported["rulesets"] if rs["subtype"] == "enter_market")
+    assert len(enter["rules"]) == 2
+    for rule in enter["rules"]:
+        acts = rule["actions"]
+        # the open action survives untouched
+        assert acts["act"]["action_type"] == "buy"
+        tp = acts["s1_tp_target"]
+        assert tp["action_type"] == "adjust_take_profit"
+        assert tp["reference_value"] == "expert_target_price"
+        assert tp["value"] == -2
+        sl = acts["s1_sl_entry"]
+        assert sl["action_type"] == "adjust_stop_loss"
+        assert sl["reference_value"] == "order_open_price"
+        assert sl["value"] == -10
+        # GA-disabled actions never reach live
+        assert "disabled_one" not in acts
+    # the exported file still round-trips (brackets are counted, entry tree intact)
+    again = live_export_to_strategy(exported)
+    assert again["summary"]["ignored_initial_brackets"] == 4  # 2 rules x 2 brackets
+    assert again["buy_entry_conditions"]["operator"] == "OR"
+
+
 def test_unknown_event_type_does_not_raise():
     payload = {"export_type": "rule", "rule": {
         "name": "BUY", "subtype": "enter_market",

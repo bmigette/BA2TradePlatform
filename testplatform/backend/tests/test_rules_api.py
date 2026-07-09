@@ -64,8 +64,11 @@ def test_export_rules_enter():
     }
     db = SessionLocal()
     try:
-        s = Strategy(name="export-enter-test", buy_entry_conditions=tree,
-                     exit_conditions=[])
+        s = Strategy(name="export-enter-test",
+                     entry_rules=[{"id": "buy", "conditions": tree["conditions"][0],
+                                   "actions": [{"action_type": "buy"}],
+                                   "continue_processing": False}],
+                     exit_rules=[])
         db.add(s)
         db.commit()
         db.refresh(s)
@@ -81,19 +84,20 @@ def test_export_rules_enter():
 
 
 def test_export_rules_exit_from_rule_list():
-    # exit_conditions is a LIST of exit-rule dicts, each with a `conditions` sub-tree.
+    # exit_rules is a LIST of TradeRule dicts, each with a `conditions` sub-tree.
     exit_rules = [{
         "id": "ex0", "name": "take-profit",
         "conditions": {"id": "ec0", "operator": "AND", "conditions": [
             {"id": "el0", "field": "confidence", "op": "<", "value": 0.3,
              "enabled": True, "optimize": False},
         ]},
-        "action": "close",
+        "actions": [{"action_type": "close"}],
+        "continue_processing": False,
     }]
     db = SessionLocal()
     try:
-        s = Strategy(name="export-exit-test", buy_entry_conditions=None,
-                     exit_conditions=exit_rules)
+        s = Strategy(name="export-exit-test", entry_rules=[],
+                     exit_rules=exit_rules)
         db.add(s)
         db.commit()
         db.refresh(s)
@@ -112,8 +116,7 @@ def test_export_rules_exit_from_rule_list():
 def test_export_rules_empty_returns_valid_ruleset():
     db = SessionLocal()
     try:
-        s = Strategy(name="export-empty-test", buy_entry_conditions=None,
-                     exit_conditions=[])
+        s = Strategy(name="export-empty-test", entry_rules=[], exit_rules=[])
         db.add(s)
         db.commit()
         db.refresh(s)
@@ -136,7 +139,7 @@ def test_export_rules_not_found_404():
 def test_export_rules_bad_which_422():
     db = SessionLocal()
     try:
-        s = Strategy(name="export-badwhich-test", exit_conditions=[])
+        s = Strategy(name="export-badwhich-test", exit_rules=[])
         db.add(s)
         db.commit()
         db.refresh(s)

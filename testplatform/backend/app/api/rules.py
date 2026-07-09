@@ -39,16 +39,17 @@ class ImportRulesRequest(BaseModel):
     which: str
 
 
-def _exit_rules_to_tree(exit_rules: Any) -> Dict[str, Any]:
-    """Wrap a list of exit-rule dicts into an OR group of their condition sub-trees."""
+def _rules_to_tree(rules: Any, root_id: str) -> Dict[str, Any]:
+    """Wrap a TradeRule list into an OR group of the rules' condition sub-trees (rules with
+    no conditions contribute nothing — an always-true branch has no leaves to export)."""
     or_children = []
-    for rule in (exit_rules or []):
+    for rule in (rules or []):
         if not isinstance(rule, dict):
             continue
         conds = rule.get("conditions")
         if conds:
             or_children.append(conds)
-    return {"id": "exit-root", "operator": "OR", "conditions": or_children}
+    return {"id": root_id, "operator": "OR", "conditions": or_children}
 
 
 @router.post("/import-rules")
@@ -79,11 +80,13 @@ async def export_rules(
     if not strategy:
         raise HTTPException(status_code=404, detail=f"Strategy {strategy_id} not found")
 
+    # Unified rule model: BOTH sides are TradeRule lists -> wrap each rule's condition
+    # sub-tree into an OR group (one branch per rule, same OR(rules)->AND(triggers) shape
+    # tree_to_ruleset_json produces).
     if which == "enter":
-        tree = strategy.buy_entry_conditions
+        tree = _rules_to_tree(strategy.entry_rules, "enter-root")
     else:
-        # exit_conditions is a LIST of exit-rule dicts -> wrap into an OR tree.
-        tree = _exit_rules_to_tree(strategy.exit_conditions)
+        tree = _rules_to_tree(strategy.exit_rules, "exit-root")
 
     # Empty/None tree -> still produce a valid (empty-rules) ruleset JSON.
     if not tree:

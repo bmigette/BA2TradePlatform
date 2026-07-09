@@ -151,9 +151,13 @@ def test_migration_preserves_pk_and_autoincrement():
 
 
 def test_migration_preserves_pk_via_orm_insert():
-    """Through the real SQLAlchemy Strategy model: build a legacy table, run the migration on
-    the same DBAPI connection, then insert a new Strategy via the ORM (the way the app does)
-    and confirm it gets an autoincrement id and the new entry_actions column round-trips."""
+    """Through the real SQLAlchemy Strategy model: build a legacy table, run migration 026 AND
+    the follow-up 028 (the ORM is now on the unified entry_rules/exit_rules model) on the same
+    DBAPI connection, then insert a new Strategy via the ORM (the way the app does) and confirm
+    it gets an autoincrement id and the rule-list column round-trips."""
+    import importlib.util as _ilu
+    from pathlib import Path as _Path
+
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
 
@@ -167,6 +171,12 @@ def test_migration_preserves_pk_via_orm_insert():
         cursor = raw.cursor()
         migration = _load_migration()
         migration.upgrade(cursor, raw)
+        # Bring the table to the CURRENT ORM schema (migration 028: unified rule lists).
+        m028_path = _Path(__file__).resolve().parent.parent / "db_migrate" / "028_unified_trade_rules.py"
+        spec = _ilu.spec_from_file_location("migration_028_chain", m028_path)
+        m028 = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(m028)
+        m028.upgrade(cursor, raw)
         raw.commit()
     finally:
         raw.close()
@@ -174,21 +184,18 @@ def test_migration_preserves_pk_via_orm_insert():
     SessionLocal = sessionmaker(bind=engine)
     session = SessionLocal()
     try:
-        strat = Strategy(
-            name="ORM Strat",
-            entry_actions=[{"id": "e_sl", "action_type": "adjust_stop_loss", "action_value": -3.0}],
-        )
+        rules = [{"id": "r1", "conditions": None, "continue_processing": False,
+                  "actions": [{"action_type": "buy"}]}]
+        strat = Strategy(name="ORM Strat", entry_rules=rules)
         assert strat.id is None
         session.add(strat)
         session.commit()
         session.refresh(strat)
         assert strat.id is not None
         assert strat.id > 1  # greater than the migrated legacy row's id (1)
-        assert strat.entry_actions == [
-            {"id": "e_sl", "action_type": "adjust_stop_loss", "action_value": -3.0}
-        ]
+        assert strat.entry_rules == rules
         d = strat.to_dict()
-        assert d["entryActions"] == strat.entry_actions
+        assert d["entryRules"] == rules
         assert "initialTpPercent" not in d
         assert "initialSlPercent" not in d
     finally:

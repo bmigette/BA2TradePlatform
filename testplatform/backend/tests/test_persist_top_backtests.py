@@ -68,10 +68,10 @@ _RESULTS = {
 }
 
 
-def _seed_opt_for_top_n(entry_actions=None):
+def _seed_opt_for_top_n(entry_rules=None):
     db = SessionLocal()
     try:
-        strat = Strategy(name="top-n-strat", entry_actions=entry_actions)
+        strat = Strategy(name="top-n-strat", entry_rules=entry_rules or [], exit_rules=[])
         db.add(strat); db.commit(); db.refresh(strat)
         opt = StrategyOptimization(
             strategy_id=strat.id, name="top-n-opt",
@@ -118,16 +118,20 @@ def test_persist_one_pushes_backtest_after_save(monkeypatch):
     assert calls[0] == "TOP1-top-n-opt"
 
 
-def test_persist_one_mirrors_entry_actions_into_strategy_params(monkeypatch):
-    """Regression: TOP-N persist mirrors buy/sell/exit/tp/sl from decode_params() into
-    strategy_params for Load/export, but historically forgot entry_rules (the entry-time TP/SL
-    bracket, Strategy.entry_actions) — leaving strategy_params["entryActions"] empty even though
-    the persisted backtest's OWN run correctly used the bracket. Assert it's now mirrored too."""
-    entry_actions = [{
-        "id": "s4_tp", "action_type": "adjust_take_profit",
-        "reference_value": "expert_target_price", "action_value": -6.0, "enabled": True,
+def test_persist_one_mirrors_entry_rules_into_strategy_params(monkeypatch):
+    """Regression (unified rule model): TOP-N persist mirrors the CONCRETE decoded TradeRule
+    lists into strategy_params (entryRules/exitRules) for Load/export — historically the
+    entry-side bracket was forgotten, leaving the persisted display copy empty even though
+    the run itself used it."""
+    entry_rules = [{
+        "id": "bracket", "conditions": None, "continue_processing": False,
+        "actions": [
+            {"action_type": "buy"},
+            {"id": "s4_tp", "action_type": "adjust_take_profit",
+             "reference_value": "expert_target_price", "action_value": -6.0},
+        ],
     }]
-    opt_id = _seed_opt_for_top_n(entry_actions=entry_actions)
+    opt_id = _seed_opt_for_top_n(entry_rules=entry_rules)
     monkeypatch.setattr(_sync_client, "push_backtest", lambda bt, db: None)
     monkeypatch.setattr(
         _soh, "_persist_trial_worker",
@@ -141,6 +145,10 @@ def test_persist_one_mirrors_entry_actions_into_strategy_params(monkeypatch):
     try:
         from app.models.backtest import Backtest
         bt = db.query(Backtest).filter_by(optimization_id=opt_id).one()
-        assert bt.strategy_params.get("entryActions") == entry_actions
+        mirrored = bt.strategy_params.get("entryRules")
+        assert mirrored and len(mirrored) == 1
+        kinds = [a["action_type"] for a in mirrored[0]["actions"]]
+        assert kinds == ["buy", "adjust_take_profit"]
+        assert bt.strategy_params.get("exitRules") == []
     finally:
         db.close()

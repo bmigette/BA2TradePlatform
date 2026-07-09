@@ -34,16 +34,16 @@ def _host_db():
 
 
 def _tp_sl_from_decoded(decoded):
-    """Extract (tp, sl) from a decode_params() result, supporting BOTH shapes exercised in this
-    file: the entry_actions-based Strategy (``decoded['entry_rules']`` carries adjust_take_profit
-    /adjust_stop_loss rules, Task 6) used by the DB-backed handler tests, and the raw ``tp``/``sl``
-    flat-gene shortcut ``test_seeded_run_is_reproducible`` uses (it builds its own param space
-    directly, bypassing collect_param_space/entry_actions entirely). sl is returned as a positive
-    magnitude either way (entry_rules carries it signed negative per the sign convention)."""
-    rules = {r.get("action_type"): r for r in (decoded.get("entry_rules") or []) if isinstance(r, dict)}
-    if rules:
-        return rules["adjust_take_profit"]["action_value"], abs(rules["adjust_stop_loss"]["action_value"])
-    return decoded["tp"], decoded["sl"]
+    """Extract (tp, sl) from a decode_params() result on the unified rule model: the entry
+    TradeRule's adjust_take_profit / adjust_stop_loss ACTIONS. sl is returned as a positive
+    magnitude (the action carries it signed negative per the sign convention)."""
+    actions = {}
+    for rule in (decoded.get("entry_rules") or []):
+        for a in (rule.get("actions") or []):
+            if isinstance(a, dict) and a.get("action_type"):
+                actions[a["action_type"]] = a
+    return (actions["adjust_take_profit"]["action_value"],
+            abs(actions["adjust_stop_loss"]["action_value"]))
 
 
 def _deterministic_stub(backtest_cfg, hoisted, decoded):
@@ -62,14 +62,19 @@ def _deterministic_stub(backtest_cfg, hoisted, decoded):
 
 
 def _strategy_stub():
-    """A Strategy-like object with tp/sl optimize on (no DB needed)."""
+    """A Strategy-like object (unified rule model) with an optimizable entry bracket."""
     return types.SimpleNamespace(
-        initial_tp_percent=5.0,
-        initial_sl_percent=2.0,
-        buy_entry_conditions=None,
-        sell_entry_conditions=None,
-        entry_conditions=None,
-        exit_conditions=[],
+        entry_rules=[{
+            "id": "bracket", "conditions": None, "continue_processing": False,
+            "actions": [
+                {"action_type": "buy"},
+                {"action_type": "adjust_take_profit", "reference_value": "order_open_price",
+                 "action_value": 5.0},
+                {"action_type": "adjust_stop_loss", "reference_value": "order_open_price",
+                 "action_value": -2.0},
+            ],
+        }],
+        exit_rules=[],
     )
 
 
@@ -83,8 +88,8 @@ def test_seeded_run_is_reproducible():
 
     s = _strategy_stub()
     space = {
-        "tp": {"type": "float", "min": 2, "max": 12, "step": 1},
-        "sl": {"type": "float", "min": 1, "max": 6, "step": 1},
+        "entry:bracket:a1:action_value": {"type": "float", "min": 2, "max": 12, "step": 1},
+        "entry:bracket:a2:action_value": {"type": "float", "min": -6, "max": -1, "step": 1},
     }
 
     def run_once(seed):
@@ -116,29 +121,31 @@ def test_seeded_run_is_reproducible():
 # DB-backed handler tests (real Strategy + StrategyOptimization rows)
 # ---------------------------------------------------------------------------
 def _seed_strategy() -> int:
-    """A Strategy whose entry-time TP/SL bracket rides on ``entry_actions`` (adjust_take_profit
-    /adjust_stop_loss rules with ``action_value_optimize``), mirroring how ``exit_conditions``
-    rules are optimized — NOT the deleted scalar ``initial_tp_percent``/``initial_sl_percent``
-    fields. Ranges chosen so the GA searches the SAME grid the old tp(2..12)/sl(1..6) genes did
-    (11*6=66 distinct points), just keyed as ``entry:<id>:action_value`` now."""
+    """A Strategy whose entry-time TP/SL bracket rides on the unified rule model (migration
+    028): ONE entry TradeRule carrying buy + adjust_take_profit + adjust_stop_loss actions
+    with ``action_value_optimize``. Ranges chosen so the GA searches the SAME grid the old
+    tp(2..12)/sl(1..6) genes did (11*6=66 distinct points), keyed as
+    ``entry:bracket:a<i>:action_value`` now."""
     db = SessionLocal()
     try:
         s = Strategy(
             name="opt-test",
-            entry_actions=[
-                {
-                    "id": "e_tp", "action_type": "adjust_take_profit",
-                    "reference_value": "order_open_price", "action_value": 5.0,
-                    "action_value_optimize": True,
-                    "action_value_min": 2.0, "action_value_max": 12.0, "action_value_step": 1.0,
-                },
-                {
-                    "id": "e_sl", "action_type": "adjust_stop_loss",
-                    "reference_value": "order_open_price", "action_value": -2.0,
-                    "action_value_optimize": True,
-                    "action_value_min": -6.0, "action_value_max": -1.0, "action_value_step": 1.0,
-                },
-            ],
+            entry_rules=[{
+                "id": "bracket", "conditions": None, "continue_processing": False,
+                "actions": [
+                    {"action_type": "buy"},
+                    {"id": "e_tp", "action_type": "adjust_take_profit",
+                     "reference_value": "order_open_price", "action_value": 5.0,
+                     "action_value_optimize": True,
+                     "action_value_min": 2.0, "action_value_max": 12.0,
+                     "action_value_step": 1.0},
+                    {"id": "e_sl", "action_type": "adjust_stop_loss",
+                     "reference_value": "order_open_price", "action_value": -2.0,
+                     "action_value_optimize": True,
+                     "action_value_min": -6.0, "action_value_max": -1.0,
+                     "action_value_step": 1.0},
+                ],
+            }],
         )
         db.add(s)
         db.commit()
@@ -217,14 +224,14 @@ def test_handler_completes_and_persists_best(monkeypatch):
     assert row.progress == 100.0
     assert row.best_params is not None
     assert row.best_fitness is not None
-    assert row.parameter_ranges and "entry:e_tp:action_value" in row.parameter_ranges
+    assert row.parameter_ranges and "entry:bracket:a1:action_value" in row.parameter_ranges
     # The deterministic stub peaks at tp=8, sl=3 -> max score 10.0. A small GA
     # (pop=8/gen=4) is a heuristic, not exhaustive, so it converges NEAR the peak;
     # assert it found a high-fitness, in-range individual (exact global optimum is the
     # brute_force test's job). all_results recorded one entry per evaluated trial.
     assert row.best_fitness >= 8.0
-    assert 2.0 <= row.best_params["entry:e_tp:action_value"] <= 12.0
-    assert -6.0 <= row.best_params["entry:e_sl:action_value"] <= -1.0
+    assert 2.0 <= row.best_params["entry:bracket:a1:action_value"] <= 12.0
+    assert -6.0 <= row.best_params["entry:bracket:a2:action_value"] <= -1.0
     assert row.all_results and all("fitness" in r for r in row.all_results)
 
 
@@ -287,7 +294,7 @@ def test_brute_force_finds_global_optimum(monkeypatch):
     assert out["status"] == "completed"
     assert out["best_fitness"] == pytest.approx(10.0)
     assert out["best_params"] == {
-        "entry:e_tp:action_value": 8.0, "entry:e_sl:action_value": -3.0,
+        "entry:bracket:a1:action_value": 8.0, "entry:bracket:a2:action_value": -3.0,
     }
 
 
@@ -327,7 +334,7 @@ def test_max_drawdown_metric_negated_through_handler(monkeypatch):
     assert out["status"] == "completed"
     # best (max fitness) = least drawdown = -2.0 at tp=8 (GA maximizes -dd).
     assert out["best_fitness"] == pytest.approx(-2.0)
-    assert out["best_params"]["entry:e_tp:action_value"] == 8.0
+    assert out["best_params"]["entry:bracket:a1:action_value"] == 8.0
 
 
 def test_zero_trade_sentinel_through_handler(monkeypatch):

@@ -2,35 +2,57 @@
 
 Collects ONE flat param_ranges dict (the GeneticOptimizer shape
 {name: {'type','min','max','step'}}) from a Strategy row + expert numeric
-settings, and decodes a flat decoded-params dict back into
-(tp, sl, expert_overrides, buy_tree, sell_tree, exit_rules, entry_rules) by
-deep-copying the condition trees and substituting node value/confirmation_bars/
-action_value by id. The Strategy row is never mutated.
+settings, and decodes a flat decoded-params dict back into concrete
+``entry_rules``/``exit_rules`` TradeRule lists by deep-copying the rules and
+substituting condition values / action values by id. The Strategy row is never
+mutated.
 
-RM sizing is optimized through the expert ``model:*`` path keyed by the REAL ba2
-setting names (e.g. ``risk_per_trade_pct``); there is no separate rm namespace.
-Entry TP/SL is likewise NOT a bespoke tp/sl gene namespace: it rides on
-``Strategy.entry_actions`` (adjust_take_profit/adjust_stop_loss rules, same shape
-as ``exit_conditions``), collected/decoded via the ``entry:<id>:*`` namespace below
-(mirrors ``exit:<id>:*`` exactly). ``tp``/``sl`` decode keys are a legacy pass-through
-only (no genes are collected for them anymore).
+The Strategy is the unified EventAction-shaped model (migration 028, see
+docs/plans/2026-07-08-unified-rule-model.md): ``Strategy.entry_rules`` and
+``Strategy.exit_rules`` are ordered TradeRule lists — each rule = conditions
+tree + one-or-more actions + continue_processing. Genes are derived per rule
+and per action, so a per-rule bracket (live's per-tier TP/SL) optimizes
+independently per rule.
 
-Namespacing (design §5):
-  model:<p>                       expert numeric decision settings (incl. RM sizing)
-  cond:<id>:value                 a buy/sell condition node's threshold
-  cond:<id>:confirmation_bars     that node's confirmation bars
-  exit:<id>:action_value          an exit rule's action value
-  entry:<id>:action_value         an entry action's (TP/SL adjust) action value
-  schedule:<day>                  ON/OFF toggle for that weekday's entry scan
+RM sizing is optimized through the expert ``model:*`` path keyed by the REAL
+ba2 setting names (e.g. ``risk_per_trade_pct``); there is no separate rm
+namespace.
+
+Namespacing:
+  model:<p>                        expert numeric decision settings (incl. RM sizing)
+  cond:<id>:value                  a condition node's threshold (any rule's tree)
+  cond:<id>:confirmation_bars      that node's confirmation bars
+  cond:<id>:enabled                that node's ON/OFF toggle
+  entry:<rid>:enabled              entry rule ON/OFF toggle (rule.toggle_optimize)
+  entry:<rid>:a<i>:action_value    entry rule action i's value
+  entry:<rid>:a<i>:enabled         entry rule action i's ON/OFF toggle
+  exit:<rid>:enabled               exit rule ON/OFF toggle
+  exit:<rid>:a<i>:action_value     exit rule action i's value
+  exit:<rid>:a<i>:enabled          exit rule action i's ON/OFF toggle
+  exit:<rid>:a<i>:option_delta     option strike delta (option actions)
+  exit:<rid>:a<i>:option_dte       option DTE window center
+  exit:<rid>:a<i>:option_wing_width  option wing width %
+  schedule:<day>                   ON/OFF toggle for that weekday's entry scan
+  screener:<setting>               screener settings
+
+The pre-028 namespaces (``exit:<id>:action_value`` with the action fields on
+the rule itself, ``entry:<id>:*`` for the flat entry_actions list) are decoded
+nowhere here anymore — saved rows carrying them are reconstructed by the
+quick-load path, not by this module.
 """
 import copy
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
 # Fixed order so the gene list (and therefore reproducibility) is stable across runs.
 SCHEDULE_DAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+
+# Actions that must NEVER be dropped by a per-action toggle: removing the open action would
+# turn an entry rule into a no-op bracket; guards must stay. (Rule-level toggles can still
+# drop the whole rule.)
+_UNDROPPABLE_ACTIONS = {"buy", "sell"}
 
 
 def _range_entry(min_v, max_v, step_v, is_int: bool) -> Dict[str, Any]:
@@ -49,11 +71,6 @@ def _collect_expert(expert_cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """model:<p> ranges from per-expert numeric settings marked optimize=True.
 
     expert_cfg shape: {param_name: {'optimize': bool,'min','max','step','type'}}.
-    For the ML expert this is typically empty (model frozen, decision thresholds
-    live in the condition tree). For ba2 experts: EarningsDrift surprise_min_pct/
-    max_days_since_report/expected_profit_percent; Insider lookback_days/
-    min_insiders/min_total_value; Rating profit_ratio/min_analysts; FactorRanker
-    factor weights/top_n/winsorize_pct.
     """
     out: Dict[str, Any] = {}
     if not expert_cfg:
@@ -91,11 +108,9 @@ def _collect_screener(screener_cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 def _collect_schedule_days(schedule_cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """schedule:<day> ON/OFF toggle genes from a schedule_cfg ({day: {optimize: bool}}).
 
-    One boolean gene per weekday the GA can independently flip, replacing a single fixed
-    --run-schedule-day pin with a per-individual, per-day search (e.g. a fast-decaying signal
-    can discover "monday+thursday" itself instead of a hand-picked cadence). ``decode_params``
-    enforces at least one day stays ON (an all-OFF individual would never scan for entries at
-    all — a dead config, not a legitimately weak one)."""
+    One boolean gene per weekday the GA can independently flip. ``decode_params`` enforces at
+    least one day stays ON (an all-OFF individual would never scan for entries at all — a dead
+    config, not a legitimately weak one)."""
     out: Dict[str, Any] = {}
     for day, spec in (schedule_cfg or {}).items():
         if day in SCHEDULE_DAYS and spec and spec.get("optimize"):
@@ -104,98 +119,84 @@ def _collect_schedule_days(schedule_cfg: Optional[Dict[str, Any]]) -> Dict[str, 
 
 
 def _walk_condition_nodes(cond: Optional[Dict[str, Any]], out: Dict[str, Any]) -> None:
-    """Emit cond:<id>:value and cond:<id>:confirmation_bars for optimizable nodes.
+    """Emit cond:<id>:value / :confirmation_bars / :enabled for optimizable nodes.
 
-    Mirrors api/strategies.py traverse_conditions: AND/OR nodes recurse via
-    'conditions'; leaf nodes carry id + value + optimize flags.
+    AND/OR nodes recurse via 'conditions'; leaf nodes carry id + value + optimize flags.
     """
     if not isinstance(cond, dict):
         return
-    # Recurse into AND/OR sub-trees
     for child in (cond.get("conditions") or []):
         _walk_condition_nodes(child, out)
     cid = cond.get("id")
     if not cid:
         return
-    # value optimization
     if cond.get("optimize") or cond.get("optimize_enabled"):
         out[f"cond:{cid}:value"] = _range_entry(
             cond.get("value_min"), cond.get("value_max"), cond.get("value_step"),
             is_int=False,
         )
-    # confirmation-bars optimization
     if cond.get("confirmation_bars_min") is not None:
         out[f"cond:{cid}:confirmation_bars"] = _range_entry(
             cond.get("confirmation_bars_min"), cond.get("confirmation_bars_max"),
             cond.get("confirmation_bars_step"), is_int=True,
         )
-    # ON/OFF toggle: a 0/1 gene the optimizer flips to enable/disable this condition
-    # (a "step" the optimizer can turn on or off). Marked via toggle_optimize=True.
     if cond.get("toggle_optimize"):
         out[f"cond:{cid}:enabled"] = _range_entry(0, 1, 1, is_int=True)
 
 
+def _collect_action_genes(ns: str, rid: str, idx: int, action: Dict[str, Any],
+                          out: Dict[str, Any]) -> None:
+    """Genes for ONE action of a rule: value, per-action toggle, and option selection params."""
+    prefix = f"{ns}:{rid}:a{idx}"
+    if action.get("action_value_optimize"):
+        out[f"{prefix}:action_value"] = _range_entry(
+            action.get("action_value_min"), action.get("action_value_max"),
+            action.get("action_value_step"), is_int=False,
+        )
+    at = str(action.get("action_type") or action.get("action") or "")
+    if action.get("toggle_optimize") and at not in _UNDROPPABLE_ACTIONS:
+        out[f"{prefix}:enabled"] = _range_entry(0, 1, 1, is_int=True)
+    # OPTION action selection params: strike delta / DTE window center / wing width.
+    if action.get("option_strike_param_optimize"):
+        out[f"{prefix}:option_delta"] = _range_entry(
+            action.get("option_strike_param_min"),
+            action.get("option_strike_param_max"),
+            action.get("option_strike_param_step"), is_int=False,
+        )
+    if action.get("option_dte_optimize"):
+        out[f"{prefix}:option_dte"] = _range_entry(
+            action.get("option_dte_min_range"),
+            action.get("option_dte_max_range"),
+            action.get("option_dte_step"), is_int=True,
+        )
+    if action.get("option_wing_width_optimize"):
+        out[f"{prefix}:option_wing_width"] = _range_entry(
+            action.get("option_wing_width_min"),
+            action.get("option_wing_width_max"),
+            action.get("option_wing_width_step"), is_int=False,
+        )
+
+
+def _collect_rule_list(rules, ns: str, out: Dict[str, Any]) -> None:
+    """cond:* + rule/action genes across ONE TradeRule list (ns = 'entry' or 'exit')."""
+    for rule in (rules or []):
+        if not isinstance(rule, dict):
+            continue
+        rid = rule.get("id")
+        if rid and rule.get("toggle_optimize"):
+            out[f"{ns}:{rid}:enabled"] = _range_entry(0, 1, 1, is_int=True)
+        if rid:
+            for idx, action in enumerate(a for a in (rule.get("actions") or [])
+                                         if isinstance(a, dict)):
+                _collect_action_genes(ns, rid, idx, action, out)
+        _walk_condition_nodes(rule.get("conditions"), out)
+
+
 def _collect_conditions(strategy) -> Dict[str, Any]:
-    """cond:<id>:* across buy + sell trees, exit:<id>:action_value across exits,
-    and entry:<id>:action_value across strategy.entry_actions."""
+    """All cond:*/entry:*/exit:* genes across the strategy's two rule lists."""
     out: Dict[str, Any] = {}
-    _walk_condition_nodes(getattr(strategy, "buy_entry_conditions", None), out)
-    _walk_condition_nodes(getattr(strategy, "sell_entry_conditions", None), out)
-    # legacy single entry tree (backwards compat)
-    _walk_condition_nodes(getattr(strategy, "entry_conditions", None), out)
-    # entry_actions: adjust_take_profit/adjust_stop_loss rules seeded onto the enter
-    # rule (live parity — action_0=buy/action_1=adjust_take_profit sharing one gate).
-    # Same action_value_optimize/toggle_optimize fields as exit_conditions, but no
-    # option-selection branches and no nested 'conditions' sub-tree (entry actions
-    # fire on the SAME gate as the buy/sell action, they have no condition of their own).
-    for entry_rule in (getattr(strategy, "entry_actions", None) or []):
-        if not isinstance(entry_rule, dict):
-            continue
-        eid = entry_rule.get("id")
-        if eid and entry_rule.get("action_value_optimize"):
-            out[f"entry:{eid}:action_value"] = _range_entry(
-                entry_rule.get("action_value_min"), entry_rule.get("action_value_max"),
-                entry_rule.get("action_value_step"), is_int=False,
-            )
-        # ON/OFF toggle for the whole entry action (optimizer can drop it entirely).
-        if eid and entry_rule.get("toggle_optimize"):
-            out[f"entry:{eid}:enabled"] = _range_entry(0, 1, 1, is_int=True)
-    for exit_rule in (getattr(strategy, "exit_conditions", None) or []):
-        if not isinstance(exit_rule, dict):
-            continue
-        eid = exit_rule.get("id")
-        if eid and exit_rule.get("action_value_optimize"):
-            out[f"exit:{eid}:action_value"] = _range_entry(
-                exit_rule.get("action_value_min"), exit_rule.get("action_value_max"),
-                exit_rule.get("action_value_step"), is_int=False,
-            )
-        # OPTION action selection params (Plan 2 T4): the strike delta and DTE the
-        # optimizer can tune for an exit rule that opens an option position.
-        if eid and exit_rule.get("option_strike_param_optimize"):
-            out[f"exit:{eid}:option_delta"] = _range_entry(
-                exit_rule.get("option_strike_param_min"),
-                exit_rule.get("option_strike_param_max"),
-                exit_rule.get("option_strike_param_step"), is_int=False,
-            )
-        if eid and exit_rule.get("option_dte_optimize"):
-            out[f"exit:{eid}:option_dte"] = _range_entry(
-                exit_rule.get("option_dte_min_range"),
-                exit_rule.get("option_dte_max_range"),
-                exit_rule.get("option_dte_step"), is_int=True,
-            )
-        # WING WIDTH for multi-leg option strategies (iron condor / jade lizard /
-        # butterfly / ratio): a float % the optimizer can tune for the spread width.
-        if eid and exit_rule.get("option_wing_width_optimize"):
-            out[f"exit:{eid}:option_wing_width"] = _range_entry(
-                exit_rule.get("option_wing_width_min"),
-                exit_rule.get("option_wing_width_max"),
-                exit_rule.get("option_wing_width_step"), is_int=False,
-            )
-        # ON/OFF toggle for the whole exit rule (optimizer can drop it entirely).
-        if eid and exit_rule.get("toggle_optimize"):
-            out[f"exit:{eid}:enabled"] = _range_entry(0, 1, 1, is_int=True)
-        # exit rules may also carry an optimizable condition sub-tree
-        _walk_condition_nodes(exit_rule.get("conditions"), out)
+    _collect_rule_list(getattr(strategy, "entry_rules", None), "entry", out)
+    _collect_rule_list(getattr(strategy, "exit_rules", None), "exit", out)
     return out
 
 
@@ -208,27 +209,22 @@ def collect_param_space(
 ) -> Dict[str, Any]:
     """Return the flat joint param_ranges dict for GeneticOptimizer.
 
-    Merges expert (model:*, including RM sizing settings) + condition/exit/entry-action
-    (cond:*/exit:*/entry:*) ranges. Key order is deterministic (model, conditions) so
-    the gene list is stable across runs — required for reproducibility. There is no
-    bespoke tp/sl gene namespace: the decoded ``tp``/``sl`` keys are a legacy
-    pass-through only (see module docstring) — entry TP/SL is optimized via the
-    ``entry:<id>:*`` namespace instead.
+    Merges expert (model:*, including RM sizing settings) + rule/action/condition
+    (cond:*/entry:*/exit:*) ranges. Key order is deterministic (model, rules) so the gene
+    list is stable across runs — required for reproducibility.
 
-    BYPASS experts (piece 1c): when ``bypass`` is True the strategy/expert does NOT use
-    the classic RM or the enter/exit ruleset (e.g. FactorRanker rebalances to target weights
-    via its own portfolio manager). For such an expert the search space is restricted to the
-    expert's OWN params (model:*) ONLY — the cond:*, exit:* and entry:* namespaces are
-    EXCLUDED (they have no effect on the rebalance path, so optimizing them would be noise).
-    ``schedule_cfg`` (entry-scan weekday toggles) is likewise excluded for bypass experts —
-    they don't use the classic per-day entry-scan gate at all.
+    BYPASS experts: when ``bypass`` is True the strategy/expert does NOT use the classic RM
+    or the enter/exit ruleset (e.g. FactorRanker rebalances to target weights via its own
+    portfolio manager). The search space is restricted to the expert's OWN params (model:*)
+    ONLY — cond:*/entry:*/exit:* and schedule:* are EXCLUDED (no effect on the rebalance
+    path). ``screener:*`` genes apply on BOTH paths.
     """
     space: Dict[str, Any] = {}
     space.update(_collect_expert(expert_cfg))
     if not bypass:
         space.update(_collect_conditions(strategy))
         space.update(_collect_schedule_days(schedule_cfg))
-    space.update(_collect_screener(screener_cfg))  # screener genes apply on BOTH paths
+    space.update(_collect_screener(screener_cfg))
     if not space:
         raise ValueError(
             "No optimizable parameters found: "
@@ -249,10 +245,8 @@ def collect_param_space(
 
 def _apply_to_tree(tree: Optional[Dict[str, Any]], by_id: Dict[str, Dict[str, Any]]
                    ) -> Optional[Dict[str, Any]]:
-    """Deep-copy a condition tree, substituting value/confirmation_bars by node id.
-
-    The input tree (and therefore the source Strategy) is never mutated.
-    """
+    """Deep-copy a condition tree, substituting value/confirmation_bars by node id and
+    dropping toggle-disabled nodes. The input tree is never mutated."""
     if tree is None:
         return None
     new = copy.deepcopy(tree)
@@ -283,44 +277,97 @@ def _apply_to_tree(tree: Optional[Dict[str, Any]], by_id: Dict[str, Dict[str, An
     return new
 
 
+def _apply_option_dte(action: Dict[str, Any], center_val: Any) -> None:
+    """option_dte gene tunes the DTE WINDOW CENTER; keep a half-width so the [min, max] span
+    covers real (weekly) expiries instead of a single impossible day."""
+    center = int(round(center_val))
+    base_hw = 0
+    try:
+        bmin = action.get("option_dte_min")
+        bmax = action.get("option_dte_max")
+        if bmin is not None and bmax is not None and bmax > bmin:
+            base_hw = int((bmax - bmin) // 2)
+    except Exception:  # noqa: BLE001 - defensive: malformed base window -> default hw
+        base_hw = 0
+    hw = max(base_hw, 7)  # at least +/-7 days so a weekly expiry falls in-window
+    action["option_dte_min"] = max(0, center - hw)
+    action["option_dte_max"] = center + hw
+
+
+def _decode_rule_list(rules, ns: str,
+                      rule_genes: Dict[str, Dict[str, Any]],
+                      cond_by_id: Dict[str, Dict[str, Any]]):
+    """Deep-copy ONE TradeRule list applying decoded genes: drop toggle-disabled rules,
+    substitute per-action values / option params, drop toggle-disabled (non-open) actions,
+    and substitute condition values."""
+    out = []
+    for rule in copy.deepcopy(rules or []):
+        if not isinstance(rule, dict):
+            out.append(rule)
+            continue
+        rid = rule.get("id")
+        genes = rule_genes.get(rid or "", {})
+        if genes.get("enabled") == 0:
+            continue  # whole rule dropped by the GA
+        actions = []
+        for idx, action in enumerate(a for a in (rule.get("actions") or [])
+                                     if isinstance(a, dict)):
+            agenes = genes.get(f"a{idx}", {})
+            at = str(action.get("action_type") or action.get("action") or "")
+            if agenes.get("enabled") == 0 and at not in _UNDROPPABLE_ACTIONS:
+                continue  # this action dropped by the GA
+            if "action_value" in agenes:
+                action["action_value"] = agenes["action_value"]
+                action["value"] = agenes["action_value"]
+            if "option_delta" in agenes:
+                action["option_strike_param"] = agenes["option_delta"]
+            if "option_dte" in agenes:
+                _apply_option_dte(action, agenes["option_dte"])
+            if "option_wing_width" in agenes:
+                action["option_wing_width_pct"] = agenes["option_wing_width"]
+            actions.append(action)
+        rule["actions"] = actions
+        if rule.get("conditions"):
+            rule["conditions"] = _apply_to_tree(rule["conditions"], cond_by_id)
+        out.append(rule)
+    return out
+
+
 def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
     """Reconstruct a concrete trial config from a decoded flat params dict.
 
-    The flat dict comes from GeneticOptimizer.decode_individual (namespaced keys:
-    tp | sl | model:<p> | cond:<id>:value | cond:<id>:confirmation_bars |
-    exit:<id>:action_value | entry:<id>:action_value | schedule:<day>). Returns::
+    The flat dict comes from GeneticOptimizer.decode_individual (namespaced keys — see the
+    module docstring). Returns::
 
       {
-        'tp': float, 'sl': float,                 # falls back to strategy defaults
         'expert_overrides': {param: value},       # model:* stripped of prefix (incl. RM sizing)
+        'screener_overrides': {setting: value},
         'schedule_days': {day: bool}|None,        # None when no schedule:* genes were collected
-        'buy_tree': dict|None, 'sell_tree': dict|None, 'exit_rules': list,
-        'entry_rules': list,                      # from strategy.entry_actions
+        'entry_rules': list,                      # concrete TradeRule lists (genes applied,
+        'exit_rules': list,                       #  disabled rules/actions pruned)
       }
 
-    The source Strategy is NEVER mutated (trees are deep-copied).
+    The source Strategy is NEVER mutated (rules are deep-copied).
     """
-    # Partition flat keys by namespace
     cond_by_id: Dict[str, Dict[str, Any]] = {}
-    exit_action_by_id: Dict[str, Any] = {}
-    exit_enabled_by_id: Dict[str, Any] = {}
-    exit_option_delta_by_id: Dict[str, Any] = {}
-    exit_option_dte_by_id: Dict[str, Any] = {}
-    exit_option_wing_by_id: Dict[str, Any] = {}
-    entry_action_by_id: Dict[str, Any] = {}
-    entry_enabled_by_id: Dict[str, Any] = {}
+    entry_genes: Dict[str, Dict[str, Any]] = {}
+    exit_genes: Dict[str, Dict[str, Any]] = {}
     expert_overrides: Dict[str, Any] = {}
     screener_overrides: Dict[str, Any] = {}
     schedule_by_day: Dict[str, Any] = {}
-    tp = getattr(strategy, "initial_tp_percent", None)
-    sl = getattr(strategy, "initial_sl_percent", None)
+
+    def _rule_gene(store: Dict[str, Dict[str, Any]], rid: str, rest: str, val: Any) -> None:
+        genes = store.setdefault(rid, {})
+        if rest == "enabled":
+            genes["enabled"] = val
+        elif rest.startswith("a") and ":" in rest:
+            aid, field = rest.split(":", 1)
+            genes.setdefault(aid, {})[field] = val
+        else:
+            raise ValueError(f"Unknown rule gene field {rest!r} for rule {rid!r}")
 
     for key, val in flat_params.items():
-        if key == "tp":
-            tp = val
-        elif key == "sl":
-            sl = val
-        elif key.startswith("model:"):
+        if key.startswith("model:"):
             expert_overrides[key[len("model:"):]] = val
         elif key.startswith("screener:"):
             screener_overrides[key[len("screener:"):]] = val
@@ -329,84 +376,19 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
         elif key.startswith("cond:"):
             _, cid, field = key.split(":", 2)
             cond_by_id.setdefault(cid, {})[field] = val
-        elif key.startswith("exit:"):
-            _, eid, field = key.split(":", 2)  # 'action_value'|'enabled'|'option_delta'|'option_dte'|'option_wing_width'
-            if field == "enabled":
-                exit_enabled_by_id[eid] = val
-            elif field == "option_delta":
-                exit_option_delta_by_id[eid] = val
-            elif field == "option_dte":
-                exit_option_dte_by_id[eid] = val
-            elif field == "option_wing_width":
-                exit_option_wing_by_id[eid] = val
-            else:
-                exit_action_by_id[eid] = val
         elif key.startswith("entry:"):
-            _, eid, field = key.split(":", 2)  # 'action_value'|'enabled'
-            if field == "enabled":
-                entry_enabled_by_id[eid] = val
-            else:
-                entry_action_by_id[eid] = val
+            _, rid, rest = key.split(":", 2)
+            _rule_gene(entry_genes, rid, rest, val)
+        elif key.startswith("exit:"):
+            _, rid, rest = key.split(":", 2)
+            _rule_gene(exit_genes, rid, rest, val)
         else:
             raise ValueError(f"Unknown decoded param namespace: {key!r}")
 
-    buy_tree = _apply_to_tree(getattr(strategy, "buy_entry_conditions", None), cond_by_id)
-    sell_tree = _apply_to_tree(getattr(strategy, "sell_entry_conditions", None), cond_by_id)
-
-    exit_rules = []
-    for rule in copy.deepcopy(getattr(strategy, "exit_conditions", None) or []):
-        if not isinstance(rule, dict):
-            exit_rules.append(rule)
-            continue
-        eid = rule.get("id")
-        # ON/OFF toggle: an exit rule whose 'enabled' gene decoded to 0 is dropped entirely.
-        if eid in exit_enabled_by_id and exit_enabled_by_id[eid] == 0:
-            continue
-        if eid in exit_action_by_id:
-            rule["action_value"] = exit_action_by_id[eid]
-        # OPTION action selection params (Plan 2 T4).
-        if eid in exit_option_delta_by_id:
-            rule["option_strike_param"] = exit_option_delta_by_id[eid]
-        if eid in exit_option_dte_by_id:
-            # option_dte gene tunes the DTE WINDOW CENTER; keep a half-width so the
-            # [min, max] span covers real (weekly) expiries instead of a single
-            # impossible day. A single-day window (min == max) almost never matches an
-            # actual discrete expiry, so the option entry selects nothing -> 0 fills.
-            center = int(round(exit_option_dte_by_id[eid]))
-            base_hw = 0
-            try:
-                bmin = rule.get("option_dte_min")
-                bmax = rule.get("option_dte_max")
-                if bmin is not None and bmax is not None and bmax > bmin:
-                    base_hw = int((bmax - bmin) // 2)
-            except Exception:  # noqa: BLE001 - defensive: malformed base window -> default hw
-                base_hw = 0
-            hw = max(base_hw, 7)  # at least +/-7 days so a weekly expiry falls in-window
-            rule["option_dte_min"] = max(0, center - hw)
-            rule["option_dte_max"] = center + hw
-        # WING WIDTH: applied directly as the rule_builders key option_wing_width_pct
-        # (mirrors option_strike_param; no window logic — it's a plain float %).
-        if eid in exit_option_wing_by_id:
-            rule["option_wing_width_pct"] = exit_option_wing_by_id[eid]
-        if rule.get("conditions"):
-            rule["conditions"] = _apply_to_tree(rule["conditions"], cond_by_id)
-        exit_rules.append(rule)
-
-    # entry_actions: adjust_take_profit/adjust_stop_loss rules seeded onto the enter
-    # rule. Mirrors exit_rules exactly (drop on toggle-off, apply decoded action_value)
-    # minus the option-selection-param handling (not applicable to entry actions).
-    entry_rules = []
-    for rule in copy.deepcopy(getattr(strategy, "entry_actions", None) or []):
-        if not isinstance(rule, dict):
-            entry_rules.append(rule)
-            continue
-        eid = rule.get("id")
-        # ON/OFF toggle: an entry action whose 'enabled' gene decoded to 0 is dropped.
-        if eid in entry_enabled_by_id and entry_enabled_by_id[eid] == 0:
-            continue
-        if eid in entry_action_by_id:
-            rule["action_value"] = entry_action_by_id[eid]
-        entry_rules.append(rule)
+    entry_rules = _decode_rule_list(getattr(strategy, "entry_rules", None), "entry",
+                                    entry_genes, cond_by_id)
+    exit_rules = _decode_rule_list(getattr(strategy, "exit_rules", None), "exit",
+                                   exit_genes, cond_by_id)
 
     # Repair, don't reject: an all-days-OFF individual would never scan for entries at all (a
     # dead config the fitness function can't even distinguish from "just unlucky"), so force the
@@ -418,10 +400,9 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
             schedule_days[SCHEDULE_DAYS[0]] = True
 
     return {
-        "tp": tp, "sl": sl,
         "expert_overrides": expert_overrides,
         "screener_overrides": screener_overrides,
         "schedule_days": schedule_days,
-        "buy_tree": buy_tree, "sell_tree": sell_tree, "exit_rules": exit_rules,
         "entry_rules": entry_rules,
+        "exit_rules": exit_rules,
     }

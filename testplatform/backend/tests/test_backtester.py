@@ -119,45 +119,32 @@ def sample_strategy(test_db):
         name="Test Strategy",
         description="A test trading strategy",
         required_fields=["price_up_10pct"],
-        entry_conditions={
-            "operator": "AND",
-            "conditions": [
-                {
-                    "id": "cond1",
-                    "field": "price_up_10pct",
-                    "field_type": "model_probability",
-                    "comparison": ">",
-                    "value": 0.7
-                }
-            ]
-        },
-        exit_conditions=[
-            {
-                "id": "exit1",
-                "name": "Time Exit",
-                "conditions": {
-                    "field": "bars_in_trade",
-                    "field_type": "position",
-                    "comparison": ">",
-                    "value": 50
-                },
-                "action": "close"
-            }
-        ],
-        entry_actions=[
-            {
-                "id": "entry_tp",
-                "action_type": "adjust_take_profit",
-                "reference_value": "order_open_price",
-                "action_value": 5.0
+        entry_rules=[{
+            "id": "enter1",
+            "conditions": {
+                "operator": "AND",
+                "conditions": [
+                    {"id": "cond1", "field": "price_up_10pct",
+                     "field_type": "model_probability", "comparison": ">", "value": 0.7}
+                ]
             },
-            {
-                "id": "entry_sl",
-                "action_type": "adjust_stop_loss",
-                "reference_value": "order_open_price",
-                "action_value": -2.0
-            }
-        ]
+            "actions": [
+                {"action_type": "buy"},
+                {"id": "entry_tp", "action_type": "adjust_take_profit",
+                 "reference_value": "order_open_price", "action_value": 5.0},
+                {"id": "entry_sl", "action_type": "adjust_stop_loss",
+                 "reference_value": "order_open_price", "action_value": -2.0},
+            ],
+            "continue_processing": False,
+        }],
+        exit_rules=[{
+            "id": "exit1",
+            "name": "Time Exit",
+            "conditions": {"field": "bars_in_trade", "field_type": "position",
+                           "comparison": ">", "value": 50},
+            "actions": [{"action_type": "close"}],
+            "continue_processing": False,
+        }],
     )
     test_db.add(strategy)
     test_db.commit()
@@ -183,17 +170,16 @@ class TestExtractRequiredFields:
                 {"field": "volatility_high", "field_type": "model_class", "comparison": "==", "value": 1}
             ]
         }
-        exit_conds = []
-
-        result = extract_required_fields(entry, exit_conds)
+        # Unified rule model: the tree is a RULE's conditions sub-tree.
+        result = extract_required_fields([{"conditions": entry,
+                                           "actions": [{"action_type": "buy"}]}], [])
         assert sorted(result) == ["price_up_10pct", "volatility_high"]
 
     def test_extract_from_exit_conditions(self):
         """Should extract model fields from exit conditions."""
         from app.api.strategies import extract_required_fields
 
-        entry = {}
-        exit_conds = [
+        exit_rules = [
             {
                 "id": "exit1",
                 "conditions": {
@@ -202,11 +188,11 @@ class TestExtractRequiredFields:
                     "comparison": ">",
                     "value": 0.8
                 },
-                "action": "close"
+                "actions": [{"action_type": "close"}]
             }
         ]
 
-        result = extract_required_fields(entry, exit_conds)
+        result = extract_required_fields([], exit_rules)
         assert result == ["bearish_signal"]
 
     def test_extract_ignores_position_fields(self):
@@ -219,9 +205,8 @@ class TestExtractRequiredFields:
                 {"field": "hour", "field_type": "time", "comparison": ">=", "value": 9}
             ]
         }
-        exit_conds = []
-
-        result = extract_required_fields(entry, exit_conds)
+        result = extract_required_fields([{"conditions": entry,
+                                           "actions": [{"action_type": "buy"}]}], [])
         assert result == []
 
     def test_extract_nested_conditions(self):
@@ -241,16 +226,15 @@ class TestExtractRequiredFields:
                 {"field": "momentum", "field_type": "model_class", "comparison": "==", "value": 1}
             ]
         }
-        exit_conds = []
-
-        result = extract_required_fields(entry, exit_conds)
+        result = extract_required_fields([{"conditions": entry,
+                                           "actions": [{"action_type": "buy"}]}], [])
         assert sorted(result) == ["bear_signal", "bull_signal", "momentum"]
 
     def test_empty_conditions(self):
         """Should handle empty conditions gracefully."""
         from app.api.strategies import extract_required_fields
 
-        result = extract_required_fields({}, [])
+        result = extract_required_fields([], [])
         assert result == []
 
         result = extract_required_fields(None, None)
@@ -274,24 +258,23 @@ class TestStrategyModelSerialization:
         assert result["requiredFields"] == ["price_up_10pct"]
 
     def test_strategy_to_dict_conditions(self, sample_strategy):
-        """Test that conditions are properly serialized."""
+        """Test that rules are properly serialized (unified rule model)."""
         result = sample_strategy.to_dict()
 
-        assert "entryConditions" in result
-        assert result["entryConditions"]["operator"] == "AND"
-        assert len(result["entryConditions"]["conditions"]) == 1
+        assert "entryRules" in result
+        assert result["entryRules"][0]["conditions"]["operator"] == "AND"
+        assert len(result["entryRules"][0]["conditions"]["conditions"]) == 1
 
-        assert "exitConditions" in result
-        assert len(result["exitConditions"]) == 1
-        assert result["exitConditions"][0]["action"] == "close"
+        assert "exitRules" in result
+        assert len(result["exitRules"]) == 1
+        assert result["exitRules"][0]["actions"][0]["action_type"] == "close"
 
     def test_strategy_to_dict_tp_sl(self, sample_strategy):
-        """Entry-time TP/SL now rides on entryActions (adjust_take_profit/adjust_stop_loss
-        rules), not the deleted initialTpPercent/initialSlPercent scalar fields."""
+        """Entry-time TP/SL rides on the entry rule's adjust actions (unified rule model)."""
         result = sample_strategy.to_dict()
 
-        assert "entryActions" in result
-        by_type = {a["action_type"]: a for a in result["entryActions"]}
+        by_type = {a["action_type"]: a
+                   for a in result["entryRules"][0]["actions"] if "action_type" in a}
         assert by_type["adjust_take_profit"]["action_value"] == 5.0
         assert by_type["adjust_stop_loss"]["action_value"] == -2.0
 
@@ -310,16 +293,16 @@ class TestStrategyModelSerialization:
 
         strategy = Strategy(
             name="Empty Strategy",
-            entry_conditions={},
-            exit_conditions=[]
+            entry_rules=[],
+            exit_rules=[]
         )
         test_db.add(strategy)
         test_db.commit()
         test_db.refresh(strategy)
 
         result = strategy.to_dict()
-        assert result["entryConditions"] == {}
-        assert result["exitConditions"] == []
+        assert result["entryRules"] == []
+        assert result["exitRules"] == []
         assert result["requiredFields"] == []
 
         # Cleanup
@@ -550,9 +533,13 @@ class TestStrategyAPIEndpoints:
         data = response.json()
         assert data["name"] == "API Test Strategy"
         assert data["description"] == "Created via API"
-        by_type = {a["action_type"]: a for a in data["entryActions"]}
+        # The LEGACY trio converts server-side to the unified rule model: one entry rule
+        # carrying buy + the bracket actions.
+        assert len(data["entryRules"]) == 1
+        by_type = {a["action_type"]: a for a in data["entryRules"][0]["actions"]}
         assert by_type["adjust_take_profit"]["action_value"] == 10.0
         assert by_type["adjust_stop_loss"]["action_value"] == -5.0
+        assert by_type["buy"]["action_type"] == "buy"
         assert "bull_signal" in data["requiredFields"]
 
         # Store ID for later tests
@@ -579,12 +566,16 @@ class TestStrategyAPIEndpoints:
         strategy_id = TestStrategyAPIEndpoints.created_strategy_id
         update_data = {
             "name": "Updated Strategy Name",
-            "entry_actions": [
+            "entry_rules": [
                 {
-                    "id": "entry_tp",
-                    "action_type": "adjust_take_profit",
-                    "reference_value": "order_open_price",
-                    "action_value": 15.0
+                    "id": "enter1",
+                    "conditions": None,
+                    "actions": [
+                        {"action_type": "buy"},
+                        {"id": "entry_tp", "action_type": "adjust_take_profit",
+                         "reference_value": "order_open_price", "action_value": 15.0},
+                    ],
+                    "continue_processing": False,
                 }
             ]
         }
@@ -594,7 +585,7 @@ class TestStrategyAPIEndpoints:
 
         data = response.json()
         assert data["name"] == "Updated Strategy Name"
-        by_type = {a["action_type"]: a for a in data["entryActions"]}
+        by_type = {a["action_type"]: a for a in data["entryRules"][0]["actions"]}
         assert by_type["adjust_take_profit"]["action_value"] == 15.0
 
     def test_update_strategy_conditions(self, test_client):

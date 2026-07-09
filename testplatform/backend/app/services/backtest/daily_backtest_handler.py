@@ -95,18 +95,26 @@ def strategy_uses_options(cfg: Dict[str, Any]) -> bool:
 
     ALSO True when ``cfg["entry_action"]`` names an option action — a pure-option ENTRY (the
     enter_market ruleset fires the option directly, no equity leg), which is an options run even
-    when no exit rule names an option."""
+    when no exit rule names an option.
+
+    Rules in the unified TradeRule shape (an ``actions`` LIST per rule) are scanned per-action;
+    legacy single-action rows (action fields on the rule itself) keep working."""
+    def _names_option(cfg_like: Dict[str, Any]) -> bool:
+        a = cfg_like.get("option_strategy") or cfg_like.get("action_type") or cfg_like.get("action")
+        return bool(a and is_option_action(str(a)))
+
     ea = cfg.get("entry_action")
-    if isinstance(ea, dict):
-        a = ea.get("option_strategy") or ea.get("action_type") or ea.get("action")
-        if a and is_option_action(str(a)):
-            return True
-    for rule in (cfg.get("exit_rules") or cfg.get("exit_conditions") or []):
-        if not isinstance(rule, dict):
-            continue
-        action = rule.get("option_strategy") or rule.get("action_type") or rule.get("action")
-        if action and is_option_action(str(action)):
-            return True
+    if isinstance(ea, dict) and _names_option(ea):
+        return True
+    for key in ("exit_rules", "exit_conditions", "entry_rules"):
+        for rule in (cfg.get(key) or []):
+            if not isinstance(rule, dict):
+                continue
+            if _names_option(rule):
+                return True
+            for action in (rule.get("actions") or []):
+                if isinstance(action, dict) and _names_option(action):
+                    return True
     return False
 
 
@@ -703,31 +711,34 @@ def _build_experts(
     from app.services.backtest.default_rulesets import (
         seed_enter_long_ruleset,
         seed_enter_long_short_ruleset,
+        seed_entry_ruleset_from_rules,
+        seed_exit_ruleset_from_rules,
         seed_open_positions_ruleset,
         seed_ruleset_from_tree,
     )
 
-    # When the (optimizer-decoded) buy-entry condition tree is present, build the enter ruleset
-    # FROM it so the optimizer's cond:<id>:value thresholds + on/off toggles actually gate
-    # entries; else fall back to the default "BUY when bullish & flat" ruleset.
+    # UNIFIED RULE MODEL (migration 028): ``entry_rules``/``exit_rules`` carrying TradeRule
+    # lists (rows with an ``actions`` LIST) seed their rulesets 1:1 — one EventAction per rule,
+    # all actions + continue_processing verbatim, no implicit base gates (builders/converters
+    # make bullish+flat explicit). The LEGACY shapes (buy_tree/sell_tree condition trees, the
+    # flat entry-bracket list, single-action exit rows) keep working through the historical
+    # seeding path until every caller is migrated.
     buy_tree = config.get("buy_tree")
-    # Optimizer-decoded exit rules (open_positions): list of {conditions, action_type,
-    # reference_value, action_value, enabled} — seeded into the per-expert OPEN_POSITIONS
-    # ruleset so the engine manages held positions via the real RM/evaluator (Adjust TP/SL/Close).
     exit_rules = config.get("exit_rules")
-    # Entry-time TP/SL bracket: a list of rule dicts (same shape as ``exit_rules``) seeded
-    # alongside the buy/sell action via ``action_from_rule`` — the SAME conversion exit rules
-    # already use. Opt-in: absent/empty means the enter ruleset carries no bracket at all, and a
-    # position's protection is just the strategy's own exit conditions plus the classic RM's
-    # safeguard stop (TradeRiskManagement -> submit_order(sl_price=...)). enable_short adds the
-    # symmetric SELL/short entry rule + the RM enable_sell gate.
     entry_rules = config.get("entry_rules")
     enable_short = bool(config.get("enable_short"))
-    # Pure-option ENTRY: when set, the enter_market ruleset fires this option action directly
-    # (no equity leg) — the engine submits it directly (``_entry_is_option``).
+    # Pure-option ENTRY (legacy path): when set, the enter_market ruleset fires this option
+    # action directly (no equity leg) — the engine submits it directly (``_entry_is_option``).
+    # On the unified model an option entry is just an entry rule whose action is the option.
     entry_action = config.get("entry_action")
 
+    def _is_trade_rules(rules) -> bool:
+        return any(isinstance(r, dict) and isinstance(r.get("actions"), list)
+                   for r in (rules or []))
+
     def _seed_enter(nm: str) -> int:
+        if _is_trade_rules(entry_rules):
+            return seed_entry_ruleset_from_rules(entry_rules, name=nm)
         if buy_tree or entry_action or entry_rules:
             return seed_ruleset_from_tree(buy_tree, name=nm, enable_short=enable_short,
                                           entry_action=entry_action, entry_actions=entry_rules)
@@ -735,6 +746,8 @@ def _build_experts(
                 else seed_enter_long_ruleset(name=nm))
 
     def _seed_exit(nm: str) -> Optional[int]:
+        if _is_trade_rules(exit_rules):
+            return seed_exit_ruleset_from_rules(exit_rules, name=nm)
         return seed_open_positions_ruleset(exit_rules, name=nm) if exit_rules else None
 
     out: List[Tuple[Any, int, Dict[str, Any], int]] = []

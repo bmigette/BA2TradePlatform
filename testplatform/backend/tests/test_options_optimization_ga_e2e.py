@@ -42,30 +42,36 @@ def _host_db():
     yield
 
 
-# An exit rule that is an OPTION action (buy_call) with BOTH option selection-param genes on.
+# An exit rule (unified TradeRule shape) whose ACTION is an OPTION action (buy_call) with
+# BOTH option selection-param genes on.
 _OPTION_EXIT = {
     "id": "o1",
-    "action": "buy_call",
-    "action_type": "buy_call",
-    "option_strategy": "buy_call",
-    "option_strike_param": 0.3,
-    "option_strike_param_optimize": True,
-    "option_strike_param_min": 0.2,
-    "option_strike_param_max": 0.5,
-    "option_strike_param_step": 0.05,
-    "option_dte_optimize": True,
-    "option_dte_min_range": 20,
-    "option_dte_max_range": 45,
-    "option_dte_step": 5,
+    "conditions": {},
+    "continue_processing": False,
+    "actions": [{
+        "action_type": "buy_call",
+        "option_strategy": "buy_call",
+        "option_strike_param": 0.3,
+        "option_strike_param_optimize": True,
+        "option_strike_param_min": 0.2,
+        "option_strike_param_max": 0.5,
+        "option_strike_param_step": 0.05,
+        "option_dte_optimize": True,
+        "option_dte_min_range": 20,
+        "option_dte_max_range": 45,
+        "option_dte_step": 5,
+    }],
 }
 
 
 def _seed_option_strategy() -> int:
     db = SessionLocal()
     try:
+        import copy
         s = Strategy(
             name="opt-options-e2e",
-            exit_conditions=[dict(_OPTION_EXIT)],
+            entry_rules=[],
+            exit_rules=[copy.deepcopy(_OPTION_EXIT)],
         )
         db.add(s)
         db.commit()
@@ -172,8 +178,8 @@ def test_ga_options_run_injects_provider_and_optimizes_option_genes(monkeypatch)
 
     # 1. The option genes appear in the run's param space.
     assert row.parameter_ranges, "expected a non-empty param space"
-    assert "exit:o1:option_delta" in row.parameter_ranges
-    assert "exit:o1:option_dte" in row.parameter_ranges
+    assert "exit:o1:a0:option_delta" in row.parameter_ranges
+    assert "exit:o1:a0:option_dte" in row.parameter_ranges
 
     # 2. EVERY per-trial config carried the options provider (non-None options_cache_db) — each
     #    trial ran as an OPTIONS backtest.
@@ -185,9 +191,9 @@ def test_ga_options_run_injects_provider_and_optimizes_option_genes(monkeypatch)
     # 3. The run completed with >0 trials and best_params includes the option genes.
     assert row.all_results and len(row.all_results) > 0
     assert row.best_params is not None
-    assert "exit:o1:option_delta" in row.best_params
-    assert "exit:o1:option_dte" in row.best_params
+    assert "exit:o1:a0:option_delta" in row.best_params
+    assert "exit:o1:a0:option_dte" in row.best_params
     # And the GA climbed toward the deterministic peak (delta 0.35, dte 30).
-    assert 0.2 <= row.best_params["exit:o1:option_delta"] <= 0.5
-    assert 20 <= row.best_params["exit:o1:option_dte"] <= 45
+    assert 0.2 <= row.best_params["exit:o1:a0:option_delta"] <= 0.5
+    assert 20 <= row.best_params["exit:o1:a0:option_dte"] <= 45
     assert row.best_fitness is not None

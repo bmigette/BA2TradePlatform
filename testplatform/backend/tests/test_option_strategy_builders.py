@@ -54,7 +54,9 @@ def test_covered_call_has_overlay_rule():
     strat = mod._build_strategy("O_CC", "O_CC", "FMPRating")
     # O_CC is an equity entry with a covered-call OPEN_POSITIONS overlay (no entry_action).
     assert getattr(strat, "entry_action", None) is None
-    actions = [r.get("action_type") for r in (strat.exit_conditions or [])]
+    actions = [a.get("action_type")
+               for r in (strat.exit_rules or [])
+               for a in (r.get("actions") or [])]
     assert "sell_covered_call" in actions, f"expected sell_covered_call overlay; got {actions}"
 
 

@@ -2,12 +2,9 @@ from app.services.strategy_param_space import collect_param_space, decode_params
 import app.services.strategy_optimization_handler as H
 
 
-class _Strat:  # minimal stand-in
-    initial_tp_percent = 5.0
-    initial_sl_percent = 5.0
-    buy_entry_conditions = None
-    sell_entry_conditions = None
-    exit_conditions = []
+class _Strat:  # minimal stand-in (unified rule model)
+    entry_rules = []
+    exit_rules = []
 
 
 def test_collect_screener_adds_namespaced_genes():
@@ -23,13 +20,11 @@ def test_collect_screener_adds_namespaced_genes():
 
 def test_decode_screener_overrides():
     out = decode_params(_Strat(), {
-        "tp": 6.0, "sl": 4.0,
         "screener:screener_market_cap_min": 2e9,
         "screener:screener_relative_volume_min": 1.4,
     })
     assert out["screener_overrides"] == {
         "screener_market_cap_min": 2e9, "screener_relative_volume_min": 1.4}
-    assert out["tp"] == 6.0  # existing fields still present
 
 
 def test_trial_config_carries_screener_runtime(tmp_path):

@@ -110,26 +110,23 @@ def test_trial_config_forwards_explicit_cache_even_for_equity_only():
 # 2. param-space -> decode chain: the option genes flow to the trial's exit rule
 # --------------------------------------------------------------------------- #
 _OPTION_EXIT = {
-    "id": "o1", "action": "buy_call", "option_strategy": "buy_call",
-    "option_strike_param": 0.3,
-    "option_strike_param_optimize": True,
-    "option_strike_param_min": 0.2, "option_strike_param_max": 0.4,
-    "option_strike_param_step": 0.05,
-    "option_dte_optimize": True,
-    "option_dte_min_range": 20, "option_dte_max_range": 45, "option_dte_step": 5,
+    "id": "o1",
+    "conditions": {},
+    "continue_processing": False,
+    "actions": [{
+        "action_type": "buy_call", "option_strategy": "buy_call",
+        "option_strike_param": 0.3,
+        "option_strike_param_optimize": True,
+        "option_strike_param_min": 0.2, "option_strike_param_max": 0.4,
+        "option_strike_param_step": 0.05,
+        "option_dte_optimize": True,
+        "option_dte_min_range": 20, "option_dte_max_range": 45, "option_dte_step": 5,
+    }],
 }
 
 
-def _strategy(exit_conditions):
-    return types.SimpleNamespace(
-        initial_tp_optimize=False, initial_tp_min=None, initial_tp_max=None,
-        initial_tp_step=None,
-        initial_sl_optimize=False, initial_sl_min=None, initial_sl_max=None,
-        initial_sl_step=None,
-        buy_entry_conditions=None, sell_entry_conditions=None, entry_conditions=None,
-        initial_tp_percent=None, initial_sl_percent=None,
-        exit_conditions=exit_conditions,
-    )
+def _strategy(exit_rules):
+    return types.SimpleNamespace(entry_rules=[], exit_rules=exit_rules)
 
 
 def test_option_genes_emitted_and_decode_to_trial_rule():
@@ -139,30 +136,33 @@ def test_option_genes_emitted_and_decode_to_trial_rule():
     span >= 14 days so it covers a real (weekly) expiry instead of a single impossible day
     (min == max almost never matches a discrete expiry -> 0 fills). This is the gene ->
     trial-rule flow that _build_daily_trial_config then runs with the provider."""
-    strategy = _strategy([dict(_OPTION_EXIT)])
+    import copy
+    strategy = _strategy([copy.deepcopy(_OPTION_EXIT)])
 
     space = collect_param_space(strategy)
-    assert "exit:o1:option_delta" in space
-    assert "exit:o1:option_dte" in space
+    assert "exit:o1:a0:option_delta" in space
+    assert "exit:o1:a0:option_dte" in space
 
     decoded = decode_params(
-        strategy, {"exit:o1:option_delta": 0.35, "exit:o1:option_dte": 30}
+        strategy, {"exit:o1:a0:option_delta": 0.35, "exit:o1:a0:option_dte": 30}
     )
-    rule = decoded["exit_rules"][0]
-    assert rule["option_strike_param"] == 0.35
-    assert rule["option_dte_min"] <= 30 <= rule["option_dte_max"]
-    assert rule["option_dte_max"] - rule["option_dte_min"] >= 14
+    action = decoded["exit_rules"][0]["actions"][0]
+    assert action["option_strike_param"] == 0.35
+    assert action["option_dte_min"] <= 30 <= action["option_dte_max"]
+    assert action["option_dte_max"] - action["option_dte_min"] >= 14
 
 
 def test_decoded_option_rule_drives_options_cache_in_trial_config():
     """End of the chain: the decoded option rule (from the genes) makes _build_daily_trial_config
     derive a non-None options_cache_db — i.e. the genes -> rule -> provider injection holds."""
-    strategy = _strategy([dict(_OPTION_EXIT)])
+    import copy
+    strategy = _strategy([copy.deepcopy(_OPTION_EXIT)])
     decoded = decode_params(
-        strategy, {"exit:o1:option_delta": 0.35, "exit:o1:option_dte": 30}
+        strategy, {"exit:o1:a0:option_delta": 0.35, "exit:o1:a0:option_dte": 30}
     )
     cfg = H._build_daily_trial_config(_backtest_cfg(), decoded)
     assert cfg["options_cache_db"] is not None
-    assert cfg["exit_rules"][0]["option_strike_param"] == 0.35
+    action = cfg["exit_rules"][0]["actions"][0]
+    assert action["option_strike_param"] == 0.35
     # DTE decodes to a window centered on 30 (not a single impossible day).
-    assert cfg["exit_rules"][0]["option_dte_min"] <= 30 <= cfg["exit_rules"][0]["option_dte_max"]
+    assert action["option_dte_min"] <= 30 <= action["option_dte_max"]

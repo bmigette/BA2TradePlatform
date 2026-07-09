@@ -107,22 +107,26 @@ class ExitCondition(BaseModel):
 class StrategyCreate(BaseModel):
     name: str
     description: Optional[str] = None
-    # Old single entry conditions (deprecated, for backwards compat)
+    # Unified rule model (migration 028): ordered TradeRule lists — each rule = conditions
+    # tree + one-or-more actions + continue_processing. See
+    # docs/plans/2026-07-08-unified-rule-model.md.
+    entry_rules: Optional[List[dict]] = None
+    exit_rules: Optional[List[dict]] = None
+    # LEGACY trio (pre-028 clients): converted server-side via trade_rules_from_legacy when
+    # no entry_rules/exit_rules are supplied. Remove once the frontend is fully migrated.
     entry_conditions: Optional[dict] = None
-    # New separate buy/sell entry conditions
     buy_entry_conditions: Optional[dict] = None
     sell_entry_conditions: Optional[dict] = None
     exit_conditions: Optional[List[dict]] = None
-    # Entry TP/SL is a rule list, in the SAME shape as exit_conditions rows (minus a nested
-    # `conditions` sub-tree — an entry action fires on the same gate as the buy/sell action).
-    # Replaces the deleted initial_tp_*/initial_sl_* dedicated fields; see
-    # docs/plans/2026-07-03-entry-tp-sl-bracket-actions.md (REVISION 2026-07-04).
     entry_actions: Optional[List[dict]] = None
 
 
 class StrategyUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
+    entry_rules: Optional[List[dict]] = None
+    exit_rules: Optional[List[dict]] = None
+    # LEGACY trio (pre-028 clients), converted like StrategyCreate's.
     entry_conditions: Optional[dict] = None
     buy_entry_conditions: Optional[dict] = None
     sell_entry_conditions: Optional[dict] = None
@@ -130,28 +134,29 @@ class StrategyUpdate(BaseModel):
     entry_actions: Optional[List[dict]] = None
 
 
-def extract_required_fields(
-    first_arg=None,
-    second_arg=None,
-    *,
-    buy_entry_conditions: dict = None,
-    sell_entry_conditions: dict = None,
-    exit_conditions: list = None,
-    entry_conditions: dict = None
-) -> List[str]:
-    """Extract all model prediction fields used in conditions.
+def _resolve_rule_lists(payload) -> tuple:
+    """(entry_rules, exit_rules) from a create/update payload: the unified lists when given
+    (normalized), else the legacy trio converted via the shared trade_rules_from_legacy."""
+    from ba2_common.core.rule_models import normalize_trade_rules, trade_rules_from_legacy
 
-    Supports both old signature: extract_required_fields(entry_conditions, exit_conditions)
-    and new signature with keyword args for buy/sell split.
-    """
-    # Handle backwards compatibility with old positional signature
-    # Old: extract_required_fields(entry_conditions_dict, exit_conditions_list)
-    if first_arg is not None:
-        if isinstance(first_arg, dict):
-            entry_conditions = first_arg
-        if isinstance(second_arg, list):
-            exit_conditions = second_arg
+    if payload.entry_rules is not None or payload.exit_rules is not None:
+        return (normalize_trade_rules(payload.entry_rules or []),
+                normalize_trade_rules(payload.exit_rules or []))
+    if any(getattr(payload, f, None) is not None for f in
+           ("entry_conditions", "buy_entry_conditions", "sell_entry_conditions",
+            "exit_conditions", "entry_actions")):
+        converted = trade_rules_from_legacy(
+            buy_tree=payload.buy_entry_conditions or payload.entry_conditions,
+            sell_tree=payload.sell_entry_conditions,
+            entry_actions=payload.entry_actions,
+            exit_conditions=payload.exit_conditions,
+        )
+        return converted["entry_rules"], converted["exit_rules"]
+    return None, None
 
+
+def extract_required_fields(entry_rules: list = None, exit_rules: list = None) -> List[str]:
+    """Extract all model prediction fields used across the rule lists' condition trees."""
     fields = set()
 
     def traverse_conditions(cond):
@@ -165,12 +170,9 @@ def extract_required_fields(
                 for c in cond["conditions"]:
                     traverse_conditions(c)
 
-    # Traverse all condition sources
-    traverse_conditions(buy_entry_conditions)
-    traverse_conditions(sell_entry_conditions)
-    traverse_conditions(entry_conditions)
-    for exit_cond in (exit_conditions or []):
-        traverse_conditions(exit_cond.get("conditions"))
+    for rule in list(entry_rules or []) + list(exit_rules or []):
+        if isinstance(rule, dict):
+            traverse_conditions(rule.get("conditions"))
 
     return sorted(list(fields))
 
@@ -199,23 +201,16 @@ async def create_strategy(
     strategy: StrategyCreate,
     db: Session = Depends(get_db)
 ):
-    """Create a new strategy."""
-    required_fields = extract_required_fields(
-        buy_entry_conditions=strategy.buy_entry_conditions,
-        sell_entry_conditions=strategy.sell_entry_conditions,
-        exit_conditions=strategy.exit_conditions,
-        entry_conditions=strategy.entry_conditions
-    )
+    """Create a new strategy (unified rule model; legacy trio converted server-side)."""
+    entry_rules, exit_rules = _resolve_rule_lists(strategy)
+    required_fields = extract_required_fields(entry_rules, exit_rules)
 
     db_strategy = Strategy(
         name=strategy.name,
         description=strategy.description,
         required_fields=required_fields,
-        entry_conditions=strategy.entry_conditions,
-        buy_entry_conditions=strategy.buy_entry_conditions,
-        sell_entry_conditions=strategy.sell_entry_conditions,
-        exit_conditions=strategy.exit_conditions or [],
-        entry_actions=strategy.entry_actions or [],
+        entry_rules=entry_rules or [],
+        exit_rules=exit_rules or [],
     )
 
     db.add(db_strategy)
@@ -410,15 +405,17 @@ async def update_strategy(
 
     update_data = update.model_dump(exclude_unset=True)
 
-    # Recalculate required fields if any conditions changed
-    conditions_keys = ["entry_conditions", "buy_entry_conditions", "sell_entry_conditions", "exit_conditions"]
-    if any(k in update_data for k in conditions_keys):
+    # Any rule change (unified lists or legacy trio) resolves through the shared converter,
+    # then lands on the two rule-list columns; recalc required fields from the result.
+    rule_keys = ("entry_rules", "exit_rules", "entry_conditions", "buy_entry_conditions",
+                 "sell_entry_conditions", "exit_conditions", "entry_actions")
+    if any(k in update_data for k in rule_keys):
+        entry_rules, exit_rules = _resolve_rule_lists(update)
+        update_data = {k: v for k, v in update_data.items() if k not in rule_keys}
+        update_data["entry_rules"] = entry_rules if entry_rules is not None else strategy.entry_rules
+        update_data["exit_rules"] = exit_rules if exit_rules is not None else strategy.exit_rules
         update_data["required_fields"] = extract_required_fields(
-            buy_entry_conditions=update_data.get("buy_entry_conditions", strategy.buy_entry_conditions),
-            sell_entry_conditions=update_data.get("sell_entry_conditions", strategy.sell_entry_conditions),
-            exit_conditions=update_data.get("exit_conditions", strategy.exit_conditions),
-            entry_conditions=update_data.get("entry_conditions", strategy.entry_conditions)
-        )
+            update_data["entry_rules"], update_data["exit_rules"])
 
     for key, value in update_data.items():
         setattr(strategy, key, value)

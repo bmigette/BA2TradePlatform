@@ -460,6 +460,10 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 n_gens = int(ga["generations"])
                 gen = gen_state["gen"]
                 step = max(1, total_in_batch // 20)
+                # Periodic memory snapshot (master process only; cheap psutil calls, twice per
+                # generation — NOT per-trial) so a run leaves a coarse memory-over-time trail for
+                # diagnosing worker MemoryErrors, without adding any per-trial overhead.
+                _mem_mark = max(1, total_in_batch // 2)
 
                 def _emit_intra(done: int):
                     frac = (done / total_in_batch) if total_in_batch else 1.0
@@ -495,6 +499,10 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     _persist_live(pct)
                     if done % step == 0 or done == total_in_batch:
                         _emit_intra(done)
+                    if done == _mem_mark or done == total_in_batch:
+                        from app.services.distributed_eval import _log_memory_diagnostics
+                        _log_memory_diagnostics(
+                            logger.warning, f"gen {gen + 1}/{n_gens} ind {done}/{total_in_batch}")
                 return fits
 
             return batch_fitness
@@ -530,12 +538,16 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             from concurrent.futures import ProcessPoolExecutor
 
             _env = {k: _os.environ[k] for k in _WORKER_ENV_KEYS if _os.environ.get(k)}
-            _pool = ProcessPoolExecutor(
-                max_workers=parallel,
-                mp_context=_mp.get_context("spawn"),
-                initializer=_worker_init,
-                initargs=(_BACKEND_DIR, _env),
-            )
+
+            def _make_pool() -> ProcessPoolExecutor:
+                return ProcessPoolExecutor(
+                    max_workers=parallel,
+                    mp_context=_mp.get_context("spawn"),
+                    initializer=_worker_init,
+                    initargs=(_BACKEND_DIR, _env),
+                )
+
+            _pool = _make_pool()
             try:
                 _workers = _resolve_workers(db, opt.worker_ids)
             except Exception as e:  # noqa: BLE001 — distribution is optional; never block a run
@@ -548,6 +560,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 _evaluator = DistributedEvaluator(
                     _pool, opt.fitness_metric, parallel, opt_id,
                     workers=_workers, master_version=_master_version,
+                    pool_factory=_make_pool,
                 )
                 _evaluator.start()  # pre-flight: version-match + cache-push each worker
                 batch_fitness = make_batch_fitness(_evaluator.execute_jobs)
@@ -709,10 +722,9 @@ def _run_trial_backtest(
         RM sizing such as ``risk_per_trade_pct``) is MERGED into each expert's settings dict
         (the engine feeds settings to ``_process``; the RM reads its sizing params off the
         expert via ``get_setting_with_interface_default``);
-      * ``decoded['buy_tree']`` / ``decoded['sell_tree']`` / ``decoded['exit_rules']`` /
-        ``decoded['entry_rules']`` are the substituted condition trees + rule lists
-        (``entry_rules`` seeds the enter ruleset's opt-in TP/SL bracket, mirroring
-        ``exit_rules`` exactly).
+      * ``decoded['entry_rules']`` / ``decoded['exit_rules']`` are the substituted TradeRule
+        lists (unified rule model, migration 028) — the engine seeds the ENTER_MARKET /
+        OPEN_POSITIONS rulesets 1:1 from them.
 
     The legacy ML-expert single-asset path (``backtest_handler.run_backtest``) is kept as a
     lazily-imported fallback for ``engine == 'ml'`` so it never pulls torch unless explicitly
@@ -908,15 +920,12 @@ def _build_daily_trial_config(
         # Optional trade-frequency fitness scale (down-weight statistically thin few-trade configs).
         "fitness_trade_scale": backtest_cfg.get("fitness_trade_scale"),
         "fitness_trade_scale_cap": backtest_cfg.get("fitness_trade_scale_cap"),
-        # Optimizer-decoded condition trees: the engine builds the enter ruleset FROM buy_tree
-        # (seed_ruleset_from_tree) so cond:<id>:value thresholds + on/off toggles drive entries.
-        "buy_tree": decoded.get("buy_tree"),
-        "sell_tree": decoded.get("sell_tree"),
-        "exit_rules": decoded.get("exit_rules"),
-        # Entry-time TP/SL bracket rules (adjust_take_profit/adjust_stop_loss actions on the
-        # enter rule) — decoded from Strategy.entry_actions via the entry:<id>:* genes, mirrors
-        # exit_rules exactly. Opt-in: empty/absent means no bracket for this trial.
+        # Optimizer-decoded TradeRule lists (unified rule model, migration 028): the engine
+        # seeds the ENTER_MARKET / OPEN_POSITIONS rulesets 1:1 from these (one EventAction per
+        # rule, all actions + continue_processing verbatim; disabled rules/actions already
+        # pruned by decode_params).
         "entry_rules": decoded.get("entry_rules"),
+        "exit_rules": decoded.get("exit_rules"),
         # Pure-option ENTRY action (no equity leg): forwarded run-level so daily_backtest_handler.
         # _build_experts seeds the enter ruleset with it. None for equity strategies (unchanged).
         "entry_action": entry_action,
@@ -965,21 +974,15 @@ def _run_ml_trial_backtest(
         for df in (pred_df, exec_df):
             if "Date" in df.columns:
                 df["Date"] = pd.to_datetime(df["Date"])
-        # decoded['tp']/['sl'] are a legacy pass-through ONLY (see strategy_param_space's
-        # module/decode_params docstrings): collect_param_space no longer emits a "tp"/"sl"
-        # gene namespace for any real (DB-backed) Strategy — that GA gene family (formerly
-        # built by the deleted _collect_tp_sl) was removed along with the
-        # initial_tp_percent/initial_sl_percent scalar columns when entry TP/SL moved to
-        # entry_actions (docs/plans/2026-07-03-entry-tp-sl-bracket-actions.md). The legacy 'ml'
-        # engine was explicitly OUT OF SCOPE for that migration and was never wired onto
-        # entry_actions, so decoded["tp"]/["sl"] always resolve to None here now and this path
-        # is no longer GA-optimized. Fall back to the SAME static historical defaults (5.0/2.0)
-        # backtest_handler.run_backtest's single-run path already uses for this exact reason,
-        # so behavior is at least consistent across both 'ml'-engine call sites instead of
-        # silently degrading to a 0%/0% (disabled) bracket.
+        # The legacy 'ml' engine was explicitly OUT OF SCOPE for the entry-actions migration
+        # AND for the unified rule model (migration 028): the Strategy no longer stores the
+        # condition trees this engine consumes, so this path runs the STATIC historical
+        # defaults (5.0/2.0 bracket, no optimizer-substituted trees) — the same values
+        # backtest_handler.run_backtest's single-run path uses. Condition/rule genes have no
+        # effect on 'ml'-engine trials (they already effectively didn't).
         strategy_params = {
-            "initial_tp_percent": decoded["tp"] if decoded["tp"] is not None else 5.0,
-            "initial_sl_percent": decoded["sl"] if decoded["sl"] is not None else 2.0,
+            "initial_tp_percent": 5.0,
+            "initial_sl_percent": 2.0,
         }
         return run_backtest(
             model=model,
@@ -991,9 +994,9 @@ def _run_ml_trial_backtest(
             position_sizing_value=backtest_cfg.get("position_sizing_value", 10.0),
             commission=backtest_cfg.get("commission", 0.0),
             slippage=backtest_cfg.get("slippage", 0.0),
-            buy_entry_conditions=decoded["buy_tree"],
-            sell_entry_conditions=decoded["sell_tree"],
-            exit_conditions=decoded["exit_rules"],
+            buy_entry_conditions=None,
+            sell_entry_conditions=None,
+            exit_conditions=None,
         )
     finally:
         db.close()

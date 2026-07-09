@@ -265,3 +265,208 @@ def normalize_ruleset(buy: Any = None, sell: Any = None, exits: Any = None) -> D
         "sell_entry_conditions": normalize_tree(sell),
         "exit_conditions": normalize_exit_rules(exits),
     }
+
+
+# ---------------------------------------------------------------------------
+# Unified rule model (EventAction-shaped): TradeRule = conditions + actions[] +
+# continue_processing. The canonical Strategy shape going forward — mirrors the live
+# EventAction 1:1 (ordered rules, first-match unless continue_processing, N actions per
+# rule), ending the split between condition trees and a flat shared action list.
+# ---------------------------------------------------------------------------
+class ActionCfg(BaseModel):
+    """ONE action of a TradeRule (open/close/adjust/option). Accepts every legacy spelling
+    (``action``/``action_type``/``actionType``; ``value``/``action_value``); ``option_*``
+    selection params and other extras are preserved verbatim."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    id: Optional[str] = None
+    action_type: str = Field(validation_alias=AliasChoices("action_type", "action", "actionType"))
+    reference_value: Optional[str] = Field(default=None, validation_alias=AliasChoices("referenceValue", "reference_value"))
+    action_value: Optional[float] = Field(default=None, validation_alias=AliasChoices("actionValue", "action_value", "value"))
+    action_value_optimize: Optional[bool] = Field(default=None, validation_alias=AliasChoices("actionValueOptimize", "action_value_optimize"))
+    action_value_min: Optional[float] = Field(default=None, validation_alias=AliasChoices("actionValueMin", "action_value_min"))
+    action_value_max: Optional[float] = Field(default=None, validation_alias=AliasChoices("actionValueMax", "action_value_max"))
+    action_value_step: Optional[float] = Field(default=None, validation_alias=AliasChoices("actionValueStep", "action_value_step"))
+    toggle_optimize: Optional[bool] = Field(default=None, validation_alias=AliasChoices("toggleOptimize", "toggle_optimize"))
+
+    def to_canonical_dict(self) -> Dict[str, Any]:
+        out: Dict[str, Any] = {k: v for k, v in (self.__pydantic_extra__ or {}).items()}
+        if self.id is not None:
+            out["id"] = self.id
+        # both spellings, same convention as ExitRule (builder reads 'action', seeding
+        # 'action_type'); 'value' additionally mirrors the live EventAction actions-cfg key.
+        out["action"] = self.action_type
+        out["action_type"] = self.action_type
+        if self.reference_value is not None:
+            out["referenceValue"] = self.reference_value
+            out["reference_value"] = self.reference_value
+        if self.action_value is not None:
+            out["actionValue"] = self.action_value
+            out["action_value"] = self.action_value
+            out["value"] = self.action_value
+        if self.action_value_optimize is not None:
+            out["actionValueOptimize"] = self.action_value_optimize
+            out["action_value_optimize"] = self.action_value_optimize
+        for camel, snake, val in (
+            ("actionValueMin", "action_value_min", self.action_value_min),
+            ("actionValueMax", "action_value_max", self.action_value_max),
+            ("actionValueStep", "action_value_step", self.action_value_step),
+        ):
+            if val is not None:
+                out[camel] = val
+                out[snake] = val
+        if self.toggle_optimize is not None:
+            out["toggleOptimize"] = self.toggle_optimize
+            out["toggle_optimize"] = self.toggle_optimize
+        return out
+
+
+# Keys that belong to the RULE when lifting a legacy single-action row (everything else is
+# treated as part of that row's single action, so option_* params travel with the action).
+_RULE_LEVEL_KEYS = {
+    "id", "name", "conditions", "enabled",
+    "continue_processing", "continueProcessing",
+    "toggle_optimize", "toggleOptimize",
+    "actions",
+}
+
+
+def _lift_legacy_rule(rule: Dict[str, Any]) -> Dict[str, Any]:
+    """Lift a LEGACY single-action rule row (the exit_conditions / entry_actions shape:
+    action fields at the top level) into the TradeRule shape. New-shape rules (with an
+    ``actions`` list) pass through unchanged."""
+    if "actions" in rule and isinstance(rule["actions"], list):
+        return rule
+    action = {k: v for k, v in rule.items() if k not in _RULE_LEVEL_KEYS}
+    lifted = {k: v for k, v in rule.items() if k in _RULE_LEVEL_KEYS}
+    lifted["actions"] = [action] if action else []
+    return lifted
+
+
+class TradeRule(BaseModel):
+    """One EventAction-shaped strategy rule: conditions + ordered actions + continue flag.
+
+    Mirrors the live ``EventAction`` contract exactly: within a ruleset rules evaluate in
+    order, the first rule whose conditions match fires ALL its actions, and evaluation stops
+    unless ``continue_processing`` is True. ``conditions: None`` means "always matches"
+    (engine base triggers only). Accepts the new shape AND legacy single-action rows (lift
+    via :func:`_lift_legacy_rule` / :func:`normalize_trade_rules`)."""
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    id: Optional[str] = None
+    name: Optional[str] = None
+    conditions: Optional[Any] = None
+    actions: List[Any] = Field(default_factory=list)
+    continue_processing: bool = Field(default=False, validation_alias=AliasChoices("continueProcessing", "continue_processing"))
+    toggle_optimize: Optional[bool] = Field(default=None, validation_alias=AliasChoices("toggleOptimize", "toggle_optimize"))
+
+    def to_canonical_dict(self) -> Dict[str, Any]:
+        extra = {k: v for k, v in (self.__pydantic_extra__ or {}).items()}
+        out: Dict[str, Any] = dict(extra)
+        if self.id is not None:
+            out["id"] = self.id
+        if self.name is not None:
+            out["name"] = self.name
+        if self.conditions is not None:
+            out["conditions"] = _node_to_canonical(self.conditions)
+        out["actions"] = [
+            ActionCfg.model_validate(a).to_canonical_dict()
+            for a in (self.actions or [])
+            if isinstance(a, dict)
+        ]
+        out["continueProcessing"] = bool(self.continue_processing)
+        out["continue_processing"] = bool(self.continue_processing)
+        if self.toggle_optimize is not None:
+            out["toggleOptimize"] = self.toggle_optimize
+            out["toggle_optimize"] = self.toggle_optimize
+        return out
+
+
+def normalize_trade_rules(rules: Any) -> List[Dict[str, Any]]:
+    """Normalise a list of rules to the canonical TradeRule shape. Accepts new-shape rules
+    (``actions`` list) AND legacy single-action rows (exit_conditions / entry_actions shape)
+    in the same list. Non-list input / non-dict entries are skipped."""
+    if not isinstance(rules, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for r in rules:
+        if isinstance(r, dict):
+            out.append(TradeRule.model_validate(_lift_legacy_rule(r)).to_canonical_dict())
+    return out
+
+
+def trade_rules_from_legacy(
+    buy_tree: Any = None,
+    sell_tree: Any = None,
+    entry_actions: Any = None,
+    exit_conditions: Any = None,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Convert the LEGACY Strategy trio (buy/sell condition trees + flat entry_actions +
+    single-action exit rows) into ``{"entry_rules": [...], "exit_rules": [...]}``.
+
+    Entry: one TradeRule per top-level OR branch of each side's tree (an AND/leaf tree is a
+    single rule), actions = the side's open action + the flat entry_actions bracket replicated
+    per rule — the exact semantics the old seeder implemented, now explicit in the data. The
+    old seeder also implicitly ANDed base gates (bullish/bearish + has_no_position) onto every
+    entry rule; the unified seeder is 1:1 with no magic, so those base leaves are PREPENDED
+    here explicitly whenever the branch doesn't already carry them. A ``None`` tree
+    contributes no rules for that side.
+    Exit: each legacy row lifts to a one-action TradeRule (order preserved).
+    """
+    bracket = [a for a in (entry_actions or []) if isinstance(a, dict)]
+
+    def _branches(tree: Any) -> List[Any]:
+        if not isinstance(tree, dict):
+            return []
+        op = str(tree.get("operator") or tree.get("type") or "AND").upper()
+        if op == "OR":
+            return [b for b in (tree.get("conditions") or []) if isinstance(b, dict)]
+        return [tree]
+
+    def _leaf_fields(node: Any) -> set:
+        if not isinstance(node, dict):
+            return set()
+        fields = set()
+        for child in (node.get("conditions") or []):
+            fields |= _leaf_fields(child)
+        if node.get("field"):
+            fields.add(node["field"])
+        return fields
+
+    def _with_base_gates(branch: dict, side: str, rid: str) -> dict:
+        present = _leaf_fields(branch)
+        signal = "bullish" if side == "buy" else "bearish"
+        base = []
+        if signal not in present:
+            base.append({"id": f"{rid}-{signal}", "field": signal, "field_type": "flag"})
+        if "has_no_position" not in present:
+            base.append({"id": f"{rid}-flat", "field": "has_no_position", "field_type": "flag"})
+        if not base:
+            return branch
+        kids = branch.get("conditions") if isinstance(branch, dict) else None
+        if isinstance(kids, list):
+            merged = dict(branch)
+            merged["conditions"] = base + kids
+            return merged
+        return {"id": f"{rid}-grp", "operator": "AND", "conditions": base + [branch]}
+
+    entry_rules: List[Dict[str, Any]] = []
+    for tree, open_action, side in ((buy_tree, "buy", "buy"), (sell_tree, "sell", "sell")):
+        branches = _branches(tree)
+        for j, branch in enumerate(branches):
+            suffix = f"-{j + 1}" if len(branches) > 1 else ""
+            rid = f"{side}{suffix}"
+            entry_rules.append({
+                "id": rid,
+                "name": f"enter-{side}{suffix}",
+                "conditions": _with_base_gates(branch, side, rid),
+                "actions": [{"action_type": open_action}] + [dict(a) for a in bracket],
+                "continue_processing": False,
+            })
+
+    return {
+        "entry_rules": normalize_trade_rules(entry_rules),
+        "exit_rules": normalize_trade_rules(exit_conditions or []),
+    }

@@ -48,16 +48,16 @@ from app.services import strategy_optimization_handler as H
 # Shared deterministic stub backtest + strategy stub
 # ---------------------------------------------------------------------------
 def _tp_sl_from_decoded(decoded):
-    """Extract (tp, sl) from a decode_params() result, supporting BOTH shapes exercised in this
-    file: the entry_actions-based Strategy (``decoded['entry_rules']`` carries adjust_take_profit
-    /adjust_stop_loss rules, Task 6) used by the DB-backed handler gates, and the raw ``tp``/``sl``
-    flat-gene shortcut several gates below use directly (bypassing collect_param_space/
-    entry_actions entirely via ``_strategy_stub`` + ``_TPSL_SPACE``). sl is returned as a positive
-    magnitude either way (entry_rules carries it signed negative per the sign convention)."""
-    rules = {r.get("action_type"): r for r in (decoded.get("entry_rules") or []) if isinstance(r, dict)}
-    if rules:
-        return rules["adjust_take_profit"]["action_value"], abs(rules["adjust_stop_loss"]["action_value"])
-    return decoded["tp"], decoded["sl"]
+    """Extract (tp, sl) from a decode_params() result on the unified rule model: the entry
+    TradeRule's adjust_take_profit / adjust_stop_loss ACTIONS. sl is returned as a positive
+    magnitude (the action carries it signed negative per the sign convention)."""
+    actions = {}
+    for rule in (decoded.get("entry_rules") or []):
+        for a in (rule.get("actions") or []):
+            if isinstance(a, dict) and a.get("action_type"):
+                actions[a["action_type"]] = a
+    return (actions["adjust_take_profit"]["action_value"],
+            abs(actions["adjust_stop_loss"]["action_value"]))
 
 
 def _deterministic_stub(backtest_cfg, hoisted, decoded):
@@ -79,40 +79,30 @@ def _deterministic_stub(backtest_cfg, hoisted, decoded):
 
 
 def _strategy_stub(**over):
+    """A Strategy-like object (unified rule model) with an entry bracket rule."""
     base = dict(
-        initial_tp_percent=5.0,
-        initial_sl_percent=2.0,
-        buy_entry_conditions=None,
-        sell_entry_conditions=None,
-        entry_conditions=None,
-        exit_conditions=[],
+        entry_rules=[{
+            "id": "bracket", "conditions": None, "continue_processing": False,
+            "actions": [
+                {"action_type": "buy"},
+                {"action_type": "adjust_take_profit", "reference_value": "order_open_price",
+                 "action_value": 5.0},
+                {"action_type": "adjust_stop_loss", "reference_value": "order_open_price",
+                 "action_value": -2.0},
+            ],
+        }],
+        exit_rules=[],
     )
     base.update(over)
     return types.SimpleNamespace(**base)
 
 
+# The SAME tp(2..12)/sl(1..6) grid the historical scalar genes searched, expressed as the
+# bracket rule's per-action value genes (sl signed negative per the sign convention).
 _TPSL_SPACE = {
-    "tp": {"type": "float", "min": 2, "max": 12, "step": 1},
-    "sl": {"type": "float", "min": 1, "max": 6, "step": 1},
+    "entry:bracket:a1:action_value": {"type": "float", "min": 2, "max": 12, "step": 1},
+    "entry:bracket:a2:action_value": {"type": "float", "min": -6, "max": -1, "step": 1},
 }
-
-# entry_actions equivalent of _TPSL_SPACE's range (Task 6): the SAME tp(2..12)/sl(1..6) grid,
-# expressed as adjust_take_profit/adjust_stop_loss rules with action_value_optimize, for the
-# DB-backed handler gates that need a real Strategy row.
-_ENTRY_TPSL_ACTIONS = [
-    {
-        "id": "e_tp", "action_type": "adjust_take_profit",
-        "reference_value": "order_open_price", "action_value": 5.0,
-        "action_value_optimize": True,
-        "action_value_min": 2.0, "action_value_max": 12.0, "action_value_step": 1.0,
-    },
-    {
-        "id": "e_sl", "action_type": "adjust_stop_loss",
-        "reference_value": "order_open_price", "action_value": -2.0,
-        "action_value_optimize": True,
-        "action_value_min": -6.0, "action_value_max": -1.0, "action_value_step": 1.0,
-    },
-]
 
 
 # ===========================================================================
@@ -130,30 +120,34 @@ def test_decode_by_id_deep_copy_source_unmutated():
              "confirmation_bars_step": 1},
         ],
     }
-    exits = [{"id": "e1", "action": "adjust_sl", "action_value": 1.0,
-              "action_value_optimize": True, "action_value_min": 0.5,
-              "action_value_max": 3.0, "action_value_step": 0.5, "conditions": {}}]
-    s = _strategy_stub(buy_entry_conditions=buy, exit_conditions=exits)
+    exits = [{"id": "e1", "conditions": {}, "continue_processing": False,
+              "actions": [{"action_type": "adjust_stop_loss", "action_value": 1.0,
+                           "action_value_optimize": True, "action_value_min": 0.5,
+                           "action_value_max": 3.0, "action_value_step": 0.5}]}]
+    entry_rules = [{"id": "r1", "conditions": buy, "continue_processing": False,
+                    "actions": [{"action_type": "buy"}]}]
+    s = _strategy_stub(entry_rules=entry_rules, exit_rules=exits)
 
-    buy_before = copy.deepcopy(s.buy_entry_conditions)
-    exits_before = copy.deepcopy(s.exit_conditions)
+    entry_before = copy.deepcopy(s.entry_rules)
+    exits_before = copy.deepcopy(s.exit_rules)
 
     decoded = decode_params(s, {
         "cond:c1:value": 0.8,
         "cond:c1:confirmation_bars": 3,
-        "exit:e1:action_value": 2.5,
+        "exit:e1:a0:action_value": 2.5,
     })
 
-    # The decoded trees carry the substituted values...
-    assert decoded["buy_tree"]["conditions"][0]["value"] == 0.8
-    assert decoded["buy_tree"]["conditions"][0]["confirmation_bars"] == 3
-    assert decoded["exit_rules"][0]["action_value"] == 2.5
+    # The decoded rules carry the substituted values...
+    leaf = decoded["entry_rules"][0]["conditions"]["conditions"][0]
+    assert leaf["value"] == 0.8
+    assert leaf["confirmation_bars"] == 3
+    assert decoded["exit_rules"][0]["actions"][0]["action_value"] == 2.5
     # ...and they are NOT the same objects as the source (deep-copied).
-    assert decoded["buy_tree"] is not s.buy_entry_conditions
-    assert decoded["exit_rules"] is not s.exit_conditions
+    assert decoded["entry_rules"] is not s.entry_rules
+    assert decoded["exit_rules"] is not s.exit_rules
     # ...and the source is completely unmutated.
-    assert s.buy_entry_conditions == buy_before
-    assert s.exit_conditions == exits_before
+    assert s.entry_rules == entry_before
+    assert s.exit_rules == exits_before
 
 
 def test_joint_space_is_real_with_every_family(seed_strategy):
@@ -161,22 +155,23 @@ def test_joint_space_is_real_with_every_family(seed_strategy):
     (entry:*/model:*/cond:*/exit:*) in one flat dict.
 
     Uses the conftest seed_strategy (real Strategy row) for the entry-time TP/SL bracket
-    (entry_actions), plus an expert_cfg + condition tree to exercise model:/cond:/exit:
+    (the bracket entry rule), plus an expert_cfg + condition tree to exercise model:/cond:/exit:
     namespaces. RM sizing rides on the expert model:* path (real ba2 setting names), so it is
     part of expert_cfg now — there is no separate rm:* namespace.
     """
     s = seed_strategy
-    s.buy_entry_conditions = {
-        "operator": "AND",
-        "conditions": [
+    s.entry_rules = list(s.entry_rules) + [{
+        "id": "gate9",
+        "conditions": {"operator": "AND", "conditions": [
             {"id": "c9", "field": "model:probability", "comparison": ">=", "value": 0.6,
-             "optimize": True, "value_min": 0.5, "value_max": 0.9, "value_step": 0.1},
-        ],
-    }
-    s.exit_conditions = [
-        {"id": "e9", "action": "adjust_sl", "action_value": 1.0,
-         "action_value_optimize": True, "action_value_min": 0.5,
-         "action_value_max": 3.0, "action_value_step": 0.5, "conditions": {}},
+             "optimize": True, "value_min": 0.5, "value_max": 0.9, "value_step": 0.1}]},
+        "actions": [{"action_type": "buy"}], "continue_processing": False,
+    }]
+    s.exit_rules = [
+        {"id": "e9", "conditions": {}, "continue_processing": False,
+         "actions": [{"action_type": "adjust_stop_loss", "action_value": 1.0,
+                      "action_value_optimize": True, "action_value_min": 0.5,
+                      "action_value_max": 3.0, "action_value_step": 0.5}]},
     ]
     expert_cfg = {
         "surprise_min_pct": {"optimize": True, "min": 1.0, "max": 20.0, "step": 1.0,
@@ -186,12 +181,13 @@ def test_joint_space_is_real_with_every_family(seed_strategy):
                                "type": "float"},
     }
     space = collect_param_space(s, expert_cfg=expert_cfg)
-    assert "entry:e_tp:action_value" in space and "entry:e_sl:action_value" in space
+    assert ("entry:bracket:a1:action_value" in space
+            and "entry:bracket:a2:action_value" in space)
     assert "model:risk_per_trade_pct" in space
     assert not any(k.startswith("rm:") for k in space)
     assert "model:surprise_min_pct" in space
     assert "cond:c9:value" in space
-    assert "exit:e9:action_value" in space
+    assert "exit:e9:a0:action_value" in space
     # every entry is a valid GeneticOptimizer range
     for name, spec in space.items():
         assert spec["type"] in ("int", "float"), name
@@ -276,7 +272,20 @@ def test_seeded_run_reproducible_through_handler(monkeypatch):
     def _seed_strategy_id():
         db = SessionLocal()
         try:
-            s = Strategy(name="gate-rep", entry_actions=_ENTRY_TPSL_ACTIONS)
+            s = Strategy(name="gate-rep", entry_rules=[{
+            "id": "bracket", "conditions": None, "continue_processing": False,
+            "actions": [
+                {"action_type": "buy"},
+                {"id": "e_tp", "action_type": "adjust_take_profit",
+                 "reference_value": "order_open_price", "action_value": 5.0,
+                 "action_value_optimize": True,
+                 "action_value_min": 2.0, "action_value_max": 12.0, "action_value_step": 1.0},
+                {"id": "e_sl", "action_type": "adjust_stop_loss",
+                 "reference_value": "order_open_price", "action_value": -2.0,
+                 "action_value_optimize": True,
+                 "action_value_min": -6.0, "action_value_max": -1.0, "action_value_step": 1.0},
+            ],
+        }], exit_rules=[])
             db.add(s)
             db.commit()
             db.refresh(s)
@@ -333,7 +342,7 @@ def test_same_decoded_params_yield_same_results():
     """Re-running the SAME decoded params through the trial runner yields the SAME
     results[<metric>] (deterministic-runner contract)."""
     s = _strategy_stub()
-    flat = {"tp": 7.0, "sl": 4.0}
+    flat = {"entry:bracket:a1:action_value": 7.0, "entry:bracket:a2:action_value": -4.0}
     d1 = decode_params(s, flat)
     d2 = decode_params(s, flat)
     r1 = _deterministic_stub({}, {}, d1)
@@ -379,7 +388,20 @@ def test_handler_memo_collapses_duplicate_trials(monkeypatch):
 
     db = SessionLocal()
     try:
-        s = Strategy(name="gate-memo", entry_actions=_ENTRY_TPSL_ACTIONS)
+        s = Strategy(name="gate-memo", entry_rules=[{
+            "id": "bracket", "conditions": None, "continue_processing": False,
+            "actions": [
+                {"action_type": "buy"},
+                {"id": "e_tp", "action_type": "adjust_take_profit",
+                 "reference_value": "order_open_price", "action_value": 5.0,
+                 "action_value_optimize": True,
+                 "action_value_min": 2.0, "action_value_max": 12.0, "action_value_step": 1.0},
+                {"id": "e_sl", "action_type": "adjust_stop_loss",
+                 "reference_value": "order_open_price", "action_value": -2.0,
+                 "action_value_optimize": True,
+                 "action_value_min": -6.0, "action_value_max": -1.0, "action_value_step": 1.0},
+            ],
+        }], exit_rules=[])
         db.add(s)
         db.commit()
         db.refresh(s)
@@ -467,7 +489,20 @@ def test_max_drawdown_negated_end_to_end(monkeypatch):
 
     db = SessionLocal()
     try:
-        s = Strategy(name="gate-dd", entry_actions=_ENTRY_TPSL_ACTIONS)
+        s = Strategy(name="gate-dd", entry_rules=[{
+            "id": "bracket", "conditions": None, "continue_processing": False,
+            "actions": [
+                {"action_type": "buy"},
+                {"id": "e_tp", "action_type": "adjust_take_profit",
+                 "reference_value": "order_open_price", "action_value": 5.0,
+                 "action_value_optimize": True,
+                 "action_value_min": 2.0, "action_value_max": 12.0, "action_value_step": 1.0},
+                {"id": "e_sl", "action_type": "adjust_stop_loss",
+                 "reference_value": "order_open_price", "action_value": -2.0,
+                 "action_value_optimize": True,
+                 "action_value_min": -6.0, "action_value_max": -1.0, "action_value_step": 1.0},
+            ],
+        }], exit_rules=[])
         db.add(s)
         db.commit()
         db.refresh(s)
@@ -499,7 +534,7 @@ def test_max_drawdown_negated_end_to_end(monkeypatch):
     assert out["status"] == "completed"
     # least drawdown is 2.0 at tp=8 -> max fitness = -2.0
     assert out["best_fitness"] == pytest.approx(-2.0)
-    assert out["best_params"]["entry:e_tp:action_value"] == 8.0
+    assert out["best_params"]["entry:bracket:a1:action_value"] == 8.0
 
 
 # ===========================================================================

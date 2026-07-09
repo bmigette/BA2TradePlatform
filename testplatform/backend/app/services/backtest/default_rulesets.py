@@ -56,7 +56,8 @@ _triggers_from_conditions = triggers_from_condition_tree
 
 
 def _make_event_action(name: str, triggers: dict, actions: dict,
-                       subtype: "AnalysisUseCase" = AnalysisUseCase.ENTER_MARKET) -> int:
+                       subtype: "AnalysisUseCase" = AnalysisUseCase.ENTER_MARKET,
+                       continue_processing: bool = False) -> int:
     """Create one ``EventAction`` (default enter_market subtype) and return its id."""
     ea = EventAction(
         name=name,
@@ -65,7 +66,7 @@ def _make_event_action(name: str, triggers: dict, actions: dict,
         triggers=triggers,
         actions=actions,
         extra_parameters={},
-        continue_processing=False,
+        continue_processing=continue_processing,
     )
     return add_instance(ea)
 
@@ -87,6 +88,65 @@ def _link(ruleset_id: int, event_action_ids: List[int]) -> None:
                 )
             )
         session.commit()
+
+
+def seed_ruleset_from_rules(rules, subtype: "AnalysisUseCase",
+                            name: str = "backtest-rules") -> int:
+    """Seed a ruleset 1:1 from a TradeRule LIST (the unified EventAction-shaped model);
+    return its id.
+
+    One ordered ``EventAction`` per rule, VERBATIM: the rule's conditions tree becomes the
+    ANDed triggers (no implicit base gates — builders/converters make bullish+flat explicit),
+    the rule's ordered ``actions`` list converts via the shared
+    ``live_actions_from_trade_rule`` (same conversion the live export uses, so a rule seeds
+    byte-identically to how it exports), and ``continue_processing`` is honored — first-match
+    semantics with explicit fall-through, exactly the live ``TradeActionEvaluator`` contract.
+
+    A rule with no convertible action is skipped. Returns the ruleset id (possibly with no
+    event actions if every rule was skipped).
+    """
+    from ba2_common.core.rule_builders import live_actions_from_trade_rule
+
+    ruleset = Ruleset(
+        name=name,
+        description="Backtest ruleset seeded 1:1 from a Strategy TradeRule list.",
+        type=ExpertEventRuleType.TRADING_RECOMMENDATION_RULE,
+        subtype=subtype,
+    )
+    ruleset_id = add_instance(ruleset)
+
+    ea_ids = []
+    for idx, rule in enumerate(rules or []):
+        if not isinstance(rule, dict):
+            continue
+        actions = live_actions_from_trade_rule(rule)
+        if not actions:
+            continue
+        conds = rule.get("conditions")
+        triggers = triggers_from_condition_tree(conds) if conds else {}
+        ea_ids.append(
+            _make_event_action(
+                name=rule.get("name") or f"{name}-rule-{idx}",
+                triggers=triggers,
+                actions=actions,
+                subtype=subtype,
+                continue_processing=bool(rule.get("continue_processing")
+                                         or rule.get("continueProcessing") or False),
+            )
+        )
+    if ea_ids:
+        _link(ruleset_id, ea_ids)
+    return ruleset_id
+
+
+def seed_entry_ruleset_from_rules(entry_rules, name: str = "backtest-enter-rules") -> int:
+    """Seed the ENTER_MARKET ruleset from a Strategy's entry TradeRule list (1:1)."""
+    return seed_ruleset_from_rules(entry_rules, AnalysisUseCase.ENTER_MARKET, name)
+
+
+def seed_exit_ruleset_from_rules(exit_rules, name: str = "backtest-open-positions") -> int:
+    """Seed the OPEN_POSITIONS ruleset from a Strategy's exit TradeRule list (1:1)."""
+    return seed_ruleset_from_rules(exit_rules, AnalysisUseCase.OPEN_POSITIONS, name)
 
 
 def seed_open_positions_ruleset(exit_rules, name: str = "backtest-open-positions") -> int:

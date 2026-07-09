@@ -63,22 +63,23 @@ def seed_strategy(test_db):
     s = Strategy(
         name="opt-route-test",
         description="strategy for optimize-route test",
-        # Entry-time TP/SL bracket: rides on entry_actions (adjust_take_profit/adjust_stop_loss
-        # rules with action_value_optimize), not the deleted initial_tp_*/initial_sl_* fields.
-        entry_actions=[
-            {
-                "id": "e_tp", "action_type": "adjust_take_profit",
-                "reference_value": "order_open_price", "action_value": 5.0,
-                "action_value_optimize": True,
-                "action_value_min": 2.0, "action_value_max": 12.0, "action_value_step": 1.0,
-            },
-            {
-                "id": "e_sl", "action_type": "adjust_stop_loss",
-                "reference_value": "order_open_price", "action_value": -2.0,
-                "action_value_optimize": True,
-                "action_value_min": -6.0, "action_value_max": -1.0, "action_value_step": 1.0,
-            },
-        ],
+        # Entry-time TP/SL bracket on the unified rule model (migration 028): one entry
+        # TradeRule carrying buy + the adjust actions with action_value_optimize.
+        entry_rules=[{
+            "id": "bracket", "conditions": None, "continue_processing": False,
+            "actions": [
+                {"action_type": "buy"},
+                {"id": "e_tp", "action_type": "adjust_take_profit",
+                 "reference_value": "order_open_price", "action_value": 5.0,
+                 "action_value_optimize": True,
+                 "action_value_min": 2.0, "action_value_max": 12.0, "action_value_step": 1.0},
+                {"id": "e_sl", "action_type": "adjust_stop_loss",
+                 "reference_value": "order_open_price", "action_value": -2.0,
+                 "action_value_optimize": True,
+                 "action_value_min": -6.0, "action_value_max": -1.0, "action_value_step": 1.0},
+            ],
+        }],
+        exit_rules=[],
     )
     test_db.add(s)
     test_db.commit()

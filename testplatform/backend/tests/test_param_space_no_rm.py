@@ -11,17 +11,8 @@ from app.services.strategy_param_space import collect_param_space, decode_params
 
 
 def _strategy():
-    """A minimal Strategy-like object with NO optimizable tp/sl/conditions."""
-    return types.SimpleNamespace(
-        initial_tp_optimize=False,
-        initial_sl_optimize=False,
-        initial_tp_percent=None,
-        initial_sl_percent=None,
-        buy_entry_conditions=None,
-        sell_entry_conditions=None,
-        entry_conditions=None,
-        exit_conditions=None,
-    )
+    """A minimal Strategy-like object with NO optimizable rules."""
+    return types.SimpleNamespace(entry_rules=[], exit_rules=[])
 
 
 def test_rm_sizing_optimizes_through_model_namespace():

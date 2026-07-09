@@ -90,8 +90,13 @@ class BacktestCreate(BaseModel):
     # that fire on the same gate as the buy/sell action, rather than a flat percent bracket.
     # All optional: omitted -> the handler falls back to its defaults (the bullish+flat enter
     # ruleset / no entry-time bracket).
-    buy_entry_conditions: Optional[dict] = None   # AND/OR condition tree -> config "buy_tree"
-    sell_entry_conditions: Optional[dict] = None  # -> config "sell_tree"
+    # UNIFIED RULE MODEL (migration 028): ordered TradeRule lists (conditions + actions[] +
+    # continue_processing per rule). When present these take precedence over the legacy
+    # fields below and seed the rulesets 1:1 (config "entry_rules"/"exit_rules").
+    entry_rules: Optional[list] = None
+    exit_rules: Optional[list] = None
+    buy_entry_conditions: Optional[dict] = None   # LEGACY tree -> config "buy_tree"
+    sell_entry_conditions: Optional[dict] = None  # LEGACY -> config "sell_tree"
     enable_short: Optional[bool] = None           # -> config "enable_short": seed the symmetric
                                                   # SHORT/sell enter rule + enable the RM sell gate
                                                   # (the "Allow short" UI toggle). Default long-only.
@@ -318,10 +323,8 @@ async def create_backtest(
     strategy_params = backtest.strategy_params or {}
     if strategy and not strategy_params:
         strategy_params = {
-            'entryActions': strategy.entry_actions or [],
-            'buyEntryConditions': strategy.buy_entry_conditions,
-            'sellEntryConditions': strategy.sell_entry_conditions,
-            'exitConditions': strategy.exit_conditions,
+            'entryRules': strategy.entry_rules or [],
+            'exitRules': strategy.exit_rules or [],
             'strategyName': strategy.name,
         }
 
@@ -458,6 +461,10 @@ def _create_daily_expert_backtest(backtest: "BacktestCreate", db: Session) -> di
     # conditions, TP/SL, expert settings, universe and interval are all lost. Keys mirror what
     # _derive_export_payload reads (camelCase structured shape).
     strategy_params: dict = {}
+    if backtest.entry_rules is not None:
+        strategy_params["entryRules"] = backtest.entry_rules
+    if backtest.exit_rules is not None:
+        strategy_params["exitRules"] = backtest.exit_rules
     if backtest.buy_entry_conditions is not None:
         strategy_params["buyEntryConditions"] = backtest.buy_entry_conditions
     if backtest.sell_entry_conditions is not None:
@@ -547,16 +554,20 @@ def _create_daily_expert_backtest(backtest: "BacktestCreate", db: Session) -> di
     # TP/SL bracket, seeded onto the enter ruleset alongside the buy/sell action — same
     # action_from_rule conversion exit rules use). Only include provided (non-None) keys so we
     # never override the handler's own defaults with None (fail-early/no-silent-defaults rule).
+    if backtest.entry_rules is not None:
+        payload['entry_rules'] = backtest.entry_rules       # unified TradeRule list (1:1 seed)
+    elif backtest.entry_actions is not None:
+        payload['entry_rules'] = backtest.entry_actions     # legacy flat bracket list
+    if backtest.exit_rules is not None:
+        payload['exit_rules'] = backtest.exit_rules         # unified TradeRule list (1:1 seed)
+    elif backtest.exit_conditions is not None:
+        payload['exit_rules'] = backtest.exit_conditions    # legacy single-action rows
     if backtest.buy_entry_conditions is not None:
         payload['buy_tree'] = backtest.buy_entry_conditions
     if backtest.sell_entry_conditions is not None:
         payload['sell_tree'] = backtest.sell_entry_conditions
     if backtest.enable_short is not None:
         payload['enable_short'] = bool(backtest.enable_short)
-    if backtest.exit_conditions is not None:
-        payload['exit_rules'] = backtest.exit_conditions
-    if backtest.entry_actions is not None:
-        payload['entry_rules'] = backtest.entry_actions
 
     from app.services.task_queue import get_task_queue
     task_queue = get_task_queue()
