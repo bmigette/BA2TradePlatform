@@ -17,6 +17,15 @@ from tests.factories import (
     create_account_definition, create_expert_instance, create_market_analysis,
 )
 
+# _gather() eagerly builds a real OHLCV provider before it knows whether any enabled factor
+# needs it; fetch_close_prices is mocked below so the instance is never actually used.
+_OHLCV_MOD = "ba2_providers.ohlcv.FMPOHLCVProvider.FMPOHLCVProvider"
+
+
+class _StubOHLCV:
+    def __init__(self, *a, **k):
+        pass
+
 
 def _ramp(end, n=260):
     return pd.Series(np.linspace(100.0, end, n), index=pd.RangeIndex(n))
@@ -90,7 +99,8 @@ def test_two_rebalances_sell_dropped_buy_new():
     run2 = {"A": _ramp(105), "B": _ramp(103), "C": _ramp(200), "D": _ramp(320), "E": _ramp(300)}
 
     with patch("ba2_trade_platform.core.utils.get_account_instance_from_id", return_value=account), \
-         patch("ba2_trade_platform.core.utils.get_expert_instance_from_id", return_value=expert_stub):
+         patch("ba2_trade_platform.core.utils.get_expert_instance_from_id", return_value=expert_stub), \
+         patch(f"{_OHLCV_MOD}.__new__", lambda cls: _StubOHLCV()):
 
         ma1 = create_market_analysis(symbol="EXPERT", expert_instance_id=inst.id)
         with patch("ba2_trade_platform.modules.experts.FactorRanker.data.fetch_close_prices", return_value=run1):

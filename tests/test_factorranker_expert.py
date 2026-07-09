@@ -9,6 +9,17 @@ from tests.factories import (
     create_account_definition, create_expert_instance, create_market_analysis,
 )
 
+# _gather() eagerly builds a real OHLCV provider (providers.ohlcv()) at the top, before it
+# knows whether any enabled factor will actually need it — see FactorRanker/__init__.py. The
+# instance itself is never touched here (fetch_close_prices is mocked below, so nothing calls
+# a method on it), so a bare stub avoids depending on a real FMP_API_KEY app setting.
+_OHLCV_MOD = "ba2_providers.ohlcv.FMPOHLCVProvider.FMPOHLCVProvider"
+
+
+class _StubOHLCV:
+    def __init__(self, *a, **k):
+        pass
+
 
 def _ramp(start, end, n=260):
     return pd.Series(np.linspace(start, end, n), index=pd.RangeIndex(n))
@@ -50,16 +61,15 @@ def test_run_analysis_ranks_and_rebalances():
     pm_instance = MagicMock()
     pm_instance.get_holdings.return_value = ({}, {})  # empty portfolio (first run)
     with patch("ba2_trade_platform.modules.experts.FactorRanker.data.fetch_close_prices", return_value=prices) as fetch_px, \
-         patch("ba2_trade_platform.modules.experts.FactorRanker.FactorPortfolioManager", return_value=pm_instance) as PM:
+         patch("ba2_trade_platform.modules.experts.FactorRanker.FactorPortfolioManager", return_value=pm_instance) as PM, \
+         patch(f"{_OHLCV_MOD}.__new__", lambda cls: _StubOHLCV()):
         expert.run_analysis("EXPERT", ma)
 
-    # Disabled factors must not be fetched. Phase 6: the package FactorRanker's
-    # _gather fetches close prices twice — once for the momentum factor
-    # (_compute_factor) and once for the rebalance price snapshot — so it's the
-    # only price-fetching factor active (value/quality/pead disabled here). The
-    # pre-extraction in-tree code fetched once; the count is an internal detail of
-    # the (golden-verified) package _gather/_process split.
-    assert fetch_px.call_count == 2
+    # Disabled factors must not be fetched — momentum (the only enabled factor here) is the
+    # sole fetch_close_prices caller. The whole-universe "rebalance price snapshot" fetch that
+    # used to make this 2 calls was dropped (it was never consumed downstream — the portfolio
+    # reads live prices off the account instead; see FactorRanker/__init__.py's _gather).
+    assert fetch_px.call_count == 1
     for call in fetch_px.call_args_list:
         assert call.args[0] == ["A", "B", "C"]
 
@@ -99,7 +109,8 @@ def test_run_analysis_action_reflects_holdings():
     # Currently hold A (stays in top-2) and C (ranked last, drops out of top-2).
     pm_instance.get_holdings.return_value = ({"A": 10.0, "C": 20.0}, {})
     with patch("ba2_trade_platform.modules.experts.FactorRanker.data.fetch_close_prices", return_value=prices), \
-         patch("ba2_trade_platform.modules.experts.FactorRanker.FactorPortfolioManager", return_value=pm_instance):
+         patch("ba2_trade_platform.modules.experts.FactorRanker.FactorPortfolioManager", return_value=pm_instance), \
+         patch(f"{_OHLCV_MOD}.__new__", lambda cls: _StubOHLCV()):
         expert.run_analysis("EXPERT", ma)
 
     actions = {row["symbol"]: row["action"] for row in ma.state["factor_ranker"]["ranking"]}
@@ -119,7 +130,8 @@ def test_run_analysis_skips_when_universe_empty():
     # the empty-universe path off the network. The subject under test is the SKIP
     # decision (empty universe -> no portfolio manager, status SKIPPED).
     with patch("ba2_trade_platform.modules.experts.FactorRanker.data.fetch_close_prices", return_value={}), \
-         patch("ba2_trade_platform.modules.experts.FactorRanker.FactorPortfolioManager") as PM:
+         patch("ba2_trade_platform.modules.experts.FactorRanker.FactorPortfolioManager") as PM, \
+         patch(f"{_OHLCV_MOD}.__new__", lambda cls: _StubOHLCV()):
         expert.run_analysis("EXPERT", ma)
 
     PM.assert_not_called()

@@ -70,13 +70,19 @@ AS_OF = datetime(2026, 6, 2, tzinfo=timezone.utc)
 # the source of truth the package data.py actually constructs. (The class objects
 # are identical via the alias, but the package path resolves unambiguously to the
 # submodule, avoiding the submodule-vs-class shadow on the in-tree path.)
-OVERVIEW_MOD = "ba2_providers.fundamentals.overview.FMPCompanyOverviewProvider.FMPCompanyOverviewProvider"
 DETAILS_MOD = "ba2_providers.fundamentals.details.FMPCompanyDetailsProvider.FMPCompanyDetailsProvider"
 
+# fetch_value_inputs no longer reads price from Overview at all (see its docstring —
+# NO-LOOKAHEAD price/market_cap now come from an OHLCV close + dated shares outstanding); every
+# test below passes ``price_as_of`` explicitly instead, so OHLCV construction is never reached
+# either (lazy — see data.py's ``_get_ohlcv``), keeping these unit tests free of any FMP
+# provider dependency beyond the statement details.
 
-def _income(eps, net_income, gross_profit):
+
+def _income(eps, net_income, gross_profit, shares=10.0):
     return {"statements": [{
         "eps": eps, "net_income": net_income, "gross_profit": gross_profit,
+        "weighted_average_shares_outstanding": shares,
     }]}
 
 
@@ -92,17 +98,6 @@ def _balance(equity, total_assets, cash=0.0, st_debt=0.0, lt_debt=0.0):
 
 def _cashflow(fcf, ocf):
     return {"statements": [{"free_cash_flow": fcf, "operating_cash_flow": ocf}]}
-
-
-class _FakeOverview:
-    """get_fundamentals_overview: GOOD -> valid metrics; BAD -> error string."""
-    def __init__(self, *a, **k):
-        pass
-
-    def get_fundamentals_overview(self, symbol, as_of_date=None, format_type="dict"):
-        if symbol == "GOOD":
-            return {"metrics": {"price": 100.0, "market_cap": 1_000.0}}
-        return "Error fetching company overview: Limit Reach."
 
 
 class _FakeDetails:
@@ -141,9 +136,9 @@ class _FakeDetails:
 
 
 def test_fetch_value_inputs_drops_bad_symbol():
-    with patch(f"{OVERVIEW_MOD}.__new__", lambda cls: _FakeOverview()), \
-         patch(f"{DETAILS_MOD}.__new__", lambda cls: _FakeDetails()):
-        out = fr_data.fetch_value_inputs(["GOOD", "BAD"], as_of=AS_OF)
+    with patch(f"{DETAILS_MOD}.__new__", lambda cls: _FakeDetails()):
+        out = fr_data.fetch_value_inputs(
+            ["GOOD", "BAD"], as_of=AS_OF, price_as_of={"GOOD": 100.0, "BAD": 100.0})
     assert "GOOD" in out
     assert "BAD" not in out
     assert out["GOOD"]["price"] == 100.0
@@ -166,14 +161,10 @@ def test_fetch_pead_inputs_drops_bad_symbol():
 
 
 def test_fetch_value_inputs_drops_when_price_missing():
-    """A symbol whose overview lacks a positive price is dropped (no failsafe default)."""
-    class _NoPriceOverview(_FakeOverview):
-        def get_fundamentals_overview(self, symbol, as_of_date=None, format_type="dict"):
-            return {"metrics": {"price": None, "market_cap": 1_000.0}}
-
-    with patch(f"{OVERVIEW_MOD}.__new__", lambda cls: _NoPriceOverview()), \
-         patch(f"{DETAILS_MOD}.__new__", lambda cls: _FakeDetails()):
-        out = fr_data.fetch_value_inputs(["GOOD"], as_of=AS_OF)
+    """A symbol with no as_of close available (price_as_of doesn't cover it) is dropped
+    (no failsafe default, no fall back to a current-snapshot price)."""
+    with patch(f"{DETAILS_MOD}.__new__", lambda cls: _FakeDetails()):
+        out = fr_data.fetch_value_inputs(["GOOD"], as_of=AS_OF, price_as_of={})
     assert out == {}
 
 
@@ -192,9 +183,13 @@ def test_fetch_quality_inputs_drops_when_no_quality_signal():
 
 
 def test_no_exception_propagates_when_all_bad():
-    """Even if every symbol fails, the fetchers return {} rather than raising."""
-    with patch(f"{OVERVIEW_MOD}.__new__", lambda cls: _FakeOverview()), \
-         patch(f"{DETAILS_MOD}.__new__", lambda cls: _FakeDetails()):
+    """Even if every symbol fails, the fetchers return {} rather than raising.
+
+    ``fetch_value_inputs`` is called WITHOUT ``price_as_of`` here on purpose: BAD's income
+    statement fetch raises before the (now-lazy) OHLCV price lookup is ever reached, so this
+    also pins that a fully-BAD batch never touches OHLCV/the FMP API key at all.
+    """
+    with patch(f"{DETAILS_MOD}.__new__", lambda cls: _FakeDetails()):
         assert fr_data.fetch_value_inputs(["BAD"], as_of=AS_OF) == {}
         assert fr_data.fetch_quality_inputs(["BAD"], as_of=AS_OF) == {}
         assert fr_data.fetch_pead_inputs(["BAD"], as_of=AS_OF) == {}

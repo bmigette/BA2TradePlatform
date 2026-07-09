@@ -47,7 +47,12 @@ def _settings_stub(values):
 
 def test_resolve_universe_uses_screener_when_configured(monkeypatch):
     inst = _bare_expert()
-    monkeypatch.setattr(inst, "_screen_universe", lambda: ["AAA", "BBB"])
+    # _resolve_universe_source() reads self.settings (the real cached-settings property,
+    # NOT get_setting_with_interface_default) FIRST to check for an explicit
+    # instrument_selection_method override — an empty cache means "unset", so it falls
+    # through to the universe_source stub below (see that method's docstring).
+    inst._settings_cache = {}
+    monkeypatch.setattr(inst, "_screen_universe", lambda as_of=None: ["AAA", "BBB"])
     monkeypatch.setattr(inst, "_get_enabled_instruments_config", lambda: {"ZZZ": {}})
     inst.get_setting_with_interface_default = _settings_stub(
         {"universe_source": "screener", "min_price": 0.0, "min_dollar_volume": 0.0}
@@ -57,7 +62,8 @@ def test_resolve_universe_uses_screener_when_configured(monkeypatch):
 
 def test_resolve_universe_uses_static_by_default(monkeypatch):
     inst = _bare_expert()
-    monkeypatch.setattr(inst, "_screen_universe", lambda: ["AAA", "BBB"])
+    inst._settings_cache = {}
+    monkeypatch.setattr(inst, "_screen_universe", lambda as_of=None: ["AAA", "BBB"])
     monkeypatch.setattr(inst, "_get_enabled_instruments_config", lambda: {"ZZZ": {}, "YYY": {}})
     inst.get_setting_with_interface_default = _settings_stub(
         {"universe_source": "static", "min_price": 0.0, "min_dollar_volume": 0.0}

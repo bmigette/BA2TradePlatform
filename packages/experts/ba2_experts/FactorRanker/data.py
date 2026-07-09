@@ -17,7 +17,7 @@ momentum uses ~400 calendar days of daily closes.
 """
 
 from datetime import datetime, timezone
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 import pandas as pd
 
@@ -210,11 +210,23 @@ def fetch_value_inputs(symbols, as_of: Optional[datetime] = None,
     from ba2_providers.fundamentals.details.FMPCompanyDetailsProvider import FMPCompanyDetailsProvider
     as_of = as_of or datetime.now(timezone.utc)
     details = FMPCompanyDetailsProvider()
-    if ohlcv_provider is not None:
-        ohlcv = ohlcv_provider
-    else:
-        from ba2_providers.ohlcv.FMPOHLCVProvider import FMPOHLCVProvider
-        ohlcv = FMPOHLCVProvider()
+    # LAZY: only construct a real FMPOHLCVProvider if some symbol actually falls through to
+    # the OHLCV-fetch price path below (price_as_of misses it, or the caller passed none at
+    # all). When price_as_of fully covers the batch (the metric-store fast path this was
+    # built for), this function should hold zero OHLCV history/connections — constructing it
+    # unconditionally here defeated that goal and made a store-covered call needlessly depend
+    # on FMP_API_KEY being configured.
+    _ohlcv_cache: Dict[str, Any] = {}
+
+    def _get_ohlcv():
+        if "provider" not in _ohlcv_cache:
+            if ohlcv_provider is not None:
+                _ohlcv_cache["provider"] = ohlcv_provider
+            else:
+                from ba2_providers.ohlcv.FMPOHLCVProvider import FMPOHLCVProvider
+                _ohlcv_cache["provider"] = FMPOHLCVProvider()
+        return _ohlcv_cache["provider"]
+
     out: Dict[str, dict] = {}
     for sym in symbols:
         try:
@@ -235,7 +247,7 @@ def fetch_value_inputs(symbols, as_of: Optional[datetime] = None,
             # When the caller supplies ``price_as_of`` (the metric store's precomputed point-in-time
             # ``close`` as-of), use it instead of an OHLCV fetch — same value (store close == the
             # as_of close at an aligned scan date), but no per-symbol 400-day series in memory.
-            price = price_as_of.get(sym) if price_as_of is not None else _as_of_close(ohlcv, sym, as_of)
+            price = price_as_of.get(sym) if price_as_of is not None else _as_of_close(_get_ohlcv(), sym, as_of)
             if not price or price <= 0:
                 logger.warning(
                     f"FactorRanker: dropping {sym} from value inputs "
