@@ -26,7 +26,9 @@ import hmac
 import logging
 import os
 import tempfile
+import threading
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from typing import Optional
 
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -44,6 +46,48 @@ worker_app = FastAPI(title="BA2 Remote Worker", docs_url=None, redoc_url=None, o
 _PASSWORD: Optional[str] = None
 _CAPACITY: int = 1
 _POOL: Optional[ProcessPoolExecutor] = None
+# Rebuilds _POOL after a BrokenProcessPool (set alongside _POOL in run_worker_server).
+_POOL_FACTORY = None
+_POOL_LOCK = threading.Lock()
+
+
+def _dump_worker_memory(context: str) -> None:
+    """Best-effort memory snapshot of the worker SERVER + its trial children, logged at the
+    moment a pool breaks — so the next WinError-1450-style incident shows what was depleting
+    memory instead of leaving only 'terminated abruptly'."""
+    try:
+        import psutil
+        me = psutil.Process(os.getpid())
+        vm = psutil.virtual_memory()
+        kids = me.children(recursive=True)
+        kid_rss = sorted((round(k.memory_info().rss / 1048576) for k in kids), reverse=True)
+        logger.warning(
+            "%s: server RSS=%dMB, %d child proc(s) RSS(MB)=%s, system available=%dMB/%dMB (%.1f%% used)",
+            context, me.memory_info().rss // 1048576, len(kids), kid_rss,
+            vm.available // 1048576, vm.total // 1048576, vm.percent,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("%s: memory dump unavailable (%r)", context, e)
+
+
+def _rebuild_pool(exc: Exception) -> None:
+    """Swap the broken trial pool for a fresh one (same recovery pattern as the master's
+    DistributedEvaluator._recover_pool). Under a lock so concurrent /run-trial threads
+    rebuild once, not once each."""
+    global _POOL
+    with _POOL_LOCK:
+        if _POOL_FACTORY is None:
+            logger.error("trial pool broken (%r) and no factory to rebuild it", exc)
+            return
+        logger.warning("trial pool broken (%r); rebuilding %d-slot pool", exc, _CAPACITY)
+        _dump_worker_memory("trial pool crash")
+        old = _POOL
+        try:
+            if old is not None:
+                old.shutdown(wait=False, cancel_futures=True)
+        except Exception:  # noqa: BLE001 — best-effort cleanup of the already-dead pool
+            pass
+        _POOL = _POOL_FACTORY()
 
 # Bound lazily on first sync request (see _sync_session()) so tests can monkeypatch it to an
 # isolated DB, and so importing this module doesn't eagerly touch app.models.database.
@@ -197,6 +241,14 @@ def run_trial(req: RunTrialReq, authorization: str = Header(default=None)):
         config = _localize_paths(req.config, req.cache_root, CACHE_FOLDER)
     try:
         return _POOL.submit(_trial_worker, config, req.fitness_metric).result()
+    except BrokenProcessPool as e:
+        # A dead child (e.g. WinError 1450 killing it mid-IPC) poisons the WHOLE pool: every
+        # later submit raises instantly. Rebuild the pool (with a memory dump so we see what
+        # depleted the box) and tell the master the failure is RETRYABLE — it says nothing
+        # about the genome, so the trial must be requeued, not recorded as a failed result.
+        _rebuild_pool(e)
+        return {"ok": False, "fitness": 0.0, "trades": 0, "error": repr(e), "fatal": False,
+                "retryable": True}
     except Exception as e:  # noqa: BLE001 — surface as a failed trial, never 500 the dispatcher
         return {"ok": False, "fitness": 0.0, "trades": 0, "error": repr(e), "fatal": False}
 
@@ -216,7 +268,11 @@ def run_trial_full(req: RunTrialReq, authorization: str = Header(default=None)):
     if req.cache_root:
         from ba2_common.config import CACHE_FOLDER
         config = _localize_paths(req.config, req.cache_root, CACHE_FOLDER)
-    return _POOL.submit(_persist_trial_worker, config).result()
+    try:
+        return _POOL.submit(_persist_trial_worker, config).result()
+    except BrokenProcessPool as e:
+        _rebuild_pool(e)
+        return {"ok": False, "error": repr(e), "retryable": True}
 
 
 @worker_app.post("/cache/prune")
@@ -381,6 +437,21 @@ def sync_backtest(req: SyncRowReq, authorization: str = Header(default=None)):
     )
 
 
+def _shutdown_pool_for_restart() -> None:
+    """Pre-restart cleanup: stop the trial pool FIRST so its management thread cannot respawn
+    replacement children between restart_now's _kill_children() and execv — the race that
+    orphaned ~10 spawn children (2-4.8GB each) on every self-update and eventually depleted
+    the worker box (WinError 1450)."""
+    global _POOL
+    with _POOL_LOCK:
+        pool, _POOL = _POOL, None
+    if pool is not None:
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except Exception as e:  # noqa: BLE001 — cleanup must never block the restart
+            logger.warning("pre-restart pool shutdown failed (continuing): %r", e)
+
+
 @worker_app.post("/update")
 def update(authorization: str = Header(default=None)):
     """git pull + reinstall (if non-editable) + restart this worker process."""
@@ -388,8 +459,42 @@ def update(authorization: str = Header(default=None)):
     report = self_update.perform_update()
     if not report.get("ok"):
         raise HTTPException(status_code=500, detail=f"update failed: {report.get('git_pull')}")
-    self_update.schedule_restart(delay=2.0)
+    self_update.schedule_restart(delay=2.0, on_before_restart=_shutdown_pool_for_restart)
     return {"restart": "scheduled", "version": report.get("version"), "git_pull": report.get("git_pull")}
+
+
+def _sweep_orphaned_spawn_children() -> None:
+    """Kill ORPHANED multiprocessing-spawn python processes left by force-kills / crashed
+    restarts (their cmdline is `... -c "from multiprocessing.spawn import spawn_main;
+    spawn_main(parent_pid=N, ...)"` with a parent that no longer exists). Each orphan holds a
+    full trial working set (2-4.8GB); ~20 of them depleted the 64GB worker box on 2026-07-09.
+    Conservative: only touches processes matching that exact cmdline signature whose stated
+    parent_pid is gone."""
+    try:
+        import re
+        import psutil
+    except ImportError:
+        return
+    killed = []
+    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+        try:
+            if "python" not in (proc.info["name"] or "").lower():
+                continue
+            cmd = " ".join(proc.info["cmdline"] or [])
+            m = re.search(r"multiprocessing\.spawn import spawn_main.*?parent_pid=(\d+)", cmd)
+            if not m:
+                continue
+            parent_pid = int(m.group(1))
+            if psutil.pid_exists(parent_pid):
+                continue  # parent alive -> legitimate worker of another process
+            proc.kill()
+            killed.append(proc.info["pid"])
+        except (psutil.Error, ValueError):
+            continue
+    if killed:
+        logger.warning("startup sweep: killed %d orphaned spawn child(ren): %s",
+                       len(killed), killed)
+        print(f">> swept {len(killed)} orphaned trial worker(s) from previous runs: {killed}")
 
 
 def run_worker_server(host: str, port: int, password: str, n_workers: int) -> None:
@@ -402,7 +507,7 @@ def run_worker_server(host: str, port: int, password: str, n_workers: int) -> No
         _BACKEND_DIR, _WORKER_ENV_KEYS, _worker_init,
     )
 
-    global _PASSWORD, _CAPACITY, _POOL
+    global _PASSWORD, _CAPACITY, _POOL, _POOL_FACTORY
     if not password:
         raise SystemExit("ba2-test worker: --password (or $BA2_WORKER_PASSWORD) is required.")
     _PASSWORD = password
@@ -410,10 +515,16 @@ def run_worker_server(host: str, port: int, password: str, n_workers: int) -> No
     # Hermetic trials run cache-only, so provider keys aren't required here; mirror any that
     # happen to be set (harmless) so a non-hermetic edge still resolves them.
     env = {k: os.environ[k] for k in _WORKER_ENV_KEYS if os.environ.get(k)}
-    _POOL = ProcessPoolExecutor(
-        max_workers=_CAPACITY, mp_context=_mp.get_context("spawn"),
-        initializer=_worker_init, initargs=(_BACKEND_DIR, env),
-    )
+
+    def _make_pool() -> ProcessPoolExecutor:
+        return ProcessPoolExecutor(
+            max_workers=_CAPACITY, mp_context=_mp.get_context("spawn"),
+            initializer=_worker_init, initargs=(_BACKEND_DIR, env),
+        )
+
+    _sweep_orphaned_spawn_children()
+    _POOL_FACTORY = _make_pool
+    _POOL = _make_pool()
     logger.info("worker server: %d trial slots, listening on %s:%d", _CAPACITY, host, port)
     print(f">> BA2 worker server: {_CAPACITY} slots, http://{host}:{port}  "
           f"(version {self_update.get_version_info().get('git_commit')})")

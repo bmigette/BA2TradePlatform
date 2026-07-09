@@ -67,12 +67,45 @@ class BacktestCacheMiss(Exception):
 _WORKER_BAR_CACHE: "OrderedDict[Any, Any]" = OrderedDict()
 # Max distinct (symbol, window) series held. ~1500 covers the largest screener band (~1100 symbols)
 # with headroom; at ~3MB/symbol (3yr 5min) that bounds the cache near a single band's working set.
-_WORKER_BAR_CACHE_MAX = 1500
+# ENV-TUNABLE (BT_BAR_CACHE_MAX): a box running MANY trial slots multiplies this per-process
+# bound by the slot count — e.g. 10 slots x 1500 entries x ~3MB ≈ 45GB worst case — so a
+# memory-constrained worker host can lower it (at the cost of within-band re-parses on the
+# symbols beyond the cap; eviction is result-neutral).
+_WORKER_BAR_CACHE_MAX = int(os.getenv("BT_BAR_CACHE_MAX", "1500"))
 
 
 def clear_worker_bar_cache() -> None:
     """Drop the process-wide parsed-bar cache (call between unrelated runs / in tests)."""
     _WORKER_BAR_CACHE.clear()
+
+
+def memory_stats() -> Dict[str, Any]:
+    """Cheap per-process snapshot of the two OHLCV caches this module owns, for the per-trial
+    memory telemetry (diagnosing which cache depletes a worker box):
+
+      * ``bar_cache``: the LRU-bounded parsed-bar columnar store (_WORKER_BAR_CACHE) —
+        entries + estimated MB (numpy nbytes + ~50B/key for the Python key list).
+      * ``series_memo``: MemoizedOHLCVProvider's full-DataFrame memo (_FULL_SERIES_MEMO) —
+        entries + estimated MB (shallow memory_usage; deep=True would rescan every frame).
+
+    O(cache entries) with tiny constants — safe to call once per trial.
+    """
+    bar_bytes = 0
+    for cached in _WORKER_BAR_CACHE.values():
+        keys = cached[0]
+        bar_bytes += len(keys) * 50
+        for arr in cached[1:]:
+            bar_bytes += getattr(arr, "nbytes", 0)
+    memo_bytes = 0
+    for df in _FULL_SERIES_MEMO.values():
+        try:
+            memo_bytes += int(df.memory_usage(deep=False).sum())
+        except Exception:  # noqa: BLE001 — non-DataFrame entries just aren't counted
+            pass
+    return {
+        "bar_cache": {"entries": len(_WORKER_BAR_CACHE), "mb": round(bar_bytes / 1048576, 1)},
+        "series_memo": {"entries": len(_FULL_SERIES_MEMO), "mb": round(memo_bytes / 1048576, 1)},
+    }
 
 
 @lru_cache(maxsize=16)

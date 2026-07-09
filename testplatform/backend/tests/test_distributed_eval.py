@@ -220,3 +220,61 @@ def test_broken_local_pool_without_factory_degrades_to_remote(monkeypatch):
         ev.stop()
     assert set(by_idx) == set(range(10))  # remote covers every trial the dead local pool can't
     assert isinstance(ev.pool, _DeadPool)  # left as-is (no factory to rebuild it)
+
+
+def test_remote_retryable_failure_requeues_instead_of_posting(monkeypatch):
+    """A worker that returns HTTP-200 with ``retryable: True`` (its own trial pool broke —
+    e.g. WinError 1450 killing a child) must have the trial REQUEUED, never recorded as a
+    failed result: the failure says nothing about the genome. Regression for the 2026-07-09
+    incident where 317 such results were accepted and fed fitness 0.0 to the GA."""
+    calls = {"n": 0}
+
+    def flaky_then_ok(worker, config, metric, **kw):
+        calls["n"] += 1
+        if calls["n"] <= 3:  # first few dispatches: worker-side pool broken (retryable)
+            return {"ok": False, "fitness": 0.0, "trades": 0,
+                    "error": "BrokenProcessPool('child died')", "retryable": True}
+        return {"ok": True, "fitness": _fitness(config), "trades": 1, "error": None}
+
+    monkeypatch.setattr(de.worker_client, "ensure_synced", lambda w, c, **k: True)
+    monkeypatch.setattr(de.worker_client, "push_cache", lambda w, **k: {"pushed": 0})
+    monkeypatch.setattr(de.worker_client, "health", lambda w, **k: {"capacity": 2})
+    monkeypatch.setattr(de.worker_client, "run_trial", flaky_then_ok)
+
+    workers = [{"id": 1, "name": "flaky150", "url": "http://x", "password": "p"}]
+    ev = DistributedEvaluator(_SlowPool(), "sharpe", n_consumers=1, optimization_id="t",
+                              workers=workers, master_version="abc", log=lambda *_: None)
+    ev.start()
+    try:
+        jobs = [(i, {"idx": i}, f"k{i}", {"v": i}) for i in range(8)]
+        by_idx = {i: out for (i, _f, _k, out) in ev.execute_jobs(jobs)}
+    finally:
+        ev.stop()
+    # Every trial completes with a REAL fitness — no retryable failure leaked into results.
+    assert set(by_idx) == set(range(8))
+    assert all(by_idx[i]["ok"] for i in range(8))
+    assert all(by_idx[i]["fitness"] == i * 2.0 for i in range(8))
+
+
+def test_remote_repeated_retryable_failures_bench_the_worker(monkeypatch):
+    """A worker that ONLY returns retryable failures gets benched after _MAX_WORKER_FAILURES
+    (trials fall back to local) instead of spinning forever."""
+    monkeypatch.setattr(de.worker_client, "ensure_synced", lambda w, c, **k: True)
+    monkeypatch.setattr(de.worker_client, "push_cache", lambda w, **k: {"pushed": 0})
+    monkeypatch.setattr(de.worker_client, "health", lambda w, **k: {"capacity": 2})
+    monkeypatch.setattr(
+        de.worker_client, "run_trial",
+        lambda *a, **k: {"ok": False, "fitness": 0.0, "trades": 0,
+                         "error": "BrokenProcessPool('dead')", "retryable": True})
+
+    workers = [{"id": 1, "name": "dead150", "url": "http://x", "password": "p"}]
+    ev = DistributedEvaluator(_FakePool(), "sharpe", n_consumers=2, optimization_id="t",
+                              workers=workers, master_version="abc", log=lambda *_: None)
+    ev.start()
+    try:
+        jobs = [(i, {"idx": i}, f"k{i}", {"v": i}) for i in range(10)]
+        by_idx = {i: out for (i, _f, _k, out) in ev.execute_jobs(jobs)}
+    finally:
+        ev.stop()
+    assert set(by_idx) == set(range(10))
+    assert all(by_idx[i]["ok"] for i in range(10))  # local finished everything

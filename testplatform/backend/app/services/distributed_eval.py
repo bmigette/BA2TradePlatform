@@ -288,6 +288,26 @@ class DistributedEvaluator:
                 continue
             try:
                 out = worker_client.run_trial(w, job["config"], job["fitness_metric"])
+                # RETRYABLE worker-side failure (e.g. the remote's own trial pool broke —
+                # WinError 1450 killing a child mid-IPC): the worker returns HTTP 200 with
+                # ``retryable: True`` after rebuilding its pool. The failure says nothing
+                # about the GENOME, so requeue the trial (local/another slot runs it) instead
+                # of accepting a poisoned failed-trial result.
+                if isinstance(out, dict) and out.get("retryable"):
+                    self.broker.requeue_one(job["trial_id"])
+                    failures += 1
+                    self.log(f"worker {w['name']} returned retryable failure "
+                             f"({failures}/{_MAX_WORKER_FAILURES}): {out.get('error')}")
+                    if failures >= _MAX_WORKER_FAILURES:
+                        self.log(f"worker {w['name']} giving up (repeated retryable failures); "
+                                 f"trials fall back to local/others")
+                        with self._worker_lock:
+                            if w in self._active_workers:
+                                self._active_workers.remove(w)
+                            self._down_workers.append(w)
+                        return
+                    self._stop.wait(2.0)
+                    continue
                 self.broker.post_result(job["trial_id"], out)
                 failures = 0
             except Exception as e:  # noqa: BLE001 — push the trial back so local/another worker runs it

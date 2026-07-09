@@ -124,14 +124,33 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str) -> Dict[str, Any]
         results = run_daily_backtest(config)
         fit = compute_fitness(fitness_metric, results)
         return {"ok": True, "fitness": float(fit),
-                "trades": int(results.get("total_trades") or 0), "error": None}
+                "trades": int(results.get("total_trades") or 0), "error": None,
+                # Per-trial memory telemetry (a few psutil/len calls — negligible): RSS of
+                # THIS worker process + the two per-process OHLCV caches, so a memory-driven
+                # incident (e.g. WinError 1450 on the remote box) leaves a trail showing what
+                # was depleting the machine.
+                "mem": _trial_memory_snapshot()}
     except Exception as e:  # noqa: BLE001 — surface as a failed trial, don't kill the pool
         # A cache miss is FATAL (a data/config problem, not a bad-parameter trial): every trial
         # will hit the same gap, so flag it so the parent can abort with the actionable message
         # instead of grinding the whole population to 0 fitness.
         fatal = type(e).__name__ in ("BacktestCacheMiss", "FMPHistoryCacheMiss")
         return {"ok": False, "fitness": 0.0, "trades": 0, "error": str(e) if fatal else repr(e),
-                "fatal": fatal}
+                "fatal": fatal, "mem": _trial_memory_snapshot()}
+
+
+def _trial_memory_snapshot() -> Dict[str, Any]:
+    """Cheap per-trial memory snapshot taken INSIDE the worker process: RSS + the two OHLCV
+    cache sizes (price_source.memory_stats). Best-effort — never fails a trial."""
+    try:
+        import psutil
+
+        from app.services.backtest.price_source import memory_stats
+        snap = memory_stats()
+        snap["rss_mb"] = psutil.Process(_os.getpid()).memory_info().rss // 1048576
+        return snap
+    except Exception as e:  # noqa: BLE001
+        return {"error": repr(e)}
 
 
 def _persist_trial_worker(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -477,17 +496,28 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 _emit_intra(done)
 
                 for i, flat, key, out in execute_jobs(jobs):
-                    fit = float(out["fitness"])
-                    fits[i] = fit
-                    memo.put(key, fit)
                     if out["ok"]:
+                        fit = float(out["fitness"])
+                        fits[i] = fit
+                        memo.put(key, fit)
                         all_results.append(
                             {"params": flat, "fitness": fit, "key": key, "trades": out["trades"]}
                         )
-                    elif out.get("error"):
-                        logger.warning(f"trial failed in worker: {out['error']}")
-                        if out.get("fatal") and fatal["msg"] is None:
-                            fatal["msg"] = out["error"]
+                    else:
+                        # FAILED trial: score it at the always-worst sentinel so the GA never
+                        # prefers a crashed genome (the old 0.0 fallback ranked ABOVE every
+                        # legitimately-negative individual, biasing selection toward crashes),
+                        # and do NOT memo it — a crash is an environment event, not a property
+                        # of the genome, so a re-selection should re-run it.
+                        from app.services.strategy_fitness import ZERO_TRADE_SENTINEL
+                        fit = ZERO_TRADE_SENTINEL
+                        fits[i] = fit
+                        if out.get("error"):
+                            mem = out.get("mem")
+                            logger.warning(f"trial failed in worker: {out['error']}"
+                                           + (f" | worker mem: {mem}" if mem else ""))
+                            if out.get("fatal") and fatal["msg"] is None:
+                                fatal["msg"] = out["error"]
                     if best["fitness"] is None or fit > best["fitness"]:
                         best["fitness"] = fit
                         best["params"] = flat
