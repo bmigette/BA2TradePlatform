@@ -1376,17 +1376,24 @@ class ExpertSettingsTab:
                         logger.warning(f'Error getting risk manager mode for expert {instance.id}: {e}')
                         is_smart_mode = False
                     
-                    # Fetch and add ruleset names
+                    # Fetch and add ruleset names. A dangling ruleset id (e.g. the referenced
+                    # ruleset was deleted) must not drop the whole expert row: get_instance
+                    # raises on a missing id, so look up tolerantly and show '(Not found)'.
+                    def _ruleset_name(ruleset_id):
+                        try:
+                            return get_instance(Ruleset, ruleset_id).name
+                        except Exception:
+                            logger.warning(f'Expert instance {instance.id} references missing ruleset {ruleset_id}')
+                            return '(Not found)'
+
                     if instance.enter_market_ruleset_id:
-                        enter_market_ruleset = get_instance(Ruleset, instance.enter_market_ruleset_id)
-                        ruleset_name = enter_market_ruleset.name if enter_market_ruleset else '(Not found)'
+                        ruleset_name = _ruleset_name(instance.enter_market_ruleset_id)
                         row['enter_market_ruleset_name'] = f"{ruleset_name} (Smart)" if is_smart_mode else ruleset_name
                     else:
                         row['enter_market_ruleset_name'] = 'Smart' if is_smart_mode else '(None)'
-                    
+
                     if instance.open_positions_ruleset_id:
-                        open_positions_ruleset = get_instance(Ruleset, instance.open_positions_ruleset_id)
-                        ruleset_name = open_positions_ruleset.name if open_positions_ruleset else '(Not found)'
+                        ruleset_name = _ruleset_name(instance.open_positions_ruleset_id)
                         row['open_positions_ruleset_name'] = f"{ruleset_name} (Smart)" if is_smart_mode else ruleset_name
                     else:
                         row['open_positions_ruleset_name'] = 'Smart' if is_smart_mode else '(None)'
