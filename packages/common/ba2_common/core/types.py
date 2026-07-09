@@ -274,6 +274,22 @@ class OrderDirection(str, Enum):
     SELL = "SELL"
     BUY = "BUY"
 
+class BrokerOrderErrorReason(str, Enum):
+    """Broker-agnostic classification of an order-submission rejection.
+
+    Each broker's AccountInterface subclass maps its OWN native error shape (an Alpaca
+    APIError's numeric code + message, an IBKR error code, ...) onto this shared taxonomy via
+    ``_classify_order_error``. Generic recovery (e.g. resubmitting a breached stop as a market
+    order) lives once in AccountInterface, keyed off these reasons — so a new reason handled for
+    one broker benefits every broker without touching the retry logic itself.
+    """
+    INSUFFICIENT_FUNDS = "insufficient_funds"        # not enough buying power / cash
+    INSUFFICIENT_QTY = "insufficient_qty"            # not enough shares/qty held to sell/close
+    WASH_TRADE = "wash_trade"                        # opposing order already working this symbol
+    STOP_THROUGH_MARKET = "stop_through_market"      # stop/trigger price already breached by market
+    INVALID_SYMBOL = "invalid_symbol"                # broker doesn't recognize/support the symbol
+    UNKNOWN = "unknown"                              # unmapped — broker message kept verbatim
+
 class OrderOpenType(str, Enum):
     MANUAL = "manual"
     AUTOMATIC = "automatic"

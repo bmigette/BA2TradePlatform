@@ -660,33 +660,64 @@ class TradeManager:
                         )
                         continue
 
+                    # A deferred CLOSE order (submit_close_order_for_transaction with a
+                    # dependency) reaches the broker through this generic dependent-order
+                    # path, so it must carry the same is_closing_order=True its immediate
+                    # sibling call gets — otherwise the position-size validation wrongly
+                    # blocks a close just because the position grew past the entry cap
+                    # (the position is shrinking, not growing). Same MARKET+"closing"
+                    # comment heuristic close_transaction() already uses elsewhere.
+                    is_closing = (
+                        dependent_order.order_type == OrderType.MARKET and
+                        dependent_order.comment and
+                        'closing' in dependent_order.comment.lower()
+                    )
                     self.logger.info(
                         f"Submitting dependent order {dependent_order.id}: {dependent_order.side.value} "
                         f"{dependent_order.quantity} {dependent_order.symbol} @ {dependent_order.order_type.value} "
                         f"(triggered by parent order {parent_order_id})"
                     )
-                    submitted_order = account.submit_order(dependent_order)
+                    submitted_order = account.submit_order(dependent_order, is_closing_order=is_closing)
 
                     if submitted_order:
                         self.logger.info(f"Successfully submitted dependent order {dependent_order.id}")
                         submitted_count += 1
                     else:
-                        self.logger.error(
-                            f"Failed to submit dependent order {dependent_order.id} (symbol: {dependent_order.symbol}) - "
-                            f"setting to ERROR status"
-                        )
-                        dependent_order.status = OrderStatus.ERROR
-                        update_instance(dependent_order)
-                        
+                        # submit_order's own broker-agnostic error handling
+                        # (AccountInterface._handle_order_submit_error) has already marked the
+                        # FRESH db row ERROR with the classified reason in its comment — re-fetch
+                        # rather than writing the stale pre-submit `dependent_order` object back,
+                        # which would clobber that comment with the old pre-failure value.
+                        fresh = get_instance(TradingOrder, dependent_order.id)
+                        if fresh and fresh.status == OrderStatus.ERROR:
+                            self.logger.error(
+                                f"Failed to submit dependent order {dependent_order.id} "
+                                f"(symbol: {dependent_order.symbol}) — already marked ERROR "
+                                f"with broker reason: {fresh.comment}"
+                            )
+                        else:
+                            self.logger.error(
+                                f"Failed to submit dependent order {dependent_order.id} (symbol: {dependent_order.symbol}) - "
+                                f"setting to ERROR status"
+                            )
+                            (fresh or dependent_order).status = OrderStatus.ERROR
+                            update_instance(fresh or dependent_order)
+
                 except Exception as submit_error:
                     self.logger.error(
                         f"Exception submitting dependent order {dependent_order.id} (symbol: {dependent_order.symbol}, "
                         f"qty: {dependent_order.quantity}): {submit_error}",
                         exc_info=True
                     )
-                    dependent_order.status = OrderStatus.ERROR
                     try:
-                        update_instance(dependent_order)
+                        # Re-fetch: this exception is typically raised BEFORE broker submission
+                        # (e.g. order validation), so nothing has written a comment yet here —
+                        # but re-fetch anyway for a consistent, non-stale write.
+                        fresh = get_instance(TradingOrder, dependent_order.id) or dependent_order
+                        fresh.status = OrderStatus.ERROR
+                        error_msg = f"[validation_error] {str(submit_error)[:180]}"
+                        fresh.comment = (f"{fresh.comment} | {error_msg}" if fresh.comment else error_msg)[:500]
+                        update_instance(fresh)
                     except Exception as update_error:
                         self.logger.error(f"Could not update order {dependent_order.id} to ERROR status: {update_error}")
             

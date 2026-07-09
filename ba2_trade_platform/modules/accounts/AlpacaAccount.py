@@ -796,6 +796,38 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         logger.debug(f"Converted {len(raw_orders)} raw orders to {len(orders)} TradingOrder objects")
         return orders
 
+    def _classify_order_error(self, exc: Exception) -> "BrokerOrderErrorReason":
+        """Map an Alpaca ``APIError`` onto the shared broker-agnostic taxonomy.
+
+        Alpaca's numeric ``code`` is NOT enough on its own — 42210000 (422 Unprocessable) has
+        been observed for both a breached stop price ("stop price must be less than current
+        price") AND an unrelated invalid-symbol rejection ("invalid underlying symbols"), and
+        40310000 (403) covers both "insufficient buying power" and a wash-trade rejection — so
+        classification also inspects ``message``. Non-APIError exceptions (network errors,
+        etc.) fall through to UNKNOWN.
+        """
+        from ...core.types import BrokerOrderErrorReason
+
+        if not isinstance(exc, APIError):
+            return BrokerOrderErrorReason.UNKNOWN
+        try:
+            code = exc.code
+            message = (exc.message or "").lower()
+        except Exception:  # noqa: BLE001 — malformed error body, treat as unknown
+            return BrokerOrderErrorReason.UNKNOWN
+
+        if code == 42210000 and "stop price" in message and "current price" in message:
+            return BrokerOrderErrorReason.STOP_THROUGH_MARKET
+        if code == 42210000 and "invalid underlying symbols" in message:
+            return BrokerOrderErrorReason.INVALID_SYMBOL
+        if code == 40310000 and "insufficient buying power" in message:
+            return BrokerOrderErrorReason.INSUFFICIENT_FUNDS
+        if code == 40310000 and "wash trade" in message:
+            return BrokerOrderErrorReason.WASH_TRADE
+        if code == 40310000 and ("insufficient qty" in message or "insufficient quantity" in message):
+            return BrokerOrderErrorReason.INSUFFICIENT_QTY
+        return BrokerOrderErrorReason.UNKNOWN
+
     @alpaca_api_retry
     def _submit_order_impl(self, trading_order: TradingOrder, tp_price: Optional[float] = None, sl_price: Optional[float] = None, is_closing_order: bool = False) -> TradingOrder:
         """
@@ -1146,31 +1178,12 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             except Exception as log_error:
                 logger.warning(f"Failed to log order submission error to activity log: {log_error}")
             
-            # Step 4: Mark order as ERROR in database using thread-safe function
-            try:
-                if trading_order.id:
-                    fresh_order = get_instance(TradingOrder, trading_order.id)
-                    if fresh_order:
-                        fresh_order.status = OrderStatus.ERROR
-                        
-                        # Store error details in comment field (append to existing comment)
-                        error_msg = f"Error: {str(e)[:200]}"
-                        if not fresh_order.comment:
-                            fresh_order.comment = error_msg
-                        else:
-                            # Append error to existing comment, truncate if too long
-                            fresh_order.comment = f"{fresh_order.comment} | {error_msg}"[:500]
-                        
-                        # Use thread-safe update function with retry logic
-                        update_instance(fresh_order)
-                        logger.info(f"Marked order {trading_order.id} as ERROR in database")
-                    else:
-                        logger.warning(f"Could not find order {trading_order.id} to mark as ERROR")
-                else:
-                    logger.warning(f"Cannot mark order as ERROR - order has no ID")
-            except Exception as update_error:
-                logger.error(f"Failed to update order status to ERROR: {update_error}")
-            
+            # Step 4: broker-agnostic error handling (classify + retry-as-market on a
+            # breached stop + mark ERROR with the reason recorded in comment). Centralized
+            # in AccountInterface so the stop-breach retry isn't Alpaca-specific.
+            if trading_order.id:
+                return self._handle_order_submit_error(trading_order, e)
+            logger.warning("Cannot mark order as ERROR - order has no ID")
             return None
 
     @alpaca_api_retry

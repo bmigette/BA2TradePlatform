@@ -3,7 +3,9 @@ from typing import Any, Dict, Optional, List
 from datetime import datetime, timezone
 from ba2_common.logger import logger
 from ba2_common.core.models import TradingOrder, Transaction, ExpertRecommendation, ExpertInstance
-from ba2_common.core.types import OrderOpenType, OrderDirection, OrderType, OrderStatus, TransactionStatus
+from ba2_common.core.types import (
+    OrderOpenType, OrderDirection, OrderType, OrderStatus, TransactionStatus, BrokerOrderErrorReason,
+)
 from ba2_common.core.interfaces.ReadOnlyAccountInterface import ReadOnlyAccountInterface
 from ba2_common.core.db import add_instance, get_db, get_instance, update_instance
 
@@ -42,6 +44,78 @@ class AccountInterface(ReadOnlyAccountInterface):
             Any: The created order object if successful. Returns None or raises an exception if failed.
         """
         pass
+
+    def _classify_order_error(self, exc: Exception) -> BrokerOrderErrorReason:
+        """Map this broker's NATIVE submission error onto the shared, broker-agnostic
+        ``BrokerOrderErrorReason`` taxonomy. Default: UNKNOWN (the broker's raw message is
+        still preserved verbatim in the order comment). Override in a broker subclass to
+        recognize its own error codes/messages — a single numeric/string code is often
+        AMBIGUOUS on its own (e.g. Alpaca's 42210000 covers both "stop price must be less
+        than current price" and "invalid underlying symbols"), so classification must
+        inspect the full error, not just a code.
+        """
+        return BrokerOrderErrorReason.UNKNOWN
+
+    # Stop-type orders where a STOP_THROUGH_MARKET rejection can be safely resubmitted as an
+    # equivalent MARKET order (same side/qty) — the stop had already been breached by the time
+    # the broker processed it, so a market order fulfills the same intent immediately.
+    _STOP_ORDER_TYPES = {
+        OrderType.BUY_STOP, OrderType.SELL_STOP,
+        OrderType.BUY_STOP_LIMIT, OrderType.SELL_STOP_LIMIT,
+    }
+
+    def _handle_order_submit_error(self, trading_order: TradingOrder, exc: Exception) -> Optional[TradingOrder]:
+        """Broker-agnostic order-submission failure handling: classify the error via
+        ``_classify_order_error``, retry ONCE as a MARKET order when a stop was already
+        breached (STOP_THROUGH_MARKET), and otherwise mark the order ERROR with the typed
+        reason + broker message recorded in ``comment`` (so it's visible in the Pending
+        Orders UI, not just the log).
+
+        Every ``_submit_order_impl`` should call this from its except block instead of each
+        broker duplicating this bookkeeping — that's what makes the stop-breach retry and the
+        comment reason work identically for Alpaca, IBKR, or any future broker.
+
+        Returns the resubmitted order on a successful retry, else None (matching
+        ``_submit_order_impl``'s existing "None on failure" contract).
+        """
+        reason = self._classify_order_error(exc)
+        fresh_order = get_instance(TradingOrder, trading_order.id)
+        if not fresh_order:
+            logger.error(f"Could not find order {trading_order.id} to record submit error")
+            return None
+
+        error_msg = f"[{reason.value}] {str(exc)[:180]}"
+
+        if reason == BrokerOrderErrorReason.STOP_THROUGH_MARKET and fresh_order.order_type in self._STOP_ORDER_TYPES:
+            logger.warning(
+                f"Order {fresh_order.id} ({fresh_order.symbol}) stop already through market; "
+                f"resubmitting as MARKET order"
+            )
+            fresh_order.order_type = OrderType.MARKET
+            fresh_order.stop_price = None
+            fresh_order.limit_price = None
+            note = f"{error_msg} — auto-converted to MARKET (stop already breached)"
+            fresh_order.comment = f"{fresh_order.comment} | {note}" if fresh_order.comment else note
+            fresh_order.comment = fresh_order.comment[:500]
+            update_instance(fresh_order)
+            try:
+                # The converted order is a reducing/closing action for the stop's own
+                # position, not a new entry — exempt it from position-size validation.
+                return self._submit_order_impl(fresh_order, is_closing_order=True)
+            except Exception as retry_exc:  # noqa: BLE001 — fall through to ERROR below
+                logger.error(
+                    f"Market-order retry failed for order {fresh_order.id}: {retry_exc}", exc_info=True
+                )
+                error_msg = f"{error_msg} | market retry also failed: {str(retry_exc)[:150]}"
+                fresh_order = get_instance(TradingOrder, trading_order.id) or fresh_order
+
+        fresh_order.status = OrderStatus.ERROR
+        fresh_order.comment = (
+            f"{fresh_order.comment} | {error_msg}" if fresh_order.comment else error_msg
+        )[:500]
+        update_instance(fresh_order)
+        logger.info(f"Marked order {fresh_order.id} as ERROR in database ({reason.value})")
+        return None
 
     def _generate_tracking_comment(self, trading_order: TradingOrder) -> str:
         """
