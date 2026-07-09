@@ -5,6 +5,8 @@ asserts the contract the GA relies on: ``execute_jobs`` returns each job's resul
 INPUT index regardless of where/when it ran, and a failing remote worker's trials fall back to
 local (never lost).
 """
+from concurrent.futures.process import BrokenProcessPool
+
 import app.services.distributed_eval as de
 from app.services.distributed_eval import DistributedEvaluator
 
@@ -157,3 +159,64 @@ def test_recovered_worker_is_readmitted_mid_run(monkeypatch):
     assert all(by_idx[i]["fitness"] == i * 2.0 for i in range(30))
     assert seen  # the recovered worker actually picked up trials before the job finished
     assert ev._active_workers and not ev._down_workers
+
+
+class _DeadFuture:
+    def result(self):
+        raise BrokenProcessPool("A process in the process pool was terminated abruptly "
+                                 "while the future was running or pending.")
+
+
+class _DeadPool:
+    """A local pool whose FIRST submission (and every one after, matching the real
+    ProcessPoolExecutor contract) raises BrokenProcessPool -- simulates a crashed worker."""
+    def submit(self, _fn, _config, _metric):
+        return _DeadFuture()
+
+
+def test_broken_local_pool_recovers_via_pool_factory():
+    """A dead local pool is replaced (not left broken for the rest of the run) when a
+    pool_factory is supplied, and the trials that hit it are requeued -- not lost -- so a
+    single-local-consumer, no-remote-worker run still finishes every trial."""
+    built = {"count": 0}
+
+    def factory():
+        built["count"] += 1
+        return _FakePool()  # the "recovered" pool behaves normally
+
+    ev = DistributedEvaluator(_DeadPool(), "sharpe", n_consumers=1, optimization_id="t",
+                              workers=[], log=lambda *_: None, pool_factory=factory)
+    ev.start()
+    try:
+        jobs = [(i, {"idx": i}, f"k{i}", {"v": i}) for i in range(10)]
+        by_idx = {i: out for (i, _f, _k, out) in ev.execute_jobs(jobs)}
+    finally:
+        ev.stop()
+    assert set(by_idx) == set(range(10))
+    assert all(by_idx[i]["fitness"] == i * 2.0 for i in range(10))
+    assert built["count"] == 1  # recreated exactly once, not once per failed trial
+    assert ev.pool is not None and not isinstance(ev.pool, _DeadPool)
+
+
+def test_broken_local_pool_without_factory_degrades_to_remote(monkeypatch):
+    """No pool_factory (the historical call sites) -> local trials keep failing over to remote,
+    matching the pre-fix behaviour (no crash, no trial lost, just no local recovery)."""
+    def fake_run_trial(worker, config, metric, **kw):
+        return {"ok": True, "fitness": _fitness(config), "trades": 1, "error": None}
+
+    monkeypatch.setattr(de.worker_client, "ensure_synced", lambda w, c, **k: True)
+    monkeypatch.setattr(de.worker_client, "push_cache", lambda w, **k: {"pushed": 0})
+    monkeypatch.setattr(de.worker_client, "health", lambda w, **k: {"capacity": 2})
+    monkeypatch.setattr(de.worker_client, "run_trial", fake_run_trial)
+
+    workers = [{"id": 1, "name": "box1", "url": "http://x", "password": "p"}]
+    ev = DistributedEvaluator(_DeadPool(), "sharpe", n_consumers=1, optimization_id="t",
+                              workers=workers, master_version="abc", log=lambda *_: None)
+    ev.start()
+    try:
+        jobs = [(i, {"idx": i}, f"k{i}", {"v": i}) for i in range(10)]
+        by_idx = {i: out for (i, _f, _k, out) in ev.execute_jobs(jobs)}
+    finally:
+        ev.stop()
+    assert set(by_idx) == set(range(10))  # remote covers every trial the dead local pool can't
+    assert isinstance(ev.pool, _DeadPool)  # left as-is (no factory to rebuild it)

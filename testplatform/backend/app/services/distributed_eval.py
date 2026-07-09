@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Any, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Iterator, List, Optional, Tuple
 
 from app.services import worker_client
 from app.services.trial_broker import TrialBroker
@@ -43,10 +43,33 @@ Job = Tuple[int, dict, str, dict]
 _MAX_WORKER_FAILURES = 3
 
 
+def _log_memory_diagnostics(log, context: str) -> None:
+    """Best-effort process/system memory snapshot, logged when a local trial dies unexpectedly
+    (e.g. BrokenProcessPool) so a recurrence leaves a real data point instead of just the bare
+    exception repr. Never raises — diagnostics must not mask the original failure."""
+    try:
+        import os
+        import psutil
+        p = psutil.Process(os.getpid())
+        rss_mb = p.memory_info().rss / (1024 * 1024)
+        vm = psutil.virtual_memory()
+        log(f"{context}: master RSS={rss_mb:.0f}MB, system available="
+            f"{vm.available / (1024 * 1024):.0f}MB / {vm.total / (1024 * 1024):.0f}MB "
+            f"({vm.percent:.1f}% used)")
+    except Exception as e:  # noqa: BLE001 — diagnostics are best-effort, never fatal
+        log(f"{context}: memory diagnostics unavailable ({e!r})")
+
+
 class DistributedEvaluator:
     """Bridges the GA batch loop to local + remote workers via a per-optimization TrialBroker.
 
     *submit_pool* is the master's ``ProcessPoolExecutor`` (local consumers run trials through it).
+    *pool_factory*, if given, rebuilds an equivalent fresh pool (same max_workers/mp_context/
+    initializer/initargs) when the local pool dies mid-run (``BrokenProcessPool`` — one worker
+    crashed, e.g. from a transient MemoryError, which permanently breaks a
+    ``concurrent.futures.ProcessPoolExecutor``: EVERY subsequent ``.submit()`` on it raises
+    immediately). Without a factory, local consumers degrade to remote-only for the rest of the
+    run (the previous behaviour) instead of recovering.
     *workers* is a list of resolved worker dicts ``{id,name,url,password,capacity}``. *master_version*
     is the master's app version (workers are version-matched to it before use).
     """
@@ -54,8 +77,11 @@ class DistributedEvaluator:
     def __init__(self, submit_pool, fitness_metric: str, n_consumers: int,
                  optimization_id: Any, workers: Optional[List[dict]] = None,
                  master_version: Optional[str] = None, log=logger.warning,
-                 requeue_timeout: float = 1800.0):
+                 requeue_timeout: float = 1800.0,
+                 pool_factory: Optional[Callable[[], Any]] = None):
         self.pool = submit_pool
+        self._pool_factory = pool_factory
+        self._pool_lock = threading.Lock()  # guards self.pool reads/recreation across consumers
         self.fitness_metric = fitness_metric
         self.n_consumers = max(1, n_consumers)
         self.optimization_id = optimization_id
@@ -208,17 +234,50 @@ class DistributedEvaluator:
 
     # -- workers -----------------------------------------------------------------------------
     def _consume_local(self) -> None:
+        from concurrent.futures.process import BrokenProcessPool
         from app.services.strategy_optimization_handler import _trial_worker
         while not self._stop.is_set():
             job = self.broker.claim(worker_id="local")
             if job is None:
                 self._stop.wait(0.05)
                 continue
+            pool = self.pool  # snapshot: may be swapped by another consumer's _recover_pool below
             try:
-                out = self.pool.submit(_trial_worker, job["config"], job["fitness_metric"]).result()
+                out = pool.submit(_trial_worker, job["config"], job["fitness_metric"]).result()
+            except BrokenProcessPool as e:
+                # A crashed worker (e.g. a transient MemoryError) leaves the WHOLE pool unusable —
+                # every future .submit() raises the SAME error immediately (no computation, near-
+                # zero latency). Without recovery every local consumer thread spins in a tight
+                # claim/fail/requeue loop for the rest of the run: local capacity is silently lost
+                # AND the log floods with one line per loop iteration. Recreate once (thread-safe)
+                # and requeue this trial so it isn't lost.
+                self._recover_pool(pool, e)
+                self.broker.requeue_one(job["trial_id"])
+                continue
             except Exception as e:  # noqa: BLE001
                 out = {"ok": False, "fitness": 0.0, "trades": 0, "error": repr(e), "fatal": False}
+                self.broker.post_result(job["trial_id"], out)
+                continue
             self.broker.post_result(job["trial_id"], out)
+
+    def _recover_pool(self, bad_pool, exc: Exception) -> None:
+        """Replace a dead local pool with a fresh one. Thread-safe: if several consumers hit the
+        SAME break around the same time, only the first to acquire the lock rebuilds it — the
+        rest see ``self.pool is not bad_pool`` and no-op. No-op entirely (degrade to remote-only,
+        the pre-existing behaviour) if no ``pool_factory`` was supplied at construction."""
+        if self._pool_factory is None:
+            self.log(f"local pool broken ({exc!r}); no pool_factory to recover, degrading to remote-only")
+            return
+        with self._pool_lock:
+            if self.pool is not bad_pool:
+                return  # another consumer already recreated it
+            self.log(f"local pool broken ({exc!r}); recreating")
+            _log_memory_diagnostics(self.log, "local pool crash")
+            try:
+                bad_pool.shutdown(wait=False, cancel_futures=True)
+            except Exception:  # noqa: BLE001 — best-effort cleanup of the already-dead pool
+                pass
+            self.pool = self._pool_factory()
 
     def _dispatch_remote(self, w: dict) -> None:
         failures = 0
