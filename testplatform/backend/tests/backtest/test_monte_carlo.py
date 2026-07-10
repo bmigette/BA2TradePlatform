@@ -86,9 +86,11 @@ def test_spread_sweep_returns_one_row_per_level_with_monotonic_degradation():
     trades = _trades_priced([(3.0, 100.0, 100.0), (-1.0, 100.0, 100.0)] * 20)
     rows = spread_sweep(trades, initial=10_000.0, years=3.0, spread_bps_list=[0, 10, 50])
     assert [r["spread_bps"] for r in rows] == [0, 10, 50]
-    # Wider spread -> strictly worse (or equal) annualized_return, monotonically.
+    # Wider spread -> strictly worse annualized_return (this scenario is built so spread bites
+    # every trade, so a no-op implementation that ignores `bps` would produce identical values
+    # here and fail this strict chain).
     ann = [r["annualized_return"] for r in rows]
-    assert ann[0] >= ann[1] >= ann[2]
+    assert ann[0] > ann[1] > ann[2]
 
 def test_spread_sweep_empty_list_returns_empty():
     trades = _trades_priced([(3.0, 100.0, 100.0)])
