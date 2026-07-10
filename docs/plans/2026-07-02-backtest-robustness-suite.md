@@ -194,3 +194,7 @@ Commit: `docs(robustness): validation results on real -aggr rows + usage notes`.
 - Tasks 1–5 are backend-only and independent of the in-flight fitness agent EXCEPT the consistency-per-path reuse in Task 1 (soft dependency — implement behind a try-import until the fitness commit merges).
 - Schedule-variant re-runs are full 3-year backtests (~minutes each on the rerun pool) — the UI must treat them as long-running (status polling), unlike MC (sub-second).
 - YAGNI deliberately excluded: manage-schedule perturbation variants, distributed variant execution on remote150, MC over intraday marks (trade-level only), persistence of every MC path (summaries only).
+
+---
+
+**Update (2026-07-10):** Spread-cost sensitivity was added on top of this suite's Monte-Carlo pass — a baseline `spread_bps` round-trip haircut folded into the existing bootstrap/shuffle/drop-K/jitter pipeline, plus an independent `spread_sweep_bps` degradation-curve table (same "deterministic table over the original trade order" shape as `drop_k`). It's implemented as a purely post-hoc deduction against each trade's persisted `pnl_pct` inside `monte_carlo.py` — no engine/fill-level spread model was added, and it is not part of the GA optimization gene space. See `docs/plans/2026-07-10-spread-cost-monte-carlo.md` for the full design and task breakdown.
