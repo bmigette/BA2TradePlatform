@@ -122,6 +122,28 @@ def test_post_monte_carlo_runs_inline(client, db):
     assert len(results["drop_k"]) == 2
 
 
+def test_post_monte_carlo_threads_spread_config_into_results(client, db):
+    bt = _seed_backtest(db)
+    payload = {
+        "backtest_ids": [bt.id],
+        "monte_carlo": {
+            "enabled": True, "n_paths": 50, "seed": 1,
+            "methods": ["bootstrap"], "drop_k": [], "jitter_bp": 0,
+            "spread_bps": 15.0, "spread_sweep_bps": [0, 10, 30],
+        },
+        "schedule": {"enabled": False},
+    }
+    resp = client.post("/api/backtests/robustness", json=payload)
+    assert resp.status_code == 200, resp.text
+    run_id = resp.json()["runs"][0]["robustness_run_id"]
+
+    from app.models.backtest import RobustnessRun
+    rr = db.query(RobustnessRun).filter(RobustnessRun.id == run_id).first()
+    assert rr.params["spread_bps"] == 15.0
+    assert rr.params["spread_sweep_bps"] == [0, 10, 30]
+    assert [row["spread_bps"] for row in rr.results["spread_sweep"]] == [0, 10, 30]
+
+
 def test_get_list_for_backtest(client, db):
     bt = _seed_backtest(db)
     payload = {

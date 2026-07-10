@@ -824,13 +824,24 @@ async def backtest_whatif(
 class MonteCarloConfig(BaseModel):
     """Monte-Carlo knobs (only read when ``enabled``). ``methods`` is the subset of the
     path-resampling methods (bootstrap/shuffle/jitter); ``drop_k`` drives the separate drop-K-best
-    table. Explicit values (no hidden defaults on the load-bearing ones)."""
+    table. Explicit values (no hidden defaults on the load-bearing ones).
+
+    NOTE on the two spread fields below (easy to conflate by name, different semantics):
+    - ``spread_bps`` mutates the shared trade pnl fed into the ENTIRE MC pipeline (bootstrap/
+      shuffle/jitter/drop_k all see the haircut) -- a single "what if spread was always X"
+      scenario baked into the whole run.
+    - ``spread_sweep_bps`` is a fully independent, deterministic table (one row per spread level
+      in the list) computed separately from the resampling pipeline; it neither affects nor is
+      affected by ``spread_bps`` or the other MC knobs above.
+    """
     enabled: bool = False
     n_paths: int = 1000
     seed: int = 42
     methods: List[str] = ["bootstrap", "shuffle"]
     drop_k: List[int] = [1, 2, 3]
     jitter_bp: float = 0.0
+    spread_bps: float = 0.0
+    spread_sweep_bps: List[float] = []
 
 
 class ScheduleConfig(BaseModel):
@@ -896,6 +907,8 @@ async def launch_robustness(request: RobustnessRequest, db: Session = Depends(ge
                 "methods": request.monte_carlo.methods,
                 "drop_k": request.monte_carlo.drop_k,
                 "jitter_bp": request.monte_carlo.jitter_bp,
+                "spread_bps": request.monte_carlo.spread_bps,
+                "spread_sweep_bps": request.monte_carlo.spread_sweep_bps,
             }
             run = RobustnessRun(backtest_id=bid, kind="monte_carlo", params=mc_cfg, status="pending")
             db.add(run)
