@@ -143,6 +143,12 @@ def test_post_monte_carlo_threads_spread_config_into_results(client, db):
     assert rr.params["spread_sweep_bps"] == [0, 10, 30]
     assert [row["spread_bps"] for row in rr.results["spread_sweep"]] == [0, 10, 30]
 
+    # GET round trip: spread_sweep must survive the actual HTTP JSON response, not just the DB row.
+    resp2 = client.get(f"/api/backtests/robustness/{run_id}")
+    assert resp2.status_code == 200, resp2.text
+    body_sweep = resp2.json()["results"]["spread_sweep"]
+    assert [row["spread_bps"] for row in body_sweep] == [0, 10, 30]
+
 
 def test_get_list_for_backtest(client, db):
     bt = _seed_backtest(db)
