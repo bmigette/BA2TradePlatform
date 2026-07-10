@@ -198,6 +198,24 @@ def drop_k_best(trades: List[Dict[str, Any]], k: int, initial: float, years: flo
     return {"dropped": dropped, **metrics}
 
 
+def spread_sweep(trades: List[Dict[str, Any]], initial: float, years: float,
+                  spread_bps_list: List[float]) -> List[Dict[str, Any]]:
+    """DETERMINISTIC table: for each ``spread_bps`` in ``spread_bps_list``, apply
+    ``apply_spread_cost`` to the ORIGINAL (unresampled) trade order and report the resulting
+    path metrics. Answers "how much of the edge survives as spread widens" — a curve, not a
+    distribution (no randomness, mirrors ``drop_k_best``'s determinism).
+
+    Returns one row per level: ``{"spread_bps": X, **_path_metrics(...)}``, in the SAME order
+    as ``spread_bps_list``. Empty input -> empty output.
+    """
+    rows = []
+    for bps in spread_bps_list:
+        adjusted = apply_spread_cost(trades, initial, float(bps))
+        path = equity_path_from_trade_pcts(adjusted, initial)
+        rows.append({"spread_bps": float(bps), **_path_metrics(path, initial, years)})
+    return rows
+
+
 # ---------------------------------------------------------------------------
 # Summaries
 # ---------------------------------------------------------------------------

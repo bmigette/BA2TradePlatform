@@ -2,7 +2,7 @@
 import numpy as np
 from app.services.backtest.monte_carlo import (
     equity_path_from_trade_pcts, mc_bootstrap, mc_shuffle, drop_k_best, summarize_paths,
-    apply_spread_cost,
+    apply_spread_cost, spread_sweep,
 )
 
 def _trades(pcts):
@@ -80,3 +80,16 @@ def test_apply_spread_cost_multi_trade_uses_pre_trade_equity_not_post_trade():
     assert len(adjusted) == 2
     assert abs(adjusted[0] - 4.8) < 1e-9
     assert abs(adjusted[1] - (-3.038095238095238)) < 1e-9
+
+def test_spread_sweep_returns_one_row_per_level_with_monotonic_degradation():
+    # A run of alternating small wins/losses, priced so notional ~= equity (spread bites).
+    trades = _trades_priced([(3.0, 100.0, 100.0), (-1.0, 100.0, 100.0)] * 20)
+    rows = spread_sweep(trades, initial=10_000.0, years=3.0, spread_bps_list=[0, 10, 50])
+    assert [r["spread_bps"] for r in rows] == [0, 10, 50]
+    # Wider spread -> strictly worse (or equal) annualized_return, monotonically.
+    ann = [r["annualized_return"] for r in rows]
+    assert ann[0] >= ann[1] >= ann[2]
+
+def test_spread_sweep_empty_list_returns_empty():
+    trades = _trades_priced([(3.0, 100.0, 100.0)])
+    assert spread_sweep(trades, initial=10_000.0, years=3.0, spread_bps_list=[]) == []
