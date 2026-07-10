@@ -321,7 +321,15 @@ def run_monte_carlo(trades: List[Dict[str, Any]], initial: float, years: float, 
     A per-path ``consistency`` score is added (median across paths) when the fitness reuse and
     trade ``exit_time`` dates allow yearly bucketing.
     """
-    pcts = [float(t.get("pnl_pct") or 0.0) for t in trades]
+    spread_bps = float(cfg.get("spread_bps") or 0.0)
+    pcts = apply_spread_cost(trades, initial, spread_bps) if spread_bps else \
+        [float(t.get("pnl_pct") or 0.0) for t in trades]
+    # drop_k_best reads pnl_pct straight off each trade dict -- give it the SAME spread-adjusted
+    # values via shallow copies (never mutate the caller's trades) so the "was it luck" table
+    # reflects the same cost assumption as bootstrap/shuffle/jitter above.
+    trades_for_drop_k = trades
+    if spread_bps:
+        trades_for_drop_k = [{**t, "pnl_pct": p} for t, p in zip(trades, pcts)]
     exit_dates = [t.get("exit_time") for t in trades]
     seed = int(cfg["seed"])
     n_paths = int(cfg["n_paths"])
@@ -355,7 +363,7 @@ def run_monte_carlo(trades: List[Dict[str, Any]], initial: float, years: float, 
 
     drop_k_rows = []
     for k in (cfg.get("drop_k") or []):
-        drop_k_rows.append({"k": int(k), **drop_k_best(trades, int(k), initial, years)})
+        drop_k_rows.append({"k": int(k), **drop_k_best(trades_for_drop_k, int(k), initial, years)})
 
     return {
         "methods": out_methods,

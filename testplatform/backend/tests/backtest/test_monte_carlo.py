@@ -95,3 +95,22 @@ def test_spread_sweep_returns_one_row_per_level_with_monotonic_degradation():
 def test_spread_sweep_empty_list_returns_empty():
     trades = _trades_priced([(3.0, 100.0, 100.0)])
     assert spread_sweep(trades, initial=10_000.0, years=3.0, spread_bps_list=[]) == []
+
+def test_run_monte_carlo_spread_bps_haircuts_bootstrap_and_drop_k():
+    from app.services.backtest.monte_carlo import run_monte_carlo
+    trades = _trades_priced([(5.0, 100.0, 100.0), (-2.0, 100.0, 100.0), (4.0, 100.0, 100.0)] * 5)
+    cfg_no_spread = {"methods": ["bootstrap"], "n_paths": 200, "seed": 1, "drop_k": [1]}
+    cfg_spread = {**cfg_no_spread, "spread_bps": 20.0}
+    r0 = run_monte_carlo(trades, initial=10_000.0, years=3.0, cfg=cfg_no_spread)
+    r1 = run_monte_carlo(trades, initial=10_000.0, years=3.0, cfg=cfg_spread)
+    # Same seed/paths -> spread strictly worsens the median annualized return.
+    assert r1["methods"]["bootstrap"]["annualized_return"]["p50"] < r0["methods"]["bootstrap"]["annualized_return"]["p50"]
+    # drop_k_best also runs over the spread-adjusted trades now.
+    assert r1["drop_k"][0]["annualized_return"] < r0["drop_k"][0]["annualized_return"]
+
+def test_run_monte_carlo_spread_bps_defaults_to_zero_noop():
+    from app.services.backtest.monte_carlo import run_monte_carlo
+    trades = _trades_priced([(5.0, 100.0, 100.0)] * 10)
+    cfg = {"methods": ["bootstrap"], "n_paths": 50, "seed": 1, "drop_k": []}
+    r = run_monte_carlo(trades, initial=10_000.0, years=3.0, cfg=cfg)  # no spread_bps key at all
+    assert r["methods"]["bootstrap"]["n_paths"] == 50  # ran fine, no KeyError
