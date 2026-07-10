@@ -316,10 +316,13 @@ def run_monte_carlo(trades: List[Dict[str, Any]], initial: float, years: float, 
       * ``drop_k``    — list of K values for the drop-K-best table (e.g. ``[1, 2, 3]``).
       * ``jitter_bp`` — basis-point sigma for the jitter method.
 
-    Returns ``{"methods": {name: summary}, "drop_k": [rows], "n_trades": int, "years": float}``
-    where each ``summary`` is ``summarize_paths(...)`` and each drop-K row is ``drop_k_best(...)``.
-    A per-path ``consistency`` score is added (median across paths) when the fitness reuse and
-    trade ``exit_time`` dates allow yearly bucketing.
+    Returns ``{"methods": {name: summary}, "drop_k": [rows], "spread_sweep": [rows], "n_trades":
+    int, "years": float}`` where each ``summary`` is ``summarize_paths(...)`` and each drop-K row
+    is ``drop_k_best(...)``. ``spread_sweep`` is computed via ``spread_sweep(...)`` over the
+    ORIGINAL ``trades``/``years`` (independent of the ``spread_bps`` baseline haircut above), keyed
+    off ``cfg["spread_sweep_bps"]`` (defaults to ``[]`` -> empty list, never a ``KeyError``). A
+    per-path ``consistency`` score is added (median across paths) when the fitness reuse and trade
+    ``exit_time`` dates allow yearly bucketing.
     """
     spread_bps = float(cfg.get("spread_bps") or 0.0)
     pcts = apply_spread_cost(trades, initial, spread_bps) if spread_bps else \
@@ -368,6 +371,7 @@ def run_monte_carlo(trades: List[Dict[str, Any]], initial: float, years: float, 
     return {
         "methods": out_methods,
         "drop_k": drop_k_rows,
+        "spread_sweep": spread_sweep(trades, initial, years, cfg.get("spread_sweep_bps") or []),
         "n_trades": len(trades),
         "years": float(years),
     }

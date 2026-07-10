@@ -123,3 +123,32 @@ def test_run_monte_carlo_spread_bps_does_not_mutate_caller_trades():
                      cfg={"methods": ["bootstrap"], "n_paths": 10, "seed": 1,
                           "drop_k": [1], "spread_bps": 20.0})
     assert [t["pnl_pct"] for t in trades] == original_pcts
+
+def test_run_monte_carlo_includes_spread_sweep_table_when_configured():
+    from app.services.backtest.monte_carlo import run_monte_carlo
+    trades = _trades_priced([(5.0, 100.0, 100.0), (-2.0, 100.0, 100.0)] * 5)
+    cfg = {"methods": [], "n_paths": 10, "seed": 1, "drop_k": [],
+           "spread_sweep_bps": [0, 10, 25]}
+    r = run_monte_carlo(trades, initial=10_000.0, years=3.0, cfg=cfg)
+    assert [row["spread_bps"] for row in r["spread_sweep"]] == [0, 10, 25]
+
+def test_run_monte_carlo_omits_spread_sweep_key_when_not_configured():
+    from app.services.backtest.monte_carlo import run_monte_carlo
+    trades = _trades_priced([(5.0, 100.0, 100.0)])
+    cfg = {"methods": [], "n_paths": 10, "seed": 1, "drop_k": []}
+    r = run_monte_carlo(trades, initial=10_000.0, years=3.0, cfg=cfg)
+    assert r["spread_sweep"] == []  # present but empty, not a KeyError either way
+
+def test_run_monte_carlo_spread_sweep_is_independent_of_baseline_spread_bps():
+    # The sweep must run over the ORIGINAL trades regardless of whether the caller also set a
+    # baseline `spread_bps` haircut (Task 3) -- the two are deliberately independent concerns.
+    # A buggy wiring that fed the sweep the baseline-adjusted pcts/trades (e.g. `trades_for_drop_k`)
+    # would make this diverge whenever spread_bps is nonzero; this test pins that it does NOT.
+    from app.services.backtest.monte_carlo import run_monte_carlo
+    trades = _trades_priced([(5.0, 100.0, 100.0), (-2.0, 100.0, 100.0)] * 5)
+    cfg_no_baseline = {"methods": [], "n_paths": 10, "seed": 1, "drop_k": [],
+                        "spread_sweep_bps": [0, 10, 25]}
+    cfg_with_baseline = {**cfg_no_baseline, "spread_bps": 20.0}
+    r0 = run_monte_carlo(trades, initial=10_000.0, years=3.0, cfg=cfg_no_baseline)
+    r1 = run_monte_carlo(trades, initial=10_000.0, years=3.0, cfg=cfg_with_baseline)
+    assert r0["spread_sweep"] == r1["spread_sweep"]
