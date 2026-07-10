@@ -114,3 +114,12 @@ def test_run_monte_carlo_spread_bps_defaults_to_zero_noop():
     cfg = {"methods": ["bootstrap"], "n_paths": 50, "seed": 1, "drop_k": []}
     r = run_monte_carlo(trades, initial=10_000.0, years=3.0, cfg=cfg)  # no spread_bps key at all
     assert r["methods"]["bootstrap"]["n_paths"] == 50  # ran fine, no KeyError
+
+def test_run_monte_carlo_spread_bps_does_not_mutate_caller_trades():
+    from app.services.backtest.monte_carlo import run_monte_carlo
+    trades = _trades_priced([(5.0, 100.0, 100.0), (-2.0, 100.0, 100.0)])
+    original_pcts = [t["pnl_pct"] for t in trades]
+    run_monte_carlo(trades, initial=10_000.0, years=3.0,
+                     cfg={"methods": ["bootstrap"], "n_paths": 10, "seed": 1,
+                          "drop_k": [1], "spread_bps": 20.0})
+    assert [t["pnl_pct"] for t in trades] == original_pcts
