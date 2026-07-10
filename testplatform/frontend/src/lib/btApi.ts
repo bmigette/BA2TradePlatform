@@ -272,6 +272,8 @@ export interface RobustnessRequestBody {
     methods: string[];      // subset of "bootstrap" | "shuffle" | "jitter"
     drop_k: number[];       // e.g. [1,2,3]
     jitter_bp: number;
+    spread_bps: number;         // single baseline round-trip spread haircut, in bp
+    spread_sweep_bps: number[]; // deterministic degradation table levels, in bp
   };
   schedule: {
     enabled: boolean;
@@ -305,9 +307,17 @@ export interface McDropKRow {
   max_drawdown: number;
   calmar: number;
 }
+export interface McSpreadSweepRow {
+  spread_bps: number;
+  final_equity: number;
+  annualized_return: number;
+  max_drawdown: number;
+  calmar: number;
+}
 export interface McResults {
   methods: Record<string, McMethodSummary>;
   drop_k: McDropKRow[];
+  spread_sweep: McSpreadSweepRow[];
   n_trades: number;
   years: number;
 }

@@ -40,6 +40,8 @@ const RobustnessDialog: React.FC<Props> = ({ isOpen, backtestIds, backtestNames,
   const [seed, setSeed] = useState(42);
   const [dropKText, setDropKText] = useState('1,2,3');
   const [jitterBp, setJitterBp] = useState(0);
+  const [spreadBps, setSpreadBps] = useState(0);
+  const [spreadSweepText, setSpreadSweepText] = useState('0,5,10,20,50');
 
   // Schedule config
   const [scheduleEnabled, setScheduleEnabled] = useState(false);
@@ -70,6 +72,11 @@ const RobustnessDialog: React.FC<Props> = ({ isOpen, backtestIds, backtestNames,
     .map(s => parseInt(s.trim(), 10))
     .filter(n => Number.isFinite(n) && n > 0);
 
+  const parsedSpreadSweep = spreadSweepText
+    .split(',')
+    .map(s => parseFloat(s.trim()))
+    .filter(n => Number.isFinite(n) && n >= 0);
+
   const canSubmit =
     backtestIds.length > 0 &&
     (mcEnabled || scheduleEnabled) &&
@@ -89,6 +96,8 @@ const RobustnessDialog: React.FC<Props> = ({ isOpen, backtestIds, backtestNames,
         methods: [...methods],
         drop_k: parsedDropK,
         jitter_bp: jitterBp,
+        spread_bps: spreadBps,
+        spread_sweep_bps: parsedSpreadSweep,
       },
       schedule: {
         enabled: scheduleEnabled,
@@ -180,10 +189,21 @@ const RobustnessDialog: React.FC<Props> = ({ isOpen, backtestIds, backtestNames,
                     <input type="number" min={0} step={1} value={jitterBp}
                       onChange={e => setJitterBp(Math.max(0, parseFloat(e.target.value) || 0))} className={inputClass} />
                   </label>
+                  <label className="flex flex-col gap-1">
+                    <span className={label}>Spread (round-trip, bp)</span>
+                    <input type="number" min={0} step={1} value={spreadBps}
+                      onChange={e => setSpreadBps(Math.max(0, parseFloat(e.target.value) || 0))} className={inputClass} />
+                  </label>
+                  <label className="flex flex-col gap-1">
+                    <span className={label}>Spread sweep (bp, comma list)</span>
+                    <input type="text" value={spreadSweepText} placeholder="0,5,10,20,50"
+                      onChange={e => setSpreadSweepText(e.target.value)} className={inputClass} />
+                  </label>
                 </div>
                 <p className="text-[11px] text-gray-500 dark:text-gray-400">
                   Jitter is only applied when "Slippage jitter" is checked. Probabilities use the backend
-                  defaults P(ann ≥ 30%) / P(dd ≤ −20%).
+                  defaults P(ann ≥ 30%) / P(dd ≤ −20%). Spread applies a flat round-trip cost haircut; the
+                  sweep re-runs the original trade order at each listed level to show cost sensitivity.
                 </p>
               </div>
             )}

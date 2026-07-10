@@ -11,7 +11,7 @@ import {
   Cell,
 } from 'recharts';
 import { listRobustnessRuns } from '../lib/btApi';
-import type { RobustnessRun, McMethodSummary, McDropKRow, ScheduleVariantRow } from '../lib/btApi';
+import type { RobustnessRun, McMethodSummary, McDropKRow, McSpreadSweepRow, ScheduleVariantRow } from '../lib/btApi';
 
 // Per-backtest robustness results panel (Task 6), collapsible. Polls
 //   GET /api/backtests/robustness?backtest_id=<id>
@@ -163,6 +163,37 @@ function DropKTable({ rows }: { rows: McDropKRow[] }) {
   );
 }
 
+function SpreadSweepTable({ rows }: { rows: McSpreadSweepRow[] }) {
+  if (!rows.length) return null;
+  return (
+    <div className="border border-gray-200 dark:border-gray-700 rounded-lg p-3">
+      <h5 className="text-sm font-semibold text-gray-800 dark:text-gray-200 mb-2">
+        Spread sensitivity (original trade order)
+      </h5>
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="text-xs text-gray-500 dark:text-gray-400 text-right">
+            <th className="text-left py-1">spread (bp)</th>
+            <th className="py-1">ann return</th>
+            <th className="py-1">max DD</th>
+            <th className="py-1">calmar</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map(r => (
+            <tr key={r.spread_bps} className="border-t border-gray-100 dark:border-gray-700/50 text-right">
+              <td className="text-left py-1 text-gray-700 dark:text-gray-300">{r.spread_bps}</td>
+              <td className="py-1 text-gray-900 dark:text-gray-100">{fmtPct(r.annualized_return)}</td>
+              <td className="py-1 text-red-600 dark:text-red-400">{fmtPct(r.max_drawdown)}</td>
+              <td className="py-1 text-gray-900 dark:text-gray-100">{fmtNum(r.calmar)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 function MonteCarloResults({ run }: { run: RobustnessRun }) {
   if (run.status === 'failed') {
     return <p className="text-sm text-red-600 dark:text-red-400">Monte-Carlo failed: {run.error_message || 'unknown error'}</p>;
@@ -181,6 +212,7 @@ function MonteCarloResults({ run }: { run: RobustnessRun }) {
         <McMethodTable key={name} name={name} summary={res.methods[name]} />
       ))}
       <DropKTable rows={res.drop_k || []} />
+      <SpreadSweepTable rows={res.spread_sweep || []} />
     </div>
   );
 }
