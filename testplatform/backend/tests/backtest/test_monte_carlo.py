@@ -2,6 +2,7 @@
 import numpy as np
 from app.services.backtest.monte_carlo import (
     equity_path_from_trade_pcts, mc_bootstrap, mc_shuffle, drop_k_best, summarize_paths,
+    apply_spread_cost,
 )
 
 def _trades(pcts):
@@ -46,7 +47,6 @@ def test_summarize_paths_percentiles_and_probs():
     assert abs(s["prob_dd_breach"] - 0.4) < 1e-9
 
 def test_apply_spread_cost_deducts_round_trip_bps_from_pnl_pct():
-    from app.services.backtest.monte_carlo import apply_spread_cost
     # Single trade: $10,000 equity, notional = 100 * 100 = $10,000 (fully invested),
     # so round-trip cost at 10bps = 10_000 * 0.0010 * 2 = $20 = 0.20% of the $10,000 entry equity.
     trades = _trades_priced([(5.0, 100.0, 100.0)])
@@ -55,13 +55,28 @@ def test_apply_spread_cost_deducts_round_trip_bps_from_pnl_pct():
     assert abs(adjusted[0] - (5.0 - 0.20)) < 1e-6
 
 def test_apply_spread_cost_zero_bps_is_a_noop():
-    from app.services.backtest.monte_carlo import apply_spread_cost
     trades = _trades_priced([(5.0, 100.0, 100.0), (-3.0, 50.0, 40.0)])
     adjusted = apply_spread_cost(trades, initial=10_000.0, spread_bps=0.0)
     assert adjusted == [5.0, -3.0]
 
 def test_apply_spread_cost_tolerates_missing_notional_fields():
-    from app.services.backtest.monte_carlo import apply_spread_cost
     trades = [{"pnl_pct": 5.0, "exit_time": "2023-01-15T00:00:00"}]  # no entry_price/size
     adjusted = apply_spread_cost(trades, initial=10_000.0, spread_bps=10.0)
     assert adjusted == [5.0]  # zero notional -> zero deduction, no crash
+
+def test_apply_spread_cost_multi_trade_uses_pre_trade_equity_not_post_trade():
+    # Same 2-trade scenario as the no-op test above, but with a NONZERO spread_bps so both
+    # trades' deductions are exercised (trade 0's equity-at-entry is the flat `initial`; trade
+    # 1's equity-at-entry must come from the RAW (pre-spread) equity path, i.e. path[1] built
+    # from trade 0's un-adjusted 5.0% -- NOT path[2], and NOT a path rebuilt from adjusted pcts).
+    # path = equity_path_from_trade_pcts([5.0, -3.0], 10_000.0) = [10000, 10500, 10185].
+    # Trade 0: notional = 100*100 = 10_000, equity_at_entry = path[0] = 10_000.
+    #   round_trip_cost = 10_000 * 0.0010 * 2 = 20 -> deduct 20/10_000*100 = 0.20 -> 5.0 - 0.20 = 4.8
+    # Trade 1: notional = 50*40 = 2_000, equity_at_entry = path[1] = 10_500 (from trade 0's RAW pct).
+    #   round_trip_cost = 2_000 * 0.0010 * 2 = 4 -> deduct 4/10_500*100 = 0.0380952... ->
+    #   -3.0 - 0.0380952... = -3.038095238095238
+    trades = _trades_priced([(5.0, 100.0, 100.0), (-3.0, 50.0, 40.0)])
+    adjusted = apply_spread_cost(trades, initial=10_000.0, spread_bps=10.0)
+    assert len(adjusted) == 2
+    assert abs(adjusted[0] - 4.8) < 1e-9
+    assert abs(adjusted[1] - (-3.038095238095238)) < 1e-9
