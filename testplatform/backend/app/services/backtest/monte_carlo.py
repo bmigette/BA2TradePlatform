@@ -55,6 +55,37 @@ def equity_path_from_trade_pcts(pcts, initial: float) -> np.ndarray:
     return path
 
 
+def apply_spread_cost(trades: List[Dict[str, Any]], initial: float, spread_bps: float) -> List[float]:
+    """Deduct an assumed round-trip bid-ask spread cost from each trade's equity-relative
+    ``pnl_pct``, returning the ADJUSTED pct list (same length/order as ``trades``).
+
+    ``spread_bps`` is crossed TWICE per trade (once entering, once exiting) — the standard
+    round-trip convention. Converts the price-space cost to an equity-relative pct using the
+    SAME sequential-compounding equity reconstruction ``equity_path_from_trade_pcts`` already
+    uses elsewhere in this module (equity-at-entry for trade i = path[i], the point BEFORE
+    trade i is applied) — see the module's approximation-philosophy docstring. A trade with
+    missing/zero ``entry_price``/``size`` gets zero deduction rather than raising.
+
+    ``spread_bps == 0`` is an exact no-op (returns the original pcts unchanged).
+    """
+    pcts = [float(t.get("pnl_pct") or 0.0) for t in trades]
+    if not spread_bps:
+        return pcts
+    path = equity_path_from_trade_pcts(pcts, initial)  # path[i] = equity BEFORE trade i
+    bps_frac = float(spread_bps) / 10_000.0
+    out = []
+    for i, t in enumerate(trades):
+        notional = float(t.get("entry_price") or 0.0) * float(t.get("size") or 0.0)
+        equity_at_entry = float(path[i])
+        if notional <= 0 or equity_at_entry <= 0:
+            out.append(pcts[i])
+            continue
+        round_trip_cost = notional * bps_frac * 2.0
+        deduct_pct = (round_trip_cost / equity_at_entry) * 100.0
+        out.append(pcts[i] - deduct_pct)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Path metrics (mirror results.py conventions)
 # ---------------------------------------------------------------------------

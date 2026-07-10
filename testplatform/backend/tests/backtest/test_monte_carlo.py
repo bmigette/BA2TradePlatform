@@ -7,6 +7,12 @@ from app.services.backtest.monte_carlo import (
 def _trades(pcts):
     return [{"pnl_pct": p, "exit_time": f"2023-0{1+i%9}-15T00:00:00"} for i, p in enumerate(pcts)]
 
+def _trades_priced(rows):
+    """rows: list of (pnl_pct, entry_price, size) tuples."""
+    return [{"pnl_pct": p, "entry_price": ep, "size": sz,
+             "exit_time": f"2023-0{1+i%9}-15T00:00:00"}
+            for i, (p, ep, sz) in enumerate(rows)]
+
 def test_equity_path_compounds_equity_relative_pcts():
     path = equity_path_from_trade_pcts([10.0, -10.0], initial=10_000.0)
     assert abs(path[-1] - 9_900.0) < 1e-6
@@ -38,3 +44,24 @@ def test_summarize_paths_percentiles_and_probs():
     assert s["annualized_return"]["p50"] == 30
     assert abs(s["prob_target_annual"] - 0.6) < 1e-9
     assert abs(s["prob_dd_breach"] - 0.4) < 1e-9
+
+def test_apply_spread_cost_deducts_round_trip_bps_from_pnl_pct():
+    from app.services.backtest.monte_carlo import apply_spread_cost
+    # Single trade: $10,000 equity, notional = 100 * 100 = $10,000 (fully invested),
+    # so round-trip cost at 10bps = 10_000 * 0.0010 * 2 = $20 = 0.20% of the $10,000 entry equity.
+    trades = _trades_priced([(5.0, 100.0, 100.0)])
+    adjusted = apply_spread_cost(trades, initial=10_000.0, spread_bps=10.0)
+    assert len(adjusted) == 1
+    assert abs(adjusted[0] - (5.0 - 0.20)) < 1e-6
+
+def test_apply_spread_cost_zero_bps_is_a_noop():
+    from app.services.backtest.monte_carlo import apply_spread_cost
+    trades = _trades_priced([(5.0, 100.0, 100.0), (-3.0, 50.0, 40.0)])
+    adjusted = apply_spread_cost(trades, initial=10_000.0, spread_bps=0.0)
+    assert adjusted == [5.0, -3.0]
+
+def test_apply_spread_cost_tolerates_missing_notional_fields():
+    from app.services.backtest.monte_carlo import apply_spread_cost
+    trades = [{"pnl_pct": 5.0, "exit_time": "2023-01-15T00:00:00"}]  # no entry_price/size
+    adjusted = apply_spread_cost(trades, initial=10_000.0, spread_bps=10.0)
+    assert adjusted == [5.0]  # zero notional -> zero deduction, no crash
