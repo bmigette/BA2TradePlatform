@@ -77,6 +77,7 @@ _CATALOG_META = {
         "label": "Sharpe Ratio",
         "description": "Risk-adjusted return (mean/stdev). No adjusted variant under caps.",
         "supports_trade_scale": True,
+        "supports_win_rate_factor": True,
         "uses_adjusted_under_caps": False,
     },
     "total_return": {
@@ -84,36 +85,42 @@ _CATALOG_META = {
         "description": "Total return over the run. Ranks on the capped (adjusted) return when a "
                        "profit cap is active.",
         "supports_trade_scale": True,
+        "supports_win_rate_factor": True,
         "uses_adjusted_under_caps": True,
     },
     "profit_factor": {
         "label": "Profit Factor",
         "description": "Gross profit / gross loss. Cap-aware (adjusted) variant used under caps.",
         "supports_trade_scale": True,
+        "supports_win_rate_factor": True,
         "uses_adjusted_under_caps": True,
     },
     "win_rate": {
         "label": "Win Rate",
         "description": "Share of winning trades. No adjusted variant under caps.",
         "supports_trade_scale": True,
+        "supports_win_rate_factor": True,
         "uses_adjusted_under_caps": False,
     },
     "sortino_ratio": {
         "label": "Sortino Ratio",
         "description": "Downside-risk-adjusted return. No adjusted variant under caps.",
         "supports_trade_scale": True,
+        "supports_win_rate_factor": True,
         "uses_adjusted_under_caps": False,
     },
     "calmar_ratio": {
         "label": "Calmar Ratio",
         "description": "Annualized return / max drawdown. Cap-aware (adjusted) variant under caps.",
         "supports_trade_scale": True,
+        "supports_win_rate_factor": True,
         "uses_adjusted_under_caps": True,
     },
     "sqn": {
         "label": "System Quality Number",
         "description": "Van Tharp SQN (expectancy x sqrt(N)). Cap-aware (adjusted) variant under caps.",
         "supports_trade_scale": True,
+        "supports_win_rate_factor": True,
         "uses_adjusted_under_caps": True,
     },
 }
@@ -126,16 +133,19 @@ _SPECIAL_META = {
     _MAX_DRAWDOWN_KEY: {
         "label": "Max Drawdown",
         "description": "Largest peak-to-trough equity drop (minimized: fitness is the negated dd).",
-        # Negated, not return-based: the trade-frequency scale doesn't apply.
+        # Negated, not return-based: neither multiplicative factor applies.
         "supports_trade_scale": False,
+        "supports_win_rate_factor": False,
         "uses_adjusted_under_caps": False,
     },
     _CAR_KEY: {
         "label": "Consistent Annual Return",
         "description": "Goal metric: ~30%/yr EVERY year, >=30 trades/yr, dd<=20% ok. The hard "
-                       "trade-rate gate replaces the trade-scale multiplier.",
+                       "trade-rate gate replaces the trade-scale multiplier; win rate isn't part "
+                       "of the CAR formula, so the optional win-rate factor still applies.",
         # Early-return in compute_fitness: fitness_trade_scale is a structural no-op here.
         "supports_trade_scale": False,
+        "supports_win_rate_factor": True,
         "uses_adjusted_under_caps": True,
     },
 }
@@ -228,14 +238,16 @@ def compute_fitness(fitness_metric: str, results: dict) -> float:
         dd = results.get("max_drawdown")
         if dd is None:
             return ZERO_TRADE_SENTINEL
-        return -float(dd)  # smaller drawdown -> larger (less negative) fitness
+        return -float(dd)  # smaller drawdown -> larger (less negative) fitness; not win-rate-scaled
+        # (negated distance metric, not a return — same reasoning as supports_trade_scale=False).
 
     if metric in _CAR_ALIASES:
-        # Early return ON PURPOSE: the trade-frequency scale block below must NOT apply to this
-        # metric — its linear ramp-to-100/yr would penalize the 30-40 trades/yr target zone ~3x,
-        # and the hard >=30/yr gate inside the metric already replaces it. fitness_trade_scale
-        # is therefore a structural no-op for consistent_annual_return.
-        return _consistent_annual_return(results)
+        # Early return for the trade-frequency scale ONLY (see its own comment): its linear
+        # ramp-to-100/yr would penalize the 30-40 trades/yr target zone ~3x, and the hard >=30/yr
+        # gate inside the metric already replaces it. The win-rate factor is NOT similarly
+        # exclusive with CAR's own machinery (win rate isn't part of the CAR formula at all), so
+        # it still applies via the shared _apply_win_rate_factor call below.
+        return _apply_win_rate_factor(_consistent_annual_return(results), results)
 
     key = _FITNESS_KEYS.get(metric)
     if key is None:
@@ -273,7 +285,21 @@ def compute_fitness(fitness_metric: str, results: dict) -> float:
         cap = float(results.get("fitness_trade_scale_cap") or 100.0)
         tpy = results.get("avg_trades_per_year") or 0.0
         val *= min(float(tpy), cap) / 100.0
-    return val
+    return _apply_win_rate_factor(val, results)
+
+
+def _apply_win_rate_factor(val: float, results: dict) -> float:
+    """Optional multiplicative win-rate factor (``fitness_win_rate_factor``): rewards a higher
+    share of winning trades, penalizes a lower one. factor = 2 * win_rate_fraction, so 0% win ->
+    0.0x, 50% win -> 1.0x (break-even, no change), 100% win -> 2.0x. Mirrors fitness_trade_scale's
+    guard: applied only to a POSITIVE fitness, since scaling a losing (<=0) value by a <1.0 factor
+    would IMPROVE it, wrongly rewarding a low-win-rate loser."""
+    if not results.get("fitness_win_rate_factor") or val <= 0:
+        return val
+    win_rate = results.get("win_rate")
+    if win_rate is None:
+        return val
+    return val * (2.0 * (float(win_rate) / 100.0))
 
 
 # ---------------------------------------------------------------------------

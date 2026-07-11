@@ -142,6 +142,13 @@ interface Strategy {
   // condition). Replaces the deleted initialTp*/initialSl* scalar fields; see
   // docs/plans/2026-07-03-entry-tp-sl-bracket-actions.md (REVISION 2026-07-04).
   entryActions: ExitConditionSet[];
+  // Unified rule model (migration 028): the ACTUAL source of truth on the backend —
+  // buyEntryConditions/sellEntryConditions/exitConditions/entryActions above are always
+  // undefined on a migrated row (the Strategy model only has these two DB columns now).
+  // Optional because saved-backtest strategyParams (a different, ad-hoc dict shape reused
+  // via this same interface) may omit them.
+  entryRules?: TradeRule[];
+  exitRules?: TradeRule[];
   // Classic-RM params with optimization ranges (Phase 4 joint optimizer)
   rmRiskPerTradePct?: number;
   rmRiskPerTradePctOptimize?: boolean;
@@ -2967,6 +2974,12 @@ const Backtesting: React.FC = () => {
                               buyEntryConditions: strat.buyEntryConditions,
                               sellEntryConditions: strat.sellEntryConditions,
                               exitConditions: strat.exitConditions,
+                              // Unified rule model (migration 028): the Strategy row itself now
+                              // only carries entryRules/exitRules (the legacy fields above are
+                              // always undefined post-migration) — carry them through too so the
+                              // fallback below can still render human-readable conditions.
+                              entryRules: strat.entryRules,
+                              exitRules: strat.exitRules,
                               strategyName: strat.name,
                             };
                           }
@@ -2974,18 +2987,54 @@ const Backtesting: React.FC = () => {
                         if (!sp && !selectedBacktest.strategyId) {
                           return <p className="text-sm text-gray-500 dark:text-gray-400">No strategy information available for this backtest.</p>;
                         }
+                        // Unified rule model (migration 028): _persist_top_backtests and saved
+                        // Strategy rows now only carry entryRules/exitRules (the concrete decoded
+                        // TradeRule lists that actually ran) — no legacy buyEntryConditions/
+                        // sellEntryConditions/exitConditions/entryActions mirror.
+                        //
+                        // IMPORTANT: do NOT route this read-only display through
+                        // tradeRulesToLegacyEditor — that converter targets the EDITABLE builder
+                        // forms (one action per exit row, camelCase field names for form state)
+                        // and is deliberately lossy: a rule's 2nd+ actions are dropped (e.g. an S4
+                        // tier rule fires an SL ratchet AND a TP extension from ONE rule — only the
+                        // ratchet survived) and the camelCase fields it emits don't match what
+                        // fmtExitAction reads, so even the one action shown rendered as a blank
+                        // "reference" instead of its real value. Real trades were hitting that
+                        // dropped take-profit action exactly (e.g. tier3's adjust_take_profit=48
+                        // matching every +48.00% "take_profit" exit) with no visible rule to explain
+                        // it. Use the entryRules/exitRules TradeRule objects DIRECTLY instead — full
+                        // fidelity (buy tree via .conditions, extra actions via .actions[],
+                        // continue_processing) and no lossy round trip needed for a read-only view.
+                        const hasLegacyConditionShape = !!(sp?.buyEntryConditions || sp?.sellEntryConditions
+                          || sp?.exitConditions || sp?.entryActions || sp?.entry_actions);
+                        const newEntryRules = (sp?.entryRules ?? sp?.entry_rules) as TradeRule[] | undefined;
+                        const newExitRules = (sp?.exitRules ?? sp?.exit_rules) as TradeRule[] | undefined;
+                        const hasNewShapeRules = !hasLegacyConditionShape
+                          && (Array.isArray(newEntryRules) || Array.isArray(newExitRules));
+                        // Only the entry rule's OWN protective actions belong in "Entry Actions" —
+                        // the buy/sell action that OPENS the position is shown implicitly via the
+                        // Entry Conditions block below, not repeated here.
+                        const newEntryExtraActions = hasNewShapeRules
+                          ? (newEntryRules ?? []).flatMap((r) =>
+                              (r.actions ?? []).filter((a) => a.action_type !== 'buy' && a.action_type !== 'sell'))
+                          : [];
                         // The entry-time TP/SL bracket now rides on entryActions (a rule list,
                         // same shape as exitConditions) instead of the deleted scalar
                         // initialTpPercent/initialSlPercent fields. Pull the adjust_take_profit /
                         // adjust_stop_loss rule's value for the quick-glance cards below.
-                        const entryActionsList = (sp?.entryActions ?? sp?.entry_actions ?? sp?.entry_rules ?? []) as any[];
+                        const entryActionsList = (sp?.entryActions ?? sp?.entry_actions ?? newEntryExtraActions) as any[];
                         const tpRule = entryActionsList.find((r) => (r?.action ?? r?.action_type) === 'adjust_take_profit');
                         const slRule = entryActionsList.find((r) => (r?.action ?? r?.action_type) === 'adjust_stop_loss');
                         const tp = tpRule ? (tpRule.actionValue ?? tpRule.action_value) : undefined;
                         const sl = slRule ? (slRule.actionValue ?? slRule.action_value) : undefined;
-                        const buyConditions = sp?.buyEntryConditions?.conditions || [];
-                        const sellConditions = sp?.sellEntryConditions?.conditions || [];
-                        const exitConditions = sp?.exitConditions || [];
+                        // Entry condition TREES aren't lossy (only extra actions are), so the legacy
+                        // editor's buy/sell tree merge is fine to reuse just for this part.
+                        const legacyEntryTrees = hasNewShapeRules
+                          ? tradeRulesToLegacyEditor(newEntryRules ?? [], [])
+                          : null;
+                        const buyConditions = sp?.buyEntryConditions?.conditions || legacyEntryTrees?.buyTree?.conditions || [];
+                        const sellConditions = sp?.sellEntryConditions?.conditions || legacyEntryTrees?.sellTree?.conditions || [];
+                        const exitConditions = sp?.exitConditions || (hasNewShapeRules ? (newExitRules ?? []) : []);
                         const stratName = sp?.strategyName;
                         // Flat optimized genes (model:*/cond:*/exit:*/entry:*) — surfaced as a
                         // readable list so the tab is informative for optimization runs (which
@@ -3073,12 +3122,28 @@ const Backtesting: React.FC = () => {
                                   {exitConditions.map((rule: any, i: number) => {
                                     const nConds = (rule.conditions?.conditions ?? []).length;
                                     const grpOp = rule.conditions?.operator === 'OR' || rule.conditions?.type === 'OR' ? 'any of' : 'all of';
+                                    // New-shape TradeRules carry actions[] (possibly >1 — e.g. an SL
+                                    // ratchet + TP extension fired together from one rule); legacy
+                                    // rows inline a single action's fields directly on the rule
+                                    // object. Normalize to an array so a multi-action rule is never
+                                    // silently shown as if only its first action existed.
+                                    const ruleActions = Array.isArray(rule.actions) ? rule.actions : [rule];
                                     return (
                                       <div key={i} className="text-sm bg-yellow-50 dark:bg-yellow-900/20 rounded px-3 py-2 text-yellow-800 dark:text-yellow-300">
                                         <div className="flex items-baseline gap-2 flex-wrap">
                                           <span className="font-semibold">{rule.name || `Exit Rule ${i + 1}`}</span>
-                                          <span className="text-[11px] font-semibold rounded px-1.5 py-0.5 bg-yellow-200/70 dark:bg-yellow-700/40 text-yellow-900 dark:text-yellow-200">{fmtExitAction(rule)}</span>
+                                          {ruleActions.map((a: any, ai: number) => (
+                                            <span key={ai} className="text-[11px] font-semibold rounded px-1.5 py-0.5 bg-yellow-200/70 dark:bg-yellow-700/40 text-yellow-900 dark:text-yellow-200">
+                                              {fmtExitAction(a)}
+                                            </span>
+                                          ))}
                                           {nConds > 1 && <span className="text-[10px] uppercase tracking-wide rounded px-1 bg-yellow-100 dark:bg-yellow-800/40 text-yellow-700 dark:text-yellow-300">{grpOp}</span>}
+                                          {rule.continue_processing && (
+                                            <span className="text-[10px] uppercase tracking-wide rounded px-1 bg-orange-100 dark:bg-orange-800/40 text-orange-700 dark:text-orange-300"
+                                              title="Evaluation continues to the next exit rule even after this one matches (instead of stopping here)">
+                                              continues
+                                            </span>
+                                          )}
                                         </div>
                                         <div className="flex items-baseline gap-2 mt-0.5">
                                           <span className="text-[10px] uppercase opacity-50 shrink-0">when</span>

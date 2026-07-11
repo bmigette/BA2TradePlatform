@@ -1101,61 +1101,79 @@ class AdjustStopLossAction(_AdjustPriceLevelAction):
         pass  # SL does not store metadata
 
     def _enforce_minimum_distance(self) -> None:
-        """Enforce minimum SL percent distance from open price."""
-        if self.existing_order and self.existing_order.open_price and self.target_price:
+        """Enforce a minimum SL distance from CURRENT price, not open/entry price.
+
+        Distance-from-current is direction-aware by construction: a proposed stop that's
+        already comfortably far below current price (long) needs no adjustment, whether it's
+        a fresh loss-limiting floor set at entry (current ~= open there) or a profit-locking
+        tier/trailing stop that's since drifted far below a price that rallied hard. The
+        floor only kicks in when the proposed stop sits too close to -- or on the wrong side
+        of -- CURRENT price, which is the actual premature-stopout/whipsaw risk this guard
+        exists to prevent. (The previous open-price-relative version couldn't distinguish
+        "stop too tight" from "stop is a legitimate profit-lock above entry": a trailing stop
+        is defined as current_price * (1 - pct/100), i.e. its distance FROM OPEN keeps
+        shrinking as price rallies even though its distance from CURRENT price never changes
+        -- so it kept getting clobbered back down to a guaranteed loss the moment it moved
+        above entry.)"""
+        if self.existing_order and self.target_price:
+            current_price = self.get_current_price()
+            if not current_price:
+                return
             from ba2_common.config import get_min_tp_sl_percent
             min_tp_percent = get_min_tp_sl_percent()
-
-            open_price = float(self.existing_order.open_price)
             is_long = (self.existing_order.side.upper() == "BUY")
 
             if is_long:
-                actual_percent = ((open_price - self.target_price) / open_price) * 100
+                actual_percent = ((current_price - self.target_price) / current_price) * 100
                 if actual_percent < min_tp_percent:
-                    enforced_sl = open_price * (1 - min_tp_percent / 100)
+                    enforced_sl = current_price * (1 - min_tp_percent / 100)
                     logger.warning(
-                        f"SL enforcement: Maximum loss {actual_percent:.2f}% below minimum {min_tp_percent}%. "
-                        f"Adjusting SL from ${self.target_price:.2f} to ${enforced_sl:.2f} (open: ${open_price:.2f})"
+                        f"SL enforcement: distance from current price {actual_percent:.2f}% below minimum {min_tp_percent}%. "
+                        f"Adjusting SL from ${self.target_price:.2f} to ${enforced_sl:.2f} (current: ${current_price:.2f})"
                     )
                     self.target_price = enforced_sl
                     self.stop_loss_price = self.target_price
             else:
-                actual_percent = ((self.target_price - open_price) / open_price) * 100
+                actual_percent = ((self.target_price - current_price) / current_price) * 100
                 if actual_percent < min_tp_percent:
-                    enforced_sl = open_price * (1 + min_tp_percent / 100)
+                    enforced_sl = current_price * (1 + min_tp_percent / 100)
                     logger.warning(
-                        f"SL enforcement: Maximum loss {actual_percent:.2f}% below minimum {min_tp_percent}%. "
-                        f"Adjusting SL from ${self.target_price:.2f} to ${enforced_sl:.2f} (open: ${open_price:.2f})"
+                        f"SL enforcement: distance from current price {actual_percent:.2f}% below minimum {min_tp_percent}%. "
+                        f"Adjusting SL from ${self.target_price:.2f} to ${enforced_sl:.2f} (current: ${current_price:.2f})"
                     )
                     self.target_price = enforced_sl
                     self.stop_loss_price = self.target_price
 
     def compute_price(self, order: "TradingOrder") -> Optional[float]:
-        """Calculate the stop loss price, enforcing minimum distance from open price."""
+        """Calculate the stop loss price, enforcing minimum distance from CURRENT price.
+
+        Same current-price-relative guard as _enforce_minimum_distance above (see its
+        docstring for why open-price-relative was wrong for profit-locking stops)."""
         price = super().compute_price(order)
 
-        # Enforce minimum SL distance from open price
-        if price is not None and order.open_price:
-            from ba2_common.config import get_min_tp_sl_percent
-            min_pct = get_min_tp_sl_percent()
-            open_price = float(order.open_price)
+        # Enforce minimum SL distance from current price
+        if price is not None:
+            current_price = self.get_current_price()
+            if current_price:
+                from ba2_common.config import get_min_tp_sl_percent
+                min_pct = get_min_tp_sl_percent()
 
-            if self.order_recommendation in (OrderRecommendation.BUY, OrderRecommendation.OVERWEIGHT):
-                is_long = True
-            elif self.order_recommendation in (OrderRecommendation.SELL, OrderRecommendation.UNDERWEIGHT):
-                is_long = False
-            else:
-                order_side = str(order.side.value if hasattr(order.side, 'value') else order.side).upper()
-                is_long = (order_side == "BUY")
+                if self.order_recommendation in (OrderRecommendation.BUY, OrderRecommendation.OVERWEIGHT):
+                    is_long = True
+                elif self.order_recommendation in (OrderRecommendation.SELL, OrderRecommendation.UNDERWEIGHT):
+                    is_long = False
+                else:
+                    order_side = str(order.side.value if hasattr(order.side, 'value') else order.side).upper()
+                    is_long = (order_side == "BUY")
 
-            if is_long:
-                actual_pct = ((open_price - price) / open_price) * 100
-                if actual_pct < min_pct:
-                    price = open_price * (1 - min_pct / 100)
-            else:
-                actual_pct = ((price - open_price) / open_price) * 100
-                if actual_pct < min_pct:
-                    price = open_price * (1 + min_pct / 100)
+                if is_long:
+                    actual_pct = ((current_price - price) / current_price) * 100
+                    if actual_pct < min_pct:
+                        price = current_price * (1 - min_pct / 100)
+                else:
+                    actual_pct = ((price - current_price) / current_price) * 100
+                    if actual_pct < min_pct:
+                        price = current_price * (1 + min_pct / 100)
 
         return price
 

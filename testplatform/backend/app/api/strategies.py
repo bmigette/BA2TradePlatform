@@ -27,7 +27,7 @@ def get_fitness_options():
     """UI single source of truth for the optimization form's fitness controls.
 
     Returns the fitness-metrics catalog (derived from strategy_fitness so the UI can never drift
-    from the backend) plus the four cap/scale knob definitions with their defaults. The four knobs
+    from the backend) plus the five cap/scale knob definitions with their defaults. The five knobs
     ride in the optimize request's ``optimization_config.backtest`` block (see /{id}/optimize) and
     are threaded per-trial by strategy_optimization_handler using these exact keys.
     """
@@ -44,6 +44,8 @@ def get_fitness_options():
             "fitness_trade_scale": {"default": False},
             # Clamp on avg_trades_per_year before scaling (100/yr = factor 1.0 break-even).
             "fitness_trade_scale_cap": {"default": 100},
+            # Win-rate fitness factor: 2 * win_rate_fraction (50% win = 1.0x break-even).
+            "fitness_win_rate_factor": {"default": False},
         },
     }
 

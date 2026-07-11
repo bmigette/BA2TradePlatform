@@ -177,6 +177,7 @@ async def list_backtests(
     optimization_id: Optional[int] = None,
     saved: Optional[bool] = None,
     single: Optional[bool] = None,
+    label: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
     """List all backtests (summary only, no curves/trades).
@@ -190,17 +191,23 @@ async def list_backtests(
                              ``False`` -> only optimization-derived runs
                              (``optimization_id IS NOT NULL``). Used by the BT-History tab
                              which lists single backtests only.
+      * ``label``           — only runs whose ``Backtest.labels`` array CONTAINS this tag
+                             (e.g. "goal5" or "S4" — a backtest can carry several independent
+                             labels, one for the grid/batch id and one for the strategy, so
+                             this matches ANY one of them, not the whole set).
     """
     from sqlalchemy import text
 
     # Use raw SQL to avoid loading huge blob columns (equity_curve, drawdown_curve, trades
     # can be 2-5MB each; with 200+ backtests the ORM query loads 1GB+ even with defer)
-    # Check if description column exists (migration may not have run yet)
+    # Check if description/labels columns exist (migration may not have run yet)
     col_check = db.execute(text("PRAGMA table_info(backtests)"))
     columns = [r[1] for r in col_check]
     has_description = 'description' in columns
+    has_labels = 'labels' in columns
 
     desc_col = ", description" if has_description else ""
+    labels_col = ", labels" if has_labels else ""
 
     # Build the optional WHERE clause from the provided filters (parameterised — never
     # string-interpolate user input).
@@ -221,6 +228,13 @@ async def list_backtests(
         where_clauses.append(
             "b.optimization_id IS NULL" if single else "b.optimization_id IS NOT NULL"
         )
+    if label is not None and has_labels:
+        # labels is a JSON-encoded array (e.g. '["goal5", "S4"]'); json_each unpacks it so we
+        # can match a single element without string-matching the raw JSON text.
+        where_clauses.append(
+            "EXISTS (SELECT 1 FROM json_each(b.labels) WHERE json_each.value = :label)"
+        )
+        params["label"] = label
     where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
 
     result = db.execute(text(f"""
@@ -231,7 +245,7 @@ async def list_backtests(
                b.avg_trade_duration, b.final_equity,
                b.best_trade, b.worst_trade, b.error_message, b.is_saved, b.created_at, b.completed_at,
                m.name as model_name, b.expert_name, b.optimization_id, b.engine_type
-               {desc_col}
+               {desc_col}{labels_col}
         FROM backtests b
         LEFT JOIN trained_models m ON b.model_id = m.id
         {where_sql}
@@ -240,6 +254,7 @@ async def list_backtests(
 
     backtests = []
     for row in result:
+        idx = 31  # first index past the fixed 31 columns (0-30); desc/labels appended in order
         bt = {
             "id": row[0], "name": row[1], "modelId": row[2],
             "predictionDatasetId": row[3], "executionDatasetId": row[4],
@@ -261,8 +276,21 @@ async def list_backtests(
             "expertName": row[28],
             "optimizationId": row[29],
             "engineType": row[30] or "ml",
-            "description": row[31] if has_description else None,
+            "description": None,
+            "labels": [],
         }
+        if has_description:
+            bt["description"] = row[idx]
+            idx += 1
+        if has_labels:
+            raw = row[idx]
+            if raw:
+                import json as _json
+                try:
+                    bt["labels"] = _json.loads(raw)
+                except (TypeError, ValueError):
+                    bt["labels"] = []
+            idx += 1
         backtests.append(bt)
 
     return {"backtests": backtests, "total": len(backtests)}

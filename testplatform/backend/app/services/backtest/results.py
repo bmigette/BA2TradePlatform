@@ -332,6 +332,8 @@ def _compute_metrics(
         # Cap (trades/year) for the scale: avg_trades_per_year is clamped to this before scaling so
         # the GA is not rewarded for over-trading. None -> the fitness default (100 = factor <= 1.0).
         "fitness_trade_scale_cap": config.get("fitness_trade_scale_cap"),
+        # Optional win-rate fitness factor (2 * win_rate_fraction; see strategy_fitness.py).
+        "fitness_win_rate_factor": bool(config.get("fitness_win_rate_factor")),
         "winning_trades": winning_trades,
         "losing_trades": losing_trades,
         "win_rate": round(_safe_float(win_rate), 2),

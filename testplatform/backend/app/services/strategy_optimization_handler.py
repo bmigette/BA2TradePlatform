@@ -950,6 +950,8 @@ def _build_daily_trial_config(
         # Optional trade-frequency fitness scale (down-weight statistically thin few-trade configs).
         "fitness_trade_scale": backtest_cfg.get("fitness_trade_scale"),
         "fitness_trade_scale_cap": backtest_cfg.get("fitness_trade_scale_cap"),
+        # Optional win-rate fitness factor (2 * win_rate_fraction; 50% win = 1.0x break-even).
+        "fitness_win_rate_factor": backtest_cfg.get("fitness_win_rate_factor"),
         # Optimizer-decoded TradeRule lists (unified rule model, migration 028): the engine
         # seeds the ENTER_MARKET / OPEN_POSITIONS rulesets 1:1 from these (one EventAction per
         # rule, all actions + continue_processing verbatim; disabled rules/actions already

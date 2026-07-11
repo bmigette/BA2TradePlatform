@@ -165,6 +165,10 @@ def main() -> int:
     ap.add_argument("--fitness-trade-scale-cap", type=float, default=100.0,
                     help="Cap (trades/year) for --fitness-trade-scale so the GA is not rewarded for "
                          "over-trading (scalping). Default 100 = factor maxes at 1.0.")
+    ap.add_argument("--fitness-win-rate-factor", action="store_true",
+                    help="Scale each trial's fitness by 2 * win_rate_fraction (50%% win = break-even "
+                         "1.0x, 100%% win = 2x, 0%% win = 0x). Applies even to consistent_annual_return. "
+                         "Default: OFF.")
     ap.add_argument("--fmp-population-bonus", type=int, default=10,
                     help="Extra GA population for FMPRating jobs ONLY (its search space grew with the "
                          "price-target + analyst-recency genes). Added to --population for FMPRating. "
@@ -226,6 +230,17 @@ def main() -> int:
         if args.fitness_trade_scale:
             cmd += ["--fitness-trade-scale",
                     "--fitness-trade-scale-cap", str(args.fitness_trade_scale_cap)]
+        if args.fitness_win_rate_factor:
+            cmd += ["--fitness-win-rate-factor"]
+        # Auto-labels for easy filtering (GET /api/backtests?label=...): one tag for the grid/
+        # batch id (--name-suffix, e.g. "goal5"), one for the strategy (or expert, for the
+        # bypass FactorRanker job which has no strategy). Every top-N Backtest this job persists
+        # carries both, independent of cap-band/optimization_id.
+        job_labels = []
+        if args.name_suffix.strip():
+            job_labels.append(args.name_suffix.strip().lstrip("-"))
+        job_labels.append(strat or expert)
+        cmd += ["--labels", ",".join(job_labels)]
         if strat is not None:
             cmd += ["--strategy", strat]
         if args.workers:

@@ -56,12 +56,13 @@ def test_catalog_entries_have_required_metadata():
     from app.services import strategy_fitness as sf
 
     required = {"key", "label", "description",
-                "supports_trade_scale", "uses_adjusted_under_caps"}
+                "supports_trade_scale", "supports_win_rate_factor", "uses_adjusted_under_caps"}
     for m in sf.METRICS_CATALOG:
         assert required <= set(m), f"entry {m.get('key')} missing {required - set(m)}"
         assert isinstance(m["label"], str) and m["label"]
         assert isinstance(m["description"], str) and m["description"]
         assert isinstance(m["supports_trade_scale"], bool)
+        assert isinstance(m["supports_win_rate_factor"], bool)
         assert isinstance(m["uses_adjusted_under_caps"], bool)
 
 
@@ -97,8 +98,18 @@ def test_max_drawdown_entry_present_and_no_trade_scale():
 
     by_key = {m["key"]: m for m in sf.METRICS_CATALOG}
     assert "max_drawdown" in by_key
-    # max_drawdown is negated, not return-based; trade-scale doesn't apply.
+    # max_drawdown is negated, not return-based; neither multiplicative factor applies.
     assert by_key["max_drawdown"]["supports_trade_scale"] is False
+    assert by_key["max_drawdown"]["supports_win_rate_factor"] is False
+
+
+def test_car_entry_supports_win_rate_factor():
+    # Unlike trade_scale, the win-rate factor is NOT a structural no-op for CAR (win rate isn't
+    # part of the CAR formula), so it should still be advertised as supported.
+    from app.services import strategy_fitness as sf
+
+    by_key = {m["key"]: m for m in sf.METRICS_CATALOG}
+    assert by_key["consistent_annual_return"]["supports_win_rate_factor"] is True
 
 
 # --------------------------------------------------------------------------- #

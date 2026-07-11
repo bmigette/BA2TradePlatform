@@ -1865,6 +1865,8 @@ def _cmd_optimize(args) -> int:
             "fitness_trade_scale": bool(getattr(args, "fitness_trade_scale", False)),
             "fitness_trade_scale_cap": (float(args.fitness_trade_scale_cap)
                                         if getattr(args, "fitness_trade_scale_cap", None) else None),
+            "fitness_win_rate_factor": bool(getattr(args, "fitness_win_rate_factor", False)),
+            "labels": [t.strip() for t in getattr(args, "labels", "").split(",") if t.strip()],
             "backtest_id": int(_dt.now().timestamp()),
             "name": f"opt-{expert}-trial",
         }
@@ -2123,6 +2125,8 @@ def _cmd_optimize_batch(args) -> int:
                 "fitness_trade_scale": bool(getattr(args, "fitness_trade_scale", False)),
                 "fitness_trade_scale_cap": (float(args.fitness_trade_scale_cap)
                                             if getattr(args, "fitness_trade_scale_cap", None) else None),
+                "fitness_win_rate_factor": bool(getattr(args, "fitness_win_rate_factor", False)),
+                "labels": [t.strip() for t in getattr(args, "labels", "").split(",") if t.strip()],
                 "backtest_id": int(_dt.now().timestamp()),
                 "name": f"{name}-trial",
             }
@@ -2301,6 +2305,7 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
             bt = Backtest(
                 name=trial_cfg["name"], model_id=None, engine_type="daily_expert",
                 expert_name=expert, optimization_id=opt_id,
+                labels=bt_block.get("labels") or None,
                 strategy_params=strategy_params,
                 start_date=_dt.fromisoformat(str(bt_block["start_date"])),
                 end_date=_dt.fromisoformat(str(bt_block["end_date"])),
@@ -2707,6 +2712,17 @@ def main(argv: "list | None" = None) -> int:
                          "to this before scaling, so above it the factor stops growing (no scalper "
                          "incentive). Default 100 = factor maxes at 1.0 (pure thinness penalty); a "
                          "higher value allows some up-weighting up to that rate.")
+    op.add_argument("--fitness-win-rate-factor", action="store_true",
+                    help="Multiply each trial's (positive) fitness by 2 * win_rate_fraction, so "
+                         "50%% win rate is break-even (1.0x), 100%% win rate doubles the fitness, and "
+                         "0%% win rate zeroes it out. Applies to every fitness metric including "
+                         "consistent_annual_return (win rate isn't part of its own formula). "
+                         "Default: off.")
+    op.add_argument("--labels", default="",
+                    help="Comma-separated free-form tags stored on every persisted top-N Backtest "
+                         "(e.g. 'goal5,S4' — one for the grid/batch id, one for the strategy). Lets "
+                         "runs be filtered by ANY one of these tags via GET /api/backtests?label=..., "
+                         "independent of cap-band or optimization_id. Default: none.")
     op.add_argument("--commission", type=float, default=1.0)
     op.add_argument("--slippage", type=float, default=0.0)
     op.add_argument("--fill-model", default="next_bar_open")

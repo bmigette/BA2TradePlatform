@@ -95,6 +95,11 @@ class Backtest(Base):
     # (group stats). Both nullable: legacy/manual runs may have neither.
     expert_name = Column(String(100), nullable=True, index=True)
     optimization_id = Column(Integer, nullable=True, index=True)
+    # Free-form tags set by a grid/optimization driver, e.g. ["goal5", "S4"] (one for the grid/
+    # batch id, one for the strategy — a backtest can carry several independent labels, unlike
+    # the single expert_name/optimization_id columns). NULL/empty for manual/legacy runs. See
+    # db_migrate/029. Filtered via SQLite json_each in the list API (app/api/backtests.py).
+    labels = Column(JSON, nullable=True)
 
     # Strategy
     strategy_id = Column(Integer, ForeignKey("strategies.id"), nullable=True)
@@ -206,6 +211,7 @@ class Backtest(Base):
             "engineType": self.engine_type or "ml",
             "expertName": self.expert_name,
             "optimizationId": self.optimization_id,
+            "labels": self.labels or [],
             "modelId": self.model_id,
             "predictionDatasetId": self.prediction_dataset_id,
             "executionDatasetId": self.execution_dataset_id,
@@ -256,6 +262,7 @@ class Backtest(Base):
             "engineType": self.engine_type or "ml",
             "expertName": self.expert_name,
             "optimizationId": self.optimization_id,
+            "labels": self.labels or [],
             "modelId": self.model_id,
             "predictionDatasetId": self.prediction_dataset_id,
             "executionDatasetId": self.execution_dataset_id,
