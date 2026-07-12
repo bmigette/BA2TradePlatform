@@ -2294,8 +2294,13 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
         #    keeps progress visible (1/N, 2/N, ...) so the persist phase doesn't look stalled, lets a
         #    crash keep the done ones, frees each (large) result blob as we go, and unblocks the next
         #    matrix job as soon as the last one lands. Fan the re-runs across a bounded local process
-        #    pool when parallel > 1; else run in-process.
-        from app.services.strategy_optimization_handler import _persist_trial_worker
+        #    pool (parallel > 1) AND, if the optimization used remote workers, THOSE workers too --
+        #    reusing the same worker_ids the GA phase already resolved+synced, via the worker's
+        #    ``/run-trial-full`` endpoint (which runs the identical ``_persist_trial_worker`` on the
+        #    remote box, so a top-N re-run is byte-identical whether it lands local or remote). Only
+        #    the trading-db post-mortem file lands on whichever box actually ran it -- the master
+        #    still gets the full results blob either way.
+        from app.services.strategy_optimization_handler import _persist_trial_worker, _resolve_workers
         from app.services.sync_client import push_backtest
 
         def _persist_one(rank, trial_cfg, strategy_params, out) -> bool:
@@ -2321,25 +2326,48 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
             return True
 
         persisted = 0
-        n_workers = max(1, min(int(parallel or 1), len(specs)))
-        if n_workers > 1 and len(specs) > 1:
+        n_local = max(1, min(int(parallel or 1), len(specs)))
+        remote_workers = _resolve_workers(db, getattr(opt, "worker_ids", None))
+        if remote_workers:
+            from app.services.self_update import get_version_info
+            from app.services.worker_client import ensure_synced
+            master_version = get_version_info().get("app_version")
+            remote_workers = [w for w in remote_workers if ensure_synced(w, master_version, log=print)]
+
+        if (n_local > 1 or remote_workers) and len(specs) > 1:
             import multiprocessing as _mp
             import os as _os
-            from concurrent.futures import ProcessPoolExecutor, as_completed
+            from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
             from app.services.strategy_optimization_handler import (
                 _BACKEND_DIR, _WORKER_ENV_KEYS, _worker_init,
             )
+            from app.services.worker_client import run_trial_full
             env = {k: _os.environ[k] for k in _WORKER_ENV_KEYS if _os.environ.get(k)}
-            spec_by_rank = {rk: (rk, tc, sp2) for rk, tc, sp2 in specs}
-            print(f"    persisting top {len(specs)} in parallel ({n_workers} local workers)...")
+            fitness_metric = opt.fitness_metric or "consistent_annual_return"
+            print(f"    persisting top {len(specs)} across {n_local} local + "
+                  f"{len(remote_workers)} remote worker(s)...")
             with ProcessPoolExecutor(
-                max_workers=n_workers, mp_context=_mp.get_context("spawn"),
+                max_workers=n_local, mp_context=_mp.get_context("spawn"),
                 initializer=_worker_init, initargs=(_BACKEND_DIR, env),
-            ) as ex:
-                futs = {ex.submit(_persist_trial_worker, cfg): rk for rk, cfg, _ in specs}
+            ) as local_ex, ThreadPoolExecutor(max_workers=max(1, len(remote_workers))) as remote_ex:
+                # Round-robin each spec across every available slot (n_local local + one per
+                # remote worker) -- with n <= save-top (default 5) this just spreads a handful of
+                # re-runs across whatever capacity is on hand, no need for real load balancing.
+                slots = (["local"] * n_local) + remote_workers
+                futs = {}
+                for idx, (rk, tc, sp2) in enumerate(specs):
+                    slot = slots[idx % len(slots)]
+                    fut = (local_ex.submit(_persist_trial_worker, tc) if slot == "local"
+                           else remote_ex.submit(run_trial_full, slot, tc, fitness_metric))
+                    futs[fut] = (rk, tc, sp2)
                 for fut in as_completed(futs):
-                    rk, tc, sp2 = spec_by_rank[futs[fut]]
-                    if _persist_one(rk, tc, sp2, fut.result()):
+                    rk, tc, sp2 = futs[fut]
+                    try:
+                        out = fut.result()
+                    except Exception as exc:  # noqa: BLE001 — a dead remote/local worker must not abort the rest
+                        print(f"    TOP{rk} re-run raised: {exc!r}")
+                        continue
+                    if _persist_one(rk, tc, sp2, out):
                         persisted += 1
                         print(f"    persisted TOP{rk} ({persisted}/{len(specs)})")
         else:
