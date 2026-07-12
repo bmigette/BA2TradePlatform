@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Any
 from datetime import datetime, timedelta
 from dataclasses import dataclass
 from enum import Enum
+from zoneinfo import ZoneInfo
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
@@ -36,23 +37,36 @@ _WEEKDAY_ABBR = {
     "friday": "fri", "saturday": "sat", "sunday": "sun",
 }
 
+# A schedule's ``times``/``days`` are ambiguous on their own: "09:30" could mean this
+# machine's clock or the exchange's. ``time_basis: "market"`` pins them to NYSE wall-clock
+# time via an explicit CronTrigger timezone (DST-safe on both sides -- US and EU change
+# clocks on different dates, so a static UTC-offset hack would drift twice a year).
+# Absence of the key (legacy configs) means "local" -- the historical, unqualified behaviour.
+_MARKET_TZ = ZoneInfo("America/New_York")
 
-def build_monthly_cron(ordinal: int, weekday: str, hour: int, minute: int) -> CronTrigger:
+
+def build_monthly_cron(ordinal: int, weekday: str, hour: int, minute: int,
+                        market_time: bool = False) -> CronTrigger:
     """Build a CronTrigger firing on the Nth weekday of each month (e.g. 1st Monday).
 
     APScheduler natively supports the "<ordinal> <weekday>" day expression
     (e.g. "1st mon"), which is robust to month length and weekends.
     Only ordinals 1-3 are supported (per product decision).
+
+    ``market_time=True`` pins ``hour``/``minute``/the weekday to US/Eastern (NYSE) wall-clock
+    time instead of this machine's local timezone -- see ``_MARKET_TZ``.
     """
     if ordinal not in _ORDINALS:
         raise ValueError(f"ordinal must be 1, 2 or 3 (got {ordinal})")
     wd = _WEEKDAY_ABBR.get(weekday.lower())
     if not wd:
         raise ValueError(f"invalid weekday {weekday!r}")
-    return CronTrigger(day=f"{_ORDINALS[ordinal]} {wd}", hour=hour, minute=minute)
+    return CronTrigger(day=f"{_ORDINALS[ordinal]} {wd}", hour=hour, minute=minute,
+                        timezone=_MARKET_TZ if market_time else None)
 
 
-def assemble_monthly_schedule(ordinal: int, weekday: str, times: List[str]) -> Dict[str, Any]:
+def assemble_monthly_schedule(ordinal: int, weekday: str, times: List[str],
+                               time_basis: str = "local") -> Dict[str, Any]:
     """Build the monthly schedule config dict consumed by ``_parse_schedule``.
 
     Kept next to ``_parse_schedule``/``build_monthly_cron`` so the UI and the parser
@@ -63,6 +77,7 @@ def assemble_monthly_schedule(ordinal: int, weekday: str, times: List[str]) -> D
         "ordinal": int(ordinal),
         "weekday": str(weekday).lower(),
         "times": list(times),
+        "time_basis": time_basis,
     }
 
 
@@ -842,14 +857,16 @@ class JobManager:
                     logger.warning("No times specified in monthly schedule")
                     return None
                 hour, minute = map(int, times[0].split(':'))
+                market_time = schedule_setting.get('time_basis') == 'market'
                 logger.info(
                     f"Creating monthly cron trigger: ordinal={schedule_setting.get('ordinal')}, "
-                    f"weekday={schedule_setting.get('weekday')}, hour={hour}, minute={minute}"
+                    f"weekday={schedule_setting.get('weekday')}, hour={hour}, minute={minute}, "
+                    f"time_basis={'market' if market_time else 'local'}"
                 )
                 return build_monthly_cron(
                     ordinal=int(schedule_setting['ordinal']),
                     weekday=schedule_setting['weekday'],
-                    hour=hour, minute=minute,
+                    hour=hour, minute=minute, market_time=market_time,
                 )
 
             # Handle dict schedule configuration (JSON format)
@@ -884,12 +901,15 @@ class JobManager:
                 # TODO: In the future, we could create multiple jobs for different times
                 first_time = times[0]
                 hour, minute = map(int, first_time.split(':'))
-                
+
                 # Create day_of_week string for APScheduler
                 day_of_week = ','.join(map(str, sorted(enabled_days)))
-                
-                logger.info(f"Creating cron trigger: hour={hour}, minute={minute}, day_of_week={day_of_week}")
-                return CronTrigger(hour=hour, minute=minute, day_of_week=day_of_week)
+
+                market_time = schedule_setting.get('time_basis') == 'market'
+                logger.info(f"Creating cron trigger: hour={hour}, minute={minute}, "
+                            f"day_of_week={day_of_week}, time_basis={'market' if market_time else 'local'}")
+                return CronTrigger(hour=hour, minute=minute, day_of_week=day_of_week,
+                                   timezone=_MARKET_TZ if market_time else None)
             
             # Handle other schedule formats (string-based) - can be extended as needed
             else:

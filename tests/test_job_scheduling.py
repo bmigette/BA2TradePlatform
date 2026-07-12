@@ -48,7 +48,35 @@ def test_assemble_monthly_schedule_round_trips_through_parse():
     # shape must parse back into the matching CronTrigger.
     from ba2_trade_platform.core.JobManager import assemble_monthly_schedule, JobManager
     cfg = assemble_monthly_schedule(ordinal=1, weekday="monday", times=["09:30"])
-    assert cfg == {"frequency": "monthly", "ordinal": 1, "weekday": "monday", "times": ["09:30"]}
+    assert cfg == {"frequency": "monthly", "ordinal": 1, "weekday": "monday", "times": ["09:30"],
+                   "time_basis": "local"}
     jm = JobManager.__new__(JobManager)
     trig = jm._parse_schedule(cfg)
     assert "day='1st mon'" in str(trig)
+
+
+def test_time_basis_market_pins_cron_to_new_york_tz():
+    """'time_basis': 'market' must fire NYSE wall-clock time, not this machine's local clock
+    -- the deployment bug this guards: a live cron built with no explicit timezone uses
+    APScheduler's default (the OS local zone), so "09:30" silently meant Paris/whatever-local
+    time instead of the 09:30 ET the strategy was optimized/backtested against."""
+    from zoneinfo import ZoneInfo
+    from ba2_trade_platform.core.JobManager import JobManager
+
+    jm = JobManager.__new__(JobManager)
+    trig = jm._parse_schedule({"days": {"monday": True}, "times": ["09:30"], "time_basis": "market"})
+    assert trig.timezone == ZoneInfo("America/New_York")
+
+    # Absence of time_basis (legacy configs) keeps the old local-clock behaviour.
+    trig_local = jm._parse_schedule({"days": {"monday": True}, "times": ["09:30"]})
+    assert trig_local.timezone != ZoneInfo("America/New_York")
+
+
+def test_time_basis_market_pins_monthly_cron_to_new_york_tz():
+    from zoneinfo import ZoneInfo
+    from ba2_trade_platform.core.JobManager import JobManager
+
+    jm = JobManager.__new__(JobManager)
+    trig = jm._parse_schedule({"frequency": "monthly", "ordinal": 1, "weekday": "monday",
+                                "times": ["09:30"], "time_basis": "market"})
+    assert trig.timezone == ZoneInfo("America/New_York")

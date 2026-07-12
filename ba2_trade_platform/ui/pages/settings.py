@@ -1649,6 +1649,14 @@ class ExpertSettingsTab:
 
                                     self._build_schedule_frequency_controls('enter_market')
 
+                                    with ui.row().classes('w-full items-center gap-4 mb-2'):
+                                        ui.label('Time basis:').classes('text-body2')
+                                        self.enter_market_time_basis = ui.toggle(
+                                            ['Local time', 'Market time (NYSE)'], value='Local time',
+                                            on_change=lambda e: self._refresh_time_basis_hint('enter_market'),
+                                        ).props('no-caps dense')
+                                    self.enter_market_local_hint = ui.label('').classes('text-caption text-grey-7 mb-1')
+
                                     ui.label('Execution times (24-hour format, e.g., 09:30, 15:00):').classes('text-body2 mb-2')
                                     try:
                                         self.enter_market_times_container = ui.column().classes('w-full mb-4')
@@ -1681,6 +1689,14 @@ class ExpertSettingsTab:
                                     ui.label('Schedule for analyzing existing open positions:').classes('text-body2 mb-2')
 
                                     self._build_schedule_frequency_controls('open_positions')
+
+                                    with ui.row().classes('w-full items-center gap-4 mb-2'):
+                                        ui.label('Time basis:').classes('text-body2')
+                                        self.open_positions_time_basis = ui.toggle(
+                                            ['Local time', 'Market time (NYSE)'], value='Local time',
+                                            on_change=lambda e: self._refresh_time_basis_hint('open_positions'),
+                                        ).props('no-caps dense')
+                                    self.open_positions_local_hint = ui.label('').classes('text-caption text-grey-7 mb-1')
 
                                     ui.label('Execution times (24-hour format, e.g., 09:30, 15:00):').classes('text-body2 mb-2')
                                     try:
@@ -2265,6 +2281,31 @@ class ExpertSettingsTab:
                 logger.warning(f"Error parsing {label} time '{getattr(time_input, 'value', None)}': {e}")
         return times
 
+    def _refresh_time_basis_hint(self, kind: str):
+        """Show this machine's local-time equivalent of the configured times when the
+        schedule's time basis is 'Market time (NYSE)' -- the stored/edited HH:MM values are
+        NYSE wall-clock time in that mode (JobManager applies them via an explicit
+        America/New_York CronTrigger timezone), which is NOT what this machine's clock shows.
+        Cleared when the basis is 'Local time' (the HH:MM values already ARE local then)."""
+        toggle = getattr(self, f'{kind}_time_basis', None)
+        hint = getattr(self, f'{kind}_local_hint', None)
+        if toggle is None or hint is None:
+            return
+        if toggle.value != 'Market time (NYSE)':
+            hint.text = ''
+            return
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        ny = ZoneInfo('America/New_York')
+        local_tz = datetime.now().astimezone().tzinfo
+        times = self._collect_execution_times(getattr(self, f'{kind}_execution_times', []))
+        parts = []
+        for time_str in times:
+            hours, minutes = map(int, time_str.split(':'))
+            ny_dt = datetime.now(ny).replace(hour=hours, minute=minutes, second=0, microsecond=0)
+            parts.append(f"{time_str} NYSE -> {ny_dt.astimezone(local_tz).strftime('%H:%M')} local")
+        hint.text = ('This machine\'s local time: ' + ', '.join(parts)) if parts else ''
+
     def _update_open_positions_schedule_visibility(self):
         """Hide the open-positions schedule editor for experts that handle exits
         in their enter-market batch run (schedules_open_positions=False)."""
@@ -2310,6 +2351,8 @@ class ExpertSettingsTab:
     def _get_enter_market_schedule_config(self):
         """Get the current enter market schedule configuration as a JSON-serializable dict."""
         times = self._collect_execution_times(getattr(self, 'enter_market_execution_times', []), 'enter_market')
+        toggle = getattr(self, 'enter_market_time_basis', None)
+        time_basis = 'market' if toggle is not None and toggle.value == 'Market time (NYSE)' else 'local'
 
         # Monthly Nth-weekday shape
         freq = getattr(self, 'enter_market_frequency', None)
@@ -2319,12 +2362,13 @@ class ExpertSettingsTab:
                 ordinal=self.enter_market_ordinal_select.value,
                 weekday=self.enter_market_weekday_select.value,
                 times=times or ['09:30'],
+                time_basis=time_basis,
             )
             logger.info(f"Enter market schedule config (monthly): {cfg}")
             return cfg
 
         # Weekly shape (default)
-        schedule = {'days': {}, 'times': times}
+        schedule = {'days': {}, 'times': times, 'time_basis': time_basis}
         if hasattr(self, 'enter_market_schedule_days'):
             for day, checkbox in self.enter_market_schedule_days.items():
                 schedule['days'][day] = checkbox.value
@@ -2333,10 +2377,12 @@ class ExpertSettingsTab:
 
         logger.info(f"Enter market schedule config: {schedule}")
         return schedule
-    
+
     def _get_open_positions_schedule_config(self):
         """Get the current open positions schedule configuration as a JSON-serializable dict."""
         times = self._collect_execution_times(getattr(self, 'open_positions_execution_times', []), 'open_positions')
+        toggle = getattr(self, 'open_positions_time_basis', None)
+        time_basis = 'market' if toggle is not None and toggle.value == 'Market time (NYSE)' else 'local'
 
         # Monthly Nth-weekday shape
         freq = getattr(self, 'open_positions_frequency', None)
@@ -2346,12 +2392,13 @@ class ExpertSettingsTab:
                 ordinal=self.open_positions_ordinal_select.value,
                 weekday=self.open_positions_weekday_select.value,
                 times=times or ['09:30'],
+                time_basis=time_basis,
             )
             logger.info(f"Open positions schedule config (monthly): {cfg}")
             return cfg
 
         # Weekly shape (default)
-        schedule = {'days': {}, 'times': times}
+        schedule = {'days': {}, 'times': times, 'time_basis': time_basis}
         if hasattr(self, 'open_positions_schedule_days'):
             for day, checkbox in self.open_positions_schedule_days.items():
                 schedule['days'][day] = checkbox.value
@@ -2643,7 +2690,8 @@ class ExpertSettingsTab:
                             time_input.props('error=true error-message="Invalid time format (use HH:MM)"')
                         except ValueError:
                             time_input.props('error=true error-message="Invalid time format (use HH:MM)"')
-                    
+                        self._refresh_time_basis_hint('enter_market')
+
                     time_input.on('blur', validate_time)
                     ui.button(icon='remove', on_click=lambda: self._remove_time_input_enter_market(time_input)).props('flat round').classes('ml-2')
                     
@@ -2694,7 +2742,8 @@ class ExpertSettingsTab:
                             time_input.props('error=true error-message="Invalid time format (use HH:MM)"')
                         except ValueError:
                             time_input.props('error=true error-message="Invalid time format (use HH:MM)"')
-                    
+                        self._refresh_time_basis_hint('open_positions')
+
                     time_input.on('blur', validate_time)
                     ui.button(icon='remove', on_click=lambda: self._remove_time_input_open_positions(time_input)).props('flat round').classes('ml-2')
                     
@@ -2752,24 +2801,32 @@ class ExpertSettingsTab:
 
         self._apply_schedule_frequency_visibility('enter_market')
 
+        # Load time basis (defaults to 'local' -- absence means legacy/unset config)
+        if hasattr(self, 'enter_market_time_basis'):
+            self.enter_market_time_basis.value = (
+                'Market time (NYSE)' if schedule_config.get('time_basis') == 'market' else 'Local time'
+            )
+
         # Load times
         times = schedule_config.get('times', ['09:30'])
         logger.info(f'Loading enter market times: {times}')
-        
+
         # Clear existing time inputs
         if hasattr(self, 'enter_market_execution_times'):
             self.enter_market_execution_times.clear()
         self.enter_market_times_container.clear()
-        
+
         # Add time inputs for each configured time
         for time_str in times:
             self._add_time_input_enter_market(time_str)
             logger.debug(f'Added enter market time input: {time_str}')
-        
+
         # If no times were configured, add a default
         if not times:
             self._add_time_input_enter_market('09:30')
             logger.debug('Added default enter market time: 09:30')
+
+        self._refresh_time_basis_hint('enter_market')
 
     def _load_open_positions_schedule_config(self, schedule_config):
         """Load open positions schedule configuration from a JSON dict."""
@@ -2808,25 +2865,33 @@ class ExpertSettingsTab:
 
         self._apply_schedule_frequency_visibility('open_positions')
 
+        # Load time basis (defaults to 'local' -- absence means legacy/unset config)
+        if hasattr(self, 'open_positions_time_basis'):
+            self.open_positions_time_basis.value = (
+                'Market time (NYSE)' if schedule_config.get('time_basis') == 'market' else 'Local time'
+            )
+
         # Load times
         times = schedule_config.get('times', ['15:00'])
         logger.info(f'Loading open positions times: {times}')
-        
+
         # Clear existing time inputs
         if hasattr(self, 'open_positions_execution_times'):
             self.open_positions_execution_times.clear()
         self.open_positions_times_container.clear()
-        
+
         # Add time inputs for each configured time
         for time_str in times:
             self._add_time_input_open_positions(time_str)
             logger.debug(f'Added open positions time input: {time_str}')
-        
+
         # If no times were configured, add defaults
         if not times:
             for time in ['09:30', '10:30', '11:30', '12:30', '13:30', '14:30', '15:30']:
                 self._add_time_input_open_positions(time)
             logger.debug('Added default open positions times')
+
+        self._refresh_time_basis_hint('open_positions')
     
     def _on_expert_type_change_dialog(self, event, expert_instance):
         """Handle expert type change in the dialog."""
