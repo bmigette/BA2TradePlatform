@@ -113,3 +113,33 @@ def test_trade_rules_from_legacy_single_branch_and_none_trees():
     assert [r["id"] for r in got["entry_rules"]] == ["buy"]
     assert got["exit_rules"] == []
     assert trade_rules_from_legacy()["entry_rules"] == []
+
+
+def test_stale_camelcase_mirror_does_not_win_over_fresh_snake_case():
+    """Regression for a real incident: a GA gene decode had mutated an action's snake_case
+    ``action_value``/``value`` in place without refreshing the camelCase ``actionValue``
+    mirror, leaving a persisted rule with TWO conflicting values for the same field. Because
+    AliasChoices picks whichever alias is listed FIRST when several are present in the input,
+    a camelCase-first order silently used the STALE value -- confirmed live: it corrupted an
+    exported/deployed backtest rule's take-profit (50 instead of the real, GA-decoded 48) and
+    stop-loss (2 instead of the real 1). snake_case/``value`` must win whenever both are
+    present, since those are what the execution engine and the frontend's own read-back
+    already treat as authoritative."""
+    rules = [{
+        "id": "tier3",
+        "conditions": {"operator": "AND", "conditions": [
+            {"field": "profit_loss_percent", "comparison": ">", "value": 24.0},
+        ]},
+        "actions": [
+            {
+                "id": "tier3_tp", "action_type": "adjust_take_profit",
+                "reference_value": "order_open_price",
+                # Conflicting spellings, as actually persisted in the incident: stale
+                # camelCase (50.0) vs fresh snake_case + 'value' (48.0, the real GA gene).
+                "actionValue": 50.0, "action_value": 48.0, "value": 48.0,
+            },
+        ],
+    }]
+    out = normalize_trade_rules(rules)
+    assert out[0]["actions"][0]["action_value"] == 48.0
+    assert out[0]["actions"][0]["actionValue"] == 48.0  # canonical output re-syncs both spellings

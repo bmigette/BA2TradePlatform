@@ -1,5 +1,5 @@
 """Tests for ba2_common.core.rules_convert — live ruleset export-file <-> backtester shapes."""
-from ba2_common.core.rule_builders import (
+from ba2_common.core.rules_convert import (
     live_export_to_strategy,
     strategy_to_live_export,
 )

@@ -3,12 +3,13 @@
 Rule PROCESSING is already one path (both platforms seed EventActions and evaluate them with the
 live TradeActionEvaluator). What differs is the AUTHORING/serialisation shape: the live platform
 exports/imports EventAction ``export_type`` files; the test platform authors condition TREES
-(optimizer genes / strategy_params). They are bridged by ba2_common.core.rules_convert
-(re-exported via rule_builders). These tests pin that bridge LOSSLESS in BOTH directions so a
-strategy moves between platforms without silent drift — guarding the bugs found 2026-06-29/30:
-OR-of-groups collapsing into one ANDed rule, exit-action loss, and import-time cycles.
+(optimizer genes / strategy_params). They are bridged by ba2_common.core.rules_convert, which
+derives its vocabulary from ba2_common.core.rule_builders (one-directional import, no cycle).
+These tests pin that bridge LOSSLESS in BOTH directions so a strategy moves between platforms
+without silent drift — guarding the bugs found 2026-06-29/30: OR-of-groups collapsing into one
+ANDed rule, exit-action loss, and import-time cycles.
 """
-from ba2_common.core.rule_builders import (
+from ba2_common.core.rules_convert import (
     live_export_to_strategy,
     strategy_to_live_export,
 )

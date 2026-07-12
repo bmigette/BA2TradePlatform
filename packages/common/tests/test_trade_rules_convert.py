@@ -1,6 +1,6 @@
 """Lossless live<->TradeRule converters: multi-action rules, per-tier brackets,
 continue_processing, stop_processing guards, and full round-trip fidelity."""
-from ba2_common.core.rule_builders import (  # canonical import point (rules_convert is cyclic)
+from ba2_common.core.rules_convert import (
     live_export_to_trade_rules,
     trade_rules_to_live_export,
 )

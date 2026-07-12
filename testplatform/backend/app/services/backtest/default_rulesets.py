@@ -105,7 +105,7 @@ def seed_ruleset_from_rules(rules, subtype: "AnalysisUseCase",
     A rule with no convertible action is skipped. Returns the ruleset id (possibly with no
     event actions if every rule was skipped).
     """
-    from ba2_common.core.rule_builders import live_actions_from_trade_rule
+    from ba2_common.core.rules_convert import live_actions_from_trade_rule
 
     ruleset = Ruleset(
         name=name,

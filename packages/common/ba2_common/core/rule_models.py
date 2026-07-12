@@ -78,24 +78,29 @@ def infer_field_type(field: Optional[str], given: Optional[str]) -> str:
 # Models
 # ---------------------------------------------------------------------------
 class ConditionLeaf(BaseModel):
-    """A single condition (numeric gate or flag). Accepts every legacy alias; emits canonical."""
+    """A single condition (numeric gate or flag). Accepts every legacy alias; emits canonical.
+
+    Alias order is snake_case-first everywhere a camelCase mirror exists -- see ActionCfg's
+    docstring above for why: a persisted condition can carry both spellings with DIFFERENT
+    values when something (e.g. GA gene decode) mutates only the snake_case copy in place,
+    and AliasChoices silently picks whichever alias is listed first when both are present."""
 
     model_config = ConfigDict(populate_by_name=True, extra="allow")
 
     id: Optional[str] = None
     field: str = Field(validation_alias=AliasChoices("field", "event_type"))
-    field_type: Optional[str] = Field(default=None, validation_alias=AliasChoices("fieldType", "field_type"))
+    field_type: Optional[str] = Field(default=None, validation_alias=AliasChoices("field_type", "fieldType"))
     comparison: Optional[str] = Field(default=None, validation_alias=AliasChoices("comparison", "op", "operator"))
     value: Optional[float] = None
-    optimize_enabled: bool = Field(default=False, validation_alias=AliasChoices("optimizeEnabled", "optimize_enabled", "optimize"))
-    value_min: Optional[float] = Field(default=None, validation_alias=AliasChoices("valueMin", "value_min"))
-    value_max: Optional[float] = Field(default=None, validation_alias=AliasChoices("valueMax", "value_max"))
-    value_step: Optional[float] = Field(default=None, validation_alias=AliasChoices("valueStep", "value_step"))
-    toggle_optimize: Optional[bool] = Field(default=None, validation_alias=AliasChoices("toggleOptimize", "toggle_optimize"))
-    confirmation_bars: Optional[int] = Field(default=None, validation_alias=AliasChoices("confirmationBars", "confirmation_bars"))
-    confirmation_bars_min: Optional[int] = Field(default=None, validation_alias=AliasChoices("confirmationBarsMin", "confirmation_bars_min"))
-    confirmation_bars_max: Optional[int] = Field(default=None, validation_alias=AliasChoices("confirmationBarsMax", "confirmation_bars_max"))
-    confirmation_bars_step: Optional[int] = Field(default=None, validation_alias=AliasChoices("confirmationBarsStep", "confirmation_bars_step"))
+    optimize_enabled: bool = Field(default=False, validation_alias=AliasChoices("optimize_enabled", "optimize", "optimizeEnabled"))
+    value_min: Optional[float] = Field(default=None, validation_alias=AliasChoices("value_min", "valueMin"))
+    value_max: Optional[float] = Field(default=None, validation_alias=AliasChoices("value_max", "valueMax"))
+    value_step: Optional[float] = Field(default=None, validation_alias=AliasChoices("value_step", "valueStep"))
+    toggle_optimize: Optional[bool] = Field(default=None, validation_alias=AliasChoices("toggle_optimize", "toggleOptimize"))
+    confirmation_bars: Optional[int] = Field(default=None, validation_alias=AliasChoices("confirmation_bars", "confirmationBars"))
+    confirmation_bars_min: Optional[int] = Field(default=None, validation_alias=AliasChoices("confirmation_bars_min", "confirmationBarsMin"))
+    confirmation_bars_max: Optional[int] = Field(default=None, validation_alias=AliasChoices("confirmation_bars_max", "confirmationBarsMax"))
+    confirmation_bars_step: Optional[int] = Field(default=None, validation_alias=AliasChoices("confirmation_bars_step", "confirmationBarsStep"))
 
     def to_canonical_dict(self) -> Dict[str, Any]:
         ftype = infer_field_type(self.field, self.field_type)
@@ -202,13 +207,13 @@ class ExitRule(BaseModel):
     name: Optional[str] = None
     conditions: Optional[Any] = None
     action: Optional[str] = Field(default=None, validation_alias=AliasChoices("action", "action_type"))
-    reference_value: Optional[str] = Field(default=None, validation_alias=AliasChoices("referenceValue", "reference_value"))
-    action_value: Optional[float] = Field(default=None, validation_alias=AliasChoices("actionValue", "action_value", "value"))
-    action_value_optimize: Optional[bool] = Field(default=None, validation_alias=AliasChoices("actionValueOptimize", "action_value_optimize"))
-    action_value_min: Optional[float] = Field(default=None, validation_alias=AliasChoices("actionValueMin", "action_value_min"))
-    action_value_max: Optional[float] = Field(default=None, validation_alias=AliasChoices("actionValueMax", "action_value_max"))
-    action_value_step: Optional[float] = Field(default=None, validation_alias=AliasChoices("actionValueStep", "action_value_step"))
-    toggle_optimize: Optional[bool] = Field(default=None, validation_alias=AliasChoices("toggleOptimize", "toggle_optimize"))
+    reference_value: Optional[str] = Field(default=None, validation_alias=AliasChoices("reference_value", "referenceValue"))
+    action_value: Optional[float] = Field(default=None, validation_alias=AliasChoices("action_value", "value", "actionValue"))
+    action_value_optimize: Optional[bool] = Field(default=None, validation_alias=AliasChoices("action_value_optimize", "actionValueOptimize"))
+    action_value_min: Optional[float] = Field(default=None, validation_alias=AliasChoices("action_value_min", "actionValueMin"))
+    action_value_max: Optional[float] = Field(default=None, validation_alias=AliasChoices("action_value_max", "actionValueMax"))
+    action_value_step: Optional[float] = Field(default=None, validation_alias=AliasChoices("action_value_step", "actionValueStep"))
+    toggle_optimize: Optional[bool] = Field(default=None, validation_alias=AliasChoices("toggle_optimize", "toggleOptimize"))
 
     def to_canonical_dict(self) -> Dict[str, Any]:
         # Preserve any extra keys (option_strike_param, option_dte_min, enabled, etc.) verbatim.
@@ -276,19 +281,31 @@ def normalize_ruleset(buy: Any = None, sell: Any = None, exits: Any = None) -> D
 class ActionCfg(BaseModel):
     """ONE action of a TradeRule (open/close/adjust/option). Accepts every legacy spelling
     (``action``/``action_type``/``actionType``; ``value``/``action_value``); ``option_*``
-    selection params and other extras are preserved verbatim."""
+    selection params and other extras are preserved verbatim.
+
+    Alias order is snake_case-first (matching ``action_type``'s original order) on EVERY
+    field here, not just for style: a persisted rule can carry BOTH spellings of a field
+    with DIFFERENT values when something mutates only the snake_case copy in place (e.g. a
+    GA gene decode writing ``action_value``/``value`` without also updating the camelCase
+    mirror) — ``AliasChoices`` silently picks whichever alias is listed FIRST when several
+    are present, so a camelCase-first order picks the STALE value. snake_case/``value`` are
+    what the actual execution engine (``TradeActionEvaluator``/``TradeActions.py``) and the
+    frontend's own read-back (``fmtExitAction``) already treat as authoritative, so they must
+    win here too. Confirmed live: this exact ordering corrupted an exported/deployed backtest
+    rule's TP (50 instead of the real 48) and SL (2 instead of the real 1) — see
+    packages/common/ba2_common/core/TradeActions.py history for the incident."""
 
     model_config = ConfigDict(populate_by_name=True, extra="allow")
 
     id: Optional[str] = None
     action_type: str = Field(validation_alias=AliasChoices("action_type", "action", "actionType"))
-    reference_value: Optional[str] = Field(default=None, validation_alias=AliasChoices("referenceValue", "reference_value"))
-    action_value: Optional[float] = Field(default=None, validation_alias=AliasChoices("actionValue", "action_value", "value"))
-    action_value_optimize: Optional[bool] = Field(default=None, validation_alias=AliasChoices("actionValueOptimize", "action_value_optimize"))
-    action_value_min: Optional[float] = Field(default=None, validation_alias=AliasChoices("actionValueMin", "action_value_min"))
-    action_value_max: Optional[float] = Field(default=None, validation_alias=AliasChoices("actionValueMax", "action_value_max"))
-    action_value_step: Optional[float] = Field(default=None, validation_alias=AliasChoices("actionValueStep", "action_value_step"))
-    toggle_optimize: Optional[bool] = Field(default=None, validation_alias=AliasChoices("toggleOptimize", "toggle_optimize"))
+    reference_value: Optional[str] = Field(default=None, validation_alias=AliasChoices("reference_value", "referenceValue"))
+    action_value: Optional[float] = Field(default=None, validation_alias=AliasChoices("action_value", "value", "actionValue"))
+    action_value_optimize: Optional[bool] = Field(default=None, validation_alias=AliasChoices("action_value_optimize", "actionValueOptimize"))
+    action_value_min: Optional[float] = Field(default=None, validation_alias=AliasChoices("action_value_min", "actionValueMin"))
+    action_value_max: Optional[float] = Field(default=None, validation_alias=AliasChoices("action_value_max", "actionValueMax"))
+    action_value_step: Optional[float] = Field(default=None, validation_alias=AliasChoices("action_value_step", "actionValueStep"))
+    toggle_optimize: Optional[bool] = Field(default=None, validation_alias=AliasChoices("toggle_optimize", "toggleOptimize"))
 
     def to_canonical_dict(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {k: v for k, v in (self.__pydantic_extra__ or {}).items()}
@@ -359,8 +376,8 @@ class TradeRule(BaseModel):
     name: Optional[str] = None
     conditions: Optional[Any] = None
     actions: List[Any] = Field(default_factory=list)
-    continue_processing: bool = Field(default=False, validation_alias=AliasChoices("continueProcessing", "continue_processing"))
-    toggle_optimize: Optional[bool] = Field(default=None, validation_alias=AliasChoices("toggleOptimize", "toggle_optimize"))
+    continue_processing: bool = Field(default=False, validation_alias=AliasChoices("continue_processing", "continueProcessing"))
+    toggle_optimize: Optional[bool] = Field(default=None, validation_alias=AliasChoices("toggle_optimize", "toggleOptimize"))
 
     def to_canonical_dict(self) -> Dict[str, Any]:
         extra = {k: v for k, v in (self.__pydantic_extra__ or {}).items()}

@@ -187,27 +187,12 @@ def action_from_rule(rule: dict, key: str = "act") -> Optional[Dict[str, dict]]:
     return {key: cfg}
 
 
-# --- REVERSE direction (live ruleset / export file -> backtester condition tree) -------------
-# Re-exported here so callers have a SINGLE import point for all rules/ruleset conversion. This
-# import sits at the BOTTOM on purpose: ``rules_convert`` imports the canonical maps + forward
-# converters from THIS module, so the re-export must run after those are defined (no circular
-# import — by the time this line executes, the names above already exist).
-from ba2_common.core.rules_convert import (  # noqa: E402
-    ACTION_VALUES,
-    ADJUST_ACTIONS,
-    BUY_ACTION,
-    FLAG_EVENT_VALUES,
-    NUMERIC_EVENT_VALUES,
-    SELL_ACTION,
-    entry_action_side,
-    eventaction_to_entry_group,
-    eventaction_to_exit_rule,
-    groups_to_tree,
-    live_actions_from_trade_rule,
-    live_export_to_strategy,
-    live_export_to_trade_rules,
-    opt_range,
-    strategy_to_live_export,
-    trade_rules_to_live_export,
-    trigger_to_leaf,
-)
+# NOTE: the REVERSE direction (live ruleset / export file -> backtester condition tree) lives in
+# ``rules_convert.py``, which imports the canonical maps + forward converters FROM this module.
+# This module deliberately does NOT import anything back from ``rules_convert`` (that used to be
+# a bottom-of-file re-export "for a single import point", but it made the pair import-order
+# dependent: importing ``rules_convert`` cold, before anything had imported ``rule_builders``,
+# raised ``ImportError: cannot import name 'ACTION_VALUES' from partially initialized module``.
+# ``rules_convert`` is a strict superset of this module's names (it re-exports everything it
+# imports from here plus its own reverse-direction names), so callers who want the reverse
+# direction should import from ``rules_convert`` directly — see its module docstring.

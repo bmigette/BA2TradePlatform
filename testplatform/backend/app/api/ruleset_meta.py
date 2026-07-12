@@ -30,7 +30,7 @@ from fastapi import APIRouter, HTTPException
 # All trigger/action <-> condition-tree conversion now lives in ba2_common (single source of
 # truth). This file keeps only the backtester-specific glue: the live-DB SQL readers, the HTTP
 # endpoints, and the vocabulary endpoint.
-from ba2_common.core.rule_builders import (
+from ba2_common.core.rules_convert import (
     entry_action_side as _entry_action_side,
     eventaction_to_entry_group as _eventaction_to_entry_group,
     eventaction_to_exit_rule as _eventaction_to_exit_rule,
@@ -195,7 +195,7 @@ def _read_live_trade_rules(db_path: str, expert_id: int) -> dict:
     ``live_export_to_trade_rules``, so every action per rule (per-tier TP/SL brackets,
     multi-action exits), ``continue_processing`` and rule ORDER survive — unlike the legacy
     tree readers, which flatten per-rule brackets and drop 2nd+ actions."""
-    from ba2_common.core.rule_builders import live_export_to_trade_rules
+    from ba2_common.core.rules_convert import live_export_to_trade_rules
 
     rulesets = []
     for col, subtype in (("enter_market_ruleset_id", "enter_market"),
