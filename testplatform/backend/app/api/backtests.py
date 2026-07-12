@@ -802,6 +802,28 @@ async def get_backtest(
     return backtest.to_dict()
 
 
+@router.get("/{backtest_id}/yearly")
+async def get_backtest_yearly_breakdown(
+    backtest_id: int,
+    db: Session = Depends(get_db),
+):
+    """Per-calendar-year return/drawdown/sharpe/trades for the "Yearly Breakdown" detail tab.
+
+    Computed from the FULL (non-downsampled) equity/drawdown curves stored on the row --
+    ``Backtest.to_dict()`` thins those to ~2000 points for chart display (LTTB), which would
+    silently drop the true per-year peak/trough, so this reads the raw columns directly rather
+    than reusing the detail payload."""
+    backtest = db.query(Backtest).filter(Backtest.id == backtest_id).first()
+    if not backtest:
+        raise HTTPException(status_code=404, detail=f"Backtest {backtest_id} not found")
+
+    from app.services.backtest.results import yearly_breakdown
+    years = yearly_breakdown(
+        backtest.equity_curve or [], backtest.drawdown_curve or [], backtest.trades or [],
+    )
+    return {"years": years}
+
+
 class WhatIfRequest(BaseModel):
     """Body for the hidden-trade what-if: 1-based trade ids to EXCLUDE (matching the trade ids the
     list endpoint assigns, id = index+1)."""

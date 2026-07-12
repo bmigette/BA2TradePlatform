@@ -139,6 +139,21 @@ export const getOptimization = (id: number) =>
 export const fetchOptSettingsExport = (id: number) =>
   jget<Record<string, unknown>>(`/strategies/optimizations/${id}/export`);
 
+export interface YearlyBreakdownRow {
+  year: number;
+  startDate: string;
+  endDate: string;
+  returnPct: number;
+  maxDrawdownPct: number;
+  sharpeRatio: number;
+  totalTrades: number;
+  winRate: number;
+}
+/** Per-calendar-year return/drawdown/sharpe/trades, computed server-side from the FULL
+ * (non-downsampled) curves — see app/services/backtest/results.py::yearly_breakdown. */
+export const getYearlyBreakdown = (id: number) =>
+  jget<{ years: YearlyBreakdownRow[] }>(`/backtests/${id}/yearly`).then(r => r.years);
+
 export const listBacktests = (q: { expert?: string; optimization_id?: number; saved?: boolean; single?: boolean } = {}) => {
   const p = new URLSearchParams();
   if (q.expert) p.set('expert', q.expert);

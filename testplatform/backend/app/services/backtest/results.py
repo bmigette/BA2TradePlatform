@@ -572,3 +572,100 @@ def _days_between(a: Any, b: Any) -> float:
     if da is None or db is None:
         return 0.0
     return abs((db - da).days)
+
+
+# ---------------------------------------------------------------------------
+# Yearly breakdown (BT detail "Yearly Breakdown" tab)
+# ---------------------------------------------------------------------------
+_PARTIAL_YEAR_MIN_DAYS = 182.62  # ~6 months; matches strategy_fitness._CAR_PARTIAL_YEAR_MIN_DAYS
+
+def yearly_breakdown(
+    equity_curve: List[Dict[str, Any]],
+    drawdown_curve: List[Dict[str, Any]],
+    trades: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Per-calendar-year return/drawdown/sharpe/trades, computed from the FULL (non-downsampled)
+    curves — the UI's chart curves are LTTB-thinned to ~2000 points for display, which would
+    silently drop the true per-year peak/trough, so this must run on the raw DB columns, not
+    ``Backtest.to_dict()``'s output.
+
+    Year boundaries mirror ``strategy_fitness._calendar_year_returns``: anchored on the first
+    equity point and the last point of every calendar year, with a <~6-month partial year at the
+    run's start/end merged into its neighbor (so a 2-week stub can't appear as its own "year").
+    Drawdown per year is the min of the (already running-peak-relative) drawdown_curve within
+    that year's date range -- NOT reset to a fresh peak at year start, consistent with how the
+    single overall max_drawdown metric is computed. Sharpe uses the same _step_returns/_sharpe/
+    _periods_per_year helpers as the overall metric, applied to just that year's equity points.
+    Trades are attributed to the year their EXIT falls in (a trade's P&L is realized at exit).
+    """
+    pts = []
+    for p in equity_curve or []:
+        d = _parse_date(p.get("date"))
+        e = p.get("equity")
+        if d is None or e is None:
+            continue
+        pts.append((d, float(e)))
+    if len(pts) < 2:
+        return []
+
+    # Anchor points: first point (opening) + last point of every calendar year.
+    anchors = [pts[0]]
+    for i in range(1, len(pts)):
+        if pts[i][0].year != pts[i - 1][0].year:
+            anchors.append(pts[i - 1])
+    anchors.append(pts[-1])
+    anchors = [a for i, a in enumerate(anchors) if i == 0 or a[0] != anchors[i - 1][0]]
+    if len(anchors) < 2:
+        return []
+
+    segs = [[anchors[i - 1][0], anchors[i][0]] for i in range(1, len(anchors))]
+    min_secs = _PARTIAL_YEAR_MIN_DAYS * 86400.0
+    if len(segs) >= 2 and (segs[0][1] - segs[0][0]).total_seconds() < min_secs:
+        segs[1][0] = segs[0][0]
+        segs.pop(0)
+    if len(segs) >= 2 and (segs[-1][1] - segs[-1][0]).total_seconds() < min_secs:
+        segs[-2][1] = segs[-1][1]
+        segs.pop()
+
+    dd_pts = [(d, p["drawdown"]) for p in (drawdown_curve or [])
+              if (d := _parse_date(p.get("date"))) is not None and p.get("drawdown") is not None]
+
+    out: List[Dict[str, Any]] = []
+    for start_dt, end_dt in segs:
+        seg_pts = [(d, e) for d, e in pts if start_dt <= d <= end_dt]
+        if len(seg_pts) < 2:
+            continue
+        seg_equities = [e for _d, e in seg_pts]
+        start_eq, end_eq = seg_equities[0], seg_equities[-1]
+        return_pct = ((end_eq / start_eq - 1.0) * 100.0) if start_eq else 0.0
+
+        seg_years = max((end_dt - start_dt).total_seconds() / (365.25 * 86400.0), 1e-9)
+        periods_per_year = _periods_per_year(len(seg_equities), seg_years)
+        step_returns = _step_returns(seg_equities)
+        sharpe = _sharpe(step_returns, periods_per_year)
+
+        seg_dd = [dd for d, dd in dd_pts if start_dt <= d <= end_dt]
+        max_dd = min(seg_dd) if seg_dd else 0.0
+
+        seg_trades = [t for t in (trades or [])
+                      if (exit_dt := _parse_date(t.get("exit_time"))) is not None
+                      and start_dt <= exit_dt <= end_dt]
+        n_trades = len(seg_trades)
+        wins = sum(1 for t in seg_trades if (t.get("pnl") or 0.0) > 0)
+        win_rate = (wins / n_trades * 100.0) if n_trades else 0.0
+
+        # Label the segment by whichever year contains most of its span (a merged partial-year
+        # segment can straddle two calendar years).
+        label_year = max({start_dt.year, end_dt.year}, key=lambda y: min(end_dt.year, y) - max(start_dt.year, y - 1))
+
+        out.append({
+            "year": label_year,
+            "startDate": _iso(start_dt),
+            "endDate": _iso(end_dt),
+            "returnPct": round(_safe_float(return_pct), 2),
+            "maxDrawdownPct": round(_safe_float(max_dd), 2),
+            "sharpeRatio": round(_safe_float(sharpe), 2),
+            "totalTrades": n_trades,
+            "winRate": round(_safe_float(win_rate), 2),
+        })
+    return out

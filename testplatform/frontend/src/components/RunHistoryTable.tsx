@@ -51,6 +51,11 @@ export function RunHistoryTable({ savedOnly, onSelect, onLoad, selectedId, selec
   const [minRet, setMinRet] = usePersistentState(ns + 'minRet', '');
   const [maxDD, setMaxDD] = usePersistentState(ns + 'maxDD', '');
   const [minWin, setMinWin] = usePersistentState(ns + 'minWin', '');
+  // Labels filter: a run's `labels` array (e.g. ["goal6", "S4"] — grid/batch id + strategy tags
+  // set by the grid driver, see tools/run_screener_capband_matrix.py) must contain EVERY selected
+  // label (AND, not OR) so picking "goal6" + "S4" narrows down to exactly that job's results
+  // across every cap-band, not to "any run tagged with either".
+  const [selectedLabels, setSelectedLabels] = usePersistentState<string[]>(ns + 'labels', []);
   // Sort state: column key + direction. Default newest-first (id desc).
   const [sortKey, setSortKey] = usePersistentState<string>(ns + 'sortKey', 'id');
   const [sortDir, setSortDir] = usePersistentState<'asc' | 'desc'>(ns + 'sortDir', 'desc');
@@ -116,6 +121,10 @@ export function RunHistoryTable({ savedOnly, onSelect, onLoad, selectedId, selec
     () => Array.from(new Set(rows.map(r => r.optimizationId ?? r.optimization_id).filter((x: any) => x != null))),
     [rows],
   );
+  const allLabels = useMemo(
+    () => Array.from(new Set(rows.flatMap(r => (r.labels as string[] | undefined) ?? []))).sort(),
+    [rows],
+  );
 
   // Tolerant numeric coercion (camelCase + snake_case fields). Returns NaN when absent.
   const num = (v: unknown): number => { const n = typeof v === 'number' ? v : Number(v); return Number.isFinite(n) ? n : NaN; };
@@ -129,13 +138,15 @@ export function RunHistoryTable({ savedOnly, onSelect, onLoad, selectedId, selec
     trades: r => num(r.totalTrades ?? r.total_trades),
     dd: r => num(r.maxDrawdown ?? r.max_drawdown),
     win: r => num(r.winRate ?? r.win_rate),
-    saved: r => ((r.isSaved ?? r.is_saved) ? 1 : 0),
     name: r => String(r.name ?? '').toLowerCase(),
+    labels: r => String((r.labels ?? []).join(',')).toLowerCase(),
   };
 
   // Number of active filter-menu thresholds (drives the "Filters (N)" badge + Clear button).
-  const activeFilters = [expert, optId, minSharpe, minTrades, minRet, maxDD, minWin].filter(v => v !== '').length;
-  const clearFilters = () => { setExpert(''); setOptId(''); setMinSharpe(''); setMinTrades(''); setMinRet(''); setMaxDD(''); setMinWin(''); };
+  const activeFilters = [expert, optId, minSharpe, minTrades, minRet, maxDD, minWin].filter(v => v !== '').length
+    + (selectedLabels.length > 0 ? 1 : 0);
+  const clearFilters = () => { setExpert(''); setOptId(''); setMinSharpe(''); setMinTrades(''); setMinRet(''); setMaxDD(''); setMinWin(''); setSelectedLabels([]); };
+  const toggleLabel = (label: string) => setSelectedLabels(sel => sel.includes(label) ? sel.filter(l => l !== label) : [...sel, label]);
 
   const filtered = rows.filter(r => {
     if (expert && (r.expertName ?? r.expert_name) !== expert) return false;
@@ -147,11 +158,18 @@ export function RunHistoryTable({ savedOnly, onSelect, onLoad, selectedId, selec
     // DD is stored signed-negative; "max drawdown %" caps the magnitude.
     if (maxDD !== '' && !(Math.abs(num(r.maxDrawdown ?? r.max_drawdown)) <= Number(maxDD))) return false;
     if (minWin !== '' && !(num(r.winRate ?? r.win_rate) >= Number(minWin))) return false;
+    if (selectedLabels.length > 0) {
+      const rowLabels: string[] = r.labels ?? [];
+      if (!selectedLabels.every(l => rowLabels.includes(l))) return false;
+    }
     return true;
   });
 
+  // Guard against a stale sortKey persisted from before a column was removed (e.g. the old
+  // 'saved' column) — falling back to 'id' avoids a hard crash from calling a missing accessor.
+  const activeSortKey = accessors[sortKey] ? sortKey : 'id';
   const sorted = [...filtered].sort((a, b) => {
-    const av = accessors[sortKey](a), bv = accessors[sortKey](b);
+    const av = accessors[activeSortKey](a), bv = accessors[activeSortKey](b);
     let cmp: number;
     if (typeof av === 'string' || typeof bv === 'string') {
       cmp = String(av).localeCompare(String(bv));
@@ -173,7 +191,8 @@ export function RunHistoryTable({ savedOnly, onSelect, onLoad, selectedId, selec
   const columns: { key: string; label: string }[] = [
     { key: 'id', label: 'id' }, { key: 'expert', label: 'expert' }, { key: 'opt', label: 'opt#' },
     { key: 'ret', label: 'ret%' }, { key: 'sharpe', label: 'sharpe' }, { key: 'trades', label: 'trades' },
-    { key: 'dd', label: 'DD%' }, { key: 'win', label: 'win%' }, { key: 'saved', label: 'saved' }, { key: 'name', label: 'name' },
+    { key: 'dd', label: 'DD%' }, { key: 'win', label: 'win%' }, { key: 'name', label: 'name' },
+    { key: 'labels', label: 'labels' },
   ];
 
   return (
@@ -227,6 +246,28 @@ export function RunHistoryTable({ savedOnly, onSelect, onLoad, selectedId, selec
           <label className="flex flex-col gap-1 text-xs text-gray-600 dark:text-gray-300">min win %
             <input type="number" step="1" placeholder="any" value={minWin} onChange={(e) => setMinWin(e.target.value)} className={inputClass} />
           </label>
+          {allLabels.length > 0 && (
+            <label className="flex flex-col gap-1 text-xs text-gray-600 dark:text-gray-300 col-span-2 sm:col-span-3 lg:col-span-4">
+              labels {selectedLabels.length > 0 ? <span className="text-gray-400">(must have all selected)</span> : null}
+              <div className="flex flex-wrap gap-1">
+                {allLabels.map(l => {
+                  const active = selectedLabels.includes(l);
+                  return (
+                    <button
+                      key={l}
+                      type="button"
+                      onClick={() => toggleLabel(l)}
+                      className={`px-2 py-0.5 text-xs rounded-full border whitespace-nowrap ${active
+                        ? 'border-blue-400 dark:border-blue-500 bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300'
+                        : 'border-gray-300 dark:border-gray-600 text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700'}`}
+                    >
+                      {l}
+                    </button>
+                  );
+                })}
+              </div>
+            </label>
+          )}
         </div>
       )}
       <table className="w-full text-sm">
@@ -236,7 +277,7 @@ export function RunHistoryTable({ savedOnly, onSelect, onLoad, selectedId, selec
             {columns.map(c => (
               <th key={c.key} onClick={() => toggleSort(c.key)}
                 className="px-2 py-1 text-left text-xs font-medium text-gray-700 dark:text-gray-300 cursor-pointer select-none hover:text-gray-900 dark:hover:text-gray-100 whitespace-nowrap">
-                {c.label}<span className="text-blue-500">{sortKey === c.key ? (sortDir === 'asc' ? ' ▲' : ' ▼') : ''}</span>
+                {c.label}<span className="text-blue-500">{activeSortKey === c.key ? (sortDir === 'asc' ? ' ▲' : ' ▼') : ''}</span>
               </th>
             ))}
             <th className="px-2 py-1 text-left text-xs font-medium text-gray-700 dark:text-gray-300">Actions</th>
@@ -271,8 +312,16 @@ export function RunHistoryTable({ savedOnly, onSelect, onLoad, selectedId, selec
               <td className="px-2 py-1 text-sm text-gray-900 dark:text-gray-100">{(r.totalTrades ?? r.total_trades) ?? '—'}</td>
               <td className="px-2 py-1 text-sm text-red-600 dark:text-red-400">{fmtDrawdown(r.maxDrawdown ?? r.max_drawdown)}</td>
               <td className="px-2 py-1 text-sm text-gray-900 dark:text-gray-100">{(() => { const w = r.winRate ?? r.win_rate; return w != null ? `${Number(w).toFixed(1)}%` : '—'; })()}</td>
-              <td className="px-2 py-1 text-sm text-gray-900 dark:text-gray-100">{(r.isSaved ?? r.is_saved) ? '★' : ''}</td>
               <td className="px-2 py-1 text-sm text-gray-900 dark:text-gray-100"><div className="max-w-[9rem] truncate" title={r.name}>{r.name}</div></td>
+              <td className="px-2 py-1 text-sm">
+                <div className="flex flex-wrap gap-0.5 max-w-[8rem]">
+                  {((r.labels as string[] | undefined) ?? []).map(l => (
+                    <span key={l} className="px-1.5 py-0.5 text-[10px] rounded-full border border-blue-300 dark:border-blue-700 bg-blue-50 dark:bg-blue-900/20 text-blue-700 dark:text-blue-300 whitespace-nowrap">
+                      {l}
+                    </span>
+                  ))}
+                </div>
+              </td>
               <td className="px-2 py-1 text-sm text-gray-900 dark:text-gray-100">
                 <div className="flex gap-0.5" onClick={(e) => e.stopPropagation()}>
                   <button

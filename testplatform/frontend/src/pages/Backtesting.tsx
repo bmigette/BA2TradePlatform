@@ -64,8 +64,8 @@ import RobustnessDialog from '../components/RobustnessDialog';
 import RobustnessResults from '../components/RobustnessResults';
 import ResolvedRulesetView from '../components/ResolvedRulesetView';
 import type { BestParams } from '../lib/resolveRuleset';
-import { getRulesetVocabulary, importLiveEnterMarket, importLiveRuleset, convertLiveRuleset, listTasks, listBacktests, fetchOptSettingsExport, listExperts, optimizeBatch, listRunningOptimizations, fetchBacktestExport, listWorkers, rerunBacktest, getFitnessOptions } from '../lib/btApi';
-import type { ExpertInfo, OptimizeBatchJob, OptimizeBatchBody, RunningOpt, WorkerLite, FitnessMetricOption, FitnessOptions } from '../lib/btApi';
+import { getRulesetVocabulary, importLiveEnterMarket, importLiveRuleset, convertLiveRuleset, listTasks, listBacktests, fetchOptSettingsExport, listExperts, optimizeBatch, listRunningOptimizations, fetchBacktestExport, listWorkers, rerunBacktest, getFitnessOptions, getYearlyBreakdown } from '../lib/btApi';
+import type { ExpertInfo, OptimizeBatchJob, OptimizeBatchBody, RunningOpt, WorkerLite, FitnessMetricOption, FitnessOptions, YearlyBreakdownRow } from '../lib/btApi';
 import { RunningJobsPanel, RunningJobProgress } from '../components/RunningJobsPanel';
 import { OptimizationJobsTable, OptJobSettingsDetail } from '../components/OptimizationJobsTable';
 import { TopIndividualsTable } from '../components/TopIndividualsTable';
@@ -1035,7 +1035,40 @@ const Backtesting: React.FC = () => {
   // Set when the clicked individual has no persisted full backtest (rank beyond the saved
   // top-N): the Individual Backtest tab shows this note + the individual's params instead.
   const [individualNoBacktest, setIndividualNoBacktest] = useState<OptIndividual | null>(null);
-  const [activeTab, setActiveTab] = useState<'equity' | 'drawdown' | 'trades' | 'strategy'>('equity');
+  const [activeTab, setActiveTab] = useState<'equity' | 'drawdown' | 'trades' | 'strategy' | 'yearly'>('equity');
+  // Yearly Breakdown tab: fetched lazily (only once the tab is opened) from the FULL
+  // (non-downsampled) curves server-side — see app/services/backtest/results.py::yearly_breakdown.
+  const [yearlyRows, setYearlyRows] = useState<YearlyBreakdownRow[] | null>(null);
+  const [yearlyLoading, setYearlyLoading] = useState(false);
+  const [yearlyError, setYearlyError] = useState<string | null>(null);
+  // Tracks which backtest id we've already fetched (or are fetching) yearly data for — a REF,
+  // not state, so setting it inside the effect below doesn't re-trigger that same effect (state
+  // in an effect's own dependency array that the effect itself sets causes React to re-run the
+  // effect immediately on the state change, whose cleanup then flips `alive` to false BEFORE the
+  // in-flight fetch resolves — the result silently gets discarded and the tab spins forever).
+  const yearlyFetchedForId = useRef<number | null>(null);
+  useEffect(() => {
+    setYearlyRows(null);
+    setYearlyError(null);
+    yearlyFetchedForId.current = null;
+  }, [selectedBacktest?.id]);
+  useEffect(() => {
+    if (activeTab !== 'yearly' || !selectedBacktest?.id) return;
+    if (yearlyFetchedForId.current === selectedBacktest.id) return;  // already fetched/fetching
+    yearlyFetchedForId.current = selectedBacktest.id;
+    let alive = true;
+    setYearlyLoading(true);
+    setYearlyError(null);
+    getYearlyBreakdown(selectedBacktest.id)
+      .then(rows => { if (alive) setYearlyRows(rows); })
+      .catch(e => {
+        if (!alive) return;
+        setYearlyError(e instanceof Error ? e.message : String(e));
+        yearlyFetchedForId.current = null;  // allow a retry (e.g. after switching tabs back)
+      })
+      .finally(() => { if (alive) setYearlyLoading(false); });
+    return () => { alive = false; };
+  }, [activeTab, selectedBacktest?.id]);
   const [tradeFilter, setTradeFilter] = useState<'all' | 'profit' | 'loss'>('all');
   // trade.pnlPercent is EQUITY-relative (pnl / total account equity at entry — see
   // backtest_account.py's pnl_pct), which is what Monte Carlo compounds on but reads as
@@ -2754,11 +2787,12 @@ const Backtesting: React.FC = () => {
                       { id: 'equity', label: 'Equity Curve', icon: TrendingUp },
                       { id: 'drawdown', label: 'Drawdown', icon: TrendingDown },
                       { id: 'trades', label: 'Trade List', icon: Activity },
-                      { id: 'strategy', label: 'Strategy', icon: Award }
+                      { id: 'strategy', label: 'Strategy', icon: Award },
+                      { id: 'yearly', label: 'Yearly Breakdown', icon: Calendar }
                     ].map(tab => (
                       <button
                         key={tab.id}
-                        onClick={() => setActiveTab(tab.id as 'equity' | 'drawdown' | 'trades' | 'strategy')}
+                        onClick={() => setActiveTab(tab.id as 'equity' | 'drawdown' | 'trades' | 'strategy' | 'yearly')}
                         className={`flex items-center gap-2 px-4 py-3 border-b-2 transition-colors text-sm ${
                           activeTab === tab.id
                             ? 'border-blue-500 text-blue-600'
@@ -3177,6 +3211,45 @@ const Backtesting: React.FC = () => {
                           </>
                         );
                       })()}
+                    </div>
+                  )}
+
+                  {activeTab === 'yearly' && (
+                    <div className="p-4">
+                      {yearlyLoading && (
+                        <p className="text-sm text-gray-500 dark:text-gray-400">Loading…</p>
+                      )}
+                      {yearlyError && (
+                        <p className="text-sm text-red-600 dark:text-red-400">Failed to load: {yearlyError}</p>
+                      )}
+                      {!yearlyLoading && !yearlyError && yearlyRows && yearlyRows.length === 0 && (
+                        <p className="text-sm text-gray-500 dark:text-gray-400">Not enough equity-curve data to break down by year.</p>
+                      )}
+                      {!yearlyLoading && !yearlyError && yearlyRows && yearlyRows.length > 0 && (
+                        <table className="w-full text-sm">
+                          <thead className="bg-gray-50 dark:bg-gray-700 border-b border-gray-200 dark:border-gray-600">
+                            <tr>
+                              {['Year', 'Return %', 'Max DD %', 'Sharpe', 'Trades', 'Win %'].map(h => (
+                                <th key={h} className="px-3 py-1.5 text-left text-xs font-medium text-gray-700 dark:text-gray-300 whitespace-nowrap">{h}</th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {yearlyRows.map(y => (
+                              <tr key={y.year} className="border-b border-gray-200 dark:border-gray-600">
+                                <td className="px-3 py-1.5 font-medium text-gray-900 dark:text-gray-100">{y.year}</td>
+                                <td className={`px-3 py-1.5 font-medium ${y.returnPct >= 0 ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
+                                  {y.returnPct >= 0 ? '+' : ''}{y.returnPct.toFixed(1)}%
+                                </td>
+                                <td className="px-3 py-1.5 text-red-600 dark:text-red-400">{y.maxDrawdownPct.toFixed(1)}%</td>
+                                <td className="px-3 py-1.5 text-gray-900 dark:text-gray-100">{y.sharpeRatio.toFixed(2)}</td>
+                                <td className="px-3 py-1.5 text-gray-900 dark:text-gray-100">{y.totalTrades}</td>
+                                <td className="px-3 py-1.5 text-gray-900 dark:text-gray-100">{y.winRate.toFixed(1)}%</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      )}
                     </div>
                   )}
                 </div>
