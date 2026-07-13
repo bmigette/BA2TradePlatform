@@ -149,6 +149,11 @@ def test_persist_one_mirrors_entry_rules_into_strategy_params(monkeypatch):
         assert mirrored and len(mirrored) == 1
         kinds = [a["action_type"] for a in mirrored[0]["actions"]]
         assert kinds == ["buy", "adjust_take_profit"]
-        assert bt.strategy_params.get("exitRules") == []
+        # This fixture's Strategy has NO exit_rules template (exit_rules=[] at seed time, i.e.
+        # unset) -> decode_params correctly yields None (not []) for "no unified-model template
+        # here", so the mirror key is never written. See daily_backtest_handler._seed_enter's
+        # None-vs-[] fix: only a PRUNED-to-zero template (a real template that existed) should
+        # ever surface as an explicit [].
+        assert bt.strategy_params.get("exitRules") is None
     finally:
         db.close()

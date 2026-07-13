@@ -54,10 +54,17 @@ def test_bracket_action_dropped_when_toggled_off_but_open_survives():
     assert kinds == ["buy"]  # SL dropped, buy untouched
 
 
-def test_entry_rules_default_empty_when_no_rules():
+def test_entry_rules_none_when_strategy_has_no_template():
+    """No entry_rules TEMPLATE on the Strategy (empty, same as unset) -> decode_params yields
+    None, NOT []. The distinction matters downstream (daily_backtest_handler._seed_enter):
+    None means "no unified model here, fall back to buy_tree/legacy default"; [] means "a real
+    template existed and the GA pruned every rule" -- a deliberate zero-entries decision that
+    must NOT be silently replaced with the legacy default ruleset. Collapsing both into []
+    (the old behavior) made a fully-pruned genome quietly re-armed with an unrelated default,
+    corrupting its fitness. See daily_backtest_handler._seed_enter for the consuming fix."""
     s = _strategy()
     decoded = decode_params(s, {})
-    assert decoded["entry_rules"] == []
+    assert decoded["entry_rules"] is None
 
 
 def test_bracket_source_not_mutated():

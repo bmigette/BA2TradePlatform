@@ -385,10 +385,19 @@ def decode_params(strategy, flat_params: Dict[str, Any]) -> Dict[str, Any]:
         else:
             raise ValueError(f"Unknown decoded param namespace: {key!r}")
 
-    entry_rules = _decode_rule_list(getattr(strategy, "entry_rules", None), "entry",
-                                    entry_genes, cond_by_id)
-    exit_rules = _decode_rule_list(getattr(strategy, "exit_rules", None), "exit",
-                                   exit_genes, cond_by_id)
+    # None (no unified-model template on this Strategy -- legacy buy_tree/exit_conditions
+    # path) is preserved as None, NOT coerced to []: downstream (daily_backtest_handler's
+    # _seed_enter/_seed_exit) treats "entry_rules is not None" as "the unified model applies,
+    # even if every rule got pruned" vs "not configured, fall back to buy_tree/default". If a
+    # real template got pruned down to zero rules by the GA (every branch disabled), that is a
+    # genuine decision -- an empty list, not None -- and must NOT collapse into the same
+    # signal as "no template" the way `[] or []` truthiness checks would.
+    _template_entry = getattr(strategy, "entry_rules", None)
+    _template_exit = getattr(strategy, "exit_rules", None)
+    entry_rules = (_decode_rule_list(_template_entry, "entry", entry_genes, cond_by_id)
+                   if _template_entry else None)
+    exit_rules = (_decode_rule_list(_template_exit, "exit", exit_genes, cond_by_id)
+                  if _template_exit else None)
 
     # Repair, don't reject: an all-days-OFF individual would never scan for entries at all (a
     # dead config the fitness function can't even distinguish from "just unlucky"), so force the

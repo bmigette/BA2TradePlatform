@@ -435,3 +435,56 @@ def test_config_entry_rules_reach_build_experts_and_set_stop_loss(monkeypatch):
         assert txn.stop_loss == pytest.approx(95.0)
     finally:
         ctx.__exit__(None, None, None)
+
+
+def test_config_entry_rules_explicitly_empty_seeds_zero_rules_not_default(monkeypatch):
+    """Regression: ``entry_rules=[]`` (present, non-None, but every rule pruned) must seed a
+    ruleset with ZERO EventActions -- NOT silently fall back to the generic bullish+flat
+    default. ``decode_params`` only ever emits `[]` for a Strategy that HAS a unified-model
+    entry_rules template which the GA pruned down to nothing (every rule/branch disabled); that
+    is a deliberate "never enter" decision, not "not configured". Before the fix,
+    ``_seed_enter``'s `if buy_tree or entry_action or entry_rules:` treated `[]` as falsy --
+    indistinguishable from "no unified rules at all" -- so the fallback below fired and quietly
+    re-armed the trial with an unrelated default ruleset, corrupting both the GA's fitness
+    signal for that individual and any persisted top-N re-run (real trades recorded against a
+    genome that had explicitly disabled every entry path). See the real incident this pins:
+    scr-mid-FMPRating-S1-goal6's TOP1 (all four buy-N branches disabled) recorded 153 phantom
+    trades instead of the zero its genome actually specified."""
+    from app.services.backtest import daily_backtest_handler as H
+    from app.services.backtest.seam_wiring import wire_backtest_seams
+    from ba2_common.core.db import get_db
+    from ba2_common.core.models import RulesetEventActionLink
+    from sqlmodel import select
+
+    monkeypatch.setitem(
+        H._SUPPORTED_EXPERTS, "_ConfigWiredStubExpert",
+        "tests.backtest.test_entry_bracket_engine",
+    )
+
+    account_id = 302
+    account, ctx, ps = _acct([(D1, 100, 101, 99, 100)], account_id=account_id)
+    try:
+        ps.set_clock(D1)
+        resolver = wire_backtest_seams()
+
+        config = {
+            "experts": ["_ConfigWiredStubExpert"],
+            "enabled_instruments": ["AAPL"],
+            "entry_rules": [],  # explicitly empty, NOT absent/None
+        }
+        built = H._build_experts(config, resolver, account_id)
+        assert len(built) == 1
+        _expert, _expert_id, _decision_settings, ruleset_id = built[0]
+
+        with get_db() as session:
+            links = session.exec(
+                select(RulesetEventActionLink).where(
+                    RulesetEventActionLink.ruleset_id == ruleset_id
+                )
+            ).all()
+        assert links == [], (
+            "entry_rules=[] must seed ZERO EventActions, not fall back to the default "
+            "bullish+flat ruleset"
+        )
+    finally:
+        ctx.__exit__(None, None, None)

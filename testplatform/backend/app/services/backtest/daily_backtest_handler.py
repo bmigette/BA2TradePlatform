@@ -739,6 +739,24 @@ def _build_experts(
     def _seed_enter(nm: str) -> int:
         if _is_trade_rules(entry_rules):
             return seed_entry_ruleset_from_rules(entry_rules, name=nm)
+        # entry_rules == [] (present, non-None, but every rule pruned) is a REAL decision on
+        # the GA-optimizer path -- decode_params only ever emits `[]` when the Strategy has an
+        # actual unified-model entry_rules template that the genome pruned down to nothing
+        # (every buy-N branch disabled), never as a stand-in for "not configured". That must
+        # seed a ruleset with ZERO entry rules, not silently fall through to the generic
+        # "bullish+flat -> buy" default below -- `if ... or entry_rules:` treated `[]` as
+        # falsy, so a fully-pruned genome got quietly re-armed with an unrelated default
+        # ruleset, corrupting both the GA's fitness signal for that individual AND the
+        # persisted top-N re-run (real trades recorded against a genome that had explicitly
+        # disabled every entry path).
+        #
+        # The standalone/API path's entry_rules is a DIFFERENT thing (an optional entry-time
+        # TP/SL bracket riding ON TOP of buy_tree, "absent/empty means no bracket" -- see the
+        # field's comment in _build_config) and always co-occurs with a real buy_tree/
+        # entry_action there, so gate on their absence to keep that path's `[]` meaning
+        # unchanged.
+        if entry_rules == [] and not buy_tree and not entry_action:
+            return seed_entry_ruleset_from_rules(entry_rules, name=nm)
         if buy_tree or entry_action or entry_rules:
             return seed_ruleset_from_tree(buy_tree, name=nm, enable_short=enable_short,
                                           entry_action=entry_action, entry_actions=entry_rules)
@@ -747,6 +765,13 @@ def _build_experts(
 
     def _seed_exit(nm: str) -> Optional[int]:
         if _is_trade_rules(exit_rules):
+            return seed_exit_ruleset_from_rules(exit_rules, name=nm)
+        if exit_rules == [] and entry_rules is not None:
+            # Same reasoning as _seed_enter: on the GA-optimizer path an explicitly empty
+            # exit_rules (alongside a present entry_rules, i.e. this trial IS on the unified-
+            # model path) means "every exit rule pruned", not "not configured" -- seed an
+            # empty OPEN_POSITIONS ruleset rather than silently returning None (no exit
+            # management at all is still a real, distinct outcome the fitness should see).
             return seed_exit_ruleset_from_rules(exit_rules, name=nm)
         return seed_open_positions_ruleset(exit_rules, name=nm) if exit_rules else None
 
