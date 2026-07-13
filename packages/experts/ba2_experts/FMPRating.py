@@ -1209,18 +1209,20 @@ Final Confidence = Base Confidence + Directional Boost ({signal.value}) = {base_
                         'skip_message': f"No price target consensus available for {symbol} — stock likely has no analyst coverage on FMP"
                     }
                 else:  # "insufficient analysts"
-                    analyst_count = self._count_analysts(upgrade_data)
-                    self.logger.info(
-                        f"Skipping FMPRating analysis for {symbol}: insufficient analyst coverage "
-                        f"({analyst_count} analysts, minimum {min_analysts} required)"
-                    )
+                    # Use rec.details verbatim -- it already carries the EXACT count_desc
+                    # _process decided the skip on (either the age-filtered "N active within
+                    # Mmo" when max_analyst_age_months > 0, or the plain unfiltered count
+                    # otherwise). Recomputing analyst_count here via _count_analysts(
+                    # upgrade_data) unconditionally (the pre-fix code) ignored the recency
+                    # filter, so a symbol skipped for "too few RECENT analysts" displayed the
+                    # unrelated, much larger all-time count instead -- e.g. "41 analysts
+                    # found, minimum 10 required" for a skip that was actually about only 3
+                    # analysts being active in the configured 6-month window.
+                    self.logger.info(f"Skipping FMPRating analysis for {symbol}: {rec.details}")
                     market_analysis.state = {
                         'skipped': True,
                         'skip_reason': 'insufficient_analyst_coverage',
-                        'skip_message': (
-                            f"Insufficient analyst coverage for {symbol}: {analyst_count} analysts found, "
-                            f"minimum {min_analysts} required"
-                        )
+                        'skip_message': f"Insufficient analyst coverage for {symbol}: {rec.details}"
                     }
                 market_analysis.status = MarketAnalysisStatus.SKIPPED
                 update_instance(market_analysis)
