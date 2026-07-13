@@ -447,23 +447,28 @@ class StockScreener:
     def _quotes_from_bars(
         self, symbols: List[str], window: int = 20
     ) -> Dict[str, Dict[str, Any]]:
-        """Build a quote-shaped map from as-of bars for the historical RVOL path.
+        """Build a quote-shaped map (volume/avgVolume/price) from daily bars — the SOLE
+        volume/RVOL source for both live and backtest (see ``_enrich_with_rvol``).
 
-        The live RVOL path reads ``volume`` / ``avgVolume`` / ``price`` off the FMP
-        ``/quote`` payload. ``/quote`` has no temporal parameter, so for the as_of
-        reconstruction we synthesize the same three keys from daily bars truncated to
-        ``self._as_of`` (via the as_of-anchored :meth:`_fetch_history_bulk`):
+        FMP's real-time ``/quote`` "volume" is today's volume-SO-FAR, which is not a fair
+        stand-in for a full trading day the way ``avgVolume`` (a full-day average) assumes
+        — it is near-zero right at the open and only becomes comparable late in the
+        session. Synthesizing the same three keys from daily bars, truncated to
+        ``self._as_of`` (via the as_of-anchored :meth:`_fetch_history_bulk`; ``as_of=None``
+        anchors on "now", i.e. the live path), gives a stable, time-of-day-independent
+        signal that is IDENTICAL whether backtesting or live:
 
-          - ``volume``    = the as-of (last) bar's volume,
-          - ``avgVolume`` = trailing mean volume over ~``window`` sessions ending at
-            ``as_of`` (the point-in-time analogue of FMP's rolling avgVolume),
-          - ``price``     = the as-of (last) bar's close.
+          - ``volume``    = the last COMPLETE session's volume (as of ``self._as_of`` for a
+            backtest; yesterday's for live — FMP's daily endpoint has no partial "today"
+            bar to leak),
+          - ``avgVolume`` = trailing mean volume over ~``window`` sessions ending there
+            (the point-in-time analogue of FMP's rolling avgVolume),
+          - ``price``     = that last bar's close (superseded by a live quote's price when
+            ``_enrich_with_rvol`` has one — see there).
 
-        ``marketCap`` / ``sharesFloat`` are intentionally omitted so the downstream
-        loop keeps the reconstructed market_cap (the q_mcap update only fires when the
-        key is present). This makes the historical RVOL fully point-in-time while the
-        per-candidate enrichment loop reads the SAME keys as the live path — the LOGIC
-        never forks, only the data source.
+        ``marketCap`` / ``sharesFloat`` are intentionally omitted so the downstream loop
+        only overwrites them from a live quote (the ``q_mcap``/``q_float`` updates only
+        fire when the key is present) — this function never has an opinion on them.
         """
         # window + a small buffer for the lookback window passed to _fetch_history_bulk
         history_map = self._fetch_history_bulk(symbols, lookback_days=window + 10)
@@ -545,8 +550,8 @@ class StockScreener:
         min_rvol: float,
     ) -> tuple:
         """
-        Enrich candidates with FMP quote data, compute relative volume,
-        and apply client-side filters that the screener API does not support
+        Enrich candidates with volume/RVOL + a live price/market-cap/float refresh, and
+        apply client-side filters that the screener API does not support
         (float_min, volume_max).
         """
         all_symbols = [
@@ -557,15 +562,25 @@ class StockScreener:
         if not all_symbols:
             return [], {"dropped_rvol": 0, "dropped_float": 0, "dropped_volume_max": 0}
 
-        # RVOL source: live FMP quotes on the live path (UNCHANGED); on the as_of
-        # path the live /quote endpoint has no temporal equivalent, so derive a
-        # quote-shaped map from as-of bars (last-bar volume vs. trailing average) —
-        # fully point-in-time. The per-candidate loop below reads from this map by
-        # the SAME keys (volume/avgVolume/price), so its logic never forks.
-        if self._as_of is not None:
-            quotes_map = self._quotes_from_bars(all_symbols)
-        else:
-            quotes_map = self._fetch_quotes_chunked(all_symbols)
+        # volume/avgVolume/RVOL ALWAYS come from daily bars (the last COMPLETE trading
+        # session's full-day volume vs. a trailing 20-day average) — live and backtest
+        # alike. This is what the backtest was optimized against, and it's the only
+        # correct choice: FMP's real-time /quote "volume" is today's volume-SO-FAR, which
+        # resets to ~0 at the open and only becomes comparable to a full-day average once
+        # most of the session has elapsed. A scan running at/near market open would divide
+        # by a near-zero numerator and reject nearly every candidate on RVOL regardless of
+        # what's actually happening in the stock — confirmed live on 2026-07-13: the 09:30
+        # ET scan (fixed to fire at the correct time that same day) returned 0/133
+        # candidates after the RVOL filter. Bars give a stable, time-of-day-independent
+        # signal that is IDENTICAL whether as_of is set (backtest) or None (live) — see
+        # _fetch_history_bulk's anchor logic.
+        quotes_map = self._quotes_from_bars(all_symbols)
+
+        # Price / market cap ARE legitimately live-sensitive (a stock's price is a real,
+        # meaningful number the instant the market opens — nothing to "warm up" the way
+        # cumulative volume does) and float is a near-static company attribute, so still
+        # refresh those three from the real-time quote when not backtesting.
+        live_quotes_map = self._fetch_quotes_chunked(all_symbols) if self._as_of is None else {}
 
         float_min = self._settings["screener_float_min"]
         volume_max = self._settings["screener_volume_max"]
@@ -578,8 +593,9 @@ class StockScreener:
         for c in candidates:
             sym = (c.get("symbol") or "").upper()
             quote = quotes_map.get(sym, {})
+            live_quote = live_quotes_map.get(sym, {})
 
-            # Update volume from quote
+            # Update volume from the daily-bar-derived quote
             volume = quote.get("volume") or c.get("volume") or 0
             avg_vol = quote.get("avgVolume", 0) or 0
             rvol = round(volume / avg_vol, 2) if avg_vol > 0 else 0.0
@@ -588,18 +604,18 @@ class StockScreener:
             c["avg_volume"] = avg_vol
             c["relative_volume"] = rvol
 
-            # Update price from quote if available
-            q_price = quote.get("price")
+            # Update price from the LIVE quote when available (else the bar-derived close)
+            q_price = live_quote.get("price") or quote.get("price")
             if q_price and q_price > 0:
                 c["price"] = q_price
 
-            # Update market_cap from quote if available
-            q_mcap = quote.get("marketCap")
+            # Update market_cap from the live quote if available
+            q_mcap = live_quote.get("marketCap")
             if q_mcap and q_mcap > 0:
                 c["market_cap"] = q_mcap
 
-            # Update float_shares from quote if available
-            q_float = quote.get("sharesFloat")
+            # Update float_shares from the live quote if available
+            q_float = live_quote.get("sharesFloat")
             if q_float and q_float > 0:
                 c["float_shares"] = q_float
 

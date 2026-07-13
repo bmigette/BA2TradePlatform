@@ -185,22 +185,37 @@ def test_enrich_with_rvol_uses_bars_on_as_of_path(monkeypatch):
     assert enriched[0]["relative_volume"] == 1.6
 
 
-def test_enrich_with_rvol_live_path_uses_quotes(monkeypatch):
+def test_enrich_with_rvol_live_path_uses_bars_for_volume_and_quotes_for_price(monkeypatch):
+    """Regression for a real incident: the live path used to source volume/avgVolume from
+    FMP's real-time /quote, whose "volume" is today's volume-SO-FAR -- near-zero right at
+    the open, so RVOL (volume/avgVolume) came back ~0 for every candidate on a scan running
+    at/near market open, rejecting the entire universe regardless of what was actually
+    happening (confirmed live: 0/133 candidates survived a 09:30 ET scan). Volume/avgVolume/
+    RVOL must ALWAYS come from daily bars (stable, time-of-day-independent, and identical to
+    what the backtest optimized against) -- live and backtest alike -- while price/market
+    cap/float still refresh from the real-time quote (those ARE legitimately live-sensitive,
+    with no "cold start" the way cumulative volume has)."""
     sc = S.StockScreener({"screener_relative_volume_min": 1.5})  # live, no as_of
     called = {"bars": False, "quotes": False}
 
     def fake_quotes(symbols, *a, **k):
         called["quotes"] = True
-        return {"KEEP": {"volume": 2_000_000, "avgVolume": 1_000_000, "price": 51.0}}
+        return {"KEEP": {"price": 51.0, "marketCap": 5_000_000_000, "sharesFloat": 10_000_000}}
 
-    def boom_bars(*a, **k):
+    def fake_bars(symbols, *a, **k):
         called["bars"] = True
-        raise AssertionError("_quotes_from_bars/_fetch_history_bulk called on live path")
+        return {"KEEP": {"volume": 2_000_000, "avgVolume": 1_000_000, "price": 50.5}}
 
     monkeypatch.setattr(sc, "_fetch_quotes_chunked", fake_quotes)
-    monkeypatch.setattr(sc, "_quotes_from_bars", boom_bars)
+    monkeypatch.setattr(sc, "_quotes_from_bars", fake_bars)
 
     enriched, _ = sc._enrich_with_rvol([{"symbol": "KEEP", "price": 51.0}], min_rvol=1.5)
     assert called["quotes"] is True
-    assert called["bars"] is False
+    assert called["bars"] is True
     assert {c["symbol"] for c in enriched} == {"KEEP"}
+    kept = enriched[0]
+    assert kept["volume"] == 2_000_000 and kept["avg_volume"] == 1_000_000  # from bars
+    assert kept["relative_volume"] == 2.0
+    assert kept["price"] == 51.0  # from the LIVE quote, not the bar's 50.5
+    assert kept["market_cap"] == 5_000_000_000
+    assert kept["float_shares"] == 10_000_000
