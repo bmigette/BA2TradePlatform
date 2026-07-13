@@ -760,6 +760,17 @@ def _build_experts(
         if buy_tree or entry_action or entry_rules:
             return seed_ruleset_from_tree(buy_tree, name=nm, enable_short=enable_short,
                                           entry_action=entry_action, entry_actions=entry_rules)
+        # Nothing configured at all (no buy_tree/entry_action/entry_rules -- entry_rules is
+        # None here, i.e. this Strategy has no unified-model template): the legacy "bullish +
+        # flat -> buy" convenience default for a bare-minimum standalone/API backtest. On the
+        # GA-optimizer path this should be UNREACHABLE (every optimized Strategy has a real
+        # entry_rules template by the time it reaches here) -- log loudly if it ever fires so a
+        # similar silent-fallback bug can't hide again the way the entry_rules==[] one did.
+        logger.warning(
+            f"_seed_enter({nm!r}): no buy_tree/entry_action/entry_rules configured -- "
+            "falling back to the generic bullish+flat default ruleset. Expected for a bare "
+            "standalone/API backtest; NOT expected on the GA-optimizer path."
+        )
         return (seed_enter_long_short_ruleset(name=nm) if enable_short
                 else seed_enter_long_ruleset(name=nm))
 
