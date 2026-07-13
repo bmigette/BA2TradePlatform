@@ -131,25 +131,49 @@ def test_fetch_history_bulk_live_window_is_today(monkeypatch):
 # ----------------------------------------------------------------------
 
 def test_quotes_from_bars_builds_quote_shape(monkeypatch):
-    sc = S.StockScreener({}, as_of=AS_OF)
-    # 5 bars, oldest-first; last bar volume = 3,000,000, avg of all = 1,800,000
+    sc = S.StockScreener({}, as_of=AS_OF)  # AS_OF = 2020-06-30
+    # 5 bars, oldest-first. The LAST bar is dated on AS_OF's own calendar day (2020-06-30) --
+    # a bar for a day still IN PROGRESS at as_of's scan time (e.g. 09:30) has only partial
+    # volume and must be excluded (both the real "cold start" bug this guards -- confirmed
+    # live, FMP's daily endpoint returns an in-progress bar for today when queried during
+    # market hours -- AND a lookahead-bias fix: a point-in-time scan can't see today's own
+    # full-day volume yet). "Last COMPLETE session" is therefore 2020-06-29.
     bars = [
         {"date": "2020-06-24", "close": 10.0, "volume": 1_000_000},
         {"date": "2020-06-25", "close": 11.0, "volume": 1_500_000},
         {"date": "2020-06-26", "close": 12.0, "volume": 2_000_000},
         {"date": "2020-06-29", "close": 13.0, "volume": 1_500_000},
-        {"date": "2020-06-30", "close": 14.0, "volume": 3_000_000},
+        {"date": "2020-06-30", "close": 14.0, "volume": 3_000_000},  # dropped: AS_OF's own day
     ]
     monkeypatch.setattr(sc, "_fetch_history_bulk", lambda syms, lookback_days: {"AAA": bars})
 
     quotes = sc._quotes_from_bars(["AAA"], window=20)
     q = quotes["AAA"]
-    assert q["volume"] == 3_000_000              # last (as-of) bar volume
-    assert q["price"] == 14.0                    # last (as-of) close
-    assert q["avgVolume"] == 1_800_000.0         # mean of the 5 in-window vols
+    assert q["volume"] == 1_500_000               # last COMPLETE (06-29) bar volume
+    assert q["price"] == 13.0                     # last COMPLETE (06-29) close
+    assert q["avgVolume"] == 1_500_000.0           # mean of the 4 remaining in-window vols
     # marketCap/sharesFloat intentionally absent so reconstructed market_cap survives
     assert "marketCap" not in q
     assert "sharesFloat" not in q
+
+
+def test_quotes_from_bars_live_path_drops_todays_partial_bar(monkeypatch):
+    """Same guard on the LIVE path (as_of=None, anchor='now'): a bar dated today must never
+    be used even when it's the ONLY bar present after the filter -- regression for the real
+    incident where FMP's daily endpoint returned an in-progress bar for the current session,
+    with only the volume traded so far, corrupting RVOL for the entire universe."""
+    sc = S.StockScreener({})  # live, no as_of
+    from datetime import datetime, timezone as tz
+    today = datetime.now(tz.utc).strftime("%Y-%m-%d")
+    bars = [
+        {"date": "2020-06-29", "close": 13.0, "volume": 1_500_000},
+        {"date": today, "close": 99.0, "volume": 9_999_999},  # today's in-progress bar
+    ]
+    monkeypatch.setattr(sc, "_fetch_history_bulk", lambda syms, lookback_days: {"AAA": bars})
+
+    quotes = sc._quotes_from_bars(["AAA"], window=20)
+    assert quotes["AAA"]["volume"] == 1_500_000
+    assert quotes["AAA"]["price"] == 13.0
 
 
 def test_enrich_with_rvol_uses_bars_on_as_of_path(monkeypatch):

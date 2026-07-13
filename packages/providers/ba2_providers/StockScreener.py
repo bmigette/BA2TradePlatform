@@ -459,12 +459,18 @@ class StockScreener:
         signal that is IDENTICAL whether backtesting or live:
 
           - ``volume``    = the last COMPLETE session's volume (as of ``self._as_of`` for a
-            backtest; yesterday's for live — FMP's daily endpoint has no partial "today"
-            bar to leak),
+            backtest; yesterday's for live),
           - ``avgVolume`` = trailing mean volume over ~``window`` sessions ending there
             (the point-in-time analogue of FMP's rolling avgVolume),
           - ``price``     = that last bar's close (superseded by a live quote's price when
             ``_enrich_with_rvol`` has one — see there).
+
+        FMP's ``/historical-price-full`` (unlike ``/quote``) was assumed to have no partial
+        "today" bar to leak -- WRONG, confirmed empirically: queried during market hours it
+        DOES return an in-progress bar dated today, with only the volume traded so far (the
+        exact same "cold start" problem this function exists to avoid, one level deeper). A
+        bar dated on the anchor's own calendar day is therefore explicitly dropped before
+        picking ``bars[-1]``, so "last" always means the last FULLY COMPLETE session.
 
         ``marketCap`` / ``sharesFloat`` are intentionally omitted so the downstream loop
         only overwrites them from a live quote (the ``q_mcap``/``q_float`` updates only
@@ -472,9 +478,12 @@ class StockScreener:
         """
         # window + a small buffer for the lookback window passed to _fetch_history_bulk
         history_map = self._fetch_history_bulk(symbols, lookback_days=window + 10)
+        anchor_date = (self._as_of or datetime.now(timezone.utc)).strftime("%Y-%m-%d")
         quotes: Dict[str, Dict[str, Any]] = {}
         for sym in symbols:
             bars = history_map.get(sym.upper()) or history_map.get(sym) or []
+            if bars and bars[-1].get("date") == anchor_date:
+                bars = bars[:-1]  # drop today's in-progress bar (partial volume)
             if not bars:
                 continue
             last = bars[-1]
