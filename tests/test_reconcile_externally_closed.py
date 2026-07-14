@@ -62,6 +62,27 @@ class TestReconcileExternallyClosed:
         assert fresh.status == TransactionStatus.CLOSED
         assert fresh.close_reason == "position_not_at_broker"
 
+    def test_closes_stuck_closing_transaction_when_broker_flat(self):
+        """2026-07-14 prod incident: a transaction can get stuck in CLOSING (the platform's
+        own close attempt failed/canceled repeatedly) while the position was ALREADY closed
+        directly at the broker in the meantime. An OPENED-only filter left it unreconciled
+        for 5 days until a stale retry surfaced it via a broker error. CLOSING must be
+        checked too, not just OPENED."""
+        acct = create_account_definition()
+        account = MockAccount(acct.id)
+        account._positions = []  # broker holds nothing
+        txn = _open_txn(acct.id, "AMPX")
+        txn = get_instance(Transaction, txn.id)
+        txn.status = TransactionStatus.CLOSING
+        update_instance(txn)
+
+        closed = account.reconcile_externally_closed_transactions()
+
+        assert closed == 1
+        fresh = get_instance(Transaction, txn.id)
+        assert fresh.status == TransactionStatus.CLOSED
+        assert fresh.close_reason == "position_not_at_broker"
+
     def test_keeps_when_broker_still_holds_position(self):
         acct = create_account_definition()
         account = MockAccount(acct.id)

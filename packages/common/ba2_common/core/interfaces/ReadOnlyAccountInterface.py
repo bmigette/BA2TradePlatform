@@ -755,7 +755,8 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
             return False
 
     def reconcile_externally_closed_transactions(self, grace_period_minutes: int = 5) -> int:
-        """Close OPENED transactions whose symbol no longer has a position at the broker.
+        """Close OPENED (or stuck-CLOSING) transactions whose symbol no longer has a position
+        at the broker.
 
         ``refresh_transactions`` is order-driven: it closes a transaction only when the
         platform's OWN orders fill/balance/terminate. A position closed DIRECTLY at the
@@ -810,11 +811,19 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         closed_count = 0
 
         with Session(get_db().bind) as session:
-            # OPENED transactions belonging to THIS account (transactions link to an
-            # account only through their orders), mirroring refresh_transactions' join.
+            # OPENED (and CLOSING) transactions belonging to THIS account (transactions link
+            # to an account only through their orders), mirroring refresh_transactions' join.
+            # CLOSING is included because a transaction can get stuck there indefinitely: the
+            # platform's own close attempt fails/cancels repeatedly (flipping status to CLOSING)
+            # while the position gets closed DIRECTLY at the broker in the meantime (manually,
+            # outside the platform) -- that external fill never resolves the CLOSING state since
+            # order-driven refresh_transactions only reacts to the platform's OWN order fills.
+            # An OPENED-only filter here left such a transaction silently unreconciled forever
+            # (see the 2026-07-14 ASC incident: stuck CLOSING since 2026-07-09, only surfaced via
+            # a stale bracket-retry erroring 5 days later).
             statement = select(Transaction).join(TradingOrder).where(
                 TradingOrder.account_id == self.id,
-                Transaction.status == TransactionStatus.OPENED,
+                Transaction.status.in_([TransactionStatus.OPENED, TransactionStatus.CLOSING]),
             ).distinct()
             open_txns = session.exec(statement).all()
 
