@@ -126,3 +126,59 @@ def test_two_rebalances_sell_dropped_buy_new():
         "E": OrderDirection.BUY,    # new
     }
     assert "C" not in run2_orders   # held with unchanged target weight -> no churn
+
+
+class _LaggingPromotionAccount:
+    """Account double that fills orders but does NOT promote WAITING -> OPENED (simulates
+    the real-world gap between refresh_orders() confirming a fill and the separate
+    refresh_transactions() call promoting the transaction -- see the 2026-07-14 incident
+    where re-triggering FactorRanker in that gap tripled a live position)."""
+
+    def __init__(self, prices):
+        self.prices = prices
+        self.submitted = []
+
+    def get_instrument_current_price(self, symbol):
+        return self.prices.get(symbol)
+
+    def submit_order(self, order, is_closing_order=False):
+        order.status = OrderStatus.FILLED
+        order.filled_qty = order.quantity
+        order.open_price = self.prices.get(order.symbol)
+        add_instance(order, expunge_after_flush=True)
+        self.submitted.append(order)
+        return order  # transaction stays WAITING -- no promotion
+
+
+def test_rerun_before_transaction_promoted_does_not_double_buy():
+    """get_holdings() must see an already-filled-but-still-WAITING transaction as held, or a
+    re-trigger before the promotion cycle runs re-buys the full target from scratch."""
+    acct = create_account_definition()
+    inst = create_expert_instance(account_id=acct.id, expert="FactorRanker", virtual_equity_pct=100.0)
+    expert = FactorRanker(inst.id)
+    expert._settings_cache = _settings()
+
+    account = _LaggingPromotionAccount({s: 10.0 for s in ["A", "B", "C", "D", "E"]})
+    expert_stub = MagicMock()
+    expert_stub.get_virtual_balance.return_value = 100_000.0
+
+    run1 = {"A": _ramp(300), "B": _ramp(250), "C": _ramp(200), "D": _ramp(120), "E": _ramp(110)}
+
+    with patch("ba2_trade_platform.core.utils.get_account_instance_from_id", return_value=account), \
+         patch("ba2_trade_platform.core.utils.get_expert_instance_from_id", return_value=expert_stub), \
+         patch(f"{_OHLCV_MOD}.__new__", lambda cls: _StubOHLCV()), \
+         patch("ba2_trade_platform.modules.experts.FactorRanker.data.fetch_close_prices", return_value=run1):
+
+        ma1 = create_market_analysis(symbol="EXPERT", expert_instance_id=inst.id)
+        expert.run_analysis("EXPERT", ma1)
+        run1_orders = _orders_by_symbol(account.submitted)
+        account.submitted.clear()
+
+        # Re-trigger with the SAME ranking/target before any promotion happened.
+        ma2 = create_market_analysis(symbol="EXPERT", expert_instance_id=inst.id)
+        expert.run_analysis("EXPERT", ma2)
+        run2_orders = _orders_by_symbol(account.submitted)
+
+    assert run1_orders == {"A": OrderDirection.BUY, "B": OrderDirection.BUY, "C": OrderDirection.BUY}
+    # Same target, positions already (WAITING-but-filled) held -> zero new orders, not a repeat buy.
+    assert run2_orders == {}

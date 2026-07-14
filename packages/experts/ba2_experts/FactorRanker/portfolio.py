@@ -114,11 +114,11 @@ class FactorPortfolioManager:
 
     def get_holdings(self):
         """Return (held_shares {symbol: qty}, transactions_by_symbol {symbol: [_OpenedTxn]})
-        for this expert's OPENED transactions.
+        for this expert's OPENED (and, on live, WAITING-but-actually-filled) transactions.
 
-        The OPENED-Transaction set is expert-scoped (``Transaction.expert_id``) and is the source
-        of truth for WHICH symbols/txns belong to THIS expert (needed to attach a sell to a txn id
-        in ``_submit_sell``) and for each txn's cost basis (``open_price``/``open_qty``).
+        The OPENED/WAITING-Transaction set is expert-scoped (``Transaction.expert_id``) and is the
+        source of truth for WHICH symbols/txns belong to THIS expert (needed to attach a sell to a
+        txn id in ``_submit_sell``) and for each txn's cost basis (``open_price``/``open_qty``).
 
         On a BACKTEST account we read it from the account's cached, fill-invalidated
         ``opened_position_snapshot`` (GENERAL account infra) instead of issuing the OPENED ``SELECT``
@@ -141,11 +141,20 @@ class FactorPortfolioManager:
         else:
             # Live: no account snapshot -> direct DB query (build the same lightweight records;
             # get_current_open_qty is computed once here, exactly as the cost-basis loop needs it).
+            # Include WAITING alongside OPENED: a transaction stays WAITING until the account's
+            # refresh_transactions() cycle promotes it, which can lag well behind the order actually
+            # filling at the broker (refresh_orders() and refresh_transactions() are separate calls
+            # on separate cadences). get_current_open_qty() only counts orders whose OWN status is
+            # already FILLED, so this is safe either way — a still-pending WAITING transaction
+            # contributes 0. Without this, re-triggering FactorRanker between an order filling and
+            # its transaction being promoted makes get_holdings() see an empty book and re-buy the
+            # full target from scratch, stacking duplicate positions (see 2026-07-14 incident where
+            # 3 rapid re-triggers 3x'd a live position before this fix).
             with get_db() as session:
                 transactions = session.exec(
                     select(Transaction)
                     .where(Transaction.expert_id == self.expert_instance_id)
-                    .where(Transaction.status == TransactionStatus.OPENED)
+                    .where(Transaction.status.in_([TransactionStatus.OPENED, TransactionStatus.WAITING]))
                 ).all()
             by_symbol = {}
             for trans in transactions:
