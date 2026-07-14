@@ -1093,6 +1093,26 @@ def _reconstruct_opt_ruleset(backtest: Backtest, db: Any):
         return None, None, None, None
 
 
+def _is_bypass_expert_class(expert_name: Optional[str]) -> bool:
+    """True iff ``expert_name`` resolves to a class declaring ``bypasses_classic_rm`` (e.g.
+    FactorRanker). Mirrors strategy_optimization_handler._is_bypass_expert's single-class
+    case; kept local here to avoid importing the whole optimization handler for one flag."""
+    if not expert_name:
+        return False
+    import importlib
+    from app.services.backtest.daily_backtest_handler import _SUPPORTED_EXPERTS
+
+    module_path = _SUPPORTED_EXPERTS.get(expert_name)
+    if not module_path:
+        return False
+    try:
+        module = importlib.import_module(module_path)
+        expert_cls = getattr(module, expert_name)
+    except Exception:  # noqa: BLE001 — detection is best-effort; default to non-bypass
+        return False
+    return bool(getattr(expert_cls, "bypasses_classic_rm", False))
+
+
 def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dict:
     """Build the chosen read-only export payload from a backtest's strategy_params.
 
@@ -1159,6 +1179,23 @@ def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dic
                     "screener_settings": eff_screener,
                     "screener_cadence_days": int(screener_opt.get("cadence_days", 7)),
                 }
+                # BYPASS-expert screener wiring (piece 1c mirror): for an expert that declares
+                # bypasses_classic_rm (e.g. FactorRanker), _build_daily_trial_config pushes
+                # universe_source=screener + screener_store + the effective screener_* settings
+                # directly onto the expert's OWN settings at trial-build time -- that override is
+                # never written back to Backtest.strategy_params, so base_settings here still shows
+                # whatever static default the Strategy template had (e.g. universe_source="static").
+                # Re-derive the same overlay here so the export/deploy reproduces what the backtest
+                # actually ran with, not the un-overridden template. Explicit model:* overrides
+                # still win last, matching _build_daily_trial_config's merge order.
+                if screener_opt.get("apply_to_expert_settings") and _is_bypass_expert_class(backtest.expert_name):
+                    expert_params = {
+                        **base_settings,
+                        "universe_source": "screener",
+                        "screener_store": screener_opt["store"],
+                        **eff_screener,
+                        **model_overrides,
+                    }
             else:
                 universe = {"mode": "static", "symbols": list(bt_block.get("enabled_instruments") or [])}
             execution = {
