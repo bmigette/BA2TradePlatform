@@ -957,6 +957,15 @@ class DailyBacktestEngine:
             try:
                 rec = expert.analyze_as_of(as_of, ctx)
             except Exception as e:  # noqa: BLE001 — one symbol must not abort the bar
+                # A hermetic cache miss (un-prewarmed data) must ABORT loudly, NOT be silently
+                # skipped per-symbol — otherwise a missing pre-warm degrades results invisibly.
+                # Mirrors the ENTER_MARKET path's handling (see above); this OPEN_POSITIONS
+                # path had been missing it (found 2026-07-15 while auditing the senate
+                # trader-skill feature's hermeticity).
+                from app.services.backtest.price_source import BacktestCacheMiss
+                from ba2_providers.fmp_common import FMPHistoryCacheMiss
+                if isinstance(e, (BacktestCacheMiss, FMPHistoryCacheMiss)):
+                    raise
                 self._log(f"open-pos analyze failed for {symbol} @ {as_of:%Y-%m-%d}: {e}")
                 continue
             rec_id = _recommendation_to_expert_recommendation(
@@ -1052,8 +1061,10 @@ class DailyBacktestEngine:
         TradeRiskManagement / position_sizing.
 
         A skip / empty-targets recommendation is a no-op for the bar (nothing to rebalance).
-        A per-bar failure is logged and swallowed (one bad bar must not abort the run), matching
-        the classic path's per-bar try/except.
+        A per-bar failure is logged and swallowed (one bad bar must not abort the run) — EXCEPT
+        a hermetic cache miss (un-prewarmed data), which ABORTS loudly instead: silently
+        swallowing it would degrade results invisibly rather than surfacing the missing
+        prewarm. Matches the classic (ENTER_MARKET) path's per-bar try/except exactly.
         """
         ctx = BacktestContext(
             providers=self._provider_bundle(),
@@ -1065,6 +1076,10 @@ class DailyBacktestEngine:
         try:
             rec = expert.analyze_as_of(as_of, ctx)
         except Exception as e:  # noqa: BLE001 — one bar must not abort the run
+            from app.services.backtest.price_source import BacktestCacheMiss
+            from ba2_providers.fmp_common import FMPHistoryCacheMiss
+            if isinstance(e, (BacktestCacheMiss, FMPHistoryCacheMiss)):
+                raise
             self._log(f"bypass analyze_as_of failed @ {as_of:%Y-%m-%d}: {e}")
             return
 
