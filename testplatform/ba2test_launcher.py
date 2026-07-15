@@ -207,7 +207,7 @@ def _cmd_prewarm(args) -> int:
     import time
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from ba2_providers.fmp_common import (
-        frozen_ttl_cache, _fmp_history_cache_dir, persist_empty_sentinel,
+        frozen_ttl_cache, _fmp_history_cache_dir, persist_empty_sentinel, set_ttl_frozen,
     )
 
     # Resolve the FMP key the same way the providers / fetch-cache do.
@@ -394,8 +394,20 @@ def _cmd_prewarm(args) -> int:
     # The freeze gate engages the BACKTEST-ONLY disk cache (live would pass through).
     # persist_empty_sentinel(): a symbol FMP genuinely has no data for is cached as ``[]`` so it
     # reads back as "checked, no data" (not the fatal "not pre-warmed" of an absent file).
+    #
+    # CRITICAL: frozen_ttl_cache()/set_ttl_frozen() set a THREAD-LOCAL flag (by design — a live
+    # backtest thread must never see a sibling thread's freeze state). threading.local() does
+    # NOT propagate into a ThreadPoolExecutor's worker threads, so entering frozen_ttl_cache()
+    # only in this (main) thread left every submitted fn() running UN-frozen: real network
+    # fetches happened but fmp_history_disk_cached() took the "live: never persist" branch on
+    # every call — a prewarm run could burn the full FMP rate-limit budget and write ZERO cache
+    # files. The initializer runs ONCE per worker thread (before it processes any task) and sets
+    # the SAME thread-local flag from inside that thread, so every task the pool ever runs on it
+    # sees frozen=True. persist_empty_sentinel's flag is a plain module global (not thread-local)
+    # so it already applied to worker threads correctly — only ttl_frozen needed this.
     with frozen_ttl_cache(), persist_empty_sentinel():
-        with ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
+        with ThreadPoolExecutor(max_workers=max(1, args.workers),
+                                initializer=set_ttl_frozen, initargs=(True,)) as ex:
             futures = {ex.submit(fn, sym): (expert, sym) for (expert, sym, fn) in work}
             for fut in as_completed(futures):
                 expert, sym = futures[fut]
