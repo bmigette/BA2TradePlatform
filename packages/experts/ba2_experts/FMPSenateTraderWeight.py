@@ -13,6 +13,7 @@ API Documentation: https://site.financialmodelingprep.com/developer/docs#senate-
 
 from typing import Any, Dict, Optional, List
 from datetime import datetime, timezone, timedelta
+from functools import lru_cache
 import json
 import os
 import re
@@ -30,6 +31,19 @@ from ba2_common.config import get_app_setting
 from ba2_experts.expert_mixins import AnalysisStatusRenderMixin, FMPCongressTradingMixin
 # NOTE: parse_fmp_amount_range / calculate_fmp_trade_metrics are imported LOCALLY inside
 # methods to avoid a circular import (core.utils -> modules.experts -> ...).
+
+
+@lru_cache(maxsize=None)
+def _parse_ymd_utc(date_str: str) -> datetime:
+    """Parse a "%Y-%m-%d" trade-date string as UTC midnight.
+
+    Profiled a 6-month/3-symbol backtest at 1336s total; ``datetime.strptime`` alone
+    (re-resolving the C locale on every call) accounted for ~570s of that across ~17.5M
+    calls, almost all of them re-parsing the SAME handful of disclosure/exec date strings
+    that recur across every bar and every GA trial. ``fromisoformat`` skips locale
+    resolution entirely, and memoizing collapses the repeats to one parse per unique
+    string (bounded: real trade dates, at most a few thousand distinct values ever)."""
+    return datetime.fromisoformat(date_str).replace(tzinfo=timezone.utc)
 
 
 class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, MarketExpertInterface):
@@ -304,7 +318,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             if key in exec_price_by_trade:
                 continue
             try:
-                exec_date = datetime.strptime(exec_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                exec_date = _parse_ymd_utc(exec_date_str)
             except (ValueError, TypeError):
                 continue
             exec_price_by_trade[key] = self._get_price_at_date(trade.get('symbol', ''), exec_date)
@@ -383,7 +397,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         if not ds:
             return True
         try:
-            d = datetime.strptime(ds, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            d = _parse_ymd_utc(ds)
         except (ValueError, TypeError):
             return True
         return d <= ceiling
@@ -607,23 +621,29 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
     _HOLD_CACHE_FILE = "congress_scalper_scores.json"
     _SKILL_CACHE_FILE = "congress_skill_scores.json"
     _CONFIDENCE_CACHE_FILE = "congress_confidence_scores.json"
-    # Flush every N new entries rather than every single one. A naive "write on every miss"
-    # re-serializes the WHOLE accumulated dict each time — fine for hold-days (~1 entry per
-    # trader, computed once) but a real bottleneck for skill (keyed per trader PER DAY: a
-    # full backtest accumulates thousands of entries, making per-miss writes O(n^2) total —
-    # profiled live: a 3-symbol/3.7-year run got SLOWER after adding the cache, not faster,
-    # because of this). Throttling bounds it to O(n) amortized. Worst case on a crash: the
-    # last <N entries since the previous flush are recomputed next run — never a correctness
-    # issue (both scores are pure functions of their inputs).
+    # Append only N new entries at a time to a JSON-Lines delta file, rather than
+    # re-serializing the whole accumulated dict on every flush. An earlier version of this
+    # throttle rewrote the FULL dict every _CACHE_FLUSH_EVERY entries — still O(n^2) total
+    # (just with a smaller constant), and profiling a 6-month/3-symbol backtest showed it
+    # cost ~270s of a 1336s run because skill/confidence are keyed per trader PER DAY
+    # (hundreds of thousands of entries in one run). Appending only the new entries is
+    # O(new entries) per flush, O(n) total for the whole run. Periodically COMPACTED (see
+    # _CACHE_COMPACT_EVERY) so the delta file — and the replay cost of loading it — stays
+    # bounded across a long-lived worker process reused for many GA trials.
     _CACHE_FLUSH_EVERY = 25
+    _CACHE_COMPACT_EVERY = 2000
 
     def _scoring_cache_path(self, filename: str) -> str:
         from ba2_common.config import CACHE_FOLDER
         return os.path.join(CACHE_FOLDER, "fmp_history", filename)
 
+    def _scoring_cache_delta_path(self, filename: str) -> str:
+        return self._scoring_cache_path(filename) + ".delta.jsonl"
+
     def _load_scoring_cache(self, attr: str, filename: str) -> Dict[str, Any]:
         """Lazily load + memoize one JSON cache file on ``self`` (one disk read per
-        instance/process, not per lookup)."""
+        instance/process, not per lookup). Merges the compacted base file with any
+        not-yet-compacted append-only delta lines (see ``_save_scoring_cache_throttled``)."""
         cache = getattr(self, attr, None)
         if cache is not None:
             return cache
@@ -633,13 +653,24 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                 cache = json.load(f)
         except Exception:  # noqa: BLE001 — missing/corrupt cache -> start fresh, never fatal
             cache = {}
+        try:
+            with open(self._scoring_cache_delta_path(filename), "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    entry = json.loads(line)
+                    cache[entry["k"]] = entry["v"]
+        except Exception:  # noqa: BLE001 — missing/corrupt delta -> ignore, never fatal
+            pass
         setattr(self, attr, cache)
         return cache
 
     def _save_scoring_cache(self, attr: str, filename: str) -> None:
-        """Unconditional flush — writes the FULL cache dict now. Callers on the hot per-bar
-        path should use ``_save_scoring_cache_throttled`` instead; this is for the
-        occasional caller (e.g. tests) that wants a guaranteed on-disk write."""
+        """Unconditional COMPACTING flush — writes the FULL cache dict now and clears any
+        pending delta file. Callers on the hot per-bar path should use
+        ``_save_scoring_cache_throttled`` instead; this is for the occasional caller (e.g.
+        tests, or periodic compaction) that wants a guaranteed, fully-compacted write."""
         cache = getattr(self, attr, {})
         path = self._scoring_cache_path(filename)
         try:
@@ -648,22 +679,47 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(cache, f)
             os.replace(tmp, path)
+            delta_path = self._scoring_cache_delta_path(filename)
+            if os.path.exists(delta_path):
+                os.remove(delta_path)
+            setattr(self, attr + "_pending", [])
+            setattr(self, attr + "_since_compact", 0)
         except Exception as e:  # noqa: BLE001 — a cache-write failure must never fail scoring
             self.logger.debug(f"Failed to persist scoring cache {filename}: {e}")
 
-    def _save_scoring_cache_throttled(self, attr: str, filename: str) -> None:
-        """Flush only every ``_CACHE_FLUSH_EVERY`` NEW entries (see the class-level comment
-        on why: a per-miss flush is O(n^2) total for a cache that accumulates thousands of
-        entries over one run). The in-memory dict (``self.<attr>``) is ALWAYS up to date
-        regardless — only the on-disk write is throttled, so within-process lookups are
-        unaffected; only a crash mid-run can lose the last <N entries (harmless — pure
-        functions, just recomputed next time)."""
-        dirty_attr = attr + "_dirty"
-        dirty = getattr(self, dirty_attr, 0) + 1
-        if dirty >= self._CACHE_FLUSH_EVERY:
-            self._save_scoring_cache(attr, filename)
-            dirty = 0
-        setattr(self, dirty_attr, dirty)
+    def _save_scoring_cache_throttled(self, attr: str, filename: str, key: str) -> None:
+        """Append ``key`` (and its already-stored value) to the pending list; every
+        ``_CACHE_FLUSH_EVERY`` pending entries, APPEND just those to the JSON-Lines delta
+        file (O(new entries), not O(total cache size) — see the class-level comment on
+        why a whole-dict rewrite, even throttled, is still O(n^2) total). Every
+        ``_CACHE_COMPACT_EVERY`` entries, fold the delta back into the base file via a full
+        compacting ``_save_scoring_cache`` so a long-lived worker process (reused across
+        many GA trials) doesn't accumulate an ever-growing delta file. The in-memory dict
+        (``self.<attr>``) is ALWAYS up to date regardless of flush/compact timing — only a
+        crash mid-run can lose the last <N pending entries (harmless — pure functions of
+        their inputs, recomputed next time)."""
+        pending_attr = attr + "_pending"
+        pending = getattr(self, pending_attr, None) or []
+        cache = getattr(self, attr)
+        pending.append({"k": key, "v": cache[key]})
+        if len(pending) < self._CACHE_FLUSH_EVERY:
+            setattr(self, pending_attr, pending)
+            return
+        since_compact_attr = attr + "_since_compact"
+        since_compact = getattr(self, since_compact_attr, 0) + len(pending)
+        if since_compact >= self._CACHE_COMPACT_EVERY:
+            self._save_scoring_cache(attr, filename)  # also clears pending/since_compact
+            return
+        delta_path = self._scoring_cache_delta_path(filename)
+        try:
+            os.makedirs(os.path.dirname(delta_path), exist_ok=True)
+            with open(delta_path, "a", encoding="utf-8") as f:
+                for entry in pending:
+                    f.write(json.dumps(entry) + "\n")
+        except Exception as e:  # noqa: BLE001 — a cache-write failure must never fail scoring
+            self.logger.debug(f"Failed to append scoring cache delta {filename}: {e}")
+        setattr(self, pending_attr, [])
+        setattr(self, since_compact_attr, since_compact)
 
     def _get_trader_hold_info_cached(self, trader_name: str,
                                      trader_history: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -678,7 +734,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             return {"avg_hold_days": entry.get("avg_hold_days"), "roundtrips": entry.get("roundtrips")}
         result = self._calculate_trader_avg_hold_days(trader_history)
         cache[trader_name] = {"history_len": n, **result}
-        self._save_scoring_cache_throttled("_hold_cache", self._HOLD_CACHE_FILE)
+        self._save_scoring_cache_throttled("_hold_cache", self._HOLD_CACHE_FILE, trader_name)
         return result
 
     def _get_trader_skill_cached(self, trader_name: str, trader_history: List[Dict[str, Any]],
@@ -711,7 +767,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             min_past_trades=min_past_trades, max_past_trades=max_past_trades,
             lookback_months=lookback_months)
         cache[key] = result
-        self._save_scoring_cache_throttled("_skill_cache", self._SKILL_CACHE_FILE)
+        self._save_scoring_cache_throttled("_skill_cache", self._SKILL_CACHE_FILE, key)
         return result
 
     def _get_trader_confidence_cached(self, trader_name: str, trader_history: List[Dict[str, Any]],
@@ -741,7 +797,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             trader_history, current_trade_type, current_symbol, current_price,
             max_exec_days, now=now, symbol_focus_cap_pct=symbol_focus_cap_pct)
         cache[key] = result
-        self._save_scoring_cache_throttled("_confidence_cache", self._CONFIDENCE_CACHE_FILE)
+        self._save_scoring_cache_throttled("_confidence_cache", self._CONFIDENCE_CACHE_FILE, key)
         return result
 
     def _price_on_or_after(self, symbol: str, date: datetime, max_walk_days: int = 5) -> Optional[float]:
@@ -796,7 +852,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             if not exec_str or not sym:
                 continue
             try:
-                exec_date = datetime.strptime(exec_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                exec_date = _parse_ymd_utc(exec_str)
             except (ValueError, TypeError):
                 continue
             if exec_date < lookback_floor:
@@ -853,7 +909,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             if not (is_buy or is_sell):
                 continue
             try:
-                dt = datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                dt = _parse_ymd_utc(d)
             except (ValueError, TypeError):
                 continue
             by_symbol.setdefault(sym, []).append((dt, is_buy))
@@ -924,8 +980,8 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                     continue
                 
                 # Parse dates (FMP returns YYYY-MM-DD format)
-                disclose_date = datetime.strptime(disclose_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                exec_date = datetime.strptime(exec_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                disclose_date = _parse_ymd_utc(disclose_date_str)
+                exec_date = _parse_ymd_utc(exec_date_str)
                 # Build trader name for logging
 
                 # Check if this is the correct symbol (case insensitive)
@@ -1077,7 +1133,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                 
                 # Parse date
                 try:
-                    exec_date = datetime.strptime(exec_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                    exec_date = _parse_ymd_utc(exec_date_str)
                 except (ValueError, TypeError) as e:
                     self.logger.warning(f"Skipping trade with unparseable date {exec_date_str!r}: {e}")
                     continue
