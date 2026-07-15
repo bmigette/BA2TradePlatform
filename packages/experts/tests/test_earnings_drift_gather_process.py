@@ -65,6 +65,63 @@ def test_process_hold_below_threshold():
     assert rec.expected_profit_percent == 0.0
 
 
+def test_process_static_mode_ignores_dynamic_scale():
+    """expected_profit_mode='static' must reproduce today's flat-percent behaviour exactly,
+    even when dynamic_scale is set to something nonzero (it should simply be ignored)."""
+    e = _expert()
+    settings = {**SETTINGS, "expected_profit_mode": "static", "dynamic_scale": 5.0}
+    bundle = e._gather(LiveProviderBundle(_get_provider), as_of=NOW)
+    rec = e._process(bundle, settings, as_of=NOW)
+    assert rec.signal == OrderRecommendation.BUY
+    assert rec.expected_profit_percent == 8.0
+
+
+def test_process_dynamic_mode_zero_scale_matches_static():
+    """dynamic_scale=0.0 must be numerically identical to 'static' -- the documented invariant."""
+    e = _expert()
+    settings = {**SETTINGS, "expected_profit_mode": "dynamic", "dynamic_scale": 0.0}
+    bundle = e._gather(LiveProviderBundle(_get_provider), as_of=NOW)
+    rec = e._process(bundle, settings, as_of=NOW)
+    assert rec.expected_profit_percent == 8.0
+
+
+def test_process_dynamic_mode_scales_with_excess_surprise():
+    """dynamic mode: expected_profit = base + scale * max(0, surprise_pct - surprise_min_pct).
+    Fixture surprise is 20.0%, surprise_min_pct is 5.0% -> excess 15.0%."""
+    e = _expert()
+    settings = {**SETTINGS, "expected_profit_mode": "dynamic", "dynamic_scale": 0.5}
+    bundle = e._gather(LiveProviderBundle(_get_provider), as_of=NOW)
+    rec = e._process(bundle, settings, as_of=NOW)
+    assert rec.expected_profit_percent == 8.0 + 0.5 * (20.0 - 5.0)  # == 15.5
+
+
+def test_process_dynamic_mode_hold_still_zero():
+    """A HOLD (surprise below threshold) must stay expected_profit=0 regardless of mode --
+    dynamic scaling only ever applies to an actual BUY signal."""
+    class WeakDetails:
+        def get_past_earnings(self, symbol, frequency, end_date, lookback_periods, format_type, **kw):
+            return {"earnings": [{"report_date": "2026-06-10", "reported_eps": 1.01,
+                                  "estimated_eps": 1.0, "surprise_percent": 1.0}]}
+
+    e = _expert()
+    settings = {**SETTINGS, "expected_profit_mode": "dynamic", "dynamic_scale": 2.0}
+    bundle = e._gather(
+        LiveProviderBundle(lambda c, n, **k: WeakDetails() if c == "fundamentals_details" else FakeOHLCV()),
+        as_of=NOW)
+    rec = e._process(bundle, settings, as_of=NOW)
+    assert rec.signal == OrderRecommendation.HOLD
+    assert rec.expected_profit_percent == 0.0
+
+
+def test_process_missing_mode_and_scale_default_to_static():
+    """Settings dicts built without the new (optional) keys -- e.g. older/hand-built configs,
+    existing tests/fixtures -- must fall back to 'static' behaviour, not raise KeyError."""
+    e = _expert()
+    bundle = e._gather(LiveProviderBundle(_get_provider), as_of=NOW)
+    rec = e._process(bundle, SETTINGS, as_of=NOW)  # SETTINGS has neither key
+    assert rec.expected_profit_percent == 8.0
+
+
 def test_gather_threads_as_of_into_provider():
     captured = {}
 

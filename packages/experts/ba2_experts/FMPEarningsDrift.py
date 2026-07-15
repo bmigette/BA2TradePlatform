@@ -181,7 +181,24 @@ class FMPEarningsDrift(AnalysisStatusRenderMixin, MarketExpertInterface):
             },
             "expected_profit_percent": {
                 "type": "float", "required": True, "default": 8.0,
-                "description": "Expected profit %% attached to BUY recommendations",
+                "description": "Base expected profit %% attached to BUY recommendations. In "
+                               "'dynamic' mode this is the floor (surprise at the trigger "
+                               "threshold); in 'static' mode it's the flat value for every signal.",
+            },
+            "expected_profit_mode": {
+                "type": "str", "required": False, "default": "static",
+                "choices": ["static", "dynamic"],
+                "description": "'static': every BUY gets the flat expected_profit_percent. "
+                               "'dynamic': expected_profit_percent scales up with how far the "
+                               "EPS surprise exceeds surprise_min_pct (see dynamic_scale). "
+                               "dynamic_scale=0 makes 'dynamic' numerically identical to 'static'.",
+            },
+            "dynamic_scale": {
+                "type": "float", "required": False, "default": 0.0,
+                "description": "Only used when expected_profit_mode='dynamic'. Added profit %% "
+                               "per 1 point the EPS surprise exceeds surprise_min_pct: "
+                               "expected_profit = expected_profit_percent + dynamic_scale * "
+                               "max(0, surprise_pct - surprise_min_pct). Ignored in 'static' mode.",
             },
         }
 
@@ -192,7 +209,8 @@ class FMPEarningsDrift(AnalysisStatusRenderMixin, MarketExpertInterface):
     # the point-in-time (no-lookahead) fetch and the live latest fetch share one
     # code path; with as_of=None the fetch is byte-identical to the live path.
     # ------------------------------------------------------------------
-    _SETTING_KEYS = ("surprise_min_pct", "max_days_since_report", "expected_profit_percent")
+    _SETTING_KEYS = ("surprise_min_pct", "max_days_since_report", "expected_profit_percent",
+                      "expected_profit_mode", "dynamic_scale")
 
     def _gather(self, providers: ProviderBundle, as_of: Optional[datetime]) -> Dict[str, Any]:
         symbol = self._gather_symbol
@@ -244,10 +262,22 @@ class FMPEarningsDrift(AnalysisStatusRenderMixin, MarketExpertInterface):
         now = as_of or datetime.now(timezone.utc)
         surprise_min = float(settings["surprise_min_pct"])
         max_days = int(settings["max_days_since_report"])
-        expected_profit = float(settings["expected_profit_percent"])
+        expected_profit_base = float(settings["expected_profit_percent"])
+        # Both declared optional (required=False) with defaults in get_settings_definitions --
+        # .get() here mirrors that contract for callers (tests, older configs) that don't pass
+        # them, unlike the required settings above which fail loud on a missing key.
+        expected_profit_mode = str(settings.get("expected_profit_mode", "static"))
+        dynamic_scale = float(settings.get("dynamic_scale", 0.0))
         result = evaluate_earnings_drift(data_bundle["latest_earnings"], now, surprise_min, max_days)
 
         if result["is_signal"]:
+            if expected_profit_mode == "dynamic" and result["surprise_pct"] is not None:
+                # dynamic_scale=0 is numerically identical to 'static' -- the excess-surprise
+                # bonus vanishes and expected_profit collapses to expected_profit_base.
+                excess_surprise = max(0.0, float(result["surprise_pct"]) - surprise_min)
+                expected_profit = expected_profit_base + dynamic_scale * excess_surprise
+            else:
+                expected_profit = expected_profit_base
             signal, confidence, expected = OrderRecommendation.BUY, result["confidence"], expected_profit
         else:
             signal, confidence, expected = OrderRecommendation.HOLD, 10.0, 0.0

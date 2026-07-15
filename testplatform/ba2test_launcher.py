@@ -800,6 +800,14 @@ _EXPERT_OPT = {
         "expert_params": {
             "surprise_min_pct": {"optimize": True, "min": 2.0, "max": 15.0, "step": 1.0, "type": "float"},
             "max_days_since_report": {"optimize": True, "min": 5, "max": 45, "step": 5, "type": "int"},
+            "expected_profit_percent": {"optimize": True, "min": 3.0, "max": 20.0, "step": 1.0, "type": "float"},
+            # 2026-07 addition: was a hardcoded flat 8% for every BUY regardless of signal
+            # strength. 'static' preserves that exact behaviour (now GA-tunable instead of
+            # fixed at the class default); 'dynamic' scales expected_profit up with how far
+            # the EPS surprise exceeds surprise_min_pct. dynamic_scale=0 makes 'dynamic'
+            # numerically identical to 'static', so the GA can freely discover either.
+            "expected_profit_mode": {"optimize": True, "type": "choice", "choices": ["static", "dynamic"]},
+            "dynamic_scale": {"optimize": True, "min": 0.0, "max": 2.0, "step": 0.25, "type": "float"},
         },
         "fixed_settings": {"sizing_mode": "risk_atr"},
     },
