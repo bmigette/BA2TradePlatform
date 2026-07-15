@@ -64,7 +64,7 @@ import RobustnessDialog from '../components/RobustnessDialog';
 import RobustnessResults from '../components/RobustnessResults';
 import ResolvedRulesetView from '../components/ResolvedRulesetView';
 import type { BestParams } from '../lib/resolveRuleset';
-import { getRulesetVocabulary, importLiveEnterMarket, importLiveRuleset, convertLiveRuleset, listTasks, listBacktests, fetchOptSettingsExport, listExperts, optimizeBatch, listRunningOptimizations, fetchBacktestExport, listWorkers, rerunBacktest, getFitnessOptions, getYearlyBreakdown } from '../lib/btApi';
+import { getRulesetVocabulary, importLiveEnterMarket, importLiveRuleset, convertLiveRuleset, listTasks, listBacktests, fetchOptSettingsExport, listExperts, optimizeBatch, listRunningOptimizations, fetchBacktestExport, listWorkers, rerunBacktest, getFitnessOptions, getYearlyBreakdown, updateBacktest, runOptimizationIndividual } from '../lib/btApi';
 import type { ExpertInfo, OptimizeBatchJob, OptimizeBatchBody, RunningOpt, WorkerLite, FitnessMetricOption, FitnessOptions, YearlyBreakdownRow } from '../lib/btApi';
 import { RunningJobsPanel, RunningJobProgress } from '../components/RunningJobsPanel';
 import { OptimizationJobsTable, OptJobSettingsDetail } from '../components/OptimizationJobsTable';
@@ -251,6 +251,7 @@ interface Backtest {
   errorMessage: string | null;
   createdAt: string;
   completedAt: string | null;
+  labels?: string[] | null;
 }
 
 
@@ -742,6 +743,7 @@ const Backtesting: React.FC = () => {
   const [optProfitShareCapPct, setOptProfitShareCapPct] = useState(25);
   const [optFitnessTradeScale, setOptFitnessTradeScale] = useState(false);
   const [optFitnessTradeScaleCap, setOptFitnessTradeScaleCap] = useState(100);
+  const [optFitnessWinRateFactor, setOptFitnessWinRateFactor] = useState(false);
   // Metrics list actually rendered: prefer the backend catalog, fall back to the static list until
   // it loads (or if the fetch fails).
   const fitnessMetricList = fitnessOptions && fitnessOptions.length
@@ -788,6 +790,7 @@ const Backtesting: React.FC = () => {
         setOptProfitShareCapPct(opts.knobs.profit_share_cap_pct.default);
         setOptFitnessTradeScale(opts.knobs.fitness_trade_scale.default);
         setOptFitnessTradeScaleCap(opts.knobs.fitness_trade_scale_cap.default);
+        setOptFitnessWinRateFactor(opts.knobs.fitness_win_rate_factor.default);
       })
       .catch(() => setFitnessOptions([]));
   }, [showOptimizeDialog, showBatchDialog, fitnessOptions]);
@@ -893,6 +896,18 @@ const Backtesting: React.FC = () => {
           className="w-full px-2 py-1.5 text-sm border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 disabled:opacity-50 disabled:cursor-not-allowed"
         />
       </div>
+      <div>
+        <label className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300"
+          title="Scale fitness by 2 * win_rate_fraction (50% win = 1.0x break-even, 100% win = 2x, 0% win = 0x). Applies even to metrics that don't support trade-scale.">
+          <input
+            type="checkbox"
+            className="rounded"
+            checked={optFitnessWinRateFactor}
+            onChange={e => setOptFitnessWinRateFactor(e.target.checked)}
+          />
+          Scale fitness by win rate
+        </label>
+      </div>
     </div>
   );
 
@@ -919,6 +934,7 @@ const Backtesting: React.FC = () => {
         profit_share_cap_pct: optProfitShareCapPct,
         fitness_trade_scale: tradeScaleSupported ? optFitnessTradeScale : false,
         fitness_trade_scale_cap: optFitnessTradeScaleCap,
+        fitness_win_rate_factor: optFitnessWinRateFactor,
       };
       const body: OptimizeBatchBody = {
         experts: [...batchSelected],
@@ -1035,6 +1051,31 @@ const Backtesting: React.FC = () => {
   // Set when the clicked individual has no persisted full backtest (rank beyond the saved
   // top-N): the Individual Backtest tab shows this note + the individual's params instead.
   const [individualNoBacktest, setIndividualNoBacktest] = useState<OptIndividual | null>(null);
+  // Add/remove labels on any saved backtest (used to tag arbitrary History rows the same way the
+  // CLI grid driver auto-labels its TOP-N — e.g. "goal6"/"S1" — so they show up under the same
+  // ?label= filter regardless of how the backtest was created).
+  const [newLabelText, setNewLabelText] = useState('');
+  const addLabel = async (bt: Backtest, label: string) => {
+    const trimmed = label.trim();
+    if (!trimmed) return;
+    const next = Array.from(new Set([...(bt.labels ?? []), trimmed]));
+    try {
+      await updateBacktest(bt.id, { labels: next });
+      setSelectedBacktest(prev => (prev && prev.id === bt.id ? { ...prev, labels: next } : prev));
+      setNewLabelText('');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to add label');
+    }
+  };
+  const removeLabel = async (bt: Backtest, label: string) => {
+    const next = (bt.labels ?? []).filter(l => l !== label);
+    try {
+      await updateBacktest(bt.id, { labels: next });
+      setSelectedBacktest(prev => (prev && prev.id === bt.id ? { ...prev, labels: next } : prev));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to remove label');
+    }
+  };
   const [activeTab, setActiveTab] = useState<'equity' | 'drawdown' | 'trades' | 'strategy' | 'yearly'>('equity');
   // Yearly Breakdown tab: fetched lazily (only once the tab is opened) from the FULL
   // (non-downsampled) curves server-side — see app/services/backtest/results.py::yearly_breakdown.
@@ -1866,6 +1907,28 @@ const Backtesting: React.FC = () => {
     }
   };
 
+  // Launch a full backtest for an individual with no persisted top-N row (e.g. rank beyond the
+  // CLI's saved top-5, or ANY individual from a UI-launched job — task #43 means those never got
+  // a top-N persist at all). Creates + queues a new optimization-derived Backtest row; the
+  // existing pending/running poll (backtests state) picks up progress once it's in the list.
+  const [launchingIndividual, setLaunchingIndividual] = useState(false);
+  const runIndividualBacktest = async (ind: OptIndividual) => {
+    if (!selectedOptJob) return;
+    try {
+      setLaunchingIndividual(true);
+      setError(null);
+      const created = await runOptimizationIndividual(selectedOptJob.job.id, ind.rank);
+      const bt = created as unknown as Backtest;
+      setIndividualNoBacktest(null);
+      setBacktests(prev => [bt, ...prev]);
+      setSelectedBacktest(bt);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to launch backtest');
+    } finally {
+      setLaunchingIndividual(false);
+    }
+  };
+
   // Export the selected optimization JOB's settings as JSON. Prefer the backend export endpoint
   // (it carries the full static-universe symbol list); fall back to a client-side build from the
   // already-loaded job if the endpoint is unavailable. Browser download — no server file write.
@@ -2397,6 +2460,7 @@ const Backtesting: React.FC = () => {
         profit_share_cap_pct: optProfitShareCapPct,
         fitness_trade_scale: tradeScaleSupported ? optFitnessTradeScale : false,
         fitness_trade_scale_cap: optFitnessTradeScaleCap,
+        fitness_win_rate_factor: optFitnessWinRateFactor,
       };
       const backtestBlock: Record<string, unknown> = source === 'expert'
         ? {
@@ -2614,6 +2678,27 @@ const Backtesting: React.FC = () => {
                     </span>
                   )}
                 </div>
+              </div>
+              {/* Labels: add/remove tags on ANY saved backtest (works for CLI-grid rows and
+                  manually/individual-launched rows alike — GET /api/backtests?label=... filters
+                  on this same field). */}
+              <div className="flex items-center flex-wrap gap-1.5">
+                {(selectedBacktest.labels ?? []).map(l => (
+                  <span key={l} className="inline-flex items-center gap-1 px-2 py-0.5 text-xs font-medium rounded-full bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300">
+                    {l}
+                    <button type="button" onClick={() => removeLabel(selectedBacktest, l)} title={`Remove label "${l}"`}
+                      className="hover:text-red-600 dark:hover:text-red-400">
+                      <X className="w-3 h-3" />
+                    </button>
+                  </span>
+                ))}
+                <input
+                  type="text" value={newLabelText}
+                  onChange={e => setNewLabelText(e.target.value)}
+                  onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addLabel(selectedBacktest, newLabelText); } }}
+                  placeholder="+ add label"
+                  className="w-24 px-2 py-0.5 text-xs border border-dashed border-gray-300 dark:border-gray-600 rounded-full bg-transparent text-gray-700 dark:text-gray-300 placeholder-gray-400 focus:outline-none focus:border-blue-400"
+                />
               </div>
               {/* Open-positions note: total_trades counts CLOSED round-trips, so a buy-and-hold
                   (no exit rule) shows 0 trades while equity still moved (entry commission + the
@@ -4245,13 +4330,24 @@ const Backtesting: React.FC = () => {
                     <h4 className="text-sm font-semibold text-gray-900 dark:text-gray-100">
                       Individual #{individualNoBacktest.rank} params
                     </h4>
-                    <button
-                      type="button"
-                      onClick={() => exportIndividual(selectedOptJob.job, individualNoBacktest, selectedOptJob.detail)}
-                      className="flex items-center gap-1 px-2.5 py-1 text-xs font-medium border border-gray-300 dark:border-gray-600 rounded text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700"
-                    >
-                      <Download className="w-3.5 h-3.5" /> Export
-                    </button>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => runIndividualBacktest(individualNoBacktest)}
+                        disabled={launchingIndividual}
+                        title="Run a full backtest for this individual and save it as a Backtest"
+                        className="flex items-center gap-1 px-2.5 py-1 text-xs font-medium border border-blue-300 dark:border-blue-600 rounded text-blue-700 dark:text-blue-300 hover:bg-blue-50 dark:hover:bg-blue-900/30 disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        <Play className="w-3.5 h-3.5" /> {launchingIndividual ? 'Launching…' : 'Run backtest'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => exportIndividual(selectedOptJob.job, individualNoBacktest, selectedOptJob.detail)}
+                        className="flex items-center gap-1 px-2.5 py-1 text-xs font-medium border border-gray-300 dark:border-gray-600 rounded text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700"
+                      >
+                        <Download className="w-3.5 h-3.5" /> Export
+                      </button>
+                    </div>
                   </div>
                   <div className="grid grid-cols-2 gap-x-4 gap-y-1">
                     {Object.entries(individualNoBacktest.params ?? {}).map(([k, v]) => (

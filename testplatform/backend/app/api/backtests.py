@@ -617,7 +617,7 @@ async def update_backtest(
     update: dict,
     db: Session = Depends(get_db)
 ):
-    """Update backtest fields (description, name)."""
+    """Update backtest fields (description, name, labels)."""
     backtest = db.query(Backtest).filter(Backtest.id == backtest_id).first()
     if not backtest:
         raise HTTPException(status_code=404, detail=f"Backtest {backtest_id} not found")
@@ -626,6 +626,13 @@ async def update_backtest(
         backtest.description = update['description']
     if 'name' in update:
         backtest.name = update['name']
+    if 'labels' in update:
+        labels = update['labels']
+        if labels is not None and not (
+            isinstance(labels, list) and all(isinstance(t, str) for t in labels)
+        ):
+            raise HTTPException(status_code=400, detail="labels must be a list of strings (or null)")
+        backtest.labels = [t.strip() for t in labels if t.strip()] if labels else None
     db.commit()
     return {"status": "updated", "id": backtest_id}
 

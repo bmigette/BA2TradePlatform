@@ -20,6 +20,11 @@ async function jdelete<T>(path: string): Promise<T> {
   if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
   return r.json();
 }
+async function jpatch<T>(path: string, body: unknown): Promise<T> {
+  const r = await fetch(`${API_BASE}${path}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
+  return r.json();
+}
 
 export interface OhlcvBar { Date: string; Open: number; High: number; Low: number; Close: number; Volume?: number; }
 /** Daily (or any-interval) OHLCV bars for one symbol over [start,end] — feeds the trade-list chart. */
@@ -32,6 +37,18 @@ export const getOhlcvBars = (symbol: string, start: string, end: string, interva
  * queued task id on the dedicated re-run worker pool. */
 export const rerunBacktest = (id: number) =>
   jpost<{ status: string; task_id: string; backtest_id: number }>(`/backtests/${id}/rerun`, {});
+
+/** Update a saved backtest's editable fields (description/name/labels). Passing `labels: []` or
+ * `null` clears all labels. */
+export const updateBacktest = (id: number, update: { description?: string; name?: string; labels?: string[] | null }) =>
+  jpatch<{ status: string; id: number }>(`/backtests/${id}`, update);
+
+/** Launch a full backtest for the rank-th distinct-fitness individual (1-indexed) from an
+ * optimization's all_results — covers ANY evaluated individual, not just the persisted top-N.
+ * Creates + queues a new Backtest row (optimization-derived) and returns it (status starts
+ * "pending"; the existing pending/running poll picks up progress once added to the list). */
+export const runOptimizationIndividual = (optimizationId: number, rank: number) =>
+  jpost<Record<string, unknown>>(`/strategies/optimizations/${optimizationId}/individuals/${rank}/backtest`, {});
 
 export const listExperts = () => jget<{ experts: ExpertInfo[] }>('/experts').then(r => r.experts);
 export const getExpertSettings = (cls: string) => jget<{ definitions: Record<string, SettingDef> }>(`/experts/${cls}/settings-definitions`).then(r => r.definitions);
@@ -389,6 +406,7 @@ export interface FitnessKnobs {
   profit_share_cap_pct: FitnessKnobDef<number>;
   fitness_trade_scale: FitnessKnobDef<boolean>;
   fitness_trade_scale_cap: FitnessKnobDef<number>;
+  fitness_win_rate_factor: FitnessKnobDef<boolean>;
 }
 export interface FitnessOptions { metrics: FitnessMetricOption[]; knobs: FitnessKnobs; }
 export const getFitnessOptions = () =>

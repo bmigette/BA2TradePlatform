@@ -5,6 +5,7 @@ Manages trading strategies with entry/exit conditions.
 """
 
 import logging
+from datetime import datetime
 from typing import List, Optional
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
@@ -325,6 +326,87 @@ def get_optimization(opt_id: int, db: Session = Depends(get_db)):
     d = r.to_dict()
     d["topIndividuals"] = _top_individuals(r, n=15)
     return d
+
+
+@router.post("/optimizations/{opt_id}/individuals/{rank}/backtest")
+def run_optimization_individual(opt_id: int, rank: int, db: Session = Depends(get_db)):
+    """Launch a full backtest for the rank-th distinct-fitness individual from this
+    optimization's ``all_results`` (1-indexed, same ranking ``_top_individuals``/
+    ``_ranked_results`` use) — covers ANY evaluated individual, not just the CLI's
+    already-persisted top-N.
+
+    Creates a new, OPTIMIZATION-DERIVED ``Backtest`` row (``optimization_id`` set,
+    ``strategy_params`` = the individual's raw genes) and queues it on the dedicated re-run
+    queue: because the row is optimization-derived, ``handle_rerun_backtest`` rebuilds its exact
+    trial config via ``_build_optimization_rerun_config`` (decode_params + the parent
+    optimization's stored ``optimization_config``) — no new execution path needed, this reuses
+    the same machinery that already backs the "Re-run" button on persisted top-N rows.
+    """
+    from app.models.backtest import Backtest
+    from app.services.strategy_param_space import decode_params
+
+    opt = db.query(StrategyOptimization).filter(StrategyOptimization.id == opt_id).first()
+    if not opt:
+        raise HTTPException(status_code=404, detail=f"Optimization {opt_id} not found")
+    strat = db.query(Strategy).filter(Strategy.id == opt.strategy_id).first()
+    if not strat:
+        raise HTTPException(status_code=404, detail=f"Strategy {opt.strategy_id} not found")
+    cfg = opt.optimization_config or {}
+    bt_block = cfg.get("backtest")
+    if not bt_block:
+        raise HTTPException(status_code=400, detail=f"optimization {opt_id} has no backtest config")
+
+    ranked = _ranked_results(opt)
+    if rank < 1 or rank > len(ranked):
+        raise HTTPException(
+            status_code=404,
+            detail=f"rank {rank} out of range (optimization {opt_id} has {len(ranked)} distinct individuals)",
+        )
+    params = ranked[rank - 1].get("params") or {}
+
+    experts = bt_block.get("experts") or []
+    expert_name = experts[0].get("class") if experts and isinstance(experts[0], dict) else None
+
+    # entryRules/exitRules are DISPLAY-only extras (the concrete decoded ruleset, mirroring
+    # _persist_top_backtests) — the rerun handler re-decodes from the raw genes itself, so a
+    # decode failure here must not block queuing the run.
+    strategy_params = dict(params)
+    try:
+        decoded = decode_params(strat, params)
+        if decoded.get("entry_rules") is not None:
+            strategy_params["entryRules"] = decoded["entry_rules"]
+        if decoded.get("exit_rules") is not None:
+            strategy_params["exitRules"] = decoded["exit_rules"]
+    except Exception:  # noqa: BLE001
+        pass
+
+    bt = Backtest(
+        name=f"IND{rank}-{opt.name or expert_name or 'opt'}",
+        model_id=None,
+        engine_type="daily_expert",
+        expert_name=expert_name,
+        optimization_id=opt_id,
+        strategy_params=strategy_params,
+        start_date=datetime.fromisoformat(str(bt_block["start_date"])),
+        end_date=datetime.fromisoformat(str(bt_block["end_date"])),
+        initial_capital=float(bt_block["initial_capital"]),
+        status="pending",
+    )
+    db.add(bt)
+    db.commit()
+    db.refresh(bt)
+
+    from app.services.task_queue import get_rerun_task_queue
+    task_id = get_rerun_task_queue().queue_task(
+        task_type="rerun_backtest",
+        name=f"Run individual: {bt.name}",
+        payload={"backtest_id": bt.id},
+    )
+    logger.info(
+        f"Queued individual-backtest run for optimization {opt_id} rank {rank} "
+        f"(backtest {bt.id}, task {task_id})"
+    )
+    return {"task_id": task_id, "backtest_id": bt.id, **bt.to_dict()}
 
 
 @router.get("/optimizations/{opt_id}/export")
@@ -690,10 +772,11 @@ def _merge_screener_opt(cfg: dict, screener_opt: dict) -> None:
         cfg["expert_params"] = expert_params
 
 
-def _top_individuals(row, n: int = 8) -> list:
-    """Top-N distinct (by fitness) evaluated individuals from a (running) optimization's
-    all_results, best first. Each entry carries its fitness + trade count (all_results stores a
-    trade COUNT per trial, not the full trade list — full backtests are the persisted top-N)."""
+def _ranked_results(row) -> list:
+    """ALL distinct-fitness evaluated individuals from a (running) optimization's all_results,
+    best first, uncapped (dedup only — no N cutoff). Shared by ``_top_individuals`` (UI display,
+    capped) and the run-individual-backtest route (needs to index an arbitrary rank, not just the
+    display-capped top-N)."""
     results = row.all_results or []
     seen, uniq = set(), []
     for e in sorted(results,
@@ -704,12 +787,17 @@ def _top_individuals(row, n: int = 8) -> list:
             continue
         seen.add(f)
         uniq.append(e)
-        if len(uniq) >= n:
-            break
+    return uniq
+
+
+def _top_individuals(row, n: int = 8) -> list:
+    """Top-N distinct (by fitness) evaluated individuals from a (running) optimization's
+    all_results, best first. Each entry carries its fitness + trade count (all_results stores a
+    trade COUNT per trial, not the full trade list — full backtests are the persisted top-N)."""
     return [
         {"rank": i + 1, "fitness": e.get("fitness"), "nTrades": e.get("trades"),
          "params": e.get("params")}
-        for i, e in enumerate(uniq)
+        for i, e in enumerate(_ranked_results(row)[:n])
     ]
 
 
