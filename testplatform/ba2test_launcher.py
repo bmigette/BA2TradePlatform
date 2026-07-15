@@ -31,6 +31,17 @@ import sys
 from datetime import datetime
 
 
+def _parse_symbols_arg(raw: str) -> list:
+    """Comma list or ``@file`` (one symbol per line) — the idiom ``fetch-options``
+    already uses for its ``--underlyings`` flag, extended to ``fetch-cache``/
+    ``prewarm``'s ``--symbols`` so a large pinned universe file (e.g.
+    ``tools/senate_universe.txt``, 498 symbols) doesn't need a giant comma line."""
+    if raw.startswith("@"):
+        with open(raw[1:], encoding="utf-8") as f:
+            return [s.strip().upper() for s in f.read().split() if s.strip()]
+    return [s.strip().upper() for s in raw.split(",") if s.strip()]
+
+
 def _enter_backend() -> str:
     """Put ``backend/`` on the path and chdir into it (the app's import + cwd root)."""
     repo_root = os.path.dirname(os.path.abspath(__file__))
@@ -156,7 +167,7 @@ def _cmd_fetch_cache(args) -> int:
     total concurrency stays ~= workers x chunk."""
     from app.services.ohlcv_cache_handler import handle_ohlcv_cache_fetch
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    symbols = _parse_symbols_arg(args.symbols)
     timeframes = [t.strip() for t in args.timeframes.split(",") if t.strip()]
     overall = {"fetched": [], "failed": []}
     n_workers = max(1, int(args.workers))
@@ -218,7 +229,7 @@ def _cmd_prewarm(args) -> int:
     except Exception:  # noqa: BLE001
         finnhub_key = os.getenv("FINNHUB_API_KEY")
 
-    symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    symbols = _parse_symbols_arg(args.symbols)
     experts = [e.strip() for e in args.experts.split(",") if e.strip()]
     if not symbols:
         sys.exit("ba2-test prewarm: --symbols is empty.")
@@ -2617,7 +2628,7 @@ def main(argv: "list | None" = None) -> int:
                    add_help=False)
 
     fc = sub.add_parser("fetch-cache", help="Populate the as-of OHLCV cache.")
-    fc.add_argument("--symbols", required=True, help="Comma-separated symbols.")
+    fc.add_argument("--symbols", required=True, help="Comma-separated symbols, or @file.")
     fc.add_argument("--timeframes", default="1d", help="Comma-separated intervals (default 1d).")
     fc.add_argument("--start", required=True, help="ISO start date.")
     fc.add_argument("--end", required=True, help="ISO end date.")
@@ -2627,7 +2638,7 @@ def main(argv: "list | None" = None) -> int:
     pw = sub.add_parser("prewarm",
                         help="Pre-build the per-symbol FMP history disk cache for the grid experts "
                              "(ratings/earnings/insider) before the GA pool spawns.")
-    pw.add_argument("--symbols", required=True, help="Comma-separated symbols.")
+    pw.add_argument("--symbols", required=True, help="Comma-separated symbols, or @file.")
     pw.add_argument("--experts", default="FMPRating,FMPEarningsDrift,FMPInsiderClusterBuy",
                     help="Comma-separated experts to pre-warm. Supported: FMPRating, "
                          "FMPEarningsDrift, FMPInsiderClusterBuy, FactorRanker, "
