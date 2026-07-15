@@ -32,11 +32,6 @@ _PLACEHOLDER_UNIVERSE = ("AAPL,MSFT,NVDA,AMZN,META,GOOGL,AVGO,TSLA,COST,NFLX,AMD
                          "INTC,QCOM,INTU,AMAT,TXN,AMGN,ISRG,BKNG,HON,VRTX,ADP,SBUX,GILD,MU,LRCX")
 _CLASSIC = ["FMPRating", "FMPEarningsDrift", "FMPInsiderClusterBuy"]
 _RANKER = "FactorRanker"
-# Experts with NO cap-band concept at all (Senate disclosures are sparse across the whole market,
-# so splitting into large/mid/small would starve each band of signal) -- these get exactly ONE
-# job per strategy, run WITHOUT --screener-cap-band (unrestricted market-cap universe), regardless
-# of how many --bands were requested.
-_UNIFIED = ["FMPSenateTraderWeight"]
 # Experts with no usable data in the large-cap band (skipped on `large` unless --include-no-data).
 _NO_LARGE_CAP = {"FMPEarningsDrift", "FMPInsiderClusterBuy"}
 # Strategies restricted to experts producing a REAL, updating analyst price target. S4 (which
@@ -93,10 +88,8 @@ def _jobs(bands, strategies, include_no_data, skip_experts=frozenset(), name_suf
 
     ORDER: FMPRating runs across ALL bands FIRST (large -> mid -> small), so its full optimization
     completes before any other expert starts; then the remaining classic experts + FactorRanker run
-    band-by-band; finally the _UNIFIED experts (no cap-band concept) run ONCE per strategy, with
-    band=None (no --screener-cap-band passed at all -- unrestricted market-cap universe), regardless
-    of how many --bands were requested. (FMPRating is the most general rating expert, so prioritising
-    it surfaces its results first.)"""
+    band-by-band. (FMPRating is the most general rating expert, so prioritising it surfaces its
+    results first.)"""
     def _eligible(band, expert):
         if expert in skip_experts:
             return False
@@ -122,14 +115,6 @@ def _jobs(bands, strategies, include_no_data, skip_experts=frozenset(), name_suf
                 yield (f"scr-{band}-{expert}-{s}{name_suffix}", expert, s, band)
         if _RANKER not in skip_experts:
             yield (f"scr-{band}-{_RANKER}{name_suffix}", _RANKER, None, band)  # bypass: one job per band
-    # 3) UNIFIED experts: exactly one job per strategy, no band split at all.
-    for expert in _UNIFIED:
-        if expert in skip_experts:
-            continue
-        for s in strategies:
-            if s in _TARGET_PRICE_STRATEGIES and expert not in _TARGET_PRICE_EXPERTS:
-                continue
-            yield (f"scr-all-{expert}-{s}{name_suffix}", expert, s, None)
 
 
 def main() -> int:
@@ -204,7 +189,7 @@ def main() -> int:
           f"{sum(1 for j in jobs if j[0] in done)} already completed.")
     if args.dry_run:
         for nm, exp, s, band in jobs:
-            print(f"  {'DONE' if nm in done else 'TODO'}  {nm}  ({exp} {s or '(bypass)'} / {band or 'unified-no-band'})")
+            print(f"  {'DONE' if nm in done else 'TODO'}  {nm}  ({exp} {s or '(bypass)'} / {band})")
         return 0
 
     for i, (name, expert, strat, band) in enumerate(jobs, 1):
@@ -225,7 +210,7 @@ def main() -> int:
             population = budget.get("population", population)
             generations = budget.get("generations", generations)
         cmd = [exe, "optimize", "--expert", expert, "--universe", _PLACEHOLDER_UNIVERSE,
-               "--screener", "--screener-store", args.store,
+               "--screener", "--screener-store", args.store, "--screener-cap-band", band,
                "--start", args.start, "--end", args.end, "--fitness", args.fitness,
                "--interval", args.interval, "--population", str(population),
                "--generations", str(generations), "--screener-cadence-days", str(args.cadence_days),
@@ -236,8 +221,6 @@ def main() -> int:
                # fast-decaying signal like FMPEarningsDrift discovers its own best cadence instead
                # of a hand-picked "monday,thursday" pin.
                "--run-schedule", "weekly", "--name", name, "--parallel", str(args.parallel)]
-        if band is not None:
-            cmd += ["--screener-cap-band", band]
         if args.mutation_prob is not None:
             cmd += ["--mutation-prob", str(args.mutation_prob)]
         if args.profit_cap_pct and args.profit_cap_pct > 0:
