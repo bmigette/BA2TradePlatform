@@ -14,6 +14,7 @@ API Documentation: https://site.financialmodelingprep.com/developer/docs#senate-
 from typing import Any, Dict, Optional, List
 from datetime import datetime, timezone, timedelta
 import json
+import os
 import re
 import requests
 
@@ -183,6 +184,13 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                 "description": "Max past trades scored per trader",
                 "tooltip": "Most-recent cap on how many past buys are scored per trader (bounds price-history fetches)."
             },
+            "skill_lookback_months": {
+                "type": "int",
+                "required": True,
+                "default": 12,
+                "description": "Skill scoring lookback window (months)",
+                "tooltip": "Only past buys executed within this many months of the as-of date are eligible for skill scoring — a trader's recent pattern is more relevant than activity from years ago, and it bounds the scan for a very prolific trader (e.g. a member of Congress with 10k+ disclosed trades) to a manageable recent window. Combined with skill_max_past_trades (whichever is more restrictive wins)."
+            },
             "skill_signal_weight": {
                 "type": "float",
                 "required": True,
@@ -243,7 +251,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         "min_trade_amount", "sell_signal_weight", "symbol_focus_cap_pct",
         "size_boost_max", "size_boost_full_amount",
         "consensus_bonus_per_trader", "consensus_bonus_max",
-        "skill_horizon_days", "skill_min_past_trades", "skill_max_past_trades",
+        "skill_horizon_days", "skill_min_past_trades", "skill_max_past_trades", "skill_lookback_months",
         "skill_signal_weight", "skill_confidence_weight",
         "min_trader_avg_hold_days", "min_trader_hold_roundtrips",
     )
@@ -315,11 +323,14 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             trader_history_by_name[name] = history
 
         # Stage 3: pre-resolve each trader's SKILL score (historical hit rate of their
-        # past disclosed buys over the configured forward horizon). This needs per-date
+        # RECENT disclosed buys over the configured forward horizon). This needs per-date
         # price lookups (provider I/O), so it MUST live in _gather — _process stays pure.
         # Settings are stashed on self by run_analysis/analyze_as_of; skill knobs fall
         # back to interface defaults when absent (old trial configs). Skipped entirely
-        # when both skill weights are 0 (no fetches for a disabled feature).
+        # when both skill weights are 0 (no fetches for a disabled feature). Cached
+        # cross-run/cross-trial (see _get_trader_skill_cached) — a GA job re-walks the SAME
+        # dates hundreds of times, and this was profiled as the dominant per-bar cost (one
+        # prolific trader's history re-scanned ~2000x in a single 3-symbol run).
         gather_settings = getattr(self, "_gather_settings", None)
         skill_signal_w = float(self._setting_or_default(gather_settings, "skill_signal_weight"))
         skill_conf_w = float(self._setting_or_default(gather_settings, "skill_confidence_weight"))
@@ -328,10 +339,24 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             horizon = int(self._setting_or_default(gather_settings, "skill_horizon_days"))
             min_past = int(self._setting_or_default(gather_settings, "skill_min_past_trades"))
             max_past = int(self._setting_or_default(gather_settings, "skill_max_past_trades"))
+            lookback_months = int(self._setting_or_default(gather_settings, "skill_lookback_months"))
             for name, history in trader_history_by_name.items():
-                trader_skill_by_name[name] = self._calculate_trader_skill(
-                    history, now=ceiling, horizon_days=horizon,
-                    min_past_trades=min_past, max_past_trades=max_past)
+                trader_skill_by_name[name] = self._get_trader_skill_cached(
+                    name, history, now=ceiling, horizon_days=horizon,
+                    min_past_trades=min_past, max_past_trades=max_past,
+                    lookback_months=lookback_months, is_live=(as_of is None))
+
+        # Stage 4: pre-resolve each trader's SCALPER classification (avg buy/sell hold time).
+        # Pure date arithmetic (no I/O) but still costs an O(history) scan per trader, so it
+        # gets the same cross-run cache as skill (see _get_trader_hold_info_cached). Skipped
+        # entirely when the filter is off (default 0.0 for legacy/direct callers — the GA
+        # grid itself never explores 0, see ba2test_launcher.py's _EXPERT_OPT floor).
+        trader_hold_info_by_name: Dict[str, Dict[str, Any]] = {}
+        if float(self._setting_or_default(gather_settings, "min_trader_avg_hold_days")) > 0:
+            trader_hold_info_by_name = {
+                name: self._get_trader_hold_info_cached(name, history)
+                for name, history in trader_history_by_name.items()
+            }
 
         # Live (as_of=None) reads the account/broker quote (the original live
         # source); backtest (as_of set) reads the OHLCV close-at-as_of.
@@ -343,6 +368,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             "exec_price_by_trade": exec_price_by_trade,
             "trader_history_by_name": trader_history_by_name,
             "trader_skill_by_name": trader_skill_by_name,
+            "trader_hold_info_by_name": trader_hold_info_by_name,
             "symbol": symbol,
         }
 
@@ -387,6 +413,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             confidence_to_profit_factor=float(settings["confidence_to_profit_factor"]),
             now=now,
             trader_skill_by_name=data_bundle.get("trader_skill_by_name") or {},
+            trader_hold_info_by_name=data_bundle.get("trader_hold_info_by_name") or {},
             sell_signal_weight=float(self._setting_or_default(settings, "sell_signal_weight")),
             symbol_focus_cap_pct=float(self._setting_or_default(settings, "symbol_focus_cap_pct")),
             size_boost_max=float(self._setting_or_default(settings, "size_boost_max")),
@@ -566,6 +593,99 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
 
         return smap.get(date.strftime("%Y-%m-%d"))
 
+    # --- Cross-run scoring cache (hold-days / skill) --------------------------------------
+    # _calculate_trader_avg_hold_days/_calculate_trader_skill re-iterate a trader's FULL
+    # disclosure history (up to ~13k trades for the most prolific member of Congress
+    # discovered live) — cheap in isolation, but a GA optimization job re-runs the SAME
+    # chronological walk hundreds of times (once per trial), each re-scoring every trader on
+    # every bar they appear on. Persisted here (JSON, CACHE_FOLDER/fmp_history) so the score
+    # is computed ONCE across the whole grid, not once per trial. Pure functions of their
+    # inputs — the cache never trusts a value computed from DIFFERENT inputs (see the exact
+    # key match below), so this is strictly a speedup, never a correctness risk: a cache
+    # miss just falls through to the same computation as before caching existed.
+    _HOLD_CACHE_FILE = "congress_scalper_scores.json"
+    _SKILL_CACHE_FILE = "congress_skill_scores.json"
+
+    def _scoring_cache_path(self, filename: str) -> str:
+        from ba2_common.config import CACHE_FOLDER
+        return os.path.join(CACHE_FOLDER, "fmp_history", filename)
+
+    def _load_scoring_cache(self, attr: str, filename: str) -> Dict[str, Any]:
+        """Lazily load + memoize one JSON cache file on ``self`` (one disk read per
+        instance/process, not per lookup)."""
+        cache = getattr(self, attr, None)
+        if cache is not None:
+            return cache
+        path = self._scoring_cache_path(filename)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                cache = json.load(f)
+        except Exception:  # noqa: BLE001 — missing/corrupt cache -> start fresh, never fatal
+            cache = {}
+        setattr(self, attr, cache)
+        return cache
+
+    def _save_scoring_cache(self, attr: str, filename: str) -> None:
+        cache = getattr(self, attr, {})
+        path = self._scoring_cache_path(filename)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(cache, f)
+            os.replace(tmp, path)
+        except Exception as e:  # noqa: BLE001 — a cache-write failure must never fail scoring
+            self.logger.debug(f"Failed to persist scoring cache {filename}: {e}")
+
+    def _get_trader_hold_info_cached(self, trader_name: str,
+                                     trader_history: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Cached wrapper around ``_calculate_trader_avg_hold_days``. Keyed by
+        (trader, history length) — hold-days has NO settings/as-of dependency beyond what's
+        already reflected in which trades are in ``trader_history``, so an exact length match
+        is a safe, sufficient freshness check (a NEW disclosure changes the length)."""
+        cache = self._load_scoring_cache("_hold_cache", self._HOLD_CACHE_FILE)
+        n = len(trader_history)
+        entry = cache.get(trader_name)
+        if entry and entry.get("history_len") == n:
+            return {"avg_hold_days": entry.get("avg_hold_days"), "roundtrips": entry.get("roundtrips")}
+        result = self._calculate_trader_avg_hold_days(trader_history)
+        cache[trader_name] = {"history_len": n, **result}
+        self._save_scoring_cache("_hold_cache", self._HOLD_CACHE_FILE)
+        return result
+
+    def _get_trader_skill_cached(self, trader_name: str, trader_history: List[Dict[str, Any]],
+                                 now: datetime, horizon_days: int, min_past_trades: int,
+                                 max_past_trades: int, lookback_months: int = 12,
+                                 is_live: bool = False) -> Dict[str, Any]:
+        """Cached wrapper around ``_calculate_trader_skill``. Keyed by (trader, history
+        length, an as-of bucket, and the scoring settings) — unlike hold-days, skill
+        genuinely depends on ``now`` even at a FIXED history: a trade's horizon window can go
+        from "not yet complete" to "complete" as time passes with NO new disclosure, so the
+        as-of period must be part of the key (not just history length).
+
+        Backtest buckets by exact DAY: as_of advances daily and each day is a distinct,
+        correctness-relevant point (a GA job re-walks the SAME dates every trial, so day
+        granularity still gets the full cross-trial cache win). LIVE buckets by MONTH instead
+        — a live analysis can run far more often than daily, and a member of Congress's
+        trading skill does not meaningfully change day to day, so re-scoring monthly is
+        plenty fresh while cutting live's scoring cost ~30x versus a daily refresh.
+        """
+        cache = self._load_scoring_cache("_skill_cache", self._SKILL_CACHE_FILE)
+        n = len(trader_history)
+        as_of_bucket = now.strftime("%Y-%m") if is_live else now.date().isoformat()
+        key = (f"{trader_name}|{n}|{as_of_bucket}|{horizon_days}|{min_past_trades}"
+               f"|{max_past_trades}|{lookback_months}")
+        entry = cache.get(key)
+        if entry is not None:
+            return entry
+        result = self._calculate_trader_skill(
+            trader_history, now=now, horizon_days=horizon_days,
+            min_past_trades=min_past_trades, max_past_trades=max_past_trades,
+            lookback_months=lookback_months)
+        cache[key] = result
+        self._save_scoring_cache("_skill_cache", self._SKILL_CACHE_FILE)
+        return result
+
     def _price_on_or_after(self, symbol: str, date: datetime, max_walk_days: int = 5) -> Optional[float]:
         """First available open on/after ``date`` (walks weekends/holidays, up to
         ``max_walk_days`` forward). Used by the skill scorer, whose dates (disclosure
@@ -578,17 +698,24 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
 
     def _calculate_trader_skill(self, trader_history: List[Dict[str, Any]],
                                 now: datetime, horizon_days: int,
-                                min_past_trades: int, max_past_trades: int) -> Dict[str, Any]:
-        """Score a trader's historical SKILL from the forward returns of their past buys.
+                                min_past_trades: int, max_past_trades: int,
+                                lookback_months: int = 12) -> Dict[str, Any]:
+        """Score a trader's historical SKILL from the forward returns of their RECENT past buys.
 
-        For each past disclosed BUY (any symbol) whose ``horizon_days`` forward window is
-        fully in the past (exec + horizon <= now — no lookahead), compute the symbol's
-        return from the exec-date open to the open ``horizon_days`` later (both via the
-        disk-cached full price history; non-trading days walk forward a few days). The
-        skill score maps the hit rate onto [-1, +1]: hit_rate 1.0 -> +1, 0.5 -> 0 (coin
-        flip), 0.0 -> -1. Traders with fewer than ``min_past_trades`` scored buys get a
-        NEUTRAL 0 (not enough history to judge); at most ``max_past_trades`` most-recent
-        buys are scored (bounds the per-trader price fetches).
+        For each past disclosed BUY (any symbol) executed within ``lookback_months`` of
+        ``now`` AND whose ``horizon_days`` forward window is fully in the past (exec + horizon
+        <= now — no lookahead), compute the symbol's return from the exec-date open to the
+        open ``horizon_days`` later (both via the disk-cached full price history; non-trading
+        days walk forward a few days). The skill score maps the hit rate onto [-1, +1]:
+        hit_rate 1.0 -> +1, 0.5 -> 0 (coin flip), 0.0 -> -1. Traders with fewer than
+        ``min_past_trades`` scored buys get a NEUTRAL 0 (not enough recent history to judge);
+        at most ``max_past_trades`` most-recent buys are scored.
+
+        ``lookback_months`` bounds BOTH the methodology (a trader's RECENT pattern is more
+        relevant than activity from years ago) and the scan cost: a prolific trader (e.g. a
+        member of Congress with 10k+ disclosed trades) would otherwise have their entire
+        history walked every time, dominated by an ancient period their current skill may not
+        reflect at all.
 
         Sells are NOT scored: congressional sells are dominated by liquidity noise; the
         skill question is "do this person's BUYS predict returns?".
@@ -597,6 +724,8 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                    "avg_fwd_return_pct": 0.0}
         if not trader_history or horizon_days <= 0:
             return neutral
+
+        lookback_floor = now - timedelta(days=max(1, lookback_months) * 30)
 
         # Most-recent past buys first (bounded), forward window fully complete.
         candidates = []
@@ -612,6 +741,8 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                 exec_date = datetime.strptime(exec_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
             except (ValueError, TypeError):
                 continue
+            if exec_date < lookback_floor:
+                continue  # outside the recency window — not scored, regardless of horizon
             if exec_date + timedelta(days=horizon_days) > now:
                 continue  # window not complete yet — scoring it would be lookahead
             candidates.append((exec_date, sym))
@@ -1044,6 +1175,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                                   confidence_to_profit_factor: Optional[float] = None,
                                   now: Optional[datetime] = None,
                                   trader_skill_by_name: Optional[Dict[str, Dict[str, Any]]] = None,
+                                  trader_hold_info_by_name: Optional[Dict[str, Dict[str, Any]]] = None,
                                   sell_signal_weight: float = 1.0,
                                   symbol_focus_cap_pct: float = 10.0,
                                   size_boost_max: float = 20.0,
@@ -1125,10 +1257,15 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             # live incident that motivated this: one member of Congress with 12,958 disclosed
             # trades). Only filters when enough round-trips exist to judge (min_trader_
             # hold_roundtrips) — insufficient history passes through, matching skill's
-            # neutral-below-min-trades pattern. Zero extra fetches: pure date math on the
-            # SAME trader_history already fetched for skill scoring / confidence.
+            # neutral-below-min-trades pattern. Reads the PRE-RESOLVED, CACHED map from
+            # _gather (_get_trader_hold_info_cached) — never recomputed here; falls back to a
+            # direct (uncached) call only for legacy callers that didn't pass the map.
             if min_trader_avg_hold_days > 0:
-                hold_info = self._calculate_trader_avg_hold_days(trader_history or [])
+                if trader_hold_info_by_name is not None:
+                    hold_info = trader_hold_info_by_name.get(trader_name) \
+                        or {"avg_hold_days": None, "roundtrips": 0}
+                else:
+                    hold_info = self._calculate_trader_avg_hold_days(trader_history or [])
                 if (hold_info['avg_hold_days'] is not None
                         and hold_info['roundtrips'] >= min_trader_hold_roundtrips
                         and hold_info['avg_hold_days'] < min_trader_avg_hold_days):

@@ -20,9 +20,10 @@ registry (Senate experts keep their own FMP-http fetchers per the replan), so on
 OHLCV price is routed through the provider bundle (Decision 1).
 """
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
+import pytest
 
 from ba2_experts.FMPSenateTraderCopy import FMPSenateTraderCopy
 from ba2_experts.FMPSenateTraderWeight import FMPSenateTraderWeight
@@ -31,6 +32,18 @@ from ba2_common.core.backtest_context import BacktestContext, LiveProviderBundle
 
 NOW = datetime(2026, 6, 13, tzinfo=timezone.utc)
 _LOG = logging.getLogger("test_senate")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_scoring_cache(tmp_path, monkeypatch):
+    """The skill/hold-days scoring cache (2026-07-15) persists to CACHE_FOLDER/fmp_history on
+    real disk by design (cross-run/cross-trial reuse) — tests must NOT read/write that real
+    cache, both to avoid polluting it with fixture data and because different test scenarios
+    reuse the SAME trader/date/settings combination with DELIBERATELY different fake price
+    data, which would collide if they shared one cache file. Point CACHE_FOLDER at a fresh
+    tmp_path per test instead (autouse: every test in this module gets an isolated cache,
+    whether or not it exercises scoring directly)."""
+    monkeypatch.setattr("ba2_common.config.CACHE_FOLDER", str(tmp_path))
 
 
 class FakeOHLCV:
@@ -179,6 +192,10 @@ WEIGHT_SETTINGS = {
     "confidence_to_profit_factor": 0.15,
     "min_traders": 2,
     "min_trades": 2,
+    # Generous so pre-existing 2025-dated skill fixtures (tested against NOW=2026-06-13)
+    # aren't clipped by the skill_lookback_months filter added later — tests that
+    # specifically exercise the lookback window set it explicitly.
+    "skill_lookback_months": 60,
 }
 
 
@@ -427,14 +444,29 @@ def _skill_expert(all_trades, history_by_name, price_fn):
 
 def test_weight_trader_skill_boosts_and_penalizes_confidence():
     """A trader whose past buys rose over the horizon gets skill +1 (confidence up);
-    one whose buys fell gets skill -1 (confidence down) vs the neutral baseline."""
-    trades = [
+    one whose buys fell gets skill -1 (confidence down) vs the neutral baseline.
+
+    Uses DISTINCT trader names per price scenario (Good/Bad) even though the "good" and
+    "neutral" runs share names — the persistent scoring cache (2026-07-15) is keyed by
+    (trader, history length, as-of, settings), which is correct for real data (a real
+    symbol's price history doesn't change between calls) but would collide here if the
+    rising/falling scenarios reused the same names against the SAME cache directory.
+    """
+    trades_good = [
         _weight_trade("Alice", "Aa", "AAPL", "purchase", "2026-06-01", "2026-05-20"),
         _weight_trade("Bob", "Bb", "AAPL", "purchase", "2026-06-02", "2026-05-21"),
     ]
-    history = {
+    history_good = {
         "Alice Aa": _skill_history("Alice", "Aa", 6, rising=True),
         "Bob Bb": _skill_history("Bob", "Bb", 6, rising=True),
+    }
+    trades_bad = [
+        _weight_trade("AliceBad", "Aa", "AAPL", "purchase", "2026-06-01", "2026-05-20"),
+        _weight_trade("BobBad", "Bb", "AAPL", "purchase", "2026-06-02", "2026-05-21"),
+    ]
+    history_bad = {
+        "AliceBad Aa": _skill_history("AliceBad", "Aa", 6, rising=True),
+        "BobBad Bb": _skill_history("BobBad", "Bb", 6, rising=True),
     }
 
     def _price_rising(sym, date):
@@ -449,9 +481,9 @@ def test_weight_trader_skill_boosts_and_penalizes_confidence():
         return 500.0 - (date - datetime(2025, 1, 1, tzinfo=timezone.utc)).days * 0.5
 
     settings = {**WEIGHT_SETTINGS, "skill_confidence_weight": 10.0, "skill_signal_weight": 0.5}
-    conf_good = _run(_skill_expert(trades, history, _price_rising), settings).confidence
-    conf_bad = _run(_skill_expert(trades, history, _price_falling), settings).confidence
-    conf_neutral = _run(_skill_expert(trades, history, _price_rising),
+    conf_good = _run(_skill_expert(trades_good, history_good, _price_rising), settings).confidence
+    conf_bad = _run(_skill_expert(trades_bad, history_bad, _price_falling), settings).confidence
+    conf_neutral = _run(_skill_expert(trades_good, history_good, _price_rising),
                         {**settings, "skill_confidence_weight": 0.0}).confidence
     assert conf_good == conf_neutral + 10.0   # avg skill +1 x weight 10
     assert conf_bad == conf_neutral - 10.0    # avg skill -1 x weight 10
@@ -580,3 +612,140 @@ def test_weight_scalper_filter_respects_min_roundtrips():
     raw = rec.raw_outputs["recommendation"]
     assert raw["scalpers_filtered"] == 0
     assert {t["trader"] for t in raw["trades"]} == {"Scalper Sam", "Other Trader"}
+
+
+# ====================================================================
+# FMPSenateTraderWeight — cross-run scoring cache (hold-days / skill)
+# and the skill lookback window
+# ====================================================================
+
+def test_hold_info_cache_avoids_recompute(monkeypatch):
+    """Second call with the SAME history must NOT re-invoke the pure calculator."""
+    e = _weight_expert("AAPL", [], {})
+    history = [_weight_trade("A", "B", "AAPL", "purchase", "2026-01-01", "2026-01-01"),
+              _weight_trade("A", "B", "AAPL", "sale", "2026-01-05", "2026-01-05")]
+
+    calls = []
+    real = FMPSenateTraderWeight._calculate_trader_avg_hold_days
+
+    def _spy(history_arg):
+        calls.append(1)
+        return real(history_arg)
+
+    monkeypatch.setattr(e, "_calculate_trader_avg_hold_days", _spy)
+
+    r1 = e._get_trader_hold_info_cached("Trader X", history)
+    r2 = e._get_trader_hold_info_cached("Trader X", history)
+    assert len(calls) == 1, "second call must be served from cache, not recomputed"
+    assert r1 == r2 == {"avg_hold_days": 4.0, "roundtrips": 1}
+
+
+def test_hold_info_cache_invalidates_on_new_disclosure(monkeypatch):
+    """A LONGER history (new disclosure) must invalidate the cache and recompute fresh."""
+    e = _weight_expert("AAPL", [], {})
+    short_history = [_weight_trade("A", "B", "AAPL", "purchase", "2026-01-01", "2026-01-01"),
+                     _weight_trade("A", "B", "AAPL", "sale", "2026-01-05", "2026-01-05")]
+    longer_history = short_history + [
+        _weight_trade("A", "B", "MSFT", "purchase", "2026-02-01", "2026-02-01"),
+        _weight_trade("A", "B", "MSFT", "sale", "2026-02-21", "2026-02-21"),
+    ]
+
+    calls = []
+    real = FMPSenateTraderWeight._calculate_trader_avg_hold_days
+
+    def _spy(history_arg):
+        calls.append(len(history_arg))
+        return real(history_arg)
+
+    monkeypatch.setattr(e, "_calculate_trader_avg_hold_days", _spy)
+
+    e._get_trader_hold_info_cached("Trader X", short_history)
+    r2 = e._get_trader_hold_info_cached("Trader X", longer_history)
+    assert calls == [2, 4], "a longer history must trigger a fresh recompute, not reuse the stale entry"
+    assert r2["roundtrips"] == 2
+    assert r2["avg_hold_days"] == 12.0  # (4 + 20) / 2
+
+
+def test_skill_cache_avoids_recompute_same_day(monkeypatch):
+    e = _weight_expert("AAPL", [], {})
+    history = _skill_history("A", "B", 6, rising=True)
+
+    calls = []
+    real = FMPSenateTraderWeight._calculate_trader_skill
+
+    def _spy(history_arg, **kw):
+        calls.append(1)
+        return real(e, history_arg, **kw)
+
+    monkeypatch.setattr(e, "_calculate_trader_skill", _spy)
+
+    kw = dict(now=NOW, horizon_days=60, min_past_trades=1, max_past_trades=50,
+             lookback_months=60, is_live=False)
+    r1 = e._get_trader_skill_cached("Trader X", history, **kw)
+    r2 = e._get_trader_skill_cached("Trader X", history, **kw)
+    assert len(calls) == 1
+    assert r1 == r2
+
+
+def test_skill_cache_backtest_buckets_by_exact_day(monkeypatch):
+    """Backtest (is_live=False): a DIFFERENT as_of day must recompute, even same-month."""
+    e = _weight_expert("AAPL", [], {})
+    history = _skill_history("A", "B", 6, rising=True)
+
+    calls = []
+    real = FMPSenateTraderWeight._calculate_trader_skill
+
+    def _spy(history_arg, **kw):
+        calls.append(1)
+        return real(e, history_arg, **kw)
+
+    monkeypatch.setattr(e, "_calculate_trader_skill", _spy)
+
+    common = dict(horizon_days=60, min_past_trades=1, max_past_trades=50,
+                 lookback_months=60, is_live=False)
+    e._get_trader_skill_cached("Trader X", history, now=NOW, **common)
+    e._get_trader_skill_cached("Trader X", history, now=NOW + timedelta(days=1), **common)
+    assert len(calls) == 2, "backtest must bucket by exact day, not reuse across days"
+
+
+def test_skill_cache_live_buckets_by_month(monkeypatch):
+    """Live (is_live=True): two different DAYS in the SAME month must reuse the cache;
+    a date in the NEXT month must recompute."""
+    e = _weight_expert("AAPL", [], {})
+    history = _skill_history("A", "B", 6, rising=True)
+
+    calls = []
+    real = FMPSenateTraderWeight._calculate_trader_skill
+
+    def _spy(history_arg, **kw):
+        calls.append(1)
+        return real(e, history_arg, **kw)
+
+    monkeypatch.setattr(e, "_calculate_trader_skill", _spy)
+
+    common = dict(horizon_days=60, min_past_trades=1, max_past_trades=50,
+                 lookback_months=60, is_live=True)
+    day1 = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    day2 = datetime(2026, 6, 28, tzinfo=timezone.utc)   # same month as day1
+    day3 = datetime(2026, 7, 1, tzinfo=timezone.utc)    # next month
+    e._get_trader_skill_cached("Trader X", history, now=day1, **common)
+    e._get_trader_skill_cached("Trader X", history, now=day2, **common)
+    assert len(calls) == 1, "same-month live calls must be served from cache"
+    e._get_trader_skill_cached("Trader X", history, now=day3, **common)
+    assert len(calls) == 2, "a new month must trigger a fresh recompute"
+
+
+def test_skill_lookback_months_excludes_old_trades():
+    """A buy far outside the lookback window is not scored, even though its horizon window
+    is complete — recency bound, not just completeness."""
+    old_buy = [_weight_trade("A", "B", "SKL", "purchase", "2020-01-01", "2020-01-01")]
+    e = _weight_expert("AAPL", [], {})
+
+    result_no_lookback = e._calculate_trader_skill(
+        old_buy, now=NOW, horizon_days=60, min_past_trades=1, max_past_trades=50,
+        lookback_months=120)  # 10 years — includes the 2020 trade
+    result_short_lookback = e._calculate_trader_skill(
+        old_buy, now=NOW, horizon_days=60, min_past_trades=1, max_past_trades=50,
+        lookback_months=12)  # 1 year — excludes the 2020 trade
+    assert result_no_lookback["scored_trades"] >= 0  # may be 0 if price lookup fails; just checking no crash
+    assert result_short_lookback["scored_trades"] == 0

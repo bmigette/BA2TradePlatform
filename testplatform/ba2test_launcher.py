@@ -835,6 +835,10 @@ _EXPERT_OPT = {
             "skill_horizon_days": {"optimize": True, "min": 30, "max": 90, "step": 30, "type": "int"},
             "skill_signal_weight": {"optimize": True, "min": 0.0, "max": 1.0, "step": 0.25, "type": "float"},
             "skill_confidence_weight": {"optimize": True, "min": 0.0, "max": 20.0, "step": 5.0, "type": "float"},
+            # Recency window for skill scoring (2026-07-15): a trader's RECENT pattern is more
+            # relevant than activity from years ago, and it bounds the scan for a very
+            # prolific trader. GA searches {6, 12} months.
+            "skill_lookback_months": {"optimize": True, "min": 6, "max": 12, "step": 6, "type": "int"},
             # Scalper filter (2026-07-15): excludes a trader whose disclosed buy/sell
             # round-trips (FIFO-paired, same symbol) average below this many days — e.g.
             # the live-discovered case of a member of Congress with 12,958 disclosed trades,
