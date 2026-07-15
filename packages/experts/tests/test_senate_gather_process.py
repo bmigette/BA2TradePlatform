@@ -749,3 +749,74 @@ def test_skill_lookback_months_excludes_old_trades():
         lookback_months=12)  # 1 year — excludes the 2020 trade
     assert result_no_lookback["scored_trades"] >= 0  # may be 0 if price lookup fails; just checking no crash
     assert result_short_lookback["scored_trades"] == 0
+
+
+def test_confidence_cache_avoids_recompute(monkeypatch):
+    """Second call with the SAME (trader, symbol, side, day) must NOT re-invoke the pure
+    calculator — this was the MOST-called of the three O(history) scans in profiling."""
+    e = _weight_expert("AAPL", [], {})
+    history = [_weight_trade("A", "B", "AAPL", "purchase", "2026-01-01", "2026-01-01")]
+
+    calls = []
+    real = FMPSenateTraderWeight._calculate_trader_confidence
+
+    def _spy(history_arg, *a, **kw):
+        calls.append(1)
+        return real(e, history_arg, *a, **kw)
+
+    monkeypatch.setattr(e, "_calculate_trader_confidence", _spy)
+
+    kw = dict(current_trade_type="purchase", current_symbol="AAPL", current_price=100.0,
+             max_exec_days=60, now=NOW, symbol_focus_cap_pct=10.0, is_live=False)
+    r1 = e._get_trader_confidence_cached("Trader X", history, **kw)
+    r2 = e._get_trader_confidence_cached("Trader X", history, **kw)
+    assert len(calls) == 1
+    assert r1 == r2
+
+
+def test_confidence_cache_differs_per_symbol(monkeypatch):
+    """A DIFFERENT current_symbol must NOT reuse another symbol's cached entry — the
+    symbol-specific focus subtotal is part of what's being cached."""
+    e = _weight_expert("AAPL", [], {})
+    history = [_weight_trade("A", "B", "AAPL", "purchase", "2026-01-01", "2026-01-01"),
+              _weight_trade("A", "B", "MSFT", "purchase", "2026-01-02", "2026-01-02")]
+
+    calls = []
+    real = FMPSenateTraderWeight._calculate_trader_confidence
+
+    def _spy(history_arg, *a, **kw):
+        calls.append(1)
+        return real(e, history_arg, *a, **kw)
+
+    monkeypatch.setattr(e, "_calculate_trader_confidence", _spy)
+
+    common = dict(current_trade_type="purchase", current_price=100.0, max_exec_days=60,
+                  now=NOW, symbol_focus_cap_pct=10.0, is_live=False)
+    e._get_trader_confidence_cached("Trader X", history, current_symbol="AAPL", **common)
+    e._get_trader_confidence_cached("Trader X", history, current_symbol="MSFT", **common)
+    assert len(calls) == 2, "different symbols must each get their own cache entry"
+
+
+def test_confidence_cache_live_buckets_by_month(monkeypatch):
+    e = _weight_expert("AAPL", [], {})
+    history = [_weight_trade("A", "B", "AAPL", "purchase", "2026-01-01", "2026-01-01")]
+
+    calls = []
+    real = FMPSenateTraderWeight._calculate_trader_confidence
+
+    def _spy(history_arg, *a, **kw):
+        calls.append(1)
+        return real(e, history_arg, *a, **kw)
+
+    monkeypatch.setattr(e, "_calculate_trader_confidence", _spy)
+
+    common = dict(current_trade_type="purchase", current_symbol="AAPL", current_price=100.0,
+                 max_exec_days=60, symbol_focus_cap_pct=10.0, is_live=True)
+    day1 = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    day2 = datetime(2026, 6, 28, tzinfo=timezone.utc)
+    day3 = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    e._get_trader_confidence_cached("Trader X", history, now=day1, **common)
+    e._get_trader_confidence_cached("Trader X", history, now=day2, **common)
+    assert len(calls) == 1
+    e._get_trader_confidence_cached("Trader X", history, now=day3, **common)
+    assert len(calls) == 2

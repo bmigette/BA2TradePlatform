@@ -424,6 +424,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             skill_confidence_weight=float(self._setting_or_default(settings, "skill_confidence_weight")),
             min_trader_avg_hold_days=float(self._setting_or_default(settings, "min_trader_avg_hold_days")),
             min_trader_hold_roundtrips=int(self._setting_or_default(settings, "min_trader_hold_roundtrips")),
+            is_live=(as_of is None),
         )
         return Recommendation(
             signal=rec["signal"], confidence=round(rec["confidence"], 1),
@@ -605,6 +606,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
     # miss just falls through to the same computation as before caching existed.
     _HOLD_CACHE_FILE = "congress_scalper_scores.json"
     _SKILL_CACHE_FILE = "congress_skill_scores.json"
+    _CONFIDENCE_CACHE_FILE = "congress_confidence_scores.json"
     # Flush every N new entries rather than every single one. A naive "write on every miss"
     # re-serializes the WHOLE accumulated dict each time — fine for hold-days (~1 entry per
     # trader, computed once) but a real bottleneck for skill (keyed per trader PER DAY: a
@@ -710,6 +712,36 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             lookback_months=lookback_months)
         cache[key] = result
         self._save_scoring_cache_throttled("_skill_cache", self._SKILL_CACHE_FILE)
+        return result
+
+    def _get_trader_confidence_cached(self, trader_name: str, trader_history: List[Dict[str, Any]],
+                                      current_trade_type: str, current_symbol: str,
+                                      current_price: float, max_exec_days: int, now: datetime,
+                                      symbol_focus_cap_pct: float, is_live: bool) -> Dict[str, Any]:
+        """Cached wrapper around ``_calculate_trader_confidence`` — a THIRD O(history) scan
+        found the same way as skill/hold-days (profiled live: it iterates the trader's FULL
+        history to compute yearly buy/sell totals + a symbol-specific focus subtotal, and is
+        called MORE often than skill/hold-days since it runs once per qualifying trade in
+        ``_calculate_recommendation``'s main loop, not once per unique trader per bar).
+
+        Keyed by (trader, history length, the CURRENT symbol/side being evaluated, an as-of
+        bucket, and the settings) — unlike hold-days, this depends on ``current_symbol``
+        (the symbol-specific subtotal) and ``current_trade_type`` (buy vs sell side), and
+        like skill it depends on ``now`` even at fixed history (the recent/yearly windows
+        slide). Same day/month bucketing split as skill (see _get_trader_skill_cached)."""
+        cache = self._load_scoring_cache("_confidence_cache", self._CONFIDENCE_CACHE_FILE)
+        n = len(trader_history)
+        as_of_bucket = now.strftime("%Y-%m") if is_live else now.date().isoformat()
+        key = (f"{trader_name}|{n}|{current_symbol.upper()}|{current_trade_type}|{as_of_bucket}"
+               f"|{max_exec_days}|{symbol_focus_cap_pct}")
+        entry = cache.get(key)
+        if entry is not None:
+            return entry
+        result = self._calculate_trader_confidence(
+            trader_history, current_trade_type, current_symbol, current_price,
+            max_exec_days, now=now, symbol_focus_cap_pct=symbol_focus_cap_pct)
+        cache[key] = result
+        self._save_scoring_cache_throttled("_confidence_cache", self._CONFIDENCE_CACHE_FILE)
         return result
 
     def _price_on_or_after(self, symbol: str, date: datetime, max_walk_days: int = 5) -> Optional[float]:
@@ -1211,7 +1243,8 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                                   skill_signal_weight: float = 0.5,
                                   skill_confidence_weight: float = 10.0,
                                   min_trader_avg_hold_days: float = 0.0,
-                                  min_trader_hold_roundtrips: int = 3) -> Dict[str, Any]:
+                                  min_trader_hold_roundtrips: int = 3,
+                                  is_live: bool = False) -> Dict[str, Any]:
         """
         Calculate trading recommendation from filtered senate trades.
 
@@ -1303,10 +1336,12 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                     continue
 
             # Calculate confidence modifier based on trader's portfolio allocation to this symbol
-            # This looks at what % of their money is focused on the current symbol
-            trader_stats = self._calculate_trader_confidence(
-                trader_history or [], transaction_type, symbol, current_price,
-                max_exec_days, now=now, symbol_focus_cap_pct=symbol_focus_cap_pct)
+            # This looks at what % of their money is focused on the current symbol. Cached
+            # (see _get_trader_confidence_cached) — this was the MOST-called of the three
+            # O(history) scans found in profiling, since it runs once per qualifying trade.
+            trader_stats = self._get_trader_confidence_cached(
+                trader_name, trader_history or [], transaction_type, symbol, current_price,
+                max_exec_days, now, symbol_focus_cap_pct, is_live)
             trader_confidence_modifier = trader_stats['confidence_modifier']
             symbol_focus_pct = trader_stats.get('symbol_focus_pct', 0.0)
 
