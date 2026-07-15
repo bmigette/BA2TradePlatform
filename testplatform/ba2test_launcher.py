@@ -312,11 +312,30 @@ def _cmd_prewarm(args) -> int:
         trades = (s._fetch_senate_trades(sym) or []) + (s._fetch_house_trades(sym) or [])
         s._get_price_at_date(sym, end_date)  # warms historical_price_full (full history, once)
         seen = set()
+        skill_syms: set = set()
         for trade in trades:
             name = s._trader_name(trade)
             if name and name not in seen:
                 seen.add(name)
-                s._fetch_trader_history(name)  # warms congress_trader_history per trader
+                history = s._fetch_trader_history(name) or []  # warms congress_trader_history
+                # Skill scoring (2026-07 upgrade) reads the price history of every symbol in
+                # the trader's scored past BUYS. Warm ALL unique buy symbols — not just the
+                # most-recent-N as of today — because at an early backtest as_of (e.g. 2022)
+                # the scorer's "most recent completed buys" are OLDER trades whose symbols a
+                # today-anchored cap would miss, hard-failing the hermetic run
+                # (FMPHistoryCacheMiss). Dedup is global across traders; each symbol is ONE
+                # full-history fetch, disk-cached and shared. Symbols FMP has no data for
+                # (delisted/bonds) persist as the [] sentinel, which the scorer skips cleanly.
+                for t in history:
+                    ttype = str(t.get('type', '')).lower()
+                    if 'purchase' not in ttype and 'buy' not in ttype:
+                        continue
+                    ssym = str(t.get('symbol', '')).upper()
+                    if ssym:
+                        skill_syms.add(ssym)
+        for ssym in skill_syms:
+            if ssym != sym.upper():
+                s._get_price_at_date(ssym, end_date)  # warms historical_price_full per skill symbol
 
     # FinnHubRating: warm the per-symbol finnhub_reco_trends namespace. Bare instance carries the
     # Finnhub key + a logger (all _fetch_recommendation_trends needs).
@@ -750,6 +769,17 @@ _EXPERT_OPT = {
             "confidence_to_profit_factor": {"optimize": True, "min": 0.05, "max": 0.30, "step": 0.05, "type": "float"},
             "min_traders": {"optimize": True, "min": 1, "max": 4, "step": 1, "type": "int"},
             "min_trades": {"optimize": True, "min": 1, "max": 4, "step": 1, "type": "int"},
+            # Scoring-model knobs (2026-07 upgrade): trade-size filter/boost, sell-side
+            # discount, focus cap, trader-count consensus, and historical trader-skill
+            # weighting (hit rate of past disclosed buys over a forward horizon).
+            "min_trade_amount": {"optimize": True, "min": 0.0, "max": 100000.0, "step": 25000.0, "type": "float"},
+            "sell_signal_weight": {"optimize": True, "min": 0.0, "max": 1.0, "step": 0.25, "type": "float"},
+            "symbol_focus_cap_pct": {"optimize": True, "min": 5.0, "max": 25.0, "step": 5.0, "type": "float"},
+            "size_boost_max": {"optimize": True, "min": 0.0, "max": 30.0, "step": 10.0, "type": "float"},
+            "consensus_bonus_per_trader": {"optimize": True, "min": 0.0, "max": 4.0, "step": 1.0, "type": "float"},
+            "skill_horizon_days": {"optimize": True, "min": 30, "max": 90, "step": 30, "type": "int"},
+            "skill_signal_weight": {"optimize": True, "min": 0.0, "max": 1.0, "step": 0.25, "type": "float"},
+            "skill_confidence_weight": {"optimize": True, "min": 0.0, "max": 20.0, "step": 5.0, "type": "float"},
         },
         "fixed_settings": {"sizing_mode": "risk_atr"},
     },

@@ -112,6 +112,90 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                 "default": 2,
                 "description": "Minimum total trades required",
                 "tooltip": "Minimum number of total trades required for the symbol. Both min_traders and min_trades must be met. Default 2: need at least 2 trades total."
+            },
+            "min_trade_amount": {
+                "type": "float",
+                "required": True,
+                "default": 0.0,
+                "description": "Minimum trade dollar amount ($)",
+                "tooltip": "Trades below this dollar amount (midpoint of the FMP disclosure range) are filtered out. Small trades carry little conviction. 0 = no minimum."
+            },
+            "sell_signal_weight": {
+                "type": "float",
+                "required": True,
+                "default": 1.0,
+                "description": "Weight of SELL disclosures in the signal (0-1)",
+                "tooltip": "Congressional sells are often liquidity/diversification-driven (weak signal) while buys carry information. This scales the sell side's portfolio-focus total in the signal. 1.0 = symmetric (legacy), 0.5 = half-weight sells, 0 = ignore sells."
+            },
+            "symbol_focus_cap_pct": {
+                "type": "float",
+                "required": True,
+                "default": 10.0,
+                "description": "Symbol portfolio-focus cap (%)",
+                "tooltip": "A trader's symbol focus (their $ on this symbol / total $ traded, yearly) is capped here before feeding confidence. Raising the cap rewards very concentrated conviction more."
+            },
+            "size_boost_max": {
+                "type": "float",
+                "required": True,
+                "default": 20.0,
+                "description": "Max confidence boost from trade size (points)",
+                "tooltip": "Confidence points added when the winning side's average trade size reaches size_boost_full_amount. Scales linearly below that. 0 disables the size term."
+            },
+            "size_boost_full_amount": {
+                "type": "float",
+                "required": True,
+                "default": 1000000.0,
+                "description": "Trade size for full size boost ($)",
+                "tooltip": "Dollar amount at which a trade earns the full size_boost_max confidence points (default $1M). A $500k trade with defaults earns half the max."
+            },
+            "consensus_bonus_per_trader": {
+                "type": "float",
+                "required": True,
+                "default": 2.0,
+                "description": "Confidence bonus per extra unique trader (points)",
+                "tooltip": "Each unique trader on the winning side beyond the first adds this many confidence points (breadth of consensus). 0 disables."
+            },
+            "consensus_bonus_max": {
+                "type": "float",
+                "required": True,
+                "default": 10.0,
+                "description": "Max consensus bonus (points)",
+                "tooltip": "Cap on the total consensus bonus from unique-trader count."
+            },
+            "skill_horizon_days": {
+                "type": "int",
+                "required": True,
+                "default": 60,
+                "description": "Trader-skill forward-return horizon (days)",
+                "tooltip": "Each trader's PAST disclosed buys are scored by the symbol's return over this many days after execution. Only windows fully in the past are scored (no lookahead)."
+            },
+            "skill_min_past_trades": {
+                "type": "int",
+                "required": True,
+                "default": 5,
+                "description": "Min scored past trades for a skill rating",
+                "tooltip": "Traders with fewer scored past buys than this get a NEUTRAL skill (0) — not enough history to judge."
+            },
+            "skill_max_past_trades": {
+                "type": "int",
+                "required": True,
+                "default": 50,
+                "description": "Max past trades scored per trader",
+                "tooltip": "Most-recent cap on how many past buys are scored per trader (bounds price-history fetches)."
+            },
+            "skill_signal_weight": {
+                "type": "float",
+                "required": True,
+                "default": 0.5,
+                "description": "Trader-skill weight in the signal (0-1)",
+                "tooltip": "Each trade's signal contribution is multiplied by (1 + skill x this). Skill is -1..+1 from the trader's historical hit rate. 0 disables skill weighting of the signal."
+            },
+            "skill_confidence_weight": {
+                "type": "float",
+                "required": True,
+                "default": 10.0,
+                "description": "Trader-skill confidence adjustment (points)",
+                "tooltip": "Confidence points added/subtracted per unit of the winning side's average skill (-1..+1). Default 10: a perfect-hit-rate cohort adds +10, a always-wrong cohort subtracts 10. 0 disables."
             }
         }
     
@@ -142,7 +226,22 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         "max_disclose_date_days", "max_trade_exec_days", "max_trade_price_delta_pct",
         "growth_confidence_multiplier", "confidence_to_profit_factor",
         "min_traders", "min_trades",
+        "min_trade_amount", "sell_signal_weight", "symbol_focus_cap_pct",
+        "size_boost_max", "size_boost_full_amount",
+        "consensus_bonus_per_trader", "consensus_bonus_max",
+        "skill_horizon_days", "skill_min_past_trades", "skill_max_past_trades",
+        "skill_signal_weight", "skill_confidence_weight",
     )
+
+    @classmethod
+    def _setting_or_default(cls, settings: Optional[Dict[str, Any]], key: str) -> Any:
+        """Read *key* from a plain settings dict, falling back to the interface default.
+
+        Trial/test settings dicts may predate newer knobs; every new setting must degrade
+        to its declared default so old configs keep producing the same recommendation."""
+        if settings and key in settings and settings[key] is not None:
+            return settings[key]
+        return cls.get_settings_definitions()[key]["default"]
 
     @staticmethod
     def _trader_name(trade: Dict[str, Any]) -> str:
@@ -158,7 +257,19 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         symbol = self._gather_symbol
         senate = self._fetch_senate_trades(symbol) or []
         house = self._fetch_house_trades(symbol) or []
-        all_trades = senate + house
+        # Dedup amended/duplicate filings: FMP can return the same disclosure more than
+        # once (amendments, senate+house overlaps for the same person). Counting a dupe
+        # twice double-weights one trade in min_trades and the focus totals.
+        seen: set = set()
+        all_trades = []
+        for trade in senate + house:
+            fp = (self._trader_name(trade), str(trade.get('symbol', '')).upper(),
+                  str(trade.get('transactionDate', '')), str(trade.get('type', '')).lower(),
+                  str(trade.get('amount', '')))
+            if fp in seen:
+                continue
+            seen.add(fp)
+            all_trades.append(trade)
 
         # Stage 1: pre-resolve the per-trade execution price (already date-aware).
         exec_price_by_trade: Dict[tuple, Optional[float]] = {}
@@ -188,6 +299,25 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                            if self._disclosure_date_ok(h, ceiling)]
             trader_history_by_name[name] = history
 
+        # Stage 3: pre-resolve each trader's SKILL score (historical hit rate of their
+        # past disclosed buys over the configured forward horizon). This needs per-date
+        # price lookups (provider I/O), so it MUST live in _gather — _process stays pure.
+        # Settings are stashed on self by run_analysis/analyze_as_of; skill knobs fall
+        # back to interface defaults when absent (old trial configs). Skipped entirely
+        # when both skill weights are 0 (no fetches for a disabled feature).
+        gather_settings = getattr(self, "_gather_settings", None)
+        skill_signal_w = float(self._setting_or_default(gather_settings, "skill_signal_weight"))
+        skill_conf_w = float(self._setting_or_default(gather_settings, "skill_confidence_weight"))
+        trader_skill_by_name: Dict[str, Dict[str, Any]] = {}
+        if skill_signal_w != 0.0 or skill_conf_w != 0.0:
+            horizon = int(self._setting_or_default(gather_settings, "skill_horizon_days"))
+            min_past = int(self._setting_or_default(gather_settings, "skill_min_past_trades"))
+            max_past = int(self._setting_or_default(gather_settings, "skill_max_past_trades"))
+            for name, history in trader_history_by_name.items():
+                trader_skill_by_name[name] = self._calculate_trader_skill(
+                    history, now=ceiling, horizon_days=horizon,
+                    min_past_trades=min_past, max_past_trades=max_past)
+
         # Live (as_of=None) reads the account/broker quote (the original live
         # source); backtest (as_of set) reads the OHLCV close-at-as_of.
         current_price = (self._get_current_price(symbol) if as_of is None
@@ -197,6 +327,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             "current_price": current_price,
             "exec_price_by_trade": exec_price_by_trade,
             "trader_history_by_name": trader_history_by_name,
+            "trader_skill_by_name": trader_skill_by_name,
             "symbol": symbol,
         }
 
@@ -229,6 +360,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             current_price, symbol,
             now=now,
             exec_price_by_trade=data_bundle["exec_price_by_trade"],
+            min_trade_amount=float(self._setting_or_default(settings, "min_trade_amount")),
         )
         rec = self._calculate_recommendation(
             filtered, symbol, current_price,
@@ -239,6 +371,15 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             growth_multiplier=float(settings["growth_confidence_multiplier"]),
             confidence_to_profit_factor=float(settings["confidence_to_profit_factor"]),
             now=now,
+            trader_skill_by_name=data_bundle.get("trader_skill_by_name") or {},
+            sell_signal_weight=float(self._setting_or_default(settings, "sell_signal_weight")),
+            symbol_focus_cap_pct=float(self._setting_or_default(settings, "symbol_focus_cap_pct")),
+            size_boost_max=float(self._setting_or_default(settings, "size_boost_max")),
+            size_boost_full_amount=float(self._setting_or_default(settings, "size_boost_full_amount")),
+            consensus_bonus_per_trader=float(self._setting_or_default(settings, "consensus_bonus_per_trader")),
+            consensus_bonus_max=float(self._setting_or_default(settings, "consensus_bonus_max")),
+            skill_signal_weight=float(self._setting_or_default(settings, "skill_signal_weight")),
+            skill_confidence_weight=float(self._setting_or_default(settings, "skill_confidence_weight")),
         )
         return Recommendation(
             signal=rec["signal"], confidence=round(rec["confidence"], 1),
@@ -252,6 +393,9 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         """BacktestInterface entry: resolve the gather-time symbol then run the SAME
         _gather(two-stage pre-resolve)+_process the live path drives."""
         self._gather_symbol = context.extra.get("symbol", getattr(self, "_gather_symbol", None))
+        # Stash settings for _gather: the skill pre-resolve (stage 3) reads its knobs
+        # (horizon/min/max/weights) at gather time, before _process sees the dict.
+        self._gather_settings = context.settings
         bundle = self._gather(context.providers, as_of)
         return self._process(bundle, context.settings, as_of)
 
@@ -404,7 +548,79 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             price_maps[sym] = smap
 
         return smap.get(date.strftime("%Y-%m-%d"))
-    
+
+    def _price_on_or_after(self, symbol: str, date: datetime, max_walk_days: int = 5) -> Optional[float]:
+        """First available open on/after ``date`` (walks weekends/holidays, up to
+        ``max_walk_days`` forward). Used by the skill scorer, whose dates (disclosure
+        exec dates, exec+horizon) routinely land on non-trading days."""
+        for offset in range(max_walk_days + 1):
+            price = self._get_price_at_date(symbol, date + timedelta(days=offset))
+            if price:
+                return price
+        return None
+
+    def _calculate_trader_skill(self, trader_history: List[Dict[str, Any]],
+                                now: datetime, horizon_days: int,
+                                min_past_trades: int, max_past_trades: int) -> Dict[str, Any]:
+        """Score a trader's historical SKILL from the forward returns of their past buys.
+
+        For each past disclosed BUY (any symbol) whose ``horizon_days`` forward window is
+        fully in the past (exec + horizon <= now — no lookahead), compute the symbol's
+        return from the exec-date open to the open ``horizon_days`` later (both via the
+        disk-cached full price history; non-trading days walk forward a few days). The
+        skill score maps the hit rate onto [-1, +1]: hit_rate 1.0 -> +1, 0.5 -> 0 (coin
+        flip), 0.0 -> -1. Traders with fewer than ``min_past_trades`` scored buys get a
+        NEUTRAL 0 (not enough history to judge); at most ``max_past_trades`` most-recent
+        buys are scored (bounds the per-trader price fetches).
+
+        Sells are NOT scored: congressional sells are dominated by liquidity noise; the
+        skill question is "do this person's BUYS predict returns?".
+        """
+        neutral = {"skill_score": 0.0, "scored_trades": 0, "hit_rate": None,
+                   "avg_fwd_return_pct": 0.0}
+        if not trader_history or horizon_days <= 0:
+            return neutral
+
+        # Most-recent past buys first (bounded), forward window fully complete.
+        candidates = []
+        for t in trader_history:
+            ttype = str(t.get('type', '')).lower()
+            if 'purchase' not in ttype and 'buy' not in ttype:
+                continue
+            exec_str = t.get('transactionDate', '')
+            sym = str(t.get('symbol', '')).upper()
+            if not exec_str or not sym:
+                continue
+            try:
+                exec_date = datetime.strptime(exec_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            except (ValueError, TypeError):
+                continue
+            if exec_date + timedelta(days=horizon_days) > now:
+                continue  # window not complete yet — scoring it would be lookahead
+            candidates.append((exec_date, sym))
+        candidates.sort(key=lambda c: c[0], reverse=True)
+
+        returns: List[float] = []
+        for exec_date, sym in candidates:
+            if len(returns) >= max_past_trades:
+                break
+            entry = self._price_on_or_after(sym, exec_date)
+            fwd = self._price_on_or_after(sym, exec_date + timedelta(days=horizon_days))
+            if not entry or not fwd:
+                continue
+            returns.append((fwd - entry) / entry * 100.0)
+
+        if len(returns) < min_past_trades:
+            return neutral
+        hits = sum(1 for r in returns if r > 0)
+        hit_rate = hits / len(returns)
+        return {
+            "skill_score": max(-1.0, min(1.0, (hit_rate - 0.5) * 2.0)),
+            "scored_trades": len(returns),
+            "hit_rate": hit_rate,
+            "avg_fwd_return_pct": sum(returns) / len(returns),
+        }
+
     def _filter_trades(self, trades: List[Dict[str, Any]],
                       max_disclose_days: int,
                       max_exec_days: int,
@@ -412,7 +628,8 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                       current_price: float,
                       symbol: str,
                       now: Optional[datetime] = None,
-                      exec_price_by_trade: Optional[Dict[tuple, Optional[float]]] = None) -> List[Dict[str, Any]]:
+                      exec_price_by_trade: Optional[Dict[tuple, Optional[float]]] = None,
+                      min_trade_amount: float = 0.0) -> List[Dict[str, Any]]:
         """
         Filter trades based on configured settings.
 
@@ -435,8 +652,11 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         now = now or datetime.now(timezone.utc)
         filtered_trades = []
         max_exec_days = int(max_exec_days)
-        max_price_delta_pct = int (max_price_delta_pct)
+        # float, NOT int: the GA searches fractional thresholds (e.g. 7.5%); the old
+        # int() cast silently truncated them, aliasing half the search grid.
+        max_price_delta_pct = float(max_price_delta_pct)
         max_disclose_days = int(max_disclose_days)
+        min_trade_amount = float(min_trade_amount or 0.0)
         for trade in trades:
             # Parse dates
             try:
@@ -472,7 +692,12 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                 if days_since_exec > max_exec_days:
                     #logger.debug(f"Trade executed {days_since_exec} days ago (max: {max_exec_days}), filtering out")
                     continue
-                
+
+                # Minimum trade size: sub-threshold trades carry little conviction.
+                if min_trade_amount > 0 and self._parse_amount(trade.get('amount', '0')) < min_trade_amount:
+                    self.logger.debug(f"Trade below min amount ${min_trade_amount:,.0f}, filtering out")
+                    continue
+
                 # Execution price: read from the pre-resolved map (Phase 1) so
                 # _process is pure; fall back to an inline fetch only when no map
                 # was supplied (legacy direct callers).
@@ -531,7 +756,8 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                                      current_symbol: str,
                                      current_price: float,
                                      max_exec_days: int = 60,
-                                     now: Optional[datetime] = None) -> Dict[str, Any]:
+                                     now: Optional[datetime] = None,
+                                     symbol_focus_cap_pct: float = 10.0) -> Dict[str, Any]:
         """
         Calculate confidence based on trader's portfolio allocation to the current symbol.
         
@@ -676,10 +902,11 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             if yearly_sell_amount > 0:
                 symbol_focus_pct = (yearly_symbol_sell_amount / yearly_sell_amount) * 100
         
-        # Cap symbol focus at 10% to avoid extreme confidence values
-        symbol_focus_pct = min(10.0, symbol_focus_pct)
-        
-        # Use symbol focus % as confidence modifier (capped at 10%)
+        # Cap symbol focus (configurable) to avoid extreme confidence values
+        cap = float(symbol_focus_cap_pct or 10.0)
+        symbol_focus_pct = min(cap, symbol_focus_pct)
+
+        # Use symbol focus % as confidence modifier (capped)
         confidence_modifier = symbol_focus_pct
         
         self.logger.debug(f"Trader pattern (yearly): {yearly_buy_count} buys (${yearly_buy_amount:,.0f}), "
@@ -705,47 +932,43 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             'yearly_symbol_sell_amount': yearly_symbol_sell_amount
         }
     
-    def _calculate_confidence(self, trade: Dict[str, Any], 
-                             trader_confidence_modifier: float) -> float:
+    def _size_boost(self, trade: Dict[str, Any],
+                    size_boost_max: float = 20.0,
+                    size_boost_full_amount: float = 1_000_000.0) -> float:
+        """Confidence points from the trade's dollar size: linear up to
+        ``size_boost_max`` at ``size_boost_full_amount`` (defaults reproduce the
+        original +10/$500k-capped-at-20 curve). This term now feeds the OVERALL
+        confidence (it was previously computed per trade but never aggregated —
+        trade size had no effect on the final signal)."""
+        if not size_boost_max or size_boost_full_amount <= 0:
+            return 0.0
+        try:
+            amount = self._parse_amount(trade.get('amount', '0'))
+            return min(float(size_boost_max), (amount / float(size_boost_full_amount)) * float(size_boost_max))
+        except Exception as e:  # noqa: BLE001 — a bad amount string is a 0 boost, not a crash
+            self.logger.debug(f"Error parsing trade amount: {e}")
+            return 0.0
+
+    def _calculate_confidence(self, trade: Dict[str, Any],
+                             trader_confidence_modifier: float,
+                             size_boost_max: float = 20.0,
+                             size_boost_full_amount: float = 1_000_000.0) -> float:
         """
-        Calculate confidence for a trade recommendation.
-        
+        Calculate confidence for ONE trade (stored per-trade for transparency/UI).
+
         Formula:
         1. Start at 50% base confidence
-        2. Add trader pattern modifier (0 to +10, from the trader's symbol portfolio focus %)
-        3. Add investment size boost (up to +20%)
+        2. Add trader pattern modifier (from the trader's symbol portfolio focus %)
+        3. Add investment size boost (via _size_boost; same term that now also feeds
+           the overall confidence as the winning side's average)
 
-        Args:
-            trade: Trade record with amount information
-            trader_confidence_modifier: Confidence adjustment from the trader's symbol
-                portfolio focus (0 to +10; capped at 10 in _calculate_trader_confidence)
-            
         Returns:
             Confidence percentage (0-100)
         """
-        # Base confidence
         confidence = 50.0
-        
-        # Add trader pattern modifier
         confidence += trader_confidence_modifier
-        
-        # Add investment size boost (up to +20% for very large trades)
-        try:
-            amount = self._parse_amount(trade.get('amount', '0'))
-
-            # Calculate boost: +10% per $500k, capped at +20%
-            investment_boost = min(20.0, (amount / 500000) * 10.0)
-            confidence += investment_boost
-            
-            self.logger.debug(f"Trade amount: ${amount:,.0f} -> boost: +{investment_boost:.1f}%")
-            
-        except Exception as e:
-            self.logger.debug(f"Error parsing trade amount: {e}")
-        
-        # Final cap at 100%, floor at 0%
-        confidence = min(100.0, max(0.0, confidence))
-        
-        return confidence
+        confidence += self._size_boost(trade, size_boost_max, size_boost_full_amount)
+        return min(100.0, max(0.0, confidence))
     
     def _calculate_recommendation(self, filtered_trades: List[Dict[str, Any]],
                                   symbol: str,
@@ -756,7 +979,16 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                                   min_trades_required: Optional[int] = None,
                                   growth_multiplier: Optional[float] = None,
                                   confidence_to_profit_factor: Optional[float] = None,
-                                  now: Optional[datetime] = None) -> Dict[str, Any]:
+                                  now: Optional[datetime] = None,
+                                  trader_skill_by_name: Optional[Dict[str, Dict[str, Any]]] = None,
+                                  sell_signal_weight: float = 1.0,
+                                  symbol_focus_cap_pct: float = 10.0,
+                                  size_boost_max: float = 20.0,
+                                  size_boost_full_amount: float = 1_000_000.0,
+                                  consensus_bonus_per_trader: float = 2.0,
+                                  consensus_bonus_max: float = 10.0,
+                                  skill_signal_weight: float = 0.5,
+                                  skill_confidence_weight: float = 10.0) -> Dict[str, Any]:
         """
         Calculate trading recommendation from filtered senate trades.
 
@@ -823,12 +1055,22 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
 
             # Calculate confidence modifier based on trader's portfolio allocation to this symbol
             # This looks at what % of their money is focused on the current symbol
-            trader_stats = self._calculate_trader_confidence(trader_history or [], transaction_type, symbol, current_price, max_exec_days, now=now)
+            trader_stats = self._calculate_trader_confidence(
+                trader_history or [], transaction_type, symbol, current_price,
+                max_exec_days, now=now, symbol_focus_cap_pct=symbol_focus_cap_pct)
             trader_confidence_modifier = trader_stats['confidence_modifier']
             symbol_focus_pct = trader_stats.get('symbol_focus_pct', 0.0)
-            
+
+            # Trader skill (pre-resolved in _gather; neutral 0 when disabled/unknown).
+            skill_info = (trader_skill_by_name or {}).get(trader_name) or {}
+            trader_skill = float(skill_info.get('skill_score', 0.0))
+            # Per-trade SIGNAL weight: skill scales this trade's focus contribution.
+            # Clamped >= 0 so a maximally-bad trader zeroes out rather than inverting.
+            trade_signal_weight = max(0.0, 1.0 + trader_skill * float(skill_signal_weight))
+
             # Calculate confidence for this specific trade
-            trade_confidence = self._calculate_confidence(trade, trader_confidence_modifier)
+            trade_confidence = self._calculate_confidence(
+                trade, trader_confidence_modifier, size_boost_max, size_boost_full_amount)
             
             # Store trade details
             trade_info = {
@@ -842,6 +1084,11 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                 'price_delta_pct': trade.get('price_delta_pct', 0),
                 'trader_confidence_modifier': trader_confidence_modifier,
                 'symbol_focus_pct': symbol_focus_pct,
+                'trader_skill': trader_skill,
+                'trader_skill_trades': int(skill_info.get('scored_trades', 0)),
+                'trader_skill_hit_rate': skill_info.get('hit_rate'),
+                'signal_weight': trade_signal_weight,
+                'size_boost': self._size_boost(trade, size_boost_max, size_boost_full_amount),
                 'confidence': trade_confidence,
                 'days_since_exec': trade.get('days_since_exec', 0),
                 'days_since_disclose': trade.get('days_since_disclose', 0),
@@ -892,20 +1139,28 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                 'price_confidence_adj': 0.0
             }
 
-        # Determine overall signal based on net portfolio allocation
-        # Compare the total symbol focus % for buy trades vs sell trades
-        # This weighs traders by how much of their portfolio they're allocating to this symbol
-        
-        # Calculate total symbol focus for buy and sell sides
-        buy_symbol_focus_total = sum(t['symbol_focus_pct'] for t in trade_details 
-                                     if 'purchase' in t['type'].lower() or 'buy' in t['type'].lower())
-        sell_symbol_focus_total = sum(t['symbol_focus_pct'] for t in trade_details 
-                                      if 'sale' in t['type'].lower() or 'sell' in t['type'].lower())
-        
+        # Determine overall signal based on net SKILL-WEIGHTED portfolio allocation.
+        # Each trade contributes its trader's symbol focus x that trader's skill weight
+        # (1 + skill x skill_signal_weight, so proven traders count more, proven-bad ones
+        # less); the SELL side is additionally scaled by sell_signal_weight because
+        # congressional sells are dominated by liquidity/diversification noise while buys
+        # carry the information.
+        def _is_buy_t(t):
+            return 'purchase' in t['type'].lower() or 'buy' in t['type'].lower()
+
+        def _is_sell_t(t):
+            return 'sale' in t['type'].lower() or 'sell' in t['type'].lower()
+
+        buy_symbol_focus_total = sum(t['symbol_focus_pct'] * t['signal_weight']
+                                     for t in trade_details if _is_buy_t(t))
+        sell_symbol_focus_total = (sum(t['symbol_focus_pct'] * t['signal_weight']
+                                       for t in trade_details if _is_sell_t(t))
+                                   * float(sell_signal_weight))
+
         net_trades = buy_count - sell_count
         net_amount = total_buy_amount - total_sell_amount
         net_symbol_focus = buy_symbol_focus_total - sell_symbol_focus_total
-        
+
         # Use net portfolio allocation (symbol focus) to determine signal
         # This considers both the number of traders AND how much they're allocating
         if net_symbol_focus > 0:
@@ -963,7 +1218,25 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         # For SELL: price up (positive delta) is good → keep as positive adjustment
         price_confidence_adj = (-avg_price_delta if is_buy_signal else avg_price_delta) / 2
 
-        overall_confidence = min(100.0, max(0.0, 50.0 + avg_symbol_focus_pct * growth_multiplier + price_confidence_adj))
+        # SIZE term: winning side's average dollar-size boost (0..size_boost_max). This
+        # was previously computed per trade but never aggregated — trade size had NO
+        # effect on the final confidence.
+        avg_size_boost = (sum(t.get('size_boost', 0.0) for t in relevant_trades) / len(relevant_trades)
+                          if relevant_trades else 0.0)
+
+        # CONSENSUS term: breadth of unique traders on the winning side beyond the first.
+        winning_traders = len({t['trader'] for t in relevant_trades})
+        consensus_bonus = min(float(consensus_bonus_max),
+                              float(consensus_bonus_per_trader) * max(0, winning_traders - 1))
+
+        # SKILL term: winning side's average historical skill (-1..+1) scaled to points.
+        avg_skill = (sum(t.get('trader_skill', 0.0) for t in relevant_trades) / len(relevant_trades)
+                     if relevant_trades else 0.0)
+        skill_confidence_adj = avg_skill * float(skill_confidence_weight)
+
+        overall_confidence = min(100.0, max(0.0,
+            50.0 + avg_symbol_focus_pct * growth_multiplier + price_confidence_adj
+            + avg_size_boost + consensus_bonus + skill_confidence_adj))
         
         # Expected Profit: Confidence multiplied by profit factor (always positive regardless of BUY/SELL)
         # Example: 80% confidence * 0.15 factor = 12% expected profit (passed in by
@@ -1000,7 +1273,8 @@ Trade #{i}:
 - Execution Price: ${trade_info['exec_price']:.2f}
 - Current Price: ${trade_info['current_price']:.2f}
 - Price Change: {trade_info['price_delta_pct']:+.1f}%
-- Symbol Focus: {trade_info['symbol_focus_pct']:.1f}% (of trader's portfolio, capped at 10%)
+- Symbol Focus: {trade_info['symbol_focus_pct']:.1f}% (of trader's portfolio, capped at {symbol_focus_cap_pct:.0f}%)
+- Trader Skill: {trade_info['trader_skill']:+.2f} ({trade_info['trader_skill_trades']} past buys scored) → signal weight {trade_info['signal_weight']:.2f}
 - Trade Confidence: {trade_info['confidence']:.1f}%
 - Trader Recent Activity (last {max_exec_days}d): {trade_info['trader_recent_buys']} buys, {trade_info['trader_recent_sells']} sells
 - Trader Yearly Activity (all symbols): {trade_info['trader_yearly_buys']} buys, {trade_info['trader_yearly_sells']} sells
@@ -1015,26 +1289,27 @@ Trade #{i}:
 - Portfolio focus % is calculated from yearly activity to understand their true allocation
 - Only filtered trades are used to generate the BUY/SELL signal
 
-Signal Determination:
-- Buy Trades: {buy_count} trades (${total_buy_amount:,.0f}) with {buy_symbol_focus_total:.1f}% total portfolio focus
-- Sell Trades: {sell_count} trades (${total_sell_amount:,.0f}) with {sell_symbol_focus_total:.1f}% total portfolio focus
-- Net Portfolio Focus: {net_symbol_focus:+.1f}% (buy focus - sell focus)
-- Signal is determined by net portfolio allocation, not just trade count
-- More portfolio focus on buys = BUY, more on sells = SELL, equal = HOLD
+Signal Determination (skill-weighted, sell-discounted):
+- Buy Trades: {buy_count} trades (${total_buy_amount:,.0f}) with {buy_symbol_focus_total:.1f} skill-weighted focus score
+- Sell Trades: {sell_count} trades (${total_sell_amount:,.0f}) with {sell_symbol_focus_total:.1f} skill-weighted focus score (sell weight {sell_signal_weight})
+- Net Focus Score: {net_symbol_focus:+.1f} (buy - sell)
+- Each trade's focus is multiplied by its trader's skill weight (1 + skill × {skill_signal_weight});
+  the sell side is additionally scaled by {sell_signal_weight} (congressional sells are mostly liquidity noise)
+- More weighted focus on buys = BUY, more on sells = SELL, equal = HOLD
 
 Confidence Calculation Method:
 1. Calculate Symbol Focus % for each trader:
    - Look at all their trades in the past year
    - Calculate: ($ spent on {symbol} / $ spent on all symbols) × 100
-   - This shows what % of their portfolio is allocated to {symbol}
-   - Cap at 10% to avoid extreme values
+   - Cap at {symbol_focus_cap_pct:.0f}% to avoid extreme values
 2. Average Symbol Focus across relevant {signal.value} traders: {avg_symbol_focus_pct:.1f}%
 3. Price Movement Adjustment: avg delta {avg_price_delta:+.1f}% → {price_confidence_adj:+.1f} confidence
-4. Confidence Formula: 50 + (Avg Symbol Focus % × {growth_multiplier}) + price adj ({price_confidence_adj:+.1f}) = {overall_confidence:.1f}%
-   - 10% portfolio allocation × {growth_multiplier} = {10 * growth_multiplier:.0f}% bonus
-   - Price dropped 10% on BUY → +5 confidence (better entry)
-   - Price rose 10% on BUY → -5 confidence (opportunity partly gone)
-5. Expected Profit: Uses same formula = {abs(expected_profit):.1f}%
+4. Size Boost: winning side's avg trade-size boost = +{avg_size_boost:.1f} (max {size_boost_max:.0f} at ${size_boost_full_amount:,.0f})
+5. Consensus Bonus: {winning_traders} unique {signal.value} trader(s) → +{consensus_bonus:.1f} (per-extra-trader {consensus_bonus_per_trader}, cap {consensus_bonus_max})
+6. Skill Adjustment: winning side's avg skill {avg_skill:+.2f} × {skill_confidence_weight} = {skill_confidence_adj:+.1f}
+   (skill = trader's historical hit rate of past disclosed buys over the forward horizon, -1..+1; neutral 0 without enough scored history)
+7. Confidence Formula: 50 + (Avg Focus % × {growth_multiplier}) + price adj ({price_confidence_adj:+.1f}) + size (+{avg_size_boost:.1f}) + consensus (+{consensus_bonus:.1f}) + skill ({skill_confidence_adj:+.1f}) = {overall_confidence:.1f}%
+8. Expected Profit: confidence × factor = {abs(expected_profit):.1f}%
 
 Symbol Focus Analysis:
 This measures how much conviction/focus the trader has on {symbol}.
@@ -1064,6 +1339,12 @@ All {len(trade_details)} trades shown above for transparency.
             'total_sell_amount': total_sell_amount,
             'avg_price_delta': avg_price_delta,
             'price_confidence_adj': price_confidence_adj,
+            # New confidence terms (also surfaced for UI/inspection)
+            'avg_size_boost': avg_size_boost,
+            'consensus_bonus': consensus_bonus,
+            'avg_trader_skill': avg_skill,
+            'skill_confidence_adj': skill_confidence_adj,
+            'winning_traders': winning_traders,
             # Add trade metrics
             'trade_metrics': self._calculate_trade_metrics(filtered_trades)
         }
@@ -1231,6 +1512,7 @@ All {len(trade_details)} trades shown above for transparency.
             # the backtest engine drives via analyze_as_of. _gather raises if the FMP
             # fetch fails (raise_on_error=True fetchers), preserving the live contract.
             self._gather_symbol = symbol
+            self._gather_settings = settings  # skill knobs read at gather time (stage 3)
             providers = self._live_providers()
             bundle = self._gather(providers, as_of=None)
             current_price = bundle["current_price"]
@@ -1269,7 +1551,11 @@ All {len(trade_details)} trades shown above for transparency.
                         'money_spent': trade_metrics.get('total_money_spent', 0.0),
                         'percent_of_yearly': trade_metrics.get('percent_of_yearly', 0.0),
                         'avg_price_delta': recommendation_data.get('avg_price_delta', 0.0),
-                        'price_confidence_adj': recommendation_data.get('price_confidence_adj', 0.0)
+                        'price_confidence_adj': recommendation_data.get('price_confidence_adj', 0.0),
+                        'avg_size_boost': recommendation_data.get('avg_size_boost', 0.0),
+                        'consensus_bonus': recommendation_data.get('consensus_bonus', 0.0),
+                        'avg_trader_skill': recommendation_data.get('avg_trader_skill', 0.0),
+                        'skill_confidence_adj': recommendation_data.get('skill_confidence_adj', 0.0)
                     },
                     'trade_statistics': {
                         'total_trades': len(all_trades),
@@ -1396,6 +1682,17 @@ All {len(trade_details)} trades shown above for transparency.
                     ui.label(
                         f'Avg Price Move: {avg_price_delta:+.1f}% → Confidence {price_confidence_adj:+.1f}'
                     ).classes('text-sm').style(f'color: {delta_color}')
+
+                # New confidence terms (size / consensus / trader skill)
+                _size = rec.get('avg_size_boost', 0.0)
+                _cons = rec.get('consensus_bonus', 0.0)
+                _skill = rec.get('avg_trader_skill', 0.0)
+                _skill_adj = rec.get('skill_confidence_adj', 0.0)
+                if _size or _cons or _skill_adj:
+                    ui.label(
+                        f'Adjustments — Size: +{_size:.1f} | Consensus: +{_cons:.1f} | '
+                        f'Trader Skill: {_skill:+.2f} → {_skill_adj:+.1f}'
+                    ).classes('text-sm').style('color: #a0aec0')
 
             # Trade Statistics
             total_trades = stats.get('total_trades', 0)

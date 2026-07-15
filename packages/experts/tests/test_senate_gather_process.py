@@ -291,3 +291,190 @@ def test_weight_analyze_as_of_equals_live_process():
     rec_live = e._process(bundle_live, WEIGHT_SETTINGS, as_of=NOW)
     assert rec_asof.almost_equals(rec_live)
     assert rec_asof.details == rec_live.details
+
+
+# ====================================================================
+# FMPSenateTraderWeight — scoring-model upgrades (skill / sell weight /
+# size boost / consensus / focus cap / min amount / dedup / float delta)
+# ====================================================================
+
+def _two_buyer_setup(exec_price=95.0, amount="$100,001 - $250,000", extra_settings=None):
+    trades = [
+        _weight_trade("Alice", "Aa", "AAPL", "purchase", "2026-06-01", "2026-05-20", amount=amount),
+        _weight_trade("Bob", "Bb", "AAPL", "purchase", "2026-06-02", "2026-05-21", amount=amount),
+    ]
+    history = {
+        "Alice Aa": [_weight_trade("Alice", "Aa", "AAPL", "purchase", "2026-05-01", "2026-05-10")],
+        "Bob Bb": [_weight_trade("Bob", "Bb", "AAPL", "purchase", "2026-05-02", "2026-05-11")],
+    }
+    e = _weight_expert("AAPL", trades, history, exec_price=exec_price)
+    settings = {**WEIGHT_SETTINGS, **(extra_settings or {})}
+    return e, settings
+
+
+def _run(e, settings, price=100.0):
+    e._gather_settings = settings
+    bundle = e._gather(_bundle({"AAPL": price}), as_of=NOW)
+    return e._process(bundle, settings, as_of=NOW)
+
+
+def test_weight_dedup_drops_duplicate_filings():
+    """The same filing appearing twice (amendment / feed overlap) must count ONCE —
+    two dupes of one trade must NOT satisfy min_trades=2."""
+    t = _weight_trade("Alice", "Aa", "AAPL", "purchase", "2026-06-01", "2026-05-20")
+    dupe = dict(t)
+    dupe["_chamber"] = "house"   # arrives via the house feed too
+    history = {"Alice Aa": [_weight_trade("Alice", "Aa", "AAPL", "purchase", "2026-05-01", "2026-05-10")]}
+    e = _weight_expert("AAPL", [t, dupe], history, exec_price=95.0)
+    rec = _run(e, WEIGHT_SETTINGS)
+    assert rec.signal == OrderRecommendation.HOLD  # 1 unique trade < min_trades 2
+
+
+def test_weight_price_delta_threshold_keeps_float_precision():
+    """max_trade_price_delta_pct=7.9 must NOT truncate to 7: a +7.5% favourable move
+    passes a 7.9% threshold (it was filtered under the old int() cast)."""
+    e, settings = _two_buyer_setup(exec_price=93.0)   # current 100 => +7.53% favourable
+    settings["max_trade_price_delta_pct"] = 7.9
+    rec = _run(e, settings)
+    assert rec.signal == OrderRecommendation.BUY, "7.53% move must pass a 7.9% threshold"
+
+
+def test_weight_min_trade_amount_filters_small_trades():
+    e, settings = _two_buyer_setup(amount="$1,001 - $15,000")   # midpoint ~$8k
+    settings["min_trade_amount"] = 50000.0
+    rec = _run(e, settings)
+    assert rec.signal == OrderRecommendation.HOLD   # all trades filtered by size
+
+
+def test_weight_size_boost_feeds_overall_confidence():
+    """Bigger disclosed amounts must now RAISE the final confidence (the boost used
+    to be computed per trade but never aggregated)."""
+    e_small, settings = _two_buyer_setup(amount="$1,001 - $15,000")
+    e_big, _ = _two_buyer_setup(amount="$1,000,001 - $5,000,000")
+    conf_small = _run(e_small, settings).confidence
+    conf_big = _run(e_big, settings).confidence
+    assert conf_big > conf_small
+
+
+def test_weight_sell_signal_weight_zero_ignores_sells():
+    """Equal buy/sell focus is HOLD at sell weight 1.0 but BUY at 0.0."""
+    trades = [
+        _weight_trade("Alice", "Aa", "AAPL", "purchase", "2026-06-01", "2026-05-20"),
+        _weight_trade("Bob", "Bb", "AAPL", "sale", "2026-06-02", "2026-05-21"),
+    ]
+    history = {
+        "Alice Aa": [_weight_trade("Alice", "Aa", "AAPL", "purchase", "2026-05-01", "2026-05-10")],
+        "Bob Bb": [_weight_trade("Bob", "Bb", "AAPL", "sale", "2026-05-02", "2026-05-11")],
+    }
+    e = _weight_expert("AAPL", trades, history, exec_price=100.0)  # no price-delta effects
+    rec_sym = _run(e, {**WEIGHT_SETTINGS, "sell_signal_weight": 1.0})
+    assert rec_sym.signal == OrderRecommendation.HOLD   # focus cancels out
+    rec_buy = _run(e, {**WEIGHT_SETTINGS, "sell_signal_weight": 0.0})
+    assert rec_buy.signal == OrderRecommendation.BUY    # sells ignored
+
+
+def test_weight_focus_cap_configurable():
+    """A trader with 100% symbol focus scores higher under a 20% cap than a 10% cap."""
+    e, settings = _two_buyer_setup(exec_price=100.0)
+    conf_cap10 = _run(e, {**settings, "symbol_focus_cap_pct": 10.0}).confidence
+    conf_cap20 = _run(e, {**settings, "symbol_focus_cap_pct": 20.0, "growth_confidence_multiplier": 2.0}).confidence
+    conf_cap10_lowmult = _run(e, {**settings, "symbol_focus_cap_pct": 10.0, "growth_confidence_multiplier": 2.0}).confidence
+    # Same multiplier: raising the cap raises confidence (their focus is 100% -> capped).
+    assert conf_cap20 > conf_cap10_lowmult
+    assert conf_cap10 > 0
+
+
+def test_weight_consensus_bonus_scales_with_unique_traders():
+    """More unique buyers (same focus) => higher confidence via the consensus term."""
+    def _mk(n_traders):
+        trades, history = [], {}
+        for i in range(n_traders):
+            first, last = f"T{i}", "Xx"
+            trades.append(_weight_trade(first, last, "AAPL", "purchase", "2026-06-01", "2026-05-20"))
+            history[f"{first} {last}"] = [
+                _weight_trade(first, last, "AAPL", "purchase", "2026-05-01", "2026-05-10")]
+        return _weight_expert("AAPL", trades, history, exec_price=100.0)
+
+    settings = {**WEIGHT_SETTINGS, "consensus_bonus_per_trader": 3.0, "consensus_bonus_max": 10.0,
+                "growth_confidence_multiplier": 1.0}
+    conf2 = _run(_mk(2), settings).confidence
+    conf4 = _run(_mk(4), settings).confidence
+    assert conf4 > conf2
+    assert conf4 - conf2 == 6.0   # 2 extra traders x 3.0
+
+
+def _skill_history(first, last, n, rising):
+    """n past AAPL buys with completed forward windows; price map decides outcome."""
+    rows = []
+    for i in range(n):
+        d = f"2025-{(i % 9) + 1:02d}-10"
+        rows.append(_weight_trade(first, last, "SKL", "purchase", d, d))
+    return rows
+
+
+def _skill_expert(all_trades, history_by_name, price_fn):
+    e = FMPSenateTraderWeight.__new__(FMPSenateTraderWeight)
+    e.id = 1
+    e._gather_symbol = "AAPL"
+    e.logger = _LOG
+    e._fetch_senate_trades = lambda s: all_trades
+    e._fetch_house_trades = lambda s: []
+    e._fetch_trader_history = lambda name: history_by_name.get(name)
+    e._get_price_at_date = price_fn
+    e._get_current_price = lambda sym: 100.0
+    return e
+
+
+def test_weight_trader_skill_boosts_and_penalizes_confidence():
+    """A trader whose past buys rose over the horizon gets skill +1 (confidence up);
+    one whose buys fell gets skill -1 (confidence down) vs the neutral baseline."""
+    trades = [
+        _weight_trade("Alice", "Aa", "AAPL", "purchase", "2026-06-01", "2026-05-20"),
+        _weight_trade("Bob", "Bb", "AAPL", "purchase", "2026-06-02", "2026-05-21"),
+    ]
+    history = {
+        "Alice Aa": _skill_history("Alice", "Aa", 6, rising=True),
+        "Bob Bb": _skill_history("Bob", "Bb", 6, rising=True),
+    }
+
+    def _price_rising(sym, date):
+        if str(sym).upper() == "AAPL":
+            return 100.0                      # analyzed symbol: flat (no delta effects)
+        # SKL: price grows over time => every past buy is a WINNER
+        return 50.0 + (date - datetime(2025, 1, 1, tzinfo=timezone.utc)).days * 0.1
+
+    def _price_falling(sym, date):
+        if str(sym).upper() == "AAPL":
+            return 100.0
+        return 500.0 - (date - datetime(2025, 1, 1, tzinfo=timezone.utc)).days * 0.5
+
+    settings = {**WEIGHT_SETTINGS, "skill_confidence_weight": 10.0, "skill_signal_weight": 0.5}
+    conf_good = _run(_skill_expert(trades, history, _price_rising), settings).confidence
+    conf_bad = _run(_skill_expert(trades, history, _price_falling), settings).confidence
+    conf_neutral = _run(_skill_expert(trades, history, _price_rising),
+                        {**settings, "skill_confidence_weight": 0.0}).confidence
+    assert conf_good == conf_neutral + 10.0   # avg skill +1 x weight 10
+    assert conf_bad == conf_neutral - 10.0    # avg skill -1 x weight 10
+
+
+def test_weight_skill_neutral_below_min_past_trades():
+    """Fewer scored past buys than skill_min_past_trades => neutral (no skill effect)."""
+    trades = [
+        _weight_trade("Alice", "Aa", "AAPL", "purchase", "2026-06-01", "2026-05-20"),
+        _weight_trade("Bob", "Bb", "AAPL", "purchase", "2026-06-02", "2026-05-21"),
+    ]
+    history = {
+        "Alice Aa": _skill_history("Alice", "Aa", 2, rising=True),   # 2 < min 5
+        "Bob Bb": _skill_history("Bob", "Bb", 2, rising=True),
+    }
+
+    def _price(sym, date):
+        if str(sym).upper() == "AAPL":
+            return 100.0
+        return 50.0 + (date - datetime(2025, 1, 1, tzinfo=timezone.utc)).days * 0.1
+
+    settings = {**WEIGHT_SETTINGS, "skill_confidence_weight": 10.0}
+    conf = _run(_skill_expert(trades, history, _price), settings).confidence
+    conf_disabled = _run(_skill_expert(trades, history, _price),
+                         {**settings, "skill_confidence_weight": 0.0}).confidence
+    assert conf == conf_disabled   # neutral skill: no adjustment either way
