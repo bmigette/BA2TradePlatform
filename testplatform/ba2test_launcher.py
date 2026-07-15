@@ -205,6 +205,7 @@ def _cmd_prewarm(args) -> int:
     through to the API). FactorRanker is skipped — its factor data is not disk-cached.
     """
     import time
+    import threading
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from ba2_providers.fmp_common import (
         frozen_ttl_cache, _fmp_history_cache_dir, persist_empty_sentinel, set_ttl_frozen,
@@ -308,45 +309,59 @@ def _cmd_prewarm(args) -> int:
     # keyed by trader name, discovered from the trades). A bare instance (no DB row) carries just
     # the FMP key + a logger — all the fetch methods need. (The OHLCV current-price leg of _gather
     # is served by the fetch-cache parquet, not fmp_history, so it's out of prewarm's scope.)
+    #
+    # Dedup state is SHARED across every universe symbol's _do_senate call (not per-call locals):
+    # the same prolific trader (e.g. one member of Congress with 10k+ disclosed trades) is
+    # discovered from dozens of different universe symbols, and re-iterating their whole history
+    # + re-warming their buy-symbols each time was pure wasted CPU (the disk/memory price cache
+    # already prevented redundant NETWORK fetches, but not the redundant Python-side work of
+    # getting there). Lock-guarded since the ThreadPoolExecutor runs _do_senate concurrently.
     _senate_expert = None
+    _senate_seen_traders: set = set()
+    _senate_warmed_skill_syms: set = set()
+    _senate_lock = threading.Lock()
 
     def _do_senate(sym: str) -> None:
         nonlocal _senate_expert
         if _senate_expert is None:
             import logging as _lg
             from ba2_experts.FMPSenateTraderWeight import FMPSenateTraderWeight
-            s = FMPSenateTraderWeight.__new__(FMPSenateTraderWeight)
-            s._api_key = key
-            s.logger = _lg.getLogger("senate-prewarm")
-            _senate_expert = s
+            with _senate_lock:
+                if _senate_expert is None:
+                    s = FMPSenateTraderWeight.__new__(FMPSenateTraderWeight)
+                    s._api_key = key
+                    s.logger = _lg.getLogger("senate-prewarm")
+                    _senate_expert = s
         s = _senate_expert
         trades = (s._fetch_senate_trades(sym) or []) + (s._fetch_house_trades(sym) or [])
         s._get_price_at_date(sym, end_date)  # warms historical_price_full (full history, once)
-        seen = set()
-        skill_syms: set = set()
-        for trade in trades:
-            name = s._trader_name(trade)
-            if name and name not in seen:
-                seen.add(name)
-                history = s._fetch_trader_history(name) or []  # warms congress_trader_history
-                # Skill scoring (2026-07 upgrade) reads the price history of every symbol in
-                # the trader's scored past BUYS. Warm ALL unique buy symbols — not just the
-                # most-recent-N as of today — because at an early backtest as_of (e.g. 2022)
-                # the scorer's "most recent completed buys" are OLDER trades whose symbols a
-                # today-anchored cap would miss, hard-failing the hermetic run
-                # (FMPHistoryCacheMiss). Dedup is global across traders; each symbol is ONE
-                # full-history fetch, disk-cached and shared. Symbols FMP has no data for
-                # (delisted/bonds) persist as the [] sentinel, which the scorer skips cleanly.
+        new_traders = []
+        with _senate_lock:
+            for trade in trades:
+                name = s._trader_name(trade)
+                if name and name not in _senate_seen_traders:
+                    _senate_seen_traders.add(name)
+                    new_traders.append(name)
+        # Skill scoring (2026-07 upgrade) reads the price history of every symbol in each
+        # trader's scored past BUYS. Warm ALL unique buy symbols — not just the most-recent-N
+        # as of today — because at an early backtest as_of (e.g. 2022) the scorer's "most
+        # recent completed buys" are OLDER trades whose symbols a today-anchored cap would
+        # miss, hard-failing the hermetic run (FMPHistoryCacheMiss). Symbols FMP has no data
+        # for (delisted/bonds) persist as the [] sentinel, which the scorer skips cleanly.
+        for name in new_traders:
+            history = s._fetch_trader_history(name) or []  # warms congress_trader_history (once)
+            new_skill_syms = []
+            with _senate_lock:
                 for t in history:
                     ttype = str(t.get('type', '')).lower()
                     if 'purchase' not in ttype and 'buy' not in ttype:
                         continue
                     ssym = str(t.get('symbol', '')).upper()
-                    if ssym:
-                        skill_syms.add(ssym)
-        for ssym in skill_syms:
-            if ssym != sym.upper():
-                s._get_price_at_date(ssym, end_date)  # warms historical_price_full per skill symbol
+                    if ssym and ssym not in _senate_warmed_skill_syms:
+                        _senate_warmed_skill_syms.add(ssym)
+                        new_skill_syms.append(ssym)
+            for ssym in new_skill_syms:
+                s._get_price_at_date(ssym, end_date)  # warms historical_price_full (once, ever)
 
     # FinnHubRating: warm the per-symbol finnhub_reco_trends namespace. Bare instance carries the
     # Finnhub key + a logger (all _fetch_recommendation_trends needs).
