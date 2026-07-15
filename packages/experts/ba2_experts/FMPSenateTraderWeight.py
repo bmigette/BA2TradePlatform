@@ -605,6 +605,15 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
     # miss just falls through to the same computation as before caching existed.
     _HOLD_CACHE_FILE = "congress_scalper_scores.json"
     _SKILL_CACHE_FILE = "congress_skill_scores.json"
+    # Flush every N new entries rather than every single one. A naive "write on every miss"
+    # re-serializes the WHOLE accumulated dict each time — fine for hold-days (~1 entry per
+    # trader, computed once) but a real bottleneck for skill (keyed per trader PER DAY: a
+    # full backtest accumulates thousands of entries, making per-miss writes O(n^2) total —
+    # profiled live: a 3-symbol/3.7-year run got SLOWER after adding the cache, not faster,
+    # because of this). Throttling bounds it to O(n) amortized. Worst case on a crash: the
+    # last <N entries since the previous flush are recomputed next run — never a correctness
+    # issue (both scores are pure functions of their inputs).
+    _CACHE_FLUSH_EVERY = 25
 
     def _scoring_cache_path(self, filename: str) -> str:
         from ba2_common.config import CACHE_FOLDER
@@ -626,6 +635,9 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         return cache
 
     def _save_scoring_cache(self, attr: str, filename: str) -> None:
+        """Unconditional flush — writes the FULL cache dict now. Callers on the hot per-bar
+        path should use ``_save_scoring_cache_throttled`` instead; this is for the
+        occasional caller (e.g. tests) that wants a guaranteed on-disk write."""
         cache = getattr(self, attr, {})
         path = self._scoring_cache_path(filename)
         try:
@@ -636,6 +648,20 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             os.replace(tmp, path)
         except Exception as e:  # noqa: BLE001 — a cache-write failure must never fail scoring
             self.logger.debug(f"Failed to persist scoring cache {filename}: {e}")
+
+    def _save_scoring_cache_throttled(self, attr: str, filename: str) -> None:
+        """Flush only every ``_CACHE_FLUSH_EVERY`` NEW entries (see the class-level comment
+        on why: a per-miss flush is O(n^2) total for a cache that accumulates thousands of
+        entries over one run). The in-memory dict (``self.<attr>``) is ALWAYS up to date
+        regardless — only the on-disk write is throttled, so within-process lookups are
+        unaffected; only a crash mid-run can lose the last <N entries (harmless — pure
+        functions, just recomputed next time)."""
+        dirty_attr = attr + "_dirty"
+        dirty = getattr(self, dirty_attr, 0) + 1
+        if dirty >= self._CACHE_FLUSH_EVERY:
+            self._save_scoring_cache(attr, filename)
+            dirty = 0
+        setattr(self, dirty_attr, dirty)
 
     def _get_trader_hold_info_cached(self, trader_name: str,
                                      trader_history: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -650,7 +676,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             return {"avg_hold_days": entry.get("avg_hold_days"), "roundtrips": entry.get("roundtrips")}
         result = self._calculate_trader_avg_hold_days(trader_history)
         cache[trader_name] = {"history_len": n, **result}
-        self._save_scoring_cache("_hold_cache", self._HOLD_CACHE_FILE)
+        self._save_scoring_cache_throttled("_hold_cache", self._HOLD_CACHE_FILE)
         return result
 
     def _get_trader_skill_cached(self, trader_name: str, trader_history: List[Dict[str, Any]],
@@ -683,7 +709,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             min_past_trades=min_past_trades, max_past_trades=max_past_trades,
             lookback_months=lookback_months)
         cache[key] = result
-        self._save_scoring_cache("_skill_cache", self._SKILL_CACHE_FILE)
+        self._save_scoring_cache_throttled("_skill_cache", self._SKILL_CACHE_FILE)
         return result
 
     def _price_on_or_after(self, symbol: str, date: datetime, max_walk_days: int = 5) -> Optional[float]:
