@@ -320,6 +320,15 @@ def _cmd_prewarm(args) -> int:
     _senate_seen_traders: set = set()
     _senate_warmed_skill_syms: set = set()
     _senate_lock = threading.Lock()
+    # Scalper-skip floor: the GENTLEST scalper filter any GA trial for this expert will ever
+    # use (the grid's min_trader_avg_hold_days floor + the fixed min_trader_hold_roundtrips).
+    # A trader who fails EVEN this gentlest setting fails every stricter setting in the grid
+    # too, so their skill-symbols are unreachable by any trial — safe to skip warming them.
+    # Read from _EXPERT_OPT (not hardcoded) so a future grid change can't silently desync
+    # prewarm from what the GA actually searches.
+    _senate_opt = _EXPERT_OPT["FMPSenateTraderWeight"]
+    _senate_hold_floor_days = float(_senate_opt["expert_params"]["min_trader_avg_hold_days"]["min"])
+    _senate_hold_min_roundtrips = int(_senate_opt["fixed_settings"]["min_trader_hold_roundtrips"])
 
     def _do_senate(sym: str) -> None:
         nonlocal _senate_expert
@@ -350,6 +359,14 @@ def _cmd_prewarm(args) -> int:
         # for (delisted/bonds) persist as the [] sentinel, which the scorer skips cleanly.
         for name in new_traders:
             history = s._fetch_trader_history(name) or []  # warms congress_trader_history (once)
+            # Scalper skip: a trader excluded by even the grid's gentlest filter setting
+            # contributes to NO GA trial's signal, so their (potentially thousands of)
+            # buy-symbols are dead weight — skip the price-history warm entirely for them.
+            hold_info = s._calculate_trader_avg_hold_days(history)
+            if (hold_info["avg_hold_days"] is not None
+                    and hold_info["roundtrips"] >= _senate_hold_min_roundtrips
+                    and hold_info["avg_hold_days"] < _senate_hold_floor_days):
+                continue
             new_skill_syms = []
             with _senate_lock:
                 for t in history:
@@ -818,8 +835,22 @@ _EXPERT_OPT = {
             "skill_horizon_days": {"optimize": True, "min": 30, "max": 90, "step": 30, "type": "int"},
             "skill_signal_weight": {"optimize": True, "min": 0.0, "max": 1.0, "step": 0.25, "type": "float"},
             "skill_confidence_weight": {"optimize": True, "min": 0.0, "max": 20.0, "step": 5.0, "type": "float"},
+            # Scalper filter (2026-07-15): excludes a trader whose disclosed buy/sell
+            # round-trips (FIFO-paired, same symbol) average below this many days — e.g.
+            # the live-discovered case of a member of Congress with 12,958 disclosed trades,
+            # functionally a day-trader rather than a conviction-position insider signal.
+            # DELIBERATELY floored > 0 (never "disabled") — the senate prewarm skips
+            # skill-symbol warming for any trader who fails the GRID'S OWN MINIMUM here
+            # (see _SENATE_SCALPER_FLOOR_DAYS below): a 0-floor would make that prewarm
+            # optimization unsound, since a trial with the filter off would need symbols
+            # prewarm never fetched -> FMPHistoryCacheMiss mid-run.
+            "min_trader_avg_hold_days": {"optimize": True, "min": 1.0, "max": 15.0, "step": 2.0, "type": "float"},
         },
-        "fixed_settings": {"sizing_mode": "risk_atr"},
+        # min_trader_hold_roundtrips is intentionally FIXED (not GA-optimized): letting it vary
+        # too would require reconciling two grid bounds for the prewarm-skip safety check below
+        # instead of one. 3 round-trips is enough to distinguish "genuine scalper" from "a
+        # trader who happened to flip one position quickly."
+        "fixed_settings": {"sizing_mode": "risk_atr", "min_trader_hold_roundtrips": 3},
     },
     # FactorRanker is a BYPASS expert: it ignores enter/exit rulesets and the classic RM, and
     # rebalances a portfolio by factor score. So its optimization searches ONLY the factor-model

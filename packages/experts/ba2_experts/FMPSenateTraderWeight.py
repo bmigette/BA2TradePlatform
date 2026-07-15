@@ -196,6 +196,20 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                 "default": 10.0,
                 "description": "Trader-skill confidence adjustment (points)",
                 "tooltip": "Confidence points added/subtracted per unit of the winning side's average skill (-1..+1). Default 10: a perfect-hit-rate cohort adds +10, a always-wrong cohort subtracts 10. 0 disables."
+            },
+            "min_trader_avg_hold_days": {
+                "type": "float",
+                "required": True,
+                "default": 0.0,
+                "description": "Min average holding period to trust a trader (days)",
+                "tooltip": "Excludes a trader's trades when their historical average buy->sell round-trip (FIFO-paired, same symbol) is below this many days AND they have >= min_trader_hold_roundtrips scored round-trips. Filters out intraday/scalper-like disclosure patterns (e.g. a member with 10k+ disclosed trades) that don't reflect conviction positions. 0 = disabled (no filter). Costs zero extra fetches (computed from the same disclosure history already fetched for skill scoring)."
+            },
+            "min_trader_hold_roundtrips": {
+                "type": "int",
+                "required": True,
+                "default": 3,
+                "description": "Min round-trips required to judge a trader's hold time",
+                "tooltip": "A trader with fewer FIFO-paired buy/sell round-trips than this is NOT filtered by min_trader_avg_hold_days (not enough history to judge — treated as pass, not scalper)."
             }
         }
     
@@ -231,6 +245,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         "consensus_bonus_per_trader", "consensus_bonus_max",
         "skill_horizon_days", "skill_min_past_trades", "skill_max_past_trades",
         "skill_signal_weight", "skill_confidence_weight",
+        "min_trader_avg_hold_days", "min_trader_hold_roundtrips",
     )
 
     @classmethod
@@ -380,6 +395,8 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             consensus_bonus_max=float(self._setting_or_default(settings, "consensus_bonus_max")),
             skill_signal_weight=float(self._setting_or_default(settings, "skill_signal_weight")),
             skill_confidence_weight=float(self._setting_or_default(settings, "skill_confidence_weight")),
+            min_trader_avg_hold_days=float(self._setting_or_default(settings, "min_trader_avg_hold_days")),
+            min_trader_hold_roundtrips=int(self._setting_or_default(settings, "min_trader_hold_roundtrips")),
         )
         return Recommendation(
             signal=rec["signal"], confidence=round(rec["confidence"], 1),
@@ -620,6 +637,52 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             "hit_rate": hit_rate,
             "avg_fwd_return_pct": sum(returns) / len(returns),
         }
+
+    @staticmethod
+    def _calculate_trader_avg_hold_days(trader_history: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Estimate a trader's average holding period from FIFO-paired buy/sell round-trips
+        in their OWN disclosure history (no price data needed — pure date arithmetic on data
+        already fetched for skill scoring / prewarm, so this filter costs ZERO extra fetches).
+
+        Per symbol, buys are queued chronologically; each sell pops the oldest still-open buy
+        and the gap in days is one round-trip. A trader who flips positions same-day/next-day
+        across many symbols (a "scalper", e.g. the extreme case discovered live: one member of
+        Congress with 12,958 disclosed trades) reads as a low avg_hold_days — congressional
+        insider signal is about conviction positions held for a stretch, not high-frequency
+        flips, so such traders are excluded via min_trader_avg_hold_days (see
+        _calculate_recommendation). Returns roundtrip count so a trader with too few round
+        trips to judge isn't penalized (mirrors skill's min_past_trades neutral-below-min)."""
+        by_symbol: Dict[str, List[tuple]] = {}
+        for t in trader_history:
+            ttype = str(t.get('type', '')).lower()
+            sym = str(t.get('symbol', '')).upper()
+            d = t.get('transactionDate', '')
+            if not sym or not d:
+                continue
+            is_buy = 'purchase' in ttype or 'buy' in ttype
+            is_sell = 'sale' in ttype or 'sell' in ttype
+            if not (is_buy or is_sell):
+                continue
+            try:
+                dt = datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            except (ValueError, TypeError):
+                continue
+            by_symbol.setdefault(sym, []).append((dt, is_buy))
+
+        hold_days: List[float] = []
+        for rows in by_symbol.values():
+            rows.sort(key=lambda r: r[0])
+            open_buys: List[datetime] = []
+            for dt, is_buy in rows:
+                if is_buy:
+                    open_buys.append(dt)
+                elif open_buys:
+                    buy_dt = open_buys.pop(0)  # FIFO: oldest open buy closes first
+                    hold_days.append((dt - buy_dt).days)
+
+        if not hold_days:
+            return {"avg_hold_days": None, "roundtrips": 0}
+        return {"avg_hold_days": sum(hold_days) / len(hold_days), "roundtrips": len(hold_days)}
 
     def _filter_trades(self, trades: List[Dict[str, Any]],
                       max_disclose_days: int,
@@ -988,7 +1051,9 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                                   consensus_bonus_per_trader: float = 2.0,
                                   consensus_bonus_max: float = 10.0,
                                   skill_signal_weight: float = 0.5,
-                                  skill_confidence_weight: float = 10.0) -> Dict[str, Any]:
+                                  skill_confidence_weight: float = 10.0,
+                                  min_trader_avg_hold_days: float = 0.0,
+                                  min_trader_hold_roundtrips: int = 3) -> Dict[str, Any]:
         """
         Calculate trading recommendation from filtered senate trades.
 
@@ -1030,7 +1095,8 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         total_buy_amount = 0.0
         total_sell_amount = 0.0
         trade_details = []
-        
+        scalpers_filtered = 0
+
         for trade in filtered_trades:
             # Build trader name from firstName and lastName
             first_name = trade.get('firstName', '')
@@ -1052,6 +1118,26 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             else:
                 trader_history = self._fetch_trader_history(trader_name)
             self.logger.debug(f"Found {len(trader_history or [])} total trades by {trader_name}")
+
+            # SCALPER FILTER: exclude a trader whose historical buy/sell round-trips (FIFO
+            # per symbol) average below min_trader_avg_hold_days — congressional insider
+            # signal is about conviction positions, not intraday/high-frequency flips (the
+            # live incident that motivated this: one member of Congress with 12,958 disclosed
+            # trades). Only filters when enough round-trips exist to judge (min_trader_
+            # hold_roundtrips) — insufficient history passes through, matching skill's
+            # neutral-below-min-trades pattern. Zero extra fetches: pure date math on the
+            # SAME trader_history already fetched for skill scoring / confidence.
+            if min_trader_avg_hold_days > 0:
+                hold_info = self._calculate_trader_avg_hold_days(trader_history or [])
+                if (hold_info['avg_hold_days'] is not None
+                        and hold_info['roundtrips'] >= min_trader_hold_roundtrips
+                        and hold_info['avg_hold_days'] < min_trader_avg_hold_days):
+                    self.logger.debug(
+                        f"Filtering scalper-like trader {trader_name}: avg hold "
+                        f"{hold_info['avg_hold_days']:.1f}d over {hold_info['roundtrips']} "
+                        f"round-trips (min {min_trader_avg_hold_days}d)")
+                    scalpers_filtered += 1
+                    continue
 
             # Calculate confidence modifier based on trader's portfolio allocation to this symbol
             # This looks at what % of their money is focused on the current symbol
@@ -1122,13 +1208,15 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
 
         if num_unique_traders < min_traders or num_total_trades < min_trades_required:
             self.logger.info(f"Below minimums: {num_unique_traders} traders (min {min_traders}), "
-                           f"{num_total_trades} trades (min {min_trades_required}) - returning HOLD")
+                           f"{num_total_trades} trades (min {min_trades_required}) "
+                           f"({scalpers_filtered} scalper-filtered) - returning HOLD")
             return {
                 'signal': OrderRecommendation.HOLD,
                 'confidence': 0.0,
                 'expected_profit_percent': 0.0,
                 'details': f'Below minimum thresholds: {num_unique_traders} unique trader(s) (min {min_traders}), '
-                          f'{num_total_trades} trade(s) (min {min_trades_required}). Both must be met.',
+                          f'{num_total_trades} trade(s) (min {min_trades_required}). Both must be met. '
+                          f'({scalpers_filtered} trade(s) excluded as scalper-like.)',
                 'trades': trade_details,
                 'trade_count': len(filtered_trades),
                 'buy_count': buy_count,
@@ -1136,7 +1224,8 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                 'total_buy_amount': total_buy_amount,
                 'total_sell_amount': total_sell_amount,
                 'avg_price_delta': 0.0,
-                'price_confidence_adj': 0.0
+                'price_confidence_adj': 0.0,
+                'scalpers_filtered': scalpers_filtered,
             }
 
         # Determine overall signal based on net SKILL-WEIGHTED portfolio allocation.
@@ -1321,6 +1410,7 @@ Example: If trader bought $100k of {symbol} and $1M total stocks → 10% focus �
 
 Settings:
 - Growth Confidence Multiplier: {growth_multiplier} (configurable, controls sensitivity)
+- Scalper Filter: {scalpers_filtered} trade(s) excluded (trader's avg buy/sell hold time below the configured minimum)
 
 Note: Only {signal.value} trades are used for confidence calculation.
 All {len(trade_details)} trades shown above for transparency.
@@ -1345,6 +1435,7 @@ All {len(trade_details)} trades shown above for transparency.
             'avg_trader_skill': avg_skill,
             'skill_confidence_adj': skill_confidence_adj,
             'winning_traders': winning_traders,
+            'scalpers_filtered': scalpers_filtered,
             # Add trade metrics
             'trade_metrics': self._calculate_trade_metrics(filtered_trades)
         }

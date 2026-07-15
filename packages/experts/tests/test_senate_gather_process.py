@@ -478,3 +478,105 @@ def test_weight_skill_neutral_below_min_past_trades():
     conf_disabled = _run(_skill_expert(trades, history, _price),
                          {**settings, "skill_confidence_weight": 0.0}).confidence
     assert conf == conf_disabled   # neutral skill: no adjustment either way
+
+
+# ====================================================================
+# FMPSenateTraderWeight — scalper filter (min_trader_avg_hold_days)
+# ====================================================================
+
+def test_calculate_trader_avg_hold_days_pairs_fifo_per_symbol():
+    """Two symbols, one round-trip each: 2 days and 30 days -> avg 16, 2 roundtrips.
+    An unmatched trailing BUY (no sell yet) must not be counted."""
+    history = [
+        _weight_trade("A", "B", "AAPL", "purchase", "2026-01-01", "2026-01-01"),
+        _weight_trade("A", "B", "AAPL", "sale", "2026-01-03", "2026-01-03"),        # 2 days
+        _weight_trade("A", "B", "MSFT", "purchase", "2026-02-01", "2026-02-01"),
+        _weight_trade("A", "B", "MSFT", "sale", "2026-03-03", "2026-03-03"),        # 30 days
+        _weight_trade("A", "B", "GOOGL", "purchase", "2026-04-01", "2026-04-01"),   # no sell yet
+    ]
+    result = FMPSenateTraderWeight._calculate_trader_avg_hold_days(history)
+    assert result["roundtrips"] == 2
+    assert result["avg_hold_days"] == 16.0
+
+
+def test_calculate_trader_avg_hold_days_no_roundtrips_returns_none():
+    history = [_weight_trade("A", "B", "AAPL", "purchase", "2026-01-01", "2026-01-01")]
+    result = FMPSenateTraderWeight._calculate_trader_avg_hold_days(history)
+    assert result["avg_hold_days"] is None
+    assert result["roundtrips"] == 0
+
+
+def _scalper_history(first, last, n_roundtrips, hold_days=1):
+    """n_roundtrips FIFO-paired buy/sell trades, each held `hold_days` (default: same-day
+    flip, like the live Ro Khanna incident: thousands of rapid disclosed round-trips).
+    Round trips are spaced a year apart so they never overlap regardless of hold_days."""
+    from datetime import timedelta as _td
+    rows = []
+    for i in range(n_roundtrips):
+        buy_dt = datetime(2020 + i, 1, 1)
+        sell_dt = buy_dt + _td(days=hold_days)
+        rows.append(_weight_trade(first, last, "SKL", "purchase",
+                                  buy_dt.strftime("%Y-%m-%d"), buy_dt.strftime("%Y-%m-%d")))
+        rows.append(_weight_trade(first, last, "SKL", "sale",
+                                  sell_dt.strftime("%Y-%m-%d"), sell_dt.strftime("%Y-%m-%d")))
+    return rows
+
+
+def test_weight_scalper_filter_excludes_frequent_flipper():
+    """A scalper-like trader (avg hold 1 day, well past min roundtrips) is excluded when
+    min_trader_avg_hold_days is set; a normal long-hold trader still counts."""
+    trades = [
+        _weight_trade("Scalper", "Sam", "AAPL", "purchase", "2026-06-01", "2026-05-20"),
+        _weight_trade("LongHold", "Lee", "AAPL", "purchase", "2026-06-02", "2026-05-21"),
+    ]
+    history = {
+        "Scalper Sam": _scalper_history("Scalper", "Sam", 10, hold_days=1),
+        "LongHold Lee": _scalper_history("LongHold", "Lee", 5, hold_days=90),  # genuinely long holds
+    }
+    e = _weight_expert("AAPL", trades, history, exec_price=95.0)
+    settings = {**WEIGHT_SETTINGS, "min_trader_avg_hold_days": 5.0, "min_trader_hold_roundtrips": 3,
+                "min_traders": 1, "min_trades": 1}
+    rec = _run(e, settings)
+    raw = rec.raw_outputs["recommendation"]
+    assert raw["scalpers_filtered"] == 1
+    traders_counted = {t["trader"] for t in raw["trades"]}
+    assert "Scalper Sam" not in traders_counted
+    assert "LongHold Lee" in traders_counted
+
+
+def test_weight_scalper_filter_disabled_by_default():
+    """min_trader_avg_hold_days=0 (default) must NOT filter anything, even an extreme
+    scalper — backward compatible with every pre-existing test/config."""
+    trades = [
+        _weight_trade("Scalper", "Sam", "AAPL", "purchase", "2026-06-01", "2026-05-20"),
+        _weight_trade("Other", "Trader", "AAPL", "purchase", "2026-06-02", "2026-05-21"),
+    ]
+    history = {
+        "Scalper Sam": _scalper_history("Scalper", "Sam", 10, hold_days=1),
+        "Other Trader": [_weight_trade("Other", "Trader", "AAPL", "purchase", "2026-05-01", "2026-05-10")],
+    }
+    e = _weight_expert("AAPL", trades, history, exec_price=95.0)
+    rec = _run(e, WEIGHT_SETTINGS)  # min_trader_avg_hold_days defaults to 0.0
+    raw = rec.raw_outputs["recommendation"]
+    assert raw["scalpers_filtered"] == 0
+    assert {t["trader"] for t in raw["trades"]} == {"Scalper Sam", "Other Trader"}
+
+
+def test_weight_scalper_filter_respects_min_roundtrips():
+    """A trader with FEWER round-trips than min_trader_hold_roundtrips is NOT filtered
+    even if their few trades happen to be quick flips (not enough history to judge)."""
+    trades = [
+        _weight_trade("Scalper", "Sam", "AAPL", "purchase", "2026-06-01", "2026-05-20"),
+        _weight_trade("Other", "Trader", "AAPL", "purchase", "2026-06-02", "2026-05-21"),
+    ]
+    history = {
+        # Only 1 round-trip, quick flip — below min_trader_hold_roundtrips=3.
+        "Scalper Sam": _scalper_history("Scalper", "Sam", 1, hold_days=1),
+        "Other Trader": [_weight_trade("Other", "Trader", "AAPL", "purchase", "2026-05-01", "2026-05-10")],
+    }
+    e = _weight_expert("AAPL", trades, history, exec_price=95.0)
+    settings = {**WEIGHT_SETTINGS, "min_trader_avg_hold_days": 5.0, "min_trader_hold_roundtrips": 3}
+    rec = _run(e, settings)
+    raw = rec.raw_outputs["recommendation"]
+    assert raw["scalpers_filtered"] == 0
+    assert {t["trader"] for t in raw["trades"]} == {"Scalper Sam", "Other Trader"}
