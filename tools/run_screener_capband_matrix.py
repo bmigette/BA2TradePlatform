@@ -128,6 +128,13 @@ def main() -> int:
     ap.add_argument("--mutation-prob", type=float, default=None,
                     help="Per-gene mutation probability passthrough (default: launcher's 0.3).")
     ap.add_argument("--interval", default="5min")
+    ap.add_argument("--spread-bps", type=float, default=0.0,
+                    help="Round-trip bid-ask spread in basis points, modeled at the fill-engine "
+                         "level (widens LIMIT/TP trigger thresholds + degrades MARKET/STOP fill "
+                         "prices) -- see BacktestAccount._slip/_limit_trigger_price. Applied to "
+                         "EVERY job this invocation runs (one value per driver call -- run large/"
+                         "mid/small as separate invocations with different values, since real "
+                         "spread varies sharply by cap band). Default 0.0 (off).")
     ap.add_argument("--fitness", default="calmar_ratio")
     ap.add_argument("--store", default=_STORE)
     ap.add_argument("--cadence-days", type=int, default=7)
@@ -232,6 +239,8 @@ def main() -> int:
                     "--fitness-trade-scale-cap", str(args.fitness_trade_scale_cap)]
         if args.fitness_win_rate_factor:
             cmd += ["--fitness-win-rate-factor"]
+        if args.spread_bps and args.spread_bps > 0:
+            cmd += ["--spread-bps", str(args.spread_bps)]
         # Auto-labels for easy filtering (GET /api/backtests?label=...): one tag for the grid/
         # batch id (--name-suffix, e.g. "goal5"), one for the strategy (or expert, for the
         # bypass FactorRanker job which has no strategy). Every top-N Backtest this job persists

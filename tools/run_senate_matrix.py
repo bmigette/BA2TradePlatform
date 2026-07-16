@@ -101,6 +101,10 @@ def main() -> int:
     ap.add_argument("--profit-share-cap-pct", type=float, default=25.0,
                     help="Cap each trade's share of the run's net profit for the ADJUSTED "
                          "fitness. Default 25. Pass 0 to disable.")
+    ap.add_argument("--spread-bps", type=float, default=0.0,
+                    help="Round-trip bid-ask spread in basis points (see BacktestAccount._slip/"
+                         "_limit_trigger_price). Senate's universe spans all cap bands, so this "
+                         "is a single blended assumption, not cap-band-specific. Default 0.0.")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -139,6 +143,8 @@ def main() -> int:
             cmd += ["--profit-share-cap-pct", str(args.profit_share_cap_pct)]
         if args.workers:
             cmd += ["--workers", args.workers]
+        if args.spread_bps and args.spread_bps > 0:
+            cmd += ["--spread-bps", str(args.spread_bps)]
         cmd += ["--labels", strat]
         print(f"[{i}/{len(jobs)}] RUN  {name} ...", flush=True)
         rc = subprocess.run(cmd, env=os.environ.copy()).returncode

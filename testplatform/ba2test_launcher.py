@@ -1963,6 +1963,7 @@ def _cmd_optimize(args) -> int:
                 "starting_cash": float(args.initial_capital),
                 "commission_per_trade": float(args.commission),
                 "slippage_bps": float(args.slippage),
+                "spread_bps": float(getattr(args, "spread_bps", 0.0)),
                 "fill_model": args.fill_model,
             },
             "warmup_days": derive_warmup_days([expert]),
@@ -2225,6 +2226,7 @@ def _cmd_optimize_batch(args) -> int:
                     "starting_cash": float(args.initial_capital),
                     "commission_per_trade": float(args.commission),
                     "slippage_bps": float(args.slippage),
+                    "spread_bps": float(getattr(args, "spread_bps", 0.0)),
                     "fill_model": args.fill_model,
                 },
                 "warmup_days": derive_warmup_days([expert]),
@@ -2875,6 +2877,11 @@ def main(argv: "list | None" = None) -> int:
                          "independent of cap-band or optimization_id. Default: none.")
     op.add_argument("--commission", type=float, default=1.0)
     op.add_argument("--slippage", type=float, default=0.0)
+    op.add_argument("--spread-bps", type=float, default=0.0,
+                    help="Round-trip bid-ask spread in basis points, modeled properly at the "
+                         "fill-engine level (widens LIMIT/TP trigger thresholds + degrades "
+                         "MARKET/STOP fill prices) -- see BacktestAccount._slip/"
+                         "_limit_trigger_price. Default 0.0 (off).")
     op.add_argument("--fill-model", default="next_bar_open")
     op.add_argument("--interval", default="5min", help="Execution/fill clock interval (default 5min for "
                     "precise intraday TP/SL; analysis cadence is set by --run-schedule).")
@@ -2947,6 +2954,8 @@ def main(argv: "list | None" = None) -> int:
                          "return). Complements --profit-cap-pct. Default: off.")
     ob.add_argument("--commission", type=float, default=1.0)
     ob.add_argument("--slippage", type=float, default=0.0)
+    ob.add_argument("--spread-bps", type=float, default=0.0,
+                    help="Round-trip bid-ask spread in basis points (see optimize --spread-bps).")
     ob.add_argument("--fill-model", default="next_bar_open")
     ob.add_argument("--interval", default="5min",
                     help="Fill-clock interval (default 5min for precise intraday TP/SL).")
