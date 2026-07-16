@@ -98,6 +98,15 @@ class ExpertRecommendation(SQLModel, table=True):
     expected_profit_percent: float
     price_at_date: float
     target_price: float | None = Field(default=None, description="Expert's recommended target/take-profit price (None -> derive from expected_profit_percent)")
+    min_take_profit_percent: float = Field(
+        default=2.0,
+        description="Floor for how close to entry a take-profit may be set, as %% of the REAL "
+                    "fill price (not the signal-time price_at_date) -- enforced by "
+                    "AdjustTakeProfitAction regardless of which reference_value produced the "
+                    "computed TP. Mirrors min_stop_loss_pct's role on the SL side. Snapshotted "
+                    "onto the recommendation (not read live) so backtest and live share the same "
+                    "mechanism without a live-only expert-instance lookup from TradeActions.py.",
+    )
     details: str | None
     confidence: float | None
     risk_level: RiskLevel = Field(description="LOW|MEDIUM|HIGH")

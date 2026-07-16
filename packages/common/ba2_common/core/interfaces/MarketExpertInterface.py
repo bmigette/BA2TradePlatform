@@ -171,6 +171,20 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                                "purely from risk_per_trade_pct%% (still floored at min_stop_loss_pct%%) — "
                                "useful when ATR-implied stops are too tight and causing frequent whipsaw."
                 },
+                "min_take_profit_pct": {
+                    "type": "float", "required": False, "default": 2.0,
+                    "description": "Minimum take-profit distance as %% of the REAL entry fill price",
+                    "tooltip": "Floors any adjust_take_profit action's resulting price so it's never "
+                               "closer than this %% to the actual filled entry price (order.open_price, "
+                               "not a stale signal-time price) — regardless of which reference_value "
+                               "(order_open_price / current_price / expert_target_price) computed it. "
+                               "Prevents a too-tight TP (e.g. an expert_target_price anchor that "
+                               "resolves to a fraction of a percent above entry) from being wiped out by "
+                               "normal spread/slippage. Default 2%%. NOTE: currently applies its "
+                               "universal 2%% default to every expert automatically; per-expert values "
+                               "other than the default require that expert's recommendation-creation "
+                               "code to read this setting explicitly (not yet wired for every expert)."
+                },
                 # AI Model Settings
                 "risk_manager_model": {
                     "type": "str", "required": True, "default": "NagaAC/gpt-5.1-2025-11-13",

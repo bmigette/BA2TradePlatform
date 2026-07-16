@@ -1046,8 +1046,100 @@ class AdjustTakeProfitAction(_AdjustPriceLevelAction):
         update_instance(transaction)
         logger.info(f"Stored current_target_price=${self.target_price:.2f} in transaction {transaction.id} metadata for TradeConditions")
 
+    def _resolve_min_take_profit_pct(self) -> float:
+        """min_take_profit_percent snapshotted on the triggering ExpertRecommendation at
+        signal time (mirrors expected_profit_percent's plumbing) -- defaults to 2.0 for rows
+        created before this field existed, or when no recommendation is linked. Snapshotted
+        rather than read live off an expert instance because TradeActions.py is shared by both
+        the live engine and the backtest engine, and only a live expert-instance lookup would
+        work in the live path."""
+        rec = self.expert_recommendation
+        if rec is None and self.existing_order and self.existing_order.expert_recommendation_id:
+            from ba2_common.core.db import get_instance
+            from ba2_common.core.models import ExpertRecommendation
+            rec = get_instance(ExpertRecommendation, self.existing_order.expert_recommendation_id)
+        return float(getattr(rec, "min_take_profit_percent", None) or 2.0) if rec else 2.0
+
     def _enforce_minimum_distance(self) -> None:
-        pass  # TP has no minimum distance enforcement
+        """Floor the TP so it's never closer than min_take_profit_pct%% to the REAL entry FILL
+        price (order.limit_price -> order.open_price -> current-price fallback -- the SAME
+        chain ORDER_OPEN_PRICE uses) regardless of which reference_value computed
+        self.target_price. This is what actually catches an EXPERT_TARGET_PRICE-anchored TP
+        that resolves too tight after real slippage on entry: that reference is computed from
+        the recommendation's price_at_date, a stale signal-time price that never re-syncs to
+        the real fill, so without this floor a slipped entry can silently erode the TP margin
+        below the configured minimum."""
+        if not self.existing_order or self.target_price is None:
+            return
+        entry_price = self.existing_order.limit_price
+        if entry_price is None:
+            entry_price = self.existing_order.open_price
+        if entry_price is None:
+            entry_price = self.get_current_price()
+        if not entry_price:
+            return
+        min_pct = self._resolve_min_take_profit_pct()
+        side_str = str(self.existing_order.side.value if hasattr(self.existing_order.side, "value")
+                       else self.existing_order.side).upper()
+        is_long = side_str == "BUY"
+        if is_long:
+            actual_pct = ((self.target_price - entry_price) / entry_price) * 100
+            if actual_pct < min_pct:
+                enforced_tp = entry_price * (1 + min_pct / 100)
+                logger.warning(
+                    f"TP enforcement: distance from entry {actual_pct:.2f}% below minimum "
+                    f"{min_pct}%. Adjusting TP from ${self.target_price:.2f} to "
+                    f"${enforced_tp:.2f} (entry: ${entry_price:.2f})"
+                )
+                self.target_price = enforced_tp
+                self.take_profit_price = self.target_price
+        else:
+            actual_pct = ((entry_price - self.target_price) / entry_price) * 100
+            if actual_pct < min_pct:
+                enforced_tp = entry_price * (1 - min_pct / 100)
+                logger.warning(
+                    f"TP enforcement: distance from entry {actual_pct:.2f}% below minimum "
+                    f"{min_pct}%. Adjusting TP from ${self.target_price:.2f} to "
+                    f"${enforced_tp:.2f} (entry: ${entry_price:.2f})"
+                )
+                self.target_price = enforced_tp
+                self.take_profit_price = self.target_price
+
+    def compute_price(self, order: "TradingOrder") -> Optional[float]:
+        """Calculate the take-profit price, enforcing the same real-entry-relative minimum
+        distance as _enforce_minimum_distance (see its docstring) -- used by the backtest
+        engine's entry_action seeding, which calls compute_price directly rather than
+        execute()."""
+        price = super().compute_price(order)
+        if price is None:
+            return None
+
+        entry_price = order.limit_price
+        if entry_price is None:
+            entry_price = order.open_price
+        if entry_price is None:
+            entry_price = self.get_current_price()
+        if not entry_price:
+            return price
+
+        min_pct = self._resolve_min_take_profit_pct()
+        if self.order_recommendation in (OrderRecommendation.BUY, OrderRecommendation.OVERWEIGHT):
+            is_long = True
+        elif self.order_recommendation in (OrderRecommendation.SELL, OrderRecommendation.UNDERWEIGHT):
+            is_long = False
+        else:
+            order_side = str(order.side.value if hasattr(order.side, 'value') else order.side).upper()
+            is_long = (order_side == "BUY")
+
+        if is_long:
+            actual_pct = ((price - entry_price) / entry_price) * 100
+            if actual_pct < min_pct:
+                price = entry_price * (1 + min_pct / 100)
+        else:
+            actual_pct = ((entry_price - price) / entry_price) * 100
+            if actual_pct < min_pct:
+                price = entry_price * (1 - min_pct / 100)
+        return price
 
 
 class AdjustStopLossAction(_AdjustPriceLevelAction):
