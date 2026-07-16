@@ -301,7 +301,19 @@ class GeneticOptimizer:
 
         individual = []
         for param_name in self.param_names:
-            individual.append(expanded_params.get(param_name, self.param_ranges[param_name]['min']))
+            config = self.param_ranges[param_name]
+            if param_name in expanded_params and config['type'] == 'choice':
+                # Categorical genes are chromosome-encoded as an int INDEX (see
+                # _create_individual/_mutate_individual/decode_individual) -- convert the
+                # decoded VALUE (e.g. a target_price_type string) back to its index. An
+                # unrecognised value (e.g. the source came from a differently-configured
+                # param space) falls back to index 0 rather than raising.
+                choices = config['choices']
+                value = expanded_params[param_name]
+                value = choices.index(value) if value in choices else 0
+            else:
+                value = expanded_params.get(param_name, config['min'])
+            individual.append(value)
         return creator.Individual(individual)
 
     def resume_from_checkpoint(self, checkpoint: Dict) -> tuple:

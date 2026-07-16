@@ -2096,6 +2096,8 @@ def _cmd_optimize(args) -> int:
                               else {**spec["expert_params"], **_RM_OPT, **screener_genes, **schedule_genes}),
             "backtest": backtest_block,
         }
+        if getattr(args, "warm_start_from", None) is not None:
+            cfg["warmStartFromOptimizationId"] = int(args.warm_start_from)
         _worker_ids = _worker_ids_from_args(args)
         opt = StrategyOptimization(
             strategy_id=strat.id, name=args.name or f"opt-{expert}",
@@ -2830,6 +2832,15 @@ def main(argv: "list | None" = None) -> int:
     op.add_argument("--save-top", type=int, default=5,
                     help="Persist the top-N distinct param sets as saved Backtests (default 5).")
     op.add_argument("--seed", type=int, default=42, help="RNG seed (determinism).")
+    op.add_argument("--warm-start-from", type=int, default=None,
+                    help="StrategyOptimization id to seed this job's STARTING population from "
+                         "(that job's evaluated individuals, most-recent -- i.e. approx. its "
+                         "final generation -- first). This is a warm start, NOT a resume: this "
+                         "job still runs its own fresh --generations budget from generation 0, "
+                         "and --seed still applies (so a different seed explores differently "
+                         "from the same starting point). Use to keep evolving a converged/"
+                         "plateaued run instead of re-searching from scratch. Default: off "
+                         "(fresh random population).")
     op.add_argument("--initial-capital", type=float, default=10000.0)
     op.add_argument("--profit-cap-pct", type=float, default=None,
                     help="Cap each trade's gain at this %% of its cost basis when computing the "

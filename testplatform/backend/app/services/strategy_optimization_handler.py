@@ -541,6 +541,35 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         ckpt = _load_checkpoint(task_id)
         if ckpt:
             start_gen, init_pop = optimizer.resume_from_checkpoint(ckpt)
+        else:
+            # Warm-start (NOT resume): seed this job's population from a DIFFERENT, already-run
+            # optimization's individuals, but run this job's OWN fresh --generations budget from
+            # generation 0 (start_gen stays 0) with its OWN --seed. Distinct from checkpoint-resume
+            # above (which continues THIS SAME interrupted job, carrying over its generation
+            # counter + RNG state) -- checkpoint-resume takes priority when both could apply.
+            warm_start_id = ga.get("warmStartFromOptimizationId")
+            if warm_start_id:
+                source_opt = db.query(StrategyOptimization).filter(
+                    StrategyOptimization.id == warm_start_id
+                ).first()
+                if source_opt is None:
+                    return _fail(
+                        opt_id, db,
+                        f"warm-start source optimization {warm_start_id} not found",
+                    )
+                init_pop = _build_warm_start_population(
+                    source_opt, optimizer, int(ga["populationSize"])
+                )
+                if init_pop is None:
+                    logger.warning(
+                        f"strategy_optimization {opt_id}: warm-start source {warm_start_id} "
+                        "has no all_results to seed from; starting with a fresh population"
+                    )
+                else:
+                    logger.warning(
+                        f"strategy_optimization {opt_id}: warm-started population "
+                        f"({len(init_pop)} individuals) from optimization {warm_start_id}"
+                    )
 
         # Suppress per-trial verbose logging for the optimization's duration — across many
         # trials it's pure noise (only a SINGLE standalone backtest should log in detail).
@@ -1107,3 +1136,35 @@ def _load_checkpoint(task_id: str) -> Optional[Dict[str, Any]]:
         return t.checkpoint_data if (t and t.checkpoint_data) else None
     finally:
         db.close()
+
+
+def _build_warm_start_population(
+    source_opt: StrategyOptimization, optimizer: GeneticOptimizer, target_size: int
+) -> Optional[list]:
+    """Seed a NEW job's starting population from a DIFFERENT, already-run optimization's
+    individuals -- a warm start, not a resume: this job still runs its OWN fresh
+    --generations budget from generation 0 (and can use a different --seed), it just starts
+    from evolved genomes instead of random ones.
+
+    ``StrategyOptimization.all_results`` accumulates ``{params, fitness, trades}`` for every
+    DISTINCT individual evaluated across the WHOLE source run (all generations, deduplicated
+    by the trial memo) -- there's no per-generation tag, so the LAST ``target_size`` entries
+    (append order = evaluation order) are used as an approximation of its final generation.
+    Real GA checkpointing (``_save_checkpoint``/``resume_from_checkpoint``) would give an
+    exact final population, but it's a no-op for CLI-driven runs today (the CLI's ``optimize``
+    command calls this handler directly under a single shared, non-unique task_id
+    ("cli-optimize"), so every CLI job's checkpoint clobbers the previous one's before it can
+    ever be read back) -- all_results is reliable regardless of how the source job ran.
+
+    Returns encoded chromosomes (``GeneticOptimizer.encode_params`` per individual, most-recent
+    first, padded with fresh random individuals up to ``target_size`` if the source had fewer),
+    or None if the source has no results to seed from.
+    """
+    results = source_opt.all_results or []
+    if not results:
+        return None
+    tail = results[-target_size:] if len(results) > target_size else list(results)
+    population = [optimizer.encode_params(e.get("params") or {}) for e in tail]
+    while len(population) < target_size:
+        population.append(optimizer.toolbox.individual())
+    return population[:target_size]

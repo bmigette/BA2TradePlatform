@@ -251,6 +251,94 @@ def test_handler_reproducible_via_db(monkeypatch):
     assert r1.best_fitness == r2.best_fitness
 
 
+def test_warm_start_seeds_population_from_source_optimization(monkeypatch):
+    """warmStartFromOptimizationId seeds this job's STARTING population from a DIFFERENT,
+    already-run optimization's all_results (not a resume of that job -- this run still uses
+    its own fresh generation counter and can use a different seed).
+
+    Verified two ways: (1) captures the actual initial_population/start_generation passed to
+    GeneticOptimizer.optimize, and (2) an extreme population=6/generations=1 budget (far too
+    small to find the peak from a RANDOM start) still lands near the known peak (fitness 10.0
+    at tp=8/sl=3) because it started there -- a purely random start could not do this."""
+    monkeypatch.setattr(H, "_run_trial_backtest", _deterministic_stub)
+    monkeypatch.setattr(H, "_build_hoisted_state", lambda cfg: {})
+    sid = _seed_strategy()
+
+    # Source job: fabricate all_results as if a prior GA run converged near the deterministic
+    # stub's known peak (tp=8, sl=3 -> fitness 10.0).
+    source_results = [
+        {"params": {"entry:bracket:a1:action_value": 8.0 + i * 0.1,
+                     "entry:bracket:a2:action_value": -3.0 - i * 0.1},
+         "fitness": 9.9 - i * 0.01, "trades": 5}
+        for i in range(6)
+    ]
+    source_id = _seed_opt(sid)
+    db = SessionLocal()
+    try:
+        src = db.query(StrategyOptimization).filter(StrategyOptimization.id == source_id).first()
+        src.all_results = source_results
+        db.commit()
+    finally:
+        db.close()
+
+    captured: dict = {}
+    import app.services.genetic as genetic_mod
+
+    RealOptimizer = genetic_mod.GeneticOptimizer
+
+    class _SpyOptimizer(RealOptimizer):
+        def optimize(self, *a, **kw):
+            captured["initial_population"] = kw.get("initial_population")
+            captured["start_generation"] = kw.get("start_generation")
+            return super().optimize(*a, **kw)
+
+    monkeypatch.setattr(H, "GeneticOptimizer", _SpyOptimizer)
+
+    target_id = _seed_opt(sid, config=_ga_config(
+        populationSize=6, generations=1, earlyStoppingGenerations=1,
+        warmStartFromOptimizationId=source_id,
+    ))
+    out = H.handle_strategy_optimization("t-warm-start", {"optimization_id": target_id})
+
+    assert out["status"] == "completed", out
+    assert captured["start_generation"] == 0  # fresh generation counter, NOT a resume
+    assert captured["initial_population"] is not None
+    assert len(captured["initial_population"]) == 6  # == populationSize, source also had 6
+
+    row = _load_opt(target_id)
+    # 1 generation / 6 individuals from a RANDOM start would not reliably land this close to
+    # the peak (10.0) -- this confirms the warm-started individuals actually drove the result.
+    assert row.best_fitness >= 9.5
+
+
+def test_warm_start_falls_back_to_fresh_population_when_source_has_no_results(monkeypatch):
+    """A source optimization with no all_results (e.g. it failed before evaluating anyone)
+    must not crash the new job -- it just starts fresh, same as no warm start at all."""
+    monkeypatch.setattr(H, "_run_trial_backtest", _deterministic_stub)
+    monkeypatch.setattr(H, "_build_hoisted_state", lambda cfg: {})
+    sid = _seed_strategy()
+
+    empty_source_id = _seed_opt(sid)  # all_results defaults to None/[]
+    target_id = _seed_opt(sid, config=_ga_config(
+        warmStartFromOptimizationId=empty_source_id,
+    ))
+    out = H.handle_strategy_optimization("t-warm-start-empty", {"optimization_id": target_id})
+    assert out["status"] == "completed", out
+
+
+def test_warm_start_missing_source_fails_loud(monkeypatch):
+    """An unresolvable warmStartFromOptimizationId must fail the job with a clear error, not
+    silently ignore the request or crash with a raw exception."""
+    monkeypatch.setattr(H, "_run_trial_backtest", _deterministic_stub)
+    monkeypatch.setattr(H, "_build_hoisted_state", lambda cfg: {})
+    sid = _seed_strategy()
+
+    target_id = _seed_opt(sid, config=_ga_config(warmStartFromOptimizationId=999999))
+    out = H.handle_strategy_optimization("t-warm-start-missing", {"optimization_id": target_id})
+    assert out["status"] == "failed"
+    assert "999999" in out["error"]
+
+
 def test_required_ga_key_validation(monkeypatch):
     """A missing GA key must fail fast (no-defaults rule, gate #5)."""
     monkeypatch.setattr(H, "_run_trial_backtest", _deterministic_stub)
