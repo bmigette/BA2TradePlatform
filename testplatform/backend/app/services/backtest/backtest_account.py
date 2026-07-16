@@ -272,6 +272,18 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 "required": True,
                 "description": "Slippage in basis points applied to market/stop fills (worsening)",
             },
+            "spread_bps": {
+                "type": "float",
+                "required": False,
+                "description": "Round-trip bid-ask spread in basis points, modeled properly "
+                               "(not just a pnl haircut): MARKET/STOP fills get an EXTRA "
+                               "half-spread price degradation on top of slippage; LIMIT fills "
+                               "(the TP leg) get their TRIGGER threshold widened by half-spread "
+                               "-- the underlying market must move further to realistically "
+                               "cross the spread, so a marginal TP can miss entirely and the "
+                               "trade resolves via SL/timeout instead, not just at a worse "
+                               "price. Default 0.0 (exact no-op, existing behaviour unchanged).",
+            },
             "fill_model": {
                 "type": "str",
                 "required": True,
@@ -2758,9 +2770,27 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         return self._price.next_bar(order.symbol, as_of)  # default: next_bar_open
 
     def _slip(self, px: float, side_is_buy: bool) -> float:
-        """Apply slippage in the worsening direction (buys up, sells down)."""
+        """Apply slippage + half the bid-ask spread in the worsening direction (buys up, sells
+        down). MARKET and STOP fills trade INTO the spread immediately once triggered (a stop
+        becomes a market order), so the cost lands entirely on the fill PRICE here -- unlike a
+        LIMIT fill, whose spread cost instead widens the TRIGGER threshold (see
+        ``_limit_trigger_price``). spread_bps defaults to 0.0 (optional setting) so an existing
+        config that never set it is an exact no-op, identical to before this was added."""
         bps = float(self._cfg["slippage_bps"]) / 10_000.0
+        bps += float(self._cfg.get("spread_bps", 0.0)) / 10_000.0 / 2.0
         return px * (1.0 + bps) if side_is_buy else px * (1.0 - bps)
+
+    def _limit_trigger_price(self, limit_price: float, is_sell: bool) -> float:
+        """The RAW market price a LIMIT order's underlying mid/last must reach for a fill at
+        ``limit_price`` to be realistic given a round-trip bid-ask spread: a SELL_LIMIT only
+        crosses the BID, so the market needs to trade half-spread ABOVE the limit; a BUY_LIMIT
+        only crosses the ASK, so half-spread BELOW. The fill price stays ``limit_price`` (the
+        net target actually realized once the wider threshold is crossed) -- this only makes
+        the order HARDER to trigger, so a marginal TP can miss the window entirely and the
+        trade resolves via its SL/timeout instead, unlike a flat pnl haircut which can't change
+        which exit a trade takes. spread_bps=0.0 (default) returns ``limit_price`` unchanged."""
+        frac = float(self._cfg.get("spread_bps", 0.0)) / 10_000.0 / 2.0
+        return limit_price * (1.0 + frac) if is_sell else limit_price * (1.0 - frac)
 
     def _trigger_thresholds(self, order) -> tuple:
         """The (trig_hi, trig_lo) PLAIN-float price thresholds for a working equity order.
@@ -2793,9 +2823,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         if ot == OrderType.MARKET:
             trig_hi = -INF  # always triggers (bar.high >= -inf is always True)
         elif ot == OrderType.BUY_LIMIT:
-            trig_lo = float(order.limit_price)
+            trig_lo = self._limit_trigger_price(float(order.limit_price), is_sell=False)
         elif ot == OrderType.SELL_LIMIT:
-            trig_hi = float(order.limit_price)
+            trig_hi = self._limit_trigger_price(float(order.limit_price), is_sell=True)
         elif ot == OrderType.BUY_STOP:
             trig_hi = float(order.stop_price)
         elif ot == OrderType.SELL_STOP:
@@ -2804,19 +2834,21 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             # Both legs present: one side is a {bar.high >= X} test, the other {bar.low <= X}.
             # SELL OCO (closing long):  TP SELL_LIMIT (high>=limit), SL SELL_STOP (low<=stop).
             # BUY  OCO (closing short): SL BUY_STOP   (high>=stop),  TP BUY_LIMIT  (low<=limit).
+            # The TP (limit) side's threshold is spread-widened; the SL (stop) side is not (its
+            # spread cost lands on the fill PRICE via _slip once triggered, not the threshold).
             is_sell = order.side == OrderDirection.SELL
             tp = order.limit_price
             sl = order.stop_price
             if is_sell:
                 if tp is not None:
-                    trig_hi = float(tp)
+                    trig_hi = self._limit_trigger_price(float(tp), is_sell=True)
                 if sl is not None:
                     trig_lo = float(sl)
             else:
                 if sl is not None:
                     trig_hi = float(sl)
                 if tp is not None:
-                    trig_lo = float(tp)
+                    trig_lo = self._limit_trigger_price(float(tp), is_sell=False)
         # else: unknown type -> never triggers via the gate (INF/-INF). _evaluate_fill returns
         # None for it anyway, so the gate (which would skip it) stays results-identical.
         order._trig_hi = trig_hi
@@ -2847,9 +2879,11 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             return self._slip(ref, order.side == OrderDirection.BUY)
 
         if ot == OrderType.BUY_LIMIT:
-            return order.limit_price if bar["low"] <= order.limit_price else None
+            trig = self._limit_trigger_price(float(order.limit_price), is_sell=False)
+            return order.limit_price if bar["low"] <= trig else None
         if ot == OrderType.SELL_LIMIT:
-            return order.limit_price if bar["high"] >= order.limit_price else None
+            trig = self._limit_trigger_price(float(order.limit_price), is_sell=True)
+            return order.limit_price if bar["high"] >= trig else None
 
         if ot == OrderType.BUY_STOP:
             return self._slip(order.stop_price, True) if bar["high"] >= order.stop_price else None
@@ -2878,19 +2912,21 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
 
         if is_sell:
             sl_hit = sl is not None and bar["low"] <= sl
-            tp_hit = tp is not None and bar["high"] >= tp
+            tp_trig = self._limit_trigger_price(float(tp), is_sell=True) if tp is not None else None
+            tp_hit = tp_trig is not None and bar["high"] >= tp_trig
             if sl_hit:
-                return self._slip(sl, False)   # SELL_STOP fills at stop -slippage
+                return self._slip(sl, False)   # SELL_STOP fills at stop -slippage(-spread/2)
             if tp_hit:
-                return tp                       # SELL_LIMIT fills at limit (no slippage)
+                return tp                       # SELL_LIMIT fills at limit (trigger was widened)
             return None
         else:
             sl_hit = sl is not None and bar["high"] >= sl
-            tp_hit = tp is not None and bar["low"] <= tp
+            tp_trig = self._limit_trigger_price(float(tp), is_sell=False) if tp is not None else None
+            tp_hit = tp_trig is not None and bar["low"] <= tp_trig
             if sl_hit:
-                return self._slip(sl, True)    # BUY_STOP fills at stop +slippage
+                return self._slip(sl, True)    # BUY_STOP fills at stop +slippage(+spread/2)
             if tp_hit:
-                return tp                       # BUY_LIMIT fills at limit
+                return tp                       # BUY_LIMIT fills at limit (trigger was widened)
             return None
 
     def _apply_fill(self, order, fill_px: float, as_of: datetime) -> None:

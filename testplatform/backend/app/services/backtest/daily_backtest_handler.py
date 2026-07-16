@@ -373,6 +373,13 @@ def _build_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         "commission_per_trade": float(payload["commission"]),
         "slippage_bps": float(payload["slippage"]),
         "fill_model": str(payload["fill_model"]),
+        # Optional (default 0.0 = exact no-op): round-trip bid-ask spread, modeled properly at
+        # the fill-engine level (widens LIMIT/TP trigger thresholds + degrades MARKET/STOP fill
+        # prices) -- see BacktestAccount._slip/_limit_trigger_price. Distinct from the Monte
+        # Carlo robustness suite's spread_bps/spread_sweep_bps (a post-hoc pnl_pct haircut over
+        # ALREADY-decided trades, robustness.py's apply_spread_cost) -- this one can change
+        # WHICH exit a trade takes, not just its realized pnl.
+        "spread_bps": float(payload.get("spread_bps") or 0.0),
     }
 
     # warmup_days: longest indicator/lookback window the experts need preloaded before

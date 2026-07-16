@@ -703,3 +703,154 @@ def test_price_cache_busted_across_bars():
         assert acct.get_instrument_current_price("AAPL") == 200.0  # not stale 100.0
     finally:
         ctx.__exit__(None, None, None)
+
+
+# ---------------------------------------------------------------------------
+# spread_bps: proper fill-engine modeling (not a post-hoc pnl haircut) —
+# MARKET/STOP fills get an EXTRA half-spread price degradation; LIMIT (TP) fills get their
+# TRIGGER threshold widened by half-spread, so a marginal TP can miss the bar entirely instead
+# of just filling at a worse price.
+# ---------------------------------------------------------------------------
+def test_spread_bps_absent_from_cfg_is_noop():
+    """An existing config dict that never sets spread_bps at all (not even 0.0) must behave
+    identically to before this feature existed -- proves the .get(..., 0.0) default, not a
+    required key that would break every pre-existing caller."""
+    from ba2_common.core.types import OrderDirection
+
+    assert "spread_bps" not in CFG
+    acct, ctx, ps = _acct([(D1, 100, 101, 99, 100), (D2, 102, 103, 101, 102)])
+    try:
+        ps.set_clock(D1)
+        o = _market("AAPL", 10, OrderDirection.BUY)
+        acct.submit_order(o)
+        acct.refresh_orders()
+        assert acct.get_order(o.broker_order_id).open_price == pytest.approx(102.0)
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_spread_worsens_market_buy_beyond_slippage():
+    from ba2_common.core.types import OrderDirection
+
+    # 50bps slippage + 100bps spread (half = 50bps) -> total 100bps worsening on a buy.
+    cfg = {**CFG, "slippage_bps": 50.0, "spread_bps": 100.0}
+    acct, ctx, ps = _acct([(D1, 100, 101, 99, 100), (D2, 102, 103, 101, 102)], cfg=cfg)
+    try:
+        ps.set_clock(D1)
+        o = _market("AAPL", 10, OrderDirection.BUY)
+        acct.submit_order(o)
+        acct.refresh_orders()
+        assert acct.get_order(o.broker_order_id).open_price == pytest.approx(102.0 * 1.01)
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_spread_worsens_market_sell_beyond_slippage():
+    from ba2_common.core.types import OrderDirection
+
+    cfg = {**CFG, "slippage_bps": 50.0, "spread_bps": 100.0}
+    acct, ctx, ps = _acct([(D1, 100, 101, 99, 100), (D2, 102, 103, 101, 102)], cfg=cfg)
+    try:
+        ps.set_clock(D1)
+        o = _market("AAPL", 10, OrderDirection.SELL)
+        acct.submit_order(o)
+        acct.refresh_orders()
+        assert acct.get_order(o.broker_order_id).open_price == pytest.approx(102.0 * 0.99)
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_spread_widens_buy_limit_trigger_so_marginal_fill_misses():
+    """WITHOUT spread this BUY_LIMIT would fill (D2 low 99 <= limit 100, matching
+    test_buy_limit_fills_at_limit_when_bar_crosses exactly) -- WITH a wide enough spread the
+    trigger widens below the bar's low, so it must NOT fill on this bar. This is the behavior
+    difference from a flat pnl haircut: the trade takes a DIFFERENT exit, not just a worse
+    price on the SAME exit."""
+    from ba2_common.core.types import OrderDirection, OrderType, OrderStatus
+
+    # BUY_LIMIT trigger widens to limit * (1 - spread/2) = 100 * (1 - 0.02) = 98.0; D2 low is
+    # 99, which no longer crosses 98.0.
+    cfg = {**CFG, "spread_bps": 400.0}  # 4% round-trip -> 2% half-spread
+    acct, ctx, ps = _acct([(D1, 100, 101, 99, 100), (D2, 101, 102, 99, 101)], cfg=cfg)
+    try:
+        ps.set_clock(D1)
+        o = _limit("AAPL", 10, OrderDirection.BUY, OrderType.BUY_LIMIT, 100.0)
+        acct.submit_order(o)
+        acct.refresh_orders()
+        assert acct.get_order(o.broker_order_id).status != OrderStatus.FILLED
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_spread_widened_sell_limit_still_fills_at_original_limit_price():
+    """When the bar's range DOES cross the widened threshold, the fill price is still the
+    ORIGINAL limit price (the net target actually realized), not further discounted -- the
+    spread cost is entirely in whether/when it fires, not an extra price haircut on top."""
+    from ba2_common.core.types import OrderDirection, OrderType, OrderStatus
+
+    # SELL_LIMIT @104, spread_bps=200 (1% half-spread) -> widened trigger = 104*1.01 = 105.04.
+    # D2 high is 106 -> still crosses the widened trigger; fills AT 104 (unchanged).
+    cfg = {**CFG, "spread_bps": 200.0}
+    acct, ctx, ps = _acct([(D1, 100, 101, 99, 100), (D2, 102, 106, 101, 103)], cfg=cfg)
+    try:
+        ps.set_clock(D1)
+        o = _limit("AAPL", 10, OrderDirection.SELL, OrderType.SELL_LIMIT, 104.0)
+        acct.submit_order(o)
+        acct.refresh_orders()
+        filled = acct.get_order(o.broker_order_id)
+        assert filled.status == OrderStatus.FILLED
+        assert filled.open_price == pytest.approx(104.0)
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_spread_does_not_change_stop_trigger_only_the_fill_price():
+    """A STOP order's trigger stays at the RAW stop price regardless of spread (a stop just
+    becomes a market order once crossed) -- only its fill price gets the extra half-spread
+    degradation, exactly like a market order."""
+    from ba2_common.core.types import OrderDirection, OrderType, OrderStatus
+
+    cfg = {**CFG, "spread_bps": 200.0}  # 1% half-spread, no slippage
+    # D2 high is 110 -> BUY_STOP @ 105 triggers (unchanged threshold); fills at 105 * 1.01.
+    acct, ctx, ps = _acct([(D1, 100, 101, 99, 100), (D2, 104, 110, 103, 108)], cfg=cfg)
+    try:
+        ps.set_clock(D1)
+        o = _stop("AAPL", 10, OrderDirection.BUY, OrderType.BUY_STOP, 105.0)
+        acct.submit_order(o)
+        acct.refresh_orders()
+        filled = acct.get_order(o.broker_order_id)
+        assert filled.status == OrderStatus.FILLED
+        assert filled.open_price == pytest.approx(105.0 * 1.01)
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_spread_widens_oco_tp_leg_so_marginal_bracket_tp_misses():
+    """The same widening applies to the bracket-exit TP leg (adjust_tp / OCO), not just a
+    standalone LIMIT order -- this is the path _apply_bracket_exits/_FillProbe actually uses
+    for a strategy's entry TP/SL, i.e. the one that matters for the FMPEarningsDrift-562-style
+    tight-TP concern."""
+    from ba2_common.core.types import OrderStatus
+
+    # TP @106, spread_bps=400 (2% half-spread) -> widened trigger = 106*1.02 = 108.12.
+    # D3 high is 107 -> crosses the RAW TP (106) but NOT the widened trigger (108.12) -> no fill.
+    acct, ctx, ps = _acct(
+        [(D1, 100, 101, 99, 100), (D2, 102, 103, 101, 102), (D3, 104, 107, 103, 106)],
+        cfg={**CFG, "spread_bps": 400.0},
+    )
+    try:
+        ps.set_clock(D1)
+        entry, txn = _open_long_with_legs(acct, ps)
+        acct.adjust_tp(txn, 106.0)
+        ps.set_clock(D1); acct.refresh_orders(); acct.refresh_transactions()  # entry fills @102
+        assert acct.get_order(entry.broker_order_id).status == OrderStatus.FILLED
+        ps.set_clock(D2); acct.refresh_orders(); acct.refresh_transactions()  # bracket vs D3
+        # Unlike test_tp_closes_position_when_price_crosses (same bars, spread_bps=0), the
+        # position must STILL be open -- the widened TP threshold wasn't reached. (Not asserting
+        # get_round_trip_trades() == [] here: it synthesizes an "open_at_end" pseudo-trade for
+        # still-open positions for P&L reporting, so it's never empty once a position exists.)
+        assert len(acct.get_positions()) == 1
+        assert acct.get_positions()[0]["qty"] == 10.0
+        assert all(t["exit_reason"] != "take_profit" for t in acct.get_round_trip_trades())
+    finally:
+        ctx.__exit__(None, None, None)

@@ -112,6 +112,7 @@ def test_build_config_assembles_account_settings():
         "commission_per_trade": 1.0,
         "slippage_bps": 0.0,
         "fill_model": "next_bar_open",
+        "spread_bps": 0.0,  # optional, defaults to 0.0 (exact no-op) when absent from payload
     }
     assert cfg["enabled_instruments"] == ["AAPL"]
     assert cfg["initial_capital"] == 100_000.0
