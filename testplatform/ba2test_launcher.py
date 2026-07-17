@@ -2245,7 +2245,9 @@ def _cmd_optimize(args) -> int:
         print(f"optimize: done. best_fitness={opt.best_fitness} best_params={json.dumps(opt.best_params, default=str)}")
     finally:
         db.close()
-    nsaved = _persist_top_backtests(opt_id, expert, n=int(args.save_top), parallel=int(args.parallel))
+    from app.services.strategy_optimization_handler import _last_gen_full_results_by_opt
+    nsaved = _persist_top_backtests(opt_id, expert, n=int(args.save_top), parallel=int(args.parallel),
+                                     last_gen_full_results=_last_gen_full_results_by_opt.pop(opt_id, None))
     print(f"optimize: top {nsaved} persisted as tagged, saved Backtests (optimization_id={opt_id}); "
           f"run `ba2-test runs list --group {opt_id}` or `ba2-test report`.")
     return 0
@@ -2408,7 +2410,16 @@ def _cmd_optimize_batch(args) -> int:
             continue
 
         try:
-            nsaved = _persist_top_backtests(opt_id, expert, n=int(args.save_top), parallel=int(args.parallel))
+            # NOTE: this batch driver submits each optimization to the RUNNING serve queue and
+            # polls it (it never calls handle_strategy_optimization in THIS process), so
+            # _last_gen_full_results_by_opt here is process-local to the CLI, not the serve
+            # process that actually ran the GA -- this pop is a no-op (always None) until the
+            # serve process's own buffer is collected too (tracked separately; see the "KNOWN
+            # GAP" comment on _last_gen_full_results_by_opt's declaration). Harmless: falls back
+            # to the existing full re-run path exactly like today.
+            from app.services.strategy_optimization_handler import _last_gen_full_results_by_opt
+            nsaved = _persist_top_backtests(opt_id, expert, n=int(args.save_top), parallel=int(args.parallel),
+                                             last_gen_full_results=_last_gen_full_results_by_opt.pop(opt_id, None))
             print(f"[{n}/{len(jobs)}] {expert} opt#{opt_id} COMPLETE; persisted top {nsaved} backtests.")
         except Exception as exc:  # noqa: BLE001
             print(f"[{n}/{len(jobs)}] persist top-N failed for opt#{opt_id}: {exc}")
@@ -2422,7 +2433,8 @@ def _cmd_optimize_batch(args) -> int:
     return 0
 
 
-def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int = 1) -> int:
+def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int = 1,
+                            last_gen_full_results: Optional[Dict[str, Any]] = None) -> int:
     """Re-run the optimization's TOP-N distinct param sets and persist each as a tagged,
     saved Backtest (best params + their metrics) so the top performers are kept for
     comparison and to warm-start future optimizations. Returns how many were persisted.
@@ -2468,25 +2480,27 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
         # in INERT genes (e.g. exit:<id>:action_value while exit:<id>:enabled=0) yet score the same
         # and produce identical backtests — keying on params would persist N behaviourally-identical
         # rows. Distinct fitness gives genuinely different performers across the search landscape.
+        last_gen_full_results = last_gen_full_results or {}
         seen, ranked = set(), []
         for r in sorted(opt.all_results or [], key=lambda r: (r.get("fitness") if r.get("fitness") is not None else -1e9), reverse=True):
             fit = r.get("fitness")
-            key = round(fit, 6) if isinstance(fit, (int, float)) else _json.dumps(r.get("params"), sort_keys=True, default=str)
-            if key in seen:
+            dedup_key = round(fit, 6) if isinstance(fit, (int, float)) else _json.dumps(r.get("params"), sort_keys=True, default=str)
+            if dedup_key in seen:
                 continue
-            seen.add(key)
-            ranked.append(r["params"])
+            seen.add(dedup_key)
+            ranked.append((r["params"], r.get("key")))
             if len(ranked) >= n:
                 break
         if not ranked and opt.best_params:
-            ranked = [opt.best_params]
+            ranked = [(opt.best_params, None)]  # no trial key known -> always falls back to re-run
 
         # 1) Build every re-run's spec in the MASTER (cheap: decode + config + display params).
         #    Store the raw optimized genes (for the "Optimized Parameters" display) AND the CONCRETE
         #    decoded ruleset that actually ran (buy/sell/exit trees + TP/SL) so Load/export can
         #    restore the optimized conditions directly. Keys mirror what _derive_export_payload reads.
-        specs = []  # (rank, trial_cfg, strategy_params)
-        for rank, params in enumerate(ranked, start=1):
+        ready = []  # (rank, trial_cfg, strategy_params, full_results) -- no re-run needed
+        specs = []  # (rank, trial_cfg, strategy_params) -- must be re-run (existing path)
+        for rank, (params, trial_key_) in enumerate(ranked, start=1):
             decoded = decode_params(strat, params)
             trial_cfg = _build_daily_trial_config(bt_block, decoded, hoisted)
             trial_cfg["name"] = f"TOP{rank}-{opt.name or expert}"
@@ -2502,7 +2516,14 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
                 strategy_params["entryRules"] = decoded["entry_rules"]
             if decoded.get("exit_rules") is not None:
                 strategy_params["exitRules"] = decoded["exit_rules"]
-            specs.append((rank, trial_cfg, strategy_params))
+            buffered = last_gen_full_results.get(trial_key_) if trial_key_ else None
+            if buffered is not None:
+                ready.append((rank, trial_cfg, strategy_params, buffered))
+            else:
+                specs.append((rank, trial_cfg, strategy_params))
+        if ready:
+            print(f"    {len(ready)}/{len(ranked)} top individual(s) available from the GA's "
+                  f"last generation (no re-run); re-running the remaining {len(specs)}.")
 
         # 2) Run the re-runs (the slow part) and persist each as a tagged, saved Backtest the moment
         #    it finishes — MASTER-only DB writes. Committing INCREMENTALLY (not collect-then-commit)
@@ -2541,6 +2562,10 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
             return True
 
         persisted = 0
+        for rank, trial_cfg, strategy_params, full_results in ready:
+            if _persist_one(rank, trial_cfg, strategy_params, {"ok": True, "results": full_results}):
+                persisted += 1
+                print(f"    persisted TOP{rank} ({persisted}/{len(ranked)}) [no re-run]")
         n_local = max(1, min(int(parallel or 1), len(specs)))
         remote_workers = _resolve_workers(db, getattr(opt, "worker_ids", None))
         if remote_workers:

@@ -157,3 +157,85 @@ def test_persist_one_mirrors_entry_rules_into_strategy_params(monkeypatch):
         assert bt.strategy_params.get("exitRules") is None
     finally:
         db.close()
+
+
+def test_persist_top_uses_buffered_full_results_without_rerun(monkeypatch):
+    """When every top-N individual's full results are already in the buffer (the common case —
+    they came from the GA's own last generation), _persist_top_backtests must NOT invoke
+    _persist_trial_worker (the re-run path) at all."""
+    opt_id = _seed_opt_for_top_n()
+    # Overwrite all_results with an entry carrying a real trial `key` so the buffer lookup works.
+    db = SessionLocal()
+    try:
+        opt = db.query(StrategyOptimization).filter_by(id=opt_id).first()
+        opt.all_results = [{"params": {}, "fitness": 1.23, "trades": 10, "key": "trial-key-1"}]
+        db.commit()
+    finally:
+        db.close()
+
+    calls = []
+    monkeypatch.setattr(_sync_client, "push_backtest", lambda bt, db: calls.append(bt.name))
+    monkeypatch.setattr(
+        _soh, "_persist_trial_worker",
+        lambda cfg: (_ for _ in ()).throw(AssertionError("must not re-run — buffer had this key")),
+    )
+
+    persisted = mod._persist_top_backtests(
+        opt_id, "FMPRating", n=1, parallel=1,
+        last_gen_full_results={"trial-key-1": dict(_RESULTS)},
+    )
+
+    assert persisted == 1
+    assert calls == ["TOP1-top-n-opt"]
+
+
+def test_persist_top_reruns_only_the_missing_members(monkeypatch):
+    """Two top-N individuals: one's key is in the buffer (persist directly), the other's is not
+    (e.g. an elite reused via the GA memo, never freshly evaluated in the last generation) — only
+    the missing one goes through the re-run path."""
+    opt_id = _seed_opt_for_top_n()
+    db = SessionLocal()
+    try:
+        opt = db.query(StrategyOptimization).filter_by(id=opt_id).first()
+        # Params must be valid namespaced genes (decode_params rejects unknown-namespace keys
+        # like a bare "a") -- "model:*" is stripped of its prefix into expert_overrides and
+        # accepts any param name, so it's the simplest way to get two distinct-but-valid genomes.
+        opt.all_results = [
+            {"params": {"model:x": 1}, "fitness": 2.0, "trades": 10, "key": "buffered-key"},
+            {"params": {"model:x": 2}, "fitness": 1.0, "trades": 5, "key": "missing-key"},
+        ]
+        db.commit()
+    finally:
+        db.close()
+
+    rerun_calls = []
+    monkeypatch.setattr(_sync_client, "push_backtest", lambda bt, db: None)
+    monkeypatch.setattr(
+        _soh, "_persist_trial_worker",
+        lambda cfg: rerun_calls.append(cfg) or {"ok": True, "results": dict(_RESULTS)},
+    )
+
+    persisted = mod._persist_top_backtests(
+        opt_id, "FMPRating", n=2, parallel=1,
+        last_gen_full_results={"buffered-key": dict(_RESULTS)},
+    )
+
+    assert persisted == 2
+    assert len(rerun_calls) == 1  # only the "missing-key" individual was re-run
+
+
+def test_persist_top_no_buffer_falls_back_to_full_rerun(monkeypatch):
+    """Backward compatibility: calling without last_gen_full_results (or with None) behaves
+    exactly like today — every top-N individual is re-run."""
+    opt_id = _seed_opt_for_top_n()
+    calls = []
+    monkeypatch.setattr(_sync_client, "push_backtest", lambda bt, db: calls.append(bt.name))
+    monkeypatch.setattr(
+        _soh, "_persist_trial_worker",
+        lambda cfg: {"ok": True, "results": dict(_RESULTS)},
+    )
+
+    persisted = mod._persist_top_backtests(opt_id, "FMPRating", n=1, parallel=1)
+
+    assert persisted == 1
+    assert calls == ["TOP1-top-n-opt"]
