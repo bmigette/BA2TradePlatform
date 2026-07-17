@@ -18,13 +18,23 @@ freshly evaluated in the last generation).
 2. `handle_strategy_optimization`'s `batch_fitness` closure sets that flag only for the
    population being evaluated in the GA's final generation, and accumulates each returned
    `full_results` blob into an in-memory `last_gen_full_results: Dict[str, dict]` (keyed by the
-   trial's cache key) that lives for the duration of the run. This buffer is returned as part of
-   `handle_strategy_optimization`'s result dict — never written to the DB (it can be large; it's
-   consumed immediately, in-process, by the very next step).
-3. `_persist_top_backtests` (the CLI's post-GA persist step) accepts this buffer. For each of the
-   top-N ranked param sets it now persists DIRECTLY from the buffered full results when the
-   trial's key is present, and falls back to the existing re-run codepath only for the (typically
-   0-2) top-N members whose key is missing.
+   trial's cache key) that lives for the duration of the run. **This buffer is stashed in a
+   module-level, process-local, `opt_id`-keyed scratch dict
+   (`_last_gen_full_results_by_opt`) — it is NOT added to `handle_strategy_optimization`'s
+   return value.** That return dict flows into `TaskQueue.result` (a JSON DB column,
+   `_process_task_inline` in `task_queue.py:719-726`) for every UI/API-submitted optimization —
+   the main task queue registers this handler with `use_subprocess=False`
+   (`app/main.py:311`, `task_queue.py:56` default) — so anything added to the return dict gets
+   persisted to the DB for every real job, not just the CLI path. The buffer can hold a full
+   generation's worth of trade/equity/drawdown blobs (~100-140 individuals), so it must never
+   flow through that generic path. Only the CLI's direct, in-process caller (Task 3, below) pops
+   it from the module-level dict right after `handle_strategy_optimization` returns.
+3. `_persist_top_backtests` (the CLI's post-GA persist step) reads and pops the buffer from
+   `_last_gen_full_results_by_opt` (keyed by `opt_id`, defaulting to `{}`/`None` if absent — e.g.
+   a UI-submitted run, or a CLI run whose process was interrupted before reaching this step). For
+   each of the top-N ranked param sets it now persists DIRECTLY from the buffered full results
+   when the trial's key is present, and falls back to the existing re-run codepath only for the
+   (typically 0-2) top-N members whose key is missing.
 
 **Why this is safe / doesn't slow the GA:** `run_daily_backtest` already computes the full
 results dict internally for EVERY trial today — `_trial_worker` just discards it down to
@@ -36,14 +46,27 @@ the several-minutes-each cost of re-running full backtests from scratch for 5 in
 current, hang-prone behavior observed live on 2026-07-17: `_persist_top_backtests`'s
 `ProcessPoolExecutor`+`ThreadPoolExecutor` fan-out hung mid-run with only 1/5 saved).
 
-**Known limitation (explicitly in scope, not silently traded away):** the last generation's
-population may not contain the GA's true best-ever individual if it was out-competed after
-elitism stopped carrying it forward. The *existing* re-run code sidesteps this by picking top-N
-from `opt.all_results` (every generation). This plan keeps that exact selection logic —
-`last_gen_full_results` is only a *fast path* for individuals that happen to be available; the
-fallback re-run still runs for anything not in the buffer, so correctness (which individuals get
-persisted) is unchanged from today. Only the speed/reliability of *how* they get persisted
-changes.
+**Known limitations (explicitly in scope, not silently traded away):**
+- The last generation's population may not contain the GA's true best-ever individual if it was
+  out-competed after elitism stopped carrying it forward. The *existing* re-run code sidesteps
+  this by picking top-N from `opt.all_results` (every generation). This plan keeps that exact
+  selection logic — `last_gen_full_results` is only a *fast path* for individuals that happen to
+  be available; the fallback re-run still runs for anything not in the buffer, so correctness
+  (which individuals get persisted) is unchanged from today. Only the speed/reliability of *how*
+  they get persisted changes.
+- `is_last_gen` is computed as `gen_state["gen"] == n_gens - 1` — i.e. "the generation the GA's
+  configured budget says is last." When a run exits via **early stopping**
+  (`GeneticOptimizer.optimize()`'s `no_improvement_count >= early_stopping_generations` break,
+  `genetic.py`) before reaching that generation, the buffer stays empty for the whole run — early
+  stopping is a normal, commonly-hit exit path (not an edge case), so this means the fast path
+  does nothing for a meaningful fraction of real runs. This degrades gracefully (Task 3's
+  fallback-to-full-rerun handles an empty/missing buffer correctly — same behavior as today, just
+  without the speedup) so it is NOT a correctness bug, only a missed optimization. Deliberately
+  not fixed in this pass: the alternative (capture full results on EVERY generation, keeping only
+  the most-recently-evaluated one) would pay the serialization/network cost on every generation
+  instead of once, which risks reintroducing exactly the kind of remote-worker payload/timeout
+  strain this session already fought once (the Senate matrix cold-cache timeouts). Worth
+  revisiting as a follow-up if early-stopped runs turn out to be the common case in practice.
 
 **Scope:** Only the `parallelIndividuals > 1` / `batch_fitness` path (the one every real grid job
 uses — confirmed live: `--parallel 4`). The `parallel <= 1` sequential path is unaffected/out of
@@ -357,7 +380,34 @@ New code (adds the capture call):
                             _capture_full_result(last_gen_full_results, key, out)
 ```
 
-3c. Thread the buffer out through the handler's completion return
+3c. **Do NOT add `last_gen_full_results` to `handle_strategy_optimization`'s return dict.** That
+return value flows into `TaskQueue.result` (a JSON DB column) for EVERY UI/API-submitted
+optimization — the main task queue registers this handler with `use_subprocess=False`
+(`app/main.py:311`; `TaskQueueService.__init__` defaults `use_subprocess=False`,
+`task_queue.py:56`), so `_process_task_inline` (`task_queue.py:706-726`) does
+`result = handler(task_id, task.payload)` then `db_task.result = result; db.commit()` — anything
+in the return dict gets persisted to the DB for every real job, not just the CLI's direct-call
+path. `last_gen_full_results` can hold a full generation's worth of trade/equity/drawdown blobs
+(~100-140 individuals), so it must never flow through that path.
+
+Instead, add a module-level, process-local, `opt_id`-keyed scratch dict — declare it near the top
+of `strategy_optimization_handler.py`, alongside the other module-level state (e.g. near where
+`_trial_worker`/`_maybe_mark_want_full` are defined):
+
+```python
+# Process-local scratch space for the CLI's post-optimization top-N persist step (see
+# _persist_top_backtests in ba2test_launcher.py). Deliberately NOT part of
+# handle_strategy_optimization's return value: that return dict flows into TaskQueue.result (a
+# JSON DB column) for every UI/API-submitted job via the main task queue's inline handler path
+# (use_subprocess=False), and this buffer can hold a full generation's worth of trade/equity/
+# drawdown blobs -- it must never be serialized to the DB. Only the CLI's direct, same-process
+# caller ever reads this (via pop, right after handle_strategy_optimization returns), so a
+# long-lived worker process handling many jobs over time doesn't accumulate entries for jobs
+# nobody ever collected.
+_last_gen_full_results_by_opt: Dict[int, Dict[str, Any]] = {}
+```
+
+Then, at the point in `handle_strategy_optimization` where the completion return dict is built
 (`strategy_optimization_handler.py:676-681`), current code:
 
 ```python
@@ -369,36 +419,65 @@ New code (adds the capture call):
         }
 ```
 
-New code:
+New code (return dict is UNCHANGED — the buffer is stashed as a side effect just before
+returning, not added to the dict):
 
 ```python
+        if last_gen_full_results:
+            _last_gen_full_results_by_opt[opt_id] = last_gen_full_results
         return {
             "status": "completed",
             "optimization_id": opt_id,
             "best_fitness": result["best_fitness"],
             "best_params": result["best_params"],
-            # In-memory only (never persisted to the DB — see module docstring on
-            # last_gen_full_results): consumed immediately by the caller's top-N persist step.
-            "last_gen_full_results": last_gen_full_results,
         }
 ```
 
 Also handle the `parallel <= 1` path (no `batch_fitness` at all, per this plan's stated scope) —
-find where `handle_strategy_optimization` returns on the non-batched path (if it's the SAME
-return statement above, i.e. `last_gen_full_results` was declared unconditionally, this is
-already safe: it'll just be `{}` when `parallel <= 1` never populated it, since it's declared
-once regardless of the `if parallel > 1:` branch). Confirm this by declaring
-`last_gen_full_results: Dict[str, Any] = {}` at the SAME scope level as `all_results = []` (which
-is declared before the `if parallel > 1:` branch already) — not inside the `if parallel > 1:`
-block.
+`last_gen_full_results` stays an empty `{}` there (declared once, unconditionally, at the same
+scope as `all_results = []`, before the `if parallel > 1:` branch), so the
+`if last_gen_full_results:` guard above naturally skips stashing anything for that path — nothing
+extra to do.
+
+3d. Add one more test proving the return dict does NOT carry the buffer (this is the regression
+guard for the bug this redesign exists to prevent — a future edit must not silently reintroduce
+it). Add to `testplatform/backend/tests/test_strategy_optimization_handler.py`, near the other
+`handle_strategy_optimization`-level tests (e.g. next to `test_handler_completes_and_persists_best`):
+
+```python
+def test_completion_return_dict_never_carries_last_gen_full_results(monkeypatch):
+    """Regression guard: handle_strategy_optimization's return value flows into
+    TaskQueue.result (a JSON DB column) for every UI/API-submitted job — last_gen_full_results
+    must NEVER be a key in that dict, no matter how large or small it is. The buffer is
+    consumed via the module-level _last_gen_full_results_by_opt dict instead (popped by the
+    CLI's direct caller, not returned)."""
+    from app.services import strategy_optimization_handler as H
+
+    opt_id = _seed_optimization_row()  # reuse whatever fixture/seed helper this file already
+                                        # uses to build a minimal runnable StrategyOptimization +
+                                        # Strategy pair for handle_strategy_optimization tests —
+                                        # follow the exact pattern test_handler_completes_and_
+                                        # persists_best already uses in this same file, including
+                                        # its monkeypatch of the per-trial backtest stub.
+    res = H.handle_strategy_optimization("test-task", {"optimization_id": opt_id})
+    assert res["status"] == "completed"
+    assert "last_gen_full_results" not in res
+```
+
+(The implementer should look at the existing `test_handler_completes_and_persists_best` test
+immediately above this one in the file for the real fixture/monkeypatch setup to copy — don't
+invent a new one; match its exact pattern for building a runnable optimization row and stubbing
+the backtest so this test actually exercises the real `handle_strategy_optimization` completion
+path, including a `parallelIndividuals` value that engages `batch_fitness` if that existing test
+already does, or add `parallelIndividuals: 2` to the config if the existing fixture defaults to
+1 — either way, the point of this test is that the return dict is checked directly, not the
+module-level buffer.)
 
 **Step 4: Run tests to verify they pass**
 
 Run: `./venv/bin/python -m pytest tests/test_strategy_optimization_handler.py -v`
-Expected: PASS — all tests including the two new ones, and NO regression in
-`test_seeded_run_is_reproducible` / `test_handler_completes_and_persists_best` (these don't
-inspect `last_gen_full_results`, so an empty/populated dict in the return value doesn't affect
-them, but re-run the FULL file to be sure).
+Expected: PASS — all tests including the three new ones, and NO regression in
+`test_seeded_run_is_reproducible` / `test_handler_completes_and_persists_best`.
 
 **Step 5: Commit**
 
@@ -653,7 +732,9 @@ worker-pool spin-up, zero hang risk).
     nsaved = _persist_top_backtests(opt_id, expert, n=int(args.save_top), parallel=int(args.parallel))
 ```
 
-New code:
+New code (pops from the module-level scratch dict added in Task 2 — NOT from `res`, since `res`
+never carries this data, by design, to avoid it leaking into `TaskQueue.result` for UI/API-driven
+runs; see Task 2 step 3c):
 
 ```python
     res = handle_strategy_optimization("cli-optimize", {"optimization_id": opt_id})
@@ -668,14 +749,15 @@ New code:
         print(f"optimize: done. best_fitness={opt.best_fitness} best_params={json.dumps(opt.best_params, default=str)}")
     finally:
         db.close()
+    from app.services.strategy_optimization_handler import _last_gen_full_results_by_opt
     nsaved = _persist_top_backtests(opt_id, expert, n=int(args.save_top), parallel=int(args.parallel),
-                                     last_gen_full_results=res.get("last_gen_full_results"))
+                                     last_gen_full_results=_last_gen_full_results_by_opt.pop(opt_id, None))
 ```
 
-Apply the identical one-line change at the second call site,
-`testplatform/ba2test_launcher.py:2411` (`_cmd_optimize_batch`) — find its preceding
-`handle_strategy_optimization(...)` call in the same function and thread `res` (or whatever it's
-locally named there) the same way.
+Apply the identical change at the second call site, `testplatform/ba2test_launcher.py:2411`
+(`_cmd_optimize_batch`) — find its preceding `handle_strategy_optimization(...)` call in the same
+function and thread it the same way (import `_last_gen_full_results_by_opt` and `.pop(opt_id,
+None)` it, same as above).
 
 **Step 4: Run tests to verify they pass**
 
