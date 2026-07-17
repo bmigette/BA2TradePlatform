@@ -463,6 +463,53 @@ def test_memo_returns_same_fitness_on_reselection(monkeypatch):
     assert calls["n"] <= 66
 
 
+def test_trial_worker_default_omits_full_results(monkeypatch):
+    """Regression guard: the hot GA path (no flag) must NOT grow a payload — full_results must
+    be absent, not just empty/None, so the pickled return stays the same small shape it is today."""
+    from app.services import strategy_optimization_handler as H
+
+    monkeypatch.setattr(
+        H, "run_daily_backtest",
+        lambda cfg: {"total_trades": 3, "sharpe_ratio": 1.5},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "app.services.backtest.daily_backtest_handler.run_daily_backtest",
+        lambda cfg: {"total_trades": 3, "sharpe_ratio": 1.5},
+    )
+    out = H._trial_worker({"backtest_id": 1}, "sharpe")
+    assert out["ok"] is True
+    assert "full_results" not in out
+
+
+def test_trial_worker_want_full_flag_attaches_results_and_is_stripped_from_config():
+    """When the caller marks a config `_want_full_results`, the worker (a) returns the full
+    results blob under `full_results` alongside the normal {fitness,trades} summary, and (b)
+    pops the flag before handing the config to run_daily_backtest — a real backtest config
+    builder has no idea about this internal signal and must never see it."""
+    from app.services import strategy_optimization_handler as H
+
+    seen_configs = []
+
+    def _fake_run_daily_backtest(cfg):
+        seen_configs.append(dict(cfg))
+        return {"total_trades": 7, "sharpe_ratio": 2.0}
+
+    import app.services.backtest.daily_backtest_handler as _dbh
+    orig = _dbh.run_daily_backtest
+    _dbh.run_daily_backtest = _fake_run_daily_backtest
+    try:
+        out = H._trial_worker({"backtest_id": 1, "_want_full_results": True}, "sharpe")
+    finally:
+        _dbh.run_daily_backtest = orig
+
+    assert out["ok"] is True
+    assert out["fitness"] == 2.0
+    assert out["trades"] == 7
+    assert out["full_results"] == {"total_trades": 7, "sharpe_ratio": 2.0}
+    assert "_want_full_results" not in seen_configs[0]
+
+
 def test_build_daily_trial_config_maps_rm_and_overrides():
     """The daily-trial seam merges expert overrides + tp/sl into each expert's settings.
 

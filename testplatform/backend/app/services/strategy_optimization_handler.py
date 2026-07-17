@@ -111,25 +111,34 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str) -> Dict[str, Any]
 
     Only the CPU-bound backtest runs here (no GIL contention with the GA loop); the result is
     reduced to ``{ok, fitness, trades, error}`` so the pickled payload back to the parent is
-    small (the full equity/trade blobs are re-derived later for the persisted top-N only).
+    small (the full equity/trade blobs are re-derived later for the persisted top-N only) --
+    UNLESS the caller sets ``config["_want_full_results"] = True`` (used only for the GA's final
+    generation, see ``handle_strategy_optimization``'s ``batch_fitness``), in which case the full
+    ``run_daily_backtest`` results dict is ALSO returned under ``full_results``. The flag is
+    popped before the config reaches ``run_daily_backtest`` -- it is an internal signal between
+    the GA loop and this worker, not a real backtest setting.
 
     The cross-job OHLCV-memo eviction (the remote/local worker memory leak fix) lives in
     ``run_daily_backtest`` — the single chokepoint EVERY path goes through — so it covers the pool
     workers here AND the master's in-process top-N persist / parallel=1 runs uniformly.
     """
+    want_full = config.pop("_want_full_results", False)
     try:
         from app.services.backtest.daily_backtest_handler import run_daily_backtest
         from app.services.strategy_fitness import compute_fitness
 
         results = run_daily_backtest(config)
         fit = compute_fitness(fitness_metric, results)
-        return {"ok": True, "fitness": float(fit),
-                "trades": int(results.get("total_trades") or 0), "error": None,
-                # Per-trial memory telemetry (a few psutil/len calls — negligible): RSS of
-                # THIS worker process + the two per-process OHLCV caches, so a memory-driven
-                # incident (e.g. WinError 1450 on the remote box) leaves a trail showing what
-                # was depleting the machine.
-                "mem": _trial_memory_snapshot()}
+        out = {"ok": True, "fitness": float(fit),
+               "trades": int(results.get("total_trades") or 0), "error": None,
+               # Per-trial memory telemetry (a few psutil/len calls — negligible): RSS of
+               # THIS worker process + the two per-process OHLCV caches, so a memory-driven
+               # incident (e.g. WinError 1450 on the remote box) leaves a trail showing what
+               # was depleting the machine.
+               "mem": _trial_memory_snapshot()}
+        if want_full:
+            out["full_results"] = results
+        return out
     except Exception as e:  # noqa: BLE001 — surface as a failed trial, don't kill the pool
         # A cache miss is FATAL (a data/config problem, not a bad-parameter trial): every trial
         # will hit the same gap, so flag it so the parent can abort with the actionable message
