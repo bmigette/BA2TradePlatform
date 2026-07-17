@@ -469,11 +469,6 @@ def test_trial_worker_default_omits_full_results(monkeypatch):
     from app.services import strategy_optimization_handler as H
 
     monkeypatch.setattr(
-        H, "run_daily_backtest",
-        lambda cfg: {"total_trades": 3, "sharpe_ratio": 1.5},
-        raising=False,
-    )
-    monkeypatch.setattr(
         "app.services.backtest.daily_backtest_handler.run_daily_backtest",
         lambda cfg: {"total_trades": 3, "sharpe_ratio": 1.5},
     )
