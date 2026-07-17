@@ -2609,12 +2609,12 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
                         continue
                     if _persist_one(rk, tc, sp2, out):
                         persisted += 1
-                        print(f"    persisted TOP{rk} ({persisted}/{len(specs)})")
+                        print(f"    persisted TOP{rk} ({persisted}/{len(ranked)})")
         else:
             for rk, cfg, sp2 in specs:
                 if _persist_one(rk, cfg, sp2, _persist_trial_worker(cfg)):
                     persisted += 1
-                    print(f"    persisted TOP{rk} ({persisted}/{len(specs)})")
+                    print(f"    persisted TOP{rk} ({persisted}/{len(ranked)})")
         return persisted
     finally:
         db.close()

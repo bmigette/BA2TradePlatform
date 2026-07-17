@@ -189,7 +189,7 @@ def test_persist_top_uses_buffered_full_results_without_rerun(monkeypatch):
     assert calls == ["TOP1-top-n-opt"]
 
 
-def test_persist_top_reruns_only_the_missing_members(monkeypatch):
+def test_persist_top_reruns_only_the_missing_members(monkeypatch, capsys):
     """Two top-N individuals: one's key is in the buffer (persist directly), the other's is not
     (e.g. an elite reused via the GA memo, never freshly evaluated in the last generation) — only
     the missing one goes through the re-run path."""
@@ -222,6 +222,15 @@ def test_persist_top_reruns_only_the_missing_members(monkeypatch):
 
     assert persisted == 2
     assert len(rerun_calls) == 1  # only the "missing-key" individual was re-run
+
+    # Regression: the progress print for the re-run (specs) dispatch loop must report the total
+    # across BOTH groups (len(ranked) == 2 -- 1 buffered + 1 re-run), not just len(specs) (== 1,
+    # the re-run-only count). Before the fix this printed the nonsensical "(2/1)" -- persisted
+    # exceeding its own printed "total".
+    out = capsys.readouterr().out
+    assert "persisted TOP1 (1/2) [no re-run]" in out
+    assert "persisted TOP2 (2/2)" in out
+    assert "(2/1)" not in out
 
 
 def test_persist_top_no_buffer_falls_back_to_full_rerun(monkeypatch):
