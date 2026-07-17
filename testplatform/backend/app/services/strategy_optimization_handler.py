@@ -106,6 +106,27 @@ def _worker_init(backend_dir: str, env: Dict[str, str]) -> None:
         _lg.getLogger(n).setLevel(_lg.WARNING)
 
 
+def _maybe_mark_want_full(config: Dict[str, Any], is_last_gen: bool) -> Dict[str, Any]:
+    """Attach the opt-in full-results flag (see ``_trial_worker``) to a trial config when this
+    job belongs to the GA's FINAL generation. Returns a shallow copy when tagging (never mutates
+    the caller's config in place) so the same base dict can be reused for other jobs."""
+    if not is_last_gen:
+        return config
+    tagged = dict(config)
+    tagged["_want_full_results"] = True
+    return tagged
+
+
+def _capture_full_result(buffer: Dict[str, Any], key: str, out: Dict[str, Any]) -> None:
+    """Stash a trial's full results blob (if the worker computed one — see
+    ``_maybe_mark_want_full``) into the last-generation buffer, keyed by trial key. Used by
+    ``_persist_top_backtests`` to skip a re-run for any top-N individual that was already fully
+    computed as part of the final generation."""
+    full = out.get("full_results")
+    if full is not None:
+        buffer[key] = full
+
+
 def _trial_worker(config: Dict[str, Any], fitness_metric: str) -> Dict[str, Any]:
     """Run ONE deterministic daily backtest in a worker PROCESS and return a tiny summary.
 
@@ -313,6 +334,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
 
         memo = TrialMemo()
         all_results: list = []
+        last_gen_full_results: Dict[str, Any] = {}
         best = {"fitness": None, "params": None}
         fatal = {"msg": None}  # first FATAL trial error (e.g. OHLCV cache miss) -> abort loudly
 
@@ -468,6 +490,8 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     raise InterruptedError("paused/cancelled")
                 fits: list = [None] * len(param_dicts)
                 jobs = []  # (idx, decoded_flat, key, config)
+                n_gens = int(ga["generations"])
+                is_last_gen = gen_state["gen"] == n_gens - 1
                 for i, flat in enumerate(param_dicts):
                     key = _trial_key_for(flat)
                     cached = memo.get(key)
@@ -477,6 +501,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     config = _build_daily_trial_config(
                         backtest_cfg, decode_params(strategy, flat), hoisted
                     )
+                    config = _maybe_mark_want_full(config, is_last_gen)
                     jobs.append((i, flat, key, config))
 
                 # Intra-generation progress: report individuals evaluated WITHIN the current
@@ -485,7 +510,6 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 # (ga_callback still snaps it to the exact boundary at gen end). Throttled to
                 # ~20 updates/gen so we don't hammer the task DB.
                 total_in_batch = len(param_dicts)
-                n_gens = int(ga["generations"])
                 gen = gen_state["gen"]
                 step = max(1, total_in_batch // 20)
                 # Periodic memory snapshot (master process only; cheap psutil calls, twice per
@@ -512,6 +536,8 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                         all_results.append(
                             {"params": flat, "fitness": fit, "key": key, "trades": out["trades"]}
                         )
+                        if is_last_gen:
+                            _capture_full_result(last_gen_full_results, key, out)
                     else:
                         # FAILED trial: score it at the always-worst sentinel so the GA never
                         # prefers a crashed genome (the old 0.0 fallback ranked ABOVE every
@@ -687,6 +713,9 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             "optimization_id": opt_id,
             "best_fitness": result["best_fitness"],
             "best_params": result["best_params"],
+            # In-memory only (never persisted to the DB — the buffer can be large): consumed
+            # immediately by the caller's top-N persist step (see _persist_top_backtests).
+            "last_gen_full_results": last_gen_full_results,
         }
 
     except InterruptedError:

@@ -505,6 +505,31 @@ def test_trial_worker_want_full_flag_attaches_results_and_is_stripped_from_confi
     assert "_want_full_results" not in seen_configs[0]
 
 
+def test_mark_want_full_only_tags_last_generation():
+    from app.services import strategy_optimization_handler as H
+
+    cfg = {"backtest_id": 1}
+    untouched = H._maybe_mark_want_full(cfg, is_last_gen=False)
+    assert untouched is cfg  # no copy needed when untagged
+    assert "_want_full_results" not in untouched
+
+    tagged = H._maybe_mark_want_full(cfg, is_last_gen=True)
+    assert tagged["_want_full_results"] is True
+    assert "_want_full_results" not in cfg  # original dict must not be mutated
+
+
+def test_capture_full_result_stores_only_when_present():
+    from app.services import strategy_optimization_handler as H
+
+    buf: dict = {}
+    H._capture_full_result(buf, "key-a", {"ok": True, "fitness": 1.0, "trades": 3})
+    assert buf == {}  # no full_results key on the worker output -> nothing stored
+
+    H._capture_full_result(buf, "key-b", {"ok": True, "fitness": 1.0, "trades": 3,
+                                           "full_results": {"total_trades": 3}})
+    assert buf == {"key-b": {"total_trades": 3}}
+
+
 def test_build_daily_trial_config_maps_rm_and_overrides():
     """The daily-trial seam merges expert overrides + tp/sl into each expert's settings.
 
