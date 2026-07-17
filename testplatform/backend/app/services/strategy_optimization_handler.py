@@ -132,10 +132,17 @@ def _capture_full_result(buffer: Dict[str, Any], key: str, out: Dict[str, Any]) 
 # handle_strategy_optimization's return value: that return dict flows into TaskQueue.result (a
 # JSON DB column) for every UI/API-submitted job via the main task queue's inline handler path
 # (use_subprocess=False), and this buffer can hold a full generation's worth of trade/equity/
-# drawdown blobs -- it must never be serialized to the DB. Only the CLI's direct, same-process
-# caller ever reads this (via pop, right after handle_strategy_optimization returns), so a
-# long-lived worker process handling many jobs over time doesn't accumulate entries for jobs
-# nobody ever collected.
+# drawdown blobs -- it must never be serialized to the DB.
+#
+# KNOWN GAP: only the CLI's direct, same-process caller (ba2test_launcher.py, Task 3 of
+# docs/plans/2026-07-17-ga-last-gen-full-results-capture.md) ever pops an entry. A UI/API-
+# submitted job (this same handler, run inline in the main backend server process) stashes an
+# entry here too but nothing currently collects it -- see task #43 ("Serve handler: persist
+# optimization top-N as tagged Backtests"), still pending as of this writing. Until that lands,
+# entries for UI-submitted parallel>1 runs accumulate in the server process's memory for its
+# whole uptime. Bounded impact today (this fixes a WORSE bug -- the same data unconditionally
+# hitting the DB on every run -- and a server restart clears it), but worth a size/TTL bound or
+# an explicit pop-on-collect wired into the serve path once #43 is built.
 _last_gen_full_results_by_opt: Dict[int, Dict[str, Any]] = {}
 
 
