@@ -1,8 +1,9 @@
-"""Data-quality gate for the screener grid: worker cache sync + local data gaps.
+"""Data-quality gate for the screener grid: worker cache sync + local data gaps + local data
+VALIDITY over an explicit period.
 
-Two independent checks, both meant to run as a manual/periodic gate before trusting a distributed
-optimization run — NOT the per-job pre-flight (that's the fast, size-only push_cache, already run
-automatically at the start of every optimization job):
+Three independent checks, all meant to run as a manual/periodic gate before trusting a
+distributed optimization run — NOT the per-job pre-flight (that's the fast, size-only
+push_cache, already run automatically at the start of every optimization job):
 
 1. WORKER CACHE SYNC (``check_cache_integrity``): reads + CRC32-checksums EVERY file in the
    master's cache and each configured remote worker's cache to catch the one drift (rel_path,
@@ -17,17 +18,33 @@ automatically at the start of every optimization job):
    and the OHLCV cache for per-symbol internal date gaps + symbols that fell behind the rest of
    the universe (their last cached bar is much older than the panel-wide newest bar).
 
+3. LOCAL DATA VALIDITY over an explicit period (``check_period_validity``): gaps/presence alone
+   miss the failure mode where a file/partition EXISTS for every month but its CONTENT is broken
+   — e.g. a rebuild whose per-symbol API calls silently degraded (rate-limited, or a poisoned
+   disk cache) so every row in a "complete" metric_store partition has ``market_cap = NaN``.
+   Walks --start/--end month by month and validates: metric_store partitions (per-column NaN
+   rate on the columns experts actually filter on — market_cap, price, relative_volume,
+   price_drop_pct, weinstein_stage, atr_*), OHLCV coverage (does each sampled symbol have AT
+   LEast one bar in each month, not just "no gap > N days" which a single stray bar can satisfy),
+   and expert-warmed cache existence/non-triviality (analyst targets, earnings calendar, insider
+   trades, congress skill/scalper scores — the caches that are NOT part of push_cache's OHLCV/
+   metric_store sync and can rot silently, see docs/plans/2026-07-15-senate-weight-fast-
+   optimization.md for the Senate-specific case of this).
+
 Usage (test venv):
     ba2-venvs/test/Scripts/python.exe tools/cache_health_check.py [--worker NAME] [--fix]
         [--skip-workers] [--skip-gaps] [--ohlcv-interval 1d] [--max-gap-days 7] [--stale-days 10]
+        [--start 2022-01-01] [--end 2026-06-30] [--skip-validity] [--validity-symbols 25]
+        [--nan-threshold 0.5]
 
 --fix removes anything `push_cache` already handles (missing + stale) via the normal push/prune,
 then force-repushes any CONTENT-MISMATCH file (same rel_path/size, different crc32) — the one
 case `push_cache`'s size-only diff cannot detect or fix on its own. --fix only applies to the
-worker-sync check; local gaps are a report only (fixing them means re-fetching data, out of scope
-here).
+worker-sync check; local gaps/validity are report-only (fixing them means re-fetching data, out
+of scope here).
 """
 import argparse
+import json
 import os
 import sys
 from datetime import datetime, timedelta
@@ -172,6 +189,272 @@ def check_local_gaps(max_gap_days: int, stale_days: int, interval: str) -> bool:
     return ok
 
 
+def _months_between(start: str, end: str) -> list:
+    """Inclusive list of ``YYYY-MM`` strings from *start* to *end* (``YYYY-MM-DD`` each)."""
+    lo = datetime.strptime(start, "%Y-%m-%d").replace(day=1)
+    hi = datetime.strptime(end, "%Y-%m-%d").replace(day=1)
+    out = []
+    cur = lo
+    while cur <= hi:
+        out.append(cur.strftime("%Y-%m"))
+        cur = (cur.replace(day=1) + timedelta(days=32)).replace(day=1)
+    return out
+
+
+# Columns experts actually filter/size on — a NaN-heavy column here silently starves every
+# cap-band screen even though the partition file "exists" and passes the month-gap check.
+_METRIC_STORE_VALIDITY_COLUMNS = [
+    "market_cap", "price", "close", "relative_volume", "price_drop_pct",
+    "weinstein_stage", "atr_14", "float_shares",
+]
+
+
+def check_metric_store_validity(store_dir: str, start: str, end: str,
+                                 nan_threshold: float = 0.5) -> dict:
+    """For every month in [start, end], load the partition (if present) and compute each
+    validity column's NaN rate. A column whose NaN rate exceeds *nan_threshold* for a month is
+    reported — this is the check that would have caught the 2026-07-17 incident where two
+    successive ``build-screener-metrics`` rebuilds produced ~99% NaN ``market_cap`` (a poisoned
+    market-cap-history disk cache from FMP rate-limiting) despite every ``ym=`` partition
+    existing and the month-gap check passing cleanly.
+
+    Returns ``{months_checked, months_missing: [...], bad: {month: {column: nan_rate}}}``.
+    """
+    import glob
+    import pandas as pd
+
+    months = _months_between(start, end)
+    missing = []
+    bad: dict = {}
+    for ym in months:
+        parts = sorted(glob.glob(os.path.join(store_dir, f"ym={ym}", "*.parquet")))
+        if not parts:
+            missing.append(ym)
+            continue
+        try:
+            df = pd.concat([pd.read_parquet(p) for p in parts], ignore_index=True)
+        except Exception as e:  # noqa: BLE001 — unreadable partition is itself a finding
+            bad[ym] = {"UNREADABLE": str(e)}
+            continue
+        if len(df) == 0:
+            bad[ym] = {"EMPTY": 0.0}
+            continue
+        month_bad = {}
+        for col in _METRIC_STORE_VALIDITY_COLUMNS:
+            if col not in df.columns:
+                month_bad[col] = "MISSING_COLUMN"
+                continue
+            nan_rate = df[col].isna().mean()
+            if nan_rate > nan_threshold:
+                month_bad[col] = round(float(nan_rate), 3)
+        if month_bad:
+            bad[ym] = month_bad
+    return {"months_checked": len(months), "months_missing": missing, "bad": bad}
+
+
+def check_ohlcv_period_coverage(provider_dir: str, interval: str, start: str, end: str,
+                                 max_symbols: int = 25) -> dict:
+    """For a SAMPLE of up to *max_symbols* cached symbols, verify each month in [start, end] has
+    at least one bar. This is stricter than ``check_ohlcv_gaps``'s internal-gap check: a lone bar
+    surrounded by two >max_gap_days holes satisfies "no gap over threshold" at the file level but
+    still leaves a whole month with zero real coverage for anything that queries that month.
+
+    Returns ``{symbols_checked, per_symbol_missing_months: {symbol: [months...]}}``.
+    """
+    import glob
+    import pandas as pd
+
+    months = _months_between(start, end)
+    files = sorted(glob.glob(os.path.join(provider_dir, f"*_{interval}.parquet")))[:max_symbols]
+    per_symbol_missing: dict = {}
+    for p in files:
+        sym = os.path.basename(p)[: -len(f"_{interval}.parquet")]
+        try:
+            raw = pd.to_datetime(pd.read_parquet(p, columns=["Date"])["Date"], utc=True)
+            present_months = set(raw.dt.tz_localize(None).dt.strftime("%Y-%m").unique())
+        except Exception:  # noqa: BLE001
+            per_symbol_missing[sym] = months  # unreadable -> treat as fully missing
+            continue
+        missing = [m for m in months if m not in present_months]
+        if missing:
+            per_symbol_missing[sym] = missing
+    return {"symbols_checked": len(files), "per_symbol_missing_months": per_symbol_missing}
+
+
+# (glob pattern under CACHE_FOLDER/fmp_history, human label) — the per-expert warmed caches that
+# live OUTSIDE push_cache's OHLCV/metric_store sync path and so can rot silently between runs.
+# The 3 congress_* scoring caches use a trailing ``*`` so the glob also matches the not-yet-
+# COMPACTED ``<name>.delta.jsonl`` companion (see FMPSenateTraderWeight._save_scoring_cache_throttled)
+# — without it, a long-lived worker that hasn't hit _CACHE_COMPACT_EVERY yet has ALL its data in the
+# delta file and the base ``.json`` glob alone reports a false "no files found" (confirmed live on
+# 2026-07-17: congress_scalper_scores.json had zero base entries but a populated delta).
+_EXPERT_WARM_CACHE_PATTERNS = [
+    ("*price_target*.json", "FMPRating analyst price targets"),
+    ("*earnings*.json", "FMPEarningsDrift earnings calendar/surprises"),
+    ("*insider*.json", "FMPInsiderClusterBuy insider transactions"),
+    ("congress_skill_scores.json*", "FMPSenateTraderWeight trader-skill scores"),
+    ("congress_scalper_scores.json*", "FMPSenateTraderWeight scalper/hold-time (roundtrip) scores"),
+    ("congress_confidence_scores.json*", "FMPSenateTraderWeight trader-confidence scores"),
+]
+
+
+def check_expert_warm_cache(cache_folder: str) -> dict:
+    """Existence + non-triviality (file present, non-empty, parseable, has >0 entries) of each
+    known per-expert warmed-cache file pattern under ``CACHE_FOLDER/fmp_history``. These are NOT
+    covered by push_cache's OHLCV/metric_store sync and are built lazily during trial execution
+    for some experts (e.g. Senate's skill/scalper/confidence scores) — a missing or empty file
+    here doesn't fail a job outright but silently degrades or (for Senate) can cause remote-worker
+    trial timeouts as the cache gets rebuilt cold on every worker independently.
+
+    A ``.delta.jsonl`` match (JSON-Lines, one ``{"k": ..., "v": ...}`` object per line) is counted
+    by LINE, not ``json.load`` — it is not a single JSON document.
+
+    Returns ``{pattern_label: {"files": n, "total_entries": n, "empty_files": [...]}}``.
+    """
+    import glob
+
+    fmp_dir = os.path.join(cache_folder, "fmp_history")
+    out = {}
+    for pattern, label in _EXPERT_WARM_CACHE_PATTERNS:
+        matches = sorted(glob.glob(os.path.join(fmp_dir, pattern)))
+        total_entries = 0
+        empty_files = []
+        for p in matches:
+            base = os.path.basename(p)
+            try:
+                if base.endswith(".delta.jsonl"):
+                    with open(p, encoding="utf-8") as f:
+                        n = sum(1 for line in f if line.strip())
+                else:
+                    with open(p, encoding="utf-8") as f:
+                        data = json.load(f)
+                    n = len(data) if hasattr(data, "__len__") else 1
+                total_entries += n
+                if n == 0:
+                    empty_files.append(base)
+            except Exception:  # noqa: BLE001
+                empty_files.append(base + " (unreadable)")
+        out[label] = {"files": len(matches), "total_entries": total_entries, "empty_files": empty_files}
+    return out
+
+
+def check_senate_skill_score_coverage(cache_folder: str, start: str, end: str) -> dict:
+    """Check ``congress_skill_scores.json``'s DATE-RANGE coverage against every month in
+    [start, end] — existence/entry-count alone (``check_expert_warm_cache`` above) cannot catch
+    this: the cache can hold thousands of entries and still leave whole YEARS of the grid's actual
+    backtest range uncovered.
+
+    This is exactly the gap that motivated ``_do_senate_scores`` in
+    ``testplatform/ba2test_launcher.py``: a population=4 priming run left the cache with 550
+    entries spanning ``2022-10-03``..``2024-12-09`` after 2+ hours — file-existence alone looked
+    "fine" (non-empty, thousands-adjacent entry count) while the actual 2025-2026 half of the grid
+    range had ZERO coverage, because each GA individual's distinct schedule genes only walk a
+    different subset of calendar days (the cache key buckets by exact day — see
+    ``FMPSenateTraderWeight._get_trader_skill_cached``'s docstring), so small-population reuse
+    across trials is far lower than entry count alone suggests.
+
+    Each key is ``"{trader}|{history_len}|{as_of_day}|{horizon_days}|{min_past}|{max_past}|
+    {lookback_months}"`` — ``as_of_day`` (``YYYY-MM-DD``) is the 3rd pipe-delimited field. Merges
+    the base file with any not-yet-compacted delta lines (mirrors
+    ``FMPSenateTraderWeight._load_scoring_cache``).
+
+    Returns ``{entries, distinct_days, months_checked, months_missing: [...]}``.
+    """
+    months = _months_between(start, end)
+    path = os.path.join(cache_folder, "fmp_history", "congress_skill_scores.json")
+    keys = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            keys.extend(json.load(f).keys())
+    except Exception:  # noqa: BLE001 — missing/corrupt base -> no coverage from it
+        pass
+    try:
+        with open(path + ".delta.jsonl", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    keys.append(json.loads(line)["k"])
+    except Exception:  # noqa: BLE001 — missing/corrupt delta -> ignore
+        pass
+    as_of_days = {parts[2] for k in keys if len(parts := k.split("|")) >= 3}
+    present_months = {d[:7] for d in as_of_days}
+    missing_months = [m for m in months if m not in present_months]
+    return {
+        "entries": len(keys), "distinct_days": len(as_of_days),
+        "months_checked": len(months), "months_missing": missing_months,
+    }
+
+
+def check_period_validity(start: str, end: str, nan_threshold: float,
+                           validity_symbols: int, interval: str) -> bool:
+    """Orchestrates the three validity sub-checks over [start, end] and prints a report.
+    Returns True if nothing looks broken."""
+    from ba2_common.config import SCREENER_STORE_DIR, CACHE_FOLDER
+
+    print(f"\n=== local data VALIDITY ({start} .. {end}) ===")
+    ok = True
+
+    print(f"  metric_store column validity ({SCREENER_STORE_DIR}):")
+    ms_res = check_metric_store_validity(SCREENER_STORE_DIR, start, end, nan_threshold)
+    if ms_res["months_missing"]:
+        ok = False
+        print(f"    MISSING {len(ms_res['months_missing'])} month partition(s) in range: "
+              f"{ms_res['months_missing'][:10]}{' ...' if len(ms_res['months_missing']) > 10 else ''}")
+    if ms_res["bad"]:
+        ok = False
+        print(f"    {len(ms_res['bad'])}/{ms_res['months_checked']} month(s) have a column "
+              f"exceeding {nan_threshold:.0%} NaN (or unreadable/empty):")
+        for ym, cols in list(ms_res["bad"].items())[:10]:
+            print(f"      [{ym}] {cols}")
+        if len(ms_res["bad"]) > 10:
+            print(f"      ... +{len(ms_res['bad']) - 10} more month(s)")
+    if not ms_res["months_missing"] and not ms_res["bad"]:
+        print(f"    all {ms_res['months_checked']} month(s) present, no column exceeds "
+              f"{nan_threshold:.0%} NaN.")
+
+    provider_dir = os.path.join(CACHE_FOLDER, "FMPOHLCVProvider")
+    print(f"  OHLCV per-month coverage sample ({provider_dir}, interval={interval}, "
+          f"{validity_symbols} symbol(s)):")
+    if not os.path.isdir(provider_dir):
+        print("    directory not found, skipping.")
+    else:
+        oh_res = check_ohlcv_period_coverage(provider_dir, interval, start, end, validity_symbols)
+        n_bad = len(oh_res["per_symbol_missing_months"])
+        print(f"    scanned {oh_res['symbols_checked']} symbol(s); "
+              f"{n_bad} have >=1 month with zero bars in range")
+        for sym, months in list(oh_res["per_symbol_missing_months"].items())[:10]:
+            print(f"      [{sym}] missing: {months[:6]}{' ...' if len(months) > 6 else ''}")
+        if n_bad:
+            ok = False
+
+    print(f"  expert-warmed cache existence ({os.path.join(CACHE_FOLDER, 'fmp_history')}):")
+    ew_res = check_expert_warm_cache(CACHE_FOLDER)
+    for label, info in ew_res.items():
+        flag = ""
+        if info["files"] == 0:
+            flag = "  <-- no files found"
+        elif info["empty_files"]:
+            flag = f"  <-- {len(info['empty_files'])} empty/unreadable"
+        print(f"    {label}: {info['files']} file(s), {info['total_entries']} total entries{flag}")
+        if info["files"] == 0 or info["empty_files"]:
+            ok = False
+
+    print(f"  Senate trader-skill score DATE-RANGE coverage ({start} .. {end}):")
+    sk_res = check_senate_skill_score_coverage(CACHE_FOLDER, start, end)
+    print(f"    {sk_res['entries']} entries, {sk_res['distinct_days']} distinct as-of day(s)")
+    if sk_res["months_missing"]:
+        ok = False
+        print(f"    MISSING coverage in {len(sk_res['months_missing'])}/{sk_res['months_checked']} "
+              f"month(s): {sk_res['months_missing'][:10]}"
+              f"{' ...' if len(sk_res['months_missing']) > 10 else ''}")
+        print("    (run: ba2-test prewarm --experts FMPSenateTraderWeight --start <start> --end <end> "
+              "-- see _do_senate_scores in testplatform/ba2test_launcher.py)")
+    else:
+        print(f"    all {sk_res['months_checked']} month(s) have >=1 scored as-of day.")
+
+    return ok
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -183,6 +466,11 @@ def main() -> int:
     ap.add_argument("--max-gap-days", type=int, default=7, help="Internal-gap threshold in calendar days (default 7).")
     ap.add_argument("--stale-days", type=int, default=10,
                     help="Flag a symbol whose last bar trails the panel-wide newest bar by more than this many days (default 10).")
+    ap.add_argument("--start", default=None, help="Period start (YYYY-MM-DD) for the validity check (default: metric_store's own earliest ym= partition).")
+    ap.add_argument("--end", default=None, help="Period end (YYYY-MM-DD) for the validity check (default: metric_store's own latest ym= partition).")
+    ap.add_argument("--skip-validity", action="store_true", help="Skip the period validity check (metric_store column NaN rates + OHLCV per-month coverage + expert warm-cache existence).")
+    ap.add_argument("--validity-symbols", type=int, default=25, help="How many OHLCV symbols to sample for the per-month coverage check (default 25).")
+    ap.add_argument("--nan-threshold", type=float, default=0.5, help="Flag a metric_store column if its NaN rate for a month exceeds this fraction (default 0.5 = 50%%).")
     args = ap.parse_args()
 
     overall_ok = True
@@ -190,6 +478,22 @@ def main() -> int:
     if not args.skip_gaps:
         if not check_local_gaps(args.max_gap_days, args.stale_days, args.ohlcv_interval):
             overall_ok = False
+
+    if not args.skip_validity:
+        from ba2_common.config import SCREENER_STORE_DIR
+        start, end = args.start, args.end
+        if start is None or end is None:
+            present = sorted(d[len("ym="):] for d in os.listdir(SCREENER_STORE_DIR)
+                              if d.startswith("ym=")) if os.path.isdir(SCREENER_STORE_DIR) else []
+            if not present:
+                print("\n=== local data VALIDITY ===\n  metric_store empty/missing, skipping (pass --start/--end explicitly).")
+                present = None
+            if present:
+                start = start or f"{present[0]}-01"
+                end = end or f"{present[-1]}-28"
+        if start and end:
+            if not check_period_validity(start, end, args.nan_threshold, args.validity_symbols, args.ohlcv_interval):
+                overall_ok = False
 
     if args.skip_workers:
         print()

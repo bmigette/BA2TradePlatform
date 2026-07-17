@@ -820,3 +820,139 @@ def test_confidence_cache_live_buckets_by_month(monkeypatch):
     assert len(calls) == 1
     e._get_trader_confidence_cached("Trader X", history, now=day3, **common)
     assert len(calls) == 2
+
+
+# ====================================================================
+# FMPSenateTraderWeight — _calculate_trader_skill bisect fast-path equivalence
+#
+# The prewarm perf pass (2026-07-17) replaced _calculate_trader_skill's per-call O(history)
+# rebuild-and-filter with an O(log n) bisect over a candidate list precomputed ONCE per trader
+# (_sorted_buy_candidates / _sorted_buy_candidates_cached). This is exercised on production
+# data via _get_trader_skill_cached, but the equivalence proof lives here: a from-scratch
+# REFERENCE reimplementation of the ORIGINAL (pre-optimization) O(history) algorithm, run
+# differentially against the current implementation over many randomized histories — including
+# same-exec_date ties, which is the one case where a naive rewrite could silently reorder which
+# trades get selected under the max_past_trades cap.
+# ====================================================================
+import random as _random
+
+
+def _reference_calculate_trader_skill(trader_history, now, horizon_days, min_past_trades,
+                                       max_past_trades, lookback_months=12):
+    """Golden reference: byte-for-byte copy of _calculate_trader_skill's ORIGINAL body
+    (before the bisect fast-path), kept independent of production code on purpose so a future
+    accidental edit to the real implementation can't silently drag this reference along and
+    hide a regression."""
+    from ba2_experts.FMPSenateTraderWeight import _parse_ymd_utc
+    neutral = {"skill_score": 0.0, "scored_trades": 0, "hit_rate": None, "avg_fwd_return_pct": 0.0}
+    if not trader_history or horizon_days <= 0:
+        return neutral
+    lookback_floor = now - timedelta(days=max(1, lookback_months) * 30)
+    candidates = []
+    for t in trader_history:
+        ttype = str(t.get('type', '')).lower()
+        if 'purchase' not in ttype and 'buy' not in ttype:
+            continue
+        exec_str = t.get('transactionDate', '')
+        sym = str(t.get('symbol', '')).upper()
+        if not exec_str or not sym:
+            continue
+        try:
+            exec_date = _parse_ymd_utc(exec_str)
+        except (ValueError, TypeError):
+            continue
+        if exec_date < lookback_floor:
+            continue
+        if exec_date + timedelta(days=horizon_days) > now:
+            continue
+        candidates.append((exec_date, sym))
+    candidates.sort(key=lambda c: c[0], reverse=True)
+
+    returns = []
+    for exec_date, sym in candidates:
+        if len(returns) >= max_past_trades:
+            break
+        # NOTE: uses the SAME price stub as the real instance (injected by the caller via a
+        # closure) -- see _price_fn below.
+        entry = _reference_price_fn(sym, exec_date)
+        fwd = _reference_price_fn(sym, exec_date + timedelta(days=horizon_days))
+        if not entry or not fwd:
+            continue
+        returns.append((fwd - entry) / entry * 100.0)
+
+    if len(returns) < min_past_trades:
+        return neutral
+    hits = sum(1 for r in returns if r > 0)
+    hit_rate = hits / len(returns)
+    return {
+        "skill_score": max(-1.0, min(1.0, (hit_rate - 0.5) * 2.0)),
+        "scored_trades": len(returns),
+        "hit_rate": hit_rate,
+        "avg_fwd_return_pct": sum(returns) / len(returns),
+    }
+
+
+_reference_price_fn = None  # set per-test via a closure so both implementations see identical prices
+
+
+def _make_deterministic_price_fn(seed):
+    """A pseudo-random but DETERMINISTIC per-(symbol, date) price, so entry/fwd differ enough
+    to exercise both winning and losing "trades", and repeated calls for the same (symbol,
+    date) are stable (real price history behaves the same way)."""
+    def _price(sym, date):
+        h = hash((sym, date.date().isoformat(), seed))
+        return 10.0 + (h % 9000) / 100.0  # in [10, 100)
+    return _price
+
+
+def test_skill_bisect_fastpath_matches_reference_random_histories():
+    """Differential test: for many randomized trader histories/settings (including same-day
+    ties across different symbols, the one case tie-break order could diverge), the current
+    _calculate_trader_skill (bisect fast-path, via _sorted_buy_candidates_cached) must produce
+    IDENTICAL results to the golden pre-optimization reference above."""
+    global _reference_price_fn
+    rng = _random.Random(12345)
+    symbols = ["AAA", "BBB", "CCC", "DDD"]
+    base = datetime(2023, 1, 1, tzinfo=timezone.utc)
+
+    for trial in range(30):
+        e = _weight_expert("AAPL", [], {})
+        price_fn = _make_deterministic_price_fn(seed=trial)
+        e._get_price_at_date = lambda sym, date, _f=price_fn: _f(sym, date)
+        _reference_price_fn = price_fn
+
+        n_trades = rng.randint(0, 60)
+        history = []
+        for _ in range(n_trades):
+            offset_days = rng.randint(0, 900)
+            exec_date = base + timedelta(days=offset_days)
+            # Force clustering onto a handful of exec dates so same-day ties across
+            # different symbols/traders are common, not a rare edge case.
+            exec_date = base + timedelta(days=(offset_days // 15) * 15)
+            sym = rng.choice(symbols)
+            ttype = rng.choice(["purchase", "purchase", "purchase", "sale"])  # mostly buys
+            history.append({
+                "firstName": "T", "lastName": str(trial), "symbol": sym, "type": ttype,
+                "disclosureDate": exec_date.date().isoformat(),
+                "transactionDate": exec_date.date().isoformat(),
+                "amount": "$1,001 - $15,000",
+            })
+
+        now = base + timedelta(days=rng.randint(200, 1000))
+        horizon_days = rng.choice([30, 60, 90])
+        lookback_months = rng.choice([6, 12])
+        min_past_trades = rng.choice([1, 5])
+        max_past_trades = rng.choice([5, 50])
+
+        expected = _reference_calculate_trader_skill(
+            history, now=now, horizon_days=horizon_days,
+            min_past_trades=min_past_trades, max_past_trades=max_past_trades,
+            lookback_months=lookback_months)
+        actual = e._get_trader_skill_cached(
+            f"Trader{trial}", history, now=now, horizon_days=horizon_days,
+            min_past_trades=min_past_trades, max_past_trades=max_past_trades,
+            lookback_months=lookback_months, is_live=False)
+
+        assert actual == expected, (
+            f"trial={trial} n_trades={n_trades} now={now} horizon={horizon_days} "
+            f"lookback={lookback_months} min={min_past_trades} max={max_past_trades}")

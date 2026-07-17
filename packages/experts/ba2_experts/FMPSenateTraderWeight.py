@@ -11,9 +11,10 @@ Senate Trading API to generate trading recommendations based on:
 API Documentation: https://site.financialmodelingprep.com/developer/docs#senate-trading
 """
 
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Tuple
 from datetime import datetime, timezone, timedelta
 from functools import lru_cache
+import bisect
 import json
 import os
 import re
@@ -630,8 +631,25 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
     # O(new entries) per flush, O(n) total for the whole run. Periodically COMPACTED (see
     # _CACHE_COMPACT_EVERY) so the delta file — and the replay cost of loading it — stays
     # bounded across a long-lived worker process reused for many GA trials.
-    _CACHE_FLUSH_EVERY = 25
-    _CACHE_COMPACT_EVERY = 2000
+    #
+    # 2026-07-17: _CACHE_COMPACT_EVERY=2000 was tuned for a live/backtest process whose writes
+    # are spread across a whole run (one call per bar per trader) — a compaction's cost scales
+    # with the CURRENT cache size (a full json.dump of the accumulated dict), and at that
+    # cadence the file never gets big enough for that to matter. The date-range skill prewarm
+    # (_do_senate_scores in testplatform/ba2test_launcher.py) writes ~1.4M entries in a single
+    # TIGHT loop instead — profiled live: the skill cache had grown to 159MB+ from prior runs,
+    # and compacting every 2000 entries meant re-serializing that whole (and growing) file
+    # roughly 700 times over one prewarm run, which measured as THE dominant cost (far more
+    # than the actual scoring math, even before the sliding-window optimization below).
+    # Raising both thresholds ~40-50x keeps the same architecture (bounded delta growth for a
+    # long-lived worker, crash only loses cheaply-recomputable cache entries) while making
+    # compaction rare enough that a bulk prewarm's total compaction cost stays a small fraction
+    # of total runtime — a delta file up to _CACHE_FLUSH_EVERY-1 entries lost on a hard crash,
+    # or an un-compacted delta up to _CACHE_COMPACT_EVERY lines replayed at next process start,
+    # are both cheap regardless (pure functions of their inputs; the delta itself is durable,
+    # nothing is lost until compaction, only left un-folded into the base file).
+    _CACHE_FLUSH_EVERY = 1000
+    _CACHE_COMPACT_EVERY = 100_000
 
     def _scoring_cache_path(self, filename: str) -> str:
         from ba2_common.config import CACHE_FOLDER
@@ -762,10 +780,11 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         entry = cache.get(key)
         if entry is not None:
             return entry
+        sorted_candidates = self._sorted_buy_candidates_cached(trader_name, trader_history)
         result = self._calculate_trader_skill(
             trader_history, now=now, horizon_days=horizon_days,
             min_past_trades=min_past_trades, max_past_trades=max_past_trades,
-            lookback_months=lookback_months)
+            lookback_months=lookback_months, _sorted_candidates=sorted_candidates)
         cache[key] = result
         self._save_scoring_cache_throttled("_skill_cache", self._SKILL_CACHE_FILE, key)
         return result
@@ -810,10 +829,70 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                 return price
         return None
 
+    @staticmethod
+    def _sorted_buy_candidates(
+        trader_history: List[Dict[str, Any]]
+    ) -> Tuple[List[Tuple[datetime, str]], List[datetime]]:
+        """Parse + BUY-filter a trader's disclosure history into ``(exec_date, symbol)``
+        candidates, factored out of ``_calculate_trader_skill`` so this O(history) pass can run
+        ONCE per trader per process (see ``_sorted_buy_candidates_cached``) instead of on every
+        (as-of day, horizon, lookback) call — for a prolific trader (10k+ disclosed trades)
+        scored across a multi-year day-by-day grid, the repeated O(history) rebuild was the
+        dominant cost of a full date-range skill prewarm (see
+        ``testplatform/ba2test_launcher.py``'s ``_do_senate_scores``).
+
+        Returns ``(candidates_desc, ascending_dates)``:
+          - ``candidates_desc``: candidates sorted by exec_date DESCENDING (most-recent first),
+            ties broken by original disclosure order — a stable sort with ``reverse=True`` keeps
+            tied elements in their original relative order, so this is byte-identical to what a
+            fresh ``sort(key=..., reverse=True)`` over the SAME candidates would produce for ANY
+            as-of/horizon/lookback window (restricting a stably-sorted sequence to a contiguous
+            date sub-range never reorders the elements that remain).
+          - ``ascending_dates``: the parallel list of just the dates, ascending — kept solely so
+            ``_calculate_trader_skill`` can ``bisect`` a window's boundaries in O(log n) instead
+            of re-scanning the whole list.
+        """
+        out = []
+        for t in trader_history:
+            ttype = str(t.get('type', '')).lower()
+            if 'purchase' not in ttype and 'buy' not in ttype:
+                continue
+            exec_str = t.get('transactionDate', '')
+            sym = str(t.get('symbol', '')).upper()
+            if not exec_str or not sym:
+                continue
+            try:
+                exec_date = _parse_ymd_utc(exec_str)
+            except (ValueError, TypeError):
+                continue
+            out.append((exec_date, sym))
+        out.sort(key=lambda c: c[0], reverse=True)
+        ascending_dates = sorted(c[0] for c in out)
+        return out, ascending_dates
+
+    def _sorted_buy_candidates_cached(
+        self, trader_name: str, trader_history: List[Dict[str, Any]]
+    ) -> Tuple[List[Tuple[datetime, str]], List[datetime]]:
+        """In-memory (never disk-persisted) memo of ``_sorted_buy_candidates`` keyed by
+        (trader, history length) — mirrors the ``_hp_price_map`` pattern: cheap to recompute
+        once per process but expensive to redo on every one of hundreds/thousands of skill
+        lookups for the same trader within a single backtest/prewarm run."""
+        memo = getattr(self, "_buy_candidates_memo", None)
+        if memo is None:
+            memo = self._buy_candidates_memo = {}
+        key = (trader_name, len(trader_history))
+        cached = memo.get(key)
+        if cached is None:
+            cached = memo[key] = self._sorted_buy_candidates(trader_history)
+        return cached
+
     def _calculate_trader_skill(self, trader_history: List[Dict[str, Any]],
                                 now: datetime, horizon_days: int,
                                 min_past_trades: int, max_past_trades: int,
-                                lookback_months: int = 12) -> Dict[str, Any]:
+                                lookback_months: int = 12,
+                                _sorted_candidates: Optional[
+                                    Tuple[List[Tuple[datetime, str]], List[datetime]]] = None
+                                ) -> Dict[str, Any]:
         """Score a trader's historical SKILL from the forward returns of their RECENT past buys.
 
         For each past disclosed BUY (any symbol) executed within ``lookback_months`` of
@@ -833,6 +912,11 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
 
         Sells are NOT scored: congressional sells are dominated by liquidity noise; the
         skill question is "do this person's BUYS predict returns?".
+
+        ``_sorted_candidates`` (internal): an optional precomputed
+        ``_sorted_buy_candidates(trader_history)`` result — pass it (e.g. via
+        ``_sorted_buy_candidates_cached``) to turn the window lookup below into an O(log n)
+        bisect instead of an O(n) rebuild. Omitted, it's computed fresh (same cost as before).
         """
         neutral = {"skill_score": 0.0, "scored_trades": 0, "hit_rate": None,
                    "avg_fwd_return_pct": 0.0}
@@ -840,30 +924,27 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             return neutral
 
         lookback_floor = now - timedelta(days=max(1, lookback_months) * 30)
+        horizon_cutoff = now - timedelta(days=horizon_days)
 
-        # Most-recent past buys first (bounded), forward window fully complete.
-        candidates = []
-        for t in trader_history:
-            ttype = str(t.get('type', '')).lower()
-            if 'purchase' not in ttype and 'buy' not in ttype:
-                continue
-            exec_str = t.get('transactionDate', '')
-            sym = str(t.get('symbol', '')).upper()
-            if not exec_str or not sym:
-                continue
-            try:
-                exec_date = _parse_ymd_utc(exec_str)
-            except (ValueError, TypeError):
-                continue
-            if exec_date < lookback_floor:
-                continue  # outside the recency window — not scored, regardless of horizon
-            if exec_date + timedelta(days=horizon_days) > now:
-                continue  # window not complete yet — scoring it would be lookahead
-            candidates.append((exec_date, sym))
-        candidates.sort(key=lambda c: c[0], reverse=True)
+        candidates_desc, ascending_dates = (
+            _sorted_candidates if _sorted_candidates is not None
+            else self._sorted_buy_candidates(trader_history)
+        )
+        if not candidates_desc:
+            return neutral
+
+        # candidates_desc is sorted most-recent-first; ascending_dates is the same dates
+        # ascending, purely to binary-search the window boundaries in O(log n). Elements
+        # strictly newer than horizon_cutoff sit at the FRONT of candidates_desc (n - hi of
+        # them); elements strictly older than lookback_floor sit at the BACK (lo of them) — the
+        # in-window slice is what's left between those two counts.
+        n = len(ascending_dates)
+        lo = bisect.bisect_left(ascending_dates, lookback_floor)
+        hi = bisect.bisect_right(ascending_dates, horizon_cutoff)
+        window = candidates_desc[n - hi: n - lo]
 
         returns: List[float] = []
-        for exec_date, sym in candidates:
+        for exec_date, sym in window:
             if len(returns) >= max_past_trades:
                 break
             entry = self._price_on_or_after(sym, exec_date)

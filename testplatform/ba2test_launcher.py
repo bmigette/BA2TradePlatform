@@ -248,6 +248,16 @@ def _cmd_prewarm(args) -> int:
     else:
         end_date = datetime.now(_tz.utc)
 
+    # start_date only drives FMPSenateTraderWeight's post-loop skill-score prewarm below
+    # (_do_senate_scores) — no other expert's fetch is date-ranged (they all pull FULL
+    # histories and filter in Python at read time). Left None -> that step is skipped
+    # (with a printed reminder) rather than guessing a range.
+    start_date = None
+    if args.start:
+        start_date = datetime.fromisoformat(args.start)
+        if start_date.tzinfo is None:
+            start_date = start_date.replace(tzinfo=_tz.utc)
+
     # Build the (expert, symbol) work items. Each item is a callable doing the cached fetch.
     from ba2_experts.FMPRating import (
         fetch_grades_historical_cached, fetch_price_target_history_cached,
@@ -380,6 +390,83 @@ def _cmd_prewarm(args) -> int:
             for ssym in new_skill_syms:
                 s._get_price_at_date(ssym, end_date)  # warms historical_price_full (once, ever)
 
+    def _do_senate_scores(start: datetime, end: datetime) -> None:
+        """Proactively compute FMPSenateTraderWeight's trader-SKILL cache
+        (``congress_skill_scores.json``) for every trading day in ``[start, end]``, instead of
+        leaving it to lazy per-trial computation.
+
+        Why this is needed: ``_get_trader_skill_cached``'s key includes the exact calendar
+        day (backtest mode buckets by day, not month — see its docstring), and a GA trial only
+        ever scores the days its OWN schedule genes actually walk. Different individuals walk
+        DIFFERENT subsets of days (e.g. "every Monday" vs "every day"), so cache reuse across
+        trials is far lower than it looks: a population=4 priming run measured this live and,
+        after 2+ hours and multiple full passes, still only covered 550 scattered days versus
+        the thousands needed for a multi-year grid — a genuine gap the plain per-symbol fetch
+        warming above does nothing to close. Looping every trading day here, once, up front,
+        makes every trial's lazy lookup a guaranteed cache hit.
+
+        Scope: only ``horizon_days``/``lookback_months`` are GA-optimized (see
+        ``_EXPERT_OPT["FMPSenateTraderWeight"]``) — 3 x 2 = 6 combos. ``min_past_trades``/
+        ``max_past_trades`` are fixed (not GA genes), read from the expert's own settings
+        defaults so this can't silently desync from what a live/backtest run actually uses.
+        Confidence scoring (``_get_trader_confidence_cached``) is intentionally NOT covered
+        here: its key additionally depends on the current symbol/trade-type pair and is only
+        reachable through real trade-qualification logic in ``_calculate_recommendation`` — a
+        far bigger, non-grid-shaped key space that doesn't fit this same day x combo loop.
+        """
+        if _senate_expert is None or not _senate_seen_traders:
+            return
+        s = _senate_expert
+        from ba2_experts.FMPSenateTraderWeight import FMPSenateTraderWeight
+        min_past = int(FMPSenateTraderWeight._setting_or_default(None, "skill_min_past_trades"))
+        max_past = int(FMPSenateTraderWeight._setting_or_default(None, "skill_max_past_trades"))
+
+        def _grid_values(param: Dict[str, Any]) -> List[int]:
+            return list(range(int(param["min"]), int(param["max"]) + 1, int(param["step"])))
+
+        horizon_values = _grid_values(_senate_opt["expert_params"]["skill_horizon_days"])
+        lookback_values = _grid_values(_senate_opt["expert_params"]["skill_lookback_months"])
+
+        # Real trading days, not a synthetic weekday calendar: reuse the fullest already-warmed
+        # price history above (any gaps in a thin/delisted symbol would silently under-cover).
+        price_maps = getattr(s, "_hp_price_map", {}) or {}
+        if not price_maps:
+            print("!! senate skill prewarm: no warmed price history to derive trading days from "
+                  "(did _do_senate run first?) — skipping.")
+            return
+        calendar_sym = max(price_maps, key=lambda sym: len(price_maps[sym]))
+        days = sorted(
+            datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=end.tzinfo)
+            for d in price_maps[calendar_sym]
+            if start <= datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=end.tzinfo) <= end
+        )
+        if not days:
+            print(f"!! senate skill prewarm: {calendar_sym} has no bars in [{start.date()}, "
+                  f"{end.date()}] — skipping.")
+            return
+
+        total = len(days) * len(horizon_values) * len(lookback_values) * len(_senate_seen_traders)
+        print(f">> senate skill prewarm: {len(days)} trading days x {len(horizon_values)} horizons "
+              f"x {len(lookback_values)} lookbacks x {len(_senate_seen_traders)} traders "
+              f"({total} score computations)", flush=True)
+        done_scores = 0
+        t_scores = time.time()
+        for trader_idx, name in enumerate(_senate_seen_traders, start=1):
+            history = s._fetch_trader_history(name) or []
+            for day in days:
+                for horizon in horizon_values:
+                    for lookback in lookback_values:
+                        s._get_trader_skill_cached(
+                            name, history, now=day, horizon_days=horizon,
+                            min_past_trades=min_past, max_past_trades=max_past,
+                            lookback_months=lookback, is_live=False)
+                        done_scores += 1
+            if trader_idx % 25 == 0:
+                print(f"   senate skill prewarm: {trader_idx}/{len(_senate_seen_traders)} traders, "
+                      f"{done_scores}/{total} scores ({time.time() - t_scores:.0f}s elapsed)", flush=True)
+        s._save_scoring_cache("_skill_cache", s._SKILL_CACHE_FILE)  # final compacting flush
+        print(f">> senate skill prewarm done: {total} scores in {time.time() - t_scores:.0f}s", flush=True)
+
     # FinnHubRating: warm the per-symbol finnhub_reco_trends namespace. Bare instance carries the
     # Finnhub key + a logger (all _fetch_recommendation_trends needs).
     _finnhub_expert = None
@@ -449,6 +536,19 @@ def _cmd_prewarm(args) -> int:
                 except Exception as e:  # noqa: BLE001 — one bad symbol must not abort
                     errors += 1
                     print(f"!! prewarm {expert}/{sym} failed: {e}")
+
+        # Skill-score prewarm runs AFTER the per-symbol loop above (needs its fully-populated
+        # _senate_seen_traders), and serially (not thread-pooled — it's CPU-bound in-memory work
+        # over already-warmed price history, not network fetches). Still inside the freeze gate:
+        # a trader-history/price cache miss here would otherwise fall through to the "live: never
+        # persist" branch same as the per-symbol fetchers above.
+        if "FMPSenateTraderWeight" in experts:
+            if start_date is not None:
+                _do_senate_scores(start_date, end_date)
+            else:
+                print("!! senate skill prewarm skipped: pass --start to prewarm trader-skill scores "
+                      "for the full backtest date range (otherwise they're computed lazily per-trial, "
+                      "which under-covers a multi-year grid — see _do_senate_scores docstring).")
     elapsed = time.time() - t0
 
     print("\n>> pre-warm summary")
@@ -2721,6 +2821,11 @@ def main(argv: "list | None" = None) -> int:
     pw.add_argument("--workers", type=int, default=5, help="Parallel fetch threads (default 5).")
     pw.add_argument("--end", default=None,
                     help="ISO end date for the earnings/insider in-Python filter (default today).")
+    pw.add_argument("--start", default=None,
+                    help="ISO start date. Only consumed by FMPSenateTraderWeight, to proactively "
+                         "compute trader-skill scores for every trading day in [start, end] instead "
+                         "of leaving them to lazy per-trial computation (see _do_senate_scores). "
+                         "Ignored by the other experts.")
 
     bm = sub.add_parser("build-screener-metrics", help="Build/extend the screener METRIC store (parquet).")
     bm.add_argument("--store", default=_DEFAULT_SCREENER_STORE_DIR,
