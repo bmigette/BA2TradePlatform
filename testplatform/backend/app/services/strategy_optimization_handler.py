@@ -127,6 +127,18 @@ def _capture_full_result(buffer: Dict[str, Any], key: str, out: Dict[str, Any]) 
         buffer[key] = full
 
 
+# Process-local scratch space for the CLI's post-optimization top-N persist step (see
+# _persist_top_backtests in ba2test_launcher.py). Deliberately NOT part of
+# handle_strategy_optimization's return value: that return dict flows into TaskQueue.result (a
+# JSON DB column) for every UI/API-submitted job via the main task queue's inline handler path
+# (use_subprocess=False), and this buffer can hold a full generation's worth of trade/equity/
+# drawdown blobs -- it must never be serialized to the DB. Only the CLI's direct, same-process
+# caller ever reads this (via pop, right after handle_strategy_optimization returns), so a
+# long-lived worker process handling many jobs over time doesn't accumulate entries for jobs
+# nobody ever collected.
+_last_gen_full_results_by_opt: Dict[int, Dict[str, Any]] = {}
+
+
 def _trial_worker(config: Dict[str, Any], fitness_metric: str) -> Dict[str, Any]:
     """Run ONE deterministic daily backtest in a worker PROCESS and return a tiny summary.
 
@@ -708,14 +720,13 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             f"best_fitness={result['best_fitness']:.4f} "
             f"memo hits/misses={memo.hits}/{memo.misses}"
         )
+        if last_gen_full_results:
+            _last_gen_full_results_by_opt[opt_id] = last_gen_full_results
         return {
             "status": "completed",
             "optimization_id": opt_id,
             "best_fitness": result["best_fitness"],
             "best_params": result["best_params"],
-            # In-memory only (never persisted to the DB — the buffer can be large): consumed
-            # immediately by the caller's top-N persist step (see _persist_top_backtests).
-            "last_gen_full_results": last_gen_full_results,
         }
 
     except InterruptedError:

@@ -235,6 +235,23 @@ def test_handler_completes_and_persists_best(monkeypatch):
     assert row.all_results and all("fitness" in r for r in row.all_results)
 
 
+def test_completion_return_dict_never_carries_last_gen_full_results(monkeypatch):
+    """Regression guard: handle_strategy_optimization's return value flows into
+    TaskQueue.result (a JSON DB column) for every UI/API-submitted job — last_gen_full_results
+    must NEVER be a key in that dict, no matter how large or small it is. The buffer is
+    consumed via the module-level _last_gen_full_results_by_opt dict instead (popped by the
+    CLI's direct caller, not returned)."""
+    monkeypatch.setattr(H, "_run_trial_backtest", _deterministic_stub)
+    monkeypatch.setattr(H, "_build_hoisted_state", lambda cfg: {})
+
+    sid = _seed_strategy()
+    opt_id = _seed_opt(sid)
+    res = H.handle_strategy_optimization("t-no-leak", {"optimization_id": opt_id})
+
+    assert res["status"] == "completed"
+    assert "last_gen_full_results" not in res
+
+
 def test_handler_reproducible_via_db(monkeypatch):
     """Two seeded handler runs over the stub => identical best_params/best_fitness."""
     monkeypatch.setattr(H, "_run_trial_backtest", _deterministic_stub)
