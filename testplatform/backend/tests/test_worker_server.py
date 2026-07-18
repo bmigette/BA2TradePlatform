@@ -21,6 +21,9 @@ class _FakePool:
             return _FakeFuture({"ok": True, "results": {"total_return": 12.3, "total_trades": 5}})
         return _FakeFuture({"ok": True, "fitness": 42.0, "trades": 3, "error": None})
 
+    def shutdown(self, wait=True, cancel_futures=False):
+        pass
+
 
 @pytest.fixture()
 def client(monkeypatch):
@@ -53,6 +56,23 @@ def test_run_trial(client):
     assert r.json() == {"ok": True, "fitness": 42.0, "trades": 3, "error": None}
     # auth still enforced
     assert client.post("/run-trial", json={"config": {}, "fitness_metric": "x"}).status_code == 401
+
+
+def test_shutdown_pool_for_restart_stops_rebuild(monkeypatch):
+    """_shutdown_pool_for_restart() must clear _POOL_FACTORY (not just _POOL) so a concurrent
+    /run-trial handler that catches BrokenProcessPool during the restart window no-ops instead
+    of spawning a fresh pool that _kill_children() would immediately kill again — the
+    rebuild-then-kill storm this fix prevents."""
+    built = []
+    monkeypatch.setattr(ws, "_POOL", _FakePool())
+    monkeypatch.setattr(ws, "_POOL_FACTORY", lambda: built.append(1) or _FakePool())
+
+    ws._shutdown_pool_for_restart()
+
+    assert ws._POOL is None
+    assert ws._POOL_FACTORY is None
+    ws._rebuild_pool(Exception("broken"))  # simulates an in-flight handler racing the shutdown
+    assert built == [], "rebuild must no-op once _POOL_FACTORY has been cleared for restart"
 
 
 def test_cache_push_extracts(client, tmp_path, monkeypatch):

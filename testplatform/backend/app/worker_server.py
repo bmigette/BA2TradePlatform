@@ -441,10 +441,20 @@ def _shutdown_pool_for_restart() -> None:
     """Pre-restart cleanup: stop the trial pool FIRST so its management thread cannot respawn
     replacement children between restart_now's _kill_children() and execv — the race that
     orphaned ~10 spawn children (2-4.8GB each) on every self-update and eventually depleted
-    the worker box (WinError 1450)."""
-    global _POOL
+    the worker box (WinError 1450).
+
+    Also clears _POOL_FACTORY so any /run-trial handler mid-flight when this fires — and
+    whose BrokenProcessPool lands during the shutdown window — sees _rebuild_pool() no-op
+    (fails fast with retryable=True) instead of spawning a fresh pool that's just going to be
+    killed again by _kill_children() a moment later. Without this, concurrent in-flight
+    handlers would race to rebuild, each spawning a full torch/numpy child process only to
+    have it killed immediately — a rebuild-then-kill storm (observed 15-20 cycles deep) before
+    the process finally execv's. This does NOT wait for the pool to drain — restart stays fast,
+    it just stops the pool from being pointlessly resurrected while restarting."""
+    global _POOL, _POOL_FACTORY
     with _POOL_LOCK:
         pool, _POOL = _POOL, None
+        _POOL_FACTORY = None
     if pool is not None:
         try:
             pool.shutdown(wait=False, cancel_futures=True)
