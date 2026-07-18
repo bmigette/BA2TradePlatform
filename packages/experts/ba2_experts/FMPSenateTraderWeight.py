@@ -575,6 +575,21 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         build for that one symbol) — ``_calculate_recommendation`` only ever looks up trader
         names that actually appear in the symbol's OWN ``filtered_trades``, so the extra
         unrelated entries are inert, never accessed for a different symbol's calculation.
+
+        UNBOUNDED SYMBOL DISCOVERY — READ BEFORE WIRING THIS INTO A REAL RUN: unlike the
+        per-symbol ``_gather`` (always called on an already-vetted, config-provided universe
+        symbol), this method discovers its symbol set FROM THE LIVE DISCLOSURE FEED — any
+        tradable ticker any member of Congress disclosed, with no static-universe bound. If a
+        discovered symbol's OHLCV wasn't prewarmed, ``providers.price_at_date`` raises
+        ``BacktestCacheMiss``/``FMPHistoryCacheMiss`` (confirmed in practice: opt 178's 2026-07-18
+        verification run hit this for ``BBEU``, a real disclosed symbol outside its 498-symbol
+        prewarm universe) — and per ``daily_engine.py``'s ``_run_basket_expert_bar``, that
+        exception RE-RAISES and aborts the ENTIRE bar for this expert, not just the one symbol.
+        A backtest/GA run needs OHLCV prewarm covering the full discoverable symbol space (not
+        just a configured ``enabled_instruments`` list) before using basket mode for real; the
+        new ``congress_senate_latest``/``congress_house_latest`` trade-feed cache namespace
+        itself IS covered by ``ba2test_launcher.py``'s prewarm (``_do_senate_latest``), but
+        OHLCV bars for every symbol that feed can name are not automatically included.
         """
         from ba2_common.core.utils import is_tradable_stock_ticker  # lazy: avoid circular import
 
