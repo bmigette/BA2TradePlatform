@@ -111,8 +111,16 @@ def test_is_tradable_stock_ticker():
     from ba2_common.core.utils import is_tradable_stock_ticker
     assert is_tradable_stock_ticker("AAPL") is True
     assert is_tradable_stock_ticker("MSFT") is True
+    assert is_tradable_stock_ticker("aapl") is True
+    assert is_tradable_stock_ticker("A") is True
     # Mutual-fund pattern: 4-5 uppercase letters ending in X
     assert is_tradable_stock_ticker("FTGCX") is False
     assert is_tradable_stock_ticker("VFIAX") is False
     assert is_tradable_stock_ticker("") is False
     assert is_tradable_stock_ticker(None) is False
+    # Forbidden characters (share-class suffix, currency marker, whitespace)
+    assert is_tradable_stock_ticker("BRK/B") is False
+    assert is_tradable_stock_ticker("TICKER$") is False
+    assert is_tradable_stock_ticker("AAPL ") is False
+    # Non-ASCII
+    assert is_tradable_stock_ticker("ÀAPL") is False
