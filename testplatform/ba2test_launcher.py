@@ -451,13 +451,32 @@ def _cmd_prewarm(args) -> int:
               f"({total} score computations)", flush=True)
         done_scores = 0
         t_scores = time.time()
+        from ba2_experts.FMPSenateTraderWeight import _parse_ymd_utc as _parse_disc_date
         for trader_idx, name in enumerate(_senate_seen_traders, start=1):
             history = s._fetch_trader_history(name) or []
+            # CRITICAL: slice the history to disclosures known as-of EACH day, exactly like
+            # _gather does (FMPSenateTraderWeight.py, "Stage 2": ``[h for h in history if
+            # _disclosure_date_ok(h, ceiling)]``) — the skill-cache key includes
+            # ``len(history)``, so scoring the FULL history under a mid-backtest as-of day
+            # writes keys no real trial ever looks up (found live 2026-07-18: 1.4M prewarmed
+            # entries all keyed at today's full length, e.g. n=1003 for a trader whose
+            # mid-backtest lookups used n=854..895 — near-zero cache-hit rate, and the sen-*
+            # grid jobs ground at cold-cache speed as if never prewarmed). Disclosure dates
+            # are parsed ONCE per trader here (not per day) — same lru-cached parser +
+            # keep-on-unparseable semantics as _disclosure_date_ok.
+            parsed_disc_dates = []
+            for t in history:
+                ds = t.get('disclosureDate', '')
+                try:
+                    parsed_disc_dates.append(_parse_disc_date(ds) if ds else None)
+                except (ValueError, TypeError):
+                    parsed_disc_dates.append(None)  # unparseable -> always kept, like _disclosure_date_ok
             for day in days:
+                sliced = [t for t, d in zip(history, parsed_disc_dates) if d is None or d <= day]
                 for horizon in horizon_values:
                     for lookback in lookback_values:
                         s._get_trader_skill_cached(
-                            name, history, now=day, horizon_days=horizon,
+                            name, sliced, now=day, horizon_days=horizon,
                             min_past_trades=min_past, max_past_trades=max_past,
                             lookback_months=lookback, is_live=False)
                         done_scores += 1
