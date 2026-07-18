@@ -70,13 +70,29 @@ The BA2 Trade Platform uses a plugin-based expert system where each expert can:
 - **Type**: Government trading tracker (sophisticated algorithm)
 - **Methodology**: Weighted algorithm considering portfolio allocation percentages
 - **Data Sources**: FMP Senate/House trading disclosure data
-- **Instrument Selection**: Static/Dynamic (cannot recommend its own instruments)
+- **Instrument Selection**: Static/Dynamic, **or** expert-driven **basket dispatch**
+  (`can_recommend_instruments=True`, `should_expand_instrument_jobs=False`,
+  `instrument_selection_method=expert`) — same dispatch style as FMPSenateTraderCopy below.
+  `instrument_selection_method` is a per-`ExpertInstance` setting, not a class default, so
+  any existing instance configured `static`/`dynamic` is unaffected until an operator
+  explicitly switches it to `expert`.
 - **Key Features**:
   - Portfolio allocation analysis (symbol focus percentage)
   - Historical trader performance evaluation
   - Investment size and timing considerations
   - Age-based filtering for trade relevance
   - Complex confidence calculation based on trader behavior patterns
+  - **Basket dispatch** (opt-in via `instrument_selection_method=expert`): one analysis
+    cycle per bar/job scans ALL congressional disclosures (not a fixed universe) via
+    `_gather_all`/`_process_all` and emits one recommendation per qualifying symbol that
+    passes the disclosure-window filters plus a tradable-stock-only filter. Verified ~4.6x
+    faster (543s→117s) than the legacy per-symbol path on a 42-month/498-symbol backtest,
+    identical trade output. See `_gather_all`'s docstring in
+    `packages/experts/ba2_experts/FMPSenateTraderWeight.py` for the full design and its
+    documented "unbounded symbol discovery" caveat: a discovered symbol whose OHLCV was
+    never prewarmed is silently skipped for that bar (not a crash), not a fixed list like
+    `tools/senate_universe.txt` (see
+    [`docs/plans/2026-07-18-senate-basket-dispatch.md`](docs/plans/2026-07-18-senate-basket-dispatch.md)).
 
 **Key Settings** (4 total):
 - `max_disclose_date_days`: Maximum days since trade disclosure (default: 30)
@@ -143,12 +159,14 @@ The BA2 Trade Platform uses a plugin-based expert system where each expert can:
 | TradingAgents | No | No | Complex AI-driven analysis with debate system |
 | FinnHubRating | No | No | Analyst consensus tracking |
 | FMPRating | No | No | Price target analysis |
-| FMPSenateTraderWeight | No | No | Sophisticated government trading analysis |
+| FMPSenateTraderWeight | **Yes** (opt-in basket mode)² | No | Sophisticated government trading analysis |
 | FMPSenateTraderCopy | **Yes** | No | Simple government trade copying |
 | PennyMomentumTrader | **Yes** | **Yes** | Live intraday penny-stock momentum |
 | FactorRanker | **Yes** | **Yes** | Systematic multi-factor equity ranking |
 
 ¹ *Self-executing* experts place and manage their own orders via a dedicated manager (no `ExpertRecommendation`, no SmartRiskManager); order/expert attribution flows through `Transaction.expert_id`.
+
+² Unlike FMPSenateTraderCopy, this is **opt-in**: `can_recommend_instruments`/`should_expand_instrument_jobs` are always set on the class, but `instrument_selection_method` is a per-`ExpertInstance` setting — an instance stays on its configured `static`/`dynamic` selection until an operator explicitly switches it to `expert`.
 
 ## Instrument Selection Methods
 
@@ -164,7 +182,7 @@ The BA2 Trade Platform uses a plugin-based expert system where each expert can:
 
 ### Expert-Driven Selection
 - **Expert Decides**: The expert algorithm determines which instruments to analyze
-- **Used by**: FMPSenateTraderCopy, PennyMomentumTrader, FactorRanker (can recommend their own instruments)
+- **Used by**: FMPSenateTraderCopy, PennyMomentumTrader, FactorRanker (can recommend their own instruments); FMPSenateTraderWeight when its `instrument_selection_method` setting is switched to `expert` (opt-in basket dispatch, off by default)
 - **Best for**: Autonomous trading systems that discover opportunities
 
 ### Screener Selection
@@ -179,11 +197,14 @@ The BA2 Trade Platform uses a plugin-based expert system where each expert can:
 - Follow traditional scheduling patterns
 - Suitable for portfolio-based strategies
 
-### Self-Managing Experts (FMPSenateTraderCopy, PennyMomentumTrader, FactorRanker)
+### Self-Managing Experts (FMPSenateTraderCopy, PennyMomentumTrader, FactorRanker, FMPSenateTraderWeight in basket mode)
 - Can recommend their own instruments
 - Use `should_expand_instrument_jobs: False` to run a single batch job (no per-symbol duplication)
 - Run analysis and discover/rank trading opportunities autonomously
 - Ideal for discovery-based and portfolio/factor strategies
+- FMPSenateTraderWeight is opt-in here: it only joins this group once an instance's
+  `instrument_selection_method` setting is switched to `expert`; by default it still runs
+  as a Standard Expert against `static`/`dynamic`-selected instruments
 
 ### Weekly vs Monthly Schedules
 - Each analysis schedule (Enter-Market, Open-Positions) can fire **weekly** (chosen days + time) or **monthly** on the **Nth weekday** (e.g. *1st Monday*, *3rd Tuesday*).
@@ -199,8 +220,11 @@ The BA2 Trade Platform uses a plugin-based expert system where each expert can:
 
 ### For Government Trading Following
 1. Use **FMPSenateTraderWeight** for sophisticated analysis of government trading patterns
+   — either against a `static`/`dynamic`-selected instrument list, or (opt-in) against its
+   own live-disclosure-derived basket by setting `instrument_selection_method: expert`
 2. Use **FMPSenateTraderCopy** for simple copy trading of specific officials
-3. FMPSenateTraderCopy works best with `should_expand_instrument_jobs: False`
+3. FMPSenateTraderCopy works best with `should_expand_instrument_jobs: False`; the same is
+   true of FMPSenateTraderWeight once switched into basket (`expert`) mode
 
 ### For Market Discovery
 1. **FMPSenateTraderCopy** with expert-driven instrument selection

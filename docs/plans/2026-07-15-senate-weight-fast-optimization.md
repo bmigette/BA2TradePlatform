@@ -3,6 +3,47 @@
 > **For Claude:** implementation tasks here are small and mostly operational; execute
 > top-to-bottom. Code tasks (1, 4) follow the usual test-first + commit cadence.
 
+> **Status update (2026-07-19) — partially superseded, see
+> [`docs/plans/2026-07-18-senate-basket-dispatch.md`](2026-07-18-senate-basket-dispatch.md):**
+> That plan gave `FMPSenateTraderWeight` a **basket-dispatch** mode
+> (`instrument_selection_method=expert`, `should_expand_instrument_jobs=False`) — the expert
+> now derives its own working symbol set **per bar**, directly from the live Senate/House
+> disclosure feed plus a tradable-stock filter, rather than depending on Phase 1's
+> periodically-regenerated static `tools/senate_universe.txt`. Practically:
+> - **Phase 1 (`tools/build_senate_universe.py` / `tools/senate_universe.txt`) is NOT
+>   deleted and still has a job**: OHLCV/FMP-history **PREWARM scoping** (Phases 2-4 below)
+>   still benefits from a bounded, pre-vetted symbol list rather than trying to prewarm the
+>   disclosure feed's unbounded discovered-symbol set ahead of time. It is simply no longer
+>   the expert's *runtime dispatch* mechanism — basket mode does not read
+>   `senate_universe.txt` to decide what to score.
+> - The tool's ticker-classification helper moved: what was
+>   `build_senate_universe.py`'s local `_FUND_TICKER_RE`/`_is_junk_ticker` is now the shared,
+>   public `is_tradable_stock_ticker()` in `packages/common/ba2_common/core/utils.py`
+>   (senate-basket-dispatch plan, Task 4) — same regex (`^[A-Z]{4,5}X$`), inverted sense
+>   (True = keep). `build_senate_universe.py` imports it instead of defining its own copy.
+> - Three correctness fixes landed alongside basket dispatch (all outside this plan's
+>   original scope, but load-bearing for anyone relying on basket-mode backtests): a
+>   lookahead-bias fix so trade-age filters have an upper bound (commit `d20c2a3` — both
+>   `FMPSenateTraderWeight` and `FMPSenateTraderCopy` were previously including
+>   future-disclosed/future-executed trades); deep-pagination for the unscoped
+>   congress-trades feed, which previously only fetched ~4 months of history via
+>   `full_history=True` (commit `d8862f1`); and per-symbol OHLCV cache-miss isolation so one
+>   un-prewarmed discovered symbol no longer aborts the whole bar (commit `42753ff`). With
+>   those in place, basket mode was verified end-to-end at **4.6x real speedup (543s→117s)**
+>   on a full 42-month/498-symbol backtest, with identical trade output to the old
+>   per-symbol path — this is the actual delivery of the "fast optimization" goal this plan
+>   was written for, just via a different mechanism (once-per-bar basket scan) than Phase 3
+>   originally assumed (once-per-symbol calls over a fixed universe).
+> - **Known, accepted operational gap (not a bug, not yet automated):** because basket mode
+>   discovers symbols live from the disclosure feed, it can name a symbol whose OHLCV was
+>   never prewarmed. A targeted one-time prewarm covered the gap observed as of this writing
+>   (roughly 560 symbols the disclosure feed named across a 2023-2026 window that were
+>   missing from the platform's broader ~11,064-symbol OHLCV cache), but this is a
+>   point-in-time fix, not a maintained/automatic one — newly-disclosed, never-before-seen
+>   symbols will keep needing occasional re-prewarms. See `_gather_all`'s docstring in
+>   `packages/experts/ba2_experts/FMPSenateTraderWeight.py` for the mechanics (a missing
+>   symbol is now silently skipped for that bar, not a hard failure).
+
 **Goal:** make FMPSenateTraderWeight optimizable like the screener-grid experts — a
 resumable GA matrix over a data-appropriate universe, running hermetic (0-fetch)
 backtests from pre-warmed caches, distributable to remote workers.
