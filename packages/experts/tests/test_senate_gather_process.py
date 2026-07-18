@@ -1318,6 +1318,138 @@ def test_gather_all_excludes_non_tradable_symbols():
     assert "AAPL" in bundle
 
 
+# ====================================================================
+# FMPSenateTraderWeight — basket-mode resilience to un-prewarmed discovered symbols
+#
+# _gather_all discovers its symbol set from the LIVE disclosure feed (no static universe
+# bound), so a discovered symbol whose OHLCV/price-history was never prewarmed is a routine,
+# expected occurrence -- NOT an operator/config error the way it would be for the classic
+# per-symbol _gather's pre-vetted universe. These tests prove _gather_all catches the
+# cache-miss exception PER SYMBOL (dropping just that one) rather than letting it propagate
+# out of the whole basket gather (which would abort the entire bar one layer up, in
+# daily_engine.py's _run_basket_expert_bar -- see that method's re-raise-on-cache-miss branch).
+# ====================================================================
+
+class _RaisingOHLCV(FakeOHLCV):
+    """FakeOHLCV whose get_ohlcv_data raises FMPHistoryCacheMiss for ONE symbol, simulating
+    providers.price_at_date hitting an un-prewarmed discovered symbol during a hermetic
+    backtest (the real exception _gather_all must isolate)."""
+
+    def __init__(self, price_map, raise_for):
+        super().__init__(price_map)
+        self._raise_for = str(raise_for).upper()
+
+    def get_ohlcv_data(self, symbol, end_date=None, lookback_days=7, interval="1d"):
+        if str(symbol).upper() == self._raise_for:
+            from ba2_providers.fmp_common import FMPHistoryCacheMiss
+            raise FMPHistoryCacheMiss(f"{symbol} not pre-warmed (hermetic backtest, 0 fetch)")
+        return super().get_ohlcv_data(symbol, end_date=end_date, lookback_days=lookback_days,
+                                       interval=interval)
+
+
+def _two_symbol_basket_fixture():
+    """Shared AAPL+MSFT basket fixture (two traders each, both qualify on min_traders/
+    min_trades) for the cache-miss isolation tests below."""
+    senate = [
+        _weight_trade("Alice", "Aa", "AAPL", "purchase", "2026-06-01", "2026-05-20"),
+        _weight_trade("Bob", "Bb", "AAPL", "purchase", "2026-06-02", "2026-05-21"),
+    ]
+    house = [
+        _weight_trade("Carol", "Cc", "MSFT", "purchase", "2026-06-01", "2026-05-20"),
+        _weight_trade("Dave", "Dd", "MSFT", "purchase", "2026-06-02", "2026-05-21"),
+    ]
+    history = {
+        "Alice Aa": [_weight_trade("Alice", "Aa", "AAPL", "purchase", "2026-05-01", "2026-04-20")],
+        "Bob Bb": [_weight_trade("Bob", "Bb", "AAPL", "purchase", "2026-05-02", "2026-04-21")],
+        "Carol Cc": [_weight_trade("Carol", "Cc", "MSFT", "purchase", "2026-05-01", "2026-04-20")],
+        "Dave Dd": [_weight_trade("Dave", "Dd", "MSFT", "purchase", "2026-05-02", "2026-04-21")],
+    }
+    price_map = {"AAPL": 100.0, "MSFT": 60.0}
+    return senate, house, history, price_map
+
+
+def test_gather_all_skips_symbol_whose_current_price_cache_misses():
+    """A cache-miss EXCEPTION (not just a None/falsy return) while resolving ONE symbol's
+    current_price via providers.price_at_date must not abort _gather_all for the other
+    qualifying symbols: MSFT is dropped, AAPL's bundle is unaffected."""
+    senate, house, history, price_map = _two_symbol_basket_fixture()
+    e = _weight_basket_expert(senate, house, history, price_map, exec_price=50.0)
+    e._gather_settings = WEIGHT_SETTINGS
+
+    raising_bundle = LiveProviderBundle(
+        lambda cat, name, **kw: {"ohlcv": _RaisingOHLCV(price_map, raise_for="MSFT")}[cat])
+
+    bundle = e._gather_all(raising_bundle, as_of=NOW)
+
+    assert "MSFT" not in bundle, "symbol whose price resolution raised must be dropped"
+    assert "AAPL" in bundle, "the OTHER symbol must still be resolved normally"
+    assert bundle["AAPL"]["current_price"] == 100.0
+    assert bundle["AAPL"]["symbol"] == "AAPL"
+    assert len(bundle["AAPL"]["exec_price_by_trade"]) == 2
+
+
+def test_gather_all_skips_symbol_whose_exec_price_cache_misses():
+    """A cache-miss EXCEPTION from _get_price_at_date while resolving ONE symbol's per-trade
+    exec price (not the current_price call) must also just drop that symbol -- not ship a
+    bundle with a broken/partial exec_price_by_trade map."""
+    from ba2_providers.fmp_common import FMPHistoryCacheMiss
+
+    senate, house, history, price_map = _two_symbol_basket_fixture()
+    e = _weight_basket_expert(senate, house, history, price_map, exec_price=50.0)
+    e._gather_settings = WEIGHT_SETTINGS
+
+    def _exec_price(sym, date):
+        if str(sym).upper() == "MSFT":
+            raise FMPHistoryCacheMiss(f"{sym} not pre-warmed (hermetic backtest, 0 fetch)")
+        return 50.0
+
+    e._get_price_at_date = _exec_price
+
+    bundle = e._gather_all(_bundle(price_map), as_of=NOW)
+
+    assert "MSFT" not in bundle, "symbol whose exec-price resolution raised must be dropped"
+    assert "AAPL" in bundle
+    assert bundle["AAPL"]["current_price"] == 100.0
+    assert len(bundle["AAPL"]["exec_price_by_trade"]) == 2
+
+
+def test_gather_all_bubbles_up_a_non_cache_miss_exception():
+    """A genuine bug (not a cache-miss) during price resolution must still propagate loudly
+    out of _gather_all -- this fix narrows the catch to cache-miss types ONLY, it must not
+    turn into a blanket except-and-skip that would hide real errors."""
+    senate, house, history, price_map = _two_symbol_basket_fixture()
+    e = _weight_basket_expert(senate, house, history, price_map, exec_price=50.0)
+    e._gather_settings = WEIGHT_SETTINGS
+
+    def _boom(sym):
+        if str(sym).upper() == "MSFT":
+            raise RuntimeError("some unrelated bug")
+        return price_map.get(str(sym).upper())
+
+    e._get_current_price = _boom  # as_of=None path -> exercised via analyze_as_of-style live call
+    with pytest.raises(RuntimeError, match="some unrelated bug"):
+        e._gather_all(_bundle(price_map), as_of=None)
+
+
+def test_gather_all_all_symbols_cache_miss_returns_empty_dict_not_raise():
+    """Every qualifying symbol missing its prewarm must still return an empty dict (a fully
+    empty basket for this bar), not raise -- the caller (analyze_as_of/_process_all) already
+    handles an empty bundle_by_symbol as "no recommendations this bar"."""
+    senate, house, history, price_map = _two_symbol_basket_fixture()
+    e = _weight_basket_expert(senate, house, history, price_map, exec_price=50.0)
+    e._gather_settings = WEIGHT_SETTINGS
+
+    class _AlwaysRaisingOHLCV(FakeOHLCV):
+        def get_ohlcv_data(self, symbol, end_date=None, lookback_days=7, interval="1d"):
+            from ba2_providers.fmp_common import FMPHistoryCacheMiss
+            raise FMPHistoryCacheMiss(f"{symbol} not pre-warmed")
+
+    raising_bundle = LiveProviderBundle(
+        lambda cat, name, **kw: {"ohlcv": _AlwaysRaisingOHLCV(price_map)}[cat])
+    bundle = e._gather_all(raising_bundle, as_of=NOW)
+    assert bundle == {}
+
+
 def test_analyze_as_of_basket_mode_returns_list_when_no_symbol_pinned():
     """context.extra without 'symbol' -> analyze_as_of returns List[Recommendation]."""
     senate = [

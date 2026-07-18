@@ -569,16 +569,22 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
            ``is_tradable_stock_ticker`` — a filter the per-symbol path never needed, since its
            caller always pinned an already-vetted universe symbol.
         4. Group the surviving trades by symbol.
-        5. Resolve ``current_price`` per symbol (same ``providers.price_at_date``/
-           ``_get_current_price`` call ``_gather`` already makes, just looped) and build the
-           per-trader history/skill/hold-info maps EXACTLY ONCE for the whole bar — shared
-           across every qualifying symbol (Stages 2-4 in ``_gather`` are symbol-independent
-           except for which traders/trades a given symbol's list touches; recomputing them per
-           symbol, as the per-symbol ``_gather`` does when called once per universe symbol, is
-           the redundant work this basket path is designed to eliminate). A symbol whose price
-           doesn't resolve is dropped (mirrors ``FMPSenateTraderCopy._gather``'s
-           ``supported_symbols`` filter — an unresolvable current_price would otherwise blow up
-           ``_filter_trades``' price-delta arithmetic downstream).
+        5. Resolve each symbol's per-trade ``exec_price_by_trade`` (``_get_price_at_date``) and
+           ``current_price`` (same ``providers.price_at_date``/``_get_current_price`` call
+           ``_gather`` already makes, just looped), and build the per-trader history/skill/
+           hold-info maps EXACTLY ONCE for the whole bar — shared across every qualifying symbol
+           (Stages 2-4 in ``_gather`` are symbol-independent except for which traders/trades a
+           given symbol's list touches; recomputing them per symbol, as the per-symbol
+           ``_gather`` does when called once per universe symbol, is the redundant work this
+           basket path is designed to eliminate). A symbol whose price resolution fails — EITHER
+           a clean ``None``/falsy return, OR an OHLCV/FMP-history cache-miss EXCEPTION
+           (``FMPHistoryCacheMiss``/``BacktestCacheMiss``, see ``_price_cache_miss_exceptions``)
+           raised while resolving ``current_price`` or ANY of its trades' ``exec_price_by_trade``
+           — is dropped (mirrors ``FMPSenateTraderCopy._gather``'s ``supported_symbols`` filter;
+           a missing/broken price would otherwise blow up ``_filter_trades``' price-delta
+           arithmetic downstream, or ship a partial bundle with unresolved exec prices). This
+           per-symbol catch is basket-mode-ONLY: the classic per-symbol ``_gather`` leaves both
+           call sites unguarded on purpose (see the "UNBOUNDED SYMBOL DISCOVERY" note below).
         6. Return ``{symbol: bundle}`` where each ``bundle`` has the SAME keys/shape
            ``_gather``'s single-symbol bundle has, so ``_process`` (unmodified) can consume any
            one of them directly (see ``_process_all``).
@@ -594,16 +600,21 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         per-symbol ``_gather`` (always called on an already-vetted, config-provided universe
         symbol), this method discovers its symbol set FROM THE LIVE DISCLOSURE FEED — any
         tradable ticker any member of Congress disclosed, with no static-universe bound. If a
-        discovered symbol's OHLCV wasn't prewarmed, ``providers.price_at_date`` raises
-        ``BacktestCacheMiss``/``FMPHistoryCacheMiss`` (confirmed in practice: opt 178's 2026-07-18
-        verification run hit this for ``BBEU``, a real disclosed symbol outside its 498-symbol
-        prewarm universe) — and per ``daily_engine.py``'s ``_run_basket_expert_bar``, that
-        exception RE-RAISES and aborts the ENTIRE bar for this expert, not just the one symbol.
-        A backtest/GA run needs OHLCV prewarm covering the full discoverable symbol space (not
-        just a configured ``enabled_instruments`` list) before using basket mode for real; the
-        new ``congress_senate_latest``/``congress_house_latest`` trade-feed cache namespace
-        itself IS covered by ``ba2test_launcher.py``'s prewarm (``_do_senate_latest``), but
-        OHLCV bars for every symbol that feed can name are not automatically included.
+        discovered symbol's OHLCV/price-history wasn't prewarmed, ``providers.price_at_date``/
+        ``_get_price_at_date`` raise ``BacktestCacheMiss``/``FMPHistoryCacheMiss`` (confirmed in
+        practice: opt 178's 2026-07-18 verification run hit this for ``BBEU``, a real disclosed
+        symbol outside its 498-symbol prewarm universe). Step 5's per-symbol price resolution
+        above catches EXACTLY those exception types and drops just that ONE symbol — the OTHER
+        qualifying symbols in the bar resolve normally, and ``daily_engine.py``'s
+        ``_run_basket_expert_bar`` never sees the exception for this failure mode any more (its
+        own re-raise-on-cache-miss branch around the whole ``analyze_as_of`` call still exists,
+        but now only guards a miss from something OUTSIDE this per-symbol loop, e.g. the
+        unscoped trade-feed fetch itself — not a routine per-symbol OHLCV gap). A backtest/GA
+        run should still prewarm OHLCV as broadly as practical (missing coverage just means
+        fewer scored symbols, not a crash); the ``congress_senate_latest``/
+        ``congress_house_latest`` trade-feed cache namespace itself IS covered by
+        ``ba2test_launcher.py``'s prewarm (``_do_senate_latest``), but OHLCV bars for every
+        symbol that feed can name are not automatically included.
         """
         from ba2_common.core.utils import is_tradable_stock_ticker  # lazy: avoid circular import
 
@@ -670,26 +681,44 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             }
 
         # Step 5b + 6: per-symbol exec-price map + current_price + bundle assembly.
+        # Cache-miss exception types resolved ONCE (not per symbol) -- see
+        # _price_cache_miss_exceptions' docstring for why BacktestCacheMiss is best-effort.
+        cache_miss_excs = self._price_cache_miss_exceptions()
+
         bundle_by_symbol: Dict[str, Dict[str, Any]] = {}
         for symbol, symbol_trades in trades_by_symbol.items():
-            exec_price_by_trade: Dict[tuple, Optional[float]] = {}
-            for trade in symbol_trades:
-                exec_date_str = trade.get('transactionDate', '')
-                if not exec_date_str:
-                    continue
-                key = self._trade_key(trade)
-                if key in exec_price_by_trade:
-                    continue
-                try:
-                    exec_date = _parse_ymd_utc(exec_date_str)
-                except (ValueError, TypeError):
-                    continue
-                exec_price_by_trade[key] = self._get_price_at_date(symbol, exec_date)
+            try:
+                exec_price_by_trade: Dict[tuple, Optional[float]] = {}
+                for trade in symbol_trades:
+                    exec_date_str = trade.get('transactionDate', '')
+                    if not exec_date_str:
+                        continue
+                    key = self._trade_key(trade)
+                    if key in exec_price_by_trade:
+                        continue
+                    try:
+                        exec_date = _parse_ymd_utc(exec_date_str)
+                    except (ValueError, TypeError):
+                        continue
+                    exec_price_by_trade[key] = self._get_price_at_date(symbol, exec_date)
 
-            # Live (as_of=None) reads the account/broker quote (the original live source);
-            # backtest (as_of set) reads the OHLCV close-at-as_of -- identical to _gather.
-            current_price = (self._get_current_price(symbol) if as_of is None
-                             else providers.price_at_date(symbol, as_of))
+                # Live (as_of=None) reads the account/broker quote (the original live source);
+                # backtest (as_of set) reads the OHLCV close-at-as_of -- identical to _gather.
+                current_price = (self._get_current_price(symbol) if as_of is None
+                                 else providers.price_at_date(symbol, as_of))
+            except cache_miss_excs as e:
+                # UNPREWARMED symbol discovered dynamically from the live disclosure feed --
+                # expected/routine for basket mode (confirmed 2026-07-18: 560 of ~2,057
+                # tradable disclosed symbols in a 3.5-year window lack cached OHLCV, mostly
+                # foreign OTC/ADR tickers), NOT an operator/config error the way a miss would
+                # be for the classic per-symbol path's pre-vetted, fully-prewarmed universe
+                # (see this method's "UNBOUNDED SYMBOL DISCOVERY" docstring note). Skip just
+                # this ONE symbol -- the other qualifying symbols in this bar are unaffected.
+                self.logger.warning(
+                    f"_gather_all: skipping {symbol} @ {ceiling:%Y-%m-%d} -- price resolution "
+                    f"hit an un-prewarmed OHLCV/price-history cache miss: {e}")
+                continue
+
             if not current_price:
                 # No resolvable price for this symbol -- can't score it (would blow up
                 # _filter_trades' price-delta arithmetic downstream). Mirrors
@@ -706,6 +735,38 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                 "symbol": symbol,
             }
         return bundle_by_symbol
+
+    @staticmethod
+    def _price_cache_miss_exceptions() -> Tuple[type, ...]:
+        """Exception types an un-prewarmed OHLCV/FMP-history cache raises through
+        ``_get_price_at_date``/``providers.price_at_date`` during a hermetic backtest --
+        used ONLY by ``_gather_all``'s per-symbol try/except (basket-mode resilience; see its
+        docstring) to tell "this discovered symbol just isn't prewarmed, skip it" apart from a
+        genuine bug, which must still propagate loudly.
+
+        ``FMPHistoryCacheMiss`` (``ba2_providers.fmp_common``) is always importable: this
+        package's own ``pyproject.toml`` declares a hard dependency on ``ba2trade-providers``.
+
+        ``BacktestCacheMiss`` (``testplatform/backend``'s ``app.services.backtest.price_source``
+        -- the concrete backtest ``ProviderBundle``'s actual OHLCV cache-miss exception) lives in
+        the APP layer, which this package does NOT and must NOT depend on (directional
+        dependency: the app depends on this package, not the reverse -- confirmed by
+        ``ModuleNotFoundError`` when importing ``app.services.backtest`` from a packages-only
+        test run, see ``packages/experts/tests/test_senate_gather_process.py``'s basket-mode
+        section). So this import is deliberately best-effort: it succeeds (and the exception is
+        caught) only when this code executes inside the full app process, which is the ONLY
+        place ``providers.price_at_date`` can actually raise it; in a packages-only environment
+        (this package's own test venv, or any future standalone use) the import silently no-ops
+        and only ``FMPHistoryCacheMiss`` is caught.
+        """
+        from ba2_providers.fmp_common import FMPHistoryCacheMiss
+        excs: List[type] = [FMPHistoryCacheMiss]
+        try:
+            from app.services.backtest.price_source import BacktestCacheMiss
+            excs.append(BacktestCacheMiss)
+        except ImportError:
+            pass
+        return tuple(excs)
 
     @staticmethod
     def _disclosure_date_ok(trade: Dict[str, Any], ceiling: datetime) -> bool:
