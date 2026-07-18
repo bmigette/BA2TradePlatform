@@ -25,6 +25,7 @@ from ba2_common.core.models import MarketAnalysis, AnalysisOutput, ExpertRecomme
 from ba2_common.core.db import get_db, update_instance, add_instance
 from ba2_common.core.types import (
     MarketAnalysisStatus, OrderRecommendation, Recommendation, RiskLevel, TimeHorizon,
+    AnalysisUseCase,
 )
 from ba2_common.core.backtest_context import BacktestContext, ProviderBundle
 from ba2_common.logger import get_expert_logger
@@ -75,7 +76,35 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
     @classmethod
     def description(cls) -> str:
         return "Government official trading activity analysis using weighted algorithm based on portfolio allocation"
-    
+
+    @classmethod
+    def get_expert_properties(cls) -> Dict[str, Any]:
+        """
+        Get expert-specific properties and capabilities.
+
+        senate-basket-dispatch plan, Task 6: mirrors FMPSenateTraderCopy's own
+        get_expert_properties exactly. ``should_expand_instrument_jobs=False`` means
+        JobManager passes the "EXPERT" symbol straight to ``run_analysis`` (see
+        ``_execute_expert_driven_analysis``/``_get_enabled_instruments`` in
+        ``ba2_trade_platform/core/JobManager.py``) instead of expanding into one job per
+        recommended instrument — this expert already produces one recommendation per
+        qualifying symbol from a SINGLE analysis cycle via ``_gather_all``/``_process_all``
+        (Task 5), so per-instrument job expansion would be redundant, N-times-slower
+        duplicate work.
+
+        ``instrument_selection_method`` is a per-ExpertInstance DB setting, not a class
+        default (see ``get_setting_with_interface_default`` in ``_get_enabled_instruments``)
+        — declaring ``required_instrument_selection_method`` here only changes what NEW or
+        explicitly-reconfigured instances use; any existing live instance still configured
+        with ``static``/``enabled_instruments`` keeps that behavior completely unchanged
+        until an operator explicitly switches its setting to ``expert``.
+        """
+        return {
+            "can_recommend_instruments": True,
+            "should_expand_instrument_jobs": False,
+            "required_instrument_selection_method": "expert",
+        }
+
     def __init__(self, id: int):
         """Initialize FMPSenateTraderWeight expert with database instance."""
         super().__init__(id)
@@ -2507,14 +2536,171 @@ All {len(trade_details)} trades shown above for transparency.
         finally:
             session.close()
     
+    def _run_basket_analysis(self, market_analysis: MarketAnalysis) -> None:
+        """
+        Basket-mode live entry point for the "EXPERT" symbol (senate-basket-dispatch plan,
+        Task 6). Mirrors ``FMPSenateTraderCopy.run_analysis``/``_run_enter_market_analysis``:
+        a single ``_gather_all``/``_process_all`` pair (Task 5's basket methods, ``as_of=None``
+        -- the SAME pair ``analyze_as_of`` calls in backtest mode when no symbol is pinned)
+        replaces the per-symbol ``_gather``/``_process`` pair, and one ``ExpertRecommendation``
+        row is created per qualifying symbol via the EXISTING ``_create_expert_recommendation``
+        helper below (reused as-is, not duplicated -- it already accepts a plain
+        ``recommendation_data`` dict + symbol + market_analysis_id + current_price, which is
+        exactly what each basket ``Recommendation.raw_outputs`` carries).
+
+        Only ENTER_MARKET is supported here: FMPSenateTraderWeight's OPEN_POSITIONS analysis
+        reasons about ONE already-held symbol's trade history at a time (see the single-symbol
+        ``run_analysis`` path below), which is inherently per-instrument, not basket-shaped.
+        JobManager's SCHEDULED path never pairs subtype=OPEN_POSITIONS with symbol="EXPERT" --
+        scheduled OPEN_POSITIONS jobs always use the dedicated "OPEN_POSITIONS" special symbol
+        (see ``_schedule_expert_jobs``, which calls ``_create_scheduled_job(..., "OPEN_POSITIONS",
+        ..., AnalysisUseCase.OPEN_POSITIONS)`` unconditionally, never routing through
+        ``_get_enabled_instruments``/the "EXPERT" symbol for this subtype) -- but
+        ``submit_market_analysis`` (the manual/API entry point) does NOT cross-validate symbol
+        against subtype, so a manual "EXPERT" + OPEN_POSITIONS call is technically reachable;
+        guarded explicitly below so that combination fails loudly instead of silently
+        mishandling positions it was never designed to reason about.
+
+        Error handling: a raised exception here propagates out of ``run_analysis`` and is
+        caught by ``WorkerQueue._execute_task``'s (and, redundantly, ``_worker_loop``'s)
+        existing top-level ``except Exception`` -- confirmed by reading both call sites during
+        this task's live-safety review -- so ONE failed basket analysis cycle does NOT crash a
+        worker thread; the next scheduled cycle simply retries. The try/except below exists for
+        a DIFFERENT reason: to persist this cycle's ``MarketAnalysis`` row as FAILED (with an
+        error state, matching every other live analysis path's UX) before re-raising -- without
+        it, ``_execute_task`` would only mark the in-memory WorkerTask failed, leaving the
+        persisted MarketAnalysis stuck at RUNNING forever.
+        """
+        if market_analysis.subtype == AnalysisUseCase.OPEN_POSITIONS:
+            error_msg = (
+                "FMPSenateTraderWeight basket mode ('EXPERT' symbol) only supports "
+                "ENTER_MARKET analysis; OPEN_POSITIONS must be scheduled per-symbol."
+            )
+            self.logger.error(error_msg)
+            market_analysis.state = {
+                'error': error_msg,
+                'error_timestamp': datetime.now(timezone.utc).isoformat(),
+                'analysis_failed': True,
+            }
+            market_analysis.status = MarketAnalysisStatus.FAILED
+            update_instance(market_analysis)
+            raise ValueError(error_msg)
+
+        self.logger.info(f"Starting FMPSenateTraderWeight basket analysis (Analysis ID: {market_analysis.id})")
+
+        try:
+            # Update status to running
+            market_analysis.status = MarketAnalysisStatus.RUNNING
+            update_instance(market_analysis)
+
+            # Resolve settings into a plain dict so _process_all stays pure (no self.* reads)
+            settings = self._resolve_settings(self._SETTING_KEYS)
+            self._gather_settings = settings  # skill knobs read at gather time (stage 3)
+
+            # Thin orchestrator: _gather_all(as_of=None) + _process_all — the EXACT same pair
+            # the backtest engine drives via analyze_as_of when no symbol is pinned (Task 5).
+            # _gather_all raises on a genuine fetch failure of the unscoped disclosure feed
+            # itself (raise_on_error=True fetchers); a per-symbol OHLCV/price cache-miss is
+            # already isolated INSIDE _gather_all (see its docstring) and never reaches here.
+            providers = self._live_providers()
+            bundle_by_symbol = self._gather_all(providers, as_of=None)
+            recommendations = self._process_all(bundle_by_symbol, settings, as_of=None)
+
+            # Persist one ExpertRecommendation per element of the basket result, reusing the
+            # SAME helper the single-symbol path below uses (not duplicated).
+            recommendation_ids = []
+            symbols_analyzed = []
+            for rec in recommendations:
+                trade_symbol = rec.raw_outputs["symbol"]
+                recommendation_data = rec.raw_outputs["recommendation"]
+                current_price = rec.current_price
+                try:
+                    recommendation_id = self._create_expert_recommendation(
+                        recommendation_data, trade_symbol, market_analysis.id, current_price
+                    )
+                    recommendation_ids.append(recommendation_id)
+                    symbols_analyzed.append(trade_symbol)
+                except Exception as e:
+                    self.logger.error(f"Error creating recommendation for {trade_symbol}: {e}", exc_info=True)
+                    # Continue with other symbols -- one bad symbol shouldn't drop the rest.
+
+            self.logger.info(f"FMPSenateTraderWeight basket analysis found {len(bundle_by_symbol)} qualifying "
+                       f"symbol(s), created {len(recommendation_ids)} recommendation(s)")
+
+            # Store analysis state with basket-mode summary information.
+            market_analysis.state = {
+                'senate_trade_basket': {
+                    'analysis_type': 'basket',
+                    'total_symbols': len(bundle_by_symbol),
+                    'symbols_analyzed': sorted(symbols_analyzed),
+                    'expert_recommendation_ids': recommendation_ids,
+                    'settings': {
+                        'max_disclose_date_days': int(settings['max_disclose_date_days']),
+                        'max_trade_exec_days': int(settings['max_trade_exec_days']),
+                        'max_trade_price_delta_pct': float(settings['max_trade_price_delta_pct']),
+                    },
+                    'analysis_timestamp': datetime.now(timezone.utc).isoformat(),
+                }
+            }
+
+            # Update status to completed
+            market_analysis.status = MarketAnalysisStatus.COMPLETED
+            update_instance(market_analysis)
+
+            self.logger.info(f"Completed FMPSenateTraderWeight basket analysis: "
+                       f"{len(recommendation_ids)} recommendation(s) across "
+                       f"{len(bundle_by_symbol)} symbol(s)")
+
+        except Exception as e:
+            self.logger.error(f"FMPSenateTraderWeight basket analysis failed: {e}", exc_info=True)
+
+            # Update status to failed
+            market_analysis.state = {
+                'error': str(e),
+                'error_timestamp': datetime.now(timezone.utc).isoformat(),
+                'analysis_failed': True
+            }
+            market_analysis.status = MarketAnalysisStatus.FAILED
+            update_instance(market_analysis)
+
+            # Create error output
+            try:
+                session = get_db()
+                error_output = AnalysisOutput(
+                    market_analysis_id=market_analysis.id,
+                    name="Analysis Error",
+                    type="error",
+                    text=f"FMPSenateTraderWeight basket analysis failed: {str(e)}"
+                )
+                session.add(error_output)
+                session.commit()
+                session.close()
+            except Exception as db_error:
+                self.logger.error(f"Failed to store error output: {db_error}", exc_info=True)
+
+            raise
+
     def run_analysis(self, symbol: str, market_analysis: MarketAnalysis) -> None:
         """
-        Run FMPSenateTrade analysis for a symbol and create ExpertRecommendation.
-        
+        Run FMPSenateTrade analysis and create ExpertRecommendation(s).
+
         Args:
-            symbol: Financial instrument symbol to analyze
+            symbol: Financial instrument symbol to analyze, OR the special "EXPERT" symbol
+                (senate-basket-dispatch plan, Task 6): JobManager passes "EXPERT" when this
+                instance's ``instrument_selection_method`` setting is ``expert`` (see
+                ``get_expert_properties`` above) — this expert then scans ALL congressional
+                disclosures in ONE cycle via ``_gather_all``/``_process_all`` (Task 5) and
+                creates one ExpertRecommendation per qualifying symbol, instead of being
+                invoked once per already-selected instrument. Any other symbol runs the
+                original, unchanged single-symbol path below (still reachable for
+                ``static``-configured instances, or ``OPEN_POSITIONS`` on an already-held
+                symbol).
             market_analysis: MarketAnalysis instance to update with results
         """
+        if symbol == "EXPERT":
+            self._run_basket_analysis(market_analysis)
+            return
+
         self.logger.info(f"Starting FMPSenateTrade analysis for {symbol} (Analysis ID: {market_analysis.id})")
 
         try:

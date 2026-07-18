@@ -1512,6 +1512,127 @@ def test_weight_declares_analyzes_as_basket():
 
 
 # ====================================================================
+# Live wiring: get_expert_properties + run_analysis("EXPERT", ...) (senate-basket-dispatch
+# plan, Task 6). Unlike the analyze_as_of/_gather_all/_process_all tests above (pure, no DB),
+# these exercise the real run_analysis -> _create_expert_recommendation -> add_instance/
+# update_instance path against the throwaway sqlite the session-scoped conftest.py fixture
+# wires up (ba2_common.core.db.configure_db), so ExpertRecommendation/MarketAnalysis rows are
+# real DB writes -- proving the live dispatch actually persists, not just that the pure
+# gather/process pair returns the right shape.
+# ====================================================================
+
+def _weight_live_basket_expert(senate_trades, house_trades, history_by_name, price_map,
+                               exec_price=50.0, instance_id=1):
+    """Like _weight_basket_expert, but wired for the LIVE run_analysis path: needs e.id +
+    e._settings_cache set so _resolve_settings/get_setting_with_interface_default work without
+    a real ExpertInstance row (the throwaway test sqlite does not enforce FK constraints --
+    see ba2_common/core/db.py, no PRAGMA foreign_keys=ON).
+
+    Unlike the pure _gather_all/_process_all tests above (which pin `now` via as_of=NOW),
+    run_analysis's basket path is live (as_of=None), so the age-window filters (Stage 1's
+    _window_trades) measure trade age against the REAL wall-clock `datetime.now()` at test-run
+    time -- overriding max_disclose_date_days/max_trade_exec_days to a generous 10-year window
+    keeps the fixture's fixed 2026-dated trades inside the window regardless of which real date
+    the test suite happens to run on (all other keys still fall back to their interface
+    defaults, matching how a bare/never-configured ExpertInstance behaves)."""
+    e = _weight_basket_expert(senate_trades, house_trades, history_by_name, price_map, exec_price)
+    e.id = instance_id
+    e._settings_cache = {
+        "max_disclose_date_days": 3650,
+        "max_trade_exec_days": 3650,
+    }
+    return e
+
+
+def test_get_expert_properties_shape():
+    """Task 6 Step 1: property dict must mirror FMPSenateTraderCopy's shape exactly (same
+    can_recommend_instruments/should_expand_instrument_jobs/required_instrument_selection_method)
+    so JobManager's _get_enabled_instruments/_execute_expert_driven_analysis route "EXPERT"-symbol
+    jobs straight to run_analysis without expanding into per-instrument jobs."""
+    assert FMPSenateTraderWeight.get_expert_properties() == {
+        "can_recommend_instruments": True,
+        "should_expand_instrument_jobs": False,
+        "required_instrument_selection_method": "expert",
+    }
+
+
+def test_run_analysis_expert_symbol_creates_one_recommendation_per_qualifying_symbol():
+    """Task 6 Steps 2-3: run_analysis("EXPERT", ...) must call _gather_all/_process_all ONCE
+    (live, as_of=None) and persist one ExpertRecommendation row per qualifying symbol, mirroring
+    FMPSenateTraderCopy's own EXPERT-symbol handling and the backtest _run_basket_expert_bar
+    path Task 2 built."""
+    from ba2_common.core.models import MarketAnalysis, ExpertRecommendation
+    from ba2_common.core.types import MarketAnalysisStatus
+    from ba2_common.core.db import add_instance, get_instance, get_db
+    from sqlmodel import select
+
+    senate = [
+        _weight_trade("Alice", "Aa", "AAPL", "purchase", "2026-06-01", "2026-05-20"),
+        _weight_trade("Bob", "Bb", "AAPL", "purchase", "2026-06-02", "2026-05-21"),
+    ]
+    house = [
+        _weight_trade("Carol", "Cc", "MSFT", "purchase", "2026-06-01", "2026-05-20"),
+        _weight_trade("Dave", "Dd", "MSFT", "purchase", "2026-06-02", "2026-05-21"),
+    ]
+    history = {
+        "Alice Aa": [_weight_trade("Alice", "Aa", "AAPL", "purchase", "2026-05-01", "2026-04-20")],
+        "Bob Bb": [_weight_trade("Bob", "Bb", "AAPL", "purchase", "2026-05-02", "2026-04-21")],
+        "Carol Cc": [_weight_trade("Carol", "Cc", "MSFT", "purchase", "2026-05-01", "2026-04-20")],
+        "Dave Dd": [_weight_trade("Dave", "Dd", "MSFT", "purchase", "2026-05-02", "2026-04-21")],
+    }
+    price_map = {"AAPL": 100.0, "MSFT": 60.0}
+    e = _weight_live_basket_expert(senate, house, history, price_map, exec_price=50.0, instance_id=777)
+
+    market_analysis = MarketAnalysis(
+        symbol="EXPERT", expert_instance_id=777,
+        status=MarketAnalysisStatus.PENDING, subtype=AnalysisUseCase.ENTER_MARKET,
+    )
+    ma_id = add_instance(market_analysis)
+    market_analysis = get_instance(MarketAnalysis, ma_id)
+
+    e.run_analysis("EXPERT", market_analysis)
+
+    market_analysis = get_instance(MarketAnalysis, ma_id)
+    assert market_analysis.status == MarketAnalysisStatus.COMPLETED
+    assert market_analysis.state["senate_trade_basket"]["total_symbols"] == 2
+    assert set(market_analysis.state["senate_trade_basket"]["symbols_analyzed"]) == {"AAPL", "MSFT"}
+
+    with get_db() as session:
+        recs = session.exec(
+            select(ExpertRecommendation).where(ExpertRecommendation.market_analysis_id == ma_id)
+        ).all()
+    assert len(recs) == 2
+    assert {r.symbol for r in recs} == {"AAPL", "MSFT"}
+    for r in recs:
+        assert r.instance_id == 777
+
+
+def test_run_analysis_expert_symbol_rejects_open_positions():
+    """Task 6 live-safety guard: OPEN_POSITIONS is inherently per-symbol for this expert (it
+    reasons about one already-held position's trade history at a time -- see
+    _run_basket_analysis's docstring), so an "EXPERT"-symbol OPEN_POSITIONS job must fail
+    loudly (raised ValueError + FAILED MarketAnalysis) rather than silently no-op or crash on
+    an unrelated AttributeError."""
+    from ba2_common.core.models import MarketAnalysis
+    from ba2_common.core.types import MarketAnalysisStatus
+    from ba2_common.core.db import add_instance, get_instance
+
+    e = _weight_live_basket_expert([], [], {}, {}, instance_id=778)
+    market_analysis = MarketAnalysis(
+        symbol="EXPERT", expert_instance_id=778,
+        status=MarketAnalysisStatus.PENDING, subtype=AnalysisUseCase.OPEN_POSITIONS,
+    )
+    ma_id = add_instance(market_analysis)
+    market_analysis = get_instance(MarketAnalysis, ma_id)
+
+    with pytest.raises(ValueError, match="OPEN_POSITIONS"):
+        e.run_analysis("EXPERT", market_analysis)
+
+    market_analysis = get_instance(MarketAnalysis, ma_id)
+    assert market_analysis.status == MarketAnalysisStatus.FAILED
+
+
+# ====================================================================
 # Lookahead-bias fix (2026-07-18): reject future-disclosed / future-executed trades.
 #
 # _filter_trades (both experts) and _window_trades (Weight's pre-filter) only ever
