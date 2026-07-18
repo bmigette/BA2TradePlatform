@@ -340,7 +340,7 @@ def _cmd_prewarm(args) -> int:
     _senate_hold_floor_days = float(_senate_opt["expert_params"]["min_trader_avg_hold_days"]["min"])
     _senate_hold_min_roundtrips = int(_senate_opt["fixed_settings"]["min_trader_hold_roundtrips"])
 
-    def _do_senate(sym: str) -> None:
+    def _ensure_senate_expert():
         nonlocal _senate_expert
         if _senate_expert is None:
             import logging as _lg
@@ -351,9 +351,20 @@ def _cmd_prewarm(args) -> int:
                     s._api_key = key
                     s.logger = _lg.getLogger("senate-prewarm")
                     _senate_expert = s
-        s = _senate_expert
-        trades = (s._fetch_senate_trades(sym) or []) + (s._fetch_house_trades(sym) or [])
-        s._get_price_at_date(sym, end_date)  # warms historical_price_full (full history, once)
+        return _senate_expert
+
+    def _warm_new_traders(s, trades) -> None:
+        """Discover new (not-yet-seen) traders from ``trades`` and warm their full disclosure
+        history + skill-relevant buy-symbol price history. Shared by ``_do_senate`` (traders
+        discovered via the per-symbol ``-trades`` endpoint) and ``_do_senate_latest`` (traders
+        discovered via the unscoped ``-latest`` endpoint) -- a trader who only shows up in the
+        unscoped feed (e.g. one whose per-symbol history was never queried because none of
+        THIS run's universe symbols happen to trigger it) still needs their
+        ``congress_trader_history`` cache entry warmed, or ``_gather_all``'s Stage 2 hits a
+        hermetic ``FMPHistoryCacheMiss`` for them mid-backtest (found empirically running
+        senate_profile_basket_verify.py after the ``_do_senate_latest`` fix alone: the unscoped
+        feed surfaces traders like "Debbie Wasserman Schultz" that the per-symbol loop over a
+        498-symbol universe never happened to discover)."""
         new_traders = []
         with _senate_lock:
             for trade in trades:
@@ -389,6 +400,12 @@ def _cmd_prewarm(args) -> int:
                         new_skill_syms.append(ssym)
             for ssym in new_skill_syms:
                 s._get_price_at_date(ssym, end_date)  # warms historical_price_full (once, ever)
+
+    def _do_senate(sym: str) -> None:
+        s = _ensure_senate_expert()
+        trades = (s._fetch_senate_trades(sym) or []) + (s._fetch_house_trades(sym) or [])
+        s._get_price_at_date(sym, end_date)  # warms historical_price_full (full history, once)
+        _warm_new_traders(s, trades)
 
     def _do_senate_scores(start: datetime, end: datetime) -> None:
         """Proactively compute FMPSenateTraderWeight's trader-SKILL cache
@@ -486,6 +503,39 @@ def _cmd_prewarm(args) -> int:
         s._save_scoring_cache("_skill_cache", s._SKILL_CACHE_FILE)  # final compacting flush
         print(f">> senate skill prewarm done: {total} scores in {time.time() - t_scores:.0f}s", flush=True)
 
+    def _do_senate_latest() -> None:
+        """Warm the UNSCOPED 'latest disclosures' cache entries (``congress_senate_latest/ALL``,
+        ``congress_house_latest/ALL``) that FMPSenateTraderWeight's basket-mode ``_gather_all``
+        (``analyzes_as_basket = True``, senate-basket-dispatch plan Task 5) reads via
+        ``_fetch_senate_trades(symbol=None)``/``_fetch_house_trades(symbol=None)`` -- a DIFFERENT
+        disk-cache namespace from the per-symbol ``congress_senate_trades__<SYM>``/
+        ``congress_house_trades__<SYM>`` entries ``_do_senate`` above warms (those are keyed per
+        symbol; this is keyed by the fixed name ``"ALL"``, see ``_fetch_congress_trades`` in
+        ``expert_mixins.py``).
+
+        Nothing warmed this before Task 5 added the basket dispatch path: the per-symbol prewarm
+        loop above only ever calls ``_fetch_senate_trades(sym)``/``_fetch_house_trades(sym)`` with
+        a real symbol, never ``symbol=None``. A real hermetic backtest of basket-mode
+        FMPSenateTraderWeight (or FMPSenateTraderCopy, which has used this SAME unscoped fetch
+        since Task 3 and shares this exact gap) therefore failed immediately with
+        ``FMPHistoryCacheMiss`` on every bar ("congress_senate_latest/ALL not pre-warmed") until
+        this was added. One fetch each -- cheap, and independent of any universe symbol, so it
+        runs once regardless of how many symbols are being pre-warmed.
+
+        Also warms every trader DISCOVERED via this unscoped feed through the same
+        ``_warm_new_traders`` path ``_do_senate`` uses -- the unscoped feed's trader set does
+        NOT equal the per-symbol loop's trader set (a trader can appear in the recent unscoped
+        disclosures without ever being surfaced by any of THIS run's universe symbols' own
+        per-symbol ``-trades`` history), so skipping this would leave ``_gather_all``'s Stage 2
+        hitting a hermetic miss on those traders mid-backtest.
+        """
+        s = _ensure_senate_expert()
+        print(">> senate: warming unscoped 'latest disclosures' feed (congress_senate_latest/"
+              "congress_house_latest, ALL)...", flush=True)
+        senate_latest = s._fetch_senate_trades(symbol=None) or []
+        house_latest = s._fetch_house_trades(symbol=None) or []
+        _warm_new_traders(s, senate_latest + house_latest)
+
     # FinnHubRating: warm the per-symbol finnhub_reco_trends namespace. Bare instance carries the
     # Finnhub key + a logger (all _fetch_recommendation_trends needs).
     _finnhub_expert = None
@@ -555,6 +605,13 @@ def _cmd_prewarm(args) -> int:
                 except Exception as e:  # noqa: BLE001 — one bad symbol must not abort
                     errors += 1
                     print(f"!! prewarm {expert}/{sym} failed: {e}")
+
+        # Unscoped "latest disclosures" warm (basket-mode _gather_all's congress_senate_latest/
+        # congress_house_latest, "ALL" key) -- independent of any universe symbol, so it runs
+        # once regardless of order relative to the per-symbol loop above; placed here (serially,
+        # still inside the freeze gate) alongside the other one-shot senate prewarm steps below.
+        if "FMPSenateTraderWeight" in experts:
+            _do_senate_latest()
 
         # Skill-score prewarm runs AFTER the per-symbol loop above (needs its fully-populated
         # _senate_seen_traders), and serially (not thread-pooled — it's CPU-bound in-memory work
