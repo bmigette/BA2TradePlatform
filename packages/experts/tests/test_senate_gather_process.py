@@ -1129,3 +1129,235 @@ def test_confidence_cached_uses_index_and_matches(monkeypatch):
         current_price=100.0, max_exec_days=60, now=now + timedelta(days=1),
         symbol_focus_cap_pct=10.0, is_live=False)
     assert builds == []  # memo hit, no rebuild
+
+
+# ====================================================================
+# FMPSenateTraderWeight — basket dispatch (senate-basket-dispatch plan, Task 5):
+# _gather_all / _process_all / analyze_as_of dual-mode dispatch.
+#
+# Unlike _weight_expert (which stubs _fetch_senate_trades/_fetch_house_trades with a
+# single-positional-arg lambda relying on _symbol_trades_index_cached's internal per-symbol
+# filtering), the basket path calls _fetch_senate_trades(symbol=None)/_fetch_house_trades
+# (symbol=None) directly — so its fixture stubs must accept the keyword call.
+# ====================================================================
+
+def _weight_basket_expert(senate_trades, house_trades, history_by_name, price_map, exec_price=50.0):
+    """Basket-mode expert fixture: _fetch_senate_trades/_fetch_house_trades accept
+    symbol=None (the unscoped '-latest' feed convention _gather_all relies on) instead of
+    _weight_expert's per-symbol wrappers. exec_price is a flat per-trade execution price
+    (same simplification _weight_expert uses) so a differential test against _weight_expert
+    can use the identical value on both sides."""
+    e = FMPSenateTraderWeight.__new__(FMPSenateTraderWeight)
+    e.id = 1
+    e.logger = _LOG
+    e._fetch_senate_trades = lambda symbol=None: senate_trades
+    e._fetch_house_trades = lambda symbol=None: house_trades
+    e._fetch_trader_history = lambda name: history_by_name.get(name)
+    e._get_price_at_date = lambda sym, date: exec_price
+    e._get_current_price = lambda sym: price_map.get(str(sym).upper())
+    return e
+
+
+def _sorted_trades(trades):
+    """Order-independent comparison key for a trade list (differential tests must not depend
+    on incidental ordering between the bisect-window-preserving basket grouping and the
+    per-symbol path's disclose-date sort — both are correct; only CONTENT should be compared)."""
+    return sorted(trades, key=lambda t: (t.get('firstName', ''), t.get('lastName', ''),
+                                          t.get('symbol', ''), t.get('transactionDate', ''),
+                                          t.get('type', '')))
+
+
+def test_gather_all_matches_per_symbol_gather_for_each_surviving_symbol():
+    """Differential test: for every symbol that survives _gather_all's window+tradability
+    filter, the per-symbol bundle it produces must be equivalent to calling the EXISTING
+    per-symbol _gather(symbol=that_symbol, as_of) directly -- proves the basket path isn't
+    silently dropping or corrupting data relative to the already-trusted per-symbol path."""
+    senate = [
+        _weight_trade("Alice", "Aa", "AAPL", "purchase", "2026-06-01", "2026-05-20"),
+        _weight_trade("Bob", "Bb", "AAPL", "purchase", "2026-06-02", "2026-05-21"),
+    ]
+    house = [
+        _weight_trade("Carol", "Cc", "MSFT", "purchase", "2026-06-01", "2026-05-20"),
+        _weight_trade("Dave", "Dd", "MSFT", "purchase", "2026-06-02", "2026-05-21"),
+    ]
+    all_trades = senate + house
+    history = {
+        "Alice Aa": [_weight_trade("Alice", "Aa", "AAPL", "purchase", "2026-05-01", "2026-04-20")],
+        "Bob Bb": [_weight_trade("Bob", "Bb", "AAPL", "purchase", "2026-05-02", "2026-04-21")],
+        "Carol Cc": [_weight_trade("Carol", "Cc", "MSFT", "purchase", "2026-05-01", "2026-04-20")],
+        "Dave Dd": [_weight_trade("Dave", "Dd", "MSFT", "purchase", "2026-05-02", "2026-04-21")],
+    }
+    price_map = {"AAPL": 100.0, "MSFT": 60.0}
+
+    e_all = _weight_basket_expert(senate, house, history, price_map, exec_price=50.0)
+    e_all._gather_settings = WEIGHT_SETTINGS
+    bundle_all = e_all._gather_all(_bundle(price_map), as_of=NOW)
+
+    assert set(bundle_all.keys()) == {"AAPL", "MSFT"}
+
+    for symbol, basket_bundle in bundle_all.items():
+        e_single = _weight_expert(symbol, all_trades, history, exec_price=50.0)
+        e_single._gather_settings = WEIGHT_SETTINGS
+        single_bundle = e_single._gather(_bundle(price_map), as_of=NOW)
+
+        assert _sorted_trades(basket_bundle["all_trades"]) == _sorted_trades(single_bundle["all_trades"])
+        assert basket_bundle["current_price"] == single_bundle["current_price"]
+        assert basket_bundle["exec_price_by_trade"] == single_bundle["exec_price_by_trade"]
+        assert basket_bundle["symbol"] == single_bundle["symbol"] == symbol
+
+        # trader_history_by_name/skill/hold-info are computed ONCE for the whole bar and
+        # SHARED across every qualifying symbol in the basket path (the actual perf win, see
+        # _gather_all's docstring) -- so the basket dict is a SUPERSET of what a per-symbol
+        # _gather call would build for just this symbol, not an exact match. Equivalence here
+        # means: every trader the per-symbol path resolved gets an IDENTICAL value in the
+        # basket path (no corruption for the traders that matter to THIS symbol).
+        for name, hist in single_bundle["trader_history_by_name"].items():
+            assert basket_bundle["trader_history_by_name"][name] == hist
+        for name, skill in single_bundle["trader_skill_by_name"].items():
+            assert basket_bundle["trader_skill_by_name"][name] == skill
+        for name, hold in single_bundle["trader_hold_info_by_name"].items():
+            assert basket_bundle["trader_hold_info_by_name"][name] == hold
+
+
+def test_process_all_matches_calculate_recommendation_per_symbol():
+    """Differential test: _process_all's per-symbol Recommendation must match calling
+    _calculate_recommendation directly on that symbol's filtered_trades -- same signal,
+    confidence, expected_profit_percent."""
+    senate = [
+        _weight_trade("Alice", "Aa", "AAPL", "purchase", "2026-06-01", "2026-05-20"),
+        _weight_trade("Bob", "Bb", "AAPL", "purchase", "2026-06-02", "2026-05-21"),
+    ]
+    house = [
+        _weight_trade("Carol", "Cc", "MSFT", "purchase", "2026-06-01", "2026-05-20"),
+        _weight_trade("Dave", "Dd", "MSFT", "purchase", "2026-06-02", "2026-05-21"),
+    ]
+    history = {
+        "Alice Aa": [_weight_trade("Alice", "Aa", "AAPL", "purchase", "2026-05-01", "2026-04-20")],
+        "Bob Bb": [_weight_trade("Bob", "Bb", "AAPL", "purchase", "2026-05-02", "2026-04-21")],
+        "Carol Cc": [_weight_trade("Carol", "Cc", "MSFT", "purchase", "2026-05-01", "2026-04-20")],
+        "Dave Dd": [_weight_trade("Dave", "Dd", "MSFT", "purchase", "2026-05-02", "2026-04-21")],
+    }
+    price_map = {"AAPL": 100.0, "MSFT": 60.0}
+
+    e = _weight_basket_expert(senate, house, history, price_map, exec_price=50.0)
+    e._gather_settings = WEIGHT_SETTINGS
+    bundle_by_symbol = e._gather_all(_bundle(price_map), as_of=NOW)
+    recs = e._process_all(bundle_by_symbol, WEIGHT_SETTINGS, as_of=NOW)
+
+    recs_by_symbol = {r.raw_outputs["symbol"]: r for r in recs}
+    assert set(recs_by_symbol) == set(bundle_by_symbol) == {"AAPL", "MSFT"}
+
+    for symbol, data_bundle in bundle_by_symbol.items():
+        current_price = data_bundle["current_price"]
+        filtered = e._filter_trades(
+            data_bundle["all_trades"],
+            int(WEIGHT_SETTINGS["max_disclose_date_days"]),
+            int(WEIGHT_SETTINGS["max_trade_exec_days"]),
+            float(WEIGHT_SETTINGS["max_trade_price_delta_pct"]),
+            current_price, symbol, now=NOW,
+            exec_price_by_trade=data_bundle["exec_price_by_trade"],
+        )
+        direct = e._calculate_recommendation(
+            filtered, symbol, current_price,
+            int(WEIGHT_SETTINGS["max_trade_exec_days"]),
+            trader_history_by_name=data_bundle["trader_history_by_name"],
+            min_traders=int(WEIGHT_SETTINGS["min_traders"]),
+            min_trades_required=int(WEIGHT_SETTINGS["min_trades"]),
+            growth_multiplier=float(WEIGHT_SETTINGS["growth_confidence_multiplier"]),
+            confidence_to_profit_factor=float(WEIGHT_SETTINGS["confidence_to_profit_factor"]),
+            now=NOW,
+            trader_skill_by_name=data_bundle.get("trader_skill_by_name") or {},
+            trader_hold_info_by_name=data_bundle.get("trader_hold_info_by_name") or {},
+            is_live=False,
+        )
+        rec = recs_by_symbol[symbol]
+        assert rec.signal == direct['signal']
+        assert round(rec.confidence, 1) == round(direct['confidence'], 1)
+        assert rec.expected_profit_percent == direct['expected_profit_percent']
+        assert rec.raw_outputs["symbol"] == symbol
+
+
+def test_gather_all_excludes_non_tradable_symbols():
+    """A disclosed trade in a mutual-fund-pattern ticker (e.g. 'FTGCX') must never appear
+    in _gather_all's output, even if it otherwise passes all date/amount criteria."""
+    senate = [
+        _weight_trade("Alice", "Aa", "FTGCX", "purchase", "2026-06-01", "2026-05-20"),
+        _weight_trade("Bob", "Bb", "FTGCX", "purchase", "2026-06-02", "2026-05-21"),
+        _weight_trade("Carol", "Cc", "AAPL", "purchase", "2026-06-01", "2026-05-20"),
+        _weight_trade("Dave", "Dd", "AAPL", "purchase", "2026-06-02", "2026-05-21"),
+    ]
+    history = {
+        "Alice Aa": [_weight_trade("Alice", "Aa", "FTGCX", "purchase", "2026-05-01", "2026-04-20")],
+        "Bob Bb": [_weight_trade("Bob", "Bb", "FTGCX", "purchase", "2026-05-02", "2026-04-21")],
+        "Carol Cc": [_weight_trade("Carol", "Cc", "AAPL", "purchase", "2026-05-01", "2026-04-20")],
+        "Dave Dd": [_weight_trade("Dave", "Dd", "AAPL", "purchase", "2026-05-02", "2026-04-21")],
+    }
+    price_map = {"FTGCX": 10.0, "AAPL": 100.0}
+
+    e = _weight_basket_expert(senate, [], history, price_map, exec_price=5.0)
+    e._gather_settings = WEIGHT_SETTINGS
+    bundle = e._gather_all(_bundle(price_map), as_of=NOW)
+
+    assert "FTGCX" not in bundle
+    assert "AAPL" in bundle
+
+
+def test_analyze_as_of_basket_mode_returns_list_when_no_symbol_pinned():
+    """context.extra without 'symbol' -> analyze_as_of returns List[Recommendation]."""
+    senate = [
+        _weight_trade("Alice", "Aa", "AAPL", "purchase", "2026-06-01", "2026-05-20"),
+        _weight_trade("Bob", "Bb", "AAPL", "purchase", "2026-06-02", "2026-05-21"),
+    ]
+    house = [
+        _weight_trade("Carol", "Cc", "MSFT", "purchase", "2026-06-01", "2026-05-20"),
+        _weight_trade("Dave", "Dd", "MSFT", "purchase", "2026-06-02", "2026-05-21"),
+    ]
+    history = {
+        "Alice Aa": [_weight_trade("Alice", "Aa", "AAPL", "purchase", "2026-05-01", "2026-04-20")],
+        "Bob Bb": [_weight_trade("Bob", "Bb", "AAPL", "purchase", "2026-05-02", "2026-04-21")],
+        "Carol Cc": [_weight_trade("Carol", "Cc", "MSFT", "purchase", "2026-05-01", "2026-04-20")],
+        "Dave Dd": [_weight_trade("Dave", "Dd", "MSFT", "purchase", "2026-05-02", "2026-04-21")],
+    }
+    price_map = {"AAPL": 100.0, "MSFT": 60.0}
+    e = _weight_basket_expert(senate, house, history, price_map, exec_price=50.0)
+
+    # No "symbol" key in extra at all -- exactly what _run_basket_expert_bar's BacktestContext
+    # construction produces (it never sets context.extra).
+    ctx = BacktestContext(providers=_bundle(price_map), settings=WEIGHT_SETTINGS, as_of=NOW)
+    recs = e.analyze_as_of(NOW, ctx)
+
+    assert isinstance(recs, list)
+    assert all(isinstance(r, Recommendation) for r in recs)
+    assert {r.raw_outputs["symbol"] for r in recs} == {"AAPL", "MSFT"}
+
+
+def test_analyze_as_of_single_symbol_mode_unchanged_when_symbol_pinned():
+    """context.extra['symbol'] set -> analyze_as_of returns a single Recommendation,
+    byte-identical to today's behavior (regression guard for the dual-mode branch added by
+    Task 5 -- proves declaring analyzes_as_basket = True did not disturb the pre-existing
+    per-symbol calling convention any caller might still use)."""
+    trades = [
+        _weight_trade("Alice", "Aa", "AAPL", "purchase", "2026-06-01", "2026-05-20"),
+        _weight_trade("Bob", "Bb", "AAPL", "purchase", "2026-06-02", "2026-05-21"),
+    ]
+    history = {
+        "Alice Aa": [_weight_trade("Alice", "Aa", "AAPL", "purchase", "2026-05-01", "2026-05-10")],
+        "Bob Bb": [_weight_trade("Bob", "Bb", "AAPL", "purchase", "2026-05-02", "2026-05-11")],
+    }
+    e = _weight_expert("AAPL", trades, history, exec_price=95.0)
+    ctx = BacktestContext(providers=_bundle({"AAPL": 100.0}), settings=WEIGHT_SETTINGS,
+                          as_of=NOW, extra={"symbol": "AAPL"})
+    rec = e.analyze_as_of(NOW, ctx)
+
+    assert isinstance(rec, Recommendation)
+    bundle_live = e._gather(_bundle({"AAPL": 100.0}), as_of=None)
+    rec_live = e._process(bundle_live, WEIGHT_SETTINGS, as_of=NOW)
+    assert rec.almost_equals(rec_live)
+    assert rec.details == rec_live.details
+
+
+def test_weight_declares_analyzes_as_basket():
+    """senate-basket-dispatch plan Task 5: FMPSenateTraderWeight must declare
+    analyzes_as_basket = True (mirroring Task 3's FMPSenateTraderCopy marker) so
+    daily_engine.py routes it through _run_basket_expert_bar."""
+    assert FMPSenateTraderWeight.analyzes_as_basket is True

@@ -11,7 +11,7 @@ Senate Trading API to generate trading recommendations based on:
 API Documentation: https://site.financialmodelingprep.com/developer/docs#senate-trading
 """
 
-from typing import Any, Dict, Optional, List, Tuple
+from typing import Any, Dict, Optional, List, Tuple, Union
 from datetime import datetime, timezone, timedelta
 from functools import lru_cache
 import bisect
@@ -61,6 +61,16 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
     
     RENDER_PENDING_MESSAGE = 'Senate trade analysis for {symbol} is queued'
     RENDER_RUNNING_MESSAGE = 'Fetching senate/house trading data for {symbol}...'
+
+    # Backtest dispatch marker (senate-basket-dispatch plan, Task 5): tells daily_engine.py's
+    # dispatch loop to call analyze_as_of ONCE per bar via _run_basket_expert_bar (which
+    # expects List[Recommendation] back), instead of once per universe symbol via
+    # _run_expert_bar (which expects a single Recommendation). See analyze_as_of below for the
+    # dual-mode branching this requires: the OLD per-symbol calling convention
+    # (context.extra["symbol"] pinned) is still supported and unchanged, alongside the NEW
+    # basket convention this marker enables. Mirrors FMPSenateTraderCopy's own marker (see
+    # FMPSenateTraderCopy.py, Task 3 of the same plan).
+    analyzes_as_basket = True
 
     @classmethod
     def description(cls) -> str:
@@ -487,6 +497,187 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             "symbol": symbol,
         }
 
+    def _all_trades_index_cached(self) -> Dict[str, Any]:
+        """Unscoped counterpart of ``_symbol_trades_index_cached``: a per-instance memo of the
+        deduped ALL-SYMBOLS senate+house trade list (the ``{chamber}-latest`` feed), PLUS a
+        disclosure-date-sorted view for O(log n) per-day window selection — mirrors
+        ``_symbol_trades_index_cached`` exactly, just not scoped to one symbol.
+
+        Why: ``_fetch_senate_trades(symbol=None)``/``_fetch_house_trades(symbol=None)`` are
+        disk-cached at the HTTP layer (``fmp_history_disk_cached`` returns the SAME in-memory
+        list every call for a frozen backtest run), but the Python-level dedup + date-parse
+        pass over that list was still redone from scratch on every ``_gather_all`` call — once
+        per bar, over the FULL feed (not one symbol's slice) — without this memo. Memoizing it
+        once per instance turns ~900 bars' worth of O(all disclosures) rescans into one."""
+        cached = getattr(self, "_all_trades_memo", None)
+        if cached is not None:
+            return cached
+
+        senate = self._fetch_senate_trades(symbol=None) or []
+        house = self._fetch_house_trades(symbol=None) or []
+        # Same dedup fingerprint as _symbol_trades_index_cached, generalized across symbols
+        # (amended/duplicate filings must count once, same as the per-symbol path).
+        seen: set = set()
+        all_trades = []
+        for trade in senate + house:
+            fp = (self._trader_name(trade), str(trade.get('symbol', '')).upper(),
+                  str(trade.get('transactionDate', '')), str(trade.get('type', '')).lower(),
+                  str(trade.get('amount', '')))
+            if fp in seen:
+                continue
+            seen.add(fp)
+            all_trades.append(trade)
+
+        rows = []
+        for trade in all_trades:
+            ds, es = trade.get('disclosureDate', ''), trade.get('transactionDate', '')
+            if not ds or not es:
+                continue  # _filter_trades drops date-less rows unconditionally
+            try:
+                rows.append((_parse_ymd_utc(ds), _parse_ymd_utc(es), trade))
+            except (ValueError, TypeError):
+                continue  # unparseable either date -> _filter_trades would drop it
+        rows.sort(key=lambda r: r[0])
+        cached = self._all_trades_memo = {"rows": rows, "disclose_dates": [r[0] for r in rows]}
+        return cached
+
+    def _gather_all(self, providers: ProviderBundle, as_of: Optional[datetime]) -> Dict[str, Dict[str, Any]]:
+        """Basket-mode counterpart of ``_gather`` (senate-basket-dispatch plan, Task 5).
+
+        Design (written before the code, per the plan's Step 1):
+        1. Fetch the UNSCOPED senate+house feeds (``symbol=None``, via
+           ``_all_trades_index_cached``) instead of one ``_fetch_*_trades(symbol)`` call per
+           universe symbol.
+        2. Apply the SAME disclose/exec date window ``_window_trades`` applies per-symbol
+           (bisect on the disclosure-sorted view — no upper bound on either date, matching
+           ``_filter_trades``' "only rejects too-OLD rows" semantics).
+        3. NEW: drop non-tradable symbols (mutual-fund-pattern tickers etc.) via Task 4's
+           ``is_tradable_stock_ticker`` — a filter the per-symbol path never needed, since its
+           caller always pinned an already-vetted universe symbol.
+        4. Group the surviving trades by symbol.
+        5. Resolve ``current_price`` per symbol (same ``providers.price_at_date``/
+           ``_get_current_price`` call ``_gather`` already makes, just looped) and build the
+           per-trader history/skill/hold-info maps EXACTLY ONCE for the whole bar — shared
+           across every qualifying symbol (Stages 2-4 in ``_gather`` are symbol-independent
+           except for which traders/trades a given symbol's list touches; recomputing them per
+           symbol, as the per-symbol ``_gather`` does when called once per universe symbol, is
+           the redundant work this basket path is designed to eliminate). A symbol whose price
+           doesn't resolve is dropped (mirrors ``FMPSenateTraderCopy._gather``'s
+           ``supported_symbols`` filter — an unresolvable current_price would otherwise blow up
+           ``_filter_trades``' price-delta arithmetic downstream).
+        6. Return ``{symbol: bundle}`` where each ``bundle`` has the SAME keys/shape
+           ``_gather``'s single-symbol bundle has, so ``_process`` (unmodified) can consume any
+           one of them directly (see ``_process_all``).
+
+        NOTE: the per-symbol ``trader_history_by_name``/``trader_skill_by_name``/
+        ``trader_hold_info_by_name`` dicts returned here are the SAME shared dict object for
+        every symbol in the batch (a superset of what a per-symbol ``_gather`` call would
+        build for that one symbol) — ``_calculate_recommendation`` only ever looks up trader
+        names that actually appear in the symbol's OWN ``filtered_trades``, so the extra
+        unrelated entries are inert, never accessed for a different symbol's calculation.
+        """
+        from ba2_common.core.utils import is_tradable_stock_ticker  # lazy: avoid circular import
+
+        gather_settings = getattr(self, "_gather_settings", None)
+        ceiling = as_of or datetime.now(timezone.utc)
+        max_disclose_days = int(self._setting_or_default(gather_settings, "max_disclose_date_days"))
+        max_exec_days = int(self._setting_or_default(gather_settings, "max_trade_exec_days"))
+
+        # Steps 1-2: unscoped fetch + date-window filter (bisect, mirrors _window_trades).
+        index = self._all_trades_index_cached()
+        lo = bisect.bisect_left(index["disclose_dates"], ceiling - timedelta(days=max_disclose_days))
+        exec_floor = ceiling - timedelta(days=max_exec_days)
+        windowed = [t for _d, e, t in index["rows"][lo:] if e >= exec_floor]
+
+        # Step 3: NEW tradability filter.
+        tradable = [t for t in windowed
+                   if is_tradable_stock_ticker(str(t.get('symbol', '')).upper().strip())]
+
+        # Step 4: group by symbol (preserving the disclosure-date-ascending order from the
+        # sorted index, same ordering _window_trades' per-symbol callers already see).
+        trades_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+        for trade in tradable:
+            sym = str(trade.get('symbol', '')).upper().strip()
+            if not sym:
+                continue
+            trades_by_symbol.setdefault(sym, []).append(trade)
+
+        # Step 5a: Stages 2-4 from _gather, computed ONCE for every trader appearing in ANY
+        # surviving symbol's trade list (shared across the whole bar).
+        day_key = ceiling.date().isoformat()
+        if getattr(self, "_day_slice_key", None) != day_key:
+            self._day_slice_key = day_key
+            self._day_slice_memo = {}
+        trader_history_by_name: Dict[str, List[Dict[str, Any]]] = {}
+        for trade in tradable:
+            name = self._trader_name(trade)
+            if name in trader_history_by_name:
+                continue
+            if as_of is not None:
+                trader_history_by_name[name] = self._sliced_history_for_day(
+                    name, ceiling, self._day_slice_memo)
+            else:
+                trader_history_by_name[name] = self._fetch_trader_history(name) or []
+
+        skill_signal_w = float(self._setting_or_default(gather_settings, "skill_signal_weight"))
+        skill_conf_w = float(self._setting_or_default(gather_settings, "skill_confidence_weight"))
+        trader_skill_by_name: Dict[str, Dict[str, Any]] = {}
+        if skill_signal_w != 0.0 or skill_conf_w != 0.0:
+            horizon = int(self._setting_or_default(gather_settings, "skill_horizon_days"))
+            min_past = int(self._setting_or_default(gather_settings, "skill_min_past_trades"))
+            max_past = int(self._setting_or_default(gather_settings, "skill_max_past_trades"))
+            lookback_months = int(self._setting_or_default(gather_settings, "skill_lookback_months"))
+            for name, history in trader_history_by_name.items():
+                trader_skill_by_name[name] = self._get_trader_skill_cached(
+                    name, history, now=ceiling, horizon_days=horizon,
+                    min_past_trades=min_past, max_past_trades=max_past,
+                    lookback_months=lookback_months, is_live=(as_of is None))
+
+        trader_hold_info_by_name: Dict[str, Dict[str, Any]] = {}
+        if float(self._setting_or_default(gather_settings, "min_trader_avg_hold_days")) > 0:
+            trader_hold_info_by_name = {
+                name: self._get_trader_hold_info_cached(name, history, is_live=(as_of is None))
+                for name, history in trader_history_by_name.items()
+            }
+
+        # Step 5b + 6: per-symbol exec-price map + current_price + bundle assembly.
+        bundle_by_symbol: Dict[str, Dict[str, Any]] = {}
+        for symbol, symbol_trades in trades_by_symbol.items():
+            exec_price_by_trade: Dict[tuple, Optional[float]] = {}
+            for trade in symbol_trades:
+                exec_date_str = trade.get('transactionDate', '')
+                if not exec_date_str:
+                    continue
+                key = self._trade_key(trade)
+                if key in exec_price_by_trade:
+                    continue
+                try:
+                    exec_date = _parse_ymd_utc(exec_date_str)
+                except (ValueError, TypeError):
+                    continue
+                exec_price_by_trade[key] = self._get_price_at_date(symbol, exec_date)
+
+            # Live (as_of=None) reads the account/broker quote (the original live source);
+            # backtest (as_of set) reads the OHLCV close-at-as_of -- identical to _gather.
+            current_price = (self._get_current_price(symbol) if as_of is None
+                             else providers.price_at_date(symbol, as_of))
+            if not current_price:
+                # No resolvable price for this symbol -- can't score it (would blow up
+                # _filter_trades' price-delta arithmetic downstream). Mirrors
+                # FMPSenateTraderCopy._gather's supported_symbols filter.
+                continue
+
+            bundle_by_symbol[symbol] = {
+                "all_trades": symbol_trades,
+                "current_price": current_price,
+                "exec_price_by_trade": exec_price_by_trade,
+                "trader_history_by_name": trader_history_by_name,
+                "trader_skill_by_name": trader_skill_by_name,
+                "trader_hold_info_by_name": trader_hold_info_by_name,
+                "symbol": symbol,
+            }
+        return bundle_by_symbol
+
     @staticmethod
     def _disclosure_date_ok(trade: Dict[str, Any], ceiling: datetime) -> bool:
         """True if the trade's disclosure date is on/before the as_of ceiling.
@@ -549,22 +740,82 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                          "text": rec["details"], "recommendation": rec,
                          "filtered_trades": filtered})
 
-    def analyze_as_of(self, as_of: datetime, context: BacktestContext) -> Recommendation:
-        """BacktestInterface entry: resolve the gather-time symbol then run the SAME
-        _gather(two-stage pre-resolve)+_process the live path drives."""
-        self._gather_symbol = context.extra.get("symbol", getattr(self, "_gather_symbol", None))
-        # Stash settings for _gather: the skill pre-resolve (stage 3) reads its knobs
-        # (horizon/min/max/weights) at gather time, before _process sees the dict.
-        self._gather_settings = context.settings
-        bundle = self._gather(context.providers, as_of)
-        return self._process(bundle, context.settings, as_of)
+    def _process_all(self, bundle_by_symbol: Dict[str, Dict[str, Any]], settings: Dict[str, Any],
+                     as_of: Optional[datetime] = None) -> List[Recommendation]:
+        """Basket-mode counterpart of ``_process`` (senate-basket-dispatch plan, Task 5):
+        loops the per-symbol bundles from ``_gather_all`` and delegates to the EXISTING
+        ``_process`` (unmodified — which itself calls ``_filter_trades`` then
+        ``_calculate_recommendation``, unchanged signature/logic) once per symbol, then stamps
+        ``raw_outputs["symbol"]`` on the result (required by daily_engine.py's
+        ``_run_basket_expert_bar`` to route each list item to the right
+        ``ExpertRecommendation`` row — matches Task 3's ``FMPSenateTraderCopy`` convention).
 
-    def _fetch_senate_trades(self, symbol: str) -> Optional[List[Dict[str, Any]]]:
-        """Fetch senate trades for a symbol (raises ValueError on request failure)."""
+        Symbols whose recommendation comes back HOLD/SKIP/ERROR are still included in the
+        returned list — the engine's ``_recommendation_to_expert_recommendation`` (called once
+        per basket item) already knows how to turn those into "not staged"; pre-filtering them
+        here would duplicate that logic (see the plan's Task 5 Step 2 caution).
+
+        Delegating to ``_process`` (rather than re-deriving its body) is deliberate: it makes
+        this method provably equivalent to the single-symbol path by construction, not just by
+        careful copying — see ``test_process_all_matches_calculate_recommendation_per_symbol``.
+        """
+        recommendations: List[Recommendation] = []
+        for symbol, data_bundle in sorted(bundle_by_symbol.items()):
+            rec = self._process(data_bundle, settings, as_of)
+            rec.raw_outputs["symbol"] = symbol
+            recommendations.append(rec)
+        return recommendations
+
+    def analyze_as_of(self, as_of: datetime,
+                      context: BacktestContext) -> Union[Recommendation, List[Recommendation]]:
+        """BacktestInterface entry: DUAL-MODE dispatch (senate-basket-dispatch plan, Task 5).
+
+        FMPSenateTraderWeight declares ``analyzes_as_basket = True`` so daily_engine.py's
+        ``_run_basket_expert_bar`` calls this ONCE per bar with NO symbol pinned in
+        ``context.extra``, expecting ``List[Recommendation]`` back (the NEW basket
+        convention). However, this is also still the entry point for any caller doing
+        per-symbol analysis — pinning ``context.extra["symbol"]`` — which predates the basket
+        dispatch mode and is exactly what the pre-existing test suite in
+        ``test_senate_gather_process.py`` exercises; that path is NOT being removed here (Task
+        6 decides whether any live caller still needs it).
+
+        A single method can't return both a ``Recommendation`` and a
+        ``List[Recommendation]`` depending on the caller, so branch EXPLICITLY on which
+        calling convention is in play rather than guessing from what ``_gather``/``_process``
+        happen to return:
+          - ``context.extra.get("symbol")`` truthy -> OLD per-symbol convention: run the
+            existing ``_gather``/``_process`` pair pinned to that symbol, return a single
+            ``Recommendation`` (byte-identical to pre-Task-5 behavior).
+          - ``context.extra.get("symbol")`` falsy (``_run_basket_expert_bar`` never sets it)
+            -> NEW basket convention: run ``_gather_all``/``_process_all`` instead, return
+            ``List[Recommendation]``.
+        """
+        symbol = context.extra.get("symbol")
+        if symbol:
+            # OLD per-symbol convention — unchanged from pre-Task-5 behavior (keeps the exact
+            # original fallback-to-previously-pinned-symbol semantics for any caller that
+            # relies on it).
+            self._gather_symbol = context.extra.get("symbol", getattr(self, "_gather_symbol", None))
+            # Stash settings for _gather: the skill pre-resolve (stage 3) reads its knobs
+            # (horizon/min/max/weights) at gather time, before _process sees the dict.
+            self._gather_settings = context.settings
+            bundle = self._gather(context.providers, as_of)
+            return self._process(bundle, context.settings, as_of)
+
+        # NEW basket convention: scan the whole disclosure feed once, one Recommendation per
+        # qualifying symbol.
+        self._gather_settings = context.settings
+        bundle_by_symbol = self._gather_all(context.providers, as_of)
+        return self._process_all(bundle_by_symbol, context.settings, as_of)
+
+    def _fetch_senate_trades(self, symbol: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
+        """Fetch senate trades for a symbol, or all latest disclosures when symbol is None
+        (used by _gather_all's basket path; raises ValueError on request failure)."""
         return self._fetch_congress_trades("senate", symbol, timeout=60, raise_on_error=True)
-    
-    def _fetch_house_trades(self, symbol: str) -> Optional[List[Dict[str, Any]]]:
-        """Fetch house trades for a symbol (raises ValueError on request failure)."""
+
+    def _fetch_house_trades(self, symbol: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
+        """Fetch house trades for a symbol, or all latest disclosures when symbol is None
+        (used by _gather_all's basket path; raises ValueError on request failure)."""
         return self._fetch_congress_trades("house", symbol, timeout=60, raise_on_error=True)
     
     def _fetch_trader_history(self, trader_name: str) -> Optional[List[Dict[str, Any]]]:
