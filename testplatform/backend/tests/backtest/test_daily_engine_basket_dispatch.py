@@ -568,12 +568,18 @@ def _senate_trade(first, last, sym, ttype, disclose, exec_date, amount="$15,001 
 
 
 class _FakeOHLCV:
-    """OHLCV provider installed via ``set_backtest_ohlcv_override`` -- FMPSenateTraderCopy's
-    real ``_gather`` (unlike the stub experts above) calls ``providers.price_at_date(symbol,
+    """OHLCV provider installed via ``set_backtest_ohlcv_override`` -- a real basket expert's
+    ``_gather`` (unlike the stub experts above) calls ``providers.price_at_date(symbol,
     as_of)``, which resolves through ``LiveProviderBundle.ohlcv()`` -> the TradeConditions
     provider resolver -> this override, exactly the seam ``daily_backtest_handler.py`` uses
     for the real (network/disk-cache) OHLCV path -- see seam_wiring.py's
-    ``_wire_provider_resolver`` docstring."""
+    ``_wire_provider_resolver`` docstring.
+
+    Deliberately duplicates ``FakeOHLCV`` in packages/experts/tests/test_senate_gather_process.py
+    (same shape) rather than importing it: this file cannot import from packages/experts/tests
+    (that package's tests aren't on this venv's collected path in the same way _senate_trade's
+    docstring explains for _copy_trade), and the directional-dependency constraint documented
+    above the Task 3 test block means a real shared import isn't available either way."""
 
     def __init__(self, price_map):
         self._price_map = price_map  # symbol(upper) -> close price
@@ -586,9 +592,40 @@ class _FakeOHLCV:
         return pd.DataFrame({"Close": [price]})
 
 
-def _build_real_copy_run(account_id=57, expert_id=57):
-    """Wire a REAL ``FMPSenateTraderCopy`` instance (not a stub) into the same harness the stub
-    basket tests above use.
+# Task 3's own fixture defaults for FMPSenateTraderCopy -- module-level (rather than inlined
+# in _build_real_copy_run) so they can be referenced as the function's explicit defaults.
+_COPY_SENATE_TRADES_DEFAULT = [
+    _senate_trade("Nancy", "Pelosi", "AAPL", "purchase", "2023-12-15", "2023-12-01"),
+]
+_COPY_HOUSE_TRADES_DEFAULT = [
+    _senate_trade("Josh", "Gottheimer", "MSFT", "purchase", "2023-12-15", "2023-12-01"),
+]
+# copy_trade_names has NO usable declared default ("" -- nobody to copy, a real per-expert
+# decision, see daily_backtest_handler.py's _expert_decision_settings docstring) -- must be
+# supplied explicitly, matching what a real backtest run's payload override would provide.
+_COPY_SETTINGS_DEFAULT = {
+    "copy_trade_names": "Nancy Pelosi, Josh Gottheimer",
+    "max_disclose_date_days": 365,
+    "max_trade_exec_days": 365,
+}
+
+
+def _build_real_copy_run(
+    account_id=57,
+    expert_id=57,
+    expert_cls=None,
+    expert_class_name=None,
+    senate_trades=None,
+    house_trades=None,
+    settings=None,
+    price_map=None,
+):
+    """Wire a REAL expert instance (not a stub) into the same harness the stub basket tests
+    above use. Defaults to ``FMPSenateTraderCopy`` with Task 3's original fixture data/settings
+    (so the existing call site stays byte-identical); pass ``expert_cls``/``senate_trades``/
+    ``house_trades``/``settings``/``price_map`` to reuse this harness for a DIFFERENT real
+    basket expert (e.g. a future ``FMPSenateTraderWeight`` engine-integration test) instead of
+    copy-pasting this ~100-line function.
 
     Hermetic: ``_fetch_senate_trades``/``_fetch_house_trades`` are monkeypatched directly on
     the instance (mirrors ``_copy_expert()`` in test_senate_gather_process.py -- the FMP-http
@@ -596,6 +633,21 @@ def _build_real_copy_run(account_id=57, expert_id=57):
     stubbed on the instance rather than through the provider seam), and
     ``providers.price_at_date`` is routed through ``_FakeOHLCV`` via
     ``set_backtest_ohlcv_override`` instead of the network.
+
+    Args:
+        expert_cls: the ba2_experts class to construct (default ``FMPSenateTraderCopy``). Any
+            class with the ``_fetch_senate_trades``/``_fetch_house_trades`` instance-attribute
+            override points and an ``analyzes_as_basket = True`` marker works here.
+        expert_class_name: the ``ExpertInstance.expert`` string seeded into the DB (default:
+            ``expert_cls.__name__``). Exposed separately from ``expert_cls`` only for the
+            unlikely case a caller wants to seed under a different registered name.
+        senate_trades / house_trades: hermetic fixture rows returned by the monkeypatched
+            fetchers (default: Task 3's Nancy Pelosi/AAPL + Josh Gottheimer/MSFT fixtures).
+        settings: the per-expert decision-settings dict fed into the engine's ``experts`` tuple
+            (default: Task 3's ``copy_trade_names``/age-window settings). A different expert's
+            ``_SETTING_KEYS`` will need a different dict here.
+        price_map: symbol(upper) -> close price fed to ``_FakeOHLCV`` (default: AAPL/MSFT at
+            Task 3's original prices).
 
     Returns (engine, account, expert, ctx, ps). Caller MUST call
     ``set_backtest_ohlcv_override(None)`` AND close ``ctx`` in a ``finally`` block.
@@ -610,7 +662,15 @@ def _build_real_copy_run(account_id=57, expert_id=57):
     from app.services.backtest.default_rulesets import seed_enter_long_ruleset
     from app.services.backtest.price_source import AsOfPriceSource
     from app.services.backtest.seam_wiring import set_backtest_ohlcv_override, wire_backtest_seams
-    from ba2_experts.FMPSenateTraderCopy import FMPSenateTraderCopy
+
+    if expert_cls is None:
+        from ba2_experts.FMPSenateTraderCopy import FMPSenateTraderCopy
+        expert_cls = FMPSenateTraderCopy
+    expert_class_name = expert_class_name or expert_cls.__name__
+    senate_trades = _COPY_SENATE_TRADES_DEFAULT if senate_trades is None else senate_trades
+    house_trades = _COPY_HOUSE_TRADES_DEFAULT if house_trades is None else house_trades
+    settings = dict(_COPY_SETTINGS_DEFAULT if settings is None else settings)
+    price_map = {"AAPL": 100.0, "MSFT": 50.0} if price_map is None else price_map
 
     cfg = {
         "starting_cash": 100_000.0,
@@ -627,7 +687,7 @@ def _build_real_copy_run(account_id=57, expert_id=57):
     ruleset_id = seed_enter_long_ruleset(name="backtest-basket-dispatch-real-copy")
     seed_expert_instance(
         account_id=account_id,
-        expert_class_name="FMPSenateTraderCopy",
+        expert_class_name=expert_class_name,
         enter_market_ruleset_id=ruleset_id,
         instance_id=expert_id,
     )
@@ -642,15 +702,11 @@ def _build_real_copy_run(account_id=57, expert_id=57):
     # Real constructor: __init__ runs _load_expert_instance (needs the seeded row above) and
     # _get_fmp_api_key (warns, does not raise, when unconfigured -- fine, since we bypass the
     # network fetcher this pins over entirely).
-    expert = FMPSenateTraderCopy(expert_id)
+    expert = expert_cls(expert_id)
     # Hermetic fetch: fixed disclosures, well before the BARS window (2024-01-02..01-08), so
     # every bar's no-lookahead / age-window checks pass identically across the whole run.
-    expert._fetch_senate_trades = lambda symbol=None: [
-        _senate_trade("Nancy", "Pelosi", "AAPL", "purchase", "2023-12-15", "2023-12-01"),
-    ]
-    expert._fetch_house_trades = lambda symbol=None: [
-        _senate_trade("Josh", "Gottheimer", "MSFT", "purchase", "2023-12-15", "2023-12-01"),
-    ]
+    expert._fetch_senate_trades = lambda symbol=None: senate_trades
+    expert._fetch_house_trades = lambda symbol=None: house_trades
     # Enable automated opening + buy (interface defaults are False/True; the RM gates on
     # these) -- same settings the stub basket tests above need to actually fund an order.
     expert.save_settings(
@@ -661,21 +717,13 @@ def _build_real_copy_run(account_id=57, expert_id=57):
     )
     resolver.register_expert(expert_id, expert)
 
-    set_backtest_ohlcv_override(_FakeOHLCV({"AAPL": 100.0, "MSFT": 50.0}))
+    set_backtest_ohlcv_override(_FakeOHLCV(price_map))
 
     config = {
         "start_date": START,
         "end_date": END,
         "enabled_instruments": ["AAPL", "MSFT"],
         "seed": 42,
-    }
-    # copy_trade_names has NO usable declared default ("" -- nobody to copy, a real per-expert
-    # decision, see daily_backtest_handler.py's _expert_decision_settings docstring) -- must be
-    # supplied explicitly, matching what a real backtest run's payload override would provide.
-    settings = {
-        "copy_trade_names": "Nancy Pelosi, Josh Gottheimer",
-        "max_disclose_date_days": 365,
-        "max_trade_exec_days": 365,
     }
     engine = DailyBacktestEngine(
         account=account,
