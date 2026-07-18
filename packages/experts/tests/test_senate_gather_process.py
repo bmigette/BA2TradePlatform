@@ -234,6 +234,68 @@ def test_weight_gather_slices_history_to_as_of():
     assert sliced[0]["symbol"] == "AAPL"           # the future MSFT row is gone
 
 
+def test_gather_window_prefilter_is_behavior_preserving():
+    """2026-07-18 perf pass: _gather pre-filters the symbol's trades to the trial's
+    disclosure/exec windows before Stages 1-4. Out-of-window trades (and their traders)
+    were ALWAYS discarded later by _filter_trades / never consumed by
+    _calculate_recommendation — so adding ancient trades from other traders must change
+    NOTHING about the recommendation, and the per-trader maps must not carry them."""
+    recent = [
+        _weight_trade("Alice", "Aa", "AAPL", "purchase", "2026-06-01", "2026-05-20"),
+        _weight_trade("Bob", "Bb", "AAPL", "purchase", "2026-06-02", "2026-05-21"),
+    ]
+    ancient = [
+        _weight_trade("Old", "Timer", "AAPL", "purchase", "2023-01-05", "2023-01-01"),
+        _weight_trade("Stale", "Seller", "AAPL", "sale", "2022-06-05", "2022-06-01"),
+    ]
+    history = {
+        "Alice Aa": [_weight_trade("Alice", "Aa", "AAPL", "purchase", "2026-05-01", "2026-04-20")],
+        "Bob Bb": [_weight_trade("Bob", "Bb", "AAPL", "purchase", "2026-05-02", "2026-04-21")],
+        "Old Timer": [_weight_trade("Old", "Timer", "AAPL", "purchase", "2022-05-01", "2022-04-20")],
+        "Stale Seller": [_weight_trade("Stale", "Seller", "AAPL", "sale", "2022-05-02", "2022-04-21")],
+    }
+    settings = {**WEIGHT_SETTINGS, "max_disclose_date_days": 60, "max_trade_exec_days": 90}
+
+    rec_without = _run(_weight_expert("AAPL", recent, history), settings)
+    e = _weight_expert("AAPL", recent + ancient, history)
+    rec_with = _run(e, settings)
+
+    assert rec_with.signal == rec_without.signal
+    assert rec_with.confidence == rec_without.confidence
+    assert rec_with.expected_profit_percent == rec_without.expected_profit_percent
+
+    e2 = _weight_expert("AAPL", recent + ancient, history)
+    e2._gather_settings = settings
+    bundle = e2._gather(_bundle({"AAPL": 100.0}), as_of=NOW)
+    assert set(bundle["trader_history_by_name"].keys()) == {"Alice Aa", "Bob Bb"}
+    assert set(bundle["trader_skill_by_name"].keys()) == {"Alice Aa", "Bob Bb"}
+
+
+def test_gather_day_memo_shares_history_slices_across_symbols():
+    """Two symbols analysed under the SAME as_of ceiling must fetch+slice a shared trader's
+    history only ONCE (the per-day slice memo) — the second symbol's _gather reuses it."""
+    trades = [
+        _weight_trade("Alice", "Aa", "AAPL", "purchase", "2026-06-01", "2026-05-20"),
+        _weight_trade("Alice", "Aa", "MSFT", "purchase", "2026-06-02", "2026-05-21"),
+    ]
+    history = {"Alice Aa": [_weight_trade("Alice", "Aa", "AAPL", "purchase", "2026-05-01", "2026-04-20")]}
+    e = _weight_expert("AAPL", trades, history)
+    fetches = []
+    orig = e._fetch_trader_history
+    e._fetch_trader_history = lambda name: fetches.append(name) or orig(name)
+
+    e._gather_symbol = "AAPL"
+    e._gather(_bundle({"AAPL": 100.0}), as_of=NOW)
+    e._gather_symbol = "MSFT"
+    e._gather(_bundle({"MSFT": 100.0}), as_of=NOW)
+    assert fetches == ["Alice Aa"]  # second symbol, same day -> memo hit, no refetch
+
+    # A LATER day invalidates the memo (fresh slice for the new ceiling).
+    e._gather_symbol = "AAPL"
+    e._gather(_bundle({"AAPL": 100.0}), as_of=NOW + timedelta(days=1))
+    assert fetches == ["Alice Aa", "Alice Aa"]
+
+
 def test_weight_process_uses_preresolved_history_for_confidence():
     """Confidence must be driven by the pre-resolved history map (symbol focus %)."""
     trades = [

@@ -291,8 +291,28 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         """Stable per-trade key for the exec_price map (symbol + execution date)."""
         return (str(trade.get('symbol', '')).upper(), str(trade.get('transactionDate', '')))
 
-    def _gather(self, providers: ProviderBundle, as_of: Optional[datetime]) -> Dict[str, Any]:
-        symbol = self._gather_symbol
+    def _symbol_trades_index_cached(self, symbol: str) -> Dict[str, Any]:
+        """Per-symbol, per-instance memo of the deduped senate+house trade list PLUS a
+        disclosure-date-sorted view for O(log n) per-day window selection.
+
+        Why: the trade list for a symbol is FROZEN for the whole backtest (hermetic disk
+        cache), yet _gather used to re-fetch + re-dedup + re-scan ALL of it — years of
+        trades — on every (symbol, day) bar. Profiled 2026-07-18 on a 2-week senate trial
+        slice: the per-bar rescans over full histories (9.9M _disclosure_date_ok calls in
+        10 trading days) made one 42-month trial take 45-75 minutes. Only trades inside the
+        trial's disclosure/exec windows can ever survive _filter_trades, so per day we now
+        bisect this sorted view instead of rescanning everything.
+
+        Returns ``{all_trades, rows}`` where rows = [(disclose_dt, exec_dt, trade), ...]
+        sorted by disclose_dt, restricted to rows with BOTH dates parseable and a matching
+        symbol (rows _filter_trades would drop unconditionally anyway)."""
+        memo = getattr(self, "_symbol_trades_memo", None)
+        if memo is None:
+            memo = self._symbol_trades_memo = {}
+        cached = memo.get(symbol)
+        if cached is not None:
+            return cached
+
         senate = self._fetch_senate_trades(symbol) or []
         house = self._fetch_house_trades(symbol) or []
         # Dedup amended/duplicate filings: FMP can return the same disclosure more than
@@ -309,6 +329,81 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             seen.add(fp)
             all_trades.append(trade)
 
+        sym_upper = symbol.upper()
+        rows = []
+        for trade in all_trades:
+            ds, es = trade.get('disclosureDate', ''), trade.get('transactionDate', '')
+            if not ds or not es:
+                continue  # _filter_trades drops date-less rows unconditionally
+            if str(trade.get('symbol', '')).upper() != sym_upper:
+                continue  # _filter_trades drops symbol mismatches unconditionally
+            try:
+                rows.append((_parse_ymd_utc(ds), _parse_ymd_utc(es), trade))
+            except (ValueError, TypeError):
+                continue  # unparseable either date -> _filter_trades would drop it
+        rows.sort(key=lambda r: r[0])
+        cached = memo[symbol] = {"all_trades": all_trades, "rows": rows,
+                                 "disclose_dates": [r[0] for r in rows]}
+        return cached
+
+    def _window_trades(self, index: Dict[str, Any], now: datetime,
+                       max_disclose_days: int, max_exec_days: int) -> List[Dict[str, Any]]:
+        """Trades that can possibly survive _filter_trades' two date-window checks under
+        THIS trial's settings: disclose_date >= now - max_disclose_days AND exec_date >=
+        now - max_exec_days. Deliberately NO upper <= now bound on either date —
+        _filter_trades has none (it only rejects too-OLD rows via ``days_since > max``),
+        and this pre-filter must stay a faithful superset, not a behavior change.
+        O(log n) bisect on the disclosure-sorted view + a scan of the small tail."""
+        lo = bisect.bisect_left(index["disclose_dates"], now - timedelta(days=int(max_disclose_days)))
+        exec_floor = now - timedelta(days=int(max_exec_days))
+        return [t for _d, e, t in index["rows"][lo:] if e >= exec_floor]
+
+    def _sliced_history_for_day(self, name: str, ceiling: datetime,
+                                day_memo: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+        """A trader's history sliced to disclosure <= ceiling, memoized per (trader, DAY) in
+        ``day_memo`` (one shared dict per _gather ceiling — every symbol analysed on the same
+        day reuses the same slice instead of re-filtering the full history ~500x). Disclosure
+        dates are parsed once per (trader, full length) into a parallel array; the slice
+        itself preserves original row order exactly like the inline filter it replaces."""
+        sliced = day_memo.get(name)
+        if sliced is not None:
+            return sliced
+        history = self._fetch_trader_history(name) or []
+        parse_memo = getattr(self, "_disc_dates_memo", None)
+        if parse_memo is None:
+            parse_memo = self._disc_dates_memo = {}
+        pkey = (name, len(history))
+        dates = parse_memo.get(pkey)
+        if dates is None:
+            dates = []
+            for t in history:
+                ds = t.get('disclosureDate', '')
+                try:
+                    dates.append(_parse_ymd_utc(ds) if ds else None)
+                except (ValueError, TypeError):
+                    dates.append(None)  # unparseable -> always kept, like _disclosure_date_ok
+            parse_memo[pkey] = dates
+        sliced = [t for t, d in zip(history, dates) if d is None or d <= ceiling]
+        day_memo[name] = sliced
+        return sliced
+
+    def _gather(self, providers: ProviderBundle, as_of: Optional[datetime]) -> Dict[str, Any]:
+        symbol = self._gather_symbol
+        index = self._symbol_trades_index_cached(symbol)
+
+        # Window pre-filter (2026-07-18 perf pass): only trades inside the trial's OWN
+        # disclosure/exec windows can survive _filter_trades, and _calculate_recommendation
+        # only ever consumes the per-trader maps below for traders of surviving trades — so
+        # Stages 1-4 run over this (typically tiny) window set instead of every trade/trader
+        # that ever touched the symbol. Passing the window set as ``all_trades`` is
+        # result-identical too: _process only uses it as _filter_trades input, and the
+        # dropped rows are exactly those _filter_trades would reject on its date checks.
+        gather_settings = getattr(self, "_gather_settings", None)
+        ceiling = as_of or datetime.now(timezone.utc)
+        max_disclose_days = int(self._setting_or_default(gather_settings, "max_disclose_date_days"))
+        max_exec_days = int(self._setting_or_default(gather_settings, "max_trade_exec_days"))
+        all_trades = self._window_trades(index, ceiling, max_disclose_days, max_exec_days)
+
         # Stage 1: pre-resolve the per-trade execution price (already date-aware).
         exec_price_by_trade: Dict[tuple, Optional[float]] = {}
         for trade in all_trades:
@@ -324,18 +419,23 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                 continue
             exec_price_by_trade[key] = self._get_price_at_date(trade.get('symbol', ''), exec_date)
 
-        # Stage 2: pre-resolve each trader's full history, sliced to disclosure <= as_of.
-        ceiling = as_of or datetime.now(timezone.utc)
+        # Stage 2: pre-resolve each (window) trader's history, sliced to disclosure <= as_of.
+        # The slice is memoized per (trader, DAY) — every symbol analysed under the same
+        # ceiling shares it (the engine walks symbols within a day before advancing).
+        day_key = ceiling.date().isoformat()
+        if getattr(self, "_day_slice_key", None) != day_key:
+            self._day_slice_key = day_key
+            self._day_slice_memo = {}
         trader_history_by_name: Dict[str, List[Dict[str, Any]]] = {}
         for trade in all_trades:
             name = self._trader_name(trade)
             if name in trader_history_by_name:
                 continue
-            history = self._fetch_trader_history(name) or []
             if as_of is not None:
-                history = [h for h in history
-                           if self._disclosure_date_ok(h, ceiling)]
-            trader_history_by_name[name] = history
+                trader_history_by_name[name] = self._sliced_history_for_day(
+                    name, ceiling, self._day_slice_memo)
+            else:
+                trader_history_by_name[name] = self._fetch_trader_history(name) or []
 
         # Stage 3: pre-resolve each trader's SKILL score (historical hit rate of their
         # RECENT disclosed buys over the configured forward horizon). This needs per-date
@@ -346,7 +446,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         # cross-run/cross-trial (see _get_trader_skill_cached) — a GA job re-walks the SAME
         # dates hundreds of times, and this was profiled as the dominant per-bar cost (one
         # prolific trader's history re-scanned ~2000x in a single 3-symbol run).
-        gather_settings = getattr(self, "_gather_settings", None)
+        # (gather_settings already resolved above, before the window pre-filter.)
         skill_signal_w = float(self._setting_or_default(gather_settings, "skill_signal_weight"))
         skill_conf_w = float(self._setting_or_default(gather_settings, "skill_confidence_weight"))
         trader_skill_by_name: Dict[str, Dict[str, Any]] = {}
