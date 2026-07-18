@@ -1163,8 +1163,11 @@ def _weight_basket_expert(senate_trades, house_trades, history_by_name, price_ma
     e = FMPSenateTraderWeight.__new__(FMPSenateTraderWeight)
     e.id = 1
     e.logger = _LOG
-    e._fetch_senate_trades = lambda symbol=None: senate_trades
-    e._fetch_house_trades = lambda symbol=None: house_trades
+    # **kwargs: _all_trades_index_cached calls these with full_history=True (deep-pagination
+    # opt-in, see expert_mixins.py's "Pagination-depth design" docstring) -- this fixture
+    # ignores the flag and always returns the same fixed trade list regardless of depth.
+    e._fetch_senate_trades = lambda symbol=None, **kwargs: senate_trades
+    e._fetch_house_trades = lambda symbol=None, **kwargs: house_trades
     e._fetch_trader_history = lambda name: history_by_name.get(name)
     e._get_price_at_date = lambda sym, date: exec_price
     e._get_current_price = lambda sym: price_map.get(str(sym).upper())

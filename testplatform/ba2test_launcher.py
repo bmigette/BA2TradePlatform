@@ -504,36 +504,50 @@ def _cmd_prewarm(args) -> int:
         print(f">> senate skill prewarm done: {total} scores in {time.time() - t_scores:.0f}s", flush=True)
 
     def _do_senate_latest() -> None:
-        """Warm the UNSCOPED 'latest disclosures' cache entries (``congress_senate_latest/ALL``,
-        ``congress_house_latest/ALL``) that FMPSenateTraderWeight's basket-mode ``_gather_all``
-        (``analyzes_as_basket = True``, senate-basket-dispatch plan Task 5) reads via
-        ``_fetch_senate_trades(symbol=None)``/``_fetch_house_trades(symbol=None)`` -- a DIFFERENT
-        disk-cache namespace from the per-symbol ``congress_senate_trades__<SYM>``/
+        """Warm the UNSCOPED 'latest disclosures' cache entries (``congress_senate_latest/
+        ALL_FULL_HISTORY``, ``congress_house_latest/ALL_FULL_HISTORY``) that
+        FMPSenateTraderWeight's basket-mode ``_gather_all`` (``analyzes_as_basket = True``,
+        senate-basket-dispatch plan Task 5) reads via ``_fetch_senate_trades(symbol=None,
+        full_history=True)``/``_fetch_house_trades(symbol=None, full_history=True)`` -- a
+        DIFFERENT disk-cache namespace from the per-symbol ``congress_senate_trades__<SYM>``/
         ``congress_house_trades__<SYM>`` entries ``_do_senate`` above warms (those are keyed per
-        symbol; this is keyed by the fixed name ``"ALL"``, see ``_fetch_congress_trades`` in
-        ``expert_mixins.py``).
+        symbol; this is keyed by the fixed name ``"ALL_FULL_HISTORY"``, see
+        ``_fetch_congress_trades`` in ``expert_mixins.py``).
 
         Nothing warmed this before Task 5 added the basket dispatch path: the per-symbol prewarm
         loop above only ever calls ``_fetch_senate_trades(sym)``/``_fetch_house_trades(sym)`` with
         a real symbol, never ``symbol=None``. A real hermetic backtest of basket-mode
-        FMPSenateTraderWeight (or FMPSenateTraderCopy, which has used this SAME unscoped fetch
-        since Task 3 and shares this exact gap) therefore failed immediately with
-        ``FMPHistoryCacheMiss`` on every bar ("congress_senate_latest/ALL not pre-warmed") until
-        this was added. One fetch each -- cheap, and independent of any universe symbol, so it
-        runs once regardless of how many symbols are being pre-warmed.
+        FMPSenateTraderWeight therefore failed immediately with ``FMPHistoryCacheMiss`` on every
+        bar ("congress_senate_latest/ALL_FULL_HISTORY not pre-warmed") until this was added.
+
+        DEEP PAGINATION (not the original page-0-only fetch): confirmed empirically 2026-07-18
+        that the original single-page fetch (``full_history=False``, ~4 months of disclosures)
+        left basket-mode FMPSenateTraderWeight scoring ``trades=0, fitness=-1e9`` for EVERY
+        individual across a full 2023-2026 GA matrix grid -- the unscoped fetch simply didn't
+        reach back far enough for the backtest to ever see a trade. ``full_history=True`` here
+        paginates the ``{chamber}-latest`` feed to its end (verified in
+        ``build_senate_universe.py`` to reach back to ~2012/2019 for senate/house respectively)
+        instead of a single page, and writes to the SEPARATE ``"ALL_FULL_HISTORY"`` cache key so
+        a shallow-cached "ALL" entry from before this fix (or from some other still-shallow
+        caller, e.g. FMPSenateTraderCopy's live path) can never silently satisfy this deep read
+        -- see ``_fetch_congress_trades``'s "Pagination-depth design" docstring for the full
+        reasoning. One (slower, multi-page) fetch each -- still independent of any universe
+        symbol, so it runs once regardless of how many symbols are being pre-warmed.
 
         Also warms every trader DISCOVERED via this unscoped feed through the same
         ``_warm_new_traders`` path ``_do_senate`` uses -- the unscoped feed's trader set does
-        NOT equal the per-symbol loop's trader set (a trader can appear in the recent unscoped
-        disclosures without ever being surfaced by any of THIS run's universe symbols' own
-        per-symbol ``-trades`` history), so skipping this would leave ``_gather_all``'s Stage 2
-        hitting a hermetic miss on those traders mid-backtest.
+        NOT equal the per-symbol loop's trader set (a trader can appear in the disclosures
+        without ever being surfaced by any of THIS run's universe symbols' own per-symbol
+        ``-trades`` history), so skipping this would leave ``_gather_all``'s Stage 2 hitting a
+        hermetic miss on those traders mid-backtest.
         """
         s = _ensure_senate_expert()
         print(">> senate: warming unscoped 'latest disclosures' feed (congress_senate_latest/"
-              "congress_house_latest, ALL)...", flush=True)
-        senate_latest = s._fetch_senate_trades(symbol=None) or []
-        house_latest = s._fetch_house_trades(symbol=None) or []
+              "congress_house_latest, ALL_FULL_HISTORY, full pagination)...", flush=True)
+        senate_latest = s._fetch_senate_trades(symbol=None, full_history=True) or []
+        house_latest = s._fetch_house_trades(symbol=None, full_history=True) or []
+        print(f"   senate: {len(senate_latest)} senate + {len(house_latest)} house rows "
+              f"fetched (full pagination)", flush=True)
         _warm_new_traders(s, senate_latest + house_latest)
 
     # FinnHubRating: warm the per-symbol finnhub_reco_trends namespace. Bare instance carries the

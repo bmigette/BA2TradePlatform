@@ -511,13 +511,23 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         list every call for a frozen backtest run), but the Python-level dedup + date-parse
         pass over that list was still redone from scratch on every ``_gather_all`` call — once
         per bar, over the FULL feed (not one symbol's slice) — without this memo. Memoizing it
-        once per instance turns ~900 bars' worth of O(all disclosures) rescans into one."""
+        once per instance turns ~900 bars' worth of O(all disclosures) rescans into one.
+
+        ``full_history=True``: unlike the per-symbol ``_symbol_trades_index_cached`` (which
+        already pulls a symbol's COMPLETE trade history unconditionally, so "how far back"
+        never arises there), this UNSCOPED fetch used to grab only page 0 of the
+        ``{chamber}-latest`` feed (~4 months of disclosures) — invisible to a multi-year
+        backtest walking further back than that (confirmed empirically: a 2023-2026 GA grid
+        scored trades=0/fitness=-1e9 for every individual). ``full_history=True`` paginates
+        the fetch to the end of the feed instead (see ``_fetch_congress_trades``'s
+        "Pagination-depth design" docstring for why unconditional-depth beats trying to derive
+        a floor date from this backtest's own as_of walk)."""
         cached = getattr(self, "_all_trades_memo", None)
         if cached is not None:
             return cached
 
-        senate = self._fetch_senate_trades(symbol=None) or []
-        house = self._fetch_house_trades(symbol=None) or []
+        senate = self._fetch_senate_trades(symbol=None, full_history=True) or []
+        house = self._fetch_house_trades(symbol=None, full_history=True) or []
         # Same dedup fingerprint as _symbol_trades_index_cached, generalized across symbols
         # (amended/duplicate filings must count once, same as the per-symbol path).
         seen: set = set()
@@ -827,15 +837,27 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         bundle_by_symbol = self._gather_all(context.providers, as_of)
         return self._process_all(bundle_by_symbol, context.settings, as_of)
 
-    def _fetch_senate_trades(self, symbol: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
+    def _fetch_senate_trades(self, symbol: Optional[str] = None,
+                             full_history: bool = False) -> Optional[List[Dict[str, Any]]]:
         """Fetch senate trades for a symbol, or all latest disclosures when symbol is None
-        (used by _gather_all's basket path; raises ValueError on request failure)."""
-        return self._fetch_congress_trades("senate", symbol, timeout=60, raise_on_error=True)
+        (used by _gather_all's basket path; raises ValueError on request failure).
 
-    def _fetch_house_trades(self, symbol: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
+        full_history: passed through to _fetch_congress_trades (only meaningful when
+        symbol is None) — see its "Pagination-depth design" docstring. _all_trades_index_cached
+        below is the only caller that sets this True."""
+        return self._fetch_congress_trades(
+            "senate", symbol, timeout=60, raise_on_error=True, full_history=full_history)
+
+    def _fetch_house_trades(self, symbol: Optional[str] = None,
+                            full_history: bool = False) -> Optional[List[Dict[str, Any]]]:
         """Fetch house trades for a symbol, or all latest disclosures when symbol is None
-        (used by _gather_all's basket path; raises ValueError on request failure)."""
-        return self._fetch_congress_trades("house", symbol, timeout=60, raise_on_error=True)
+        (used by _gather_all's basket path; raises ValueError on request failure).
+
+        full_history: passed through to _fetch_congress_trades (only meaningful when
+        symbol is None) — see its "Pagination-depth design" docstring. _all_trades_index_cached
+        below is the only caller that sets this True."""
+        return self._fetch_congress_trades(
+            "house", symbol, timeout=60, raise_on_error=True, full_history=full_history)
     
     def _fetch_trader_history(self, trader_name: str) -> Optional[List[Dict[str, Any]]]:
         """Cached (backtest-only) wrapper around the per-trader disclosure fetch.

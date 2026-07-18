@@ -705,8 +705,12 @@ def _build_real_copy_run(
     expert = expert_cls(expert_id)
     # Hermetic fetch: fixed disclosures, well before the BARS window (2024-01-02..01-08), so
     # every bar's no-lookahead / age-window checks pass identically across the whole run.
-    expert._fetch_senate_trades = lambda symbol=None: senate_trades
-    expert._fetch_house_trades = lambda symbol=None: house_trades
+    # **kwargs: FMPSenateTraderWeight's _all_trades_index_cached calls these with
+    # full_history=True (deep-pagination opt-in, see expert_mixins.py's
+    # "Pagination-depth design" docstring) -- this hermetic stub ignores the flag and always
+    # returns the same fixed disclosure list regardless of depth requested.
+    expert._fetch_senate_trades = lambda symbol=None, **kwargs: senate_trades
+    expert._fetch_house_trades = lambda symbol=None, **kwargs: house_trades
     # Enable automated opening + buy (interface defaults are False/True; the RM gates on
     # these) -- same settings the stub basket tests above need to actually fund an order.
     expert.save_settings(
