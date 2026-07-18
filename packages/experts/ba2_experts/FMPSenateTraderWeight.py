@@ -552,8 +552,9 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
            ``_all_trades_index_cached``) instead of one ``_fetch_*_trades(symbol)`` call per
            universe symbol.
         2. Apply the SAME disclose/exec date window ``_window_trades`` applies per-symbol
-           (bisect on the disclosure-sorted view — no upper bound on either date, matching
-           ``_filter_trades``' "only rejects too-OLD rows" semantics).
+           (bisect on the disclosure-sorted view, bounded BOTH below — too-old — and above —
+           future-dated, i.e. not yet knowable as of ``as_of`` — matching ``_filter_trades``'
+           semantics; see the lookahead-bias fix that added the upper bound).
         3. NEW: drop non-tradable symbols (mutual-fund-pattern tickers etc.) via Task 4's
            ``is_tradable_stock_ticker`` — a filter the per-symbol path never needed, since its
            caller always pinned an already-vetted universe symbol.
