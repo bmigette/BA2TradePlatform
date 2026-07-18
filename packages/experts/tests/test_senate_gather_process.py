@@ -956,3 +956,98 @@ def test_skill_bisect_fastpath_matches_reference_random_histories():
         assert actual == expected, (
             f"trial={trial} n_trades={n_trades} now={now} horizon={horizon_days} "
             f"lookback={lookback_months} min={min_past_trades} max={max_past_trades}")
+
+
+# ====================================================================
+# FMPSenateTraderWeight — _calculate_trader_confidence prefix-sum fast-path equivalence
+#
+# The 2026-07-18 perf pass added an optional precomputed prefix-sum index (_index param,
+# built by _build_confidence_index / memoized by _confidence_index_cached) that answers the
+# recent/yearly window aggregates with O(log n) bisects instead of the original O(n) history
+# rescan. The original scan path is kept verbatim as the no-index fallback — so equivalence
+# is provable directly: run BOTH paths of the same production function on randomized
+# histories (including messy rows: unparseable dates, missing dates, exchange types, mixed
+# symbols) and require identical result dicts.
+# ====================================================================
+
+def test_confidence_index_fastpath_matches_full_scan():
+    rng = _random.Random(98765)
+    symbols = ["AAA", "BBB", "CCC", "DDD"]
+    base = datetime(2023, 1, 1, tzinfo=timezone.utc)
+    amounts = ["$1,001 - $15,000", "$15,001 - $50,000", "$50,001 - $100,000", "$1,000,001 - $5,000,000"]
+    types = ["purchase", "sale", "sale (partial)", "exchange", "purchase"]
+
+    for trial in range(30):
+        e = _weight_expert("AAPL", [], {})
+        n_trades = rng.randint(0, 80)
+        history = []
+        for i in range(n_trades):
+            exec_date = base + timedelta(days=(rng.randint(0, 900) // 10) * 10)  # cluster ties
+            row = {
+                "firstName": "T", "lastName": str(trial), "symbol": rng.choice(symbols),
+                "type": rng.choice(types),
+                "disclosureDate": exec_date.date().isoformat(),
+                "transactionDate": exec_date.date().isoformat(),
+                "amount": rng.choice(amounts),
+            }
+            # Inject messy rows the original loop skips/tolerates: no date, garbage date.
+            if i % 13 == 0:
+                row["transactionDate"] = ""
+            elif i % 17 == 0:
+                row["transactionDate"] = "not-a-date"
+            history.append(row)
+
+        now = base + timedelta(days=rng.randint(100, 1100))
+        max_exec_days = rng.choice([30, 60, 90, 120])
+        focus_cap = rng.choice([5.0, 10.0, 25.0])
+        cur_symbol = rng.choice(symbols)
+        cur_type = rng.choice(["purchase", "sale"])
+
+        slow = e._calculate_trader_confidence(
+            history, cur_type, cur_symbol, 100.0, max_exec_days=max_exec_days,
+            now=now, symbol_focus_cap_pct=focus_cap)
+        index = e._build_confidence_index(history, e.logger)
+        fast = e._calculate_trader_confidence(
+            history, cur_type, cur_symbol, 100.0, max_exec_days=max_exec_days,
+            now=now, symbol_focus_cap_pct=focus_cap, _index=index)
+
+        assert fast == slow, (
+            f"trial={trial} n_trades={n_trades} now={now} exec_days={max_exec_days} "
+            f"cap={focus_cap} sym={cur_symbol} type={cur_type}\nslow={slow}\nfast={fast}")
+
+
+def test_confidence_cached_uses_index_and_matches(monkeypatch):
+    """_get_trader_confidence_cached must produce the same result as a direct no-index call
+    (proving the wired-in index path is transparent), and the index memo must be reused
+    across calls for the same (trader, history length)."""
+    e = _weight_expert("AAPL", [], {})
+    base = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    history = [
+        {"firstName": "A", "lastName": "B", "symbol": "AAA", "type": "purchase",
+         "disclosureDate": (base + timedelta(days=i * 30)).date().isoformat(),
+         "transactionDate": (base + timedelta(days=i * 30)).date().isoformat(),
+         "amount": "$15,001 - $50,000"}
+        for i in range(10)
+    ]
+    now = base + timedelta(days=400)
+
+    direct = e._calculate_trader_confidence(history, "purchase", "AAA", 100.0,
+                                            max_exec_days=60, now=now,
+                                            symbol_focus_cap_pct=10.0)
+    cached = e._get_trader_confidence_cached(
+        "Trader X", history, current_trade_type="purchase", current_symbol="AAA",
+        current_price=100.0, max_exec_days=60, now=now, symbol_focus_cap_pct=10.0,
+        is_live=False)
+    assert cached == direct
+
+    builds = []
+    real_build = FMPSenateTraderWeight._build_confidence_index
+    monkeypatch.setattr(FMPSenateTraderWeight, "_build_confidence_index",
+                        staticmethod(lambda h, lg: builds.append(1) or real_build(h, lg)))
+    # New day -> new cache key -> miss -> index needed again, but the (trader, n) memo
+    # already holds it: no rebuild.
+    e._get_trader_confidence_cached(
+        "Trader X", history, current_trade_type="purchase", current_symbol="AAA",
+        current_price=100.0, max_exec_days=60, now=now + timedelta(days=1),
+        symbol_focus_cap_pct=10.0, is_live=False)
+    assert builds == []  # memo hit, no rebuild

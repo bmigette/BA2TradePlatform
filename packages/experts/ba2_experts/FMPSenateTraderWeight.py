@@ -812,9 +812,11 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         entry = cache.get(key)
         if entry is not None:
             return entry
+        index = self._confidence_index_cached(trader_name, trader_history)
         result = self._calculate_trader_confidence(
             trader_history, current_trade_type, current_symbol, current_price,
-            max_exec_days, now=now, symbol_focus_cap_pct=symbol_focus_cap_pct)
+            max_exec_days, now=now, symbol_focus_cap_pct=symbol_focus_cap_pct,
+            _index=index)
         cache[key] = result
         self._save_scoring_cache_throttled("_confidence_cache", self._CONFIDENCE_CACHE_FILE, key)
         return result
@@ -1140,32 +1142,137 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         from ba2_common.core.utils import parse_fmp_amount_range
         return parse_fmp_amount_range(amount_str)
 
+    @staticmethod
+    def _build_confidence_index(trader_history: List[Dict[str, Any]], logger) -> Dict[str, Any]:
+        """Precompute a date-sorted prefix-sum index over a trader's history so a confidence
+        query becomes O(log n) bisects instead of an O(n) rescan (see
+        ``_calculate_trader_confidence``'s ``_index`` parameter). Mirrors the original loop's
+        per-trade semantics EXACTLY: skip no-date rows, warn+skip unparseable dates, classify
+        buy-first/elif-sell, skip a row entirely on any parse exception.
+
+        Returns ``{dates, buy_amt, sell_amt, buy_cnt, sell_cnt, by_symbol}`` where the ``*``
+        arrays are length n+1 cumulative prefixes over the date-sorted rows, and ``by_symbol``
+        maps UPPER symbol -> the same shape restricted to that symbol's rows (only the yearly
+        symbol-focus subtotal needs it, so per-symbol carries just buy_amt/sell_amt)."""
+        rows = []  # (exec_date, amount, is_buy, is_sell, symbol_upper)
+        for trade in trader_history:
+            try:
+                transaction_type = trade.get('type', '').lower()
+                amount_str = trade.get('amount', '0')
+                exec_date_str = trade.get('transactionDate', '')
+                if not exec_date_str:
+                    continue
+                try:
+                    exec_date = _parse_ymd_utc(exec_date_str)
+                except (ValueError, TypeError) as e:
+                    logger.warning(f"Skipping trade with unparseable date {exec_date_str!r}: {e}")
+                    continue
+                amount = FMPSenateTraderWeight._parse_amount(amount_str)
+                is_buy = 'purchase' in transaction_type or 'buy' in transaction_type
+                is_sell = 'sale' in transaction_type or 'sell' in transaction_type
+                rows.append((exec_date, amount, is_buy, is_sell, trade.get('symbol', '').upper()))
+            except Exception as e:  # noqa: BLE001 — mirror the original loop's skip-on-error
+                logger.debug(f"Error parsing trade: {e}")
+                continue
+        rows.sort(key=lambda r: r[0])
+
+        def _prefixes(rs):
+            dates, ba, sa, bc, sc = [], [0.0], [0.0], [0], [0]
+            for d, amount, is_buy, is_sell, _sym in rs:
+                dates.append(d)
+                ba.append(ba[-1] + (amount if is_buy else 0.0))
+                sa.append(sa[-1] + (amount if is_sell and not is_buy else 0.0))
+                bc.append(bc[-1] + (1 if is_buy else 0))
+                sc.append(sc[-1] + (1 if is_sell and not is_buy else 0))
+            return {"dates": dates, "buy_amt": ba, "sell_amt": sa, "buy_cnt": bc, "sell_cnt": sc}
+
+        by_symbol: Dict[str, Any] = {}
+        for r in rows:
+            by_symbol.setdefault(r[4], []).append(r)
+        return {**_prefixes(rows),
+                "by_symbol": {sym: _prefixes(rs) for sym, rs in by_symbol.items()}}
+
+    def _confidence_index_cached(self, trader_name: str,
+                                 trader_history: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """In-memory (never disk-persisted) memo of ``_build_confidence_index`` keyed by
+        (trader, history length) — same pattern/justification as ``_sorted_buy_candidates_cached``:
+        the index is cheap to build once per (trader, as-of slice) but was being effectively
+        rebuilt via a full O(history) rescan on every one of the ~100k+ confidence-cache MISSES
+        in a cold GA trial (profiled live 2026-07-18: the confidence scan dominated senate trial
+        time even after the skill cache was fully prewarmed — >24 min/trial, 27MB of new
+        confidence entries in one 24-minute window)."""
+        memo = getattr(self, "_confidence_index_memo", None)
+        if memo is None:
+            memo = self._confidence_index_memo = {}
+        key = (trader_name, len(trader_history))
+        cached = memo.get(key)
+        if cached is None:
+            cached = memo[key] = self._build_confidence_index(trader_history, self.logger)
+        return cached
+
+    @staticmethod
+    def _window_sums(prefix: Dict[str, Any], threshold: datetime) -> tuple:
+        """(buy_amt, sell_amt, buy_cnt, sell_cnt) over rows with exec_date >= threshold, via
+        one bisect on the sorted dates + suffix-from-prefix subtraction."""
+        i = bisect.bisect_left(prefix["dates"], threshold)
+        return (prefix["buy_amt"][-1] - prefix["buy_amt"][i],
+                prefix["sell_amt"][-1] - prefix["sell_amt"][i],
+                prefix["buy_cnt"][-1] - prefix["buy_cnt"][i],
+                prefix["sell_cnt"][-1] - prefix["sell_cnt"][i])
+
     def _calculate_trader_confidence(self, trader_history: List[Dict[str, Any]],
                                      current_trade_type: str,
                                      current_symbol: str,
                                      current_price: float,
                                      max_exec_days: int = 60,
                                      now: Optional[datetime] = None,
-                                     symbol_focus_cap_pct: float = 10.0) -> Dict[str, Any]:
+                                     symbol_focus_cap_pct: float = 10.0,
+                                     _index: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Calculate confidence based on trader's portfolio allocation to the current symbol.
-        
+
         Logic:
         - Calculate % of money spent on current symbol vs total portfolio (yearly)
         - Higher % = stronger conviction/focus on this specific stock
         - Cap at 10% to avoid extreme confidence values
         - Use this allocation % to determine confidence level
-        
+
         Args:
             trader_history: List of all trades by this person (all symbols, all time)
             current_trade_type: Type of the current trade ('purchase' or 'sale')
             current_symbol: The symbol being analyzed
             current_price: Current price of the symbol (not used in this calculation)
             max_exec_days: Days to look back for recent activity
-            
+
+        ``_index`` (internal): an optional precomputed ``_build_confidence_index`` result —
+        pass it (e.g. via ``_confidence_index_cached``) to answer the window aggregates with
+        O(log n) bisects instead of the O(n) history rescan below. Omitted, the original
+        full-scan path runs unchanged (same results either way — proven by the differential
+        test in packages/experts/tests/test_senate_gather_process.py).
+
         Returns:
             Dictionary with confidence modifier, symbol focus %, and trading statistics
         """
+        if _index is not None and trader_history:
+            now_ = now or datetime.now(timezone.utc)
+            recent_threshold = now_ - timedelta(days=int(max_exec_days))
+            yearly_threshold = now_ - timedelta(days=365)
+            (recent_buy_amount, recent_sell_amount,
+             recent_buy_count, recent_sell_count) = self._window_sums(_index, recent_threshold)
+            (yearly_buy_amount, yearly_sell_amount,
+             yearly_buy_count, yearly_sell_count) = self._window_sums(_index, yearly_threshold)
+            sym_prefix = _index["by_symbol"].get(current_symbol.upper())
+            if sym_prefix is not None:
+                (yearly_symbol_buy_amount, yearly_symbol_sell_amount,
+                 _ysbc, _yssc) = self._window_sums(sym_prefix, yearly_threshold)
+            else:
+                yearly_symbol_buy_amount = yearly_symbol_sell_amount = 0.0
+            return self._confidence_from_aggregates(
+                current_trade_type, current_symbol, max_exec_days, symbol_focus_cap_pct,
+                recent_buy_amount, recent_sell_amount, recent_buy_count, recent_sell_count,
+                yearly_buy_amount, yearly_sell_amount, yearly_buy_count, yearly_sell_count,
+                yearly_symbol_buy_amount, yearly_symbol_sell_amount)
+
         if not trader_history:
             return {
                 'confidence_modifier': 0.0,
@@ -1258,13 +1365,29 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                 self.logger.debug(f"Error parsing trade: {e}")
                 continue
         
+        return self._confidence_from_aggregates(
+            current_trade_type, current_symbol, max_exec_days, symbol_focus_cap_pct,
+            recent_buy_amount, recent_sell_amount, recent_buy_count, recent_sell_count,
+            yearly_buy_amount, yearly_sell_amount, yearly_buy_count, yearly_sell_count,
+            yearly_symbol_buy_amount, yearly_symbol_sell_amount)
+
+    def _confidence_from_aggregates(self, current_trade_type: str, current_symbol: str,
+                                    max_exec_days: int, symbol_focus_cap_pct: float,
+                                    recent_buy_amount: float, recent_sell_amount: float,
+                                    recent_buy_count: int, recent_sell_count: int,
+                                    yearly_buy_amount: float, yearly_sell_amount: float,
+                                    yearly_buy_count: int, yearly_sell_count: int,
+                                    yearly_symbol_buy_amount: float,
+                                    yearly_symbol_sell_amount: float) -> Dict[str, Any]:
+        """The pure focus/modifier tail of ``_calculate_trader_confidence``, shared verbatim by
+        the original full-scan path and the ``_index`` fast path so the two can never diverge."""
         # Calculate symbol focus percentage
         # What % of the trader's buys/sells (by dollar amount) are focused on this specific symbol?
         current_is_buy = 'purchase' in current_trade_type.lower() or 'buy' in current_trade_type.lower()
-        
+
         symbol_focus_pct = 0.0
         total_volume = yearly_buy_amount + yearly_sell_amount
-        
+
         if total_volume == 0:
             return {
                 'confidence_modifier': 0.0,
@@ -1280,7 +1403,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                 'yearly_symbol_buy_amount': yearly_symbol_buy_amount,
                 'yearly_symbol_sell_amount': yearly_symbol_sell_amount
             }
-        
+
         # Calculate what % of their trading activity (by dollar) is focused on this symbol
         if current_is_buy:
             # For buy trades, calculate % of total buys spent on this symbol
@@ -1290,14 +1413,14 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             # For sell trades, calculate % of total sells from this symbol
             if yearly_sell_amount > 0:
                 symbol_focus_pct = (yearly_symbol_sell_amount / yearly_sell_amount) * 100
-        
+
         # Cap symbol focus (configurable) to avoid extreme confidence values
         cap = float(symbol_focus_cap_pct or 10.0)
         symbol_focus_pct = min(cap, symbol_focus_pct)
 
         # Use symbol focus % as confidence modifier (capped)
         confidence_modifier = symbol_focus_pct
-        
+
         self.logger.debug(f"Trader pattern (yearly): {yearly_buy_count} buys (${yearly_buy_amount:,.0f}), "
                     f"{yearly_sell_count} sells (${yearly_sell_amount:,.0f})")
         self.logger.debug(f"Symbol {current_symbol} (yearly): ${yearly_symbol_buy_amount:,.0f} buys, "
@@ -1305,7 +1428,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         self.logger.debug(f"Symbol focus: {symbol_focus_pct:.1f}% of trader's {'buys' if current_is_buy else 'sells'} (capped at 10%, confidence modifier)")
         self.logger.debug(f"Trader pattern (recent {max_exec_days}d): {recent_buy_count} buys (${recent_buy_amount:,.0f}), "
                     f"{recent_sell_count} sells (${recent_sell_amount:,.0f})")
-        
+
         return {
             'confidence_modifier': confidence_modifier,
             'symbol_focus_pct': symbol_focus_pct,
