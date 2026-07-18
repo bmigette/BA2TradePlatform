@@ -767,3 +767,118 @@ def test_fmp_senate_trader_copy_produces_recommendations_in_backtest():
     finally:
         set_backtest_ohlcv_override(None)
         ctx.__exit__(None, None, None)
+
+
+# ---------------------------------------------------------------------------
+# Task 5 (senate-basket-dispatch plan): FMPSenateTraderWeight wired onto the SAME
+# analyzes_as_basket dispatch mode Task 2/3 built, reusing Task 3's parameterized
+# _build_real_copy_run harness (expert_cls/senate_trades/house_trades/settings/price_map are
+# all overridable specifically so this test doesn't need to copy-paste that ~100-line
+# function -- see _build_real_copy_run's own docstring above, which calls this out by name).
+#
+# Weight needs TWO extra hermetic stubs beyond what Copy needs: _get_price_at_date and
+# _fetch_trader_history. Copy's _process never resolves a per-trade EXECUTION price (it only
+# compares disclosure/exec dates for its age filter, no price-delta logic) and has no notion
+# of "trader history" at all, so _build_real_copy_run never stubs either method. Discovered
+# empirically running this test (not just reasoned about): this harness's DB actually SEEDS an
+# FMP_API_KEY app setting ("test-fmp-key", unlike packages/experts/tests' bare __new__
+# fixtures, which have no API key at all) -- so, left unstubbed, BOTH methods fall through to
+# REAL network calls against FMP with that fake key, each one taking 1-2s to 401 rather than
+# failing fast, and _fetch_trader_history additionally returns [] (empty history) on every
+# call, which makes _calculate_trader_confidence's symbol_focus_pct resolve to 0 for every
+# trader (no "yearly activity" to compute a focus % from) -- collapsing net_symbol_focus to
+# exactly 0 and producing a HOLD signal (silently, no crash) instead of the intended BUY.
+# Weight's _filter_trades ALSO needs a per-trade execution price (pre-resolved by _gather_all
+# into exec_price_by_trade via _get_price_at_date) for the price-delta filter and trade_details
+# -- a None exec price would make _filter_trades' `if not exec_price: continue` guard drop
+# every trade. Both stubs mirror the SAME hermetic stubs the per-symbol fixtures in
+# packages/experts/tests/test_senate_gather_process.py already apply for the identical reasons
+# (see that file's `_weight_expert`).
+# ---------------------------------------------------------------------------
+_WEIGHT_SENATE_TRADES_DEFAULT = [
+    _senate_trade("Alice", "Aa", "AAPL", "purchase", "2023-12-15", "2023-12-01"),
+    _senate_trade("Bob", "Bb", "AAPL", "purchase", "2023-12-16", "2023-12-02"),
+]
+_WEIGHT_HOUSE_TRADES_DEFAULT = [
+    _senate_trade("Carol", "Cc", "MSFT", "purchase", "2023-12-15", "2023-12-01"),
+    _senate_trade("Dave", "Dd", "MSFT", "purchase", "2023-12-16", "2023-12-02"),
+]
+# Each trader's OWN "yearly history" for the confidence-modifier calc: fixed to a single past
+# buy of the SAME symbol they're disclosed trading above, so their whole yearly activity is
+# this symbol (100% focus, capped by symbol_focus_cap_pct) -- otherwise (see the comment block
+# above) an unstubbed/empty history collapses every trader's symbol-focus % to 0 and the net
+# signal to a silent HOLD.
+_WEIGHT_HISTORY_DEFAULT = {
+    "Alice Aa": [_senate_trade("Alice", "Aa", "AAPL", "purchase", "2023-11-01", "2023-10-20")],
+    "Bob Bb": [_senate_trade("Bob", "Bb", "AAPL", "purchase", "2023-11-02", "2023-10-21")],
+    "Carol Cc": [_senate_trade("Carol", "Cc", "MSFT", "purchase", "2023-11-01", "2023-10-20")],
+    "Dave Dd": [_senate_trade("Dave", "Dd", "MSFT", "purchase", "2023-11-02", "2023-10-21")],
+}
+# copy_trade_names has no equivalent here -- Weight's REQUIRED (direct dict access, no
+# _setting_or_default) settings keys are max_disclose_date_days/max_trade_exec_days/
+# max_trade_price_delta_pct/growth_confidence_multiplier/confidence_to_profit_factor/
+# min_traders/min_trades (see FMPSenateTraderWeight._process). min_traders=min_trades=2
+# matches the two-distinct-traders-per-symbol fixture data above so a real BUY signal (not a
+# below-minimums HOLD) comes out for each symbol.
+_WEIGHT_SETTINGS_DEFAULT = {
+    "max_disclose_date_days": 365,
+    "max_trade_exec_days": 365,
+    "max_trade_price_delta_pct": 1000.0,
+    "growth_confidence_multiplier": 5.0,
+    "confidence_to_profit_factor": 0.15,
+    "min_traders": 2,
+    "min_trades": 2,
+    # Disabled so this hermetic engine-level test never touches the real on-disk skill/
+    # hold-days scoring cache (packages/experts/tests isolates CACHE_FOLDER per test via an
+    # autouse fixture; this test doesn't, so keeping these knobs at their "off" default value
+    # keeps the run hermetic without needing that isolation fixture here too).
+    "skill_signal_weight": 0.0,
+    "skill_confidence_weight": 0.0,
+}
+_WEIGHT_EXEC_PRICE_BY_SYMBOL = {"AAPL": 95.0, "MSFT": 57.0}
+
+
+def test_fmp_senate_trader_weight_produces_recommendations_in_backtest():
+    """Mirrors test_fmp_senate_trader_copy_produces_recommendations_in_backtest above, but for
+    FMPSenateTraderWeight: proves the SAME analyzes_as_basket dispatch mode (Task 2) also
+    carries Weight's basket path (Task 5's _gather_all/_process_all + analyze_as_of dual-mode
+    dispatch) end-to-end through a real DailyBacktestEngine run -- one analyze_as_of call per
+    bar, ExpertRecommendation rows for the symbols with qualifying (min_traders/min_trades
+    -satisfying) disclosures, and a funded order via the full classic
+    TradeActionEvaluator/TradeRiskManagement pipeline (not a target-weight rebalance)."""
+    from app.services.backtest.seam_wiring import set_backtest_ohlcv_override
+    from ba2_common.core.db import get_all_instances
+    from ba2_common.core.models import ExpertRecommendation
+    from ba2_experts.FMPSenateTraderWeight import FMPSenateTraderWeight
+
+    engine, account, expert, ctx, ps = _build_real_copy_run(
+        account_id=58, expert_id=58, expert_cls=FMPSenateTraderWeight,
+        senate_trades=_WEIGHT_SENATE_TRADES_DEFAULT,
+        house_trades=_WEIGHT_HOUSE_TRADES_DEFAULT,
+        settings=_WEIGHT_SETTINGS_DEFAULT,
+        price_map={"AAPL": 100.0, "MSFT": 60.0},
+    )
+    # Extra hermetic stubs Weight needs beyond what Copy needs -- see the block comment above.
+    expert._get_price_at_date = lambda sym, date: _WEIGHT_EXEC_PRICE_BY_SYMBOL.get(
+        str(sym).upper(), 50.0)
+    expert._fetch_trader_history = lambda name: _WEIGHT_HISTORY_DEFAULT.get(name)
+    try:
+        engine.run()
+
+        rows = get_all_instances(ExpertRecommendation)
+        assert len(rows) > 0, (
+            "FMPSenateTraderWeight produced zero ExpertRecommendation rows via the basket "
+            "dispatch path"
+        )
+        symbols = {r.symbol for r in rows}
+        assert symbols <= {"AAPL", "MSFT"}
+
+        # A funded order actually opened a position -- proves the recommendations flowed all
+        # the way through TradeActionEvaluator + TradeRiskManagement sizing (the full classic
+        # pipeline a basket expert keeps, per Task 2), not merely persisted-then-ignored.
+        positions = account.get_positions()
+        assert len(positions) >= 1
+        assert {p["symbol"] for p in positions} <= {"AAPL", "MSFT"}
+    finally:
+        set_backtest_ohlcv_override(None)
+        ctx.__exit__(None, None, None)
