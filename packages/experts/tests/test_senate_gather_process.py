@@ -96,6 +96,22 @@ COPY_SETTINGS = {
 }
 
 
+def test_copy_declares_analyzes_as_basket():
+    """senate-basket-dispatch plan Task 3: FMPSenateTraderCopy must declare
+    ``analyzes_as_basket = True`` so daily_engine.py's dispatch loop routes it through
+    ``_run_basket_expert_bar`` (one analyze_as_of call per bar, List[Recommendation] return)
+    instead of ``_run_expert_bar`` (one call per universe symbol expecting a single
+    Recommendation — which crashes on a list return, see
+    testplatform/backend/tests/backtest/test_daily_engine_basket_dispatch.py Task 1). This is
+    a class-level attribute check only; the full engine-integration proof (real
+    ExpertRecommendation rows produced via DailyBacktestEngine) lives in that same
+    testplatform/backend test file, not here — packages/experts/tests cannot import
+    testplatform/backend's ``app.services.backtest`` package (directional dependency: the app
+    depends on this package, not the reverse; confirmed by ModuleNotFoundError when attempted
+    with cwd at repo root)."""
+    assert FMPSenateTraderCopy.analyzes_as_basket is True
+
+
 def test_copy_gather_resolves_price_map_and_supported():
     senate = [_copy_trade("Nancy", "Pelosi", "AAPL", "purchase", "2026-06-01", "2026-05-20")]
     house = [_copy_trade("Nancy", "Pelosi", "ZZZZ", "purchase", "2026-06-01", "2026-05-20")]

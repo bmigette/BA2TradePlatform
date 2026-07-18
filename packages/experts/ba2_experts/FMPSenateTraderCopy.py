@@ -54,6 +54,14 @@ class FMPSenateTraderCopy(AnalysisStatusRenderMixin, FMPCongressTradingMixin, Ma
     RENDER_RUNNING_MESSAGE = 'Fetching trades from followed senators/representatives for {symbol}...'
     RENDER_FAILED_TITLE = 'Copy Trade Analysis Failed'
 
+    # Backtest dispatch marker (senate-basket-dispatch plan, Task 3): analyze_as_of already
+    # returns List[Recommendation] (one per supported symbol, see _process below) — this
+    # class attribute tells daily_engine.py to call analyze_as_of ONCE per bar via
+    # _run_basket_expert_bar instead of once per universe symbol via _run_expert_bar (which
+    # has no handling for a list return and crashes with AttributeError, see Task 1's
+    # test_daily_engine_basket_dispatch.py::test_list_returning_expert_crashes_the_backtest_run_today).
+    analyzes_as_basket = True
+
     @classmethod
     def description(cls) -> str:
         return "Copy trades from specific senators/representatives with 100% confidence"

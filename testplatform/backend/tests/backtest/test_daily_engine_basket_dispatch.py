@@ -525,3 +525,197 @@ def test_basket_expert_non_list_analyze_as_of_return_skips_bar_without_crashing(
         assert len(account.get_balance_history()) == len(BARS)
     finally:
         ctx.__exit__(None, None, None)
+
+
+# ---------------------------------------------------------------------------
+# Task 3 (senate-basket-dispatch plan): FMPSenateTraderCopy wired onto analyzes_as_basket for
+# real -- proves the previously-dead backtest path (Task 1's crash, documented above) now
+# actually produces ExpertRecommendation rows through the FULL engine, using a REAL expert
+# instance (not a stub).
+#
+# This test intentionally lives here (testplatform/backend/tests/backtest/), NOT under
+# packages/experts/tests/, even though the plan's Task 3 write-up suggested the latter as the
+# default location. Reason (a directional-dependency + import-feasibility check, not a
+# preference): packages/experts is a standalone installable package that testplatform/backend
+# CONSUMES (see CLAUDE.md's Phase 6 packages note) -- the dependency only points one way. A
+# test under packages/experts/tests/ cannot import app.services.backtest.daily_engine (the
+# DailyBacktestEngine harness this test needs) because `app` is testplatform/backend's
+# FastAPI-local package, not an installed dependency of the ba2_experts venv -- confirmed
+# empirically: `python -c "import app.services.backtest.daily_engine"` raises
+# ModuleNotFoundError when the cwd/rootdir is the repo root (or packages/experts), and only
+# resolves when cwd is testplatform/backend itself. This matches the repo's own existing
+# convention: every other engine-level integration test for a REAL ba2_experts class
+# (FactorRanker, FMPEarningsDrift, FMPInsiderClusterBuy, FMPRating) already lives under
+# testplatform/backend/tests/backtest/, not packages/experts/tests/ -- see
+# test_daily_engine_bypass.py, test_backtest_perf_assertions.py, test_engine_golden_regression.py,
+# test_size_candidate_orders_parity.py. A companion class-attribute-only check (cheap, no `app`
+# dependency) was added to packages/experts/tests/test_senate_gather_process.py instead
+# (test_copy_declares_analyzes_as_basket).
+# ---------------------------------------------------------------------------
+def _senate_trade(first, last, sym, ttype, disclose, exec_date, amount="$15,001 - $50,000"):
+    """Hermetic FMP senate/house trade fixture row. Shape matches ``_copy_trade()`` in
+    packages/experts/tests/test_senate_gather_process.py -- that file's docstring documents
+    this as the repo's established convention for fabricating FMP trade data without hitting
+    the network (test_tools/test_fmp_senate_copy.py, the other candidate reference named in
+    the Task 3 plan text, turns out to be a pre-Phase-6 manual `--all` CLI harness against the
+    OLD `ba2_trade_platform.modules.experts` import path and the real network/DB -- it does
+    NOT mock _fetch_congress_trades or seed a disk cache, so it isn't a hermetic-fixture
+    reference; test_senate_gather_process.py's _copy_expert()/_copy_trade() is the real one)."""
+    return {
+        "firstName": first, "lastName": last, "symbol": sym, "type": ttype,
+        "disclosureDate": disclose, "transactionDate": exec_date, "amount": amount,
+    }
+
+
+class _FakeOHLCV:
+    """OHLCV provider installed via ``set_backtest_ohlcv_override`` -- FMPSenateTraderCopy's
+    real ``_gather`` (unlike the stub experts above) calls ``providers.price_at_date(symbol,
+    as_of)``, which resolves through ``LiveProviderBundle.ohlcv()`` -> the TradeConditions
+    provider resolver -> this override, exactly the seam ``daily_backtest_handler.py`` uses
+    for the real (network/disk-cache) OHLCV path -- see seam_wiring.py's
+    ``_wire_provider_resolver`` docstring."""
+
+    def __init__(self, price_map):
+        self._price_map = price_map  # symbol(upper) -> close price
+
+    def get_ohlcv_data(self, symbol, end_date=None, lookback_days=7, interval="1d"):
+        import pandas as pd
+        price = self._price_map.get(str(symbol).upper())
+        if price is None:
+            return pd.DataFrame({"Close": []})
+        return pd.DataFrame({"Close": [price]})
+
+
+def _build_real_copy_run(account_id=57, expert_id=57):
+    """Wire a REAL ``FMPSenateTraderCopy`` instance (not a stub) into the same harness the stub
+    basket tests above use.
+
+    Hermetic: ``_fetch_senate_trades``/``_fetch_house_trades`` are monkeypatched directly on
+    the instance (mirrors ``_copy_expert()`` in test_senate_gather_process.py -- the FMP-http
+    fetchers aren't in the ``get_provider`` registry per that file's docstring, so they're
+    stubbed on the instance rather than through the provider seam), and
+    ``providers.price_at_date`` is routed through ``_FakeOHLCV`` via
+    ``set_backtest_ohlcv_override`` instead of the network.
+
+    Returns (engine, account, expert, ctx, ps). Caller MUST call
+    ``set_backtest_ohlcv_override(None)`` AND close ``ctx`` in a ``finally`` block.
+    """
+    from app.services.backtest.backtest_account import BacktestAccount
+    from app.services.backtest.backtest_db import (
+        backtest_trading_db,
+        seed_account_definition,
+        seed_expert_instance,
+    )
+    from app.services.backtest.daily_engine import DailyBacktestEngine
+    from app.services.backtest.default_rulesets import seed_enter_long_ruleset
+    from app.services.backtest.price_source import AsOfPriceSource
+    from app.services.backtest.seam_wiring import set_backtest_ohlcv_override, wire_backtest_seams
+    from ba2_experts.FMPSenateTraderCopy import FMPSenateTraderCopy
+
+    cfg = {
+        "starting_cash": 100_000.0,
+        "commission_per_trade": 0.0,
+        "slippage_bps": 0.0,
+        "fill_model": "next_bar_open",
+    }
+
+    resolver = wire_backtest_seams()
+    ctx = backtest_trading_db(f"engine-basket-dispatch-real-copy-{account_id}")
+    ctx.__enter__()
+
+    seed_account_definition(account_id, cfg)
+    ruleset_id = seed_enter_long_ruleset(name="backtest-basket-dispatch-real-copy")
+    seed_expert_instance(
+        account_id=account_id,
+        expert_class_name="FMPSenateTraderCopy",
+        enter_market_ruleset_id=ruleset_id,
+        instance_id=expert_id,
+    )
+
+    ps = AsOfPriceSource(ohlcv_provider=None)
+    ps.load_bars("AAPL", _bar_rows(BARS))
+    ps.load_bars("MSFT", _bar_rows(BARS))
+
+    account = BacktestAccount(account_id, ps, cfg)
+    resolver.register_account(account_id, account)
+
+    # Real constructor: __init__ runs _load_expert_instance (needs the seeded row above) and
+    # _get_fmp_api_key (warns, does not raise, when unconfigured -- fine, since we bypass the
+    # network fetcher this pins over entirely).
+    expert = FMPSenateTraderCopy(expert_id)
+    # Hermetic fetch: fixed disclosures, well before the BARS window (2024-01-02..01-08), so
+    # every bar's no-lookahead / age-window checks pass identically across the whole run.
+    expert._fetch_senate_trades = lambda symbol=None: [
+        _senate_trade("Nancy", "Pelosi", "AAPL", "purchase", "2023-12-15", "2023-12-01"),
+    ]
+    expert._fetch_house_trades = lambda symbol=None: [
+        _senate_trade("Josh", "Gottheimer", "MSFT", "purchase", "2023-12-15", "2023-12-01"),
+    ]
+    # Enable automated opening + buy (interface defaults are False/True; the RM gates on
+    # these) -- same settings the stub basket tests above need to actually fund an order.
+    expert.save_settings(
+        {
+            "allow_automated_trade_opening": (True, "bool"),
+            "enable_buy": (True, "bool"),
+        }
+    )
+    resolver.register_expert(expert_id, expert)
+
+    set_backtest_ohlcv_override(_FakeOHLCV({"AAPL": 100.0, "MSFT": 50.0}))
+
+    config = {
+        "start_date": START,
+        "end_date": END,
+        "enabled_instruments": ["AAPL", "MSFT"],
+        "seed": 42,
+    }
+    # copy_trade_names has NO usable declared default ("" -- nobody to copy, a real per-expert
+    # decision, see daily_backtest_handler.py's _expert_decision_settings docstring) -- must be
+    # supplied explicitly, matching what a real backtest run's payload override would provide.
+    settings = {
+        "copy_trade_names": "Nancy Pelosi, Josh Gottheimer",
+        "max_disclose_date_days": 365,
+        "max_trade_exec_days": 365,
+    }
+    engine = DailyBacktestEngine(
+        account=account,
+        experts=[(expert, expert_id, settings, ruleset_id)],
+        price_source=ps,
+        config=config,
+        indicator_provider=object(),  # notional sizing -> ATR not needed
+    )
+    return engine, account, expert, ctx, ps
+
+
+def test_fmp_senate_trader_copy_produces_recommendations_in_backtest():
+    """Was broken before Task 2/3 (zero recommendations -- Task 1's test above documents the
+    real pre-fix crash: an uncaught AttributeError out of engine.run() after the first
+    symbol). Now: FMPSenateTraderCopy.analyzes_as_basket routes it through
+    _run_basket_expert_bar (one real analyze_as_of call per bar), and ExpertRecommendation
+    rows appear for the symbols with qualifying copy-trades (AAPL via Nancy Pelosi, MSFT via
+    Josh Gottheimer)."""
+    from app.services.backtest.seam_wiring import set_backtest_ohlcv_override
+    from ba2_common.core.db import get_all_instances
+    from ba2_common.core.models import ExpertRecommendation
+
+    engine, account, expert, ctx, ps = _build_real_copy_run()
+    try:
+        engine.run()
+
+        rows = get_all_instances(ExpertRecommendation)
+        assert len(rows) > 0, (
+            "FMPSenateTraderCopy produced zero ExpertRecommendation rows -- the dead "
+            "backtest path Task 1 documented is still dead"
+        )
+        symbols = {r.symbol for r in rows}
+        assert symbols <= {"AAPL", "MSFT"}
+
+        # A funded order actually opened a position -- proves the recommendations flowed all
+        # the way through TradeActionEvaluator + TradeRiskManagement sizing (the full classic
+        # pipeline a basket expert keeps, per Task 2), not merely persisted-then-ignored.
+        positions = account.get_positions()
+        assert len(positions) >= 1
+        assert {p["symbol"] for p in positions} <= {"AAPL", "MSFT"}
+    finally:
+        set_backtest_ohlcv_override(None)
+        ctx.__exit__(None, None, None)
