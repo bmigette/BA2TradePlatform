@@ -622,13 +622,18 @@ class DailyBacktestEngine:
                     # UNLIKE a bypass expert, they still go through the full classic pipeline
                     # (TradeActionEvaluator/TradeConditions ruleset eval, one ExpertRecommendation
                     # row per symbol, TradeRiskManagement sizing) per recommendation item. Run
-                    # only on entry bars (mirrors the classic per-symbol branch below).
+                    # only on entry bars (mirrors the classic per-symbol branch below). NO
+                    # `continue` here (unlike the bypass branch above): a basket expert's
+                    # OPEN_POSITIONS management is NOT folded into its entry pass the way a
+                    # bypass expert's rebalance-IS-the-management is — it must fall through to
+                    # the shared `if manage_ok: self._manage_open_positions(...)` below exactly
+                    # like the classic per-symbol branch does, or exit conditions (Adjust-TP/SL/
+                    # Close/Sell) would never evaluate for a basket expert on ANY bar.
                     if entry_ok:
                         self._run_basket_expert_bar(
                             expert, expert_id, settings, ruleset_id, as_of_dt
                         )
-                    continue
-                if entry_ok:
+                elif entry_ok:
                     # _run_expert_bar now self-sizes + submits equity entries via the temp-list flow
                     # (_size_and_submit_candidates) — only funded orders are persisted + submitted, so
                     # there is no separate _size_and_submit DB pass over qty=0 rows here anymore.

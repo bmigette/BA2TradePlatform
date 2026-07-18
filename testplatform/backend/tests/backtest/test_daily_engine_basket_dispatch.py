@@ -390,3 +390,60 @@ def test_basket_expert_still_uses_classic_rm_and_ruleset(monkeypatch):
         assert all(p["qty"] > 0 for p in positions)
     finally:
         ctx.__exit__(None, None, None)
+
+
+def test_basket_expert_manage_open_positions_runs_when_entry_ok_false(monkeypatch):
+    """Regression guard for the dispatch branch's OPEN_POSITIONS fall-through.
+
+    UNLIKE the BYPASS branch (whose rebalance IS the management, so it legitimately
+    ``continue``s past the shared ``manage_ok`` pass), a basket expert must NOT skip
+    ``_manage_open_positions`` on a bar where only the MANAGE cadence fires (``entry_ok``
+    False, ``manage_ok`` True) -- exactly like the classic per-symbol branch (which has no
+    ``continue`` and always falls through to the shared ``if manage_ok:`` check). An earlier
+    version of the ``analyzes_as_basket`` dispatch branch mirrored the bypass branch's
+    ``continue`` verbatim, which silently skipped OPEN_POSITIONS management (Adjust-TP/SL/
+    Close/Sell) for a basket expert on EVERY bar -- this test is the regression that would have
+    caught it (it did not exist when that bug was introduced, which is exactly why it slipped
+    through the original Task 2 test suite).
+
+    Uses ``run_schedule_override``/``manage_schedule_override`` to decouple the two cadences:
+    entry fires ONLY on the first bar (Tuesday 2024-01-02), management fires every day.
+    """
+    from app.services.backtest.daily_engine import DailyBacktestEngine
+
+    engine, account, expert, ctx, ps = _build_basket_run(account_id=55, expert_id=55)
+    try:
+        # Entry cadence: Tuesday only -> entry_ok True on bar 1 (2024-01-02), False on every
+        # later bar (Wed/Thu/Fri/Mon). Manage cadence: every day -> manage_ok True on ALL bars,
+        # INCLUDING the later entry_ok=False bars this test targets.
+        engine.config["run_schedule_override"] = {
+            "days": {"monday": False, "tuesday": True, "wednesday": False, "thursday": False,
+                     "friday": False, "saturday": False, "sunday": False},
+        }
+        engine.config["manage_schedule_override"] = {
+            "days": {"monday": True, "tuesday": True, "wednesday": True, "thursday": True,
+                     "friday": True, "saturday": True, "sunday": True},
+        }
+
+        manage_calls: list = []
+        orig_manage = DailyBacktestEngine._manage_open_positions
+
+        def _spy_manage(self, expert_arg, expert_id_arg, settings_arg, as_of_arg):
+            manage_calls.append(as_of_arg)
+            return orig_manage(self, expert_arg, expert_id_arg, settings_arg, as_of_arg)
+
+        monkeypatch.setattr(
+            DailyBacktestEngine, "_manage_open_positions", _spy_manage, raising=True
+        )
+
+        engine.run()
+
+        # The entry pass (analyze_as_of) fires ONLY on the Tuesday bar.
+        assert expert.call_count == 1
+
+        # _manage_open_positions fires on EVERY bar (the manage cadence is unrestricted),
+        # INCLUDING the later bars where entry_ok is False -- proving the basket branch falls
+        # through to the shared manage_ok pass instead of `continue`-ing past it.
+        assert len(manage_calls) == len(BARS)
+    finally:
+        ctx.__exit__(None, None, None)
