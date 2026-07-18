@@ -583,11 +583,11 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         max_disclose_days = int(self._setting_or_default(gather_settings, "max_disclose_date_days"))
         max_exec_days = int(self._setting_or_default(gather_settings, "max_trade_exec_days"))
 
-        # Steps 1-2: unscoped fetch + date-window filter (bisect, mirrors _window_trades).
+        # Steps 1-2: unscoped fetch + date-window filter. _all_trades_index_cached() produces
+        # the SAME {"rows", "disclose_dates"} shape the per-symbol _window_trades already
+        # bisects over, so reuse it directly instead of re-deriving the same bisect+filter here.
         index = self._all_trades_index_cached()
-        lo = bisect.bisect_left(index["disclose_dates"], ceiling - timedelta(days=max_disclose_days))
-        exec_floor = ceiling - timedelta(days=max_exec_days)
-        windowed = [t for _d, e, t in index["rows"][lo:] if e >= exec_floor]
+        windowed = self._window_trades(index, ceiling, max_disclose_days, max_exec_days)
 
         # Step 3: NEW tradability filter.
         tradable = [t for t in windowed
