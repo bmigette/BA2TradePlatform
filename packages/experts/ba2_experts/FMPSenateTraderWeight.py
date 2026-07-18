@@ -359,14 +359,17 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
     def _window_trades(self, index: Dict[str, Any], now: datetime,
                        max_disclose_days: int, max_exec_days: int) -> List[Dict[str, Any]]:
         """Trades that can possibly survive _filter_trades' two date-window checks under
-        THIS trial's settings: disclose_date >= now - max_disclose_days AND exec_date >=
-        now - max_exec_days. Deliberately NO upper <= now bound on either date —
-        _filter_trades has none (it only rejects too-OLD rows via ``days_since > max``),
-        and this pre-filter must stay a faithful superset, not a behavior change.
-        O(log n) bisect on the disclosure-sorted view + a scan of the small tail."""
+        THIS trial's settings: now - max_disclose_days <= disclose_date <= now AND
+        now - max_exec_days <= exec_date <= now. The upper <= now bound on both dates
+        mirrors _filter_trades' lookahead-bias fix (2026-07-18): a trade disclosed or
+        executed AFTER the backtest's simulated 'now' cannot possibly be known yet, so
+        this pre-filter must reject it too to stay a faithful superset of _filter_trades.
+        O(log n) bisect on the disclosure-sorted view (both bounds) + a scan of the
+        small tail for the exec-date bounds."""
         lo = bisect.bisect_left(index["disclose_dates"], now - timedelta(days=int(max_disclose_days)))
+        hi = bisect.bisect_right(index["disclose_dates"], now)
         exec_floor = now - timedelta(days=int(max_exec_days))
-        return [t for _d, e, t in index["rows"][lo:] if e >= exec_floor]
+        return [t for _d, e, t in index["rows"][lo:hi] if exec_floor <= e <= now]
 
     def _sliced_history_for_day(self, name: str, ceiling: datetime,
                                 day_memo: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
@@ -1452,15 +1455,19 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                 if trade_symbol != symbol.upper():
                     #logger.debug(f"Trade symbol {trade_symbol} doesn't match requested symbol {symbol}, filtering out")
                     continue
-                # Check disclose date
+                # Check disclose date. Reject too-OLD rows (days_since > max) AND
+                # future-dated rows (days_since < 0, i.e. disclose_date > now) -- a
+                # disclosure dated after the backtest's simulated 'now' cannot possibly
+                # be known yet (lookahead-bias fix, 2026-07-18).
                 days_since_disclose = (now - disclose_date).days
-                if days_since_disclose > max_disclose_days:
+                if days_since_disclose > max_disclose_days or days_since_disclose < 0:
                     #logger.debug(f"Trade disclosed {days_since_disclose} days ago (max: {max_disclose_days}), filtering out")
                     continue
-                
-                # Check execution date
+
+                # Check execution date. Same lower bound as disclose date: an
+                # execution dated after 'now' is future information.
                 days_since_exec = (now - exec_date).days
-                if days_since_exec > max_exec_days:
+                if days_since_exec > max_exec_days or days_since_exec < 0:
                     #logger.debug(f"Trade executed {days_since_exec} days ago (max: {max_exec_days}), filtering out")
                     continue
 

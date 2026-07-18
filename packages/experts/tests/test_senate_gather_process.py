@@ -254,8 +254,12 @@ def test_gather_window_prefilter_is_behavior_preserving():
     """2026-07-18 perf pass: _gather pre-filters the symbol's trades to the trial's
     disclosure/exec windows before Stages 1-4. Out-of-window trades (and their traders)
     were ALWAYS discarded later by _filter_trades / never consumed by
-    _calculate_recommendation — so adding ancient trades from other traders must change
-    NOTHING about the recommendation, and the per-trader maps must not carry them."""
+    _calculate_recommendation — so adding ancient OR future-dated trades from other
+    traders must change NOTHING about the recommendation, and the per-trader maps must
+    not carry them. The future-dated trades here are the lookahead-bias regression guard
+    (2026-07-18 fix): _window_trades must reject disclose_date/exec_date > now exactly
+    like _filter_trades does, so it stays a faithful superset rather than admitting rows
+    _filter_trades would (now correctly) reject."""
     recent = [
         _weight_trade("Alice", "Aa", "AAPL", "purchase", "2026-06-01", "2026-05-20"),
         _weight_trade("Bob", "Bb", "AAPL", "purchase", "2026-06-02", "2026-05-21"),
@@ -264,27 +268,36 @@ def test_gather_window_prefilter_is_behavior_preserving():
         _weight_trade("Old", "Timer", "AAPL", "purchase", "2023-01-05", "2023-01-01"),
         _weight_trade("Stale", "Seller", "AAPL", "sale", "2022-06-05", "2022-06-01"),
     ]
+    future = [
+        # Disclosed/executed AFTER NOW (2026-06-13) -- must be excluded, not treated as
+        # fresh/current information.
+        _weight_trade("Future", "Filer", "AAPL", "purchase", "2026-09-05", "2026-09-01"),
+    ]
     history = {
         "Alice Aa": [_weight_trade("Alice", "Aa", "AAPL", "purchase", "2026-05-01", "2026-04-20")],
         "Bob Bb": [_weight_trade("Bob", "Bb", "AAPL", "purchase", "2026-05-02", "2026-04-21")],
         "Old Timer": [_weight_trade("Old", "Timer", "AAPL", "purchase", "2022-05-01", "2022-04-20")],
         "Stale Seller": [_weight_trade("Stale", "Seller", "AAPL", "sale", "2022-05-02", "2022-04-21")],
+        "Future Filer": [_weight_trade("Future", "Filer", "AAPL", "purchase", "2026-05-01", "2026-04-20")],
     }
     settings = {**WEIGHT_SETTINGS, "max_disclose_date_days": 60, "max_trade_exec_days": 90}
 
     rec_without = _run(_weight_expert("AAPL", recent, history), settings)
-    e = _weight_expert("AAPL", recent + ancient, history)
+    e = _weight_expert("AAPL", recent + ancient + future, history)
     rec_with = _run(e, settings)
 
     assert rec_with.signal == rec_without.signal
     assert rec_with.confidence == rec_without.confidence
     assert rec_with.expected_profit_percent == rec_without.expected_profit_percent
 
-    e2 = _weight_expert("AAPL", recent + ancient, history)
+    e2 = _weight_expert("AAPL", recent + ancient + future, history)
     e2._gather_settings = settings
     bundle = e2._gather(_bundle({"AAPL": 100.0}), as_of=NOW)
     assert set(bundle["trader_history_by_name"].keys()) == {"Alice Aa", "Bob Bb"}
     assert set(bundle["trader_skill_by_name"].keys()) == {"Alice Aa", "Bob Bb"}
+    assert "Future Filer" not in bundle["trader_history_by_name"], (
+        "lookahead leak: a trade disclosed/executed after 'now' must not surface its "
+        "trader in the gather bundle")
 
 
 def test_gather_day_memo_shares_history_slices_across_symbols():
@@ -1361,3 +1374,130 @@ def test_weight_declares_analyzes_as_basket():
     analyzes_as_basket = True (mirroring Task 3's FMPSenateTraderCopy marker) so
     daily_engine.py routes it through _run_basket_expert_bar."""
     assert FMPSenateTraderWeight.analyzes_as_basket is True
+
+
+# ====================================================================
+# Lookahead-bias fix (2026-07-18): reject future-disclosed / future-executed trades.
+#
+# _filter_trades (both experts) and _window_trades (Weight's pre-filter) only ever
+# bounded trade age from BELOW: `days_since_X > max_X_days` rejects too-OLD rows, but a
+# trade whose disclosureDate/transactionDate is AFTER `now` produces a NEGATIVE
+# days_since_X, which trivially satisfies "not > max_X_days" -- so it was kept as if it
+# were fresh, current information. That is textbook lookahead bias: at simulated time
+# `now`, a trade disclosed/executed in the future could not possibly be known yet.
+# Confirmed exploitable on real cached data: as of this fix, 63 of AAPL's 100 cached
+# congress_senate_trades rows have disclosureDate > 2023-06-01, i.e. a backtest scored
+# "as of 2023-06-01" would have seen the majority of AAPL's entire disclosed-trade
+# history (including trades disclosed months/years later) as current information.
+# ====================================================================
+
+def test_weight_filter_trades_rejects_future_disclosed_trade():
+    """A trade disclosed AFTER `now` must never be kept, however generous
+    max_disclose_days is -- disclose_date > now makes days_since_disclose negative,
+    which the buggy code treated as trivially 'not too old'."""
+    e = _weight_expert("AAPL", [], {})
+    future = _weight_trade("Future", "Filer", "AAPL", "purchase", "2026-06-20", "2026-06-01")
+    filtered = e._filter_trades(
+        [future], max_disclose_days=365, max_exec_days=365, max_price_delta_pct=1000.0,
+        current_price=100.0, symbol="AAPL", now=NOW,
+        exec_price_by_trade={e._trade_key(future): 50.0})
+    assert filtered == [], "trade disclosed after 'now' must be rejected (lookahead bias)"
+
+
+def test_weight_filter_trades_rejects_future_executed_trade():
+    """A trade EXECUTED after `now` (even if disclosed on time) must never be kept."""
+    e = _weight_expert("AAPL", [], {})
+    future = _weight_trade("Future", "Execer", "AAPL", "purchase", "2026-06-01", "2026-06-20")
+    filtered = e._filter_trades(
+        [future], max_disclose_days=365, max_exec_days=365, max_price_delta_pct=1000.0,
+        current_price=100.0, symbol="AAPL", now=NOW,
+        exec_price_by_trade={e._trade_key(future): 50.0})
+    assert filtered == [], "trade executed after 'now' must be rejected (lookahead bias)"
+
+
+def test_weight_filter_trades_keeps_same_day_disclosure_and_exec():
+    """Boundary check: disclosure/exec dated EXACTLY 'now' (days_since == 0) must still be
+    kept -- only STRICTLY future dates are lookahead."""
+    e = _weight_expert("AAPL", [], {})
+    same_day = _weight_trade("Same", "Day", "AAPL", "purchase", "2026-06-13", "2026-06-13")
+    filtered = e._filter_trades(
+        [same_day], max_disclose_days=365, max_exec_days=365, max_price_delta_pct=1000.0,
+        current_price=100.0, symbol="AAPL", now=NOW,
+        exec_price_by_trade={e._trade_key(same_day): 50.0})
+    assert len(filtered) == 1, "same-day (as of 'now') disclosure/exec must not be rejected"
+
+
+def test_weight_window_trades_rejects_future_disclosed_trade():
+    """_window_trades is a pre-filter that must stay a faithful superset of _filter_trades:
+    once _filter_trades rejects future-disclosed trades, the pre-filter must too, or it
+    silently keeps rows _filter_trades will reject downstream anyway (still correct in
+    isolation, but breaks the documented superset invariant and wastes work)."""
+    future = _weight_trade("Future", "Filer", "AAPL", "purchase", "2026-06-20", "2026-06-01")
+    e = _weight_expert("AAPL", [future], {})
+    index = e._symbol_trades_index_cached("AAPL")
+    windowed = e._window_trades(index, NOW, max_disclose_days=365, max_exec_days=365)
+    assert windowed == [], "future-disclosed trade must not survive the window pre-filter"
+
+
+def test_weight_window_trades_rejects_future_executed_trade():
+    future = _weight_trade("Future", "Execer", "AAPL", "purchase", "2026-06-01", "2026-06-20")
+    e = _weight_expert("AAPL", [future], {})
+    index = e._symbol_trades_index_cached("AAPL")
+    windowed = e._window_trades(index, NOW, max_disclose_days=365, max_exec_days=365)
+    assert windowed == [], "future-executed trade must not survive the window pre-filter"
+
+
+def test_weight_window_trades_keeps_same_day_disclosure_and_exec():
+    same_day = _weight_trade("Same", "Day", "AAPL", "purchase", "2026-06-13", "2026-06-13")
+    e = _weight_expert("AAPL", [same_day], {})
+    index = e._symbol_trades_index_cached("AAPL")
+    windowed = e._window_trades(index, NOW, max_disclose_days=365, max_exec_days=365)
+    assert len(windowed) == 1, "same-day (as of 'now') disclosure/exec must survive the pre-filter"
+
+
+def test_copy_filter_trades_rejects_future_disclosed_trade():
+    """FMPSenateTraderCopy._filter_trades has the identical lookahead bug."""
+    e = _copy_expert([], [])
+    future = _copy_trade("Nancy", "Pelosi", "AAPL", "purchase", "2026-06-20", "2026-06-01")
+    filtered = e._filter_trades([future], ["nancy pelosi"], max_disclose_days=365,
+                                max_exec_days=365, now=NOW)
+    assert filtered == [], "trade disclosed after 'now' must be rejected (lookahead bias)"
+
+
+def test_copy_filter_trades_rejects_future_executed_trade():
+    e = _copy_expert([], [])
+    future = _copy_trade("Nancy", "Pelosi", "AAPL", "purchase", "2026-06-01", "2026-06-20")
+    filtered = e._filter_trades([future], ["nancy pelosi"], max_disclose_days=365,
+                                max_exec_days=365, now=NOW)
+    assert filtered == [], "trade executed after 'now' must be rejected (lookahead bias)"
+
+
+def test_copy_filter_trades_keeps_same_day_disclosure_and_exec():
+    e = _copy_expert([], [])
+    same_day = _copy_trade("Nancy", "Pelosi", "AAPL", "purchase", "2026-06-13", "2026-06-13")
+    filtered = e._filter_trades([same_day], ["nancy pelosi"], max_disclose_days=365,
+                                max_exec_days=365, now=NOW)
+    assert len(filtered) == 1
+
+
+def test_copy_filter_trades_by_age_multi_rejects_future_disclosed_trade():
+    """FMPSenateTraderCopy._filter_trades_by_age_multi (basket-mode variant) has the
+    identical lookahead bug."""
+    e = _copy_expert([], [])
+    future = _copy_trade("Nancy", "Pelosi", "AAPL", "purchase", "2026-06-20", "2026-06-01")
+    filtered = e._filter_trades_by_age_multi([future], max_disclose_days=365, max_exec_days=365, now=NOW)
+    assert filtered == [], "trade disclosed after 'now' must be rejected (lookahead bias)"
+
+
+def test_copy_filter_trades_by_age_multi_rejects_future_executed_trade():
+    e = _copy_expert([], [])
+    future = _copy_trade("Nancy", "Pelosi", "AAPL", "purchase", "2026-06-01", "2026-06-20")
+    filtered = e._filter_trades_by_age_multi([future], max_disclose_days=365, max_exec_days=365, now=NOW)
+    assert filtered == [], "trade executed after 'now' must be rejected (lookahead bias)"
+
+
+def test_copy_filter_trades_by_age_multi_keeps_same_day_disclosure_and_exec():
+    e = _copy_expert([], [])
+    same_day = _copy_trade("Nancy", "Pelosi", "AAPL", "purchase", "2026-06-13", "2026-06-13")
+    filtered = e._filter_trades_by_age_multi([same_day], max_disclose_days=365, max_exec_days=365, now=NOW)
+    assert len(filtered) == 1

@@ -292,16 +292,20 @@ class FMPSenateTraderCopy(AnalysisStatusRenderMixin, FMPCongressTradingMixin, Ma
                 disclose_date = datetime.strptime(disclose_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
                 exec_date = datetime.strptime(exec_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
 
-                # Check disclose date
+                # Check disclose date. Reject too-OLD rows (days_since > max) AND
+                # future-dated rows (days_since < 0, i.e. disclose_date > now) -- a
+                # disclosure dated after the backtest's simulated 'now' cannot possibly
+                # be known yet (lookahead-bias fix, 2026-07-18).
                 days_since_disclose = (now - disclose_date).days
-                if days_since_disclose > max_disclose_days:
+                if days_since_disclose > max_disclose_days or days_since_disclose < 0:
                     continue
-                
-                # Check execution date
+
+                # Check execution date. Same lower bound as disclose date: an
+                # execution dated after 'now' is future information.
                 days_since_exec = (now - exec_date).days
-                if days_since_exec > max_exec_days:
+                if days_since_exec > max_exec_days or days_since_exec < 0:
                     continue
-                
+
                 # Trade passed all filters
                 filtered_trades.append(trade)
                 
@@ -350,16 +354,20 @@ class FMPSenateTraderCopy(AnalysisStatusRenderMixin, FMPCongressTradingMixin, Ma
                 disclose_date = datetime.strptime(disclose_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
                 exec_date = datetime.strptime(exec_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
 
-                # Check disclose date
+                # Check disclose date. Reject too-OLD rows (days_since > max) AND
+                # future-dated rows (days_since < 0, i.e. disclose_date > now) -- a
+                # disclosure dated after the backtest's simulated 'now' cannot possibly
+                # be known yet (lookahead-bias fix, 2026-07-18).
                 days_since_disclose = (now - disclose_date).days
-                if days_since_disclose > max_disclose_days:
+                if days_since_disclose > max_disclose_days or days_since_disclose < 0:
                     continue
-                
-                # Check execution date
+
+                # Check execution date. Same lower bound as disclose date: an
+                # execution dated after 'now' is future information.
                 days_since_exec = (now - exec_date).days
-                if days_since_exec > max_exec_days:
+                if days_since_exec > max_exec_days or days_since_exec < 0:
                     continue
-                
+
                 # Add calculated fields to trade
                 trade['days_since_disclose'] = days_since_disclose
                 trade['days_since_exec'] = days_since_exec
