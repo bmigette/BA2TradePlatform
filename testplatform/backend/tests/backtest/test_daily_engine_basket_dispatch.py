@@ -193,3 +193,200 @@ def test_list_returning_expert_crashes_the_backtest_run_today():
         assert get_all_instances(ExpertRecommendation) == []
     finally:
         ctx.__exit__(None, None, None)
+
+
+# ---------------------------------------------------------------------------
+# Task 2: the analyzes_as_basket dispatch mode (fixes the crash Task 1 documented above).
+# ---------------------------------------------------------------------------
+class _StubBasketExpert(MarketExpertInterface):
+    """Basket expert: ONE analyze_as_of call per bar returns recommendations for
+    MULTIPLE symbols. Each Recommendation carries its own symbol in raw_outputs['symbol']
+    (the engine has no per-symbol loop to infer it from anymore)."""
+
+    analyzes_as_basket = True
+
+    def __init__(self, id: int):
+        super().__init__(id)
+        self.call_count = 0
+
+    @classmethod
+    def description(cls) -> str:  # abstract
+        return "Stub basket expert (one call, many symbols)."
+
+    def render_market_analysis(self, market_analysis) -> str:  # abstract
+        return ""
+
+    def run_analysis(self, symbol: str, market_analysis) -> None:  # abstract
+        return None
+
+    def analyze_as_of(self, as_of, context):
+        self.call_count += 1
+        return [
+            Recommendation(
+                signal=OrderRecommendation.BUY, confidence=80.0, current_price=100.0,
+                details="stub basket rec", raw_outputs={"symbol": "AAPL"},
+            ),
+            Recommendation(
+                signal=OrderRecommendation.BUY, confidence=60.0, current_price=50.0,
+                details="stub basket rec", raw_outputs={"symbol": "MSFT"},
+            ),
+        ]
+
+
+def _build_basket_run(account_id=53, expert_id=53):
+    """Wire a backtest fixture for the stub BASKET expert (``analyzes_as_basket = True``).
+
+    Mirrors ``_build_run`` above (the pre-fix, unmarked list-returning stub) and
+    ``test_daily_engine_unit.py``'s ``_build_run``, but registers ``_StubBasketExpert`` and
+    enables the settings the classic RM / live-parity gates need to actually fund an order
+    (``allow_automated_trade_opening`` / ``enable_buy`` — interface defaults are False/True and
+    the RM gates on them). Returns (engine, account, expert, db_ctx, price_source). Caller MUST
+    close db_ctx.
+    """
+    from app.services.backtest.backtest_account import BacktestAccount
+    from app.services.backtest.backtest_db import (
+        backtest_trading_db,
+        seed_account_definition,
+        seed_expert_instance,
+    )
+    from app.services.backtest.daily_engine import DailyBacktestEngine
+    from app.services.backtest.default_rulesets import seed_enter_long_ruleset
+    from app.services.backtest.price_source import AsOfPriceSource
+    from app.services.backtest.seam_wiring import wire_backtest_seams
+
+    cfg = {
+        "starting_cash": 100_000.0,
+        "commission_per_trade": 0.0,
+        "slippage_bps": 0.0,
+        "fill_model": "next_bar_open",
+    }
+
+    resolver = wire_backtest_seams()
+    ctx = backtest_trading_db(f"engine-basket-dispatch-real-{account_id}")
+    ctx.__enter__()
+
+    seed_account_definition(account_id, cfg)
+    ruleset_id = seed_enter_long_ruleset(name="backtest-basket-dispatch-real")
+    seed_expert_instance(
+        account_id=account_id,
+        expert_class_name="_StubBasketExpert",
+        enter_market_ruleset_id=ruleset_id,
+        instance_id=expert_id,
+    )
+
+    ps = AsOfPriceSource(ohlcv_provider=None)
+    ps.load_bars("AAPL", _bar_rows(BARS))
+    ps.load_bars("MSFT", _bar_rows(BARS))
+
+    account = BacktestAccount(account_id, ps, cfg)
+    resolver.register_account(account_id, account)
+
+    expert = _StubBasketExpert(expert_id)
+    # Enable automated opening + buy (interface defaults are False/True; RM gates on these) --
+    # same settings test_daily_engine_unit.py's classic-path stub needs to actually fund an order.
+    expert.save_settings(
+        {
+            "allow_automated_trade_opening": (True, "bool"),
+            "enable_buy": (True, "bool"),
+        }
+    )
+    resolver.register_expert(expert_id, expert)
+
+    config = {
+        "start_date": START,
+        "end_date": END,
+        "enabled_instruments": ["AAPL", "MSFT"],
+        "seed": 42,
+    }
+    engine = DailyBacktestEngine(
+        account=account,
+        experts=[(expert, expert_id, {}, ruleset_id)],
+        price_source=ps,
+        config=config,
+        indicator_provider=object(),  # notional sizing -> ATR not needed
+    )
+    return engine, account, expert, ctx, ps
+
+
+def test_basket_expert_analyzed_once_per_bar_not_per_symbol():
+    """A basket expert's ``analyze_as_of`` is called ONCE per bar (not once per universe
+    symbol), and each item in the returned list persists its OWN ``ExpertRecommendation`` row
+    keyed by the symbol in ``raw_outputs['symbol']`` -- proving the new ``analyzes_as_basket``
+    dispatch path (Task 2) actually replaces the per-symbol loop for this expert, rather than
+    merely tolerating a list return (which is what Task 1 showed crashes today)."""
+    from ba2_common.core.db import get_all_instances
+    from ba2_common.core.models import ExpertRecommendation
+
+    engine, account, expert, ctx, ps = _build_basket_run()
+    try:
+        engine.run()
+
+        # ONE analyze_as_of call per bar -- NOT len(universe) times per bar (this stub has no
+        # execution_schedule_enter_market setting, so every bar is an entry bar -- see
+        # test_daily_engine_unit.py's equivalent "clock advanced once per bar" assertion).
+        assert expert.call_count == len(BARS)
+
+        rows = get_all_instances(ExpertRecommendation)
+        # TWO rows per analysed bar (one per basket item), for every bar.
+        assert len(rows) == 2 * len(BARS)
+
+        by_bar: dict = {}
+        for row in rows:
+            by_bar.setdefault(row.created_at, []).append(row)
+        assert len(by_bar) == len(BARS)
+        for bar_rows in by_bar.values():
+            assert len(bar_rows) == 2
+            assert {r.symbol for r in bar_rows} == {"AAPL", "MSFT"}
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_basket_expert_still_uses_classic_rm_and_ruleset(monkeypatch):
+    """Unlike the BYPASS path (``bypasses_classic_rm``, e.g. FactorRanker), a basket expert
+    KEEPS the full classic pipeline: ``TradeActionEvaluator`` evaluates the enter ruleset per
+    symbol, and ``TradeRiskManagement`` sizes the resulting equity candidates -- a funded
+    ``TradingOrder`` appears via the classic per-instrument-cap sizing logic, not a
+    target-weight rebalance (contrast with test_daily_engine_bypass.py's
+    ``test_bypass_expert_rebalances_and_rm_not_invoked``, which asserts the OPPOSITE: TAE/RM
+    NEVER invoked for a bypass expert)."""
+    import ba2_common.core.TradeActionEvaluator as TAE_mod
+    import ba2_common.core.TradeRiskManagement as RM_mod
+
+    engine, account, expert, ctx, ps = _build_basket_run(account_id=54, expert_id=54)
+    try:
+        tae_calls: list = []
+        orig_tae_init = TAE_mod.TradeActionEvaluator.__init__
+
+        def _spy_tae_init(self, *a, **kw):
+            tae_calls.append((a, kw))
+            return orig_tae_init(self, *a, **kw)
+
+        monkeypatch.setattr(TAE_mod.TradeActionEvaluator, "__init__", _spy_tae_init, raising=True)
+
+        rm_calls: list = []
+        orig_size = RM_mod.TradeRiskManagement.size_candidate_orders
+
+        def _spy_size(self, *a, **kw):
+            rm_calls.append((a, kw))
+            return orig_size(self, *a, **kw)
+
+        monkeypatch.setattr(
+            RM_mod.TradeRiskManagement, "size_candidate_orders", _spy_size, raising=True
+        )
+
+        engine.run()
+
+        # TradeActionEvaluator WAS constructed (unlike the bypass path, which never touches it).
+        assert len(tae_calls) >= 1
+        # TradeRiskManagement candidate sizing WAS invoked (unlike the bypass path, which routes
+        # straight to a FactorPortfolioManager rebalance and never sizes via the classic RM).
+        assert len(rm_calls) >= 1
+
+        # A funded order actually opened a position -- classic per-instrument-cap sizing, not a
+        # target-weight rebalance (no `raw_outputs["targets"]` key involved anywhere here).
+        positions = account.get_positions()
+        assert len(positions) >= 1
+        assert {p["symbol"] for p in positions} <= {"AAPL", "MSFT"}
+        assert all(p["qty"] > 0 for p in positions)
+    finally:
+        ctx.__exit__(None, None, None)

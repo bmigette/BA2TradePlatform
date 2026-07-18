@@ -615,6 +615,19 @@ class DailyBacktestEngine:
                     if entry_ok:
                         self._run_bypass_expert_bar(expert, expert_id, settings, as_of_dt)
                     continue
+                if getattr(expert, "analyzes_as_basket", False):
+                    # Basket experts (e.g. FMPSenateTraderWeight/FMPSenateTraderCopy) call
+                    # analyze_as_of ONCE per bar for the whole universe, returning
+                    # List[Recommendation] instead of one Recommendation per symbol — but,
+                    # UNLIKE a bypass expert, they still go through the full classic pipeline
+                    # (TradeActionEvaluator/TradeConditions ruleset eval, one ExpertRecommendation
+                    # row per symbol, TradeRiskManagement sizing) per recommendation item. Run
+                    # only on entry bars (mirrors the classic per-symbol branch below).
+                    if entry_ok:
+                        self._run_basket_expert_bar(
+                            expert, expert_id, settings, ruleset_id, as_of_dt
+                        )
+                    continue
                 if entry_ok:
                     # _run_expert_bar now self-sizes + submits equity entries via the temp-list flow
                     # (_size_and_submit_candidates) — only funded orders are persisted + submitted, so
@@ -822,88 +835,244 @@ class DailyBacktestEngine:
                 self._log(f"analyze_as_of failed for {symbol} @ {as_of:%Y-%m-%d}: {e}")
                 continue
 
-            rec_id = _recommendation_to_expert_recommendation(
-                rec, expert_instance_id=expert_id, symbol=symbol, as_of=as_of,
-                subtype=AnalysisUseCase.ENTER_MARKET,
-            )
-            if rec_id is None:
-                continue  # SKIP / HOLD / ERROR — nothing to stage.
-
-            # Re-read the persisted row so the evaluator/actions see a DB-attached object
-            # carrying its id (BuyAction links the order to expert_recommendation.id).
-            from ba2_common.core.db import get_instance as _get_instance
-
-            recommendation = _get_instance(ExpertRecommendation, rec_id)
-            if recommendation is None:
-                continue
-
-            try:
-                evaluator = TradeActionEvaluator(
-                    account=self.account,
-                    instrument_name=symbol,
-                    existing_transactions=None,
-                )
-                action_summaries = evaluator.evaluate(
-                    instrument_name=symbol,
-                    expert_recommendation=recommendation,
-                    ruleset_id=ruleset_id,
-                    existing_order=None,
-                )
-                if not action_summaries or any("error" in s for s in action_summaries):
-                    continue  # conditions not met / evaluation error -> no order this symbol.
-
-                # LIVE-PARITY DUP-POSITION GATE (mirrors TradeManager.process_expert_recommendations_
-                # after_analysis:1130-1144): after the enter ruleset passes but BEFORE executing,
-                # skip if an OPENED/WAITING transaction already exists for this (expert, symbol).
-                # The ruleset's has_no_position flag only counts OPENED, so a not-yet-filled WAITING
-                # entry from a prior bar could otherwise stack a duplicate the live engine blocks.
-                # (No-op for standard strategies whose entries fill before the next analysis bar.)
-                if self._has_open_or_waiting_position(expert_id, symbol):
-                    self._log(f"entry dup-gate: {symbol} already OPENED/WAITING for expert "
-                              f"{expert_id} @ {as_of:%Y-%m-%d} — skip")
-                    continue
-
-                # LIVE-PARITY EQUITY GATE (mirrors TradeManager.process_expert_recommendations_
-                # after_analysis:1146-1155): before staging an entry, skip if the expert lacks
-                # sufficient available equity (available_balance >= minimum_equity_threshold_percent
-                # of virtual balance, default 5%). Calls the SAME shared
-                # MarketExpertInterface.has_sufficient_equity_for_trading the live path uses — no
-                # re-implementation. Note: BacktestAccount.get_balance() is cash (not NLV), which is
-                # the same balance BT sizing already uses (TradeRiskManagement), so the gate stays
-                # consistent with BT sizing. Stub experts without the method are treated as allowed.
-                equity_check = getattr(expert, "has_sufficient_equity_for_trading", None)
-                if callable(equity_check):
-                    try:
-                        ok_equity, equity_reason = equity_check()
-                    except Exception as e:  # noqa: BLE001 — a wiring gap must not silently over-block
-                        self._log(f"equity-gate check errored for {symbol} @ {as_of:%Y-%m-%d} "
-                                  f"(treating as allowed): {e}")
-                        ok_equity = True
-                    if not ok_equity:
-                        self._log(f"entry equity-gate: {symbol} skipped for expert {expert_id} "
-                                  f"@ {as_of:%Y-%m-%d} — {equity_reason}")
-                        continue
-
-                if self._entry_is_option:
-                    # OPTION entry: the option action sizes + submits ITSELF in execute (no equity
-                    # leg, no RM candidate sizing) — submit directly, like the open-positions path.
-                    results = evaluator.execute(submit_to_broker=True)
-                    if any(r.get("success") and (r.get("data") or {}).get("order_id") for r in results):
-                        created_any = True
-                    continue
-
-                # EQUITY entry: stage a TRANSIENT candidate (NOT persisted) for the temp-list RM
-                # pass via the shared trade_cycle builder (same shape live uses).
-                from ba2_common.core.trade_cycle import build_entry_candidate
-                candidate = build_entry_candidate(recommendation, self.account.id)
-                equity_candidates.append((candidate, evaluator, symbol, recommendation))
-            except Exception as e:  # noqa: BLE001
-                self._log(f"ruleset eval/execute failed for {symbol} @ {as_of:%Y-%m-%d}: {e}")
-                continue
+            if self._stage_recommendation_candidate(
+                rec, expert=expert, expert_id=expert_id, symbol=symbol,
+                ruleset_id=ruleset_id, as_of=as_of, equity_candidates=equity_candidates,
+            ):
+                created_any = True
 
         # Temp-list RM sizing for the bar's equity candidates: size ALL in one in-memory pass, then
         # persist + submit ONLY the funded (qty>0). Unfunded candidates are never written to the DB
         # (no qty=0 churn, no delete) — the requested order-flow redesign.
+        if equity_candidates:
+            created_any = self._size_and_submit_candidates(
+                expert_id, equity_candidates, as_of) or created_any
+
+        return created_any
+
+    def _stage_recommendation_candidate(
+        self,
+        rec: Any,
+        *,
+        expert: Any,
+        expert_id: int,
+        symbol: str,
+        ruleset_id: int,
+        as_of: datetime,
+        equity_candidates: List[Any],
+    ) -> bool:
+        """Persist ONE ``Recommendation`` for ``symbol`` and run it through the ruleset/RM gates.
+
+        Extracted from ``_run_expert_bar``'s per-symbol loop body (everything from
+        ``_recommendation_to_expert_recommendation`` through the ``equity_candidates.append``
+        call) so both the classic per-symbol loop (``_run_expert_bar``) and the basket
+        per-list-item loop (``_run_basket_expert_bar``) share the EXACT SAME downstream
+        machinery: persist the ``ExpertRecommendation`` row, re-read it DB-attached, evaluate
+        the enter ruleset via ``TradeActionEvaluator``, apply the live-parity dup-position and
+        equity gates, then either execute an OPTION entry directly or append an EQUITY entry
+        candidate to ``equity_candidates`` for the caller's batched RM sizing pass.
+
+        For an OPTION entry this returns True iff an order was actually submitted (mirroring
+        ``_run_expert_bar``'s ``created_any`` bump); for an EQUITY entry it always returns False
+        (the candidate is appended, not submitted — ``created_any`` for THAT case is driven by
+        the caller's own ``_size_and_submit_candidates`` call after the whole loop finishes).
+
+        BEHAVIOR-PRESERVING EXTRACTION: this is a verbatim lift of ``_run_expert_bar``'s old
+        per-symbol loop body, INCLUDING its exception-handling shape — ``_recommendation_to_
+        expert_recommendation``/``get_instance`` remain UNGUARDED here (any exception there
+        propagates to the caller), and only the ``TradeActionEvaluator``-onward section keeps
+        its own try/except (logged + skipped). ``_run_expert_bar`` calls this helper exactly as
+        it inlined this code before (no new try/except at its call site either) — so the classic
+        per-symbol path's behavior for a malformed ``rec`` (e.g. a list fed to a non-basket
+        expert, the exact shape Task 1 of the senate-basket-dispatch plan documented) is
+        UNCHANGED: it still propagates out of ``_run_expert_bar``/``engine.run()`` uncaught.
+        ``_run_basket_expert_bar``'s per-list-item loop is the one that adds a wrapping
+        try/except AROUND ITS CALL to this helper (see that method) — because a basket expert
+        feeds this helper once per LIST ITEM instead of once per trusted per-symbol
+        ``analyze_as_of`` call, and a single malformed item must not crash the whole bar there.
+        """
+        from ba2_common.core.TradeActionEvaluator import TradeActionEvaluator
+        from ba2_common.core.db import get_instance as _get_instance
+
+        rec_id = _recommendation_to_expert_recommendation(
+            rec, expert_instance_id=expert_id, symbol=symbol, as_of=as_of,
+            subtype=AnalysisUseCase.ENTER_MARKET,
+        )
+        if rec_id is None:
+            return False  # SKIP / HOLD / ERROR — nothing to stage.
+
+        # Re-read the persisted row so the evaluator/actions see a DB-attached object
+        # carrying its id (BuyAction links the order to expert_recommendation.id).
+        recommendation = _get_instance(ExpertRecommendation, rec_id)
+        if recommendation is None:
+            return False
+
+        try:
+            evaluator = TradeActionEvaluator(
+                account=self.account,
+                instrument_name=symbol,
+                existing_transactions=None,
+            )
+            action_summaries = evaluator.evaluate(
+                instrument_name=symbol,
+                expert_recommendation=recommendation,
+                ruleset_id=ruleset_id,
+                existing_order=None,
+            )
+            if not action_summaries or any("error" in s for s in action_summaries):
+                return False  # conditions not met / evaluation error -> no order this symbol.
+
+            # LIVE-PARITY DUP-POSITION GATE (mirrors TradeManager.process_expert_recommendations_
+            # after_analysis:1130-1144): after the enter ruleset passes but BEFORE executing,
+            # skip if an OPENED/WAITING transaction already exists for this (expert, symbol).
+            # The ruleset's has_no_position flag only counts OPENED, so a not-yet-filled WAITING
+            # entry from a prior bar could otherwise stack a duplicate the live engine blocks.
+            # (No-op for standard strategies whose entries fill before the next analysis bar.)
+            if self._has_open_or_waiting_position(expert_id, symbol):
+                self._log(f"entry dup-gate: {symbol} already OPENED/WAITING for expert "
+                          f"{expert_id} @ {as_of:%Y-%m-%d} — skip")
+                return False
+
+            # LIVE-PARITY EQUITY GATE (mirrors TradeManager.process_expert_recommendations_
+            # after_analysis:1146-1155): before staging an entry, skip if the expert lacks
+            # sufficient available equity (available_balance >= minimum_equity_threshold_percent
+            # of virtual balance, default 5%). Calls the SAME shared
+            # MarketExpertInterface.has_sufficient_equity_for_trading the live path uses — no
+            # re-implementation. Note: BacktestAccount.get_balance() is cash (not NLV), which is
+            # the same balance BT sizing already uses (TradeRiskManagement), so the gate stays
+            # consistent with BT sizing. Stub experts without the method are treated as allowed.
+            equity_check = getattr(expert, "has_sufficient_equity_for_trading", None)
+            if callable(equity_check):
+                try:
+                    ok_equity, equity_reason = equity_check()
+                except Exception as e:  # noqa: BLE001 — a wiring gap must not silently over-block
+                    self._log(f"equity-gate check errored for {symbol} @ {as_of:%Y-%m-%d} "
+                              f"(treating as allowed): {e}")
+                    ok_equity = True
+                if not ok_equity:
+                    self._log(f"entry equity-gate: {symbol} skipped for expert {expert_id} "
+                              f"@ {as_of:%Y-%m-%d} — {equity_reason}")
+                    return False
+
+            if self._entry_is_option:
+                # OPTION entry: the option action sizes + submits ITSELF in execute (no equity
+                # leg, no RM candidate sizing) — submit directly, like the open-positions path.
+                results = evaluator.execute(submit_to_broker=True)
+                return any(r.get("success") and (r.get("data") or {}).get("order_id") for r in results)
+
+            # EQUITY entry: stage a TRANSIENT candidate (NOT persisted) for the temp-list RM
+            # pass via the shared trade_cycle builder (same shape live uses).
+            from ba2_common.core.trade_cycle import build_entry_candidate
+            candidate = build_entry_candidate(recommendation, self.account.id)
+            equity_candidates.append((candidate, evaluator, symbol, recommendation))
+            return False
+        except Exception as e:  # noqa: BLE001
+            self._log(f"ruleset eval/execute failed for {symbol} @ {as_of:%Y-%m-%d}: {e}")
+            return False
+
+    # -- basket-dispatch experts (analyzes_as_basket) ------------------------
+    def _run_basket_expert_bar(
+        self,
+        expert: Any,
+        expert_id: int,
+        settings: Dict[str, Any],
+        ruleset_id: int,
+        as_of: datetime,
+    ) -> bool:
+        """Run ONE bar for a BASKET expert (``analyzes_as_basket = True``, e.g.
+        ``FMPSenateTraderWeight``/``FMPSenateTraderCopy``): ``analyze_as_of`` is called ONCE for
+        the bar and returns ``List[Recommendation]`` (one per qualifying symbol), instead of
+        being called once per universe symbol and returning a single ``Recommendation``.
+
+        UNLIKE a BYPASS expert (``bypasses_classic_rm``), a basket expert KEEPS the full classic
+        pipeline per symbol — ``TradeActionEvaluator``/``TradeConditions`` ruleset evaluation,
+        one persisted ``ExpertRecommendation`` row per symbol, ``TradeRiskManagement`` position
+        sizing — nothing about position sizing or ruleset evaluation changes; only HOW MANY
+        symbols' worth of ``Recommendation`` come out of one ``analyze_as_of`` call. Each item
+        in the returned list is fed through the EXACT SAME ``_stage_recommendation_candidate``
+        helper ``_run_expert_bar``'s per-symbol loop uses.
+
+        Because there is only ONE ``analyze_as_of`` call for the whole bar, a raised exception
+        from ``analyze_as_of`` itself aborts the WHOLE bar for this expert — there is no
+        "skip this symbol, try the next" for the GATHER step any more (that granularity only
+        exists once the list comes back). A hermetic cache miss still re-raises (must abort
+        loudly, matching every other analyze_as_of call site in this engine). Each
+        recommendation ITEM returned by the list, however, is staged through
+        ``_stage_recommendation_candidate``, which has its own try/except — a single
+        malformed/bad list item must not crash the whole bar (see the senate-basket-dispatch
+        plan's Task 1 finding: an earlier UNGUARDED per-item
+        ``_recommendation_to_expert_recommendation`` call crashed ``engine.run()`` outright,
+        after only the first symbol, when fed a list — this method's whole point is to not
+        reproduce that bug in the new dispatch mode).
+
+        Each list item MUST self-identify its symbol via ``rec.raw_outputs["symbol"]`` (there is
+        no ``for symbol in universe:`` loop here to infer it from). A missing/falsy symbol is
+        logged and that item is skipped — never guessed.
+
+        Returns True iff at least one PENDING order was created, mirroring ``_run_expert_bar``'s
+        return contract.
+        """
+        ctx = BacktestContext(
+            providers=self._provider_bundle(),
+            settings=settings,
+            as_of=as_of,
+            account=self.account,
+            subtype=self.config.get("subtype"),
+        )
+        try:
+            recs = expert.analyze_as_of(as_of, ctx)
+        except Exception as e:  # noqa: BLE001 — the whole bar aborts (no per-symbol granularity
+                                 # left at the gather step for a basket expert)
+            from app.services.backtest.price_source import BacktestCacheMiss
+            from ba2_providers.fmp_common import FMPHistoryCacheMiss
+            if isinstance(e, (BacktestCacheMiss, FMPHistoryCacheMiss)):
+                raise
+            self._log(f"basket analyze_as_of failed for expert {expert_id} @ {as_of:%Y-%m-%d}: {e}")
+            return False
+
+        if not recs:
+            return False
+
+        created_any = False
+        equity_candidates: List[Any] = []
+        for rec in recs:
+            try:
+                raw = getattr(rec, "raw_outputs", None) or {}
+                symbol = raw.get("symbol")
+            except Exception as e:  # noqa: BLE001 — a malformed list item must not crash the bar
+                self._log(f"basket recommendation item malformed for expert {expert_id} "
+                          f"@ {as_of:%Y-%m-%d}: {e}")
+                continue
+            if not symbol:
+                self._log(f"basket recommendation missing raw_outputs['symbol'] for expert "
+                          f"{expert_id} @ {as_of:%Y-%m-%d} — skip")
+                continue
+
+            # PER-ITEM GUARD (the correction to the plan's Step 3 text — see the class docstring
+            # above and the senate-basket-dispatch plan's Task 1 finding): unlike
+            # ``_run_expert_bar``'s call into ``_stage_recommendation_candidate`` (left UNGUARDED,
+            # matching its pre-extraction behavior), THIS call site wraps the helper because a
+            # basket expert feeds it once per LIST ITEM rather than once per trusted per-symbol
+            # ``analyze_as_of`` call. ``_stage_recommendation_candidate`` itself leaves
+            # ``_recommendation_to_expert_recommendation``/``get_instance`` unguarded (see its
+            # docstring), so without this wrapper a single malformed item (e.g. missing
+            # ``.signal``) would still crash the WHOLE bar for every other qualifying symbol —
+            # reproducing Task 1's bug in a new location instead of fixing it. A hermetic cache
+            # miss still re-raises (must abort loudly); everything else is logged + skipped.
+            try:
+                if self._stage_recommendation_candidate(
+                    rec, expert=expert, expert_id=expert_id, symbol=symbol,
+                    ruleset_id=ruleset_id, as_of=as_of, equity_candidates=equity_candidates,
+                ):
+                    created_any = True
+            except Exception as e:  # noqa: BLE001 — one bad list item must not abort the whole bar
+                from app.services.backtest.price_source import BacktestCacheMiss
+                from ba2_providers.fmp_common import FMPHistoryCacheMiss
+                if isinstance(e, (BacktestCacheMiss, FMPHistoryCacheMiss)):
+                    raise
+                self._log(f"basket item staging failed for {symbol} @ {as_of:%Y-%m-%d}: {e}")
+                continue
+
         if equity_candidates:
             created_any = self._size_and_submit_candidates(
                 expert_id, equity_candidates, as_of) or created_any
