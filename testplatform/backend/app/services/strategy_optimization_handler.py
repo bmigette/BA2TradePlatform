@@ -668,8 +668,15 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 _workers = []
             if _workers:
                 from app.services.distributed_eval import DistributedEvaluator
-                from app.services.self_update import get_version_info
+                from app.services.self_update import get_version_info, unsyncable_reason
                 _master_version = get_version_info().get("app_version")
+                _unsyncable = unsyncable_reason()
+                if _unsyncable:
+                    logger.warning(
+                        f"opt {opt_id}: distributed run selected {len(_workers)} worker(s), but "
+                        f"{_unsyncable} (this master's app_version={_master_version!r} may not "
+                        f"be reachable by ANY worker's git pull)"
+                    )
                 _evaluator = DistributedEvaluator(
                     _pool, opt.fitness_metric, parallel, opt_id,
                     workers=_workers, master_version=_master_version,

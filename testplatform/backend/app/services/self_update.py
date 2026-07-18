@@ -99,6 +99,56 @@ def get_version_info(root: Optional[Path] = None) -> dict:
     }
 
 
+def unsyncable_reason(root: Optional[Path] = None) -> Optional[str]:
+    """None if a remote worker can actually converge to this master's reported ``app_version``
+    via ``git pull``; otherwise a human-readable reason it can't.
+
+    Root cause this guards against (hit for real, 2026-07-18): ``app_version`` is read straight
+    from the ``version.py`` FILE (see ``_app_version``), which can differ from what's actually
+    reachable by a worker's ``git pull`` in two ways — (a) the file was edited but never
+    committed, or (b) it WAS committed but the commit was never pushed. Either way, a worker's
+    ``ensure_synced`` retries its `/update` -> poll `/version` loop for the FULL ``max_wait``
+    (300s) every single time it's selected, over and over across a whole run, before silently
+    excluding it — burning ~5min per retry with a log line ("did not converge... excluding")
+    that gives no hint WHY, so the real cause (an unpushed local commit) went unnoticed for the
+    length of a multi-hour run. Call this ONCE, right where ``master_version`` is computed
+    (before a distributed run's first worker dispatch), and log its result loudly if not None —
+    catching this in one line up front beats discovering it via N workers' worth of silent
+    5-minute timeouts.
+    """
+    root = root or resolve_repo_root()
+    try:
+        r = subprocess.run(
+            ["git", "status", "--porcelain", "--", "ba2_trade_platform/version.py"],
+            cwd=str(root), capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return ("version.py has UNCOMMITTED changes — a remote worker's `git pull` can "
+                    "never reach this app_version. Commit and push before running a distributed "
+                    "job, or workers will retry-and-exclude for the whole run.")
+    except (OSError, subprocess.SubprocessError):
+        return None  # git unavailable — can't diagnose, but also can't confirm a problem
+
+    try:
+        r = subprocess.run(
+            ["git", "rev-list", "--count", "@{u}..HEAD"],
+            cwd=str(root), capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0:
+            ahead = int(r.stdout.strip() or 0)
+            if ahead > 0:
+                return (f"local branch is {ahead} commit(s) ahead of its upstream (unpushed) — "
+                        f"a remote worker's `git pull` can never reach this app_version until "
+                        f"you `git push`. Workers will retry-and-exclude for the whole run "
+                        f"otherwise.")
+        # non-zero here commonly means "no upstream configured" (a detached/local-only branch)
+        # — not itself an error worth surfacing; a worker's pull behavior in that case is a
+        # separate, pre-existing concern outside this check's scope.
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    return None
+
+
 def is_editable_install(root: Path, package: str = "ba2_common") -> bool:
     """True iff *package* is installed editable (its source lives under ``<root>/packages``).
 
