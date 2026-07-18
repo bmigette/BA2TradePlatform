@@ -4,6 +4,7 @@ Utility functions for the BA2 Trade Platform core functionality.
 
 from typing import Optional, List, TYPE_CHECKING, Dict, Any
 from datetime import datetime, timezone
+import re
 import time
 from ba2_common.core.db import get_instance, get_db
 from ba2_common.core.models import ExpertInstance, TradingOrder, ExpertRecommendation, Transaction
@@ -908,6 +909,31 @@ def parse_fmp_amount_range(amount_str) -> float:
         return float(digits) if digits else 0.0
     except (ValueError, IndexError):
         return 0.0
+
+
+# Mutual-fund tickers: exactly 4-5 uppercase letters ending in X (matches the filter already
+# used for the options top-100 universe — see the 2026-07-08 options-cache session, and
+# tools/build_senate_universe.py where this heuristic originated).
+_FUND_TICKER_RE = re.compile(r"^[A-Z]{4,5}X$")
+
+
+def is_tradable_stock_ticker(sym: Optional[str]) -> bool:
+    """Classify whether a symbol looks like an ordinary tradable equity ticker.
+
+    Returns False for mutual-fund-pattern symbols (4-5 uppercase letters ending in
+    ``X``, e.g. ``"VFIAX"``), non-ASCII/malformed symbols, symbols containing
+    ``/``, ``$``, or a space, and empty/None input. Extracted from
+    ``tools/build_senate_universe.py``'s ``_is_junk_ticker`` (inverted sense: this
+    returns True to KEEP a symbol, matching filter-predicate call sites like
+    ``[s for s in symbols if is_tradable_stock_ticker(s)]``).
+    """
+    if not sym or not sym.isascii():
+        return False
+    if _FUND_TICKER_RE.match(sym):
+        return False
+    if any(c in sym for c in ("/", "$", " ")):
+        return False
+    return True
 
 
 def calculate_fmp_trade_metrics(trades: List[dict], all_trader_trades: List[dict] | None = None) -> dict:

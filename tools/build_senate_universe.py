@@ -17,10 +17,11 @@ Usage (test venv; FMP_API_KEY in env or app-settings DB):
 """
 import argparse
 import os
-import re
 import sys
 import time
 from datetime import date, datetime, timedelta
+
+from ba2_common.core.utils import is_tradable_stock_ticker
 
 
 def _resolve_fmp_key() -> str:
@@ -46,21 +47,6 @@ def _resolve_fmp_key() -> str:
     if not key:
         sys.exit(f"build_senate_universe: FMP_API_KEY not configured (.env or {db_file}).")
     return key
-
-
-# Mutual-fund tickers: exactly 4-5 uppercase letters ending in X (matches the filter already
-# used for the options top-100 universe — see the 2026-07-08 options-cache session).
-_FUND_TICKER_RE = re.compile(r"^[A-Z]{4,5}X$")
-
-
-def _is_junk_ticker(sym: str) -> bool:
-    if not sym or not sym.isascii():
-        return True
-    if _FUND_TICKER_RE.match(sym):
-        return True
-    if any(c in sym for c in ("/", "$", " ")):
-        return True
-    return False
 
 
 def _fetch_latest_disclosures(chamber: str, key: str, floor_date: date, max_pages: int) -> list:
@@ -146,7 +132,7 @@ def main() -> int:
     print(f"\n{len(kept)} symbols with >= {args.min_disclosures} disclosures")
 
     before_junk = len(kept)
-    kept = [s for s in kept if not _is_junk_ticker(s)]
+    kept = [s for s in kept if is_tradable_stock_ticker(s)]
     print(f"Dropped {before_junk - len(kept)} junk tickers (mutual funds / malformed symbols)")
 
     if not args.skip_price_probe:

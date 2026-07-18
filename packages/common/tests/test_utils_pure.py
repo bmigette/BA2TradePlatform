@@ -105,3 +105,14 @@ def test_get_setting_safe_pure():
     assert get_setting_safe({"x": None}, "x", 30, int) == 30
     assert get_setting_safe({"x": "50"}, "x", 30, int) == 50
     assert get_setting_safe({}, "x", 7) == 7
+
+
+def test_is_tradable_stock_ticker():
+    from ba2_common.core.utils import is_tradable_stock_ticker
+    assert is_tradable_stock_ticker("AAPL") is True
+    assert is_tradable_stock_ticker("MSFT") is True
+    # Mutual-fund pattern: 4-5 uppercase letters ending in X
+    assert is_tradable_stock_ticker("FTGCX") is False
+    assert is_tradable_stock_ticker("VFIAX") is False
+    assert is_tradable_stock_ticker("") is False
+    assert is_tradable_stock_ticker(None) is False
