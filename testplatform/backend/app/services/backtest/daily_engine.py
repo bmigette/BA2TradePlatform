@@ -1035,6 +1035,22 @@ class DailyBacktestEngine:
             self._log(f"basket analyze_as_of failed for expert {expert_id} @ {as_of:%Y-%m-%d}: {e}")
             return False
 
+        # TYPE GUARD: a basket expert's analyze_as_of MUST return List[Recommendation] (one per
+        # qualifying symbol), not a single Recommendation. A single Recommendation is truthy, so
+        # `if not recs:` alone would NOT catch it here, and `for rec in recs:` would then raise an
+        # uncaught TypeError ('Recommendation' object is not iterable) that propagates out of
+        # engine.run(), aborting the whole run -- reproducing, one layer up, the exact failure
+        # class Task 1 of the senate-basket-dispatch plan documented (a shape mismatch between
+        # what analyze_as_of returns and what the caller expects, left unguarded). This is a real
+        # risk for a future dual-mode analyze_as_of (Task 5's planned symbol-pinned vs.
+        # basket-mode branching) that could accidentally take the wrong branch. Log + skip the
+        # bar, same "log+skip, don't crash the run" convention every other failure mode in this
+        # method already uses.
+        if not isinstance(recs, list):
+            self._log(f"basket analyze_as_of for expert {expert_id} @ {as_of:%Y-%m-%d} must "
+                      f"return a list, got {type(recs).__name__} — skipping bar")
+            return False
+
         if not recs:
             return False
 

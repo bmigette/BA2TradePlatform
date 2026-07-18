@@ -233,15 +233,51 @@ class _StubBasketExpert(MarketExpertInterface):
         ]
 
 
-def _build_basket_run(account_id=53, expert_id=53):
-    """Wire a backtest fixture for the stub BASKET expert (``analyzes_as_basket = True``).
+class _StubBasketExpertReturnsSingleRec(MarketExpertInterface):
+    """Basket expert with a SHAPE BUG: declares ``analyzes_as_basket = True`` (so the engine
+    dispatches it through ``_run_basket_expert_bar``, expecting ``List[Recommendation]``) but
+    ``analyze_as_of`` actually returns a single ``Recommendation`` -- exactly the mistake a
+    future dual-mode ``analyze_as_of`` (symbol-pinned vs. basket-mode branching, as planned for
+    Task 5) could make by taking the wrong branch. Used to prove the engine's type guard logs
+    + skips the bar instead of letting an uncaught ``TypeError`` (``'Recommendation' object is
+    not iterable``) propagate out of ``engine.run()``."""
+
+    analyzes_as_basket = True
+
+    def __init__(self, id: int):
+        super().__init__(id)
+        self.call_count = 0
+
+    @classmethod
+    def description(cls) -> str:  # abstract
+        return "Stub basket expert that (buggily) returns a single Recommendation."
+
+    def render_market_analysis(self, market_analysis) -> str:  # abstract
+        return ""
+
+    def run_analysis(self, symbol: str, market_analysis) -> None:  # abstract
+        return None
+
+    def analyze_as_of(self, as_of, context):
+        self.call_count += 1
+        # BUG (deliberate, for the test): a single Recommendation, NOT a list.
+        return Recommendation(
+            signal=OrderRecommendation.BUY, confidence=80.0, current_price=100.0,
+            details="stub single rec (wrong shape for a basket expert)",
+            raw_outputs={"symbol": "AAPL"},
+        )
+
+
+def _build_basket_run(account_id=53, expert_id=53, expert_cls=None):
+    """Wire a backtest fixture for a stub BASKET expert (``analyzes_as_basket = True``).
 
     Mirrors ``_build_run`` above (the pre-fix, unmarked list-returning stub) and
-    ``test_daily_engine_unit.py``'s ``_build_run``, but registers ``_StubBasketExpert`` and
-    enables the settings the classic RM / live-parity gates need to actually fund an order
-    (``allow_automated_trade_opening`` / ``enable_buy`` — interface defaults are False/True and
-    the RM gates on them). Returns (engine, account, expert, db_ctx, price_source). Caller MUST
-    close db_ctx.
+    ``test_daily_engine_unit.py``'s ``_build_run``, but registers a basket-marked stub expert
+    (``_StubBasketExpert`` by default; pass ``expert_cls`` for a different shape, e.g. the
+    non-list-returning stub used to test the type guard) and enables the settings the classic
+    RM / live-parity gates need to actually fund an order (``allow_automated_trade_opening`` /
+    ``enable_buy`` — interface defaults are False/True and the RM gates on them). Returns
+    (engine, account, expert, db_ctx, price_source). Caller MUST close db_ctx.
     """
     from app.services.backtest.backtest_account import BacktestAccount
     from app.services.backtest.backtest_db import (
@@ -253,6 +289,8 @@ def _build_basket_run(account_id=53, expert_id=53):
     from app.services.backtest.default_rulesets import seed_enter_long_ruleset
     from app.services.backtest.price_source import AsOfPriceSource
     from app.services.backtest.seam_wiring import wire_backtest_seams
+
+    expert_cls = expert_cls or _StubBasketExpert
 
     cfg = {
         "starting_cash": 100_000.0,
@@ -269,7 +307,7 @@ def _build_basket_run(account_id=53, expert_id=53):
     ruleset_id = seed_enter_long_ruleset(name="backtest-basket-dispatch-real")
     seed_expert_instance(
         account_id=account_id,
-        expert_class_name="_StubBasketExpert",
+        expert_class_name=expert_cls.__name__,
         enter_market_ruleset_id=ruleset_id,
         instance_id=expert_id,
     )
@@ -281,7 +319,7 @@ def _build_basket_run(account_id=53, expert_id=53):
     account = BacktestAccount(account_id, ps, cfg)
     resolver.register_account(account_id, account)
 
-    expert = _StubBasketExpert(expert_id)
+    expert = expert_cls(expert_id)
     # Enable automated opening + buy (interface defaults are False/True; RM gates on these) --
     # same settings test_daily_engine_unit.py's classic-path stub needs to actually fund an order.
     expert.save_settings(
@@ -445,5 +483,45 @@ def test_basket_expert_manage_open_positions_runs_when_entry_ok_false(monkeypatc
         # INCLUDING the later bars where entry_ok is False -- proving the basket branch falls
         # through to the shared manage_ok pass instead of `continue`-ing past it.
         assert len(manage_calls) == len(BARS)
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_basket_expert_non_list_analyze_as_of_return_skips_bar_without_crashing():
+    """Type-guard regression: a basket expert (``analyzes_as_basket = True``) whose
+    ``analyze_as_of`` returns a single ``Recommendation`` instead of ``List[Recommendation]``
+    must not crash ``engine.run()``.
+
+    Without the guard, ``if not recs:`` does NOT catch this (a ``Recommendation`` dataclass
+    instance is truthy), so ``for rec in recs:`` raises an uncaught ``TypeError``
+    (``'Recommendation' object is not iterable``) that propagates out of
+    ``_run_basket_expert_bar``/``engine.run()``, aborting the whole run -- reproducing, one
+    layer up, the exact failure class Task 1 of the senate-basket-dispatch plan documented (a
+    shape mismatch between what ``analyze_as_of`` returns and what the caller expects, left
+    unguarded). This is a real risk for a future dual-mode ``analyze_as_of`` (Task 5's planned
+    symbol-pinned vs. basket-mode branching) accidentally taking the wrong branch.
+    """
+    from ba2_common.core.db import get_all_instances
+    from ba2_common.core.models import ExpertRecommendation
+
+    engine, account, expert, ctx, ps = _build_basket_run(
+        account_id=56, expert_id=56, expert_cls=_StubBasketExpertReturnsSingleRec
+    )
+    try:
+        # Must NOT raise -- the type guard logs + skips the bar instead of crashing the run.
+        engine.run()
+
+        # analyze_as_of was still called once per bar (the shape bug is in the RETURN value,
+        # not the call itself) -- the crash Task 1 documented also called analyze_as_of before
+        # dying on the caller's consumption of the return value.
+        assert expert.call_count == len(BARS)
+
+        # Every bar was skipped cleanly: zero ExpertRecommendation rows, no position opened.
+        assert get_all_instances(ExpertRecommendation) == []
+        assert account.get_positions() == []
+
+        # The run still completed all bars (one equity snapshot per bar) -- proof the bad-shape
+        # bar was skipped, not that the run silently stopped partway through.
+        assert len(account.get_balance_history()) == len(BARS)
     finally:
         ctx.__exit__(None, None, None)
