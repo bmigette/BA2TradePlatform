@@ -621,9 +621,10 @@ def _cmd_prewarm(args) -> int:
                     print(f"!! prewarm {expert}/{sym} failed: {e}")
 
         # Unscoped "latest disclosures" warm (basket-mode _gather_all's congress_senate_latest/
-        # congress_house_latest, "ALL" key) -- independent of any universe symbol, so it runs
-        # once regardless of order relative to the per-symbol loop above; placed here (serially,
-        # still inside the freeze gate) alongside the other one-shot senate prewarm steps below.
+        # congress_house_latest, "ALL_FULL_HISTORY" key, deep-paginated) -- independent of any
+        # universe symbol, so it runs once regardless of order relative to the per-symbol loop
+        # above; placed here (serially, still inside the freeze gate) alongside the other
+        # one-shot senate prewarm steps below.
         if "FMPSenateTraderWeight" in experts:
             _do_senate_latest()
 
