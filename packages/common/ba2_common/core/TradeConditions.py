@@ -112,6 +112,21 @@ class TradeCondition(ABC):
             List of previous recommendations ordered by creation date (newest first)
         """
         try:
+            from ba2_common.core.trade_store import inmem_trades_active
+            if inmem_trades_active():
+                # BT store: ExpertRecommendation is an in-mem model (see trade_store.
+                # IN_MEM_MODELS) — a raw ``select()`` bypasses it and would silently return
+                # nothing (rows never touch the real :memory: SQLite table). The per-run
+                # store only ever holds THIS backtest's recommendations, so an unfiltered
+                # fetch-then-filter-in-Python is cheap (unlike the unbounded live table).
+                from ba2_common.core.db import get_all_instances
+                matches = [
+                    r for r in get_all_instances(ExpertRecommendation)
+                    if r.instance_id == expert_instance_id and r.symbol == self.instrument_name
+                ]
+                matches.sort(key=lambda r: r.created_at, reverse=True)
+                return matches[:limit]
+
             with get_db() as session:
                 statement = (
                     select(ExpertRecommendation)
@@ -122,10 +137,10 @@ class TradeCondition(ABC):
                     .order_by(ExpertRecommendation.created_at.desc())
                     .limit(limit)
                 )
-                
+
                 recommendations = session.exec(statement).all()
                 return list(recommendations)
-                
+
         except Exception as e:
             logger.error(f"Error getting previous recommendations: {e}", exc_info=True)
             return []

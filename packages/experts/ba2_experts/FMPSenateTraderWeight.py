@@ -469,7 +469,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         trader_hold_info_by_name: Dict[str, Dict[str, Any]] = {}
         if float(self._setting_or_default(gather_settings, "min_trader_avg_hold_days")) > 0:
             trader_hold_info_by_name = {
-                name: self._get_trader_hold_info_cached(name, history)
+                name: self._get_trader_hold_info_cached(name, history, is_live=(as_of is None))
                 for name, history in trader_history_by_name.items()
             }
 
@@ -805,7 +805,8 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         except Exception as e:  # noqa: BLE001 — a cache-write failure must never fail scoring
             self.logger.debug(f"Failed to persist scoring cache {filename}: {e}")
 
-    def _save_scoring_cache_throttled(self, attr: str, filename: str, key: str) -> None:
+    def _save_scoring_cache_throttled(self, attr: str, filename: str, key: str,
+                                       is_live: bool) -> None:
         """Append ``key`` (and its already-stored value) to the pending list; every
         ``_CACHE_FLUSH_EVERY`` pending entries, APPEND just those to the JSON-Lines delta
         file (O(new entries), not O(total cache size) — see the class-level comment on
@@ -815,7 +816,18 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         many GA trials) doesn't accumulate an ever-growing delta file. The in-memory dict
         (``self.<attr>``) is ALWAYS up to date regardless of flush/compact timing — only a
         crash mid-run can lose the last <N pending entries (harmless — pure functions of
-        their inputs, recomputed next time)."""
+        their inputs, recomputed next time).
+
+        BACKTEST DOES NO DISK I/O HERE: the base cache file (if any) was already loaded
+        once into ``self.<attr>`` by ``_load_scoring_cache``; a backtest's as-of-day-bucketed
+        keys are near-unique per trial anyway (see key comments on the 3 callers), so writing
+        them back out only grows an already-unbounded on-disk cache for near-zero cross-run
+        reuse (profiled: a 620MB confidence-cache compaction was ~32% of a full-length trial's
+        wall time, entirely to persist entries a backtest would rarely re-read). Live keeps the
+        disk-backed delta/compaction path unchanged — a live process restarts and re-warms from
+        disk, and its month-bucketed keys DO get reused across the many analyses in a month."""
+        if not is_live:
+            return
         pending_attr = attr + "_pending"
         pending = getattr(self, pending_attr, None) or []
         cache = getattr(self, attr)
@@ -840,7 +852,8 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         setattr(self, since_compact_attr, since_compact)
 
     def _get_trader_hold_info_cached(self, trader_name: str,
-                                     trader_history: List[Dict[str, Any]]) -> Dict[str, Any]:
+                                     trader_history: List[Dict[str, Any]],
+                                     is_live: bool = False) -> Dict[str, Any]:
         """Cached wrapper around ``_calculate_trader_avg_hold_days``. Keyed by
         (trader, history length) — hold-days has NO settings/as-of dependency beyond what's
         already reflected in which trades are in ``trader_history``, so an exact length match
@@ -852,7 +865,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             return {"avg_hold_days": entry.get("avg_hold_days"), "roundtrips": entry.get("roundtrips")}
         result = self._calculate_trader_avg_hold_days(trader_history)
         cache[trader_name] = {"history_len": n, **result}
-        self._save_scoring_cache_throttled("_hold_cache", self._HOLD_CACHE_FILE, trader_name)
+        self._save_scoring_cache_throttled("_hold_cache", self._HOLD_CACHE_FILE, trader_name, is_live)
         return result
 
     def _get_trader_skill_cached(self, trader_name: str, trader_history: List[Dict[str, Any]],
@@ -886,7 +899,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             min_past_trades=min_past_trades, max_past_trades=max_past_trades,
             lookback_months=lookback_months, _sorted_candidates=sorted_candidates)
         cache[key] = result
-        self._save_scoring_cache_throttled("_skill_cache", self._SKILL_CACHE_FILE, key)
+        self._save_scoring_cache_throttled("_skill_cache", self._SKILL_CACHE_FILE, key, is_live)
         return result
 
     def _get_trader_confidence_cached(self, trader_name: str, trader_history: List[Dict[str, Any]],
@@ -918,7 +931,8 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             max_exec_days, now=now, symbol_focus_cap_pct=symbol_focus_cap_pct,
             _index=index)
         cache[key] = result
-        self._save_scoring_cache_throttled("_confidence_cache", self._CONFIDENCE_CACHE_FILE, key)
+        self._save_scoring_cache_throttled(
+            "_confidence_cache", self._CONFIDENCE_CACHE_FILE, key, is_live)
         return result
 
     def _price_on_or_after(self, symbol: str, date: datetime, max_walk_days: int = 5) -> Optional[float]:

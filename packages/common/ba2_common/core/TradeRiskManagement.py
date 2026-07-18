@@ -497,11 +497,24 @@ class TradeRiskManagement:
             if not rec_ids:
                 return []
 
-            with get_db() as session:
-                rows = session.exec(
-                    select(ExpertRecommendation).where(ExpertRecommendation.id.in_(rec_ids))
-                ).all()
-                recs_by_id = {rec.id: rec for rec in rows}
+            from ba2_common.core.trade_store import inmem_trades_active
+            if inmem_trades_active():
+                # BT store: ExpertRecommendation is an in-mem model too (see trade_store.
+                # IN_MEM_MODELS) — a raw ``select()`` bypasses that store and would find
+                # nothing (rows never touch the real :memory: SQLite table), so fetch by id
+                # through get_instance (routed) instead of the bulk SELECT below.
+                recs_by_id = {}
+                for rec_id in rec_ids:
+                    try:
+                        recs_by_id[rec_id] = get_instance(ExpertRecommendation, rec_id)
+                    except Exception:  # noqa: BLE001 — a missing rec just excludes the order
+                        continue
+            else:
+                with get_db() as session:
+                    rows = session.exec(
+                        select(ExpertRecommendation).where(ExpertRecommendation.id.in_(rec_ids))
+                    ).all()
+                    recs_by_id = {rec.id: rec for rec in rows}
 
             for order in orders:
                 recommendation = recs_by_id.get(order.expert_recommendation_id)

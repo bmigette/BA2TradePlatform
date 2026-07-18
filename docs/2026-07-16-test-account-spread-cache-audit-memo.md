@@ -264,8 +264,16 @@ runs from opt 116 and opt 119 specifically are still needed before reseeding eit
       `sync-cache --worker remote150` again.
 - [ ] Investigate the `goal6-mid_S4` (id 10) return-increases-with-spread anomaly (+31pp) —
       likely a trade-mix artifact, not validated yet.
-- [ ] Decide whether to run dedicated warm-start-with-spread jobs from opt 116 (small_S7) and
-      opt 119 (mid_ED_S2top1) to get real reseed candidates for the 2 disabled instances.
+- [x] **Started 2026-07-18 13:47** — dedicated warm-start-with-spread jobs from opt 116
+      (small_S7, FMPRating) and opt 119 (mid_ED_S2top1, FMPEarningsDrift), sequential (opt116
+      first), 3 generations each, `--warm-start-from` the parent job's final population.
+      Spread level picked as each band's low non-zero slot (small=40bps, mid=15bps — mirrors
+      the §6 mid-band EarningsDrift precedent, not the max stress-test level from §4's resim
+      table). Launch script: `run_warmstart_disabled_instances.sh` (scratchpad); log:
+      `warmstart_disabled_instances.log`. New jobs will be named
+      `scr-small-FMPRating-S7-goal6-spread` and `scr-mid-FMPEarningsDrift-S2-goal6-spread`.
+      Once complete, evaluate top individuals the same way §6 did (watch for the S6/S7-style
+      population collapse into a near-zero-trade "safe" strategy) before reseeding ids 12/17.
 - [ ] "watch"-tier deployments (large_FRtop1/4, mid_S1top4, small_S5, mid_ED_S1top1,
       mid_ICB_S2top3) — no action taken yet, worth a second look once the fetch/rebuild
       settles.

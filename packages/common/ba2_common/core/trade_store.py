@@ -24,7 +24,9 @@ import threading
 from contextlib import contextmanager
 from typing import Any, Callable, Iterable, List, Optional
 
-from ba2_common.core.models import TradingOrder, Transaction
+from ba2_common.core.models import (
+    AccountDefinition, ExpertInstance, ExpertRecommendation, TradingOrder, Transaction,
+)
 
 _tls = threading.local()
 
@@ -145,7 +147,19 @@ def inmem_trades():
 
 
 # Models whose access is routed to the in-memory store when the flag is active.
-IN_MEM_MODELS = (TradingOrder, Transaction)
+#
+# ExpertInstance/AccountDefinition/ExpertRecommendation joined TradingOrder/Transaction here
+# after profiling a full-length backtest showed ~40% of wall time in SQLAlchemy ORM overhead
+# (session.get/_get_impl/load_on_pk_identity for ExpertInstance reads in the per-bar balance
+# check, plus add_instance/flush/_emit_insert for ExpertRecommendation writes) even though the
+# backing DB is already :memory: SQLite (no disk I/O) — the ORM compile/hydrate/flush cost alone
+# dominates at 80K+ calls. All three are seeded fresh per-run (seed_account_definition/
+# seed_expert_instance/daily_engine's recommendation persist) and only ever accessed by-PK
+# within the backtest engine (no filtered SELECT), so they fit the exact same add-then-get
+# pattern as orders/transactions. get_account_instance itself is already a pure in-memory dict
+# lookup (BacktestInstanceResolver, testplatform/backend/app/services/backtest/seam_wiring.py)
+# and never touches this store.
+IN_MEM_MODELS = (TradingOrder, Transaction, ExpertInstance, AccountDefinition, ExpertRecommendation)
 
 
 def is_inmem_model(model) -> bool:
