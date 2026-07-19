@@ -1143,6 +1143,15 @@ class DailyBacktestEngine:
             ctx = BacktestContext(
                 providers=providers, settings=settings, as_of=as_of,
                 account=self.account, subtype=AnalysisUseCase.OPEN_POSITIONS,
+                # Basket experts (analyzes_as_basket=True, e.g. FMPSenateTraderWeight/Copy)
+                # dual-mode dispatch analyze_as_of on context.extra["symbol"] alone -- the
+                # attribute pin above is the OLD convention their dispatch no longer reads.
+                # Without this, every OPEN_POSITIONS call for a basket expert silently took
+                # the basket branch and returned List[Recommendation] where this loop expects
+                # one Recommendation, crashing at _recommendation_to_expert_recommendation's
+                # `rec.signal` (confirmed: killed every trial in the 2026-07-19 Senate matrix
+                # run once a trial opened its first position).
+                extra={"symbol": symbol},
             )
             try:
                 rec = expert.analyze_as_of(as_of, ctx)

@@ -40,9 +40,26 @@ dumps are in the DB if needed.
 | id | expert | alias | enabled | cap_min | max_stocks | drop_pct | rel_vol_min | ATR mult/period | use_atr_stop | min_SL% | risk/trade% |
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | 16 | FMPEarningsDrift | goal6-mid_ED_S1top1 | 1 | $6B | 30 | 1.0 | 1.9 | 3.5/21 | 0 | 12.0 | 5.0 |
-| 17 | FMPEarningsDrift | goal6-mid_ED_S2top1 | **0 (disabled)** | $2B | 50 | 3.0 | 2.7 | 3.5/28 | 0 | 8.0 | 1.0 |
-| 18 | FMPInsiderClusterBuy | goal6-mid_ICB_S7top1 | 1 | $6B | 40 | 0.0 | 1.2 | 6.0/7 | 1 | 12.0 | 5.0 |
+| 20 | FMPEarningsDrift | goal6-mid_ED_S2top1 | 1 | $2B | 50 | 3.0 | 2.7 | 3.5/28 | 0 | 8.0 | 1.0 |
 | 19 | FMPInsiderClusterBuy | goal6-mid_ICB_S2top3 | 1 | $5B | 30 | 2.0 | 1.6 | 4.0/21 | 0 | 9.0 | 9.0 |
+| 21 | FMPInsiderClusterBuy | goal6-small_ICB_S1top3 | 1 | $200M | 20 | — | — | — | — | — | — |
+| 22 | FMPEarningsDrift | goal6-small_ED_S1top1 | 1 | $100M | 40 | 7.0 | 2.6 | 6.0/28 | 1 | 14.0 | 1.5 |
+| 23 | FMPEarningsDrift | goal6-small_ED_S7top2 | 1 | $1.1B | 20 | 4.0 | 1.5 | 6.0/28 | 0 | 12.0 | 3.0 |
+| 24 | FMPInsiderClusterBuy | goal6-small_ICB_S7top1 | 1 | (screener, small) | — | — | — | — | — | — | — |
+| 25 | FMPInsiderClusterBuy | goal6-mid_ICB_S7top2 | 1 | $6B | 40 | 0.0 | 1.2 | 6.0/7 | 1 | 12.0 | 5.0 |
+
+Notes: id 17 (`goal6-mid_ED_S2top1`, disabled for spread fragility, see §3) was replaced by id
+20, reseeded from `TOP1-scr-mid-FMPEarningsDrift-S2-goal6-spread` (backtest 660, the warm-start-
+with-spread job flagged as in-progress in §8) — held up better under spread resim. ids 21/22/23
+are net-new small-band deployments (2026-07-19), not reseeds — 21 closes the InsiderClusterBuy
+small-band gap, 22/23 close the EarningsDrift small-band gap (§2). id24 (bt717, S7-TOP1,
+70.49%/-11.64%DD/48.15%WR) closes the remaining InsiderClusterBuy small-band slot. id18
+(`goal6-mid_ICB_S7top1`, bt551, TOP1) **disabled and replaced by id25** (bt549, TOP2) — TOP1
+had been ranked #1 by the `consistent_annual_return` fitness metric purely on `trade_gate`
+(avg_trades_per_year 25.4 vs TOP2's 17.0, closer to the 30/yr target), but TOP2 beats it on
+total return (97.63% vs 68.87%), every single calendar year (2023/24/25), and has a *better*
+YoY consistency ratio (worst/mean 0.876 vs 0.860) at nearly identical drawdown — user-directed
+swap 2026-07-19. `ForwardTest` label moved bt551 -> bt549 accordingly.
 
 ### BA2-Test3 (account_id=3)
 
@@ -67,10 +84,18 @@ large-cap).
 |---|---|---|---|---|
 | FMPRating | 8 | 8 | **0 — at target count** | large/mid/small currently 3/3/2, not an even 2/2/2/2 — see note below |
 | FactorRanker | 6 | 2 | **+4 needed** | currently large-only (2/0/0); need mid + small (2 each) |
-| FMPEarningsDrift | 4 | 2 | **+2 needed** | currently mid-only (0/2/0); need small (2) — mid already covered |
-| FMPInsiderClusterBuy | 4 | 2 | **+2 needed** | currently mid-only (0/2/0); need small (2) — mid already covered |
+| FMPEarningsDrift | 4 | 4 | **0 — closed 2026-07-19** | mid (S1top1 id16, reseeded S2top1 id20) + small (S1top1 id22, S7top2 id23) — 2/2 |
+| FMPInsiderClusterBuy | 4 | 4 | **0 — closed 2026-07-19** | mid (S2top3 id19, S7top2 id25) + small (S1top3 id21, S7top1 id24) — 2/2 |
 | FMPSenateTraderWeight | 2 | 0 | **+2 needed** | not band-split (Senate's universe spans all bands — single blended assumption per `tools/run_senate_matrix.py`); Phase 3 of the grid sequence, not yet run |
-| **Total** | **24** | **14** | **+10 needed** | |
+| **Total** | **24** | **18** | **+6 needed** | |
+
+**2026-07-19 update — EarningsDrift small-band gap closed**: the small-band grid (opt166=S1,
+opt167=S2, plus S7 from an earlier phase, opt195) finished. S2's full top-5 (opt167:
+54.93%/60.11%/24.11%/50.73%/79.32% return) was checked against S1 and S7 per the process rule
+below and confirmed **not competitive** — every S2 individual landed below both S1's TOP1
+(111.44%, bt709) and S7's best (TOP2, 89.77%, bt704). Deployed bt709 (S1 TOP1) as id22 and
+bt704 (S7 TOP2, chosen over S7's own TOP1 at 79.9%) as id23, both tagged `ForwardTest` on their
+source `Backtest.labels`.
 
 Notes:
 - **FMPRating is at the target count (8) but not evenly split 2-per-band** — currently
@@ -260,11 +285,14 @@ runs from opt 116 and opt 119 specifically are still needed before reseeding eit
       existing $140B vs $70B vs $90B cap-min spread across the 3 current "large" instances).
 - [ ] Run mid-band and small-band FactorRanker optimization + deploy top-2 each (+4 toward
       the FactorRanker gap: 2 → 6).
-- [ ] Deploy top-2 from the small-band FMPEarningsDrift grid currently building (job 148 and
-      siblings) once complete (+2 toward the EarningsDrift gap: 2 → 4) — do NOT reuse backtest
-      562, it doesn't reliably reproduce (see §5).
-- [ ] Run small-band FMPInsiderClusterBuy (grid Phase 2, spread=40bps, queued after Phase 1b)
-      and deploy top-2 (+2 toward the InsiderClusterBuy gap: 2 → 4).
+- [x] **Done 2026-07-19** — deployed top small-band FMPEarningsDrift picks: S1 TOP1 (bt709,
+      id22) and S7 TOP2 (bt704, id23). Did NOT reuse backtest 562 (doesn't reliably reproduce,
+      see §5). S2 (opt167) top-5 fully checked and confirmed not competitive with S1/S7.
+      EarningsDrift gap closed: 2 → 4.
+- [x] **Done 2026-07-19** — small-band FMPInsiderClusterBuy: deployed both needed slots
+      (`goal6-small_ICB_S1top3`, bt626, id21; `goal6-small_ICB_S7top1`, bt717, id24).
+      InsiderClusterBuy gap closed: 2 → 4. Also swapped the mid `S7` deployment (id18 → id25,
+      TOP1 → TOP2) after a user-requested fitness review — see §1 notes.
 - [ ] Run Phase 3 of the grid (`tools/run_senate_matrix.py`, S2/S3/S5/S6) once Phases 1b/2
       finish, then deploy top-2 (0 → 2, closes the FMPSenateTraderWeight gap entirely).
 

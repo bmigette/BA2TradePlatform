@@ -268,7 +268,7 @@ class _StubBasketExpertReturnsSingleRec(MarketExpertInterface):
         )
 
 
-def _build_basket_run(account_id=53, expert_id=53, expert_cls=None):
+def _build_basket_run(account_id=53, expert_id=53, expert_cls=None, with_open_positions_ruleset=False):
     """Wire a backtest fixture for a stub BASKET expert (``analyzes_as_basket = True``).
 
     Mirrors ``_build_run`` above (the pre-fix, unmarked list-returning stub) and
@@ -278,6 +278,11 @@ def _build_basket_run(account_id=53, expert_id=53, expert_cls=None):
     RM / live-parity gates need to actually fund an order (``allow_automated_trade_opening`` /
     ``enable_buy`` — interface defaults are False/True and the RM gates on them). Returns
     (engine, account, expert, db_ctx, price_source). Caller MUST close db_ctx.
+
+    ``with_open_positions_ruleset``: seeds an (empty-actions) OPEN_POSITIONS ruleset and wires
+    it onto the ExpertInstance. Off by default (existing callers don't need it — ``_run_open_
+    positions`` no-ops without one: ``if not open_ruleset_id: return``). Needed by any test that
+    wants to exercise the OPEN_POSITIONS management pass for a held position.
     """
     from app.services.backtest.backtest_account import BacktestAccount
     from app.services.backtest.backtest_db import (
@@ -286,7 +291,7 @@ def _build_basket_run(account_id=53, expert_id=53, expert_cls=None):
         seed_expert_instance,
     )
     from app.services.backtest.daily_engine import DailyBacktestEngine
-    from app.services.backtest.default_rulesets import seed_enter_long_ruleset
+    from app.services.backtest.default_rulesets import seed_enter_long_ruleset, seed_open_positions_ruleset
     from app.services.backtest.price_source import AsOfPriceSource
     from app.services.backtest.seam_wiring import wire_backtest_seams
 
@@ -305,10 +310,15 @@ def _build_basket_run(account_id=53, expert_id=53, expert_cls=None):
 
     seed_account_definition(account_id, cfg)
     ruleset_id = seed_enter_long_ruleset(name="backtest-basket-dispatch-real")
+    open_positions_ruleset_id = (
+        seed_open_positions_ruleset([], name="backtest-basket-dispatch-real-open-positions")
+        if with_open_positions_ruleset else None
+    )
     seed_expert_instance(
         account_id=account_id,
         expert_class_name=expert_cls.__name__,
         enter_market_ruleset_id=ruleset_id,
+        open_positions_ruleset_id=open_positions_ruleset_id,
         instance_id=expert_id,
     )
 
@@ -840,6 +850,103 @@ _WEIGHT_SETTINGS_DEFAULT = {
     "skill_confidence_weight": 0.0,
 }
 _WEIGHT_EXEC_PRICE_BY_SYMBOL = {"AAPL": 95.0, "MSFT": 57.0}
+
+
+class _StubDualModeBasketExpert(MarketExpertInterface):
+    """Mimics FMPSenateTraderWeight/Copy's REAL dual-mode ``analyze_as_of`` branching (see
+    FMPSenateTraderWeight.analyze_as_of's docstring): ``context.extra.get("symbol")`` truthy ->
+    single ``Recommendation`` (the per-symbol OPEN_POSITIONS convention); falsy -> basket-mode
+    ``List[Recommendation]``. Unlike ``_StubBasketExpert`` above (which ALWAYS returns a list
+    regardless of context, so it can never exercise this branch), this stub is what actually
+    catches the ``_run_open_positions`` bug: that method built its ``BacktestContext`` WITHOUT
+    ``extra={"symbol": ...}`` (only the old ``expert._gather_symbol`` attribute pin), so a real
+    dual-mode expert always took the basket branch there too, returning a list where
+    ``_recommendation_to_expert_recommendation`` expects one ``Recommendation`` -- crashing on
+    ``rec.signal`` (confirmed: killed every trial in the 2026-07-19 Senate matrix run once a
+    trial opened its first position). Fixed by passing ``extra={"symbol": symbol}`` in
+    ``_run_open_positions``'s ``BacktestContext`` construction."""
+
+    analyzes_as_basket = True
+
+    def __init__(self, id: int):
+        super().__init__(id)
+        self.basket_call_count = 0
+        self.single_call_count = 0
+
+    @classmethod
+    def description(cls) -> str:  # abstract
+        return "Stub dual-mode basket expert (branches on context.extra['symbol'])."
+
+    def render_market_analysis(self, market_analysis) -> str:  # abstract
+        return ""
+
+    def run_analysis(self, symbol: str, market_analysis) -> None:  # abstract
+        return None
+
+    def analyze_as_of(self, as_of, context):
+        symbol = context.extra.get("symbol")
+        if symbol:
+            self.single_call_count += 1
+            return Recommendation(
+                signal=OrderRecommendation.HOLD, confidence=80.0, current_price=100.0,
+                details="stub single rec (per-symbol OPEN_POSITIONS convention)",
+            )
+        self.basket_call_count += 1
+        return [
+            Recommendation(
+                signal=OrderRecommendation.BUY, confidence=80.0, current_price=100.0,
+                details="stub basket rec", raw_outputs={"symbol": "AAPL"},
+            ),
+        ]
+
+
+def test_dual_mode_basket_expert_open_positions_management_does_not_crash():
+    """Regression for the ``_run_open_positions`` bug: a dual-mode basket expert (branches on
+    ``context.extra.get("symbol")``, exactly like the real FMPSenateTraderWeight/Copy) must NOT
+    crash when the engine manages an already-open position on a later bar.
+
+    Without the fix, ``_run_open_positions`` never set ``context.extra["symbol"]``, so
+    ``analyze_as_of`` always took the basket branch and returned ``List[Recommendation]`` where
+    ``_recommendation_to_expert_recommendation`` expects a single ``Recommendation`` --
+    ``AttributeError: 'list' object has no attribute 'signal'``, propagating out of
+    ``engine.run()`` and killing the whole backtest. ``_StubBasketExpert`` (used by the other
+    tests in this file) cannot catch this: it ignores ``context`` entirely and always returns a
+    list, so it never proves the per-symbol branch is reachable from OPEN_POSITIONS."""
+    engine, account, expert, ctx, ps = _build_basket_run(
+        account_id=59, expert_id=59, expert_cls=_StubDualModeBasketExpert,
+        with_open_positions_ruleset=True,
+    )
+    try:
+        # Entry cadence: Tuesday only (bar 1) -> one funded position by bar 2 (next_bar_open
+        # fill). Manage cadence: every day -> OPEN_POSITIONS management actually reaches the
+        # held position on later bars, exactly like
+        # test_basket_expert_manage_open_positions_runs_when_entry_ok_false above.
+        engine.config["run_schedule_override"] = {
+            "days": {"monday": False, "tuesday": True, "wednesday": False, "thursday": False,
+                     "friday": False, "saturday": False, "sunday": False},
+        }
+        engine.config["manage_schedule_override"] = {
+            "days": {"monday": True, "tuesday": True, "wednesday": True, "thursday": True,
+                     "friday": True, "saturday": True, "sunday": True},
+        }
+
+        # Must NOT raise.
+        engine.run()
+
+        # The entry pass took the basket branch (no symbol pinned) at least once.
+        assert expert.basket_call_count >= 1
+
+        # A position was opened from the basket entry (AAPL, per the stub's fixed rec).
+        positions = account.get_positions()
+        assert len(positions) >= 1
+        assert {p["symbol"] for p in positions} <= {"AAPL"}
+
+        # OPEN_POSITIONS management called analyze_as_of with a symbol pinned (the per-symbol
+        # branch) at least once -- proving _run_open_positions's BacktestContext now carries
+        # extra={"symbol": ...}, not just the old attribute pin.
+        assert expert.single_call_count >= 1
+    finally:
+        ctx.__exit__(None, None, None)
 
 
 def test_fmp_senate_trader_weight_produces_recommendations_in_backtest():
