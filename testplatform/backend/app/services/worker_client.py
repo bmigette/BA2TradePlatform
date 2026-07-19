@@ -55,8 +55,54 @@ def quick_status(worker: dict, timeout: float = 1.5) -> tuple:
         return ("offline", None)
 
 
+class WorkerJobLost(Exception):
+    """A submitted job's id came back 404 on poll — the worker doesn't know it anymore, almost
+    always because the worker process restarted (self-update, crash, manual kill) after the
+    submit and before the trial finished. The trial's outcome is simply unknowable now; the
+    caller should treat this like any other worker failure (existing call sites already catch
+    broad ``Exception`` and requeue/retry — see distributed_eval.py's ``_dispatch_remote``)."""
+
+
+def _submit_and_poll(worker: dict, submit_path: str, payload: dict, timeout: float,
+                     poll_interval: float = 2.0) -> dict:
+    """POST *payload* to *submit_path* for a job_id, then GET /job-status/{job_id} every
+    ``poll_interval`` seconds until it reports done. Raises WorkerJobLost immediately (no
+    waiting) if the worker no longer recognizes the job_id — the fast-failure case a blocking
+    request could never distinguish from "still working" (2026-07-19: replaced the old
+    single-long-blocking-POST design specifically to fix this — see worker_server.py's
+    module docstring for the full incident this was written to prevent).
+
+    Each individual HTTP call (submit, each poll) uses its own SHORT timeout — only the overall
+    *timeout* budget is long, so a single dropped connection fails fast and gets retried on the
+    next poll tick instead of hanging for the full budget.
+    """
+    call_timeout = min(30.0, timeout)
+    with httpx.Client(timeout=call_timeout) as c:
+        r = c.post(f"{_base(worker)}{submit_path}", headers=_headers(worker), json=payload)
+        r.raise_for_status()
+        job_id = r.json()["job_id"]
+
+    deadline = time.monotonic() + timeout
+    status_url = f"{_base(worker)}/job-status/{job_id}"
+    with httpx.Client(timeout=call_timeout) as c:
+        while True:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"worker {worker.get('name')} job {job_id} did not "
+                                   f"complete within {timeout:.0f}s")
+            r = c.get(status_url, headers=_headers(worker))
+            if r.status_code == 404:
+                raise WorkerJobLost(f"worker {worker.get('name')} job {job_id} unknown "
+                                    f"(worker likely restarted mid-job)")
+            r.raise_for_status()
+            body = r.json()
+            if body["status"] == "done":
+                return body["result"]
+            time.sleep(poll_interval)
+
+
 def run_trial(worker: dict, config: dict, fitness_metric: str, timeout: float = 1800.0) -> dict:
-    """Push ONE trial to the worker and return its ``{ok,fitness,trades,error,fatal}`` summary.
+    """Submit ONE trial to the worker and poll until it returns its ``{ok,fitness,trades,error,
+    fatal}`` summary (same external contract as before — callers don't need to change).
 
     Sends the master's ``cache_root`` so the worker can remap absolute cache paths embedded in the
     config (screener_store, options_cache_db, ...) to ITS OWN local cache — the master and worker
@@ -64,30 +110,23 @@ def run_trial(worker: dict, config: dict, fitness_metric: str, timeout: float = 
     """
     from ba2_common.config import CACHE_FOLDER
     from app.services.backtest.backtest_db import _inmem_trades_enabled
-    with httpx.Client(timeout=timeout) as c:
-        r = c.post(f"{_base(worker)}/run-trial", headers=_headers(worker),
-                   json={"config": config, "fitness_metric": fitness_metric,
-                         "cache_root": CACHE_FOLDER,
-                         # Propagate the sql-less "dict trades" flag so distributed trials use the
-                         # SAME backend (and thus byte-identical economics) as the master.
-                         "inmem_trades": _inmem_trades_enabled()})
-        r.raise_for_status()
-        return r.json()
+    payload = {"config": config, "fitness_metric": fitness_metric, "cache_root": CACHE_FOLDER,
+              # Propagate the sql-less "dict trades" flag so distributed trials use the
+              # SAME backend (and thus byte-identical economics) as the master.
+              "inmem_trades": _inmem_trades_enabled()}
+    return _submit_and_poll(worker, "/submit-trial", payload, timeout)
 
 
 def run_trial_full(worker: dict, config: dict, fitness_metric: str, timeout: float = 1800.0) -> dict:
     """Like ``run_trial`` but returns ``{ok, results:{...}}`` (the full backtest results dict)
     instead of the trimmed summary — an operator/debug tool for diagnosing a fitness mismatch
-    against a master-side result field-by-field, not the hot GA path."""
+    against a master-side result field-by-field, and for remote top-N persist re-runs, not the
+    hot GA path."""
     from ba2_common.config import CACHE_FOLDER
     from app.services.backtest.backtest_db import _inmem_trades_enabled
-    with httpx.Client(timeout=timeout) as c:
-        r = c.post(f"{_base(worker)}/run-trial-full", headers=_headers(worker),
-                   json={"config": config, "fitness_metric": fitness_metric,
-                         "cache_root": CACHE_FOLDER,
-                         "inmem_trades": _inmem_trades_enabled()})
-        r.raise_for_status()
-        return r.json()
+    payload = {"config": config, "fitness_metric": fitness_metric, "cache_root": CACHE_FOLDER,
+              "inmem_trades": _inmem_trades_enabled()}
+    return _submit_and_poll(worker, "/submit-trial-full", payload, timeout)
 
 
 def push_cache(worker: dict, log: Callable[[str], None] = logger.info) -> dict:

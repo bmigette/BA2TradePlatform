@@ -91,11 +91,18 @@ class TrialBroker:
             return True
 
     def requeue_stale(self, claim_timeout: float = 300.0) -> int:
-        """Re-queue trials claimed longer than *claim_timeout* ago (dead worker). Returns count."""
+        """Re-queue trials claimed *claim_timeout* or more ago (dead worker). Returns count.
+
+        >= not > (fixed 2026-07-19): time.time() can return the IDENTICAL value across two
+        back-to-back calls on this platform (confirmed: 1000/1000 zero-diff pairs), so a
+        claim() immediately followed by requeue_stale(claim_timeout=0) could see
+        now == claim_time exactly -- a strict > silently treated that as "not stale yet",
+        which is also the wrong semantics for a timeout boundary generally (a trial claimed
+        EXACTLY claim_timeout ago should count as stale, not be exempt by one tick)."""
         now = time.time()
         with self._cv:
             stale = [tid for tid, c in self._claimed.items()
-                     if now - c["claim_time"] > claim_timeout]
+                     if now - c["claim_time"] >= claim_timeout]
             for tid in stale:
                 c = self._claimed.pop(tid)
                 self._pending.appendleft(c["trial"])

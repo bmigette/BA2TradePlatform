@@ -1,4 +1,5 @@
-"""Worker server gate — password auth, /run-trial via the pool, and tar /cache/push extraction."""
+"""Worker server gate — password auth, /submit-trial + /job-status via the pool, and tar
+/cache/push extraction."""
 import io
 
 import pytest
@@ -8,8 +9,14 @@ from app.services import cache_sync
 
 
 class _FakeFuture:
+    """Immediately-resolved stand-in for concurrent.futures.Future -- .done() is always True,
+    matching a pool that finishes synchronously inside .submit() (fine for these tests: they
+    only care about the request/response shape, not real async timing)."""
     def __init__(self, v):
         self._v = v
+
+    def done(self):
+        return True
 
     def result(self):
         return self._v
@@ -31,7 +38,17 @@ def client(monkeypatch):
     monkeypatch.setattr(ws, "_PASSWORD", "secret")
     monkeypatch.setattr(ws, "_CAPACITY", 4)
     monkeypatch.setattr(ws, "_POOL", _FakePool())
+    # Fresh job registry per test (module-level dicts would otherwise bleed state across tests).
+    monkeypatch.setattr(ws, "_JOBS", {})
+    monkeypatch.setattr(ws, "_JOBS_SUBMITTED_AT", {})
     return TestClient(ws.worker_app)
+
+
+def _submit_and_get_job_id(client, path, config=None):
+    r = client.post(path, headers=H,
+                    json={"config": config or {"v": 1}, "fitness_metric": "sharpe"})
+    assert r.status_code == 200
+    return r.json()["job_id"]
 
 
 H = {"Authorization": "Bearer secret"}
@@ -49,20 +66,75 @@ def test_version(client):
     assert r.status_code == 200 and "git_commit" in r.json()
 
 
-def test_run_trial(client):
-    r = client.post("/run-trial", headers=H,
-                    json={"config": {"v": 1}, "fitness_metric": "sharpe"})
+def test_submit_trial_then_poll_returns_done_with_result(client):
+    job_id = _submit_and_get_job_id(client, "/submit-trial")
+    r = client.get(f"/job-status/{job_id}", headers=H)
     assert r.status_code == 200
-    assert r.json() == {"ok": True, "fitness": 42.0, "trades": 3, "error": None}
-    # auth still enforced
-    assert client.post("/run-trial", json={"config": {}, "fitness_metric": "x"}).status_code == 401
+    assert r.json() == {"status": "done",
+                        "result": {"ok": True, "fitness": 42.0, "trades": 3, "error": None}}
+    # auth still enforced on both endpoints
+    assert client.post("/submit-trial", json={"config": {}, "fitness_metric": "x"}).status_code == 401
+    assert client.get(f"/job-status/{job_id}").status_code == 401
+
+
+def test_job_status_running_before_done(client, monkeypatch):
+    """A future that isn't done yet must report {"status": "running"}, not block."""
+    class _PendingFuture:
+        def done(self):
+            return False
+
+    monkeypatch.setattr(ws, "_JOBS", {"pending-job": _PendingFuture()})
+    r = client.get("/job-status/pending-job", headers=H)
+    assert r.status_code == 200 and r.json() == {"status": "running"}
+
+
+def test_job_status_unknown_id_returns_404(client):
+    """An id the registry has never seen -- including one from BEFORE a restart, since the
+    registry is in-memory only -- must 404 so the client can fail fast (see worker_client.py's
+    WorkerJobLost) instead of polling forever."""
+    r = client.get("/job-status/never-existed", headers=H)
+    assert r.status_code == 404
+
+
+def test_job_status_is_one_shot(client):
+    """Once a done job's result has been fetched, the SAME job_id must 404 on a second poll —
+    proves the registry entry is popped (bounded growth), not leaked."""
+    job_id = _submit_and_get_job_id(client, "/submit-trial")
+    first = client.get(f"/job-status/{job_id}", headers=H)
+    assert first.status_code == 200 and first.json()["status"] == "done"
+    second = client.get(f"/job-status/{job_id}", headers=H)
+    assert second.status_code == 404
+
+
+def test_submit_trial_broken_pool_at_submit_time_yields_retryable_done_job(client, monkeypatch):
+    """A pool that's ALREADY broken when /submit-trial is called (submit() itself raises) must
+    still hand back a normal job_id -- polling it should report done with a retryable failure,
+    not a submit-time 500."""
+    from concurrent.futures.process import BrokenProcessPool
+
+    class _DeadPool:
+        def submit(self, *a, **k):
+            raise BrokenProcessPool("already dead")
+
+    monkeypatch.setattr(ws, "_POOL", _DeadPool())
+    rebuilt = []
+    monkeypatch.setattr(ws, "_rebuild_pool", lambda exc: rebuilt.append(exc))
+
+    job_id = _submit_and_get_job_id(client, "/submit-trial")
+    r = client.get(f"/job-status/{job_id}", headers=H)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "done"
+    assert body["result"]["retryable"] is True
+    assert len(rebuilt) == 1
 
 
 def test_shutdown_pool_for_restart_stops_rebuild(monkeypatch):
     """_shutdown_pool_for_restart() must clear _POOL_FACTORY (not just _POOL) so a concurrent
-    /run-trial handler that catches BrokenProcessPool during the restart window no-ops instead
-    of spawning a fresh pool that _kill_children() would immediately kill again — the
-    rebuild-then-kill storm this fix prevents."""
+    /submit-trial handler (or /job-status, polling a future that breaks) that catches
+    BrokenProcessPool during the restart window no-ops instead of spawning a fresh pool that
+    _kill_children() would immediately kill again — the rebuild-then-kill storm this fix
+    prevents."""
     built = []
     monkeypatch.setattr(ws, "_POOL", _FakePool())
     monkeypatch.setattr(ws, "_POOL_FACTORY", lambda: built.append(1) or _FakePool())
@@ -102,12 +174,13 @@ def test_cache_manifest_with_hash(client, tmp_path, monkeypatch):
     assert r.status_code == 200 and "crc32" in r.json()["files"][0]
 
 
-def test_run_trial_full_returns_complete_results(client):
-    r = client.post("/run-trial-full", headers=H,
-                    json={"config": {"v": 1}, "fitness_metric": "sharpe"})
+def test_submit_trial_full_then_poll_returns_complete_results(client):
+    job_id = _submit_and_get_job_id(client, "/submit-trial-full")
+    r = client.get(f"/job-status/{job_id}", headers=H)
     assert r.status_code == 200
-    assert r.json() == {"ok": True, "results": {"total_return": 12.3, "total_trades": 5}}
-    assert client.post("/run-trial-full", json={"config": {}, "fitness_metric": "x"}).status_code == 401
+    assert r.json() == {"status": "done",
+                        "result": {"ok": True, "results": {"total_return": 12.3, "total_trades": 5}}}
+    assert client.post("/submit-trial-full", json={"config": {}, "fitness_metric": "x"}).status_code == 401
 
 
 def test_cache_prune_deletes_stale_leftovers(client, tmp_path, monkeypatch):
@@ -144,6 +217,19 @@ def test_localize_paths_remaps_master_cache_to_local():
     assert out["experts"] == [{"class": "FMPRating"}] and out["seed"] == 42  # untouched
     # a path NOT under the master cache root is left alone
     assert ws._localize_paths("/some/other/path", r"C:\Users\basti\Documents\ba2\common\cache", "/local/c") == "/some/other/path"
+
+
+def test_localize_paths_windows_to_windows_worker_uses_backslashes():
+    """The real production topology (master + remote150 both Windows): local_root is itself a
+    backslash path, so the remapped result must be ALL backslashes too, not mixed -- os.path.join
+    would have been fine here in isolation, but the fix must not regress THIS common case while
+    fixing the POSIX-local_root one above."""
+    out = ws._localize_paths(
+        r"C:\Users\basti\Documents\ba2\common\cache\screener\metric_store",
+        r"C:\Users\basti\Documents\ba2\common\cache",
+        r"D:\ba2-worker\cache",
+    )
+    assert out == r"D:\ba2-worker\cache\screener\metric_store"
 
 
 def test_cache_push_rejects_traversal(client, tmp_path, monkeypatch):

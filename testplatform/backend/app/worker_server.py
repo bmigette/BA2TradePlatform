@@ -7,17 +7,29 @@ the master (``_trial_worker``) in its own process pool, mirrors the master's cac
 Run it with: ``ba2-test worker --port 8100 --password <secret> [--workers N]``.
 
 Endpoints (every one bearer-checked against the worker password):
-  GET  /health         -> {ok, capacity, cpu, gpu, version}
-  GET  /version        -> {app_version, git_commit, ...}
-  GET  /cache/manifest -> {files:[{rel_path,size,...}], ...}   (what this worker already has)
-  POST /cache/push     -> accept a tar STREAM, extract into CACHE_FOLDER
-  POST /cache/prune    -> {rel_paths} -> delete leftovers from a master-side rebuild/compaction
-  POST /run-trial      -> {config, fitness_metric} -> {ok, fitness, trades, error, fatal}
-  POST /run-trial-full -> {config, fitness_metric} -> {ok, results:{...full backtest results}}
+  GET  /health              -> {ok, capacity, cpu, gpu, version}
+  GET  /version              -> {app_version, git_commit, ...}
+  GET  /cache/manifest       -> {files:[{rel_path,size,...}], ...}   (what this worker already has)
+  POST /cache/push           -> accept a tar STREAM, extract into CACHE_FOLDER
+  POST /cache/prune          -> {rel_paths} -> delete leftovers from a master-side rebuild/compaction
+  POST /submit-trial         -> {config, fitness_metric} -> {job_id}      (async; poll /job-status)
+  POST /submit-trial-full    -> {config, fitness_metric} -> {job_id}      (async; poll /job-status)
+  GET  /job-status/{job_id}  -> {status: running} | {status: done, result: {...}}  (404 if unknown)
   POST /sync/strategy     -> {...Strategy row + natural keys} -> upsert by (name, created_at)
   POST /sync/optimization -> {...StrategyOptimization row + strategy natural key} -> upsert
   POST /sync/backtest     -> {...Backtest row + strategy/optimization natural keys} -> upsert
   POST /update         -> git pull + reinstall + restart (self_update)
+
+SUBMIT/POLL, NOT A BLOCKING CALL (2026-07-19): /submit-trial(-full) return a job_id
+IMMEDIATELY; the actual trial runs in the background pool and the master polls
+/job-status/{job_id} every couple seconds until it reports done. This replaces the old
+synchronous /run-trial(-full) (removed) that held a client HTTP connection open for the
+WHOLE trial (up to a 1800s client-side timeout) -- if THIS worker restarted mid-request
+(e.g. an /update landing right as a trial was in flight, or any other connection drop),
+the master had no way to notice until that full timeout elapsed. A restart wipes _JOBS
+(in-memory only, by design), so a poll for a job_id from before the restart gets a clean
+404 within one poll interval (a couple seconds) instead of a ~30-minute stall — see
+worker_client.py's WorkerJobLost.
 """
 
 from __future__ import annotations
@@ -27,7 +39,8 @@ import logging
 import os
 import tempfile
 import threading
-from concurrent.futures import ProcessPoolExecutor
+import uuid
+from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from typing import Optional
 
@@ -49,6 +62,18 @@ _POOL: Optional[ProcessPoolExecutor] = None
 # Rebuilds _POOL after a BrokenProcessPool (set alongside _POOL in run_worker_server).
 _POOL_FACTORY = None
 _POOL_LOCK = threading.Lock()
+
+# In-memory submit/poll job registry (2026-07-19): job_id -> Future. Deliberately NOT
+# persisted anywhere — a restart wiping this is the FEATURE (see module docstring's
+# "SUBMIT/POLL" note): a poll for a pre-restart job_id must come back "unknown" fast, not
+# hang. A finished job is popped on its first successful status fetch (one-shot; the
+# master never polls the same job_id twice), so this stays small in the steady state.
+# Entries only accumulate if a client submits and then never polls (crash) — bounded by
+# _JOBS_MAX_ORPHAN_AGE's sweep below.
+_JOBS: dict[str, Future] = {}
+_JOBS_SUBMITTED_AT: dict[str, float] = {}
+_JOBS_LOCK = threading.Lock()
+_JOBS_MAX_ORPHAN_AGE = 6 * 3600.0  # 6h: generous vs. any real trial; just bounds a leak
 
 
 def _dump_worker_memory(context: str) -> None:
@@ -72,8 +97,8 @@ def _dump_worker_memory(context: str) -> None:
 
 def _rebuild_pool(exc: Exception) -> None:
     """Swap the broken trial pool for a fresh one (same recovery pattern as the master's
-    DistributedEvaluator._recover_pool). Under a lock so concurrent /run-trial threads
-    rebuild once, not once each."""
+    DistributedEvaluator._recover_pool). Under a lock so concurrent /submit-trial or
+    /job-status callers rebuild once, not once each."""
     global _POOL
     with _POOL_LOCK:
         if _POOL_FACTORY is None:
@@ -88,6 +113,70 @@ def _rebuild_pool(exc: Exception) -> None:
         except Exception:  # noqa: BLE001 — best-effort cleanup of the already-dead pool
             pass
         _POOL = _POOL_FACTORY()
+
+
+def _sweep_orphaned_jobs() -> None:
+    """Drop job registry entries older than _JOBS_MAX_ORPHAN_AGE that were never polled to
+    completion (client crashed / gave up before fetching the result) — called opportunistically
+    from _submit_job so it costs nothing on the (normal) submit-then-poll-once path."""
+    import time as _time
+    cutoff = _time.monotonic() - _JOBS_MAX_ORPHAN_AGE
+    with _JOBS_LOCK:
+        stale = [jid for jid, ts in _JOBS_SUBMITTED_AT.items() if ts < cutoff]
+        for jid in stale:
+            _JOBS.pop(jid, None)
+            _JOBS_SUBMITTED_AT.pop(jid, None)
+    if stale:
+        logger.warning("swept %d orphaned job(s) never polled to completion: %s", len(stale), stale)
+
+
+def _submit_job(fn, *args) -> str:
+    """Submit *fn(*args)* to the trial pool, register it under a fresh job_id, and return that
+    id immediately (does NOT wait for the trial). A BrokenProcessPool AT SUBMIT time (the pool
+    was already dead) is handled the same way a broken pool during execution is: rebuild it and
+    hand back a job whose result is already the retryable-failure dict, so the client's poll
+    loop sees a normal 'done' status instead of a submit-time 500."""
+    import time as _time
+    _sweep_orphaned_jobs()
+    if _POOL is None:
+        raise HTTPException(status_code=503, detail="Worker pool not initialized.")
+    job_id = uuid.uuid4().hex
+    try:
+        future = _POOL.submit(fn, *args)
+    except BrokenProcessPool as e:
+        _rebuild_pool(e)
+        future = Future()
+        future.set_result({"ok": False, "error": repr(e), "fatal": False, "retryable": True})
+    with _JOBS_LOCK:
+        _JOBS[job_id] = future
+        _JOBS_SUBMITTED_AT[job_id] = _time.monotonic()
+    return job_id
+
+
+def _job_status(job_id: str) -> dict:
+    """Poll one job: {"status": "running"} while in flight, or {"status": "done", "result":
+    {...}} once finished (popping the registry entry — one-shot fetch). Raises 404 if job_id
+    is unknown, which happens for a genuinely bad id AND, deliberately, for any id from
+    before this process's last restart (the registry is in-memory only) — see the module
+    docstring's SUBMIT/POLL note for why that's the point, not a bug."""
+    with _JOBS_LOCK:
+        future = _JOBS.get(job_id)
+    if future is None:
+        raise HTTPException(status_code=404, detail=f"job {job_id!r} unknown (unrecognized id, "
+                                                     f"or this worker restarted since it was submitted).")
+    if not future.done():
+        return {"status": "running"}
+    with _JOBS_LOCK:
+        _JOBS.pop(job_id, None)
+        _JOBS_SUBMITTED_AT.pop(job_id, None)
+    try:
+        result = future.result()
+    except BrokenProcessPool as e:
+        _rebuild_pool(e)
+        result = {"ok": False, "error": repr(e), "fatal": False, "retryable": True}
+    except Exception as e:  # noqa: BLE001 — surface as a failed trial, never 500 the poller
+        result = {"ok": False, "error": repr(e), "fatal": False}
+    return {"status": "done", "result": result}
 
 # Bound lazily on first sync request (see _sync_session()) so tests can monkeypatch it to an
 # isolated DB, and so importing this module doesn't eagerly touch app.models.database.
@@ -161,7 +250,14 @@ def _localize_paths(obj, master_root: str, local_root: str):
         v = obj.replace("\\", "/")
         if v == mr or v.startswith(mr + "/"):
             rel = v[len(mr):].lstrip("/")
-            return os.path.join(local_root, *rel.split("/")) if rel else local_root
+            if not rel:
+                return local_root
+            # Join using WHATEVER separator local_root itself already uses (NOT os.path.join,
+            # which would splice in THIS process's os.sep regardless of local_root's own
+            # style — worker and master aren't guaranteed to be the same OS, and even on the
+            # same OS this must be a pure string transform to stay deterministic/testable).
+            sep = "\\" if ("\\" in local_root and "/" not in local_root) else "/"
+            return local_root.rstrip("/\\") + sep + rel.replace("/", sep)
         return obj
     if isinstance(obj, dict):
         return {k: _localize_paths(val, master_root, local_root) for k, val in obj.items()}
@@ -222,57 +318,48 @@ async def cache_push(request: Request, authorization: str = Header(default=None)
             pass
 
 
-@worker_app.post("/run-trial")
-def run_trial(req: RunTrialReq, authorization: str = Header(default=None)):
-    """Run ONE deterministic trial in the worker pool and return its summary (synchronous).
-
-    Defined as a sync endpoint so FastAPI runs it in its threadpool — blocking on the process
-    future here ties up one threadpool thread (fine), not the event loop. The master sends up to
-    ``capacity`` concurrent calls to saturate the pool.
-    """
+@worker_app.post("/submit-trial")
+def submit_trial(req: RunTrialReq, authorization: str = Header(default=None)):
+    """Submit ONE deterministic trial to the worker pool and return a job_id IMMEDIATELY —
+    does not wait for the trial. Poll /job-status/{job_id} for the result (see module
+    docstring's SUBMIT/POLL note for why this replaced the old blocking /run-trial)."""
     _verify(authorization)
     _apply_inmem_trades_flag(req.inmem_trades)
     from app.services.strategy_optimization_handler import _trial_worker
-    if _POOL is None:
-        raise HTTPException(status_code=503, detail="Worker pool not initialized.")
     config = req.config
     if req.cache_root:
         from ba2_common.config import CACHE_FOLDER
         config = _localize_paths(req.config, req.cache_root, CACHE_FOLDER)
-    try:
-        return _POOL.submit(_trial_worker, config, req.fitness_metric).result()
-    except BrokenProcessPool as e:
-        # A dead child (e.g. WinError 1450 killing it mid-IPC) poisons the WHOLE pool: every
-        # later submit raises instantly. Rebuild the pool (with a memory dump so we see what
-        # depleted the box) and tell the master the failure is RETRYABLE — it says nothing
-        # about the genome, so the trial must be requeued, not recorded as a failed result.
-        _rebuild_pool(e)
-        return {"ok": False, "fitness": 0.0, "trades": 0, "error": repr(e), "fatal": False,
-                "retryable": True}
-    except Exception as e:  # noqa: BLE001 — surface as a failed trial, never 500 the dispatcher
-        return {"ok": False, "fitness": 0.0, "trades": 0, "error": repr(e), "fatal": False}
+    job_id = _submit_job(_trial_worker, config, req.fitness_metric)
+    return {"job_id": job_id}
 
 
-@worker_app.post("/run-trial-full")
-def run_trial_full(req: RunTrialReq, authorization: str = Header(default=None)):
-    """Like ``/run-trial`` but returns the FULL results dict (equity curve, metrics, ...) instead
-    of the trimmed ``{ok,fitness,trades,error}`` summary — for diagnosing a fitness mismatch
-    against a master-side result field-by-field. Not on the hot GA path (that stays on
-    ``/run-trial``'s small payload); this is an operator/debug tool."""
+@worker_app.post("/submit-trial-full")
+def submit_trial_full(req: RunTrialReq, authorization: str = Header(default=None)):
+    """Like ``/submit-trial`` but for the FULL results dict (equity curve, metrics, ...)
+    instead of the trimmed ``{ok,fitness,trades,error}`` summary — for diagnosing a fitness
+    mismatch against a master-side result field-by-field, or persisting a top-N backtest.
+    Not on the hot GA path (that stays on ``/submit-trial``'s small payload); this is an
+    operator/debug + top-N-persist tool."""
     _verify(authorization)
     _apply_inmem_trades_flag(req.inmem_trades)
     from app.services.strategy_optimization_handler import _persist_trial_worker
-    if _POOL is None:
-        raise HTTPException(status_code=503, detail="Worker pool not initialized.")
     config = req.config
     if req.cache_root:
         from ba2_common.config import CACHE_FOLDER
         config = _localize_paths(req.config, req.cache_root, CACHE_FOLDER)
-    try:
-        return _POOL.submit(_persist_trial_worker, config).result()
-    except BrokenProcessPool as e:
-        _rebuild_pool(e)
-        return {"ok": False, "error": repr(e), "retryable": True}
+    job_id = _submit_job(_persist_trial_worker, config)
+    return {"job_id": job_id}
+
+
+@worker_app.get("/job-status/{job_id}")
+def job_status(job_id: str, authorization: str = Header(default=None)):
+    """Poll a job submitted via /submit-trial or /submit-trial-full. 404 means the id is
+    unknown — either a bad id, or (deliberately, see module docstring) this worker process
+    restarted since the job was submitted, so the caller should treat it as lost and retry
+    rather than keep polling."""
+    _verify(authorization)
+    return _job_status(job_id)
 
 
 @worker_app.post("/cache/prune")
