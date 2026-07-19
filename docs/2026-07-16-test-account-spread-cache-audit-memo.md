@@ -4,6 +4,16 @@ Working memo for deciding what to update. Covers: current dev-account deployment
 per-deployment spread-robustness resim, the mid-band FMPEarningsDrift warm-start-with-spread
 results, and the cache/data-quality findings that came up along the way.
 
+## Process rule: tag every deployed backtest's source with `ForwardTest`
+
+**Whenever a `Backtest` row (test-platform DB) is deployed to a live `ExpertInstance`
+(either account, dev or prod), add `"ForwardTest"` to that backtest's `labels` field.**
+This marks it as "the specific run whose settings are live" so it's filterable in
+`ba2-test runs`/the History UI, distinct from every other trial the GA produced for the
+same job. Added retroactively 2026-07-19 to all 15 backtests currently backing a live
+instance (§1); apply going forward on every new deploy (e.g. right after the
+`add_instance(ExpertInstance(...))` step in a deploy script).
+
 ## 1. Currently deployed instances (dev trade platform: `ba2\trade\db.sqlite`)
 
 3 accounts (`BA2-Test1`/`2`/`3`, all Alpaca). 15 `ExpertInstance` rows total; 2 disabled today

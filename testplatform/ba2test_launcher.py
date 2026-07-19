@@ -625,7 +625,13 @@ def _cmd_prewarm(args) -> int:
         # universe symbol, so it runs once regardless of order relative to the per-symbol loop
         # above; placed here (serially, still inside the freeze gate) alongside the other
         # one-shot senate prewarm steps below.
-        if "FMPSenateTraderWeight" in experts:
+        #
+        # FMPSenateTraderCopy also needs this now (review 2026-07-18, finding H2):
+        # basket-mode Copy's _gather was fixed to fetch full_history=True too (same
+        # ALL_FULL_HISTORY cache key Weight reads), so a hermetic backtest/GA run including
+        # Copy without Weight in the same run must warm it too, or it hits a cache miss on
+        # the first bar.
+        if "FMPSenateTraderWeight" in experts or "FMPSenateTraderCopy" in experts:
             _do_senate_latest()
 
         # Skill-score prewarm runs AFTER the per-symbol loop above (needs its fully-populated
@@ -1095,6 +1101,19 @@ _RM_OPT = {
     "max_virtual_equity_per_instrument_percent": {"optimize": True, "min": 5.0, "max": 30.0, "step": 5.0, "type": "float"},
 }
 
+# Bypass experts (FactorRanker) size their own portfolio and skip the classic per-trade RM
+# entirely, EXCEPT for one piece it still reuses: daily_engine.py's _apply_bypass_stops applies
+# risk_per_trade_pct as a per-name max-loss-vs-equity stop on non-rebalance bars (see that
+# method's docstring). Before 2026-07-19 this was left off bypass experts' gene space entirely,
+# so it sat frozen at MarketExpertInterface's 1.0% default for every band/individual — measured
+# as a major contributor to small-band FactorRanker underperformance (26.2% of small-band trades
+# were quick same-day stop-outs vs 3.1% for large). Exposed as its own (narrower) gene set so the
+# GA can actually tune it, instead of the full _RM_OPT block (whose other keys — ATR/min-stop/
+# max-virtual-equity — have no bypass-path reader).
+_BYPASS_RM_OPT = {
+    "risk_per_trade_pct": {"optimize": True, "min": 0.5, "max": 10.0, "step": 0.5, "type": "float"},
+}
+
 # Per-weekday entry-scan ON/OFF toggle genes (schedule:<day>): merged into expert_params
 # pre-namespaced with `schedule:` so collect_param_space/decode_params route them to the schedule
 # namespace (see _collect_schedule_days/decode_params in strategy_param_space.py). Replaces a
@@ -1115,7 +1134,13 @@ _SCHEDULE_DAY_OPT = {
 # namespace (see _collect_screener / decode_params in strategy_param_space.py).
 _SCREENER_OPT = {
     "screener_market_cap_min": {"min": 2e9, "max": 1e10, "step": 1e9, "type": "float", "optimize": True},
-    "screener_relative_volume_min": {"min": 1.0, "max": 3.0, "step": 0.1, "type": "float", "optimize": True},
+    # Floor lowered 1.0->0.0 (2026-07-19): FactorRanker's own docs say this gate is
+    # penny-momentum-oriented and should be 0 for factor strategies, but the floor never let the
+    # GA reach 0. Measured against the live metric_store at the GA's winning mid/small-band gene
+    # combos: 0-5 candidates/week (mid), 0 candidates on 4/5 sampled dates (small) — this gate was
+    # the primary cause of small-band FactorRanker trade starvation, not a lack of factor edge.
+    # screener_price_drop_pct already floors at 0 for every expert; this brings rvol_min in line.
+    "screener_relative_volume_min": {"min": 0.0, "max": 3.0, "step": 0.1, "type": "float", "optimize": True},
     "screener_price_drop_pct": {"min": 0.0, "max": 25.0, "step": 1.0, "type": "float", "optimize": True},
     # Lookback window Y (trading days) for the price-drop gate: selects the precomputed
     # price_drop_pct_<Y> column in a multi-window store (build with --max-lookback >= this max).
@@ -2282,9 +2307,10 @@ def _cmd_optimize(args) -> int:
             "elitismPercent": 0.1, "seed": int(args.seed),
             "parallelIndividuals": int(args.parallel),
             # Expert decision params (+ classic-RM sizing for ruleset experts; bypass experts size
-            # their own portfolio so they carry NO RM block). Screener genes (screener:* namespace)
-            # are merged in ONLY when --screener is set.
-            "expert_params": ({**spec["expert_params"], **screener_genes} if bypass
+            # their own portfolio so they carry only the narrow _BYPASS_RM_OPT block, not the
+            # full _RM_OPT). Screener genes (screener:* namespace) are merged in ONLY when
+            # --screener is set.
+            "expert_params": ({**spec["expert_params"], **_BYPASS_RM_OPT, **screener_genes} if bypass
                               else {**spec["expert_params"], **_RM_OPT, **screener_genes, **schedule_genes}),
             "backtest": backtest_block,
         }
@@ -2453,10 +2479,11 @@ def _cmd_optimize_batch(args) -> int:
                 "earlyStoppingGenerations": int(args.early_stop),
                 "elitismPercent": 0.1, "seed": int(args.seed),
                 "parallelIndividuals": int(args.parallel),
-                # Bypass experts (FactorRanker) carry no classic-RM block (they size their own
-                # portfolio) and no per-day schedule genes; ruleset experts get the expert params +
-                # the RM sizing/stop params + per-weekday entry-scan toggle genes.
-                "expert_params": (dict(spec["expert_params"]) if bypass
+                # Bypass experts (FactorRanker) size their own portfolio and skip the full RM
+                # block + per-day schedule genes, but still carry _BYPASS_RM_OPT (risk_per_trade_pct,
+                # read by daily_engine.py's _apply_bypass_stops); ruleset experts get the expert
+                # params + the full RM sizing/stop params + per-weekday entry-scan toggle genes.
+                "expert_params": ({**spec["expert_params"], **_BYPASS_RM_OPT} if bypass
                                   else {**spec["expert_params"], **_RM_OPT,
                                         **{f"schedule:{k}": v for k, v in _SCHEDULE_DAY_OPT.items()}}),
                 "backtest": backtest_block,

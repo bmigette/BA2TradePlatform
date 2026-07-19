@@ -169,10 +169,6 @@ class FactorRanker(MarketExpertInterface):
                 "type": "float", "required": False, "default": 0.0,
                 "description": "Minimum average dollar volume guard (reserved; not applied in v1).",
             },
-            "hard_stop_pct": {
-                "type": "float", "required": False, "default": 0.0,
-                "description": "Optional per-name hard stop between rebalances (0 disables).",
-            },
             "screener_store": {
                 "type": "str", "required": False, "default": "",
                 "description": "Path to a prebuilt screener metric store (parquet dir, built via ba2-test build-screener-metrics). When set with universe_source=screener, FactorRanker resolves its candidate universe from the fast metric_store (survivorship-biased: current tradable names) instead of the slower survivorship-free StockScreener.",

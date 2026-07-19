@@ -95,3 +95,49 @@ def test_transactions_where_and_join():
         # join: transactions that have a FILLED order -> only t_open
         joined = ts.transactions_with_orders(lambda o: o.status == OrderStatus.FILLED)
         assert [t.id for t in joined] == [t_open]
+
+
+# ====================================================================
+# M1 fix (review 2026-07-18): TradingOrder.get_expert_id() must route through the in-mem
+# store (get_instance), not a raw session.get(), when the backtest in-mem flag is on --
+# same bug class as _get_orders_with_recommendations above, just left unfixed on this
+# method. A raw session.get() finds nothing in the real (unused) SQLite table and
+# silently returns None even when the linked Transaction/ExpertRecommendation exists.
+# ====================================================================
+
+def test_get_expert_id_via_transaction_link_in_mem():
+    from ba2_common.core.db import add_instance
+    with ts.inmem_trades():
+        txn = _txn(expert_id=42)
+        txn_id = add_instance(txn)
+        order = _order(txn_id=txn_id)
+        order_id = add_instance(order)
+        got = ts.store_get(TradingOrder, order_id)
+        assert got.get_expert_id() == 42
+
+
+def test_get_expert_id_via_recommendation_link_in_mem():
+    from ba2_common.core.db import add_instance
+    from ba2_common.core.models import ExpertRecommendation
+    from ba2_common.core.types import OrderRecommendation, RiskLevel
+    with ts.inmem_trades():
+        rec = ExpertRecommendation(
+            instance_id=7, symbol="AAPL", recommended_action=OrderRecommendation.BUY,
+            expected_profit_percent=5.0, price_at_date=100.0, details=None,
+            confidence=80.0, risk_level=RiskLevel.MEDIUM,
+        )
+        rec_id = add_instance(rec)
+        order = TradingOrder(account_id=1, symbol="AAPL", quantity=10.0,
+                             side=OrderDirection.BUY, order_type=OrderType.MARKET,
+                             status=OrderStatus.NEW, expert_recommendation_id=rec_id)
+        order_id = add_instance(order)
+        got = ts.store_get(TradingOrder, order_id)
+        assert got.get_expert_id() == 7
+
+
+def test_get_expert_id_returns_none_when_link_missing_in_mem():
+    with ts.inmem_trades():
+        order = _order()  # no transaction_id, no expert_recommendation_id
+        order_id = ts.store_add(order)
+        got = ts.store_get(TradingOrder, order_id)
+        assert got.get_expert_id() is None

@@ -147,8 +147,15 @@ class FMPSenateTraderCopy(AnalysisStatusRenderMixin, FMPCongressTradingMixin, Ma
 
     def _gather(self, providers: ProviderBundle, as_of: Optional[datetime]) -> Dict[str, Any]:
         # Fetch all latest disclosures (symbol=None) across both chambers.
-        senate = self._fetch_senate_trades(symbol=None) or []
-        house = self._fetch_house_trades(symbol=None) or []
+        # full_history=True (review 2026-07-18, finding H2): the unscoped feed is
+        # SHALLOW by default (~4 months, page 0 only — see _fetch_congress_trades'
+        # "Pagination-depth design" docstring), which silently caps how far back a
+        # backtest can ever see a copy-trade regardless of max_disclose_date_days.
+        # FMPSenateTraderWeight's basket-mode _gather_all already deep-paginates for
+        # exactly this reason; Copy's basket-mode _gather must match so a real
+        # multi-year backtest doesn't silently score against 4 months of data.
+        senate = self._fetch_senate_trades(symbol=None, full_history=True) or []
+        house = self._fetch_house_trades(symbol=None, full_history=True) or []
         all_syms = {
             str(t.get('symbol', '')).upper().strip()
             for t in (senate + house) if str(t.get('symbol', '')).strip()
@@ -239,13 +246,15 @@ class FMPSenateTraderCopy(AnalysisStatusRenderMixin, FMPCongressTradingMixin, Ma
         bundle = self._gather(context.providers, as_of)
         return self._process(bundle, merged, as_of)
 
-    def _fetch_senate_trades(self, symbol: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
+    def _fetch_senate_trades(self, symbol: Optional[str] = None,
+                             full_history: bool = False) -> Optional[List[Dict[str, Any]]]:
         """Fetch senate trades for a symbol, or all latest disclosures when symbol is None."""
-        return self._fetch_congress_trades("senate", symbol)
-    
-    def _fetch_house_trades(self, symbol: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
+        return self._fetch_congress_trades("senate", symbol, full_history=full_history)
+
+    def _fetch_house_trades(self, symbol: Optional[str] = None,
+                            full_history: bool = False) -> Optional[List[Dict[str, Any]]]:
         """Fetch house trades for a symbol, or all latest disclosures when symbol is None."""
-        return self._fetch_congress_trades("house", symbol)
+        return self._fetch_congress_trades("house", symbol, full_history=full_history)
     
     def _filter_trades(self, trades: List[Dict[str, Any]],
                       copy_trade_names: List[str],

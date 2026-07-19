@@ -65,9 +65,12 @@ Symbols whose data can't be gathered (FMP error / missing fundamentals) are **dr
 | `min_price` | float | `0.0` | Minimum share price liquidity guard (0 disables). |
 | `sector_neutralize` | bool | `False` | Reserved — not applied in v1. |
 | `min_dollar_volume` | float | `0.0` | Reserved — not enforced in v1. |
-| `hard_stop_pct` | float | `0.0` | Reserved — optional per-name hard stop between rebalances. |
 
 **Per-factor weights are separate float settings** (not a single JSON blob), so each renders as a plain number field.
+
+**Per-name stop between rebalances is not a FactorRanker setting.** It reuses the classic-RM
+`risk_per_trade_pct` setting (see `daily_engine.py::_apply_bypass_stops`), same as every other
+bypass expert — optimize/tune it there, not via a FactorRanker-local field.
 
 ### Screener universe settings (`universe_source = "screener"`)
 

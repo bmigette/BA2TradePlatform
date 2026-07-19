@@ -916,6 +916,17 @@ def parse_fmp_amount_range(amount_str) -> float:
 # tools/build_senate_universe.py where this heuristic originated).
 _FUND_TICKER_RE = re.compile(r"^[A-Z]{4,5}X$")
 
+# Known real, tradable NYSE/NASDAQ equities that happen to match the 4-5-letters-ending-in-X
+# mutual-fund pattern above (review 2026-07-18, finding L4). The regex heuristic has no way
+# to distinguish these from an actual fund ticker (e.g. "VFIAX"); a proper fix would check
+# FMP's profile isEtf/isFund fields per symbol, which is a network call this pure filter
+# deliberately avoids. This allowlist is NOT exhaustive — it only covers cases actually
+# confirmed to be real equities; add more here if a future symbol is found misclassified.
+_KNOWN_NON_FUND_X_TICKERS = frozenset({
+    "MPLX",   # MPLX LP — midstream energy partnership, NYSE
+    "CEIX",   # CONSOL Energy Inc. — coal producer, NYSE
+})
+
 
 def is_tradable_stock_ticker(sym: Optional[str]) -> bool:
     """Classify whether a symbol looks like an ordinary tradable equity ticker.
@@ -926,9 +937,14 @@ def is_tradable_stock_ticker(sym: Optional[str]) -> bool:
     ``tools/build_senate_universe.py``'s ``_is_junk_ticker`` (inverted sense: this
     returns True to KEEP a symbol, matching filter-predicate call sites like
     ``[s for s in symbols if is_tradable_stock_ticker(s)]``).
+
+    ``_KNOWN_NON_FUND_X_TICKERS`` overrides the regex for confirmed real equities that
+    would otherwise false-positive as mutual funds (e.g. MPLX, CEIX).
     """
     if not sym or not sym.isascii():
         return False
+    if sym in _KNOWN_NON_FUND_X_TICKERS:
+        return True
     if _FUND_TICKER_RE.match(sym):
         return False
     if any(c in sym for c in ("/", "$", " ")):

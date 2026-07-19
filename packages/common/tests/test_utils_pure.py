@@ -124,3 +124,6 @@ def test_is_tradable_stock_ticker():
     assert is_tradable_stock_ticker("AAPL ") is False
     # Non-ASCII
     assert is_tradable_stock_ticker("ÀAPL") is False
+    # L4 fix (review 2026-07-18): known real equities that match the fund pattern
+    assert is_tradable_stock_ticker("MPLX") is True
+    assert is_tradable_stock_ticker("CEIX") is True

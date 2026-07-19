@@ -412,9 +412,11 @@ class TradeRiskManagement:
         try:
             from ba2_common.core.trade_store import inmem_trades_active, orders_where
             if inmem_trades_active():
-                # BT store: PENDING orders live in the in-memory store; their ExpertRecommendation
-                # rows are still in SQLite (not an in-mem model), so correlate the two by id and
-                # keep only this expert's (rec.instance_id == expert_instance_id).
+                # BT store: PENDING orders AND their ExpertRecommendation rows both live in the
+                # in-memory store (ExpertRecommendation is an in-mem model too, see
+                # trade_store.IN_MEM_MODELS -- expanded 2026-07-18, senate-basket-dispatch
+                # changeset). get_instance routes correctly either way; correlate the two by id
+                # and keep only this expert's (rec.instance_id == expert_instance_id).
                 from ba2_common.core.db import get_instance
                 expert_orders = []
                 seen_order_ids = set()
@@ -933,14 +935,43 @@ class TradeRiskManagement:
             re-raised so it is not silently swallowed.
         """
         from ba2_common.core.TransactionHelper import TransactionHelper
-        from ba2_common.core.db import get_db
+        from ba2_common.core.db import get_db, get_instance
+        from ba2_common.core.trade_store import inmem_trades_active
         from sqlmodel import Session, select
 
         try:
             updated_count = 0
             failed_count = 0
             grouped_by_transaction = {}
-            
+
+            # BT store: Transaction is an in-mem model (see trade_store.IN_MEM_MODELS) --
+            # a raw Session(get_db().bind).get() bypasses that store and silently finds
+            # nothing, so review 2026-07-18 (M2) routes this through get_instance() instead
+            # when the backtest in-mem flag is on. Live keeps the original shared-session
+            # bulk-load path unchanged.
+            if inmem_trades_active():
+                for order in orders:
+                    if order.transaction_id:
+                        if order.transaction_id not in grouped_by_transaction:
+                            try:
+                                transaction = get_instance(Transaction, order.transaction_id)
+                            except Exception:  # noqa: BLE001 — a missing transaction just skips grouping
+                                transaction = None
+                            if transaction:
+                                grouped_by_transaction[order.transaction_id] = {
+                                    'transaction': transaction,
+                                    'orders': [order]
+                                }
+                        else:
+                            grouped_by_transaction[order.transaction_id]['orders'].append(order)
+                    else:
+                        from ba2_common.core.db import update_instance
+                        if update_instance(order):
+                            updated_count += 1
+                            self.logger.debug(f"Updated orphan order {order.id} with quantity {order.quantity}")
+                return self._finish_update_orders_in_database(
+                    grouped_by_transaction, updated_count, failed_count)
+
             # Group orders by transaction
             with Session(get_db().bind) as session:
                 for order in orders:
@@ -961,43 +992,53 @@ class TradeRiskManagement:
                         if update_instance(order):
                             updated_count += 1
                             self.logger.debug(f"Updated orphan order {order.id} with quantity {order.quantity}")
-            
-            # Update each transaction and its related orders
-            for txn_id, data in grouped_by_transaction.items():
-                transaction = data['transaction']
-                orders_in_txn = data['orders']
-                
-                # Use the first order's new quantity (all should be the same)
-                if orders_in_txn:
-                    new_quantity = orders_in_txn[0].quantity
-                    
-                    # Use TransactionHelper to update transaction and all related orders in sync
-                    if TransactionHelper.adjust_qty(transaction, new_quantity):
-                        updated_count += len(orders_in_txn)
-                        self.logger.debug(
-                            f"Updated transaction {txn_id} with quantity {new_quantity} "
-                            f"and {len(orders_in_txn)} related orders"
-                        )
-                    else:
-                        failed_count += len(orders_in_txn)
-                        self.logger.error(f"Failed to update transaction {txn_id}")
 
-            if failed_count:
-                self.logger.warning(
-                    f"Updated {updated_count} orders in database via TransactionHelper; "
-                    f"{failed_count} order(s) FAILED to update"
-                )
-            else:
-                self.logger.info(f"Successfully updated {updated_count} orders in database via TransactionHelper")
-
-            return updated_count, failed_count
+            return self._finish_update_orders_in_database(
+                grouped_by_transaction, updated_count, failed_count)
 
         except Exception as e:
             # Don't swallow: surface the failure to the caller so the activity log
             # reflects it rather than reporting SUCCESS over a broken update (RM-5).
             self.logger.error(f"Error updating orders in database: {e}", exc_info=True)
             raise
-    
+
+    def _finish_update_orders_in_database(self, grouped_by_transaction: dict,
+                                          updated_count: int, failed_count: int) -> Tuple[int, int]:
+        """Shared tail of ``_update_orders_in_database``: apply ``TransactionHelper.adjust_qty``
+        to each grouped transaction + its related orders, log, and return the final counts.
+        Split out so the in-mem-store path and the live shared-session path (which load the
+        ``grouped_by_transaction`` dict differently) share this logic instead of duplicating it."""
+        from ba2_common.core.TransactionHelper import TransactionHelper
+
+        for txn_id, data in grouped_by_transaction.items():
+            transaction = data['transaction']
+            orders_in_txn = data['orders']
+
+            # Use the first order's new quantity (all should be the same)
+            if orders_in_txn:
+                new_quantity = orders_in_txn[0].quantity
+
+                # Use TransactionHelper to update transaction and all related orders in sync
+                if TransactionHelper.adjust_qty(transaction, new_quantity):
+                    updated_count += len(orders_in_txn)
+                    self.logger.debug(
+                        f"Updated transaction {txn_id} with quantity {new_quantity} "
+                        f"and {len(orders_in_txn)} related orders"
+                    )
+                else:
+                    failed_count += len(orders_in_txn)
+                    self.logger.error(f"Failed to update transaction {txn_id}")
+
+        if failed_count:
+            self.logger.warning(
+                f"Updated {updated_count} orders in database via TransactionHelper; "
+                f"{failed_count} order(s) FAILED to update"
+            )
+        else:
+            self.logger.info(f"Successfully updated {updated_count} orders in database via TransactionHelper")
+
+        return updated_count, failed_count
+
     def _delete_unfunded_orders(self, orders: List[TradingOrder], symbol_prices: Dict[str, float] = None, max_equity_per_instrument: float = None) -> None:
         """
         Delete orders with quantity=0 (insufficient funds) and their linked orders/transactions.
@@ -1012,10 +1053,18 @@ class TradeRiskManagement:
         """
         try:
             from ba2_common.core.db import delete_instance
+            from ba2_common.core.trade_store import inmem_trades_active, orders_where, get_or_none
 
             deleted_order_count = 0
             deleted_linked_order_count = 0
             deleted_transaction_count = 0
+
+            # BT store: TradingOrder/Transaction are in-mem models (see trade_store.
+            # IN_MEM_MODELS) -- the raw select()/session.get() below bypass that store and
+            # silently find nothing, leaving linked orders/transactions never deleted (review
+            # 2026-07-18, M2). orders_where/get_or_none are the routed, dual-path equivalents
+            # (in-mem filter when the flag is on, the exact original SQLite query otherwise).
+            in_mem = inmem_trades_active()
 
             with get_db() as session:
                 for order in orders:
@@ -1026,22 +1075,26 @@ class TradeRiskManagement:
                         limit_info = f", limit=${max_equity_per_instrument:.2f}" if max_equity_per_instrument else ""
                         self.logger.info(f"Deleting unfunded order {order.id} ({order.symbol}, {order.side}) - "
                                        f"{price_info}{limit_info} (can't afford 1 share)")
-                        
+
                         # Find and delete any linked orders (orders that depend on this order)
                         if order.id:
-                            linked_orders_statement = select(TradingOrder).where(
-                                TradingOrder.depends_on_order == order.id
-                            )
-                            linked_orders = session.exec(linked_orders_statement).all()
-                            
+                            if in_mem:
+                                linked_orders = orders_where(depends_on_order=order.id)
+                            else:
+                                linked_orders_statement = select(TradingOrder).where(
+                                    TradingOrder.depends_on_order == order.id
+                                )
+                                linked_orders = session.exec(linked_orders_statement).all()
+
                             for linked_order in linked_orders:
                                 self.logger.debug(f"  Deleting linked order {linked_order.id} (waiting on trigger order {order.id})")
                                 delete_instance(linked_order, session)
                                 deleted_linked_order_count += 1
-                        
+
                         # Find and delete any transaction linked to this order
                         if order.transaction_id:
-                            transaction = session.get(Transaction, order.transaction_id)
+                            transaction = (get_or_none(Transaction, order.transaction_id) if in_mem
+                                         else session.get(Transaction, order.transaction_id))
                             if transaction:
                                 self.logger.debug(f"  Deleting transaction {transaction.id} linked to order {order.id}")
                                 delete_instance(transaction, session)

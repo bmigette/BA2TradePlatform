@@ -464,45 +464,46 @@ class AccountInterface(ReadOnlyAccountInterface):
                 OrderStatus.ERROR
             ]
             
-            with get_db() as session:
-                # Get all market entry orders (no depends_on_order) matching transaction direction
-                statement = select(TradingOrder).where(
-                    TradingOrder.transaction_id == transaction_id,
-                    TradingOrder.account_id == self.id,
-                    TradingOrder.depends_on_order.is_(None),  # Market entry orders only
-                    TradingOrder.side == target_side  # Only orders matching transaction direction
+            # orders_where is the dual-path equivalent of the raw select() this replaced
+            # (review 2026-07-18, M2): a raw select(TradingOrder) silently finds nothing
+            # when the backtest in-mem store is active (TradingOrder is an in-mem model,
+            # see trade_store.IN_MEM_MODELS). orders_where has no `side` filter, so that
+            # check is applied in Python after the routed fetch.
+            from ba2_common.core.trade_store import orders_where
+            candidate_orders = orders_where(
+                transaction_id=transaction_id, account_id=self.id, depends_on_order=None,
+            )
+            market_entry_orders = [o for o in candidate_orders if o.side == target_side]
+
+            if not market_entry_orders:
+                logger.debug(f"No market entry orders found for transaction {transaction_id}")
+                return
+
+            # Calculate total quantity from non-canceled market entry orders
+            total_quantity = 0.0
+            valid_count = 0
+            for order in market_entry_orders:
+                # Skip orders with excluded statuses
+                if order.status in excluded_statuses:
+                    continue
+                qty = float(order.quantity) if order.quantity else 0.0
+                total_quantity += qty
+                valid_count += 1
+
+            # Quantity is always positive - direction field indicates LONG/SHORT
+            # No need to negate for SELL transactions
+
+            # Only update if quantity has changed
+            if transaction.quantity != total_quantity:
+                old_qty = transaction.quantity
+                transaction.quantity = total_quantity
+                update_instance(transaction)
+                logger.info(
+                    f"Transaction {transaction_id} quantity recalculated: {old_qty} -> {total_quantity} "
+                    f"(from {valid_count} valid market entry orders)"
                 )
-                market_entry_orders = session.exec(statement).all()
-                
-                if not market_entry_orders:
-                    logger.debug(f"No market entry orders found for transaction {transaction_id}")
-                    return
-                
-                # Calculate total quantity from non-canceled market entry orders
-                total_quantity = 0.0
-                valid_count = 0
-                for order in market_entry_orders:
-                    # Skip orders with excluded statuses
-                    if order.status in excluded_statuses:
-                        continue
-                    qty = float(order.quantity) if order.quantity else 0.0
-                    total_quantity += qty
-                    valid_count += 1
-                
-                # Quantity is always positive - direction field indicates LONG/SHORT
-                # No need to negate for SELL transactions
-                
-                # Only update if quantity has changed
-                if transaction.quantity != total_quantity:
-                    old_qty = transaction.quantity
-                    transaction.quantity = total_quantity
-                    update_instance(transaction)
-                    logger.info(
-                        f"Transaction {transaction_id} quantity recalculated: {old_qty} -> {total_quantity} "
-                        f"(from {valid_count} valid market entry orders)"
-                    )
-                else:
-                    logger.debug(f"Transaction {transaction_id} quantity unchanged: {total_quantity}")
+            else:
+                logger.debug(f"Transaction {transaction_id} quantity unchanged: {total_quantity}")
                     
         except Exception as e:
             logger.error(f"Error recalculating transaction quantity for {transaction_id}: {e}", exc_info=True)
@@ -745,14 +746,15 @@ class AccountInterface(ReadOnlyAccountInterface):
         """
         if transaction_id is None:
             return None
-        from sqlmodel import select
-        with get_db() as session:
-            return session.exec(
-                select(TradingOrder)
-                .where(TradingOrder.transaction_id == transaction_id)
-                .order_by(TradingOrder.id)
-                .limit(1)
-            ).first()
+        # orders_where is the dual-path equivalent of the raw select() this replaced
+        # (review 2026-07-18, M2): a raw select(TradingOrder) silently finds nothing when
+        # the backtest in-mem store is active. No ORDER BY/LIMIT support on the routed
+        # helper, so take the lowest-id order in Python instead (small per-transaction set).
+        from ba2_common.core.trade_store import orders_where
+        candidates = orders_where(transaction_id=transaction_id)
+        if not candidates:
+            return None
+        return min(candidates, key=lambda o: o.id)
 
     def _validate_single_position_size(self, trading_order: TradingOrder, transaction, expert_instance,
                                        current_price: float, max_position_pct: float,

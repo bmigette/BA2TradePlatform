@@ -80,8 +80,10 @@ def _copy_expert(senate, house):
     e.id = 1
     e._gather_symbol = "MULTI"
     e.logger = _LOG
-    e._fetch_senate_trades = lambda symbol=None: senate
-    e._fetch_house_trades = lambda symbol=None: house
+    # **kwargs: _gather calls these with full_history=True (H2 fix, review 2026-07-18) --
+    # this fixture ignores the flag and always returns the same fixed trade list.
+    e._fetch_senate_trades = lambda symbol=None, **kwargs: senate
+    e._fetch_house_trades = lambda symbol=None, **kwargs: house
     # Live (as_of=None) current_price_map now reads the per-symbol account quote
     # via _get_current_price; pin AAPL to the FakeOHLCV close so live==as_of holds.
     e._get_current_price = lambda sym: {"AAPL": 100.0}.get(str(sym).upper())
@@ -1556,11 +1558,19 @@ def test_get_expert_properties_shape():
     }
 
 
-def test_run_analysis_expert_symbol_creates_one_recommendation_per_qualifying_symbol():
+def test_run_analysis_expert_symbol_gathers_both_symbols_once_via_real_pipeline():
     """Task 6 Steps 2-3: run_analysis("EXPERT", ...) must call _gather_all/_process_all ONCE
-    (live, as_of=None) and persist one ExpertRecommendation row per qualifying symbol, mirroring
+    (live, as_of=None) and reach both qualifying symbols found in the unscoped feed, mirroring
     FMPSenateTraderCopy's own EXPERT-symbol handling and the backtest _run_basket_expert_bar
-    path Task 2 built."""
+    path Task 2 built.
+
+    This fixture's 2-trader, minimal-history setup genuinely resolves to HOLD (confidence
+    0.0 -- below the signal engine's real net-symbol-focus threshold) for BOTH symbols under
+    the REAL _calculate_recommendation pipeline, so it doubles as a real (non-mocked)
+    verification of the L2 fix (review 2026-07-18): a qualifying-but-HOLD symbol must still
+    be *gathered* (present in total_symbols) but must NOT be persisted as an
+    ExpertRecommendation row. See test_run_basket_analysis_does_not_persist_hold_recommendations
+    below for the deterministic mixed-signal (BUY + HOLD) case."""
     from ba2_common.core.models import MarketAnalysis, ExpertRecommendation
     from ba2_common.core.types import MarketAnalysisStatus
     from ba2_common.core.db import add_instance, get_instance, get_db
@@ -1595,16 +1605,16 @@ def test_run_analysis_expert_symbol_creates_one_recommendation_per_qualifying_sy
     market_analysis = get_instance(MarketAnalysis, ma_id)
     assert market_analysis.status == MarketAnalysisStatus.COMPLETED
     assert market_analysis.state["senate_trade_basket"]["total_symbols"] == 2
-    assert set(market_analysis.state["senate_trade_basket"]["symbols_analyzed"]) == {"AAPL", "MSFT"}
+    # Both symbols genuinely resolve HOLD under this fixture's data -> L2 fix means
+    # neither is persisted, and symbols_analyzed only lists what WAS persisted.
+    assert market_analysis.state["senate_trade_basket"]["symbols_analyzed"] == []
+    assert market_analysis.state["senate_trade_basket"]["skipped_hold_count"] == 2
 
     with get_db() as session:
         recs = session.exec(
             select(ExpertRecommendation).where(ExpertRecommendation.market_analysis_id == ma_id)
         ).all()
-    assert len(recs) == 2
-    assert {r.symbol for r in recs} == {"AAPL", "MSFT"}
-    for r in recs:
-        assert r.instance_id == 777
+    assert recs == [], "qualifying-but-HOLD symbols must not be persisted (L2 fix)"
 
 
 def test_run_analysis_expert_symbol_rejects_open_positions():
@@ -1757,3 +1767,318 @@ def test_copy_filter_trades_by_age_multi_keeps_same_day_disclosure_and_exec():
     same_day = _copy_trade("Nancy", "Pelosi", "AAPL", "purchase", "2026-06-13", "2026-06-13")
     filtered = e._filter_trades_by_age_multi([same_day], max_disclose_days=365, max_exec_days=365, now=NOW)
     assert len(filtered) == 1
+
+
+# ====================================================================
+# H1 fix (review 2026-07-18): _symbol_trades_index_cached / _all_trades_index_cached
+# must NOT memoize forever for a LIVE (long-lived singleton) instance -- only a backtest
+# run may treat the trade feed as frozen. is_live=True must re-fetch every call so a new
+# disclosure becomes visible on the next scheduled cycle; is_live=False (backtest, the
+# default) must keep the existing memoized behaviour.
+# ====================================================================
+
+def test_symbol_trades_index_cached_live_refetches_and_sees_new_disclosures():
+    """Two calls with is_live=True must both hit the fetcher, and a disclosure added
+    between calls (simulating real time passing between live cycles) must show up on the
+    second call -- proves the memo is bypassed, not just double-called with stale data."""
+    trades_box = {"trades": [_weight_trade("Alice", "Aa", "AAPL", "purchase",
+                                            "2026-06-01", "2026-05-20")]}
+    e = FMPSenateTraderWeight.__new__(FMPSenateTraderWeight)
+    e.id = 1
+    e.logger = _LOG
+    calls = []
+
+    def _fetch_senate(s):
+        calls.append(1)
+        return trades_box["trades"]
+
+    e._fetch_senate_trades = _fetch_senate
+    e._fetch_house_trades = lambda s: []
+
+    idx1 = e._symbol_trades_index_cached("AAPL", is_live=True)
+    assert len(calls) == 1
+    assert len(idx1["rows"]) == 1
+
+    # A new disclosure lands between live cycles.
+    trades_box["trades"] = trades_box["trades"] + [
+        _weight_trade("Bob", "Bb", "AAPL", "purchase", "2026-06-05", "2026-06-01")
+    ]
+    idx2 = e._symbol_trades_index_cached("AAPL", is_live=True)
+    assert len(calls) == 2, "live must re-fetch on every call, not serve a frozen memo"
+    assert len(idx2["rows"]) == 2, "the new disclosure must be visible on the next live call"
+    assert not hasattr(e, "_symbol_trades_memo"), "live path must never populate the memo"
+
+
+def test_symbol_trades_index_cached_backtest_still_memoizes():
+    """is_live=False (default, backtest) must preserve the existing perf-critical
+    memoization -- the second call must NOT re-invoke the fetcher, even if the underlying
+    (hermetic, frozen) source list is mutated."""
+    trades_box = {"trades": [_weight_trade("Alice", "Aa", "AAPL", "purchase",
+                                            "2026-06-01", "2026-05-20")]}
+    e = FMPSenateTraderWeight.__new__(FMPSenateTraderWeight)
+    e.id = 1
+    e.logger = _LOG
+    calls = []
+
+    def _fetch_senate(s):
+        calls.append(1)
+        return trades_box["trades"]
+
+    e._fetch_senate_trades = _fetch_senate
+    e._fetch_house_trades = lambda s: []
+
+    idx1 = e._symbol_trades_index_cached("AAPL")  # is_live defaults to False
+    trades_box["trades"] = trades_box["trades"] + [
+        _weight_trade("Bob", "Bb", "AAPL", "purchase", "2026-06-05", "2026-06-01")
+    ]
+    idx2 = e._symbol_trades_index_cached("AAPL")
+    assert len(calls) == 1, "backtest must serve the memo on the second call"
+    assert idx1 is idx2
+
+
+def test_all_trades_index_cached_live_refetches_and_sees_new_disclosures():
+    """Basket-mode counterpart: is_live=True must re-fetch the unscoped feed every call and
+    see a disclosure added between calls."""
+    trades_box = {"trades": [_weight_trade("Alice", "Aa", "AAPL", "purchase",
+                                            "2026-06-01", "2026-05-20")]}
+    e = FMPSenateTraderWeight.__new__(FMPSenateTraderWeight)
+    e.id = 1
+    e.logger = _LOG
+    calls = []
+
+    def _fetch_senate(symbol=None, **kwargs):
+        calls.append(1)
+        return trades_box["trades"]
+
+    e._fetch_senate_trades = _fetch_senate
+    e._fetch_house_trades = lambda symbol=None, **kwargs: []
+
+    idx1 = e._all_trades_index_cached(is_live=True)
+    assert len(calls) == 1
+    assert len(idx1["rows"]) == 1
+
+    trades_box["trades"] = trades_box["trades"] + [
+        _weight_trade("Bob", "Bb", "MSFT", "purchase", "2026-06-05", "2026-06-01")
+    ]
+    idx2 = e._all_trades_index_cached(is_live=True)
+    assert len(calls) == 2, "live must re-fetch on every call, not serve a frozen memo"
+    assert len(idx2["rows"]) == 2
+    assert not hasattr(e, "_all_trades_memo"), "live path must never populate the memo"
+
+
+def test_all_trades_index_cached_backtest_still_memoizes():
+    trades_box = {"trades": [_weight_trade("Alice", "Aa", "AAPL", "purchase",
+                                            "2026-06-01", "2026-05-20")]}
+    e = FMPSenateTraderWeight.__new__(FMPSenateTraderWeight)
+    e.id = 1
+    e.logger = _LOG
+    calls = []
+
+    def _fetch_senate(symbol=None, **kwargs):
+        calls.append(1)
+        return trades_box["trades"]
+
+    e._fetch_senate_trades = _fetch_senate
+    e._fetch_house_trades = lambda symbol=None, **kwargs: []
+
+    idx1 = e._all_trades_index_cached()  # is_live defaults to False
+    trades_box["trades"] = trades_box["trades"] + [
+        _weight_trade("Bob", "Bb", "MSFT", "purchase", "2026-06-05", "2026-06-01")
+    ]
+    idx2 = e._all_trades_index_cached()
+    assert len(calls) == 1, "backtest must serve the memo on the second call"
+    assert idx1 is idx2
+
+
+def test_gather_live_passes_is_live_true_to_symbol_trades_index_cached(monkeypatch):
+    """End-to-end wiring check: _gather(as_of=None) (the live convention) must actually
+    thread is_live=True through to _symbol_trades_index_cached, not just default False."""
+    e = _weight_expert("AAPL", [], {})
+    e._gather_settings = WEIGHT_SETTINGS
+    seen = {}
+    real = FMPSenateTraderWeight._symbol_trades_index_cached
+
+    def _spy(self, symbol, is_live=False):
+        seen["is_live"] = is_live
+        return real(self, symbol, is_live=is_live)
+
+    monkeypatch.setattr(FMPSenateTraderWeight, "_symbol_trades_index_cached", _spy)
+    e._gather(_bundle({"AAPL": 100.0}), as_of=None)
+    assert seen["is_live"] is True
+
+
+def test_gather_all_live_passes_is_live_true_to_all_trades_index_cached(monkeypatch):
+    e = _weight_basket_expert([], [], {}, {})
+    e._gather_settings = WEIGHT_SETTINGS
+    seen = {}
+    real = FMPSenateTraderWeight._all_trades_index_cached
+
+    def _spy(self, is_live=False):
+        seen["is_live"] = is_live
+        return real(self, is_live=is_live)
+
+    monkeypatch.setattr(FMPSenateTraderWeight, "_all_trades_index_cached", _spy)
+    e._gather_all(_bundle({}), as_of=None)
+    assert seen["is_live"] is True
+
+
+# ====================================================================
+# H2 fix (review 2026-07-18): basket-mode FMPSenateTraderCopy._gather must fetch
+# full_history=True, same as FMPSenateTraderWeight's basket-mode _gather_all -- otherwise
+# it silently reads only ~4 months of the unscoped feed (page 0), capped well below
+# whatever max_disclose_date_days claims to search, and diverges from what the launcher's
+# _do_senate_latest prewarm actually warms (the deep "ALL_FULL_HISTORY" key).
+# ====================================================================
+
+def test_copy_gather_requests_full_history_for_both_chambers():
+    e = _copy_expert([], [])
+    seen = {}
+
+    def _spy_senate(symbol=None, **kwargs):
+        seen["senate_full_history"] = kwargs.get("full_history")
+        return []
+
+    def _spy_house(symbol=None, **kwargs):
+        seen["house_full_history"] = kwargs.get("full_history")
+        return []
+
+    e._fetch_senate_trades = _spy_senate
+    e._fetch_house_trades = _spy_house
+    e._gather(_bundle({}), as_of=None)
+    assert seen["senate_full_history"] is True
+    assert seen["house_full_history"] is True
+
+
+# ====================================================================
+# M4 fix (review 2026-07-18): _window_trades' bisect cutoff must carry a +1 day margin
+# so it stays a faithful superset of _filter_trades' integer-day-truncated comparison for
+# INTRADAY 'now' values (a daily 'now', always midnight, was never affected).
+# ====================================================================
+
+def test_weight_window_trades_intraday_keeps_edge_trade_filter_trades_would_keep():
+    """now carries a time-of-day (14:30). A trade disclosed exactly max_disclose_days
+    calendar days before now's date has days_since_disclose == max_disclose_days under
+    _filter_trades' (now - disclose).days truncation (elapsed is max_disclose_days + a
+    few hours, which still truncates to max_disclose_days) -- _filter_trades KEEPS it.
+    The old exact-datetime bisect cutoff (now - timedelta(days=max)) sits a few hours
+    AFTER this disclosure and would wrongly exclude it."""
+    intraday_now = datetime(2026, 6, 13, 14, 30, tzinfo=timezone.utc)
+    max_disclose_days = 5
+    edge_trade = _weight_trade("Edge", "Case", "AAPL", "purchase", "2026-06-08", "2026-06-08")
+    e = _weight_expert("AAPL", [edge_trade], {})
+    index = e._symbol_trades_index_cached("AAPL")
+
+    # Confirm _filter_trades (the ground truth) actually keeps it at this exact now.
+    filtered = e._filter_trades(
+        [edge_trade], max_disclose_days=max_disclose_days, max_exec_days=max_disclose_days,
+        max_price_delta_pct=1000.0, current_price=100.0, symbol="AAPL", now=intraday_now,
+        exec_price_by_trade={e._trade_key(edge_trade): 50.0})
+    assert len(filtered) == 1, "sanity check: _filter_trades must keep this edge trade"
+
+    windowed = e._window_trades(index, intraday_now, max_disclose_days=max_disclose_days,
+                                max_exec_days=max_disclose_days)
+    assert len(windowed) == 1, ("_window_trades must stay a superset of _filter_trades for "
+                                "an intraday 'now' -- it silently dropped a trade "
+                                "_filter_trades would have kept")
+
+
+def test_weight_window_trades_still_rejects_genuinely_too_old_trade():
+    """The +1 day margin makes _window_trades a slightly LOOSER superset, not a no-op: a
+    trade well outside even the widened window must still be excluded (the pre-filter
+    stays a superset, not "keep everything")."""
+    daily_now = datetime(2026, 6, 13, tzinfo=timezone.utc)
+    max_disclose_days = 5
+    too_old = _weight_trade("Too", "Old", "AAPL", "purchase", "2026-06-01", "2026-06-01")
+    e = _weight_expert("AAPL", [too_old], {})
+    index = e._symbol_trades_index_cached("AAPL")
+    windowed = e._window_trades(index, daily_now, max_disclose_days=max_disclose_days,
+                                max_exec_days=max_disclose_days)
+    assert windowed == [], "a genuinely too-old trade must still be rejected"
+
+
+# ====================================================================
+# L2 fix (review 2026-07-18): live basket analysis must NOT persist HOLD/SKIP
+# recommendations -- _process_all deliberately includes them (the backtest engine filters
+# them downstream), but the live basket path had no such filter, so a real disclosure feed
+# would write dozens-to-hundreds of dead-weight HOLD rows every cycle.
+# ====================================================================
+
+def test_run_basket_analysis_does_not_persist_hold_recommendations(monkeypatch):
+    from ba2_common.core.models import MarketAnalysis, ExpertRecommendation
+    from ba2_common.core.types import MarketAnalysisStatus
+    from ba2_common.core.db import add_instance, get_instance, get_db
+    from sqlmodel import select
+
+    e = _weight_live_basket_expert([], [], {}, {}, instance_id=779)
+
+    def _rec_data(signal, confidence):
+        return {"signal": signal, "confidence": confidence, "expected_profit_percent": 5.0,
+                "details": "test", "buy_count": 1, "sell_count": 0, "total_buy_amount": 0.0,
+                "total_sell_amount": 0.0, "trade_count": 1}
+
+    buy_rec = Recommendation(
+        signal=OrderRecommendation.BUY, confidence=80.0, current_price=100.0,
+        raw_outputs={"symbol": "AAPL", "recommendation": _rec_data(OrderRecommendation.BUY, 80.0)},
+    )
+    hold_rec = Recommendation(
+        signal=OrderRecommendation.HOLD, confidence=10.0, current_price=60.0,
+        raw_outputs={"symbol": "MSFT", "recommendation": _rec_data(OrderRecommendation.HOLD, 10.0)},
+    )
+    skip_rec = Recommendation(
+        signal=OrderRecommendation.HOLD, confidence=0.0, current_price=30.0, skip=True,
+        raw_outputs={"symbol": "GOOG", "recommendation": _rec_data(OrderRecommendation.HOLD, 0.0)},
+    )
+    monkeypatch.setattr(e, "_gather_all", lambda providers, as_of: {"AAPL": {}, "MSFT": {}, "GOOG": {}})
+    monkeypatch.setattr(e, "_process_all", lambda bundle, settings, as_of: [buy_rec, hold_rec, skip_rec])
+
+    market_analysis = MarketAnalysis(
+        symbol="EXPERT", expert_instance_id=779,
+        status=MarketAnalysisStatus.PENDING, subtype=AnalysisUseCase.ENTER_MARKET,
+    )
+    ma_id = add_instance(market_analysis)
+    market_analysis = get_instance(MarketAnalysis, ma_id)
+
+    e.run_analysis("EXPERT", market_analysis)
+
+    market_analysis = get_instance(MarketAnalysis, ma_id)
+    assert market_analysis.status == MarketAnalysisStatus.COMPLETED
+    assert market_analysis.state["senate_trade_basket"]["symbols_analyzed"] == ["AAPL"]
+    assert market_analysis.state["senate_trade_basket"]["skipped_hold_count"] == 2
+
+    with get_db() as session:
+        recs = session.exec(
+            select(ExpertRecommendation).where(ExpertRecommendation.market_analysis_id == ma_id)
+        ).all()
+    assert len(recs) == 1, "only the BUY recommendation must be persisted, not the HOLD/SKIP ones"
+    assert recs[0].symbol == "AAPL"
+
+
+# ====================================================================
+# L3 fix (review 2026-07-18): _render_completed must dispatch basket-mode
+# ('senate_trade_basket' in state) analyses to a dedicated summary renderer instead of
+# falling through to the single-symbol 'senate_trade' branch's "No analysis data
+# available" fallback.
+# ====================================================================
+
+def test_render_completed_dispatches_basket_state_to_basket_renderer(monkeypatch):
+    e = FMPSenateTraderWeight.__new__(FMPSenateTraderWeight)
+    e.id = 1
+    e.logger = _LOG
+    market_analysis = type("MA", (), {
+        "state": {"senate_trade_basket": {"total_symbols": 3, "symbols_analyzed": ["AAPL"]}},
+    })()
+
+    calls = []
+    monkeypatch.setattr(e, "_render_basket_completed", lambda ma: calls.append(ma))
+    e._render_completed(market_analysis)
+    assert calls == [market_analysis], "basket state must route to _render_basket_completed"
+
+
+def test_render_completed_still_uses_no_data_fallback_for_empty_state():
+    import nicegui
+    e = FMPSenateTraderWeight.__new__(FMPSenateTraderWeight)
+    e.id = 1
+    e.logger = _LOG
+    market_analysis = type("MA", (), {"state": None})()
+    # Must not raise / must not try the basket branch for genuinely empty state.
+    e._render_completed(market_analysis)

@@ -126,18 +126,18 @@ class TradeAction(ABC):
         if not expert_id:
             return None
         try:
-            from sqlmodel import select, Session
-            from ba2_common.core.models import Transaction
             from ba2_common.core.types import TransactionStatus
-            from ba2_common.core.db import get_db
+            from ba2_common.core.trade_store import transactions_where
 
-            with Session(get_db().bind) as session:
-                statement = select(Transaction).where(
-                    Transaction.symbol == self.instrument_name,
-                    Transaction.expert_id == expert_id,
-                    Transaction.status.in_([TransactionStatus.WAITING, TransactionStatus.OPENED]),
-                )
-                transactions = session.exec(statement).all()
+            # transactions_where is the dual-path equivalent of the raw select() this
+            # replaced (review 2026-07-18, M2): a raw select(Transaction) silently finds
+            # nothing when the backtest in-mem store is active (Transaction is an in-mem
+            # model, see trade_store.IN_MEM_MODELS), so get_expert_position always returned
+            # 0.0/None in that mode instead of the real position.
+            transactions = transactions_where(
+                symbol=self.instrument_name, expert_id=expert_id,
+                statuses=[TransactionStatus.WAITING, TransactionStatus.OPENED],
+            )
 
             if not transactions:
                 return 0.0
@@ -1764,35 +1764,30 @@ class _OptionEntryAction(TradeAction):
         instance_id = self.expert_recommendation.instance_id if self.expert_recommendation else None
         if not instance_id:
             return 0.0
-        from sqlmodel import select, Session
-        from ba2_common.core.models import Transaction
+        # transactions_where/orders_where are the dual-path equivalents of the raw
+        # select() calls this replaced (review 2026-07-18, M2): those silently found
+        # nothing when the backtest in-mem store is active (Transaction/TradingOrder are
+        # in-mem models, see trade_store.IN_MEM_MODELS).
+        from ba2_common.core.trade_store import transactions_where, orders_where
         total = 0.0
-        with Session(get_db().bind) as session:
-            txns = session.exec(
-                select(Transaction).where(
-                    Transaction.symbol == self.instrument_name,
-                    Transaction.expert_id == instance_id,
-                    Transaction.status == TransactionStatus.OPENED,
-                )
-            ).all()
-            txn_ids = [t.id for t in txns]
-            if not txn_ids:
-                return 0.0
-            orders = session.exec(
-                select(TradingOrder).where(TradingOrder.transaction_id.in_(txn_ids))
-            ).all()
-            for o in orders:
-                if o.asset_class == AssetClass.OPTION:
-                    continue
-                if o.status not in OrderStatus.get_executed_statuses():
-                    continue
-                qty = o.filled_qty
-                if not qty:
-                    continue
-                if o.side == OrderDirection.BUY:
-                    total += abs(float(qty))
-                else:
-                    total -= abs(float(qty))
+        txns = transactions_where(symbol=self.instrument_name, expert_id=instance_id,
+                                  status=TransactionStatus.OPENED)
+        txn_ids = [t.id for t in txns]
+        if not txn_ids:
+            return 0.0
+        orders = orders_where(transaction_ids=txn_ids)
+        for o in orders:
+            if o.asset_class == AssetClass.OPTION:
+                continue
+            if o.status not in OrderStatus.get_executed_statuses():
+                continue
+            qty = o.filled_qty
+            if not qty:
+                continue
+            if o.side == OrderDirection.BUY:
+                total += abs(float(qty))
+            else:
+                total -= abs(float(qty))
         return total
 
     def _consensus_target(self) -> Optional[float]:
@@ -2918,19 +2913,29 @@ class CloseOptionAction(TradeAction):
         txn_id = self.existing_order.transaction_id if self.existing_order else None
         if not txn_id:
             return None
-        from sqlmodel import select, Session
-        with Session(get_db().bind) as session:
-            orders = session.exec(
-                select(TradingOrder).where(
-                    TradingOrder.transaction_id == txn_id,
-                    TradingOrder.asset_class == AssetClass.OPTION,
-                    TradingOrder.contract_symbol.is_not(None),
-                )
-            ).all()
-            for o in orders:
-                if o.status in OrderStatus.get_executed_statuses():
-                    return o
-            return orders[0] if orders else None
+        # BT store: TradingOrder is an in-mem model (see trade_store.IN_MEM_MODELS) -- the
+        # raw select() below silently finds nothing when the backtest in-mem flag is active
+        # (review 2026-07-18, M2). No routed helper covers this asset_class/contract_symbol
+        # filter combination, so branch manually (mirrors orders_where's own dual-path shape).
+        from ba2_common.core.trade_store import inmem_trades_active, store_all
+        if inmem_trades_active():
+            orders = [o for o in store_all(TradingOrder)
+                     if o.transaction_id == txn_id and o.asset_class == AssetClass.OPTION
+                     and o.contract_symbol is not None]
+        else:
+            from sqlmodel import select, Session
+            with Session(get_db().bind) as session:
+                orders = session.exec(
+                    select(TradingOrder).where(
+                        TradingOrder.transaction_id == txn_id,
+                        TradingOrder.asset_class == AssetClass.OPTION,
+                        TradingOrder.contract_symbol.is_not(None),
+                    )
+                ).all()
+        for o in orders:
+            if o.status in OrderStatus.get_executed_statuses():
+                return o
+        return orders[0] if orders else None
 
     def _close_limit_price(self, position: OptionPosition, order: TradingOrder) -> Optional[float]:
         """Long(BUY) closes at the bid; short(SELL) closes at the ask. Use a fresh
@@ -2952,15 +2957,22 @@ class CloseOptionAction(TradeAction):
         """Close a spread position by reversing its child leg orders as one
         multi-leg order. The parent order carries the strategy/transaction; the
         legs carry the contract symbols."""
-        from sqlmodel import select, Session
-        with Session(get_db().bind) as session:
-            children = session.exec(
-                select(TradingOrder).where(
-                    TradingOrder.parent_order_id == order.id,
-                    TradingOrder.contract_symbol.is_not(None),
-                )
-            ).all()
-            session.expunge_all()
+        # BT store: same M2 fix as _resolve_option_order -- a raw select() bypasses the
+        # in-mem store and silently finds nothing when the backtest flag is active.
+        from ba2_common.core.trade_store import inmem_trades_active, store_all
+        if inmem_trades_active():
+            children = [o for o in store_all(TradingOrder)
+                       if o.parent_order_id == order.id and o.contract_symbol is not None]
+        else:
+            from sqlmodel import select, Session
+            with Session(get_db().bind) as session:
+                children = session.exec(
+                    select(TradingOrder).where(
+                        TradingOrder.parent_order_id == order.id,
+                        TradingOrder.contract_symbol.is_not(None),
+                    )
+                ).all()
+                session.expunge_all()
 
         if not children:
             return self.create_and_save_action_result(

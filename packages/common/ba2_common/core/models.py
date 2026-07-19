@@ -486,31 +486,56 @@ class TradingOrder(SQLModel, table=True):
             int | None: Expert instance ID if found, None otherwise
         """
         # Import here to avoid circular dependency
-        from ba2_common.core.db import get_db
-        
+        from ba2_common.core.db import get_db, get_instance
+        from ba2_common.core.trade_store import inmem_trades_active
+
+        # BT store: Transaction/ExpertRecommendation are in-mem models (see trade_store.
+        # IN_MEM_MODELS) — a raw session.get() bypasses that store and silently returns
+        # None even when the row exists, so route through get_instance() (which the store
+        # intercepts) instead. Same bug class TradeRiskManagement._get_orders_with_
+        # recommendations was fixed for (2026-07-18 senate-basket-dispatch changeset).
+        if inmem_trades_active():
+            try:
+                # Path 1: Check transaction-based linkage (Smart Risk Manager)
+                if self.transaction_id:
+                    transaction = get_instance(Transaction, self.transaction_id)
+                    if transaction and transaction.expert_id:
+                        return transaction.expert_id
+            except Exception:  # noqa: BLE001 — a missing transaction just falls through
+                pass
+            try:
+                # Path 2: Check recommendation-based linkage (traditional experts)
+                if self.expert_recommendation_id:
+                    recommendation = get_instance(ExpertRecommendation, self.expert_recommendation_id)
+                    if recommendation and recommendation.instance_id:
+                        return recommendation.instance_id
+            except Exception:  # noqa: BLE001 — a missing recommendation just falls through
+                pass
+            return None
+
         # Use provided session or create new one
         close_session = False
         if session is None:
             session = get_db()
             close_session = True
-        
+
         try:
             # Path 1: Check transaction-based linkage (Smart Risk Manager)
             if self.transaction_id:
                 transaction = session.get(Transaction, self.transaction_id)
                 if transaction and transaction.expert_id:
                     return transaction.expert_id
-            
+
             # Path 2: Check recommendation-based linkage (traditional experts)
             if self.expert_recommendation_id:
                 from sqlmodel import select
                 recommendation = session.get(ExpertRecommendation, self.expert_recommendation_id)
                 if recommendation and recommendation.instance_id:
                     return recommendation.instance_id
-            
+
             # No expert found via either path
             return None
-            
+
         finally:
             if close_session:
                 session.close()

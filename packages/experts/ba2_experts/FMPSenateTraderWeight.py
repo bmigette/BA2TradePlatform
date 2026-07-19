@@ -330,7 +330,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         """Stable per-trade key for the exec_price map (symbol + execution date)."""
         return (str(trade.get('symbol', '')).upper(), str(trade.get('transactionDate', '')))
 
-    def _symbol_trades_index_cached(self, symbol: str) -> Dict[str, Any]:
+    def _symbol_trades_index_cached(self, symbol: str, is_live: bool = False) -> Dict[str, Any]:
         """Per-symbol, per-instance memo of the deduped senate+house trade list PLUS a
         disclosure-date-sorted view for O(log n) per-day window selection.
 
@@ -342,15 +342,27 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         trial's disclosure/exec windows can ever survive _filter_trades, so per day we now
         bisect this sorted view instead of rescanning everything.
 
+        ``is_live``: the "frozen for the whole run" premise above holds only for a backtest
+        (hermetic disk cache, one trial per process). A LIVE expert instance is a long-lived
+        singleton (``ExpertInstanceCache``) that lives across many scheduled analysis cycles,
+        so caching this memo unconditionally would freeze the disclosure feed at whatever it
+        was on the FIRST live cycle forever (found in review 2026-07-18, finding H1: new
+        congressional trades become invisible to every subsequent cycle until a restart).
+        When ``is_live`` is True this method skips the memo entirely — always fetch + dedup +
+        parse fresh, matching ``fmp_history_disk_cached``'s own live-passthrough contract
+        (live always pulls fresh from the API; only backtests get the hermetic frozen cache).
+
         Returns ``{all_trades, rows}`` where rows = [(disclose_dt, exec_dt, trade), ...]
         sorted by disclose_dt, restricted to rows with BOTH dates parseable and a matching
         symbol (rows _filter_trades would drop unconditionally anyway)."""
-        memo = getattr(self, "_symbol_trades_memo", None)
-        if memo is None:
-            memo = self._symbol_trades_memo = {}
-        cached = memo.get(symbol)
-        if cached is not None:
-            return cached
+        memo = None
+        if not is_live:
+            memo = getattr(self, "_symbol_trades_memo", None)
+            if memo is None:
+                memo = self._symbol_trades_memo = {}
+            cached = memo.get(symbol)
+            if cached is not None:
+                return cached
 
         senate = self._fetch_senate_trades(symbol) or []
         house = self._fetch_house_trades(symbol) or []
@@ -381,8 +393,10 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             except (ValueError, TypeError):
                 continue  # unparseable either date -> _filter_trades would drop it
         rows.sort(key=lambda r: r[0])
-        cached = memo[symbol] = {"all_trades": all_trades, "rows": rows,
-                                 "disclose_dates": [r[0] for r in rows]}
+        cached = {"all_trades": all_trades, "rows": rows,
+                  "disclose_dates": [r[0] for r in rows]}
+        if memo is not None:
+            memo[symbol] = cached
         return cached
 
     def _window_trades(self, index: Dict[str, Any], now: datetime,
@@ -394,10 +408,24 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         executed AFTER the backtest's simulated 'now' cannot possibly be known yet, so
         this pre-filter must reject it too to stay a faithful superset of _filter_trades.
         O(log n) bisect on the disclosure-sorted view (both bounds) + a scan of the
-        small tail for the exec-date bounds."""
-        lo = bisect.bisect_left(index["disclose_dates"], now - timedelta(days=int(max_disclose_days)))
+        small tail for the exec-date bounds.
+
+        The lower bounds carry a +1 DAY margin (review 2026-07-18, M4): _filter_trades
+        compares INTEGER-truncated day counts (``(now - disclose_date).days <= max``,
+        disclose_date always parsed at midnight), while this pre-filter used to bisect on
+        an EXACT datetime cutoff (``now - timedelta(days=max)``). For a DAILY run (now at
+        midnight) the two agree exactly. For an INTRADAY run (now carries a time-of-day),
+        a disclose/exec date up to ~1 day older than the exact cutoff can still have
+        ``.days == max`` (truncation) and so still survive _filter_trades -- the exact-
+        datetime cutoff dropped it a day early, silently losing recall at the window edge
+        (never leaked a stale trade, only lost some real ones). Widening the bisect floor
+        by one extra day restores the superset guarantee for both daily and intraday runs;
+        _filter_trades still runs its own exact check afterward, so the extra day of
+        candidates it doesn't actually need are simply filtered back out downstream."""
+        lo = bisect.bisect_left(index["disclose_dates"],
+                                now - timedelta(days=int(max_disclose_days) + 1))
         hi = bisect.bisect_right(index["disclose_dates"], now)
-        exec_floor = now - timedelta(days=int(max_exec_days))
+        exec_floor = now - timedelta(days=int(max_exec_days) + 1)
         return [t for _d, e, t in index["rows"][lo:hi] if exec_floor <= e <= now]
 
     def _sliced_history_for_day(self, name: str, ceiling: datetime,
@@ -431,7 +459,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
 
     def _gather(self, providers: ProviderBundle, as_of: Optional[datetime]) -> Dict[str, Any]:
         symbol = self._gather_symbol
-        index = self._symbol_trades_index_cached(symbol)
+        index = self._symbol_trades_index_cached(symbol, is_live=(as_of is None))
 
         # Window pre-filter (2026-07-18 perf pass): only trades inside the trial's OWN
         # disclosure/exec windows can survive _filter_trades, and _calculate_recommendation
@@ -529,7 +557,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             "symbol": symbol,
         }
 
-    def _all_trades_index_cached(self) -> Dict[str, Any]:
+    def _all_trades_index_cached(self, is_live: bool = False) -> Dict[str, Any]:
         """Unscoped counterpart of ``_symbol_trades_index_cached``: a per-instance memo of the
         deduped ALL-SYMBOLS senate+house trade list (the ``{chamber}-latest`` feed), PLUS a
         disclosure-date-sorted view for O(log n) per-day window selection — mirrors
@@ -550,10 +578,18 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         scored trades=0/fitness=-1e9 for every individual). ``full_history=True`` paginates
         the fetch to the end of the feed instead (see ``_fetch_congress_trades``'s
         "Pagination-depth design" docstring for why unconditional-depth beats trying to derive
-        a floor date from this backtest's own as_of walk)."""
-        cached = getattr(self, "_all_trades_memo", None)
-        if cached is not None:
-            return cached
+        a floor date from this backtest's own as_of walk).
+
+        ``is_live``: see ``_symbol_trades_index_cached``'s docstring — same H1 fix (review
+        2026-07-18): a live singleton instance must NOT memoize this forever, or every
+        scheduled analysis cycle after the first sees a frozen feed. When True, skip the memo
+        and fetch+dedup fresh every call (still ``full_history=True`` — live wants the whole
+        current feed each cycle, it just must not be cached across cycles)."""
+        cached = None
+        if not is_live:
+            cached = getattr(self, "_all_trades_memo", None)
+            if cached is not None:
+                return cached
 
         senate = self._fetch_senate_trades(symbol=None, full_history=True) or []
         house = self._fetch_house_trades(symbol=None, full_history=True) or []
@@ -580,7 +616,9 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             except (ValueError, TypeError):
                 continue  # unparseable either date -> _filter_trades would drop it
         rows.sort(key=lambda r: r[0])
-        cached = self._all_trades_memo = {"rows": rows, "disclose_dates": [r[0] for r in rows]}
+        cached = {"rows": rows, "disclose_dates": [r[0] for r in rows]}
+        if not is_live:
+            self._all_trades_memo = cached
         return cached
 
     def _gather_all(self, providers: ProviderBundle, as_of: Optional[datetime]) -> Dict[str, Dict[str, Any]]:
@@ -655,7 +693,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         # Steps 1-2: unscoped fetch + date-window filter. _all_trades_index_cached() produces
         # the SAME {"rows", "disclose_dates"} shape the per-symbol _window_trades already
         # bisects over, so reuse it directly instead of re-deriving the same bisect+filter here.
-        index = self._all_trades_index_cached()
+        index = self._all_trades_index_cached(is_live=(as_of is None))
         windowed = self._window_trades(index, ceiling, max_disclose_days, max_exec_days)
 
         # Step 3: NEW tradability filter.
@@ -904,10 +942,23 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         happen to return:
           - ``context.extra.get("symbol")`` truthy -> OLD per-symbol convention: run the
             existing ``_gather``/``_process`` pair pinned to that symbol, return a single
-            ``Recommendation`` (byte-identical to pre-Task-5 behavior).
-          - ``context.extra.get("symbol")`` falsy (``_run_basket_expert_bar`` never sets it)
-            -> NEW basket convention: run ``_gather_all``/``_process_all`` instead, return
-            ``List[Recommendation]``.
+            ``Recommendation`` (byte-identical to pre-Task-5 behavior for THIS specific
+            calling shape).
+          - ``context.extra.get("symbol")`` falsy -> NEW basket convention: run
+            ``_gather_all``/``_process_all`` instead, return ``List[Recommendation]``.
+
+        CAVEAT (review 2026-07-18, finding L1): pre-Task-5, a symbol-less ``context.extra``
+        did NOT mean "no symbol at all" — it fell back to ``self._gather_symbol`` (whatever
+        attribute value a caller had previously pinned directly), matching the convention
+        ``daily_engine.py``'s classic ``_run_expert_bar`` still uses today (it pins the
+        attribute, never sets ``context.extra["symbol"]``). That fallback path is GONE:
+        a symbol-less ``context.extra`` now unconditionally routes to the NEW basket branch
+        instead. No production caller of Weight relies on the old fallback shape today (the
+        ``analyzes_as_basket`` marker routes every real call through ``_run_basket_expert_bar``,
+        which never sets ``context.extra["symbol"]``), so this is latent, not a live bug — but
+        if that marker were ever removed while some caller still used the old pinned-attribute
+        convention, this method would return a ``List[Recommendation]`` where a single
+        ``Recommendation`` was expected and crash the caller.
         """
         symbol = context.extra.get("symbol")
         if symbol:
@@ -2606,11 +2657,23 @@ All {len(trade_details)} trades shown above for transparency.
             bundle_by_symbol = self._gather_all(providers, as_of=None)
             recommendations = self._process_all(bundle_by_symbol, settings, as_of=None)
 
-            # Persist one ExpertRecommendation per element of the basket result, reusing the
-            # SAME helper the single-symbol path below uses (not duplicated).
+            # Persist one ExpertRecommendation per ACTIONABLE element of the basket result
+            # (review 2026-07-18, finding L2): _process_all deliberately includes HOLD/SKIP
+            # items too (the backtest engine's own _recommendation_to_expert_recommendation
+            # filters those out downstream, see daily_engine.py), but this live path has no
+            # such downstream filter -- persisting them here would write one row per
+            # qualifying-but-HOLD symbol in the WHOLE disclosure feed, every cycle (dozens to
+            # hundreds of rows the enter loop immediately skips anyway). The single-symbol
+            # live path below is unaffected: it always persists exactly one row per (symbol,
+            # cycle) regardless of signal, which is the established one-row audit-trail
+            # convention for that much smaller call volume.
+            actionable = [rec for rec in recommendations
+                         if rec.signal != OrderRecommendation.HOLD and not rec.skip]
+            skipped_hold_count = len(recommendations) - len(actionable)
+
             recommendation_ids = []
             symbols_analyzed = []
-            for rec in recommendations:
+            for rec in actionable:
                 trade_symbol = rec.raw_outputs["symbol"]
                 recommendation_data = rec.raw_outputs["recommendation"]
                 current_price = rec.current_price
@@ -2625,13 +2688,15 @@ All {len(trade_details)} trades shown above for transparency.
                     # Continue with other symbols -- one bad symbol shouldn't drop the rest.
 
             self.logger.info(f"FMPSenateTraderWeight basket analysis found {len(bundle_by_symbol)} qualifying "
-                       f"symbol(s), created {len(recommendation_ids)} recommendation(s)")
+                       f"symbol(s), created {len(recommendation_ids)} recommendation(s) "
+                       f"({skipped_hold_count} HOLD/SKIP not persisted)")
 
             # Store analysis state with basket-mode summary information.
             market_analysis.state = {
                 'senate_trade_basket': {
                     'analysis_type': 'basket',
                     'total_symbols': len(bundle_by_symbol),
+                    'skipped_hold_count': skipped_hold_count,
                     'symbols_analyzed': sorted(symbols_analyzed),
                     'expert_recommendation_ids': recommendation_ids,
                     'settings': {
@@ -2820,15 +2885,70 @@ All {len(trade_details)} trades shown above for transparency.
             
             raise
     
+    def _render_basket_completed(self, market_analysis: MarketAnalysis) -> None:
+        """Lightweight summary card for a basket-mode ('EXPERT' symbol) analysis cycle
+        (review 2026-07-18, finding L3). Unlike the single-symbol 'senate_trade' branch,
+        there is no one recommendation/trade-list to show -- a basket cycle scans the whole
+        disclosure feed and may touch dozens of symbols, so this renders the per-cycle
+        summary _run_basket_analysis actually wrote (total_symbols found, which of those
+        were persisted as actionable, how many were HOLD/SKIP -- see the L2 fix)."""
+        from nicegui import ui
+
+        state = market_analysis.state['senate_trade_basket']
+        symbols_analyzed = state.get('symbols_analyzed', [])
+        total_symbols = state.get('total_symbols', 0)
+        skipped_hold_count = state.get('skipped_hold_count', 0)
+        settings = state.get('settings', {})
+
+        with ui.card().classes('w-full').style('background-color: #1e2a3a'):
+            with ui.card_section().style('background: linear-gradient(135deg, #00d4aa 0%, #00b894 100%)'):
+                ui.label('Senate/House Trading Activity — Basket Analysis').classes(
+                    'text-h5 text-weight-bold').style('color: white')
+                ui.label('Whole-feed scan across all congressional disclosures').style(
+                    'color: rgba(255,255,255,0.8)')
+
+            with ui.card_section():
+                with ui.row().classes('w-full items-center gap-6'):
+                    with ui.column():
+                        ui.label(str(total_symbols)).classes('text-h4 text-weight-bold')
+                        ui.label('Symbols scanned').classes('text-caption text-grey-6')
+                    with ui.column():
+                        ui.label(str(len(symbols_analyzed))).classes('text-h4 text-weight-bold text-positive')
+                        ui.label('Recommendations created').classes('text-caption text-grey-6')
+                    with ui.column():
+                        ui.label(str(skipped_hold_count)).classes('text-h4 text-weight-bold text-grey-6')
+                        ui.label('HOLD/SKIP (not persisted)').classes('text-caption text-grey-6')
+
+                if symbols_analyzed:
+                    ui.label('Symbols with a recommendation:').classes('text-weight-medium q-mt-md')
+                    ui.label(', '.join(sorted(symbols_analyzed))).classes('text-grey-4')
+
+                if settings:
+                    ui.label('Settings').classes('text-weight-medium q-mt-md')
+                    with ui.row().classes('gap-4'):
+                        ui.label(f"Max disclose days: {settings.get('max_disclose_date_days', 'N/A')}")
+                        ui.label(f"Max exec days: {settings.get('max_trade_exec_days', 'N/A')}")
+                        ui.label(f"Max price delta: {settings.get('max_trade_price_delta_pct', 'N/A')}%")
+
     def _render_completed(self, market_analysis: MarketAnalysis) -> None:
         """Render completed analysis with detailed UI."""
         from nicegui import ui
-        
+
+        if market_analysis.state and 'senate_trade_basket' in market_analysis.state:
+            # Basket-mode analysis (review 2026-07-18, finding L3): _run_basket_analysis
+            # writes a coarser, per-CYCLE summary shape (qualifying symbols + persisted
+            # recommendation ids), not the per-trade detail the single-symbol 'senate_trade'
+            # branch below renders -- there is no single set of trades/recommendation to
+            # show. Render a lighter summary card instead of falling through to "No analysis
+            # data available" (the state IS there, just shaped differently).
+            self._render_basket_completed(market_analysis)
+            return
+
         if not market_analysis.state or 'senate_trade' not in market_analysis.state:
             with ui.card().classes('w-full p-4'):
                 ui.label('No analysis data available').classes('text-grey-7')
             return
-        
+
         state = market_analysis.state['senate_trade']
         rec = state.get('recommendation', {})
         stats = state.get('trade_statistics', {})

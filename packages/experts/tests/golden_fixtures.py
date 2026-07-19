@@ -243,8 +243,9 @@ def _build_senate_copy(subtype: AnalysisUseCase):
     e.logger = _LOG
     # live account quote per symbol mirrors the as_of price_map (None for unsupported)
     e._get_current_price = lambda sym: {"AAPL": 100.0}.get(str(sym).upper())
-    e._fetch_senate_trades = lambda symbol=None: senate
-    e._fetch_house_trades = lambda symbol=None: []
+    # **kwargs: _gather calls these with full_history=True (H2 fix, review 2026-07-18).
+    e._fetch_senate_trades = lambda symbol=None, **kwargs: senate
+    e._fetch_house_trades = lambda symbol=None, **kwargs: []
     # settings passed to analyze_as_of (which merges context.subtype into _subtype).
     settings = {"copy_trade_names": "Nancy Pelosi", "max_disclose_date_days": 365,
                 "max_trade_exec_days": 365}
