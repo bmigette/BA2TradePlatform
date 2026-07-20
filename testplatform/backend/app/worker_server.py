@@ -79,6 +79,37 @@ _JOBS_LOCK = threading.Lock()
 _JOBS_MAX_ORPHAN_AGE = 6 * 3600.0  # 6h: generous vs. any real trial; just bounds a leak
 
 
+def _install_orchestration_file_logging() -> None:
+    """Persist THIS process's own orchestration-layer logs (submit-trial, job-status, pool
+    crashes, memory dumps, uvicorn) to ``<LOGS_DIR>/worker_server.log`` so the ``/logs`` endpoint
+    has something to show for them.
+
+    Deliberately separate from ``ba2_common.logger``'s per-instance rotating handlers: those are
+    attached ONLY to the ``ba2_common`` logger (``propagate = False``) and the per-expert loggers
+    — trial business logic running in a SPAWNED pool child, not this single long-lived server
+    process. Spawned children already run with ``BA2_FILE_LOGGING=0`` (see logger.py's module
+    docstring) specifically to dodge a multi-process RotatingFileHandler rollover race, so this
+    does NOT attach to the root logger from a child process — only from the one, single-process
+    server the pool children are spawned FROM. A ROOT handler here (not a module-specific one)
+    also captures uvicorn's own access/error logs, useful context for the same incidents."""
+    if not os.environ.get("BA2_FILE_LOGGING", "1") == "0":
+        from logging.handlers import RotatingFileHandler
+        from ba2_common.logger import LOGS_DIR
+
+        os.makedirs(LOGS_DIR, exist_ok=True)
+        path = os.path.join(LOGS_DIR, "worker_server.log")
+        root = logging.getLogger()
+        if any(isinstance(h, RotatingFileHandler) and getattr(h, "baseFilename", None) ==
+               os.path.abspath(path) for h in root.handlers):
+            return  # already installed (e.g. a hot-reload re-entering this)
+        handler = RotatingFileHandler(path, maxBytes=10 * 1024 * 1024, backupCount=7, encoding="utf-8")
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+        handler.setLevel(logging.INFO)
+        root.addHandler(handler)
+        root.setLevel(logging.INFO)
+
+
 def _memory_snapshot() -> dict:
     """Best-effort memory snapshot of the worker SERVER + its trial children. Shared by
     ``_dump_worker_memory`` (logs it on a pool crash) and the ``/diag/memory`` endpoint (returns
@@ -685,6 +716,7 @@ def run_worker_server(host: str, port: int, password: str, n_workers: int) -> No
             initializer=_worker_init, initargs=(_BACKEND_DIR, env),
         )
 
+    _install_orchestration_file_logging()
     _sweep_orphaned_spawn_children()
     _POOL_FACTORY = _make_pool
     _POOL = _make_pool()

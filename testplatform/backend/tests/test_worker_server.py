@@ -115,6 +115,38 @@ def test_logs_unknown_file_404s(client, tmp_path, monkeypatch):
     assert r.status_code == 404
 
 
+def test_install_orchestration_file_logging_persists_root_warnings(tmp_path, monkeypatch):
+    """The orchestration layer (worker_server.py's own logger, e.g. pool-crash / memory-dump
+    warnings) previously went to console only -- nothing to show via /logs. Regression for the
+    2026-07-20 remote150 incident where NEITHER the spawned trial children (file logging off by
+    design) NOR this layer had persisted any record of what happened."""
+    import logging as _logging
+    import ba2_common.logger as bl
+
+    monkeypatch.setattr(bl, "LOGS_DIR", str(tmp_path))
+    monkeypatch.delenv("BA2_FILE_LOGGING", raising=False)
+    root = _logging.getLogger()
+    before = list(root.handlers)
+    try:
+        ws._install_orchestration_file_logging()
+        ws.logger.warning("test warning for the orchestration log file")
+        log_path = tmp_path / "worker_server.log"
+        assert log_path.exists()
+        assert "test warning for the orchestration log file" in log_path.read_text()
+
+        # Calling it again must not attach a duplicate handler.
+        n_before = len(root.handlers)
+        ws._install_orchestration_file_logging()
+        assert len(root.handlers) == n_before
+    finally:
+        # Restore the root logger to its pre-test state (avoid bleeding a file handler into
+        # other tests' logging).
+        for h in list(root.handlers):
+            if h not in before:
+                root.removeHandler(h)
+                h.close()
+
+
 def test_submit_trial_then_poll_returns_done_with_result(client):
     job_id = _submit_and_get_job_id(client, "/submit-trial")
     r = client.get(f"/job-status/{job_id}", headers=H)
