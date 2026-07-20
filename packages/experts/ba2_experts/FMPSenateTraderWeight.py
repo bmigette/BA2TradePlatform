@@ -99,6 +99,15 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
     # FMPSenateTraderCopy.py, Task 3 of the same plan).
     analyzes_as_basket = True
 
+    # 2026-07-20 Senate-matrix memory investigation: a single trial's congress scoring caches
+    # (see _WORKER_SCORING_CACHE above) plus per-symbol/per-day gather state run ~11-12GB RSS at
+    # steady state. Running a remote worker's full advertised /health capacity (e.g. 8 slots)
+    # concurrently risks OOM-ing that box. strategy_optimization_handler._max_remote_slots_for_experts
+    # reads this class attribute (mirroring how bypasses_classic_rm is read) and caps
+    # DistributedEvaluator's remote dispatcher threads per worker to this value for any
+    # optimization run that includes this expert.
+    max_remote_worker_slots = 4
+
     @classmethod
     def description(cls) -> str:
         return "Government official trading activity analysis using weighted algorithm based on portfolio allocation"

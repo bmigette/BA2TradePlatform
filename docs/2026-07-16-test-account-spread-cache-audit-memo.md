@@ -16,8 +16,9 @@ instance (§1); apply going forward on every new deploy (e.g. right after the
 
 ## 1. Currently deployed instances (dev trade platform: `ba2\trade\db.sqlite`)
 
-3 accounts (`BA2-Test1`/`2`/`3`, all Alpaca). 15 `ExpertInstance` rows total; 2 disabled today
-(see §2). Settings below are the fields most relevant to spread/TP-SL behavior — full settings
+3 accounts (`BA2-Test1`/`2`/`3`, all Alpaca). 25 `ExpertInstance` rows total as of 2026-07-20
+(24 goal6-grid instances at target + 1 out-of-scope PennyMomentumTrader); none disabled (see
+§2/§3). Settings below are the fields most relevant to spread/TP-SL behavior — full settings
 dumps are in the DB if needed.
 
 ### BA2-Test1 (account_id=1)
@@ -36,6 +37,8 @@ dumps are in the DB if needed.
 | 15 | FactorRanker | goal6-large_FRtop4 | 1 | large | $50B | 20 | 6.0 | 1.9 | — | — | — | — | (expert-driven) |
 | 26 | FactorRanker | goal6-mid_FRtop1 | 1 | mid | (screener, mid) | — | — | — | — | — | — | — | (expert-driven) |
 | 27 | FactorRanker | goal6-mid_FRtop4 | 1 | mid | (screener, mid) | — | — | — | — | — | — | — | (expert-driven) |
+| 30 | FactorRanker | goal6-small_FRtop2 | 1 | small | (screener, small) | — | — | — | — | — | — | — | (expert-driven) |
+| 31 | FactorRanker | goal6-small_FRtop3 | 1 | small | (screener, small) | — | — | — | — | — | — | — | (expert-driven) |
 
 Notes (2026-07-19): ids 26/27 deployed from the `-goal6c` re-run (fixed genes: `hard_stop_pct`
 removed, `risk_per_trade_pct` GA-tunable, screener volume floor 1.0→0.0), TOP1 (bt726,
@@ -44,6 +47,16 @@ large-band deployment. TOP1 wins the `consistent_annual_return` fitness despite 
 return because it's the only mid individual with all-3-years positive (no `consistency`-floor
 penalty); TOP4 is the best raw-return individual either mid run has found, included for
 diversification. Both `ForwardTest`-tagged.
+
+Notes (2026-07-20): ids 30/31 deployed from opt199 (`-goal6c` small-band re-run, same fixed
+genes as the mid re-run above). opt190 (pre-fix genes) was uniformly weak/negative (-0.17% to
+-0.66% return, TOP1-4) — opt199's top-3 are all positive: TOP2 (bt728, 24.71%/70.0%WR),
+TOP3 (bt729, 20.35%/61.11%WR), TOP1 (bt731, 13.52%/64.71%WR, best `consistent_annual_return`
+fitness but lower return/WR). User-directed pick 2026-07-20: TOP2+TOP3 over TOP1, for
+diversification and to lead on return/WR (same rationale as the existing large/mid pairs) —
+trade frequency is low (10-19 trades over 3.5yr, ~3-5/yr) so the fitness score itself is modest
+(`best_fitness`=0.76, heavily penalized by the `trade_gate` term vs the 30/yr target) despite
+solidly positive returns. Both `ForwardTest`-tagged. Closes the FactorRanker gap: 4 → 6.
 
 ### BA2-Test2 (account_id=2)
 
@@ -78,9 +91,13 @@ was confirmed live — user-directed cleanup 2026-07-19.
 | id | expert | alias | enabled | notes |
 |---|---|---|---|---|
 | 4 | PennyMomentumTrader | TestPenny | 1 | Not part of the GA/screener pipeline — no matching `StrategyOptimization`/`Backtest` row exists. sizing_mode=risk_atr, risk_manager_mode=classic, min_SL%=7.0, risk/trade%=2.0. Out of scope for this audit. |
+| 28 | FMPSenateTraderWeight | goal6-senate_S3top3 | 1 | bt739 (`TOP3-sen-S3-goal6`, opt201): 92.12% return / 66.17% WR / -14.32% DD / 133 trades. `instrument_selection_method=expert` (basket dispatch — Senate scans its own candidate list every cycle via `_gather_all`, not the backtest's static 498-symbol scanning universe). risk/trade%=5.0. `ForwardTest`-tagged. |
+| 29 | FMPSenateTraderWeight | goal6-senate_S5top2 | 1 | bt743 (`TOP2-sen-S5-goal6`, opt202): 179.13% return / 35.29% WR / -14.47% DD / 119 trades. Same basket-dispatch wiring as id28. risk/trade%=5.0. `ForwardTest`-tagged. |
 
 All non-PennyMomentumTrader instances trace back to a specific `Backtest` row via the
-`TOP<rank>-scr-<band>-<expert>-<strategy>-goal6` naming convention (mapping table in §3).
+`TOP<rank>-scr-<band>-<expert>-<strategy>-goal6` naming convention (mapping table in §3), except
+the FMPSenateTraderWeight pair (ids 28/29, `TOP<rank>-sen-<strategy>-goal6`, not band-split —
+Senate's universe spans all bands, deployed here since BA2-Test3 had the most spare capacity).
 
 ## 2. Final deployment goal & gap analysis
 
@@ -95,11 +112,11 @@ large-cap).
 | expert | target | current | gap | band split (2/band) |
 |---|---|---|---|---|
 | FMPRating | 8 | 8 | **0 — at target count** | large/mid/small currently 3/3/2, not an even 2/2/2/2 — see note below. The FRAGILE-flagged small instance (id12) is now reseeded in place (§3) — zero disabled/fragile FMPRating instances remain. |
-| FactorRanker | 6 | 4 | **+2 needed** | large (2, ids 14/15) + mid (2, ids 26/27, deployed 2026-07-19) — small-band still needed |
+| FactorRanker | 6 | 6 | **0 — closed 2026-07-20** | large (2, ids 14/15) + mid (2, ids 26/27, deployed 2026-07-19) + small (2, ids 30/31, deployed 2026-07-20) |
 | FMPEarningsDrift | 4 | 4 | **0 — closed 2026-07-19** | mid (S1top1 id16, reseeded S2top1 id20) + small (S1top1 id22, S7top2 id23) — 2/2 |
 | FMPInsiderClusterBuy | 4 | 4 | **0 — closed 2026-07-19** | mid (S2top3 id19, S7top2 id25) + small (S1top3 id21, S7top1 id24) — 2/2 |
-| FMPSenateTraderWeight | 2 | 0 | **+2 needed** | not band-split (Senate's universe spans all bands — single blended assumption per `tools/run_senate_matrix.py`); Phase 3 of the grid sequence, not yet run |
-| **Total** | **24** | **20** | **+4 needed** | |
+| FMPSenateTraderWeight | 2 | 2 | **0 — closed 2026-07-20** | not band-split (Senate's universe spans all bands — single blended assumption per `tools/run_senate_matrix.py`); deployed S3top3 (id28, bt739) + S5top2 (id29, bt743) to BA2-Test3, best 2 by `consistent_annual_return` fitness across the full S2/S3/S5/S6 matrix |
+| **Total** | **24** | **24** | **at target** | |
 
 **2026-07-19 update — EarningsDrift small-band gap closed**: the small-band grid (opt166=S1,
 opt167=S2, plus S7 from an earlier phase, opt195) finished. S2's full top-5 (opt167:
@@ -130,10 +147,15 @@ Notes:
   insider data). Mid is already deployed (ICB_S7top1, ICB_S2top3, ids 18/19). Need small-band
   optimization run and top-2 deployed — grid Phase 2 (`scr-small-FMPInsiderClusterBuy-*`,
   spread=40bps) covers this but hasn't run yet (queued after Phase 1b).
-- **FMPSenateTraderWeight gap (+2)**: Phase 3 of `run_grid_sequence_v2.sh`
-  (`tools/run_senate_matrix.py`, strategies S2/S3/S5/S6, spread=20bps) hasn't run yet —
-  sequential phases 1a/1b/2 haven't finished. Once it does, pick top-2 by fitness for
-  deployment.
+- **FMPSenateTraderWeight gap — closed 2026-07-20**: Phase 3 (`tools/run_senate_matrix.py`,
+  strategies S2/S3/S5/S6, spread=20bps, opt200/201/202/206) finished. Top candidates per
+  strategy: S2 TOP2 (bt732, 74.4%/17.29%ann), S3 TOP3 (bt739, 92.12%/20.59%ann/66.17%WR), S5
+  TOP2 (bt743, 179.13%/34.22%ann), S6 TOP2 (bt747, 47.83%/11.86%ann) — S3 TOP3 and S5 TOP2 won
+  on `consistent_annual_return` (approximate recompute: annualized_return × win_rate_factor,
+  with `dd_guard`/`trade_gate` both ≈1.0 for every leading candidate — all under the 20% DD
+  guard threshold and well above the 30 trades/yr gate). Deployed both to BA2-Test3 (ids
+  28/29, the only account with spare capacity) as basket-dispatch instances
+  (`instrument_selection_method=expert`), `ForwardTest`-tagged on bt739/bt743.
 
 ## 3. Currently disabled (pending reseed) — UPDATE: both now reseeded, none disabled
 
@@ -305,8 +327,8 @@ runs from opt 116 and opt 119 specifically are still needed before reseeding eit
 - [ ] Decide FMPRating's band split: keep 3/3/2 (large/mid/small) at 8 total, or rebalance to
       an even 2/2/2/2 across 4 bands (would need defining a mega-cap tier — hinted at by the
       existing $140B vs $70B vs $90B cap-min spread across the 3 current "large" instances).
-- [ ] Run mid-band and small-band FactorRanker optimization + deploy top-2 each (+4 toward
-      the FactorRanker gap: 2 → 6).
+- [x] **Done 2026-07-19/20** — mid-band (ids 26/27, bt726/bt724) and small-band (ids 30/31,
+      bt728/bt729) FactorRanker deployed. FactorRanker gap closed: 2 → 6.
 - [x] **Done 2026-07-19** — deployed top small-band FMPEarningsDrift picks: S1 TOP1 (bt709,
       id22) and S7 TOP2 (bt704, id23). Did NOT reuse backtest 562 (doesn't reliably reproduce,
       see §5). S2 (opt167) top-5 fully checked and confirmed not competitive with S1/S7.
@@ -315,8 +337,9 @@ runs from opt 116 and opt 119 specifically are still needed before reseeding eit
       (`goal6-small_ICB_S1top3`, bt626, id21; `goal6-small_ICB_S7top1`, bt717, id24).
       InsiderClusterBuy gap closed: 2 → 4. Also swapped the mid `S7` deployment (id18 → id25,
       TOP1 → TOP2) after a user-requested fitness review — see §1 notes.
-- [ ] Run Phase 3 of the grid (`tools/run_senate_matrix.py`, S2/S3/S5/S6) once Phases 1b/2
-      finish, then deploy top-2 (0 → 2, closes the FMPSenateTraderWeight gap entirely).
+- [x] **Done 2026-07-20** — Phase 3 of the grid (`tools/run_senate_matrix.py`, S2/S3/S5/S6,
+      opt200/201/202/206) finished; deployed top-2 by fitness (S3 TOP3 bt739 id28, S5 TOP2
+      bt743 id29) to BA2-Test3. FMPSenateTraderWeight gap closed: 0 → 2.
 
 **Data/infra follow-through:**
 - [ ] 2022-coverage fetch (1,331 symbols) — wait for completion, then **rebuild `metric_store`

@@ -706,6 +706,23 @@ def test_is_bypass_expert_detects_factorranker_and_clean_experts():
     assert H._is_bypass_expert({"engine": "daily", "experts": ["NoSuchExpert"]}) is False
 
 
+def test_max_remote_slots_for_experts_reads_senate_cap_and_defaults_uncapped():
+    """``_max_remote_slots_for_experts`` returns FMPSenateTraderWeight's declared
+    ``max_remote_worker_slots`` (memory-heavy trials cap remote concurrency below a worker's
+    reported /health capacity), None for experts that don't declare a cap, and the tightest
+    cap when multiple capped experts are named in the same run."""
+    senate_cfg = {"engine": "daily", "experts": [{"class": "FMPSenateTraderWeight", "settings": {}}]}
+    clean_cfg = {"engine": "daily", "experts": [{"class": "FMPEarningsDrift", "settings": {}}]}
+    assert H._max_remote_slots_for_experts(senate_cfg) == 4
+    assert H._max_remote_slots_for_experts(clean_cfg) is None
+    assert H._max_remote_slots_for_experts({"engine": "daily", "experts": ["NoSuchExpert"]}) is None
+    mixed_cfg = {"engine": "daily", "experts": [
+        {"class": "FMPSenateTraderWeight", "settings": {}},
+        {"class": "FMPEarningsDrift", "settings": {}},
+    ]}
+    assert H._max_remote_slots_for_experts(mixed_cfg) == 4  # tightest cap wins
+
+
 def test_build_daily_trial_config_bypass_drops_rm_tp_sl():
     """For a FactorRanker (bypass) backtest_cfg, _build_daily_trial_config forwards ONLY the
     expert's own model:* overrides — NO rm:* mapped names, NO initial_tp/sl, even if decoded

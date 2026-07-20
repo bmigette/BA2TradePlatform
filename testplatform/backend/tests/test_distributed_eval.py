@@ -103,6 +103,36 @@ def test_failing_worker_falls_back_to_local(monkeypatch):
     assert all(by_idx[i]["fitness"] == i * 2.0 for i in range(12))
 
 
+def test_max_remote_slots_per_worker_caps_dispatcher_count(monkeypatch):
+    """A worker reporting capacity=8 only gets ``max_remote_slots_per_worker`` dispatcher
+    threads (and the fleet-state report reflects the capped count), not its full capacity —
+    regression for capping memory-heavy experts (e.g. FMPSenateTraderWeight) below a worker's
+    advertised /health capacity."""
+    monkeypatch.setattr(de.worker_client, "ensure_synced", lambda w, c, **k: True)
+    monkeypatch.setattr(de.worker_client, "push_cache", lambda w, **k: {"pushed": 0})
+    monkeypatch.setattr(de.worker_client, "push_secrets", lambda w, s, **k: {"set": 0})
+    monkeypatch.setattr(de.worker_client, "health", lambda w, **k: {"capacity": 8})
+    monkeypatch.setattr(de.worker_client, "run_trial",
+                        lambda w, config, metric, **kw: {"ok": True, "fitness": _fitness(config),
+                                                          "trades": 1, "error": None})
+
+    workers = [{"id": 1, "name": "remote150", "url": "http://x", "password": "p"}]
+    ev = DistributedEvaluator(_FakePool(), "sharpe", n_consumers=1, optimization_id="t",
+                              workers=workers, master_version="abc", log=lambda *_: None,
+                              max_remote_slots_per_worker=4)
+    ev.start()
+    try:
+        remote_threads = [t for t in ev._threads if t.name.startswith("remote-remote150-")]
+        assert len(remote_threads) == 4  # capped, not the worker's reported 8
+        assert ev._active_workers[0]["capacity"] == 8  # reported capacity is untouched
+        jobs = [(i, {"idx": i}, f"k{i}", {"v": i}) for i in range(10)]
+        by_idx = {i: out for (i, _f, _k, out) in ev.execute_jobs(jobs)}
+    finally:
+        ev.stop()
+    assert set(by_idx) == set(range(10))
+    assert all(by_idx[i]["fitness"] == i * 2.0 for i in range(10))
+
+
 def test_unsynced_worker_excluded(monkeypatch):
     """A worker that can't be version-matched is dropped; the run proceeds local-only."""
     monkeypatch.setattr(de.worker_client, "ensure_synced", lambda w, c, **k: False)

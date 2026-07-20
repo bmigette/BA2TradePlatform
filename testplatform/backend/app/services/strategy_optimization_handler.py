@@ -677,15 +677,19 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                         f"{_unsyncable} (this master's app_version={_master_version!r} may not "
                         f"be reachable by ANY worker's git pull)"
                     )
+                _max_remote_slots = _max_remote_slots_for_experts(backtest_cfg)
                 _evaluator = DistributedEvaluator(
                     _pool, opt.fitness_metric, parallel, opt_id,
                     workers=_workers, master_version=_master_version,
                     pool_factory=_make_pool,
+                    max_remote_slots_per_worker=_max_remote_slots,
                 )
                 _evaluator.start()  # pre-flight: version-match + cache-push each worker
                 batch_fitness = make_batch_fitness(_evaluator.execute_jobs)
                 logger.warning(f"strategy_optimization {opt_id}: DISTRIBUTED across "
-                               f"{len(_workers)} selected worker(s) + local")
+                               f"{len(_workers)} selected worker(s) + local"
+                               + (f" (remote slots capped at {_max_remote_slots}/worker)"
+                                  if _max_remote_slots else ""))
             else:
                 batch_fitness = make_batch_fitness(_local_execute_jobs)
         try:
@@ -786,6 +790,37 @@ def _is_bypass_expert(backtest_cfg: Dict[str, Any]) -> bool:
         if bool(getattr(expert_cls, "bypasses_classic_rm", False)):
             return True
     return False
+
+
+def _max_remote_slots_for_experts(backtest_cfg: Dict[str, Any]) -> Optional[int]:
+    """Tightest ``max_remote_worker_slots`` declared by any expert named in *backtest_cfg*.
+
+    Mirrors ``_is_bypass_expert``'s resolution (same ``_SUPPORTED_EXPERTS`` lookup). Memory-heavy
+    experts (e.g. FMPSenateTraderWeight — see its class attribute) cap how many concurrent remote
+    dispatcher slots ``DistributedEvaluator`` engages per worker, regardless of the worker's
+    reported ``/health`` capacity, so a worker advertising more slots than the expert's per-trial
+    footprint can safely run isn't driven into OOM. Returns None (uncapped — use the worker's
+    full reported capacity, the pre-existing behaviour) when no named expert declares a cap.
+    """
+    import importlib
+
+    from app.services.backtest.daily_backtest_handler import _SUPPORTED_EXPERTS
+
+    cap: Optional[int] = None
+    for spec in backtest_cfg.get("experts", []) or []:
+        class_name = spec.get("class") if isinstance(spec, dict) else spec
+        module_path = _SUPPORTED_EXPERTS.get(class_name)
+        if not module_path:
+            continue
+        try:
+            module = importlib.import_module(module_path)
+            expert_cls = getattr(module, class_name)
+        except Exception:  # noqa: BLE001 — never let detection raise; default to uncapped
+            continue
+        expert_cap = getattr(expert_cls, "max_remote_worker_slots", None)
+        if expert_cap is not None:
+            cap = expert_cap if cap is None else min(cap, expert_cap)
+    return cap
 
 
 # ---------------------------------------------------------------------------

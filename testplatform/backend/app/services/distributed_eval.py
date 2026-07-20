@@ -78,7 +78,8 @@ class DistributedEvaluator:
                  optimization_id: Any, workers: Optional[List[dict]] = None,
                  master_version: Optional[str] = None, log=logger.warning,
                  requeue_timeout: float = 1800.0,
-                 pool_factory: Optional[Callable[[], Any]] = None):
+                 pool_factory: Optional[Callable[[], Any]] = None,
+                 max_remote_slots_per_worker: Optional[int] = None):
         self.pool = submit_pool
         self._pool_factory = pool_factory
         self._pool_lock = threading.Lock()  # guards self.pool reads/recreation across consumers
@@ -88,6 +89,11 @@ class DistributedEvaluator:
         self.workers = workers or []
         self.master_version = master_version
         self.log = log
+        # Per-run ceiling on concurrent remote slots PER WORKER, regardless of the worker's
+        # reported /health capacity. Used by memory-heavy experts (e.g. FMPSenateTraderWeight,
+        # see max_remote_worker_slots there) so a worker that advertises 8 slots doesn't run 8
+        # concurrent trials of an expert whose per-trial footprint would OOM it.
+        self.max_remote_slots_per_worker = max_remote_slots_per_worker
         self.requeue_timeout = requeue_timeout  # safety net: re-queue a trial whose worker vanished
         self.broker = TrialBroker()  # OWN broker (per-optimization isolation; queue is max_workers=4)
         self._stop = threading.Event()
@@ -159,7 +165,7 @@ class DistributedEvaluator:
                     row = db.query(Worker).filter(Worker.id == w.get("id")).first()
                     if not row:
                         continue
-                    row.active_jobs_count = int(w.get("capacity") or 1) if active else 0
+                    row.active_jobs_count = self._engaged_slots(w) if active else 0
                     if active:
                         row.status = "online"
                         row.last_heartbeat = datetime.utcnow()
@@ -193,8 +199,16 @@ class DistributedEvaluator:
             self.log(f"worker {w.get('name')} pre-flight failed: {e}; excluding")
             return False
 
-    def _spawn_remote_dispatchers(self, w: dict) -> int:
+    def _engaged_slots(self, w: dict) -> int:
+        """Slots actually engaged for *w*: its reported capacity, capped by
+        ``max_remote_slots_per_worker`` if the run set one."""
         cap = max(1, int(w.get("capacity") or 1))
+        if self.max_remote_slots_per_worker:
+            cap = min(cap, self.max_remote_slots_per_worker)
+        return cap
+
+    def _spawn_remote_dispatchers(self, w: dict) -> int:
+        cap = self._engaged_slots(w)
         for i in range(cap):
             self._spawn(lambda w=w, i=i: self._dispatch_remote(w), f"remote-{w['name']}-{i}")
         return cap
