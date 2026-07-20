@@ -11,12 +11,19 @@ and by every worker process. The options cache file is large (2.6GB, ~14M bar ro
 underlyings as of 2026-07-20) so it can't be loaded wholesale into a worker's memory the way
 FMPSenateTraderWeight's scoring caches are -- instead this caches PER (db_path, underlying)
 chain history and PER (db_path, occ_symbol) bar history, lazily on first access, shared across
-every HistoricalOptionsProvider built in the same worker process for the rest of its life. A
-single backtest only ever touches a handful of underlyings/contracts, so the lazy per-key load
-stays small regardless of the whole cache file's size. Bounded LRU (not unbounded) because a
-REMOTE worker's trial-serving process pool is long-lived across many different optimization
-jobs (see worker_server.py's module-level _POOL), so keys could otherwise accumulate across
-jobs touching different universes over the process's lifetime."""
+every HistoricalOptionsProvider built in the same worker process for the rest of its life.
+get_chain (filtered by expiry/strike) and get_bar/get_quote (a specific held contract) only ever
+touch a handful of contracts, but get_atm_iv scans EVERY contract in the underlying's cached
+chain snapshot unfiltered -- a single liquid underlying can carry 10-16k contracts (measured
+2026-07-20: MU 15882, SNDK 15204, AMD 13576) -- so the bar-history cache cap must comfortably
+exceed one underlying's full chain width, not just "a handful", or an LRU sized too small
+THRASHES (evicts and reloads) within a single get_atm_iv call and defeats the cache entirely
+(measured: a 3000-entry cap made two back-to-back identical trials equally slow, ~460s each,
+against the real 2.6GB cache). Bounded (not unbounded) because a REMOTE worker's trial-serving
+process pool is long-lived across many different optimization jobs (see worker_server.py's
+module-level _POOL), so keys could otherwise accumulate across jobs touching different
+universes over the process's lifetime -- the default just needs to clear the realistic
+single-underlying ceiling with headroom for a few underlyings at once."""
 from __future__ import annotations
 from bisect import bisect_right
 from collections import OrderedDict
@@ -29,7 +36,10 @@ from ba2_common.core.types import OptionRight
 from .options_cache import OptionsHistoryCache
 
 _CHAIN_CACHE_MAX = int(os.getenv("BT_OPTION_CHAIN_CACHE_MAX", "300"))
-_BAR_CACHE_MAX = int(os.getenv("BT_OPTION_BAR_CACHE_MAX", "3000"))
+# Must clear one underlying's full chain width (measured max 15882, MU) with headroom for a
+# few underlyings cached at once -- get_atm_iv touches every contract in the snapshot
+# unfiltered, so a cap below that thrashes (evict-then-reload) within a SINGLE call.
+_BAR_CACHE_MAX = int(os.getenv("BT_OPTION_BAR_CACHE_MAX", "50000"))
 
 _WORKER_CHAIN_CACHE: "OrderedDict[Tuple[str, str], _ChainHistory]" = OrderedDict()
 _WORKER_BAR_CACHE: "OrderedDict[Tuple[str, str], _BarHistory]" = OrderedDict()
