@@ -40,6 +40,33 @@ def version(worker: dict, timeout: float = 10.0) -> dict:
         return r.json()
 
 
+def memory(worker: dict, timeout: float = 15.0) -> dict:
+    """On-demand RSS snapshot of *worker* (server + trial-pool children) — for diagnosing a
+    slow/hung remote worker without SSH/RDP access."""
+    with httpx.Client(timeout=timeout) as c:
+        r = c.get(f"{_base(worker)}/diag/memory", headers=_headers(worker))
+        r.raise_for_status()
+        return r.json()
+
+
+def logs_list(worker: dict, timeout: float = 15.0) -> dict:
+    """List *worker*'s log filenames (``{dir, files}``)."""
+    with httpx.Client(timeout=timeout) as c:
+        r = c.get(f"{_base(worker)}/logs/list", headers=_headers(worker))
+        r.raise_for_status()
+        return r.json()
+
+
+def logs(worker: dict, file: str = "app.log", tail_lines: int = 500,
+         timeout: float = 30.0) -> dict:
+    """Tail *file* from *worker*'s LOGS_DIR (``{file, total_lines, lines}``)."""
+    with httpx.Client(timeout=timeout) as c:
+        r = c.get(f"{_base(worker)}/logs", headers=_headers(worker),
+                  params={"file": file, "tail_lines": tail_lines})
+        r.raise_for_status()
+        return r.json()
+
+
 def quick_status(worker: dict, timeout: float = 1.5) -> tuple:
     """Live one-shot reachability probe. Returns ``(status, capacity)`` where status is
     ``"online"``/``"offline"`` and capacity is the worker's reported slot count (or None).

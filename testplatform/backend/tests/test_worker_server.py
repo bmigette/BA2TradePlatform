@@ -66,6 +66,55 @@ def test_version(client):
     assert r.status_code == 200 and "git_commit" in r.json()
 
 
+def test_diag_memory_returns_snapshot(client):
+    r = client.get("/diag/memory", headers=H)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True
+    assert "server_rss_mb" in body and "child_rss_mb" in body and "system_available_mb" in body
+    # auth still enforced
+    assert client.get("/diag/memory").status_code == 401
+
+
+def test_logs_list_and_tail(client, tmp_path, monkeypatch):
+    import ba2_common.logger as bl
+    monkeypatch.setattr(bl, "LOGS_DIR", str(tmp_path))
+    (tmp_path / "app.log").write_text("\n".join(f"line{i}" for i in range(10)) + "\n")
+    (tmp_path / "app.debug.log").write_text("debug\n")
+
+    r = client.get("/logs/list", headers=H)
+    assert r.status_code == 200
+    assert set(r.json()["files"]) == {"app.log", "app.debug.log"}
+
+    r = client.get("/logs", headers=H, params={"file": "app.log", "tail_lines": 3})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total_lines"] == 10
+    assert body["lines"] == ["line7\n", "line8\n", "line9\n"]
+
+    # auth still enforced
+    assert client.get("/logs", params={"file": "app.log"}).status_code == 401
+
+
+def test_logs_rejects_path_traversal(client, tmp_path, monkeypatch):
+    import ba2_common.logger as bl
+    monkeypatch.setattr(bl, "LOGS_DIR", str(tmp_path))
+    (tmp_path / "app.log").write_text("safe\n")
+    secret = tmp_path.parent / "secret.txt"
+    secret.write_text("should never be readable via /logs")
+
+    for traversal in ("../secret.txt", "..\\secret.txt", "/etc/passwd", "sub/app.log"):
+        r = client.get("/logs", headers=H, params={"file": traversal})
+        assert r.status_code == 400, f"expected 400 for {traversal!r}, got {r.status_code}"
+
+
+def test_logs_unknown_file_404s(client, tmp_path, monkeypatch):
+    import ba2_common.logger as bl
+    monkeypatch.setattr(bl, "LOGS_DIR", str(tmp_path))
+    r = client.get("/logs", headers=H, params={"file": "does-not-exist.log"})
+    assert r.status_code == 404
+
+
 def test_submit_trial_then_poll_returns_done_with_result(client):
     job_id = _submit_and_get_job_id(client, "/submit-trial")
     r = client.get(f"/job-status/{job_id}", headers=H)

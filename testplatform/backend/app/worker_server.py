@@ -9,6 +9,9 @@ Run it with: ``ba2-test worker --port 8100 --password <secret> [--workers N]``.
 Endpoints (every one bearer-checked against the worker password):
   GET  /health              -> {ok, capacity, cpu, gpu, version}
   GET  /version              -> {app_version, git_commit, ...}
+  GET  /diag/memory          -> {ok, server_rss_mb, child_count, child_rss_mb, system_*}
+  GET  /logs/list            -> {dir, files:[...]}                  (this worker's LOGS_DIR listing)
+  GET  /logs                 -> {file, total_lines, lines:[...]}    (tail of one log file, no SSH needed)
   GET  /cache/manifest       -> {files:[{rel_path,size,...}], ...}   (what this worker already has)
   POST /cache/push           -> accept a tar STREAM, extract into CACHE_FOLDER
   POST /cache/prune          -> {rel_paths} -> delete leftovers from a master-side rebuild/compaction
@@ -76,20 +79,35 @@ _JOBS_LOCK = threading.Lock()
 _JOBS_MAX_ORPHAN_AGE = 6 * 3600.0  # 6h: generous vs. any real trial; just bounds a leak
 
 
+def _memory_snapshot() -> dict:
+    """Best-effort memory snapshot of the worker SERVER + its trial children. Shared by
+    ``_dump_worker_memory`` (logs it on a pool crash) and the ``/diag/memory`` endpoint (returns
+    it on demand — e.g. from the master while investigating a slow/hung worker, no SSH needed)."""
+    import psutil
+    me = psutil.Process(os.getpid())
+    vm = psutil.virtual_memory()
+    kids = me.children(recursive=True)
+    kid_rss = sorted((round(k.memory_info().rss / 1048576) for k in kids), reverse=True)
+    return {
+        "server_rss_mb": me.memory_info().rss // 1048576,
+        "child_count": len(kids),
+        "child_rss_mb": kid_rss,
+        "system_available_mb": vm.available // 1048576,
+        "system_total_mb": vm.total // 1048576,
+        "system_percent_used": vm.percent,
+    }
+
+
 def _dump_worker_memory(context: str) -> None:
     """Best-effort memory snapshot of the worker SERVER + its trial children, logged at the
     moment a pool breaks — so the next WinError-1450-style incident shows what was depleting
     memory instead of leaving only 'terminated abruptly'."""
     try:
-        import psutil
-        me = psutil.Process(os.getpid())
-        vm = psutil.virtual_memory()
-        kids = me.children(recursive=True)
-        kid_rss = sorted((round(k.memory_info().rss / 1048576) for k in kids), reverse=True)
+        snap = _memory_snapshot()
         logger.warning(
             "%s: server RSS=%dMB, %d child proc(s) RSS(MB)=%s, system available=%dMB/%dMB (%.1f%% used)",
-            context, me.memory_info().rss // 1048576, len(kids), kid_rss,
-            vm.available // 1048576, vm.total // 1048576, vm.percent,
+            context, snap["server_rss_mb"], snap["child_count"], snap["child_rss_mb"],
+            snap["system_available_mb"], snap["system_total_mb"], snap["system_percent_used"],
         )
     except Exception as e:  # noqa: BLE001
         logger.warning("%s: memory dump unavailable (%r)", context, e)
@@ -286,6 +304,54 @@ def health(authorization: str = Header(default=None)):
 def version(authorization: str = Header(default=None)):
     _verify(authorization)
     return self_update.get_version_info()
+
+
+@worker_app.get("/diag/memory")
+def diag_memory(authorization: str = Header(default=None)):
+    """On-demand memory snapshot (see ``_memory_snapshot``) — lets the master check a remote
+    worker's RSS/child-process footprint without SSH/RDP access, e.g. while investigating a
+    slow or hung worker."""
+    _verify(authorization)
+    try:
+        return {"ok": True, **_memory_snapshot()}
+    except Exception as e:  # noqa: BLE001 — diagnostics must never 500 the caller
+        return {"ok": False, "error": repr(e)}
+
+
+@worker_app.get("/logs/list")
+def logs_list(authorization: str = Header(default=None)):
+    """List the log filenames in this worker's LOGS_DIR (app.log, app.debug.log,
+    all.debug.log, all.error.log, ...) — see ``ba2_common.logger`` for what writes there."""
+    _verify(authorization)
+    from ba2_common.logger import LOGS_DIR
+
+    try:
+        files = sorted(os.listdir(LOGS_DIR))
+    except FileNotFoundError:
+        files = []
+    return {"dir": LOGS_DIR, "files": files}
+
+
+@worker_app.get("/logs")
+def logs_tail(file: str = "app.log", tail_lines: int = 500,
+              authorization: str = Header(default=None)):
+    """Return the last *tail_lines* lines of one log file under LOGS_DIR — the remote-debugging
+    tool this worker didn't have before: without it, diagnosing a hang/crash/anomaly on a
+    machine with no SSH/RDP access meant flying blind. ``file`` must be a bare filename (no `/`,
+    `\\`, or `..`) so a caller can't read arbitrary paths off the worker's disk."""
+    _verify(authorization)
+    from ba2_common.logger import LOGS_DIR
+
+    name = os.path.basename(file)
+    if not name or name != file:
+        raise HTTPException(status_code=400, detail="file must be a bare filename (no path)")
+    path = os.path.join(LOGS_DIR, name)
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail=f"no such log file: {name!r}")
+    tail_lines = max(1, min(tail_lines, 20000))  # bound the response size
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        lines = f.readlines()
+    return {"file": name, "total_lines": len(lines), "lines": lines[-tail_lines:]}
 
 
 @worker_app.get("/cache/manifest")
