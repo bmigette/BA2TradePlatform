@@ -27,6 +27,11 @@ class OptionsHistoryCache:
         self.db_path = db_path
         with self._conn() as cx:
             cx.execute(_CHAIN_DDL); cx.execute(_BAR_DDL)
+            # Speeds up options_provider.py's per-underlying chain load (the read-side worker
+            # cache queries "WHERE underlying=?" once per underlying per worker process instead
+            # of per bar/contract) -- idempotent, cheap no-op once built.
+            cx.execute("CREATE INDEX IF NOT EXISTS idx_option_chain_underlying ON option_chain(underlying)")
+            cx.execute("CREATE INDEX IF NOT EXISTS idx_option_bar_underlying ON option_bar(underlying)")
 
     def _conn(self):
         cx = sqlite3.connect(self.db_path); cx.row_factory = sqlite3.Row; return cx
