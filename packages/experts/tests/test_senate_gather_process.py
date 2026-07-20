@@ -780,6 +780,42 @@ def test_skill_cache_avoids_recompute_same_day(monkeypatch):
     assert r1 == r2
 
 
+def test_skill_cache_shared_across_instances_in_same_worker_process(monkeypatch):
+    """Regression for the 2026-07-20 Senate-matrix memory fix: a FRESH FMPSenateTraderWeight
+    instance (as the backtest engine creates once per GA trial) must reuse a score already
+    computed by an EARLIER instance in the same process/CACHE_FOLDER, not recompute it.
+
+    Before the fix, ``_load_scoring_cache`` only memoized onto ``self``, so every new
+    instance re-read the on-disk cache file from scratch and never saw scores an earlier
+    instance had computed in memory (each instance's ``self._skill_cache`` was discarded
+    when the instance went out of scope, with backtest never flushing it to disk either --
+    see ``_save_scoring_cache_throttled``'s ``if not is_live: return``). The real-world
+    symptom: a Senate GA job re-read+re-parsed a ~626MB confidence-cache / ~226MB
+    skill-cache file from disk on EVERY trial, ballooning each worker process to 11-12GB."""
+    e1 = _weight_expert("AAPL", [], {})
+    e2 = _weight_expert("AAPL", [], {})  # a second, independent instance -- same CACHE_FOLDER
+    history = _skill_history("A", "B", 6, rising=True)
+
+    calls = []
+    real = FMPSenateTraderWeight._calculate_trader_skill
+
+    def _spy(self_arg, history_arg, **kw):
+        calls.append(1)
+        return real(self_arg, history_arg, **kw)
+
+    monkeypatch.setattr(FMPSenateTraderWeight, "_calculate_trader_skill", _spy)
+
+    kw = dict(now=NOW, horizon_days=60, min_past_trades=1, max_past_trades=50,
+             lookback_months=60, is_live=False)
+    r1 = e1._get_trader_skill_cached("Trader X", history, **kw)
+    r2 = e2._get_trader_skill_cached("Trader X", history, **kw)
+    assert len(calls) == 1, (
+        "second instance recomputed instead of reusing the first instance's cached score -- "
+        "the worker-process-level cache isn't being shared across instances"
+    )
+    assert r1 == r2
+
+
 def test_skill_cache_backtest_buckets_by_exact_day(monkeypatch):
     """Backtest (is_live=False): a DIFFERENT as_of day must recompute, even same-month."""
     e = _weight_expert("AAPL", [], {})

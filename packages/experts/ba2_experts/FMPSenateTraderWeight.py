@@ -35,6 +35,32 @@ from ba2_experts.expert_mixins import AnalysisStatusRenderMixin, FMPCongressTrad
 # methods to avoid a circular import (core.utils -> modules.experts -> ...).
 
 
+# WORKER-PROCESS-LEVEL cache for the 3 congress scoring caches (skill/confidence/hold-days),
+# keyed by each cache file's FULL resolved path (not bare filename -- tests monkeypatch
+# CACHE_FOLDER per-test via a tmp_path fixture, so different tests naturally get different
+# keys here with zero extra cleanup needed). Shared across every FMPSenateTraderWeight
+# instance in this process, mirroring price_source.py's _WORKER_BAR_CACHE pattern.
+#
+# Root cause this fixes (found profiling the 2026-07-20 Senate matrix run): the class-level
+# comment on _HOLD_CACHE_FILE etc. already documents the INTENDED design -- "a long-lived
+# worker process reused for many GA trials" should load each scoring cache file ONCE. But
+# _load_scoring_cache only ever memoized onto ``self``, and a fresh FMPSenateTraderWeight
+# instance is created per GA trial -- so every single trial re-read + re-parsed the full
+# on-disk cache files (confidence: ~626MB, skill: ~226MB JSON) from scratch, each blowing up
+# to several GB in memory once parsed into Python dicts. That memory becomes garbage after
+# the trial, but CPython/the OS don't reliably shrink the process's working set back down
+# afterward, so worker RSS ratchets up to the worst per-trial peak and plateaus there --
+# exactly the 11-12GB/worker footprint observed. Loading once per worker (this fix) also
+# lets newly-computed scores actually get reused across trials within a generation, instead
+# of being silently recomputed and discarded every time.
+_WORKER_SCORING_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
+def clear_worker_scoring_cache() -> None:
+    """Drop every cached scoring-cache file (test isolation / explicit reset)."""
+    _WORKER_SCORING_CACHE.clear()
+
+
 @lru_cache(maxsize=None)
 def _parse_ymd_utc(date_str: str) -> datetime:
     """Parse a "%Y-%m-%d" trade-date string as UTC midnight.
@@ -1192,13 +1218,19 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         return self._scoring_cache_path(filename) + ".delta.jsonl"
 
     def _load_scoring_cache(self, attr: str, filename: str) -> Dict[str, Any]:
-        """Lazily load + memoize one JSON cache file on ``self`` (one disk read per
-        instance/process, not per lookup). Merges the compacted base file with any
-        not-yet-compacted append-only delta lines (see ``_save_scoring_cache_throttled``)."""
-        cache = getattr(self, attr, None)
-        if cache is not None:
-            return cache
+        """Lazily load + memoize one JSON cache file, shared across every instance in this
+        WORKER PROCESS via ``_WORKER_SCORING_CACHE`` (keyed by the file's full resolved
+        path) -- one disk read per worker process, not per GA trial/instance (see
+        ``_WORKER_SCORING_CACHE``'s module-level docstring for why this matters). Merges the
+        compacted base file with any not-yet-compacted append-only delta lines (see
+        ``_save_scoring_cache_throttled``). ``self.<attr>`` is still set as an alias to the
+        SAME shared dict object, so ``_save_scoring_cache``/``_save_scoring_cache_throttled``
+        (which read/write via ``self.<attr>``) transparently operate on the shared cache."""
         path = self._scoring_cache_path(filename)
+        cache = _WORKER_SCORING_CACHE.get(path)
+        if cache is not None:
+            setattr(self, attr, cache)
+            return cache
         try:
             with open(path, "r", encoding="utf-8") as f:
                 cache = json.load(f)
@@ -1214,6 +1246,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                     cache[entry["k"]] = entry["v"]
         except Exception:  # noqa: BLE001 — missing/corrupt delta -> ignore, never fatal
             pass
+        _WORKER_SCORING_CACHE[path] = cache
         setattr(self, attr, cache)
         return cache
 

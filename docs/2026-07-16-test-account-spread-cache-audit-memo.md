@@ -30,10 +30,20 @@ dumps are in the DB if needed.
 | 9 | FMPRating | goal6-mid_S3 | 1 | mid | $4B | 10 | 25.0 | 2.5 | 4.5/28 | 1 | 11.0 | 10.0 | median |
 | 10 | FMPRating | goal6-mid_S4 | 1 | mid | $2B | 10 | 15.0 | 2.1 | 4.5/21 | 1 | 8.0 | 3.0 | low_consensus_avg |
 | 11 | FMPRating | goal6-mid_S1top4 | 1 | mid | $5B | 40 | 11.0 | 2.1 | 4.0/21 | 0 | 8.0 | 6.0 | low_consensus_avg |
-| 12 | FMPRating | goal6-small_S7 | **0 (disabled)** | small | $200M | 20 | 17.0 | 1.2 | 4.0/7 | 0 | 15.0 | 9.0 | low |
+| 12 | FMPRating | goal6-small_S7 | 1 (reseeded 2026-07-19) | small | see note | — | — | — | — | — | — | — | — |
 | 13 | FMPRating | goal6-small_S5 | 1 | small | $200M | 20 | 23.0 | 1.2 | 4.5/21 | 0 | 4.0 | 10.0 | high |
 | 14 | FactorRanker | goal6-large_FRtop1 | 1 | large | $50B | 10 | 6.0 | 1.9 | — | — | — | — | (expert-driven) |
 | 15 | FactorRanker | goal6-large_FRtop4 | 1 | large | $50B | 20 | 6.0 | 1.9 | — | — | — | — | (expert-driven) |
+| 26 | FactorRanker | goal6-mid_FRtop1 | 1 | mid | (screener, mid) | — | — | — | — | — | — | — | (expert-driven) |
+| 27 | FactorRanker | goal6-mid_FRtop4 | 1 | mid | (screener, mid) | — | — | — | — | — | — | — | (expert-driven) |
+
+Notes (2026-07-19): ids 26/27 deployed from the `-goal6c` re-run (fixed genes: `hard_stop_pct`
+removed, `risk_per_trade_pct` GA-tunable, screener volume floor 1.0→0.0), TOP1 (bt726,
+20.9%/-8.96%DD/70.0%WR) + TOP4 (bt724, 50.7%/-9.42%DD/76.5%WR) — same rank pair as the existing
+large-band deployment. TOP1 wins the `consistent_annual_return` fitness despite lower raw
+return because it's the only mid individual with all-3-years positive (no `consistency`-floor
+penalty); TOP4 is the best raw-return individual either mid run has found, included for
+diversification. Both `ForwardTest`-tagged.
 
 ### BA2-Test2 (account_id=2)
 
@@ -54,12 +64,14 @@ with-spread job flagged as in-progress in §8) — held up better under spread r
 are net-new small-band deployments (2026-07-19), not reseeds — 21 closes the InsiderClusterBuy
 small-band gap, 22/23 close the EarningsDrift small-band gap (§2). id24 (bt717, S7-TOP1,
 70.49%/-11.64%DD/48.15%WR) closes the remaining InsiderClusterBuy small-band slot. id18
-(`goal6-mid_ICB_S7top1`, bt551, TOP1) **disabled and replaced by id25** (bt549, TOP2) — TOP1
-had been ranked #1 by the `consistent_annual_return` fitness metric purely on `trade_gate`
-(avg_trades_per_year 25.4 vs TOP2's 17.0, closer to the 30/yr target), but TOP2 beats it on
-total return (97.63% vs 68.87%), every single calendar year (2023/24/25), and has a *better*
-YoY consistency ratio (worst/mean 0.876 vs 0.860) at nearly identical drawdown — user-directed
-swap 2026-07-19. `ForwardTest` label moved bt551 -> bt549 accordingly.
+(`goal6-mid_ICB_S7top1`, bt551, TOP1) **replaced by id25** (bt549, TOP2) — TOP1 had been ranked
+#1 by the `consistent_annual_return` fitness metric purely on `trade_gate` (avg_trades_per_year
+25.4 vs TOP2's 17.0, closer to the 30/yr target), but TOP2 beats it on total return (97.63% vs
+68.87%), every single calendar year (2023/24/25), and has a *better* YoY consistency ratio
+(worst/mean 0.876 vs 0.860) at nearly identical drawdown — user-directed swap 2026-07-19.
+`ForwardTest` label moved bt551 -> bt549 accordingly. id18 had zero open transactions (never
+traded before being superseded), so it was **deleted outright** (not just disabled) once id25
+was confirmed live — user-directed cleanup 2026-07-19.
 
 ### BA2-Test3 (account_id=3)
 
@@ -82,12 +94,12 @@ large-cap).
 
 | expert | target | current | gap | band split (2/band) |
 |---|---|---|---|---|
-| FMPRating | 8 | 8 | **0 — at target count** | large/mid/small currently 3/3/2, not an even 2/2/2/2 — see note below |
-| FactorRanker | 6 | 2 | **+4 needed** | currently large-only (2/0/0); need mid + small (2 each) |
+| FMPRating | 8 | 8 | **0 — at target count** | large/mid/small currently 3/3/2, not an even 2/2/2/2 — see note below. The FRAGILE-flagged small instance (id12) is now reseeded in place (§3) — zero disabled/fragile FMPRating instances remain. |
+| FactorRanker | 6 | 4 | **+2 needed** | large (2, ids 14/15) + mid (2, ids 26/27, deployed 2026-07-19) — small-band still needed |
 | FMPEarningsDrift | 4 | 4 | **0 — closed 2026-07-19** | mid (S1top1 id16, reseeded S2top1 id20) + small (S1top1 id22, S7top2 id23) — 2/2 |
 | FMPInsiderClusterBuy | 4 | 4 | **0 — closed 2026-07-19** | mid (S2top3 id19, S7top2 id25) + small (S1top3 id21, S7top1 id24) — 2/2 |
 | FMPSenateTraderWeight | 2 | 0 | **+2 needed** | not band-split (Senate's universe spans all bands — single blended assumption per `tools/run_senate_matrix.py`); Phase 3 of the grid sequence, not yet run |
-| **Total** | **24** | **18** | **+6 needed** | |
+| **Total** | **24** | **20** | **+4 needed** | |
 
 **2026-07-19 update — EarningsDrift small-band gap closed**: the small-band grid (opt166=S1,
 opt167=S2, plus S7 from an earlier phase, opt195) finished. S2's full top-5 (opt167:
@@ -123,17 +135,27 @@ Notes:
   sequential phases 1a/1b/2 haven't finished. Once it does, pick top-2 by fitness for
   deployment.
 
-## 3. Currently disabled (this session, pending reseed)
+## 3. Currently disabled (pending reseed) — UPDATE: both now reseeded, none disabled
 
 - **id 12 — `goal6-small_S7`** (FMPRating, small-cap, BA2-Test1). Resim: -20.9pp return delta
-  from spread=0 to spread=80bps → flagged **FRAGILE**.
+  from spread=0 to spread=80bps → flagged **FRAGILE**. **Reseeded IN PLACE 2026-07-19** from
+  bt653 (`TOP4-scr-small-FMPRating-S7-goal6-spread`, opt182's warm-start-with-spread batch):
+  117.26% return / -14.35% DD / 45.16% WR — the best of that batch on return, drawdown, AND
+  YoY consistency simultaneously (years 48.0%/30.9%/12.7%, worst/mean=0.415 vs TOP1's 0.197).
+  Updated the SAME `ExpertInstance` row's `enter_market_ruleset_id`/`open_positions_ruleset_id`
+  + settings in place (did NOT create a new instance or delete id12) because it had 3 live
+  OPEN transactions (IONS/ALNY/ORCL, opened 2026-07-14) — swapping the ruleset in place lets
+  the normal TradeActionEvaluator/RM machinery adjust TP/SL and close those positions under
+  the new rules, rather than orphaning them under a dead/deleted instance. Re-enabled.
 - **id 17 — `goal6-mid_ED_S2top1`** (FMPEarningsDrift, mid-cap, BA2-Test2). Resim: -100.8pp
   delta from spread=0 to spread=50bps (132.28% → 31.46%, a 4x collapse between 15bps and
-  30bps) → flagged **FRAGILE**, the worst of all 14.
+  30bps) → flagged **FRAGILE**. **Replaced 2026-07-18/19** by a new instance, id 20, reseeded
+  from `TOP1-scr-mid-FMPEarningsDrift-S2-goal6-spread` (bt660) — held up better under spread
+  resim. id17 itself had zero open transactions and was deleted outright rather than left
+  disabled (see §1 note).
 
-Both disabled via `UPDATE expertinstance SET enabled=0` + `POST /api/reload` (confirmed live,
-no restart needed). **Not yet reseeded** — see §5 for why the obvious warm-start candidates
-aren't usable as-is.
+Both disabled via `UPDATE expertinstance SET enabled=0` + `POST /api/reload` originally
+(confirmed live, no restart needed); both are now reseeded and live again as of 2026-07-19.
 
 ## 4. Spread-robustness resim — full results (all 14 GA-derived deployments)
 
