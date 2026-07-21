@@ -590,9 +590,13 @@ git commit -m "feat(options): wire price-vs-analyst-target gates into OS1/OS2/OS
   existing "condition catalog" or "OS1/OS2/OS3" section and add a short paragraph)
 - Modify: `ba2_trade_platform/version.py`
 
-**Step 1:** Add a short paragraph to the options-grid doc describing the two new conditions
-(`price_vs_target_low_percent` / `price_vs_target_high_percent`), the sign convention, and that they're
-toggleable/optimizable per OS1/OS2/OS3 member.
+**Step 1:** Add a short paragraph to the options-grid doc describing the two new condition
+fields (`price_vs_target_low_percent` / `price_vs_target_high_percent`), the sign convention,
+and that each is wired as TWO toggleable/optimizable gates per OS1/OS2/OS3 member — one per
+comparison direction (`price_low_below`/`price_low_above`, `price_high_above`/`price_high_below`)
+— because the GA never searches a condition's operator, only its threshold and enabled flag, so
+each direction needs its own gate (see the plan's "Design reference" section for the full
+rationale).
 
 **Step 2:** Bump `APP_VERSION` in `ba2_trade_platform/version.py` (patch the trailing build
 number per the repo's existing convention — check the current value first, don't guess).
@@ -608,8 +612,9 @@ git commit -m "docs: document price-vs-analyst-target entry conditions; version 
 
 ## Relaunch note (not a code task)
 
-The added conditions roughly double the per-member gene count for OS1/OS2/OS3 (signal-gate
-toggle + 2 new compare conditions, each with their own `enabled` + `value` genes). Per the
+The added conditions roughly double the per-member gene count for OS1/OS2/OS3 again on top of
+the existing gates (signal-gate toggle + 4 new compare conditions — one per direction per
+bound — each with their own `enabled` + `value` genes). Per the
 session discussion, plan to increase `--population` (and possibly `--generations`) above the
 current defaults (40 / 8) when relaunching the options matrix after this lands, so the GA has
 enough individuals to actually explore the larger search space rather than converging
