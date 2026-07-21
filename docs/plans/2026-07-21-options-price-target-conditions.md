@@ -31,7 +31,7 @@ GA can rely on price-positioning alone, or combine it with the rating, per membe
 
 ---
 
-## Design reference: the two new conditions
+## Design reference: four gates from two underlying conditions
 
 - `price_vs_target_low_percent = (current_price - target_low) / target_low * 100`
   Positive = price already above the LOW (most conservative) analyst estimate.
@@ -39,22 +39,48 @@ GA can rely on price-positioning alone, or combine it with the rating, per membe
   Positive = price already above the HIGH (most bullish) analyst estimate — i.e. overextended
   even by the most optimistic analyst's number.
 
-How the GA can express each of the user's target patterns purely by toggling these two
-conditions on/off per member and searching their thresholds (no per-member hardcoding needed
-beyond a sensible default direction/seed value):
+**Important constraint that shapes this design:** the GA's gene-space collector
+(`strategy_param_space._walk_condition_nodes`) only ever generates genes for a condition's
+`value` (via `value_min`/`value_max`/`value_step`) and its `enabled` flag (via
+`toggle_optimize`) — it never touches `op`. So a condition dict's comparison operator is FIXED
+for the life of that dict; the GA can only slide the threshold and flip it on/off, never flip
+its direction. That means a single `price_vs_target_low_percent` condition wired with a fixed
+`op=">"` can express "price is above X" for any threshold X, but can NEVER express "price is
+below X" — the two are different rule *shapes*, not different values of the same shape. Wiring
+each field ONCE (an earlier draft of this plan wired `price_low: op=">"` +
+`price_high: op="<"`) can therefore only ever reach ONE of the three non-trivial patterns below
+(the "inside the range" one) — the other two, including the plan's own headline motivating
+example ("put fires because price already cleared the high estimate, regardless of rating"),
+would be structurally unreachable. The fix is to wire each field TWICE, once per direction, so
+the GA can independently enable whichever shape(s) it needs per member:
 
-| Pattern | Conditions |
+| Gate id | Field | Fixed op | Meaning when enabled (threshold near 0) |
+|---|---|---|---|
+| `{m}-price_low_below` | `price_vs_target_low_percent` | `<` | Price still below the low estimate — room to run |
+| `{m}-price_high_above` | `price_vs_target_high_percent` | `>` | Price already above the high estimate — overextended |
+| `{m}-price_low_above` | `price_vs_target_low_percent` | `>` | Price has cleared the low estimate (paired with the next row for "inside the range") |
+| `{m}-price_high_below` | `price_vs_target_high_percent` | `<` | Price hasn't reached the high estimate (paired with the row above) |
+
+How the GA reaches each of the user's target patterns by toggling these four gates
+independently (no per-member hardcoding of direction needed — only the shared default
+threshold/range, searched per gate):
+
+| Pattern | Gates enabled |
 |---|---|
-| "Still room to run" (favor `O_LC`) | `price_vs_target_low_percent < 0` (below even the low estimate) |
-| "Overextended, put regardless of rating" (favor `O_LP`/`O_VERT`) | `price_vs_target_high_percent > 0` |
-| "Inside the analyst range" (favor `O_SSTG`/`O_SSTD`/`O_IC` — neutral/credit) | `price_vs_target_low_percent > 0` AND `price_vs_target_high_percent < 0` (both toggled ON) |
-| "Ignore price-target entirely, use rating only" | both toggled OFF (today's behavior, unchanged) |
+| "Still room to run" (favor `O_LC`) | `{m}-price_low_below` only |
+| "Overextended, put regardless of rating" (favor `O_LP`/`O_VERT`) | `{m}-price_high_above` only |
+| "Inside the analyst range" (favor `O_SSTG`/`O_SSTD`/`O_IC` — neutral/credit) | `{m}-price_low_above` AND `{m}-price_high_below` together |
+| "Ignore price-target entirely, use rating only" | all four OFF (today's behavior, unchanged) |
+
+This roughly doubles the gene-space growth from the original 2-gate design (4 new
+toggleable/optimizable conditions per member instead of 2, on top of the now-toggleable rating
+gate) — factor this into the "Relaunch note" population-size guidance at the end of this plan.
 
 `price_vs_target_consensus_percent` (vs. the median/consensus target) is also added as a general
 primitive (Task 2) for completeness and potential future use (e.g. `O_BF`'s "pinned near
-consensus" framing), but Task 4 only wires `_low`/`_high` into the OS1/OS2/OS3 templates to keep
-the added gene count per member controlled — `consensus` can be wired into a specific member's
-rule by hand later the same way if it proves useful.
+consensus" framing), but Task 3 only wires `_low`/`_high` (as the four gates above) into the
+OS1/OS2/OS3 templates — `consensus` can be wired into a specific member's rule by hand later the
+same way if it proves useful.
 
 ---
 
@@ -405,17 +431,35 @@ def test_signal_gate_is_toggleable():
     assert signal["toggle_optimize"] is True
 
 
-def test_price_vs_target_conditions_present_and_optimizable():
+def test_price_target_gates_present_and_optimizable_with_correct_directions():
+    """Four gates, each independently toggleable, so the GA can reach all three non-trivial
+    price-positioning patterns (below-low-only, above-high-only, within-range) - not just one
+    of them. See the plan's "Design reference" section for why a single op-per-field wiring
+    (an earlier, buggy draft of this plan) can't do this: op is never part of the gene space,
+    only value and enabled are, so a fixed op only ever reaches ONE direction."""
     rule = mod._option_entry_rule("O_LC")
-    low = _find_cond(rule, "o_lc-price_low")
-    assert low["field"] == "price_vs_target_low_percent"
-    assert low["toggle_optimize"] is True
-    assert low["optimize"] is True
-    assert low["value_min"] < 0 < low["value_max"]
 
-    high = _find_cond(rule, "o_lc-price_high")
-    assert high["field"] == "price_vs_target_high_percent"
-    assert high["toggle_optimize"] is True
+    low_below = _find_cond(rule, "o_lc-price_low_below")
+    assert low_below["field"] == "price_vs_target_low_percent"
+    assert low_below["op"] == "<"
+    assert low_below["toggle_optimize"] is True
+    assert low_below["optimize"] is True
+    assert low_below["value_min"] < 0 < low_below["value_max"]
+
+    high_above = _find_cond(rule, "o_lc-price_high_above")
+    assert high_above["field"] == "price_vs_target_high_percent"
+    assert high_above["op"] == ">"
+    assert high_above["toggle_optimize"] is True
+
+    low_above = _find_cond(rule, "o_lc-price_low_above")
+    assert low_above["field"] == "price_vs_target_low_percent"
+    assert low_above["op"] == ">"
+    assert low_above["toggle_optimize"] is True
+
+    high_below = _find_cond(rule, "o_lc-price_high_below")
+    assert high_below["field"] == "price_vs_target_high_percent"
+    assert high_below["op"] == "<"
+    assert high_below["toggle_optimize"] is True
 
 
 def test_bearish_member_gets_bearish_signal_field():
@@ -424,12 +468,14 @@ def test_bearish_member_gets_bearish_signal_field():
     assert signal["field"] == "bearish"
 
 
-def test_every_pure_option_member_gets_price_target_conditions():
+def test_every_pure_option_member_gets_all_four_price_target_gates():
     for member in mod._OPTION_STRATS:
         rule = mod._option_entry_rule(member)
         m = member.lower()
-        _find_cond(rule, f"{m}-price_low")
-        _find_cond(rule, f"{m}-price_high")
+        _find_cond(rule, f"{m}-price_low_below")
+        _find_cond(rule, f"{m}-price_high_above")
+        _find_cond(rule, f"{m}-price_low_above")
+        _find_cond(rule, f"{m}-price_high_below")
 ```
 
 **Step 2: Run tests to verify they fail**
@@ -438,7 +484,7 @@ def test_every_pure_option_member_gets_price_target_conditions():
 .venv\Scripts\python.exe -m pytest testplatform/backend/tests/test_launcher_option_entry_rule.py -v
 ```
 Expected: FAIL — `test_signal_gate_is_toggleable` fails on `assert signal["toggle_optimize"] is True`
-(KeyError, since the key doesn't exist yet), and the price_low/price_high tests fail with the
+(KeyError, since the key doesn't exist yet), and the four-gate tests fail with the
 `_find_cond` `AssertionError` (conditions not present yet).
 
 **Step 3: Implement — modify `_option_entry_rule`**
@@ -451,19 +497,39 @@ with:
 def _option_entry_rule(member: str, *, toggleable: bool = False) -> dict:
     """The entry TradeRule dict for one pure-option strategy key: directional signal gate
     (bullish for every original key, bearish for O_LP — see _OPTION_ENTRY_GATE) + flat +
-    optimizable confidence gate + price-vs-analyst-target-range gates, action = the member's
-    option action config. Rule/condition ids are prefixed with the member key so a GROUP of
-    these rules yields uniquely-keyed genes per member. ``toggleable`` adds the rule-level
-    enabled gene (group members only — a single-strategy job keeps its one entry always-on).
+    optimizable confidence gate + four price-vs-analyst-target-range gates, action = the
+    member's option action config. Rule/condition ids are prefixed with the member key so a
+    GROUP of these rules yields uniquely-keyed genes per member. ``toggleable`` adds the
+    rule-level enabled gene (group members only — a single-strategy job keeps its one entry
+    always-on).
 
-    The signal (bullish/bearish) gate and the two price-vs-target gates are ALL independently
-    toggle_optimize=True, so the GA can search: rating-only (today's behavior, price gates
-    OFF), price-only (signal gate OFF, e.g. "put even though the rating still says buy" when
-    price has already cleared the high analyst estimate), both together, or - with BOTH price
-    gates ON - "price sits inside the analyst range" (favors neutral/credit structures). See
-    docs/plans/2026-07-21-options-price-target-conditions.md.
+    The signal (bullish/bearish) gate and all four price-vs-target gates are independently
+    toggle_optimize=True. Op is fixed per gate (the GA's gene space only ever searches a
+    condition's threshold value and enabled flag, never its operator - see
+    docs/plans/2026-07-21-options-price-target-conditions.md's "Design reference"), so each
+    directional pattern needs its OWN gate rather than one gate whose op could flip:
+    price_low_below (< , "still below the low estimate") + price_high_above (> , "already
+    above the high estimate") + price_low_above (>) + price_high_below (< , the last two
+    paired together = "inside the analyst range"). The GA can search: rating-only (today's
+    behavior, all four price gates OFF), price-only (signal gate OFF, e.g. "put even though
+    the rating still says buy" via price_high_above alone), any combination of the four price
+    gates together, or every gate off entirely.
     """
     m = member.lower()
+    price_target_conditions = [
+        {"id": f"{m}-price_low_below", "field": "price_vs_target_low_percent", "op": "<",
+         "value": 0.0, "optimize": True, "value_min": -20.0, "value_max": 20.0,
+         "value_step": 5.0, "toggle_optimize": True},
+        {"id": f"{m}-price_high_above", "field": "price_vs_target_high_percent", "op": ">",
+         "value": 0.0, "optimize": True, "value_min": -20.0, "value_max": 20.0,
+         "value_step": 5.0, "toggle_optimize": True},
+        {"id": f"{m}-price_low_above", "field": "price_vs_target_low_percent", "op": ">",
+         "value": 0.0, "optimize": True, "value_min": -20.0, "value_max": 20.0,
+         "value_step": 5.0, "toggle_optimize": True},
+        {"id": f"{m}-price_high_below", "field": "price_vs_target_high_percent", "op": "<",
+         "value": 0.0, "optimize": True, "value_min": -20.0, "value_max": 20.0,
+         "value_step": 5.0, "toggle_optimize": True},
+    ]
     rule = {
         "id": f"{m}-entry",
         "name": f"{member}-entry",
@@ -474,12 +540,7 @@ def _option_entry_rule(member: str, *, toggleable: bool = False) -> dict:
             {"id": f"{m}-gate_confidence", "field": "confidence", "op": ">", "value": 50,
              "optimize": True, "value_min": 40, "value_max": 75, "value_step": 5,
              "toggle_optimize": True},
-            {"id": f"{m}-price_low", "field": "price_vs_target_low_percent", "op": ">", "value": 0.0,
-             "optimize": True, "value_min": -20.0, "value_max": 20.0, "value_step": 5.0,
-             "toggle_optimize": True},
-            {"id": f"{m}-price_high", "field": "price_vs_target_high_percent", "op": "<", "value": 0.0,
-             "optimize": True, "value_min": -20.0, "value_max": 20.0, "value_step": 5.0,
-             "toggle_optimize": True},
+            *price_target_conditions,
         ]},
         "actions": [_option_entry_action_for(member)],
         "continue_processing": False,
@@ -489,8 +550,10 @@ def _option_entry_rule(member: str, *, toggleable: bool = False) -> dict:
     return rule
 ```
 
-(Everything changed vs. the current version: `{m}-signal` gained `"toggle_optimize": True`; two
-new condition dicts `{m}-price_low` / `{m}-price_high` were appended before the closing `]}`.)
+(Everything changed vs. the current version: `{m}-signal` gained `"toggle_optimize": True`; four
+new condition dicts — `{m}-price_low_below`, `{m}-price_high_above`, `{m}-price_low_above`,
+`{m}-price_high_below` — were appended before the closing `]}`, built via the
+`price_target_conditions` list for readability given there are now four near-identical dicts.)
 
 **Step 4: Run tests to verify they pass**
 
