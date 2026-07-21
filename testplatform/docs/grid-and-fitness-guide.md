@@ -174,3 +174,27 @@ free-form — there's no fixed vocabulary). Runs predating this feature (or that
 - List/filter API: `testplatform/backend/app/api/backtests.py`
 - UI metadata endpoint (catalog + knobs, single source of truth for the frontend):
   `GET /api/optimization/fitness-options` in `testplatform/backend/app/api/strategies.py`
+
+---
+
+## 6. Options entry conditions: price-vs-analyst-target gates
+
+OS1/OS2/OS3 members can gate entries on where price sits relative to FMPRating's analyst
+price-target range, independent of the expert's own BUY/SELL/HOLD rating. Two `CompareCondition`
+fields drive this: `price_vs_target_low_percent = (current_price - target_low) / target_low * 100`
+and `price_vs_target_high_percent = (current_price - target_high) / target_high * 100` — positive
+means price is already above that estimate, negative means it's still below.
+
+Because the GA's gene-space collector only ever optimizes a condition's `value` (via
+`value_min`/`value_max`) and `enabled` flag (via `toggle_optimize`), never its `op`, each field is
+wired as **two** fixed-direction gates per member so the GA can reach both comparison shapes:
+
+- `{m}-price_low_below` (`price_vs_target_low_percent < X`) and `{m}-price_low_above`
+  (`price_vs_target_low_percent > X`)
+- `{m}-price_high_above` (`price_vs_target_high_percent > X`) and `{m}-price_high_below`
+  (`price_vs_target_high_percent < X`)
+
+Combining `price_low_above` + `price_high_below` reconstructs "price inside the analyst range"
+(useful for iron condors/strangles); `price_high_above` alone lets a bearish structure fire
+purely because price has already cleared the analyst's high estimate, regardless of the expert's
+own rating still saying BUY.
