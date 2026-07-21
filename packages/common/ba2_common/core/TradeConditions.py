@@ -1837,6 +1837,119 @@ class PercentAboveRecentLowCondition(CompareCondition):
         return f"{self.calculated_value:+.2f}%"
 
 
+class PriceVsTargetLowCondition(CompareCondition):
+    """Compare current price vs. FMPRating's analyst LOW price target.
+
+    Calculates: (current_price - target_low) / target_low * 100. Positive means price is
+    ABOVE the low (most conservative) analyst estimate. Reads target_low from
+    expert_recommendation.data["FMPRating"] (persisted by FMPRating.run_analysis for every
+    recommendation) - decoupled from the expert's BUY/SELL/HOLD rating so an option entry can
+    gate on price positioning independent of the directional signal.
+    """
+
+    def evaluate(self) -> bool:
+        try:
+            current_price = self.get_current_price()
+            if current_price is None:
+                self.calculated_value = None
+                return False
+            fmp_data = (self.expert_recommendation.data or {}).get("FMPRating") \
+                if self.expert_recommendation is not None else None
+            target_low = fmp_data.get("target_low") if fmp_data else None
+            if target_low is None or target_low <= 0:
+                self.calculated_value = None
+                return False
+            self.calculated_value = (current_price - target_low) / target_low * 100
+            return self.operator_func(self.calculated_value, self.value)
+        except Exception as e:
+            logger.error(f"Error evaluating price vs target low condition: {e}", exc_info=True)
+            self.calculated_value = None
+            return False
+
+    def get_description(self) -> str:
+        return (f"Check if {self.instrument_name} price is {self.operator_str} {self.value}% "
+                f"vs analyst LOW target")
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            return None
+        return f"{self.calculated_value:+.2f}%"
+
+
+class PriceVsTargetHighCondition(CompareCondition):
+    """Compare current price vs. FMPRating's analyst HIGH price target.
+
+    Calculates: (current_price - target_high) / target_high * 100. Positive means price is
+    ABOVE the high (most bullish) analyst estimate - i.e. overextended even by the most
+    optimistic analyst's number. This is the condition that lets an entry fire a bearish
+    structure (e.g. a long put) purely on price positioning, regardless of whether the
+    expert's own rating still says BUY.
+    """
+
+    def evaluate(self) -> bool:
+        try:
+            current_price = self.get_current_price()
+            if current_price is None:
+                self.calculated_value = None
+                return False
+            fmp_data = (self.expert_recommendation.data or {}).get("FMPRating") \
+                if self.expert_recommendation is not None else None
+            target_high = fmp_data.get("target_high") if fmp_data else None
+            if target_high is None or target_high <= 0:
+                self.calculated_value = None
+                return False
+            self.calculated_value = (current_price - target_high) / target_high * 100
+            return self.operator_func(self.calculated_value, self.value)
+        except Exception as e:
+            logger.error(f"Error evaluating price vs target high condition: {e}", exc_info=True)
+            self.calculated_value = None
+            return False
+
+    def get_description(self) -> str:
+        return (f"Check if {self.instrument_name} price is {self.operator_str} {self.value}% "
+                f"vs analyst HIGH target")
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            return None
+        return f"{self.calculated_value:+.2f}%"
+
+
+class PriceVsTargetConsensusCondition(CompareCondition):
+    """Compare current price vs. FMPRating's analyst CONSENSUS (median) price target.
+
+    Calculates: (current_price - target_consensus) / target_consensus * 100.
+    """
+
+    def evaluate(self) -> bool:
+        try:
+            current_price = self.get_current_price()
+            if current_price is None:
+                self.calculated_value = None
+                return False
+            fmp_data = (self.expert_recommendation.data or {}).get("FMPRating") \
+                if self.expert_recommendation is not None else None
+            target_consensus = fmp_data.get("target_consensus") if fmp_data else None
+            if target_consensus is None or target_consensus <= 0:
+                self.calculated_value = None
+                return False
+            self.calculated_value = (current_price - target_consensus) / target_consensus * 100
+            return self.operator_func(self.calculated_value, self.value)
+        except Exception as e:
+            logger.error(f"Error evaluating price vs target consensus condition: {e}", exc_info=True)
+            self.calculated_value = None
+            return False
+
+    def get_description(self) -> str:
+        return (f"Check if {self.instrument_name} price is {self.operator_str} {self.value}% "
+                f"vs analyst CONSENSUS target")
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if self.calculated_value is None:
+            return None
+        return f"{self.calculated_value:+.2f}%"
+
+
 class IVRankCondition(CompareCondition):
     """Compare the implied-volatility rank (0-100) of the underlying.
 
@@ -2174,6 +2287,9 @@ def create_condition(event_type: ExpertEventType, account: AccountInterface,
         ExpertEventType.N_DAYS_SINCE_LAST_PROFITABLE_CLOSE: DaysSinceLastProfitableCloseCondition,
         ExpertEventType.N_DAYS_SINCE_LAST_LOSING_CLOSE: DaysSinceLastLosingCloseCondition,
         ExpertEventType.N_CONFIDENCE: ConfidenceCondition,
+        ExpertEventType.N_PRICE_VS_TARGET_LOW_PERCENT: PriceVsTargetLowCondition,
+        ExpertEventType.N_PRICE_VS_TARGET_HIGH_PERCENT: PriceVsTargetHighCondition,
+        ExpertEventType.N_PRICE_VS_TARGET_CONSENSUS_PERCENT: PriceVsTargetConsensusCondition,
         ExpertEventType.N_INSTRUMENT_ACCOUNT_SHARE: InstrumentAccountShareCondition,
         ExpertEventType.N_PERCENT_OPEN_TO_NEW_TARGET: PercentOpenToNewTargetCondition,
         ExpertEventType.N_PERCENT_BELOW_RECENT_HIGH: PercentBelowRecentHighCondition,

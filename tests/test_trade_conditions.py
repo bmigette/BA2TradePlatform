@@ -17,6 +17,7 @@ from ba2_trade_platform.core.TradeConditions import (
     RatingUpgradedCondition, RatingDowngradedCondition,
     RatingNeutralToPositiveCondition,
     create_condition, CompareCondition,
+    PriceVsTargetLowCondition, PriceVsTargetHighCondition, PriceVsTargetConsensusCondition,
 )
 from ba2_trade_platform.core.types import (
     OrderRecommendation, RiskLevel, TimeHorizon, ExpertEventType,
@@ -170,6 +171,80 @@ class TestConfidenceCondition:
         rec = _make_recommendation(confidence=None)
         cond = ConfidenceCondition(account, "AAPL", rec, ">", 50.0)
         assert cond.evaluate() is False
+
+
+def _make_recommendation_with_targets(target_low=None, target_high=None, target_consensus=None,
+                                       price_at_date=150.0, **kwargs):
+    rec = _make_recommendation(price_at_date=price_at_date, **kwargs)
+    rec.data = {"FMPRating": {
+        "target_low": target_low, "target_high": target_high, "target_consensus": target_consensus,
+    }}
+    return rec
+
+
+class TestPriceVsTargetConditions:
+    def test_price_above_low_target_is_positive(self):
+        account = _make_mock_account()
+        account._prices["AAPL"] = 120.0
+        rec = _make_recommendation_with_targets(target_low=100.0)
+        cond = PriceVsTargetLowCondition(account, "AAPL", rec, ">", 0.0)
+        assert cond.evaluate() is True
+        assert cond.calculated_value == pytest.approx(20.0)
+
+    def test_price_below_low_target_is_negative(self):
+        account = _make_mock_account()
+        account._prices["AAPL"] = 80.0
+        rec = _make_recommendation_with_targets(target_low=100.0)
+        cond = PriceVsTargetLowCondition(account, "AAPL", rec, "<", 0.0)
+        assert cond.evaluate() is True
+        assert cond.calculated_value == pytest.approx(-20.0)
+
+    def test_price_above_high_target_is_positive(self):
+        account = _make_mock_account()
+        account._prices["AAPL"] = 250.0
+        rec = _make_recommendation_with_targets(target_high=200.0)
+        cond = PriceVsTargetHighCondition(account, "AAPL", rec, ">", 0.0)
+        assert cond.evaluate() is True
+        assert cond.calculated_value == pytest.approx(25.0)
+
+    def test_price_below_high_target(self):
+        account = _make_mock_account()
+        account._prices["AAPL"] = 150.0
+        rec = _make_recommendation_with_targets(target_high=200.0)
+        cond = PriceVsTargetHighCondition(account, "AAPL", rec, "<", 0.0)
+        assert cond.evaluate() is True
+        assert cond.calculated_value == pytest.approx(-25.0)
+
+    def test_consensus_condition(self):
+        account = _make_mock_account()
+        account._prices["AAPL"] = 110.0
+        rec = _make_recommendation_with_targets(target_consensus=100.0)
+        cond = PriceVsTargetConsensusCondition(account, "AAPL", rec, ">", 0.0)
+        assert cond.evaluate() is True
+        assert cond.calculated_value == pytest.approx(10.0)
+
+    def test_missing_target_data_returns_false(self):
+        account = _make_mock_account()
+        rec = _make_recommendation_with_targets()  # no targets set
+        cond = PriceVsTargetLowCondition(account, "AAPL", rec, ">", 0.0)
+        assert cond.evaluate() is False
+        assert cond.calculated_value is None
+
+    def test_missing_price_returns_false(self):
+        account = _make_mock_account()
+        account._prices.pop("AAPL", None)
+        rec = _make_recommendation_with_targets(target_low=100.0)
+        cond = PriceVsTargetLowCondition(account, "AAPL", rec, ">", 0.0)
+        assert cond.evaluate() is False
+
+    def test_create_condition_factory_wires_field(self):
+        account = _make_mock_account()
+        account._prices["AAPL"] = 120.0
+        rec = _make_recommendation_with_targets(target_low=100.0)
+        cond = create_condition(ExpertEventType.N_PRICE_VS_TARGET_LOW_PERCENT, account, "AAPL", rec,
+                                operator_str=">", value=0.0)
+        assert isinstance(cond, PriceVsTargetLowCondition)
+        assert cond.evaluate() is True
 
 
 class TestExpectedProfitCondition:
