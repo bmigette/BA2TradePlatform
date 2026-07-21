@@ -2007,20 +2007,36 @@ def _build_strategy_option(kind: str):
 def _option_entry_rule(member: str, *, toggleable: bool = False) -> dict:
     """The entry TradeRule dict for one pure-option strategy key: directional signal gate
     (bullish for every original key, bearish for O_LP — see _OPTION_ENTRY_GATE) + flat +
-    optimizable confidence gate, action = the member's option action config. Rule/condition
-    ids are prefixed with the member key so a GROUP of these rules yields uniquely-keyed
-    genes per member. ``toggleable`` adds the rule-level enabled gene (group members only —
-    a single-strategy job keeps its one entry always-on)."""
+    optimizable confidence gate + price-vs-analyst-target-range gates, action = the member's
+    option action config. Rule/condition ids are prefixed with the member key so a GROUP of
+    these rules yields uniquely-keyed genes per member. ``toggleable`` adds the rule-level
+    enabled gene (group members only — a single-strategy job keeps its one entry always-on).
+
+    The signal (bullish/bearish) gate and the two price-vs-target gates are ALL independently
+    toggle_optimize=True, so the GA can search: rating-only (today's behavior, price gates
+    OFF), price-only (signal gate OFF, e.g. "put even though the rating still says buy" when
+    price has already cleared the high analyst estimate), both together, or - with BOTH price
+    gates ON - "price sits inside the analyst range" (favors neutral/credit structures). See
+    docs/plans/2026-07-21-options-price-target-conditions.md.
+    """
     m = member.lower()
     rule = {
         "id": f"{m}-entry",
         "name": f"{member}-entry",
         "conditions": {"id": f"{m}-root", "type": "AND", "conditions": [
-            {"id": f"{m}-signal", "field": _OPTION_ENTRY_GATE[member], "field_type": "flag"},
+            {"id": f"{m}-signal", "field": _OPTION_ENTRY_GATE[member], "field_type": "flag",
+             "toggle_optimize": True},
             {"id": f"{m}-flat", "field": "has_no_position", "field_type": "flag"},
             {"id": f"{m}-gate_confidence", "field": "confidence", "op": ">", "value": 50,
              "optimize": True, "value_min": 40, "value_max": 75, "value_step": 5,
-             "toggle_optimize": True}]},
+             "toggle_optimize": True},
+            {"id": f"{m}-price_low", "field": "price_vs_target_low_percent", "op": ">", "value": 0.0,
+             "optimize": True, "value_min": -20.0, "value_max": 20.0, "value_step": 5.0,
+             "toggle_optimize": True},
+            {"id": f"{m}-price_high", "field": "price_vs_target_high_percent", "op": "<", "value": 0.0,
+             "optimize": True, "value_min": -20.0, "value_max": 20.0, "value_step": 5.0,
+             "toggle_optimize": True},
+        ]},
         "actions": [_option_entry_action_for(member)],
         "continue_processing": False,
     }
