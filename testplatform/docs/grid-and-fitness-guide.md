@@ -198,3 +198,10 @@ Combining `price_low_above` + `price_high_below` reconstructs "price inside the 
 (useful for iron condors/strangles); `price_high_above` alone lets a bearish structure fire
 purely because price has already cleared the analyst's high estimate, regardless of the expert's
 own rating still saying BUY.
+
+Condition classes: `PriceVsTargetLowCondition`/`PriceVsTargetHighCondition` in
+`packages/common/ba2_common/core/TradeConditions.py`. Gate wiring: `_option_entry_rule()` in
+`testplatform/ba2test_launcher.py` (OS1/OS2/OS3 are defined in `tools/run_options_matrix.py`).
+A third field, `price_vs_target_consensus_percent` (vs. the median/consensus target,
+`PriceVsTargetConsensusCondition`), also exists but isn't wired into any strategy by default —
+it's a general-purpose primitive, available to wire into a specific member's rule by hand.
