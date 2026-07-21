@@ -272,22 +272,15 @@ class OptionsAccountInterface(ABC):
 
     def reserved_option_buying_power(self) -> float:
         """Sum of stored reserves across this account's OPEN short-premium option orders."""
-        from ba2_common.core.db import get_db
-        from ba2_common.core.models import TradingOrder
+        from ba2_common.core.trade_store import orders_where
         from ba2_common.core.types import AssetClass, OrderStatus
-        from sqlmodel import select
         terminal = OrderStatus.get_terminal_statuses()
         total = 0.0
-        with get_db() as session:
-            rows = session.exec(select(TradingOrder).where(
-                TradingOrder.account_id == self.id,
-                TradingOrder.asset_class == AssetClass.OPTION,
-            )).all()
-            for o in rows:
-                if o.status in terminal:
-                    continue
-                data = o.data or {}
-                total += float(data.get("option_reserve", 0) or 0)
+        for o in orders_where(account_id=self.id, not_statuses=terminal):
+            if o.asset_class != AssetClass.OPTION:
+                continue
+            data = o.data or {}
+            total += float(data.get("option_reserve", 0) or 0)
         return total
 
     def available_option_buying_power(self) -> float:
