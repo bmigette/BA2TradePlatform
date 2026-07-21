@@ -376,6 +376,14 @@ class ExpertEventType(str, Enum):
     N_NEW_TARGET_PERCENT = "new_target_percent"                # Percent change from current TP to new target (positive if higher, negative if lower)
     N_PROFIT_LOSS_AMOUNT = "profit_loss_amount"
     N_PROFIT_LOSS_PERCENT = "profit_loss_percent"
+    # Current price vs. FMPRating's analyst price-target lines (target_low/target_high/
+    # target_consensus, already persisted on ExpertRecommendation.data["FMPRating"] by
+    # FMPRating.run_analysis) - lets an entry rule gate on WHERE price sits relative to the
+    # analyst range, decoupled from the expert's BUY/SELL/HOLD rating. Positive % = price is
+    # ABOVE that target line.
+    N_PRICE_VS_TARGET_LOW_PCT = "price_vs_target_low_pct"
+    N_PRICE_VS_TARGET_HIGH_PCT = "price_vs_target_high_pct"
+    N_PRICE_VS_TARGET_CONSENSUS_PCT = "price_vs_target_consensus_pct"
     N_DAYS_OPENED = "days_opened"
     # Cooldown gates: calendar days since this expert last CLOSED a transaction on the symbol.
     # ANY close, only a PROFITABLE close, or only a LOSING close. Used to stop churning the
