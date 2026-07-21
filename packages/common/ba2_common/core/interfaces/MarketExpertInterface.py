@@ -724,14 +724,64 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                 return None
             
             available_balance = virtual_balance - used_balance
-            
+
+            # Clamp to the account's ACTUAL available balance (2026-07-21 fix). The calculation
+            # above is purely this expert's OWN virtual-equity bookkeeping — it has no visibility
+            # into (a) other experts on the SAME account oversubscribing their own virtual slices
+            # (virtual_equity_pct across experts is allowed to sum past 100%), or (b) a manual
+            # trade placed outside any expert's tracking. Both silently consume REAL account cash
+            # this expert's own math never learns about, so its virtual number can overstate what
+            # the account can actually spend. Cap it at the broker's real available balance so an
+            # expert is never told it can afford more than the account actually has.
+            actual_available = self._get_actual_available_balance(account)
+            if actual_available is not None and actual_available < available_balance:
+                logger.debug(f"Expert {self.id}: virtual available=${available_balance} exceeds "
+                            f"actual account available=${actual_available} (oversubscription or "
+                            f"a manual trade) — clamping to the actual figure")
+                available_balance = actual_available
+
             logger.debug(f"Expert {self.id}: Virtual balance=${virtual_balance}, "
                         f"Used balance=${used_balance}, Available balance=${available_balance}")
-            
+
             return available_balance
-            
+
         except Exception as e:
             logger.error(f"Error calculating available balance for expert {self.id}: {e}", exc_info=True)
+            return None
+
+    @staticmethod
+    def _get_actual_available_balance(account: AccountInterface) -> Optional[float]:
+        """The account's REAL spendable balance, straight from the broker — not this expert's
+        virtual-equity slice. Tries ``get_account_info()``'s buying-power-style fields first (the
+        true "can I actually place this order" figure); different account implementations name it
+        differently (Alpaca/backtest: ``buying_power``; IBKR: ``buying_power``; TastyTrade:
+        ``equity_buying_power`` or ``cash_balance``), so several known names are tried in order.
+        Falls back to ``get_balance()`` (equity) if none are present — a real, if less precise,
+        cap; still catches an account whose overall value has genuinely dropped. None (never a
+        fabricated number) if nothing is available."""
+        try:
+            info = account.get_account_info()
+        except Exception:  # noqa: BLE001 — a broker hiccup here must not block the virtual figure
+            info = None
+
+        def _field(obj: Any, name: str) -> Optional[float]:
+            val = obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+            if val is None:
+                return None
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                return None
+
+        if info is not None:
+            for name in ("buying_power", "cash", "cash_balance", "equity_buying_power"):
+                val = _field(info, name)
+                if val is not None:
+                    return val
+
+        try:
+            return account.get_balance()
+        except Exception:  # noqa: BLE001 — best-effort; None means "couldn't determine, don't clamp"
             return None
     
     def has_sufficient_equity_for_trading(self) -> tuple[bool, str]:
