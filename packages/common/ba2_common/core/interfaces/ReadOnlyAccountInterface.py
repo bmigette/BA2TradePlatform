@@ -426,7 +426,7 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
             from sqlmodel import select, Session
             from ba2_common.core.db import get_db
             from ba2_common.core.models import TradingOrder, Transaction
-            from ba2_common.core.types import OrderStatus, OrderDirection, OrderType, TransactionStatus
+            from ba2_common.core.types import OrderStatus, OrderDirection, OrderType, TransactionStatus, AssetClass
             from ba2_common.core.db import update_instance, delete_instance
             from ba2_common.core import trade_store as _ts
 
@@ -501,9 +501,29 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                     # recalculation re-inflates the transaction back to the pre-fill
                     # quantity on every refresh, overwriting reconcile_canceled_partial_fill
                     # (and any manual correction) every cycle.
+                    # A multi-leg option combo (e.g. call_butterfly) represents ONE
+                    # "structures" quantity on BOTH its PARENT order (asset_class OPTION,
+                    # no contract_symbol) and each of its CHILD legs (each leg's own
+                    # quantity/filled_qty independently encodes that same structures count,
+                    # scaled by that leg's ratio - e.g. 1x/2x/1x for a butterfly's
+                    # wing/body/wing). Summing every order unconditionally counts a single
+                    # combo fill event (1 parent + N legs) times instead of once, which
+                    # compounds every bar as the resulting bogus quantity inflates
+                    # mark-to-market equity -> next trade's position size -> quantity
+                    # further. Only the parent's filled_qty is the transaction-level
+                    # position size; its legs are execution mechanics and must be excluded.
+                    multi_leg_parent_ids = {
+                        o.id for o in orders
+                        if getattr(o, "asset_class", None) == AssetClass.OPTION
+                        and not getattr(o, "contract_symbol", None)
+                        and getattr(o, "parent_order_id", None) is None
+                    }
+
                     total_filled_buy = 0.0
                     total_filled_sell = 0.0
                     for order in orders:
+                        if getattr(order, "parent_order_id", None) in multi_leg_parent_ids:
+                            continue
                         filled_qty = order.filled_qty or 0
                         if order.status in executed_statuses or filled_qty > 0:
                             qty = filled_qty if filled_qty else order.quantity
@@ -753,6 +773,41 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         except Exception as e:
             logger.error(f"Error refreshing transactions for account {self.id}: {e}", exc_info=True)
             return False
+
+    def has_pending_closing_order(self, transaction_id: int) -> bool:
+        """True if a closing order for this transaction is already WORKING (submitted, not
+        yet terminal).
+
+        A transaction's market-entry-level orders (``depends_on_order IS NULL`` - this
+        includes both the original entry and any subsequently-submitted closing order, whether
+        single-leg or a multi-leg parent) sort oldest-first to newest: the oldest is the entry,
+        so any LATER one still non-terminal is a close that hasn't resolved yet.
+
+        Callers managing open positions (deciding whether to re-evaluate exit rules / submit a
+        new closing order for a transaction) MUST check this first. Without it, a transaction
+        stays visible as "still open, needs managing" for every cycle a submitted close takes to
+        fill - and each cycle submits ANOTHER closing order for the same position, each one
+        crediting cash/reducing exposure for contracts that may already be gone. This is a
+        shared standard on the interface (not a backtest- or live-only concern) because both
+        sides re-evaluate open positions from ``Transaction.status`` alone and neither
+        previously guarded against a close already in flight (found investigating the
+        2026-07-21 options-grid trillion-scale equity runaway, where the backtest engine's
+        limit-order multi-leg closes take a full bar to fill).
+        """
+        from ba2_common.core.trade_store import orders_where
+        from ba2_common.core.types import OrderStatus
+
+        orders = orders_where(account_id=self.id, transaction_id=transaction_id, depends_on_order=None)
+        if len(orders) <= 1:
+            return False
+        orders.sort(key=lambda o: (o.created_at or datetime.min.replace(tzinfo=timezone.utc), o.id or 0))
+        # "Resolved" = genuinely terminal (rejected/canceled/expired/...) OR fully FILLED.
+        # get_terminal_statuses() deliberately excludes FILLED (tracked separately as
+        # "executed") — a FILLED close IS resolved and must not be read as still pending.
+        # PARTIALLY_FILLED is intentionally left OUT of "resolved": the remainder is still
+        # working, so the close hasn't finished doing its job yet.
+        resolved = OrderStatus.get_terminal_statuses() | {OrderStatus.FILLED}
+        return any(o.status not in resolved for o in orders[1:])
 
     def reconcile_externally_closed_transactions(self, grace_period_minutes: int = 5) -> int:
         """Close OPENED (or stuck-CLOSING) transactions whose symbol no longer has a position

@@ -1208,6 +1208,15 @@ class DailyBacktestEngine:
         managing it now would cancel the entry before it ever opens. Live includes WAITING
         because there a limit entry can genuinely sit working; here only a filled position is a
         real open position to manage.
+
+        Excludes a transaction that already has a closing order WORKING (submitted on an
+        earlier bar, not yet filled/canceled) — see
+        ``ReadOnlyAccountInterface.has_pending_closing_order`` (shared with live's
+        ``TradeManager.process_open_positions_recommendations``). Without this, exit rules get
+        re-evaluated on this transaction every bar the close is still in flight and can submit
+        ANOTHER closing order for the same position; each one credits cash for contracts that
+        may already be gone, compounding into runaway equity (the 2026-07-21 options-grid
+        trillion-scale fitness anomaly).
         """
         from ba2_common.core.trade_store import transactions_where
         from ba2_common.core.types import TransactionStatus
@@ -1215,6 +1224,8 @@ class DailyBacktestEngine:
         out: Dict[str, List[Any]] = {}
         rows = transactions_where(expert_id=expert_id, status=TransactionStatus.OPENED)
         for t in rows:
+            if self.account.has_pending_closing_order(t.id):
+                continue
             out.setdefault(t.symbol, []).append(t)
         return out
 

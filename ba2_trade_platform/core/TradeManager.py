@@ -1703,7 +1703,19 @@ class TradeManager:
                             Transaction.expert_id == expert_instance_id
                         )
                         existing_transactions = session.exec(statement).all()
-                        
+
+                        # Skip a transaction that already has a closing order WORKING
+                        # (submitted on an earlier cycle, not yet filled/canceled) — otherwise
+                        # this loop re-evaluates exit rules and can submit ANOTHER closing
+                        # order for the same position on every subsequent cycle until the
+                        # first one resolves. Shared with the backtest engine's equivalent
+                        # guard (found investigating the 2026-07-21 options-grid equity
+                        # runaway); see ReadOnlyAccountInterface.has_pending_closing_order.
+                        existing_transactions = [
+                            t for t in existing_transactions
+                            if not account.has_pending_closing_order(t.id)
+                        ]
+
                         if not existing_transactions:
                             self.logger.debug(f"No existing transactions for {recommendation.symbol}, skipping recommendation {recommendation.id}")
                             continue
