@@ -381,9 +381,9 @@ class ExpertEventType(str, Enum):
     # FMPRating.run_analysis) - lets an entry rule gate on WHERE price sits relative to the
     # analyst range, decoupled from the expert's BUY/SELL/HOLD rating. Positive % = price is
     # ABOVE that target line.
-    N_PRICE_VS_TARGET_LOW_PCT = "price_vs_target_low_pct"
-    N_PRICE_VS_TARGET_HIGH_PCT = "price_vs_target_high_pct"
-    N_PRICE_VS_TARGET_CONSENSUS_PCT = "price_vs_target_consensus_pct"
+    N_PRICE_VS_TARGET_LOW_PERCENT = "price_vs_target_low_percent"
+    N_PRICE_VS_TARGET_HIGH_PERCENT = "price_vs_target_high_percent"
+    N_PRICE_VS_TARGET_CONSENSUS_PERCENT = "price_vs_target_consensus_percent"
     N_DAYS_OPENED = "days_opened"
     # Cooldown gates: calendar days since this expert last CLOSED a transaction on the symbol.
     # ANY close, only a PROFITABLE close, or only a LOSING close. Used to stop churning the
