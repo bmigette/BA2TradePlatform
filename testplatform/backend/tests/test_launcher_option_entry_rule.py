@@ -30,17 +30,35 @@ def test_signal_gate_is_toggleable():
     assert signal["toggle_optimize"] is True
 
 
-def test_price_vs_target_conditions_present_and_optimizable():
+def test_price_target_gates_present_and_optimizable_with_correct_directions():
+    """Four gates, each independently toggleable, so the GA can reach all three non-trivial
+    price-positioning patterns (below-low-only, above-high-only, within-range) - not just one
+    of them. See the plan's "Design reference" section for why a single op-per-field wiring
+    (an earlier, buggy draft of this plan) can't do this: op is never part of the gene space,
+    only value and enabled are, so a fixed op only ever reaches ONE direction."""
     rule = mod._option_entry_rule("O_LC")
-    low = _find_cond(rule, "o_lc-price_low")
-    assert low["field"] == "price_vs_target_low_percent"
-    assert low["toggle_optimize"] is True
-    assert low["optimize"] is True
-    assert low["value_min"] < 0 < low["value_max"]
 
-    high = _find_cond(rule, "o_lc-price_high")
-    assert high["field"] == "price_vs_target_high_percent"
-    assert high["toggle_optimize"] is True
+    low_below = _find_cond(rule, "o_lc-price_low_below")
+    assert low_below["field"] == "price_vs_target_low_percent"
+    assert low_below["op"] == "<"
+    assert low_below["toggle_optimize"] is True
+    assert low_below["optimize"] is True
+    assert low_below["value_min"] < 0 < low_below["value_max"]
+
+    high_above = _find_cond(rule, "o_lc-price_high_above")
+    assert high_above["field"] == "price_vs_target_high_percent"
+    assert high_above["op"] == ">"
+    assert high_above["toggle_optimize"] is True
+
+    low_above = _find_cond(rule, "o_lc-price_low_above")
+    assert low_above["field"] == "price_vs_target_low_percent"
+    assert low_above["op"] == ">"
+    assert low_above["toggle_optimize"] is True
+
+    high_below = _find_cond(rule, "o_lc-price_high_below")
+    assert high_below["field"] == "price_vs_target_high_percent"
+    assert high_below["op"] == "<"
+    assert high_below["toggle_optimize"] is True
 
 
 def test_bearish_member_gets_bearish_signal_field():
@@ -49,9 +67,11 @@ def test_bearish_member_gets_bearish_signal_field():
     assert signal["field"] == "bearish"
 
 
-def test_every_pure_option_member_gets_price_target_conditions():
+def test_every_pure_option_member_gets_all_four_price_target_gates():
     for member in mod._OPTION_STRATS:
         rule = mod._option_entry_rule(member)
         m = member.lower()
-        _find_cond(rule, f"{m}-price_low")
-        _find_cond(rule, f"{m}-price_high")
+        _find_cond(rule, f"{m}-price_low_below")
+        _find_cond(rule, f"{m}-price_high_above")
+        _find_cond(rule, f"{m}-price_low_above")
+        _find_cond(rule, f"{m}-price_high_below")

@@ -2007,19 +2007,39 @@ def _build_strategy_option(kind: str):
 def _option_entry_rule(member: str, *, toggleable: bool = False) -> dict:
     """The entry TradeRule dict for one pure-option strategy key: directional signal gate
     (bullish for every original key, bearish for O_LP — see _OPTION_ENTRY_GATE) + flat +
-    optimizable confidence gate + price-vs-analyst-target-range gates, action = the member's
-    option action config. Rule/condition ids are prefixed with the member key so a GROUP of
-    these rules yields uniquely-keyed genes per member. ``toggleable`` adds the rule-level
-    enabled gene (group members only — a single-strategy job keeps its one entry always-on).
+    optimizable confidence gate + four price-vs-analyst-target-range gates, action = the
+    member's option action config. Rule/condition ids are prefixed with the member key so a
+    GROUP of these rules yields uniquely-keyed genes per member. ``toggleable`` adds the
+    rule-level enabled gene (group members only — a single-strategy job keeps its one entry
+    always-on).
 
-    The signal (bullish/bearish) gate and the two price-vs-target gates are ALL independently
-    toggle_optimize=True, so the GA can search: rating-only (today's behavior, price gates
-    OFF), price-only (signal gate OFF, e.g. "put even though the rating still says buy" when
-    price has already cleared the high analyst estimate), both together, or - with BOTH price
-    gates ON - "price sits inside the analyst range" (favors neutral/credit structures). See
-    docs/plans/2026-07-21-options-price-target-conditions.md.
+    The signal (bullish/bearish) gate and all four price-vs-target gates are independently
+    toggle_optimize=True. Op is fixed per gate (the GA's gene space only ever searches a
+    condition's threshold value and enabled flag, never its operator - see
+    docs/plans/2026-07-21-options-price-target-conditions.md's "Design reference"), so each
+    directional pattern needs its OWN gate rather than one gate whose op could flip:
+    price_low_below (< , "still below the low estimate") + price_high_above (> , "already
+    above the high estimate") + price_low_above (>) + price_high_below (< , the last two
+    paired together = "inside the analyst range"). The GA can search: rating-only (today's
+    behavior, all four price gates OFF), price-only (signal gate OFF, e.g. "put even though
+    the rating still says buy" via price_high_above alone), any combination of the four price
+    gates together, or every gate off entirely.
     """
     m = member.lower()
+    price_target_conditions = [
+        {"id": f"{m}-price_low_below", "field": "price_vs_target_low_percent", "op": "<",
+         "value": 0.0, "optimize": True, "value_min": -20.0, "value_max": 20.0,
+         "value_step": 5.0, "toggle_optimize": True},
+        {"id": f"{m}-price_high_above", "field": "price_vs_target_high_percent", "op": ">",
+         "value": 0.0, "optimize": True, "value_min": -20.0, "value_max": 20.0,
+         "value_step": 5.0, "toggle_optimize": True},
+        {"id": f"{m}-price_low_above", "field": "price_vs_target_low_percent", "op": ">",
+         "value": 0.0, "optimize": True, "value_min": -20.0, "value_max": 20.0,
+         "value_step": 5.0, "toggle_optimize": True},
+        {"id": f"{m}-price_high_below", "field": "price_vs_target_high_percent", "op": "<",
+         "value": 0.0, "optimize": True, "value_min": -20.0, "value_max": 20.0,
+         "value_step": 5.0, "toggle_optimize": True},
+    ]
     rule = {
         "id": f"{m}-entry",
         "name": f"{member}-entry",
@@ -2030,12 +2050,7 @@ def _option_entry_rule(member: str, *, toggleable: bool = False) -> dict:
             {"id": f"{m}-gate_confidence", "field": "confidence", "op": ">", "value": 50,
              "optimize": True, "value_min": 40, "value_max": 75, "value_step": 5,
              "toggle_optimize": True},
-            {"id": f"{m}-price_low", "field": "price_vs_target_low_percent", "op": ">", "value": 0.0,
-             "optimize": True, "value_min": -20.0, "value_max": 20.0, "value_step": 5.0,
-             "toggle_optimize": True},
-            {"id": f"{m}-price_high", "field": "price_vs_target_high_percent", "op": "<", "value": 0.0,
-             "optimize": True, "value_min": -20.0, "value_max": 20.0, "value_step": 5.0,
-             "toggle_optimize": True},
+            *price_target_conditions,
         ]},
         "actions": [_option_entry_action_for(member)],
         "continue_processing": False,
