@@ -26,6 +26,13 @@ ZERO_TRADE_SENTINEL = -1.0e9
 # and (deliberately) ranks ABOVE a no-trade config. Both are always worse than any real fitness.
 LOW_TRADE_SENTINEL = -1.0e8
 
+# A trial whose account hit net_liquidating_value <= 0 (results["account_wiped_out"], set by
+# BacktestAccount.snapshot_equity / DailyBacktestEngine.run — the sim stops the moment this
+# happens, since real capital can't go negative). Blowing up the account is a WORSE outcome
+# than never having traded at all, so this must rank BELOW ZERO_TRADE_SENTINEL, not just
+# alongside it.
+WIPED_OUT_SENTINEL = -2.0e9
+
 # --- consistent_annual_return metric constants -------------------------------------------------
 # Goal: ~30% return EVERY year — not 50% one year / 10% the next.
 _CAR_MIN_TRADES_PER_YEAR = 30.0   # trade_gate ramp target: full credit at/above this, linear below
@@ -224,12 +231,16 @@ def compute_fitness(fitness_metric: str, results: dict) -> float:
     """Return the scalar fitness for a metric from a backtest results dict.
 
     - None results or 0-trade runs return ZERO_TRADE_SENTINEL (distinct from 0.0).
+    - A wiped-out account (results["account_wiped_out"]) returns WIPED_OUT_SENTINEL, ranked
+      WORSE than ZERO_TRADE_SENTINEL — blowing up the account is worse than never trading.
     - max_drawdown/max_dd/drawdown is NEGATED (smaller drawdown -> larger fitness).
     - NaN/inf metric values collapse to ZERO_TRADE_SENTINEL (degenerate trial).
     - An unknown fitness_metric raises ValueError (no-defaults, fail-early).
     """
     if results is None:
         return ZERO_TRADE_SENTINEL
+    if results.get("account_wiped_out"):
+        return WIPED_OUT_SENTINEL
     if int(results.get("total_trades", 0) or 0) == 0:
         return ZERO_TRADE_SENTINEL
 
@@ -273,18 +284,21 @@ def compute_fitness(fitness_metric: str, results: dict) -> float:
         return ZERO_TRADE_SENTINEL
     val = float(val)
     # Optional TRADE-FREQUENCY scale (``fitness_trade_scale``): multiply the fitness by
-    # min(avg_trades_per_year, cap) / 100, so a statistically thin config (few trades over the run)
-    # is down-weighted. ~100 trades/yr is the break-even (factor 1.0); a 16-trade/3yr config (~5/yr)
-    # is scaled x0.05, crushing lottery winners. The CAP (``fitness_trade_scale_cap``, default 100)
-    # clamps avg_trades_per_year BEFORE scaling so the factor stops growing above it — the GA is
-    # therefore NOT rewarded for over-trading (a scalper aiming for the multiplier). With the
-    # default cap=100 the factor maxes at 1.0 (a pure thinness penalty); a higher cap allows some
-    # up-weighting up to that rate. Applied only to a POSITIVE fitness — scaling a losing (<=0)
-    # fitness toward 0 would wrongly FAVOUR a thin loser, so those are left unchanged.
+    # min(avg_trades_per_year, cap) / target, so a statistically thin config (few trades over the
+    # run) is down-weighted. ~target trades/yr is the break-even (factor 1.0); a 16-trade/3yr
+    # config (~5/yr) against the default target=100 is scaled x0.05, crushing lottery winners. The
+    # TARGET (``fitness_trade_scale_target``, default 100) is the trades/yr rate that earns full
+    # credit -- lower it (e.g. 50) for an asset class/cadence where 100/yr is an unrealistic bar
+    # (options strategies trade far less often than equities). The CAP (``fitness_trade_scale_cap``,
+    # default 100) separately clamps avg_trades_per_year BEFORE dividing by the target, so the GA is
+    # NOT rewarded for over-trading (a scalper aiming for the multiplier) even if target is lowered.
+    # Applied only to a POSITIVE fitness — scaling a losing (<=0) fitness toward 0 would wrongly
+    # FAVOUR a thin loser, so those are left unchanged.
     if results.get("fitness_trade_scale") and val > 0:
         cap = float(results.get("fitness_trade_scale_cap") or 100.0)
+        target = float(results.get("fitness_trade_scale_target") or 100.0)
         tpy = results.get("avg_trades_per_year") or 0.0
-        val *= min(float(tpy), cap) / 100.0
+        val *= min(float(tpy), cap) / target
     return _apply_win_rate_factor(val, results)
 
 

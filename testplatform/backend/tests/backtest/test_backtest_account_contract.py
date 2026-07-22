@@ -182,6 +182,30 @@ def test_snapshot_equity_builds_curve():
         ctx.__exit__(None, None, None)
 
 
+def test_snapshot_equity_clamps_and_flags_wipeout():
+    """A real (non-margin) account can't hold negative equity -- once net_liquidating_value
+    hits <= 0, the RECORDED point is clamped to 0.0 and _wiped_out is set. See
+    DailyBacktestEngine.run's 5a step, which reads this flag to stop the sim early."""
+    acct, ctx, ps = _acct()
+    try:
+        assert acct._wiped_out is False
+        acct._cash = -50_000.0  # simulate a blown-up book directly on the ledger
+        snap = acct.snapshot_equity(datetime(2024, 1, 2))
+        assert snap["net_liquidating_value"] == 0.0
+        assert acct._wiped_out is True
+    finally:
+        ctx.__exit__(None, None, None)
+
+
+def test_snapshot_equity_does_not_flag_a_healthy_account():
+    acct, ctx, ps = _acct()
+    try:
+        acct.snapshot_equity(datetime(2024, 1, 2))
+        assert acct._wiped_out is False
+    finally:
+        ctx.__exit__(None, None, None)
+
+
 def test_market_order_fills_and_updates_ledger():
     """End-to-end through the INHERITED submit_order -> _submit_order_impl -> refresh_orders.
 

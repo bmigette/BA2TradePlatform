@@ -60,6 +60,21 @@ def _results():
     return build_results(_AccountStub(SNAPS, TRADES), CONFIG)
 
 
+def test_account_wiped_out_defaults_false_for_a_stub_without_the_attribute():
+    """_AccountStub has no _wiped_out attribute at all -- build_results must not crash on it,
+    and must default the flag to False (getattr fallback)."""
+    r = _results()
+    assert r["account_wiped_out"] is False
+
+
+def test_account_wiped_out_propagates_when_set_on_the_account():
+    class _WipedAccountStub(_AccountStub):
+        _wiped_out = True
+
+    r = build_results(_WipedAccountStub(SNAPS, TRADES), CONFIG)
+    assert r["account_wiped_out"] is True
+
+
 def test_total_return_and_final_equity():
     r = _results()
     # 100k -> 105k = +5%.

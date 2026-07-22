@@ -188,6 +188,14 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         self._snapshot_dates: List[Any] = []
         # Monotonic synthetic broker-order-id counter.
         self._broker_seq = 0
+        # Set True the first time snapshot_equity() sees net_liquidating_value <= 0 -- a real
+        # (non-margin) account cannot go below zero equity, so a trial that gets here is
+        # producing meaningless further simulation (unbounded, un-recoverable "equity" swings
+        # that show up as e.g. a -1900% drawdown -- impossible for real capital). The engine's
+        # main loop checks this flag and stops the run early; results.py/strategy_fitness.py
+        # mark the trial as invalid rather than scoring it on the (nonsensical) numbers a
+        # continued simulation would produce.
+        self._wiped_out: bool = False
         # contract_symbol -> signed option lot (qty in CONTRACTS, multiplier 100). Kept
         # SEPARATE from ``self._positions`` (which is the equity ledger keyed by the plain
         # underlying symbol and multiplier-unaware) so option marking can value at
@@ -955,9 +963,18 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         The engine calls this once per bar (after fills/transactions are rolled). Keys
         match ``ReadOnlyAccountInterface.get_balance_history``'s documented contract
         (date / net_liquidating_value / cash_balance / equity_value).
+
+        Clamps a non-positive net_liquidating_value to 0.0 in the RECORDED point and sets
+        ``self._wiped_out`` -- a real (non-margin) account cannot hold negative equity, so
+        anything the sim computes past that point is unbounded and meaningless (this is what
+        produces impossible drawdowns like -1900%). The engine's main loop stops the run as
+        soon as this flag is set; see its docstring for the full story.
         """
         equity_value = self._open_positions_mtm()
         nlv = self._cash + equity_value
+        if nlv <= 0:
+            self._wiped_out = True
+            nlv = 0.0
         snap = {
             "date": as_of,
             "net_liquidating_value": nlv,

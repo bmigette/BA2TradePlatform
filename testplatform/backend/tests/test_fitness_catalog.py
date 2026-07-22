@@ -171,6 +171,7 @@ def test_fitness_options_endpoint_returns_catalog_and_knobs(client):
     assert knobs["profit_share_cap_pct"]["default"] == 25
     assert knobs["fitness_trade_scale"]["default"] is False
     assert knobs["fitness_trade_scale_cap"]["default"] == 100
+    assert knobs["fitness_trade_scale_target"]["default"] == 100
 
 
 def test_optimize_route_accepts_fitness_metric_and_knobs(client, seed_strategy, test_db):
@@ -197,6 +198,7 @@ def test_optimize_route_accepts_fitness_metric_and_knobs(client, seed_strategy, 
                 "profit_share_cap_pct": 25.0,
                 "fitness_trade_scale": True,
                 "fitness_trade_scale_cap": 100.0,
+                "fitness_trade_scale_target": 50.0,
             },
         },
     }
@@ -218,3 +220,4 @@ def test_optimize_route_accepts_fitness_metric_and_knobs(client, seed_strategy, 
     assert bt["profit_share_cap_pct"] == 25.0
     assert bt["fitness_trade_scale"] is True
     assert bt["fitness_trade_scale_cap"] == 100.0
+    assert bt["fitness_trade_scale_target"] == 50.0

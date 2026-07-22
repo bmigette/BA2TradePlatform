@@ -55,3 +55,27 @@ def test_scale_leaves_negative_fitness_unchanged():
 def test_scale_keeps_zero_trade_sentinel():
     r = _r(total_trades=0, avg_trades_per_year=0.0, fitness_trade_scale=True)
     assert compute_fitness("calmar_ratio", r) == ZERO_TRADE_SENTINEL
+
+
+def test_scale_target_lowers_the_break_even_point():
+    # target=50 -> 50/yr now earns FULL credit (factor 1.0), not the default's 0.5.
+    r = _r(avg_trades_per_year=50.0, fitness_trade_scale=True, fitness_trade_scale_target=50.0)
+    assert compute_fitness("calmar_ratio", r) == pytest.approx(2.0)
+
+
+def test_scale_target_defaults_to_100_when_unset():
+    r = _r(avg_trades_per_year=50.0, fitness_trade_scale=True, fitness_trade_scale_target=None)
+    assert compute_fitness("calmar_ratio", r) == pytest.approx(1.0)
+
+
+def test_scale_target_and_cap_are_independent():
+    # target=50 (break-even lowered) but cap stays at the default 100 -> a 90/yr book still
+    # gets UP-weighted (90 isn't clamped by cap=100), not capped at the target.
+    r = _r(avg_trades_per_year=90.0, fitness_trade_scale=True, fitness_trade_scale_target=50.0)
+    assert compute_fitness("calmar_ratio", r) == pytest.approx(2.0 * (90.0 / 50.0))
+
+
+def test_scale_target_below_cap_still_clamped_by_cap_first():
+    # 216/yr clamped to cap=100 BEFORE dividing by the lowered target=50 -> factor 2.0, not 4.32.
+    r = _r(avg_trades_per_year=216.0, fitness_trade_scale=True, fitness_trade_scale_target=50.0)
+    assert compute_fitness("calmar_ratio", r) == pytest.approx(4.0)

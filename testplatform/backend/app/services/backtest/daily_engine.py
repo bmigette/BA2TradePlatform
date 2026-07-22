@@ -717,6 +717,15 @@ class DailyBacktestEngine:
             # 5. record per-bar equity / drawdown point.
             self.account.snapshot_equity(as_of_dt)
 
+            # 5a. account wipeout (net_liquidating_value <= 0): a real account can't go
+            #     negative, so continuing to simulate further bars/trades on top of a wiped
+            #     book produces meaningless numbers (the -1900%-drawdown class of bug). Stop
+            #     the run here — results.py/strategy_fitness.py read the flag and invalidate
+            #     the trial rather than scoring it.
+            if getattr(self.account, "_wiped_out", False):
+                self._log(f"account wiped out @ {as_of_dt} — stopping run early")
+                break
+
             pct = (i + 1) / total * 100.0
             pct_i = int(pct)
             if pct_i != last_pct or (i + 1) == total:

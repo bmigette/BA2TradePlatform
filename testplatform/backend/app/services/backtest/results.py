@@ -117,6 +117,12 @@ def build_results(account: Any, config: Dict[str, Any]) -> Dict[str, Any]:
     metrics["equity_curve"] = equity_curve
     metrics["drawdown_curve"] = drawdown_curve
     metrics["trades"] = trades
+    # See BacktestAccount.snapshot_equity / DailyBacktestEngine.run: the sim stops early the
+    # moment net_liquidating_value hits zero, since anything simulated past that point is
+    # meaningless. strategy_fitness.compute_fitness reads this to invalidate the trial instead
+    # of scoring it on the (already-clamped-at-0) numbers a real-money account could never
+    # actually produce.
+    metrics["account_wiped_out"] = bool(getattr(account, "_wiped_out", False))
     # Positions still OPEN at the end of the run. total_trades counts CLOSED round-trips, so a
     # buy-and-hold (no exit rule) shows 0 trades while equity still moves (entry commission +
     # the held position's mark-to-market). Surfacing these explains "0 trades but P&L changed".
@@ -489,6 +495,8 @@ def _compute_metrics(
         # Cap (trades/year) for the scale: avg_trades_per_year is clamped to this before scaling so
         # the GA is not rewarded for over-trading. None -> the fitness default (100 = factor <= 1.0).
         "fitness_trade_scale_cap": config.get("fitness_trade_scale_cap"),
+        # Trades/year that earns FULL credit (factor 1.0) for the scale. None -> fitness default 100.
+        "fitness_trade_scale_target": config.get("fitness_trade_scale_target"),
         # Optional win-rate fitness factor (2 * win_rate_fraction; see strategy_fitness.py).
         "fitness_win_rate_factor": bool(config.get("fitness_win_rate_factor")),
         "winning_trades": winning_trades,

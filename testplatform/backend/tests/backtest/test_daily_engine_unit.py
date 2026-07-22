@@ -221,6 +221,36 @@ def test_engine_busts_price_cache_each_bar():
         ctx.__exit__(None, None, None)
 
 
+def test_engine_stops_early_on_account_wipeout():
+    """Once BacktestAccount.snapshot_equity sets _wiped_out (net_liquidating_value <= 0), the
+    engine's main loop must stop simulating further bars -- continuing past a wiped account
+    produces meaningless numbers (the -1900%-drawdown class of bug). Forces the wipeout after
+    the 2nd bar via a wrapped snapshot_equity, isolating the early-stop behavior from needing a
+    real equity-destroying trade sequence."""
+    engine, account, expert, ctx, ps = _build_run(account_id=3, expert_id=3)
+    try:
+        engine._indicator_provider = object()
+        orig_snapshot = account.snapshot_equity
+        calls = {"n": 0}
+
+        def _wrapped(as_of):
+            calls["n"] += 1
+            snap = orig_snapshot(as_of)
+            if calls["n"] == 2:
+                account._wiped_out = True
+            return snap
+
+        account.snapshot_equity = _wrapped  # type: ignore[assignment]
+        engine.run()
+
+        hist = account.get_balance_history()
+        assert len(hist) == 2, "engine must stop right after the bar that triggers wipeout"
+        assert len(hist) < len(BARS), "must not simulate the remaining bars"
+        assert expert.seen_as_of == [d for (d, *_rest) in BARS[:2]]
+    finally:
+        ctx.__exit__(None, None, None)
+
+
 def test_recommendation_to_expert_recommendation_skips_hold_and_skip():
     """SKIP and HOLD recommendations are not persisted as actionable rows."""
     from app.services.backtest.daily_engine import _recommendation_to_expert_recommendation

@@ -2224,6 +2224,8 @@ def _cmd_optimize(args) -> int:
             "fitness_trade_scale": bool(getattr(args, "fitness_trade_scale", False)),
             "fitness_trade_scale_cap": (float(args.fitness_trade_scale_cap)
                                         if getattr(args, "fitness_trade_scale_cap", None) else None),
+            "fitness_trade_scale_target": (float(args.fitness_trade_scale_target)
+                                        if getattr(args, "fitness_trade_scale_target", None) else None),
             "fitness_win_rate_factor": bool(getattr(args, "fitness_win_rate_factor", False)),
             "labels": [t.strip() for t in getattr(args, "labels", "").split(",") if t.strip()],
             "backtest_id": int(_dt.now().timestamp()),
@@ -2490,6 +2492,8 @@ def _cmd_optimize_batch(args) -> int:
                 "fitness_trade_scale": bool(getattr(args, "fitness_trade_scale", False)),
                 "fitness_trade_scale_cap": (float(args.fitness_trade_scale_cap)
                                             if getattr(args, "fitness_trade_scale_cap", None) else None),
+                "fitness_trade_scale_target": (float(args.fitness_trade_scale_target)
+                                            if getattr(args, "fitness_trade_scale_target", None) else None),
                 "fitness_win_rate_factor": bool(getattr(args, "fitness_win_rate_factor", False)),
                 "labels": [t.strip() for t in getattr(args, "labels", "").split(",") if t.strip()],
                 "backtest_id": int(_dt.now().timestamp()),
@@ -3133,16 +3137,23 @@ def main(argv: "list | None" = None) -> int:
                          "return). Complements --profit-cap-pct: a trade can pass the cost-basis cap "
                          "yet still dominate the book's return; this bounds that. Default: off.")
     op.add_argument("--fitness-trade-scale", action="store_true",
-                    help="Multiply each trial's fitness by min(avg_trades_per_year, cap)/100, so "
-                         "statistically thin (few-trade) configs are down-weighted (~100 trades/yr = "
-                         "break-even). The cap (--fitness-trade-scale-cap) bounds the factor so the GA "
-                         "is NOT rewarded for over-trading (scalping). Stops a 16-trade lottery winner "
-                         "from topping the search on calmar. Default: off.")
+                    help="Multiply each trial's fitness by min(avg_trades_per_year, cap)/target, so "
+                         "statistically thin (few-trade) configs are down-weighted (~target trades/yr "
+                         "= break-even, default 100). The cap (--fitness-trade-scale-cap) bounds the "
+                         "factor so the GA is NOT rewarded for over-trading (scalping). Stops a "
+                         "16-trade lottery winner from topping the search on calmar. Default: off.")
     op.add_argument("--fitness-trade-scale-cap", type=float, default=100.0,
                     help="Cap (trades/year) for --fitness-trade-scale: avg_trades_per_year is clamped "
                          "to this before scaling, so above it the factor stops growing (no scalper "
                          "incentive). Default 100 = factor maxes at 1.0 (pure thinness penalty); a "
                          "higher value allows some up-weighting up to that rate.")
+    op.add_argument("--fitness-trade-scale-target", type=float, default=100.0,
+                    help="Trades/year that earns FULL credit (factor 1.0) for --fitness-trade-scale. "
+                         "Default 100 (matches equities cadence); lower it (e.g. 50) for an asset "
+                         "class/strategy that naturally trades less often (options), so a healthy "
+                         "config there isn't crushed just for not hitting an equities-scale trade "
+                         "count. Independent of --fitness-trade-scale-cap, which bounds the numerator, "
+                         "not the target denominator.")
     op.add_argument("--fitness-win-rate-factor", action="store_true",
                     help="Multiply each trial's (positive) fitness by 2 * win_rate_fraction, so "
                          "50%% win rate is break-even (1.0x), 100%% win rate doubles the fitness, and "

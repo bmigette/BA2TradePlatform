@@ -127,6 +127,11 @@ def main() -> int:
                          "modest real dollar result. Passed through to `ba2-test optimize`.")
     ap.add_argument("--fitness-trade-scale-cap", type=float, default=100.0,
                     help="Cap (trades/year) for --fitness-trade-scale. Default 100.")
+    ap.add_argument("--fitness-trade-scale-target", type=float, default=100.0,
+                    help="Trades/year that earns FULL credit (factor 1.0) for --fitness-trade-scale. "
+                         "Default 100 (an equities-scale cadence); options strategies trade far less "
+                         "often, so lower this (e.g. 50) to avoid crushing a healthy options config "
+                         "just for not hitting an equities-scale trade count.")
     ap.add_argument("--fitness-win-rate-factor", action="store_true",
                     help="Multiply a positive fitness by 2 x win_rate_fraction. Passed through "
                          "to `ba2-test optimize`.")
@@ -170,7 +175,8 @@ def main() -> int:
         if args.profit_share_cap_pct and args.profit_share_cap_pct > 0:
             cmd += ["--profit-share-cap-pct", str(args.profit_share_cap_pct)]
         if args.fitness_trade_scale:
-            cmd += ["--fitness-trade-scale", "--fitness-trade-scale-cap", str(args.fitness_trade_scale_cap)]
+            cmd += ["--fitness-trade-scale", "--fitness-trade-scale-cap", str(args.fitness_trade_scale_cap),
+                    "--fitness-trade-scale-target", str(args.fitness_trade_scale_target)]
         if args.fitness_win_rate_factor:
             cmd += ["--fitness-win-rate-factor"]
         if args.workers:
