@@ -635,6 +635,45 @@ class CloseAction(TradeAction):
         return f"Close existing position for {self.instrument_name} (sell long or buy to cover short)"
 
 
+def resolve_min_take_profit_pct(expert_recommendation_id: Optional[int]) -> float:
+    """Look up min_take_profit_percent from an ExpertRecommendation id, defaulting to 2.0 when
+    unset, the recommendation can't be found, or the lookup itself fails (get_instance raises
+    on a missing row rather than returning None) -- this is a best-effort default resolver, so a
+    dangling/deleted recommendation id must never propagate as an exception. Standalone
+    (ID-only) counterpart to AdjustTakeProfitAction._resolve_min_take_profit_pct, for callers
+    with no in-memory ExpertRecommendation object -- e.g. TradeManager re-checking the floor
+    post-fill, where only the parent order's expert_recommendation_id is available."""
+    if not expert_recommendation_id:
+        return 2.0
+    from ba2_common.core.db import get_instance
+    from ba2_common.core.models import ExpertRecommendation
+    try:
+        rec = get_instance(ExpertRecommendation, expert_recommendation_id)
+    except Exception:
+        return 2.0
+    return float(getattr(rec, "min_take_profit_percent", None) or 2.0) if rec else 2.0
+
+
+def compute_tp_floor_price(
+    target_price: float, entry_price: float, min_pct: float, is_long: bool
+) -> Optional[float]:
+    """If `target_price` is closer to `entry_price` than `min_pct`% allows, return the
+    floor-enforced price; otherwise None (no adjustment needed). Pure, no I/O -- shared by the
+    pre-fill Phase-2 enforcement (AdjustTakeProfitAction._enforce_minimum_distance / compute_price)
+    and TradeManager's post-fill re-check of the same floor against the REAL fill price."""
+    if not entry_price:
+        return None
+    if is_long:
+        actual_pct = ((target_price - entry_price) / entry_price) * 100
+        if actual_pct < min_pct:
+            return entry_price * (1 + min_pct / 100)
+    else:
+        actual_pct = ((entry_price - target_price) / entry_price) * 100
+        if actual_pct < min_pct:
+            return entry_price * (1 - min_pct / 100)
+    return None
+
+
 class _AdjustPriceLevelAction(TradeAction):
     """
     Base class for TP and SL adjustment actions.
@@ -1054,11 +1093,11 @@ class AdjustTakeProfitAction(_AdjustPriceLevelAction):
         the live engine and the backtest engine, and only a live expert-instance lookup would
         work in the live path."""
         rec = self.expert_recommendation
-        if rec is None and self.existing_order and self.existing_order.expert_recommendation_id:
-            from ba2_common.core.db import get_instance
-            from ba2_common.core.models import ExpertRecommendation
-            rec = get_instance(ExpertRecommendation, self.existing_order.expert_recommendation_id)
-        return float(getattr(rec, "min_take_profit_percent", None) or 2.0) if rec else 2.0
+        if rec is not None:
+            return float(getattr(rec, "min_take_profit_percent", None) or 2.0)
+        if self.existing_order and self.existing_order.expert_recommendation_id:
+            return resolve_min_take_profit_pct(self.existing_order.expert_recommendation_id)
+        return 2.0
 
     def _enforce_minimum_distance(self) -> None:
         """Floor the TP so it's never closer than min_take_profit_pct%% to the REAL entry FILL
@@ -1068,7 +1107,13 @@ class AdjustTakeProfitAction(_AdjustPriceLevelAction):
         that resolves too tight after real slippage on entry: that reference is computed from
         the recommendation's price_at_date, a stale signal-time price that never re-syncs to
         the real fill, so without this floor a slipped entry can silently erode the TP margin
-        below the configured minimum."""
+        below the configured minimum.
+
+        NOTE: for a fresh MARKET-order entry this runs in Phase 2, before the order is even
+        submitted to the broker, so `limit_price`/`open_price` are both still None and this
+        falls back to get_current_price() -- a live quote, not the actual fill. TradeManager
+        re-checks this same floor (via compute_tp_floor_price) once the real fill is known,
+        in _check_all_waiting_trigger_orders."""
         if not self.existing_order or self.target_price is None:
             return
         entry_price = self.existing_order.limit_price
@@ -1082,28 +1127,17 @@ class AdjustTakeProfitAction(_AdjustPriceLevelAction):
         side_str = str(self.existing_order.side.value if hasattr(self.existing_order.side, "value")
                        else self.existing_order.side).upper()
         is_long = side_str == "BUY"
-        if is_long:
-            actual_pct = ((self.target_price - entry_price) / entry_price) * 100
-            if actual_pct < min_pct:
-                enforced_tp = entry_price * (1 + min_pct / 100)
-                logger.warning(
-                    f"TP enforcement: distance from entry {actual_pct:.2f}% below minimum "
-                    f"{min_pct}%. Adjusting TP from ${self.target_price:.2f} to "
-                    f"${enforced_tp:.2f} (entry: ${entry_price:.2f})"
-                )
-                self.target_price = enforced_tp
-                self.take_profit_price = self.target_price
-        else:
-            actual_pct = ((entry_price - self.target_price) / entry_price) * 100
-            if actual_pct < min_pct:
-                enforced_tp = entry_price * (1 - min_pct / 100)
-                logger.warning(
-                    f"TP enforcement: distance from entry {actual_pct:.2f}% below minimum "
-                    f"{min_pct}%. Adjusting TP from ${self.target_price:.2f} to "
-                    f"${enforced_tp:.2f} (entry: ${entry_price:.2f})"
-                )
-                self.target_price = enforced_tp
-                self.take_profit_price = self.target_price
+        enforced_tp = compute_tp_floor_price(self.target_price, entry_price, min_pct, is_long)
+        if enforced_tp is not None:
+            actual_pct = (((self.target_price - entry_price) / entry_price) * 100 if is_long
+                          else ((entry_price - self.target_price) / entry_price) * 100)
+            logger.warning(
+                f"TP enforcement: distance from entry {actual_pct:.2f}% below minimum "
+                f"{min_pct}%. Adjusting TP from ${self.target_price:.2f} to "
+                f"${enforced_tp:.2f} (entry: ${entry_price:.2f})"
+            )
+            self.target_price = enforced_tp
+            self.take_profit_price = self.target_price
 
     def compute_price(self, order: "TradingOrder") -> Optional[float]:
         """Calculate the take-profit price, enforcing the same real-entry-relative minimum
@@ -1131,15 +1165,8 @@ class AdjustTakeProfitAction(_AdjustPriceLevelAction):
             order_side = str(order.side.value if hasattr(order.side, 'value') else order.side).upper()
             is_long = (order_side == "BUY")
 
-        if is_long:
-            actual_pct = ((price - entry_price) / entry_price) * 100
-            if actual_pct < min_pct:
-                price = entry_price * (1 + min_pct / 100)
-        else:
-            actual_pct = ((entry_price - price) / entry_price) * 100
-            if actual_pct < min_pct:
-                price = entry_price * (1 - min_pct / 100)
-        return price
+        enforced_price = compute_tp_floor_price(price, entry_price, min_pct, is_long)
+        return enforced_price if enforced_price is not None else price
 
 
 class AdjustStopLossAction(_AdjustPriceLevelAction):

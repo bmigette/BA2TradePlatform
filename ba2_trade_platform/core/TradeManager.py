@@ -335,8 +335,23 @@ class TradeManager:
             # PHASE 1: Collect all orders to process WHILE session is open
             orders_to_submit = []  # List of (order, parent_order_id)
             status_updates = {}  # Map of order_id -> new_status
+            # True if the SL-rebase or TP-floor-recheck blocks below wrote a Transaction field
+            # (txn.stop_loss / txn.take_profit). Those updates live only in this Phase-1 session
+            # and are otherwise silently lost on close: order.limit_price/stop_price mutations
+            # happen to survive because Phase 2 re-persists the SAME order object via
+            # update_instance()/account.submit_order(), but nothing analogous ever re-touches
+            # Transaction, so without this flag the commit below (previously gated on
+            # status_updates alone) would never fire for a pure rebase/floor-recheck run.
+            transaction_field_updates = False
             
             with get_db() as session:
+                # Phase 2 keeps using these SAME order objects (in orders_to_submit) after this
+                # session/commit — expire_on_commit's default would detach their already-loaded
+                # attributes on commit, raising DetachedInstanceError once the session below
+                # closes. Keep the in-memory values usable across the commit; Phase 2 re-fetches
+                # explicitly wherever it needs a truly fresh read (e.g. the `fresh = get_instance(...)`
+                # re-fetch on submit failure).
+                session.expire_on_commit = False
                 # Get all orders in WAITING_TRIGGER status
                 statement = select(TradingOrder).where(
                     TradingOrder.status == OrderStatus.WAITING_TRIGGER,
@@ -425,12 +440,57 @@ class TradeManager:
                                         if txn:
                                             txn.stop_loss = new_sl
                                             session.add(txn)
+                                            transaction_field_updates = True
                                         if isinstance(dependent_order.data, dict):
                                             dependent_order.data["sl_rebased_to_fill"] = True
                                             dependent_order.data["parent_filled_price"] = parent_order.open_price
                             except (KeyError, TypeError, ValueError) as rebase_err:
                                 self.logger.warning(
                                     f"Could not re-base SL for order {dependent_order.id}: {rebase_err}")
+
+                            # ===== Re-check the TAKE-PROFIT floor against the parent's actual fill =====
+                            # AdjustTakeProfitAction._enforce_minimum_distance() enforces
+                            # min_take_profit_percent against the "real fill price" — but for a
+                            # MARKET-order entry it runs in Phase 2, before the order is even
+                            # submitted, so limit_price/open_price are both still None and it can
+                            # only fall back to a live quote snapshot, not the actual fill. Re-run
+                            # that same floor check now that the real fill is known, and bump the
+                            # TP up (never down) if it's under-floor. Unlike SL this is a re-check
+                            # of an existing safety floor, not a full proportional rebase: a TP
+                            # that already clears the floor is left untouched, in keeping with TP
+                            # being "intentionally left untouched" for anything that isn't a floor
+                            # violation.
+                            try:
+                                if (isinstance(dependent_order.data, dict)
+                                        and "tp_percent_target" in dependent_order.data
+                                        and parent_order.open_price and dependent_order.limit_price):
+                                    from ba2_common.core.TradeActions import (
+                                        compute_tp_floor_price, resolve_min_take_profit_pct)
+                                    min_pct = resolve_min_take_profit_pct(parent_order.expert_recommendation_id)
+                                    side_str = str(parent_order.side.value if hasattr(parent_order.side, "value")
+                                                   else parent_order.side).upper()
+                                    is_long = side_str == "BUY"
+                                    floor_price = compute_tp_floor_price(
+                                        dependent_order.limit_price, parent_order.open_price, min_pct, is_long)
+                                    if floor_price is not None:
+                                        old_tp = dependent_order.limit_price
+                                        dependent_order.limit_price = floor_price
+                                        self.logger.warning(
+                                            f"TP floor re-check against real fill: order {dependent_order.id} "
+                                            f"was ${old_tp:.4f} (pre-fill), below the {min_pct}% minimum from "
+                                            f"the real fill ${parent_order.open_price:.4f}. Adjusted to "
+                                            f"${floor_price:.4f}"
+                                        )
+                                        txn = session.get(Transaction, dependent_order.transaction_id) \
+                                            if dependent_order.transaction_id else None
+                                        if txn:
+                                            txn.take_profit = floor_price
+                                            session.add(txn)
+                                            transaction_field_updates = True
+                                        dependent_order.data["tp_floor_rechecked_at_fill"] = True
+                            except (KeyError, TypeError, ValueError) as tp_floor_err:
+                                self.logger.warning(
+                                    f"Could not re-check TP floor for order {dependent_order.id}: {tp_floor_err}")
 
                             # ===== Legacy: percent-based recalc (kept as fallback) =====
                             # This ensures TP/SL prices use the parent's filled price, not stale market data
@@ -606,9 +666,12 @@ class TradeManager:
                         order_obj.status = new_status
                         session.add(order_obj)
                 
-                if status_updates:
+                if status_updates or transaction_field_updates:
                     session.commit()
-                    self.logger.debug(f"Applied {len(status_updates)} status-only updates")
+                    if status_updates:
+                        self.logger.debug(f"Applied {len(status_updates)} status-only updates")
+                    if transaction_field_updates:
+                        self.logger.debug("Committed SL-rebase/TP-floor Transaction field updates")
                 # Session will close here
             
             # PHASE 2: Process all order submissions OUTSIDE of session context
