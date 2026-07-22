@@ -118,6 +118,18 @@ def main() -> int:
     ap.add_argument("--profit-share-cap-pct", type=float, default=25.0,
                     help="Cap each trade's share of the run's net profit for the ADJUSTED "
                          "fitness. Default 25. Pass 0 to disable.")
+    ap.add_argument("--fitness-trade-scale", action="store_true",
+                    help="Down-weight thin-trade-count configs: multiplies a positive fitness "
+                         "by min(avg_trades_per_year, cap)/100. Options entries are naturally "
+                         "sparse (far fewer signals than the equity screener grid), so a "
+                         "handful-of-trades config with a near-zero max_drawdown can otherwise "
+                         "post an artificially huge calmar_ratio (return/~0 blows up) despite a "
+                         "modest real dollar result. Passed through to `ba2-test optimize`.")
+    ap.add_argument("--fitness-trade-scale-cap", type=float, default=100.0,
+                    help="Cap (trades/year) for --fitness-trade-scale. Default 100.")
+    ap.add_argument("--fitness-win-rate-factor", action="store_true",
+                    help="Multiply a positive fitness by 2 x win_rate_fraction. Passed through "
+                         "to `ba2-test optimize`.")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -157,6 +169,10 @@ def main() -> int:
             cmd += ["--profit-cap-pct", str(args.profit_cap_pct)]
         if args.profit_share_cap_pct and args.profit_share_cap_pct > 0:
             cmd += ["--profit-share-cap-pct", str(args.profit_share_cap_pct)]
+        if args.fitness_trade_scale:
+            cmd += ["--fitness-trade-scale", "--fitness-trade-scale-cap", str(args.fitness_trade_scale_cap)]
+        if args.fitness_win_rate_factor:
+            cmd += ["--fitness-win-rate-factor"]
         if args.workers:
             cmd += ["--workers", args.workers]
         print(f"[{i}/{len(jobs)}] RUN  {name} ...", flush=True)
