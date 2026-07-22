@@ -1940,14 +1940,65 @@ _OPTION_STRATS = {
         "option_strike_param_max": 8.0, "option_strike_param_step": 2.0,
         "option_dte_optimize": True, "option_dte_min_range": 20,
         "option_dte_max_range": 60, "option_dte_step": 5},
+    "O_BULLCS": {  # bull call vertical (debit) — the bullish mirror of O_VERT (bear put
+        # vertical). Same 2-leg select_vertical_spread mechanism, single strike_param shared
+        # by both legs (OpenBullCallSpreadAction._spread_params dedups by strike).
+        "action_type": "open_bull_call_spread", "option_strike_method": "percent_otm",
+        "option_strike_param": 2.0, "option_dte_min": 25, "option_dte_max": 45,
+        "option_sizing": 5.0,
+        "option_strike_param_optimize": True, "option_strike_param_min": 0.0,
+        "option_strike_param_max": 6.0, "option_strike_param_step": 2.0,
+        "option_dte_optimize": True, "option_dte_min_range": 20,
+        "option_dte_max_range": 60, "option_dte_step": 5},
+    "O_BEARCS": {  # bear call vertical (credit, defined risk) — sell the near-the-money leg,
+        # buy further OTM as protection. Directional-bearish credit, so it sits alongside
+        # O_JL/O_RS's skewed-credit group (OS3) rather than OS2's delta-neutral one.
+        "action_type": "open_bear_call_spread", "option_strike_method": "percent_otm",
+        "option_strike_param": 8.0, "option_dte_min": 25, "option_dte_max": 45,
+        "option_sizing": 15.0,
+        "option_strike_param_optimize": True, "option_strike_param_min": 4.0,
+        "option_strike_param_max": 16.0, "option_strike_param_step": 2.0,
+        "option_dte_optimize": True, "option_dte_min_range": 20,
+        "option_dte_max_range": 60, "option_dte_step": 5},
+    "O_CSP": {  # cash-secured put (credit, income) — sized off strike*100 reserve, not
+        # premium (see SellCashSecuredPutAction). Further OTM than O_LP's debit purchase
+        # is typical (reduce assignment risk while still collecting premium).
+        "action_type": "sell_cash_secured_put", "option_strike_method": "percent_otm",
+        "option_strike_param": 10.0, "option_dte_min": 25, "option_dte_max": 45,
+        "option_sizing": 20.0,
+        "option_strike_param_optimize": True, "option_strike_param_min": 5.0,
+        "option_strike_param_max": 20.0, "option_strike_param_step": 2.5,
+        "option_dte_optimize": True, "option_dte_min_range": 20,
+        "option_dte_max_range": 50, "option_dte_step": 5},
+    "O_STRD": {  # long straddle (debit, non-directional) — profits from a big move EITHER
+        # way (e.g. ahead of earnings). OpenStraddleAction always selects ATM internally
+        # (ignores strike_param), so only dte/sizing matter here.
+        "action_type": "open_straddle", "option_strike_method": "percent_otm",
+        "option_strike_param": 0.0, "option_dte_min": 20, "option_dte_max": 40,
+        "option_sizing": 5.0,
+        "option_dte_optimize": True, "option_dte_min_range": 10,
+        "option_dte_max_range": 55, "option_dte_step": 5},
+    "O_STRG": {  # long strangle (debit, non-directional) — cheaper than the straddle, needs
+        # a bigger move to pay off. strike_param is the OTM% for BOTH legs (symmetric).
+        "action_type": "open_strangle", "option_strike_method": "percent_otm",
+        "option_strike_param": 5.0, "option_dte_min": 20, "option_dte_max": 40,
+        "option_sizing": 5.0,
+        "option_strike_param_optimize": True, "option_strike_param_min": 2.0,
+        "option_strike_param_max": 12.0, "option_strike_param_step": 2.0,
+        "option_dte_optimize": True, "option_dte_min_range": 10,
+        "option_dte_max_range": 55, "option_dte_step": 5},
 }
 
 # Directional entry gate per pure-option strategy: which signal flag the entry rule requires.
 # Every original O_* key fires on the expert's BULLISH signal (including O_VERT — a bearish
 # STRUCTURE opened on a bullish signal as a hedge-shaped premium play, the original grid
-# semantics, kept unchanged). O_LP is the one true bearish-signal entry.
+# semantics, kept unchanged). O_LP and O_BEARCS (both bearish structures) are the true
+# bearish-signal entries. O_STRD/O_STRG (non-directional vol plays) keep the "bullish"
+# default here too, but the gate condition is toggle_optimize=True in _option_entry_rule, so
+# the GA can turn direction-gating off entirely and let them fire on either signal.
 _OPTION_ENTRY_GATE = {k: "bullish" for k in _OPTION_STRATS}
 _OPTION_ENTRY_GATE["O_LP"] = "bearish"
+_OPTION_ENTRY_GATE["O_BEARCS"] = "bearish"
 
 # GROUPED option strategies: ONE optimize job searching a FAMILY of similar structures.
 # Each member becomes its own toggleable entry TradeRule (entry:<member>-entry:enabled gene)
@@ -1955,15 +2006,16 @@ _OPTION_ENTRY_GATE["O_LP"] = "bearish"
 # tune each independently — top-5 individuals can land on DIFFERENT structures, giving the
 # saved top-N variety instead of 5 near-clones of one structure.
 _OPTION_GROUPS = {
-    "OS1": ["O_LC", "O_LP", "O_VERT", "O_BF"],   # directional DEBIT (long premium / defined)
-    "OS2": ["O_SSTG", "O_SSTD", "O_IC"],          # neutral CREDIT (short premium)
-    "OS3": ["O_JL", "O_RS"],                      # skewed CREDIT (asymmetric short premium)
+    "OS1": ["O_LC", "O_LP", "O_VERT", "O_BF", "O_BULLCS"],  # directional DEBIT (long premium / defined)
+    "OS2": ["O_SSTG", "O_SSTD", "O_IC", "O_CSP"],           # neutral CREDIT (short premium)
+    "OS3": ["O_JL", "O_RS", "O_BEARCS"],                    # skewed CREDIT (asymmetric short premium)
+    "OS4": ["O_STRD", "O_STRG"],                            # volatility DEBIT (non-directional)
 }
 
 # Pure-option strategy keys (entry is the option action; no equity leg). O_CC/O_STK are equity.
 _PURE_OPTION_STRATEGIES = set(_OPTION_STRATS) | set(_OPTION_GROUPS)
 # All launcher option/equity strategy keys handled by the option builders.
-_OPTION_STRATEGY_KEYS = _PURE_OPTION_STRATEGIES | {"O_CC", "O_STK"}
+_OPTION_STRATEGY_KEYS = _PURE_OPTION_STRATEGIES | {"O_CC", "O_PP", "O_STK"}
 
 
 def _option_entry_action_for(kind: str) -> dict:
@@ -2100,6 +2152,24 @@ def _build_strategy_stock(kind: str):
     return _build_strategy_S2(kind)
 
 
+def _build_strategy_protective_put(kind: str):
+    """O_PP — equity entry (the S2 baseline) + a ``buy_protective_put`` OPEN_POSITIONS overlay
+    rule (buy a put ~8% OTM against the held shares). Mirrors _build_strategy_covered_call's
+    shape exactly, swapping the overlay action; BuyProtectivePutAction sizes off the HELD
+    equity quantity (1 contract per 100 shares), not option_sizing. Equity-entry, so NO
+    entry_action."""
+    from app.models.strategy import Strategy  # noqa: F401 — keep import parity with siblings
+    s = _build_strategy_S2(kind)
+    s.exit_rules = list(s.exit_rules or []) + [{
+        "id": "pp_buy",
+        "conditions": {"type": "AND", "conditions": [{"id": "pp_hold", "field": "has_position"}]},
+        "actions": [{"action_type": "buy_protective_put",
+                     "option_strike_method": "percent_otm", "option_strike_param": 8.0,
+                     "option_dte_min": 25, "option_dte_max": 45}],
+        "continue_processing": False}]
+    return s
+
+
 _STRATEGY_BUILDERS = {
     "S1": _build_strategy_S1,   # (name, expert) — live "high conviction" ruleset + entry TP/SL
                                 #                  bracket (target-anchored TP, merged from S4)
@@ -2117,10 +2187,14 @@ _STRATEGY_BUILDERS = {
     "O_IC": _build_strategy_option, "O_JL": _build_strategy_option,
     "O_BF": _build_strategy_option, "O_RS": _build_strategy_option,
     "O_LP": _build_strategy_option,
+    "O_BULLCS": _build_strategy_option, "O_BEARCS": _build_strategy_option,
+    "O_CSP": _build_strategy_option, "O_STRD": _build_strategy_option,
+    "O_STRG": _build_strategy_option,
     "O_CC": _build_strategy_covered_call, "O_STK": _build_strategy_stock,
+    "O_PP": _build_strategy_protective_put,
     # Grouped option families (one job searches the whole family; see _OPTION_GROUPS):
     "OS1": _build_strategy_option_group, "OS2": _build_strategy_option_group,
-    "OS3": _build_strategy_option_group,
+    "OS3": _build_strategy_option_group, "OS4": _build_strategy_option_group,
 }
 
 # Per-strategy GA population multiplier applied on top of --population in optimize-batch. S1 is the

@@ -25,8 +25,10 @@ _spec.loader.exec_module(mod)
 
 
 _ALL_KEYS = ["O_LC", "O_CC", "O_VERT", "O_STK", "O_SSTG", "O_SSTD",
-             "O_IC", "O_JL", "O_BF", "O_RS"]
-_PURE_OPTION_KEYS = ["O_LC", "O_VERT", "O_SSTG", "O_SSTD", "O_IC", "O_JL", "O_BF", "O_RS"]
+             "O_IC", "O_JL", "O_BF", "O_RS",
+             "O_BULLCS", "O_BEARCS", "O_CSP", "O_STRD", "O_STRG", "O_PP"]
+_PURE_OPTION_KEYS = ["O_LC", "O_VERT", "O_SSTG", "O_SSTD", "O_IC", "O_JL", "O_BF", "O_RS",
+                     "O_BULLCS", "O_BEARCS", "O_CSP", "O_STRD", "O_STRG"]
 
 
 def test_option_strategy_keys_registered():
@@ -120,3 +122,67 @@ def test_group_decode_drops_disabled_members():
     decoded = decode_params(strat, flat)
     rids = [r.get("id") for r in (decoded.get("entry_rules") or [])]
     assert rids == [f"{keep.lower()}-entry"], f"expected only {keep} to survive; got {rids}"
+
+
+# --- New structure types: bull/bear call spreads, cash-secured put, long straddle/strangle,
+# protective put (OS1/OS2/OS3/OS4 extensions + the O_PP equity+overlay hybrid) -----------------
+
+def test_bull_call_spread_builder_emits_entry_action():
+    entry = mod._option_entry_action_for("O_BULLCS")
+    assert entry["action_type"] == "open_bull_call_spread"
+    assert "option_strike_param" in entry
+
+
+def test_bear_call_spread_builder_emits_entry_action():
+    entry = mod._option_entry_action_for("O_BEARCS")
+    assert entry["action_type"] == "open_bear_call_spread"
+    assert "option_strike_param" in entry
+
+
+def test_cash_secured_put_builder_emits_entry_action():
+    entry = mod._option_entry_action_for("O_CSP")
+    assert entry["action_type"] == "sell_cash_secured_put"
+    assert "option_strike_param" in entry
+
+
+def test_long_straddle_builder_emits_entry_action():
+    entry = mod._option_entry_action_for("O_STRD")
+    assert entry["action_type"] == "open_straddle"
+
+
+def test_long_strangle_builder_emits_entry_action():
+    entry = mod._option_entry_action_for("O_STRG")
+    assert entry["action_type"] == "open_strangle"
+    assert "option_strike_param" in entry
+
+
+def test_bear_call_spread_gates_bearish():
+    """O_BEARCS is a directional-bearish credit structure -- must gate like O_LP, not the
+    default bullish gate every other original key uses."""
+    strat = mod._build_strategy("O_BEARCS", "O_BEARCS", "FMPRating")
+    fields = [c.get("field") for c in strat.entry_rules[0]["conditions"]["conditions"]]
+    assert "bearish" in fields, f"O_BEARCS entry must gate on the bearish signal; got {fields}"
+
+
+def test_protective_put_registered_and_has_overlay_rule():
+    """O_PP mirrors O_CC's shape: equity entry (no entry_action) + a buy_protective_put
+    OPEN_POSITIONS overlay."""
+    strat = mod._build_strategy("O_PP", "O_PP", "FMPRating")
+    assert getattr(strat, "entry_action", None) is None
+    actions = [a.get("action_type")
+               for r in (strat.exit_rules or [])
+               for a in (r.get("actions") or [])]
+    assert "buy_protective_put" in actions, f"expected buy_protective_put overlay; got {actions}"
+
+
+def test_os4_is_non_directional_volatility_group():
+    """OS4 groups the two non-directional (long vol) structures."""
+    assert mod._OPTION_GROUPS["OS4"] == ["O_STRD", "O_STRG"]
+
+
+def test_every_pure_option_action_type_is_unique_across_groups():
+    """Sanity: no two _OPTION_STRATS keys should collide on the same underlying action_type
+    (that would mean a structure got accidentally duplicated instead of a new one added)."""
+    action_types = [v["action_type"] for v in mod._OPTION_STRATS.values()]
+    assert len(action_types) == len(set(action_types)), \
+        f"duplicate action_type in _OPTION_STRATS: {action_types}"

@@ -41,7 +41,10 @@ import sys
 _UNIVERSE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "options_universe_top100.txt")
 # Grouped families first (the interesting structure search), then the equity-entry pair.
-_DEFAULT_STRATEGIES = ["OS1", "OS2", "OS3", "O_CC", "O_STK"]
+# OS1-4 collectively cover all 15 pure-option structure types (see _OPTION_GROUPS in
+# ba2test_launcher.py); O_CC/O_PP are equity + option-overlay hybrids; O_STK is the plain
+# equity control.
+_DEFAULT_STRATEGIES = ["OS1", "OS2", "OS3", "OS4", "O_CC", "O_PP", "O_STK"]
 _DEFAULT_EXPERTS = ["FMPRating"]
 # Options need ~2x the equity balance headroom (100-share multipliers, CSP/strangle margin
 # reservations) — $20k keeps mid-priced large-cap structures affordable without letting one
@@ -84,9 +87,11 @@ def main() -> int:
                     help="Comma list of experts (default FMPRating; EarningsDrift/Insider "
                          "excluded — no large-cap signal on this options universe).")
     ap.add_argument("--strategies", default=",".join(_DEFAULT_STRATEGIES),
-                    help="Comma list of option strategy keys: grouped OS1/OS2/OS3 and/or "
-                         "singles (O_LC,O_LP,O_VERT,O_BF,O_SSTG,O_SSTD,O_IC,O_JL,O_RS,"
-                         "O_CC,O_STK).")
+                    help="Comma list of option strategy keys: grouped OS1-4 and/or singles "
+                         "(O_LC,O_LP,O_VERT,O_BULLCS,O_BF,O_SSTG,O_SSTD,O_IC,O_CSP,O_JL,O_RS,"
+                         "O_BEARCS,O_STRD,O_STRG,O_CC,O_PP,O_STK). OS1=directional debit, "
+                         "OS2=neutral credit, OS3=skewed credit, OS4=volatility debit "
+                         "(non-directional).")
     ap.add_argument("--start", default="2024-04-01",
                     help="Backtest start (options cache floor 2024-02-01 + expert warmup; "
                          "default 2024-04-01).")

@@ -2232,14 +2232,10 @@ class SellCashSecuredPutAction(_OptionEntryAction):
         if contract.strike is None or contract.strike <= 0:
             return self._result(False, f"No strike for {contract.symbol}")
         # Sizing: budget by the cash that must be reserved (strike*100), not the premium.
-        equity = self._virtual_equity()
-        if equity is None or equity <= 0:
-            return self._result(False, f"No virtual equity available for {self.instrument_name}")
-        if not self.sizing or self.sizing <= 0:
-            return self._result(False, f"No sizing configured for cash-secured put on {self.instrument_name}")
-        budget = equity * (self.sizing / 100.0)
+        # Routed through the shared _size_by_reserve() (not inlined) so it also gets capped by
+        # max_virtual_equity_per_instrument_percent, same as every other structure.
         per_contract_reserve = contract.strike * 100.0
-        quantity = int(math.floor(budget / per_contract_reserve))
+        quantity = self._size_by_reserve(per_contract_reserve, self.sizing)
         if quantity < 1:
             return self._result(False,
                                 f"Insufficient budget to size cash_secured_put for {self.instrument_name} "
@@ -2317,13 +2313,9 @@ class OpenBearCallSpreadAction(_OptionEntryAction):
         if per_spread_reserve <= 0:
             return self._result(False,
                                 f"Non-positive max-loss reserve for {self.instrument_name} bear call spread")
-        equity = self._virtual_equity()
-        if equity is None or equity <= 0:
-            return self._result(False, f"No virtual equity available for {self.instrument_name}")
-        if not self.sizing or self.sizing <= 0:
-            return self._result(False, f"No sizing configured for bear call spread on {self.instrument_name}")
-        budget = equity * (self.sizing / 100.0)
-        quantity = int(math.floor(budget / per_spread_reserve))
+        # Routed through the shared _size_by_reserve() (not inlined) so it also gets capped by
+        # max_virtual_equity_per_instrument_percent, same as every other structure.
+        quantity = self._size_by_reserve(per_spread_reserve, self.sizing)
         if quantity < 1:
             return self._result(False,
                                 f"Insufficient budget to size bear_call_spread for {self.instrument_name} "
