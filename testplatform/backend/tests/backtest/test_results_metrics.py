@@ -99,6 +99,28 @@ def test_profit_factor_capped_when_no_losers():
     assert math.isfinite(r["profit_factor"])
 
 
+def test_calmar_ratio_floors_near_zero_drawdown():
+    """Regression: a near-zero (but nonzero) max_drawdown must not blow calmar_ratio up to an
+    absurd value via division by a tiny denominator. A genuinely clean run (max_drawdown
+    rounds to 0.0 exactly) already short-circuits to calmar=0.0 via the existing `if
+    max_drawdown else 0.0` guard - the bug is a TINY nonzero drawdown (e.g. -0.01%), which is
+    truthy and so divides through unguarded. Observed on a real options-grid run: an 8-trade
+    individual with essentially no recorded drawdown posted calmar_ratio=852.98 for a genuinely
+    modest ~9% real return, purely because max_drawdown was a hair below zero rather than
+    exactly zero. Fix: floor abs(max_drawdown) at 1.0 (1 percentage point) before dividing."""
+    tiny_dip_snaps = [
+        _snap(datetime(2024, 1, 2), 100_000.0),
+        _snap(datetime(2024, 6, 1), 99_990.0),   # -0.01% dip from the running peak
+        _snap(datetime(2025, 1, 2), 200_000.0),  # big rally afterward, ~1 year span
+    ]
+    r = build_results(_AccountStub(tiny_dip_snaps, []), CONFIG)
+    assert -0.02 < r["max_drawdown"] < 0  # genuinely tiny but nonzero, not exactly 0.0
+    # Unfloored this would be annualized_return / ~0.01 -> thousands. Floored at 1.0pp it must
+    # stay in the same order of magnitude as the annualized return itself.
+    assert r["calmar_ratio"] < abs(r["annualized_return"]) * 1.5
+    assert math.isfinite(r["calmar_ratio"])
+
+
 def test_curves_present_with_frontend_field_names():
     r = _results()
     # equity curve: one point per snapshot, {date, equity}.

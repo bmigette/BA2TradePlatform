@@ -30,6 +30,14 @@ from app.services.backtest.metrics_utils import _safe_float, _safe_duration_days
 # Trading days per year — the standard convention used by backtesting.py for annualisation.
 _TRADING_DAYS_PER_YEAR = 252
 _PROFIT_FACTOR_CAP = 999.99
+# Floor for the calmar_ratio denominator (percentage points). A near-zero-but-nonzero
+# max_drawdown (e.g. a handful of quick, mostly-winning trades whose daily-bar equity curve
+# never dips) divides annualized_return by almost nothing, producing an absurd calmar_ratio for
+# a genuinely modest real return. A true zero-drawdown run already short-circuits to 0.0 via the
+# `if max_drawdown else` guard below; this floor catches the tiny-nonzero case that guard misses.
+# 1% is a conservative floor: real strategies essentially never hold a full percentage point of
+# drawdown headroom, so this only suppresses the degenerate thin-sample case, not genuine edge.
+_MIN_DRAWDOWN_FLOOR_PCT = 1.0
 
 
 def build_results(account: Any, config: Dict[str, Any]) -> Dict[str, Any]:
@@ -203,7 +211,7 @@ def _compute_metrics(
     neg_dd = [d for d in dd_values if d < 0]
     avg_drawdown = (sum(neg_dd) / len(neg_dd)) if neg_dd else 0.0
     max_dd_duration = _max_drawdown_duration_days(drawdown_curve)
-    calmar = (annualized_return / abs(max_drawdown)) if max_drawdown else 0.0
+    calmar = (annualized_return / max(abs(max_drawdown), _MIN_DRAWDOWN_FLOOR_PCT)) if max_drawdown else 0.0
 
     # --- trade quality -----------------------------------------------------
     pnls = [t["pnl"] for t in trades]
@@ -302,7 +310,7 @@ def _compute_metrics(
         adj_final = final - excess
         adjusted_total_return = ((adj_final - initial) / initial * 100.0) if initial else 0.0
         adjusted_annualized_return = _annualized_return(initial, adj_final, years)
-        adjusted_calmar = (adjusted_annualized_return / abs(max_drawdown)) if max_drawdown else 0.0
+        adjusted_calmar = (adjusted_annualized_return / max(abs(max_drawdown), _MIN_DRAWDOWN_FLOOR_PCT)) if max_drawdown else 0.0
         # Trade-quality on capped pnls (mirrors the raw block above).
         a_wins = [p for p in adj_pnls if p > 0]
         a_losses = [p for p in adj_pnls if p < 0]
