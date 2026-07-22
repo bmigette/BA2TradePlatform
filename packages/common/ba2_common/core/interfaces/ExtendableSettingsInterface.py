@@ -259,6 +259,35 @@ class ExtendableSettingsInterface(ABC):
         finally:
             session.close()
     
+    def reset_settings(self):
+        """
+        Delete ALL existing settings rows for this instance, so a subsequent
+        ``save_setting``/``save_settings`` call starts from a clean slate instead of merging
+        onto whatever was previously configured. Needed before applying an imported settings
+        payload: an import only writes the keys it explicitly contains, so any key absent from
+        the payload (e.g. a setting that was never a GA-optimized gene) would otherwise silently
+        keep its stale prior value instead of reverting to the class default.
+        """
+        setting_model = type(self).SETTING_MODEL
+        lk_field = type(self).SETTING_LOOKUP_FIELD
+        session = get_db()
+
+        try:
+            statement = select(setting_model).filter_by(**{lk_field: self.id})
+            existing = session.exec(statement).all()
+            for setting in existing:
+                session.delete(setting)
+            session.commit()
+            logger.info(f"Reset {len(existing)} setting(s) for {lk_field}={self.id}")
+
+            self._invalidate_settings_cache()
+        except Exception as e:
+            session.rollback()
+            logger.error(f"Error resetting settings: {e}", exc_info=True)
+            raise
+        finally:
+            session.close()
+
     def _invalidate_settings_cache(self):
         """
         Invalidate the cached settings for this instance and the singleton cache.

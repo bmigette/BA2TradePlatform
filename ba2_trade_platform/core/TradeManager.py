@@ -1300,10 +1300,12 @@ class TradeManager:
             worker_queue = get_worker_queue()
             all_tasks = worker_queue.get_all_tasks()
             
-            # Check for pending enter_market tasks for this expert
+            # Check for pending enter_market tasks for this expert. The shared queue also holds
+            # SmartRiskManagerTask entries, which have no `subtype` (they aren't analysis tasks) -
+            # use getattr so those don't crash this check and get misread as "pending analysis".
             for task in all_tasks.values():
                 if (task.expert_instance_id == expert_instance_id and
-                    task.subtype == AnalysisUseCase.ENTER_MARKET and
+                    getattr(task, "subtype", None) == AnalysisUseCase.ENTER_MARKET and
                     task.status in [WorkerTaskStatus.PENDING, WorkerTaskStatus.RUNNING]):
                     return True
             

@@ -3901,6 +3901,14 @@ class ExpertSettingsTab:
                     expert = get_expert_instance_from_id(target_expert_id)
                     
                     if expert:
+                        # Wipe any settings already on this instance BEFORE applying the import.
+                        # Otherwise a key the import payload doesn't mention (e.g. risk_manager_mode,
+                        # which is only ever a GA-optimized gene sometimes) silently keeps whatever
+                        # stale value the instance had from a PRIOR deploy instead of reverting to
+                        # the class default - this is exactly how instance 6 ended up on "smart" RM
+                        # mode despite the validating backtest never having set it.
+                        expert.reset_settings()
+
                         # Save all expert settings
                         for setting_key, setting_value in expert_settings.items():
                             try:
