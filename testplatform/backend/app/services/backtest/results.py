@@ -18,13 +18,16 @@ optional ``commission_per_trade`` (already folded into the ledger) is absent fro
 from __future__ import annotations
 
 import math
+import os
+from collections import OrderedDict
 from datetime import date, datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # Import the metric-coercion helpers from the lightweight ``metrics_utils`` module, NOT from
 # ``backtest_handler`` (the legacy ML path), which top-imports the tsai/torch/darts training
 # stack (~7s of startup) that the expert backtest never uses. See metrics_utils for details.
 from app.services.backtest.metrics_utils import _safe_float, _safe_duration_days
+from ba2_common.logger import logger
 
 
 # Trading days per year — the standard convention used by backtesting.py for annualisation.
@@ -38,6 +41,40 @@ _PROFIT_FACTOR_CAP = 999.99
 # 1% is a conservative floor: real strategies essentially never hold a full percentage point of
 # drawdown headroom, so this only suppresses the degenerate thin-sample case, not genuine edge.
 _MIN_DRAWDOWN_FLOOR_PCT = 1.0
+
+# Worker-process-level cache of each symbol's full-window 5-minute OHLCV frame, used by the
+# intraday drawdown refinement (mirrors options_provider.py's _WORKER_CHAIN_CACHE /
+# _WORKER_BAR_CACHE pattern). A GA trial-serving process handles MANY trials sequentially over
+# its life, and the universe/date-range is the same across every trial in a job -- reading and
+# filtering a symbol's multi-year 5-minute parquet cache (tens of thousands of rows) on every
+# trial's every flagged trade was the dominant cost of this refinement (measured: ~15-30x
+# slower per trial on a trade-heavy individual). Caching the loaded frame ONCE per symbol, on
+# first request, and reusing it for the rest of the worker's life turns "N reads per trial" into
+# "<= len(universe) reads for the whole job". Bounded (not unbounded) for the same reason
+# options_provider.py's caches are: a remote worker's process pool is long-lived across many
+# different optimization jobs touching different universes.
+_WORKER_5M_BARS_CACHE_MAX = int(os.getenv("BT_5M_BARS_CACHE_MAX", "300"))
+_WORKER_5M_BARS_CACHE: "OrderedDict[Tuple[str, Any, Any], Any]" = OrderedDict()
+
+
+def clear_worker_5m_bars_cache() -> None:
+    """Drop every cached 5-minute frame (test isolation / explicit reset)."""
+    _WORKER_5M_BARS_CACHE.clear()
+
+
+def _get_5m_bars_cached(provider: Any, symbol: str, start_date: Any, end_date: Any) -> Any:
+    """Worker-cached ``provider.get_ohlcv_data(symbol, ..., interval="5m")`` for the whole
+    [start_date, end_date] window -- see the cache docstring above."""
+    key = (symbol, start_date, end_date)
+    df = _WORKER_5M_BARS_CACHE.get(key)
+    if df is not None:
+        _WORKER_5M_BARS_CACHE.move_to_end(key)  # LRU: mark most-recently-used
+        return df
+    df = provider.get_ohlcv_data(symbol, start_date=start_date, end_date=end_date, interval="5m")
+    _WORKER_5M_BARS_CACHE[key] = df
+    while len(_WORKER_5M_BARS_CACHE) > _WORKER_5M_BARS_CACHE_MAX:
+        _WORKER_5M_BARS_CACHE.popitem(last=False)
+    return df
 
 
 def build_results(account: Any, config: Dict[str, Any]) -> Dict[str, Any]:
@@ -73,7 +110,10 @@ def build_results(account: Any, config: Dict[str, Any]) -> Dict[str, Any]:
 
     final = equity_curve[-1]["equity"] if equity_curve else initial
 
-    metrics = _compute_metrics(equity_curve, drawdown_curve, trades, initial, final, config)
+    refine_drawdown_fn = _build_refine_drawdown_fn(account, config)
+    metrics = _compute_metrics(
+        equity_curve, drawdown_curve, trades, initial, final, config, refine_drawdown_fn,
+    )
     metrics["equity_curve"] = equity_curve
     metrics["drawdown_curve"] = drawdown_curve
     metrics["trades"] = trades
@@ -82,6 +122,102 @@ def build_results(account: Any, config: Dict[str, Any]) -> Dict[str, Any]:
     # the held position's mark-to-market). Surfacing these explains "0 trades but P&L changed".
     metrics["open_positions"] = _open_positions(account)
     return metrics
+
+
+def _build_refine_drawdown_fn(account: Any, config: Dict[str, Any]) -> Optional[Any]:
+    """Build the ``refine_drawdown_fn(trades, max_drawdown) -> max_drawdown`` closure that
+    ``_compute_metrics`` calls, wiring ``intraday_drawdown.refine_max_drawdown``'s
+    dependency-injected callables to REAL data sources: the account's own daily price source
+    (``_price``) for daily bar lows / underlying prices, its options cache (``_options.cache``)
+    for delta-at-entry, and the shared FMP OHLCV provider's 5-minute bars for the intraday
+    re-pricing window. Returns None (skip refinement entirely) if the account doesn't expose
+    the private attributes this needs (e.g. a lightweight test stub) -- this is purely a
+    refinement layer, never a hard dependency.
+    """
+    price = getattr(account, "_price", None)
+    options = getattr(account, "_options", None)
+    if price is None or options is None:
+        return None
+    cache = getattr(options, "cache", None)
+    if cache is None:
+        return None
+    commission = float(config.get("commission_per_trade") or 0.0)
+    # get_provider() constructs a FRESH provider instance every call (no internal caching) --
+    # build it ONCE per backtest here, not once per flagged trade inside _bars_5m_between.
+    from ba2_providers import get_provider
+
+    ohlcv_5m_provider = get_provider("ohlcv", "fmp")
+    window_start = config.get("start_date")
+    window_end = config.get("end_date")
+
+    def _bars_5m_for_symbol(symbol: str):
+        # Worker-process-level cache (see _get_5m_bars_cached / _WORKER_5M_BARS_CACHE above):
+        # the universe + date window is the same across every trial in a job, so this turns
+        # "re-read this symbol's multi-year parquet cache on every trial" into "read it once
+        # per worker, for the life of the process".
+        return _get_5m_bars_cached(ohlcv_5m_provider, symbol, window_start, window_end)
+
+    def _daily_bar_low(symbol: str, dt: Any) -> Optional[float]:
+        bar = price.bar_at(symbol, dt)
+        return bar.get("low") if bar else None
+
+    def _prior_daily_bar_low(symbol: str, dt: Any) -> Optional[float]:
+        bar = price.prev_bar(symbol, dt)
+        return bar.get("low") if bar else None
+
+    def _underlying_price_at(symbol: str, dt: Any) -> Optional[float]:
+        return price.close_at(symbol, dt)
+
+    def _delta_at_entry(underlying: str, contract: str, dt: Any) -> Optional[float]:
+        # Route through options_provider's OWN worker-cached chain history (bisect over an
+        # already-loaded-once-per-underlying structure) instead of OptionsHistoryCache's raw
+        # methods, which open a fresh sqlite3 connection on every call. The backtest's normal
+        # option pricing/entry path already populates this cache for every underlying this
+        # trial touches, so by the time refinement runs it's typically already warm.
+        from app.services.backtest.options_provider import _chain_history
+
+        as_of = dt.strftime("%Y-%m-%d") if hasattr(dt, "strftime") else str(dt)
+        hist = _chain_history(cache.db_path, underlying)
+        snapshot = hist.latest_as_of(as_of)
+        if snapshot is None:
+            return None
+        for row in hist.by_asof.get(snapshot, []):
+            if row.get("occ_symbol") == contract:
+                return row.get("delta")
+        return None
+
+    def _bars_5m_between(symbol: str, entry: Any, exit_: Any) -> List[Dict[str, Optional[float]]]:
+        df = _bars_5m_for_symbol(symbol)
+        if df is None or df.empty or entry is None or exit_ is None:
+            return []
+        window = df[(df["Date"] >= entry) & (df["Date"] <= exit_)]
+        if window.empty:
+            return []
+        return [{"Low": row["Low"], "High": row["High"]} for _, row in window.iterrows()]
+
+    def _refine(trades: List[Dict[str, Any]], max_drawdown: float) -> float:
+        from app.services.backtest.intraday_drawdown import refine_max_drawdown
+
+        # `trades` here carries entry_time/exit_time as ISO STRINGS (_trade_row already ran
+        # them through _iso() for JSON/DB storage) -- every price-source lookup below needs
+        # real datetimes, so parse them back once per trade rather than in every callable.
+        parsed_trades = [
+            {**t, "entry_time": _parse_date(t.get("entry_time")), "exit_time": _parse_date(t.get("exit_time"))}
+            for t in trades
+        ]
+        return refine_max_drawdown(
+            parsed_trades,
+            max_drawdown,
+            equity_at=lambda dt: getattr(account, "_equity_at", lambda _dt: None)(dt),
+            daily_bar_low=_daily_bar_low,
+            prior_daily_bar_low=_prior_daily_bar_low,
+            delta_at_entry=_delta_at_entry,
+            underlying_price_at=_underlying_price_at,
+            bars_5m_between=_bars_5m_between,
+            commission_per_trade=commission,
+        )
+
+    return _refine
 
 
 def _open_positions(account: Any) -> List[Dict[str, Any]]:
@@ -154,6 +290,10 @@ def _trade_row(trade: Dict[str, Any]) -> Dict[str, Any]:
         "pnl_pct": _safe_float(trade.get("pnl_pct")),
         "bars_held": int(trade.get("bars_held", 0) or 0),
         "exit_reason": trade.get("exit_reason", "unknown"),
+        # Only set for option legs (passed through unchanged, no frontend consumer today) --
+        # lets the intraday_drawdown refinement look up delta/underlying bars per trade.
+        "contract_symbol": trade.get("contract_symbol"),
+        "underlying_symbol": trade.get("underlying_symbol"),
     }
 
 
@@ -179,6 +319,7 @@ def _compute_metrics(
     initial: float,
     final: float,
     config: Dict[str, Any],
+    refine_drawdown_fn: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Compute every reused ``Backtest`` metric column from the curves + trades.
 
@@ -208,6 +349,14 @@ def _compute_metrics(
     # --- drawdown ----------------------------------------------------------
     dd_values = [pt["drawdown"] for pt in drawdown_curve]  # <= 0
     max_drawdown = min(dd_values) if dd_values else 0.0  # most negative
+    if refine_drawdown_fn is not None and max_drawdown:
+        # Best-effort: a daily-bar equity curve can hide a real intraday dip for a
+        # single-bar-held option trade, or one whose exit day made a new low vs. the day
+        # before -- see intraday_drawdown.py. Only ever makes max_drawdown MORE negative.
+        try:
+            max_drawdown = refine_drawdown_fn(trades, max_drawdown)
+        except Exception as e:  # noqa: BLE001 -- refinement must never fail the backtest
+            logger.debug(f"intraday drawdown refinement failed, using daily-only figure: {e}")
     neg_dd = [d for d in dd_values if d < 0]
     avg_drawdown = (sum(neg_dd) / len(neg_dd)) if neg_dd else 0.0
     max_dd_duration = _max_drawdown_duration_days(drawdown_curve)

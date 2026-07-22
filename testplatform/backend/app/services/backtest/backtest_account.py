@@ -1924,6 +1924,10 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                     "pnl_pct": pnl_pct,
                     "bars_held": bars_held,
                     "exit_reason": exit_reason,
+                    # Only set for option legs; lets a post-hoc consumer (intraday_drawdown)
+                    # look up delta/underlying bars without re-deriving them from the order set.
+                    "contract_symbol": getattr(opening, "contract_symbol", None),
+                    "underlying_symbol": getattr(opening, "underlying_symbol", None),
                 }
             )
         # Deterministic order: by entry time then symbol.

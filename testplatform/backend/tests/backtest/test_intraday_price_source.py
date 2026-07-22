@@ -58,6 +58,17 @@ class TestIntradaySource:
         nb = ps.next_bar("AAPL", datetime(2024, 1, 2, 9, 0))
         assert nb["open"] == 10.5                      # the 10:00 bar (next-bar fill)
 
+    def test_prev_bar_is_previous_hour(self):
+        ps = AsOfPriceSource(ohlcv_provider=None, interval="1h")
+        ps.load_bars("AAPL", _bars_hourly())
+        pb = ps.prev_bar("AAPL", datetime(2024, 1, 2, 11, 0))
+        assert pb["close"] == 11.5                     # the 10:00 bar
+
+    def test_prev_bar_none_before_first_bar(self):
+        ps = AsOfPriceSource(ohlcv_provider=None, interval="1h")
+        ps.load_bars("AAPL", _bars_hourly())
+        assert ps.prev_bar("AAPL", datetime(2024, 1, 2, 9, 0)) is None
+
     def test_engine_clock_steps_per_intraday_bar(self):
         ps = AsOfPriceSource(ohlcv_provider=None, interval="1h")
         ps.load_bars("AAPL", _bars_hourly())

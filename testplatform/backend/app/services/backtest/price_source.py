@@ -507,6 +507,19 @@ class AsOfPriceSource:
                 "low": float(self._l[symbol][i]), "close": float(self._c[symbol][i]),
                 "volume": float(self._v[symbol][i])}
 
+    def prev_bar(self, symbol: str, before: datetime) -> Optional[Dict[str, float]]:
+        """The PREVIOUS trading bar strictly before ``before`` (e.g. for a "did the low undercut
+        yesterday's low" check). Symmetric to ``next_bar``."""
+        k = self._keys.get(symbol)
+        if not k:
+            return None
+        i = bisect.bisect_left(k, _norm(before, self._interval)) - 1
+        if i < 0:
+            return None
+        return {"open": float(self._o[symbol][i]), "high": float(self._h[symbol][i]),
+                "low": float(self._l[symbol][i]), "close": float(self._c[symbol][i]),
+                "volume": float(self._v[symbol][i])}
+
     def next_bar_date(self, symbol: str, after: datetime) -> Optional[Any]:
         """The key of the next trading bar strictly after ``after`` (date or datetime), or None.
 
