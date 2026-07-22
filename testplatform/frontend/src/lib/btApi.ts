@@ -406,6 +406,7 @@ export interface FitnessKnobs {
   profit_share_cap_pct: FitnessKnobDef<number>;
   fitness_trade_scale: FitnessKnobDef<boolean>;
   fitness_trade_scale_cap: FitnessKnobDef<number>;
+  fitness_trade_scale_target: FitnessKnobDef<number>;
   fitness_win_rate_factor: FitnessKnobDef<boolean>;
 }
 export interface FitnessOptions { metrics: FitnessMetricOption[]; knobs: FitnessKnobs; }

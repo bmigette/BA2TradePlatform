@@ -743,6 +743,7 @@ const Backtesting: React.FC = () => {
   const [optProfitShareCapPct, setOptProfitShareCapPct] = useState(25);
   const [optFitnessTradeScale, setOptFitnessTradeScale] = useState(false);
   const [optFitnessTradeScaleCap, setOptFitnessTradeScaleCap] = useState(100);
+  const [optFitnessTradeScaleTarget, setOptFitnessTradeScaleTarget] = useState(100);
   const [optFitnessWinRateFactor, setOptFitnessWinRateFactor] = useState(false);
   // Metrics list actually rendered: prefer the backend catalog, fall back to the static list until
   // it loads (or if the fetch fails).
@@ -790,6 +791,7 @@ const Backtesting: React.FC = () => {
         setOptProfitShareCapPct(opts.knobs.profit_share_cap_pct.default);
         setOptFitnessTradeScale(opts.knobs.fitness_trade_scale.default);
         setOptFitnessTradeScaleCap(opts.knobs.fitness_trade_scale_cap.default);
+        setOptFitnessTradeScaleTarget(opts.knobs.fitness_trade_scale_target.default);
         setOptFitnessWinRateFactor(opts.knobs.fitness_win_rate_factor.default);
       })
       .catch(() => setFitnessOptions([]));
@@ -886,7 +888,19 @@ const Backtesting: React.FC = () => {
       </div>
       <div>
         <label className={`block text-xs mb-1 ${tradeScaleSupported ? 'text-gray-500 dark:text-gray-400' : 'text-gray-400 dark:text-gray-500'}`}
-          title="Clamp on avg trades/year before scaling (100/yr = factor 1.0 break-even).">
+          title="Trades/year that earns FULL credit (factor 1.0). Lower it for a naturally low-cadence strategy (e.g. options) so it isn't crushed for not trading like equities.">
+          Trade-scale target (trades/yr)
+        </label>
+        <input
+          type="number" min="1" step="1" value={optFitnessTradeScaleTarget}
+          disabled={!tradeScaleSupported || !optFitnessTradeScale}
+          onChange={e => setOptFitnessTradeScaleTarget(parseInt(e.target.value) || 0)}
+          className="w-full px-2 py-1.5 text-sm border border-gray-300 dark:border-gray-600 rounded bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 disabled:opacity-50 disabled:cursor-not-allowed"
+        />
+      </div>
+      <div>
+        <label className={`block text-xs mb-1 ${tradeScaleSupported ? 'text-gray-500 dark:text-gray-400' : 'text-gray-400 dark:text-gray-500'}`}
+          title="Ceiling on avg trades/year BEFORE dividing by the target, so the factor can't grow without bound for a very high-frequency strategy. Default 100 (with the default target=100, this caps the factor at 1.0 -- pure downweighting, no over-trading reward).">
           Trade-scale cap (trades/yr)
         </label>
         <input
@@ -934,6 +948,7 @@ const Backtesting: React.FC = () => {
         profit_share_cap_pct: optProfitShareCapPct,
         fitness_trade_scale: tradeScaleSupported ? optFitnessTradeScale : false,
         fitness_trade_scale_cap: optFitnessTradeScaleCap,
+        fitness_trade_scale_target: optFitnessTradeScaleTarget,
         fitness_win_rate_factor: optFitnessWinRateFactor,
       };
       const body: OptimizeBatchBody = {
@@ -2460,6 +2475,7 @@ const Backtesting: React.FC = () => {
         profit_share_cap_pct: optProfitShareCapPct,
         fitness_trade_scale: tradeScaleSupported ? optFitnessTradeScale : false,
         fitness_trade_scale_cap: optFitnessTradeScaleCap,
+        fitness_trade_scale_target: optFitnessTradeScaleTarget,
         fitness_win_rate_factor: optFitnessWinRateFactor,
       };
       const backtestBlock: Record<string, unknown> = source === 'expert'
