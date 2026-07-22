@@ -1763,20 +1763,55 @@ class _OptionEntryAction(TradeAction):
                 logger.debug(f"_virtual_equity: could not load ExpertInstance {instance_id}: {e}")
         return balance * (pct / 100.0)
 
+    def _max_equity_per_instrument_cap(self, equity: float) -> Optional[float]:
+        """Dollar ceiling from max_virtual_equity_per_instrument_percent -- the SAME
+        per-instrument cap the classic equity RM path enforces (TradeRiskManagement.py's
+        EARLY SKIP / available_for_instrument), reused here so a single option position
+        (one lumpy/expensive contract, or a whole spread) can't consume more of the account
+        than that already-GA-optimized cap allows -- independent of option_sizing's own
+        (usually smaller, structure-specific) budget, which otherwise has no ceiling at all.
+
+        Best-effort: returns None (no cap applied) if the expert instance or its setting
+        can't be resolved. This is a SUPPLEMENTARY safety net layered on top of
+        option_sizing, not a hard requirement to trade -- a resolution hiccup must not
+        block an otherwise-valid entry option_sizing already approved."""
+        instance_id = self.expert_recommendation.instance_id if self.expert_recommendation else None
+        if not instance_id:
+            return None
+        try:
+            from ba2_common.core.instance_resolver import get_instance_resolver
+            expert = get_instance_resolver().get_expert_instance(instance_id)
+            if not expert:
+                return None
+            pct = expert.settings.get('max_virtual_equity_per_instrument_percent')
+            if pct is None:
+                return None
+            return equity * (float(pct) / 100.0)
+        except Exception as e:
+            logger.debug(f"_max_equity_per_instrument_cap: could not resolve expert {instance_id}: {e}")
+            return None
+
     def _size(self, premium: float, sizing_pct: Optional[float]) -> int:
-        """floor(virtual_equity * sizing% / (premium * 100)); 0 if not sizeable."""
+        """floor(virtual_equity * sizing% / (premium * 100)); 0 if not sizeable.
+
+        The sizing budget is additionally capped by max_virtual_equity_per_instrument_percent
+        (see _max_equity_per_instrument_cap) -- whichever of the two budgets is tighter wins."""
         if premium is None or premium <= 0 or not sizing_pct or sizing_pct <= 0:
             return 0
         equity = self._virtual_equity()
         if equity is None or equity <= 0:
             return 0
         budget = equity * (sizing_pct / 100.0)
+        cap = self._max_equity_per_instrument_cap(equity)
+        if cap is not None:
+            budget = min(budget, cap)
         return int(math.floor(budget / (premium * 100.0)))
 
     def _size_by_reserve(self, reserve_per_contract: float,
                          sizing_pct: Optional[float]) -> int:
         """floor(virtual_equity * sizing% / reserve_per_contract). For credit/naked
-        structures where net premium is negative (can't size off premium)."""
+        structures where net premium is negative (can't size off premium). Same
+        max_virtual_equity_per_instrument_percent cap as _size() applies here too."""
         if not reserve_per_contract or reserve_per_contract <= 0:
             return 0
         if not sizing_pct or sizing_pct <= 0:
@@ -1784,7 +1819,11 @@ class _OptionEntryAction(TradeAction):
         equity = self._virtual_equity()
         if equity is None or equity <= 0:
             return 0
-        return int(math.floor((equity * (sizing_pct / 100.0)) / reserve_per_contract))
+        budget = equity * (sizing_pct / 100.0)
+        cap = self._max_equity_per_instrument_cap(equity)
+        if cap is not None:
+            budget = min(budget, cap)
+        return int(math.floor(budget / reserve_per_contract))
 
     def _held_equity_shares(self) -> float:
         """Sum filled equity BUY quantity across this expert's OPENED transactions for the symbol."""
