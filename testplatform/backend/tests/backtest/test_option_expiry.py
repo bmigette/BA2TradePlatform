@@ -3,13 +3,13 @@
 At expiry the engine resolves every held single-leg option position:
 
   * OTM  -> expires worthless (option transaction closed at premium 0).
-  * ITM long  -> exercised  (option closed at intrinsic; a SHARE position is created
-                 in the equity ledger, settled at the STRIKE) — WHEN cash/shares/margin
-                 support it (the Alpaca-mirror policy, see
-                 BacktestAccount.settle_single_leg_expiry; an unsupportable long is sold
-                 to close instead — covered in test_options_review_fixes.py). The
-                 integration test below holds ample cash, so it exercises physically.
-  * ITM short -> assigned   (same conversion, opposite share side — always physical).
+  * ITM long  -> SOLD TO CLOSE at the expiry bar's premium close (intrinsic fallback) —
+                 NEVER exercised: a backtest strategy only manages options, so an
+                 exercised share position would ride unmanaged to the end of the run
+                 (the no-orphaned-stock policy, see
+                 BacktestAccount.settle_single_leg_expiry).
+  * ITM short -> assigned   (share conversion at the strike — always physical; the
+                 assigned stock is then liquidated at the next bar's open).
 
 ITM is decided off the underlying's bar close: a CALL is ITM when spot > strike, a
 PUT when spot < strike. Early American assignment is NOT modelled (at-expiry only).
@@ -199,23 +199,28 @@ def engine_with_long_call(tmp_path):
         ctx.__exit__(None, None, None)
 
 
-def test_apply_option_expiry_exercises_itm_long_call(engine_with_long_call):
+def test_apply_option_expiry_sells_itm_long_call_to_close(engine_with_long_call):
+    """ITM long call at expiry -> SOLD TO CLOSE at intrinsic (never exercised): the option
+    leg is closed exactly once, cash is credited the intrinsic premium, and NO share
+    position is created."""
     engine, acct, ps = engine_with_long_call
 
+    cash_after_entry = acct._cash
     # Step the clock to the expiry bar: underlying closes 200 -> the 180 call is ITM.
     ps.set_clock(datetime(2024, 3, 15))
 
     engine._apply_option_expiry(datetime(2024, 3, 15))
 
-    # The option position is gone (transaction closed).
+    # The option position is gone (transaction closed) — booked exactly once.
     assert acct.get_option_positions() == []
+    closes = [o for o in acct.get_orders() if o.comment == "option_expiry_close"]
+    assert len(closes) == 1
+    # No expiry-day premium bar in the seeded cache -> settled at intrinsic (200-180 = 20).
+    assert closes[0].open_price == pytest.approx(20.0)
 
-    # A LONG equity position of 100 shares of AAPL settled at the strike (180) now exists.
-    positions = acct.get_positions()
-    aapl = [p for p in positions if p["symbol"] == "AAPL"]
-    assert len(aapl) == 1
-    assert aapl[0]["qty"] == 100
-    assert aapl[0]["avg_price"] == pytest.approx(180.0)
+    # Cash credited intrinsic x 1 contract x 100 — and NO equity/shares position created.
+    assert acct._cash == pytest.approx(cash_after_entry + 20.0 * 100.0, abs=1.0)
+    assert [p for p in acct.get_positions() if p["symbol"] == "AAPL"] == []
 
 
 def test_apply_option_expiry_skips_unexpired(engine_with_long_call):

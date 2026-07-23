@@ -240,10 +240,10 @@ def option_expiry_outcome(opt_type, side, *, strike, spot, qty, multiplier=100):
     short ITM -> assigned; OTM -> worthless. ITM: call when spot>strike, put when spot<strike.
 
     NOTE: the engine settles through ``BacktestAccount.settle_single_leg_expiry``, which
-    applies the Alpaca-mirror SUPPORTABILITY policy on top of this theoretical outcome
-    (auto-exercise a long only if cash/shares/margin support it, else sell-to-close at the
-    expiry premium; shorts always physically assign, with a next-bar broker cleanup when an
-    assignment leaves cash negative). This helper remains the pure ITM/side contract."""
+    applies the no-orphaned-stock backtest policy on top of this theoretical outcome (a
+    long ITM is NEVER exercised — always sold to close at the expiry premium/intrinsic;
+    shorts always physically assign, with the assigned stock liquidated at the next bar's
+    open). This helper remains the pure ITM/side contract."""
     from ba2_common.core.types import OptionRight, OrderDirection
     itm = (spot > strike) if opt_type == OptionRight.CALL else (spot < strike)
     if not itm:
@@ -662,23 +662,23 @@ class DailyBacktestEngine:
             if filled:
                 self.account.refresh_transactions()
 
-            # 4a-pre. Alpaca-mirror post-assignment cleanup from a PRIOR bar's expiry: a short
-            #     put is always PHYSICALLY assigned, which can leave cash negative; the broker
-            #     then liquidates enough of the assigned shares to restore buying power. Sell
-            #     just enough of them at THIS bar's open (before this bar's expiries settle).
-            #     One dict check when nothing is pending; equity-only runs never schedule any.
+            # 4a-pre. Post-assignment liquidation from a PRIOR bar's expiry: a short option
+            #     is always PHYSICALLY assigned, and the assigned stock is unmanaged in a
+            #     backtest — close ALL of it at THIS bar's open (before this bar's expiries
+            #     settle). One dict check when nothing is pending; equity-only runs never
+            #     schedule any.
             if hasattr(self.account, "process_pending_assignment_liquidations"):
                 try:
                     self.account.process_pending_assignment_liquidations()
                 except Exception as e:  # noqa: BLE001 — cleanup failure must not abort the run
                     self._log(f"assignment liquidation failed @ {as_of_dt}: {e}")
 
-            # 4a. resolve any option positions reaching expiry on THIS bar (Alpaca-mirror
-            #     policy — see BacktestAccount.settle_single_leg_expiry): OTM -> worthless;
-            #     ITM long -> auto-exercised into a SHARE position at the strike ONLY IF
-            #     cash/shares/margin support it, else sold to close at the expiry premium;
-            #     ITM short -> ALWAYS physically assigned (shares at the strike), with a
-            #     next-bar broker cleanup when the assignment leaves cash negative.
+            # 4a. resolve any option positions reaching expiry on THIS bar (no-orphaned-stock
+            #     backtest policy — see BacktestAccount.settle_single_leg_expiry): OTM ->
+            #     worthless; ITM long -> NEVER exercised, sold to close at the expiry
+            #     premium (intrinsic fallback) — no shares; ITM short -> ALWAYS physically
+            #     assigned (shares at the strike), with the assigned stock liquidated at
+            #     the next bar's open (4a-pre above).
             #     Defined-risk combos unit-settle as a group instead. Runs after the
             #     transaction roll (so freshly-OPENED option positions are visible) and before
             #     snapshot_equity (so the resulting equity position is marked this bar).
@@ -1371,16 +1371,15 @@ class DailyBacktestEngine:
 
         For each held option whose ``expiry <= as_of.date()`` the engine reads the
         underlying's bar CLOSE; defined-risk combos unit-settle as a group, everything else
-        settles per leg via ``BacktestAccount.settle_single_leg_expiry`` (the Alpaca-mirror
-        policy):
+        settles per leg via ``BacktestAccount.settle_single_leg_expiry`` (the
+        no-orphaned-stock backtest policy):
 
           * worthless -> close the option transaction at premium 0 (realise the entry P&L).
-          * ITM long -> auto-exercised into the SHARE position at the STRIKE only if
-            cash/shares/margin SUPPORT it; otherwise sold to close at the expiry premium
-            (Alpaca liquidates unsupportable longs shortly before expiry) — no shares.
-          * ITM short -> ALWAYS physically assigned (shares at the STRIKE); an assignment
-            that leaves cash negative schedules a next-bar broker cleanup sale of the
-            assigned shares.
+          * ITM long -> NEVER exercised: sold to close at the expiry bar's premium close
+            (intrinsic fallback) — no share position, cash credited at the premium.
+          * ITM short -> ALWAYS physically assigned (shares at the STRIKE); the assigned
+            stock is unmanaged in a backtest, so it is liquidated in full at the next
+            bar's open (``process_pending_assignment_liquidations``).
 
         Early American assignment is NOT modelled — options resolve at expiry only.
 
@@ -1436,8 +1435,9 @@ class DailyBacktestEngine:
                         f"({pos.contract_symbol}) @ {as_of_date} — skipped"
                     )
                     continue
-                # The account applies the Alpaca-mirror policy (supportability-gated exercise
-                # for longs / physical assignment + next-bar cleanup for shorts) — see
+                # The account applies the no-orphaned-stock backtest policy (long ITM ->
+                # sell-to-close, never exercise / short ITM -> physical assignment with the
+                # stock liquidated at the next bar's open) — see
                 # BacktestAccount.settle_single_leg_expiry.
                 self.account.settle_single_leg_expiry(pos, float(spot))
             except Exception as e:  # noqa: BLE001 — one bad expiry must not abort the run

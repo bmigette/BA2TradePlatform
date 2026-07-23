@@ -53,7 +53,6 @@ Field/enum names verified against the installed ba2_common:
 from __future__ import annotations
 
 import bisect
-import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -145,6 +144,24 @@ class _FillProbe:
     order_type: OrderType
     limit_price: Optional[float] = None
     stop_price: Optional[float] = None
+
+
+# Per-share no-arbitrage tolerance for option-fill validation. The sparse options cache
+# occasionally carries junk indicative prints (e.g. a call at $0.01 while spot is $159.85
+# against a $105 strike — $54.85 of intrinsic); filling at such a premium and later
+# settling/marking against the REAL underlying fabricates P&L (the OS1 $20k -> $7-18M
+# blow-up). A fill premium violating a no-arbitrage bound by MORE than this tolerance is
+# rejected as untradable (see BacktestAccount._arb_fill_reject_reason).
+_ARB_FILL_TOLERANCE = 0.05
+
+# Maximum share of a premium bar's traded volume an option order may absorb and still
+# fill on that bar — the standard backtest participation assumption. Without it an
+# option order of ANY size fills at the bar's price regardless of liquidity (the
+# options audit found 2,100 contracts of a CVX call filled at a bar whose total volume
+# was 1 contract — a real order that size would move the market or not fill at all).
+# An order needing more contracts than participation x bar volume does NOT fill that
+# bar; it stays pending and retries the next (see BacktestAccount._option_fill_price).
+_OPTION_FILL_MAX_VOLUME_PARTICIPATION = 0.10
 
 
 class BacktestAccount(AccountInterface, OptionsAccountInterface):
@@ -249,10 +266,20 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         # same first-match rule the un-memoized scan used). Rebuilt when the generation moves.
         self._lot_order_index: Optional[Dict[str, TradingOrder]] = None
         self._lot_order_index_gen: int = -1
-        # F8 (Alpaca-mirror expiry): symbol -> share count ASSIGNED by a short-put expiry that
-        # left cash negative; process_pending_assignment_liquidations sells just enough of them
-        # at the NEXT bar's open to restore cash >= 0 (broker post-assignment liquidation).
+        # F8 (no-orphaned-stock expiry): symbol -> SIGNED share count created by a short-option
+        # physical assignment (+ = long stock from an assigned short put, - = short stock
+        # from an assigned naked short call). Option strategies never manage the resulting
+        # stock, so process_pending_assignment_liquidations closes ALL of it at the NEXT
+        # bar's open (broker post-assignment liquidation; no orphaned stock in backtests).
         self._pending_assignment_sells: Dict[str, float] = {}
+        # Count of option fills REJECTED by the no-arbitrage guard (_arb_fill_reject_reason)
+        # — junk indicative premium prints the run skipped instead of filling at.
+        self.rejected_arb_fills: int = 0
+        # Count of option fills REJECTED by the volume-participation cap
+        # (_OPTION_FILL_MAX_VOLUME_PARTICIPATION) — bars too thinly traded to absorb the
+        # order's size, so the order stays pending instead of filling at a price the
+        # market could not have absorbed.
+        self.rejected_illiquid_fills: int = 0
 
     # ======================================================================
     # Settings
@@ -927,7 +954,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         comment: str = "margin_call_liquidation",
     ) -> None:
         """Persist a synthetic FILLED closing order for a forced STOCK liquidation
-        (margin call, or the Alpaca-mirror post-assignment cleanup — ``comment`` names which).
+        (margin call, or the post-assignment next-bar liquidation — ``comment`` names which).
 
         BOOK-KEEPING only (the caller already moved cash + ledger). Linked to the symbol's
         OPENED equity transaction when one resolves — the entry order's side must match the
@@ -1404,6 +1431,19 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         fill is at the BAR price when it is better than the limit (never worse, no slippage
         on a limit fill). A LIMIT-typed leg carrying NO ``limit_price`` (a multi-leg child —
         the PARENT holds the combo's net limit) falls through to the market-style fill.
+
+        NO-ARBITRAGE guard: a resolved premium is validated against the underlying's own bar
+        on the fill day (``_arb_fill_reject_reason``); a junk indicative print is rejected
+        like a non-crossing limit — the order stays pending and retries the next bar (a
+        multi-leg parent fills NOTHING this bar, per its all-or-none semantics).
+
+        LIQUIDITY guard: the fill bar must also be able to ABSORB the order's size —
+        required contracts (a multi-leg child leg already carries parent structures x leg
+        ratio_qty, so ``order.quantity`` is the required contracts for both shapes) may not
+        exceed ``_OPTION_FILL_MAX_VOLUME_PARTICIPATION`` of the bar's traded volume
+        (``_volume_cap_reject_reason``). Rejected the same no-fill idiom as the arb guard:
+        the order stays pending and retries the next bar, a multi-leg parent fills NOTHING
+        this bar, and expiry settlement remains the backstop for exits.
         """
         if self._options is None:
             return None
@@ -1429,10 +1469,147 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         limit = getattr(order, "limit_price", None)
         ot = order.order_type
         if limit is not None and ot == OrderType.BUY_LIMIT:
-            return px if px <= float(limit) else None
-        if limit is not None and ot == OrderType.SELL_LIMIT:
-            return px if px >= float(limit) else None
-        return self._slip(px, order.side == OrderDirection.BUY)
+            if px > float(limit):
+                return None
+            fill_px = px
+        elif limit is not None and ot == OrderType.SELL_LIMIT:
+            if px < float(limit):
+                return None
+            fill_px = px
+        else:
+            fill_px = self._slip(px, order.side == OrderDirection.BUY)
+        reason = self._arb_fill_reject_reason(order, fill_px, fill_day, same_bar, bar)
+        if reason is not None:
+            self.rejected_arb_fills += 1
+            logger.warning(
+                "[backtest] arb-inconsistent option fill REJECTED: %s %s @ premium %.4f — "
+                "%s. The order stays pending and retries the next bar (rejections so far: "
+                "%d).",
+                getattr(order, "side", None), order.contract_symbol, fill_px, reason,
+                self.rejected_arb_fills,
+            )
+            return None
+        reason = self._volume_cap_reject_reason(order, bar)
+        if reason is not None:
+            self.rejected_illiquid_fills += 1
+            logger.warning(
+                "[backtest] illiquid option fill REJECTED: %s %s qty %s — %s. The order "
+                "stays pending and retries the next bar (rejections so far: %d).",
+                getattr(order, "side", None), order.contract_symbol,
+                getattr(order, "quantity", None), reason, self.rejected_illiquid_fills,
+            )
+            return None
+        return fill_px
+
+    def _volume_cap_reject_reason(self, order, bar: dict) -> Optional[str]:
+        """Why a candidate option fill exceeds the fill bar's liquidity, else None.
+
+        A fill is only plausible if the bar's traded volume could have absorbed the
+        order: the required contracts must be at most
+        ``_OPTION_FILL_MAX_VOLUME_PARTICIPATION`` of the bar's volume. The required
+        contracts are simply ``abs(order.quantity)`` — for a single-leg order that IS
+        the order quantity, and a multi-leg CHILD leg is created with quantity =
+        parent structures x leg ratio_qty (OptionsAccountInterface.submit_option_order),
+        so the same read covers both. ``_fill_multi_leg_parent`` prices every leg
+        through here, so one illiquid leg already blocks the whole all-or-none combo
+        (no partial fills). A missing/zero bar volume is treated as 0 — nothing fills
+        that bar (conservative; the order retries the next bar and expiry settlement
+        remains the backstop for exits, so a position cannot be stranded forever).
+        Applies to entries AND non-expiry exits alike.
+        """
+        required = abs(float(order.quantity or 0.0))
+        if required <= 0:
+            return None
+        volume = bar.get("volume")
+        volume = float(volume) if volume is not None else 0.0
+        capacity = _OPTION_FILL_MAX_VOLUME_PARTICIPATION * volume
+        if required > capacity:
+            return (
+                f"order requires {required:g} contracts but bar volume {volume:g} allows "
+                f"at most {capacity:g} "
+                f"({_OPTION_FILL_MAX_VOLUME_PARTICIPATION:.0%} participation cap)"
+            )
+        return None
+
+    def _arb_fill_reject_reason(
+        self, order, fill_px: float, fill_day, same_bar: bool, bar: dict
+    ) -> Optional[str]:
+        """Why a candidate option fill premium is untradable junk, else None (fill allowed).
+
+        The sparse options cache can carry junk indicative prints (e.g. a call at $0.01
+        while spot is $159.85 against a $105 strike — $54.85 of intrinsic); filling there
+        and later settling against the REAL underlying fabricates P&L. The account prices
+        the underlying itself (``self._price``), so a fill whose premium violates a
+        no-arbitrage bound by more than ``_ARB_FILL_TOLERANCE`` per share is rejected:
+
+          * ENTRY (opening intent, or intent unset): premium < intrinsic - tol, where
+            intrinsic = max(0, spot-strike) for a call / max(0, strike-spot) for a put.
+            Nobody sells an option below its immediate-exercise value; a lower print is
+            stale/indicative junk. (Applies to sell_to_open too — a junk-cheap CREDIT is
+            the same bad data and settles at the real intrinsic later.)
+          * EXIT (closing intent): premium > spot + tol for a CALL (a call can never cost
+            more than the stock) or premium > strike + tol for a PUT (a put can never be
+            worth more than the strike) — impossible premiums. A below-intrinsic CLOSE is
+            NOT rejected (a wide bid in a fast market is plausible), and expiry settlement
+            still guarantees the eventual exit via intrinsic, so a position cannot get
+            stuck forever.
+
+        The contract's strike/type come from the order, falling back to the premium bar's
+        own columns (minimal legs may not carry them). The spot reference is the
+        underlying's bar on the FILL day at the same price point as the fill model (open
+        for ``next_bar_open`` — the premium IS that bar's open — close for
+        ``same_bar_close``). Fails OPEN (debug log, no rejection) when the contract terms
+        are missing or the underlying has no bar on the fill day — a hermetic run may
+        legitimately lack one.
+        """
+        strike = getattr(order, "strike", None)
+        if strike is None:
+            strike = bar.get("strike")  # the cache bar carries the contract terms too
+        opt_type = getattr(order, "option_type", None) or bar.get("option_type")
+        if strike is None or opt_type is None:
+            logger.debug(
+                "[backtest] arb check skipped for %s: no strike/option_type on the order "
+                "or its premium bar.",
+                getattr(order, "contract_symbol", None),
+            )
+            return None
+        is_call = opt_type == OptionRight.CALL
+        strike = float(strike)
+        intent = (getattr(order, "position_intent", None) or "").lower()
+        is_close = "close" in intent
+        # The put upper bound needs no spot — check it before touching the price source.
+        if is_close and not is_call and fill_px > strike + _ARB_FILL_TOLERANCE:
+            return (
+                f"put premium {fill_px:.4f} exceeds strike {strike:.2f} + tolerance "
+                f"{_ARB_FILL_TOLERANCE} (a put can never be worth more than its strike)"
+            )
+
+        underlying = getattr(order, "underlying_symbol", None) or order.symbol
+        spot_bar = self._price.bar_at(underlying, fill_day)
+        spot = None
+        if spot_bar is not None:
+            spot = float(spot_bar["close"] if same_bar else spot_bar["open"])
+        if spot is None:
+            logger.debug(
+                "[backtest] arb check skipped for %s: no %s bar on %s (fail-open).",
+                order.contract_symbol, underlying, fill_day,
+            )
+            return None
+        if is_close:
+            # call close: a premium above the stock price itself is impossible.
+            if fill_px > spot + _ARB_FILL_TOLERANCE:
+                return (
+                    f"call premium {fill_px:.4f} exceeds spot {spot:.2f} + tolerance "
+                    f"{_ARB_FILL_TOLERANCE} (a call can never cost more than the stock)"
+                )
+            return None
+        intrinsic = max(0.0, (spot - strike) if is_call else (strike - spot))
+        if fill_px < intrinsic - _ARB_FILL_TOLERANCE:
+            return (
+                f"premium {fill_px:.4f} is below intrinsic {intrinsic:.4f} - tolerance "
+                f"{_ARB_FILL_TOLERANCE} (spot {spot:.2f}, strike {strike:.2f})"
+            )
+        return None
 
     def _child_legs(self, parent) -> List[TradingOrder]:
         """The not-yet-filled child leg orders of a multi-leg option parent.
@@ -2270,8 +2447,8 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
 
         This is a deterministic AT-EXPIRY settlement (no next-bar fill, no slippage/commission):
         the option simply resolves on its expiry bar. Returns True if the position was settled.
-        This is the settlement MECHANISM; whether a leg exercises physically or is sold to
-        close is decided by the Alpaca-mirror policy in ``settle_single_leg_expiry``.
+        This is the settlement MECHANISM; whether a leg is assigned physically or is sold to
+        close is decided by the no-orphaned-stock policy in ``settle_single_leg_expiry``.
 
         MULTI-LEG (strangle/straddle/spread) note: the two/four legs of a spread SHARE one
         ``Transaction`` whose ENTRY is the multi-leg PARENT (which carries NO ``contract_symbol``).
@@ -2325,32 +2502,28 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         return True
 
     def settle_single_leg_expiry(self, position: OptionPosition, spot: float) -> bool:
-        """Alpaca-mirror expiry for a SINGLE-LEG (non-defined-risk-combo) option position.
+        """Expiry settlement POLICY for a SINGLE-LEG (non-defined-risk-combo) option position.
 
-        Mirrors Alpaca's actual expiration handling (docs/support): an ITM long is
-        auto-exercised (>= $0.01 ITM) ONLY IF buying power / shares support it; if not,
-        Alpaca sells the option to close ~1h before expiry while still ITM. ITM shorts are
-        PHYSICALLY assigned after the close; unsupportable resulting positions are then
-        liquidated by the broker. Concretely:
+        Backtest expiry policy (no orphaned stock): a backtest strategy manages OPTIONS
+        (its exit rules are all ``close_option``), so any SHARE position an expiry leaves
+        behind would ride unmanaged to the end of the run — exercised ITM long calls riding
+        to 67-85% of final equity was the OS1 blow-up. Concretely:
 
           * OTM -> worthless (transaction closed at premium 0) — unchanged.
-          * LONG CALL ITM: exercise (BUY shares at strike) if ``strike x multiplier x
-            contracts <= cash``; otherwise SELL-TO-CLOSE at the expiry bar's premium close
-            (intrinsic when the sparse cache has no bar — near expiry premium ~ intrinsic).
-            NO share position, cash credited at the premium.
-          * LONG PUT ITM: exercise (SELL shares at strike). Supportable when held long
-            shares cover the delivery (protective put), OR — when it would create SHORT
-            stock — when equity covers the short's maintenance
-            (``SHORT_STOCK_MAINTENANCE_FRACTION x strike x multiplier x contracts``).
-            Otherwise SELL-TO-CLOSE like the call.
+          * LONG ITM (call or put): NEVER exercised. SELL-TO-CLOSE at the expiry bar's
+            premium close (intrinsic when the sparse cache has no bar — near expiry the
+            premium converges to intrinsic). NO share position is created; cash is credited
+            premium x multiplier x contracts exactly once.
           * SHORT ITM (call or put): ALWAYS physical assignment at the strike, covered or
-            naked. A short-put assignment that leaves cash NEGATIVE schedules a broker-style
-            cleanup: ``process_pending_assignment_liquidations`` sells just enough of the
-            ASSIGNED shares at the NEXT bar's open to restore cash >= 0. (Assigned SHORT
-            stock from a short call is already bounded by the 30% maintenance path.)
+            naked — the share leg is the real-world outcome and keeps the assignment loss
+            in the book. But the assigned stock is unmanaged here, so EVERY assignment
+            schedules a broker-style liquidation of the resulting stock at the NEXT bar's
+            open via ``process_pending_assignment_liquidations`` (not only the
+            cash-negative case, which previously sold just enough to restore cash >= 0 and
+            left the REST of the assigned shares orphaned).
 
-        Exercise/assignment cash always moves at the STRIKE; the sell-to-close credit is the
-        only premium-priced leg. Deterministic at-expiry settlement — no slippage/commission,
+        Assignment cash always moves at the STRIKE; the sell-to-close credit is the only
+        premium-priced leg. Deterministic at-expiry settlement — no slippage/commission,
         matching ``settle_option_expiry``. Defined-risk combos must NOT be routed here (they
         unit-settle via ``settle_defined_risk_combo_expiry``).
         """
@@ -2372,82 +2545,65 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 position, close_premium=intrinsic,
                 share_side=share_side, shares=shares, share_price=strike,
             )
-            if ok and share_side == OrderDirection.BUY and self._cash < 0:
-                # Assigned short put bought shares the account cannot fund: schedule the
-                # broker cleanup sale of (up to) the assigned shares at the next bar's open.
+            if ok:
+                # The assigned stock (long from a short put, short from a naked call) is an
+                # unmanaged orphan in a backtest: schedule its FULL liquidation at the next
+                # bar's open. Signed: +shares to SELL (long) / -shares to BUY back (short).
+                signed = float(shares) if share_side == OrderDirection.BUY else -float(shares)
                 self._pending_assignment_sells[position.underlying] = (
-                    self._pending_assignment_sells.get(position.underlying, 0.0) + shares
+                    self._pending_assignment_sells.get(position.underlying, 0.0) + signed
                 )
                 logger.warning(
-                    "[backtest] short-put assignment of %d x %s left cash $%.2f — scheduling "
-                    "assignment_liquidation of up to %d shares at the next bar's open.",
-                    shares, position.underlying, self._cash, shares,
+                    "[backtest] short-%s assignment of %d x %s at strike %.2f — scheduling "
+                    "assignment_liquidation of the assigned stock at the next bar's open "
+                    "(cash now $%.2f).",
+                    "call" if is_call else "put", shares, position.underlying, strike,
+                    self._cash,
                 )
             return ok
 
-        # LONG ITM: exercise only if the resulting position is supportable (Alpaca rule).
-        if is_call:
-            supported = strike * shares <= self._cash + 1e-6  # exercise cost fits in cash
-            share_side = OrderDirection.BUY
-        else:
-            pos = self._positions.get(position.underlying)
-            held = float(pos.qty) if (pos is not None and pos.qty > 0) else 0.0
-            if held >= shares:
-                supported = True  # protective put: delivers already-held shares
-            else:
-                # Exercising would create SHORT stock: supportable only when equity covers
-                # its maintenance requirement (the existing 30% short-stock rule).
-                supported = (
-                    self.equity()
-                    >= self.SHORT_STOCK_MAINTENANCE_FRACTION * strike * shares
-                )
-            share_side = OrderDirection.SELL
-        if supported:
-            return self.settle_option_expiry(
-                position, close_premium=intrinsic,
-                share_side=share_side, shares=shares, share_price=strike,
-            )
-
-        # NOT supportable -> Alpaca sells the long option to close shortly before expiry.
-        # Price at the expiry bar's premium close; intrinsic when the cache has no bar
-        # (near expiry the premium converges to intrinsic). Cash is credited at the premium;
-        # NO share position is created.
+        # LONG ITM -> SELL-TO-CLOSE, never exercise: the strategy's exits only manage
+        # options, so exercised stock would ride unmanaged to the end of the run. Price at
+        # the expiry bar's premium close; intrinsic when the cache has no bar (near expiry
+        # the premium converges to intrinsic). Cash is credited at the premium; NO share
+        # position is created.
         bar = self._options.get_bar(position.contract_symbol, self._as_of_date()) if self._options else None
         premium = float(bar["close"]) if (bar and bar.get("close") is not None) else float(intrinsic)
         self._cash += premium * multiplier * contracts
         logger.warning(
-            "[backtest] long %s %s ITM at expiry is NOT supportable (exercise needs %s) — "
-            "sold to close at %.4f (Alpaca pre-expiry liquidation).",
-            "call" if is_call else "put", position.contract_symbol,
-            f"${strike * shares:,.2f} cash" if is_call else "share/margin support", premium,
+            "[backtest] long %s %s ITM at expiry — sold to close at %.4f (backtests never "
+            "exercise; intrinsic %.4f).",
+            "call" if is_call else "put", position.contract_symbol, premium, intrinsic,
         )
         return self.settle_option_expiry(position, close_premium=premium)
 
     def process_pending_assignment_liquidations(self) -> bool:
-        """Broker-style cleanup of an unsupported short-put assignment (Alpaca-mirror).
+        """Broker-style liquidation of stock orphaned by a short-option assignment.
 
-        A short put is ALWAYS physically assigned at expiry, even when buying the shares at
-        the strike drives cash negative; the broker then liquidates enough of the resulting
-        position to restore buying power. Mirror that on the NEXT bar: sell just enough of
-        the ASSIGNED shares at this bar's OPEN to restore cash >= 0 — never more than were
-        assigned, never more than are still held. Each sale persists a synthetic FILLED
-        closing order (comment ``assignment_liquidation``) so the equity move is a visible
-        trade. A symbol with no bar this tick stays pending for the next bar. One dict check
-        when nothing is pending; equity-only runs never schedule anything.
+        A short option is ALWAYS physically assigned at expiry; the resulting stock
+        position (LONG from an assigned short put, SHORT from an assigned naked short
+        call) is unmanaged by option strategies, so the account closes ALL of it at the
+        NEXT bar's OPEN — never more than was assigned, never more than is still held in
+        that direction (a pre-existing position the strategy opened itself is untouched,
+        and an assignment that merely offset an opposite position leaves nothing to do).
+        Each liquidation persists a synthetic FILLED closing order (comment
+        ``assignment_liquidation``) so the equity move is a visible trade. A symbol with
+        no bar this tick stays pending for the next bar. One dict check when nothing is
+        pending; equity-only runs never schedule anything.
 
-        Returns True when any shares were sold.
+        Returns True when any shares were liquidated.
         """
         if not self._pending_assignment_sells:
             return False
-        sold_any = False
+        traded_any = False
         for symbol in list(self._pending_assignment_sells.keys()):
-            if self._cash >= 0:
-                self._pending_assignment_sells.pop(symbol)
-                continue
             assigned = self._pending_assignment_sells[symbol]
             pos = self._positions.get(symbol)
-            held = float(pos.qty) if pos is not None else 0.0
-            if held <= 0 or assigned <= 0:
+            qty = float(pos.qty) if pos is not None else 0.0
+            # +assigned -> SELL long stock; -assigned -> BUY BACK short stock. Bound by
+            # what is actually held in that direction right now.
+            held = qty if assigned > 0 else -qty
+            if assigned == 0 or held <= 0:
                 self._pending_assignment_sells.pop(symbol)  # nothing left to clean up
                 continue
             bar = self._price.bar_at(symbol)
@@ -2456,23 +2612,21 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             px = float(bar["open"])
             if px <= 0:
                 continue
-            to_sell = float(min(assigned, held, float(math.ceil(-self._cash / px))))
-            if to_sell <= 0:
-                self._pending_assignment_sells.pop(symbol)
-                continue
-            self._cash += to_sell * px
-            self._update_position(symbol, -to_sell, px)
+            to_close = float(min(abs(assigned), held))
+            signed = -to_close if assigned > 0 else to_close  # sell long / buy back short
+            self._cash -= signed * px
+            self._update_position(symbol, signed, px)
             self._record_stock_liquidation_close(
-                symbol, to_sell, was_long=True, px=px, comment="assignment_liquidation"
+                symbol, to_close, was_long=(assigned > 0), px=px, comment="assignment_liquidation"
             )
             logger.warning(
-                "[backtest] assignment_liquidation: sold %g x %s @ %.4f (next-bar open) to "
-                "restore cash >= 0 after short-put assignment; cash now $%.2f.",
-                to_sell, symbol, px, self._cash,
+                "[backtest] assignment_liquidation: %s %g x %s @ %.4f (next-bar open) — "
+                "assigned stock is unmanaged in a backtest; cash now $%.2f.",
+                "sold" if assigned > 0 else "bought back", to_close, symbol, px, self._cash,
             )
             self._pending_assignment_sells.pop(symbol)
-            sold_any = True
-        return sold_any
+            traded_any = True
+        return traded_any
 
     def defined_risk_combo_strategy(self, position: OptionPosition) -> Optional[str]:
         """Return the DEFINED-RISK ``option_strategy`` of the combo a leg belongs to, else None.

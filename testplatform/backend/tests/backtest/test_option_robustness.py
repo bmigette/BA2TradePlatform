@@ -111,9 +111,9 @@ def _chain_row(sym, ot, k):
             "bid": 1.0, "ask": 1.2, "last": 1.1, "iv": 0.25}
 
 
-def _bar(sym, d, close, ot, k, underlying=_UND):
+def _bar(sym, d, close, ot, k, underlying=_UND, vol=100):
     return {"occ_symbol": sym, "date": d, "open": float(close), "high": float(close),
-            "low": float(close), "close": float(close), "volume": 100,
+            "low": float(close), "close": float(close), "volume": vol,
             "underlying": underlying, "option_type": ot, "strike": float(k),
             "expiry": _EXPIRY}
 
@@ -235,6 +235,9 @@ class Combo:
         """
         rows = []
         seen = set()
+        # Bar volume must fit the WHOLE entry under the 10% volume-participation cap
+        # (fuzz combos reach 8 structures x ratio 2 = 16 contracts on one leg).
+        vol = max(100, 10 * self.quantity * max(r for (_o, _k, _d, r) in self.legs))
         for (ot, k, direction, _r) in self.legs:
             key = (ot, k)
             if key in seen:
@@ -248,8 +251,8 @@ class Combo:
                     # Wild outlier on a SHORT leg: a $500/share print (x contracts x 100) would,
                     # unclamped, mark the group thousands past defined risk. The clamp must cap it.
                     px = 500.0
-                rows.append(_bar(sym, ds, px, ot, k))
-            rows.append(_bar(sym, "2024-03-15", _intrinsic(ot, k, spot_at_expiry), ot, k))
+                rows.append(_bar(sym, ds, px, ot, k, vol=vol))
+            rows.append(_bar(sym, "2024-03-15", _intrinsic(ot, k, spot_at_expiry), ot, k, vol=vol))
         return rows
 
     def order_legs(self):
@@ -262,6 +265,32 @@ class Combo:
 # ---------------------------------------------------------------------------
 # run_lifecycle: submit -> fill -> step underlying -> expiry -> settle
 # ---------------------------------------------------------------------------
+def _entry_spot(combo: Combo) -> float:
+    """A spot at which EVERY leg's entry premium is arbitrage-consistent — premium >=
+    intrinsic (the fill guard rejects anything below intrinsic - tolerance).
+
+    For each call leg the premium bounds spot from above (px >= spot - k -> spot <= k+px);
+    for each put leg from below (px >= k - spot -> spot >= k-px). The consistent band's
+    midpoint is used (a dollar inside the single-sided bound when the combo has legs of
+    only one right). The entry day sits at this spot; the underlying then moves to
+    ``spot_at_expiry`` for the expiry regime — entry economics (and thus the test's
+    max_loss/max_profit teeth) are unchanged.
+    """
+    lo = hi = None
+    for (ot, k, _d, _r) in combo.legs:
+        px = combo.premiums[k][ot]
+        if ot == "call":
+            hi = k + px if hi is None else min(hi, k + px)
+        else:
+            lo = k - px if lo is None else max(lo, k - px)
+    if lo is not None and hi is not None:
+        return (lo + hi) / 2.0
+    if hi is not None:
+        return hi - 1.0
+    assert lo is not None, f"combo {combo.strategy} has no legs to bound an entry spot"
+    return lo + 1.0
+
+
 def run_lifecycle(tmp_path, tag: str, combo: Combo, spot_at_expiry: float,
                   underlying_path: Optional[List[float]] = None,
                   do_margin_call: bool = True) -> Dict[str, Any]:
@@ -271,10 +300,12 @@ def run_lifecycle(tmp_path, tag: str, combo: Combo, spot_at_expiry: float,
 
     Returns {equity_curve, snapshots, final_cash, final_equity, positions, option_positions}.
     """
-    # Underlying path: one close per step date. Default = flat at expiry spot for MTM bars,
-    # landing exactly on spot_at_expiry at expiry.
+    # Underlying path: one close per step date. Default = flat at the arbitrage-consistent
+    # ENTRY spot for the MTM bars (a premium below intrinsic at the fill would be junk the
+    # no-arbitrage fill guard rejects), landing exactly on spot_at_expiry at expiry.
     if underlying_path is None:
-        underlying_path = [spot_at_expiry] * len(_MTM_DATES) + [spot_at_expiry]
+        entry_spot = _entry_spot(combo)
+        underlying_path = [entry_spot] * len(_MTM_DATES) + [spot_at_expiry]
     assert len(underlying_path) == len(_ALL_STEP_DATES)
 
     def _und_bar(dt, close):
@@ -477,12 +508,15 @@ def _run_naked(tmp_path, tag, strategy, legs_spec, quantity, gap_spot):
     ps = _make_ps(_UND, und_bars, _D_START)
     chain = [_chain_row(_occ(ot, k), ot, k) for (ot, k, _p) in legs_spec]
     bar_rows = []
+    # Entry-bar volume must fit the whole naked entry under the 10% volume-participation
+    # cap (20/25 contracts per leg here); the blow-up bar only prices the margin buyback.
+    vol = max(100, 10 * quantity)
     for (ot, k, prem) in legs_spec:
         sym = _occ(ot, k)
-        bar_rows.append(_bar(sym, "2024-03-06", prem, ot, k))
+        bar_rows.append(_bar(sym, "2024-03-06", prem, ot, k, vol=vol))
         # A blow-up premium bar at the gap day so the buyback books the real (large) loss.
         blow = _intrinsic(ot, k, gap_spot) + 1.0
-        bar_rows.append(_bar(sym, "2024-03-08", blow, ot, k))
+        bar_rows.append(_bar(sym, "2024-03-08", blow, ot, k, vol=vol))
     acct, ctx = _account(tmp_path, tag, ps, _UND, chain, bar_rows, cfg=CFG)
     try:
         order_legs = [_leg(_occ(ot, k), OrderDirection.SELL, _right(ot), k)

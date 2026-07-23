@@ -123,3 +123,66 @@ pytest suite (`tests/`, 1031 passed) and the backend backtest suite
   **413 passed, 1 skipped**; parity gate `test_parity_golden.py` 3/3 before and after.
 - `packages/common/tests/`: 164 passed (run separately; duplicate-`conftest` import clash
   if combined with `tests/`).
+
+---
+
+# Follow-up: OS1 unrealistic-profit investigation (2026-07-23)
+
+Runs 765–769 (`TOPn-optm-FMPRating-OS1-pricetarget-v2`) showed $20k → $7.4M–18.6M
+(+37,000% to +92,000%). Root-caused against the DB, options cache, and external price
+data (underlying closes cross-verified against Yahoo Finance — the cache was correct):
+
+## Root causes
+
+1. **Exercised ITM long calls became unmanaged buy-and-hold stock (67–85% of final
+   equity in every run).** Expiry physically exercised supportable ITM longs → stock at
+   strike; the option ruleset's `close_option` exits don't manage stock, so positions
+   rode the 2024→2026 rally to end-of-run (AMD @141→581, MU @88→1154, GEV @282→1175).
+   Also a reporting double-count: the exercised leg booked option P&L at intrinsic while
+   the same intrinsic persisted as stock MTM (cash/equity were correct; round-trip
+   reports summed it twice).
+2. **Arbitrage-inconsistent option prints (indicative feed).** AZN 105C bought at $0.01
+   with spot $159.85 (intrinsic $54.85) → +$1.53M fabricated (49% of the run's closed
+   P&L). No engine check compared premium to intrinsic.
+3. **No liquidity constraint.** 2,100 contracts filled at a V=1 print; 281 at V=12.
+4. Compounding percent-of-equity sizing amplified all of the above.
+
+## Fixes (all in `testplatform/backend/app/services/backtest/backtest_account.py` unless noted)
+
+- **Expiry policy** — long ITM options now SELL-TO-CLOSE at expiry premium (intrinsic
+  fallback), never exercise → no orphaned stock. Short-option assignment still creates
+  stock at strike, but it is now *always* liquidated at the next bar open (previously
+  only when cash went negative, and only partially). (`settle_single_leg_expiry`,
+  `process_pending_assignment_liquidations`)
+- **Arb-consistency guard** — `_ARB_FILL_TOLERANCE = 0.05`: entry fills with
+  `premium < intrinsic − tol` are rejected (retry next bar; counter
+  `rejected_arb_fills`); exit fills with call `premium > spot + tol` / put
+  `premium > strike + tol` rejected. Spot taken from the fill-day underlying bar
+  (open for next_bar_open, close for same_bar_close). Fail-open when terms/spot
+  unavailable. Any failing leg blocks the whole multi-leg combo.
+- **Volume participation cap** — `_OPTION_FILL_MAX_VOLUME_PARTICIPATION = 0.10`: an
+  order (per leg for combos, all-or-none) fills only when required contracts ≤ 10% of
+  the fill bar's volume; else retry next bar. None/0 volume → no fill. Counter
+  `rejected_illiquid_fills`.
+- **`--feed` flag wired** (`fetch_options.py`) — `build_cache` now actually passes the
+  feed to Alpaca via `_FedOptionBarsRequest` (alpaca-py 0.43.4's `OptionBarsRequest`
+  has no `feed` field and silently drops unknown kwargs — the subclass + `OptionsFeed`
+  enum mapping is validated to emit `feed` in the wire params). Values: `indicative`
+  (default, unchanged), `opra`. **Action needed:** rebuild the options cache with
+  `--feed opra` (requires an OPRA-capable Alpaca subscription) to get trades-based
+  bars + real volumes, then re-run OS1.
+
+## Tests
+
+- New: `test_option_orphan_stock_and_arb_guards.py` (8), `test_fetch_options_feed.py`
+  (6), `test_option_volume_participation.py` (6).
+- Fixtures updated where old test data was itself junk (arb-inconsistent premiums) or
+  oversized vs the 10% cap — assertions kept, data made realistic.
+- Backtest suite: 435 passed + parity gate 3/3. Live suite: 1031 passed.
+
+## Note on universe
+
+Run 765 traded 67 underlyings — all large/mega-caps (AAPL, MSFT, JPM, …). The
+illiquidity was at the **option-contract** level (deep-OTM/short-dated strikes with
+single-digit daily volume), not the underlying level — which is why the volume cap
+matters even for a large-cap-only universe.

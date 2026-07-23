@@ -83,9 +83,9 @@ def _c(sym, strike):
             "expiry": "2024-03-15", "bid": 1.0, "ask": 1.2, "last": 1.1, "iv": 0.25}
 
 
-def _bar(sym, d, o, strike):
+def _bar(sym, d, o, strike, v=100):
     return {"occ_symbol": sym, "date": d, "open": o, "high": o, "low": o, "close": o,
-            "volume": 100, "underlying": "AAPL", "option_type": "call",
+            "volume": v, "underlying": "AAPL", "option_type": "call",
             "strike": strike, "expiry": "2024-03-15"}
 
 
@@ -113,10 +113,12 @@ def test_butterfly_fill_debit_capped_to_cash(tmp_path):
     # Analysis-time quotes were cheap; the FILL premiums (2024-03-06 open) are absurdly high:
     # per-structure debit = low(90) + high(30) - 2*body(20) = 90 + 30 - 40 = 80 /share -> $8000.
     chain = [_c(_LOW, 170.0), _c(_BODY, 180.0), _c(_HIGH, 190.0)]
+    # Bar volume sized so the 10% volume-participation cap admits the whole 20-structure
+    # entry (the ratio-2 body leg needs 40 contracts) — this test exercises the CASH cap.
     bars = [
-        _bar(_LOW, "2024-03-06", 90.0, 170.0),
-        _bar(_BODY, "2024-03-06", 20.0, 180.0),
-        _bar(_HIGH, "2024-03-06", 30.0, 190.0),
+        _bar(_LOW, "2024-03-06", 90.0, 170.0, v=1000),
+        _bar(_BODY, "2024-03-06", 20.0, 180.0, v=1000),
+        _bar(_HIGH, "2024-03-06", 30.0, 190.0, v=1000),
     ]
     acct, ps, ctx = _base_account(tmp_path, chain, bars)
     try:

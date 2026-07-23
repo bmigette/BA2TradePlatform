@@ -182,6 +182,21 @@ def _alpaca_keys(key: Optional[str] = None, secret: Optional[str] = None) -> Tup
     return key, secret
 
 
+def _options_feed(feed: str) -> Any:
+    """Resolve the CLI/build_cache ``feed`` string to alpaca's ``OptionsFeed`` enum, matching its
+    values case-insensitively ("indicative" / "opra"). Fails LOUD on anything else — no silent
+    fallback to the default feed: which feed the bars come from is a data-correctness choice
+    (the indicative feed's quote-derived prints can be arbitrage-inconsistent with the
+    underlying), so a typo must error, not silently fetch the wrong feed."""
+    from alpaca.data.enums import OptionsFeed
+    by_value = {f.value: f for f in OptionsFeed}
+    try:
+        return by_value[str(feed).strip().lower()]
+    except KeyError:
+        raise ValueError(
+            f"invalid options feed {feed!r}; valid values: {sorted(by_value)}") from None
+
+
 # Default risk-free rate used when FRED is unreachable/unconfigured. Rho (rate sensitivity) is
 # the smallest-impact Greek for short-dated equity options, so a rough constant is a far smaller
 # error source than the close-price-based IV itself — this is a documented fallback, not a
@@ -353,20 +368,36 @@ def build_cache(cache_db: str, underlyings: List[str], start: date, end: date,
     discovery) authenticates against. A LIVE-only key has no paper-account counterpart and is
     REJECTED (40110000 "request is not authorized") if paper=True — pass paper=False when
     ``api_key``/``api_secret`` are a live account's keys. Contract discovery is read-only
-    (GetOptionContractsRequest), so paper=False here places no live orders."""
+    (GetOptionContractsRequest), so paper=False here places no live orders.
+
+    ``feed`` selects the Alpaca options data feed the daily BARS are fetched from
+    ("indicative", the free default, or "opra", trades — requires the OPRA subscription). It
+    is honored on every option-data request below; an invalid value raises ValueError before
+    any network call."""
     import os as _os
     import threading
     from concurrent.futures import ThreadPoolExecutor
     from alpaca.trading.client import TradingClient
     from alpaca.data.historical.option import OptionHistoricalDataClient
+    from alpaca.data.enums import OptionsFeed
     from alpaca.data.requests import OptionBarsRequest
     from alpaca.data.timeframe import TimeFrame
     from ba2_providers import get_provider
     if start < _OPTIONS_HISTORY_FLOOR:
         raise ValueError(
             f"Alpaca options history starts {_OPTIONS_HISTORY_FLOOR.isoformat()}; pick a later --start")
+    options_feed = _options_feed(feed)   # fail loud on a bad feed BEFORE any network/cred work
     key, secret = _alpaca_keys(api_key, api_secret)
     cache = OptionsHistoryCache(cache_db)
+
+    # alpaca-py (0.43.4) gives OptionBarsRequest NO feed field (only the snapshot/chain/latest
+    # option request classes carry one) and its pydantic models silently IGNORE unknown kwargs,
+    # so feed= on the base class would be a silent no-op — the exact dead-flag bug this guards
+    # against. Declaring the field via a subclass makes to_request_fields() emit `feed`, which
+    # the /options/bars endpoint honors (same serialization path as the SDK's own feed-bearing
+    # request classes).
+    class _FedOptionBarsRequest(OptionBarsRequest):
+        feed: Optional[OptionsFeed] = None
 
     expiry_gte = start.isoformat()
     expiry_lte = (end + timedelta(days=_EXPIRY_TAIL_DAYS)).isoformat()
@@ -423,9 +454,9 @@ def build_cache(cache_db: str, underlyings: List[str], start: date, end: date,
             for i in range(0, len(syms), _OPTION_BARS_BATCH):
                 chunk = syms[i:i + _OPTION_BARS_BATCH]
                 resp = _with_retry(
-                    lambda chunk=chunk: dc.get_option_bars(OptionBarsRequest(
+                    lambda chunk=chunk: dc.get_option_bars(_FedOptionBarsRequest(
                         symbol_or_symbols=chunk, timeframe=TimeFrame.Day,
-                        start=start_iso, end=end_iso)),
+                        start=start_iso, end=end_iso, feed=options_feed)),
                     what=f"bars {u} [{i // _OPTION_BARS_BATCH + 1}]")
                 for s, blist in (resp.data or {}).items():
                     bars_by_sym[s] = blist
@@ -490,7 +521,12 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="ba2-test fetch-options")
     ap.add_argument("--underlyings", required=True, help="comma list or @file")
     ap.add_argument("--start", required=True); ap.add_argument("--end", required=True)
-    ap.add_argument("--cache-db", required=True); ap.add_argument("--feed", default="indicative")
+    ap.add_argument("--cache-db", required=True)
+    ap.add_argument("--feed", default="indicative",
+                    help="options data feed the daily bars are fetched from — 'indicative' "
+                         "(default, free; quote-derived prints) or 'opra' (trades; requires "
+                         "the OPRA subscription). Honored on the bars request; invalid values "
+                         "are rejected.")
     ap.add_argument("--strike-min", type=float, default=None, help="narrow strikes >= this")
     ap.add_argument("--strike-max", type=float, default=None, help="narrow strikes <= this")
     ap.add_argument("--max-contracts", type=int, default=None,

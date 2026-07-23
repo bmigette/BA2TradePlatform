@@ -11,9 +11,10 @@ end over a fixture options cache and proves the three pieces work TOGETHER:
   2. MARK  : while held, each bar's ``snapshot_equity`` values the option at the current
              premium close x qty x multiplier (the equity curve tracks the premium).
   3. EXPIRY: on the expiry bar the underlying closes ITM (200 > strike 180), so the engine's
-             per-bar ``_apply_option_expiry`` exercises the call -> the option position is
-             gone AND a LONG equity position of 100 AAPL shares at the strike (180) exists,
-             with the final NLV reflecting the exercise.
+             per-bar ``_apply_option_expiry`` SELLS THE CALL TO CLOSE at intrinsic (a
+             backtest never exercises — no orphaned stock) -> the option position is gone,
+             cash is credited the intrinsic premium, and NO equity position is created,
+             with the final NLV reflecting the settlement.
 
 Harness: modelled on ``test_daily_engine_stop.py`` (fresh trading DB + seam wiring + seeded
 account/expert + ``AsOfPriceSource`` + ``DailyBacktestEngine(...).run()``). The expert is a
@@ -54,24 +55,26 @@ END = datetime(2024, 2, 7)
 
 # Underlying daily OHLCV. The clock starts 2024-02-01 (entry/submit bar); the call fills
 # next_bar_open at 2024-02-02. The underlying climbs and ENDS the expiry day (2024-02-07)
-# at close 200 > strike 180 -> the call is deep ITM and exercises.
+# at close 200 > strike 180 -> the call is deep ITM and settles at intrinsic.
 #                       (date,            open, high, low,  close)  weekday
 _AAPL_BARS = [
     (date(2024, 2, 1), 185, 186, 184, 185),   # Thu -> submit/entry bar (clock starts)
-    (date(2024, 2, 2), 186, 188, 185, 187),   # Fri -> fill bar (call fills @ open premium 2.0)
+    (date(2024, 2, 2), 186, 188, 185, 187),   # Fri -> fill bar (call fills @ open premium 6.5)
     (date(2024, 2, 5), 188, 191, 187, 190),   # Mon -> held / marked
     (date(2024, 2, 6), 191, 196, 190, 195),   # Tue -> held / marked
-    (date(2024, 2, 7), 198, 201, 197, 200),   # Wed -> EXPIRY: close 200 > 180 -> ITM exercise
+    (date(2024, 2, 7), 198, 201, 197, 200),   # Wed -> EXPIRY: close 200 > 180 -> ITM settle
 ]
 
-# Per-contract premium bars across the holding period. The fill bar (2024-02-02) opens at
-# 2.0 (the entry premium); the premium then RISES 2.0 -> 3.0 across the hold (marking tracks
-# the close). No premium bar on the expiry day is needed (expiry resolves off the underlying).
+# Per-contract premium bars across the holding period — ARBITRAGE-CONSISTENT with the
+# underlying (a premium below intrinsic would be junk the fill guard rejects): the fill
+# bar (2024-02-02) opens at 6.5 (entry premium; intrinsic is 186-180 = 6), and the premium
+# tracks intrinsic as spot rises (marks at close 10.5 / 15.5). No premium bar on the
+# expiry day is needed (expiry resolves off the underlying at intrinsic).
 #               (date,            open, high, low, close)
 _PREMIUM_BARS = [
-    (date(2024, 2, 2), 2.0, 2.3, 1.9, 2.2),   # fill bar: open 2.0 (entry premium)
-    (date(2024, 2, 5), 2.2, 2.7, 2.1, 2.5),   # marked @ close 2.5
-    (date(2024, 2, 6), 2.5, 3.2, 2.4, 3.0),   # marked @ close 3.0 (premium peaked)
+    (date(2024, 2, 2), 6.5, 6.8, 6.4, 6.7),   # fill bar: open 6.5 (entry premium)
+    (date(2024, 2, 5), 10.2, 10.7, 10.1, 10.5),   # marked @ close 10.5
+    (date(2024, 2, 6), 15.2, 15.7, 15.1, 15.5),   # marked @ close 15.5
 ]
 
 CFG = {
@@ -139,9 +142,9 @@ def _seed_cache(db_path: str) -> None:
                 "option_type": "call",
                 "strike": _STRIKE,
                 "expiry": _EXPIRY.isoformat(),
-                "bid": 1.9,
-                "ask": 2.1,
-                "last": 2.0,
+                "bid": 6.4,
+                "ask": 6.6,
+                "last": 6.5,
                 "iv": 0.25,
             },
         ],
@@ -249,9 +252,10 @@ def engine_run(tmp_path):
         ctx.__exit__(None, None, None)
 
 
-def test_engine_e2e_option_fill_mark_and_exercise(engine_run):
+def test_engine_e2e_option_fill_mark_and_expiry_settles_itm(engine_run):
     """End-to-end: the long call FILLS, is MARKED on the equity curve, and at expiry (ITM)
-    converts to a 100-share AAPL position at the strike, with the final NLV reflecting it."""
+    is SOLD TO CLOSE at intrinsic — no share position is created and the final NLV
+    reflects the intrinsic settlement."""
     engine, account, expert, ps = engine_run
 
     results = engine.run()
@@ -260,36 +264,31 @@ def test_engine_e2e_option_fill_mark_and_exercise(engine_run):
     # (The held option was marked while open; the curve carries an equity_value at premium x 100.)
     history = account.get_balance_history()
     assert history, "expected per-bar equity snapshots"
-    # The premium-close marks over the hold are 2.5 (02-05) and 3.0 (02-06): 250 and 300.
+    # The premium-close marks over the hold are 10.5 (02-05) and 15.5 (02-06): 1050 and 1550.
     marked_values = {round(s["equity_value"], 6) for s in history}
-    assert 2.5 * _MULTIPLIER in marked_values, (
-        f"expected an equity point marking the option at premium 2.5 x 100, got {marked_values}"
+    assert 10.5 * _MULTIPLIER in marked_values, (
+        f"expected an equity point marking the option at premium 10.5 x 100, got {marked_values}"
     )
-    assert 3.0 * _MULTIPLIER in marked_values, (
-        f"expected an equity point marking the option at premium 3.0 x 100, got {marked_values}"
+    assert 15.5 * _MULTIPLIER in marked_values, (
+        f"expected an equity point marking the option at premium 15.5 x 100, got {marked_values}"
     )
 
-    # --- Assertion 2: at expiry the option is GONE and a 100-share LONG AAPL @ strike exists ---
+    # --- Assertion 2: at expiry the option is GONE and NO share position was created ---
     assert account.get_option_positions() == [], (
-        "expected the call exercised/closed at expiry, none held"
+        "expected the call sold to close at expiry, none held"
     )
-    positions = account.get_positions()
-    aapl = [p for p in positions if p["symbol"] == "AAPL"]
-    assert len(aapl) == 1, f"expected exactly one AAPL equity position, got {aapl}"
-    assert aapl[0]["qty"] == 100, f"expected 100 shares from exercise, got {aapl[0]['qty']}"
-    assert aapl[0]["avg_price"] == pytest.approx(_STRIKE), (
-        f"expected shares settled at the strike (180), got {aapl[0]['avg_price']}"
+    assert [p for p in account.get_positions() if p["symbol"] == "AAPL"] == [], (
+        "backtests never exercise: expected NO AAPL equity position"
     )
 
-    # --- Assertion 3: the final NLV reflects the exercise (deterministic, computed below) ---
-    #   start cash 100,000; buy 1 call @ 2.0 x 100 = -200 -> cash 99,800;
-    #   exercise: buy 100 AAPL @ strike 180 = -18,000 -> cash 81,800;
-    #   shares marked at the expiry-day close 200 -> equity_value 100 x 200 = 20,000;
-    #   final NLV = 81,800 + 20,000 = 101,800 (net +1,800 = 100 x (200-180) - 200 premium).
-    assert account.get_balance() == pytest.approx(99_800.0 - 18_000.0)  # 81,800 cash
+    # --- Assertion 3: the final NLV reflects the intrinsic settlement (deterministic) ---
+    #   start cash 100,000; buy 1 call @ 6.5 x 100 = -650 -> cash 99,350;
+    #   expiry: sold to close at intrinsic (200-180) = 20 x 100 = +2,000 -> cash 101,350;
+    #   no positions -> final NLV = 101,350 (net +1,350 = intrinsic 2,000 - premium 650).
+    assert account.get_balance() == pytest.approx(101_350.0)
     final_nlv = account.equity()
-    assert final_nlv == pytest.approx(101_800.0), f"final NLV {final_nlv} != 101,800"
-    assert results["final_equity"] == pytest.approx(101_800.0)
+    assert final_nlv == pytest.approx(101_350.0), f"final NLV {final_nlv} != 101,350"
+    assert results["final_equity"] == pytest.approx(101_350.0)
     assert results["initial_capital"] == pytest.approx(100_000.0)
     # Deep-ITM call -> the run ENDED above the starting capital.
     assert final_nlv > results["initial_capital"]

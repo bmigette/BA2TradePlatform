@@ -361,7 +361,7 @@ def test_multi_leg_spread_is_all_or_none_when_one_leg_lacks_a_bar(options_accoun
 # ======================================================================
 # B3: ratio-weighted parent open_price for ratio'd structures (1-2-1, 1-2)
 # ======================================================================
-_OCC_BF_LOW = "AAPL240315C00170000"   # butterfly lower wing (170 call)
+_OCC_BF_LOW = "AAPL240315C00175000"   # butterfly lower wing (175 call)
 _OCC_PR_LONG = "AAPL240315P00180000"  # put-ratio long leg (180 put)
 _OCC_PR_SHORT = "AAPL240315P00170000"  # put-ratio short leg (170 put)
 
@@ -391,10 +391,11 @@ def _bar_row(occ, o, ot, strike, d="2024-03-06", c=None, h=None, l=None):
 def test_butterfly_parent_open_price_is_ratio_weighted(options_account, tmp_path):
     """1-2-1 call butterfly: parent open_price = Σ(sign x premium x ratio) PER STRUCTURE.
 
-    Legs fill at their bar opens: buy 1x 170c @8.0, sell 2x 180c @4.0, buy 1x 190c @1.5.
+    Legs fill at their bar opens: buy 1x 175c @8.0, sell 2x 180c @4.0, buy 1x 190c @1.5.
     Ratio-weighted net debit = 8.0 - 2*4.0 + 1.5 = 1.5 per share per structure (the OLD
     unweighted math gave 8.0 - 4.0 + 1.5 = 5.5). Cash still moves PER LEG, so the total
-    debit equals open_price x 100 x structures.
+    debit equals open_price x 100 x structures. (175 strike so the 8.0 premium is
+    arbitrage-consistent with spot 181 — intrinsic 6 — under the junk-print fill guard.)
     """
     from ba2_common.core.option_types import OptionLeg
     from ba2_common.core.types import OptionRight
@@ -402,7 +403,7 @@ def test_butterfly_parent_open_price_is_ratio_weighted(options_account, tmp_path
     acct, ps = options_account
     _seed_short_leg_bar(str(tmp_path / "options_cache.sqlite"))  # 190c bar (open 1.5)
     _seed_extra_bars(str(tmp_path / "options_cache.sqlite"),
-                     [_bar_row(_OCC_BF_LOW, 8.0, "call", 170.0)])
+                     [_bar_row(_OCC_BF_LOW, 8.0, "call", 175.0)])
     cash_before = acct.get_balance()
 
     def _leg(sym, side, ratio, strike):
@@ -414,7 +415,7 @@ def test_butterfly_parent_open_price_is_ratio_weighted(options_account, tmp_path
         )
 
     parent = acct.submit_option_order(
-        legs=[_leg(_OCC_BF_LOW, OrderDirection.BUY, 1, 170.0),
+        legs=[_leg(_OCC_BF_LOW, OrderDirection.BUY, 1, 175.0),
               _leg(_OCC, OrderDirection.SELL, 2, 180.0),
               _leg(_OCC_SHORT, OrderDirection.BUY, 1, 190.0)],
         quantity=1, order_type="market", option_strategy="call_butterfly",
@@ -503,7 +504,7 @@ def _extend_to_0307(ps, db_path, option_open_0307):
 
 def test_limit_buy_above_market_does_not_fill_then_fills_on_cross(options_account, tmp_path):
     """BUY_LIMIT 3.0 vs bar open 4.0: NO fill (stays working, cash untouched). When the
-    next fill bar opens at 2.5 (<= limit), it fills AT THE BAR PRICE (better than limit)."""
+    next fill bar opens at 3.0 (<= limit), it fills AT THE BAR PRICE (never worse)."""
     acct, ps = options_account
     cache_db = str(tmp_path / "options_cache.sqlite")
     order = _submit_limit_buy_call(acct, 3.0)
@@ -516,17 +517,18 @@ def test_limit_buy_above_market_does_not_fill_then_fills_on_cross(options_accoun
     assert acct.get_option_positions() == []
     assert acct.get_balance() == pytest.approx(cash_before)
 
-    # Next bar (2024-03-07) opens at 2.5 <= 3.0 -> crosses -> fills at 2.5 (bar price is
-    # better than the limit), NOT at the limit and NOT at 4.0.
-    _extend_to_0307(ps, cache_db, 2.5)
+    # Next bar (2024-03-07) opens at 3.0 <= 3.0 -> crosses -> fills at the bar price 3.0,
+    # NOT at 4.0. (3.0 is also arbitrage-consistent: intrinsic at the 03-07 open 183 is
+    # 3.0 — a lower print would be junk the no-arbitrage guard rejects.)
+    _extend_to_0307(ps, cache_db, 3.0)
     ps.set_clock(datetime(2024, 3, 6))
     acct.refresh_orders()
     acct.refresh_transactions()
     filled = acct.get_order(order.id)
     assert filled.status == OrderStatus.FILLED
-    assert filled.open_price == pytest.approx(2.5)
+    assert filled.open_price == pytest.approx(3.0)
     commission = CFG["commission_per_trade"]
-    assert acct.get_balance() == pytest.approx(cash_before - 2.5 * 100 - commission)
+    assert acct.get_balance() == pytest.approx(cash_before - 3.0 * 100 - commission)
 
 
 def test_limit_sell_below_market_does_not_fill_then_fills_on_cross(options_account, tmp_path):
