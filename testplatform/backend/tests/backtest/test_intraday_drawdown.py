@@ -258,3 +258,51 @@ def test_refine_never_improves_on_the_daily_figure():
         bars_5m_between=lambda sym, entry, exit_: [{"Low": 99.0, "High": 101.0}],  # mild-only dip
     )
     assert refined == pytest.approx(-2.0)
+
+
+def test_refine_does_not_accumulate_additively_across_many_flagged_trades():
+    """Regression: a 251-trade live run's refined drawdown reached -101.71% (worse than a total
+    wipeout) while the raw equity curve's real peak-to-trough was only -41%. Root cause: each
+    flagged trade's candidate was computed against the RUNNING (already-adjusted) `refined`
+    value instead of the original `max_drawdown`, so N unrelated trades on different dates --
+    whose hypothetical worst cases are mutually exclusive, they can't all have hit the SAME
+    equity trough at once -- stacked additively without bound. 20 trades each contributing a
+    modest -3pp individually must NOT sum to -60pp; the result must be bounded by the worst
+    SINGLE trade's contribution."""
+    trades = [_make_trade(entry_time=datetime(2024, 4, i + 1), exit_time=datetime(2024, 4, i + 2))
+              for i in range(1, 21)]  # 20 separate, non-overlapping flagged trades
+    refined = refine_max_drawdown(
+        trades,
+        max_drawdown=-2.0,
+        equity_at=lambda dt: 20_000.0,
+        daily_bar_low=lambda sym, dt: 100.0,
+        prior_daily_bar_low=lambda sym, dt: 105.0,
+        delta_at_entry=lambda underlying, contract, dt: 0.5,
+        underlying_price_at=lambda sym, dt: 100.0,
+        bars_5m_between=lambda sym, entry, exit_: [{"Low": 90.0, "High": 101.0}],
+    )
+    # Each trade individually implies candidate_dd = -2.0 + (-600/20000*100) = -5.0 (same math as
+    # test_refine_worsens_drawdown_for_flagged_trade_with_hidden_dip). With 20 trades, the OLD
+    # (buggy) additive-accumulation behavior would reach roughly -2.0 + 20*-3.0 = -62.0. The
+    # fixed behavior must land at exactly the worst SINGLE trade's candidate, -5.0.
+    assert refined == pytest.approx(-5.0)
+
+
+def test_refine_is_hard_floored_at_negative_100_percent():
+    """Drawdown relative to total equity cannot mathematically exceed -100% (that would mean
+    losing more than the entire equity), even as a hypothetical worst-case estimate. A trade
+    whose implied extra loss would push the candidate past that must be clamped."""
+    trade = _make_trade()
+    refined = refine_max_drawdown(
+        [trade],
+        max_drawdown=-2.0,
+        equity_at=lambda dt: 100.0,  # tiny equity relative to the loss -> candidate blows past -100%
+        daily_bar_low=lambda sym, dt: 100.0,
+        prior_daily_bar_low=lambda sym, dt: 105.0,
+        delta_at_entry=lambda underlying, contract, dt: 0.5,
+        underlying_price_at=lambda sym, dt: 100.0,
+        bars_5m_between=lambda sym, entry, exit_: [{"Low": 90.0, "High": 101.0}],
+    )
+    # extra_loss = -600 against equity=100 -> candidate_dd = -2.0 + (-600/100*100) = -602.0,
+    # must be floored to exactly -100.0.
+    assert refined == pytest.approx(-100.0)

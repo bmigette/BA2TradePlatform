@@ -104,6 +104,16 @@ def refine_max_drawdown(
     makes the result MORE negative (a worse drawdown) than the input; never improves on the
     daily-computed figure, since the daily curve is authoritative and this is a refinement on
     top of it, not a replacement.
+
+    Each flagged trade's candidate is computed against the ORIGINAL ``max_drawdown``, not the
+    running ``refined`` value -- these are separate, non-overlapping trades on different dates
+    whose hypothetical worst cases are mutually exclusive (they can't all have happened to the
+    SAME equity trough at once). Accumulating them additively across hundreds of trades would
+    make the result worsen without bound purely from trade COUNT, not from any single real
+    dip -- confirmed live: a 251-trade run's refined drawdown reached -101.71% (worse than a
+    total account wipeout) while the actual equity curve's peak-to-trough was only -41%. The
+    result is also hard-floored at -100%: drawdown relative to total equity cannot exceed that
+    even as a hypothetical estimate.
     """
     refined = max_drawdown
     for t in trades:
@@ -141,9 +151,9 @@ def refine_max_drawdown(
             equity = equity_at(t.get("entry_time"))
             if not equity:
                 continue
-            candidate_dd = refined + (extra_loss / equity * 100.0)
+            candidate_dd = max_drawdown + (extra_loss / equity * 100.0)
             refined = min(refined, candidate_dd)
         except Exception as e:  # noqa: BLE001 - best-effort refinement, never break the backtest
             logger.debug(f"intraday drawdown refinement skipped for a trade: {e}")
             continue
-    return refined
+    return max(refined, -100.0)
