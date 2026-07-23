@@ -497,7 +497,29 @@ class AccountInterface(ReadOnlyAccountInterface):
             if transaction.quantity != total_quantity:
                 old_qty = transaction.quantity
                 transaction.quantity = total_quantity
-                update_instance(transaction)
+                from ba2_common.core.trade_store import inmem_trades_active
+                if inmem_trades_active():
+                    # Backtest in-mem store: `transaction` IS the stored object (same
+                    # identity), so this mutation is already reflected -- update_instance
+                    # is a safe, tested no-op persist here (see db.update_instance's
+                    # _inmem_route branch).
+                    update_instance(transaction)
+                else:
+                    # LIVE (SQLite): do NOT call update_instance(transaction) here. That
+                    # helper copies EVERY attribute from this in-memory `transaction` object
+                    # onto the DB row, so if some OTHER field (e.g. take_profit/stop_loss)
+                    # was set by a different session after THIS object was fetched -- which
+                    # is exactly what happens here: this runs right after the entry order is
+                    # submitted, moments after the ruleset's TP/SL adjustment committed in
+                    # its own session -- that write gets silently reverted (found 2026-07-22:
+                    # a live goal6 TP was set by the ruleset, then wiped back to None by this
+                    # exact call). Fetch fresh and set only `.quantity` so the commit only
+                    # ever touches that one column.
+                    with get_db() as session:
+                        db_txn = session.get(Transaction, transaction_id)
+                        if db_txn:
+                            db_txn.quantity = total_quantity
+                            session.commit()
                 logger.info(
                     f"Transaction {transaction_id} quantity recalculated: {old_qty} -> {total_quantity} "
                     f"(from {valid_count} valid market entry orders)"
