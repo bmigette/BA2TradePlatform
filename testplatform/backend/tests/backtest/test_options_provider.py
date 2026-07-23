@@ -1,5 +1,6 @@
 # backend/tests/backtest/test_options_provider.py
 from datetime import date
+import pytest
 import app.services.backtest.options_provider as op
 from app.services.backtest.options_cache import OptionsHistoryCache
 from app.services.backtest.options_provider import HistoricalOptionsProvider
@@ -135,3 +136,125 @@ def test_chain_and_bar_cache_are_lru_bounded(monkeypatch, tmp_path):
     # AAA was the least-recently-used entry (evicted first).
     assert (db, "AAA") not in op._WORKER_CHAIN_CACHE
     assert (db, "BBB") in op._WORKER_CHAIN_CACHE and (db, "CCC") in op._WORKER_CHAIN_CACHE
+
+
+# ---------------------------------------------------------------------------
+# 2026-07-22 bug B4: point-in-time quotes. The chain row's bid/ask/last are the cache
+# build's START-DATE snapshot and go stale weeks into a backtest — when a per-date bar
+# exists, quotes derive from the bar close (last = close; bid/ask = close ± half the
+# snapshot's absolute spread). With no bar the chain-row snapshot is kept exactly.
+# ---------------------------------------------------------------------------
+def _seed_b4(db):
+    c = OptionsHistoryCache(db)
+    c.write_chain_rows("AAPL", "2024-03-01", [
+        {"occ_symbol":"AAPL240419C00180000","option_type":"call","strike":180.0,"expiry":"2024-04-19",
+         "bid":2.0,"ask":2.2,"last":2.1,"iv":0.25,"delta":0.5,"gamma":0.01,"theta":-0.03,"vega":0.1,
+         "open_interest":1000,"volume":50},
+        {"occ_symbol":"AAPL240419P00180000","option_type":"put","strike":180.0,"expiry":"2024-04-19",
+         "bid":None,"ask":None,"last":None,"iv":0.27,"delta":-0.5,"gamma":0.01,"theta":-0.03,
+         "vega":0.1,"open_interest":900,"volume":40}])
+    c.write_bar_rows([{"occ_symbol":"AAPL240419C00180000","date":"2024-03-05","open":2.9,"high":3.2,
+        "low":2.8,"close":3.0,"volume":120,"underlying":"AAPL","option_type":"call","strike":180.0,
+        "expiry":"2024-04-19"},
+        {"occ_symbol":"AAPL240419P00180000","date":"2024-03-05","open":1.4,"high":1.6,
+        "low":1.3,"close":1.5,"volume":80,"underlying":"AAPL","option_type":"put","strike":180.0,
+        "expiry":"2024-04-19"}])
+    return c
+
+def test_chain_quotes_derived_from_bar_close(tmp_path):
+    """Bar close moved vs the start-date snapshot premium -> bid/ask/last come from the bar."""
+    op.clear_worker_options_cache()
+    db = str(tmp_path / "opt.db"); _seed_b4(db)
+    p = HistoricalOptionsProvider(db)
+    chain = p.get_chain("AAPL", date(2024,3,7), expiry_min=date(2024,3,1),
+                        expiry_max=date(2024,5,31), option_type=OptionRight.CALL)
+    assert len(chain) == 1
+    ct = chain[0]
+    assert ct.last == 3.0                   # bar close, not the stale 2.1 snapshot
+    assert ct.bid == pytest.approx(2.9)     # close - snapshot_spread/2 (spread 0.2 preserved)
+    assert ct.ask == pytest.approx(3.1)     # close + snapshot_spread/2
+
+def test_get_quote_synthesizes_same_spread_as_chain(tmp_path):
+    """Entry actions read chain rows, close actions read quotes — both must agree (B4)."""
+    op.clear_worker_options_cache()
+    db = str(tmp_path / "opt.db"); _seed_b4(db)
+    p = HistoricalOptionsProvider(db)
+    q = p.get_quote("AAPL240419C00180000", date(2024,3,5))
+    assert q is not None
+    assert q.last == 3.0
+    assert q.bid == pytest.approx(2.9) and q.ask == pytest.approx(3.1)
+
+def test_chain_quotes_keep_snapshot_when_no_bar(tmp_path):
+    """No bar on/before the as-of date -> chain-row snapshot quotes kept exactly (B4)."""
+    op.clear_worker_options_cache()
+    db = str(tmp_path / "opt.db"); _seed_b4(db)
+    p = HistoricalOptionsProvider(db)
+    chain = p.get_chain("AAPL", date(2024,3,3), expiry_min=date(2024,3,1),
+                        expiry_max=date(2024,5,31), option_type=OptionRight.CALL)
+    assert len(chain) == 1
+    assert chain[0].bid == 2.0 and chain[0].ask == 2.2 and chain[0].last == 2.1
+
+def test_chain_quotes_bar_close_only_when_snapshot_lacks_spread(tmp_path):
+    """Chain row without bid/ask + a bar -> only last is set; spread never fabricated (B4)."""
+    op.clear_worker_options_cache()
+    db = str(tmp_path / "opt.db"); _seed_b4(db)
+    p = HistoricalOptionsProvider(db)
+    chain = p.get_chain("AAPL", date(2024,3,7), expiry_min=date(2024,3,1),
+                        expiry_max=date(2024,5,31), option_type=OptionRight.PUT)
+    assert len(chain) == 1
+    assert chain[0].last == 1.5 and chain[0].bid is None and chain[0].ask is None
+    q = p.get_quote("AAPL240419P00180000", date(2024,3,5))
+    assert q.last == 1.5 and q.bid is None and q.ask is None
+
+
+# ---------------------------------------------------------------------------
+# 2026-07-22 bug B7: get_atm_iv must return a NEAR-ATM contract's iv (mirroring live
+# AlpacaAccount.get_atm_implied_volatility: nearest the money, 20-45 DTE), not the old
+# chain-wide mean. Spot is unavailable in this layer, so |delta| nearest 0.50 among CALLS
+# proxies at-the-money (documented in the provider docstring).
+# ---------------------------------------------------------------------------
+def _seed_skewed_chain(db):
+    """Known skew: near-ATM call iv 0.30, wings 0.60/0.90, an out-of-window near-dated call
+    at 0.05 and an in-window put at 0.99. The old chain mean (0.568) is far from 0.30."""
+    c = OptionsHistoryCache(db)
+    c.write_chain_rows("AAPL", "2024-03-01", [
+        # near-ATM call, in the 20-45 DTE window (as_of 2024-03-01 -> window 03-21..04-15)
+        {"occ_symbol":"AAPL240405C00100000","option_type":"call","strike":100.0,"expiry":"2024-04-05",
+         "iv":0.30,"delta":0.52,"gamma":0.01,"theta":-0.03,"vega":0.1},
+        # deep-ITM call (delta ~1) — skewed high iv
+        {"occ_symbol":"AAPL240405C00050000","option_type":"call","strike":50.0,"expiry":"2024-04-05",
+         "iv":0.60,"delta":0.99,"gamma":0.01,"theta":-0.03,"vega":0.1},
+        # far-OTM call (delta ~0) — skewed high iv
+        {"occ_symbol":"AAPL240405C00150000","option_type":"call","strike":150.0,"expiry":"2024-04-05",
+         "iv":0.90,"delta":0.05,"gamma":0.01,"theta":-0.03,"vega":0.1},
+        # near-ATM call OUTSIDE the DTE window (10 DTE) — must be excluded
+        {"occ_symbol":"AAPL240311C00100000","option_type":"call","strike":100.0,"expiry":"2024-03-11",
+         "iv":0.05,"delta":0.50,"gamma":0.01,"theta":-0.03,"vega":0.1},
+        # near-ATM PUT in-window — excluded (calls only, for determinism)
+        {"occ_symbol":"AAPL240405P00100000","option_type":"put","strike":100.0,"expiry":"2024-04-05",
+         "iv":0.99,"delta":-0.48,"gamma":0.01,"theta":-0.03,"vega":0.1}])
+    return c
+
+def test_atm_iv_picks_near_atm_call_not_chain_mean(tmp_path):
+    op.clear_worker_options_cache()
+    db = str(tmp_path / "opt.db"); _seed_skewed_chain(db)
+    p = HistoricalOptionsProvider(db)
+    assert p.get_atm_iv("AAPL", date(2024,3,1)) == pytest.approx(0.30)
+
+def test_atm_iv_uses_asof_bar_greeks_overlay(tmp_path):
+    """ATM selection reads the as-of-clamped bar's iv/delta when its own iv computed (same
+    overlay rule as get_chain), so the value tracks iv changes across the backtest window."""
+    op.clear_worker_options_cache()
+    db = str(tmp_path / "opt.db"); _seed_skewed_chain(db)
+    OptionsHistoryCache(db).write_bar_rows([
+        {"occ_symbol":"AAPL240405C00100000","date":"2024-03-01","open":3.0,"high":3.1,"low":2.9,
+         "close":3.0,"volume":100,"underlying":"AAPL","option_type":"call","strike":100.0,
+         "expiry":"2024-04-05","iv":0.42,"delta":0.51,"gamma":0.01,"theta":-0.03,"vega":0.1}])
+    p = HistoricalOptionsProvider(db)
+    assert p.get_atm_iv("AAPL", date(2024,3,1)) == pytest.approx(0.42)
+
+def test_atm_iv_none_when_no_in_window_contract(tmp_path):
+    op.clear_worker_options_cache()
+    db = str(tmp_path / "opt.db"); _seed(db)  # seeded expiry 2024-03-15 is only 8 DTE out
+    p = HistoricalOptionsProvider(db)
+    assert p.get_atm_iv("AAPL", date(2024,3,7)) is None

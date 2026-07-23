@@ -2134,16 +2134,27 @@ def _build_strategy_option_group(kind: str):
 
 def _build_strategy_covered_call(kind: str):
     """O_CC — equity entry (the S2 baseline) + a ``sell_covered_call`` OPEN_POSITIONS overlay rule
-    (sell a ~5% OTM call against the held shares). Equity-entry, so NO entry_action."""
+    (sell a ~5% OTM call against the held shares). Equity-entry, so NO entry_action.
+
+    The overlay is gated against re-firing every manage cycle (bug B2): rules evaluate in
+    order, so a ``stop_processing`` guard rule ahead of it — the codebase's negation idiom
+    (test_files/setup_option_rulesets.py; rules_documentation.py: "require NOT
+    has_covered_call before sell_covered_call") — halts the ruleset whenever a covered call
+    is ALREADY open, and ``cc_sell`` only fires while the held shares have no overlay."""
     from app.models.strategy import Strategy  # noqa: F401 — keep import parity with siblings
     s = _build_strategy_S2(kind)  # reuse equity entry + base exits
-    s.exit_rules = list(s.exit_rules or []) + [{
-        "id": "cc_sell",
-        "conditions": {"type": "AND", "conditions": [{"id": "cc_hold", "field": "has_position"}]},
-        "actions": [{"action_type": "sell_covered_call",
-                     "option_strike_method": "percent_otm", "option_strike_param": 5.0,
-                     "option_dte_min": 25, "option_dte_max": 45}],
-        "continue_processing": False}]
+    s.exit_rules = list(s.exit_rules or []) + [
+        {"id": "cc_guard",
+         "conditions": {"type": "AND", "conditions": [
+             {"id": "cc_guard_has_cc", "field": "has_covered_call"}]},
+         "actions": [{"action_type": "stop_processing"}],
+         "continue_processing": False},
+        {"id": "cc_sell",
+         "conditions": {"type": "AND", "conditions": [{"id": "cc_hold", "field": "has_position"}]},
+         "actions": [{"action_type": "sell_covered_call",
+                      "option_strike_method": "percent_otm", "option_strike_param": 5.0,
+                      "option_dte_min": 25, "option_dte_max": 45}],
+         "continue_processing": False}]
     return s
 
 
@@ -2157,16 +2168,24 @@ def _build_strategy_protective_put(kind: str):
     rule (buy a put ~8% OTM against the held shares). Mirrors _build_strategy_covered_call's
     shape exactly, swapping the overlay action; BuyProtectivePutAction sizes off the HELD
     equity quantity (1 contract per 100 shares), not option_sizing. Equity-entry, so NO
-    entry_action."""
+    entry_action. The overlay carries the same anti-stacking guard as O_CC (bug B2): a
+    ``stop_processing`` guard rule on ``has_protective_put`` (a dedicated condition —
+    TradeConditions.py ``HasProtectivePutCondition``) ahead of the overlay halts the ruleset
+    once a protective put is already open."""
     from app.models.strategy import Strategy  # noqa: F401 — keep import parity with siblings
     s = _build_strategy_S2(kind)
-    s.exit_rules = list(s.exit_rules or []) + [{
-        "id": "pp_buy",
-        "conditions": {"type": "AND", "conditions": [{"id": "pp_hold", "field": "has_position"}]},
-        "actions": [{"action_type": "buy_protective_put",
-                     "option_strike_method": "percent_otm", "option_strike_param": 8.0,
-                     "option_dte_min": 25, "option_dte_max": 45}],
-        "continue_processing": False}]
+    s.exit_rules = list(s.exit_rules or []) + [
+        {"id": "pp_guard",
+         "conditions": {"type": "AND", "conditions": [
+             {"id": "pp_guard_has_pp", "field": "has_protective_put"}]},
+         "actions": [{"action_type": "stop_processing"}],
+         "continue_processing": False},
+        {"id": "pp_buy",
+         "conditions": {"type": "AND", "conditions": [{"id": "pp_hold", "field": "has_position"}]},
+         "actions": [{"action_type": "buy_protective_put",
+                      "option_strike_method": "percent_otm", "option_strike_param": 8.0,
+                      "option_dte_min": 25, "option_dte_max": 45}],
+         "continue_processing": False}]
     return s
 
 

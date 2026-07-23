@@ -1038,3 +1038,45 @@ class TransactionHelper:
         pnl_pct = (pnl_amount / cost_basis * 100) if cost_basis > 0 else 0.0
 
         return {'amount': round(pnl_amount, 2), 'percent': round(pnl_pct, 4)}
+
+    @staticmethod
+    def calculate_option_pnl(transaction: Transaction, current_premium: float, multiplier: int) -> Optional[Dict[str, float]]:
+        """
+        Calculate current unrealised P&L for an open OPTION transaction.
+
+        Same shape as calculate_pnl, but priced off the option premium (the
+        transaction's open_price is the per-share entry premium, not the
+        underlying price) and scaled by the contract multiplier:
+            Long:  pnl = (current_premium - open_price) * |quantity| * multiplier
+            Short: pnl = (open_price - current_premium) * |quantity| * multiplier
+            pnl_pct = pnl / (open_price * |quantity| * multiplier) * 100
+
+        Args:
+            transaction: An open option Transaction with open_price (premium),
+                quantity and side set.
+            current_premium: Current option premium (bid for long, ask for short).
+            multiplier: Contract multiplier (100 for standard options).
+
+        Returns:
+            Dict with keys 'amount' (float, $) and 'percent' (float, %),
+            or None if required fields are missing.
+        """
+        if not transaction.open_price or not transaction.quantity:
+            return None
+        if current_premium is None or current_premium <= 0:
+            return None
+        if not multiplier or multiplier <= 0:
+            return None
+
+        open_price = transaction.open_price
+        quantity = abs(transaction.quantity)
+
+        if transaction.side == OrderDirection.BUY:
+            pnl_amount = (current_premium - open_price) * quantity * multiplier
+        else:
+            pnl_amount = (open_price - current_premium) * quantity * multiplier
+
+        cost_basis = open_price * quantity * multiplier
+        pnl_pct = (pnl_amount / cost_basis * 100) if cost_basis > 0 else 0.0
+
+        return {'amount': round(pnl_amount, 2), 'percent': round(pnl_pct, 4)}

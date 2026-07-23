@@ -12,14 +12,15 @@ underlyings as of 2026-07-20) so it can't be loaded wholesale into a worker's me
 FMPSenateTraderWeight's scoring caches are -- instead this caches PER (db_path, underlying)
 chain history and PER (db_path, occ_symbol) bar history, lazily on first access, shared across
 every HistoricalOptionsProvider built in the same worker process for the rest of its life.
-get_chain (filtered by expiry/strike) and get_bar/get_quote (a specific held contract) only ever
-touch a handful of contracts, but get_atm_iv scans EVERY contract in the underlying's cached
-chain snapshot unfiltered -- a single liquid underlying can carry 10-16k contracts (measured
-2026-07-20: MU 15882, SNDK 15204, AMD 13576) -- so the bar-history cache cap must comfortably
-exceed one underlying's full chain width, not just "a handful", or an LRU sized too small
-THRASHES (evicts and reloads) within a single get_atm_iv call and defeats the cache entirely
-(measured: a 3000-entry cap made two back-to-back identical trials equally slow, ~460s each,
-against the real 2.6GB cache). Bounded (not unbounded) because a REMOTE worker's trial-serving
+get_chain (filtered by expiry/strike) touches only the contracts passing its filters,
+get_bar/get_quote a specific held contract, and get_atm_iv only its 20-45 DTE band
+(2026-07-22 bug B7 -- before that it scanned EVERY contract in the underlying's cached
+chain snapshot unfiltered). A WIDE get_chain filter on a single liquid underlying can
+still pull 10-16k bar histories in one call (measured 2026-07-20: MU 15882, SNDK 15204,
+AMD 13576), so the bar-history cache cap must comfortably exceed one underlying's full
+chain width, not just "a handful", or an LRU sized too small THRASHES (evicts and reloads)
+within a single call and defeats the cache entirely (measured: a 3000-entry cap made two
+back-to-back identical trials equally slow, ~460s each, against the real 2.6GB cache). Bounded (not unbounded) because a REMOTE worker's trial-serving
 process pool is long-lived across many different optimization jobs (see worker_server.py's
 module-level _POOL), so keys could otherwise accumulate across jobs touching different
 universes over the process's lifetime -- the default just needs to clear the realistic
@@ -27,7 +28,7 @@ single-underlying ceiling with headroom for a few underlyings at once."""
 from __future__ import annotations
 from bisect import bisect_right
 from collections import OrderedDict
-from datetime import date
+from datetime import date, timedelta
 import os
 import sqlite3
 from typing import Dict, List, Optional, Tuple
@@ -37,8 +38,9 @@ from .options_cache import OptionsHistoryCache
 
 _CHAIN_CACHE_MAX = int(os.getenv("BT_OPTION_CHAIN_CACHE_MAX", "300"))
 # Must clear one underlying's full chain width (measured max 15882, MU) with headroom for a
-# few underlyings cached at once -- get_atm_iv touches every contract in the snapshot
-# unfiltered, so a cap below that thrashes (evict-then-reload) within a SINGLE call.
+# few underlyings cached at once -- a wide-filter get_chain can touch most of the chain's bar
+# histories in a SINGLE call (and get_atm_iv its 20-45 DTE band, post-2026-07-22 bug B7), so
+# a much smaller cap thrashes (evict-then-reload) within one read.
 _BAR_CACHE_MAX = int(os.getenv("BT_OPTION_BAR_CACHE_MAX", "50000"))
 
 _WORKER_CHAIN_CACHE: "OrderedDict[Tuple[str, str], _ChainHistory]" = OrderedDict()
@@ -53,15 +55,31 @@ def clear_worker_options_cache() -> None:
 
 class _ChainHistory:
     """One underlying's full chain history: every cached (as_of -> rows) snapshot."""
-    __slots__ = ("by_asof", "dates")
+    __slots__ = ("by_asof", "dates", "_row_index")
 
     def __init__(self, by_asof: Dict[str, List[dict]]):
         self.by_asof = by_asof
         self.dates = sorted(by_asof)  # ascending, for bisect
+        self._row_index: Dict[str, Dict[str, dict]] = {}  # as_of -> {occ_symbol: row}, lazy
 
     def latest_as_of(self, on_or_before: str) -> Optional[str]:
         i = bisect_right(self.dates, on_or_before)
         return self.dates[i - 1] if i else None
+
+    def row_for(self, occ_symbol: str, on_or_before: str) -> Optional[dict]:
+        """The chain row for one contract at the latest snapshot <= on_or_before, or None.
+
+        O(1) after the first lookup per snapshot (the occ->row dict is built lazily and
+        memoized). get_quote needs the snapshot row's bid/ask spread to synthesize
+        point-in-time quotes around a bar close (see _pit_quotes)."""
+        snap = self.latest_as_of(on_or_before)
+        if snap is None:
+            return None
+        idx = self._row_index.get(snap)
+        if idx is None:
+            idx = {r["occ_symbol"]: r for r in self.by_asof[snap]}
+            self._row_index[snap] = idx
+        return idx.get(occ_symbol)
 
 
 class _BarHistory:
@@ -132,6 +150,29 @@ def _bar_history(db_path: str, occ_symbol: str) -> _BarHistory:
     return hist
 
 
+def _pit_quotes(chain_row: Optional[dict],
+                bar: dict) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """Derive POINT-IN-TIME (bid, ask, last) from a contract's daily bar (2026-07-22, bug B4).
+
+    The chain row's bid/ask/last are a single snapshot written ONLY for the cache build's
+    start date (see fetch_options.build_cache), so weeks into a backtest they are stale —
+    sizing and limit prices must instead track the per-date bar. ``last`` = bar close.
+    bid/ask = close ± half the SNAPSHOT's ABSOLUTE spread (ask − bid) when the chain row
+    has both — modeling assumption: the historical cache has no as-of quote spreads
+    (Alpaca exposes no historical NBBO), so the start-date spread is carried forward
+    unchanged around each day's close (for fetch_options-built caches that spread is
+    zero — bid=ask=last=close — making this an identity). When the chain row lacks
+    bid/ask they stay None (fail-loud: never fabricate a spread) and only ``last`` is set.
+    """
+    close = bar.get("close")
+    bid = chain_row.get("bid") if chain_row else None
+    ask = chain_row.get("ask") if chain_row else None
+    if close is None or bid is None or ask is None:
+        return None, None, close
+    half_spread = (ask - bid) / 2.0
+    return close - half_spread, close + half_spread, close
+
+
 def _to_contract(r: dict, greeks_row: Optional[dict] = None) -> OptionContract:
     # greeks_row (the AS-OF-CLAMPED daily bar for this contract, when available) carries the
     # POINT-IN-TIME iv/greeks computed by fetch_options.py's Black-Scholes inversion of that
@@ -141,11 +182,19 @@ def _to_contract(r: dict, greeks_row: Optional[dict] = None) -> OptionContract:
     # iv/greeks still None (missing underlying close that day, or a pre-existing cache built
     # before this feature), in which case fall back to the chain row rather than lose greeks.
     g = greeks_row if (greeks_row and greeks_row.get("iv") is not None) else r
+    # Quotes (bug B4): the chain row's bid/ask/last are the build's START-DATE snapshot and go
+    # stale as the clock advances — when this contract has a bar on/before the as-of date,
+    # derive point-in-time quotes from the bar close (see _pit_quotes). With no bar (or a
+    # close-less bar) keep the chain row's snapshot quotes exactly as before.
+    if greeks_row is not None and greeks_row.get("close") is not None:
+        bid, ask, last = _pit_quotes(r, greeks_row)
+    else:
+        bid, ask, last = r.get("bid"), r.get("ask"), r.get("last")
     return OptionContract(
         symbol=r["occ_symbol"], underlying=r.get("underlying") or "",
         option_type=OptionRight(r["option_type"]), strike=r["strike"],
-        expiry=date.fromisoformat(r["expiry"]), bid=r.get("bid"), ask=r.get("ask"),
-        last=r.get("last"), implied_volatility=g.get("iv"), delta=g.get("delta"),
+        expiry=date.fromisoformat(r["expiry"]), bid=bid, ask=ask,
+        last=last, implied_volatility=g.get("iv"), delta=g.get("delta"),
         gamma=g.get("gamma"), theta=g.get("theta"), vega=g.get("vega"),
         open_interest=r.get("open_interest"), volume=r.get("volume"))
 
@@ -181,24 +230,60 @@ class HistoricalOptionsProvider:
         bar = _bar_history(self.db_path, occ_symbol).by_date.get(as_of.isoformat())
         if bar is None:
             return None
-        return OptionQuote(symbol=occ_symbol, bid=None, ask=None, last=bar.get("close"))
+        # Synthesize bid/ask the same way get_chain does (bug B4): entry actions price off
+        # chain rows while close actions price off quotes, so both must see the same
+        # point-in-time premium (bar close ± half the snapshot spread) or the two paths
+        # disagree. A bar row always carries its underlying; if it (or the chain row) is
+        # missing, bid/ask stay None and only last is set — never fabricated.
+        chain_row = (_chain_history(self.db_path, bar["underlying"]).row_for(
+            occ_symbol, as_of.isoformat()) if bar.get("underlying") else None)
+        bid, ask, last = _pit_quotes(chain_row, bar)
+        return OptionQuote(symbol=occ_symbol, bid=bid, ask=ask, last=last)
 
     def get_bar(self, occ_symbol: str, as_of: date) -> Optional[dict]:
         return _bar_history(self.db_path, occ_symbol).by_date.get(as_of.isoformat())
 
     def get_atm_iv(self, underlying: str, as_of: date) -> Optional[float]:
-        """Mean IV across the underlying's cached contracts as of ``as_of`` — feeds
-        ``IVRankCondition``'s rolling history. Reads each contract's AS-OF-CLAMPED daily-bar IV
-        (point-in-time, computed by fetch_options.py's Black-Scholes inversion), not the static
-        start-date chain snapshot, so this tracks IV changes across the whole backtest window."""
+        """NEAR-ATM implied volatility (0-1) for ``underlying`` as of ``as_of`` — feeds
+        ``IVRankCondition``'s rolling history.
+
+        Mirrors the LIVE semantics (AlpacaAccount.get_atm_implied_volatility): pick the ONE
+        contract nearest the money in a 20-45 DTE expiry window and return ITS iv. The
+        pre-2026-07-22 chain-wide MEAN (bug B7) averaged iv across all 10-16k cached
+        contracts — skew- and expiry-contaminated — breaking live/backtest parity of the
+        iv_rank condition.
+
+        ATM PROXY (documented): this layer has no point-in-time underlying SPOT — the
+        options cache stores no underlying-price column (see options_cache._CHAIN_DDL /
+        _BAR_DDL) and the backtest's OHLCV store lives in price_source.py, not the
+        provider — so "nearest the money" is proxied by the contract whose |delta| is
+        nearest 0.50 among CALLS in the window (live picks the nearest strike to spot;
+        |delta| ≈ 0.5 is the options-native definition of at-the-money). Calls only, for
+        determinism — put iv at the same strike/expiry is near-identical by put-call
+        parity, and live returns a single contract's iv, not a smoothed pair. Per-date
+        iv/delta come from the as-of-clamped bar's Black-Scholes inversion, overlaid with
+        the same fallback rule as _to_contract (bar preferred only when its OWN iv
+        computed), so this tracks iv changes across the whole backtest window. Returns
+        None when no cached snapshot exists or no in-window call has usable delta+iv."""
         hist = _chain_history(self.db_path, underlying)
         snap = hist.latest_as_of(as_of.isoformat())
         if snap is None:
             return None
-        ivs: List[float] = []
+        expiry_min = as_of + timedelta(days=20)
+        expiry_max = as_of + timedelta(days=45)
+        best: Optional[Tuple[Tuple[float, date, float], float]] = None
         for r in hist.by_asof[snap]:
+            if r["option_type"] != OptionRight.CALL.value:
+                continue
+            exp = date.fromisoformat(r["expiry"])
+            if exp < expiry_min or exp > expiry_max:
+                continue
             bar = _bar_history(self.db_path, r["occ_symbol"]).latest_on_or_before(as_of.isoformat())
-            iv = (bar or {}).get("iv") or r.get("iv")
-            if iv:
-                ivs.append(float(iv))
-        return float(sum(ivs) / len(ivs)) if ivs else None
+            g = bar if (bar and bar.get("iv") is not None) else r
+            delta, iv = g.get("delta"), g.get("iv")
+            if delta is None or iv is None:
+                continue
+            key = (abs(abs(delta) - 0.5), exp, r["strike"])
+            if best is None or key < best[0]:
+                best = (key, float(iv))
+        return best[1] if best is not None else None

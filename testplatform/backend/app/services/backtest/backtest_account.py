@@ -597,8 +597,9 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         The requirement is the sum of the (unbounded-risk) short positions' broker
         maintenance margins:
 
-          * short OPTION legs -> ``naked_margin_per_contract(strike, spot)`` x contracts
-            (Reg-T naked ~20% of notional less OTM, floored 10%) — the SAME model the entry
+          * short OPTION legs -> ``naked_margin_per_contract(strike, option_type=right, spot)``
+            x contracts (Reg-T naked ~20% of notional less the DIRECTION-AWARE OTM amount —
+            0 for an ITM short — floored 10%) — the SAME model the entry
             reserve uses, so the maintenance check is consistent with sizing.
           * short STOCK       -> ``SHORT_STOCK_MAINTENANCE_FRACTION`` (30%) x |qty| x price.
 
@@ -624,7 +625,7 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 continue  # covered short leg of a defined-risk combo -> no naked margin
             if lot.contract_symbol in covered_calls:
                 continue  # short call covered by long shares -> no naked margin
-            strike, spot = self._lot_strike_and_spot(lot.contract_symbol)
+            strike, spot, right = self._lot_strike_spot_right(lot.contract_symbol)
             if strike is None:
                 # An unresolvable strike UNDERSTATES the requirement (this short leg
                 # contributes nothing) — never silently.
@@ -635,7 +636,20 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                     lot.contract_symbol,
                 )
                 continue
-            req += self.naked_margin_per_contract(strike, spot=spot) * abs(lot.qty)
+            if right is None:
+                # An unresolvable RIGHT must not understate the requirement either: charge
+                # the worst case over both rights (and log it — the leg's order is malformed).
+                logger.warning(
+                    "[backtest] maintenance margin: no option_type resolves for held short "
+                    "option lot %s — charging the WORST-CASE margin over both rights.",
+                    lot.contract_symbol,
+                )
+                req += max(
+                    self.naked_margin_per_contract(strike, option_type=OptionRight.CALL, spot=spot),
+                    self.naked_margin_per_contract(strike, option_type=OptionRight.PUT, spot=spot),
+                ) * abs(lot.qty)
+                continue
+            req += self.naked_margin_per_contract(strike, option_type=right, spot=spot) * abs(lot.qty)
         # Short stock.
         for p in self._positions.values():
             if p.qty >= 0:
@@ -690,21 +704,22 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             self._lot_order_index_gen = self._option_memo_gen
         return self._lot_order_index.get(contract_symbol)
 
-    def _lot_strike_and_spot(self, contract_symbol: str):
-        """(strike, underlying_spot) for a held option lot, resolved from its FILLED order.
+    def _lot_strike_spot_right(self, contract_symbol: str):
+        """(strike, underlying_spot, option_right) for a held option lot, from its FILLED order.
 
-        Returns (None, None) when the order/strike cannot be resolved (the caller then skips
-        that lot's margin contribution rather than guessing).
+        Returns (None, None, None) when the order/strike cannot be resolved (the caller then
+        skips that lot's margin contribution rather than guessing). The right may independently
+        be None (malformed order row) — the caller then charges the worst case over both rights.
         """
         o = self._lot_order(contract_symbol)
         if o is None:
-            return None, None
+            return None, None, None
         spot = None
         if o.underlying_symbol:
             spot = self._price.close_at(o.underlying_symbol)
             if spot is None:
                 spot = self._price.close_asof(o.underlying_symbol)
-        return float(o.strike), (float(spot) if spot is not None else None)
+        return float(o.strike), (float(spot) if spot is not None else None), o.option_type
 
     def _covered_short_call_contracts(self) -> set:
         """Contract symbols of held SHORT CALL lots fully covered by LONG underlying shares.
@@ -1379,7 +1394,16 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         underlying's trading calendar picks the day — ``same_bar_close`` uses the current
         bar's date; ``next_bar_open`` (default) uses the next trading day strictly after the
         current bar. The premium is then read for that day from the as-of options cache.
-        Returns None when no provider, no fill day, no premium bar, or no usable price.
+        Returns None when no provider, no fill day, no premium bar, no usable price, or a
+        LIMIT whose price the bar never crosses (the order stays pending, exactly like the
+        equity branch's non-crossing limit).
+
+        LIMIT handling mirrors the equity path: the premium bar yields ONE reference price
+        (open/close per ``fill_model``), so the cross test uses it directly — a BUY_LIMIT
+        fills only when ``px <= limit``, a SELL_LIMIT only when ``px >= limit`` — and the
+        fill is at the BAR price when it is better than the limit (never worse, no slippage
+        on a limit fill). A LIMIT-typed leg carrying NO ``limit_price`` (a multi-leg child —
+        the PARENT holds the combo's net limit) falls through to the market-style fill.
         """
         if self._options is None:
             return None
@@ -1401,7 +1425,14 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         px = bar.get("close") if same_bar else bar.get("open")
         if px is None:
             return None
-        return self._slip(float(px), order.side == OrderDirection.BUY)
+        px = float(px)
+        limit = getattr(order, "limit_price", None)
+        ot = order.order_type
+        if limit is not None and ot == OrderType.BUY_LIMIT:
+            return px if px <= float(limit) else None
+        if limit is not None and ot == OrderType.SELL_LIMIT:
+            return px if px >= float(limit) else None
+        return self._slip(px, order.side == OrderDirection.BUY)
 
     def _child_legs(self, parent) -> List[TradingOrder]:
         """The not-yet-filled child leg orders of a multi-leg option parent.
@@ -1496,9 +1527,12 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         ``contract_symbol`` so ``_option_fill_price`` works). If EVERY leg resolves to a
         price, fill all legs through the SAME per-leg path as single-leg fills
         (``_apply_option_fill`` -> per-contract lot + cash, scaled x multiplier), then mark
-        the PARENT FILLED with ``open_price`` = net per-share debit = Σ(buy premium) -
-        Σ(sell premium) (positive = debit, negative = credit). The parent moves NO cash (it
-        already moved per leg). If ANY leg lacks a price, NOTHING fills this bar (retry next).
+        the PARENT FILLED with ``open_price`` = net per-share debit PER STRUCTURE =
+        Σ(sign x premium x leg ratio) (positive = debit, negative = credit) — the ratio
+        (leg qty / structure qty) matters for ratio'd shapes (1-2-1 butterfly, 1-2 put
+        ratio); all-ratio-1 shapes (verticals/condors) are unchanged. The parent moves NO
+        cash (it already moved per leg). If ANY leg lacks a price, NOTHING fills this bar
+        (retry next).
         """
         legs = self._child_legs(parent)
         if not legs:
@@ -1571,13 +1605,17 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             self._sync_transaction_quantity(parent.transaction_id, float(capped))
 
         net = 0.0
+        # Leg ratio = leg contracts / structures, computed AFTER any cash-cap rescale above
+        # (legs and parent.quantity were rescaled together, so the ratio is preserved).
+        struct_qty = abs(float(parent.quantity or 0.0))
         for leg, px in priced:
             self._apply_option_fill(leg, px, as_of)  # reuse single-leg per-leg lot+cash math
             signed = px if leg.side == OrderDirection.BUY else -px
-            net += signed
+            ratio = abs(float(leg.quantity or 0.0)) / struct_qty if struct_qty else 0.0
+            net += signed * ratio
 
         parent.filled_qty = parent.quantity
-        parent.open_price = net  # net per-share: +debit / -credit. No cash moved on the parent.
+        parent.open_price = net  # net per-share PER STRUCTURE: +debit / -credit. No cash moved on the parent.
         parent.status = OrderStatus.FILLED
         update_instance(parent)
         if parent.id is not None:

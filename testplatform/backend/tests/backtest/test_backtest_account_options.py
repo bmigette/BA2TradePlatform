@@ -73,6 +73,42 @@ def _seed_cache(db_path: str) -> None:
                 "open_interest": 900,
                 "volume": 150,
             },
+            # In-window (20-45 DTE from the 2024-03-05 clock) contracts for the ATM-IV test:
+            # near-ATM call (|delta| nearest 0.50) vs a skewed-iv wing — B7 semantics pick the
+            # near-ATM contract's iv (0.33), never the chain mean. Expiry 2024-04-05 stays
+            # outside the 2024-03-01..2024-03-31 window the chain-read test queries.
+            {
+                "occ_symbol": "AAPL240405C00180000",
+                "option_type": "call",
+                "strike": 180.0,
+                "expiry": "2024-04-05",
+                "bid": 4.0,
+                "ask": 4.2,
+                "last": 4.1,
+                "iv": 0.33,
+                "delta": 0.52,
+                "gamma": 0.04,
+                "theta": -0.05,
+                "vega": 0.10,
+                "open_interest": 800,
+                "volume": 100,
+            },
+            {
+                "occ_symbol": "AAPL240405C00150000",
+                "option_type": "call",
+                "strike": 150.0,
+                "expiry": "2024-04-05",
+                "bid": 30.0,
+                "ask": 30.4,
+                "last": 30.2,
+                "iv": 0.80,
+                "delta": 0.97,
+                "gamma": 0.01,
+                "theta": -0.05,
+                "vega": 0.02,
+                "open_interest": 500,
+                "volume": 20,
+            },
         ],
     )
 
@@ -171,8 +207,10 @@ def test_get_option_quote_reads_provider(options_account):
 
 def test_get_atm_implied_volatility_reads_provider(options_account):
     iv = options_account.get_atm_implied_volatility("AAPL")
-    # mean of seeded IVs (0.25, 0.27) = 0.26
-    assert iv == pytest.approx(0.26)
+    # B7 (2026-07-22): NEAR-ATM iv, mirroring live — the in-window (20-45 DTE) call whose
+    # |delta| is nearest 0.50 (seeded strike-180 2024-04-05 call, iv 0.33), NOT the old
+    # chain-wide mean. The two 2024-03-15 contracts are only 10 DTE out -> excluded.
+    assert iv == pytest.approx(0.33)
 
 
 def test_get_option_positions_empty_when_no_option_txns(options_account):

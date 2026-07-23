@@ -48,6 +48,14 @@ FLAG_FIELD_EVENT: Dict[str, ExpertEventType] = {
     "has_no_position": ExpertEventType.F_HAS_NO_POSITION,
     "has_buy_position": ExpertEventType.F_HAS_BUY_POSITION,
     "has_sell_position": ExpertEventType.F_HAS_SELL_POSITION,
+    # Option-overlay position flags (added for the O_CC/O_PP overlay guards, bug B2): the
+    # conditions themselves are registered in TradeConditions.create_condition and documented
+    # in rules_documentation.py ("require NOT has_covered_call before sell_covered_call" —
+    # expressed as a stop_processing guard rule, the codebase's negation idiom). Without these
+    # mappings a condition-tree leaf naming one of these fields was silently SKIPPED here.
+    "has_option_position": ExpertEventType.F_HAS_OPTION_POSITION,
+    "has_covered_call": ExpertEventType.F_HAS_COVERED_CALL,
+    "has_protective_put": ExpertEventType.F_HAS_PROTECTIVE_PUT,
     "short_term": ExpertEventType.F_SHORT_TERM,
     "medium_term": ExpertEventType.F_MEDIUM_TERM,
     "long_term": ExpertEventType.F_LONG_TERM,

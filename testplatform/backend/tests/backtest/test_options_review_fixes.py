@@ -344,7 +344,7 @@ def test_partially_covered_call_still_charged_and_liquidated(tmp_path):
         ps.set_clock(datetime(2024, 3, 6))
 
         assert acct._covered_short_call_contracts() == set()
-        expected = 2 * acct.naked_margin_per_contract(200.0, spot=180.0)
+        expected = 2 * acct.naked_margin_per_contract(200.0, option_type=OptionRight.CALL, spot=180.0)
         assert acct.maintenance_margin_requirement() == pytest.approx(expected)
 
         acct._cash = -100_000.0
@@ -369,7 +369,7 @@ def test_covered_call_greedy_cover_no_double_count(tmp_path):
         ps.set_clock(datetime(2024, 3, 8))
 
         assert acct._covered_short_call_contracts() == {_CC_A}
-        expected = 2 * acct.naked_margin_per_contract(210.0, spot=180.0)
+        expected = 2 * acct.naked_margin_per_contract(210.0, option_type=OptionRight.CALL, spot=180.0)
         assert acct.maintenance_margin_requirement() == pytest.approx(expected)
     finally:
         ctx.__exit__(None, None, None)

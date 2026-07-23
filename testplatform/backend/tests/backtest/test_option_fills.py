@@ -356,3 +356,210 @@ def test_multi_leg_spread_is_all_or_none_when_one_leg_lacks_a_bar(options_accoun
     children = [o for o in acct.get_orders() if o.parent_order_id == parent.id]
     assert len(children) == 2
     assert all(c.status == OrderStatus.ACCEPTED for c in children)
+
+
+# ======================================================================
+# B3: ratio-weighted parent open_price for ratio'd structures (1-2-1, 1-2)
+# ======================================================================
+_OCC_BF_LOW = "AAPL240315C00170000"   # butterfly lower wing (170 call)
+_OCC_PR_LONG = "AAPL240315P00180000"  # put-ratio long leg (180 put)
+_OCC_PR_SHORT = "AAPL240315P00170000"  # put-ratio short leg (170 put)
+
+
+def _seed_extra_bars(db_path: str, rows) -> None:
+    from app.services.backtest.options_cache import OptionsHistoryCache
+
+    OptionsHistoryCache(db_path).write_bar_rows(rows)
+
+
+def _bar_row(occ, o, ot, strike, d="2024-03-06", c=None, h=None, l=None):
+    return {
+        "occ_symbol": occ,
+        "date": d,
+        "open": o,
+        "high": h if h is not None else o,
+        "low": l if l is not None else o,
+        "close": c if c is not None else o,
+        "volume": 100,
+        "underlying": "AAPL",
+        "option_type": ot,
+        "strike": strike,
+        "expiry": "2024-03-15",
+    }
+
+
+def test_butterfly_parent_open_price_is_ratio_weighted(options_account, tmp_path):
+    """1-2-1 call butterfly: parent open_price = Σ(sign x premium x ratio) PER STRUCTURE.
+
+    Legs fill at their bar opens: buy 1x 170c @8.0, sell 2x 180c @4.0, buy 1x 190c @1.5.
+    Ratio-weighted net debit = 8.0 - 2*4.0 + 1.5 = 1.5 per share per structure (the OLD
+    unweighted math gave 8.0 - 4.0 + 1.5 = 5.5). Cash still moves PER LEG, so the total
+    debit equals open_price x 100 x structures.
+    """
+    from ba2_common.core.option_types import OptionLeg
+    from ba2_common.core.types import OptionRight
+
+    acct, ps = options_account
+    _seed_short_leg_bar(str(tmp_path / "options_cache.sqlite"))  # 190c bar (open 1.5)
+    _seed_extra_bars(str(tmp_path / "options_cache.sqlite"),
+                     [_bar_row(_OCC_BF_LOW, 8.0, "call", 170.0)])
+    cash_before = acct.get_balance()
+
+    def _leg(sym, side, ratio, strike):
+        return OptionLeg(
+            contract_symbol=sym, side=side, ratio_qty=ratio,
+            position_intent=("buy_to_open" if side == OrderDirection.BUY else "sell_to_open"),
+            option_type=OptionRight.CALL, strike=strike, expiry=date(2024, 3, 15),
+            underlying="AAPL",
+        )
+
+    parent = acct.submit_option_order(
+        legs=[_leg(_OCC_BF_LOW, OrderDirection.BUY, 1, 170.0),
+              _leg(_OCC, OrderDirection.SELL, 2, 180.0),
+              _leg(_OCC_SHORT, OrderDirection.BUY, 1, 190.0)],
+        quantity=1, order_type="market", option_strategy="call_butterfly",
+    )
+    acct.refresh_orders()
+    acct.refresh_transactions()
+
+    filled = acct.get_order(parent.id)
+    assert filled.status == OrderStatus.FILLED
+    # ratio-weighted: 8.0 - 2*4.0 + 1.5 = 1.5 (NOT 5.5)
+    assert filled.open_price == pytest.approx(1.5)
+    # Per-leg cash: -800 + 2*400 - 150 = -150 == -open_price*100, plus 3 flat commissions.
+    commission = CFG["commission_per_trade"]
+    assert acct.get_balance() == pytest.approx(cash_before - 1.5 * 100 - 3 * commission)
+
+
+def test_put_ratio_parent_open_price_is_ratio_weighted(options_account, tmp_path):
+    """1-2 put ratio spread: net = 5.0 - 2*3.0 = -1.0 per structure (a CREDIT).
+
+    The OLD unweighted math gave 5.0 - 3.0 = +2.0 — wrong sign AND magnitude.
+    """
+    from ba2_common.core.option_types import OptionLeg
+    from ba2_common.core.types import OptionRight
+
+    acct, ps = options_account
+    _seed_extra_bars(str(tmp_path / "options_cache.sqlite"), [
+        _bar_row(_OCC_PR_LONG, 5.0, "put", 180.0),
+        _bar_row(_OCC_PR_SHORT, 3.0, "put", 170.0),
+    ])
+    cash_before = acct.get_balance()
+
+    def _leg(sym, side, ratio, strike):
+        return OptionLeg(
+            contract_symbol=sym, side=side, ratio_qty=ratio,
+            position_intent=("buy_to_open" if side == OrderDirection.BUY else "sell_to_open"),
+            option_type=OptionRight.PUT, strike=strike, expiry=date(2024, 3, 15),
+            underlying="AAPL",
+        )
+
+    parent = acct.submit_option_order(
+        legs=[_leg(_OCC_PR_LONG, OrderDirection.BUY, 1, 180.0),
+              _leg(_OCC_PR_SHORT, OrderDirection.SELL, 2, 170.0)],
+        quantity=1, order_type="market", option_strategy="put_ratio_spread",
+    )
+    acct.refresh_orders()
+    acct.refresh_transactions()
+
+    filled = acct.get_order(parent.id)
+    assert filled.status == OrderStatus.FILLED
+    # ratio-weighted: 5.0 - 2*3.0 = -1.0 (credit; NOT +2.0)
+    assert filled.open_price == pytest.approx(-1.0)
+    # Per-leg cash: -500 + 2*300 = +100 == -open_price*100, plus 2 flat commissions.
+    commission = CFG["commission_per_trade"]
+    assert acct.get_balance() == pytest.approx(cash_before + 1.0 * 100 - 2 * commission)
+
+
+# ======================================================================
+# B5: LIMIT option orders fill only when the bar premium crosses the limit
+# ======================================================================
+def _submit_limit_buy_call(acct, limit):
+    from ba2_common.core.option_types import OptionLeg
+
+    leg = OptionLeg(
+        contract_symbol=_OCC, side=OrderDirection.BUY, position_intent="buy_to_open",
+        underlying="AAPL",
+    )
+    return acct.submit_option_order(
+        legs=[leg], quantity=1, order_type="limit", limit_price=limit,
+        option_strategy="long_call",
+    )
+
+
+def _extend_to_0307(ps, db_path, option_open_0307):
+    """Add an AAPL bar AND a contract premium bar for 2024-03-07 (the next fill day)."""
+    ps.load_bars(
+        "AAPL",
+        _AAPL_BARS
+        + [{"Date": datetime(2024, 3, 7), "Open": 183, "High": 185, "Low": 182, "Close": 184, "Volume": 900}],
+    )
+    _seed_extra_bars(db_path, [_bar_row(_OCC, option_open_0307, "call", 180.0, d="2024-03-07")])
+    # The provider memoizes per-contract bar histories process-wide (worker cache); the
+    # mid-test reseed above is only visible after an explicit reset.
+    from app.services.backtest.options_provider import clear_worker_options_cache
+    clear_worker_options_cache()
+
+
+def test_limit_buy_above_market_does_not_fill_then_fills_on_cross(options_account, tmp_path):
+    """BUY_LIMIT 3.0 vs bar open 4.0: NO fill (stays working, cash untouched). When the
+    next fill bar opens at 2.5 (<= limit), it fills AT THE BAR PRICE (better than limit)."""
+    acct, ps = options_account
+    cache_db = str(tmp_path / "options_cache.sqlite")
+    order = _submit_limit_buy_call(acct, 3.0)
+    cash_before = acct.get_balance()
+
+    # Fill bar = 2024-03-06, premium open 4.0 > limit 3.0 -> the limit is NOT crossed.
+    acct.refresh_orders()
+    acct.refresh_transactions()
+    assert acct.get_order(order.id).status == OrderStatus.ACCEPTED
+    assert acct.get_option_positions() == []
+    assert acct.get_balance() == pytest.approx(cash_before)
+
+    # Next bar (2024-03-07) opens at 2.5 <= 3.0 -> crosses -> fills at 2.5 (bar price is
+    # better than the limit), NOT at the limit and NOT at 4.0.
+    _extend_to_0307(ps, cache_db, 2.5)
+    ps.set_clock(datetime(2024, 3, 6))
+    acct.refresh_orders()
+    acct.refresh_transactions()
+    filled = acct.get_order(order.id)
+    assert filled.status == OrderStatus.FILLED
+    assert filled.open_price == pytest.approx(2.5)
+    commission = CFG["commission_per_trade"]
+    assert acct.get_balance() == pytest.approx(cash_before - 2.5 * 100 - commission)
+
+
+def test_limit_sell_below_market_does_not_fill_then_fills_on_cross(options_account, tmp_path):
+    """SELL_LIMIT 5.0 vs bar open 4.0: NO fill. When the next fill bar opens at 5.5
+    (>= limit), it fills AT THE BAR PRICE 5.5 (better than the limit)."""
+    from ba2_common.core.option_types import OptionLeg
+
+    acct, ps = options_account
+    cache_db = str(tmp_path / "options_cache.sqlite")
+    leg = OptionLeg(
+        contract_symbol=_OCC, side=OrderDirection.SELL, position_intent="sell_to_open",
+        underlying="AAPL",
+    )
+    order = acct.submit_option_order(
+        legs=[leg], quantity=1, order_type="limit", limit_price=5.0,
+        option_strategy="naked_call",
+    )
+    cash_before = acct.get_balance()
+
+    # Fill bar = 2024-03-06, premium open 4.0 < limit 5.0 -> NOT crossed -> stays working.
+    acct.refresh_orders()
+    acct.refresh_transactions()
+    assert acct.get_order(order.id).status == OrderStatus.ACCEPTED
+    assert acct.get_option_positions() == []
+    assert acct.get_balance() == pytest.approx(cash_before)
+
+    # Next bar opens at 5.5 >= 5.0 -> crosses -> fills at 5.5 (credit at the bar price).
+    _extend_to_0307(ps, cache_db, 5.5)
+    ps.set_clock(datetime(2024, 3, 6))
+    acct.refresh_orders()
+    acct.refresh_transactions()
+    filled = acct.get_order(order.id)
+    assert filled.status == OrderStatus.FILLED
+    assert filled.open_price == pytest.approx(5.5)
+    commission = CFG["commission_per_trade"]
+    assert acct.get_balance() == pytest.approx(cash_before + 5.5 * 100 - commission)

@@ -260,20 +260,49 @@ def test_naked_margin_far_below_full_cash():
     """Reg-T naked margin per contract must be a fraction (not the full strike*100)."""
     acct = FakeAccount(spot=250.0)
     full_cash = 225.0 * 100.0
-    margin = acct.naked_margin_per_contract(225.0, spot=250.0)
+    # Spot 250 / strike 225 PUT is 25 OTM: max(0.20*250-25, 0.10*250)*100 = max(25,25)*100 = 2500
+    margin = acct.naked_margin_per_contract(225.0, option_type=OptionRight.PUT, spot=250.0)
     assert 0 < margin < full_cash
-    # With spot 250 / strike 225 (25 OTM): max(0.20*250-25, 0.10*250)*100 = max(25,25)*100 = 2500
     assert margin == pytest.approx(2500.0)
     # Without a spot, falls back to 0.20*strike*100 = 4500 (still << full 22500 cash).
-    assert acct.naked_margin_per_contract(225.0) == pytest.approx(4500.0)
+    assert acct.naked_margin_per_contract(225.0, option_type=OptionRight.PUT) == pytest.approx(4500.0)
+
+
+def test_naked_margin_reg_t_direction_aware():
+    """Reg-T: the OTM deduction is DIRECTION-aware and NEVER negative for an ITM short.
+
+    Reg-T naked-short margin = premium + max(20%*underlying - OTM_amount, 10%*underlying)
+    with OTM_amount = max(strike-spot, 0) for a CALL and max(spot-strike, 0) for a PUT.
+    The old abs(spot-strike) wrongly REDUCED margin for ITM shorts (spot 100, short put
+    strike 150 gave 1000 instead of 2000)."""
+    acct = FakeAccount(spot=100.0)
+    # ITM short PUT (spot 100, strike 150): OTM amount 0 -> full 20%*spot*100 = 2000
+    # (the premium term is handled in cash, not by this bracket helper).
+    assert acct.naked_margin_per_contract(150.0, option_type=OptionRight.PUT, spot=100.0) == pytest.approx(2000.0)
+    # ITM short CALL (spot 100, strike 50): OTM amount 0 -> 2000 as well.
+    assert acct.naked_margin_per_contract(50.0, option_type=OptionRight.CALL, spot=100.0) == pytest.approx(2000.0)
+    # Far-OTM PUT (strike 50, spot 100): deduction exceeds the 20% bracket -> 10% floor = 1000.
+    assert acct.naked_margin_per_contract(50.0, option_type=OptionRight.PUT, spot=100.0) == pytest.approx(1000.0)
+    # Mildly OTM CALL (strike 115, spot 100): max(20-15, 10)*100 = 1000.
+    assert acct.naked_margin_per_contract(115.0, option_type=OptionRight.CALL, spot=100.0) == pytest.approx(1000.0)
 
 
 def test_naked_reserve_uses_margin_not_full_cash():
     """option_reserve_required for naked structures must use the margin model."""
     acct = FakeAccount(spot=250.0)
     full_cash = 225.0 * 100.0 * 2
+    # short_straddle shorts BOTH rights at one strike -> worst case over both is reserved
+    # (no option_type needed); the single-sided strategies require the leg's right.
     for strat in ("short_straddle", "short_strangle", "naked_put", "put_ratio_spread"):
-        r = acct.option_reserve_required(strat, 2, strike=225.0, spot=250.0)
+        kw = {} if strat == "short_straddle" else {"option_type": OptionRight.PUT}
+        r = acct.option_reserve_required(strat, 2, strike=225.0, spot=250.0, **kw)
         assert 0 < r < full_cash, f"{strat} reserve {r} should be margin (< full cash {full_cash})"
+    # A naked strategy without option_type fails LOUDLY (no silent direction default)...
+    with pytest.raises(ValueError):
+        acct.option_reserve_required("naked_put", 1, strike=225.0, spot=250.0)
+    # ...except short_straddle, which reserves the worst case over both rights:
+    # max(call: OTM=0 -> 0.20*250, put: OTM=25 -> max(50-25,25)) *100*2 = 5000*2.
+    assert acct.option_reserve_required(
+        "short_straddle", 2, strike=225.0, spot=250.0) == pytest.approx(10000.0)
     # cash-secured put stays fully secured (full strike*100 by design).
     assert acct.option_reserve_required("cash_secured_put", 1, strike=225.0) == pytest.approx(22500.0)

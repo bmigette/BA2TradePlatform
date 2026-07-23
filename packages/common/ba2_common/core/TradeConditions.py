@@ -1322,14 +1322,8 @@ class PercentOpenToNewTargetCondition(CompareCondition):
         return f"{self.calculated_value:+.2f}%"
 
 
-def _get_pnl_via_transaction(existing_order, current_price) -> Optional[Dict]:
-    """
-    Look up the Transaction linked to existing_order and calculate P&L using
-    TransactionHelper.calculate_pnl — the same formula as the Live Trades page.
-    Returns the pnl dict {'amount', 'percent'} or None on failure.
-    """
-    from ba2_common.core.TransactionHelper import TransactionHelper
-    from ba2_common.core.db import get_db
+def _get_transaction_for_order(existing_order):
+    """Look up the Transaction linked to existing_order (None if not found)."""
     from ba2_common.core.models import Transaction
 
     transaction_id = getattr(existing_order, 'transaction_id', None)
@@ -1348,7 +1342,93 @@ def _get_pnl_via_transaction(existing_order, current_price) -> Optional[Dict]:
         logger.warning(f"Transaction {transaction_id} not found for order {existing_order.id}")
         return None
 
+    return transaction
+
+
+def _get_pnl_via_transaction(existing_order, current_price) -> Optional[Dict]:
+    """
+    Look up the Transaction linked to existing_order and calculate P&L using
+    TransactionHelper.calculate_pnl — the same formula as the Live Trades page.
+    Returns the pnl dict {'amount', 'percent'} or None on failure.
+    """
+    from ba2_common.core.TransactionHelper import TransactionHelper
+
+    transaction = _get_transaction_for_order(existing_order)
+    if transaction is None:
+        return None
+
     return TransactionHelper.calculate_pnl(transaction, current_price)
+
+
+def _get_option_pnl_via_transaction(account, existing_order) -> Optional[Dict]:
+    """
+    P&L of an OPTION position, priced off the option premium and scaled by the
+    contract multiplier.
+
+    For an option transaction open_price is the per-share PREMIUM, so comparing
+    it against the underlying share price (what get_current_price() returns for
+    the underlying symbol) overstates P&L by orders of magnitude. Instead the
+    current premium comes from the account's option quote: long (BUY) positions
+    mark at the bid, short (SELL) at the ask, each falling back to last when
+    that side of the quote is missing. Returns the pnl dict {'amount', 'percent'}
+    or None when no premium or multiplier is obtainable (never a fabricated price).
+    """
+    from ba2_common.core.TransactionHelper import TransactionHelper
+    from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
+    from ba2_common.core.types import OrderDirection
+
+    if not isinstance(account, OptionsAccountInterface):
+        logger.warning(f"Account does not support options; cannot compute option P&L for order {existing_order.id}")
+        return None
+
+    transaction = _get_transaction_for_order(existing_order)
+    if transaction is None:
+        return None
+
+    try:
+        quote = account.get_option_quote(existing_order.contract_symbol)
+    except Exception as e:
+        logger.error(f"Error fetching option quote for {existing_order.contract_symbol}: {e}", exc_info=True)
+        return None
+    if quote is None:
+        logger.warning(f"No option quote for {existing_order.contract_symbol} — cannot compute option P&L")
+        return None
+
+    if transaction.side == OrderDirection.BUY:
+        current_premium = quote.bid if quote.bid is not None else quote.last
+    else:
+        current_premium = quote.ask if quote.ask is not None else quote.last
+    if current_premium is None:
+        logger.warning(f"Option quote for {existing_order.contract_symbol} has no usable premium (bid/ask/last all None)")
+        return None
+
+    # The multiplier is carried from the originating order onto the transaction
+    # at creation (100 for standard options); refuse to guess when it is missing.
+    multiplier = transaction.multiplier or existing_order.multiplier
+    if not multiplier:
+        logger.warning(f"No contract multiplier on transaction {transaction.id} or order {existing_order.id} — cannot compute option P&L")
+        return None
+
+    return TransactionHelper.calculate_option_pnl(transaction, current_premium, multiplier)
+
+
+def _get_pnl_for_condition(condition) -> Optional[Dict]:
+    """
+    P&L of the condition's existing_order: option orders are priced off the
+    option premium (see _get_option_pnl_via_transaction), equity orders off the
+    instrument's current price (legacy behavior, unchanged).
+    """
+    from ba2_common.core.types import AssetClass
+
+    existing_order = condition.existing_order
+    if getattr(existing_order, 'asset_class', None) == AssetClass.OPTION and existing_order.contract_symbol:
+        return _get_option_pnl_via_transaction(condition.account, existing_order)
+
+    current_price = condition.get_current_price()
+    if current_price is None:
+        return None
+
+    return _get_pnl_via_transaction(existing_order, current_price)
 
 
 class ProfitLossAmountCondition(CompareCondition):
@@ -1360,12 +1440,7 @@ class ProfitLossAmountCondition(CompareCondition):
                 self.calculated_value = None
                 return False
 
-            current_price = self.get_current_price()
-            if current_price is None:
-                self.calculated_value = None
-                return False
-
-            pnl = _get_pnl_via_transaction(self.existing_order, current_price)
+            pnl = _get_pnl_for_condition(self)
             if pnl is None:
                 self.calculated_value = None
                 return False
@@ -1396,12 +1471,7 @@ class ProfitLossPercentCondition(CompareCondition):
                 self.calculated_value = None
                 return False
 
-            current_price = self.get_current_price()
-            if current_price is None:
-                self.calculated_value = None
-                return False
-
-            pnl = _get_pnl_via_transaction(self.existing_order, current_price)
+            pnl = _get_pnl_for_condition(self)
             if pnl is None:
                 self.calculated_value = None
                 return False

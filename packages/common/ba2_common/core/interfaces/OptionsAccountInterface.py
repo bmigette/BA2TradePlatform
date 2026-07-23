@@ -225,17 +225,32 @@ class OptionsAccountInterface(ABC):
     NAKED_MARGIN_FLOOR_FRACTION = 0.10
 
     @classmethod
-    def naked_margin_per_contract(cls, strike: float, *, spot: float | None = None) -> float:
+    def naked_margin_per_contract(cls, strike: float, *, option_type: OptionRight,
+                                  spot: float | None = None) -> float:
         """Reg-T naked single-option initial margin for ONE contract (x100 multiplier).
 
-        ``max(0.20*underlying - OTM, 0.10*underlying) * 100`` using ``spot`` when known
-        (OTM amount = |spot - strike|). Without a spot, falls back to ``0.20*strike*100``
-        (OTM term dropped) — still ~5x cheaper than the old full strike*100 cash proxy."""
+        Reg-T / CBOE naked-short initial margin is::
+
+            premium + max(20% * underlying - OTM_amount, 10% * underlying)
+
+        where the OTM amount is 0 for an ITM option (NEVER negative — an ITM short
+        carries the full 20%-of-notional requirement, there is no OTM deduction):
+          * CALL: OTM_amount = max(strike - spot, 0)
+          * PUT:  OTM_amount = max(spot - strike, 0)
+
+        The PREMIUM term is NOT added here: this returns only the per-share bracket
+        x100, and the collected premium already sits in the account's cash where it
+        offsets the requirement (callers reserve/margin the bracket only). ``spot``
+        is used when known; without it, falls back to ``0.20*strike*100`` (OTM term
+        dropped) — still ~5x cheaper than the old full strike*100 cash proxy."""
         if strike is None or strike <= 0:
             return 0.0
         if spot is None or spot <= 0:
             return cls.NAKED_MARGIN_FRACTION * strike * 100.0
-        otm = abs(spot - strike)
+        if option_type == OptionRight.CALL:
+            otm = max(float(strike) - float(spot), 0.0)
+        else:
+            otm = max(float(spot) - float(strike), 0.0)
         primary = cls.NAKED_MARGIN_FRACTION * spot - otm
         floor = cls.NAKED_MARGIN_FLOOR_FRACTION * spot
         return max(primary, floor) * 100.0
@@ -243,8 +258,15 @@ class OptionsAccountInterface(ABC):
     @classmethod
     def option_reserve_required(cls, strategy: str, quantity: int, *, strike: float | None = None,
                                spread_width: float | None = None, net_credit: float | None = None,
-                               spot: float | None = None) -> float:
-        """Cash/BP that a short-premium strategy must reserve. 0 for long/debit strategies."""
+                               spot: float | None = None, option_type: OptionRight | None = None) -> float:
+        """Cash/BP that a short-premium strategy must reserve. 0 for long/debit strategies.
+
+        ``option_type`` is REQUIRED for the single-sided naked strategies
+        (``short_strangle``/``naked_put``/``put_ratio_spread``) — the Reg-T OTM amount
+        is direction-aware, so a missing right would silently misstate the reserve.
+        ``short_straddle`` needs none: it shorts BOTH rights at the same strike and
+        Reg-T margins a straddle at the GREATER of the two legs, so the worst case
+        over both rights is reserved."""
         if quantity <= 0:
             return 0.0
         if strategy == "cash_secured_put":
@@ -262,7 +284,18 @@ class OptionsAccountInterface(ABC):
             # NAKED short premium: reserve the Reg-T naked-option margin, not full cash.
             if strike is None:
                 return 0.0
-            return cls.naked_margin_per_contract(strike, spot=spot) * quantity
+            if strategy == "short_straddle":
+                # Both a short call AND a short put at the SAME strike: reserve the
+                # worst-case leg (only one side can finish ITM; Reg-T charges the greater).
+                return max(
+                    cls.naked_margin_per_contract(strike, option_type=OptionRight.CALL, spot=spot),
+                    cls.naked_margin_per_contract(strike, option_type=OptionRight.PUT, spot=spot),
+                ) * quantity
+            if option_type is None:
+                raise ValueError(
+                    f"option_reserve_required({strategy!r}) requires option_type — the Reg-T "
+                    "OTM amount is direction-aware (call: strike-spot, put: spot-strike).")
+            return cls.naked_margin_per_contract(strike, option_type=option_type, spot=spot) * quantity
         if strategy in ("iron_condor", "jade_lizard", "call_butterfly", "debit_spread"):
             if spread_width is None:
                 return 0.0
