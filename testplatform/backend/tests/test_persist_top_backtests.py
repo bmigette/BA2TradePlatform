@@ -68,7 +68,7 @@ _RESULTS = {
 }
 
 
-def _seed_opt_for_top_n(entry_rules=None):
+def _seed_opt_for_top_n(entry_rules=None, expert_settings=None):
     db = SessionLocal()
     try:
         strat = Strategy(name="top-n-strat", entry_rules=entry_rules or [], exit_rules=[])
@@ -86,7 +86,7 @@ def _seed_opt_for_top_n(entry_rules=None):
                     "backtest_id": 1,
                     "start_date": "2024-01-01", "end_date": "2024-06-01",
                     "enabled_instruments": ["AAPL"],
-                    "experts": [{"class": "FMPRating", "settings": {}}],
+                    "experts": [{"class": "FMPRating", "settings": expert_settings or {}}],
                     "initial_capital": 10000.0,
                     "account_settings": {"starting_cash": 10000.0},
                     "warmup_days": 30,
@@ -155,6 +155,54 @@ def test_persist_one_mirrors_entry_rules_into_strategy_params(monkeypatch):
         # None-vs-[] fix: only a PRUNED-to-zero template (a real template that existed) should
         # ever surface as an explicit [].
         assert bt.strategy_params.get("exitRules") is None
+    finally:
+        db.close()
+
+
+def test_persist_one_mirrors_fixed_settings_into_strategy_params(monkeypatch):
+    """Regression: the expert's FIXED (non-GA-tunable) settings from the optimization's
+    bt_block (e.g. sizing_mode=risk_atr) must be mirrored onto strategy_params as
+    expertFixedSettings, so a later export doesn't depend on the StrategyOptimization row
+    surviving (it can be pruned by db-cleanup while the "starred" Backtest stays) -- without
+    this, sizing_mode silently vanishes from a live deploy and the position ends up with no
+    safeguard stop-loss."""
+    opt_id = _seed_opt_for_top_n(expert_settings={"sizing_mode": "risk_atr"})
+    monkeypatch.setattr(_sync_client, "push_backtest", lambda bt, db: None)
+    monkeypatch.setattr(
+        _soh, "_persist_trial_worker",
+        lambda cfg: {"ok": True, "results": dict(_RESULTS)},
+    )
+
+    persisted = mod._persist_top_backtests(opt_id, "FMPRating", n=1, parallel=1)
+    assert persisted == 1
+
+    db = SessionLocal()
+    try:
+        from app.models.backtest import Backtest
+        bt = db.query(Backtest).filter_by(optimization_id=opt_id).one()
+        assert bt.strategy_params.get("expertFixedSettings") == {"sizing_mode": "risk_atr"}
+    finally:
+        db.close()
+
+
+def test_persist_one_omits_fixed_settings_key_when_none_configured(monkeypatch):
+    """No fixed_settings on the expert spec (the common case for non-RM experts) -> no
+    expertFixedSettings key at all, not an empty dict -- keeps strategy_params clean."""
+    opt_id = _seed_opt_for_top_n(expert_settings={})
+    monkeypatch.setattr(_sync_client, "push_backtest", lambda bt, db: None)
+    monkeypatch.setattr(
+        _soh, "_persist_trial_worker",
+        lambda cfg: {"ok": True, "results": dict(_RESULTS)},
+    )
+
+    persisted = mod._persist_top_backtests(opt_id, "FMPRating", n=1, parallel=1)
+    assert persisted == 1
+
+    db = SessionLocal()
+    try:
+        from app.models.backtest import Backtest
+        bt = db.query(Backtest).filter_by(optimization_id=opt_id).one()
+        assert "expertFixedSettings" not in bt.strategy_params
     finally:
         db.close()
 

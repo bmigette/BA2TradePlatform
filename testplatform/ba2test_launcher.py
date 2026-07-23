@@ -2721,6 +2721,20 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
         # diverge from their fitness (and from the UI "Load + run" / the in-place re-run).
         hoisted = _build_hoisted_state(bt_block) if bt_block.get("screener_opt") else None
 
+        # Fixed (non-GA-tunable) settings this optimization pinned for the expert, e.g.
+        # sizing_mode=risk_atr (see _EXPERT_OPT[...]["fixed_settings"]). These live only in
+        # bt_block["experts"][i]["settings"], sourced from StrategyOptimization.optimization_config
+        # -- a row that can be pruned by `server db-cleanup` long after this Backtest is "starred"
+        # and kept. Stash them directly onto each persisted Backtest.strategy_params so a later
+        # export/deploy (_derive_export_payload) doesn't depend on the optimization row surviving;
+        # without this, a pruned optimization silently drops sizing_mode from the deploy and the
+        # live instance ends up with zero safeguard stop-loss protection (see the PKE/CALX incident).
+        _fixed_settings = {}
+        for _spec in (bt_block.get("experts") or []):
+            if isinstance(_spec, dict) and _spec.get("class") == expert:
+                _fixed_settings = dict(_spec.get("settings") or {})
+                break
+
         # Top-N param sets by DISTINCT fitness (fall back to best_params if all_results is thin).
         # Dedup on fitness, not raw params: a converged GA yields many param sets that differ only
         # in INERT genes (e.g. exit:<id>:action_value while exit:<id>:enabled=0) yet score the same
@@ -2755,6 +2769,8 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
             # by the trial's UNIQUE backtest_id, so concurrent re-runs never collide.
             trial_cfg["persist_trading_db"] = True
             strategy_params = dict(params)
+            if _fixed_settings:
+                strategy_params["expertFixedSettings"] = _fixed_settings
             # Unified rule model (migration 028): the CONCRETE decoded TradeRule lists that
             # actually ran (genes applied, disabled rules/actions pruned) — what Load/export
             # restores.

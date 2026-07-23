@@ -1155,6 +1155,13 @@ def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dic
              if isinstance(k, str) and k.startswith("model:")}
             if isinstance(sp, dict) else {}
         )
+        # Fixed (non-GA-tunable) settings _persist_top_backtests stashed directly onto this
+        # Backtest's strategy_params at persist time (e.g. sizing_mode=risk_atr) -- the durable
+        # floor layer that survives even if the source StrategyOptimization row is later pruned
+        # by `server db-cleanup` (see _opt_backtest_block's docstring). Lowest priority: the
+        # live optimization row's base_settings (when it still resolves) and model_overrides
+        # both take precedence, this only fills the gap when they can't.
+        persisted_fixed = (sp.get("expertFixedSettings") or {}) if isinstance(sp, dict) else {}
         bt_block, _strat = _opt_backtest_block(backtest, db)
         # FULL expert settings = the optimization's base expert spec settings overlaid with the
         # optimized overrides (faithful reproduction); falls back to a standalone run's stored
@@ -1166,7 +1173,7 @@ def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dic
                 if isinstance(spec, dict) and spec.get("class") == backtest.expert_name:
                     base_settings = dict(spec.get("settings") or {})
                     break
-            expert_params = {**base_settings, **model_overrides}
+            expert_params = {**persisted_fixed, **base_settings, **model_overrides}
             acct = bt_block.get("account_settings") or {}
             # Universe: a SCREENER-settings run (``backtest.screener_opt`` present) must export the
             # screener block — store + the EFFECTIVE settings (run-level base overlaid with this
@@ -1197,6 +1204,7 @@ def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dic
                 # still win last, matching _build_daily_trial_config's merge order.
                 if screener_opt.get("apply_to_expert_settings") and _is_bypass_expert_class(backtest.expert_name):
                     expert_params = {
+                        **persisted_fixed,
                         **base_settings,
                         "universe_source": "screener",
                         "screener_store": screener_opt["store"],
@@ -1216,7 +1224,10 @@ def _derive_export_payload(backtest: Backtest, kind: str, db: Any = None) -> dic
             }
             interval = bt_block.get("execution_interval")
         else:
-            expert_params = model_overrides or _pick("expertSettings", "expert_settings") or {}
+            expert_params = (
+                {**persisted_fixed, **model_overrides} if (persisted_fixed or model_overrides)
+                else _pick("expertSettings", "expert_settings") or {}
+            )
             universe = _pick("universe")
             execution = {
                 "seed": _pick("seed"),
