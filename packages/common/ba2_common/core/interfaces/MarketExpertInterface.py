@@ -878,40 +878,90 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                 if transaction.open_price is None or transaction.quantity is None:
                     logger.warning(f"Transaction {transaction.id} missing open_price or quantity, skipping")
                     continue
-                
-                # Get current price from bulk-fetched prices
-                current_price = symbol_prices.get(transaction.symbol) if symbol_prices else None
-                if current_price is None:
-                    logger.warning(f"Could not get current price for {transaction.symbol}, using open_price")
-                    current_price = transaction.open_price
-                
+
+                is_option = bool(transaction.multiplier and transaction.multiplier != 1)
+                multiplier = float(transaction.multiplier) if is_option else 1.0
+
+                if is_option:
+                    # transaction.symbol is the UNDERLYING ticker for options (see
+                    # OptionsAccountInterface.submit_option_order) -- the bulk-fetched
+                    # symbol_prices above are the underlying's STOCK price, off by roughly the
+                    # option's leverage ratio. Price the option off its OWN quote instead (long
+                    # marks at bid, short at ask, last as fallback -- same convention as
+                    # TradeConditions._get_option_pnl_via_transaction).
+                    current_price = self._used_balance_option_price(account, transaction)
+                    if current_price is None:
+                        logger.warning(f"No option quote for transaction {transaction.id} "
+                                       f"({transaction.symbol}) — using open_price")
+                        current_price = transaction.open_price
+                else:
+                    # Get current price from bulk-fetched prices
+                    current_price = symbol_prices.get(transaction.symbol) if symbol_prices else None
+                    if current_price is None:
+                        logger.warning(f"Could not get current price for {transaction.symbol}, using open_price")
+                        current_price = transaction.open_price
+
                 # Calculate profit/loss based on side field
                 # BUY = LONG, SELL = SHORT
                 if transaction.side == OrderDirection.BUY:  # Long position
-                    profit_loss = (current_price - transaction.open_price) * transaction.quantity
-                else:  # Short position  
-                    profit_loss = (transaction.open_price - current_price) * transaction.quantity
-                
+                    profit_loss = (current_price - transaction.open_price) * transaction.quantity * multiplier
+                else:  # Short position
+                    profit_loss = (transaction.open_price - current_price) * transaction.quantity * multiplier
+
                 # Calculate used balance for this transaction
                 if profit_loss >= 0:
                     # Transaction is profitable, use open_price
-                    transaction_used = transaction.open_price * transaction.quantity
+                    transaction_used = transaction.open_price * transaction.quantity * multiplier
                 else:
                     # Transaction is losing money, use open_price + loss
                     loss_amount = abs(profit_loss)
-                    transaction_used = (transaction.open_price * transaction.quantity) + loss_amount
-                
+                    transaction_used = (transaction.open_price * transaction.quantity * multiplier) + loss_amount
+
                 used_balance += transaction_used
-                
+
                 logger.debug(f"Transaction {transaction.id} ({transaction.symbol}): "
                            f"Open=${transaction.open_price}, Current=${current_price}, "
                            f"P/L=${profit_loss:.2f}, Used=${transaction_used:.2f}")
             
             return used_balance
-            
+
         except Exception as e:
             logger.error(f"Error calculating used balance for expert {self.id}: {e}", exc_info=True)
             return None
+
+    @staticmethod
+    def _used_balance_option_price(account, transaction) -> Optional[float]:
+        """Current premium for an option transaction's used-balance mark: long positions at
+        bid, short at ask, last as fallback -- same convention as
+        TradeConditions._get_option_pnl_via_transaction. Resolves the contract symbol from the
+        transaction's entry order (transaction.symbol is the UNDERLYING ticker for options, not
+        quotable as a contract). A multi-leg parent (no single contract_symbol, e.g. a spread)
+        has no single quote to mark against -- returns None, and the caller falls back to
+        open_price (no P&L adjustment for that transaction's used-balance contribution; a
+        documented simplification, not a silent wrong number)."""
+        if not hasattr(account, "get_option_quote"):
+            return None
+        try:
+            from ba2_common.core.trade_store import orders_where
+            entries = orders_where(transaction_id=transaction.id, depends_on_order=None)
+        except Exception as e:
+            logger.debug(f"_used_balance_option_price: entry order lookup failed for "
+                         f"transaction {transaction.id}: {e}")
+            return None
+        contract_symbol = next((o.contract_symbol for o in entries if o.contract_symbol), None)
+        if not contract_symbol:
+            return None
+        try:
+            quote = account.get_option_quote(contract_symbol)
+        except Exception as e:
+            logger.debug(f"_used_balance_option_price: quote lookup failed for "
+                         f"{contract_symbol}: {e}")
+            return None
+        if quote is None:
+            return None
+        if transaction.side == OrderDirection.BUY:
+            return quote.bid if quote.bid is not None else quote.last
+        return quote.ask if quote.ask is not None else quote.last
 
     def has_sufficient_balance_for_entry(self) -> bool:
         """

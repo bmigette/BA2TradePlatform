@@ -360,17 +360,58 @@ class AccountInterface(ReadOnlyAccountInterface):
                 raise ValueError(f"Transaction {trading_order.transaction_id} not found")
             logger.debug(f"Order linked to existing transaction {trading_order.transaction_id}")
     
+    def _estimate_transaction_open_price(self, trading_order: TradingOrder) -> Optional[float]:
+        """Best-effort entry-price ESTIMATE for a just-created Transaction (superseded by the
+        order's own real fill data for anything that reads the ORDER directly, e.g. round-trip
+        trade reporting -- this is only what gets stamped on the Transaction row itself).
+
+        For an OPTION order, ``trading_order.symbol`` is the UNDERLYING ticker (see
+        ``OptionsAccountInterface.submit_option_order``: ``symbol=(first.underlying or
+        first.contract_symbol)``), so ``get_instrument_current_price(symbol)`` would return
+        the underlying's STOCK price -- wrong by roughly the option's leverage ratio. Confirmed
+        live: a real backtest transaction showed ``open_price=$497.37`` for a META call whose
+        actual premium was a few dollars -- that corrupted value then fed
+        ``MarketExpertInterface._calculate_used_balance`` (``open_price * quantity``, no
+        multiplier), overstating that ONE position's "used" capital by ~100x and tripping the
+        entry equity-gate into rejecting nearly every other candidate for the rest of the run.
+
+        Priced instead off the option's own premium: single-leg via ``get_option_quote``
+        (mid of bid/ask, else last, else whichever side is available); a multi-leg parent (no
+        ``contract_symbol``) via its own ``limit_price`` -- the net debit/credit
+        ``submit_option_order`` already computed for the combo. Equity orders are unaffected
+        (unchanged ``get_instrument_current_price`` call)."""
+        from ba2_common.core.types import AssetClass
+        if getattr(trading_order, "asset_class", None) != AssetClass.OPTION:
+            return self.get_instrument_current_price(trading_order.symbol)
+
+        if trading_order.contract_symbol and hasattr(self, "get_option_quote"):
+            try:
+                quote = self.get_option_quote(trading_order.contract_symbol)
+            except Exception as e:
+                logger.debug(f"_estimate_transaction_open_price: quote lookup failed for "
+                             f"{trading_order.contract_symbol}: {e}")
+                quote = None
+            if quote is not None:
+                if quote.bid is not None and quote.ask is not None:
+                    return (quote.bid + quote.ask) / 2.0
+                for px in (quote.last, quote.bid, quote.ask):
+                    if px is not None:
+                        return px
+        # Multi-leg parent (no single contract to quote) or quote unavailable: fall back to
+        # the order's own limit_price, the net premium already computed at submission time.
+        return abs(trading_order.limit_price) if trading_order.limit_price else None
+
     def _create_transaction_for_order(self, trading_order: TradingOrder) -> None:
         """
         Create a new Transaction for the given trading order.
-        
+
         Args:
             trading_order: The TradingOrder object to create a transaction for
         """
         try:
             # Get current price for the symbol (this will be the open_price estimate)
-            current_price = self.get_instrument_current_price(trading_order.symbol)
-            
+            current_price = self._estimate_transaction_open_price(trading_order)
+
             # Get expert_id from the expert_recommendation if available
             expert_id = None
             if trading_order.expert_recommendation_id:
