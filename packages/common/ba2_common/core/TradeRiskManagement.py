@@ -725,6 +725,13 @@ class TradeRiskManagement:
                         max_position_value=available_for_instrument,
                         available_balance=remaining_balance,
                     )
+                else:
+                    # notional mode still sizes purely by equity/balance below (unaffected), but
+                    # a strategy whose exit conditions set NO stop-loss must not trade fully
+                    # unprotected just because it isn't in risk_atr mode -- attach the same
+                    # safeguard stop here (quantity-neutral: it only sets order.stop_price so the
+                    # existing bracket mechanism creates a protective SL leg).
+                    self._ensure_safeguard_stop(order, symbol, current_price, expert)
 
                 if not sized_by_risk:
                     # Calculate maximum affordable quantity based on available equity per instrument
@@ -855,19 +862,21 @@ class TradeRiskManagement:
 
         return orders_to_update, orders_to_delete, symbol_prices
 
-    def _risk_atr_quantity(self, order, symbol: str, current_price: float, expert,
-                           max_position_value: float, available_balance: float) -> int:
-        """Risk-based share count for one order (risk_atr sizing mode).
-
-        Stop distance comes from the order's explicit SL price when present, else
-        atr_multiplier * ATR. Result is clamped by the per-instrument cap and the
-        remaining balance (passed in), and respects any lot_size on the order.
-        Returns 0 (order will be deleted as unfunded) when it can't be sized.
+    def _ensure_safeguard_stop(self, order, symbol: str, current_price: float, expert) -> None:
+        """Write a protective stop-loss to ``order.stop_price`` when the strategy's exit
+        conditions left none — REGARDLESS of ``sizing_mode``. An entry with no explicit SL must
+        never trade fully unprotected just because it happens to be sized in ``notional`` mode
+        (the default); the risk_atr-only version of this safeguard let a live instance that never
+        set ``sizing_mode`` (defaulting to notional) hold positions with literally no stop for
+        days. No-ops if the order already has a stop_price (an explicit SL from the ruleset always
+        wins). The caller (live TradeManager / backtest daily_engine, both share this method) must
+        pass the result as ``submit_order(..., sl_price=order.stop_price)`` — the EXISTING bracket
+        mechanism — for the WAITING_TRIGGER protective SL leg to actually be created.
         """
-        from ba2_common.core.position_sizing import (
-            compute_risk_based_quantity, get_latest_atr, synthesize_safeguard_stop)
+        if order.stop_price:
+            return
+        from ba2_common.core.position_sizing import get_latest_atr, synthesize_safeguard_stop
 
-        equity = expert.get_virtual_balance()
         risk_pct = float(expert.get_setting_with_interface_default('risk_per_trade_pct', log_warning=False) or 1.0)
         atr_mult = float(expert.get_setting_with_interface_default('atr_multiplier', log_warning=False) or 2.0)
         atr_period = int(expert.get_setting_with_interface_default('atr_period', log_warning=False) or 14)
@@ -877,31 +886,43 @@ class TradeRiskManagement:
         # stops are too tight and causing frequent whipsaw (see synthesize_safeguard_stop).
         use_atr_stop = bool(expert.get_setting_with_interface_default('use_atr_stop', log_warning=False))
 
-        # SAFEGUARD SL FIRST, then size off it — ONE stop distance for both. When the order has
-        # NO explicit stop (the strategy's exit conditions set none), synthesize the hard
-        # protective stop (TIGHTER of ATR×atr_multiplier / risk_per_trade_pct%, floored at
-        # min_stop_loss_pct; ATR leg skipped when use_atr_stop is off) and write it to
-        # order.stop_price BEFORE sizing, so compute_risk_based_quantity keys the share count off
-        # the ACTUAL stop that will protect the position. Previously sizing and safeguard computed
-        # their distances independently (sizing: ATR-or-min_stop fallback; safeguard: min-of-two
-        # floored) — when they disagreed (e.g. use_atr_stop=0 with risk% > min_stop%) the realized
-        # loss at the stop exceeded risk_per_trade_pct by up to risk%/min_stop%. The caller (live
-        # TradeManager / backtest daily_engine, both share this method) must pass it as
-        # submit_order(..., sl_price=order.stop_price) — the EXISTING bracket mechanism — for the
-        # WAITING_TRIGGER protective SL leg to actually be created.
-        if not order.stop_price:
-            sl_atr = None
-            if use_atr_stop:
-                sl_atr = get_latest_atr(
-                    symbol, self.indicator_provider, period=atr_period, end_date=self.as_of)
-            sl = synthesize_safeguard_stop(
-                current_price, order.side == OrderDirection.BUY, risk_pct,
-                atr=sl_atr, atr_multiplier=atr_mult, min_stop_pct=min_stop_pct)
-            if sl:
-                order.stop_price = sl
-                self.logger.info(
-                    f"  safeguard SL for {symbol}: ${sl:.2f} "
-                    f"(min of ATR×{atr_mult:g} / {risk_pct:g}% risk, floor {min_stop_pct:g}%)")
+        sl_atr = None
+        if use_atr_stop:
+            sl_atr = get_latest_atr(
+                symbol, self.indicator_provider, period=atr_period, end_date=self.as_of)
+        sl = synthesize_safeguard_stop(
+            current_price, order.side == OrderDirection.BUY, risk_pct,
+            atr=sl_atr, atr_multiplier=atr_mult, min_stop_pct=min_stop_pct)
+        if sl:
+            order.stop_price = sl
+            self.logger.info(
+                f"  safeguard SL for {symbol}: ${sl:.2f} "
+                f"(min of ATR×{atr_mult:g} / {risk_pct:g}% risk, floor {min_stop_pct:g}%)")
+
+    def _risk_atr_quantity(self, order, symbol: str, current_price: float, expert,
+                           max_position_value: float, available_balance: float) -> int:
+        """Risk-based share count for one order (risk_atr sizing mode).
+
+        Stop distance comes from the order's explicit SL price when present, else
+        atr_multiplier * ATR. Result is clamped by the per-instrument cap and the
+        remaining balance (passed in), and respects any lot_size on the order.
+        Returns 0 (order will be deleted as unfunded) when it can't be sized.
+        """
+        from ba2_common.core.position_sizing import compute_risk_based_quantity
+
+        equity = expert.get_virtual_balance()
+        risk_pct = float(expert.get_setting_with_interface_default('risk_per_trade_pct', log_warning=False) or 1.0)
+        atr_mult = float(expert.get_setting_with_interface_default('atr_multiplier', log_warning=False) or 2.0)
+        min_stop_pct = float(expert.get_setting_with_interface_default('min_stop_loss_pct', log_warning=False) or 0.0)
+
+        # SAFEGUARD SL FIRST, then size off it — ONE stop distance for both. Writes
+        # order.stop_price BEFORE sizing (no-ops if already set), so compute_risk_based_quantity
+        # keys the share count off the ACTUAL stop that will protect the position. Previously
+        # sizing and safeguard computed their distances independently (sizing: ATR-or-min_stop
+        # fallback; safeguard: min-of-two floored) — when they disagreed (e.g. use_atr_stop=0
+        # with risk% > min_stop%) the realized loss at the stop exceeded risk_per_trade_pct by up
+        # to risk%/min_stop%.
+        self._ensure_safeguard_stop(order, symbol, current_price, expert)
 
         lot = (order.data or {}).get('lot_size') if order.data else None
         result = compute_risk_based_quantity(

@@ -116,13 +116,8 @@ def test_profit_factor_capped_when_no_losers():
 
 def test_calmar_ratio_floors_near_zero_drawdown():
     """Regression: a near-zero (but nonzero) max_drawdown must not blow calmar_ratio up to an
-    absurd value via division by a tiny denominator. A genuinely clean run (max_drawdown
-    rounds to 0.0 exactly) already short-circuits to calmar=0.0 via the existing `if
-    max_drawdown else 0.0` guard - the bug is a TINY nonzero drawdown (e.g. -0.01%), which is
-    truthy and so divides through unguarded. Observed on a real options-grid run: an 8-trade
-    individual with essentially no recorded drawdown posted calmar_ratio=852.98 for a genuinely
-    modest ~9% real return, purely because max_drawdown was a hair below zero rather than
-    exactly zero. Fix: floor abs(max_drawdown) at 1.0 (1 percentage point) before dividing."""
+    absurd value via division by a tiny denominator. Fix: floor abs(max_drawdown) at 1.0 (1
+    percentage point) before dividing."""
     tiny_dip_snaps = [
         _snap(datetime(2024, 1, 2), 100_000.0),
         _snap(datetime(2024, 6, 1), 99_990.0),   # -0.01% dip from the running peak
@@ -134,6 +129,27 @@ def test_calmar_ratio_floors_near_zero_drawdown():
     # stay in the same order of magnitude as the annualized return itself.
     assert r["calmar_ratio"] < abs(r["annualized_return"]) * 1.5
     assert math.isfinite(r["calmar_ratio"])
+
+
+def test_calmar_ratio_uses_floor_on_exact_zero_drawdown():
+    """Regression: an equity curve that never dips below its running peak (max_drawdown exactly
+    0.0, not just near-zero) must still be ranked via the 1% floor denominator, not zeroed out.
+    Previously `if max_drawdown else 0.0` treated an EXACT 0.0 as "no drawdown data" and
+    short-circuited calmar_ratio to a flat 0.0 regardless of how profitable the run was. On a
+    real options-grid run this tied ~85% of a GA population (thin, quiet configs whose
+    daily-bar curve happened to never dip) at fitness=0.0, making calmar-based ranking useless
+    across the population."""
+    monotonic_snaps = [
+        _snap(datetime(2024, 1, 2), 100_000.0),
+        _snap(datetime(2024, 7, 1), 110_000.0),
+        _snap(datetime(2025, 1, 2), 120_000.0),  # never dips below the running peak
+    ]
+    r = build_results(_AccountStub(monotonic_snaps, []), CONFIG)
+    assert r["max_drawdown"] == pytest.approx(0.0)
+    assert r["annualized_return"] > 0
+    # Floored denominator (1.0pp) -> calmar == annualized_return, not 0.0.
+    assert r["calmar_ratio"] == pytest.approx(r["annualized_return"], rel=0.01)
+    assert r["calmar_ratio"] > 0
 
 
 def test_curves_present_with_frontend_field_names():

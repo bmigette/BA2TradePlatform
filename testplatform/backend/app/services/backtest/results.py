@@ -355,10 +355,13 @@ def _compute_metrics(
     # --- drawdown ----------------------------------------------------------
     dd_values = [pt["drawdown"] for pt in drawdown_curve]  # <= 0
     max_drawdown = min(dd_values) if dd_values else 0.0  # most negative
-    if refine_drawdown_fn is not None and max_drawdown:
+    if refine_drawdown_fn is not None and dd_values:
         # Best-effort: a daily-bar equity curve can hide a real intraday dip for a
         # single-bar-held option trade, or one whose exit day made a new low vs. the day
         # before -- see intraday_drawdown.py. Only ever makes max_drawdown MORE negative.
+        # Gated on dd_values (a curve exists at all), NOT on max_drawdown being nonzero --
+        # an exact-zero daily-bar drawdown is exactly the case this refinement exists to catch
+        # (a quick option trade whose entry/exit bars never register a dip on the daily curve).
         try:
             max_drawdown = refine_drawdown_fn(trades, max_drawdown)
         except Exception as e:  # noqa: BLE001 -- refinement must never fail the backtest
@@ -366,7 +369,13 @@ def _compute_metrics(
     neg_dd = [d for d in dd_values if d < 0]
     avg_drawdown = (sum(neg_dd) / len(neg_dd)) if neg_dd else 0.0
     max_dd_duration = _max_drawdown_duration_days(drawdown_curve)
-    calmar = (annualized_return / max(abs(max_drawdown), _MIN_DRAWDOWN_FLOOR_PCT)) if max_drawdown else 0.0
+    # Floor-based denominator applies whenever there IS an equity curve (dd_values non-empty),
+    # including an exact-zero recorded drawdown -- NOT just the near-zero-but-nonzero case. A
+    # genuinely clean, profitable run should be ranked via the 1% floor like a near-zero one,
+    # not zeroed out entirely (that made every zero-drawdown trial tie at calmar=0.0 regardless
+    # of how profitable it was, which defeated calmar-based ranking for thin/quiet strategies
+    # such as options). Only a truly empty curve (no data at all) falls back to 0.0.
+    calmar = (annualized_return / max(abs(max_drawdown), _MIN_DRAWDOWN_FLOOR_PCT)) if dd_values else 0.0
 
     # --- trade quality -----------------------------------------------------
     pnls = [t["pnl"] for t in trades]
@@ -465,7 +474,7 @@ def _compute_metrics(
         adj_final = final - excess
         adjusted_total_return = ((adj_final - initial) / initial * 100.0) if initial else 0.0
         adjusted_annualized_return = _annualized_return(initial, adj_final, years)
-        adjusted_calmar = (adjusted_annualized_return / max(abs(max_drawdown), _MIN_DRAWDOWN_FLOOR_PCT)) if max_drawdown else 0.0
+        adjusted_calmar = (adjusted_annualized_return / max(abs(max_drawdown), _MIN_DRAWDOWN_FLOOR_PCT)) if dd_values else 0.0
         # Trade-quality on capped pnls (mirrors the raw block above).
         a_wins = [p for p in adj_pnls if p > 0]
         a_losses = [p for p in adj_pnls if p < 0]
