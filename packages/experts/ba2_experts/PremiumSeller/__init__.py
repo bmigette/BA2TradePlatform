@@ -256,14 +256,16 @@ class PremiumSeller(MarketExpertInterface):
 
     def _fetch_closes(self, sym: str, as_of: datetime,
                       settings: Dict[str, Any]) -> Optional[List[float]]:
+        """Recent daily closes via the OHLCV provider. get_ohlcv_data's contract is a
+        single pd.DataFrame with a capital-C "Close" column (FactorRanker consumes it
+        the same way). None on any missing data — the gates treat None as "cannot
+        evaluate" and skip, never a fabricated number."""
         lookback = max(int(settings["trend_sma"]), int(settings["hv_lookback"])) + 10
         data = self._context.providers.ohlcv().get_ohlcv_data(
             sym, end_date=as_of, lookback_days=int(lookback * 1.5) + 10, interval="1d")
-        rows = data.get(sym) if isinstance(data, dict) else data
-        if not rows:
+        if data is None or getattr(data, "empty", True) or "Close" not in getattr(data, "columns", []):
             return None
-        closes = [r["close"] if isinstance(r, dict) else r.close for r in rows]
-        closes = [c for c in closes if c is not None]
+        closes = [c for c in data["Close"].tolist() if c is not None]
         return closes or None
 
     def _earnings_blocked(self, sym: str, as_of: datetime, target_dte: int) -> bool:

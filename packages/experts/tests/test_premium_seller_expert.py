@@ -1,5 +1,8 @@
 from datetime import date, datetime
+from importlib import import_module
 from types import SimpleNamespace
+
+import pandas as pd
 
 from ba2_common.core.backtest_context import BacktestContext
 from ba2_common.core.option_types import OptionContract
@@ -56,10 +59,11 @@ class StubProviders:
         return 100.0
 
 
-def make_expert(account, settings=None):
+def make_expert(account, settings=None, providers=None):
     expert = PremiumSeller.__new__(PremiumSeller)
     expert._iv_history = {}
-    ctx = BacktestContext(providers=StubProviders(), settings=settings or dict(FULL_SETTINGS),
+    ctx = BacktestContext(providers=providers or StubProviders(),
+                          settings=settings or dict(FULL_SETTINGS),
                           as_of=AS_OF, account=account, subtype=None)
     return expert, ctx
 
@@ -132,3 +136,104 @@ def test_trend_filter_blocks(monkeypatch):
                           account=account, subtype=None)
     rec = expert.analyze_as_of(AS_OF, ctx)
     assert rec.raw_outputs["targets"]["structures"] == []
+
+
+class OHLCVProviders(StubProviders):
+    """Providers stub whose ohlcv() honors the REAL get_ohlcv_data contract: a
+    single pd.DataFrame with a capital-C "Close" column (what FactorRanker and
+    the backtest context consume). Used by the no-monkeypatch regression tests."""
+
+    def __init__(self, closes):
+        self._closes = closes
+
+    def ohlcv(self):
+        closes = self._closes
+        return SimpleNamespace(
+            get_ohlcv_data=lambda *a, **k: pd.DataFrame({"Close": closes}))
+
+
+def test_trend_filter_dataframe_passes_above_sma():
+    """Regression for the _fetch_closes DataFrame-contract bug: no monkeypatching of
+    _fetch_closes — the gate must read the Close column off the DataFrame. Last close
+    above SMA(3) -> gate passes, structures emitted."""
+    settings = dict(FULL_SETTINGS, trend_filter_enabled=True, trend_sma=3,
+                    risk_per_structure_pct=10.0)
+    providers = OHLCVProviders([10.0, 10.0, 13.0])     # sma 11.0, spot 13.0 >= 11.0
+    expert, ctx = make_expert(StubAccount(chain_for()), settings, providers)
+    rec = expert.analyze_as_of(AS_OF, ctx)
+    specs = rec.raw_outputs["targets"]["structures"]
+    assert len(specs) == 2
+    assert specs[0].strategy == "put_credit_spread" and specs[0].underlying == "XYZ"
+
+
+def test_trend_filter_dataframe_blocks_below_sma():
+    """Same real-DataFrame path; last close below SMA(3) -> gate blocks, zero structures."""
+    settings = dict(FULL_SETTINGS, trend_filter_enabled=True, trend_sma=3,
+                    risk_per_structure_pct=10.0)
+    providers = OHLCVProviders([13.0, 13.0, 10.0])     # sma 12.0, spot 10.0 < 12.0
+    expert, ctx = make_expert(StubAccount(chain_for()), settings, providers)
+    rec = expert.analyze_as_of(AS_OF, ctx)
+    assert rec.raw_outputs["targets"]["structures"] == []
+
+
+def _patch_earnings(monkeypatch, report_date):
+    """Patch the FMP earnings seam at its source module (the expert imports it lazily
+    inside _earnings_blocked). get_app_setting is patched in the PROVIDER module's
+    namespace (module-level `from ... import`) so __init__ doesn't raise on a missing
+    FMP_API_KEY. The package __init__ rebinds the submodule name to the CLASS, so the
+    module must be resolved via import_module, not attribute access."""
+    details_mod = import_module("ba2_providers.fundamentals.details.FMPCompanyDetailsProvider")
+    monkeypatch.setattr(details_mod, "get_app_setting",
+                        lambda key, default=None: "dummy-key")
+    monkeypatch.setattr(details_mod.FMPCompanyDetailsProvider, "get_past_earnings",
+                        lambda self, *a, **k: {"earnings": [{"report_date": report_date}]})
+
+
+def test_earnings_gate_blocks_inside_window(monkeypatch):
+    # AS_OF 2024-01-02, window = target_dte 38 + 5 = 43d -> ends 2024-02-14;
+    # a 2024-01-20 report lands inside -> blocked.
+    _patch_earnings(monkeypatch, "2024-01-20")
+    settings = dict(FULL_SETTINGS, earnings_filter_enabled=True,
+                    risk_per_structure_pct=10.0)
+    expert, ctx = make_expert(StubAccount(chain_for()), settings)
+    rec = expert.analyze_as_of(AS_OF, ctx)
+    assert rec.raw_outputs["targets"]["structures"] == []
+
+
+def test_earnings_gate_passes_outside_window(monkeypatch):
+    _patch_earnings(monkeypatch, "2024-06-01")          # far outside the 43d window
+    settings = dict(FULL_SETTINGS, earnings_filter_enabled=True,
+                    risk_per_structure_pct=10.0)
+    expert, ctx = make_expert(StubAccount(chain_for()), settings)
+    rec = expert.analyze_as_of(AS_OF, ctx)
+    assert len(rec.raw_outputs["targets"]["structures"]) == 2
+
+
+def _patch_rating(monkeypatch, grade):
+    """Patch the rating seam at its source modules (the expert imports both lazily
+    inside _rating_blocked, so patching the source-module attributes is enough).
+    ba2_experts/__init__ rebinds the FMPRating submodule name to the CLASS, so the
+    module must be resolved via import_module, not attribute access."""
+    fmp_rating_mod = import_module("ba2_experts.FMPRating")
+    monkeypatch.setattr("ba2_common.config.get_app_setting",
+                        lambda key, default=None: "dummy-key")
+    monkeypatch.setattr(fmp_rating_mod, "fetch_grades_historical_cached",
+                        lambda api_key, symbol: [{"date": "2023-12-15", "newGrade": grade}])
+
+
+def test_rating_floor_blocks_known_bad_grade(monkeypatch):
+    _patch_rating(monkeypatch, "Strong Sell")           # score 1 < 3.0 floor
+    settings = dict(FULL_SETTINGS, fmp_rating_floor_enabled=True, fmp_rating_min=3.0,
+                    risk_per_structure_pct=10.0)
+    expert, ctx = make_expert(StubAccount(chain_for()), settings)
+    rec = expert.analyze_as_of(AS_OF, ctx)
+    assert rec.raw_outputs["targets"]["structures"] == []
+
+
+def test_rating_floor_passes_strong_buy(monkeypatch):
+    _patch_rating(monkeypatch, "Strong Buy")            # score 5 >= 3.0 floor
+    settings = dict(FULL_SETTINGS, fmp_rating_floor_enabled=True, fmp_rating_min=3.0,
+                    risk_per_structure_pct=10.0)
+    expert, ctx = make_expert(StubAccount(chain_for()), settings)
+    rec = expert.analyze_as_of(AS_OF, ctx)
+    assert len(rec.raw_outputs["targets"]["structures"]) == 2
