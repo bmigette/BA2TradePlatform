@@ -1395,6 +1395,13 @@ class DailyBacktestEngine:
         # two per-bar ExpertInstance DB queries (manager __init__ + get_virtual_balance). When
         # the balance is unavailable, pass equity=None so the method self-computes (old path).
         pm = self._bypass_manager(expert_id)
+        # Managers that own their exits (PremiumSeller's OptionPortfolioManager.manage_open)
+        # have no per-name equity stop — skip cleanly. Without this guard the call below
+        # AttributeErrors, is swallowed by the broad except, and returns True -> the caller
+        # marks the book dirty and spams the log EVERY non-entry bar.
+        apply_stops = getattr(pm, "apply_stop_losses", None)
+        if apply_stops is None:
+            return False
         balance = self.account.get_balance()
         if balance is None:
             equity = None
@@ -1402,7 +1409,7 @@ class DailyBacktestEngine:
             equity = balance * (self._bypass_veq_pct.get(expert_id, 100.0) / 100.0)
 
         try:
-            submitted = pm.apply_stop_losses(float(stop_pct), equity=equity)
+            submitted = apply_stops(float(stop_pct), equity=equity)
         except Exception as e:  # noqa: BLE001 — a stop failure must not kill the run
             self._log(f"bypass stop failed for expert {expert_id} @ {as_of:%Y-%m-%d}: {e}")
             # Unknown whether an order was submitted before the failure -> assume YES so the fill
