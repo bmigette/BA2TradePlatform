@@ -125,7 +125,9 @@ Owns the full lifecycle (this replaces the RM for this expert):
 ## 4. Structure selection pipeline (per ENTRY bar)
 
 The expert does NOT predict direction. It systematically sells the same shapes of
-insurance every cycle on the richest premium available, sized by a risk budget.
+insurance every cycle on the richest premium available, sized by a risk budget. The
+entry gates below and the exit rules of §5 are the tunable core of the expert — every
+threshold is a GA gene (§7).
 
 1. **Universe.** Screener metric store (FactorRanker's data source) when the
    `universe_source=screener` filter is enabled, else the static `enabled_instruments`
@@ -138,7 +140,15 @@ insurance every cycle on the richest premium available, sized by a risk budget.
 4. **IVR gate** (GA-toggleable, threshold GA): IVR = rank of current chain IV within its
    ~1y history of cached OPRA chain snapshots. Skip underlyings below the gate. Ranking
    among survivors: IVR descending.
-5. **Structure construction** (per selected underlying, per the GA-tuned structure mix):
+5. **IV−HV spread gate** (GA-toggleable, threshold GA in vol points): sell only when
+   implied vol exceeds realized (historical) vol by at least X pp — the direct measure
+   of the premium seller's edge. HV from the underlying's daily closes (setting:
+   lookback window); missing HV history → gate fails closed (skip, never fabricate).
+6. **Trend filter** (GA-toggleable, SMA period GA): sell puts / put spreads only when
+   the underlying closes above its SMA(N) (default 200). A *when-not-to-sell* regime
+   rule, not a directional bet — it keeps the sleeve from selling insurance into
+   downtrends. Ignored for strangles (delta-neutral by construction).
+7. **Structure construction** (per selected underlying, per the GA-tuned structure mix):
    - Expiry nearest to target DTE (GA, 30–45).
    - Short strike(s): delta closest to target (GA, 0.16–0.35). Delta from OPRA greeks;
      Black-Scholes from chain IV as fallback; missing IV → skip underlying (never
@@ -149,7 +159,7 @@ insurance every cycle on the richest premium available, sized by a risk budget.
      defined-risk (max loss = (width − credit) × 100); for undefined-risk, qty bounded
      by the margin model and the notional leverage cap. Skip if credit < min-credit
      ratio (GA floor).
-6. **Targets emission.** Held structures count against the caps; only the gap between
+8. **Targets emission.** Held structures count against the caps; only the gap between
    current book and target book is emitted.
 
 ## 5. Position management (per MANAGE bar, daily)
@@ -158,12 +168,18 @@ Per held structure, in priority order:
 
 1. **Profit capture**: close at X% of max credit captured (GA, ~50%; ~25% for
    strangles).
-2. **Time stop / roll**: remaining DTE < roll threshold (GA, ~21) → close; if the
+2. **Tested-side management** (GA-toggleable, threshold GA): close or roll when the
+   short strike's delta exceeds the threshold (e.g. Δ > 0.30 — the position is being
+   tested). The standard practitioner adjustment; uses the same greeks source as entry
+   (OPRA greeks, BS-from-IV fallback, missing → no action this bar).
+3. **Time stop / roll**: remaining DTE < roll threshold (GA, ~21) → close; if the
    underlying still passes §4 filters and the book has room, re-enter fresh (the "always
    invested" engine). Managed at 21 DTE specifically to avoid end-of-life gamma
    (evidence §2).
-3. **Undefined-risk stop** (GA-toggleable): close at 200% of credit received.
-4. **Circuit breaker**: sleeve drawdown since equity peak > X% (GA) → flatten the whole
+4. **Defined-risk stop** (GA-toggleable, multiple GA): exit a spread when its loss
+   reaches N× the credit received (symmetric counterpart of the undefined-risk stop).
+5. **Undefined-risk stop** (GA-toggleable): close at 200% of credit received.
+6. **Circuit breaker**: sleeve drawdown since equity peak > X% (GA) → flatten the whole
    book and stand down until the next entry bar.
 
 What reaches expiry unit-settles via the engine's existing `_apply_option_expiry`.
@@ -185,13 +201,23 @@ fallbacks:
 
 ## 7. GA-tunable parameters (gene space)
 
-Structure mix enablement (`enable_put_credit_spread` / `enable_short_put` /
-`enable_short_strangle`), target delta, target DTE, spread width, profit-capture %,
-roll-DTE threshold, min-credit ratio, max deployment %, undefined-risk sub-cap %,
-notional leverage, max concurrent structures, circuit-breaker %, IVR gate threshold,
-IVR scaling on/off, earnings filter on/off, FMP-rating floor on/off + threshold,
-universe source (static/screener). Roughly 15–18 genes — deliberately smaller and more
-meaningful than the OS1–4 rm:/cond:/exit: gene soup.
+The entry/exit signal set of §4–§5 IS the tunable core of this expert — every threshold
+is a GA gene:
+
+- **Entry signals**: IVR gate on/off + threshold, IV−HV spread gate on/off + threshold
+  (+ HV lookback), trend filter on/off + SMA period, earnings filter on/off,
+  FMP-rating floor on/off + threshold, universe source (static/screener), target delta,
+  target DTE, spread width, min-credit ratio.
+- **Exit signals**: profit-capture % (per structure family), tested-side delta
+  management on/off + threshold, roll-DTE threshold, defined-risk stop on/off + credit
+  multiple, undefined-risk stop on/off (+ multiple), circuit-breaker %.
+- **Book/rails**: structure mix enablement (`enable_put_credit_spread` /
+  `enable_short_put` / `enable_short_strangle`), max deployment %, IVR scaling on/off,
+  undefined-risk sub-cap %, notional leverage, max concurrent structures.
+
+Roughly 20–24 genes — deliberately smaller and more meaningful than the OS1–4
+rm:/cond:/exit: gene soup. Every added toggle is overfit surface: the forward
+out-of-sample split (§10) is what keeps the tuned result honest.
 
 ## 8. Error handling
 
