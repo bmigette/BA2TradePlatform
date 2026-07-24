@@ -181,6 +181,11 @@ _SUPPORTED_EXPERTS = {
     # FactorPortfolioManager. ``_build_experts`` detects the marker and skips ruleset seeding /
     # RM-gate enabling for it; the engine routes its targets straight to the portfolio manager.
     "FactorRanker": "ba2_experts.FactorRanker",
+    # BYPASS expert (options): PremiumSeller declares ``bypasses_classic_rm`` AND
+    # ``manages_between_entries`` — it sells premium (CSP/CC) on its entry cadence via its
+    # own OptionPortfolioManager (``portfolio_manager_classpath``) and additionally runs a
+    # manage pass (exits only) on MANAGE bars. Engine seams route both passes.
+    "PremiumSeller": "ba2_experts.PremiumSeller",
     # Classic (non-bypass) signal experts, also no-LLM + analyze_as_of-driven:
     #  * FinnHubRating — analyst recommendation-trend rating (needs the ``finnhub_api_key`` setting;
     #    no LLM). Recommendation trends are disk-cached (backtest-only) like the FMP histories.
@@ -198,6 +203,7 @@ _SUPPORTED_EXPERTS = {
 # momentum needs a full year. An expert may override via a ``BACKTEST_WARMUP_BARS`` class attr.
 _EXPERT_WARMUP_BARS = {
     "FactorRanker": 252,          # momentum_12_1 lookback (12 months)
+    "PremiumSeller": 300,         # SMA-200/HV floor; matches BACKTEST_WARMUP_BARS
     "FMPRating": 10,
     "FMPEarningsDrift": 10,
     "FMPInsiderClusterBuy": 10,

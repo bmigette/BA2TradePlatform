@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 
 from ba2_common.core.option_types import OptionLeg
 from ba2_common.core.types import AssetClass, OrderDirection, OrderStatus
+from ba2_experts.PremiumSeller import portfolio as ps_portfolio_mod
 from ba2_experts.PremiumSeller.portfolio import OptionPortfolioManager
 from ba2_experts.PremiumSeller.structures import StructureSpec
 
@@ -141,8 +142,10 @@ def _combo_orders():
 
 def test_tested_combo_short_leg_over_threshold(monkeypatch):
     pm = make_manager()                              # tested_delta = 0.30
-    monkeypatch.setattr("ba2_experts.PremiumSeller.portfolio.orders_where",
-                        lambda **_: _combo_orders())
+    # Patch the module OBJECT (not the "ba2_experts.PremiumSeller.portfolio" string path):
+    # ba2_experts/__init__.py binds the name PremiumSeller to the CLASS, which shadows the
+    # submodule attribute and breaks monkeypatch's dotted-path resolution.
+    monkeypatch.setattr(ps_portfolio_mod, "orders_where", lambda **_: _combo_orders())
     pm.account.get_option_chain = lambda underlying, start, end: [
         SimpleNamespace(symbol="XYZP95", delta=-0.35)]   # |delta| 0.35 >= 0.30
     parent = SimpleNamespace(id=70, transaction_id=7)
@@ -151,8 +154,10 @@ def test_tested_combo_short_leg_over_threshold(monkeypatch):
 
 def test_tested_combo_short_leg_under_threshold(monkeypatch):
     pm = make_manager()                              # tested_delta = 0.30
-    monkeypatch.setattr("ba2_experts.PremiumSeller.portfolio.orders_where",
-                        lambda **_: _combo_orders())
+    # Patch the module OBJECT (not the "ba2_experts.PremiumSeller.portfolio" string path):
+    # ba2_experts/__init__.py binds the name PremiumSeller to the CLASS, which shadows the
+    # submodule attribute and breaks monkeypatch's dotted-path resolution.
+    monkeypatch.setattr(ps_portfolio_mod, "orders_where", lambda **_: _combo_orders())
     pm.account.get_option_chain = lambda underlying, start, end: [
         SimpleNamespace(symbol="XYZP95", delta=-0.20),   # |delta| 0.20 < 0.30
         SimpleNamespace(symbol="XYZP90", delta=None)]    # None delta -> no action

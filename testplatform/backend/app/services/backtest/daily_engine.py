@@ -233,6 +233,35 @@ def _schedule_allows_entry(as_of_dt: datetime, schedule: Optional[Dict[str, Any]
 
 
 # ---------------------------------------------------------------------------
+# BYPASS-expert seams (spec §3.3): manager-class resolution + run cadence.
+# ---------------------------------------------------------------------------
+def _resolve_bypass_manager_class(expert) -> Any:
+    """Portfolio-manager class for a bypass expert.
+
+    Experts may declare ``portfolio_manager_classpath`` (dotted path); the
+    default is FactorRanker's FactorPortfolioManager — byte-identical for every
+    existing bypass expert (spec §3.3.1)."""
+    import importlib
+    classpath = getattr(expert, "portfolio_manager_classpath", None)
+    if not classpath:
+        from ba2_experts.FactorRanker.portfolio import FactorPortfolioManager
+        return FactorPortfolioManager
+    module, _, name = classpath.rpartition(".")
+    return getattr(importlib.import_module(module), name)
+
+
+def _bypass_run_kind(expert, entry_ok: bool, manage_ok: bool) -> Optional[str]:
+    """Which pass a bypass expert runs this bar: "entry" on entry bars (always),
+    "manage" on manage bars ONLY when the expert declares
+    ``manages_between_entries`` (default False — FactorRanker unchanged)."""
+    if entry_ok:
+        return "entry"
+    if manage_ok and getattr(expert, "manages_between_entries", False):
+        return "manage"
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Option expiry / exercise / assignment
 # ---------------------------------------------------------------------------
 def option_expiry_outcome(opt_type, side, *, strike, spot, qty, multiplier=100):
@@ -403,7 +432,11 @@ class DailyBacktestEngine:
             self._entry_is_option = bool(a and is_option_action(str(a)))
 
     def _bypass_manager(self, expert_id: int) -> Any:
-        """Lazily build + cache the FactorPortfolioManager for a bypass expert (run-constant).
+        """Lazily build + cache the portfolio manager for a bypass expert (run-constant).
+
+        The manager class comes from ``_resolve_bypass_manager_class`` (default:
+        FactorRanker's FactorPortfolioManager; PremiumSeller declares its
+        OptionPortfolioManager via ``portfolio_manager_classpath``).
 
         Also caches the expert's ``virtual_equity_pct`` (read ONCE here, not per bar) so the
         per-bar stop can compute equity without re-querying ExpertInstance. Both are stable for
@@ -411,9 +444,10 @@ class DailyBacktestEngine:
         """
         pm = self._bypass_pm.get(expert_id)
         if pm is None:
-            from ba2_experts.FactorRanker.portfolio import FactorPortfolioManager
+            from ba2_common.core.instance_resolver import get_instance_resolver
 
-            pm = FactorPortfolioManager(expert_id)
+            expert = get_instance_resolver().get_expert_instance(expert_id)
+            pm = _resolve_bypass_manager_class(type(expert))(expert_id)
             self._bypass_pm[expert_id] = pm
             try:
                 from ba2_common.core.db import get_instance
@@ -610,10 +644,22 @@ class DailyBacktestEngine:
                     analyzed_manage_days.add(_day_key)
                 book_dirty = True  # an analysis/management pass runs -> orders may be created
                 if getattr(expert, "bypasses_classic_rm", False):
-                    # Bypass experts (FactorRanker) rebalance the whole book on their ENTRY cadence;
-                    # the rebalance IS the management, so run it only on entry bars.
-                    if entry_ok:
+                    # Bypass experts rebalance on their ENTRY cadence; experts that
+                    # declare manages_between_entries (PremiumSeller) also run a
+                    # manage pass on MANAGE bars (exits only). Default: entry-only
+                    # (FactorRanker byte-identical).
+                    kind = _bypass_run_kind(expert, entry_ok, manage_ok)
+                    if kind == "entry":
                         self._run_bypass_expert_bar(expert, expert_id, settings, as_of_dt)
+                    elif kind == "manage":
+                        try:
+                            self._bypass_manager(expert_id).manage_open(as_of_dt)
+                        except Exception as e:  # noqa: BLE001 — one bar must not abort the run
+                            from app.services.backtest.price_source import BacktestCacheMiss
+                            from ba2_providers.fmp_common import FMPHistoryCacheMiss
+                            if isinstance(e, (BacktestCacheMiss, FMPHistoryCacheMiss)):
+                                raise
+                            self._log(f"bypass manage_open failed for expert {expert_id} @ {as_of_dt:%Y-%m-%d}: {e}")
                     continue
                 if getattr(expert, "analyzes_as_basket", False):
                     # Basket experts (e.g. FMPSenateTraderWeight/FMPSenateTraderCopy) call

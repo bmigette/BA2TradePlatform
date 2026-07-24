@@ -301,6 +301,17 @@ def test_apply_bypass_stops_invokes_manager_when_risk_pct_set(monkeypatch):
     )
     # _bypass_manager reads virtual_equity_pct via get_instance — stub it (no DB in this unit test).
     monkeypatch.setattr(_db_mod, "get_instance", lambda *a, **k: _Inst(), raising=True)
+    # _bypass_manager resolves the manager CLASS through the instance resolver (PremiumSeller
+    # seam, spec §3.3) — wire a stub resolver returning the stub expert (no host seam wiring in
+    # this unit test). The stub declares no ``portfolio_manager_classpath``, so resolution still
+    # lands on the default FactorPortfolioManager.
+    import ba2_common.core.instance_resolver as _resolver_mod
+
+    class _Resolver:
+        def get_expert_instance(self, expert_id):
+            return _Expert()
+
+    monkeypatch.setattr(_resolver_mod, "_resolver", _Resolver(), raising=True)
 
     engine._apply_bypass_stops(_Expert(), 77, {}, datetime(2024, 1, 5))
     # Manager built ONCE for the expert; stop invoked with the pct and equity = 1000 * 100/100.
