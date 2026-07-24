@@ -2018,24 +2018,66 @@ _PURE_OPTION_STRATEGIES = set(_OPTION_STRATS) | set(_OPTION_GROUPS)
 _OPTION_STRATEGY_KEYS = _PURE_OPTION_STRATEGIES | {"O_CC", "O_PP", "O_STK"}
 
 
+def _resolve_fitness(cli_fitness: str | None, strat_kind: str, stock_default: str) -> str:
+    """Effective fitness metric for an optimize job. An explicit --fitness always wins.
+    Otherwise PURE-OPTION kinds (O_* except the equity-entry O_CC/O_PP/O_STK, and the
+    OS1-OS4 groups) default to consistent_annual_return — the ~30%/yr goal metric
+    (annualized return x drawdown guard x worst-year/mean-year consistency x >=30
+    trades/yr gate). Calmar/sharpe on option books rewards barely-trading low-drawdown
+    configs (v6 OS runs on calmar: 2-27 trades, TR 3.6-18%). STOCK kinds (and the
+    equity-entry option overlays) keep the command's historical default (``stock_default``)
+    so equity tuning is untouched.
+    """
+    if cli_fitness:
+        return cli_fitness
+    return "consistent_annual_return" if strat_kind in _PURE_OPTION_STRATEGIES else stock_default
+
+
 def _option_entry_action_for(kind: str) -> dict:
     """The option ENTRY action config for a pure-option strategy key (a fresh copy)."""
     return dict(_OPTION_STRATS[kind])
 
 
+# DEBIT structures (long premium): OS1/OS4 and their members. The TP band differs by payoff
+# profile (see _option_exit_rules).
+_DEBIT_OPTION_KINDS = {"O_LC", "O_LP", "O_VERT", "O_BF", "O_BULLCS", "O_STRD", "O_STRG",
+                       "OS1", "OS4"}
+
+
 def _option_exit_rules(kind: str):
-    """Close the held option at +50% premium profit, plus a time exit — both optimizable +
-    on/off-toggleable. (CLOSE on the held option position via ``close_option``.)"""
-    return [
+    """Close the held option at a premium-profit TP, plus a time exit — both optimizable +
+    on/off-toggleable. (CLOSE on the held option position via ``close_option``.)
+
+    Bands differ by payoff profile. DEBIT kinds get a WIDE TP band (default 100%, range
+    25-200%): long premium lives off the right tail — a 25-75% cap truncates the few big
+    winners that pay for the many small losers (v6 OS1 evidence: the GA disabled O_LC/O_LP
+    outright and converged to barely-trading configs). CREDIT kinds keep the tastytrade-style
+    tight band (default 50% of credit) and additionally get a toggleable STOP-LOSS at -100%
+    of credit (range -200..-50) so the GA can manage the short-premium left tail (v6 OS2/OS3:
+    56-87% win rate but only 3.8-18% TR — small wins eaten by uncapped losers).
+    """
+    debit = kind in _DEBIT_OPTION_KINDS
+    tp = ({"value": 100, "value_min": 25, "value_max": 200, "value_step": 25} if debit
+          else {"value": 50, "value_min": 25, "value_max": 75, "value_step": 5})
+    td = ({"value": 28, "value_min": 10, "value_max": 45, "value_step": 5} if debit
+          else {"value": 21, "value_min": 10, "value_max": 35, "value_step": 5})
+    rules = [
         {"id": "opt_tp", "action_type": "close_option", "toggle_optimize": True,
          "conditions": {"type": "AND", "conditions": [
-             {"id": "tp", "field": "profit_loss_percent", "op": ">", "value": 50,
-              "optimize": True, "value_min": 25, "value_max": 75, "value_step": 5}]}},
+             {"id": "tp", "field": "profit_loss_percent", "op": ">",
+              "optimize": True, **tp}]}},
         {"id": "opt_time", "action_type": "close_option", "toggle_optimize": True,
          "conditions": {"type": "AND", "conditions": [
-             {"id": "td", "field": "days_opened", "op": ">", "value": 21,
-              "optimize": True, "value_min": 10, "value_max": 35, "value_step": 5}]}},
+             {"id": "td", "field": "days_opened", "op": ">",
+              "optimize": True, **td}]}},
     ]
+    if not debit:
+        rules.append(
+            {"id": "opt_sl", "action_type": "close_option", "toggle_optimize": True,
+             "conditions": {"type": "AND", "conditions": [
+                 {"id": "sl", "field": "profit_loss_percent", "op": "<", "value": -100,
+                  "optimize": True, "value_min": -200, "value_max": -50, "value_step": 25}]}})
+    return rules
 
 
 def _build_strategy_option(kind: str):
@@ -2258,6 +2300,8 @@ def _cmd_optimize(args) -> int:
     spec = _EXPERT_OPT.get(expert)
     if spec is None:
         sys.exit(f"ba2-test: optimize not configured for expert {expert!r}; have {sorted(_EXPERT_OPT)}")
+    # Pure-option kinds default to the ~30%/yr goal metric; stock kinds keep sharpe_ratio.
+    fitness = _resolve_fitness(args.fitness, args.strategy, "sharpe_ratio")
     universe = [s.strip().upper() for s in args.universe.split(",") if s.strip()]
     if not universe:
         sys.exit("ba2-test: --universe must list at least one symbol")
@@ -2445,7 +2489,7 @@ def _cmd_optimize(args) -> int:
         _worker_ids = _worker_ids_from_args(args)
         opt = StrategyOptimization(
             strategy_id=strat.id, name=args.name or f"opt-{expert}",
-            fitness_metric=args.fitness, optimization_type="genetic",
+            fitness_metric=fitness, optimization_type="genetic",
             optimization_config=cfg, worker_ids=(_worker_ids or None), status="pending",
         )
         db.add(opt); db.commit(); db.refresh(opt)
@@ -2454,7 +2498,7 @@ def _cmd_optimize(args) -> int:
             print(f"optimize: distributing across worker ids {_worker_ids} + local")
         print(f"optimize: strategy #{strat.id} + StrategyOptimization #{opt_id} "
               f"({expert} x {len(universe)} syms, pop={args.population} gen={args.generations} "
-              f"parallel={args.parallel} fitness={args.fitness})")
+              f"parallel={args.parallel} fitness={fitness})")
     finally:
         db.close()
 
@@ -2470,7 +2514,7 @@ def _cmd_optimize(args) -> int:
             task_type="strategy_optimization",
             name=args.name or f"opt-{expert}",
             payload={"optimization_id": opt_id},
-            description=f"{expert} x {len(universe)} syms, {args.fitness}, pop={args.population} gen={args.generations}",
+            description=f"{expert} x {len(universe)} syms, {fitness}, pop={args.population} gen={args.generations}",
         )
         print(f"optimize: SUBMITTED to serve queue (task {task_id}, optimization_id={opt_id}). "
               f"Watch it in the UI: Backtesting -> History -> Running jobs.")
@@ -2548,13 +2592,17 @@ def _cmd_optimize_batch(args) -> int:
     init_db()
     tq = get_task_queue()
     print(f"optimize-batch: {len(jobs)} job(s) {jobs} x {len(universe)} syms, "
-          f"{args.fitness}, pop={args.population} gen={args.generations} parallel={args.parallel}")
+          f"fitness={args.fitness or 'auto (car for pure-option, calmar_ratio otherwise)'}, "
+          f"pop={args.population} gen={args.generations} parallel={args.parallel}")
 
     for n, (expert, strat_kind) in enumerate(jobs, 1):
         spec = _EXPERT_OPT[expert]
         bypass = bool(spec.get("bypass"))
         prefix = args.name_prefix or "phase1"
-        name = f"{prefix}-{expert}-{strat_kind}-{args.fitness}"
+        # Per-job resolution: pure-option kinds default to consistent_annual_return, stock
+        # kinds keep this command's historical calmar_ratio default.
+        fitness = _resolve_fitness(args.fitness, strat_kind, "calmar_ratio")
+        name = f"{prefix}-{expert}-{strat_kind}-{fitness}"
         db = SessionLocal()
         try:
             strat = _build_strategy_minimal(name) if bypass else _build_strategy(strat_kind, name, expert)
@@ -2617,7 +2665,7 @@ def _cmd_optimize_batch(args) -> int:
                 "backtest": backtest_block,
             }
             opt = StrategyOptimization(
-                strategy_id=strat.id, name=name, fitness_metric=args.fitness,
+                strategy_id=strat.id, name=name, fitness_metric=fitness,
                 optimization_type="genetic", optimization_config=cfg,
                 worker_ids=(batch_worker_ids or None), status="pending",
             )
@@ -2629,7 +2677,7 @@ def _cmd_optimize_batch(args) -> int:
         task_id = tq.queue_task(
             task_type="strategy_optimization", name=name,
             payload={"optimization_id": opt_id},
-            description=f"{expert} {strat_kind} x {len(universe)} syms, {args.fitness}, pop={pop_for_strat}",
+            description=f"{expert} {strat_kind} x {len(universe)} syms, {fitness}, pop={pop_for_strat}",
         )
         print(f"[{n}/{len(jobs)}] SUBMITTED {expert}/{strat_kind} opt#{opt_id} (task {task_id}); polling every {args.poll}s...")
 
@@ -3212,11 +3260,14 @@ def main(argv: "list | None" = None) -> int:
     op.add_argument("--universe", required=True, help="Comma-separated symbols.")
     op.add_argument("--start", required=True, help="ISO start date.")
     op.add_argument("--end", required=True, help="ISO end date.")
-    op.add_argument("--fitness", default="sharpe_ratio",
-                    help="Fitness metric (default sharpe_ratio). 'consistent_annual_return' (aliases "
-                         "'car'/'goal') targets ~30%%/yr EVERY year: (adjusted) annualized return, "
-                         "hard >=30 trades/yr gate, soft drawdown penalty beyond 20%%, x worst-year/"
-                         "mean-year consistency (--fitness-trade-scale is a no-op for it).")
+    op.add_argument("--fitness", default=None,
+                    help="Fitness metric. Default: 'consistent_annual_return' for pure-option "
+                         "strategies (OS1-OS4 + O_* option entries; NOT the equity-entry "
+                         "O_CC/O_PP/O_STK), 'sharpe_ratio' for stock strategies. "
+                         "'consistent_annual_return' (aliases 'car'/'goal') targets ~30%%/yr "
+                         "EVERY year: (adjusted) annualized return, hard >=30 trades/yr gate, "
+                         "soft drawdown penalty beyond 20%%, x worst-year/mean-year consistency "
+                         "(--fitness-trade-scale is a no-op for it).")
     op.add_argument("--generations", type=int, default=6)
     op.add_argument("--population", type=int, default=10)
     op.add_argument("--parallel", type=int, default=4, help="Parallel trials (ThreadPoolExecutor).")
@@ -3332,8 +3383,10 @@ def main(argv: "list | None" = None) -> int:
     ob.add_argument("--universe", required=True, help="Comma-separated symbols (shared by all jobs).")
     ob.add_argument("--start", required=True, help="ISO start date.")
     ob.add_argument("--end", required=True, help="ISO end date.")
-    ob.add_argument("--fitness", default="calmar_ratio",
-                    help="Fitness metric (default calmar_ratio). See optimize --fitness for "
+    ob.add_argument("--fitness", default=None,
+                    help="Fitness metric, resolved PER JOB when omitted: 'consistent_annual_return' "
+                         "for pure-option kinds (OS1-OS4/O_*), 'calmar_ratio' for stock kinds "
+                         "(the historical batch default). See optimize --fitness for "
                          "'consistent_annual_return' ('car'/'goal').")
     ob.add_argument("--generations", type=int, default=8)
     ob.add_argument("--population", type=int, default=40)

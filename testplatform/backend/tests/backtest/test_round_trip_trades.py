@@ -487,3 +487,43 @@ def test_close_option_position_rides_open_transaction_and_nets_flat(option_close
     # Netted FLAT: the sell-to-close on the SAME txn reduces net qty to 0, so the
     # position no longer shows — NOT two positions (original long + a new short).
     assert acct.get_option_positions() == []
+
+
+# ---------------------------------------------------------------------------
+# REGRESSION: an OPTION left open at run end must mark at the contract's
+# PREMIUM close, not the underlying's share close. For option orders
+# ``opening.symbol`` is the UNDERLYING, so the open_at_end branch recorded the
+# share price as exit_price (run 782: NVDA260710C00227500 marked at 200.09 spot
+# instead of the 0.10 premium close -> fantasy pnl / best_trade).
+# ---------------------------------------------------------------------------
+def test_option_open_at_end_marks_at_premium_close_not_underlying(option_close_account):
+    """1 LONG call still open at run end: exit_price is the D3 premium close (1.60),
+    NOT the D3 underlying close (185); pnl scales by the 100x contract multiplier."""
+    acct, ps, open_txn_id, open_order_id = option_close_account
+    ps.set_clock(D3)  # run ends on D3 with NO closing fill
+
+    rts = acct.get_round_trip_trades()
+    assert len(rts) == 1
+    t = rts[0]
+    assert t["exit_reason"] == "open_at_end"
+    assert t["contract_symbol"] == _OPT_OCC
+    assert t["entry_price"] == pytest.approx(1.0)
+    assert t["exit_price"] == pytest.approx(1.6)   # D3 premium close
+    assert t["exit_price"] != pytest.approx(185.0)  # never the underlying share close
+    assert t["size"] == pytest.approx(1.0)
+    # (1.60 - 1.00) premium x 1 contract x 100 multiplier = +60, commission 0.
+    assert t["pnl"] == pytest.approx(60.0)
+
+
+def test_option_open_at_end_without_premium_bar_falls_back_to_entry(option_close_account):
+    """No premium bar on the run-end day -> mark at the ENTRY premium (breakeven),
+    never the underlying close."""
+    acct, ps, open_txn_id, open_order_id = option_close_account
+    ps.set_clock(D4)  # the option cache has no bar for 2024-01-05
+
+    rts = acct.get_round_trip_trades()
+    assert len(rts) == 1
+    t = rts[0]
+    assert t["exit_reason"] == "open_at_end"
+    assert t["exit_price"] == pytest.approx(1.0)  # entry premium fallback
+    assert t["pnl"] == pytest.approx(0.0)

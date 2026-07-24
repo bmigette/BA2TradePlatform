@@ -2117,9 +2117,31 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             else:
                 # Still open at run end: mark-to-market at the last available price.
                 size = entry_qty
-                exit_px = self._price.close_at(opening.symbol)
-                if exit_px is None:
-                    exit_px = entry_px  # no closing price -> flat (counts as a near-zero trade)
+                if (
+                    getattr(opening, "asset_class", None) == AssetClass.OPTION
+                    and getattr(opening, "contract_symbol", None)
+                    and self._options is not None
+                ):
+                    # OPTION leg: ``opening.symbol`` is the UNDERLYING, so ``close_at``
+                    # would record the share price as the exit (the run-782 NVDA defect:
+                    # 200.09 spot instead of the 0.10 premium close). Mark at the
+                    # contract's premium close via the same ``_options.get_bar`` path the
+                    # equity curve's option MTM uses. No premium bar -> entry premium
+                    # (breakeven), NEVER the underlying close.
+                    bar = self._options.get_bar(opening.contract_symbol, self._as_of_date())
+                    exit_px = bar["close"] if bar and bar.get("close") is not None else None
+                    if exit_px is None:
+                        logger.warning(
+                            "[backtest] round-trip recorder: no premium bar for open option "
+                            "%s at run end (%s) — marking open_at_end at the entry premium.",
+                            opening.contract_symbol,
+                            self._as_of_date(),
+                        )
+                        exit_px = entry_px
+                else:
+                    exit_px = self._price.close_at(opening.symbol)
+                    if exit_px is None:
+                        exit_px = entry_px  # no closing price -> flat (counts as a near-zero trade)
                 exit_dt = self._price.now()
                 exit_reason = "open_at_end"
                 comm = commission

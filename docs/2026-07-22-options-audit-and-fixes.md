@@ -186,3 +186,92 @@ Run 765 traded 67 underlyings — all large/mega-caps (AAPL, MSFT, JPM, …). Th
 illiquidity was at the **option-contract** level (deep-OTM/short-dated strikes with
 single-digit daily volume), not the underlying level — which is why the volume cap
 matters even for a large-cap-only universe.
+
+---
+
+# Follow-up 2: open-at-end recorder fix + fitness/exit realignment (2026-07-23)
+
+After the artifact removal above, the v6 OS runs (780–794, `TOPn-optm-FMPRating-OS{1,2,3}-pricetarget-v6`)
+showed anemic results: OS1 TR −7.7..+18.5% on 2–27 trades, OS2 TR 3.8–18.1% (n=8–16, wr 56–87%),
+OS3 TR 3.6–5.9% (n=12–27). Investigation found one more reporting bug plus a scoring/strategy
+misalignment — the low profits were not (only) "the strategy has no edge".
+
+## B8 — open-at-end option trades recorded the UNDERLYING price as exit (reporting-only)
+
+- **Symptom:** run 782, NVDA260710C00227500 (10 contracts @ $0.50, opened 2026-06-23, still open
+  at run end): recorded `exit_price=200.09` (= NVDA spot) vs the real premium close $0.10 →
+  fantasy `pnl=+199,589`, `best_trade=912.95%`. The equity curve was CORRECT (final $21,442
+  reconciles to the dollar, incl. the real $400 unrealized loss) — only the trades table and
+  derived stats (`best_trade`/`avg_trade`/`expectancy`) were polluted.
+- **Root cause:** `BacktestAccount.get_round_trip_trades()` (`backtest_account.py`) marked
+  open-at-end transactions with `exit_px = self._price.close_at(opening.symbol)`; for option
+  orders `symbol` is the underlying.
+- **Fix:** option legs now mark at the contract's premium close via the same
+  `self._options.get_bar(contract_symbol, self._as_of_date())` path the equity curve's option
+  MTM uses; no premium bar → entry premium (breakeven, logged warning), never the underlying
+  close. Stock path byte-for-byte unchanged.
+- **Tests:** `test_round_trip_trades.py` —
+  `test_option_open_at_end_marks_at_premium_close_not_underlying` (verified failing pre-fix:
+  obtained 185.0, expected 1.6) and
+  `test_option_open_at_end_without_premium_bar_falls_back_to_entry`.
+
+## Fitness misalignment — why the GA converged to barely-trading configs
+
+DB check (`strategy_optimizations`): **every** OS optimization (v1→v6) ran
+`fitness_metric='calmar_ratio'`. Calmar has no trade-count floor and no consistency term, so on
+honest (post-artifact) data the search minimized drawdown by *not trading* — v6 best_fitness was
+0.006–0.057 with 2–27 trades over ~1.5y, and the param diff v2→v6 showed the GA disabling the
+O_LC/O_LP entries outright, risk 7→2.5%, max/instrument 20→5%.
+
+The literal "≥30%/yr every year" metric already existed but was never used for options:
+`consistent_annual_return` (`app/services/strategy_fitness.py`) = annualized return ×
+dd_guard (soft cap 20%) × worst-year/mean-year consistency × trade gate (ramps to ≥30
+trades/yr). Changes (`testplatform/ba2test_launcher.py`):
+
+- **`_resolve_fitness()`** — pure-option kinds (`_PURE_OPTION_STRATEGIES`: the 14 `O_*` option
+  entries + `OS1`–`OS4`) now default to `consistent_annual_return` when `--fitness` is not
+  passed. **Stock scope is untouched**: equity kinds keep each command's historical default
+  (`sharpe_ratio` for `optimize`, `calmar_ratio` for `optimize-batch`), the equity-entry
+  `O_CC`/`O_PP`/`O_STK` are explicitly excluded, and an explicit `--fitness` always wins.
+- **`_option_exit_rules()` debit/credit split** — debit kinds (OS1/OS4 + members: long premium)
+  get a wide take-profit band (default +100%, range 25–200%, step 25; was capped at 25–75%) —
+  long premium lives off the right tail, and a ≤75% cap truncates the few winners that pay for
+  the many small losers. Time-exit band widened to 10–45d (default 28). Credit kinds
+  (OS2/OS3 + members) keep the tastytrade-style 25–75% TP band and gain a **toggleable
+  stop-loss** (`opt_sl`: close at −100% of credit, range −200..−50, step 25) so the GA can
+  manage the short-premium left tail (v6 OS2/OS3: 56–87% win rate but 3.8–18% TR = small wins
+  eaten by uncapped losers).
+
+Related, landed in the same window: `5b1632c` fixed the entry equity-gate mispricing option
+positions as their underlying stock (`Transaction.open_price` seeding) — root-caused to the
+same "OS1 traded almost nothing" symptom.
+
+## On the OPRA feed (why it matters, and what it won't do)
+
+Rebuilding the options cache with `--feed opra` is **not** expected to raise the P&L — expect
+the opposite or a reshuffle. The indicative feed's quote-derived prints are where the junk
+lived (B/$0.01-with-$54-intrinsic prints); the arb guard now *rejects* those, so on indicative
+data the GA optimizes a market where some wanted trades never fill, and can still learn stale
+prints that pass the guard — edges that cannot exist live. OPRA (consolidated trades + real
+volumes, needed by the 10% volume-participation cap) makes a 30%/yr backtest claim
+*believable*, not bigger. If OS1–3 can't reach 30%/yr on OPRA data, that's the honest answer
+and the strategy — not the metric — needs changing. **Action still needed:** rebuild the cache
+with `--feed opra` (requires the OPRA-capable Alpaca subscription) before the next OS runs.
+
+## Verification (this round)
+
+- Backend backtest suite: **438 passed, 1 skipped** (incl. parity gate `test_parity_golden.py`
+  3/3) — 436 baseline + 2 new B8 tests.
+- Live suite: **1031 passed**.
+- Launcher smoke: `optimize`/`optimize-batch --help` render; `_resolve_fitness` matrix and
+  `_option_exit_rules` bands verified per kind; `OS1`/`OS2` strategy builds produce
+  `[opt_tp, opt_time]` / `[opt_tp, opt_time, opt_sl]`.
+
+## Honest expectation
+
+These changes align the *search objective* with the 30%/yr goal and stop the GA from
+"winning" by not trading; they cannot manufacture edge on honest data. Next OS runs (v7, on
+CAR) should show ≥30 trades/yr configs with year-consistency pressure — if the best CAR
+fitness still maps to single-digit annual returns, the FMPRating→options entry signal itself
+is the bottleneck, and the next lever is the entry universe/signal (e.g. event-driven
+candidates), not further exit tuning.
