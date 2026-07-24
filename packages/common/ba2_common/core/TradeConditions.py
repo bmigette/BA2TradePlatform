@@ -1412,17 +1412,110 @@ def _get_option_pnl_via_transaction(account, existing_order) -> Optional[Dict]:
     return TransactionHelper.calculate_option_pnl(transaction, current_premium, multiplier)
 
 
+def _get_spread_pnl_via_transaction(account, existing_order) -> Optional[Dict]:
+    """
+    P&L of a MULTI-LEG option structure (spread/strangle/condor/butterfly/...), priced
+    off the structure's NET premium.
+
+    The parent order of a multi-leg combo has asset_class OPTION but NO contract_symbol
+    (the contract lives on each child leg), so the single-leg path
+    (_get_option_pnl_via_transaction) does not apply — and the legacy equity path
+    compared the UNDERLYING price against the parent's net-premium open_price, producing
+    astronomic percentages (~+4900% for a $3.75 debit on a $190 stock, ~-7500% for a
+    credit) that fired any TP/SL on the FIRST evaluation (the B9 defect: debit spreads
+    TP'd after 1 bar at a real +1-12%; credit spreads could never TP and any SL fired
+    instantly).
+
+    The structure's current net premium per structure is
+        sum_legs( sign x current_premium x leg_ratio ),  sign = +1 BUY leg / -1 SELL leg
+    with each leg marked from the account's option quote exactly like the single-leg
+    path (long legs at bid, short legs at ask, last as fallback). The parent
+    transaction's open_price is the entry net premium per structure (positive = debit,
+    negative = credit — normalised here via the parent's side, so a stored absolute
+    value prices identically). Then:
+        amount  = (net_current - open_net) * |qty| * multiplier
+        percent = amount / (|open_net| * |qty| * multiplier) * 100
+    which reduces to "% of credit captured" for a SELL parent (net premium halving =
+    +50%) and to the debit multiple for a BUY parent. Returns None (decline to
+    evaluate — never a fabricated number) when a leg quote/multiplier is missing, no
+    filled legs exist, or the entry net premium is ~0 (even-money structure: the
+    percent basis is undefined).
+    """
+    from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
+    from ba2_common.core.trade_store import orders_where
+    from ba2_common.core.types import OrderDirection, OrderStatus
+
+    if not isinstance(account, OptionsAccountInterface):
+        logger.warning(f"Account does not support options; cannot compute structure P&L for order {existing_order.id}")
+        return None
+
+    transaction = _get_transaction_for_order(existing_order)
+    if transaction is None:
+        return None
+
+    legs = [o for o in orders_where(parent_order_id=existing_order.id)
+            if o.status == OrderStatus.FILLED and o.contract_symbol]
+    if not legs:
+        logger.warning(f"No filled child legs for multi-leg parent order {existing_order.id} — cannot compute structure P&L")
+        return None
+
+    structures = abs(float(existing_order.quantity or 0.0))
+    if structures <= 0:
+        logger.warning(f"Multi-leg parent order {existing_order.id} has no structure quantity — cannot compute structure P&L")
+        return None
+
+    net_current = 0.0
+    for leg in legs:
+        try:
+            quote = account.get_option_quote(leg.contract_symbol)
+        except Exception as e:
+            logger.error(f"Error fetching option quote for leg {leg.contract_symbol}: {e}", exc_info=True)
+            return None
+        if quote is None:
+            logger.warning(f"No option quote for leg {leg.contract_symbol} — cannot compute structure P&L")
+            return None
+        if leg.side == OrderDirection.BUY:
+            leg_premium = quote.bid if quote.bid is not None else quote.last
+        else:
+            leg_premium = quote.ask if quote.ask is not None else quote.last
+        if leg_premium is None:
+            logger.warning(f"Option quote for leg {leg.contract_symbol} has no usable premium (bid/ask/last all None)")
+            return None
+        ratio = abs(float(leg.quantity or 0.0)) / structures
+        net_current += (leg_premium if leg.side == OrderDirection.BUY else -leg_premium) * ratio
+
+    multiplier = transaction.multiplier or existing_order.multiplier
+    if not multiplier:
+        logger.warning(f"No contract multiplier on transaction {transaction.id} or order {existing_order.id} — cannot compute structure P&L")
+        return None
+
+    open_net = abs(float(transaction.open_price or 0.0))
+    if transaction.side != OrderDirection.BUY:
+        open_net = -open_net
+    if abs(open_net) < 1e-9:
+        logger.warning(f"Even-money / zero net premium on multi-leg parent order {existing_order.id} — structure P&L% undefined")
+        return None
+
+    qty = abs(float(transaction.quantity or 0.0)) or structures
+    pnl_amount = (net_current - open_net) * qty * multiplier
+    pnl_pct = pnl_amount / (abs(open_net) * qty * multiplier) * 100
+    return {'amount': round(pnl_amount, 2), 'percent': round(pnl_pct, 4)}
+
+
 def _get_pnl_for_condition(condition) -> Optional[Dict]:
     """
-    P&L of the condition's existing_order: option orders are priced off the
-    option premium (see _get_option_pnl_via_transaction), equity orders off the
-    instrument's current price (legacy behavior, unchanged).
+    P&L of the condition's existing_order: single-leg option orders are priced off the
+    option premium (see _get_option_pnl_via_transaction), multi-leg option structures
+    off the structure's net premium (see _get_spread_pnl_via_transaction), equity
+    orders off the instrument's current price (legacy behavior, unchanged).
     """
     from ba2_common.core.types import AssetClass
 
     existing_order = condition.existing_order
-    if getattr(existing_order, 'asset_class', None) == AssetClass.OPTION and existing_order.contract_symbol:
-        return _get_option_pnl_via_transaction(condition.account, existing_order)
+    if getattr(existing_order, 'asset_class', None) == AssetClass.OPTION:
+        if existing_order.contract_symbol:
+            return _get_option_pnl_via_transaction(condition.account, existing_order)
+        return _get_spread_pnl_via_transaction(condition.account, existing_order)
 
     current_price = condition.get_current_price()
     if current_price is None:

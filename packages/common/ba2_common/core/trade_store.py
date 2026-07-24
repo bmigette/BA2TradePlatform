@@ -209,13 +209,15 @@ def orders_where(*, account_id: Optional[int] = None, transaction_id: Optional[i
                  statuses: Optional[Iterable] = None, broker_order_id: Optional[str] = None,
                  transaction_ids: Optional[Iterable] = None,
                  not_statuses: Optional[Iterable] = None, depends_on_order: Any = _UNSET,
+                 parent_order_id: Optional[int] = None,
                  session=None) -> List[TradingOrder]:
     """TradingOrders matching the given equality/in filters (all AND-ed). Mirrors the
     ``select(TradingOrder).where(...)`` sites.
 
     ``session`` (flag-OFF only): reuse an existing SQLite session so a refactored inline site keeps
     its original transaction semantics (live is never on the flag path). ``depends_on_order`` may be
-    ``None`` (entry orders) / a value (that parent) — omit it to not filter on it."""
+    ``None`` (entry orders) / a value (that parent) — omit it to not filter on it.
+    ``parent_order_id`` selects the CHILD legs of a multi-leg (OCO/option-spread) parent."""
     if inmem_trades_active():
         sset = set(statuses) if statuses is not None else None
         nset = set(not_statuses) if not_statuses is not None else None
@@ -236,6 +238,8 @@ def orders_where(*, account_id: Optional[int] = None, transaction_id: Optional[i
                 continue
             if depends_on_order is not _UNSET and o.depends_on_order != depends_on_order:
                 continue
+            if parent_order_id is not None and o.parent_order_id != parent_order_id:
+                continue
             out.append(o)
         return out
     from sqlmodel import select, Session
@@ -254,6 +258,8 @@ def orders_where(*, account_id: Optional[int] = None, transaction_id: Optional[i
         stmt = stmt.where(TradingOrder.broker_order_id == broker_order_id)
     if depends_on_order is not _UNSET:
         stmt = stmt.where(TradingOrder.depends_on_order == depends_on_order)
+    if parent_order_id is not None:
+        stmt = stmt.where(TradingOrder.parent_order_id == parent_order_id)
     if session is not None:
         return list(session.exec(stmt).all())
     from ba2_common.core.db import get_db

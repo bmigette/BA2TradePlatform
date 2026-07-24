@@ -275,3 +275,87 @@ CAR) should show ≥30 trades/yr configs with year-consistency pressure — if t
 fitness still maps to single-digit annual returns, the FMPRating→options entry signal itself
 is the bottleneck, and the next lever is the entry universe/signal (e.g. event-driven
 candidates), not further exit tuning.
+
+---
+
+# Follow-up 3: B9 — multi-leg structure P&L was garbage (2026-07-24)
+
+The v7 runs (CAR fitness): OS1 (233) evaluated **307 individuals, 0 positive**; OS2 (234)
+165/269 positive but best CAR only 0.136. Root-caused to one more shared engine bug plus an
+economic reality check.
+
+## B9 — profit_loss_* conditions on multi-leg parents fell through to the equity path
+
+- **Root cause:** `_get_pnl_for_condition` (`packages/common/ba2_common/core/TradeConditions.py`)
+  routed option orders to the option-aware path only when they had a `contract_symbol`.
+  Multi-leg PARENT orders (asset_class OPTION, no contract_symbol — the contract lives on the
+  child legs) fell through to the legacy equity path: `calculate_pnl(transaction,
+  underlying_price)` vs the parent's NET-PREMIUM open_price (~$3.75 debit / ~$2.50 credit on a
+  ~$190 stock) → ~+4,900% for BUY parents, ~−7,500% for SELL parents.
+- **Runtime proof (not just code):** run 759 (OS1-v7 TOP4) had `opt_tp` enabled at **75%**,
+  time exit disabled — yet 8 of 13 structures closed after **1 bar** at real net P&L
+  +0.7…+11.7% (impossible legitimately). Run 758 had both exits GA-disabled, so single-leg
+  longs rode to expiry (50/84 expired at ~zero). For credit structures (OS2/OS3): TP could
+  never fire (−7,500% < any threshold) and the new `opt_sl` fired on the FIRST manage cycle →
+  "OS2 almost nothing profitable". Affected members: O_VERT, O_BF, O_BULLCS (OS1), O_SSTG,
+  O_SSTD, O_IC (OS2), all OS3 — and LIVE trading (shared packages/common code).
+- **Fix:** new `_get_spread_pnl_via_transaction` — prices the STRUCTURE:
+  `net_current = Σ sign×leg_premium×leg_ratio` (sign +1 BUY / −1 SELL leg; each leg marked
+  from `account.get_option_quote`: long at bid, short at ask, last fallback — same as the
+  single-leg path) against the parent's entry net premium (sign normalised via the parent
+  side: BUY = debit paid, SELL = credit received). `percent = (net_current − open_net) /
+  |open_net|` → "% of credit captured" for credit structures, debit multiple for debit
+  structures. Declines (None, never fabricated) on missing leg quotes/multiplier, no filled
+  legs, or ~zero entry net (even-money). Legs are fetched via a new
+  `orders_where(parent_order_id=...)` filter (`trade_store.py`, both in-mem and DB paths) —
+  the same parent→child link the live Alpaca account persists for MLEG orders.
+- **Tests:** 7 live (`tests/test_option_spread_pnl_condition.py`: debit TP below/at threshold,
+  credit TP at 50%-of-credit, credit SL at −100% incl. absolute-stored open_price, 1-2-1
+  butterfly ratio weighting, no-legs/even-money decline) — **6 of 7 verified failing pre-fix**
+  (git-stash TDD check). 1 backend wiring test
+  (`tests/backtest/test_spread_pnl_condition.py`): the condition through BacktestAccount +
+  HistoricalOptionsProvider + the trade_store DB path.
+- **Known limitation:** all originally-filled legs are priced; a structure whose legs were
+  individually closed mid-life (rare — legs normally close together via close_option/expiry)
+  is priced with stale legs. Same class of limitation as the single-leg path.
+
+## Economic verdict (web-checked)
+
+- **Single-leg long premium (O_LC/O_LP) has no edge on weekly FMPRating signals** — the one
+  correctly-priced path, and the GA's verdict was unanimous: 307/307 OS1 configs ≤ 0. Buying
+  25–45 DTE options pays theta + the volatility risk premium that a slow analyst-rating signal
+  doesn't overcome ([QuantPedia VRP](https://quantpedia.com/strategies/volatility-risk-premium-effect),
+  [Andersen/Todorov, Kellogg](https://www.kellogg.northwestern.edu/faculty/todorov/htm/papers/opa.pdf)).
+- **Credit selling is where the systematic premium lives** — but calibrated: the CBOE
+  PutWrite benchmark did ~9.4–9.7%/yr over 37 years
+  ([Cboe](https://www.cboe.com/insights/posts/generating-income-and-managing-risk-cash-secured-put-writing-in-a-low-equity-return-environment/),
+  [Bondarenko](https://cdn.cboe.com/resources/education/research_publications/PutWriteCBOE19_v14_by_Prof_Oleg_Bondarenko_as_of_June_14.pdf)).
+  OS2's 13.6% CAR (achieved *with* broken exits) is already above-benchmark; 30%/yr sustained
+  is above the honest base rate without leverage or a real timing signal.
+
+## Validation re-run (2026-07-24, backtest id 760)
+
+Re-ran the best OS2-v7 individual (optimization 234) on the fixed engine via
+`ba2test_launcher._persist_top_backtests(234, 'FMPRating', n=1)`. Exits: TP 75% of credit
+enabled, 30-day time exit enabled, SL disabled — same exit config as pre-fix run 759.
+
+- **TP now fires at the REAL threshold**: the four TP exits cluster at +74.4…+78.9% of credit
+  captured (GOOGL strangle +75.7% after 19 bars, AAPL +74.4% after 13, MRK +75.0% after 7),
+  with both legs of a paired structure closing together (GOOGL/WFC/MU/AAPL/MRK/INTC).
+- **No more garbage 1-bar TP closes**: pre-fix run 759 closed 8/13 structures after 1 bar at a
+  real +0.7…+11.7%; run 760 has exactly one same-day close (BAC, −30%, a signal exit at a
+  loss) out of 13 structures.
+- **Time exits work**: WFC/MU closed at 17–20 bars on the 30-day rule with partial credit.
+- **Scoreboard**: 13 structures, +$569 on $4,353 premium (+13.1% per-premium), TR 7.42% over
+  the ~2.2y window. The fix repairs exit semantics, not edge — see the economic verdict above.
+
+### New anomaly found during validation → follow-up B10
+
+3 short-put legs (BABA240503P00067000, C240503P00057000, MRVL240503P00067000) were recorded
+`open_at_end` at the entry premium (−$1 each) even though the contracts **expired 2024-05-03 —
+two years before run end**. Each had its strangle call leg closed early by a signal exit; the
+put leg was then held 551–560 bars despite the enabled 30-day time exit AND the expiry, i.e.
+its lifecycle stopped entirely once the sibling leg closed. BABA and C were OTM at expiry
+(should have kept the full ~$298 credit); the engine records ≈0% instead — materially
+understating credit-strategy P&L (est. +$300…+870 on a +$569 run). Root cause under
+investigation (expiry/time-exit processing appears to skip legs whose sibling/parent closed).
