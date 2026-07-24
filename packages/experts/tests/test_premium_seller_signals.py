@@ -2,7 +2,8 @@ import math
 from datetime import date
 
 from ba2_experts.PremiumSeller.signals import (
-    earnings_within, grade_score, iv_rank, realized_vol_annualized, sma,
+    analyst_counts_score, earnings_within, grade_score, iv_rank,
+    realized_vol_annualized, sma,
 )
 
 
@@ -55,6 +56,26 @@ def test_grade_score():
     assert grade_score("Underperform") == 2.0
     assert grade_score("some unknown shop grade") is None
     assert grade_score(None) is None
+
+
+def test_analyst_counts_score():
+    # One-sided rows land on the pole weights (FMP analystRatings* key spellings).
+    assert analyst_counts_score({"analystRatingsStrongBuy": 10}) == 5.0
+    assert analyst_counts_score({"analystRatingsbuy": 10}) == 4.0
+    assert analyst_counts_score({"analystRatingsStrongSell": 4}) == 1.0
+    # Mixed row -> weighted mean: (5*7 + 4*3) / 10.
+    assert analyst_counts_score(
+        {"analystRatingsStrongBuy": 7, "analystRatingsBuy": 3}) == 4.7
+    assert analyst_counts_score(
+        {"analystRatingsStrongSell": 8, "analystRatingsSell": 2}) == 1.2
+    # Equal counts across all five buckets -> midpoint 3.0.
+    assert analyst_counts_score(
+        {"strongBuy": 1, "buy": 1, "hold": 1, "sell": 1, "strongSell": 1}) == 3.0
+    # Empty / missing / non-numeric counts -> None (never a fabricated score).
+    assert analyst_counts_score(None) is None
+    assert analyst_counts_score({}) is None
+    assert analyst_counts_score({"date": "2024-01-01"}) is None
+    assert analyst_counts_score({"analystRatingsStrongBuy": 0, "analystRatingsHold": "n/a"}) is None
 
 
 def test_earnings_within():

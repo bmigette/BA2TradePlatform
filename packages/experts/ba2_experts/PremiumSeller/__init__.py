@@ -9,6 +9,7 @@ tested-delta, roll-DTE, credit-multiple stops, circuit breaker). Bypasses the
 classic RM: lifecycle is owned by OptionPortfolioManager.
 """
 
+import math
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -265,7 +266,8 @@ class PremiumSeller(MarketExpertInterface):
             sym, end_date=as_of, lookback_days=int(lookback * 1.5) + 10, interval="1d")
         if data is None or getattr(data, "empty", True) or "Close" not in getattr(data, "columns", []):
             return None
-        closes = [c for c in data["Close"].tolist() if c is not None]
+        closes = [c for c in data["Close"].tolist()
+                  if c is not None and not (isinstance(c, float) and math.isnan(c))]
         return closes or None
 
     def _earnings_blocked(self, sym: str, as_of: datetime, target_dte: int) -> bool:
@@ -298,8 +300,12 @@ class PremiumSeller(MarketExpertInterface):
         return signals.earnings_within(dates, as_of.date(), target_dte + 5)
 
     def _rating_blocked(self, sym: str, as_of: datetime, settings: Dict[str, Any]) -> bool:
-        """True iff the latest analyst grade on/before as_of scores below the floor.
-        Unknown grades do not block (the floor only excludes KNOWN-bad names)."""
+        """True iff the latest grades-historical row on/before as_of scores below
+        the floor. stable/grades-historical rows carry AGGREGATE StrongBuy..StrongSell
+        counts (no per-grade strings), scored by signals.analyst_counts_score.
+        Rows with no usable counts do not block (the floor only excludes
+        KNOWN-bad names). Point-in-time safe: only rows dated on/before as_of
+        are considered."""
         from ba2_common.config import get_app_setting
         from ba2_common.core.provider_utils import parse_provider_date
         from ba2_experts.FMPRating import fetch_grades_historical_cached
@@ -318,10 +324,10 @@ class PremiumSeller(MarketExpertInterface):
             if d is None or d.date() > as_of.date():
                 continue
             if best is None or d.date() > best[0]:
-                best = (d.date(), r.get("newGrade"))
+                best = (d.date(), r)
         if best is None:
             return False
-        score = signals.grade_score(best[1])
+        score = signals.analyst_counts_score(best[1])
         if score is None:
             return False
         return score < float(settings["fmp_rating_min"])

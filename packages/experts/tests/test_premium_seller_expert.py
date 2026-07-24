@@ -209,20 +209,24 @@ def test_earnings_gate_passes_outside_window(monkeypatch):
     assert len(rec.raw_outputs["targets"]["structures"]) == 2
 
 
-def _patch_rating(monkeypatch, grade):
+def _patch_rating(monkeypatch, rows):
     """Patch the rating seam at its source modules (the expert imports both lazily
     inside _rating_blocked, so patching the source-module attributes is enough).
     ba2_experts/__init__ rebinds the FMPRating submodule name to the CLASS, so the
-    module must be resolved via import_module, not attribute access."""
+    module must be resolved via import_module, not attribute access. `rows` must be
+    real stable/grades-historical rows: a `date` plus aggregate analystRatings*
+    counts (there is no per-row newGrade on this endpoint)."""
     fmp_rating_mod = import_module("ba2_experts.FMPRating")
     monkeypatch.setattr("ba2_common.config.get_app_setting",
                         lambda key, default=None: "dummy-key")
     monkeypatch.setattr(fmp_rating_mod, "fetch_grades_historical_cached",
-                        lambda api_key, symbol: [{"date": "2023-12-15", "newGrade": grade}])
+                        lambda api_key, symbol: rows)
 
 
 def test_rating_floor_blocks_known_bad_grade(monkeypatch):
-    _patch_rating(monkeypatch, "Strong Sell")           # score 1 < 3.0 floor
+    # (1*8 + 2*2) / 10 = 1.2 < 3.0 floor -> blocks.
+    _patch_rating(monkeypatch, [{"date": "2023-12-15", "analystRatingsStrongSell": 8,
+                                 "analystRatingsSell": 2}])
     settings = dict(FULL_SETTINGS, fmp_rating_floor_enabled=True, fmp_rating_min=3.0,
                     risk_per_structure_pct=10.0)
     expert, ctx = make_expert(StubAccount(chain_for()), settings)
@@ -231,7 +235,9 @@ def test_rating_floor_blocks_known_bad_grade(monkeypatch):
 
 
 def test_rating_floor_passes_strong_buy(monkeypatch):
-    _patch_rating(monkeypatch, "Strong Buy")            # score 5 >= 3.0 floor
+    # (5*7 + 4*3) / 10 = 4.7 >= 3.0 floor -> passes.
+    _patch_rating(monkeypatch, [{"date": "2023-12-15", "analystRatingsStrongBuy": 7,
+                                 "analystRatingsBuy": 3}])
     settings = dict(FULL_SETTINGS, fmp_rating_floor_enabled=True, fmp_rating_min=3.0,
                     risk_per_structure_pct=10.0)
     expert, ctx = make_expert(StubAccount(chain_for()), settings)

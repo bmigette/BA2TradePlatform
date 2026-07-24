@@ -60,6 +60,31 @@ def grade_score(grade: Optional[str]) -> Optional[float]:
     return _GRADE_SCORE.get(str(grade).strip().lower())
 
 
+def analyst_counts_score(row: Optional[dict]) -> Optional[float]:
+    """Weighted analyst-consensus score (1-5) from a grades-historical row's
+    aggregate counts. None when the row carries no usable counts.
+
+    Key spellings mirror FMPRating._GRADES_FIELD_ALIASES (stable/grades-historical
+    rows carry a ``date`` plus analystRatings* counts — no per-grade strings)."""
+    if not row:
+        return None
+    def _n(*keys):
+        for k in keys:
+            v = row.get(k)
+            if isinstance(v, (int, float)):
+                return float(v)
+        return 0.0
+    sb = _n("analystRatingsStrongBuy", "analystRatingsStrongbuy", "strongBuy")
+    b = _n("analystRatingsbuy", "analystRatingsBuy", "buy")
+    h = _n("analystRatingsHold", "hold")
+    s = _n("analystRatingsSell", "sell")
+    ss = _n("analystRatingsStrongSell", "strongSell")
+    total = sb + b + h + s + ss
+    if total <= 0:
+        return None
+    return (5.0 * sb + 4.0 * b + 3.0 * h + 2.0 * s + 1.0 * ss) / total
+
+
 def earnings_within(report_dates: Iterable[date], as_of: date, window_days: int) -> bool:
     """True iff any (eventual) report date falls inside (as_of, as_of + window_days].
 
