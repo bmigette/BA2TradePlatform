@@ -31,7 +31,7 @@ Usage (test venv; FMP_API_KEY/DB_FILE in env):
     ba2-venvs/test/Scripts/python.exe tools/run_options_matrix.py \
         [--strategies OS1,OS2,OS3,O_CC,O_STK] [--experts FMPRating] \
         [--start 2024-04-01] [--end 2026-06-30] [--population 40] [--generations 8] \
-        [--fitness calmar_ratio] [--initial-capital 20000] [--dry-run]
+        [--fitness <override>] [--initial-capital 20000] [--dry-run]
 """
 import argparse
 import os
@@ -102,7 +102,12 @@ def main() -> int:
                     help="Per-gene mutation probability passthrough (default: launcher's).")
     ap.add_argument("--interval", default="1d",
                     help="Analysis/fill interval (default 1d — option cache bars are daily).")
-    ap.add_argument("--fitness", default="calmar_ratio")
+    ap.add_argument("--fitness", default=None,
+                    help="Fitness metric forced on EVERY job. Default: omitted, so each job "
+                         "gets ba2test_launcher's per-strategy-kind auto-resolution "
+                         "(consistent_annual_return for pure-option kinds OS1-4/O_*, "
+                         "sharpe_ratio for O_CC/O_PP/O_STK) -- passing this flag here "
+                         "overrides that auto-resolution uniformly for the whole matrix.")
     ap.add_argument("--initial-capital", type=float, default=_DEFAULT_CAPITAL,
                     help=f"Starting cash per trial (default {_DEFAULT_CAPITAL:.0f} — options "
                          "need more headroom than the equity grid's 10k).")
@@ -166,13 +171,18 @@ def main() -> int:
             continue
         cmd = [exe, "optimize", "--expert", expert, "--universe", universe,
                "--strategy", strat,
-               "--start", args.start, "--end", args.end, "--fitness", args.fitness,
+               "--start", args.start, "--end", args.end,
                "--interval", args.interval, "--population", str(args.population),
                "--generations", str(args.generations),
                "--initial-capital", str(args.initial_capital),
                # Daily cadence: option entries want the day's signal, not a weekly scan —
                # mirrors scripts/run_options_grid.sh.
                "--run-schedule", "daily", "--name", name, "--parallel", str(args.parallel)]
+        if args.fitness:
+            # Explicit override forces this metric uniformly; omitted (default) lets
+            # ba2test_launcher's _resolve_fitness() pick per-strategy-kind (pure-option ->
+            # consistent_annual_return, O_CC/O_PP/O_STK -> sharpe_ratio).
+            cmd += ["--fitness", args.fitness]
         if args.mutation_prob is not None:
             cmd += ["--mutation-prob", str(args.mutation_prob)]
         if args.profit_cap_pct and args.profit_cap_pct > 0:
