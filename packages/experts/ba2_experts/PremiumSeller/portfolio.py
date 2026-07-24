@@ -224,19 +224,36 @@ class OptionPortfolioManager:
         return False
 
     def _tested(self, parent) -> bool:
-        """True iff any SHORT leg's |delta| >= tested_delta threshold (chain lookup —
-        quotes carry no greeks). Missing chain/greeks -> False (no action this bar)."""
+        """True iff any CURRENTLY-SHORT contract's |delta| >= tested_delta threshold.
+
+        Currently-short is found by per-contract netting over the transaction's
+        executed option orders — the same netting _close_structure performs (BUY
+        +qty, SELL −qty) — because combo child legs carry parent_order_id and a
+        parent-only filter can never see them. Each net-short contract's delta comes
+        from a chain lookup (quotes carry no greeks) using the underlying/expiry on
+        that contract's most recent order row. Missing chain rows or None deltas ->
+        False (no action this bar)."""
         executed = OrderStatus.get_executed_statuses()
+        net: Dict[str, float] = {}
+        meta: Dict[str, Any] = {}
         for o in orders_where(transaction_id=parent.transaction_id):
             if getattr(o, "asset_class", None) != AssetClass.OPTION or not getattr(o, "contract_symbol", None):
                 continue
-            if o.status not in executed or o.side != OrderDirection.SELL or o.parent_order_id is None:
+            if o.status not in executed:
                 continue
+            sign = 1.0 if o.side == OrderDirection.BUY else -1.0
+            net[o.contract_symbol] = net.get(o.contract_symbol, 0.0) + sign * float(o.filled_qty or o.quantity or 0.0)
+            meta[o.contract_symbol] = o
+        threshold = float(self._s("tested_delta"))
+        for contract, n in net.items():
+            if n >= 0:
+                continue
+            o = meta[contract]
             expiry = o.expiry
             chain = self.account.get_option_chain(o.underlying_symbol, expiry, expiry)
             for c in chain:
-                if c.symbol == o.contract_symbol and c.delta is not None:
-                    if abs(c.delta) >= float(self._s("tested_delta")):
+                if c.symbol == contract and c.delta is not None:
+                    if abs(c.delta) >= threshold:
                         return True
         return False
 

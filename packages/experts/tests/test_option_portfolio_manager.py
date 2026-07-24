@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 from ba2_common.core.option_types import OptionLeg
-from ba2_common.core.types import OrderDirection
+from ba2_common.core.types import AssetClass, OrderDirection, OrderStatus
 from ba2_experts.PremiumSeller.portfolio import OptionPortfolioManager
 from ba2_experts.PremiumSeller.structures import StructureSpec
 
@@ -120,3 +120,41 @@ def test_circuit_breaker_flattens_and_halts(monkeypatch):
     closed.clear()
     pm.manage_open(datetime(2024, 1, 4))
     assert closed == []
+
+
+def _combo_orders():
+    """Multi-leg combo: parent order + two child SELL legs WITH parent_order_id set."""
+    return [
+        SimpleNamespace(id=70, parent_order_id=None, asset_class=AssetClass.OPTION,
+                        contract_symbol=None, status=OrderStatus.FILLED,
+                        side=OrderDirection.SELL, option_strategy="put_credit_spread"),
+        SimpleNamespace(id=71, parent_order_id=70, asset_class=AssetClass.OPTION,
+                        contract_symbol="XYZP95", status=OrderStatus.FILLED,
+                        side=OrderDirection.SELL, filled_qty=1.0, quantity=1.0,
+                        expiry=date(2024, 2, 9), underlying_symbol="XYZ"),
+        SimpleNamespace(id=72, parent_order_id=70, asset_class=AssetClass.OPTION,
+                        contract_symbol="XYZP90", status=OrderStatus.FILLED,
+                        side=OrderDirection.SELL, filled_qty=1.0, quantity=1.0,
+                        expiry=date(2024, 2, 9), underlying_symbol="XYZ"),
+    ]
+
+
+def test_tested_combo_short_leg_over_threshold(monkeypatch):
+    pm = make_manager()                              # tested_delta = 0.30
+    monkeypatch.setattr("ba2_experts.PremiumSeller.portfolio.orders_where",
+                        lambda **_: _combo_orders())
+    pm.account.get_option_chain = lambda underlying, start, end: [
+        SimpleNamespace(symbol="XYZP95", delta=-0.35)]   # |delta| 0.35 >= 0.30
+    parent = SimpleNamespace(id=70, transaction_id=7)
+    assert pm._tested(parent) is True
+
+
+def test_tested_combo_short_leg_under_threshold(monkeypatch):
+    pm = make_manager()                              # tested_delta = 0.30
+    monkeypatch.setattr("ba2_experts.PremiumSeller.portfolio.orders_where",
+                        lambda **_: _combo_orders())
+    pm.account.get_option_chain = lambda underlying, start, end: [
+        SimpleNamespace(symbol="XYZP95", delta=-0.20),   # |delta| 0.20 < 0.30
+        SimpleNamespace(symbol="XYZP90", delta=None)]    # None delta -> no action
+    parent = SimpleNamespace(id=70, transaction_id=7)
+    assert pm._tested(parent) is False
