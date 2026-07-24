@@ -79,6 +79,37 @@ class TestBuildClosingLegs:
                                      quote_fn=lambda s: _Quote(bid=0.8, ask=0.95))
         assert all(l.contract_symbol for l in legs)
 
+    def test_held_qty_skips_individually_closed_leg(self):
+        # B10: a leg closed individually mid-life is FLAT — reversing it again would
+        # open a NEW opposite position. With held_qty netted over the transaction's
+        # executed option orders, only the still-held leg is closed.
+        children = [
+            _child("MP260717C00110000", OrderDirection.SELL, strike=110.0),
+            _child("MP260717P00090000", OrderDirection.SELL, option_type=OptionRight.PUT,
+                   strike=90.0),
+        ]
+        held = {"MP260717C00110000": 0.0, "MP260717P00090000": -1.0}
+        quotes = {
+            "MP260717C00110000": _Quote(bid=0.1, ask=0.2),
+            "MP260717P00090000": _Quote(bid=0.4, ask=0.5),
+        }
+        legs, net = build_closing_legs(children, parent_quantity=1, quote_fn=quotes.get,
+                                       held_qty=held)
+        assert [l.contract_symbol for l in legs] == ["MP260717P00090000"]
+        assert legs[0].side == OrderDirection.BUY  # buy back the surviving short put
+        assert net == pytest.approx(0.5)
+
+    def test_held_qty_sizes_ratio_from_remaining_qty(self):
+        # 2 structures, only 1 leg contract remains -> ratio reflects the remainder.
+        children = [_child("MP260717P00090000", OrderDirection.SELL, qty=2.0,
+                           option_type=OptionRight.PUT, strike=90.0)]
+        held = {"MP260717P00090000": -1.0}
+        legs, net = build_closing_legs(children, parent_quantity=2,
+                                       quote_fn=lambda s: _Quote(bid=0.4, ask=0.5),
+                                       held_qty=held)
+        assert legs[0].ratio_qty == 1  # 1 remaining / 2 structures -> ratio 1 (min 1)
+        assert net == pytest.approx(0.5)
+
 
 class TestApplyLotSize:
     def test_rounds_down_to_lot(self):

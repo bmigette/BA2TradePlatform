@@ -1426,24 +1426,30 @@ def _get_spread_pnl_via_transaction(account, existing_order) -> Optional[Dict]:
     TP'd after 1 bar at a real +1-12%; credit spreads could never TP and any SL fired
     instantly).
 
-    The structure's current net premium per structure is
-        sum_legs( sign x current_premium x leg_ratio ),  sign = +1 BUY leg / -1 SELL leg
-    with each leg marked from the account's option quote exactly like the single-leg
-    path (long legs at bid, short legs at ask, last as fallback). The parent
-    transaction's open_price is the entry net premium per structure (positive = debit,
-    negative = credit — normalised here via the parent's side, so a stored absolute
-    value prices identically). Then:
-        amount  = (net_current - open_net) * |qty| * multiplier
-        percent = amount / (|open_net| * |qty| * multiplier) * 100
+    The P&L is computed from the transaction's PER-CONTRACT view over EVERY executed
+    option order (entry legs, MLEG-close legs, standalone single-leg closes, synthetic
+    expiry closes):
+        amount = cash_collected + cost_to_flatten_held_legs
+    where cash_collected is the signed premium cash of all executed fills (sells +,
+    buys −) — so a leg closed individually mid-life contributes its REALIZED P&L — and
+    the still-held contracts are marked to flatten from the account's option quotes
+    exactly like the single-leg path (long at bid, short at ask, last fallback). For an
+    untouched structure this reduces to (net_current − open_net) x qty x multiplier with
+    net_current = Σ sign x current_premium x leg_ratio. The parent transaction's
+    open_price is the entry net premium per structure (positive = debit, negative =
+    credit — normalised here via the parent's side, so a stored absolute value prices
+    identically). Then:
+        percent = amount / (|open_net| x |qty| x multiplier) x 100
     which reduces to "% of credit captured" for a SELL parent (net premium halving =
     +50%) and to the debit multiple for a BUY parent. Returns None (decline to
-    evaluate — never a fabricated number) when a leg quote/multiplier is missing, no
-    filled legs exist, or the entry net premium is ~0 (even-money structure: the
-    percent basis is undefined).
+    evaluate — never a fabricated number) when a held-leg quote/multiplier is missing,
+    no executed option orders exist, the structure is already flat (nothing left to
+    manage), or the entry net premium is ~0 (even-money structure: the percent basis is
+    undefined).
     """
     from ba2_common.core.interfaces.OptionsAccountInterface import OptionsAccountInterface
     from ba2_common.core.trade_store import orders_where
-    from ba2_common.core.types import OrderDirection, OrderStatus
+    from ba2_common.core.types import AssetClass, OrderDirection, OrderStatus
 
     if not isinstance(account, OptionsAccountInterface):
         logger.warning(f"Account does not support options; cannot compute structure P&L for order {existing_order.id}")
@@ -1453,10 +1459,26 @@ def _get_spread_pnl_via_transaction(account, existing_order) -> Optional[Dict]:
     if transaction is None:
         return None
 
-    legs = [o for o in orders_where(parent_order_id=existing_order.id)
-            if o.status == OrderStatus.FILLED and o.contract_symbol]
-    if not legs:
-        logger.warning(f"No filled child legs for multi-leg parent order {existing_order.id} — cannot compute structure P&L")
+    executed = OrderStatus.get_executed_statuses()
+    cash_collected = 0.0          # signed premium cash per share: sells +, buys −
+    remaining: Dict[str, float] = {}  # contract_symbol -> signed qty (BUY +)
+    for o in orders_where(transaction_id=transaction.id):
+        if getattr(o, "asset_class", None) != AssetClass.OPTION or not o.contract_symbol:
+            continue
+        if o.status not in executed:
+            continue
+        if o.open_price is None:
+            logger.warning(f"Executed option order {o.id} ({o.contract_symbol}) has no fill price — cannot compute structure P&L")
+            return None
+        o_qty = float(o.filled_qty or o.quantity or 0.0)
+        if o_qty <= 0:
+            continue
+        sign = 1.0 if o.side == OrderDirection.BUY else -1.0
+        cash_collected += -sign * float(o.open_price) * o_qty
+        remaining[o.contract_symbol] = remaining.get(o.contract_symbol, 0.0) + sign * o_qty
+
+    if not remaining:
+        logger.warning(f"No executed option legs for multi-leg parent order {existing_order.id} — cannot compute structure P&L")
         return None
 
     structures = abs(float(existing_order.quantity or 0.0))
@@ -1464,25 +1486,36 @@ def _get_spread_pnl_via_transaction(account, existing_order) -> Optional[Dict]:
         logger.warning(f"Multi-leg parent order {existing_order.id} has no structure quantity — cannot compute structure P&L")
         return None
 
-    net_current = 0.0
-    for leg in legs:
+    # Signed cash inflow of flattening every still-held contract at current quotes.
+    flatten_cash = 0.0
+    any_held = False
+    for contract, net in remaining.items():
+        if abs(net) < 1e-9:
+            continue
+        any_held = True
         try:
-            quote = account.get_option_quote(leg.contract_symbol)
+            quote = account.get_option_quote(contract)
         except Exception as e:
-            logger.error(f"Error fetching option quote for leg {leg.contract_symbol}: {e}", exc_info=True)
+            logger.error(f"Error fetching option quote for leg {contract}: {e}", exc_info=True)
             return None
         if quote is None:
-            logger.warning(f"No option quote for leg {leg.contract_symbol} — cannot compute structure P&L")
+            logger.warning(f"No option quote for leg {contract} — cannot compute structure P&L")
             return None
-        if leg.side == OrderDirection.BUY:
+        if net > 0:  # long leg: mark at the bid (what selling it back yields)
             leg_premium = quote.bid if quote.bid is not None else quote.last
-        else:
+        else:        # short leg: mark at the ask (what buying it back costs)
             leg_premium = quote.ask if quote.ask is not None else quote.last
         if leg_premium is None:
-            logger.warning(f"Option quote for leg {leg.contract_symbol} has no usable premium (bid/ask/last all None)")
+            logger.warning(f"Option quote for leg {contract} has no usable premium (bid/ask/last all None)")
             return None
-        ratio = abs(float(leg.quantity or 0.0)) / structures
-        net_current += (leg_premium if leg.side == OrderDirection.BUY else -leg_premium) * ratio
+        # Flatten trade of signed qty -net at the mark: long net>0 -> sell -> +net*prem;
+        # short net<0 -> buy back -> net*prem (negative cash). One expression covers both.
+        flatten_cash += net * leg_premium
+
+    if not any_held:
+        # Every leg already resolved individually — nothing left to manage; the
+        # transaction closes itself via refresh (per-contract balance).
+        return None
 
     multiplier = transaction.multiplier or existing_order.multiplier
     if not multiplier:
@@ -1497,7 +1530,7 @@ def _get_spread_pnl_via_transaction(account, existing_order) -> Optional[Dict]:
         return None
 
     qty = abs(float(transaction.quantity or 0.0)) or structures
-    pnl_amount = (net_current - open_net) * qty * multiplier
+    pnl_amount = (cash_collected + flatten_cash) * multiplier
     pnl_pct = pnl_amount / (abs(open_net) * qty * multiplier) * 100
     return {'amount': round(pnl_amount, 2), 'percent': round(pnl_pct, 4)}
 

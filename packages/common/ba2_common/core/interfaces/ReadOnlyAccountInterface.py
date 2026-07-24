@@ -542,6 +542,36 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                     # If buy and sell orders match, position is closed
                     position_balanced = abs(total_filled_buy - total_filled_sell) < 0.0001
 
+                    # MULTI-LEG OPTION STRUCTURE: the transaction's real position is the
+                    # PER-CONTRACT net over every executed option order on it (entry legs,
+                    # MLEG-close legs, standalone single-leg closes, synthetic expiry
+                    # closes) — NOT the parent-vs-closes quantity comparison above, which
+                    # mixes units (structures vs contracts) and marked the transaction
+                    # CLOSED as soon as ANY ONE leg was closed individually (e.g. a
+                    # margin-liquidation buy-back of one strangle leg): the surviving legs
+                    # then became invisible to get_option_positions / _apply_option_expiry /
+                    # exit management and were recorded open_at_end instead of expiring
+                    # (the B10 orphan-leg defect, run 760's BABA/C/MRVL puts). The
+                    # structure-quantity rewrite is likewise skipped (mixed-unit garbage);
+                    # the parent + the engine's own sync own the structures count.
+                    if multi_leg_parent_ids:
+                        contract_net: Dict[str, float] = {}
+                        for order in orders:
+                            if getattr(order, "asset_class", None) != AssetClass.OPTION:
+                                continue
+                            contract = getattr(order, "contract_symbol", None)
+                            if not contract:
+                                continue  # net-only parent, not a contract position
+                            o_filled = order.filled_qty or 0
+                            if order.status in executed_statuses or o_filled > 0:
+                                qty = float(o_filled if o_filled else order.quantity or 0)
+                                if qty:
+                                    contract_net[contract] = contract_net.get(contract, 0.0) + (
+                                        qty if order.side == OrderDirection.BUY else -qty)
+                        position_balanced = bool(contract_net) and all(
+                            abs(v) < 0.0001 for v in contract_net.values())
+                        calculated_quantity = 0.0
+
                     # Update transaction quantity if different
                     if calculated_quantity != 0 and transaction.quantity != calculated_quantity:
                         if calculated_quantity < 0:

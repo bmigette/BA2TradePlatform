@@ -349,13 +349,62 @@ enabled, 30-day time exit enabled, SL disabled — same exit config as pre-fix r
 - **Scoreboard**: 13 structures, +$569 on $4,353 premium (+13.1% per-premium), TR 7.42% over
   the ~2.2y window. The fix repairs exit semantics, not edge — see the economic verdict above.
 
-### New anomaly found during validation → follow-up B10
+### New anomaly found during validation → follow-up B10 (root-caused & fixed, 2026-07-24)
 
 3 short-put legs (BABA240503P00067000, C240503P00057000, MRVL240503P00067000) were recorded
 `open_at_end` at the entry premium (−$1 each) even though the contracts **expired 2024-05-03 —
-two years before run end**. Each had its strangle call leg closed early by a signal exit; the
-put leg was then held 551–560 bars despite the enabled 30-day time exit AND the expiry, i.e.
-its lifecycle stopped entirely once the sibling leg closed. BABA and C were OTM at expiry
-(should have kept the full ~$298 credit); the engine records ≈0% instead — materially
-understating credit-strategy P&L (est. +$300…+870 on a +$569 run). Root cause under
-investigation (expiry/time-exit processing appears to skip legs whose sibling/parent closed).
+two years before run end**. The put legs were held 551–560 bars despite the enabled 30-day
+time exit AND the expiry — their lifecycle stopped entirely once the sibling call leg closed.
+BABA and C were OTM at expiry (should have kept the full ~$298 credit); the engine records
+≈0% instead — materially understating credit-strategy P&L (est. +$300…+870 on a +$569 run).
+
+**Root cause (code-proven + engine-reproduced):** a three-step chain.
+
+1. **Trigger — a per-leg close.** `maybe_margin_call_liquidation`
+   (`testplatform/backend/app/services/backtest/backtest_account.py:780`) buys back ONE naked
+   short leg at a time (largest |qty|, ties → the call leg). That standalone single-leg close
+   has no `parent_order_id`, so it rides the structure's shared transaction.
+2. **Mechanism — premature `position_balanced`.** `refresh_transactions`
+   (`packages/common/ba2_common/core/interfaces/ReadOnlyAccountInterface.py`) computed the
+   balanced check from parent-level buy/sell sums that EXCLUDE multi-leg child legs but COUNT
+   standalone option closes. One leg close (BUY 1) therefore offsets the entry parent (SELL 1)
+   and the whole strangle transaction is marked CLOSED with
+   `close_reason="position_balanced"` — while the put leg is still open.
+3. **Consequence — orphan leg.** Every consumer that would manage the surviving leg filters
+   on `status == OPENED`: `get_option_positions`, `_apply_option_expiry`,
+   `_option_transaction_for_contract`. The leg becomes invisible: it never expires, never
+   time-exits, never contributes P&L. The same defect exists in LIVE (shared
+   `packages/common` code), not just in the backtest engine.
+
+**Fix (3 parts, all option-gated — equity/stock paths are byte-identical):**
+
+1. `ReadOnlyAccountInterface.refresh_transactions`: when the transaction has a multi-leg
+   parent (`multi_leg_parent_ids` non-empty), compute `position_balanced` by **per-contract
+   netting over ALL executed option orders with a `contract_symbol`** (multi-leg children,
+   standalone per-leg closes, synthetic expiry closes), and skip the mixed-unit
+   `calculated_quantity` rewrite (set to 0.0). Single-leg option and equity transactions keep
+   the previous parent-level logic.
+2. `TradeConditions._get_spread_pnl_via_transaction` (the B9 structure-P&L path): price
+   `cash_collected + flatten_cash` over the transaction's executed option orders — realized
+   P&L of individually closed legs plus mark-to-flatten of the legs still held — and decline
+   (return `None`) once the structure is fully flat. Reduces to the B9 formula for untouched
+   structures (the 7 original B9 tests pass unchanged).
+3. `TradeActions.build_closing_legs` / `_close_multi_leg`: new optional `held_qty` parameter —
+   skips legs that are already flat and sizes the closing ratio from the remaining quantity;
+   `_close_multi_leg` computes `held_qty` from the transaction's orders (in-memory and DB
+   dual path) and returns a success no-op when nothing is left to close.
+
+**Tests (TDD — red on the pre-fix code, green after):**
+
+- `testplatform/backend/tests/backtest/test_spread_orphan_leg.py` (new, real engine): enter a
+  strangle, close the call leg individually → pre-fix the transaction went CLOSED with
+  `close_reason="position_balanced"`; post-fix it stays OPENED, the put is held to expiry,
+  expires worthless, and only then does the transaction close.
+- `tests/test_option_spread_pnl_condition.py`: partially-closed structure prices
+  realized-plus-remainder (+70% fixture); fully-flat structure declines.
+- `tests/test_option_close_multileg.py`: `held_qty` skips a flat leg; closing ratio is sized
+  from the remaining quantity.
+
+**Re-run still owed:** the exit-semantics improvement needs a fresh OS2 re-run (v8) to be
+measured — expected recovery is the est. +$300…+870 leaked on run 760's 13 structures, plus
+any knock-on from no longer orphaning legs mid-run.

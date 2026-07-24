@@ -53,7 +53,10 @@ def _set_leg_quotes(mock_account, quotes):
 def _seed_spread(mock_account, mock_expert_instance, *, side, open_price, legs,
                  structures=2, option_strategy="test_spread"):
     """Seed an open multi-leg Transaction + parent order (NO contract_symbol) + FILLED
-    child legs linked via parent_order_id. ``legs``: [(contract, side, qty_ratio)]."""
+    child legs linked via parent_order_id. ``legs``:
+    [(contract, side, qty_ratio, entry_premium)] — the engine records each leg's fill
+    premium on the leg order, so the seeded legs carry it too (the structure P&L prices
+    realized cash from it)."""
     txn = create_transaction(
         symbol="AAPL", quantity=structures, side=side,
         status=TransactionStatus.OPENED, open_price=open_price,
@@ -66,12 +69,13 @@ def _seed_spread(mock_account, mock_expert_instance, *, side, open_price, legs,
         asset_class=AssetClass.OPTION, contract_symbol=None,
         option_strategy=option_strategy, underlying_symbol="AAPL", multiplier=100,
     )
-    for contract, leg_side, ratio in legs:
+    for contract, leg_side, ratio, entry_premium in legs:
         right = OptionRight.CALL if "C" in contract[10:] else OptionRight.PUT
         create_trading_order(
             account_id=mock_account.id, symbol="AAPL",
             quantity=structures * ratio, side=leg_side, order_type=OrderType.MARKET,
             status=OrderStatus.FILLED, filled_qty=structures * ratio,
+            open_price=entry_premium,
             transaction_id=txn.id, parent_order_id=parent.id,
             asset_class=AssetClass.OPTION, contract_symbol=contract,
             option_type=right, strike=190.0, expiry=EXPIRY,
@@ -91,11 +95,12 @@ def _pct_cond(mock_account, rec, parent, op, value):
 # --- debit spread (BUY parent, open_price = net debit per structure) ----------------
 
 def _debit_spread(mock_account, mock_expert_instance):
-    # Bull call spread, 2 structures, net debit $3.75/structure.
+    # Bull call spread, 2 structures, net debit $3.75/structure (long 4.50 - short 0.75).
     return _seed_spread(
         mock_account, mock_expert_instance,
         side=OrderDirection.BUY, open_price=3.75,
-        legs=[(LONG_CALL, OrderDirection.BUY, 1), (SHORT_CALL, OrderDirection.SELL, 1)],
+        legs=[(LONG_CALL, OrderDirection.BUY, 1, 4.50),
+              (SHORT_CALL, OrderDirection.SELL, 1, 0.75)],
         option_strategy="bull_call_spread",
     )
 
@@ -143,11 +148,12 @@ def test_debit_spread_tp_fires_at_real_structure_gain(
 # --- credit spread (SELL parent, open_price = net credit per structure) -------------
 
 def _credit_spread(mock_account, mock_expert_instance, open_price=-2.50):
-    # Short strangle, 2 structures, net credit $2.50/structure.
+    # Short strangle, 2 structures, net credit $2.50/structure (1.25 + 1.25).
     return _seed_spread(
         mock_account, mock_expert_instance,
         side=OrderDirection.SELL, open_price=open_price,
-        legs=[(SHORT_PUT, OrderDirection.SELL, 1), (FAR_CALL, OrderDirection.SELL, 1)],
+        legs=[(SHORT_PUT, OrderDirection.SELL, 1, 1.25),
+              (FAR_CALL, OrderDirection.SELL, 1, 1.25)],
         option_strategy="short_strangle",
     )
 
@@ -196,9 +202,9 @@ def test_butterfly_ratio_legs_are_weighted(
     parent = _seed_spread(
         mock_account, mock_expert_instance,
         side=OrderDirection.BUY, open_price=1.50, structures=1,
-        legs=[(LONG_CALL, OrderDirection.BUY, 1),
-              (SHORT_CALL, OrderDirection.SELL, 2),
-              (FAR_CALL, OrderDirection.BUY, 1)],
+        legs=[(LONG_CALL, OrderDirection.BUY, 1, 5.00),
+              (SHORT_CALL, OrderDirection.SELL, 2, 2.00),
+              (FAR_CALL, OrderDirection.BUY, 1, 0.50)],
         option_strategy="call_butterfly",
     )
     _set_leg_quotes(mock_account, {LONG_CALL: (5.00, 5.10, 5.05),
@@ -242,10 +248,71 @@ def test_even_money_structure_declines(
     parent = _seed_spread(
         mock_account, mock_expert_instance,
         side=OrderDirection.SELL, open_price=0.0,
-        legs=[(SHORT_PUT, OrderDirection.SELL, 1), (FAR_CALL, OrderDirection.SELL, 1)],
+        legs=[(SHORT_PUT, OrderDirection.SELL, 1, 1.25),
+              (FAR_CALL, OrderDirection.SELL, 1, 1.25)],
     )
     _set_leg_quotes(mock_account, {SHORT_PUT: (0.70, 0.75, 0.72),
                                    FAR_CALL: (0.45, 0.50, 0.47)})
+    cond = _pct_cond(mock_account, sample_recommendation, parent, ">", 1.0)
+    assert cond.evaluate() is False
+    assert cond.calculated_value is None
+
+
+# --- partially-closed structures (B10 follow-through) --------------------------------
+
+def _close_leg_individually(mock_account, txn_id, contract, side_closed, qty, premium):
+    """A STANDALONE single-leg close fill riding the same transaction — the shape the
+    margin-liquidation buy-back and close_option_position both produce (NO
+    parent_order_id)."""
+    right = OptionRight.CALL if "C" in contract[10:] else OptionRight.PUT
+    return create_trading_order(
+        account_id=mock_account.id, symbol="AAPL",
+        quantity=qty, side=side_closed, order_type=OrderType.MARKET,
+        status=OrderStatus.FILLED, filled_qty=qty, open_price=premium,
+        transaction_id=txn_id, parent_order_id=None,
+        asset_class=AssetClass.OPTION, contract_symbol=contract,
+        option_type=right, strike=190.0, expiry=EXPIRY,
+        underlying_symbol="AAPL", multiplier=100,
+    )
+
+
+def test_partially_closed_structure_prices_realized_plus_remainder(
+    mock_account, mock_expert_instance, sample_recommendation,
+):
+    """Strangle ($2.50 credit, 2 structures) whose CALL leg was bought back individually
+    at 0.50: the condition must price REALIZED (call +0.75/contract) + REMAINING (put
+    still held, marked to flatten), not treat the closed call as still short.
+
+    cash = +2x1.25 (put) + 2x1.25 (call) - 2x0.50 (buy-back) = +4.00; put ask now 0.25
+    -> flatten -0.50; amount = 3.50 x 100 = $350 on the $500 basis = +70%. (The stale
+    all-legs formula would read the flat call as still held and report a different
+    number.)"""
+    mock_account._prices["AAPL"] = 190.0
+    parent = _credit_spread(mock_account, mock_expert_instance)
+    _close_leg_individually(mock_account, parent.transaction_id, FAR_CALL,
+                            OrderDirection.BUY, qty=2, premium=0.50)
+    _set_leg_quotes(mock_account, {SHORT_PUT: (0.20, 0.25, 0.22),
+                                   FAR_CALL: (0.05, 0.10, 0.07)})
+
+    cond = _pct_cond(mock_account, sample_recommendation, parent, ">", 65.0)
+    assert cond.evaluate() is True
+    assert cond.calculated_value == pytest.approx(70.0, abs=0.01)
+
+
+def test_fully_flat_structure_declines(
+    mock_account, mock_expert_instance, sample_recommendation,
+):
+    """Both legs closed individually -> nothing left to manage: decline (False, None)
+    rather than pricing a phantom position."""
+    mock_account._prices["AAPL"] = 190.0
+    parent = _credit_spread(mock_account, mock_expert_instance)
+    _close_leg_individually(mock_account, parent.transaction_id, FAR_CALL,
+                            OrderDirection.BUY, qty=2, premium=0.50)
+    _close_leg_individually(mock_account, parent.transaction_id, SHORT_PUT,
+                            OrderDirection.BUY, qty=2, premium=0.25)
+    _set_leg_quotes(mock_account, {SHORT_PUT: (0.20, 0.25, 0.22),
+                                   FAR_CALL: (0.05, 0.10, 0.07)})
+
     cond = _pct_cond(mock_account, sample_recommendation, parent, ">", 1.0)
     assert cond.evaluate() is False
     assert cond.calculated_value is None

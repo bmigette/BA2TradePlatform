@@ -2868,7 +2868,7 @@ class OpenPutRatioSpreadAction(_OptionEntryAction):
         return f"Open put ratio spread on {self.instrument_name}"
 
 
-def build_closing_legs(children, parent_quantity: int, quote_fn) -> "tuple[List[OptionLeg], Optional[float]]":
+def build_closing_legs(children, parent_quantity: int, quote_fn, held_qty=None) -> "tuple[List[OptionLeg], Optional[float]]":
     """Build reversed legs (and a net limit price) that close a spread's child legs.
 
     Pure given ``quote_fn`` so it is unit-testable.
@@ -2883,16 +2883,29 @@ def build_closing_legs(children, parent_quantity: int, quote_fn) -> "tuple[List[
         children: child TradingOrder rows of the spread parent (contract_symbol set).
         parent_quantity: the parent order quantity (children's ratio is derived from it).
         quote_fn: ``contract_symbol -> OptionQuote | None``.
+        held_qty: optional ``{contract_symbol: signed remaining qty}`` netted over the
+            transaction's executed option orders. A leg closed individually mid-life is
+            FLAT and is SKIPPED — reversing it again would open a NEW opposite position
+            (the B10 partial-close hazard); the close ratio is sized from the held qty,
+            not the original leg qty. When None every child is closed at its original
+            ratio (legacy behavior).
     """
     legs: List[OptionLeg] = []
     net: float = 0.0
     quotes_ok = True
     for child in children:
+        if held_qty is not None:
+            held = held_qty.get(child.contract_symbol, 0.0)
+            if abs(held) < 1e-9:
+                continue  # leg closed individually mid-life — nothing left to close
+            qty_for_ratio = abs(held)
+        else:
+            qty_for_ratio = abs(float(child.quantity or 0.0))
         close_side = OrderDirection.SELL if child.side == OrderDirection.BUY else OrderDirection.BUY
         intent = "sell_to_close" if child.side == OrderDirection.BUY else "buy_to_close"
         ratio = 1
-        if child.quantity and parent_quantity:
-            ratio = max(1, int(round(abs(child.quantity) / parent_quantity)))
+        if qty_for_ratio and parent_quantity:
+            ratio = max(1, int(round(qty_for_ratio / parent_quantity)))
         legs.append(OptionLeg(
             contract_symbol=child.contract_symbol,
             side=close_side,
@@ -3065,8 +3078,44 @@ class CloseOptionAction(TradeAction):
                 message=f"Spread parent order {order.id} for {self.instrument_name} has no quantity to close",
                 data={})
 
+        # Net every contract over the transaction's executed option orders (entry legs +
+        # any standalone single-leg closes): a leg closed individually mid-life is FLAT
+        # and must not be reversed again (that would OPEN a new opposite position — the
+        # B10 partial-close hazard once refresh keeps the transaction OPENED).
+        from ba2_common.core.types import OrderStatus
+        executed = OrderStatus.get_executed_statuses()
+        held_qty: Dict[str, float] = {}
+        if inmem_trades_active():
+            txn_orders = [o for o in store_all(TradingOrder)
+                          if o.transaction_id == order.transaction_id
+                          and o.asset_class == AssetClass.OPTION
+                          and o.contract_symbol is not None]
+        else:
+            from sqlmodel import select, Session
+            with Session(get_db().bind) as session:
+                txn_orders = session.exec(
+                    select(TradingOrder).where(
+                        TradingOrder.transaction_id == order.transaction_id,
+                        TradingOrder.asset_class == AssetClass.OPTION,
+                        TradingOrder.contract_symbol.is_not(None),
+                    )
+                ).all()
+                session.expunge_all()
+        for o in txn_orders:
+            if o.status in executed:
+                q = float(o.filled_qty or o.quantity or 0.0)
+                held_qty[o.contract_symbol] = held_qty.get(o.contract_symbol, 0.0) + (
+                    q if o.side == OrderDirection.BUY else -q)
+
         legs, net_limit = build_closing_legs(
-            children, parent_quantity=quantity, quote_fn=self._safe_option_quote)
+            children, parent_quantity=quantity, quote_fn=self._safe_option_quote,
+            held_qty=held_qty)
+        if not legs:
+            return self.create_and_save_action_result(
+                action_type=ExpertActionType.CLOSE_OPTION.value, success=True,
+                message=f"Spread parent order {order.id} for {self.instrument_name}: "
+                        f"all legs already closed — nothing left to close",
+                data={"contract_symbols": []})
         if net_limit is None:
             # No usable quotes for one or more legs: close at the negated entry
             # premium (entry debit -> closing credit and vice versa) as a neutral

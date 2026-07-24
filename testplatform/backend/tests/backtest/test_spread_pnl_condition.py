@@ -112,11 +112,14 @@ def spread_account(tmp_path):
         option_strategy="bull_call_spread", underlying_symbol="AAPL", multiplier=100,
     )
     add_instance(parent)
-    for contract, side in ((LONG_LEG, OrderDirection.BUY), (SHORT_LEG, OrderDirection.SELL)):
+    for contract, side, leg_price in (
+        (LONG_LEG, OrderDirection.BUY, 4.75),
+        (SHORT_LEG, OrderDirection.SELL, 1.00),
+    ):
         add_instance(TradingOrder(
             account_id=acct.id, symbol="AAPL", quantity=2, side=side,
             order_type=OrderType.MARKET, status=OrderStatus.FILLED, filled_qty=2,
-            transaction_id=txn.id, parent_order_id=parent.id,
+            open_price=leg_price, transaction_id=txn.id, parent_order_id=parent.id,
             asset_class=AssetClass.OPTION, contract_symbol=contract,
             option_type=OptionRight.CALL, strike=180.0 if side == OrderDirection.BUY else 185.0,
             expiry=datetime(2024, 3, 15).date(), underlying_symbol="AAPL", multiplier=100,
