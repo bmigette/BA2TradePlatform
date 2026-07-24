@@ -2708,15 +2708,21 @@ class OpenJadeLizardAction(_OptionEntryAction):
         net_credit = round(sc.bid + sp.bid - lc.ask, 4)
         if net_credit <= 0:
             return self._result(False, f"Non-positive credit for {self.instrument_name} jade lizard")
-        # Put side is NAKED: reserve Reg-T naked margin (not full strike*100 cash) so the
-        # structure is sizeable on a realistic account. (Call side is wing-capped.)
-        per_contract_reserve = self.account.naked_margin_per_contract(
-            sp.strike, option_type=OptionRight.PUT, spot=spot)
+        # Put side is naked, but Alpaca's real MLEG margin engine does NOT grant this 3-leg
+        # combo the standard Reg-T naked-margin discount (empirically confirmed exact against a
+        # real order: reported cost_basis matched put_strike*100 + call_wing_width*100 -
+        # net_credit*100 to the dollar, ~10x the naked_margin_per_contract Reg-T approximation
+        # this used to size off — see option_reserve_required's "jade_lizard" branch). Size and
+        # reserve off the SAME conservative formula so quantity and the persisted reserve agree
+        # with what the broker will actually charge.
+        call_wing_width = lc.strike - sc.strike
+        per_contract_reserve = self.account.option_reserve_required(
+            "jade_lizard", 1, strike=sp.strike, spread_width=call_wing_width, net_credit=net_credit)
         quantity = self._size_by_reserve(per_contract_reserve, self.sizing)
         if quantity < 1:
             return self._result(False, f"Insufficient budget to size jade lizard for {self.instrument_name}")
         reserve = self.account.option_reserve_required(
-            "naked_put", quantity, strike=sp.strike, spot=spot, option_type=OptionRight.PUT)
+            "jade_lizard", quantity, strike=sp.strike, spread_width=call_wing_width, net_credit=net_credit)
         if not self.account.check_option_buying_power(reserve):
             return self._result(False, f"Insufficient BP for jade lizard on {self.instrument_name}")
         legs = [
@@ -2830,15 +2836,21 @@ class OpenPutRatioSpreadAction(_OptionEntryAction):
         if long_p.ask is None or short_p.bid is None:
             return self._result(False, f"Missing quotes for ratio spread on {self.instrument_name}")
         net = round(long_p.ask - 2 * short_p.bid, 4)   # usually negative (credit)
-        # Reserve the 1 net naked short put at Reg-T naked margin (not full strike*100 cash)
-        # so the structure is sizeable on a realistic account.
-        per_contract_reserve = self.account.naked_margin_per_contract(
-            short_p.strike, option_type=OptionRight.PUT, spot=spot)
+        # Alpaca's real MLEG margin engine does NOT grant Reg-T naked-margin netting (nor any
+        # credit for the long leg's partial protection) to this combo shape -- empirically
+        # confirmed exact against a real order: it margins the WHOLE position as if it were a
+        # plain naked short put at the SHORT strike (cash-secured-style full notional), netted
+        # only by the total credit collected (see option_reserve_required's "put_ratio_spread"
+        # branch). net_credit is expressed as a positive amount; net>=0 (a net debit, no credit
+        # to net against) reserves the full short-strike notional with no discount.
+        net_credit = max(0.0, -net)
+        per_contract_reserve = self.account.option_reserve_required(
+            "put_ratio_spread", 1, strike=short_p.strike, net_credit=net_credit)
         quantity = self._size_by_reserve(per_contract_reserve, self.sizing)
         if quantity < 1:
             return self._result(False, f"Insufficient budget to size ratio spread for {self.instrument_name}")
         reserve = self.account.option_reserve_required(
-            "put_ratio_spread", quantity, strike=short_p.strike, spot=spot, option_type=OptionRight.PUT)
+            "put_ratio_spread", quantity, strike=short_p.strike, net_credit=net_credit)
         if not self.account.check_option_buying_power(reserve):
             return self._result(False, f"Insufficient BP for ratio spread on {self.instrument_name}")
         legs = [

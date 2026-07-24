@@ -288,12 +288,15 @@ def test_naked_margin_reg_t_direction_aware():
 
 
 def test_naked_reserve_uses_margin_not_full_cash():
-    """option_reserve_required for naked structures must use the margin model."""
+    """option_reserve_required for GENUINELY Reg-T-netted naked structures must use the
+    margin model, not full cash. put_ratio_spread is deliberately EXCLUDED from this group
+    (see test_jade_lizard_and_put_ratio_spread_reserve_match_alpaca below) -- Alpaca's real
+    MLEG engine does NOT extend this discount to it."""
     acct = FakeAccount(spot=250.0)
     full_cash = 225.0 * 100.0 * 2
     # short_straddle shorts BOTH rights at one strike -> worst case over both is reserved
     # (no option_type needed); the single-sided strategies require the leg's right.
-    for strat in ("short_straddle", "short_strangle", "naked_put", "put_ratio_spread"):
+    for strat in ("short_straddle", "short_strangle", "naked_put"):
         kw = {} if strat == "short_straddle" else {"option_type": OptionRight.PUT}
         r = acct.option_reserve_required(strat, 2, strike=225.0, spot=250.0, **kw)
         assert 0 < r < full_cash, f"{strat} reserve {r} should be margin (< full cash {full_cash})"
@@ -306,3 +309,34 @@ def test_naked_reserve_uses_margin_not_full_cash():
         "short_straddle", 2, strike=225.0, spot=250.0) == pytest.approx(10000.0)
     # cash-secured put stays fully secured (full strike*100 by design).
     assert acct.option_reserve_required("cash_secured_put", 1, strike=225.0) == pytest.approx(22500.0)
+
+
+def test_jade_lizard_and_put_ratio_spread_reserve_match_alpaca():
+    """Regression (2026-07-24): jade_lizard and put_ratio_spread previously sized/reserved off
+    plain Reg-T naked_margin_per_contract, underestimating Alpaca's real MLEG margin requirement
+    by ~9-10x (empirically confirmed via real paper-account submissions on account 3 -- Alpaca's
+    risk engine does not extend Reg-T naked-margin netting to these non-simple combo shapes,
+    unlike the 2-leg vertical / 4-leg iron condor cases above, which DO match Reg-T/max-loss
+    exactly). Both now reserve at full notional for the naked component, netted by the credit
+    collected -- verified exact against the real cost_basis Alpaca reported."""
+    acct = OptionsAccountInterface
+
+    # jade_lizard: real order (put strike 290, call wing width 17.5, net_credit 3.04) reported
+    # Alpaca cost_basis=$30,446 for quantity=1.
+    r = acct.option_reserve_required(
+        "jade_lizard", 1, strike=290.0, spread_width=17.5, net_credit=3.04)
+    assert r == pytest.approx(30446.0)
+    # Previous (wrong) naked_margin_per_contract-only formula would have given ~$3,289 here --
+    # assert the fix is materially more conservative, not just numerically different.
+    assert r > 9 * 3289.0
+
+    # put_ratio_spread: real order (short strike 290, net_credit 3.65) reported Alpaca
+    # cost_basis=$859,050 for quantity=30 -> $28,635/contract.
+    r = acct.option_reserve_required("put_ratio_spread", 30, strike=290.0, net_credit=3.65)
+    assert r == pytest.approx(859_050.0)
+    assert r / 30 == pytest.approx(28_635.0)
+
+    # A net-debit put ratio spread (no credit to net against) reserves the full strike notional,
+    # not a fraction -- no Reg-T discount applies here at all.
+    r = acct.option_reserve_required("put_ratio_spread", 1, strike=200.0, net_credit=0.0)
+    assert r == pytest.approx(20_000.0)

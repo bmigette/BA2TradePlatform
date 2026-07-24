@@ -280,7 +280,7 @@ class OptionsAccountInterface(ABC):
                 return 0.0
             max_loss = (spread_width - net_credit)
             return max(0.0, max_loss) * 100.0 * quantity
-        if strategy in ("short_straddle", "short_strangle", "naked_put", "put_ratio_spread"):
+        if strategy in ("short_straddle", "short_strangle", "naked_put"):
             # NAKED short premium: reserve the Reg-T naked-option margin, not full cash.
             if strike is None:
                 return 0.0
@@ -296,7 +296,44 @@ class OptionsAccountInterface(ABC):
                     f"option_reserve_required({strategy!r}) requires option_type — the Reg-T "
                     "OTM amount is direction-aware (call: strike-spot, put: spot-strike).")
             return cls.naked_margin_per_contract(strike, option_type=option_type, spot=spot) * quantity
-        if strategy in ("iron_condor", "jade_lizard", "call_butterfly", "debit_spread"):
+        if strategy == "put_ratio_spread":
+            # Empirically confirmed against a real Alpaca paper submission (2026-07-24, same
+            # session as the jade_lizard fix): a 1-long/2-short put ratio spread is NOT given
+            # Reg-T naked-margin netting for its net-1-naked-short leg, nor any credit for the
+            # long leg's partial protection -- Alpaca's MLEG engine margins the WHOLE position as
+            # if it were a plain naked short put at the SHORT strike (cash-secured-style full
+            # notional), netted by the total credit collected. Verified EXACT to the dollar: a
+            # real 30-contract order (short strike 290, net_credit 3.65) reported Alpaca
+            # cost_basis=$859,050 == 30 * (290*100 - 3.65*100) = 30 * 28,635. The previous formula
+            # (naked_margin_per_contract on the short strike alone) reserved only ~$3,289/contract
+            # for the same order -- an ~8.7x underestimate.
+            if strike is None:
+                return 0.0
+            credit = net_credit if net_credit is not None else 0.0
+            per_contract = strike * 100.0 - credit * 100.0
+            return max(0.0, per_contract) * quantity
+        if strategy == "jade_lizard":
+            # Empirically confirmed against a real Alpaca paper submission (2026-07-24): a 3-leg
+            # combo mixing a naked short put with a defined-risk call credit spread is NOT given
+            # the standard Reg-T naked-margin netting/discount -- Alpaca's MLEG risk engine
+            # apparently doesn't recognize "jade lizard" as an eligible strategy for that
+            # treatment (unlike the 2-leg vertical / 4-leg iron condor cases below, which ARE
+            # margined at their textbook defined-risk max-loss with no issue). It instead charges
+            # the naked put leg at FULL cash-secured-style notional (put_strike*100, same as a
+            # standalone cash_secured_put) plus the call spread's own max-loss (spread_width*100),
+            # netted by the total premium collected. Verified EXACT to the dollar: a real order
+            # (put strike 290, call wing width 17.5, net_credit 3.04) reported Alpaca
+            # cost_basis=$30,446 == 290*100 + 17.5*100 - 3.04*100. The previous formula (plain
+            # Reg-T naked_margin_per_contract on the put strike alone, ignoring the call wing
+            # entirely) reserved only ~$3,289 for that same order -- a ~10x underestimate that
+            # would silently let the platform think a position is affordable when Alpaca will
+            # actually reject it.
+            if strike is None or spread_width is None:
+                return 0.0
+            credit = net_credit if net_credit is not None else 0.0
+            per_contract = strike * 100.0 + spread_width * 100.0 - credit * 100.0
+            return max(0.0, per_contract) * quantity
+        if strategy in ("iron_condor", "call_butterfly", "debit_spread"):
             if spread_width is None:
                 return 0.0
             credit = net_credit if net_credit is not None else 0.0
