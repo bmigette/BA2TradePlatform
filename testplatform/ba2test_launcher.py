@@ -2475,6 +2475,8 @@ def _cmd_optimize(args) -> int:
                 "commission_per_trade": float(args.commission),
                 "slippage_bps": float(args.slippage),
                 "spread_bps": float(getattr(args, "spread_bps", 0.0)),
+                "option_spread_pct": float(getattr(args, "option_spread_pct", 0.0)),
+                "option_spread_min_tick": float(getattr(args, "option_spread_min_tick", 0.0)),
                 "fill_model": args.fill_model,
             },
             "warmup_days": derive_warmup_days([expert]),
@@ -2752,6 +2754,8 @@ def _cmd_optimize_batch(args) -> int:
                     "commission_per_trade": float(args.commission),
                     "slippage_bps": float(args.slippage),
                     "spread_bps": float(getattr(args, "spread_bps", 0.0)),
+                    "option_spread_pct": float(getattr(args, "option_spread_pct", 0.0)),
+                    "option_spread_min_tick": float(getattr(args, "option_spread_min_tick", 0.0)),
                     "fill_model": args.fill_model,
                 },
                 "warmup_days": derive_warmup_days([expert]),
@@ -3468,6 +3472,19 @@ def main(argv: "list | None" = None) -> int:
                          "fill-engine level (widens LIMIT/TP trigger thresholds + degrades "
                          "MARKET/STOP fill prices) -- see BacktestAccount._slip/"
                          "_limit_trigger_price. Default 0.0 (off).")
+    op.add_argument("--option-spread-pct", type=float, default=5.0,
+                    help="Modeled OPTION bid-ask spread as a PERCENT OF PREMIUM (full width; "
+                         "half charged per fill, adverse direction), widened x2 for contracts "
+                         "under 100 contracts/day. Separate from --spread-bps because bps-of-price "
+                         "is the wrong shape for a premium (5 bps of a $1.00 option is $0.0005). "
+                         "The cached chain has NO real quotes (every row is bid==ask or NULL), so "
+                         "without this an option round trip costs ~nothing and multi-leg credit "
+                         "structures are systematically overstated. Default 5.0; pass 0 to "
+                         "reproduce pre-2026-07-25 results.")
+    op.add_argument("--option-spread-min-tick", type=float, default=0.02,
+                    help="Absolute floor on the modeled option spread in premium dollars (full "
+                         "width). Percent-of-premium alone under-charges cheap contracts, which "
+                         "is where fabricated edge concentrates. Default 0.02.")
     op.add_argument("--fill-model", default="next_bar_open")
     op.add_argument("--interval", default="5min", help="Execution/fill clock interval (default 5min for "
                     "precise intraday TP/SL; analysis cadence is set by --run-schedule).")
@@ -3544,6 +3561,19 @@ def main(argv: "list | None" = None) -> int:
     ob.add_argument("--slippage", type=float, default=0.0)
     ob.add_argument("--spread-bps", type=float, default=0.0,
                     help="Round-trip bid-ask spread in basis points (see optimize --spread-bps).")
+    ob.add_argument("--option-spread-pct", type=float, default=5.0,
+                    help="Modeled OPTION bid-ask spread as a PERCENT OF PREMIUM (full width; "
+                         "half charged per fill, adverse direction), widened x2 for contracts "
+                         "under 100 contracts/day. Separate from --spread-bps because bps-of-price "
+                         "is the wrong shape for a premium (5 bps of a $1.00 option is $0.0005). "
+                         "The cached chain has NO real quotes (every row is bid==ask or NULL), so "
+                         "without this an option round trip costs ~nothing and multi-leg credit "
+                         "structures are systematically overstated. Default 5.0; pass 0 to "
+                         "reproduce pre-2026-07-25 results.")
+    ob.add_argument("--option-spread-min-tick", type=float, default=0.02,
+                    help="Absolute floor on the modeled option spread in premium dollars (full "
+                         "width). Percent-of-premium alone under-charges cheap contracts, which "
+                         "is where fabricated edge concentrates. Default 0.02.")
     ob.add_argument("--fill-model", default="next_bar_open")
     ob.add_argument("--interval", default="5min",
                     help="Fill-clock interval (default 5min for precise intraday TP/SL).")

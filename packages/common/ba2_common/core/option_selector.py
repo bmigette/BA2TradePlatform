@@ -30,13 +30,27 @@ _MIN_TRADEABLE_PREMIUM = 0.10
 
 
 def passes_liquidity(c: OptionContract, min_open_interest: Optional[int],
-                     max_spread_pct: Optional[float]) -> bool:
+                     max_spread_pct: Optional[float],
+                     min_volume: Optional[int] = None) -> bool:
     # Penny/near-worthless contracts are rejected outright. Judged on the mark (mid when both
     # sides quote, else last). A contract with NO price at all is left to the callers' own
     # missing-quote guards rather than being silently dropped here.
     mark = c.mid if c.mid is not None else c.last
     if mark is not None and mark < _MIN_TRADEABLE_PREMIUM:
         return False
+    # DAILY TRADED VOLUME (2026-07-25). The most broadly available liquidity signal in the
+    # historical cache: open_interest is NULL for every cached row, but volume is populated
+    # for every bar. It matters because the BACKTEST FILL ENGINE independently enforces a
+    # participation cap (an order may absorb at most ~10% of the bar's volume), so selecting
+    # a contract that trades 1-3 contracts/day produces an order that can never fill — it
+    # just sits pending and retries. Gating here makes the selector agree with the filler
+    # instead of handing it unfillable candidates. Measured distribution across 13.7M cached
+    # bars: p10=1, p25=3, p50=14, p75=71, p90=319 contracts/day — i.e. most of the chain is
+    # far too thin to trade. A contract with NO volume figure is treated as failing the gate
+    # only when the gate is ON (fail-closed: unknown liquidity is not assumed to be good).
+    if min_volume is not None:
+        if c.volume is None or c.volume < min_volume:
+            return False
     if min_open_interest is not None:
         if c.open_interest is None or c.open_interest < min_open_interest:
             return False
@@ -71,10 +85,10 @@ def _target_strike(method, strike_param, spot, target_price, option_type) -> Opt
     return None
 
 
-def _candidates(chain, option_type, dte_min, dte_max, today, min_oi, max_spread):
+def _candidates(chain, option_type, dte_min, dte_max, today, min_oi, max_spread, min_volume=None):
     out = [c for c in chain if c.option_type == option_type]
     out = filter_dte(out, today, dte_min, dte_max)
-    out = [c for c in out if passes_liquidity(c, min_oi, max_spread)]
+    out = [c for c in out if passes_liquidity(c, min_oi, max_spread, min_volume)]
     return out
 
 
@@ -93,16 +107,19 @@ def _pick_by(method, cands, strike_param, spot, target_price, option_type):
 
 
 def select_single(chain, *, method, strike_param, spot, option_type, dte_min, dte_max, today,
-                  target_price=None, min_open_interest=None, max_spread_pct=None) -> Optional[OptionContract]:
-    cands = _candidates(chain, option_type, dte_min, dte_max, today, min_open_interest, max_spread_pct)
+                  target_price=None, min_open_interest=None, max_spread_pct=None,
+                  min_volume=None) -> Optional[OptionContract]:
+    cands = _candidates(chain, option_type, dte_min, dte_max, today, min_open_interest,
+                        max_spread_pct, min_volume)
     return _pick_by(method, cands, strike_param, spot, target_price, option_type)
 
 
 def select_vertical_spread(chain, *, method, long_param, short_param, spot, option_type,
                            dte_min, dte_max, today, target_price=None,
-                           min_open_interest=None, max_spread_pct=None
+                           min_open_interest=None, max_spread_pct=None, min_volume=None
                            ) -> Optional[Tuple[OptionContract, OptionContract]]:
-    cands = _candidates(chain, option_type, dte_min, dte_max, today, min_open_interest, max_spread_pct)
+    cands = _candidates(chain, option_type, dte_min, dte_max, today, min_open_interest,
+                        max_spread_pct, min_volume)
     if len(cands) < 2:
         return None
     # Work within a single expiry: the earliest expiry in the window that has >=2 strikes.
@@ -128,12 +145,13 @@ def select_vertical_spread(chain, *, method, long_param, short_param, spot, opti
 
 def select_wing(chain, *, center_strike, width_pct, option_type,
                 dte_min, dte_max, today, expiry=None,
-                min_open_interest=None, max_spread_pct=None) -> Optional[OptionContract]:
+                min_open_interest=None, max_spread_pct=None,
+                min_volume=None) -> Optional[OptionContract]:
     """Pick the wing contract nearest ``center_strike`` moved ``width_pct`` percent
     farther OTM (calls: up; puts: down). When ``expiry`` is given, restrict to that
     expiry (wings must share the short leg's expiry)."""
     cands = _candidates(chain, option_type, dte_min, dte_max, today,
-                        min_open_interest, max_spread_pct)
+                        min_open_interest, max_spread_pct, min_volume)
     if expiry is not None:
         cands = [c for c in cands if c.expiry == expiry]
     if not cands:

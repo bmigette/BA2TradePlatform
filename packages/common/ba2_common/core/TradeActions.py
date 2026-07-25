@@ -1686,6 +1686,7 @@ class _OptionEntryAction(TradeAction):
                  sizing: Optional[float] = None,
                  min_open_interest: Optional[int] = None,
                  max_spread_pct: Optional[float] = None,
+                 min_volume: Optional[int] = None,
                  wing_width_pct: Optional[float] = None,
                  **kwargs):
         super().__init__(instrument_name, account, order_recommendation,
@@ -1697,6 +1698,11 @@ class _OptionEntryAction(TradeAction):
         self.sizing = sizing
         self.min_open_interest = min_open_interest
         self.max_spread_pct = max_spread_pct
+        # Minimum DAILY TRADED VOLUME for a contract to be selectable. Opt-in (None = off).
+        # See option_selector.passes_liquidity: the cache has no open_interest, so volume is
+        # the usable liquidity signal, and the fill engine's participation cap means a
+        # too-thin contract yields an order that can never fill.
+        self.min_volume = min_volume
         self.wing_width_pct = wing_width_pct
 
     # --- helpers ----------------------------------------------------------
@@ -1955,7 +1961,8 @@ class BuyCallAction(_OptionEntryAction):
             chain, method=self.strike_method, strike_param=self.strike_param, spot=spot,
             option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=self._consensus_target(),
-            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct)
+            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct,
+            min_volume=self.min_volume)
         if contract is None:
             return self._result(False, f"No liquid call contract for {self.instrument_name}")
         if contract.ask is None or contract.ask <= 0:
@@ -1993,7 +2000,8 @@ class OpenBullCallSpreadAction(_OptionEntryAction):
             chain, method=self.strike_method, long_param=long_param, short_param=short_param,
             spot=spot, option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=self._consensus_target(),
-            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct)
+            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct,
+            min_volume=self.min_volume)
         if pair is None:
             return self._result(False, f"No liquid bull call spread for {self.instrument_name}")
         long_c, short_c = pair
@@ -2047,7 +2055,8 @@ class BuyPutAction(_OptionEntryAction):
             chain, method=self.strike_method, strike_param=self.strike_param, spot=spot,
             option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=self._consensus_target(),
-            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct)
+            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct,
+            min_volume=self.min_volume)
         if contract is None:
             return self._result(False, f"No liquid put contract for {self.instrument_name}")
         if contract.ask is None or contract.ask <= 0:
@@ -2085,7 +2094,8 @@ class OpenBearPutSpreadAction(_OptionEntryAction):
             chain, method=self.strike_method, long_param=long_param, short_param=short_param,
             spot=spot, option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=self._consensus_target(),
-            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct)
+            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct,
+            min_volume=self.min_volume)
         if pair is None:
             return self._result(False, f"No liquid bear put spread for {self.instrument_name}")
         # For a PUT debit spread the selector returns (long, short) with long.strike > short.strike.
@@ -2147,7 +2157,8 @@ class SellCoveredCallAction(_OptionEntryAction):
             chain, method=self.strike_method, strike_param=self.strike_param, spot=spot,
             option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=self._consensus_target(),
-            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct)
+            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct,
+            min_volume=self.min_volume)
         if contract is None:
             return self._result(False, f"No liquid call contract for covered call on {self.instrument_name}")
         if contract.bid is None or contract.bid <= 0:
@@ -2186,7 +2197,8 @@ class BuyProtectivePutAction(_OptionEntryAction):
             chain, method=self.strike_method, strike_param=self.strike_param, spot=spot,
             option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=self._consensus_target(),
-            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct)
+            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct,
+            min_volume=self.min_volume)
         if contract is None:
             return self._result(False, f"No liquid put contract for protective put on {self.instrument_name}")
         if contract.ask is None or contract.ask <= 0:
@@ -2224,7 +2236,8 @@ class SellCashSecuredPutAction(_OptionEntryAction):
             chain, method=self.strike_method, strike_param=self.strike_param, spot=spot,
             option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=self._consensus_target(),
-            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct)
+            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct,
+            min_volume=self.min_volume)
         if contract is None:
             return self._result(False, f"No liquid put contract for cash-secured put on {self.instrument_name}")
         if contract.bid is None or contract.bid <= 0:
@@ -2292,7 +2305,8 @@ class OpenBearCallSpreadAction(_OptionEntryAction):
             chain, method=self.strike_method, long_param=long_param, short_param=short_param,
             spot=spot, option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=self._consensus_target(),
-            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct)
+            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct,
+            min_volume=self.min_volume)
         if pair is None:
             return self._result(False, f"No liquid bear call spread for {self.instrument_name}")
         # For a CALL spread the selector returns (lo, hi) ordered by strike.
@@ -2364,7 +2378,8 @@ class OpenStraddleAction(_OptionEntryAction):
             call_chain, method="percent_otm", strike_param=0, spot=spot,
             option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=None,
-            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct)
+            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct,
+            min_volume=self.min_volume)
         if call_c is None:
             return self._result(False, f"No liquid ATM call for straddle on {self.instrument_name}")
         # Force the put to the SAME strike + expiry as the chosen call leg.
@@ -2374,7 +2389,8 @@ class OpenStraddleAction(_OptionEntryAction):
             put_candidates, method="percent_otm", strike_param=0, spot=spot,
             option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=None,
-            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct)
+            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct,
+            min_volume=self.min_volume)
         if put_c is None:
             return self._result(False,
                                 f"No liquid ATM put at strike {call_c.strike} for straddle "
@@ -2427,14 +2443,16 @@ class OpenStrangleAction(_OptionEntryAction):
             call_chain, method="percent_otm", strike_param=otm_pct, spot=spot,
             option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=None,
-            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct)
+            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct,
+            min_volume=self.min_volume)
         if call_c is None:
             return self._result(False, f"No liquid OTM call for strangle on {self.instrument_name}")
         put_c = select_single(
             put_chain, method="percent_otm", strike_param=otm_pct, spot=spot,
             option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=None,
-            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct)
+            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct,
+            min_volume=self.min_volume)
         if put_c is None:
             return self._result(False, f"No liquid OTM put for strangle on {self.instrument_name}")
         if call_c.ask is None or put_c.ask is None:
@@ -2628,11 +2646,13 @@ class OpenIronCondorAction(_OptionEntryAction):
         lc = select_wing(call_chain, center_strike=sc.strike, width_pct=wing,
                          option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
                          today=self._today(), expiry=sc.expiry,
-                         min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct)
+                         min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct,
+            min_volume=self.min_volume)
         lp = select_wing(put_chain, center_strike=sp.strike, width_pct=wing,
                          option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
                          today=self._today(), expiry=sp.expiry,
-                         min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct)
+                         min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct,
+            min_volume=self.min_volume)
         if lc is None or lp is None or lc.strike <= sc.strike or lp.strike >= sp.strike:
             return self._result(False, f"No valid wings for iron condor on {self.instrument_name}")
         if None in (sc.bid, sp.bid, lc.ask, lp.ask):
@@ -2700,7 +2720,8 @@ class OpenJadeLizardAction(_OptionEntryAction):
         lc = select_wing(call_chain, center_strike=sc.strike, width_pct=wing,
                          option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
                          today=self._today(), expiry=sc.expiry,
-                         min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct)
+                         min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct,
+            min_volume=self.min_volume)
         if lc is None or lc.strike <= sc.strike:
             return self._result(False, f"No valid call wing for jade lizard on {self.instrument_name}")
         if None in (sc.bid, sp.bid, lc.ask):
@@ -2768,7 +2789,8 @@ class OpenCallButterflyAction(_OptionEntryAction):
         upper = select_wing(chain, center_strike=body.strike, width_pct=wing,
                             option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
                             today=self._today(), expiry=body.expiry,
-                            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct)
+                            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct,
+            min_volume=self.min_volume)
         # Lower wing: a call BELOW the body. Reuse select_wing with a PUT-style downward
         # target by searching for strike nearest body*(1 - wing%).
         lower_target = body.strike * (1 - wing / 100.0)
@@ -2830,7 +2852,8 @@ class OpenPutRatioSpreadAction(_OptionEntryAction):
         short_p = select_wing(chain, center_strike=long_p.strike, width_pct=wing,
                               option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
                               today=self._today(), expiry=long_p.expiry,
-                              min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct)
+                              min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct,
+            min_volume=self.min_volume)
         if short_p is None or short_p.strike >= long_p.strike:
             return self._result(False, f"No valid short put wing for ratio spread on {self.instrument_name}")
         if long_p.ask is None or short_p.bid is None:

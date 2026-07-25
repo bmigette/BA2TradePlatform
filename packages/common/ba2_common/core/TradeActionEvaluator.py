@@ -33,7 +33,7 @@ _OPTION_ENTRY_ACTION_TYPES = _ALL_OPTION_ACTION_TYPES - {ExpertActionType.CLOSE_
 # action's own defaults apply otherwise.
 _OPTION_ENTRY_PARAM_KEYS = (
     'strike_method', 'strike_param', 'dte_min', 'dte_max',
-    'sizing', 'min_open_interest', 'max_spread_pct', 'wing_width_pct',
+    'sizing', 'min_open_interest', 'max_spread_pct', 'min_volume', 'wing_width_pct',
 )
 
 

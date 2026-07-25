@@ -391,6 +391,11 @@ def _build_config(payload: Dict[str, Any]) -> Dict[str, Any]:
         # ALREADY-decided trades, robustness.py's apply_spread_cost) -- this one can change
         # WHICH exit a trade takes, not just its realized pnl.
         "spread_bps": float(payload.get("spread_bps") or 0.0),
+        # Optional (default 0.0 = exact no-op): OPTION bid-ask spread modeled as a percent
+        # of PREMIUM. Separate from spread_bps because bps-of-price is the wrong shape for
+        # an option premium -- see BacktestAccount._option_half_spread.
+        "option_spread_pct": float(payload.get("option_spread_pct") or 0.0),
+        "option_spread_min_tick": float(payload.get("option_spread_min_tick") or 0.0),
     }
 
     # warmup_days: longest indicator/lookback window the experts need preloaded before

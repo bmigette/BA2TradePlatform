@@ -113,6 +113,13 @@ def test_build_config_assembles_account_settings():
         "slippage_bps": 0.0,
         "fill_model": "next_bar_open",
         "spread_bps": 0.0,  # optional, defaults to 0.0 (exact no-op) when absent from payload
+        # OPTION spread model (2026-07-25) — also optional and also 0.0-by-default, so an
+        # existing payload reproduces pre-model fills bit-for-bit. The grid CLI passes real
+        # values (--option-spread-pct defaults to 5.0 there); the handler itself never
+        # invents one. Percent OF PREMIUM, not bps of price — see
+        # BacktestAccount._option_half_spread for why options cannot share spread_bps.
+        "option_spread_pct": 0.0,
+        "option_spread_min_tick": 0.0,
     }
     assert cfg["enabled_instruments"] == ["AAPL"]
     assert cfg["initial_capital"] == 100_000.0

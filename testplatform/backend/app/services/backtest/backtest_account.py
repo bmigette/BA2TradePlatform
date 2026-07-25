@@ -163,6 +163,37 @@ _ARB_FILL_TOLERANCE = 0.05
 # bar; it stays pending and retries the next (see BacktestAccount._option_fill_price).
 _OPTION_FILL_MAX_VOLUME_PARTICIPATION = 0.10
 
+# ---------------------------------------------------------------------------
+# OPTION BID-ASK SPREAD MODEL (2026-07-25)
+# ---------------------------------------------------------------------------
+# WHY A SEPARATE MODEL FROM ``spread_bps``: the equity ``spread_bps`` knob is basis points OF
+# PRICE, which is the right SHAPE for a stock and the wrong shape for an option. On a $100
+# stock, 5 bps = $0.05 — realistic. On a $1.00 option premium, 5 bps = $0.0005 — about two
+# orders of magnitude too small, since a real $1.00 contract quotes something like $0.95/$1.05
+# (~10% of premium). Expressing a 5% option spread through ``spread_bps`` would require 500
+# bps, which in the same run would also charge stocks 5% — catastrophically wrong. One shared
+# knob cannot serve both asset classes, so options get their own PERCENT-OF-PREMIUM model.
+#
+# WHY IT MATTERS: the historical options cache carries NO usable quote. Verified over the
+# 958,024 cached chain rows, every single one is either bid==ask (701,849) or has both NULL
+# (256,175) — not one real spread exists. ``_option_fill_price`` reads the bar's open/close
+# directly, so before this model an option round trip cost only ``slippage_bps`` of premium,
+# i.e. essentially nothing. Multi-leg credit structures are the most exposed: an iron condor
+# crosses the spread on 4 legs entering and 4 exiting, so charging ~0 is a large, systematic,
+# one-directional overstatement of exactly the strategies the options grid searches.
+#
+# THE MODEL: full spread = max(min_tick, premium x pct), charged HALF per fill in the adverse
+# direction (buys up, sells down), then widened for thin contracts. The absolute floor matters
+# because percent-of-premium alone under-charges cheap contracts, which is where fabricated
+# edge concentrates. The thin-volume multiplier reflects that quoted width scales inversely
+# with activity; the threshold sits near the p75-p80 of the measured cache distribution
+# (p10=1, p25=3, p50=14, p75=71, p90=319 contracts/day).
+#
+# All of this is a MODELING ASSUMPTION, not observed data — it is a defensible estimate
+# replacing an indefensible zero. Real quotes (e.g. ThetaData EOD bid/ask) should supersede it.
+_OPTION_SPREAD_LIQUID_VOLUME = 100.0   # at/above this daily volume, no thin-widening
+_OPTION_SPREAD_THIN_MULT = 2.0         # multiplier applied below that volume
+
 
 class BacktestAccount(AccountInterface, OptionsAccountInterface):
     """Simulated broker for daily multi-asset backtests.
@@ -306,6 +337,24 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 "type": "float",
                 "required": True,
                 "description": "Slippage in basis points applied to market/stop fills (worsening)",
+            },
+            "option_spread_pct": {
+                "type": "float",
+                "required": False,
+                "description": "Modeled option bid-ask spread as a PERCENT OF PREMIUM (full "
+                               "width; half is charged per fill in the adverse direction). "
+                               "Options need this instead of spread_bps, which is bps of "
+                               "price and ~2 orders of magnitude too small for a premium. "
+                               "Widened for thin contracts and floored at "
+                               "option_spread_min_tick. Defaults to 0.0 (exact no-op, "
+                               "pre-2026-07-25 behaviour); the grid passes a real value.",
+            },
+            "option_spread_min_tick": {
+                "type": "float",
+                "required": False,
+                "description": "Absolute floor on the modeled option spread, in premium "
+                               "dollars (full width). Percent-of-premium alone under-charges "
+                               "cheap contracts, which is where fabricated edge concentrates.",
             },
             "spread_bps": {
                 "type": "float",
@@ -1477,7 +1526,11 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 return None
             fill_px = px
         else:
-            fill_px = self._slip(px, order.side == OrderDirection.BUY)
+            # Option-specific cost model (percent of premium), NOT the equity _slip. Multi-leg
+            # combo CHILDREN are LIMIT-typed but carry no limit_price (the parent holds the net
+            # limit), so they fall through to here — meaning iron condors / strangles / spreads
+            # DO get charged the spread on every leg, which is the point.
+            fill_px = self._option_slip(px, order.side == OrderDirection.BUY, bar)
         reason = self._arb_fill_reject_reason(order, fill_px, fill_day, same_bar, bar)
         if reason is not None:
             self.rejected_arb_fills += 1
@@ -1500,6 +1553,39 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             )
             return None
         return fill_px
+
+    def _option_half_spread(self, premium: float, bar: dict) -> float:
+        """Half the modeled bid-ask spread, in premium dollars per share (>= 0).
+
+        See the _OPTION_SPREAD_* block for why options need a percent-of-premium model rather
+        than the equity ``spread_bps``. Returns 0.0 when ``option_spread_pct`` is unset/0 and
+        ``option_spread_min_tick`` is 0 — an exact no-op reproducing pre-2026-07-25 fills.
+        """
+        pct = float(self._cfg.get("option_spread_pct", 0.0) or 0.0)
+        min_tick = float(self._cfg.get("option_spread_min_tick", 0.0) or 0.0)
+        if pct <= 0 and min_tick <= 0:
+            return 0.0
+        full = max(min_tick, abs(premium) * pct / 100.0)
+        volume = bar.get("volume")
+        # Unknown volume is treated as THIN, not liquid: the participation cap already treats a
+        # missing volume as 0, so assuming a tight quote here would contradict it.
+        if volume is None or float(volume) < _OPTION_SPREAD_LIQUID_VOLUME:
+            full *= _OPTION_SPREAD_THIN_MULT
+        return full / 2.0
+
+    def _option_slip(self, px: float, side_is_buy: bool, bar: dict) -> float:
+        """Option fill price after execution slippage + the modeled half bid-ask spread.
+
+        Deliberately NOT ``_slip``: that adds the equity ``spread_bps`` (bps of price), whose
+        shape is wrong for a premium and which would double-count against the option model
+        here. ``slippage_bps`` (generic execution slippage) still applies to both asset
+        classes. Never returns a negative premium — a spread wider than the premium itself
+        would otherwise flip the sign on a deep-OTM contract, and the floor keeps a sell
+        credit at worst zero rather than paying the account to sell.
+        """
+        bps = float(self._cfg["slippage_bps"]) / 10_000.0
+        half = self._option_half_spread(px, bar)
+        return px * (1.0 + bps) + half if side_is_buy else max(0.0, px * (1.0 - bps) - half)
 
     def _volume_cap_reject_reason(self, order, bar: dict) -> Optional[str]:
         """Why a candidate option fill exceeds the fill bar's liquidity, else None.
