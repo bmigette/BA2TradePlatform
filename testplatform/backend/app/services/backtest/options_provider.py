@@ -46,11 +46,36 @@ _BAR_CACHE_MAX = int(os.getenv("BT_OPTION_BAR_CACHE_MAX", "50000"))
 _WORKER_CHAIN_CACHE: "OrderedDict[Tuple[str, str], _ChainHistory]" = OrderedDict()
 _WORKER_BAR_CACHE: "OrderedDict[Tuple[str, str], _BarHistory]" = OrderedDict()
 
+# get_atm_iv RESULT memo, keyed (db_path, underlying, as_of.isoformat()) -> iv or None.
+#
+# The chain/bar caches above stop the SQL re-reads, but get_atm_iv still re-did its whole
+# scan on every call: for one (underlying, as_of) it walks every CALL in the 20-45 DTE band
+# and does a per-contract `_bar_history(...).latest_on_or_before(...)`. Measured at 56 ms per
+# call, which is fine for a signal-driven expert (FMPRating only touches chains when a signal
+# fires) but fatal for a PORTFOLIO SCANNER: PremiumSeller evaluates all ~98 universe symbols
+# on every entry bar, so one trial costs ~98 x 440 bars x 56 ms ~= 40 min of pure IV lookups
+# (plus a 4.7 min cold-start seed of 98 x 52 weekly samples). A GA run of ~640 trials never
+# finished — an 80x8 job produced ZERO completed individuals in 34 minutes and every remote
+# trial hit the 1800s timeout.
+#
+# Every GA trial re-evaluates the IDENTICAL (symbol, date) pairs — same universe, same window
+# — so the memo is near-100% hit rate after the first trial in a worker process. Values are
+# tiny (a float or None), so the cap is generous: 98 symbols x ~500 bars ~= 49k entries fits
+# comfortably. None is cached too — a symbol with no usable chain returns None every time, and
+# re-deriving that is exactly as expensive as a hit.
+_ATM_IV_CACHE_MAX = int(os.getenv("BT_OPTION_ATM_IV_CACHE_MAX", "200000"))
+_WORKER_ATM_IV_CACHE: "OrderedDict[Tuple[str, str, str], Optional[float]]" = OrderedDict()
+# Distinct from None, which is a VALID cached result ("no usable chain for this symbol/date").
+# A plain `.get(key) is None` miss-check would re-scan those every call — the worst case, since
+# a symbol absent from the cache is scanned in full before returning None.
+_MISSING = object()
+
 
 def clear_worker_options_cache() -> None:
-    """Drop every cached chain/bar history (test isolation / explicit reset)."""
+    """Drop every cached chain/bar history + ATM-IV result (test isolation / explicit reset)."""
     _WORKER_CHAIN_CACHE.clear()
     _WORKER_BAR_CACHE.clear()
+    _WORKER_ATM_IV_CACHE.clear()
 
 
 class _ChainHistory:
@@ -265,6 +290,23 @@ class HistoricalOptionsProvider:
         the same fallback rule as _to_contract (bar preferred only when its OWN iv
         computed), so this tracks iv changes across the whole backtest window. Returns
         None when no cached snapshot exists or no in-window call has usable delta+iv."""
+        # Memoized on (db_path, underlying, as_of): the scan below is pure w.r.t. those three
+        # (the cache file is immutable during a run), and a GA re-evaluates the same
+        # (symbol, date) pairs on every trial. See _WORKER_ATM_IV_CACHE for why this matters.
+        cache_key = (self.db_path, underlying, as_of.isoformat())
+        cached = _WORKER_ATM_IV_CACHE.get(cache_key, _MISSING)
+        if cached is not _MISSING:
+            _WORKER_ATM_IV_CACHE.move_to_end(cache_key)  # LRU: mark most-recently-used
+            return cached
+
+        result = self._compute_atm_iv(underlying, as_of)
+        _WORKER_ATM_IV_CACHE[cache_key] = result
+        while len(_WORKER_ATM_IV_CACHE) > _ATM_IV_CACHE_MAX:
+            _WORKER_ATM_IV_CACHE.popitem(last=False)
+        return result
+
+    def _compute_atm_iv(self, underlying: str, as_of: date) -> Optional[float]:
+        """Uncached body of get_atm_iv (see its docstring for the selection rule)."""
         hist = _chain_history(self.db_path, underlying)
         snap = hist.latest_as_of(as_of.isoformat())
         if snap is None:
