@@ -23,6 +23,9 @@ Import all interfaces from this module for easy access:
 from .ReadOnlyAccountInterface import ReadOnlyAccountInterface
 from .AccountInterface import AccountInterface
 from .OptionsAccountInterface import OptionsAccountInterface
+from .OptionsDataProviderInterface import (
+    OptionsDataProviderInterface, OptionContractMeta, OptionEodBar,
+)
 from .MarketExpertInterface import MarketExpertInterface, BacktestInterface
 from .ExtendableSettingsInterface import ExtendableSettingsInterface
 from .SmartRiskExpertInterface import SmartRiskExpertInterface
@@ -54,6 +57,9 @@ __all__ = [
     "ReadOnlyAccountInterface",
     "AccountInterface",
     "OptionsAccountInterface",
+    "OptionsDataProviderInterface",
+    "OptionContractMeta",
+    "OptionEodBar",
     "MarketExpertInterface",
     "BacktestInterface",
     "ExtendableSettingsInterface",

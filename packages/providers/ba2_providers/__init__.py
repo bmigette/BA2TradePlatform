@@ -35,7 +35,8 @@ from ba2_common.core.interfaces import (
     MacroEconomicsInterface,
     CompanyInsiderInterface,
     SocialMediaDataProviderInterface,
-    ScreenerProviderInterface
+    ScreenerProviderInterface,
+    OptionsDataProviderInterface,
 )
 
 # Legacy data provider (to be migrated)
@@ -60,6 +61,7 @@ from .macro import FREDMacroProvider
 from .insider import FMPInsiderProvider
 from .socialmedia import StockTwitsSentiment, StockTwitsTrending
 from .screener import FMPScreenerProvider, FMPHistoricalScreenerProvider
+from .options import AlpacaOptionsProvider, ThetaDataOptionsProvider
 
 # Provider registries - will be populated as providers are implemented
 OHLCV_PROVIDERS: Dict[str, Type[DataProviderInterface]] = {
@@ -118,6 +120,15 @@ SCREENER_PROVIDERS: Dict[str, Type[ScreenerProviderInterface]] = {
     "fmp_historical": FMPHistoricalScreenerProvider,
 }
 
+# Bulk HISTORICAL option data used to build the offline options cache (NOT the broker
+# side -- that is OptionsAccountInterface). "alpaca" is the incumbent but is capped at a
+# measured 2024-01-18 history floor at every tier; "thetadata" exists to reach further
+# back (4-12y by tier) and needs a locally-running Theta Terminal rather than an API key.
+OPTIONS_PROVIDERS: Dict[str, Type[OptionsDataProviderInterface]] = {
+    "alpaca": AlpacaOptionsProvider,
+    "thetadata": ThetaDataOptionsProvider,
+}
+
 
 def get_provider(category: str, provider_name: str, **kwargs) -> DataProviderInterface:
     """
@@ -134,6 +145,7 @@ def get_provider(category: str, provider_name: str, **kwargs) -> DataProviderInt
                  - 'macro': Macroeconomic data
                  - 'insider': Insider trading data
                  - 'socialmedia': Social media sentiment analysis
+                 - 'options': Bulk historical option data (cache builders)
         provider_name: Provider name (e.g., 'alpaca', 'yfinance', 'alphavantage', 'openai')
         **kwargs: Additional arguments to pass to the provider constructor
                  (e.g., source='trading_agents' for Alpha Vantage providers)
@@ -161,6 +173,7 @@ def get_provider(category: str, provider_name: str, **kwargs) -> DataProviderInt
         "insider": INSIDER_PROVIDERS,
         "socialmedia": SOCIALMEDIA_PROVIDERS,
         "screener": SCREENER_PROVIDERS,
+        "options": OPTIONS_PROVIDERS,
     }
 
     if category not in registries:
