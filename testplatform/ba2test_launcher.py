@@ -2062,17 +2062,54 @@ _OPTION_ENTRY_GATE = {k: "bullish" for k in _OPTION_STRATS}
 _OPTION_ENTRY_GATE["O_LP"] = "bearish"
 _OPTION_ENTRY_GATE["O_BEARCS"] = "bearish"
 
+# FULL-NOTIONAL structures: those whose per-contract buying-power reserve scales with the
+# STRIKE (cash-secured / un-netted naked notional) rather than with a defined-risk spread
+# width or a Reg-T margin bracket. On this large-cap universe at the grid's $20k capital they
+# cannot open at all on the expensive names, and eat the account on the mid-priced ones.
+# Measured per-contract reserve (option_reserve_required, 2026-07-25) vs $20,000:
+#
+#     structure           spot 40   spot 100   spot 200   spot 320
+#     cash_secured_put      3,600      9,000     18,000    28,800  <- over the whole account
+#     jade_lizard           3,760      9,400     18,800    30,080  <- over the whole account
+#     put_ratio_spread      3,580      8,950     17,900    28,640  <- over the whole account
+#     ---- vs the affordable ones ----
+#     short_strangle          400      1,000      2,000      3,200
+#     short_straddle          800      2,000      4,000      6,400
+#     bear_call_spread        160        400        800      1,280
+#     iron_condor             160        400        800      1,280
+#
+# That is why v8's OS2/OS3 only ever traded the cheapest underlyings (BAC $41, INTC $35) and
+# died out after a handful of positions. They stay defined in _OPTION_STRATS and remain
+# runnable as EXPLICIT single-strategy jobs (`--strategies O_CSP`) for a larger-capital run;
+# they are only excluded from the DEFAULT grouped search at $20k. Re-add them here (or raise
+# --initial-capital to ~$100k) to search them again.
+_FULL_NOTIONAL_OPTION_KINDS = {"O_CSP", "O_JL", "O_RS"}
+
 # GROUPED option strategies: ONE optimize job searching a FAMILY of similar structures.
 # Each member becomes its own toggleable entry TradeRule (entry:<member>-entry:enabled gene)
 # carrying its own option action + option_* genes, so the GA can turn structures on/off and
 # tune each independently — top-5 individuals can land on DIFFERENT structures, giving the
 # saved top-N variety instead of 5 near-clones of one structure.
-_OPTION_GROUPS = {
+#
+# The FULL taxonomy lives here; the affordability filter below derives what actually gets
+# searched, so the two can never drift apart.
+_OPTION_GROUPS_ALL = {
     "OS1": ["O_LC", "O_LP", "O_VERT", "O_BF", "O_BULLCS"],  # directional DEBIT (long premium / defined)
     "OS2": ["O_SSTG", "O_SSTD", "O_IC", "O_CSP"],           # neutral CREDIT (short premium)
     "OS3": ["O_JL", "O_RS", "O_BEARCS"],                    # skewed CREDIT (asymmetric short premium)
     "OS4": ["O_STRD", "O_STRG"],                            # volatility DEBIT (non-directional)
 }
+_OPTION_GROUPS = {
+    key: [m for m in members if m not in _FULL_NOTIONAL_OPTION_KINDS]
+    for key, members in _OPTION_GROUPS_ALL.items()
+}
+# A group whose every member was filtered out would silently produce a job with no entries
+# (and a -1e9 zero-trade sentinel for every trial) — fail loudly at import instead.
+_empty_groups = [k for k, v in _OPTION_GROUPS.items() if not v]
+if _empty_groups:
+    raise RuntimeError(
+        f"_OPTION_GROUPS {_empty_groups} have no affordable members left after excluding "
+        f"{sorted(_FULL_NOTIONAL_OPTION_KINDS)}; drop the group or relax the exclusion.")
 
 # Pure-option strategy keys (entry is the option action; no equity leg). O_CC/O_STK are equity.
 _PURE_OPTION_STRATEGIES = set(_OPTION_STRATS) | set(_OPTION_GROUPS)
@@ -2236,6 +2273,32 @@ def _build_strategy_option_group(kind: str):
     return s
 
 
+def _with_round_lot_entry(s, lot: int = 100):
+    """Force the strategy's equity ENTRY to size in whole ``lot``-share lots (in place).
+
+    Required by the option-OVERLAY strategies (O_CC / O_PP). ``SellCoveredCallAction`` and
+    ``BuyProtectivePutAction`` both size as ``floor(held_shares / 100)`` — one contract per
+    round lot — so an odd-lot equity position can never carry even ONE contract and the
+    overlay silently no-ops, leaving a plain long-equity strategy behind.
+
+    That is exactly what v8 shipped: O_CC and O_PP produced BYTE-IDENTICAL top-5 results
+    (46.90% / 438.65% / 40.82% / 45.70% / 44.65%), ZERO trades carrying a contract_symbol,
+    and a winning gene set with no covered-call/protective-put keys at all — both jobs were
+    silently running the same plain S2 equity baseline. At $20k the RM sizes a position at
+    5-25% of equity, i.e. 3-27 shares on a $180-320 name and 24-85 on a $30-40 name: never
+    the 100 needed.
+
+    With the lot constraint the RM floors to whole lots and rejects anything under one lot as
+    unfunded, so O_CC/O_PP now trade ONLY where a round lot actually fits the per-instrument
+    cap (at $20k: the cheap names, and only at the higher cap settings). Fewer entries, but
+    they are real covered calls / protective puts instead of mislabelled equity."""
+    for rule in (s.entry_rules or []):
+        for action in (rule.get("actions") or []):
+            if action.get("action_type") in ("buy", "sell"):
+                action["lot_size"] = int(lot)
+    return s
+
+
 def _build_strategy_covered_call(kind: str):
     """O_CC — equity entry (the S2 baseline) + a ``sell_covered_call`` OPEN_POSITIONS overlay rule
     (sell a ~5% OTM call against the held shares). Equity-entry, so NO entry_action.
@@ -2246,7 +2309,7 @@ def _build_strategy_covered_call(kind: str):
     has_covered_call before sell_covered_call") — halts the ruleset whenever a covered call
     is ALREADY open, and ``cc_sell`` only fires while the held shares have no overlay."""
     from app.models.strategy import Strategy  # noqa: F401 — keep import parity with siblings
-    s = _build_strategy_S2(kind)  # reuse equity entry + base exits
+    s = _with_round_lot_entry(_build_strategy_S2(kind))  # equity entry in 100-share lots
     s.exit_rules = list(s.exit_rules or []) + [
         {"id": "cc_guard",
          "conditions": {"type": "AND", "conditions": [
@@ -2277,7 +2340,7 @@ def _build_strategy_protective_put(kind: str):
     TradeConditions.py ``HasProtectivePutCondition``) ahead of the overlay halts the ruleset
     once a protective put is already open."""
     from app.models.strategy import Strategy  # noqa: F401 — keep import parity with siblings
-    s = _build_strategy_S2(kind)
+    s = _with_round_lot_entry(_build_strategy_S2(kind))  # equity entry in 100-share lots
     s.exit_rules = list(s.exit_rules or []) + [
         {"id": "pp_guard",
          "conditions": {"type": "AND", "conditions": [

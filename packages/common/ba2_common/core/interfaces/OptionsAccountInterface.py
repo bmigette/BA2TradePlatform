@@ -341,17 +341,50 @@ class OptionsAccountInterface(ABC):
         return 0.0
 
     def reserved_option_buying_power(self) -> float:
-        """Sum of stored reserves across this account's OPEN short-premium option orders."""
-        from ba2_common.core.trade_store import orders_where
-        from ba2_common.core.types import AssetClass, OrderStatus
+        """Sum of stored reserves across this account's OPEN short-premium option positions.
+
+        A reserve belongs to the POSITION, not to the order row that created it: the broker
+        frees the margin/cash the moment the structure is flattened, so this must too.
+
+        Previously this summed ``data["option_reserve"]`` over every order not in a TERMINAL
+        status — but ``FILLED`` is NOT terminal (see ``OrderStatus.get_terminal_statuses``),
+        and nothing ever cleared the field or terminalised a filled entry order. The reserve
+        was therefore a ONE-WAY RATCHET: every credit/naked structure ever opened consumed
+        buying power for the remainder of the run, even long after it closed. On the options
+        grid's $20k account that exhausted BP after 1-3 structures, which is why the RESERVING
+        groups (OS2/OS3) capped out at 10-20 trades all clustered in the run's opening weeks
+        while the non-reserving debit groups (OS1/OS4) traded 43-214 times over the identical
+        window — and why the GA appeared to "win by barely trading" (it could not trade).
+
+        Now a reserve counts only while its owning transaction is still open. WAITING/OPENED/
+        CLOSING all still hold the position (a submitted-but-unfilled close has not freed
+        anything yet); CLOSED/FAILED release it. A reserve-carrying order with no transaction
+        yet (submitted, not linked) is still counted — that capital is genuinely in flight.
+        """
+        from ba2_common.core.trade_store import orders_where, transactions_where
+        from ba2_common.core.types import AssetClass, OrderStatus, TransactionStatus
+
         terminal = OrderStatus.get_terminal_statuses()
-        total = 0.0
+        unlinked_total = 0.0
+        linked: list = []  # (transaction_id, reserve)
         for o in orders_where(account_id=self.id, not_statuses=terminal):
             if o.asset_class != AssetClass.OPTION:
                 continue
-            data = o.data or {}
-            total += float(data.get("option_reserve", 0) or 0)
-        return total
+            reserve = float((o.data or {}).get("option_reserve", 0) or 0)
+            if reserve <= 0:
+                continue
+            if o.transaction_id is None:
+                unlinked_total += reserve
+            else:
+                linked.append((o.transaction_id, reserve))
+        if not linked:
+            return unlinked_total
+        # One bulk lookup of the OPEN book (small — bounded by held positions), not N queries.
+        live_ids = {
+            t.id for t in transactions_where(
+                not_statuses=(TransactionStatus.CLOSED, TransactionStatus.FAILED))
+        }
+        return unlinked_total + sum(r for txn_id, r in linked if txn_id in live_ids)
 
     def available_option_buying_power(self) -> float:
         bal = self.get_balance() or 0.0

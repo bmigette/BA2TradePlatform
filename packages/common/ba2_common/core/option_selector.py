@@ -16,8 +16,27 @@ from ba2_common.core.option_types import OptionContract
 from ba2_common.core.types import OptionRight
 
 
+# Absolute floor on a contract's mark, in premium dollars per share. A contract marked below
+# this is not realistically tradeable at any size: the bid/ask spread is 100%+ of its value, a
+# systematic strategy would never get the modelled fill, and the whole position is worth less
+# than one commission. This is an UNCONDITIONAL safety floor, not a tunable knob — the
+# min_open_interest / max_spread_pct gates below are both opt-in (the options grid passes
+# NEITHER, so they no-op there) and cannot be relied on to catch this.
+#
+# Evidence for the floor: the OS3 (skewed-credit) grid winner's 12 trades had entry premiums of
+# $0.01-$0.09 (median $0.04), producing $2-$7 of P&L each on a $20k account — pure noise the GA
+# nonetheless optimised toward, because nothing rejected it.
+_MIN_TRADEABLE_PREMIUM = 0.10
+
+
 def passes_liquidity(c: OptionContract, min_open_interest: Optional[int],
                      max_spread_pct: Optional[float]) -> bool:
+    # Penny/near-worthless contracts are rejected outright. Judged on the mark (mid when both
+    # sides quote, else last). A contract with NO price at all is left to the callers' own
+    # missing-quote guards rather than being silently dropped here.
+    mark = c.mid if c.mid is not None else c.last
+    if mark is not None and mark < _MIN_TRADEABLE_PREMIUM:
+        return False
     if min_open_interest is not None:
         if c.open_interest is None or c.open_interest < min_open_interest:
             return False

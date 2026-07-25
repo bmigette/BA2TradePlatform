@@ -186,3 +186,55 @@ def test_every_pure_option_action_type_is_unique_across_groups():
     action_types = [v["action_type"] for v in mod._OPTION_STRATS.values()]
     assert len(action_types) == len(set(action_types)), \
         f"duplicate action_type in _OPTION_STRATS: {action_types}"
+
+
+# --------------------------------------------------------------------------- #
+# $20k affordability + overlay wiring (2026-07-25)
+# --------------------------------------------------------------------------- #
+def test_option_overlay_strategies_size_the_equity_entry_in_round_lots():
+    """Regression: O_CC/O_PP must buy in 100-share lots so the overlay can actually fire.
+
+    SellCoveredCall/BuyProtectivePut size as floor(held_shares/100). At $20k the RM buys
+    3-85 shares, never 100, so both overlays no-opped and BOTH jobs silently degenerated to
+    the plain S2 equity baseline -- v8 shipped byte-identical O_CC and O_PP top-5 rows with
+    ZERO trades carrying a contract_symbol."""
+    for kind in ("O_CC", "O_PP"):
+        strat = mod._build_strategy(kind, kind, "FMPRating")
+        lots = [a.get("lot_size")
+                for r in (strat.entry_rules or [])
+                for a in (r.get("actions") or [])
+                if a.get("action_type") == "buy"]
+        assert lots and all(l == 100 for l in lots), \
+            f"{kind} equity entry must carry lot_size=100; got {lots}"
+
+
+def test_plain_equity_control_is_not_lot_constrained():
+    """O_STK is the plain-equity CONTROL — constraining it to round lots would change the
+    baseline the option jobs are measured against."""
+    strat = mod._build_strategy("O_STK", "O_STK", "FMPRating")
+    lots = [a.get("lot_size")
+            for r in (strat.entry_rules or [])
+            for a in (r.get("actions") or [])]
+    assert all(l is None for l in lots), f"O_STK must stay odd-lot; got {lots}"
+
+
+def test_covered_call_and_protective_put_are_not_the_same_strategy():
+    """They differ only in the overlay action; v8 shipped them producing identical results."""
+    cc = mod._build_strategy("O_CC", "O_CC", "FMPRating")
+    pp = mod._build_strategy("O_PP", "O_PP", "FMPRating")
+    cc_actions = {a.get("action_type") for r in (cc.exit_rules or []) for a in (r.get("actions") or [])}
+    pp_actions = {a.get("action_type") for r in (pp.exit_rules or []) for a in (r.get("actions") or [])}
+    assert "sell_covered_call" in cc_actions and "sell_covered_call" not in pp_actions
+    assert "buy_protective_put" in pp_actions and "buy_protective_put" not in cc_actions
+
+
+def test_full_notional_structures_excluded_from_default_groups_at_20k():
+    """CSP / jade lizard / put ratio spread reserve 18k-30k PER CONTRACT on this large-cap
+    universe (strike-scaled notional), i.e. the whole $20k account or more. They stay
+    defined + standalone-runnable, just out of the default grouped search."""
+    grouped = {m for members in mod._OPTION_GROUPS.values() for m in members}
+    for kind in ("O_CSP", "O_JL", "O_RS"):
+        assert kind not in grouped, f"{kind} is unaffordable at $20k and must not be grouped"
+        assert kind in mod._OPTION_STRATS, f"{kind} must remain runnable standalone"
+    # ...and no group may be left empty by the filter.
+    assert all(members for members in mod._OPTION_GROUPS.values())

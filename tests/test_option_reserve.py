@@ -1,8 +1,10 @@
 from ba2_common.core import trade_store as ts
 from ba2_trade_platform.core.interfaces.OptionsAccountInterface import OptionsAccountInterface as OAI
 from ba2_trade_platform.core.db import add_instance
-from ba2_trade_platform.core.models import TradingOrder
-from ba2_trade_platform.core.types import AssetClass, OrderStatus, OrderDirection, OrderType
+from ba2_trade_platform.core.models import TradingOrder, Transaction
+from ba2_trade_platform.core.types import (
+    AssetClass, OrderStatus, OrderDirection, OrderType, TransactionStatus,
+)
 
 
 def test_reserve_required_csp():
@@ -35,6 +37,39 @@ def test_available_and_check(mock_account):
         asset_class=AssetClass.OPTION, option_strategy="cash_secured_put",
         data={"option_reserve": 99999.0}))
     assert mock_account.reserved_option_buying_power() == 30000.0  # closed one excluded
+
+
+def test_reserve_is_released_when_the_position_closes(mock_account):
+    """Regression: an option BP reserve must be released the moment its structure CLOSES.
+
+    The reserve was summed over every order not in a TERMINAL status — but FILLED is not
+    terminal and nothing ever cleared ``data["option_reserve"]`` or terminalised the entry
+    order, so each credit/naked structure ever opened consumed buying power FOREVER (a
+    one-way ratchet). On the options grid's $20k account that exhausted BP after 1-3
+    structures: the credit groups (OS2/OS3, which reserve) capped out at 10-20 trades all
+    clustered in the run's first weeks, while the debit groups (OS1/OS4, which reserve
+    nothing) traded 43-214 times over the same window. The reserve belongs to the POSITION,
+    so it is now counted only while the owning transaction is still open."""
+    txn = Transaction(symbol="AAPL", quantity=1, open_price=1.0,
+                      status=TransactionStatus.OPENED, side=OrderDirection.SELL)
+    txn_id = add_instance(txn)
+    add_instance(TradingOrder(
+        account_id=mock_account.id, symbol="AAPL", quantity=1,
+        side=OrderDirection.SELL, order_type=OrderType.SELL_LIMIT,
+        status=OrderStatus.FILLED, asset_class=AssetClass.OPTION,
+        option_strategy="cash_secured_put", transaction_id=txn_id,
+        data={"option_reserve": 18000.0}))
+
+    # While the structure is held the reserve ties up buying power.
+    assert mock_account.reserved_option_buying_power() == 18000.0
+
+    # Closing the structure must give the buying power back.
+    from ba2_trade_platform.core.db import get_instance, update_instance
+    stored = get_instance(Transaction, txn_id)
+    stored.status = TransactionStatus.CLOSED
+    update_instance(stored)
+    assert mock_account.reserved_option_buying_power() == 0.0
+    assert mock_account.available_option_buying_power() == 100000.0
 
 
 def test_reserved_option_buying_power_sees_inmem_orders(mock_account):
