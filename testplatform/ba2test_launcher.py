@@ -2132,9 +2132,37 @@ def _resolve_fitness(cli_fitness: str | None, strat_kind: str, stock_default: st
     return "consistent_annual_return" if strat_kind in _PURE_OPTION_STRATEGIES else stock_default
 
 
+# Minimum DAILY TRADED VOLUME a contract must show to be SELECTABLE (2026-07-25).
+#
+# NOT a strategy parameter and deliberately NOT GA-searchable -- it is a TRADABILITY floor, the
+# same category as option_selector._MIN_TRADEABLE_PREMIUM. Exposed to the GA it would simply be
+# driven to 0, because relaxing it unlocks fills the backtest will happily model and the market
+# would never give.
+#
+# Why 25: the fill engine independently caps an order at _OPTION_FILL_MAX_VOLUME_PARTICIPATION
+# (10%) of the bar's volume, so a contract must trade >= 10x the order size for the order to
+# fill at all. At $20k with defined-risk structures orders run 1-3 contracts, so ~25 is the
+# floor at which a 2-3 lot is fillable. Measured over 13.7M cached bars the distribution is
+# p10=1, p25=3, p50=14, p75=71, p90=319 contracts/day -- i.e. this rejects roughly the bottom
+# half of the chain, which is exactly the half the engine could not have filled anyway.
+_OPTION_MIN_VOLUME_DEFAULT = 25
+# Set from --option-min-volume at command entry; module-level because _option_entry_action_for
+# is called deep in the strategy builders, far from the parsed args.
+_OPTION_MIN_VOLUME = _OPTION_MIN_VOLUME_DEFAULT
+
+
 def _option_entry_action_for(kind: str) -> dict:
-    """The option ENTRY action config for a pure-option strategy key (a fresh copy)."""
-    return dict(_OPTION_STRATS[kind])
+    """The option ENTRY action config for a pure-option strategy key (a fresh copy).
+
+    Injects ``option_min_volume`` (see _OPTION_MIN_VOLUME_DEFAULT). Before 2026-07-25 the
+    min_volume gate existed all the way down the stack -- passes_liquidity, the three
+    selectors, the action classes, the rule-builder aliases -- but NO caller ever set a value,
+    so it was inert and the selector kept handing the fill engine contracts it would reject.
+    """
+    cfg = dict(_OPTION_STRATS[kind])
+    if _OPTION_MIN_VOLUME and _OPTION_MIN_VOLUME > 0:
+        cfg.setdefault("option_min_volume", int(_OPTION_MIN_VOLUME))
+    return cfg
 
 
 # DEBIT structures (long premium): OS1/OS4 and their members. The TP band differs by payoff
@@ -2412,6 +2440,8 @@ def _cmd_optimize(args) -> int:
     per-trial logging. Persists the best trial as a tagged Backtest (optimization_id) and writes
     the HTML report.
     """
+    global _OPTION_MIN_VOLUME
+    _OPTION_MIN_VOLUME = int(getattr(args, "option_min_volume", _OPTION_MIN_VOLUME_DEFAULT))
     from datetime import datetime as _dt
     import app.models  # noqa: F401 — register ORM models
     from app.models.database import SessionLocal, init_db
@@ -2680,6 +2710,8 @@ def _cmd_optimize_batch(args) -> int:
     ONE AT A TIME (each gets the full process pool) to avoid oversubscribing the CPU. The serve
     process must be running (`ba2-test serve`); this driver only enqueues + polls + persists.
     """
+    global _OPTION_MIN_VOLUME
+    _OPTION_MIN_VOLUME = int(getattr(args, "option_min_volume", _OPTION_MIN_VOLUME_DEFAULT))
     import time as _time
     from datetime import datetime as _dt
     from types import SimpleNamespace
@@ -3485,6 +3517,13 @@ def main(argv: "list | None" = None) -> int:
                     help="Absolute floor on the modeled option spread in premium dollars (full "
                          "width). Percent-of-premium alone under-charges cheap contracts, which "
                          "is where fabricated edge concentrates. Default 0.02.")
+    op.add_argument("--option-min-volume", type=int, default=_OPTION_MIN_VOLUME_DEFAULT,
+                    help="Minimum DAILY TRADED VOLUME for an option contract to be selectable. "
+                         "The fill engine caps an order at 10%% of a bar's volume, so a contract "
+                         "trading below ~10x the order size can never fill -- without this the "
+                         "selector hands the filler candidates it rejects, and the order just sits "
+                         "pending. Cached-bar distribution: p25=3, p50=14, p75=71. A tradability "
+                         "floor, NOT a GA gene (exposed, the GA would drive it to 0). 0 disables.")
     op.add_argument("--fill-model", default="next_bar_open")
     op.add_argument("--interval", default="5min", help="Execution/fill clock interval (default 5min for "
                     "precise intraday TP/SL; analysis cadence is set by --run-schedule).")
@@ -3574,6 +3613,13 @@ def main(argv: "list | None" = None) -> int:
                     help="Absolute floor on the modeled option spread in premium dollars (full "
                          "width). Percent-of-premium alone under-charges cheap contracts, which "
                          "is where fabricated edge concentrates. Default 0.02.")
+    ob.add_argument("--option-min-volume", type=int, default=_OPTION_MIN_VOLUME_DEFAULT,
+                    help="Minimum DAILY TRADED VOLUME for an option contract to be selectable. "
+                         "The fill engine caps an order at 10%% of a bar's volume, so a contract "
+                         "trading below ~10x the order size can never fill -- without this the "
+                         "selector hands the filler candidates it rejects, and the order just sits "
+                         "pending. Cached-bar distribution: p25=3, p50=14, p75=71. A tradability "
+                         "floor, NOT a GA gene (exposed, the GA would drive it to 0). 0 disables.")
     ob.add_argument("--fill-model", default="next_bar_open")
     ob.add_argument("--interval", default="5min",
                     help="Fill-clock interval (default 5min for precise intraday TP/SL).")

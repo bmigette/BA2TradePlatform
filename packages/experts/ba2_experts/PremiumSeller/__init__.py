@@ -80,6 +80,12 @@ class PremiumSeller(MarketExpertInterface):
                                          "description": "Exclude names graded below fmp_rating_min."},
             "fmp_rating_min": {"type": "float", "required": False, "default": 3.0,
                                "description": "Min analyst grade score (1-5)."},
+            "min_volume": {"type": "int", "required": False, "default": 25,
+                           "description": "Minimum daily traded volume for a contract to be "
+                                          "selectable. The fill engine caps an order at 10% of "
+                                          "a bar's volume, so a thinner contract yields an "
+                                          "order that can never fill. 0 disables (the "
+                                          "unconditional premium floor still applies)."},
             "target_delta": {"type": "float", "required": False, "default": 0.30,
                              "description": "Short-strike target |delta|."},
             "target_dte": {"type": "int", "required": False, "default": 38,
@@ -183,6 +189,14 @@ class PremiumSeller(MarketExpertInterface):
         d0 = as_of.date() + timedelta(days=target_dte - _CHAIN_DTE_PAD[0])
         d1 = as_of.date() + timedelta(days=target_dte + _CHAIN_DTE_PAD[1])
         chain = account.get_option_chain(sym, d0, d1)
+        if not chain:
+            return None
+        # Liquidity filter BEFORE strike selection (2026-07-25). PremiumSeller picks strikes
+        # with its own closest_to_delta and never went through option_selector, so it was the
+        # one option path with no tradability guard: it could select a $0.03 contract, or one
+        # trading 2 lots/day that the fill engine's participation cap would then refuse. See
+        # structures.filter_tradeable.
+        chain = structures.filter_tradeable(chain, int(settings["min_volume"]) or None)
         if not chain:
             return None
 

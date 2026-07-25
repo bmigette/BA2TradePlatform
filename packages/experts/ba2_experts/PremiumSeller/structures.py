@@ -11,10 +11,28 @@ from dataclasses import dataclass
 from datetime import date
 from typing import List, Optional
 
+from ba2_common.core.option_selector import passes_liquidity
 from ba2_common.core.option_types import OptionContract, OptionLeg
 from ba2_common.core.types import OptionRight, OrderDirection
 
 MULTIPLIER = 100
+
+
+def filter_tradeable(chain: List[OptionContract],
+                     min_volume: Optional[int] = None) -> List[OptionContract]:
+    """Drop contracts that are not realistically tradeable, BEFORE any strike selection.
+
+    Added 2026-07-25. PremiumSeller selects strikes with its own ``closest_to_delta`` and
+    never went through ``option_selector``, so it was the one option path with NO liquidity
+    guard at all -- it saw neither the unconditional ``_MIN_TRADEABLE_PREMIUM`` floor (which
+    rejects $0.01-$0.09 contracts whose spread exceeds their value) nor the daily-volume gate.
+    Since the fill engine independently refuses an order exceeding ~10% of a bar's volume,
+    an unfiltered pick routinely produced orders that could never fill and simply sat pending.
+
+    ``min_volume=None`` applies the premium floor only, preserving the previous behaviour for
+    callers that have not opted in.
+    """
+    return [c for c in chain if passes_liquidity(c, None, None, min_volume)]
 
 
 @dataclass
