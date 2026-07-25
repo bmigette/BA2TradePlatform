@@ -303,10 +303,26 @@ into three independent sub-periods to reject single-episode artifacts:
 
 Three findings that shaped the module:
 
-1. **Regime predicts VOLATILITY, not DIRECTION.** Forward returns also separated — but with
-   the counter-intuitive sign (higher forward returns in "bad" states). That is a 2011–2026
-   sample artifact (dip-buying worked in a period with no sustained bear outside 2022), so no
-   directional regime is exposed. Volatility clustering held in *every* sub-period.
+1. **This signal is a RISK regime, not a direction forecast** (corrected 2026-07-25 after
+   challenge — the original wording claimed regime predicts volatility and *not* direction,
+   which is false as a general statement).
+
+   Trend *does* predict direction: time-series momentum (Moskowitz, Ooi & Pedersen 2012) is
+   robust across 58 instruments and 25+ years, Sharpe ~1.28 vs 0.38 buy-and-hold. But the
+   documented value of *this* construction — a 200-day SMA cross on a single equity index —
+   is volatility and drawdown reduction, not return enhancement: since 1951 it returns
+   **7.11% @ 10.1% vol (Sharpe 0.704)** vs buy-and-hold **7.24% @ 15.37% (Sharpe 0.471)**,
+   and over 1929–2019 it cut max drawdown from **83.4% → 29.6%**.
+
+   Our sample cannot settle direction either way. The 568 "below SMA200" observations
+   collapse to **8 independent episodes** (2015×2, 2018, 2020, 2022×2, 2025, 2026), two of
+   which fell — overlapping daily windows inflated n=8 into an apparent n=568. That sample
+   showed below-trend predicting *higher* returns, the opposite sign to TSMOM, which marks
+   the window as unrepresentative rather than informative.
+
+   **Implication:** use it as a risk/vol regime (what it is documented to deliver, and what
+   our data supports). If a directional regime is wanted later, build it as 12-month
+   time-series momentum applied across assets — not an SMA cross on one index.
 2. **Expose orthogonal primitives; do not hand-combine.** The hand-tuned 2-factor score scored
    *worse than plain SMA200* in every sub-period. Trend and volatility ship as two independent
    axes for the GA to combine.

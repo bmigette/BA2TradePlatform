@@ -19,14 +19,28 @@ single-episode artifacts. Separation of forward realized volatility (pct points)
 
 THREE CONCLUSIONS THAT SHAPED THIS MODULE:
 
-1. Regime predicts VOLATILITY, not DIRECTION. Forward realized vol separates cleanly and
-   in every sub-period (volatility clustering). Forward RETURNS also separated, but with
-   the counter-intuitive sign -- higher forward returns in "bad" states -- which is a
-   2011-2026 sample artifact (dip-buying worked in a period with no sustained bear outside
-   2022). We deliberately do NOT expose a directional/return-predicting regime: the
-   evidence for it is an artifact, while volatility clustering is one of the most robust
-   effects in finance. Volatility is also the quantity that actually decides whether short
-   premium wins (realized vs implied) and whether a position gets run over.
+1. THIS SIGNAL is a RISK regime, not a DIRECTION forecast. Careful about the general
+   claim here: trend DOES predict direction -- time-series momentum (Moskowitz, Ooi &
+   Pedersen 2012) is robust across 58 instruments and 25+ years, Sharpe ~1.28 vs 0.38
+   buy-and-hold. What the literature says about THIS construction (a 200-day SMA cross on
+   a single equity index) is narrower: its value is volatility and drawdown reduction, not
+   return enhancement. Since 1951, SMA200 timing returns 7.11% at 10.1% vol (Sharpe 0.704)
+   against buy-and-hold's 7.24% at 15.37% (Sharpe 0.471) -- LOWER return, much lower risk;
+   over 1929-2019 it cut max drawdown from 83.4% to 29.6%.
+
+   Our own 3,777-session sample cannot settle direction either way, and a check confirms
+   why: the 568 "below SMA200" observations collapse to just EIGHT independent episodes
+   (2015 x2, 2018, 2020, 2022 x2, 2025, 2026), of which two fell. Overlapping daily windows
+   inflated n=8 into an apparent n=568. That sample even showed below-trend predicting
+   HIGHER forward returns -- the opposite sign to time-series momentum -- which is a signal
+   that the window is unrepresentative, not a finding.
+
+   So: use this as a RISK/vol regime, which is what it is documented to deliver and what
+   our data can actually support. Volatility clustering is separately one of the most
+   replicated effects in finance, and volatility is the quantity that decides whether short
+   premium wins (realized vs implied) and whether a position gets run over. If a DIRECTIONAL
+   regime is wanted later, build it the way the literature does -- 12-month time-series
+   momentum, applied across assets -- not as an SMA cross on one index.
 
 2. Expose ORTHOGONAL PRIMITIVES, do not hand-combine. A hand-tuned 2-factor score scored
    WORSE than plain SMA200 in every sub-period. Trend and volatility are exposed as two
