@@ -44,16 +44,18 @@ class OptionPortfolioManager:
 
         Parent order = the txn's order with parent_order_id None, asset_class OPTION,
         and an option_strategy other than 'close' (covers both multi-leg parents —
-        contract_symbol None — and single-leg 'single' parents)."""
-        from ba2_common.core.db import get_db
-        from sqlmodel import select
+        contract_symbol None — and single-leg 'single' parents).
 
-        with get_db() as session:
-            txns = session.exec(
-                select(Transaction)
-                .where(Transaction.expert_id == self.expert_instance_id)
-                .where(Transaction.status == TransactionStatus.OPENED)
-            ).all()
+        Reads via the dual-path ``transactions_where`` accessor: a raw SQL session is
+        BLIND under the backtest's in-memory trade store (``backtest_trading_db``'s
+        default), where Transaction rows live in the RAM dict store — with a raw
+        session this returned {} forever, so manage_open never closed anything and
+        rebalance re-opened duplicate structures every entry bar. Flag-OFF (live)
+        the accessor issues the identical SELECT, so live behaviour is unchanged."""
+        from ba2_common.core.trade_store import transactions_where
+
+        txns = transactions_where(expert_id=self.expert_instance_id,
+                                  status=TransactionStatus.OPENED)
         out: Dict[int, Tuple[Transaction, Any]] = {}
         for txn in txns:
             for o in orders_where(transaction_id=txn.id):
