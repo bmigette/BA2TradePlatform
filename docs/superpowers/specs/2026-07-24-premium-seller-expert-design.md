@@ -266,5 +266,8 @@ out-of-sample split (§10) is what keeps the tuned result honest.
 - No wheel / no holding assigned stock (engine policy; v2 candidate).
 - No directional signal input in v1 (OS1 lesson). FMP rating is a quality floor only.
 - Stock/equity expert code paths untouched; FactorRanker behavior byte-identical.
+- Universe is the static `static_universe` list only in v1; the screener metric-store
+  universe source of §4.1 is deferred to v1.5 (the GA `universe_source` gene ships
+  when the screener path lands). All other §4 filters are implemented as specified.
 - Shared code goes in `packages/experts`; only the engine seams and GA wiring live in
   `testplatform/backend`.
