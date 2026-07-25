@@ -36,7 +36,6 @@ def test_realized_vol_known_value():
         px *= up if i % 2 == 0 else dn
         closes.append(px)
     v = realized_vol_annualized(closes, 60)
-    assert v == sorted([v])[0]
     assert abs(v - math.sqrt(252) * 0.01) < 0.01
 
 

@@ -94,3 +94,9 @@ def test_short_strangle():
     syms = {l.contract_symbol for l in spec.legs}
     assert syms == {"P95", "C105"}
     assert all(l.side == OrderDirection.SELL for l in spec.legs)
+    # credit = put bid + call bid = 1.40 + 1.40 = 2.80; per-risk = max(95,105)x100 = 10500
+    # qty = min(floor(30000/10500), floor(50000/10500)) = 2
+    assert abs(spec.net_credit - 2.80) < 1e-9
+    assert spec.qty == 2
+    assert spec.max_loss == (10500.0 - 2.80 * 100) * 2     # 20440
+    assert spec.notional == 10500.0 * 2

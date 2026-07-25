@@ -186,8 +186,11 @@ class OptionPortfolioManager:
                 and balance <= self._peak_equity * (1.0 - breaker / 100.0)):
             logger.warning(f"PremiumSeller: circuit breaker hit (dd>{breaker}%) — flattening book")
             self._halted = True
-            return [self._close_structure(txn, parent)
-                    for txn, parent in holdings.values()]
+            # Filter Nones like the normal path below: _close_structure returns None
+            # when a structure has nothing left to offset (already flat).
+            return [o for o in (self._close_structure(txn, parent)
+                                for txn, parent in holdings.values())
+                    if o is not None]
         closed: List[Any] = []
         for txn, parent in holdings.values():
             if self._should_close(txn, parent, as_of):
