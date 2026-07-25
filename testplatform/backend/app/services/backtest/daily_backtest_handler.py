@@ -38,11 +38,16 @@ logger = logging.getLogger(__name__)
 # Alpaca's options-history floor: there is no chain/bar data before this date, so an
 # options backtest that starts earlier would silently see empty chains. Reject it with a
 # clear error instead (a missing cache still fails fast via OptionsCacheMiss).
-_OPTIONS_HISTORY_FLOOR = date(2024, 2, 1)
+#
+# SINGLE SOURCE OF TRUTH: imported from fetch_options (which documents how the date was
+# measured against the live API). This used to be a second, independent `date(2024, 2, 1)`
+# literal — two copies of the same vendor fact that could silently drift apart, so that
+# correcting the fetch guard alone would still leave backtests rejecting valid windows.
+from .fetch_options import _OPTIONS_HISTORY_FLOOR  # noqa: E402
 
 
 def validate_options_window(start, uses_options: bool) -> None:
-    """Reject option backtests before Alpaca's 2024-02-01 options-history floor."""
+    """Reject option backtests before Alpaca's options-history floor (2024-01-18, measured)."""
     if not uses_options:
         return
     if isinstance(start, datetime):

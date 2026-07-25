@@ -3333,7 +3333,7 @@ def main(argv: "list | None" = None) -> int:
 
     fo = sub.add_parser("fetch-options", help="Build the offline options cache from Alpaca.")
     fo.add_argument("--underlyings", required=True, help="Comma-separated symbols, or @file.")
-    fo.add_argument("--start", required=True, help="ISO start date (>= 2024-02-01).")
+    fo.add_argument("--start", required=True, help="ISO start date (>= 2024-01-18, Alpaca options-history floor).")
     fo.add_argument("--end", required=True, help="ISO end date.")
     fo.add_argument("--cache-db", default=_DEFAULT_OPTIONS_CACHE_DB,
                     help=f"Path to the options-history SQLite cache (default {_DEFAULT_OPTIONS_CACHE_DB}).")

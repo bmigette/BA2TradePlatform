@@ -122,7 +122,7 @@ def handle_build_options(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any
     """Build the offline options cache from Alpaca.
 
     Mirrors ``ba2test_launcher._cmd_fetch_options``. Required payload keys: underlyings (list of
-    symbols), start, end (ISO, start >= 2024-02-01), cache_db. Optional: feed (default
+    symbols), start, end (ISO, start >= 2024-01-18), cache_db. Optional: feed (default
     "indicative").
     """
     # Default the options cache DB to the shared ba2_common path (common bucket)

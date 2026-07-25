@@ -51,7 +51,7 @@ class BuildScreenerMetricsRequest(BaseModel):
 class BuildOptionsRequest(BaseModel):
     """Build the offline options cache from Alpaca — mirrors CLI fetch-options."""
     underlyings: List[str]
-    start: str                               # ISO (>= 2024-02-01)
+    start: str                               # ISO (>= 2024-01-18, Alpaca options-history floor)
     end: str
     cache_db: Optional[str] = None           # options-history SQLite cache (default: ba2_common OPTIONS_CACHE_DB)
     feed: Optional[str] = "indicative"

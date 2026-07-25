@@ -43,7 +43,20 @@ from .options_cache import OptionsHistoryCache
 logger = logging.getLogger(__name__)
 
 # Alpaca options-history floor: no chain/bar data exists before this date.
-_OPTIONS_HISTORY_FLOOR = date(2024, 2, 1)
+#
+# MEASURED against the live API (2026-07-25), not taken from the docs — docs.alpaca.markets'
+# "About Market Data API" page claims options history back to 2016, which is FALSE for this
+# API. Four long-dated contracts that were actively trading well before 2024 (SPY 2024-06-21,
+# SPY 2024-12-20, the SPY 2025-01-17 LEAP and the AAPL 2025-01-17 LEAP), each requested over a
+# 2022-01-01 -> 2026-07-01 window, ALL return their first bar on exactly 2024-01-18; probes at
+# 2016/2018/2020/2022/2023-06/2023-12 return zero bars. It is a hard account-wide cutoff, the
+# same day for every symbol and expiry, and it is NOT a subscription limit — Algo Trader Plus
+# (OPRA) upgrades data QUALITY (real prints/volume/OI vs the indicative feed) but buys no extra
+# history. Pre-2024 options history needs a different vendor entirely.
+#
+# Was 2024-02-01 (~2 weeks conservative), which made this guard reject fetches that would in
+# fact succeed.
+_OPTIONS_HISTORY_FLOOR = date(2024, 1, 18)
 # How far past `end` to still pull contracts (so a position opened near `end` can pick an
 # expiry that lands after the window). Matches the handler's DTE windows comfortably.
 _EXPIRY_TAIL_DAYS = 60
