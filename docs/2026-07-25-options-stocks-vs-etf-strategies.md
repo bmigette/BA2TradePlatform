@@ -44,6 +44,37 @@ The index premium is attributed *entirely to priced correlation risk* — implie
 no correlation to sell.** That is why the index premium survives and the single-name one is
 roughly zero or negative.
 
+### UPDATE 2026-07-25 (evening) — measured, and it only PARTLY supports the above
+
+SPY/QQQ/IWM options were fetched (5.76M bars) and the same IV-vs-subsequent-realized test run
+on them. The result does **not** confirm the "index premium is bigger" claim as stated:
+
+| group | n | ATM IV | fwd realized | VRP | VRP > 0 |
+|---|---|---|---|---|---|
+| Index ETF (SPY/QQQ/IWM) | 1,743 | 18.9 | 17.5 | **1.43** | **70.1%** |
+| Single names (91) | 25,466 | 33.6 | 31.7 | **1.87** | 63.3% |
+| — SPY | 581 | 14.7 | 13.7 | 1.02 | 71.3% |
+| — QQQ | 581 | 19.6 | 18.6 | 1.04 | 65.6% |
+| — IWM | 581 | 22.4 | 20.1 | **2.24** | **73.3%** |
+
+In **absolute vol points the index VRP is LOWER** (1.43 vs 1.87). It is richer only on two other
+readings: it is positive far more **consistently** (70.1% vs 63.3%), and as a **fraction of the
+vol sold** it is larger (7.6% of IV vs 5.6%). For a premium seller consistency is arguably the
+more useful property — it is what determines how often the trade works rather than how much a
+single win pays — but that is a weaker and different claim than the one made above.
+
+Read this as *not yet settled*, for three concrete reasons:
+1. **Thin index sample** — 581 observations per symbol against 25,466 across single names.
+2. **A calm window for the index** — SPY ATM IV averaged 14.7% here. The report's 4.2-point
+   figure spans 1990–2018 including 2008; ours is 2024-02 → 2026-07 with no crisis.
+3. **Earnings inflate both sides for single names**, lifting IV and realized together, so the
+   single-name VRP is not directly comparable to a no-earnings index.
+
+The *structural* argument (correlation risk premium is a real thing single names cannot supply)
+is unaffected — it rests on external evidence, not on this window. What this measurement does
+undercut is the stronger quantitative claim that we are "harvesting less than half" the
+available premium. Re-run after the regime extension (roadmap Phase 2) before relying on it.
+
 **Consequence:** a continuous premium-selling strategy on single names is harvesting the wrong
 premium. It is not a weaker version of the index trade; it is a different trade with much less
 evidence behind it.
