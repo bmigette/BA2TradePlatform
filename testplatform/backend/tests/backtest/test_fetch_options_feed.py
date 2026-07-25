@@ -1,19 +1,25 @@
 # backend/tests/backtest/test_fetch_options_feed.py
-"""No-network regression tests: the --feed flag must actually reach Alpaca's /options/bars.
+"""No-network regression tests: ``feed`` must NOT be sent to Alpaca's /options/bars.
 
-Dead-flag bug: ``build_cache`` accepted ``feed`` and both CLIs (``ba2-test fetch-options``,
-``ba2test_launcher.py``) passed it, but the value never reached ``OptionBarsRequest`` — bars
-always came from the SDK-default feed. This matters because the indicative feed's
-quote-derived prints can be arbitrage-inconsistent with the underlying; users need
-``--feed opra`` (trades) to actually take effect.
+CORRECTED 2026-07-25. This file previously asserted the OPPOSITE -- that ``--feed`` had to
+reach ``OptionBarsRequest`` -- and a subclass existed purely to make pydantic serialize it.
+That was built on an assumption about the API that was never verified against it. Verified
+now, live:
 
-Complication the fix works around: the installed alpaca-py (0.43.4) gives ``OptionBarsRequest``
-NO ``feed`` field (only the snapshot/chain/latest option request classes carry one) and its
-pydantic models silently IGNORE unknown kwargs — so ``feed=`` on the base class is a silent
-no-op. ``fetch_options.build_cache`` therefore declares the field via a subclass; these tests
-capture the request object handed to ``OptionHistoricalDataClient.get_option_bars`` and assert
-the requested feed is on it (and on the wire params), plus that an invalid feed fails LOUD
-(ValueError) before any client/network/credential work."""
+    request WITH    feed -> {"message":"unexpected query parameter(s): feed"}
+    request WITHOUT feed -> bars returned normally
+
+``feed`` IS valid on the snapshot / chain / latest option endpoints, which is where the
+assumption came from; the BARS endpoint rejects it. The tests below therefore pin the
+corrected behaviour: no ``feed`` on the bars request, at all, regardless of what the caller
+passed.
+
+Impact of the original bug: every options fetch failed outright, for every underlying -- not
+just new ones. It stayed invisible because the existing 13.7M-bar cache predates Alpaca
+tightening its unknown-parameter check, so nothing re-fetched until 2026-07-25.
+
+``feed`` is still VALIDATED (a typo fails loud before any network/credential work) and still
+selects the chain/snapshot source -- those tests are unchanged and still pass."""
 from datetime import date, datetime
 from types import SimpleNamespace
 
@@ -76,27 +82,40 @@ def _run_build_cache(monkeypatch, tmp_path, feed=_OMIT):
     return captured
 
 
-def test_build_cache_opra_feed_reaches_option_bars_request(monkeypatch, tmp_path):
-    """--feed opra must land on EVERY OptionBarsRequest the build makes (as the SDK enum),
-    not be dropped on the floor."""
-    for req in _run_build_cache(monkeypatch, tmp_path, "opra"):
-        assert isinstance(req, OptionBarsRequest)
-        assert req.feed is OptionsFeed.OPRA
-        # What the wire actually carries: to_request_fields() feeds requests' params, which
-        # encode the str-enum by value.
-        assert req.to_request_fields()["feed"] == "opra"
+def test_feed_is_never_sent_on_the_bars_request(monkeypatch, tmp_path):
+    """The bars endpoint rejects `feed` outright, so it must not appear on the request --
+    whatever the caller asked for. Checks the WIRE params, which is what actually reaches
+    Alpaca, not just the model attribute."""
+    for i, feed in enumerate(("opra", "OPRA", "indicative", _OMIT)):
+        # A FRESH cache dir per iteration: build_cache resumes by default, so reusing one
+        # path would skip the symbol on every pass after the first (symbols_done=0) and the
+        # loop would silently assert nothing.
+        case_dir = tmp_path / f"case{i}"
+        case_dir.mkdir()
+        for req in _run_build_cache(monkeypatch, case_dir, feed):
+            assert isinstance(req, OptionBarsRequest)
+            assert "feed" not in req.to_request_fields(), (
+                f"feed leaked onto the bars request for feed={feed!r}; Alpaca answers "
+                f'{{"message":"unexpected query parameter(s): feed"}} and the whole fetch fails')
 
 
-def test_build_cache_feed_matching_is_case_insensitive(monkeypatch, tmp_path):
-    for req in _run_build_cache(monkeypatch, tmp_path, "OPRA"):
-        assert req.feed is OptionsFeed.OPRA
+def test_bars_request_carries_the_fields_that_ARE_valid(monkeypatch, tmp_path):
+    """Guard against over-correcting: dropping feed must not drop the real parameters."""
+    req = _run_build_cache(monkeypatch, tmp_path, "opra")[0]
+    fields = req.to_request_fields()
+    # timeframe serializes as the SDK's TimeFrame object, not a plain string.
+    assert str(fields.get("timeframe")) == "1Day"
+    assert {"start", "end", "symbols"} <= set(fields)
 
 
-def test_build_cache_default_feed_is_indicative(monkeypatch, tmp_path):
-    """Omitting feed keeps the historical default (indicative — free tier), now EXPLICITLY set
-    on the request instead of relying on the SDK default."""
-    for req in _run_build_cache(monkeypatch, tmp_path, _OMIT):
-        assert req.feed is OptionsFeed.INDICATIVE
+def test_an_invalid_feed_still_fails_loud_even_though_bars_ignore_it(monkeypatch, tmp_path):
+    """feed still selects the chain/snapshot source, so a typo must still error rather than
+    silently fetch the wrong thing -- removing it from the BARS request does not make the
+    value meaningless."""
+    with pytest.raises(ValueError, match="valid values"):
+        fo.build_cache(str(tmp_path / "opt.db"), ["AAPL"],
+                       date(2024, 3, 1), date(2024, 3, 8), "bogus",
+                       api_key="test-key", api_secret="test-secret")
 
 
 def test_options_feed_enum_values():

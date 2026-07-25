@@ -304,13 +304,32 @@ def discover_contracts(tc: Any, underlying: str, *, expiry_gte: str, expiry_lte:
     from alpaca.trading.enums import AssetStatus
 
     def _fetch(status: AssetStatus) -> List[Any]:
-        req = GetOptionContractsRequest(
-            underlying_symbols=[underlying], status=status,
-            expiration_date_gte=expiry_gte, expiration_date_lte=expiry_lte,
-            strike_price_gte=str(strike_min) if strike_min is not None else None,
-            strike_price_lte=str(strike_max) if strike_max is not None else None,
-            limit=10000)
-        return tc.get_option_contracts(req).option_contracts or []
+        """All contracts for this status, PAGINATED (fixed 2026-07-25).
+
+        This used to issue ONE request with limit=10000 and take whatever came back. For a
+        single name that is harmless -- a couple of thousand contracts fit. For an INDEX ETF
+        it silently truncated: a 2.4-year SPY window is on the order of 100k contracts
+        (~250 expiries x ~200 strikes x 2 rights), so a single call captured roughly a tenth
+        of the chain, in whatever order the API returned rather than centred on the money.
+        A smoke fetch returning exactly 9,999 rows against the 10,000 cap is what exposed it.
+
+        Alpaca pages via ``next_page_token``; follow it until exhausted. The page cap stays
+        at 10,000 (the API maximum) so the number of round-trips stays small.
+        """
+        out: List[Any] = []
+        page_token = None
+        while True:
+            req = GetOptionContractsRequest(
+                underlying_symbols=[underlying], status=status,
+                expiration_date_gte=expiry_gte, expiration_date_lte=expiry_lte,
+                strike_price_gte=str(strike_min) if strike_min is not None else None,
+                strike_price_lte=str(strike_max) if strike_max is not None else None,
+                limit=10000, page_token=page_token)
+            resp = tc.get_option_contracts(req)
+            out.extend(resp.option_contracts or [])
+            page_token = getattr(resp, "next_page_token", None)
+            if not page_token:
+                return out
 
     inactive = _fetch(AssetStatus.INACTIVE)   # expired/historical — the important leg
     active = _fetch(AssetStatus.ACTIVE)        # still-listed (window may overlap "now")
@@ -403,14 +422,21 @@ def build_cache(cache_db: str, underlyings: List[str], start: date, end: date,
     key, secret = _alpaca_keys(api_key, api_secret)
     cache = OptionsHistoryCache(cache_db)
 
-    # alpaca-py (0.43.4) gives OptionBarsRequest NO feed field (only the snapshot/chain/latest
-    # option request classes carry one) and its pydantic models silently IGNORE unknown kwargs,
-    # so feed= on the base class would be a silent no-op — the exact dead-flag bug this guards
-    # against. Declaring the field via a subclass makes to_request_fields() emit `feed`, which
-    # the /options/bars endpoint honors (same serialization path as the SDK's own feed-bearing
-    # request classes).
-    class _FedOptionBarsRequest(OptionBarsRequest):
-        feed: Optional[OptionsFeed] = None
+    # DO NOT send `feed` on the BARS request (fixed 2026-07-25).
+    #
+    # The previous code declared a _FedOptionBarsRequest subclass specifically so pydantic would
+    # serialize `feed`, on the stated belief that "/options/bars honors it". It does not. Verified
+    # live against the API: the identical request WITH feed returns
+    #     {"message":"unexpected query parameter(s): feed"}
+    # and WITHOUT it returns bars normally. `feed` IS valid on the snapshot/chain/latest option
+    # endpoints -- which is where that assumption came from -- but not on bars.
+    #
+    # Impact: this made EVERY options fetch fail outright, for every underlying, not just new
+    # ones. The existing 13.7M-bar cache predates Alpaca tightening the parameter check, so the
+    # breakage was invisible until the next fetch was attempted.
+    #
+    # ``feed`` is still validated above by _options_feed() (a typo must fail loud) and is still
+    # used for the CHAIN/snapshot calls; it simply is not forwarded to the bars endpoint.
 
     expiry_gte = start.isoformat()
     expiry_lte = (end + timedelta(days=_EXPIRY_TAIL_DAYS)).isoformat()
@@ -467,9 +493,9 @@ def build_cache(cache_db: str, underlyings: List[str], start: date, end: date,
             for i in range(0, len(syms), _OPTION_BARS_BATCH):
                 chunk = syms[i:i + _OPTION_BARS_BATCH]
                 resp = _with_retry(
-                    lambda chunk=chunk: dc.get_option_bars(_FedOptionBarsRequest(
+                    lambda chunk=chunk: dc.get_option_bars(OptionBarsRequest(
                         symbol_or_symbols=chunk, timeframe=TimeFrame.Day,
-                        start=start_iso, end=end_iso, feed=options_feed)),
+                        start=start_iso, end=end_iso)),
                     what=f"bars {u} [{i // _OPTION_BARS_BATCH + 1}]")
                 for s, blist in (resp.data or {}).items():
                     bars_by_sym[s] = blist
