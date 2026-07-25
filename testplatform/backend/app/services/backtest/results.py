@@ -636,9 +636,26 @@ def _annualized_volatility(step_returns: List[float], periods_per_year: float) -
 
 
 def _annualized_return(initial: float, final: float, years: float) -> float:
-    """Geometric annualised return (%) over the actual ``years`` of calendar time elapsed."""
-    if initial <= 0 or final <= 0 or years <= 0:
+    """Geometric annualised return (%) over the actual ``years`` of calendar time elapsed.
+
+    ``final <= 0`` (equity wiped out, or driven under water by the profit-cap adjustment)
+    returns **-100.0**, NOT 0.0. The geometric formula is undefined for a non-positive
+    final value, but the ANSWER is not ambiguous: everything was lost, i.e. -100%/yr. The
+    old 0.0 made a total loss indistinguishable from BREAKEVEN, and since
+    ``consistent_annual_return`` ranks directly on this number, that inverted the ordering
+    of the worst configs: PremiumSeller's smoke run scored its single worst individual
+    (-34.1% real return, adjusted_total_return -141%, i.e. adjusted final equity -$8,198)
+    at fitness 0.0 — ABOVE a merely -26% config — and five heavy losers tied at 0.0 as
+    "best". High trade counts made it worse, since more winners means more capped "excess"
+    subtracted from final equity.
+
+    ``initial <= 0`` / ``years <= 0`` still return 0.0: those are genuinely undefined
+    inputs (no capital deployed, no time elapsed), not a loss.
+    """
+    if initial <= 0 or years <= 0:
         return 0.0
+    if final <= 0:
+        return -100.0
     return ((final / initial) ** (1.0 / years) - 1.0) * 100.0
 
 

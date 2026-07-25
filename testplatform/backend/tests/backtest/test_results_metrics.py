@@ -274,3 +274,44 @@ def test_empty_run_is_safe():
     assert r["drawdown_curve"] == []
     assert r["trades"] == []
     assert r["profit_factor"] == pytest.approx(0.0)
+
+
+# --------------------------------------------------------------------------- #
+# Total loss must rank BELOW a partial loss (2026-07-25)
+# --------------------------------------------------------------------------- #
+def test_annualized_return_is_minus_100_when_final_equity_is_wiped_not_zero():
+    """Regression: _annualized_return returned 0.0 for final <= 0, making a TOTAL loss
+    indistinguishable from BREAKEVEN.
+
+    consistent_annual_return ranks directly on this number, so the ordering of the worst
+    configs was inverted: PremiumSeller's smoke run scored its single worst individual
+    (-34.1% real return; adjusted_total_return -141%, i.e. adjusted final equity -$8,198
+    after the profit-cap deduction) at fitness 0.0 -- ABOVE a merely -26% config -- and five
+    heavy losers tied at 0.0 as "best_fitness"."""
+    from app.services.backtest.results import _annualized_return
+
+    # Wiped out / driven under water -> the floor, not neutral.
+    assert _annualized_return(20_000.0, 0.0, 2.0) == -100.0
+    assert _annualized_return(20_000.0, -8_198.0, 1.75) == -100.0
+    # ...and that must sort below any real (partial) loss.
+    partial = _annualized_return(20_000.0, 13_176.0, 1.75)
+    assert -100.0 < partial < 0, f"a -34% run should be a modest negative, got {partial}"
+    assert _annualized_return(20_000.0, -8_198.0, 1.75) < partial
+
+    # Genuinely UNDEFINED inputs stay 0.0 — no capital deployed / no time elapsed is not a loss.
+    assert _annualized_return(0.0, 5_000.0, 2.0) == 0.0
+    assert _annualized_return(20_000.0, 25_000.0, 0.0) == 0.0
+    # Profitable case unchanged.
+    assert _annualized_return(100.0, 121.0, 2.0) == pytest.approx(10.0)
+
+
+def test_wiped_out_run_reports_minus_100_annualized_end_to_end():
+    """Through build_results, not just the helper."""
+    wiped = [
+        _snap(datetime(2024, 1, 2), 100_000.0),
+        _snap(datetime(2024, 7, 1), 40_000.0),
+        _snap(datetime(2025, 1, 2), 0.0),
+    ]
+    r = build_results(_AccountStub(wiped, []), CONFIG)
+    assert r["annualized_return"] == -100.0
+    assert r["total_return"] == -100.0

@@ -152,3 +152,24 @@ def test_run_monte_carlo_spread_sweep_is_independent_of_baseline_spread_bps():
     r0 = run_monte_carlo(trades, initial=10_000.0, years=3.0, cfg=cfg_no_baseline)
     r1 = run_monte_carlo(trades, initial=10_000.0, years=3.0, cfg=cfg_with_baseline)
     assert r0["spread_sweep"] == r1["spread_sweep"]
+
+
+def test_blown_up_path_scores_minus_100_so_the_left_tail_is_not_understated():
+    """_annualized_return mirrors results.py, INCLUDING the final<=0 -> -100.0 floor.
+
+    Scoring a ruined path 0.0 (the old behaviour) makes it look BREAKEVEN and drags the low
+    percentile bands upward -- understating precisely the left tail MC is run to measure."""
+    from app.services.backtest.monte_carlo import _annualized_return, _path_metrics
+    import numpy as np
+
+    assert _annualized_return(100_000.0, 0.0, 3.0) == -100.0
+    assert _annualized_return(100_000.0, -500.0, 3.0) == -100.0
+    # Undefined inputs are still 0.0, not a loss.
+    assert _annualized_return(0.0, 50_000.0, 3.0) == 0.0
+    assert _annualized_return(100_000.0, 50_000.0, 0.0) == 0.0
+
+    wiped = _path_metrics(np.array([100_000.0, 50_000.0, 0.0]), 100_000.0, 3.0)
+    assert wiped["annualized_return"] == -100.0
+    # ...and it must sort below a path that merely halved.
+    halved = _path_metrics(np.array([100_000.0, 70_000.0, 50_000.0]), 100_000.0, 3.0)
+    assert wiped["annualized_return"] < halved["annualized_return"] < 0

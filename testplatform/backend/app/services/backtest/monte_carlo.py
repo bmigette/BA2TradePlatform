@@ -18,8 +18,9 @@ shuffle/bootstrap/drop-K tests exploit.
 
 Metric conventions are mirrored from ``app/services/backtest/results.py`` so MC numbers line up
 with the engine's:
-  * annualized_return = ((final / initial) ** (1 / years) - 1) * 100   (guarded when
-    initial/final <= 0 or years <= 0 -> 0.0), matching ``results._annualized_return``.
+  * annualized_return = ((final / initial) ** (1 / years) - 1) * 100   (guarded: initial <= 0
+    or years <= 0 -> 0.0 (undefined inputs); final <= 0 -> -100.0 (wiped out)), matching
+    ``results._annualized_return``.
   * max_drawdown = min over the running-peak drawdown series ``(equity - peak) / peak * 100``
     (<= 0, a NEGATIVE pct), matching ``results._drawdown_curve`` + ``max_drawdown = min(dd)``.
   * calmar = annualized_return / abs(max_drawdown)  (0.0 when max_drawdown == 0), matching
@@ -117,9 +118,17 @@ def _path_metrics(path: np.ndarray, initial: float, years: float) -> Dict[str, f
 
 
 def _annualized_return(initial: float, final: float, years: float) -> float:
-    """Geometric annualised return (%). Mirrors ``results._annualized_return`` exactly."""
-    if initial <= 0 or final <= 0 or years <= 0:
+    """Geometric annualised return (%). Mirrors ``results._annualized_return`` exactly,
+    INCLUDING the ``final <= 0 -> -100.0`` floor.
+
+    A path that blows up must score -100, not 0. Scoring it 0 would make the ruined paths
+    look BREAKEVEN and pull the lower percentile bands upward — i.e. it would systematically
+    understate exactly the left tail Monte Carlo is run to measure.
+    """
+    if initial <= 0 or years <= 0:
         return 0.0
+    if final <= 0:
+        return -100.0
     return ((final / initial) ** (1.0 / years) - 1.0) * 100.0
 
 
