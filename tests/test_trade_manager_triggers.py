@@ -94,3 +94,47 @@ class TestRefreshReentrancyLock:
         tm = TradeManager()
         tm.refresh_accounts()
         assert calls["n"] >= 1
+
+
+# --------------------------------------------------------------------------- #
+# A FILLED parent is FINAL — the dependent must never wait on it forever
+# (2026-07-26)
+# --------------------------------------------------------------------------- #
+def test_filled_parent_resolves_instead_of_waiting_forever():
+    """Regression: FILLED is deliberately excluded from get_terminal_statuses() (that set
+    drives buying-power release, where a filled order still holds a position). So a dependent
+    whose trigger was anything OTHER than FILLED fell through to "wait" — and waited forever,
+    because a filled parent can never change status again.
+
+    Live evidence (dev account 3, JSPR txn 46): a SELL_STOP for the 181 shares still held was
+    chained on a MARKET order with trigger=CANCELED; that parent FILLED instead (a
+    cancel/replace that lost the race), so the stop sat in WAITING_TRIGGER with a NULL
+    broker_order_id for three days while the position carried no protection at the broker."""
+    assert classify_waiting_trigger(OrderStatus.FILLED, OrderStatus.CANCELED) != "wait"
+    assert classify_waiting_trigger(OrderStatus.FILLED, OrderStatus.CANCELED) == "submit"
+
+
+def test_filled_parent_submits_a_protective_leg_rather_than_cancelling_it():
+    """Resolved toward SUBMIT deliberately. The staged leg is protective, so cancelling
+    leaves an open position naked, whereas submitting a possibly-stale quantity is already
+    guarded by replacement_blocked_by_qty() and the caller's quantity>0 check. Over-protection
+    is recoverable; no protection is not."""
+    for trigger in (OrderStatus.CANCELED, OrderStatus.REPLACED):
+        assert classify_waiting_trigger(OrderStatus.FILLED, trigger) == "submit", trigger
+    # ...but NOT when no trigger was configured at all — that contract predates this branch
+    # (test_no_trigger_status_waits) and means "never auto-submit", which must still hold.
+    assert classify_waiting_trigger(OrderStatus.FILLED, None) == "wait"
+
+
+def test_the_ordinary_filled_trigger_still_submits():
+    """The common case — a protective leg chained on its ENTRY with trigger=FILLED — is
+    unchanged, and must not be affected by the new branch."""
+    assert classify_waiting_trigger(OrderStatus.FILLED, OrderStatus.FILLED) == "submit"
+
+
+def test_other_terminal_parents_still_cancel_and_working_parents_still_wait():
+    """The new branch must not swallow the surrounding cases."""
+    assert classify_waiting_trigger(OrderStatus.REJECTED, OrderStatus.CANCELED) == "cancel"
+    assert classify_waiting_trigger(OrderStatus.EXPIRED, OrderStatus.FILLED) == "cancel"
+    assert classify_waiting_trigger(OrderStatus.PARTIALLY_FILLED, OrderStatus.CANCELED) == "wait"
+    assert classify_waiting_trigger(OrderStatus.PENDING, OrderStatus.FILLED) == "wait"

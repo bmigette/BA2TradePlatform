@@ -39,6 +39,30 @@ def classify_waiting_trigger(parent_status, trigger_status):
     # the explicit branch documents intent and is robust to status re-categorization.)
     if parent_status == OrderStatus.PARTIALLY_FILLED:
         return "wait"
+    # A FILLED parent is FINAL even though FILLED is deliberately NOT in
+    # get_terminal_statuses() (that set drives buying-power release, where a filled order
+    # still holds a position and must not be treated as done). Without this branch a
+    # dependent whose trigger was anything other than FILLED fell through to "wait" and
+    # waited FOREVER, because the parent can never change status again.
+    #
+    # Observed live (dev account 3, JSPR txn 46, 2026-07-26): order 153, a SELL_STOP for the
+    # 181 shares still held, chained on order 152 with trigger=CANCELED. 152 FILLED instead
+    # of cancelling — a cancel/replace that lost the race — so 153 sat in WAITING_TRIGGER
+    # with broker_order_id NULL for three days and the position carried NO protective stop
+    # at the broker.
+    #
+    # Resolved as "submit" rather than "cancel" because the asymmetry is severe: the staged
+    # leg is protective, so cancelling leaves an open position naked, whereas submitting a
+    # possibly-stale quantity is already guarded — replacement_blocked_by_qty() defers a
+    # submission the broker would reject for insufficient qty, and the caller independently
+    # rejects a dependent whose quantity is <= 0. Over-protection is recoverable; no
+    # protection is not.
+    #
+    # Scoped to dependents that DO have a configured trigger: trigger_status None means no
+    # auto-submit was ever intended (see test_no_trigger_status_waits), and this branch must
+    # not quietly override that contract.
+    if trigger_status is not None and parent_status == OrderStatus.FILLED:
+        return "submit"
     if parent_status in OrderStatus.get_terminal_statuses():
         return "cancel"
     return "wait"
