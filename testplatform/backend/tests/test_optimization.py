@@ -10,6 +10,24 @@ Use larger datasets (500+ rows) or force CPU training on Mac.
 import pytest
 import sys
 import os
+
+# Skip when the ML stack is absent (2026-07-26). These exercise the DARTS-based training/
+# optimization job path; job_handler gates it on `ML_AVAILABLE = DARTS_AVAILABLE and
+# DEAP_AVAILABLE` and returns {"status": "failed", "error": "ML libraries not available"}.
+# Without darts installed they FAILED rather than skipped, which is the same colour as a real
+# regression -- the reason a standing 25-failure suite stops being read at all. deap alone is
+# installed and the strategy GA (a different feature) is unaffected.
+def _ml_available() -> bool:
+    try:
+        from app.services.job_handler import ML_AVAILABLE
+        return bool(ML_AVAILABLE)
+    except Exception:
+        return False
+
+
+pytestmark = pytest.mark.skipif(
+    not _ml_available(), reason="darts not installed (job_handler.ML_AVAILABLE is False)")
+
 import platform
 import numpy as np
 

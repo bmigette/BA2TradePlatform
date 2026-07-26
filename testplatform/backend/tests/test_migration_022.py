@@ -5,7 +5,23 @@ Builds a legacy `strategies` table containing a few `rm_*` columns alongside the
 kept columns + one row, loads `db_migrate/022_drop_strategy_rm_columns.py` via
 importlib, runs its migration against an open sqlite3 connection (the real runner
 contract: `upgrade(cursor, conn)`), then asserts NO column starts with `rm_` and
-the kept row (name, initial_tp_percent, id) survives.
+the kept row (name, id) survives.
+
+UPDATED 2026-07-26. This test caught a REAL breakage and was being written off as noise.
+022 rebuilds `strategies` from a hardcoded DDL, and that DDL was later "kept in sync with
+the model" when 026 replaced `initial_tp_*`/`initial_sl_*` with `entry_actions`. Syncing a
+HISTORICAL migration forward broke it: a database that has not yet run 022 still carries the
+dead columns, 022 tried to copy them into a table that no longer declares them, and the whole
+chain died with `no column named initial_tp_percent`. Replaying migrations on any old
+database — restoring a backup, cloning an old snapshot — failed hard.
+
+022 now copies only columns present in BOTH the source table and the rebuilt DDL. Safe
+specifically because 026 DROPS the tp/sl columns rather than converting their values, so
+discarding them one migration earlier changes the intermediate state but not the end state.
+
+Consequently the assertions below no longer expect `initial_tp_percent` to survive 022 — it
+is dropped there now instead of at 026. What must still hold is that the row, its id and the
+columns the CURRENT model keeps all survive.
 """
 
 import importlib.util
@@ -32,6 +48,18 @@ def _load_migration():
     spec = importlib.util.spec_from_file_location(
         "migration_022", MIGRATION_PATH
     )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+MIGRATION_028_PATH = (
+    Path(__file__).resolve().parent.parent / "db_migrate" / "028_unified_trade_rules.py"
+)
+
+
+def _load_migration_028():
+    spec = importlib.util.spec_from_file_location("migration_028", MIGRATION_028_PATH)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -118,18 +146,19 @@ def test_migration_drops_all_rm_columns_and_keeps_data():
         assert not any(c.startswith("rm_") for c in after), after
         # Kept columns survive.
         assert "name" in after
-        assert "initial_tp_percent" in after
         assert "id" in after
+        # Dropped here now rather than at 026 (see module docstring) — 026 discards the value
+        # either way, so the end state is unchanged.
+        assert "initial_tp_percent" not in after
+        # ...and the column 026 introduces is present, because 022's DDL is the post-026 shape.
+        assert "entry_actions" in after
 
-        # The kept row (and its id/name/tp) survived.
-        cursor.execute(
-            "SELECT id, name, initial_tp_percent FROM strategies"
-        )
+        # The kept row (and its id/name) survived the rebuild.
+        cursor.execute("SELECT id, name FROM strategies")
         rows = cursor.fetchall()
         assert len(rows) == 1
         assert rows[0][0] == 1
         assert rows[0][1] == "Legacy Strat"
-        assert rows[0][2] == 7.5
     finally:
         conn.close()
 
@@ -165,10 +194,8 @@ def test_migration_preserves_pk_and_autoincrement():
         assert existing_max == 1
 
         # Insert a row WITHOUT specifying id -> must get a working autoincrement.
-        cursor.execute(
-            "INSERT INTO strategies (name, initial_tp_percent) VALUES (?, ?)",
-            ("Brand New", 3.0),
-        )
+        # Only `name` — 022 no longer carries initial_tp_percent through the rebuild.
+        cursor.execute("INSERT INTO strategies (name) VALUES (?)", ("Brand New",))
         conn.commit()
         new_id = cursor.lastrowid
         assert new_id is not None
@@ -176,9 +203,7 @@ def test_migration_preserves_pk_and_autoincrement():
 
         # name NOT NULL constraint survived the rebuild.
         try:
-            cursor.execute(
-                "INSERT INTO strategies (initial_tp_percent) VALUES (?)", (1.0,)
-            )
+            cursor.execute("INSERT INTO strategies (description) VALUES (?)", ("no name",))
             inserted_null_name = True
         except sqlite3.IntegrityError:
             inserted_null_name = False
@@ -214,6 +239,11 @@ def test_migration_preserves_pk_via_orm_insert():
         migration.upgrade(cursor, raw)
         migration_026 = _load_migration_026()
         migration_026.upgrade(cursor, raw)
+        # ...and 028, which replaced `entry_actions` with `entry_rules`/`exit_rules`. The
+        # chain must run to the CURRENT head or the ORM below cannot map the table -- the
+        # same "hardcoded DDL drifts behind the model" trap that broke 022 itself.
+        migration_028 = _load_migration_028()
+        migration_028.upgrade(cursor, raw)
         raw.commit()
     finally:
         raw.close()
@@ -221,7 +251,8 @@ def test_migration_preserves_pk_via_orm_insert():
     SessionLocal = sessionmaker(bind=engine)
     session = SessionLocal()
     try:
-        strat = Strategy(name="ORM Strat", entry_actions=[{"id": "e_sl", "action_type": "adjust_stop_loss"}])
+        strat = Strategy(name="ORM Strat",
+                         entry_rules=[{"id": "e_sl", "actions": [{"action_type": "adjust_stop_loss"}]}])
         assert strat.id is None
         session.add(strat)
         session.commit()

@@ -427,7 +427,11 @@ class TestRunChronosInferenceWithMock:
 class TestGetPipeline:
     """Tests for get_pipeline function."""
 
+    @pytest.mark.skipif(not CHRONOS_AVAILABLE, reason="chronos-forecasting not installed")
     def test_invalid_model_raises(self):
+        # Guarded like its neighbours (2026-07-26): without the library get_pipeline raises
+        # RuntimeError("chronos-forecasting is not installed") BEFORE it can reach the
+        # unknown-model ValueError, so the test failed instead of skipping.
         from app.services.chronos_service import get_pipeline
         with pytest.raises(ValueError, match="Unknown Chronos model"):
             get_pipeline('nonexistent-model')

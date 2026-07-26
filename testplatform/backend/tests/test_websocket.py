@@ -16,6 +16,21 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.main import app
 from app.api.websocket import ConnectionManager, manager
 
+# Run the async tests under anyio's pytest plugin (2026-07-26).
+#
+# These 9 tests had been FAILING, not skipping, with "async def functions are not natively
+# supported" -- pytest-asyncio is not installed. anyio IS (it ships with the FastAPI stack),
+# and its pytest plugin runs the same coroutines, so the tests can actually execute rather
+# than merely stop being red. Pinned to the asyncio backend because that is what the app
+# runs on; without the fixture anyio would also parametrise every test over trio, which is
+# not installed.
+pytestmark = pytest.mark.anyio
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
 
 class TestConnectionManager:
     """Tests for the ConnectionManager class."""

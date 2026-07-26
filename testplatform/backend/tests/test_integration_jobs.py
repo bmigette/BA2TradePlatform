@@ -550,6 +550,12 @@ class TestIntegrationJobs:
 
     def test_generate_report(self, dataset_with_targets):
         """Generate test report."""
+        # This summarises results the tsai/darts tests above populate; when those SKIP for a
+        # missing library self.results is empty and the summary asserts on nothing, so it
+        # failed while its inputs were skipped. Skip it on the same condition (2026-07-26).
+        _buckets = ("classification", "classification_h1", "classification_h3", "regression")
+        if not any(self.results.get(k) for k in _buckets):
+            pytest.skip("no model results to report (tsai/darts not installed)")
         df, target_cols = dataset_with_targets
         
         # Summary

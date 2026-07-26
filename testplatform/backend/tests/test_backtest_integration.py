@@ -13,6 +13,24 @@ from unittest.mock import MagicMock
 from dataclasses import dataclass
 from typing import Optional, Dict, Any
 
+
+def _tsai_available() -> bool:
+    """The backtests below load a trained tsai model to generate signals."""
+    try:
+        import tsai  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+# Skip when tsai is absent (2026-07-26). Without it backtest_handler logs "Failed to load
+# model: tsai library not available", the run produces no signals, and the assertions land as
+# `assert 0 > 0` / an empty equity curve -- indistinguishable at a glance from a real
+# backtest-engine regression. These two are the only tests in the file that need a model;
+# the other five exercise pure logic and keep running.
+_needs_tsai = pytest.mark.skipif(not _tsai_available(), reason="tsai not installed")
+
+
 # Test fixtures paths
 TEST_DATA_DIR = Path(__file__).parent / "data"
 TEST_MODEL_PATH = TEST_DATA_DIR / "models" / "xception_test_model.pt"
@@ -102,6 +120,7 @@ class TestBacktestIntegration:
         not TEST_MODEL_PATH.exists() or not TEST_DATASET_PATH.exists(),
         reason="Test fixtures not available"
     )
+    @_needs_tsai
     def test_backtest_opens_trades_with_class_conditions(
         self, test_model, test_dataset, buy_conditions, sell_conditions
     ):
@@ -233,6 +252,7 @@ class TestBacktestIntegration:
         not TEST_MODEL_PATH.exists() or not TEST_DATASET_PATH.exists(),
         reason="Test fixtures not available"
     )
+    @_needs_tsai
     def test_backtest_equity_curve(
         self, test_model, test_dataset, buy_conditions
     ):

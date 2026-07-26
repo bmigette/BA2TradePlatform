@@ -108,6 +108,15 @@ def handle_news_batch_fetch(task_id: str, payload: Dict[str, Any]) -> Dict[str, 
 
             analyzed_count = 0
             if articles:
+                # Only send articles that DON'T already carry sentiment (2026-07-26).
+                # Sentiment analysis is an LLM call per article, so re-analysing an article
+                # that already has a verdict costs money and time for an identical answer.
+                # This was the documented intent -- test_already_analyzed_articles_skip_sentiment
+                # asserted it -- but the handler analysed the whole batch unconditionally, so
+                # the test had been failing since it was written.
+                pending = [a for a in articles if not a.get("sentiment")]
+                already = [a for a in articles if a.get("sentiment")]
+
                 def on_sentiment_progress(done, article_total):
                     pct = base_progress + per_symbol * (0.85 + 0.12 * done / max(article_total, 1))
                     task_queue.update_progress(
@@ -115,9 +124,12 @@ def handle_news_batch_fetch(task_id: str, payload: Dict[str, Any]) -> Dict[str, 
                         f"[{i+1}/{total}] {symbol}: Sentiment {done}/{article_total}"
                     )
 
-                analyzed = sentiment_service.analyze_news_articles(
-                    articles, progress_callback=on_sentiment_progress
-                )
+                # Skip the service call entirely when nothing needs analysing.
+                newly = (sentiment_service.analyze_news_articles(
+                    pending, progress_callback=on_sentiment_progress) if pending else [])
+                # Cache/report ALL of them: the already-analysed ones were still refetched
+                # and their cache rows should be refreshed alongside the new ones.
+                analyzed = list(already) + list(newly)
                 analyzed_count = len(analyzed)
 
                 # Save/update all articles in cache (upserts by URL)

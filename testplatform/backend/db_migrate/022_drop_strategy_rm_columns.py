@@ -53,6 +53,25 @@ STRATEGIES_INDEXES = [
 ]
 
 
+def _ddl_column_names(ddl: str):
+    """Column names declared in a CREATE TABLE statement.
+
+    Parsed from the DDL rather than hardcoded a second time, so the copy list cannot drift
+    from the table actually being created."""
+    import re
+    body = ddl[ddl.index("(") + 1: ddl.rindex(")")]
+    names = []
+    for line in body.split(","):
+        line = line.strip()
+        if not line:
+            continue
+        first = line.split()[0]
+        if first.upper() in ("PRIMARY", "FOREIGN", "UNIQUE", "CHECK", "CONSTRAINT"):
+            continue
+        names.append(first)
+    return names
+
+
 def get_table_columns(cursor, table_name):
     cursor.execute(f"PRAGMA table_info({table_name})")
     return [col[1] for col in cursor.fetchall()]
@@ -81,9 +100,32 @@ def upgrade(cursor, conn):
         print("  - no rm_* columns on strategies; nothing to migrate")
         return False
 
-    kept = [c for c in columns if not c.startswith("rm_")]
+    # Copy only columns present in BOTH the source table AND the rebuilt DDL (fixed
+    # 2026-07-26). This used to keep every non-rm_ source column and INSERT them all, which
+    # breaks the moment the source has a column the DDL lacks:
+    #
+    #     sqlite3.OperationalError: table strategies_new has no column named initial_tp_percent
+    #
+    # That is not hypothetical -- it is the state of every pre-022 database. STRATEGIES_DDL is
+    # a hardcoded snapshot, and the comment above it instructs keeping it "in sync with the
+    # model". It duly WAS synced forward when 026 replaced initial_tp_*/initial_sl_* with
+    # entry_actions -- which silently broke 022 as a HISTORICAL migration, because a DB that
+    # has not yet run 022 still carries those dead columns. Result: replaying the chain on an
+    # old database (restoring a backup, cloning an old snapshot) failed hard at 022.
+    #
+    # Intersecting is safe here specifically because 026 DROPS initial_tp_*/initial_sl_*
+    # outright rather than converting their values, so discarding them one migration earlier
+    # loses nothing that would otherwise have survived. Anything dropped is printed rather
+    # than silently swallowed.
+    ddl_columns = set(_ddl_column_names(STRATEGIES_DDL))
+    kept = [c for c in columns if not c.startswith("rm_") and c in ddl_columns]
+    dropped_not_in_ddl = [c for c in columns
+                          if not c.startswith("rm_") and c not in ddl_columns]
     kept_csv = ", ".join(kept)
     print(f"  - dropping {len(rm_columns)} rm_* columns from strategies")
+    if dropped_not_in_ddl:
+        print(f"  - also dropping {len(dropped_not_in_ddl)} column(s) absent from the rebuilt "
+              f"schema (removed by a later migration): {', '.join(dropped_not_in_ddl)}")
 
     # SQLite-safe, schema-preserving table rebuild:
     #   1. create strategies_new with the real ORM schema (PK/AUTOINCREMENT etc.)
