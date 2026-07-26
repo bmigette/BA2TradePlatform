@@ -1,0 +1,326 @@
+{
+  "expert": "FMPSenateTraderWeight",
+  "live_instance_id": 28,
+  "entry_rules": [
+    {
+      "id": "live-0",
+      "name": "enter-buy-14",
+      "conditions": {
+        "id": "grp-0",
+        "operator": "AND",
+        "type": "AND",
+        "conditions": [
+          {
+            "id": "c0",
+            "field": "bullish",
+            "fieldType": "flag",
+            "field_type": "flag",
+            "comparison": "is_true",
+            "op": "is_true",
+            "optimizeEnabled": false,
+            "optimize": false
+          },
+          {
+            "id": "c1",
+            "field": "has_no_position",
+            "fieldType": "flag",
+            "field_type": "flag",
+            "comparison": "is_true",
+            "op": "is_true",
+            "optimizeEnabled": false,
+            "optimize": false
+          },
+          {
+            "id": "c2",
+            "field": "expected_profit_target_percent",
+            "fieldType": "numeric",
+            "field_type": "numeric",
+            "comparison": ">",
+            "op": ">",
+            "optimizeEnabled": true,
+            "optimize": true,
+            "value": 3.0,
+            "valueMin": 1.5,
+            "value_min": 1.5,
+            "valueMax": 4.5,
+            "value_max": 4.5,
+            "valueStep": 0.6,
+            "value_step": 0.6
+          }
+        ]
+      },
+      "actions": [
+        {
+          "action": "buy",
+          "action_type": "buy"
+        }
+      ],
+      "continueProcessing": false,
+      "continue_processing": false,
+      "toggleOptimize": true,
+      "toggle_optimize": true
+    }
+  ],
+  "exit_rules": [
+    {
+      "id": "live-0",
+      "name": "goal6-senate_S3top3-open_positions-0",
+      "conditions": {
+        "id": "grp-0",
+        "operator": "AND",
+        "type": "AND",
+        "conditions": [
+          {
+            "id": "c0",
+            "field": "profit_loss_percent",
+            "fieldType": "numeric",
+            "field_type": "numeric",
+            "comparison": ">",
+            "op": ">",
+            "optimizeEnabled": true,
+            "optimize": true,
+            "value": 16.0,
+            "valueMin": 8.0,
+            "value_min": 8.0,
+            "valueMax": 24.0,
+            "value_max": 24.0,
+            "valueStep": 3.2,
+            "value_step": 3.2
+          }
+        ]
+      },
+      "actions": [
+        {
+          "action": "adjust_stop_loss",
+          "action_type": "adjust_stop_loss",
+          "referenceValue": "order_open_price",
+          "reference_value": "order_open_price",
+          "actionValue": 10.0,
+          "action_value": 10.0,
+          "value": 10.0,
+          "actionValueOptimize": true,
+          "action_value_optimize": true,
+          "actionValueMin": 5.0,
+          "action_value_min": 5.0,
+          "actionValueMax": 15.0,
+          "action_value_max": 15.0,
+          "actionValueStep": 2.0,
+          "action_value_step": 2.0
+        }
+      ],
+      "continueProcessing": false,
+      "continue_processing": false,
+      "toggleOptimize": true,
+      "toggle_optimize": true
+    },
+    {
+      "id": "live-1",
+      "name": "goal6-senate_S3top3-open_positions-1",
+      "conditions": {
+        "id": "grp-1",
+        "operator": "AND",
+        "type": "AND",
+        "conditions": [
+          {
+            "id": "c0",
+            "field": "profit_loss_percent",
+            "fieldType": "numeric",
+            "field_type": "numeric",
+            "comparison": ">",
+            "op": ">",
+            "optimizeEnabled": true,
+            "optimize": true,
+            "value": 6.0,
+            "valueMin": 3.0,
+            "value_min": 3.0,
+            "valueMax": 9.0,
+            "value_max": 9.0,
+            "valueStep": 1.2,
+            "value_step": 1.2
+          }
+        ]
+      },
+      "actions": [
+        {
+          "action": "adjust_stop_loss",
+          "action_type": "adjust_stop_loss",
+          "referenceValue": "order_open_price",
+          "reference_value": "order_open_price",
+          "actionValue": 6.0,
+          "action_value": 6.0,
+          "value": 6.0,
+          "actionValueOptimize": true,
+          "action_value_optimize": true,
+          "actionValueMin": 3.0,
+          "action_value_min": 3.0,
+          "actionValueMax": 9.0,
+          "action_value_max": 9.0,
+          "actionValueStep": 1.2,
+          "action_value_step": 1.2
+        }
+      ],
+      "continueProcessing": false,
+      "continue_processing": false,
+      "toggleOptimize": true,
+      "toggle_optimize": true
+    },
+    {
+      "id": "live-2",
+      "name": "goal6-senate_S3top3-open_positions-2",
+      "conditions": {
+        "id": "grp-2",
+        "operator": "AND",
+        "type": "AND",
+        "conditions": [
+          {
+            "id": "c0",
+            "field": "has_position",
+            "fieldType": "flag",
+            "field_type": "flag",
+            "comparison": "is_true",
+            "op": "is_true",
+            "optimizeEnabled": false,
+            "optimize": false
+          }
+        ]
+      },
+      "actions": [
+        {
+          "action": "adjust_stop_loss",
+          "action_type": "adjust_stop_loss",
+          "referenceValue": "order_open_price",
+          "reference_value": "order_open_price",
+          "actionValue": -10.0,
+          "action_value": -10.0,
+          "value": -10.0,
+          "actionValueOptimize": true,
+          "action_value_optimize": true,
+          "actionValueMin": -15.0,
+          "action_value_min": -15.0,
+          "actionValueMax": -5.0,
+          "action_value_max": -5.0,
+          "actionValueStep": 2.0,
+          "action_value_step": 2.0
+        }
+      ],
+      "continueProcessing": false,
+      "continue_processing": false,
+      "toggleOptimize": true,
+      "toggle_optimize": true
+    }
+  ],
+  "buy_entry_conditions": {
+    "id": "grp-88",
+    "operator": "AND",
+    "conditions": [
+      {
+        "id": "c0",
+        "field": "bullish",
+        "field_type": "flag"
+      },
+      {
+        "id": "c1",
+        "field": "has_no_position",
+        "field_type": "flag"
+      },
+      {
+        "id": "c2",
+        "field": "expected_profit_target_percent",
+        "field_type": "numeric",
+        "comparison": ">",
+        "value": 3.0,
+        "optimize": true,
+        "optimize_enabled": true,
+        "value_min": 1.5,
+        "value_max": 4.5,
+        "value_step": 0.6
+      }
+    ]
+  },
+  "sell_entry_conditions": null,
+  "exit_conditions": [
+    {
+      "id": "live-89",
+      "name": "goal6-senate_S3top3-open_positions-0",
+      "conditions": {
+        "id": "grp-89",
+        "operator": "AND",
+        "conditions": [
+          {
+            "id": "c0",
+            "field": "profit_loss_percent",
+            "field_type": "numeric",
+            "comparison": ">",
+            "value": 16.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 8.0,
+            "value_max": 24.0,
+            "value_step": 3.2
+          }
+        ]
+      },
+      "action": "adjust_stop_loss",
+      "toggle_optimize": true,
+      "reference_value": "order_open_price",
+      "action_value": 10.0,
+      "action_value_optimize": true,
+      "action_value_min": 5.0,
+      "action_value_max": 15.0,
+      "action_value_step": 2.0
+    },
+    {
+      "id": "live-90",
+      "name": "goal6-senate_S3top3-open_positions-1",
+      "conditions": {
+        "id": "grp-90",
+        "operator": "AND",
+        "conditions": [
+          {
+            "id": "c0",
+            "field": "profit_loss_percent",
+            "field_type": "numeric",
+            "comparison": ">",
+            "value": 6.0,
+            "optimize": true,
+            "optimize_enabled": true,
+            "value_min": 3.0,
+            "value_max": 9.0,
+            "value_step": 1.2
+          }
+        ]
+      },
+      "action": "adjust_stop_loss",
+      "toggle_optimize": true,
+      "reference_value": "order_open_price",
+      "action_value": 6.0,
+      "action_value_optimize": true,
+      "action_value_min": 3.0,
+      "action_value_max": 9.0,
+      "action_value_step": 1.2
+    },
+    {
+      "id": "live-91",
+      "name": "goal6-senate_S3top3-open_positions-2",
+      "conditions": {
+        "id": "grp-91",
+        "operator": "AND",
+        "conditions": [
+          {
+            "id": "c0",
+            "field": "has_position",
+            "field_type": "flag"
+          }
+        ]
+      },
+      "action": "adjust_stop_loss",
+      "toggle_optimize": true,
+      "reference_value": "order_open_price",
+      "action_value": -10.0,
+      "action_value_optimize": true,
+      "action_value_min": -15.0,
+      "action_value_max": -5.0,
+      "action_value_step": 2.0
+    }
+  ]
+}
