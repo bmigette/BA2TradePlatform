@@ -338,6 +338,17 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                 "required": True,
                 "description": "Slippage in basis points applied to market/stop fills (worsening)",
             },
+            "assume_stop_fills_at_price": {
+                "type": "bool",
+                "required": False,
+                "description": "When True, a triggered STOP is assumed to fill at exactly its "
+                               "stop price even if the bar GAPPED through it. Only true for a "
+                               "stop-LIMIT; a plain stop is a market order and fills at the "
+                               "open on a gap. Setting this hides gap risk -- losses on "
+                               "overnight/earnings gaps are understated. Default False "
+                               "(accurate). LIMIT orders are unaffected: they always fill at "
+                               "their price or better, gap or not.",
+            },
             "option_spread_pct": {
                 "type": "float",
                 "required": False,
@@ -3113,6 +3124,52 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         frac = float(self._cfg.get("spread_bps", 0.0)) / 10_000.0 / 2.0
         return limit_price * (1.0 + frac) if is_sell else limit_price * (1.0 - frac)
 
+    def _gap_stop_fill(self, stop: float, bar: Dict[str, float], is_sell: bool) -> float:
+        """Stop fill price, accounting for a bar that GAPPED THROUGH the stop (2026-07-26).
+
+        A stop becomes a MARKET order the moment it is touched, so if the bar OPENED already
+        beyond the stop the fill happens at that open, not at the stop. Before this, the engine
+        only tested ``bar.low <= stop`` and filled at ``stop`` — which silently assumed you
+        always got your stop price no matter how far the market gapped past it, understating
+        losses precisely where real stops fail worst (overnight/earnings gaps).
+
+        Returns the WORSE of stop/open for the closing side: a SELL stop (closing a long) fills
+        at the lower of the two, a BUY stop (closing a short) at the higher. A bar with no open
+        falls back to the stop (previous behaviour).
+        """
+        # CONFIGURABLE, because it encodes a real disagreement about execution.
+        #
+        # A plain stop becomes a MARKET order when touched, so a gap through it fills at the
+        # open -- that is what stops DO, and it is why SELL_STOP_LIMIT exists (it floors the
+        # price, at the risk of not filling at all). Modelling it is the accurate default.
+        #
+        # ``assume_stop_fills_at_price`` = True instead assumes the stop price is always
+        # obtained. That is only true for a stop-LIMIT, and it makes gap risk invisible --
+        # which matters most on low-priced/volatile names where overnight gaps are routine.
+        # Kept as an explicit, named setting rather than a silent behaviour so the assumption
+        # shows up in the run config instead of being buried in the engine.
+        if self._cfg.get("assume_stop_fills_at_price"):
+            return stop
+        o = bar.get("open")
+        if o is None:
+            return stop
+        o = float(o)
+        return min(stop, o) if is_sell else max(stop, o)
+
+    def _gap_limit_fill(self, limit: float, bar: Dict[str, float], is_sell: bool) -> float:
+        """Limit fill price, accounting for a favourable gap (2026-07-26).
+
+        A limit order fills at its price OR BETTER, so a bar that OPENED beyond the limit fills
+        at that open. The mirror of _gap_stop_fill and deliberately shipped WITH it: modelling
+        only the adverse gap would bias results pessimistic, just as modelling neither biased
+        stops optimistic. Returns the BETTER of limit/open for the closing side.
+        """
+        o = bar.get("open")
+        if o is None:
+            return limit
+        o = float(o)
+        return max(limit, o) if is_sell else min(limit, o)
+
     def _trigger_thresholds(self, order) -> tuple:
         """The (trig_hi, trig_lo) PLAIN-float price thresholds for a working equity order.
 
@@ -3184,8 +3241,10 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                                  worsened by slippage.
           * BUY_LIMIT         -> fills at the limit iff bar.low  <= limit (price traded down to it).
           * SELL_LIMIT        -> fills at the limit iff bar.high >= limit (price traded up to it).
-          * BUY_STOP          -> triggers iff bar.high >= stop; fills at stop +slippage.
-          * SELL_STOP         -> triggers iff bar.low  <= stop; fills at stop -slippage.
+          * BUY_STOP          -> triggers iff bar.high >= stop; fills at stop +slippage, or at
+                                 the bar OPEN when the bar gapped above the stop.
+          * SELL_STOP         -> triggers iff bar.low  <= stop; fills at stop -slippage, or at
+                                 the bar OPEN when the bar gapped below the stop.
           * OCO (TP+SL leg)   -> evaluate TP (limit) and SL (stop) sides; fill the side the
                                  bar crosses (SL preferred when the bar straddles both, the
                                  conservative assumption that the stop hit first).
@@ -3201,15 +3260,19 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
 
         if ot == OrderType.BUY_LIMIT:
             trig = self._limit_trigger_price(float(order.limit_price), is_sell=False)
-            return order.limit_price if bar["low"] <= trig else None
+            return (self._gap_limit_fill(float(order.limit_price), bar, is_sell=False)
+                    if bar["low"] <= trig else None)
         if ot == OrderType.SELL_LIMIT:
             trig = self._limit_trigger_price(float(order.limit_price), is_sell=True)
-            return order.limit_price if bar["high"] >= trig else None
+            return (self._gap_limit_fill(float(order.limit_price), bar, is_sell=True)
+                    if bar["high"] >= trig else None)
 
         if ot == OrderType.BUY_STOP:
-            return self._slip(order.stop_price, True) if bar["high"] >= order.stop_price else None
+            return (self._slip(self._gap_stop_fill(float(order.stop_price), bar, is_sell=False), True)
+                    if bar["high"] >= order.stop_price else None)
         if ot == OrderType.SELL_STOP:
-            return self._slip(order.stop_price, False) if bar["low"] <= order.stop_price else None
+            return (self._slip(self._gap_stop_fill(float(order.stop_price), bar, is_sell=True), False)
+                    if bar["low"] <= order.stop_price else None)
 
         if ot == OrderType.OCO:
             return self._evaluate_oco_fill(order, bar)
@@ -3236,18 +3299,20 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             tp_trig = self._limit_trigger_price(float(tp), is_sell=True) if tp is not None else None
             tp_hit = tp_trig is not None and bar["high"] >= tp_trig
             if sl_hit:
-                return self._slip(sl, False)   # SELL_STOP fills at stop -slippage(-spread/2)
+                # stop -slippage, or the OPEN when the bar gapped below it (see _gap_stop_fill)
+                return self._slip(self._gap_stop_fill(float(sl), bar, is_sell=True), False)
             if tp_hit:
-                return tp                       # SELL_LIMIT fills at limit (trigger was widened)
+                # limit, or the OPEN when the bar gapped above it (trigger was widened)
+                return self._gap_limit_fill(float(tp), bar, is_sell=True)
             return None
         else:
             sl_hit = sl is not None and bar["high"] >= sl
             tp_trig = self._limit_trigger_price(float(tp), is_sell=False) if tp is not None else None
             tp_hit = tp_trig is not None and bar["low"] <= tp_trig
             if sl_hit:
-                return self._slip(sl, True)    # BUY_STOP fills at stop +slippage(+spread/2)
+                return self._slip(self._gap_stop_fill(float(sl), bar, is_sell=False), True)
             if tp_hit:
-                return tp                       # BUY_LIMIT fills at limit (trigger was widened)
+                return self._gap_limit_fill(float(tp), bar, is_sell=False)
             return None
 
     def _apply_fill(self, order, fill_px: float, as_of: datetime) -> None:
