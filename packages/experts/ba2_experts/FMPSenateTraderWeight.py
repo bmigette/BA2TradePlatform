@@ -12,6 +12,7 @@ API Documentation: https://site.financialmodelingprep.com/developer/docs#senate-
 """
 
 from typing import Any, Dict, Optional, List, Tuple, Union
+from collections import OrderedDict
 from datetime import datetime, timezone, timedelta
 from functools import lru_cache
 import bisect
@@ -53,7 +54,45 @@ from ba2_experts.expert_mixins import AnalysisStatusRenderMixin, FMPCongressTrad
 # exactly the 11-12GB/worker footprint observed. Loading once per worker (this fix) also
 # lets newly-computed scores actually get reused across trials within a generation, instead
 # of being silently recomputed and discarded every time.
-_WORKER_SCORING_CACHE: Dict[str, Dict[str, Any]] = {}
+#
+# 2026-07-27 SHARDING. The above fixed the per-TRIAL reload but not the per-PROCESS size, and
+# the cache kept growing: measured on remote150 during Senate S4, skill had reached 3,406,775
+# entries (452MB JSON -> 2.22GB in RAM) and confidence 1,778,046 (657MB -> 2.95GB) = 5.17GB
+# per process, so ~20.7GB across four pool children -- four identical copies of the same
+# read-only table. The box hit 99.2% memory, trials swapped, and six of them blew past the
+# master's 1800s budget.
+#
+# Both key formats end in their SETTINGS, and one GA trial uses exactly ONE combination:
+#     skill       "<trader>|<n>|<as_of>|<horizon>|<min_past>|<max_past>|<lookback>"
+#     confidence  "<trader>|<n>|<SYM>|<side>|<as_of>|<max_exec_days>|<focus_cap_pct>"
+# Measured on the real files: 6 distinct suffixes each (skill splits evenly at ~567,798;
+# confidence unevenly: 655,130 / 604,424 / 300,002 / 141,925 / 76,275 / 300). So a trial only
+# ever reads ONE shard -- ~1.46GB worst case instead of 5.17GB -- and it stays a PLAIN DICT, so
+# lookups keep O(1) dict speed. (A columnar mmapped store was built and measured first: 20.19x
+# slower per hit. See test_files/bench_scoring_store.py and commit ecfe14c.)
+#
+# The shard goes in the FILENAME, so _WORKER_SCORING_CACHE (keyed by resolved path) and the
+# delta/compaction machinery below shard themselves with no further changes.
+#
+# Crucially this also BOUNDS memory as the cache grows: previously every new parameter
+# combination the GA explored inflated every process's RSS.
+_WORKER_SCORING_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+
+# A pool child is long-lived and reused across trials with DIFFERENT genomes; without a cap it
+# would re-accumulate every shard and undo the fix. 2 is enough to avoid thrashing when a child
+# alternates between two genomes, while capping the footprint at ~2 shards.
+_WORKER_SCORING_CACHE_MAX = 2
+
+
+def _shard_filename(base_filename: str, suffix: str) -> str:
+    """``("congress_skill_scores.json", "60|5|50|12")`` -> ``congress_skill_scores__60_5_50_12.json``.
+
+    ``|`` is not a legal Windows filename character and ``.`` (from float settings like the
+    confidence cache's ``20.0``) would fake an extension, so both are flattened to ``_``.
+    """
+    stem, ext = os.path.splitext(base_filename)
+    safe = suffix.replace("|", "_").replace(".", "_")
+    return f"{stem}__{safe}{ext}"
 
 
 def clear_worker_scoring_cache() -> None:
@@ -1238,6 +1277,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         path = self._scoring_cache_path(filename)
         cache = _WORKER_SCORING_CACHE.get(path)
         if cache is not None:
+            _WORKER_SCORING_CACHE.move_to_end(path)  # LRU touch
             setattr(self, attr, cache)
             return cache
         try:
@@ -1256,6 +1296,11 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         except Exception:  # noqa: BLE001 — missing/corrupt delta -> ignore, never fatal
             pass
         _WORKER_SCORING_CACHE[path] = cache
+        # Evict least-recently-used shards. Dropping a shard is always SAFE: every entry is a
+        # pure function of its inputs and is already durable on disk (base + delta), so a later
+        # re-load re-reads it rather than recomputing.
+        while len(_WORKER_SCORING_CACHE) > _WORKER_SCORING_CACHE_MAX:
+            _WORKER_SCORING_CACHE.popitem(last=False)
         setattr(self, attr, cache)
         return cache
 
@@ -1360,7 +1405,11 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         trading skill does not meaningfully change day to day, so re-scoring monthly is
         plenty fresh while cutting live's scoring cost ~30x versus a daily refresh.
         """
-        cache = self._load_scoring_cache("_skill_cache", self._SKILL_CACHE_FILE)
+        # Shard by the SETTINGS tail of the key: this trial only ever reads its own combination,
+        # so loading the other ~5 shards would cost ~2.2GB of RSS for entries it cannot hit.
+        suffix = f"{horizon_days}|{min_past_trades}|{max_past_trades}|{lookback_months}"
+        shard = _shard_filename(self._SKILL_CACHE_FILE, suffix)
+        cache = self._load_scoring_cache("_skill_cache", shard)
         n = len(trader_history)
         as_of_bucket = now.strftime("%Y-%m") if is_live else now.date().isoformat()
         key = (f"{trader_name}|{n}|{as_of_bucket}|{horizon_days}|{min_past_trades}"
@@ -1374,7 +1423,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             min_past_trades=min_past_trades, max_past_trades=max_past_trades,
             lookback_months=lookback_months, _sorted_candidates=sorted_candidates)
         cache[key] = result
-        self._save_scoring_cache_throttled("_skill_cache", self._SKILL_CACHE_FILE, key, is_live)
+        self._save_scoring_cache_throttled("_skill_cache", shard, key, is_live)
         return result
 
     def _get_trader_confidence_cached(self, trader_name: str, trader_history: List[Dict[str, Any]],
@@ -1392,7 +1441,11 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         (the symbol-specific subtotal) and ``current_trade_type`` (buy vs sell side), and
         like skill it depends on ``now`` even at fixed history (the recent/yearly windows
         slide). Same day/month bucketing split as skill (see _get_trader_skill_cached)."""
-        cache = self._load_scoring_cache("_confidence_cache", self._CONFIDENCE_CACHE_FILE)
+        # Same settings-tail sharding as skill (see _get_trader_skill_cached). Confidence is the
+        # bigger win in absolute terms: 2.95GB whole vs ~1.09GB for its largest shard.
+        suffix = f"{max_exec_days}|{symbol_focus_cap_pct}"
+        shard = _shard_filename(self._CONFIDENCE_CACHE_FILE, suffix)
+        cache = self._load_scoring_cache("_confidence_cache", shard)
         n = len(trader_history)
         as_of_bucket = now.strftime("%Y-%m") if is_live else now.date().isoformat()
         key = (f"{trader_name}|{n}|{current_symbol.upper()}|{current_trade_type}|{as_of_bucket}"
@@ -1406,8 +1459,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             max_exec_days, now=now, symbol_focus_cap_pct=symbol_focus_cap_pct,
             _index=index)
         cache[key] = result
-        self._save_scoring_cache_throttled(
-            "_confidence_cache", self._CONFIDENCE_CACHE_FILE, key, is_live)
+        self._save_scoring_cache_throttled("_confidence_cache", shard, key, is_live)
         return result
 
     def _price_on_or_after(self, symbol: str, date: datetime, max_walk_days: int = 5) -> Optional[float]:
