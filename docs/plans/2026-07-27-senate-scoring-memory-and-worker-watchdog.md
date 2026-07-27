@@ -67,7 +67,45 @@ against S2/S3's ~4.8h.
 
 ---
 
-## Phase A — Columnar, shareable scoring store
+## REVISION 2026-07-27 — Phase A shipped as SHARDING, not a columnar store
+
+**Phase A as written below was built, measured, and rejected by its own A3 gate.** Kept for the
+reasoning; what shipped is different and simpler.
+
+`ScoringStore` (columnar + mmapped) works — 14 tests green, exact float round-trip, None vs nan,
+forced-collision resolution. But A3 measured **20.19× slower per hit** (0.914 → 18.458 µs over
+1M random hits at 250k entries). The cost is not the dict rebuild; it is Python↔numpy boundary
+crossings — two `searchsorted`, a `bytes()` on a memmap slice, and one scalar extraction per
+field, *per lookup*. On the hot per-trade path that trades a memory win for a CPU loss on a
+CPU-bound GA. Committed at `ecfe14c` and superseded.
+
+Measuring the real key space showed a better shape. Both caches carry their settings in the key
+suffix, and a trial uses exactly **one** combination — 6 distinct suffixes in each file:
+
+| | entries | suffixes | per-shard |
+|---|---|---|---|
+| skill | 3,406,775 | 6 (even, ~567,798) | ~370 MB |
+| confidence | 1,778,046 | 6 (655,130 / 604,424 / 300,002 / 141,925 / 76,275 / 300) | ~1.09 GB worst |
+| **per process** | | | **~1.46 GB vs 5.17 GB** |
+
+So: **shard by settings suffix, keep a plain dict.** 3.5× less memory, *zero* lookup slowdown.
+Putting the shard in the filename means `_WORKER_SCORING_CACHE` (keyed by resolved path) and the
+delta/compaction machinery shard themselves — the diff is a filename helper, an LRU cap, and 4
+call sites.
+
+It also fixes something the columnar store did not: **memory is now bounded as the cache grows.**
+Previously every new parameter combination the GA explored inflated every process's RSS.
+
+**Shipped:** `ffbf9f5` (sharding + 9 tests; 264 expert / 226 common green),
+`9c96d34` (`tools/shard_scoring_caches.py` migration splitter).
+
+**Remaining before S5:** run the splitter on an idle box (needs ~2.95 GB peak — *not* against a
+live grid), verify with `--verify`, measure per-child RSS, then bump `APP_VERSION`, push, let
+remote150 self-update, and relaunch S5–S7.
+
+---
+
+## Phase A — Columnar, shareable scoring store *(REJECTED — see revision above)*
 
 ### Task A1: `ScoringStore` read path
 
