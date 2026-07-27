@@ -54,39 +54,47 @@ PY=.venv/Scripts/python.exe
 SC="$HOME/Documents/ba2"
 START=2020-01-01
 END=2026-06-30
-GRID_LOG="${1:-}"
+MODE="${1:-all}"          # data | metrics | all
+WAIT_LOG="${2:-}"
 
-if [ -n "$GRID_LOG" ]; then
-  echo "=== waiting for the Senate grid to finish ($GRID_LOG) ..."
-  until grep -q "GRID COMPLETE" "$GRID_LOG" 2>/dev/null; do sleep 300; done
-  echo "=== grid finished $(date); starting 2020 preparation"
+# TWO CHAINS, split by what they actually contend for (2026-07-27):
+#   data    = steps 1+3, NETWORK-bound (FMP). Safe to run alongside the GA -- it barely touches
+#             CPU. Chained behind the 5min backfill instead, because both hit the same FMP
+#             rate-limit budget and running them together just multiplies 429 backoff.
+#   metrics = step 2, CPU+DISK-bound (reads every symbol's 1d bars and computes indicators).
+#             This one WOULD slow the grid, so it waits for GRID COMPLETE.
+if [ -n "$WAIT_LOG" ]; then
+  echo "=== [$MODE] waiting on $WAIT_LOG ..."
+  case "$MODE" in
+    # The 5min backfill prints a final "fetch-cache: N/N symbols" line when every symbol has
+    # been processed. Deterministic and available in git-bash, unlike a pgrep on the cmdline.
+    data)    until grep -qE 'fetch-cache: 2409/2409 symbols' "$WAIT_LOG" 2>/dev/null; do sleep 300; done ;;
+    *)       until grep -q "GRID COMPLETE" "$WAIT_LOG" 2>/dev/null; do sleep 300; done ;;
+  esac
+  echo "=== [$MODE] wait satisfied $(date)"
 fi
 
-echo "=================================================================="
-echo "=== STEP 1/3: 1d OHLCV back to $START   $(date)"
-echo "=== (metric_store reads 1d ONLY; 5min does not feed it)"
-echo "=================================================================="
-"$PY" testplatform/ba2test_launcher.py fetch-cache \
-  --symbols "@$SC/fwdtest_all_symbols.txt" \
-  --timeframes 1d --start "$START" --end "$END" --workers 4
-echo "=== step 1 rc=$? $(date)"
+if [ "$MODE" = "data" ] || [ "$MODE" = "all" ]; then
+  echo "=================================================================="
+  echo "=== STEP 1: 1d OHLCV back to $START   $(date)"
+  echo "=== (metric_store reads 1d ONLY; the 5min backfill does not feed it)"
+  echo "=================================================================="
+  "$PY" testplatform/ba2test_launcher.py fetch-cache     --symbols "@$SC/fwdtest_all_symbols.txt"     --timeframes 1d --start "$START" --end "$END" --workers 3
+  echo "=== step 1 rc=$? $(date)"
 
-echo "=================================================================="
-echo "=== STEP 2/3: extend screener metric_store to $START   $(date)"
-echo "=================================================================="
-"$PY" testplatform/ba2test_launcher.py build-screener-metrics \
-  --store "$SC/common/cache/screener/metric_store" \
-  --start "$START" --end "$END" \
-  --market-cap-min 5e7 \
-  --workers 4
-echo "=== step 2 rc=$? $(date)"
+  echo "=================================================================="
+  echo "=== STEP 3: prewarm all non-option experts   $(date)"
+  echo "=================================================================="
+  "$PY" testplatform/ba2test_launcher.py prewarm     --symbols "@$SC/fwdtest_all_symbols.txt"     --experts FMPRating,FMPEarningsDrift,FMPInsiderClusterBuy,FactorRanker,FMPSenateTraderWeight     --start "$START" --end "$END" --workers 4
+  echo "=== step 3 rc=$? $(date)"
+fi
 
-echo "=================================================================="
-echo "=== STEP 3/3: prewarm all non-option experts   $(date)"
-echo "=================================================================="
-"$PY" testplatform/ba2test_launcher.py prewarm \
-  --symbols "@$SC/fwdtest_all_symbols.txt" \
-  --experts FMPRating,FMPEarningsDrift,FMPInsiderClusterBuy,FactorRanker,FMPSenateTraderWeight \
-  --start "$START" --end "$END" --workers 5
-echo "=== step 3 rc=$? $(date)"
-echo "=== 2020 PREPARATION COMPLETE $(date) ==="
+if [ "$MODE" = "metrics" ] || [ "$MODE" = "all" ]; then
+  echo "=================================================================="
+  echo "=== STEP 2: extend screener metric_store to $START   $(date)"
+  echo "=== (CPU+disk heavy -- deliberately runs only after the grid)"
+  echo "=================================================================="
+  "$PY" testplatform/ba2test_launcher.py build-screener-metrics     --store "$SC/common/cache/screener/metric_store"     --start "$START" --end "$END"     --market-cap-min 5e7     --workers 4
+  echo "=== step 2 rc=$? $(date)"
+fi
+echo "=== [$MODE] COMPLETE $(date) ==="
