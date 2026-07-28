@@ -28,6 +28,9 @@ from .interfaces import MarketExpertInterface
 from .models import ExpertInstance, ExpertSetting, Instrument
 from .WorkerQueue import get_worker_queue, AnalysisTask
 from .types import WorkerTaskStatus
+
+# Scheduler id of the periodic account/order/transaction reconciliation job.
+ACCOUNT_REFRESH_JOB_ID = "account_refresh_job"
 from .types import AnalysisUseCase
 
 
@@ -141,7 +144,14 @@ class JobManager:
         self._control_queue = queue.Queue()
         self._control_thread = None
         self._control_thread_running = False
-        
+
+        # Account-refresh watchdog state. Deliberately a plain thread rather than an
+        # APScheduler job: the failure it guards against is remove_all_jobs() wiping
+        # scheduled jobs, which would take a scheduled watchdog down with it.
+        self._last_account_refresh_completed: Optional[datetime] = None
+        self._watchdog_thread = None
+        self._watchdog_running = False
+
         logger.info("JobManager initialized")
         
     def start(self):
@@ -163,7 +173,10 @@ class JobManager:
         
         # Schedule account refresh job
         self._schedule_account_refresh_job()
-        
+
+        # Watch it for the rest of the process lifetime: losing this job is silent.
+        self._start_account_refresh_watchdog()
+
         logger.info("JobManager started successfully")
         
     def stop(self):
@@ -173,6 +186,9 @@ class JobManager:
             return
 
         logger.info("Stopping JobManager...")
+
+        # Stop the watchdog first so it cannot re-arm jobs during shutdown.
+        self._stop_account_refresh_watchdog()
 
         # Stop all running live experts
         self._stop_all_live_experts()
@@ -266,6 +282,12 @@ class JobManager:
                 self._scheduler.remove_all_jobs()
                 self._scheduled_jobs.clear()
                 self._schedule_all_expert_jobs()
+                # remove_all_jobs() above also deletes the NON-expert jobs, so the
+                # account refresh job must be re-established here. Without this it was
+                # silently dropped on the first "refresh all schedules" and account /
+                # order / transaction reconciliation stopped for 4 days while the
+                # process kept trading (2026-07-23 incident).
+                self._schedule_account_refresh_job()
 
         logger.info("Expert schedules refreshed successfully")
     
@@ -502,6 +524,10 @@ class JobManager:
                 
         # Re-schedule all jobs
         self._schedule_all_expert_jobs()
+        # The removal loop above walks _scheduled_jobs, which also holds the
+        # non-expert "account_refresh_job" -- re-establish it or reconciliation
+        # stops silently (see _refresh_expert_schedules_sync for the same trap).
+        self._schedule_account_refresh_job()
         logger.info("Scheduled jobs refreshed")
         
     def _schedule_all_expert_jobs(self):
@@ -545,7 +571,7 @@ class JobManager:
             trigger = IntervalTrigger(minutes=refresh_interval_minutes)
             
             # Schedule the job
-            job_id = "account_refresh_job"
+            job_id = ACCOUNT_REFRESH_JOB_ID
             job = self._scheduler.add_job(
                 func=self._execute_account_refresh,
                 trigger=trigger,
@@ -602,11 +628,119 @@ class JobManager:
             # Get the trade manager and call refresh_accounts
             trade_manager = get_trade_manager()
             trade_manager.refresh_accounts()
-            
+
+            # Liveness marker for _account_refresh_watchdog_loop.
+            self._last_account_refresh_completed = datetime.now()
+
             logger.info("Scheduled account refresh completed")
-            
+
         except Exception as e:
             logger.error(f"Error executing account refresh: {e}", exc_info=True)
+
+    def _get_account_refresh_interval_minutes(self) -> int:
+        """Configured account refresh interval in minutes (defaults to 5)."""
+        try:
+            raw = get_setting("account_refresh_interval")
+            if raw:
+                return max(1, int(raw))
+        except (TypeError, ValueError):
+            logger.warning(
+                f"Invalid account_refresh_interval setting: {raw!r}; watchdog assuming 5 minutes"
+            )
+        return 5
+
+    def account_refresh_health(self):
+        """Report on account-refresh liveness: (healthy, job_present, seconds_since_last, threshold).
+
+        Split out from the watchdog loop so it is directly unit-testable and can back a
+        UI/API health indicator. ``seconds_since_last`` is None until the first refresh
+        completes in this process.
+        """
+        interval_minutes = self._get_account_refresh_interval_minutes()
+        # Two missed intervals plus a margin: tolerant of one slow/skipped run.
+        threshold_seconds = max(interval_minutes * 60 * 3, 900)
+
+        job_present = False
+        try:
+            job_present = self._scheduler.get_job(ACCOUNT_REFRESH_JOB_ID) is not None
+        except Exception:  # scheduler shut down mid-check
+            job_present = False
+
+        last = self._last_account_refresh_completed
+        seconds_since_last = None if last is None else (datetime.now() - last).total_seconds()
+
+        stale = seconds_since_last is not None and seconds_since_last > threshold_seconds
+        healthy = job_present and not stale
+        return healthy, job_present, seconds_since_last, threshold_seconds
+
+    def _account_refresh_watchdog_loop(self, poll_seconds: int = 60):
+        """Detect and repair a dead account-refresh job.
+
+        The 2026-07-23 incident ran for 4 days because losing this job is completely
+        silent: the process stays up, experts keep trading, and only reconciliation
+        stops. So on detection we log loudly, write an ActivityLog entry, and re-arm
+        the job rather than merely reporting.
+        """
+        while self._watchdog_running:
+            try:
+                healthy, job_present, since, threshold = self.account_refresh_health()
+                if not healthy:
+                    reason = (
+                        "account_refresh_job missing from scheduler" if not job_present
+                        else f"no completed refresh in {since:.0f}s (threshold {threshold}s)"
+                    )
+                    logger.error(
+                        f"ACCOUNT REFRESH WATCHDOG: reconciliation is not running ({reason}). "
+                        f"Re-arming the account refresh job."
+                    )
+                    try:
+                        from .db import log_activity
+                        from .types import ActivityLogSeverity, ActivityLogType
+                        log_activity(
+                            severity=ActivityLogSeverity.FAILURE,
+                            activity_type=ActivityLogType.APPLICATION_STATUS_CHANGE,
+                            description=f"Account refresh watchdog fired: {reason} - re-arming job",
+                            data={
+                                "reason": reason,
+                                "job_present": job_present,
+                                "seconds_since_last_refresh": since,
+                                "threshold_seconds": threshold,
+                            },
+                        )
+                    except Exception as log_error:
+                        logger.warning(f"Watchdog could not write activity log: {log_error}")
+
+                    self._schedule_account_refresh_job()
+                    self.execute_account_refresh_immediately()
+            except Exception as e:
+                logger.error(f"Account refresh watchdog error: {e}", exc_info=True)
+
+            # Sleep in short slices so stop() is responsive.
+            for _ in range(poll_seconds):
+                if not self._watchdog_running:
+                    break
+                time.sleep(1)
+
+    def _start_account_refresh_watchdog(self):
+        """Start the account-refresh watchdog thread (idempotent)."""
+        if self._watchdog_running:
+            logger.debug("Account refresh watchdog already running")
+            return
+        self._watchdog_running = True
+        self._watchdog_thread = threading.Thread(
+            target=self._account_refresh_watchdog_loop,
+            name="AccountRefreshWatchdog",
+            daemon=True,
+        )
+        self._watchdog_thread.start()
+        logger.info("Account refresh watchdog started")
+
+    def _stop_account_refresh_watchdog(self):
+        """Signal the watchdog thread to stop."""
+        if not self._watchdog_running:
+            return
+        self._watchdog_running = False
+        logger.info("Account refresh watchdog stopped")
             
     def _schedule_expert_jobs(self, expert_instance: ExpertInstance):
         """Schedule jobs for a specific expert instance."""
