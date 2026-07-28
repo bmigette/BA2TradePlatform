@@ -602,6 +602,18 @@ def delete_instance(instance, session: Session | None = None):
         except Exception as e:
             logger.error(f"Error deleting instance: {e}", exc_info=True)
             raise
+class InstanceNotFound(LookupError):
+    """A row with that id does not exist.
+
+    A DEDICATED type because "not found" is a legitimate, expected data condition that callers
+    routinely tolerate -- but it used to be signalled with a BARE ``Exception``, which no handler
+    can name. Under deny-by-default error handling (failure_modes.absorb_if_benign) an
+    un-nameable signal forces the call site back to swallowing everything, which is exactly the
+    blindness that let the ATR tz bug survive for months. Subclasses LookupError, and any
+    existing ``except Exception`` keeps catching it, so this is backward compatible.
+    """
+
+
 
 def get_instance(model_class, instance_id, session: Session | None = None):
     """
@@ -622,7 +634,7 @@ def get_instance(model_class, instance_id, session: Session | None = None):
         instance = _ts.store_get(model_class, instance_id)
         if not instance:
             logger.error(f"Instance with id {instance_id}/{model_class} not found.")
-            raise Exception(f"Instance with id {instance_id}/{model_class} not found.")
+            raise InstanceNotFound(f"Instance with id {instance_id}/{model_class} not found.")
         return instance
     start = time.perf_counter()
     try:
@@ -630,14 +642,14 @@ def get_instance(model_class, instance_id, session: Session | None = None):
             instance = session.get(model_class, instance_id)
             if not instance:
                 logger.error(f"Instance with id {instance_id}/{model_class} not found.")
-                raise Exception(f"Instance with id {instance_id}/{model_class} not found.")
+                raise InstanceNotFound(f"Instance with id {instance_id}/{model_class} not found.")
             return instance
         else:
             with Session(get_engine()) as new_session:
                 instance = new_session.get(model_class, instance_id)
                 if not instance:
                     logger.error(f"Instance with id {instance_id}/{model_class} not found.")
-                    raise Exception(f"Instance with id {instance_id}/{model_class} not found.")
+                    raise InstanceNotFound(f"Instance with id {instance_id}/{model_class} not found.")
                 return instance
     except Exception as e:
         logger.error(f"Error retrieving instance: {e}", exc_info=True)

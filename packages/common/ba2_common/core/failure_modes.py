@@ -1,67 +1,116 @@
-"""Tell a DEFECT apart from an expected data-absence, so defects fail loud.
+"""Broad exception handlers fail LOUD by default; only explicitly-named benign errors absorb.
 
 WHY THIS EXISTS (2026-07-28). ``position_sizing.get_latest_atr`` wrapped its indicator call in
 ``except Exception -> logger.warning -> return None``. A tz naive/aware ``TypeError`` — a plain
-code defect — was therefore indistinguishable from "this symbol has no ATR data", which is a
-legitimate, expected outcome the caller handles by falling back to ``min_stop_loss_pct``.
+code defect — was therefore indistinguishable from "this symbol has no ATR data", a legitimate
+outcome the caller handles by falling back to ``min_stop_loss_pct``. ATR was dead for MONTHS,
+``use_atr_stop``/``atr_multiplier``/``atr_period`` were inert GA genes, and nothing in any log
+said so (GA pool workers run at ``logging.disable(ERROR)``). See
+[[reference-atr-tz-bug-invalidated-optimizations]].
 
-Result: ATR was dead for MONTHS across every classic-expert optimization, ``use_atr_stop`` /
-``atr_multiplier`` / ``atr_period`` were inert GA genes, and NOTHING in any log said so (GA pool
-workers run at ``logging.disable(ERROR)``). The bug was found only by accident, while profiling
-something else. See [[reference-atr-tz-bug-invalidated-optimizations]].
+DENY BY DEFAULT. The first version of this module inverted the test: it re-raised a fixed list
+of "defect" types (TypeError, AttributeError, ...) and absorbed everything else. That is
+allow-by-default, and it leaks exactly the bugs that wear a data-shaped exception — a typo'd
+settings key raises ``KeyError``, a bad enum string raises ``ValueError``, and both would have
+been swallowed just like the ATR TypeError was. Classification by type cannot tell
+``settings["max_stopp_loss"]`` (a typo) from ``payload["close"]`` (a genuinely absent field),
+so the safe default is to propagate and make the caller SAY what it expects.
 
-The rule this encodes: **a broad ``except`` may absorb the world being uncooperative; it must
-NOT absorb the code being wrong.** An empty API response, a timeout, a missing file are data
-conditions. A ``TypeError`` is a bug, and a bug that returns a plausible-looking ``None`` is far
-more expensive than one that crashes — the crash is found in minutes, the silent fallback took
-months and invalidated a fleet of optimizations.
-
-Usage — call it FIRST inside a broad handler::
-
-    try:
-        ...
     except Exception as e:
-        raise_if_defect(e)              # TypeError/AttributeError/... propagate
-        logger.warning("no data for %s: %s", symbol, e)
-        return None
+        absorb_if_benign(e)                     # anything unexpected propagates
+        logger.error(...); return None
+
+    except Exception as e:
+        absorb_if_benign(e, KeyError)           # THIS site legitimately sees absent fields
+        logger.error(...); return None
+
+Naming the expectation at each site is the real fix — the same discipline as writing
+``except (OSError, KeyError):`` in the first place, but retrofittable to handlers nobody can
+currently characterise.
+
+MODES (env ``BA2_ERROR_MODE``), because flipping ~95 handlers from absorb-all to
+propagate-unless-named is a real behaviour change in LIVE trading:
+
+    observe   log what WOULD have propagated, then absorb  (CURRENT DEFAULT — staged rollout)
+    enforce   propagate — the intended end state
+    legacy    absorb everything, no logging — escape hatch only
+
+DEFAULT IS ``observe`` ON PURPOSE, and this is a temporary staging decision, not the design.
+Flipping ~95 handlers from absorb-all to propagate-unless-named is a real behaviour change in
+LIVE trading, and turning it on immediately showed why: it surfaced 5 option tests that pass in
+isolation but fail in a full-suite run, i.e. pre-existing test-order pollution that the old
+swallow had been hiding. Those are worth fixing, but not by discovering them one production
+incident at a time.
+
+    set BA2_ERROR_MODE=enforce      # flip when the measurement says it is safe
+
+Run a full grid in ``observe`` and grep for ``WOULD-RAISE``: that turns the benign set from a
+guess into a measurement, per call site, before anything starts failing for real. Then flip.
 """
 from __future__ import annotations
 
-# Exception types that essentially always mean "the code is wrong", not "the data is missing":
-#   TypeError        — wrong types reaching an operation (the ATR tz bug)
-#   AttributeError   — None/wrong object where a real one was expected
-#   NameError        — typo / missing binding
-#   ImportError      — broken dependency or packaging
-#   IndentationError / SyntaxError — malformed code reached at import/exec time
-#   ZeroDivisionError— arithmetic the caller failed to guard
+import logging
+import os
+
+logger = logging.getLogger(__name__)
+
+_MODE_ENV = "BA2_ERROR_MODE"
+
+# Genuinely benign EVERYWHERE: the world being uncooperative, never a statement about this
+# program's correctness. OSError covers ConnectionError/TimeoutError/FileNotFoundError and the
+# rest of the network+filesystem family.
 #
-# DELIBERATELY EXCLUDED, because each has a common legitimate data-shaped cause:
-#   KeyError / IndexError — routinely mean "field absent from an API payload"
-#   ValueError            — routinely means "unparseable value from a feed"
-#   OSError / IOError     — network + filesystem
-# Adding those would make this fire on ordinary bad-data paths and train people to bypass it.
+# Deliberately NOT here: KeyError, IndexError, ValueError. Each is a COMMON data condition AND a
+# common bug, and only the call site knows which it is facing — that is precisely the judgement
+# this module refuses to make on the caller's behalf. Pass them per-site when they are expected.
+_BENIGN_DEFAULT: tuple = (OSError,)
+
+
+def _mode() -> str:
+    return (os.environ.get(_MODE_ENV) or "observe").strip().lower()
+
+
+def is_benign(exc: BaseException, *also_benign: type) -> bool:
+    """True when *exc* is one of the globally-benign types, or one named by this call site."""
+    return isinstance(exc, _BENIGN_DEFAULT + tuple(also_benign))
+
+
+def absorb_if_benign(exc: BaseException, *also_benign: type) -> None:
+    """Return quietly when *exc* is benign; otherwise propagate it (mode-dependent).
+
+    Re-raises the exception being handled, so the ORIGINAL traceback survives and points at the
+    real failure site rather than at this function.
+    """
+    if is_benign(exc, *also_benign):
+        return
+    mode = _mode()
+    if mode == "legacy":
+        return
+    if mode == "observe":
+        # One grep-able marker so a full grid run yields the real per-site benign set.
+        logger.error("WOULD-RAISE %s: %s", type(exc).__name__, exc, exc_info=True)
+        return
+    raise exc
+
+
+# --------------------------------------------------------------------------- #
+# superseded
+# --------------------------------------------------------------------------- #
 _DEFECTS: tuple = (
-    TypeError,
-    AttributeError,
-    NameError,
-    ImportError,
-    IndentationError,
-    SyntaxError,
-    ZeroDivisionError,
+    TypeError, AttributeError, NameError, ImportError,
+    IndentationError, SyntaxError, ZeroDivisionError,
 )
 
 
 def is_defect(exc: BaseException) -> bool:
-    """True when *exc* indicates a code defect rather than an unhelpful world."""
+    """Allow-by-default classifier. Superseded by :func:`is_benign` — see the module docstring
+    for why type-based defect detection leaks bugs that wear a data-shaped exception."""
     return isinstance(exc, _DEFECTS)
 
 
 def raise_if_defect(exc: BaseException) -> None:
-    """Re-raise *exc* when it is a code defect; return quietly otherwise.
-
-    Preserves the original traceback: a bare ``raise`` inside the active handler re-raises the
-    exception being handled, so the stack still points at the real failure site rather than at
-    this function.
-    """
+    """Deprecated: allow-by-default. Use :func:`absorb_if_benign`, which propagates unless the
+    call site names the error as expected. Kept so an un-migrated caller still escalates the
+    obvious defects rather than silently reverting to absorb-everything."""
     if is_defect(exc):
         raise exc

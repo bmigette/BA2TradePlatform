@@ -25,7 +25,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from ba2_common.logger import logger
-from ba2_common.core.failure_modes import raise_if_defect
+from ba2_common.core.failure_modes import absorb_if_benign
 
 
 def compute_risk_based_quantity(
@@ -316,6 +316,6 @@ def get_latest_atr(symbol: str, indicator_provider, period: int = 14, interval: 
         # and returned None, which is indistinguishable from "this symbol has no ATR" -- so ATR
         # was silently dead for months and use_atr_stop/atr_multiplier/atr_period became inert
         # GA genes with nothing in any log to show for it (see failure_modes.raise_if_defect).
-        raise_if_defect(e)
+        absorb_if_benign(e)
         logger.error(f"get_latest_atr failed for {symbol}: {e}", exc_info=True)
         return None

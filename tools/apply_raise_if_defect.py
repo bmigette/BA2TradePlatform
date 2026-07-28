@@ -1,4 +1,4 @@
-"""Insert ``raise_if_defect(e)`` at the top of broad, swallowing except handlers.
+"""Insert ``absorb_if_benign(e)`` at the top of broad, swallowing except handlers.
 
 An AST-guided rewriter for the pattern the ATR incident exposed::
 
@@ -35,7 +35,7 @@ import ast
 import pathlib
 import sys
 
-IMPORT_LINE = "from ba2_common.core.failure_modes import raise_if_defect"
+IMPORT_LINE = "from ba2_common.core.failure_modes import absorb_if_benign"
 
 
 def candidates(tree: ast.AST, skipped=None):
@@ -56,7 +56,7 @@ def candidates(tree: ast.AST, skipped=None):
         first = n.body[0]
         if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Call)
                 and isinstance(first.value.func, ast.Name)
-                and first.value.func.id == "raise_if_defect"):
+                and first.value.func.id == "absorb_if_benign"):
             continue
         out.append(n)
     return out
@@ -81,7 +81,7 @@ def rewrite(path: pathlib.Path, check: bool) -> int:
     for h in sorted(cands, key=lambda x: x.lineno, reverse=True):
         first = h.body[0]
         indent = " " * (first.col_offset)
-        lines.insert(first.lineno - 1, f"{indent}raise_if_defect({h.name})")
+        lines.insert(first.lineno - 1, f"{indent}absorb_if_benign({h.name})")
 
     out = "\n".join(lines)
     if IMPORT_LINE not in out:
