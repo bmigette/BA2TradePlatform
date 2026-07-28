@@ -530,6 +530,15 @@ class MarketDataProviderInterface(DataProviderInterface):
             if new_df is not None and not new_df.empty:
                 new_df = self._clean_dataframe(new_df)
                 new_df['Date'] = pd.to_datetime(new_df['Date'])
+                # Align the fetched bars' tz-awareness to the CACHE's convention before
+                # concat. The provider may return tz-aware timestamps while the parquet
+                # holds naive ones (FMP daily does exactly this); concatenating the two
+                # yields an object column of mixed aware/naive values, and the
+                # pd.to_datetime() in get_ohlcv_data then raises "Tz-aware datetime cannot
+                # be converted to datetime64 unless utc=True". Matching the EXISTING cache
+                # (rather than forcing one global convention) keeps already-working intraday
+                # caches byte-identical instead of shifting their stored instants.
+                new_df['Date'] = self._match_tz(new_df['Date'], df['Date'])
                 new_df['effective_date'] = new_df['Date']
                 if 'effective_date' not in df.columns:
                     df['effective_date'] = df['Date']
@@ -544,6 +553,26 @@ class MarketDataProviderInterface(DataProviderInterface):
                 f"Failed to refresh parquet cache for {symbol} ({interval}): {e}"
             )
         return df
+
+    @staticmethod
+    def _match_tz(new_dates: 'pd.Series', existing_dates: 'pd.Series') -> 'pd.Series':
+        """Return ``new_dates`` with the same tz-awareness as ``existing_dates``.
+
+        Aware -> naive converts through UTC first so the instant is preserved rather than
+        the wall-clock reading being reinterpreted. Naive -> aware localizes to the
+        existing series' tz. Used when merging freshly fetched bars into a cached frame,
+        where the two sides can disagree (see the caller).
+        """
+        new_dates = pd.to_datetime(new_dates)
+        existing_tz = getattr(existing_dates.dt, 'tz', None) if len(existing_dates) else None
+        new_tz = getattr(new_dates.dt, 'tz', None)
+        if existing_tz is None and new_tz is not None:
+            return new_dates.dt.tz_convert('UTC').dt.tz_localize(None)
+        if existing_tz is not None and new_tz is None:
+            return new_dates.dt.tz_localize(existing_tz)
+        if existing_tz is not None and new_tz is not None and str(new_tz) != str(existing_tz):
+            return new_dates.dt.tz_convert(existing_tz)
+        return new_dates
 
     @staticmethod
     def _is_latest_request(requested_end: Optional[datetime]) -> bool:

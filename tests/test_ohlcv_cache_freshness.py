@@ -191,6 +191,35 @@ def test_pinned_past_end_date_returns_same_rows_as_before_the_fix(cache_dir):
 # Intraday catch-up
 # ---------------------------------------------------------------------------
 
+def test_tz_aware_fetch_merges_into_a_tz_naive_cache(cache_dir):
+    """Regression: the provider may return tz-AWARE bars while the parquet holds NAIVE ones.
+
+    Caught end-to-end against real FMP data after the first version of this fix shipped
+    green unit tests: concatenating the two produced an object Date column of mixed
+    aware/naive values, and get_ohlcv_data's pd.to_datetime then raised
+    "Tz-aware datetime.datetime cannot be converted to datetime64 unless utc=True".
+    Daily only started hitting this path once it began refreshing at all.
+    """
+    _seed_cache("TZA", "1d", datetime.now() - timedelta(days=20), age_hours=20 * 24)
+
+    class _AwareProvider(_FreshnessStubProvider):
+        def _get_ohlcv_data_impl(self, symbol, start_date, end_date, interval):
+            df = super()._get_ohlcv_data_impl(symbol, start_date, end_date, interval)
+            if not df.empty:  # provider hands back tz-aware UTC timestamps
+                df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(timezone.utc)
+            return df
+
+    p = _AwareProvider()
+    got = p.get_ohlcv_data("TZA", interval="1d")  # must not raise
+
+    assert p.impl_calls, "stale cache should still have been topped up"
+    assert len(got) > 0
+    # A single consistent dtype, not an object column of mixed tz values.
+    assert pd.api.types.is_datetime64_any_dtype(got["Date"]), (
+        f"Date column ended up mixed-tz (dtype={got['Date'].dtype})"
+    )
+
+
 def test_intraday_catches_up_when_last_bar_is_not_today(cache_dir):
     """Old guard returned early unless the last bar was already from today, so an
     intraday cache that fell a day behind could never recover."""
