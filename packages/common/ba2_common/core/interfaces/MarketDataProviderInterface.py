@@ -17,6 +17,16 @@ from ba2_common import config
 from ba2_common.core.provider_utils import log_provider_call, validate_date_range
 from ba2_common.core.interfaces.DataProviderInterface import DataProviderInterface
 
+# Intraday interval spellings, SHORT and provider long form (FMP writes "5min"/"1hour").
+# Single source of truth: the cache-freshness branch in get_ohlcv_data and its
+# cache-fill-range branch must agree on what counts as intraday. They were two separate
+# literal tuples, and the drift (one listing only short forms) already caused a wasteful
+# ~15-year fetch for long-form spellings.
+_INTRADAY_INTERVALS = (
+    '1m', '5m', '15m', '30m', '1h', '4h',
+    '1min', '5min', '15min', '30min', '1hour', '4hour',
+)
+
 
 class MarketDataProviderInterface(DataProviderInterface):
     """
@@ -474,19 +484,27 @@ class MarketDataProviderInterface(DataProviderInterface):
         out['effective_date'] = out['Date']
         native_cache.write_timeseries(provider_name, symbol, interval, out)
 
-    def _refresh_intraday_parquet_if_stale(
+    def _refresh_parquet_if_stale(
         self,
         df: pd.DataFrame,
         symbol: str,
         interval: str,
         provider_name: str,
     ) -> pd.DataFrame:
-        """Intraday incremental refresh against the parquet as_of store.
+        """Incremental top-up of the parquet as_of store, for ANY interval.
 
-        If the last cached bar is from today but older than one interval, fetch only
-        the missing bars, append them (stamping effective_date == Date), rewrite the
-        parquet file, and return the merged frame. Mirrors the legacy
-        ``_refresh_intraday_if_stale`` semantics, persisting to parquet instead of CSV.
+        Fetches only the bars after the last cached one, appends them (stamping
+        effective_date == Date), rewrites the parquet file, and returns the merged frame.
+        Callers must only invoke this for a LATEST/live request — a pinned historical
+        ``end_date`` is immutable and must never re-fetch (see ``_is_latest_request``).
+
+        History (2026-07-28): this used to bail out unless the last cached bar was from
+        TODAY (``if last_bar.date() != now.date(): return df``), so it could only extend a
+        cache that was already current and could never catch up after a weekend, holiday
+        or outage. Combined with it being called for intraday intervals only, daily caches
+        were effectively write-once: every held symbol on the dev box had a last daily bar
+        13-139 days old. The date-equality guard is gone; the ``expected_latest`` check
+        below still prevents a redundant re-fetch inside the same bar.
         """
         df = df.copy()
         df['Date'] = pd.to_datetime(df['Date'])
@@ -500,9 +518,6 @@ class MarketDataProviderInterface(DataProviderInterface):
             last_bar_naive = last_bar_naive.replace(tzinfo=None)
 
         now = datetime.now()
-        if last_bar_naive.date() != now.date():
-            return df
-
         interval_td = self._interval_to_timedelta(interval)
         expected_latest = self.normalize_time_to_interval(now, interval)
         if last_bar_naive >= expected_latest:
@@ -526,9 +541,29 @@ class MarketDataProviderInterface(DataProviderInterface):
                 native_cache.write_timeseries(provider_name, symbol, interval, df)
         except Exception as e:
             logger.warning(
-                f"Failed to refresh intraday parquet cache for {symbol} ({interval}): {e}"
+                f"Failed to refresh parquet cache for {symbol} ({interval}): {e}"
             )
         return df
+
+    @staticmethod
+    def _is_latest_request(requested_end: Optional[datetime]) -> bool:
+        """True when the caller is asking for the LATEST data (live), not a pinned past as_of.
+
+        Two live spellings must both count: ``end_date=None`` (validate_date_range defaults
+        it to now) and an explicit "now" — ``ba2_providers.cache.cached_get.ohlcv_get`` does
+        ``end = as_of or datetime.now(timezone.utc)``, so live arrives as an explicit
+        tz-aware now. A backtest pins a real historical ``end_date`` and must be excluded so
+        its reads stay byte-identical (immutable history, no re-fetch).
+
+        The 1-hour tolerance covers clock/timezone skew between a naive ``datetime.now()``
+        and a tz-aware "now" without admitting a genuine backtest date.
+        """
+        if requested_end is None:
+            return True
+        end = requested_end
+        if end.tzinfo is not None:
+            end = end.astimezone(timezone.utc).replace(tzinfo=None)
+        return end >= datetime.utcnow() - timedelta(hours=1)
 
     def get_data(
         self,
@@ -678,6 +713,11 @@ class MarketDataProviderInterface(DataProviderInterface):
         Returns:
             DataFrame with columns: Date, Open, High, Low, Close, Volume
         """
+        # Capture the caller's ORIGINAL end_date before validate_date_range defaults it to
+        # now: that is the only way to tell a live "latest" request from a pinned backtest
+        # as_of once normalization has run (see _is_latest_request).
+        is_latest = self._is_latest_request(end_date)
+
         # Validate and normalize dates with intelligent optional handling
         start_date, end_date = validate_date_range(start_date, end_date, lookback_days)
 
@@ -709,11 +749,30 @@ class MarketDataProviderInterface(DataProviderInterface):
             df = native_cache.read_timeseries(provider_name, symbol, interval, as_of=end_date)
             if df is not None and df.empty:
                 df = None
-            # For intraday intervals, incrementally fetch any bars missing since
-            # the last cached bar and persist them back to the parquet store.
-            if df is not None and interval in ('1m', '5m', '15m', '30m', '1h', '4h'):
-                df = self._refresh_intraday_parquet_if_stale(
-                    df, symbol, interval, provider_name)
+            # LATEST/live request: top the cache up so we never serve indefinitely stale
+            # bars. A pinned historical end_date is immutable and skips this entirely, so
+            # backtest reads stay byte-identical.
+            #
+            # INTRADAY has no age gate — it must stay current within the bar, and
+            # _refresh_parquet_if_stale's own ``expected_latest`` check already suppresses a
+            # redundant fetch inside the same bar.
+            #
+            # DAILY/weekly/monthly are gated on the parquet file's mtime via
+            # max_cache_age_hours (the documented-but-previously-ignored parameter). Without
+            # that gate every live daily read between sessions would re-hit the API (60+
+            # symbols x many cycles -> FMP rate limiting), since the last bar legitimately
+            # is not today on a Monday morning or over a weekend.
+            if df is not None and is_latest:
+                if interval in _INTRADAY_INTERVALS:
+                    df = self._refresh_parquet_if_stale(
+                        df, symbol, interval, provider_name)
+                else:
+                    cache_path = native_cache.find_timeseries_path(
+                        provider_name, symbol, interval)
+                    if cache_path is None or not self._is_cache_valid(
+                            cache_path, max_cache_age_hours):
+                        df = self._refresh_parquet_if_stale(
+                            df, symbol, interval, provider_name)
 
         # Fetch from source if needed (cache miss or caching disabled)
         if df is None:
@@ -725,11 +784,7 @@ class MarketDataProviderInterface(DataProviderInterface):
             # code (a) listed only short forms, so '5min'/'1hour' fell through to the DAILY branch
             # and forced a wasteful ~15-year fetch (mostly empty pre-2021), and (b) ignored the
             # requested start entirely. DAILY/weekly/monthly still pre-fill a deep 15-year window.
-            _INTRADAY = (
-                '1m', '5m', '15m', '30m', '1h', '4h',
-                '1min', '5min', '15min', '30min', '1hour', '4hour',
-            )
-            if interval in _INTRADAY:
+            if interval in _INTRADAY_INTERVALS:
                 fetch_start = normalized_start or (datetime.now() - timedelta(days=365 * 2))
                 # Clamp the cache-fill END to the REQUESTED end_date (the backtest window) rather
                 # than "now". A historical intraday backtest only needs [start, end_date], but
@@ -737,8 +792,8 @@ class MarketDataProviderInterface(DataProviderInterface):
                 # against a 2.5y-old date) and triggered FMP rate-limiting (the dominant cold-fetch
                 # cost). ``end_date`` is non-None here (validate_date_range defaults it to now), so
                 # a LIVE request (end_date -> now) still fills to now. Warm reads of a PAST window
-                # do NOT re-fetch: _refresh_intraday_parquet_if_stale only refreshes when the last
-                # cached bar is from TODAY. Backtest results are unchanged: the engine only ever
+                # do NOT re-fetch: the top-up above is gated on ``is_latest``, which is False for a
+                # pinned historical end_date. Backtest results are unchanged: the engine only ever
                 # consumes bars in [start, end_date] regardless of how far the fill reached.
                 fetch_end = end_date if end_date is not None else datetime.now()
             else:
