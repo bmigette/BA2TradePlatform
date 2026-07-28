@@ -196,3 +196,16 @@ def test_memo_is_bounded():
     for i in range(4300):
         e._still_held_by(trades, "S%d" % i, now=NOW)
     assert len(e._still_held_memo) <= 4096
+
+
+def test_gate_uses_unwindowed_history_not_the_windowed_set():
+    """REGRESSION: _window_trades filters on the DISCLOSURE window too (as short as 15 days),
+    so a sale that CLOSED a position but was disclosed 100 days ago is absent from all_trades.
+    Netting over the windowed set reported long-closed positions as still open -- biased toward
+    'held', the opposite of the conservative direction this gate is for."""
+    e = _expert()
+    buy = _t("Alice", "UBER", "purchase", "2024-01-10")
+    closing_sale = _t("Alice", "UBER", "sale", "2024-02-10")   # disclosed long ago -> windowed out
+    assert e._still_held_by([buy], "UBER", now=NOW) == {"Alice": True}          # windowed view
+    e2 = _expert()
+    assert e2._still_held_by([buy, closing_sale], "UBER", now=NOW) == {"Alice": False}

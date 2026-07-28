@@ -581,6 +581,13 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         max_disclose_days = int(self._setting_or_default(gather_settings, "max_disclose_date_days"))
         max_exec_days = int(self._setting_or_default(gather_settings, "max_trade_exec_days"))
         all_trades = self._window_trades(index, ceiling, max_disclose_days, max_exec_days)
+        # UNWINDOWED history, for still-held ONLY. _window_trades filters on the DISCLOSURE
+        # window as well as the exec window, and max_disclose_date_days can be as short as 15
+        # days -- so a sale that CLOSED a position but was disclosed 100 days ago is absent from
+        # `all_trades`. Netting over the windowed set would therefore report long-closed
+        # positions as still open: biased toward "held", the opposite of the conservative
+        # direction this gate is supposed to take. Everything else keeps using the window set.
+        unwindowed_trades = index.get("all_trades") or []
 
         # Stage 1: pre-resolve the per-trade execution price (already date-aware).
         exec_price_by_trade: Dict[tuple, Optional[float]] = {}
@@ -657,6 +664,9 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                          else providers.price_at_date(symbol, as_of))
         return {
             "all_trades": all_trades,
+            # still-held ONLY -- see the note where this is built; the windowed set hides
+            # closing sales whose DISCLOSURE fell outside max_disclose_date_days.
+            "unwindowed_trades": unwindowed_trades,
             "current_price": current_price,
             "exec_price_by_trade": exec_price_by_trade,
             "trader_history_by_name": trader_history_by_name,
@@ -981,8 +991,17 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         # cannot retro-actively close an earlier bar's position.
         require_held = int(self._setting_or_default(settings, "require_still_held") or 0)
         min_holders = int(self._setting_or_default(settings, "min_still_holders") or 0)
+        # Computed UNCONDITIONALLY so analysis details can show it even when the gate is off --
+        # "does this discloser still hold?" is useful context for reading a recommendation, not
+        # just a filter input. Cheap: memoized per (symbol, day), so this is one history walk per
+        # symbol per day regardless of bar frequency.
+        held_by = self._still_held_by(
+            data_bundle.get("unwindowed_trades") or data_bundle["all_trades"],
+            symbol, now=now)
+        for _t in filtered:
+            _who = (_t.get("representative") or _t.get("senator") or _t.get("office") or "?")
+            _t["still_held"] = bool(held_by.get(_who, False))
         if require_held or min_holders:
-            held_by = self._still_held_by(data_bundle["all_trades"], symbol, now=now)
             holders = sum(1 for v in held_by.values() if v)
             if min_holders and holders < min_holders:
                 self.logger.debug(
@@ -2414,6 +2433,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                 'exec_price': trade.get('exec_price'),
                 'current_price': trade.get('current_price'),
                 'price_delta_pct': trade.get('price_delta_pct', 0),
+                'still_held': bool(trade.get('still_held', False)),
                 'trader_confidence_modifier': trader_confidence_modifier,
                 'symbol_focus_pct': symbol_focus_pct,
                 'trader_skill': trader_skill,
@@ -2608,6 +2628,7 @@ Trade #{i}:
 - Execution Price: ${trade_info['exec_price']:.2f}
 - Current Price: ${trade_info['current_price']:.2f}
 - Price Change: {trade_info['price_delta_pct']:+.1f}%
+- Still Held: {'YES' if trade_info.get('still_held') else 'no (sold since)'}
 - Symbol Focus: {trade_info['symbol_focus_pct']:.1f}% (of trader's portfolio, capped at {symbol_focus_cap_pct:.0f}%)
 - Trader Skill: {trade_info['trader_skill']:+.2f} ({trade_info['trader_skill_trades']} past buys scored) → signal weight {trade_info['signal_weight']:.2f}
 - Trade Confidence: {trade_info['confidence']:.1f}%
@@ -3331,6 +3352,11 @@ All {len(trade_details)} trades shown above for transparency.
                                         ui.label(f'${exec_price:.2f} → ${trade.get("current_price", 0):.2f}').classes('text-xs').style('color: #a0aec0')
                                         ui.label(f'{price_delta:+.1f}%').classes(f'text-sm text-{delta_color}')
                                     
+                                    if trade.get('still_held'):
+                                        ui.label('STILL HELD').classes('text-xs text-positive text-weight-medium')
+                                    else:
+                                        ui.label('sold since').classes('text-xs').style('color: #718096')
+
                                     modifier = trade.get('trader_confidence_modifier', 0)
                                     if modifier != 0:
                                         modifier_color = 'positive' if modifier > 0 else 'negative'

@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# Full Senate strategy grid (S1-S7) with STILL-HELD gating + a 9-12 month lookback
+# (2026-07-28, commit 536bc20). Supersedes the sen5min2/atrfix attempt.
+#
+# WHAT IS NEW IN THE SEARCH SPACE (verified present in collect_param_space, 35 genes total):
+#   model:require_still_held      0..1     drop trades whose discloser has since sold out
+#   model:min_still_holders       0..4     consensus floor on OPEN positions
+#   model:max_disclose_date_days  15..270  was 15..60   -- 9 months now reachable
+#   model:max_trade_exec_days     30..365  was 30..120  -- 12 months now reachable
+#
+# WHY THESE SHIP TOGETHER. The old ceilings made a 9-12 month lookback unsearchable, so "old
+# but still-open positions carry signal" was never rejected on evidence -- it was never asked.
+# But over 9-12 months a stale buy is as likely CLOSED as open, and before 536bc20 the expert
+# had no notion of an open position at all, so a sold-out buy scored identically to a held one.
+# Widening the window WITHOUT still-held would therefore make results worse, not better.
+#
+# WHAT TO READ FROM THE RESULT. If the winners keep require_still_held=0 and short windows, the
+# hypothesis is refuted cheaply and we stop revisiting it. If they pick long windows only WITH
+# still-held on, that is the tracker signal ("N bought and none sold") showing up as fitness.
+# Watch for long windows with still_held=0 -- that would suggest stale disclosures alone carry
+# signal, which is worth a second look before believing.
+#
+# Superseded, kept for comparison: sen5min-* (pre-ATR-fix, ATR genes inert) and sen5min2-*
+# (ATR fixed, but no still-held and a 60/120-day fence).
+#
+# ---- inherited from the ATR-fix run --------------------------------------------------------
+# Full Senate strategy grid (S1-S7) RE-RUN after the ATR tz fix (2026-07-28, v2026.07.989).
+#
+# WHY THE WHOLE GRID AGAIN. PandasIndicatorCalc reconciled tz-awareness in only ONE direction,
+# so a naive OHLCV frame + the tz-AWARE end_date that position_sizing.get_latest_atr always
+# passes (datetime.now(timezone.utc)) raised TypeError. @log_provider_call swallowed it and GA
+# pool workers run at logging.disable(ERROR), so it was invisible in every log: ATR simply
+# returned None and the stop fell back to min_stop_loss_pct.
+#
+# That made use_atr_stop / atr_multiplier / atr_period INERT GENES. The GA was scoring every
+# ATR-enabled individual as if ATR did nothing, biasing the search against ATR configs -- which
+# is plausibly why 3 of the first 4 winners chose use_atr_stop=0, and why S2 (the one winner
+# that chose 1) scored worst at 13.49. The results are not merely noisy, they are
+# systematically biased, so re-running only S5-S7 would leave the grid incomparable.
+#
+# Superseded run (buggy, kept for comparison): sen5min-S1..S4 = 17.58 / 13.49 / 17.29 / 18.20.
+# NEW NAMES sen5min2-* + label "atrfix" so those rows survive side by side rather than being
+# overwritten -- same rule as the 2020 stress test.
+#
+# Full Senate strategy grid (S1-S7) on a 5-MINUTE execution clock, gap-aware fill engine.
+#
+# WHY 5min: both Senate ForwardTest rows ran execution_interval="1d". The ENTRY cadence is
+# genuinely low-frequency (disclosures, Mondays), but the TP/SL EXITS are not -- on a daily
+# clock a target is tested once per bar. The A/B (backtests 794/795) showed S5 falling
+# 179% -> 81% at 5min because its take-profits fire the instant price TOUCHES the level
+# intraday, halving its biggest winners (top-10 avg 14.64% -> 8.86%) on a strategy whose edge
+# IS the right tail. Those exits were tuned against daily closes, so they are out-of-sample at
+# 5min. Re-optimize on the clock live actually runs.
+#
+# WHY ALL SEVEN: the clock plausibly changes WHICH exit template wins. S5's right-tail design
+# is exactly what intraday touches punish, so a bracket (S2) or target-anchored (S4) exit may
+# suit 5min better. Running only the deployed pair (S3/S5) would never surface that.
+#
+# WHY SEQUENTIAL `optimize` AND NOT `optimize-batch` -- this is the load-bearing detail.
+# optimize-batch SUBMITS to the main task queue, which is started with max_workers=4
+# (app/main.py init_task_queue), so it runs up to FOUR optimizations at once. --parallel is
+# PER JOB, so machine concurrency becomes jobs x parallel and is bounded by nothing real.
+# Observed: 2 jobs x --parallel 4 = 8 local trial slots, 0.9GB free of 63.7GB and 28.1GB of
+# pagefile -- worse than the parallel-6 swap that prompted dropping to 4. Each job also
+# claimed its own 4 REMOTE slots (2 x 4 = 8 on remote150) and separately pushed the full
+# 5.47GB cache. Running `optimize` in-process, one strategy at a time, keeps exactly
+# --parallel local + the expert's 4 remote live at any moment, and needs no serve backend.
+#
+# SIZING: FMPSenateTraderWeight runs ~11-12GB RSS per trial (documented on its
+# max_remote_worker_slots attribute; confirmed live at 12.46/10.75/10.22/9.04GB). 4 local
+# slots ~= 46GB of the 63.7GB box. The remote cap stays at the expert's declared 4/worker --
+# 6 would need ~69GB there, which is the OOM that attribute exists to prevent.
+#
+# remote150 is listed regardless: distribution engages only when a worker is ONLINE, so it is
+# a no-op while powered off and is re-admitted mid-run by the background re-check.
+#
+# DO NOT bump ba2_trade_platform/version.py while this runs. The master version is snapshotted
+# once at job start; if the repo moves ahead, the worker correctly pulls to the NEW version and
+# then fails the job's version match forever (cost us opt 218: worker on 986 vs job's 985).
+set -u
+cd "$(dirname "$0")/.."
+UNI=$(cat "$HOME/Documents/ba2/senate_universe.csv")
+PY=.venv/Scripts/python.exe
+
+for S in S1 S2 S3 S4 S5 S6 S7; do
+  echo "=================================================================="
+  echo "=== Senate $S @ 5min   start $(date)"
+  echo "=================================================================="
+  "$PY" testplatform/ba2test_launcher.py optimize \
+    --expert FMPSenateTraderWeight \
+    --strategy "$S" \
+    --universe "$UNI" \
+    --start 2023-01-01 --end 2026-06-30 \
+    --interval 5min \
+    --fitness consistent_annual_return \
+    --population 60 --generations 8 --early-stop 4 --mutation-prob 0.3 \
+    --parallel 4 --seed 42 \
+    --initial-capital 10000 --commission 1.0 --spread-bps 20 \
+    --workers remote150 \
+    --labels "sen5min3,stillheld,longlookback,${S},ForwardTestCandidate" \
+    --name "sen5min3-${S}"
+  echo "=== Senate $S @ 5min   done rc=$? $(date)"
+done
+echo "=== GRID COMPLETE $(date) ==="
