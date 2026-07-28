@@ -19,7 +19,6 @@ import bisect
 import json
 import os
 import re
-import time  # DIAG (temporary instrumentation)
 import requests
 
 from ba2_common.core.interfaces import MarketExpertInterface
@@ -33,6 +32,9 @@ from ba2_common.core.backtest_context import BacktestContext, ProviderBundle
 from ba2_common.logger import get_expert_logger
 from ba2_common.config import get_app_setting
 from ba2_experts.expert_mixins import AnalysisStatusRenderMixin, FMPCongressTradingMixin
+from ba2_experts.scoring_table import ScoringTable, use_scoring_table
+
+_USE_SCORING_TABLE = use_scoring_table()
 # NOTE: parse_fmp_amount_range / calculate_fmp_trade_metrics are imported LOCALLY inside
 # methods to avoid a circular import (core.utils -> modules.experts -> ...).
 
@@ -121,6 +123,16 @@ def clear_worker_scoring_cache() -> None:
     _WORKER_SCORING_CACHE.clear()
 
 
+def _dump_scoring_cache(cache, fh) -> None:
+    """Serialize a scoring cache — a ``ScoringTable`` streams itself, a plain dict goes through
+    ``json.dump``. Both produce identical bytes, so which one is in memory never reaches disk."""
+    dump = getattr(cache, "dump_json", None)
+    if dump is not None:
+        dump(fh)
+    else:
+        json.dump(cache, fh)
+
+
 def set_scoring_cache_max(n: int) -> int:
     """Raise the resident-shard cap to at least *n*; returns the effective value.
 
@@ -161,7 +173,7 @@ def flush_all_scoring_caches() -> int:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             tmp = f"{path}.{os.getpid()}.flush.tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(cache, f)
+                _dump_scoring_cache(cache, f)
             os.replace(tmp, path)          # atomic: a concurrent reader never sees a partial file
             delta = path + ".delta.jsonl"  # folded in by this compaction; must not be re-applied
             if os.path.exists(delta):
@@ -1452,6 +1464,22 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                 cache = json.load(f)
         except Exception:  # noqa: BLE001 — missing/corrupt cache -> start fresh, never fatal
             cache = {}
+        # Column-oriented storage. These shards are 400-600k entries whose values are fixed,
+        # all-numeric dicts, i.e. almost pure Python boxing: measured 173MB -> 67MB on the real
+        # confidence shard, at +44ms per trial (0.07% of a 64.5s trial). ScoringTable is
+        # dict-compatible for the operations used here, so the callers are unchanged.
+        #
+        # BA2_SCORING_TABLE=0 falls back to plain dicts: an escape hatch for a data-structure
+        # swap on the hot scoring path, and the control arm for measuring it.
+        if _USE_SCORING_TABLE and isinstance(cache, dict):
+            # Drain the source dict as the table is built so peak memory is ~max(dict, table)
+            # rather than their SUM -- load is the moment a worker is closest to OOM, and
+            # holding both would make the peak worse than the plain-dict path it improves on.
+            table = ScoringTable()
+            while cache:
+                k, v = cache.popitem()
+                table[k] = v
+            cache = table
         try:
             with open(self._scoring_cache_delta_path(filename), "r", encoding="utf-8") as f:
                 for line in f:
@@ -1482,7 +1510,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             os.makedirs(os.path.dirname(path), exist_ok=True)
             tmp = path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(cache, f)
+                _dump_scoring_cache(cache, f)
             os.replace(tmp, path)
             delta_path = self._scoring_cache_delta_path(filename)
             if os.path.exists(delta_path):

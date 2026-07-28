@@ -116,7 +116,11 @@ def test_missing_shard_starts_empty_not_fatal(tmp_path, monkeypatch):
                         lambda self, fn: os.path.join(str(tmp_path), "fmp_history", fn))
     e = FMPSenateTraderWeight.__new__(FMPSenateTraderWeight)
     got = e._load_scoring_cache("_skill_cache", "congress_skill_scores__1_2_3_4.json")
-    assert got == {}
+    # len, not `== {}`: shards load as a ScoringTable (column storage) which deliberately does
+    # NOT implement __eq__ against a mapping -- doing so would materialise every one of a real
+    # shard's ~400k entries on an innocuous-looking comparison.
+    assert len(got) == 0
+    assert got.get("anything") is None
 
 
 # --------------------------------------------------------------------------- #
