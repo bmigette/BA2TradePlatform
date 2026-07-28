@@ -21,6 +21,7 @@ from ba2_common.core.db import get_db, add_instance, update_instance, get_instan
 from ba2_common.core.option_types import OptionContract, OptionLeg, OptionPosition
 from ba2_common.core.option_selector import select_single, select_vertical_spread, select_wing, passes_liquidity
 from ba2_common.logger import logger
+from ba2_common.core.failure_modes import raise_if_defect
 
 
 class TradeAction(ABC):
@@ -90,6 +91,7 @@ class TradeAction(ABC):
         try:
             return self.account.get_instrument_current_price(self.instrument_name)
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error getting current price for {self.instrument_name}: {e}", exc_info=True)
             return None
     
@@ -107,6 +109,7 @@ class TradeAction(ABC):
                     return getattr(position, 'qty', None)
             return None
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error getting current position for {self.instrument_name}: {e}", exc_info=True)
             return None
 
@@ -151,6 +154,7 @@ class TradeAction(ABC):
                     total -= qty
             return total
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error getting expert position for {self.instrument_name}: {e}", exc_info=True)
             return None
     
@@ -183,6 +187,7 @@ class TradeAction(ABC):
             return expert_rec.data
             
         except Exception as e:
+            raise_if_defect(e)
             logger.debug(f"Could not copy data from expert recommendation {expert_recommendation_id}: {e}")
             return None
     
@@ -279,6 +284,7 @@ class TradeAction(ABC):
                 return None
                 
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error creating order record: {e}", exc_info=True)
             return None
     
@@ -319,6 +325,7 @@ class TradeAction(ABC):
                 data['calculation_preview'] = calc_preview
                 logger.debug(f"Storing calculation preview in TradeActionResult for {action_type}")
             except Exception as e:
+                raise_if_defect(e)
                 logger.debug(f"Could not get calculation preview: {e}")
         
         # Create the result object (only if we have expert_recommendation_id)
@@ -399,6 +406,7 @@ class SellAction(TradeAction):
             )
                 
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error creating sell order for {self.instrument_name}: {e}", exc_info=True)
             return self.create_and_save_action_result(
                 action_type=ExpertActionType.SELL.value,
@@ -483,6 +491,7 @@ class BuyAction(TradeAction):
             )
                 
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error creating buy order for {self.instrument_name}: {e}", exc_info=True)
             return self.create_and_save_action_result(
                 action_type=ExpertActionType.BUY.value,
@@ -622,6 +631,7 @@ class CloseAction(TradeAction):
                 )
 
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error executing close action for {self.instrument_name}: {e}", exc_info=True)
             return self.create_and_save_action_result(
                 action_type=ExpertActionType.CLOSE.value,
@@ -931,6 +941,7 @@ class _AdjustPriceLevelAction(TradeAction):
                 raise
 
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error adjusting {self._long_label.lower()} for {self.instrument_name}: {e}", exc_info=True)
             return self.create_and_save_action_result(
                 action_type=self._action_type,
@@ -1047,6 +1058,7 @@ class _AdjustPriceLevelAction(TradeAction):
                         preview["calculated_price"] = preview["reference_price"] * (1 - self.percent / 100)
 
             except Exception as e:
+                raise_if_defect(e)
                 logger.debug(f"Error calculating {self._label} preview: {e}")
 
         return preview
@@ -1463,6 +1475,7 @@ class IncreaseInstrumentShareAction(TradeAction):
             )
             
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error executing increase instrument share action for {self.instrument_name}: {e}", exc_info=True)
             return self.create_and_save_action_result(
                 action_type=ExpertActionType.INCREASE_INSTRUMENT_SHARE.value,
@@ -1650,6 +1663,7 @@ class DecreaseInstrumentShareAction(TradeAction):
             )
             
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error executing decrease instrument share action for {self.instrument_name}: {e}", exc_info=True)
             return self.create_and_save_action_result(
                 action_type=ExpertActionType.DECREASE_INSTRUMENT_SHARE.value,
@@ -1742,6 +1756,7 @@ class _OptionEntryAction(TradeAction):
             # Mock/account without price_type support
             pass
         except Exception as e:
+            raise_if_defect(e)
             logger.debug(f"_spot mid lookup failed for {self.instrument_name}: {e}")
         return self.get_current_price()
 
@@ -1766,6 +1781,7 @@ class _OptionEntryAction(TradeAction):
                 if ei is not None and ei.virtual_equity_pct is not None:
                     pct = ei.virtual_equity_pct
             except Exception as e:
+                raise_if_defect(e)
                 logger.debug(f"_virtual_equity: could not load ExpertInstance {instance_id}: {e}")
         return balance * (pct / 100.0)
 
@@ -1794,6 +1810,7 @@ class _OptionEntryAction(TradeAction):
                 return None
             return equity * (float(pct) / 100.0)
         except Exception as e:
+            raise_if_defect(e)
             logger.debug(f"_max_equity_per_instrument_cap: could not resolve expert {instance_id}: {e}")
             return None
 
@@ -1927,6 +1944,7 @@ class _OptionEntryAction(TradeAction):
                     stored.data = {**(stored.data or {}), "option_reserve": option_reserve}
                     update_instance(stored)
             except Exception as e:
+                raise_if_defect(e)
                 logger.error(f"Failed to persist option_reserve on order {order_id}: {e}", exc_info=True)
         return self._result(True, f"Submitted {option_strategy} for {self.instrument_name}", data)
 
@@ -1939,6 +1957,7 @@ class _OptionEntryAction(TradeAction):
                 return self._result(False, f"Account does not support options for {self.instrument_name}")
             return self._build_and_submit()
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error executing {self._action_type_value()} for {self.instrument_name}: {e}",
                          exc_info=True)
             return self._result(False, f"Error executing option action: {str(e)}")
@@ -3013,6 +3032,7 @@ class CloseOptionAction(TradeAction):
                 data={"contract_symbol": position.contract_symbol, "limit_price": limit_price})
 
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error executing close_option for {self.instrument_name}: {e}", exc_info=True)
             return self.create_and_save_action_result(
                 action_type=ExpertActionType.CLOSE_OPTION.value, success=False,
@@ -3058,6 +3078,7 @@ class CloseOptionAction(TradeAction):
         try:
             quote = self.account.get_option_quote(position.contract_symbol)
         except Exception as e:
+            raise_if_defect(e)
             logger.debug(f"get_option_quote failed for {position.contract_symbol}: {e}")
         if position.side == OrderDirection.BUY:
             if quote is not None and quote.bid is not None:
@@ -3172,6 +3193,7 @@ class CloseOptionAction(TradeAction):
         try:
             return self.account.get_option_quote(contract_symbol)
         except Exception as e:
+            raise_if_defect(e)
             logger.debug(f"get_option_quote failed for {contract_symbol}: {e}")
             return None
 

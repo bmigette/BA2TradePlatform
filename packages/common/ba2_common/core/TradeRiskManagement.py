@@ -14,6 +14,7 @@ from ba2_common.core.models import TradingOrder, ExpertRecommendation, ExpertIns
 from ba2_common.core.types import OrderStatus, OrderDirection, TransactionStatus
 from ba2_common.core.db import get_instance, get_all_instances, update_instance, get_db
 from sqlmodel import select, Session
+from ba2_common.core.failure_modes import raise_if_defect
 
 if TYPE_CHECKING:
     from ba2_common.core.interfaces import MarketExpertInterface
@@ -466,6 +467,7 @@ class TradeRiskManagement:
                 return expert_orders
 
         except Exception as e:
+            raise_if_defect(e)
             self.logger.error(f"Error getting pending orders for expert {expert_instance_id}: {e}", exc_info=True)
             return []
     
@@ -529,6 +531,7 @@ class TradeRiskManagement:
                     self.logger.debug(f"Order {order.id} has no linked recommendation")
 
         except Exception as e:
+            raise_if_defect(e)
             self.logger.error(f"Error getting recommendations for orders: {e}", exc_info=True)
 
         self.logger.debug(f"Found {len(orders_with_recommendations)} orders with valid recommendations")
@@ -561,6 +564,7 @@ class TradeRiskManagement:
             return prioritized
 
         except Exception as e:
+            raise_if_defect(e)
             self.logger.error(f"Error prioritizing orders by score: {e}", exc_info=True)
             return orders_with_recommendations
     
@@ -841,6 +845,7 @@ class TradeRiskManagement:
                 updated_orders.append(order)
                 
             except Exception as e:
+                raise_if_defect(e)
                 self.logger.error(f"Error calculating quantity for order {order.id}: {e}", exc_info=True)
                 order.quantity = 0
                 updated_orders.append(order)
@@ -1126,6 +1131,7 @@ class TradeRiskManagement:
                         deleted_order_count += 1
                         
                     except Exception as e:
+                        raise_if_defect(e)
                         self.logger.error(f"Error deleting unfunded order {order.id}: {e}", exc_info=True)
                         # Continue with other orders even if one fails
                         continue
@@ -1138,6 +1144,7 @@ class TradeRiskManagement:
                            f"{deleted_transaction_count} transactions")
             
         except Exception as e:
+            raise_if_defect(e)
             self.logger.error(f"Error deleting unfunded orders: {e}", exc_info=True)
 
 

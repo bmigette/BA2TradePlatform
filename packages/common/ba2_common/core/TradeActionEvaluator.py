@@ -18,6 +18,7 @@ from ba2_common.logger import logger
 from sqlmodel import select
 import enum
 import datetime
+from ba2_common.core.failure_modes import raise_if_defect
 
 
 # Canonical option action-type sets, derived from get_option_action_values() so a new
@@ -214,6 +215,7 @@ class TradeActionEvaluator:
             return action_summaries
             
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error evaluating ruleset {ruleset_id}: {e}", exc_info=True)
             return [{"error": f"Error evaluating ruleset: {str(e)}"}]
     
@@ -365,6 +367,7 @@ class TradeActionEvaluator:
                     logger.info(f"Order creation result: {result_dict['success']} - {result_dict['message']}")
                     
                 except Exception as e:
+                    raise_if_defect(e)
                     logger.error(f"Error creating order: {e}", exc_info=True)
                     action_results.append({
                         "action_type": self._get_action_type_from_action(action),
@@ -397,6 +400,7 @@ class TradeActionEvaluator:
                             update_instance(order)
                             logger.info(f"Created transaction {order.transaction_id} for order {order_id}")
                         except Exception as e:
+                            raise_if_defect(e)
                             logger.error(f"Error creating transaction for order {order_id}: {e}", exc_info=True)
             
             # Phase 2: Execute adjustment actions (TP/SL)
@@ -430,6 +434,7 @@ class TradeActionEvaluator:
                                     f"(symbol: {transaction.symbol}) — cannot adjust TP/SL"
                                 )
                         except Exception as e:
+                            raise_if_defect(e)
                             logger.error(
                                 f"Error finding entry order for transaction {transaction.id}: {e}",
                                 exc_info=True
@@ -556,6 +561,7 @@ class TradeActionEvaluator:
                                 logger.info(f"Adjustment result: {result_dict['success']} - {result_dict['message']}")
 
                     except Exception as e:
+                        raise_if_defect(e)
                         logger.error(f"Error executing adjustment action for order {order.id}: {e}", exc_info=True)
                         action_results.append({
                             "action_type": ExpertActionType.ADJUST_TAKE_PROFIT,
@@ -599,6 +605,7 @@ class TradeActionEvaluator:
                     logger.info(f"Share adjustment result: {result_dict['success']} - {result_dict['message']}")
 
                 except Exception as e:
+                    raise_if_defect(e)
                     logger.error(f"Error executing share adjustment action: {e}", exc_info=True)
                     action_results.append({
                         "action_type": self._get_action_type_from_action(action),
@@ -609,6 +616,7 @@ class TradeActionEvaluator:
                     })
 
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error in execute: {e}", exc_info=True)
             action_results.append({
                 "action_type": None,
@@ -762,6 +770,7 @@ class TradeActionEvaluator:
             return all_met
             
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error evaluating conditions for event action {event_action.name}: {e}", exc_info=True)
             # Add error to rule evaluation
             rule_evaluation = {
@@ -810,6 +819,7 @@ class TradeActionEvaluator:
             return condition
             
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error creating condition for {event_type}: {e}", exc_info=True)
             return None
     
@@ -927,6 +937,7 @@ class TradeActionEvaluator:
                     })
             
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error creating trade actions for event action {event_action.name}: {e}", exc_info=True)
             action_summaries.append({
                 "error": f"Error creating trade actions: {str(e)}",
@@ -1006,6 +1017,7 @@ class TradeActionEvaluator:
             return action
             
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error creating trade action for {action_type}: {e}", exc_info=True)
             return None
     
@@ -1052,6 +1064,7 @@ class TradeActionEvaluator:
             return action_type_map.get(class_name)
             
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error getting action type from action: {e}", exc_info=True)
             return None
     
@@ -1110,6 +1123,7 @@ class TradeActionEvaluator:
             return sorted_actions
             
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error sorting actions by priority: {e}", exc_info=True)
             return actions  # Return unsorted list if sorting fails
     
@@ -1171,6 +1185,7 @@ class TradeActionEvaluator:
             return "\n".join(description_parts)
             
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error getting ruleset description for {ruleset_id}: {e}", exc_info=True)
             return f"Error getting description: {str(e)}"
     
@@ -1208,6 +1223,7 @@ class TradeActionEvaluator:
             }
             
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error getting evaluation details: {e}", exc_info=True)
             return {
                 "condition_evaluations": [],

@@ -16,6 +16,7 @@ from ba2_common.core.types import OrderRecommendation, ExpertEventType, RiskLeve
 from ba2_common.core.db import get_db
 from ba2_common.logger import logger
 from sqlmodel import select
+from ba2_common.core.failure_modes import raise_if_defect
 
 
 # --- Provider-injection seam -------------------------------------------------
@@ -142,6 +143,7 @@ class TradeCondition(ABC):
                 return list(recommendations)
 
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error getting previous recommendations: {e}", exc_info=True)
             return []
     
@@ -159,6 +161,7 @@ class TradeCondition(ABC):
                     return getattr(position, 'qty', None)
             return None
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error getting current position: {e}", exc_info=True)
             return None
     
@@ -172,6 +175,7 @@ class TradeCondition(ABC):
         try:
             return self.account.get_instrument_current_price(self.instrument_name)
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error getting current price: {e}", exc_info=True)
             return None
     
@@ -195,6 +199,7 @@ class TradeCondition(ABC):
             return len(open_transactions) > 0
 
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error checking expert position for {self.instrument_name}: {e}", exc_info=True)
             return False
     
@@ -292,6 +297,7 @@ class BearishCondition(FlagCondition):
             return self.expert_recommendation.recommended_action == OrderRecommendation.SELL
 
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error evaluating bearish condition: {e}", exc_info=True)
             return False
 
@@ -313,6 +319,7 @@ class BullishCondition(FlagCondition):
             return self.expert_recommendation.recommended_action == OrderRecommendation.BUY
 
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error evaluating bullish condition: {e}", exc_info=True)
             return False
 
@@ -381,6 +388,7 @@ class HasBuyPositionCondition(FlagCondition):
                 self._has_position = len(session.exec(statement).all()) > 0
                 return self._has_position
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error checking BUY position for {self.instrument_name}: {e}", exc_info=True)
             return False
     def get_description(self) -> str:
@@ -414,6 +422,7 @@ class HasSellPositionCondition(FlagCondition):
                 self._has_position = len(session.exec(statement).all()) > 0
                 return self._has_position
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error checking SELL position for {self.instrument_name}: {e}", exc_info=True)
             return False
     def get_description(self) -> str:
@@ -467,6 +476,7 @@ class LongTermCondition(FlagCondition):
         try:
             return self.expert_recommendation.time_horizon == TimeHorizon.LONG_TERM
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error evaluating long term condition: {e}", exc_info=True)
             return False
     def get_description(self) -> str:
@@ -482,6 +492,7 @@ class MediumTermCondition(FlagCondition):
         try:
             return self.expert_recommendation.time_horizon == TimeHorizon.MEDIUM_TERM
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error evaluating medium term condition: {e}", exc_info=True)
             return False
     def get_description(self) -> str:
@@ -497,6 +508,7 @@ class ShortTermCondition(FlagCondition):
         try:
             return self.expert_recommendation.time_horizon == TimeHorizon.SHORT_TERM
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error evaluating short term condition: {e}", exc_info=True)
             return False
     def get_description(self) -> str:
@@ -514,6 +526,7 @@ class CurrentRatingPositiveCondition(FlagCondition):
         try:
             return self.expert_recommendation.recommended_action == OrderRecommendation.BUY
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error evaluating current rating positive condition: {e}", exc_info=True)
             return False
     def get_description(self) -> str:
@@ -530,6 +543,7 @@ class CurrentRatingNeutralCondition(FlagCondition):
         try:
             return self.expert_recommendation.recommended_action == OrderRecommendation.HOLD
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error evaluating current rating neutral condition: {e}", exc_info=True)
             return False
     def get_description(self) -> str:
@@ -546,6 +560,7 @@ class CurrentRatingNegativeCondition(FlagCondition):
         try:
             return self.expert_recommendation.recommended_action == OrderRecommendation.SELL
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error evaluating current rating negative condition: {e}", exc_info=True)
             return False
     def get_description(self) -> str:
@@ -562,6 +577,7 @@ class CurrentRatingOverweightCondition(FlagCondition):
         try:
             return self.expert_recommendation.recommended_action == OrderRecommendation.OVERWEIGHT
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error evaluating current rating overweight condition: {e}", exc_info=True)
             return False
     def get_description(self) -> str:
@@ -578,6 +594,7 @@ class CurrentRatingUnderweightCondition(FlagCondition):
         try:
             return self.expert_recommendation.recommended_action == OrderRecommendation.UNDERWEIGHT
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error evaluating current rating underweight condition: {e}", exc_info=True)
             return False
     def get_description(self) -> str:
@@ -595,6 +612,7 @@ class HighRiskCondition(FlagCondition):
         try:
             return getattr(self.expert_recommendation, 'risk_level', None) == RiskLevel.HIGH
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error evaluating high risk condition: {e}", exc_info=True)
             return False
     def get_description(self) -> str:
@@ -611,6 +629,7 @@ class MediumRiskCondition(FlagCondition):
         try:
             return getattr(self.expert_recommendation, 'risk_level', None) == RiskLevel.MEDIUM
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error evaluating medium risk condition: {e}", exc_info=True)
             return False
     def get_description(self) -> str:
@@ -627,6 +646,7 @@ class LowRiskCondition(FlagCondition):
         try:
             return getattr(self.expert_recommendation, 'risk_level', None) == RiskLevel.LOW
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error evaluating low risk condition: {e}", exc_info=True)
             return False
     def get_description(self) -> str:
@@ -715,6 +735,7 @@ class NewTargetHigherCondition(FlagCondition):
             return is_higher
             
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error evaluating new target higher condition: {e}", exc_info=True)
             # Clear tracking variables on error
             self.current_tp_price = None
@@ -811,6 +832,7 @@ class NewTargetLowerCondition(FlagCondition):
             return is_lower
             
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error evaluating new target lower condition: {e}", exc_info=True)
             # Clear tracking variables on error
             self.current_tp_price = None
@@ -869,6 +891,7 @@ class RatingChangeCondition(FlagCondition):
                    current.recommended_action == self.to_rating)
 
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error evaluating rating change condition ({self.from_rating} -> {self.to_rating}): {e}", exc_info=True)
             return False
 
@@ -978,6 +1001,7 @@ class RatingUpgradedCondition(RatingDirectionCondition):
             delta = self._rank_delta()
             return delta is not None and delta > 0
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error evaluating rating upgraded condition: {e}", exc_info=True)
             return False
 
@@ -992,6 +1016,7 @@ class RatingDowngradedCondition(RatingDirectionCondition):
             delta = self._rank_delta()
             return delta is not None and delta < 0
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error evaluating rating downgraded condition: {e}", exc_info=True)
             return False
 
@@ -1018,6 +1043,7 @@ class ExpectedProfitTargetPercentCondition(CompareCondition):
             return self.operator_func(expected_profit, self.value)
 
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error evaluating expected profit target condition: {e}", exc_info=True)
             return False
 
@@ -1076,6 +1102,7 @@ class PercentToCurrentTargetCondition(CompareCondition):
             return self.operator_func(percent_to_current_target, self.value)
             
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error evaluating percent to current target condition: {e}", exc_info=True)
             self.calculated_value = None
             return False
@@ -1160,6 +1187,7 @@ class NewTargetPercentCondition(CompareCondition):
             return self.operator_func(new_target_percent, self.value)
             
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error evaluating new target percent condition: {e}", exc_info=True)
             self.calculated_value = None
             return False
@@ -1227,6 +1255,7 @@ class PercentToNewTargetCondition(CompareCondition):
             return self.operator_func(percent_to_new_target, self.value)
             
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error evaluating percent to new target condition: {e}", exc_info=True)
             self.calculated_value = None
             return False
@@ -1309,6 +1338,7 @@ class PercentOpenToNewTargetCondition(CompareCondition):
             return self.operator_func(percent_open_to_target, self.value)
 
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error evaluating percent open-to-target condition: {e}", exc_info=True)
             self.calculated_value = None
             return False
@@ -1335,6 +1365,7 @@ def _get_transaction_for_order(existing_order):
         from ba2_common.core.trade_store import get_or_none
         transaction = get_or_none(Transaction, transaction_id)
     except Exception as e:
+        raise_if_defect(e)
         logger.error(f"Error fetching transaction {transaction_id}: {e}", exc_info=True)
         return None
 
@@ -1388,6 +1419,7 @@ def _get_option_pnl_via_transaction(account, existing_order) -> Optional[Dict]:
     try:
         quote = account.get_option_quote(existing_order.contract_symbol)
     except Exception as e:
+        raise_if_defect(e)
         logger.error(f"Error fetching option quote for {existing_order.contract_symbol}: {e}", exc_info=True)
         return None
     if quote is None:
@@ -1496,6 +1528,7 @@ def _get_spread_pnl_via_transaction(account, existing_order) -> Optional[Dict]:
         try:
             quote = account.get_option_quote(contract)
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error fetching option quote for leg {contract}: {e}", exc_info=True)
             return None
         if quote is None:
@@ -1575,6 +1608,7 @@ class ProfitLossAmountCondition(CompareCondition):
             return self.operator_func(pnl['amount'], self.value)
 
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error evaluating profit loss amount condition: {e}", exc_info=True)
             self.calculated_value = None
             return False
@@ -1606,6 +1640,7 @@ class ProfitLossPercentCondition(CompareCondition):
             return self.operator_func(pnl['percent'], self.value)
 
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error evaluating profit loss percent condition: {e}", exc_info=True)
             self.calculated_value = None
             return False
@@ -1632,6 +1667,7 @@ class ConfidenceCondition(CompareCondition):
             self.calculated_value = confidence  # Store calculated value
             return self.operator_func(confidence, self.value)
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error evaluating confidence condition: {e}", exc_info=True)
             return False
     def get_description(self) -> str:
@@ -1670,6 +1706,7 @@ class DaysOpenedCondition(CompareCondition):
                 if open_date is not None:
                     return open_date
             except Exception as e:  # noqa: BLE001
+                raise_if_defect(e)
                 logger.debug(f"DaysOpenedCondition: open_date lookup failed for "
                              f"transaction {txn_id}: {e}")
         return self.existing_order.created_at
@@ -1700,6 +1737,7 @@ class DaysOpenedCondition(CompareCondition):
             return self.operator_func(days_opened, self.value)
 
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error evaluating days opened condition: {e}", exc_info=True)
             self.calculated_value = None
             return False
@@ -1778,6 +1816,7 @@ class DaysSinceLastCloseCondition(CompareCondition):
             self.calculated_value = days
             return self.operator_func(days, self.value)
         except Exception as e:  # noqa: BLE001
+            raise_if_defect(e)
             logger.error(f"Error evaluating days-since-last-close for {self.instrument_name}: {e}",
                          exc_info=True)
             self.calculated_value = None
@@ -1836,6 +1875,7 @@ class InstrumentAccountShareCondition(CompareCondition):
             return self.operator_func(share_percent, self.value)
             
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error evaluating instrument account share condition: {e}", exc_info=True)
             return False
     
@@ -1877,6 +1917,7 @@ class InstrumentAccountShareCondition(CompareCondition):
             return total_qty * current_price
 
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error getting instrument position value: {e}", exc_info=True)
             return None
 
@@ -1904,6 +1945,7 @@ class InstrumentAccountShareCondition(CompareCondition):
             return virtual_balance
 
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error getting expert virtual equity: {e}", exc_info=True)
             return None
     
@@ -1962,6 +2004,7 @@ class PercentBelowRecentHighCondition(CompareCondition):
             return self.operator_func(self.calculated_value, self.value)
 
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error evaluating percent below recent high condition: {e}", exc_info=True)
             self.calculated_value = None
             return False
@@ -2019,6 +2062,7 @@ class PercentAboveRecentLowCondition(CompareCondition):
             return self.operator_func(self.calculated_value, self.value)
 
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error evaluating percent above recent low condition: {e}", exc_info=True)
             self.calculated_value = None
             return False
@@ -2058,6 +2102,7 @@ class PriceVsTargetLowCondition(CompareCondition):
             self.calculated_value = (current_price - target_low) / target_low * 100
             return self.operator_func(self.calculated_value, self.value)
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error evaluating price vs target low condition: {e}", exc_info=True)
             self.calculated_value = None
             return False
@@ -2097,6 +2142,7 @@ class PriceVsTargetHighCondition(CompareCondition):
             self.calculated_value = (current_price - target_high) / target_high * 100
             return self.operator_func(self.calculated_value, self.value)
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error evaluating price vs target high condition: {e}", exc_info=True)
             self.calculated_value = None
             return False
@@ -2132,6 +2178,7 @@ class PriceVsTargetConsensusCondition(CompareCondition):
             self.calculated_value = (current_price - target_consensus) / target_consensus * 100
             return self.operator_func(self.calculated_value, self.value)
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error evaluating price vs target consensus condition: {e}", exc_info=True)
             self.calculated_value = None
             return False
@@ -2182,6 +2229,7 @@ class IVRankCondition(CompareCondition):
             return self.operator_func(rank, self.value)
 
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error evaluating IV rank condition: {e}", exc_info=True)
             self.calculated_value = None
             return False
@@ -2249,6 +2297,7 @@ class DaysToEarningsCondition(CompareCondition):
                 return None
             return min(future)
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error fetching next earnings date for {symbol}: {e}", exc_info=True)
             return None
 
@@ -2272,6 +2321,7 @@ class DaysToEarningsCondition(CompareCondition):
             return self.operator_func(days, self.value)
 
         except Exception as e:
+            raise_if_defect(e)
             logger.error(f"Error evaluating days to earnings condition: {e}", exc_info=True)
             self.calculated_value = None
             return False
@@ -2316,6 +2366,7 @@ class HasOptionPositionCondition(FlagCondition):
             return self._has
 
         except Exception as e:
+            raise_if_defect(e)
             logger.error(
                 f"Error checking option position for {self.instrument_name}: {e}", exc_info=True)
             return False
@@ -2363,6 +2414,7 @@ class HasCoveredCallCondition(FlagCondition):
             return self._has
 
         except Exception as e:
+            raise_if_defect(e)
             logger.error(
                 f"Error checking covered call for {self.instrument_name}: {e}", exc_info=True)
             return False
@@ -2410,6 +2462,7 @@ class HasProtectivePutCondition(FlagCondition):
             return self._has
 
         except Exception as e:
+            raise_if_defect(e)
             logger.error(
                 f"Error checking protective put for {self.instrument_name}: {e}", exc_info=True)
             return False

@@ -48,8 +48,17 @@ def test_screen_universe_uses_metric_store_when_store_set(monkeypatch):
         captured["settings"] = settings
         return ["aapl", "Msft"]  # lower/mixed case -> must be uppercased
 
+    # The fake REPLACES sys.modules["...metric_store"], so it must expose everything the code
+    # imports from that module -- not just the two functions this test stubs. _metric_store_settings
+    # also does `from ...metric_store import METRIC_STORE_KEYS, normalize_screener_settings`, and
+    # when the fake lacked them the ImportError was swallowed by FactorRanker's fallback and the
+    # test failed with a confusing empty result instead of a missing-attribute error.
+    # Delegate the real symbols so the fake stays in step with the module it stands in for.
+    import ba2_providers.screener.metric_store as _real_ms
     fake_ms = SimpleNamespace(load_store=fake_load_store,
-                              screen_universe_as_of=fake_screen_as_of)
+                              screen_universe_as_of=fake_screen_as_of,
+                              METRIC_STORE_KEYS=_real_ms.METRIC_STORE_KEYS,
+                              normalize_screener_settings=_real_ms.normalize_screener_settings)
 
     # Local import target: ba2_providers.screener.metric_store
     import ba2_providers.screener as screener_pkg
@@ -137,7 +146,7 @@ def test_metric_store_settings_strips_screener_prefix():
         "screener_max_stocks": 10,
         "screener_sort_metric": "market_cap",
         "screener_weinstein_stage2_only": True,
-        # keys the store does NOT support — must not leak through
+        # float_min/price_drop_days ARE store keys (see METRIC_STORE_KEYS); provider is not.
         "screener_float_min": 10_000_000,
         "screener_price_drop_days": 1,
         "screener_provider": "fmp",
@@ -156,7 +165,13 @@ def test_metric_store_settings_strips_screener_prefix():
         "max_stocks": 10,
         "sort_metric": "market_cap",
         "weinstein_stage2_only": True,
+        # float_min / price_drop_days ARE supported by the store. They were added to
+        # METRIC_STORE_KEYS in 60122df ("stop dropping supported filters") precisely because
+        # FactorRanker's hand-rolled mapping had been silently discarding them. This test
+        # predates that and used to assert the OLD, dropping behaviour.
+        "float_min": 10_000_000,
+        "price_drop_days": 1,
     }
-    # None of the unsupported / prefixed keys leaked into the translated dict.
-    assert "float_min" not in out and "price_drop_days" not in out and "provider" not in out
+    # `provider` is genuinely NOT a store key, and no prefixed key may leak through.
+    assert "provider" not in out
     assert not any(k.startswith("screener_") for k in out)
