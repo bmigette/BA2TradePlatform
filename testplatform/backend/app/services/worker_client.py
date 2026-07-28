@@ -90,6 +90,28 @@ class WorkerJobLost(Exception):
     broad ``Exception`` and requeue/retry — see distributed_eval.py's ``_dispatch_remote``)."""
 
 
+def cancel_job(worker: dict, job_id: str, timeout: float = 10.0) -> dict:
+    """Best-effort: tell *worker* to abandon *job_id*.
+
+    Called when the master gives up on a trial. Without it the worker keeps computing a result
+    nobody will collect, holding a slot until its 6h orphan sweep -- so a timeout REMOVED
+    capacity instead of freeing it, which is how the Senate S5 grid went 12 timeouts straight
+    into "worker dead" (opt 226, 2026-07-28).
+
+    NEVER raises: this runs on the failure path, and a cancel that fails must not mask the
+    original error the caller is already handling.
+    """
+    try:
+        with httpx.Client(timeout=timeout) as c:
+            r = c.post(f"{_base(worker)}/cancel-job/{job_id}", headers=_headers(worker))
+            if r.status_code == 404:
+                return {"cancelled": False, "reason": "unknown job"}
+            r.raise_for_status()
+            return r.json()
+    except Exception as e:  # noqa: BLE001 — see docstring
+        return {"cancelled": False, "reason": repr(e)}
+
+
 def _submit_and_poll(worker: dict, submit_path: str, payload: dict, timeout: float,
                      poll_interval: float = 2.0) -> dict:
     """POST *payload* to *submit_path* for a job_id, then GET /job-status/{job_id} every
@@ -114,6 +136,9 @@ def _submit_and_poll(worker: dict, submit_path: str, payload: dict, timeout: flo
     with httpx.Client(timeout=call_timeout) as c:
         while True:
             if time.monotonic() >= deadline:
+                # Abandon it on the worker too, or it runs to completion for nobody and keeps
+                # its slot for up to 6h -- see cancel_job.
+                cancel_job(worker, job_id)
                 raise TimeoutError(f"worker {worker.get('name')} job {job_id} did not "
                                    f"complete within {timeout:.0f}s")
             r = c.get(status_url, headers=_headers(worker))

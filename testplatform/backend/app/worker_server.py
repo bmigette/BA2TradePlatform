@@ -45,7 +45,7 @@ import threading
 import uuid
 from concurrent.futures import Future, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
@@ -77,6 +77,24 @@ _JOBS: dict[str, Future] = {}
 _JOBS_SUBMITTED_AT: dict[str, float] = {}
 _JOBS_LOCK = threading.Lock()
 _JOBS_MAX_ORPHAN_AGE = 6 * 3600.0  # 6h: generous vs. any real trial; just bounds a leak
+
+# COOPERATIVE CANCEL (2026-07-28). Per-job control block, a Manager dict proxy passed into the
+# pool child: {"cancel": bool, "bars": int}. The trial's progress_cb reads it every throttled
+# bar and aborts when cancel flips.
+#
+# WHY COOPERATIVE AND NOT A KILL: the trial runs in a shared ProcessPoolExecutor. Terminating one
+# child raises BrokenProcessPool for every OTHER in-flight trial on this worker — unacceptable
+# when three healthy trials are sharing the pool.
+#
+# WHY IT MATTERS: before this, a trial the master gave up on kept computing and held its slot
+# until the 6h orphan sweep, so a TIMEOUT REMOVED CAPACITY instead of freeing it. Retries then
+# landed on an ever-more-loaded worker: the Senate S5 grid went 4 slots x 3 retries = 12
+# timeouts straight into "worker dead" (opt 226, 2026-07-28).
+#
+# A Manager proxy (not multiprocessing.Value) because it must be PICKLABLE to cross into a
+# spawn-based pool child as a task argument; a raw Value can only be inherited at fork.
+_JOB_CTL: dict[str, Any] = {}
+_MANAGER = None
 
 
 def _install_orchestration_file_logging() -> None:
@@ -175,6 +193,14 @@ def _sweep_orphaned_jobs() -> None:
         for jid in stale:
             _JOBS.pop(jid, None)
             _JOBS_SUBMITTED_AT.pop(jid, None)
+            ctl = _JOB_CTL.pop(jid, None)
+            if ctl is not None:
+                # Sweeping an orphan now also STOPS it. Previously the registry entry was
+                # dropped while the trial kept burning a slot to completion.
+                try:
+                    ctl["cancel"] = True
+                except Exception:  # noqa: BLE001
+                    pass
     if stale:
         logger.warning("swept %d orphaned job(s) never polled to completion: %s", len(stale), stale)
 
@@ -190,8 +216,11 @@ def _submit_job(fn, *args) -> str:
     if _POOL is None:
         raise HTTPException(status_code=503, detail="Worker pool not initialized.")
     job_id = uuid.uuid4().hex
+    ctl = _new_job_ctl()
     try:
-        future = _POOL.submit(fn, *args)
+        # ctl rides as a trailing arg; _trial_worker takes it as an optional keyword-style
+        # positional so an older master (which never sends one) still works unchanged.
+        future = _POOL.submit(fn, *args, ctl)
     except BrokenProcessPool as e:
         _rebuild_pool(e)
         future = Future()
@@ -199,7 +228,53 @@ def _submit_job(fn, *args) -> str:
     with _JOBS_LOCK:
         _JOBS[job_id] = future
         _JOBS_SUBMITTED_AT[job_id] = _time.monotonic()
+        if ctl is not None:
+            _JOB_CTL[job_id] = ctl
     return job_id
+
+
+def _new_job_ctl():
+    """Fresh per-job control block, or None if a Manager can't be started.
+
+    Degrades to None rather than failing the submit: without a control block the job simply
+    isn't cancellable, which is exactly today's behaviour — never a reason to refuse work.
+    """
+    global _MANAGER
+    try:
+        if _MANAGER is None:
+            import multiprocessing
+            _MANAGER = multiprocessing.Manager()
+        return _MANAGER.dict({"cancel": False, "bars": 0})
+    except Exception as e:  # noqa: BLE001
+        logger.warning("job control block unavailable (%r); job will not be cancellable", e)
+        return None
+
+
+def _cancel_job(job_id: str) -> dict:
+    """Flag a job for cooperative cancellation and drop it from the registry.
+
+    Returns ``{"cancelled": bool, "was_running": bool}``. A job that already finished, or whose
+    control block is missing, is reported honestly rather than pretended-cancelled — the caller
+    (a master that just timed out) uses this only as best-effort cleanup.
+    """
+    with _JOBS_LOCK:
+        future = _JOBS.pop(job_id, None)
+        _JOBS_SUBMITTED_AT.pop(job_id, None)
+        ctl = _JOB_CTL.pop(job_id, None)
+    if future is None:
+        raise HTTPException(status_code=404, detail=f"job {job_id!r} unknown")
+    # Not yet started -> a plain Future.cancel() is enough and frees the slot immediately.
+    if future.cancel():
+        return {"cancelled": True, "was_running": False}
+    if ctl is None:
+        return {"cancelled": False, "was_running": True}
+    try:
+        ctl["cancel"] = True
+    except Exception as e:  # noqa: BLE001 — a dead manager must not 500 the caller
+        logger.warning("could not flag job %s for cancel (%r)", job_id, e)
+        return {"cancelled": False, "was_running": True}
+    logger.warning("job %s flagged for cooperative cancel", job_id)
+    return {"cancelled": True, "was_running": True}
 
 
 def _job_status(job_id: str) -> dict:
@@ -218,6 +293,7 @@ def _job_status(job_id: str) -> dict:
     with _JOBS_LOCK:
         _JOBS.pop(job_id, None)
         _JOBS_SUBMITTED_AT.pop(job_id, None)
+        _JOB_CTL.pop(job_id, None)   # control block dies with the job it belonged to
     try:
         result = future.result()
     except BrokenProcessPool as e:
@@ -457,6 +533,17 @@ def job_status(job_id: str, authorization: str = Header(default=None)):
     rather than keep polling."""
     _verify(authorization)
     return _job_status(job_id)
+
+
+@worker_app.post("/cancel-job/{job_id}")
+def cancel_job(job_id: str, authorization: str = Header(default=None)):
+    """Abandon a job: flag it for cooperative cancellation and forget it.
+
+    Called by a master that gave up (timeout). Without it the trial runs to completion for a
+    result nobody will collect, holding a worker slot for up to _JOBS_MAX_ORPHAN_AGE — so a
+    timeout REMOVED capacity instead of freeing it (see _JOB_CTL)."""
+    _verify(authorization)
+    return _cancel_job(job_id)
 
 
 @worker_app.post("/cache/prune")

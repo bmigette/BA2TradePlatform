@@ -146,7 +146,37 @@ def _capture_full_result(buffer: Dict[str, Any], key: str, out: Dict[str, Any]) 
 _last_gen_full_results_by_opt: Dict[int, Dict[str, Any]] = {}
 
 
-def _trial_worker(config: Dict[str, Any], fitness_metric: str) -> Dict[str, Any]:
+class TrialCancelled(Exception):
+    """The master abandoned this trial (timeout) and the worker flagged it for cancellation."""
+
+
+def _cancel_progress_cb(ctl):
+    """progress_cb that aborts the run when *ctl* is flagged for cancel; None when uncancellable.
+
+    Rides the engine's EXISTING per-bar ``progress_cb`` hook (daily_engine.DailyBacktestEngine),
+    which is already throttled -- calling it per bar was once ~36% of runtime, so the throttle
+    is load-bearing and this must not bypass it. Reading a Manager proxy is an IPC round-trip,
+    which is affordable at the throttled cadence and would NOT be per raw bar.
+
+    Returning None (rather than a no-op lambda) when there is no control block keeps the
+    uncancellable path byte-identical to the old behaviour: run_daily_backtest substitutes its
+    own no-op.
+    """
+    if ctl is None:
+        return None
+
+    def _cb(pct: float, msg: str) -> None:
+        try:
+            cancelled = bool(ctl.get("cancel"))
+        except Exception:  # noqa: BLE001 — a dead manager must never fail a healthy trial
+            return
+        if cancelled:
+            raise TrialCancelled("cancelled by master (abandoned)")
+
+    return _cb
+
+
+def _trial_worker(config: Dict[str, Any], fitness_metric: str, ctl: Any = None) -> Dict[str, Any]:
     """Run ONE deterministic daily backtest in a worker PROCESS and return a tiny summary.
 
     Only the CPU-bound backtest runs here (no GIL contention with the GA loop); the result is
@@ -167,7 +197,7 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str) -> Dict[str, Any]
         from app.services.backtest.daily_backtest_handler import run_daily_backtest
         from app.services.strategy_fitness import compute_fitness
 
-        results = run_daily_backtest(config)
+        results = run_daily_backtest(config, progress_cb=_cancel_progress_cb(ctl))
         fit = compute_fitness(fitness_metric, results)
         out = {"ok": True, "fitness": float(fit),
                "trades": int(results.get("total_trades") or 0), "error": None,
@@ -183,6 +213,11 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str) -> Dict[str, Any]
         # A cache miss is FATAL (a data/config problem, not a bad-parameter trial): every trial
         # will hit the same gap, so flag it so the parent can abort with the actionable message
         # instead of grinding the whole population to 0 fitness.
+        # A CANCEL is not a bad genome -- the master abandoned it. Report it as retryable so a
+        # requeue re-runs it elsewhere rather than recording a bogus 0-fitness result.
+        if isinstance(e, TrialCancelled):
+            return {"ok": False, "fitness": 0.0, "trades": 0, "error": "cancelled",
+                    "cancelled": True, "retryable": True, "fatal": False}
         fatal = type(e).__name__ in ("BacktestCacheMiss", "FMPHistoryCacheMiss")
         return {"ok": False, "fitness": 0.0, "trades": 0, "error": str(e) if fatal else repr(e),
                 "fatal": fatal, "mem": _trial_memory_snapshot()}
@@ -202,7 +237,7 @@ def _trial_memory_snapshot() -> Dict[str, Any]:
         return {"error": repr(e)}
 
 
-def _persist_trial_worker(config: Dict[str, Any]) -> Dict[str, Any]:
+def _persist_trial_worker(config: Dict[str, Any], ctl: Any = None) -> Dict[str, Any]:
     """Run a TOP-N re-run and return the FULL results dict (equity curve / trades / metrics) for
     the master to persist as a tagged Backtest.
 
@@ -210,6 +245,10 @@ def _persist_trial_worker(config: Dict[str, Any]) -> Dict[str, Any]:
     the whole results blob. Used by ``_persist_top_backtests`` to fan the independent re-runs across
     a bounded local process pool (the re-runs are the slow post-GA phase). On error returns
     ``{ok: False, error}`` so one bad re-run never poisons the pool or aborts the others.
+
+    ``ctl`` is the worker's per-job cancellation block. It is accepted here because
+    ``worker_server._submit_job`` appends one to EVERY pooled call — without this parameter
+    /submit-trial-full would raise a TypeError on arity the moment cancellation shipped.
     """
     try:
         from app.services.backtest.daily_backtest_handler import run_daily_backtest

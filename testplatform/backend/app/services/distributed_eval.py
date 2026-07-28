@@ -77,7 +77,8 @@ class DistributedEvaluator:
     def __init__(self, submit_pool, fitness_metric: str, n_consumers: int,
                  optimization_id: Any, workers: Optional[List[dict]] = None,
                  master_version: Optional[str] = None, log=logger.warning,
-                 requeue_timeout: float = 1800.0,
+                 trial_timeout: float = 10800.0,
+                 requeue_timeout: float = 12600.0,
                  pool_factory: Optional[Callable[[], Any]] = None,
                  max_remote_slots_per_worker: Optional[int] = None):
         self.pool = submit_pool
@@ -94,7 +95,18 @@ class DistributedEvaluator:
         # see max_remote_worker_slots there) so a worker that advertises 8 slots doesn't run 8
         # concurrent trials of an expert whose per-trial footprint would OOM it.
         self.max_remote_slots_per_worker = max_remote_slots_per_worker
-        self.requeue_timeout = requeue_timeout  # safety net: re-queue a trial whose worker vanished
+        # 2026-07-28: both budgets were 1800s, which is only ~2x a real trial and collapsed the
+        # Senate 5min grid twice. MEASURED on an idle box (test_files/profile_senate_trial.py):
+        # a 6-month S1/S3/S5 trial is 126-144s, so the full 2023-2026 window is ~15 min/trial —
+        # and under 4 local + 4 remote concurrent trials it crosses 30 min. S4 lost 6 trials to
+        # this and S5 lost 12 (4 slots x 3 retries), after which the worker was declared dead.
+        # The strategy was NOT at fault: S5 measured within 6% of S3.
+        #
+        # requeue_timeout MUST stay above trial_timeout. It re-queues a trial whose worker
+        # vanished; if it fired first, a slow-but-healthy trial would be duplicated onto another
+        # slot while the original is still running — wasting exactly the capacity we are short of.
+        self.trial_timeout = trial_timeout
+        self.requeue_timeout = max(requeue_timeout, trial_timeout * 1.15)
         self.broker = TrialBroker()  # OWN broker (per-optimization isolation; queue is max_workers=4)
         self._stop = threading.Event()
         self._threads: List[threading.Thread] = []
@@ -301,7 +313,8 @@ class DistributedEvaluator:
                 self._stop.wait(0.1)
                 continue
             try:
-                out = worker_client.run_trial(w, job["config"], job["fitness_metric"])
+                out = worker_client.run_trial(w, job["config"], job["fitness_metric"],
+                                              timeout=self.trial_timeout)
                 # RETRYABLE worker-side failure (e.g. the remote's own trial pool broke —
                 # WinError 1450 killing a child mid-IPC): the worker returns HTTP 200 with
                 # ``retryable: True`` after rebuilding its pool. The failure says nothing
