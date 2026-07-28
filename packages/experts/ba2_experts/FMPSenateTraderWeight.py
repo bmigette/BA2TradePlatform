@@ -123,14 +123,29 @@ def clear_worker_scoring_cache() -> None:
     _WORKER_SCORING_CACHE.clear()
 
 
-def _dump_scoring_cache(cache, fh) -> None:
-    """Serialize a scoring cache — a ``ScoringTable`` streams itself, a plain dict goes through
-    ``json.dump``. Both produce identical bytes, so which one is in memory never reaches disk."""
-    dump = getattr(cache, "dump_json", None)
-    if dump is not None:
-        dump(fh)
-    else:
-        json.dump(cache, fh)
+def _write_scoring_cache(cache, base_path: str) -> None:
+    """Persist a scoring cache, preferring the streamable JSON-Lines layout.
+
+    A ``ScoringTable`` writes ``.jsonl`` (one entry per line) and RETIRES the legacy ``.json``
+    once the new file is safely in place: leaving both would let a stale base outlive the fresh
+    one invisibly, since the loader prefers ``.jsonl``. A plain dict (BA2_SCORING_TABLE=0) keeps
+    writing the legacy single-object format, so the escape hatch stays round-trippable.
+    """
+    dump_jsonl = getattr(cache, "dump_jsonl", None)
+    if dump_jsonl is None:
+        tmp = f"{base_path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(cache, f)
+        os.replace(tmp, base_path)
+        return
+
+    jsonl_path = FMPSenateTraderWeight._scoring_cache_jsonl_path(base_path)
+    tmp = f"{jsonl_path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        dump_jsonl(f)
+    os.replace(tmp, jsonl_path)          # atomic: a reader never sees a partial file
+    if os.path.exists(base_path):
+        os.remove(base_path)
 
 
 def set_scoring_cache_max(n: int) -> int:
@@ -171,10 +186,7 @@ def flush_all_scoring_caches() -> int:
     for path, cache in list(_WORKER_SCORING_CACHE.items()):
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            tmp = f"{path}.{os.getpid()}.flush.tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                _dump_scoring_cache(cache, f)
-            os.replace(tmp, path)          # atomic: a concurrent reader never sees a partial file
+            _write_scoring_cache(cache, path)
             delta = path + ".delta.jsonl"  # folded in by this compaction; must not be re-applied
             if os.path.exists(delta):
                 os.remove(delta)
@@ -1441,6 +1453,19 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         from ba2_common.config import CACHE_FOLDER
         return os.path.join(CACHE_FOLDER, "fmp_history", filename)
 
+    @staticmethod
+    def _scoring_cache_jsonl_path(path: str) -> str:
+        """The streamable sibling of a ``.json`` base file.
+
+        A distinct EXTENSION rather than sniffing the content: a legacy base file is a single
+        line and is itself valid JSON, so "parse the first line and see" cannot tell the two
+        apart without reading the whole thing -- which is exactly the cost the format exists to
+        avoid. ``.jsonl`` wins when both are present; see ``tools/jsonl_scoring_caches.py`` for
+        the one-off conversion (BACKTESTS NEVER WRITE, so an unconverted shard would otherwise
+        stay on the legacy path forever).
+        """
+        return path[:-len(".json")] + ".jsonl" if path.endswith(".json") else path + ".jsonl"
+
     def _scoring_cache_delta_path(self, filename: str) -> str:
         return self._scoring_cache_path(filename) + ".delta.jsonl"
 
@@ -1459,11 +1484,6 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             _WORKER_SCORING_CACHE.move_to_end(path)  # LRU touch
             setattr(self, attr, cache)
             return cache
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                cache = json.load(f)
-        except Exception:  # noqa: BLE001 — missing/corrupt cache -> start fresh, never fatal
-            cache = {}
         # Column-oriented storage. These shards are 400-600k entries whose values are fixed,
         # all-numeric dicts, i.e. almost pure Python boxing: measured 173MB -> 67MB on the real
         # confidence shard, at +44ms per trial (0.07% of a 64.5s trial). ScoringTable is
@@ -1471,15 +1491,47 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         #
         # BA2_SCORING_TABLE=0 falls back to plain dicts: an escape hatch for a data-structure
         # swap on the hot scoring path, and the control arm for measuring it.
-        if _USE_SCORING_TABLE and isinstance(cache, dict):
-            # Drain the source dict as the table is built so peak memory is ~max(dict, table)
-            # rather than their SUM -- load is the moment a worker is closest to OOM, and
-            # holding both would make the peak worse than the plain-dict path it improves on.
-            table = ScoringTable()
-            while cache:
-                k, v = cache.popitem()
-                table[k] = v
-            cache = table
+        jsonl_path = self._scoring_cache_jsonl_path(path)
+        cache = None
+        if os.path.exists(jsonl_path):
+            # STREAMING path: one entry in flight, so peak memory is the loaded form itself
+            # rather than the dict representation it replaces.
+            #
+            # DELIBERATELY NOT gated on _USE_SCORING_TABLE. The conversion tool REMOVES the
+            # legacy .json, so gating this on the table would make BA2_SCORING_TABLE=0 load
+            # every shard as EMPTY on a converted cache -- silently, since an empty scoring
+            # cache is valid (it just recomputes). The escape hatch has to read whatever is
+            # actually on disk; only the in-memory representation differs. Caught by the
+            # control arm of the memory A/B reporting 0 MB loaded.
+            try:
+                with open(jsonl_path, "r", encoding="utf-8") as f:
+                    if _USE_SCORING_TABLE:
+                        cache = ScoringTable.from_jsonl(f)
+                    else:
+                        cache = {}
+                        for line in f:
+                            line = line.strip()
+                            if line:
+                                entry = json.loads(line)
+                                cache[entry["k"]] = entry["v"]
+            except OSError:  # unreadable -> fall through to the legacy base / empty
+                cache = None
+        if cache is None:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    cache = json.load(f)
+            except Exception:  # noqa: BLE001 — missing/corrupt cache -> start fresh, never fatal
+                cache = {}
+            if _USE_SCORING_TABLE and isinstance(cache, dict):
+                # LEGACY base: json.load has already materialised every entry, so the best
+                # available is to drain the dict as the table is built -- peak ~max(dict, table)
+                # instead of their sum. Convert the shard (tools/jsonl_scoring_caches.py) to get
+                # the streaming path and the full peak win.
+                table = ScoringTable()
+                while cache:
+                    k, v = cache.popitem()
+                    table[k] = v
+                cache = table
         try:
             with open(self._scoring_cache_delta_path(filename), "r", encoding="utf-8") as f:
                 for line in f:
@@ -1508,10 +1560,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         path = self._scoring_cache_path(filename)
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            tmp = path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                _dump_scoring_cache(cache, f)
-            os.replace(tmp, path)
+            _write_scoring_cache(cache, path)
             delta_path = self._scoring_cache_delta_path(filename)
             if os.path.exists(delta_path):
                 os.remove(delta_path)

@@ -47,6 +47,21 @@ def _expert():
 SHARDS = [f"congress_skill_scores__{h}_5_50_{lb}.json" for h in (30, 60, 90) for lb in (6, 12)]
 
 
+def _read_flushed(cache_dir, name):
+    """Read back what a flush wrote. Flushes land in the streamable JSON-Lines sibling (one
+    ``{"k":…,"v":…}`` per line), not the legacy single-object ``.json`` — see
+    test_scoring_cache_jsonl.py."""
+    p = cache_dir / (name[:-len(".json")] + ".jsonl")
+    if not p.exists():
+        return {}
+    out = {}
+    for line in p.read_text().splitlines():
+        if line.strip():
+            e = json.loads(line)
+            out[e["k"]] = e["v"]
+    return out
+
+
 def test_every_resident_shard_is_written_to_its_own_path(cache_dir):
     """The core fix: 6 shards in, 6 shards out, each where it came from."""
     set_scoring_cache_max(len(SHARDS))
@@ -59,8 +74,7 @@ def test_every_resident_shard_is_written_to_its_own_path(cache_dir):
     assert flush_all_scoring_caches() == len(SHARDS)
 
     for i, name in enumerate(SHARDS):
-        on_disk = json.loads((cache_dir / name).read_text())
-        assert on_disk == {f"trader|{i}|2024-01-01": {"skill_score": float(i)}}, (
+        assert _read_flushed(cache_dir, name) == {f"trader|{i}|2024-01-01": {"skill_score": float(i)}}, (
             f"{name} did not receive its own scores")
 
 
@@ -87,7 +101,7 @@ def test_an_evicted_shard_is_silently_absent_from_the_flush(cache_dir):
         e._load_scoring_cache("_skill_cache", name)["k"] = {"skill_score": 1.0}
 
     assert flush_all_scoring_caches() == 2, "only the still-resident shards can be written"
-    written = [n for n in SHARDS if json.loads((cache_dir / n).read_text())]
+    written = [n for n in SHARDS if _read_flushed(cache_dir, n)]
     assert len(written) == 2 and written == SHARDS[-2:], "the surviving shards are the newest two"
 
 
