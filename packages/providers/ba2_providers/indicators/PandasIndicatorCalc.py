@@ -138,23 +138,39 @@ class PandasIndicatorCalc(MarketIndicatorsInterface):
         start_dt = pd.to_datetime(start_date)
         end_dt = pd.to_datetime(end_date)
         
-        # Make start_dt and end_dt timezone-aware if df['Date'] is timezone-aware
-        if hasattr(df["Date"], 'dt') and df["Date"].dt.tz is not None:
-            # DataFrame dates are timezone-aware, make filter dates match
+        # Reconcile timezone-awareness between df['Date'] and the filter bounds. BOTH directions
+        # must be handled: pandas raises TypeError on ANY naive-vs-aware comparison, and the
+        # caller's awareness is not something this function controls.
+        #
+        # 2026-07-28: only the df-aware branch existed, so the mirror case (naive df, tz-AWARE
+        # bounds — exactly what the backtest passes, since as_of is UTC-aware) fell through to the
+        # comparison and raised "Cannot compare tz-naive and tz-aware datetime-like objects".
+        # @log_provider_call swallowed it into "Failed to get atr for <SYMBOL>", and pool workers
+        # run at logging.disable(ERROR), so it was INVISIBLE in every grid log. Net effect: ATR
+        # silently unavailable, which makes use_atr_stop / atr_multiplier / atr_period inert GA
+        # genes and drops the stop back to min_stop_loss_pct.
+        df_tz = df["Date"].dt.tz if hasattr(df["Date"], "dt") else None
+        if df_tz is not None:
+            # df is aware -> bounds must be aware, in the df's zone.
             if start_dt.tzinfo is None:
-                # Timestamp is naive, localize it
                 start_dt = start_dt.tz_localize('UTC')
-            elif start_dt.tz != df["Date"].dt.tz:
-                # Timestamp has different timezone, convert it
-                start_dt = start_dt.tz_convert(df["Date"].dt.tz)
-            
+            elif start_dt.tz != df_tz:
+                start_dt = start_dt.tz_convert(df_tz)
+
             if end_dt.tzinfo is None:
-                # Timestamp is naive, localize it
                 end_dt = end_dt.tz_localize('UTC')
-            elif end_dt.tz != df["Date"].dt.tz:
-                # Timestamp has different timezone, convert it
-                end_dt = end_dt.tz_convert(df["Date"].dt.tz)
-        
+            elif end_dt.tz != df_tz:
+                end_dt = end_dt.tz_convert(df_tz)
+        else:
+            # df is naive -> strip tz from the bounds. Naive frames are treated as UTC, matching
+            # the assumption the branch above already makes when it localizes naive bounds to UTC;
+            # converting to UTC FIRST means a non-UTC bound still selects the correct instant
+            # rather than being silently shifted by its offset.
+            if start_dt.tzinfo is not None:
+                start_dt = start_dt.tz_convert('UTC').tz_localize(None)
+            if end_dt.tzinfo is not None:
+                end_dt = end_dt.tz_convert('UTC').tz_localize(None)
+
         mask = (df["Date"] >= start_dt) & (df["Date"] <= end_dt)
         filtered_df = df.loc[mask, ["Date", indicator]].copy()
         
