@@ -31,21 +31,28 @@ currently characterise.
 MODES (env ``BA2_ERROR_MODE``), because flipping ~95 handlers from absorb-all to
 propagate-unless-named is a real behaviour change in LIVE trading:
 
-    observe   log what WOULD have propagated, then absorb  (CURRENT DEFAULT — staged rollout)
-    enforce   propagate — the intended end state
+    enforce   propagate — the intended end state, and the CURRENT DEFAULT
+    observe   log what WOULD have propagated, then absorb  (the staged-rollout mode)
     legacy    absorb everything, no logging — escape hatch only
 
-DEFAULT IS ``observe`` ON PURPOSE, and this is a temporary staging decision, not the design.
-Flipping ~95 handlers from absorb-all to propagate-unless-named is a real behaviour change in
-LIVE trading, and turning it on immediately showed why: it surfaced 5 option tests that pass in
-isolation but fail in a full-suite run, i.e. pre-existing test-order pollution that the old
-swallow had been hiding. Those are worth fixing, but not by discovering them one production
-incident at a time.
+ENFORCE SINCE 2026-07-28, on measurement rather than on a guess. The rollout ran in ``observe``
+first, which was the right call: turning it on immediately had surfaced 5 option tests that pass
+in isolation but fail in a full-suite run — pre-existing test-order pollution the old swallow was
+hiding. The flip happened only once all of the following held:
 
-    set BA2_ERROR_MODE=enforce      # flip when the measurement says it is safe
+  * the full suite (1072 tests) passed under ``enforce``;
+  * a real Senate S3 trial (498 symbols, 3 months, 5min) absorbed NOTHING in observe mode — and
+    a deliberate canary confirmed the WOULD-RAISE line does reach that run's log, because an
+    empty result proves nothing on its own (exactly how the ATR tz bug survived for months);
+  * the one genuine data condition found — ``InstanceNotFound`` when a Ruleset is deleted while
+    a recommendation still references it — was NAMED at its call site rather than absorbed by
+    the broad catch.
 
-Run a full grid in ``observe`` and grep for ``WOULD-RAISE``: that turns the benign set from a
-guess into a measurement, per call site, before anything starts failing for real. Then flip.
+    set BA2_ERROR_MODE=observe      # to re-measure after adding handlers
+    set BA2_ERROR_MODE=legacy       # escape hatch if enforce ever breaks live unexpectedly
+
+To calibrate new sites: run in ``observe``, then ``python tools/summarize_would_raise.py <logs>``
+for a per-site table. Name the genuine data conditions, fix the rest, return to ``enforce``.
 """
 from __future__ import annotations
 
@@ -68,7 +75,7 @@ _BENIGN_DEFAULT: tuple = (OSError,)
 
 
 def _mode() -> str:
-    return (os.environ.get(_MODE_ENV) or "observe").strip().lower()
+    return (os.environ.get(_MODE_ENV) or "enforce").strip().lower()
 
 
 def _caller_site() -> str:

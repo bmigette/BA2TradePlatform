@@ -136,18 +136,27 @@ def test_legacy_mode_absorbs_everything(monkeypatch):
     absorb_if_benign(TypeError("boom"))        # escape hatch only
 
 
-def test_default_mode_is_observe_during_the_staged_rollout(monkeypatch):
-    """Deliberately NOT enforce yet -- see the module docstring. Enforcing immediately surfaced
-    pre-existing test-order pollution that the old swallow was hiding, and would change live
-    trading behaviour on guesses rather than on measurement."""
+def test_default_mode_is_enforce(monkeypatch):
+    """The intended end state, reached 2026-07-28 on measurement: the full suite passed under
+    enforce, and a real Senate trial absorbed nothing in observe mode (canary-verified, since an
+    empty observe log proves nothing by itself). Staged through `observe` first because flipping
+    ~95 handlers is a real change to LIVE trading behaviour."""
     monkeypatch.delenv("BA2_ERROR_MODE", raising=False)
+    with pytest.raises(TypeError):
+        absorb_if_benign(TypeError("boom"))
+
+
+def test_observe_is_still_available_for_recalibration(monkeypatch):
+    """Adding handlers means re-measuring -- observe must stay usable, not become vestigial."""
+    monkeypatch.setenv("BA2_ERROR_MODE", "observe")
     absorb_if_benign(TypeError("boom"))          # absorbed, but recorded as WOULD-RAISE
 
 
-def test_enforce_is_one_env_var_away(monkeypatch):
-    monkeypatch.setenv("BA2_ERROR_MODE", "enforce")
-    with pytest.raises(TypeError):
-        absorb_if_benign(TypeError("boom"))
+def test_a_named_benign_type_still_absorbs_under_enforce(monkeypatch):
+    """The calibration mechanism itself: enforce must not defeat per-site declarations, or the
+    only way to keep a legitimate data condition working would be to disable enforcement."""
+    monkeypatch.delenv("BA2_ERROR_MODE", raising=False)
+    absorb_if_benign(KeyError("absent field"), KeyError)
 
 
 # --------------------------------------------------------------------------- #

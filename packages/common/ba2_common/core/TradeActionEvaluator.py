@@ -13,7 +13,7 @@ from ba2_common.core.models import Ruleset, EventAction, TradingOrder, TradeActi
 from ba2_common.core.types import (
     OrderRecommendation, ExpertEventType, ExpertActionType, get_option_action_values,
 )
-from ba2_common.core.db import get_db, get_instance
+from ba2_common.core.db import get_db, get_instance, InstanceNotFound
 from ba2_common.logger import logger
 from sqlmodel import select
 import enum
@@ -215,7 +215,12 @@ class TradeActionEvaluator:
             return action_summaries
             
         except Exception as e:
-            absorb_if_benign(e)
+            # InstanceNotFound is a genuine RUNTIME condition here, not a defect: a Ruleset can
+            # be deleted while a recommendation still references its id, and the designed
+            # behaviour is to report an error for THIS evaluation rather than take down the
+            # trading loop. Named explicitly (2026-07-28) rather than left to the broad catch,
+            # so every other exception still propagates under BA2_ERROR_MODE=enforce.
+            absorb_if_benign(e, InstanceNotFound)
             logger.error(f"Error evaluating ruleset {ruleset_id}: {e}", exc_info=True)
             return [{"error": f"Error evaluating ruleset: {str(e)}"}]
     
