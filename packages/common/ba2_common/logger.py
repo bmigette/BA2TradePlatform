@@ -5,6 +5,7 @@ import os
 import io
 import sys
 import threading
+import time
 from contextlib import contextmanager
 from typing import Optional
 
@@ -71,6 +72,99 @@ def _attach_suppress(handler: RotatingFileHandler) -> RotatingFileHandler:
         handler.addFilter(_FILE_SUPPRESS_FILTER)
     return handler
 
+
+# --- Rotation that survives a lost race + one handler per file path -------------------------
+# 2026-07-28: once app.log crossed 10MB, EVERY subsequent record printed
+#   --- Logging error --- / PermissionError: [WinError 32] ... app.log -> app.log.1
+# On Windows os.rename fails while ANY other handle on the file is open. Two causes:
+#   1. this module and ``ba2_trade_platform.logger`` are near-duplicates and EACH built its
+#      own handler for the same app.log / app.debug.log / all.debug.log / all.error.log once
+#      startup pointed both at <db folder>/logs -> two handles per file in ONE process, so
+#      rotation could NEVER succeed and the files grew past maxBytes without bound.
+#      Fixed by handing out one shared instance per path (get_shared_file_handler).
+#   2. other PROCESSES write the same tree (ad-hoc scripts run from the repo, backtest/grid
+#      workers). That race is unavoidable, so rotation must degrade instead of raising.
+_ROTATE_COOLDOWN_SECONDS = 60.0
+
+
+class SharedRotatingFileHandler(RotatingFileHandler):
+    """RotatingFileHandler that keeps logging when it loses the rotation race.
+
+    The stock handler lets the PermissionError escape ``doRollover``, which logging reports
+    as "--- Logging error ---" with a full stack for every record. Here a failed rotation
+    just leaves the current file in place (temporarily over maxBytes) and is retried after
+    ``_ROTATE_COOLDOWN_SECONDS`` — no records are lost and stderr stays clean. The cooldown
+    matters: ``shouldRollover`` keeps returning True on an oversized file, so without it
+    every single record would retry the rename and the stream close/reopen.
+    """
+
+    def doRollover(self) -> None:
+        now = time.time()
+        if now < getattr(self, "_rotate_blocked_until", 0.0):
+            return  # recent attempt lost the race; keep appending and retry later
+        try:
+            super().doRollover()
+        except OSError as exc:
+            # PermissionError/WinError 32 is the expected case; any OSError is treated the
+            # same rather than letting a disk/FS problem take this process's logging down.
+            self._rotate_blocked_until = now + _ROTATE_COOLDOWN_SECONDS
+            self._rotate_last_error = exc
+            if self.stream is None:
+                # super() closes the stream BEFORE renaming, so reopen it (mode 'a') or the
+                # next emit writes to None.
+                self.stream = self._open()
+
+
+_shared_file_handlers: dict = {}
+_shared_handlers_lock = threading.Lock()
+
+
+def get_shared_file_handler(path: str, level: int,
+                            formatter: Optional[logging.Formatter] = None
+                            ) -> Optional[RotatingFileHandler]:
+    """The ONE handler for ``path`` in this process (created on first request).
+
+    Both logger trees must attach the SAME object for a shared file, otherwise the file is
+    held twice and rotation is permanently wedged (see the note above). ``level`` and
+    ``formatter`` apply to the first caller; every file here has a fixed level
+    (app.log INFO, app.debug.log DEBUG, all.error.log ERROR), so later callers for the same
+    path want the same settings. Returns None when FILE_LOGGING is off.
+    """
+    if not FILE_LOGGING:
+        return None
+    abs_path = os.path.abspath(path)
+    key = os.path.normcase(abs_path)
+    with _shared_handlers_lock:
+        handler = _shared_file_handlers.get(key)
+        if handler is None:
+            os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+            handler = SharedRotatingFileHandler(
+                abs_path, maxBytes=(1024 * 1024 * 10), backupCount=7, encoding='utf-8')
+            handler.setFormatter(formatter or logging.Formatter(LOG_FORMAT))
+            handler.setLevel(level)
+            _attach_suppress(handler)
+            _shared_file_handlers[key] = handler
+        return handler
+
+
+def evict_shared_handlers_outside(log_dir: str) -> None:
+    """Close + forget shared handlers that do not live under ``log_dir``.
+
+    Used by ``reconfigure_file_logging`` when LOGS_DIR moves. Only handlers OUTSIDE the new
+    directory are closed: both logger modules call reconfigure with the same target, and
+    closing the freshly-built handlers on the second call would leave the first module's
+    logger holding a closed stream ("I/O operation on closed file").
+    """
+    keep = os.path.normcase(os.path.abspath(log_dir))
+    with _shared_handlers_lock:
+        for key in [k for k in _shared_file_handlers
+                    if os.path.normcase(os.path.dirname(k)) != keep]:
+            try:
+                _shared_file_handlers[key].close()
+            except Exception:  # noqa: BLE001 — teardown must not raise
+                pass
+            del _shared_file_handlers[key]
+
 if STDOUT_LOGGING:
     # Create a safe StreamHandler that handles Unicode characters
     handler = logging.StreamHandler(io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace'))
@@ -100,19 +194,9 @@ def _get_all_debug_handler() -> Optional[RotatingFileHandler]:
     if not FILE_LOGGING:
         return None
     
-    # Create the shared handler
-    os.makedirs(LOGS_DIR, exist_ok=True)
-
-    _all_debug_handler = RotatingFileHandler(
-        os.path.join(LOGS_DIR, "all.debug.log"),
-        maxBytes=(1024*1024*10),  # 10MB
-        backupCount=7,
-        encoding='utf-8'
-    )
-
-    _all_debug_handler.setFormatter(logging.Formatter(LOG_FORMAT))
-    _all_debug_handler.setLevel(logging.DEBUG)
-    _attach_suppress(_all_debug_handler)
+    # One handler per path for the whole process (see get_shared_file_handler).
+    _all_debug_handler = get_shared_file_handler(
+        os.path.join(LOGS_DIR, "all.debug.log"), logging.DEBUG)
 
     return _all_debug_handler
 
@@ -133,19 +217,9 @@ def _get_all_error_handler() -> Optional[RotatingFileHandler]:
     if not FILE_LOGGING:
         return None
     
-    # Create the shared handler
-    os.makedirs(LOGS_DIR, exist_ok=True)
-
-    _all_error_handler = RotatingFileHandler(
-        os.path.join(LOGS_DIR, "all.error.log"),
-        maxBytes=(1024*1024*10),  # 10MB
-        backupCount=7,
-        encoding='utf-8'
-    )
-
-    _all_error_handler.setFormatter(logging.Formatter(LOG_FORMAT))
-    _all_error_handler.setLevel(logging.ERROR)  # Only ERROR and above
-    _attach_suppress(_all_error_handler)
+    # One handler per path for the whole process (see get_shared_file_handler).
+    _all_error_handler = get_shared_file_handler(
+        os.path.join(LOGS_DIR, "all.error.log"), logging.ERROR)
 
     return _all_error_handler
 
@@ -157,21 +231,12 @@ def _install_app_file_handlers() -> None:
     if not FILE_LOGGING:
         return
     os.makedirs(LOGS_DIR, exist_ok=True)
-    fmt = logging.Formatter(LOG_FORMAT)
-    debug_fh = RotatingFileHandler(
-        os.path.join(LOGS_DIR, "app.debug.log"), maxBytes=(1024*1024*10), backupCount=7, encoding='utf-8'
-    )
-    debug_fh.setFormatter(fmt)
-    debug_fh.setLevel(logging.DEBUG)
-    _attach_suppress(debug_fh)
-    logger.addHandler(debug_fh)
-    info_fh = RotatingFileHandler(
-        os.path.join(LOGS_DIR, "app.log"), maxBytes=(1024*1024*10), backupCount=7, encoding='utf-8'
-    )
-    info_fh.setFormatter(fmt)
-    info_fh.setLevel(logging.INFO)
-    _attach_suppress(info_fh)
-    logger.addHandler(info_fh)
+    debug_fh = get_shared_file_handler(os.path.join(LOGS_DIR, "app.debug.log"), logging.DEBUG)
+    if debug_fh:
+        logger.addHandler(debug_fh)
+    info_fh = get_shared_file_handler(os.path.join(LOGS_DIR, "app.log"), logging.INFO)
+    if info_fh:
+        logger.addHandler(info_fh)
     adh = _get_all_debug_handler()
     if adh:
         logger.addHandler(adh)
@@ -261,16 +326,10 @@ def get_expert_logger(expert_class: str, expert_id: int) -> logging.Logger:
         log_filename = f"{expert_class}-exp{expert_id}.log"
         log_filepath = os.path.join(LOGS_DIR, log_filename)
         
-        file_handler = RotatingFileHandler(
-            log_filepath,
-            maxBytes=(1024*1024*10),  # 10MB
-            backupCount=7,
-            encoding='utf-8'
-        )
-        file_handler.setLevel(logging.DEBUG)
-        file_handler.setFormatter(file_formatter)
-        _attach_suppress(file_handler)
-        expert_logger.addHandler(file_handler)
+        file_handler = get_shared_file_handler(
+            log_filepath, logging.DEBUG, formatter=file_formatter)
+        if file_handler:
+            expert_logger.addHandler(file_handler)
         
         # Add the shared all.debug.log handler to this expert logger
         all_debug_handler = _get_all_debug_handler()
@@ -307,16 +366,15 @@ def reconfigure_file_logging(log_dir: str) -> None:
     if log_dir == os.path.abspath(LOGS_DIR):
         return
 
-    # Detach + close every rotating file handler currently attached to the app logger and any
-    # already-created expert loggers (the shared all.* singletons are among them).
+    # DETACH only — do NOT close here. These handlers are now shared per path across both
+    # logger trees (see get_shared_file_handler), so closing one from this module would leave
+    # ba2_trade_platform's logger holding a closed stream ("I/O operation on closed file").
+    # Closing is the registry's job, and only for handlers outside the new directory.
     for lg in [logger, *_expert_loggers.values()]:
         for h in [h for h in lg.handlers if isinstance(h, RotatingFileHandler)]:
             lg.removeHandler(h)
-            try:
-                h.close()
-            except Exception:  # noqa: BLE001
-                pass
-    # Drop the shared singletons so they are rebuilt under the new dir.
+    evict_shared_handlers_outside(log_dir)
+    # Drop the shared singletons so they are re-resolved under the new dir.
     _all_debug_handler = None
     _all_error_handler = None
 
@@ -331,14 +389,11 @@ def reconfigure_file_logging(log_dir: str) -> None:
         if not expert_class:
             continue
         efmt = ExpertFormatter(expert_class, expert_id, LOG_FORMAT)
-        efh = RotatingFileHandler(
+        efh = get_shared_file_handler(
             os.path.join(LOGS_DIR, f"{expert_class}-exp{expert_id}.log"),
-            maxBytes=(1024*1024*10), backupCount=7, encoding='utf-8'
-        )
-        efh.setLevel(logging.DEBUG)
-        efh.setFormatter(efmt)
-        _attach_suppress(efh)
-        elog.addHandler(efh)
+            logging.DEBUG, formatter=efmt)
+        if efh:
+            elog.addHandler(efh)
         if adh:
             elog.addHandler(adh)
         if aeh:
