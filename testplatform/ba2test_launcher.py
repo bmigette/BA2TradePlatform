@@ -462,6 +462,13 @@ def _cmd_prewarm(args) -> int:
                   f"{end.date()}] — skipping.")
             return
 
+        # Size the resident-shard cap to PREWARM's working set, not a trial's. The horizon x
+        # lookback loops below are the INNERMOST ones, so all combos rotate on every (trader, day)
+        # -- at the 3-shard trial default that is continuous eviction, and any shard evicted
+        # before the final flush loses its scores entirely.
+        from ba2_experts.FMPSenateTraderWeight import set_scoring_cache_max
+        set_scoring_cache_max(len(horizon_values) * len(lookback_values))
+
         total = len(days) * len(horizon_values) * len(lookback_values) * len(_senate_seen_traders)
         print(f">> senate skill prewarm: {len(days)} trading days x {len(horizon_values)} horizons "
               f"x {len(lookback_values)} lookbacks x {len(_senate_seen_traders)} traders "
@@ -500,8 +507,24 @@ def _cmd_prewarm(args) -> int:
             if trader_idx % 25 == 0:
                 print(f"   senate skill prewarm: {trader_idx}/{len(_senate_seen_traders)} traders, "
                       f"{done_scores}/{total} scores ({time.time() - t_scores:.0f}s elapsed)", flush=True)
-        s._save_scoring_cache("_skill_cache", s._SKILL_CACHE_FILE)  # final compacting flush
-        print(f">> senate skill prewarm done: {total} scores in {time.time() - t_scores:.0f}s", flush=True)
+        # Flush EVERY shard this loop touched, each to its OWN path. The loops above walk
+        # len(horizon_values) x len(lookback_values) skill shards, and scoring runs with
+        # is_live=False (no throttled delta writes), so a single _save_scoring_cache of
+        # self._skill_cache would persist only the LAST shard touched -- and to the unsharded
+        # _SKILL_CACHE_FILE, which no trial reads. See flush_all_scoring_caches' docstring.
+        from ba2_experts.FMPSenateTraderWeight import flush_all_scoring_caches
+        n_shards = flush_all_scoring_caches()
+        print(f">> senate skill prewarm done: {total} scores in {time.time() - t_scores:.0f}s "
+              f"({n_shards} shards flushed)", flush=True)
+        expected_shards = len(horizon_values) * len(lookback_values)
+        if n_shards < expected_shards:
+            # Loud, because the failure mode this replaced was SILENT: a multi-hour prewarm that
+            # reported success while persisting a fraction of its work. The usual cause is the
+            # scoring LRU evicting shards mid-loop -- prewarm's working set is every combo, so it
+            # must run with BA2_SCORING_LRU_MAX >= expected_shards.
+            print(f"!! senate skill prewarm: flushed {n_shards} shards but the grid spans "
+                  f"{expected_shards}. Shards were evicted before the flush and their scores are "
+                  f"LOST. Re-run with BA2_SCORING_LRU_MAX={expected_shards} or higher.", flush=True)
 
     def _do_senate_latest() -> None:
         """Warm the UNSCOPED 'latest disclosures' cache entries (``congress_senate_latest/

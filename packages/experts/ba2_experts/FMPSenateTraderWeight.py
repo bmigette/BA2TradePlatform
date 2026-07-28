@@ -121,6 +121,57 @@ def clear_worker_scoring_cache() -> None:
     _WORKER_SCORING_CACHE.clear()
 
 
+def set_scoring_cache_max(n: int) -> int:
+    """Raise the resident-shard cap to at least *n*; returns the effective value.
+
+    For callers whose working set is genuinely wider than one trial's 3 files -- PREWARM walks
+    every (horizon x lookback) skill shard, so at the default cap it would both thrash and, worse,
+    EVICT shards before ``flush_all_scoring_caches`` can persist them. Never lowers the cap: the
+    default is a correctness floor (see ``_WORKER_SCORING_CACHE_MAX``), not a preference.
+
+    Set at runtime rather than via ``BA2_SCORING_LRU_MAX`` because that env var is read at import
+    time, and prewarm runs in a process that has already imported this module.
+    """
+    global _WORKER_SCORING_CACHE_MAX
+    _WORKER_SCORING_CACHE_MAX = max(_WORKER_SCORING_CACHE_MAX, int(n))
+    return _WORKER_SCORING_CACHE_MAX
+
+
+def flush_all_scoring_caches() -> int:
+    """Write EVERY resident scoring shard back to its OWN path. Returns the number written.
+
+    PREWARM CORRECTNESS. ``_do_senate_scores`` walks 6 skill shards (3 horizons x 2 lookbacks)
+    in its innermost loops and scores with ``is_live=False``, which disables the throttled delta
+    writes -- so the ONLY persistence was one final ``_save_scoring_cache("_skill_cache",
+    _SKILL_CACHE_FILE)``. That call has two faults after sharding (ffbf9f5): it writes whichever
+    single shard ``self._skill_cache`` last pointed at, discarding the other 5 combos' work, and
+    it writes to the UNSHARDED ``congress_skill_scores.json`` -- a filename no trial reads and
+    which is not even present on disk (the one-off splitter, 9c96d34, moved the originals to
+    shards). A multi-hour prewarm therefore persisted ~1/6 of its work to a dead file, while
+    still printing "prewarm done: N scores".
+
+    Driving the write off ``_WORKER_SCORING_CACHE`` (path -> dict) instead of off one ``self``
+    attribute makes that class of desync impossible: the registry IS the set of shards that were
+    loaded, so each is written back exactly where it was read from, whatever the loop order or
+    however many shards exist.
+    """
+    written = 0
+    for path, cache in list(_WORKER_SCORING_CACHE.items()):
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = f"{path}.{os.getpid()}.flush.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(cache, f)
+            os.replace(tmp, path)          # atomic: a concurrent reader never sees a partial file
+            delta = path + ".delta.jsonl"  # folded in by this compaction; must not be re-applied
+            if os.path.exists(delta):
+                os.remove(delta)
+            written += 1
+        except OSError as e:
+            logger.error("Failed to flush scoring shard %s: %s", path, e, exc_info=True)
+    return written
+
+
 @lru_cache(maxsize=None)
 def _parse_ymd_utc(date_str: str) -> datetime:
     """Parse a "%Y-%m-%d" trade-date string as UTC midnight.
