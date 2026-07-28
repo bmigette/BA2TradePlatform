@@ -23,6 +23,7 @@ deadlock. The fitness calls the synchronous runner in-process (confirmed in Repl
 """
 import logging
 import random
+import time as _time
 from datetime import datetime
 from typing import Any, Dict, Optional
 
@@ -146,6 +147,11 @@ def _capture_full_result(buffer: Dict[str, Any], key: str, out: Dict[str, Any]) 
 _last_gen_full_results_by_opt: Dict[int, Dict[str, Any]] = {}
 
 
+# Seconds between ctl-proxy reads on the progress hook. Module-level so tests can drop it to 0;
+# see _cancel_progress_cb for why reading a Manager proxy per call is not acceptable.
+_CANCEL_CHECK_INTERVAL_S = 5.0
+
+
 class TrialCancelled(Exception):
     """The master abandoned this trial (timeout) and the worker flagged it for cancellation."""
 
@@ -165,7 +171,22 @@ def _cancel_progress_cb(ctl):
     if ctl is None:
         return None
 
+    # TIME-THROTTLED, and that is load-bearing. ctl is a multiprocessing.Manager PROXY, so every
+    # read is a cross-process round-trip. Reading it on each progress_cb call made a trial
+    # >600s that runs in 123s without it (>5x) -- measured after it slowed opt 228 to ~75
+    # min/trial. The engine already throttles progress_cb (per-bar calls were once 36% of
+    # runtime), but that throttle was tuned for a LOCAL callback, not for IPC.
+    #
+    # A 5s cancellation latency is irrelevant: this exists to stop a trial the master abandoned
+    # after a multi-minute timeout, so being 5s late costs nothing and the hot path stays free.
+    state = {"next_check": 0.0}
+    interval = _CANCEL_CHECK_INTERVAL_S
+
     def _cb(pct: float, msg: str) -> None:
+        now = _time.monotonic()
+        if now < state["next_check"]:
+            return
+        state["next_check"] = now + interval
         try:
             cancelled = bool(ctl.get("cancel"))
         except Exception:  # noqa: BLE001 — a dead manager must never fail a healthy trial

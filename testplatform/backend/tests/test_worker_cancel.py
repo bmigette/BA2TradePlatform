@@ -99,14 +99,34 @@ def test_orphan_sweep_also_stops_the_trial():
 # --------------------------------------------------------------------------- #
 # the trial side
 # --------------------------------------------------------------------------- #
-def test_progress_cb_raises_once_cancelled():
-    from app.services.strategy_optimization_handler import _cancel_progress_cb, TrialCancelled
+def test_progress_cb_raises_once_cancelled(monkeypatch):
+    """Interval forced to 0 so this asserts the CANCELLATION, not the throttle."""
+    import app.services.strategy_optimization_handler as h
+    monkeypatch.setattr(h, "_CANCEL_CHECK_INTERVAL_S", 0.0)
     ctl = {"cancel": False}
-    cb = _cancel_progress_cb(ctl)
+    cb = h._cancel_progress_cb(ctl)
     cb(0.1, "bar")                      # not cancelled -> silent
     ctl["cancel"] = True
-    with pytest.raises(TrialCancelled):
+    with pytest.raises(h.TrialCancelled):
         cb(0.2, "bar")
+
+
+def test_progress_cb_does_not_hit_the_proxy_on_every_call():
+    """ctl is a multiprocessing.Manager PROXY -- every read is a cross-process round-trip, so
+    reading it per progress_cb call puts IPC on the engine's per-bar hook. Only the throttled
+    reads may touch it."""
+    from app.services.strategy_optimization_handler import _cancel_progress_cb
+
+    class CountingCtl(dict):
+        reads = 0
+        def get(self, k, *a):
+            CountingCtl.reads += 1
+            return False
+
+    cb = _cancel_progress_cb(CountingCtl())
+    for _ in range(1000):
+        cb(0.5, "bar")
+    assert CountingCtl.reads <= 2, f"proxy read {CountingCtl.reads} times in 1000 calls"
 
 
 def test_no_control_block_means_no_callback():
