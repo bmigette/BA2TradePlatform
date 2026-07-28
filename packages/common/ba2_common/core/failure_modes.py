@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +71,31 @@ def _mode() -> str:
     return (os.environ.get(_MODE_ENV) or "observe").strip().lower()
 
 
+def _caller_site() -> str:
+    """``file.py:lineno`` of the handler that called absorb_if_benign (2 frames up)."""
+    try:
+        # frame 0 = _caller_site, 1 = absorb_if_benign, 2 = the handler that called it
+        f = sys._getframe(2)
+        return f"{os.path.basename(f.f_code.co_filename)}:{f.f_lineno}"
+    except Exception:                 # noqa: BLE001 — diagnostics must never fail the caller
+        return "?"
+
+
+def _raise_site(exc: BaseException) -> str:
+    """``file.py:lineno`` of the deepest frame in the exception's own traceback."""
+    try:
+        tb = exc.__traceback__
+        last = None
+        while tb:
+            last = tb
+            tb = tb.tb_next
+        if last is None:
+            return "?"
+        return (f"{os.path.basename(last.tb_frame.f_code.co_filename)}:{last.tb_lineno}")
+    except Exception:                 # noqa: BLE001
+        return "?"
+
+
 def is_benign(exc: BaseException, *also_benign: type) -> bool:
     """True when *exc* is one of the globally-benign types, or one named by this call site."""
     return isinstance(exc, _BENIGN_DEFAULT + tuple(also_benign))
@@ -87,8 +113,14 @@ def absorb_if_benign(exc: BaseException, *also_benign: type) -> None:
     if mode == "legacy":
         return
     if mode == "observe":
-        # One grep-able marker so a full grid run yields the real per-site benign set.
-        logger.error("WOULD-RAISE %s: %s", type(exc).__name__, exc, exc_info=True)
+        # One grep-able marker carrying BOTH locations, because the measurement is only useful
+        # if it says which site to adjust:
+        #   at=   the handler that would have propagated  -> the line to add a benign type to
+        #   from= where the exception was actually raised -> what it really is
+        # Without these a grid produces thousands of "WOULD-RAISE KeyError" lines that cannot be
+        # attributed to anything.
+        logger.error("WOULD-RAISE %s at=%s from=%s: %s",
+                     type(exc).__name__, _caller_site(), _raise_site(exc), exc)
         return
     raise exc
 
