@@ -19,6 +19,7 @@ import bisect
 import json
 import os
 import re
+import time  # DIAG (temporary instrumentation)
 import requests
 
 from ba2_common.core.interfaces import MarketExpertInterface
@@ -81,7 +82,16 @@ _WORKER_SCORING_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 # A pool child is long-lived and reused across trials with DIFFERENT genomes; without a cap it
 # would re-accumulate every shard and undo the fix. 2 is enough to avoid thrashing when a child
 # alternates between two genomes, while capping the footprint at ~2 shards.
-_WORKER_SCORING_CACHE_MAX = 2
+_WORKER_SCORING_CACHE_MAX = int(os.environ.get("BA2_DIAG_SCORING_LRU_MAX", "2"))
+
+# --- TEMPORARY DIAGNOSTIC INSTRUMENTATION (revert before commit) -------------------
+# path -> [miss_count, hit_count, seconds_spent_loading]
+_DIAG_LOAD_STATS: "OrderedDict[str, list]" = OrderedDict()
+
+
+def get_scoring_cache_load_stats():
+    return _DIAG_LOAD_STATS
+# --- END TEMPORARY DIAGNOSTIC INSTRUMENTATION --------------------------------------
 
 
 def _shard_filename(base_filename: str, suffix: str) -> str:
@@ -206,6 +216,29 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                 "default": 60,
                 "description": "Maximum days since trade execution",
                 "tooltip": "Trades executed more than this many days ago will be filtered out. Helps focus on recent trading activity."
+            },
+            # STILL-HELD (2026-07-28). Distinct settings, deliberately NOT folded into the
+            # existing consensus knobs: "N politicians bought and none have sold" is a different
+            # claim from "N bought once", and the GA must be able to price them separately --
+            # bundling would make it impossible to tell which one carries the signal.
+            "require_still_held": {
+                "type": "int",
+                "required": True,
+                "default": 0,
+                "description": "Only trade symbols the discloser still holds (1=on, 0=off)",
+                "tooltip": ("When on, a trader's buy is ignored if their later SALES of that "
+                            "symbol net the position out by the analysis date. Matters most at "
+                            "long lookbacks: over 9-12 months a stale buy is as likely closed as "
+                            "open, and without this it would count identically either way."),
+            },
+            "min_still_holders": {
+                "type": "int",
+                "required": True,
+                "default": 0,
+                "description": "Minimum distinct traders STILL holding the symbol (0=off)",
+                "tooltip": ("Consensus on open positions rather than on disclosures. Independent "
+                            "of min_traders, which counts anyone who ever traded it in the "
+                            "window regardless of whether they since sold."),
             },
             "max_trade_price_delta_pct": {
                 "type": "float",
@@ -374,6 +407,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
     # ------------------------------------------------------------------
     _SETTING_KEYS = (
         "max_disclose_date_days", "max_trade_exec_days", "max_trade_price_delta_pct",
+        "require_still_held", "min_still_holders",
         "growth_confidence_multiplier", "confidence_to_profit_factor",
         "min_traders", "min_trades",
         "min_trade_amount", "sell_signal_weight", "symbol_focus_cap_pct",
@@ -940,6 +974,30 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             exec_price_by_trade=data_bundle["exec_price_by_trade"],
             min_trade_amount=float(self._setting_or_default(settings, "min_trade_amount")),
         )
+
+        # STILL-HELD gates. Computed from the FULL trade list (not `filtered`): a sale that
+        # closes the position may itself fall outside the disclosure/exec window, and missing it
+        # would report a long-closed position as open. Netting is as-of `now`, so a later sale
+        # cannot retro-actively close an earlier bar's position.
+        require_held = int(self._setting_or_default(settings, "require_still_held") or 0)
+        min_holders = int(self._setting_or_default(settings, "min_still_holders") or 0)
+        if require_held or min_holders:
+            held_by = self._still_held_by(data_bundle["all_trades"], symbol, now=now)
+            holders = sum(1 for v in held_by.values() if v)
+            if min_holders and holders < min_holders:
+                self.logger.debug(
+                    f"{symbol}: {holders} still-holding trader(s) < min_still_holders="
+                    f"{min_holders}; skipping")
+                filtered = []
+            elif require_held:
+                before = len(filtered)
+                filtered = [t for t in filtered
+                            if held_by.get(t.get("representative") or t.get("senator")
+                                           or t.get("office") or "?", False)]
+                if before != len(filtered):
+                    self.logger.debug(
+                        f"{symbol}: require_still_held dropped {before - len(filtered)}/{before} "
+                        f"trade(s) whose discloser has since sold out")
         rec = self._calculate_recommendation(
             filtered, symbol, current_price,
             int(settings["max_trade_exec_days"]),
@@ -1275,11 +1333,15 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         SAME shared dict object, so ``_save_scoring_cache``/``_save_scoring_cache_throttled``
         (which read/write via ``self.<attr>``) transparently operate on the shared cache."""
         path = self._scoring_cache_path(filename)
+        _diag = _DIAG_LOAD_STATS.setdefault(os.path.basename(path), [0, 0, 0.0])  # DIAG
+        _diag_t0 = time.perf_counter()  # DIAG
         cache = _WORKER_SCORING_CACHE.get(path)
         if cache is not None:
+            _diag[1] += 1  # DIAG
             _WORKER_SCORING_CACHE.move_to_end(path)  # LRU touch
             setattr(self, attr, cache)
             return cache
+        _diag[0] += 1  # DIAG
         try:
             with open(path, "r", encoding="utf-8") as f:
                 cache = json.load(f)
@@ -1302,6 +1364,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         while len(_WORKER_SCORING_CACHE) > _WORKER_SCORING_CACHE_MAX:
             _WORKER_SCORING_CACHE.popitem(last=False)
         setattr(self, attr, cache)
+        _diag[2] += time.perf_counter() - _diag_t0  # DIAG
         return cache
 
     def _save_scoring_cache(self, attr: str, filename: str) -> None:
@@ -1652,6 +1715,86 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         if not hold_days:
             return {"avg_hold_days": None, "roundtrips": 0}
         return {"avg_hold_days": sum(hold_days) / len(hold_days), "roundtrips": len(hold_days)}
+
+
+    def _still_held_by(self, trades: List[Dict[str, Any]], symbol: str,
+                       now: Optional[datetime] = None) -> Dict[str, bool]:
+        """Per trader: is this symbol still HELD as of *now* -- i.e. is their LATEST action a buy?
+
+        "N politicians bought and none have sold" is a materially stronger claim than "N bought
+        once", and it is the signal the public trackers actually surface. The expert previously
+        scored individual DISCLOSURES with no notion of an open position, so a buy that was
+        quietly sold two months later counted exactly like one still held.
+
+        This matters most as the lookback widens: at a 60-day window almost nothing has been sold
+        yet, but over 9-12 months a stale buy is as likely to be closed as open. Widening the
+        window WITHOUT this would make results worse, not better.
+
+        SIMPLIFYING RULE (deliberate): **any sale closes the position entirely.** Disclosures are
+        AMOUNT RANGES, not share counts, so a partial sale cannot be sized reliably -- netting
+        ranges would invent precision the data does not have. Treating every sale as a full exit
+        is the conservative direction: it can only DROP a candidate we might have kept, never
+        keep one the trader has actually exited. Revisit only if partial sales prove common
+        enough to matter.
+
+        Only trades EXECUTED on or before *now* count: a later sale must not retro-actively mark
+        an earlier bar's position as closed (that would be lookahead).
+        """
+        sym = (symbol or "").upper()
+
+        # MEMO, per instance (= per trial), bucketed by DAY. Without it this walks every trade
+        # for the symbol on EVERY bar: on a 5min clock that is ~78 identical recomputations per
+        # symbol per day, and the same class of avoidable per-bar cost that made ATR and the
+        # congress scoring caches expensive. Holdings do not change intraday -- a disclosure has
+        # a DATE, not a time -- so a day bucket is exact here, not an approximation.
+        #
+        # Keyed on len(trades) as well so a re-gathered/extended history invalidates rather than
+        # silently serving a stale answer (same guard the skill/confidence caches use).
+        #
+        # Deliberately in-memory and per-instance: NOT a disk cache. The on-disk scoring shards
+        # are cheap to load but this is cheap to RECOMPUTE, so persisting it would add I/O and a
+        # staleness surface for no gain.
+        bucket = now.date().isoformat() if now is not None else "now"
+        memo_key = (sym, len(trades), bucket)
+        memo = getattr(self, "_still_held_memo", None)
+        if memo is None:
+            memo = self._still_held_memo = {}
+        hit = memo.get(memo_key)
+        if hit is not None:
+            return hit
+
+        latest: Dict[str, tuple] = {}          # trader -> (exec_dt, is_buy)
+        for t in trades:
+            if (t.get("symbol") or t.get("ticker") or "").upper() != sym:
+                continue
+            exec_dt = self._trade_exec_dt(t)
+            if exec_dt is None or (now is not None and exec_dt > now):
+                continue
+            ttype = str(t.get("type", "")).lower()
+            is_buy = "purchase" in ttype or "buy" in ttype
+            is_sell = "sale" in ttype or "sell" in ttype
+            if not (is_buy or is_sell):
+                continue
+            who = t.get("representative") or t.get("senator") or t.get("office") or "?"
+            prev = latest.get(who)
+            # On a same-day buy+sale, the SALE wins: assume the exit, never the entry.
+            if prev is None or exec_dt > prev[0] or (exec_dt == prev[0] and not is_buy):
+                latest[who] = (exec_dt, is_buy)
+        result = {who: is_buy for who, (_dt, is_buy) in latest.items()}
+        # Bounded: one entry per (symbol, day) and a backtest walks many days. 4096 covers a
+        # basket bar comfortably while capping the footprint at a few MB.
+        if len(memo) >= 4096:
+            memo.clear()
+        memo[memo_key] = result
+        return result
+
+    def _trade_exec_dt(self, trade: Dict[str, Any]) -> Optional[datetime]:
+        """Execution datetime of a trade, or None when unparseable."""
+        raw = trade.get("transactionDate") or trade.get("dateRecieved") or ""
+        try:
+            return _parse_ymd_utc(str(raw)[:10])
+        except Exception:  # noqa: BLE001 — a malformed date just drops the trade from netting
+            return None
 
     def _filter_trades(self, trades: List[Dict[str, Any]],
                       max_disclose_days: int,

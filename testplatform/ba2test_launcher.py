@@ -1049,8 +1049,20 @@ _EXPERT_OPT = {
     # wider list). Optimizes the disclosure/recency/consensus knobs.
     "FMPSenateTraderWeight": {
         "expert_params": {
-            "max_disclose_date_days": {"optimize": True, "min": 15, "max": 60, "step": 5, "type": "int"},
-            "max_trade_exec_days": {"optimize": True, "min": 30, "max": 120, "step": 15, "type": "int"},
+            # 2026-07-28: ceilings raised 60->270 / 120->365. The old fence made a 9-12 month
+            # lookback UNSEARCHABLE, so "old but still-open positions carry signal" was never
+            # rejected on evidence -- it was never asked. Two winners had already pushed toward
+            # the old ceiling (S2 chose exec=105 of max 120), which hints the optimum may sit
+            # outside it. Steps widened to keep the grid coarse rather than exploding the space.
+            "max_disclose_date_days": {"optimize": True, "min": 15, "max": 270, "step": 15, "type": "int"},
+            "max_trade_exec_days": {"optimize": True, "min": 30, "max": 365, "step": 30, "type": "int"},
+            # Distinct genes on purpose: require_still_held is a FILTER (drop disclosers who
+            # sold out), min_still_holders is a CONSENSUS floor on open positions. Bundling them
+            # with min_traders would hide which one carries the signal. Only meaningful once the
+            # window is long enough for sales to have happened, which is why they land together
+            # with the widened ceilings above.
+            "require_still_held": {"optimize": True, "min": 0, "max": 1, "step": 1, "type": "int"},
+            "min_still_holders": {"optimize": True, "min": 0, "max": 4, "step": 1, "type": "int"},
             "max_trade_price_delta_pct": {"optimize": True, "min": 5.0, "max": 20.0, "step": 2.5, "type": "float"},
             "growth_confidence_multiplier": {"optimize": True, "min": 2.0, "max": 8.0, "step": 1.0, "type": "float"},
             "confidence_to_profit_factor": {"optimize": True, "min": 0.05, "max": 0.30, "step": 0.05, "type": "float"},
