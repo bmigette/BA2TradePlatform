@@ -80,18 +80,29 @@ from ba2_experts.expert_mixins import AnalysisStatusRenderMixin, FMPCongressTrad
 _WORKER_SCORING_CACHE: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 
 # A pool child is long-lived and reused across trials with DIFFERENT genomes; without a cap it
-# would re-accumulate every shard and undo the fix. 2 is enough to avoid thrashing when a child
-# alternates between two genomes, while capping the footprint at ~2 shards.
-_WORKER_SCORING_CACHE_MAX = int(os.environ.get("BA2_DIAG_SCORING_LRU_MAX", "2"))
-
-# --- TEMPORARY DIAGNOSTIC INSTRUMENTATION (revert before commit) -------------------
-# path -> [miss_count, hit_count, seconds_spent_loading]
-_DIAG_LOAD_STATS: "OrderedDict[str, list]" = OrderedDict()
-
-
-def get_scoring_cache_load_stats():
-    return _DIAG_LOAD_STATS
-# --- END TEMPORARY DIAGNOSTIC INSTRUMENTATION --------------------------------------
+# would re-accumulate every shard and undo the fix.
+#
+# MUST BE >= 3 — this is a WORKING-SET floor, not a tuning knob. ONE trial touches exactly three
+# cache files: the hold cache (``congress_scalper_scores.json``), its skill shard, and its
+# confidence shard. The original value of 2 was set believing a trial touched two ("enough when a
+# child alternates between two genomes"), which is only true when ``min_trader_avg_hold_days`` is
+# 0 — the interface default, and what the single-trial profiler used. Every GA trial floors that
+# gene at 1.0 (see ``ba2test_launcher._EXPERT_OPT``), which switches the hold cache ON, so the
+# real working set is 3 against a 2-slot LRU: every access evicts the file needed next.
+#
+# Measured on one S3 trial (2023-01-01..03-31, 5min, 498 symbols), same genome, identical
+# ``trades=31`` at every setting — a pure memo, so this is performance-only:
+#
+#     LRU=2   1056.5s   334 misses/file   995.0s reloading (94.2% of wall)
+#     LRU=3     64.5s     1 miss /file      3.0s reloading ( 4.7% of wall)
+#     LRU=4     65.0s     1 miss /file      2.9s reloading ( 4.5% of wall)
+#
+# 3 is chosen over 4 deliberately: it fits the working set exactly and holds the memory line that
+# the sharding was introduced to win back (4 buys no measurable time but carries another shard,
+# and a confidence shard runs 29-238MB). Raising ``min_trader_avg_hold_days`` out of the picture
+# or adding a FOURTH per-trial cache file would make this floor 4 — keep it equal to the number
+# of distinct files one trial loads, and see test_scoring_cache_lru.py which pins that.
+_WORKER_SCORING_CACHE_MAX = int(os.environ.get("BA2_SCORING_LRU_MAX", "3"))
 
 
 def _shard_filename(base_filename: str, suffix: str) -> str:
@@ -434,9 +445,31 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         return f"{trade.get('firstName', '')} {trade.get('lastName', '')}".strip() or 'Unknown'
 
     @staticmethod
-    def _trade_key(trade: Dict[str, Any]) -> tuple:
+    def _normalize_ticker(symbol: str) -> str:
+        """Congressional-disclosure ticker -> the platform's canonical form.
+
+        The disclosure feed writes share classes with a SLASH (``BRK/B``); FMP price history and
+        the platform's own OHLCV cache both use a HYPHEN (``historical_price_full__BRK-B.json``,
+        ``BRK-B_5min.parquet``). Nothing normalised between them, so every ``BRK/B`` disclosure
+        failed its exec-price lookup and was dropped by ``_filter_trades``' ``if not exec_price``
+        -- silently, and at EVERY window length. Measured 2026-07-28 over a 365-day window:
+        ``BRK/B`` was the single largest coverage gap at 31 disclosures, ~4x the next symbol.
+
+        ONLY ``/`` is rewritten, and a DOT must NOT be: dots are meaningful to FMP. Of the 27
+        dotted tickers in the price cache, 8 carry real data — ``CWEN.A``, ``HEI.A``, ``RDS.A``,
+        ``RDS.B`` (dotted share classes that genuinely resolve) and ``RY.TO``, ``VUL.V`` (exchange
+        suffixes). Mapping ``.`` -> ``-`` would break all 8 to fix nothing, since the disclosure
+        feed writes slashes. (``BRK.B`` IS cached but as a 2-byte empty sentinel — FMP has no data
+        under that spelling, only under ``BRK-B``, which is exactly why the slash must land on the
+        hyphen and not the dot.) Uppercases and strips as the call sites already did.
+        """
+        return symbol.replace("/", "-").upper().strip() if symbol else ""
+
+    @classmethod
+    def _trade_key(cls, trade: Dict[str, Any]) -> tuple:
         """Stable per-trade key for the exec_price map (symbol + execution date)."""
-        return (str(trade.get('symbol', '')).upper(), str(trade.get('transactionDate', '')))
+        return (cls._normalize_ticker(str(trade.get('symbol', ''))),
+                str(trade.get('transactionDate', '')))
 
     def _symbol_trades_index_cached(self, symbol: str, is_live: bool = False) -> Dict[str, Any]:
         """Per-symbol, per-instance memo of the deduped senate+house trade list PLUS a
@@ -480,7 +513,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         seen: set = set()
         all_trades = []
         for trade in senate + house:
-            fp = (self._trader_name(trade), str(trade.get('symbol', '')).upper(),
+            fp = (self._trader_name(trade), self._normalize_ticker(str(trade.get('symbol', ''))),
                   str(trade.get('transactionDate', '')), str(trade.get('type', '')).lower(),
                   str(trade.get('amount', '')))
             if fp in seen:
@@ -488,13 +521,15 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             seen.add(fp)
             all_trades.append(trade)
 
-        sym_upper = symbol.upper()
+        # Normalise BOTH sides: a universe symbol is already canonical (BRK-B) while the feed
+        # writes BRK/B, and comparing them raw silently dropped every such disclosure.
+        sym_upper = self._normalize_ticker(symbol)
         rows = []
         for trade in all_trades:
             ds, es = trade.get('disclosureDate', ''), trade.get('transactionDate', '')
             if not ds or not es:
                 continue  # _filter_trades drops date-less rows unconditionally
-            if str(trade.get('symbol', '')).upper() != sym_upper:
+            if self._normalize_ticker(str(trade.get('symbol', ''))) != sym_upper:
                 continue  # _filter_trades drops symbol mismatches unconditionally
             try:
                 rows.append((_parse_ymd_utc(ds), _parse_ymd_utc(es), trade))
@@ -716,7 +751,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         seen: set = set()
         all_trades = []
         for trade in senate + house:
-            fp = (self._trader_name(trade), str(trade.get('symbol', '')).upper(),
+            fp = (self._trader_name(trade), self._normalize_ticker(str(trade.get('symbol', ''))),
                   str(trade.get('transactionDate', '')), str(trade.get('type', '')).lower(),
                   str(trade.get('amount', '')))
             if fp in seen:
@@ -814,15 +849,17 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         index = self._all_trades_index_cached(is_live=(as_of is None))
         windowed = self._window_trades(index, ceiling, max_disclose_days, max_exec_days)
 
-        # Step 3: NEW tradability filter.
+        # Step 3: NEW tradability filter. Normalise first — basket mode DISCOVERS its symbols
+        # here rather than reading a vetted universe, so this is the point where a raw feed
+        # ticker becomes one the engine will be asked to price and trade (see _normalize_ticker).
         tradable = [t for t in windowed
-                   if is_tradable_stock_ticker(str(t.get('symbol', '')).upper().strip())]
+                   if is_tradable_stock_ticker(self._normalize_ticker(str(t.get('symbol', ''))))]
 
         # Step 4: group by symbol (preserving the disclosure-date-ascending order from the
         # sorted index, same ordering _window_trades' per-symbol callers already see).
         trades_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
         for trade in tradable:
-            sym = str(trade.get('symbol', '')).upper().strip()
+            sym = self._normalize_ticker(str(trade.get('symbol', '')))
             if not sym:
                 continue
             trades_by_symbol.setdefault(sym, []).append(trade)
@@ -1274,7 +1311,9 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         """
         if not self._api_key:
             return None
-        sym = symbol.upper() if symbol else ""
+        # Normalise BEFORE the cache key: the disclosure feed's BRK/B and the price cache's
+        # BRK-B are the same instrument (see _normalize_ticker).
+        sym = self._normalize_ticker(symbol)
         if not sym:
             return None
 
@@ -1352,15 +1391,11 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         SAME shared dict object, so ``_save_scoring_cache``/``_save_scoring_cache_throttled``
         (which read/write via ``self.<attr>``) transparently operate on the shared cache."""
         path = self._scoring_cache_path(filename)
-        _diag = _DIAG_LOAD_STATS.setdefault(os.path.basename(path), [0, 0, 0.0])  # DIAG
-        _diag_t0 = time.perf_counter()  # DIAG
         cache = _WORKER_SCORING_CACHE.get(path)
         if cache is not None:
-            _diag[1] += 1  # DIAG
             _WORKER_SCORING_CACHE.move_to_end(path)  # LRU touch
             setattr(self, attr, cache)
             return cache
-        _diag[0] += 1  # DIAG
         try:
             with open(path, "r", encoding="utf-8") as f:
                 cache = json.load(f)
@@ -1383,7 +1418,6 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         while len(_WORKER_SCORING_CACHE) > _WORKER_SCORING_CACHE_MAX:
             _WORKER_SCORING_CACHE.popitem(last=False)
         setattr(self, attr, cache)
-        _diag[2] += time.perf_counter() - _diag_t0  # DIAG
         return cache
 
     def _save_scoring_cache(self, attr: str, filename: str) -> None:
@@ -1530,7 +1564,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         cache = self._load_scoring_cache("_confidence_cache", shard)
         n = len(trader_history)
         as_of_bucket = now.strftime("%Y-%m") if is_live else now.date().isoformat()
-        key = (f"{trader_name}|{n}|{current_symbol.upper()}|{current_trade_type}|{as_of_bucket}"
+        key = (f"{trader_name}|{n}|{self._normalize_ticker(current_symbol)}|{current_trade_type}|{as_of_bucket}"
                f"|{max_exec_days}|{symbol_focus_cap_pct}")
         entry = cache.get(key)
         if entry is not None:
@@ -1554,9 +1588,9 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                 return price
         return None
 
-    @staticmethod
+    @classmethod
     def _sorted_buy_candidates(
-        trader_history: List[Dict[str, Any]]
+        cls, trader_history: List[Dict[str, Any]]
     ) -> Tuple[List[Tuple[datetime, str]], List[datetime]]:
         """Parse + BUY-filter a trader's disclosure history into ``(exec_date, symbol)``
         candidates, factored out of ``_calculate_trader_skill`` so this O(history) pass can run
@@ -1583,7 +1617,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             if 'purchase' not in ttype and 'buy' not in ttype:
                 continue
             exec_str = t.get('transactionDate', '')
-            sym = str(t.get('symbol', '')).upper()
+            sym = cls._normalize_ticker(str(t.get('symbol', '')))
             if not exec_str or not sym:
                 continue
             try:
@@ -1689,8 +1723,8 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             "avg_fwd_return_pct": sum(returns) / len(returns),
         }
 
-    @staticmethod
-    def _calculate_trader_avg_hold_days(trader_history: List[Dict[str, Any]]) -> Dict[str, Any]:
+    @classmethod
+    def _calculate_trader_avg_hold_days(cls, trader_history: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Estimate a trader's average holding period from FIFO-paired buy/sell round-trips
         in their OWN disclosure history (no price data needed — pure date arithmetic on data
         already fetched for skill scoring / prewarm, so this filter costs ZERO extra fetches).
@@ -1706,7 +1740,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         by_symbol: Dict[str, List[tuple]] = {}
         for t in trader_history:
             ttype = str(t.get('type', '')).lower()
-            sym = str(t.get('symbol', '')).upper()
+            sym = cls._normalize_ticker(str(t.get('symbol', '')))
             d = t.get('transactionDate', '')
             if not sym or not d:
                 continue
@@ -1759,7 +1793,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         Only trades EXECUTED on or before *now* count: a later sale must not retro-actively mark
         an earlier bar's position as closed (that would be lookahead).
         """
-        sym = (symbol or "").upper()
+        sym = self._normalize_ticker(symbol or "")
 
         # MEMO, per instance (= per trial), bucketed by DAY. Without it this walks every trade
         # for the symbol on EVERY bar: on a 5min clock that is ~78 identical recomputations per
@@ -1784,7 +1818,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
 
         latest: Dict[str, tuple] = {}          # trader -> (exec_dt, is_buy)
         for t in trades:
-            if (t.get("symbol") or t.get("ticker") or "").upper() != sym:
+            if self._normalize_ticker(t.get("symbol") or t.get("ticker") or "") != sym:
                 continue
             exec_dt = self._trade_exec_dt(t)
             if exec_dt is None or (now is not None and exec_dt > now):
@@ -1870,9 +1904,10 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                 exec_date = _parse_ymd_utc(exec_date_str)
                 # Build trader name for logging
 
-                # Check if this is the correct symbol (case insensitive)
-                trade_symbol = trade.get('symbol', '').upper()
-                if trade_symbol != symbol.upper():
+                # Check if this is the correct symbol (case insensitive, and BRK/B == BRK-B —
+                # see _normalize_ticker; comparing raw silently dropped every slashed ticker)
+                trade_symbol = self._normalize_ticker(trade.get('symbol', ''))
+                if trade_symbol != self._normalize_ticker(symbol):
                     #logger.debug(f"Trade symbol {trade_symbol} doesn't match requested symbol {symbol}, filtering out")
                     continue
                 # Check disclose date. Reject too-OLD rows (days_since > max) AND
@@ -1977,7 +2012,8 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                 amount = FMPSenateTraderWeight._parse_amount(amount_str)
                 is_buy = 'purchase' in transaction_type or 'buy' in transaction_type
                 is_sell = 'sale' in transaction_type or 'sell' in transaction_type
-                rows.append((exec_date, amount, is_buy, is_sell, trade.get('symbol', '').upper()))
+                rows.append((exec_date, amount, is_buy, is_sell,
+                             FMPSenateTraderWeight._normalize_ticker(trade.get('symbol', ''))))
             except Exception as e:  # noqa: BLE001 — mirror the original loop's skip-on-error
                 logger.debug(f"Error parsing trade: {e}")
                 continue
@@ -2068,7 +2104,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
              recent_buy_count, recent_sell_count) = self._window_sums(_index, recent_threshold)
             (yearly_buy_amount, yearly_sell_amount,
              yearly_buy_count, yearly_sell_count) = self._window_sums(_index, yearly_threshold)
-            sym_prefix = _index["by_symbol"].get(current_symbol.upper())
+            sym_prefix = _index["by_symbol"].get(self._normalize_ticker(current_symbol))
             if sym_prefix is not None:
                 (yearly_symbol_buy_amount, yearly_symbol_sell_amount,
                  _ysbc, _yssc) = self._window_sums(sym_prefix, yearly_threshold)
@@ -2140,9 +2176,10 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                 is_buy = 'purchase' in transaction_type or 'buy' in transaction_type
                 is_sell = 'sale' in transaction_type or 'sell' in transaction_type
                 
-                # Get trade symbol
-                trade_symbol = trade.get('symbol', '').upper()
-                is_current_symbol = (trade_symbol == current_symbol.upper())
+                # Get trade symbol (normalised both sides — current_symbol arrives canonical
+                # from the caller while the feed writes BRK/B; see _normalize_ticker)
+                trade_symbol = self._normalize_ticker(trade.get('symbol', ''))
+                is_current_symbol = (trade_symbol == self._normalize_ticker(current_symbol))
                 
                 # Count for recent period (max_exec_days)
                 if exec_date >= recent_threshold:
