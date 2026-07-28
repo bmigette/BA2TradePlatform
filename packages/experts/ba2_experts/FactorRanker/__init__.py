@@ -250,25 +250,26 @@ class FactorRanker(MarketExpertInterface):
         raw ``screener_*`` keys would match nothing in the store's ``settings.get(...)``
         lookups (so every filter is a no-op and the WHOLE universe is selected).
 
-        metric_store does NOT support ``screener_float_*`` / ``screener_price_drop_days`` /
-        ``screener_universe_mode`` / ``screener_provider`` — that's the documented
-        consolidation tradeoff (the store is precomputed from current tradable names with a
-        fixed drop window), so those are intentionally not passed.
+        The key set is taken from ``METRIC_STORE_KEYS`` and normalised by the store's own
+        ``normalize_screener_settings`` (the same helper daily_backtest_handler and
+        strategy_optimization_handler use) rather than hand-listed here. A hand-rolled list
+        silently drops any key the store learns later: it had omitted ``price_drop_days`` and
+        ``float_min``/``float_max`` — all three ARE supported (the store carries
+        ``price_drop_pct_2..30`` and ``float_shares``). Live consequence on 2026-07-27:
+        instances 26/27 differed only on ``price_drop_days`` (3 vs 2) once ``top_n`` had
+        swallowed the pool, that difference was discarded here, and both resolved the same
+        universe -> byte-identical portfolios -> double-sized positions on one broker account.
+
+        ``screener_universe_mode`` / ``screener_provider`` remain unsupported by the store and
+        are correctly filtered out by the normalizer.
         """
+        from ba2_providers.screener.metric_store import (
+            METRIC_STORE_KEYS, normalize_screener_settings,
+        )
         g = self.get_setting_with_interface_default
-        return {
-            "market_cap_min": g("screener_market_cap_min"),
-            "market_cap_max": g("screener_market_cap_max"),
-            "price_min": g("screener_price_min"),
-            "price_max": g("screener_price_max"),
-            "volume_min": g("screener_volume_min"),
-            "volume_max": g("screener_volume_max"),
-            "relative_volume_min": g("screener_relative_volume_min"),
-            "price_drop_pct": g("screener_price_drop_pct"),
-            "max_stocks": g("screener_max_stocks"),
-            "sort_metric": g("screener_sort_metric"),
-            "weinstein_stage2_only": g("screener_weinstein_stage2_only"),
-        }
+        return normalize_screener_settings(
+            {f"screener_{key}": g(f"screener_{key}") for key in METRIC_STORE_KEYS}
+        )
 
     def _screen_universe(self, as_of: Optional[datetime] = None) -> List[str]:
         """Resolve the candidate universe.
@@ -293,7 +294,16 @@ class FactorRanker(MarketExpertInterface):
         StockScreener path keeps working unchanged.
         """
         store = (self.get_setting_with_interface_default("screener_store") or "").strip()
-        if store:
+        # BACKTEST ONLY. The store is a prebuilt weekly snapshot, so resolving "today"
+        # against it returns the newest scan date <= today -- on 2026-07-27 that was
+        # 2026-06-27, i.e. live orders were being placed off a 31-day-stale universe
+        # (stale caps / relative volume / Weinstein stage, and no new listings). A live
+        # deploy inherits ``screener_store`` from the backtest export
+        # (testplatform backtests.py, the bypass-expert overlay), so the setting being
+        # present must NOT be read as "use the store live". ``_precomputed_factor_inputs``
+        # already guards the same way (``as_of is None -> return None, None``); this is
+        # the universe path catching up with it.
+        if store and as_of is not None:
             try:
                 from ba2_providers.screener import metric_store as ms  # local import (opt-in)
                 df = ms.load_store(store)

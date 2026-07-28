@@ -824,12 +824,18 @@ def recompute_atr_columns(store_dir: str, ohlcv_get, *,
 # together so they can't drift). Callers: daily_backtest_handler (UI/standalone path) AND
 # strategy_optimization_handler (optimizer path) — both must normalize before the gate, else the
 # prefixed keys are silently ignored and only ``market_cap_max`` filters.
-_METRIC_STORE_KEYS = (
+METRIC_STORE_KEYS = (
     "market_cap_min", "market_cap_max", "price_min", "price_max",
     "volume_min", "volume_max", "float_min", "float_max",
     "relative_volume_min", "price_drop_pct", "price_drop_days",
     "weinstein_stage2_only", "max_stocks", "sort_metric",
 )
+
+# Public name is the one to import: callers that build their own screener_* -> unprefixed
+# mapping by hand drift out of sync as keys are added here (FactorRanker silently dropped
+# price_drop_days and float_min/max that way). Derive from this tuple + the normalizer below
+# instead of hand-listing. Private alias kept for existing importers.
+_METRIC_STORE_KEYS = METRIC_STORE_KEYS
 
 
 def normalize_screener_settings(screener_settings: Dict[str, Any]) -> Dict[str, Any]:

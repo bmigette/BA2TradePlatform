@@ -69,3 +69,66 @@ def test_resolve_universe_uses_static_by_default(monkeypatch):
         {"universe_source": "static", "min_price": 0.0, "min_dollar_volume": 0.0}
     )
     assert sorted(inst._resolve_universe()) == ["YYY", "ZZZ"]
+
+
+# ---------------------------------------------------------------------------
+# The metric_store is a point-in-time RESEARCH artifact: it is a prebuilt weekly
+# snapshot, so resolving "today" against it returns the newest scan date <= today.
+# On 2026-07-27 that was 2026-06-27 -- a 31-day-stale universe driving live orders.
+# Live (as_of is None) must therefore always screen with the real StockScreener.
+# The precomputed-momentum path already guards this way ("if ... as_of is None:
+# return None, None"); the universe path did not, which is the inconsistency here.
+# ---------------------------------------------------------------------------
+
+def _store_expert(monkeypatch, store=r"C:\some\metric_store"):
+    inst = _bare_expert()
+    inst._settings_cache = {}
+    inst.get_setting_with_interface_default = _settings_stub({"screener_store": store})
+    return inst
+
+
+def _record_store(monkeypatch, symbols=("msft",)):
+    """Record store access. Must NOT raise: _screen_universe catches broad Exception and
+    silently degrades to StockScreener, so an exception-based probe would make a
+    'live skipped the store' assertion pass even when the store WAS read."""
+    from ba2_providers.screener import metric_store as ms
+    calls = []
+    monkeypatch.setattr(ms, "load_store", lambda store: calls.append(store) or "DF")
+    monkeypatch.setattr(ms, "screen_universe_as_of",
+                        lambda df, day, settings: list(symbols))
+    return calls
+
+
+def test_live_never_reads_the_metric_store(monkeypatch):
+    """as_of=None (live) must bypass the store even when screener_store is set."""
+    store_calls = _record_store(monkeypatch)
+    fake = MagicMock()
+    fake.screen.return_value = {"results": [{"symbol": "aapl"}], "stats": {}}
+    monkeypatch.setattr(fr_mod, "StockScreener", lambda settings, **k: fake)
+
+    inst = _store_expert(monkeypatch)
+    got = inst._screen_universe()
+
+    assert store_calls == [], (
+        f"live resolved its universe from the metric_store ({store_calls}) -- that snapshot "
+        f"is a weekly prebuilt artifact and was 31 days stale on 2026-07-27"
+    )
+    assert fake.screen.called, "live must fall through to the real StockScreener"
+    assert got == ["AAPL"]
+
+
+def test_backtest_still_uses_the_metric_store(monkeypatch):
+    """as_of set (backtest) keeps the fast precomputed path -- speed/fidelity preserved."""
+    from datetime import datetime, timezone
+
+    store_calls = _record_store(monkeypatch, symbols=("msft",))
+    screener_calls = []
+    monkeypatch.setattr(fr_mod, "StockScreener",
+                        lambda *a, **k: screener_calls.append(1) or MagicMock())
+
+    inst = _store_expert(monkeypatch)
+    got = inst._screen_universe(as_of=datetime(2025, 1, 2, tzinfo=timezone.utc))
+
+    assert store_calls, "backtest must still use the fast metric_store path"
+    assert screener_calls == [], "backtest must not fall back to the slow StockScreener"
+    assert got == ["MSFT"]
