@@ -19,6 +19,7 @@ import bisect
 import json
 import os
 import re
+import time
 import requests
 
 from ba2_common.core.interfaces import MarketExpertInterface
@@ -516,8 +517,24 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
 
     @staticmethod
     def _trader_name(trade: Dict[str, Any]) -> str:
-        """Build the trader display/lookup name from FMP firstName/lastName."""
-        return f"{trade.get('firstName', '')} {trade.get('lastName', '')}".strip() or 'Unknown'
+        """The canonical per-trader key, from FMP firstName/lastName.
+
+        Falls back to ``representative``/``senator``/``office`` when the name fields are absent,
+        so every per-trader map (skill, confidence, hold-days, still-held) keys the SAME way on
+        any feed shape. The still-held gate originally used the fallback chain ALONE, which
+        disagreed with all the others: the real feed carries no ``representative``/``senator``,
+        so every row fell through to ``office`` -- 285 distinct values for 262 actual people
+        (formatting variants), silently over-counting ``min_still_holders`` and making its
+        holder map un-joinable with the rest.
+
+        Ordering matters: firstName+lastName FIRST, so real feed rows keep the keys the existing
+        on-disk scoring caches were built with and nothing is invalidated.
+        """
+        name = f"{trade.get('firstName', '')} {trade.get('lastName', '')}".strip()
+        if name:
+            return name
+        return (trade.get('representative') or trade.get('senator')
+                or trade.get('office') or 'Unknown')
 
     @staticmethod
     def _normalize_ticker(symbol: str) -> str:
@@ -844,7 +861,13 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             except (ValueError, TypeError):
                 continue  # unparseable either date -> _filter_trades would drop it
         rows.sort(key=lambda r: r[0])
-        cached = {"rows": rows, "disclose_dates": [r[0] for r in rows]}
+        # "all_trades" mirrors _symbol_trades_index_cached's shape. It is the UNWINDOWED deduped
+        # feed, and the still-held gate needs it: `rows` drops any trade with an unparseable
+        # date, and every consumer downstream of here is window-filtered, so without this the
+        # basket path had no route to the full history and silently netted holdings over
+        # windowed data. Costs one list of references -- `rows` already holds the same dicts.
+        cached = {"all_trades": all_trades, "rows": rows,
+                  "disclose_dates": [r[0] for r in rows]}
         if not is_live:
             self._all_trades_memo = cached
         return cached
@@ -923,6 +946,11 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         # bisects over, so reuse it directly instead of re-deriving the same bisect+filter here.
         index = self._all_trades_index_cached(is_live=(as_of is None))
         windowed = self._window_trades(index, ceiling, max_disclose_days, max_exec_days)
+
+        # The FULL deduped feed, before any window filtering — the still-held gate nets over
+        # this (see the bundle below), and _holdings_index_cached turns it into a per-symbol
+        # index once per process so that is a lookup, not a 39k-row scan per symbol per bar.
+        all_trades_unwindowed = index.get("all_trades") or []
 
         # Step 3: NEW tradability filter. Normalise first — basket mode DISCOVERS its symbols
         # here rather than reading a vetted universe, so this is the point where a raw feed
@@ -1024,6 +1052,15 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
 
             bundle_by_symbol[symbol] = {
                 "all_trades": symbol_trades,
+                # UNWINDOWED feed, for the still-held gate ONLY -- the same fix _gather got in
+                # 9306eb8, which this path was missing. `symbol_trades` is windowed on the
+                # DISCLOSURE date too (as short as 15 days), so a sale that CLOSED a position
+                # but was disclosed earlier is absent from it, and netting over it reports
+                # long-closed positions as still open -- biased toward "held", the opposite of
+                # the conservative direction this gate exists to take. Basket mode is the path
+                # that actually runs, so the gate was wrong wherever it mattered; the original
+                # regression test called _still_held_by directly and so never caught it.
+                "unwindowed_trades": all_trades_unwindowed,
                 "current_price": current_price,
                 "exec_price_by_trade": exec_price_by_trade,
                 "trader_history_by_name": trader_history_by_name,
@@ -1105,16 +1142,18 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         min_holders = int(self._setting_or_default(settings, "min_still_holders") or 0)
         # Computed UNCONDITIONALLY so analysis details can show it even when the gate is off --
         # "does this discloser still hold?" is useful context for reading a recommendation, not
-        # just a filter input. Cheap: memoized per (symbol, day), so this is one history walk per
-        # symbol per day regardless of bar frequency.
-        held_by = self._still_held_by(
-            data_bundle.get("unwindowed_trades") or data_bundle["all_trades"],
-            symbol, now=now)
+        # just a filter input. Cheap now: a per-symbol index built once per process (not a
+        # per-bar scan of the whole 39k-row feed), plus a day-bucketed memo on top.
+        _unwindowed = data_bundle.get("unwindowed_trades") or data_bundle["all_trades"]
+        held_by = self._still_held_by(_unwindowed, symbol, now=now)
         for _t in filtered:
-            _who = (_t.get("representative") or _t.get("senator") or _t.get("office") or "?")
-            _t["still_held"] = bool(held_by.get(_who, False))
+            # _trader_name -- the same key the index and every other per-trader map use.
+            _t["still_held"] = bool(held_by.get(self._trader_name(_t), False))
         if require_held or min_holders:
-            holders = sum(1 for v in held_by.values() if v)
+            # PRECOMPUTED holder count: a bisect into the per-symbol timeline rather than a
+            # recount per bar. Identical to summing held_by (same netting rule, pinned by test),
+            # but O(log n) and independent of how many traders touched the symbol.
+            holders = self._holder_count_as_of(_unwindowed, symbol, now, is_live=(as_of is None))
             if min_holders and holders < min_holders:
                 self.logger.debug(
                     f"{symbol}: {holders} still-holding trader(s) < min_still_holders="
@@ -1944,19 +1983,21 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         if hit is not None:
             return hit
 
+        # PREFIX INDEX, built ONCE per (process, trade-list) instead of scanning per call. The
+        # memo above only collapses repeat calls for the SAME (symbol, day); the scan itself was
+        # still O(all_trades) per symbol per day. In basket mode ``trades`` is the WHOLE
+        # congressional feed (~39k rows) and a bar analyses hundreds of symbols, so that is
+        # ~39k x symbols x trading-days row visits per trial -- billions over a 3.5-year run,
+        # which would have dominated the grid. Indexing by symbol makes each call proportional
+        # to the traders who touched THAT symbol. Same pattern as _confidence_index_cached and
+        # _sorted_buy_candidates_cached.
+        index = self._holdings_index_cached(trades)
+
         latest: Dict[str, tuple] = {}          # trader -> (exec_dt, is_buy)
-        for t in trades:
-            if self._normalize_ticker(t.get("symbol") or t.get("ticker") or "") != sym:
+        for t in index.get(sym, ()):
+            exec_dt, is_buy, is_sell, who = t
+            if now is not None and exec_dt > now:
                 continue
-            exec_dt = self._trade_exec_dt(t)
-            if exec_dt is None or (now is not None and exec_dt > now):
-                continue
-            ttype = str(t.get("type", "")).lower()
-            is_buy = "purchase" in ttype or "buy" in ttype
-            is_sell = "sale" in ttype or "sell" in ttype
-            if not (is_buy or is_sell):
-                continue
-            who = t.get("representative") or t.get("senator") or t.get("office") or "?"
             prev = latest.get(who)
             # On a same-day buy+sale, the SALE wins: assume the exit, never the entry.
             if prev is None or exec_dt > prev[0] or (exec_dt == prev[0] and not is_buy):
@@ -1968,6 +2009,119 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             memo.clear()
         memo[memo_key] = result
         return result
+
+    def _holdings_index_cached(self, trades: List[Dict[str, Any]]) -> Dict[str, list]:
+        """``symbol -> [(exec_dt, is_buy, is_sell, trader), ...]`` for every buy/sell, built once.
+
+        Turns still-held netting from an O(all_trades) scan per (symbol, day) into a dict lookup
+        plus a walk over just that symbol's rows. The parse/normalise/classify work that used to
+        run on every call -- ``_normalize_ticker``, ``_trade_exec_dt``, the buy/sell string
+        matching -- happens ONCE per row here instead.
+
+        Rows are NOT date-filtered: ``now`` varies per call and filtering here would bake one
+        bar's as-of into a shared structure (the lookahead guard has to stay at the call site).
+
+        Keyed on ``len(trades)`` like the skill/confidence caches: the trade list is a stable,
+        memoized object within a run, and a re-gathered/extended feed changes its length, so a
+        stale index is invalidated rather than silently reused. In-memory and per-instance --
+        it is derived from the already-disk-cached feed and costs one pass to rebuild, so
+        persisting it would add I/O and a staleness surface for no gain.
+        """
+        cached = getattr(self, "_holdings_index", None)
+        if cached is not None and cached[0] == len(trades):
+            return cached[1]
+
+        index: Dict[str, list] = {}
+        for t in trades:
+            ttype = str(t.get("type", "")).lower()
+            is_buy = "purchase" in ttype or "buy" in ttype
+            is_sell = "sale" in ttype or "sell" in ttype
+            if not (is_buy or is_sell):
+                continue
+            sym = self._normalize_ticker(t.get("symbol") or t.get("ticker") or "")
+            if not sym:
+                continue
+            exec_dt = self._trade_exec_dt(t)
+            if exec_dt is None:
+                continue
+            # _trader_name (firstName + lastName) -- the SAME key skill/confidence/hold-days use.
+            # The earlier `representative or senator or office` chain disagreed with all of them:
+            # the real feed carries none of `representative`/`senator`, so every row fell through
+            # to `office`, which has 285 distinct values for 262 actual people (formatting
+            # variants). That silently OVER-COUNTED min_still_holders -- one person could be two
+            # "holders" -- and made held_by un-joinable with every other per-trader map.
+            who = self._trader_name(t)
+            index.setdefault(sym, []).append((exec_dt, is_buy, is_sell, who))
+
+        self._holdings_index = (len(trades), index)
+        return index
+
+    # Live holdings TTL: the disclosure feed only changes when a new filing lands (daily at
+    # best), so a short TTL is ample and keeps a live analysis from rebuilding the timeline on
+    # every call. Backtests never use it -- their feed is frozen, so the precomputed timeline is
+    # valid for the whole run (see _holder_count_timeline_cached).
+    _HOLDINGS_TTL_SECONDS = 900.0
+
+    def _holder_count_timeline_cached(self, trades: List[Dict[str, Any]],
+                                      is_live: bool = False) -> Dict[str, tuple]:
+        """``symbol -> (event_dates[], holder_counts[])`` — how many traders hold, over time.
+
+        PRECOMPUTED, not recomputed per bar. ``min_still_holders`` needs "how many members of
+        Congress hold this symbol as of *now*", which is a function of (symbol, date) only — it
+        does not depend on any GA gene. Recomputing it per bar meant replaying a symbol's whole
+        event history on every analysis; here the history is swept ONCE per symbol and the answer
+        at any date becomes a ``bisect`` into a prefix array.
+
+        Built by walking each symbol's events in date order, tracking each trader's latest action
+        (a sale closes the position entirely — see ``_still_held_by``) and recording the holder
+        count after each event date. ``counts[i]`` is the number of holders in force from
+        ``dates[i]`` until ``dates[i+1]``, so ``bisect_right(dates, now) - 1`` gives the count
+        as of ``now`` and -1 (before the first event) correctly reads as zero holders.
+
+        LIVE vs BACKTEST, deliberately different:
+          * backtest — the feed is frozen for the run, so this is built once per process and
+            reused for every trial and every bar;
+          * live — new filings land continuously, so it is rebuilt on a
+            ``_HOLDINGS_TTL_SECONDS`` timer rather than cached for the process lifetime.
+        """
+        key = len(trades)
+        cached = getattr(self, "_holder_timeline", None)
+        if cached is not None and cached[0] == key:
+            if not is_live or (time.time() - cached[2]) < self._HOLDINGS_TTL_SECONDS:
+                return cached[1]
+
+        timeline: Dict[str, tuple] = {}
+        for sym, events in self._holdings_index_cached(trades).items():
+            latest: Dict[str, tuple] = {}
+            dates: List[datetime] = []
+            counts: List[int] = []
+            for exec_dt, is_buy, _is_sell, who in sorted(events, key=lambda e: e[0]):
+                prev = latest.get(who)
+                # Same-day buy+sale resolves to the SALE, matching _still_held_by exactly.
+                if prev is None or exec_dt > prev[0] or (exec_dt == prev[0] and not is_buy):
+                    latest[who] = (exec_dt, is_buy)
+                held = sum(1 for _d, b in latest.values() if b)
+                if dates and dates[-1] == exec_dt:
+                    counts[-1] = held          # collapse same-day events to one checkpoint
+                else:
+                    dates.append(exec_dt)
+                    counts.append(held)
+            timeline[sym] = (dates, counts)
+
+        self._holder_timeline = (key, timeline, time.time())
+        return timeline
+
+    def _holder_count_as_of(self, trades: List[Dict[str, Any]], symbol: str,
+                            now: Optional[datetime], is_live: bool = False) -> int:
+        """Holders of *symbol* as of *now*, via one bisect into the precomputed timeline."""
+        dates, counts = self._holder_count_timeline_cached(trades, is_live).get(
+            self._normalize_ticker(symbol or ""), ([], []))
+        if not dates:
+            return 0
+        if now is None:
+            return counts[-1]
+        i = bisect.bisect_right(dates, now) - 1
+        return counts[i] if i >= 0 else 0
 
     def _trade_exec_dt(self, trade: Dict[str, Any]) -> Optional[datetime]:
         """Execution datetime of a trade, or None when unparseable."""

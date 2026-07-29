@@ -2118,3 +2118,68 @@ def test_render_completed_still_uses_no_data_fallback_for_empty_state():
     market_analysis = type("MA", (), {"state": None})()
     # Must not raise / must not try the basket branch for genuinely empty state.
     e._render_completed(market_analysis)
+
+
+# ====================================================================
+# STILL-HELD in BASKET mode -- the path that actually runs.
+# ====================================================================
+def test_gather_all_bundle_carries_the_unwindowed_feed_for_still_held():
+    """REGRESSION (2026-07-28). 9306eb8 fixed still-held to net over UNWINDOWED history, but only
+    in the per-symbol _gather. _gather_all -- the path FMPSenateTraderWeight actually uses in
+    backtests AND live -- kept setting only "all_trades" (the WINDOWED, tradability-filtered
+    per-symbol list), so _process fell back to it and the gate went on netting over windowed data
+    wherever it mattered.
+
+    The original regression test called _still_held_by directly with a hand-built list, so it
+    passed throughout. This asserts the BUNDLE the real path builds.
+
+    Why it matters: _window_trades filters on the DISCLOSURE date too (as short as 15 days), so a
+    sale that CLOSED a position but was disclosed earlier is missing -- reporting long-closed
+    positions as still open, biased toward "held", the opposite of this gate's purpose.
+    """
+    # Alice bought AAPL (disclosed recently -> inside the window) and LATER sold it, but that
+    # sale carries an old DISCLOSURE date, so _window_trades drops it while the buy survives.
+    # Args are (first, last, symbol, type, DISCLOSE, EXEC) -- the sale must EXECUTE after the
+    # buy to close it, which is the ordering that makes this a closing sale rather than a
+    # prior, unrelated one.
+    senate = [
+        _weight_trade("Alice", "Aa", "AAPL", "purchase", "2026-06-01", "2026-05-20"),
+        _weight_trade("Alice", "Aa", "AAPL", "sale", "2026-01-05", "2026-05-25"),
+    ]
+    e = _weight_basket_expert(senate, [], {"Alice Aa": senate}, {"AAPL": 100.0})
+    bundle = e._gather_all(_bundle({"AAPL": 100.0}), as_of=NOW)
+    assert "AAPL" in bundle
+
+    unwindowed = bundle["AAPL"].get("unwindowed_trades")
+    assert unwindowed is not None, "basket bundle lost the unwindowed feed the gate needs"
+    assert len(unwindowed) >= len(bundle["AAPL"]["all_trades"]), \
+        "unwindowed feed must be a superset of the windowed per-symbol list"
+
+    # And the gate reaches the right answer THROUGH the bundle: the sale closed the position.
+    held = e._still_held_by(unwindowed, "AAPL", now=NOW)
+    assert held == {"Alice Aa": False}, "closing sale was invisible -> reported as still held"
+
+
+def test_still_held_index_is_built_once_and_reused():
+    """PERFORMANCE CONTRACT. In basket mode the trade list is the WHOLE feed and a bar analyses
+    hundreds of symbols, so an O(all_trades) scan per (symbol, day) is billions of row visits
+    over a multi-year trial. The index must be built once per trade-list, not per call."""
+    trades = [
+        _weight_trade("Alice", "Aa", "AAPL", "purchase", "2026-06-01", "2026-05-20"),
+        _weight_trade("Bob", "Bb", "MSFT", "purchase", "2026-06-01", "2026-05-20"),
+    ]
+    e = FMPSenateTraderWeight.__new__(FMPSenateTraderWeight)
+    e.logger = _LOG
+    first = e._holdings_index_cached(trades)
+    assert e._holdings_index_cached(trades) is first, "index rebuilt instead of reused"
+    assert set(first) == {"AAPL", "MSFT"}, "index must be keyed by symbol"
+
+
+def test_a_changed_feed_invalidates_the_holdings_index():
+    """Otherwise a re-gathered/extended feed would be answered from a stale index."""
+    e = FMPSenateTraderWeight.__new__(FMPSenateTraderWeight)
+    e.logger = _LOG
+    t1 = [_weight_trade("Alice", "Aa", "AAPL", "purchase", "2026-06-01", "2026-05-20")]
+    assert set(e._holdings_index_cached(t1)) == {"AAPL"}
+    t2 = t1 + [_weight_trade("Bob", "Bb", "MSFT", "purchase", "2026-06-01", "2026-05-20")]
+    assert set(e._holdings_index_cached(t2)) == {"AAPL", "MSFT"}
