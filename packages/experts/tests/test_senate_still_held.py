@@ -18,6 +18,28 @@ from ba2_experts.FMPSenateTraderWeight import FMPSenateTraderWeight
 
 NOW = datetime(2024, 6, 1, tzinfo=timezone.utc)
 
+import contextlib
+import time as _time
+import ba2_experts.FMPSenateTraderWeight as _mod_shadow   # noqa: F401  (see importlib note below)
+import importlib as _importlib
+_M = _importlib.import_module("ba2_experts.FMPSenateTraderWeight")
+
+
+@contextlib.contextmanager
+def _clock_advanced_past_ttl():
+    """Jump the clock beyond the holdings TTL. Patches time.time globally because the module
+    calls it via `time.time()`; the package __init__ re-exports the CLASS under the module's own
+    name, so `import ba2_experts.FMPSenateTraderWeight as m` yields the class -- importlib is
+    required to reach the real module."""
+    orig = _time.time
+    _time.time = lambda: orig() + FMPSenateTraderWeight._HOLDINGS_TTL_SECONDS + 10
+    try:
+        yield
+    finally:
+        _time.time = orig
+
+
+
 
 def _t(who, sym, ttype, date, amount="$15,001 - $50,000"):
     return {"representative": who, "symbol": sym, "type": ttype,
@@ -254,3 +276,62 @@ def test_a_mismatched_office_trader_who_sold_is_still_dropped():
     held = e._still_held_by([buy, sale], "UBER", now=NOW)
     kept = [t for t in [buy] if held.get(FMPSenateTraderWeight._trader_name(t), False)]
     assert kept == [], "trader who sold out should have been dropped"
+
+
+# --------------------------------------------------------------------------- #
+# live cache invalidation
+# --------------------------------------------------------------------------- #
+def _named(first, last, sym, ttype, date):
+    return {"firstName": first, "lastName": last, "symbol": sym, "type": ttype,
+            "transactionDate": date, "amount": "$15,001 - $50,000"}
+
+
+_BASE = [_named("A", "a", "UBER", "purchase", "2024-01-10"),
+         _named("B", "b", "UBER", "purchase", "2024-01-11")]
+_GREW = _BASE + [_named("C", "c", "UBER", "purchase", "2024-02-01")]      # C bought
+_AMEND = _BASE + [_named("C", "c", "UBER", "sale", "2024-02-01")]         # C sold - SAME LENGTH
+
+
+def test_live_same_length_feed_change_is_picked_up_after_the_ttl():
+    """REGRESSION. Both holdings caches keyed on len(trades) ALONE. The live `-latest` endpoints
+    return a ROLLING WINDOW, so as new filings arrive old ones drop off and the content changes
+    completely while the count stays identical -- a length-only key then pins a stale answer
+    forever.
+
+    The timeline had a TTL, but it rebuilt by calling _holdings_index_cached, which had NONE, so
+    on expiry it faithfully reconstructed the same wrong answer from the same stale rows. Cache
+    invalidation has to reach the layer that owns the data. Measured before the fix: 3 holders
+    where the truth was 2, still 3 after the TTL elapsed."""
+    e = _expert()
+    assert e._holder_count_as_of(_GREW, "UBER", NOW, is_live=True) == 3
+    with _clock_advanced_past_ttl():
+        assert e._holder_count_as_of(_AMEND, "UBER", NOW, is_live=True) == 2, \
+            "stale index survived TTL expiry -- invalidation did not reach _holdings_index_cached"
+
+
+def test_live_still_held_map_also_expires():
+    """_still_held_by memoised on (symbol, len, DAY), which is exact for a frozen backtest feed
+    but pins a live answer for the whole day. Its key now carries a TTL window too."""
+    e = _expert()
+    assert e._still_held_by(_GREW, "UBER", now=NOW, is_live=True)["C c"] is True
+    with _clock_advanced_past_ttl():
+        assert e._still_held_by(_AMEND, "UBER", now=NOW, is_live=True)["C c"] is False
+
+
+def test_backtest_never_pays_the_ttl():
+    """A backtest feed is FROZEN for the whole run, so length is an exact content check there.
+    Expiring on a timer would rebuild the index for nothing, per symbol, for millions of bars."""
+    e = _expert()
+    first = e._holder_count_as_of(_BASE, "UBER", NOW, is_live=False)
+    with _clock_advanced_past_ttl():
+        assert e._holder_count_as_of(_BASE, "UBER", NOW, is_live=False) == first
+        assert e._holdings_index_cached(_BASE, False) is e._holdings_index_cached(_BASE, False), \
+            "backtest rebuilt the index on a clock change"
+
+
+def test_within_the_ttl_the_cache_is_deliberately_reused():
+    """The bound is TTL-sized staleness, not zero staleness -- rebuilding per call would put an
+    O(feed) scan back on the hot path, which is what the index exists to remove."""
+    e = _expert()
+    assert e._holder_count_as_of(_GREW, "UBER", NOW, is_live=True) == 3
+    assert e._holder_count_as_of(_AMEND, "UBER", NOW, is_live=True) == 3  # same window -> cached

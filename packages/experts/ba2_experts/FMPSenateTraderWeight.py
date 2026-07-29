@@ -1145,7 +1145,8 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         # just a filter input. Cheap now: a per-symbol index built once per process (not a
         # per-bar scan of the whole 39k-row feed), plus a day-bucketed memo on top.
         _unwindowed = data_bundle.get("unwindowed_trades") or data_bundle["all_trades"]
-        held_by = self._still_held_by(_unwindowed, symbol, now=now)
+        _is_live = as_of is None
+        held_by = self._still_held_by(_unwindowed, symbol, now=now, is_live=_is_live)
         for _t in filtered:
             # _trader_name -- the same key the index and every other per-trader map use.
             _t["still_held"] = bool(held_by.get(self._trader_name(_t), False))
@@ -1944,7 +1945,8 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
 
 
     def _still_held_by(self, trades: List[Dict[str, Any]], symbol: str,
-                       now: Optional[datetime] = None) -> Dict[str, bool]:
+                       now: Optional[datetime] = None,
+                       is_live: bool = False) -> Dict[str, bool]:
         """Per trader: is this symbol still HELD as of *now* -- i.e. is their LATEST action a buy?
 
         "N politicians bought and none have sold" is a materially stronger claim than "N bought
@@ -1981,7 +1983,13 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         # are cheap to load but this is cheap to RECOMPUTE, so persisting it would add I/O and a
         # staleness surface for no gain.
         bucket = now.date().isoformat() if now is not None else "now"
-        memo_key = (sym, len(trades), bucket)
+        # LIVE adds a TTL window to the key. The day bucket is exact for a FROZEN backtest feed,
+        # but live re-fetches a rolling window whose content changes while its length does not,
+        # so (sym, len, day) would pin a stale answer for the rest of the day. Dividing the clock
+        # into TTL-sized windows expires the memo on the same cadence as the index it is built
+        # from -- one recompute per symbol per window, not per bar.
+        ttl_bucket = int(time.time() // self._HOLDINGS_TTL_SECONDS) if is_live else 0
+        memo_key = (sym, len(trades), bucket, ttl_bucket)
         memo = getattr(self, "_still_held_memo", None)
         if memo is None:
             memo = self._still_held_memo = {}
@@ -1997,7 +2005,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         # which would have dominated the grid. Indexing by symbol makes each call proportional
         # to the traders who touched THAT symbol. Same pattern as _confidence_index_cached and
         # _sorted_buy_candidates_cached.
-        index = self._holdings_index_cached(trades)
+        index = self._holdings_index_cached(trades, is_live)
 
         latest: Dict[str, tuple] = {}          # trader -> (exec_dt, is_buy)
         for t in index.get(sym, ()):
@@ -2016,7 +2024,8 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         memo[memo_key] = result
         return result
 
-    def _holdings_index_cached(self, trades: List[Dict[str, Any]]) -> Dict[str, list]:
+    def _holdings_index_cached(self, trades: List[Dict[str, Any]],
+                               is_live: bool = False) -> Dict[str, list]:
         """``symbol -> [(exec_dt, is_buy, is_sell, trader), ...]`` for every buy/sell, built once.
 
         Turns still-held netting from an O(all_trades) scan per (symbol, day) into a dict lookup
@@ -2027,15 +2036,28 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         Rows are NOT date-filtered: ``now`` varies per call and filtering here would bake one
         bar's as-of into a shared structure (the lookahead guard has to stay at the call site).
 
-        Keyed on ``len(trades)`` like the skill/confidence caches: the trade list is a stable,
-        memoized object within a run, and a re-gathered/extended feed changes its length, so a
-        stale index is invalidated rather than silently reused. In-memory and per-instance --
-        it is derived from the already-disk-cached feed and costs one pass to rebuild, so
-        persisting it would add I/O and a staleness surface for no gain.
+        BACKTEST keys on ``len(trades)`` alone, which is exact there: the feed is frozen for the
+        whole run, so the list is a stable memoized object and its length only changes when the
+        feed genuinely does.
+
+        LIVE ALSO EXPIRES ON A TIMER, and that is a CORRECTNESS fix, not a tuning knob. Length is
+        not a content check: the ``-latest`` endpoints return a ROLLING WINDOW, so as new filings
+        arrive old ones drop off the end and the content changes completely while the count stays
+        identical. An amended filing that swaps one row for another does the same. A length-only
+        key therefore serves a stale index indefinitely in live.
+
+        This was live for one day and was invisible: ``_holder_count_timeline_cached`` had a TTL,
+        but it REBUILT BY CALLING THIS METHOD, which had none -- so on expiry it faithfully
+        reconstructed the same wrong answer from the same stale rows. Verified before the fix:
+        an amended feed of equal length reported 3 holders where the truth was 2, and still did
+        after the TTL elapsed. Cache invalidation has to reach the layer that owns the data.
         """
         cached = getattr(self, "_holdings_index", None)
         if cached is not None and cached[0] == len(trades):
-            return cached[1]
+            fresh = (not is_live
+                     or (time.time() - cached[2]) < self._HOLDINGS_TTL_SECONDS)
+            if fresh:
+                return cached[1]
 
         index: Dict[str, list] = {}
         for t in trades:
@@ -2059,7 +2081,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             who = self._trader_name(t)
             index.setdefault(sym, []).append((exec_dt, is_buy, is_sell, who))
 
-        self._holdings_index = (len(trades), index)
+        self._holdings_index = (len(trades), index, time.time())
         return index
 
     # Live holdings TTL: the disclosure feed only changes when a new filing lands (daily at
@@ -2097,7 +2119,10 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                 return cached[1]
 
         timeline: Dict[str, tuple] = {}
-        for sym, events in self._holdings_index_cached(trades).items():
+        # is_live MUST be threaded through: without it the index below serves a stale build
+        # forever and this rebuild just reconstructs the same wrong answer (see
+        # _holdings_index_cached -- that was the actual bug, not the TTL here).
+        for sym, events in self._holdings_index_cached(trades, is_live).items():
             latest: Dict[str, tuple] = {}
             dates: List[datetime] = []
             counts: List[int] = []
