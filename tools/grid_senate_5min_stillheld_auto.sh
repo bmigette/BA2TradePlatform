@@ -47,9 +47,14 @@ cd "$(dirname "$0")/.."
 UNI=$(cat "$HOME/Documents/ba2/senate_universe.csv")
 PY=.venv/Scripts/python.exe
 
+# Total generation budget for the grid. Passed BOTH to optimize (below) and to the warm-start
+# helper, which uses it to compute how many generations a resumed run still owes.
+GENERATIONS=8
+
 for S in S1 S2 S3 S4 S5 S6 S7; do
   NAME="sen5min3-${S}"
-  WS=$("$PY" tools/grid_warm_start_arg.py --name "$NAME" --not-before "$NOT_BEFORE" 2>/dev/null)
+  WS=$("$PY" tools/grid_warm_start_arg.py --name "$NAME" --not-before "$NOT_BEFORE" \
+                                          --generations "$GENERATIONS" 2>/dev/null)
 
   if [ "$WS" = "SKIP" ]; then
     echo "=== Senate $S @ 5min   SKIPPED — a completed run already exists ($(date))"
@@ -65,8 +70,12 @@ for S in S1 S2 S3 S4 S5 S6 S7; do
   fi
   echo "=================================================================="
 
-  # $WS is intentionally UNQUOTED: it must expand to two argv entries
-  # ("--warm-start-from" "233") or to nothing at all.
+  # $WS is intentionally UNQUOTED: it must expand to argv entries
+  # ("--warm-start-from" "233" ["--generations" "4"]) or to nothing at all.
+  #
+  # ORDER MATTERS: $WS sits AFTER --generations below, so when it carries a reduced
+  # --generations that later value WINS (argparse keeps the last occurrence for a non-append
+  # argument -- verified). Moving $WS above --generations would silently restore the full budget.
   # shellcheck disable=SC2086
   "$PY" testplatform/ba2test_launcher.py optimize \
     --expert FMPSenateTraderWeight \
@@ -75,7 +84,7 @@ for S in S1 S2 S3 S4 S5 S6 S7; do
     --start 2023-01-01 --end 2026-06-30 \
     --interval 5min \
     --fitness consistent_annual_return \
-    --population 60 --generations 8 --early-stop 4 --mutation-prob 0.3 \
+    --population 60 --generations "$GENERATIONS" --early-stop 4 --mutation-prob 0.3 \
     --parallel 4 --seed 42 \
     --initial-capital 10000 --commission 1.0 --spread-bps 20 \
     --workers remote150 \

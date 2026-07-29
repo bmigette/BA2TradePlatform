@@ -42,6 +42,10 @@ def main() -> int:
     ap.add_argument("--min-trials", type=int, default=10,
                     help="a source needs at least this many evaluated individuals to be worth "
                          "seeding from; below it a fresh random population is no worse (default 10)")
+    ap.add_argument("--generations", type=int, default=None,
+                    help="the grid's TOTAL generation budget. When given, the printed args also "
+                         "carry a REDUCED --generations so a resumed run finishes the original "
+                         "budget instead of re-running it in full (see module docstring).")
     ap.add_argument("--db", default=_DEFAULT_DB)
     a = ap.parse_args()
 
@@ -52,8 +56,8 @@ def main() -> int:
     try:
         con = sqlite3.connect(f"file:{a.db}?mode=ro", uri=True)
         rows = con.execute(
-            "SELECT id, status, all_results FROM strategy_optimizations "
-            "WHERE name = ? AND id >= ? ORDER BY id DESC",
+            "SELECT id, status, all_results, progress, optimization_config "
+            "FROM strategy_optimizations WHERE name = ? AND id >= ? ORDER BY id DESC",
             (a.name, a.not_before),
         ).fetchall()
     except sqlite3.Error as e:
@@ -79,24 +83,65 @@ def main() -> int:
     # ever reached an older `completed` row, silently re-running finished work. (That bug was
     # live until a synthetic test caught it: completed@400 + partial@401 returned
     # "--warm-start-from 401" instead of SKIP.)
-    if any(status == "completed" for _oid, status, _ar in rows):
+    if any(status == "completed" for _oid, status, *_rest in rows):
         # Re-running risks replacing a complete result with a worse one if this attempt is
         # interrupted early.
         print("SKIP", flush=True)
         return 0
 
     # PASS 2 — newest usable run wins.
-    for oid, _status, all_results in rows:
+    for oid, _status, all_results, progress, cfg_json in rows:
         try:
             n = len(json.loads(all_results)) if all_results else 0
         except (ValueError, TypeError):
             n = 0
-        if n >= a.min_trials:
-            print(f"--warm-start-from {oid}", flush=True)
-            return 0
+        if n < a.min_trials:
+            continue
+
+        out = f"--warm-start-from {oid}"
+        rem = _remaining_generations(progress, cfg_json, a.generations)
+        if rem is not None:
+            out += f" --generations {rem}"
+        print(out, flush=True)
+        return 0
 
     print("", flush=True)   # nothing usable -> fresh random population
     return 0
+
+
+def _remaining_generations(progress, cfg_json, total):
+    """How many generations are LEFT of the grid's budget, or None to leave it untouched.
+
+    Without this a resumed run does its FULL budget again on top of the generations the dead run
+    already completed: a job that died at generation 5 of 8, resumed for another 8, has had ~13
+    generations of selection pressure. That is not the configured experiment — it is not
+    comparable with the strategies that ran cleanly, nor with earlier grids, and the extra
+    pressure is exactly what overfits a 3.5-year window.
+
+    Progress is the right input and TRIAL COUNT IS NOT: ``ga_callback`` sets
+    ``progress = ((generation+1)/generations)*100`` at each generation boundary, whereas
+    ``all_results`` omits memoised duplicate genomes (the fitness function returns from the memo
+    BEFORE appending), so ``len(all_results)/population`` UNDERCOUNTS work done and would
+    overestimate what is left.
+
+    ``floor`` is deliberate: 94.17% of 8 means seven generations finished and the eighth was in
+    flight, so seven are banked and the partial one is redone. The floor of 1 keeps a nearly-done
+    run from being asked for zero generations.
+
+    Caveat worth stating: a warm start restores the POPULATION, not full GA state — elites, RNG
+    stream and the early-stopping counter all reset. So "5 done + 3 more" is not bit-identical to
+    an uninterrupted 8. It is far closer than 5 + 8, which is the alternative.
+    """
+    if total is None or not progress:
+        return None
+    try:
+        src_total = int((json.loads(cfg_json) or {}).get("generations") or 0) if cfg_json else 0
+    except (ValueError, TypeError):
+        src_total = 0
+    if src_total <= 0:
+        src_total = total
+    done = int((float(progress) / 100.0) * src_total)   # floor
+    return max(1, int(total) - done)
 
 
 if __name__ == "__main__":
