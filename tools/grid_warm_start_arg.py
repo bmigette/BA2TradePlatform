@@ -62,24 +62,40 @@ def main() -> int:
         print("", flush=True)
         return 0
 
-    best_id, best_n = None, 0
-    for oid, status, all_results in rows:
-        if status == "completed":
-            # Already done under trustworthy code. Re-running would overwrite a finished result
-            # with a worse one if this attempt is interrupted early.
-            print("SKIP", flush=True)
-            return 0
+    # Rows are id DESC = newest first. Take the NEWEST run with enough individuals to seed from.
+    #
+    # NEWEST, NOT LARGEST — this is the whole point. Warm-starts CHAIN: a run that was itself
+    # warm-started inherits its predecessor's population, so it is strictly FURTHER ALONG even
+    # when it recorded fewer trials. Picking "most trials" would walk the search BACKWARDS,
+    # throwing away the newer generations: after opt 238 (314 trials) dies and opt 239 resumes
+    # from it and dies at 50, 239 holds 238's evolution PLUS 50 more evaluations — resuming 238
+    # would discard them. Trial count stops being a proxy for progress the moment chaining exists.
+    #
+    # The min_trials floor is what makes "newest" safe: a run that died almost immediately holds
+    # a near-empty population, which would seed WORSE than random, so it is skipped in favour of
+    # the next-newest usable run.
+    # PASS 1 — is this strategy already DONE? Must be a SEPARATE, EXHAUSTIVE pass: rows arrive
+    # newest-first, so a later partial attempt would otherwise match and return before the loop
+    # ever reached an older `completed` row, silently re-running finished work. (That bug was
+    # live until a synthetic test caught it: completed@400 + partial@401 returned
+    # "--warm-start-from 401" instead of SKIP.)
+    if any(status == "completed" for _oid, status, _ar in rows):
+        # Re-running risks replacing a complete result with a worse one if this attempt is
+        # interrupted early.
+        print("SKIP", flush=True)
+        return 0
+
+    # PASS 2 — newest usable run wins.
+    for oid, _status, all_results in rows:
         try:
             n = len(json.loads(all_results)) if all_results else 0
         except (ValueError, TypeError):
             n = 0
-        if n > best_n:
-            best_id, best_n = oid, n
+        if n >= a.min_trials:
+            print(f"--warm-start-from {oid}", flush=True)
+            return 0
 
-    if best_id is not None and best_n >= a.min_trials:
-        print(f"--warm-start-from {best_id}", flush=True)
-    else:
-        print("", flush=True)
+    print("", flush=True)   # nothing usable -> fresh random population
     return 0
 
 
