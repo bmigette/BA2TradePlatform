@@ -1161,9 +1161,15 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
                 filtered = []
             elif require_held:
                 before = len(filtered)
+                # _trader_name, matching how held_by is KEYED (and how every other per-trader map
+                # is keyed). Looking up `office` here missed for 51 traders / 20.9% of feed rows
+                # -- 'A. Mitchell McConnell' vs 'Mitch McConnell', 'Cory A Booker' vs
+                # 'Cory Booker' -- and a miss defaults to False, so this dropped their trades as
+                # "sold out" whether or not they still held. That biased the GA against
+                # require_still_held=1 for a pure string-matching reason, the same way the ATR tz
+                # bug biased it against use_atr_stop.
                 filtered = [t for t in filtered
-                            if held_by.get(t.get("representative") or t.get("senator")
-                                           or t.get("office") or "?", False)]
+                            if held_by.get(self._trader_name(t), False)]
                 if before != len(filtered):
                     self.logger.debug(
                         f"{symbol}: require_still_held dropped {before - len(filtered)}/{before} "

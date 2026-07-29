@@ -209,3 +209,48 @@ def test_gate_uses_unwindowed_history_not_the_windowed_set():
     assert e._still_held_by([buy], "UBER", now=NOW) == {"Alice": True}          # windowed view
     e2 = _expert()
     assert e2._still_held_by([buy, closing_sale], "UBER", now=NOW) == {"Alice": False}
+
+
+# --------------------------------------------------------------------------- #
+# the gate's own lookup key
+# --------------------------------------------------------------------------- #
+def _t_named(first, last, office, sym, ttype, date, amount="$15,001 - $50,000"):
+    """A REAL-shaped feed row: firstName/lastName plus an `office` string that does NOT match
+    them. 51 of 285 traders are like this in the live feed (20.9% of all rows) -- e.g.
+    office='A. Mitchell McConnell' vs 'Mitch McConnell', 'Cory A Booker' vs 'Cory Booker'."""
+    return {"firstName": first, "lastName": last, "office": office, "symbol": sym,
+            "type": ttype, "transactionDate": date, "amount": amount}
+
+
+def test_held_by_is_keyed_by_trader_name_not_office():
+    """REGRESSION. held_by is keyed by _trader_name; the require_still_held FILTER looked the
+    trader up by `office`. For any trader whose office string differs from firstName+lastName the
+    lookup missed, defaulted to False, and dropped their trades as "sold out" whether or not they
+    still held -- biasing the GA against require_still_held=1 for a pure string-matching reason,
+    exactly as the ATR tz bug biased it against use_atr_stop."""
+    e = _expert()
+    trades = [_t_named("Mitch", "McConnell", "A. Mitchell McConnell", "UBER",
+                       "purchase", "2024-01-10")]
+    held = e._still_held_by(trades, "UBER", now=NOW)
+    assert held == {"Mitch McConnell": True}
+    assert "A. Mitchell McConnell" not in held, "office must not be the key"
+
+
+def test_a_mismatched_office_trader_survives_the_require_still_held_filter():
+    """The end-to-end consequence: the filter must find this trader and KEEP the trade."""
+    e = _expert()
+    trade = _t_named("Cory", "Booker", "Cory A Booker", "UBER", "purchase", "2024-01-10")
+    held = e._still_held_by([trade], "UBER", now=NOW)
+    # This is the exact expression the gate uses.
+    kept = [t for t in [trade] if held.get(FMPSenateTraderWeight._trader_name(t), False)]
+    assert kept == [trade], "still-holding trader was dropped by a name-key mismatch"
+
+
+def test_a_mismatched_office_trader_who_sold_is_still_dropped():
+    """And the gate must keep WORKING -- fixing the key must not make it a no-op."""
+    e = _expert()
+    buy = _t_named("Cory", "Booker", "Cory A Booker", "UBER", "purchase", "2024-01-10")
+    sale = _t_named("Cory", "Booker", "Cory A Booker", "UBER", "sale", "2024-03-10")
+    held = e._still_held_by([buy, sale], "UBER", now=NOW)
+    kept = [t for t in [buy] if held.get(FMPSenateTraderWeight._trader_name(t), False)]
+    assert kept == [], "trader who sold out should have been dropped"
