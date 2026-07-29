@@ -165,3 +165,11 @@ cython_debug/
 # Vendored TradingAgents framework runtime output (sample analyses)
 ba2_trade_platform/thirdparties/TradingAgents/results/
 .aider*
+
+# Run artifacts under test_files/ — 657MB of logs+HTML had accumulated here
+# (one serve_restart.log alone was 658MB). These are outputs, never inputs.
+test_files/*.log
+test_files/*.html
+*.opt[0-9]*-*.log
+sen5min*.log
+fetch_5min*.log
