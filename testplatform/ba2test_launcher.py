@@ -32,14 +32,22 @@ from datetime import datetime
 
 
 def _parse_symbols_arg(raw: str) -> list:
-    """Comma list or ``@file`` (one symbol per line) — the idiom ``fetch-options``
-    already uses for its ``--underlyings`` flag, extended to ``fetch-cache``/
-    ``prewarm``'s ``--symbols`` so a large pinned universe file (e.g.
-    ``tools/senate_universe.txt``, 498 symbols) doesn't need a giant comma line."""
+    """Comma list or ``@file`` — the idiom ``fetch-options`` already uses for its
+    ``--underlyings`` flag, extended to ``fetch-cache``/``prewarm``'s ``--symbols`` so a large
+    pinned universe file (e.g. ``tools/senate_universe.txt``, 498 symbols) doesn't need a giant
+    comma line.
+
+    ``@file`` splits on WHITESPACE **and** COMMAS. It used to split on whitespace alone
+    ("one symbol per line"), which silently mangled the very file this project keeps its universe
+    in: ``~/Documents/ba2/senate_universe.csv`` is ONE comma-separated line with no whitespace, so
+    ``.split()`` returned a single 3,000-character "symbol". FMP predictably had no data for it,
+    and the fetch reported success having downloaded nothing (2026-07-29). A ticker never contains
+    a comma or a space, so accepting both separators cannot be ambiguous.
+    """
     if raw.startswith("@"):
         with open(raw[1:], encoding="utf-8") as f:
-            return [s.strip().upper() for s in f.read().split() if s.strip()]
-    return [s.strip().upper() for s in raw.split(",") if s.strip()]
+            raw = f.read()
+    return [s.strip().upper() for s in raw.replace(",", " ").split() if s.strip()]
 
 
 def _enter_backend() -> str:
@@ -181,15 +189,37 @@ def _cmd_fetch_cache(args) -> int:
         return sym, handle_ohlcv_cache_fetch(f"cli-fetch-{sym}", payload)
 
     done = 0
+    zero_row = []  # (symbol, timeframe) pairs that "succeeded" with nothing to show for it
     with ThreadPoolExecutor(max_workers=n_workers) as ex:
         for fut in as_completed([ex.submit(_one, s) for s in symbols]):
             sym, res = fut.result()
             (overall["fetched"] if res.get("status") == "completed" else overall["failed"]).append({sym: res})
+            # A handler can report status=completed having written ZERO rows. That is a failure
+            # wearing a success label, and it is how a 498-symbol fetch once reported
+            # "1/1 symbols (0 failed)" after downloading nothing at all (2026-07-29 --
+            # a mangled symbol list meant FMP was asked for one 3,000-char ticker).
+            for tf, tf_res in (res.get("results") or {}).items():
+                if int((tf_res or {}).get("rows") or 0) == 0:
+                    zero_row.append(f"{sym}:{tf}")
             done += 1
             if done % 25 == 0 or done == len(symbols):
                 print(f"  fetch-cache: {done}/{len(symbols)} symbols "
-                      f"({len(overall['failed'])} failed)", flush=True)
+                      f"({len(overall['failed'])} failed, {len(zero_row)} zero-row)", flush=True)
     print(json.dumps(overall, indent=2, default=str))
+
+    if zero_row:
+        # LOUD and non-zero exit: an empty fetch must never look like a completed one. Some
+        # symbol/timeframe pairs legitimately have no data (delisted, pre-IPO, a thin ETF over a
+        # short window) -- hence a report rather than an exception -- but the operator has to SEE
+        # it, because the failure mode this guards is a whole run silently doing nothing.
+        shown = ", ".join(zero_row[:15]) + (" ..." if len(zero_row) > 15 else "")
+        print(f"\n!! fetch-cache: {len(zero_row)}/{len(symbols) * max(len(timeframes), 1)} "
+              f"symbol/timeframe pair(s) returned ZERO rows: {shown}", flush=True)
+        if len(zero_row) == len(symbols) * max(len(timeframes), 1):
+            print("!! EVERY pair was empty — treat this run as FAILED (bad symbol list, "
+                  "bad date range, or an exhausted API plan), not as a completed fetch.",
+                  flush=True)
+            return 1
     return 0
 
 

@@ -3,10 +3,28 @@
 WHY THIS EXISTS (2026-07-28). ``position_sizing.get_latest_atr`` wrapped its indicator call in
 ``except Exception -> logger.warning -> return None``. A tz naive/aware ``TypeError`` — a plain
 code defect — was therefore indistinguishable from "this symbol has no ATR data", a legitimate
-outcome the caller handles by falling back to ``min_stop_loss_pct``. ATR was dead for MONTHS,
-``use_atr_stop``/``atr_multiplier``/``atr_period`` were inert GA genes, and nothing in any log
-said so (GA pool workers run at ``logging.disable(ERROR)``). See
-[[reference-atr-tz-bug-invalidated-optimizations]].
+outcome the caller handles by falling back to ``min_stop_loss_pct``. ATR was dead for MONTHS and
+``use_atr_stop``/``atr_multiplier``/``atr_period`` were inert GA genes.
+
+WHAT ACTUALLY HID IT — CORRECTED 2026-07-29. An earlier version of this docstring blamed log
+suppression, claiming "GA pool workers run at ``logging.disable(ERROR)``". That is wrong twice
+over, and the claim is repeated in several commit messages, so do not trust it there either:
+
+  * the real call is ``logging.disable(logging.INFO)``
+    (``strategy_optimization_handler.py``), which ALLOWS WARNING/ERROR/CRITICAL through — its own
+    comment says "Floor is INFO so WARNING+ survive";
+  * ``_worker_init`` does set ``BA2_FILE_LOGGING=0``/``BA2_STDOUT_LOGGING=0``, leaving a worker
+    with no ba2 handlers — but Python's ``logging.lastResort`` then writes WARNING+ to stderr,
+    which a grid captures via ``2>&1``. Verified empirically: an ERROR raised inside a
+    worker-shaped process does surface (bare and unformatted — the lastResort signature).
+
+So the warning was DELIVERED and nobody could act on it. What hid the bug was signal QUALITY:
+``logger.warning(...) + return None`` is indistinguishable from the legitimate "this symbol has
+no ATR data", so there was nothing to distinguish a defect from routine missing data. That is
+precisely the confusion this module exists to remove — and it is why the fix is to make the
+caller SAY what it expects, not to shout louder.
+
+See [[reference-atr-tz-bug-invalidated-optimizations]].
 
 DENY BY DEFAULT. The first version of this module inverted the test: it re-raised a fixed list
 of "defect" types (TypeError, AttributeError, ...) and absorbed everything else. That is

@@ -56,11 +56,23 @@ def main():
             print(f"!! cannot read {path}: {e}", file=sys.stderr)
 
     if not total:
-        print("no WOULD-RAISE lines found.\n"
-              "Either nothing was absorbed (good), or the run was not in observe mode, or the\n"
-              "logger never reached this file -- ba2_common sets propagate=False and GA pool\n"
-              "workers run at logging.disable(ERROR), which is why this class of error is easy\n"
-              "to miss. Check the worker logs too, not just the master's.")
+        print("no WOULD-RAISE lines found. Before concluding 'nothing was absorbed', rule out\n"
+              "the two boring explanations: the run was not in observe mode (BA2_ERROR_MODE),\n"
+              "or the records never reached THIS file.\n"
+              "\n"
+              "PROVE the pipe works before trusting an empty result -- fire a canary:\n"
+              "    BA2_ERROR_MODE=observe python -c \"\\\n"
+              "        from ba2_common.core.failure_modes import absorb_if_benign\\n"
+              "        try: raise TypeError('canary')\\n"
+              "        except Exception as e: absorb_if_benign(e)\"\n"
+              "and confirm a WOULD-RAISE line appears where you are grepping. An absent line\n"
+              "proves nothing on its own -- that assumption is exactly how the ATR tz bug\n"
+              "survived for months.\n"
+              "\n"
+              "(For the record: GA pool workers run at logging.disable(INFO), NOT (ERROR), so\n"
+              "WARNING/ERROR/CRITICAL do pass the level filter; and although _worker_init clears\n"
+              "the ba2 handlers, logging.lastResort still writes WARNING+ to stderr, which a grid\n"
+              "captures via 2>&1. Check the worker logs too, not just the master's.)")
         return 0
 
     print(f"{total} absorbed exception(s) that WOULD propagate under BA2_ERROR_MODE=enforce\n")
