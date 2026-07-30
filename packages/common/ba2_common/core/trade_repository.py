@@ -1,92 +1,82 @@
-"""Storage-agnostic access to trade rows — ONE implementation for live and backtest.
+"""Storage-agnostic access to trade rows.
+
+Callers ask for trades. They do NOT know, and must not ask, whether those rows live in the
+backtest's in-memory store or in SQLite — that is decided in exactly ONE place, the resolver at
+the bottom of this module. A condition, a risk rule or an expert says "give me this expert's
+open transactions on AAPL" and gets them, in a backtest and live alike.
 
 WHY THIS EXISTS
 ---------------
-``TradingOrder`` / ``Transaction`` / ``ExpertRecommendation`` live in DIFFERENT places
-depending on how the process was started:
+``TradingOrder`` / ``Transaction`` / ``ExpertRecommendation`` are ``IN_MEM_MODELS``: during a
+RAM-only backtest (``backtest_trading_db(..., in_memory=True)``) their rows live in
+``trade_store``'s dicts and NEVER reach the run's SQLite tables. A raw ``select(Transaction)``
+against that run therefore returns EMPTY instead of raising — the decision built on it silently
+evaluates to "nothing found", and it looks like ordinary data rather than a bug.
 
-* **live** and file-backed backtests -> SQLite, reachable with ``select()`` via ``get_db()``
-* **GA trials / RAM-only backtests**  -> ``trade_store``'s in-memory dicts
-  (``backtest_trading_db(..., in_memory=True)`` activates it; see ``IN_MEM_MODELS``)
+MEASURED (2026-07-30): ``DaysSinceLastCloseCondition`` did exactly this. With a close 3 days old
+and a ">15 day" cooldown it read the 1e9 "never closed" sentinel, so the gate was inert for a
+WHOLE optimization and the GA spent its search tuning a gene that did nothing. The same genome
+scored 103 trades / 17.55% annualised on the in-memory path and 169 / 0.20% on the SQLite one.
+Live has no in-memory store, so live behaved like the second — a deployed config running gates
+its own backtest never exercised.
 
-A raw ``select(Transaction)`` is blind to the second case: the rows never reach the run's
-SQLite table, so the query returns EMPTY instead of raising. Any decision built on such a
-query therefore silently evaluates to "nothing found" in every GA trial while working
-correctly live — the failure is invisible because it looks like ordinary data.
+THE SHAPE
+---------
+``TradeRepository`` is the interface. Two implementations own the storage detail:
 
-That is not hypothetical. On 2026-07-30 ``DaysSinceLastCloseCondition`` was measured doing
-exactly this: with a close 3 days old and a ">15 day" cooldown it returned the
-"never closed" sentinel (1e9) under the in-memory store and the correct 3.0 under SQLite.
-The cooldown gate was inert for the WHOLE optimization, so the GA spent its search tuning a
-gene that did nothing, and the same genome then scored 103 trades / 17.55% annualised in a
-GA trial versus 169 trades / 0.20% on the file-backed path. Live, which has no in-memory
-store, behaves like the 0.20% arm — i.e. unlike its own backtest.
+    InMemoryTradeRepository  -> the backtest store's dicts
+    SqlTradeRepository       -> SQLModel / SQLite (live, and file-backed backtests)
 
-THE RULE
---------
-**Never issue a raw ``select(Transaction)`` / ``select(TradingOrder)`` in decision code.**
-Go through this repository. It delegates to ``trade_store``'s dual-mode helpers
-(``transactions_where`` / ``orders_where`` / ``get_instance``), which pick the backend, so
-call sites contain no ``inmem_trades_active()`` branch and both paths run the SAME code.
+``get_trade_repository()`` picks one. Tests (and any seam that wants to substitute a fake) call
+``set_trade_repository()`` instead of reaching into the storage layer, so nothing above this
+module mentions a backend.
 
-Joins are expressed as "fetch transactions, then fetch their orders by id" rather than a SQL
-join, because ``trade_store.transactions_with_orders`` is in-mem-ONLY and would force call
-sites back into two implementations. The id sets involved are the caller's own OPEN
-transactions, so this stays small on both paths.
+Joins are expressed as "open transactions -> their orders" rather than SQL joins, because the
+in-memory side has no join and a SQL-only formulation would force two different call-site
+shapes — the very split this module removes.
 """
+from abc import ABC, abstractmethod
 from typing import Any, List, Optional
 
 from ba2_common.core.models import Transaction, TradingOrder
-from ba2_common.core.types import OrderStatus, TransactionStatus
+from ba2_common.core.types import AssetClass, OrderStatus, TransactionStatus
 from ba2_common.core.utils import calculate_transaction_pnl
 
 
-class TradeRepository:
-    """Domain queries over trade rows, valid under BOTH storage backends."""
+class TradeRepository(ABC):
+    """Read access to trade rows, independent of where they are stored."""
 
-    # -- transactions ----------------------------------------------------
+    # -- backend-specific ------------------------------------------------
+    @abstractmethod
     def transaction(self, transaction_id: Any) -> Optional[Transaction]:
-        """One Transaction by id, or None. ``get_instance`` already routes to the store."""
-        if transaction_id is None:
-            return None
-        from ba2_common.core.db import get_instance
-        return get_instance(Transaction, transaction_id)
+        """One Transaction by id, or None if it does not exist."""
 
+    @abstractmethod
     def open_transactions(self, *, expert_id: int, symbol: Optional[str] = None,
                           side: Optional[Any] = None) -> List[Transaction]:
-        """This expert's OPENED transactions, optionally narrowed to a symbol and/or side.
+        """This expert's OPENED transactions, optionally narrowed by symbol and/or side."""
 
-        ``side`` is filtered in Python: ``transactions_where`` has no side filter, and doing it
-        here keeps the single-code-path guarantee rather than reintroducing a raw query.
-        """
-        from ba2_common.core.trade_store import transactions_where
-        txns = transactions_where(expert_id=expert_id, symbol=symbol,
-                                  status=TransactionStatus.OPENED)
-        if side is not None:
-            txns = [t for t in txns if t.side == side]
-        return list(txns)
-
-    def closed_transactions(self, *, expert_id: int, symbol: Optional[str] = None,
-                            ) -> List[Transaction]:
+    @abstractmethod
+    def closed_transactions(self, *, expert_id: int,
+                            symbol: Optional[str] = None) -> List[Transaction]:
         """This expert's CLOSED transactions that carry a ``close_date``, NEWEST CLOSE FIRST.
 
-        Ordering is done here (not in SQL) so both backends return the same sequence — callers
-        rely on "newest first" to mean "most recent close".
+        Implementations must apply the ordering themselves so both backends return the same
+        sequence — callers rely on "newest first" meaning "most recent close".
         """
-        from ba2_common.core.trade_store import transactions_where
-        txns = [t for t in transactions_where(expert_id=expert_id, symbol=symbol,
-                                              status=TransactionStatus.CLOSED)
-                if t.close_date is not None]
-        txns.sort(key=lambda t: t.close_date, reverse=True)
-        return txns
 
+    @abstractmethod
+    def _orders_for_transactions(self, transaction_ids: List[Any]) -> List[TradingOrder]:
+        """Every TradingOrder attached to any of ``transaction_ids``."""
+
+    # -- storage-independent logic, shared by every backend ---------------
     def last_closed_transaction(self, *, expert_id: int, symbol: str,
                                 profit_sign: int = 0) -> Optional[Transaction]:
         """Most recent qualifying close, or None.
 
         ``profit_sign``: 0 = any close, +1 = only profitable, -1 = only losing. A transaction
-        whose P&L cannot be computed is skipped when a sign is requested (it cannot be shown
-        to qualify), matching the previous per-condition logic.
+        whose P&L cannot be computed is skipped when a sign is requested — it cannot be shown
+        to qualify.
         """
         for txn in self.closed_transactions(expert_id=expert_id, symbol=symbol):
             if profit_sign != 0:
@@ -100,23 +90,17 @@ class TradeRepository:
             return txn
         return None
 
-    # -- orders ----------------------------------------------------------
     def open_option_orders(self, *, expert_id: int, underlying: str,
                            option_type: Optional[Any] = None,
                            side: Optional[Any] = None,
                            option_strategy: Optional[str] = None) -> List[TradingOrder]:
-        """Non-terminal OPTION orders on ``underlying`` belonging to this expert's OPEN
-        transactions — the storage-agnostic form of the old
-        ``select(TradingOrder).join(Transaction)...`` used by the option flag conditions.
-        """
-        from ba2_common.core.trade_store import orders_where
+        """Non-terminal OPTION orders on ``underlying`` under this expert's OPEN transactions."""
         open_ids = [t.id for t in self.open_transactions(expert_id=expert_id) if t.id is not None]
         if not open_ids:
             return []
-        from ba2_common.core.types import AssetClass
         terminal = OrderStatus.get_terminal_statuses()
         out = []
-        for o in orders_where(transaction_ids=open_ids):
+        for o in self._orders_for_transactions(open_ids):
             if o.status in terminal:
                 continue
             if o.asset_class != AssetClass.OPTION:
@@ -132,11 +116,122 @@ class TradeRepository:
             out.append(o)
         return out
 
+    @staticmethod
+    def _newest_close_first(txns: List[Transaction]) -> List[Transaction]:
+        out = [t for t in txns if t.close_date is not None]
+        out.sort(key=lambda t: t.close_date, reverse=True)
+        return out
 
-_REPOSITORY = TradeRepository()
+
+class InMemoryTradeRepository(TradeRepository):
+    """Backed by the backtest in-memory trade store."""
+
+    def transaction(self, transaction_id: Any) -> Optional[Transaction]:
+        if transaction_id is None:
+            return None
+        from ba2_common.core.trade_store import store_get
+        return store_get(Transaction, transaction_id)
+
+    def open_transactions(self, *, expert_id: int, symbol: Optional[str] = None,
+                          side: Optional[Any] = None) -> List[Transaction]:
+        from ba2_common.core.trade_store import store_all
+        return [
+            t for t in store_all(Transaction)
+            if t.expert_id == expert_id
+            and t.status == TransactionStatus.OPENED
+            and (symbol is None or t.symbol == symbol)
+            and (side is None or t.side == side)
+        ]
+
+    def closed_transactions(self, *, expert_id: int,
+                            symbol: Optional[str] = None) -> List[Transaction]:
+        from ba2_common.core.trade_store import store_all
+        return self._newest_close_first([
+            t for t in store_all(Transaction)
+            if t.expert_id == expert_id
+            and t.status == TransactionStatus.CLOSED
+            and (symbol is None or t.symbol == symbol)
+        ])
+
+    def _orders_for_transactions(self, transaction_ids: List[Any]) -> List[TradingOrder]:
+        from ba2_common.core.trade_store import store_all
+        wanted = set(transaction_ids)
+        return [o for o in store_all(TradingOrder) if o.transaction_id in wanted]
+
+
+class SqlTradeRepository(TradeRepository):
+    """Backed by SQLModel/SQLite — live, and file-backed backtests."""
+
+    def transaction(self, transaction_id: Any) -> Optional[Transaction]:
+        if transaction_id is None:
+            return None
+        from ba2_common.core.db import get_db
+        with get_db() as session:
+            return session.get(Transaction, transaction_id)
+
+    def open_transactions(self, *, expert_id: int, symbol: Optional[str] = None,
+                          side: Optional[Any] = None) -> List[Transaction]:
+        from sqlmodel import select
+        from ba2_common.core.db import get_db
+        stmt = select(Transaction).where(
+            Transaction.expert_id == expert_id,
+            Transaction.status == TransactionStatus.OPENED,
+        )
+        if symbol is not None:
+            stmt = stmt.where(Transaction.symbol == symbol)
+        if side is not None:
+            stmt = stmt.where(Transaction.side == side)
+        with get_db() as session:
+            return list(session.exec(stmt).all())
+
+    def closed_transactions(self, *, expert_id: int,
+                            symbol: Optional[str] = None) -> List[Transaction]:
+        from sqlmodel import select
+        from ba2_common.core.db import get_db
+        stmt = select(Transaction).where(
+            Transaction.expert_id == expert_id,
+            Transaction.status == TransactionStatus.CLOSED,
+            Transaction.close_date.is_not(None),
+        )
+        if symbol is not None:
+            stmt = stmt.where(Transaction.symbol == symbol)
+        with get_db() as session:
+            rows = list(session.exec(stmt).all())
+        # Sorted in Python, not SQL, so both backends order identically.
+        return self._newest_close_first(rows)
+
+    def _orders_for_transactions(self, transaction_ids: List[Any]) -> List[TradingOrder]:
+        from sqlmodel import select
+        from ba2_common.core.db import get_db
+        stmt = select(TradingOrder).where(TradingOrder.transaction_id.in_(list(transaction_ids)))
+        with get_db() as session:
+            return list(session.exec(stmt).all())
+
+
+_IN_MEMORY = InMemoryTradeRepository()
+_SQL = SqlTradeRepository()
+_override: Optional[TradeRepository] = None
 
 
 def get_trade_repository() -> TradeRepository:
-    """The process-wide repository. Stateless — the backend is chosen per call by
-    ``trade_store``, so one instance is correct for live and for every concurrent trial."""
-    return _REPOSITORY
+    """The repository for the CURRENT execution context.
+
+    This is the single place in the codebase that maps "how was this process started" onto a
+    storage backend. Resolved per call, not cached, because a process runs live code and
+    backtest trials at different moments (and the backtest override is thread-local).
+    """
+    if _override is not None:
+        return _override
+    from ba2_common.core.trade_store import inmem_trades_active
+    return _IN_MEMORY if inmem_trades_active() else _SQL
+
+
+def set_trade_repository(repo: Optional[TradeRepository]) -> None:
+    """Force a specific repository (tests, or a seam substituting a fake). None restores
+    automatic resolution — always reset in a fixture teardown, since this is process-wide."""
+    global _override
+    _override = repo
+
+
+def reset_trade_repository() -> None:
+    set_trade_repository(None)
