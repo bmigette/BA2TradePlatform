@@ -34,13 +34,22 @@ NOT_BEFORE=233
 #
 # 2026-07-30 — WHY THIS IS STILL 233 AFTER A RESULT-AFFECTING CHANGE. The condition fix
 # (b431469/7798427, v2026.07.1002) made DaysSinceLastClose* and DaysOpened actually fire in
-# backtests; they had been INERT under the in-memory trade store, so every run before it scored
-# those genes as no-ops. By the rule above that should raise NOT_BEFORE past 240 — but doing so
-# would also force S1 (opt 238) to re-run, and S1 is genuinely unaffected: strategy 432 declares
-# NONE of the fixed conditions (verified against entry_rules/exit_rules). The invalidated runs
-# are instead RENAMED out of the way (sen5min3-S2/-S3 -> *-preconditionfix), which removes them
-# from this helper's name lookup entirely, so they can neither be SKIPped nor warm-started from.
-# Net effect: S1 skips (valid), S2/S3 start fresh, S4-S7 start fresh.
+# backtests; they had been INERT under the in-memory trade store, so runs before it could score
+# those genes as no-ops. By the rule above that should raise NOT_BEFORE past 240 — but a blanket
+# raise would discard TWO valid runs, so each was checked individually instead:
+#
+#   S1 (opt 238) VALID — strategy 432 declares NONE of the fixed conditions.
+#   S2 (opt 239) INVALID — its winner enabled BOTH exit_time (days_opened) and
+#                gate_days_since_close, so it was scored with two dead code paths.
+#   S3 (opt 240) VALID — its only days_opened user is the exit_time rule and the winner has
+#                exit:exit_time:enabled=0, so the dead condition was never evaluated.
+#                Confirmed empirically: re-running its top genome on the FIXED code reproduces
+#                390 trades / 49.80% ann / -31.21% DD exactly.
+#
+# So only S2 is renamed out of the way (sen5min3-S2 -> sen5min3-S2-preconditionfix), which
+# removes it from this helper's name lookup entirely — it can then be neither SKIPped (PASS 1)
+# nor warm-started from (PASS 2, poisoned population).
+# Net effect: S1 and S3 skip, S2 starts fresh, S4-S7 start fresh.
 # ---------------------------------------------------------------------------------------------
 #
 # STOPPING THIS GRID: kill the BASH SCRIPT FIRST. Killing only the python master makes `optimize`
