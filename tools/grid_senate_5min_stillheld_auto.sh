@@ -32,6 +32,25 @@
 # population costs a wrong conclusion.
 NOT_BEFORE=233
 #
+# !!! THIS GRID MIXES TWO WINDOWS — READ BEFORE COMPARING FITNESS ACROSS STRATEGIES !!!
+#
+# The window changed 2026-07-30 from `--end 2026-06-30` to `--end 2025-12-31`, because a
+# 30-June end produces a ~181-day tail that falls JUST under consistent_annual_return's
+# 182.62-day threshold and silently MERGES into the prior year, making that bucket 18 months
+# and biasing the consistency factor down. 31-Dec gives three clean calendar buckets
+# (2023 ~362d, 2024 ~366d, 2025 ~365d).
+#
+# S1 (opt 238, fitness 16.349) and S3 (opt 240, fitness 24.452) were optimized on the OLD
+# 2026-06-30 window and are deliberately NOT re-run — they still SKIP. So:
+#
+#     S1, S3          scored over 2023-01-01 -> 2026-06-30  (3.5y, 18-month final bucket)
+#     S2, S4..S7      scored over 2023-01-01 -> 2025-12-31  (3.0y, clean buckets)
+#
+# Their fitness numbers are therefore NOT directly comparable. Before picking a winner to
+# deploy, re-measure S1's and S3's WINNING GENOMES as single backtests on the 2025-12-31
+# window (~4 min each via a one-off run, NOT an 8h re-optimization) so the comparison is
+# like-for-like. Labels carry `end2025` to tell the two apart in later analysis.
+#
 # 2026-07-30 — WHY THIS IS STILL 233 AFTER A RESULT-AFFECTING CHANGE. The condition fix
 # (b431469/7798427, v2026.07.1002) made DaysSinceLastClose* and DaysOpened actually fire in
 # backtests; they had been INERT under the in-memory trade store, so runs before it could score
@@ -100,7 +119,7 @@ for S in S1 S2 S3 S4 S5 S6 S7; do
     --expert FMPSenateTraderWeight \
     --strategy "$S" \
     --universe "$UNI" \
-    --start 2023-01-01 --end 2026-06-30 \
+    --start 2023-01-01 --end 2025-12-31 \
     --interval 5min \
     --fitness consistent_annual_return \
     --population 60 --generations "$GENERATIONS" --early-stop 4 --mutation-prob 0.3 \
@@ -108,7 +127,7 @@ for S in S1 S2 S3 S4 S5 S6 S7; do
     --initial-capital 10000 --commission 1.0 --spread-bps 20 \
     --workers remote150 \
     $WS \
-    --labels "sen5min3,stillheld,longlookback,${S},ForwardTestCandidate" \
+    --labels "sen5min3,stillheld,longlookback,end2025,${S},ForwardTestCandidate" \
     --name "$NAME"
   echo "=== Senate $S @ 5min   done rc=$? $(date)"
 done
