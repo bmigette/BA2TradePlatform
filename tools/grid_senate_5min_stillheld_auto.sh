@@ -31,6 +31,16 @@
 # unsure whether a change is result-affecting, raise it — a fresh start costs compute, a poisoned
 # population costs a wrong conclusion.
 NOT_BEFORE=233
+#
+# 2026-07-30 — WHY THIS IS STILL 233 AFTER A RESULT-AFFECTING CHANGE. The condition fix
+# (b431469/7798427, v2026.07.1002) made DaysSinceLastClose* and DaysOpened actually fire in
+# backtests; they had been INERT under the in-memory trade store, so every run before it scored
+# those genes as no-ops. By the rule above that should raise NOT_BEFORE past 240 — but doing so
+# would also force S1 (opt 238) to re-run, and S1 is genuinely unaffected: strategy 432 declares
+# NONE of the fixed conditions (verified against entry_rules/exit_rules). The invalidated runs
+# are instead RENAMED out of the way (sen5min3-S2/-S3 -> *-preconditionfix), which removes them
+# from this helper's name lookup entirely, so they can neither be SKIPped nor warm-started from.
+# Net effect: S1 skips (valid), S2/S3 start fresh, S4-S7 start fresh.
 # ---------------------------------------------------------------------------------------------
 #
 # STOPPING THIS GRID: kill the BASH SCRIPT FIRST. Killing only the python master makes `optimize`
@@ -85,7 +95,7 @@ for S in S1 S2 S3 S4 S5 S6 S7; do
     --interval 5min \
     --fitness consistent_annual_return \
     --population 60 --generations "$GENERATIONS" --early-stop 4 --mutation-prob 0.3 \
-    --parallel 4 --seed 42 \
+    --parallel 3 --seed 42 \
     --initial-capital 10000 --commission 1.0 --spread-bps 20 \
     --workers remote150 \
     $WS \

@@ -242,7 +242,11 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
     # reads this class attribute (mirroring how bypasses_classic_rm is read) and caps
     # DistributedEvaluator's remote dispatcher threads per worker to this value for any
     # optimization run that includes this expert.
-    max_remote_worker_slots = 4
+    # Lowered 4 -> 3 on 2026-07-30. At 4 the sen5min3 grid drove the MASTER box to 99.5-99.7%
+    # memory (170-860MB free of 64GB across 25 sampled points) — ~12GB/trial does not fit 4-up
+    # alongside the master. 3 leaves headroom on both the local pool (--parallel 3) and the
+    # remote worker, which is sized the same way.
+    max_remote_worker_slots = 3
 
     @classmethod
     def description(cls) -> str:
