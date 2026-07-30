@@ -10,9 +10,8 @@ from collections import namedtuple
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
-from sqlmodel import select
 
-from ba2_common.core.db import add_instance, get_db, get_instance
+from ba2_common.core.db import add_instance, get_instance
 from ba2_common.core.models import ExpertInstance, TradingOrder, Transaction
 from ba2_common.core.types import (
     OrderDirection, OrderOpenType, OrderStatus, OrderType, TransactionStatus,
@@ -130,6 +129,12 @@ class FactorPortfolioManager:
         account-wide, not expert-scoped); we only read it for the expert-owned symbols. Live
         accounts (no snapshot / no ledger) fall back to the direct DB path.
         """
+        # NOTE ON THE TWO BRANCHES: this is a CACHE choice, not a storage choice — both paths
+        # answer "which transactions does this expert hold". Storage is the repository's
+        # business (see ba2_common.core.trade_repository); the snapshot exists purely because
+        # re-deriving the book per bar is expensive, and it is invalidated per fill rather than
+        # per bar. Collapsing to the repository alone would be correct but pays that per-bar
+        # cost back, so the fast path stays deliberate.
         snapshot_fn = getattr(self.account, "opened_position_snapshot", None)
         if snapshot_fn is not None:
             # Backtest: cached, fill-invalidated OPENED snapshot from the account (no per-bar DB).
@@ -150,12 +155,9 @@ class FactorPortfolioManager:
             # its transaction being promoted makes get_holdings() see an empty book and re-buy the
             # full target from scratch, stacking duplicate positions (see 2026-07-14 incident where
             # 3 rapid re-triggers 3x'd a live position before this fix).
-            with get_db() as session:
-                transactions = session.exec(
-                    select(Transaction)
-                    .where(Transaction.expert_id == self.expert_instance_id)
-                    .where(Transaction.status.in_([TransactionStatus.OPENED, TransactionStatus.WAITING]))
-                ).all()
+            from ba2_common.core.trade_repository import get_trade_repository
+            transactions = get_trade_repository().open_transactions(
+                expert_id=self.expert_instance_id, include_waiting=True)
             by_symbol = {}
             for trans in transactions:
                 by_symbol.setdefault(trans.symbol, []).append(

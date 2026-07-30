@@ -42,8 +42,7 @@ class TestFindOpenEntryBuy:
             side=OrderDirection.BUY, status=OrderStatus.PARTIALLY_FILLED,
             filled_qty=60.0, transaction_id=txn.id,
         )
-        with get_db() as session:
-            found = find_open_entry_buy(session, txn.id)
+        found = find_open_entry_buy(txn.id)
         assert found is not None and found.id == entry.id
 
     def test_ignores_fully_filled_entry(self):
@@ -54,8 +53,7 @@ class TestFindOpenEntryBuy:
             side=OrderDirection.BUY, status=OrderStatus.FILLED,
             filled_qty=100.0, transaction_id=txn.id,
         )
-        with get_db() as session:
-            assert find_open_entry_buy(session, txn.id) is None
+        assert find_open_entry_buy(txn.id) is None
 
     def test_ignores_dependent_sell_leg(self):
         """A TP/SL leg (depends_on_order set) is never treated as the entry buy."""
@@ -71,8 +69,7 @@ class TestFindOpenEntryBuy:
             side=OrderDirection.BUY, status=OrderStatus.NEW,
             transaction_id=txn.id, depends_on_order=entry.id,
         )
-        with get_db() as session:
-            assert find_open_entry_buy(session, txn.id) is None
+        assert find_open_entry_buy(txn.id) is None
 
 
 # ---------------------------------------------------------------------------

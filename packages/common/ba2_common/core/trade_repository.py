@@ -18,7 +18,8 @@ and a ">15 day" cooldown it read the 1e9 "never closed" sentinel, so the gate wa
 WHOLE optimization and the GA spent its search tuning a gene that did nothing. The same genome
 scored 103 trades / 17.55% annualised on the in-memory path and 169 / 0.20% on the SQLite one.
 Live has no in-memory store, so live behaved like the second — a deployed config running gates
-its own backtest never exercised.
+its own backtest never exercised. ``PennyMomentumTrader._exit_position`` had the same defect
+with a blunter symptom: it found no open transactions in a backtest, so exits never fired.
 
 THE SHAPE
 ---------
@@ -27,18 +28,23 @@ THE SHAPE
     InMemoryTradeRepository  -> the backtest store's dicts
     SqlTradeRepository       -> SQLModel / SQLite (live, and file-backed backtests)
 
-``get_trade_repository()`` picks one. Tests (and any seam that wants to substitute a fake) call
+``get_trade_repository()`` picks one. Tests (and any seam substituting a fake) call
 ``set_trade_repository()`` instead of reaching into the storage layer, so nothing above this
 module mentions a backend.
 
-Joins are expressed as "open transactions -> their orders" rather than SQL joins, because the
-in-memory side has no join and a SQL-only formulation would force two different call-site
-shapes — the very split this module removes.
+Only four operations are backend-specific (``transactions``, ``transaction``,
+``_orders_for_transactions``, ``_orders_by_recommendation``); everything else is shared logic on
+the base class so it cannot drift between backends. Each backend-specific method must push its
+filters DOWN to the backend — the live tables are unbounded, so "fetch all then filter in
+Python" is only acceptable where the row set is already scoped (one transaction, one expert).
+
+Joins are expressed as "transactions -> their orders" rather than SQL joins, because the
+in-memory side has no join and a SQL-only formulation would force two call-site shapes.
 """
 from abc import ABC, abstractmethod
-from typing import Any, List, Optional
+from typing import Any, Iterable, List, Optional
 
-from ba2_common.core.models import Transaction, TradingOrder
+from ba2_common.core.models import ExpertRecommendation, Transaction, TradingOrder
 from ba2_common.core.types import AssetClass, OrderStatus, TransactionStatus
 from ba2_common.core.utils import calculate_transaction_pnl
 
@@ -46,30 +52,59 @@ from ba2_common.core.utils import calculate_transaction_pnl
 class TradeRepository(ABC):
     """Read access to trade rows, independent of where they are stored."""
 
-    # -- backend-specific ------------------------------------------------
+    # -- backend-specific -------------------------------------------------
     @abstractmethod
     def transaction(self, transaction_id: Any) -> Optional[Transaction]:
         """One Transaction by id, or None if it does not exist."""
 
     @abstractmethod
-    def open_transactions(self, *, expert_id: int, symbol: Optional[str] = None,
-                          side: Optional[Any] = None) -> List[Transaction]:
-        """This expert's OPENED transactions, optionally narrowed by symbol and/or side."""
-
-    @abstractmethod
-    def closed_transactions(self, *, expert_id: int,
-                            symbol: Optional[str] = None) -> List[Transaction]:
-        """This expert's CLOSED transactions that carry a ``close_date``, NEWEST CLOSE FIRST.
-
-        Implementations must apply the ordering themselves so both backends return the same
-        sequence — callers rely on "newest first" meaning "most recent close".
-        """
+    def transactions(self, *, expert_id: int, statuses: Iterable[Any],
+                     symbol: Optional[str] = None) -> List[Transaction]:
+        """This expert's transactions in any of ``statuses``, optionally one symbol."""
 
     @abstractmethod
     def _orders_for_transactions(self, transaction_ids: List[Any]) -> List[TradingOrder]:
         """Every TradingOrder attached to any of ``transaction_ids``."""
 
-    # -- storage-independent logic, shared by every backend ---------------
+    @abstractmethod
+    def _orders_by_recommendation(self, *, expert_id: int,
+                                  symbol: Optional[str] = None) -> List[TradingOrder]:
+        """Orders linked to this expert through their ``ExpertRecommendation``.
+
+        A DIFFERENT linkage from ``_orders_for_transactions``: some experts attribute an order
+        via ``expert_recommendation_id`` rather than through a transaction.
+        """
+
+    # -- shared logic, identical on every backend -------------------------
+    def open_transactions(self, *, expert_id: int, symbol: Optional[str] = None,
+                          side: Optional[Any] = None,
+                          include_waiting: bool = False) -> List[Transaction]:
+        """OPENED transactions, optionally narrowed by symbol and/or side.
+
+        ``include_waiting`` also returns WAITING ones: a transaction stays WAITING until the
+        account's ``refresh_transactions()`` cycle promotes it, which can lag the broker fill
+        (separate refresh cadences). Callers that re-derive a target book from holdings need
+        them, or a re-trigger between fill and promotion sees an empty book and re-buys from
+        scratch (the 2026-07-14 incident where 3 rapid re-triggers 3x'd a live position).
+        """
+        statuses = ([TransactionStatus.OPENED, TransactionStatus.WAITING] if include_waiting
+                    else [TransactionStatus.OPENED])
+        txns = self.transactions(expert_id=expert_id, statuses=statuses, symbol=symbol)
+        if side is not None:
+            txns = [t for t in txns if t.side == side]
+        return txns
+
+    def closed_transactions(self, *, expert_id: int,
+                            symbol: Optional[str] = None) -> List[Transaction]:
+        """CLOSED transactions carrying a ``close_date``, NEWEST CLOSE FIRST.
+
+        Ordered here rather than in SQL so both backends return the same sequence — callers
+        rely on "newest first" meaning "most recent close".
+        """
+        return self._newest_close_first(
+            self.transactions(expert_id=expert_id, statuses=[TransactionStatus.CLOSED],
+                              symbol=symbol))
+
     def last_closed_transaction(self, *, expert_id: int, symbol: str,
                                 profit_sign: int = 0) -> Optional[Transaction]:
         """Most recent qualifying close, or None.
@@ -89,6 +124,40 @@ class TradeRepository(ABC):
                     continue
             return txn
         return None
+
+    def orders_for_transaction(self, transaction_id: Any, *, side: Optional[Any] = None,
+                               statuses: Optional[Iterable[Any]] = None,
+                               entry_only: bool = False,
+                               newest_first: bool = False) -> List[TradingOrder]:
+        """This transaction's orders. Filtering is in Python because the row set is one
+        transaction's legs — a handful — on either backend.
+
+        ``entry_only`` keeps only orders with no ``depends_on_order`` (i.e. not a TP/SL leg).
+        """
+        if transaction_id is None:
+            return []
+        sset = set(statuses) if statuses is not None else None
+        out = []
+        for o in self._orders_for_transactions([transaction_id]):
+            if side is not None and o.side != side:
+                continue
+            if sset is not None and o.status not in sset:
+                continue
+            if entry_only and o.depends_on_order is not None:
+                continue
+            out.append(o)
+        if newest_first:
+            out.sort(key=lambda o: (o.created_at is not None, o.created_at), reverse=True)
+        return out
+
+    def orders_by_recommendation(self, *, expert_id: int, symbol: Optional[str] = None,
+                                 statuses: Optional[Iterable[Any]] = None) -> List[TradingOrder]:
+        """Orders attributed to this expert via their recommendation."""
+        orders = self._orders_by_recommendation(expert_id=expert_id, symbol=symbol)
+        if statuses is None:
+            return orders
+        sset = set(statuses)
+        return [o for o in orders if o.status in sset]
 
     def open_option_orders(self, *, expert_id: int, underlying: str,
                            option_type: Optional[Any] = None,
@@ -132,31 +201,31 @@ class InMemoryTradeRepository(TradeRepository):
         from ba2_common.core.trade_store import store_get
         return store_get(Transaction, transaction_id)
 
-    def open_transactions(self, *, expert_id: int, symbol: Optional[str] = None,
-                          side: Optional[Any] = None) -> List[Transaction]:
+    def transactions(self, *, expert_id: int, statuses: Iterable[Any],
+                     symbol: Optional[str] = None) -> List[Transaction]:
         from ba2_common.core.trade_store import store_all
+        sset = set(statuses)
         return [
             t for t in store_all(Transaction)
             if t.expert_id == expert_id
-            and t.status == TransactionStatus.OPENED
+            and t.status in sset
             and (symbol is None or t.symbol == symbol)
-            and (side is None or t.side == side)
         ]
-
-    def closed_transactions(self, *, expert_id: int,
-                            symbol: Optional[str] = None) -> List[Transaction]:
-        from ba2_common.core.trade_store import store_all
-        return self._newest_close_first([
-            t for t in store_all(Transaction)
-            if t.expert_id == expert_id
-            and t.status == TransactionStatus.CLOSED
-            and (symbol is None or t.symbol == symbol)
-        ])
 
     def _orders_for_transactions(self, transaction_ids: List[Any]) -> List[TradingOrder]:
         from ba2_common.core.trade_store import store_all
         wanted = set(transaction_ids)
         return [o for o in store_all(TradingOrder) if o.transaction_id in wanted]
+
+    def _orders_by_recommendation(self, *, expert_id: int,
+                                  symbol: Optional[str] = None) -> List[TradingOrder]:
+        from ba2_common.core.trade_store import store_all
+        rec_ids = {r.id for r in store_all(ExpertRecommendation) if r.instance_id == expert_id}
+        if not rec_ids:
+            return []
+        return [o for o in store_all(TradingOrder)
+                if o.expert_recommendation_id in rec_ids
+                and (symbol is None or o.symbol == symbol)]
 
 
 class SqlTradeRepository(TradeRepository):
@@ -169,41 +238,38 @@ class SqlTradeRepository(TradeRepository):
         with get_db() as session:
             return session.get(Transaction, transaction_id)
 
-    def open_transactions(self, *, expert_id: int, symbol: Optional[str] = None,
-                          side: Optional[Any] = None) -> List[Transaction]:
+    def transactions(self, *, expert_id: int, statuses: Iterable[Any],
+                     symbol: Optional[str] = None) -> List[Transaction]:
         from sqlmodel import select
         from ba2_common.core.db import get_db
         stmt = select(Transaction).where(
             Transaction.expert_id == expert_id,
-            Transaction.status == TransactionStatus.OPENED,
+            Transaction.status.in_(list(statuses)),
         )
         if symbol is not None:
             stmt = stmt.where(Transaction.symbol == symbol)
-        if side is not None:
-            stmt = stmt.where(Transaction.side == side)
         with get_db() as session:
             return list(session.exec(stmt).all())
-
-    def closed_transactions(self, *, expert_id: int,
-                            symbol: Optional[str] = None) -> List[Transaction]:
-        from sqlmodel import select
-        from ba2_common.core.db import get_db
-        stmt = select(Transaction).where(
-            Transaction.expert_id == expert_id,
-            Transaction.status == TransactionStatus.CLOSED,
-            Transaction.close_date.is_not(None),
-        )
-        if symbol is not None:
-            stmt = stmt.where(Transaction.symbol == symbol)
-        with get_db() as session:
-            rows = list(session.exec(stmt).all())
-        # Sorted in Python, not SQL, so both backends order identically.
-        return self._newest_close_first(rows)
 
     def _orders_for_transactions(self, transaction_ids: List[Any]) -> List[TradingOrder]:
         from sqlmodel import select
         from ba2_common.core.db import get_db
         stmt = select(TradingOrder).where(TradingOrder.transaction_id.in_(list(transaction_ids)))
+        with get_db() as session:
+            return list(session.exec(stmt).all())
+
+    def _orders_by_recommendation(self, *, expert_id: int,
+                                  symbol: Optional[str] = None) -> List[TradingOrder]:
+        from sqlmodel import select
+        from ba2_common.core.db import get_db
+        stmt = (
+            select(TradingOrder)
+            .join(ExpertRecommendation,
+                  TradingOrder.expert_recommendation_id == ExpertRecommendation.id)
+            .where(ExpertRecommendation.instance_id == expert_id)
+        )
+        if symbol is not None:
+            stmt = stmt.where(TradingOrder.symbol == symbol)
         with get_db() as session:
             return list(session.exec(stmt).all())
 
@@ -216,9 +282,9 @@ _override: Optional[TradeRepository] = None
 def get_trade_repository() -> TradeRepository:
     """The repository for the CURRENT execution context.
 
-    This is the single place in the codebase that maps "how was this process started" onto a
-    storage backend. Resolved per call, not cached, because a process runs live code and
-    backtest trials at different moments (and the backtest override is thread-local).
+    The single place in the codebase mapping "how was this process started" onto a storage
+    backend. Resolved per call, not cached, because one process runs live code and backtest
+    trials at different moments (and the backtest override is thread-local).
     """
     if _override is not None:
         return _override

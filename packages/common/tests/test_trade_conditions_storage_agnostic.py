@@ -41,30 +41,29 @@ SYMBOL = "AAPL"
 class FakeTradeRepository(TradeRepository):
     """A repository over plain lists — no storage, no backend, no setup."""
 
-    def __init__(self, transactions=None, orders=None):
-        self.transactions: List[Transaction] = list(transactions or [])
+    def __init__(self, transactions=None, orders=None, recommendation_orders=None):
+        self.rows: List[Transaction] = list(transactions or [])
         self.orders: List[TradingOrder] = list(orders or [])
+        # Orders attributed via ExpertRecommendation rather than via a transaction.
+        self.recommendation_orders: List[TradingOrder] = list(recommendation_orders or [])
 
     def transaction(self, transaction_id: Any) -> Optional[Transaction]:
-        return next((t for t in self.transactions if t.id == transaction_id), None)
+        return next((t for t in self.rows if t.id == transaction_id), None)
 
-    def open_transactions(self, *, expert_id, symbol=None, side=None):
-        return [t for t in self.transactions
+    def transactions(self, *, expert_id, statuses, symbol=None):
+        sset = set(statuses)
+        return [t for t in self.rows
                 if t.expert_id == expert_id
-                and t.status == TransactionStatus.OPENED
-                and (symbol is None or t.symbol == symbol)
-                and (side is None or t.side == side)]
-
-    def closed_transactions(self, *, expert_id, symbol=None):
-        return self._newest_close_first([
-            t for t in self.transactions
-            if t.expert_id == expert_id
-            and t.status == TransactionStatus.CLOSED
-            and (symbol is None or t.symbol == symbol)])
+                and t.status in sset
+                and (symbol is None or t.symbol == symbol)]
 
     def _orders_for_transactions(self, transaction_ids):
         wanted = set(transaction_ids)
         return [o for o in self.orders if o.transaction_id in wanted]
+
+    def _orders_by_recommendation(self, *, expert_id, symbol=None):
+        return [o for o in self.recommendation_orders
+                if symbol is None or o.symbol == symbol]
 
 
 class _Rec:
@@ -125,7 +124,7 @@ def test_cooldown_blocks_entry_while_the_last_close_is_recent(repo):
     Before the fix the condition never saw the close and allowed the entry, making the gate —
     and the GA gene tuning it — completely inert.
     """
-    repo.transactions.append(_closed_txn(days_ago=3))
+    repo.rows.append(_closed_txn(days_ago=3))
     cond = _days_since_close()
     allowed = cond.evaluate()
 
@@ -135,7 +134,7 @@ def test_cooldown_blocks_entry_while_the_last_close_is_recent(repo):
 
 def test_cooldown_allows_entry_once_elapsed(repo):
     """Proves the fix didn't just make the gate block unconditionally."""
-    repo.transactions.append(_closed_txn(days_ago=40))
+    repo.rows.append(_closed_txn(days_ago=40))
     cond = _days_since_close()
     assert cond.evaluate() is True
     assert cond.calculated_value == 40.0
@@ -143,7 +142,7 @@ def test_cooldown_allows_entry_once_elapsed(repo):
 
 def test_cooldown_uses_the_most_recent_close(repo):
     """Ordering is applied by the repository, so newest-close-first must hold."""
-    repo.transactions += [_closed_txn(days_ago=40), _closed_txn(days_ago=2),
+    repo.rows += [_closed_txn(days_ago=40), _closed_txn(days_ago=2),
                           _closed_txn(days_ago=25)]
     cond = _days_since_close()
     cond.evaluate()
@@ -151,7 +150,7 @@ def test_cooldown_uses_the_most_recent_close(repo):
 
 
 def test_cooldown_ignores_other_experts_and_symbols(repo):
-    repo.transactions += [_closed_txn(days_ago=3, expert_id=999),
+    repo.rows += [_closed_txn(days_ago=3, expert_id=999),
                           _closed_txn(days_ago=3, symbol="MSFT")]
     cond = _days_since_close()
     assert cond.evaluate() is True
@@ -162,7 +161,7 @@ def test_buy_and_sell_position_conditions_discriminate_side(repo):
     from ba2_common.core.TradeConditions import (
         HasBuyPositionCondition, HasSellPositionCondition,
     )
-    repo.transactions.append(_open_txn(side=OrderDirection.BUY))
+    repo.rows.append(_open_txn(side=OrderDirection.BUY))
     buy = HasBuyPositionCondition(account=None, instrument_name=SYMBOL,
                                   expert_recommendation=_Rec(), existing_order=None)
     sell = HasSellPositionCondition(account=None, instrument_name=SYMBOL,
@@ -175,7 +174,7 @@ def test_option_position_condition_resolves_the_transaction_to_order_link(repo):
     """The old SQL join had no in-memory equivalent; the repository expresses it as
     open-transactions -> their orders, so it must resolve without a join."""
     from ba2_common.core.TradeConditions import HasOptionPositionCondition
-    repo.transactions.append(_open_txn(txn_id=7))
+    repo.rows.append(_open_txn(txn_id=7))
     repo.orders.append(_option_order(txn_id=7))
     cond = HasOptionPositionCondition(account=None, instrument_name=SYMBOL,
                                       expert_recommendation=_Rec(), existing_order=None)
@@ -184,7 +183,7 @@ def test_option_position_condition_resolves_the_transaction_to_order_link(repo):
 
 def test_option_position_condition_ignores_terminal_orders(repo):
     from ba2_common.core.TradeConditions import HasOptionPositionCondition
-    repo.transactions.append(_open_txn(txn_id=7))
+    repo.rows.append(_open_txn(txn_id=7))
     repo.orders.append(_option_order(txn_id=7, status=OrderStatus.CANCELED))
     cond = HasOptionPositionCondition(account=None, instrument_name=SYMBOL,
                                       expert_recommendation=_Rec(), existing_order=None)
@@ -193,7 +192,7 @@ def test_option_position_condition_ignores_terminal_orders(repo):
 
 def test_covered_call_condition_requires_the_matching_strategy(repo):
     from ba2_common.core.TradeConditions import HasCoveredCallCondition
-    repo.transactions.append(_open_txn(txn_id=7))
+    repo.rows.append(_open_txn(txn_id=7))
     repo.orders.append(_option_order(txn_id=7, option_type=OptionRight.CALL,
                                      side=OrderDirection.SELL, strategy="protective_put"))
     cond = HasCoveredCallCondition(account=None, instrument_name=SYMBOL,

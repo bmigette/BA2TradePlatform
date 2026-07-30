@@ -409,46 +409,34 @@ class FMPSenateTraderCopy(AnalysisStatusRenderMixin, FMPCongressTradingMixin, Ma
             - orders_with_trader_names_count: Count of orders with trader names linked
         """
         try:
-            from sqlmodel import select
-            from ba2_common.core.db import get_db
-            from ba2_common.core.models import TradingOrder, ExpertRecommendation
+            from ba2_common.core.trade_repository import get_trade_repository
             from ba2_common.core.types import OrderStatus
 
-            with get_db() as session:
-                # Query for trading orders with this symbol that are open
-                # Orders linked to this expert via recommendations
-                statement = select(TradingOrder).join(
-                    ExpertRecommendation,
-                    TradingOrder.expert_recommendation_id == ExpertRecommendation.id,
-                    isouter=True
-                ).where(
-                    ExpertRecommendation.instance_id == self.id,
-                    TradingOrder.symbol == symbol,
-                    TradingOrder.status.in_([
-                        OrderStatus.PENDING,
-                        OrderStatus.NEW,
-                        OrderStatus.PARTIALLY_FILLED,
-                        OrderStatus.FILLED
-                    ])
-                )
-                
-                orders = session.exec(statement).all()
-                total_orders = len(orders)
-                
-                # Count orders with trader names linked
-                orders_with_trader_names = 0
-                for order in orders:
-                    if order.data and 'trader_name' in order.data:
-                        trader_name = order.data.get('trader_name', '').strip()
-                        if trader_name:
-                            orders_with_trader_names += 1
-                
-                if total_orders > 0:
-                    self.logger.debug(f"Open positions check for {symbol}: {total_orders} total, {orders_with_trader_names} with trader names")
-                else:
-                    self.logger.debug(f"No open positions for {symbol}")
-                
-                return total_orders, orders_with_trader_names
+            # Repository, not a raw select().join(): TradingOrder/ExpertRecommendation are
+            # IN_MEM_MODELS, so under a RAM-only backtest this returned EMPTY and the check
+            # always reported (0, 0) — silently forcing the "no open positions" branch in
+            # backtests while behaving correctly live.
+            orders = get_trade_repository().orders_by_recommendation(
+                expert_id=self.id, symbol=symbol,
+                statuses=[OrderStatus.PENDING, OrderStatus.NEW,
+                          OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED],
+            )
+            total_orders = len(orders)
+
+            # Count orders with trader names linked
+            orders_with_trader_names = 0
+            for order in orders:
+                if order.data and 'trader_name' in order.data:
+                    trader_name = order.data.get('trader_name', '').strip()
+                    if trader_name:
+                        orders_with_trader_names += 1
+
+            if total_orders > 0:
+                self.logger.debug(f"Open positions check for {symbol}: {total_orders} total, {orders_with_trader_names} with trader names")
+            else:
+                self.logger.debug(f"No open positions for {symbol}")
+
+            return total_orders, orders_with_trader_names
                 
         except Exception as e:
             self.logger.error(f"Error checking open positions trader status for {symbol}: {e}", exc_info=True)

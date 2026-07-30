@@ -11,9 +11,7 @@ Manages:
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional
 
-from sqlmodel import select
-
-from ba2_common.core.db import get_db, get_instance, add_instance
+from ba2_common.core.db import get_instance, add_instance
 from ba2_common.core.models import (
     ExpertInstance, TradingOrder, Transaction,
 )
@@ -39,7 +37,7 @@ _NON_TRADABLE_ERROR_MARKERS = (
 )
 
 
-def find_open_entry_buy(session, transaction_id: int):
+def find_open_entry_buy(transaction_id: int):
     """Return the entry BUY order for a transaction that is still working at the
     broker, or None.
 
@@ -47,15 +45,16 @@ def find_open_entry_buy(session, transaction_id: int):
     trade. An entry buy counts as "open" when it is partially filled or in any
     unfilled status. Dependent legs (TP/SL, i.e. ``depends_on_order`` set) are never
     treated as the entry order.
+
+    Goes through the trade repository rather than a raw session query: TradingOrder is an
+    IN_MEM_MODEL, so under a RAM-only backtest a ``select()`` returns EMPTY instead of raising
+    and this would always report "no open entry buy".
     """
+    from ba2_common.core.trade_repository import get_trade_repository
     open_statuses = list(OrderStatus.get_unfilled_statuses()) + [OrderStatus.PARTIALLY_FILLED]
-    return session.exec(
-        select(TradingOrder)
-        .where(TradingOrder.transaction_id == transaction_id)
-        .where(TradingOrder.side == OrderDirection.BUY)
-        .where(TradingOrder.depends_on_order.is_(None))
-        .where(TradingOrder.status.in_(open_statuses))
-    ).first()
+    orders = get_trade_repository().orders_for_transaction(
+        transaction_id, side=OrderDirection.BUY, statuses=open_statuses, entry_only=True)
+    return orders[0] if orders else None
 
 
 class PennyTradeManager:
@@ -275,13 +274,12 @@ class PennyTradeManager:
         Returns:
             True if at least one exit order was successfully submitted.
         """
-        with get_db() as session:
-            transactions = session.exec(
-                select(Transaction)
-                .where(Transaction.expert_id == self.expert_instance_id)
-                .where(Transaction.symbol == symbol)
-                .where(Transaction.status == TransactionStatus.OPENED)
-            ).all()
+        # Repository, not a raw select(): Transaction is an IN_MEM_MODEL, so under a RAM-only
+        # backtest this query came back EMPTY and every exit bailed out at the guard below —
+        # positions were opened and never closed. Same defect as DaysSinceLastCloseCondition.
+        from ba2_common.core.trade_repository import get_trade_repository
+        transactions = get_trade_repository().open_transactions(
+            expert_id=self.expert_instance_id, symbol=symbol)
 
         if not transactions:
             logger.warning(f"No open transactions found for {symbol}")
@@ -296,13 +294,10 @@ class PennyTradeManager:
             # Guard: skip if a pending sell order already exists for this transaction.
             # This prevents duplicate exits when shares are already held_for_orders at the
             # broker (Alpaca code 40310000 "insufficient qty available").
-            with get_db() as session:
-                existing_sell = session.exec(
-                    select(TradingOrder)
-                    .where(TradingOrder.transaction_id == trans.id)
-                    .where(TradingOrder.side == OrderDirection.SELL)
-                    .where(TradingOrder.status.in_(list(OrderStatus.get_unfilled_statuses())))
-                ).first()
+            pending_sells = get_trade_repository().orders_for_transaction(
+                trans.id, side=OrderDirection.SELL,
+                statuses=OrderStatus.get_unfilled_statuses())
+            existing_sell = pending_sells[0] if pending_sells else None
             if existing_sell:
                 logger.info(
                     f"PennyTradeManager: exit for {symbol} skipped — "
@@ -318,13 +313,9 @@ class PennyTradeManager:
             #   * any other (transient) failure -> back off for a cooldown window
             # Without this, a stop-loss on a frozen symbol re-fires every monitor
             # tick and floods the order table (see SUUN: 296 ERROR sells in 5h).
-            with get_db() as session:
-                last_sell = session.exec(
-                    select(TradingOrder)
-                    .where(TradingOrder.transaction_id == trans.id)
-                    .where(TradingOrder.side == OrderDirection.SELL)
-                    .order_by(TradingOrder.created_at.desc())
-                ).first()
+            recent_sells = get_trade_repository().orders_for_transaction(
+                trans.id, side=OrderDirection.SELL, newest_first=True)
+            last_sell = recent_sells[0] if recent_sells else None
             if last_sell is not None and last_sell.status == OrderStatus.ERROR:
                 comment = (last_sell.comment or "").lower()
                 if any(marker in comment for marker in _NON_TRADABLE_ERROR_MARKERS):
@@ -359,8 +350,7 @@ class PennyTradeManager:
             # Detect an entry BUY still working at the broker. Submitting an opposing
             # SELL while it is open triggers Alpaca's wash-trade rejection, so stage
             # the exit to fire once the entry reaches FILLED.
-            with get_db() as session:
-                open_buy = find_open_entry_buy(session, trans.id)
+            open_buy = find_open_entry_buy(trans.id)
 
             order = TradingOrder(
                 account_id=self.account_id,
@@ -479,12 +469,9 @@ class PennyTradeManager:
         Each element is a dict with keys:
             transaction_id, symbol, qty, entry_price
         """
-        with get_db() as session:
-            transactions = session.exec(
-                select(Transaction)
-                .where(Transaction.expert_id == self.expert_instance_id)
-                .where(Transaction.status == TransactionStatus.OPENED)
-            ).all()
+        from ba2_common.core.trade_repository import get_trade_repository
+        transactions = get_trade_repository().open_transactions(
+            expert_id=self.expert_instance_id)
 
         positions: List[dict] = []
         for trans in transactions:
