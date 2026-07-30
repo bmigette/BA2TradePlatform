@@ -1022,14 +1022,30 @@ def _daily_manage_schedule() -> dict:
     return {"days": days, "times": ["09:30"]}
 
 
-def _expert_run_settings(spec: dict, universe: list) -> dict:
+def _expert_run_settings(spec: dict, universe: list, overrides: "dict | None" = None) -> dict:
     """Expert settings for a run: the spec's fixed_settings, plus the run universe injected into
     the expert's own universe setting when the spec names one (PremiumSeller's static_universe —
-    it reads its universe from that setting, not from enabled_instruments)."""
+    it reads its universe from that setting, not from enabled_instruments).
+
+    ``overrides`` wins over fixed_settings. Used by ``--sizing-mode`` so the SAME expert spec can
+    be run once per sizing mode without editing _EXPERT_OPT: sizing_mode is a 2-value categorical
+    the GA has never searched (it is pinned risk_atr for the classic experts), and it is
+    deliberately compared as two separate runs rather than made a gene — under notional the five
+    ATR genes face no selection pressure and drift random, so a crossover that flips the mode
+    would judge it with unselected parameters and bias the comparison toward whichever mode
+    happens to dominate the population."""
     settings = dict(spec["fixed_settings"])
     if spec.get("universe_setting"):
         settings[spec["universe_setting"]] = ",".join(universe)
+    if overrides:
+        settings.update(overrides)
     return settings
+
+
+def _sizing_overrides(args) -> "dict | None":
+    """``{"sizing_mode": ...}`` when --sizing-mode was given, else None (spec default stands)."""
+    mode = getattr(args, "sizing_mode", None)
+    return {"sizing_mode": mode} if mode else None
 
 
 def _apply_options_seam(spec: dict, backtest_block: dict) -> None:
@@ -2562,7 +2578,7 @@ def _cmd_optimize(args) -> int:
         backtest_block = {
             "engine": "daily",
             "enabled_instruments": universe,
-            "experts": [{"class": expert, "settings": _expert_run_settings(spec, universe)}],
+            "experts": [{"class": expert, "settings": _expert_run_settings(spec, universe, _sizing_overrides(args))}],
             "start_date": args.start, "end_date": args.end,
             "initial_capital": float(args.initial_capital),
             "account_settings": {
@@ -2843,7 +2859,7 @@ def _cmd_optimize_batch(args) -> int:
             backtest_block = {
                 "engine": "daily",
                 "enabled_instruments": universe,
-                "experts": [{"class": expert, "settings": _expert_run_settings(spec, universe)}],
+                "experts": [{"class": expert, "settings": _expert_run_settings(spec, universe, _sizing_overrides(args))}],
                 "start_date": args.start, "end_date": args.end,
                 "initial_capital": float(args.initial_capital),
                 "account_settings": {
@@ -3602,6 +3618,19 @@ def main(argv: "list | None" = None) -> int:
                          "selection for those runs. Bypass experts (FactorRanker) don't get the "
                          "schedule genes, so this flag still fully controls their day(s).")
     op.add_argument("--name", default=None)
+    op.add_argument("--sizing-mode", choices=("notional", "risk_atr"), default=None,
+                    help="Override the expert spec's pinned sizing_mode for this run. Omit to "
+                         "keep the spec default (risk_atr for the classic experts). Exists so "
+                         "notional vs risk_atr can be compared as TWO separate optimizations "
+                         "instead of one gene: under notional the five ATR genes "
+                         "(risk_per_trade_pct, atr_multiplier, atr_period, min_stop_loss_pct, "
+                         "use_atr_stop) are inert and drift random, so a crossover that flipped "
+                         "the mode would score it with unselected parameters and bias the "
+                         "comparison toward whichever mode dominates the population. No effect "
+                         "on bypass experts (FactorRanker, PremiumSeller) — they skip "
+                         "TradeRiskManagement entirely, so sizing_mode is never read. ALWAYS "
+                         "give the two runs different --name suffixes, or the second is SKIPped "
+                         "as an already-completed run.")
     op.add_argument("--screener", action="store_true",
                     help="Optimize a screener-selected dynamic universe (screener:* genes). "
                          "Requires --screener-store; the run universe becomes the store's full "

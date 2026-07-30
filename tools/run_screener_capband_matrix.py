@@ -148,6 +148,16 @@ def main() -> int:
                          "under FRESH names so prior runs' tagged Backtests are kept untouched — "
                          "used after a screener fix (e.g. the price-drop rebuild) to re-explore the "
                          "now-meaningful dimension without overwriting the old results.")
+    ap.add_argument("--sizing-mode", choices=("notional", "risk_atr"), default=None,
+                    help="Pin sizing_mode for every job in this matrix, overriding the expert "
+                         "spec's default (risk_atr for the classic experts). Exists so the two "
+                         "modes are compared as TWO SEPARATE MATRICES rather than one GA gene: "
+                         "under notional the five ATR genes are inert and drift random, so a "
+                         "crossover flipping the mode would judge it with unselected parameters "
+                         "and bias the result toward whichever mode dominates the population. "
+                         "REQUIRES --name-suffix to contain the mode token (enforced below), or "
+                         "the second matrix would be skipped as already-completed. No effect on "
+                         "FactorRanker (bypass expert — never reads sizing_mode).")
     ap.add_argument("--workers", default=None,
                     help="Comma-separated remote worker NAMES to distribute each job's GA trials to "
                          "(e.g. 'remote150'); trials spread across these + local. Workers must be "
@@ -182,6 +192,18 @@ def main() -> int:
                          "Default 10.")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
+
+    # A sizing-mode matrix MUST be name-distinguished from its sibling. Jobs are skipped by NAME
+    # when already `completed`, so running notional and risk_atr under the same --name-suffix
+    # would silently skip the entire second matrix and leave you comparing one mode against
+    # itself. Fail loudly rather than let that happen hours later.
+    if args.sizing_mode:
+        token = "riskatr" if args.sizing_mode == "risk_atr" else "notional"
+        if token not in args.name_suffix.replace("_", "").lower():
+            ap.error(
+                f"--sizing-mode {args.sizing_mode} requires --name-suffix to contain "
+                f"'{token}' (got {args.name_suffix!r}). Otherwise the second matrix is skipped "
+                f"as already-completed. Example: --name-suffix goal2020-{token}")
 
     bands = [b.strip() for b in args.bands.split(",") if b.strip()]
     strategies = [s.strip() for s in args.strategies.split(",") if s.strip()]
@@ -228,6 +250,10 @@ def main() -> int:
                # fast-decaying signal like FMPEarningsDrift discovers its own best cadence instead
                # of a hand-picked "monday,thursday" pin.
                "--run-schedule", "weekly", "--name", name, "--parallel", str(args.parallel)]
+        if args.sizing_mode:
+            # Pinned, not searched — see the --sizing-mode help. Harmless for FactorRanker
+            # (bypass expert: it never reads sizing_mode), so no need to special-case it here.
+            cmd += ["--sizing-mode", args.sizing_mode]
         if args.mutation_prob is not None:
             cmd += ["--mutation-prob", str(args.mutation_prob)]
         if args.profit_cap_pct and args.profit_cap_pct > 0:
