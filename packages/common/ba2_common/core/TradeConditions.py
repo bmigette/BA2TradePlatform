@@ -371,22 +371,19 @@ class HasBuyPositionCondition(FlagCondition):
     """Check if this expert has an open BUY (long) position for the instrument."""
     def evaluate(self) -> bool:
         try:
-            from ba2_common.core.db import get_db
-            from ba2_common.core.models import Transaction
-            from ba2_common.core.types import TransactionStatus, OrderDirection
-            from sqlmodel import select
+            from ba2_common.core.trade_repository import get_trade_repository
+            from ba2_common.core.types import OrderDirection
 
-            expert_id = self.expert_recommendation.instance_id
-
-            with get_db() as session:
-                statement = select(Transaction).where(
-                    Transaction.expert_id == expert_id,
-                    Transaction.symbol == self.instrument_name,
-                    Transaction.status == TransactionStatus.OPENED,
-                    Transaction.side == OrderDirection.BUY
-                )
-                self._has_position = len(session.exec(statement).all()) > 0
-                return self._has_position
+            # Repository, never a raw select(): Transaction is an IN_MEM_MODEL, so under the
+            # backtest store a select() returns EMPTY instead of raising and this condition
+            # would be permanently False in every GA trial while working live. See
+            # trade_repository's module docstring for the measured case.
+            open_txns = get_trade_repository().open_transactions(
+                expert_id=self.expert_recommendation.instance_id,
+                symbol=self.instrument_name, side=OrderDirection.BUY,
+            )
+            self._has_position = len(open_txns) > 0
+            return self._has_position
         except Exception as e:
             absorb_if_benign(e)
             logger.error(f"Error checking BUY position for {self.instrument_name}: {e}", exc_info=True)
@@ -405,22 +402,16 @@ class HasSellPositionCondition(FlagCondition):
     """Check if this expert has an open SELL (short) position for the instrument."""
     def evaluate(self) -> bool:
         try:
-            from ba2_common.core.db import get_db
-            from ba2_common.core.models import Transaction
-            from ba2_common.core.types import TransactionStatus, OrderDirection
-            from sqlmodel import select
+            from ba2_common.core.trade_repository import get_trade_repository
+            from ba2_common.core.types import OrderDirection
 
-            expert_id = self.expert_recommendation.instance_id
-
-            with get_db() as session:
-                statement = select(Transaction).where(
-                    Transaction.expert_id == expert_id,
-                    Transaction.symbol == self.instrument_name,
-                    Transaction.status == TransactionStatus.OPENED,
-                    Transaction.side == OrderDirection.SELL
-                )
-                self._has_position = len(session.exec(statement).all()) > 0
-                return self._has_position
+            # See HasBuyPositionCondition: raw select() is blind to the in-memory BT store.
+            open_txns = get_trade_repository().open_transactions(
+                expert_id=self.expert_recommendation.instance_id,
+                symbol=self.instrument_name, side=OrderDirection.SELL,
+            )
+            self._has_position = len(open_txns) > 0
+            return self._has_position
         except Exception as e:
             absorb_if_benign(e)
             logger.error(f"Error checking SELL position for {self.instrument_name}: {e}", exc_info=True)
@@ -1699,10 +1690,12 @@ class DaysOpenedCondition(CompareCondition):
         txn_id = getattr(self.existing_order, "transaction_id", None)
         if txn_id is not None:
             try:
-                from ba2_common.core.models import Transaction
-                with get_db() as session:
-                    txn = session.get(Transaction, txn_id)
-                    open_date = txn.open_date if txn is not None else None
+                # Repository, not session.get(): the transaction lives in the in-memory store
+                # during a RAM-only backtest, where a raw lookup returns None and would silently
+                # fall back to the order's wall-clock created_at (collapsing days_opened to ~0).
+                from ba2_common.core.trade_repository import get_trade_repository
+                txn = get_trade_repository().transaction(txn_id)
+                open_date = txn.open_date if txn is not None else None
                 if open_date is not None:
                     return open_date
             except Exception as e:  # noqa: BLE001
@@ -1770,40 +1763,23 @@ class DaysSinceLastCloseCondition(CompareCondition):
 
     def evaluate(self) -> bool:
         try:
-            from ba2_common.core.models import Transaction
-            from ba2_common.core.types import TransactionStatus
-            from ba2_common.core.utils import calculate_transaction_pnl
+            from ba2_common.core.trade_repository import get_trade_repository
 
             expert_id = getattr(self.expert_recommendation, "instance_id", None)
             now = getattr(self.expert_recommendation, "created_at", None) or datetime.now(timezone.utc)
             if now.tzinfo is None:
                 now = now.replace(tzinfo=timezone.utc)
 
-            with get_db() as session:
-                stmt = (
-                    select(Transaction)
-                    .where(
-                        Transaction.expert_id == expert_id,
-                        Transaction.symbol == self.instrument_name,
-                        Transaction.status == TransactionStatus.CLOSED,
-                        Transaction.close_date.is_not(None),
-                    )
-                    .order_by(Transaction.close_date.desc())
-                )
-                closed = session.exec(stmt).all()
-
-            most_recent = None
-            for txn in closed:  # already newest-first
-                if self._profit_sign != 0:
-                    pnl = calculate_transaction_pnl(txn)
-                    if pnl is None:
-                        continue
-                    if self._profit_sign > 0 and pnl <= 0:
-                        continue
-                    if self._profit_sign < 0 and pnl >= 0:
-                        continue
-                most_recent = txn
-                break
+            # MEASURED FAILURE (2026-07-30): this used a raw select(Transaction), which the
+            # in-memory backtest store does not serve — with a close 3 days old and a ">15 day"
+            # cooldown it returned the 1e9 "never closed" sentinel, so the gate was INERT for
+            # every GA trial and the optimizer tuned a gene that did nothing. Live (SQLite) the
+            # gate DID fire, so a deployed config behaved unlike its own backtest: the same
+            # genome scored 103 trades / 17.55% annualised in-memory vs 169 / 0.20% on disk.
+            most_recent = get_trade_repository().last_closed_transaction(
+                expert_id=expert_id, symbol=self.instrument_name,
+                profit_sign=self._profit_sign,
+            )
 
             if most_recent is None:
                 self.calculated_value = 1e9  # never closed (qualifying) -> "infinitely" long ago
@@ -1889,18 +1865,13 @@ class InstrumentAccountShareCondition(CompareCondition):
         try:
             expert_instance_id = self.expert_recommendation.instance_id
 
-            from ba2_common.core.db import get_db
-            from ba2_common.core.models import Transaction
-            from ba2_common.core.types import TransactionStatus
-            from sqlmodel import select as sql_select
+            from ba2_common.core.trade_repository import get_trade_repository
 
-            with get_db() as session:
-                stmt = sql_select(Transaction).where(
-                    Transaction.expert_id == expert_instance_id,
-                    Transaction.symbol == self.instrument_name,
-                    Transaction.status == TransactionStatus.OPENED,
-                )
-                transactions = session.exec(stmt).all()
+            # Repository, not a raw select(): blind to the in-memory BT store otherwise, which
+            # would report a 0% instrument share for every position in a backtest.
+            transactions = get_trade_repository().open_transactions(
+                expert_id=expert_instance_id, symbol=self.instrument_name,
+            )
 
             if not transactions:
                 return 0.0
@@ -2341,28 +2312,16 @@ class HasOptionPositionCondition(FlagCondition):
 
     def evaluate(self) -> bool:
         try:
-            from ba2_common.core.db import get_db
-            from ba2_common.core.models import Transaction, TradingOrder
-            from ba2_common.core.types import TransactionStatus, AssetClass, OrderStatus
-            from sqlmodel import select
+            from ba2_common.core.trade_repository import get_trade_repository
 
-            expert_id = self.expert_recommendation.instance_id
-            terminal = OrderStatus.get_terminal_statuses()
-
-            with get_db() as session:
-                statement = (
-                    select(TradingOrder)
-                    .join(Transaction, TradingOrder.transaction_id == Transaction.id)
-                    .where(
-                        Transaction.expert_id == expert_id,
-                        Transaction.status == TransactionStatus.OPENED,
-                        TradingOrder.asset_class == AssetClass.OPTION,
-                        TradingOrder.underlying_symbol == self.instrument_name,
-                    )
-                )
-                rows = [o for o in session.exec(statement).all() if o.status not in terminal]
-                self._has = len(rows) > 0
-
+            # The old select().join() is unavailable under the in-memory store (its join helper
+            # is in-mem ONLY), so the repository expresses it as open-transactions -> their
+            # orders, giving live and backtest one implementation.
+            rows = get_trade_repository().open_option_orders(
+                expert_id=self.expert_recommendation.instance_id,
+                underlying=self.instrument_name,
+            )
+            self._has = len(rows) > 0
             return self._has
 
         except Exception as e:
@@ -2386,31 +2345,17 @@ class HasCoveredCallCondition(FlagCondition):
 
     def evaluate(self) -> bool:
         try:
-            from ba2_common.core.db import get_db
-            from ba2_common.core.models import Transaction, TradingOrder
-            from ba2_common.core.types import TransactionStatus, AssetClass, OrderStatus, OptionRight, OrderDirection
-            from sqlmodel import select
+            from ba2_common.core.trade_repository import get_trade_repository
+            from ba2_common.core.types import OptionRight, OrderDirection
 
-            expert_id = self.expert_recommendation.instance_id
-            terminal = OrderStatus.get_terminal_statuses()
-
-            with get_db() as session:
-                statement = (
-                    select(TradingOrder)
-                    .join(Transaction, TradingOrder.transaction_id == Transaction.id)
-                    .where(
-                        Transaction.expert_id == expert_id,
-                        Transaction.status == TransactionStatus.OPENED,
-                        TradingOrder.asset_class == AssetClass.OPTION,
-                        TradingOrder.underlying_symbol == self.instrument_name,
-                        TradingOrder.option_type == OptionRight.CALL,
-                        TradingOrder.side == OrderDirection.SELL,
-                        TradingOrder.option_strategy == "covered_call",
-                    )
-                )
-                rows = [o for o in session.exec(statement).all() if o.status not in terminal]
-                self._has = len(rows) > 0
-
+            # See HasOptionPositionCondition for why this goes through the repository.
+            rows = get_trade_repository().open_option_orders(
+                expert_id=self.expert_recommendation.instance_id,
+                underlying=self.instrument_name,
+                option_type=OptionRight.CALL, side=OrderDirection.SELL,
+                option_strategy="covered_call",
+            )
+            self._has = len(rows) > 0
             return self._has
 
         except Exception as e:
@@ -2434,31 +2379,17 @@ class HasProtectivePutCondition(FlagCondition):
 
     def evaluate(self) -> bool:
         try:
-            from ba2_common.core.db import get_db
-            from ba2_common.core.models import Transaction, TradingOrder
-            from ba2_common.core.types import TransactionStatus, AssetClass, OrderStatus, OptionRight, OrderDirection
-            from sqlmodel import select
+            from ba2_common.core.trade_repository import get_trade_repository
+            from ba2_common.core.types import OptionRight, OrderDirection
 
-            expert_id = self.expert_recommendation.instance_id
-            terminal = OrderStatus.get_terminal_statuses()
-
-            with get_db() as session:
-                statement = (
-                    select(TradingOrder)
-                    .join(Transaction, TradingOrder.transaction_id == Transaction.id)
-                    .where(
-                        Transaction.expert_id == expert_id,
-                        Transaction.status == TransactionStatus.OPENED,
-                        TradingOrder.asset_class == AssetClass.OPTION,
-                        TradingOrder.underlying_symbol == self.instrument_name,
-                        TradingOrder.option_type == OptionRight.PUT,
-                        TradingOrder.side == OrderDirection.BUY,
-                        TradingOrder.option_strategy == "protective_put",
-                    )
-                )
-                rows = [o for o in session.exec(statement).all() if o.status not in terminal]
-                self._has = len(rows) > 0
-
+            # See HasOptionPositionCondition for why this goes through the repository.
+            rows = get_trade_repository().open_option_orders(
+                expert_id=self.expert_recommendation.instance_id,
+                underlying=self.instrument_name,
+                option_type=OptionRight.PUT, side=OrderDirection.BUY,
+                option_strategy="protective_put",
+            )
+            self._has = len(rows) > 0
             return self._has
 
         except Exception as e:
