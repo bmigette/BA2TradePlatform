@@ -92,7 +92,9 @@ def _build(expert_id=8801, account_id=8801, held_qty=0.0):
         price_source=ps, config={"start_date": date(2024, 1, 2), "end_date": date(2024, 1, 4),
                                  "enabled_instruments": ["AAPL"], "seed": 42},
         indicator_provider=None)
-    engine._indicator_provider = object()  # notional sizing -> no ATR build
+    # _ensure_safeguard_stop always attempts an ATR lookup now regardless of sizing_mode;
+    # None is its documented no-ATR-available fallback.
+    engine._indicator_provider = None
     return engine, account, expert, expert_id, ruleset_id, ctx
 
 

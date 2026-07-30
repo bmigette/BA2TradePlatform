@@ -416,7 +416,9 @@ def test_config_entry_rules_reach_build_experts_and_set_stop_loss(monkeypatch):
             },
             indicator_provider=None,  # notional sizing -> ATR not needed
         )
-        engine._indicator_provider = object()  # never touched by notional sizing
+        # _ensure_safeguard_stop always attempts an ATR lookup now regardless of sizing_mode;
+        # None is its documented no-ATR-available fallback, not "never touched".
+        engine._indicator_provider = None
         engine.run()
 
         filled = [

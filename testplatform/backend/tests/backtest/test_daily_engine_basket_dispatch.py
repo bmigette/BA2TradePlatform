@@ -351,7 +351,11 @@ def _build_basket_run(account_id=53, expert_id=53, expert_cls=None, with_open_po
         experts=[(expert, expert_id, {}, ruleset_id)],
         price_source=ps,
         config=config,
-        indicator_provider=object(),  # notional sizing -> ATR not needed
+        # None, not object(): _ensure_safeguard_stop now runs REGARDLESS of sizing_mode (see
+        # TradeRiskManagement.py) and always attempts an ATR lookup when use_atr_stop is on
+        # (default True) -- get_latest_atr's `if indicator_provider is None: return None` is the
+        # documented graceful no-ATR-available path, exactly what a hermetic stub run needs.
+        indicator_provider=None,
     )
     return engine, account, expert, ctx, ps
 
@@ -744,7 +748,9 @@ def _build_real_copy_run(
         experts=[(expert, expert_id, settings, ruleset_id)],
         price_source=ps,
         config=config,
-        indicator_provider=object(),  # notional sizing -> ATR not needed
+        # None, not object(): see the comment in _build_basket_run -- _ensure_safeguard_stop
+        # always attempts an ATR lookup now, and None is its documented no-ATR-available path.
+        indicator_provider=None,
     )
     return engine, account, expert, ctx, ps
 

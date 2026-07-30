@@ -86,7 +86,9 @@ def test_enter_market_swallows_ordinary_exception():
 def _open_position_via_full_run(engine, account, expert, ps):
     """Run the fixture's normal engine.run() once (well-tested to open+fill an AAPL long by
     day 2), so _manage_open_positions has a real held position to iterate."""
-    engine._indicator_provider = object()  # notional sizing never touches it
+    # _ensure_safeguard_stop always attempts an ATR lookup now regardless of sizing_mode;
+    # None is its documented no-ATR-available fallback.
+    engine._indicator_provider = None
     engine.run()
     assert engine._held_transactions(expert.id).get("AAPL"), \
         "fixture must have an open AAPL position to exercise the OPEN_POSITIONS path"
