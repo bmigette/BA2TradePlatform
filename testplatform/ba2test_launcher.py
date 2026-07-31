@@ -3540,15 +3540,15 @@ def main(argv: "list | None" = None) -> int:
                          "plateaued run instead of re-searching from scratch. Default: off "
                          "(fresh random population).")
     op.add_argument("--initial-capital", type=float, default=10000.0)
-    op.add_argument("--profit-cap-pct", type=float, default=None,
+    op.add_argument("--profit-cap-pct", type=float, default=2000.0,
                     help="Cap each trade's gain at this %% of its cost basis when computing the "
-                         "ADJUSTED fitness/return (e.g. 2000 = a trade can't count as more than "
-                         "20x its cost). Stops one lucky mega-winner dominating the GA. Default: off.")
-    op.add_argument("--profit-share-cap-pct", type=float, default=None,
+                         "ADJUSTED fitness/return (2000 = a trade can't count as more than 20x its "
+                         "cost). Stops one lucky mega-winner dominating the GA. DEFAULT-ON since 2026-07-31: the senate grid ran uncapped and its S5 TOP5 reached rank 5 with 96.9%% of net P&L in ONE trade (370%% total return, ~flat without it) -- the capband matrix driver had defaulted these to 2000/25 for ages, the senate scripts never passed them, and nobody noticed until the concentration was checked by hand. Pass 0 to disable.")
+    op.add_argument("--profit-share-cap-pct", type=float, default=25.0,
                     help="Cap each trade's gain at this %% of the run's NET profit for the ADJUSTED "
-                         "fitness/return (e.g. 25 = no single trade may contribute >25%% of total "
-                         "return). Complements --profit-cap-pct: a trade can pass the cost-basis cap "
-                         "yet still dominate the book's return; this bounds that. Default: off.")
+                         "fitness/return (25 = no single trade may contribute >25%% of total return). "
+                         "Complements --profit-cap-pct: a trade can pass the cost-basis cap yet still "
+                         "dominate the book's return; this bounds that. Stops one lucky mega-winner dominating the GA. DEFAULT-ON since 2026-07-31: the senate grid ran uncapped and its S5 TOP5 reached rank 5 with 96.9%% of net P&L in ONE trade (370%% total return, ~flat without it) -- the capband matrix driver had defaulted these to 2000/25 for ages, the senate scripts never passed them, and nobody noticed until the concentration was checked by hand. Pass 0 to disable.")
     op.add_argument("--fitness-trade-scale", action="store_true",
                     help="Multiply each trial's fitness by min(avg_trades_per_year, cap)/target, so "
                          "statistically thin (few-trade) configs are down-weighted (~target trades/yr "
@@ -3683,13 +3683,12 @@ def main(argv: "list | None" = None) -> int:
     ob.add_argument("--save-top", type=int, default=5)
     ob.add_argument("--seed", type=int, default=42)
     ob.add_argument("--initial-capital", type=float, default=10000.0)
-    ob.add_argument("--profit-cap-pct", type=float, default=None,
+    ob.add_argument("--profit-cap-pct", type=float, default=2000.0,
                     help="Cap each trade's gain at this %% of its cost basis for the ADJUSTED "
-                         "fitness/return (e.g. 2000). Stops one lucky mega-winner dominating the GA.")
-    ob.add_argument("--profit-share-cap-pct", type=float, default=None,
+                         "fitness/return (2000). Default-on; see `optimize --profit-cap-pct`.")
+    ob.add_argument("--profit-share-cap-pct", type=float, default=25.0,
                     help="Cap each trade's gain at this %% of the run's NET profit for the ADJUSTED "
-                         "fitness/return (e.g. 25 = no single trade may contribute >25%% of total "
-                         "return). Complements --profit-cap-pct. Default: off.")
+                         "fitness/return (25). Default-on; see `optimize --profit-share-cap-pct`.")
     ob.add_argument("--commission", type=float, default=1.0)
     ob.add_argument("--slippage", type=float, default=0.0)
     ob.add_argument("--spread-bps", type=float, default=0.0,
