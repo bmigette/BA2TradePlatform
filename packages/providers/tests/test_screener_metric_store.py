@@ -267,6 +267,88 @@ def test_screen_legacy_store_without_float_column_skips_float_gate():
     assert ms.screen_universe_for_day(store, "2024-01-08", {"float_min": 1e9}) == ["AAA"]
 
 
+def test_market_cap_cache_refetches_when_build_widens_start(tmp_path, monkeypatch):
+    """A symbol's market_cap cache was written by an earlier build starting 2022-01-01. A later
+    build asking for 2020-01-01 must NOT silently serve the shorter-range cache (the bug found
+    2026-08-01: the metric_store's 2020 extension left market_cap ~99.7% null because the
+    fundamentals cache short-circuited on existence alone) -- it must re-fetch and MERGE onto
+    what's already cached."""
+    path = tmp_path / "AAA.parquet"
+    monkeypatch.setattr(ms, "_fund_cache_path", lambda kind, sym: str(path))
+
+    # First build: 2022-01-01 onward.
+    calls = []
+
+    def _resp_2022(*a, **k):
+        calls.append(k["params"])
+        class _R:
+            @staticmethod
+            def json():
+                return [{"date": "2022-01-03", "marketCap": 5e9}]
+        return _R()
+
+    monkeypatch.setattr(ms, "fmp_http_get", _resp_2022)
+    s1 = ms.fetch_historical_market_cap("AAA", "key", "2022-01-01", "2022-12-31")
+    assert s1.index.min() == pd.Timestamp("2022-01-03")
+
+    # Second build: widen back to 2020-01-01 -- must re-fetch (not just re-read the old cache).
+    def _resp_2020(*a, **k):
+        calls.append(k["params"])
+        class _R:
+            @staticmethod
+            def json():
+                return [{"date": "2020-01-02", "marketCap": 3e9}, {"date": "2022-01-03", "marketCap": 5e9}]
+        return _R()
+
+    monkeypatch.setattr(ms, "fmp_http_get", _resp_2020)
+    s2 = ms.fetch_historical_market_cap("AAA", "key", "2020-01-01", "2022-12-31")
+    # 2020-01-01..2022-12-31 spans > _MCAP_CHUNK_DAYS, so the second build itself chunks into 2
+    # calls (see test_market_cap_wide_range_is_chunked below) -- 1 (first build) + 2 (second).
+    assert len(calls) == 3
+    assert s2.index.min() == pd.Timestamp("2020-01-02")        # now covers the wider range
+    assert s2.loc[pd.Timestamp("2022-01-03")] == 5e9            # merged, not lost
+
+    # Third build: same 2020-01-01 start as last time -- now cached, no further fetch.
+    s3 = ms.fetch_historical_market_cap("AAA", "key", "2020-01-01", "2022-12-31")
+    assert len(calls) == 3                                    # no new call
+    assert s3.index.min() == pd.Timestamp("2020-01-02")
+
+
+def test_market_cap_wide_range_is_chunked(tmp_path, monkeypatch):
+    """The endpoint silently caps its response to the newest ~1300 rows regardless of the
+    from/to span or `limit` (confirmed by direct probe 2026-08-01: NVDA's full 2020-2026 span
+    came back truncated to ~2021-04 even though a narrower request for the same years returns
+    everything). A request spanning more than ``_MCAP_CHUNK_DAYS`` must be split into multiple
+    calls and merged, or a wide goal2020-style request would silently lose its earliest years
+    exactly like the incident that motivated this fix."""
+    path = tmp_path / "BBB.parquet"
+    monkeypatch.setattr(ms, "_fund_cache_path", lambda kind, sym: str(path))
+
+    calls = []
+
+    def _resp(*a, **k):
+        p = k["params"]
+        calls.append((p["from"], p["to"]))
+        # Each chunk returns ONE row dated at its own `from` -- if the code only fired ONE call
+        # for the whole span (the bug), only the LAST chunk's row would ever be seen.
+        class _R:
+            @staticmethod
+            def json():
+                return [{"date": p["from"], "marketCap": 1e9}]
+        return _R()
+
+    monkeypatch.setattr(ms, "fmp_http_get", _resp)
+    span_days = ms._MCAP_CHUNK_DAYS * 2 + 10  # guarantees >= 3 chunks
+    start = "2018-01-01"
+    end = (pd.Timestamp(start) + pd.Timedelta(days=span_days)).strftime("%Y-%m-%d")
+    s = ms.fetch_historical_market_cap("BBB", "key", start, end)
+    assert len(calls) >= 3                                    # the wide span WAS split
+    assert s.index.min() == pd.Timestamp(start)                # earliest chunk's row survived
+    # chunk boundaries are contiguous, no gap/overlap in days covered
+    for (f1, t1), (f2, t2) in zip(calls, calls[1:]):
+        assert pd.Timestamp(t1) + pd.Timedelta(days=1) == pd.Timestamp(f2)
+
+
 def test_float_series_built_lookahead_safe_effective_dated(monkeypatch):
     """fetch_historical_float indexes by the EFFECTIVE (publication) date — period-end + reporting
     lag — so a float is never exposed before it was public (no filing-lag lookahead)."""

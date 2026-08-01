@@ -7,9 +7,11 @@ partitions). At optimize time the store loads into pandas and each GA individual
 per day. No server.
 """
 from __future__ import annotations
+import json
 import os
 import time
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -23,6 +25,29 @@ _SCREENER_URL = "https://financialmodelingprep.com/api/v3/stock-screener"
 _HIST_MCAP_URL = "https://financialmodelingprep.com/api/v3/historical-market-capitalization"
 _HIST_FLOAT_URL = "https://financialmodelingprep.com/api/v4/historical/shares_float"
 
+# historical-market-capitalization silently caps its response to the most recent ~1300 rows
+# regardless of the from/to span or `limit` (confirmed by direct probe 2026-08-01: a 3-year/
+# 756-row window came back complete; the full 2020-2026/~1650-trading-day span was truncated to
+# the newest 1306). 1000 CALENDAR days (~2.7y, ~680 trading days) stays comfortably under the
+# confirmed-safe point while keeping the per-symbol call count low.
+_MCAP_CHUNK_DAYS = 1000
+
+
+def _date_chunks(start: str, end: str, chunk_days: int) -> List[Tuple[str, str]]:
+    """Split [start, end] (``YYYY-MM-DD``) into consecutive <=``chunk_days`` windows."""
+    lo = datetime.strptime(start, "%Y-%m-%d")
+    hi = datetime.strptime(end, "%Y-%m-%d")
+    if lo > hi:
+        return []
+    chunks = []
+    cur = lo
+    step = timedelta(days=chunk_days)
+    while cur <= hi:
+        chunk_end = min(cur + step - timedelta(days=1), hi)
+        chunks.append((cur.strftime("%Y-%m-%d"), chunk_end.strftime("%Y-%m-%d")))
+        cur = chunk_end + timedelta(days=1)
+    return chunks
+
 
 def _fund_cache_path(kind: str, symbol: str) -> str:
     """Disk-cache path for a per-symbol historical fundamentals series (so a re-build never
@@ -31,6 +56,30 @@ def _fund_cache_path(kind: str, symbol: str) -> str:
     d = os.path.join(_cfg.CACHE_FOLDER, "screener_fundamentals", kind)
     os.makedirs(d, exist_ok=True)
     return os.path.join(d, f"{symbol.upper()}.parquet")
+
+
+def _fund_meta_path(path: str) -> str:
+    return path + ".meta.json"
+
+
+def _read_fetched_from(meta_path: str) -> Optional[str]:
+    """The ``start`` a symbol's fundamentals cache was actually fetched from, or None if unknown
+    (no meta file yet — e.g. a cache written before this tracking existed). ``None`` is always
+    treated as "does not cover any start" so an old cache self-heals on the next build that
+    widens the window, instead of silently short-circuiting on a range it never fetched."""
+    try:
+        with open(meta_path) as f:
+            return json.load(f).get("fetched_from")
+    except Exception:  # noqa: BLE001 — missing/corrupt meta -> unknown, forces a re-fetch
+        return None
+
+
+def _write_fetched_from(meta_path: str, start: str) -> None:
+    try:
+        with open(meta_path, "w") as f:
+            json.dump({"fetched_from": start}, f)
+    except Exception:  # noqa: BLE001 — best-effort, same as the parquet cache write
+        pass
 
 
 def _write_parquet_atomic(df: "pd.DataFrame", path: str) -> None:
@@ -59,30 +108,68 @@ def _series_from_cache_df(df: "pd.DataFrame", col: str) -> "pd.Series":
 def fetch_historical_market_cap(symbol: str, api_key: str, start: str, end: str) -> "pd.Series":
     """Daily historical market cap for ``symbol`` over [start,end], as a tz-naive date-indexed
     Series. DISK-CACHED (parquet) — a re-build reads the cache instead of re-hitting FMP. Each
-    row's date is the market date, so an as-of (ffill <= scan date) read is point-in-time."""
+    row's date is the market date, so an as-of (ffill <= scan date) read is point-in-time.
+
+    The cache is keyed on symbol only, so a plain "does the file exist" check would silently
+    serve a shorter range whenever a later build widens ``start`` (e.g. extending the store back
+    to 2020 after it was first built from 2022) — found 2026-08-01 when the 2020 extension left
+    market_cap ~99.7% null for 2020-2021 despite the OHLCV backfill succeeding. A sidecar
+    ``.meta.json`` records the ``start`` actually fetched; a build asking for an earlier one
+    triggers a re-fetch, merged onto the existing cache (never re-fetches a range already
+    covered).
+
+    SECOND bug found the same day, AFTER the above fix: the endpoint itself silently caps its
+    response to the most recent ~1300 rows regardless of the ``from``/``to`` span or
+    ``limit=100000`` — confirmed by direct probe: a 1-year request for NVDA returns the full,
+    untruncated year, but the SAME symbol's full 2020-2026 span returns only the newest ~1306
+    rows (floor ~2021-04), silently DISCARDING the older 2020-2021 rows it would happily return
+    if asked narrowly. ``limit`` doesn't help — it's accepted but ignored. Fixed here by CHUNKING
+    any request wider than ``_MCAP_CHUNK_DAYS`` into sub-ranges (confirmed safe: a 3-year/756-row
+    chunk came back complete) and concatenating — the same shape as the codebase's other known
+    FMP per-request caps (intraday OHLCV's 8-day chunking, the insider provider's pagination)."""
     path = _fund_cache_path("market_cap", symbol)
+    meta_path = _fund_meta_path(path)
+    prior_start = _read_fetched_from(meta_path)
+    covers_start = prior_start is not None and prior_start <= start
+    cached_df: "Optional[pd.DataFrame]" = None
     if os.path.exists(path):
         try:
-            return _series_from_cache_df(pd.read_parquet(path), "market_cap")
+            cached_df = pd.read_parquet(path)
+            if covers_start:
+                return _series_from_cache_df(cached_df, "market_cap")
         except Exception:  # noqa: BLE001 — corrupt cache -> re-fetch
-            pass
+            cached_df = None
     rows: list = []
-    try:
-        r = fmp_http_get(f"{_HIST_MCAP_URL}/{symbol}",
-                         params={"apikey": api_key, "from": start, "to": end, "limit": 100000},
-                         endpoint="historical-market-cap", timeout=30)
-        j = r.json()
-        rows = j if isinstance(j, list) else []
-    except Exception:  # noqa: BLE001 — per-symbol fetch failure -> empty (mcap NaN, dropped by filter)
-        rows = []
+    fetch_ok = True
+    for chunk_start, chunk_end in _date_chunks(start, end, _MCAP_CHUNK_DAYS):
+        try:
+            r = fmp_http_get(f"{_HIST_MCAP_URL}/{symbol}",
+                             params={"apikey": api_key, "from": chunk_start, "to": chunk_end,
+                                     "limit": 100000},
+                             endpoint="historical-market-cap", timeout=30)
+            j = r.json()
+            rows.extend(j if isinstance(j, list) else [])
+        except Exception:  # noqa: BLE001 — per-symbol/per-chunk fetch failure
+            fetch_ok = False  # don't record fetched_from below -- this range wasn't fully fetched
     df = pd.DataFrame(
         [{"date": x.get("date"), "market_cap": x.get("marketCap")}
          for x in rows if isinstance(x, dict) and x.get("date")]
     )
+    if cached_df is not None and not cached_df.empty:
+        df = pd.concat([cached_df, df], ignore_index=True).drop_duplicates(subset="date", keep="last")
     if not df.empty:
         try:
             _write_parquet_atomic(df, path)
         except Exception:  # noqa: BLE001 — cache write best-effort
+            fetch_ok = False
+    # Only record coverage when every chunk genuinely succeeded -- a partial/failed chunk (e.g.
+    # rate-limited mid-symbol) must NOT be remembered as "fetched from `start`", or the next
+    # build would trust the gap as real and never retry it (this was the actual failure mode
+    # that produced the 2020-2021 nulls even after the range-check fix above).
+    if fetch_ok:
+        try:
+            _write_fetched_from(meta_path, start)
+        except Exception:  # noqa: BLE001
             pass
     return _series_from_cache_df(df, "market_cap")
 
@@ -99,13 +186,33 @@ def fetch_historical_float(symbol: str, api_key: str, start: str, end: str) -> "
     reporting lag) — the SAME gate ``FMPHistoricalScreenerProvider._shares_at`` uses for shares.
     An as-of (ffill) read then only exposes a float on/after its likely public date. The cache
     stores the already-effective-dated series. Empty Series when the plan/endpoint returns
-    nothing (the float filter then degrades gracefully — unknown float passes the gate)."""
+    nothing (the float filter then degrades gracefully — unknown float passes the gate).
+
+    Cache-coverage tracking matches ``fetch_historical_market_cap`` (see its docstring): a
+    sidecar ``.meta.json`` records the ``start`` a build actually requested, so widening the
+    window on a later build re-fetches (merged onto the existing cache) instead of silently
+    serving a cache that never covered the new range. The FMP endpoint here isn't itself
+    ``from``/``to``-bounded (it returns everything), so ``start`` only gates the cache check.
+
+    UNLIKE market_cap, this one can't be chunked around its cap: confirmed by direct probe
+    2026-08-01 the endpoint returns a hard-capped ~1800 most-recent rows (NVDA floor ~2021-05)
+    regardless of a ``page`` param (tried 0/1/2 -- identical response each time) and takes no
+    ``from``/``to`` at all. Pre-2021ish float is therefore NOT recoverable from this endpoint on
+    the current plan. Accepted as-is: ``screen_universe_for_day``'s float gate is already
+    NaN-tolerant (missing float passes rather than excludes), so this degrades gracefully rather
+    than silently breaking a screen."""
     path = _fund_cache_path("float", symbol)
+    meta_path = _fund_meta_path(path)
+    prior_start = _read_fetched_from(meta_path)
+    covers_start = prior_start is not None and prior_start <= start
+    cached_df: "Optional[pd.DataFrame]" = None
     if os.path.exists(path):
         try:
-            return _series_from_cache_df(pd.read_parquet(path), "float_shares")
+            cached_df = pd.read_parquet(path)
+            if covers_start:
+                return _series_from_cache_df(cached_df, "float_shares")
         except Exception:  # noqa: BLE001
-            pass
+            cached_df = None
     rows: list = []
     try:
         r = fmp_http_get(_HIST_FLOAT_URL, params={"symbol": symbol, "apikey": api_key},
@@ -127,9 +234,12 @@ def fetch_historical_float(symbol: str, api_key: str, start: str, end: str) -> "
             continue
         recs.append({"date": eff.strftime("%Y-%m-%d"), "float_shares": fs})
     df = pd.DataFrame(recs)
+    if cached_df is not None and not cached_df.empty:
+        df = pd.concat([cached_df, df], ignore_index=True).drop_duplicates(subset="date", keep="last")
     if not df.empty:
         try:
             _write_parquet_atomic(df, path)
+            _write_fetched_from(meta_path, start)
         except Exception:  # noqa: BLE001
             pass
     return _series_from_cache_df(df, "float_shares")

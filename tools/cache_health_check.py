@@ -338,6 +338,66 @@ def check_expert_warm_cache(cache_folder: str) -> dict:
     return out
 
 
+# (glob pattern, human label, candidate per-row date field names tried in order) for the two
+# expert-warmed caches confirmed to store a genuine per-row date: FMPRating's price-target
+# history (``publishedDate``) and FMPInsiderClusterBuy's Form-4 history (``transactionDate``).
+# Both are fetched FULL/unconditional per symbol (no from/to params — see
+# ``fmp_history_disk_cached`` callers in FMPRating.py / FMPInsiderProvider.py), so unlike the
+# metric_store market_cap/float bug (2026-08-01: symbol-only cache existence check silently
+# served a shorter range after the window widened — see fetch_historical_market_cap's docstring)
+# these can't be truncated by a caching short-circuit. This still checks a REAL thing: whether
+# the underlying FMP history actually reaches back far enough for the requested period, which a
+# plain existence/entry-count check (``check_expert_warm_cache`` above) cannot see.
+_WARM_CACHE_DATE_FIELDS = [
+    ("*price_target*.json", "FMPRating price-target history", ("publishedDate", "date")),
+    ("*insider*.json", "FMPInsiderClusterBuy Form-4 history", ("transactionDate", "filingDate", "date")),
+]
+
+
+def check_warm_cache_date_coverage(cache_folder: str, start: str, sample: int = 20) -> dict:
+    """For each pattern in ``_WARM_CACHE_DATE_FIELDS``, sample up to *sample* cached files and
+    find each symbol's EARLIEST row date. Returns ``{label: {"sampled": n, "no_data_before_start":
+    {symbol: earliest_date}, "unparseable": [symbols]}}`` — ``no_data_before_start`` symbols may
+    be a genuine FMP history-depth limit (not necessarily a bug) but are worth knowing about
+    before trusting a pre-``start`` backtest for that expert."""
+    import glob
+
+    fmp_dir = os.path.join(cache_folder, "fmp_history")
+    out: dict = {}
+    for pattern, label, date_fields in _WARM_CACHE_DATE_FIELDS:
+        matches = sorted(glob.glob(os.path.join(fmp_dir, pattern)))[:sample]
+        no_data_before_start: dict = {}
+        unparseable: list = []
+        for p in matches:
+            base = os.path.basename(p)
+            sym = base.split("__", 1)[-1].rsplit(".json", 1)[0] if "__" in base else base
+            try:
+                with open(p, encoding="utf-8") as f:
+                    rows = json.load(f)
+                if not isinstance(rows, list) or not rows:
+                    continue  # empty-sentinel or non-list payload -> nothing to date-check
+                dates = []
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    for field in date_fields:
+                        v = row.get(field)
+                        if v:
+                            dates.append(str(v)[:10])
+                            break
+                if not dates:
+                    unparseable.append(sym)
+                    continue
+                earliest = min(dates)
+                if earliest > start:
+                    no_data_before_start[sym] = earliest
+            except Exception:  # noqa: BLE001 — unreadable file is itself a finding
+                unparseable.append(sym + " (unreadable)")
+        out[label] = {"sampled": len(matches), "no_data_before_start": no_data_before_start,
+                      "unparseable": unparseable}
+    return out
+
+
 def check_senate_skill_score_coverage(cache_folder: str, start: str, end: str) -> dict:
     """Check ``congress_skill_scores.json``'s DATE-RANGE coverage against every month in
     [start, end] — existence/entry-count alone (``check_expert_warm_cache`` above) cannot catch
@@ -438,6 +498,20 @@ def check_period_validity(start: str, end: str, nan_threshold: float,
         print(f"    {label}: {info['files']} file(s), {info['total_entries']} total entries{flag}")
         if info["files"] == 0 or info["empty_files"]:
             ok = False
+
+    print(f"  expert-warmed cache DATE-RANGE coverage (sampled, start={start}):")
+    dc_res = check_warm_cache_date_coverage(CACHE_FOLDER, start)
+    for label, info in dc_res.items():
+        n_gap = len(info["no_data_before_start"])
+        flag = f"  <-- {n_gap} symbol(s) with earliest data AFTER {start}" if n_gap else ""
+        print(f"    {label}: sampled {info['sampled']}{flag}")
+        for sym, earliest in list(info["no_data_before_start"].items())[:5]:
+            print(f"      [{sym}] earliest={earliest}")
+        if info["unparseable"]:
+            print(f"      {len(info['unparseable'])} unparseable/no-date-field file(s): "
+                  f"{info['unparseable'][:5]}")
+        # Informational only (see _WARM_CACHE_DATE_FIELDS docstring: a gap here may be a genuine
+        # FMP history-depth limit, not a bug) -- does not flip `ok`.
 
     print(f"  Senate trader-skill score DATE-RANGE coverage ({start} .. {end}):")
     sk_res = check_senate_skill_score_coverage(CACHE_FOLDER, start, end)
