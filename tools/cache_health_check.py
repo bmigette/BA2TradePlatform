@@ -48,6 +48,7 @@ import json
 import os
 import sys
 from datetime import datetime, timedelta
+from typing import List
 
 _BACKEND_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                              "testplatform", "backend")
@@ -283,18 +284,24 @@ def check_ohlcv_period_coverage(provider_dir: str, interval: str, start: str, en
 
 # (glob pattern under CACHE_FOLDER/fmp_history, human label) — the per-expert warmed caches that
 # live OUTSIDE push_cache's OHLCV/metric_store sync path and so can rot silently between runs.
-# The 3 congress_* scoring caches use a trailing ``*`` so the glob also matches the not-yet-
-# COMPACTED ``<name>.delta.jsonl`` companion (see FMPSenateTraderWeight._save_scoring_cache_throttled)
-# — without it, a long-lived worker that hasn't hit _CACHE_COMPACT_EVERY yet has ALL its data in the
-# delta file and the base ``.json`` glob alone reports a false "no files found" (confirmed live on
-# 2026-07-17: congress_scalper_scores.json had zero base entries but a populated delta).
+#
+# skill/confidence moved to PER-PARAMETER-COMBO shards (``congress_skill_scores__<params>.jsonl``,
+# plain JSON-Lines, one shard per horizon/lookback/min_past/max_past combo — see the Senate
+# scoring-store sharding work) — found 2026-08-01 that the OLD single-file glob
+# (``congress_skill_scores.json*``) silently matches NOTHING post-sharding, so
+# check_expert_warm_cache reported "0 files found" for genuinely-complete, 2020-2026-covering
+# data (confirmed by direct read of the .jsonl shards). scalper is NOT sharded (still one file +
+# delta companion, trailing ``*`` catches the not-yet-COMPACTED ``.delta.jsonl`` companion — see
+# FMPSenateTraderWeight._save_scoring_cache_throttled; without it a long-lived worker that hasn't
+# hit _CACHE_COMPACT_EVERY yet has ALL its data in the delta file and the base ``.json`` glob alone
+# reports a false "no files found", confirmed live 2026-07-17).
 _EXPERT_WARM_CACHE_PATTERNS = [
     ("*price_target*.json", "FMPRating analyst price targets"),
     ("*earnings*.json", "FMPEarningsDrift earnings calendar/surprises"),
     ("*insider*.json", "FMPInsiderClusterBuy insider transactions"),
-    ("congress_skill_scores.json*", "FMPSenateTraderWeight trader-skill scores"),
+    ("congress_skill_scores__*.jsonl", "FMPSenateTraderWeight trader-skill scores"),
     ("congress_scalper_scores.json*", "FMPSenateTraderWeight scalper/hold-time (roundtrip) scores"),
-    ("congress_confidence_scores.json*", "FMPSenateTraderWeight trader-confidence scores"),
+    ("congress_confidence_scores__*.jsonl", "FMPSenateTraderWeight trader-confidence scores"),
 ]
 
 
@@ -306,8 +313,10 @@ def check_expert_warm_cache(cache_folder: str) -> dict:
     here doesn't fail a job outright but silently degrades or (for Senate) can cause remote-worker
     trial timeouts as the cache gets rebuilt cold on every worker independently.
 
-    A ``.delta.jsonl`` match (JSON-Lines, one ``{"k": ..., "v": ...}`` object per line) is counted
-    by LINE, not ``json.load`` — it is not a single JSON document.
+    Any ``.jsonl`` match (both the ``.delta.jsonl`` compaction companion AND a sharded
+    ``congress_skill_scores__<params>.jsonl``) is JSON-LINES — one JSON object/line — and counted
+    by LINE, not ``json.load``: a sharded file is not a single JSON document and would otherwise
+    be misreported as unreadable.
 
     Returns ``{pattern_label: {"files": n, "total_entries": n, "empty_files": [...]}}``.
     """
@@ -322,7 +331,7 @@ def check_expert_warm_cache(cache_folder: str) -> dict:
         for p in matches:
             base = os.path.basename(p)
             try:
-                if base.endswith(".delta.jsonl"):
+                if base.endswith(".jsonl"):
                     with open(p, encoding="utf-8") as f:
                         n = sum(1 for line in f if line.strip())
                 else:
@@ -399,7 +408,7 @@ def check_warm_cache_date_coverage(cache_folder: str, start: str, sample: int = 
 
 
 def check_senate_skill_score_coverage(cache_folder: str, start: str, end: str) -> dict:
-    """Check ``congress_skill_scores.json``'s DATE-RANGE coverage against every month in
+    """Check the Senate trader-skill scores' DATE-RANGE coverage against every month in
     [start, end] — existence/entry-count alone (``check_expert_warm_cache`` above) cannot catch
     this: the cache can hold thousands of entries and still leave whole YEARS of the grid's actual
     backtest range uncovered.
@@ -413,29 +422,41 @@ def check_senate_skill_score_coverage(cache_folder: str, start: str, end: str) -
     ``FMPSenateTraderWeight._get_trader_skill_cached``'s docstring), so small-population reuse
     across trials is far lower than entry count alone suggests.
 
+    The cache is now PER-PARAMETER-COMBO SHARDED (``congress_skill_scores__<horizon>_<lookback>_
+    <min_past>_<max_past>.jsonl``, plain JSON-Lines) rather than one file (found 2026-08-01: the
+    old single-file check silently read nothing post-sharding and reported "0 entries, all months
+    missing" for data that was actually complete). Reads across ALL shards + each shard's
+    not-yet-compacted ``.delta.jsonl`` companion.
+
     Each key is ``"{trader}|{history_len}|{as_of_day}|{horizon_days}|{min_past}|{max_past}|
-    {lookback_months}"`` — ``as_of_day`` (``YYYY-MM-DD``) is the 3rd pipe-delimited field. Merges
-    the base file with any not-yet-compacted delta lines (mirrors
-    ``FMPSenateTraderWeight._load_scoring_cache``).
+    {lookback_months}"`` — ``as_of_day`` (``YYYY-MM-DD``) is the 3rd pipe-delimited field.
 
     Returns ``{entries, distinct_days, months_checked, months_missing: [...]}``.
     """
+    import glob
+
     months = _months_between(start, end)
-    path = os.path.join(cache_folder, "fmp_history", "congress_skill_scores.json")
+    fmp_dir = os.path.join(cache_folder, "fmp_history")
     keys = []
-    try:
-        with open(path, encoding="utf-8") as f:
-            keys.extend(json.load(f).keys())
-    except Exception:  # noqa: BLE001 — missing/corrupt base -> no coverage from it
-        pass
-    try:
-        with open(path + ".delta.jsonl", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    keys.append(json.loads(line)["k"])
-    except Exception:  # noqa: BLE001 — missing/corrupt delta -> ignore
-        pass
+    for path in sorted(glob.glob(os.path.join(fmp_dir, "congress_skill_scores__*.jsonl"))):
+        if path.endswith(".delta.jsonl"):
+            continue  # picked up alongside its base shard below
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        keys.append(json.loads(line)["k"])
+        except Exception:  # noqa: BLE001 — missing/corrupt shard -> no coverage from it
+            pass
+        try:
+            with open(path + ".delta.jsonl", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        keys.append(json.loads(line)["k"])
+        except Exception:  # noqa: BLE001 — missing/corrupt delta -> ignore
+            pass
     as_of_days = {parts[2] for k in keys if len(parts := k.split("|")) >= 3}
     present_months = {d[:7] for d in as_of_days}
     missing_months = [m for m in months if m not in present_months]
@@ -445,9 +466,109 @@ def check_senate_skill_score_coverage(cache_folder: str, start: str, end: str) -
     }
 
 
+# Expert -> max indicator lookback in trading BARS, and the bars->calendar-days conversion.
+# MIRRORS ``daily_backtest_handler._EXPERT_WARMUP_BARS`` / ``derive_warmup_days`` (kept as a
+# local copy rather than an import so this tool stays runnable without the backtest package on
+# the path; if the engine's table changes, update here too).
+_WARMUP_BARS_BY_EXPERT = {
+    "FactorRanker": 252,          # momentum_12_1 (12 months) -- the deepest non-option lookback
+    "PremiumSeller": 300,         # SMA-200/HV floor (options expert; excluded from equity grids)
+    "FMPRating": 10,
+    "FMPEarningsDrift": 10,
+    "FMPInsiderClusterBuy": 10,
+    "FinnHubRating": 10,
+    "FMPSenateTraderWeight": 10,  # ATR floor governs
+    "FMPSenateTraderCopy": 10,
+}
+_WARMUP_FLOOR_DAYS = 60
+_BARS_TO_CALDAYS = 1.45
+
+
+def warmup_days_for(experts: List[str]) -> int:
+    """Calendar-day warmup the engine will derive for *experts* (mirrors derive_warmup_days)."""
+    max_bars = 14  # ATR-14 floor
+    for name in experts:
+        max_bars = max(max_bars, _WARMUP_BARS_BY_EXPERT.get(name, 20))
+    return max(_WARMUP_FLOOR_DAYS, int(max_bars * _BARS_TO_CALDAYS) + 10)
+
+
+def check_warmup_coverage(store_dir: str, provider_dir: str, interval: str, start: str,
+                           experts: List[str], max_symbols: int = 0) -> dict:
+    """DEPENDENCY check: does each symbol the run will actually SCREEN have enough OHLCV history
+    BEFORE ``start`` to satisfy the indicator warmup the engine derives for *experts*?
+
+    Presence/NaN checks cannot catch this. A metric_store month can be fully populated and every
+    OHLCV file present, yet an indicator that needs N bars of lead-in (EMA-200, ATR-14,
+    Weinstein's 30-week MA, FactorRanker's 252-bar momentum) silently yields NaN/garbage for any
+    symbol whose history STARTS at the backtest's start date. Found 2026-08-01: 1114/2290 (48.6%)
+    of the symbols in the ``ym=2020-01`` partition had ZERO bars before 2020-01-01 -- all starting
+    exactly 2020-01-02 -- because the 1d backfill was run with ``--start 2020-01-01`` and the
+    OHLCV as-of cache only ever extends FORWARD, never backward, on a warm hit. The tell was
+    weinstein_stage sitting at ~50% NaN through early 2020, almost exactly matching that 48.6%.
+
+    Universe = the symbols present in the metric_store partition for ``start``'s month (i.e. what
+    the screener can actually select on day one), not the whole OHLCV cache -- a symbol that never
+    passes the screen needing no warmup is not a finding.
+
+    Returns ``{required_days, universe, checked, ok, insufficient: {symbol: bars_before_start},
+    zero: n, examples: [...]}``.
+    """
+    import glob
+    import pandas as pd
+
+    required_days = warmup_days_for(experts)
+    start_ts = pd.Timestamp(start)
+    warmup_start = start_ts - pd.Timedelta(days=required_days)
+    # Trading bars expected in that calendar window (~252/yr), with slack for holidays.
+    required_bars = int(required_days / _BARS_TO_CALDAYS * 0.9)
+
+    ym = start_ts.strftime("%Y-%m")
+    parts = sorted(glob.glob(os.path.join(store_dir, f"ym={ym}", "*.parquet")))
+    if not parts:
+        return {"required_days": required_days, "universe": 0, "checked": 0, "ok": 0,
+                "insufficient": {}, "zero": 0, "examples": [],
+                "error": f"no metric_store partition for ym={ym}"}
+    df = pd.concat([pd.read_parquet(p, columns=["symbol"]) for p in parts], ignore_index=True)
+    syms = sorted(df["symbol"].unique())
+    if max_symbols and len(syms) > max_symbols:
+        syms = syms[:max_symbols]
+
+    insufficient, zero, ok = {}, 0, 0
+    for s in syms:
+        p = os.path.join(provider_dir, f"{s}_{interval}.parquet")
+        if not os.path.exists(p):
+            insufficient[s] = -1  # no file at all
+            continue
+        try:
+            dts = pd.to_datetime(pd.read_parquet(p, columns=["Date"])["Date"], utc=True).dt.tz_localize(None)
+        except Exception:  # noqa: BLE001
+            insufficient[s] = -1
+            continue
+        n_before = int(((dts >= warmup_start) & (dts < start_ts)).sum())
+        if n_before == 0:
+            zero += 1
+            insufficient[s] = 0
+        elif n_before < required_bars:
+            insufficient[s] = n_before
+        else:
+            ok += 1
+    return {"required_days": required_days, "required_bars": required_bars,
+            "universe": len(syms), "checked": len(syms), "ok": ok,
+            "insufficient": insufficient, "zero": zero,
+            "examples": sorted(insufficient.items())[:10]}
+
+
+# Experts the warmup-dependency check sizes against: every non-option expert a goal2020-style
+# equity grid runs. FactorRanker's 252-bar momentum dominates, so this is the deepest requirement
+# any equity job will derive. PremiumSeller (options, 300 bars) is excluded -- the options cache
+# floors at 2024 anyway, so it can never run a 2020 window.
+_warmup_experts = ["FactorRanker", "FMPRating", "FMPEarningsDrift",
+                   "FMPInsiderClusterBuy", "FMPSenateTraderWeight"]
+
+
 def check_period_validity(start: str, end: str, nan_threshold: float,
                            validity_symbols: int, interval: str) -> bool:
-    """Orchestrates the three validity sub-checks over [start, end] and prints a report.
+    """Orchestrates the validity sub-checks over [start, end] and prints a report.
     Returns True if nothing looks broken."""
     from ba2_common.config import SCREENER_STORE_DIR, CACHE_FOLDER
 
@@ -498,6 +619,24 @@ def check_period_validity(start: str, end: str, nan_threshold: float,
         print(f"    {label}: {info['files']} file(s), {info['total_entries']} total entries{flag}")
         if info["files"] == 0 or info["empty_files"]:
             ok = False
+
+    print(f"  INDICATOR WARMUP dependency ({start} start, experts={','.join(_warmup_experts)}):")
+    wu = check_warmup_coverage(SCREENER_STORE_DIR, provider_dir, interval, start, _warmup_experts)
+    if wu.get("error"):
+        print(f"    {wu['error']}")
+    else:
+        n_bad = len(wu["insufficient"])
+        print(f"    needs {wu['required_days']}d (~{wu['required_bars']} bars) of history BEFORE "
+              f"{start}; day-one screen universe = {wu['universe']} symbol(s)")
+        print(f"    sufficient: {wu['ok']}   insufficient: {n_bad} (of which {wu['zero']} have "
+              f"ZERO pre-{start} bars)")
+        for sym, n in wu["examples"]:
+            print(f"      [{sym}] bars_before_start={'NO FILE' if n < 0 else n}")
+        if n_bad:
+            ok = False
+            print(f"    -> indicators needing lead-in (EMA/ATR/Weinstein/momentum) will be NaN or "
+                  f"wrong for those symbols. Re-fetch 1d OHLCV with a start >= {wu['required_days']}d "
+                  f"before {start}.")
 
     print(f"  expert-warmed cache DATE-RANGE coverage (sampled, start={start}):")
     dc_res = check_warm_cache_date_coverage(CACHE_FOLDER, start)
