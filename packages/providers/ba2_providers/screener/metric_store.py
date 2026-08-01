@@ -554,7 +554,7 @@ def build_store(store_dir: str, api_key: str, start: str, end: str, *,
                 ohlcv_get, mcap_get=None, float_get=None, shares_get=None,
                 cadence_days: int = 7, rvol_window: int = 20, drop_days: int = 5,
                 max_lookback: int = 30, max_workers: int = 8, symbol_retries: int = 2,
-                flush_every: int = 250) -> Dict[str, Any]:
+                flush_every: int = 250, fail_on_quality: bool = True) -> Dict[str, Any]:
     """Build/extend the metric store for [start,end] at ``cadence_days`` (default 7 = weekly).
     SKIPS months already present (incremental).
 
@@ -571,7 +571,12 @@ def build_store(store_dir: str, api_key: str, start: str, end: str, *,
 
     The per-symbol fetch+compute runs in a thread pool (``max_workers``); the OHLCV reads are
     disk-IO and the mcap/float fetches go through ``fmp_http_get`` (global rate-limit gate), so
-    threads overlap IO/network safely. Returns {symbols, months_written, months_skipped, cadence_days}.
+    threads overlap IO/network safely. Returns {symbols, months_written, months_skipped,
+    cadence_days, quality_failures}.
+
+    ``fail_on_quality`` (default True): raise ``MetricStoreQualityError`` if any written month has
+    a column exceeding its ``_BUILD_MAX_NAN`` tolerance. Written partitions are kept either way --
+    the raise reports that they are not TRUSTWORTHY, it does not discard the work.
     """
     grid = scan_date_grid(start, end, cadence_days)
     want_months = sorted({d.strftime("%Y-%m") for d in grid})
@@ -647,15 +652,48 @@ def build_store(store_dir: str, api_key: str, start: str, end: str, *,
                     f"(part-{flush_seq:05d}, {written} total) to {store_dir}")
         frames = []
 
+    quality: Dict[str, Dict[str, float]] = {}
+
+    def _record_quality(batch: "pd.DataFrame") -> None:
+        """Accumulate per-month NaN findings for the rows just flushed."""
+        for ym, grp in batch.groupby(batch["date"].astype(str).str.slice(0, 7)):
+            bad = check_frame_quality(grp)
+            if bad:
+                quality[str(ym)] = bad
+
     with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as ex:
         for res in ex.map(lambda kv: _build_one(kv[0], kv[1]), items):
             if res is not None and not res.empty:
                 frames.append(res)
                 if fe > 0 and len(frames) >= fe:
+                    _record_quality(pd.concat(frames, ignore_index=True))
                     _flush()
+    if frames:
+        _record_quality(pd.concat(frames, ignore_index=True))
     _flush()  # final remainder
-    return {"symbols": len(static_by_sym), "months_written": len(todo_months),
-            "months_skipped": len(set(have) & set(want_months)), "cadence_days": cadence_days}
+
+    summary = {"symbols": len(static_by_sym), "months_written": len(todo_months),
+               "months_skipped": len(set(have) & set(want_months)),
+               "cadence_days": cadence_days, "quality_failures": quality}
+    if quality and fail_on_quality:
+        # FAIL LOUD. A partition that exists but whose columns are mostly NaN is worse than a
+        # missing one: every downstream check ("month coverage continuous", "all partitions
+        # present") passes while the screen it feeds is silently starved. This is the guard that
+        # was missing on 2026-08-01, when a build wrote 24 months of ~99.7%-NaN market_cap and
+        # ~50%-NaN weinstein_stage and reported success -- the breakage was only caught days later
+        # by reading a health-check log. Partitions are LEFT ON DISK (progress is not thrown away);
+        # the caller decides whether to repair the inputs and re-run, or lower the thresholds.
+        worst = sorted(quality.items())[:8]
+        raise MetricStoreQualityError(
+            f"metric-store build wrote {len(quality)} month(s) failing column-quality thresholds "
+            f"{_BUILD_MAX_NAN} -- partitions are on disk but NOT trustworthy. "
+            f"First failures: {worst}. "
+            f"A high NaN rate on warmup-dependent columns (weinstein_stage/atr_14/momentum_12_1) "
+            f"usually means the underlying OHLCV cache lacks history BEFORE the build's start "
+            f"date -- re-fetch 1d bars with an earlier --start, then rebuild. "
+            f"Pass fail_on_quality=False to record findings without raising."
+        )
+    return summary
 
 
 _STORE_MEMO: Dict[str, "pd.DataFrame"] = {}
@@ -674,6 +712,55 @@ def scan_dates(store_df: "pd.DataFrame", store_key: str = "") -> List[str]:
     if store_key:
         _SCAN_DATES_MEMO[store_key] = ds
     return ds
+
+
+# Columns a build MUST be able to compute, with the max NaN fraction tolerated before the build
+# is treated as failed. Deliberately per-column, not one global threshold: they degrade for
+# different reasons and a blanket number would either mask a dead market_cap or reject a
+# legitimately sparse float.
+#   market_cap  - hard screen filter; a NaN row is silently DROPPED by every cap-band screen, so
+#                 a dead column empties the universe rather than loosening it. Near-zero tolerance.
+#   close/price - if these are NaN the row is meaningless.
+#   weinstein_stage / atr_14 / momentum_12_1 - WARMUP-dependent (30-week MA, ATR-14, 252-bar
+#                 momentum). A high NaN rate here means the underlying OHLCV lacks the lead-in
+#                 before the build's start date, which is exactly the 2026-08-01 incident: half
+#                 the universe's 1d cache began ON the start date, so weinstein sat at ~50% NaN
+#                 and nothing failed. Tolerance is loose (0.35) because thin/new listings
+#                 legitimately lack history -- it catches a systemic gap, not individual symbols.
+# float_shares is deliberately ABSENT: the FMP endpoint hard-caps ~1800 rows with no pagination
+# (see fetch_historical_float), so pre-~2021 float is unobtainable and the screen's float gate is
+# explicitly NaN-tolerant. Failing on it would block every legitimate deep-history build.
+_BUILD_MAX_NAN = {
+    "close": 0.01,
+    "price": 0.01,
+    "market_cap": 0.20,
+    "weinstein_stage": 0.35,
+    "atr_14": 0.35,
+    "momentum_12_1": 0.35,
+}
+
+
+class MetricStoreQualityError(RuntimeError):
+    """A build produced partitions whose columns are too NaN-heavy to be usable."""
+
+
+def check_frame_quality(df: "pd.DataFrame", thresholds: Optional[Dict[str, float]] = None
+                        ) -> Dict[str, float]:
+    """NaN fraction per column that EXCEEDS its threshold (empty dict = healthy).
+
+    Split out from the build so callers/tests can assess a frame directly.
+    """
+    limits = _BUILD_MAX_NAN if thresholds is None else thresholds
+    if df is None or df.empty:
+        return {"__empty__": 1.0}
+    bad = {}
+    for col, limit in limits.items():
+        if col not in df.columns:
+            continue  # a store predating the column is not a build failure
+        rate = float(df[col].isna().mean())
+        if rate > limit:
+            bad[col] = round(rate, 4)
+    return bad
 
 
 def load_store(store_dir: str) -> "pd.DataFrame":

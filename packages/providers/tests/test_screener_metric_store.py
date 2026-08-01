@@ -267,6 +267,39 @@ def test_screen_legacy_store_without_float_column_skips_float_gate():
     assert ms.screen_universe_for_day(store, "2024-01-08", {"float_min": 1e9}) == ["AAA"]
 
 
+def test_build_quality_gate_flags_nan_heavy_columns():
+    """check_frame_quality reports any column over its per-column NaN tolerance. This is the
+    guard for the 2026-08-01 incident: a build wrote 24 months with ~99.7% NaN market_cap and
+    ~50% NaN weinstein_stage and still reported success, so every 'partitions present / months
+    continuous' check passed while the screen it fed was starved."""
+    n = 100
+    healthy = pd.DataFrame({
+        "close": [10.0] * n, "price": [10.0] * n, "market_cap": [1e9] * n,
+        "weinstein_stage": [2] * n, "atr_14": [1.0] * n, "momentum_12_1": [0.1] * n,
+    })
+    assert ms.check_frame_quality(healthy) == {}
+
+    # market_cap dead (the actual incident) -> flagged
+    dead_mcap = healthy.copy()
+    dead_mcap.loc[: n - 4, "market_cap"] = float("nan")   # ~97% NaN
+    bad = ms.check_frame_quality(dead_mcap)
+    assert "market_cap" in bad and bad["market_cap"] > 0.9
+
+    # warmup-dependent column half-NaN (the weinstein symptom) -> flagged
+    no_warmup = healthy.copy()
+    no_warmup.loc[: n // 2, "weinstein_stage"] = float("nan")
+    assert "weinstein_stage" in ms.check_frame_quality(no_warmup)
+
+    # float_shares is deliberately NOT gated (FMP endpoint cap makes old float unobtainable,
+    # and the screen's float filter is NaN-tolerant) -- an all-NaN float must NOT fail a build.
+    with_float = healthy.copy()
+    with_float["float_shares"] = float("nan")
+    assert ms.check_frame_quality(with_float) == {}
+
+    # an empty frame is itself a failure, not a pass-by-vacuum
+    assert ms.check_frame_quality(pd.DataFrame()) != {}
+
+
 def test_market_cap_cache_refetches_when_build_widens_start(tmp_path, monkeypatch):
     """A symbol's market_cap cache was written by an earlier build starting 2022-01-01. A later
     build asking for 2020-01-01 must NOT silently serve the shorter-range cache (the bug found
