@@ -28,7 +28,7 @@ import argparse
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
 
 def _parse_symbols_arg(raw: str) -> list:
@@ -778,11 +778,19 @@ def _cmd_build_screener_metrics(args) -> int:
     #  * market cap: FMP historical-market-capitalization (correct across buybacks/issuance/splits)
     #  * free float: FMP v4 historical/shares_float
     # ``shares_get`` stays only as the legacy mcap fallback for a symbol with no historical series.
+    # Fundamentals are read AS-OF each scan date (ffill from the latest row <= that date), so a
+    # series that begins exactly ON --start leaves the first scan dates with nothing to fill FROM.
+    # Measured 2026-08-01: market_cap was 20.2% NaN in the build's first month (2020-01) and 0.3%
+    # in every later month -- purely a boundary artifact, not missing data. Fetch fundamentals from
+    # a lead-in before the window so the first scan date already has a prior value.
+    _FUND_LEADIN_DAYS = 120
+    _fund_start = (datetime.fromisoformat(args.start) - timedelta(days=_FUND_LEADIN_DAYS)).strftime("%Y-%m-%d")
+
     def _mcap(sym):
-        return ms.fetch_historical_market_cap(sym, api_key, args.start, args.end)
+        return ms.fetch_historical_market_cap(sym, api_key, _fund_start, args.end)
 
     def _float(sym):
-        return ms.fetch_historical_float(sym, api_key, args.start, args.end)
+        return ms.fetch_historical_float(sym, api_key, _fund_start, args.end)
 
     os.makedirs(args.store, exist_ok=True)
     summary = ms.build_store(
