@@ -135,3 +135,27 @@ def test_static_mode_unaffected(tmp_path):
     cfg = _build_config(payload)
     assert cfg["enabled_instruments"] == ["AAPL", "MSFT"]
     assert cfg["screener_runtime"] is None  # engine gate no-op for static runs
+
+
+def test_per_bar_gate_filters_on_price_max_point_in_time(tmp_path):
+    """The engine's per-bar entry gate applies price_max POINT-IN-TIME: A is priced 120 on the
+    Jan scan (gated out) and 80 on the Feb scan (admitted). This is the exact semantics the
+    options grid's max-stock-price gate relies on — a stock crossing the cap mid-backtest is
+    only excluded while above it."""
+    rows = [
+        {"date": "2024-01-01", "symbol": "A", "market_cap": 2e9, "price": 120.0, "volume": 1e6,
+         "relative_volume": 1.5, "price_drop_pct": 0.0, "weinstein_stage": 2, "sector": "X", "close": 120.0},
+        {"date": "2024-02-01", "symbol": "A", "market_cap": 2e9, "price": 80.0, "volume": 1e6,
+         "relative_volume": 1.5, "price_drop_pct": 0.0, "weinstein_stage": 2, "sector": "X", "close": 80.0},
+    ]
+    store = str(tmp_path / "ms")
+    ms.write_partitions(store, pd.DataFrame(rows))
+    ms.clear_store_memo()
+
+    rt = {"store": store, "settings": {"price_max": 100.0, "max_stocks": 10000},
+          "cadence_days": 7}
+    cache = {}
+    # Bar between the two scans resolves to the Jan scan (price 120 > 100): gated out.
+    assert _screened_symbols_for_bar(rt, datetime(2024, 1, 15, tzinfo=timezone.utc), cache) == []
+    # Bar after the Feb scan (price 80 <= 100): admitted again.
+    assert _screened_symbols_for_bar(rt, datetime(2024, 2, 15, tzinfo=timezone.utc), cache) == ["A"]
