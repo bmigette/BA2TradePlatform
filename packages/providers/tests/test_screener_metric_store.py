@@ -608,3 +608,23 @@ def test_recompute_atr_columns_cache_only_inplace(tmp_path):
     # BBB skipped -> ATR columns stay NaN (consumer treats missing ATR as "no ATR available").
     bbb_row = out[out["symbol"] == "BBB"].iloc[0]
     assert pd.isna(bbb_row["atr_7"]) and pd.isna(bbb_row["atr_14"])
+
+
+def test_screen_universe_for_day_price_max_point_in_time():
+    """The option grid's max-stock-price gate rests on this: price_max excludes rows whose
+    POINT-IN-TIME store price is above the cap — per scan date, not statically. A symbol cheap
+    on one scan and expensive on another is admitted only on the cheap scan."""
+    df = pd.DataFrame({
+        "symbol": ["AAA", "AAA", "BBB", "BBB"],
+        "date": ["2024-01-31", "2024-02-29", "2024-01-31", "2024-02-29"],
+        "price": [80.0, 150.0, 40.0, 45.0],
+        "market_cap": [5e9] * 4, "relative_volume": [1.0] * 4,
+        "price_drop_pct": [0.0] * 4,
+    })
+    settings = {"price_max": 100.0, "max_stocks": 10000}
+    # Jan: AAA at 80 passes. Feb: AAA at 150 is gated out; BBB stays under the cap on both.
+    assert set(ms.screen_universe_for_day(df, "2024-01-31", settings)) == {"AAA", "BBB"}
+    assert ms.screen_universe_for_day(df, "2024-02-29", settings) == ["BBB"]
+    # 0 disables the filter entirely (the --max-stock-price 0 escape hatch).
+    assert set(ms.screen_universe_for_day(df, "2024-02-29",
+                                          {"price_max": 0, "max_stocks": 10000})) == {"AAA", "BBB"}
