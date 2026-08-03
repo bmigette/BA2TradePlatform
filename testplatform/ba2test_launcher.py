@@ -2239,6 +2239,12 @@ _OPTION_MIN_VOLUME_DEFAULT = 25
 # is called deep in the strategy builders, far from the parsed args.
 _OPTION_MIN_VOLUME = _OPTION_MIN_VOLUME_DEFAULT
 
+# Default cap on the UNDERLYING price for the gate-only screener entry gate
+# (--screener-gate-store): the options grid runs at $20k, where full-notional structures on
+# $100+ underlyings reserve more than the account (see the reserve table above
+# _FULL_NOTIONAL_OPTION_KINDS). 100 keeps every grid structure openable on gated names.
+_MAX_STOCK_PRICE_DEFAULT = 100.0
+
 
 def _option_entry_action_for(kind: str) -> dict:
     """The option ENTRY action config for a pure-option strategy key (a fresh copy).
@@ -2252,6 +2258,57 @@ def _option_entry_action_for(kind: str) -> dict:
     if _OPTION_MIN_VOLUME and _OPTION_MIN_VOLUME > 0:
         cfg.setdefault("option_min_volume", int(_OPTION_MIN_VOLUME))
     return cfg
+
+
+def _screener_gate_base_for_strategy(kind: str) -> dict:
+    """Per-strategy gate-only screener overrides declared on _OPTION_STRATS members
+    (``screener_gate_base``). A group (OS1-4) merges its ACTIVE members' dicts in order
+    (later member wins). Equity/unknown keys -> {}."""
+    if kind in _OPTION_STRATS:
+        return dict(_OPTION_STRATS[kind].get("screener_gate_base") or {})
+    merged: dict = {}
+    for member in _OPTION_GROUPS.get(kind, []):
+        merged.update(_OPTION_STRATS[member].get("screener_gate_base") or {})
+    return merged
+
+
+def _screener_gate_opt_block(args, strategy_key: str) -> "dict | None":
+    """The gate-only screener_opt block for --screener-gate-store (None when the flag is unset).
+
+    Gate-only = the metric store is attached PURELY as a per-bar entry gate: the run universe
+    stays the static --universe, no screener:* genes enter the search, and the optimization
+    handler skips its candidate-bound universe restriction. Base settings are most-admitting
+    except the price cap, so ONLY --max-stock-price bites unless --screener-base-json or a
+    per-strategy screener_gate_base says otherwise. Precedence (high -> low): per-strategy
+    screener_gate_base > --screener-base-json > the --max-stock-price default block.
+    """
+    store = getattr(args, "screener_gate_store", None)
+    if not store:
+        return None
+    if getattr(args, "screener", False):
+        sys.exit("optimize: --screener-gate-store cannot be combined with --screener "
+                 "(full screener mode already gates entries; pick one).")
+    base: dict = {
+        "market_cap_min": 0.0,
+        "relative_volume_min": 0.0,
+        "price_drop_pct": 0.0,
+        "weinstein_stage2_only": 0,
+        "max_stocks": 10000,
+    }
+    max_price = float(getattr(args, "max_stock_price", _MAX_STOCK_PRICE_DEFAULT))
+    if max_price > 0:
+        base["price_max"] = max_price
+    if getattr(args, "screener_base_json", None):
+        with open(args.screener_base_json) as _f:
+            base.update(json.load(_f))
+    base.update(_screener_gate_base_for_strategy(strategy_key))
+    return {
+        "store": store,
+        "base_settings": base,
+        "cadence_days": int(args.screener_cadence_days),
+        "apply_to_expert_settings": False,
+        "gate_only": True,
+    }
 
 
 # DEBIT structures (long premium): OS1/OS4 and their members. The TP band differs by payoff
@@ -2706,6 +2763,29 @@ def _cmd_optimize(args) -> int:
             backtest_block["enabled_instruments"] = enabled
             universe = enabled  # for the progress line / submit description below
             screener_genes = {f"screener:{k}": v for k, v in _scr_opt.items()}
+
+        # GATE-ONLY screener (--screener-gate-store): attach the metric store PURELY as a
+        # per-bar entry gate (the options grid's max-stock-price cap) — the run universe stays
+        # the static --universe and NO screener genes enter the search. The optimization
+        # handler reads gate_only to skip its candidate-bound universe restriction.
+        _gate_opt = _screener_gate_opt_block(args, args.strategy)
+        if _gate_opt:
+            backtest_block["screener_opt"] = _gate_opt
+            from ba2_providers.screener import metric_store as _gate_ms
+            _gate_df = _gate_ms.load_store(_gate_opt["store"])
+            if _gate_df.empty:
+                sys.exit(f"optimize: --screener-gate-store {_gate_opt['store']!r} has no symbols")
+            # Coverage guard: a symbol with no store row can NEVER pass the per-bar gate, so a
+            # store that doesn't cover the static universe silently starves those names. Warn
+            # loud instead of trading a quietly-shrunk universe.
+            _covered = set(_gate_df["symbol"].unique())
+            _static = list(backtest_block["enabled_instruments"])
+            _uncovered = [s for s in _static if s not in _covered]
+            if len(_uncovered) > max(1, len(_static) // 10):
+                print(f"optimize: WARNING screener-gate store covers only "
+                      f"{len(_static) - len(_uncovered)}/{len(_static)} universe symbols; the "
+                      f"uncovered {len(_uncovered)} can NEVER enter — rebuild/extend the store "
+                      f"(ba2-test build-screener-metrics) for this universe.")
 
         # Target-anchored variant (S4): the TP-on-target anchoring lives on the Strategy row itself
         # (strat.entry_actions, seeded by _build_strategy_S4 with reference_value=
@@ -3655,6 +3735,18 @@ def main(argv: "list | None" = None) -> int:
                          "/ large >=$10B): overrides the market-cap gene range + pins market_cap_max so "
                          "each band optimizes a smaller, disjoint universe (keeps 5min feasible). Other "
                          "genes unchanged. Run one job per band.")
+    op.add_argument("--screener-gate-store", default=None,
+                    help="GATE-ONLY screener mode: path to the parquet metric store used PURELY "
+                         "as a per-bar entry gate — the run universe stays the static "
+                         "--universe and no screener:* genes enter the search. Pairs with "
+                         "--max-stock-price so the options grid skips underlyings a $20k "
+                         "account cannot structure. Cannot be combined with --screener.")
+    op.add_argument("--max-stock-price", type=float, default=_MAX_STOCK_PRICE_DEFAULT,
+                    help="Max UNDERLYING price admitted by the gate-only screener entry gate "
+                         "(default 100 — the $20k-account cap for the options grid). "
+                         "Point-in-time: a name above the cap is only excluded while above it. "
+                         "0 disables the price filter. Per-strategy overrides live in "
+                         "_OPTION_STRATS[].screener_gate_base.")
     op.add_argument("--submit", action="store_true",
                     help="Enqueue on the running serve queue (live in the UI Running-jobs strip) "
                          "instead of running in-process. Submit jobs one at a time to avoid "
