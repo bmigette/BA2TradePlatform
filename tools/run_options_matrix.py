@@ -81,6 +81,14 @@ def _jobs(experts, strategies, name_suffix=""):
             yield (f"optm-{expert}-{s}{name_suffix}", expert, s)
 
 
+def _gate_passthrough(args) -> list:
+    """Extra optimize CLI tokens for the gate-only screener entry gate ([] when unset)."""
+    if not args.screener_gate_store:
+        return []
+    return ["--screener-gate-store", args.screener_gate_store,
+            "--max-stock-price", str(args.max_stock_price)]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--experts", default=",".join(_DEFAULT_EXPERTS),
@@ -146,6 +154,13 @@ def main() -> int:
                     help="Multiply a positive fitness by 2 x win_rate_fraction. Passed through "
                          "to `ba2-test optimize`.")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--screener-gate-store", default=None,
+                    help="Attach this parquet metric store as a GATE-ONLY per-bar entry gate on "
+                         "EVERY job (passes --screener-gate-store/--max-stock-price through to "
+                         "ba2-test optimize). The store must cover the options universe.")
+    ap.add_argument("--max-stock-price", type=float, default=100.0,
+                    help="Max underlying price for the gate-only entry gate (default 100 — the "
+                         "$20k-account cap). 0 disables the price filter.")
     args = ap.parse_args()
 
     experts = [e.strip() for e in args.experts.split(",") if e.strip()]
@@ -178,6 +193,7 @@ def main() -> int:
                # Daily cadence: option entries want the day's signal, not a weekly scan —
                # mirrors scripts/run_options_grid.sh.
                "--run-schedule", "daily", "--name", name, "--parallel", str(args.parallel)]
+        cmd += _gate_passthrough(args)
         if args.fitness:
             # Explicit override forces this metric uniformly; omitted (default) lets
             # ba2test_launcher's _resolve_fitness() pick per-strategy-kind (pure-option ->
