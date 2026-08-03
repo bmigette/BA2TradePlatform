@@ -33,6 +33,8 @@ from . import CompanyInsiderInterface as _m14  # noqa: F401
 from . import MarketDataProviderInterface as _m15  # noqa: F401
 from . import SocialMediaDataProviderInterface as _m16  # noqa: F401
 from . import ScreenerProviderInterface as _m17  # noqa: F401
+from . import RiskStatsInterface as _m18  # noqa: F401
+from . import ValuationSnapshotInterface as _m19  # noqa: F401
 
 # 2) Bind the actual classes/functions LAST so they win over the submodule objects.
 from ba2_common.core.interfaces import (  # noqa: F401
@@ -54,6 +56,8 @@ from ba2_common.core.interfaces import (  # noqa: F401
     MarketDataProviderInterface,
     SocialMediaDataProviderInterface,
     ScreenerProviderInterface,
+    RiskStatsInterface,
+    ValuationSnapshotInterface,
     LLMServiceInterface,
     LLMServiceNotConfigured,
     set_llm_service,
@@ -79,6 +83,8 @@ __all__ = [
     "MarketDataProviderInterface",
     "SocialMediaDataProviderInterface",
     "ScreenerProviderInterface",
+    "RiskStatsInterface",
+    "ValuationSnapshotInterface",
     "LLMServiceInterface",
     "LLMServiceNotConfigured",
     "set_llm_service",

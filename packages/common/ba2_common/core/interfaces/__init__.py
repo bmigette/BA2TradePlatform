@@ -42,6 +42,8 @@ from .CompanyInsiderInterface import CompanyInsiderInterface
 from .MarketDataProviderInterface import MarketDataProviderInterface
 from .SocialMediaDataProviderInterface import SocialMediaDataProviderInterface
 from .ScreenerProviderInterface import ScreenerProviderInterface
+from .RiskStatsInterface import RiskStatsInterface
+from .ValuationSnapshotInterface import ValuationSnapshotInterface
 
 # LLM-service seam (Task 4) — langchain-free; host injects the concrete service
 from .LLMServiceInterface import (
@@ -77,6 +79,8 @@ __all__ = [
     "MarketDataProviderInterface",
     "SocialMediaDataProviderInterface",
     "ScreenerProviderInterface",
+    "RiskStatsInterface",
+    "ValuationSnapshotInterface",
 
     # LLM-service seam
     "LLMServiceInterface",
