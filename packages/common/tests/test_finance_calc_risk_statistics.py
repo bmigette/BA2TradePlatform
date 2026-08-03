@@ -21,15 +21,22 @@ def test_beta_of_exact_2x_series():
 
 def test_correlation_matrix_perfect_pos_neg():
     from ba2_common.core.finance_calc.risk import compute_correlation
-    # A returns +1%,+1%; B identical; C exactly -1x A
+    # A returns +1%, -1%, +2%; B identical returns; C exactly negated returns
     res = compute_correlation({
-        "A": [100.0, 101.0, 102.01],
-        "B": [50.0, 50.5, 51.005],
-        "C": [200.0, 198.0, 196.02],
+        "A": [100.0, 101.0, 99.99, 101.9898],
+        "B": [50.0, 50.5, 49.995, 50.9949],
+        "C": [200.0, 198.0, 199.98, 195.9804],
     })
     assert res["matrix"]["A"]["B"] == pytest.approx(1.0, abs=1e-3)
     assert res["matrix"]["A"]["C"] == pytest.approx(-1.0, abs=1e-3)
-    assert res["n_obs"] == 2
+    assert res["n_obs"] == 3
+
+
+def test_correlation_zero_variance_series_is_none():
+    from ba2_common.core.finance_calc.risk import compute_correlation
+    # Constant returns -> zero variance -> correlation undefined (upstream semantics).
+    res = compute_correlation({"A": [100.0, 101.0, 102.01], "B": [50.0, 50.5, 51.005]})
+    assert res["matrix"]["A"]["B"] is None
 
 
 def test_var_historical_and_parametric():

@@ -1,9 +1,7 @@
 """
 Vendored from FinanceHarness (https://github.com/Yijia-Xiao/FinanceHarness),
 Apache-2.0 license. Modified for BA2TradePlatform: ToolSpec/ToolResponse layer
-removed, ToolError replaced with ValueError, imports localized, and the
-correlation matrix reports ±1.0 for zero-variance series that are exact
-scalar multiples of each other (upstream reported None there).
+removed, ToolError replaced with ValueError, imports localized.
 
 Risk family — return helpers, beta, correlation matrix, and Value-at-Risk,
 flattened from FinanceHarness's compute.risk.{returns, beta, correlation, var}
@@ -32,7 +30,6 @@ downside-risk lens on a single name.
 
 from __future__ import annotations
 
-import math
 import statistics
 from typing import Any, Self
 
@@ -150,31 +147,6 @@ class CorrelationRequest(BaseModel):
         return self
 
 
-def _proportional_corr(ra: list[float], rb: list[float]) -> float | None:
-    """±1.0 when two return series are exact scalar multiples of each other.
-
-    Pearson correlation is undefined (and statistics.correlation raises) when
-    either series is constant — but two constant (or near-constant) series that
-    ARE proportional still co-move perfectly, so report +1.0 (same direction)
-    or -1.0 (opposite). Non-proportional series stay None.
-    """
-    k: float | None = None
-    for a, b in zip(ra, rb, strict=True):
-        if a != 0:
-            k = b / a
-            break
-        if b != 0:
-            return None  # zero in ra maps to nonzero in rb — not proportional
-    if k is None:
-        return None  # both all-zero: no co-movement to measure
-    if all(
-        math.isclose(b, k * a, rel_tol=1e-9, abs_tol=1e-15)
-        for a, b in zip(ra, rb, strict=True)
-    ):
-        return 1.0 if k > 0 else -1.0
-    return None
-
-
 def compute_correlation(series: dict[str, list[float]]) -> dict[str, Any]:
     """Compute pairwise correlations from one common aligned return window."""
 
@@ -190,14 +162,11 @@ def compute_correlation(series: dict[str, list[float]]) -> dict[str, Any]:
         for b in names[i:]:
             ra, rb = aligned[a], aligned[b]
             # correlation is undefined (and statistics.correlation raises) when either
-            # series is constant — report None rather than erroring on valid input,
-            # unless the series are exact scalar multiples (perfect ±1 co-movement).
-            if n_obs >= 2 and statistics.variance(ra) > 0 and statistics.variance(rb) > 0:
-                corr = statistics.correlation(ra, rb)
-            elif n_obs >= 2:
-                corr = _proportional_corr(ra, rb)
-            else:
-                corr = None
+            # series is constant — report None rather than erroring on valid input.
+            computable = (
+                n_obs >= 2 and statistics.variance(ra) > 0 and statistics.variance(rb) > 0
+            )
+            corr = statistics.correlation(ra, rb) if computable else None
             c = round(corr, 4) if corr is not None else None
             matrix[a][b] = c
             matrix[b][a] = c
