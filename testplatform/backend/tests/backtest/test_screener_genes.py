@@ -85,3 +85,65 @@ def test_trial_config_carries_screener_runtime(tmp_path):
     plain_hoisted = H._build_hoisted_state(plain)
     plain_cfg = H._build_daily_trial_config(plain, decoded, plain_hoisted)
     assert plain_cfg["screener_runtime"] is None
+
+
+def test_trial_config_gate_only_keeps_static_universe(tmp_path):
+    """GATE-ONLY screener mode (options grid max-stock-price): the store is attached PURELY as
+    a per-bar entry gate. The trial config still carries screener_runtime (with the normalized
+    price_max), but the candidate-bound universe restriction is SKIPPED — the static run
+    universe passes through untouched even when a symbol NEVER passes the screen. Without
+    gate_only the same config restricts enabled_instruments to the screened union (contrast)."""
+    import pandas as pd
+    from ba2_providers.screener import metric_store as ms
+
+    store = str(tmp_path / "s")
+    # AAA's store price (10) NEVER passes price_max 5 — under full screener mode the candidate
+    # bound would drop it from enabled_instruments entirely.
+    ms.write_partitions(store, pd.DataFrame({
+        "symbol": ["AAA"], "date": ["2023-01-31"], "close": [10.0],
+        "market_cap": [3e9], "relative_volume": [1.6], "price_drop_pct": [20.0],
+        "sector": ["T"], "volume": [2e6], "price": [10.0]}))
+    ms.clear_store_memo()
+
+    backtest_cfg = {
+        "backtest_id": 99,
+        "start_date": "2023-01-02",
+        "end_date": "2023-02-28",
+        "enabled_instruments": ["AAA"],
+        "experts": [{"class": "FMPRating", "settings": {}}],
+        "initial_capital": 100000.0,
+        "account_settings": {"starting_cash": 100000.0},
+        "warmup_days": 30,
+        "seed": 7,
+        "screener_opt": {
+            "store": store,
+            "base_settings": {"price_max": 5.0},
+            "cadence_days": 7,
+            "gate_only": True,
+        },
+    }
+    decoded = {
+        "tp": 5.0, "sl": 5.0,
+        "expert_overrides": {},
+        "screener_overrides": {},   # gate-only runs have NO screener genes
+        "buy_tree": None, "sell_tree": None, "exit_rules": [],
+    }
+
+    hoisted = H._build_hoisted_state(backtest_cfg)
+    assert hoisted["screener_gate_only"] is True
+
+    cfg = H._build_daily_trial_config(backtest_cfg, decoded, hoisted)
+    rt = cfg["screener_runtime"]
+    assert rt["store"] == store
+    assert rt["settings"]["price_max"] == 5.0          # normalized, carried to the engine gate
+    assert cfg["enabled_instruments"] == ["AAA"]       # candidate bound SKIPPED
+
+    # Contrast: same block WITHOUT gate_only applies the candidate bound (existing behavior) —
+    # AAA never passes price_max 5, so it is restricted out of the loaded universe.
+    backtest_cfg["screener_opt"] = {
+        "store": store, "base_settings": {"price_max": 5.0}, "cadence_days": 7,
+    }
+    hoisted2 = H._build_hoisted_state(backtest_cfg)
+    assert hoisted2["screener_gate_only"] is False
+    cfg2 = H._build_daily_trial_config(backtest_cfg, decoded, hoisted2)
+    assert cfg2["enabled_instruments"] == []

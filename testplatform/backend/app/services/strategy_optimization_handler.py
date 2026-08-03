@@ -922,6 +922,10 @@ def _build_hoisted_state(backtest_cfg: Dict[str, Any]) -> Dict[str, Any]:
         hoisted["screener_apply_to_expert_settings"] = bool(
             screener_opt.get("apply_to_expert_settings")
         )
+        # GATE-ONLY mode (options grid max-stock-price): the store rides along PURELY as a
+        # per-bar entry gate — _build_daily_trial_config skips its candidate-bound universe
+        # restriction so the static run universe is kept byte-identical.
+        hoisted["screener_gate_only"] = bool(screener_opt.get("gate_only"))
     return hoisted
 
 
@@ -1080,7 +1084,7 @@ def _build_daily_trial_config(
         # whole band (e.g. 814 -> ~150 symbols), the dominant screener-opt memory + CPU cost. Matches
         # the standalone path's _resolve_enabled_instruments. Bypass experts keep the full band (they
         # rank the whole universe). Exact per-trial bound — no gene-tightening assumption.
-        if not bypass:
+        if not bypass and not hoisted.get("screener_gate_only"):
             try:
                 _df = _ms.load_store(hoisted["screener_store"])
                 _sd = str(backtest_cfg["start_date"])[:10]
