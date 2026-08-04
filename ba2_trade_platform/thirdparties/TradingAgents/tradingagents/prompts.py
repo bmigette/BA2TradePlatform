@@ -412,6 +412,13 @@ def format_analyst_prompt(system_prompt: str, tool_names: list, current_date: st
             context_info=context_info,
             timeframe=timeframe
         )
+        # Hybrid analysts (e.g. fundamentals) pre-fetch the DATA but still have
+        # compute tools bound — name them so the model knows they exist.
+        if tool_names:
+            formatted_system += (
+                f"\n\nYou also have access to exact compute tools: {', '.join(tool_names)}. "
+                "Use them for any valuation or arithmetic instead of computing in your head."
+            )
     else:
         formatted_system = ANALYST_COLLABORATION_SYSTEM_PROMPT.format(
             tool_names=", ".join(tool_names),

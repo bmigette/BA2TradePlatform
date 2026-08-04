@@ -83,5 +83,6 @@ class CalcRequest(BaseModel):
 def render_calc(req: CalcRequest) -> str:
     """Exact-arithmetic renderer — the string an agent sees."""
     result = safe_eval(req.expression)
-    shown = f"{result:.6g}"  # tidy float display without lying about precision
+    # Two-decimal display with trailing zeros stripped: 3 -> "3", 184.61538 -> "184.62".
+    shown = f"{result:.2f}".rstrip("0").rstrip(".")
     return f"`{req.expression}` = **{shown}**"

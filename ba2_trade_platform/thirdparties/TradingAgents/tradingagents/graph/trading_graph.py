@@ -589,12 +589,180 @@ class TradingAgentsGraph(DatabaseStorageMixin):
         ) -> str:
             """Get Federal Reserve calendar and meetings."""
             return self.toolkit.get_fed_calendar(end_date, lookback_days)
-        
+
+        # ------------------------------------------------------------------
+        # Compute tools (pure-math, no provider calls) — vendored finance_calc
+        # suite. Validation errors are returned as "Error: ..." strings so the
+        # agent can fix its arguments instead of crashing the tool node.
+        # ------------------------------------------------------------------
+        from pydantic import ValidationError
+        from ba2_common.core.finance_calc.valuation import (
+            DCFRequest, render_dcf, DCFSensitivityRequest, render_sensitivity,
+            CostOfCapitalRequest, render_wacc,
+        )
+        from ba2_common.core.finance_calc.fixed_income import BondRequest, render_bond
+        from ba2_common.core.finance_calc.derivatives import BlackScholesRequest, render_black_scholes
+        from ba2_common.core.finance_calc.arithmetic import CalcRequest, render_calc
+
+        @tool
+        def compute_valuation_dcf(
+            fcf_schedule: List[float],
+            discount_rate: float,
+            terminal_method: str = "gordon_growth",
+            terminal_growth_rate: Optional[float] = None,
+            terminal_ebitda: Optional[float] = None,
+            terminal_ebitda_multiple: Optional[float] = None,
+            net_debt: float = 0.0,
+            shares_outstanding: Optional[float] = None,
+        ) -> str:
+            """Discounted-cash-flow valuation — exact math, YOUR assumptions. Takes an
+            explicit-period FCF schedule (year 1→N, USD, e.g. [1200, 1320, 1450]), a
+            discount_rate (decimal, e.g. 0.10 — WACC for FCFF, cost of equity for FCFE),
+            a terminal_method ('gordon_growth' needs terminal_growth_rate < discount_rate;
+            'exit_multiple' needs terminal_ebitda + terminal_ebitda_multiple), optional
+            net_debt and shares_outstanding. Returns enterprise value, equity value,
+            intrinsic value per share, and the PV breakdown. State every assumption you
+            used in your report."""
+            try:
+                req = DCFRequest(
+                    fcf_schedule=fcf_schedule, discount_rate=discount_rate,
+                    terminal_method=terminal_method,
+                    terminal_growth_rate=terminal_growth_rate,
+                    terminal_ebitda=terminal_ebitda,
+                    terminal_ebitda_multiple=terminal_ebitda_multiple,
+                    net_debt=net_debt, shares_outstanding=shares_outstanding,
+                )
+                return render_dcf(req)
+            except (ValidationError, ValueError) as e:
+                return f"Error: {e}"
+
+        @tool
+        def compute_valuation_wacc(
+            risk_free_rate: float,
+            equity_risk_premium: float,
+            beta: float,
+            cost_of_debt: Optional[float] = None,
+            tax_rate: Optional[float] = None,
+            debt_to_equity: Optional[float] = None,
+        ) -> str:
+            """Cost of capital via CAPM + optional WACC blend — the discount rate for a
+            DCF. Always: risk_free_rate, equity_risk_premium, beta (CAPM cost of equity);
+            optionally cost_of_debt, tax_rate, debt_to_equity (all-or-none) for a WACC
+            blend with after-tax cost of debt. Returns cost_of_equity and wacc plus the
+            premium over the risk-free rate; pass all rates as decimals (0.045 not 4.5)."""
+            try:
+                req = CostOfCapitalRequest(
+                    risk_free_rate=risk_free_rate,
+                    equity_risk_premium=equity_risk_premium,
+                    beta=beta,
+                    cost_of_debt=cost_of_debt,
+                    tax_rate=tax_rate,
+                    debt_to_equity=debt_to_equity,
+                )
+                return render_wacc(req)
+            except (ValidationError, ValueError) as e:
+                return f"Error: {e}"
+
+        @tool
+        def compute_valuation_dcf_sensitivity(
+            fcf_schedule: List[float],
+            discount_rates: List[float],
+            terminal_method: str = "gordon_growth",
+            terminal_growth_rates: Optional[List[float]] = None,
+            terminal_ebitda: Optional[float] = None,
+            terminal_ebitda_multiples: Optional[List[float]] = None,
+            net_debt: float = 0.0,
+            shares_outstanding: Optional[float] = None,
+        ) -> str:
+            """DCF sensitivity grid: values the company across a range of discount rates
+            (rows) and a terminal driver (columns) — terminal_growth_rates for
+            gordon_growth, or terminal_ebitda_multiples for exit_multiple. Takes the same
+            FCF schedule / net_debt / shares_outstanding as the DCF tool plus the two
+            axes, and returns the value matrix with the bear/base/bull range. Use it to
+            show how the valuation depends on the discount rate and terminal assumptions."""
+            try:
+                req = DCFSensitivityRequest(
+                    fcf_schedule=fcf_schedule, discount_rates=discount_rates,
+                    terminal_method=terminal_method,
+                    terminal_growth_rates=terminal_growth_rates,
+                    terminal_ebitda=terminal_ebitda,
+                    terminal_ebitda_multiples=terminal_ebitda_multiples,
+                    net_debt=net_debt, shares_outstanding=shares_outstanding,
+                )
+                return render_sensitivity(req)
+            except (ValidationError, ValueError) as e:
+                return f"Error: {e}"
+
+        @tool
+        def compute_fixed_income_bond(
+            coupon_rate: float,
+            years_to_maturity: float,
+            frequency: int = 2,
+            face: float = 100.0,
+            ytm: Optional[float] = None,
+            price: Optional[float] = None,
+        ) -> str:
+            """Fixed-rate bond analytics. Give coupon_rate (annual decimal, e.g. 0.04),
+            years_to_maturity, frequency (coupons/yr, default 2), face (default 100),
+            and EITHER ytm OR price (per face). Returns clean price, YTM, current yield,
+            Macaulay & modified duration, convexity, DV01, and the ±100bp price change.
+            Option-free fixed-rate bonds only."""
+            try:
+                req = BondRequest(
+                    coupon_rate=coupon_rate,
+                    years_to_maturity=years_to_maturity,
+                    frequency=frequency,
+                    face=face,
+                    ytm=ytm,
+                    price=price,
+                )
+                return render_bond(req)
+            except (ValidationError, ValueError) as e:
+                return f"Error: {e}"
+
+        @tool
+        def compute_derivatives_black_scholes(
+            spot: float,
+            strike: float,
+            years: float,
+            rate: float,
+            vol: float,
+            option_type: str = "call",
+            dividend_yield: float = 0.0,
+        ) -> str:
+            """Black-Scholes-Merton price and Greeks for a European option. Give spot,
+            strike, years to expiry, the continuously-compounded risk-free rate, and
+            volatility (both decimals p.a.); option_type call|put, dividend_yield
+            default 0. Returns price, delta, gamma, vega (per vol point), theta (per
+            day), rho (per 1% rate), and the risk-neutral in-the-money probability.
+            European exercise only."""
+            try:
+                req = BlackScholesRequest(
+                    spot=spot, strike=strike, years=years, rate=rate, vol=vol,
+                    option_type=option_type, dividend_yield=dividend_yield,
+                )
+                return render_black_scholes(req)
+            except (ValidationError, ValueError) as e:
+                return f"Error: {e}"
+
+        @tool
+        def compute_arithmetic(expression: str) -> str:
+            """Evaluate an arithmetic expression EXACTLY — use for every growth rate,
+            ratio, percentage and sum instead of mental math, e.g. '(37-13)/13*100'.
+            Supports + - * / ** % //, parentheses, abs/round/min/max/sqrt/log/exp."""
+            try:
+                req = CalcRequest(expression=expression)
+                return render_calc(req)
+            except (ValidationError, ValueError) as e:
+                return f"Error: {e}"
+
         return {
             "market": LoggingToolNode(
                 [
                     get_ohlcv_data,
                     get_indicator_data,
+                    compute_derivatives_black_scholes,
+                    compute_arithmetic,
                 ],
                 self.market_analysis_id,
                 model_info=model_info
@@ -622,6 +790,11 @@ class TradingAgentsGraph(DatabaseStorageMixin):
                     get_insider_transactions,
                     get_insider_sentiment,
                     get_earnings_estimates,
+                    compute_valuation_wacc,
+                    compute_valuation_dcf,
+                    compute_valuation_dcf_sensitivity,
+                    compute_fixed_income_bond,
+                    compute_arithmetic,
                 ],
                 self.market_analysis_id,
                 model_info=model_info

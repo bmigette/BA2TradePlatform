@@ -8,9 +8,11 @@ from ba2_trade_platform.core.prompt_caching import apply_anthropic_prompt_cachin
 def create_fundamentals_analyst(llm, toolkit, tools, parallel_tool_calls=False):
     """Create the fundamentals analyst node.
 
-    Pre-fetch (non-agentic): all fundamental data is gathered up-front via the
-    toolkit and injected into the prompt, then the LLM produces the report in a
-    single turn. ``tools`` is accepted for signature compatibility but unused.
+    HYBRID: all fundamental data is pre-fetched and injected (deterministic, one
+    round-trip of data gathering), and the COMPUTE tools (valuation, bond,
+    arithmetic) are bound so the LLM can run exact math with its own assumptions
+    instead of computing in its head. Report-only turns end the loop (no tool
+    calls); tool calls route through tools_fundamentals and back.
     """
     def fundamentals_analyst_node(state):
         current_date = state["trade_date"]
@@ -19,25 +21,39 @@ def create_fundamentals_analyst(llm, toolkit, tools, parallel_tool_calls=False):
         system_message = get_prompt("fundamentals_analyst")
         prompt_config = format_analyst_prompt(
             system_prompt=system_message,
-            tool_names=[],
+            tool_names=[tool.name for tool in tools],
             current_date=current_date,
             ticker=ticker,
             prefetch=True,
         )
 
+        # Google models don't support parallel_tool_calls parameter.
+        # Bind + invoke directly (messages are built explicitly below) rather
+        # than piping through a ChatPromptTemplate.
+        is_google = "google" in type(llm).__module__.lower()
+        if is_google:
+            bound_llm = llm.bind_tools(tools)
+        else:
+            bound_llm = llm.bind_tools(tools, parallel_tool_calls=parallel_tool_calls)
+
         context = gather_fundamentals_context(toolkit, ticker, current_date)
         human = (
             f"Below is the comprehensive fundamental data gathered for {ticker} as of "
-            f"{current_date}. Analyze it and produce your fundamentals report.\n\n{context}"
+            f"{current_date}. Analyze it and produce your fundamentals report. The "
+            f"valuation snapshot uses DEFAULT assumptions — if your view differs, re-run "
+            f"the valuation tools with your own explicit assumptions instead of "
+            f"computing in your head.\n\n{context}"
         )
 
         messages = apply_anthropic_prompt_caching([
             SystemMessage(content=prompt_config["system"]),
             HumanMessage(content=human),
         ], llm)
-        result = llm.invoke(messages)
+        result = bound_llm.invoke(messages)
 
-        report = extract_text_from_llm_response(result.content)
+        report = ""
+        if len(result.tool_calls) == 0:
+            report = extract_text_from_llm_response(result.content)
 
         return {
             "messages": [result],
