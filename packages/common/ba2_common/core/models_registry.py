@@ -246,6 +246,43 @@ MODELS: Dict[str, Dict[str, Any]] = {
     },
 
     # =========================================================================
+    # GPT-5.6 Family (with reasoning effort parameter)
+    # =========================================================================
+    "gpt5.6_sol": {
+        "native_provider": PROVIDER_OPENAI,
+        "display_name": "GPT-5.6 Sol",
+        "description": "OpenAI's GPT-5.6 flagship for complex reasoning and coding (alias gpt-5.6)",
+        "provider_names": {
+            PROVIDER_OPENAI: "gpt-5.6-sol",
+        },
+        "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_WEBSEARCH, LABEL_VISION, LABEL_TOOL_CALLING],
+        "supports_parameters": ["reasoning_effort"],
+        "context_size": 1050000,
+    },
+    "gpt5.6_terra": {
+        "native_provider": PROVIDER_OPENAI,
+        "display_name": "GPT-5.6 Terra",
+        "description": "GPT-5.6 tier balancing intelligence and cost",
+        "provider_names": {
+            PROVIDER_OPENAI: "gpt-5.6-terra",
+        },
+        "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_WEBSEARCH, LABEL_VISION, LABEL_TOOL_CALLING],
+        "supports_parameters": ["reasoning_effort"],
+        "context_size": 1050000,
+    },
+    "gpt5.6_luna": {
+        "native_provider": PROVIDER_OPENAI,
+        "display_name": "GPT-5.6 Luna",
+        "description": "GPT-5.6 tier for cost-sensitive, high-volume workloads",
+        "provider_names": {
+            PROVIDER_OPENAI: "gpt-5.6-luna",
+        },
+        "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_THINKING, LABEL_WEBSEARCH, LABEL_VISION, LABEL_TOOL_CALLING],
+        "supports_parameters": ["reasoning_effort"],
+        "context_size": 1050000,
+    },
+
+    # =========================================================================
     # GPT-4o Family
     # =========================================================================
     "gpt4o": {
@@ -276,29 +313,6 @@ MODELS: Dict[str, Dict[str, Any]] = {
     # =========================================================================
     # O-Series (Reasoning Models)
     # =========================================================================
-    "o1": {
-        "native_provider": PROVIDER_OPENAI,
-        "display_name": "O1",
-        "description": "OpenAI's most capable reasoning model",
-        "provider_names": {
-            PROVIDER_OPENAI: "o1",
-            PROVIDER_OPENROUTER: "openai/o1",
-        },
-        "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_TOOL_CALLING],
-        "no_temperature": True,  # O-series models don't support temperature parameter
-        "context_size": 200000,
-    },
-    "o1_mini": {
-        "native_provider": PROVIDER_OPENROUTER,
-        "display_name": "O1 Mini",
-        "description": "Smaller, faster O1 variant (deprecated on OpenAI)",
-        "provider_names": {
-            PROVIDER_OPENROUTER: "openai/o1-mini",
-        },
-        "labels": [LABEL_LOW_COST, LABEL_THINKING, LABEL_FAST, LABEL_TOOL_CALLING],
-        "no_temperature": True,  # O-series models don't support temperature parameter
-        "context_size": 128000,
-    },
     "o3_mini": {
         "native_provider": PROVIDER_OPENAI,
         "display_name": "O3 Mini",
@@ -363,29 +377,15 @@ MODELS: Dict[str, Dict[str, Any]] = {
         "labels": [LABEL_THINKING, LABEL_FAST, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
         "context_size": 131072,
     },
-    "grok4.1_fast_reasoning": {
+    "grok4.5": {
         "native_provider": PROVIDER_XAI,
-        "display_name": "Grok-4.1 Fast Reasoning",
-        "description": "Latest Grok-4.1 with fast reasoning",
+        "display_name": "Grok-4.5",
+        "description": "xAI's Grok-4.5 flagship — agentic tool calling, configurable reasoning, 500k context",
         "provider_names": {
-            PROVIDER_XAI: "grok-4-1-fast-reasoning",
-            PROVIDER_NAGAAI: "grok-4-1-fast-reasoning",
-            PROVIDER_OPENROUTER: "x-ai/grok-4-1-fast-reasoning",
+            PROVIDER_XAI: "grok-4.5",
         },
-        "labels": [LABEL_THINKING, LABEL_FAST, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
-        "context_size": 131072,
-    },
-    "grok4.1_fast": {
-        "native_provider": PROVIDER_XAI,
-        "display_name": "Grok-4.1 Fast",
-        "description": "Latest Grok-4.1 fast model without reasoning",
-        "provider_names": {
-            PROVIDER_XAI: "grok-4-1-fast-non-reasoning",
-            PROVIDER_NAGAAI: "grok-4-1-fast-non-reasoning",
-            PROVIDER_OPENROUTER: "x-ai/grok-4-1-fast-non-reasoning",
-        },
-        "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
-        "context_size": 131072,
+        "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_CODING, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
+        "context_size": 500000,
     },
     "grok3": {
         "native_provider": PROVIDER_XAI,
@@ -452,135 +452,58 @@ MODELS: Dict[str, Dict[str, Any]] = {
     # =========================================================================
     # DeepSeek Family
     # =========================================================================
-    "deepseek_v3.2": {
+    "deepseek_v4_flash": {
         "native_provider": PROVIDER_DEEPSEEK,
-        "display_name": "DeepSeek V3.2",
-        "description": "DeepSeek's latest v3.2 model",
+        "display_name": "DeepSeek V4 Flash",
+        "description": "DeepSeek's V4 volume tier (thinking + non-thinking modes) — successor of deepseek-chat/deepseek-reasoner (retired 2026-07-24)",
         "provider_names": {
-            PROVIDER_DEEPSEEK: "deepseek-chat",
-            PROVIDER_NAGAAI: "deepseek-v3.2",
-            PROVIDER_OPENROUTER: "deepseek/deepseek-chat",
+            PROVIDER_DEEPSEEK: "deepseek-v4-flash",
         },
-        "labels": [LABEL_LOW_COST, LABEL_CODING, LABEL_TOOL_CALLING, LABEL_THINKING],
-        "context_size": 128000,
-        # Note: thinking parameter not supported by langchain-deepseek yet
+        "labels": [LABEL_LOW_COST, LABEL_CODING, LABEL_THINKING, LABEL_TOOL_CALLING],
+        "context_size": 1000000,
     },
-    "deepseek_chat": {
+    "deepseek_v4_pro": {
         "native_provider": PROVIDER_DEEPSEEK,
-        "display_name": "DeepSeek Chat",
-        "description": "DeepSeek chat model",
+        "display_name": "DeepSeek V4 Pro",
+        "description": "DeepSeek's V4 flagship with 1M context (thinking + non-thinking modes)",
         "provider_names": {
-            PROVIDER_DEEPSEEK: "deepseek-chat",
-            PROVIDER_NAGAAI: "deepseek-chat-v3.1",
-            PROVIDER_OPENROUTER: "deepseek/deepseek-chat",
+            PROVIDER_DEEPSEEK: "deepseek-v4-pro",
         },
-        "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_TOOL_CALLING, LABEL_THINKING],
-        "context_size": 128000,
-        # Note: thinking parameter not supported by langchain-deepseek yet
-    },
-    "deepseek_reasoner": {
-        "native_provider": PROVIDER_DEEPSEEK,
-        "display_name": "DeepSeek Reasoner",
-        "description": "DeepSeek's reasoning model (R1)",
-        "provider_names": {
-            PROVIDER_DEEPSEEK: "deepseek-reasoner",
-            PROVIDER_NAGAAI: "deepseek-reasoner-0528",
-            PROVIDER_OPENROUTER: "deepseek/deepseek-reasoner",
-        },
-        "labels": [LABEL_LOW_COST, LABEL_THINKING, LABEL_TOOL_CALLING],
-        "context_size": 128000,
-    },
-    "deepseek_coder": {
-        "native_provider": PROVIDER_DEEPSEEK,
-        "display_name": "DeepSeek Coder",
-        "description": "DeepSeek's code-specialized model",
-        "provider_names": {
-            PROVIDER_DEEPSEEK: "deepseek-coder",
-            PROVIDER_OPENROUTER: "deepseek/deepseek-coder",
-        },
-        "labels": [LABEL_LOW_COST, LABEL_CODING, LABEL_TOOL_CALLING],
-        "context_size": 128000,
+        "labels": [LABEL_CODING, LABEL_THINKING, LABEL_TOOL_CALLING],
+        "context_size": 1000000,
     },
 
     # =========================================================================
     # Kimi (Moonshot AI)
     # =========================================================================
-    "kimi_k2": {
+    "kimi_k3": {
         "native_provider": PROVIDER_MOONSHOT,
-        "display_name": "Kimi K2",
-        "description": "Moonshot AI's Kimi K2 flagship model",
+        "display_name": "Kimi K3",
+        "description": "Moonshot AI's Kimi K3 flagship (2.8T params, native vision, 1M context)",
         "provider_names": {
-            PROVIDER_MOONSHOT: "kimi-k2-0905-preview",
-            PROVIDER_NAGAAI: "kimi-k2",
-            PROVIDER_OPENROUTER: "moonshot/kimi-k2",
+            PROVIDER_MOONSHOT: "kimi-k3",
         },
-        "labels": [LABEL_LOW_COST, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
-        "context_size": 131072,
+        "labels": [LABEL_HIGH_COST, LABEL_THINKING, LABEL_VISION, LABEL_CODING, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
+        "context_size": 1048576,
     },
-    "kimi_k2_thinking": {
+    "kimi_k2.7_code": {
         "native_provider": PROVIDER_MOONSHOT,
-        "display_name": "Kimi K2 Thinking",
-        "description": "Moonshot AI's Kimi K2 with thinking capabilities",
+        "display_name": "Kimi K2.7 Code",
+        "description": "Moonshot AI's dedicated coding model (256K context)",
         "provider_names": {
-            PROVIDER_MOONSHOT: "kimi-k2-thinking",
-            PROVIDER_NAGAAI: "kimi-k2-thinking",
-            PROVIDER_OPENROUTER: "moonshot/kimi-k2-thinking",
+            PROVIDER_MOONSHOT: "kimi-k2.7-code",
         },
-        "labels": [LABEL_LOW_COST, LABEL_THINKING, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
-        "context_size": 131072,
-    },
-    "kimi_k2_thinking_turbo": {
-        "native_provider": PROVIDER_MOONSHOT,
-        "display_name": "Kimi K2 Thinking Turbo",
-        "description": "Moonshot AI's Kimi K2 Thinking Turbo - faster thinking model",
-        "provider_names": {
-            PROVIDER_MOONSHOT: "kimi-k2-thinking-turbo",
-            PROVIDER_NAGAAI: "kimi-k2-thinking-turbo",
-            PROVIDER_OPENROUTER: "moonshot/kimi-k2-thinking-turbo",
-        },
-        "labels": [LABEL_LOW_COST, LABEL_THINKING, LABEL_FAST, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
-        "context_size": 131072,
-    },
-    "kimi_k1.5": {
-        "native_provider": PROVIDER_MOONSHOT,
-        "display_name": "Kimi K1.5",
-        "description": "Moonshot AI's Kimi K1.5 model",
-        "provider_names": {
-            PROVIDER_MOONSHOT: "moonshot-v1-128k",
-            PROVIDER_OPENROUTER: "moonshot/moonshot-v1-128k",
-        },
-        "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_TOOL_CALLING],
-        "context_size": 131072,
-    },
-    "kimi_k2.5": {
-        "native_provider": PROVIDER_MOONSHOT,
-        "display_name": "Kimi K2.5",
-        "description": "Moonshot AI's Kimi K2.5 multimodal agentic model with 256K context (thinking enabled by default)",
-        "provider_names": {
-            PROVIDER_MOONSHOT: "kimi-k2.5",
-            PROVIDER_NAGAAI: "kimi-k2.5",
-            PROVIDER_OPENROUTER: "moonshotai/kimi-k2.5",
-        },
-        "labels": [LABEL_LOW_COST, LABEL_VISION, LABEL_CODING, LABEL_WEBSEARCH, LABEL_TOOL_CALLING, LABEL_THINKING],
-        "fixed_temperature": 1.0,  # Kimi K2.5 thinking mode requires temperature=1
-        "fixed_top_p": 0.95,  # Kimi K2.5 only accepts top_p=0.95
+        "labels": [LABEL_CODING, LABEL_TOOL_CALLING],
         "context_size": 262144,
     },
-    "kimi_k2.5-nonthinking": {
+    "kimi_k2.7_code_highspeed": {
         "native_provider": PROVIDER_MOONSHOT,
-        "display_name": "Kimi K2.5 (Instant)",
-        "description": "Moonshot AI's Kimi K2.5 in instant mode - faster responses without reasoning traces",
+        "display_name": "Kimi K2.7 Code Highspeed",
+        "description": "High-speed variant of Kimi K2.7 Code (~180 tok/s output, 256K context)",
         "provider_names": {
-            # Uses same API model name - the thinking parameter controls the mode
-            PROVIDER_MOONSHOT: "kimi-k2.5",
-            PROVIDER_NAGAAI: "kimi-k2.5",
-            PROVIDER_OPENROUTER: "moonshotai/kimi-k2.5",
+            PROVIDER_MOONSHOT: "kimi-k2.7-code-highspeed",
         },
-        "labels": [LABEL_LOW_COST, LABEL_FAST, LABEL_VISION, LABEL_CODING, LABEL_WEBSEARCH, LABEL_TOOL_CALLING],
-        "fixed_temperature": 0.6,  # Kimi K2.5 with thinking disabled requires temperature=0.6
-        "fixed_top_p": 0.95,  # Kimi K2.5 only accepts top_p=0.95
-        # Disable thinking mode for instant responses
-        "default_model_kwargs": {"thinking": {"type": "disabled"}},
+        "labels": [LABEL_CODING, LABEL_FAST, LABEL_TOOL_CALLING],
         "context_size": 262144,
     },
     "kimi_k2.6": {
@@ -1000,14 +923,14 @@ def get_model_default_kwargs(friendly_name: str) -> Optional[Dict[str, Any]]:
     User-provided model_kwargs will override these defaults.
     
     Args:
-        friendly_name: The friendly model name (e.g., "deepseek_v3.2")
+        friendly_name: The friendly model name (e.g., "kimi_k2.6-nonthinking")
         
     Returns:
         Dict of default model_kwargs or None if no defaults
         
     Example:
-        >>> get_model_default_kwargs("deepseek_v3.2")
-        {'max_tokens': 8192}
+        >>> get_model_default_kwargs("kimi_k2.6-nonthinking")
+        {'thinking': {'type': 'disabled'}}
     """
     model_info = MODELS.get(friendly_name)
     if not model_info:

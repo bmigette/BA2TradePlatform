@@ -112,6 +112,20 @@ def check_api_key(provider: str) -> Tuple[bool, str]:
     return bool(api_key), api_key_setting
 
 
+# Priority order for test models per provider (most reliable first)
+PREFERRED_ORDER = {
+    PROVIDER_OPENAI: ["gpt4o_mini", "gpt4o", "gpt5_mini", "gpt5", "gpt5.4_nano", "gpt5.4_mini", "gpt5.4", "gpt5.6_luna", "gpt5.6_terra", "gpt5.6_sol"],
+    PROVIDER_NAGAAI: ["gpt4o_mini", "grok3_mini", "gpt5_mini", "gpt5", "gpt5.4_nano", "gpt5.4_mini", "gpt5.4"],
+    PROVIDER_GOOGLE: ["gemini_2.0_flash", "gemini_2.5_flash", "gemini_3_flash"],
+    PROVIDER_ANTHROPIC: ["claude_3.5_haiku", "claude_3.5_sonnet", "claude_4_sonnet"],
+    PROVIDER_XAI: ["grok3_mini", "grok3", "grok4_fast", "grok4.5"],
+    PROVIDER_DEEPSEEK: ["deepseek_v4_flash", "deepseek_v4_pro"],
+    PROVIDER_MOONSHOT: ["kimi_k2.6", "kimi_k2.6-nonthinking", "kimi_k3"],
+    PROVIDER_OPENROUTER: ["gpt4o_mini", "claude_3.5_haiku", "grok3_mini"],
+    PROVIDER_BEDROCK: ["llama3_1_8b", "llama3_1_70b"],
+}
+
+
 def get_models_for_provider(provider: str) -> List[Tuple[str, str, Dict]]:
     """
     Get all models available for a specific provider.
@@ -119,19 +133,6 @@ def get_models_for_provider(provider: str) -> List[Tuple[str, str, Dict]]:
     Returns:
         List of (friendly_name, provider_model_name, model_info) tuples
     """
-    # Priority order for test models per provider (most reliable first)
-    preferred_order = {
-        PROVIDER_OPENAI: ["gpt4o_mini", "gpt4o", "gpt5_mini", "gpt5", "gpt5.4_nano", "gpt5.4_mini", "gpt5.4"],
-        PROVIDER_NAGAAI: ["gpt4o_mini", "grok3_mini", "gpt5_mini", "gpt5", "gpt5.4_nano", "gpt5.4_mini", "gpt5.4"],
-        PROVIDER_GOOGLE: ["gemini_2.0_flash", "gemini_2.5_flash", "gemini_3_flash"],
-        PROVIDER_ANTHROPIC: ["claude_3.5_haiku", "claude_3.5_sonnet", "claude_4_sonnet"],
-        PROVIDER_XAI: ["grok3_mini", "grok3", "grok4_fast"],
-        PROVIDER_DEEPSEEK: ["deepseek_chat", "deepseek_coder", "deepseek_reasoner"],
-        PROVIDER_MOONSHOT: ["kimi_k2.6", "kimi_k2.6-nonthinking", "kimi_k2.5", "kimi_k2", "kimi_k1.5"],
-        PROVIDER_OPENROUTER: ["gpt4o_mini", "claude_3.5_haiku", "grok3_mini"],
-        PROVIDER_BEDROCK: ["llama3_1_8b", "llama3_1_70b"],
-    }
-
     models = []
     for model_name, model_info in MODELS.items():
         provider_names = model_info.get("provider_names", {})
@@ -139,7 +140,7 @@ def get_models_for_provider(provider: str) -> List[Tuple[str, str, Dict]]:
             models.append((model_name, provider_names[provider], model_info))
 
     # Sort: preferred models first, then alphabetically
-    preferred = preferred_order.get(provider, [])
+    preferred = PREFERRED_ORDER.get(provider, [])
     def sort_key(item):
         model_name = item[0]
         if model_name in preferred:
