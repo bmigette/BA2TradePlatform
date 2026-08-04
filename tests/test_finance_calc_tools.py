@@ -35,7 +35,7 @@ def _get(nodes, role, name):
 def test_compute_arithmetic_tool():
     nodes = _tool_nodes()
     out = _get(nodes, "fundamentals", "compute_arithmetic").invoke({"expression": "(37-13)/13*100"})
-    assert "184.62" in out
+    assert "184.615" in out
 
 
 def test_compute_dcf_tool_and_validation_error():
