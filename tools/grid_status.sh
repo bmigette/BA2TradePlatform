@@ -65,7 +65,7 @@ rows = list(c.execute(
     "select id,name,status,round(coalesce(best_fitness,0),3) from strategy_optimizations "
     "where name like '%goal2020%' and name not like '%abandoned%' order by id"))
 done = sum(1 for r in rows if r[2] == 'completed')
-print(f"\nOPTS    {len(rows)} row(s), {done} completed   (48 jobs total: 24 risk_atr + 24 notional)")
+print(f"\nOPTS    {len(rows)} row(s), {done} completed   (45 jobs total: 24 risk_atr + 21 notional)")
 for r in rows[-12:]:
     print(f"  {r[0]:<5} {r[2]:<10} fit={r[3]:<9} {r[1]}")
 EOF

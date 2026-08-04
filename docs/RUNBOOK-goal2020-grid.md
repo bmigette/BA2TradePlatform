@@ -3,7 +3,8 @@
 Everything needed to start, watch, stop and resume the grid without help. Run every command from
 the repo root (`C:\Users\basti\Documents\dev\BA2TradePlatform`) in **Git Bash**.
 
-Last verified 2026-08-04 against app_version 2026.08.1014.
+Last verified 2026-08-04 against app_version 2026.08.1014. Job counts and the pace figure are
+measured, not estimated (`--dry-run` per band; job 1 of the live run).
 
 ---
 
@@ -32,12 +33,15 @@ the result the new source of truth. It exists because every optimization before 
 scored with `DaysOpened` / `DaysSinceLastClose*` **inert** — 129 of 153 completed runs were built
 on a strategy declaring at least one of them.
 
-**48 jobs, run strictly one at a time**, as two sizing matrices × three cap bands:
+**45 jobs, run strictly one at a time**, as two sizing matrices × three cap bands:
 
-| matrix | sizing_mode | bands | experts |
-|---|---|---|---|
-| 1 | `risk_atr` | large, mid, small | FMPRating, FMPEarningsDrift, FMPInsiderClusterBuy, FactorRanker |
-| 2 | `notional` | large, mid, small | same, **minus FactorRanker** |
+| matrix | sizing_mode | bands | experts | jobs |
+|---|---|---|---|---|
+| 1 | `risk_atr` | large, mid, small | FMPRating, FMPEarningsDrift, FMPInsiderClusterBuy, FactorRanker | 4 + 10 + 10 = **24** |
+| 2 | `notional` | large, mid, small | same, **minus FactorRanker** | 3 + 9 + 9 = **21** |
+
+The large band is small because FMPEarningsDrift and FMPInsiderClusterBuy are skipped there —
+FMP has no large-cap insider data and the earnings-drift edge is a small/mid phenomenon.
 
 Why the split, and why not a `sizing_mode` gene: under `notional` the five ATR genes face no
 selection pressure and drift randomly, so a crossover flipping the mode would judge it with
@@ -51,7 +55,15 @@ a stub shorter than 182.62 days into its neighbour, so a 30-June end silently pr
 18-month final bucket. This gives six clean buckets and leaves **2026-H1 as an untouched
 out-of-sample holdout** — note that nothing currently *scores* on it; that is still owed.
 
-**Expected duration** ≈ 2 days at 4 local + 6 remote slots. Roughly 2.5× that local-only.
+**Expected duration — measured, and longer than you may have been told.** Job 1
+(`FMPRating/S1/large`, the heaviest shape: FMPRating carries a population bonus and the large band
+has the most symbols) ran **31.8 min/generation × 8 = ~4.2 h** at 4 local + 6 remote. At that pace
+45 jobs is ~8 days; realistically **5-7 days**, since mid/small bands and the non-FMPRating
+experts are lighter. Local-only is ~2.5× that.
+
+An earlier "≈2 days" estimate in conversation was simply wrong — it is recorded here so the
+number in your head matches the one the box will actually deliver. Plan around days, not hours,
+and use `grid_status.sh` rather than waiting on it.
 
 ---
 
@@ -111,8 +123,23 @@ no quote data. A Corwin-Schultz high-low estimate was tried and rejected: it ret
 AAPL and 44 bps for SPY, whose true spreads are ~1 bp. Any winner is conditional on these numbers;
 the Monte Carlo spread sweep is what tells you whether an edge survives.
 
-Anything after the script name is passed through to the driver, e.g.
-`bash tools/grid_goal2020.sh --population 60`.
+Anything after the script name is passed through to the driver. The ones you are most likely to
+want:
+
+| passthrough | default | when |
+|---|---|---|
+| `--population N` | 40 (+bonus for FMPRating) | wider search; costs time linearly |
+| `--generations N` | 8 | ditto |
+| `--parallel N` | 4 | LOCAL trial slots. **Lower it, never raise it**, on a 64 GB box — ~2.5 GB per slot for light experts, and Senate-class trials are ~11-12 GB. |
+| `--bands a,b` | all three | re-run one band only |
+| `--strategies S1,S3` | S1,S2,S3 | re-run specific strategies |
+
+```bash
+bash tools/grid_goal2020.sh --population 60
+```
+
+Changing `--population` or `--generations` changes the checkpoint fingerprint, so any in-flight
+checkpoint is discarded and those jobs restart from generation 0. That is deliberate — see §6.
 
 ---
 
@@ -125,12 +152,12 @@ bash tools/grid_status.sh
 A healthy run looks like:
 
 ```
-RUN     script alive (1 bash, 2 driver)
+RUN     script alive (2 bash, 3 driver)      <- counts vary; only 'script alive' matters
 DIST    distributed evaluator (opt 251): 4 local + 6 remote slot(s) across 1 worker(s)
 SPREAD  (spread 3 bps round-trip)
 JOB     [1/4] RUN  scr-large-FMPRating-S1-goal2020-riskatr-from2022
 GEN     gen 3/8 ind 95/95
-OPTS    1 row(s), 0 completed   (48 jobs total)
+OPTS    1 row(s), 0 completed   (45 jobs total)
 ```
 
 ### What each line must show
@@ -140,7 +167,7 @@ OPTS    1 row(s), 0 completed   (48 jobs total)
 | `RUN` | `script alive` | `PARTIAL` = the wrapper died; it will **not** advance to the next band. Stop and relaunch. |
 | `DIST` | `4 local + 6 remote` | `!! LOCAL-ONLY` = the remote worker is not helping |
 | `GEN` | advances every ~20-50 min | frozen for hours = investigate |
-| `OPTS` | grows toward 48 completed | a `failed` row = read the log |
+| `OPTS` | grows toward 45 completed | a `failed` row = read the log |
 
 ### Signals worth grepping
 
@@ -157,6 +184,48 @@ Only worry if the recovery line never arrives.
 **Memory.** The `gen N/M ind i/j` lines carry `master RSS` and system availability. ~2.5 GB per
 local trial slot for LIGHT experts; on a 64 GB box, 4 local slots is the ceiling. Sustained
 availability under ~5 GB means back off `--parallel`.
+
+### If a command dies with "FMP API key not configured"
+
+The key lives in the **test-platform app-settings DB**, not the environment. `ba2-test` mirrors it
+into the env at startup; a script that bypasses the launcher does not. Point `ba2_common` at the
+test DB first, exactly as `ba2test_launcher._ensure_backend_on_path` does:
+
+```python
+from app.models.database import DATABASE_URL
+from ba2_common.core import db as ba2_db
+ba2_db.configure_db(DATABASE_URL.replace("sqlite:///", "", 1))
+import os
+from ba2_common.config import get_app_setting
+os.environ["FMP_API_KEY"] = get_app_setting("FMP_API_KEY")
+```
+
+### Is the remote worker even up?
+
+```bash
+# The password lives in the workers table -- never hardcode it in a script or doc.
+# NOTE the Windows-style path: Git Bash's $HOME is a POSIX path Windows Python cannot open.
+DB='C:\Users\basti\Documents\ba2\test\dl_forecasting.db'
+PW=$(.venv/Scripts/python.exe -c "import sqlite3,sys;print(sqlite3.connect(sys.argv[1]).execute(\"select password from workers where name='remote150'\").fetchone()[0])" "$DB")
+curl -s -m 10 -H "Authorization: Bearer $PW" http://192.168.1.150:8100/health
+```
+
+Healthy looks like `{"ok":true,"capacity":6,"version":{"app_version":"...","git_commit":"..."}}`.
+If `git_commit` is behind `origin/dev`, the worker will pull it at the next job's pre-flight —
+that is expected, not a fault.
+
+### A job ends up `failed`
+
+The driver moves on to the next job; a `failed` row is NOT retried automatically and will be
+re-attempted on the next launch (only `completed` is skipped). Read why first:
+
+```bash
+grep -B5 "strategy_optimization .* failed" grid_goal2020.log | tail -40
+```
+
+`0 successful trials — every backtest failed` almost always means a config problem affecting every
+trial (a missing cache, a bad window), not a bad genome. Fix the cause, then relaunch: that job
+starts fresh.
 
 ---
 
