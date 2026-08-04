@@ -29,12 +29,26 @@ class TestWashtradeLockCandidate:
                          status=OrderStatus.PENDING)
         assert acct._is_washtrade_lock_candidate(o) is True
 
-    def test_dependent_protective_order_is_not_candidate(self):
+    def test_dependent_protective_order_IS_candidate(self):
+        """Dependent legs are subject to the lock too (changed 2026-08-04).
+
+        They used to be exempt outright, on the theory that a protective leg is always an
+        accepted bracket. True against its own parent; false against an unrelated order — and
+        that gap silently killed 8 real SELL_STOPs on 2026-08-03 (they bypassed the lock, hit
+        the broker, got 40310000, and were marked ERROR = terminal, never retried).
+
+        BOTH leg shapes qualify — a dependent SELL_STOP (SL) and a dependent SELL_LIMIT (TP).
+        A LIMIT can be REJECTED by an opposing stop even though it never CAUSES a rejection
+        itself: verified against the live paper broker 2026-08-04, where a BUY LIMIT was refused
+        40310000 by a standing SELL_STOP. Only the BLOCKING side stays restricted (see
+        _WASHTRADE_BLOCKING_ORDER_TYPES).
+        """
         acct = _acct()
-        o = TradingOrder(account_id=acct.id, symbol="AAPL", quantity=1.0,
-                         side=OrderDirection.SELL, order_type=OrderType.SELL_LIMIT,
-                         status=OrderStatus.PENDING, depends_on_order=123)
-        assert acct._is_washtrade_lock_candidate(o) is False
+        for leg_type in (OrderType.SELL_STOP, OrderType.SELL_LIMIT):
+            leg = TradingOrder(account_id=acct.id, symbol="AAPL", quantity=1.0,
+                               side=OrderDirection.SELL, order_type=leg_type,
+                               status=OrderStatus.PENDING, depends_on_order=123)
+            assert acct._is_washtrade_lock_candidate(leg) is True, leg_type
 
 
 class TestFindOpposingWorkingOrder:
@@ -120,13 +134,12 @@ class TestSubmitOrderGate:
         result = AccountInterface.submit_order(acct, order, is_closing_order=True)
         assert result.status == OrderStatus.FILLED
 
-    def test_protective_leg_not_locked_despite_opposing(self):
+    def test_protective_leg_not_locked_by_its_OWN_parent(self):
+        """A leg's own parent is a genuine bracket pair — it must never lock its own leg,
+        or every TP/SL would deadlock behind the entry it protects."""
         acct = _acct()
-        create_trading_order(account_id=acct.id, symbol="AAPL",
-                             side=OrderDirection.BUY, status=OrderStatus.NEW)
-        # A protective SL leg depends on an entry order; must never be locked.
         entry = create_trading_order(account_id=acct.id, symbol="AAPL",
-                                     side=OrderDirection.BUY, status=OrderStatus.FILLED)
+                                     side=OrderDirection.BUY, status=OrderStatus.NEW)
         leg = TradingOrder(account_id=acct.id, symbol="AAPL", quantity=1.0,
                            side=OrderDirection.SELL, order_type=OrderType.SELL_STOP,
                            status=OrderStatus.PENDING, depends_on_order=entry.id,
@@ -134,6 +147,32 @@ class TestSubmitOrderGate:
                            stop_price=140.0, transaction_id=entry.transaction_id)
         result = AccountInterface.submit_order(acct, leg, is_closing_order=True)
         assert result.status != OrderStatus.WASHTRADE_LOCKED
+
+    def test_protective_leg_IS_locked_by_an_UNRELATED_opposing_order(self):
+        """REGRESSION (2026-08-03, order 587 / UBER tx 273).
+
+        Several experts hold the same ticker in separate transactions while the broker nets
+        them into ONE position, so a protective SELL_STOP routinely meets a DIFFERENT
+        transaction's working BUY. Alpaca rejects that with 40310000 and the leg was marked
+        ERROR — terminal — leaving 21 UBER shares with no stop at the broker at all.
+
+        It must be locked and retried instead. The wait is bounded: a working order blocks only
+        until it FILLS (the real blocker was a MARKET order), not until its position closes.
+        """
+        acct = _acct()
+        # its own parent - already filled, not a blocker
+        entry = create_trading_order(account_id=acct.id, symbol="AAPL",
+                                     side=OrderDirection.BUY, status=OrderStatus.FILLED)
+        # an UNRELATED expert's entry, still working on the same symbol
+        create_trading_order(account_id=acct.id, symbol="AAPL",
+                             side=OrderDirection.BUY, status=OrderStatus.NEW)
+        leg = TradingOrder(account_id=acct.id, symbol="AAPL", quantity=1.0,
+                           side=OrderDirection.SELL, order_type=OrderType.SELL_STOP,
+                           status=OrderStatus.PENDING, depends_on_order=entry.id,
+                           depends_order_status_trigger=OrderStatus.FILLED,
+                           stop_price=140.0, transaction_id=entry.transaction_id)
+        result = AccountInterface.submit_order(acct, leg, is_closing_order=True)
+        assert result.status == OrderStatus.WASHTRADE_LOCKED
 
 
 class _PromotingAccount(MockAccount):

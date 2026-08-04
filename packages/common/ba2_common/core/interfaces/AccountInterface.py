@@ -223,7 +223,12 @@ class AccountInterface(ReadOnlyAccountInterface):
         # The order stays in the DB as WASHTRADE_LOCKED and is re-submitted by
         # TradeManager once the symbol clears. Protective TP/SL legs are exempt.
         if self._is_washtrade_lock_candidate(trading_order):
-            blocker = self._find_opposing_working_order(symbol, side)
+            # A dependent leg's own parent is a genuine bracket pair the broker accepts, so it
+            # must not lock its own leg; any OTHER opposing order still does.
+            blocker = self._find_opposing_working_order(
+                symbol, side,
+                exclude_order_id=getattr(trading_order, 'depends_on_order', None),
+            )
             if blocker is not None:
                 trading_order.status = OrderStatus.WASHTRADE_LOCKED
                 update_instance(trading_order)
@@ -294,22 +299,40 @@ class AccountInterface(ReadOnlyAccountInterface):
     }
 
     def _is_washtrade_lock_candidate(self, trading_order: TradingOrder) -> bool:
-        """Only primary open/close orders are subject to the wash-trade lock.
+        """Primary open/close orders AND dependent protective legs are subject to the lock.
 
-        Dependent protective legs (TP/SL, OCO/bracket) carry ``depends_on_order``
-        and are exempt — they are inherently opposite-side and brokers accept them
-        as complex orders.
+        A dependent leg (TP/SL) used to be exempt outright, on the reasoning that it is
+        "inherently opposite-side and brokers accept it as a complex order". That holds only
+        against its OWN parent — Alpaca does accept that bracket pair. It does NOT hold when an
+        UNRELATED order is working on the same symbol, which happens constantly here because
+        several experts hold the same ticker in separate transactions while the broker nets them
+        into one position.
+
+        Measured 2026-08-03: 8 protective SELL_STOP legs were rejected 40310000
+        ("opposite side market/stop order exists") by a DIFFERENT transaction's BUY. Because the
+        exemption skipped the lock, they went straight to the broker and were marked ERROR —
+        terminal, never retried. Order 587 died that way and left tx 273 (UBER, 21 shares) with
+        NO stop at the broker at all. 7 of the 8 survived only by timing luck.
+
+        Locking them instead is safe: a working order blocks only until it FILLS (the blocking
+        BUY was a MARKET order, filled seconds later), not until its position closes — so the
+        retry in ``_check_all_washtrade_locked_orders`` clears it promptly rather than parking a
+        naked position indefinitely.
         """
-        if getattr(trading_order, 'depends_on_order', None) is not None:
-            return False
         return trading_order.order_type in self._PRIMARY_ORDER_TYPES
 
-    def _find_opposing_working_order(self, symbol: str, side: OrderDirection) -> Optional[TradingOrder]:
+    def _find_opposing_working_order(self, symbol: str, side: OrderDirection,
+                                     exclude_order_id: Optional[int] = None) -> Optional[TradingOrder]:
         """Return the first order on this account for ``symbol`` on the side opposite
         to ``side`` that is working at the broker (unfilled or partially filled).
 
         Orders that are not live at the broker — WASHTRADE_LOCKED, WAITING_TRIGGER,
         terminal — do not count, so two opposing locked orders cannot deadlock.
+
+        ``exclude_order_id`` skips one specific order: a dependent leg's OWN parent. That pair is
+        a genuine bracket, which the broker accepts as a complex order, so the parent must not
+        lock its own protective leg (that would deadlock every TP/SL behind an unfilled entry).
+        Any OTHER opposing order still blocks.
         """
         from sqlmodel import select
         working = OrderStatus.get_unfilled_statuses() | {OrderStatus.PARTIALLY_FILLED}
@@ -321,6 +344,8 @@ class AccountInterface(ReadOnlyAccountInterface):
                 TradingOrder.status.in_(working),
                 TradingOrder.order_type.in_(self._WASHTRADE_BLOCKING_ORDER_TYPES),
             )
+            if exclude_order_id is not None:
+                statement = statement.where(TradingOrder.id != exclude_order_id)
             return session.exec(statement).first()
 
     def _handle_transaction_requirements(self, trading_order: TradingOrder) -> None:

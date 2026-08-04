@@ -307,7 +307,13 @@ class TradeManager:
                     account = account_class(account_def.id)
                     account_cache[order.account_id] = account
 
-                blocker = account._find_opposing_working_order(order.symbol, order.side)
+                # Same parent exclusion as submit_order: a dependent leg's own parent is a
+                # genuine bracket pair, not a wash-trade blocker — without this a protective leg
+                # could sit locked behind the very entry it protects.
+                blocker = account._find_opposing_working_order(
+                    order.symbol, order.side,
+                    exclude_order_id=getattr(order, 'depends_on_order', None),
+                )
                 if blocker is not None:
                     self.logger.debug(
                         f"Order {order_id} ({order.symbol} {order.side.value}) still locked: "
