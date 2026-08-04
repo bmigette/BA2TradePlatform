@@ -54,3 +54,18 @@ def test_internal_toolkit_dict_results_are_unwrapped():
     }
     ctx = gather_market_context(tk, "AAA", "2026-01-15")
     assert "# Risk statistics — AAA" in ctx
+
+
+def test_error_strings_never_become_sections():
+    """Toolkit 'Error: No ... providers configured' strings (unset vendor
+    settings) are not data — they must not leak into the LLM context."""
+    from ba2_trade_platform.thirdparties.TradingAgents.tradingagents.agents.utils.prefetch_context import (
+        gather_fundamentals_context, gather_market_context)
+    tk = _toolkit()
+    tk.get_risk_stats.return_value = "Error: No risk-stats providers configured"
+    tk.get_valuation_snapshot.return_value = "Error: No valuation providers configured"
+    assert gather_market_context(tk, "AAA", "2026-01-15") == ""
+    ctx = gather_fundamentals_context(tk, "AAA", "2026-01-15")
+    assert "Error:" not in ctx
+    assert "Valuation Snapshot" not in ctx
+    assert "stub get_company_profile" in ctx   # other sections survive

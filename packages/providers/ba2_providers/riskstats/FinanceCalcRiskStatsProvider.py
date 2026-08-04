@@ -9,8 +9,6 @@ beta/correlation — all on DAILY bars over the lookback window ending at end_da
 from datetime import datetime, timedelta
 from typing import Any, Dict, Literal
 
-import pandas as pd
-
 from ba2_common.core.interfaces.RiskStatsInterface import RiskStatsInterface
 from ba2_common.core.finance_calc.risk import (
     pct_returns, compute_beta, compute_correlation, compute_var,
@@ -38,7 +36,8 @@ class FinanceCalcRiskStatsProvider(RiskStatsInterface):
 
     def _closes(self, symbol: str, start: datetime, end: datetime) -> list[float]:
         df = self._ohlcv.get_ohlcv_data(symbol, start_date=start, end_date=end, interval="1d")
-        return [float(c) for c in df["close"].tolist()]
+        # OHLCV contract: CAPITALIZED columns (Date, Open, High, Low, Close, Volume).
+        return [float(c) for c in df["Close"].tolist()]
 
     def _compute(self, symbol: str, end_date: datetime, lookback_days: int) -> Dict[str, Any]:
         start = end_date - timedelta(days=lookback_days)
@@ -49,6 +48,10 @@ class FinanceCalcRiskStatsProvider(RiskStatsInterface):
                     "reason": f"need >=5 daily closes, got {len(closes)}"}
         rets = pct_returns(closes)
         bench_rets = pct_returns(bench)
+        # performance() pairs returns/benchmark with zip(strict=True): unequal lengths
+        # raise (IPOs, halt days). Align to the most-recent common window; if the
+        # benchmark history is shorter, skip the benchmark block instead of raising.
+        bench_aligned = bench_rets[-len(rets):] if len(bench_rets) >= len(rets) else None
         return {
             "symbol": symbol,
             "computable": True,
@@ -61,7 +64,7 @@ class FinanceCalcRiskStatsProvider(RiskStatsInterface):
             "correlation": compute_correlation({"asset": closes, "benchmark": bench})
                            if len(bench) >= 3 else None,
             "performance": performance(rets, periods_per_year=_PERIODS_PER_YEAR,
-                                       benchmark=bench_rets or None),
+                                       benchmark=bench_aligned),
         }
 
     def get_risk_stats(self, symbol, end_date, lookback_days: int = 365,

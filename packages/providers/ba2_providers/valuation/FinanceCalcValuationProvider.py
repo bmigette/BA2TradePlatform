@@ -8,7 +8,7 @@ Missing fundamentals -> "not computable: <reason>", never a fabricated number.
 """
 
 from datetime import datetime
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Dict, Literal
 
 from ba2_common.core.interfaces.ValuationSnapshotInterface import ValuationSnapshotInterface
 from ba2_common.core.finance_calc.valuation import (
@@ -77,6 +77,7 @@ class FinanceCalcValuationProvider(ValuationSnapshotInterface):
         bs = self._details.get_balance_sheet(symbol, "annual", as_of,
                                              lookback_periods=1, format_type="dict")
         net_debt = 0.0
+        net_debt_assumed_zero = False
         if bs.get("statements"):
             b0 = bs["statements"][0]
             debt = sum(x for x in (b0.get("short_term_debt"), b0.get("long_term_debt"))
@@ -86,6 +87,8 @@ class FinanceCalcValuationProvider(ValuationSnapshotInterface):
                 net_debt = debt - cash
             elif _real(debt):
                 net_debt = debt
+        else:
+            net_debt_assumed_zero = True
         # missing balance-sheet detail is NOT fatal: net_debt defaults to 0 and the
         # report says so explicitly.
 
@@ -94,6 +97,11 @@ class FinanceCalcValuationProvider(ValuationSnapshotInterface):
                     "reason": "missing " + ", ".join(missing)}
 
         base_fcf = fcfs[0]
+        if base_fcf <= 0:
+            # A Gordon-growth DCF projected from a cash-burning base is
+            # meaningless — say so, never fabricate a negative "intrinsic value".
+            return {"symbol": symbol, "computable": False,
+                    "reason": "negative free cash flow"}
         oldest = fcfs[-1]
         n_years = len(fcfs) - 1
         fcf_cagr = (base_fcf / oldest) ** (1 / n_years) - 1 if oldest > 0 else 0.0
@@ -130,6 +138,7 @@ class FinanceCalcValuationProvider(ValuationSnapshotInterface):
                 "projection_years": self.projection_years,
                 "fcf_growth_source": f"historical FCF CAGR over {n_years}y",
                 "net_debt": net_debt,
+                "net_debt_assumed_zero": net_debt_assumed_zero,
             },
             "fcf_cagr": fcf_cagr,
             "fcf_schedule": schedule,
@@ -166,7 +175,9 @@ class FinanceCalcValuationProvider(ValuationSnapshotInterface):
             f"-> discount rate (CAPM cost of equity) **{pct(data['wacc'])}**",
             f"- FCF growth: {a['fcf_growth_source']} = {pct(data['fcf_cagr'])} · "
             f"terminal growth {pct(a['terminal_growth_rate'])} · "
-            f"{a['projection_years']}y explicit · net debt {money(a['net_debt'])}",
+            f"{a['projection_years']}y explicit · net debt {money(a['net_debt'])}"
+            + (" (net debt assumed 0 — balance sheet detail unavailable)"
+               if a.get("net_debt_assumed_zero") else ""),
             "",
             "## Default DCF (Gordon growth)",
             f"- Enterprise value {money(data['dcf']['enterprise_value'])} · equity value "

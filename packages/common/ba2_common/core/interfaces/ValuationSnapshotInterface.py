@@ -8,7 +8,7 @@ the standard format_type contract (markdown / dict / both).
 """
 
 from abc import abstractmethod
-from typing import Annotated, Any, Dict, Literal, Optional
+from typing import Annotated, Any, Dict, Literal
 from datetime import datetime
 
 from ba2_common.core.interfaces.DataProviderInterface import DataProviderInterface

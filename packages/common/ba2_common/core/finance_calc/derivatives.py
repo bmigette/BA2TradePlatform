@@ -1,7 +1,7 @@
 """
 Vendored from FinanceHarness (https://github.com/Yijia-Xiao/FinanceHarness),
 Apache-2.0 license. Modified for BA2TradePlatform: ToolSpec/ToolResponse layer
-removed, ToolError replaced with ValueError, imports localized.
+removed, imports localized.
 
 compute.derivatives.black_scholes — European option price + Greeks (BSM).
 

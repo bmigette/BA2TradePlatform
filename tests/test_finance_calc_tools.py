@@ -106,3 +106,93 @@ def test_fundamentals_hybrid_defers_report_on_tool_calls():
         out = node(_node_state())
     assert out["fundamentals_report"] == ""            # graph routes to tools_fundamentals
     assert out["messages"]                             # the AIMessage goes back into state
+
+
+class _RecordingLLM:
+    """Fake LLM that captures the exact message payload of every invoke."""
+
+    def __init__(self, tool_calls=None):
+        self._tool_calls = tool_calls or []
+        self.invocations = []
+
+    def bind_tools(self, tools, **kwargs):
+        return self
+
+    def invoke(self, messages):
+        from langchain_core.messages import AIMessage
+        self.invocations.append(list(messages))
+        return AIMessage(content="fundamentals report text", tool_calls=self._tool_calls)
+
+
+def test_fundamentals_hybrid_reentry_sees_tool_messages_and_skips_regather():
+    """Two-turn ReAct flow: after tools_fundamentals runs, the node is re-entered
+    with an AIMessage(tool_calls) + ToolMessage in state. The re-entry must (a)
+    pass those messages to llm.invoke (otherwise the LLM never sees the tool
+    results and loops until the recursion limit) and (b) NOT re-gather the
+    fundamentals context (no duplicate provider calls)."""
+    from unittest.mock import MagicMock, patch
+    from langchain_core.messages import AIMessage, ToolMessage
+    from ba2_trade_platform.thirdparties.TradingAgents.tradingagents.agents.analysts.fundamentals_analyst import (
+        create_fundamentals_analyst)
+
+    llm = _RecordingLLM()
+    node = create_fundamentals_analyst(llm, MagicMock(), [])
+    gather = MagicMock(return_value="stub context")
+    with patch("ba2_trade_platform.thirdparties.TradingAgents.tradingagents.agents.analysts.fundamentals_analyst.gather_fundamentals_context",
+               gather):
+        # Turn 1: first entry — gathers context, LLM requests a tool call.
+        out1 = node(_node_state())
+        # The AIMessage the first turn put into state (with its tool call) ...
+        ai_msg = AIMessage(
+            content="",
+            tool_calls=[{"name": "compute_valuation_dcf", "args": {}, "id": "1"}])
+        # ... plus the ToolMessage tools_fundamentals appended.
+        tool_msg = ToolMessage(content="Intrinsic value/share: $13.32",
+                               tool_call_id="1")
+        state2 = {**_node_state(),
+                  "messages": [ai_msg, tool_msg],
+                  "fundamentals_input": out1["fundamentals_input"]}
+        # Turn 2: re-entry.
+        out2 = node(state2)
+
+    assert gather.call_count == 1                      # no re-gather on re-entry
+    assert len(llm.invocations) == 2
+    second_payload = llm.invocations[1]
+    assert any(getattr(m, "type", None) == "tool" for m in second_payload), \
+        "re-entry payload must include the ToolMessage"
+    assert ai_msg in second_payload, \
+        "re-entry payload must include the AIMessage with the tool calls"
+    assert out2["fundamentals_report"] == "fundamentals report text"
+
+
+def test_fundamentals_hybrid_reentry_without_marker_regathers():
+    """Legacy/foreign state without the snapshot marker: fall back to
+    re-gathering the context rather than crashing."""
+    from unittest.mock import MagicMock, patch
+    from langchain_core.messages import AIMessage, ToolMessage
+    from ba2_trade_platform.thirdparties.TradingAgents.tradingagents.agents.analysts.fundamentals_analyst import (
+        create_fundamentals_analyst)
+
+    llm = _RecordingLLM()
+    node = create_fundamentals_analyst(llm, MagicMock(), [])
+    gather = MagicMock(return_value="stub context")
+    ai_msg = AIMessage(content="",
+                       tool_calls=[{"name": "compute_arithmetic", "args": {}, "id": "1"}])
+    tool_msg = ToolMessage(content="42", tool_call_id="1")
+    state = {**_node_state(), "messages": [ai_msg, tool_msg],
+             "fundamentals_input": "no marker here"}
+    with patch("ba2_trade_platform.thirdparties.TradingAgents.tradingagents.agents.analysts.fundamentals_analyst.gather_fundamentals_context",
+               gather):
+        node(state)
+    assert gather.call_count == 1
+    assert any(getattr(m, "type", None) == "tool" for m in llm.invocations[0])
+
+
+def test_compute_arithmetic_error_paths_return_error_string():
+    """ZeroDivisionError / SyntaxError / OverflowError must surface as 'Error:'
+    strings, never escape the tool node."""
+    nodes = _tool_nodes()
+    arith = _get(nodes, "fundamentals", "compute_arithmetic")
+    for bad in ("1/0", "(((", "10**1000 * 1.0"):
+        out = arith.invoke({"expression": bad})
+        assert out.startswith("Error:"), f"{bad!r} -> {out!r}"

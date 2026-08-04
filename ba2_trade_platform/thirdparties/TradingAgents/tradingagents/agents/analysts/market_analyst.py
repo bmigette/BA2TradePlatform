@@ -13,7 +13,8 @@ def create_market_analyst(llm, toolkit, tools, parallel_tool_calls=False):
     
     Args:
         llm: Language model for the analyst
-        toolkit: Toolkit instance (kept for backward compatibility, not used)
+        toolkit: Toolkit instance — used to pre-compute the deterministic
+            risk-statistics block via gather_market_context(toolkit, ...)
         tools: List of pre-defined tool objects to use
         parallel_tool_calls: Whether to enable parallel tool calls (default False)
     """
@@ -49,14 +50,19 @@ def create_market_analyst(llm, toolkit, tools, parallel_tool_calls=False):
 
         # Deterministic risk-stats block (injected, no tool call needed): exact
         # realized vol / drawdown / VaR / beta figures for the analyst to read.
-        risk_context = gather_market_context(toolkit, ticker, current_date)
+        # First entry only — on ReAct re-entries (tool results in state) the
+        # block is already in the history; prepending again would accumulate
+        # duplicate blocks.
         messages = list(state["messages"])
-        if risk_context:
-            messages = [HumanMessage(
-                content=f"Pre-computed risk statistics for {ticker} as of {current_date} "
-                        f"(deterministic, provider-computed — cite these exact figures, "
-                        f"do not recompute them):\n\n{risk_context}"
-            )] + messages
+        reentry = any(getattr(m, "type", None) == "tool" for m in messages)
+        if not reentry:
+            risk_context = gather_market_context(toolkit, ticker, current_date)
+            if risk_context:
+                messages = [HumanMessage(
+                    content=f"Pre-computed risk statistics for {ticker} as of {current_date} "
+                            f"(deterministic, provider-computed — cite these exact figures, "
+                            f"do not recompute them):\n\n{risk_context}"
+                )] + messages
 
         result = chain.invoke(messages)
 

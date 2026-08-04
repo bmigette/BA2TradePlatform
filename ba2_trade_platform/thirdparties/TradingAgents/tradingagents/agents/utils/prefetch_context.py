@@ -22,7 +22,13 @@ def _section(parts, title, fn):
         if isinstance(result, dict) and result.get("_internal"):
             result = result.get("text_for_agent", "")
         if result and isinstance(result, str) and result.strip():
-            parts.append(f"# {title}\n\n{result.strip()}")
+            text = result.strip()
+            if text.startswith("Error:"):
+                # Toolkit "no provider configured" / failure strings are not
+                # data — never leak them into the LLM context as a section.
+                logger.warning(f"prefetch: section '{title}' returned an error string: {text}")
+                return
+            parts.append(f"# {title}\n\n{text}")
     except Exception as e:
         logger.warning(f"prefetch: section '{title}' failed: {e}")
 

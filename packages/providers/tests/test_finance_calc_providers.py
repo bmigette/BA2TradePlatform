@@ -5,8 +5,17 @@ import pytest
 
 
 def _ohlcv_df(closes, start="2024-01-01"):
+    """Stub frame using the REAL OHLCV contract: capitalized columns
+    (Date, Open, High, Low, Close, Volume) — see MarketDataProviderInterface."""
     idx = pd.date_range(start, periods=len(closes), freq="B")
-    return pd.DataFrame({"close": closes}, index=idx)
+    return pd.DataFrame({
+        "Date": idx,
+        "Open": closes,
+        "High": closes,
+        "Low": closes,
+        "Close": closes,
+        "Volume": [1000] * len(closes),
+    })
 
 
 class _StubOHLCV:
@@ -81,6 +90,24 @@ def test_risk_stats_point_in_time():
         assert pd.Timestamp(end) <= pd.Timestamp(AS_OF)
 
 
+def test_risk_stats_benchmark_misalignment_does_not_raise():
+    """IPO/halt-day case: asset history shorter than the benchmark's. The
+    benchmark block must be aligned (or skipped), never a ValueError from
+    zip(strict=True) inside performance()."""
+    from ba2_providers.riskstats import FinanceCalcRiskStatsProvider
+    ohlcv = _StubOHLCV({
+        "AAA": [100 + i * 0.1 for i in range(30)],
+        "SPY": [400 + i * 0.05 for i in range(60)],
+    })
+    p = FinanceCalcRiskStatsProvider(ohlcv, benchmark_symbol="SPY")
+    d = p.get_risk_stats("AAA", AS_OF, lookback_days=90, format_type="dict")
+    assert d["computable"] is True
+    assert d["performance"]["n_obs"] == 29
+    assert "beta" in d["performance"]            # benchmark block present, aligned
+    md = p.get_risk_stats("AAA", AS_OF, lookback_days=90, format_type="markdown")
+    assert "Risk statistics" in md
+
+
 def test_valuation_snapshot_contains_assumptions_and_value():
     from ba2_providers.valuation import FinanceCalcValuationProvider
     p = FinanceCalcValuationProvider(_StubOverview(), _StubDetails(),
@@ -110,3 +137,45 @@ def test_valuation_snapshot_not_computable_when_no_fcf():
     d = p.get_valuation_snapshot("AAA", AS_OF, format_type="dict")
     assert d["computable"] is False
     # Never an exception, never a fabricated number.
+
+
+def test_valuation_snapshot_not_computable_when_negative_fcf():
+    """Negative-only FCF: a Gordon-growth DCF on a cash-burning base is
+    meaningless — the snapshot must say 'not computable', never a number."""
+    from ba2_providers.valuation import FinanceCalcValuationProvider
+
+    class _NegFCF(_StubDetails):
+        def get_cashflow_statement(self, *a, **k):
+            return {"statement_count": 3, "statements": [
+                {"fiscal_date_ending": "2025-12-31", "free_cash_flow": -80.0},
+                {"fiscal_date_ending": "2024-12-31", "free_cash_flow": -100.0},
+                {"fiscal_date_ending": "2023-12-31", "free_cash_flow": -120.0},
+            ]}
+
+    p = FinanceCalcValuationProvider(_StubOverview(), _NegFCF())
+    md = p.get_valuation_snapshot("AAA", AS_OF, format_type="markdown")
+    assert "not computable" in md.lower()
+    assert "negative free cash flow" in md
+    d = p.get_valuation_snapshot("AAA", AS_OF, format_type="dict")
+    assert d["computable"] is False
+
+
+def test_valuation_snapshot_flags_net_debt_assumed_zero():
+    """When the balance-sheet section is missing, net debt silently defaults
+    to 0 — the report must say so explicitly."""
+    from ba2_providers.valuation import FinanceCalcValuationProvider
+
+    class _NoBS(_StubDetails):
+        def get_balance_sheet(self, *a, **k):
+            return {"statement_count": 0, "statements": []}
+
+    p = FinanceCalcValuationProvider(_StubOverview(), _NoBS())
+    md = p.get_valuation_snapshot("AAA", AS_OF, format_type="markdown")
+    assert "net debt assumed 0" in md
+    d = p.get_valuation_snapshot("AAA", AS_OF, format_type="dict")
+    assert d["computable"] is True
+    assert d["assumptions"]["net_debt"] == 0.0
+    # With a real balance sheet the disclaimer is absent.
+    md2 = FinanceCalcValuationProvider(_StubOverview(), _StubDetails()) \
+        .get_valuation_snapshot("AAA", AS_OF, format_type="markdown")
+    assert "net debt assumed 0" not in md2

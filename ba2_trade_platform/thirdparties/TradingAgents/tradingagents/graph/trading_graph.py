@@ -753,7 +753,9 @@ class TradingAgentsGraph(DatabaseStorageMixin):
             try:
                 req = CalcRequest(expression=expression)
                 return render_calc(req)
-            except (ValidationError, ValueError) as e:
+            except (ValidationError, ValueError, ArithmeticError, SyntaxError) as e:
+                # 1/0 (ZeroDivisionError), unparseable input (SyntaxError from
+                # ast.parse), huge ** (OverflowError) — all become Error: strings.
                 return f"Error: {e}"
 
         return {
