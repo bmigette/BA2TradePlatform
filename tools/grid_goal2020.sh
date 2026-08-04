@@ -90,24 +90,63 @@ if first > "2020-01":
         f"       2020 . Extend the store first (see the metric_store task), then re-run.")
 EOF
 
+# --- transaction costs, PER CAP BAND ---------------------------------------------------------
+# Until 2026-08-04 this grid ran with spread_bps=0 AND slippage=0 -- every fill at the ideal
+# price. That is not a small optimism: it biases the SEARCH, because a cost-free book rewards
+# exactly the genomes costs would punish (trade more often, take tighter targets). Both knobs
+# already existed and worked (BacktestAccount._slip degrades MARKET/STOP fills,
+# _limit_trigger_price widens LIMIT/TP triggers so a marginal TP can miss its window entirely);
+# nothing ever passed them.
+#
+# WHERE THESE NUMBERS COME FROM -- and what they are not. We have no quote data, so the spread
+# cannot be measured from the cache. A Corwin-Schultz (2012) high-low estimate over 2022-2025 was
+# tried and REJECTED: it returns 76 bps for AAPL and 44 bps for SPY, whose true effective spreads
+# are ~1 bp. On daily bars at this liquidity the estimator is dominated by intraday volatility,
+# not spread, so its levels are meaningless here (its band ORDERING -- small > mid > large -- is
+# the one thing it does get right, and it agrees with the values below).
+#
+# So these are ASSUMPTIONS from US equity market structure, not measurements: round-trip
+# effective spread of a few bps for large caps, ~10 for mid, tens for small. They are deliberately
+# on the conservative side. Treat any winner as conditional on them and run the Monte Carlo
+# spread SWEEP (robustness.py's spread_sweep_bps) before trusting a genome -- that is what
+# actually tells you whether an edge survives, rather than any single assumed number.
+SPREAD_BPS_LARGE="${SPREAD_BPS_LARGE:-3}"
+SPREAD_BPS_MID="${SPREAD_BPS_MID:-10}"
+SPREAD_BPS_SMALL="${SPREAD_BPS_SMALL:-40}"
+
+spread_for() {
+  case "$1" in
+    large) echo "$SPREAD_BPS_LARGE" ;;
+    mid)   echo "$SPREAD_BPS_MID" ;;
+    small) echo "$SPREAD_BPS_SMALL" ;;
+    *)     echo 0 ;;
+  esac
+}
+
+# One driver invocation per (mode, band): --spread-bps applies to EVERY job of an invocation, so
+# a per-band value requires splitting what used to be one call per mode. Job names are unchanged,
+# so the completed-job skip still resumes across this restructure.
+run_matrix() {                      # $1=mode  $2=name-suffix  $3...=extra driver args
+  local mode="$1" suffix="$2"; shift 2
+  for band in large mid small; do
+    local sp; sp="$(spread_for "$band")"
+    echo; echo "=== $mode / $band  (spread ${sp} bps round-trip)  $(date)"
+    "$PY" "$DRIVER" "${COMMON[@]}"       --sizing-mode "$mode"       --bands "$band"       --spread-bps "$sp"       --name-suffix="$suffix"       "$@"
+    echo "=== $mode / $band  done rc=$? $(date)"
+  done
+}
+
 # --- matrix 1: risk_atr ------------------------------------------------------------------------
 # NOTE the `=` in --name-suffix=-... : the value starts with a dash, which argparse would
 # otherwise read as another flag.
 echo; echo "=== matrix 1/2  risk_atr  $(date)"
-"$PY" "$DRIVER" "${COMMON[@]}" \
-  --sizing-mode risk_atr \
-  --name-suffix=-goal2020-riskatr \
-  "$@"
-echo "=== matrix 1/2  done rc=$? $(date)"
+run_matrix risk_atr -goal2020-riskatr "$@"
+echo "=== matrix 1/2  done $(date)"
 
 # --- matrix 2: notional ------------------------------------------------------------------------
 echo; echo "=== matrix 2/2  notional  $(date)"
-"$PY" "$DRIVER" "${COMMON[@]}" \
-  --sizing-mode notional \
-  --name-suffix=-goal2020-notional \
-  --skip-experts FactorRanker \
-  "$@"
-echo "=== matrix 2/2  done rc=$? $(date)"
+run_matrix notional -goal2020-notional --skip-experts FactorRanker "$@"
+echo "=== matrix 2/2  done $(date)"
 
 echo; echo "=== goal2020 COMPLETE $(date) ==="
 echo "Compare with:  ba2-test report   (labels: goal2020-riskatr / goal2020-notional)"
