@@ -314,7 +314,91 @@ Labels: `goal2020-riskatr` / `goal2020-notional`.
 
 ---
 
-## 8. Files
+## 8. Recovery and edge cases
+
+### There is no pause. Stop and relaunch instead.
+
+The GA calls `is_task_paused(task_id)` every generation, but a CLI-launched grid passes the
+literal task_id `"cli-optimize"` and **no `task_queue` row with that id has ever existed** — so
+the check always returns False and the UI's pause button cannot touch a grid run. Verified:
+`select count(*) from task_queue where task_id='cli-optimize'` → 0.
+
+Since 2026.08.1013 this costs almost nothing: `grid_stop.sh` then relaunching resumes the
+interrupted job at its last completed generation. Treat stop+relaunch as the pause.
+
+### After a power cut, a crash, or a reboot
+
+Nothing restarts itself. The grid does **not** survive a reboot, and the DB is left mid-flight.
+
+```bash
+bash tools/grid_status.sh                                  # 1. expect "STOPPED"
+bash tools/grid_stop.sh --dry-run                          # 2. confirm no orphans survived
+.venv/Scripts/python.exe tools/grid_abandon.py --list      # 3. any goal2020 row still "running"?
+```
+
+A row still marked `running` with no process behind it is the normal post-outage state — the
+handler never got to write a terminal status. Retire it before relaunching:
+
+```bash
+.venv/Scripts/python.exe tools/grid_abandon.py outage
+git push origin dev                                        # in case anything was committed since
+nohup bash tools/grid_goal2020.sh > grid_goal2020.log 2>&1 &
+```
+
+The relaunch resumes that job from its last checkpointed generation — the abandon step renames
+the row, which frees the name, and the checkpoint is keyed on the *job name from the driver*, so
+it is still found.
+
+**Stale rows from OTHER grids are normal and are not yours to clean here.** As of 2026-08-04 the
+DB still carries `sen5min-S5` ×3, `sen5min2-S1` ×2 and `diag-shardthrash` stuck at `running` from
+earlier outages. `grid_abandon.py` deliberately only touches `%goal2020%`. Note the duplicated
+names in that list — that is exactly the collision that broke the senate grid's resume, left in
+place as a cautionary example.
+
+### Orphaned pool workers
+
+`spawn` pool children can outlive a killed master on Windows. `grid_stop.sh` sweeps them as its
+third tier, but verify after any hard kill:
+
+```bash
+bash tools/grid_stop.sh --dry-run     # all three tiers should report "none"
+```
+
+Anything still listed is an orphan holding ~2.5 GB; re-run `grid_stop.sh` without `--dry-run`.
+
+### Re-running one specific job
+
+The driver only skips `completed` jobs, so the simplest re-run is to abandon that row and narrow
+the invocation to the single job:
+
+```bash
+# example: just FMPRating S2 on the mid band, risk_atr
+.venv/Scripts/python.exe tools/run_screener_capband_matrix.py   --start 2020-01-01 --end 2025-12-31 --fitness consistent_annual_return   --store "$HOME/Documents/ba2/common/cache/screener/metric_store"   --sizing-mode risk_atr --bands mid --strategies S2   --skip-experts FMPEarningsDrift,FMPInsiderClusterBuy,FactorRanker   --spread-bps 10 --workers remote150 --name-suffix=-goal2020-riskatr
+```
+
+The `--spread-bps` MUST match the band (3/10/40) or that row is not comparable with its matrix.
+
+### Disk
+
+The grid writes trial rows and Backtest blobs into the test DB, and reads a large cache. Current
+footprint: cache 27 GB, test DB tree 24 GB, 741 GB free — not a concern today, but the test DB
+grows with every persisted top-N. Logs are the thing that actually bites (§9).
+
+### When it finishes
+
+The wrapper prints `=== goal2020 COMPLETE`. Then:
+
+```bash
+bash tools/grid_status.sh          # OPTS should read 45 completed
+ba2-test report                     # HTML summary
+```
+
+Go to §7 before trusting anything — the concentration check and the spread sweep are the two
+that have actually changed conclusions in the past.
+
+---
+
+## 9. Files
 
 | path | what |
 |---|---|
