@@ -658,6 +658,21 @@ class TradeRiskManagement:
         sizing_mode = expert.get_setting_with_interface_default('sizing_mode', log_warning=False) or 'notional'
         if sizing_mode == 'risk_atr':
             self.logger.info("Sizing mode: risk_atr (risk-based ATR position sizing)")
+
+        # REGIME OVERLAY (size): shrink/grow the per-instrument cap while the benchmark is
+        # stressed. Applied to the CAP so it bites in BOTH sizing modes -- notional sizes straight
+        # off this number, and risk_atr passes it as max_position_value. risk_atr additionally
+        # scales risk_per_trade_pct (see _risk_atr_quantity); both terms are linear in the scale,
+        # and quantity is the min of them, so the position scales by exactly the factor either way
+        # rather than by its square. 1.0 (the default, and the value in an unstressed bar) leaves
+        # the arithmetic bit-for-bit unchanged.
+        risk_scale = self._regime_scale(expert, 'regime_risk_scale')
+        if risk_scale != 1.0:
+            scaled_cap = max_equity_per_instrument * risk_scale
+            self.logger.info(
+                f"Regime overlay: stressed market -> regime_risk_scale={risk_scale:g}, "
+                f"max per instrument ${max_equity_per_instrument:.2f} -> ${scaled_cap:.2f}")
+            max_equity_per_instrument = scaled_cap
         
         # Group orders by symbol for diversity calculation
         orders_by_symbol = {}
@@ -867,6 +882,17 @@ class TradeRiskManagement:
 
         return orders_to_update, orders_to_delete, symbol_prices
 
+    def _regime_scale(self, expert, setting_name: str) -> float:
+        """This bar's regime multiplier for ``setting_name`` (1.0 = exact no-op).
+
+        Reads the regime the HOST published for the bar (backtest daily_engine / live
+        TradeManager) -- never classifies it here: the regime is market-wide and the RM runs
+        inside a per-symbol loop, so classifying here would repeat a 504-bar rank window once per
+        symbol.
+        """
+        from ba2_common.core.regime_overlay import get_stressed, regime_scale
+        return regime_scale(expert, setting_name, get_stressed())
+
     def _ensure_safeguard_stop(self, order, symbol: str, current_price: float, expert) -> None:
         """Write a protective stop-loss to ``order.stop_price`` when the strategy's exit
         conditions left none — REGARDLESS of ``sizing_mode``. An entry with no explicit SL must
@@ -890,6 +916,21 @@ class TradeRiskManagement:
         # (still floored at min_stop_loss_pct%). Lets the GA/user drop ATR when its implied
         # stops are too tight and causing frequent whipsaw (see synthesize_safeguard_stop).
         use_atr_stop = bool(expert.get_setting_with_interface_default('use_atr_stop', log_warning=False))
+
+        # REGIME OVERLAY (stop distance): all three inputs are DISTANCES here -- risk_pct and
+        # min_stop_pct as percents of price, atr_mult as a multiple of ATR -- and
+        # synthesize_safeguard_stop is max(min(...)) over them, which is linear. Scaling all three
+        # therefore scales the resulting stop distance by exactly the factor; scaling only one
+        # would silently change WHICH candidate wins the min and produce a distance that is not
+        # the intended multiple.
+        stop_scale = self._regime_scale(expert, 'regime_stop_scale')
+        if stop_scale != 1.0:
+            self.logger.info(
+                f"  regime overlay: stressed market -> regime_stop_scale={stop_scale:g}, "
+                f"widening safeguard stop distance for {symbol}")
+            risk_pct *= stop_scale
+            atr_mult *= stop_scale
+            min_stop_pct *= stop_scale
 
         sl_atr = None
         if use_atr_stop:
@@ -919,6 +960,11 @@ class TradeRiskManagement:
         risk_pct = float(expert.get_setting_with_interface_default('risk_per_trade_pct', log_warning=False) or 1.0)
         atr_mult = float(expert.get_setting_with_interface_default('atr_multiplier', log_warning=False) or 2.0)
         min_stop_pct = float(expert.get_setting_with_interface_default('min_stop_loss_pct', log_warning=False) or 0.0)
+
+        # REGIME OVERLAY (size): here risk_pct is the dollar RISK BUDGET, not a distance -- the
+        # stop distance was already set (and already stop_scale'd) by _ensure_safeguard_stop
+        # below. So this scales SIZE and reads regime_risk_scale, not regime_stop_scale.
+        risk_pct *= self._regime_scale(expert, 'regime_risk_scale')
 
         # SAFEGUARD SL FIRST, then size off it — ONE stop distance for both. Writes
         # order.stop_price BEFORE sizing (no-ops if already set), so compute_risk_based_quantity

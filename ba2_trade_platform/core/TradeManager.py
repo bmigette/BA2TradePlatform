@@ -19,6 +19,12 @@ from .db import get_instance, get_all_instances, add_instance, update_instance
 # two refreshes concurrently could submit the same dependent order twice.
 _REFRESH_LOCK = threading.Lock()
 
+# Market-regime benchmark + its once-per-day classification cache (see
+# TradeManager._publish_market_regime). SPY: the classifier in ba2_common.core.market_regime was
+# measured on it, and the backtest uses the same symbol so live and simulated agree.
+_REGIME_BENCHMARK = "SPY"
+_LIVE_REGIME_CACHE = {"day": None, "stressed": None}
+
 
 def classify_waiting_trigger(parent_status, trigger_status):
     """Decide what to do with a WAITING_TRIGGER dependent order given its parent's current
@@ -125,6 +131,52 @@ class TradeManager:
         self._processing_locks: Dict[str, threading.Lock] = {}
         self._locks_dict_lock = threading.Lock()  # Lock for accessing the locks dictionary
     
+    def _publish_market_regime(self) -> None:
+        """Classify the benchmark ONCE per calendar day and publish it on the regime seam.
+
+        Live counterpart of the backtest engine's per-bar ``set_stressed``. Both read the same
+        ``ba2_common.core.market_regime`` classifier off the same daily closes, so an
+        overlay-enabled genome behaves identically in a backtest and in production — the whole
+        point of keeping the classifier in ``ba2_common``.
+
+        Cached per day because the classifier's inputs are DAILY closes: re-fetching 3 years of
+        SPY on every refresh (which runs many times a day) would buy nothing.
+
+        A failure publishes ``None`` = "unclassified" = neutral scales, i.e. exactly today's
+        behaviour. That is safe in LIVE (never trade off a guessed regime); the loud-failure
+        stance belongs in the backtest, where a silently-neutral overlay would waste a grid.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        from ba2_common.core.market_regime import is_stressed
+        from ba2_common.core.regime_overlay import set_stressed
+
+        today = datetime.now(timezone.utc).date()
+        if _LIVE_REGIME_CACHE["day"] != today:
+            stressed = None
+            try:
+                from ba2_providers import get_provider
+                # 1200 calendar days ~= 825 sessions, comfortably above the 524 daily closes
+                # (20 vol window + 504 rank lookback) the classifier needs before it will answer.
+                df = get_provider("ohlcv", "fmp").get_ohlcv_data(
+                    _REGIME_BENCHMARK,
+                    start_date=datetime.now(timezone.utc) - timedelta(days=1200),
+                    end_date=datetime.now(timezone.utc),
+                    interval="1d",
+                )
+                if df is not None and len(df):
+                    stressed = is_stressed([c for c in df["Close"].tolist() if c is not None])
+                else:
+                    self.logger.warning(
+                        f"Market regime: no {_REGIME_BENCHMARK} daily bars returned")
+            except Exception as e:  # noqa: BLE001 -- regime is advisory; never block a refresh
+                self.logger.warning(f"Market regime unavailable ({type(e).__name__}: {e})")
+            _LIVE_REGIME_CACHE["day"] = today
+            _LIVE_REGIME_CACHE["stressed"] = stressed
+            self.logger.info(f"Market regime for {today}: stressed={stressed}")
+
+        set_stressed(_LIVE_REGIME_CACHE["stressed"])
+
     def refresh_accounts(self):
         """
         Refresh account information for all registered accounts.
@@ -140,6 +192,12 @@ class TradeManager:
             self.logger.info("Account refresh already in progress — skipping this run")
             return
         try:
+            # Publish the market regime for this pass BEFORE any order work, so the RM's sizing
+            # and the ruleset's TP/SL actions all read the same value. Live counterpart of the
+            # backtest engine's per-bar set_stressed(); cached per calendar day (the classifier
+            # reads DAILY benchmark closes, so it cannot change intraday).
+            self._publish_market_regime()
+
             from .models import AccountDefinition
             from ..modules.accounts import get_account_class
             from sqlmodel import select

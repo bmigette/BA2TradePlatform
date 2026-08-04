@@ -59,6 +59,7 @@ from ba2_common.core.types import (
     TimeHorizon,
     TransactionStatus,
 )
+from ba2_common.core.regime_overlay import reset_stressed, set_stressed
 from ba2_common.logger import logger
 
 from app.services.backtest.seam_wiring import make_indicator_provider, make_atr_cache_indicator_provider
@@ -389,6 +390,7 @@ class DailyBacktestEngine:
         config: Dict[str, Any],
         progress_cb: Optional[Callable[[float, str], None]] = None,
         indicator_provider: Any = None,
+        regime_calendar: Any = None,
     ) -> None:
         self.account = account
         self.experts = experts
@@ -397,6 +399,10 @@ class DailyBacktestEngine:
         self.progress_cb = progress_cb or (lambda pct, msg: None)
         self.seed = config["seed"]
         self._indicator_provider = indicator_provider
+        # Precomputed benchmark stress flags (ba2_common.core.regime_overlay.StressedCalendar),
+        # or None when the benchmark history was unreadable. run() refuses to start in the
+        # None case IF any expert enables the overlay -- see _check_regime_calendar.
+        self._regime_calendar = regime_calendar
         # Per-day dynamic screener universe (screener-settings optimization). The optimizer's
         # trial config sets ``screener_runtime`` ({"store", "settings"[, "cadence_days"]}); when
         # absent (every non-screener run) this is None and the per-bar entry gate is a no-op, so
@@ -462,6 +468,26 @@ class DailyBacktestEngine:
         return pm
 
     # -- the loop -----------------------------------------------------------
+    def _check_regime_calendar(self) -> None:
+        """Refuse to run an overlay-enabled genome with no benchmark history.
+
+        Without this the overlay would degrade to "never stressed" -> every regime_*_scale a
+        no-op -> the GA spends a whole grid searching four genes that cannot change an outcome.
+        That is precisely how ``use_atr_stop`` was searched for months against dead code, and the
+        only defence is to make the missing input fatal instead of quiet.
+        """
+        from ba2_common.core.regime_overlay import overlay_enabled
+
+        if self._regime_calendar is not None:
+            return
+        wanted = [eid for expert, eid, _s, _r in self.experts if overlay_enabled(expert)]
+        if wanted:
+            raise RuntimeError(
+                f"regime_overlay_enabled is set on expert instance(s) {wanted} but no benchmark "
+                f"regime calendar could be built — the overlay would silently do nothing. "
+                f"Pre-cache the benchmark's daily bars (`ba2-test fetch-cache`) and re-run."
+            )
+
     def run(self) -> Dict[str, Any]:
         """Run the full simulation and return a results dict (Task 5 ``build_results`` shape).
 
@@ -488,6 +514,11 @@ class DailyBacktestEngine:
             store = (self._screener_runtime or {}).get("store") if self._screener_runtime else None
             indicator_provider = make_atr_cache_indicator_provider(store) or make_indicator_provider()
         self._indicator_provider = indicator_provider
+
+        self._check_regime_calendar()
+        # Start from a clean regime even if a PREVIOUS trial in this worker died mid-loop and
+        # never reached its own reset.
+        reset_stressed()
 
         days = trading_days(self.config["start_date"], self.config["end_date"], self.price)
         total = max(len(days), 1)
@@ -559,6 +590,13 @@ class DailyBacktestEngine:
             # 1. advance the clock + bust the per-account price cache (the gotcha).
             self.price.set_clock(as_of_dt)
             self._bust_price_cache()
+
+            # 1b. publish this bar's market regime ONCE, market-wide. Everything downstream
+            #     (TradeRiskManagement sizing/stops, the TP/SL adjust actions) reads it from the
+            #     regime_overlay seam instead of classifying per symbol. Cheap: a bisect into the
+            #     precomputed calendar. None (no calendar) publishes None = neutral, which
+            #     _check_regime_calendar has already proven no expert depends on.
+            set_stressed(self._regime_calendar.at(as_of_dt) if self._regime_calendar else None)
 
             # 2. universe for the bar.
             universe = resolve_universe(as_of_dt, self.config, self.price)
@@ -786,6 +824,10 @@ class DailyBacktestEngine:
                 _k = _bisect.bisect_right(analysis_idx, i)
                 i = analysis_idx[_k] if _k < len(analysis_idx) else n_days
 
+        # The published regime is PROCESS-global (one market, one regime) and the GA reuses a
+        # worker across individuals -- clear it so the next trial cannot inherit this run's last
+        # bar before its own first set_stressed.
+        reset_stressed()
         return self._build_minimal_results()
 
     def _has_activity(self) -> bool:

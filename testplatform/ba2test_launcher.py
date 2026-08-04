@@ -1243,6 +1243,26 @@ _EXPERT_OPT = {
 # itself can sit wider when ATR is disabled. use_atr_stop lets the GA drop the ATR leg of the
 # stop entirely and rely purely on risk_per_trade_pct% (still floored at min_stop_loss_pct%),
 # for symbols/regimes where ATR-implied stops are tighter than the risk% budget would allow.
+# Regime overlay genes (ba2_common.core.regime_overlay). Every scale applies ONLY on bars the
+# benchmark is classified STRESSED and is 1.0 -- an exact no-op -- otherwise, so adding these to
+# the space cannot change what a pre-existing genome scores.
+#
+# TWO-SIDED 0.5-2.0 ON PURPOSE. A de-risk-only range (<=1.0) would presuppose that stress means
+# "take less"; two-sided lets the GA express the opposite and so TESTS the hypothesis instead of
+# encoding it. 1.0 sits inside every range, which is also the leak check: enabled=1 with all three
+# at 1.0 must score identically to enabled=0.
+#
+# regime_tp_scale is the best-motivated of the three: the stop is already ATR-scaled per symbol
+# while the take-profit is a fixed percent, so reward:risk drifts with each symbol's volatility
+# and the GA can otherwise only pick one compromise TP%. See
+# docs/plans/2026-08-04-regime-overlay-and-car-drawdown-design.md.
+_REGIME_OPT = {
+    "regime_overlay_enabled": {"optimize": True, "min": 0, "max": 1, "step": 1, "type": "int"},
+    "regime_risk_scale": {"optimize": True, "min": 0.5, "max": 2.0, "step": 0.25, "type": "float"},
+    "regime_stop_scale": {"optimize": True, "min": 0.5, "max": 2.0, "step": 0.25, "type": "float"},
+    "regime_tp_scale": {"optimize": True, "min": 0.5, "max": 2.0, "step": 0.25, "type": "float"},
+}
+
 _RM_OPT = {
     "risk_per_trade_pct": {"optimize": True, "min": 0.5, "max": 10.0, "step": 0.5, "type": "float"},
     "atr_multiplier": {"optimize": True, "min": 3.0, "max": 6.0, "step": 0.5, "type": "float"},
@@ -1250,6 +1270,7 @@ _RM_OPT = {
     "min_stop_loss_pct": {"optimize": True, "min": 3.0, "max": 15.0, "step": 1.0, "type": "float"},
     "use_atr_stop": {"optimize": True, "min": 0, "max": 1, "step": 1, "type": "int"},
     "max_virtual_equity_per_instrument_percent": {"optimize": True, "min": 5.0, "max": 30.0, "step": 5.0, "type": "float"},
+    **_REGIME_OPT,
 }
 
 # Bypass experts (FactorRanker) size their own portfolio and skip the classic per-trade RM

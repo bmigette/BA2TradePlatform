@@ -520,6 +520,64 @@ def _resolve_enabled_instruments(
 # ---------------------------------------------------------------------------
 # Engine run (the per-run trading DB scope)
 # ---------------------------------------------------------------------------
+# Benchmark whose daily closes define the market regime. SPY: the classifier was measured on it
+# and it is already in the OHLCV cache for every run.
+_REGIME_BENCHMARK = "SPY"
+# The classifier needs 20 (vol window) + 504 (rank lookback) DAILY closes before it will answer,
+# so the benchmark series must start well before the run does -- the run's own warmup_days is
+# derived from indicator lookbacks and is far shorter. 800 sessions of slack in calendar days.
+_REGIME_LOOKBACK_DAYS = 1200
+
+# Worker-process memo: the calendar is market-wide and identical for every GA individual of a
+# run, so building it once per (benchmark, window) instead of once per trial keeps it off the hot
+# path entirely. Keyed on the window because a grid may run several date ranges in one worker.
+_REGIME_CALENDAR_MEMO: Dict[Any, Any] = {}
+
+
+def _build_regime_calendar(raw_ohlcv: Any, start_date: Any, end_date: Any):
+    """The run's ``StressedCalendar``, or None when the benchmark's history is unavailable.
+
+    Returning None is NOT silently fine: ``DailyBacktestEngine.run`` refuses to start when any
+    expert has the regime overlay enabled and the calendar is missing, so an unreadable benchmark
+    can never turn the overlay genes into dead search space (the ``use_atr_stop`` failure mode).
+    Runs that don't use the overlay are unaffected and just carry None.
+    """
+    from datetime import timedelta
+
+    from ba2_common.core.regime_overlay import StressedCalendar
+    from app.services.backtest.price_source import MemoizedOHLCVProvider
+
+    key = (_REGIME_BENCHMARK, str(start_date), str(end_date))
+    if key in _REGIME_CALENDAR_MEMO:
+        return _REGIME_CALENDAR_MEMO[key]
+
+    cal = None
+    try:
+        # A SEPARATE bounded reader: the run's own MemoizedOHLCVProvider is clamped to
+        # [start - warmup_days, end] at the EXECUTION interval, which is both too short and
+        # (on an intraday run) the wrong granularity for a 504-DAILY-bar rank window.
+        bench = MemoizedOHLCVProvider(
+            raw_ohlcv,
+            start_date - timedelta(days=_REGIME_LOOKBACK_DAYS),
+            end_date,
+            interval="1d",
+            cached_only=True,
+        )
+        df = bench.get_ohlcv_data(_REGIME_BENCHMARK, interval="1d")
+        if df is not None and len(df):
+            cal = StressedCalendar(df["Date"].tolist(), df["Close"].tolist())
+            logger.info(
+                f"Regime calendar built from {len(df)} {_REGIME_BENCHMARK} daily closes "
+                f"({df['Date'].iloc[0]} -> {df['Date'].iloc[-1]})")
+        else:
+            logger.warning(f"Regime calendar: no {_REGIME_BENCHMARK} daily bars in the cache")
+    except Exception as e:  # noqa: BLE001 -- a missing benchmark must not break non-overlay runs
+        logger.warning(f"Regime calendar unavailable ({type(e).__name__}: {e})")
+
+    _REGIME_CALENDAR_MEMO[key] = cal
+    return cal
+
+
 def run_daily_backtest(
     config: Dict[str, Any],
     progress_cb: Optional[Callable[[float, str], None]] = None,
@@ -699,6 +757,8 @@ def run_daily_backtest(
                 config=config,
                 progress_cb=progress,
                 indicator_provider=indicator_provider,
+                regime_calendar=_build_regime_calendar(
+                    raw_ohlcv, config["start_date"], config["end_date"]),
             )
             engine.run()
 

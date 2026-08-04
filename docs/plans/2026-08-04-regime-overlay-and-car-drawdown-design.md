@@ -1,6 +1,8 @@
 # Regime overlay (incl. take-profit) + CAR drawdown fix — design (2026-08-04)
 
-**Status:** designed, ready to implement. Supersedes the gene list in
+**Status:** IMPLEMENTED 2026-08-04 (Part 1 in `631dc1a`, Part 2 in this changeset). See
+"Implementation record" at the bottom for what landed where and the evidence it is not inert.
+Originally: designed, ready to implement. Supersedes the gene list in
 `2026-07-29-regime-risk-scaling-overlay.md` (adds a 4th gene); that document's reasoning about
 WHY the overlay is an exposure-management tool, why the range is two-sided, and how the gene can
 end up inert all still stands and is not repeated here.
@@ -129,3 +131,78 @@ because absent/neutral genes leave the arithmetic exactly as it is today.
    failure mode (`use_atr_stop` searched for months while the code path did nothing) and the
    same test discipline `2026-07-29` demands for `regime_stop_scale`.
 4. Regime cache: classifier called once per bar, not once per symbol.
+
+
+---
+
+## Implementation record (2026-08-04)
+
+### Where it landed
+
+| Piece | File |
+|---|---|
+| `dd_guard` fix + tests | `testplatform/backend/app/services/strategy_fitness.py` (commit `631dc1a`) |
+| Scales, per-bar seam, `StressedCalendar` | `packages/common/ba2_common/core/regime_overlay.py` |
+| `regime_tp_scale` / `regime_stop_scale` on the percent->price paths | `packages/common/ba2_common/core/TradeActions.py` (`_AdjustPriceLevelAction`) |
+| `regime_risk_scale` (size) + `regime_stop_scale` (safeguard stop distance) | `packages/common/ba2_common/core/TradeRiskManagement.py` |
+| The 4 settings | `packages/common/ba2_common/core/interfaces/MarketExpertInterface.py` |
+| The 4 genes (`_REGIME_OPT` -> `_RM_OPT`) | `testplatform/ba2test_launcher.py` |
+| Backtest: build calendar, publish per bar | `daily_backtest_handler.py` / `daily_engine.py` |
+| Live: publish per refresh, cached per day | `ba2_trade_platform/core/TradeManager.py` |
+
+### Two decisions the design did not anticipate
+
+**There are TWO percent->price sites, not one.** `execute()` computes the price inline for a
+single TP-or-SL adjustment, but `compute_price()` serves the MERGED TP+SL path that
+`TradeActionEvaluator` uses for entry brackets — the common case in a backtest. The scaling
+therefore lives on the shared base `_AdjustPriceLevelAction`, not on a mixin over the two
+subclasses, which would have covered only `execute()` and left the dominant path unscaled.
+
+**`risk_per_trade_pct` means two different things** and needed two different genes.
+In `_ensure_safeguard_stop` it is a stop DISTANCE, so it scales with `regime_stop_scale`
+(alongside `atr_multiplier` and `min_stop_loss_pct` — all three, because the function is a
+`max(min(...))` over them and scaling one would change which candidate wins). In
+`_risk_atr_quantity` it is a dollar RISK BUDGET, so it scales with `regime_risk_scale`.
+
+`regime_risk_scale` also scales `max_equity_per_instrument`, which is what makes it bite in
+`notional` mode (the majority of the grid) and not only in `risk_atr`.
+
+### The missing-input failure is FATAL, not quiet
+
+`DailyBacktestEngine._check_regime_calendar` raises when any expert has
+`regime_overlay_enabled` and no benchmark calendar could be built. Without that, an unreadable
+SPY cache would degrade the overlay to "never stressed" — four genes searched against dead code,
+which is exactly the `use_atr_stop` failure this document set out not to repeat. Live is the
+opposite by design: an unavailable regime publishes `None` (neutral) and trading continues.
+
+### Evidence it works
+
+Unit: `packages/common/tests/test_regime_overlay.py` (21) and
+`test_regime_overlay_actions.py` (12). The calendar test asserts day-for-day equality with
+`market_regime.is_stressed(closes[:i+1])` for every day, plus a guard that the sample actually
+reaches STRESSED so the equality cannot pass vacuously.
+
+End-to-end, FMPEarningsDrift over 2022 (69% of its sessions classify STRESSED), 8 symbols,
+`risk_atr`:
+
+| run | trades | return | max DD |
+|---|---|---|---|
+| A — overlay off | 16 | -4.52% | -8.43% |
+| B — on, all scales 1.0 | 16 | -4.52% | -8.43% |
+| C — on, risk 0.5 / stop 2.0 / tp 2.0 | 15 | -4.55% | -7.65% |
+
+B is identical to A (the leak check, on the real engine rather than in a unit test). C differs,
+so the genes reach the trades — and de-risking into a stressed year cut drawdown, the expected
+direction.
+
+### Regime frequency on the goal2020 window
+
+Share of sessions classified STRESSED, from the cached SPY daily series (3,777 bars,
+2011-06-22 -> 2026-06-30):
+
+    2020  50%   2021   3%   2022  69%
+    2023   0%   2024  10%   2025  42%
+
+28.9% over 2020-2025 as a whole. The overlay is inactive for most of 2021 and 2023, so a genome
+that enables it is betting specifically on 2020/2022/2025 — worth remembering when reading which
+years drive a winner's fitness.

@@ -23,6 +23,7 @@ from ba2_common.core.option_selector import select_single, select_vertical_sprea
 from ba2_common.logger import logger
 from ba2_common.core.failure_modes import absorb_if_benign
 from ba2_common.core.db import InstanceNotFound
+from ba2_common.core.instance_resolver import InstanceResolverNotConfigured
 
 
 class TradeAction(ABC):
@@ -711,6 +712,67 @@ class _AdjustPriceLevelAction(TradeAction):
         self.reference_value = reference_value
         self.percent = percent
 
+    # --- Regime overlay -------------------------------------------------------------------
+    # Lives on the SHARED base, not on a mixin, because there are TWO percent->price sites and
+    # both must scale: execute() (single TP-or-SL adjustment) and compute_price() (the merged
+    # TP+SL path TradeActionEvaluator uses for entry brackets -- the common case in backtests).
+    # A mixin on the subclasses only would have covered execute(), leaving the dominant path
+    # unscaled: the ATR failure mode this feature exists to avoid repeating.
+
+    _regime_scale_setting: str = ""      # subclass names its gene; "" -> never scaled
+
+    def _regime_scaled_percent(self) -> float:
+        """``self.percent`` after the regime multiplier, or unchanged when it does not apply."""
+        if not self._regime_scale_setting or self.percent is None:
+            return self.percent
+        from ba2_common.core.regime_overlay import get_stressed, regime_scale, scale_percent
+
+        # Cheap gate FIRST. Resolving the expert costs a DB-backed get_expert_id() and this runs
+        # per order per bar, so short-circuit on the process-global flag before touching it: on an
+        # unstressed bar (and on every run with no regime published at all) nothing can scale, so
+        # the lookup would be pure waste.
+        stressed = get_stressed()
+        if stressed is not True:
+            return self.percent
+
+        expert = self._regime_expert()
+        scale = regime_scale(expert, self._regime_scale_setting, stressed)
+        if scale == 1.0:
+            return self.percent          # exact no-op: do not even log
+        scaled = scale_percent(self.percent, scale)
+        logger.info(
+            f"{self._label} regime overlay: stressed market -> {self._regime_scale_setting}"
+            f"={scale:g}, offset {self.percent:+.2f}% -> {scaled:+.2f}%")
+        return scaled
+
+    def _regime_expert(self):
+        """The expert instance whose genome carries the regime settings, or None.
+
+        TP/SL actions are usually constructed WITHOUT an expert_recommendation (the ruleset
+        adjusts an order that already exists -- see _create_order's "copy from existing_order"
+        branch), so the recommendation is only the first of two paths; ``get_expert_id()`` is the
+        canonical fallback and already handles both the transaction and recommendation linkage
+        under the backtest in-mem store.
+
+        Returns None -> neutral scale. A missing expert must degrade to today's behaviour, never
+        to a guessed multiplier.
+        """
+        try:
+            expert_id = self.expert_recommendation.instance_id if self.expert_recommendation else None
+            if expert_id is None and self.existing_order is not None:
+                # getattr, not a direct call: an option/stub order object need not implement the
+                # full TradingOrder surface, and a missing linkage must read as "no expert".
+                getter = getattr(self.existing_order, "get_expert_id", None)
+                expert_id = getter() if callable(getter) else None
+            if not expert_id:
+                return None
+            from ba2_common.core.instance_resolver import get_instance_resolver
+            return get_instance_resolver().get_expert_instance(expert_id)
+        except Exception as e:  # the overlay must never break order placement
+            absorb_if_benign(e, InstanceNotFound, InstanceResolverNotConfigured)
+            logger.debug(f"{self._label} regime overlay: no expert resolved ({e}); using neutral scale")
+            return None
+
     # --- Hooks that subclasses override ---
 
     def _call_broker(self, transaction) -> bool:
@@ -860,13 +922,20 @@ class _AdjustPriceLevelAction(TradeAction):
                         data={}
                     )
 
+                # REGIME OVERLAY: scale the percent OFFSET (not the price) while the benchmark is
+                # stressed. This is the single point where a configured percent becomes a price,
+                # for BOTH take-profit and stop-loss, so the multiplier lands here once instead of
+                # in each action subclass. Neutral (1.0) unless the genome enabled the overlay AND
+                # the bar is stressed, so every persisted ruleset is bit-for-bit unchanged.
+                eff_percent = self._regime_scaled_percent()
+
                 # Apply price calculation based on position direction
                 if is_long_position:
-                    self.target_price = reference_price * (1 + self.percent / 100)
-                    logger.info(f"{self._label} Final (LONG/BUY): ${reference_price:.2f} * (1 + {self.percent:+.2f}/100) = ${self.target_price:.2f}")
+                    self.target_price = reference_price * (1 + eff_percent / 100)
+                    logger.info(f"{self._label} Final (LONG/BUY): ${reference_price:.2f} * (1 + {eff_percent:+.2f}/100) = ${self.target_price:.2f}")
                 else:
-                    self.target_price = reference_price * (1 - self.percent / 100)
-                    logger.info(f"{self._label} Final (SHORT/SELL): ${reference_price:.2f} * (1 - {self.percent:+.2f}/100) = ${self.target_price:.2f}")
+                    self.target_price = reference_price * (1 - eff_percent / 100)
+                    logger.info(f"{self._label} Final (SHORT/SELL): ${reference_price:.2f} * (1 - {eff_percent:+.2f}/100) = ${self.target_price:.2f}")
 
                 logger.info(f"{self._label} Calculation COMPLETE for {self.instrument_name} - Final {self._label} Price: ${self.target_price:.2f}")
 
@@ -992,10 +1061,11 @@ class _AdjustPriceLevelAction(TradeAction):
             order_side = str(order.side.value if hasattr(order.side, 'value') else order.side).upper()
             is_long = (order_side == "BUY")
 
+        eff_percent = self._regime_scaled_percent()
         if is_long:
-            return reference_price * (1 + self.percent / 100)
+            return reference_price * (1 + eff_percent / 100)
         else:
-            return reference_price * (1 - self.percent / 100)
+            return reference_price * (1 - eff_percent / 100)
 
     def get_description(self) -> str:
         """Get description of the action."""
@@ -1072,6 +1142,7 @@ class AdjustTakeProfitAction(_AdjustPriceLevelAction):
     _label = "TP"
     _long_label = "Take profit"
     _price_key_prefix = "tp"
+    _regime_scale_setting = "regime_tp_scale"
     _result_price_key = "new_tp_price"
 
     def __init__(self, instrument_name: str, account: AccountInterface,
@@ -1189,6 +1260,7 @@ class AdjustStopLossAction(_AdjustPriceLevelAction):
     _label = "SL"
     _long_label = "Stop loss"
     _price_key_prefix = "sl"
+    _regime_scale_setting = "regime_stop_scale"
     _result_price_key = "new_sl_price"
 
     def __init__(self, instrument_name: str, account: AccountInterface,

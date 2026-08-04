@@ -185,6 +185,42 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                                "other than the default require that expert's recommendation-creation "
                                "code to read this setting explicitly (not yet wired for every expert)."
                 },
+                # Regime overlay (ba2_common.core.regime_overlay). All three scales apply ONLY
+                # while the benchmark is stressed (market_regime.is_stressed) and are 1.0 --
+                # an exact no-op -- otherwise, so every pre-existing expert and genome is
+                # unaffected. 1.0 sits inside each range, so enabled=1 with all scales at 1.0
+                # must behave identically to enabled=0.
+                "regime_overlay_enabled": {
+                    "type": "bool", "required": False, "default": False,
+                    "description": "Scale risk/stop/take-profit while the market is stressed",
+                    "tooltip": "Master switch for the regime overlay. When off (default) the three "
+                               "regime_*_scale settings are ignored entirely. When on, they take "
+                               "effect only on bars the benchmark is classified STRESSED (SMA200 "
+                               "trend + realized-volatility percentile rank)."
+                },
+                "regime_risk_scale": {
+                    "type": "float", "required": False, "default": 1.0,
+                    "description": "Position-SIZE multiplier while the market is stressed",
+                    "tooltip": "Multiplies the per-instrument equity cap (and, in risk_atr mode, "
+                               "risk_per_trade_pct) on stressed bars. <1 de-risks into stress, >1 "
+                               "leans in. 1.0 = no change. Requires regime_overlay_enabled."
+                },
+                "regime_stop_scale": {
+                    "type": "float", "required": False, "default": 1.0,
+                    "description": "Stop-loss DISTANCE multiplier while the market is stressed",
+                    "tooltip": "Multiplies the stop distance -- both a ruleset adjust_stop_loss "
+                               "percent offset and the RM safeguard stop -- on stressed bars. >1 "
+                               "gives volatile markets more room. 1.0 = no change. Requires "
+                               "regime_overlay_enabled."
+                },
+                "regime_tp_scale": {
+                    "type": "float", "required": False, "default": 1.0,
+                    "description": "Take-profit DISTANCE multiplier while the market is stressed",
+                    "tooltip": "Multiplies an adjust_take_profit percent offset on stressed bars, "
+                               "so a '+10% from entry' target becomes +15% at 1.5. This is the only "
+                               "volatility awareness the take-profit has; the stop is already "
+                               "ATR-scaled. 1.0 = no change. Requires regime_overlay_enabled."
+                },
                 # AI Model Settings
                 "risk_manager_model": {
                     "type": "str", "required": True, "default": "NagaAC/gpt-5.1-2025-11-13",
