@@ -42,6 +42,47 @@ _NO_LARGE_CAP = {"FMPEarningsDrift", "FMPInsiderClusterBuy"}
 # meaningful for experts with a REAL analyst target (FMPRating).
 _TARGET_PRICE_STRATEGIES: set = {"S4"}
 _TARGET_PRICE_EXPERTS = {"FMPRating"}
+
+# PER-EXPERT EARLIEST USABLE START, floored against the driver's --start.
+#
+# An expert can only be evaluated as far back as the DATA ITS SIGNAL DEPENDS ON, which is not the
+# same for all of them and is not something the OHLCV/metric_store backfill can fix.
+#
+# FMPRating keys off FMP's analyst PRICE TARGETS, and that endpoint simply does not serve rows
+# before ~2021-04 (probed 2026-08-04 against the live API: AAPL oldest 2021-06-11, MSFT
+# 2021-04-22, JPM 2021-04-27 -- while the analyst GRADE endpoint on the same symbols goes back to
+# 2012). A 2020-01-01 run therefore produced its FIRST TRADE on 2021-08-16: ~20 months of the
+# window were silently dead, the fitness bucketed an empty 2020 calendar year, and the result was
+# not comparable with experts that really did cover 2020. Those runs (opt 248/249/250) were
+# discarded.
+#
+# 2022-01-01 for FMPRating is deliberately LATER than the ~2021-04 data floor: it starts clear of
+# the sparse ramp-up period rather than hugging the edge, and it re-optimizes this expert on the
+# post-fix engine (condition store-blindness, ATR tz, market_cap chunking, warmup) rather than
+# inheriting anything from the old runs.
+#
+# Everything else is left to the driver's --start: FactorRanker is pure OHLCV (backfilled to
+# 2018), insider Form-4 history reaches 2003, and the earnings endpoint serves full history.
+_EXPERT_MIN_START = {
+    "FMPRating": "2022-01-01",
+}
+
+
+def _start_for(expert: str, default_start: str) -> str:
+    """The later of the driver's --start and the expert's own data floor."""
+    floor = _EXPERT_MIN_START.get(expert)
+    return max(default_start, floor) if floor else default_start
+
+
+def _window_tag(expert: str) -> str:
+    """Name suffix marking an expert whose window is floored (e.g. '-from2022'), else ''.
+
+    Put in the NAME because the name is the only thing carried into the results table and the
+    resume check: without it a 2022-start FMPRating job and a 2020-start one are indistinguishable
+    downstream, and `--name-suffix goal2020` would label a run that never saw 2020-2021.
+    """
+    floor = _EXPERT_MIN_START.get(expert)
+    return f"-from{floor[:4]}" if floor else ""
 # Per-strategy population/generations override. S7 is a NARROW refinement around a known-good point
 # (the archived 186% S2-large winner) so it converges with far fewer individuals/generations. S1 is
 # the RICHEST strategy (live "high conviction" conditions + entry TP/SL bracket + target-anchored TP
@@ -103,7 +144,10 @@ def _jobs(bands, strategies, include_no_data, skip_experts=frozenset(), name_suf
             if not _eligible(band, "FMPRating"):
                 continue
             for s in strategies:
-                yield (f"scr-{band}-FMPRating-{s}{name_suffix}", "FMPRating", s, band)
+                # ``_window_tag`` marks a data-floored expert in its own NAME, so a 2022-start
+                # FMPRating row can never be read as, or resumed as, a full-window "goal2020" run.
+                yield (f"scr-{band}-FMPRating-{s}{name_suffix}{_window_tag('FMPRating')}",
+                       "FMPRating", s, band)
     # 2) then the remaining classic experts + FactorRanker, band by band.
     for band in bands:
         for expert in _CLASSIC:
@@ -225,6 +269,12 @@ def main() -> int:
         if name in _completed_names():   # re-read each loop (resumable)
             print(f"[{i}/{len(jobs)}] SKIP {name} (already completed)", flush=True)
             continue
+        # Data-floored start (see _EXPERT_MIN_START). Announced per job so a shorter window is
+        # visible in the log instead of being inferred later from a suspiciously late first trade.
+        job_start = _start_for(expert, args.start)
+        if job_start != args.start:
+            print(f"[{i}/{len(jobs)}] NOTE {expert}: start floored {args.start} -> {job_start} "
+                  f"(signal data does not reach {args.start})", flush=True)
         # FMPRating's search space grew (price-target + analyst-recency genes), so give it extra
         # population to explore the larger space; other experts use the base --population.
         population = args.population + (args.fmp_population_bonus if expert == "FMPRating" else 0)
@@ -240,7 +290,10 @@ def main() -> int:
             generations = budget.get("generations", generations)
         cmd = [exe, "optimize", "--expert", expert, "--universe", _PLACEHOLDER_UNIVERSE,
                "--screener", "--screener-store", args.store, "--screener-cap-band", band,
-               "--start", args.start, "--end", args.end, "--fitness", args.fitness,
+               # Per-expert floor, not the raw --start: see _EXPERT_MIN_START. An expert whose
+               # signal data does not reach --start would otherwise burn the early years as dead
+               # window and bucket empty calendar years into the consistency fitness.
+               "--start", job_start, "--end", args.end, "--fitness", args.fitness,
                "--interval", args.interval, "--population", str(population),
                "--generations", str(generations), "--screener-cadence-days", str(args.cadence_days),
                # --run-schedule-day now only seeds the STATIC fallback (used as a base for the
