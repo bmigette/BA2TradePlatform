@@ -1,7 +1,9 @@
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import HumanMessage
 import time
 import json
 from ...prompts import format_analyst_prompt, get_prompt
+from ..utils.prefetch_context import gather_market_context
 from ba2_trade_platform.core.text_utils import extract_text_from_llm_response
 
 
@@ -45,7 +47,18 @@ def create_market_analyst(llm, toolkit, tools, parallel_tool_calls=False):
         else:
             chain = prompt | llm.bind_tools(tools, parallel_tool_calls=parallel_tool_calls)
 
-        result = chain.invoke(state["messages"])
+        # Deterministic risk-stats block (injected, no tool call needed): exact
+        # realized vol / drawdown / VaR / beta figures for the analyst to read.
+        risk_context = gather_market_context(toolkit, ticker, current_date)
+        messages = list(state["messages"])
+        if risk_context:
+            messages = [HumanMessage(
+                content=f"Pre-computed risk statistics for {ticker} as of {current_date} "
+                        f"(deterministic, provider-computed — cite these exact figures, "
+                        f"do not recompute them):\n\n{risk_context}"
+            )] + messages
+
+        result = chain.invoke(messages)
 
         report = ""
 

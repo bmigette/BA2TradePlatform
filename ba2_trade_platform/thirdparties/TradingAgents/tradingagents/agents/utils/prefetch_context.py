@@ -16,6 +16,11 @@ def _section(parts, title, fn):
     """Run fn() and append '# title\n\n<result>' to parts if it returns content."""
     try:
         result = fn()
+        # Toolkit compute methods return the standard internal envelope
+        # {"_internal": True, "text_for_agent", "json_for_storage"} — unwrap once
+        # so the text lands in the context (json_for_storage is not persisted here).
+        if isinstance(result, dict) and result.get("_internal"):
+            result = result.get("text_for_agent", "")
         if result and isinstance(result, str) and result.strip():
             parts.append(f"# {title}\n\n{result.strip()}")
     except Exception as e:
@@ -32,6 +37,8 @@ def gather_fundamentals_context(toolkit, ticker, current_date):
     _section(parts, "Cash Flow (quarterly, last 4)", lambda: toolkit.get_cashflow_statement(ticker, "quarterly", current_date, 4))
     _section(parts, "Past Earnings (last 8 quarters)", lambda: toolkit.get_past_earnings(ticker, current_date, 8, "quarterly"))
     _section(parts, "Forward Earnings Estimates", lambda: toolkit.get_earnings_estimates(ticker, current_date, 4, "quarterly"))
+    _section(parts, "Valuation Snapshot (default assumptions)",
+             lambda: toolkit.get_valuation_snapshot(ticker, current_date))
     _section(parts, "Insider Sentiment", lambda: toolkit.get_insider_sentiment(ticker, current_date, None))
     _section(parts, "Insider Transactions", lambda: toolkit.get_insider_transactions(ticker, current_date, None))
     return "\n\n---\n\n".join(parts) if parts else "No fundamental data available."
@@ -60,3 +67,15 @@ def gather_macro_context(toolkit, current_date):
     _section(parts, "Treasury Yield Curve", lambda: toolkit.get_yield_curve(current_date, None))
     _section(parts, "Federal Reserve Calendar", lambda: toolkit.get_fed_calendar(current_date, None))
     return "\n\n---\n\n".join(parts) if parts else "No macroeconomic data available."
+
+
+def gather_market_context(toolkit, ticker, current_date):
+    """Deterministic risk-statistics block for the (agentic) market analyst.
+
+    Computed locally from OHLCV history via the risk-stats compute provider —
+    injected so the analyst reads exact figures instead of estimating them.
+    Returns "" when nothing could be computed (caller skips injection)."""
+    parts = []
+    _section(parts, f"Risk Statistics (deterministic) — {ticker}",
+             lambda: toolkit.get_risk_stats(ticker, current_date))
+    return "\n\n---\n\n".join(parts)
