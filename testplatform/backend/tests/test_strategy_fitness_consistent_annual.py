@@ -19,13 +19,20 @@ def _curve(points):
 
 
 def _r(**kw):
-    """A healthy baseline result: 30%/yr, 100 trades/yr, -10% dd, no equity curve
-    (fewer than 2 measurable years -> consistency factor 1.0)."""
+    """A healthy baseline result: 30%/yr, 100 trades/yr, no equity curve
+    (fewer than 2 measurable years -> consistency factor 1.0).
+
+    ``max_drawdown`` is pinned at the REFERENCE (-20%), where dd_guard is exactly 1.0, so these
+    tests isolate what they actually assert (base / trade_gate / consistency). Before 2026-08-04
+    the baseline was -10%, which was also neutral back when dd_guard was a flat 1.0 anywhere
+    below 20% — now that the guard is continuous, -10% would silently multiply every expectation
+    by 2.0. Drawdown behaviour itself is covered by the dedicated tests below.
+    """
     base = {
         "total_trades": 300,
         "avg_trades_per_year": 100.0,
         "annualized_return": 30.0,
-        "max_drawdown": -10.0,
+        "max_drawdown": -20.0,
     }
     base.update(kw)
     return base
@@ -141,16 +148,39 @@ def test_uneven_years_rank_below_even_years_at_equal_base():
 # ---------------------------------------------------------------------------
 # 3. Drawdown guard
 # ---------------------------------------------------------------------------
-def test_dd_within_20_no_penalty():
-    assert compute_fitness("consistent_annual_return", _r(max_drawdown=-12.0)) == pytest.approx(30.0)
-
-
-def test_dd_exactly_20_no_penalty():
+def test_dd_exactly_at_reference_is_neutral():
+    """20% is the reference risk budget: dd_guard == 1.0 exactly there."""
     assert compute_fitness("consistent_annual_return", _r(max_drawdown=-20.0)) == pytest.approx(30.0)
 
 
-def test_dd_30_soft_penalty():
+def test_dd_below_reference_scores_STRICTLY_BETTER():
+    """REGRESSION (2026-08-04). dd_guard used to be a flat 1.0 anywhere below 20%, so the search
+    was INDIFFERENT between a 4% and a 19% drawdown — and since higher drawdown usually carries
+    higher return (rewarded in full by ``base``), it actively preferred the riskier genome. Lower
+    drawdown must now score strictly better."""
+    f4 = compute_fitness("consistent_annual_return", _r(max_drawdown=-4.0))
+    f10 = compute_fitness("consistent_annual_return", _r(max_drawdown=-10.0))
+    f19 = compute_fitness("consistent_annual_return", _r(max_drawdown=-19.0))
+    f20 = compute_fitness("consistent_annual_return", _r(max_drawdown=-20.0))
+    assert f4 > f10 > f19 > f20                      # strictly monotone, no plateau
+    assert f10 == pytest.approx(30.0 * 20.0 / 10.0)  # 2.0x at half the reference
+
+
+def test_dd_above_reference_unchanged_from_before():
+    """Above the reference the formula is byte-identical to the pre-2026-08-04 one."""
     assert compute_fitness("consistent_annual_return", _r(max_drawdown=-30.0)) == pytest.approx(30.0 * 20.0 / 30.0)
+    assert compute_fitness("consistent_annual_return", _r(max_drawdown=-40.0)) == pytest.approx(30.0 * 20.0 / 40.0)
+
+
+def test_tiny_drawdown_is_floored_not_infinite():
+    """The floor is a divide-by-zero RAIL: dd -> 0 would otherwise send fitness to infinity
+    (the calmar failure mode). Clamped at 1%, so the multiplier tops out at 20x — and anything
+    at or below the floor scores the same, which is why the floor is kept small enough that it
+    effectively never binds on real runs (observed drawdowns run 8.5-34%)."""
+    capped = 30.0 * 20.0 / 1.0
+    assert compute_fitness("consistent_annual_return", _r(max_drawdown=-1.0)) == pytest.approx(capped)
+    assert compute_fitness("consistent_annual_return", _r(max_drawdown=-0.1)) == pytest.approx(capped)
+    assert compute_fitness("consistent_annual_return", _r(max_drawdown=0.0)) == pytest.approx(capped)
 
 
 # ---------------------------------------------------------------------------

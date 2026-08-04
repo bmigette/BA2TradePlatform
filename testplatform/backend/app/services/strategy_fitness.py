@@ -36,7 +36,8 @@ WIPED_OUT_SENTINEL = -2.0e9
 # --- consistent_annual_return metric constants -------------------------------------------------
 # Goal: ~30% return EVERY year — not 50% one year / 10% the next.
 _CAR_MIN_TRADES_PER_YEAR = 30.0   # trade_gate ramp target: full credit at/above this, linear below
-_CAR_DD_SOFT_CAP = 20.0           # % drawdown tolerated at full credit; beyond it, soft penalty
+_CAR_DD_REFERENCE = 20.0          # % drawdown scoring exactly 1.0; below scores >1, above <1
+_CAR_DD_FLOOR = 1.0               # % floor on dd before dividing -- divide-by-zero rail only
 _CAR_CONSISTENCY_FLOOR = 0.25     # worst_year/mean_year clamp lower bound
 _CAR_PARTIAL_YEAR_MIN_DAYS = 182.62  # ~6 months: shorter partial start/end years merge into neighbor
 _CAR_ALIASES = ("consistent_annual_return", "car", "goal")
@@ -335,8 +336,10 @@ def _consistent_annual_return(results: dict) -> float:
       close". ``avg_trades_per_year`` missing is derived as total_trades / calendar-years spanned
       by the equity curve; if that too is underivable, the config is disqualified with
       ``LOW_TRADE_SENTINEL`` (a genuine data problem, not a thin-trading config).
-    * dd_guard — 1.0 while |max_drawdown| <= 20%; beyond that 20/|dd| (soft penalty, e.g.
-      -30% dd -> x0.667), because up to 20% drawdown is explicitly acceptable.
+    * dd_guard — 20/max(|max_drawdown|, 1%): CONTINUOUS in drawdown, exactly 1.0 at 20%, >1
+      below it (10% dd -> x2.0) and <1 above it (30% dd -> x0.667, unchanged from before
+      2026-08-04). 20% is the reference risk budget, not a cliff — lower drawdown scores
+      strictly better, which the previous "flat 1.0 below 20%" form did not do.
     * consistency — clamp(worst_year / mean_year, 0.25, 1.0) over CALENDAR-YEAR returns from
       the equity curve. Equal years (30, 30, 30) -> 1.0 (no penalty); an uneven (50, 10, 50)
       -> 10 / 36.67 = 0.27 (a 50/10 profile is worth ~a quarter of its headline return); a
@@ -378,8 +381,32 @@ def _consistent_annual_return(results: dict) -> float:
         return base  # unfactored: penalty factors on a negative would flip its sign
 
     # --- drawdown guard -------------------------------------------------------------------------
+    # CONTINUOUS, not a cliff (changed 2026-08-04). The old form was
+    #     1.0 if dd <= 20 else 20/dd
+    # which read "20% drawdown is acceptable" but IMPLEMENTED "everything below 20% is equally
+    # good" -- a different claim. It left the search indifferent between a 4% and a 19% drawdown,
+    # and because higher drawdown usually carries higher return (which ``base`` rewards in full
+    # while the guard stayed silent), it actively PREFERRED the riskier genome as long as it kept
+    # under the cap. Measured on the aborted goal2020 pass: S2 scored 2.86 on 32% drawdowns while
+    # LOSING money in two of five years, while S1 at a third of the drawdown earned nothing for
+    # being safer.
+    #
+    # Identical to the old formula above the reference; only the blind region below it changes,
+    # and it is still exactly 1.0 AT the reference so "20% is the risk budget" survives as a
+    # reference point instead of a cliff.
+    #
+    # The floor is a DIVIDE-BY-ZERO RAIL, not a policy knob: without it dd -> 0 sends fitness to
+    # infinity. It is deliberately small (1%) because a larger floor would simply relocate the
+    # flaw being fixed -- every drawdown below it flattened to one value. At 1% it effectively
+    # never binds (observed drawdowns run 8.5-34%), so the metric stays continuous across the
+    # whole realistic range.
+    #
+    # NOTE: this makes CAR risk-ADJUSTED rather than risk-capped, so it now behaves much like the
+    # `consistent_calmar` proposed in docs/plans/2026-07-29-regime-risk-scaling-overlay.md -- one
+    # fix serves both and no second metric is needed. CAR fitness numbers from BEFORE this change
+    # are NOT comparable with numbers after it; rankings within a single run still are.
     dd = abs(float(results.get("max_drawdown") or 0.0))
-    dd_guard = 1.0 if dd <= _CAR_DD_SOFT_CAP else _CAR_DD_SOFT_CAP / dd
+    dd_guard = _CAR_DD_REFERENCE / max(dd, _CAR_DD_FLOOR)
 
     # --- yearly consistency ----------------------------------------------------------------------
     consistency = _consistency_factor(_calendar_year_returns(results.get("equity_curve")))
