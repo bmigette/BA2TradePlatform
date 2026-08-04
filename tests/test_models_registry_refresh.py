@@ -62,3 +62,29 @@ def test_preferred_order_lists_have_no_removed_models():
     for provider, order in tm.PREFERRED_ORDER.items():
         for friendly in order:
             assert friendly in MODELS, f"{provider}: stale preferred name {friendly}"
+
+
+def _legacy_model_settings():
+    from ba2_common.core.interfaces.MarketExpertInterface import MarketExpertInterface
+    return MarketExpertInterface.get_merged_settings_definitions()
+
+
+def test_legacy_valid_values_have_no_eol_strings():
+    defs = _legacy_model_settings()
+    eol_fragments = ["kimi-k2-thinking", "kimi-k2.5", "moonshot-v1",
+                     "deepseek-v3.2", "deepseek-chat", "deepseek-reasoner",
+                     "deepseek-coder", "grok-4.1-fast", "/o1"]
+    for setting in ("risk_manager_model", "dynamic_instrument_selection_model"):
+        values = defs[setting]["valid_values"]
+        for v in values:
+            for frag in eol_fragments:
+                assert frag not in v, f"{setting}: EOL model string {v}"
+
+
+def test_legacy_valid_values_include_new_models():
+    defs = _legacy_model_settings()
+    for setting in ("risk_manager_model", "dynamic_instrument_selection_model"):
+        joined = " ".join(defs[setting]["valid_values"])
+        for frag in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+                     "grok-4.5", "kimi-k3", "deepseek-v4-flash", "deepseek-v4-pro"):
+            assert frag in joined, f"{setting}: missing {frag}"

@@ -233,6 +233,10 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                         "NagaAI/gpt-5-nano-2025-08-07",
                         "NagaAI/gpt-5-chat-latest",
                         "NagaAI/gpt-5-codex",
+                        # NagaAI GPT-5.6
+                        "NagaAI/gpt-5.6-sol",
+                        "NagaAI/gpt-5.6-terra",
+                        "NagaAI/gpt-5.6-luna",
 
                         # NagaAC GPT-5.1 (with reasoning effort support)
                         "NagaAC/gpt-5.1-2025-11-13",
@@ -245,7 +249,7 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                         "NagaAI/grok-4-0709",
                         "NagaAI/grok-4-fast-non-reasoning",
                         "NagaAI/grok-4-fast-reasoning",
-                        "NagaAC/grok-4.1-fast-reasoning",
+                        "NagaAI/grok-4.5",
                         # NagaAI Gemini 3 (DISABLED - thought_signature incompatible with LangGraph)
                         # "NagaAI/gemini-3-pro-preview",
                         # "NagaAI/gemini-3-pro-preview{reasoning_effort:low}",
@@ -255,15 +259,11 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                         "NagaAI/qwen3-next-80b-a3b-instruct",
                         "NagaAI/qwen3-next-80b-a3b-thinking",
                         # DeepSeek (latest)
-                        "NagaAI/deepseek-v3.2",
-                        "NagaAI/deepseek-v3.2:free",
-                        "NagaAC/deepseek-v3.2-speciale",
-                        "NagaAI/deepseek-chat-v3.1",
-                        "NagaAI/deepseek-chat-v3.1:free",
-                        "NagaAI/deepseek-reasoner-0528",
-                        "NagaAI/deepseek-reasoner-0528:free",
-                        # Kimi (NagaAC - advanced reasoning)
-                        "NagaAI/kimi-k2-thinking",
+                        "NagaAI/deepseek-v4-flash",
+                        "NagaAI/deepseek-v4-pro",
+                        # Kimi (latest)
+                        "NagaAI/kimi-k3",
+                        "NagaAI/kimi-k2.7-code",
                     ],
                     "allow_custom": True,
                     "help": "For more information, see [OpenAI Docs](https://platform.openai.com/docs/models), [Naga AI Web Search](https://docs.naga.ac/features/web-search), and [Gemini Thinking](https://ai.google.dev/gemini-api/docs/thinking)",
@@ -279,6 +279,10 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                         "NagaAI/gpt-5-nano-2025-08-07",
                         "NagaAI/gpt-5-chat-latest",
                         "NagaAI/gpt-5-codex",
+                        # NagaAI GPT-5.6
+                        "NagaAI/gpt-5.6-sol",
+                        "NagaAI/gpt-5.6-terra",
+                        "NagaAI/gpt-5.6-luna",
                         # NagaAC GPT-5.1 (with reasoning effort support)
                         "NagaAC/gpt-5.1-2025-11-13",
                         "NagaAC/gpt-5.1-2025-11-13{reasoning=effort:low}",
@@ -290,7 +294,7 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                         "NagaAI/grok-4-0709",
                         "NagaAI/grok-4-fast-non-reasoning",
                         "NagaAI/grok-4-fast-reasoning",
-                        "NagaAC/grok-4.1-fast-reasoning",
+                        "NagaAI/grok-4.5",
                         # NagaAI Gemini 3 (DISABLED - thought_signature incompatible with LangGraph)
                         # "NagaAI/gemini-3-pro-preview",
                         # "NagaAI/gemini-3-pro-preview{reasoning_effort:low}",
@@ -300,15 +304,11 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                         "NagaAI/qwen3-next-80b-a3b-instruct",
                         "NagaAI/qwen3-next-80b-a3b-thinking",
                         # DeepSeek (latest)
-                        "NagaAI/deepseek-v3.2",
-                        "NagaAI/deepseek-v3.2:free",
-                        "NagaAC/deepseek-v3.2-speciale",
-                        "NagaAI/deepseek-chat-v3.1",
-                        "NagaAI/deepseek-chat-v3.1:free",
-                        "NagaAI/deepseek-reasoner-0528",
-                        "NagaAI/deepseek-reasoner-0528:free",
-                        # Kimi (NagaAC - advanced reasoning)
-                        "NagaAI/kimi-k2-thinking",
+                        "NagaAI/deepseek-v4-flash",
+                        "NagaAI/deepseek-v4-pro",
+                        # Kimi (latest)
+                        "NagaAI/kimi-k3",
+                        "NagaAI/kimi-k2.7-code",
                     ],
                     "allow_custom": True,
                     "help": "For more information, see [OpenAI Docs](https://platform.openai.com/docs/models), [Naga AI Web Search](https://docs.naga.ac/features/web-search), and [Gemini Thinking](https://ai.google.dev/gemini-api/docs/thinking)",
