@@ -46,7 +46,25 @@ END=2025-12-31
 FITNESS=consistent_annual_return
 STORE="$HOME/Documents/ba2/common/cache/screener/metric_store"
 
+# DISTRIBUTE BY DEFAULT. This is not a tuning preference -- it is the difference between ~2 days
+# and ~2.5 weeks for 48 jobs, and a local-only run is SILENT about it: with no --workers the
+# driver simply omits the flag, StrategyOptimization.worker_ids stays NULL, and
+# strategy_optimization_handler keeps the local-only path with no warning. The only tell is the
+# ABSENCE of a "DISTRIBUTED across N selected worker(s)" line in the log, which is easy to miss
+# for hours. Defaulting it here means you must opt OUT (WORKERS= ./grid_goal2020.sh) rather than
+# remember to opt in.
+#
+# The worker syncs by `git pull`, so the master's commit MUST be pushed before launching or every
+# trial is retry-excluded for the whole run.
+WORKERS="${WORKERS-remote150}"
+
 COMMON=(--start "$START" --end "$END" --fitness "$FITNESS" --store "$STORE")
+if [ -n "$WORKERS" ]; then
+  COMMON+=(--workers "$WORKERS")
+  echo "=== distributing to remote worker(s): $WORKERS  (+ 4 local)"
+else
+  echo "=== WORKERS empty -> LOCAL-ONLY run (roughly 2.5x slower)"
+fi
 
 echo "=================================================================="
 echo "=== goal2020 : $START -> $END , fitness=$FITNESS"

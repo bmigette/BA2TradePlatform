@@ -35,6 +35,7 @@ from app.models import (
     StrategyOptimization,
     TaskQueue,
 )
+from app.models.task_queue import TaskStatus
 from app.services.genetic import GeneticOptimizer, DEAP_AVAILABLE
 from app.services.task_queue import get_task_queue
 from app.services.strategy_param_space import collect_param_space, decode_params
@@ -523,10 +524,15 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             if tq.is_task_paused(task_id):
                 raise InterruptedError("paused/cancelled")
 
+        # Checkpoints are keyed on the JOB (its name), not this row's id, so a relaunch of an
+        # interrupted job -- which inserts a NEW StrategyOptimization row -- still finds them.
+        ckpt_task_id = checkpoint_task_id(opt.name, opt_id)
+        ckpt_fingerprint = checkpoint_fingerprint(param_space, ga)
+
         def checkpoint_cb(generation: int, population: list):
-            _save_checkpoint(
-                task_id, optimizer.get_checkpoint_data(generation, population)
-            )
+            data = optimizer.get_checkpoint_data(generation, population)
+            data["fingerprint"] = ckpt_fingerprint   # refuse to resume into a changed gene space
+            _save_checkpoint(ckpt_task_id, data)
 
         def _trial_key_for(decoded_flat: Dict[str, Any]) -> str:
             return trial_key(
@@ -652,9 +658,30 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             return batch_fitness
 
         start_gen, init_pop = 0, None
-        ckpt = _load_checkpoint(task_id)
+        ckpt = _load_checkpoint(ckpt_task_id, ckpt_fingerprint)
+        # EXHAUSTED CHECKPOINT: one written at (or past) the final generation leaves nothing to
+        # run, and resuming into it produces a 0-trial run that reports "every backtest failed" --
+        # a confusing failure for what is really "this search already finished". Only reachable
+        # when a run reached the last generation and then died before _clear_checkpoint (or when a
+        # NEW job reuses a dead job's name), so discarding and searching from scratch is both the
+        # safe reading and the one that produces a result.
+        if ckpt and int(ckpt.get("generation", -1)) + 1 >= int(ga["generations"]):
+            logger.warning(
+                f"strategy_optimization {opt_id}: checkpoint {ckpt_task_id} is at generation "
+                f"{ckpt.get('generation')} of {ga['generations']} — exhausted, starting fresh")
+            _clear_checkpoint(ckpt_task_id)
+            ckpt = None
         if ckpt:
             start_gen, init_pop = optimizer.resume_from_checkpoint(ckpt)
+            logger.warning(
+                f"strategy_optimization {opt_id}: RESUMING {opt.name!r} at generation "
+                f"{start_gen}/{ga['generations']} from checkpoint {ckpt_task_id}")
+            # KNOWN LIMITATION: ``all_results`` restarts empty, so this row records only the
+            # trials evaluated AFTER the resume -- the earlier ones stay on the interrupted run's
+            # own row. The SEARCH is unaffected (population, elites, best_individual and both RNG
+            # states are all restored), and elites re-appear in later generations, so best_params
+            # is intact; only the top-N candidate POOL is thinner than an uninterrupted run's.
+            # Carrying all_results in the checkpoint would embed every trial's trades JSON in it.
         else:
             # Warm-start (NOT resume): seed this job's population from a DIFFERENT, already-run
             # optimization's individuals, but run this job's OWN fresh --generations budget from
@@ -784,6 +811,10 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 "logs for per-trial 'Fitness evaluation failed' warnings (e.g. a bad backtest "
                 "config) before trusting any result.",
             )
+
+        # The search finished: drop the checkpoint so a later re-run of this name starts a fresh
+        # search instead of resuming from the final generation of a completed one.
+        _clear_checkpoint(ckpt_task_id)
 
         opt.status = "completed"
         opt.completed_at = datetime.now()
@@ -1279,24 +1310,120 @@ def _run_brute_force(
     }
 
 
+def checkpoint_task_id(opt_name: Optional[str], opt_id: int) -> str:
+    """The key a GA checkpoint is stored under, STABLE ACROSS RE-RUNS of the same job.
+
+    Deliberately keyed on the optimization NAME, not its row id: re-running an interrupted job
+    INSERTS a new StrategyOptimization row (the aborted goal2020 job was 248, its relaunch 249),
+    so an id-keyed checkpoint could never be found by the very run that needs it. The name is what
+    the grid driver already treats as job identity when it decides what to skip.
+
+    Hashed because ``TaskQueue.task_id`` is String(50) and job names run longer than that
+    (``scr-large-FMPRating-S1-goal2020-riskatr-from2022`` is 47 chars before any prefix).
+    """
+    import hashlib
+
+    key = (opt_name or f"opt-{opt_id}").strip()
+    return "ckpt-" + hashlib.sha1(key.encode("utf-8")).hexdigest()[:24]
+
+
+def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any]) -> str:
+    """Identity of the SEARCH ITSELF -- a checkpoint may only be resumed into a matching one.
+
+    A GA checkpoint is a list of chromosomes plus an RNG state; both are meaningless against a
+    different gene space. Adding the 4 regime-overlay genes to ``_RM_OPT`` on 2026-08-04 changed
+    every classic expert's chromosome LENGTH, so an older checkpoint restored into the new space
+    would misread each locus -- silent corruption, not a crash. Population size matters for the
+    same reason (elitism/selection slice a fixed-length list), and generations because the
+    restored counter is compared against it.
+
+    Gene ORDER is included (not just the set): ``encode_params`` maps by position.
+    """
+    import hashlib
+    import json
+
+    payload = {
+        "genes": [[name, sorted((spec or {}).items(), key=lambda kv: kv[0])]
+                  for name, spec in param_space.items()],
+        "population": ga.get("populationSize"),
+        "generations": ga.get("generations"),
+    }
+    blob = json.dumps(payload, sort_keys=False, default=str)
+    return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16]
+
+
 def _save_checkpoint(task_id: str, checkpoint_data: Dict[str, Any]) -> None:
-    """Persist GA checkpoint to TaskQueue.checkpoint_data (keyed by task_id)."""
+    """Persist a GA checkpoint to ``TaskQueue.checkpoint_data``, CREATING the row if absent.
+
+    The row-creation is the whole fix. Checkpointing was inert for every CLI-driven run because
+    ``ba2-test optimize`` calls the handler directly instead of enqueuing, so no TaskQueue row
+    with that task_id existed -- and this function used to be ``if t: ...``, i.e. a silent no-op
+    that ran once per generation, wrote nothing, and logged nothing. (The old comment blamed
+    CLI jobs sharing one task_id and clobbering each other's checkpoints; that was wrong -- with
+    no row, nothing was ever written to clobber.)
+    """
     db = SessionLocal()
     try:
         t = db.query(TaskQueue).filter(TaskQueue.task_id == task_id).first()
-        if t:
-            t.checkpoint_data = checkpoint_data
-            db.commit()
+        if t is None:
+            t = TaskQueue(
+                task_id=task_id,
+                task_type="strategy_optimization",
+                name=task_id,
+                description="GA checkpoint holder for a directly-invoked (CLI) optimization",
+                # RUNNING, never PENDING: a PENDING row is claimable by the queue worker, which
+                # would re-dispatch this job while it is already running here.
+                status=TaskStatus.RUNNING.value,
+            )
+            db.add(t)
+        t.checkpoint_data = checkpoint_data
+        db.commit()
+    except Exception as e:  # noqa: BLE001 -- a checkpoint failure must never kill the run
+        logger.warning(f"checkpoint save failed for {task_id}: {e}")
+        db.rollback()
     finally:
         db.close()
 
 
-def _load_checkpoint(task_id: str) -> Optional[Dict[str, Any]]:
-    """Load a GA checkpoint from TaskQueue.checkpoint_data (keyed by task_id)."""
+def _clear_checkpoint(task_id: str) -> None:
+    """Drop a finished job's checkpoint so a later re-run starts clean instead of resuming
+    from the last generation of a search that already completed."""
     db = SessionLocal()
     try:
         t = db.query(TaskQueue).filter(TaskQueue.task_id == task_id).first()
-        return t.checkpoint_data if (t and t.checkpoint_data) else None
+        if t is not None:
+            t.checkpoint_data = None
+            # Also retire the holder row: left RUNNING it would show up forever as a phantom
+            # in-flight task in the queue UI. (It is never CLAIMABLE either way -- the queue
+            # only claims QUEUED rows -- so this is presentation, not safety.)
+            t.status = TaskStatus.COMPLETED.value
+            db.commit()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"checkpoint clear failed for {task_id}: {e}")
+        db.rollback()
+    finally:
+        db.close()
+
+
+def _load_checkpoint(task_id: str, fingerprint: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Load a GA checkpoint, refusing one whose search space no longer matches.
+
+    ``fingerprint=None`` skips the check (queue-driven callers that predate it); a stored
+    checkpoint with NO fingerprint is likewise accepted, so pre-existing checkpoints keep working.
+    """
+    db = SessionLocal()
+    try:
+        t = db.query(TaskQueue).filter(TaskQueue.task_id == task_id).first()
+        ckpt = t.checkpoint_data if (t and t.checkpoint_data) else None
+        if not ckpt:
+            return None
+        stored = ckpt.get("fingerprint")
+        if fingerprint and stored and stored != fingerprint:
+            logger.warning(
+                f"discarding checkpoint for {task_id}: it was written for a different search "
+                f"(fingerprint {stored} != {fingerprint}) — starting from generation 0")
+            return None
+        return ckpt
     finally:
         db.close()
 
