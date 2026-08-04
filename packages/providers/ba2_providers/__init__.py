@@ -37,6 +37,8 @@ from ba2_common.core.interfaces import (
     SocialMediaDataProviderInterface,
     ScreenerProviderInterface,
     OptionsDataProviderInterface,
+    RiskStatsInterface,
+    ValuationSnapshotInterface,
 )
 
 # Legacy data provider (to be migrated)
@@ -62,6 +64,8 @@ from .insider import FMPInsiderProvider
 from .socialmedia import StockTwitsSentiment, StockTwitsTrending
 from .screener import FMPScreenerProvider, FMPHistoricalScreenerProvider
 from .options import AlpacaOptionsProvider, ThetaDataOptionsProvider
+from .riskstats import FinanceCalcRiskStatsProvider
+from .valuation import FinanceCalcValuationProvider
 
 # Provider registries - will be populated as providers are implemented
 OHLCV_PROVIDERS: Dict[str, Type[DataProviderInterface]] = {
@@ -75,6 +79,14 @@ OHLCV_PROVIDERS: Dict[str, Type[DataProviderInterface]] = {
 INDICATORS_PROVIDERS: Dict[str, Type[MarketIndicatorsInterface]] = {
     "pandas": PandasIndicatorCalc,
     "alphavantage": AlphaVantageIndicatorsProvider,
+}
+
+# Compute providers (deterministic injection blocks) — pure-math, no API key/network
+RISK_STATS_PROVIDERS: Dict[str, Type[RiskStatsInterface]] = {
+    "finance_calc": FinanceCalcRiskStatsProvider,
+}
+VALUATION_PROVIDERS: Dict[str, Type[ValuationSnapshotInterface]] = {
+    "finance_calc": FinanceCalcValuationProvider,
 }
 
 FUNDAMENTALS_OVERVIEW_PROVIDERS: Dict[str, Type[CompanyFundamentalsOverviewInterface]] = {
@@ -146,6 +158,8 @@ def get_provider(category: str, provider_name: str, **kwargs) -> DataProviderInt
                  - 'insider': Insider trading data
                  - 'socialmedia': Social media sentiment analysis
                  - 'options': Bulk historical option data (cache builders)
+                 - 'risk_stats': Deterministic risk statistics (computed locally)
+                 - 'valuation': Default-assumption valuation snapshot (computed locally)
         provider_name: Provider name (e.g., 'alpaca', 'yfinance', 'alphavantage', 'openai')
         **kwargs: Additional arguments to pass to the provider constructor
                  (e.g., source='trading_agents' for Alpha Vantage providers)
@@ -174,6 +188,8 @@ def get_provider(category: str, provider_name: str, **kwargs) -> DataProviderInt
         "socialmedia": SOCIALMEDIA_PROVIDERS,
         "screener": SCREENER_PROVIDERS,
         "options": OPTIONS_PROVIDERS,
+        "risk_stats": RISK_STATS_PROVIDERS,
+        "valuation": VALUATION_PROVIDERS,
     }
 
     if category not in registries:
@@ -230,6 +246,8 @@ __all__ = [
     "StockTwitsTrending",
     "FMPScreenerProvider",
     "FMPHistoricalScreenerProvider",
+    "FinanceCalcRiskStatsProvider",
+    "FinanceCalcValuationProvider",
 
     # Helper functions
     "get_provider",

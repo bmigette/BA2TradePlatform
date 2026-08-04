@@ -65,6 +65,8 @@ class Toolkit:
         "fundamentals_details": [FundProviderClass1, ...],            # All called, results aggregated
         "ohlcv": [OHLCVProviderClass1, OHLCVProviderClass2, ...],    # Fallback: try first, then second, etc.
         "indicators": [IndProviderClass1, IndProviderClass2, ...]     # Fallback: try first, then second, etc.
+        "risk_stats": [RiskStatsProviderClass1, ...],                 # Fallback: compute providers (deterministic)
+        "valuation": [ValuationProviderClass1, ...]                   # Fallback: compute providers (deterministic)
     }
     
     Provider Args Structure (optional):
@@ -126,11 +128,31 @@ class Toolkit:
                 raise ValueError(f"Cannot instantiate {provider_name}: No OHLCV provider configured")
             logger.debug(f"Instantiating {provider_name} with OHLCV provider: {ohlcv_provider.__class__.__name__}")
             return provider_class(ohlcv_provider=ohlcv_provider)
-        
+
+        # Compute providers need their composed providers injected
+        from ba2_trade_platform.core.interfaces import RiskStatsInterface, ValuationSnapshotInterface
+        if issubclass(provider_class, RiskStatsInterface):
+            ohlcv_provider = self._get_ohlcv_provider()
+            if ohlcv_provider is None:
+                raise ValueError(f"Cannot instantiate {provider_name}: No OHLCV provider configured")
+            logger.debug(f"Instantiating {provider_name} with OHLCV provider: {ohlcv_provider.__class__.__name__}")
+            return provider_class(ohlcv_provider=ohlcv_provider)
+        if issubclass(provider_class, ValuationSnapshotInterface):
+            if not self.provider_map.get("fundamentals_overview") or not self.provider_map.get("fundamentals_details"):
+                raise ValueError(f"Cannot instantiate {provider_name}: need fundamentals_overview + fundamentals_details providers")
+            overview = self._instantiate_provider(self.provider_map["fundamentals_overview"][0])
+            details = self._instantiate_provider(self.provider_map["fundamentals_details"][0])
+            ohlcv_provider = self._get_ohlcv_provider()
+            logger.debug(f"Instantiating {provider_name} with fundamentals providers: "
+                         f"{overview.__class__.__name__} + {details.__class__.__name__}")
+            return provider_class(fundamentals_overview_provider=overview,
+                                  fundamentals_details_provider=details,
+                                  ohlcv_provider=ohlcv_provider)
+
         # Check if this is an AI provider that supports model parameter (OpenAI or NagaAI)
         # Includes: AINewsProvider, AICompanyOverviewProvider, AISocialMediaSentiment, etc.
         # TODO Not reliable for future use cases - consider a more robust way to identify AI providers
-        elif (provider_name.startswith('AI') or 'OpenAI' in provider_name) and 'websearch_model' in self.provider_args:
+        if (provider_name.startswith('AI') or 'OpenAI' in provider_name) and 'websearch_model' in self.provider_args:
             model = self.provider_args['websearch_model']
             logger.debug(f"Instantiating {provider_name} with model={model}")
             return provider_class(model=model)
@@ -1462,7 +1484,209 @@ class Toolkit:
         except Exception as e:
             logger.error(f"Error in get_indicator_data: {e}", exc_info=True)
             return f"Error retrieving indicator data: {str(e)}"
-    
+
+    # ========================================================================
+    # COMPUTE PROVIDERS - Deterministic injection blocks (risk stats, valuation)
+    # Fallback logic (try first, then second, etc.) — same shape as indicators
+    # ========================================================================
+
+    def get_risk_stats(
+        self,
+        symbol: Annotated[str, "Stock ticker symbol (e.g., 'AAPL', 'MSFT')"],
+        end_date: Annotated[Optional[str], "End date in YYYY-MM-DD format. Optional - defaults to today."] = None,
+        lookback_days: Annotated[int, "Calendar days of history to compute over. Default: 365 days."] = 365
+    ) -> str:
+        """
+        Compute deterministic risk statistics for a symbol.
+
+        Computed locally from OHLCV history (never fetched from an API): descriptive
+        return stats, annualized realized volatility, max drawdown, VaR, and
+        benchmark-relative beta/correlation.
+
+        Uses FALLBACK logic: tries first provider, if it fails, tries second provider, etc.
+        Only one provider's data is returned (the first successful one).
+
+        Args:
+            symbol: Stock ticker symbol
+            end_date: End date in YYYY-MM-DD format (optional - defaults to today)
+            lookback_days: Calendar days of history to compute over (default: 365)
+
+        Returns:
+            str: Markdown-formatted risk statistics from first successful provider
+
+        Raises:
+            AllProvidersFailedError: If all configured providers fail to return data
+        """
+        if "risk_stats" not in self.provider_map or not self.provider_map["risk_stats"]:
+            return "Error: No risk-stats providers configured"
+
+        try:
+            from ba2_trade_platform.core.provider_utils import validate_date_range
+
+            # Treat empty strings as None
+            if isinstance(end_date, str) and not end_date.strip():
+                end_date = None
+
+            # Convert date string to datetime if provided
+            end_dt = None
+            if end_date:
+                try:
+                    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+                except ValueError:
+                    return f"Error: Invalid end_date format. Expected YYYY-MM-DD, got '{end_date}'"
+
+            # Validate and normalize dates with smart defaults (end defaults to today)
+            _, end_dt = validate_date_range(None, end_dt, lookback_days)
+
+            # Try each provider in order until one succeeds (fallback logic)
+            provider_errors = {}
+            for provider_class in self.provider_map["risk_stats"]:
+                try:
+                    provider = self._instantiate_provider(provider_class)
+                    provider_name = provider.__class__.__name__
+
+                    logger.debug(f"Trying risk-stats provider {provider_name} for {symbol}")
+
+                    # Get both markdown (for LLM) and structured data (for storage) in single call
+                    markdown_data, data_dict = self._call_provider_with_both_format(
+                        provider,
+                        "get_risk_stats",
+                        symbol=symbol,
+                        end_date=end_dt,
+                        lookback_days=lookback_days
+                    )
+
+                    if markdown_data is None:
+                        provider_errors[provider_name] = "Failed to compute risk stats (returned None)"
+                        continue
+
+                    logger.info(f"Successfully computed risk stats from {provider_name}")
+
+                    # Return structured format for LoggingToolNode storage
+                    return {
+                        "_internal": True,
+                        "text_for_agent": f"## RISK STATISTICS from {provider_name.upper()}\n\n{markdown_data}",
+                        "json_for_storage": {
+                            "tool": "get_risk_stats",
+                            "symbol": symbol,
+                            "end_date": end_date if end_date else end_dt.strftime("%Y-%m-%d"),
+                            "lookback_days": lookback_days,
+                            "provider": provider_name,
+                            "data": data_dict if isinstance(data_dict, dict) else {"raw": str(data_dict)}
+                        }
+                    }
+
+                except Exception as e:
+                    provider_errors[provider_class.__name__] = str(e)
+                    logger.warning(f"Risk-stats provider {provider_class.__name__} failed: {e}, trying next provider...")
+                    continue
+
+            # All providers failed - raise exception to stop the graph
+            raise AllProvidersFailedError("risk_stats", provider_errors or {"all_providers": "All risk-stats providers failed to compute data"})
+
+        except AllProvidersFailedError:
+            raise  # Re-raise to propagate up
+        except Exception as e:
+            logger.error(f"Error in get_risk_stats: {e}", exc_info=True)
+            return f"Error retrieving risk stats: {str(e)}"
+
+    def get_valuation_snapshot(
+        self,
+        symbol: Annotated[str, "Stock ticker symbol (e.g., 'AAPL', 'MSFT')"],
+        as_of_date: Annotated[Optional[str], "Valuation date in YYYY-MM-DD format. Optional - defaults to today."] = None
+    ) -> str:
+        """
+        Compute a default-assumption valuation snapshot for a symbol.
+
+        Computed locally from fundamentals (never fetched from an API): WACC, DCF
+        fair value, and a sensitivity table. Every assumption is printed verbatim in
+        the report. When required fundamentals are missing the report says
+        'not computable: <reason>' instead of fabricating numbers.
+
+        Uses FALLBACK logic: tries first provider, if it fails, tries second provider, etc.
+        Only one provider's data is returned (the first successful one).
+
+        Args:
+            symbol: Stock ticker symbol
+            as_of_date: Valuation date in YYYY-MM-DD format (optional - defaults to today)
+
+        Returns:
+            str: Markdown-formatted valuation snapshot from first successful provider
+
+        Raises:
+            AllProvidersFailedError: If all configured providers fail to return data
+        """
+        if "valuation" not in self.provider_map or not self.provider_map["valuation"]:
+            return "Error: No valuation providers configured"
+
+        try:
+            from ba2_trade_platform.core.provider_utils import validate_date_range
+
+            # Treat empty strings as None
+            if isinstance(as_of_date, str) and not as_of_date.strip():
+                as_of_date = None
+
+            # Convert date string to datetime if provided
+            as_of_dt = None
+            if as_of_date:
+                try:
+                    as_of_dt = datetime.strptime(as_of_date, "%Y-%m-%d")
+                except ValueError:
+                    return f"Error: Invalid as_of_date format. Expected YYYY-MM-DD, got '{as_of_date}'"
+
+            # Validate and normalize dates with smart defaults (as_of defaults to today)
+            _, as_of_dt = validate_date_range(None, as_of_dt)
+
+            # Try each provider in order until one succeeds (fallback logic)
+            provider_errors = {}
+            for provider_class in self.provider_map["valuation"]:
+                try:
+                    provider = self._instantiate_provider(provider_class)
+                    provider_name = provider.__class__.__name__
+
+                    logger.debug(f"Trying valuation provider {provider_name} for {symbol}")
+
+                    # Get both markdown (for LLM) and structured data (for storage) in single call
+                    markdown_data, data_dict = self._call_provider_with_both_format(
+                        provider,
+                        "get_valuation_snapshot",
+                        symbol=symbol,
+                        as_of_date=as_of_dt
+                    )
+
+                    if markdown_data is None:
+                        provider_errors[provider_name] = "Failed to compute valuation snapshot (returned None)"
+                        continue
+
+                    logger.info(f"Successfully computed valuation snapshot from {provider_name}")
+
+                    # Return structured format for LoggingToolNode storage
+                    return {
+                        "_internal": True,
+                        "text_for_agent": f"## VALUATION SNAPSHOT from {provider_name.upper()}\n\n{markdown_data}",
+                        "json_for_storage": {
+                            "tool": "get_valuation_snapshot",
+                            "symbol": symbol,
+                            "as_of_date": as_of_date if as_of_date else as_of_dt.strftime("%Y-%m-%d"),
+                            "provider": provider_name,
+                            "data": data_dict if isinstance(data_dict, dict) else {"raw": str(data_dict)}
+                        }
+                    }
+
+                except Exception as e:
+                    provider_errors[provider_class.__name__] = str(e)
+                    logger.warning(f"Valuation provider {provider_class.__name__} failed: {e}, trying next provider...")
+                    continue
+
+            # All providers failed - raise exception to stop the graph
+            raise AllProvidersFailedError("valuation", provider_errors or {"all_providers": "All valuation providers failed to compute data"})
+
+        except AllProvidersFailedError:
+            raise  # Re-raise to propagate up
+        except Exception as e:
+            logger.error(f"Error in get_valuation_snapshot: {e}", exc_info=True)
+            return f"Error retrieving valuation snapshot: {str(e)}"
+
     # ========================================================================
     # MACRO PROVIDERS - Aggregate results from all providers
     # ========================================================================

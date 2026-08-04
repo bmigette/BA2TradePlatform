@@ -30,6 +30,8 @@ from ba2_providers import get_provider as _pkg_get_provider  # noqa: F401
 from ba2_providers import (  # noqa: F401
     OHLCV_PROVIDERS,
     INDICATORS_PROVIDERS,
+    RISK_STATS_PROVIDERS,
+    VALUATION_PROVIDERS,
     FUNDAMENTALS_OVERVIEW_PROVIDERS,
     FUNDAMENTALS_DETAILS_PROVIDERS,
     NEWS_PROVIDERS,

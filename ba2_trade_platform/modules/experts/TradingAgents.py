@@ -143,6 +143,20 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                 "multiple": True,
                 "tooltip": "Select one or more data providers for technical indicators (RSI, MACD, Bollinger Bands, etc.). Multiple vendors enable automatic fallback. Pandas calculates indicators locally using configured OHLCV provider. Alpha Vantage provides pre-calculated indicators."
             },
+            "vendor_risk_stats": {
+                "type": "list", "required": True, "default": ["finance_calc"],
+                "description": "Compute provider(s) for the injected risk-statistics block",
+                "valid_values": ["finance_calc"],
+                "multiple": True,
+                "tooltip": "Deterministic risk statistics (realized vol, drawdown, VaR, beta) computed locally from OHLCV data and injected into the market analyst. finance_calc is vendored pure-math — no API key, no network."
+            },
+            "vendor_valuation": {
+                "type": "list", "required": True, "default": ["finance_calc"],
+                "description": "Compute provider(s) for the injected valuation snapshot",
+                "valid_values": ["finance_calc"],
+                "multiple": True,
+                "tooltip": "Default-assumption valuation snapshot (WACC + DCF + sensitivity) computed locally from fundamentals and injected into the fundamentals analyst. finance_calc is vendored pure-math — no API key, no network."
+            },
             "vendor_fundamentals": {
                 "type": "list", "required": True, "default": ["alpha_vantage"],
                 "description": "Data vendor(s) for company fundamentals overview",
@@ -383,12 +397,16 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                 "macro": [MacroProviderClass1, ...],
                 "fundamentals_details": [FundProviderClass1, ...],
                 "ohlcv": [OHLCVProviderClass1, ...],
-                "indicators": [IndicatorProviderClass1, ...]
+                "indicators": [IndicatorProviderClass1, ...],
+                "risk_stats": [RiskStatsProviderClass1, ...],
+                "valuation": [ValuationProviderClass1, ...]
             }
         """
         from ...modules.dataproviders import (
             OHLCV_PROVIDERS,
             INDICATORS_PROVIDERS,
+            RISK_STATS_PROVIDERS,
+            VALUATION_PROVIDERS,
             FUNDAMENTALS_OVERVIEW_PROVIDERS,
             FUNDAMENTALS_DETAILS_PROVIDERS,
             NEWS_PROVIDERS,
@@ -486,6 +504,23 @@ class TradingAgents(MarketExpertInterface, SmartRiskExpertInterface):
                 provider_map['indicators'].append(INDICATORS_PROVIDERS[vendor])
             else:
                 self.logger.warning(f"Indicators provider '{vendor}' not found in INDICATORS_PROVIDERS registry")
+
+        # Compute providers (deterministic injection blocks) — risk stats + valuation
+        risk_stats_vendors = _get_vendor_list('vendor_risk_stats')
+        provider_map['risk_stats'] = []
+        for vendor in risk_stats_vendors:
+            if vendor in RISK_STATS_PROVIDERS:
+                provider_map['risk_stats'].append(RISK_STATS_PROVIDERS[vendor])
+            else:
+                self.logger.warning(f"Risk-stats provider '{vendor}' not found in RISK_STATS_PROVIDERS registry")
+
+        valuation_vendors = _get_vendor_list('vendor_valuation')
+        provider_map['valuation'] = []
+        for vendor in valuation_vendors:
+            if vendor in VALUATION_PROVIDERS:
+                provider_map['valuation'].append(VALUATION_PROVIDERS[vendor])
+            else:
+                self.logger.warning(f"Valuation provider '{vendor}' not found in VALUATION_PROVIDERS registry")
         
         self.logger.debug(f"Built provider_map with {len(provider_map)} categories: {list(provider_map.keys())}")
         return provider_map
