@@ -2236,9 +2236,15 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
                         )
                         exit_px = entry_px
                 else:
-                    exit_px = self._price.close_at(opening.symbol)
+                    # VALUATION (not a fill): forward-fill the last KNOWN close, exactly like the
+                    # equity curve's MTM. ``close_at`` needs an EXACT bar on the run-end clock, but
+                    # the clock is the UNION of every symbol's timestamps — a held symbol whose data
+                    # ends EARLY (delisted/stale cache) has no bar there, so close_at returned None
+                    # and the fallback stamped exit=entry, silently zeroing real unrealised P&L that
+                    # the equity curve had already counted (the 2026-08-05 ED full-window $4.3k gap).
+                    exit_px = self._price.close_asof(opening.symbol)
                     if exit_px is None:
-                        exit_px = entry_px  # no closing price -> flat (counts as a near-zero trade)
+                        exit_px = entry_px  # never priced after entry -> flat (near-zero trade)
                 exit_dt = self._price.now()
                 exit_reason = "open_at_end"
                 comm = commission

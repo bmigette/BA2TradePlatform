@@ -291,8 +291,39 @@ def test_open_transaction_marks_to_market_open_at_end():
         ctx.__exit__(None, None, None)
 
 
-# ---------------------------------------------------------------------------
-# Task 10: OPTION round-trips must scale realised P&L by the contract multiplier
+def test_open_at_end_stale_symbol_marks_last_known_close_not_entry():
+    """A held symbol whose data ends BEFORE the run-end clock (union of all symbols'
+    bars) must still be marked at its last KNOWN close, not fall back to entry price.
+
+    Pre-fix, the recorder used close_at (exact-clock bar) which returned None there,
+    so exit was stamped = entry and real unrealised P&L vanished from the trade rows
+    while the equity curve (close_asof MTM) kept counting it.
+    """
+    from ba2_common.core.types import OrderDirection
+
+    acct, ctx, ps = _acct(symbol="AAPL", last_close=100.0, account_id=107)
+    try:
+        # Held symbol with bars only through D2; the clock will advance to D4 (union tick).
+        ps.load_bars("STALE", [
+            {"Date": D1, "Open": 50, "High": 60, "Low": 40, "Close": 50, "Volume": 1000},
+            {"Date": D2, "Open": 50, "High": 80, "Low": 45, "Close": 75, "Volume": 1000},
+        ])
+        buy_bid, txn = _open_entry(acct, symbol="STALE", qty=10, side=OrderDirection.BUY)
+        _fill(acct, buy_bid, 50.0, D2)
+        ps.set_clock(D4)  # final union tick; STALE has NO bar on D4
+
+        rts = acct.get_round_trip_trades()
+        assert len(rts) == 1
+        t = rts[0]
+        assert t["exit_reason"] == "open_at_end"
+        assert t["entry_price"] == pytest.approx(50.0)
+        # last KNOWN close (75 on D2), NOT the entry fallback
+        assert t["exit_price"] == pytest.approx(75.0)
+        assert t["pnl"] == pytest.approx((75.0 - 50.0) * 10 - CFG["commission_per_trade"])
+    finally:
+        ctx.__exit__(None, None, None)
+
+
 # ---------------------------------------------------------------------------
 # The premium is quoted PER SHARE but a contract controls 100 shares, so a call
 # bought @1.00 and closed @1.50 (1 contract) realises (1.50-1.00)*1*100 = $50 gross,
