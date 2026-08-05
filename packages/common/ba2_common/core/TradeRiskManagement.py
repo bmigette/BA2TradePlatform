@@ -743,6 +743,7 @@ class TradeRiskManagement:
                         order, symbol, current_price, expert,
                         max_position_value=available_for_instrument,
                         available_balance=remaining_balance,
+                        account=account,
                     )
                 else:
                     # notional mode still sizes purely by equity/balance below (unaffected), but
@@ -756,8 +757,15 @@ class TradeRiskManagement:
                     # Calculate maximum affordable quantity based on available equity per instrument
                     max_quantity_by_instrument = max(0, available_for_instrument / current_price) if current_price > 0 else 0
                 
-                    # Calculate maximum affordable quantity based on remaining total balance
-                    max_quantity_by_balance = max(0, remaining_balance / current_price) if current_price > 0 else 0
+                    # Calculate maximum affordable quantity based on remaining total balance.
+                    # Commission is RESERVED first: the fill costs qty*price + commission, so
+                    # dividing raw cash by price over-sizes by up to one commission's worth. At
+                    # near-full deployment that produced an order which fitted in cash but not in
+                    # cash+commission, tripping the engine's cash-secured safeguard (and, when
+                    # even one share no longer fitted, cancelling the order outright).
+                    _commission = self._commission_per_trade(account)
+                    max_quantity_by_balance = (max(0, (remaining_balance - _commission) / current_price)
+                                               if current_price > 0 else 0)
                 
                     self.logger.info(f"  Calculated: max_qty_by_instrument={max_quantity_by_instrument:.2f} shares, "
                                    f"max_qty_by_balance={max_quantity_by_balance:.2f} shares")
@@ -882,6 +890,28 @@ class TradeRiskManagement:
 
         return orders_to_update, orders_to_delete, symbol_prices
 
+    def _commission_per_trade(self, account) -> float:
+        """Per-fill commission to RESERVE out of cash before sizing, or 0.0 when unknown.
+
+        It is an ACCOUNT setting, not an expert one -- reading it off the expert raises, because
+        ExtendableSettingsInterface rejects unknown keys by design. Live equities at Alpaca are
+        commission-free, so 0.0 is both the correct live value and an exact no-op; only the
+        backtest account carries a non-zero one.
+        """
+        for getter in (lambda: account.get_setting_with_interface_default(
+                           'commission_per_trade', log_warning=False),
+                       lambda: (getattr(account, '_cfg', None) or {}).get('commission_per_trade')):
+            try:
+                v = getter()
+            except Exception:  # noqa: BLE001 -- an unknown key must degrade to "no commission"
+                continue
+            if v is not None:
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    return 0.0
+        return 0.0
+
     def _regime_scale(self, expert, setting_name: str) -> float:
         """This bar's regime multiplier for ``setting_name`` (1.0 = exact no-op).
 
@@ -946,7 +976,8 @@ class TradeRiskManagement:
                 f"(min of ATR×{atr_mult:g} / {risk_pct:g}% risk, floor {min_stop_pct:g}%)")
 
     def _risk_atr_quantity(self, order, symbol: str, current_price: float, expert,
-                           max_position_value: float, available_balance: float) -> int:
+                           max_position_value: float, available_balance: float,
+                           account=None) -> int:
         """Risk-based share count for one order (risk_atr sizing mode).
 
         Stop distance comes from the order's explicit SL price when present, else
@@ -981,6 +1012,7 @@ class TradeRiskManagement:
             stop_price=order.stop_price, atr=None, atr_multiplier=atr_mult,
             min_stop_pct=min_stop_pct,
             max_position_value=max_position_value, available_balance=available_balance,
+            commission_per_trade=self._commission_per_trade(account),
             lot_size=int(lot) if lot else None,
         )
         qty = int(result["quantity"])

@@ -39,6 +39,7 @@ def compute_risk_based_quantity(
     min_stop_pct: Optional[float] = None,
     max_position_value: Optional[float] = None,
     available_balance: Optional[float] = None,
+    commission_per_trade: float = 0.0,
     lot_size: Optional[int] = None,
 ) -> dict:
     """Compute a risk-based share quantity. Pure function (no IO).
@@ -59,6 +60,10 @@ def compute_risk_based_quantity(
         max_position_value: per-instrument notional ceiling ($) — the lot is
             trimmed so quantity*price never exceeds it.
         available_balance: cash available — the lot is trimmed to what's affordable.
+        commission_per_trade: per-fill commission RESERVED out of ``available_balance`` before
+            sizing. A fill costs qty*price + commission, so dividing raw cash by price over-sizes
+            by up to one commission at near-full deployment. 0.0 (the default, and what live
+            equities cost at Alpaca) is an exact no-op.
         lot_size: round-lot constraint (e.g. 100); quantity is floored to a multiple.
 
     Returns:
@@ -126,7 +131,9 @@ def compute_risk_based_quantity(
 
     # Clamp by available cash.
     if available_balance is not None and available_balance >= 0:
-        max_by_cash = int(available_balance // current_price)
+        # Reserve the round-trip commission before dividing — a fill costs qty*price + commission,
+        # so raw cash / price over-sizes by up to one commission at near-full deployment.
+        max_by_cash = int(max(0.0, available_balance - float(commission_per_trade or 0.0)) // current_price)
         if qty > max_by_cash:
             qty = max_by_cash
             out["capped_by"] = "balance"

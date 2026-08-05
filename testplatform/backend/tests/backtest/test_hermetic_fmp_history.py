@@ -20,17 +20,39 @@ def temp_cache(monkeypatch):
     return d
 
 
-def test_hermetic_miss_raises_without_fetching(temp_cache):
+def test_hermetic_miss_disables_the_symbol_without_fetching(temp_cache):
+    """ONE missing symbol is skipped, not fatal (changed 2026-08-05).
+
+    It used to raise, which failed the whole TRIAL: on the goal2020 grid a single never-prewarmed
+    symbol killed 77 genomes across three jobs, and since a failed trial scores at the worst
+    sentinel the GA was taught to avoid every screener region containing it. The 0-network-fetch
+    guarantee — the actual point of hermetic mode — is unchanged and still asserted here.
+    """
     calls = {"n": 0}
 
     def fetch():
         calls["n"] += 1
         return [{"x": 1}]
 
+    fc.reset_hermetic_misses()
     with fc.frozen_ttl_cache(), fc.hermetic_fmp_history():
-        with pytest.raises(fc.FMPHistoryCacheMiss):
-            fc.fmp_history_disk_cached("insider_v2", "NOPE", fetch)
+        assert fc.fmp_history_disk_cached("insider_v2", "NOPE", fetch) == []
+        assert fc.hermetic_miss_symbols() == {"insider_v2/NOPE"}   # registered, not silent
     assert calls["n"] == 0  # 0 network fetches — the whole point
+    fc.reset_hermetic_misses()
+
+
+def test_hermetic_aborts_once_too_many_symbols_are_missing(temp_cache, monkeypatch):
+    """MANY missing symbols means the prewarm itself is broken, so the run stops rather than
+    scoring a crippled universe for its full generation budget."""
+    monkeypatch.setattr(fc, "_HERMETIC_MISS_LIMIT", 3)
+    fc.reset_hermetic_misses()
+    with fc.frozen_ttl_cache(), fc.hermetic_fmp_history():
+        fc.fmp_history_disk_cached("insider_v2", "A", lambda: [{"x": 1}])
+        fc.fmp_history_disk_cached("insider_v2", "B", lambda: [{"x": 1}])
+        with pytest.raises(fc.FMPHistoryCacheMiss):
+            fc.fmp_history_disk_cached("insider_v2", "C", lambda: [{"x": 1}])
+    fc.reset_hermetic_misses()
 
 
 def test_prewarm_fetches_then_hermetic_serves(temp_cache, monkeypatch):
@@ -60,9 +82,13 @@ def test_empty_not_persisted_without_sentinel(temp_cache, monkeypatch):
         out = fc.fmp_history_disk_cached("past_earnings_quarterly", "BNH", lambda: [])
     assert out == []
     monkeypatch.setattr(fc, "_HISTORY_MEM_CACHE", fc.TTLCache(999999))
+    fc.reset_hermetic_misses()
     with fc.frozen_ttl_cache(), fc.hermetic_fmp_history():
-        with pytest.raises(fc.FMPHistoryCacheMiss):
-            fc.fmp_history_disk_cached("past_earnings_quarterly", "BNH", lambda: [{"x": 1}])
+        # The absent file still reads back as a MISS — it is registered for the abort counter —
+        # but a single one now disables the symbol instead of failing the trial (2026-08-05).
+        assert fc.fmp_history_disk_cached("past_earnings_quarterly", "BNH", lambda: [{"x": 1}]) == []
+        assert "past_earnings_quarterly/BNH" in fc.hermetic_miss_symbols()
+    fc.reset_hermetic_misses()
 
 
 def test_prewarm_persists_empty_as_sentinel(temp_cache, monkeypatch):

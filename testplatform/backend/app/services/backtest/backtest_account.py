@@ -3331,10 +3331,13 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
             if (cur.qty if cur else 0.0) >= 0 and signed * fill_px + commission > self._cash + 1e-6:
                 affordable = int((self._cash - commission) / fill_px)
                 logger.error(
-                    "BACKTEST cash-secured safeguard TRIPPED on %s: BUY %g @ %.4f (cost $%.2f) "
-                    "exceeds cash $%.2f -> clamping to %d share(s). A sizing regression let the RM "
-                    "over-size; the engine should bound deployment to available cash.",
-                    order.symbol, qty, fill_px, signed * fill_px, self._cash, max(0, affordable),
+                    "BACKTEST cash-secured safeguard TRIPPED on %s: BUY %g @ %.4f "
+                    "(cost $%.2f + $%.2f commission = $%.2f) exceeds cash $%.2f -> clamping to "
+                    "%d share(s). The RM over-sized; the engine bounds deployment to available "
+                    "cash. NOTE the commission: the test is cost+commission, so a line where the "
+                    "bare cost looks affordable is not a false trip.",
+                    order.symbol, qty, fill_px, signed * fill_px, commission,
+                    signed * fill_px + commission, self._cash, max(0, affordable),
                 )
                 if affordable < 1:
                     order.status = OrderStatus.CANCELED
