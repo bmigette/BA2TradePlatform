@@ -38,7 +38,7 @@ class _RaisingAccount(MockAccount):
     def _classify_order_error(self, exc):
         return self._classify_result
 
-    def _submit_order_impl(self, trading_order, tp_price=None, sl_price=None, is_closing_order=False):
+    def _submit_order_impl(self, trading_order, tp_price=None, sl_price=None, is_closing_order=False, use_complex_order=False):
         if self._raise_on_submit is not None and trading_order.order_type != OrderType.MARKET:
             raise self._raise_on_submit
         if trading_order.order_type == OrderType.MARKET and not self._market_retry_succeeds:

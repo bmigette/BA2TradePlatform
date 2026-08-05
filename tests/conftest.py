@@ -204,7 +204,7 @@ class MockAccount(AccountInterface, OptionsAccountInterface):
     def symbols_exist(self, symbols):
         return {s: True for s in symbols}
 
-    def _submit_order_impl(self, trading_order, tp_price=None, sl_price=None, is_closing_order=False):
+    def _submit_order_impl(self, trading_order, tp_price=None, sl_price=None, is_closing_order=False, use_complex_order=False):
         if not self._submit_order_result:
             return None
         trading_order.status = OrderStatus.FILLED

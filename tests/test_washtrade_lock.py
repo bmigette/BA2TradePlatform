@@ -175,6 +175,95 @@ class TestSubmitOrderGate:
         assert result.status == OrderStatus.WASHTRADE_LOCKED
 
 
+class _RecordingAccount(MockAccount):
+    """Records how _submit_order_impl was called, and whether the adjust_* bracket block ran."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.impl_calls = []
+        self.adjust_calls = []
+
+    def _submit_order_impl(self, trading_order, tp_price=None, sl_price=None,
+                           is_closing_order=False, use_complex_order=False):
+        self.impl_calls.append({'tp': tp_price, 'sl': sl_price, 'complex': use_complex_order})
+        return super()._submit_order_impl(trading_order, tp_price=tp_price, sl_price=sl_price,
+                                          is_closing_order=is_closing_order,
+                                          use_complex_order=use_complex_order)
+
+    def adjust_tp_sl(self, transaction, tp_price, sl_price, source=None):
+        self.adjust_calls.append('tp_sl')
+
+    def adjust_tp(self, transaction, tp_price, source=None):
+        self.adjust_calls.append('tp')
+
+    def adjust_sl(self, transaction, sl_price, source=None):
+        self.adjust_calls.append('sl')
+
+
+class TestComplexOrderEscape:
+    """A blocked order with protective prices goes out as a COMPLEX order instead of locking.
+
+    Alpaca exempts bracket/OTO/OCO from the wash-trade check — verified against the live paper
+    API on 2026-08-05: an identical BUY was rejected 40310000 as MARKET and as marketable LIMIT,
+    then ACCEPTED and FILLED with order_class=BRACKET against the very same blocker.
+    See docs/WASHTRADE-LOCK.md.
+    """
+
+    def _blocked_order(self, acct):
+        create_trading_order(account_id=acct.id, symbol="AAPL",
+                             side=OrderDirection.SELL, status=OrderStatus.NEW,
+                             order_type=OrderType.SELL_STOP)
+        txn = create_transaction(symbol="AAPL", side=OrderDirection.BUY,
+                                 status=TransactionStatus.WAITING)
+        return TradingOrder(account_id=acct.id, symbol="AAPL", quantity=1.0,
+                            side=OrderDirection.BUY, order_type=OrderType.MARKET,
+                            status=OrderStatus.PENDING, transaction_id=txn.id)
+
+    def test_blocked_with_tp_and_sl_submits_as_complex(self):
+        acct = _RecordingAccount(create_account_definition().id)
+        result = AccountInterface.submit_order(acct, self._blocked_order(acct),
+                                               tp_price=200.0, sl_price=90.0)
+        assert result.status != OrderStatus.WASHTRADE_LOCKED
+        assert acct.impl_calls[-1]['complex'] is True
+
+    def test_blocked_with_only_sl_submits_as_complex(self):
+        """One leg is enough — the broker takes it as OTO."""
+        acct = _RecordingAccount(create_account_definition().id)
+        result = AccountInterface.submit_order(acct, self._blocked_order(acct), sl_price=90.0)
+        assert result.status != OrderStatus.WASHTRADE_LOCKED
+        assert acct.impl_calls[-1]['complex'] is True
+
+    def test_blocked_with_no_protective_price_still_locks(self):
+        """The fallback survives: with neither TP nor SL there is no complex order to form."""
+        acct = _RecordingAccount(create_account_definition().id)
+        result = AccountInterface.submit_order(acct, self._blocked_order(acct))
+        assert result.status == OrderStatus.WASHTRADE_LOCKED
+        assert acct.impl_calls == []  # never reached the broker
+
+    def test_unblocked_order_is_not_made_complex(self):
+        """REGRESSION GUARD: the uncontended path must be untouched by this feature.
+
+        Without a blocker the order stays a plain order and the normal adjust_* bracket block
+        still creates the protective legs.
+        """
+        acct = _RecordingAccount(create_account_definition().id)
+        txn = create_transaction(symbol="AAPL", side=OrderDirection.BUY,
+                                 status=TransactionStatus.WAITING)
+        order = TradingOrder(account_id=acct.id, symbol="AAPL", quantity=1.0,
+                             side=OrderDirection.BUY, order_type=OrderType.MARKET,
+                             status=OrderStatus.PENDING, transaction_id=txn.id)
+        AccountInterface.submit_order(acct, order, tp_price=200.0, sl_price=90.0)
+        assert acct.impl_calls[-1]['complex'] is False
+        assert acct.adjust_calls == ['tp_sl']
+
+    def test_complex_submission_does_not_also_call_adjust(self):
+        """The broker built the legs; calling adjust_* too would place a DUPLICATE pair."""
+        acct = _RecordingAccount(create_account_definition().id)
+        AccountInterface.submit_order(acct, self._blocked_order(acct),
+                                      tp_price=200.0, sl_price=90.0)
+        assert acct.adjust_calls == []
+
+
 class _PromotingAccount(MockAccount):
     """MockAccount whose submit_order records calls and persists FILLED.
 
@@ -221,3 +310,84 @@ class TestRefreshPromotion:
 
         assert locked.id not in _PromotingAccount.submitted
         assert get_instance(TradingOrder, locked.id).status == OrderStatus.WASHTRADE_LOCKED
+
+
+class TestLockExpiry:
+    """A lock that outlives its signal is a deadlock, not a wait.
+
+    Measured 2026-08-05: 13 entries stuck up to 9 days, every one of them blocked by a
+    protective SELL_STOP guarding an OPEN position — a blocker that stays working at the broker
+    for the life of that position and so can never clear on its own.
+    """
+
+    def _setup(self, monkeypatch, age_hours):
+        from datetime import datetime, timedelta, timezone
+        _PromotingAccount.submitted = []
+        acct_def = create_account_definition()
+        monkeypatch.setattr(accounts_mod, "get_account_class", lambda provider: _PromotingAccount)
+        txn = create_transaction(symbol="AAPL", side=OrderDirection.BUY,
+                                 status=TransactionStatus.WAITING)
+        locked = create_trading_order(
+            account_id=acct_def.id, symbol="AAPL", side=OrderDirection.BUY,
+            order_type=OrderType.MARKET, status=OrderStatus.WASHTRADE_LOCKED,
+            transaction_id=txn.id,
+            created_at=datetime.now(timezone.utc) - timedelta(hours=age_hours))
+        return acct_def, txn, locked
+
+    def _blocker(self, acct_def):
+        return create_trading_order(account_id=acct_def.id, symbol="AAPL",
+                                    side=OrderDirection.SELL, status=OrderStatus.NEW,
+                                    order_type=OrderType.SELL_STOP)
+
+    def test_fresh_lock_is_left_alone(self, monkeypatch):
+        acct_def, txn, locked = self._setup(monkeypatch, age_hours=2)
+        self._blocker(acct_def)
+
+        TradeManager()._check_all_washtrade_locked_orders()
+
+        assert get_instance(TradingOrder, locked.id).status == OrderStatus.WASHTRADE_LOCKED
+
+    def test_stale_lock_is_cancelled(self, monkeypatch):
+        acct_def, txn, locked = self._setup(monkeypatch, age_hours=48)
+        self._blocker(acct_def)
+
+        TradeManager()._check_all_washtrade_locked_orders()
+
+        assert get_instance(TradingOrder, locked.id).status == OrderStatus.CANCELED
+        assert locked.id not in _PromotingAccount.submitted
+
+    def test_stale_lock_fails_its_waiting_transaction(self, monkeypatch):
+        from ba2_trade_platform.core.models import Transaction
+        acct_def, txn, locked = self._setup(monkeypatch, age_hours=48)
+        self._blocker(acct_def)
+
+        TradeManager()._check_all_washtrade_locked_orders()
+
+        assert get_instance(Transaction, txn.id).status == TransactionStatus.FAILED
+
+    def test_stale_lock_cancels_its_waiting_protective_leg(self, monkeypatch):
+        """Otherwise the leg waits forever on a parent status that will never arrive."""
+        acct_def, txn, locked = self._setup(monkeypatch, age_hours=48)
+        self._blocker(acct_def)
+        leg = create_trading_order(account_id=acct_def.id, symbol="AAPL",
+                                   side=OrderDirection.SELL, order_type=OrderType.SELL_STOP,
+                                   status=OrderStatus.WAITING_TRIGGER, transaction_id=txn.id,
+                                   depends_on_order=locked.id,
+                                   depends_order_status_trigger=OrderStatus.FILLED)
+
+        TradeManager()._check_all_washtrade_locked_orders()
+
+        assert get_instance(TradingOrder, leg.id).status == OrderStatus.CANCELED
+
+    def test_clearing_beats_expiry(self, monkeypatch):
+        """A stale lock whose symbol is now CLEAR submits normally — it is not cancelled.
+
+        Expiry is the give-up path for orders that are still blocked, not a blanket age cap.
+        """
+        acct_def, txn, locked = self._setup(monkeypatch, age_hours=48)
+        # no blocker created
+
+        TradeManager()._check_all_washtrade_locked_orders()
+
+        assert locked.id in _PromotingAccount.submitted
+        assert get_instance(TradingOrder, locked.id).status == OrderStatus.FILLED

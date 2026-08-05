@@ -29,7 +29,7 @@ class AccountInterface(ReadOnlyAccountInterface):
 
 
     @abstractmethod
-    def _submit_order_impl(self, trading_order, tp_price: Optional[float] = None, sl_price: Optional[float] = None, is_closing_order: bool = False) -> Any:
+    def _submit_order_impl(self, trading_order, tp_price: Optional[float] = None, sl_price: Optional[float] = None, is_closing_order: bool = False, use_complex_order: bool = False) -> Any:
         """
         Internal implementation of order submission. This method should be implemented by child classes.
         The public submit_order method will call this after validation.
@@ -39,6 +39,12 @@ class AccountInterface(ReadOnlyAccountInterface):
             tp_price: Optional take profit price for bracket orders (broker-specific support).
             sl_price: Optional stop loss price for bracket orders (broker-specific support).
             is_closing_order: If True, this order closes an existing position (skip hedging checks).
+            use_complex_order: If True, submit as a native complex order (bracket/OTO) with the
+                given tp_price/sl_price as attached legs, instead of a plain order plus separate
+                protective legs. Set by ``submit_order`` when an opposing order is working at the
+                broker, because complex orders are exempt from the wash-trade check. Brokers that
+                do not support complex orders may ignore it; at least one of tp_price/sl_price is
+                guaranteed non-None when it is True.
 
         Returns:
             Any: The created order object if successful. Returns None or raises an exception if failed.
@@ -217,11 +223,21 @@ class AccountInterface(ReadOnlyAccountInterface):
         # Log successful validation (using captured values to avoid any potential issues)
         logger.info(f"Order validation passed for {symbol} - {side.value} {quantity} @ {order_type.value}")
 
-        # Wash-trade lock (broker-agnostic): hold a primary open/close order when an
-        # opposite-side order is already working at the broker for this symbol — most
-        # brokers (e.g. Alpaca, code 40310000) reject the second one as a wash trade.
-        # The order stays in the DB as WASHTRADE_LOCKED and is re-submitted by
-        # TradeManager once the symbol clears. Protective TP/SL legs are exempt.
+        # Wash-trade gate (broker-agnostic): an opposite-side order already working at the
+        # broker for this symbol makes most brokers (e.g. Alpaca, code 40310000) reject a
+        # plain market/stop/limit order as a wash trade.
+        #
+        # Brokers exempt COMPLEX orders (bracket/OTO/OCO) from that check — Alpaca's own
+        # rejection says "use complex orders", and this was verified against the live paper
+        # API on 2026-08-05 (see docs/WASHTRADE-LOCK.md for the probe table). So when a
+        # blocker exists and we have at least one protective price to attach, submit the
+        # order as a complex order and let it through rather than locking it.
+        #
+        # Locking is the fallback for orders that cannot form a complex order (no TP and no
+        # SL). It is only safe as a fallback: a lock waits for the blocker to clear, and a
+        # protective stop guarding an open position never does. TradeManager expires locks
+        # that outlive their signal.
+        use_complex_order = False
         if self._is_washtrade_lock_candidate(trading_order):
             # A dependent leg's own parent is a genuine bracket pair the broker accepts, so it
             # must not lock its own leg; any OTHER opposing order still does.
@@ -230,25 +246,46 @@ class AccountInterface(ReadOnlyAccountInterface):
                 exclude_order_id=getattr(trading_order, 'depends_on_order', None),
             )
             if blocker is not None:
-                trading_order.status = OrderStatus.WASHTRADE_LOCKED
-                update_instance(trading_order)
                 blocker_status = blocker.status.value if hasattr(blocker.status, 'value') else blocker.status
-                logger.info(
-                    f"Order {trading_order.id} ({symbol} {side.value}) set WASHTRADE_LOCKED: "
-                    f"opposite-side order {blocker.id} ({blocker.side.value}, {blocker_status}) "
-                    f"is working at the broker; will retry on next refresh"
-                )
-                return trading_order
+                if tp_price or sl_price:
+                    use_complex_order = True
+                    logger.info(
+                        f"Order {trading_order.id} ({symbol} {side.value}) is blocked by "
+                        f"opposite-side order {blocker.id} ({blocker.side.value}, {blocker_status}) "
+                        f"— submitting as a complex order (tp={tp_price}, sl={sl_price}) instead "
+                        f"of locking; complex orders are exempt from the wash-trade check"
+                    )
+                else:
+                    trading_order.status = OrderStatus.WASHTRADE_LOCKED
+                    update_instance(trading_order)
+                    logger.info(
+                        f"Order {trading_order.id} ({symbol} {side.value}) set WASHTRADE_LOCKED: "
+                        f"opposite-side order {blocker.id} ({blocker.side.value}, {blocker_status}) "
+                        f"is working at the broker and no TP/SL is available to form a complex "
+                        f"order; will retry on next refresh"
+                    )
+                    return trading_order
 
         # Call the child class implementation (this will update the order with broker_order_id)
         # Pass tp_price and sl_price for brokers that support bracket orders
         # The trading_order object is now detached but all attributes are accessible
-        result = self._submit_order_impl(trading_order, tp_price=tp_price, sl_price=sl_price, is_closing_order=is_closing_order)
+        result = self._submit_order_impl(trading_order, tp_price=tp_price, sl_price=sl_price,
+                                         is_closing_order=is_closing_order,
+                                         use_complex_order=use_complex_order)
         
         # Set TP and/or SL if provided and order was successfully submitted
         # Use adjust methods which create OCO/OTO orders (avoids code duplication)
         # The skip logic in adjust_tp_sl will prevent redundant calls if caller calls again
-        if result and result.transaction_id:
+        #
+        # Skipped entirely for a complex submission: the broker built the protective legs as
+        # part of the order itself, so calling adjust_* here would place a SECOND, duplicate
+        # set of legs against the same position.
+        if use_complex_order:
+            logger.debug(
+                f"Order {trading_order.id}: protective legs came from the complex order itself "
+                f"— skipping the adjust_tp/adjust_sl bracket block"
+            )
+        elif result and result.transaction_id:
             transaction = get_instance(Transaction, result.transaction_id)
             if transaction:
                 if tp_price and sl_price:

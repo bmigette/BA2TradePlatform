@@ -25,6 +25,17 @@ _REFRESH_LOCK = threading.Lock()
 _REGIME_BENCHMARK = "SPY"
 _LIVE_REGIME_CACHE = {"day": None, "stressed": None}
 
+# Wash-trade lock lifetime. A lock is a WAIT, and a wait that outlives its signal is a
+# deadlock: an entry blocked by a protective stop on an open position can never clear on
+# its own, because that stop stays working at the broker for the life of the position.
+# Measured 2026-08-05: 13 entries stuck this way, the oldest for 9 days. Past the max age
+# the order is cancelled rather than retried forever — a market entry signal a day stale is
+# not one that should still fill. See docs/WASHTRADE-LOCK.md.
+_WASHTRADE_LOCK_MAX_AGE_HOURS = 24.0
+# Below the max age but past this, log at WARNING instead of DEBUG. The 2026-08-05 deadlock
+# went unnoticed for 9 days precisely because a still-blocked order only logged at DEBUG.
+_WASHTRADE_LOCK_WARN_AGE_HOURS = 1.0
+
 
 def classify_waiting_trigger(parent_status, trigger_status):
     """Decide what to do with a WAITING_TRIGGER dependent order given its parent's current
@@ -373,10 +384,22 @@ class TradeManager:
                     exclude_order_id=getattr(order, 'depends_on_order', None),
                 )
                 if blocker is not None:
-                    self.logger.debug(
+                    age_hours = self._washtrade_lock_age_hours(order)
+                    if age_hours is not None and age_hours >= _WASHTRADE_LOCK_MAX_AGE_HOURS:
+                        self._expire_washtrade_locked_order(order, blocker, age_hours)
+                        continue
+                    msg = (
+                        f"Order {order_id} ({order.symbol} {order.side.value}) still locked "
+                        f"after {age_hours:.1f}h: opposite-side order {blocker.id} "
+                        f"({blocker.order_type.value}) working at broker"
+                        if age_hours is not None else
                         f"Order {order_id} ({order.symbol} {order.side.value}) still locked: "
                         f"opposite-side order {blocker.id} working at broker"
                     )
+                    if age_hours is not None and age_hours >= _WASHTRADE_LOCK_WARN_AGE_HOURS:
+                        self.logger.warning(msg)
+                    else:
+                        self.logger.debug(msg)
                     continue
 
                 # Infer whether this is a closing order (side opposite to its position).
@@ -406,6 +429,71 @@ class TradeManager:
                 account.submit_order(order, sl_price=sl_price, is_closing_order=is_closing)
             except Exception as e:
                 self.logger.error(f"Error processing WASHTRADE_LOCKED order {order_id}: {e}", exc_info=True)
+
+    @staticmethod
+    def _washtrade_lock_age_hours(order) -> Optional[float]:
+        """Hours since ``order`` was created, or None when it carries no timestamp.
+
+        A missing ``created_at`` must never be treated as age 0 (would disable the expiry
+        silently) nor as infinitely old (would cancel a fresh order); callers skip the age
+        checks entirely on None.
+        """
+        created_at = getattr(order, 'created_at', None)
+        if not created_at:
+            return None
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - created_at).total_seconds() / 3600.0
+
+    def _expire_washtrade_locked_order(self, order, blocker, age_hours: float) -> None:
+        """Give up on a lock that can no longer clear: cancel the order and fail its transaction.
+
+        Safe to do without talking to the broker — WASHTRADE_LOCKED is an unsent status (see
+        OrderStatus.get_unsent_statuses()), so nothing is working at the broker for this order.
+
+        Also cancels any WAITING_TRIGGER protective leg hanging off it. Those legs wait on a
+        parent status that will now never arrive, so leaving them would just move the leak.
+        """
+        from sqlmodel import select
+        from .db import get_db
+        from .types import TransactionStatus
+
+        self.logger.warning(
+            f"Order {order.id} ({order.symbol} {order.side.value} {order.quantity}) locked "
+            f"{age_hours:.1f}h (limit {_WASHTRADE_LOCK_MAX_AGE_HOURS}h) behind opposite-side order "
+            f"{blocker.id} ({blocker.order_type.value}, still working) — cancelling: the entry "
+            f"signal is stale and this blocker may never clear"
+        )
+        order.status = OrderStatus.CANCELED
+        update_instance(order)
+
+        with get_db() as session:
+            dependents = session.exec(
+                select(TradingOrder).where(
+                    TradingOrder.depends_on_order == order.id,
+                    TradingOrder.status == OrderStatus.WAITING_TRIGGER,
+                )
+            ).all()
+            dependent_ids = [d.id for d in dependents]
+        for dep_id in dependent_ids:
+            dep = get_instance(TradingOrder, dep_id)
+            if dep and dep.status == OrderStatus.WAITING_TRIGGER:
+                dep.status = OrderStatus.CANCELED
+                update_instance(dep)
+                self.logger.info(f"Cancelled protective leg {dep_id} of expired locked order {order.id}")
+
+        # Only fail a transaction this order never managed to open. An OPENED transaction has
+        # other filled orders behind it and a real position at the broker; the expired order was
+        # an add-on, not the position itself.
+        if order.transaction_id:
+            txn = get_instance(Transaction, order.transaction_id)
+            if txn and txn.status == TransactionStatus.WAITING:
+                txn.status = TransactionStatus.FAILED
+                update_instance(txn)
+                self.logger.warning(
+                    f"Transaction {txn.id} ({txn.symbol}) marked FAILED — its entry order "
+                    f"{order.id} expired in WASHTRADE_LOCKED without ever reaching the broker"
+                )
 
     def _check_all_waiting_trigger_orders(self):
         """

@@ -829,7 +829,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         return BrokerOrderErrorReason.UNKNOWN
 
     @alpaca_api_retry
-    def _submit_order_impl(self, trading_order: TradingOrder, tp_price: Optional[float] = None, sl_price: Optional[float] = None, is_closing_order: bool = False) -> TradingOrder:
+    def _submit_order_impl(self, trading_order: TradingOrder, tp_price: Optional[float] = None, sl_price: Optional[float] = None, is_closing_order: bool = False, use_complex_order: bool = False) -> TradingOrder:
         """
         Submit a new order to Alpaca.
         
@@ -1063,7 +1063,41 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 
             else:
                 raise ValueError(f"Unsupported order type: {trading_order.order_type} (value: {order_type_value})")
-            
+
+            # Wash-trade escape: attach the protective legs to THIS order so it goes to Alpaca as
+            # a complex order. Alpaca exempts BRACKET/OTO/OCO from the wash-trade check that
+            # rejects plain orders with 40310000 when an opposite-side market/stop order is
+            # working (verified against the paper API 2026-08-05 — see docs/WASHTRADE-LOCK.md).
+            # submit_order() sets this flag only on the blocked branch, and guarantees at least
+            # one of tp_price/sl_price is present. The order type is unchanged; only order_class
+            # gains legs, so an unblocked order is untouched by this.
+            if use_complex_order:
+                if trading_order.order_type == CoreOrderType.OCO:
+                    # Already a complex order — it carries its own legs and is exempt as-is.
+                    logger.debug(f"Order {trading_order.id} is already OCO; no extra legs needed")
+                else:
+                    legs = {}
+                    if tp_price:
+                        legs['take_profit'] = TakeProfitRequest(
+                            limit_price=self._round_price(tp_price, trading_order.symbol))
+                    if sl_price:
+                        rounded_sl = self._round_price(sl_price, trading_order.symbol)
+                        legs['stop_loss'] = StopLossRequest(stop_price=rounded_sl)
+                    if not legs:
+                        raise ValueError(
+                            f"use_complex_order set for order {trading_order.id} but neither "
+                            f"tp_price nor sl_price was provided"
+                        )
+                    order_request.order_class = (
+                        OrderClass.BRACKET if len(legs) == 2 else OrderClass.OTO)
+                    for leg_name, leg in legs.items():
+                        setattr(order_request, leg_name, leg)
+                    logger.info(
+                        f"Order {trading_order.id} ({trading_order.symbol}) submitted as "
+                        f"{order_request.order_class.value.upper()} to bypass the wash-trade block "
+                        f"(tp={tp_price}, sl={sl_price})"
+                    )
+
             logger.debug(f"Submitting Alpaca order: {order_request} (client_order_id={trading_order.id})")
             alpaca_order = self.client.submit_order(order_request)
             logger.info(f"Successfully submitted order to Alpaca: broker_order_id={alpaca_order.id}")
@@ -1097,8 +1131,21 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 # Step 4a: Handle OCO order legs - extract leg order IDs from broker response
                 logger.debug(f"Checking for OCO legs: fresh_order.order_type={fresh_order.order_type}, is OCO: {fresh_order.order_type == CoreOrderType.OCO}")
                 logger.debug(f"Alpaca order: has order_class={hasattr(alpaca_order, 'order_class')}, value={getattr(alpaca_order, 'order_class', None)}")
-                if fresh_order.order_type == CoreOrderType.OCO and alpaca_order.order_class == OrderClass.OCO:
+                submitted_class = getattr(alpaca_order, 'order_class', None)
+                if fresh_order.order_type == CoreOrderType.OCO and submitted_class == OrderClass.OCO:
                     logger.info(f"Order {fresh_order.id} is OCO, inserting legs...")
+                    self._insert_oco_order_legs(alpaca_order, fresh_order, trading_order.transaction_id)
+                elif submitted_class in (OrderClass.BRACKET, OrderClass.OTO):
+                    # Wash-trade escape path: this entry went out as a complex order, so ALPACA
+                    # created the protective legs, not us. Adopt them into our own TradingOrder
+                    # rows now — submit_order() skipped its adjust_tp/adjust_sl block precisely
+                    # so we would not place a duplicate set. The leg reader is generic over the
+                    # legs array (it classifies TP vs SL by which prices are present), so the
+                    # same helper works for BRACKET/OTO as for OCO.
+                    logger.info(
+                        f"Order {fresh_order.id} submitted as {submitted_class.value.upper()}, "
+                        f"adopting broker-created protective legs..."
+                    )
                     self._insert_oco_order_legs(alpaca_order, fresh_order, trading_order.transaction_id)
                 else:
                     logger.debug(f"Skipping OCO leg insertion for order {fresh_order.id}")

@@ -2997,8 +2997,14 @@ class BacktestAccount(AccountInterface, OptionsAccountInterface):
         tp_price: Optional[float] = None,
         sl_price: Optional[float] = None,
         is_closing_order: bool = False,
+        use_complex_order: bool = False,
     ) -> Any:
         """Called by the INHERITED ``submit_order`` after validation/persistence.
+
+        ``use_complex_order`` is accepted for signature parity and ignored: it is the live
+        wash-trade escape (see docs/WASHTRADE-LOCK.md), and the simulated broker has no
+        wash-trade rule, so it can never be set here — ``_find_opposing_working_order``
+        would have to find a blocker first.
 
         Assign a synthetic broker id and mark the order working; the per-bar fill engine
         (``refresh_orders``) decides when/whether it fills. We do NOT reimplement

@@ -1,7 +1,22 @@
 # WASHTRADE_LOCKED order status — design
 
 Date: 2026-06-03
-Status: Approved design, ready for implementation plan
+Status: **Partly superseded — see `docs/WASHTRADE-LOCK.md`.**
+
+> The `WASHTRADE_LOCKED` status semantics (§1), the gate mechanics (§2), the
+> dependent-chain behaviour (§4) and the UI treatment (§6) below are still
+> accurate. Two sections are obsolete:
+>
+> - **§2.1 exempting TP/SL legs** — reversed 2026-08-03 after 8 protective legs
+>   were rejected `40310000` by unrelated orders and died in `ERROR`, leaving a
+>   position unprotected. Legs are lock candidates now.
+> - **§5 "No expiry"** — its own revisit trigger ("locks surviving across
+>   sessions") fired on 2026-08-05 with 13 orders stuck up to 9 days.
+>
+> Note the last line of "Problem" below already records that bracket/OCO
+> ("complex") orders are exempt from the wash-trade rule. That is the fix
+> eventually adopted; it was written down on day one and not acted on for two
+> months.
 
 ## Problem
 
