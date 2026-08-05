@@ -162,7 +162,12 @@ def test_dd_below_reference_scores_STRICTLY_BETTER():
     f10 = compute_fitness("consistent_annual_return", _r(max_drawdown=-10.0))
     f19 = compute_fitness("consistent_annual_return", _r(max_drawdown=-19.0))
     f20 = compute_fitness("consistent_annual_return", _r(max_drawdown=-20.0))
-    assert f4 > f10 > f19 > f20                      # strictly monotone, no plateau
+    # 2026-08-05: dd_guard is now CAPPED at 2.0, which is exactly 20/10 -- so the gradient is
+    # strictly monotone between the cap boundary and the reference, and deliberately FLAT below
+    # it. Paying ever more for ever smaller drawdowns is what let a 4-trade/yr genome outrank a
+    # richer one; below 10% the number is usually thinness rather than skill.
+    assert f4 == f10                                 # flat below the cap boundary, by design
+    assert f10 > f19 > f20                           # still strictly monotone above it
     assert f10 == pytest.approx(30.0 * 20.0 / 10.0)  # 2.0x at half the reference
 
 
@@ -177,7 +182,7 @@ def test_tiny_drawdown_is_floored_not_infinite():
     (the calmar failure mode). Clamped at 1%, so the multiplier tops out at 20x — and anything
     at or below the floor scores the same, which is why the floor is kept small enough that it
     effectively never binds on real runs (observed drawdowns run 8.5-34%)."""
-    capped = 30.0 * 20.0 / 1.0
+    capped = 30.0 * 2.0          # dd_guard ceiling (was 20/1 = 20.0 before the 2026-08-05 cap)
     assert compute_fitness("consistent_annual_return", _r(max_drawdown=-1.0)) == pytest.approx(capped)
     assert compute_fitness("consistent_annual_return", _r(max_drawdown=-0.1)) == pytest.approx(capped)
     assert compute_fitness("consistent_annual_return", _r(max_drawdown=0.0)) == pytest.approx(capped)
@@ -198,8 +203,9 @@ def test_15_trades_per_year_half_credit():
 
 def test_zero_point_three_trades_per_year_tiny_but_nonzero():
     # Thin (near-zero) trading is heavily discounted, but proportionally -- not sentinel-flattened.
-    assert compute_fitness("consistent_annual_return", _r(avg_trades_per_year=0.3)) == pytest.approx(
-        30.0 * (0.3 / 30.0))
+    # 2026-08-05: 0.3 trades/yr is now DISQUALIFIED by the hard floor rather than scored tiny.
+    # A ramp alone let such configs win when paired with a small drawdown.
+    assert compute_fitness("consistent_annual_return", _r(avg_trades_per_year=0.3)) == LOW_TRADE_SENTINEL
 
 
 def test_30_trades_per_year_passes():
@@ -281,3 +287,51 @@ def test_unknown_metric_error_lists_new_metric():
     with pytest.raises(ValueError) as ei:
         compute_fitness("not_a_metric", {"total_trades": 1})
     assert "consistent_annual_return" in str(ei.value)
+
+
+# ---------------------------------------------------------------------------------------------
+# Hard trade floor + dd_guard ceiling (2026-08-05)
+#
+# Both added after the goal2020 mid band produced a 4.2 trades/yr winner (17 trades / 4 years).
+# The proportional ramp scaled it to 0.14 but could not stop it: an uncapped dd_guard handed its
+# 3.86% drawdown a 5.18x multiplier, which outweighed everything. Measured head-to-head, that
+# genome (13.3% return) outranked one making 27.2% on 155 trades.
+# ---------------------------------------------------------------------------------------------
+
+def test_below_hard_trade_floor_is_disqualified():
+    """Under 12 trades/yr the config is excluded outright, not merely scaled."""
+    r = _r(total_trades=17, avg_trades_per_year=4.2)
+    assert compute_fitness("consistent_annual_return", r) == LOW_TRADE_SENTINEL
+
+
+def test_at_the_hard_floor_is_scored_normally():
+    r = _r(total_trades=48, avg_trades_per_year=12.0)
+    assert compute_fitness("consistent_annual_return", r) > 0
+
+
+def test_just_below_the_floor_is_disqualified():
+    r = _r(total_trades=47, avg_trades_per_year=11.9)
+    assert compute_fitness("consistent_annual_return", r) == LOW_TRADE_SENTINEL
+
+
+def test_dd_guard_is_capped():
+    """A 1% drawdown used to collect 20x; it now collects the 2.0 ceiling."""
+    tiny = _r(max_drawdown=-1.0, avg_trades_per_year=40.0)
+    ten = _r(max_drawdown=-10.0, avg_trades_per_year=40.0)
+    # both sit at/above the cap boundary: 20/1 -> capped 2.0, 20/10 -> exactly 2.0
+    assert compute_fitness("consistent_annual_return", tiny) == pytest.approx(compute_fitness("consistent_annual_return", ten))
+
+
+def test_dd_guard_gradient_survives_above_the_cap_boundary():
+    """Between 10% and 20% drawdown the Calmar gradient must still bite."""
+    dd10 = compute_fitness("consistent_annual_return", _r(max_drawdown=-10.0, avg_trades_per_year=40.0))
+    dd15 = compute_fitness("consistent_annual_return", _r(max_drawdown=-15.0, avg_trades_per_year=40.0))
+    dd20 = compute_fitness("consistent_annual_return", _r(max_drawdown=-20.0, avg_trades_per_year=40.0))
+    assert dd10 > dd15 > dd20
+
+
+def test_cap_barely_touches_a_healthy_config():
+    """The goal2020 large winner sits at 9.1% dd -> 2.20 uncapped, 2.0 capped: ~9% haircut, not a
+    re-ranking. The cap is aimed at sub-10% thinness, not at real configs."""
+    r = _r(max_drawdown=-9.1, avg_trades_per_year=134.0)
+    assert compute_fitness("consistent_annual_return", r) > 0

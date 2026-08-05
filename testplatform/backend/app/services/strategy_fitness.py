@@ -36,6 +36,21 @@ WIPED_OUT_SENTINEL = -2.0e9
 # --- consistent_annual_return metric constants -------------------------------------------------
 # Goal: ~30% return EVERY year — not 50% one year / 10% the next.
 _CAR_MIN_TRADES_PER_YEAR = 30.0   # trade_gate ramp target: full credit at/above this, linear below
+
+# HARD trade-frequency floor: below this a config is DISQUALIFIED, not merely scaled down. The
+# proportional ramp alone was not enough -- on the mid band a 4.2 trades/yr genome won its job
+# outright (17 trades over 4 years), because a 0.14 gate multiplied against a huge low-drawdown
+# dd_guard still beat every richer config. A handful of trades cannot evidence an edge whatever
+# its ratios, so it is excluded rather than ranked.
+_CAR_HARD_MIN_TRADES_PER_YEAR = 12.0
+
+# Ceiling on the drawdown reward. dd_guard is 20/dd, i.e. base x dd_guard IS 20 x Calmar, so an
+# unbounded guard lets a tiny-drawdown config buy its way past a materially better one: measured
+# at dd 3.86% it collected 5.18x. Capping at 2.0 keeps the full Calmar gradient down to a 10%
+# drawdown -- which is where real configs live (the goal2020 large winner sits at 9.1%, barely
+# touched) -- and stops paying for drawdowns below that, where the number is usually thinness
+# rather than skill.
+_CAR_DD_GUARD_MAX = 2.0
 _CAR_DD_REFERENCE = 20.0          # % drawdown scoring exactly 1.0; below scores >1, above <1
 _CAR_DD_FLOOR = 1.0               # % floor on dd before dividing -- divide-by-zero rail only
 _CAR_CONSISTENCY_FLOOR = 0.25     # worst_year/mean_year clamp lower bound
@@ -375,6 +390,8 @@ def _consistent_annual_return(results: dict) -> float:
         tpy = (total / years) if years > 0 else None
     if tpy is None:
         return LOW_TRADE_SENTINEL  # genuinely no trade-frequency data to score against
+    if float(tpy) < _CAR_HARD_MIN_TRADES_PER_YEAR:
+        return LOW_TRADE_SENTINEL          # disqualified: too few trades to evidence anything
     trade_gate = min(max(float(tpy) / _CAR_MIN_TRADES_PER_YEAR, 0.0), 1.0)
 
     if base <= 0:
@@ -406,7 +423,7 @@ def _consistent_annual_return(results: dict) -> float:
     # fix serves both and no second metric is needed. CAR fitness numbers from BEFORE this change
     # are NOT comparable with numbers after it; rankings within a single run still are.
     dd = abs(float(results.get("max_drawdown") or 0.0))
-    dd_guard = _CAR_DD_REFERENCE / max(dd, _CAR_DD_FLOOR)
+    dd_guard = min(_CAR_DD_REFERENCE / max(dd, _CAR_DD_FLOOR), _CAR_DD_GUARD_MAX)
 
     # --- yearly consistency ----------------------------------------------------------------------
     consistency = _consistency_factor(_calendar_year_returns(results.get("equity_curve")))
