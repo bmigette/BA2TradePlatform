@@ -297,6 +297,12 @@ def _resolve_workers(db: Any, worker_ids: Optional[list]) -> list:
     return [{"id": w.id, "name": w.name, "url": w.url, "password": w.password} for w in rows]
 
 
+class _FatalTrialError(RuntimeError):
+    """A trial failed for a reason that will affect EVERY remaining trial (incomplete prewarm,
+    missing OHLCV cache). Raised out of the fitness batch to stop the search immediately rather
+    than spending the full generation budget producing a result nobody should trust."""
+
+
 def _fail(opt_id: int, db: Any, msg: str) -> Dict[str, Any]:
     """Mark the StrategyOptimization row failed + return the failure dict."""
     logger.error(f"strategy_optimization {opt_id} failed: {msg}")
@@ -638,6 +644,14 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                                            + (f" | worker mem: {mem}" if mem else ""))
                             if out.get("fatal") and fatal["msg"] is None:
                                 fatal["msg"] = out["error"]
+                                # ABORT NOW, not at the end. A fatal is a DATA/CONFIG problem --
+                                # an incomplete prewarm, a missing OHLCV cache -- so it affects
+                                # every remaining trial identically. Before this, fatal["msg"] was
+                                # recorded and then only consulted if all_results ended up EMPTY;
+                                # when most trials happened to succeed (the goal2020 OP case) the
+                                # run ground through all 8 generations and reported a confident
+                                # winner chosen partly by which genomes dodged the broken data.
+                                raise _FatalTrialError(out["error"])
                     if best["fitness"] is None or fit > best["fitness"]:
                         best["fitness"] = fit
                         best["params"] = flat
@@ -789,6 +803,13 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 initial_population=init_pop,
                 batch_fitness=batch_fitness,
             )
+        except _FatalTrialError as e:
+            # Stops at the CURRENT generation rather than completing the search on data that is
+            # known to be incomplete. Whatever was evaluated so far is discarded deliberately:
+            # a partial population scored against a crippled universe is not a result.
+            logger.error(f"strategy_optimization {opt_id}: ABORTING at generation "
+                         f"{gen_state['gen'] + 1}/{ga['generations']} — {e}")
+            return _fail(opt_id, db, str(e))
         finally:
             _logging.disable(_prior_disable)
             if _evaluator is not None:

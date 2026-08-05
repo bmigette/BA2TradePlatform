@@ -13,6 +13,7 @@ Providers that assume a list then crash when they slice/index the dict
 * unexpected dict -> ``FMPError`` immediately (raw payload logged, no retry)
 """
 
+import os as _os
 import threading
 import time
 from contextlib import contextmanager
@@ -106,6 +107,76 @@ def hermetic_fmp_history():
 _PERSIST_EMPTY_SENTINEL = False
 
 
+# --- hermetic miss policy --------------------------------------------------
+# A missing per-symbol history used to raise, which FAILED THE WHOLE TRIAL. Measured on the
+# goal2020 grid: ONE symbol (OP, never prewarmed) killed 77 trials across three jobs, and because
+# a failed trial is scored at the always-worst sentinel, the GA was taught to avoid every screener
+# region containing that symbol -- a selection bias produced by a missing file.
+#
+# So the policy is two-tier, and the tiers answer different questions:
+#
+#   1 symbol missing  -> a data gap for ONE instrument. Skip it (empty history = no signal, the
+#                        same thing an empty-sentinel file means) and let the trial stand. Logged
+#                        ONCE per symbol so it is visible without flooding.
+#   N symbols missing -> the PREWARM ITSELF is broken. Every trial is now scoring a crippled
+#                        universe, so finishing 8 generations produces a confidently wrong answer.
+#                        Raise: _trial_worker marks FMPHistoryCacheMiss fatal, and the handler
+#                        aborts the job immediately.
+#
+# Counted in DISTINCT SYMBOLS, not miss events: one symbol missed 77 times is one gap, whereas ten
+# different symbols is a systematically incomplete cache. Per-process (each trial worker is its own
+# process), which is the right scope -- the question is whether THIS run's cache is sound.
+_HERMETIC_MISS_LIMIT = int(_os.environ.get("BA2_PREWARM_MISS_LIMIT") or 10)
+_hermetic_misses: set = set()
+
+
+def hermetic_miss_symbols() -> set:
+    """Distinct ``namespace/symbol`` histories skipped this process (diagnostics/tests)."""
+    return set(_hermetic_misses)
+
+
+def reset_hermetic_misses() -> None:
+    """Clear the miss registry AND the memoized empties it produced, between runs.
+
+    Both halves matter. ``_record_hermetic_miss`` returns ``[]``, which the in-process history memo
+    then caches — so on a second run the memo would serve that empty WITHOUT going through the
+    recorder, the symbol would never be re-registered, and the abort counter would under-count a
+    cache that is still just as broken. Dropping the memo entries keeps the registry an honest
+    picture of THIS run.
+    """
+    for key in _hermetic_misses:
+        ns, _, sym = key.partition("/")
+        _HISTORY_MEM_CACHE.invalidate(f"{ns}__{sym.upper()}")
+    _hermetic_misses.clear()
+
+
+def _record_hermetic_miss(namespace: str, symbol: str):
+    """Register a hermetic cache miss, then skip the symbol -- or abort once too many are missing."""
+    import logging as _logging
+
+    key = f"{namespace}/{symbol}"
+    first_time = key not in _hermetic_misses
+    _hermetic_misses.add(key)
+
+    if len(_hermetic_misses) >= _HERMETIC_MISS_LIMIT:
+        missing = ", ".join(sorted(_hermetic_misses)[:20])
+        raise FMPHistoryCacheMiss(
+            f"{len(_hermetic_misses)} distinct fmp_history datasets are not pre-warmed "
+            f"(limit {_HERMETIC_MISS_LIMIT}) — the cache is incomplete, so every trial is scoring "
+            f"a crippled universe. Aborting instead of finishing the search. Missing: {missing}. "
+            f"Run `ba2-test prewarm` for this universe, then re-run."
+        )
+
+    if first_time:
+        # WARNING so it survives the optimizer's logging.disable(INFO); once per symbol per
+        # process, so a persistent gap is visible without one line per bar.
+        _logging.getLogger(__name__).warning(
+            "fmp_history '%s' not pre-warmed — DISABLING this symbol for the run (%d/%d before "
+            "abort). Run `ba2-test prewarm` to close the gap.",
+            key, len(_hermetic_misses), _HERMETIC_MISS_LIMIT)
+    return []
+
+
 @contextmanager
 def persist_empty_sentinel():
     """Within this context a genuinely-empty FMP history is cached as ``[]`` (prewarm sentinel).
@@ -184,13 +255,10 @@ def _fmp_history_disk_read_or_fetch(namespace: str, symbol: str, fetch_fn: Calla
     except Exception:  # corrupt / partial / unreadable -> re-fetch (or raise, hermetic)
         pass
 
-    # HERMETIC backtest: NEVER network-fetch — a miss means the data wasn't pre-warmed. Raise a
-    # clear, actionable error (0-fetch guarantee) instead of a silent multi-minute network grind.
+    # HERMETIC backtest: NEVER network-fetch — a miss means the data wasn't pre-warmed.
+    # ONE missing symbol DISABLES THAT SYMBOL; MANY abort the run. See _record_hermetic_miss.
     if _is_hermetic_fmp_history():
-        raise FMPHistoryCacheMiss(
-            f"fmp_history '{namespace}/{symbol}' not pre-warmed (hermetic backtest, 0 fetch). "
-            f"Run `ba2-test prewarm` for this universe before backtesting."
-        )
+        return _record_hermetic_miss(namespace, symbol)
 
     # 2. Fetch. Any error PROPAGATES to the caller and is NEVER cached, so the failure is
     #    retried on the next run instead of poisoning the cache with a bad value.
@@ -240,6 +308,12 @@ class TTLCache:
         self._clock = clock
         self._store: dict = {}
         self._lock = threading.Lock()
+
+    def invalidate(self, key) -> None:
+        """Drop one entry. Used to un-memoize a hermetic cache-miss empty (see
+        reset_hermetic_misses) so a later run re-evaluates it instead of inheriting the empty."""
+        with self._lock:
+            self._store.pop(key, None)
 
     def get_or_call(self, key, fn: Callable[[], Any]) -> Any:
         with self._lock:

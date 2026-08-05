@@ -1023,7 +1023,7 @@ def recompute_atr_columns(store_dir: str, ohlcv_get, *,
 # prefixed keys are silently ignored and only ``market_cap_max`` filters.
 METRIC_STORE_KEYS = (
     "market_cap_min", "market_cap_max", "price_min", "price_max",
-    "volume_min", "volume_max", "float_min", "float_max",
+    "volume_min", "volume_max", "dollar_volume_min", "float_min", "float_max",
     "relative_volume_min", "price_drop_pct", "price_drop_days",
     "weinstein_stage2_only", "max_stocks", "sort_metric",
 )
@@ -1047,6 +1047,34 @@ def normalize_screener_settings(screener_settings: Dict[str, Any]) -> Dict[str, 
     return out
 
 
+# --- symbols excluded from every screened universe -------------------------------------------
+# Deliberately a SHORT, EVIDENCE-BACKED list, not a dumping ground. A symbol earns a place here
+# only when its STORE DATA is wrong in a way the numeric gates cannot catch — i.e. it would be
+# selected on values that do not describe a tradeable instrument.
+#
+# OP (added 2026-08-05, goal2020 grid). A collapsed nano-cap whose split-adjusted history explodes
+# backwards: median close $47,060 in 2021 on a median FOUR shares/day, decaying to $348 on 2,357
+# shares/day by 2025 — roughly $130k of daily turnover throughout, i.e. untradeable at any size.
+# Its stored market_cap is computed off those adjusted prices and reads $35 BILLION in Dec 2021
+# (range 1.3e6 .. 3.5e10), which is what put it in the MID band ($2-10bn) and into FMPRating's
+# universe. It was also never prewarmed, so it additionally crashed 77 trials across three
+# goal2020 jobs before the hermetic miss became non-fatal.
+#
+# The durable fix for the whole CLASS is a dollar-volume floor (see ``dollar_volume_min``), which
+# is off by default because switching it on changes the universe for every run and would make new
+# results non-comparable with existing ones. This list handles the one case already known to be
+# poisoning a live grid.
+EXCLUDED_SYMBOLS = frozenset({"OP"})
+
+
+def _drop_excluded(d: "pd.DataFrame") -> "pd.DataFrame":
+    """Remove EXCLUDED_SYMBOLS. Applied to every store-driven universe selection so a known-bad
+    symbol cannot enter through any gate combination."""
+    if not EXCLUDED_SYMBOLS or "symbol" not in d.columns:
+        return d
+    return d[~d["symbol"].isin(EXCLUDED_SYMBOLS)]
+
+
 def screen_universe_for_day(store_df: "pd.DataFrame", day: str,
                             settings: Dict[str, Any]) -> List[str]:
     """The dynamic per-day universe for one individual's screener thresholds.
@@ -1057,7 +1085,7 @@ def screen_universe_for_day(store_df: "pd.DataFrame", day: str,
     rows, matching the slow StockScreener Stage-2 filter), max_stocks, sort_metric ('market_cap'|
     'relative_volume'|'price_drop_pct'). Returns the selected symbols (<= max_stocks), sorted by
     sort_metric desc. Pure in-memory filter over the precomputed row values — microseconds."""
-    d = store_df[store_df["date"] == day]
+    d = _drop_excluded(store_df[store_df["date"] == day])
     if d.empty:
         return []
     def _ge(col, key):
@@ -1073,6 +1101,13 @@ def screen_universe_for_day(store_df: "pd.DataFrame", day: str,
     _ge("market_cap", "market_cap_min"); _le("market_cap", "market_cap_max")
     _ge("price", "price_min"); _le("price", "price_max")
     _ge("volume", "volume_min"); _le("volume", "volume_max")
+    # Dollar-volume floor (price x volume). OFF unless set: turning it on changes the universe for
+    # every run, so it must be an explicit choice, not a silent default. This is the general form
+    # of what EXCLUDED_SYMBOLS handles case-by-case -- OP passed every existing gate on a $35bn
+    # phantom market cap while turning over ~$130k/day.
+    _dvmin = settings.get("dollar_volume_min")
+    if _dvmin is not None and float(_dvmin) > 0:
+        d = d[(d["price"] * d["volume"]) >= float(_dvmin)]
     # Free float (point-in-time, baked into the store). A row with UNKNOWN float (NaN) PASSES the
     # gate (graceful degradation): this matches the column-absent skip for a pure legacy store AND
     # avoids silently dropping legacy-month symbols in an incrementally-rebuilt MIXED-schema store
@@ -1175,7 +1210,7 @@ def screened_symbol_union(store_df: "pd.DataFrame", start_day: str, end_day: str
         return []
     prior = [d for d in dates if d <= start_day]
     lo = prior[-1] if prior else dates[0]
-    d = store_df[(store_df["date"] >= lo) & (store_df["date"] <= end_day)]
+    d = _drop_excluded(store_df[(store_df["date"] >= lo) & (store_df["date"] <= end_day)])
     if d.empty:
         return []
 
@@ -1194,6 +1229,13 @@ def screened_symbol_union(store_df: "pd.DataFrame", start_day: str, end_day: str
     _ge("market_cap", "market_cap_min"); _le("market_cap", "market_cap_max")
     _ge("price", "price_min"); _le("price", "price_max")
     _ge("volume", "volume_min"); _le("volume", "volume_max")
+    # Dollar-volume floor (price x volume). OFF unless set: turning it on changes the universe for
+    # every run, so it must be an explicit choice, not a silent default. This is the general form
+    # of what EXCLUDED_SYMBOLS handles case-by-case -- OP passed every existing gate on a $35bn
+    # phantom market cap while turning over ~$130k/day.
+    _dvmin = settings.get("dollar_volume_min")
+    if _dvmin is not None and float(_dvmin) > 0:
+        d = d[(d["price"] * d["volume"]) >= float(_dvmin)]
     if "float_shares" in d.columns:
         _fmin = settings.get("float_min")
         if _fmin is not None and float(_fmin) > 0:

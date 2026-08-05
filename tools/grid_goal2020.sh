@@ -148,6 +148,31 @@ echo; echo "=== matrix 2/2  notional  $(date)"
 run_matrix notional -goal2020-notional --skip-experts FactorRanker "$@"
 echo "=== matrix 2/2  done $(date)"
 
+# --- matrices 3 & 4: the S5/S6/S7 strategies -------------------------------------------------
+# These are CLASSIC-expert strategies, not Senate ones, and they were run against FMPRating (S5 x6,
+# S6 x5, S7 x6), FMPEarningsDrift and FMPInsiderClusterBuy in earlier grids. They were never in
+# THIS driver's default (git: only ever S1,S2,S3,S4 -> S1,S2,S3), so without them goal2020 would
+# not actually be re-optimizing everything that has been explored -- which is its whole purpose.
+#
+# It matters most for S7: it is a faithful replica of the archived 186.53% FMPRating S2-large
+# winner (backtest #91 / opt 23, calmar 3.66, dd -11.52%). S5 is an S2/S3 hybrid derived from that
+# same winner, S6 the high-frequency quick-cycle from the -tpsl S2-large run. Every prior result
+# for all three is invalidated twice over: scored with the inert DaysOpened conditions AND on the
+# pre-2026-08-04 CAR scale.
+#
+# Runs LAST, as separate matrices, so the S1/S2/S3 answer lands first and this is purely additive:
+# +45 jobs (measured), i.e. roughly double the wall time. Set STRATEGIES_EXTRA= to skip.
+STRATEGIES_EXTRA="${STRATEGIES_EXTRA-S5,S6,S7}"
+if [ -n "$STRATEGIES_EXTRA" ]; then
+  echo; echo "=== matrix 3/4  risk_atr  strategies=$STRATEGIES_EXTRA  $(date)"
+  run_matrix risk_atr -goal2020-riskatr --strategies "$STRATEGIES_EXTRA" "$@"
+  echo "=== matrix 3/4  done $(date)"
+
+  echo; echo "=== matrix 4/4  notional  strategies=$STRATEGIES_EXTRA  $(date)"
+  run_matrix notional -goal2020-notional --skip-experts FactorRanker --strategies "$STRATEGIES_EXTRA" "$@"
+  echo "=== matrix 4/4  done $(date)"
+fi
+
 echo; echo "=== goal2020 COMPLETE $(date) ==="
 echo "Compare with:  ba2-test report   (labels: goal2020-riskatr / goal2020-notional)"
 echo "Worth checking beyond fitness: whether the two modes put"

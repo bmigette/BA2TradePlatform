@@ -37,6 +37,29 @@ else
   echo "STOPPED no grid process running"
 fi
 
+# --- 1b. orphaned spawn-pool children ----------------------------------------------------------
+# Survivors of an earlier kill, holding GBs and reporting to nobody. Worth its own line because
+# the symptom is indirect: on 2026-08-05 eight of them held 10.3 GB, took the box to 96.8% memory
+# and STALLED the running grid mid-generation for ~40 min. Nothing in the grid's own log says
+# "you are out of memory" except the RSS figure on the gen lines.
+read -r N_ORPH MB_ORPH <<<"$(powershell -NoProfile -Command "
+  \$o = @(Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object {
+      \$_.CommandLine -like '*--multiprocessing-fork*' -and
+      \$null -eq (Get-Process -Id \$_.ParentProcessId -ErrorAction SilentlyContinue) })
+  '{0} {1}' -f \$o.Count, [math]::Round((\$o | Measure-Object WorkingSetSize -Sum).Sum/1MB)" 2>/dev/null)"
+if [ "${N_ORPH:-0}" -gt 0 ]; then
+  echo "!! ORPHANS ${N_ORPH} spawn-pool process(es) holding ${MB_ORPH} MB with a DEAD parent."
+  echo "   They will never finish anything. Free them:  bash tools/grid_stop.sh --orphans-only"
+fi
+
+# --- 1c. host memory ---------------------------------------------------------------------------
+powershell -NoProfile -Command "
+  \$os = Get-CimInstance Win32_OperatingSystem
+  \$free = [math]::Round(\$os.FreePhysicalMemory/1KB)
+  \$pct  = [math]::Round(100-100*\$os.FreePhysicalMemory/\$os.TotalVisibleMemorySize,1)
+  \$flag = if (\$free -lt 5000) { '  <- LOW: the grid stalls, it does not crash' } else { '' }
+  'MEM     {0} MB free ({1}% used){2}' -f \$free, \$pct, \$flag" 2>/dev/null
+
 # --- 2. distributed or local-only? -------------------------------------------------------------
 if [ -f "$LOG" ]; then
   if grep -q "DISTRIBUTED across" "$LOG"; then

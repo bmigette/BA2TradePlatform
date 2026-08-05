@@ -19,18 +19,34 @@ set -u
 cd "$(dirname "$0")/.."
 
 DRY=0
-[ "${1:-}" = "--dry-run" ] && DRY=1
+ONLY_ORPHANS=0
+case "${1:-}" in
+  --dry-run)      DRY=1 ;;
+  --orphans-only) ONLY_ORPHANS=1 ;;   # free leaked workers WITHOUT stopping a healthy run
+esac
 
 powershell -NoProfile -Command "
 \$dry = $DRY
+\$onlyOrphans = $ONLY_ORPHANS
 
 \$groups = @(
   @{ n='1. wrapper script'; p={ \$_.Name -eq 'bash.exe' -and \$_.CommandLine -like '* tools/grid_goal2020.sh' } },
   @{ n='2. matrix driver' ; p={ \$_.CommandLine -like '*run_screener_capband_matrix*' } },
-  @{ n='3. optimize / pool workers'; p={ \$_.CommandLine -like '*BA2TradePlatform\.venv*' } }
+  @{ n='3. optimize / pool workers'; p={ \$_.CommandLine -like '*BA2TradePlatform\.venv*' } },
+  # 4. SPAWN-POOL ORPHANS. These do NOT match tier 3: a multiprocessing spawn child runs from the
+  # BASE interpreter (AppData\Local\Programs\Python) with a bare "--multiprocessing-fork" command
+  # line, so the repo-venv path never appears in it. Missing them is not cosmetic -- on 2026-08-05
+  # eight survivors of earlier kills held 10.3 GB, drove the box to 96.8% memory, and STALLED the
+  # running grid for ~40 minutes mid-generation. Only ones whose PARENT IS GONE are touched: a
+  # live pool's children belong to a running job and must never be killed from here.
+  @{ n='4. orphaned spawn-pool children'; p={
+        \$_.CommandLine -like '*--multiprocessing-fork*' -and
+        \$null -eq (Get-Process -Id \$_.ParentProcessId -ErrorAction SilentlyContinue) } }
 )
 
 foreach (\$g in \$groups) {
+  # --orphans-only: skip tiers 1-3 so a HEALTHY run keeps going and only the leaked children die.
+  if (\$onlyOrphans -and \$g.n -notlike '4.*') { continue }
   # Never match a PowerShell process: the grid never runs under one, but THIS query does -- and
   # group 3's venv pattern happily matches the very shell executing it.
   \$procs = @(Get-CimInstance Win32_Process | Where-Object \$g.p |
@@ -53,13 +69,15 @@ if (\$dry) { 'DRY RUN — nothing was killed.' } else {
   \$left = @(Get-CimInstance Win32_Process | Where-Object {
       \$_.CommandLine -like '*grid_goal2020.sh' -or
       \$_.CommandLine -like '*run_screener_capband_matrix*' -or
-      \$_.CommandLine -like '*BA2TradePlatform\.venv*' })
+      \$_.CommandLine -like '*BA2TradePlatform\.venv*' -or
+      (\$_.CommandLine -like '*--multiprocessing-fork*' -and
+       \$null -eq (Get-Process -Id \$_.ParentProcessId -ErrorAction SilentlyContinue)) })
   'remaining grid processes : {0}' -f \$left.Count
   'live platform (ba2-trade): {0}  <- must still be > 0' -f @(Get-CimInstance Win32_Process | Where-Object { \$_.CommandLine -like '*ba2-trade*' }).Count
 }
 " 2>/dev/null
 
-if [ "$DRY" = "0" ]; then
+if [ "$DRY" = "0" ] && [ "$ONLY_ORPHANS" = "0" ]; then
   echo
   echo "Next: mark the interrupted row so its NAME is free and it can never be read as a result."
   echo "A half-finished GA has no usable winner, and a duplicate name is what broke the senate"
