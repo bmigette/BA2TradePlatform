@@ -240,6 +240,42 @@ class FactorRanker(MarketExpertInterface):
     # Pipeline helpers
     # ------------------------------------------------------------------
 
+    def validate_deployed_settings(self) -> None:
+        """Flag a deploy whose factor ranking cannot do anything.
+
+        ``long_only_top_n`` does ``picks = ranked[:top_n]``. When the candidate pool is already
+        <= ``top_n`` that slice discards NOTHING: the expert holds the whole screener output,
+        equal-weighted, and factor_weight_{momentum,value,quality,pead} have zero effect on what
+        is held. The genome still LOOKS tuned, and the backtest that justified it ran the same
+        way, so nothing downstream ever notices.
+
+        Found live 2026-08-06 on 3 of 6 FactorRanker instances (14: top_n 15 >= max_stocks 10;
+        26: 30 >= 30; 27: 35 >= 30). Two of those differed only in inert genes, so they held the
+        same names on one account at ~2x combined exposure — something neither backtest modelled.
+
+        Warns rather than raises: those instances are live, and blocking the save would make an
+        existing bad config unfixable through the normal path.
+        """
+        try:
+            if self._resolve_universe_source() != "screener":
+                return  # a static universe is not capped by the screener; top_n is meaningful
+            g = self.get_setting_with_interface_default
+            top_n = int(g("top_n") or 0)
+            max_stocks = int(g("screener_max_stocks") or 0)
+        except Exception as e:  # noqa: BLE001 — never fail a save over a diagnostic
+            self.logger.debug(f"FactorRanker: ranking-inertness check skipped ({e})")
+            return
+
+        if top_n and max_stocks and top_n >= max_stocks:
+            self.logger.warning(
+                f"FactorRanker instance {self.id}: RANKING IS INERT — top_n={top_n} >= "
+                f"screener_max_stocks={max_stocks}, so every screened candidate is held and the "
+                f"factor weights (momentum/value/quality/pead) have NO effect on selection. "
+                f"Set top_n < screener_max_stocks for the ranking to discriminate. NOTE: doing so "
+                f"changes the strategy to one the GA never evaluated — prefer re-optimising over "
+                f"hand-editing a deployed genome."
+            )
+
     def _metric_store_settings(self) -> Dict[str, Any]:
         """Translate this expert's ``screener_*``-prefixed settings into the UNPREFIXED
         keys the fast metric_store expects.

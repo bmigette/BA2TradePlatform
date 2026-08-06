@@ -249,9 +249,18 @@ class ExtendableSettingsInterface(ABC):
                 self._save_single_setting(session, key, value, setting_type)
             session.commit()
             logger.info(f"Saved settings for {lk_field}={self.id}: {settings}")
-            
+
             # Invalidate cache for account settings
             self._invalidate_settings_cache()
+
+            # Post-save sanity hook: the point where a DEPLOY lands, so a config that is
+            # internally consistent but strategically degenerate gets flagged once, loudly,
+            # instead of silently running for weeks. Must come AFTER the cache invalidation
+            # so the check reads the values just written, and must never fail the save.
+            try:
+                self.validate_deployed_settings()
+            except Exception as e:  # noqa: BLE001 — a bad check must not block a good save
+                logger.warning(f"validate_deployed_settings() failed for {lk_field}={self.id}: {e}")
         except Exception as e:
             session.rollback()
             logger.error(f"Error saving account settings: {e}", exc_info=True)
@@ -259,6 +268,21 @@ class ExtendableSettingsInterface(ABC):
         finally:
             session.close()
     
+    def validate_deployed_settings(self) -> None:
+        """Hook: sanity-check a freshly-saved settings set. Default no-op.
+
+        For configurations that are VALID (every key known, every value in range) but
+        strategically degenerate — the kind a GA can converge on and a deploy will happily
+        accept. Subclasses should LOG rather than raise: these instances are already live, and
+        refusing the save would make an existing bad config unfixable through the normal path.
+
+        Added 2026-08-06 after three live FactorRankers were found running with
+        ``top_n >= screener_max_stocks``, which silently makes the GA-optimised factor weights
+        do nothing (the ranker keeps its entire candidate pool). Nothing in the deploy path
+        looked at the relationship between those two settings.
+        """
+        return None
+
     def reset_settings(self):
         """
         Delete ALL existing settings rows for this instance, so a subsequent
