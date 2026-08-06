@@ -250,6 +250,12 @@ class FactorPortfolioManager:
             order = self._submit_delta(sym, int(delta), by_symbol.get(sym, []))
             if order is not None:
                 submitted.append(order)
+
+        # The stop price is a function of avg entry cost, held qty AND equity — a rebalance moves
+        # all three, so a stop priced at the original entry goes stale the moment a name is added
+        # to or trimmed. Re-price the survivors here, the same way every other expert's stop is
+        # maintained (adjust_sl), so the resting order keeps encoding the CURRENT rule.
+        self._resync_protective_stops(by_symbol, changed={s for s, d in deltas.items() if d})
         logger.info(
             f"FactorRanker[{self.expert_instance_id}]: rebalance submitted {len(submitted)} orders "
             f"(equity={equity:.2f}, deltas={deltas})"
@@ -260,71 +266,110 @@ class FactorPortfolioManager:
     # Per-name EQUITY-loss stop (reuses risk_per_trade_pct)
     # ------------------------------------------------------------------
 
-    def apply_stop_losses(self, risk_pct: float, equity: Optional[float] = None,
-                          prices: Optional[Dict[str, float]] = None) -> List[TradingOrder]:
-        """Sell (full exit) every held name whose unrealized loss has reached risk_pct% of
-        equity (per-name EQUITY-loss stop; reuses risk_per_trade_pct). Computes each symbol's
-        quantity-weighted avg entry cost from its OPENED transactions, uses get_virtual_balance()
-        for equity when not supplied, prices held names off the account when not supplied, runs
-        stop_loss_sells, and submits a market sell per stopped name via _submit_sell. Returns the
-        submitted orders. Non-positive risk_pct or no holdings -> no-op. Mirrors rebalance()'s
-        structure/logging.
+    # apply_stop_losses() REMOVED 2026-08-06.
+    #
+    # It priced every held name and submitted market sells -- i.e. it evaluated a stop against a
+    # price and issued the exit itself. That is execution, which belongs to the account/broker,
+    # not to expert code. It also had NO live caller and never had one, so live FactorRanker ran
+    # with no downside protection at all: 22 open positions across all 6 instances.
+    #
+    # The stop is now a RESTING ORDER priced by protective_stop_price() below (the same
+    # inequality stop_loss_sells encodes, solved for price). Alpaca enforces it live;
+    # BacktestAccount.refresh_orders fills it per bar in simulation. One mechanism, both sides.
+    #
+    # Leaving this method AND the resting order in place would DOUBLE-EXIT in backtest: the stop
+    # order fills, and this would submit a second market sell on the same bar.
+    #
+    # stop_loss_sells() is deliberately KEPT: it is pure (no IO, no orders) and is the canonical
+    # statement of the rule that protective_stop_price inverts.
+
+    def _resync_protective_stops(self, by_symbol: Dict[str, list], changed: set) -> None:
+        """Re-price the resting stop of every still-held name whose position just changed.
+
+        Best-effort and never raises: a stop that could not be amended is worse than one that
+        could, but far better than aborting a rebalance that has already submitted orders.
         """
-        held, by_symbol = self.get_holdings()
-        if not risk_pct or risk_pct <= 0 or not held:
-            return []
-
-        # Quantity-weighted avg entry COST per symbol from its OPENED transactions' recorded
-        # ``open_price``. This deliberately uses the per-transaction ``open_price`` (NOT the
-        # account ledger's ``_Position.avg_price``): the two are NOT identical once a name is
-        # ADDED TO across rebalances — ``open_price`` is the transaction's recorded entry price
-        # (stable per transaction) while the ledger ``avg_price`` re-weights across every fill.
-        # FactorRanker repeatedly adds to positions, so sourcing avg-cost from the ledger here
-        # would CHANGE stop-loss decisions (verified divergence). The qty NUMBERS still come from
-        # the ledger via ``held`` (identity-exact — see get_holdings); only the cost basis stays
-        # on the existing DB ``open_price`` path so stop results are byte-identical.
-        positions: Dict[str, tuple] = {}
-        for symbol, transactions in by_symbol.items():
-            total_qty = 0.0
-            cost_qty = 0.0
-            for trans in transactions:
-                qty = trans.open_qty
-                open_price = trans.open_price
-                if qty is None or qty <= 0 or open_price is None or open_price <= 0:
-                    continue
-                total_qty += qty
-                cost_qty += open_price * qty
-            if total_qty <= 0:
+        for symbol in sorted(changed):
+            transactions = by_symbol.get(symbol) or []
+            if not transactions:
+                continue  # fully exited — its protective leg is closed with the transaction
+            sl = self.protective_stop_price(symbol, transactions)
+            if sl is None:
                 continue
-            positions[symbol] = (cost_qty / total_qty, total_qty)
+            for trans in transactions:
+                try:
+                    self.account.adjust_sl(trans, sl, source="factorranker_rebalance")
+                except NotImplementedError:
+                    return  # broker cannot amend stops — nothing to retry per symbol
+                except Exception as e:  # noqa: BLE001 — one bad amend must not void the rebalance
+                    logger.warning(
+                        f"FactorRanker[{self.expert_instance_id}]: could not re-price the "
+                        f"protective stop for {symbol} to {sl:.4f}: {e}")
 
-        if not positions:
-            return []
+    def protective_stop_price(self, symbol: str, transactions: list,
+                              extra_qty: float = 0.0, extra_price: Optional[float] = None
+                              ) -> Optional[float]:
+        """The RESTING stop price that encodes this expert's per-name equity-loss rule.
 
-        if equity is None:
-            equity = self.expert.get_virtual_balance()
-        if equity is None:
-            logger.warning(
-                f"FactorRanker[{self.expert_instance_id}]: virtual balance (equity) not "
-                f"available for stop-loss; skipping"
-            )
-            return []
+        ``stop_loss_sells`` stops a name when its dollar loss reaches the equity budget:
 
-        if prices is None:
-            prices = {s: self.account.get_instrument_current_price(s) for s in positions}
+            held_qty * (avg_entry_cost - price) >= equity * risk_pct/100
 
-        sells = stop_loss_sells(positions, prices, equity, risk_pct)
+        which is a straight inequality in ``price``, so it collapses to one number:
 
-        submitted: List[TradingOrder] = []
-        for symbol, qty in sells.items():
-            order = self._submit_sell(symbol, qty, by_symbol.get(symbol, []))
-            if order is not None:
-                submitted.append(order)
-        logger.info(
-            f"FactorRanker[{self.expert_instance_id}]: stop-loss submitted {len(submitted)} sells "
-            f"(risk_pct={risk_pct}, equity={equity:.2f}, stopped={sells})"
-        )
-        return submitted
+            stop_price = avg_entry_cost - (equity * risk_pct / 100) / held_qty
+
+        Placing THAT as a real stop order is not an approximation of the rule -- it is the same
+        rule, enforced by whoever owns the order book.
+
+        WHY A RESTING ORDER AND NOT A PER-BAR CHECK (2026-08-06)
+        -------------------------------------------------------
+        The backtest evaluates the stop on every bar because a simulator has no exchange; that
+        per-bar pass IS the broker stand-in, not a cadence the live side should copy. Live, the
+        exchange already does it -- continuously, and while our platform is down. Porting the
+        loop into production instead of placing an order is how FactorRanker ended up as the ONLY
+        expert with no broker-side protection: 22 open positions across all 6 live instances with
+        no stop of any kind, because ``apply_stop_losses`` has no live caller and never had one.
+
+        With a real order, ``BacktestAccount.refresh_orders`` fills it per bar (it already fills
+        stop_price orders) and Alpaca fills it live -- one mechanism, no divergence to maintain.
+
+        ``extra_qty``/``extra_price`` fold in a buy that has not yet been persisted, so the stop
+        priced at entry reflects the position that is about to exist. Returns None when the rule
+        is off (no risk_pct), the inputs are unavailable, or the maths yields a non-positive
+        price -- a stop must never be invented from missing data.
+        """
+        try:
+            risk_pct = float(self.expert.get_setting_with_interface_default("risk_per_trade_pct") or 0.0)
+        except Exception:  # noqa: BLE001 — a stub expert -> no stop
+            return None
+        if risk_pct <= 0:
+            return None
+
+        equity = self.expert.get_virtual_balance()
+        if not equity or equity <= 0:
+            logger.warning(f"FactorRanker[{self.expert_instance_id}]: no virtual balance; "
+                           f"cannot price a protective stop for {symbol}")
+            return None
+
+        # Same quantity-weighted avg-entry-COST basis apply_stop_losses uses (per-transaction
+        # open_price, NOT the ledger avg) so the resting price and the simulated rule agree.
+        total_qty, cost_qty = 0.0, 0.0
+        for trans in (transactions or []):
+            qty, open_price = trans.open_qty, trans.open_price
+            if qty is None or qty <= 0 or open_price is None or open_price <= 0:
+                continue
+            total_qty += qty
+            cost_qty += open_price * qty
+        if extra_qty > 0 and extra_price and extra_price > 0:
+            total_qty += extra_qty
+            cost_qty += extra_price * extra_qty
+        if total_qty <= 0 or cost_qty <= 0:
+            return None
+
+        avg_cost = cost_qty / total_qty
+        stop = avg_cost - (equity * risk_pct / 100.0) / total_qty
+        return stop if stop > 0 else None
 
     def _submit_delta(self, symbol: str, delta: int, transactions: list) -> Optional[TradingOrder]:
         if delta > 0:
@@ -336,16 +381,16 @@ class FactorPortfolioManager:
     def _submit_buy(self, symbol: str, qty: int, transactions: list) -> Optional[TradingOrder]:
         if qty <= 0:
             return None
+        entry_price = self.account.get_instrument_current_price(symbol)
         if transactions:
             # Adding to an existing position — link to its OPENED transaction.
             transaction_id = transactions[0].id
         else:
             # New position — pre-create an expert-attributed transaction so the
             # holding is recognised on the next rebalance (attribution path 1).
-            price = self.account.get_instrument_current_price(symbol)
             trans = Transaction(
                 symbol=symbol, quantity=qty, side=OrderDirection.BUY,
-                status=TransactionStatus.WAITING, open_price=price,
+                status=TransactionStatus.WAITING, open_price=entry_price,
                 open_date=datetime.now(timezone.utc), expert_id=self.expert_instance_id,
             )
             transaction_id = add_instance(trans)
@@ -359,7 +404,19 @@ class FactorPortfolioManager:
             # Deliberate rebalance sizing — never let transaction qty-sync resize it.
             data={"fixed_quantity": True},
         )
-        return self.account.submit_order(order, is_closing_order=False)
+        # Attach the per-name equity-loss stop as a REAL protective order, via the same
+        # submit_order(sl_price=...) -> adjust_sl path every other expert uses. The broker (or
+        # BacktestAccount.refresh_orders, which fills stop_price orders per bar) then enforces
+        # it; nothing has to poll. Passing an sl_price also lets the wash-trade gate form an OTO
+        # when the symbol is blocked, instead of locking the entry.
+        sl_price = self.protective_stop_price(
+            symbol, transactions, extra_qty=qty, extra_price=entry_price)
+        if sl_price is None:
+            logger.warning(
+                f"FactorRanker[{self.expert_instance_id}]: no protective stop priced for "
+                f"{symbol} x{qty} — position will be UNPROTECTED at the broker"
+            )
+        return self.account.submit_order(order, sl_price=sl_price, is_closing_order=False)
 
     def _submit_sell(self, symbol: str, qty: int, transactions: list) -> Optional[TradingOrder]:
         if qty <= 0 or not transactions:

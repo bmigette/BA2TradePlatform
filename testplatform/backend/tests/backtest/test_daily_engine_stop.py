@@ -1,21 +1,22 @@
-"""Per-bar EQUITY-loss STOP for BYPASS experts (FactorRanker) in the daily engine.
+"""Downside protection for BYPASS-expert (FactorRanker) positions in the daily engine.
 
-A bypass expert (``bypasses_classic_rm = True``) sizes by weight and skips the classic
-risk manager, so between its scheduled rebalances a held name has NO downside protection.
-The fix is a per-name stop that reuses ``risk_per_trade_pct`` as a max-loss-per-name cap
-measured in % of TOTAL EQUITY: a held name is sold (full exit) when its unrealized dollar
-loss reaches ``equity * risk_per_trade_pct / 100``. The stop runs ONLY on NON-rebalance bars
-(the rebalance owns the book on its scheduled bars) and is lookahead-safe (it submits a
-MARKET sell that fills on a later bar per the fill model).
+A bypass expert (``bypasses_classic_rm = True``) sizes by weight and skips the classic risk
+manager, so a held name needs protection that does not come from the RM. Until 2026-08-06 the
+engine supplied it with a per-bar pass that called back into expert code to price every holding
+and submit market sells. That mechanism existed only in backtest — live FactorRanker positions
+had no stop at all — so it was replaced by the thing a broker actually does: FactorRanker attaches
+a RESTING ``SELL_STOP`` when it opens the position (``FactorPortfolioManager._submit_buy`` ->
+``protective_stop_price``), priced from the same equity-loss budget (``risk_per_trade_pct`` % of
+equity). Live, Alpaca holds it; here, ``BacktestAccount.refresh_orders`` fills it on the bar whose
+low touches the stop.
 
-This module has TWO layers:
+These tests are deliberately BEHAVIOURAL, not mechanical: they assert that a position which
+breaches the equity-loss budget is exited and one that does not is still held, without caring how
+the engine gets there. That is why they survived the rewrite unchanged.
 
-  * an END-TO-END engine bar test (the real ``DailyBacktestEngine.run`` loop, the simulated
-    AsOfPriceSource + BacktestAccount harness): a held bypass position that breaches the
-    equity-loss cap on a non-rebalance bar is EXITED; an otherwise-identical position whose
-    loss stays within the cap is NOT sold;
-  * gating unit tests for the ``_apply_bypass_stops`` helper (no-op when ``risk_per_trade_pct``
-    is unset / non-positive).
+Note the fill timing DID change: the stop now fills AT the stop price on the bar that touches it,
+rather than as a market order on the bar after a close-based check. Backtest numbers for
+FactorRanker before and after 2026-08-06 are not directly comparable.
 
 Run from the backend dir:
     ./venv/bin/python -m pytest tests/backtest/test_daily_engine_stop.py -v
@@ -196,13 +197,36 @@ def test_e2e_bypass_stop_exits_breached_name():
         aapl = [p for p in positions if p["symbol"] == "AAPL" and p.get("qty", 0) > 0]
         assert aapl == [], f"expected AAPL exited by the stop, still held: {aapl}"
 
-        # The exit was a real SELL FILL (not a cancel / a no-op): the stop submitted a market
-        # sell that filled on a later bar per the fill model.
+        # The exit was a real SELL FILL (not a cancel / a no-op).
         sell_fills = [
             t for t in account.get_filled_trades(symbol="AAPL")
             if str(t.get("direction") or t.get("side") or "").lower() == "sell"
         ]
         assert sell_fills, f"expected a filled stop SELL for AAPL, got {account.get_filled_trades('AAPL')}"
+
+        # ...and it was a RESTING SELL_STOP attached to the entry, filled AT the stop price —
+        # not a market sell submitted by a per-bar pass through expert code. This is the whole
+        # point of the 2026-08-06 change, so assert the mechanism, not just the outcome.
+        #
+        # The stop price is the equity-loss budget solved for price: entry 100, 50 shares,
+        # cap = 100k * 1% = $1000 -> 100 - 1000/50 = 80. The Friday bar (low 79) crosses it.
+        from ba2_common.core.types import OrderDirection, OrderType
+
+        stops = [o for o in account.get_orders()
+                 if o.symbol == "AAPL" and o.order_type == OrderType.SELL_STOP]
+        assert len(stops) == 1, f"expected exactly one resting SELL_STOP, got {stops}"
+        stop = stops[0]
+        assert stop.side == OrderDirection.SELL
+        assert stop.stop_price == 80.0, f"stop price {stop.stop_price} != equity-budget price 80.0"
+        assert stop.open_price == 80.0, "stop must fill AT the stop price, not at a market price"
+        assert stop.depends_on_order is not None, "stop must be attached to the entry order"
+
+        # And NOTHING else sold: a leftover per-bar stop pass would show up as a second,
+        # depends_on_order-less MARKET sell here (the double-exit this change had to avoid).
+        market_sells = [o for o in account.get_orders()
+                        if o.symbol == "AAPL" and o.side == OrderDirection.SELL
+                        and o.order_type == OrderType.MARKET]
+        assert market_sells == [], f"unexpected market sell(s) alongside the stop: {market_sells}"
     finally:
         ctx.__exit__(None, None, None)
 
@@ -221,104 +245,11 @@ def test_e2e_bypass_stop_keeps_name_within_cap():
         ctx.__exit__(None, None, None)
 
 
-# --------------------------------------------------------------------------- #
-# Gating unit tests for the _apply_bypass_stops helper
-# --------------------------------------------------------------------------- #
-
-def test_apply_bypass_stops_noop_when_risk_pct_unset(monkeypatch):
-    """When ``risk_per_trade_pct`` resolves to None/0, the helper does NOT touch the book
-    (no FactorPortfolioManager.apply_stop_losses call)."""
-    from app.services.backtest.daily_engine import DailyBacktestEngine
-    from ba2_experts.FactorRanker import portfolio as pf_mod
-
-    engine = DailyBacktestEngine.__new__(DailyBacktestEngine)  # no __init__ / no DB needed
-
-    class _Expert:
-        bypasses_classic_rm = True
-
-        def get_setting_with_interface_default(self, key, log_warning=False):
-            assert key == "risk_per_trade_pct"
-            return None  # unset
-
-    calls = []
-    monkeypatch.setattr(
-        pf_mod.FactorPortfolioManager, "apply_stop_losses",
-        lambda self, *a, **kw: calls.append((a, kw)), raising=True,
-    )
-
-    engine._apply_bypass_stops(_Expert(), 99, {}, datetime(2024, 1, 5))
-    assert calls == []
-
-
-def test_apply_bypass_stops_invokes_manager_when_risk_pct_set(monkeypatch):
-    """When ``risk_per_trade_pct`` is positive, the helper builds (once) and calls
-    FactorPortfolioManager(expert_id).apply_stop_losses(float(stop_pct), equity=...).
-
-    The manager + virtual_equity_pct are cached per run (perf #47): the per-bar stop reuses the
-    same manager and passes a cheaply-computed equity (account.get_balance() * pct) instead of
-    re-querying ExpertInstance twice per bar."""
-    from app.services.backtest.daily_engine import DailyBacktestEngine
-    from ba2_experts.FactorRanker import portfolio as pf_mod
-    import ba2_common.core.db as _db_mod
-
-    engine = DailyBacktestEngine.__new__(DailyBacktestEngine)
-    # Per-run caches normally set in __init__ (bypassed here via __new__).
-    engine._bypass_pm = {}
-    engine._bypass_veq_pct = {}
-
-    # The flat-account fast path gates on account.get_positions(); give the engine a stub
-    # account that reports a held position (so the helper proceeds) and a cash balance (used to
-    # compute the stop equity = balance * virtual_equity_pct/100).
-    class _Account:
-        def get_positions(self):
-            return [{"symbol": "AAPL", "qty": 1}]
-
-        def get_balance(self):
-            return 1000.0
-
-    engine.account = _Account()
-
-    class _Expert:
-        bypasses_classic_rm = True
-
-        def get_setting_with_interface_default(self, key, log_warning=False):
-            return 1.0
-
-    init_calls = []
-    apply_calls = []
-
-    def _fake_init(self, expert_instance_id):
-        init_calls.append(expert_instance_id)
-
-    class _Inst:
-        virtual_equity_pct = 100.0
-
-    monkeypatch.setattr(pf_mod.FactorPortfolioManager, "__init__", _fake_init, raising=True)
-    monkeypatch.setattr(
-        pf_mod.FactorPortfolioManager, "apply_stop_losses",
-        lambda self, stop_pct, equity=None, prices=None: apply_calls.append((stop_pct, equity)),
-        raising=True,
-    )
-    # _bypass_manager reads virtual_equity_pct via get_instance — stub it (no DB in this unit test).
-    monkeypatch.setattr(_db_mod, "get_instance", lambda *a, **k: _Inst(), raising=True)
-    # _bypass_manager resolves the manager CLASS through the instance resolver (PremiumSeller
-    # seam, spec §3.3) — wire a stub resolver returning the stub expert (no host seam wiring in
-    # this unit test). The stub declares no ``portfolio_manager_classpath``, so resolution still
-    # lands on the default FactorPortfolioManager.
-    import ba2_common.core.instance_resolver as _resolver_mod
-
-    class _Resolver:
-        def get_expert_instance(self, expert_id):
-            return _Expert()
-
-    monkeypatch.setattr(_resolver_mod, "_resolver", _Resolver(), raising=True)
-
-    engine._apply_bypass_stops(_Expert(), 77, {}, datetime(2024, 1, 5))
-    # Manager built ONCE for the expert; stop invoked with the pct and equity = 1000 * 100/100.
-    assert init_calls == [77]
-    assert apply_calls == [(1.0, 1000.0)]
-
-    # A SECOND bar reuses the cached manager (no new construction) — the perf win.
-    engine._apply_bypass_stops(_Expert(), 77, {}, datetime(2024, 1, 6))
-    assert init_calls == [77]
-    assert apply_calls == [(1.0, 1000.0), (1.0, 1000.0)]
+# The two gating unit tests that used to live here drove ``DailyBacktestEngine._apply_bypass_stops``
+# directly (no risk_per_trade_pct -> no call; positive -> one cached manager + one apply_stop_losses).
+# That helper was deleted on 2026-08-06 along with the whole per-bar expert-side stop pass, so the
+# tests were testing a mechanism that no longer exists. What replaced them:
+#
+#   * the two E2E tests ABOVE still pin the observable behaviour (breach -> exit, within cap -> held);
+#   * ``packages/experts/tests/test_factorranker_portfolio.py`` pins the stop PRICE and the fact that
+#     _submit_buy attaches it, which is where the rule now lives.

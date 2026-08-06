@@ -11,6 +11,8 @@ These tests pin the pure math (no DB / no account needed) the way the existing
 ``rebalance_deltas`` math would be tested: dollar-loss vs the equity cap, boundary
 (>=), skips, and a concrete equity-scaling case.
 """
+import pytest
+
 from ba2_experts.FactorRanker.portfolio import stop_loss_sells
 
 
@@ -105,3 +107,76 @@ def test_equity_scaling_5pct_weight_needs_20pct_price_drop():
 def test_price_none_explicit_skipped():
     out = stop_loss_sells({"AAA": (50.0, 100)}, {"AAA": None}, equity=100_000.0, risk_pct=1.0)
     assert out == {}
+
+
+# --- resting protective stop (2026-08-06) -----------------------------------------------------
+# FactorRanker was the ONLY expert with no broker-side protection: 22 live positions across all 6
+# instances had no stop of any kind, because apply_stop_losses has no live caller and never had
+# one. The per-bar pass in daily_engine is the SIMULATOR standing in for an exchange, not a
+# cadence to port into production -- so the stop is now a real order and the broker enforces it.
+
+class _Expert:
+    def __init__(self, risk_pct=1.0, equity=100_000.0):
+        self._risk, self._equity = risk_pct, equity
+    def get_setting_with_interface_default(self, key, **k):
+        return self._risk if key == "risk_per_trade_pct" else None
+    def get_virtual_balance(self):
+        return self._equity
+
+
+class _Trans:
+    def __init__(self, qty, price):
+        self.open_qty, self.open_price = qty, price
+
+
+def _pm(expert):
+    from ba2_experts.FactorRanker.portfolio import FactorPortfolioManager
+    pm = FactorPortfolioManager.__new__(FactorPortfolioManager)
+    pm.expert = expert
+    pm.expert_instance_id = 99
+    pm.account_id = 1
+    return pm
+
+
+def test_stop_price_is_the_same_rule_stop_loss_sells_applies():
+    """The resting price must be the exact boundary of the equity-loss inequality, so the order
+    and the simulated rule cannot disagree."""
+    from ba2_experts.FactorRanker.portfolio import stop_loss_sells
+    pm = _pm(_Expert(risk_pct=1.0, equity=100_000.0))
+    # 100 shares @ 50 -> budget 1000 -> stop at 50 - 1000/100 = 40
+    sl = pm.protective_stop_price("AAA", [_Trans(100, 50.0)])
+    assert sl == pytest.approx(40.0)
+    # just BELOW the stop the rule fires; just above it does not
+    assert stop_loss_sells({"AAA": (50.0, 100)}, {"AAA": sl - 0.01}, 100_000.0, 1.0) == {"AAA": 100}
+    assert stop_loss_sells({"AAA": (50.0, 100)}, {"AAA": sl + 0.01}, 100_000.0, 1.0) == {}
+
+
+def test_pending_buy_is_folded_into_the_price():
+    """A stop priced at entry must reflect the position about to exist, not the empty one."""
+    pm = _pm(_Expert(risk_pct=1.0, equity=100_000.0))
+    sl = pm.protective_stop_price("AAA", [], extra_qty=100, extra_price=50.0)
+    assert sl == pytest.approx(40.0)
+
+
+def test_adding_to_a_position_reprices_the_stop():
+    """avg cost AND qty both move, so the stop must move -- a stale stop is the bug this fixes."""
+    pm = _pm(_Expert(risk_pct=1.0, equity=100_000.0))
+    before = pm.protective_stop_price("AAA", [_Trans(100, 50.0)])
+    after = pm.protective_stop_price("AAA", [_Trans(100, 50.0)], extra_qty=100, extra_price=60.0)
+    # avg cost 55, qty 200 -> 55 - 1000/200 = 50.0
+    assert before == pytest.approx(40.0)
+    assert after == pytest.approx(50.0)
+
+
+def test_no_stop_is_invented_from_missing_inputs():
+    """Better unprotected-and-warned than protected at a fabricated price."""
+    assert _pm(_Expert(risk_pct=0)).protective_stop_price("AAA", [_Trans(100, 50.0)]) is None
+    assert _pm(_Expert(equity=0)).protective_stop_price("AAA", [_Trans(100, 50.0)]) is None
+    assert _pm(_Expert()).protective_stop_price("AAA", []) is None
+
+
+def test_stop_below_zero_is_refused():
+    """A risk budget larger than the position's whole value implies a negative stop -- not a
+    valid order; the caller warns and leaves it unprotected rather than sending nonsense."""
+    pm = _pm(_Expert(risk_pct=99.0, equity=1_000_000.0))
+    assert pm.protective_stop_price("AAA", [_Trans(10, 5.0)]) is None

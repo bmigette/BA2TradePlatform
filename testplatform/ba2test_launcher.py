@@ -1199,9 +1199,10 @@ _EXPERT_OPT = {
     #                  per-trial by _build_daily_trial_config).
     # universe_setting -> --universe is injected into its static_universe setting (it reads its
     #                  universe from that setting, NOT from enabled_instruments).
-    # no_bypass_rm  -> _BYPASS_RM_OPT's risk_per_trade_pct has no reader for it (the engine's
-    #                  _apply_bypass_stops skips managers without apply_stop_losses), so the
-    #                  gene would be dead weight.
+    # no_bypass_rm  -> _BYPASS_RM_OPT's risk_per_trade_pct has no reader for it: the gene prices
+    #                  FactorRanker's resting protective stop (protective_stop_price), and
+    #                  PremiumSeller's OptionPortfolioManager has no such stop (it owns its exits
+    #                  via manage_open), so the gene would be dead weight.
     "PremiumSeller": {
         "expert_params": {
             "iv_rank_min": {"optimize": True, "min": 20.0, "max": 60.0, "step": 10.0, "type": "float"},
@@ -1274,9 +1275,10 @@ _RM_OPT = {
 }
 
 # Bypass experts (FactorRanker) size their own portfolio and skip the classic per-trade RM
-# entirely, EXCEPT for one piece it still reuses: daily_engine.py's _apply_bypass_stops applies
-# risk_per_trade_pct as a per-name max-loss-vs-equity stop on non-rebalance bars (see that
-# method's docstring). Before 2026-07-19 this was left off bypass experts' gene space entirely,
+# entirely, EXCEPT for one piece it still reuses: risk_per_trade_pct is the per-name
+# max-loss-vs-equity budget, which FactorPortfolioManager.protective_stop_price turns into the
+# RESTING stop price attached to each entry (before 2026-08-06 the same number instead drove a
+# per-bar stop pass inside the engine; the gene's meaning is unchanged). Before 2026-07-19 this was left off bypass experts' gene space entirely,
 # so it sat frozen at MarketExpertInterface's 1.0% default for every band/individual — measured
 # as a major contributor to small-band FactorRanker underperformance (26.2% of small-band trades
 # were quick same-day stop-outs vs 3.1% for large). Exposed as its own (narrower) gene set so the
@@ -3017,9 +3019,9 @@ def _cmd_optimize_batch(args) -> int:
                 "parallelIndividuals": int(args.parallel),
                 # Bypass experts (FactorRanker, PremiumSeller) size their own portfolio and skip
                 # the full RM block + per-day schedule genes, but carry _BYPASS_RM_OPT
-                # (risk_per_trade_pct, read by daily_engine.py's _apply_bypass_stops) UNLESS the
-                # spec opts out via no_bypass_rm (PremiumSeller's manager owns its exits — the
-                # gene would be dead weight); ruleset experts get the expert params + the full
+                # (risk_per_trade_pct, which prices FactorRanker's resting protective stop)
+                # UNLESS the spec opts out via no_bypass_rm (PremiumSeller's manager owns its
+                # exits — the gene would be dead weight); ruleset experts get the full
                 # RM sizing/stop params + per-weekday entry-scan toggle genes.
                 "expert_params": (_bypass_gene_space(spec) if bypass
                                   else {**spec["expert_params"], **_RM_OPT,

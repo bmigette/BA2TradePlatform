@@ -412,18 +412,12 @@ class DailyBacktestEngine:
         # set only changes per scan date (weekly cadence), so it's computed once per scan date and
         # reused for every bar in that period (vs recomputing the full-store filter every 5min bar).
         self._screened_cache: Dict[str, List[str]] = {}
-        # BYPASS-expert (FactorRanker) per-run caches. The FactorPortfolioManager holds only
-        # run-CONSTANT state (the resolver expert/account instances + ids), and the per-bar stop
-        # pass runs on ~every non-rebalance 5min bar — so reconstructing the manager (and its
-        # ExpertInstance DB query) per bar was a profiled hotspot (~44% of the loop on a held
-        # book). Build it ONCE per expert and reuse. virtual_equity_pct is likewise run-constant,
-        # cached so the per-bar stop equity is account.get_balance() * pct with NO per-bar
-        # ExpertInstance query (get_virtual_balance's hidden DB round-trip). Results-identical:
-        # the cached manager reads live account/holdings on each call exactly as a fresh one did,
-        # and the passed equity equals get_virtual_balance()'s value bit-for-bit (same balance,
-        # same pct, same multiply order).
+        # BYPASS-expert (FactorRanker/PremiumSeller) per-run manager cache. The portfolio manager
+        # holds only run-CONSTANT state (the resolver expert/account instances + ids), so building
+        # it ONCE per expert avoids an ExpertInstance DB query on every rebalance bar.
+        # (``_bypass_veq_pct`` lived here too until 2026-08-06; it existed solely to feed the
+        # per-bar stop pass its equity, and went with it.)
         self._bypass_pm: Dict[int, Any] = {}
-        self._bypass_veq_pct: Dict[int, float] = {}
 
         # Entry-option path: when the run's enter_market action IS an option action (pure-option
         # entry, no equity leg), the option action must size + submit itself — so the entry runs
@@ -444,9 +438,7 @@ class DailyBacktestEngine:
         FactorRanker's FactorPortfolioManager; PremiumSeller declares its
         OptionPortfolioManager via ``portfolio_manager_classpath``).
 
-        Also caches the expert's ``virtual_equity_pct`` (read ONCE here, not per bar) so the
-        per-bar stop can compute equity without re-querying ExpertInstance. Both are stable for
-        the whole run; the manager itself reads live account state on every call.
+        The manager is stable for the whole run; it reads live account state on every call.
         """
         pm = self._bypass_pm.get(expert_id)
         if pm is None:
@@ -455,16 +447,6 @@ class DailyBacktestEngine:
             expert = get_instance_resolver().get_expert_instance(expert_id)
             pm = _resolve_bypass_manager_class(type(expert))(expert_id)
             self._bypass_pm[expert_id] = pm
-            try:
-                from ba2_common.core.db import get_instance
-                from ba2_common.core.models import ExpertInstance
-
-                inst = get_instance(ExpertInstance, expert_id)
-                self._bypass_veq_pct[expert_id] = float(
-                    getattr(inst, "virtual_equity_pct", None) or 100.0
-                )
-            except Exception:  # noqa: BLE001 — fall back to equity=None (method self-computes)
-                self._bypass_veq_pct[expert_id] = 100.0
         return pm
 
     # -- the loop -----------------------------------------------------------
@@ -607,8 +589,7 @@ class DailyBacktestEngine:
             #     ``allowed is not None`` it restricts which symbols may ENTER this bar — the
             #     ENTRY candidate universe fed to ``_run_expert_bar`` is intersected with it,
             #     PRESERVING bar order so determinism is unchanged. Open-position management /
-            #     exits are NOT gated: ``_manage_open_positions``, ``_apply_bypass_stops``,
-            #     the bypass rebalance, ``_apply_option_expiry`` and the OCO bracket fills all
+            #     exits are NOT gated: ``_manage_open_positions``, the bypass rebalance, ``_apply_option_expiry`` and the OCO bracket fills all
             #     run over held positions / the full universe regardless. When no screener is
             #     configured ``_screened_symbols_for_bar`` returns None and this is a no-op
             #     (byte-identical to a non-screener run — the hot path is untouched).
@@ -626,20 +607,25 @@ class DailyBacktestEngine:
             # the common no-event bars do zero order DB reads.
             book_dirty = False
 
-            # 2.5 per-bar STOP pass for bypass experts. The cadence-gated analyse/rebalance pass
-            #     below skips non-entry bars, so a bypass expert (sizes by weight, skips the classic
-            #     RM) gets its only between-rebalance downside protection here: a per-name equity-loss
-            #     stop reusing risk_per_trade_pct. Skipped on rebalance bars (the rebalance owns the book).
-            for expert, expert_id, settings, ruleset_id in self.experts:
-                if not getattr(expert, "bypasses_classic_rm", False):
-                    continue
-                if _schedule_allows_entry(as_of_dt, self._entry_schedule(expert),
-                                          self.price.is_intraday, _date_ctx):
-                    continue
-                if self._apply_bypass_stops(expert, expert_id, settings, as_of_dt):
-                    # Only mark dirty when a stop SELL was actually submitted; flat/no-sell bars
-                    # leave the order cache byte-identical and skip the invalidate_order_cache.
-                    book_dirty = True
+            # 2.5 REMOVED 2026-08-06 — the per-bar bypass STOP pass used to live here.
+            #
+            #     It called back into EXPERT code (FactorPortfolioManager.apply_stop_losses) once
+            #     per bar to price every held name, compare it against an equity-loss cap, and
+            #     submit market sells. That is the exchange's job, not the expert's: a per-bar
+            #     price check is precisely what a resting stop order IS, and the simulator already
+            #     owns one (``refresh_orders`` fills ``stop_price`` orders every bar, stops first).
+            #     Expert code re-implementing it produced a mechanism that existed ONLY in
+            #     backtest — live FactorRanker had no stop at all, and 22 open positions across 6
+            #     instances sat unprotected at the broker.
+            #
+            #     FactorRanker now attaches a resting SELL_STOP at entry (``_submit_buy`` ->
+            #     ``protective_stop_price``), so Alpaca enforces it live and ``refresh_orders``
+            #     fills it here — the same stop, one mechanism, both sides. Reinstating this pass
+            #     would DOUBLE-EXIT: the resting stop fills AND this submits a second market sell.
+            #
+            #     Consequence for results: a stop now fills AT the stop price on the bar that
+            #     touches it, not as a market order on the bar after a close-based check. Pre-2026-08-06
+            #     FactorRanker backtest numbers are therefore not directly comparable.
 
             # 3. each expert: analyze_as_of -> persist rec -> ruleset -> RM -> submit.
             #    BYPASS experts (piece 1b): an expert that declares ``bypasses_classic_rm``
@@ -1402,63 +1388,6 @@ class DailyBacktestEngine:
             self._bypass_manager(expert_id).rebalance(targets)
         except Exception as e:  # noqa: BLE001 — a rebalance failure must not kill the run
             self._log(f"bypass rebalance failed for expert {expert_id} @ {as_of:%Y-%m-%d}: {e}")
-
-    def _apply_bypass_stops(self, expert, expert_id, settings, as_of) -> bool:
-        """Per-name EQUITY-loss stop for a BYPASS expert (FactorRanker), reusing
-        risk_per_trade_pct as a max-loss-per-name cap (% of equity). Sells any held name
-        whose unrealized loss has reached that % of equity. Runs only on NON-rebalance bars
-        (the rebalance pass owns the book on its scheduled bars). Lookahead-safe: submits a
-        MARKET sell that fills on a later bar per the fill model (same next-bar-fill discipline
-        as every other order in this engine). A per-bar failure is logged and swallowed.
-
-        Returns True iff at least one stop SELL was actually submitted, so the caller can mark
-        the order cache dirty ONLY when there is a new order for the fill engine to see. When it
-        returns False nothing was submitted (no stop_pct, flat account, or no name breached) so
-        the cache is byte-identical and need not be invalidated.
-        """
-        try:
-            stop_pct = expert.get_setting_with_interface_default(
-                "risk_per_trade_pct", log_warning=False
-            )
-        except Exception:  # noqa: BLE001 — a stub/unschedulable expert -> no stop
-            stop_pct = None
-        if not (stop_pct and stop_pct > 0):
-            return False
-
-        # Flat account -> nothing to stop. Results-identical fast path: skips a pass that could
-        # only ever sell nothing (no positions exist). Avoids constructing the portfolio manager
-        # and its expert-scoped OPENED-Transaction query on the (common) no-position bars.
-        if not self.account.get_positions():
-            return False
-
-        # Reuse the run-constant portfolio manager (built once) and compute the stop equity
-        # cheaply from the account cash + cached virtual_equity_pct — byte-identical to
-        # apply_stop_losses' own get_virtual_balance() (same balance, same pct) but WITHOUT the
-        # two per-bar ExpertInstance DB queries (manager __init__ + get_virtual_balance). When
-        # the balance is unavailable, pass equity=None so the method self-computes (old path).
-        pm = self._bypass_manager(expert_id)
-        # Managers that own their exits (PremiumSeller's OptionPortfolioManager.manage_open)
-        # have no per-name equity stop — skip cleanly. Without this guard the call below
-        # AttributeErrors, is swallowed by the broad except, and returns True -> the caller
-        # marks the book dirty and spams the log EVERY non-entry bar.
-        apply_stops = getattr(pm, "apply_stop_losses", None)
-        if apply_stops is None:
-            return False
-        balance = self.account.get_balance()
-        if balance is None:
-            equity = None
-        else:
-            equity = balance * (self._bypass_veq_pct.get(expert_id, 100.0) / 100.0)
-
-        try:
-            submitted = apply_stops(float(stop_pct), equity=equity)
-        except Exception as e:  # noqa: BLE001 — a stop failure must not kill the run
-            self._log(f"bypass stop failed for expert {expert_id} @ {as_of:%Y-%m-%d}: {e}")
-            # Unknown whether an order was submitted before the failure -> assume YES so the fill
-            # engine cannot miss a sell (the safe default: an unnecessary cache reload is harmless,
-            # a missed one changes results).
-            return True
-        return bool(submitted)
 
     # -- option expiry / exercise / assignment ------------------------------
     def _apply_option_expiry(self, as_of: datetime) -> None:
