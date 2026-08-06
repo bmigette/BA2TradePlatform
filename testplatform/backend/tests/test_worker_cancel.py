@@ -215,3 +215,27 @@ def test_cancel_job_never_raises(monkeypatch):
     monkeypatch.setattr(wc.httpx, "Client", _Boom)
     out = wc.cancel_job({"name": "w", "url": "http://x", "password": "p"}, "J")
     assert out["cancelled"] is False
+
+
+def test_progress_cb_writes_the_bars_heartbeat():
+    """REGRESSION (2026-08-06): `bars` was declared in the control block on 2026-07-28 and never
+    written by anything. `_job_status` therefore had no liveness to report, the master could not
+    tell a queued trial from a running one, and opt 251 burned ~9h waiting out 3h timeouts on a
+    worker whose pool was jammed. The counter going inert again would silently restore that."""
+    from app.services.strategy_optimization_handler import _cancel_progress_cb
+
+    ctl = {"cancel": False, "bars": 0}
+    cb = _cancel_progress_cb(ctl)
+    for _ in range(3):
+        cb(0.5, "bar 2024-01-02")
+
+    assert ctl["bars"] > 0, "progress_cb must publish a heartbeat, not just read the cancel flag"
+
+
+def test_progress_cb_still_honours_cancel_alongside_the_heartbeat():
+    from app.services.strategy_optimization_handler import _cancel_progress_cb, TrialCancelled
+
+    ctl = {"cancel": True, "bars": 0}
+    cb = _cancel_progress_cb(ctl)
+    with pytest.raises(TrialCancelled):
+        cb(0.5, "bar 2024-01-02")

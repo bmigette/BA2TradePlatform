@@ -114,3 +114,91 @@ def test_run_trial_raises_timeout_error_when_deadline_exceeded(monkeypatch):
     finally:
         patcher.stop()
     assert mock_client.get.call_count == 0, "deadline must be checked BEFORE the first poll"
+
+
+# --- heartbeat / stall detection (2026-08-06) -------------------------------------------------
+# Before this, "running" was the ONLY signal: a trial queued behind a saturated pool looked
+# exactly like one computing, so the master could only wait out the full trial_timeout. opt 251
+# lost ~9h that way (3h x 3 retries per slot, zero trials run).
+
+def _clock(monkeypatch, step: float):
+    """monotonic() that advances *step* seconds per call, so a test can drive elapsed time."""
+    state = {"t": 0.0}
+
+    def _fake():
+        state["t"] += step
+        return state["t"]
+
+    monkeypatch.setattr(worker_client.time, "monotonic", _fake)
+    return state
+
+
+def test_never_started_job_fails_fast_instead_of_burning_the_whole_timeout(monkeypatch):
+    """bars stuck at 0 == accepted but never scheduled. Waiting cannot help."""
+    cancelled = []
+    monkeypatch.setattr(worker_client, "cancel_job", lambda w, j, **k: cancelled.append(j))
+    _clock(monkeypatch, step=60.0)
+    patcher, mock_client = _patched_client(
+        post_response=_resp(json_body={"job_id": "job-stuck"}),
+        get_responses=[_resp(json_body={"status": "running", "bars": 0, "started": False})] * 50,
+    )
+    try:
+        with pytest.raises(worker_client.WorkerJobStalled, match="never started"):
+            worker_client.run_trial(WORKER, {"cfg": 1}, "sharpe", timeout=10800.0)
+    finally:
+        patcher.stop()
+
+    assert cancelled == ["job-stuck"], "must release the worker's slot on give-up"
+    # The point of the fix: minutes, not the 10800s budget.
+    assert mock_client.get.call_count < 12
+
+
+def test_stalled_midrun_job_is_detected(monkeypatch):
+    """Bars advanced, then stopped — the trial wedged after starting."""
+    cancelled = []
+    monkeypatch.setattr(worker_client, "cancel_job", lambda w, j, **k: cancelled.append(j))
+    _clock(monkeypatch, step=60.0)
+    patcher, _ = _patched_client(
+        post_response=_resp(json_body={"job_id": "job-wedged"}),
+        get_responses=([_resp(json_body={"status": "running", "bars": 3})] +
+                       [_resp(json_body={"status": "running", "bars": 7})] * 60),
+    )
+    try:
+        with pytest.raises(worker_client.WorkerJobStalled, match="stalled at bar 7"):
+            worker_client.run_trial(WORKER, {"cfg": 1}, "sharpe", timeout=10800.0)
+    finally:
+        patcher.stop()
+    assert cancelled == ["job-wedged"]
+
+
+def test_advancing_bars_are_never_treated_as_stalled(monkeypatch):
+    """A slow but progressing trial must run to completion, well past both thresholds."""
+    monkeypatch.setattr(worker_client, "cancel_job",
+                        lambda w, j, **k: pytest.fail("a progressing trial must not be cancelled"))
+    _clock(monkeypatch, step=60.0)
+    polls = [_resp(json_body={"status": "running", "bars": n}) for n in range(1, 40)]
+    polls.append(_resp(json_body={"status": "done", "result": {"ok": True, "fitness": 1.0}}))
+    patcher, _ = _patched_client(
+        post_response=_resp(json_body={"job_id": "job-slow"}), get_responses=polls)
+    try:
+        out = worker_client.run_trial(WORKER, {"cfg": 1}, "sharpe", timeout=10800.0)
+    finally:
+        patcher.stop()
+    assert out == {"ok": True, "fitness": 1.0}
+
+
+def test_worker_too_old_to_report_bars_keeps_the_old_behaviour(monkeypatch):
+    """A version-skewed worker omits `bars` entirely. It must never be failed for that —
+    absence of the field means 'no heartbeat available', not 'no progress'."""
+    monkeypatch.setattr(worker_client, "cancel_job",
+                        lambda w, j, **k: pytest.fail("must not cancel a worker that lacks bars"))
+    _clock(monkeypatch, step=60.0)
+    polls = [_resp(json_body={"status": "running"})] * 30
+    polls.append(_resp(json_body={"status": "done", "result": {"ok": True, "fitness": 2.0}}))
+    patcher, _ = _patched_client(
+        post_response=_resp(json_body={"job_id": "job-old"}), get_responses=polls)
+    try:
+        out = worker_client.run_trial(WORKER, {"cfg": 1}, "sharpe", timeout=10800.0)
+    finally:
+        patcher.stop()
+    assert out == {"ok": True, "fitness": 2.0}

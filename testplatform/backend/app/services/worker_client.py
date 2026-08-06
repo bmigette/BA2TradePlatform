@@ -90,6 +90,30 @@ class WorkerJobLost(Exception):
     broad ``Exception`` and requeue/retry — see distributed_eval.py's ``_dispatch_remote``)."""
 
 
+class WorkerJobStalled(Exception):
+    """A submitted job stopped making progress (or never started) well before its timeout.
+
+    Distinct from ``WorkerJobLost``: the worker still HAS the job and keeps answering "running".
+    Detected from the trial's own per-bar heartbeat rather than from wall clock alone, so it
+    fires in minutes instead of burning the full ``trial_timeout``.
+
+    Why this exists (2026-08-06, opt 251): remote150 accepted 6 trials onto a pool already
+    saturated by orphaned children. They queued and never ran. ``/job-status`` reported a bare
+    "running" for each, which is indistinguishable from healthy work, so the master waited the
+    full 10800s x 3 retries per slot — the grid sat idle ~9h for zero trials. Callers treat this
+    like any other worker failure and requeue elsewhere."""
+
+
+# Fail a job that was ACCEPTED but never reported a single bar. This is the saturated-pool /
+# never-scheduled case, where waiting longer cannot help — the trial is not running at all.
+# Generous enough to cover a slow cold start (spawn + imports + first cache reads).
+_NEVER_STARTED_GRACE = 420.0
+# Fail a job that started and then went quiet. Must stay comfortably above the trial's own
+# heartbeat cadence (_CANCEL_CHECK_INTERVAL_S, seconds) and above any legitimate long gap
+# between throttled progress callbacks.
+_NO_PROGRESS_TIMEOUT = 900.0
+
+
 def cancel_job(worker: dict, job_id: str, timeout: float = 10.0) -> dict:
     """Best-effort: tell *worker* to abandon *job_id*.
 
@@ -133,9 +157,13 @@ def _submit_and_poll(worker: dict, submit_path: str, payload: dict, timeout: flo
 
     deadline = time.monotonic() + timeout
     status_url = f"{_base(worker)}/job-status/{job_id}"
+    started_at = time.monotonic()
+    last_bars = 0
+    last_bars_at = started_at
     with httpx.Client(timeout=call_timeout) as c:
         while True:
-            if time.monotonic() >= deadline:
+            now = time.monotonic()
+            if now >= deadline:
                 # Abandon it on the worker too, or it runs to completion for nobody and keeps
                 # its slot for up to 6h -- see cancel_job.
                 cancel_job(worker, job_id)
@@ -149,6 +177,25 @@ def _submit_and_poll(worker: dict, submit_path: str, payload: dict, timeout: flo
             body = r.json()
             if body["status"] == "done":
                 return body["result"]
+
+            # HEARTBEAT CHECK. `bars` is the trial's own per-bar progress counter (see
+            # strategy_optimization_handler._cancel_progress_cb). A worker too old to report it
+            # omits the key entirely -> bars is None -> both checks are skipped and behaviour is
+            # exactly as before, so a version-skewed worker is never failed for our new field.
+            bars = body.get("bars")
+            if isinstance(bars, int) and bars >= 0:
+                if bars > last_bars:
+                    last_bars, last_bars_at = bars, now
+                elif bars == 0 and (now - started_at) >= _NEVER_STARTED_GRACE:
+                    cancel_job(worker, job_id)
+                    raise WorkerJobStalled(
+                        f"worker {worker.get('name')} job {job_id} accepted but never started "
+                        f"({now - started_at:.0f}s, no bars) — pool likely saturated")
+                elif bars > 0 and (now - last_bars_at) >= _NO_PROGRESS_TIMEOUT:
+                    cancel_job(worker, job_id)
+                    raise WorkerJobStalled(
+                        f"worker {worker.get('name')} job {job_id} stalled at bar {bars} "
+                        f"for {now - last_bars_at:.0f}s")
             time.sleep(poll_interval)
 
 

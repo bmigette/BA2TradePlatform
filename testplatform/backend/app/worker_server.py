@@ -285,11 +285,26 @@ def _job_status(job_id: str) -> dict:
     docstring's SUBMIT/POLL note for why that's the point, not a bug."""
     with _JOBS_LOCK:
         future = _JOBS.get(job_id)
+        ctl = _JOB_CTL.get(job_id)
     if future is None:
         raise HTTPException(status_code=404, detail=f"job {job_id!r} unknown (unrecognized id, "
                                                      f"or this worker restarted since it was submitted).")
     if not future.done():
-        return {"status": "running"}
+        # LIVENESS. "running" alone is ambiguous: a Future queued behind a saturated pool is
+        # indistinguishable from one actively computing, so the master could only wait out the
+        # full trial_timeout (2026-08-06: 3h x 3 retries x 6 slots, grid idle ~9h, because
+        # remote150's pool was jammed by orphaned children). Report the trial's own bar
+        # heartbeat so the client can fail fast — see worker_client._submit_and_poll.
+        #
+        # bars == 0 means ACCEPTED BUT NEVER STARTED, which is the saturated-pool case and is
+        # worth failing much faster than a trial that started and then stalled.
+        bars = 0
+        if ctl is not None:
+            try:
+                bars = int(ctl.get("bars") or 0)
+            except Exception:  # noqa: BLE001 — a dead manager must not 500 the poller
+                bars = -1  # unknown; client treats this as "no heartbeat available"
+        return {"status": "running", "bars": bars, "started": bars > 0}
     with _JOBS_LOCK:
         _JOBS.pop(job_id, None)
         _JOBS_SUBMITTED_AT.pop(job_id, None)

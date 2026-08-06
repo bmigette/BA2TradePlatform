@@ -158,15 +158,33 @@ def test_submit_trial_then_poll_returns_done_with_result(client):
     assert client.get(f"/job-status/{job_id}").status_code == 401
 
 
-def test_job_status_running_before_done(client, monkeypatch):
-    """A future that isn't done yet must report {"status": "running"}, not block."""
-    class _PendingFuture:
-        def done(self):
-            return False
+class _PendingFuture:
+    def done(self):
+        return False
 
+
+def test_job_status_running_before_done(client, monkeypatch):
+    """A future that isn't done yet must report status=running, not block.
+
+    Since 2026-08-06 it also carries the trial's `bars` heartbeat: without it the master cannot
+    distinguish a queued trial from a computing one and can only wait out the full trial_timeout
+    (see worker_client._submit_and_poll). No control block registered here -> bars 0.
+    """
     monkeypatch.setattr(ws, "_JOBS", {"pending-job": _PendingFuture()})
+    monkeypatch.setattr(ws, "_JOB_CTL", {})
     r = client.get("/job-status/pending-job", headers=H)
-    assert r.status_code == 200 and r.json() == {"status": "running"}
+    assert r.status_code == 200
+    assert r.json()["status"] == "running"
+    assert r.json()["bars"] == 0
+
+
+def test_job_status_reports_the_trial_heartbeat(client, monkeypatch):
+    """A started, progressing trial reports its bar count so the master can tell it apart from
+    one that was accepted and never scheduled (the saturated-pool case that cost opt 251 ~9h)."""
+    monkeypatch.setattr(ws, "_JOBS", {"live-job": _PendingFuture()})
+    monkeypatch.setattr(ws, "_JOB_CTL", {"live-job": {"cancel": False, "bars": 42}})
+    body = client.get("/job-status/live-job", headers=H).json()
+    assert body == {"status": "running", "bars": 42, "started": True}
 
 
 def test_job_status_unknown_id_returns_404(client):

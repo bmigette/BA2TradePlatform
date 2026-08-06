@@ -180,7 +180,7 @@ def _cancel_progress_cb(ctl):
     #
     # A 5s cancellation latency is irrelevant: this exists to stop a trial the master abandoned
     # after a multi-minute timeout, so being 5s late costs nothing and the hot path stays free.
-    state = {"next_check": 0.0}
+    state = {"next_check": 0.0, "bars": 0}
     interval = _CANCEL_CHECK_INTERVAL_S
 
     def _cb(pct: float, msg: str) -> None:
@@ -189,6 +189,17 @@ def _cancel_progress_cb(ctl):
             return
         state["next_check"] = now + interval
         try:
+            # HEARTBEAT. Publish liveness on the SAME throttled IPC round-trip that reads the
+            # cancel flag, so it costs nothing extra. Without this the master cannot tell a trial
+            # that is computing from one that was accepted and never scheduled, and can only wait
+            # out the full trial_timeout — 3h, three times, per slot (measured 2026-08-06, opt
+            # 251: remote150's pool was saturated by orphaned children, every trial reported
+            # "running" until the 10800s budget expired, and the grid sat idle ~9h).
+            #
+            # "bars" was declared in the control block on 2026-07-28 and never written by
+            # anything; this is the line that was missing.
+            state["bars"] += 1
+            ctl["bars"] = state["bars"]
             cancelled = bool(ctl.get("cancel"))
         except Exception:  # noqa: BLE001 — a dead manager must never fail a healthy trial
             return
