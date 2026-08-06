@@ -170,3 +170,91 @@ def test_index_universe_rejects_unknown_index():
     import pytest
     with pytest.raises(ValueError):
         U.index_universe("russell2000", D("2022-01-03"))
+
+
+# --- live-only short-TTL cache (2026-08-06) ---------------------------------------------------
+# 16 live screener-based instances each pulled the whole market per cycle (available-traded +
+# PAGINATED delisted-companies, then quote/OHLCV for the universe). That exhausted the FMP daily
+# quota. The payloads are settings-independent, so they can be shared.
+
+def test_lifecycle_map_is_fetched_once_and_shared_live(monkeypatch):
+    import ba2_providers.fmp_common as fc
+    import ba2_providers.screener.universe as U
+    monkeypatch.setattr(fc, "_LIVE_BULK_CACHES", {})          # fresh cache per test
+    monkeypatch.setattr(fc, "_is_ttl_frozen", lambda: False)   # live path
+
+    calls = {"n": 0}
+    def _fake():
+        calls["n"] += 1
+        return {"AAPL": (None, None)}
+    monkeypatch.setattr(U, "_fetch_lifecycle_map_uncached", _fake)
+
+    a, b, c = U.fetch_lifecycle_map(), U.fetch_lifecycle_map(), U.fetch_lifecycle_map()
+
+    assert calls["n"] == 1, "the whole-market listing must be fetched once, not once per caller"
+    assert a == b == c == {"AAPL": (None, None)}
+
+
+def test_lifecycle_map_is_NOT_cached_in_a_frozen_backtest(monkeypatch):
+    """A frozen TTLCache never expires, so caching a live-shaped payload would pin it for the
+    whole run. Backtests must keep taking their own (hermetic disk) path."""
+    import ba2_providers.fmp_common as fc
+    import ba2_providers.screener.universe as U
+    monkeypatch.setattr(fc, "_LIVE_BULK_CACHES", {})
+    monkeypatch.setattr(fc, "_is_ttl_frozen", lambda: True)    # backtest path
+
+    calls = {"n": 0}
+    def _fake():
+        calls["n"] += 1
+        return {}
+    monkeypatch.setattr(U, "_fetch_lifecycle_map_uncached", _fake)
+
+    U.fetch_lifecycle_map(); U.fetch_lifecycle_map()
+
+    assert calls["n"] == 2, "frozen/backtest runs must pass through, not memoize"
+
+
+def test_live_cache_keys_do_not_collide_across_windows(monkeypatch):
+    """The OHLCV key carries symbols AND the from/to window, so a different as_of or lookback
+    never serves the wrong bars."""
+    import ba2_providers.fmp_common as fc
+    monkeypatch.setattr(fc, "_LIVE_BULK_CACHES", {})
+    monkeypatch.setattr(fc, "_is_ttl_frozen", lambda: False)
+
+    seen = []
+    def make(tag):
+        def _f():
+            seen.append(tag); return tag
+        return _f
+
+    assert fc.fmp_live_cached("screener:ohlcv:AAPL:2026-01-01:2026-06-01", make("w1")) == "w1"
+    assert fc.fmp_live_cached("screener:ohlcv:AAPL:2026-01-01:2026-06-27", make("w2")) == "w2"
+    assert fc.fmp_live_cached("screener:ohlcv:AAPL:2026-01-01:2026-06-01", make("w1b")) == "w1"
+    assert seen == ["w1", "w2"], "same window reuses; different window refetches"
+
+
+def test_each_ttl_gets_its_own_cache(monkeypatch):
+    """REGRESSION: TTLCache fixes its expiry at CONSTRUCTION, so one shared instance would give
+    every caller whichever TTL constructed it first. The 6h lifecycle map is fetched before the
+    quotes in a screen, so a shared cache pinned LIVE QUOTES for six hours.
+
+    The clock is injected into the TTLCache instances rather than monkeypatched onto `time.time`:
+    TTLCache takes `clock=time.time` as a DEFAULT ARGUMENT, bound at class-definition time, so
+    patching the module attribute afterwards does nothing.
+    """
+    import ba2_providers.fmp_common as fc
+    monkeypatch.setattr(fc, "_is_ttl_frozen", lambda: False)
+    clock = {"t": 1000.0}
+    now = lambda: clock["t"]
+    monkeypatch.setattr(fc, "_LIVE_BULK_CACHES", {
+        6 * 3600.0: fc.TTLCache(6 * 3600.0, clock=now),
+        900.0: fc.TTLCache(900.0, clock=now),
+    })
+
+    fc.fmp_live_cached("bulk", lambda: "bulk-v1", ttl_seconds=6 * 3600.0)
+    fc.fmp_live_cached("quote", lambda: "quote-v1", ttl_seconds=900.0)
+
+    clock["t"] += 1800.0          # 30 min: past the quote TTL, well inside the bulk TTL
+
+    assert fc.fmp_live_cached("quote", lambda: "quote-v2", ttl_seconds=900.0) == "quote-v2",         "a 15-min quote must expire at 15 min even though a 6h entry exists"
+    assert fc.fmp_live_cached("bulk", lambda: "bulk-v2", ttl_seconds=6 * 3600.0) == "bulk-v1",         "the 6h entry must still be served"

@@ -314,14 +314,22 @@ class StockScreener:
         result_lock = threading.Lock()
         completed_count = 0
 
+        from ba2_providers.fmp_common import fmp_live_cached, _FMP_LIVE_QUOTE_TTL_S
+
         def fetch_chunk(chunk_idx: int, chunk: List[str]):
             joined = ",".join(chunk)
             try:
-                resp = fmp_http_get(
-                    f"https://financialmodelingprep.com/api/v3/quote/{joined}",
-                    params={"apikey": api_key},
-                    endpoint="quote",
-                    timeout=15,
+                # Shared across screener instances: the quote payload depends only on the
+                # symbols, never on this instance's thresholds (those filter it afterwards).
+                resp = fmp_live_cached(
+                    f"screener:quote:{joined}",
+                    lambda: fmp_http_get(
+                        f"https://financialmodelingprep.com/api/v3/quote/{joined}",
+                        params={"apikey": api_key},
+                        endpoint="quote",
+                        timeout=15,
+                    ),
+                    ttl_seconds=_FMP_LIVE_QUOTE_TTL_S,
                 )
                 data = resp.json()
                 if isinstance(data, list):
@@ -400,11 +408,21 @@ class StockScreener:
         result_lock = threading.Lock()
         completed_count = 0
 
+        from ba2_providers.fmp_common import fmp_live_cached
+
         def fetch_chunk(chunk: List[str]):
             joined = ",".join(chunk)
             url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{joined}"
             try:
-                resp = fmp_http_get(url, params=params_base, endpoint="historical-price-full", timeout=15)
+                # The bars depend only on (symbols, from, to) -- all three are in the key, so a
+                # different as_of or lookback never reuses the wrong window. The thresholds that
+                # differ per instance (RVOL / Weinstein / price-drop) are computed FROM this
+                # payload afterwards, so every screener instance wants the identical response.
+                resp = fmp_live_cached(
+                    f"screener:ohlcv:{joined}:{from_date}:{to_date}",
+                    lambda: fmp_http_get(url, params=params_base,
+                                         endpoint="historical-price-full", timeout=15),
+                )
                 data = resp.json()
             except FMPError as e:
                 logger.warning(f"StockScreener: OHLCV chunk failed after retries: {e}")

@@ -88,6 +88,15 @@ def fetch_lifecycle_map() -> Dict[str, Tuple[Optional[datetime], Optional[dateti
     The delisted list takes precedence over the active list on symbol collisions so
     a re-listed-then-delisted ticker keeps its delistedDate window.
     """
+    from ba2_providers.fmp_common import fmp_live_cached
+    # Settings-independent and the single most expensive call in a live screen: one full
+    # available-traded listing plus a PAGINATED walk of delisted-companies, repeated by every
+    # screener-based expert on every cycle. Cached live (6h; the lists change at most daily) and
+    # shared across all instances. Passthrough under a frozen/backtest run — see fmp_live_cached.
+    return fmp_live_cached("universe:lifecycle_map", _fetch_lifecycle_map_uncached)
+
+
+def _fetch_lifecycle_map_uncached() -> Dict[str, Tuple[Optional[datetime], Optional[datetime]]]:
     key = _api_key()
     lifecycle: Dict[str, Tuple[Optional[datetime], Optional[datetime]]] = {}
 

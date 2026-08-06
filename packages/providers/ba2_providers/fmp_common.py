@@ -190,6 +190,53 @@ def persist_empty_sentinel():
         _PERSIST_EMPTY_SENTINEL = prev
 
 
+# --- live-only short-TTL cache for SETTINGS-INDEPENDENT bulk fetches --------
+# The mirror image of fmp_history_disk_cached below: that one is BACKTEST-only (gated ON the
+# freeze flag) and long-lived on disk; this one is LIVE-only (gated OFF it) and short-lived in
+# memory. Together they cover both paths without either interfering with the other.
+#
+# Why (2026-08-06): a `screener` instrument-selection expert runs StockScreener on EVERY analysis
+# cycle, and each run pulls the whole market before evaluating a single threshold —
+# available-traded/list, the PAGINATED delisted-companies list, then quote + historical-price-full
+# for the entire universe in chunks. With 16 such live instances (8 FMPRating, 4
+# FMPEarningsDrift, 4 FMPInsiderClusterBuy) that is the same multi-thousand-call sweep repeated
+# per instance per cycle. It exhausted the FMP daily quota on 2026-08-05 22:57 and still returns
+# 429s on available-traded / delisted-companies.
+#
+# It is SAFE to share those payloads across instances because NONE of the screener settings reach
+# FMP: the queries carry only {apikey}, {apikey,page} or {apikey,from,to}. market_cap_min,
+# relative_volume_min, weinstein_stage2_only, price_drop_* and max_stocks are all applied AFTER
+# the fetch, in local filtering. So every instance is asking for identical data and filtering it
+# differently — exactly the shape a shared cache is for.
+_FMP_LIVE_BULK_TTL_S = 6 * 3600.0     # market-structure lists: change at most daily
+_FMP_LIVE_QUOTE_TTL_S = 900.0         # quotes: 15 min, matching the existing FMP TTL convention
+# ONE CACHE PER DISTINCT TTL, keyed by ttl_seconds. TTLCache fixes its expiry window at
+# CONSTRUCTION (``self._clock() + self._ttl``), so a single shared instance would hand every
+# caller whichever TTL happened to construct it first. In a screen the 6h lifecycle map is
+# fetched BEFORE the quotes, so one shared cache would have pinned live quotes for six hours.
+_LIVE_BULK_CACHES: dict = {}          # built lazily so the TTLCache class below is defined first
+_LIVE_BULK_CACHES_LOCK = threading.Lock()
+
+
+def fmp_live_cached(key: str, fetch_fn: Callable[[], Any],
+                    ttl_seconds: float = _FMP_LIVE_BULK_TTL_S) -> Any:
+    """Memoize a settings-INDEPENDENT live fetch for *ttl_seconds*, shared across callers.
+
+    Passthrough in a frozen (backtest) run: backtests must keep taking the hermetic disk path,
+    and a frozen TTLCache never expires, which would pin a live-shaped payload for the whole run.
+
+    ``key`` must capture everything that varies the RESPONSE (endpoint + symbols + date window)
+    and nothing that varies only the caller's later filtering.
+    """
+    if _is_ttl_frozen():
+        return fetch_fn()
+    with _LIVE_BULK_CACHES_LOCK:
+        cache = _LIVE_BULK_CACHES.get(ttl_seconds)
+        if cache is None:
+            cache = _LIVE_BULK_CACHES[ttl_seconds] = TTLCache(ttl_seconds)
+    return cache.get_or_call(key, fetch_fn)
+
+
 # --- backtest-only disk cache for per-symbol FMP history payloads -----------
 # A spawned GA optimization worker pool starts each worker with EMPTY module-level TTLCaches,
 # so every fresh worker re-fetches the same per-symbol full-history payloads from FMP — the
