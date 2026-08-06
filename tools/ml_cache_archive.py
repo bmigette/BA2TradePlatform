@@ -13,9 +13,23 @@ The DB is live (WAL mode, actively written by a running server) so a raw file co
 inconsistent snapshot mid-write. Export always takes it via sqlite3's backup API instead, which
 is the engine's own safe-copy path and does not require stopping the server.
 
+Export scopes (--scope):
+    full   cache + complete DB (default; the historical behavior)
+    db     complete DB only, no cache
+    bt-ga  DB trimmed to ALL backtests + ALL GA jobs (strategy_optimizations), plus the
+           strategies they reference and their robustness runs -- no cache
+    bt     DB trimmed to backtests only (GA jobs dropped, backtests.optimization_id set to
+           NULL in the exported copy), optionally filtered by labels -- no cache
+
+In bt/bt-ga scopes the runtime-only tables (task_queue, activitylog, persistedqueuetask,
+llmusagelog) are cleared from the exported copy, and the DB is VACUUMed down.
+
 Usage:
     python tools/ml_cache_archive.py export --dest-dir "G:\\Mon Drive\\Work\\AiTrading\\Test ML Cache"
     python tools/ml_cache_archive.py export --dest-dir <dir> --name my_export.zip --overwrite
+    python tools/ml_cache_archive.py export --dest-dir <dir> --scope db
+    python tools/ml_cache_archive.py export --dest-dir <dir> --scope bt-ga
+    python tools/ml_cache_archive.py export --dest-dir <dir> --scope bt --label goal2020 --label sen5min
     python tools/ml_cache_archive.py import --archive <path/to/export.zip>
     python tools/ml_cache_archive.py import --archive <path> --overwrite --force
 """
@@ -33,7 +47,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
                                 "packages", "common"))
 from ba2_common.config import CACHE_FOLDER, TEST_DIR  # noqa: E402
 
-DEFAULT_NAME = "ba2_ml_cache_export.zip"
+DEFAULT_NAMES = {
+    "full": "ba2_ml_cache_export.zip",
+    "db": "ba2_db_export.zip",
+    "bt-ga": "ba2_btga_export.zip",
+    "bt": "ba2_bt_export.zip",
+}
+# Tables that only hold runtime state -- never part of a bt/ga results export.
+RUNTIME_TABLES = ("task_queue", "activitylog", "persistedqueuetask", "llmusagelog")
 DB_ARCNAME = "db/dl_forecasting.db"
 CACHE_ARC_PREFIX = "cache/"
 MANIFEST_ARCNAME = "manifest.json"
@@ -73,15 +94,79 @@ def _iter_cache_files(cache_dir: str):
             yield full, CACHE_ARC_PREFIX + rel
 
 
+def _filter_db(db_file: str, scope: str, labels: list) -> dict:
+    """Trim a full DB snapshot (in place) down to backtest/GA-job content.
+
+    bt-ga: keep all backtests + all strategy_optimizations (GA jobs), plus the strategies
+           they reference and their robustness runs.
+    bt:    keep backtests (optionally filtered by labels substring on backtests.labels),
+           drop all GA jobs; backtests.optimization_id is set to NULL in the exported copy.
+    Runtime-only tables are cleared in both scopes, then the file is VACUUMed.
+    Returns kept-row stats for the manifest."""
+    con = sqlite3.connect(db_file)
+    try:
+        cur = con.cursor()
+        if labels:
+            clause = " OR ".join(["labels LIKE ?"] * len(labels))
+            params = [f"%{lbl}%" for lbl in labels]
+            keep_ids = [r[0] for r in cur.execute(
+                f"SELECT id FROM backtests WHERE {clause}", params)]
+        else:
+            keep_ids = [r[0] for r in cur.execute("SELECT id FROM backtests")]
+        if not keep_ids:
+            raise SystemExit(f"Label filter {labels} matched 0 backtests -- nothing to export.")
+
+        cur.execute("CREATE TEMP TABLE _keep_bt (id INTEGER PRIMARY KEY)")
+        cur.executemany("INSERT INTO _keep_bt (id) VALUES (?)", [(i,) for i in keep_ids])
+        cur.execute("CREATE TEMP TABLE _keep_strat (id INTEGER PRIMARY KEY)")
+        cur.execute(
+            "INSERT OR IGNORE INTO _keep_strat (id) "
+            "SELECT DISTINCT strategy_id FROM backtests "
+            "WHERE strategy_id IS NOT NULL AND id IN (SELECT id FROM _keep_bt)")
+        if scope == "bt-ga":
+            cur.execute(
+                "INSERT OR IGNORE INTO _keep_strat (id) "
+                "SELECT DISTINCT strategy_id FROM strategy_optimizations "
+                "WHERE strategy_id IS NOT NULL")
+
+        cur.execute("DELETE FROM robustness_runs "
+                    "WHERE backtest_id NOT IN (SELECT id FROM _keep_bt)")
+        if scope == "bt":
+            cur.execute("UPDATE backtests SET optimization_id = NULL "
+                        "WHERE optimization_id IS NOT NULL")
+            cur.execute("DELETE FROM strategy_optimizations")
+        cur.execute("DELETE FROM backtests WHERE id NOT IN (SELECT id FROM _keep_bt)")
+        cur.execute("DELETE FROM strategies WHERE id NOT IN (SELECT id FROM _keep_strat)")
+        for table in RUNTIME_TABLES:
+            cur.execute(f"DELETE FROM {table}")
+        con.commit()
+
+        stats = {
+            "backtests_kept": cur.execute("SELECT COUNT(*) FROM backtests").fetchone()[0],
+            "ga_jobs_kept": cur.execute("SELECT COUNT(*) FROM strategy_optimizations").fetchone()[0],
+            "strategies_kept": cur.execute("SELECT COUNT(*) FROM strategies").fetchone()[0],
+            "robustness_runs_kept": cur.execute("SELECT COUNT(*) FROM robustness_runs").fetchone()[0],
+        }
+        cur.execute("VACUUM")
+        return stats
+    finally:
+        con.close()
+
+
 def cmd_export(args: argparse.Namespace) -> None:
-    if not os.path.isdir(CACHE_FOLDER):
+    scope = args.scope
+    if args.label and scope != "bt":
+        raise SystemExit("--label is only valid with --scope bt.")
+    include_cache = scope == "full"
+    if include_cache and not os.path.isdir(CACHE_FOLDER):
         raise SystemExit(f"Cache folder not found: {CACHE_FOLDER}")
     db_path = _default_db_path()
     if not os.path.isfile(db_path):
         raise SystemExit(f"Results DB not found: {db_path}")
 
+    name = args.name or DEFAULT_NAMES[scope]
     os.makedirs(args.dest_dir, exist_ok=True)
-    final_path = os.path.join(args.dest_dir, args.name)
+    final_path = os.path.join(args.dest_dir, name)
     if os.path.exists(final_path) and not args.overwrite:
         raise SystemExit(f"{final_path} already exists. Pass --overwrite to replace it.")
 
@@ -96,22 +181,34 @@ def cmd_export(args: argparse.Namespace) -> None:
     try:
         print(f"Snapshotting {db_path} via sqlite backup API...")
         _safe_sqlite_copy(db_path, tmp_db)
-        db_size = os.path.getsize(tmp_db)
-
-        print(f"Scanning {CACHE_FOLDER} ...")
-        cache_files = list(_iter_cache_files(CACHE_FOLDER))
-        cache_size = sum(os.path.getsize(f) for f, _ in cache_files)
-        print(f"  {len(cache_files):,} files, {_human(cache_size)}")
 
         manifest = {
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "source_cache_dir": CACHE_FOLDER,
+            "scope": scope,
+            "label_filters": args.label or [],
             "source_db_path": db_path,
-            "cache_file_count": len(cache_files),
-            "cache_bytes": cache_size,
-            "db_bytes": db_size,
             "compression": "deflate" if args.compress else "stored",
         }
+
+        if scope in ("bt", "bt-ga"):
+            print(f"Filtering DB snapshot (scope={scope})...")
+            stats = _filter_db(tmp_db, scope, args.label or [])
+            manifest.update(stats)
+            print(f"  kept: {stats['backtests_kept']} backtests, {stats['ga_jobs_kept']} GA jobs, "
+                  f"{stats['strategies_kept']} strategies, {stats['robustness_runs_kept']} robustness runs")
+        db_size = os.path.getsize(tmp_db)
+        manifest["db_bytes"] = db_size
+
+        cache_files = []
+        cache_size = 0
+        if include_cache:
+            print(f"Scanning {CACHE_FOLDER} ...")
+            cache_files = list(_iter_cache_files(CACHE_FOLDER))
+            cache_size = sum(os.path.getsize(f) for f, _ in cache_files)
+            print(f"  {len(cache_files):,} files, {_human(cache_size)}")
+            manifest["source_cache_dir"] = CACHE_FOLDER
+            manifest["cache_file_count"] = len(cache_files)
+            manifest["cache_bytes"] = cache_size
 
         print(f"Writing {tmp_zip} ...")
         with zipfile.ZipFile(tmp_zip, "w", compression=compression, allowZip64=True) as zf:
@@ -134,7 +231,8 @@ def cmd_export(args: argparse.Namespace) -> None:
 
     elapsed = time.monotonic() - t0
     print(f"Done in {elapsed:.0f}s: {final_path} ({_human(zip_size)})")
-    print(f"  cache: {len(cache_files):,} files, {_human(cache_size)}")
+    if include_cache:
+        print(f"  cache: {len(cache_files):,} files, {_human(cache_size)}")
     print(f"  db:    {_human(db_size)}")
 
 
@@ -155,6 +253,15 @@ def cmd_import(args: argparse.Namespace) -> None:
             manifest = None
             print("(no manifest.json in this archive -- proceeding without it)")
 
+        names = zf.namelist()
+        if DB_ARCNAME not in names:
+            raise SystemExit(f"Archive does not contain {DB_ARCNAME} -- nothing to restore.")
+        members = [m for m in names if m.startswith(CACHE_ARC_PREFIX)]
+        if manifest and manifest.get("scope") not in (None, "full"):
+            print(f"WARNING: this archive is a PARTIAL export (scope={manifest['scope']}"
+                  + (f", labels={manifest['label_filters']}" if manifest.get("label_filters") else "")
+                  + "). Importing it REPLACES the entire DB.")
+
         # Refuse to clobber a DB that looks like it's currently attached to a running server
         # (WAL/SHM sidecars present) unless the caller explicitly forces it.
         wal_sidecars = [db_path + suffix for suffix in ("-wal", "-shm")
@@ -168,32 +275,34 @@ def cmd_import(args: argparse.Namespace) -> None:
             conflicts = []
             if os.path.exists(db_path):
                 conflicts.append(db_path)
-            if os.path.isdir(cache_dir) and os.listdir(cache_dir):
+            if members and os.path.isdir(cache_dir) and os.listdir(cache_dir):
                 conflicts.append(cache_dir + " (non-empty)")
             if conflicts:
                 raise SystemExit(
                     "Refusing to import over existing data (pass --overwrite to proceed): "
                     + "; ".join(conflicts))
 
-        os.makedirs(cache_dir, exist_ok=True)
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
 
         print(f"Restoring DB -> {db_path}")
         with zf.open(DB_ARCNAME) as src, open(db_path, "wb") as dst:
             shutil.copyfileobj(src, dst)
 
-        print(f"Restoring cache -> {cache_dir}")
-        members = [m for m in zf.namelist() if m.startswith(CACHE_ARC_PREFIX)]
-        for i, member in enumerate(members, 1):
-            rel = member[len(CACHE_ARC_PREFIX):]
-            if not rel:
-                continue
-            target = os.path.join(cache_dir, *rel.split("/"))
-            os.makedirs(os.path.dirname(target), exist_ok=True)
-            with zf.open(member) as src, open(target, "wb") as dst:
-                shutil.copyfileobj(src, dst)
-            if i % 2000 == 0:
-                print(f"  ...{i:,}/{len(members):,} files")
+        if members:
+            os.makedirs(cache_dir, exist_ok=True)
+            print(f"Restoring cache -> {cache_dir}")
+            for i, member in enumerate(members, 1):
+                rel = member[len(CACHE_ARC_PREFIX):]
+                if not rel:
+                    continue
+                target = os.path.join(cache_dir, *rel.split("/"))
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with zf.open(member) as src, open(target, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                if i % 2000 == 0:
+                    print(f"  ...{i:,}/{len(members):,} files")
+        else:
+            print("No cache in this archive -- skipping cache restore.")
 
     print(f"Done: restored {len(members):,} cache files + DB.")
 
@@ -205,7 +314,16 @@ def main() -> None:
 
     p_export = sub.add_parser("export", help="Archive the provider cache + results DB into one zip.")
     p_export.add_argument("--dest-dir", required=True, help="Directory to write the zip into.")
-    p_export.add_argument("--name", default=DEFAULT_NAME, help=f"Zip filename (default: {DEFAULT_NAME}).")
+    p_export.add_argument("--scope", choices=("full", "db", "bt-ga", "bt"), default="full",
+                          help="What to export: full = cache + complete DB (default); "
+                               "db = complete DB only; bt-ga = DB trimmed to all backtests + GA jobs; "
+                               "bt = DB trimmed to backtests only.")
+    p_export.add_argument("--label", action="append", default=None, metavar="SUBSTR",
+                          help="With --scope bt: keep only backtests whose labels contain SUBSTR "
+                               "(repeatable, OR-combined, case-insensitive).")
+    p_export.add_argument("--name", default=None,
+                          help=f"Zip filename (default per scope: "
+                               f"{' / '.join(DEFAULT_NAMES[s] for s in ('full', 'db', 'bt-ga', 'bt'))}).")
     p_export.add_argument("--overwrite", action="store_true",
                           help="Replace the destination zip if it already exists.")
     p_export.add_argument("--compress", action="store_true",
