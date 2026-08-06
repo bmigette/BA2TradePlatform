@@ -275,7 +275,33 @@ class StockScreener:
             f"StockScreener: pipeline complete — {len(result)} stocks "
             f"(sorted by {self._settings['screener_sort_metric']})"
         )
+        self._log_live_selection(result)
         return {"results": result, "stats": stats}
+
+    def _log_live_selection(self, result: List[Dict[str, Any]]) -> None:
+        """LIVE-ONLY audit trail of WHICH symbols were selected, and under which thresholds.
+
+        Live and backtest resolve the universe from different sources — live screens here,
+        backtests screen the prebuilt metric_store — and nothing recorded the live side, so five
+        weeks of live trading left no evidence to compare against. The live logs said only
+        "creating SCREENER job", never its output, which is why the 2026-08-06 investigation
+        could not settle whether the two paths agree on the same date.
+
+        GRID SAFETY: gated on ``self._as_of is None``. A backtest ALWAYS passes an as_of, so this
+        is structurally incapable of firing there — it is not merely "cheap enough". One line per
+        live screen, no extra API calls.
+        """
+        if self._as_of is not None:
+            return
+        g = self._settings.get
+        picked = ",".join(str(r.get("symbol") or "?") for r in result)
+        logger.info(
+            f"StockScreener LIVE SELECTION: {len(result)} symbols "
+            f"[cap>={g('screener_market_cap_min')} rvol>={g('screener_relative_volume_min')} "
+            f"stage2only={g('screener_weinstein_stage2_only')} "
+            f"drop>={g('screener_price_drop_pct')}/{g('screener_price_drop_days')}d "
+            f"max={g('screener_max_stocks')}] -> {picked}"
+        )
 
     # ------------------------------------------------------------------
     # Static helpers

@@ -258,3 +258,43 @@ def test_each_ttl_gets_its_own_cache(monkeypatch):
 
     assert fc.fmp_live_cached("quote", lambda: "quote-v2", ttl_seconds=900.0) == "quote-v2",         "a 15-min quote must expire at 15 min even though a 6h entry exists"
     assert fc.fmp_live_cached("bulk", lambda: "bulk-v2", ttl_seconds=6 * 3600.0) == "bulk-v1",         "the 6h entry must still be served"
+
+
+# --- live screener audit trail (2026-08-06) ---------------------------------------------------
+# ba2_common's logger has propagate=False, so caplog cannot see it -- capture via a stub instead.
+
+class _RecordingLogger:
+    def __init__(self): self.lines = []
+    def info(self, msg, *a, **k): self.lines.append(str(msg))
+    def warning(self, msg, *a, **k): self.lines.append(str(msg))
+    def debug(self, msg, *a, **k): pass
+    def error(self, msg, *a, **k): pass
+
+    @property
+    def text(self): return chr(10).join(self.lines)
+
+
+def _screener_with(as_of, monkeypatch):
+    import ba2_providers.StockScreener as SS
+    rec = _RecordingLogger()
+    monkeypatch.setattr(SS, "logger", rec)
+    return SS.StockScreener({"screener_max_stocks": 2}, as_of=as_of), rec
+
+
+def test_live_selection_is_logged_with_symbols(monkeypatch):
+    """Live runs must record WHICH symbols were picked -- the live logs previously recorded only
+    that a screener job started, so there was nothing to compare against the metric_store."""
+    s, rec = _screener_with(None, monkeypatch)
+    s._log_live_selection([{"symbol": "AAPL"}, {"symbol": "MSFT"}])
+    assert "LIVE SELECTION" in rec.text
+    assert "AAPL,MSFT" in rec.text
+    assert "cap>=" in rec.text, "the thresholds in force must be recorded alongside the picks"
+
+
+def test_backtest_never_logs_a_live_selection(monkeypatch):
+    """GRID SAFETY: a backtest always passes an as_of, so this must be structurally incapable of
+    firing there -- ~324k rebalances per optimization job would otherwise pay for the string."""
+    from datetime import datetime
+    s, rec = _screener_with(datetime(2024, 1, 2), monkeypatch)
+    s._log_live_selection([{"symbol": "AAPL"}])
+    assert rec.text == "", "a backtest must emit nothing at all"
