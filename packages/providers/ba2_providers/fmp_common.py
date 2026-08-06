@@ -387,6 +387,59 @@ class FMPError(RuntimeError):
     """Raised when an FMP call returns an error/unexpected payload (after retries)."""
 
 
+class FMPHermeticViolation(RuntimeError):
+    """A backtest tried to reach the FMP network. The hermetic contract forbids it.
+
+    Deliberately NOT an ``FMPError`` subclass: several providers wrap FMP calls in
+    ``except FMPError`` and degrade to an empty result, which would turn a contract breach back
+    into the silent behaviour this exists to stop.
+
+    WHY THIS GUARD IS AT ``fmp_http_get`` AND NOT PER-CALLER (2026-08-06)
+    --------------------------------------------------------------------
+    ``daily_backtest_handler`` documents the contract as "a backtest must run from PRE-WARMED
+    caches only (0 network fetches)". But ``hermetic_fmp_history()`` was only ever consulted
+    inside ``_fmp_history_disk_read_or_fetch`` -- i.e. it protected the ONE path that already had
+    a disk cache. NINE provider modules call ``fmp_http_get`` directly and none was covered, so
+    the "guarantee" held only for callers that had already opted in.
+
+    What that cost: FactorRanker with ``universe_source=screener`` and no ``screener_store`` falls
+    back to the live ``StockScreener``, which fetches per-symbol history for the whole universe.
+    Every trial worker of opt 255 sat blocked in ``_gate_wait`` for EIGHT HOURS with zero trials
+    completed, and the same job on 2026-08-05 exhausted the FMP daily quota at 22:57. Neither was
+    attributable from the cache (these calls never write ``fmp_history``) nor from the logs.
+
+    Enforcing at the single choke point makes the contract structural: a backtest cannot reach the
+    network by any route, and a breach fails LOUDLY and IMMEDIATELY, naming the endpoint, instead
+    of grinding for hours behind a rate limiter.
+    """
+
+
+def _assert_not_hermetic(fn_name: str, endpoint: str, symbol: str = "") -> None:
+    """Refuse an outbound FMP call while a hermetic (backtest) run is active.
+
+    The single choke point both ``fmp_http_get`` and ``fmp_list_call`` pass through, so the
+    "0 network fetches" contract holds for EVERY provider rather than only the ones that route
+    through ``fmp_history_disk_cached``. See ``FMPHermeticViolation`` for what the gap cost.
+
+    ``BA2_HERMETIC_ALLOW_NETWORK=1`` re-opens the network for a deliberate diagnostic run (e.g.
+    comparing the live screener against the store). It is an escape hatch, not a setting: a grid
+    must never be run with it on, or the stall it prevents comes straight back.
+    """
+    if not _is_hermetic_fmp_history():
+        return
+    import os as _os
+    if _os.environ.get("BA2_HERMETIC_ALLOW_NETWORK") == "1":
+        return
+    raise FMPHermeticViolation(
+        f"HERMETIC CONTRACT BREACH: {fn_name} tried to reach FMP endpoint "
+        f"'{endpoint or '?'}'{f' for {symbol}' if symbol else ''} during a backtest. A backtest "
+        f"must read from pre-warmed caches only. Either pre-warm this data, or point the caller "
+        f"at its cached equivalent (e.g. set FactorRanker's `screener_store` so the universe "
+        f"resolves from the metric_store instead of the live StockScreener). "
+        f"Set BA2_HERMETIC_ALLOW_NETWORK=1 ONLY for a deliberate diagnostic run."
+    )
+
+
 def _fmp_error_message(payload: dict) -> Any:
     """Return the FMP error string from a dict payload, or None if not an error."""
     for key in _FMP_ERROR_KEYS:
@@ -462,6 +515,7 @@ def fmp_http_get(
     retries are exhausted on a retryable condition.
     """
     getter = getter or requests.get
+    _assert_not_hermetic("fmp_http_get", endpoint or url, symbol)
     total_attempts = len(delays) + 1
     last_reason: Any = None
     retry_after: Optional[float] = None
@@ -535,6 +589,7 @@ def fmp_list_call(
         FMPError: On a persistent FMP error dict (after retries) or on an
             unexpected (non-list, non-error-dict) payload.
     """
+    _assert_not_hermetic("fmp_list_call", endpoint, symbol)
     total_attempts = len(delays) + 1
     last_payload: Any = None
 

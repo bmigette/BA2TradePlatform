@@ -251,7 +251,12 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str, ctl: Any = None) 
         if isinstance(e, TrialCancelled):
             return {"ok": False, "fitness": 0.0, "trades": 0, "error": "cancelled",
                     "cancelled": True, "retryable": True, "fatal": False}
-        fatal = type(e).__name__ in ("BacktestCacheMiss", "FMPHistoryCacheMiss")
+        # FMPHermeticViolation is FATAL for the same reason as a cache miss: it is a
+        # data/config problem that affects EVERY trial, not a bad genome. It also has to abort
+        # fast — opt 255 spent 8h with all four workers blocked in the FMP rate gate, having
+        # completed zero trials, because a breach merely made each trial slow instead of failing.
+        fatal = type(e).__name__ in (
+            "BacktestCacheMiss", "FMPHistoryCacheMiss", "FMPHermeticViolation")
         return {"ok": False, "fitness": 0.0, "trades": 0, "error": str(e) if fatal else repr(e),
                 "fatal": fatal, "mem": _trial_memory_snapshot()}
 

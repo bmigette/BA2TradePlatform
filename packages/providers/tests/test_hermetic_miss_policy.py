@@ -124,3 +124,64 @@ def test_non_hermetic_mode_still_fetches():
         fc.fmp_history_disk_cached("grades_historical", "ZZZ_NOPE_LIVE", fetch, 3650)
     assert calls, "non-hermetic miss must fetch"
     assert fc.hermetic_miss_symbols() == set(), "and must not pollute the miss registry"
+
+
+# --- hermetic contract enforced at the CHOKE POINT (2026-08-06) --------------------------------
+# The contract says a backtest makes ZERO network fetches, but the guard was only ever consulted
+# inside fmp_history_disk_cached -- so the 9 modules calling fmp_http_get directly were exempt.
+# FactorRanker's live-StockScreener fallback blocked every worker of opt 255 in the FMP rate gate
+# for 8 hours with 0 trials, and exhausted the daily quota on 2026-08-05.
+
+def test_fmp_http_get_refuses_to_leave_the_process_in_a_backtest(monkeypatch):
+    import ba2_providers.fmp_common as fc
+
+    def _boom(*a, **k):
+        raise AssertionError("a hermetic backtest must never reach the network")
+    monkeypatch.setattr(fc.requests, "get", _boom)
+
+    with fc.hermetic_fmp_history():
+        with pytest.raises(fc.FMPHermeticViolation, match="HERMETIC CONTRACT BREACH"):
+            fc.fmp_http_get("https://financialmodelingprep.com/api/v3/quote/AAPL",
+                            endpoint="quote", symbol="AAPL")
+
+
+def test_fmp_list_call_is_guarded_too(monkeypatch):
+    """Both entry points, or a caller just switches to the unguarded one."""
+    import ba2_providers.fmp_common as fc
+    with fc.hermetic_fmp_history():
+        with pytest.raises(fc.FMPHermeticViolation):
+            fc.fmp_list_call(lambda: [], endpoint="income_statement", symbol="AAPL")
+
+
+def test_violation_is_not_an_FMPError(monkeypatch):
+    """Several providers wrap FMP calls in `except FMPError` and degrade to an empty result.
+    If the breach were an FMPError it would be swallowed -- back to the silent behaviour."""
+    import ba2_providers.fmp_common as fc
+    assert not issubclass(fc.FMPHermeticViolation, fc.FMPError)
+
+
+def test_live_path_is_untouched(monkeypatch):
+    """Outside hermetic mode nothing changes -- live analysis still fetches."""
+    import ba2_providers.fmp_common as fc
+
+    class _Resp:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self): return [{"symbol": "AAPL"}]
+    monkeypatch.setattr(fc.requests, "get", lambda *a, **k: _Resp())
+    out = fc.fmp_http_get("https://financialmodelingprep.com/api/v3/quote/AAPL", endpoint="quote")
+    assert out.json() == [{"symbol": "AAPL"}]
+
+
+def test_escape_hatch_reopens_the_network_for_a_deliberate_diagnostic(monkeypatch):
+    import ba2_providers.fmp_common as fc
+
+    class _Resp:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self): return []
+    monkeypatch.setattr(fc.requests, "get", lambda *a, **k: _Resp())
+    monkeypatch.setenv("BA2_HERMETIC_ALLOW_NETWORK", "1")
+    with fc.hermetic_fmp_history():
+        assert fc.fmp_http_get("https://financialmodelingprep.com/api/v3/quote/AAPL",
+                               endpoint="quote").json() == []
