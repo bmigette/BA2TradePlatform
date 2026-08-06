@@ -212,7 +212,31 @@ class FactorPortfolioManager:
         # ``rebalance_deltas`` also sorts internally, but keeping this stable too
         # avoids re-introducing process-dependent ordering if this set is reused.
         symbols = sorted(set(target_weights) | set(held))
-        prices = {s: self.account.get_instrument_current_price(s) for s in symbols}
+        # ONE unpriceable symbol must not kill the whole rebalance. The backtest account RAISES
+        # ("No backtest price for GIBO at ...") rather than returning None for a symbol with no
+        # bar on this date, so a bare dict comprehension propagated that out of rebalance() and
+        # the engine logged "bypass rebalance failed" and skipped the ENTIRE basket. Measured
+        # 2026-08-06: GIBO had no price on any Monday, so every weekly rebalance of the large
+        # universe aborted and FactorRanker produced ZERO trades over the whole window.
+        #
+        # ``rebalance_deltas`` already handles a None price correctly (it skips an unpriceable
+        # BUY target and still fully exits an unpriceable HELD name using its held quantity), so
+        # degrading to None here is exactly what the downstream logic already expects.
+        prices: Dict[str, Optional[float]] = {}
+        unpriced: List[str] = []
+        for s in symbols:
+            try:
+                prices[s] = self.account.get_instrument_current_price(s)
+            except Exception as e:  # noqa: BLE001 — one bad symbol disables itself, never the basket
+                prices[s] = None
+                unpriced.append(s)
+                logger.debug(f"FactorRanker: no price for {s} this bar ({e}); excluded from rebalance")
+        if unpriced:
+            logger.warning(
+                f"FactorRanker: {len(unpriced)}/{len(symbols)} symbol(s) unpriceable this "
+                f"rebalance and skipped: {', '.join(unpriced[:10])}"
+                f"{' ...' if len(unpriced) > 10 else ''}"
+            )
 
         if equity is None:
             equity = self.expert.get_virtual_balance()

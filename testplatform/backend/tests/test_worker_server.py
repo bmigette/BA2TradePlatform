@@ -413,3 +413,49 @@ def test_sync_endpoints_require_auth(client):
     assert client.post("/sync/strategy", json={"name": "x", "created_at": "2026-01-01T00:00:00"}).status_code == 401
     assert client.post("/sync/optimization", json={"name": "x", "created_at": "2026-01-01T00:00:00"}).status_code == 401
     assert client.post("/sync/backtest", json={"name": "x", "created_at": "2026-01-01T00:00:00"}).status_code == 401
+
+
+def test_health_reports_free_slots_not_just_nominal_capacity(client, monkeypatch):
+    """REGRESSION (2026-08-05/06). remote150 answered ok:true capacity:6 while every slot was
+    held by children of a killed master, so the pre-flight kept selecting it and every trial was
+    accepted and never scheduled. capacity alone cannot express "full"."""
+    monkeypatch.setattr(ws, "_CAPACITY", 6)
+    monkeypatch.setattr(ws, "_JOBS", {f"j{i}": _PendingFuture() for i in range(6)})
+    monkeypatch.setattr(ws, "_JOB_CTL", {})
+    monkeypatch.setattr(ws, "_JOBS_SUBMITTED_AT", {})
+    body = client.get("/health", headers=H).json()
+    assert body["capacity"] == 6
+    assert body["busy"] == 6 and body["free"] == 0
+
+
+def test_abandoned_job_is_swept_when_master_stops_polling(monkeypatch):
+    """A killed master never cancels its trials. Without this they held a slot for the full 6h
+    orphan age -- the leak that jammed remote150's pool twice."""
+    import time as _time
+    ctl = {"cancel": False, "bars": 5}
+    now = _time.monotonic()
+    monkeypatch.setattr(ws, "_JOBS", {"dead": _PendingFuture()})
+    monkeypatch.setattr(ws, "_JOB_CTL", {"dead": ctl})
+    monkeypatch.setattr(ws, "_JOBS_SUBMITTED_AT", {"dead": now - 600})
+    monkeypatch.setattr(ws, "_JOBS_LAST_POLL_AT", {"dead": now - ws._JOBS_ABANDONED_AFTER - 30})
+
+    ws._sweep_orphaned_jobs()
+
+    assert "dead" not in ws._JOBS, "abandoned job must be dropped so its slot frees"
+    assert ctl["cancel"] is True, "and cooperatively cancelled so the child actually stops"
+
+
+def test_actively_polled_job_is_never_swept(monkeypatch):
+    """The counterpart: a long trial whose master is still polling must survive."""
+    import time as _time
+    ctl = {"cancel": False, "bars": 900}
+    now = _time.monotonic()
+    monkeypatch.setattr(ws, "_JOBS", {"alive": _PendingFuture()})
+    monkeypatch.setattr(ws, "_JOB_CTL", {"alive": ctl})
+    monkeypatch.setattr(ws, "_JOBS_SUBMITTED_AT", {"alive": now - 4 * 3600})   # 4h old
+    monkeypatch.setattr(ws, "_JOBS_LAST_POLL_AT", {"alive": now - 3})          # polled 3s ago
+
+    ws._sweep_orphaned_jobs()
+
+    assert "alive" in ws._JOBS
+    assert ctl["cancel"] is False

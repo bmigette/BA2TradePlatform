@@ -75,8 +75,18 @@ _POOL_LOCK = threading.Lock()
 # _JOBS_MAX_ORPHAN_AGE's sweep below.
 _JOBS: dict[str, Future] = {}
 _JOBS_SUBMITTED_AT: dict[str, float] = {}
+# Last time the MASTER polled each job. A live master polls every ~2s (worker_client's
+# _submit_and_poll), so a long gap means the master is gone -- killed, crashed, or it gave up.
+_JOBS_LAST_POLL_AT: dict[str, float] = {}
 _JOBS_LOCK = threading.Lock()
 _JOBS_MAX_ORPHAN_AGE = 6 * 3600.0  # 6h: generous vs. any real trial; just bounds a leak
+# ABANDONED-MASTER SWEEP (2026-08-06). The 6h age sweep above is keyed on SUBMIT time, so a
+# killed master left its trials running for up to 6h, each holding a pool slot. Measured: after
+# two killed optimize runs, remote150 had 7 children on a 6-slot pool -- it answered /health with
+# ok:true capacity:6 while having ZERO free slots, so every new trial was accepted and never
+# scheduled. That is what stalled the grid for ~9h on 2026-08-05 and again on 08-06.
+# 300s is ~150 missed polls: unambiguous, while tolerating a slow/paused master.
+_JOBS_ABANDONED_AFTER = 300.0
 
 # COOPERATIVE CANCEL (2026-07-28). Per-job control block, a Manager dict proxy passed into the
 # pool child: {"cancel": bool, "bars": int}. The trial's progress_cb reads it every throttled
@@ -187,12 +197,21 @@ def _sweep_orphaned_jobs() -> None:
     completion (client crashed / gave up before fetching the result) — called opportunistically
     from _submit_job so it costs nothing on the (normal) submit-then-poll-once path."""
     import time as _time
-    cutoff = _time.monotonic() - _JOBS_MAX_ORPHAN_AGE
+    now = _time.monotonic()
+    cutoff = now - _JOBS_MAX_ORPHAN_AGE
+    abandoned_cutoff = now - _JOBS_ABANDONED_AFTER
     with _JOBS_LOCK:
         stale = [jid for jid, ts in _JOBS_SUBMITTED_AT.items() if ts < cutoff]
-        for jid in stale:
+        # A job whose master stopped polling is abandoned NOW -- do not wait out the 6h age.
+        # Falls back to submit time for a job never polled at all (master died between the
+        # submit response and its first poll).
+        abandoned = [jid for jid in _JOBS_SUBMITTED_AT
+                     if jid not in stale
+                     and _JOBS_LAST_POLL_AT.get(jid, _JOBS_SUBMITTED_AT[jid]) < abandoned_cutoff]
+        for jid in stale + abandoned:
             _JOBS.pop(jid, None)
             _JOBS_SUBMITTED_AT.pop(jid, None)
+            _JOBS_LAST_POLL_AT.pop(jid, None)
             ctl = _JOB_CTL.pop(jid, None)
             if ctl is not None:
                 # Sweeping an orphan now also STOPS it. Previously the registry entry was
@@ -203,6 +222,9 @@ def _sweep_orphaned_jobs() -> None:
                     pass
     if stale:
         logger.warning("swept %d orphaned job(s) never polled to completion: %s", len(stale), stale)
+    if abandoned:
+        logger.warning("swept %d job(s) whose master stopped polling (>%.0fs) — slots released: %s",
+                       len(abandoned), _JOBS_ABANDONED_AFTER, abandoned)
 
 
 def _submit_job(fn, *args) -> str:
@@ -283,9 +305,14 @@ def _job_status(job_id: str) -> dict:
     is unknown, which happens for a genuinely bad id AND, deliberately, for any id from
     before this process's last restart (the registry is in-memory only) — see the module
     docstring's SUBMIT/POLL note for why that's the point, not a bug."""
+    import time as _time
     with _JOBS_LOCK:
         future = _JOBS.get(job_id)
         ctl = _JOB_CTL.get(job_id)
+        if future is not None:
+            # Liveness of the MASTER, not the trial: proves someone is still waiting for this
+            # result. _sweep_orphaned_jobs cancels jobs nobody has polled recently.
+            _JOBS_LAST_POLL_AT[job_id] = _time.monotonic()
     if future is None:
         raise HTTPException(status_code=404, detail=f"job {job_id!r} unknown (unrecognized id, "
                                                      f"or this worker restarted since it was submitted).")
@@ -418,8 +445,23 @@ def _hardware() -> dict:
 
 @worker_app.get("/health")
 def health(authorization: str = Header(default=None)):
+    """Worker liveness + how much of it is actually AVAILABLE.
+
+    Sweeps abandoned jobs first: the sweep used to run only from ``_submit_job``, so a worker
+    whose master had been killed never swept (no new submits arrive) and sat on occupied slots
+    indefinitely. /health is what the next master's pre-flight calls, so sweeping here is what
+    guarantees a fresh run finds released slots.
+
+    ``capacity`` stays the NOMINAL slot count (unchanged for existing callers); ``busy``/``free``
+    report reality. A worker answering ok:true capacity:6 while holding 6 live jobs is exactly
+    how the 2026-08-05/06 stalls looked from the master's side.
+    """
     _verify(authorization)
-    return {"ok": True, "capacity": _CAPACITY, "version": self_update.get_version_info(), **_hardware()}
+    _sweep_orphaned_jobs()
+    with _JOBS_LOCK:
+        busy = sum(1 for f in _JOBS.values() if not f.done())
+    return {"ok": True, "capacity": _CAPACITY, "busy": busy, "free": max(0, _CAPACITY - busy),
+            "version": self_update.get_version_info(), **_hardware()}
 
 
 @worker_app.get("/version")
