@@ -322,6 +322,23 @@ def _cmd_prewarm(args) -> int:
             sym, end_date=end_date, lookback_days=400, as_of=end_date,
             format_type="dict")
 
+    # DeterministicScorer: warm the SAME fmp_history namespaces its _gather reads --
+    # annual income/balance/cashflow statements (point-in-time F-Score / Altman Z /
+    # quality / value / growth inputs; the backtest filters them by filing date in
+    # Python) + the dated analyst-grade history for the OPTIONAL analyst section
+    # (weight default 0, but the grid may switch it on). OHLCV comes from the
+    # fetch-cache parquet (same reminder as FactorRanker below).
+    def _do_deterministic_scorer(sym: str) -> None:
+        nonlocal _details_provider
+        if _details_provider is None:
+            _details_provider = FMPCompanyDetailsProvider()
+        for fn in (_details_provider.get_income_statement,
+                   _details_provider.get_balance_sheet,
+                   _details_provider.get_cashflow_statement):
+            fn(symbol=sym, frequency="annual", end_date=end_date,
+               lookback_periods=6, as_of=end_date, format_type="dict")
+        fetch_grades_historical_cached(key, sym)
+
     # FactorRanker (bypass/rebalance expert): warm ALL of its factor inputs by calling the SAME
     # data-layer fetchers the rebalance path uses (so coverage auto-tracks the real fetch surface
     # and can't drift). Per symbol this writes the fmp_history namespaces income_statement_annual /
@@ -628,6 +645,7 @@ def _cmd_prewarm(args) -> int:
         "FactorRanker": _do_factorranker,
         "FMPSenateTraderWeight": _do_senate,
         "FinnHubRating": _do_finnhub,
+        "DeterministicScorer": _do_deterministic_scorer,
     }
 
     work = []  # list of (expert, symbol, fetch_callable)
@@ -1116,6 +1134,25 @@ _EXPERT_OPT = {
         "expert_params": {
             "lookback_days": {"optimize": True, "min": 30, "max": 120, "step": 15, "type": "int"},
             "min_insiders": {"optimize": True, "min": 2, "max": 6, "step": 1, "type": "int"},
+        },
+        "fixed_settings": {"sizing_mode": "risk_atr"},
+    },
+    # DeterministicScorer — LLM-free multi-section scorer. Gene choices stay PARSIMONIOUS
+    # on purpose (memo §5.3: free-weight sweeps over many signals overfit fast): section
+    # weights, decision thresholds, ATR multiples, and the analyst-section switch (the
+    # bias question: w_analyst searches {0,0.1,0.2,0.3,0.4} so the grid itself measures
+    # whether ratings add value or double-count momentum). z_veto / k_compress / periods
+    # stay fixed in v1 — widen the space only after this first grid reports OOS.
+    "DeterministicScorer": {
+        "expert_params": {
+            "w_technical": {"optimize": True, "min": 0.2, "max": 0.8, "step": 0.1, "type": "float"},
+            "w_fundamental": {"optimize": True, "min": 0.1, "max": 0.7, "step": 0.1, "type": "float"},
+            "w_analyst": {"optimize": True, "min": 0.0, "max": 0.4, "step": 0.1, "type": "float"},
+            "macro_mode": {"optimize": True, "type": "choice", "choices": ["multiply", "gate", "off"]},
+            "theta_buy": {"optimize": True, "min": 0.3, "max": 0.7, "step": 0.1, "type": "float"},
+            "theta_sell": {"optimize": True, "min": 0.1, "max": 0.4, "step": 0.1, "type": "float"},
+            "k_stop": {"optimize": True, "min": 1.5, "max": 3.0, "step": 0.5, "type": "float"},
+            "k_target": {"optimize": True, "min": 3.0, "max": 6.0, "step": 1.0, "type": "float"},
         },
         "fixed_settings": {"sizing_mode": "risk_atr"},
     },
