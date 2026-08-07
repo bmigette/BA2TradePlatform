@@ -299,6 +299,17 @@ _EXPERT_WARM_CACHE_PATTERNS = [
     ("*price_target*.json", "FMPRating analyst price targets"),
     ("*earnings*.json", "FMPEarningsDrift earnings calendar/surprises"),
     ("*insider*.json", "FMPInsiderClusterBuy insider transactions"),
+    # Added 2026-08-07: these were a total blind spot. FactorRanker fetches with
+    # lookback_periods=1 and the disk cache is keyed WITHOUT depth, so every
+    # statement file on disk held exactly ONE row (the latest filing). Nothing
+    # here noticed, because "file exists and has >0 entries" is true of a 1-row
+    # file -- see _MIN_ROWS_PER_SYMBOL for the depth half of the check.
+    ("income_statement_annual__*.json", "FactorRanker/DeterministicScorer income statements"),
+    ("balance_sheet_annual__*.json", "FactorRanker/DeterministicScorer balance sheets"),
+    ("cashflow_statement_annual__*.json", "FactorRanker/DeterministicScorer cash-flow statements"),
+    ("analyst_grades__*.json", "FMPRating/DeterministicScorer analyst grades"),
+    ("congress_senate_trades__*.json", "FMPSenateTrader* senate disclosures"),
+    ("congress_house_trades__*.json", "FMPSenateTrader* house disclosures"),
     ("congress_skill_scores__*.jsonl", "FMPSenateTraderWeight trader-skill scores"),
     ("congress_scalper_scores.json*", "FMPSenateTraderWeight scalper/hold-time (roundtrip) scores"),
     ("congress_confidence_scores__*.jsonl", "FMPSenateTraderWeight trader-confidence scores"),
@@ -360,7 +371,67 @@ def check_expert_warm_cache(cache_folder: str) -> dict:
 _WARM_CACHE_DATE_FIELDS = [
     ("*price_target*.json", "FMPRating price-target history", ("publishedDate", "date")),
     ("*insider*.json", "FMPInsiderClusterBuy Form-4 history", ("transactionDate", "filingDate", "date")),
+    # Statements are POINT-IN-TIME gated on their FILING date, so an earliest
+    # filing later than `start` means the fundamental sections are empty for the
+    # whole window -- which is exactly what happened (earliest fillingDate
+    # 2025-10-31 against a 2020 start) and what this check would have caught.
+    ("income_statement_annual__*.json", "income-statement filing history",
+     ("fillingDate", "filingDate", "acceptedDate", "date")),
+    ("balance_sheet_annual__*.json", "balance-sheet filing history",
+     ("fillingDate", "filingDate", "acceptedDate", "date")),
+    ("cashflow_statement_annual__*.json", "cash-flow filing history",
+     ("fillingDate", "filingDate", "acceptedDate", "date")),
+    ("analyst_grades__*.json", "analyst-grades history", ("date", "publishedDate")),
 ]
+
+# Minimum rows a per-symbol cache must hold before it can serve a MULTI-PERIOD
+# calculation. Existence + ">0 entries" is not enough: a 1-row statement file is
+# non-empty and still cannot compute Piotroski (needs 2 fiscal years) or growth
+# acceleration (needs 3+). Only namespaces with a hard structural requirement are
+# listed -- a thin price-target history is legitimate, a 1-row balance sheet is not.
+_MIN_ROWS_PER_SYMBOL = {
+    "income_statement_annual__*.json": 3,
+    "balance_sheet_annual__*.json": 3,
+    "cashflow_statement_annual__*.json": 3,
+}
+
+
+def check_warm_cache_depth(cache_folder: str, sample: int = 60) -> dict:
+    """Flag per-symbol caches too SHALLOW for the calculations that read them.
+
+    Catches the failure this tool missed for months: a depth-agnostic cache key
+    plus a caller that fetches ``limit=1`` pins every file to one row, which then
+    passes every existence/non-emptiness check while silently disabling whole
+    scoring sections downstream.
+    """
+    import glob
+
+    fmp_dir = os.path.join(cache_folder, "fmp_history")
+    out: dict = {}
+    for pattern, min_rows in _MIN_ROWS_PER_SYMBOL.items():
+        matches = sorted(glob.glob(os.path.join(fmp_dir, pattern)))[:sample]
+        shallow, counts = [], []
+        for p in matches:
+            base = os.path.basename(p)
+            sym = base.split("__", 1)[-1].rsplit(".json", 1)[0]
+            try:
+                with open(p, encoding="utf-8") as f:
+                    rows = json.load(f)
+            except Exception:  # noqa: BLE001 — unreadable file is itself a finding
+                shallow.append(f"{sym} (unreadable)")
+                continue
+            if isinstance(rows, dict):
+                rows = rows.get("data") or rows.get("rows") or []
+            n = len(rows) if hasattr(rows, "__len__") else 0
+            counts.append(n)
+            if n < min_rows:
+                shallow.append(f"{sym}={n}")
+        out[pattern] = {
+            "sampled": len(matches), "min_rows": min_rows,
+            "median_rows": sorted(counts)[len(counts) // 2] if counts else 0,
+            "shallow_count": len(shallow), "shallow": shallow[:15],
+        }
+    return out
 
 
 def check_warm_cache_date_coverage(cache_folder: str, start: str, sample: int = 20) -> dict:
@@ -619,6 +690,19 @@ def check_period_validity(start: str, end: str, nan_threshold: float,
         print(f"    {label}: {info['files']} file(s), {info['total_entries']} total entries{flag}")
         if info["files"] == 0 or info["empty_files"]:
             ok = False
+
+    print("  WARM-CACHE DEPTH (multi-period calculations need >1 row per symbol):")
+    depth = check_warm_cache_depth(CACHE_FOLDER)
+    for pattern, info in depth.items():
+        if not info["sampled"]:
+            print(f"    {pattern}: no files sampled")
+            continue
+        flag = ""
+        if info["shallow_count"]:
+            flag = (f"  <-- {info['shallow_count']}/{info['sampled']} BELOW "
+                    f"{info['min_rows']} rows: {', '.join(info['shallow'])}")
+            ok = False
+        print(f"    {pattern}: median {info['median_rows']} row(s){flag}")
 
     print(f"  INDICATOR WARMUP dependency ({start} start, experts={','.join(_warmup_experts)}):")
     wu = check_warmup_coverage(SCREENER_STORE_DIR, provider_dir, interval, start, _warmup_experts)
