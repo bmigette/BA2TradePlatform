@@ -39,7 +39,9 @@ from . import data
 from .technical import technical_score
 from .fundamental import (fundamental_score, piotroski_f_score,
                           altman_z_and_variant, growth_acceleration)
-from .analyst import revision_momentum
+from .analyst import (analyst_section_score, DEF_AW_GRADES, DEF_AW_TARGETS,
+                      DEF_TARGET_WINDOW_DAYS, DEF_TARGET_SCALE, DEF_MIN_TARGETS)
+from ba2_experts.earnings_surprise import pead_score
 from .macro import (trend_score, vix_score, pmi_score, sahm_score, credit_score,
                     yield_curve_score, regime_composite, DEF_MW, DEF_YC_SCALE,
                     DEF_M_FLOOR, DEF_HARD_RISKOFF)
@@ -47,7 +49,7 @@ from .combine import (final_score, schmitt_trigger, atr_target_price,
                       atr_stop_price, confidence_from_score,
                       DEF_W_TECHNICAL, DEF_W_FUNDAMENTAL, DEF_W_ANALYST,
                       DEF_K_COMPRESS, DEF_THETA_BUY, DEF_THETA_SELL,
-                      DEF_K_STOP, DEF_K_TARGET, DEF_VETO_CAP)
+                      DEF_K_STOP, DEF_K_TARGET, DEF_VETO_CAP, DEF_W_EARNINGS)
 
 
 class DeterministicScorer(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExpertInterface):
@@ -107,6 +109,20 @@ class DeterministicScorer(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExper
                                         "valid_values": ["skip", "neutral"],
                                         "description": "Missing section: skip=renormalize over the available ones, "
                                                        "neutral=keep its weight at score 0 (drags toward flat)"},
+            "w_earnings": {"type": "float", "required": False, "default": DEF_W_EARNINGS,
+                           "description": "Weight of the EARNINGS/PEAD section (0 = disabled). "
+                                          "Shares its maths with FMPEarningsDrift, which trades the "
+                                          "same signal standalone — let the grid say whether it also "
+                                          "adds value inside the composite"},
+            "earnings_drift_window_days": {"type": "int", "required": False, "default": 75,
+                                           "description": "Days after the report beyond which the drift is treated as spent"},
+            "earnings_halflife_days": {"type": "int", "required": False, "default": 25,
+                                       "description": "Half-life of the post-announcement decay"},
+            "earnings_scale_pct": {"type": "float", "required": False, "default": 5.0,
+                                   "description": "Surprise %% saturating the tanh (fallback when SUE has no history)"},
+            "earnings_use_sue": {"type": "bool", "required": False, "default": True,
+                                 "description": "Standardize the surprise by the name's OWN past dispersion (SUE) "
+                                                "so a 3%% beat means the same for a utility and a biotech"},
             # ---- technical sub-settings ----
             "mom_lookback_days": {"type": "int", "required": False, "default": 252,
                                   "description": "Momentum lookback (trading days)"},
@@ -171,6 +187,17 @@ class DeterministicScorer(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExper
                                     "description": "Trailing window for rating revisions"},
             "analyst_recency_halflife_days": {"type": "int", "required": False, "default": 30,
                                               "description": "Exponential recency-decay halflife"},
+            "aw_grades": {"type": "float", "required": False, "default": DEF_AW_GRADES,
+                          "description": "ANALYST sub-weight: rating-revision momentum"},
+            "aw_targets": {"type": "float", "required": False, "default": DEF_AW_TARGETS,
+                           "description": "ANALYST sub-weight: price-target upside + revision drift"},
+            "analyst_target_window_days": {"type": "int", "required": False, "default": DEF_TARGET_WINDOW_DAYS,
+                                           "description": "Trailing window of dated analyst price targets"},
+            "analyst_target_scale": {"type": "float", "required": False, "default": DEF_TARGET_SCALE,
+                                     "description": "Implied upside saturating the tanh (0.20 = 20%%)"},
+            "analyst_min_targets": {"type": "int", "required": False, "default": DEF_MIN_TARGETS,
+                                    "description": "Minimum targets in the window; below this the leg is dropped "
+                                                   "(a 1-2 analyst consensus is noise dressed as agreement)"},
             # ---- macro sub-weights ----
             "mw_trend_index": {"type": "float", "required": False, "default": DEF_MW["trend_index"],
                                "description": "Macro weight: index trend vs SMA200"},
@@ -212,6 +239,8 @@ class DeterministicScorer(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExper
         "w_technical", "w_fundamental", "w_analyst", "macro_mode", "m_floor",
         "hard_riskoff", "macro_gate_min", "w_macro",
         "k_compress", "theta_buy", "theta_sell", "veto_cap", "skip_on_missing_section",
+        "w_earnings", "earnings_drift_window_days", "earnings_halflife_days",
+        "earnings_scale_pct", "earnings_use_sue",
         "mom_lookback_days", "mom_skip_days", "vol_window", "sma_trend_period",
         "rsi_period", "donchian_period", "adx_period", "adx_gate", "adx_rsi_boost",
         "tw_mom", "tw_d200", "tw_rsi", "tw_don",
@@ -220,6 +249,8 @@ class DeterministicScorer(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExper
         "z_veto", "z_veto_adjusted", "altman_variant",
         "fscore_disqualify", "scale_accel", "fundamentals_max_age_days",
         "analyst_window_days", "analyst_recency_halflife_days",
+        "aw_grades", "aw_targets", "analyst_target_window_days",
+        "analyst_target_scale", "analyst_min_targets",
         "mw_trend_index", "mw_breadth", "mw_vix", "mw_credit",
         "mw_yield_curve", "mw_pmi", "mw_sahm",
         "vix_calm", "vix_stress", "yc_scale", "index_symbol",
@@ -241,6 +272,7 @@ class DeterministicScorer(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExper
         extra = getattr(context, "extra", None) or {}
         self._gather_symbol = extra.get("symbol", getattr(self, "_gather_symbol", None))
         self._gather_w_analyst = float(settings.get("w_analyst", DEF_W_ANALYST) or 0.0)
+        self._gather_w_earnings = float(settings.get("w_earnings", DEF_W_EARNINGS) or 0.0)
         self._gather_index_symbol = str(settings.get("index_symbol", data.INDEX_SYMBOL))
         bundle = self._gather(context.providers, as_of)
         return self._process(bundle, settings, as_of)
@@ -258,11 +290,15 @@ class DeterministicScorer(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExper
         statements = data.fetch_statements(providers, symbol, as_of)
 
         grades_rows: list = []
+        target_rows: list = []
         if float(getattr(self, "_gather_w_analyst", 0.0) or 0.0) > 0:
             api_key = self._get_fmp_api_key()
             if api_key:
                 grades_rows = data.fetch_grades_history(api_key, symbol)
+                target_rows = data.fetch_price_targets(api_key, symbol)
 
+        earnings_rows = (data.fetch_past_earnings(providers, symbol, as_of)
+                         if float(getattr(self, "_gather_w_earnings", 0.0) or 0.0) > 0 else [])
         macro_inputs = data.fetch_macro_series(providers, as_of)
         index_closes = data.fetch_index_closes(
             providers, as_of, str(getattr(self, "_gather_index_symbol", data.INDEX_SYMBOL)))
@@ -276,6 +312,8 @@ class DeterministicScorer(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExper
             "ohlcv": df,
             "statements": statements,
             "grades_rows": grades_rows,
+            "target_rows": target_rows,
+            "earnings_rows": earnings_rows,
             "macro_inputs": macro_inputs,
             "index_closes": index_closes,
             "current_price": current_price,
@@ -309,15 +347,31 @@ class DeterministicScorer(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExper
         # ---- ANALYST (optional) ----
         analyst_score: Optional[float] = None
         analyst_info: Dict[str, Any] = {}
-        if float(settings.get("w_analyst", 0.0) or 0.0) > 0 and data_bundle.get("grades_rows"):
+        if float(settings.get("w_analyst", 0.0) or 0.0) > 0:
             ref = as_of if as_of is not None else datetime.now(timezone.utc)
-            rm = revision_momentum(
-                data_bundle["grades_rows"], ref,
-                int(settings.get("analyst_window_days", 90)),
-                int(settings.get("analyst_recency_halflife_days", 30)))
-            if rm is not None:
-                analyst_score = rm["score"]
-                analyst_info = rm
+            # Two dated legs: rating revisions + price-target drift. EPS-estimate
+            # revisions would be the stronger signal but FMP exposes no dated
+            # estimate history (only a snapshot keyed by future fiscal period),
+            # so they are not backtestable and deliberately absent.
+            sec = analyst_section_score(
+                data_bundle.get("grades_rows"), data_bundle.get("target_rows"),
+                ref, current_price, settings)
+            if sec is not None:
+                analyst_score = sec["score"]
+                analyst_info = sec
+
+        # ---- EARNINGS / PEAD (optional) ----
+        # Shares its maths with FMPEarningsDrift via ba2_experts.earnings_surprise:
+        # that expert thresholds the surprise into a boolean entry signal, this
+        # section keeps it continuous so the weighting has something to weigh.
+        earnings_score: Optional[float] = None
+        earnings_info: Dict[str, Any] = {}
+        if float(settings.get("w_earnings", 0.0) or 0.0) > 0 and data_bundle.get("earnings_rows"):
+            ref = as_of if as_of is not None else datetime.now(timezone.utc)
+            pead = pead_score(data_bundle["earnings_rows"], ref, settings)
+            if pead is not None:
+                earnings_score = pead["score"]
+                earnings_info = pead
 
         # ---- MACRO regime ----
         regime = self._build_regime(data_bundle, settings)
@@ -327,6 +381,7 @@ class DeterministicScorer(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExper
             technical=tech.get("score"),
             fundamental=fund.get("score"),
             analyst=analyst_score,
+            earnings=earnings_score,
             regime=regime.get("score") if regime else None,
             s=settings, veto=veto,
             # How many macro inputs actually backed the regime: without it a
@@ -377,6 +432,7 @@ class DeterministicScorer(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExper
             "technical": tech.get("score"),
             "fundamental": fund.get("score"),
             "analyst": analyst_score,
+            "earnings": earnings_score,
             "regime": regime.get("score") if regime else None,
             "exposure_multiplier": result.get("exposure_multiplier"),
             "veto": veto,
@@ -394,7 +450,8 @@ class DeterministicScorer(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExper
             expected_profit_percent=expected_profit_percent,
             target_price=target_price,
             raw_outputs={"calc": calc, "technical": tech, "fundamental": fund,
-                         "analyst": analyst_info, "regime": regime,
+                         "analyst": analyst_info, "earnings": earnings_info,
+                         "regime": regime,
                          "combination": result})
 
     # ------------------------------------------------------- section builders
@@ -579,6 +636,7 @@ class DeterministicScorer(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExper
             settings = self._resolve_settings(self._SETTING_KEYS)
             self._gather_symbol = symbol
             self._gather_w_analyst = float(settings.get("w_analyst", 0.0) or 0.0)
+            self._gather_w_earnings = float(settings.get("w_earnings", 0.0) or 0.0)
             self._gather_index_symbol = str(settings.get("index_symbol", "SPY"))
 
             providers = self._live_providers()

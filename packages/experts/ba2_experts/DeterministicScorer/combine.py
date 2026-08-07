@@ -13,6 +13,10 @@ import numpy as np
 DEF_W_TECHNICAL = 0.50
 DEF_W_FUNDAMENTAL = 0.30
 DEF_W_ANALYST = 0.00
+# PEAD section: off by default. A dedicated FMPEarningsDrift expert already
+# trades this signal standalone, so the grid decides whether it also earns its
+# place INSIDE the composite rather than the default asserting it.
+DEF_W_EARNINGS = 0.00
 DEF_W_MACRO_AS_INPUT = 0.20   # only when macro_mode == "input"
 DEF_K_COMPRESS = 0.6
 DEF_THETA_BUY = 0.5
@@ -93,7 +97,8 @@ def apply_vetoes(score: float, veto: bool, veto_cap: float = DEF_VETO_CAP) -> fl
 def final_score(technical: Optional[float], fundamental: Optional[float],
                 analyst: Optional[float], regime: Optional[float],
                 s: Dict[str, Any], veto: bool = False,
-                regime_n_inputs: Optional[int] = None) -> Dict[str, Any]:
+                regime_n_inputs: Optional[int] = None,
+                earnings: Optional[float] = None) -> Dict[str, Any]:
     """Full deterministic pipeline: combine -> compress -> veto -> regime.
 
     macro_mode: 'multiply' (default, regime scales exposure), 'gate' (regime
@@ -111,8 +116,10 @@ def final_score(technical: Optional[float], fundamental: Optional[float],
         "technical": float(s.get("w_technical", DEF_W_TECHNICAL)),
         "fundamental": float(s.get("w_fundamental", DEF_W_FUNDAMENTAL)),
         "analyst": float(s.get("w_analyst", DEF_W_ANALYST)),
+        "earnings": float(s.get("w_earnings", DEF_W_EARNINGS)),
     }
-    sections = {"technical": technical, "fundamental": fundamental, "analyst": analyst}
+    sections = {"technical": technical, "fundamental": fundamental,
+                "analyst": analyst, "earnings": earnings}
     if mode == "input":
         weights["macro"] = float(s.get("w_macro", DEF_W_MACRO_AS_INPUT))
         sections["macro"] = regime

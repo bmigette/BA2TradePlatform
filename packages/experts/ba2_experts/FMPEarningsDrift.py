@@ -37,6 +37,7 @@ from ba2_common.core.types import (
 from ba2_common.core.backtest_context import ProviderBundle
 from ba2_common.logger import get_expert_logger
 from ba2_experts.expert_mixins import AnalysisStatusRenderMixin
+from ba2_experts.earnings_surprise import surprise_percent as _surprise_percent
 from ba2_providers.cache.cached_get import past_earnings_get
 from ba2_providers.fmp_common import TTLCache
 from ba2_providers.fundamentals.details.FMPCompanyDetailsProvider import FMPCompanyDetailsProvider
@@ -120,8 +121,11 @@ def evaluate_earnings_drift(latest_earnings: Optional[Dict[str, Any]],
     surprise_pct = latest_earnings.get("surprise_percent")
     reported = latest_earnings.get("reported_eps")
     estimated = latest_earnings.get("estimated_eps")
-    if surprise_pct is None and reported is not None and estimated not in (None, 0):
-        surprise_pct = (reported - estimated) / abs(estimated) * 100.0
+    if surprise_pct is None:
+        # Shared with DeterministicScorer's PEAD section -- one formula, one
+        # place. (Same value as the old inline expression, including the |est|
+        # denominator that keeps the sign right on a negative consensus.)
+        surprise_pct = _surprise_percent(reported, estimated)
     if surprise_pct is None:
         out["reason"] = "no surprise data"
         return out

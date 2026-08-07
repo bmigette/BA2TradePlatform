@@ -188,6 +188,27 @@ def reset_statement_warning() -> None:
     _NO_STATEMENTS_WARNED = False
 
 
+def fetch_past_earnings(providers, symbol: str, as_of: Optional[datetime],
+                        lookback_periods: int = 16) -> list:
+    """Reported-vs-estimated quarterly earnings rows, point-in-time.
+
+    An earnings ANNOUNCEMENT is public on its report date, so `end_date=as_of`
+    is the correct no-lookahead window here -- unlike a financial statement,
+    which additionally needs its FILING date checked. 16 quarters gives the SUE
+    standardization (4 years) enough dispersion history.
+    """
+    ref = as_of if as_of is not None else _utcnow()
+    det = providers.fundamentals_details()
+    try:
+        out = det.get_past_earnings(symbol=symbol, frequency="quarterly", end_date=ref,
+                                    lookback_periods=lookback_periods, format_type="dict")
+    except Exception as e:              # noqa: BLE001 - hermetic/defect errors re-raise
+        absorb_if_benign(e)
+        logger.warning("DeterministicScorer past-earnings fetch failed for %s: %s", symbol, e)
+        return []
+    return out.get("earnings", []) if isinstance(out, dict) else []
+
+
 def fetch_grades_history(api_key: str, symbol: str) -> list:
     """Dated FMP analyst-grade history, re-using FMPRating's cached fetcher
     (TTLCache + backtest disk cache; no-lookahead filtering is done by the
@@ -198,6 +219,19 @@ def fetch_grades_history(api_key: str, symbol: str) -> list:
     except Exception as e:              # noqa: BLE001 - hermetic/defect errors re-raise
         absorb_if_benign(e)
         logger.warning("DeterministicScorer grades fetch failed for %s: %s", symbol, e)
+        return []
+
+
+def fetch_price_targets(api_key: str, symbol: str) -> list:
+    """Dated individual analyst price targets, re-using FMPRating's cached
+    fetcher (TTLCache + backtest disk cache). Each row carries publishedDate, so
+    the no-lookahead filtering happens in the pure calculator at as_of."""
+    from ba2_experts.FMPRating import fetch_price_target_history_cached
+    try:
+        return fetch_price_target_history_cached(api_key, symbol) or []
+    except Exception as e:              # noqa: BLE001 - hermetic/defect errors re-raise
+        absorb_if_benign(e)
+        logger.warning("DeterministicScorer price-target fetch failed for %s: %s", symbol, e)
         return []
 
 
