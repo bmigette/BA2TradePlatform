@@ -16,6 +16,7 @@ from ba2_common.core.interfaces import MarketExpertInterface
 from ba2_common.core.backtest_context import BacktestContext, ProviderBundle
 from ba2_common.core.models import AnalysisOutput, MarketAnalysis
 from ba2_providers.StockScreener import StockScreener
+from ba2_providers.fmp_common import FMPHermeticViolation
 from ba2_common.core.types import MarketAnalysisStatus, OrderRecommendation, Recommendation
 from ba2_common.logger import get_expert_logger
 
@@ -298,14 +299,40 @@ class FactorRanker(MarketExpertInterface):
 
         ``screener_universe_mode`` / ``screener_provider`` remain unsupported by the store and
         are correctly filtered out by the normalizer.
+
+        Deriving the key set from ``METRIC_STORE_KEYS`` cuts BOTH ways, and the second edge drew
+        blood on 2026-08-05: ``dollar_volume_min`` was added to the store's key set (47c4b26) with
+        no matching ``screener_dollar_volume_min`` EXPERT setting, so this comprehension asked for
+        a setting that did not exist, ``get_setting_with_interface_default`` raised, and the whole
+        metric_store path fell over. The fallback then hit the live StockScreener, which a backtest
+        cannot reach -- so every FactorRanker run since screened an EMPTY universe and traded
+        nothing (opts 251/252/255 failed, 257 "completed" with 0 trades).
+
+        So: a store key with no expert setting is SKIPPED and named in a warning, never fatal. A
+        missing key costs one unexpressed filter; raising costs the entire universe. The warning
+        is what keeps it from becoming the silent no-op the docstring above warns about.
         """
         from ba2_providers.screener.metric_store import (
             METRIC_STORE_KEYS, normalize_screener_settings,
         )
-        g = self.get_setting_with_interface_default
-        return normalize_screener_settings(
-            {f"screener_{key}": g(f"screener_{key}") for key in METRIC_STORE_KEYS}
-        )
+        raw, unsupported = {}, []
+        for key in METRIC_STORE_KEYS:
+            setting = f"screener_{key}"
+            try:
+                raw[setting] = self.get_setting_with_interface_default(setting)
+            except ValueError:
+                # get_setting_with_interface_default raises ValueError for exactly one reason --
+                # the key is absent from the merged interface definitions. Probing via the real
+                # lookup (rather than inspecting the definitions dict) keeps this working for any
+                # settings-provider shape, including the test stubs.
+                unsupported.append(setting)
+        if unsupported:
+            self.logger.warning(
+                f"FactorRanker: the metric_store supports {sorted(unsupported)} but this expert "
+                f"defines no such setting(s) -- those filters are NOT applied. Add them to the "
+                f"screener settings block in MarketExpertInterface to enable them."
+            )
+        return normalize_screener_settings(raw)
 
     def _screen_universe(self, as_of: Optional[datetime] = None) -> List[str]:
         """Resolve the candidate universe.
@@ -362,6 +389,18 @@ class FactorRanker(MarketExpertInterface):
             syms = [r["symbol"].upper() for r in (result.get("results") or []) if r.get("symbol")]
             self.logger.info(f"FactorRanker: screener returned {len(syms)} candidates")
             return syms
+        except FMPHermeticViolation:
+            # NEVER degrade a hermetic breach to an empty universe. This handler is what made the
+            # 2026-08-05 metric_store regression invisible for two days: the store path raised, the
+            # fallback reached for the live screener, the guard fired correctly -- and then this
+            # `except Exception` swallowed it and returned [], so the job screened NOTHING, traded
+            # NOTHING, and still exited 0 (opt 257: one backtest, 0 trades, 0%).
+            #
+            # A breach can only happen inside a backtest, so re-raising cannot affect live: the
+            # graceful empty-universe degradation below still covers every real screener failure.
+            # strategy_optimization_handler already classifies FMPHermeticViolation as FATAL; it
+            # just never got to see one.
+            raise
         except Exception as e:
             self.logger.error(f"FactorRanker: screener universe resolution failed: {e}", exc_info=True)
             return []

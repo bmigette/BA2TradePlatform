@@ -175,3 +175,62 @@ def test_metric_store_settings_strips_screener_prefix():
     # `provider` is genuinely NOT a store key, and no prefixed key may leak through.
     assert "provider" not in out
     assert not any(k.startswith("screener_") for k in out)
+
+
+def test_metric_store_key_without_expert_setting_is_skipped_not_fatal(caplog):
+    """REGRESSION (2026-08-05 -> 2026-08-07). A metric_store key with no matching expert
+    setting must degrade to ONE unapplied filter, never to a dead universe.
+
+    ``dollar_volume_min`` was added to METRIC_STORE_KEYS (47c4b26) with no matching
+    ``screener_dollar_volume_min`` expert setting. ``_metric_store_settings`` derives its keys
+    FROM that set, so it asked for a setting that did not exist,
+    ``get_setting_with_interface_default`` raised ValueError, the whole metric_store path was
+    abandoned, and the StockScreener fallback then breached the hermetic contract -- leaving
+    FactorRanker screening an EMPTY universe. Four goal2020 optimizations produced nothing
+    (251/252/255 failed, 257 "completed" with 0 trades) before anyone noticed.
+
+    Here the expert knows every key EXCEPT one. The result must still carry the other filters,
+    and the missing one must be NAMED in a warning rather than swallowed.
+    """
+    import ba2_providers.screener.metric_store as ms
+
+    known = {f"screener_{k}": 0 for k in ms.METRIC_STORE_KEYS}
+    known["screener_market_cap_min"] = 1_000_000_000
+    missing_key = "screener_dollar_volume_min"
+    del known[missing_key]
+
+    def lookup(key):
+        if key not in known:
+            raise ValueError(f"Setting '{key}' not found in FactorRanker interface definitions.")
+        return known[key]
+
+    me = SimpleNamespace(get_setting_with_interface_default=lookup,
+                         settings=known, logger=logging.getLogger("t"))
+
+    with caplog.at_level(logging.WARNING):
+        out = FactorRanker._metric_store_settings(me)
+
+    # The supported filters survived -- this is what "not fatal" has to mean to be worth anything.
+    assert out["market_cap_min"] == 1_000_000_000
+    # The unsupported key is absent rather than guessed at.
+    assert "dollar_volume_min" not in out
+    # ...and it was named, so a future store key cannot go missing silently.
+    assert missing_key in caplog.text
+
+
+def test_every_metric_store_key_has_a_real_expert_setting():
+    """The condition that was actually violated: every METRIC_STORE_KEYS entry should have a
+    real ``screener_<key>`` setting, so no filter silently goes unapplied.
+
+    The test above proves a gap is survivable; this one proves there ISN'T one right now. Adding
+    a key to METRIC_STORE_KEYS without the matching expert setting fails here -- at the commit
+    that introduces it, rather than four dead optimizations later.
+    """
+    import ba2_providers.screener.metric_store as ms
+
+    defined = FactorRanker.get_merged_settings_definitions()
+    missing = sorted(f"screener_{k}" for k in ms.METRIC_STORE_KEYS
+                     if f"screener_{k}" not in defined)
+    assert missing == [], (
+        f"metric_store supports {missing} but no expert setting defines them, so those filters "
+        f"are silently unapplied. Add them to the screener block in MarketExpertInterface.")

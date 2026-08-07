@@ -401,6 +401,19 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                     "description": "Max avg volume (0 = disabled)",
                     "tooltip": "Maximum average daily volume. Set to 0 to disable this filter."
                 },
+                # Added 2026-08-07. ``dollar_volume_min`` entered the metric_store's
+                # METRIC_STORE_KEYS on 2026-08-05 (47c4b26, the dollar-volume floor that keeps
+                # illiquid no-prewarm symbols out of the grid) but no matching EXPERT setting was
+                # added, so FactorRanker._metric_store_settings -- which derives its key set FROM
+                # METRIC_STORE_KEYS -- asked for a setting that did not exist and raised. Default 0
+                # (disabled) keeps every existing expert byte-identical; only a caller that sets it
+                # gets the filter.
+                "screener_dollar_volume_min": {
+                    "type": "float", "required": False, "default": 0,
+                    "description": "Min avg dollar volume (0 = disabled)",
+                    "tooltip": "Minimum average daily DOLLAR volume (price * volume). Filters out "
+                               "illiquid names that a share-count volume floor still admits. Set to 0 to disable."
+                },
                 "screener_float_min": {
                     "type": "int", "required": False, "default": 10000000,
                     "description": "Min share float (0 = disabled)",
