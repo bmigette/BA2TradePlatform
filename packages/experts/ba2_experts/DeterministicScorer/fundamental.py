@@ -68,60 +68,67 @@ def piotroski_f_score(cur: Dict[str, Any], prior: Dict[str, Any]) -> Optional[in
     computed = 0
 
     # 1. ROA > 0
-    roa = _safe_div(_fnum(cur, "netIncome"), _fnum(cur, "totalAssets"))
+    roa = _safe_div(_fnum(cur, "netIncome", "net_income"), _fnum(cur, "totalAssets", "total_assets"))
     if roa is not None:
         computed += 1
         points += 1 if roa > 0 else 0
 
     # 2. CFO > 0
-    cfo = _fnum(cur, "operatingCashFlow", "netCashProvidedByOperatingActivities")
+    cfo = _fnum(cur, "operatingCashFlow", "operating_cash_flow",
+                "netCashProvidedByOperatingActivities")
     if cfo is not None:
         computed += 1
         points += 1 if cfo > 0 else 0
 
     # 3. ROA increasing YoY
-    roa_prior = _safe_div(_fnum(prior, "netIncome"), _fnum(prior, "totalAssets"))
+    roa_prior = _safe_div(_fnum(prior, "netIncome", "net_income"),
+                          _fnum(prior, "totalAssets", "total_assets"))
     if roa is not None and roa_prior is not None:
         computed += 1
         points += 1 if roa > roa_prior else 0
 
     # 4. Accruals: CFO/Assets > ROA
-    cfo_a = _safe_div(cfo, _fnum(cur, "totalAssets"))
+    cfo_a = _safe_div(cfo, _fnum(cur, "totalAssets", "total_assets"))
     if cfo_a is not None and roa is not None:
         computed += 1
         points += 1 if cfo_a > roa else 0
 
     # 5. Leverage: long-term debt/Assets decreased
-    lev = _safe_div(_fnum(cur, "longTermDebt"), _fnum(cur, "totalAssets"))
-    lev_prior = _safe_div(_fnum(prior, "longTermDebt"), _fnum(prior, "totalAssets"))
+    lev = _safe_div(_fnum(cur, "longTermDebt", "long_term_debt"),
+                    _fnum(cur, "totalAssets", "total_assets"))
+    lev_prior = _safe_div(_fnum(prior, "longTermDebt", "long_term_debt"),
+                          _fnum(prior, "totalAssets", "total_assets"))
     if lev is not None and lev_prior is not None:
         computed += 1
         points += 1 if lev <= lev_prior else 0
 
     # 6. Liquidity: current ratio increased
-    cr = _safe_div(_fnum(cur, "currentAssets", "netReceivables"), _fnum(cur, "currentLiabilities", "totalCurrentLiabilities"))
-    cr_prior = _safe_div(_fnum(prior, "currentAssets", "netReceivables"), _fnum(prior, "currentLiabilities", "totalCurrentLiabilities"))
+    cr = _safe_div(_fnum(cur, "totalCurrentAssets", "total_current_assets", "currentAssets", "netReceivables"),
+                   _fnum(cur, "totalCurrentLiabilities", "total_current_liabilities", "currentLiabilities"))
+    cr_prior = _safe_div(_fnum(prior, "totalCurrentAssets", "total_current_assets", "currentAssets", "netReceivables"),
+                         _fnum(prior, "totalCurrentLiabilities", "total_current_liabilities", "currentLiabilities"))
     if cr is not None and cr_prior is not None:
         computed += 1
         points += 1 if cr > cr_prior else 0
 
-    # 7. No dilution: share count flat or down
-    sh = _fnum(cur, "commonStock", "weightedAverageShsOut")
-    sh_prior = _fnum(prior, "commonStock", "weightedAverageShsOut")
+    # 7. No dilution: share count flat or down (weighted avg shares from the
+    # income statement; the provider's balance 'common_stock' is a dollar amount)
+    sh = _fnum(cur, "weightedAverageShsOut", "weighted_average_shares_outstanding")
+    sh_prior = _fnum(prior, "weightedAverageShsOut", "weighted_average_shares_outstanding")
     if sh is not None and sh_prior is not None and sh_prior > 0:
         computed += 1
         points += 1 if sh <= sh_prior * 1.001 else 0
 
     # 8. Gross margin increased
-    gm = _safe_div(_fnum(cur, "grossProfit"), _fnum(cur, "revenue"))
-    gm_prior = _safe_div(_fnum(prior, "grossProfit"), _fnum(prior, "revenue"))
+    gm = _safe_div(_fnum(cur, "grossProfit", "gross_profit"), _fnum(cur, "revenue", "total_revenue"))
+    gm_prior = _safe_div(_fnum(prior, "grossProfit", "gross_profit"), _fnum(prior, "revenue", "total_revenue"))
     if gm is not None and gm_prior is not None:
         computed += 1
         points += 1 if gm > gm_prior else 0
 
     # 9. Asset turnover increased
-    ato = _safe_div(_fnum(cur, "revenue"), _fnum(cur, "totalAssets"))
-    ato_prior = _safe_div(_fnum(prior, "revenue"), _fnum(prior, "totalAssets"))
+    ato = _safe_div(_fnum(cur, "revenue", "total_revenue"), _fnum(cur, "totalAssets", "total_assets"))
+    ato_prior = _safe_div(_fnum(prior, "revenue", "total_revenue"), _fnum(prior, "totalAssets", "total_assets"))
     if ato is not None and ato_prior is not None:
         computed += 1
         points += 1 if ato > ato_prior else 0
@@ -137,27 +144,28 @@ def altman_z(cur: Dict[str, Any], market_cap: Optional[float],
     non-manufacturers/emerging), auto (= original when market cap present).
     Financials should be skipped by the caller (opaque balance sheets).
     """
-    ta = _fnum(cur, "totalAssets")
+    ta = _fnum(cur, "totalAssets", "total_assets")
     if ta is None or ta <= 0:
         return None
-    x1 = _safe_div((_fnum(cur, "totalCurrentAssets", "currentAssets") or 0.0)
-                   - (_fnum(cur, "totalCurrentLiabilities", "currentLiabilities") or 0.0), ta)
-    x2 = _safe_div(_fnum(cur, "retainedEarnings", "totalRetainedEarnings"), ta)
-    x3 = _safe_div(_fnum(cur, "ebit", "operatingIncome"), ta)
-    x5 = _safe_div(_fnum(cur, "revenue"), ta)
+    x1 = _safe_div((_fnum(cur, "totalCurrentAssets", "total_current_assets", "currentAssets") or 0.0)
+                   - (_fnum(cur, "totalCurrentLiabilities", "total_current_liabilities", "currentLiabilities") or 0.0), ta)
+    x2 = _safe_div(_fnum(cur, "retainedEarnings", "retained_earnings", "totalRetainedEarnings"), ta)
+    x3 = _safe_div(_fnum(cur, "ebit", "operatingIncome", "operating_income"), ta)
+    x5 = _safe_div(_fnum(cur, "revenue", "total_revenue"), ta)
     if x1 is None or x2 is None or x3 is None or x5 is None:
         return None
 
     use_original = variant == "original" or (variant == "auto" and market_cap is not None)
     if use_original and market_cap is not None:
-        tl = _fnum(cur, "totalLiabilities", "totalDebt")
+        tl = _fnum(cur, "totalLiabilities", "total_liabilities", "totalDebt")
         x4 = _safe_div(market_cap, tl) if tl else None
         if x4 is None:
             return None
         return 1.2 * x1 + 1.4 * x2 + 3.3 * x3 + 0.6 * x4 + 1.0 * x5
     # Z'' adjusted (book equity for X4; +3.25 constant for emerging omitted by default)
-    be = _fnum(cur, "bookValue", "totalStockholdersEquity", "totalEquity")
-    x4b = _safe_div(be, _fnum(cur, "totalLiabilities", "totalDebt"))
+    be = _fnum(cur, "bookValue", "totalStockholdersEquity", "total_shareholder_equity",
+               "totalEquity")
+    x4b = _safe_div(be, _fnum(cur, "totalLiabilities", "total_liabilities", "totalDebt"))
     if x4b is None:
         return None
     return 6.56 * x1 + 3.26 * x2 + 6.72 * x3 + 1.05 * x4b

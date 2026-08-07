@@ -21,6 +21,7 @@ Research:   workspace/ba2/research-deterministic-scoring.md
 """
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
@@ -221,7 +222,6 @@ class DeterministicScorer(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExper
         """
         symbol = self._gather_symbol
         df = data.fetch_ohlcv(providers, symbol, as_of)
-        overview = data.fetch_fundamentals_overview(providers, symbol, as_of)
         statements = data.fetch_statements(providers, symbol, as_of)
 
         grades_rows: list = []
@@ -241,7 +241,6 @@ class DeterministicScorer(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExper
         return {
             "symbol": symbol,
             "ohlcv": df,
-            "overview": overview,
             "statements": statements,
             "grades_rows": grades_rows,
             "macro_inputs": macro_inputs,
@@ -358,15 +357,18 @@ class DeterministicScorer(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExper
     # ------------------------------------------------------- section builders
     def _build_fundamental(self, data_bundle: Dict[str, Any],
                            settings: Dict[str, Any]) -> Dict[str, Any]:
-        """Assemble the fundamental snapshot from overview + statements."""
-        overview = data_bundle.get("overview") or {}
+        """Assemble the fundamental snapshot from point-in-time statements ONLY.
+
+        The overview provider is a 'now' snapshot (documented lookahead
+        limitation), so the backtest-safe path derives every input from the
+        dated statements + the as_of price: market cap = price x weighted avg
+        shares, ROE from income/balance, value from an EV-based earnings yield.
+        """
         statements = data_bundle.get("statements") or {}
         income = statements.get("income") or []
         balance = statements.get("balance") or []
         cashflow = statements.get("cashflow") or []
-
-        metrics = overview.get("metrics", overview) if isinstance(overview, dict) else {}
-        market_cap = metrics.get("market_cap") or metrics.get("marketCap")
+        current_price = data_bundle.get("current_price")
 
         snapshot: Dict[str, Any] = {}
         cur_inc = income[0] if income else {}
@@ -375,46 +377,53 @@ class DeterministicScorer(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExper
         prior_bal = balance[1] if len(balance) > 1 else {}
         cur_cf = cashflow[0] if cashflow else {}
 
+        # Market cap from the as_of price x latest weighted avg shares (keeps
+        # the backtest free of the overview provider's 'now' snapshot).
+        market_cap = None
+        shares = cur_inc.get("weighted_average_shares_outstanding") \
+            or cur_inc.get("weightedAverageShsOut")
+        if shares and current_price:
+            try:
+                market_cap = float(shares) * float(current_price)
+            except (TypeError, ValueError):
+                market_cap = None
+
         if income and balance:
             cur = {**cur_bal, **cur_inc, **cur_cf}
             prior = {**prior_bal, **prior_inc}
             snapshot["fscore"] = piotroski_f_score(cur, prior)
-            try:
-                mc = float(market_cap) if market_cap is not None else None
-            except (TypeError, ValueError):
-                mc = None
-            snapshot["z"] = altman_z(cur, mc, str(settings.get("altman_variant", "auto")))
+            snapshot["z"] = altman_z(cur, market_cap,
+                                     str(settings.get("altman_variant", "auto")))
 
-        # Quality: ROE from the overview when present
-        roe = metrics.get("roe") or metrics.get("returnOnEquity")
-        if roe is not None:
+        # Quality: ROE = net income / shareholder equity (tanh around 15%).
+        ni = cur_inc.get("net_income") or cur_inc.get("netIncome")
+        eq = cur_bal.get("total_shareholder_equity") or cur_bal.get("totalStockholdersEquity")
+        if ni is not None and eq:
             try:
-                snapshot["quality_norm"] = max(-1.0, min(1.0, float(roe) / 0.30))
-            except (TypeError, ValueError):
+                roe = float(ni) / float(eq)
+                snapshot["quality_norm"] = max(-1.0, min(1.0, math.tanh((roe - 0.10) / 0.10)))
+            except (TypeError, ValueError, ZeroDivisionError):
                 pass
 
-        # Value: EV/EBIT + FCF yield proxies from the overview
-        ev_ebit = metrics.get("enterprise_value_over_ebitda") or metrics.get("ev_ebit")
-        if ev_ebit is not None:
+        # Value: operating earnings yield on enterprise value, tanh around a
+        # 10% neutral yield (cheap = high yield = positive).
+        opinc = cur_inc.get("operating_income") or cur_inc.get("operatingIncome")
+        cash = cur_bal.get("cash_and_cash_equivalents") or cur_bal.get("cashAndCashEquivalents") or 0.0
+        tl = cur_bal.get("total_liabilities") or cur_bal.get("totalLiabilities") or 0.0
+        if opinc is not None and market_cap:
             try:
-                v = float(ev_ebit)
-                # cheaper (lower multiple) = better; ~10x = neutral
-                snapshot.setdefault("value_norm", 0.0)
-                snapshot["value_norm"] = max(-1.0, min(1.0, (10.0 - v) / 10.0))
-            except (TypeError, ValueError):
-                pass
-        fcf_yield = metrics.get("free_cash_flow_yield") or metrics.get("fcf_yield")
-        if fcf_yield is not None:
-            try:
-                fy = float(fcf_yield)
-                comp = max(-1.0, min(1.0, fy / 0.06))  # 6% yield = saturated
-                snapshot["value_norm"] = (snapshot.get("value_norm", 0.0) + comp) / 2.0 \
-                    if "value_norm" in snapshot else comp
+                ev = market_cap + float(tl or 0.0) - float(cash or 0.0)
+                if ev > 0:
+                    ey = float(opinc) / ev
+                    snapshot["value_norm"] = max(-1.0, min(1.0, math.tanh((ey - 0.10) / 0.10)))
             except (TypeError, ValueError):
                 pass
 
         # Growth: revenue acceleration across annual income statements
-        revs = [s.get("revenue") for s in reversed(income) if s.get("revenue") is not None]
+        # (provider returns latest-first).
+        revs = [s.get("total_revenue") if s.get("total_revenue") is not None else s.get("revenue")
+                for s in reversed(income)]
+        revs = [r for r in revs if r is not None]
         if len(revs) >= 3:
             try:
                 vals = [float(r) for r in revs]
@@ -426,6 +435,7 @@ class DeterministicScorer(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExper
 
         result = fundamental_score(snapshot, settings)
         result["snapshot"] = snapshot
+        result["market_cap"] = market_cap
         return result
 
     def _build_regime(self, data_bundle: Dict[str, Any],

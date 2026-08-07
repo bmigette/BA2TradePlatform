@@ -200,6 +200,11 @@ _SUPPORTED_EXPERTS = {
     "FinnHubRating": "ba2_experts.FinnHubRating",
     "FMPSenateTraderWeight": "ba2_experts.FMPSenateTraderWeight",
     "FMPSenateTraderCopy": "ba2_experts.FMPSenateTraderCopy",
+    # Deterministic multi-section scorer (technical/fundamental/analyst/macro), pure
+    # local math, no LLM. Backtestable: analyze_as_of + point-in-time statements
+    # (provider filing-date filter) + causal OHLCV slicing. Macro degrades to the
+    # index-trend input when FRED is not wired into the backtest bundle.
+    "DeterministicScorer": "ba2_experts.DeterministicScorer",
 }
 
 
@@ -215,6 +220,7 @@ _EXPERT_WARMUP_BARS = {
     "FinnHubRating": 10,          # recommendation-trend rating; no long OHLCV lookback
     "FMPSenateTraderWeight": 10,  # recent congressional trades; ATR floor governs warmup
     "FMPSenateTraderCopy": 10,
+    "DeterministicScorer": 260,   # 12-1 momentum (252) + SMA200 trend inputs
 }
 _WARMUP_FLOOR_DAYS = 60           # never warm up less than this (ATR + safety)
 _BARS_TO_CALDAYS = 1.45           # trading bars -> calendar days (≈252 bars/year -> ~365 days)

@@ -88,19 +88,27 @@ def fetch_fundamentals_overview(providers, symbol: str,
 
 def fetch_statements(providers, symbol: str, as_of: Optional[datetime],
                      lookback_periods: int = 6) -> Dict[str, Any]:
-    """Annual income/balance/cashflow statements, latest-first, point-in-time
-    via the provider's end_date semantics. Returns {'balance': [...],
-    'income': [...], 'cashflow': [...]} (each a list of statement dicts)."""
+    """Annual income/balance/cashflow statements, latest-first, point-in-time.
+
+    Passes the as_of down so the provider's filing-date (fillingDate) pre-pass
+    drops statements not yet FILED at that date (no lookahead). Live (as_of
+    None) skips the pre-pass and uses the latest available. Returns
+    {'balance': [...], 'income': [...], 'cashflow': [...]} (provider dict
+    format, snake_case fields).
+    """
     try:
         ref = as_of if as_of is not None else datetime.utcnow()
         det = providers.fundamentals_details()
         out: Dict[str, Any] = {}
         for key, fn in (("balance", det.get_balance_sheet),
                         ("income", det.get_income_statement),
-                        ("cashflow", det.get_cash_flow_statement)):
+                        ("cashflow", det.get_cashflow_statement)):
             try:
-                stmts = fn(symbol=symbol, frequency="annual", end_date=ref,
-                           lookback_periods=lookback_periods, format_type="dict")
+                kwargs = dict(symbol=symbol, frequency="annual", end_date=ref,
+                              lookback_periods=lookback_periods, format_type="dict")
+                if as_of is not None:
+                    kwargs["as_of"] = as_of  # activates the filing-date filter
+                stmts = fn(**kwargs)
                 rows = stmts.get("statements", []) if isinstance(stmts, dict) else []
                 out[key] = rows
             except Exception as e:
