@@ -22,6 +22,12 @@ _DOWN = ("strongSell", "sell")
 _HOLD = ("hold",)
 
 
+def _as_utc(d: datetime) -> datetime:
+    """Force a datetime to tz-aware UTC so naive/aware operands never mix."""
+    from datetime import timezone
+    return d.replace(tzinfo=timezone.utc) if d.tzinfo is None else d.astimezone(timezone.utc)
+
+
 def _bucket_counts(row: Dict[str, Any]) -> tuple:
     """(upgrades, holds, downgrades) from one grades-historical row."""
     def n(keys):
@@ -40,6 +46,11 @@ def revision_momentum(grades_rows: List[Dict[str, Any]], as_of: datetime,
     """
     if not grades_rows:
         return None
+    # FMP rows carry tz-aware dates while a backtest as_of is often naive (and
+    # vice versa); comparing the two raises TypeError mid-bar. Normalise ONCE,
+    # both directions, before any date math -- the tz-mismatch class of bug has
+    # already silently killed an indicator in this codebase once.
+    as_of = _as_utc(as_of)
     cutoff = as_of - timedelta(days=window_days)
     decay = math.log(2.0) / max(1.0, float(halflife_days))
 
@@ -54,9 +65,7 @@ def revision_momentum(grades_rows: List[Dict[str, Any]], as_of: datetime,
                 continue
         if d is None or not isinstance(d, datetime):
             continue
-        if d.tzinfo is None and as_of.tzinfo is not None:
-            from datetime import timezone
-            d = d.replace(tzinfo=timezone.utc)
+        d = _as_utc(d)
         if d > as_of or d < cutoff:
             continue
         up, hold, down = _bucket_counts(row)

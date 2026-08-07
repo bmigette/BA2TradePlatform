@@ -52,7 +52,11 @@ def momentum_12_1(closes: pd.Series, lookback: int = DEF_MOM_LOOKBACK,
     Skips the most recent month because short-horizon returns mean-revert
     (microstructure), which degrades momentum (Jegadeesh-Titman).
     """
-    if closes is None or len(closes) < lookback:
+    # skip >= lookback is a nonsensical combination the UI can still produce; it
+    # used to walk off the front of the series with an IndexError mid-bar.
+    if closes is None or lookback <= 0 or skip < 0 or skip >= lookback:
+        return None
+    if len(closes) < lookback:
         return None
     p_recent = float(closes.iloc[-1 - skip]) if skip > 0 else float(closes.iloc[-1])
     p_base = float(closes.iloc[-lookback])

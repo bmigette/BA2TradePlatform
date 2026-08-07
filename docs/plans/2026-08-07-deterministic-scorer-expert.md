@@ -1,7 +1,27 @@
 # Plan: `DeterministicScorer` — LLM-free multi-section scoring expert
 
 **Date:** 2026-08-07 · **Author:** bababot (research memo: `workspace/ba2/research-deterministic-scoring.md`)
-**Status:** DRAFT v1 — approved scope by Nekkro (2026-08-07 #trade-dev)
+**Status:** v1 IMPLEMENTED + post-review corrections applied (2026-08-07)
+
+## Post-review amendments (2026-08-07)
+
+A review of the shipped v1 found 13 defects; all are fixed, each locked by a test in
+`packages/experts/tests/test_deterministic_scorer_regressions.py`. Where a fix required a
+design call rather than a mechanical correction, the decision is recorded here because it
+DEVIATES from the plan text below:
+
+| # | Decision | Why it deviates |
+|---|---|---|
+| §2 veto | `veto_cap` default **0.0**, not −0.5 | −0.5 sits below `−theta_sell`, so a veto did not block an entry — it opened a SHORT, including on a data-integrity flag. 0.0 blocks; go negative to opt back in. |
+| §2 macro | Hard risk-off now needs **≥2 macro inputs** | With only the index trend available (the hermetic-backtest case) the composite is exactly ±1, so `hard_riskoff` fired on one uncorroborated binary reading and pinned the whole book to HOLD below SMA200. |
+| §3 Altman | Separate `z_veto_adjusted` (**1.1**) for Z″ | One threshold across two scales: 1.8 is the *original* Z cutoff; Z″ breaks at 1.1, so non-manufacturers were mass-vetoed. |
+| §3 data policy | `fundamentals_max_age_days` default **450**, not 180 | Statements are fetched ANNUALLY; 180d blanks the section 8 months out of 12. |
+| §3 macro | `yc_scale` default **0.5**, not 0.005 | FRED serves 10y-3m in percent, so the decimal scale saturated tanh on every observation. |
+| §3 decision | `min_score_delta` **removed** from settings | It only acts when the caller threads `prev_signal`, which the stateless per-bar `_process` does not — a declared GA gene that cannot move anything is worse than a missing feature. `exit_hysteresis` is supported in `schmitt_trigger` on the same terms and likewise unexposed. |
+| §3 combine | `skip_on_missing_section` **implemented** (default `skip`) | Was specified but never built; a missing section scored 0.0 with full weight, silently cutting every score ~37%. |
+
+Still open (unchanged from §8): breadth needs screener integration; ALFRED vintage macro;
+prev-state plumbing before hysteresis can be re-exposed as a tunable.
 
 ## Goal
 

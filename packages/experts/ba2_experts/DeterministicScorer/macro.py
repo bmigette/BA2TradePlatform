@@ -26,9 +26,16 @@ DEF_MW = {
 }
 DEF_VIX_CALM = 15.0
 DEF_VIX_STRESS = 30.0
-DEF_YC_SCALE = 0.005      # 50bp spread saturates the tanh
+# FRED serves T10Y3M in PERCENT (1.5 == 1.5% == 150bp), so the characteristic
+# scale is 0.5 (=50bp), NOT 0.005 -- the decimal value saturated tanh on every
+# observation and silently turned a graded input into a binary one.
+DEF_YC_SCALE = 0.5        # 50bp spread saturates the tanh (percent units)
 DEF_M_FLOOR = 0.25        # minimum exposure multiplier
 DEF_HARD_RISKOFF = -0.75  # regime below this -> exposure forced to 0
+# A single input can hit exactly -1.0 on its own (the index trend is +-1 by
+# construction). Zeroing the whole book on one uncorroborated binary reading is
+# not a regime call, so the hard cutoff needs at least this many inputs.
+DEF_MIN_INPUTS_FOR_RISKOFF = 2
 
 
 def trend_score(index_closes: pd.Series, sma_period: int = 200) -> Optional[float]:
@@ -121,10 +128,20 @@ def regime_composite(inputs: Dict[str, Optional[float]],
 
 
 def exposure_multiplier(regime: float, m_floor: float = DEF_M_FLOOR,
-                        hard_riskoff: float = DEF_HARD_RISKOFF) -> float:
+                        hard_riskoff: float = DEF_HARD_RISKOFF,
+                        n_inputs: Optional[int] = None,
+                        min_inputs_for_riskoff: int = DEF_MIN_INPUTS_FOR_RISKOFF) -> float:
     """Regime -> exposure multiplier in [0, 1]. Floor applies except in hard
-    risk-off, where exposure goes to zero."""
-    if regime < hard_riskoff:
+    risk-off, where exposure goes to zero.
+
+    `n_inputs` = how many macro inputs backed `regime`. The hard cutoff needs
+    corroboration (>= `min_inputs_for_riskoff`): with only the index trend
+    available it fires on a bare +-1 reading and flattens every position, which
+    is a data-availability artefact rather than a regime call. n_inputs=None
+    means "unknown" and keeps the cutoff armed so direct callers stay safe.
+    """
+    corroborated = n_inputs is None or n_inputs >= min_inputs_for_riskoff
+    if regime < hard_riskoff and corroborated:
         return 0.0
     m = m_floor + (1.0 - m_floor) * (regime + 1.0) / 2.0
     return float(np.clip(m, 0.0, 1.0))
