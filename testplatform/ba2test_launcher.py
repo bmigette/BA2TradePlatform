@@ -338,6 +338,14 @@ def _cmd_prewarm(args) -> int:
             fn(symbol=sym, frequency="annual", end_date=end_date,
                lookback_periods=6, as_of=end_date, format_type="dict")
         fetch_grades_historical_cached(key, sym)
+        # EARNINGS/PEAD + the ANALYST price-target leg read these two namespaces.
+        # They MUST be warmed here or a hermetic trial with w_earnings>0 /
+        # w_analyst>0 aborts on a cache miss -- loudly now that the fetchers no
+        # longer swallow it, but still an aborted trial.
+        _details_provider.get_past_earnings(symbol=sym, frequency="quarterly",
+                                            end_date=end_date, lookback_periods=16,
+                                            format_type="dict")
+        fetch_price_target_history_cached(key, sym)
 
     # FactorRanker (bypass/rebalance expert): warm ALL of its factor inputs by calling the SAME
     # data-layer fetchers the rebalance path uses (so coverage auto-tracks the real fetch surface
@@ -1148,6 +1156,11 @@ _EXPERT_OPT = {
             "w_technical": {"optimize": True, "min": 0.2, "max": 0.8, "step": 0.1, "type": "float"},
             "w_fundamental": {"optimize": True, "min": 0.1, "max": 0.7, "step": 0.1, "type": "float"},
             "w_analyst": {"optimize": True, "min": 0.0, "max": 0.4, "step": 0.1, "type": "float"},
+            # Same bias question as w_analyst, for the PEAD section: FMPEarningsDrift
+            # already trades this signal standalone, so the grid — not the default —
+            # decides whether it ALSO pays for its weight inside the composite. Both
+            # ranges start at 0.0 so "this section adds nothing" stays reachable.
+            "w_earnings": {"optimize": True, "min": 0.0, "max": 0.4, "step": 0.1, "type": "float"},
             "macro_mode": {"optimize": True, "type": "choice", "choices": ["multiply", "gate", "off"]},
             "theta_buy": {"optimize": True, "min": 0.3, "max": 0.7, "step": 0.1, "type": "float"},
             "theta_sell": {"optimize": True, "min": 0.1, "max": 0.4, "step": 0.1, "type": "float"},
