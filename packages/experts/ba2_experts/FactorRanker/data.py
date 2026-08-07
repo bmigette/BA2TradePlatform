@@ -230,16 +230,26 @@ def fetch_value_inputs(symbols, as_of: Optional[datetime] = None,
     out: Dict[str, dict] = {}
     for sym in symbols:
         try:
+            # as_of MUST be passed by KEYWORD. The 3rd positional parameter is
+            # `end_date`, not `as_of`, so `(sym, "annual", as_of, ...)` alone left
+            # as_of=None -- which SKIPS the provider's filing-date pre-pass. With
+            # lookback_periods set, end_date is ignored too, so the call returned
+            # the LATEST annual statement at every historical bar: a 2023 backtest
+            # was reading FY2025 financials (verified: fiscal_date_ending
+            # 2025-09-27 at as_of 2023-06-15). Live was unaffected (as_of == now).
             income = _require_statement(
-                details.get_income_statement(sym, "annual", as_of, lookback_periods=1, format_type="dict"),
+                details.get_income_statement(sym, "annual", as_of, lookback_periods=1,
+                                        as_of=as_of, format_type="dict"),
                 "statements", "income statement",
             )
             balance = _require_statement(
-                details.get_balance_sheet(sym, "annual", as_of, lookback_periods=1, format_type="dict"),
+                details.get_balance_sheet(sym, "annual", as_of, lookback_periods=1,
+                                        as_of=as_of, format_type="dict"),
                 "statements", "balance sheet",
             )
             cashflow = _require_statement(
-                details.get_cashflow_statement(sym, "annual", as_of, lookback_periods=1, format_type="dict"),
+                details.get_cashflow_statement(sym, "annual", as_of, lookback_periods=1,
+                                        as_of=as_of, format_type="dict"),
                 "statements", "cash flow statement",
             )
             # AS_OF price = the OHLCV close at as_of (no lookahead). Anchored at
@@ -306,16 +316,26 @@ def fetch_quality_inputs(symbols, as_of: Optional[datetime] = None) -> Dict[str,
     out: Dict[str, dict] = {}
     for sym in symbols:
         try:
+            # as_of MUST be passed by KEYWORD. The 3rd positional parameter is
+            # `end_date`, not `as_of`, so `(sym, "annual", as_of, ...)` alone left
+            # as_of=None -- which SKIPS the provider's filing-date pre-pass. With
+            # lookback_periods set, end_date is ignored too, so the call returned
+            # the LATEST annual statement at every historical bar: a 2023 backtest
+            # was reading FY2025 financials (verified: fiscal_date_ending
+            # 2025-09-27 at as_of 2023-06-15). Live was unaffected (as_of == now).
             income = _require_statement(
-                details.get_income_statement(sym, "annual", as_of, lookback_periods=1, format_type="dict"),
+                details.get_income_statement(sym, "annual", as_of, lookback_periods=1,
+                                        as_of=as_of, format_type="dict"),
                 "statements", "income statement",
             )
             balance = _require_statement(
-                details.get_balance_sheet(sym, "annual", as_of, lookback_periods=1, format_type="dict"),
+                details.get_balance_sheet(sym, "annual", as_of, lookback_periods=1,
+                                        as_of=as_of, format_type="dict"),
                 "statements", "balance sheet",
             )
             cashflow = _require_statement(
-                details.get_cashflow_statement(sym, "annual", as_of, lookback_periods=1, format_type="dict"),
+                details.get_cashflow_statement(sym, "annual", as_of, lookback_periods=1,
+                                        as_of=as_of, format_type="dict"),
                 "statements", "cash flow statement",
             )
             inputs = build_quality_inputs(

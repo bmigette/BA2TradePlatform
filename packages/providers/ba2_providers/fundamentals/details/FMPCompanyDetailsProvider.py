@@ -18,6 +18,23 @@ from ba2_common.config import get_app_setting
 from ba2_common.logger import logger
 from ba2_providers.fmp_common import fmp_list_call, fmp_http_get, fmp_history_disk_cached, FMPError
 
+# Depth of the CACHED statement history, deliberately independent of any caller's
+# ``lookback_periods``.
+#
+# The disk cache is keyed by (namespace, symbol) only -- NOT by depth -- while the
+# payload used to be fetched with ``limit=lookback_periods``. So the FIRST caller
+# decided the depth for everyone: FactorRanker asks for 1 period, which pinned
+# every statement cache file to a SINGLE row, and every later caller asking for 6
+# silently inherited that one row. Point-in-time filtering then dropped it (its
+# filing date is newer than any historical as_of), so the whole fundamental
+# section came back empty and its settings became inert GA genes.
+#
+# Fetching a fixed depth makes the cache entry genuinely "full per-symbol history"
+# as the comments below claim; ``_filter_statements_by_date`` still trims to each
+# caller's lookback_periods afterwards, so no caller's RESULT changes -- only the
+# cache stops being poisoned by whoever got there first.
+STATEMENT_HISTORY_DEPTH = 20
+
 # Earnings-history fetch limit (fmpsdk.historical_earning_calendar defaults to only 10 periods).
 # Large enough to cover full per-symbol history (e.g. AAPL = 164 rows back to 1985) so the as-of /
 # lookback_periods filtering in get_past_earnings works for arbitrarily old backtest windows.
@@ -119,7 +136,7 @@ class FMPCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
                         apikey=self.api_key,
                         symbol=symbol,
                         period=period,
-                        limit=lookback_periods or 10  # Default to 10 periods
+                        limit=STATEMENT_HISTORY_DEPTH,  # cache depth: caller-independent
                     ),
                     symbol=symbol,
                     endpoint="balance_sheet_statement",
@@ -226,7 +243,7 @@ class FMPCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
                         apikey=self.api_key,
                         symbol=symbol,
                         period=period,
-                        limit=lookback_periods or 10
+                        limit=STATEMENT_HISTORY_DEPTH,  # cache depth: caller-independent
                     ),
                     symbol=symbol,
                     endpoint="income_statement",
@@ -325,7 +342,7 @@ class FMPCompanyDetailsProvider(CompanyFundamentalsDetailsInterface):
                         apikey=self.api_key,
                         symbol=symbol,
                         period=period,
-                        limit=lookback_periods or 10
+                        limit=STATEMENT_HISTORY_DEPTH,  # cache depth: caller-independent
                     ),
                     symbol=symbol,
                     endpoint="cash_flow_statement",

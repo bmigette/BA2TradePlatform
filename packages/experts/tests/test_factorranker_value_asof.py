@@ -70,12 +70,21 @@ class FakeOverview:
 
 
 class FakeDetails:
-    """Dated statements: income carries shares outstanding; balance carries debt/cash."""
+    """Dated statements: income carries shares outstanding; balance carries debt/cash.
+
+    Signatures mirror the REAL provider, `as_of` included. They used to omit it,
+    so the buggy positional call (which left as_of=None and leaked the latest
+    statement into historical bars) sailed through this fixture unnoticed; the
+    forwarded value is recorded so the lookahead guard has something to assert on.
+    """
 
     def __init__(self, shares=SHARES_OUT):
         self._shares = shares
+        self.as_of_seen = []
 
-    def get_income_statement(self, symbol, frequency, end_date, lookback_periods=None, format_type="dict"):
+    def get_income_statement(self, symbol, frequency, end_date, lookback_periods=None,
+                 as_of=None, format_type="dict"):
+        self.as_of_seen.append(as_of)
         return {
             "statements": [{
                 "eps": 5.0,
@@ -83,7 +92,9 @@ class FakeDetails:
             }]
         }
 
-    def get_balance_sheet(self, symbol, frequency, end_date, lookback_periods=None, format_type="dict"):
+    def get_balance_sheet(self, symbol, frequency, end_date, lookback_periods=None,
+                 as_of=None, format_type="dict"):
+        self.as_of_seen.append(as_of)
         return {
             "statements": [{
                 "short_term_debt": 0.0,
@@ -92,7 +103,9 @@ class FakeDetails:
             }]
         }
 
-    def get_cashflow_statement(self, symbol, frequency, end_date, lookback_periods=None, format_type="dict"):
+    def get_cashflow_statement(self, symbol, frequency, end_date, lookback_periods=None,
+                 as_of=None, format_type="dict"):
+        self.as_of_seen.append(as_of)
         return {"statements": [{"free_cash_flow": 50_000_000.0}]}
 
 
