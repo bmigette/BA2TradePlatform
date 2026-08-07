@@ -38,6 +38,7 @@ def _build_experts_list():
     from ba2_experts import (
         FinnHubRating, FMPRating, FMPSenateTraderWeight, FMPSenateTraderCopy,
         FMPInsiderClusterBuy, FMPEarningsDrift, PennyMomentumTrader, FactorRanker,
+        DeterministicScorer,
     )
     return [
         TradingAgents,
@@ -49,6 +50,7 @@ def _build_experts_list():
         FMPEarningsDrift,
         PennyMomentumTrader,
         FactorRanker,
+        DeterministicScorer,
     ]
 
 

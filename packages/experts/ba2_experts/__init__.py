@@ -15,10 +15,11 @@ from .FMPEarningsDrift import FMPEarningsDrift
 from .PennyMomentumTrader import PennyMomentumTrader
 from .FactorRanker import FactorRanker
 from .PremiumSeller import PremiumSeller
+from .DeterministicScorer import DeterministicScorer
 
 experts = [FinnHubRating, FMPRating, FMPSenateTraderWeight, FMPSenateTraderCopy,
            FMPInsiderClusterBuy, FMPEarningsDrift, PennyMomentumTrader, FactorRanker,
-           PremiumSeller]
+           PremiumSeller, DeterministicScorer]
 
 
 def get_expert_class(expert_type):
