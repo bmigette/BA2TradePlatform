@@ -167,17 +167,47 @@ class AccountInterface(ReadOnlyAccountInterface):
         # Handle transaction requirements based on order type
         self._handle_transaction_requirements(trading_order)
         
-        # Sync quantity with parent order ONLY for TP/SL orders whose parent is also a limit/stop order
-        # TP/SL orders should match their entry order's quantity to close the full position
-        # BUT: TP/SL orders triggered by close orders (MARKET) should keep their own quantity
-        # Example: Partial close of 4 shares → new TP/SL for remaining 1 share (don't sync with close qty)
-        if (trading_order.depends_on_order is not None and 
+        # Sync quantity with the parent order for dependent TP/SL legs.
+        #
+        # A protective leg must cover the position its parent creates, so it inherits the parent's
+        # quantity. The one case where it must NOT is a PARTIAL CLOSE: closing 4 of 5 shares creates
+        # a MARKET sell, and the new TP/SL for the remaining 1 share must keep its own quantity
+        # rather than be resized to 4.
+        #
+        # THIS IS A REGRESSION, not an original defect. Until 1077e2c (2025-12-25, a commit titled
+        # "Refactor UI: LazyTable component, async rendering fixes, modern dark theme") the sync was
+        # unconditional -- `if parent_order and parent_order.quantity:` -- and entry-attached TPs
+        # worked. That commit added `and parent_order.order_type != OrderType.MARKET` to stop a
+        # partial close from resizing the leg for the REMAINING shares. The intent was right; the
+        # test was not, because an ENTRY is a MARKET order too, so it silently took out every
+        # entry-attached TP as collateral. Neither version was correct on its own:
+        #
+        #   pre-1077e2c : entry TP synced (correct)   | partial close wrongly resized (bug)
+        #   1077e2c..   : entry TP left at 0 (bug)    | partial close keeps own qty (correct)
+        #   this        : both correct, discriminated by SIDE
+        #
+        # Measured on prod 2026-08-08: every FMPEarningsDrift
+        # take-profit (WKC/GNTX/CSTL) was created as a SELL_LIMIT with a real price but quantity 0,
+        # hit this branch because its parent was the MARKET entry, kept the 0, and was cancelled by
+        # the broker. Three live positions ran with a stop and NO upside exit, silently -- no error,
+        # just a cancelled order. Dev has 12 more of the same rows; it only looked healthy there
+        # because its other positions use OCO, which carries both legs in one correctly-sized order.
+        #
+        # The real discriminator is SIDE, not order type:
+        #   * entry BUY  -> protective SELL leg : OPPOSITE sides -> the parent is the entry, SYNC.
+        #   * close SELL -> new protective SELL : SAME side      -> partial close, KEEP own qty.
+        # That is exactly the case the original comment describes, expressed in terms of what
+        # actually distinguishes the two.
+        if (trading_order.depends_on_order is not None and
             trading_order.order_type in [OrderType.SELL_LIMIT, OrderType.BUY_LIMIT, OrderType.SELL_STOP, OrderType.BUY_STOP]):
             try:
                 parent_order = get_instance(TradingOrder, trading_order.depends_on_order)
-                # Only sync if parent is NOT a market order (market orders are typically close orders)
-                if (parent_order and parent_order.quantity and 
-                    parent_order.order_type != OrderType.MARKET):
+                is_partial_close_parent = (
+                    parent_order is not None
+                    and parent_order.order_type == OrderType.MARKET
+                    and parent_order.side == trading_order.side
+                )
+                if parent_order and parent_order.quantity and not is_partial_close_parent:
                     if trading_order.quantity != parent_order.quantity:
                         old_qty = trading_order.quantity
                         trading_order.quantity = parent_order.quantity
@@ -186,10 +216,10 @@ class AccountInterface(ReadOnlyAccountInterface):
                             f"order {trading_order.id or 'new'} qty {old_qty} → {parent_order.quantity} "
                             f"(parent order {parent_order.id}, type {parent_order.order_type})"
                         )
-                elif parent_order and parent_order.order_type == OrderType.MARKET:
+                elif is_partial_close_parent:
                     logger.debug(
-                        f"TP/SL order {trading_order.id or 'new'} parent is MARKET order "
-                        f"(likely close order) - keeping independent quantity {trading_order.quantity}"
+                        f"TP/SL order {trading_order.id or 'new'} parent {parent_order.id} is a same-side "
+                        f"MARKET close - keeping independent quantity {trading_order.quantity}"
                     )
                 else:
                     logger.warning(
@@ -198,7 +228,18 @@ class AccountInterface(ReadOnlyAccountInterface):
                     )
             except Exception as e:
                 logger.error(f"Error syncing TP/SL quantity with parent order: {e}", exc_info=True)
-        
+
+            # A protective leg with no quantity protects nothing. Submitting it anyway is what made
+            # the prod TP loss invisible: the broker cancels it and the position looks "covered" in
+            # the order list. Refuse loudly instead of sending a doomed order.
+            if not trading_order.quantity or float(trading_order.quantity) <= 0:
+                raise ValueError(
+                    f"Refusing to submit protective {trading_order.order_type} leg for "
+                    f"{trading_order.symbol} with quantity {trading_order.quantity!r}: a zero-quantity "
+                    f"TP/SL is cancelled by the broker and leaves the position unprotected. "
+                    f"(parent order {trading_order.depends_on_order})"
+                )
+
         # Set account_id BEFORE saving to DB
         trading_order.account_id = self.id
         
