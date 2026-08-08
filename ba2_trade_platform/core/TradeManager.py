@@ -1478,6 +1478,47 @@ class TradeManager:
                                     self.logger.warning(f"No main order created for funded {candidate.symbol}")
                                     continue
                                 order.quantity = fo.quantity  # RM-sized quantity from the candidate pass
+
+                                # ...and stamp the SAME quantity onto the protective legs execute()
+                                # just created. They were built by the account from the entry's
+                                # quantity while it was still the TRANSIENT 0 that
+                                # build_entry_candidate() sets, because the bracket is created inside
+                                # execute() and the RM size is stamped only here, one line above.
+                                #
+                                # A leg is therefore born correct only when the stamp happens to land
+                                # first, which is a race, not a rule. Measured 2026-08-08: 23 of 96
+                                # entry-staged legs across dev+prod carried quantity 0 (every one of
+                                # them `trigger=FILLED`, i.e. staged against an unfilled entry), and
+                                # the three live ones — WKC / GNTX / CSTL — were refused by the
+                                # quantity<=0 guard and cancelled, leaving those positions with a
+                                # stop and NO take-profit.
+                                #
+                                # Doing it here closes the race at the source: same session, same
+                                # value, same moment. Scoped to legs of THIS entry, created seconds
+                                # ago by THIS execute(), so they are all full-position legs — the
+                                # partial-close case (a leg sized for the REMAINING shares behind a
+                                # close order) hangs off a different parent and cannot be reached.
+                                #
+                                # NOT shared with the backtest deliberately: BacktestAccount builds
+                                # its legs lazily at fill time from the FILLED entry quantity
+                                # (`held = abs(net)`), so it cannot inherit a transient 0 and has no
+                                # equivalent defect. Live must stage the leg before the fill because
+                                # the broker needs it resting; that constraint is live-only.
+                                try:
+                                    from sqlmodel import select as _leg_select
+                                    legs = session.exec(_leg_select(TradingOrder).where(
+                                        TradingOrder.depends_on_order == order.id)).all()
+                                    for leg in legs:
+                                        if leg.quantity != order.quantity:
+                                            self.logger.info(
+                                                f"Stamped protective leg {leg.id} ({leg.order_type}) "
+                                                f"qty {leg.quantity} -> {order.quantity} from entry {order.id}")
+                                            leg.quantity = order.quantity
+                                except Exception as leg_err:  # noqa: BLE001 — never block the entry
+                                    self.logger.error(
+                                        f"Failed to stamp protective-leg quantity for order {order.id}: "
+                                        f"{leg_err}", exc_info=True)
+
                                 # Live parity: submit with the RM safeguard SL (fo.stop_price) — the
                                 # live path does NOT apply the backtest's tighter-wins merge (that is a
                                 # separate, not-yet-approved live change), so behavior is preserved.
