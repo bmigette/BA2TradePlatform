@@ -268,7 +268,10 @@ class TradeAction(ABC):
                 limit_price=limit_price,
                 stop_price=stop_price,
                 status=OrderStatus.PENDING.value,
-                linked_order_id=linked_order_id,
+                # parent_order_id is the model's field for "parent OCO order if
+                # this is a leg"; linked_order_id does not exist and was dropped,
+                # so a TP/SL order's link to its parent was silently lost.
+                parent_order_id=linked_order_id,
                 expert_recommendation_id=expert_recommendation_id,
                 open_type=open_type,
                 comment=comment,

@@ -132,13 +132,15 @@ class InstrumentAutoAdder:
                 if lbl not in labels:
                     labels.append(lbl)
             
+            # Instrument has categories (a LIST) + company_name; it has no
+            # category/enabled/description/created_at -- those four were dropped
+            # in silence, so every auto-added instrument lost its category.
+            category = instrument_data.get('category')
             instrument = Instrument(
                 name=symbol,
-                category=instrument_data.get('category', 'Unknown'),
-                enabled=True,
-                description=instrument_data.get('description', f'Auto-added from {source}'),
+                company_name=instrument_data.get('company_name') or instrument_data.get('description'),
+                categories=[category] if category else [],
                 labels=labels,
-                created_at=datetime.now(timezone.utc)
             )
             
             # Add to database

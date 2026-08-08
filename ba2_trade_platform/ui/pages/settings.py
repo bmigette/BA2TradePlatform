@@ -3866,7 +3866,11 @@ class ExpertSettingsTab:
                             alias=general.get('alias', 'Imported Expert'),
                             user_description=general.get('user_description', ''),
                             enabled=False,  # Always disabled for imported experts for safety
-                            virtual_equity=general.get('virtual_equity', 10000.0)
+                            # virtual_equity_pct is the real field; the old name
+                            # was dropped, so imported experts silently fell back
+                            # to the column default instead of the imported value.
+                            virtual_equity_pct=general.get('virtual_equity_pct',
+                                                           general.get('virtual_equity', 100.0))
                         )
                         
                         # Resolve and set rulesets by name

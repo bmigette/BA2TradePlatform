@@ -282,11 +282,13 @@ class IBKRAccount(AccountInterface):
             for ib_pos in ib_positions:
                 if ib_pos.account == self.settings.get("account"):
                     # Create Position object
+                    # Field names must match the model: qty / avg_entry_price,
+                    # and Position carries no account_id. The old names were
+                    # silently dropped, yielding positions with NO quantity.
                     position = Position(
-                        account_id=self.id,
                         symbol=ib_pos.contract.symbol,
-                        quantity=float(ib_pos.position),
-                        average_entry_price=float(ib_pos.avgCost) if ib_pos.avgCost else 0,
+                        qty=float(ib_pos.position),
+                        avg_entry_price=float(ib_pos.avgCost) if ib_pos.avgCost else 0,
                         current_price=float(ib_pos.marketPrice) if ib_pos.marketPrice else 0,
                         market_value=float(ib_pos.marketValue) if ib_pos.marketValue else 0,
                         unrealized_pl=float(ib_pos.unrealizedPNL) if ib_pos.unrealizedPNL else 0,

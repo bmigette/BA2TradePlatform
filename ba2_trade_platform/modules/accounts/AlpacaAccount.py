@@ -2335,12 +2335,14 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 quantity=sl_order.quantity,
                 side=sl_order.side,
                 order_type=sl_order.order_type,
-                time_in_force=sl_order.time_in_force,
+                # good_for, NOT time_in_force: TradingOrder has never had a
+                # time_in_force field, so this both dropped the kwarg AND raised
+                # AttributeError on the READ. Matches _update_broker_tp_order.
+                good_for=sl_order.good_for,
                 stop_price=new_sl_price,  # New price
                 limit_price=sl_order.limit_price,
                 status=sl_order.status,
                 comment=sl_order.comment,
-                submitted_at=sl_order.submitted_at
             )
             
             # Send replace request to Alpaca - this creates a NEW order and marks old one as REPLACED
@@ -2357,12 +2359,11 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 quantity=sl_order.quantity,
                 side=sl_order.side,
                 order_type=sl_order.order_type,
-                time_in_force=sl_order.time_in_force,
+                good_for=sl_order.good_for,
                 stop_price=new_sl_price,
                 limit_price=sl_order.limit_price,
                 status=replacement_order.status,  # Status from broker (typically NEW or ACCEPTED)
                 comment=replacement_order.comment,  # Tracking comment from broker
-                submitted_at=replacement_order.submitted_at
             )
             
             # Add NEW order to database
