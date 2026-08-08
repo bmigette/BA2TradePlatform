@@ -154,10 +154,14 @@ class FactorRanker(MarketExpertInterface):
                 "type": "float", "required": False, "default": 0.02,
                 "description": "Winsorize each factor's tails at this fraction before z-scoring.",
             },
-            "sector_neutralize": {
-                "type": "bool", "required": False, "default": False,
-                "description": "Sector-neutralize factor scores (reserved; not applied in v1).",
-            },
+            # sector_neutralize REMOVED 2026-08-08. It was declared as a reserved
+            # placeholder ("not applied in v1") and never read by any code path, so
+            # the settings UI offered a switch that silently did nothing -- the same
+            # inert-knob class as the ATR genes and DeterministicScorer's
+            # fundamentals_max_age_days. No instance had a stored value (checked in
+            # the dev, prod and test DBs), so nothing is lost by dropping it.
+            # Re-add it in the SAME commit that implements the neutralization; the
+            # intent stays recorded in docs/plans/2026-06-02-factorranker-design.md.
             "pead_drift_window_days": {
                 "type": "int", "required": False, "default": 60,
                 "description": "Post-earnings drift window (days) for the PEAD factor.",

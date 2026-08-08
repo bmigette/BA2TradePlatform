@@ -63,8 +63,7 @@ Symbols whose data can't be gathered (FMP error / missing fundamentals) are **dr
 | `winsorize_pct` | float | `0.02` | Winsorize each factor's tails at this fraction before z-scoring. |
 | `pead_drift_window_days` | int | `60` | Post-earnings drift window (days) for the PEAD factor. |
 | `min_price` | float | `0.0` | Minimum share price liquidity guard (0 disables). |
-| `sector_neutralize` | bool | `False` | Reserved — not applied in v1. |
-| `min_dollar_volume` | float | `0.0` | Reserved — not enforced in v1. |
+| `min_dollar_volume` | float | `0.0` | Minimum average dollar-volume liquidity guard (0 disables). |
 
 **Per-factor weights are separate float settings** (not a single JSON blob), so each renders as a plain number field.
 
