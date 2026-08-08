@@ -39,11 +39,17 @@ class _PipelineAccount:
     def __init__(self, prices):
         self.prices = prices
         self.submitted = []
+        self.stops = []
 
     def get_instrument_current_price(self, symbol):
         return self.prices.get(symbol)
 
-    def submit_order(self, order, is_closing_order=False):
+    def submit_order(self, order, tp_price=None, sl_price=None, is_closing_order=False):
+        """Mirrors AccountInterface.submit_order. tp_price/sl_price are NOT
+        optional extras: FactorRanker passes the protective stop through here
+        (stops belong to the broker, not to per-bar expert code -- 180f665),
+        and a double that omits them makes every rebalance raise TypeError."""
+        self.stops.append(sl_price)
         order.status = OrderStatus.FILLED
         order.filled_qty = order.quantity
         order.open_price = self.prices.get(order.symbol)
@@ -137,11 +143,17 @@ class _LaggingPromotionAccount:
     def __init__(self, prices):
         self.prices = prices
         self.submitted = []
+        self.stops = []
 
     def get_instrument_current_price(self, symbol):
         return self.prices.get(symbol)
 
-    def submit_order(self, order, is_closing_order=False):
+    def submit_order(self, order, tp_price=None, sl_price=None, is_closing_order=False):
+        """Mirrors AccountInterface.submit_order. tp_price/sl_price are NOT
+        optional extras: FactorRanker passes the protective stop through here
+        (stops belong to the broker, not to per-bar expert code -- 180f665),
+        and a double that omits them makes every rebalance raise TypeError."""
+        self.stops.append(sl_price)
         order.status = OrderStatus.FILLED
         order.filled_qty = order.quantity
         order.open_price = self.prices.get(order.symbol)

@@ -13,13 +13,19 @@ class _CapturingAccount:
 
     def __init__(self, prices):
         self.submitted = []
+        self.stops = []
         self._prices = prices
 
     def get_instrument_current_price(self, symbol):
         return self._prices.get(symbol)
 
-    def submit_order(self, order, is_closing_order=False):
+    def submit_order(self, order, tp_price=None, sl_price=None, is_closing_order=False):
+        """Mirrors AccountInterface.submit_order. tp_price/sl_price are NOT
+        optional extras: FactorRanker passes the protective stop through here
+        (stops belong to the broker, not to per-bar expert code -- 180f665),
+        and a double that omits them makes every rebalance raise TypeError."""
         from ba2_trade_platform.core.db import add_instance
+        self.stops.append(sl_price)
         self.submitted.append((order, is_closing_order))
         order.status = OrderStatus.FILLED
         order.filled_qty = order.quantity
@@ -59,6 +65,15 @@ def test_rebalance_buys_new_and_sells_dropped():
     assert by_symbol["B"] == (OrderDirection.BUY, 100, False)
     # C: dropped from target -> SELL all 20 (closing)
     assert by_symbol["C"] == (OrderDirection.SELL, 20, True)
+
+    # Every ENTRY must carry a protective stop down to submit_order. This is the
+    # behaviour 180f665 introduced ("stops belong to the broker, not to per-bar
+    # expert code") and it went unguarded: the doubles simply did not accept
+    # sl_price, so the whole rebalance raised TypeError instead of asserting it.
+    entry_stops = [sl for sl, (o, closing) in zip(account.stops, account.submitted)
+                   if not closing]
+    assert entry_stops and all(sl is not None and sl > 0 for sl in entry_stops), \
+        f"an entry reached the broker unprotected: {entry_stops}"
 
 
 def test_new_buy_creates_expert_attributed_transaction():
