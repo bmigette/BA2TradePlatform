@@ -203,7 +203,20 @@ class DistributedEvaluator:
             worker_client.push_cache(w, log=self.log)
             worker_client.push_secrets(w, secrets, log=self.log)
             try:
-                w["capacity"] = max(1, int(worker_client.health(w).get("capacity") or 1))
+                _health = worker_client.health(w)
+                w["capacity"] = max(1, int(_health.get("capacity") or 1))
+                # Log the worker's RAM at pre-flight (added 2026-08-09, alongside the worker's new
+                # /health memory block). Memory is what actually degrades a trial host, and until
+                # now the master could not see a remote's pressure at all -- a remote stall looked
+                # like an unexplained slowdown. Reported once per run, and WARNED above 90% so it
+                # is visible in the grid log rather than needing a manual probe.
+                _mem = _health.get("memory") or {}
+                if _mem.get("available"):
+                    _msg = (f"worker {w.get('name')} memory: {_mem.get('free_mb')} MB free of "
+                            f"{_mem.get('total_mb')} MB ({_mem.get('used_pct')}% used), "
+                            f"worker tree rss {_mem.get('rss_mb')} MB")
+                    self.log(_msg + ("  <- LOW: trials will stall, not crash"
+                                     if (_mem.get("used_pct") or 0) >= 90 else ""))
             except Exception:  # noqa: BLE001 — fall back to 1 slot if /health didn't report
                 w["capacity"] = max(1, int(w.get("capacity") or 1))
             return True

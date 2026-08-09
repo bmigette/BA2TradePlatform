@@ -38,6 +38,19 @@
 # Senate-class trials.
 set -u
 cd "$(dirname "$0")/.."
+
+# OWN THE LOG (2026-08-09). This script only ever wrote to stdout, so the redirect belonged to
+# whoever launched it. When that shell exits -- which it does when the launch came from a tool
+# call -- the driver keeps running ORPHANED, holding a stdout handle nobody flushes, and Python
+# block-buffers stdout when it is not a TTY. Observed on the small-band matrix: the job ran for
+# 6+ hours while grid_goal2020.log's last write stayed frozen at the launch banner and NO file on
+# disk was receiving the per-generation lines. The run was healthy; it was simply invisible.
+# Owning the redirect here makes the log independent of how the script is invoked, and
+# PYTHONUNBUFFERED stops the buffer from swallowing progress between flushes.
+GRID_LOG="${GRID_LOG:-grid_goal2020.log}"
+export PYTHONUNBUFFERED=1
+exec > >(tee -a "$GRID_LOG") 2>&1
+
 PY=.venv/Scripts/python.exe
 DRIVER=tools/run_screener_capband_matrix.py
 

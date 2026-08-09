@@ -931,10 +931,26 @@ def _max_remote_slots_for_experts(backtest_cfg: Dict[str, Any]) -> Optional[int]
     full reported capacity, the pre-existing behaviour) when no named expert declares a cap.
     """
     import importlib
+    import os as _os
 
     from app.services.backtest.daily_backtest_handler import _SUPPORTED_EXPERTS
 
     cap: Optional[int] = None
+    # OPERATIONAL OVERRIDE (added 2026-08-09). The per-expert attribute is a property of the
+    # STRATEGY's memory footprint; this is a property of the BOX on a given day. When a worker is
+    # under pressure you need to shed slots for every expert in the run without editing expert
+    # classes (which would be a code change, would apply to every future run, and would be easy to
+    # forget to revert). Applied as the TIGHTEST of the two, so it can only ever reduce
+    # concurrency -- an env var must not be able to talk an expert into exceeding its declared
+    # safe slot count. Unset -> pre-existing behaviour, exactly.
+    _env = _os.environ.get("BA2_MAX_REMOTE_SLOTS")
+    if _env:
+        try:
+            _env_cap = int(_env)
+            if _env_cap > 0:
+                cap = _env_cap
+        except ValueError:
+            pass
     for spec in backtest_cfg.get("experts", []) or []:
         class_name = spec.get("class") if isinstance(spec, dict) else spec
         module_path = _SUPPORTED_EXPERTS.get(class_name)

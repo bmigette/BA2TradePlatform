@@ -433,14 +433,53 @@ def _localize_paths(obj, master_root: str, local_root: str):
     return obj
 
 
+def _memory() -> dict:
+    """Host RAM, in MB, plus this worker process tree's own resident usage.
+
+    Added 2026-08-09. /health reported cpu and gpu but NOT memory, which made a remote worker's
+    single most useful diagnostic unobservable: memory is what actually degrades a trial host.
+    Locally the failure mode is documented and measured (47c4b26: 96.8% used stalled the grid for
+    ~40 minutes mid-generation, and it resumed within 60s of freeing memory), and the master's own
+    grid_status.sh prints a LOW-memory warning for exactly that reason -- but for the remote the
+    master was blind, so the same stall would look like an unexplained slowdown.
+
+    ``used_pct`` is what to alarm on. ``rss_mb`` covers this process AND its spawn children, which
+    is what a trial slot actually costs; a worker whose rss_mb approaches total_mb is one trial away
+    from paging regardless of what its nominal slot count claims.
+
+    Degrades to {"available": False} rather than raising -- /health must answer even where psutil
+    is missing, and a missing metric must not take the worker offline.
+    """
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+        me = psutil.Process()
+        rss = me.memory_info().rss
+        for child in me.children(recursive=True):
+            try:
+                rss += child.memory_info().rss
+            except Exception:  # noqa: BLE001 — a child may exit mid-walk
+                continue
+        return {
+            "available": True,
+            "total_mb": round(vm.total / 1048576),
+            "free_mb": round(vm.available / 1048576),
+            "used_pct": round(vm.percent, 1),
+            "rss_mb": round(rss / 1048576),
+        }
+    except Exception as e:  # noqa: BLE001
+        return {"available": False, "error": str(e)[:120]}
+
+
 def _hardware() -> dict:
-    """cpu/gpu info, reusing the master's helper so the master's worker UI shows the same shape."""
+    """cpu/gpu/memory info, reusing the master's helper so the master's worker UI shows the same shape."""
     try:
         from app.api.workers import get_local_hardware_info
         cpu, gpu = get_local_hardware_info()
-        return {"cpu": cpu, "gpu": gpu}
+        return {"cpu": cpu, "gpu": gpu, "memory": _memory()}
     except Exception:  # noqa: BLE001
-        return {"cpu": {"cores": os.cpu_count(), "model": "unknown"}, "gpu": None}
+        return {"cpu": {"cores": os.cpu_count(), "model": "unknown"}, "gpu": None,
+                "memory": _memory()}
 
 
 @worker_app.get("/health")
