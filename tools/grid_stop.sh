@@ -30,7 +30,23 @@ powershell -NoProfile -Command "
 \$onlyOrphans = $ONLY_ORPHANS
 
 \$groups = @(
-  @{ n='1. wrapper script'; p={ \$_.Name -eq 'bash.exe' -and \$_.CommandLine -like '* tools/grid_goal2020.sh' } },
+  # NOTE the trailing * : this pattern used to be '* tools/grid_goal2020.sh', anchored at the END
+  # of the command line, so it only matched a wrapper launched with NO arguments. Launching with
+  # any flag (e.g. --parallel 3) made the wrapper invisible to this tier -- grid_stop killed the
+  # driver and optimize beneath it, the wrapper survived, and its "for band in ..." loop simply
+  # started the NEXT job. Measured 2026-08-09: a stop-then-relaunch left TWO complete lanes
+  # running, each engaging 5 remote slots, so the worker reported busy=10 against capacity 6 and
+  # its RSS climbed 24 -> 37 -> 53 GB (93.6% used) in 90 seconds.
+  # ...and the -notlike '* -c *' is what keeps that trailing * safe. The REAL wrapper is invoked as
+  # bash.exe tools/grid_goal2020.sh [args]; any shell that merely MENTIONS the script (the terminal
+  # that launched it, a tooling shell running nohup bash tools/grid_goal2020.sh ..., even the shell
+  # executing grid_stop itself) is invoked as bash.exe -c "...". Without this the widened pattern
+  # matched 2 unrelated shells in a dry run. Same self-match hazard the tier-3 venv pattern already
+  # documents, reached from a different direction.
+  # (NB: no backticks anywhere in this block -- it is embedded in a bash double-quoted string, so a
+  # backtick opens command substitution and breaks the whole script at RUNTIME while bash -n still
+  # passes, because -n only parses the string, never its contents.)
+  @{ n='1. wrapper script'; p={ \$_.Name -eq 'bash.exe' -and \$_.CommandLine -like '*tools/grid_goal2020.sh*' -and \$_.CommandLine -notlike '* -c *' } },
   @{ n='2. matrix driver' ; p={ \$_.CommandLine -like '*run_screener_capband_matrix*' } },
   @{ n='3. optimize / pool workers'; p={ \$_.CommandLine -like '*BA2TradePlatform\.venv*' } },
   # 4. SPAWN-POOL ORPHANS. These do NOT match tier 3: a multiprocessing spawn child runs from the
