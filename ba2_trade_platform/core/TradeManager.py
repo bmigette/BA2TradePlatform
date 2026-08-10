@@ -495,6 +495,54 @@ class TradeManager:
                     f"{order.id} expired in WASHTRADE_LOCKED without ever reaching the broker"
                 )
 
+    # Transient DB-lock retries for a FUNDED entry. See _submit_funded_entry_with_retry.
+    _ENTRY_SUBMIT_RETRIES = 3
+    _ENTRY_SUBMIT_BACKOFF_S = 2.0
+
+    def _submit_funded_entry_with_retry(self, account, order, sl_price=None):
+        """Submit a funded entry, retrying when the DB (not the broker) is what failed.
+
+        WHY. A sqlite write lock must never cost a trade. Measured on PROD 2026-08-10: CVS was
+        screened, passed its ruleset and was FUNDED by the RM (1 share @ $95.69), then
+        submit_order's Transaction insert hit "database is locked". db.retry_on_lock burns 4
+        attempts against a 30s busy_timeout -- ~2 minutes -- then re-raises; the caller logged it
+        and moved on. The trade was simply lost, leaving a stranded qty-0 PENDING row with no
+        transaction and no broker id. Nothing sweeps those: the only code that touches PENDING
+        entries DELETES them, and order 460 sat untouched for 8 hours. Dev is worse -- 161 lock
+        events in a day and 5 entries lost the same way.
+
+        The lock is transient and the retry is trivially correct HERE, because at this point the
+        RM-sized quantity and safeguard stop are still in memory (fo.quantity / fo.stop_price);
+        re-deriving them later from a stranded row is not possible, which is why this belongs in
+        the funded loop and not in a sweeper.
+
+        ONLY lock failures are retried. A broker rejection, a validation error or a wash-trade
+        lock is a real answer and must not be re-attempted -- re-sending on those risks a
+        duplicate order, which is far worse than a missed one.
+        """
+        import time as _time
+
+        last_err = None
+        for attempt in range(1, self._ENTRY_SUBMIT_RETRIES + 1):
+            try:
+                return account.submit_order(order, sl_price=sl_price)
+            except Exception as e:  # noqa: BLE001 — classified immediately below
+                if "database is locked" not in str(e).lower():
+                    raise  # a real answer from the broker/validator: never re-send
+                last_err = e
+                if attempt < self._ENTRY_SUBMIT_RETRIES:
+                    delay = self._ENTRY_SUBMIT_BACKOFF_S * attempt
+                    self.logger.warning(
+                        f"Entry submit for order {order.id} ({order.symbol}) lost to a DB lock "
+                        f"(attempt {attempt}/{self._ENTRY_SUBMIT_RETRIES}); retrying in {delay:.0f}s")
+                    _time.sleep(delay)
+        self.logger.error(
+            f"Entry submit for order {order.id} ({order.symbol}) ABANDONED after "
+            f"{self._ENTRY_SUBMIT_RETRIES} DB-lock retries: {last_err}. The RM funded this trade "
+            f"and it never reached the broker; order {order.id} is left PENDING with no broker id.",
+            exc_info=True)
+        return None
+
     def _check_all_waiting_trigger_orders(self):
         """
         Check all orders in WAITING_TRIGGER status to see if their parent orders have reached the trigger status.
@@ -1506,8 +1554,21 @@ class TradeManager:
                                 # the broker needs it resting; that constraint is live-only.
                                 try:
                                     from sqlmodel import select as _leg_select
-                                    legs = session.exec(_leg_select(TradingOrder).where(
-                                        TradingOrder.depends_on_order == order.id)).all()
+                                    # no_autoflush IS THE POINT, not a detail. `order` is dirty from
+                                    # the line above, so running this query normally AUTOFLUSHES it --
+                                    # which takes sqlite's single WRITE LOCK on this session. The very
+                                    # next thing we do is submit_order(), which inserts the Transaction
+                                    # from a DIFFERENT session and therefore blocks on its own caller
+                                    # for the full 30s busy_timeout, four times, and the funded trade is
+                                    # lost. That is exactly what happened to CVS on 2026-08-10 (and to
+                                    # 5 dev entries the same day: 161 lock events, none before this code
+                                    # shipped on the 08-08, with the 09th a closed Sunday in between).
+                                    # Suppressing the autoflush keeps the lock unheld across the broker
+                                    # round trip; the order + legs still persist together at the outer
+                                    # commit, which is after submit and long before any leg is promoted.
+                                    with session.no_autoflush:
+                                        legs = session.exec(_leg_select(TradingOrder).where(
+                                            TradingOrder.depends_on_order == order.id)).all()
                                     for leg in legs:
                                         if leg.quantity != order.quantity:
                                             self.logger.info(
@@ -1523,7 +1584,8 @@ class TradeManager:
                                 # live path does NOT apply the backtest's tighter-wins merge (that is a
                                 # separate, not-yet-approved live change), so behavior is preserved.
                                 self.logger.info(f"Auto-submitting order {order.id} for {order.symbol}: {order.quantity} shares")
-                                submitted_order = account.submit_order(order, sl_price=fo.stop_price or None)
+                                submitted_order = self._submit_funded_entry_with_retry(
+                                    account, order, sl_price=fo.stop_price or None)
                                 if submitted_order:
                                     submitted_count += 1
                                     session.expunge(order)
