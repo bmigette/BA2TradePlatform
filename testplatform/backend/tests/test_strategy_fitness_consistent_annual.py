@@ -192,13 +192,15 @@ def test_tiny_drawdown_is_floored_not_infinite():
 # 4. Trade gate (proportional ramp toward 30/yr, no hard cliff)
 # ---------------------------------------------------------------------------
 def test_25_trades_per_year_ramped_not_disqualified():
-    # 25/30 = 0.8333x, not a flat disqualification.
-    assert compute_fitness("consistent_annual_return", _r(avg_trades_per_year=25.0)) == pytest.approx(
-        30.0 * (25.0 / 30.0))
+    # Ramp target lowered 30 -> 20 on 2026-08-09, so 25/yr now clears it outright and takes FULL
+    # credit (was 25/30 = 0.833x). The name is kept: the property under test is still "ramped, not
+    # flat-disqualified", and the clamp is the top of that ramp.
+    assert compute_fitness("consistent_annual_return", _r(avg_trades_per_year=25.0)) == pytest.approx(30.0)
 
 
-def test_15_trades_per_year_half_credit():
-    assert compute_fitness("consistent_annual_return", _r(avg_trades_per_year=15.0)) == pytest.approx(30.0 * 0.5)
+def test_15_trades_per_year_three_quarter_credit():
+    # 15/20 = 0.75 under the 2026-08-09 objective (was 15/30 = 0.5).
+    assert compute_fitness("consistent_annual_return", _r(avg_trades_per_year=15.0)) == pytest.approx(30.0 * 0.75)
 
 
 def test_zero_point_three_trades_per_year_tiny_but_nonzero():
@@ -222,7 +224,10 @@ def test_gate_derives_trades_per_year_from_curve_when_key_missing():
     r = _r(equity_curve=curve, total_trades=95)  # ~31.8/yr -> full credit
     r.pop("avg_trades_per_year")
     assert compute_fitness("consistent_annual_return", r) > 0
-    r2 = _r(equity_curve=curve, total_trades=60)  # ~20/yr -> ramped down, not disqualified
+    # 36 trades over ~3y = ~12/yr: above the 8/yr floor, below the 20/yr ramp target, so it must
+    # be ramped DOWN rather than disqualified. (60 trades = ~20/yr now takes full credit under the
+    # 2026-08-09 objective, which would no longer exercise the ramp at all.)
+    r2 = _r(equity_curve=curve, total_trades=36)
     r2.pop("avg_trades_per_year")
     f2 = compute_fitness("consistent_annual_return", r2)
     assert 0 < f2 < 30.0
@@ -310,8 +315,16 @@ def test_at_the_hard_floor_is_scored_normally():
 
 
 def test_just_below_the_floor_is_disqualified():
-    r = _r(total_trades=47, avg_trades_per_year=11.9)
+    # Hard floor lowered 12 -> 8 on 2026-08-09, so "just below" is now 7.9/yr.
+    r = _r(total_trades=32, avg_trades_per_year=7.9)
     assert compute_fitness("consistent_annual_return", r) == LOW_TRADE_SENTINEL
+
+
+def test_just_above_the_new_floor_is_scored_not_disqualified():
+    """The point of lowering the floor: a ~monthly cadence must COMPETE, not be excluded.
+    8/yr clears the floor and takes the 8/20 = 0.4x gate."""
+    r = _r(total_trades=32, avg_trades_per_year=8.0)
+    assert compute_fitness("consistent_annual_return", r) == pytest.approx(30.0 * 0.4)
 
 
 def test_dd_guard_is_capped():

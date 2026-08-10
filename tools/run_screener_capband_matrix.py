@@ -30,7 +30,20 @@ _STORE = r"C:\Users\basti\Documents\ba2\common\cache\screener\metric_store"
 # is set; pass the NDQ30 as a harmless placeholder.
 _PLACEHOLDER_UNIVERSE = ("AAPL,MSFT,NVDA,AMZN,META,GOOGL,AVGO,TSLA,COST,NFLX,AMD,PEP,ADBE,CSCO,TMUS,"
                          "INTC,QCOM,INTU,AMAT,TXN,AMGN,ISRG,BKNG,HON,VRTX,ADP,SBUX,GILD,MU,LRCX")
-_CLASSIC = ["FMPRating", "FMPEarningsDrift", "FMPInsiderClusterBuy"]
+# DeterministicScorer added 2026-08-09. It is a CLASSIC expert (bypasses_classic_rm = False), so
+# it runs the full S1/S2/S3 strategy set across every band like the others, not one job per band.
+#
+# NOT floored to 2022 like FMPRating, deliberately. FMPRating keys ENTIRELY off FMP price targets,
+# which do not serve rows before ~2021-04, so a 2020 run gave it ~20 dead months. DeterministicScorer
+# blends FIVE sections (analyst / earnings / fundamental / macro / technical), and the analyst
+# section itself splits into grades (which reach back to 2012) and targets. Only the target sub-leg
+# is thin before 2021-04, and both its weights (aw_grades / aw_targets, w_analyst) are GA genes that
+# can turn it down, so the expert still has real signal across the whole window.
+#
+# CAVEAT worth knowing when reading its results: over 2020-01 .. 2021-04 the target sub-leg is
+# degraded, so the GA sees a window where aw_targets pays less than it would on clean data and may
+# settle lower than the truth. That biases one gene, not the run.
+_CLASSIC = ["FMPRating", "FMPEarningsDrift", "FMPInsiderClusterBuy", "DeterministicScorer"]
 _RANKER = "FactorRanker"
 # Experts with no usable data in the large-cap band (skipped on `large` unless --include-no-data).
 _NO_LARGE_CAP = {"FMPEarningsDrift", "FMPInsiderClusterBuy"}

@@ -35,14 +35,22 @@ WIPED_OUT_SENTINEL = -2.0e9
 
 # --- consistent_annual_return metric constants -------------------------------------------------
 # Goal: ~30% return EVERY year — not 50% one year / 10% the next.
-_CAR_MIN_TRADES_PER_YEAR = 30.0   # trade_gate ramp target: full credit at/above this, linear below
+_CAR_MIN_TRADES_PER_YEAR = 20.0   # trade_gate ramp target: full credit at/above this, linear below
+# Lowered 30 -> 20 on 2026-08-09 (with the hard floor 12 -> 8 below). The pair encodes the
+# TRADE-FREQUENCY OBJECTIVE, not a measurement: 30/yr asked every strategy to trade roughly
+# weekly, which suits a high-turnover screener expert and quietly taxes a slower, more
+# selective one -- a 12/yr genome scored 0.4x on the gate no matter how good its edge was.
+# 20/yr full credit with an 8/yr floor keeps the 'must actually trade' discipline while
+# letting a monthly-cadence strategy compete on its returns instead of its frequency.
 
 # HARD trade-frequency floor: below this a config is DISQUALIFIED, not merely scaled down. The
 # proportional ramp alone was not enough -- on the mid band a 4.2 trades/yr genome won its job
 # outright (17 trades over 4 years), because a 0.14 gate multiplied against a huge low-drawdown
 # dd_guard still beat every richer config. A handful of trades cannot evidence an edge whatever
-# its ratios, so it is excluded rather than ranked.
-_CAR_HARD_MIN_TRADES_PER_YEAR = 12.0
+# its ratios, so it is excluded rather than ranked. Lowered 12 -> 8 on 2026-08-09: the 4.2/yr
+# case that motivated the floor is still excluded, but 8-12/yr (roughly monthly) is a real
+# cadence rather than a handful, and 12 was disqualifying it outright.
+_CAR_HARD_MIN_TRADES_PER_YEAR = 8.0
 
 # Ceiling on the drawdown reward. dd_guard is 20/dd, i.e. base x dd_guard IS 20 x Calmar, so an
 # unbounded guard lets a tiny-drawdown config buy its way past a materially better one: measured
