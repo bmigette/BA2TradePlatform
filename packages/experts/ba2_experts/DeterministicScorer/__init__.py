@@ -58,6 +58,20 @@ class DeterministicScorer(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExper
     RENDER_PENDING = "Deterministic scoring queued…"
     RENDER_RUNNING = "Computing technical/fundamental/macro scores…"
 
+    # TRADE-FREQUENCY OBJECTIVE for this expert only (2026-08-09). The platform default is a 12/yr
+    # hard floor with full credit at 30/yr, which suits a high-turnover screener expert. This one
+    # gates entries on AGREEMENT across five sections (analyst / earnings / fundamental / macro /
+    # technical), so its natural cadence is much slower; judged on the default objective a perfectly
+    # good monthly config is disqualified outright rather than ranked below a busier one.
+    #
+    # Declared per-expert rather than changed globally on purpose: these two thresholds re-scale the
+    # fitness of EVERY config between the floor and the ramp, so moving them for everyone would make
+    # this grid incomparable with the jobs already completed on the default objective.
+    # Read by strategy_fitness._consistent_annual_return via the results dict, which
+    # daily_backtest_handler stamps from these attributes.
+    car_hard_min_trades_per_year: float = 8.0
+    car_min_trades_per_year: float = 20.0
+
     def __init__(self, id: int):
         super().__init__(id)
         self.logger = get_expert_logger(self.__class__.__name__, id)

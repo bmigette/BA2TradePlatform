@@ -35,22 +35,21 @@ WIPED_OUT_SENTINEL = -2.0e9
 
 # --- consistent_annual_return metric constants -------------------------------------------------
 # Goal: ~30% return EVERY year — not 50% one year / 10% the next.
-_CAR_MIN_TRADES_PER_YEAR = 20.0   # trade_gate ramp target: full credit at/above this, linear below
-# Lowered 30 -> 20 on 2026-08-09 (with the hard floor 12 -> 8 below). The pair encodes the
-# TRADE-FREQUENCY OBJECTIVE, not a measurement: 30/yr asked every strategy to trade roughly
-# weekly, which suits a high-turnover screener expert and quietly taxes a slower, more
-# selective one -- a 12/yr genome scored 0.4x on the gate no matter how good its edge was.
-# 20/yr full credit with an 8/yr floor keeps the 'must actually trade' discipline while
-# letting a monthly-cadence strategy compete on its returns instead of its frequency.
+_CAR_MIN_TRADES_PER_YEAR = 30.0   # trade_gate ramp target: full credit at/above this, linear below
+# These two are the DEFAULT trade-frequency objective, applied to every expert that does not
+# state its own. An expert whose natural cadence differs can override BOTH per run by declaring
+# ``car_min_trades_per_year`` / ``car_hard_min_trades_per_year`` as class attributes; the backtest
+# handler resolves them and puts them in ``results``, and the reader below prefers them. That keeps
+# a new expert's objective from silently re-scaling every existing result -- changing these two
+# constants moves the fitness of EVERY config between the floor and the ramp, so a grid that mixes
+# the two scales cannot be ranked against itself.
 
 # HARD trade-frequency floor: below this a config is DISQUALIFIED, not merely scaled down. The
 # proportional ramp alone was not enough -- on the mid band a 4.2 trades/yr genome won its job
 # outright (17 trades over 4 years), because a 0.14 gate multiplied against a huge low-drawdown
 # dd_guard still beat every richer config. A handful of trades cannot evidence an edge whatever
-# its ratios, so it is excluded rather than ranked. Lowered 12 -> 8 on 2026-08-09: the 4.2/yr
-# case that motivated the floor is still excluded, but 8-12/yr (roughly monthly) is a real
-# cadence rather than a handful, and 12 was disqualifying it outright.
-_CAR_HARD_MIN_TRADES_PER_YEAR = 8.0
+# its ratios, so it is excluded rather than ranked.
+_CAR_HARD_MIN_TRADES_PER_YEAR = 12.0
 
 # Ceiling on the drawdown reward. dd_guard is 20/dd, i.e. base x dd_guard IS 20 x Calmar, so an
 # unbounded guard lets a tiny-drawdown config buy its way past a materially better one: measured
@@ -398,9 +397,14 @@ def _consistent_annual_return(results: dict) -> float:
         tpy = (total / years) if years > 0 else None
     if tpy is None:
         return LOW_TRADE_SENTINEL  # genuinely no trade-frequency data to score against
-    if float(tpy) < _CAR_HARD_MIN_TRADES_PER_YEAR:
+    # Per-run objective, defaulting to the module constants. run_daily_backtest stamps these from
+    # the expert's own class attributes when it declares them, so one expert's cadence cannot
+    # re-scale another's fitness (see _car_trade_thresholds_for_experts).
+    _floor = float(results.get("car_hard_min_trades_per_year") or _CAR_HARD_MIN_TRADES_PER_YEAR)
+    _ramp = float(results.get("car_min_trades_per_year") or _CAR_MIN_TRADES_PER_YEAR)
+    if float(tpy) < _floor:
         return LOW_TRADE_SENTINEL          # disqualified: too few trades to evidence anything
-    trade_gate = min(max(float(tpy) / _CAR_MIN_TRADES_PER_YEAR, 0.0), 1.0)
+    trade_gate = min(max(float(tpy) / _ramp, 0.0), 1.0)
 
     if base <= 0:
         return base  # unfactored: penalty factors on a negative would flip its sign

@@ -769,10 +769,53 @@ def run_daily_backtest(
             engine.run()
 
             # build_results consumes the SAME account (get_balance_history / get_filled_trades).
-            return build_results(account, config)
+            results = build_results(account, config)
+            # Stamp this run's trade-frequency objective so compute_fitness scores the expert on
+            # ITS cadence, not the platform default. Done here because run_daily_backtest is the
+            # single chokepoint every path goes through (trial worker, master top-N persist,
+            # parallel=1), so both compute_fitness call sites get it without touching either.
+            results.update(_car_trade_thresholds_for_experts(config))
+            return results
         finally:
             # Drop the per-run OHLCV override so it never leaks into a later (non-backtest) call.
             set_backtest_ohlcv_override(None)
+
+
+def _car_trade_thresholds_for_experts(config: Dict[str, Any]) -> Dict[str, float]:
+    """This run's trade-frequency objective, from the experts it names.
+
+    An expert may declare ``car_hard_min_trades_per_year`` / ``car_min_trades_per_year`` to be
+    judged on its own cadence instead of the platform default (12/yr floor, full credit at 30/yr).
+    A multi-section scorer that gates on agreement trades far less often than a screener expert,
+    and on the default objective a perfectly good monthly config is DISQUALIFIED rather than
+    ranked -- but changing the default for everyone re-scales the fitness of every config between
+    floor and ramp, which would make a grid incomparable with its own completed jobs.
+
+    Mirrors ``_max_remote_slots_for_experts``'s resolution (same _SUPPORTED_EXPERTS lookup). With
+    several experts naming a value the TIGHTEST wins, so a mixed run can never be scored more
+    leniently than its strictest member. Returns {} when nobody declares one -- the fitness reader
+    then falls back to its module defaults, i.e. pre-existing behaviour exactly.
+    """
+    import importlib
+
+    out: Dict[str, float] = {}
+    for key in ("car_hard_min_trades_per_year", "car_min_trades_per_year"):
+        best = None
+        for spec in config.get("experts", []) or []:
+            class_name = spec.get("class") if isinstance(spec, dict) else spec
+            module_path = _SUPPORTED_EXPERTS.get(class_name)
+            if not module_path:
+                continue
+            try:
+                expert_cls = getattr(importlib.import_module(module_path), class_name)
+            except Exception:  # noqa: BLE001 — detection must never break a run
+                continue
+            val = getattr(expert_cls, key, None)
+            if val is not None:
+                best = float(val) if best is None else max(best, float(val))
+        if best is not None:
+            out[key] = best
+    return out
 
 
 def _build_experts(

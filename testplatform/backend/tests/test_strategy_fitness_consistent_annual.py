@@ -192,15 +192,13 @@ def test_tiny_drawdown_is_floored_not_infinite():
 # 4. Trade gate (proportional ramp toward 30/yr, no hard cliff)
 # ---------------------------------------------------------------------------
 def test_25_trades_per_year_ramped_not_disqualified():
-    # Ramp target lowered 30 -> 20 on 2026-08-09, so 25/yr now clears it outright and takes FULL
-    # credit (was 25/30 = 0.833x). The name is kept: the property under test is still "ramped, not
-    # flat-disqualified", and the clamp is the top of that ramp.
-    assert compute_fitness("consistent_annual_return", _r(avg_trades_per_year=25.0)) == pytest.approx(30.0)
+    # 25/30 = 0.8333x, not a flat disqualification.
+    assert compute_fitness("consistent_annual_return", _r(avg_trades_per_year=25.0)) == pytest.approx(
+        30.0 * (25.0 / 30.0))
 
 
-def test_15_trades_per_year_three_quarter_credit():
-    # 15/20 = 0.75 under the 2026-08-09 objective (was 15/30 = 0.5).
-    assert compute_fitness("consistent_annual_return", _r(avg_trades_per_year=15.0)) == pytest.approx(30.0 * 0.75)
+def test_15_trades_per_year_half_credit():
+    assert compute_fitness("consistent_annual_return", _r(avg_trades_per_year=15.0)) == pytest.approx(30.0 * 0.5)
 
 
 def test_zero_point_three_trades_per_year_tiny_but_nonzero():
@@ -224,10 +222,7 @@ def test_gate_derives_trades_per_year_from_curve_when_key_missing():
     r = _r(equity_curve=curve, total_trades=95)  # ~31.8/yr -> full credit
     r.pop("avg_trades_per_year")
     assert compute_fitness("consistent_annual_return", r) > 0
-    # 36 trades over ~3y = ~12/yr: above the 8/yr floor, below the 20/yr ramp target, so it must
-    # be ramped DOWN rather than disqualified. (60 trades = ~20/yr now takes full credit under the
-    # 2026-08-09 objective, which would no longer exercise the ramp at all.)
-    r2 = _r(equity_curve=curve, total_trades=36)
+    r2 = _r(equity_curve=curve, total_trades=60)  # ~20/yr -> ramped down, not disqualified
     r2.pop("avg_trades_per_year")
     f2 = compute_fitness("consistent_annual_return", r2)
     assert 0 < f2 < 30.0
@@ -315,16 +310,8 @@ def test_at_the_hard_floor_is_scored_normally():
 
 
 def test_just_below_the_floor_is_disqualified():
-    # Hard floor lowered 12 -> 8 on 2026-08-09, so "just below" is now 7.9/yr.
-    r = _r(total_trades=32, avg_trades_per_year=7.9)
+    r = _r(total_trades=47, avg_trades_per_year=11.9)
     assert compute_fitness("consistent_annual_return", r) == LOW_TRADE_SENTINEL
-
-
-def test_just_above_the_new_floor_is_scored_not_disqualified():
-    """The point of lowering the floor: a ~monthly cadence must COMPETE, not be excluded.
-    8/yr clears the floor and takes the 8/20 = 0.4x gate."""
-    r = _r(total_trades=32, avg_trades_per_year=8.0)
-    assert compute_fitness("consistent_annual_return", r) == pytest.approx(30.0 * 0.4)
 
 
 def test_dd_guard_is_capped():
@@ -348,3 +335,44 @@ def test_cap_barely_touches_a_healthy_config():
     re-ranking. The cap is aimed at sub-10% thinness, not at real configs."""
     r = _r(max_drawdown=-9.1, avg_trades_per_year=134.0)
     assert compute_fitness("consistent_annual_return", r) > 0
+
+
+# --------------------------------------------------------------------------------------------- #
+# PER-EXPERT trade-frequency objective (2026-08-09)
+#
+# The module constants (12/yr floor, full credit at 30/yr) are the DEFAULT. An expert whose natural
+# cadence is slower may declare its own via class attributes, which daily_backtest_handler stamps
+# into the results dict. This must NOT be done by editing the constants: they re-scale the fitness
+# of every config between floor and ramp, so a grid that mixed the two scales could not be ranked
+# against itself.
+# --------------------------------------------------------------------------------------------- #
+
+def test_per_run_thresholds_override_the_default_objective():
+    """10 trades/yr is DISQUALIFIED under the default (floor 12) but scored under an 8/20 run."""
+    default = compute_fitness("consistent_annual_return", _r(avg_trades_per_year=10.0))
+    assert default == LOW_TRADE_SENTINEL
+
+    r = _r(avg_trades_per_year=10.0)
+    r["car_hard_min_trades_per_year"] = 8.0
+    r["car_min_trades_per_year"] = 20.0
+    assert compute_fitness("consistent_annual_return", r) == pytest.approx(30.0 * (10.0 / 20.0))
+
+
+def test_per_run_floor_still_disqualifies_below_itself():
+    """Overriding the objective lowers the bar; it does not remove it."""
+    r = _r(avg_trades_per_year=7.9)
+    r["car_hard_min_trades_per_year"] = 8.0
+    r["car_min_trades_per_year"] = 20.0
+    assert compute_fitness("consistent_annual_return", r) == LOW_TRADE_SENTINEL
+
+
+def test_absent_overrides_are_byte_identical_to_the_default():
+    """The common path (no expert declares a cadence) must be unchanged -- this is what protects
+    the 17 goal2020 jobs already scored on the default objective."""
+    for tpy in (11.9, 12.0, 15.0, 30.0, 60.0):
+        plain = _r(avg_trades_per_year=tpy)
+        with_none = _r(avg_trades_per_year=tpy)
+        with_none["car_hard_min_trades_per_year"] = None
+        with_none["car_min_trades_per_year"] = None
+        assert compute_fitness("consistent_annual_return", plain) == \
+               compute_fitness("consistent_annual_return", with_none)
