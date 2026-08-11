@@ -54,7 +54,17 @@ MODELS: Dict[str, Dict[str, object]] = {
 
     # Same architecture, DIFFERENT training corpus: analyst reports and earnings-call
     # tone rather than Financial PhraseBank. The most likely source of a genuine edge.
-    "finbert-tone": {"hf": "yiyanghkust/finbert-tone", "mb": 439},
+    # `tokenizer` override: this checkpoint ships only vocab.txt, and transformers 5.x
+    # cannot build a fast tokenizer from it through AutoTokenizer (it asks for
+    # sentencepiece, which does not help a WordPiece vocab). Naming the concrete
+    # WordPiece class loads it correctly. Kept per-model rather than as a blanket
+    # fallback -- a silent fallback would happily load the WRONG tokenizer for some
+    # future model and score everything through a mismatched vocabulary.
+    # `model` override for the same reason: its config.json omits `model_type`, so the
+    # Auto classes cannot infer the architecture either. It is a plain BERT classifier.
+    "finbert-tone": {"hf": "yiyanghkust/finbert-tone", "mb": 439,
+                     "tokenizer": "BertTokenizerFast",
+                     "model": "BertForSequenceClassification"},
 
     # DistilRoBERTa: 6 layers, ~half the weights and activations of the others, and
     # fine-tuned specifically on financial NEWS -- which is exactly this substrate.
@@ -133,8 +143,18 @@ def score_texts(texts: Sequence[str], model: str = "finbert",
         torch.set_num_threads(int(threads))
 
     logger.info("Loading %s (%s)", model, hf_id)
-    tok = AutoTokenizer.from_pretrained(hf_id)
-    mdl = AutoModelForSequenceClassification.from_pretrained(hf_id)
+    tok_cls = MODELS[model].get("tokenizer")
+    if tok_cls:
+        import transformers
+        tok = getattr(transformers, str(tok_cls)).from_pretrained(hf_id)
+    else:
+        tok = AutoTokenizer.from_pretrained(hf_id)
+    mdl_cls = MODELS[model].get("model")
+    if mdl_cls:
+        import transformers
+        mdl = getattr(transformers, str(mdl_cls)).from_pretrained(hf_id)
+    else:
+        mdl = AutoModelForSequenceClassification.from_pretrained(hf_id)
     mdl.eval()
     lab = _resolve_label_map(mdl.config.id2label)
 
