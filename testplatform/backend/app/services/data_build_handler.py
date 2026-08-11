@@ -39,6 +39,56 @@ def _resolve_fmp_key() -> str:
     return key
 
 
+def _resolve_fred_key() -> str:
+    """Same resolution order as FMP. The FRED key lives in AppSetting, not .env."""
+    key = os.getenv("FRED_API_KEY")
+    if not key:
+        try:
+            from ba2_common.config import get_app_setting
+
+            key = get_app_setting("fred_api_key")
+        except Exception:  # noqa: BLE001
+            key = None
+    return key
+
+
+def _prewarm_fred(max_age_hours: float = 24.0) -> Dict[str, Any]:
+    """Refresh the FRED macro series DeterministicScorer reads.
+
+    Global, not per-symbol: these are 9 economy-wide series, so they are fetched once per
+    run rather than once per (expert, symbol) like the FMP history caches.
+
+    This exists because ``fred_series.get_series_as_of`` RAISES on a missing cache file
+    rather than reaching for the network -- a backtest must never silently run on absent
+    macro data. That contract is only safe if something populates the cache first, and
+    this is it. The files land under CACHE_FOLDER, so remote workers receive them with
+    the rest of the cache sync automatically.
+    """
+    import time
+
+    from ba2_providers.macro import fred_series
+
+    key = _resolve_fred_key()
+    if not key:
+        # Not fatal to the whole prewarm: only DeterministicScorer needs it, and saying
+        # so precisely beats failing a 500-symbol FMP prewarm over a missing macro key.
+        return {"error": "fred_api_key not configured (AppSetting or FRED_API_KEY)"}
+
+    refreshed = skipped = errors = 0
+    for sid in fred_series.SERIES_SPEC:
+        path = fred_series.cache_path(sid)
+        if os.path.exists(path) and (time.time() - os.path.getmtime(path)) / 3600.0 < max_age_hours:
+            skipped += 1
+            continue
+        try:
+            fred_series.refresh_series(sid, key)
+            refreshed += 1
+        except Exception as e:  # noqa: BLE001 — one series must not abort the prewarm
+            errors += 1
+            logger.warning(f"prewarm FRED {sid} failed: {e}")
+    return {"refreshed": refreshed, "fresh": skipped, "errors": errors}
+
+
 def handle_build_screener_metrics(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     """Build/extend the screener METRIC store (parquet) from the as-of OHLCV cache.
 
@@ -247,9 +297,18 @@ def handle_prewarm(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
             "FMPInsiderClusterBuy": _do_insider,
         }
 
+        # DeterministicScorer's macro series are economy-wide, so they are refreshed once
+        # here rather than entering the per-symbol work list.
+        fred_summary = None
+        if "DeterministicScorer" in experts:
+            fred_summary = _prewarm_fred(float(payload.get("fred_max_age_hours", 24.0)))
+            logger.info(f"prewarm task {task_id}: FRED {fred_summary}")
+
         work = []
         skipped = []
         for expert in experts:
+            if expert == "DeterministicScorer":
+                continue          # handled above; nothing per-symbol to fetch
             fetcher = fetchers.get(expert)
             if fetcher is None:
                 skipped.append(expert)
@@ -261,7 +320,8 @@ def handle_prewarm(task_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
             return {
                 "status": "completed",
                 "summary": {"cached": {}, "errors": 0, "skipped": skipped,
-                            "note": "no disk-cached experts to pre-warm"},
+                            "fred": fred_summary,
+                            "note": "no per-symbol disk-cached experts to pre-warm"},
             }
 
         counts: Dict[str, int] = {}
