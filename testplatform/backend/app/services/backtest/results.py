@@ -508,6 +508,13 @@ def _compute_metrics(
         "fitness_trade_scale_target": config.get("fitness_trade_scale_target"),
         # Optional win-rate fitness factor (2 * win_rate_fraction; see strategy_fitness.py).
         "fitness_win_rate_factor": bool(config.get("fitness_win_rate_factor")),
+        # Optional SPREAD-STRESS level (bps). When > 0 the GA additionally scores the run as if
+        # the spread were this much wider and ranks on the worse of the two, selecting against
+        # genomes whose per-trade edge barely clears the modelled cost. Echoed here (like the
+        # cap/scale knobs above) so compute_fitness reads it off `results` and every path --
+        # local pool, remote worker, top-N re-run -- picks it up from the config that crossed
+        # the wire, with no separate plumbing to keep in sync.
+        "stress_spread_bps": _safe_float(config.get("stress_spread_bps") or 0.0),
         "winning_trades": winning_trades,
         "losing_trades": losing_trades,
         "win_rate": round(_safe_float(win_rate), 2),

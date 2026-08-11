@@ -2736,6 +2736,7 @@ def _cmd_optimize(args) -> int:
             "execution_interval": args.interval,
             "profit_cap_pct": (float(args.profit_cap_pct) if args.profit_cap_pct else None),
             "profit_share_cap_pct": (float(args.profit_share_cap_pct) if args.profit_share_cap_pct else None),
+            "stress_spread_bps": (float(args.stress_spread_bps) if getattr(args, "stress_spread_bps", 0) else 0.0),
             "fitness_trade_scale": bool(getattr(args, "fitness_trade_scale", False)),
             "fitness_trade_scale_cap": (float(args.fitness_trade_scale_cap)
                                         if getattr(args, "fitness_trade_scale_cap", None) else None),
@@ -3040,6 +3041,7 @@ def _cmd_optimize_batch(args) -> int:
                 "execution_interval": args.interval,
                 "profit_cap_pct": (float(args.profit_cap_pct) if args.profit_cap_pct else None),
                 "profit_share_cap_pct": (float(args.profit_share_cap_pct) if args.profit_share_cap_pct else None),
+            "stress_spread_bps": (float(args.stress_spread_bps) if getattr(args, "stress_spread_bps", 0) else 0.0),
                 "fitness_trade_scale": bool(getattr(args, "fitness_trade_scale", False)),
                 "fitness_trade_scale_cap": (float(args.fitness_trade_scale_cap)
                                             if getattr(args, "fitness_trade_scale_cap", None) else None),
@@ -3723,6 +3725,12 @@ def main(argv: "list | None" = None) -> int:
                          "fitness/return (25 = no single trade may contribute >25%% of total return). "
                          "Complements --profit-cap-pct: a trade can pass the cost-basis cap yet still "
                          "dominate the book's return; this bounds that. Stops one lucky mega-winner dominating the GA. DEFAULT-ON since 2026-07-31: the senate grid ran uncapped and its S5 TOP5 reached rank 5 with 96.9%% of net P&L in ONE trade (370%% total return, ~flat without it) -- the capband matrix driver had defaulted these to 2000/25 for ages, the senate scripts never passed them, and nobody noticed until the concentration was checked by hand. Pass 0 to disable.")
+    op.add_argument("--stress-spread-bps", type=float, default=0.0,
+                    help="Also score every genome as if the spread were this many bps "
+                         "WIDER and rank on the WORSE of the two. Selects against configs "
+                         "whose per-trade edge barely clears the modelled cost. 0 = off "
+                         "(default). NOTE: a non-zero value RESCALES fitness, so scores "
+                         "are not comparable with runs made at a different level.")
     op.add_argument("--fitness-trade-scale", action="store_true",
                     help="Multiply each trial's fitness by min(avg_trades_per_year, cap)/target, so "
                          "statistically thin (few-trade) configs are down-weighted (~target trades/yr "

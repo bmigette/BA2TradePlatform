@@ -174,6 +174,46 @@ def _jobs(bands, strategies, include_no_data, skip_experts=frozenset(), name_suf
             yield (f"scr-{band}-{_RANKER}{name_suffix}", _RANKER, None, band)  # bypass: one job per band
 
 
+
+# Realised bid-ask spreads differ by an ORDER OF MAGNITUDE across cap bands -- a few bps on a
+# mega-cap, tens of bps on a small-cap. One stress level for the whole grid is therefore
+# meaningless: it is either far too harsh on large or far too soft on small, and the bands stop
+# being rankable against each other. Accepts a scalar (same everywhere, for a single-band run)
+# or explicit per-band values.
+_STRESS_BAND_DEFAULTS = {"large": 10.0, "mid": 25.0, "small": 50.0}
+
+
+def _parse_stress_spread(spec: str) -> dict:
+    """'' | '0' -> off. '40' -> 40 for every band. 'large=10,small=50' -> per band.
+
+    An unknown band name is an ERROR, not a silent skip: a typo like 'smal=50' would otherwise
+    leave the small band running unstressed while the operator believed it was covered.
+    """
+    spec = (spec or "").strip()
+    if not spec:
+        return {}
+    if "=" not in spec:
+        try:
+            v = float(spec)
+        except ValueError:
+            raise SystemExit(f"--stress-spread-bps: expected a number or band=value pairs, got {spec!r}")
+        return {} if v <= 0 else {b: v for b in _STRESS_BAND_DEFAULTS}
+    out = {}
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        band, _, val = part.partition("=")
+        band = band.strip().lower()
+        if band not in _STRESS_BAND_DEFAULTS:
+            raise SystemExit(f"--stress-spread-bps: unknown band {band!r}; "
+                             f"expected one of {sorted(_STRESS_BAND_DEFAULTS)}")
+        try:
+            out[band] = float(val)
+        except ValueError:
+            raise SystemExit(f"--stress-spread-bps: {band}={val!r} is not a number")
+    return {b: v for b, v in out.items() if v > 0}
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--bands", default="large,mid,small")
@@ -232,6 +272,16 @@ def main() -> int:
                          "fitness/return, so no single trade contributes more than this share of "
                          "total return (a trade can pass --profit-cap-pct yet still be 60%% of the "
                          "book). Default 25. Pass 0 to disable.")
+    ap.add_argument("--stress-spread-bps", default="",
+                    help="Rank every genome on the WORSE of its fitness at the modelled "
+                         "spread and at spread + this many bps. Selects against configs "
+                         "whose edge only survives the assumed cost. Empty/0 = off "
+                         "(default). PER BAND: 'large=10,mid=25,small=50' -- realised "
+                         "spreads differ ~10x across bands, so one level for the whole grid "
+                         "is either far too harsh on large or far too soft on small. A bare "
+                         "number applies to every band (fine for a single-band run). "
+                         "Suggested: 'large=10,mid=25,small=50'. NOTE: a non-zero value "
+                         "RESCALES fitness -- do not mix levels within one grid.")
     ap.add_argument("--fitness-trade-scale", action="store_true",
                     help="Scale each trial's fitness by min(avg_trades_per_year, cap)/100 so "
                          "statistically thin (few-trade) configs are down-weighted (stops a 16-trade "
@@ -263,6 +313,16 @@ def main() -> int:
                 f"as already-completed. Example: --name-suffix goal2020-{token}")
 
     bands = [b.strip() for b in args.bands.split(",") if b.strip()]
+    stress_by_band = _parse_stress_spread(args.stress_spread_bps)
+    if stress_by_band:
+        print(f"spread stress (bps, per band): "
+              f"{ {b: stress_by_band.get(b, 0.0) for b in bands} }")
+        _un = [b for b in bands if b not in stress_by_band]
+        if _un:
+            # Loud: an unstressed band inside a stressed grid is scored on a DIFFERENT
+            # fitness scale, so its jobs cannot be ranked against the rest.
+            print(f"WARNING: bands {_un} have NO stress -- their fitness is on a "
+                  f"different scale from the stressed bands and is not comparable.")
     strategies = [s.strip() for s in args.strategies.split(",") if s.strip()]
     exe = os.path.join(os.path.dirname(sys.executable), "ba2-test.exe")
     if not os.path.exists(exe):
@@ -326,6 +386,9 @@ def main() -> int:
             cmd += ["--profit-cap-pct", str(args.profit_cap_pct)]
         if args.profit_share_cap_pct and args.profit_share_cap_pct > 0:
             cmd += ["--profit-share-cap-pct", str(args.profit_share_cap_pct)]
+        _stress = stress_by_band.get(band, 0.0)
+        if _stress > 0:
+            cmd += ["--stress-spread-bps", str(_stress)]
         if args.fitness_trade_scale:
             cmd += ["--fitness-trade-scale",
                     "--fitness-trade-scale-cap", str(args.fitness_trade_scale_cap)]

@@ -14,6 +14,7 @@ win_rate, sortino_ratio, calmar_ratio, sqn, max_drawdown (all confirmed present)
 """
 import math
 from datetime import date, datetime
+from typing import Optional
 
 # Distinct from 0.0 (the exception fallback) so a no-trade config is never
 # confused with a crashed trial, and is always worse than any real config.
@@ -250,8 +251,16 @@ def assert_catalog_complete() -> None:
         raise AssertionError(f"METRICS_CATALOG does not cover fitness inputs: {sorted(missing)}")
 
 
-def compute_fitness(fitness_metric: str, results: dict) -> float:
+def compute_fitness(fitness_metric: str, results: dict,
+                    stress_spread_bps: float = 0.0) -> float:
     """Return the scalar fitness for a metric from a backtest results dict.
+
+    ``stress_spread_bps`` > 0 additionally scores the run as if the spread were that many bps
+    WIDER (see ``stressed_results``) and returns the MINIMUM of the two. Default 0.0 is exactly
+    the previous behaviour, byte for byte -- this is opt-in because it RESCALES every fitness,
+    so scores either side of it are not comparable (same trap as the 2026-08-04 dd_guard
+    change). The min() rather than the stressed value alone: stressing can only be a penalty,
+    never a way for a genome to score higher than it did at the real modelled cost.
 
     - None results or 0-trade runs return ZERO_TRADE_SENTINEL (distinct from 0.0).
     - A wiped-out account (results["account_wiped_out"]) returns WIPED_OUT_SENTINEL, ranked
@@ -281,7 +290,8 @@ def compute_fitness(fitness_metric: str, results: dict) -> float:
         # gate inside the metric already replaces it. The win-rate factor is NOT similarly
         # exclusive with CAR's own machinery (win rate isn't part of the CAR formula at all), so
         # it still applies via the shared _apply_win_rate_factor call below.
-        return _apply_win_rate_factor(_consistent_annual_return(results), results)
+        _fit = _apply_win_rate_factor(_consistent_annual_return(results), results)
+        return _min_with_stressed(_fit, fitness_metric, results, stress_spread_bps)
 
     key = _FITNESS_KEYS.get(metric)
     if key is None:
@@ -322,7 +332,8 @@ def compute_fitness(fitness_metric: str, results: dict) -> float:
         target = float(results.get("fitness_trade_scale_target") or 100.0)
         tpy = results.get("avg_trades_per_year") or 0.0
         val *= min(float(tpy), cap) / target
-    return _apply_win_rate_factor(val, results)
+    return _min_with_stressed(_apply_win_rate_factor(val, results),
+                              fitness_metric, results, stress_spread_bps)
 
 
 def _apply_win_rate_factor(val: float, results: dict) -> float:
@@ -342,6 +353,104 @@ def _apply_win_rate_factor(val: float, results: dict) -> float:
 # ---------------------------------------------------------------------------
 # consistent_annual_return ("car" / "goal")
 # ---------------------------------------------------------------------------
+def _min_with_stressed(base_fitness: float, fitness_metric: str, results: dict,
+                       stress_spread_bps: float) -> float:
+    """Re-score under a wider spread and keep the WORSE of the two.
+
+    A no-op (returns ``base_fitness`` unchanged) when the stress is off, when the run has no
+    usable trades, or when the base is already a sentinel -- a disqualified or wiped-out genome
+    must keep its sentinel rank rather than be swapped for an ordinary negative number.
+
+    Recurses ONCE with the stress disabled, so the stressed pass runs the identical metric code
+    (win-rate factor, trade scale, cap-awareness and all) rather than a parallel reimplementation
+    that could drift from it.
+    """
+    if stress_spread_bps <= 0:
+        # Fall back to the level the RUN was configured with (echoed into results by
+        # build_results). This is what makes the flag work everywhere without threading a new
+        # argument through the worker protocol, the remote client and the top-N re-run path:
+        # the config already crosses all of them.
+        stress_spread_bps = float(results.get("stress_spread_bps") or 0.0)
+    if stress_spread_bps <= 0:
+        return base_fitness
+    if base_fitness in (ZERO_TRADE_SENTINEL, LOW_TRADE_SENTINEL, WIPED_OUT_SENTINEL):
+        return base_fitness
+    stressed = stressed_results(results, stress_spread_bps)
+    if stressed is None:
+        return base_fitness
+    return min(base_fitness, compute_fitness(fitness_metric, stressed, 0.0))
+
+
+def stressed_results(results: dict, stress_spread_bps: float) -> Optional[dict]:
+    """A shallow copy of ``results`` re-scored as if the spread were ``stress_spread_bps`` WIDER.
+
+    WHY. A genome whose per-trade edge barely clears the assumed spread looks excellent at the
+    modelled cost and collapses at a slightly higher one. Measured across 90 top-N runs, the
+    worst offender went from +43.7%/yr to -12.4%/yr on +40bps while a low-turnover run moved
+    11.4 -> 8.3. Ranking on the stressed score selects against that fragility directly, instead
+    of via a proxy like average win size (which correlates at -0.85 but misses turnover).
+
+    WHAT IT IS NOT. This does NOT re-simulate. ``apply_spread_cost`` deducts a round-trip cost
+    from each trade's equity-relative pnl_pct and the equity path is rebuilt from those; WHICH
+    trades happened is unchanged. At a genuinely wider spread some marginal winners would have
+    stopped out instead and sizing would have shifted, so this UNDERSTATES the damage. That is
+    the conservative direction for a robustness screen, and it is what makes it cost ~1ms rather
+    than another full backtest -- but it is not a substitute for re-running a finalist for real.
+
+    Returns None when the run has no usable trades, so the caller can fall back to the
+    unstressed fitness rather than score a genome on an empty path.
+    """
+    trades = results.get("trades") or []
+    if not trades or stress_spread_bps <= 0:
+        return None
+    from app.services.backtest.monte_carlo import (
+        _path_metrics, apply_spread_cost, equity_path_from_trade_pcts,
+    )
+
+    initial = float(results.get("initial_capital") or 0.0)
+    if initial <= 0:
+        eq = results.get("equity_curve") or []
+        initial = float(eq[0].get("equity")) if eq and eq[0].get("equity") else 0.0
+    if initial <= 0:
+        return None
+
+    years = _years_spanned_by_curve(results.get("equity_curve"))
+    adjusted = apply_spread_cost(trades, initial, float(stress_spread_bps))
+    path = equity_path_from_trade_pcts(adjusted, initial)
+    metrics = _path_metrics(path, initial, years) if years > 0 else None
+    if not metrics:
+        return None
+
+    out = dict(results)
+    # MUST clear the request, or the inner compute_fitness reads it back off this copy and
+    # stresses again -- unbounded recursion. Passing 0.0 explicitly is not enough, because the
+    # config-echo fallback in _min_with_stressed consults the dict when the argument is 0.
+    out["stress_spread_bps"] = 0.0
+    car = metrics.get("annualized_return")
+    out["annualized_return"] = car
+    # Overwrite BOTH: _consistent_annual_return prefers the adjusted figure whenever a profit
+    # cap is active, so leaving the adjusted key at its unstressed value would silently ignore
+    # the stress on every capped run -- i.e. on the whole grid.
+    if "adjusted_annualized_return" in out:
+        out["adjusted_annualized_return"] = car
+    out["max_drawdown"] = metrics.get("max_drawdown")
+
+    # Synthesize a dated curve at trade exits so the CONSISTENCY term is measured on the
+    # stressed path too. Sparser than the real per-bar curve, but _calendar_year_returns only
+    # reads the last point of each calendar year, which this preserves. Falls back to the
+    # unstressed curve if exit times are unavailable.
+    pts = []
+    for t, equity in zip(trades, path[1:]):
+        ts = t.get("exit_time") or t.get("entry_time")
+        if ts is None:
+            pts = []
+            break
+        pts.append({"date": ts, "equity": equity})
+    if pts:
+        out["equity_curve"] = pts
+    return out
+
+
 def _consistent_annual_return(results: dict) -> float:
     """Fitness aligned with the trading goal: ~30%/yr EVERY year, ~30 trades/yr, dd <= 20% ok.
 
