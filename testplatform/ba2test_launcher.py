@@ -3210,11 +3210,16 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
             if dedup_key in seen:
                 continue
             seen.add(dedup_key)
-            ranked.append((r["params"], r.get("key")))
+            # Carry the FITNESS, not just the params. It is the only record of how the GA
+            # actually ranked these rows -- the persisted metric columns are its inputs, and
+            # re-deriving the order from any one of them drops the other three terms.
+            ranked.append((r["params"], r.get("key"), fit))
             if len(ranked) >= n:
                 break
         if not ranked and opt.best_params:
-            ranked = [(opt.best_params, None)]  # no trial key known -> always falls back to re-run
+            # No trial key known -> always falls back to re-run. best_fitness is the score of
+            # exactly this genome (it is what made it `best`), so it is the right value here.
+            ranked = [(opt.best_params, None, opt.best_fitness)]
 
         # 1) Build every re-run's spec in the MASTER (cheap: decode + config + display params).
         #    Store the raw optimized genes (for the "Optimized Parameters" display) AND the CONCRETE
@@ -3222,7 +3227,7 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
         #    restore the optimized conditions directly. Keys mirror what _derive_export_payload reads.
         ready = []  # (rank, trial_cfg, strategy_params, full_results) -- no re-run needed
         specs = []  # (rank, trial_cfg, strategy_params) -- must be re-run (existing path)
-        for rank, (params, trial_key_) in enumerate(ranked, start=1):
+        for rank, (params, trial_key_, ga_fitness_) in enumerate(ranked, start=1):
             decoded = decode_params(strat, params)
             trial_cfg = _build_daily_trial_config(bt_block, decoded, hoisted)
             trial_cfg["name"] = f"TOP{rank}-{opt.name or expert}"
@@ -3230,6 +3235,9 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
             # for post-mortem inspection — the GA trials run RAM-only for speed. The path is keyed
             # by the trial's UNIQUE backtest_id, so concurrent re-runs never collide.
             trial_cfg["persist_trading_db"] = True
+            # Carried onto the persisted row (migration 030) so the GA ranking is a stored
+            # fact rather than something re-derived from one component metric.
+            trial_cfg["ga_fitness"] = ga_fitness_
             strategy_params = dict(params)
             if _fixed_settings:
                 strategy_params["expertFixedSettings"] = _fixed_settings
@@ -3279,6 +3287,11 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
             )
             db.add(bt); db.commit(); db.refresh(bt)
             _persist_results(db, bt, out["results"])
+            # The GA's composite score for this genome (migration 030). It comes from the
+            # OPTIMIZER, not the engine, so _persist_results (which maps `results`) cannot
+            # supply it. Without this the TOP<n> name prefix is the only record of the ranking.
+            if trial_cfg.get("ga_fitness") is not None:
+                bt.ga_fitness = float(trial_cfg["ga_fitness"])
             bt.status = "completed"; bt.completed_at = _dt.now()
             bt.is_saved = True  # top performers of a job are kept
             db.commit()

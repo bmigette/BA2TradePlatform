@@ -1083,6 +1083,9 @@ def _persist_results(db: Any, bt: Backtest, results: Dict[str, Any]) -> None:
     # Return metrics
     bt.total_return = results["total_return"]
     bt.adjusted_total_return = results.get("adjusted_total_return")
+    # The GA's composite score, if this row came from an optimizer top-N persist. It arrives on
+    # the CONFIG (the optimizer knows it), not in `results` (the engine does not compute it), so
+    # it is set by the caller below rather than mapped here.
     bt.annualized_return = results.get("annualized_return")
     bt.buy_hold_return = results.get("buy_hold_return")
 

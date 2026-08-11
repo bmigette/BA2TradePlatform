@@ -128,6 +128,12 @@ class Backtest(Base):
     # Total return % with each trade's gain capped at profit_cap_pct of its cost basis (so one
     # lucky mega-winner can't dominate). NULL when the run had no cap; raw total_return is kept.
     adjusted_total_return = Column(Float, nullable=True)
+    # The GA's composite score for this genome, carried from the optimizer's all_results when a
+    # top-N row is persisted (migration 030). NULL for manual runs and pre-030 rows. The metric
+    # columns below are its INPUTS, not the score: consistent_annual_return multiplies four
+    # terms, so re-deriving the ranking from any single one (usually annualized_return) drops
+    # the other three and can invert the order. Store it so TOP-N ordering is checkable.
+    ga_fitness = Column(Float, nullable=True)
     sharpe_ratio = Column(Float, nullable=True)
     max_drawdown = Column(Float, nullable=True)
     win_rate = Column(Float, nullable=True)
@@ -223,6 +229,7 @@ class Backtest(Base):
             "status": self.status,
             "totalReturn": self.total_return,
             "adjustedTotalReturn": self.adjusted_total_return,
+            "gaFitness": self.ga_fitness,
             "sharpeRatio": self.sharpe_ratio,
             "maxDrawdown": self.max_drawdown,
             "winRate": self.win_rate,
@@ -283,6 +290,7 @@ class Backtest(Base):
             "drawdownCurve": drawdown_curve,
             "totalReturn": self.total_return,
             "adjustedTotalReturn": self.adjusted_total_return,
+            "gaFitness": self.ga_fitness,
             "sharpeRatio": self.sharpe_ratio,
             "maxDrawdown": self.max_drawdown,
             "winRate": self.win_rate,
