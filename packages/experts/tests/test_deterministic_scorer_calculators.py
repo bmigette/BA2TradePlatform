@@ -55,11 +55,28 @@ def test_atr_positive_and_donchian_bounds():
 
 
 def test_technical_score_uptrend_positive():
-    df = _trend_df(n=300, drift=0.0015)
-    out = T.technical_score(df, {})
-    assert -1.0 <= out["score"] <= 1.0
-    assert out["score"] > 0.2  # strong uptrend should score clearly positive
-    assert out["n_signals"] >= 3
+    """An uptrend scores positive; a CLEAN one scores strongly.
+
+    Re-derived 2026-08-11 with the momentum horizon fix. This asserted > 0.2 on the default
+    seed-7 path, and only passed because vol_adjusted_momentum was saturating: that path's
+    vol-adjusted momentum is 0.597 (~0.6 sigma), which the old daily-sigma denominator inflated
+    to 9.1 and tanh pinned at 1.0, contributing a full 0.45. Unsaturated it contributes 0.148,
+    and the composite is 0.134 -- still positive, but modest, which is the honest reading of a
+    0.6-sigma drift.
+
+    That path also has ADX 22, i.e. NOT trending by the module's own gate, so adx_rsi_boost
+    doubles the mean-reversion weight to 0.30 and RSI 69.6 subtracts 0.225 -- by design. Testing
+    "strong uptrend" on a path the gate classifies as non-trending was never measuring what the
+    name claims, so the strong assertion moves to a path that is unambiguous (ADX 47.7).
+    """
+    modest = T.technical_score(_trend_df(n=300, drift=0.0015), {})
+    assert -1.0 <= modest["score"] <= 1.0
+    assert modest["score"] > 0.0, "a rising series must not score negative"
+    assert modest["n_signals"] >= 3
+
+    clean = T.technical_score(_trend_df(n=300, drift=0.0015, seed=3), {})
+    assert clean["adx"] > 25.0, "seed 3 is the trending path this assertion needs"
+    assert clean["score"] > 0.2, "an unambiguous uptrend must score clearly positive"
 
 
 def test_technical_score_downtrend_negative():
