@@ -15,14 +15,17 @@ import numpy as np
 import pandas as pd
 
 # Default regime weights (sum 1.0; renormalized when inputs are missing)
+# Default regime weights over the inputs that are ACTUALLY FED (2026-08-11). The old
+# table also carried breadth (0.20) and pmi (0.10); both are permanently None -- breadth
+# needs screener integration, and ISM's NAPM no longer exists on FRED -- so their weight
+# only ever got renormalized away. These are the old values rescaled by 1/0.70, which
+# preserves every surviving ratio exactly while summing to 1.0 again.
 DEF_MW = {
-    "trend_index": 0.30,
-    "breadth": 0.20,
-    "vix": 0.15,
-    "credit": 0.10,
-    "yield_curve": 0.10,
-    "pmi": 0.10,
-    "sahm": 0.05,
+    "trend_index": 0.43,
+    "vix": 0.21,
+    "credit": 0.14,
+    "yield_curve": 0.14,
+    "sahm": 0.08,
 }
 DEF_VIX_CALM = 15.0
 DEF_VIX_STRESS = 30.0

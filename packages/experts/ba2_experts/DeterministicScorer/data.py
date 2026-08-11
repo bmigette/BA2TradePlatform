@@ -276,60 +276,53 @@ def _observation_series(rows: Any) -> Optional[pd.Series]:
 
 
 def fetch_macro_series(providers, as_of: Optional[datetime]) -> Dict[str, Any]:
-    """Best-effort macro inputs from the macro provider (FRED).
+    """Point-in-time macro inputs, read from the FRED disk cache.
 
-    Returns SERIES (``*_series``) for every history-based input plus the scalar
-    latest reading where a level is what the calculator wants (VIX, PMI). Any
-    failure degrades that one input to None and the regime composite
-    renormalizes around what IS available.
+    Deliberately does NOT go through the ProviderBundle. This mirrors the analyst path
+    above (``fetch_grades_history`` calls a module-level cached fetcher directly): the
+    macro store is a flat per-series file, not a provider, and routing it through the
+    bundle would mean inventing a bundle method whose only implementation reads those
+    same files.
+
+    HISTORY. Until 2026-08-11 this read ``providers.macro()`` behind a
+    ``hasattr`` guard. No bundle has ever defined ``macro()``, so the guard was always
+    False and every input here returned None -- in live AND backtest. The regime
+    composite renormalized onto its one surviving input and "macro" silently became
+    ``+1 if SPY > SMA200 else -1``. The guard is gone: a missing series now raises out
+    of ``get_series_as_of`` rather than degrading to a plausible-looking zero.
+
+    NO LOOKAHEAD. ``get_series_as_of`` cuts revised monthly series (UNRATE) on their
+    true first-publication date, so a bar on 2024-01-31 cannot see January's
+    unemployment rate -- it was not published until 2024-02-02.
+
+    There is no PMI input: ISM's NAPM no longer exists on FRED and every free
+    stand-in is scaled differently from the 50-boundary ``pmi_score`` expects. See
+    ``ba2_providers.macro.fred_series.SERIES_SPEC``.
     """
-    out: Dict[str, Any] = {"vix": None, "pmi": None,
-                           "unrate_series": None, "spread_10y3m_series": None,
-                           "oas_series": None}
-    macro = providers.macro() if hasattr(providers, "macro") else None
-    if macro is None:
-        return out
-    ref = as_of if as_of is not None else _utcnow()
-    # 3y+ of history: the credit z-score wants ~756 obs, Sahm wants 15 months.
-    start = (ref - timedelta(days=1200)).date().isoformat()
-    end = ref.date().isoformat()
+    from ba2_providers.macro import fred_series
+
+    out: Dict[str, Any] = {"vix": None, "unrate_series": None,
+                           "spread_10y3m_series": None, "oas_series": None}
+
+    # str(): as_of may be a datetime (engine) or an ISO string (tools/tests), and
+    # get_series_as_of accepts both -- the memo key must not care which.
+    _key_suffix = str(as_of) if as_of is not None else "live"
+
+    def _series(series_id: str):
+        return _MACRO_CACHE.get_or_call(
+            f"{series_id}__{_key_suffix}",
+            lambda: fred_series.get_series_as_of(series_id, as_of))
 
     try:
-        ind = macro.get_economic_indicators(start_date=start, end_date=end)
-        series = ind.get("series", ind) if isinstance(ind, dict) else {}
-
-        def rows_for(*names):
-            for n in names:
-                rows = series.get(n) or series.get(n.lower())
-                if rows:
-                    return rows
-            return None
-
-        vix = _observation_series(rows_for("VIXCLS", "vix"))
-        pmi = _observation_series(rows_for("NAPM", "pmi", "ISM"))
-        out["vix"] = float(vix.iloc[-1]) if vix is not None and len(vix) else None
-        out["pmi"] = float(pmi.iloc[-1]) if pmi is not None and len(pmi) else None
-        out["unrate_series"] = _observation_series(rows_for("UNRATE", "unemployment"))
-        out["oas_series"] = _observation_series(
-            rows_for("BAMLH0A0HYM2", "hy_oas", "oas"))
+        vix = _series("VIXCLS")
+        out["vix"] = float(vix.iloc[-1]) if len(vix) else None
+        out["unrate_series"] = _series("UNRATE")
+        # Credit: Moody's Baa less 10y, NOT the ICE HY OAS the key name still reflects
+        # -- FRED serves ICE indices on a rolling ~3y licence. credit_score z-scores
+        # its input, so the substitution is unit-safe.
+        out["oas_series"] = _series("BAA10Y")
+        out["spread_10y3m_series"] = _series("T10Y3M")
     except Exception as e:              # noqa: BLE001 - hermetic/defect errors re-raise
         absorb_if_benign(e)
-        logger.warning("DeterministicScorer macro indicators failed: %s", e)
-
-    try:
-        yc = macro.get_yield_curve(start_date=start, end_date=end)
-        if isinstance(yc, dict):
-            ten = _observation_series(yc.get("10y") or yc.get("10Y"))
-            three = _observation_series(yc.get("3m") or yc.get("3M"))
-            if ten is not None and three is not None:
-                n = min(len(ten), len(three))
-                if n:
-                    out["spread_10y3m_series"] = (
-                        ten.iloc[-n:].reset_index(drop=True)
-                        - three.iloc[-n:].reset_index(drop=True))
-            elif isinstance(yc.get("spread_10y3m"), (list, tuple)):
-                out["spread_10y3m_series"] = _observation_series(yc["spread_10y3m"])
-    except Exception as e:              # noqa: BLE001 - hermetic/defect errors re-raise
-        absorb_if_benign(e)
-        logger.warning("DeterministicScorer yield curve failed: %s", e)
+        logger.warning("DeterministicScorer macro series failed: %s", e)
     return out

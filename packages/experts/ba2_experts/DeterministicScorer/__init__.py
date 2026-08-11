@@ -42,7 +42,7 @@ from .fundamental import (fundamental_score, piotroski_f_score,
 from .analyst import (analyst_section_score, DEF_AW_GRADES, DEF_AW_TARGETS,
                       DEF_TARGET_WINDOW_DAYS, DEF_TARGET_SCALE, DEF_MIN_TARGETS)
 from ba2_experts.earnings_surprise import pead_score
-from .macro import (trend_score, vix_score, pmi_score, sahm_score, credit_score,
+from .macro import (trend_score, vix_score, sahm_score, credit_score,
                     yield_curve_score, regime_composite, DEF_MW, DEF_YC_SCALE,
                     DEF_M_FLOOR, DEF_HARD_RISKOFF)
 from .combine import (final_score, schmitt_trigger, atr_target_price,
@@ -215,16 +215,12 @@ class DeterministicScorer(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExper
             # ---- macro sub-weights ----
             "mw_trend_index": {"type": "float", "required": False, "default": DEF_MW["trend_index"],
                                "description": "Macro weight: index trend vs SMA200"},
-            "mw_breadth": {"type": "float", "required": False, "default": DEF_MW["breadth"],
-                           "description": "Macro weight: breadth (% universe above SMA200)"},
             "mw_vix": {"type": "float", "required": False, "default": DEF_MW["vix"],
                        "description": "Macro weight: VIX level"},
             "mw_credit": {"type": "float", "required": False, "default": DEF_MW["credit"],
                           "description": "Macro weight: HY credit OAS"},
             "mw_yield_curve": {"type": "float", "required": False, "default": DEF_MW["yield_curve"],
                                "description": "Macro weight: 10y-3m yield curve"},
-            "mw_pmi": {"type": "float", "required": False, "default": DEF_MW["pmi"],
-                       "description": "Macro weight: ISM/NAPM"},
             "mw_sahm": {"type": "float", "required": False, "default": DEF_MW["sahm"],
                         "description": "Macro weight: Sahm rule unemployment"},
             "vix_calm": {"type": "float", "required": False, "default": 15.0,
@@ -265,8 +261,8 @@ class DeterministicScorer(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExper
         "analyst_window_days", "analyst_recency_halflife_days",
         "aw_grades", "aw_targets", "analyst_target_window_days",
         "analyst_target_scale", "analyst_min_targets",
-        "mw_trend_index", "mw_breadth", "mw_vix", "mw_credit",
-        "mw_yield_curve", "mw_pmi", "mw_sahm",
+        "mw_trend_index", "mw_vix", "mw_credit",
+        "mw_yield_curve", "mw_sahm",
         "vix_calm", "vix_stress", "yc_scale", "index_symbol",
         "atr_period", "k_stop", "k_target", "target_from_score",
         "min_history_days",
@@ -604,19 +600,29 @@ class DeterministicScorer(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExper
         # NOTE: the previous guard here was `isinstance(x, object)`, which is
         # True for EVERY value including None, so the fallback branch was
         # unreachable and the input resolved to a key data.py never wrote.
+        # Five inputs, all fed by the FRED disk cache since 2026-08-11. Before that
+        # only trend_index resolved (no bundle defines macro(), so every FRED input was
+        # None) and this composite silently reduced to "+1 if SPY > SMA200 else -1".
+        #
+        # breadth and pmi are ABSENT ON PURPOSE, not forgotten:
+        #   breadth -- needs screener integration (still v2)
+        #   pmi     -- ISM's NAPM no longer exists on FRED, and pmi_score is hard-wired
+        #              to the 50 boundary, so any differently-scaled stand-in would pin
+        #              the input at a constant.
+        # Their mw_* genes are gone too; a weight on an input that never arrives is
+        # search width spent on nothing.
         inputs = {
             "trend_index": trend_score(idx, int(settings.get("sma_trend_period", 200))),
-            "breadth": None,  # v2: universe breadth (needs screener integration)
             "vix": vix_score(mi.get("vix"), float(settings.get("vix_calm", 15.0)),
                              float(settings.get("vix_stress", 30.0))),
             "credit": credit_score(mi.get("oas_series")),
             "yield_curve": yield_curve_score(
                 mi.get("spread_10y3m_series"),
                 scale=float(settings.get("yc_scale", DEF_YC_SCALE))),
-            "pmi": pmi_score(mi.get("pmi")),
             "sahm": sahm_score(mi.get("unrate_series")),
         }
-        weights = {k: float(settings.get(f"mw_{k}", DEF_MW[k])) for k in DEF_MW}
+        weights = {k: float(settings.get(f"mw_{k}", DEF_MW[k]))
+                   for k in DEF_MW if k in inputs}
         return regime_composite(inputs, weights)
 
     # ---------------------------------------------------------------- details
