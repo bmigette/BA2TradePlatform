@@ -18,8 +18,10 @@ from .GoogleNewsProvider import GoogleNewsProvider
 from .FMPNewsProvider import FMPNewsProvider
 from .FinnhubNewsProvider import FinnhubNewsProvider
 from .LocalFilesNewsProvider import LocalFilesNewsProvider
+from . import store
 
 __all__ = [
+    "store",
     "AlpacaNewsProvider",
     "AlphaVantageNewsProvider",
     "GoogleNewsProvider",
