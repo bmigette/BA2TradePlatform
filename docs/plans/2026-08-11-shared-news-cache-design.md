@@ -48,6 +48,44 @@ Providers: `fmp` 122,473, `finnhub` 8,145, `alphavantage` 990.
 **Consequence:** a news-enabled grid can only ever run the **large** cap band. Mid and small
 have zero coverage. The cache is frozen at 2026-03-02, so live must fetch forward from there.
 
+#### Correction (measured 2026-08-11, at migration time)
+
+Per-symbol coverage is far more uneven than "26 tickers, 2019+" suggests, and two of the
+assumptions above were wrong:
+
+| Symbol | Rows | Range | Note |
+|---|---|---|---|
+| GOOG | 19,576 | 2011-02 → 2026-03 | densest |
+| NVDA | 19,092 | 2017-11 → 2026-03 | densest with a modern start |
+| **MSFT** | 2,757 | **2024-11 → 2025-12** | **13 months only** |
+| **AAPL** | 7,542 | 2021-04 → 2026-02 | only **3,573 scored** |
+| LIN | 886 | 2013-07 → 2026-03 | thinnest |
+
+§9 proposed "NVDA or MSFT, both 2022+" as the acceptance symbol. **MSFT does not qualify** —
+its window starts 2024-11 and ends 2025-12. Use **NVDA** (or GOOG). AAPL additionally holds
+most of the 3,478 unscored rows.
+
+**The blobs are much smaller than the archive suggests.** `cache.rar` is 963 MB, but the news
+tree is only **122.8 MB uncompressed across 132,237 files** — median **344 bytes**, p90 956 B,
+and only 6,721 files over 4 KB. The remaining ~4 GB is `cache/jobs` dataset CSVs. Two
+consequences:
+
+- The archive is **solid**, so extracting only `cache/news/**` still requires decompressing
+  through the job CSVs first. Budget minutes, not seconds.
+- `content_fetched=1` for only **30,584 of 131,608 rows (23%)**. The other 77% never had a
+  full-article scrape — but their blobs are *not* empty: they hold the vendor summary
+  (mean 634 chars, vs 195 for the "fetched" ones, which are often truncated ledes).
+
+So the text substrate is **headline + summary**, roughly 250–650 characters, not article
+bodies. That is a legitimate sentiment substrate and it is what FinBERT already scored, but it
+caps what any model can extract and it makes the §7 bake-off far cheaper than the estimated
+30–60 min/model.
+
+**The legacy probabilities are one-hot.** Exactly zero rows have more than one non-zero class:
+a `positive` row is `pos=0.92, neu=0, neg=0`. The stored numbers are *label + confidence*, not
+a distribution. `pos − neg` still behaves correctly (neutral → 0), but any comparison between
+`finbert-legacy` and a real re-score must know the two are not the same kind of number.
+
 ### Existing sentiment is not one model
 
 128,130 rows carry labels in **two incompatible schemas**:
