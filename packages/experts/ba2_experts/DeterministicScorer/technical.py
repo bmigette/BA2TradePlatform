@@ -80,12 +80,32 @@ def vol_adjusted_momentum(closes: pd.Series, lookback: int = DEF_MOM_LOOKBACK,
                           skip: int = DEF_MOM_SKIP,
                           vol_window: int = DEF_VOL_WINDOW) -> Optional[float]:
     """Momentum scaled by realized vol - removes most momentum-crash risk and
-    makes scores comparable across low/high-vol names."""
+    makes scores comparable across low/high-vol names.
+
+    THE VOL MUST MATCH THE RETURN'S HORIZON. ``momentum_12_1`` is a TOTAL RETURN over
+    ``lookback - skip`` trading days (~231 by default), while ``realized_vol_daily`` is a ONE-DAY
+    sigma. Dividing one by the other mixes units and inflates the result by sqrt(horizon) ~ 15x.
+
+    Measured 2026-08-11 over 160 symbol-dates (20 large/mid caps, 8 quarter-ends 2021-2024) with
+    the unscaled denominator: median 8.62, p95 53.6, max 108.9. Those go through
+    ``tanh(x / scale_momvol)`` with scale 1.5 -- the value the module docstring calls "vol-adj
+    momentum units" -- so 83% of observations came out at |1.0|. The single heaviest component
+    (weight 0.45) was therefore not a score at all but the SIGN of momentum, carrying no ranking
+    information, while the other three legs varied normally (sd 0.55-0.66).
+
+    Scaling sigma to the same horizon restores the range the constant was written for: median
+    0.57, p95 3.53, and saturation falls to 4%. This is a units fix, not a re-tuning -- the 1.5
+    scale was always correct for the intended quantity.
+    """
     mom = momentum_12_1(closes, lookback, skip)
     sigma = realized_vol_daily(closes, vol_window)
     if mom is None or sigma is None:
         return None
-    return mom / sigma
+    horizon = max(int(lookback) - int(skip), 1)
+    sigma_h = sigma * math.sqrt(horizon)
+    if sigma_h <= 0 or not np.isfinite(sigma_h):
+        return None
+    return mom / sigma_h
 
 
 def distance_to_sma(closes: pd.Series, period: int = DEF_SMA_TREND) -> Optional[float]:
