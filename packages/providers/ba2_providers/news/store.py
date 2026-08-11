@@ -150,6 +150,28 @@ def write_scored(symbol: str, df: pd.DataFrame) -> int:
     return len(df)
 
 
+def upsert_scored(symbol: str, df: pd.DataFrame) -> int:
+    """Merge one model's rows into a symbol's scored file, leaving other models intact.
+
+    ``write_scored`` replaces the whole file, which would delete ``finbert-legacy`` the
+    first time a challenger is scored -- and the point of the ``model`` column is that
+    models COEXIST so they can be compared on the same articles. This replaces only the
+    rows whose model matches, so re-scoring is idempotent and never destructive.
+    """
+    models = set(df["model"].dropna().unique())
+    if len(models) != 1:
+        raise ValueError(f"upsert_scored expects exactly one model per call, got {models}")
+    model = models.pop()
+
+    if os.path.exists(scored_path(symbol)):
+        existing = pd.read_parquet(scored_path(symbol))
+        keep = existing[existing["model"] != model]
+        merged = pd.concat([keep, df], ignore_index=True)
+    else:
+        merged = df
+    return write_scored(symbol, merged)
+
+
 def read_raw(symbol: str) -> pd.DataFrame:
     """Read the raw text tier. Scoring and export ONLY -- never an expert or a backtest.
 
