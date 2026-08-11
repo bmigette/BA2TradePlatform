@@ -127,6 +127,18 @@ SPREAD_BPS_LARGE="${SPREAD_BPS_LARGE:-3}"
 SPREAD_BPS_MID="${SPREAD_BPS_MID:-10}"
 SPREAD_BPS_SMALL="${SPREAD_BPS_SMALL:-40}"
 
+# Spread STRESS, expressed as a MULTIPLE of each band's own assumed spread rather than an
+# absolute bps figure. 0 = off (default, and the pre-existing behaviour byte for byte).
+# 1.0 = "also score every genome as if the spread were DOUBLE this band's assumption, and rank
+# on the worse of the two", which directly answers the caveat three comments above: instead of
+# treating a winner as conditional on an unmeasured number and checking it afterwards, the
+# search itself refuses to select an edge that only exists at the assumed cost.
+#
+# A multiple, not per-band numbers, because the bands' spreads differ ~13x (3 vs 40). A single
+# absolute stress would be 13x harsher on large than on small; and hand-written per-band values
+# would silently desync the moment SPREAD_BPS_* changed. This cannot drift -- it is derived.
+STRESS_SPREAD_MULT="${STRESS_SPREAD_MULT:-0}"
+
 spread_for() {
   case "$1" in
     large) echo "$SPREAD_BPS_LARGE" ;;
@@ -143,8 +155,13 @@ run_matrix() {                      # $1=mode  $2=name-suffix  $3...=extra drive
   local mode="$1" suffix="$2"; shift 2
   for band in large mid small; do
     local sp; sp="$(spread_for "$band")"
-    echo; echo "=== $mode / $band  (spread ${sp} bps round-trip)  $(date)"
-    "$PY" "$DRIVER" "${COMMON[@]}"       --sizing-mode "$mode"       --bands "$band"       --spread-bps "$sp"       --name-suffix="$suffix"       "$@"
+    local stress_args=()
+    local st; st="$(awk -v s="$sp" -v m="$STRESS_SPREAD_MULT" 'BEGIN{printf "%.6g", s*m}')"
+    if awk -v v="$st" 'BEGIN{exit !(v>0)}'; then
+      stress_args=(--stress-spread-bps "$st")
+    fi
+    echo; echo "=== $mode / $band  (spread ${sp} bps round-trip${st:+, stress +${st}})  $(date)"
+    "$PY" "$DRIVER" "${COMMON[@]}"       --sizing-mode "$mode"       --bands "$band"       --spread-bps "$sp"       "${stress_args[@]}"       --name-suffix="$suffix"       "$@"
     echo "=== $mode / $band  done rc=$? $(date)"
   done
 }
