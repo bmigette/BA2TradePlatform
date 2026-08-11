@@ -378,6 +378,153 @@ The cheap way to settle it is to test the **actual** §5 aggregation (half-life 
 floor) on a larger sample with `distilroberta-news` alone — ~1 h at 9 rows/s — rather than
 to conclude from a proxy.
 
+### 7c. SUPERSEDES 7b — at intraday resolution the signal is real
+
+§7b's negative result was **an artefact of daily bars**, exactly as its caveat 1 warned.
+Matching a 09:00 article to `close[t] → close[t+1]` discards the entire same-session
+reaction. 5-minute bars exist in cache for every covered symbol (2011→2026-06), so the
+event can be measured directly instead of inferred from a daily average.
+
+`tools/news_event_study.py` matches each article to the first 5-min bar **strictly after**
+its publication timestamp and measures forward returns from that bar's open. It needs no
+scoring — it reads the `finbert-legacy` scores already migrated — so it runs in minutes
+over **122,084 articles across all 26 symbols**, 2019–2026.
+
+**All news (122,084 articles):**
+
+| horizon | IC | t | pos_bp | neu_bp | neg_bp | pos−neg | t |
+|---|---|---|---|---|---|---|---|
+| 30m | +0.0133 | +2.59 | −1.53 | −1.13 | −8.45 | +6.92 | +6.26 |
+| 1h | +0.0119 | +2.33 | −1.08 | −0.50 | −6.98 | +5.90 | +4.58 |
+| 1d | +0.0146 | +2.27 | +5.40 | +7.17 | −2.96 | +8.36 | +3.40 |
+
+**Tradable within the hour (56,849 articles, median gap 4 min):**
+
+| horizon | IC | t | pos_bp | neu_bp | neg_bp | pos−neg | t |
+|---|---|---|---|---|---|---|---|
+| 5m | +0.0015 | +0.21 | +0.09 | −0.13 | −1.09 | +1.18 | +1.53 |
+| 30m | +0.0069 | +1.28 | +1.24 | +0.39 | −3.41 | +4.65 | +3.56 |
+| 1h | +0.0088 | +1.50 | +2.88 | +1.04 | −2.24 | +5.12 | +3.14 |
+| 1d | +0.0142 | +2.08 | +12.07 | +6.86 | −5.73 | **+17.79** | **+4.89** |
+
+Three findings:
+
+1. **The first 5–15 minutes are already priced.** t ≈ 0.2, spread ≈ 1.2 bp. There is no
+   immediate-reaction edge to capture, which is reassuring — a large one would have
+   implied a timestamp bug.
+2. **The edge accrues over hours, not seconds**, building 4.65 → 17.79 bp from 30 min to
+   one day on the tradable subset.
+3. **Timing changes the SHAPE of the signal, not just its size.** On the tradable subset
+   both sides work (pos +12.07 vs neu +6.86 at 1d). On the full sample positive news earns
+   nothing — at 1d it *underperforms neutral*, +5.40 vs +7.17 — while negative news still
+   falls. Only **47%** of articles are tradable within an hour; the rest publish outside
+   market hours, and by the next open the good news is fully priced while the bad news
+   keeps drifting.
+
+**Implication for §5 — the section must not be symmetric.** DeterministicScorer decides on
+daily bars: it cannot act four minutes after a headline, so it lives in the *full-sample*
+regime, where the entire edge is on the negative side. A symmetric `w_news` would spend
+half its GA range on a half of the signal that does not exist for this expert.
+
+What the data supports is a **negative filter**: penalise or veto names carrying fresh bad
+news, and do not reward good news at all. That is a different setting shape from §5's
+`w_news` — closer to `news_veto_threshold` + `news_lookback_days` — and it is cheaper to
+search.
+
+**On model choice:** §7b's ranking was measured through the same broken daily aggregation
+and should not be used to pick a model. The event study runs on `finbert-legacy`, so the
+re-score question is now open again and should be re-tested at intraday resolution with
+`distilroberta-news` (nominally best, 2× faster, half the memory) before any full pass.
+
+### 7d. Persistence under a realistic fetch lag — the decisive test
+
+**We do not receive news in real time.** A daily news job acts up to a day after
+publication, so the only thing that matters is what survives that delay. Re-ran the event
+study with `--entry-lag-min 1440` (enter one day after publication) against the zero-lag
+upper bound. Same 122,084 articles, 26 symbols.
+
+**pos − neg spread (bp), and the IC t-stat:**
+
+| horizon | lag 0 spread | t | **lag 1d spread** | **t** |
+|---|---|---|---|---|
+| 30m | +6.92 | +6.26 | +2.83 | +2.80 |
+| 1h | +5.90 | +4.58 | +1.62 | +1.37 |
+| 1d | +8.36 | +3.40 | +3.72 | +1.61 |
+| 2d | +14.22 | +4.27 | **+6.85** | **+2.13** |
+| 3d | +16.14 | +3.97 | **+10.96** | **+2.83** |
+| 5d | +15.92 | +3.17 | +3.81 | +0.78 |
+| 10d | +6.68 | +1.01 | −0.91 | −0.14 |
+
+**The effect does persist a few days, and only a few.** With a one-day lag the spread is
+still significant at 2–3 days (+10.96 bp, t=2.83), then collapses by day 5 (t=0.78) and is
+gone at 10. Rank IC, by contrast, is dead at every horizon once lagged (all |t| < 1.8) —
+the surviving signal lives in the *tails*, not in the ranking of the middle.
+
+**It is entirely a negative-side effect.** At 3 days with the lag applied:
+
+```
+pos +32.22 bp    neu +32.27 bp    neg +21.26 bp
+```
+
+Positive news is indistinguishable from no news — 32.22 against 32.27. The whole spread is
+negative news underperforming by ~11 bp. This holds across every lagged horizon.
+
+**Why this makes the feature worth having anyway.** ~11 bp over three days would be
+marginal as a tradable alpha after costs, but as a **veto it costs nothing to act on** —
+declining to open a position pays no spread and no commission. The asymmetry and the
+transaction-cost problem cancel: the only usable form of the signal is also the only form
+that is free to use.
+
+**Final shape for §5, replacing the original settings:**
+
+| §5 as designed | What the data supports |
+|---|---|
+| symmetric `w_news` contribution | **negative-only veto/penalty**; no positive-side weight |
+| `news_lookback_days: 7` | **2–3 days** — the edge is gone by day 5 |
+| `news_half_life_days: 3.0` | decay is faster; half-life ≈ 1 day, or a hard window |
+| `news_min_articles: 3` | keep — density still matters |
+
+A symmetric `w_news` with a 7-day lookback and 3-day half-life would have averaged mostly
+dead information and spent half its GA range on a positive side worth exactly zero.
+
+### 7e. VERDICT — the signal does not survive a weekly analysis cadence
+
+DeterministicScorer analysis runs **once or twice a week**, so the realistic entry lag is
+3–7 days, not one. Re-ran at those lags. Same 122,084 articles.
+
+**Best pos−neg spread at any horizon, by entry lag:**
+
+| entry lag | best spread | t | usable? |
+|---|---|---|---|
+| 0 (real time) | +16.14 bp @3d | +3.97 | yes — unreachable |
+| 1 day | +10.96 bp @3d | +2.83 | yes, negative-side only |
+| **3 days** | +3.71 bp @2d | +1.23 | **no** |
+| **7 days** | — | all \|t\| < 1.8, ICs negative | **no** |
+
+At a 3-day lag every horizon is inside noise, and by 5–10 days the sign flips
+(−3.62 bp, −7.86 bp). At 7 days every IC is negative. There is nothing left to capture.
+
+**Conclusion: do not wire the news section.** Not because the cache is bad, the model is
+wrong, or the aggregation was mis-specified — those were all fixed along the way. The
+binding constraint is **cadence**. News decays over roughly 3 days; an expert that looks
+at the world twice a week arrives after it is over.
+
+**What would change the answer**, in order of cost:
+
+1. **Run the news check daily**, decoupled from the weekly full analysis — a cheap
+   negative-news veto pass over open and candidate positions. This is the only variant the
+   data supports (~11 bp of avoided drag over 3 days, at zero transaction cost since a veto
+   places no trade).
+2. Intraday cadence would recover the full +16 bp, but that is a different platform.
+
+**What was NOT the problem, for the record:** the migrated cache is sound (99.9% text
+resolution), the four models are statistically indistinguishable from one another, and
+§7b's null result was a measurement artefact, not the truth. The signal is real at
++6.9 bp/30 min. It is simply not reachable on this schedule.
+
+**Value retained regardless:** the migration restores the ML engine's `news_*` features,
+which were dataless on this machine, and the store is in place if the cadence ever changes.
+
 ---
 
 ## 8. Not breaking the ML engine
