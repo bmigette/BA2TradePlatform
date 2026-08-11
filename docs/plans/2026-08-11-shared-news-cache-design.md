@@ -327,6 +327,57 @@ honest outcome is to migrate the cache and not wire it into the expert**, saving
 (`2.6.0+cpu`, Windows). Local and remote are both near their memory ceiling with the grid
 running. The scoring pass must be scheduled **around** the grid, not alongside it.
 
+### 7b. Bake-off result (2026-08-11): no model shows a usable edge
+
+Ran on a seeded stratified sample of **5,794 articles** (≤30 per symbol-year, 2019–2026),
+24 symbols with price data, 4,378 symbol-days. Scored in memory; the store was not touched.
+
+| model | IC 1d | t | IC 5d | t | rows/s |
+|---|---|---|---|---|---|
+| distilroberta-news | +0.0200 | +1.23 | +0.0143 | +0.75 | **9.0** |
+| twitter-roberta | +0.0130 | +0.75 | +0.0090 | +0.54 | 4.5 |
+| finbert | +0.0123 | +0.81 | +0.0203 | +1.07 | 4.1 |
+| finbert-tone | +0.0106 | +0.54 | +0.0025 | +0.12 | 4.7 |
+| finbert-legacy | +0.0097 | +0.59 | +0.0124 | +0.64 | — |
+
+**Nothing reaches significance.** Every |t| < 1.3. Supporting evidence that this is noise
+rather than a weak-but-real signal:
+
+- Only **11–14 of 24 symbols** are positive for any model — a coin flip.
+- Per-symbol IC scatter is σ ≈ 0.08 against a mean of ≈ 0.015, so SE ≈ 0.016 and every
+  interval comfortably contains zero.
+- **The result did not replicate.** An earlier draw (≤25/symbol-year, 4,835 articles)
+  gave distilroberta 1d IC **+0.041, t=+2.49** and legacy **+0.053, t=+3.23**. Growing the
+  sample by 20% roughly halved both and killed the significance. A real effect gets *more*
+  significant with more data. The first draw was noise, and any conclusion drawn from it
+  should be discarded.
+- Per-symbol ICs correlate **0.55–0.88 across models**. The models largely agree with each
+  other, so the between-model differences in the table are noise riding on one shared,
+  weak signal — which means model choice barely matters here.
+
+**Answer to "is there better than FinBERT": not demonstrably.** `distilroberta-news` is
+nominally top at 1d *and* 2× faster *and* half the memory, so it is the one to use if any
+is used — but it is not statistically distinguishable from the incumbent.
+
+**Caveats — this is "not demonstrated", not "proven absent":**
+
+1. **Daily bars blur the main event window.** News published at 09:00 is matched to
+   `close[t] → close[t+1]`, which misses the intraday reaction that same session — likely
+   where most of the effect lives. Resolving this needs intraday bars.
+2. **The aggregation is a crude proxy**, not the proposed feature: a plain daily mean, with
+   no half-life weighting and no `news_min_articles` floor. §5's actual formulation was
+   not what got tested.
+3. **24 symbols is a small cross-section** for a t-test over per-symbol ICs.
+
+**Consequence for §5:** on this evidence, wiring the news section into DeterministicScorer
+is **not justified**. The `use_news=False` default already means nothing regresses, but
+adding a GA-tunable `w_news` on an undemonstrated signal spends search width on noise —
+the same mistake as the inert macro genes, arrived at from the opposite direction.
+
+The cheap way to settle it is to test the **actual** §5 aggregation (half-life + article
+floor) on a larger sample with `distilroberta-news` alone — ~1 h at 9 rows/s — rather than
+to conclude from a proxy.
+
 ---
 
 ## 8. Not breaking the ML engine
