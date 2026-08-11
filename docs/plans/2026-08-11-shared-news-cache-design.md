@@ -157,6 +157,60 @@ settings: exactly one `hasattr(providers, …)` in the codebase (this one); no o
 declared-but-unread setting; `FactorRanker`'s `current_price: None` is legitimate and documented
 (basket-level, cross-sectional).
 
+### 4b. It cannot be fixed by wiring — the provider implements a different contract
+
+`FREDMacroProvider` is a **markdown-report generator**, not a time-series source:
+
+| What the expert needs | What the provider returns |
+|---|---|
+| `unrate_series`, `oas_series` as **series** | `latest = valid_obs[0]` — latest value only |
+| keys by FRED series ID (`VIXCLS`, `UNRATE`) | keys by friendly name (`"VIX"`, `"Unemployment Rate"`) |
+| `yc.get("10y")` → dict of series | a **list** of `{maturity: "10 Year", yield, date}`, latest only |
+| `BAMLH0A0HYM2` (HY OAS) | **not in `INDICATOR_SERIES`** |
+| `T10Y3M` | absent; only `DGS10`/`DGS3MO` latest values |
+| `NAPM` for PMI | present in the list, but **the series does not exist on FRED** (verified) |
+
+Even with `macro()` added to the bundle every input would still resolve to `None`. The
+`hasattr` guard was not hiding a wiring gap — it was hiding an integration that was **never
+built**, and nothing ever threw because the guard short-circuited before the mismatch surfaced.
+
+Additional blockers in `_get_fred_data`: a bare `requests.get` with **no cache** (every bar ×
+every worker would hit the FRED API, breaking the hermetic contract) and `limit: 100,
+sort_order: desc` — only the last 100 observations, while the credit z-score wants ~756.
+
+### 4c. Verified approach for the rebuild
+
+**Point-in-time via FRED vintages, not lag heuristics.** `output_type=4` (initial release only)
+with `realtime_start=1776-07-04&realtime_end=9999-12-31` returns each observation stamped with
+its true first-publication date. Verified:
+
+```
+UNRATE        obs=2024-01-01 val=3.7   first_pub=2024-02-02   <- real 32-day lag, from FRED
+BAMLH0A0HYM2  obs=2024-01-02 val=3.54  first_pub=2024-01-02   <- same-day (daily series)
+```
+
+Filtering on `realtime_start <= as_of` gives zero-lookahead point-in-time with no guessing.
+
+Per-series mode (verified empirically):
+
+| Series | Mode | Reason |
+|---|---|---|
+| `UNRATE`, `CPIAUCSL`, `PAYEMS`, `GDP` | `output_type=4` vintages | revised + published with a lag |
+| `VIXCLS`, `T10Y3M`, `BAMLH0A0HYM2`, `DGS*` | default, filter on `date` | never revised, same-day; `output_type=4` is rejected anyway ("3,907 vintage dates") |
+| PMI | **needs a replacement** — `NAPM` does not exist | ISM pulled FRED licensing ~2016 |
+
+**Reuse, don't rebuild:** `testplatform/backend/app/services/macro.py` (`MacroService`, 372
+lines) already returns **series** with forward-fill OHLC alignment — the shape the expert needs
+— and its line 97 already notes it is "intended to be sourced through ba2_providers' shared
+cache". It lacks a disk cache and vintage handling; those are the additions.
+
+**Scope of the real fix:** point-in-time series method → per-series vintage mode → disk cache
+under `CACHE_FOLDER` (syncs to workers, keeps backtests hermetic) → prewarm hook → remove the
+`limit: 100` truncation → PMI replacement → bundle `macro()` wiring → rewrite the expert's
+`fetch_macro_series` against the new contract → delete whichever genes remain unbacked.
+
+The FRED API key lives in `AppSetting.fred_api_key` (present in the trade DB), **not** in `.env`.
+
 ---
 
 ## 5. News integration into DeterministicScorer
@@ -258,7 +312,25 @@ rebuilds one dataset both ways and asserts the `news_*` columns match.
 
 ---
 
-## 9. Open items
+## 9. Live fetch, prewarm and acceptance test
+
+- **Live fetches from every provider with a configured key** — not FMP alone. `AppSetting`
+  currently holds keys for `fmp_api_key`, `finnhub_api_key` and `alpha_vantage_api_key`, matching
+  the three providers already present in the archive. Providers without a key are skipped
+  silently; a provider with a key that fails is logged, not swallowed. Results are merged and
+  deduped on `url_hash` so the same article from two providers is stored once.
+- **Prewarm support** is required, on the same footing as the other buckets: the backtest
+  prewarm hook must populate `cache/news/<SYM>.parquet` for the run's universe so GA workers
+  read from disk and never fetch. Without this, an enabled news section either fetches per bar
+  or fails the coverage check.
+- **Reuse the existing test-platform news fetch script** rather than writing a new fetcher —
+  `app/services/news_batch_handler.py` already does batched multi-provider fetch + scoring.
+- **Acceptance test on a covered symbol.** After migration, run a backtest on a symbol with
+  known dense coverage (e.g. NVDA or MSFT, both 2022+) with `use_news=True` and assert: the
+  section produces non-null scores, the article counts match the store, no network call occurs,
+  and an uncovered symbol fails the run per §5.
+
+## 10. Open items
 
 - Fold the §4 macro fix into this plan, or track separately? (Recommend: fix first — it
   invalidates DeterministicScorer GA runs that tune the nine inert genes.)
