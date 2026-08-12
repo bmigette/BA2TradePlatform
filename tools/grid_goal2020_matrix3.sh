@@ -1,6 +1,19 @@
 #!/usr/bin/env bash
 #
-# goal2020 MATRIX 3 — FMPSenateTraderWeight, both sizing modes, 2020-01-01 → 2025-12-31.
+# goal2020 MATRIX 3 — the two experts matrices 1 and 2 never covered.
+#
+#   PHASE A  FMPSenateTraderWeight   own disclosure universe, no cap bands   14 jobs
+#   PHASE B  DeterministicScorer     cap-band screener matrix                18 jobs
+#
+# Both on 2020-01-01 → 2025-12-31, both sizing modes, stress enabled.
+#
+# THE TWO PHASES HAVE DIFFERENT SHAPES AND THAT IS NOT INCIDENTAL. Senate is a
+# basket-dispatch expert that picks its own symbols from Senate filings, so it has no `--bands`
+# dimension and is driven straight through ba2test_launcher. DeterministicScorer declares
+# can_recommend_instruments=False — it is a CLASSIC per-symbol expert and belongs to the
+# cap-band screener matrix, so phase B calls run_screener_capband_matrix.py exactly as matrices
+# 1 and 2 do. Running DeterministicScorer on Senate's universe would optimize a different
+# strategy from the one that would ever be deployed.
 #
 # WHY THIS IS A SEPARATE SCRIPT, not a third run_matrix in tools/grid_goal2020.sh:
 #
@@ -37,7 +50,7 @@
 #
 # RUN AFTER MATRIX 2. Both grids on one box will exhaust memory.
 #
-#   nohup bash tools/grid_senate_goal2020.sh > grid_senate_goal2020.log 2>&1 &
+#   nohup bash tools/grid_goal2020_matrix3.sh > grid_goal2020_matrix3.log 2>&1 &
 #
 set -u
 cd "$(dirname "$0")/.."
@@ -69,7 +82,7 @@ WORKER_ARGS=()
 [ -n "$WORKERS" ] && WORKER_ARGS=(--workers "$WORKERS")
 
 echo "=================================================================="
-echo "=== goal2020 MATRIX 3 : FMPSenateTraderWeight, risk_atr + notional"
+echo "=== goal2020 MATRIX 3 : PHASE A Senate (own universe) + PHASE B DeterministicScorer (cap bands)"
 echo "=== window 2020-01-01 -> 2025-12-31 | spread ${SPREAD_BPS} bps, stress +${STRESS_BPS}"
 echo "=== strategies: $STRATEGIES | parallel $PARALLEL | workers: ${WORKERS:-local-only}"
 echo "=== universe: $(echo "$UNI" | tr ',' '\n' | wc -l) symbols"
@@ -100,6 +113,35 @@ for MODE in risk_atr notional; do
       --name "$NAME"
     rc=$?
     echo "=== $NAME  done rc=$rc $(date)"
+    [ $rc -ne 0 ] && rc_any=$rc
+  done
+done
+
+
+# ---------------------------------------------------------------------------
+# PHASE B — DeterministicScorer, cap-band matrix (the shape matrices 1/2 use).
+# ---------------------------------------------------------------------------
+# Skipped from matrices 1 and 2 via --skip-experts while its macro section was inert (every
+# FRED input resolved to None, so mw_vix/mw_credit/mw_yield_curve/mw_sahm and the hard_riskoff
+# cutoff were dead genes). That was fixed 2026-08-11 (real point-in-time FRED series + prewarm),
+# so it now has a live regime composite and is worth searching for the first time.
+DRIVER=tools/run_screener_capband_matrix.py
+STORE="${STORE:-$HOME/Documents/ba2/common/cache/screener/metric_store}"
+DS_PARALLEL="${DS_PARALLEL:-4}"      # light expert (~2.5 GB/trial), unlike Senate
+
+ds_spread_for() { case "$1" in large) echo 3 ;; mid) echo 10 ;; small) echo 40 ;; *) echo 0 ;; esac; }
+
+for MODE in risk_atr notional; do
+  for band in large mid small; do
+    sp="$(ds_spread_for "$band")"
+    st=$(awk -v s="$sp" -v m="$STRESS_SPREAD_MULT" 'BEGIN{printf "%.6g", s*m}')
+    ds_stress=()
+    awk -v v="$st" 'BEGIN{exit !(v>0)}' && ds_stress=(--stress-spread-bps "$st")
+    echo
+    echo "=== PHASE B  DeterministicScorer / $MODE / $band  (spread ${sp}, stress +${st})  $(date)"
+    "$PY" "$DRIVER"       --start 2020-01-01 --end 2025-12-31       --fitness consistent_annual_return       --store "$STORE"       --sizing-mode "$MODE" --bands "$band"       --spread-bps "$sp" "${ds_stress[@]}"       --parallel "$DS_PARALLEL"       --name-suffix="-goal2020-${MODE}-ds"       --skip-experts FMPRating,FMPEarningsDrift,FMPInsiderClusterBuy,FactorRanker       "${WORKER_ARGS[@]}"
+    rc=$?
+    echo "=== PHASE B  $MODE / $band  done rc=$rc $(date)"
     [ $rc -ne 0 ] && rc_any=$rc
   done
 done
