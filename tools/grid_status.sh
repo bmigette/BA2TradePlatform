@@ -19,12 +19,21 @@ PY=.venv/Scripts/python.exe
 echo "=================== goal2020 grid status  $(date) ==================="
 
 # --- 1. processes -----------------------------------------------------------------------------
-# Match the SCRIPT's own bash (…/bash.exe tools/grid_goal2020.sh), not an interactive shell that
-# merely mentions the name — otherwise your own grep/editor sessions count as "running".
-# The wrapper's own command line ENDS with the script path; an interactive shell that merely
-# mentions the name (a grep, an editor) always has trailing text, so the trailing-match excludes it.
+# Match the SCRIPT's own bash (…/bash.exe tools/grid_goal2020.sh …), not an interactive shell
+# that merely mentions the name — otherwise your own grep/editor sessions count as "running".
+#
+# The pattern is '* tools/grid_goal2020.sh*': a LEADING SPACE plus a trailing wildcard.
+#   - the leading space is what excludes a grep/editor, whose command line puts the path AFTER
+#     the pattern or filename (e.g. `grep -n foo tools/grid_goal2020.sh` still matches ' tools/…'
+#     — but its Name is not bash.exe, which is the real discriminator, so the space is belt and
+#     braces for a `bash -c "... tools/grid_goal2020.sh"` one-liner);
+#   - the TRAILING wildcard is required because the runbook documents passthrough arguments
+#     (`bash tools/grid_goal2020.sh --population 60`, `--skip-experts …`). The old pattern
+#     anchored on the path being LAST, so any documented passthrough launch reported
+#     "PARTIAL — wrapper GONE" on a perfectly healthy grid. That false alarm invites a restart
+#     of a multi-day run, which is far more expensive than the noise it was guarding against.
 read -r N_SH N_DRV <<<"$(powershell -NoProfile -Command "
-  \$sh  = @(Get-CimInstance Win32_Process | Where-Object { \$_.Name -eq 'bash.exe' -and \$_.CommandLine -like '* tools/grid_goal2020.sh' })
+  \$sh  = @(Get-CimInstance Win32_Process | Where-Object { \$_.Name -eq 'bash.exe' -and \$_.CommandLine -like '* tools/grid_goal2020.sh*' })
   \$drv = @(Get-CimInstance Win32_Process | Where-Object { \$_.CommandLine -like '*run_screener_capband_matrix*' })
   '{0} {1}' -f \$sh.Count, \$drv.Count" 2>/dev/null)"
 
@@ -70,7 +79,10 @@ if [ -f "$LOG" ]; then
   else
     echo "DIST    (not yet — still in setup/worker sync)"
   fi
-  echo "SPREAD  $(grep -hoE '\(spread [0-9.]+ bps round-trip\)' "$LOG" | tail -1)"
+  # [^)]* so the optional ", stress +N" suffix is captured too, not treated as a non-match:
+  # the wrapper gained STRESS_SPREAD_MULT on 2026-08-12 and the old pattern anchored on
+  # "round-trip)" being the end, so this line silently went blank on every stressed run.
+  echo "SPREAD  $(grep -hoE '\(spread [0-9.]+ bps round-trip[^)]*\)' "$LOG" | tail -1)"
 fi
 
 # --- 3. current position ------------------------------------------------------------------------
