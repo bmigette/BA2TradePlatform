@@ -1619,9 +1619,10 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         except Exception as e:  # noqa: BLE001 — a cache-write failure must never fail scoring
             self.logger.debug(f"Failed to persist scoring cache {filename}: {e}")
 
-    def _save_scoring_cache_throttled(self, attr: str, filename: str, key: str,
+    def _save_scoring_cache_throttled(self, attr: str, filename: str, key: str, value: Any,
                                        is_live: bool) -> None:
-        """Append ``key`` (and its already-stored value) to the pending list; every
+        """Append ``key``/``value`` (the pair the caller just computed and stored) to the
+        pending list; every
         ``_CACHE_FLUSH_EVERY`` pending entries, APPEND just those to the JSON-Lines delta
         file (O(new entries), not O(total cache size) — see the class-level comment on
         why a whole-dict rewrite, even throttled, is still O(n^2) total). Every
@@ -1639,13 +1640,23 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         reuse (profiled: a 620MB confidence-cache compaction was ~32% of a full-length trial's
         wall time, entirely to persist entries a backtest would rarely re-read). Live keeps the
         disk-backed delta/compaction path unchanged — a live process restarts and re-warms from
-        disk, and its month-bucketed keys DO get reused across the many analyses in a month."""
+        disk, and its month-bucketed keys DO get reused across the many analyses in a month.
+
+        ``value`` IS PASSED IN, NOT RE-READ (2026-08-11 fix). This used to do
+        ``getattr(self, attr)[key]`` instead, trusting that ``self.<attr>`` still aliased the
+        same cache object the caller had just written ``key`` into. LIVE shares one expert
+        instance across concurrent WorkerQueue threads (``get_expert_instance_from_id`` is a
+        singleton cache) and shares ``_WORKER_SCORING_CACHE`` across every sibling instance in
+        the process, so other live traffic can evict+reload this shard between the caller's
+        write and this call — silently rebinding ``self.<attr>`` to a fresh copy that never saw
+        ``key`` (see ``_load_scoring_cache``) — and the re-derived lookup raised KeyError,
+        crashing the whole analysis instead of degrading like every other cache-write failure
+        here. Taking the value directly removes the stale-alias dependency entirely."""
         if not is_live:
             return
         pending_attr = attr + "_pending"
         pending = getattr(self, pending_attr, None) or []
-        cache = getattr(self, attr)
-        pending.append({"k": key, "v": cache[key]})
+        pending.append({"k": key, "v": value})
         if len(pending) < self._CACHE_FLUSH_EVERY:
             setattr(self, pending_attr, pending)
             return
@@ -1678,8 +1689,10 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
         if entry and entry.get("history_len") == n:
             return {"avg_hold_days": entry.get("avg_hold_days"), "roundtrips": entry.get("roundtrips")}
         result = self._calculate_trader_avg_hold_days(trader_history)
-        cache[trader_name] = {"history_len": n, **result}
-        self._save_scoring_cache_throttled("_hold_cache", self._HOLD_CACHE_FILE, trader_name, is_live)
+        entry = {"history_len": n, **result}
+        cache[trader_name] = entry
+        self._save_scoring_cache_throttled(
+            "_hold_cache", self._HOLD_CACHE_FILE, trader_name, entry, is_live)
         return result
 
     def _get_trader_skill_cached(self, trader_name: str, trader_history: List[Dict[str, Any]],
@@ -1717,7 +1730,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             min_past_trades=min_past_trades, max_past_trades=max_past_trades,
             lookback_months=lookback_months, _sorted_candidates=sorted_candidates)
         cache[key] = result
-        self._save_scoring_cache_throttled("_skill_cache", shard, key, is_live)
+        self._save_scoring_cache_throttled("_skill_cache", shard, key, result, is_live)
         return result
 
     def _get_trader_confidence_cached(self, trader_name: str, trader_history: List[Dict[str, Any]],
@@ -1753,7 +1766,7 @@ class FMPSenateTraderWeight(AnalysisStatusRenderMixin, FMPCongressTradingMixin, 
             max_exec_days, now=now, symbol_focus_cap_pct=symbol_focus_cap_pct,
             _index=index)
         cache[key] = result
-        self._save_scoring_cache_throttled("_confidence_cache", shard, key, is_live)
+        self._save_scoring_cache_throttled("_confidence_cache", shard, key, result, is_live)
         return result
 
     def _price_on_or_after(self, symbol: str, date: datetime, max_walk_days: int = 5) -> Optional[float]:

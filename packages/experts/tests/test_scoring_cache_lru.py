@@ -127,3 +127,43 @@ def test_eviction_is_least_recently_used(cache_dir):
     resident = {str(p).replace("\\", "/").rsplit("/", 1)[-1] for p in mod._WORKER_SCORING_CACHE}
     assert names[0] in resident, "evicted the just-touched entry -- not LRU"
     assert names[1] not in resident, "should have evicted the genuinely-least-recent entry"
+
+
+def test_throttled_save_survives_its_own_shard_being_evicted_meanwhile(cache_dir):
+    """LIVE-ONLY regression (crashed FMPSenateTraderWeight-28 in dev, 2026-08-11 21:32,
+    KeyError: 'Michael McCaul|5520|2026-08|60|5|50|6').
+
+    ``_save_scoring_cache_throttled`` used to re-derive the value via
+    ``getattr(self, attr)[key]`` instead of using what the caller had already computed. LIVE
+    shares one expert instance across concurrent WorkerQueue threads (get_expert_instance_from_id
+    is a singleton cache) and shares ``_WORKER_SCORING_CACHE`` across every sibling instance in
+    the process -- so between a caller's write and its throttled-save call, other live traffic
+    (another symbol on this instance, or a sibling instance's own shards) can push the LRU past
+    its cap (see test_a_reload_after_the_full_working_set_is_a_cache_hit above) and evict this
+    shard. The instance's own NEXT trader then reloads it fresh from disk, silently rebinding
+    ``self._skill_cache`` to a copy that never saw the key -- and the re-derived lookup raised
+    KeyError, crashing the whole analysis instead of degrading like every other cache-write
+    failure in this function.
+
+    Reproduces the eviction deterministically (no real threads needed) exactly like the test
+    above; asserts the throttled save must not raise."""
+    shard = "congress_skill_scores__60_5_50_12.json"
+    _write(cache_dir, shard, {})
+
+    e = _expert()
+    cache = e._load_scoring_cache("_skill_cache", shard)
+    key = "Michael McCaul|5520|2026-08|60|5|50|6"
+    value = {"skill_score": 1.0}
+    cache[key] = value
+
+    # Other concurrent live traffic fills the LRU past its cap before this write is persisted.
+    for i in range(mod._WORKER_SCORING_CACHE_MAX):
+        n = f"congress_skill_scores__other{i}.json"
+        _write(cache_dir, n, {})
+        e._load_scoring_cache("_skill_cache", n)
+
+    # This instance's own next trader reloads the SAME shard -- now a miss, since it was
+    # evicted -- silently rebinding self._skill_cache to a copy that never saw `key`.
+    e._load_scoring_cache("_skill_cache", shard)
+
+    e._save_scoring_cache_throttled("_skill_cache", shard, key, value, is_live=True)
