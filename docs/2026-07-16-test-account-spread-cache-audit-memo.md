@@ -16,10 +16,15 @@ instance (§1); apply going forward on every new deploy (e.g. right after the
 
 ## 1. Currently deployed instances (dev trade platform: `ba2\trade\db.sqlite`)
 
-3 accounts (`BA2-Test1`/`2`/`3`, all Alpaca). 25 `ExpertInstance` rows total as of 2026-07-20
-(24 goal6-grid instances at target + 1 out-of-scope PennyMomentumTrader); none disabled (see
-§2/§3). Settings below are the fields most relevant to spread/TP-SL behavior — full settings
-dumps are in the DB if needed.
+> **Refreshed 2026-08-09 against the live DB.** The tables below now carry the settings that are
+> actually stored, not the ones recorded at deploy time — several had drifted (ids 20/21/24/25),
+> the Senate pair was redeployed under new aliases, `TestPenny` has since been disabled, and a
+> first goal2020-campaign instance (id 32) was added. Counts corrected accordingly.
+
+3 accounts (`BA2-Test1`/`2`/`3`, all Alpaca). **26 `ExpertInstance` rows** as of 2026-08-09:
+24 goal6-grid instances (at target, §2) + 1 out-of-scope `PennyMomentumTrader` (id 4, **disabled**)
++ 1 goal2020-campaign forward test (id 32, §1.1). Settings below are the fields most relevant to
+spread/TP-SL behavior — full settings dumps are in the DB if needed.
 
 ### BA2-Test1 (account_id=1)
 
@@ -60,16 +65,27 @@ solidly positive returns. Both `ForwardTest`-tagged. Closes the FactorRanker gap
 
 ### BA2-Test2 (account_id=2)
 
+**8 rows, all enabled — and 8 IS the target, not a shortfall.** The account was allotted ids
+16–25 (10 slots), but two of them no longer exist as rows: id 17 was **replaced** by id 20 and
+id 18 was **deleted outright** after being superseded by id 25 (both detailed in the notes
+below). 10 ids issued − 2 removed = 8 live instances = the 4 `FMPEarningsDrift` + 4
+`FMPInsiderClusterBuy` target of §2. Nothing is missing or disabled here; the gap in the id
+sequence is the only trace of the two removals.
+
 | id | expert | alias | enabled | cap_min | max_stocks | drop_pct | rel_vol_min | ATR mult/period | use_atr_stop | min_SL% | risk/trade% |
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | 16 | FMPEarningsDrift | goal6-mid_ED_S1top1 | 1 | $6B | 30 | 1.0 | 1.9 | 3.5/21 | 0 | 12.0 | 5.0 |
-| 20 | FMPEarningsDrift | goal6-mid_ED_S2top1 | 1 | $2B | 50 | 3.0 | 2.7 | 3.5/28 | 0 | 8.0 | 1.0 |
+| 20 | FMPEarningsDrift | goal6-mid_ED_S2top1 | 1 | $2B | 40 | 6.0 | 2.7 | 3.5/28 | 0 | 8.0 | 1.0 |
 | 19 | FMPInsiderClusterBuy | goal6-mid_ICB_S2top3 | 1 | $5B | 30 | 2.0 | 1.6 | 4.0/21 | 0 | 9.0 | 9.0 |
-| 21 | FMPInsiderClusterBuy | goal6-small_ICB_S1top3 | 1 | $200M | 20 | — | — | — | — | — | — |
+| 21 | FMPInsiderClusterBuy | goal6-small_ICB_S1top3 | 1 | $100M | 50 | 9.0 | 1.7 | 3.0/14 | 0 | 3.0 | 6.0 |
 | 22 | FMPEarningsDrift | goal6-small_ED_S1top1 | 1 | $100M | 40 | 7.0 | 2.6 | 6.0/28 | 1 | 14.0 | 1.5 |
 | 23 | FMPEarningsDrift | goal6-small_ED_S7top2 | 1 | $1.1B | 20 | 4.0 | 1.5 | 6.0/28 | 0 | 12.0 | 3.0 |
-| 24 | FMPInsiderClusterBuy | goal6-small_ICB_S7top1 | 1 | (screener, small) | — | — | — | — | — | — | — |
-| 25 | FMPInsiderClusterBuy | goal6-mid_ICB_S7top2 | 1 | $6B | 40 | 0.0 | 1.2 | 6.0/7 | 1 | 12.0 | 5.0 |
+| 24 | FMPInsiderClusterBuy | goal6-small_ICB_S7top1 | 1 | $300M | 30 | 16.0 | 0.7 | 5.0/7 | 0 | 13.0 | 8.0 |
+| 25 | FMPInsiderClusterBuy | goal6-mid_ICB_S7top2 | 1 | $3B | 40 | 0.0 | 1.2 | 5.5/28 | 1 | 14.0 | 5.0 |
+
+*(2026-08-09: ids 20, 21, 24 and 25 differ from the values first recorded here — 21 and 24 were
+written as "—"/"(screener, small)" placeholders that were never filled in, and 20/25 have since
+been reseeded. The table above is a direct read of `expertsetting`.)*
 
 Notes: id 17 (`goal6-mid_ED_S2top1`, disabled for spread fragility, see §3) was replaced by id
 20, reseeded from `TOP1-scr-mid-FMPEarningsDrift-S2-goal6-spread` (backtest 660, the warm-start-
@@ -90,14 +106,48 @@ was confirmed live — user-directed cleanup 2026-07-19.
 
 | id | expert | alias | enabled | notes |
 |---|---|---|---|---|
-| 4 | PennyMomentumTrader | TestPenny | 1 | Not part of the GA/screener pipeline — no matching `StrategyOptimization`/`Backtest` row exists. sizing_mode=risk_atr, risk_manager_mode=classic, min_SL%=7.0, risk/trade%=2.0. Out of scope for this audit. |
-| 28 | FMPSenateTraderWeight | goal6-senate_S3top3 | 1 | bt739 (`TOP3-sen-S3-goal6`, opt201): 92.12% return / 66.17% WR / -14.32% DD / 133 trades. `instrument_selection_method=expert` (basket dispatch — Senate scans its own candidate list every cycle via `_gather_all`, not the backtest's static 498-symbol scanning universe). risk/trade%=5.0. `ForwardTest`-tagged. |
-| 29 | FMPSenateTraderWeight | goal6-senate_S5top2 | 1 | bt743 (`TOP2-sen-S5-goal6`, opt202): 179.13% return / 35.29% WR / -14.47% DD / 119 trades. Same basket-dispatch wiring as id28. risk/trade%=5.0. `ForwardTest`-tagged. |
+| 4 | PennyMomentumTrader | TestPenny | **0** | Not part of the GA/screener pipeline — no matching `StrategyOptimization`/`Backtest` row exists. min_SL%=7.0, risk/trade%=2.0. **Disabled** since this memo was first written; left in place rather than deleted, and deliberately NOT reused as a slot for id 32 (repointing a row at a different expert class would leave the old expert's `expertsetting` rows attached, and `ExtendableSettingsInterface` rejects unknown keys). Out of scope for this audit. |
+| 28 | FMPSenateTraderWeight | **sen5min3-S6top4** | 1 | **Redeployed 2026-07-2x** from the sen5min3 (5-minute) grid — bt845, superseding the goal6-senate_S3top3/bt739 deployment recorded in the original version of this table. ATR 6.0/7, use_atr_stop=1, min_SL%=14.0, risk/trade%=8.5. `instrument_selection_method=expert` (basket dispatch — Senate scans its own candidate list every cycle via `_gather_all`). `ForwardTest`-tagged. |
+| 29 | FMPSenateTraderWeight | **sen5min3-S6top2** | 1 | **Redeployed 2026-07-2x** from bt842, superseding goal6-senate_S5top2/bt743. Same settings/wiring as id 28. `ForwardTest`-tagged. |
+| 32 | FMPEarningsDrift | **goal2020-mid_ED_S1top1** | 1 | **New 2026-08-09 — first goal2020-campaign forward test** (§1.1). |
 
 All non-PennyMomentumTrader instances trace back to a specific `Backtest` row via the
 `TOP<rank>-scr-<band>-<expert>-<strategy>-goal6` naming convention (mapping table in §3), except
 the FMPSenateTraderWeight pair (ids 28/29, `TOP<rank>-sen-<strategy>-goal6`, not band-split —
 Senate's universe spans all bands, deployed here since BA2-Test3 had the most spare capacity).
+
+### 1.1 goal2020 campaign — id 32 (added 2026-08-09)
+
+The goal6 target of 24 is **met and closed** (§2), so id 32 does not fill a gap: it opens a
+SECOND campaign (`goal2020`, the 2020-2025 re-optimization on the post-lookahead-fix engine).
+Placed on BA2-Test3 because it had the most spare capacity (30% allocated, 70% free); account 2
+is the natural home for EarningsDrift but sits at its 4+4 target.
+
+| field | value |
+|---|---|
+| source | backtest 881 = `TOP1-scr-mid-FMPEarningsDrift-S1-goal2020-riskatr` (opt 260) |
+| stored metrics | 727.6% total / 42.3% ann. / -16.6% DD / 48.9% WR / 1772 trades / Sharpe 2.04, 2020-2025 |
+| genome | surprise_min_pct 4.0, max_days_since_report 30, risk/trade 3.5%, ATR 5.0/14, use_atr_stop 1, min_SL 13%, expected_profit static 19%, sizing_mode risk_atr |
+| universe | screener, cap $3B–$10B, max_stocks 40, RVOL 1.1, price-drop 4%/14d |
+| schedules | enter Monday 09:30, manage daily 09:30 (copied from the job's run/manage overrides) |
+| virtual equity | 10%, `max_virtual_equity_per_instrument_percent` 25% |
+
+**Why this one is worth watching rather than trusting.** A robustness pass (2026-08-09) put its
+edge at **~13 bps per trade**, against a 20 bps round-trip cost at the 10 bps spread the backtest
+already models. Its annualized return crosses zero at roughly **+29 bps** of additional
+round-trip spread, and drop-K shows the top 20 trades (1.1% of them) carry ~52% of the return.
+Year-by-year it also decays: +74/+23/+80/+59/**+18/+18**% for 2020→2025, with win rate sliding
+53.5% → 43.6% over the back half. For comparison, id 16 — the goal6 mid-band EarningsDrift on the
+same signal — loses only 6.2pp at 50 bps (§4), i.e. **the new genome is markedly MORE
+spread-fragile than the one already deployed**. Paper-forward is the right way to settle whether
+13 bps survives real fills; it is not a candidate for sizing up.
+
+**Deploy mechanics.** Done with `tools/export_deploy_payload.py` → JSON →
+`tools/import_deploy_payload.py` (the Senate-specific pair, generalised the same day). Two
+gotchas worth repeating: `_derive_export_payload` only surfaces `model:*` genes, so the six
+optimized `screener:*` genes and the execution schedules had to be added to the payload by hand
+or the live universe would not have matched the backtest; and `allow_automated_trade_opening`
+defaults to False, so the importer now forces it on for a newly created instance.
 
 ## 2. Final deployment goal & gap analysis
 
