@@ -1228,6 +1228,13 @@ def _build_daily_trial_config(
         "fitness_trade_scale_target": backtest_cfg.get("fitness_trade_scale_target"),
         # Optional win-rate fitness factor (2 * win_rate_fraction; 50% win = 1.0x break-even).
         "fitness_win_rate_factor": backtest_cfg.get("fitness_win_rate_factor"),
+        # Spread-STRESS level (bps). This dict is a WHITELIST -- it rebuilds the per-trial config
+        # key by key rather than copying backtest_cfg -- so a knob missing HERE is silently dead
+        # no matter how correctly it was parsed, stored and echoed upstream. That is exactly what
+        # happened on the first stressed grid: --stress-spread-bps reached the optimize process
+        # and the run config, but never the trial config, so build_results echoed 0.0 and every
+        # "stressed" job was scored unstressed.
+        "stress_spread_bps": backtest_cfg.get("stress_spread_bps"),
         # Optimizer-decoded TradeRule lists (unified rule model, migration 028): the engine
         # seeds the ENTER_MARKET / OPEN_POSITIONS rulesets 1:1 from these (one EventAction per
         # rule, all actions + continue_processing verbatim; disabled rules/actions already

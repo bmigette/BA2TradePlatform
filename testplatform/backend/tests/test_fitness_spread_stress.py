@@ -124,3 +124,34 @@ def test_stressed_results_overwrites_the_adjusted_key_as_well():
     assert out is not None
     assert out["adjusted_annualized_return"] == out["annualized_return"]
     assert out["adjusted_annualized_return"] < base["annualized_return"]
+
+
+# --- the wiring, not just the maths -------------------------------------------------------
+
+def test_stress_level_survives_the_per_trial_config_whitelist():
+    """_build_daily_trial_config REBUILDS the config key by key instead of copying it, so a
+    knob absent from that whitelist is silently dead however correctly it was parsed upstream.
+
+    That is not hypothetical: the first stressed grid ran with --stress-spread-bps reaching the
+    optimize process and the run config, but not the trial config, so every "stressed" job was
+    scored unstressed and only the results blob (stress_spread_bps=0.0) gave it away. The unit
+    tests above all passed throughout, because they call compute_fitness directly and never
+    cross the config boundary.
+    """
+    from app.services.strategy_optimization_handler import _build_daily_trial_config
+
+    backtest_cfg = {
+        "backtest_id": "test-trial", "name": "unit",
+        "start_date": "2020-01-01", "end_date": "2025-12-31",
+        "initial_capital": 100000.0, "account_settings": {}, "warmup_days": 30, "seed": 42,
+        "experts": [{"class": "FMPRating", "settings": {}}],
+        "enabled_instruments": ["AAPL"],
+        "profit_cap_pct": 2000.0, "profit_share_cap_pct": 25.0,
+        "stress_spread_bps": 40.0,
+    }
+    cfg = _build_daily_trial_config(backtest_cfg, {})
+    assert cfg.get("stress_spread_bps") == 40.0, (
+        "stress_spread_bps was dropped by the per-trial config whitelist -- the GA would score "
+        "every genome unstressed while the CLI, the run config and the logs all claim otherwise")
+    # The sibling knobs prove the whitelist itself is working, so a failure above is specific.
+    assert cfg.get("profit_share_cap_pct") == 25.0
