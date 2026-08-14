@@ -45,8 +45,21 @@
 # trade counts before letting all 14 run.
 #
 # SPREAD + STRESS: Senate names are mostly mid/large caps, so the mid-band assumption (10 bps)
-# is the closest fit. STRESS_SPREAD_MULT defaults to 1.0 here — matrix 2 runs stressed, and a
-# Senate result that cannot be compared against it on the same basis is worth much less.
+# is the closest fit. STRESS_SPREAD_MULT defaults to 1.0.
+#
+# !!! MATRIX 3 FITNESS IS NOT COMPARABLE WITH MATRICES 1 AND 2 !!!
+#
+# Not by choice — by accident, then by decision. stress_spread_bps was dropped by
+# _build_daily_trial_config's whitelist (fixed in b991003 on 2026-08-12), so matrices 1 and 2
+# both ran UNSTRESSED despite the CLI, the wrapper and the driver all reporting otherwise.
+# Matrix 3 starts after the fix, so its stress is real. A stressed score is a DIFFERENT SCALE:
+# it is min(fitness at the modelled spread, fitness at double it), so a matrix 3 number is
+# systematically lower than a matrix 1/2 number for the same quality of genome.
+#
+# Compare WITHIN a matrix. To rank a matrix 3 winner against a matrix 1/2 winner, re-score the
+# older one through the same stress (tools/ post-hoc spread sweep — it re-scores a finished
+# trade list in milliseconds, no re-optimization) rather than comparing the raw fitness columns.
+# Set STRESS_SPREAD_MULT=0 if you would rather have comparability than robustness.
 #
 # RUN AFTER MATRIX 2. Both grids on one box will exhaust memory.
 #
