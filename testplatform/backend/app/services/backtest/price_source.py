@@ -84,27 +84,49 @@ def memory_stats() -> Dict[str, Any]:
     memory telemetry (diagnosing which cache depletes a worker box):
 
       * ``bar_cache``: the LRU-bounded parsed-bar columnar store (_WORKER_BAR_CACHE) —
-        entries + estimated MB (numpy nbytes + ~50B/key for the Python key list).
+        entries, distinct symbols, total bars + estimated MB (numpy nbytes + ~50B/key for
+        the Python key list).
       * ``series_memo``: MemoizedOHLCVProvider's full-DataFrame memo (_FULL_SERIES_MEMO) —
-        entries + estimated MB (shallow memory_usage; deep=True would rescan every frame).
+        entries, distinct symbols, total rows + estimated MB (shallow memory_usage;
+        deep=True would rescan every frame).
 
-    O(cache entries) with tiny constants — safe to call once per trial.
+    ``entries`` vs ``symbols``: an entry is keyed by (symbol, interval, window), so the two
+    are equal within one job and diverge only when a long-lived worker holds several windows
+    of the same symbol — which is exactly the accumulation this telemetry is meant to catch.
+
+    O(cache entries) with tiny constants (~25ms at a 500-symbol working set, against a
+    90s+ trial) — safe to call once per trial.
     """
     bar_bytes = 0
-    for cached in _WORKER_BAR_CACHE.values():
+    bars = 0
+    bar_symbols = set()
+    for key, cached in _WORKER_BAR_CACHE.items():
         keys = cached[0]
+        bars += len(keys)
         bar_bytes += len(keys) * 50
         for arr in cached[1:]:
             bar_bytes += getattr(arr, "nbytes", 0)
+        bar_symbols.add(key[0])          # key = (symbol, interval, fetch_start, end)
     memo_bytes = 0
-    for df in _FULL_SERIES_MEMO.values():
+    memo_rows = 0
+    memo_symbols = set()
+    for key, hit in _FULL_SERIES_MEMO.items():
+        # Values are (DataFrame, dates_ndarray) tuples -- see MemoizedOHLCVProvider._full. Calling
+        # .memory_usage() on the TUPLE raised AttributeError into the swallow below, so this whole
+        # layer silently reported 0.0 MB from the day the telemetry shipped. Unpack explicitly.
+        df, dates = hit if isinstance(hit, tuple) else (hit, None)
         try:
             memo_bytes += int(df.memory_usage(deep=False).sum())
+            memo_rows += len(df)
         except Exception:  # noqa: BLE001 — non-DataFrame entries just aren't counted
             pass
+        memo_bytes += getattr(dates, "nbytes", 0)
+        memo_symbols.add(key[0])         # key = (symbol, interval, bounds_start, bounds_end)
     return {
-        "bar_cache": {"entries": len(_WORKER_BAR_CACHE), "mb": round(bar_bytes / 1048576, 1)},
-        "series_memo": {"entries": len(_FULL_SERIES_MEMO), "mb": round(memo_bytes / 1048576, 1)},
+        "bar_cache": {"entries": len(_WORKER_BAR_CACHE), "symbols": len(bar_symbols),
+                      "bars": bars, "mb": round(bar_bytes / 1048576, 1)},
+        "series_memo": {"entries": len(_FULL_SERIES_MEMO), "symbols": len(memo_symbols),
+                        "rows": memo_rows, "mb": round(memo_bytes / 1048576, 1)},
     }
 
 

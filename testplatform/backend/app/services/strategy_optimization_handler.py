@@ -275,6 +275,30 @@ def _trial_memory_snapshot() -> Dict[str, Any]:
         return {"error": repr(e)}
 
 
+def _log_trial_memory(gen: int, n_gens: int, done: int, total: int, mem: Any) -> None:
+    """One compact INFO line per completed individual: worker RSS + what the two OHLCV caches
+    are holding (symbols / bars / MB).
+
+    WHY per-individual and not per-generation: the snapshot is taken INSIDE the worker that ran
+    the trial, so with a pool of N workers a per-generation sample would show whichever worker
+    happened to finish last and miss the one that is actually growing. Per-individual gives a
+    per-worker series for free.
+
+    WHY it was invisible before: ``_trial_worker`` has always attached this snapshot to its
+    result, but the only reader logged it on the FAILURE path — so a healthy run climbing toward
+    an OOM left no trail at all, and the first reading ever printed was from a worker that had
+    already broken. The cost is one preformatted line per ~90s trial.
+    """
+    if not isinstance(mem, dict) or mem.get("error"):
+        return
+    bc, sm = mem.get("bar_cache") or {}, mem.get("series_memo") or {}
+    logger.info(
+        f"mem gen {gen + 1}/{n_gens} ind {done}/{total} | rss {mem.get('rss_mb')}MB"
+        f" | bars {bc.get('symbols')} sym {bc.get('bars')} bars {bc.get('mb')}MB"
+        f" | memo {sm.get('symbols')} sym {sm.get('rows')} rows {sm.get('mb')}MB"
+    )
+
+
 def _persist_trial_worker(config: Dict[str, Any], ctl: Any = None) -> Dict[str, Any]:
     """Run a TOP-N re-run and return the FULL results dict (equity curve / trades / metrics) for
     the master to persist as a tagged Backtest.
@@ -640,6 +664,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                         fit = float(out["fitness"])
                         fits[i] = fit
                         memo.put(key, fit)
+                        _log_trial_memory(gen, n_gens, done + 1, total_in_batch, out.get("mem"))
                         all_results.append(
                             {"params": flat, "fitness": fit, "key": key, "trades": out["trades"]}
                         )
