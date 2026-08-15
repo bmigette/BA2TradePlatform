@@ -73,10 +73,55 @@ _WORKER_BAR_CACHE: "OrderedDict[Any, Any]" = OrderedDict()
 # symbols beyond the cap; eviction is result-neutral).
 _WORKER_BAR_CACHE_MAX = int(os.getenv("BT_BAR_CACHE_MAX", "1500"))
 
+# RECENCY BOUND, in INDIVIDUALS (the primary policy; the count cap above is now only a backstop).
+#
+# WHY the count cap alone was not enough -- measured 2026-08-15 on the goal2020 ED small-band job
+# (5min bars, 1368-symbol universe): each individual's screener touches a SUBSET (~565 symbols),
+# and different individuals touch different subsets, so the cache accumulates their UNION. It
+# climbs generation over generation toward the whole universe. Observed 506 -> 1125 symbols and
+# 3.9GB -> 8.5GB within ONE generation, heading for ~10.5GB/process (1368 x 7.7MB) -- and the cap
+# could never fire, because 1500 was set ABOVE the 1368-symbol universe. A count cap has to be
+# re-guessed for every universe; that guess is exactly what failed here.
+#
+# This bound is self-tuning instead: keep a series only while some individual in the last N has
+# actually used it. Memory then tracks the real working set (~N x one individual's subset) whatever
+# the universe size, and the pathological "union of everything" case cannot arise.
+#
+# COST: a symbol dropped and needed again re-parses its parquet (~12s per 300 symbols at 5min, so
+# ~23s for a 565-symbol set) -- result-neutral, and 3-5% against the 500s+ trials this job runs.
+# That is the trade that lets a box run 4 slots instead of 2.
+#
+# N=2 (not 1) keeps the cross-individual reuse this cache exists for when consecutive individuals
+# overlap. Lower it to 1 on a tight box: that bounds a process to ONE individual's set.
+_WORKER_BAR_CACHE_TRIALS = int(os.getenv("BT_BAR_CACHE_TRIALS", "2"))
+# key -> the _TRIAL_SEQ value of the most recent individual that used it.
+_BAR_CACHE_LAST_USED: Dict[Any, int] = {}
+# Monotonic per-process individual counter, bumped once per preload (= once per individual).
+_TRIAL_SEQ = 0
+
 
 def clear_worker_bar_cache() -> None:
     """Drop the process-wide parsed-bar cache (call between unrelated runs / in tests)."""
     _WORKER_BAR_CACHE.clear()
+    _BAR_CACHE_LAST_USED.clear()
+
+
+def _evict_bar_cache_by_recency() -> int:
+    """Drop series untouched for the last ``_WORKER_BAR_CACHE_TRIALS`` individuals. Returns the
+    number evicted.
+
+    Called at the END of preload, so the current individual's own series (stamped with the current
+    seq) are never candidates -- evicting those would free nothing anyway, since the live
+    AsOfPriceSource holds the same array objects for the duration of its trial.
+    """
+    if _WORKER_BAR_CACHE_TRIALS <= 0:          # 0/negative disables the recency bound entirely
+        return 0
+    cutoff = _TRIAL_SEQ - _WORKER_BAR_CACHE_TRIALS + 1
+    stale = [k for k, seq in _BAR_CACHE_LAST_USED.items() if seq < cutoff]
+    for k in stale:
+        _WORKER_BAR_CACHE.pop(k, None)
+        _BAR_CACHE_LAST_USED.pop(k, None)
+    return len(stale)
 
 
 def memory_stats() -> Dict[str, Any]:
@@ -301,6 +346,11 @@ class AsOfPriceSource:
             )
         fetch_start = start - timedelta(days=warmup_days)
         win = (self._interval, fetch_start.isoformat(), end.isoformat())
+        # One preload == one individual. Bump the counter FIRST so every touch below (hit or
+        # insert) stamps this individual's seq, and the end-of-preload sweep can tell "used by
+        # the last N individuals" from "carried over from older ones".
+        global _TRIAL_SEQ
+        _TRIAL_SEQ += 1
         missing: List[str] = []  # symbols with NO cached series anywhere (hermetic mode)
         for sym in symbols:
             # Worker-persistent reuse: a prior individual in this worker already parsed this
@@ -308,6 +358,10 @@ class AsOfPriceSource:
             cached = _WORKER_BAR_CACHE.get((sym, *win))
             if cached is not None:
                 _WORKER_BAR_CACHE.move_to_end((sym, *win))  # LRU: mark most-recently-used
+                # Stamp only entries that actually exist in the cache: a symbol that turns out to
+                # be a hermetic MISS below never gets stored, and stamping it here would leave a
+                # key in the tracking dict with nothing behind it.
+                _BAR_CACHE_LAST_USED[(sym, *win)] = _TRIAL_SEQ
                 (self._keys[sym], self._o[sym], self._h[sym],
                  self._l[sym], self._c[sym], self._v[sym]) = cached
                 continue
@@ -337,10 +391,17 @@ class AsOfPriceSource:
                 self._keys[sym], self._o[sym], self._h[sym],
                 self._l[sym], self._c[sym], self._v[sym],
             )
-            # LRU bound: evict the least-recently-used series so a long-lived worker running many
-            # optimizations (different universes, same window) can't accumulate every band and OOM.
+            _BAR_CACHE_LAST_USED[(sym, *win)] = _TRIAL_SEQ
+            # Count cap: now only a BACKSTOP behind the recency sweep below (it could never fire
+            # on the goal2020 ED job, whose 1368-symbol universe sits under the 1500 default).
+            # Kept so a pathological single individual still cannot outrun the bound.
             while len(_WORKER_BAR_CACHE) > _WORKER_BAR_CACHE_MAX:
-                _WORKER_BAR_CACHE.popitem(last=False)
+                k, _ = _WORKER_BAR_CACHE.popitem(last=False)
+                _BAR_CACHE_LAST_USED.pop(k, None)
+
+        # PRIMARY bound: drop series no individual in the last N has touched. Runs after the loop
+        # so the current individual's series are all stamped and safe.
+        _evict_bar_cache_by_recency()
 
         if missing:
             interval = self._interval
