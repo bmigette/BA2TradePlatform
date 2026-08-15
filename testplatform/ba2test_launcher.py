@@ -1904,7 +1904,29 @@ def _build_strategy_S1(name: str, expert: str):
     repo_root = os.path.dirname(os.path.abspath(__file__))
     path = os.path.join(repo_root, "docs", "live_rulesets", f"{expert}.json")
     if not os.path.isfile(path):
-        sys.exit(f"optimize: S1 needs {path}; run `python backend/scripts/export_live_rulesets.py` first.")
+        # FALLBACK to a COMMITTED default seed. Sourcing S1 only from a live export made the seed
+        # a side effect of production state and created a chicken-and-egg for every NEW expert:
+        # S1 needs a live ruleset, the live ruleset can only be exported from a deployed instance,
+        # and you would not deploy before optimizing. DeterministicScorer hit exactly this on
+        # 2026-08-15 -- S1 died instantly in all 6 band/matrix combinations.
+        #
+        # A checked-in default is also more reproducible: a live export drifts whenever someone
+        # edits the live ruleset, so re-running an old S1 job could silently search a different
+        # space than it did before. The default file cannot drift without a commit.
+        default_path = os.path.join(repo_root, "docs", "default_rulesets", f"{expert}.json")
+        if os.path.isfile(default_path):
+            path = default_path
+        else:
+            sys.exit(
+                f"optimize: S1 needs a seed ruleset for {expert} and found neither:\n"
+                f"  live    {path}\n"
+                f"          (export from a deployed instance: "
+                f"`python backend/scripts/export_live_rulesets.py`)\n"
+                f"  default {default_path}\n"
+                f"          (commit a default seed here for an expert with no live deployment)\n"
+                f"An expert with no live instance should use the default file; S1 then optimizes "
+                f"from those defaults instead of replicating a live config."
+            )
     with open(path, encoding="utf-8") as f:
         data = _json.load(f)
 
