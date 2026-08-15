@@ -36,6 +36,31 @@ def test_timing_survives_a_failed_memory_probe(caplog):
     assert "no mem probe" in caplog.text
 
 
+def test_line_survives_the_optimize_run_global_logging_disable(caplog):
+    """THE test. An optimize run installs a GLOBAL logging.disable(INFO) for its whole duration
+    (strategy_optimization_handler ~line 795, and again around the top-N re-runs in
+    ba2test_launcher ~line 3174) to kill ~17k records/trial. It short-circuits at the manager
+    level BEFORE a LogRecord is built, so an info() here would not be filtered -- it would never
+    happen, for the entire run, on every worker.
+
+    Caught pre-launch: the line shipped as info() and would have produced an empty log across a
+    multi-day job while the code read as correct. WARNING+ is the documented escape hatch.
+    """
+    import logging as _logging
+
+    prior = _logging.root.manager.disable
+    _logging.disable(_logging.INFO)          # exactly what a real optimize run does
+    try:
+        with caplog.at_level(logging.DEBUG):
+            _log_trial_memory(2, 8, 12, 20, MEM, secs=104.7)
+        assert "2410MB" in caplog.text, (
+            "the per-individual telemetry was swallowed by the optimize run's "
+            "logging.disable(INFO) -- it must be logged at WARNING or above")
+        assert "104.7s" in caplog.text
+    finally:
+        _logging.disable(prior)
+
+
 def test_never_raises_on_absent_or_malformed_telemetry(caplog):
     """Runs in the GA's per-individual path: a missing/odd snapshot must degrade to silence,
     never take down a trial that actually succeeded."""

@@ -295,15 +295,24 @@ def _log_trial_memory(gen: int, n_gens: int, done: int, total: int, mem: Any,
     result, but the only reader logged it on the FAILURE path — so a healthy run climbing toward
     an OOM left no trail at all, and the first reading ever printed was from a worker that had
     already broken. The cost is one preformatted line per ~90s trial.
+
+    WHY warning() AND NOT info(): an optimize run installs a GLOBAL ``logging.disable(INFO)`` for
+    its whole duration (see run_strategy_optimization, and again around the top-N re-runs in
+    ba2test_launcher) to kill ~17k records/trial. That short-circuits at the manager level before
+    any LogRecord exists, so an info() here is not merely filtered — it never happens, for the
+    entire run, on every worker. WARNING+ is the documented escape hatch and is what the sibling
+    diagnostics ("trial failed in worker", the distributed_eval worker notices) already use.
+    Downgrading this to info() re-breaks it silently: the code looks right and the log is empty.
     """
     if not isinstance(mem, dict) or mem.get("error"):
         # Still surface the timing even if the memory probe failed -- a rising trial time is a
         # signal on its own, and losing it to an unrelated psutil hiccup would be a waste.
         if secs is not None:
-            logger.info(f"mem gen {gen + 1}/{n_gens} ind {done}/{total} | {secs}s | (no mem probe)")
+            logger.warning(
+                f"mem gen {gen + 1}/{n_gens} ind {done}/{total} | {secs}s | (no mem probe)")
         return
     bc, sm = mem.get("bar_cache") or {}, mem.get("series_memo") or {}
-    logger.info(
+    logger.warning(
         f"mem gen {gen + 1}/{n_gens} ind {done}/{total}"
         + (f" | {secs}s" if secs is not None else "")
         + f" | rss {mem.get('rss_mb')}MB"
