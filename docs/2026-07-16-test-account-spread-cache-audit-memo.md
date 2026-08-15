@@ -166,7 +166,44 @@ large-cap).
 | FMPEarningsDrift | 4 | 4 | **0 — closed 2026-07-19** | mid (S1top1 id16, reseeded S2top1 id20) + small (S1top1 id22, S7top2 id23) — 2/2 |
 | FMPInsiderClusterBuy | 4 | 4 | **0 — closed 2026-07-19** | mid (S2top3 id19, S7top2 id25) + small (S1top3 id21, S7top1 id24) — 2/2 |
 | FMPSenateTraderWeight | 2 | 2 | **0 — closed 2026-07-20** | not band-split (Senate's universe spans all bands — single blended assumption per `tools/run_senate_matrix.py`); deployed S3top3 (id28, bt739) + S5top2 (id29, bt743) to BA2-Test3, best 2 by `consistent_annual_return` fitness across the full S2/S3/S5/S6 matrix |
-| **Total** | **24** | **24** | **at target** | |
+| DeterministicScorer | 6 | 0 | **6 — BLOCKED, see below** | 2 per band x large/mid/small, to **BA2-Test3** (account 3). Deploy AFTER its optimization completes — target set 2026-08-15. |
+| **Total** | **30** | **24** | **6 (DeterministicScorer)** | |
+
+**2026-08-15 — DeterministicScorer target added (6 instances, account 3), BLOCKED on optimization.**
+Deploy only once the opt is complete; there is currently **nothing to deploy from — zero
+completed DeterministicScorer backtests exist**, so no persisted top-N and no validated
+settings.
+
+What the evidence says, precisely:
+- `scr-large-DeterministicScorer-S2-goal2020-riskatr` (opt 312): 18 trials, up to **132 trades**,
+  best fitness **1.72**. The expert FUNCTIONS and trades in the large band.
+- mid (opt 313) / small (opt 314) show the all-trials-failed fitness sentinels (-1e9 / -1e8), but
+  each had only **2 trials** before the grid was stopped for the bar-cache memory work. That is an
+  insufficient sample, **not** evidence the expert is broken in those bands. Do not record it as a
+  failure without a real run.
+
+Path to unblocking: DeterministicScorer was removed from matrices 1 and 2 on 2026-08-15 (it had
+been silently duplicating matrix 3's PHASE B — 18 shadow jobs under near-identical names). **Matrix
+3 PHASE B (`tools/grid_goal2020_matrix3.sh`) is now the ONLY thing that searches it, and it is not
+running.** Run it, then deploy its top-N.
+
+Two corrections to assumptions made while investigating this:
+- **The live expert registry is NOT broken.** `from ba2_experts import DeterministicScorer` yields
+  the CLASS. Importing from `ba2_trade_platform.modules.experts` yields the shim MODULE instead,
+  because the in-tree `DeterministicScorer.py` shadows the name in that namespace. The live registry
+  (`_build_experts_list`) imports from `ba2_experts`, so it is correct.
+- **Account 3 holds no options instances** (a swap "instead of options" was considered). As of
+  2026-08-15 it holds id 4 `PennyMomentumTrader` (disabled), ids 28/29 `FMPSenateTraderWeight`,
+  id 32 `FMPEarningsDrift`. Decide explicitly what is retired before removing any live instance.
+
+Related fix: **S1 no longer requires a live deployment to seed.** It sourced its ruleset only from
+`docs/live_rulesets/<Expert>.json`, produced by exporting a DEPLOYED instance — a chicken-and-egg
+that made S1 fail instantly for every new expert and created pressure to deploy an unvalidated
+expert just to unblock a backtest. S1 now falls back to a committed
+`docs/default_rulesets/<Expert>.json` (a live export also DRIFTS, so a committed seed is the more
+reproducible provenance). **Still owed: `docs/default_rulesets/DeterministicScorer.json` itself** —
+it needs the expert's real condition vocabulary, since a skeleton copied from another expert would
+search a mismatched space and quietly waste the job.
 
 **2026-07-19 update — EarningsDrift small-band gap closed**: the small-band grid (opt166=S1,
 opt167=S2, plus S7 from an earlier phase, opt195) finished. S2's full top-5 (opt167:
