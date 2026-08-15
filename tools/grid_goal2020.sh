@@ -166,16 +166,26 @@ run_matrix() {                      # $1=mode  $2=name-suffix  $3...=extra drive
   done
 }
 
+# DeterministicScorer belongs to MATRIX 3 (grid_goal2020_matrix3.sh, PHASE B), not here. Its
+# absence from these matrices was DOCUMENTED in that script's PHASE B header ("Skipped from
+# matrices 1 and 2 via --skip-experts") but never actually wired: the driver's _CLASSIC list has
+# included it since 2026-08-09 (310f669) and neither run_matrix call below excluded it. The result
+# was 3 strategies x 3 bands x 2 matrices = 18 duplicate jobs shadowing matrix 3's own 18-job
+# PHASE B under near-identical names (-goal2020-riskatr vs -goal2020-riskatr-ds).
+# Keep this in sync with matrix 3: an expert owned by matrix 3 must be skipped in BOTH matrices
+# here AND in the S5/S6/S7 pair below.
+DS_SKIP=DeterministicScorer
+
 # --- matrix 1: risk_atr ------------------------------------------------------------------------
 # NOTE the `=` in --name-suffix=-... : the value starts with a dash, which argparse would
 # otherwise read as another flag.
 echo; echo "=== matrix 1/2  risk_atr  $(date)"
-run_matrix risk_atr -goal2020-riskatr "$@"
+run_matrix risk_atr -goal2020-riskatr --skip-experts "$DS_SKIP" "$@"
 echo "=== matrix 1/2  done $(date)"
 
 # --- matrix 2: notional ------------------------------------------------------------------------
 echo; echo "=== matrix 2/2  notional  $(date)"
-run_matrix notional -goal2020-notional --skip-experts FactorRanker "$@"
+run_matrix notional -goal2020-notional --skip-experts "FactorRanker,$DS_SKIP" "$@"
 echo "=== matrix 2/2  done $(date)"
 
 # --- matrices 3 & 4: the S5/S6/S7 strategies -------------------------------------------------
@@ -195,11 +205,11 @@ echo "=== matrix 2/2  done $(date)"
 STRATEGIES_EXTRA="${STRATEGIES_EXTRA-S5,S6,S7}"
 if [ -n "$STRATEGIES_EXTRA" ]; then
   echo; echo "=== matrix 3/4  risk_atr  strategies=$STRATEGIES_EXTRA  $(date)"
-  run_matrix risk_atr -goal2020-riskatr --strategies "$STRATEGIES_EXTRA" "$@"
+  run_matrix risk_atr -goal2020-riskatr --skip-experts "$DS_SKIP" --strategies "$STRATEGIES_EXTRA" "$@"
   echo "=== matrix 3/4  done $(date)"
 
   echo; echo "=== matrix 4/4  notional  strategies=$STRATEGIES_EXTRA  $(date)"
-  run_matrix notional -goal2020-notional --skip-experts FactorRanker --strategies "$STRATEGIES_EXTRA" "$@"
+  run_matrix notional -goal2020-notional --skip-experts "FactorRanker,$DS_SKIP" --strategies "$STRATEGIES_EXTRA" "$@"
   echo "=== matrix 4/4  done $(date)"
 fi
 
