@@ -91,9 +91,21 @@ _WORKER_BAR_CACHE_MAX = int(os.getenv("BT_BAR_CACHE_MAX", "1500"))
 # ~23s for a 565-symbol set) -- result-neutral, and 3-5% against the 500s+ trials this job runs.
 # That is the trade that lets a box run 4 slots instead of 2.
 #
-# N=2 (not 1) keeps the cross-individual reuse this cache exists for when consecutive individuals
-# overlap. Lower it to 1 on a tight box: that bounds a process to ONE individual's set.
-_WORKER_BAR_CACHE_TRIALS = int(os.getenv("BT_BAR_CACHE_TRIALS", "2"))
+# N=1 -- MEASURED, not assumed. N=2 shipped first (to preserve cross-individual reuse) and was
+# WRONG: on the goal2020 ED small-band job an individual's working set is ~600 symbols and
+# consecutive individuals overlap very little, so a 2-window retained two nearly-disjoint sets --
+# 1423 symbols / 12.6GB RSS per process, and 4 local slots exhausted a 64GB box (9MB free) exactly
+# as before the fix. Confirmed by the per-individual telemetry: single-set workers sat at 547-613
+# symbols / ~5GB, while the peak hit 1423.
+#
+# N=1 bounds a process to ONE individual's set (~600 symbols, ~5GB), so 4 local slots ~= 20GB and
+# the remote's 6 slots ~= 30GB of its 65GB. The reuse given up costs a re-parse per individual
+# (~23s for a 600-symbol set) against trials measured at 250-2400s here -- 1-10%.
+#
+# Raise it only on a box with headroom to spare, and only after checking the `mem gen ... sym`
+# telemetry for the job in question: the right N depends on how much CONSECUTIVE individuals
+# overlap, which is a property of the expert's screener, not a constant.
+_WORKER_BAR_CACHE_TRIALS = int(os.getenv("BT_BAR_CACHE_TRIALS", "1"))
 # key -> the _TRIAL_SEQ value of the most recent individual that used it.
 _BAR_CACHE_LAST_USED: Dict[Any, int] = {}
 # Monotonic per-process individual counter, bumped once per preload (= once per individual).
