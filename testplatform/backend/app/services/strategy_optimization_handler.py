@@ -230,9 +230,15 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str, ctl: Any = None) 
         from app.services.backtest.daily_backtest_handler import run_daily_backtest
         from app.services.strategy_fitness import compute_fitness
 
+        # Wall time for THIS individual, measured inside the worker so it is pure compute and
+        # excludes dispatch/queue wait. Logged next to the memory numbers because the two rise
+        # together under cache pressure: a working set that outgrows RAM shows up as trials
+        # getting slower BEFORE it shows up as an OOM, so a rising secs on flat cache counts is
+        # the early warning (and rules memory in or out as the cause of a slowdown).
+        _t0 = _time.monotonic()
         results = run_daily_backtest(config, progress_cb=_cancel_progress_cb(ctl))
         fit = compute_fitness(fitness_metric, results)
-        out = {"ok": True, "fitness": float(fit),
+        out = {"ok": True, "fitness": float(fit), "secs": round(_time.monotonic() - _t0, 1),
                "trades": int(results.get("total_trades") or 0), "error": None,
                # Per-trial memory telemetry (a few psutil/len calls — negligible): RSS of
                # THIS worker process + the two per-process OHLCV caches, so a memory-driven
@@ -275,9 +281,10 @@ def _trial_memory_snapshot() -> Dict[str, Any]:
         return {"error": repr(e)}
 
 
-def _log_trial_memory(gen: int, n_gens: int, done: int, total: int, mem: Any) -> None:
-    """One compact INFO line per completed individual: worker RSS + what the two OHLCV caches
-    are holding (symbols / bars / MB).
+def _log_trial_memory(gen: int, n_gens: int, done: int, total: int, mem: Any,
+                      secs: Any = None) -> None:
+    """One compact INFO line per completed individual: trial wall time + worker RSS + what the
+    two OHLCV caches are holding (symbols / bars / MB).
 
     WHY per-individual and not per-generation: the snapshot is taken INSIDE the worker that ran
     the trial, so with a pool of N workers a per-generation sample would show whichever worker
@@ -290,10 +297,16 @@ def _log_trial_memory(gen: int, n_gens: int, done: int, total: int, mem: Any) ->
     already broken. The cost is one preformatted line per ~90s trial.
     """
     if not isinstance(mem, dict) or mem.get("error"):
+        # Still surface the timing even if the memory probe failed -- a rising trial time is a
+        # signal on its own, and losing it to an unrelated psutil hiccup would be a waste.
+        if secs is not None:
+            logger.info(f"mem gen {gen + 1}/{n_gens} ind {done}/{total} | {secs}s | (no mem probe)")
         return
     bc, sm = mem.get("bar_cache") or {}, mem.get("series_memo") or {}
     logger.info(
-        f"mem gen {gen + 1}/{n_gens} ind {done}/{total} | rss {mem.get('rss_mb')}MB"
+        f"mem gen {gen + 1}/{n_gens} ind {done}/{total}"
+        + (f" | {secs}s" if secs is not None else "")
+        + f" | rss {mem.get('rss_mb')}MB"
         f" | bars {bc.get('symbols')} sym {bc.get('bars')} bars {bc.get('mb')}MB"
         f" | memo {sm.get('symbols')} sym {sm.get('rows')} rows {sm.get('mb')}MB"
     )
@@ -664,7 +677,8 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                         fit = float(out["fitness"])
                         fits[i] = fit
                         memo.put(key, fit)
-                        _log_trial_memory(gen, n_gens, done + 1, total_in_batch, out.get("mem"))
+                        _log_trial_memory(gen, n_gens, done + 1, total_in_batch,
+                                          out.get("mem"), out.get("secs"))
                         all_results.append(
                             {"params": flat, "fitness": fit, "key": key, "trades": out["trades"]}
                         )
