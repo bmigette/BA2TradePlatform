@@ -3813,7 +3813,14 @@ def main(argv: "list | None" = None) -> int:
                          "(e.g. 'goal5,S4' — one for the grid/batch id, one for the strategy). Lets "
                          "runs be filtered by ANY one of these tags via GET /api/backtests?label=..., "
                          "independent of cap-band or optimization_id. Default: none.")
-    op.add_argument("--commission", type=float, default=1.0)
+    op.add_argument("--commission", type=float, default=0.1,
+                    help="Flat $ commission per FILL (charged twice per round trip). Default 0.1. "
+                         "WAS 1.0 until 2026-08-16: at the $10k account size these runs use, $1 a "
+                         "fill is ~0.07%% of a typical position against an average trade of "
+                         "+0.19%% -- i.e. the assumed commission alone consumed roughly a third "
+                         "of the modelled edge, which is not what a real commission-free equity "
+                         "broker charges. Scores are NOT comparable across a change to this "
+                         "value: every stored result before that date carries the 1.0 cost model.")
     op.add_argument("--slippage", type=float, default=0.0)
     op.add_argument("--spread-bps", type=float, default=0.0,
                     help="Round-trip bid-ask spread in basis points, modeled properly at the "
@@ -3936,7 +3943,10 @@ def main(argv: "list | None" = None) -> int:
     ob.add_argument("--profit-share-cap-pct", type=float, default=25.0,
                     help="Cap each trade's gain at this %% of the run's NET profit for the ADJUSTED "
                          "fitness/return (25). Default-on; see `optimize --profit-share-cap-pct`.")
-    ob.add_argument("--commission", type=float, default=1.0)
+    ob.add_argument("--commission", type=float, default=0.1,
+                    help="Flat $ commission per FILL (see optimize --commission; default lowered "
+                         "from 1.0 on 2026-08-16). Kept in step with the optimize default so a "
+                         "single backtest and a GA trial price the same trade identically.")
     ob.add_argument("--slippage", type=float, default=0.0)
     ob.add_argument("--spread-bps", type=float, default=0.0,
                     help="Round-trip bid-ask spread in basis points (see optimize --spread-bps).")
