@@ -355,7 +355,17 @@ _MEM_THROTTLE_PCT = float(_os.getenv("BT_MEM_THROTTLE_PCT", "10"))   # release c
 _MEM_EMERGENCY_PCT = float(_os.getenv("BT_MEM_EMERGENCY_PCT", "5"))  # break the pool (frees all)
 # Recycle a pool worker after this many individuals (None disables). Backstop for anything the
 # cache release cannot reach -- allocator arenas, and the non-cache RSS growth measured 2026-08-16.
-_MAX_TASKS_PER_CHILD = int(_os.getenv("BT_MAX_TASKS_PER_CHILD", "8")) or None
+# DEFAULT OFF (2026-08-16). Recycling DEADLOCKS the local pool on Windows: opt 328 hung for 2.5h
+# with zero workers alive, the MainThread parked in as_completed and QueueFeederThread blocked in
+# _send_bytes -- i.e. the feeder was writing into a call queue no process was draining, because all
+# 4 workers had retired at exactly 4 x 8 = 32 individuals (the FIRST recycle wave) and their
+# replacements never came up. No BrokenProcessPool is raised in that state, so the pool-recovery
+# path never fires and the job hangs forever instead of failing.
+# The backstop it provided is now largely redundant: the int64 bar keys halved the per-symbol store
+# and the memory governor still releases caches / breaks the pool under real pressure. Set
+# BT_MAX_TASKS_PER_CHILD to re-enable if a box needs it -- but only on the DISTRIBUTED path, which
+# recovers from a broken pool.
+_MAX_TASKS_PER_CHILD = int(_os.getenv("BT_MAX_TASKS_PER_CHILD", "0")) or None
 
 
 class MemoryGovernor:
@@ -813,14 +823,30 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         # (master-as-worker pool consumers + remote HTTP workers). The memo/progress/persist
         # collection loop below is identical for both — only WHERE a trial runs differs.
         def _local_execute_jobs(jobs):
-            from concurrent.futures import as_completed
+            from concurrent.futures import as_completed, TimeoutError as _FTimeout
             futures = {
                 _pool.submit(_trial_worker, cfg, opt.fitness_metric): (i, flat, key)
                 for (i, flat, key, cfg) in jobs
             }
-            for fut in as_completed(futures):
-                i, flat, key = futures[fut]
-                yield (i, flat, key, fut.result())
+            # STALL GUARD. A wedged pool (see _MAX_TASKS_PER_CHILD) leaves this generator blocked
+            # in as_completed with no error, no log line and no end -- opt 328 sat there 2.5h and
+            # would have sat there indefinitely. A timeout cannot distinguish "wedged" from "slow"
+            # by itself, so it is set from the SLOWEST trial actually observed (1104s on this grid)
+            # with a wide margin, and it FAILS LOUDLY rather than trying to recover: an aborted job
+            # is visible and restartable, a silent hang costs a night.
+            _stall_s = float(_os.getenv("BT_LOCAL_STALL_TIMEOUT_S", "5400"))
+            try:
+                for fut in as_completed(futures, timeout=_stall_s):
+                    i, flat, key = futures[fut]
+                    yield (i, flat, key, fut.result())
+            except _FTimeout:
+                pending = sum(1 for f in futures if not f.done())
+                logger.error(
+                    f"LOCAL POOL STALLED: {pending}/{len(futures)} trials made no progress in "
+                    f"{_stall_s:.0f}s. This is the pool-recycle deadlock (all workers retired, "
+                    f"replacements never started, queue feeder blocked). Aborting the job so it "
+                    f"can be restarted -- check BT_MAX_TASKS_PER_CHILD is unset.")
+                raise
 
         def make_batch_fitness(execute_jobs):
             def batch_fitness(param_dicts: list) -> list:
