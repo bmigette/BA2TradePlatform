@@ -7,13 +7,14 @@ processes alive: every worker had retired and no replacement started, so the fee
 into a call queue nobody drains. CPython raises no BrokenProcessPool in that state, so the pool
 recovery path never fires and the job hangs SILENTLY -- no error, no log line, forever.
 
-The recycle itself is worth keeping (a respawn returns pymalloc arenas the cache release cannot).
-So it moved to the master, which rebuilds the pool between chunks when nothing is in flight.
+The recycle itself is worth keeping (a respawn returns pymalloc arenas the cache release cannot),
+so it moved to the master. LOCAL runs use one single-worker pool per slot (_SlotPools): a slot is
+recycled while IDLE, between its own trials, so the other slots never pause. DISTRIBUTED runs keep
+one shared executor -- several consumer threads submit into it -- and recycle it at the batch
+boundary, where nothing is in flight (measured 1.9s).
 """
 import re
 from pathlib import Path
-
-import pytest
 
 SRC = (Path(__file__).resolve().parents[1]
        / "app" / "services" / "strategy_optimization_handler.py")
@@ -33,7 +34,7 @@ def test_executor_is_never_given_max_tasks_per_child():
     assert "max_tasks_per_child" not in ctor.group(1), (
         "ProcessPoolExecutor was given max_tasks_per_child again -- this deadlocks on "
         "Windows/spawn when workers retire mid-flight (opt 328, 2h25m silent hang). The recycle "
-        "belongs in _local_execute_jobs, at a chunk boundary where nothing is in flight.")
+        "belongs in _SlotPools (local, per idle slot) or the batch boundary (distributed).")
 
 
 def test_recycle_is_still_enabled_by_default():
@@ -44,14 +45,20 @@ def test_recycle_is_still_enabled_by_default():
     assert int(m.group(1)) > 0, "worker recycling was disabled rather than fixed"
 
 
-def test_recycle_happens_only_between_chunks():
-    """The teardown must sit AFTER the as_completed drain loop, not inside it."""
+def test_local_path_recycles_per_slot_not_globally():
+    """The local dispatcher must feed IDLE slots, never drain everything to rebuild one pool.
+
+    A chunk-and-barrier design is correct but wastes the fleet: this grid has 1104s genomes
+    against a 57s median, so three slots would idle a quarter of an hour waiting on one straggler,
+    several times per generation.
+    """
     body = TEXT[TEXT.index("def _local_execute_jobs"):]
     body = body[:body.index("def make_batch_fitness")]
-    assert "_recycle_pool(" in body, "the chunk loop no longer recycles the pool"
-    drain = body.index("as_completed(")
-    recycle = body.index("_recycle_pool(")
-    assert recycle > drain, "the recycle must follow the drain, never run during it"
+    assert "idle_slots()" in body, "the dispatcher no longer fills idle slots"
+    assert "mark_done(" in body, "slots are never released back to idle"
+    assert "as_completed(" not in body, (
+        "as_completed waits on a fixed submitted set -- that is the chunk-barrier shape this "
+        "replaced. FIRST_COMPLETED + refill is what keeps every slot busy.")
 
 
 def test_stall_guard_present():
@@ -105,17 +112,118 @@ def test_recycle_pool_survives_a_failing_shutdown():
     assert any("shutdown raised" in m for m in logs)
 
 
-@pytest.mark.parametrize("n_jobs,recycle,workers,expected_chunks", [
-    (140, 8, 4, 5),    # the real shape: 140 individuals, chunk 32 -> 5 chunks (4 rebuilds)
-    (32, 8, 4, 1),     # exactly one chunk -> NO rebuild (nothing follows it)
-    (10, 8, 4, 1),
-    (100, 8, 2, 7),    # chunk 16
-])
-def test_chunk_arithmetic(n_jobs, recycle, workers, expected_chunks):
-    """Pins the cadence the comment promises, so a later tweak cannot silently make the chunk the
-    whole batch (recycle never runs) or size 1 (a barrier per trial)."""
-    chunk = max(1, recycle * max(1, workers))
-    chunks = list(range(0, n_jobs, chunk))
-    assert len(chunks) == expected_chunks
-    rebuilds = sum(1 for start in chunks if (start + chunk) < n_jobs)
-    assert rebuilds == expected_chunks - 1, "no rebuild after the final chunk -- it would be waste"
+# ---------------------------------------------------------------------------------------
+# _SlotPools: the staggered recycle
+# ---------------------------------------------------------------------------------------
+class _FakeFuture:
+    def __init__(self, val=None):
+        self._val = val
+
+    def result(self, timeout=None):
+        return self._val
+
+
+class _CountingPool:
+    """A stand-in executor that records submissions and shutdowns."""
+    _serial = 0
+
+    def __init__(self):
+        _CountingPool._serial += 1
+        self.id = _CountingPool._serial
+        self.submitted = []
+        self.shut = False
+
+    def submit(self, fn, *a):
+        self.submitted.append((fn, a))
+        return _FakeFuture(self.id)
+
+    def shutdown(self, wait=True, cancel_futures=False):
+        self.shut = True
+
+
+def _slots(n=3, every=2):
+    from app.services.strategy_optimization_handler import _SlotPools
+    return _SlotPools(_CountingPool, n, every, log=lambda m: None)
+
+
+def test_only_the_due_slot_is_recycled():
+    """THE point of the design: recycling slot 0 must leave slots 1..n-1 and their in-flight
+    work completely untouched. A shared pool cannot do this."""
+    sp = _slots(n=3, every=2)
+    before = [p.id for p in sp.pools]
+
+    for _ in range(2):                       # slot 0 reaches its quota
+        f = sp.submit(0, print); sp.mark_done(f)
+    f = sp.submit(0, print)                  # this submit triggers slot 0's recycle
+    sp.mark_done(f)
+
+    after = [p.id for p in sp.pools]
+    assert after[0] != before[0], "the due slot was not recycled"
+    assert after[1:] == before[1:], "recycling one slot must not disturb the others"
+    assert sp.recycles == 1
+
+
+def test_a_busy_slot_is_never_handed_more_work():
+    sp = _slots(n=2, every=99)
+    f = sp.submit(0, print)
+    assert sp.idle_slots() == [1], "a slot with an in-flight trial must not look idle"
+    sp.mark_done(f)
+    assert sp.idle_slots() == [0, 1]
+
+
+def test_task_counter_resets_on_recycle():
+    """Otherwise the slot would rebuild on every subsequent submit."""
+    sp = _slots(n=1, every=2)
+    for _ in range(2):
+        sp.mark_done(sp.submit(0, print))
+    sp.mark_done(sp.submit(0, print))        # recycles, counter -> 1
+    assert sp.tasks[0] == 1
+    assert sp.recycles == 1
+    sp.mark_done(sp.submit(0, print))        # counter 2, no recycle yet
+    assert sp.recycles == 1
+
+
+def test_recycle_disabled_when_interval_is_zero():
+    sp = _slots(n=1, every=0)
+    ids = [p.id for p in sp.pools]
+    for _ in range(10):
+        sp.mark_done(sp.submit(0, print))
+    assert [p.id for p in sp.pools] == ids
+    assert sp.recycles == 0
+
+
+def test_release_all_hits_every_slot_exactly_once():
+    """The shared-pool release oversubscribes 3x and HOPES each worker picks one up. With one
+    worker per pool the coverage is exact -- a missed worker keeps its caches until its next
+    preload, which is what the governor is trying to prevent."""
+    sp = _slots(n=4, every=99)
+    sp.release_all()
+    assert all(len(p.submitted) == 1 for p in sp.pools)
+
+
+def test_release_all_survives_a_dead_slot():
+    sp = _slots(n=3, every=99)
+
+    class _Dead(_CountingPool):
+        def submit(self, fn, *a):
+            raise RuntimeError("pool is shut down")
+
+    sp.pools[1] = _Dead()
+    sp.release_all()                                  # must not raise
+    assert len(sp.pools[0].submitted) == 1
+    assert len(sp.pools[2].submitted) == 1
+
+
+def test_shutdown_covers_every_slot():
+    sp = _slots(n=3, every=99)
+    sp.shutdown()
+    assert all(p.shut for p in sp.pools)
+
+
+def test_release_pool_memory_prefers_the_exact_per_slot_path():
+    from app.services.strategy_optimization_handler import _release_pool_memory
+    sp = _slots(n=3, every=99)
+    logs = []
+    _release_pool_memory(sp, 3, log=logs.append)
+    assert all(len(p.submitted) == 1 for p in sp.pools)
+    assert any("per-slot" in m for m in logs)

@@ -437,6 +437,80 @@ class MemoryGovernor:
         return "ok"
 
 
+class _SlotPools:
+    """One SINGLE-WORKER pool per slot, so a worker can be recycled without a global barrier.
+
+    WHY THIS EXISTS. Recycling a SHARED ProcessPoolExecutor forces a choice between two bad
+    options: let the executor retire workers mid-flight (``max_tasks_per_child``, which deadlocks
+    on Windows/spawn -- opt 328 hung 2h25m), or drain every in-flight trial before rebuilding, so
+    the whole fleet waits on the chunk's slowest genome. On this grid trial times run 6s..1104s
+    against a 57s median, so that barrier can idle three workers for a quarter of an hour, several
+    times per generation.
+
+    With one pool per slot, each has its OWN call queue and feeder. A slot that has hit its task
+    quota is torn down and respawned while it is IDLE -- by construction, since a slot is only
+    handed a new trial when its previous one has resolved -- and the other slots never notice.
+    Same worker count, same memory reclaim, no barrier.
+
+    Used on the LOCAL path only. The distributed path keeps the shared pool: its consumers submit
+    continuously from several threads, and it already recycles at the batch boundary (measured
+    1.9s), so it has no barrier worth removing.
+    """
+
+    def __init__(self, make_one, n: int, recycle_every: int, log=logger.warning):
+        self._make = make_one
+        self._log = log
+        self.recycle_every = int(recycle_every or 0)
+        self.pools = [make_one() for _ in range(n)]
+        self.tasks = [0] * n                 # trials run by the CURRENT process in this slot
+        self.busy: list = [None] * n         # in-flight future per slot, None when idle
+        self.recycles = 0
+
+    def idle_slots(self):
+        return [i for i, f in enumerate(self.busy) if f is None]
+
+    def submit(self, idx: int, fn, *args):
+        """Recycle this slot if it is due, then submit. The slot MUST be idle."""
+        if self.recycle_every and self.tasks[idx] >= self.recycle_every:
+            self.pools[idx] = _recycle_pool(
+                self.pools[idx], self._make, self.tasks[idx], self.recycle_every,
+                log=lambda m: self._log(f"slot {idx}: {m}"))
+            self.tasks[idx] = 0
+            self.recycles += 1
+        fut = self.pools[idx].submit(fn, *args)
+        self.busy[idx] = fut
+        self.tasks[idx] += 1
+        return fut
+
+    def mark_done(self, fut) -> None:
+        for i, f in enumerate(self.busy):
+            if f is fut:
+                self.busy[i] = None
+                return
+
+    def release_all(self) -> None:
+        """Drop data caches in every slot. Exact, unlike the shared-pool version, which has to
+        oversubscribe and hope each worker picks one up -- here each pool has exactly one worker."""
+        futs = []
+        for pool in self.pools:
+            try:
+                futs.append(pool.submit(_worker_release_memory))
+            except Exception:  # noqa: BLE001 -- a dead slot must not stop the others
+                pass
+        for f in futs:
+            try:
+                f.result(timeout=120)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
+        for pool in self.pools:
+            try:
+                pool.shutdown(wait=wait, cancel_futures=cancel_futures)
+            except Exception:  # noqa: BLE001
+                pass
+
+
 def _recycle_pool(pool: Any, make_pool, done: int, total: int, log=logger.warning):
     """Tear the worker pool down and build a fresh one. Call ONLY when no future is in flight.
 
@@ -461,6 +535,11 @@ def _release_pool_memory(pool: Any, n_workers: int, log=logger.warning) -> None:
     """Ask the pool to drop its data caches. Submits more tasks than workers because a
     ProcessPoolExecutor cannot be told WHICH worker to run on -- oversubscribing raises the odds
     every worker gets one. Best-effort by design: a missed worker is flushed at its next preload."""
+    if hasattr(pool, "release_all"):
+        # Per-slot pools: one release per pool covers every worker exactly (see _SlotPools).
+        pool.release_all()
+        log("released worker caches (per-slot, exact coverage)")
+        return
     try:
         futs = [pool.submit(_worker_release_memory) for _ in range(max(1, n_workers) * 3)]
         freed = 0.0
@@ -848,49 +927,43 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         # (master-as-worker pool consumers + remote HTTP workers). The memo/progress/persist
         # collection loop below is identical for both — only WHERE a trial runs differs.
         def _local_execute_jobs(jobs):
-            """Run a batch on the local pool, rebuilding it every _MAX_TASKS_PER_CHILD individuals.
+            """Run a batch on the per-slot pools, keeping every slot fed.
 
-            The batch is submitted in CHUNKS of (recycle_every x workers). A chunk is drained
-            fully, then the pool is torn down and remade before the next chunk starts. That gives
-            the same per-worker recycle cadence the executor's max_tasks_per_child was meant to
-            give, but the teardown happens when NOTHING is in flight -- no stranded futures, no
-            blocked queue feeder, so it cannot reproduce the opt 328 deadlock.
-
-            The cost is a drain barrier per chunk: the chunk's slowest trial holds up the rebuild
-            while other workers idle. On this grid trial times run 6s..1104s, so a barrier can
-            waste a few minutes; that is the price of reclaiming worker RSS, and it is bounded
-            (~4 barriers per 140-individual generation at the default 8).
+            A slot is handed a new trial the moment its previous one resolves, and is recycled
+            (torn down + respawned) at that same point if it has hit its task quota -- so the
+            recycle happens while that slot is idle and the other slots keep running. There is no
+            chunk barrier and no point at which the fleet waits on one slow genome.
             """
-            nonlocal _pool
-            from concurrent.futures import as_completed, TimeoutError as _FTimeout
-            # STALL GUARD. Belt and braces: if a pool ever wedges again the generator must not sit
-            # in as_completed forever with no error and no log line (opt 328 sat 2h25m and would
-            # have sat indefinitely). Sized off the SLOWEST trial actually observed here (1104s)
-            # with a wide margin, and it FAILS LOUDLY -- an aborted job is visible and restartable,
-            # a silent hang costs a night.
+            from concurrent.futures import wait as _fwait, FIRST_COMPLETED
+            # STALL GUARD. If a pool ever wedges again this must abort loudly rather than sit in
+            # wait() forever with no error and no log line (opt 328 sat 2h25m). Sized off the
+            # slowest trial actually observed here (1104s) with a wide margin.
             _stall_s = float(_os.getenv("BT_LOCAL_STALL_TIMEOUT_S", "5400"))
             jobs = list(jobs)
-            chunk = (_MAX_TASKS_PER_CHILD * max(1, parallel)) if _MAX_TASKS_PER_CHILD else len(jobs)
-            chunk = max(1, chunk)
-            for start in range(0, len(jobs), chunk):
-                part = jobs[start:start + chunk]
-                futures = {
-                    _pool.submit(_trial_worker, cfg, opt.fitness_metric): (i, flat, key)
-                    for (i, flat, key, cfg) in part
-                }
-                try:
-                    for fut in as_completed(futures, timeout=_stall_s):
-                        i, flat, key = futures[fut]
-                        yield (i, flat, key, fut.result())
-                except _FTimeout:
-                    pending = sum(1 for f in futures if not f.done())
+            pending: dict = {}      # future -> (idx, flat, key)
+            nxt = 0
+            while nxt < len(jobs) or pending:
+                for slot in _pool.idle_slots():
+                    if nxt >= len(jobs):
+                        break
+                    i, flat, key, cfg = jobs[nxt]
+                    nxt += 1
+                    pending[_pool.submit(slot, _trial_worker, cfg, opt.fitness_metric)] = (
+                        i, flat, key)
+                if not pending:
+                    break
+                done, _ = _fwait(list(pending), timeout=_stall_s,
+                                 return_when=FIRST_COMPLETED)
+                if not done:
                     logger.error(
-                        f"LOCAL POOL STALLED: {pending}/{len(futures)} trials made no progress in "
+                        f"LOCAL POOL STALLED: {len(pending)} trial(s) made no progress in "
                         f"{_stall_s:.0f}s. Aborting the job so it can be restarted rather than "
                         f"hanging silently.")
-                    raise
-                if _MAX_TASKS_PER_CHILD and (start + chunk) < len(jobs):
-                    _pool = _recycle_pool(_pool, _make_pool, start + chunk, len(jobs))
+                    raise TimeoutError("local pool stalled")
+                for fut in done:
+                    i, flat, key = pending.pop(fut)
+                    _pool.mark_done(fut)
+                    yield (i, flat, key, fut.result())
 
         def make_batch_fitness(execute_jobs):
             def batch_fitness(param_dicts: list) -> list:
@@ -1125,19 +1198,36 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     initargs=(_BACKEND_DIR, _env),
                 )
 
-            _pool = _make_pool()
             # Dynamic worker allocation. Restored to full at every JOB (this construction site is
             # per-job), so a heavy job cannot permanently shrink the fleet.
             _governor = MemoryGovernor(parallel)
-            logger.warning(
-                f"memory governor armed: {parallel} local slot(s), throttle <{_MEM_THROTTLE_PCT}% "
-                f"free, emergency <{_MEM_EMERGENCY_PCT}% free, worker recycle every "
-                f"{_MAX_TASKS_PER_CHILD} individual(s)")
+            # Resolve the workers BEFORE building the pool: the two paths want different pool
+            # SHAPES. Distributed needs one shared executor (several consumer threads submit into
+            # it concurrently); local-only wants one single-worker pool per slot, so a recycle
+            # never stalls the other slots (see _SlotPools). Building the wrong one first and
+            # discarding it would cost a full spawn+import cycle per job.
             try:
                 _workers = _resolve_workers(db, opt.worker_ids)
             except Exception as e:  # noqa: BLE001 — distribution is optional; never block a run
                 logger.warning(f"worker resolution failed, running local-only: {e}")
                 _workers = []
+            if _workers:
+                _pool = _make_pool()
+                _pool_kind = "shared executor (distributed)"
+            else:
+                def _make_one():
+                    return ProcessPoolExecutor(
+                        max_workers=1,
+                        mp_context=_mp.get_context("spawn"),
+                        initializer=_worker_init,
+                        initargs=(_BACKEND_DIR, _env),
+                    )
+                _pool = _SlotPools(_make_one, parallel, _MAX_TASKS_PER_CHILD)
+                _pool_kind = f"{parallel} single-worker pools (local, staggered recycle)"
+            logger.warning(
+                f"memory governor armed: {parallel} local slot(s), throttle <{_MEM_THROTTLE_PCT}% "
+                f"free, emergency <{_MEM_EMERGENCY_PCT}% free, worker recycle every "
+                f"{_MAX_TASKS_PER_CHILD} individual(s); pool: {_pool_kind}")
             if _workers:
                 from app.services.distributed_eval import DistributedEvaluator
                 from app.services.self_update import get_version_info, unsyncable_reason
