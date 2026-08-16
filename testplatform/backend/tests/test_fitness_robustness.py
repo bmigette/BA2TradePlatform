@@ -131,18 +131,69 @@ def test_a_big_unrepeatable_winner_is_not_rewarded():
     assert c_adj < c_comp["conc_factor"] * 1.01 * compute_fitness("consistent_annual_return", conc)
 
 
-def test_a_book_whose_rest_loses_money_scores_zero_on_concentration():
-    """top5 > 100% of net means the other trades are net NEGATIVE -- 23 rows in the audit looked
-    like this. There is nothing reproducible left to rank."""
-    r = _run([50_000.0] + [-300.0] * 60)
-    comp = robustness_metrics(r)
-    assert comp["top5_pct"] > 100.0
-    assert comp["conc_factor"] == 0.0
+def test_missing_equity_curve_raises_instead_of_inflating_silently():
+    """THE trap that produced a 4x overstatement on 2026-08-16.
+
+    `backtests.results` excludes the equity curve (own column), so re-scoring a stored row by
+    handing the blob straight back gives no curve -- and the consistency factor then defaults to
+    1.0, i.e. no penalty, silently. The measured damage was 19.04 reported against a true 4.76.
+    A missing KEY must be loud; a curve that is merely too short stays at the documented 1.0.
+    """
+    r = _even()
+    del r["equity_curve"]
+    with pytest.raises(ValueError, match="equity_curve"):
+        compute_fitness("consistent_annual_return", r)
 
 
-# ---------------------------------------------------------------------------------------
-# Monte Carlo
-# ---------------------------------------------------------------------------------------
+def test_a_short_but_present_curve_is_still_allowed():
+    """Only the ABSENT key is an error -- a sub-year run legitimately carries no consistency
+    information and must keep scoring."""
+    r = _even()
+    r["equity_curve"] = [{"date": "2022-01-15T15:00:00", "equity": 100_000.0}]
+    compute_fitness("consistent_annual_return", r)     # must not raise
+
+
+def test_rest_of_book_negative_cannot_win_however_high_its_return():
+    """top5 >= 100% means the book is net NEGATIVE without its five best trades. Measured: the
+    Monte Carlo does NOT catch this (bt 918 scored mc 0.95 while being -1,777 ex-top-5), so the
+    concentration screen is the only one that can, and a mere floor was not enough -- bt 918's
+    raw fitness was 37% higher than its cleaner rival and it won the band anyway."""
+    lottery = _run([48_000.0] + [-60.0] * 120)      # top5 > 100%, huge headline
+    clean = _run([700.0] * 120)                     # modest, diversified
+    l_adj, l_c = robust_fitness(compute_fitness("consistent_annual_return", lottery), lottery)
+    c_adj, c_c = robust_fitness(compute_fitness("consistent_annual_return", clean), clean)
+    assert l_c["top5_pct"] > 100.0
+    assert l_c["conc_factor"] == 0.0, "negative ex-top-5 leaves nothing to rank"
+    assert l_adj < c_adj, "a book that loses money ex-top-5 must never outrank a clean one"
+
+
+def test_the_penalty_is_continuous_with_no_cliff():
+    """No discontinuity anywhere: two books a hair apart in concentration must score a hair apart.
+
+    Both earlier shapes failed this -- a hard zero at 100%, then a hard gate at 90% -- and a cliff
+    is what lets a genome's score collapse on a rounding error rather than on its merits.
+    """
+    def factor(top5_target):
+        top5 = 200.0 * top5_target / 100.0
+        return robustness_metrics(_run([top5 / 5] * 5 + [(200.0 - top5) / 60] * 60))["conc_factor"]
+
+    for t in (55, 70, 85, 89):
+        a, b = factor(t), factor(t + 1)
+        assert abs(a - b) < 0.10, f"jump at {t}% -> {t+1}%: {a:.3f} vs {b:.3f} (cliff)"
+
+
+def test_fitness_tends_to_zero_as_top5_tends_to_100():
+    """The stated requirement: rip the score off as the book approaches 'negative without its top
+    five trades', but get there smoothly."""
+    def factor(top5_target):
+        top5 = 200.0 * top5_target / 100.0
+        return robustness_metrics(_run([top5 / 5] * 5 + [(200.0 - top5) / 60] * 60))["conc_factor"]
+
+    assert factor(90) < 0.05, "by 90% the score must be essentially gone"
+    assert factor(95) < factor(90) < factor(80) < factor(65), "strictly decreasing"
+    assert factor(101) == 0.0, "at/after the sign change there is nothing left to rank"
+
+
 def test_monte_carlo_is_deterministic():
     """A seeded bootstrap. A GA cannot search on a fitness that changes between evaluations of
     the same genome -- it would reward noise."""

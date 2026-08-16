@@ -447,7 +447,33 @@ _ROBUST_MC_SEED = 42
 # top-5 share at/below which no concentration penalty applies, and the share at which it reaches
 # zero. 40% is the deploy-time bar already in use; 100% is where the five best trades ARE the
 # entire result.
-_CONC_FREE_PCT, _CONC_ZERO_PCT = 40.0, 100.0
+# CONCENTRATION penalty shape: CONTINUOUS, and tending to zero as the top-5 share tends to 100%.
+#
+#   headroom = (DEAD - top5) / (DEAD - FREE)          # 1.0 at FREE, 0.0 at DEAD
+#   factor   = clamp(headroom, 0, 1) ** EXP
+#
+# WHY THIS SHAPE, after two rejected ones:
+#   * a LINEAR fall to a hard 0 at 100% (the original) deleted the gradient over a large region:
+#     measured on opt 330, 111 of 276 trials hit it and 61 scored exactly 0.00, so selection could
+#     not tell "slightly too concentrated" from "catastrophic".
+#   * a FLOORED decay (floor 0.25) fixed the gradient but was too soft at the top: bt 918 -- whose
+#     book is NEGATIVE without its five best trades (-1,777) -- won its band anyway, because its
+#     raw fitness was 37% higher than the cleaner bt 930's.
+#   * a hard GATE at 90% worked but reintroduced a cliff.
+# The power curve gives all three: continuous everywhere, a real gradient across the whole 40-100
+# range, and a tail that rips the score off near 100 without any discontinuity.
+#
+# EXP=2 reference points:  40% -> 1.00   55% -> 0.56   65% -> 0.34   72% -> 0.22
+#                          80% -> 0.11   90% -> 0.03   95% -> 0.007  100%+ -> 0.00
+#
+# 100% is not an arbitrary end point: top5 >= 100% of net P&L means the book is net NEGATIVE
+# without those five trades -- a sign change, not a degree. Note the Monte Carlo does NOT catch
+# this (measured: bt 918 scored mc 0.95 while being negative ex-top-5), because the bootstrap
+# resamples the empirical distribution and so treats the mega-winners as a repeatable feature.
+# Concentration is the only screen that asks whether the edge survives REMOVING them.
+_CONC_FREE_PCT = float(_os.getenv("BT_CONC_FREE_PCT", "40"))    # no penalty at or below this
+_CONC_DEAD_PCT = float(_os.getenv("BT_CONC_DEAD_PCT", "100"))   # factor reaches 0 here
+_CONC_EXP = float(_os.getenv("BT_CONC_EXP", "2"))               # >1 bites harder near DEAD
 
 
 def robustness_metrics(results: dict, spread_bps: float = 0.0) -> dict:
@@ -471,10 +497,9 @@ def robustness_metrics(results: dict, spread_bps: float = 0.0) -> dict:
     t5 = out["top5_pct"]
     if t5 <= _CONC_FREE_PCT:
         out["conc_factor"] = 1.0
-    elif t5 >= _CONC_ZERO_PCT:
-        out["conc_factor"] = 0.0
     else:
-        out["conc_factor"] = 1.0 - (t5 - _CONC_FREE_PCT) / (_CONC_ZERO_PCT - _CONC_FREE_PCT)
+        headroom = (_CONC_DEAD_PCT - t5) / max(1e-9, _CONC_DEAD_PCT - _CONC_FREE_PCT)
+        out["conc_factor"] = max(0.0, min(1.0, headroom)) ** _CONC_EXP
 
     # --- monte carlo: resample the TRADE ORDER ------------------------------------------
     # Bootstrap the pnl_pct sequence. This asks "was the equity path luck of ordering?" -- it
@@ -694,6 +719,24 @@ def _consistent_annual_return(results: dict) -> float:
     dd_guard = min(_CAR_DD_REFERENCE / max(dd, _CAR_DD_FLOOR), _CAR_DD_GUARD_MAX)
 
     # --- yearly consistency ----------------------------------------------------------------------
+    # LOUD on a MISSING curve. `consistency` is measured from calendar-year returns off the
+    # equity curve; with no curve _calendar_year_returns returns [] and _consistency_factor
+    # falls back to 1.0 -- a silent no-penalty default that INFLATES fitness. Measured
+    # 2026-08-16 while re-scoring stored rows: 19.04 against the true 4.76, a 4x overstatement,
+    # and it looked entirely plausible. The trap is specific to re-scoring from the DB, because
+    # `backtests.results` deliberately EXCLUDES the curve (it lives in its own column), so a
+    # caller that passes the blob straight back in gets no curve and no warning.
+    # An ABSENT KEY is a caller error and raises; a curve that is present but too short to
+    # measure (a sub-year run) keeps the documented 1.0 -- that case carries no consistency
+    # information and is not a mistake.
+    if "equity_curve" not in results:
+        raise ValueError(
+            "consistent_annual_return requires results['equity_curve'] to measure the "
+            "consistency factor, and the key is absent. If you are re-scoring a stored "
+            "Backtest, note that `results` excludes the curve -- restore it from the "
+            "equity_curve column first, or the score is silently inflated (~4x when the run "
+            "has an uneven year)."
+        )
     consistency = _consistency_factor(_calendar_year_returns(results.get("equity_curve")))
     return base * dd_guard * consistency * trade_gate
 
