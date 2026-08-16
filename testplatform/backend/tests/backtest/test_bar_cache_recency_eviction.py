@@ -97,13 +97,47 @@ def test_window_of_one_bounds_a_process_to_a_single_individual(monkeypatch):
     assert _cached_symbols() == {"D", "E"}
 
 
-def test_zero_disables_the_recency_bound(monkeypatch):
-    """Escape hatch: BT_BAR_CACHE_TRIALS=0 restores the pre-2026-08-15 count-cap-only behaviour."""
+def test_flush_mode_bounds_the_PEAK_not_just_the_resting_size(monkeypatch):
+    """THE test the first two attempts failed.
+
+    N>=1 evicts at the END of preload, so while individual B is loading, the cache still holds all
+    of A plus B-so-far -- peak |A u B|. Both N=2 and N=1 shipped and still exhausted a 64GB box,
+    because the peak is what OOMs, not the resting size. Flush mode (N=0, default) drops everything
+    at the START, so the peak is |B|.
+
+    Asserted by observing the cache DURING B's load, not after it.
+    """
     monkeypatch.setattr(ps, "_WORKER_BAR_CACHE_TRIALS", 0)
     prov = _FakeOHLCV()
-    for i in range(5):
-        _preload(prov, [f"S{i}"])
+    _preload(prov, [f"A{i}" for i in range(5)])          # individual A: 5 symbols
     assert len(_cached_symbols()) == 5
+
+    seen_during_load = []
+
+    class _Watching(_FakeOHLCV):
+        def read_window(self, symbol, start, end, interval):
+            seen_during_load.append(len(ps._WORKER_BAR_CACHE))
+            return super().read_window(symbol, start, end, interval)
+
+    _preload(_Watching(), [f"B{i}" for i in range(3)])   # individual B: 3 symbols
+    # If A were still resident while B loaded, the first observation would be >= 5.
+    assert seen_during_load[0] == 0, (
+        f"A's series were still held while B was loading (saw {seen_during_load[0]} entries) -- "
+        "the peak is |A u B|, which is exactly the OOM that N=2 and N=1 both hit")
+    assert max(seen_during_load) < 5
+    assert _cached_symbols() == {"B0", "B1", "B2"}
+
+
+def test_flush_mode_is_result_neutral(monkeypatch):
+    """Flushing every individual must change nothing but timing -- same bars, re-parsed."""
+    monkeypatch.setattr(ps, "_WORKER_BAR_CACHE_TRIALS", 0)
+    prov = _FakeOHLCV()
+    first = _preload(prov, ["AAA"])
+    before = np.array(first._c["AAA"], copy=True)
+    _preload(prov, ["ZZZ"])
+    again = _preload(prov, ["AAA"])
+    assert prov.reads.count("AAA") == 2          # re-parsed, as designed
+    np.testing.assert_array_equal(again._c["AAA"], before)
 
 
 def test_count_cap_still_backstops_a_single_oversized_individual(monkeypatch):

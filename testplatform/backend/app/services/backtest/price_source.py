@@ -28,6 +28,7 @@ from __future__ import annotations
 import bisect
 import logging
 import os
+from array import array
 from collections import OrderedDict
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
@@ -105,7 +106,10 @@ _WORKER_BAR_CACHE_MAX = int(os.getenv("BT_BAR_CACHE_MAX", "1500"))
 # Raise it only on a box with headroom to spare, and only after checking the `mem gen ... sym`
 # telemetry for the job in question: the right N depends on how much CONSECUTIVE individuals
 # overlap, which is a property of the expert's screener, not a constant.
-_WORKER_BAR_CACHE_TRIALS = int(os.getenv("BT_BAR_CACHE_TRIALS", "1"))
+# 0 = FLUSH-PER-INDIVIDUAL (the default): drop the whole cache at the START of preload, then load
+# this individual's set. Peak = exactly ONE working set. This is the only setting that bounds the
+# PEAK rather than the resting size, and the peak is what OOMs a box.
+_WORKER_BAR_CACHE_TRIALS = int(os.getenv("BT_BAR_CACHE_TRIALS", "0"))
 # key -> the _TRIAL_SEQ value of the most recent individual that used it.
 _BAR_CACHE_LAST_USED: Dict[Any, int] = {}
 # Monotonic per-process individual counter, bumped once per preload (= once per individual).
@@ -118,15 +122,41 @@ def clear_worker_bar_cache() -> None:
     _BAR_CACHE_LAST_USED.clear()
 
 
+def _flush_bar_cache_for_new_individual() -> int:
+    """FLUSH-PER-INDIVIDUAL mode (BT_BAR_CACHE_TRIALS=0, the default). Drop everything at the START
+    of preload and collect, so the previous individual's arrays are released BEFORE this one starts
+    allocating. Peak = one working set.
+
+    WHY THE PEAK, NOT THE RESTING SIZE. The end-of-preload recency sweep (N>=1 below) bounds what is
+    RETAINED but not what is HELD WHILE LOADING: during individual B's preload the cache still holds
+    all of A plus everything of B loaded so far, so the peak is |A u B| no matter how tight N is.
+    That is why both N=2 and N=1 exhausted the box -- the bound never applied at the moment that
+    mattered. Flushing first makes the peak |B|, which is the whole point.
+
+    Result-neutral, like every other eviction here: a later miss re-parses the identical parquet.
+    The cost is the full re-parse per individual (~23s for a 600-symbol 5min set) with no
+    cross-individual reuse -- which the measurements said was worth little anyway, since consecutive
+    individuals' screener selections barely overlap.
+    """
+    n = len(_WORKER_BAR_CACHE)
+    if not n:
+        return 0
+    _WORKER_BAR_CACHE.clear()
+    _BAR_CACHE_LAST_USED.clear()
+    import gc
+    gc.collect()          # release now, not at some later collection -- the point is the peak
+    return n
+
+
 def _evict_bar_cache_by_recency() -> int:
     """Drop series untouched for the last ``_WORKER_BAR_CACHE_TRIALS`` individuals. Returns the
-    number evicted.
+    number evicted. Only used when N>=1; see _flush_bar_cache_for_new_individual for the default.
 
     Called at the END of preload, so the current individual's own series (stamped with the current
     seq) are never candidates -- evicting those would free nothing anyway, since the live
     AsOfPriceSource holds the same array objects for the duration of its trial.
     """
-    if _WORKER_BAR_CACHE_TRIALS <= 0:          # 0/negative disables the recency bound entirely
+    if _WORKER_BAR_CACHE_TRIALS <= 0:          # flush mode handles this at the start of preload
         return 0
     cutoff = _TRIAL_SEQ - _WORKER_BAR_CACHE_TRIALS + 1
     stale = [k for k, seq in _BAR_CACHE_LAST_USED.items() if seq < cutoff]
@@ -160,7 +190,7 @@ def memory_stats() -> Dict[str, Any]:
     for key, cached in _WORKER_BAR_CACHE.items():
         keys = cached[0]
         bars += len(keys)
-        bar_bytes += len(keys) * 50
+        bar_bytes += getattr(keys, 'nbytes', len(keys) * 8)   # array('q') = 8B/elem
         for arr in cached[1:]:
             bar_bytes += getattr(arr, "nbytes", 0)
         bar_symbols.add(key[0])          # key = (symbol, interval, fetch_start, end)
@@ -185,6 +215,83 @@ def memory_stats() -> Dict[str, Any]:
         "series_memo": {"entries": len(_FULL_SERIES_MEMO), "symbols": len(memo_symbols),
                         "rows": memo_rows, "mb": round(memo_bytes / 1048576, 1)},
     }
+
+
+def _key64(d: Any, interval: str = "1d") -> int:
+    """The bar-store key as int64 NANOSECONDS since epoch — the storage form of ``_norm``.
+
+    The bar keys used to be a Python list of date/datetime objects. At 5min resolution that list
+    was the LARGEST part of the store: ~4.5MB/symbol (90k objects x ~48B + the pointer list)
+    against 3.6MB for all five float64 OHLCV arrays combined. The identical information as
+    int64 ns is 0.72MB — a ~47% cut of total per-symbol cost, measured 2026-08-15 while chasing
+    the GA worker OOM (7.7MB/symbol observed).
+
+    int64 (not datetime64) because the comparisons this feeds are on the engine's hottest path
+    (~200k lookups/backtest): a numpy int64 vs Python int compare is materially cheaper than
+    datetime64 scalar machinery, and searchsorted is identical on both.
+    """
+    return _key64_cached(_to_datetime(d), _is_intraday(interval))
+
+
+_EPOCH = datetime(1970, 1, 1)
+
+
+@lru_cache(maxsize=8192)
+def _key64_cached(dt: datetime, intraday: bool) -> int:
+    """datetime -> int64 ns, via timedelta arithmetic and MEMOISED.
+
+    The first version built the key with ``np.datetime64(dt,'us').astype(...).astype(np.int64)``.
+    Measured: 31190 ns PER CALL against 2023 ns for the timedelta arithmetic below -- 15x -- and
+    this runs on EVERY as-of lookup. That alone regressed the 5min A/B from 62s to ~102s, which
+    is why the change was rejected on the perf half of the acceptance gate before it shipped.
+
+    Memoised like ``_to_datetime_cached`` for the same reason: lookups hammer the same handful of
+    clock values (once per symbol per bar), so the cache turns almost every call into a dict hit.
+    """
+    if not intraday:
+        dt = datetime(dt.year, dt.month, dt.day)     # daily keys are calendar dates
+    x = dt - _EPOCH
+    return (x.days * 86400 + x.seconds) * 1_000_000_000 + x.microseconds * 1000
+
+
+def _from_key64(v: Any, intraday: bool) -> Any:
+    """int64 ns -> the Python ``date``/``datetime`` callers still expect (next_bar_date,
+    all_dates). Only used on cold paths that hand keys back out, never in a lookup."""
+    dt = np.datetime64(int(v), "ns").astype("datetime64[us]").astype(datetime)
+    return dt if intraday else dt.date()
+
+
+def _keys64_from_datetime64(keys64: np.ndarray, intraday: bool) -> "array":
+    """Normalise a datetime64 bar-key array to the storage form: ``array('q')`` of int64 ns,
+    truncated to calendar day for daily intervals (mirrors what ``_norm`` did for object keys).
+
+    WHY array('q') AND NOT AN ndarray -- measured, after an ndarray version regressed the 5min
+    A/B by 65% (62s -> 104s). Per scalar read on the per-lookup path (~200k+/backtest):
+        python list  k[i]        97 ns   (the original)
+        ndarray      int(k[i]) 2493 ns   (26x -- this was the regression)
+        ndarray      k.item(i)  334 ns
+        array('q')   k[i]       160 ns   <- returns a real Python int, no scalar boxing
+    array('q') is 8 bytes/element, so the ~47% memory cut over the object list is fully kept, and
+    it is buffer-compatible -> ``_keys_np`` gives a ZERO-COPY ndarray view for searchsorted. Best
+    of both: cheap scalar reads on the hot path, binary search on the cold ones.
+    """
+    if not intraday:
+        keys64 = keys64.astype("datetime64[D]")
+    ns = np.ascontiguousarray(keys64.astype("datetime64[ns]").astype(np.int64))
+    out = array("q")
+    # frombytes, NOT array('q', ns.tolist()): tolist() materialises one Python int PER BAR
+    # (~19k/symbol at 5min). Those land in pymalloc arenas that are NOT returned to the OS, and
+    # measured 2026-08-16 they made the "memory saving" a LOSS -- 8.62 MB/symbol against the
+    # object-list original's 6.79 MB/symbol, even though memory_stats' accounting showed a halving.
+    # frombytes copies the raw buffer and creates no Python objects at all.
+    out.frombytes(ns.tobytes())
+    return out
+
+
+def _keys_np(k: "array") -> np.ndarray:
+    """Zero-copy ndarray view over an ``array('q')`` key buffer, for np.searchsorted.
+    O(1) and allocation-free -- it shares the same memory, never a copy."""
+    return np.frombuffer(k, dtype=np.int64)
 
 
 @lru_cache(maxsize=16)
@@ -322,6 +429,9 @@ class AsOfPriceSource:
         # millions of times per backtest, almost always for the current clock — caching the key
         # here avoids re-running _norm/_to_datetime on every lookup (a top per-bar cost).
         self._clock_key = _norm(as_of, self._interval)
+        # int64-ns twin of the clock key: the bar store now holds int64 keys, and bar_at/close_at
+        # compare against this on every lookup. Computed once per bar, like _clock_key.
+        self._clock_key64 = _key64(as_of, self._interval)
 
     def now(self) -> datetime:
         if self._clock is None:
@@ -363,6 +473,8 @@ class AsOfPriceSource:
         # the last N individuals" from "carried over from older ones".
         global _TRIAL_SEQ
         _TRIAL_SEQ += 1
+        if _WORKER_BAR_CACHE_TRIALS <= 0:
+            _flush_bar_cache_for_new_individual()   # bound the PEAK: free A before allocating B
         missing: List[str] = []  # symbols with NO cached series anywhere (hermetic mode)
         for sym in symbols:
             # Worker-persistent reuse: a prior individual in this worker already parsed this
@@ -429,7 +541,7 @@ class AsOfPriceSource:
             )
 
     def _set_empty(self, symbol: str) -> None:
-        self._keys[symbol] = []
+        self._keys[symbol] = array('q')
         self._o[symbol] = np.array([], dtype=float)
         self._h[symbol] = np.array([], dtype=float)
         self._l[symbol] = np.array([], dtype=float)
@@ -452,8 +564,9 @@ class AsOfPriceSource:
         keep[:-1] = keys64[1:] != keys64[:-1]  # keep only the LAST of each run of equal keys
         if not keep.all():
             keys64, o, h, l, c, v = keys64[keep], o[keep], h[keep], l[keep], c[keep], v[keep]
-        objs = keys64.astype("datetime64[us]").astype(object)  # ndarray of datetime.datetime
-        self._keys[symbol] = list(objs) if self._intraday else [d.date() for d in objs]
+        # int64-ns array, NOT a Python object list: at 5min that list was ~4.5MB/symbol against
+        # 3.6MB for all five OHLCV arrays combined (see _key64).
+        self._keys[symbol] = _keys64_from_datetime64(keys64, self._intraday)
         self._o[symbol], self._h[symbol], self._l[symbol] = o, h, l
         self._c[symbol], self._v[symbol] = c, v
 
@@ -509,11 +622,14 @@ class AsOfPriceSource:
     def _exact_index(self, symbol: str, key: Any) -> int:
         """Index of the EXACT bar at the (Python) ``key`` for ``symbol``, or -1 — mirrors the old
         ``dict.get(key)`` via bisect + equality on the ascending Python key list."""
+        # NOTE `k is None or not len(k)`, never `if not k:` — k is a numpy array now and bare
+        # truthiness raises ValueError for len>1. Same at every other call site below.
         k = self._keys.get(symbol)
-        if not k:
+        if k is None or not len(k):
             return -1
-        i = bisect.bisect_left(k, key)
-        return i if i < len(k) and k[i] == key else -1
+        key64 = key if isinstance(key, (int, np.integer)) else _key64(key, self._interval)
+        i = bisect.bisect_left(k, key64)
+        return i if i < len(k) and k[i] == key64 else -1
 
     def _cursor_at_clock(self, symbol: str) -> int:
         """Index of the last key <= the current clock for ``symbol``, advancing a per-symbol
@@ -521,11 +637,11 @@ class AsOfPriceSource:
         run a cursor advances at most ``len(keys)`` times total — using fast native date/datetime
         comparisons. Returns -1 if no bar <= clock yet."""
         k = self._keys.get(symbol)
-        if not k:
+        if k is None or not len(k):
             return -1
         n = len(k)
         cur = self._cursor.get(symbol, -1)
-        ck = self._clock_key
+        ck = self._clock_key64
         # Advance while the NEXT key is still <= the clock (handles multi-bar jumps for a symbol not
         # queried every bar). Never moves backward (clock is monotonic).
         while cur + 1 < n and k[cur + 1] <= ck:
@@ -534,7 +650,8 @@ class AsOfPriceSource:
         return cur
 
     def has_symbol(self, symbol: str) -> bool:
-        return bool(self._keys.get(symbol))
+        k = self._keys.get(symbol)
+        return k is not None and len(k) > 0
 
     def bar_at(self, symbol: str, as_of: Optional[datetime] = None) -> Optional[Dict[str, float]]:
         """The bar for ``symbol`` on the as-of bar (or current clock bar), or None."""
@@ -544,7 +661,7 @@ class AsOfPriceSource:
                     "AsOfPriceSource clock not set; the engine must call set_clock() per bar"
                 )
             cur = self._cursor_at_clock(symbol)  # O(1) amortised clock cursor (hot path)
-            if cur < 0 or self._keys[symbol][cur] != self._clock_key:
+            if cur < 0 or self._keys[symbol][cur] != self._clock_key64:
                 return None  # no EXACT bar at the clock
             i = cur
         else:
@@ -563,7 +680,7 @@ class AsOfPriceSource:
                     "AsOfPriceSource clock not set; the engine must call set_clock() per bar"
                 )
             cur = self._cursor_at_clock(symbol)
-            if cur < 0 or self._keys[symbol][cur] != self._clock_key:
+            if cur < 0 or self._keys[symbol][cur] != self._clock_key64:
                 return None
             return float(self._c[symbol][cur])
         i = self._exact_index(symbol, _norm(as_of, self._interval))
@@ -585,17 +702,17 @@ class AsOfPriceSource:
             cur = self._cursor_at_clock(symbol)
             return float(self._c[symbol][cur]) if cur >= 0 else None
         k = self._keys.get(symbol)
-        if not k:
+        if k is None or not len(k):
             return None
-        i = bisect.bisect_right(k, _norm(as_of, self._interval)) - 1
+        i = bisect.bisect_right(k, _key64(as_of, self._interval)) - 1
         return float(self._c[symbol][i]) if i >= 0 else None
 
     def next_bar(self, symbol: str, after: datetime) -> Optional[Dict[str, float]]:
         """The NEXT trading bar strictly after ``after`` (for next-bar fills)."""
         k = self._keys.get(symbol)
-        if not k:
+        if k is None or not len(k):
             return None
-        i = bisect.bisect_right(k, _norm(after, self._interval))
+        i = bisect.bisect_right(k, _key64(after, self._interval))
         if i >= len(k):
             return None
         return {"open": float(self._o[symbol][i]), "high": float(self._h[symbol][i]),
@@ -606,9 +723,9 @@ class AsOfPriceSource:
         """The PREVIOUS trading bar strictly before ``before`` (e.g. for a "did the low undercut
         yesterday's low" check). Symmetric to ``next_bar``."""
         k = self._keys.get(symbol)
-        if not k:
+        if k is None or not len(k):
             return None
-        i = bisect.bisect_left(k, _norm(before, self._interval)) - 1
+        i = bisect.bisect_left(k, _key64(before, self._interval)) - 1
         if i < 0:
             return None
         return {"open": float(self._o[symbol][i]), "high": float(self._h[symbol][i]),
@@ -621,10 +738,10 @@ class AsOfPriceSource:
         Binary-searches the symbol's ascending Python key list (``bisect_right`` -> first key
         strictly greater than the cutoff) — O(log n)."""
         k = self._keys.get(symbol)
-        if not k:
+        if k is None or not len(k):
             return None
-        i = bisect.bisect_right(k, _norm(after, self._interval))
-        return k[i] if i < len(k) else None
+        i = bisect.bisect_right(k, _key64(after, self._interval))
+        return _from_key64(k[i], self._intraday) if i < len(k) else None
 
     def all_dates(self) -> List[Any]:
         """Sorted union of all bar keys across every loaded symbol (the trading clock).
@@ -633,8 +750,9 @@ class AsOfPriceSource:
         """
         seen: set = set()
         for k in self._keys.values():
-            seen.update(k)
-        return sorted(seen)
+            if k is not None and len(k):
+                seen.update(k)
+        return [_from_key64(v, self._intraday) for v in sorted(seen)]
 
 
 def _to_utc(d: Any) -> datetime:

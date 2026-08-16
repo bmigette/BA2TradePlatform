@@ -71,6 +71,17 @@ STORE="$HOME/Documents/ba2/common/cache/screener/metric_store"
 # trial is retry-excluded for the whole run.
 WORKERS="${WORKERS-remote150}"
 
+# Sweep orphaned multiprocessing.spawn pool workers from any PREVIOUS run before starting.
+# On Windows those children are detached: killing a grid leaves them alive holding their full
+# working set, and they match neither the driver nor the launcher in a process filter. Measured
+# 2026-08-15: 40 orphans holding 41 GB on a 65 GB box, accumulated over a few kill/relaunch
+# cycles -- they exhausted the box, failed a 2.24 MiB numpy allocation, and poisoned every memory
+# measurement taken that evening (two "the fix did not hold" conclusions were drawn against a box
+# that was mostly full of leftovers). Relaunching without this inherits the previous run's leak.
+if command -v powershell >/dev/null 2>&1; then
+  powershell -NoProfile -ExecutionPolicy Bypass -File tools/sweep_spawn_orphans.ps1 || true
+fi
+
 COMMON=(--start "$START" --end "$END" --fitness "$FITNESS" --store "$STORE")
 if [ -n "$WORKERS" ]; then
   COMMON+=(--workers "$WORKERS")
