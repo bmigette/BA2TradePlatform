@@ -240,6 +240,15 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str, ctl: Any = None) 
         fit = compute_fitness(fitness_metric, results)
         out = {"ok": True, "fitness": float(fit), "secs": round(_time.monotonic() - _t0, 1),
                "trades": int(results.get("total_trades") or 0), "error": None,
+               # BOTH fitness views, on EVERY path. `fitness` is what the GA ranks on (the robust
+               # value when --robust-fitness is on, the raw metric otherwise); these two carry the
+               # other half so a trial run on a REMOTE worker is as inspectable as a local one --
+               # otherwise the only place the raw score and the concentration/MC/spread components
+               # ever existed would be inside the remote process, and the master would see a
+               # discounted number it cannot explain. compute_fitness recorded them onto `results`.
+               # A handful of floats; nothing measurable added to the pickled payload.
+               "fitness_raw": results.get("fitness_raw"),
+               "robustness": results.get("robustness"),
                # Per-trial memory telemetry (a few psutil/len calls — negligible): RSS of
                # THIS worker process + the two per-process OHLCV caches, so a memory-driven
                # incident (e.g. WinError 1450 on the remote box) leaves a trail showing what
@@ -432,7 +441,8 @@ def _release_pool_memory(pool: Any, n_workers: int, log=logger.warning) -> None:
 
 
 def _log_trial_memory(gen: int, n_gens: int, done: int, total: int, mem: Any,
-                      secs: Any = None) -> None:
+                      secs: Any = None, fit_raw: Any = None, fit_ranked: Any = None,
+                      robustness: Any = None) -> None:
     """One compact INFO line per completed individual: trial wall time + worker RSS + what the
     two OHLCV caches are holding (symbols / bars / MB).
 
@@ -468,7 +478,28 @@ def _log_trial_memory(gen: int, n_gens: int, done: int, total: int, mem: Any,
         + f" | rss {mem.get('rss_mb')}MB"
         f" | bars {bc.get('symbols')} sym {bc.get('bars')} bars {bc.get('mb')}MB"
         f" | memo {sm.get('symbols')} sym {sm.get('rows')} rows {sm.get('mb')}MB"
+        + _fitness_suffix(fit_raw, fit_ranked, robustness)
     )
+
+
+def _fitness_suffix(fit_raw: Any, fit_ranked: Any, robustness: Any) -> str:
+    """`| fit 12.30 -> 7.42 (conc .72 mc .84 spr 1.00)` when the robustness adjustment is ON.
+
+    Empty string when it is off (raw == ranked), so a normal run's log is byte-identical to before.
+    Printed for LOCAL and REMOTE trials alike -- both carry the two values back on the result dict
+    -- because a discounted score with no visible reason is the thing that makes a GA run
+    impossible to audit after the fact.
+    """
+    try:
+        if fit_raw is None or fit_ranked is None or float(fit_raw) == float(fit_ranked):
+            return ""
+        r = robustness or {}
+        return (f" | fit {float(fit_raw):.2f} -> {float(fit_ranked):.2f}"
+                f" (conc {float(r.get('conc_factor', 1.0)):.2f}"
+                f" mc {float(r.get('mc_factor', 1.0)):.2f}"
+                f" spr {float(r.get('spread_factor', 1.0)):.2f})")
+    except Exception:  # noqa: BLE001 -- telemetry must never break a run
+        return ""
 
 
 def _persist_trial_worker(config: Dict[str, Any], ctl: Any = None) -> Dict[str, Any]:
@@ -689,6 +720,10 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     "fitness": fit,
                     "key": key,
                     "trades": results.get("total_trades") if results else 0,
+                    # Same two views as the pooled/remote path (compute_fitness recorded them
+                    # onto `results`), so an in-process run is not the odd one out.
+                    "fitness_raw": (results or {}).get("fitness_raw"),
+                    "robustness": (results or {}).get("robustness"),
                 }
             )
             if best["fitness"] is None or fit > best["fitness"]:
@@ -837,7 +872,9 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                         fits[i] = fit
                         memo.put(key, fit)
                         _log_trial_memory(gen, n_gens, done + 1, total_in_batch,
-                                          out.get("mem"), out.get("secs"))
+                                          out.get("mem"), out.get("secs"),
+                                          fit_raw=out.get("fitness_raw"), fit_ranked=fit,
+                                          robustness=out.get("robustness"))
                         # Dynamic worker allocation, checked after EVERY individual.
                         verdict = _governor.assess(out.get("mem"))
                         if verdict == "release":
@@ -856,7 +893,13 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                             except Exception as _e:  # noqa: BLE001
                                 logger.warning(f"memory governor: pool shutdown failed ({_e!r})")
                         all_results.append(
-                            {"params": flat, "fitness": fit, "key": key, "trades": out["trades"]}
+                            # `fitness` is the RANKED value; `fitness_raw` + `robustness` come
+                            # back from the worker (local or REMOTE -- _trial_worker attaches them
+                            # on both paths) so the master can always show what the raw metric was
+                            # and which factor discounted it, without re-running the trial.
+                            {"params": flat, "fitness": fit, "key": key, "trades": out["trades"],
+                             "fitness_raw": out.get("fitness_raw"),
+                             "robustness": out.get("robustness")}
                         )
                         if is_last_gen:
                             _capture_full_result(last_gen_full_results, key, out)
@@ -1467,6 +1510,10 @@ def _build_daily_trial_config(
         # and the run config, but never the trial config, so build_results echoed 0.0 and every
         # "stressed" job was scored unstressed.
         "stress_spread_bps": backtest_cfg.get("stress_spread_bps"),
+        # Robustness-adjusted ranking (concentration + monte carlo + spread). Must be listed HERE
+        # for the same reason as the line above -- this dict is a whitelist, so a knob absent from
+        # it is inert while every log upstream still claims the run is robustness-ranked.
+        "robust_fitness": backtest_cfg.get("robust_fitness"),
         # Optimizer-decoded TradeRule lists (unified rule model, migration 028): the engine
         # seeds the ENTER_MARKET / OPEN_POSITIONS rulesets 1:1 from these (one EventAction per
         # rule, all actions + continue_processing verbatim; disabled rules/actions already

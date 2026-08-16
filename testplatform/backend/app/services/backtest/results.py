@@ -515,6 +515,12 @@ def _compute_metrics(
         # local pool, remote worker, top-N re-run -- picks it up from the config that crossed
         # the wire, with no separate plumbing to keep in sync.
         "stress_spread_bps": _safe_float(config.get("stress_spread_bps") or 0.0),
+        # Optional ROBUSTNESS-adjusted fitness. Same echo mechanism, same reason: when set, the GA
+        # ranks on base_fitness x concentration x monte-carlo x spread factors instead of the raw
+        # metric, and BOTH numbers plus every component land in the results blob (fitness_raw /
+        # fitness_robust / robustness) so a persisted row can always be decomposed. Scores are NOT
+        # comparable across this flag.
+        "robust_fitness": bool(config.get("robust_fitness")),
         "winning_trades": winning_trades,
         "losing_trades": losing_trades,
         "win_rate": round(_safe_float(win_rate), 2),

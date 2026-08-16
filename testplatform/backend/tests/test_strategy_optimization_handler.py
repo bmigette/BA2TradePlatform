@@ -487,7 +487,9 @@ def test_trial_worker_default_omits_full_results(monkeypatch):
 
     monkeypatch.setattr(
         "app.services.backtest.daily_backtest_handler.run_daily_backtest",
-        lambda cfg: {"total_trades": 3, "sharpe_ratio": 1.5},
+        # **kw: the worker passes progress_cb= (the cancellation heartbeat). A 1-arg stub made
+        # this test fail on ARITY rather than on what it is meant to assert.
+        lambda cfg, **kw: {"total_trades": 3, "sharpe_ratio": 1.5},
     )
     out = H._trial_worker({"backtest_id": 1}, "sharpe")
     assert out["ok"] is True
@@ -503,7 +505,7 @@ def test_trial_worker_want_full_flag_attaches_results_and_is_stripped_from_confi
 
     seen_configs = []
 
-    def _fake_run_daily_backtest(cfg):
+    def _fake_run_daily_backtest(cfg, **kw):   # **kw: the worker passes progress_cb=
         seen_configs.append(dict(cfg))
         return {"total_trades": 7, "sharpe_ratio": 2.0}
 
@@ -518,7 +520,13 @@ def test_trial_worker_want_full_flag_attaches_results_and_is_stripped_from_confi
     assert out["ok"] is True
     assert out["fitness"] == 2.0
     assert out["trades"] == 7
-    assert out["full_results"] == {"total_trades": 7, "sharpe_ratio": 2.0}
+    # The engine metrics come back untouched, PLUS the two fitness views compute_fitness records
+    # on the results dict (raw always, robust only when the run opted in). That annotation is what
+    # makes a persisted top-N row decomposable, so it is part of the contract, not noise.
+    assert out["full_results"]["total_trades"] == 7
+    assert out["full_results"]["sharpe_ratio"] == 2.0
+    assert out["full_results"]["fitness_raw"] == 2.0
+    assert out["full_results"]["fitness_robust"] is None
     assert "_want_full_results" not in seen_configs[0]
 
 
@@ -713,14 +721,15 @@ def test_max_remote_slots_for_experts_reads_senate_cap_and_defaults_uncapped():
     cap when multiple capped experts are named in the same run."""
     senate_cfg = {"engine": "daily", "experts": [{"class": "FMPSenateTraderWeight", "settings": {}}]}
     clean_cfg = {"engine": "daily", "experts": [{"class": "FMPEarningsDrift", "settings": {}}]}
-    assert H._max_remote_slots_for_experts(senate_cfg) == 4
+    # 3, not 4: lowered when a Senate trial was measured at ~11-12GB (see the memory work).
+    assert H._max_remote_slots_for_experts(senate_cfg) == 3
     assert H._max_remote_slots_for_experts(clean_cfg) is None
     assert H._max_remote_slots_for_experts({"engine": "daily", "experts": ["NoSuchExpert"]}) is None
     mixed_cfg = {"engine": "daily", "experts": [
         {"class": "FMPSenateTraderWeight", "settings": {}},
         {"class": "FMPEarningsDrift", "settings": {}},
     ]}
-    assert H._max_remote_slots_for_experts(mixed_cfg) == 4  # tightest cap wins
+    assert H._max_remote_slots_for_experts(mixed_cfg) == 3  # tightest cap wins
 
 
 def test_build_daily_trial_config_bypass_drops_rm_tp_sl():

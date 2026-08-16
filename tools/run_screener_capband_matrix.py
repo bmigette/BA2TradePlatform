@@ -272,6 +272,12 @@ def main() -> int:
                          "fitness/return, so no single trade contributes more than this share of "
                          "total return (a trade can pass --profit-cap-pct yet still be 60%% of the "
                          "book). Default 25. Pass 0 to disable.")
+    ap.add_argument("--robust-fitness", action="store_true",
+                    help="Rank every job on the ROBUSTNESS-ADJUSTED fitness (concentration + "
+                         "monte carlo + spread) instead of the raw metric, so a genome whose "
+                         "headline number rests on one unrepeatable winner is not selected. Both "
+                         "values are stored per trial. Scores are NOT comparable with a grid run "
+                         "without it.")
     ap.add_argument("--stress-spread-bps", default="",
                     help="Rank every genome on the WORSE of its fitness at the modelled "
                          "spread and at spread + this many bps. Selects against configs "
@@ -394,6 +400,8 @@ def main() -> int:
                     "--fitness-trade-scale-cap", str(args.fitness_trade_scale_cap)]
         if args.fitness_win_rate_factor:
             cmd += ["--fitness-win-rate-factor"]
+        if args.robust_fitness:
+            cmd += ["--robust-fitness"]
         if args.spread_bps and args.spread_bps > 0:
             cmd += ["--spread-bps", str(args.spread_bps)]
         # Auto-labels for easy filtering (GET /api/backtests?label=...): one tag for the grid/

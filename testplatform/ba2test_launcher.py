@@ -2766,6 +2766,7 @@ def _cmd_optimize(args) -> int:
             "profit_cap_pct": (float(args.profit_cap_pct) if args.profit_cap_pct else None),
             "profit_share_cap_pct": (float(args.profit_share_cap_pct) if args.profit_share_cap_pct else None),
             "stress_spread_bps": (float(args.stress_spread_bps) if getattr(args, "stress_spread_bps", 0) else 0.0),
+            "robust_fitness": bool(getattr(args, "robust_fitness", False)),
             "fitness_trade_scale": bool(getattr(args, "fitness_trade_scale", False)),
             "fitness_trade_scale_cap": (float(args.fitness_trade_scale_cap)
                                         if getattr(args, "fitness_trade_scale_cap", None) else None),
@@ -3071,6 +3072,7 @@ def _cmd_optimize_batch(args) -> int:
                 "profit_cap_pct": (float(args.profit_cap_pct) if args.profit_cap_pct else None),
                 "profit_share_cap_pct": (float(args.profit_share_cap_pct) if args.profit_share_cap_pct else None),
             "stress_spread_bps": (float(args.stress_spread_bps) if getattr(args, "stress_spread_bps", 0) else 0.0),
+                "robust_fitness": bool(getattr(args, "robust_fitness", False)),
                 "fitness_trade_scale": bool(getattr(args, "fitness_trade_scale", False)),
                 "fitness_trade_scale_cap": (float(args.fitness_trade_scale_cap)
                                             if getattr(args, "fitness_trade_scale_cap", None) else None),
@@ -3317,6 +3319,19 @@ def _persist_top_backtests(opt_id: int, expert: str, n: int = 5, parallel: int =
                 status="running", started_at=_dt.now(),
             )
             db.add(bt); db.commit(); db.refresh(bt)
+            # Record BOTH fitness views onto the results blob before it is mapped to the row.
+            # compute_fitness writes fitness_raw / fitness_robust / robustness INTO the dict it is
+            # given, and _persist_results copies everything that is not a curve/trade list into
+            # bt.results -- so this is what makes a persisted row decomposable ("was this genome
+            # ranked up by its raw CAR, or did the concentration factor cut it?").
+            # It runs on the MASTER because _persist_trial_worker deliberately returns the raw
+            # engine blob and computes no fitness; doing it here covers the local pool, the remote
+            # /run-trial-full path and the no-re-run (final-generation) rows identically.
+            try:
+                from app.services.strategy_fitness import compute_fitness as _cf
+                _cf(opt.fitness_metric, out["results"])
+            except Exception as _e:  # noqa: BLE001 -- never lose a persisted row over telemetry
+                print(f"    TOP{rank} fitness annotation failed: {_e!r}")
             _persist_results(db, bt, out["results"])
             # The GA's composite score for this genome (migration 030). It comes from the
             # OPTIMIZER, not the engine, so _persist_results (which maps `results`) cannot
@@ -3760,6 +3775,15 @@ def main(argv: "list | None" = None) -> int:
                          "whose per-trade edge barely clears the modelled cost. 0 = off "
                          "(default). NOTE: a non-zero value RESCALES fitness, so scores "
                          "are not comparable with runs made at a different level.")
+    op.add_argument("--robust-fitness", action="store_true",
+                    help="Rank on a ROBUSTNESS-ADJUSTED fitness instead of the raw metric: the "
+                         "metric is multiplied by a concentration factor (how much of net P&L came "
+                         "from the top 1/5 trades), a Monte-Carlo factor (1000-path bootstrap of the "
+                         "trade sequence; penalises a genome whose 5th-percentile path loses money) "
+                         "and a spread factor (fraction of profit surviving a wider spread). A big "
+                         "winner that is not reproducible therefore stops being rewarded. BOTH "
+                         "numbers are stored (fitness_raw + fitness_robust + every component), but "
+                         "scores are NOT comparable with a run made without this flag. Default: off.")
     op.add_argument("--fitness-trade-scale", action="store_true",
                     help="Multiply each trial's fitness by min(avg_trades_per_year, cap)/target, so "
                          "statistically thin (few-trade) configs are down-weighted (~target trades/yr "

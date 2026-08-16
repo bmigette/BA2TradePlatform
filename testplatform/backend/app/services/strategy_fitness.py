@@ -14,6 +14,7 @@ win_rate, sortino_ratio, calmar_ratio, sqn, max_drawdown (all confirmed present)
 """
 import math
 from datetime import date, datetime
+import os as _os
 from typing import Optional
 
 # Distinct from 0.0 (the exception fallback) so a no-trade config is never
@@ -252,7 +253,8 @@ def assert_catalog_complete() -> None:
 
 
 def compute_fitness(fitness_metric: str, results: dict,
-                    stress_spread_bps: float = 0.0) -> float:
+                    stress_spread_bps: float = 0.0,
+                    robust: Optional[bool] = None) -> float:
     """Return the scalar fitness for a metric from a backtest results dict.
 
     ``stress_spread_bps`` > 0 additionally scores the run as if the spread were that many bps
@@ -291,7 +293,9 @@ def compute_fitness(fitness_metric: str, results: dict,
         # exclusive with CAR's own machinery (win rate isn't part of the CAR formula at all), so
         # it still applies via the shared _apply_win_rate_factor call below.
         _fit = _apply_win_rate_factor(_consistent_annual_return(results), results)
-        return _min_with_stressed(_fit, fitness_metric, results, stress_spread_bps)
+        return _maybe_robust(
+            _min_with_stressed(_fit, fitness_metric, results, stress_spread_bps),
+            fitness_metric, results, stress_spread_bps, robust)
 
     key = _FITNESS_KEYS.get(metric)
     if key is None:
@@ -332,8 +336,39 @@ def compute_fitness(fitness_metric: str, results: dict,
         target = float(results.get("fitness_trade_scale_target") or 100.0)
         tpy = results.get("avg_trades_per_year") or 0.0
         val *= min(float(tpy), cap) / target
-    return _min_with_stressed(_apply_win_rate_factor(val, results),
-                              fitness_metric, results, stress_spread_bps)
+    return _maybe_robust(
+        _min_with_stressed(_apply_win_rate_factor(val, results),
+                           fitness_metric, results, stress_spread_bps),
+        fitness_metric, results, stress_spread_bps, robust)
+
+
+def _maybe_robust(val: float, fitness_metric: str, results: dict,
+                  stress_spread_bps: float, robust: Optional[bool]) -> float:
+    """Apply the robustness adjustment and RECORD BOTH VIEWS on the results dict.
+
+    Opt-in, exactly like the spread stress: `robust` None falls back to the level the RUN was
+    configured with (echoed into results by build_results), so the flag reaches remote workers and
+    top-N re-runs through the config that already crosses all of them, with no new argument in the
+    worker protocol.
+
+    Both numbers are stored -- fitness_raw and fitness_robust, plus every component -- because a
+    single blended score that cannot be decomposed is not auditable, and because scores either
+    side of this flag are NOT comparable (same trap as the 2026-08-04 dd_guard rescale).
+    """
+    if robust is None:
+        robust = bool(results.get("robust_fitness") or False)
+    try:
+        results["fitness_raw"] = val
+    except Exception:  # noqa: BLE001 -- results may be a non-dict in odd callers
+        return val
+    if not robust:
+        results["fitness_robust"] = None
+        return val
+    adj, comp = robust_fitness(val, results, stress_spread_bps
+                               or float(results.get("stress_spread_bps") or 0.0))
+    results["fitness_robust"] = adj
+    results["robustness"] = comp
+    return adj
 
 
 def _apply_win_rate_factor(val: float, results: dict) -> float:
@@ -379,6 +414,118 @@ def _min_with_stressed(base_fitness: float, fitness_metric: str, results: dict,
     if stressed is None:
         return base_fitness
     return min(base_fitness, compute_fitness(fitness_metric, stressed, 0.0))
+
+
+# ---------------------------------------------------------------------------------------------
+# ROBUSTNESS-ADJUSTED FITNESS
+# ---------------------------------------------------------------------------------------------
+# REVERSAL, DELIBERATE, RECORDED. A concentration penalty in fitness was DECLINED 2026-08-06 on
+# the grounds that skew is a legitimate profile and concentration belongs at deploy time. The
+# 2026-08-16 robustness sweep over 84 FMPRating goal2020 results is what changed the call:
+#   * 81 of 84 had top-5 trades > 40% of net P&L;
+#   * 23 had top-5 > 100% -- the five best trades outweighed the ENTIRE net result, so every
+#     other trade combined lost money;
+#   * the headline small-band results (CAR 54-64%) were ONE position: top-1 alone was 76-79%.
+# Those genomes are what an unpenalised CAR search selects for. Keeping concentration purely as a
+# deploy-time check meant the GA spent its whole budget finding them and a human threw them away
+# afterwards. Scoring it moves the filter INTO the search.
+#
+# The three screens are deliberately different in kind, because they fail differently:
+#   spread        -- is the edge bigger than its transaction cost?      (re-scores finished trades)
+#   monte carlo   -- does the result survive reordering the trades?     (bootstrap on the pnl list)
+#   concentration -- is the result CARRIED by a handful of trades?      (share of net P&L)
+# All three are POST-HOC on the finished trade list: no re-simulation, a few ms per trial. That is
+# also their limit -- none can see the trades a different genome WOULD have taken.
+#
+# MEASURED CAVEAT (2026-08-16): the spread screen barely discriminates on these runs -- 81 of 84
+# kept >80% of CAR -- because per-trade notional is only 0.8-15% of equity, so even 80bps costs a
+# few points over 4 years. Expect concentration and MC to do nearly all the work here; spread only
+# bites at live deployment size.
+
+_ROBUST_MC_PATHS = int(_os.getenv("BT_ROBUST_MC_PATHS", "1000")) if False else 1000
+_ROBUST_MC_SEED = 42
+# top-5 share at/below which no concentration penalty applies, and the share at which it reaches
+# zero. 40% is the deploy-time bar already in use; 100% is where the five best trades ARE the
+# entire result.
+_CONC_FREE_PCT, _CONC_ZERO_PCT = 40.0, 100.0
+
+
+def robustness_metrics(results: dict, spread_bps: float = 0.0) -> dict:
+    """The three robustness screens for one finished run. Pure post-hoc, no re-simulation.
+
+    Returns a dict with every component so BOTH the raw and the adjusted view are inspectable
+    afterwards -- a single blended number that cannot be decomposed is not auditable.
+    """
+    out = {"top1_pct": None, "top5_pct": None, "mc_p5": None, "mc_prob_neg": None,
+           "spread_keep_pct": None, "conc_factor": 1.0, "mc_factor": 1.0, "spread_factor": 1.0}
+    trades = results.get("trades") or []
+    pnl = [float(t.get("pnl") or 0.0) for t in trades]
+    net = sum(pnl)
+    if len(pnl) < 2 or net <= 0:
+        return out
+
+    # --- concentration -------------------------------------------------------------------
+    srt = sorted(pnl, reverse=True)
+    out["top1_pct"] = 100.0 * srt[0] / net
+    out["top5_pct"] = 100.0 * sum(srt[:5]) / net
+    t5 = out["top5_pct"]
+    if t5 <= _CONC_FREE_PCT:
+        out["conc_factor"] = 1.0
+    elif t5 >= _CONC_ZERO_PCT:
+        out["conc_factor"] = 0.0
+    else:
+        out["conc_factor"] = 1.0 - (t5 - _CONC_FREE_PCT) / (_CONC_ZERO_PCT - _CONC_FREE_PCT)
+
+    # --- monte carlo: resample the TRADE ORDER ------------------------------------------
+    # Bootstrap the pnl_pct sequence. This asks "was the equity path luck of ordering?" -- it
+    # CANNOT see that one huge winner is a single position (resampling redraws it), which is
+    # exactly why the concentration screen above exists alongside it.
+    try:
+        import numpy as _np
+        pct = _np.array([float(t.get("pnl_pct") or 0.0) for t in trades], dtype=float) / 100.0
+        if pct.size >= 2 and _np.isfinite(pct).all():
+            rng = _np.random.default_rng(_ROBUST_MC_SEED)
+            idx = rng.integers(0, pct.size, size=(_ROBUST_MC_PATHS, pct.size))
+            finals = _np.prod(1.0 + pct[idx], axis=1)
+            out["mc_p5"] = float(_np.percentile(finals, 5) - 1.0) * 100.0
+            out["mc_prob_neg"] = float((finals < 1.0).mean())
+            # full credit when the 5th percentile is still positive; zero when a majority of
+            # reorderings lose money.
+            pn = out["mc_prob_neg"]
+            out["mc_factor"] = 0.0 if pn >= 0.5 else (1.0 - pn / 0.5)
+            if out["mc_p5"] is not None and out["mc_p5"] <= 0:
+                out["mc_factor"] *= 0.5      # a negative left tail is a real demerit, not fatal
+    except Exception:  # noqa: BLE001 -- a degenerate trade list must not kill a trial
+        pass
+
+    # --- spread --------------------------------------------------------------------------
+    if spread_bps and spread_bps > 0:
+        st = stressed_results(results, spread_bps)
+        if st is not None:
+            base_car = float(results.get("annualized_return") or 0.0)
+            st_car = float(st.get("annualized_return") or 0.0)
+            if base_car > 0:
+                keep = 100.0 * st_car / base_car
+                out["spread_keep_pct"] = keep
+                out["spread_factor"] = max(0.0, min(1.0, keep / 100.0))
+    return out
+
+
+def robust_fitness(base_fitness: float, results: dict, spread_bps: float = 0.0) -> tuple:
+    """(adjusted_fitness, components). Multiplicative, so a genome must clear ALL THREE screens.
+
+    Sentinels pass through untouched: a disqualified or wiped-out genome keeps its sentinel RANK
+    rather than being replaced by an ordinary small number that would sort above a real loser.
+    A NEGATIVE base is returned unchanged too -- multiplying a negative by a <1 factor would make
+    a bad genome look BETTER, which is the classic sign-flip bug in penalty schemes.
+    """
+    comp = robustness_metrics(results, spread_bps)
+    if base_fitness in (ZERO_TRADE_SENTINEL, LOW_TRADE_SENTINEL, WIPED_OUT_SENTINEL):
+        return base_fitness, comp
+    if base_fitness <= 0:
+        return base_fitness, comp
+    factor = comp["conc_factor"] * comp["mc_factor"] * comp["spread_factor"]
+    return base_fitness * factor, comp
 
 
 def stressed_results(results: dict, stress_spread_bps: float) -> Optional[dict]:
