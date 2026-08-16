@@ -330,6 +330,17 @@ class DistributedEvaluator:
                 continue
             self.broker.post_result(job["trial_id"], out)
 
+    def swap_pool(self, fresh) -> None:
+        """Install a freshly-built worker pool (master-driven RECYCLE, not a crash recovery).
+
+        Call only at a batch boundary, when every job has resolved and the consumers are idle:
+        consumers snapshot ``self.pool`` when they claim, so swapping under an in-flight claim
+        would submit to a pool that is being torn down. Takes the same lock ``_recover_pool``
+        uses, so a concurrent crash-recovery and a recycle cannot interleave.
+        """
+        with self._pool_lock:
+            self.pool = fresh
+
     def _recover_pool(self, bad_pool, exc: Exception) -> None:
         """Replace a dead local pool with a fresh one. Thread-safe: if several consumers hit the
         SAME break around the same time, only the first to acquire the lock rebuilds it — the

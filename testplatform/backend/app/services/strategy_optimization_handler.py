@@ -355,17 +355,22 @@ _MEM_THROTTLE_PCT = float(_os.getenv("BT_MEM_THROTTLE_PCT", "10"))   # release c
 _MEM_EMERGENCY_PCT = float(_os.getenv("BT_MEM_EMERGENCY_PCT", "5"))  # break the pool (frees all)
 # Recycle a pool worker after this many individuals (None disables). Backstop for anything the
 # cache release cannot reach -- allocator arenas, and the non-cache RSS growth measured 2026-08-16.
-# DEFAULT OFF (2026-08-16). Recycling DEADLOCKS the local pool on Windows: opt 328 hung for 2.5h
-# with zero workers alive, the MainThread parked in as_completed and QueueFeederThread blocked in
-# _send_bytes -- i.e. the feeder was writing into a call queue no process was draining, because all
-# 4 workers had retired at exactly 4 x 8 = 32 individuals (the FIRST recycle wave) and their
-# replacements never came up. No BrokenProcessPool is raised in that state, so the pool-recovery
-# path never fires and the job hangs forever instead of failing.
-# The backstop it provided is now largely redundant: the int64 bar keys halved the per-symbol store
-# and the memory governor still releases caches / breaks the pool under real pressure. Set
-# BT_MAX_TASKS_PER_CHILD to re-enable if a box needs it -- but only on the DISTRIBUTED path, which
-# recovers from a broken pool.
-_MAX_TASKS_PER_CHILD = int(_os.getenv("BT_MAX_TASKS_PER_CHILD", "0")) or None
+# Recycle a pool worker after this many individuals (0/None disables). A respawn resets EVERYTHING
+# a cache release cannot -- pymalloc arenas and any leak not yet found -- which is why it is worth
+# keeping: worker RSS was measured climbing 29% over ~30min while the bar-cache lines stayed
+# byte-identical.
+#
+# It is NOT implemented with ProcessPoolExecutor(max_tasks_per_child=...). That retires workers
+# MID-FLIGHT, while the queue feeder is still streaming work into them, and on Windows/spawn it
+# deadlocks: opt 328 hung 2h25m having completed exactly 4 workers x 8 tasks = 32 individuals (the
+# first recycle wave), with ZERO workers alive, MainThread parked in as_completed and
+# QueueFeederThread blocked in _send_bytes -- writing into a call queue nobody drains. CPython
+# raises no BrokenProcessPool there, so pool recovery never fires and the job hangs silently.
+#
+# Instead the master rebuilds the pool between CHUNKS, at a point where every future has resolved
+# (see _local_execute_jobs). Same teardown, same memory reclaim, but nothing is ever in flight
+# across the rebuild, so there is no work to strand and no feeder to block.
+_MAX_TASKS_PER_CHILD = int(_os.getenv("BT_MAX_TASKS_PER_CHILD", "8")) or None
 
 
 class MemoryGovernor:
@@ -430,6 +435,26 @@ class MemoryGovernor:
             self.current = new
             return "release"
         return "ok"
+
+
+def _recycle_pool(pool: Any, make_pool, done: int, total: int, log=logger.warning):
+    """Tear the worker pool down and build a fresh one. Call ONLY when no future is in flight.
+
+    A respawn is the only thing that returns pymalloc arenas and any not-yet-found leak to the OS;
+    the governor's cache release cannot. ``shutdown(wait=True)`` is what makes it safe -- it lets
+    the retiring processes finish and the queue feeder drain, which is precisely what the
+    executor's own max_tasks_per_child does NOT do.
+    """
+    import time as _t
+    t0 = _t.monotonic()
+    try:
+        pool.shutdown(wait=True, cancel_futures=False)
+    except Exception as e:  # noqa: BLE001 -- a failed teardown must not lose the run
+        log(f"pool recycle: shutdown raised {e!r}; building a fresh pool anyway")
+    fresh = make_pool()
+    log(f"pool recycled after {done}/{total} individuals ({_t.monotonic() - t0:.1f}s) -- "
+        f"worker RSS returned to the OS")
+    return fresh
 
 
 def _release_pool_memory(pool: Any, n_workers: int, log=logger.warning) -> None:
@@ -823,33 +848,53 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         # (master-as-worker pool consumers + remote HTTP workers). The memo/progress/persist
         # collection loop below is identical for both — only WHERE a trial runs differs.
         def _local_execute_jobs(jobs):
+            """Run a batch on the local pool, rebuilding it every _MAX_TASKS_PER_CHILD individuals.
+
+            The batch is submitted in CHUNKS of (recycle_every x workers). A chunk is drained
+            fully, then the pool is torn down and remade before the next chunk starts. That gives
+            the same per-worker recycle cadence the executor's max_tasks_per_child was meant to
+            give, but the teardown happens when NOTHING is in flight -- no stranded futures, no
+            blocked queue feeder, so it cannot reproduce the opt 328 deadlock.
+
+            The cost is a drain barrier per chunk: the chunk's slowest trial holds up the rebuild
+            while other workers idle. On this grid trial times run 6s..1104s, so a barrier can
+            waste a few minutes; that is the price of reclaiming worker RSS, and it is bounded
+            (~4 barriers per 140-individual generation at the default 8).
+            """
+            nonlocal _pool
             from concurrent.futures import as_completed, TimeoutError as _FTimeout
-            futures = {
-                _pool.submit(_trial_worker, cfg, opt.fitness_metric): (i, flat, key)
-                for (i, flat, key, cfg) in jobs
-            }
-            # STALL GUARD. A wedged pool (see _MAX_TASKS_PER_CHILD) leaves this generator blocked
-            # in as_completed with no error, no log line and no end -- opt 328 sat there 2.5h and
-            # would have sat there indefinitely. A timeout cannot distinguish "wedged" from "slow"
-            # by itself, so it is set from the SLOWEST trial actually observed (1104s on this grid)
-            # with a wide margin, and it FAILS LOUDLY rather than trying to recover: an aborted job
-            # is visible and restartable, a silent hang costs a night.
+            # STALL GUARD. Belt and braces: if a pool ever wedges again the generator must not sit
+            # in as_completed forever with no error and no log line (opt 328 sat 2h25m and would
+            # have sat indefinitely). Sized off the SLOWEST trial actually observed here (1104s)
+            # with a wide margin, and it FAILS LOUDLY -- an aborted job is visible and restartable,
+            # a silent hang costs a night.
             _stall_s = float(_os.getenv("BT_LOCAL_STALL_TIMEOUT_S", "5400"))
-            try:
-                for fut in as_completed(futures, timeout=_stall_s):
-                    i, flat, key = futures[fut]
-                    yield (i, flat, key, fut.result())
-            except _FTimeout:
-                pending = sum(1 for f in futures if not f.done())
-                logger.error(
-                    f"LOCAL POOL STALLED: {pending}/{len(futures)} trials made no progress in "
-                    f"{_stall_s:.0f}s. This is the pool-recycle deadlock (all workers retired, "
-                    f"replacements never started, queue feeder blocked). Aborting the job so it "
-                    f"can be restarted -- check BT_MAX_TASKS_PER_CHILD is unset.")
-                raise
+            jobs = list(jobs)
+            chunk = (_MAX_TASKS_PER_CHILD * max(1, parallel)) if _MAX_TASKS_PER_CHILD else len(jobs)
+            chunk = max(1, chunk)
+            for start in range(0, len(jobs), chunk):
+                part = jobs[start:start + chunk]
+                futures = {
+                    _pool.submit(_trial_worker, cfg, opt.fitness_metric): (i, flat, key)
+                    for (i, flat, key, cfg) in part
+                }
+                try:
+                    for fut in as_completed(futures, timeout=_stall_s):
+                        i, flat, key = futures[fut]
+                        yield (i, flat, key, fut.result())
+                except _FTimeout:
+                    pending = sum(1 for f in futures if not f.done())
+                    logger.error(
+                        f"LOCAL POOL STALLED: {pending}/{len(futures)} trials made no progress in "
+                        f"{_stall_s:.0f}s. Aborting the job so it can be restarted rather than "
+                        f"hanging silently.")
+                    raise
+                if _MAX_TASKS_PER_CHILD and (start + chunk) < len(jobs):
+                    _pool = _recycle_pool(_pool, _make_pool, start + chunk, len(jobs))
 
         def make_batch_fitness(execute_jobs):
             def batch_fitness(param_dicts: list) -> list:
+                nonlocal _pool          # rebound by the batch-end recycle at the bottom
                 if tq.is_task_paused(task_id):
                     raise InterruptedError("paused/cancelled")
                 fits: list = [None] * len(param_dicts)
@@ -907,10 +952,15 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                             # Reclaim for real: idled workers keep their last working set until
                             # their next preload, so throttling without this frees nothing.
                             _release_pool_memory(_pool, _governor.current)
-                        elif verdict == "emergency":
+                        elif verdict == "emergency" and _evaluator is not None:
                             # Break the pool: every worker dies -> ALL memory reclaimed at once.
                             # _consume_local's BrokenProcessPool handler rebuilds it and requeues
                             # the in-flight trial, so no individual is lost.
+                            # DISTRIBUTED ONLY (`_evaluator is not None`). On the local path there
+                            # is no requeue: cancel_futures would strand the batch generator in
+                            # as_completed on cancelled futures. Local mode falls through to the
+                            # cache release below, and gets its full teardown at the next chunk
+                            # boundary instead (see _local_execute_jobs).
                             try:
                                 _pool.shutdown(wait=False, cancel_futures=True)
                                 logger.warning(
@@ -967,6 +1017,18 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                         from app.services.distributed_eval import _log_memory_diagnostics
                         _log_memory_diagnostics(
                             logger.warning, f"gen {gen + 1}/{n_gens} ind {done}/{total_in_batch}")
+                # RECYCLE, DISTRIBUTED PATH. With --workers the trials run through
+                # DistributedEvaluator, whose consumer threads submit to the pool continuously --
+                # _local_execute_jobs (and its per-chunk rebuild) is never called, so without this
+                # the pool would never be torn down at all on the path we actually run grids on.
+                # The batch boundary is the only quiescent point there: every job of this
+                # generation has resolved and the consumers are idle, so a shutdown(wait=True)
+                # cannot strand in-flight work. Coarser than the local cadence (once per
+                # generation rather than every N individuals) -- accepted, because the governor's
+                # cache release still runs after EVERY individual in between.
+                if _pool is not None and _evaluator is not None and _MAX_TASKS_PER_CHILD:
+                    _pool = _recycle_pool(_pool, _make_pool, total_in_batch, total_in_batch)
+                    _evaluator.swap_pool(_pool)   # under the same lock crash-recovery uses
                 return fits
 
             return batch_fitness
@@ -1054,20 +1116,13 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             _env = {k: _os.environ[k] for k in _WORKER_ENV_KEYS if _os.environ.get(k)}
 
             def _make_pool() -> ProcessPoolExecutor:
-                # max_tasks_per_child: recycle a worker after N individuals so its process is torn
-                # down and rebuilt. This is the BACKSTOP behind the governor's cache release --
-                # a respawn resets EVERYTHING (caches, pymalloc arenas, any leak not yet found),
-                # which the release cannot. It is also the answer to the residual growth measured
-                # 2026-08-16: worker RSS climbed 29% over ~30min while the bar-cache lines stayed
-                # byte-identical, i.e. something outside the caches accumulates.
-                # Cost is one respawn (a full import) per N trials; N is env-tunable so a box that
-                # finds the import expensive can raise it.
+                # NOTE: deliberately NO max_tasks_per_child here -- see _MAX_TASKS_PER_CHILD for
+                # why the executor's own recycling deadlocks, and where the recycle now happens.
                 return ProcessPoolExecutor(
                     max_workers=parallel,
                     mp_context=_mp.get_context("spawn"),
                     initializer=_worker_init,
                     initargs=(_BACKEND_DIR, _env),
-                    max_tasks_per_child=_MAX_TASKS_PER_CHILD,
                 )
 
             _pool = _make_pool()
