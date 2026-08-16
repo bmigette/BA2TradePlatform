@@ -143,6 +143,19 @@ class MarketExpertInterface(ExtendableSettingsInterface):
                     "tooltip": "Only used when sizing_mode=risk_atr. The maximum fraction of equity lost if the "
                                "stop-loss triggers. Institutional rule of thumb: 1%% (conservative) to 2%% (moderate)."
                 },
+                "atr_risk_budget_pct": {
+                    "type": "float", "required": False, "default": None,
+                    "description": "%% of equity risked per trade for risk_atr SIZING (falls back to risk_per_trade_pct)",
+                    "tooltip": "Only used when sizing_mode=risk_atr. DECOUPLED from risk_per_trade_pct, which also "
+                               "sets the STOP DISTANCE (min of atr_multiplier*ATR and risk_per_trade_pct%%, floored "
+                               "at min_stop_loss_pct%%) in BOTH sizing modes. Because one setting drove both, a "
+                               "range wide enough to search stop distance (0.5-10%%) pushed the risk-based size "
+                               "above max_virtual_equity_per_instrument_percent, so the cap bound and risk_atr "
+                               "produced positions IDENTICAL to notional -- measured 2026-08-16 on real ATR, the "
+                               "cap bound in ~71%% of the gene grid, and 28 of 56 goal2020 result pairs were "
+                               "byte-identical between the two sizing modes. Leave unset to keep the old coupled "
+                               "behaviour (falls back to risk_per_trade_pct)."
+                },
                 "atr_multiplier": {
                     "type": "float", "required": False, "default": 2.0,
                     "description": "ATR multiple for the implied stop distance (risk_atr mode)",

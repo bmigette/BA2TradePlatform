@@ -82,6 +82,31 @@ if command -v powershell >/dev/null 2>&1; then
   powershell -NoProfile -ExecutionPolicy Bypass -File tools/sweep_spawn_orphans.ps1 || true
 fi
 
+INTERVAL="${INTERVAL:-5min}"
+
+# --- PREFLIGHT: does the cache cover THIS grid's window at THIS grid's interval? ---------------
+# Added 2026-08-16 after a grid ran for days on a universe with no 5min bars before 2022: the jobs
+# claimed 2020-2025 but ~75% of symbols could not be PRICED, therefore not traded, for the first
+# two years -- silently, because preload treats "cache exists but has no rows in this sub-range"
+# as a legitimate gap (recent IPO / holiday) rather than an error.
+#
+# The cache health tool ALREADY had a period-coverage check; it was simply never asked the right
+# question. Its defaults are --ohlcv-interval 1d --start 2022-01-01, and daily has deep history,
+# so running it with defaults reports everything healthy. It MUST be given the job's OWN interval
+# and start date -- which is the entire point of this block. (Its symbol sample was also the
+# alphabetical head, now a seeded random sample, which is the other reason this slipped through.)
+echo
+echo "=== PREFLIGHT cache coverage: interval=${INTERVAL} window ${START} -> ${END}"
+if ! "$PY" tools/cache_health_check.py       --ohlcv-interval "$INTERVAL" --start "$START" --end "$END"       --skip-workers --skip-gaps --validity-symbols 60; then
+  echo "=== PREFLIGHT FAILED: the cache does not cover this window at this interval."
+  echo "===   Backfill first, e.g.:"
+  echo "===   ba2-test fetch-cache --provider fmp --timeframes ${INTERVAL} \\"
+  echo "===       --start ${START} --end ${END} --symbols @<universe.txt> --workers 5"
+  echo "===   Set GRID_SKIP_PREFLIGHT=1 to run anyway (results WILL be on a reduced universe)."
+  [ "${GRID_SKIP_PREFLIGHT:-0}" = "1" ] || exit 1
+  echo "=== GRID_SKIP_PREFLIGHT=1 -- continuing on a KNOWN-INCOMPLETE cache."
+fi
+
 COMMON=(--start "$START" --end "$END" --fitness "$FITNESS" --store "$STORE")
 if [ -n "$WORKERS" ]; then
   COMMON+=(--workers "$WORKERS")

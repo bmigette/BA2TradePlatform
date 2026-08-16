@@ -94,6 +94,34 @@ fi
 WORKER_ARGS=()
 [ -n "$WORKERS" ] && WORKER_ARGS=(--workers "$WORKERS")
 
+START="${START:-2020-01-01}"
+END="${END:-2025-12-31}"
+INTERVAL="${INTERVAL:-5min}"
+
+# --- PREFLIGHT: does the cache cover THIS grid's window at THIS grid's interval? ---------------
+# Added 2026-08-16 after a grid ran for days on a universe with no 5min bars before 2022: the jobs
+# claimed 2020-2025 but ~75% of symbols could not be PRICED, therefore not traded, for the first
+# two years -- silently, because preload treats "cache exists but has no rows in this sub-range"
+# as a legitimate gap (recent IPO / holiday) rather than an error.
+#
+# The cache health tool ALREADY had a period-coverage check; it was simply never asked the right
+# question. Its defaults are --ohlcv-interval 1d --start 2022-01-01, and daily has deep history,
+# so running it with defaults reports everything healthy. It MUST be given the job's OWN interval
+# and start date -- which is the entire point of this block. (Its symbol sample was also the
+# alphabetical head, now a seeded random sample, which is the other reason this slipped through.)
+echo
+echo "=== PREFLIGHT cache coverage: interval=${INTERVAL} window ${START} -> ${END}"
+if ! "$PY" tools/cache_health_check.py       --ohlcv-interval "$INTERVAL" --start "$START" --end "$END"       --skip-workers --skip-gaps --validity-symbols 60; then
+  echo "=== PREFLIGHT FAILED: the cache does not cover this window at this interval."
+  echo "===   Backfill first, e.g.:"
+  echo "===   ba2-test fetch-cache --provider fmp --timeframes ${INTERVAL} \\"
+  echo "===       --start ${START} --end ${END} --symbols @<universe.txt> --workers 5"
+  echo "===   Set GRID_SKIP_PREFLIGHT=1 to run anyway (results WILL be on a reduced universe)."
+  [ "${GRID_SKIP_PREFLIGHT:-0}" = "1" ] || exit 1
+  echo "=== GRID_SKIP_PREFLIGHT=1 -- continuing on a KNOWN-INCOMPLETE cache."
+fi
+
+
 echo "=================================================================="
 echo "=== goal2020 MATRIX 3 : PHASE A Senate (own universe) + PHASE B DeterministicScorer (cap bands)"
 echo "=== window 2020-01-01 -> 2025-12-31 | spread ${SPREAD_BPS} bps, stress +${STRESS_BPS}"
@@ -102,33 +130,15 @@ echo "=== universe: $(echo "$UNI" | tr ',' '\n' | wc -l) symbols"
 echo "=================================================================="
 
 rc_any=0
-for MODE in risk_atr notional; do
-  for S in $STRATEGIES; do
-    NAME="sen-${S}-goal2020-${MODE}"
-    echo
-    echo "=== $NAME  start $(date)"
-    "$PY" testplatform/ba2test_launcher.py optimize \
-      --expert FMPSenateTraderWeight \
-      --strategy "$S" \
-      --universe "$UNI" \
-      --start 2020-01-01 --end 2025-12-31 \
-      --interval 5min \
-      --fitness consistent_annual_return \
-      --population "$POPULATION" --generations "$GENERATIONS" \
-      --early-stop 4 --mutation-prob 0.3 \
-      --parallel "$PARALLEL" --seed 42 \
-      --sizing-mode "$MODE" \
-      --initial-capital 10000 --commission 1.0 \
-      --spread-bps "$SPREAD_BPS" "${stress_args[@]}" \
-      --profit-cap-pct 2000 --profit-share-cap-pct 25 \
-      "${WORKER_ARGS[@]}" \
-      --labels "goal2020-senate,${S},${MODE}" \
-      --name "$NAME"
-    rc=$?
-    echo "=== $NAME  done rc=$rc $(date)"
-    [ $rc -ne 0 ] && rc_any=$rc
-  done
-done
+# ---------------------------------------------------------------------------
+# ORDER: PHASE B (DeterministicScorer) RUNS FIRST, ahead of PHASE A (Senate).
+# ---------------------------------------------------------------------------
+# DeterministicScorer has NEVER completed a run. The only prior signal is 18 trials at
+# fitness 1.72 in the large band, plus two zero-trade samples in mid/small that came from a
+# grid killed after 2 trials -- an insufficient sample, NOT evidence the expert is broken.
+# Senate is known-good, so running the unknown FIRST makes its first generation observable
+# within minutes instead of after Senate's 14 jobs: if it produces nothing, that is found
+# early and cheaply rather than a day later.
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +165,35 @@ for MODE in risk_atr notional; do
     "$PY" "$DRIVER"       --start 2020-01-01 --end 2025-12-31       --fitness consistent_annual_return       --store "$STORE"       --sizing-mode "$MODE" --bands "$band"       --spread-bps "$sp" "${ds_stress[@]}"       --parallel "$DS_PARALLEL"       --name-suffix="-goal2020-${MODE}-ds"       --skip-experts FMPRating,FMPEarningsDrift,FMPInsiderClusterBuy,FactorRanker       "${WORKER_ARGS[@]}"
     rc=$?
     echo "=== PHASE B  $MODE / $band  done rc=$rc $(date)"
+    [ $rc -ne 0 ] && rc_any=$rc
+  done
+done
+
+
+for MODE in risk_atr notional; do
+  for S in $STRATEGIES; do
+    NAME="sen-${S}-goal2020-${MODE}"
+    echo
+    echo "=== $NAME  start $(date)"
+    "$PY" testplatform/ba2test_launcher.py optimize \
+      --expert FMPSenateTraderWeight \
+      --strategy "$S" \
+      --universe "$UNI" \
+      --start 2020-01-01 --end 2025-12-31 \
+      --interval 5min \
+      --fitness consistent_annual_return \
+      --population "$POPULATION" --generations "$GENERATIONS" \
+      --early-stop 4 --mutation-prob 0.3 \
+      --parallel "$PARALLEL" --seed 42 \
+      --sizing-mode "$MODE" \
+      --initial-capital 10000 --commission 1.0 \
+      --spread-bps "$SPREAD_BPS" "${stress_args[@]}" \
+      --profit-cap-pct 2000 --profit-share-cap-pct 25 \
+      "${WORKER_ARGS[@]}" \
+      --labels "goal2020-senate,${S},${MODE}" \
+      --name "$NAME"
+    rc=$?
+    echo "=== $NAME  done rc=$rc $(date)"
     [ $rc -ne 0 ] && rc_any=$rc
   done
 done

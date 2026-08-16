@@ -1316,6 +1316,13 @@ _REGIME_OPT = {
 
 _RM_OPT = {
     "risk_per_trade_pct": {"optimize": True, "min": 0.5, "max": 10.0, "step": 0.5, "type": "float"},
+    # SIZING budget for risk_atr, decoupled from risk_per_trade_pct (which sets the STOP DISTANCE
+    # in both modes). Range 0.25-3.0 because that is where the sizing decision is REAL: measured
+    # against realized daily ATR (median 2.29% of price, n=278), the per-instrument cap binds --
+    # making risk_atr identical to notional -- for 71% of the grid at 3.0, 91% at 5.0 and 99% at
+    # 10.0. Searching above ~3 spends the GA's budget in a region where the sizing mode provably
+    # does nothing (28 of 56 goal2020 pairs came back byte-identical).
+    "atr_risk_budget_pct": {"optimize": True, "min": 0.25, "max": 3.0, "step": 0.25, "type": "float"},
     "atr_multiplier": {"optimize": True, "min": 3.0, "max": 6.0, "step": 0.5, "type": "float"},
     "atr_period": {"optimize": True, "min": 7, "max": 28, "step": 7, "type": "int"},
     "min_stop_loss_pct": {"optimize": True, "min": 3.0, "max": 15.0, "step": 1.0, "type": "float"},

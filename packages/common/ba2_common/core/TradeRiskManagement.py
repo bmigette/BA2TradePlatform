@@ -938,7 +938,15 @@ class TradeRiskManagement:
             return
         from ba2_common.core.position_sizing import get_latest_atr, synthesize_safeguard_stop
 
-        risk_pct = float(expert.get_setting_with_interface_default('risk_per_trade_pct', log_warning=False) or 1.0)
+        # SIZING budget. Prefer the dedicated atr_risk_budget_pct; fall back to risk_per_trade_pct
+        # when unset so existing configs behave exactly as before. These are decoupled because
+        # risk_per_trade_pct ALSO sets the stop DISTANCE (synthesize_safeguard_stop) in both sizing
+        # modes -- one gene doing two jobs meant a range wide enough for stop search drove the
+        # risk-based size past the per-instrument cap, collapsing risk_atr onto notional.
+        _budget = expert.get_setting_with_interface_default('atr_risk_budget_pct', log_warning=False)
+        if _budget is None:
+            _budget = expert.get_setting_with_interface_default('risk_per_trade_pct', log_warning=False)
+        risk_pct = float(_budget or 1.0)
         atr_mult = float(expert.get_setting_with_interface_default('atr_multiplier', log_warning=False) or 2.0)
         atr_period = int(expert.get_setting_with_interface_default('atr_period', log_warning=False) or 14)
         min_stop_pct = float(expert.get_setting_with_interface_default('min_stop_loss_pct', log_warning=False) or 0.0)

@@ -267,6 +267,61 @@ def _trial_worker(config: Dict[str, Any], fitness_metric: str, ctl: Any = None) 
                 "fatal": fatal, "mem": _trial_memory_snapshot()}
 
 
+def _worker_release_memory() -> Dict[str, Any]:
+    """Run INSIDE a pool worker: drop every process-local data cache and return what was freed.
+
+    This is what makes throttling actually reclaim. Merely stopping dispatch to a worker frees
+    NOTHING -- with flush-per-individual the cache is dropped at the START of the next preload, so
+    an idled worker keeps its last working set (measured 4-7 GB) resident indefinitely.
+
+    Safe to call at any time: every cache here is a pure memoisation of on-disk parquet, so a
+    later miss re-reads identical bytes. Result-neutral, costs a re-parse.
+    """
+    import gc
+
+    from app.services.backtest import price_source as _ps
+    before = 0.0
+    try:
+        st = _ps.memory_stats()
+        before = float(st["bar_cache"]["mb"]) + float(st["series_memo"]["mb"])
+    except Exception:  # noqa: BLE001
+        pass
+    _ps.clear_worker_bar_cache()
+    _ps.clear_ohlcv_memo()
+    for mod, fn in (("app.services.backtest.options_provider", "clear_worker_option_caches"),
+                    ("app.services.backtest.results", "clear_worker_5m_cache")):
+        try:
+            import importlib
+            m = importlib.import_module(mod)
+            for cand in (fn, "clear_worker_bar_cache", "clear_caches"):
+                if hasattr(m, cand):
+                    getattr(m, cand)()
+                    break
+        except Exception:  # noqa: BLE001 -- best effort; never fail a release
+            pass
+    gc.collect()
+    try:
+        import os as _o
+
+        import psutil
+        rss = psutil.Process(_o.getpid()).memory_info().rss // 1048576
+    except Exception:  # noqa: BLE001
+        rss = None
+    return {"freed_cache_mb": round(before, 1), "rss_mb_after": rss}
+
+
+def system_memory() -> Dict[str, Any]:
+    """System-wide memory, the number the governor acts on. A worker's OWN rss says nothing about
+    whether the BOX is in trouble -- 6 workers at 4 GB is fine on 64 GB and fatal on 32 GB."""
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+        return {"free_mb": vm.available // 1048576, "total_mb": vm.total // 1048576,
+                "pct_free": round(100.0 * vm.available / max(1, vm.total), 1)}
+    except Exception as e:  # noqa: BLE001
+        return {"error": repr(e)}
+
+
 def _trial_memory_snapshot() -> Dict[str, Any]:
     """Cheap per-trial memory snapshot taken INSIDE the worker process: RSS + the two OHLCV
     cache sizes (price_source.memory_stats). Best-effort — never fails a trial."""
@@ -276,9 +331,104 @@ def _trial_memory_snapshot() -> Dict[str, Any]:
         from app.services.backtest.price_source import memory_stats
         snap = memory_stats()
         snap["rss_mb"] = psutil.Process(_os.getpid()).memory_info().rss // 1048576
+        # System-wide free, sampled in the worker so it reflects the box the trial actually ran on
+        # (a REMOTE worker's box is not the master's). The governor throttles on this, not on rss.
+        snap["sys"] = system_memory()
         return snap
     except Exception as e:  # noqa: BLE001
         return {"error": repr(e)}
+
+
+# Dynamic worker allocation thresholds, as fractions of TOTAL system memory.
+# Checked after EVERY individual, from the snapshot the worker took on ITS OWN box (a remote
+# worker's box is not the master's, so each self-governs).
+_MEM_THROTTLE_PCT = float(_os.getenv("BT_MEM_THROTTLE_PCT", "10"))   # release caches + stop dispatch
+_MEM_EMERGENCY_PCT = float(_os.getenv("BT_MEM_EMERGENCY_PCT", "5"))  # break the pool (frees all)
+# Recycle a pool worker after this many individuals (None disables). Backstop for anything the
+# cache release cannot reach -- allocator arenas, and the non-cache RSS growth measured 2026-08-16.
+_MAX_TASKS_PER_CHILD = int(_os.getenv("BT_MAX_TASKS_PER_CHILD", "8")) or None
+
+
+class MemoryGovernor:
+    """Keeps the pool inside a memory budget, checked after each individual.
+
+    WHY THROTTLING ALONE IS NOT ENOUGH. Ceasing to dispatch to a worker frees NOTHING: with
+    flush-per-individual the cache is dropped at the START of the next preload, so an idled worker
+    keeps its last working set (measured 4-7 GB) resident forever. So the throttle step ALSO
+    submits _worker_release_memory tasks, which drop every process-local cache and gc -- and numpy
+    returns ~99.8% of that to the OS (measured), so the reclaim is real, not bookkeeping.
+
+    Escalation:
+      free < 10%  -> RELEASE caches across the pool + reduce dispatch concurrency by one.
+                     Nothing is lost; in-flight individuals finish normally.
+      free <  5%  -> EMERGENCY: break the pool. Every worker dies, so ALL memory is reclaimed at
+                     once, and ``_consume_local``'s existing BrokenProcessPool handler rebuilds it
+                     and REQUEUES the in-flight trial (``broker.requeue_one``) -- so the individual
+                     is re-evaluated, not lost. ``execute_jobs``' requeue_stale is the second net.
+    Concurrency is restored to full at each JOB boundary, so one bad job cannot permanently shrink
+    the fleet.
+
+    Every transition logs at WARNING: an optimize run installs logging.disable(INFO), so anything
+    below WARNING would never be emitted -- and a governor that silently halves throughput would be
+    indistinguishable from the box being slow.
+    """
+
+    def __init__(self, full_parallel: int, log=logger.warning):
+        self.full = max(1, int(full_parallel))
+        self.current = self.full
+        self.log = log
+        self._releases = 0
+        self._emergencies = 0
+
+    def restore(self, why: str = "new job") -> None:
+        if self.current != self.full:
+            self.log(f"memory governor: restoring concurrency {self.current} -> {self.full} ({why})")
+        self.current = self.full
+
+    def assess(self, mem: Any) -> str:
+        """Return 'ok' | 'release' | 'emergency' from a per-trial snapshot. Never raises."""
+        if not isinstance(mem, dict):
+            return "ok"
+        sys_mem = mem.get("sys") or {}
+        pct = sys_mem.get("pct_free")
+        if pct is None:
+            return "ok"
+        if pct < _MEM_EMERGENCY_PCT:
+            self._emergencies += 1
+            self.log(
+                f"memory governor EMERGENCY: {pct}% free ({sys_mem.get('free_mb')} MB of "
+                f"{sys_mem.get('total_mb')} MB) < {_MEM_EMERGENCY_PCT}% -- breaking the pool to "
+                f"reclaim ALL worker memory; the in-flight individual is REQUEUED, not lost "
+                f"(emergency #{self._emergencies})")
+            return "emergency"
+        if pct < _MEM_THROTTLE_PCT:
+            self._releases += 1
+            new = max(1, self.current - 1)
+            self.log(
+                f"memory governor THROTTLE: {pct}% free ({sys_mem.get('free_mb')} MB of "
+                f"{sys_mem.get('total_mb')} MB) < {_MEM_THROTTLE_PCT}% -- releasing worker caches "
+                f"and reducing concurrency {self.current} -> {new} (release #{self._releases})")
+            self.current = new
+            return "release"
+        return "ok"
+
+
+def _release_pool_memory(pool: Any, n_workers: int, log=logger.warning) -> None:
+    """Ask the pool to drop its data caches. Submits more tasks than workers because a
+    ProcessPoolExecutor cannot be told WHICH worker to run on -- oversubscribing raises the odds
+    every worker gets one. Best-effort by design: a missed worker is flushed at its next preload."""
+    try:
+        futs = [pool.submit(_worker_release_memory) for _ in range(max(1, n_workers) * 3)]
+        freed = 0.0
+        for f in futs:
+            try:
+                r = f.result(timeout=60)
+                freed += float(r.get("freed_cache_mb") or 0)
+            except Exception:  # noqa: BLE001
+                pass
+        log(f"memory governor: released ~{freed:.0f} MB of worker caches across the pool")
+    except Exception as e:  # noqa: BLE001 -- never let a release attempt kill the run
+        log(f"memory governor: cache release failed ({type(e).__name__}: {e})")
 
 
 def _log_trial_memory(gen: int, n_gens: int, done: int, total: int, mem: Any,
@@ -688,6 +838,23 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                         memo.put(key, fit)
                         _log_trial_memory(gen, n_gens, done + 1, total_in_batch,
                                           out.get("mem"), out.get("secs"))
+                        # Dynamic worker allocation, checked after EVERY individual.
+                        verdict = _governor.assess(out.get("mem"))
+                        if verdict == "release":
+                            # Reclaim for real: idled workers keep their last working set until
+                            # their next preload, so throttling without this frees nothing.
+                            _release_pool_memory(_pool, _governor.current)
+                        elif verdict == "emergency":
+                            # Break the pool: every worker dies -> ALL memory reclaimed at once.
+                            # _consume_local's BrokenProcessPool handler rebuilds it and requeues
+                            # the in-flight trial, so no individual is lost.
+                            try:
+                                _pool.shutdown(wait=False, cancel_futures=True)
+                                logger.warning(
+                                    "memory governor: pool shut down; it will be rebuilt on the "
+                                    "next submit and affected individuals requeued")
+                            except Exception as _e:  # noqa: BLE001
+                                logger.warning(f"memory governor: pool shutdown failed ({_e!r})")
                         all_results.append(
                             {"params": flat, "fitness": fit, "key": key, "trades": out["trades"]}
                         )
@@ -818,14 +985,30 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             _env = {k: _os.environ[k] for k in _WORKER_ENV_KEYS if _os.environ.get(k)}
 
             def _make_pool() -> ProcessPoolExecutor:
+                # max_tasks_per_child: recycle a worker after N individuals so its process is torn
+                # down and rebuilt. This is the BACKSTOP behind the governor's cache release --
+                # a respawn resets EVERYTHING (caches, pymalloc arenas, any leak not yet found),
+                # which the release cannot. It is also the answer to the residual growth measured
+                # 2026-08-16: worker RSS climbed 29% over ~30min while the bar-cache lines stayed
+                # byte-identical, i.e. something outside the caches accumulates.
+                # Cost is one respawn (a full import) per N trials; N is env-tunable so a box that
+                # finds the import expensive can raise it.
                 return ProcessPoolExecutor(
                     max_workers=parallel,
                     mp_context=_mp.get_context("spawn"),
                     initializer=_worker_init,
                     initargs=(_BACKEND_DIR, _env),
+                    max_tasks_per_child=_MAX_TASKS_PER_CHILD,
                 )
 
             _pool = _make_pool()
+            # Dynamic worker allocation. Restored to full at every JOB (this construction site is
+            # per-job), so a heavy job cannot permanently shrink the fleet.
+            _governor = MemoryGovernor(parallel)
+            logger.warning(
+                f"memory governor armed: {parallel} local slot(s), throttle <{_MEM_THROTTLE_PCT}% "
+                f"free, emergency <{_MEM_EMERGENCY_PCT}% free, worker recycle every "
+                f"{_MAX_TASKS_PER_CHILD} individual(s)")
             try:
                 _workers = _resolve_workers(db, opt.worker_ids)
             except Exception as e:  # noqa: BLE001 — distribution is optional; never block a run
@@ -848,6 +1031,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     workers=_workers, master_version=_master_version,
                     pool_factory=_make_pool,
                     max_remote_slots_per_worker=_max_remote_slots,
+                    governor=_governor,
                 )
                 _evaluator.start()  # pre-flight: version-match + cache-push each worker
                 batch_fitness = make_batch_fitness(_evaluator.execute_jobs)

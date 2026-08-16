@@ -74,6 +74,16 @@ _WORKER_BAR_CACHE: "OrderedDict[Any, Any]" = OrderedDict()
 # symbols beyond the cap; eviction is result-neutral).
 _WORKER_BAR_CACHE_MAX = int(os.getenv("BT_BAR_CACHE_MAX", "1500"))
 
+# How many uncached symbols preload tolerates before failing the run. BOTH bounds must hold, so
+# neither a big universe nor a small one gets the wrong behaviour:
+#   * the FRACTION stops a 1368-symbol job silently losing 27 symbols under a 2% rule;
+#   * the ABSOLUTE count stops a 20-symbol fixture universe tolerating a proportionally huge gap.
+# Defaults are deliberately tight -- this exists to survive an isolated gap (opt 324 died on 1 of
+# 586), NOT to paper over an unbuilt cache. Set BT_MISSING_SYMBOLS_MAX=0 to restore the old
+# fail-on-any behaviour.
+_MISSING_SYMBOL_MAX_ABS = int(os.getenv("BT_MISSING_SYMBOLS_MAX", "5"))
+_MISSING_SYMBOL_MAX_FRAC = float(os.getenv("BT_MISSING_SYMBOLS_MAX_FRAC", "0.01"))
+
 # RECENCY BOUND, in INDIVIDUALS (the primary policy; the count cap above is now only a backstop).
 #
 # WHY the count cap alone was not enough -- measured 2026-08-15 on the goal2020 ED small-band job
@@ -412,6 +422,10 @@ class AsOfPriceSource:
         # as fast as the old dict.get. Reset per instance (a fresh AsOfPriceSource per backtest);
         # bisect serves the rarer arbitrary-``as_of`` / next-bar lookups.
         self._cursor: Dict[str, int] = {}
+        # Symbols preload dropped under the missing-symbol tolerance. Readable by the caller so a
+        # REDUCED-universe run is traceable in its results, not only in a log line that scrolls
+        # away -- a run on 585 of 586 symbols is not comparable with a full-coverage one.
+        self._dropped_symbols: List[str] = []
 
     @property
     def interval(self) -> str:
@@ -526,6 +540,35 @@ class AsOfPriceSource:
         # PRIMARY bound: drop series no individual in the last N has touched. Runs after the loop
         # so the current individual's series are all stamped and safe.
         _evict_bar_cache_by_recency()
+
+        if missing:
+            # TOLERANCE: a handful of uncached symbols must not kill a 586-symbol job. Observed
+            # 2026-08-16: opt 324 (scr-mid-FMPRating-S5) aborted on ONE missing symbol (NBIX) out
+            # of 586 -- a 25-minute run thrown away over 0.17% of the universe. The mid-run path
+            # in daily_engine already tolerates a per-symbol miss at six sites; only this preload
+            # gate was all-or-nothing.
+            #
+            # Beyond the threshold it still fails hard: that is no longer "a gap in the data", it
+            # is a broken/unbuilt cache, and silently backtesting on a fraction of the intended
+            # universe would produce confident, meaningless results.
+            #
+            # The drop is LOUD (warning survives the optimize run's logging.disable(INFO)) and
+            # names the symbols, because it changes the universe and therefore the results: two
+            # runs of the "same" job on different cache states are NOT comparable. Never let this
+            # be quiet.
+            frac = len(missing) / max(1, len(symbols))
+            if len(missing) <= _MISSING_SYMBOL_MAX_ABS and frac <= _MISSING_SYMBOL_MAX_FRAC:
+                self._dropped_symbols = list(missing)
+                logger.warning(
+                    f"OHLCV cache miss TOLERATED: dropping {len(missing)} of {len(symbols)} "
+                    f"symbol(s) ({frac:.2%}) with no cached {self._interval} bars: "
+                    f"{', '.join(missing[:20])}{'…' if len(missing) > 20 else ''}. "
+                    f"The run continues on the REDUCED universe -- its results are not "
+                    f"comparable with a run that had full coverage. Cache them with: "
+                    f"ba2-test fetch-cache --provider fmp --timeframes {self._interval} "
+                    f"--symbols {' '.join(missing[:10])}"
+                )
+                missing = []
 
         if missing:
             interval = self._interval

@@ -80,9 +80,17 @@ class DistributedEvaluator:
                  trial_timeout: float = 10800.0,
                  requeue_timeout: float = 12600.0,
                  pool_factory: Optional[Callable[[], Any]] = None,
-                 max_remote_slots_per_worker: Optional[int] = None):
+                 max_remote_slots_per_worker: Optional[int] = None,
+                 governor: Optional[Any] = None):
         self.pool = submit_pool
         self._pool_factory = pool_factory
+        # Dynamic worker allocation. When set, consumers above governor.current PARK
+        # instead of claiming, so concurrency follows memory pressure. Parking (not
+        # killing) means an in-flight individual always finishes -- nothing is discarded
+        # to shed load; the governor's cache RELEASE is what actually reclaims memory.
+        self.governor = governor
+        self._consumer_slots = threading.local()
+        self._parked_logged = set()
         self._pool_lock = threading.Lock()  # guards self.pool reads/recreation across consumers
         self.fitness_metric = fitness_metric
         self.n_consumers = max(1, n_consumers)
@@ -138,7 +146,10 @@ class DistributedEvaluator:
 
         # Local consumers (master-as-worker).
         for i in range(self.n_consumers):
-            self._spawn(self._consume_local, f"local-trial-consumer-{i}")
+            # Each consumer carries its SLOT INDEX so the governor can park the highest-numbered
+            # ones first (deterministic, and consumer #0 always survives so a run cannot stall).
+            self._spawn(lambda idx=i: self._consume_local_slot(idx),
+                        f"local-trial-consumer-{i}")
         # Remote dispatchers: one thread per worker slot.
         remote_slots = 0
         for w in self._active_workers:
@@ -272,10 +283,30 @@ class DistributedEvaluator:
         self._spawn(_run, "worker-recheck")
 
     # -- workers -----------------------------------------------------------------------------
+    def _consume_local_slot(self, idx: int) -> None:
+        """Entry point per consumer thread: stamp the slot index, then run the claim loop."""
+        self._consumer_slots.idx = idx
+        self._consume_local()
+
     def _consume_local(self) -> None:
         from concurrent.futures.process import BrokenProcessPool
         from app.services.strategy_optimization_handler import _trial_worker
         while not self._stop.is_set():
+            # THROTTLE: consumers with an index at/above the governor's current concurrency park
+            # rather than claim. Checked before every claim so a release takes effect on the very
+            # next individual, and a restore re-admits them just as fast.
+            slot = getattr(self._consumer_slots, "idx", 0)
+            gov = self.governor
+            if gov is not None and slot >= gov.current:
+                if slot not in self._parked_logged:
+                    self._parked_logged.add(slot)
+                    self.log(f"local consumer #{slot} PARKED (concurrency now {gov.current}); "
+                             f"in-flight individuals finish normally, none are discarded")
+                self._stop.wait(1.0)
+                continue
+            if gov is not None and slot in self._parked_logged:
+                self._parked_logged.discard(slot)
+                self.log(f"local consumer #{slot} RESUMED (concurrency now {gov.current})")
             job = self.broker.claim(worker_id="local")
             if job is None:
                 self._stop.wait(0.05)

@@ -46,6 +46,7 @@ of scope here).
 import argparse
 import json
 import os
+import random
 import sys
 from datetime import datetime, timedelta
 from typing import List
@@ -266,7 +267,13 @@ def check_ohlcv_period_coverage(provider_dir: str, interval: str, start: str, en
     import pandas as pd
 
     months = _months_between(start, end)
-    files = sorted(glob.glob(os.path.join(provider_dir, f"*_{interval}.parquet")))[:max_symbols]
+    # RANDOM sample, not the alphabetical head. Taking [:max_symbols] of a sorted glob checked the
+    # same AACG/AAFTX/AAME prefix every run -- reproducible, and blind to any pattern that does not
+    # happen to live at the start of the alphabet. That is how the 2026-08-16 gap survived: 93.6%
+    # of 5min symbols had no pre-2020 history and this check never sampled widely enough to notice.
+    # Seeded so a run is still reproducible, just not biased.
+    _all = sorted(glob.glob(os.path.join(provider_dir, f"*_{interval}.parquet")))
+    files = _all if len(_all) <= max_symbols else random.Random(1337).sample(_all, max_symbols)
     per_symbol_missing: dict = {}
     for p in files:
         sym = os.path.basename(p)[: -len(f"_{interval}.parquet")]
