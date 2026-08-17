@@ -679,18 +679,22 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
                         f"{(regime.get('score') or 0):+.2f}" if regime else "n/a",
                         self._score_signal(regime.get("score")) if regime else None),
         ]
-        if "fscore" in snap:
+        # snap["fscore"]/snap["z"] are set (possibly to None -- too few periods
+        # for Piotroski, or a missing market cap/balance field for Altman Z) by
+        # _build_fundamental whenever statements were present at all, so
+        # `"key" in snap` is not a value check: use `snap.get(key) is not None`.
+        if snap.get("fscore") is not None:
             out.append(ExpertMetric("Piotroski F-Score", snap["fscore"], f"{snap['fscore']} / 9",
                                     "buy" if snap["fscore"] >= 7 else
                                     ("sell" if snap["fscore"] <= 2 else "neutral")))
-        if "z" in snap:
+        if snap.get("z") is not None:
             veto = bool(fund.get("veto"))
             out.append(ExpertMetric("Altman Z", snap["z"], f"{snap['z']:.2f}",
                                     "sell" if veto else "neutral",
                                     "Distress veto applied" if veto else None))
         for key, label in (("quality_norm", "Quality (ROE)"), ("value_norm", "Value (earnings yield)"),
                            ("rev_accel", "Revenue acceleration"), ("eps_accel", "EPS acceleration")):
-            if key in snap:
+            if snap.get(key) is not None:
                 out.append(ExpertMetric(label, snap[key], f"{snap[key]:+.2f}",
                                         self._score_signal(snap[key], pos=0.05, neg=-0.05)))
         return out

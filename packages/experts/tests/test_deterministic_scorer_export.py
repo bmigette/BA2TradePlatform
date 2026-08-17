@@ -87,3 +87,33 @@ def test_export_symbol_data_skip_surfaces_as_a_single_skipped_row():
     assert len(result.metrics) == 1
     assert result.metrics[0].label == "Skipped"
     assert result.metrics[0].detail == "insufficient_history"
+
+
+def test_export_symbol_data_a_single_statement_period_does_not_crash_on_none_fscore_or_z():
+    """With only ONE annual statement, _build_fundamental still sets
+    snapshot['fscore']/['z'] -- to None (Piotroski needs a prior period;
+    Altman Z here needs totalAssets, which this fixture omits). Those keys
+    being PRESENT-but-None must not crash `snap["fscore"] >= 7` /
+    f"{snap['z']:.2f}" -- only a real (non-None) value should render a row."""
+    class _OnePeriodDetails:
+        def get_income_statement(self, **kwargs):
+            return {"statements": [{"net_income": 25_000_000_000.0,
+                                    "weighted_average_shares_outstanding": 16_000_000_000.0}]}
+
+        def get_balance_sheet(self, **kwargs):
+            # No totalAssets/total_assets -> altman_z_and_variant returns (None, None).
+            return {"statements": [{"total_shareholder_equity": 60_000_000_000.0}]}
+
+        def get_cashflow_statement(self, **kwargs):
+            return {"statements": [{}]}
+
+    def _resolver_one_period(cat, name, **kw):
+        return {"ohlcv": _FakeOHLCV(), "fundamentals_details": _OnePeriodDetails()}.get(cat)
+
+    _data.reset_caches()
+    result = DeterministicScorer.export_symbol_data("AAPL", providers_resolver=_resolver_one_period)
+    assert result.error is None, result.error
+    labels = {m.label for m in result.metrics}
+    assert "Piotroski F-Score" not in labels, "fscore is None -- must not render (or crash)"
+    assert "Altman Z" not in labels, "z is None -- must not render (or crash)"
+    assert "Quality (ROE)" in labels, "net_income/equity are present and should still surface"
