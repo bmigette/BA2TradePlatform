@@ -71,7 +71,16 @@ def make_shim(rel_arg: str, pkg_module: str) -> pathlib.Path:
         f"import sys as _sys\n"
         f"\n"
         f'_pkg = _importlib.import_module("{pkg_module}")\n'
-        f"_sys.modules[__name__] = _pkg\n"
+        f"# RACE GUARD: mirror the package's names onto THIS module BEFORE swapping it out of\n"
+        f"# sys.modules. The swap alone leaves the original module object permanently empty, so a\n"
+        f"# second thread reaching a LAZY ``from .X import Y`` while the first is still executing\n"
+        f"# this body gets that empty object and raises \"cannot import name 'Y'\". That silently\n"
+        f"# killed a live Monday enter-market run on 2026-08-17; see\n"
+        f"# docs/2026-08-17-alias-shim-race.md. Locals are captured first because the update copies\n"
+        f"# the package namespace wholesale -- a package binding _sys/_pkg must not break the swap.\n"
+        f"_modules, _me, _target = _sys.modules, __name__, _pkg\n"
+        f"globals().update({{k: v for k, v in vars(_pkg).items() if not k.startswith('__')}})\n"
+        f"_modules[_me] = _target\n"
     )
     rel_path.write_text(shim, encoding="utf-8")
     return rel_path
