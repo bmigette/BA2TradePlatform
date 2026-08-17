@@ -3,7 +3,9 @@ from datetime import datetime, timezone
 import json
 import requests
 
-from ba2_common.core.interfaces import MarketExpertInterface
+from ba2_common.core.interfaces import (
+    ExpertDataExportInterface, ExpertMetric, MarketExpertInterface,
+)
 from ba2_experts.expert_mixins import AnalysisStatusRenderMixin
 from ba2_common.core.models import MarketAnalysis, AnalysisOutput, ExpertRecommendation
 from ba2_common.core.db import get_db, update_instance, add_instance, get_setting
@@ -59,7 +61,7 @@ def consensus_from_counts(counts: Dict[str, Any], thresholds: Optional[Dict[str,
     return {"signal": signal, "confidence": confidence, "mean": mean, "total": total}
 
 
-class FinnHubRating(AnalysisStatusRenderMixin, MarketExpertInterface):
+class FinnHubRating(ExpertDataExportInterface, AnalysisStatusRenderMixin, MarketExpertInterface):
     """
     FinnHubRating Expert Implementation
     
@@ -346,7 +348,47 @@ Confidence (agreement on dominant side): {confidence:.1f}%
             'raw_data': latest,
         }
     
-    def _create_expert_recommendation(self, recommendation_data: Dict[str, Any], 
+    # ------------------------------------------------------- data export
+    @staticmethod
+    def _fmt_mean(v: Optional[float]) -> str:
+        """mean is None ONLY when _calculate_recommendation selected no period
+        (empty/exhausted trends data -- the 'No recommendation data available'
+        fallback in _process) -- a genuine None, not a computed 0.0."""
+        return f"{v:.2f}" if v is not None else "n/a"
+
+    def _build_export_metrics(self, rec: Recommendation,
+                              settings: Dict[str, Any]) -> List[ExpertMetric]:
+        """SYMBOL360 rows: keep the base signal/confidence/details row (as
+        FMPRating does -- another ratings-consensus expert whose base
+        'Recommendation' row already carries a useful summary of the same
+        underlying signal) and append the consensus mean and analyst count
+        behind it, with the selected reporting period folded into the
+        analyst-count row's detail.
+
+        FinnHubRating has exactly ONE Recommendation(...) construction site
+        (verified by reading _process in full): there is no skip path. An
+        empty or exhausted trends fetch instead falls through to a HOLD via
+        _calculate_recommendation's own 'no eligible period' branch (mean=None,
+        total=0, period=None), so rec.skip is never True here and no skip
+        handling is required -- unlike FMPRating/FMPInsiderClusterBuy.
+
+        total is always a real int (0 in the no-data fallback, otherwise the
+        sum of the five rating buckets via consensus_from_counts) so it needs
+        no None guard; mean and period genuinely CAN be None (the same
+        no-data fallback), hence _fmt_mean and the conditional detail."""
+        base = super()._build_export_metrics(rec, settings)
+        raw = rec.raw_outputs or {}
+        mean = raw.get("mean")
+        total = raw.get("total")
+        period = raw.get("period")
+        base.append(ExpertMetric(
+            "Consensus mean (1=Strong Sell .. 5=Strong Buy)", mean, self._fmt_mean(mean)))
+        base.append(ExpertMetric(
+            "Analysts", total, str(total),
+            detail=f"Period: {period}" if period else None))
+        return base
+
+    def _create_expert_recommendation(self, recommendation_data: Dict[str, Any],
                                      symbol: str, market_analysis_id: int,
                                      current_price: Optional[float]) -> int:
         """Create ExpertRecommendation record in database."""
