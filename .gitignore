@@ -173,3 +173,6 @@ test_files/*.html
 *.opt[0-9]*-*.log
 sen5min*.log
 fetch_5min*.log
+
+# Git worktrees (superpowers:using-git-worktrees)
+.worktrees/
