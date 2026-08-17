@@ -22,6 +22,7 @@ The GA must NEVER enqueue a sub-task: ``init_task_queue(max_workers=1)`` (main.p
 deadlock. The fitness calls the synchronous runner in-process (confirmed in Replan).
 """
 import logging
+import math as _math
 import random
 import time as _time
 from datetime import datetime
@@ -554,6 +555,146 @@ def _release_pool_memory(pool: Any, n_workers: int, log=logger.warning) -> None:
         log(f"memory governor: cache release failed ({type(e).__name__}: {e})")
 
 
+class _TrialCostModel:
+    """Predicts a trial's wall time so a generation can be dispatched LONGEST-FIRST (LPT).
+
+    WHY. The GA evaluates a generation as a BATCH and cannot breed the next one until every
+    individual in it has resolved, so a generation's wall time is its MAKESPAN, not its mean. Trial
+    times here are savagely skewed -- opt 333 generation 3: median 205s, p90 1032s, max 3746s --
+    and the batch was dispatched in population order, i.e. effectively at random with respect to
+    cost. An hour-long genome therefore had a ~50% chance of STARTING in the back half of the
+    batch, at which point every other slot runs out of work and idles until it finishes. Measured
+    over that job's first three generations: 54-57% slot utilisation, and in generation 3 a SINGLE
+    trial (3746s) was longer than the entire generation would have taken perfectly balanced across
+    all 10 slots (4073s).
+
+    LPT (longest-processing-time-first) is the standard greedy remedy: start the expensive ones at
+    t=0 and let the cheap ones backfill, so the tail of the schedule is short trials and the slots
+    drain together. Makespan goes from ``sum(others)/N + longest`` to ``max(sum/N, longest)``.
+
+    THIS REORDERS DISPATCH AND NOTHING ELSE. Same individuals, same configs, same fitness function.
+    Both backends yield ``(index, flat, key, result)`` carrying the GA's ORIGINAL index and the
+    caller assigns by it, so the GA sees an identically-ordered fitness list and neither RNG stream
+    is touched -- runs stay bit-identical, and ``checkpoint_fingerprint`` (gene space + population +
+    generations) does not move, so an in-flight job resumes straight into this.
+
+    THE ESTIMATE -- two signals, both free:
+      * EXACT RECALL. Genomes recur across generations (elites, and crossover that reproduces a
+        parent), so a previously observed time for the same ``trial_key`` is reused verbatim.
+      * UNIVERSE WIDTH. ``enabled_instruments`` on a trial config is THIS trial's own screened
+        candidate set (``screener_candidate`` in _build_daily_trial_config), i.e. precisely the
+        symbols it will price -- not a gene proxy for it. Cost is roughly linear in that count, and
+        the slope is learned from observations rather than assumed.
+
+    Precision is not required and should not be chased: LPT only needs the expensive tail put at
+    the front, and mis-ranking two mid-cost trials costs nothing. The failure mode of a bad
+    estimate is the dispatch order we already have today.
+    """
+
+    _BOOTSTRAP_SLOPE = 2.0        # s/symbol, used until enough observations land
+    _SLOPE_SAMPLES = 256          # rolling window of per-symbol observations
+    _MIN_SLOPE_SAMPLES = 16       # below this the sample cannot outvote a MEASURED cost
+
+    def __init__(self) -> None:
+        self._seen: Dict[str, float] = {}     # trial_key -> observed seconds
+        self._slopes: list = []               # recent seconds-per-symbol observations
+        self._pred: list = []                 # (predicted, actual) for the CURRENT generation
+
+    @property
+    def _slope(self) -> float:
+        """MEDIAN seconds-per-symbol over the recent window -- deliberately not the mean.
+
+        The cost distribution this model exists to schedule around is heavy-tailed (opt 333 gen 3:
+        median 205s, max 3746s), and a running mean is dragged by precisely those outliers. An
+        earlier mean-based version was worse than useless: its first observation replaced the
+        bootstrap outright, so a single 3746s trial early in generation 1 set ~720 s/symbol and
+        every unseen genome was then priced above every genome we had actually MEASURED as slow --
+        inverting the ordering LPT is here to get right. The median is unmoved by the tail.
+
+        COLD START. A median needs a sample to be robust OVER: with one or two observations it
+        IS the outlier. Until `_MIN_SLOPE_SAMPLES` have landed the conservative bootstrap is kept,
+        so a genome we have actually MEASURED at an hour always outranks one merely guessed to be
+        wide -- recall must never lose to extrapolation, which is the ordering LPT depends on.
+        """
+        if len(self._slopes) < self._MIN_SLOPE_SAMPLES:
+            return self._BOOTSTRAP_SLOPE
+        s = sorted(self._slopes)
+        return s[len(s) // 2]
+
+    @staticmethod
+    def width(cfg: Dict[str, Any]) -> int:
+        """This trial's own screened universe size (the count it will actually price)."""
+        try:
+            return len(cfg.get("enabled_instruments") or ())
+        except Exception:  # noqa: BLE001 -- a cost hint must never break a run
+            return 0
+
+    def estimate(self, key: str, width: int) -> float:
+        hit = self._seen.get(key)
+        if hit is not None:
+            return hit
+        return self._slope * max(1, width)
+
+    def observe(self, key: str, width: int, secs: Any) -> None:
+        try:
+            secs = float(secs)
+        except (TypeError, ValueError):
+            return
+        # isfinite, not `> 0`: NaN fails EVERY comparison, so a bare `secs <= 0` guard lets it
+        # through -- and one NaN in the table makes `sorted()` return an arbitrary order, silently
+        # turning LPT back into the random dispatch it replaced.
+        if not _math.isfinite(secs) or secs <= 0:
+            return
+        self._seen[key] = secs
+        if width > 0:
+            self._slopes.append(secs / width)
+            if len(self._slopes) > self._SLOPE_SAMPLES:
+                del self._slopes[0]
+
+    def order(self, jobs: list) -> list:
+        """``jobs`` (index, flat, key, config) sorted most-expensive-first; stable on ties."""
+        try:
+            self._pred = []
+            return sorted(jobs, key=lambda j: -self.estimate(j[2], self.width(j[3])))
+        except Exception as e:  # noqa: BLE001 -- ordering is an optimisation, never a hard failure
+            logger.warning(f"LPT ordering skipped ({e!r}); dispatching in population order")
+            return jobs
+
+    def record_prediction(self, key: str, width: int, secs: Any) -> None:
+        """Track predicted-vs-actual so the log says whether the estimator is earning its keep."""
+        try:
+            self._pred.append((self.estimate(key, width), float(secs)))
+        except (TypeError, ValueError):
+            pass
+
+    def report(self, gen: int, n_gens: int) -> None:
+        """One line per generation: is the ordering actually tracking cost? Spearman over the
+        generation's (predicted, actual) pairs. Near 0 means LPT is dispatching blind and the
+        estimator needs a better signal; near 1 means the makespan win is real."""
+        pairs = [p for p in self._pred if p[1] > 0]
+        if len(pairs) < 8:
+            return
+
+        def _ranks(xs):
+            order = sorted(range(len(xs)), key=lambda i: xs[i])
+            r = [0.0] * len(xs)
+            for pos, i in enumerate(order):
+                r[i] = float(pos)
+            return r
+
+        pr, ar = _ranks([p[0] for p in pairs]), _ranks([p[1] for p in pairs])
+        n = len(pairs)
+        mp, ma = sum(pr) / n, sum(ar) / n
+        num = sum((a - mp) * (b - ma) for a, b in zip(pr, ar))
+        den = (sum((a - mp) ** 2 for a in pr) * sum((b - ma) ** 2 for b in ar)) ** 0.5
+        rho = (num / den) if den else 0.0
+        actual = [p[1] for p in pairs]
+        logger.warning(
+            f"LPT gen {gen + 1}/{n_gens}: cost-estimate rank corr {rho:+.2f} over {n} trials "
+            f"| slope {self._slope:.2f}s/symbol | recall {len(self._seen)} keys "
+            f"| actual median {sorted(actual)[n // 2]:.0f}s max {max(actual):.0f}s")
+
+
 def _log_trial_memory(gen: int, n_gens: int, done: int, total: int, mem: Any,
                       secs: Any = None, fit_raw: Any = None, fit_ranked: Any = None,
                       robustness: Any = None) -> None:
@@ -1010,6 +1151,17 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 done = total_in_batch - len(jobs)  # cached individuals are already evaluated
                 _emit_intra(done)
 
+                # LPT: hand the batch over most-expensive-first. This is the ONLY place the order
+                # is decided, and both backends consume it -- _local_execute_jobs indexes `jobs`
+                # directly and DistributedEvaluator.execute_jobs submits in list order -- so the
+                # local-only and distributed paths schedule identically. Results still carry the
+                # GA's original index (`i`) and are assigned by it below, so nothing downstream
+                # can tell the difference; see _TrialCostModel for why the makespan improves.
+                jobs = _cost_model.order(jobs)
+                # Universe width per trial, kept aside because the result stream carries only
+                # (index, flat, key, out) -- the config is not echoed back.
+                _widths = {j[2]: _TrialCostModel.width(j[3]) for j in jobs}
+
                 for i, flat, key, out in execute_jobs(jobs):
                     if out["ok"]:
                         fit = float(out["fitness"])
@@ -1019,8 +1171,31 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                                           out.get("mem"), out.get("secs"),
                                           fit_raw=out.get("fitness_raw"), fit_ranked=fit,
                                           robustness=out.get("robustness"))
-                        # Dynamic worker allocation, checked after EVERY individual.
-                        verdict = _governor.assess(out.get("mem"))
+                        # Score the prediction BEFORE learning from it, so the reported rank
+                        # correlation measures genuine forecasting rather than recall of a
+                        # value we just stored.
+                        _w = _widths.get(key, 0)
+                        _cost_model.record_prediction(key, _w, out.get("secs"))
+                        _cost_model.observe(key, _w, out.get("secs"))
+                        # Dynamic worker allocation, checked after EVERY individual — against the
+                        # governor for the box the snapshot was TAKEN ON.
+                        #
+                        # WHY THE ROUTING MATTERS. _trial_memory_snapshot samples free memory INSIDE
+                        # the worker process, so a trial that ran on remote150 reports REMOTE150's
+                        # memory. Both remedial actions below (cache release, pool break) only ever
+                        # touch the LOCAL pool, and MemoryGovernor only ratchets DOWN (restore()
+                        # fires at job boundaries, never mid-run). Feeding remote readings to the
+                        # local governor therefore punished the wrong box: at 4 local + 12 remote
+                        # slots ~75% of snapshots come from the remote, so remote pressure could
+                        # walk the LOCAL fleet down toward 1 slot for the rest of the job while
+                        # doing nothing whatsoever to relieve the box that was actually short.
+                        _origin = out.get("origin")
+                        if _origin and _origin != "local":
+                            if _evaluator is not None:
+                                _evaluator.assess_remote(_origin, out.get("mem"))
+                            verdict = "ok"     # never act on the local pool for a remote reading
+                        else:
+                            verdict = _governor.assess(out.get("mem"))
                         if verdict == "release":
                             # Reclaim for real: idled workers keep their last working set until
                             # their next preload, so throttling without this frees nothing.
@@ -1102,6 +1277,11 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 if _pool is not None and _evaluator is not None and _MAX_TASKS_PER_CHILD:
                     _pool = _recycle_pool(_pool, _make_pool, total_in_batch, total_in_batch)
                     _evaluator.swap_pool(_pool)   # under the same lock crash-recovery uses
+                # Did the cost estimate actually track cost this generation? Reported rather than
+                # assumed: if the rank correlation sits near zero the ordering is dispatching
+                # blind and the makespan win is imaginary, which is worth seeing in the log
+                # instead of inferring from wall times months later.
+                _cost_model.report(gen, n_gens)
                 return fits
 
             return batch_fitness
@@ -1201,6 +1381,8 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             # Dynamic worker allocation. Restored to full at every JOB (this construction site is
             # per-job), so a heavy job cannot permanently shrink the fleet.
             _governor = MemoryGovernor(parallel)
+            # Learns trial cost across generations so each batch dispatches longest-first.
+            _cost_model = _TrialCostModel()
             # Resolve the workers BEFORE building the pool: the two paths want different pool
             # SHAPES. Distributed needs one shared executor (several consumer threads submit into
             # it concurrently); local-only wants one single-worker pool per slot, so a recycle

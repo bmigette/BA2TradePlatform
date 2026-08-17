@@ -121,6 +121,14 @@ class DistributedEvaluator:
         self._active_workers: List[dict] = []
         self._down_workers: List[dict] = []  # excluded at pre-flight or gave up mid-run; retried
         self._worker_lock = threading.Lock()  # guards _active_workers/_down_workers mutations
+        # PER-WORKER memory governors. A remote worker's box is not the master's, and the master's
+        # MemoryGovernor can only act on the LOCAL pool, so remote pressure previously had no
+        # actuator at all -- the reading came back, throttled the wrong fleet, and the overcommitted
+        # box kept taking work until a trial died. Each remote gets its own governor whose
+        # `current` caps how many of ITS dispatcher slots may claim; the rest park (identical to
+        # how `_consume_local` parks local slots above the local governor's ceiling).
+        self._remote_govs: dict = {}
+        self._remote_gov_lock = threading.Lock()
         self._recheck_lock = threading.Lock()  # at most one re-admission pre-flight in flight
         self._secrets: dict = {}
 
@@ -244,10 +252,32 @@ class DistributedEvaluator:
         return cap
 
     def _spawn_remote_dispatchers(self, w: dict) -> int:
+        from app.services.strategy_optimization_handler import MemoryGovernor
         cap = self._engaged_slots(w)
+        # Arm (or re-arm, on re-admission at a NEW capacity) this worker's own governor.
+        with self._remote_gov_lock:
+            self._remote_govs[w["name"]] = MemoryGovernor(
+                cap, log=lambda m, n=w["name"]: self.log(f"[{n}] {m}"))
         for i in range(cap):
-            self._spawn(lambda w=w, i=i: self._dispatch_remote(w), f"remote-{w['name']}-{i}")
+            self._spawn(lambda w=w, i=i: self._dispatch_remote(w, i), f"remote-{w['name']}-{i}")
         return cap
+
+    def assess_remote(self, worker_name: str, mem: Any) -> None:
+        """Feed a REMOTE trial's memory snapshot to that worker's own governor.
+
+        Called by the master's result loop for every trial whose ``origin`` is a worker name.
+        A 'release' verdict reduces that worker's concurrency by one slot, which its dispatcher
+        threads observe before their next claim -- the remote analogue of parking a local slot.
+        There is no cache-release equivalent to send (the remote's own in-process governor handles
+        its pool), so shedding a slot IS the action here. Best-effort: never raises into the loop.
+        """
+        try:
+            with self._remote_gov_lock:
+                gov = self._remote_govs.get(worker_name)
+            if gov is not None:
+                gov.assess(mem)
+        except Exception as e:  # noqa: BLE001 -- governing must never fail a healthy trial
+            self.log(f"remote governor assess failed for {worker_name}: {e!r}")
 
     def _recheck_down_workers(self) -> None:
         """Re-run pre-flight against previously-excluded/failed workers; re-admit any that
@@ -325,9 +355,14 @@ class DistributedEvaluator:
                 self.broker.requeue_one(job["trial_id"])
                 continue
             except Exception as e:  # noqa: BLE001
-                out = {"ok": False, "fitness": 0.0, "trades": 0, "error": repr(e), "fatal": False}
+                out = {"ok": False, "fitness": 0.0, "trades": 0, "error": repr(e), "fatal": False,
+                       "origin": "local"}
                 self.broker.post_result(job["trial_id"], out)
                 continue
+            # Ran in the MASTER's own pool, so its memory snapshot describes this box: tag it so
+            # the master's governor acts on it (the remote-tagged ones go to their own governors).
+            if isinstance(out, dict):
+                out["origin"] = "local"
             self.broker.post_result(job["trial_id"], out)
 
     def swap_pool(self, fresh) -> None:
@@ -360,9 +395,18 @@ class DistributedEvaluator:
                 pass
             self.pool = self._pool_factory()
 
-    def _dispatch_remote(self, w: dict) -> None:
+    def _dispatch_remote(self, w: dict, slot_idx: int = 0) -> None:
         failures = 0
         while not self._stop.is_set():
+            # THROTTLE, mirroring _consume_local: a dispatcher whose slot index is at/above its
+            # worker's current ceiling parks instead of claiming, so a memory-pressured remote
+            # sheds concurrency on ITS OWN box. Checked before every claim so a release takes
+            # effect on the very next trial. Slot 0 always survives, so a worker cannot be
+            # throttled out of existence and stall the queue.
+            gov = self._remote_govs.get(w["name"])
+            if gov is not None and slot_idx >= gov.current:
+                self._stop.wait(0.5)
+                continue
             job = self.broker.claim(worker_id=f"remote:{w['name']}")
             if job is None:
                 self._stop.wait(0.1)
@@ -390,6 +434,11 @@ class DistributedEvaluator:
                         return
                     self._stop.wait(2.0)
                     continue
+                # WHICH BOX RAN THIS. The memory snapshot inside `out` was taken in the worker
+                # process, so it describes THIS worker's machine, not the master's. Tag it so the
+                # master routes it to this worker's governor instead of throttling its own pool.
+                if isinstance(out, dict):
+                    out["origin"] = w["name"]
                 self.broker.post_result(job["trial_id"], out)
                 failures = 0
             except Exception as e:  # noqa: BLE001 — push the trial back so local/another worker runs it
