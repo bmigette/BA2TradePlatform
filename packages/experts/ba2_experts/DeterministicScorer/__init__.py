@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import math
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from ba2_common.core.interfaces import (
     ExpertDataExportInterface, ExpertMetric, MarketExpertInterface,
@@ -654,7 +654,14 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
             return None
         return "buy" if v > pos else ("sell" if v < neg else "neutral")
 
-    def _build_export_metrics(self, rec: Recommendation, settings: Dict[str, Any]) -> list:
+    @staticmethod
+    def _fmt_score(v: Optional[float]) -> str:
+        """None means 'no inputs were computable' (fundamental_score's documented
+        contract) -- NOT a neutral 0.0 reading. Rendering it as '+0.00' would
+        look like a real, deliberate score instead of 'no data'."""
+        return f"{v:+.2f}" if v is not None else "n/a"
+
+    def _build_export_metrics(self, rec: Recommendation, settings: Dict[str, Any]) -> List[ExpertMetric]:
         """SYMBOL360 per-section breakdown. A skip (thin OHLCV history) means
         the bundle was never processed -- defer to the base 'Skipped' row
         rather than building a technical/fundamental section out of nothing."""
@@ -666,18 +673,18 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
         fund = raw.get("fundamental") or {}
         regime = raw.get("regime") or {}
         snap = fund.get("snapshot") or {}
+        tech_score = tech.get("score")
+        fund_score = fund.get("score")
+        regime_score = regime.get("score") if regime else None
         out = [
-            ExpertMetric("Technical section", tech.get("score"),
-                        f"{(tech.get('score') or 0):+.2f}",
-                        self._score_signal(tech.get("score")),
+            ExpertMetric("Technical section", tech_score, self._fmt_score(tech_score),
+                        self._score_signal(tech_score),
                         "Momentum/SMA200/RSI/Donchian composite"),
-            ExpertMetric("Fundamental section", fund.get("score"),
-                        f"{(fund.get('score') or 0):+.2f}",
-                        self._score_signal(fund.get("score")),
+            ExpertMetric("Fundamental section", fund_score, self._fmt_score(fund_score),
+                        self._score_signal(fund_score),
                         "Piotroski/quality/value/growth composite"),
-            ExpertMetric("Macro regime", regime.get("score") if regime else None,
-                        f"{(regime.get('score') or 0):+.2f}" if regime else "n/a",
-                        self._score_signal(regime.get("score")) if regime else None),
+            ExpertMetric("Macro regime", regime_score, self._fmt_score(regime_score),
+                        self._score_signal(regime_score)),
         ]
         # snap["fscore"]/snap["z"] are set (possibly to None -- too few periods
         # for Piotroski, or a missing market cap/balance field for Altman Z) by

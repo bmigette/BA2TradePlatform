@@ -67,6 +67,14 @@ def test_export_symbol_data_returns_technical_and_fundamental_rows():
     tech = next(m for m in result.metrics if m.label == "Technical section")
     assert tech.signal == "buy"   # clean uptrend fixture
 
+    # Empty statements -> fundamental_score() returns score=None ("nothing was
+    # computable"), which is NOT the same as a neutral 0.0 reading. It must
+    # render as "n/a" with no signal, never a misleading "+0.00"/"neutral".
+    fund = next(m for m in result.metrics if m.label == "Fundamental section")
+    assert fund.value is None
+    assert fund.display == "n/a"
+    assert fund.signal is None
+
 
 def test_export_symbol_data_skip_surfaces_as_a_single_skipped_row():
     """min_history_days default is 260; a too-short OHLCV history makes
