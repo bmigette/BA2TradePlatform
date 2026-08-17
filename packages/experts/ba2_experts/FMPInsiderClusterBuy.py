@@ -14,7 +14,9 @@ exercises are ignored, and concurrent open-market selling reduces confidence.
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from ba2_common.core.interfaces import MarketExpertInterface
+from ba2_common.core.interfaces import (
+    ExpertDataExportInterface, ExpertMetric, MarketExpertInterface,
+)
 from ba2_common.core.models import AnalysisOutput, ExpertRecommendation, MarketAnalysis
 from ba2_common.core.db import add_instance, get_db, update_instance
 from ba2_common.core.types import (
@@ -79,7 +81,7 @@ def detect_insider_cluster(transactions: List[Dict[str, Any]],
     }
 
 
-class FMPInsiderClusterBuy(AnalysisStatusRenderMixin, MarketExpertInterface):
+class FMPInsiderClusterBuy(ExpertDataExportInterface, AnalysisStatusRenderMixin, MarketExpertInterface):
     """Insider cluster-buy expert: BUY when several insiders bought recently."""
 
     RENDER_PENDING_MESSAGE = 'Insider cluster analysis for {symbol} is queued'
@@ -205,6 +207,51 @@ Confidence: {confidence:.1f}%
             "details": details,
             "cluster": cluster,
         }
+
+    # ------------------------------------------------------- data export
+    def _build_export_metrics(self, rec: Recommendation,
+                              settings: Dict[str, Any]) -> List[ExpertMetric]:
+        """SYMBOL360 per-symbol breakdown: cluster verdict, aggregate
+        buy/sell value, and one row per individual open-market buyer.
+
+        No skip guard needed here: unlike DeterministicScorer (which SKIPs on
+        thin OHLCV history), _process/_calculate_recommendation above never
+        sets skip=True -- a missing/non-dict insider response degrades to an
+        empty transaction list (see _gather's isinstance guard), which
+        detect_insider_cluster resolves to a real (not skipped) HOLD with
+        buyer_count=0. rec.skip is therefore always False for this expert;
+        the base class's skip branch would be dead code here.
+
+        None-safety note (calibration check against the plan sketch):
+        detect_insider_cluster (this module, above) is a pure deterministic
+        aggregation -- buyer_count/buy_value/sell_value/buyers/is_cluster are
+        ALWAYS computed as real values (0/0.0/{}/False when there's no
+        matching data), never left as None/absent keys. So `.get(key, 0)`
+        below is a genuine "0 was computed" default, not a None-coerced-to-0
+        bug -- there is nothing to distinguish "absent" from "zero" for these
+        fields. The `or {}` on `cluster` itself is purely defensive (raw_outputs
+        is always populated by _process in practice)."""
+        raw = rec.raw_outputs or {}
+        cluster = raw.get("cluster") or {}
+
+        is_cluster = cluster.get("is_cluster", False)
+        buyer_count = cluster.get("buyer_count", 0)
+        buy_value = cluster.get("buy_value", 0.0)
+        sell_value = cluster.get("sell_value", 0.0)
+
+        out = [
+            ExpertMetric("Cluster detected", is_cluster,
+                        "Yes" if is_cluster else "No",
+                        "buy" if is_cluster else "neutral"),
+            ExpertMetric("Open-market buyers", buyer_count, str(buyer_count)),
+            ExpertMetric("Buy value", buy_value, f"${buy_value:,.0f}"),
+            ExpertMetric("Sell value", sell_value, f"${sell_value:,.0f}",
+                        "sell" if sell_value > buy_value else None),
+        ]
+        for name, value in sorted((cluster.get("buyers") or {}).items(),
+                                  key=lambda kv: -kv[1]):
+            out.append(ExpertMetric(f"Buyer: {name}", value, f"${value:,.0f}", "buy"))
+        return out
 
     # ------------------------------------------------------------------
     def run_analysis(self, symbol: str, market_analysis: MarketAnalysis) -> None:
