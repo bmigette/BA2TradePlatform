@@ -55,8 +55,14 @@ def main() -> int:
     ap.add_argument("--sample", type=int, default=40, help="Symbols to sample (default 40).")
     ap.add_argument("--probe-days", type=int, default=90,
                     help="A symbol passes if its first bar is within this many days of --start.")
-    ap.add_argument("--max-missing-pct", type=float, default=20.0,
-                    help="FAIL when more than this %% of sampled symbols lack coverage (default 20).")
+    ap.add_argument("--min-covered-pct", type=float, default=75.0,
+                    help="PASS when at least this %% of ELIGIBLE sampled symbols have coverage "
+                         "(default 75). Eligible = the symbol actually traded at the window start, "
+                         "established from its daily file; a security that had not listed yet is "
+                         "not a cache defect and is excluded, not counted against you.")
+    ap.add_argument("--existence-interval", default="1d",
+                    help="Interval whose history establishes WHEN a symbol started trading "
+                         "(default 1d -- daily history reaches much further back than intraday).")
     ap.add_argument("--seed", type=int, default=1337, help="Sampling seed, so a run is reproducible.")
     args = ap.parse_args()
 
@@ -72,8 +78,14 @@ def main() -> int:
     if args.symbols:
         raw = args.symbols
         if raw.startswith("@"):
+            # Accept BOTH one-per-line lists and comma-separated files: the Senate universe ships
+            # as a single CSV line (senate_universe.csv), and silently reading that as ONE symbol
+            # would make the gate check a nonexistent ticker and pass on an empty sample.
             with open(raw[1:], encoding="utf-8") as f:
-                syms = [s.strip() for s in f if s.strip()]
+                blob = f.read()
+            syms = [t.strip().strip('"').strip("'")
+                    for t in blob.replace(",", "\n").splitlines()]
+            syms = [t for t in syms if t]
         else:
             syms = [s.strip() for s in raw.split(",") if s.strip()]
         files = [os.path.join(cache_dir, f"{s}_{args.interval}.parquet") for s in syms]
@@ -88,30 +100,48 @@ def main() -> int:
     rng = random.Random(args.seed)
     sample = files if len(files) <= args.sample else rng.sample(files, args.sample)
 
-    missing, ok, unreadable = [], 0, 0
+    missing, ok, unreadable, not_listed = [], 0, 0, 0
     for p in sample:
         sym = os.path.basename(p)[: -len(f"_{args.interval}.parquet")]
         first = _first_bar(p)
         if first is None:
             unreadable += 1
-        elif first > cutoff:
-            missing.append((sym, first.date()))
-        else:
+            continue
+        if first <= cutoff:
             ok += 1
+            continue
+        # Late first bar. Two very different causes -- separate them before calling it a defect.
+        # A security that had not listed yet cannot have data at any interval, and counting those
+        # made this gate report 40% "missing" on a legitimate cache (the sample was SPAC units,
+        # preferreds and 2025-26 IPOs). The DAILY file is the listing calendar: it reaches much
+        # further back than intraday, so if daily ALSO starts late the symbol simply did not exist.
+        if args.interval != args.existence_interval:
+            dpath = os.path.join(cache_dir, f"{sym}_{args.existence_interval}.parquet")
+            dfirst = _first_bar(dpath) if os.path.isfile(dpath) else None
+            if dfirst is not None and dfirst > cutoff:
+                not_listed += 1
+                continue
+        missing.append((sym, first.date()))
 
     checked = len(sample)
-    pct = 100.0 * len(missing) / max(1, checked)
+    eligible = ok + len(missing)          # not_listed is excluded: nothing to fetch, ever
+    covered_pct = 100.0 * ok / max(1, eligible)
+    pct = 100.0 - covered_pct
     print(f"coverage: interval={args.interval} start={start.date()} "
           f"(a symbol passes if its first bar is on/before {cutoff.date()})")
     print(f"coverage: sampled {checked} of {len(files)} cached symbols -- "
-          f"{ok} covered, {len(missing)} missing ({pct:.0f}%), {unreadable} unreadable")
+          f"{ok} covered, {len(missing)} missing, {not_listed} not listed yet (excluded), "
+          f"{unreadable} unreadable")
+    print(f"coverage: {covered_pct:.0f}% of the {eligible} ELIGIBLE symbols are covered "
+          f"(need >= {args.min_covered_pct:.0f}%)")
     for sym, d in missing[:12]:
         print(f"          {sym:<8} first bar {d}")
     if len(missing) > 12:
         print(f"          ... and {len(missing) - 12} more")
 
-    if pct > args.max_missing_pct:
-        print(f"coverage: FAIL -- {pct:.0f}% exceeds the {args.max_missing_pct:.0f}% threshold.")
+    if covered_pct < args.min_covered_pct:
+        print(f"coverage: FAIL -- {covered_pct:.0f}% covered is under the "
+              f"{args.min_covered_pct:.0f}% bar.")
         print(f"coverage:   These symbols cannot be PRICED before their first bar, so they cannot")
         print(f"coverage:   trade. The run would silently use a REDUCED universe for the early part")
         print(f"coverage:   of the window and its results would not mean what the window says.")

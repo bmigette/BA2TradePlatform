@@ -122,7 +122,33 @@ INTERVAL="${INTERVAL:-5min}"
 # alphabetical head, now a seeded random sample, which is the other reason this slipped through.)
 echo
 echo "=== PREFLIGHT cache coverage: interval=${INTERVAL} window ${START} -> ${END}"
-if ! "$PY" tools/cache_health_check.py       --ohlcv-interval "$INTERVAL" --start "$START" --end "$END"       --skip-workers --skip-gaps --validity-symbols 60; then
+# Checks BOTH intervals: the 5min bars the engine PRICES with, and the 1d bars the indicators and
+# the screener metric store read. A grid can be blocked by either, and 1d was never checked here.
+#
+# The bar is 75% of ELIGIBLE symbols, not ~100% of all of them. Two corrections behind that:
+#   * eligible EXCLUDES securities that had not listed yet -- they cannot have data at any
+#     interval and are not a cache defect. Counting them made this gate report 40% missing on a
+#     healthy cache (the sample was SPAC units, preferreds and 2025-26 IPOs).
+#   * of the symbols that DID trade in 2020, ~12% have no 5min history at FMP at all -- verified
+#     symbol by symbol (AFBI, ORLA, USBC, LSAK, ONC all return 0 bars for Jan-2020). FMP's
+#     intraday depth is liquidity-dependent; that data does not exist at any price.
+# 75% therefore means "the cache holds essentially everything obtainable", while still failing
+# hard on the real incident this gate exists for (2026-08-16: 75% of symbols had daily back to
+# 2019 but no 5min before 2022 -- those ARE eligible, so that cache scores ~25% and fails).
+#
+# It samples THE UNIVERSE THIS GRID TRADES, not the whole cache. The cache holds 7,048 5min and
+# 18,731 1d files -- delisted tickers, ETFs, symbols no expert will ever touch -- and scoring
+# against all of them measured something nobody cares about: 72%/66% cache-wide versus 97%/95%
+# on the Senate universe, from the same cache on the same day.
+#
+# cache_health_check.py is NOT used here: it re-reads every Date column month-by-month and did not
+# finish in 10 minutes on this cache. A gate nobody can afford to run is a gate that gets skipped.
+_cov_fail=0
+for _iv in "$INTERVAL" 1d; do
+  echo "--- coverage: interval=${_iv}"
+  "$PY" tools/check_window_coverage.py --interval "$_iv" --start "$START"       --symbols "@$UNIVERSE_FILE" --sample 150 --min-covered-pct 75 || _cov_fail=1
+done
+if [ "$_cov_fail" = "1" ]; then
   echo "=== PREFLIGHT FAILED: the cache does not cover this window at this interval."
   echo "===   Backfill first, e.g.:"
   echo "===   ba2-test fetch-cache --provider fmp --timeframes ${INTERVAL} \\"

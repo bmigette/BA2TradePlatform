@@ -255,13 +255,36 @@ def check_metric_store_validity(store_dir: str, start: str, end: str,
 
 
 def check_ohlcv_period_coverage(provider_dir: str, interval: str, start: str, end: str,
-                                 max_symbols: int = 25) -> dict:
-    """For a SAMPLE of up to *max_symbols* cached symbols, verify each month in [start, end] has
-    at least one bar. This is stricter than ``check_ohlcv_gaps``'s internal-gap check: a lone bar
-    surrounded by two >max_gap_days holes satisfies "no gap over threshold" at the file level but
-    still leaves a whole month with zero real coverage for anything that queries that month.
+                                 max_symbols: int = 25, existence_interval: str = "1d") -> dict:
+    """For a SAMPLE of up to *max_symbols* cached symbols, verify each month in [start, end] that
+    the symbol ACTUALLY TRADED has at least one bar. Stricter than ``check_ohlcv_gaps``'s
+    internal-gap check: a lone bar surrounded by two >max_gap_days holes satisfies "no gap over
+    threshold" at the file level but still leaves a whole month with zero real coverage.
 
-    Returns ``{symbols_checked, per_symbol_missing_months: {symbol: [months...]}}``.
+    "ACTUALLY TRADED" is the correction made 2026-08-17. The check used to flag EVERY month
+    without a bar, which conflates two completely different things:
+
+        (a) we failed to fetch data that exists      -> a real defect, must fail the gate
+        (b) the security did not exist yet           -> nothing to fetch, ever
+
+    On this universe (b) dominates and made the gate useless: it reported 40% of symbols
+    "missing" 2020 data when the sample was SPAC units, preferreds and recent IPOs -- AACB
+    (first traded 2025-04), AACI (2026-03), AACOU (2026-02), AACP (2026-05), AADX (2026-06).
+    FMP returns nothing for those because there is nothing to return. A gate that cries wolf on
+    60% of a legitimate cache gets overridden, which is worse than no gate.
+
+    The DAILY file is the existence calendar: daily history goes back far further than intraday,
+    so a month where 1d has bars but the target interval does not is a genuine hole, and a month
+    where NEITHER has bars is a security that was not listed. This still catches the incident the
+    check was written for (2026-08-16: symbols had 1d back to 2019 but no 5min before 2022 --
+    those months have daily bars, so they are still flagged).
+
+    Falls back to the old "any empty month counts" rule when the daily file is absent, since
+    without it existence cannot be established; those symbols are reported separately so the
+    fallback is never silent.
+
+    Returns ``{symbols_checked, per_symbol_missing_months, months_skipped_not_listed,
+    symbols_without_existence_calendar}``.
     """
     import glob
     import pandas as pd
@@ -274,19 +297,37 @@ def check_ohlcv_period_coverage(provider_dir: str, interval: str, start: str, en
     # Seeded so a run is still reproducible, just not biased.
     _all = sorted(glob.glob(os.path.join(provider_dir, f"*_{interval}.parquet")))
     files = _all if len(_all) <= max_symbols else random.Random(1337).sample(_all, max_symbols)
+    def _months_of(path: str):
+        try:
+            raw = pd.to_datetime(pd.read_parquet(path, columns=["Date"])["Date"], utc=True)
+            return set(raw.dt.tz_localize(None).dt.strftime("%Y-%m").unique())
+        except Exception:  # noqa: BLE001
+            return None
+
     per_symbol_missing: dict = {}
+    skipped_not_listed = 0
+    no_calendar: list = []
     for p in files:
         sym = os.path.basename(p)[: -len(f"_{interval}.parquet")]
-        try:
-            raw = pd.to_datetime(pd.read_parquet(p, columns=["Date"])["Date"], utc=True)
-            present_months = set(raw.dt.tz_localize(None).dt.strftime("%Y-%m").unique())
-        except Exception:  # noqa: BLE001
+        present_months = _months_of(p)
+        if present_months is None:
             per_symbol_missing[sym] = months  # unreadable -> treat as fully missing
             continue
-        missing = [m for m in months if m not in present_months]
+        # Existence calendar from the DAILY file (skip when we ARE the daily file).
+        eligible = months
+        if interval != existence_interval:
+            daily = _months_of(os.path.join(provider_dir, f"{sym}_{existence_interval}.parquet"))
+            if daily is None:
+                no_calendar.append(sym)          # fall back to the strict rule, but say so
+            else:
+                eligible = [m for m in months if m in daily]
+                skipped_not_listed += len(months) - len(eligible)
+        missing = [m for m in eligible if m not in present_months]
         if missing:
             per_symbol_missing[sym] = missing
-    return {"symbols_checked": len(files), "per_symbol_missing_months": per_symbol_missing}
+    return {"symbols_checked": len(files), "per_symbol_missing_months": per_symbol_missing,
+            "months_skipped_not_listed": skipped_not_listed,
+            "symbols_without_existence_calendar": no_calendar}
 
 
 # (glob pattern under CACHE_FOLDER/fmp_history, human label) — the per-expert warmed caches that
@@ -698,7 +739,14 @@ def check_period_validity(start: str, end: str, nan_threshold: float,
         oh_res = check_ohlcv_period_coverage(provider_dir, interval, start, end, validity_symbols)
         n_bad = len(oh_res["per_symbol_missing_months"])
         print(f"    scanned {oh_res['symbols_checked']} symbol(s); "
-              f"{n_bad} have >=1 month with zero bars in range")
+              f"{n_bad} have >=1 month with zero bars in a month they TRADED")
+        if oh_res.get("months_skipped_not_listed"):
+            print(f"    ({oh_res['months_skipped_not_listed']} symbol-months skipped: the security "
+                  f"was not listed yet -- not a cache defect)")
+        if oh_res.get("symbols_without_existence_calendar"):
+            nc = oh_res["symbols_without_existence_calendar"]
+            print(f"    ({len(nc)} symbol(s) have no {interval!r} daily file to establish listing "
+                  f"dates, judged strictly: {nc[:5]})")
         for sym, months in list(oh_res["per_symbol_missing_months"].items())[:10]:
             print(f"      [{sym}] missing: {months[:6]}{' ...' if len(months) > 6 else ''}")
         if n_bad:
