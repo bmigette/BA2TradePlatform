@@ -45,6 +45,9 @@ class ExpertDataExport:
     settings_used: Dict[str, Any] = field(default_factory=dict)
     raw: Dict[str, Any] = field(default_factory=dict)
     error: Optional[str] = None
+    skipped: bool = False   # True when the expert's Recommendation had skip=True
+                             # (e.g. no analyst coverage, empty universe) — distinct
+                             # from a normal HOLD; see rec.skip_reason on the metric row
 
 
 _SIGNAL_MAP = {
@@ -99,8 +102,9 @@ class ExpertDataExportInterface:
         get_provider callable). Production callers omit it and get the real
         live provider registry via ba2_common.core.TradeConditions._get_provider.
         """
-        settings = {**cls.export_default_settings(), **(overrides or {})}
+        settings: Dict[str, Any] = {}
         try:
+            settings = {**cls.export_default_settings(), **(overrides or {})}
             self = cls._bypass_instance(settings)
             if providers_resolver is None:
                 from ba2_common.core.TradeConditions import _get_provider
@@ -117,16 +121,28 @@ class ExpertDataExportInterface:
                 expert_name=cls.__name__, symbol=symbol,
                 overall_signal=_SIGNAL_MAP.get(rec.signal),
                 confidence=rec.confidence, metrics=metrics,
-                settings_used=settings, raw=dict(rec.raw_outputs or {}))
+                settings_used=settings, raw=dict(rec.raw_outputs or {}),
+                skipped=rec.skip)
         except Exception as e:  # noqa: BLE001 — intentional: this IS the isolation boundary
-            _module_logger.warning(f"{cls.__name__}.export_symbol_data({symbol}) failed: {e}")
+            _module_logger.warning(f"{cls.__name__}.export_symbol_data({symbol}) failed: {e}",
+                                   exc_info=True)
             return ExpertDataExport(expert_name=cls.__name__, symbol=symbol,
                                     settings_used=settings, error=str(e))
 
     def _build_export_metrics(self, rec: Recommendation,
                               settings: Dict[str, Any]) -> List[ExpertMetric]:
         """Default: one row summarizing the Recommendation. Override for
-        richer per-section rows (DeterministicScorer, FMPInsiderClusterBuy)."""
+        richer per-section rows (DeterministicScorer, FMPInsiderClusterBuy).
+
+        A skipped Recommendation (rec.skip=True — e.g. no analyst coverage,
+        empty universe) is "nothing to evaluate", not a real HOLD, so it gets
+        its own row carrying rec.skip_reason rather than being rendered as a
+        normal signal card."""
+        if rec.skip:
+            return [ExpertMetric(
+                label="Skipped", value=rec.skip_reason,
+                display=f"Skipped — {rec.skip_reason}" if rec.skip_reason else "Skipped",
+                signal=None, detail=rec.skip_reason)]
         sig = _SIGNAL_MAP.get(rec.signal)
         return [ExpertMetric(
             label="Recommendation", value=rec.signal.value,
