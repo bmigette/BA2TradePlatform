@@ -159,9 +159,22 @@ EOF
 # on the conservative side. Treat any winner as conditional on them and run the Monte Carlo
 # spread SWEEP (robustness.py's spread_sweep_bps) before trusting a genome -- that is what
 # actually tells you whether an edge survives, rather than any single assumed number.
+# MEASURED 2026-08-17, no longer assumed. Source: Alpaca SIP historical quotes (full NBBO, not
+# IEX), sampled at 11:30 ET on 8 trading days spanning both regimes -- 2022 (bear/high-vol) and
+# 2024-25 -- across symbols these strategies actually trade, ~34k quotes total. Median relative
+# top-of-book spread in bps:
+#            2022     2024-25    p90 (both)   OLD ASSUMPTION
+#   large    1.57      2.68         7.05          3   <- good
+#   mid      7.23      9.01        22.16         10   <- good
+#   small   13.75     16.78        45.31         40   <- 2.4x TOO HARSH
+# 2022 came out TIGHTER than 2024-25, so the pessimistic-regime worry does not hold either.
+# This retires the standing caveat that these were "assumptions from US equity market structure,
+# not measurements" and that Corwin-Schultz was unusable (it returned 76bps for AAPL).
+# Caveat kept: this is the QUOTED top-of-book spread. It ignores price improvement (favouring us)
+# and depth beyond the top (against us on size) -- fine at our order sizes, not for size trading.
 SPREAD_BPS_LARGE="${SPREAD_BPS_LARGE:-3}"
-SPREAD_BPS_MID="${SPREAD_BPS_MID:-10}"
-SPREAD_BPS_SMALL="${SPREAD_BPS_SMALL:-40}"
+SPREAD_BPS_MID="${SPREAD_BPS_MID:-9}"
+SPREAD_BPS_SMALL="${SPREAD_BPS_SMALL:-17}"
 
 # Spread STRESS, expressed as a MULTIPLE of each band's own assumed spread rather than an
 # absolute bps figure. 0 = off (default, and the pre-existing behaviour byte for byte).

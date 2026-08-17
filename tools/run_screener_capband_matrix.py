@@ -180,7 +180,11 @@ def _jobs(bands, strategies, include_no_data, skip_experts=frozenset(), name_suf
 # meaningless: it is either far too harsh on large or far too soft on small, and the bands stop
 # being rankable against each other. Accepts a scalar (same everywhere, for a single-band run)
 # or explicit per-band values.
-_STRESS_BAND_DEFAULTS = {"large": 10.0, "mid": 25.0, "small": 50.0}
+# Stress = the MEASURED p90 spread per band (Alpaca SIP quotes, 2026-08-17), not a round guess:
+# a genome now has to survive the worst decile of real quoted spreads rather than an invented
+# multiple. Was {10, 25, 50} -- close for mid/small by luck, but 10 for large was ~1.4x the true
+# p90 while the 3bps BASELINE made the stress leg inert (measured sd(log)=0.01 across 89 rows).
+_STRESS_BAND_DEFAULTS = {"large": 7.0, "mid": 22.0, "small": 45.0}
 
 
 def _parse_stress_spread(spec: str) -> dict:

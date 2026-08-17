@@ -463,8 +463,8 @@ _ROBUST_MC_SEED = 42
 # The power curve gives all three: continuous everywhere, a real gradient across the whole 40-100
 # range, and a tail that rips the score off near 100 without any discontinuity.
 #
-# EXP=2 reference points:  40% -> 1.00   55% -> 0.56   65% -> 0.34   72% -> 0.22
-#                          80% -> 0.11   90% -> 0.03   95% -> 0.007  100%+ -> 0.00
+# EXP=1.5 reference points: 40% -> 1.00   55% -> 0.68   65% -> 0.50   72% -> 0.36
+#                          80% -> 0.24   90% -> 0.068  95% -> 0.024  100%+ -> 0.00
 #
 # 100% is not an arbitrary end point: top5 >= 100% of net P&L means the book is net NEGATIVE
 # without those five trades -- a sign change, not a degree. Note the Monte Carlo does NOT catch
@@ -473,7 +473,13 @@ _ROBUST_MC_SEED = 42
 # Concentration is the only screen that asks whether the edge survives REMOVING them.
 _CONC_FREE_PCT = float(_os.getenv("BT_CONC_FREE_PCT", "40"))    # no penalty at or below this
 _CONC_DEAD_PCT = float(_os.getenv("BT_CONC_DEAD_PCT", "100"))   # factor reaches 0 here
-_CONC_EXP = float(_os.getenv("BT_CONC_EXP", "2"))               # >1 bites harder near DEAD
+_CONC_EXP = float(_os.getenv("BT_CONC_EXP", "1.5"))             # >1 bites harder near DEAD
+# 1.5, not 2: measured on the goal2020 corpus, EXP=2 gave the concentration factor sd(log)=2.21
+# against the return metric's 0.59 -- 3.7x, i.e. the GA would optimise diversification with return
+# as a tiebreaker. The factor self-attenuates as the population cleans up (opt 330: median top5
+# fell 137.9% -> 50.9%, sd 2.21 -> 1.09), but at EXP=2 it still led the ranking AMONG FINALISTS,
+# which is where return should decide. EXP=1.5 keeps the top-end bite (90% -> 0.068, 95% -> 0.024)
+# while dropping converged influence to ~1.4x return.
 
 
 def robustness_metrics(results: dict, spread_bps: float = 0.0) -> dict:
