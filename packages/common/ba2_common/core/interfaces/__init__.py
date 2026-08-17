@@ -27,6 +27,7 @@ from .OptionsDataProviderInterface import (
     OptionsDataProviderInterface, OptionContractMeta, OptionEodBar,
 )
 from .MarketExpertInterface import MarketExpertInterface, BacktestInterface
+from .ExpertDataExportInterface import ExpertDataExportInterface, ExpertMetric, ExpertDataExport
 from .ExtendableSettingsInterface import ExtendableSettingsInterface
 from .SmartRiskExpertInterface import SmartRiskExpertInterface
 from .LiveExpertInterface import LiveExpertInterface
@@ -64,6 +65,9 @@ __all__ = [
     "OptionEodBar",
     "MarketExpertInterface",
     "BacktestInterface",
+    "ExpertDataExportInterface",
+    "ExpertMetric",
+    "ExpertDataExport",
     "ExtendableSettingsInterface",
     "SmartRiskExpertInterface",
     "LiveExpertInterface",
