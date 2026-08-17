@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 
-from ba2_common.core.db import add_instance, get_instance
+from ba2_common.core.db import add_instance, get_instance, update_instance
 from ba2_common.core.models import ExpertInstance, TradingOrder, Transaction
 from ba2_common.core.types import (
     OrderDirection, OrderOpenType, OrderStatus, OrderType, TransactionStatus,
@@ -418,9 +418,82 @@ class FactorPortfolioManager:
             )
         return self.account.submit_order(order, sl_price=sl_price, is_closing_order=False)
 
+    # Working legs that RESERVE shares at the broker. A resting protective order sits on the
+    # SAME side as the exit (long -> SELL_STOP/SELL_LIMIT), so the wash-trade lock, which looks
+    # for an OPPOSING working order, cannot see it. Both sides are listed because a short
+    # position's protective legs are BUYs.
+    _PROTECTIVE_ORDER_TYPES = (
+        OrderType.SELL_STOP, OrderType.SELL_LIMIT, OrderType.SELL_STOP_LIMIT,
+        OrderType.BUY_STOP, OrderType.BUY_LIMIT, OrderType.BUY_STOP_LIMIT,
+    )
+
+    def _working_protective_legs(self, transactions: list) -> list:
+        """Protective TP/SL legs for these transactions that are still live at the broker."""
+        from sqlmodel import select
+        from ba2_common.core.db import get_db
+
+        txn_ids = [t.id for t in (transactions or []) if getattr(t, "id", None) is not None]
+        if not txn_ids:
+            return []
+        working = OrderStatus.get_unfilled_statuses() | {OrderStatus.PARTIALLY_FILLED}
+        try:
+            with get_db() as session:
+                return list(session.exec(
+                    select(TradingOrder).where(
+                        TradingOrder.account_id == self.account_id,
+                        TradingOrder.transaction_id.in_(txn_ids),
+                        TradingOrder.order_type.in_(self._PROTECTIVE_ORDER_TYPES),
+                        TradingOrder.status.in_(working),
+                    )
+                ).all())
+        except Exception as e:  # noqa: BLE001 — never block an exit on a lookup failure
+            logger.error(
+                f"FactorRanker[{self.expert_instance_id}]: could not read protective legs for "
+                f"transactions {txn_ids}: {e}", exc_info=True)
+            return []
+
+    def _release_protective_legs(self, legs: list) -> list:
+        """Cancel resting protective legs so their reserved shares become sellable."""
+        released = []
+        for leg in legs:
+            try:
+                if leg.broker_order_id:
+                    self.account.cancel_order(leg.broker_order_id)
+                leg.status = OrderStatus.CANCELED
+                update_instance(leg)
+                released.append(leg)
+                logger.info(
+                    f"FactorRanker[{self.expert_instance_id}]: released protective "
+                    f"{leg.order_type} order {leg.id} ({leg.symbol} x{leg.quantity} @ "
+                    f"{leg.stop_price or leg.limit_price}) to free shares for the exit")
+            except Exception as e:  # noqa: BLE001 — one stuck leg must not block the whole exit
+                logger.error(
+                    f"FactorRanker[{self.expert_instance_id}]: failed to cancel protective order "
+                    f"{leg.id} for {leg.symbol}: {e}", exc_info=True)
+        return released
+
     def _submit_sell(self, symbol: str, qty: int, transactions: list) -> Optional[TradingOrder]:
         if qty <= 0 or not transactions:
             return None
+
+        # RELEASE THE PROTECTIVE LEG BEFORE SELLING.
+        #
+        # ``_submit_buy`` deliberately attaches a stop covering the FULL position. At the broker a
+        # working stop RESERVES those shares, so a later exit for the same quantity has nothing
+        # available and is rejected outright:
+        #
+        #   order 630 (dev, 2026-08-17): SELL 11 SPCX -> 40310000 insufficient_qty
+        #   {"available":"0","existing_qty":"11","held_for_orders":"11",
+        #    "related_orders":["6ba609..."]}   <- the broker id of our OWN stop, order 608
+        #
+        # It only bites when the stop covers everything we are selling, which is why the same
+        # rebalance sold AAPL and NVO fine (stop covered 1 of 4, and none, respectively) and only
+        # the FactorRanker-owned SPCX position failed. ``is_closing_order=True`` does NOT help --
+        # it only skips the opposite-position safety check (see AlpacaAccount._submit_order_impl).
+        # The classic exit path avoids this because ``close_transaction`` cancels first; this
+        # bypass path reimplemented the exit without that step.
+        released = self._release_protective_legs(self._working_protective_legs(transactions))
+
         # Reduce/exit — attach to the existing OPENED transaction.
         order = TradingOrder(
             account_id=self.account_id, symbol=symbol, quantity=qty,
@@ -430,4 +503,59 @@ class FactorPortfolioManager:
             comment="FactorRanker rebalance sell",
             data={"fixed_quantity": True},
         )
-        return self.account.submit_order(order, is_closing_order=True)
+        result = self.account.submit_order(order, is_closing_order=True)
+        self._reprotect_remainder(symbol, qty, transactions, released, result)
+        return result
+
+    def _reprotect_remainder(self, symbol: str, sold_qty: int, transactions: list,
+                             released: list, sell_order: Optional[TradingOrder]) -> None:
+        """Re-attach a stop over whatever the reduce left behind.
+
+        A PARTIAL reduce would otherwise leave the remainder naked: we just cancelled the only
+        protective order, and nothing else re-places one until the next rebalance happens to BUY
+        this name again. Releasing the leg to fix the exit must not quietly create an unprotected
+        position -- that would trade one bug for a worse one.
+
+        The replacement carries the RELEASED leg's own price, not a freshly computed one. Only the
+        quantity may change (it must -- it is protecting fewer shares), so a partial reduce cannot
+        move a stop that the strategy already chose, and backtest results stay identical to a run
+        where the leg had simply been resized. A FULL exit leaves nothing to protect and is
+        skipped, which is the common rebalance case (and exactly what order 630 was).
+        """
+        held = sum((t.open_qty or 0) for t in (transactions or []))
+        remaining = held - sold_qty
+        if remaining <= 0 or not released:
+            return
+        # Prefer a stop price; a released TP-only leg has limit_price instead.
+        source_leg = next((l for l in released if l.stop_price), released[0])
+        price = source_leg.stop_price or source_leg.limit_price
+        if not price or price <= 0:
+            logger.warning(
+                f"FactorRanker[{self.expert_instance_id}]: released leg {source_leg.id} for "
+                f"{symbol} carried no usable price — {remaining} share(s) left UNPROTECTED")
+            return
+        try:
+            replacement = TradingOrder(
+                account_id=self.account_id, symbol=symbol, quantity=remaining,
+                side=source_leg.side, order_type=source_leg.order_type,
+                stop_price=source_leg.stop_price, limit_price=source_leg.limit_price,
+                transaction_id=source_leg.transaction_id, status=OrderStatus.PENDING,
+                open_type=OrderOpenType.AUTOMATIC,
+                # Depend on the reducing sell so the leg goes live only once the reduce has
+                # FILLED -- submitting it beforehand would reserve shares the sell still needs
+                # and reproduce the very rejection this method exists to avoid.
+                depends_on_order=(sell_order.id if sell_order is not None else None),
+                depends_order_status_trigger=OrderStatus.FILLED,
+                comment=f"FactorRanker protective leg resized after partial reduce "
+                        f"(replaces order {source_leg.id})",
+            )
+            add_instance(replacement)
+            self.account.submit_order(replacement)
+            logger.info(
+                f"FactorRanker[{self.expert_instance_id}]: re-protected {symbol} x{remaining} at "
+                f"{price} after reducing {sold_qty} (replaces released order {source_leg.id})")
+        except Exception as e:  # noqa: BLE001 — surface loudly; the reduce itself already went in
+            logger.error(
+                f"FactorRanker[{self.expert_instance_id}]: FAILED to re-protect {symbol} "
+                f"x{remaining} after a partial reduce — position is UNPROTECTED: {e}",
+                exc_info=True)
