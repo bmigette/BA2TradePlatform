@@ -1115,7 +1115,7 @@ Final Confidence = Base Confidence + Directional Boost ({signal.value}) = {base_
             base.append(ExpertMetric(
                 "Analyst target upside", upside, f"{upside:+.1f}%",
                 "buy" if upside > 0 else "sell",
-                f"Using the '{settings.get('target_price_type', 'consensus')}' target"))
+                f"Using the '{settings['target_price_type']}' target"))
 
         target_consensus = calc.get("target_consensus")
         base.append(ExpertMetric("Consensus price target", target_consensus,

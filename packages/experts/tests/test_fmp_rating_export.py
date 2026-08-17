@@ -33,12 +33,18 @@ CONSENSUS = {"targetConsensus": 130.0, "targetHigh": 160.0,
 # buy_score = 10*2 + 5 = 25 ; sell_score = 1*2 + 1 = 3 ; hold_score = 3 -> BUY.
 UPGRADE = [{"strongBuy": 10, "buy": 5, "hold": 3, "sell": 1, "strongSell": 1}]
 
+# Dates relative to "now" (not hardcoded) so the fixture stays inside the live
+# path's real trailing-quarter window (_QUARTER_DAYS=90, measured against
+# datetime.now(timezone.utc)) regardless of when the test runs -- absolute
+# dates would age out of the window and silently flip these tests into the
+# insufficient-price-targets skip path a few months out.
+_NOW = datetime.now(timezone.utc)
 PRICE_TARGET_HISTORY = [
-    {"publishedDate": "2026-06-10", "priceTarget": 110.0},
-    {"publishedDate": "2026-06-09", "priceTarget": 124.0},
-    {"publishedDate": "2026-06-08", "priceTarget": 128.0},
-    {"publishedDate": "2026-06-07", "priceTarget": 128.0},
-    {"publishedDate": "2026-06-06", "priceTarget": 160.0},
+    {"publishedDate": (_NOW - timedelta(days=10)).strftime("%Y-%m-%d"), "priceTarget": 110.0},
+    {"publishedDate": (_NOW - timedelta(days=11)).strftime("%Y-%m-%d"), "priceTarget": 124.0},
+    {"publishedDate": (_NOW - timedelta(days=12)).strftime("%Y-%m-%d"), "priceTarget": 128.0},
+    {"publishedDate": (_NOW - timedelta(days=13)).strftime("%Y-%m-%d"), "priceTarget": 128.0},
+    {"publishedDate": (_NOW - timedelta(days=14)).strftime("%Y-%m-%d"), "priceTarget": 160.0},
 ]
 
 
