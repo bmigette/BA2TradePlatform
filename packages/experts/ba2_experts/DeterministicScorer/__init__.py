@@ -25,7 +25,9 @@ import math
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from ba2_common.core.interfaces import MarketExpertInterface
+from ba2_common.core.interfaces import (
+    ExpertDataExportInterface, ExpertMetric, MarketExpertInterface,
+)
 from ba2_common.core.models import MarketAnalysis, AnalysisOutput, ExpertRecommendation
 from ba2_common.core.db import get_db, update_instance, add_instance
 from ba2_common.core.types import (
@@ -52,7 +54,8 @@ from .combine import (final_score, schmitt_trigger, atr_target_price,
                       DEF_K_STOP, DEF_K_TARGET, DEF_VETO_CAP, DEF_W_EARNINGS)
 
 
-class DeterministicScorer(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExpertInterface):
+class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
+                          FMPApiKeyMixin, MarketExpertInterface):
     """Deterministic multi-section scoring expert (no LLM)."""
 
     RENDER_PENDING = "Deterministic scoring queued…"
@@ -643,6 +646,54 @@ class DeterministicScorer(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExper
         if target_price is not None:
             parts.append(f"price {price:.2f} -> target {target_price:.2f}")
         return " | ".join(parts)
+
+    # ------------------------------------------------------- data export
+    @staticmethod
+    def _score_signal(v: Optional[float], pos: float = 0.1, neg: float = -0.1) -> Optional[str]:
+        if v is None:
+            return None
+        return "buy" if v > pos else ("sell" if v < neg else "neutral")
+
+    def _build_export_metrics(self, rec: Recommendation, settings: Dict[str, Any]) -> list:
+        """SYMBOL360 per-section breakdown. A skip (thin OHLCV history) means
+        the bundle was never processed -- defer to the base 'Skipped' row
+        rather than building a technical/fundamental section out of nothing."""
+        if rec.skip:
+            return super()._build_export_metrics(rec, settings)
+
+        raw = rec.raw_outputs or {}
+        tech = raw.get("technical") or {}
+        fund = raw.get("fundamental") or {}
+        regime = raw.get("regime") or {}
+        snap = fund.get("snapshot") or {}
+        out = [
+            ExpertMetric("Technical section", tech.get("score"),
+                        f"{(tech.get('score') or 0):+.2f}",
+                        self._score_signal(tech.get("score")),
+                        "Momentum/SMA200/RSI/Donchian composite"),
+            ExpertMetric("Fundamental section", fund.get("score"),
+                        f"{(fund.get('score') or 0):+.2f}",
+                        self._score_signal(fund.get("score")),
+                        "Piotroski/quality/value/growth composite"),
+            ExpertMetric("Macro regime", regime.get("score") if regime else None,
+                        f"{(regime.get('score') or 0):+.2f}" if regime else "n/a",
+                        self._score_signal(regime.get("score")) if regime else None),
+        ]
+        if "fscore" in snap:
+            out.append(ExpertMetric("Piotroski F-Score", snap["fscore"], f"{snap['fscore']} / 9",
+                                    "buy" if snap["fscore"] >= 7 else
+                                    ("sell" if snap["fscore"] <= 2 else "neutral")))
+        if "z" in snap:
+            veto = bool(fund.get("veto"))
+            out.append(ExpertMetric("Altman Z", snap["z"], f"{snap['z']:.2f}",
+                                    "sell" if veto else "neutral",
+                                    "Distress veto applied" if veto else None))
+        for key, label in (("quality_norm", "Quality (ROE)"), ("value_norm", "Value (earnings yield)"),
+                           ("rev_accel", "Revenue acceleration"), ("eps_accel", "EPS acceleration")):
+            if key in snap:
+                out.append(ExpertMetric(label, snap[key], f"{snap[key]:+.2f}",
+                                        self._score_signal(snap[key], pos=0.05, neg=-0.05)))
+        return out
 
     # ------------------------------------------------------------- live entry
     def run_analysis(self, symbol: str, market_analysis: MarketAnalysis) -> None:
