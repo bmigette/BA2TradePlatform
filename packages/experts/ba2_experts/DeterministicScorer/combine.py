@@ -19,7 +19,23 @@ DEF_W_ANALYST = 0.00
 DEF_W_EARNINGS = 0.00
 DEF_W_MACRO_AS_INPUT = 0.20   # only when macro_mode == "input"
 DEF_K_COMPRESS = 0.6
-DEF_THETA_BUY = 0.5
+# THETA_BUY WAS 0.5 AND THAT WAS ABOVE WHAT THE FORMULA CAN PRODUCE. Measured 2026-08-17 over
+# 5,970 scored bars (30 mega-caps, 2023, default settings, every final score captured at the
+# schmitt_trigger call):
+#
+#     min -0.538   p50 +0.205   p90 +0.437   p99 +0.513   MAX +0.562
+#
+#     theta_buy   0.25 -> 41.9% of bars    0.35 -> 26.2%    0.50 -> 1.83%    0.60 -> 0.00%
+#
+# So the old default sat at roughly the 99th percentile of an achievable range that tops out at
+# +0.562: 98% of bars could never fire, the expert produced 14 trades/yr on 30 liquid names, and
+# `consistent_annual_return` disqualifies anything under 12/yr -- which is why 34 of 40 genomes in
+# the first real DeterministicScorer GA (opt 333) scored a ZERO_TRADE or LOW_TRADE sentinel and the
+# search had almost nothing to select on. Anything >= 0.6 makes the expert COMPLETELY inert.
+#
+# 0.30 puts the gate at ~34% of bars, leaving the screener, schedule and position limits to do the
+# real thinning -- the job they are actually for.
+DEF_THETA_BUY = 0.3
 DEF_THETA_SELL = 0.2
 # A veto BLOCKS the entry; it does not open a short. Capping at 0 keeps a
 # distressed (or data-incomplete) name out of the book without turning a

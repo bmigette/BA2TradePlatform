@@ -1162,7 +1162,13 @@ _EXPERT_OPT = {
             # ranges start at 0.0 so "this section adds nothing" stays reachable.
             "w_earnings": {"optimize": True, "min": 0.0, "max": 0.4, "step": 0.1, "type": "float"},
             "macro_mode": {"optimize": True, "type": "choice", "choices": ["multiply", "gate", "off"]},
-            "theta_buy": {"optimize": True, "min": 0.3, "max": 0.7, "step": 0.1, "type": "float"},
+            # RANGE MEASURED, not guessed (2026-08-17). Every final score over 5,970 bars was
+            # captured: the distribution tops out at +0.562, so the OLD 0.3-0.7 range spent
+            # 0.6 and 0.7 on values that can NEVER fire (0.00% of bars) and 0.5 on 1.83% --
+            # three of its five values were dead or near-dead, which is most of why 34 of 40
+            # genomes in opt 333 disqualified on trade count. 0.15-0.45 is entirely live
+            # (57.7% down to ~10% of bars).
+            "theta_buy": {"optimize": True, "min": 0.15, "max": 0.45, "step": 0.05, "type": "float"},
             "theta_sell": {"optimize": True, "min": 0.1, "max": 0.4, "step": 0.1, "type": "float"},
             "k_stop": {"optimize": True, "min": 1.5, "max": 3.0, "step": 0.5, "type": "float"},
             "k_target": {"optimize": True, "min": 3.0, "max": 6.0, "step": 1.0, "type": "float"},
@@ -1888,105 +1894,77 @@ def _uniquify_condition_ids(buy_tree, exit_rules) -> None:
 
 
 def _build_strategy_S1(name: str, expert: str):
-    """S1 — the expert's LIVE dev-account "high conviction" ruleset (exported to
-    docs/live_rulesets/{expert}.json), normalized to the canonical Strategy shape with optimize
-    flags on every threshold + adjust-%, PLUS an entry-time TP/SL bracket that mirrors the live
-    "Optimized Entry - High Conviction" ruleset (which sets a target-anchored take-profit and a
-    protective stop AT ENTRY — see the enter ruleset's adjust_take_profit/adjust_stop_loss actions).
+    """S1 -- graded-conviction entry tiers + entry TP/SL bracket. EXPERT-AGNOSTIC, like S2-S7.
 
-    Faithful to the live enter (buy/sell trees, OR groups preserved) + open_positions (exit) rules.
+    WHAT CHANGED (2026-08-17) AND WHY. S1 used to be the ONLY strategy that loaded a per-expert
+    JSON (docs/live_rulesets/{expert}.json, falling back to docs/default_rulesets/). Every other
+    builder (S2, S3, S5, S6, S7) takes just a name and constructs its rules in code, so S1 was
+    the odd one out in three ways that all cost real time:
 
-    S4 (the old target-anchored-TP variant) is now MERGED here: S1 carries the target-anchored
-    take-profit as an ``entry_actions`` rule (fired ONCE at entry by the shared
-    TradeActionEvaluator's Phase 1.5/2, the same mechanism live uses — see
-    docs/plans/2026-07-03-entry-tp-sl-bracket-actions.md), plus an entry stop-loss. Both entry
-    actions are GA on/off-TOGGLEABLE (``toggle_optimize`` → ``entry:<id>:enabled`` gene), so the
-    optimizer decides whether the entry bracket helps — and the target-anchored TP self-disables
-    for experts with no real analyst target (FMPEarningsDrift / FMPInsiderClusterBuy, whose
-    ``expert_target_price`` is a static setting). The RM max-risk SAFEGUARD stop is ALWAYS placed
-    on entry regardless (shared classic RM), so a toggled-off entry SL never leaves the position
-    unprotected — the entry SL is an additional, tighter, optional bracket."""
-    import json as _json
+      * CHICKEN-AND-EGG for any new expert. S1 needed a LIVE export, a live export needs a
+        deployed instance, and you would not deploy before optimizing. DeterministicScorer hit
+        exactly this: all 6 of its S1 jobs (3 bands x 2 sizing modes) died instantly with
+        exit=1 while the grid scrolled past, so a third of its matrix silently never ran.
+      * DRIFT. A live export changes whenever someone edits the live ruleset, so re-running an
+        old S1 job could search a different space than it did the first time.
+      * INCONSISTENCY. "S1" meant "replicate THIS expert's live config" for four experts and
+        "does not exist" for the rest, so S1 numbers were not comparable across experts.
+
+    The tiers key off fields EVERY expert's recommendation carries -- confidence,
+    expected_profit, the term/risk flags -- not anything expert-specific, which is why one
+    template serves all of them. The expert contributes its own DEFAULT SETTINGS (plus whatever
+    `model:` genes the run searches); the strategy contributes the rules. That is exactly how
+    S2-S7 already worked.
+
+    SHAPE (preserved from the live rulesets this replaces): an OR of AND-tiers, each a
+    conviction band -- high conviction takes a bigger expected-profit demand, lower tiers relax
+    it -- plus a GA-toggleable entry bracket (target-anchored TP, protective SL). Every
+    threshold is optimizable and every tier is droppable via its rule-level toggle, so the GA
+    can retire a tier outright rather than only loosening its leaves.
+    """
     from app.models.strategy import Strategy
-    repo_root = os.path.dirname(os.path.abspath(__file__))
-    path = os.path.join(repo_root, "docs", "live_rulesets", f"{expert}.json")
-    if not os.path.isfile(path):
-        # FALLBACK to a COMMITTED default seed. Sourcing S1 only from a live export made the seed
-        # a side effect of production state and created a chicken-and-egg for every NEW expert:
-        # S1 needs a live ruleset, the live ruleset can only be exported from a deployed instance,
-        # and you would not deploy before optimizing. DeterministicScorer hit exactly this on
-        # 2026-08-15 -- S1 died instantly in all 6 band/matrix combinations.
-        #
-        # A checked-in default is also more reproducible: a live export drifts whenever someone
-        # edits the live ruleset, so re-running an old S1 job could silently search a different
-        # space than it did before. The default file cannot drift without a commit.
-        default_path = os.path.join(repo_root, "docs", "default_rulesets", f"{expert}.json")
-        if os.path.isfile(default_path):
-            path = default_path
-        else:
-            sys.exit(
-                f"optimize: S1 needs a seed ruleset for {expert} and found neither:\n"
-                f"  live    {path}\n"
-                f"          (export from a deployed instance: "
-                f"`python backend/scripts/export_live_rulesets.py`)\n"
-                f"  default {default_path}\n"
-                f"          (commit a default seed here for an expert with no live deployment)\n"
-                f"An expert with no live instance should use the default file; S1 then optimizes "
-                f"from those defaults instead of replicating a live config."
-            )
-    with open(path, encoding="utf-8") as f:
-        data = _json.load(f)
 
-    # LOSSLESS file shape (re-exported via export_live_rulesets.py on the unified model):
-    # TradeRule lists carrying live's OWN per-rule brackets / multi-action rules /
-    # continue_processing / rule order. Preferred when present; the legacy tree shape below
-    # keeps working for older files.
-    if data.get("entry_rules"):
-        entry_rules = data["entry_rules"]
-        exit_rules = data.get("exit_rules") or []
-        # Unique condition ids across every rule (live restarts c0,c1,... per rule; the
-        # optimizer keys cond genes by bare id in ONE global namespace).
-        ctr = [0]
-        def _relabel(node):
-            if not isinstance(node, dict):
-                return
-            ctr[0] += 1
-            node["id"] = f"u{ctr[0]}"
-            for child in (node.get("conditions") or []):
-                _relabel(child)
-        for rule in entry_rules + exit_rules:
-            if isinstance(rule, dict) and rule.get("conditions"):
-                _relabel(rule["conditions"])
-        # Rules WITHOUT their own bracket get the default S1 target-anchored TP + entry SL
-        # (merged-S4 behavior); rules that brought live's own bracket keep it untouched.
-        for rule in entry_rules:
-            kinds = {str(a.get("action_type")) for a in (rule.get("actions") or [])
-                     if isinstance(a, dict)}
-            if "adjust_take_profit" not in kinds:
-                rule["actions"] = list(rule.get("actions") or []) + [
-                    {"id": "s1_tp_target", "action_type": "adjust_take_profit",
-                     "reference_value": "expert_target_price",
-                     "action_value": -5.0, "action_value_optimize": True,
-                     "action_value_min": -20.0, "action_value_max": 10.0,
-                     "action_value_step": 2.0, "toggle_optimize": True},
-                    {"id": "s1_sl_entry", "action_type": "adjust_stop_loss",
-                     "reference_value": "order_open_price",
-                     "action_value": -8.0, "action_value_optimize": True,
-                     "action_value_min": -20.0, "action_value_max": -3.0,
-                     "action_value_step": 2.0, "toggle_optimize": True},
-                ]
-            rule["toggle_optimize"] = True  # GA can retire a whole conviction tier
-        from app.models.strategy import Strategy
-        from ba2_common.core.rule_models import normalize_trade_rules
-        return Strategy(name=name, entry_rules=normalize_trade_rules(entry_rules),
-                        exit_rules=normalize_trade_rules(exit_rules))
+    def _tier(tid, conf, conf_min, conf_max, prof, prof_min, prof_max, extra_flags):
+        conds = [
+            {"id": f"{tid}_bull", "field": "bullish"},
+            {"id": f"{tid}_conf", "field": "confidence", "op": ">=", "value": conf,
+             "optimize": True, "value_min": conf_min, "value_max": conf_max, "value_step": 5,
+             "toggle_optimize": True},
+            {"id": f"{tid}_prof", "field": "expected_profit", "op": ">=", "value": prof,
+             "optimize": True, "value_min": prof_min, "value_max": prof_max, "value_step": 1,
+             "toggle_optimize": True},
+        ]
+        # Term/risk flags are ADVISORY here and individually droppable: an expert that never
+        # sets them (they are optional recommendation attributes) would otherwise have every
+        # tier permanently false -- the silent-inertness failure this whole rewrite is about.
+        for f in extra_flags:
+            conds.append({"id": f"{tid}_{f}", "field": f, "toggle_optimize": True})
+        conds.append({"id": f"{tid}_flat", "field": "has_no_position"})
+        return {"id": f"grp_{tid}", "type": "AND", "conditions": conds}
 
-    buy = _s1_norm_tree(data.get("buy_entry_conditions"))
-    exits = [_s1_norm_exit_rule(r) for r in (data.get("exit_conditions") or [])]
-    # Live rulesets reuse leaf ids (c0,c1,...) across every rule + the buy tree; the optimizer keys
-    # condition genes by bare id in one global namespace, so colliding ids cross-contaminate (an
-    # exit's numeric range leaking onto a buy-tree flag, one toggle dropping unrelated leaves). Make
-    # them globally unique so each gene maps to exactly one leaf.
+    buy = {"id": "root", "type": "OR", "conditions": [
+        _tier("t1", 70, 40, 90, 8, 3, 15, ["long_term", "lowrisk"]),
+        _tier("t2", 60, 35, 85, 6, 2, 12, ["medium_term", "mediumrisk"]),
+        _tier("t3", 50, 30, 75, 4, 1, 10, []),
+    ]}
+
+    exits = [
+        {"id": "s1_sl_hold", "action_type": "adjust_stop_loss",
+         "reference_value": "order_open_price",
+         "action_value": -8.0, "action_value_optimize": True,
+         "action_value_min": -20.0, "action_value_max": -3.0, "action_value_step": 2.0,
+         "conditions": {"type": "AND", "conditions": [
+             {"id": "s1_hold", "field": "has_position"}]}},
+        {"id": "s1_exit_signal", "action_type": "close", "toggle_optimize": True,
+         "conditions": {"type": "AND", "conditions": [
+             {"id": "s1_bear", "field": "bearish"}]}},
+        {"id": "s1_exit_time", "action_type": "close", "toggle_optimize": True,
+         "conditions": {"type": "AND", "conditions": [
+             {"id": "s1_days", "field": "days_opened", "op": ">", "value": 120,
+              "optimize": True, "value_min": 30, "value_max": 200, "value_step": 30}]}},
+    ]
+    exits = _first_match_order(exits, ["s1_exit_time", "s1_exit_signal", "s1_sl_hold"])
+
     _uniquify_condition_ids(buy, exits)
     # NOTE: the launcher's Strategy has no separate sell tree — shorts are mirrored from the buy
     # gates via the engine's enable_short flag. The live sell_entry_conditions (if any) is dropped;
@@ -2666,18 +2644,69 @@ _STRATEGY_BUILDERS = {
 _STRATEGY_POP_FACTOR = {"S1": 1.5}
 
 
+# CONFIDENCE CEILINGS: the highest `confidence` an expert can ever emit.
+#
+# The strategy templates (S1-S7) gate on `confidence` with ranges sized for an expert that can
+# reach 100. That is true of the analyst-driven experts, but NOT of a scorer whose confidence is a
+# bounded function of its own composite: DeterministicScorer computes confidence = 100 * |final|
+# where final = tanh(weighted sum / k_compress), and the score was MEASURED to top out at +0.562
+# over 5,970 bars. A gate above that can never pass, so the GA spends population on genomes that
+# are arithmetically incapable of trading -- `cond:gate_confidence:enabled` was the single
+# strongest separator between trading and dead genomes in opt 333 (0.80 in dead vs 0.14 in
+# traders). Clamping the RANGE is better than removing the gate: the gate is still useful below
+# the ceiling, it just must not exceed it.
+_EXPERT_CONFIDENCE_CEILING = {
+    "DeterministicScorer": 50.0,   # measured max |final| 0.562 -> 56.2; 50 leaves headroom
+}
+
+
+def _clamp_confidence_genes(strat, expert: str):
+    """Cap every `confidence` condition's value/range at the expert's reachable ceiling."""
+    ceiling = _EXPERT_CONFIDENCE_CEILING.get(expert)
+    if ceiling is None or strat is None:
+        return strat
+
+    def walk(node):
+        if isinstance(node, list):
+            for n in node:
+                walk(n)
+            return
+        if not isinstance(node, dict):
+            return
+        if node.get("field") == "confidence":
+            for k in ("value", "value_min", "value_max"):
+                v = node.get(k)
+                if isinstance(v, (int, float)) and v > ceiling:
+                    node[k] = ceiling
+            # a collapsed range (min == max) would make the gene a constant; drop the step so
+            # the param space treats it as fixed rather than emitting a zero-width sweep
+            if node.get("value_min") is not None and node.get("value_min") == node.get("value_max"):
+                node.pop("optimize", None)
+        for v in node.values():
+            walk(v)
+
+    for attr in ("entry_rules", "exit_rules"):
+        walk(getattr(strat, attr, None))
+    return strat
+
+
 def _build_strategy(kind: str, name: str, expert: str):
-    """Dispatch to the right strategy builder. S1 is expert-specific (loads the live JSON).
-    Option/equity strategies (O_*) dispatch by `kind` (the builder names the Strategy off the kind
-    and, for pure-option kinds, carries the entry_action)."""
+    """Dispatch to the right strategy builder.
+
+    Every S-strategy is EXPERT-AGNOSTIC (2026-08-17): S1 used to load a per-expert live/default
+    JSON and died for any expert without one; it now builds from the same kind of code template as
+    S2-S7, with the expert contributing its own default settings. The only expert-specific step
+    left is clamping confidence gates to what the expert can actually emit."""
     if kind == "S1":
-        return _STRATEGY_BUILDERS[kind](name, expert)
-    if kind in _OPTION_STRATEGY_KEYS:
-        return _STRATEGY_BUILDERS[kind](kind)
-    builder = _STRATEGY_BUILDERS.get(kind)
-    if builder is None:
-        sys.exit(f"optimize: unknown strategy {kind!r}; have {sorted(_STRATEGY_BUILDERS)}")
-    return builder(name)
+        strat = _STRATEGY_BUILDERS[kind](name, expert)
+    elif kind in _OPTION_STRATEGY_KEYS:
+        strat = _STRATEGY_BUILDERS[kind](kind)
+    else:
+        builder = _STRATEGY_BUILDERS.get(kind)
+        if builder is None:
+            sys.exit(f"optimize: unknown strategy {kind!r}; have {sorted(_STRATEGY_BUILDERS)}")
+        strat = builder(name)
+    return _clamp_confidence_genes(strat, expert)
 
 
 def _cmd_optimize(args) -> int:

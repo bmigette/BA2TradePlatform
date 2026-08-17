@@ -735,7 +735,13 @@ def _consistent_annual_return(results: dict) -> float:
     # An ABSENT KEY is a caller error and raises; a curve that is present but too short to
     # measure (a sub-year run) keeps the documented 1.0 -- that case carries no consistency
     # information and is not a mistake.
-    if "equity_curve" not in results:
+    # Narrowed 2026-08-17: fire ONLY when the caller supplied a TRADES LIST but no curve. That is
+    # exactly the half-restored-DB-row signature (both live in their own columns; restoring one and
+    # not the other is the mistake). A synthetic fixture that carries neither is a legitimate
+    # caller asking for the base metric, and the "no curve -> consistency 1.0" fallback is its
+    # DOCUMENTED behaviour -- 20 existing tests assert it, and the first version of this guard
+    # broke every one of them.
+    if results.get("trades") and "equity_curve" not in results:
         raise ValueError(
             "consistent_annual_return requires results['equity_curve'] to measure the "
             "consistency factor, and the key is absent. If you are re-scoring a stored "
