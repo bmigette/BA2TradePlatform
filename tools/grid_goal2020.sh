@@ -186,7 +186,17 @@ SPREAD_BPS_SMALL="${SPREAD_BPS_SMALL:-17}"
 # A multiple, not per-band numbers, because the bands' spreads differ ~13x (3 vs 40). A single
 # absolute stress would be 13x harsher on large than on small; and hand-written per-band values
 # would silently desync the moment SPREAD_BPS_* changed. This cannot drift -- it is derived.
-STRESS_SPREAD_MULT="${STRESS_SPREAD_MULT:-0}"
+# 1.5 lands the widened spread on the MEASURED p90 in every band (widening/median is 1.33 large,
+# 1.44 mid, 1.65 small), so "stressed" now means "survives the worst decile of real quoted
+# spreads" rather than an invented multiple. Was 0 (off).
+STRESS_SPREAD_MULT="${STRESS_SPREAD_MULT:-1.5}"
+
+# Rank on the ROBUSTNESS-ADJUSTED fitness (concentration x monte-carlo x spread). Default ON:
+# every band x strategy cell of the previous FMPRating matrix produced a concentrated winner
+# (7 of 9 cells had NO result with a top-5 share under 40%), which is what an unpenalised search
+# converges to. Set ROBUST_FITNESS=0 for a like-for-like comparison against a pre-2026-08-16 run.
+ROBUST_FITNESS="${ROBUST_FITNESS:-1}"
+robust_args=(); [ "$ROBUST_FITNESS" = "1" ] && robust_args=(--robust-fitness)
 
 spread_for() {
   case "$1" in
@@ -210,7 +220,7 @@ run_matrix() {                      # $1=mode  $2=name-suffix  $3...=extra drive
       stress_args=(--stress-spread-bps "$st")
     fi
     echo; echo "=== $mode / $band  (spread ${sp} bps round-trip${st:+, stress +${st}})  $(date)"
-    "$PY" "$DRIVER" "${COMMON[@]}"       --sizing-mode "$mode"       --bands "$band"       --spread-bps "$sp"       "${stress_args[@]}"       --name-suffix="$suffix"       "$@"
+    "$PY" "$DRIVER" "${COMMON[@]}"       --sizing-mode "$mode"       --bands "$band"       --spread-bps "$sp"       "${stress_args[@]}" "${robust_args[@]}"       --name-suffix="$suffix"       "$@"
     echo "=== $mode / $band  done rc=$? $(date)"
   done
 }

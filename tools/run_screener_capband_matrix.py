@@ -180,11 +180,17 @@ def _jobs(bands, strategies, include_no_data, skip_experts=frozenset(), name_suf
 # meaningless: it is either far too harsh on large or far too soft on small, and the bands stop
 # being rankable against each other. Accepts a scalar (same everywhere, for a single-band run)
 # or explicit per-band values.
-# Stress = the MEASURED p90 spread per band (Alpaca SIP quotes, 2026-08-17), not a round guess:
-# a genome now has to survive the worst decile of real quoted spreads rather than an invented
-# multiple. Was {10, 25, 50} -- close for mid/small by luck, but 10 for large was ~1.4x the true
-# p90 while the 3bps BASELINE made the stress leg inert (measured sd(log)=0.01 across 89 rows).
-_STRESS_BAND_DEFAULTS = {"large": 7.0, "mid": 22.0, "small": 45.0}
+# Stress WIDENS the spread the backtest already charged -- apply_spread_cost deducts this ON TOP
+# of the baseline, it is not an absolute level. So to stress a genome to the MEASURED p90 the
+# widening must be (p90 - median), per band (Alpaca SIP quotes, 2026-08-17):
+#            median   p90    widening
+#   large      2.68   7.05      4
+#   mid        9.01  22.16     13
+#   small     16.78  45.31     28
+# A genome must therefore survive the worst decile of REAL quoted spreads. Was {10, 25, 50} (a
+# round guess), and briefly {7, 22, 45} -- which was the p90 read as if it were absolute and so
+# actually stressed to median+p90.
+_STRESS_BAND_DEFAULTS = {"large": 4.0, "mid": 13.0, "small": 28.0}
 
 
 def _parse_stress_spread(spec: str) -> dict:

@@ -44,8 +44,10 @@
 # that is the expected signature of "not enough disclosures", not a bug. Read the first job's
 # trade counts before letting all 14 run.
 #
-# SPREAD + STRESS: Senate names are mostly mid/large caps, so the mid-band assumption (10 bps)
-# is the closest fit. STRESS_SPREAD_MULT defaults to 1.0.
+# SPREAD + STRESS: Senate names are mostly mid/large caps, so the mid band is the closest fit --
+# now 9 bps, the MEASURED median (Alpaca SIP historical quotes, 2026-08-17), not the old 10 bps
+# assumption. STRESS_SPREAD_MULT 1.5 widens it to ~22 bps, the measured mid-band p90, so a genome
+# must survive the worst decile of real quoted spreads.
 #
 # !!! MATRIX 3 FITNESS IS NOT COMPARABLE WITH MATRICES 1 AND 2 !!!
 #
@@ -80,12 +82,21 @@ UNI=$(cat "$UNIVERSE_FILE")
 WORKERS="${WORKERS:-remote150}"
 STRATEGIES="${STRATEGIES:-S1 S2 S3 S5 S6 S7}"
 PARALLEL="${PARALLEL:-2}"          # 11-12 GB/trial — see header
-SPREAD_BPS="${SPREAD_BPS:-10}"     # mid-band assumption; Senate names skew mid/large
-STRESS_SPREAD_MULT="${STRESS_SPREAD_MULT:-1.0}"
+SPREAD_BPS="${SPREAD_BPS:-9}"      # MEASURED mid-band median (Alpaca SIP 2026-08-17); Senate skews mid/large
+STRESS_SPREAD_MULT="${STRESS_SPREAD_MULT:-1.5}"   # 1.5 x median ~= the measured p90
 POPULATION="${POPULATION:-40}"
 GENERATIONS="${GENERATIONS:-8}"
 
 STRESS_BPS=$(awk -v s="$SPREAD_BPS" -v m="$STRESS_SPREAD_MULT" 'BEGIN{printf "%.6g", s*m}')
+
+# Rank on the ROBUSTNESS-ADJUSTED fitness (concentration x monte-carlo x spread). Default ON.
+# Evidence: of the 9 band x strategy cells of the previous FMPRating matrix, 7 contained NO
+# result whose top-5 trades were under 40% of net P&L -- concentration is what an unpenalised
+# search converges to, not a quirk of a few rows. Set ROBUST_FITNESS=0 for a like-for-like
+# comparison against a pre-2026-08-16 run (scores are NOT comparable across this flag).
+ROBUST_FITNESS="${ROBUST_FITNESS:-1}"
+robust_args=(); [ "$ROBUST_FITNESS" = "1" ] && robust_args=(--robust-fitness)
+
 stress_args=()
 if awk -v v="$STRESS_BPS" 'BEGIN{exit !(v>0)}'; then
   stress_args=(--stress-spread-bps "$STRESS_BPS")
@@ -152,7 +163,8 @@ DRIVER=tools/run_screener_capband_matrix.py
 STORE="${STORE:-$HOME/Documents/ba2/common/cache/screener/metric_store}"
 DS_PARALLEL="${DS_PARALLEL:-4}"      # light expert (~2.5 GB/trial), unlike Senate
 
-ds_spread_for() { case "$1" in large) echo 3 ;; mid) echo 10 ;; small) echo 40 ;; *) echo 0 ;; esac; }
+# MEASURED medians (Alpaca SIP historical quotes, 2026-08-17) -- small was 40, i.e. 2.4x too harsh.
+ds_spread_for() { case "$1" in large) echo 3 ;; mid) echo 9 ;; small) echo 17 ;; *) echo 0 ;; esac; }
 
 for MODE in risk_atr notional; do
   for band in large mid small; do
@@ -162,7 +174,7 @@ for MODE in risk_atr notional; do
     awk -v v="$st" 'BEGIN{exit !(v>0)}' && ds_stress=(--stress-spread-bps "$st")
     echo
     echo "=== PHASE B  DeterministicScorer / $MODE / $band  (spread ${sp}, stress +${st})  $(date)"
-    "$PY" "$DRIVER"       --start 2020-01-01 --end 2025-12-31       --fitness consistent_annual_return       --store "$STORE"       --sizing-mode "$MODE" --bands "$band"       --spread-bps "$sp" "${ds_stress[@]}"       --parallel "$DS_PARALLEL"       --name-suffix="-goal2020-${MODE}-ds"       --skip-experts FMPRating,FMPEarningsDrift,FMPInsiderClusterBuy,FactorRanker       "${WORKER_ARGS[@]}"
+    "$PY" "$DRIVER"       --start 2020-01-01 --end 2025-12-31       --fitness consistent_annual_return       --store "$STORE"       --sizing-mode "$MODE" --bands "$band"       --spread-bps "$sp" "${ds_stress[@]}" "${robust_args[@]}"       --parallel "$DS_PARALLEL"       --name-suffix="-goal2020-${MODE}-ds"       --skip-experts FMPRating,FMPEarningsDrift,FMPInsiderClusterBuy,FactorRanker       "${WORKER_ARGS[@]}"
     rc=$?
     echo "=== PHASE B  $MODE / $band  done rc=$rc $(date)"
     [ $rc -ne 0 ] && rc_any=$rc
@@ -186,8 +198,8 @@ for MODE in risk_atr notional; do
       --early-stop 4 --mutation-prob 0.3 \
       --parallel "$PARALLEL" --seed 42 \
       --sizing-mode "$MODE" \
-      --initial-capital 10000 --commission 1.0 \
-      --spread-bps "$SPREAD_BPS" "${stress_args[@]}" \
+      --initial-capital 10000 \
+      --spread-bps "$SPREAD_BPS" "${stress_args[@]}" "${robust_args[@]}" \
       --profit-cap-pct 2000 --profit-share-cap-pct 25 \
       "${WORKER_ARGS[@]}" \
       --labels "goal2020-senate,${S},${MODE}" \
