@@ -76,6 +76,26 @@ class _BasketExpert(_DummyExpert):
         return [super().analyze_as_of(as_of, context)]
 
 
+class _LivePriceExpert(_DummyExpert):
+    """_gather's live branch (as_of is None) calls self._get_current_price,
+    exactly like FMPRating/FMPInsiderClusterBuy's real live branch does. The
+    base MarketExpertInterface._get_current_price is DB-bound (needs a real
+    ExpertInstance row for self.id) and silently returns None for the
+    sentinel id=-1 bypass instance -- fatal for any expert that then formats
+    that price (e.g. FMPRating's unguarded f"${current_price:.2f}")."""
+
+    def _gather(self, providers, as_of):
+        price = (self._get_current_price("AAPL") if as_of is None
+                 else providers.price_at_date("AAPL", as_of))
+        return {"current_price": price}
+
+    def _process(self, data_bundle, settings, as_of=None):
+        return Recommendation(signal=OrderRecommendation.HOLD, confidence=50.0,
+                              current_price=data_bundle["current_price"],
+                              details="live-price-test",
+                              raw_outputs={"current_price": data_bundle["current_price"]})
+
+
 def test_export_symbol_data_uses_defaults_with_no_db():
     result = _DummyExpert.export_symbol_data("AAPL", providers_resolver=_resolver)
     assert isinstance(result, ExpertDataExport)
@@ -138,3 +158,29 @@ def test_export_default_settings_includes_builtin_key():
     defaults = _DummyExpert.export_default_settings()
     assert "enabled_instruments" in defaults
     assert defaults["enabled_instruments"] == {}
+
+
+def test_export_symbol_data_resolves_live_price_via_providers_when_unoverridden():
+    """Reproduces the FMPRating/FMPInsiderClusterBuy bug directly: the live
+    _gather branch (as_of is None) calls self._get_current_price(symbol).
+    Without the fix this silently resolves to None (the DB-bound base method
+    swallows its own lookup failure); with the fix it resolves the injected
+    fake OHLCV provider's price (42.0) via providers.price_at_date, exactly
+    as the live get_provider("ohlcv", ...) resolver would in production."""
+    result = _LivePriceExpert.export_symbol_data("AAPL", providers_resolver=_resolver)
+    assert result.error is None
+    assert result.raw["current_price"] == 42.0
+
+
+def test_export_symbol_data_respects_class_level_get_current_price_override(monkeypatch):
+    """Simulates Task 4/5's test pattern:
+    monkeypatch.setattr(SomeExpert, "_get_current_price", lambda self, symbol: ...)
+    applied BEFORE calling export_symbol_data. The bypass factory must NOT
+    clobber this with its own instance-level price-provider override -- an
+    instance attribute always wins over a class attribute in Python's lookup,
+    so binding unconditionally would silently ignore the monkeypatch
+    regardless of which "happened first" in wall-clock time."""
+    monkeypatch.setattr(_LivePriceExpert, "_get_current_price", lambda self, symbol: 99.0)
+    result = _LivePriceExpert.export_symbol_data("AAPL", providers_resolver=_resolver)
+    assert result.error is None
+    assert result.raw["current_price"] == 99.0

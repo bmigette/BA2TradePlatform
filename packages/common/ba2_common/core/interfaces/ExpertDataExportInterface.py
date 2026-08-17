@@ -16,10 +16,12 @@ so both paths agree.
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 from ba2_common.core.backtest_context import BacktestContext, LiveProviderBundle
+from ba2_common.core.interfaces.MarketExpertInterface import MarketExpertInterface
 from ba2_common.core.types import OrderRecommendation, Recommendation
 from ba2_common.logger import logger as _module_logger
 
@@ -75,16 +77,42 @@ class ExpertDataExportInterface:
                 for k, d in cls.get_merged_settings_definitions().items()}
 
     @classmethod
-    def _bypass_instance(cls, settings: Dict[str, Any]):
+    def _bypass_instance(cls, settings: Dict[str, Any], providers=None, symbol: Optional[str] = None):
         """Construct without __init__/_load_expert_instance. Sentinel id=-1
         (never a real DB row); _settings_cache pre-populated so self.settings
-        and context.settings agree (see module docstring)."""
+        and context.settings agree (see module docstring).
+
+        The base MarketExpertInterface._get_current_price(symbol) resolves the
+        price via a DB-backed ExpertInstance -> Account lookup, which the
+        sentinel id=-1 instance has no row for; its own broad except-Exception
+        silently returns None, and any expert whose live _gather branch
+        (as_of is None) calls self._get_current_price(symbol) and then
+        formats it (e.g. FMPRating's f"${current_price:.2f}") crashes with a
+        TypeError on NoneType.__format__ instead. When ``providers`` and
+        ``symbol`` are given, bind an instance-level override that resolves
+        the price via providers.price_at_date(symbol, now) instead -- no DB
+        needed.
+
+        Only bind it when NOTHING has already customized _get_current_price
+        on this class (a real subclass override, or a test's
+        monkeypatch.setattr(SomeExpert, "_get_current_price", ...) applied
+        before calling export_symbol_data): an instance attribute always wins
+        over a class attribute in Python's lookup, so binding unconditionally
+        would silently shadow that customization regardless of call order.
+        Detected via identity against the base class's own method object.
+        """
         self = cls.__new__(cls)
         self.id = -1
         self._settings_cache = dict(settings)
         self.instance = None
         cls._ensure_builtin_settings()
         self.logger = _module_logger
+        if (providers is not None and symbol is not None
+                and getattr(cls, "_get_current_price", None)
+                    is MarketExpertInterface._get_current_price):
+            def _price_override(sym, *a, **kw):
+                return providers.price_at_date(sym, datetime.now(timezone.utc))
+            self._get_current_price = _price_override
         return self
 
     @classmethod
@@ -105,11 +133,11 @@ class ExpertDataExportInterface:
         settings: Dict[str, Any] = {}
         try:
             settings = {**cls.export_default_settings(), **(overrides or {})}
-            self = cls._bypass_instance(settings)
             if providers_resolver is None:
                 from ba2_common.core.TradeConditions import _get_provider
                 providers_resolver = _get_provider
             providers = LiveProviderBundle(providers_resolver)
+            self = cls._bypass_instance(settings, providers=providers, symbol=symbol)
             context = BacktestContext(providers=providers, settings=settings,
                                       as_of=as_of, extra={"symbol": symbol})
             rec = self.analyze_as_of(as_of, context)
