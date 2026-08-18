@@ -227,6 +227,67 @@ def _sweep_orphaned_jobs() -> None:
                        len(abandoned), _JOBS_ABANDONED_AFTER, abandoned)
 
 
+# ---------------------------------------------------------------- self-throttling on memory
+# WHY THE WORKER AND NOT THE MASTER (2026-08-18). The master CAN stop feeding a starved worker
+# (it walks its dispatch slots down), but it can never RECLAIM what that worker already holds:
+# an idle pool child keeps its last working set resident (measured 4-7 GB on the mid cap band).
+# Proven live on remote150: the master shed 12 -> 11 -> ... -> 1 slots, one per minute, and the
+# box was STILL at 0.5-2.6% free of 65 GB, because 12 pool children existed and stayed resident
+# regardless of whether anything was dispatched to them. Only this process owns those children,
+# so only this process can free them.
+_MEM_FLOOR_PCT = float(os.getenv("BT_WORKER_MEM_FLOOR_PCT", "10"))
+_MEM_POLL_S = float(os.getenv("BT_WORKER_MEM_POLL_S", "60"))
+
+
+class _MemoryPressure(Exception):
+    """Reason handed to _rebuild_pool when the pool is recycled for memory, not for a crash."""
+
+
+def _free_mem_pct() -> Optional[float]:
+    """System free memory as a percentage, or None if psutil is unavailable."""
+    try:
+        import psutil
+        return 100.0 - float(psutil.virtual_memory().percent)
+    except Exception:  # noqa: BLE001 -- never let a probe failure break a trial path
+        return None
+
+
+def _busy_job_count() -> int:
+    with _JOBS_LOCK:
+        return sum(1 for f in _JOBS.values() if not f.done())
+
+
+def _memory_watchdog() -> None:
+    """Reclaim this worker's OWN pool memory when the box drops under the floor.
+
+    Rebuilding the pool is the only thing that actually returns an idle child's working set to
+    the OS, and it is safe ONLY when nothing is running -- so a busy worker is left alone and
+    reclaimed on a later poll once its trials drain. Combined with the admission check in
+    _submit_job (which stops new work landing meanwhile), a starved box empties out and recovers
+    instead of sitting pinned until someone restarts the daemon by hand.
+    """
+    import time as _time
+    while True:
+        _time.sleep(_MEM_POLL_S)
+        try:
+            free_pct = _free_mem_pct()
+            if free_pct is None or free_pct >= _MEM_FLOOR_PCT:
+                continue
+            busy = _busy_job_count()
+            if busy:
+                logger.warning(
+                    "memory %.1f%% free < %.0f%% floor, but %d trial(s) running -- NOT recycling "
+                    "the pool (that would discard live work); new submits are being refused and "
+                    "the pool is reclaimed once they drain", free_pct, _MEM_FLOOR_PCT, busy)
+                continue
+            logger.warning(
+                "memory %.1f%% free < %.0f%% floor and pool is IDLE -- recycling %d-slot pool to "
+                "return every child's working set to the OS", free_pct, _MEM_FLOOR_PCT, _CAPACITY)
+            _rebuild_pool(_MemoryPressure(f"{free_pct:.1f}% free"))
+        except Exception as e:  # noqa: BLE001 -- the watchdog must outlive any single failure
+            logger.error("memory watchdog poll failed: %r", e)
+
+
 def _submit_job(fn, *args) -> str:
     """Submit *fn(*args)* to the trial pool, register it under a fresh job_id, and return that
     id immediately (does NOT wait for the trial). A BrokenProcessPool AT SUBMIT time (the pool
@@ -237,6 +298,23 @@ def _submit_job(fn, *args) -> str:
     _sweep_orphaned_jobs()
     if _POOL is None:
         raise HTTPException(status_code=503, detail="Worker pool not initialized.")
+    # ADMISSION CONTROL. Refuse work when this box is already under the floor rather than
+    # accepting it and thrashing. `retryable` is the existing contract: the master's dispatcher
+    # REQUEUES such a trial onto another slot (see distributed_eval's retryable branch) instead
+    # of recording a failed genome, so nothing is lost and the GA is not biased.
+    _free = _free_mem_pct()
+    if _free is not None and _free < _MEM_FLOOR_PCT:
+        logger.warning("refusing trial: %.1f%% memory free < %.0f%% floor (retryable)",
+                       _free, _MEM_FLOOR_PCT)
+        job_id = uuid.uuid4().hex
+        future = Future()
+        future.set_result({"ok": False, "fatal": False, "retryable": True,
+                           "error": f"worker under memory floor ({_free:.1f}% free)"})
+        with _JOBS_LOCK:
+            _JOBS[job_id] = future
+            import time as _t
+            _JOBS_SUBMITTED_AT[job_id] = _t.monotonic()
+        return job_id
     job_id = uuid.uuid4().hex
     ctl = _new_job_ctl()
     try:
@@ -903,6 +981,11 @@ def run_worker_server(host: str, port: int, password: str, n_workers: int) -> No
     _sweep_orphaned_spawn_children()
     _POOL_FACTORY = _make_pool
     _POOL = _make_pool()
+    # Self-throttling: reclaim this worker's own pool memory when the box is starved. Daemon so
+    # it never holds up shutdown; see _memory_watchdog for why this cannot live on the master.
+    threading.Thread(target=_memory_watchdog, name="memory-watchdog", daemon=True).start()
+    logger.info("memory watchdog armed: poll %.0fs, floor %.0f%% free, %d-slot pool",
+                _MEM_POLL_S, _MEM_FLOOR_PCT, _CAPACITY)
     logger.info("worker server: %d trial slots, listening on %s:%d", _CAPACITY, host, port)
     print(f">> BA2 worker server: {_CAPACITY} slots, http://{host}:{port}  "
           f"(version {self_update.get_version_info().get('git_commit')})")
