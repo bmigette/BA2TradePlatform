@@ -67,11 +67,9 @@ By using this software, you acknowledge that you understand and accept these ris
 
 ### Core Platform
 - **Plugin Architecture**: Extensible system for trading accounts and market experts
-- **Self-contained monorepo**: two apps (`ba2-trade` live trader, `ba2-test` backtester) over three
-  shared installable packages — `ba2_common` (models, DB, interfaces, types, position sizing),
-  `ba2_providers` (market-data providers, screener, caches), `ba2_experts` (the expert
-  implementations). Both apps run the *same* expert and provider code, which is what makes a
-  backtest predictive of live behaviour rather than a separate re-implementation.
+- **Shared package split** (see the intro): `ba2_common` holds models/DB/interfaces/types/position
+  sizing, `ba2_providers` the market-data providers, screener and caches, `ba2_experts` the expert
+  implementations — so an expert is written once and runs identically live and in backtest.
 - **SQLModel ORM**: Modern database layer with SQLite backend, Alembic migrations
 - **NiceGUI Web Interface**: Clean, responsive web UI for configuration and monitoring
 - **Extensible Settings**: Flexible configuration system for all plugins
