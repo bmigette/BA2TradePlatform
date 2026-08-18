@@ -3,10 +3,18 @@
 FMPEarningsDrift's live (as_of=None) _gather only takes the market-wide
 earnings-calendar shortcut when providers.fundamentals_details() is a REAL
 FMPCompanyDetailsProvider (see the isinstance check in FMPEarningsDrift._gather
-and the module docstring's LIVE-ONLY optimization section); a fake details
-provider (as used here) always falls through to the ordinary
-past_earnings_get(...) per-symbol fetch, so these tests exercise exactly one
-deterministic code path regardless of as_of.
+and the module docstring's LIVE-ONLY optimization section); a plain fake
+details provider (as used in most tests below) always falls through to the
+ordinary past_earnings_get(...) per-symbol fetch, so those tests exercise
+exactly one deterministic code path regardless of as_of.
+test_export_symbol_data_takes_calendar_shortcut_with_real_details_provider is
+the exception: it uses a real FMPCompanyDetailsProvider subclass (mirroring
+test_earnings_drift_calendar_shortcut.py's FakeFMPDetails fixture) so the
+isinstance-gated shortcut branch fires through export_symbol_data itself, not
+just via a direct _gather(...) call -- proving analyze_as_of's
+self._gather_max_days_since_report = context.settings["max_days_since_report"]
+wiring (the one attribute this expert's export wiring introduced solely for
+that branch) actually reaches and is used by it.
 
 Like FinnHubRating (see test_finnhub_rating_export.py), FMPEarningsDrift's
 live current_price flows through self._get_current_price(symbol), which the
@@ -37,11 +45,19 @@ the as_of/lookahead reconstruction path is exercised separately in
 test_earnings_drift_gather_process.py and is not re-tested here.
 """
 from datetime import datetime, timedelta, timezone
+import importlib
 
 import pandas as pd
 import pytest
 
 from ba2_experts.FMPEarningsDrift import FMPEarningsDrift
+# ba2_experts/__init__.py does `from .FMPEarningsDrift import FMPEarningsDrift`, which shadows
+# the `ba2_experts.FMPEarningsDrift` ATTRIBUTE with the class (see
+# test_earnings_drift_calendar_shortcut.py) -- importlib.import_module bypasses that and
+# returns the actual module object, needed to monkeypatch its fmpsdk/_CALENDAR_CACHE.
+_mod = importlib.import_module("ba2_experts.FMPEarningsDrift")
+from ba2_providers.fmp_common import TTLCache
+from ba2_providers.fundamentals.details.FMPCompanyDetailsProvider import FMPCompanyDetailsProvider
 
 SETTINGS = {"surprise_min_pct": 5.0, "max_days_since_report": 10, "expected_profit_percent": 8.0}
 
@@ -70,6 +86,24 @@ class FakeDetails:
 
     def get_past_earnings(self, symbol, frequency, end_date, lookback_periods, format_type, **kw):
         return {"earnings": self._earnings}
+
+
+class FakeFMPDetails(FMPCompanyDetailsProvider):
+    """A REAL FMPCompanyDetailsProvider subclass instance (the isinstance check
+    in FMPEarningsDrift._gather must pass) so the live calendar-shortcut branch
+    is reachable at all. Mirrors test_earnings_drift_calendar_shortcut.py's
+    fixture of the same name; deliberately skips super().__init__() (which
+    reads FMP_API_KEY from the DB -- no DB in this test). get_past_earnings is
+    stubbed as the per-symbol FALLBACK fetch, with a call flag so a test can
+    prove the shortcut branch was taken directly (this method never called)
+    rather than silently falling through to it."""
+    def __init__(self):
+        self.api_key = "fake-key"
+        self.detail_fetch_called = False
+
+    def get_past_earnings(self, symbol, frequency, end_date, lookback_periods, format_type, **kw):
+        self.detail_fetch_called = True
+        return {"earnings": []}
 
 
 def _resolver(details, ohlcv):
@@ -176,3 +210,52 @@ def test_export_symbol_data_no_earnings_data_holds_with_na_rows():
     window_row = next(m for m in result.metrics if m.label == "Within drift window")
     assert window_row.value is None
     assert window_row.display == "n/a"
+
+
+def test_export_symbol_data_takes_calendar_shortcut_with_real_details_provider(monkeypatch):
+    """export_symbol_data's default as_of=None, combined with a GENUINE
+    FMPCompanyDetailsProvider instance, must reach and correctly use the live
+    calendar-shortcut branch in _gather -- not merely fall back to the
+    per-symbol detail fetch (which _gather's broad except-Exception around the
+    shortcut would silently do if analyze_as_of's
+    self._gather_max_days_since_report = context.settings["max_days_since_report"]
+    wiring were missing or misnamed, since that attribute is read ONLY inside
+    this branch and only set by analyze_as_of for the export path).
+
+    Isolated from test_earnings_drift_calendar_shortcut.py's cache state (and
+    from the other tests in this file, none of which touch it) by swapping in
+    a fresh TTLCache for the duration of this test only."""
+    monkeypatch.setattr(_mod, "_CALENDAR_CACHE", TTLCache(_mod._CALENDAR_CACHE_TTL_SECONDS))
+    report_date = (datetime.now(timezone.utc) - timedelta(days=3)).date().isoformat()
+
+    def fake_calendar(apikey, from_date, to_date):
+        return [{"symbol": "AAPL", "date": report_date, "eps": 1.2, "epsEstimated": 1.0}]
+
+    monkeypatch.setattr(_mod.fmpsdk, "earning_calendar", fake_calendar)
+
+    details = FakeFMPDetails()
+    ohlcv = FakeOHLCV()
+    result = FMPEarningsDrift.export_symbol_data(
+        "AAPL", overrides=SETTINGS, providers_resolver=_resolver(details, ohlcv))
+
+    assert result.error is None, result.error
+    # The real regression guard: proves the calendar row was consumed directly
+    # (shortcut branch) rather than the per-symbol fallback fetch silently
+    # picking up the slack with a correct-looking answer.
+    assert details.detail_fetch_called is False
+    assert result.overall_signal == "buy"
+    assert result.skipped is False
+    assert ohlcv.calls >= 1
+
+    surprise_row = next(m for m in result.metrics if m.label == "EPS surprise")
+    assert surprise_row.value == pytest.approx(20.0)
+    assert surprise_row.display == "+20.0%"
+    assert surprise_row.signal == "buy"
+
+    days_row = next(m for m in result.metrics if m.label == "Days since report")
+    assert days_row.value == 3
+    assert days_row.display == "3d ago"
+
+    window_row = next(m for m in result.metrics if m.label == "Within drift window")
+    assert window_row.value is True
+    assert window_row.display == "Yes"
