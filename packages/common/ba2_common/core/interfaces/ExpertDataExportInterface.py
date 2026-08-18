@@ -61,6 +61,14 @@ _SIGNAL_MAP = {
 }
 
 
+#: Sentinel ``self.id`` given to every bypass-constructed export instance —
+#: never a real ExpertInstance DB row. Exported so a basket-level expert's
+#: own live-only helpers (e.g. FactorRanker._gather_holdings, which otherwise
+#: instantiates a portfolio manager against this id) can detect "this is a
+#: read-only export, not a real deployed instance" without a magic literal.
+EXPORT_BYPASS_ID = -1
+
+
 class ExpertDataExportInterface:
     """Mixin: add alongside MarketExpertInterface to opt an expert class into
     SYMBOL360 (or any other read-only research tool). Requires the class to
@@ -100,10 +108,19 @@ class ExpertDataExportInterface:
         over a class attribute in Python's lookup, so binding unconditionally
         would silently shadow that customization regardless of call order.
         Detected via identity against the base class's own method object.
+
+        ``self._export_symbol`` is always stashed (independent of the
+        providers/price-override branch below) so a BASKET-level expert's
+        ``_build_export_metrics`` override can recover the symbol that was
+        requested -- it has no other way to see it, since ``rec`` and
+        ``settings`` (its only two parameters) carry no per-symbol identity
+        for an expert whose Recommendation spans a whole universe. See
+        FactorRanker._build_export_metrics for the consumer.
         """
         self = cls.__new__(cls)
-        self.id = -1
+        self.id = EXPORT_BYPASS_ID
         self._settings_cache = dict(settings)
+        self._export_symbol = symbol
         self.instance = None
         cls._ensure_builtin_settings()
         self.logger = _module_logger
