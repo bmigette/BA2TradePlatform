@@ -45,8 +45,10 @@ class Symbol360Tab:
 
     def __init__(self):
         self.symbol_input = None
+        self.search_button = None
         self.progress_container = None
         self.cards_container = None
+        self._searching = False   # server-side re-entrancy guard — see _search()
         self.render()
 
     def render(self) -> None:
@@ -58,19 +60,34 @@ class Symbol360Tab:
                 self.symbol_input = ui.input(label="Symbol", placeholder="e.g., AAPL").props(
                     "stack-label").classes("w-48")
                 self.symbol_input.on("keydown.enter", lambda: self._search())
-                ui.button("Search", on_click=self._search, icon="search").props("color=primary")
+                self.search_button = ui.button("Search", on_click=self._search, icon="search").props(
+                    "color=primary")
 
         self.progress_container = ui.column().classes("w-full gap-1 mb-4")
         self.cards_container = ui.column().classes("w-full gap-4")
 
     def _search(self) -> None:
+        # Server-side re-entrancy guard: checked/set synchronously here (before the async task
+        # even starts) rather than relying solely on the input/button's disabled prop, since
+        # that round-trips to the browser and a fast double-click/Enter could otherwise slip a
+        # second search in before the first one's disable() takes visible effect.
+        if self._searching:
+            ui.notify("A search is already in progress", type="warning")
+            return
         symbol = (self.symbol_input.value or "").strip().upper()
         if not symbol:
             ui.notify("Enter a symbol", type="warning")
             return
+        self._searching = True
         asyncio.create_task(self._async_search(symbol))
 
     async def _async_search(self, symbol: str) -> None:
+        # UI-visible half of the re-entrancy guard: disable input+button for the duration so a
+        # second search can't start (and tear down the containers) while this one's concurrent
+        # fetches are still in flight. Re-enabled in `finally` so a failed search doesn't
+        # permanently lock the UI.
+        self.symbol_input.disable()
+        self.search_button.disable()
         try:
             self.progress_container.clear()
             self.cards_container.clear()
@@ -88,28 +105,40 @@ class Symbol360Tab:
                 nonlocal done
                 try:
                     result = await asyncio.to_thread(fetch_fn, symbol)
-                    results[key] = result
-                    status_labels[key].text = f"✅ {title}"
                 except Exception as e:
                     logger.error(f"Symbol360: card '{key}' failed for {symbol}: {e}", exc_info=True)
-                    results[key] = None
-                    status_labels[key].text = f"❌ {title} (error)"
-                finally:
-                    done += 1
-                    overall.value = done / len(cards)
+                    result = None
+                    status_text = f"❌ {title} (error)"
+                else:
+                    status_text = f"✅ {title}"
+                results[key] = result
+                status_labels[key].text = status_text  # let a disconnect RuntimeError propagate below
+                done += 1
+                overall.value = done / len(cards)
 
             await asyncio.gather(*(_run(key, title, fn) for key, title, fn in cards))
             self._render_cards(symbol, results)
 
         except RuntimeError as e:
-            # Handle client disconnection gracefully (user closed the tab/page mid-search)
-            if "client" in str(e).lower() and "deleted" in str(e).lower():
-                logger.debug("[Symbol360Tab] Client disconnected during search")
+            # Handle client disconnection gracefully (user closed the tab/page, or a newer
+            # search tore down these containers mid-flight). NiceGUI raises RuntimeError with
+            # "client...deleted" when the client itself disconnected, or "parent slot...deleted"
+            # when just this element's container was cleared (e.g. by an overlapping search) —
+            # both are a harmless "nothing left to update", not a real fetch failure.
+            if "deleted" in str(e).lower():
+                logger.debug(f"[Symbol360Tab] UI no longer available during search for {symbol}: {e}")
             else:
                 logger.error(f"Error in Symbol360 search: {e}", exc_info=True)
         except Exception as e:
             logger.error(f"Error in Symbol360 search: {e}", exc_info=True)
             ui.notify(f"Error searching {symbol}: {str(e)}", type="negative")
+        finally:
+            self._searching = False
+            try:
+                self.symbol_input.enable()
+                self.search_button.enable()
+            except RuntimeError as e:
+                logger.debug(f"[Symbol360Tab] Could not re-enable input (client gone): {e}")
 
     def _card_specs(self, symbol: str) -> List[Tuple[str, str, Callable[[str], Any]]]:
         raise NotImplementedError("filled in by Task 12")
