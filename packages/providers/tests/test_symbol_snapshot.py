@@ -1,9 +1,10 @@
 """Tests for ba2_providers.symbol_snapshot (SYMBOL360 direct-fetch helpers).
 
 All FMP access is monkeypatched — no live key / network required. Follows
-this package's convention (see test_screener_metric_store.py /
-test_hermetic_miss_policy.py) of patching the callee attribute directly on
-the module object under test: ``monkeypatch.setattr(S.fmpsdk, "quote", ...)``.
+this repo's convention (see packages/experts/tests/test_earnings_drift_export.py
+and tests/test_fmp_company_details.py) of patching the callee attribute
+directly on the module object under test:
+``monkeypatch.setattr(S.fmpsdk, "quote", ...)``.
 """
 import ba2_providers.symbol_snapshot as S
 
