@@ -221,3 +221,63 @@ def test_local_origin_and_missing_origin_both_reach_the_local_governor():
         else:
             gov.assess(_pressure(8.0))
         assert gov.current == 3
+
+
+# ------------------------------------------------- remote emergency must actually shed slots
+
+class _FakeEvaluator:
+    """Minimal stand-in exercising DistributedEvaluator.assess_remote's verdict handling."""
+
+    def __init__(self, gov):
+        import threading
+        self._remote_govs = {"remote150": gov}
+        self._remote_gov_lock = threading.Lock()
+        self.logged = []
+
+    def log(self, m):
+        self.logged.append(m)
+
+    # bound method under test, taken from the real class
+    from app.services.distributed_eval import DistributedEvaluator as _DE
+    assess_remote = _DE.assess_remote
+
+
+def test_remote_emergency_halves_the_workers_slots():
+    """THE 2026-08-18 REGRESSION. remote150 hit 85 MB free of 65 GB on the mid band and the
+    emergency shed NOTHING: assess() only returns a verdict and assess_remote discarded it, while
+    the log claimed a pool-break that cannot happen on a remote box."""
+    gov = MemoryGovernor(12, log=lambda *_: None)
+    ev = _FakeEvaluator(gov)
+    ev.assess_remote("remote150", _pressure(0.1))
+    assert gov.current == 6, "12 slots must halve on an emergency, not stay put"
+    assert any("6" in m for m in ev.logged)
+
+
+def test_remote_emergency_never_parks_the_last_slot():
+    gov = MemoryGovernor(1, log=lambda *_: None)
+    ev = _FakeEvaluator(gov)
+    for _ in range(5):
+        ev.assess_remote("remote150", _pressure(0.1))
+    assert gov.current == 1, "a worker must never be throttled out of existence"
+
+
+def test_remote_throttle_still_sheds_one_slot():
+    gov = MemoryGovernor(12, log=lambda *_: None)
+    ev = _FakeEvaluator(gov)
+    ev.assess_remote("remote150", _pressure(8.0))   # <10% = release, not emergency
+    assert gov.current == 11
+
+
+def test_remote_ok_reading_changes_nothing():
+    gov = MemoryGovernor(12, log=lambda *_: None)
+    ev = _FakeEvaluator(gov)
+    ev.assess_remote("remote150", _pressure(80.0))
+    assert gov.current == 12
+
+
+def test_emergency_note_is_owner_specific():
+    """The local governor breaks its pool; a remote one cannot. The message must not claim it does."""
+    local = MemoryGovernor(4, log=lambda *_: None)
+    assert "breaking the pool" in local.emergency_note
+    remote = MemoryGovernor(12, log=lambda *_: None, emergency_note="HALVING this worker's slots")
+    assert "breaking the pool" not in remote.emergency_note

@@ -398,12 +398,19 @@ class MemoryGovernor:
     indistinguishable from the box being slow.
     """
 
-    def __init__(self, full_parallel: int, log=logger.warning):
+    def __init__(self, full_parallel: int, log=logger.warning, emergency_note: str = None):
         self.full = max(1, int(full_parallel))
         self.current = self.full
         self.log = log
         self._releases = 0
         self._emergencies = 0
+        # What an emergency actually DOES on the box this governor owns. The local owner breaks
+        # its process pool; a REMOTE owner cannot -- it can only stop feeding that worker. Saying
+        # "breaking the pool" on the remote path was a lie in the log: assess() only ever returned
+        # a verdict, and assess_remote discarded it, so a remote emergency shed nothing at all.
+        self.emergency_note = emergency_note or (
+            "breaking the pool to reclaim ALL worker memory; the in-flight individual is "
+            "REQUEUED, not lost")
 
     def restore(self, why: str = "new job") -> None:
         if self.current != self.full:
@@ -422,8 +429,7 @@ class MemoryGovernor:
             self._emergencies += 1
             self.log(
                 f"memory governor EMERGENCY: {pct}% free ({sys_mem.get('free_mb')} MB of "
-                f"{sys_mem.get('total_mb')} MB) < {_MEM_EMERGENCY_PCT}% -- breaking the pool to "
-                f"reclaim ALL worker memory; the in-flight individual is REQUEUED, not lost "
+                f"{sys_mem.get('total_mb')} MB) < {_MEM_EMERGENCY_PCT}% -- {self.emergency_note} "
                 f"(emergency #{self._emergencies})")
             return "emergency"
         if pct < _MEM_THROTTLE_PCT:

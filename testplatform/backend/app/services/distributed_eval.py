@@ -257,7 +257,9 @@ class DistributedEvaluator:
         # Arm (or re-arm, on re-admission at a NEW capacity) this worker's own governor.
         with self._remote_gov_lock:
             self._remote_govs[w["name"]] = MemoryGovernor(
-                cap, log=lambda m, n=w["name"]: self.log(f"[{n}] {m}"))
+                cap, log=lambda m, n=w["name"]: self.log(f"[{n}] {m}"),
+                emergency_note="HALVING this worker's dispatch slots (the master cannot break a "
+                               "remote pool; it can only stop feeding it)")
         for i in range(cap):
             self._spawn(lambda w=w, i=i: self._dispatch_remote(w, i), f"remote-{w['name']}-{i}")
         return cap
@@ -274,8 +276,22 @@ class DistributedEvaluator:
         try:
             with self._remote_gov_lock:
                 gov = self._remote_govs.get(worker_name)
-            if gov is not None:
-                gov.assess(mem)
+            if gov is None:
+                return
+            verdict = gov.assess(mem)
+            # ACT on the verdict. 'release' already decremented gov.current inside assess(), which
+            # the dispatchers observe before their next claim. 'emergency' does NOT touch current
+            # -- that branch was written for the LOCAL owner, which responds by breaking its
+            # process pool. A remote owner cannot do that, so before this it shed NOTHING: on
+            # 2026-08-18 remote150 fell to 85 MB free of 65 GB on the mid band (765 screened
+            # symbols vs ~105 on large) and the emergency logged a pool-break that never happened.
+            # One slot at a time is far too slow at 0.1% free, so halve outright.
+            if verdict == "emergency":
+                before = gov.current
+                gov.current = max(1, gov.current // 2)
+                if gov.current != before:
+                    self.log(f"[{worker_name}] dispatch slots {before} -> {gov.current} "
+                             f"(emergency shed); parked dispatchers resume at the next job")
         except Exception as e:  # noqa: BLE001 -- governing must never fail a healthy trial
             self.log(f"remote governor assess failed for {worker_name}: {e!r}")
 
