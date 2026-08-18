@@ -192,20 +192,41 @@ DS_PARALLEL="${DS_PARALLEL:-4}"      # light expert (~2.5 GB/trial), unlike Sena
 # MEASURED medians (Alpaca SIP historical quotes, 2026-08-17) -- small was 40, i.e. 2.4x too harsh.
 ds_spread_for() { case "$1" in large) echo 3 ;; mid) echo 9 ;; small) echo 17 ;; *) echo 0 ;; esac; }
 
-for MODE in risk_atr notional; do
-  for band in large mid small; do
-    sp="$(ds_spread_for "$band")"
-    st=$(awk -v s="$sp" -v m="$STRESS_SPREAD_MULT" 'BEGIN{printf "%.6g", s*m}')
-    ds_stress=()
-    awk -v v="$st" 'BEGIN{exit !(v>0)}' && ds_stress=(--stress-spread-bps "$st")
-    echo
-    echo "=== PHASE B  DeterministicScorer / $MODE / $band  (spread ${sp}, stress +${st})  $(date)"
-    "$PY" "$DRIVER"       --start 2020-01-01 --end 2025-12-31       --fitness consistent_annual_return       --store "$STORE"       --sizing-mode "$MODE" --bands "$band"       --spread-bps "$sp" "${ds_stress[@]}" "${robust_args[@]}"       --parallel "$DS_PARALLEL"       --name-suffix="-goal2020-${MODE}-ds"       --skip-experts FMPRating,FMPEarningsDrift,FMPInsiderClusterBuy,FactorRanker       "${WORKER_ARGS[@]}"
-    rc=$?
-    echo "=== PHASE B  $MODE / $band  done rc=$rc $(date)"
-    [ $rc -ne 0 ] && rc_any=$rc
+# PHASE B runs TWICE, mirroring tools/grid_goal2020.sh. The S1/S2/S3 answer lands FIRST so the
+# primary result is available early; S5/S6/S7 then run as a purely additive second pass.
+#
+# WHY S5/S6/S7 ARE HERE AT ALL (added 2026-08-18): they were never in this driver's default
+# (git: only ever S1,S2,S3,S4 -> S1,S2,S3) because the cap-band driver predates them -- they
+# were added later as data-driven refinements and only ever wired into the Senate loop and
+# grid_goal2020.sh. grid_goal2020.sh then SKIPS DeterministicScorer (DS_SKIP) because matrix 3
+# owns it -- so DS was the one expert getting no S5/S6/S7 pass anywhere. Nothing technical
+# prevented it: every S-strategy is expert-agnostic (see _build_strategy), and the only
+# expert-specific step, _clamp_confidence_genes, already knows DeterministicScorer.
+ds_matrix() {                        # $@ = extra driver args (e.g. --strategies S5,S6,S7)
+  for MODE in risk_atr notional; do
+    for band in large mid small; do
+      sp="$(ds_spread_for "$band")"
+      st=$(awk -v s="$sp" -v m="$STRESS_SPREAD_MULT" 'BEGIN{printf "%.6g", s*m}')
+      ds_stress=()
+      awk -v v="$st" 'BEGIN{exit !(v>0)}' && ds_stress=(--stress-spread-bps "$st")
+      echo
+      echo "=== PHASE B  DeterministicScorer / $MODE / $band  (spread ${sp}, stress +${st}) $*  $(date)"
+      "$PY" "$DRIVER"       --start 2020-01-01 --end 2025-12-31       --fitness consistent_annual_return       --store "$STORE"       --sizing-mode "$MODE" --bands "$band"       --spread-bps "$sp" "${ds_stress[@]}" "${robust_args[@]}"       --parallel "$DS_PARALLEL"       --name-suffix="-goal2020-${MODE}-ds"       --skip-experts FMPRating,FMPEarningsDrift,FMPInsiderClusterBuy,FactorRanker       "${WORKER_ARGS[@]}" "$@"
+      rc=$?
+      echo "=== PHASE B  $MODE / $band  done rc=$rc $(date)"
+      [ $rc -ne 0 ] && rc_any=$rc
+    done
   done
-done
+}
+
+ds_matrix
+
+# Set DS_STRATEGIES_EXTRA= to skip the additive pass.
+DS_STRATEGIES_EXTRA="${DS_STRATEGIES_EXTRA-S5,S6,S7}"
+if [ -n "$DS_STRATEGIES_EXTRA" ]; then
+  echo; echo "=== PHASE B EXTRA  DeterministicScorer strategies=$DS_STRATEGIES_EXTRA  $(date)"
+  ds_matrix --strategies "$DS_STRATEGIES_EXTRA"
+fi
 
 
 for MODE in risk_atr notional; do
