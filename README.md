@@ -1,6 +1,11 @@
 # BA2 Trade Platform
 
-A sophisticated Python-based algorithmic trading platform featuring AI-driven market analysis, multi-agent trading strategies, and a comprehensive plugin architecture for accounts and market experts.
+A self-contained Python monorepo for algorithmic trading, shipping **two platforms** over three shared installable packages (`ba2_common` / `ba2_providers` / `ba2_experts`):
+
+- **ba2-trade** (repo root) — the live trader: NiceGUI web app running the expert fleet against a real/paper broker (Alpaca, TastyTrade, IBKR), with ruleset-driven trade actions (equity **and** options), risk management, order execution and performance analytics.
+- **ba2-test** (`testplatform/`, aka **BA2ML**) — the backtest & ML platform: FastAPI + React app for dataset building, genetic-algorithm strategy optimization, deep-learning forecasting (12 PyTorch architectures) and point-in-time screening.
+
+Both apps run the *same* expert/provider code, which is what makes a backtest predictive of live behaviour.
 
 ## � Screenshots
 
@@ -120,6 +125,7 @@ By using this software, you acknowledge that you understand and accept these ris
 - **Virtual Account Splitting**: Allocate portions of your account to different experts to limit exposure
 - **Risk-Based Position Sizing**: Dynamic position sizing based on expert confidence and risk assessment
 - **Expert Performance Tracking**: Monitor and compare performance across different expert strategies
+- **Options Strategies**: equity actions plus an entry-option path (rulesets can fire an option action with no equity leg) — long calls/puts, covered calls, credit/debit spreads, short straddle/strangle, iron condor, jade lizard, call butterfly, put ratio spread; GA-optimizable (`option_wing_width` gene + per-strategy grids), validated against real Alpaca options cache data
 
 ### Account Providers
 - **Alpaca**: Paper and live trading, equities + options (the primary, most exercised broker)
@@ -146,6 +152,16 @@ The platform includes multiple AI trading experts with different strategies and 
 | **PremiumSeller** | Systematic short-premium options income | Alpaca/ThetaData option chains, FMP ratings | Defined-risk put credit spreads (naked puts / strangles behind stricter rails), IVR & IV-HV entry gates, profit-capture / tested-delta / roll-DTE exits, bypasses classic RM |
 
 📖 **For detailed documentation on all experts, their settings, and configuration options, see [EXPERTS.md](EXPERTS.md)** — and the dedicated [FactorRanker guide](docs/FACTORRANKER_EXPERT.md).
+
+## 🧱 Tech Stack
+
+- **Python 3.11+**, SQLModel/SQLAlchemy ORM on SQLite (Alembic migrations)
+- **ba2-trade UI**: NiceGUI (dashboard, analysis, recommendations, rulesets, settings)
+- **ba2-test**: FastAPI + Uvicorn backend; React 19 + TypeScript + Vite + Tailwind CSS frontend (lightweight-charts, recharts)
+- **ML**: PyTorch — 12 forecasting architectures (LSTM, GRU, TCN, InceptionTime, ResNet, XceptionTime, OmniScale CNN, MiniRocket, PatchTST, TST, LSTM-FCN, N-BEATS), GA-tuned
+- **Optimization**: DEAP genetic algorithms (strategy rails S1–S7, distributed workers, robustness-adjusted fitness)
+- **Data providers**: Alpaca (prices/options), FMP (fundamentals, earnings, insider, Senate/House, screener), Finnhub, FRED (point-in-time macro), Yahoo Finance, ThetaData (option chains)
+- **Shared state**: `BA2_HOME` cache tree (parquet OHLCV, options history, screener metric store) + shared app-settings/API-keys DB read by both platforms
 
 ## 📋 Requirements
 
