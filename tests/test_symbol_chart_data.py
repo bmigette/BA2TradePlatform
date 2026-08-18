@@ -167,6 +167,25 @@ def test_malformed_indicator_result_is_skipped():
     assert "Rsi" in indicators_data
 
 
+def test_indicator_mismatched_dates_values_length_is_skipped_not_propagated():
+    # A response that PASSES the "dates"/"values" key check but has
+    # mismatched lengths used to blow up pd.DataFrame construction OUTSIDE
+    # the try/except -- discarding price_data along with it. That
+    # DataFrame(...)/to_datetime(...) call must now be inside the same
+    # failure-isolation unit as the fetch itself.
+    ohlcv = FakeOhlcvProvider(_make_ohlcv_df())
+    calc = FakeIndicatorCalc(results={
+        "close_200_sma": {"dates": [f"2026-01-0{i+1}" for i in range(5)],
+                          "values": [1.0, 2.0, 3.0]},  # 5 dates, 3 values
+    })
+
+    price_data, indicators_data = build_chart_data("AAPL", ohlcv, calc)
+
+    assert price_data is not None and not price_data.empty
+    assert "Close 200 Sma" not in indicators_data
+    assert "Rsi" in indicators_data
+
+
 def test_price_data_with_date_column_and_naive_index_is_localized_to_utc():
     df = _make_ohlcv_df()  # has "Date" column, RangeIndex (not DatetimeIndex)
     ohlcv = FakeOhlcvProvider(df)

@@ -57,23 +57,36 @@ def build_chart_data(symbol: str, ohlcv_provider, indicator_calc,
 
     indicators_data: Dict[str, pd.DataFrame] = {}
     for indicator in DEFAULT_INDICATORS:
+        # The whole per-indicator step -- fetch, shape validation, AND date
+        # parsing/DataFrame construction -- is one failure-isolation unit.
+        # An earlier version only wrapped the get_indicator() call itself,
+        # so a response that passed the "dates"/"values" key check but had
+        # mismatched lengths (or otherwise unparseable dates) raised past
+        # this loop uncaught, discarding the already-fetched price_data
+        # along with it -- exactly the "one bad overlay blocks the whole
+        # chart" failure this loop exists to prevent.
         try:
             result = indicator_calc.get_indicator(
                 symbol=symbol, indicator=indicator,
                 start_date=start_date, end_date=end_date,
                 interval=interval, format_type="dict")
+            if not isinstance(result, dict) or "dates" not in result or "values" not in result:
+                logger.warning(f"Indicator '{indicator}' for {symbol} returned an unexpected "
+                                f"shape, skipping: {type(result).__name__}")
+                continue
+            if len(result["dates"]) != len(result["values"]):
+                logger.warning(f"Indicator '{indicator}' for {symbol} returned mismatched "
+                                f"dates/values lengths ({len(result['dates'])} vs "
+                                f"{len(result['values'])}), skipping")
+                continue
+            dates = pd.to_datetime(result["dates"])
+            name = indicator.replace("_", " ").title()
+            df = pd.DataFrame({name: result["values"]}, index=dates)
+            df.index.name = "Date"
+            if df.index.tz is None:
+                df.index = df.index.tz_localize("UTC")
+            indicators_data[name] = df
         except Exception as e:
-            logger.warning(f"Skipping indicator '{indicator}' for {symbol}: {e}")
+            logger.warning(f"Skipping indicator '{indicator}' for {symbol}: {e}", exc_info=True)
             continue
-        if not isinstance(result, dict) or "dates" not in result or "values" not in result:
-            logger.warning(f"Indicator '{indicator}' for {symbol} returned an unexpected "
-                            f"shape, skipping: {type(result).__name__}")
-            continue
-        dates = pd.to_datetime(result["dates"])
-        name = indicator.replace("_", " ").title()
-        df = pd.DataFrame({name: result["values"]}, index=dates)
-        df.index.name = "Date"
-        if df.index.tz is None:
-            df.index = df.index.tz_localize("UTC")
-        indicators_data[name] = df
     return price_data, indicators_data
