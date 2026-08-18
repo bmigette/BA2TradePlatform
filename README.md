@@ -62,10 +62,32 @@ By using this software, you acknowledge that you understand and accept these ris
 
 ### Core Platform
 - **Plugin Architecture**: Extensible system for trading accounts and market experts
-- **SQLModel ORM**: Modern database layer with SQLite backend
+- **Self-contained monorepo**: two apps (`ba2-trade` live trader, `ba2-test` backtester) over three
+  shared installable packages — `ba2_common` (models, DB, interfaces, types, position sizing),
+  `ba2_providers` (market-data providers, screener, caches), `ba2_experts` (the expert
+  implementations). Both apps run the *same* expert and provider code, which is what makes a
+  backtest predictive of live behaviour rather than a separate re-implementation.
+- **SQLModel ORM**: Modern database layer with SQLite backend, Alembic migrations
 - **NiceGUI Web Interface**: Clean, responsive web UI for configuration and monitoring
 - **Extensible Settings**: Flexible configuration system for all plugins
 - **Centralized Logging**: Comprehensive logging with file rotation and colored output
+
+### Backtesting & Strategy Optimization (`ba2-test`)
+- **Event-driven backtest engine**: daily and 5-minute bars, point-in-time data only, hermetic runs
+  (never fetches mid-run) so results are reproducible
+- **Genetic optimization (DEAP)**: searches entry/exit rulesets, expert settings and risk-manager
+  parameters together; per-generation checkpoints mean an interrupted multi-day run resumes rather
+  than restarts
+- **Distributed evaluation**: master + local process pool + version-matched remote workers, with a
+  per-box memory governor that sheds concurrency instead of OOMing
+- **Robustness-adjusted fitness**: a genome's raw score is discounted by concentration (does the
+  book survive without its top trades?), Monte Carlo resampling, and a bid-ask spread stress test —
+  both the raw and adjusted values are stored so a discounted result is explainable
+- **Realistic cost modelling**: per-fill commission and measured per-cap-band bid-ask spreads
+  (Alpaca SIP quotes), with an optional widening stress applied on top
+- **Screener metric store**: precomputed cap-band/factor metrics so a genome's universe is
+  selected point-in-time, per day, without re-scanning the market
+
 
 ### AI Trading Agents
 - **Multiple Expert Support**: Extensible plugin architecture supporting multiple expert types ([see EXPERTS.md](EXPERTS.md) for complete list)
@@ -100,8 +122,10 @@ By using this software, you acknowledge that you understand and accept these ris
 - **Expert Performance Tracking**: Monitor and compare performance across different expert strategies
 
 ### Account Providers
-- **Alpaca Integration**: Paper and live trading support
-- **Extensible Architecture**: Easy addition of new brokers via AccountInterface
+- **Alpaca**: Paper and live trading, equities + options (the primary, most exercised broker)
+- **TastyTrade**: Options-oriented broker integration
+- **Interactive Brokers (IBKR)**: Broker integration
+- **Extensible Architecture**: Easy addition of new brokers via `AccountInterface`
 
 ## 🤖 Available Trading Experts
 
@@ -114,8 +138,12 @@ The platform includes multiple AI trading experts with different strategies and 
 | **FMPRating** | Price target analyzer | FMP analyst data | Profit potential calculation |
 | **FMPSenateTraderWeight** | Government trading tracker (sophisticated) | FMP Senate/House data | Portfolio allocation analysis |
 | **FMPSenateTraderCopy** | Government trading tracker (simple copy) | FMP Senate/House data | 100% confidence copy trading, can recommend instruments |
+| **FMPInsiderClusterBuy** | Insider cluster-buy detector — BUY when several insiders bought recently | FMP insider transactions | Cluster/recency windows, min distinct insiders (no large-cap data: small/mid only) |
+| **FMPEarningsDrift** | Post-earnings-announcement drift — BUY fresh EPS beats, time-boxed hold | FMP earnings surprises | Surprise threshold, freshness window, forced time exit (small/mid only) |
 | **PennyMomentumTrader** | Live intraday penny-stock momentum trader | Market data, screener, social/news catalysts | Self-executing live expert, screener universe, staged exits |
 | **FactorRanker** | Cross-sectional multi-factor equity ranker | FMP fundamentals & prices, StockScreener | momentum / value / quality / PEAD factors, static or screener universe, self-rebalancing top-N (no recommendations) |
+| **DeterministicScorer** | LLM-free multi-section scorer — reproduces a TradingAgents-style verdict with pure local math, zero LLM calls | FMP/FinnHub fundamentals, prices, ratings, FRED macro | Technical + fundamental + analyst + macro sections, `tanh`-bounded composite score, Altman-Z hard veto, fully deterministic and free to run |
+| **PremiumSeller** | Systematic short-premium options income | Alpaca/ThetaData option chains, FMP ratings | Defined-risk put credit spreads (naked puts / strangles behind stricter rails), IVR & IV-HV entry gates, profit-capture / tested-delta / roll-DTE exits, bypasses classic RM |
 
 📖 **For detailed documentation on all experts, their settings, and configuration options, see [EXPERTS.md](EXPERTS.md)** — and the dedicated [FactorRanker guide](docs/FACTORRANKER_EXPERT.md).
 
