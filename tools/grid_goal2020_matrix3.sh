@@ -192,6 +192,20 @@ DS_PARALLEL="${DS_PARALLEL:-4}"      # light expert (~2.5 GB/trial), unlike Sena
 # MEASURED medians (Alpaca SIP historical quotes, 2026-08-17) -- small was 40, i.e. 2.4x too harsh.
 ds_spread_for() { case "$1" in large) echo 3 ;; mid) echo 9 ;; small) echo 17 ;; *) echo 0 ;; esac; }
 
+# REMOTE DISPATCH SLOTS PER BAND (2026-08-18). remote150's daemon runs --workers 12; the master
+# caps how many it ENGAGES per job via BA2_MAX_REMOTE_SLOTS, applied as the TIGHTEST of (env,
+# the expert's own max_remote_worker_slots) so this can only ever reduce concurrency.
+#
+# Sized on MEASURED per-trial footprint, which is a property of the BAND, not the expert:
+#   large  ~105 screened symbols, ~2.5-3.5 GB/trial  -> 12 ran fine for three jobs
+#   mid    ~765 screened symbols, ~6 GB/trial        -> 12 starved a 65 GB box
+# On the mid band the master shed 12 -> 11 -> ... -> 1 (one slot per minute, as designed) and
+# remote150 was STILL at 0.5-2.6% free, because the daemon's 12 pool children stay resident with
+# their last working set whether or not anything is dispatched to them. Capping ENGAGEMENT keeps
+# the box out of that hole in the first place; the worker's own watchdog (9464b38) reclaims what
+# it already holds.
+ds_remote_slots_for() { case "$1" in large) echo 12 ;; *) echo 6 ;; esac; }
+
 # PHASE B runs TWICE, mirroring tools/grid_goal2020.sh. The S1/S2/S3 answer lands FIRST so the
 # primary result is available early; S5/S6/S7 then run as a purely additive second pass.
 #
@@ -210,7 +224,8 @@ ds_matrix() {                        # $@ = extra driver args (e.g. --strategies
       ds_stress=()
       awk -v v="$st" 'BEGIN{exit !(v>0)}' && ds_stress=(--stress-spread-bps "$st")
       echo
-      echo "=== PHASE B  DeterministicScorer / $MODE / $band  (spread ${sp}, stress +${st}) $*  $(date)"
+      export BA2_MAX_REMOTE_SLOTS="$(ds_remote_slots_for "$band")"
+      echo "=== PHASE B  DeterministicScorer / $MODE / $band  (spread ${sp}, stress +${st}, remote slots ${BA2_MAX_REMOTE_SLOTS}) $*  $(date)"
       "$PY" "$DRIVER"       --start 2020-01-01 --end 2025-12-31       --fitness consistent_annual_return       --store "$STORE"       --sizing-mode "$MODE" --bands "$band"       --spread-bps "$sp" "${ds_stress[@]}" "${robust_args[@]}"       --parallel "$DS_PARALLEL"       --name-suffix="-goal2020-${MODE}-ds"       --skip-experts FMPRating,FMPEarningsDrift,FMPInsiderClusterBuy,FactorRanker       "${WORKER_ARGS[@]}" "$@"
       rc=$?
       echo "=== PHASE B  $MODE / $band  done rc=$rc $(date)"
