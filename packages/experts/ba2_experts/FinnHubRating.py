@@ -1,5 +1,6 @@
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
+from functools import cached_property
 import json
 import requests
 
@@ -80,14 +81,21 @@ class FinnHubRating(ExpertDataExportInterface, AnalysisStatusRenderMixin, Market
     def __init__(self, id: int):
         """Initialize FinnHubRating expert with database instance."""
         super().__init__(id)
-        
+
         self._load_expert_instance(id)
-        # Initialize the expert logger BEFORE _get_finnhub_api_key(): that helper logs a warning
-        # via self.logger when the key is absent, so the logger must exist first or the (common in
-        # backtests) no-key path raises AttributeError.
+        # Initialize the expert logger BEFORE first access to the cached
+        # `_api_key` property: `_get_finnhub_api_key` logs a warning via
+        # self.logger when the key is absent, so the logger must exist first
+        # or the (common in backtests) no-key path raises AttributeError.
         self.logger = get_expert_logger("FinnHubRating", id)
-        self._api_key = self._get_finnhub_api_key()
-    
+
+    @cached_property
+    def _api_key(self) -> Optional[str]:
+        """Lazily resolved + cached (not eagerly set in __init__) so a
+        bypass-constructed export instance (ExpertDataExportInterface,
+        which never runs __init__) still resolves a real key on first use."""
+        return self._get_finnhub_api_key()
+
     def _get_finnhub_api_key(self) -> Optional[str]:
         """Get Finnhub API key from app settings."""
         api_key = get_setting('finnhub_api_key')

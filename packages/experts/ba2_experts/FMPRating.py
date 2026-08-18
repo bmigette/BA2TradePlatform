@@ -1,5 +1,6 @@
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
+from functools import cached_property
 import json
 import logging
 import requests
@@ -170,13 +171,19 @@ class FMPRating(ExpertDataExportInterface, AnalysisStatusRenderMixin, FMPApiKeyM
     def __init__(self, id: int):
         """Initialize FMPRating expert with database instance."""
         super().__init__(id)
-        
+
         self._load_expert_instance(id)
-        self._api_key = self._get_fmp_api_key()
-        
+
         # Initialize expert-specific logger
         self.logger = get_expert_logger("FMPRating", id)
-    
+
+    @cached_property
+    def _api_key(self) -> Optional[str]:
+        """Lazily resolved + cached (not eagerly set in __init__) so a
+        bypass-constructed export instance (ExpertDataExportInterface,
+        which never runs __init__) still resolves a real key on first use."""
+        return self._get_fmp_api_key()
+
     @classmethod
     def get_settings_definitions(cls) -> Dict[str, Any]:
         """Define configurable settings for FMPRating expert."""
