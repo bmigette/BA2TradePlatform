@@ -237,20 +237,28 @@ class _FakeEvaluator:
     def log(self, m):
         self.logged.append(m)
 
-    # bound method under test, taken from the real class
+    # bound methods under test, taken from the real class. _shed_remote_slot MUST be borrowed
+    # too: assess_remote calls it, and its except-Exception would otherwise swallow the
+    # AttributeError and report a silent no-op as success.
     from app.services.distributed_eval import DistributedEvaluator as _DE
     assess_remote = _DE.assess_remote
+    _shed_remote_slot = _DE._shed_remote_slot
 
 
-def test_remote_emergency_halves_the_workers_slots():
+def test_remote_emergency_sheds_exactly_one_slot():
     """THE 2026-08-18 REGRESSION. remote150 hit 85 MB free of 65 GB on the mid band and the
     emergency shed NOTHING: assess() only returns a verdict and assess_remote discarded it, while
-    the log claimed a pool-break that cannot happen on a remote box."""
+    the log claimed a pool-break that cannot happen on a remote box.
+
+    ONE slot, not half: halving overshoots (a box marginally over the line loses half its
+    throughput) and cannot converge. The watchdog re-polls a minute later and steps again if the
+    box is still under the floor, so concurrency walks down to what the band affords and stops."""
     gov = MemoryGovernor(12, log=lambda *_: None)
     ev = _FakeEvaluator(gov)
     ev.assess_remote("remote150", _pressure(0.1))
-    assert gov.current == 6, "12 slots must halve on an emergency, not stay put"
-    assert any("6" in m for m in ev.logged)
+    assert gov.current == 11
+    ev.assess_remote("remote150", _pressure(0.1))
+    assert gov.current == 10, "repeated pressure keeps stepping down one at a time"
 
 
 def test_remote_emergency_never_parks_the_last_slot():
@@ -281,3 +289,14 @@ def test_emergency_note_is_owner_specific():
     assert "breaking the pool" in local.emergency_note
     remote = MemoryGovernor(12, log=lambda *_: None, emergency_note="HALVING this worker's slots")
     assert "breaking the pool" not in remote.emergency_note
+
+
+def test_assess_remote_surfaces_a_broken_shed_instead_of_silently_passing():
+    """The except-Exception in assess_remote must not turn a real defect into a silent no-op --
+    which is exactly how the original bug survived: it logged success and shed nothing."""
+    gov = MemoryGovernor(12, log=lambda *_: None)
+    ev = _FakeEvaluator(gov)
+    ev._shed_remote_slot = None          # simulate the method going missing
+    ev.assess_remote("remote150", _pressure(0.1))
+    assert gov.current == 12, "nothing shed"
+    assert any("assess failed" in m for m in ev.logged), "the failure must be LOGGED, not swallowed"

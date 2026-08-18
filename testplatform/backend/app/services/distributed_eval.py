@@ -28,6 +28,7 @@ keeps the plain local-pool path (byte-identical to before).
 from __future__ import annotations
 
 import logging
+import os as _os
 import threading
 from typing import Any, Callable, Iterator, List, Optional, Tuple
 
@@ -41,6 +42,16 @@ Job = Tuple[int, dict, str, dict]
 
 # A dispatcher gives up on a worker after this many consecutive run_trial failures (dead box).
 _MAX_WORKER_FAILURES = 3
+
+# How often the master polls each remote worker's /health memory block, and the free-memory
+# floor it sheds slots to stay above. Polling on a TIMER rather than per completed trial is
+# the point: a trial-completion snapshot is the only reading the master used to get, and on
+# the mid band a trial runs 10-30 min, so a worker could sit at 0.1% free for half an hour
+# before anything noticed. One slot per poll converges without overshooting -- 12 slots can
+# be walked down to 1 in 11 minutes, and shedding STOPS the moment the box is back above the
+# floor, so it settles at whatever concurrency the band actually affords.
+_REMOTE_MEM_POLL_S = float(_os.getenv('BT_REMOTE_MEM_POLL_S', '60'))
+_REMOTE_MEM_FLOOR_PCT = float(_os.getenv('BT_REMOTE_MEM_FLOOR_PCT', '10'))
 
 
 def _log_memory_diagnostics(log, context: str) -> None:
@@ -168,6 +179,9 @@ class DistributedEvaluator:
         # count, the local worker's = the local consumer count. (The CLI path never updates these,
         # so without this the dashboard shows "0 jobs" + "offline" while a run is in flight.)
         self._report_fleet_state(active=True)
+        # Timer-driven memory control loop for the remotes (see _remote_memory_watchdog).
+        if self._active_workers:
+            self._spawn(self._remote_memory_watchdog, "remote-memory-watchdog")
 
     def _resolve_master_secrets(self) -> dict:
         """Read the credential app-settings to mirror onto workers from the MASTER's DB. Keys absent
@@ -258,11 +272,57 @@ class DistributedEvaluator:
         with self._remote_gov_lock:
             self._remote_govs[w["name"]] = MemoryGovernor(
                 cap, log=lambda m, n=w["name"]: self.log(f"[{n}] {m}"),
-                emergency_note="HALVING this worker's dispatch slots (the master cannot break a "
-                               "remote pool; it can only stop feeding it)")
+                emergency_note="shedding one dispatch slot (the master cannot break a remote pool; "
+                               "it can only stop feeding it -- see the memory watchdog)")
         for i in range(cap):
             self._spawn(lambda w=w, i=i: self._dispatch_remote(w, i), f"remote-{w['name']}-{i}")
         return cap
+
+    def _shed_remote_slot(self, worker_name: str, gov, why: str) -> bool:
+        """Drop ONE dispatch slot for *worker_name*. Returns True if anything changed.
+
+        One at a time, deliberately. Halving was tried first and is wrong: it overshoots (a box a
+        little over the line loses half its throughput) and it cannot converge on the right number.
+        Stepping down once per poll walks to whatever concurrency the band actually affords and
+        stops there -- the parked dispatchers simply stop claiming; nothing in flight is killed.
+        """
+        before = gov.current
+        gov.current = max(1, gov.current - 1)
+        if gov.current == before:
+            return False
+        self.log(f"[{worker_name}] dispatch slots {before} -> {gov.current} ({why}); "
+                 f"in-flight trials finish normally, full concurrency returns at the next job")
+        return True
+
+    def _remote_memory_watchdog(self) -> None:
+        """Poll every active worker's memory on a timer and shed a slot while it is under the floor.
+
+        Runs until the evaluator stops. Independent of trial completion, which is the whole reason
+        it exists (see _REMOTE_MEM_POLL_S). Best-effort throughout: a worker that cannot be reached
+        is left to the existing failure/re-admission path rather than being throttled on a guess.
+        """
+        while not self._stop.wait(_REMOTE_MEM_POLL_S):
+            with self._worker_lock:
+                active = list(self._active_workers)
+            for w in active:
+                name = w.get("name")
+                try:
+                    mem = (worker_client.health(w, timeout=10.0) or {}).get("memory") or {}
+                    used = mem.get("used_pct")
+                    if used is None:
+                        continue
+                    free_pct = 100.0 - float(used)
+                    with self._remote_gov_lock:
+                        gov = self._remote_govs.get(name)
+                    if gov is None:
+                        continue
+                    if free_pct < _REMOTE_MEM_FLOOR_PCT:
+                        self._shed_remote_slot(
+                            name, gov,
+                            f"{free_pct:.1f}% free < {_REMOTE_MEM_FLOOR_PCT:.0f}% floor "
+                            f"({mem.get('free_mb')} MB of {mem.get('total_mb')} MB)")
+                except Exception as e:  # noqa: BLE001 -- a poll failure must never stop the loop
+                    self.log(f"[{name}] memory poll failed: {e!r}")
 
     def assess_remote(self, worker_name: str, mem: Any) -> None:
         """Feed a REMOTE trial's memory snapshot to that worker's own governor.
@@ -287,11 +347,7 @@ class DistributedEvaluator:
             # symbols vs ~105 on large) and the emergency logged a pool-break that never happened.
             # One slot at a time is far too slow at 0.1% free, so halve outright.
             if verdict == "emergency":
-                before = gov.current
-                gov.current = max(1, gov.current // 2)
-                if gov.current != before:
-                    self.log(f"[{worker_name}] dispatch slots {before} -> {gov.current} "
-                             f"(emergency shed); parked dispatchers resume at the next job")
+                self._shed_remote_slot(worker_name, gov, "emergency (trial snapshot)")
         except Exception as e:  # noqa: BLE001 -- governing must never fail a healthy trial
             self.log(f"remote governor assess failed for {worker_name}: {e!r}")
 
