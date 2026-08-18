@@ -473,19 +473,33 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
 
         min_price = float(self.get_setting_with_interface_default("min_price") or 0.0)
         if min_price > 0 and universe:
-            from ba2_common.core.instance_resolver import get_instance_resolver
-            from ba2_common.core.models import ExpertInstance
-            from ba2_common.core.db import get_instance
-            instance = get_instance(ExpertInstance, self.id)
-            account = get_instance_resolver().get_account_instance(instance.account_id)
-            filtered = []
-            for sym in universe:
-                price = account.get_instrument_current_price(sym)
-                if price is not None and price >= min_price:
-                    filtered.append(sym)
-                else:
-                    self.logger.debug(f"FactorRanker: {sym} dropped by min_price guard (price={price})")
-            universe = filtered
+            if self.id == EXPORT_BYPASS_ID:
+                # A SYMBOL360 export instance (see _gather_holdings for the identical
+                # rationale) has no real ExpertInstance row/account to resolve here --
+                # get_instance(ExpertInstance, self.id) and get_account_instance(...)
+                # both hit real DB/live-infra lookups with no settings-only escape
+                # hatch. Degrade to "no liquidity filtering" rather than erroring: a
+                # SYMBOL360 user dialing in a nonzero min_price override (Task 12's
+                # settings expander lets them edit any setting) must get a graceful
+                # result, not an opaque DB/resolver failure for a knob unrelated to
+                # holdings.
+                self.logger.debug(
+                    "FactorRanker: min_price guard skipped for a SYMBOL360 export "
+                    "instance (no live account to price against)")
+            else:
+                from ba2_common.core.instance_resolver import get_instance_resolver
+                from ba2_common.core.models import ExpertInstance
+                from ba2_common.core.db import get_instance
+                instance = get_instance(ExpertInstance, self.id)
+                account = get_instance_resolver().get_account_instance(instance.account_id)
+                filtered = []
+                for sym in universe:
+                    price = account.get_instrument_current_price(sym)
+                    if price is not None and price >= min_price:
+                        filtered.append(sym)
+                    else:
+                        self.logger.debug(f"FactorRanker: {sym} dropped by min_price guard (price={price})")
+                universe = filtered
 
         min_dollar_volume = float(self.get_setting_with_interface_default("min_dollar_volume") or 0.0)
         if min_dollar_volume > 0:
@@ -833,7 +847,17 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
         score as if it were the requested one. Only when no override was
         applied AND the (unpinned) universe happens to resolve to exactly one
         name do we fall back to that single row.
+
+        A skipped Recommendation (empty universe / no factors enabled) carries
+        no ``raw_outputs["book"]`` at all -- defer to the base class so
+        ``rec.skip_reason`` still reaches the UI as a "Skipped" row instead of
+        silently vanishing into an empty metrics list (the base's default
+        _build_export_metrics already renders exactly that row; every other
+        wired expert does the same check first for the same reason).
         """
+        if rec.skip:
+            return super()._build_export_metrics(rec, settings)
+
         raw = rec.raw_outputs or {}
         book = raw.get("book") or {}
         ranking = book.get("ranking") or []

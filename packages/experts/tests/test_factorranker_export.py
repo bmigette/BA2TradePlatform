@@ -82,9 +82,11 @@ def test_export_symbol_data_never_touches_db(monkeypatch):
 
 
 def test_export_symbol_data_empty_universe_reports_skipped(monkeypatch):
-    """No candidate instruments -> _process's skip=True path; _build_export_metrics
-    is called (the base class always calls it), but its ranking-derived metrics
-    list is empty (no "book" key on a skipped Recommendation's raw_outputs)."""
+    """No candidate instruments -> _process's skip=True path. _build_export_metrics
+    must defer to the base class's "Skipped" row (rec.raw_outputs carries no "book"
+    at all for a skipped Recommendation) so rec.skip_reason still reaches the UI --
+    the ONLY place that text is ever surfaced -- instead of vanishing into an empty
+    metrics list."""
     _patch_value_fetcher(monkeypatch, {})  # value is still weight-1.0/enabled; only the universe is empty
     overrides = dict(_OVERRIDES_BASE)
     overrides["enabled_instruments"] = {}
@@ -92,7 +94,28 @@ def test_export_symbol_data_empty_universe_reports_skipped(monkeypatch):
         "AAPL", overrides=overrides, providers_resolver=_resolver)
     assert result.error is None, result.error
     assert result.skipped is True
-    assert result.metrics == []
+    assert len(result.metrics) == 1
+    skipped_row = result.metrics[0]
+    assert skipped_row.label == "Skipped"
+    assert skipped_row.value == "No candidate instruments configured"
+    assert "No candidate instruments configured" in skipped_row.display
+
+
+def test_export_symbol_data_nonzero_min_price_does_not_error(monkeypatch):
+    """min_price > 0 would normally make _resolve_universe do a real DB/live-infra
+    lookup (get_instance(ExpertInstance, self.id) + get_account_instance(...)) to
+    price-filter the universe -- Task 12's settings expander lets a SYMBOL360 user
+    dial in any override, including this one, so a bypass (id=EXPORT_BYPASS_ID)
+    instance must degrade gracefully (no filtering) rather than erroring out."""
+    _patch_value_fetcher(monkeypatch, {"AAPL": {
+        "eps_ttm": 10.0, "price": 100.0, "fcf_ttm": 0.0, "enterprise_value": 1.0}})
+    overrides = dict(_OVERRIDES_BASE)
+    overrides["min_price"] = 5.0
+    result = FactorRanker.export_symbol_data(
+        "AAPL", overrides=overrides, providers_resolver=_resolver)
+    assert result.error is None, result.error
+    assert not result.skipped
+    assert any(m.label == "Composite factor score" for m in result.metrics)
 
 
 def test_build_export_metrics_matches_by_symbol_not_position(monkeypatch):
