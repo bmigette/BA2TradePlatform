@@ -230,7 +230,13 @@ def main() -> int:
     ap.add_argument("--strategies", default="S1,S2,S3")  # S4 merged into S1
     ap.add_argument("--start", default="2023-01-01")
     ap.add_argument("--end", default="2026-01-01")
-    ap.add_argument("--population", type=int, default=40)
+    # 40 -> 60 (2026-08-18). At 40, only ~25 individuals per generation are INVALID (i.e.
+    # actually changed by crossover/mutation and therefore needing evaluation) -- against a
+    # 16-slot fleet. The extra trials 60 brings land in slots that were already idle, so the
+    # wall-clock cost is well under the +50% the trial count suggests. It also narrows an
+    # existing imbalance: S1 is pinned at 140 by _STRATEGY_BUDGET_OVERRIDE, so comparing S1
+    # against S2/S3 within a band was comparing a 3.5x search budget against a 1x one.
+    ap.add_argument("--population", type=int, default=60)
     ap.add_argument("--generations", type=int, default=8)
     ap.add_argument("--mutation-prob", type=float, default=None,
                     help="Per-gene mutation probability passthrough (default: launcher's 0.3).")
