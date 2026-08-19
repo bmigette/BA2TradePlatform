@@ -13,6 +13,9 @@ from typing import Any, Dict, List, Optional
 
 from ba2_common.core.db import add_instance, update_instance
 from ba2_common.core.interfaces import MarketExpertInterface
+from ba2_common.core.interfaces.ExpertDataExportInterface import (
+    EXPORT_BYPASS_ID, ExpertDataExportInterface, ExpertMetric,
+)
 from ba2_common.core.backtest_context import BacktestContext, ProviderBundle
 from ba2_common.core.models import AnalysisOutput, MarketAnalysis
 from ba2_providers.StockScreener import StockScreener
@@ -62,7 +65,7 @@ def _accepts_kwarg(fn, name: str) -> bool:
     return False
 
 
-class FactorRanker(MarketExpertInterface):
+class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
     """Configurable cross-sectional multi-factor equity ranker."""
 
     # Backtest warmup window (in trading BARS) the engine preloads before the first
@@ -470,19 +473,33 @@ class FactorRanker(MarketExpertInterface):
 
         min_price = float(self.get_setting_with_interface_default("min_price") or 0.0)
         if min_price > 0 and universe:
-            from ba2_common.core.instance_resolver import get_instance_resolver
-            from ba2_common.core.models import ExpertInstance
-            from ba2_common.core.db import get_instance
-            instance = get_instance(ExpertInstance, self.id)
-            account = get_instance_resolver().get_account_instance(instance.account_id)
-            filtered = []
-            for sym in universe:
-                price = account.get_instrument_current_price(sym)
-                if price is not None and price >= min_price:
-                    filtered.append(sym)
-                else:
-                    self.logger.debug(f"FactorRanker: {sym} dropped by min_price guard (price={price})")
-            universe = filtered
+            if self.id == EXPORT_BYPASS_ID:
+                # A SYMBOL360 export instance (see _gather_holdings for the identical
+                # rationale) has no real ExpertInstance row/account to resolve here --
+                # get_instance(ExpertInstance, self.id) and get_account_instance(...)
+                # both hit real DB/live-infra lookups with no settings-only escape
+                # hatch. Degrade to "no liquidity filtering" rather than erroring: a
+                # SYMBOL360 user dialing in a nonzero min_price override (Task 12's
+                # settings expander lets them edit any setting) must get a graceful
+                # result, not an opaque DB/resolver failure for a knob unrelated to
+                # holdings.
+                self.logger.debug(
+                    "FactorRanker: min_price guard skipped for a SYMBOL360 export "
+                    "instance (no live account to price against)")
+            else:
+                from ba2_common.core.instance_resolver import get_instance_resolver
+                from ba2_common.core.models import ExpertInstance
+                from ba2_common.core.db import get_instance
+                instance = get_instance(ExpertInstance, self.id)
+                account = get_instance_resolver().get_account_instance(instance.account_id)
+                filtered = []
+                for sym in universe:
+                    price = account.get_instrument_current_price(sym)
+                    if price is not None and price >= min_price:
+                        filtered.append(sym)
+                    else:
+                        self.logger.debug(f"FactorRanker: {sym} dropped by min_price guard (price={price})")
+                universe = filtered
 
         min_dollar_volume = float(self.get_setting_with_interface_default("min_dollar_volume") or 0.0)
         if min_dollar_volume > 0:
@@ -526,7 +543,21 @@ class FactorRanker(MarketExpertInterface):
 
     def _gather_holdings(self) -> List[str]:
         """Symbols currently held by this expert (live concern). In Phase 1 this
-        reads FactorPortfolioManager; in Phase 4 the backtest account supplies it."""
+        reads FactorPortfolioManager; in Phase 4 the backtest account supplies it.
+
+        ``FactorPortfolioManager(self.id)`` does two real DB/live-infra lookups
+        (``get_instance_resolver().get_account_instance(...)`` and
+        ``get_instance(ExpertInstance, self.id)``) — there is no settings-only
+        way to satisfy either for a read-only export. A SYMBOL360
+        (``ExpertDataExportInterface.export_symbol_data``) bypass instance is
+        stamped with the sentinel ``EXPORT_BYPASS_ID`` (never a real
+        ExpertInstance row), so short-circuit to "nothing held" rather than
+        raising: holdings only drive the ranked book's BUY/HOLD/SELL ``action``
+        display tag (not the composite/factor scores the export surfaces), and
+        a bypass instance genuinely has no live portfolio to report.
+        """
+        if self.id == EXPORT_BYPASS_ID:
+            return []
         pm = FactorPortfolioManager(self.id)
         return list(pm.get_holdings()[0])
 
@@ -787,6 +818,82 @@ class FactorRanker(MarketExpertInterface):
             ))
         except Exception as e:
             self.logger.error(f"FactorRanker: failed to write AnalysisOutput '{name}': {e}", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Data export (SYMBOL360)
+    # ------------------------------------------------------------------
+
+    def _build_export_metrics(self, rec: Recommendation, settings: Dict[str, Any]) -> List[Any]:
+        """Surface the REQUESTED symbol's row from the ranked book as
+        composite + per-factor metric rows.
+
+        FactorRanker is basket-level: ``rec`` carries the WHOLE resolved
+        universe's ranking in ``raw_outputs["book"]["ranking"]``, one dict
+        per symbol, and neither ``rec`` nor ``settings`` (this method's only
+        two parameters) identifies which symbol the caller actually asked
+        about. ``export_symbol_data`` (``ExpertDataExportInterface._bypass_instance``)
+        stashes the requested symbol on the instance as ``self._export_symbol``
+        for exactly this reason -- read it back here rather than assuming
+        position 0.
+
+        Callers are expected to pin the universe to a single symbol via
+        ``overrides`` (``instrument_selection_method``/``universe_source``
+        ``"static"`` + ``enabled_instruments={symbol: {...}}``), so in the
+        intended usage ``ranking`` has exactly one row and it already matches
+        the requested symbol. We still match BY SYMBOL (case-insensitively)
+        rather than indexing ``ranking[0]`` blindly: a caller that forgets to
+        pin the universe (or a screener-sourced universe_source override that
+        resolves >1 name) would otherwise silently report some OTHER symbol's
+        score as if it were the requested one. Only when no override was
+        applied AND the (unpinned) universe happens to resolve to exactly one
+        name do we fall back to that single row.
+
+        A skipped Recommendation (empty universe / no factors enabled) carries
+        no ``raw_outputs["book"]`` at all -- defer to the base class so
+        ``rec.skip_reason`` still reaches the UI as a "Skipped" row instead of
+        silently vanishing into an empty metrics list (the base's default
+        _build_export_metrics already renders exactly that row; every other
+        wired expert does the same check first for the same reason).
+        """
+        if rec.skip:
+            return super()._build_export_metrics(rec, settings)
+
+        raw = rec.raw_outputs or {}
+        book = raw.get("book") or {}
+        ranking = book.get("ranking") or []
+        if not ranking:
+            return []
+
+        symbol = getattr(self, "_export_symbol", None)
+        row = None
+        if symbol:
+            row = next(
+                (r for r in ranking if str(r.get("symbol", "")).upper() == symbol.upper()),
+                None)
+        if row is None:
+            if len(ranking) == 1:
+                row = ranking[0]  # unambiguous: a genuinely single-symbol universe
+            else:
+                self.logger.warning(
+                    f"FactorRanker._build_export_metrics: requested symbol {symbol!r} not "
+                    f"found in a {len(ranking)}-row ranking -- the universe was not pinned "
+                    f"to that single symbol; returning no metrics rather than guessing.")
+                return []
+
+        # _build_book always writes round(...get(sym, 0.0), 4) for composite/factor
+        # z-scores, so these are real floats, never None -- the `or 0.0` below is
+        # defense-in-depth against a future _build_book change, not a known gap.
+        composite = row.get("composite") or 0.0
+        out = [ExpertMetric(
+            "Composite factor score", composite, f"{composite:+.3f}",
+            "buy" if composite > 0 else ("sell" if composite < 0 else "neutral"),
+            f"Rank {row.get('rank')} of {book.get('universe_size', len(ranking))}")]
+        for name, z in (row.get("factors") or {}).items():
+            z = z or 0.0
+            out.append(ExpertMetric(
+                f"Factor: {name}", z, f"{z:+.3f}",
+                "buy" if z > 0 else ("sell" if z < 0 else "neutral")))
+        return out
 
     # ------------------------------------------------------------------
     # UI

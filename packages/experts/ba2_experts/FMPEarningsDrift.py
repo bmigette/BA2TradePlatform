@@ -24,17 +24,19 @@ Backtest (``as_of`` set) is completely unchanged: same per-symbol fetch as befor
 """
 
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import fmpsdk
 
-from ba2_common.core.interfaces import MarketExpertInterface
+from ba2_common.core.interfaces import (
+    ExpertDataExportInterface, ExpertMetric, MarketExpertInterface,
+)
 from ba2_common.core.models import AnalysisOutput, ExpertRecommendation, MarketAnalysis
 from ba2_common.core.db import add_instance, get_db, update_instance
 from ba2_common.core.types import (
     MarketAnalysisStatus, OrderRecommendation, Recommendation, RiskLevel, TimeHorizon,
 )
-from ba2_common.core.backtest_context import ProviderBundle
+from ba2_common.core.backtest_context import BacktestContext, ProviderBundle
 from ba2_common.logger import get_expert_logger
 from ba2_experts.expert_mixins import AnalysisStatusRenderMixin
 from ba2_experts.earnings_surprise import surprise_percent as _surprise_percent
@@ -157,7 +159,7 @@ def evaluate_earnings_drift(latest_earnings: Optional[Dict[str, Any]],
     return out
 
 
-class FMPEarningsDrift(AnalysisStatusRenderMixin, MarketExpertInterface):
+class FMPEarningsDrift(ExpertDataExportInterface, AnalysisStatusRenderMixin, MarketExpertInterface):
     """Post-earnings-drift expert: BUY fresh EPS beats, time-boxed hold."""
 
     RENDER_PENDING_MESSAGE = 'Earnings-drift analysis for {symbol} is queued'
@@ -309,6 +311,104 @@ Confidence: {confidence:.1f}%
                     "is_signal", "surprise_pct", "days_since_report", "report_date",
                     "reported_eps", "estimated_eps", "reason")},
             })
+
+    def analyze_as_of(self, as_of: Optional[datetime], context: BacktestContext) -> Recommendation:
+        """BacktestInterface entry: runs the SAME _gather+_process as the live path.
+
+        _gather reads self._gather_symbol and (on its live calendar-shortcut
+        branch) self._gather_max_days_since_report -- both otherwise only ever
+        set by run_analysis's live orchestrator. export_symbol_data (SYMBOL360)
+        drives this class through analyze_as_of instead of run_analysis, so
+        those two attributes must be sourced from the context here too (same
+        pattern as FMPRating/FMPInsiderClusterBuy/DeterministicScorer)."""
+        self._gather_symbol = context.extra.get("symbol", getattr(self, "_gather_symbol", None))
+        self._gather_max_days_since_report = int(context.settings["max_days_since_report"])
+        bundle = self._gather(context.providers, as_of)
+        return self._process(bundle, context.settings, as_of)
+
+    # ------------------------------------------------------- data export
+    @staticmethod
+    def _fmt_pct(v: Optional[float]) -> str:
+        """surprise_pct is None ONLY when evaluate_earnings_drift never reached a
+        parseable report date + a computable surprise (no earnings data, no
+        report date, an unparseable date, or a surprise_percent() that itself
+        returned None) -- a genuine 'nothing to show', not a computed 0.0 (an
+        in-line report is a real, meaningful 0.0% surprise)."""
+        return f"{v:+.1f}%" if v is not None else "n/a"
+
+    @staticmethod
+    def _surprise_signal(v: Optional[float]) -> Optional[str]:
+        """Beat/miss on the surprise number itself, independent of
+        surprise_min_pct -- the base 'Recommendation' row already carries the
+        threshold-gated BUY/HOLD verdict; this is "did they beat or miss at
+        all", which is useful context even on a HOLD (e.g. a small beat, or a
+        big-but-stale beat -- see the 'Within drift window' row for that
+        second gate)."""
+        if v is None:
+            return None
+        return "buy" if v > 0 else ("sell" if v < 0 else "neutral")
+
+    def _build_export_metrics(self, rec: Recommendation,
+                              settings: Dict[str, Any]) -> List[ExpertMetric]:
+        """SYMBOL360 rows for the Recent Earnings / PEAD card: keep the base
+        signal/confidence/details row (the BUY/HOLD verdict itself) and append
+        the three inputs that verdict is actually built from -- the EPS
+        surprise %, how long ago the report was, and whether it still sits
+        inside the freshness window -- so a reader can see WHY the expert did
+        or didn't fire without parsing `details`.
+
+        FMPEarningsDrift has exactly ONE Recommendation(...) construction site
+        (verified by reading _process in full): the fresh-beat BUY branch and
+        the "everything else" HOLD branch both fall through to the same
+        `return Recommendation(...)`, and skip is never set on it. rec.skip is
+        therefore always False here, so the base row is always the plain
+        'Recommendation' summary, never the base class's 'Skipped' fallback --
+        unlike FMPRating/FMPInsiderClusterBuy, this expert needs no skip
+        branch of its own.
+
+        surprise_pct/days_since_report/report_date/reported_eps/estimated_eps
+        all come from evaluate_earnings_drift's `out` dict, which is populated
+        BEFORE the freshness/threshold gates run (see FMPEarningsDrift.py) --
+        so a stale-but-real beat still reports a real surprise number here,
+        only 'Within drift window' flips to No. They are None ONLY on the
+        genuine no-data paths (no earnings row at all, no report date, an
+        unparseable date, or no computable surprise), never as a stand-in for
+        a real 0.0/0d reading.
+        """
+        base = super()._build_export_metrics(rec, settings)
+        ev = (rec.raw_outputs or {}).get("evaluation") or {}
+        surprise_pct = ev.get("surprise_pct")
+        days_since = ev.get("days_since_report")
+        report_date = ev.get("report_date")
+        reported_eps = ev.get("reported_eps")
+        estimated_eps = ev.get("estimated_eps")
+        surprise_min = float(settings["surprise_min_pct"])
+        max_days = int(settings["max_days_since_report"])
+
+        surprise_detail = (
+            f"Reported {reported_eps} vs estimate {estimated_eps} (threshold {surprise_min:.1f}%)"
+            if reported_eps is not None and estimated_eps is not None
+            else f"Threshold {surprise_min:.1f}%")
+        base.append(ExpertMetric(
+            "EPS surprise", surprise_pct, self._fmt_pct(surprise_pct),
+            self._surprise_signal(surprise_pct), surprise_detail))
+
+        base.append(ExpertMetric(
+            "Days since report", days_since,
+            f"{days_since}d ago" if days_since is not None else "n/a",
+            None, f"Reported {report_date}" if report_date else None))
+
+        # Recomputed independently of evaluate_earnings_drift's combined
+        # is_signal (which also folds in the surprise threshold): this row is
+        # ONLY the freshness gate, so a fresh-but-below-threshold beat reads
+        # Yes here (and HOLD on the base row), while a stale-but-large beat
+        # reads No here (and HOLD on the base row) for the opposite reason.
+        within_window = None if days_since is None else (0 <= days_since <= max_days)
+        base.append(ExpertMetric(
+            "Within drift window", within_window,
+            "n/a" if within_window is None else ("Yes" if within_window else "No"),
+            None, f"{max_days}-day freshness window"))
+        return base
 
     # ------------------------------------------------------------------
     def run_analysis(self, symbol: str, market_analysis: MarketAnalysis) -> None:

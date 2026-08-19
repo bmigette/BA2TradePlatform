@@ -20,6 +20,7 @@ from . import ReadOnlyAccountInterface as _m1  # noqa: F401
 from . import AccountInterface as _m2  # noqa: F401
 from . import OptionsAccountInterface as _m3  # noqa: F401
 from . import MarketExpertInterface as _m4  # noqa: F401
+from . import ExpertDataExportInterface as _m4b  # noqa: F401
 from . import ExtendableSettingsInterface as _m5  # noqa: F401
 from . import SmartRiskExpertInterface as _m6  # noqa: F401
 from . import LiveExpertInterface as _m7  # noqa: F401
@@ -43,6 +44,9 @@ from ba2_common.core.interfaces import (  # noqa: F401
     OptionsAccountInterface,
     MarketExpertInterface,
     BacktestInterface,
+    ExpertDataExportInterface,
+    ExpertMetric,
+    ExpertDataExport,
     ExtendableSettingsInterface,
     SmartRiskExpertInterface,
     LiveExpertInterface,
@@ -70,6 +74,9 @@ __all__ = [
     "OptionsAccountInterface",
     "MarketExpertInterface",
     "BacktestInterface",
+    "ExpertDataExportInterface",
+    "ExpertMetric",
+    "ExpertDataExport",
     "ExtendableSettingsInterface",
     "SmartRiskExpertInterface",
     "LiveExpertInterface",

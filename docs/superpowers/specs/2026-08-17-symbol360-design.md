@@ -1,7 +1,16 @@
 # SYMBOL360 — Design
 
 Date: 2026-08-17
-Status: Design approved, implementation not started
+Status: Implemented (2026-08-19). See
+`docs/superpowers/plans/2026-08-17-symbol360.md` for the accurate, executed
+14-task build — a few details below drifted from what actually shipped
+during implementation (discoveries that changed the plan, not bugs):
+the `congress_trades.py` extraction described in "Files" never happened
+(`FMPCongressTradingMixin` turned out to already be centralized — see the
+plan's "Key facts" #5); the price chart ships two indicator overlays
+(SMA200 + RSI), not four; the dated price-target table has no
+implied-upside color tinting. Treat this document for the *why*; treat the
+plan document for the *what actually shipped*.
 
 ## Problem
 

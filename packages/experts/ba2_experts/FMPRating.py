@@ -1,10 +1,13 @@
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
+from functools import cached_property
 import json
 import logging
 import requests
 
-from ba2_common.core.interfaces import MarketExpertInterface
+from ba2_common.core.interfaces import (
+    ExpertDataExportInterface, ExpertMetric, MarketExpertInterface,
+)
 from ba2_common.core.models import MarketAnalysis, AnalysisOutput, ExpertRecommendation
 from ba2_common.core.db import get_db, update_instance, add_instance
 from ba2_common.core.types import (
@@ -148,7 +151,8 @@ def fetch_analyst_grades_cached(api_key: str, symbol: str) -> list:
         symbol, lambda: fmp_history_disk_cached("analyst_grades", symbol, _do_fetch))
 
 
-class FMPRating(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExpertInterface):
+class FMPRating(ExpertDataExportInterface, AnalysisStatusRenderMixin, FMPApiKeyMixin,
+                MarketExpertInterface):
     """
     FMPRating Expert Implementation
     
@@ -167,13 +171,19 @@ class FMPRating(AnalysisStatusRenderMixin, FMPApiKeyMixin, MarketExpertInterface
     def __init__(self, id: int):
         """Initialize FMPRating expert with database instance."""
         super().__init__(id)
-        
+
         self._load_expert_instance(id)
-        self._api_key = self._get_fmp_api_key()
-        
+
         # Initialize expert-specific logger
         self.logger = get_expert_logger("FMPRating", id)
-    
+
+    @cached_property
+    def _api_key(self) -> Optional[str]:
+        """Lazily resolved + cached (not eagerly set in __init__) so a
+        bypass-constructed export instance (ExpertDataExportInterface,
+        which never runs __init__) still resolves a real key on first use."""
+        return self._get_fmp_api_key()
+
     @classmethod
     def get_settings_definitions(cls) -> Dict[str, Any]:
         """Define configurable settings for FMPRating expert."""
@@ -1075,6 +1085,61 @@ Final Confidence = Base Confidence + Directional Boost ({signal.value}) = {base_
                              f"{_money(r.get('priceTarget'))} | {_money(r.get('priceWhenPosted'))} |")
             parts.append("")
         return "\n".join(parts)
+
+    # ------------------------------------------------------- data export
+    @staticmethod
+    def _fmt_price(v: Optional[float]) -> str:
+        """A target key (targetHigh/Low/Median/Consensus) can be absent from
+        FMP's response even when consensus_data itself is non-empty -- that's
+        a genuine None, not a computed 0, so render it as 'n/a' rather than
+        '$0.00'."""
+        return f"${v:.2f}" if v is not None else "n/a"
+
+    def _build_export_metrics(self, rec: Recommendation,
+                              settings: Dict[str, Any]) -> List[ExpertMetric]:
+        """SYMBOL360 rows: the base signal summary (or, on any of _process's
+        three skip paths -- no coverage / insufficient price targets /
+        insufficient analysts -- the base class's 'Skipped' row; none of those
+        sites populate raw_outputs, so rec.skip is checked explicitly rather
+        than relying on that absence) plus the analyst-consensus figures
+        behind it.
+
+        calc's target_consensus/target_price (and analyst_count/strong_buy/
+        buy/hold/sell/strong_sell) come from ``_calculate_recommendation``:
+        the target fields read straight off FMP's consensus payload and can be
+        None (a missing key), while the rating counts are always real ints
+        (built via ``.get(key, 0)``) -- hence the price formatter but no
+        int guard."""
+        base = super()._build_export_metrics(rec, settings)
+        if rec.skip:
+            return base
+
+        calc = (rec.raw_outputs or {}).get("calc") or {}
+        current_price = rec.current_price
+        target_price = calc.get("target_price")
+        if target_price and current_price:
+            upside = (target_price / current_price - 1.0) * 100.0
+            base.append(ExpertMetric(
+                "Analyst target upside", upside, f"{upside:+.1f}%",
+                "buy" if upside > 0 else "sell",
+                f"Using the '{settings['target_price_type']}' target"))
+
+        target_consensus = calc.get("target_consensus")
+        base.append(ExpertMetric("Consensus price target", target_consensus,
+                                 self._fmt_price(target_consensus)))
+
+        analyst_count = calc.get("analyst_count", 0)
+        strong_buy = calc.get("strong_buy", 0)
+        buy = calc.get("buy", 0)
+        hold = calc.get("hold", 0)
+        sell = calc.get("sell", 0)
+        strong_sell = calc.get("strong_sell", 0)
+        base.append(ExpertMetric(
+            "Total analysts", analyst_count, str(analyst_count), None,
+            detail=f"{strong_buy} Strong Buy / {buy} Buy / {hold} Hold / "
+                   f"{sell} Sell / {strong_sell} Strong Sell"))
+
+        return base
 
     def _store_analysis_outputs(self, market_analysis_id: int, symbol: str,
                                recommendation_data: Dict[str, Any],
