@@ -14,6 +14,7 @@ import requests
 from ...config import get_app_setting
 from ...logger import logger
 from ...modules.dataproviders import get_provider
+from .symbol360 import Symbol360Tab
 
 
 class FMPSenateTradeTab:
@@ -1162,11 +1163,15 @@ class PennyScreenerTab:
 def content():
     """Render the Tools page with tabbed layout."""
     with ui.tabs().classes('w-full') as tabs:
+        symbol360_tab = ui.tab('SYMBOL360', icon='dashboard')
         fmp_senate_tab = ui.tab('FMP Senate Trade', icon='account_balance')
         analyst_ratings_tab = ui.tab('Analyst Ratings', icon='analytics')
         penny_screener_tab = ui.tab('Penny Screener', icon='trending_up')
 
-    with ui.tab_panels(tabs, value=fmp_senate_tab).classes('w-full'):
+    with ui.tab_panels(tabs, value=symbol360_tab).classes('w-full'):
+        with ui.tab_panel(symbol360_tab):
+            Symbol360Tab()
+
         with ui.tab_panel(fmp_senate_tab):
             FMPSenateTradeTab()
 
