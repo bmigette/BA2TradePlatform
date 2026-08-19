@@ -309,11 +309,31 @@ def _submit_job(fn, *args) -> str:
         job_id = uuid.uuid4().hex
         future = Future()
         future.set_result({"ok": False, "fatal": False, "retryable": True,
+                           "backpressure": True,
                            "error": f"worker under memory floor ({_free:.1f}% free)"})
         with _JOBS_LOCK:
             _JOBS[job_id] = future
             import time as _t
             _JOBS_SUBMITTED_AT[job_id] = _t.monotonic()
+        return job_id
+    # CAPACITY GATE. The pool queues anything submitted past its worker count, so without
+    # this a master that over-dispatches builds an unbounded backlog: measured busy:61 on a
+    # 12-slot pool on 2026-08-19. Every queued trial is work the master has already given up
+    # on (its no-bars timeout is 420s) and recomputed elsewhere, so running it is pure waste
+    # AND it keeps every pool child resident, which is what starved the box.
+    _busy = _busy_job_count()
+    if _busy >= _CAPACITY:
+        logger.warning("refusing trial: %d/%d slots busy (retryable backpressure)",
+                       _busy, _CAPACITY)
+        job_id = uuid.uuid4().hex
+        future = Future()
+        future.set_result({"ok": False, "fatal": False, "retryable": True,
+                           "backpressure": True,
+                           "error": f"worker at capacity ({_busy}/{_CAPACITY} busy)"})
+        with _JOBS_LOCK:
+            _JOBS[job_id] = future
+            import time as _t2
+            _JOBS_SUBMITTED_AT[job_id] = _t2.monotonic()
         return job_id
     job_id = uuid.uuid4().hex
     ctl = _new_job_ctl()

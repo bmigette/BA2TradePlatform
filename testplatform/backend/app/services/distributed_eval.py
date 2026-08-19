@@ -42,6 +42,8 @@ Job = Tuple[int, dict, str, dict]
 
 # A dispatcher gives up on a worker after this many consecutive run_trial failures (dead box).
 _MAX_WORKER_FAILURES = 3
+# How long a dispatcher waits out a worker's backpressure before claiming again.
+_BACKPRESSURE_WAIT_S = float(_os.getenv("BT_BACKPRESSURE_WAIT_S", "15"))
 
 # How often the master polls each remote worker's /health memory block, and the free-memory
 # floor it sheds slots to stay above. Polling on a TIMER rather than per completed trial is
@@ -69,6 +71,17 @@ def _log_memory_diagnostics(log, context: str) -> None:
             f"({vm.percent:.1f}% used)")
     except Exception as e:  # noqa: BLE001 — diagnostics are best-effort, never fatal
         log(f"{context}: memory diagnostics unavailable ({e!r})")
+
+
+def _is_backpressure(out: Any) -> bool:
+    """True when a worker refused work because it is FULL or under its memory floor.
+
+    This is the worker behaving correctly, not failing. Counting it toward
+    _MAX_WORKER_FAILURES declared a healthy-but-busy box dead after 3 refusals, which then
+    fed the re-admission storm that spawned duplicate dispatchers. Backpressure is requeued
+    and waited out, never fatal.
+    """
+    return bool(isinstance(out, dict) and out.get("backpressure"))
 
 
 class DistributedEvaluator:
@@ -141,6 +154,13 @@ class DistributedEvaluator:
         self._remote_govs: dict = {}
         self._remote_gov_lock = threading.Lock()
         self._recheck_lock = threading.Lock()  # at most one re-admission pre-flight in flight
+        # DISPATCHER GENERATION per worker. Re-admission used to spawn a fresh full set of
+        # dispatcher threads while the previous set kept running -- only the ONE thread that
+        # saw the failure returned. On 2026-08-19 that compounded over 418 re-admissions
+        # until remote150 reported busy:61 against a 12-slot pool. A dispatcher captures its
+        # epoch at spawn and retires itself as soon as the worker's epoch moves, so exactly
+        # one generation is ever alive. Guarded by _worker_lock.
+        self._worker_epochs: dict = {}
         self._secrets: dict = {}
 
     # -- lifecycle ---------------------------------------------------------------------------
@@ -268,15 +288,48 @@ class DistributedEvaluator:
     def _spawn_remote_dispatchers(self, w: dict) -> int:
         from app.services.strategy_optimization_handler import MemoryGovernor
         cap = self._engaged_slots(w)
+        # RETIRE the previous generation before starting a new one. Bumping the epoch is what
+        # makes the old dispatchers stand down; without it they keep claiming forever and the
+        # worker is driven at (generations x cap) concurrency.
+        with self._worker_lock:
+            epoch = self._worker_epochs.get(w["name"], 0) + 1
+            self._worker_epochs[w["name"]] = epoch
         # Arm (or re-arm, on re-admission at a NEW capacity) this worker's own governor.
+        # CARRY THE SHED LEVEL FORWARD: a re-admission is not evidence the box got roomier,
+        # and rebuilding at full cap threw away every step the governor had walked down
+        # (measured 418 resets in one run, so it logged "6 -> 5" indefinitely and never
+        # converged). A JOB boundary is what restores full concurrency -- see
+        # MemoryGovernor.restore.
         with self._remote_gov_lock:
-            self._remote_govs[w["name"]] = MemoryGovernor(
+            prev = self._remote_govs.get(w["name"])
+            gov = MemoryGovernor(
                 cap, log=lambda m, n=w["name"]: self.log(f"[{n}] {m}"),
                 emergency_note="shedding one dispatch slot (the master cannot break a remote pool; "
                                "it can only stop feeding it -- see the memory watchdog)")
+            if prev is not None:
+                gov.current = max(1, min(gov.full, prev.current))
+            self._remote_govs[w["name"]] = gov
         for i in range(cap):
-            self._spawn(lambda w=w, i=i: self._dispatch_remote(w, i), f"remote-{w['name']}-{i}")
+            self._spawn(lambda w=w, i=i, e=epoch: self._dispatch_remote(w, i, e),
+                        f"remote-{w['name']}-{i}-g{epoch}")
         return cap
+
+    def _mark_worker_down(self, w: dict, why: str) -> bool:
+        """Retire *w*: drop it from the active set, list it ONCE for re-admission, and move
+        its epoch so every one of its dispatchers stands down.
+
+        Returns True if this call is the one that took it down. Previously each dispatcher
+        did this inline, so six threads giving up together appended the same worker six
+        times and _recheck_down_workers then re-admitted it six times over.
+        """
+        with self._worker_lock:
+            already_down = w in self._down_workers
+            if w in self._active_workers:
+                self._active_workers.remove(w)
+            if not already_down:
+                self._down_workers.append(w)
+            self._worker_epochs[w["name"]] = self._worker_epochs.get(w["name"], 0) + 1
+        return not already_down
 
     def _shed_remote_slot(self, worker_name: str, gov, why: str) -> bool:
         """Drop ONE dispatch slot for *worker_name*. Returns True if anything changed.
@@ -345,7 +398,9 @@ class DistributedEvaluator:
             # process pool. A remote owner cannot do that, so before this it shed NOTHING: on
             # 2026-08-18 remote150 fell to 85 MB free of 65 GB on the mid band (765 screened
             # symbols vs ~105 on large) and the emergency logged a pool-break that never happened.
-            # One slot at a time is far too slow at 0.1% free, so halve outright.
+            # Sheds ONE slot, and the watchdog steps again a minute later if the box is
+            # still under the floor -- halving was tried and rejected: it overshoots and
+            # cannot converge on the concurrency the band actually affords.
             if verdict == "emergency":
                 self._shed_remote_slot(worker_name, gov, "emergency (trial snapshot)")
         except Exception as e:  # noqa: BLE001 -- governing must never fail a healthy trial
@@ -467,9 +522,16 @@ class DistributedEvaluator:
                 pass
             self.pool = self._pool_factory()
 
-    def _dispatch_remote(self, w: dict, slot_idx: int = 0) -> None:
+    def _dispatch_remote(self, w: dict, slot_idx: int = 0, epoch: int = None) -> None:
         failures = 0
         while not self._stop.is_set():
+            # EPOCH FENCE. This dispatcher belongs to one generation; the moment the worker
+            # is re-admitted (or marked down) the generation moves and this thread must
+            # stand down rather than keep claiming alongside its own replacements.
+            if epoch is not None:
+                with self._worker_lock:
+                    if self._worker_epochs.get(w["name"]) != epoch:
+                        return
             # THROTTLE, mirroring _consume_local: a dispatcher whose slot index is at/above its
             # worker's current ceiling parks instead of claiming, so a memory-pressured remote
             # sheds concurrency on ITS OWN box. Checked before every claim so a release takes
@@ -493,16 +555,19 @@ class DistributedEvaluator:
                 # of accepting a poisoned failed-trial result.
                 if isinstance(out, dict) and out.get("retryable"):
                     self.broker.requeue_one(job["trial_id"])
+                    # BACKPRESSURE (worker full / under its memory floor) is the worker
+                    # working as designed. Requeue and wait it out; do NOT count it as a
+                    # failure, or a merely busy box is declared dead after three refusals.
+                    if _is_backpressure(out):
+                        self._stop.wait(_BACKPRESSURE_WAIT_S)
+                        continue
                     failures += 1
                     self.log(f"worker {w['name']} returned retryable failure "
                              f"({failures}/{_MAX_WORKER_FAILURES}): {out.get('error')}")
                     if failures >= _MAX_WORKER_FAILURES:
-                        self.log(f"worker {w['name']} giving up (repeated retryable failures); "
-                                 f"trials fall back to local/others")
-                        with self._worker_lock:
-                            if w in self._active_workers:
-                                self._active_workers.remove(w)
-                            self._down_workers.append(w)
+                        if self._mark_worker_down(w, "repeated retryable failures"):
+                            self.log(f"worker {w['name']} giving up (repeated retryable "
+                                     f"failures); trials fall back to local/others")
                         return
                     self._stop.wait(2.0)
                     continue
@@ -518,11 +583,9 @@ class DistributedEvaluator:
                 failures += 1
                 self.log(f"worker {w['name']} run_trial failed ({failures}/{_MAX_WORKER_FAILURES}): {e}")
                 if failures >= _MAX_WORKER_FAILURES:
-                    self.log(f"worker {w['name']} giving up (dead); trials fall back to local/others")
-                    with self._worker_lock:
-                        if w in self._active_workers:
-                            self._active_workers.remove(w)
-                        self._down_workers.append(w)
+                    if self._mark_worker_down(w, "dead"):
+                        self.log(f"worker {w['name']} giving up (dead); trials fall back to "
+                                 f"local/others")
                     return
                 self._stop.wait(2.0)
 
