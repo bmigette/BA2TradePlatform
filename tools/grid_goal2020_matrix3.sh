@@ -192,18 +192,22 @@ DS_PARALLEL="${DS_PARALLEL:-4}"      # light expert (~2.5 GB/trial), unlike Sena
 # MEASURED medians (Alpaca SIP historical quotes, 2026-08-17) -- small was 40, i.e. 2.4x too harsh.
 ds_spread_for() { case "$1" in large) echo 3 ;; mid) echo 9 ;; small) echo 17 ;; *) echo 0 ;; esac; }
 
-# REMOTE DISPATCH SLOTS PER BAND (2026-08-18). remote150's daemon runs --workers 12; the master
-# caps how many it ENGAGES per job via BA2_MAX_REMOTE_SLOTS, applied as the TIGHTEST of (env,
-# the expert's own max_remote_worker_slots) so this can only ever reduce concurrency.
+# REMOTE POOL SLOTS PER BAND. remote150's daemon runs --workers 12 as its CEILING; the master
+# sizes the pool per job via BA2_MAX_REMOTE_SLOTS, applied as the TIGHTEST of (env, the expert's
+# own max_remote_worker_slots) so this can only ever reduce concurrency.
 #
 # Sized on MEASURED per-trial footprint, which is a property of the BAND, not the expert:
 #   large  ~105 screened symbols, ~2.5-3.5 GB/trial  -> 12 ran fine for three jobs
 #   mid    ~765 screened symbols, ~6 GB/trial        -> 12 starved a 65 GB box
-# On the mid band the master shed 12 -> 11 -> ... -> 1 (one slot per minute, as designed) and
-# remote150 was STILL at 0.5-2.6% free, because the daemon's 12 pool children stay resident with
-# their last working set whether or not anything is dispatched to them. Capping ENGAGEMENT keeps
-# the box out of that hole in the first place; the worker's own watchdog (9464b38) reclaims what
-# it already holds.
+#
+# This used to be engagement-only and therefore did nothing for memory: pool children were
+# spawned once at daemon start and stayed resident with their last working set whether or not
+# anything was dispatched to them, so the master could shed 12 -> 1 and remote150 still sat at
+# 0.5-2.6% free. Since 6bddce4 the master calls POST /pool/resize at pre-flight, so the number
+# below is the number of children that actually EXIST for the job -- it is now a real memory
+# lever. The 2026-08-19 starvation was mostly a master-side dispatcher leak (fe1cba3), not
+# footprint, so these numbers are deliberately conservative until re-measured against a run
+# with correct concurrency.
 ds_remote_slots_for() { case "$1" in large) echo 12 ;; *) echo 6 ;; esac; }
 
 # PHASE B runs TWICE, mirroring tools/grid_goal2020.sh. The S1/S2/S3 answer lands FIRST so the
