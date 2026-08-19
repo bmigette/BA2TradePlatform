@@ -64,14 +64,25 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
     # SYMBOL360's export card only shows the Technical/Fundamental/Macro
     # section scores + the fundamental snapshot rows (F-Score, Altman Z,
     # quality/value/growth) -- see _build_export_metrics below. Excludes
-    # every knob that only feeds a section this card never renders: the
-    # ANALYST section (w_analyst, analyst_*, aw_*) and EARNINGS/PEAD section
-    # (w_earnings, earnings_*) have no corresponding rows; atr_period/
-    # k_stop/k_target/target_from_score only shape the ATR target/stop
-    # levels, which this research card doesn't display either.
+    # every SUB-detail knob that only feeds a section this card never
+    # renders a breakdown row for: analyst_*/aw_* and earnings_*/PEAD-window
+    # sub-settings have no corresponding metric row, and atr_period/k_stop/
+    # k_target/target_from_score only shape the ATR target/stop levels,
+    # which this research card doesn't display either.
+    #
+    # w_analyst/w_earnings themselves are KEPT despite that, unlike their
+    # sub-settings: final_score() (combine.py) combines technical/
+    # fundamental/analyst/earnings/macro via ONE weighted average into
+    # rec.signal/rec.confidence, and _render_export_card renders THOSE two
+    # fields (the header badge + confidence label) for every card
+    # regardless of what _build_export_metrics returns -- so w_analyst/
+    # w_earnings change the displayed header exactly like w_technical/
+    # w_fundamental/w_macro do (all five are the same kind of top-level
+    # weight in the same formula), even though this card shows no separate
+    # Analyst/Earnings section for their own sub-detail knobs to tune.
     EXPORT_RELEVANT_SETTINGS = (
-        "w_technical", "w_fundamental", "macro_mode", "m_floor",
-        "hard_riskoff", "macro_gate_min", "w_macro",
+        "w_technical", "w_fundamental", "w_analyst", "w_earnings",
+        "macro_mode", "m_floor", "hard_riskoff", "macro_gate_min", "w_macro",
         "k_compress", "theta_buy", "theta_sell", "veto_cap", "skip_on_missing_section",
         "mom_lookback_days", "mom_skip_days", "vol_window", "sma_trend_period",
         "rsi_period", "donchian_period", "adx_period", "adx_gate", "adx_rsi_boost",

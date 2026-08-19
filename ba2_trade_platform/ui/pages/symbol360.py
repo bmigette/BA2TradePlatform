@@ -568,7 +568,14 @@ class Symbol360Tab:
                 # else: unrecognized type -- skip, nothing sane to render
 
             def _save() -> None:
-                collected: Dict[str, Any] = {}
+                # MERGE into whatever's already persisted, don't replace it wholesale:
+                # `fields` only covers export.relevant_settings (the curated subset
+                # rendered above), so a blind replace would silently drop any
+                # previously-saved override on a key outside today's allowlist (e.g.
+                # from before a curation change, or a future manual storage write)
+                # every time this button is clicked -- turning a save into a partial
+                # data loss with no warning.
+                collected: Dict[str, Any] = dict(_get_overrides(export.expert_name))
                 for key, (widget, caster) in fields.items():
                     try:
                         collected[key] = caster(widget.value)

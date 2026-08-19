@@ -55,3 +55,16 @@ def test_no_relevant_setting_is_dict_or_list_typed():
                 f"{cls.__name__}.EXPORT_RELEVANT_SETTINGS includes '{key}', "
                 f"whose default is a {type(default).__name__} -- the UI "
                 f"settings expander would silently drop it anyway")
+
+
+def test_deterministic_scorer_keeps_all_five_top_level_section_weights():
+    """Regression guard: w_analyst/w_earnings were initially excluded (only
+    w_technical/w_fundamental/w_macro were kept) on the reasoning "no
+    Analyst/Earnings section row exists on this card" -- true for their own
+    SUB-detail settings, but final_score() combines all five section weights
+    into ONE rec.signal/rec.confidence, which _render_export_card renders
+    as the header badge on every card regardless of _build_export_metrics.
+    All five must stay curated-in together, or the header can be silently
+    driven by a setting the user can no longer see or tune from this card."""
+    relevant = set(DeterministicScorer.export_relevant_settings())
+    assert {"w_technical", "w_fundamental", "w_analyst", "w_earnings", "w_macro"} <= relevant
