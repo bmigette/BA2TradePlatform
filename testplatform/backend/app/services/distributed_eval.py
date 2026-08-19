@@ -258,6 +258,11 @@ class DistributedEvaluator:
             try:
                 _health = worker_client.health(w)
                 w["capacity"] = max(1, int(_health.get("capacity") or 1))
+                # The daemon's ceiling, NOT the pool's current size -- a worker we shrank
+                # for a narrow job must still be growable back for a wide one. Older
+                # workers omit capacity_max; fall back to what they do report.
+                w["capacity_max"] = max(1, int(_health.get("capacity_max")
+                                               or _health.get("capacity") or 1))
                 # Log the worker's RAM at pre-flight (added 2026-08-09, alongside the worker's new
                 # /health memory block). Memory is what actually degrades a trial host, and until
                 # now the master could not see a remote's pressure at all -- a remote stall looked
@@ -272,15 +277,45 @@ class DistributedEvaluator:
                                      if (_mem.get("used_pct") or 0) >= 90 else ""))
             except Exception:  # noqa: BLE001 — fall back to 1 slot if /health didn't report
                 w["capacity"] = max(1, int(w.get("capacity") or 1))
+            self._size_remote_pool(w)
             return True
         except Exception as e:  # noqa: BLE001 — a bad worker must never abort the run
             self.log(f"worker {w.get('name')} pre-flight failed: {e}; excluding")
             return False
 
+    def _size_remote_pool(self, w: dict) -> None:
+        """Size *w*'s trial pool to the slots THIS job will actually engage.
+
+        A worker's pool children are resident whether or not the master dispatches to them,
+        so leaving a 12-slot pool up to serve 6 engaged slots wastes ~half the box (measured
+        on remote150: 12 children, 41 GB, for 6 slots). Sized here, at pre-flight, because a
+        rebuild is only safe while the worker is idle.
+
+        Best-effort throughout: an older worker with no /pool/resize, or one that refuses
+        because another optimization is mid-trial, simply keeps its current size. This must
+        never be a reason to drop a usable worker.
+        """
+        want = self._engaged_slots(w)
+        if want == int(w.get("capacity") or 0):
+            return  # the pool is already exactly this size
+        try:
+            out = worker_client.resize_pool(w, want)
+        except Exception as e:  # noqa: BLE001 — pre-Aug-2026 workers have no such endpoint
+            self.log(f"worker {w['name']} pool resize to {want} unavailable ({e}); "
+                     f"keeping its {w.get('capacity')}-slot pool")
+            return
+        if out.get("changed"):
+            w["capacity"] = max(1, int(out.get("capacity") or want))
+            self.log(f"worker {w['name']} pool resized to {w['capacity']} slot(s) for this "
+                     f"job -- surplus children released")
+        elif not out.get("ok"):
+            self.log(f"worker {w['name']} kept its {out.get('capacity')}-slot pool "
+                     f"({out.get('reason')})")
+
     def _engaged_slots(self, w: dict) -> int:
         """Slots actually engaged for *w*: its reported capacity, capped by
         ``max_remote_slots_per_worker`` if the run set one."""
-        cap = max(1, int(w.get("capacity") or 1))
+        cap = max(1, int(w.get("capacity_max") or w.get("capacity") or 1))
         if self.max_remote_slots_per_worker:
             cap = min(cap, self.max_remote_slots_per_worker)
         return cap

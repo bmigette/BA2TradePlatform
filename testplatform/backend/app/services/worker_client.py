@@ -114,6 +114,20 @@ _NEVER_STARTED_GRACE = 420.0
 _NO_PROGRESS_TIMEOUT = 900.0
 
 
+def resize_pool(worker: dict, workers: int, timeout: float = 120.0) -> dict:
+    """Ask *worker* to size its trial pool to *workers* slots for the coming job.
+
+    Generous timeout: the worker tears its pool down and respawns, which on a box that has
+    been paging can take a while. Returns the worker's verdict -- a refusal (trials in
+    flight) is a normal answer, not an error.
+    """
+    with httpx.Client(timeout=timeout) as c:
+        r = c.post(f"{_base(worker)}/pool/resize", headers=_headers(worker),
+                   json={"workers": int(workers)})
+        r.raise_for_status()
+        return r.json()
+
+
 def cancel_job(worker: dict, job_id: str, timeout: float = 10.0) -> dict:
     """Best-effort: tell *worker* to abandon *job_id*.
 

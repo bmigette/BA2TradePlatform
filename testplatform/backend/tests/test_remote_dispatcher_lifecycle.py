@@ -161,3 +161,73 @@ def test_backpressure_result_is_recognised_as_such():
     assert not _is_backpressure({"retryable": True})
     assert not _is_backpressure({"ok": True})
     assert not _is_backpressure(None)
+
+
+# ------------------------------------------------------------------ per-job pool sizing
+
+def test_engaged_slots_reasons_about_the_ceiling_not_the_current_pool_size():
+    """After a narrow job shrank the pool to 6, a wide job must still engage 12 -- capping off
+    the momentary `capacity` made the shrink permanent for the daemon's whole life."""
+    ev = _ev(cap=12)
+    w = {"name": "remote150", "capacity": 6, "capacity_max": 12}
+    assert ev._engaged_slots(w) == 12
+
+
+def test_engaged_slots_still_honours_the_per_job_cap():
+    ev = _ev(cap=6)
+    w = {"name": "remote150", "capacity": 12, "capacity_max": 12}
+    assert ev._engaged_slots(w) == 6
+
+
+def test_engaged_slots_falls_back_when_the_worker_reports_no_ceiling():
+    """A worker predating capacity_max must keep working unchanged."""
+    ev = _ev(cap=12)
+    assert ev._engaged_slots({"name": "remote150", "capacity": 8}) == 8
+
+
+def test_pool_is_resized_to_the_slots_this_job_will_engage(monkeypatch):
+    ev = _ev(cap=6)
+    w = {"name": "remote150", "capacity": 12, "capacity_max": 12}
+    calls = []
+    from app.services import distributed_eval as de
+    monkeypatch.setattr(de.worker_client, "resize_pool",
+                        lambda worker, n: calls.append(n) or {"ok": True, "capacity": n,
+                                                              "changed": True})
+    ev._size_remote_pool(w)
+    assert calls == [6]
+    assert w["capacity"] == 6, "the master must track the pool's new size"
+
+
+def test_no_resize_when_the_pool_is_already_the_right_size(monkeypatch):
+    ev = _ev(cap=6)
+    w = {"name": "remote150", "capacity": 6, "capacity_max": 12}
+    called = []
+    from app.services import distributed_eval as de
+    monkeypatch.setattr(de.worker_client, "resize_pool", lambda worker, n: called.append(n))
+    ev._size_remote_pool(w)
+    assert called == [], "re-spawning an identical pool would discard a warm one for nothing"
+
+
+def test_a_worker_without_the_resize_endpoint_is_still_usable(monkeypatch):
+    """Best-effort: an older worker keeps its pool and the run continues."""
+    ev = _ev(cap=6)
+    w = {"name": "remote150", "capacity": 12, "capacity_max": 12}
+    from app.services import distributed_eval as de
+
+    def _boom(worker, n):
+        raise RuntimeError("404 Not Found")
+
+    monkeypatch.setattr(de.worker_client, "resize_pool", _boom)
+    ev._size_remote_pool(w)                 # must not raise
+    assert w["capacity"] == 12, "unchanged, and the worker stays in the fleet"
+
+
+def test_a_refused_resize_leaves_the_running_size_in_place(monkeypatch):
+    ev = _ev(cap=6)
+    w = {"name": "remote150", "capacity": 12, "capacity_max": 12}
+    from app.services import distributed_eval as de
+    monkeypatch.setattr(de.worker_client, "resize_pool",
+                        lambda worker, n: {"ok": False, "capacity": 12, "changed": False,
+                                           "reason": "3 trial(s) in flight"})
+    ev._size_remote_pool(w)
+    assert w["capacity"] == 12

@@ -61,6 +61,10 @@ worker_app = FastAPI(title="BA2 Remote Worker", docs_url=None, redoc_url=None, o
 # Set by run_worker_server() before uvicorn starts.
 _PASSWORD: Optional[str] = None
 _CAPACITY: int = 1
+# The daemon's --workers value: the largest pool it may ever hold. _CAPACITY is the CURRENT
+# size and moves with per-job resizing; this does not. Keeping them apart is what stops a
+# narrow job's shrink from permanently capping every later job.
+_CAPACITY_MAX: int = 1
 _POOL: Optional[ProcessPoolExecutor] = None
 # Rebuilds _POOL after a BrokenProcessPool (set alongside _POOL in run_worker_server).
 _POOL_FACTORY = None
@@ -241,6 +245,10 @@ _MEM_POLL_S = float(os.getenv("BT_WORKER_MEM_POLL_S", "60"))
 
 class _MemoryPressure(Exception):
     """Reason handed to _rebuild_pool when the pool is recycled for memory, not for a crash."""
+
+
+class _PoolResize(Exception):
+    """Reason handed to _rebuild_pool when the master sized the pool for a new job."""
 
 
 def _free_mem_pct() -> Optional[float]:
@@ -597,8 +605,48 @@ def health(authorization: str = Header(default=None)):
     _sweep_orphaned_jobs()
     with _JOBS_LOCK:
         busy = sum(1 for f in _JOBS.values() if not f.done())
-    return {"ok": True, "capacity": _CAPACITY, "busy": busy, "free": max(0, _CAPACITY - busy),
+    return {"ok": True, "capacity": _CAPACITY, "capacity_max": _CAPACITY_MAX,
+            "busy": busy, "free": max(0, _CAPACITY - busy),
             "version": self_update.get_version_info(), **_hardware()}
+
+
+@worker_app.post("/pool/resize")
+def pool_resize(body: dict, authorization: str = Header(default=None)):
+    """Resize the trial pool to ``workers`` slots, for the job the master is about to run.
+
+    WHY THIS EXISTS. Pool children are spawned once at daemon start and stay resident no
+    matter how few slots the master dispatches, so a master-side cap never reclaimed
+    anything -- remote150 held 12 children (~41 GB) to serve 6 engaged slots. Rebuilding at
+    the new size is what actually returns the surplus children's working sets to the OS.
+
+    Refused while trials are in flight: two optimizations can share a worker (the grid runs
+    --parallel 2) and a rebuild under a live trial would discard it. The running size wins
+    and the caller is told why, rather than the resize silently half-applying.
+    """
+    _verify(authorization)
+    global _CAPACITY
+    try:
+        want = int(body.get("workers"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="workers must be an integer >= 1")
+    if want < 1:
+        raise HTTPException(status_code=400, detail="workers must be an integer >= 1")
+    want = min(want, _CAPACITY_MAX)  # never spawn more children than the daemon was sized for
+    if want == _CAPACITY:
+        return {"ok": True, "capacity": _CAPACITY, "changed": False,
+                "reason": "already at that size"}
+    busy = _busy_job_count()
+    if busy:
+        logger.warning("refusing pool resize %d -> %d: %d trial(s) in flight",
+                       _CAPACITY, want, busy)
+        return {"ok": False, "capacity": _CAPACITY, "changed": False,
+                "reason": f"{busy} trial(s) in flight"}
+    was = _CAPACITY
+    _CAPACITY = want
+    logger.warning("resizing trial pool %d -> %d slots (per-job sizing from the master)",
+                   was, want)
+    _rebuild_pool(_PoolResize(f"resize {was} -> {want}"))
+    return {"ok": True, "capacity": _CAPACITY, "changed": True}
 
 
 @worker_app.get("/version")
@@ -982,11 +1030,12 @@ def run_worker_server(host: str, port: int, password: str, n_workers: int) -> No
         _BACKEND_DIR, _WORKER_ENV_KEYS, _worker_init,
     )
 
-    global _PASSWORD, _CAPACITY, _POOL, _POOL_FACTORY
+    global _PASSWORD, _CAPACITY, _CAPACITY_MAX, _POOL, _POOL_FACTORY
     if not password:
         raise SystemExit("ba2-test worker: --password (or $BA2_WORKER_PASSWORD) is required.")
     _PASSWORD = password
     _CAPACITY = max(1, n_workers)
+    _CAPACITY_MAX = _CAPACITY
     # Hermetic trials run cache-only, so provider keys aren't required here; mirror any that
     # happen to be set (harmless) so a non-hermetic edge still resolves them.
     env = {k: os.environ[k] for k in _WORKER_ENV_KEYS if os.environ.get(k)}
