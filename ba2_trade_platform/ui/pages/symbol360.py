@@ -74,12 +74,21 @@ def _fetch_header(symbol: str) -> Optional[Dict[str, Any]]:
 
 
 def _fetch_chart(symbol: str) -> Optional[Tuple[pd.DataFrame, Dict[str, pd.DataFrame]]]:
-    ohlcv_provider = get_provider("ohlcv", "fmp")   # raises if FMP_API_KEY unset
+    # get_provider("ohlcv", "fmp") -> FMPOHLCVProvider.__init__ raises ValueError immediately
+    # when FMP_API_KEY is unset; guard upfront (same pattern as _fetch_header/_fetch_rvol/
+    # _fetch_congress) so a missing key degrades to an "unavailable" card instead of an
+    # uncaught exception that _run logs as a scary ERROR-level stack trace.
+    if not get_app_setting("FMP_API_KEY"):
+        return None
+    ohlcv_provider = get_provider("ohlcv", "fmp")
     indicator_calc = PandasIndicatorCalc(ohlcv_provider)   # ctor REQUIRES ohlcv_provider
     return build_chart_data(symbol, ohlcv_provider, indicator_calc)
 
 
 def _fetch_weinstein(symbol: str) -> Optional[Dict[str, Any]]:
+    # See _fetch_chart's comment -- same missing-key guard, same reason.
+    if not get_app_setting("FMP_API_KEY"):
+        return None
     ohlcv_provider = get_provider("ohlcv", "fmp")
     end_date = datetime.now()
     start_date = end_date - timedelta(days=_WEINSTEIN_LOOKBACK_DAYS)
