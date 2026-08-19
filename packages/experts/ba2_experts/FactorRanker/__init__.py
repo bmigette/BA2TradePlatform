@@ -91,6 +91,19 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
     # TradeRiskManagement / position_sizing); the optimizer drops rm:*/cond:/exit:/tp/sl.
     bypasses_classic_rm: bool = True
 
+    # SYMBOL360's export card only shows the composite factor z-score + one
+    # row per factor (momentum/value/quality/pead) -- see
+    # _build_export_metrics below. factor_weight_*/winsorize_pct/
+    # pead_drift_window_days directly shape those. Excludes: top_n/weighting/
+    # max_weight_per_name/gross_exposure (portfolio CONSTRUCTION across a
+    # book, never reflected in a single-symbol composite/factor display);
+    # universe_source/min_price/min_dollar_volume/screener_store (universe
+    # RESOLUTION, moot here since export_symbol_data pins the universe to
+    # exactly the requested symbol regardless of these).
+    EXPORT_RELEVANT_SETTINGS = ("factor_weight_momentum", "factor_weight_value",
+                                "factor_weight_quality", "factor_weight_pead",
+                                "winsorize_pct", "pead_drift_window_days")
+
     @classmethod
     def description(cls) -> str:
         return ("Configurable cross-sectional multi-factor equity ranker "

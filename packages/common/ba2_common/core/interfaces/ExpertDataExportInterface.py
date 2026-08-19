@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ba2_common.core.backtest_context import BacktestContext, LiveProviderBundle
 from ba2_common.core.interfaces.MarketExpertInterface import MarketExpertInterface
@@ -50,6 +50,13 @@ class ExpertDataExport:
     skipped: bool = False   # True when the expert's Recommendation had skip=True
                              # (e.g. no analyst coverage, empty universe) — distinct
                              # from a normal HOLD; see rec.skip_reason on the metric row
+    relevant_settings: Tuple[str, ...] = ()
+    # Curated allowlist of settings_used keys worth showing/editing in a
+    # SYMBOL360-style UI settings panel -- see
+    # ExpertDataExportInterface.export_relevant_settings(). settings_used
+    # itself is untouched (still the FULL merged dict, needed for
+    # correctness elsewhere); this only tells a UI which keys are worth a
+    # user's attention for THIS expert's displayed metrics.
 
 
 _SIGNAL_MAP = {
@@ -76,6 +83,19 @@ class ExpertDataExportInterface:
     contract) — export_symbol_data raises AttributeError, caught into
     ExpertDataExport.error, for anything that isn't wired that way."""
 
+    #: Optional curated allowlist of setting keys worth exposing in a
+    #: SYMBOL360-style UI settings panel: knobs that change what THIS
+    #: expert's export_symbol_data metrics/signal actually display, not
+    #: execution/sizing knobs (position sizing, profit targets, universe-
+    #: selection plumbing, live-only risk-manager settings, ...) that never
+    #: surface in _build_export_metrics and would just be confusing clutter.
+    #: None (the default) means "no curation declared" -- see
+    #: export_relevant_settings() for the fallback. Override per expert,
+    #: e.g. FMPEarningsDrift = ("surprise_min_pct", "max_days_since_report")
+    #: (excluding its own expected_profit_percent/_mode/dynamic_scale, which
+    #: only affect a Recommendation field this expert's card never renders).
+    EXPORT_RELEVANT_SETTINGS: Optional[Tuple[str, ...]] = None
+
     @classmethod
     def export_default_settings(cls) -> Dict[str, Any]:
         """Class-default settings, INCLUDING builtin keys (enabled_instruments,
@@ -83,6 +103,22 @@ class ExpertDataExportInterface:
         single-symbol override (a later plan task)."""
         return {k: d.get("default")
                 for k, d in cls.get_merged_settings_definitions().items()}
+
+    @classmethod
+    def export_relevant_settings(cls) -> Tuple[str, ...]:
+        """Keys from settings_used worth showing in a UI settings panel.
+
+        Falls back to this expert's OWN declared settings only
+        (get_settings_definitions(), never get_merged_settings_definitions())
+        when EXPORT_RELEVANT_SETTINGS isn't set — i.e. every generic
+        base-class setting (enable_buy, risk_manager_model, screener_*,
+        sizing_mode, ...) is excluded by default regardless of which expert,
+        since none of those are ever reflected in an export card's displayed
+        metrics. Override EXPORT_RELEVANT_SETTINGS to narrow further when an
+        expert's OWN settings still include execution-only knobs."""
+        if cls.EXPORT_RELEVANT_SETTINGS is not None:
+            return cls.EXPORT_RELEVANT_SETTINGS
+        return tuple(cls.get_settings_definitions().keys())
 
     @classmethod
     def _bypass_instance(cls, settings: Dict[str, Any], providers=None, symbol: Optional[str] = None):
@@ -167,7 +203,7 @@ class ExpertDataExportInterface:
                 overall_signal=_SIGNAL_MAP.get(rec.signal),
                 confidence=rec.confidence, metrics=metrics,
                 settings_used=settings, raw=dict(rec.raw_outputs or {}),
-                skipped=rec.skip)
+                skipped=rec.skip, relevant_settings=cls.export_relevant_settings())
         except Exception as e:  # noqa: BLE001 — intentional: this IS the isolation boundary
             _module_logger.warning(f"{cls.__name__}.export_symbol_data({symbol}) failed: {e}",
                                    exc_info=True)

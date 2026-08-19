@@ -164,6 +164,15 @@ class FMPRating(ExpertDataExportInterface, AnalysisStatusRenderMixin, FMPApiKeyM
     RENDER_PENDING_MESSAGE = 'FMPRating analysis for {symbol} is queued'
     RENDER_RUNNING_MESSAGE = 'Fetching analyst price targets for {symbol}...'
 
+    # profit_ratio/target_price_type shape the displayed "Analyst target
+    # upside" row; min_analysts/min_price_targets_per_quarter/
+    # max_analyst_age_months gate the skip/analyst-count rows. Excludes
+    # price_target_window_days, which is documented (get_settings_definitions)
+    # as BACKTEST-ONLY -- "has no effect on the live (as_of=None) path", and
+    # SYMBOL360 always calls with as_of=None, so it's dead weight here.
+    EXPORT_RELEVANT_SETTINGS = ("profit_ratio", "min_analysts", "target_price_type",
+                                "min_price_targets_per_quarter", "max_analyst_age_months")
+
     @classmethod
     def description(cls) -> str:
         return "FMP analyst price consensus with profit potential calculation"

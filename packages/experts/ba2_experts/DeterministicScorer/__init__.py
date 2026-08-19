@@ -61,6 +61,30 @@ class DeterministicScorer(ExpertDataExportInterface, AnalysisStatusRenderMixin,
     RENDER_PENDING = "Deterministic scoring queued…"
     RENDER_RUNNING = "Computing technical/fundamental/macro scores…"
 
+    # SYMBOL360's export card only shows the Technical/Fundamental/Macro
+    # section scores + the fundamental snapshot rows (F-Score, Altman Z,
+    # quality/value/growth) -- see _build_export_metrics below. Excludes
+    # every knob that only feeds a section this card never renders: the
+    # ANALYST section (w_analyst, analyst_*, aw_*) and EARNINGS/PEAD section
+    # (w_earnings, earnings_*) have no corresponding rows; atr_period/
+    # k_stop/k_target/target_from_score only shape the ATR target/stop
+    # levels, which this research card doesn't display either.
+    EXPORT_RELEVANT_SETTINGS = (
+        "w_technical", "w_fundamental", "macro_mode", "m_floor",
+        "hard_riskoff", "macro_gate_min", "w_macro",
+        "k_compress", "theta_buy", "theta_sell", "veto_cap", "skip_on_missing_section",
+        "mom_lookback_days", "mom_skip_days", "vol_window", "sma_trend_period",
+        "rsi_period", "donchian_period", "adx_period", "adx_gate", "adx_rsi_boost",
+        "tw_mom", "tw_d200", "tw_rsi", "tw_don",
+        "scale_momvol", "scale_d200", "scale_rsi",
+        "fw_piotroski", "fw_quality", "fw_value", "fw_growth",
+        "z_veto", "z_veto_adjusted", "altman_variant",
+        "fscore_disqualify", "scale_accel", "fundamentals_max_age_days",
+        "mw_trend_index", "mw_vix", "mw_credit", "mw_yield_curve", "mw_sahm",
+        "vix_calm", "vix_stress", "yc_scale", "index_symbol",
+        "min_history_days",
+    )
+
     # TRADE-FREQUENCY OBJECTIVE for this expert only (2026-08-09). The platform default is a 12/yr
     # hard floor with full credit at 30/yr, which suits a high-turnover screener expert. This one
     # gates entries on AGREEMENT across five sections (analyst / earnings / fundamental / macro /

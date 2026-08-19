@@ -184,3 +184,43 @@ def test_export_symbol_data_respects_class_level_get_current_price_override(monk
     result = _LivePriceExpert.export_symbol_data("AAPL", providers_resolver=_resolver)
     assert result.error is None
     assert result.raw["current_price"] == 99.0
+
+
+# ---------------------------------------------------------------------------
+# export_relevant_settings / ExpertDataExport.relevant_settings
+# ---------------------------------------------------------------------------
+
+def test_export_relevant_settings_defaults_to_own_settings_only():
+    """No EXPORT_RELEVANT_SETTINGS declared -> falls back to
+    get_settings_definitions() (this expert's OWN keys), NOT
+    get_merged_settings_definitions() -- the ~50 generic base-class settings
+    (enable_buy, risk_manager_model, screener_*, sizing_mode, ...) must never
+    appear here regardless of which expert, since none of them are ever
+    reflected in an export card's displayed metrics."""
+    relevant = _DummyExpert.export_relevant_settings()
+    assert set(relevant) == {"threshold", "force_skip"}
+    assert "enable_buy" not in relevant
+    assert "risk_manager_model" not in relevant
+
+
+def test_export_relevant_settings_override_narrows_further():
+    """A subclass declaring EXPORT_RELEVANT_SETTINGS can exclude some of its
+    OWN settings too (e.g. an execution/sizing knob that never surfaces in
+    _build_export_metrics), mirroring FMPEarningsDrift excluding
+    expected_profit_percent/_mode/dynamic_scale."""
+    class _CuratedExpert(_DummyExpert):
+        EXPORT_RELEVANT_SETTINGS = ("threshold",)
+
+    assert _CuratedExpert.export_relevant_settings() == ("threshold",)
+
+
+def test_export_symbol_data_populates_relevant_settings():
+    """export_symbol_data's result carries the SAME tuple
+    export_relevant_settings() would return, so a UI can filter
+    settings_used down to it without a second call."""
+    result = _DummyExpert.export_symbol_data("AAPL", providers_resolver=_resolver)
+    assert result.error is None
+    assert set(result.relevant_settings) == {"threshold", "force_skip"}
+    # settings_used itself is UNCHANGED -- still the full merged dict,
+    # relevant_settings is purely an additional filtering hint.
+    assert "enable_buy" in result.settings_used

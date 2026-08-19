@@ -74,6 +74,13 @@ class FinnHubRating(ExpertDataExportInterface, AnalysisStatusRenderMixin, Market
     RENDER_PENDING_MESSAGE = 'FinnHubRating analysis for {symbol} is queued'
     RENDER_RUNNING_MESSAGE = 'Fetching analyst recommendations for {symbol}...'
 
+    # All 4 own settings directly determine which bucket the consensus mean
+    # (the displayed "Consensus mean" row + overall signal) falls into --
+    # declared explicitly (matches the default own-settings fallback today)
+    # so it stays correct if a future, non-display-relevant setting is added.
+    EXPORT_RELEVANT_SETTINGS = ("buy_threshold", "overweight_threshold",
+                                "hold_threshold", "underweight_threshold")
+
     @classmethod
     def description(cls) -> str:
         return "Finnhub analyst recommendation trends with weighted confidence scoring"

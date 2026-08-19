@@ -533,17 +533,28 @@ class Symbol360Tab:
             self._render_settings_expander(export)
 
     def _render_settings_expander(self, export: ExpertDataExport) -> None:
-        """Collapsed '⚙ Settings' expander pre-filled from settings_used.
-        Dict/list-valued settings (universe configs, schedules, ...) are
-        plumbing, not user-tunable, and are skipped. 'Save & Re-run' only
-        PERSISTS the override (keyed by the real expert_name -- for the
-        Analyst card's two sub-experts that means each is saved under its
-        own name, not a nested blob) and prompts a fresh search; it does not
+        """Collapsed '⚙ Settings' expander pre-filled from settings_used,
+        FILTERED to export.relevant_settings -- the expert's own curated
+        allowlist of knobs that actually change what this card displays
+        (see ExpertDataExportInterface.export_relevant_settings). This
+        excludes both the ~50 generic base-class settings (enable_buy,
+        risk_manager_model, sizing_mode, screener_*, ...) that were never
+        card-relevant for any expert, and each expert's own execution/sizing
+        knobs (e.g. FMPEarningsDrift's expected_profit_percent) that only
+        shape a Recommendation field this card never renders. Dict/list-
+        valued settings (universe configs, schedules, ...) are additionally
+        skipped -- plumbing, not user-tunable, even if a future expert's
+        allowlist accidentally included one. 'Save & Re-run' only PERSISTS
+        the override (keyed by the real expert_name -- for the Analyst
+        card's two sub-experts that means each is saved under its own name,
+        not a nested blob) and prompts a fresh search; it does not
         live-refresh this one card in place (per the design doc, that's
         acceptable for this task)."""
         with ui.expansion("⚙ Settings").classes("w-full"):
             fields: Dict[str, Tuple[Any, type]] = {}
             for key, value in export.settings_used.items():
+                if key not in export.relevant_settings:
+                    continue
                 if isinstance(value, (dict, list)):
                     continue
                 if isinstance(value, bool):

@@ -165,6 +165,13 @@ class FMPEarningsDrift(ExpertDataExportInterface, AnalysisStatusRenderMixin, Mar
     RENDER_PENDING_MESSAGE = 'Earnings-drift analysis for {symbol} is queued'
     RENDER_RUNNING_MESSAGE = 'Checking latest earnings surprise for {symbol}...'
 
+    # surprise_min_pct/max_days_since_report directly gate the verdict and the
+    # EPS-surprise/days-since/within-window rows a SYMBOL360 card displays.
+    # expected_profit_percent/_mode/dynamic_scale only shape a Recommendation
+    # field (expected_profit_percent) this expert's export card never renders
+    # -- pure position-sizing, not research/explanation.
+    EXPORT_RELEVANT_SETTINGS = ("surprise_min_pct", "max_days_since_report")
+
     @classmethod
     def description(cls) -> str:
         return "BUY fresh positive earnings surprises (post-earnings-announcement drift)"

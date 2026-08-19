@@ -87,6 +87,12 @@ class FMPInsiderClusterBuy(ExpertDataExportInterface, AnalysisStatusRenderMixin,
     RENDER_PENDING_MESSAGE = 'Insider cluster analysis for {symbol} is queued'
     RENDER_RUNNING_MESSAGE = 'Scanning insider transactions for {symbol}...'
 
+    # lookback_days/min_insiders/min_total_value directly gate cluster
+    # detection and shape the buyer-count/buy-value rows a SYMBOL360 card
+    # displays. expected_profit_percent only shapes a Recommendation field
+    # this expert's export card never renders -- pure position-sizing.
+    EXPORT_RELEVANT_SETTINGS = ("lookback_days", "min_insiders", "min_total_value")
+
     @classmethod
     def description(cls) -> str:
         return "BUY when multiple insiders purchased on the open market within a short window"
