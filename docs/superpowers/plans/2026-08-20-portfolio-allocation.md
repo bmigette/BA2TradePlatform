@@ -8734,6 +8734,18 @@ git commit -m "fix(actions): IncreaseInstrumentShareAction reads buying power vi
 
 ### Task 35: Fractional-aware submission in `AlpacaAccount._submit_order_impl`
 
+> **The fractional gate is now live, and it degrades silently.** Task 31 wired
+> `supports_fractional` to `client.get_account_configurations().fractional_trading` — a SECOND
+> network call, wrapped so a failure cannot void the money, falling back to `False`. So a transient
+> outage makes a fractional-capable account look non-fractional and quietly routes to whole-share
+> sizing. That is the correct conservative direction and this task should keep it.
+>
+> Decide deliberately whether you need to distinguish "known not fractional" from "couldn't ask". If
+> you do, `supports_fractional` has to become tri-state and Task 31's method changes with it. If you
+> don't — and silently sizing whole shares for one run is an acceptable cost — say so explicitly, so
+> the next reader knows it was weighed rather than missed.
+
+
 Read `AlpacaAccount.py:832-980` before touching this. The relevant fact is at
 `:934-940`: `good_for` is mapped through a `tif_map` dict whose keys are
 `'day','gtc','opg','ioc','fok','cls'`, and the lookup is
