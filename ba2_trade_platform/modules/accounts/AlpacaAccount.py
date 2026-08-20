@@ -12,6 +12,11 @@ from ...logger import logger
 from ...core.models import TradingOrder, Position, Transaction
 from ...core.types import OrderDirection, OrderStatus, OrderOpenType, OrderType as CoreOrderType, TransactionStatus
 from ...core.interfaces import AccountInterface
+from ...core.account_types import (
+    AccountSnapshot, CashTransfer, MarginInfo,
+    CASH_TRANSFER_DEPOSIT, CASH_TRANSFER_WITHDRAWAL, CASH_TRANSFER_DIVIDEND,
+    MARGIN_SOURCE_ASSET,
+)
 from ...core.interfaces.OptionsAccountInterface import OptionsAccountInterface
 from ...core.db import get_db, get_instance, update_instance, add_instance
 from sqlmodel import Session, select
@@ -1503,6 +1508,62 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         except Exception as e:
             logger.error(f"Error fetching Alpaca account info: {e}", exc_info=True)
             return None
+
+    def get_account_snapshot(self) -> AccountSnapshot:
+        """Broker-agnostic cash / equity / buying-power view of this Alpaca account.
+
+        Overrides the tolerant base probe because Alpaca needs a SECOND endpoint
+        (get_account_configurations) for the fractional-trading capability, which
+        the base must not call. Every money field on the pydantic TradeAccount is
+        Optional[str] -- including multiplier ("1"/"2"/"4") -- so everything goes
+        through float().
+
+        Returns an ALL-None AccountSnapshot (never None) when get_account_info()
+        returns None on auth failure: the type stays stable and the caller must
+        refuse to plan rather than substitute zeros.
+        """
+        info = self.get_account_info()
+        if info is None:
+            logger.error(f"[Account {self.id}] get_account_info() returned None -- empty snapshot")
+            return AccountSnapshot()
+
+        def _f(name: str) -> Optional[float]:
+            val = getattr(info, name, None)
+            if val is None:
+                return None
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                logger.warning(f"[Account {self.id}] TradeAccount.{name}={val!r} is not numeric")
+                return None
+
+        multiplier = _f('multiplier')
+        equity = _f('equity')
+
+        # TradeAccount carries no fractional flag; AccountConfiguration does.
+        # A failure here must not lose the balances we already have.
+        supports_fractional = False
+        try:
+            supports_fractional = bool(getattr(self.client.get_account_configurations(),
+                                               'fractional_trading', False))
+        except Exception as e:
+            logger.debug(f"[Account {self.id}] Could not read account configurations: {e}")
+
+        return AccountSnapshot(
+            cash=_f('cash'),
+            equity=equity,
+            net_liquidation=equity,
+            buying_power=_f('buying_power'),
+            non_marginable_buying_power=_f('non_marginable_buying_power'),
+            margin_multiplier=multiplier,
+            is_margin_account=bool(multiplier is not None and multiplier > 1.0),
+            long_market_value=_f('long_market_value'),
+            short_market_value=_f('short_market_value'),
+            pending_transfer_in=_f('pending_transfer_in'),
+            supports_fractional=supports_fractional,
+            raw={'account_number': getattr(info, 'account_number', None),
+                 'status': str(getattr(info, 'status', None))},
+        )
 
     @alpaca_api_retry
     def symbols_exist(self, symbols: List[str]) -> Dict[str, bool]:
