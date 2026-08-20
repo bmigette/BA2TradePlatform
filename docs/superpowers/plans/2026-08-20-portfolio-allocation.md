@@ -2495,10 +2495,16 @@ from scratch, it only ever ran on top of a `create_all` database. What does work
 fresh install now gets:
 
 ```bash
-# create_all first, then stamp the pre-existing head and run only this plan's revision.
-BA2_DB_FILE=$DB venv/bin/python -m alembic stamp 0a3e0bd24598
+# create_all first, then stamp and run only what create_all did not already build.
+BA2_DB_FILE=$DB venv/bin/python -m alembic stamp f1a7c2e9b4d0
 BA2_DB_FILE=$DB venv/bin/python -m alembic upgrade head
 ```
+
+**The stamp target changed once Task 8 landed.** The original recipe stamped `0a3e0bd24598` and let
+`f1a7c2e9b4d0` run. That no longer works: `create_all` now also builds the five allocation tables, so
+`f1c8a24b7e05`'s `create_table` hits `table portfolio_allocation_config already exists`. Stamp
+`f1a7c2e9b4d0` — or simply `stamp head`, since on a `create_all` database there is by definition
+nothing left for either revision to do.
 
 On such a database `create_all` has *already* built
 `CREATE UNIQUE INDEX ix_instrument_name ON instrument (name)` (Task 6's model change), and
