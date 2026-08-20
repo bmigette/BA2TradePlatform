@@ -64,12 +64,22 @@ def test_export_symbol_data_pins_single_symbol_universe(monkeypatch):
     assert not result.skipped
     labels = {m.label for m in result.metrics}
     assert "Composite factor score" in labels
-    assert "Factor: value" in labels
+    assert "Factor: value (raw)" in labels
     composite = next(m for m in result.metrics if m.label == "Composite factor score")
     # single-symbol universe -> the composite z-score is exactly 0.0 (no
-    # cross-section to compare against), so the signal is "neutral".
+    # cross-section to compare against, zero variance by definition) --
+    # no signal badge, since it's not a real assessment, just a
+    # mathematical inevitability.
     assert composite.value == 0.0
-    assert composite.signal == "neutral"
+    assert composite.signal is None
+
+    # The RAW (pre-z-score) value factor row is the one that actually
+    # differs by symbol -- this is the whole point of adding it: eps_ttm/
+    # price=10/100 + fcf/ev=0/1 -> value_score = 0.5*0.1 + 0.5*0.0 = 0.05,
+    # not the always-0.0 composite above.
+    value_raw = next(m for m in result.metrics if m.label == "Factor: value (raw)")
+    assert value_raw.value == 0.05
+    assert value_raw.signal is None
 
 
 def test_export_symbol_data_never_touches_db(monkeypatch):
@@ -133,15 +143,18 @@ def test_build_export_metrics_matches_by_symbol_not_position(monkeypatch):
         OrderRecommendation.OVERWEIGHT, 0.0, None, "Ranked 2 names, holding 1",
         raw_outputs={"book": {"universe_size": 2, "ranking": [
             {"symbol": "AAA", "rank": 1, "composite": 1.5, "factors": {"value": 1.5},
-             "target_weight": 1.0, "action": "BUY"},
+             "factors_raw": {"value": 0.09}, "target_weight": 1.0, "action": "BUY"},
             {"symbol": "BBB", "rank": 2, "composite": -0.3, "factors": {"value": -0.3},
-             "target_weight": 0.0, "action": "—"},
+             "factors_raw": {"value": 0.02}, "target_weight": 0.0, "action": "—"},
         ]}})
 
     out = e._build_export_metrics(rec, {})
     composite = next(m for m in out if m.label == "Composite factor score")
     assert composite.value == -0.3   # BBB's row, not AAA's (ranking[0])
-    assert composite.signal == "sell"
+    assert composite.signal is None  # z-score against a peer -- never a signal badge
+
+    value_raw = next(m for m in out if m.label == "Factor: value (raw)")
+    assert value_raw.value == 0.02   # BBB's raw value, not AAA's 0.09
 
 
 def test_build_export_metrics_unmatched_symbol_returns_no_rows(monkeypatch):

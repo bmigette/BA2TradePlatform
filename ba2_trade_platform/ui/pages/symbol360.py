@@ -465,7 +465,12 @@ class Symbol360Tab:
             for t in congress.get("house") or []:
                 t = dict(t); t["_chamber"] = "House"; trades.append(t)
             if not trades:
-                ui.label("No recent trades found").classes("text-sm").style("color: #a0aec0;")
+                # Not a "recent" window -- _fetch_congress's FMP call returns this
+                # symbol's FULL disclosed history in one request (no lookback to
+                # narrow/widen, hence no settings expander on this card), so an
+                # empty result means zero senate/house trades on record, ever.
+                ui.label("No senate/house trades on record for this symbol").classes(
+                    "text-sm").style("color: #a0aec0;")
                 return
             rows = []
             for i, t in enumerate(trades):

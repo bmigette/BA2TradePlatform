@@ -251,8 +251,18 @@ Confidence: {confidence:.1f}%
                         "buy" if is_cluster else "neutral"),
             ExpertMetric("Open-market buyers", buyer_count, str(buyer_count)),
             ExpertMetric("Buy value", buy_value, f"${buy_value:,.0f}"),
-            ExpertMetric("Sell value", sell_value, f"${sell_value:,.0f}",
-                        "sell" if sell_value > buy_value else None),
+            # No signal tag here (was "sell" when sell_value > buy_value): this
+            # expert's Recommendation.signal is structurally ONLY ever BUY (a
+            # cluster was detected) or HOLD (see the class docstring above --
+            # rec.skip is always False and there is no SELL branch anywhere in
+            # _calculate_recommendation). Tagging this row "sell" implied a
+            # directional signal the expert can't actually produce, reading as
+            # contradictory next to an overall HOLD badge. Heavy insider
+            # selling is shown as context (compensation/diversification sales
+            # are routine and not inherently bearish), not as a signal.
+            ExpertMetric("Sell value", sell_value, f"${sell_value:,.0f}", None,
+                        "Informational only -- this expert signals BUY (cluster "
+                        "detected) or HOLD, never SELL." if sell_value > 0 else None),
         ]
         for name, value in sorted((cluster.get("buyers") or {}).items(),
                                   key=lambda kv: -kv[1]):

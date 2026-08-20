@@ -33,6 +33,12 @@ TWO_BUYERS = {
         {"insider_name": "B", "transaction_type": "P-Purchase", "value": 100_000},
     ],
 }
+HEAVY_SELLING_NO_BUYS = {
+    "start_date": "2026-05-14T00:00:00", "end_date": "2026-06-13T00:00:00",
+    "transactions": [
+        {"insider_name": "D", "transaction_type": "S-Sale", "value": 1_800_000},
+    ],
+}
 
 
 class FakeInsider:
@@ -122,3 +128,23 @@ def test_export_symbol_data_not_a_cluster_is_hold():
     assert "Buyer: A" in labels
     assert "Buyer: B" in labels
     assert "Buyer: C" not in labels
+
+
+def test_export_symbol_data_heavy_selling_does_not_show_sell_signal():
+    """sell_value > buy_value used to tag "Sell value" with signal="sell" --
+    misleading, since this expert's Recommendation.signal is structurally
+    only ever BUY or HOLD (see FMPInsiderClusterBuy.py's class docstring),
+    never SELL. The row must stay informational (signal=None) regardless of
+    how lopsided the selling is, with a detail note explaining why."""
+    result = FMPInsiderClusterBuy.export_symbol_data(
+        "AAPL", overrides={"min_insiders": 3, "min_total_value": 200_000.0,
+                          "expected_profit_percent": 10.0},
+        as_of=NOW, providers_resolver=_resolver(HEAVY_SELLING_NO_BUYS))
+    assert result.error is None, result.error
+    assert result.overall_signal == "hold"   # never "sell" -- structurally can't be
+
+    sell_value = next(m for m in result.metrics if m.label == "Sell value")
+    assert sell_value.value == 1_800_000
+    assert sell_value.display == "$1,800,000"
+    assert sell_value.signal is None
+    assert sell_value.detail is not None and "never SELL" in sell_value.detail
