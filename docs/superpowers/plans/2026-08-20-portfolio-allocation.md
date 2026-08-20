@@ -2156,11 +2156,16 @@ The migration gives an existing database the index; this makes the ORM (and `ini
 
 **Files:**
 - Modify: `packages/common/ba2_common/core/models.py:547`
+- Modify: `ba2_trade_platform/ui/pages/settings.py` (blank-name guard in the add/edit dialog)
+- Modify: `ba2_trade_platform/core/JobManager.py` (blank-symbol guard in
+  `submit_market_analysis`, `IntegrityError` handling in `ensure_instrument_exists`)
+- Modify: `ba2_trade_platform/core/InstrumentAutoAdder.py` (`IntegrityError` handling in
+  `_add_instrument_if_missing`)
 - Test: `tests/test_instrument_unique_constraint.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
-Create `tests/test_instrument_unique_constraint.py`:
+Create `tests/test_instrument_unique_constraint.py`. Its core is the constraint itself:
 
 ```python
 """`instrument.name` uniqueness must be enforced by the schema, not by convention.
@@ -2192,14 +2197,44 @@ def test_create_all_emits_a_unique_index_named_ix_instrument_name(test_engine):
     assert unique_on_name == ['ix_instrument_name']
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+The three routed sub-items are covered in the same file, because the constraint and the code that
+has to survive it land together. As written it holds 10 tests:
+
+- `test_inserting_a_second_instrument_with_the_same_name_is_rejected` (above)
+- `test_create_all_emits_a_unique_index_named_ix_instrument_name` (above)
+- `test_create_all_ddl_is_byte_identical_to_the_migrations_ddl` — compiles
+  `CreateIndex` for the sqlite dialect and pins the exact string
+  `CREATE UNIQUE INDEX ix_instrument_name ON instrument (name)`, so the model and revision
+  `f1a7c2e9b4d0` cannot drift.
+- `test_dialog_refuses_to_save_an_instrument_whose_name_is_only_whitespace`,
+  `test_dialog_refuses_to_rename_an_existing_instrument_to_a_blank_name`,
+  `test_dialog_still_saves_a_valid_name_normalised` — the save handler is a closure inside a
+  NiceGUI dialog, so `settings.ui` is replaced with a fake widget module (`_FakeUI`) and the REAL
+  closure is then invoked. Asserts no row is written, the notification type is `negative`, and the
+  dialog is not closed; the third is the positive control.
+- `test_submit_market_analysis_refuses_a_blank_symbol`,
+  `test_submit_market_analysis_still_accepts_a_real_symbol` — `JobManager.__new__(JobManager)` with
+  `get_worker_queue` faked; asserts `ValueError` and that nothing was queued.
+- `test_two_threads_calling_ensure_instrument_exists_create_one_row`,
+  `test_two_threads_auto_adding_the_same_symbol_create_one_row` — two real threads. The
+  session-scoped test engine is `sqlite:///:memory:` on a `SingletonThreadPool`, which gives every
+  THREAD its own empty database, so these build a throwaway file DB with the production
+  `_build_engine` and point `ba2_common.core.db._engine` at it. `get_db` is wrapped so each thread
+  parks on a `threading.Barrier` after its first query: both leave their SELECT having missed, and
+  both then INSERT. `_add_instrument_if_missing` swallows and logs its exceptions, so "no
+  exception" is asserted against a logger spy.
+
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `venv/bin/python -m pytest tests/test_instrument_unique_constraint.py -v`
 Expected: FAIL — `test_inserting_a_second_instrument...` fails with
 `Failed: DID NOT RAISE <class 'sqlalchemy.exc.IntegrityError'>`, and
 `test_create_all_emits_a_unique_index...` with `AssertionError: assert [] == ['ix_instrument_name']`.
+Actual: 8 failed, 2 passed — the two positive controls pass before the change, as they must; the
+race tests fail with `assert ['RACE', 'RACE'] == ['RACE']` (today's harmless duplicate row) and the
+dialog tests with `assert [''] == []` (today's `Instrument(name='')`).
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 In `packages/common/ba2_common/core/models.py`, replace line 547 (note the existing line has one
 trailing space after `str`):
@@ -2211,16 +2246,83 @@ trailing space after `str`):
 with:
 
 ```python
+    # unique+index emits `CREATE UNIQUE INDEX ix_instrument_name ON instrument (name)`,
+    # byte-identical to what Alembic revision f1a7c2e9b4d0 creates -- so a migrated
+    # database and a fresh create_all() one end up with the same schema.
     name: str = Field(unique=True, index=True)
 ```
 
-`Field` is already imported at the top of the file; no other change is needed. No `alembic/env.py`
-change is needed either — it already imports the models through the shim.
+`Field` is already imported at the top of the file. No `alembic/env.py` change is needed either —
+it already imports the models through the shim. Verified: the emitted `CREATE TABLE instrument` is
+byte-identical before and after (only the index is added).
 
-- [ ] **Step 4: Run test to verify it passes**
+Then the three routed sub-items.
+
+**a. `ui/pages/settings.py`** — in the add/edit dialog's `save()`, guard above the `is_edit` branch
+(so it covers both create and rename) and above `session = get_db()` (so a rejected click does not
+open a session):
+
+```python
+                    name = normalize_symbol(name_input.value)
+                    if not name:
+                        logger.warning('Rejected instrument save: name is empty after normalisation')
+                        ui.notify('Instrument name is required', type='negative')
+                        return
+                    session = get_db()
+                    labels = [l.strip() for l in labels_input.value.split(',')] if labels_input.value else []
+```
+
+**b. `core/JobManager.py`** — `from sqlalchemy.exc import IntegrityError`, then in
+`ensure_instrument_exists` wrap the commit:
+
+```python
+            try:
+                session.commit()
+                logger.info(f"Auto-added instrument '{symbol}' to database with label 'auto_added'")
+            except IntegrityError:
+                session.rollback()
+                existing_instrument = session.exec(
+                    select(Instrument).where(Instrument.name == symbol)
+                ).first()
+                if existing_instrument is None:
+                    raise
+                logger.info(f"Instrument '{symbol}' was created concurrently; using the existing row")
+```
+
+and in `submit_market_analysis`, immediately after `symbol = ensure_instrument_exists(symbol)`:
+
+```python
+        if not symbol:
+            raise ValueError("Cannot submit market analysis for a blank symbol")
+```
+
+(also documented in the method's `Raises:` block).
+
+**c. `core/InstrumentAutoAdder.py`** — `from sqlalchemy.exc import IntegrityError`, then wrap the
+insert. `add_instance` owns its session and its `with Session(...)` already rolled back and closed
+it, so the handler only re-selects:
+
+```python
+            try:
+                instrument_id = add_instance(instrument)
+            except IntegrityError:
+                with get_db() as session:
+                    winner = session.exec(
+                        select(Instrument).where(Instrument.name == symbol)
+                    ).first()
+                    if winner is None:
+                        raise
+                    logger.info(f"Instrument {symbol} was added concurrently (ID {winner.id}); keeping the existing row")
+                return
+```
+
+The re-select in (b) and (c) is load-bearing: if the row is still missing, the `IntegrityError` was
+some other constraint and is re-raised rather than silently treated as a lost race.
+
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `venv/bin/python -m pytest tests/test_instrument_unique_constraint.py -v`
-Expected: PASS (2 passed).
+Expected: PASS (10 passed).
 
 Now re-run every test that writes Instrument rows, per file (the full suite is flaky from a
 pre-existing session leak):
@@ -2239,10 +2341,12 @@ Expected: all PASS. (`tests/test_instrument_merge.py` and `tests/test_instrument
 build their `instrument` table with raw SQL precisely so the new unique index cannot stop them
 from inserting the duplicates they exist to merge.)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
-git add packages/common/ba2_common/core/models.py tests/test_instrument_unique_constraint.py
+git add packages/common/ba2_common/core/models.py ba2_trade_platform/core/JobManager.py \
+    ba2_trade_platform/core/InstrumentAutoAdder.py ba2_trade_platform/ui/pages/settings.py \
+    tests/test_instrument_unique_constraint.py
 git commit -m "feat(models): make Instrument.name unique and indexed"
 ```
 
@@ -2292,6 +2396,23 @@ pre-existing head `0a3e0bd24598`, and `init_db()`'s `create_all` has already mat
 Alembic does not know about (`option_activity`, `option_iv_snapshot`, `provider_cache`). The
 upgrade may therefore fail with a duplicate-column error before it ever reaches this plan's
 revisions — check `PRAGMA table_info` on those tables and consider `alembic stamp` first.
+
+Confirmed during Task 6 on throwaway databases: `alembic upgrade head` from an **empty** file dies
+early with `NoSuchTableError: expertrecommendation` — the migration chain has never been runnable
+from scratch, it only ever ran on top of a `create_all` database. What does work, and is what a
+fresh install now gets:
+
+```bash
+# create_all first, then stamp the pre-existing head and run only this plan's revision.
+BA2_DB_FILE=$DB venv/bin/python -m alembic stamp 0a3e0bd24598
+BA2_DB_FILE=$DB venv/bin/python -m alembic upgrade head
+```
+
+On such a database `create_all` has *already* built
+`CREATE UNIQUE INDEX ix_instrument_name ON instrument (name)` (Task 6's model change), and
+`f1a7c2e9b4d0` correctly detects it, verifies it is UNIQUE over exactly `(name)`, skips the
+`create_index`, and lands at head. The two provisioning paths were verified to produce the
+identical `sqlite_master` entry.
 
 Note the two different env vars: **alembic** reads `BA2_DB_FILE` (`alembic/env.py:21`), while the
 **app** reads `DB_FILE` (`ba2_trade_platform/config.py:16`). The commands above target alembic, so
