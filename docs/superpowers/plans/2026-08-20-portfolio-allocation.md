@@ -15983,6 +15983,14 @@ git commit -m "feat(allocation): allocatable-base snapshot for the wizard"
 > `0.0` for an order that FREES buying power. That is a real zero and semantically different from no
 > impact at all; treating it as falsy silently drops the re-solve for exactly the orders that would
 > have given headroom back.
+>
+> **Keep precheck-derived margin out of `_margin_info_cache`.** Task 32's cache holds only immutable
+> Asset facts and re-derives `bp_factor` per call from the live account multiplier — because Alpaca
+> moves an account between 1x/2x/4x as it crosses the PDT threshold, and a cached factor would go
+> stale for days. That repricing branch treats a cached entry's `initial_margin_rate` as the source
+> of truth. A `MARGIN_SOURCE_PRECHECK` entry's `bp_factor` is already ABSOLUTE, not
+> multiplier-relative, so caching one there would get it multiplied a second time. Either keep
+> precheck results out of that cache entirely, or give them an explicit `initial_margin_rate`.
 
 
 Pure-testable: `build_position_states` (fake account + in-memory DB), `fetch_margin_info`,
