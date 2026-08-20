@@ -250,3 +250,47 @@ def test_quantity_below_min_order_size_is_dropped_to_zero():
                                  allow_fractional=True, default_bp_factor=1.0)
     assert plan.rows[0].target_quantity == 0.0
     assert plan.rows[0].delta_quantity == 0.0
+
+
+def test_buys_scale_pro_rata_when_they_exceed_buying_power():
+    labels = [LabelTarget("ONE", 100.0, [SymbolTarget("MARG", 50.0), SymbolTarget("NONM", 50.0)])]
+    current = {"MARG": _pos("MARG", 100.0), "NONM": _pos("NONM", 100.0)}
+    margin = {
+        "MARG": MarginInfo(symbol="MARG", bp_factor=1.0, marginable=True),
+        "NONM": MarginInfo(symbol="NONM", bp_factor=2.0, marginable=False),
+    }
+    plan = pa.compute_allocation(100_000.0, 60_000.0, labels, current, margin,
+                                 allow_fractional=False, default_bp_factor=2.0)
+    by = {r.symbol: r for r in plan.rows}
+    assert plan.scale_factor == pytest.approx(0.4)
+    assert by["MARG"].delta_quantity == 200.0
+    assert by["NONM"].delta_quantity == 200.0
+    assert by["MARG"].bp_cost == pytest.approx(20_000.0)
+    assert by["NONM"].bp_cost == pytest.approx(40_000.0)
+    assert plan.required_buying_power == pytest.approx(60_000.0)
+    assert plan.bp_usage_pct == pytest.approx(100.0)
+    assert pa.REASON_NOT_MARGINABLE in by["NONM"].reasons
+    assert "scaled ×0.40 to fit buying power" in by["MARG"].reasons
+
+
+def test_sells_are_never_scaled_down():
+    labels = [LabelTarget("ONE", 100.0, [SymbolTarget("BUYME", 50.0), SymbolTarget("SELLME", 50.0)])]
+    current = {"BUYME": _pos("BUYME", 100.0),
+               "SELLME": _pos("SELLME", 100.0, quantity=1000.0, cost_basis=100_000.0)}
+    plan = pa.compute_allocation(100_000.0, 1_000.0, labels, current, {},
+                                 allow_fractional=False, default_bp_factor=1.0)
+    by = {r.symbol: r for r in plan.rows}
+    assert by["SELLME"].delta_quantity == -500.0
+    assert by["SELLME"].estimated_value == 50_000.0
+    assert not any("scaled" in r for r in by["SELLME"].reasons)
+    assert by["BUYME"].delta_quantity == 10.0
+    assert plan.total_sell_value == 50_000.0
+
+
+def test_zero_buying_power_skips_every_buy():
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
+    plan = pa.compute_allocation(10_000.0, 0.0, labels,
+                                 {"XXX": _pos("XXX", 100.0)}, {},
+                                 allow_fractional=False, default_bp_factor=1.0)
+    assert plan.rows[0].skipped is True
+    assert plan.total_buy_value == 0.0

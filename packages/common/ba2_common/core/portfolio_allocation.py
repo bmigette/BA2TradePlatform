@@ -277,6 +277,46 @@ def _finalise_totals(plan: AllocationPlan) -> None:
                          if plan.available_buying_power > 0 else 0.0)
 
 
+def _apply_bp_scaling(rows: List[AllocationRow], available_buying_power: float, *,
+                      allow_fractional: bool,
+                      margin: Optional[Dict[str, MarginInfo]] = None) -> float:
+    """Scale every BUY pro-rata until the plan fits available buying power.
+
+    SELLS NEVER SCALE -- they free buying power. The re-rounded quantity is fed
+    back through ``round_quantity`` (so increments and min order sizes still
+    hold) and each row's ``bp_cost`` is scaled by the SAME quantity ratio rather
+    than recomputed, which preserves a broker-precheck cost when one has been
+    substituted. A buy that scales to zero shares is marked ``skipped``.
+
+    ``margin`` may be omitted (the precheck path has no margin dict); a
+    fractional row then keeps its fractional grid via a synthetic MarginInfo.
+
+    Returns the scale factor applied (1.0 when the plan already fitted).
+    """
+    buys = [r for r in rows if r.is_buy]
+    required = sum(r.bp_cost for r in buys)
+    avail = float(available_buying_power or 0.0)
+    if not buys or required <= avail:
+        return 1.0
+    scale = (avail / required) if required > 0 else 0.0
+    for r in buys:
+        m = (margin or {}).get(r.symbol)
+        if m is None and r.fractional:
+            m = MarginInfo(symbol=r.symbol, bp_factor=r.bp_factor, fractionable=True)
+        prev_qty = r.delta_quantity
+        qty = round_quantity(r.estimated_value * scale, r.price, m,
+                             allow_fractional=allow_fractional)
+        ratio = (qty / prev_qty) if prev_qty > 0 else 0.0
+        r.delta_quantity = qty
+        r.target_quantity = r.current_quantity + qty
+        r.estimated_value = qty * r.price
+        r.bp_cost = r.bp_cost * ratio
+        r.reasons.append(REASON_SCALED_FMT.format(factor=scale))
+        if qty <= 0:
+            r.skipped = True
+    return scale
+
+
 def compute_allocation(base_notional: float, available_buying_power: float,
                        labels: List[LabelTarget], current: Dict[str, PositionState],
                        margin: Dict[str, MarginInfo], *, allow_fractional: bool,
@@ -314,6 +354,8 @@ def compute_allocation(base_notional: float, available_buying_power: float,
         row.price = ps.price if ps is not None else None
         if len(row.labels) > 1:
             row.reasons.append(REASON_MULTI_LABEL_FMT.format(labels=", ".join(row.labels)))
+        if m is not None and not m.marginable:
+            row.reasons.append(REASON_NOT_MARGINABLE)
         row.target_notional = target_notional
         frac = bool(allow_fractional and m is not None and m.fractionable)
         row.fractional = frac
@@ -340,5 +382,7 @@ def compute_allocation(base_notional: float, available_buying_power: float,
         row.bp_cost = row.estimated_value * row.bp_factor if delta > 0 else 0.0
         plan.rows.append(row)
 
+    plan.scale_factor = _apply_bp_scaling(plan.rows, plan.available_buying_power,
+                                          allow_fractional=allow_fractional, margin=margin)
     _finalise_totals(plan)
     return plan
