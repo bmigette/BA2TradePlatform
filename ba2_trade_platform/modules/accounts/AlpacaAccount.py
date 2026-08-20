@@ -1684,11 +1684,19 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
 
         Alpaca's Asset exposes no INITIAL margin field, only
         maintenance_margin_requirement (a percentage, e.g. 30.0), so the initial
-        rate is DERIVED: marginable -> 0.5 (Reg-T), otherwise 1.0. The
-        maintenance number is reported separately as maintenance_margin_rate and
-        is NEVER substituted for the initial rate. Then
-        bp_factor = initial_rate * account multiplier -- 1.0 for a marginable
-        symbol and 2.0 for a non-marginable one in a 2:1 account.
+        rate is DERIVED from three facts:
+
+          * marginable -> 0.5 (Reg-T), otherwise 1.0;
+          * but only where the ACCOUNT can borrow: at multiplier 1 (cash /
+            limited-margin, or a margin account under $2,000 equity)
+            buying_power == cash, so the rate is 1.0 for every symbol;
+          * floored by maintenance_margin_requirement / 100 -- an initial
+            requirement below the maintenance requirement is not a thing.
+
+        The maintenance number is also reported separately as
+        maintenance_margin_rate. Then bp_factor = initial_rate * account
+        multiplier -- 1.0 for an ordinary marginable symbol and 2.0 for a
+        non-marginable one in a 2:1 account, and 1.0 for everything at 1x.
 
         The multiplier is read from get_account_info() (ONE get_account() call),
         not from get_account_snapshot(), which would add a get_account_configurations()
@@ -1739,8 +1747,21 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 continue
 
             marginable = bool(getattr(asset, 'marginable', False))
-            initial_rate = 0.5 if marginable else 1.0
             maint = self._safe_float(getattr(asset, 'maintenance_margin_requirement', None))
+            # `Asset.marginable` describes the SECURITY, not the ACCOUNT. Alpaca reports
+            # multiplier="1" for cash and limited-margin accounts (and drops a margin
+            # account to 1 while its equity is under $2,000); there buying_power == cash
+            # and nothing is lent, so Reg-T's 50% does not apply to ANY symbol and the
+            # effective initial requirement is 100%. Without the multiplier gate the
+            # asset-sourced answer was HALF the conservative fallback that is used when
+            # the lookup fails -- more information made the plan bigger, which is the
+            # wrong direction for a feasibility guard.
+            initial_rate = 0.5 if (marginable and multiplier > 1.0) else 1.0
+            # An initial requirement below the MAINTENANCE requirement is not a thing:
+            # Alpaca publishes 30/50/75/100 per name and still flags hard-to-margin
+            # names marginable, so the derived Reg-T rate is floored by it.
+            if maint is not None:
+                initial_rate = max(initial_rate, maint / 100.0)
             margin_info = MarginInfo(
                 symbol=symbol,
                 bp_factor=initial_rate * multiplier,

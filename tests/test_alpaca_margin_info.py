@@ -1,8 +1,18 @@
 """AlpacaAccount.get_symbol_margin_info against mocked Asset / TradeAccount objects.
 
 bp_factor = initial_margin_rate * account_multiplier, and Alpaca's Asset has NO
-initial-margin field, so the rate is derived: marginable -> 0.5 (Reg-T),
-non-marginable -> 1.0. In a 2:1 account that is 1.0 vs 2.0.
+initial-margin field, so the rate is DERIVED from three facts, in this order:
+
+1. ``Asset.marginable`` describes the SECURITY. Non-marginable -> 1.0.
+2. The ACCOUNT's ``multiplier`` says whether borrowing is possible at all. Alpaca
+   reports "1" for cash and limited-margin accounts (and drops a margin account to
+   1 below $2,000 equity), where ``buying_power == cash``; Reg-T's 50% only exists
+   where the account can actually borrow, so at 1x the rate is 1.0 for EVERY symbol.
+3. ``Asset.maintenance_margin_requirement`` (30/50/75/100) FLOORS the result -- an
+   initial requirement below the maintenance requirement is not a thing.
+
+In a 2:1 account an ordinary marginable name is 0.5 * 2 = 1.0 and a non-marginable
+one is 1.0 * 2 = 2.0. In a 1x account everything is 1.0, i.e. exactly cash.
 
 No live API call: client is a MagicMock returning real alpaca-py model objects.
 """
@@ -66,11 +76,84 @@ def test_non_marginable_symbol_in_a_2x_account_consumes_double():
     assert info.marginable is False
 
 
-def test_marginable_symbol_in_a_cash_account_consumes_half():
+def test_marginable_symbol_in_a_cash_account_consumes_the_full_notional():
+    """CONTRACT: at multiplier=1 a marginable symbol still costs 1.0, not 0.5.
+
+    ``Asset.marginable`` is a fact about the SECURITY; the ACCOUNT decides whether
+    any borrowing is possible. Alpaca sets multiplier="1" on cash and
+    limited-margin accounts (and on a margin account that falls below $2,000
+    equity), and there ``buying_power == cash`` -- nothing is lent, so the
+    effective initial requirement is 100% for every symbol.
+
+    This test previously asserted 0.5 and was asserting the bug: the engine's
+    feasibility test is ``sum(notional * bp_factor) <= available_buying_power``,
+    so a 0.5 here let a $1,000 cash account plan $2,000 of buys. The scale-down
+    never fires, the sells execute first and the buy tail rejects with
+    INSUFFICIENT_FUNDS, leaving a half-executed rebalance.
+    """
     acct = _bare_account(multiplier="1")
     acct.client.get_asset.return_value = _asset("AAPL", marginable=True)
 
-    assert acct.get_symbol_margin_info(["AAPL"])["AAPL"].bp_factor == 0.5
+    info = acct.get_symbol_margin_info(["AAPL"])["AAPL"]
+
+    assert info.bp_factor == 1.0
+    assert info.initial_margin_rate == 1.0
+    assert info.marginable is True     # the asset fact is still reported honestly
+
+
+def test_a_cash_account_is_never_more_optimistic_than_the_conservative_fallback():
+    """The asset lookup must never BUY MORE than the no-information fallback.
+
+    When get_asset() fails the caller falls back to
+    ``default_bp_factor = account multiplier`` (1.0 at 1x). Having MORE
+    information may only make the plan smaller or equal, never bigger.
+    """
+    acct = _bare_account(multiplier="1")
+    acct.client.get_asset.side_effect = lambda s: _asset(s, marginable=True)
+
+    infos = acct.get_symbol_margin_info(["AAPL", "MSFT"])
+
+    assert all(i.bp_factor >= 1.0 for i in infos.values())
+
+
+def test_the_maintenance_requirement_floors_the_derived_initial_rate():
+    """A 100%-maintenance name cannot be bought on 50% initial margin.
+
+    Alpaca publishes maintenance_margin_requirement per name (30/50/75/100) and
+    marks plenty of hard-to-margin names 100 while still flagging them
+    marginable. The derived Reg-T 0.5 has to be floored by it, or the engine
+    sizes a 100%-requirement name as if it were half price.
+    """
+    acct = _bare_account(multiplier="2")
+    acct.client.get_asset.return_value = _asset(
+        "HTB", marginable=True, maintenance_margin_requirement=100.0)
+
+    info = acct.get_symbol_margin_info(["HTB"])["HTB"]
+
+    assert info.initial_margin_rate == 1.0
+    assert info.bp_factor == 2.0
+    assert info.maintenance_margin_rate == 1.0
+
+
+def test_a_maintenance_requirement_above_reg_t_but_below_100_also_floors():
+    """75% maintenance -> 0.75 initial, i.e. 1.5 bp_factor in a 2:1 account."""
+    acct = _bare_account(multiplier="2")
+    acct.client.get_asset.return_value = _asset(
+        "SPCY", marginable=True, maintenance_margin_requirement=75.0)
+
+    assert acct.get_symbol_margin_info(["SPCY"])["SPCY"].bp_factor == 1.5
+
+
+def test_a_maintenance_requirement_below_reg_t_does_not_lower_the_initial_rate():
+    """max(), not assignment: 30% maintenance keeps the 0.5 Reg-T initial rate."""
+    acct = _bare_account(multiplier="2")
+    acct.client.get_asset.return_value = _asset(
+        "AAPL", marginable=True, maintenance_margin_requirement=30.0)
+
+    info = acct.get_symbol_margin_info(["AAPL"])["AAPL"]
+
+    assert info.initial_margin_rate == 0.5
+    assert info.bp_factor == 1.0
 
 
 def test_maintenance_margin_percentage_is_converted_to_a_rate():
