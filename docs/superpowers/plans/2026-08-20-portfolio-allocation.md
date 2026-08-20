@@ -27,7 +27,7 @@ An engineer with zero context will get these wrong. Every one was verified again
 9. **`tastytrade.account.Account.place_order(session, order, dry_run: bool = True)` — `dry_run` DEFAULTS TO `True`** (`site-packages/tastytrade/account.py:877-879`; `place_complex_order` likewise at `:894-896`). Every real submission must pass `dry_run=False` explicitly.
 10. **`tastytrade.order.BuyingPowerEffect.change_in_buying_power` is a SIGNED Decimal** — negative for a buy (the `set_sign_for` validator, `order.py:381-393`). Always consume `OrderImpact.bp_cost`. Separately, `NewOrder.price_effect` is a **computed field** derived from the sign of `price` (`order.py:264-276`) and must never be set by hand — a BUY limit's `price` is written NEGATIVE.
 11. **`Field(unique=True, index=True)` on `Instrument.name` emits `CREATE UNIQUE INDEX ix_instrument_name`** (verified by probe). The migration must use `ix_instrument_name`, **not** the spec's `uix_instrument_name`, or `init_db()`'s `create_all` on a fresh DB and Alembic on an existing one produce differently named indexes.
-12. **The instrument merge is safe: no table has a foreign key to `instrument`** (verified by grep and by `pragma_foreign_key_list` over the live schema). On this Mac's DB: 2029 rows / 1954 distinct names (75 duplicate groups) and zero indexes.
+12. **The instrument merge is safe: no table has a foreign key to `instrument`** (verified by grep and by `pragma_foreign_key_list` over the live schema). On the LIVE DB (`~/Documents/ba2/trade/db.sqlite`, see fact 24): 2477 rows / 2353 distinct names / 124 duplicate groups, and zero indexes on `instrument`.
 13. **`Transaction` HAS NO `account_id` column.** Transactions link to an account only through `TradingOrder.account_id`. Canonical query: `select(Transaction).join(TradingOrder).where(TradingOrder.account_id == ..., Transaction.status.in_([OPENED, CLOSING])).distinct()`.
 14. **Read the gate as `account.get_setting_with_interface_default('manual_trading_enabled', log_warning=False)`.** `self.settings.get(key, default)` returns `None` (not the default) for a never-saved key, because the settings property seeds every DECLARED key to `None`. `get_setting_with_interface_default` also treats the literal string `"None"` as unset, and RAISES `ValueError` if the key is absent from the merged definitions. A saved boolean `False` IS returned correctly.
 15. **Add `manual_trading_enabled` INSIDE the existing dict literal** in `ReadOnlyAccountInterface._ensure_builtin_settings` (`:31-41`). The body is guarded by `if not cls._builtin_settings:`, so a second block or a post-hoc `.update()` never runs.
@@ -116,7 +116,7 @@ H (growth-chart persistence) — independent, any time
 - **D** (Tasks 27-35) depends only on the pinned contracts (it creates `account_types.py`); **C Task 16** also imports `MarginInfo`/`OrderImpact` from it, so **D Task 27 must land before C Task 16**.
 - **E** (Tasks 36-55) depends on **D**'s seams (Tasks 30, 32-33 in particular).
 - **F** (Tasks 56-67) depends on **B** (the store and the models) and on **C Task 26** (the engine shim, for `PositionState` and `PositionFetchFailed`).
-- **G** (Tasks 68-76) depends on **B**, **C**, **D** and **F**.
+- **G** (Tasks 68-75) depends on **B**, **C**, **D** and **F**.
 - **H** (Task 76) is independent.
 - **I** (Tasks 77-78, the trade/test version split) is independent of everything else and may be done at any point.
 - **Task 79** (bump both versions + full sweep) is last.
