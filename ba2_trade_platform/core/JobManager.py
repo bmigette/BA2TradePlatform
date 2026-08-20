@@ -94,6 +94,49 @@ def should_schedule_open_positions(expert_properties: Dict[str, Any]) -> bool:
     return expert_properties.get('schedules_open_positions', True)
 
 
+def ensure_instrument_exists(symbol: str) -> str:
+    """Create the ``auto_added`` Instrument row for ``symbol`` if it is missing.
+
+    Lifted out of ``JobManager.submit_market_analysis`` so it can be tested: that
+    method needs a live worker queue and an enabled expert before it ever reaches
+    the auto-add. Behaviour is unchanged apart from normalisation.
+
+    ``instrument.name`` is UNIQUE, so the symbol is normalised (.strip().upper())
+    before BOTH the lookup and the insert, and the normalised form is returned for
+    the caller to use downstream.
+
+    Args:
+        symbol: raw symbol, any case, possibly padded.
+
+    Returns:
+        str: the normalised symbol (``""`` for a blank input, in which case
+        nothing is written).
+    """
+    from ba2_common.core.utils import normalize_symbol
+    from .db import get_db
+    from sqlmodel import select
+
+    symbol = normalize_symbol(symbol)
+    if not symbol:
+        logger.warning("ensure_instrument_exists: blank symbol, nothing to add")
+        return symbol
+
+    with get_db() as session:
+        existing_instrument = session.exec(
+            select(Instrument).where(Instrument.name == symbol)
+        ).first()
+        if not existing_instrument:
+            session.add(Instrument(
+                name=symbol,
+                instrument_type='stock',  # Default to stock
+                categories=[],
+                labels=['auto_added'],
+            ))
+            session.commit()
+            logger.info(f"Auto-added instrument '{symbol}' to database with label 'auto_added'")
+    return symbol
+
+
 class ControlMessageType(Enum):
     """Types of control messages for JobManager."""
     REFRESH_EXPERT_SCHEDULES = "refresh_expert_schedules"
@@ -363,26 +406,10 @@ class JobManager:
         if not expert_instance.enabled:
             raise ValueError(f"Expert instance {expert_instance_id} is disabled")
         
-        # Auto-add instrument if it doesn't exist in database
-        from .models import Instrument
-        from .db import get_db
-        from sqlmodel import Session, select
-        
-        with get_db() as session:
-            statement = select(Instrument).where(Instrument.name == symbol)
-            existing_instrument = session.exec(statement).first()
-            
-            if not existing_instrument:
-                # Create new instrument with auto_added label
-                new_instrument = Instrument(
-                    name=symbol,
-                    instrument_type='stock',  # Default to stock
-                    categories=[],
-                    labels=['auto_added']
-                )
-                session.add(new_instrument)
-                session.commit()
-                logger.info(f"Auto-added instrument '{symbol}' to database with label 'auto_added'")
+        # Auto-add instrument if it doesn't exist in database. The normalised
+        # symbol is used from here on, so the analysis and the Instrument row
+        # always agree on spelling.
+        symbol = ensure_instrument_exists(symbol)
         
         # Validate subtype
         try:

@@ -2082,7 +2082,7 @@ class ExpertSettingsTab:
                     # Find the instrument ID by symbol
                     session = get_db()
                     from sqlmodel import select
-                    statement = select(Instrument).where(Instrument.name == symbol)
+                    statement = select(Instrument).where(Instrument.name == normalize_symbol(symbol))
                     result = session.exec(statement).first()
                     if result:
                         instrument_configs[result.id] = {

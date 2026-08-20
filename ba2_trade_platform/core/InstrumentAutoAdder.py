@@ -13,6 +13,7 @@ from sqlmodel import select
 from ..core.models import Instrument
 from ..core.db import get_db, add_instance, get_instance
 from ..logger import logger
+from ba2_common.core.utils import normalize_symbol
 import yfinance as yf
 from datetime import datetime, timezone
 
@@ -84,6 +85,14 @@ class InstrumentAutoAdder:
     async def _add_instrument_if_missing(self, symbol: str, expert_shortname: str, source: str, extra_labels: list = None):
         """Add instrument to database if it doesn't exist."""
         try:
+            # instrument.name is UNIQUE: normalise BEFORE the lookup and the insert,
+            # so ' aapl ' resolves to the existing AAPL row instead of inserting a
+            # second one the unique index would reject.
+            symbol = normalize_symbol(symbol)
+            if not symbol:
+                logger.warning("InstrumentAutoAdder: blank symbol skipped")
+                return
+
             # Check if instrument already exists
             with get_db() as session:
                 stmt = select(Instrument).where(Instrument.name == symbol)
