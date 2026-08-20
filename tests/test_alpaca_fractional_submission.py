@@ -8,8 +8,11 @@ Two independent traps, both of which the adapter has to close:
    GTC, and Alpaca refuses a fractional GTC order.
 2. Every non-MARKET type (limit / stop / stop-limit / OCO) refuses a fractional
    quantity outright -- including a protective TP/SL leg sized from a fractional
-   position. Those fall back ONCE to ``floor(qty)`` whole shares; a floor of 0 leaves
-   nothing to send, which is a SKIP (CANCELED + reason), not a failure.
+   position. Those are pre-floored to ``floor(qty)`` whole shares and submitted ONCE
+   (there is no retry: the quantity is corrected before the request is built); a
+   floor of 0 leaves nothing to send, which is a SKIP (CANCELED + reason), not a
+   failure. A MARKET order routed through the wash-trade escape counts as
+   non-MARKET here, because it goes to Alpaca as BRACKET/OTO.
 
 No live API call anywhere: ``client`` is a MagicMock, so ``client.submit_order``
 records the request object that WOULD have gone to Alpaca.
@@ -112,7 +115,7 @@ def test_whole_share_order_with_an_explicit_day_still_goes_out_as_day():
 
 
 # ---------------------------------------------------------------------------
-# Non-MARKET fractional: never sent fractional, retried once at floor(qty)
+# Non-MARKET fractional: never sent fractional, pre-floored before submission
 # ---------------------------------------------------------------------------
 
 def test_fractional_quantity_is_never_sent_on_a_limit_order():
@@ -128,8 +131,10 @@ def test_fractional_quantity_is_never_sent_on_a_limit_order():
     assert sent_qty == int(sent_qty), f"fractional qty {sent_qty} reached Alpaca"
 
 
-def test_fractional_limit_order_is_retried_once_at_floor_qty():
-    """The fallback floors -- it never rounds up, which would overspend the target."""
+def test_fractional_limit_order_is_floored_before_submission():
+    """The quantity is corrected BEFORE the request is built and submitted once --
+    there is no retry, nothing is ever sent fractional and rejected. The floor
+    never rounds up, which would overspend the target."""
     acct = _bare_account()
     acct.client.submit_order.return_value = _alpaca_response(order_type="limit")
     order = _saved_order(quantity=1.5, order_type=OrderType.BUY_LIMIT,
@@ -200,3 +205,78 @@ def test_a_skipped_order_does_not_keep_the_fractional_quantity_as_if_it_were_liv
     acct._submit_order_impl(order)
 
     assert get_instance(TradingOrder, order.id).broker_order_id is None
+
+
+# ---------------------------------------------------------------------------
+# The floor UNDER-COVERS a protective leg, and the log has to say so
+# ---------------------------------------------------------------------------
+
+def test_the_floor_log_names_the_uncovered_remainder(monkeypatch):
+    """A protective leg floored off a fractional parent covers LESS than the
+    position. "submitting 4.0 instead of 4.25" states the arithmetic; the
+    consequence -- 0.25 shares with no stop behind them -- is what the operator
+    needs, and it is the only place that fact is ever surfaced.
+
+    Asserts against the logger itself, not caplog: ba2_trade_platform.logger
+    installs its own handler and does not propagate to the root, so caplog.text
+    is empty even though the record is emitted.
+    """
+    # sys.modules, not `import ...AlpacaAccount as AA`: the accounts package
+    # re-exports the CLASS under that same name, so the plain import binds the class.
+    import sys
+    AA = sys.modules[AlpacaAccount.__module__]
+
+    warnings = []
+    monkeypatch.setattr(AA.logger, "warning", lambda msg, *a, **k: warnings.append(str(msg)))
+
+    acct = _bare_account()
+    acct.client.submit_order.return_value = _alpaca_response(order_type="stop_limit")
+
+    acct._submit_order_impl(
+        _saved_order(quantity=4.25, order_type=OrderType.SELL_STOP_LIMIT,
+                     side=OrderDirection.SELL, stop_price=90.0, limit_price=89.5))
+
+    assert any("uncovered" in w and "0.25" in w for w in warnings), warnings
+
+
+# ---------------------------------------------------------------------------
+# The wash-trade escape turns a MARKET order into BRACKET/OTO, which is not
+# fractional-capable either
+# ---------------------------------------------------------------------------
+
+def test_a_fractional_market_order_sent_as_a_complex_order_is_floored():
+    """Alpaca accepts fractional on a PLAIN DAY market order only. The wash-trade
+    escape re-classes the very same order as BRACKET/OTO, and Alpaca refuses a
+    fractional quantity on those, so the DAY-forcing branch must not claim it.
+    Unreachable today (nothing produces a fractional order with tp/sl on the
+    blocked branch) -- the guard is here so it stays that way."""
+    acct = _bare_account()
+
+    acct._submit_order_impl(
+        _saved_order(quantity=1.5, order_type=OrderType.MARKET, good_for='day'),
+        tp_price=120.0, sl_price=90.0, use_complex_order=True)
+
+    request = _submitted_request(acct)
+    assert float(request.qty) == 1.0
+    assert request.order_class is not None      # still went out as a complex order
+
+
+def test_a_fractional_market_order_sent_as_a_complex_order_that_floors_to_zero_is_skipped():
+    acct = _bare_account()
+    order = _saved_order(quantity=0.4, order_type=OrderType.MARKET, good_for='day')
+
+    result = acct._submit_order_impl(order, tp_price=120.0, sl_price=90.0,
+                                     use_complex_order=True)
+
+    acct.client.submit_order.assert_not_called()
+    assert result is None
+    assert get_instance(TradingOrder, order.id).status == OrderStatus.CANCELED
+
+
+def test_a_plain_fractional_market_order_is_still_sent_fractional():
+    """The complex-order guard must not floor every fractional market order."""
+    acct = _bare_account()
+
+    acct._submit_order_impl(_saved_order(quantity=1.5, order_type=OrderType.MARKET))
+
+    assert float(_submitted_request(acct).qty) == 1.5

@@ -1017,10 +1017,15 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             #     DAY rather than trusting every future caller to remember.
             #  2. Every non-MARKET type (limit / stop / stop-limit / OCO) refuses
             #     fractional outright — including a protective TP/SL leg whose quantity
-            #     was inherited from a fractional position. Those fall back ONCE to
-            #     floor(qty) whole shares: it is a guaranteed rejection otherwise, and
-            #     flooring under-fills rather than overspending the target. The floored
-            #     quantity is written back so the ledger matches what the broker got.
+            #     was inherited from a fractional position. Those are pre-floored to
+            #     floor(qty) whole shares and submitted ONCE (this is NOT a retry —
+            #     nothing fractional is ever put on the wire): it is a guaranteed
+            #     rejection otherwise, and flooring under-fills rather than overspending
+            #     the target. The floored quantity is written back so the ledger matches
+            #     what the broker got.
+            #     `use_complex_order` (the wash-trade escape) belongs on this branch even
+            #     for a MARKET order: it re-classes the request as BRACKET/OTO, and
+            #     Alpaca refuses a fractional quantity on those too.
             #
             # A floor of 0 leaves nothing to send. That is a SKIP, not a failure —
             # nothing was rejected and nothing is wrong with the account — so the row is
@@ -1032,7 +1037,9 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             # enforcement of a broker constraint only.
             quantity_value = float(trading_order.quantity or 0.0)
             if quantity_value != int(quantity_value):
-                if order_type_value == CoreOrderType.MARKET.value.lower():
+                is_plain_market = (order_type_value == CoreOrderType.MARKET.value.lower()
+                                   and not use_complex_order)
+                if is_plain_market:
                     if time_in_force != TimeInForce.DAY:
                         logger.info(
                             f"Order {trading_order.id} ({trading_order.symbol}) has fractional "
@@ -1042,8 +1049,10 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                         time_in_force = TimeInForce.DAY
                 else:
                     whole_shares = float(math.floor(quantity_value))
+                    as_complex = (" order submitted as a complex (BRACKET/OTO) order"
+                                  if use_complex_order else " order")
                     reason = (f"fractional qty {quantity_value} is not accepted by Alpaca on a "
-                              f"{order_type_value} order")
+                              f"{order_type_value}{as_complex}")
                     if whole_shares <= 0:
                         logger.warning(
                             f"Order {trading_order.id} ({trading_order.symbol}) skipped: "
@@ -1053,9 +1062,14 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                             trading_order, None,
                             f"skipped: {reason}; flooring leaves 0 whole shares")
                         return None
+                    # Name the CONSEQUENCE, not just the arithmetic: a protective leg
+                    # floored off a fractional parent covers less than the position, and
+                    # this line is the only place that ever gets said.
                     logger.warning(
                         f"Order {trading_order.id} ({trading_order.symbol}): {reason}; "
-                        f"submitting {whole_shares} whole shares instead of {quantity_value}"
+                        f"submitting {whole_shares} whole shares instead of {quantity_value}; "
+                        f"{quantity_value - whole_shares:g} shares of the position are "
+                        f"left uncovered"
                     )
                     trading_order.quantity = whole_shares
                     self._record_fractional_adjustment(
