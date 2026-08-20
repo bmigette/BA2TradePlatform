@@ -20,6 +20,39 @@ import yfinance as yf
 from datetime import datetime, timezone
 
 
+#: Labels that describe HOW A ROW WAS CREATED, not what selected the symbol.
+#: The create path below stamps these itself, so they are only ever true of a row
+#: this service inserted. They are deliberately NOT adopted onto a pre-existing
+#: row: 'auto_added' on an instrument the user added by hand is simply false, and
+#: it is the one tag the overview charts key off when picking which series to show
+#: by default. The penny screener hook (`seam_helpers.auto_add_instruments_hook`)
+#: passes `extra_labels=['auto_added']` for EVERY candidate it screens, so without
+#: this filter the first fixed run would stamp it across most of the instrument
+#: table. Matched case-insensitively.
+CREATION_PROVENANCE_LABELS = frozenset({'auto_added', 'expert_selected', 'ai_selected'})
+
+
+def _adoption_labels(expert_shortname: str, extra_labels: Optional[List[str]]) -> List[str]:
+    """The labels worth attaching to an instrument row this service did NOT create.
+
+    Selection labels (the expert shortname, plus any caller-supplied extras) say
+    "this expert picked this symbol", which is equally true of a pre-existing row
+    and a new one. Creation-provenance labels are dropped -- see
+    ``CREATION_PROVENANCE_LABELS``.
+
+    Blanks are dropped and the result is de-duplicated in first-seen order, so a
+    caller that passes the shortname again in ``extra_labels`` writes it once.
+    """
+    wanted: List[str] = []
+    for label in ([expert_shortname] if expert_shortname else []) + list(extra_labels or []):
+        label = (label or "").strip()
+        if not label or label.lower() in CREATION_PROVENANCE_LABELS:
+            continue
+        if label not in wanted:
+            wanted.append(label)
+    return wanted
+
+
 class InstrumentAutoAdder:
     """Service to automatically add instruments to database with proper labels and categories."""
     
@@ -102,19 +135,21 @@ class InstrumentAutoAdder:
 
                 if existing:
                     logger.debug(f"Instrument {symbol} already exists in database")
-                    # Add labels to existing instrument if not already present
-                    updated = False
-                    if expert_shortname and expert_shortname not in existing.labels:
-                        existing.labels.append(expert_shortname)
-                        updated = True
-                    for lbl in (extra_labels or []):
-                        if lbl not in existing.labels:
-                            existing.labels.append(lbl)
-                            updated = True
-                    if updated:
+                    # Add the selection labels this row is missing. Creation
+                    # provenance is not ours to claim on a row we did not create.
+                    wanted = _adoption_labels(expert_shortname, extra_labels)
+                    missing = [lbl for lbl in wanted if lbl not in (existing.labels or [])]
+                    if missing:
+                        # REASSIGN, never append. Instrument.labels is a plain
+                        # Column(JSON) with no MutableList wrapper, so an in-place
+                        # append leaves SQLAlchemy no attribute history: the commit
+                        # emits no UPDATE and the label is silently lost. This is
+                        # the same reassignment the label helpers in
+                        # ba2_common.core.utils use.
+                        existing.labels = list(existing.labels or []) + missing
                         session.add(existing)
                         session.commit()
-                        logger.debug(f"Updated labels for existing instrument {symbol}: {existing.labels}")
+                        logger.debug(f"Added labels {missing} to existing instrument {symbol}: {existing.labels}")
                     return
             
             # Instrument doesn't exist - create it
@@ -169,11 +204,12 @@ class InstrumentAutoAdder:
                     # instrument.name is UNIQUE and the existence check above ran in
                     # a separate transaction: another writer (a second auto-add task,
                     # or JobManager.ensure_instrument_exists) inserted this symbol
-                    # inside the window. Adopt the winner's row -- but carry our
-                    # labels over to it, because nothing else ever will: the
-                    # `existing` branch above appends to `labels` IN PLACE, and that
-                    # is a plain JSON column with no MutableList wrapper, so the
-                    # change is not tracked and never persists.
+                    # inside the window. Adopt the winner's row and carry our labels
+                    # over to it -- nothing else ever will, there is no self-healing
+                    # pass. The winner created the row and has already stamped its
+                    # own provenance, so this takes the same selection-labels-only
+                    # view of the row as the `existing` branch above: it is the same
+                    # situation, a row we did not create.
                     session.rollback()
                     winner = session.exec(
                         select(Instrument).where(Instrument.name == symbol)
@@ -182,10 +218,10 @@ class InstrumentAutoAdder:
                         # Not the race we assumed -- a different constraint was
                         # violated. Re-raise for the handler below to log.
                         raise
-                    wanted = ([expert_shortname] if expert_shortname else []) + list(extra_labels or [])
+                    wanted = _adoption_labels(expert_shortname, extra_labels)
                     missing = [lbl for lbl in wanted if lbl not in (winner.labels or [])]
                     if missing:
-                        # REASSIGN, never append: see above.
+                        # REASSIGN, never append: see the `existing` branch above.
                         winner.labels = list(winner.labels or []) + missing
                         session.add(winner)
                         session.commit()
