@@ -241,15 +241,28 @@ def test_fractional_requested_on_a_non_fractionable_symbol_falls_back_to_whole_s
     assert pa.REASON_WHOLE_SHARE_FLOOR in row.reasons
 
 
-def test_quantity_below_min_order_size_is_dropped_to_zero():
+def test_an_order_below_min_order_size_is_suppressed_and_the_target_kept():
+    """CONTRACT CHANGED (Task 25): min_order_size constrains the ORDER, not the TARGET.
+
+    This used to assert that the min order size zeroed ``target_quantity`` -- i.e.
+    that it rewrote what we want to HOLD. It does not: it suppresses the trade and
+    leaves the position where it is, with a reason saying why. On a FLAT position
+    the number is still 0.0, but it is now "held nothing, ordered nothing" rather
+    than "target rewritten to nothing", which is what stopped a held position from
+    being liquidated by a rounding rule.
+    """
     labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
     margin = {"XXX": MarginInfo(symbol="XXX", bp_factor=1.0, fractionable=True,
                                 min_order_size=5.0)}
     plan = pa.compute_allocation(1_000.0, 1_000_000.0, labels,
                                  {"XXX": _pos("XXX", 300.0)}, margin,
                                  allow_fractional=True, default_bp_factor=1.0)
-    assert plan.rows[0].target_quantity == 0.0
-    assert plan.rows[0].delta_quantity == 0.0
+    row = plan.rows[0]
+    assert row.delta_quantity == 0.0
+    assert row.side is None
+    assert row.target_notional == 1_000.0            # the TARGET is untouched
+    assert row.target_quantity == 0.0                # post-trade: flat stays flat
+    assert pa.REASON_BELOW_MIN_ORDER_FMT.format(size=5.0) in row.reasons
 
 
 def test_buys_scale_pro_rata_when_they_exceed_buying_power():
@@ -826,27 +839,108 @@ def test_the_base_the_percentages_and_the_deltas_never_disagree():
         assert sum(r.target_notional for r in plan.rows) == pytest.approx(computed_base)
 
 
-def test_a_min_order_size_that_zeroes_a_positive_target_does_not_liquidate():
-    """The close branch keys on target_notional, NOT on the rounded target_quantity.
+def test_a_min_order_size_never_liquidates_a_position_in_either_mode():
+    """Holding exactly the 3.3333 shares a 1000 target buys at 300, min_order_size 5.
 
-    Holding exactly the 3.3333 shares a 1000 target buys at 300: min_order_size 5
-    rounds the target down to 0 shares, which used to read as "target 0 - close
-    position" and sell the lot. A positive target is never a close.
+    Two separate defects used to conspire here: the close branch keyed on the
+    ROUNDED quantity, and round_quantity applied min_order_size to the TARGET. In
+    market mode that made the target 0 shares and sold the lot -- an unexplained
+    full exit on a position that is exactly where it should be. Neither mode may
+    trade anything here.
     """
     labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
     margin = {"XXX": MarginInfo(symbol="XXX", bp_factor=1.0, fractionable=True,
                                 min_order_size=5.0)}
     current = {"XXX": _pos("XXX", 300.0, quantity=3.3333, cost_basis=1_000.0)}
-    cost = pa.compute_allocation(1_000.0, 1_000_000.0, labels, current, margin,
-                                 allow_fractional=True, default_bp_factor=1.0,
-                                 valuation_mode=pa.VALUATION_MODE_COST)
-    assert cost.rows[0].delta_quantity == 0.0
-    assert cost.rows[0].side is None
-    assert pa.REASON_CLOSE_TO_ZERO not in cost.rows[0].reasons
-    market = pa.compute_allocation(1_000.0, 1_000_000.0, labels, current, margin,
-                                   allow_fractional=True, default_bp_factor=1.0,
-                                   valuation_mode=pa.VALUATION_MODE_MARKET)
-    assert pa.REASON_CLOSE_TO_ZERO not in market.rows[0].reasons
+    for mode in (pa.VALUATION_MODE_COST, pa.VALUATION_MODE_MARKET):
+        row = pa.compute_allocation(1_000.0, 1_000_000.0, labels, current, margin,
+                                    allow_fractional=True, default_bp_factor=1.0,
+                                    valuation_mode=mode).rows[0]
+        assert row.delta_quantity == 0.0, mode
+        assert row.side is None, mode
+        assert pa.REASON_CLOSE_TO_ZERO not in row.reasons, mode
+        assert row.target_quantity == pytest.approx(3.3333), mode
+
+
+def test_an_order_below_min_order_size_leaves_the_position_untouched():
+    """A REAL gap this time -- hold 10 at 100, target 1200, so 2 shares short. The
+    broker will not take an order that small, so nothing trades and the row SAYS SO
+    rather than going quiet."""
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
+    margin = {"XXX": MarginInfo(symbol="XXX", bp_factor=1.0, min_order_size=5.0)}
+    current = {"XXX": _pos("XXX", 100.0, quantity=10.0, cost_basis=1_000.0)}
+    for mode in (pa.VALUATION_MODE_COST, pa.VALUATION_MODE_MARKET):
+        row = pa.compute_allocation(1_200.0, 1_000_000.0, labels, current, margin,
+                                    allow_fractional=False, default_bp_factor=1.0,
+                                    valuation_mode=mode).rows[0]
+        assert row.delta_quantity == 0.0, mode
+        assert row.target_quantity == 10.0, mode      # position HELD, not rewritten
+        assert row.estimated_value == 0.0, mode
+        assert row.bp_cost == 0.0, mode
+        assert pa.REASON_BELOW_MIN_ORDER_FMT.format(size=5.0) in row.reasons, mode
+
+
+def test_an_order_at_the_min_order_size_still_trades():
+    """The boundary: 6 shares clears a minimum of 5 and is submitted normally."""
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
+    margin = {"XXX": MarginInfo(symbol="XXX", bp_factor=1.0, min_order_size=5.0)}
+    current = {"XXX": _pos("XXX", 100.0, quantity=10.0, cost_basis=1_000.0)}
+    row = pa.compute_allocation(1_600.0, 1_000_000.0, labels, current, margin,
+                                allow_fractional=False, default_bp_factor=1.0).rows[0]
+    assert row.delta_quantity == 6.0
+    assert row.side == OrderDirection.BUY
+    assert row.target_quantity == 16.0
+    assert not any(r.startswith("below") for r in row.reasons)
+
+
+def test_a_sell_below_min_order_size_is_suppressed_too():
+    """Suppression is on the MAGNITUDE: an unsendable trim is not sent either."""
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
+    margin = {"XXX": MarginInfo(symbol="XXX", bp_factor=1.0, min_order_size=5.0)}
+    current = {"XXX": _pos("XXX", 100.0, quantity=10.0, cost_basis=1_000.0)}
+    row = pa.compute_allocation(800.0, 1_000_000.0, labels, current, margin,
+                                allow_fractional=False, default_bp_factor=1.0).rows[0]
+    assert row.delta_quantity == 0.0
+    assert row.side is None
+    assert row.target_quantity == 10.0
+    assert pa.REASON_BELOW_MIN_ORDER_FMT.format(size=5.0) in row.reasons
+
+
+def test_label_investment_suppresses_an_order_below_min_order_size():
+    """The same rule on the INVEST_LABEL path, with the same reason string."""
+    label = LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])
+    margin = {"XXX": MarginInfo(symbol="XXX", bp_factor=1.0, fractionable=True,
+                                min_order_size=5.0)}
+    current = {"XXX": _pos("XXX", 300.0, quantity=2.0, cost_basis=600.0)}
+    plan = pa.compute_label_investment(label, 1_000.0, current, margin,
+                                       available_buying_power=1_000_000.0,
+                                       allow_fractional=True, default_bp_factor=1.0)
+    row = plan.rows[0]
+    assert row.delta_quantity == 0.0
+    assert row.side is None
+    assert row.target_quantity == 2.0
+    assert pa.REASON_BELOW_MIN_ORDER_FMT.format(size=5.0) in row.reasons
+    assert plan.total_buy_value == 0.0
+
+
+def test_both_modes_report_target_quantity_as_the_post_trade_holding():
+    """ONE meaning for target_quantity: what the account HOLDS if the row executes.
+
+    Holding 10.5 with whole-share rounding and a 2000 target at 100, the ideal
+    count is 20 but only 9 whole shares can be bought, so the honest answer is
+    19.5 in both modes -- always current_quantity + delta_quantity.
+    """
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
+    current = {"XXX": _pos("XXX", 100.0, quantity=10.5, cost_basis=1_050.0)}
+    rows = [pa.compute_allocation(2_000.0, 1_000_000.0, labels, current, {},
+                                  allow_fractional=False, default_bp_factor=1.0,
+                                  valuation_mode=mode).rows[0]
+            for mode in (pa.VALUATION_MODE_COST, pa.VALUATION_MODE_MARKET)]
+    for row in rows:
+        assert row.delta_quantity == 9.0
+        assert row.target_quantity == 19.5
+        assert row.target_quantity == row.current_quantity + row.delta_quantity
+    assert rows[0].target_quantity == rows[1].target_quantity
 
 
 def test_a_negative_target_clamped_to_zero_still_liquidates():

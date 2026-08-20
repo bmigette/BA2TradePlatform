@@ -6546,6 +6546,48 @@ git add packages/common/ba2_common/core/portfolio_allocation.py packages/common/
 git commit -m "feat(allocation): cost vs market valuation mode across base, targets and deltas"
 ```
 
+**AS-LANDED AMENDMENT (Task 25).** The task shipped in two commits and the second
+changed TWO CONTRACTS beyond the text above. Recorded here because a pinned test was
+rewritten, which must read as a deliberate change of contract rather than a weakened
+test. Sections D-G should treat this, not the code block above, as the engine's
+behaviour. Final count: `102 passed` (not the stale `67`).
+
+1. **`min_order_size` is an ORDER constraint, not a TARGET constraint.** It used to be
+   applied inside `round_quantity` to the target holding, so a minimum the target fell
+   under rewrote the target to 0 shares — and in `market` mode `delta = target -
+   current` then LIQUIDATED the position. Re-keying the close branch to
+   `target_notional` (the change specified above) removed the misleading
+   `REASON_CLOSE_TO_ZERO` label but not the sell. Now: `round_quantity` and
+   `round_delta_quantity` take `apply_min_order_size: bool = True`; `compute_allocation`
+   passes `False` in BOTH valuation branches and applies one check to the signed delta
+   via `_suppress_below_min_order`, which zeroes an unsendable trade, LEAVES THE
+   POSITION WHERE IT IS and appends the new `REASON_BELOW_MIN_ORDER_FMT`
+   (`"below broker min order size {size:g} - position held"`). It tests the MAGNITUDE,
+   so an unsendable trim is suppressed exactly like an unsendable top-up.
+   `compute_label_investment` does the same. `_apply_bp_scaling` keeps the default
+   `True`: the value it rounds IS an order.
+   *Test rewritten:* `test_quantity_below_min_order_size_is_dropped_to_zero` →
+   `test_an_order_below_min_order_size_is_suppressed_and_the_target_kept`. Its
+   `target_quantity == 0.0` assertion still holds numerically on a FLAT position but
+   now means "held nothing, ordered nothing" instead of "target rewritten to nothing";
+   it additionally asserts `target_notional` is untouched and the reason is present.
+
+2. **`target_quantity` means the POST-TRADE holding, in both modes.** It was the ideal
+   share count in `market` mode (20.0 for a 2000 target at 100 while holding 10.5, even
+   though only 9 whole shares can be bought) and `current + delta` in `cost` mode
+   (19.5). Now always `current_quantity + delta_quantity` — what the account owns if the
+   row executes — which is what `_apply_bp_scaling` and `compute_label_investment`
+   already wrote, what the dry-run column needs to be truthful, and the only one of the
+   two comparable across rows. No existing test asserted the market-mode ideal, so
+   nothing else needed rewriting; a sweep of 240 input combinations confirms the
+   identity holds with no oversell.
+
+A residual for the LIVE layer, not the engine: when a full close is itself below
+`min_order_size`, the row now carries both `REASON_CLOSE_TO_ZERO` and
+`REASON_BELOW_MIN_ORDER_FMT` and trades nothing. Most brokers exempt a full
+close-position from the minimum, so the submit path may be able to send it anyway;
+that is a live-layer decision and the engine deliberately does not assume it.
+
 ---
 
 ### Task 26: In-tree alias shim for the engine

@@ -5,8 +5,9 @@ Turns target percentages into per-symbol share deltas:
     label_notional  = base_notional * label.target_pct / 100
     symbol_notional = label_notional * symbol.weight_pct / 100   (targets SUM
                       when a symbol carries more than one managed label)
-    target_quantity = round_quantity(symbol_notional, price, ...)
-    delta_quantity  = target_quantity - current_quantity
+    delta_quantity  = SIGNED shares to trade; how it is derived depends on the
+                      valuation mode (see ``compute_allocation``)
+    target_quantity = current_quantity + delta_quantity          (POST-TRADE)
     bp_cost         = |delta_notional| * bp_factor(symbol)       (buys only)
 
 When ``sum(bp_cost of buys) > available_buying_power`` every BUY scales down
@@ -56,6 +57,7 @@ REASON_FRACTIONAL = "fractional"
 REASON_WHOLE_SHARE_FLOOR = "rounded down to whole shares"
 REASON_NEGATIVE_CLAMPED = "negative target clamped to 0"
 REASON_CLOSE_TO_ZERO = "target 0 - close position"
+REASON_BELOW_MIN_ORDER_FMT = "below broker min order size {size:g} - position held"
 REASON_MULTI_LABEL_FMT = "⚠ also in {labels}"
 REASON_SCALED_FMT = "scaled ×{factor:.2f} to fit buying power"
 #: The fixed part of REASON_SCALED_FMT, derived from it so the two cannot drift.
@@ -139,7 +141,11 @@ class AllocationRow:
 
     ``delta_quantity`` is SIGNED (positive = buy, negative = sell); ``side`` is
     the matching ``OrderDirection`` (``None`` when the delta is exactly zero or
-    the row was skipped). ``estimated_value`` and ``bp_cost`` are always POSITIVE
+    the row was skipped). ``target_quantity`` is the POST-TRADE holding --
+    ``current_quantity + delta_quantity``, what the account owns if this row
+    executes -- and NOT an ideal share count the rounding may never reach; it is
+    the same measure in both valuation modes, so it compares across rows.
+    ``estimated_value`` and ``bp_cost`` are always POSITIVE
     magnitudes. ``bp_cost`` is 0.0 for sells -- sells free buying power and never
     scale. ``fractional`` records the SIZING MODE: True when this row was rounded
     on the fractional grid (toggle on AND the broker calls the symbol
@@ -284,19 +290,46 @@ def current_value(state: Optional[PositionState], valuation_mode: str) -> float:
 
 def round_delta_quantity(delta_notional: float, price: float,
                          margin: Optional[MarginInfo], *, allow_fractional: bool,
-                         current_quantity: float) -> float:
+                         current_quantity: float,
+                         apply_min_order_size: bool = True) -> float:
     """Turn a SIGNED notional delta into a SIGNED, tradeable share delta.
 
     Used by ``cost`` valuation mode, where the target is expressed against the
     purchase value rather than the share count. The magnitude is rounded DOWN by
-    ``round_quantity`` (so increments and min order sizes still hold) and a sell
-    is CLAMPED to ``current_quantity`` -- long-only, never oversell.
+    ``round_quantity`` (so trade increments still hold) and a sell is CLAMPED to
+    ``current_quantity`` -- long-only, never oversell.
+
+    ``apply_min_order_size=False`` defers the minimum-order check to AFTER that
+    clamp, which is the only place it can be applied to the quantity actually
+    being sent; ``compute_allocation`` does this so the suppressed row also gets
+    a ``REASON_BELOW_MIN_ORDER_FMT`` explaining itself.
     """
     magnitude = round_quantity(abs(float(delta_notional or 0.0)), price, margin,
-                               allow_fractional=allow_fractional)
+                               allow_fractional=allow_fractional,
+                               apply_min_order_size=apply_min_order_size)
     if delta_notional >= 0:
         return magnitude
     return -min(magnitude, float(current_quantity or 0.0))
+
+
+def _suppress_below_min_order(delta: float, margin: Optional[MarginInfo],
+                              reasons: List[str]) -> float:
+    """Zero a signed share delta the broker would refuse as too small, with a reason.
+
+    ``min_order_size`` constrains the ORDER, not the TARGET: when the trade cannot
+    be sent, the right answer is to LEAVE THE POSITION WHERE IT IS, not to rewrite
+    what we want to hold. Filtering the target instead used to turn "hold the
+    3.3333 shares you already have" into a full liquidation.
+
+    Tests the MAGNITUDE, so an unsendable trim is suppressed exactly like an
+    unsendable top-up. Appends to ``reasons`` in place -- a silently absent order
+    is its own kind of wrong. Returns the delta to use.
+    """
+    if (delta and margin is not None and margin.min_order_size is not None
+            and abs(delta) < float(margin.min_order_size)):
+        reasons.append(REASON_BELOW_MIN_ORDER_FMT.format(size=margin.min_order_size))
+        return 0.0
+    return delta
 
 
 def even_split_pct(count: int) -> List[float]:
@@ -468,7 +501,7 @@ def compute_base_notional(available_buying_power: float,
 
 
 def round_quantity(target_notional: float, price: float, margin: Optional[MarginInfo],
-                   *, allow_fractional: bool) -> float:
+                   *, allow_fractional: bool, apply_min_order_size: bool = True) -> float:
     """Convert a notional to a tradeable share quantity.
 
     Fractional OFF: ``floor(target_notional / price)``.
@@ -479,7 +512,12 @@ def round_quantity(target_notional: float, price: float, margin: Optional[Margin
 
     Always rounds DOWN, so a plan never over-spends its notional. Returns 0.0
     when ``price <= 0``; the caller must have already skipped a ``None`` price.
-    A result below ``margin.min_order_size`` is returned as 0.0.
+
+    A result below ``margin.min_order_size`` is returned as 0.0 -- correct when
+    the value being rounded is an ORDER, WRONG when it is a TARGET holding, since
+    a minimum order size says nothing about what you may hold. Pass
+    ``apply_min_order_size=False`` when sizing a target and filter the resulting
+    DELTA instead (``_suppress_below_min_order``).
     """
     if price is None or price <= 0:
         return 0.0
@@ -497,7 +535,8 @@ def round_quantity(target_notional: float, price: float, margin: Optional[Margin
         qty = float(math.floor(raw))
     if qty <= 0:
         return 0.0
-    if margin is not None and margin.min_order_size is not None and qty < margin.min_order_size:
+    if (apply_min_order_size and margin is not None
+            and margin.min_order_size is not None and qty < margin.min_order_size):
         return 0.0
     return qty
 
@@ -588,6 +627,9 @@ def compute_allocation(base_notional: float, available_buying_power: float,
         * a symbol whose ``PositionState.price`` is ``None`` or <= 0 -> skipped
           with ``REASON_NO_PRICE`` (no guessed price -- no-fallback rule);
         * a negative computed target -> clamped to 0 with ``REASON_NEGATIVE_CLAMPED``;
+        * a delta the broker would refuse as too small (``margin.min_order_size``)
+          -> the ORDER is suppressed and the POSITION IS HELD, with
+          ``REASON_BELOW_MIN_ORDER_FMT``; the target itself is never rewritten;
         * a symbol in several managed labels -> targets SUM, one row, and
           ``REASON_MULTI_LABEL_FMT`` (no enforcement -- decision 7);
         * ``sum(bp_cost of buys) > available_buying_power`` -> every buy scaled
@@ -661,10 +703,9 @@ def compute_allocation(base_notional: float, available_buying_power: float,
 
         if target_notional <= 0 and row.current_quantity > 0:
             # Same in both modes: a zero target flattens the position outright.
-            # Keyed on the NOTIONAL, never on the rounded quantity -- a
-            # min_order_size that rounds a positive target down to 0 shares is
-            # not an instruction to liquidate.
-            row.target_quantity = 0.0
+            # Keyed on the NOTIONAL, never on the rounded quantity: only an
+            # actual instruction to hold nothing may liquidate, never a rounding
+            # rule that happened to produce 0 shares.
             delta = -row.current_quantity
             row.reasons.append(REASON_CLOSE_TO_ZERO)
         elif valuation_mode == VALUATION_MODE_COST:
@@ -672,18 +713,25 @@ def compute_allocation(base_notional: float, available_buying_power: float,
             delta = round_delta_quantity(
                 target_notional - current_value(ps, VALUATION_MODE_COST),
                 row.price, m, allow_fractional=allow_fractional,
-                current_quantity=row.current_quantity)
-            row.target_quantity = row.current_quantity + delta
+                current_quantity=row.current_quantity,
+                apply_min_order_size=False)
         else:
             # Target a SHARE COUNT: target_notional / price, delta vs what is held.
-            row.target_quantity = round_quantity(target_notional, row.price, m,
-                                                 allow_fractional=allow_fractional)
-            delta = row.target_quantity - row.current_quantity
+            ideal_quantity = round_quantity(target_notional, row.price, m,
+                                            allow_fractional=allow_fractional,
+                                            apply_min_order_size=False)
+            delta = ideal_quantity - row.current_quantity
             if not frac:
                 delta = float(math.floor(delta) if delta > 0 else -math.floor(-delta))
         if abs(delta) < QUANTITY_EPSILON:
             delta = 0.0
+        # ONE minimum-order check, on the signed delta both branches produce -- the
+        # only quantity that is actually sent to the broker.
+        delta = _suppress_below_min_order(delta, m, row.reasons)
         row.delta_quantity = delta
+        # target_quantity is the POST-TRADE holding in every mode and every branch:
+        # what the account owns if this row executes, never an unreachable ideal.
+        row.target_quantity = row.current_quantity + delta
         if delta > 0:
             row.side = OrderDirection.BUY
         elif delta < 0:
@@ -767,11 +815,15 @@ def compute_label_investment(label: LabelTarget, amount: float,
             continue
         frac = bool(allow_fractional and m is not None and m.fractionable)
         row.fractional = frac
-        qty = round_quantity(target_notional, row.price, m, allow_fractional=allow_fractional)
+        qty = round_quantity(target_notional, row.price, m,
+                             allow_fractional=allow_fractional,
+                             apply_min_order_size=False)
         if frac:
             row.reasons.append(REASON_FRACTIONAL)
         elif allow_fractional:
             row.reasons.append(REASON_WHOLE_SHARE_FLOOR)
+        # Buys only here, so the budget IS the order: same suppression, same reason.
+        qty = _suppress_below_min_order(qty, m, row.reasons)
         row.delta_quantity = qty
         row.target_quantity = row.current_quantity + qty
         if qty > 0:
