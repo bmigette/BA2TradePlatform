@@ -9,24 +9,12 @@ Per Amendment A1 the leak gate uses sys.modules in a fresh subprocess (NOT
 "not installed" — langchain_core/fmpsdk ARE present in this venv). fmpsdk is a
 legitimate declared runtime dependency of ba2_providers and is allowed.
 """
-import subprocess
-import sys
-import textwrap
-
 import pytest
 
-PY = sys.executable
+from ._leakgate import MARK, assert_no_leak, check_leak, probe_verdict
 
-
-def _assert_no_leak(import_stmt, forbidden):
-    code = textwrap.dedent(f"""
-        import sys; {import_stmt}
-        bad=[m for m in {forbidden!r} if any(k==m or k.startswith(m+'.') for k in sys.modules)]
-        print('LEAK:'+','.join(bad) if bad else 'CLEAN')""")
-    out = subprocess.run([PY, "-c", code], capture_output=True, text=True)
-    assert out.stdout.strip() == "CLEAN", (
-        f"{import_stmt} pulled {out.stdout.strip()} / stderr:\n{out.stderr}"
-    )
+FORBIDDEN = ["langchain", "langchain_core", "ba2_trade_platform", "ba2_experts",
+             "nicegui"]
 
 
 def test_providers_import_without_llm():
@@ -55,16 +43,24 @@ def test_socialmedia_has_stocktwits_not_ai():
 def test_import_pulls_no_langchain_or_modelfactory():
     # The real assertion (Amendment A1): importing ba2_providers must not PULL
     # langchain / ModelFactory / the live platform / experts / nicegui.
-    _assert_no_leak(
-        "import ba2_providers",
-        ["langchain", "langchain_core", "ba2_trade_platform", "ba2_experts", "nicegui"],
-    )
+    assert_no_leak("ba2_providers", FORBIDDEN)
 
 
 def test_modelfactory_module_not_loaded():
     # Negative control: no ModelFactory module anywhere in sys.modules after import.
-    code = textwrap.dedent("""
-        import sys, ba2_providers
-        print('HAS_MF' if any('ModelFactory' in k for k in sys.modules) else 'NO_MF')""")
-    out = subprocess.run([PY, "-c", code], capture_output=True, text=True)
-    assert out.stdout.strip() == "NO_MF", f"{out.stdout} / {out.stderr}"
+    verdict = probe_verdict(
+        "import sys, ba2_providers\n"
+        f"print({MARK!r} + ('HAS_MF' if any('ModelFactory' in k for k in sys.modules)"
+        " else 'NO_MF'))\n"
+    )
+    assert verdict == "NO_MF", verdict
+
+
+def test_leak_gate_catches_a_real_live_platform_leak():
+    """Non-vacuity control: the SAME gate pointed at a module that really does have
+    the back-edges (`ba2_trade_platform.core.utils`) must report them. If this ever
+    goes CLEAN the gate has stopped discriminating and the CLEAN above is worthless."""
+    verdict = check_leak("ba2_trade_platform.core.utils", FORBIDDEN)
+    assert verdict.startswith("LEAK:"), (
+        f"gate reported a known-leaky module as clean: {verdict!r}")
+    assert "ba2_trade_platform" in verdict and "langchain_core" in verdict, verdict

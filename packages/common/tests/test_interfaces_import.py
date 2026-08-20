@@ -5,31 +5,14 @@ The leak gate runs in a subprocess (Amendment A1) and asserts sys.modules purity
 rather than 'package not installed' — fmpsdk/nicegui/langchain_core ARE present in
 the test venv, so a real back-edge would be caught.
 """
-import os
-import subprocess
-import sys
-import textwrap
+from ._leakgate import assert_no_leak
 
 FORBIDDEN = ["ba2_providers", "ba2_experts", "langchain", "langchain_core",
              "fmpsdk", "nicegui", "ba2_trade_platform"]
 
-# Reconstruct the PYTHONPATH the subprocess needs so `import ba2_common` resolves.
-_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-
-def _assert_no_leak(import_stmt, forbidden=FORBIDDEN):
-    code = textwrap.dedent(f"""
-        import sys
-        {import_stmt}
-        bad=[m for m in {forbidden!r} if any(k==m or k.startswith(m+'.') for k in sys.modules)]
-        print('LEAK:'+','.join(bad) if bad else 'CLEAN')
-    """)
-    env = dict(os.environ)
-    existing = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = _REPO + (os.pathsep + existing if existing else "")
-    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env)
-    assert out.stdout.strip() == "CLEAN", (
-        f"{import_stmt} pulled {out.stdout.strip()!r} / stderr={out.stderr}")
+def _assert_no_leak(module, forbidden=FORBIDDEN):
+    assert_no_leak(module, forbidden)
 
 
 def test_all_interfaces_import_clean():
@@ -52,19 +35,19 @@ def test_ruleset_engine_imports_without_providers():
 
 
 def test_interfaces_import_pulls_no_provider_llm_ui():
-    _assert_no_leak("import ba2_common.core.interfaces")
+    _assert_no_leak("ba2_common.core.interfaces")
 
 
 def test_ruleset_engine_import_pulls_no_provider_llm_ui():
-    for stmt in (
-        "import ba2_common.core.TradeConditions",
-        "import ba2_common.core.TradeActions",
-        "import ba2_common.core.TradeActionEvaluator",
-        "import ba2_common.core.TradeRiskManagement",
-        "import ba2_common.core.position_sizing",
-        "import ba2_common.core.rules_export_import",
+    for module in (
+        "ba2_common.core.TradeConditions",
+        "ba2_common.core.TradeActions",
+        "ba2_common.core.TradeActionEvaluator",
+        "ba2_common.core.TradeRiskManagement",
+        "ba2_common.core.position_sizing",
+        "ba2_common.core.rules_export_import",
     ):
-        _assert_no_leak(stmt)
+        _assert_no_leak(module)
 
 
 def test_provider_resolver_seam_present():

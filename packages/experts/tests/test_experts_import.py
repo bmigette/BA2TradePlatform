@@ -12,48 +12,32 @@ this venv, so a "not importable" check would be vacuous. The real assertion is
 that importing ba2_experts does not PULL them into sys.modules. fmpsdk IS pulled
 (a declared runtime dependency of ba2_experts) and is allowed.
 """
-import subprocess
-import sys
-import textwrap
-
-PY = sys.executable
+from ._leakgate import assert_no_leak, check_leak
 
 FORBIDDEN = ["langchain", "langchain_core", "nicegui", "ba2_trade_platform",
              "ba2_common.core.ModelFactory"]
 
 
-def _assert_no_leak(import_stmt, forbidden):
-    code = textwrap.dedent(f"""
-        import sys
-        {import_stmt}
-        bad=[m for m in {forbidden!r} if any(k==m or k.startswith(m+'.') for k in sys.modules)]
-        print('LEAK:'+','.join(bad) if bad else 'CLEAN')
-    """)
-    out = subprocess.run([PY, "-c", code], capture_output=True, text=True)
-    assert out.stdout.strip() == "CLEAN", (
-        f"{import_stmt!r} pulled {out.stdout.strip()} / stderr={out.stderr}")
-
-
 def test_import_ba2_experts_pulls_no_forbidden_module():
-    _assert_no_leak("import ba2_experts", FORBIDDEN)
+    assert_no_leak("ba2_experts", FORBIDDEN)
 
 
 def test_leak_gate_is_non_vacuous():
     """Negative control: directly importing langchain_core MUST be reported as a leak,
     proving the gate would catch a real one (langchain_core is installed here)."""
-    code = textwrap.dedent("""
-        import sys, importlib
-        try:
-            importlib.import_module('langchain_core')
-        except ImportError:
-            print('CLEAN')  # not installed -> control inconclusive but not a false pass
-        else:
-            bad=[m for m in ['langchain_core'] if any(k==m or k.startswith(m+'.') for k in sys.modules)]
-            print('LEAK:'+','.join(bad) if bad else 'CLEAN')
-    """)
-    out = subprocess.run([PY, "-c", code], capture_output=True, text=True)
-    assert out.stdout.strip().startswith("LEAK:langchain_core"), (
-        f"control did not detect langchain_core: {out.stdout.strip()} / {out.stderr}")
+    verdict = check_leak("langchain_core", ["langchain_core"])
+    assert verdict.startswith("LEAK:langchain_core"), (
+        f"control did not detect langchain_core: {verdict!r}")
+
+
+def test_leak_gate_catches_a_real_live_platform_leak():
+    """Stronger control: the SAME gate pointed at a module that really does have the
+    back-edges (`ba2_trade_platform.core.utils`) must report them. If this ever goes
+    CLEAN the gate has stopped discriminating."""
+    verdict = check_leak("ba2_trade_platform.core.utils", FORBIDDEN)
+    assert verdict.startswith("LEAK:"), (
+        f"gate reported a known-leaky module as clean: {verdict!r}")
+    assert "ba2_trade_platform" in verdict and "langchain_core" in verdict, verdict
 
 
 def test_experts_package_imports_and_registry_works():

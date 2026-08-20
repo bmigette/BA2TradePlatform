@@ -5,35 +5,16 @@ the three instance-factory functions (which depended on the live registries) mus
 be gone. Plus a couple of pure-helper contract checks reconciled to the real
 source signatures.
 """
-import subprocess
-import sys
-import textwrap
-
-PY = sys.executable
-
-
-def _assert_no_leak(import_stmt, forbidden):
-    """Amendment A1 leak gate: in a subprocess, importing must not PULL a
-    forbidden module into sys.modules (forbidden pkgs ARE installed in this venv,
-    so 'not installed' is not a valid proxy)."""
-    code = textwrap.dedent(f"""
-        import sys
-        {import_stmt}
-        bad = [m for m in {forbidden!r}
-               if any(k == m or k.startswith(m + '.') for k in sys.modules)]
-        print('LEAK:' + ','.join(bad) if bad else 'CLEAN')
-    """)
-    out = subprocess.run([PY, "-c", code], capture_output=True, text=True)
-    assert out.stdout.strip() == "CLEAN", (
-        f"{import_stmt!r} pulled {out.stdout.strip()} / stderr={out.stderr}"
-    )
+from ._leakgate import assert_no_leak
 
 
 def test_utils_import_pulls_no_experts_accounts_or_live_platform():
     """The keystone: importing common utils must NOT pull any
-    provider/expert/account/live-platform package (proven via sys.modules)."""
-    _assert_no_leak(
-        "import ba2_common.core.utils",
+    provider/expert/account/live-platform package (proven via sys.modules in a
+    fresh interpreter -- see _leakgate for why the child needs an explicit
+    PYTHONPATH)."""
+    assert_no_leak(
+        "ba2_common.core.utils",
         ["ba2_providers", "ba2_experts", "ba2_trade_platform",
          "langchain", "langchain_core", "fmpsdk", "nicegui"],
     )

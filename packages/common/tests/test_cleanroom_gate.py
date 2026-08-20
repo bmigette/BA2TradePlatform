@@ -11,10 +11,7 @@ real back-edge from ba2_common into any of them would be caught here. The gate i
 proven non-vacuous by test_gate_is_non_vacuous below (a deliberate import of a
 forbidden package makes the same check report LEAK).
 """
-import os
-import subprocess
-import sys
-import textwrap
+from ._leakgate import PROBE_PATH, check_leak, probe_verdict, MARK
 
 # The Task 7 plan Step-1 module set: package + config/logger + core leaves +
 # the two seam-bearing engines (interfaces, TradeConditions, TradeRiskManagement)
@@ -37,9 +34,10 @@ CLEANROOM_MODULES = [
     "ba2_common.core.rules_export_import",
 ]
 
-# fmpsdk / nicegui / langchain_core are the REAL installed packages in this venv;
-# langchain (umbrella) and ba2_providers/ba2_experts/ba2_trade_platform are not,
-# but listing them keeps the gate honest if they ever get installed.
+# fmpsdk / nicegui / langchain_core are REAL installed packages in this venv, and
+# ba2_providers / ba2_experts / ba2_trade_platform are all importable in the probe
+# (see _leakgate.PROBE_PATH) -- so every entry here is a module the child COULD
+# have imported, which is what makes the gate non-vacuous.
 FORBIDDEN = [
     "ba2_providers",
     "ba2_experts",
@@ -50,45 +48,47 @@ FORBIDDEN = [
     "ba2_trade_platform",
 ]
 
-_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
-def _run_gate(import_lines):
-    """Run import_lines in a fresh interpreter; return its stdout ('CLEAN'/'LEAK:...')."""
-    code = textwrap.dedent(
-        f"""
-        import importlib, sys
-        for _m in {import_lines!r}:
-            importlib.import_module(_m)
-        _bad = [m for m in {FORBIDDEN!r}
-                if any(k == m or k.startswith(m + '.') for k in sys.modules)]
-        print('LEAK:' + ','.join(_bad) if _bad else 'CLEAN')
-        """
-    )
-    env = dict(os.environ)
-    existing = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = _REPO + (os.pathsep + existing if existing else "")
-    out = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, env=env
-    )
-    return out
-
-
 def test_cleanroom_no_provider_llm_ui_leak():
     """ba2_common + interfaces + TradeConditions + TradeRiskManagement (+ the rest of
     the public surface) pull NONE of the forbidden provider/LLM/UI/live modules."""
-    out = _run_gate(CLEANROOM_MODULES)
-    assert out.stdout.strip() == "CLEAN", (
-        f"clean-room gate leaked: {out.stdout.strip()!r}\nstderr={out.stderr}"
-    )
+    verdict = check_leak(CLEANROOM_MODULES, FORBIDDEN)
+    assert verdict == "CLEAN", f"clean-room gate leaked: {verdict!r}"
 
 
 def test_gate_is_non_vacuous():
     """Sanity: deliberately importing a forbidden package (fmpsdk, which IS installed)
     makes the identical sys.modules check report LEAK. Proves the CLEAN result above
     is real and not a false pass from the package merely being absent."""
-    out = _run_gate(["ba2_common", "fmpsdk"])
-    assert out.stdout.strip().startswith("LEAK:fmpsdk"), (
-        f"gate failed to detect a deliberate leak: {out.stdout.strip()!r}\n"
-        f"stderr={out.stderr}"
+    verdict = check_leak(["ba2_common", "fmpsdk"], FORBIDDEN)
+    assert verdict.startswith("LEAK:fmpsdk"), (
+        f"gate failed to detect a deliberate leak: {verdict!r}"
+    )
+
+
+def test_gate_catches_a_real_live_platform_leak():
+    """Stronger non-vacuity control: point the SAME gate at a module that really
+    does have the back-edges (`ba2_trade_platform.core.utils`, the live shim, which
+    pulls providers + experts + langchain + fmpsdk). If this ever reports CLEAN the
+    gate has stopped discriminating and every other result here is worthless."""
+    verdict = check_leak("ba2_trade_platform.core.utils", FORBIDDEN)
+    assert verdict.startswith("LEAK:"), (
+        "the gate reported a known-leaky module as clean -- it no longer "
+        f"discriminates: {verdict!r}"
+    )
+    for expected in ("ba2_providers", "ba2_experts", "ba2_trade_platform"):
+        assert expected in verdict, f"gate missed the {expected} back-edge: {verdict!r}"
+
+
+def test_probe_resolves_ba2_common_to_this_checkout():
+    """Guard against the failure mode this gate is built on top of: the probe must
+    import the ba2_common living in THIS repo, not a stale editable install (the
+    venv's .pth files point at sibling checkouts that need not exist) and not
+    nothing at all. A probe that cannot import ba2_common must fail loudly, never
+    report CLEAN."""
+    resolved = probe_verdict(
+        f"import ba2_common; print({MARK!r} + ba2_common.__file__)"
+    )
+    assert resolved.startswith(PROBE_PATH[0]), (
+        f"probe resolved ba2_common to {resolved!r}, expected it under "
+        f"{PROBE_PATH[0]!r}"
     )
