@@ -10797,6 +10797,35 @@ def test_account_snapshot_of_a_cash_account_has_no_leverage():
     assert snapshot.margin_multiplier == 1.0
 
 
+def test_account_snapshot_negates_tastytrades_positive_short_magnitude():
+    """AccountSnapshot pins short_market_value as NEGATIVE while shorts are held
+    (the Alpaca convention), but TastyTrade reports short-equity-value as a POSITIVE
+    magnitude. If the adapter passes it through, gross exposure becomes
+    broker-dependent — and every other fixture here uses a zero short, which is
+    sign-agnostic and would never catch it."""
+    acct = _bare_account()
+    acct._account.margin_or_cash = "Margin"
+    balances = _balances()
+    balances.short_equity_value = Decimal("12000")
+    acct._account.get_balances = AsyncMock(return_value=balances)
+
+    snapshot = acct.get_account_snapshot()
+
+    assert snapshot.short_market_value == -12000.0
+
+
+def test_account_snapshot_leaves_an_absent_short_value_as_none():
+    """None means 'the broker did not say', which must not be negated into -0.0."""
+    acct = _bare_account()
+    balances = _balances()
+    balances.short_equity_value = None
+    acct._account.get_balances = AsyncMock(return_value=balances)
+
+    snapshot = acct.get_account_snapshot()
+
+    assert snapshot.short_market_value is None
+
+
 def test_account_snapshot_on_failure_is_all_none_not_zeros():
     """An all-None snapshot is a legitimate 'the broker told us nothing'. Zeros would
     be a fabricated balance, which the caller cannot distinguish from a real one."""
@@ -10880,7 +10909,16 @@ Insert these two methods immediately **below** `get_account_info`:
             margin_multiplier=2.0 if is_margin else 1.0,
             is_margin_account=is_margin,
             long_market_value=_num("long_equity_value"),
-            short_market_value=_num("short_equity_value"),
+            # NEGATED ON PURPOSE. AccountSnapshot pins short_market_value as NEGATIVE
+            # while shorts are held (the Alpaca convention), but TastyTrade's
+            # short-equity-value is a POSITIVE MAGNITUDE. Passing it through unchanged
+            # makes gross exposure broker-dependent: long + abs(short) and long - short
+            # disagree, and no fixture with a zero short can tell the difference.
+            short_market_value=(
+                -_num("short_equity_value")
+                if _num("short_equity_value") is not None
+                else None
+            ),
             # TastyTrade's pending_cash is SIGNED (positive = incoming); it is reported
             # as-is rather than clamped, so the caller sees what the broker said.
             pending_transfer_in=_num("pending_cash"),
