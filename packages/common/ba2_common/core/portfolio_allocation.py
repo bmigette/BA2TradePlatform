@@ -233,11 +233,72 @@ class AllocationPlan:
         }
 
 
+def round_quantity(target_notional: float, price: float, margin: Optional[MarginInfo],
+                   *, allow_fractional: bool) -> float:
+    """Convert a notional to a tradeable share quantity. Always rounds DOWN, so a
+    plan never over-spends its notional. Whole shares only for now.
+
+    Returns 0.0 when ``price <= 0``; the caller must have already skipped a
+    ``None`` price.
+    """
+    if price is None or price <= 0:
+        return 0.0
+    if target_notional is None or target_notional <= 0:
+        return 0.0
+    return float(math.floor(float(target_notional) / float(price)))
+
+
+def _finalise_totals(plan: AllocationPlan) -> None:
+    """Fill the plan-level money totals from its rows."""
+    plan.total_buy_value = sum(r.estimated_value for r in plan.rows if r.is_buy)
+    plan.total_sell_value = sum(r.estimated_value for r in plan.rows if r.is_sell)
+    plan.required_buying_power = sum(r.bp_cost for r in plan.rows if r.is_buy)
+    plan.bp_usage_pct = (plan.required_buying_power / plan.available_buying_power * 100.0
+                         if plan.available_buying_power > 0 else 0.0)
+
+
 def compute_allocation(base_notional: float, available_buying_power: float,
                        labels: List[LabelTarget], current: Dict[str, PositionState],
                        margin: Dict[str, MarginInfo], *, allow_fractional: bool,
                        default_bp_factor: float) -> AllocationPlan:
-    """Solve a full REBALANCE. Skeleton: with no labels there is nothing to do."""
-    return AllocationPlan(base_notional=float(base_notional or 0.0),
+    """Solve a full REBALANCE: notional targets for every managed label.
+
+    A symbol carried by several managed labels gets ONE row whose targets SUM
+    (decision 7 -- no enforcement). A symbol missing from ``margin`` falls back
+    to the conservative ``default_bp_factor`` (the account multiplier), which
+    under-deploys rather than over-commits.
+    """
+    current = current or {}
+    margin = margin or {}
+    plan = AllocationPlan(base_notional=float(base_notional or 0.0),
                           available_buying_power=float(available_buying_power or 0.0),
                           allow_fractional=bool(allow_fractional))
+    targets = {}
+    sym_labels = {}
+    for lt in labels or []:
+        pct = float(lt.target_pct or 0.0)
+        for st in lt.symbols or []:
+            share = pct * float(st.weight_pct or 0.0) / 100.0
+            targets[st.symbol] = targets.get(st.symbol, 0.0) + plan.base_notional * share / 100.0
+            sym_labels.setdefault(st.symbol, []).append(lt.label)
+
+    for symbol, target_notional in targets.items():
+        ps = current.get(symbol)
+        m = margin.get(symbol)
+        row = AllocationRow(symbol=symbol, labels=list(sym_labels[symbol]))
+        row.bp_factor = float(m.bp_factor) if m is not None else float(default_bp_factor)
+        row.price = ps.price if ps is not None else None
+        if len(row.labels) > 1:
+            row.reasons.append(REASON_MULTI_LABEL_FMT.format(labels=", ".join(row.labels)))
+        row.target_notional = target_notional
+        row.target_quantity = round_quantity(target_notional, row.price, m,
+                                             allow_fractional=allow_fractional)
+        row.delta_quantity = row.target_quantity
+        if row.delta_quantity > 0:
+            row.side = OrderDirection.BUY
+        row.estimated_value = row.delta_quantity * row.price
+        row.bp_cost = row.estimated_value * row.bp_factor
+        plan.rows.append(row)
+
+    _finalise_totals(plan)
+    return plan

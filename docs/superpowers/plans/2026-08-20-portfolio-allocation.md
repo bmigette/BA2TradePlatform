@@ -4743,7 +4743,7 @@ git commit -m "feat(allocation): pure allocation engine value objects and empty 
 - Modify: `packages/common/ba2_common/core/portfolio_allocation.py`
 - Test: `packages/common/tests/test_portfolio_allocation.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to the end of `packages/common/tests/test_portfolio_allocation.py`:
 
@@ -4834,7 +4834,7 @@ def test_round_quantity_returns_zero_for_a_non_positive_price():
     assert pa.round_quantity(1_000.0, 0.0, None, allow_fractional=False) == 0.0
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `venv/bin/python -m pytest packages/common/tests/test_portfolio_allocation.py -v -k "even_split_two or uneven_label or two_labels_sums or ninety_percent or unknown_margin or no_managed_label or fractional_off_floors or round_quantity_returns_zero"`
 
@@ -4845,7 +4845,7 @@ E   IndexError: list index out of range
 E   AttributeError: module 'ba2_common.core.portfolio_allocation' has no attribute 'round_quantity'
 ```
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Delete the placeholder `compute_allocation` at the bottom of
 `packages/common/ba2_common/core/portfolio_allocation.py` and put these three functions in its
@@ -4923,12 +4923,12 @@ def compute_allocation(base_notional: float, available_buying_power: float,
     return plan
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `venv/bin/python -m pytest packages/common/tests/test_portfolio_allocation.py -v`
 Expected: PASS — `15 passed`
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add packages/common/ba2_common/core/portfolio_allocation.py packages/common/tests/test_portfolio_allocation.py
 git commit -m "feat(allocation): notional targeting across managed labels"
