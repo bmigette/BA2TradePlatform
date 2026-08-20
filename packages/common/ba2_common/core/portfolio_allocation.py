@@ -261,12 +261,13 @@ def compute_allocation(base_notional: float, available_buying_power: float,
                        labels: List[LabelTarget], current: Dict[str, PositionState],
                        margin: Dict[str, MarginInfo], *, allow_fractional: bool,
                        default_bp_factor: float) -> AllocationPlan:
-    """Solve a full REBALANCE: notional targets for every managed label.
+    """Solve a full REBALANCE: every managed label, buys and sells.
 
-    A symbol carried by several managed labels gets ONE row whose targets SUM
-    (decision 7 -- no enforcement). A symbol missing from ``margin`` falls back
-    to the conservative ``default_bp_factor`` (the account multiplier), which
-    under-deploys rather than over-commits.
+    ``delta_quantity = target_quantity - current_quantity``, signed. A target of
+    zero on a held symbol closes it outright (``REASON_CLOSE_TO_ZERO``) --
+    including a fractional holding, which a broker will always let you flatten.
+    Any other delta is rounded TOWARDS ZERO to whole shares, so whole-share mode
+    can never emit a 0.37-share order.
     """
     current = current or {}
     margin = margin or {}
@@ -287,17 +288,29 @@ def compute_allocation(base_notional: float, available_buying_power: float,
         m = margin.get(symbol)
         row = AllocationRow(symbol=symbol, labels=list(sym_labels[symbol]))
         row.bp_factor = float(m.bp_factor) if m is not None else float(default_bp_factor)
+        row.current_quantity = float(ps.quantity) if ps is not None else 0.0
+        row.current_cost_basis = float(ps.cost_basis) if ps is not None else 0.0
         row.price = ps.price if ps is not None else None
         if len(row.labels) > 1:
             row.reasons.append(REASON_MULTI_LABEL_FMT.format(labels=", ".join(row.labels)))
         row.target_notional = target_notional
         row.target_quantity = round_quantity(target_notional, row.price, m,
                                              allow_fractional=allow_fractional)
-        row.delta_quantity = row.target_quantity
-        if row.delta_quantity > 0:
+        delta = row.target_quantity - row.current_quantity
+        if row.target_quantity <= 0 and row.current_quantity > 0:
+            delta = -row.current_quantity
+            row.reasons.append(REASON_CLOSE_TO_ZERO)
+        else:
+            delta = math.floor(delta) if delta > 0 else -math.floor(-delta)
+        if abs(delta) < QUANTITY_EPSILON:
+            delta = 0.0
+        row.delta_quantity = delta
+        if delta > 0:
             row.side = OrderDirection.BUY
-        row.estimated_value = row.delta_quantity * row.price
-        row.bp_cost = row.estimated_value * row.bp_factor
+        elif delta < 0:
+            row.side = OrderDirection.SELL
+        row.estimated_value = abs(delta) * row.price
+        row.bp_cost = row.estimated_value * row.bp_factor if delta > 0 else 0.0
         plan.rows.append(row)
 
     _finalise_totals(plan)

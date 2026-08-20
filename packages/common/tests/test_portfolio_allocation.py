@@ -143,3 +143,65 @@ def test_fractional_off_floors_the_quantity():
 
 def test_round_quantity_returns_zero_for_a_non_positive_price():
     assert pa.round_quantity(1_000.0, 0.0, None, allow_fractional=False) == 0.0
+
+
+def test_held_above_target_produces_a_sell_of_the_difference():
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
+    current = {"XXX": _pos("XXX", 100.0, quantity=100.0, cost_basis=10_000.0)}
+    plan = pa.compute_allocation(5_000.0, 0.0, labels, current, {},
+                                 allow_fractional=False, default_bp_factor=1.0)
+    row = plan.rows[0]
+    assert row.target_quantity == 50.0
+    assert row.delta_quantity == -50.0
+    assert row.side == OrderDirection.SELL
+    assert row.estimated_value == 5_000.0
+    assert row.bp_cost == 0.0
+    assert plan.total_sell_value == 5_000.0
+
+
+def test_held_below_target_produces_a_top_up_buy():
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
+    current = {"XXX": _pos("XXX", 100.0, quantity=20.0, cost_basis=1_800.0)}
+    plan = pa.compute_allocation(10_000.0, 1_000_000.0, labels, current, {},
+                                 allow_fractional=False, default_bp_factor=1.0)
+    row = plan.rows[0]
+    assert row.target_quantity == 100.0
+    assert row.delta_quantity == 80.0
+    assert row.side == OrderDirection.BUY
+    assert row.estimated_value == 8_000.0
+
+
+def test_zero_target_on_a_held_symbol_closes_the_position():
+    labels = [
+        LabelTarget("KEEP", 100.0, [SymbolTarget("AAA", 100.0)]),
+        LabelTarget("EXIT", 0.0, [SymbolTarget("BBB", 100.0)]),
+    ]
+    current = {"AAA": _pos("AAA", 100.0),
+               "BBB": _pos("BBB", 20.0, quantity=30.0, cost_basis=500.0)}
+    plan = pa.compute_allocation(10_000.0, 1_000_000.0, labels, current, {},
+                                 allow_fractional=False, default_bp_factor=1.0)
+    by = {r.symbol: r for r in plan.rows}
+    assert by["BBB"].target_quantity == 0.0
+    assert by["BBB"].delta_quantity == -30.0
+    assert by["BBB"].side == OrderDirection.SELL
+    assert pa.REASON_CLOSE_TO_ZERO in by["BBB"].reasons
+
+
+def test_already_on_target_produces_no_order():
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
+    current = {"XXX": _pos("XXX", 100.0, quantity=100.0, cost_basis=10_000.0)}
+    plan = pa.compute_allocation(10_000.0, 1_000_000.0, labels, current, {},
+                                 allow_fractional=False, default_bp_factor=1.0)
+    row = plan.rows[0]
+    assert row.delta_quantity == 0.0
+    assert row.side is None
+    assert plan.buy_rows == []
+    assert plan.sell_rows == []
+
+
+def test_whole_share_mode_never_emits_a_fractional_delta():
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
+    current = {"XXX": _pos("XXX", 100.0, quantity=10.5, cost_basis=1_050.0)}
+    plan = pa.compute_allocation(2_000.0, 1_000_000.0, labels, current, {},
+                                 allow_fractional=False, default_bp_factor=1.0)
+    assert plan.rows[0].delta_quantity == 9.0

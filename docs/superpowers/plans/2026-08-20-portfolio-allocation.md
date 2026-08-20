@@ -4942,7 +4942,7 @@ git commit -m "feat(allocation): notional targeting across managed labels"
 - Modify: `packages/common/ba2_common/core/portfolio_allocation.py`
 - Test: `packages/common/tests/test_portfolio_allocation.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to the end of `packages/common/tests/test_portfolio_allocation.py`:
 
@@ -5009,7 +5009,7 @@ def test_whole_share_mode_never_emits_a_fractional_delta():
     assert plan.rows[0].delta_quantity == 9.0
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `venv/bin/python -m pytest packages/common/tests/test_portfolio_allocation.py -v -k "held_above_target or held_below_target or zero_target_on_a_held or already_on_target or whole_share_mode"`
 
@@ -5020,7 +5020,7 @@ E   AssertionError: assert 0.0 == -30.0
 E   AssertionError: assert 20.0 == 9.0
 ```
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Replace the whole `compute_allocation` function in
 `packages/common/ba2_common/core/portfolio_allocation.py` with:
@@ -5086,12 +5086,12 @@ def compute_allocation(base_notional: float, available_buying_power: float,
     return plan
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `venv/bin/python -m pytest packages/common/tests/test_portfolio_allocation.py -v`
 Expected: PASS — `20 passed`
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add packages/common/ba2_common/core/portfolio_allocation.py packages/common/tests/test_portfolio_allocation.py
 git commit -m "feat(allocation): signed deltas against held positions, close on zero target"
