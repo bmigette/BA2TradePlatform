@@ -54,6 +54,11 @@ def test_ensure_instrument_exists_creates_the_normalised_row_and_returns_it():
     assert _names() == ['TSLA']
 
 
+def test_ensure_instrument_exists_of_a_blank_symbol_creates_nothing():
+    assert ensure_instrument_exists('  ') == ''
+    assert _names() == []
+
+
 def test_ensure_instrument_exists_is_idempotent_across_case():
     ensure_instrument_exists('TSLA')
     ensure_instrument_exists('tsla')

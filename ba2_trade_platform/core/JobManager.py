@@ -114,10 +114,6 @@ def ensure_instrument_exists(symbol: str) -> str:
         str: the normalised symbol (``""`` for a blank input, in which case
         nothing is written).
     """
-    from ba2_common.core.utils import normalize_symbol
-    from .db import get_db
-    from sqlmodel import select
-
     symbol = normalize_symbol(symbol)
     if not symbol:
         logger.warning("ensure_instrument_exists: blank symbol, nothing to add")

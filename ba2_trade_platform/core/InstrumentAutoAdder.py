@@ -13,6 +13,7 @@ from sqlmodel import select
 from ..core.models import Instrument
 from ..core.db import get_db, add_instance, get_instance
 from ..logger import logger
+# straight from the package: ..core.utils would drag in the expert/account registries
 from ba2_common.core.utils import normalize_symbol
 import yfinance as yf
 from datetime import datetime, timezone

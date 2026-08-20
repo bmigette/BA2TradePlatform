@@ -699,6 +699,11 @@ def test_ensure_instrument_exists_creates_the_normalised_row_and_returns_it():
     assert _names() == ['TSLA']
 
 
+def test_ensure_instrument_exists_of_a_blank_symbol_creates_nothing():
+    assert ensure_instrument_exists('  ') == ''
+    assert _names() == []
+
+
 def test_ensure_instrument_exists_is_idempotent_across_case():
     ensure_instrument_exists('TSLA')
     ensure_instrument_exists('tsla')
@@ -718,9 +723,13 @@ Expected: FAIL at collection with
 Edit 1 — `ba2_trade_platform/core/InstrumentAutoAdder.py`, add one import after line 15
 (`from ..logger import logger`). Import straight from the package, NOT from
 `..core.utils`: the in-tree split shim also pulls the expert/account registries, which is a
-known circular-import trap, while `ba2_common.core.utils` is leak-gated pure code.
+known circular-import trap, while `ba2_common.core.utils` is leak-gated pure code. Every other
+import in that file goes through the in-tree shims, so record the reason in a comment — otherwise
+a future reader "tidies" it back to `..core.utils` and drags the registries into a background
+thread.
 
 ```python
+# straight from the package: ..core.utils would drag in the expert/account registries
 from ba2_common.core.utils import normalize_symbol
 ```
 
@@ -756,8 +765,14 @@ with:
                 existing = session.exec(stmt).first()
 ```
 
-Edit 3 — `ba2_trade_platform/core/JobManager.py`, insert this module-level function after line
-95 (after `should_schedule_open_positions`, before `class ControlMessageType`):
+Edit 3 — `ba2_trade_platform/core/JobManager.py`. First extend the module header: add `get_db` to
+the existing `from .db import ...` (`:26`) and add `from sqlmodel import select` plus
+`from ba2_common.core.utils import normalize_symbol`. Unlike the auto-adder, nothing here can
+cycle — `:24` already does `from ..core.utils import get_expert_instance_from_id` at module
+scope, so the shim and its registries are loaded regardless.
+
+Then insert this module-level function after line 95 (after `should_schedule_open_positions`,
+before `class ControlMessageType`):
 
 ```python
 def ensure_instrument_exists(symbol: str) -> str:
@@ -778,10 +793,6 @@ def ensure_instrument_exists(symbol: str) -> str:
         str: the normalised symbol (``""`` for a blank input, in which case
         nothing is written).
     """
-    from ba2_common.core.utils import normalize_symbol
-    from .db import get_db
-    from sqlmodel import select
-
     symbol = normalize_symbol(symbol)
     if not symbol:
         logger.warning("ensure_instrument_exists: blank symbol, nothing to add")
@@ -841,7 +852,7 @@ with:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `venv/bin/python -m pytest tests/test_instrument_autoadd_normalisation.py -v`
-Expected: PASS (5 passed).
+Expected: PASS (6 passed).
 
 Run: `venv/bin/python -m pytest tests/test_job_scheduling.py -v`
 Expected: PASS (the JobManager module still imports and its existing helpers are untouched).
