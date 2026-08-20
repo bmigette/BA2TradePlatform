@@ -16574,6 +16574,22 @@ git commit -m "feat(allocation): dry-run wizard dialog with tickable rows and pl
 
 ### Task 71: Wizard steps 1-3 and the INVEST_LABEL mode
 
+> **The engine will not validate for you — this step must call it.** Task 22 shipped
+> `validate_label_targets(labels, *, tolerance=LABEL_TOTAL_TOLERANCE_PCT)`, which returns a list of
+> human-readable error strings (empty means valid) covering: label percentages totalling 100 within
+> 0.01pp, negative label percentages, duplicate labels, a non-zero label with no symbols, and — per
+> label — symbol weights totalling 100, negative symbol weights, and a symbol duplicated inside one
+> label. Nothing calls it yet. `compute_allocation` deliberately multiplies whatever weights it is
+> handed, so an unvalidated 150% symbol set silently over-deploys its label.
+>
+> Wire it as the submit gate: block progression on a non-empty result and show the strings verbatim
+> (they already name the offending label and symbol).
+>
+> **Generate every default percentage through `even_split_pct`, never by hand.** The 0.01pp tolerance
+> is deliberately tight enough to reject a naive 2dp split — `3 x 33.33 = 99.99` fails — which is
+> what forces the remainder onto the last slot (`[33.33, 33.33, 33.34]`).
+
+
 Spec "The wizard": **Rebalance** — step 1 sets label percentages, validated to total exactly 100%,
 with an "Even split" button; step 2 sets symbol weights within each label, defaulting to even;
 step 3 shows the base breakdown, a Refresh button and the fractional toggle; step 4 is the
