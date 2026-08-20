@@ -19128,6 +19128,28 @@ upgrade. On this Mac the live DB is stamped `d5e1b9a3c842` — two revisions beh
 
 ---
 
+## ROLLOUT ORDERING — read before the next app start
+
+**`migrate.py upgrade` must run BEFORE the app starts again.** `init_db()` calls
+`SQLModel.metadata.create_all()` (`packages/common/ba2_common/core/db.py:368`), and Task 7 registered
+the five allocation models — so the next app start creates all five tables *outside Alembic's
+knowledge*. Reproduced: starting the app first and then upgrading gives
+
+```
+sqlalchemy.exc.OperationalError: table portfolio_allocation_config already exists
+```
+
+If the app has already started and `create_all` has made the tables, do **not** upgrade — run
+`alembic stamp f1c8a24b7e05` instead. Stamping is safe here specifically because Task 8 proved the
+two construction paths produce byte-equivalent schemas (`compare_metadata()` → 0 diffs over the whole
+database), and that proof is the only reason the escape hatch is legitimate.
+
+The same hazard already existed for `option_activity`, `option_iv_snapshot` and `provider_cache`,
+which `create_all` materialised before Alembic knew about them — which is why the live DB may fail an
+upgrade with a duplicate-column error. See Task 5's runbook.
+
+---
+
 ## Known limitations (deliberate, from the spec)
 
 1. **Allocation plans are not covered by settings export.** `settings_export_import.py` only
