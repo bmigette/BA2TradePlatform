@@ -1457,25 +1457,47 @@ git commit -m "feat(instruments): shared, idempotent duplicate-instrument merge"
 > ```
 >
 > So `python migrate.py upgrade` is broken today, independently of this feature. Fix it in
-> `alembic/env.py` next to the existing `sys.path.insert` — append the three `packages/*`
+> `alembic/env.py` next to the existing `sys.path.insert` — add the three `packages/*`
 > directories the same way — so alembic and `migrate.py` are self-sufficient and nobody has to
 > remember a prefix. Add a test that asserts `alembic current` exits 0 with a bare
 > `venv/bin/python`. This is a prerequisite for testing your revision, not optional cleanup.
+>
+> **AS BUILT (Task 5).** The three directories are `sys.path.insert(0, ...)`-ed, not appended:
+> the existing repo-root line prepends, and so does pytest.ini's `pythonpath`, so *this*
+> checkout's `packages/*` must win over the stale editable installs pointing elsewhere.
+>
+> **AS BUILT: this fix does not cover every alembic command.** `alembic heads` / `history` /
+> `branches` (i.e. `migrate.py heads|history`) import every revision module but never run
+> `env.py`, so the sys.path fix does not apply to them. A revision with a module-scope
+> `import ba2_common` therefore breaks all three for everyone — observed, not theorised. This
+> revision defers its merge import into `upgrade()` for exactly that reason, and
+> `test_alembic_heads_is_this_revision_alone_without_a_pythonpath_prefix` locks it in. Any
+> future revision importing app code must do the same, or `alembic.ini`'s `prepend_sys_path`
+> must be extended (which needs `path_separator` changed off `os`, since this repo also runs
+> on Windows).
+>
+> **AS BUILT: `migrate.py` still shells out to a bare `alembic` binary** (`subprocess.run`,
+> `shell=True`), so `venv/bin/python migrate.py upgrade` fails with
+> `/bin/sh: alembic: command not found` unless the venv is on `PATH`. Out of scope here and
+> left alone; use `venv/bin/python -m alembic upgrade head`, or activate the venv first.
 
 
 Head is `0a3e0bd24598` (verified: `venv/bin/python -m alembic heads` prints exactly
 `0a3e0bd24598 (head)`, single head), so `down_revision = '0a3e0bd24598'`. The revision imports
 the merge through the in-tree alias shim, exactly as `alembic/env.py:16` imports models, and
-adds no new import surface. It also carries a dry-run mode so the affected names can be
-inspected against the production database before anything is written.
+adds no new import surface. **AS BUILT: that import sits inside `upgrade()`, not at module
+scope** — see the second AS BUILT note above; at module scope it breaks `alembic heads`. It
+also carries a dry-run mode so the affected names can be inspected against the production
+database before anything is written.
 
 **This revision's id, `f1a7c2e9b4d0`, is the `down_revision` of Task 8's revision.**
 
 **Files:**
+- Modify: `alembic/env.py` (the sys.path prerequisite above)
 - Create: `alembic/versions/f1a7c2e9b4d0_merge_duplicate_instruments_unique_name.py`
 - Test: `tests/test_instrument_unique_migration.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `tests/test_instrument_unique_migration.py`:
 
@@ -1495,6 +1517,8 @@ import importlib.util
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 
 import pytest
 import sqlalchemy
@@ -1569,6 +1593,45 @@ def _indexes(engine):
         return {r[1]: r[2] for r in conn.execute(text("PRAGMA index_list(instrument)"))}
 
 
+def test_alembic_runs_without_a_pythonpath_prefix(tmp_path):
+    """`alembic current` must work with a bare interpreter, no PYTHONPATH prefix.
+
+    The Phase 6 packages (ba2_common/ba2_providers/ba2_experts) are only on
+    sys.path for pytest, via pytest.ini's `pythonpath`; this checkout's editable
+    installs point at an absolute path that does not exist here. Until env.py put
+    packages/* on sys.path itself, `alembic current` -- and therefore
+    `python migrate.py upgrade`, and therefore this revision -- died with
+    ModuleNotFoundError: No module named 'ba2_common'.
+
+    BA2_DB_FILE aims alembic at a throwaway file so no real database is opened.
+    """
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    env["BA2_DB_FILE"] = str(tmp_path / "alembic_probe.sqlite")
+    result = subprocess.run(
+        [sys.executable, "-m", "alembic", "current"],
+        cwd=REPO, env=env, capture_output=True, text=True, timeout=300,
+    )
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+
+
+def test_alembic_heads_is_this_revision_alone_without_a_pythonpath_prefix(tmp_path):
+    """`alembic heads` must still work bare, and report exactly one head: ours.
+
+    `heads` (like `history` and `branches`, i.e. `migrate.py heads|history`) imports
+    every revision module but does NOT run env.py, so the sys.path fix in env.py does
+    not apply to it. A revision that imports ba2_common at module scope breaks all
+    three commands; this revision therefore defers that import into upgrade().
+    """
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    env["BA2_DB_FILE"] = str(tmp_path / "alembic_probe.sqlite")
+    result = subprocess.run(
+        [sys.executable, "-m", "alembic", "heads"],
+        cwd=REPO, env=env, capture_output=True, text=True, timeout=300,
+    )
+    assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    assert result.stdout.split() == ['f1a7c2e9b4d0', '(head)'], result.stdout
+
+
 def test_migration_declares_the_verified_head_as_its_parent():
     module = _load_migration_module()
     assert module.revision == 'f1a7c2e9b4d0'
@@ -1589,6 +1652,47 @@ def test_upgrade_merges_duplicates_and_creates_the_unique_index(tmp_path):
     assert merged[0] == 'STOCK'
     assert merged[1] == 'Apple Inc'
     assert json.loads(merged[2]) == ['ark26', 'nasdaq30']
+
+
+def test_production_shape_collapses_124_groups_and_still_indexes(tmp_path):
+    """The live table's exact shape: 2477 rows, 2353 distinct names, 124 dup pairs.
+
+    Read-only queries on 2026-08-20 put production at 2477 instrument rows over 2353
+    distinct names with every name already `upper(trim(name))`, i.e. 124 groups of
+    exactly two rows and no renaming at all. The small fixture above proves the
+    merge's semantics; this proves CREATE UNIQUE INDEX actually succeeds once those
+    124 groups are gone -- if even one duplicate survived the merge, the index
+    creation, not the merge, is what would blow up in production.
+    """
+    db = tmp_path / "prodshape.sqlite"
+    engine = create_engine(f"sqlite:///{db}")
+    with engine.begin() as conn:
+        conn.execute(text(_CREATE))
+        row_id = 0
+        for i in range(2353):
+            name = f"SYM{i:04d}"
+            for _ in range(2 if i < 124 else 1):
+                row_id += 1
+                conn.execute(_INSERT, {
+                    "id": row_id, "name": name, "instrument_type": "STOCK",
+                    "categories": json.dumps([]), "labels": json.dumps([f"lab{row_id}"]),
+                    "company_name": None,
+                })
+        assert row_id == 2477
+
+    _run_upgrade(engine, _load_migration_module())
+
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT count(*) FROM instrument")).scalar() == 2353
+        assert conn.execute(text("SELECT count(DISTINCT name) FROM instrument")).scalar() == 2353
+        assert conn.execute(text(
+            "SELECT count(*) FROM instrument WHERE name <> upper(trim(name))"
+        )).scalar() == 0
+        # the merged pair keeps both rows' labels on the surviving lowest id
+        assert json.loads(conn.execute(text(
+            "SELECT labels FROM instrument WHERE name = 'SYM0000'"
+        )).scalar()) == ['lab1', 'lab2']
+    assert _indexes(engine).get('ix_instrument_name') == 1
 
 
 def test_after_upgrade_the_database_rejects_a_duplicate_name(tmp_path):
@@ -1640,13 +1744,17 @@ def test_downgrade_drops_the_index_but_keeps_the_merged_rows(tmp_path):
     assert _rows(engine) == [(1, 'AAPL'), (3, 'MSFT'), (4, 'NVDA')]
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `venv/bin/python -m pytest tests/test_instrument_unique_migration.py -v`
-Expected: FAIL — every test errors with
-`AssertionError: missing migration file .../alembic/versions/f1a7c2e9b4d0_merge_duplicate_instruments_unique_name.py`.
+Expected: FAIL — every migration test errors with
+`AssertionError: missing migration file .../alembic/versions/f1a7c2e9b4d0_merge_duplicate_instruments_unique_name.py`,
+and the two alembic-bootstrap tests fail on `returncode == 1` /
+`ModuleNotFoundError: No module named 'ba2_common'`.
+ACTUAL: `7 failed` for exactly those reasons (the 124-group test was added later, with the
+migration already in place — it is the one test in this file never observed red).
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Create `alembic/versions/f1a7c2e9b4d0_merge_duplicate_instruments_unique_name.py`:
 
@@ -1668,9 +1776,16 @@ by grepping for `foreign_key="instrument` and by iterating pragma_foreign_key_li
 over the live schema), so rows can be merged without repointing anything.
 
 The merge itself lives in `ba2_common.core.instrument_merge` and is imported here
-through the in-tree alias shim -- exactly how alembic/env.py:16 imports models --
-so this migration and its tests execute the SAME code. It is idempotent: the plan
-is recomputed from the current table state, so re-running writes nothing.
+through the in-tree alias shim -- exactly how alembic/env.py imports models -- so
+this migration and its tests execute the SAME code. It is idempotent: the plan is
+recomputed from the current table state, so re-running writes nothing.
+
+The import is INSIDE upgrade(), not at module scope. `alembic heads` / `history` /
+`branches` load every revision module but never run env.py, and env.py is what puts
+packages/* on sys.path (the venv's editable installs point at a path that does not
+exist here). A module-scope import of the shim therefore breaks those commands with
+ModuleNotFoundError: ba2_common, for every user, forever. Deferring it costs nothing:
+upgrade() only ever runs under env.py.
 
 INDEX NAME: `ix_instrument_name`, NOT `uix_instrument_name`. `Instrument.name` is
 declared `Field(unique=True, index=True)`, which makes SQLModel's create_all emit
@@ -1692,11 +1807,6 @@ from typing import Sequence, Union
 from alembic import op
 import sqlalchemy as sa
 
-from ba2_trade_platform.core.instrument_merge import (
-    merge_duplicate_instruments,
-    report_duplicate_instruments,
-)
-
 
 # revision identifiers, used by Alembic.
 revision: str = 'f1a7c2e9b4d0'
@@ -1714,6 +1824,14 @@ def _dry_run_requested() -> bool:
 
 def upgrade() -> None:
     """Upgrade schema."""
+    # Deferred on purpose -- see the module docstring: `alembic heads`/`history`
+    # import this file without ever running env.py, which is what makes ba2_common
+    # importable.
+    from ba2_trade_platform.core.instrument_merge import (
+        merge_duplicate_instruments,
+        report_duplicate_instruments,
+    )
+
     connection = op.get_bind()
 
     if _dry_run_requested():
@@ -1751,19 +1869,21 @@ def downgrade() -> None:
         op.drop_index(INDEX_NAME, table_name='instrument')
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `venv/bin/python -m pytest tests/test_instrument_unique_migration.py -v`
-Expected: PASS (6 passed).
+Expected: PASS. ACTUAL: `9 passed` (6 from the plan, + 2 alembic-bootstrap, + the 124-group
+production-shape test).
 
-Then confirm the revision chain still has exactly one head:
-Run: `PYTHONPATH=packages/common:packages/providers:packages/experts venv/bin/python -m alembic heads`
+Then confirm the revision chain still has exactly one head — no PYTHONPATH prefix any more,
+that is the whole point of the prerequisite:
+Run: `venv/bin/python -m alembic heads`
 Expected: `f1a7c2e9b4d0 (head)` — one line, no branch warning.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
-git add alembic/versions/f1a7c2e9b4d0_merge_duplicate_instruments_unique_name.py tests/test_instrument_unique_migration.py
+git add alembic/env.py alembic/versions/f1a7c2e9b4d0_merge_duplicate_instruments_unique_name.py tests/test_instrument_unique_migration.py
 git commit -m "feat(db): migration merging duplicate instruments and adding ix_instrument_name"
 ```
 
