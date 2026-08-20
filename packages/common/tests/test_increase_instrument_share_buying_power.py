@@ -6,20 +6,50 @@ absorb_if_benign() re-raises anything that is not an InstanceNotFound, so the
 AttributeError escaped execute() and this action has never once produced an order
 on Alpaca. The fix routes the read through the broker-agnostic
 get_account_snapshot() seam.
-"""
-from uuid import uuid4
 
-from alpaca.trading.enums import AccountStatus
-from alpaca.trading.models import TradeAccount
+WHY A LOCAL MODEL AND NOT alpaca.trading.models.TradeAccount: ba2trade-common is
+the pure package -- its pyproject declares neither alpaca-py nor any other broker
+SDK, so importing one here would make `pip install ba2trade-common[dev] && pytest`
+fail at collection, and would have this suite depend on a broker SDK to test a
+deliberately broker-AGNOSTIC seam. packages/common/tests has kept broker-shaped
+coverage out on purpose (see test_account_seams.py:8); the real-TradeAccount proof
+lives in the live suite at tests/test_alpaca_account_snapshot.py. pydantic IS a
+declared dependency, and the two load-bearing properties -- no .get() method, and
+money fields typed Optional[str] carrying STRINGS -- are reproduced exactly, which
+is why this test still fails against the pre-fix code with the identical
+"AttributeError: ... object has no attribute 'get'" from pydantic's __getattr__.
+"""
+from typing import Optional
+
+import pytest
+from pydantic import BaseModel
 
 from ba2_common.core import instance_resolver
 from ba2_common.core.TradeActions import IncreaseInstrumentShareAction
 from ba2_common.core.interfaces.AccountInterface import AccountInterface
 
 
+class _TradeAccountShape(BaseModel):
+    """Mirrors alpaca.trading.models.TradeAccount in the two ways that matter: it is a
+    pydantic BaseModel (so `.get` raises AttributeError via BaseModel.__getattr__ rather
+    than returning a default) and every money field is Optional[str], because Alpaca
+    ships them as strings. Field names match the ones get_account_snapshot() probes."""
+
+    account_number: Optional[str] = None
+    status: Optional[str] = None
+    cash: Optional[str] = None
+    equity: Optional[str] = None
+    buying_power: Optional[str] = None
+    non_marginable_buying_power: Optional[str] = None
+    multiplier: Optional[str] = None
+    long_market_value: Optional[str] = None
+    short_market_value: Optional[str] = None
+
+
 class _AlpacaShapedAccount(AccountInterface):
-    """get_account_info() returns a real pydantic TradeAccount, exactly like Alpaca.
-    Every other abstract method is a stub purely to satisfy ABC instantiation."""
+    """get_account_info() returns a pydantic model shaped exactly like Alpaca's
+    TradeAccount. Every other abstract method is a stub purely to satisfy ABC
+    instantiation."""
 
     def __init__(self, id, buying_power="50000"):
         self.id = id
@@ -27,10 +57,10 @@ class _AlpacaShapedAccount(AccountInterface):
         self._settings_cache = None
 
     def get_account_info(self):
-        return TradeAccount(id=uuid4(), account_number="PA1", status=AccountStatus.ACTIVE,
-                            cash="10000", equity="60000", buying_power=self._buying_power,
-                            non_marginable_buying_power="10000", multiplier="2",
-                            long_market_value="50000", short_market_value="0")
+        return _TradeAccountShape(account_number="PA1", status="ACTIVE",
+                                  cash="10000", equity="60000", buying_power=self._buying_power,
+                                  non_marginable_buying_power="10000", multiplier="2",
+                                  long_market_value="50000", short_market_value="0")
 
     def get_instrument_current_price(self, symbol_or_symbols, price_type='bid'):
         return 100.0
@@ -86,6 +116,19 @@ def _run(action):
         return action.execute()
     finally:
         instance_resolver.set_instance_resolver(previous)
+
+
+def test_the_mock_is_faithful_to_the_pydantic_shape_that_caused_the_bug():
+    """Non-vacuity guard. This suite deliberately does NOT import alpaca-py, so the mock
+    itself has to keep the two properties that made the bug reproducible: no .get()
+    method, and money fields carrying strings. Swap _TradeAccountShape for a dict or a
+    SimpleNamespace and the three tests below would pass against the BROKEN code -- the
+    dict would answer .get('buying_power', 0) happily -- and this file becomes theatre."""
+    info = _AlpacaShapedAccount(1).get_account_info()
+
+    with pytest.raises(AttributeError):
+        getattr(info, "get")
+    assert isinstance(info.buying_power, str), "Alpaca ships money fields as STRINGS"
 
 
 def test_increase_share_creates_an_order_on_an_alpaca_shaped_account():
