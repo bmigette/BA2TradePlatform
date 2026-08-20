@@ -6546,11 +6546,11 @@ git add packages/common/ba2_common/core/portfolio_allocation.py packages/common/
 git commit -m "feat(allocation): cost vs market valuation mode across base, targets and deltas"
 ```
 
-**AS-LANDED AMENDMENT (Task 25).** The task shipped in two commits and the second
-changed TWO CONTRACTS beyond the text above. Recorded here because a pinned test was
-rewritten, which must read as a deliberate change of contract rather than a weakened
-test. Sections D-G should treat this, not the code block above, as the engine's
-behaviour. Final count: `102 passed` (not the stale `67`).
+**AS-LANDED AMENDMENT (Task 25).** The task shipped in three commits and changed
+several CONTRACTS beyond the text above, including rewriting pinned tests — recorded
+here so each reads as a deliberate change rather than a weakened test. Sections D-G
+should treat this, not the code block above, as the engine's behaviour. Final count:
+`127 passed` (not the stale `67`).
 
 1. **`min_order_size` is an ORDER constraint, not a TARGET constraint.** It used to be
    applied inside `round_quantity` to the target holding, so a minimum the target fell
@@ -6562,7 +6562,7 @@ behaviour. Final count: `102 passed` (not the stale `67`).
    passes `False` in BOTH valuation branches and applies one check to the signed delta
    via `_suppress_below_min_order`, which zeroes an unsendable trade, LEAVES THE
    POSITION WHERE IT IS and appends the new `REASON_BELOW_MIN_ORDER_FMT`
-   (`"below broker min order size {size:g} - position held"`). It tests the MAGNITUDE,
+   (`"below broker min order size {size:g} - no order"`). It tests the MAGNITUDE,
    so an unsendable trim is suppressed exactly like an unsendable top-up.
    `compute_label_investment` does the same. `_apply_bp_scaling` keeps the default
    `True`: the value it rounds IS an order.
@@ -6587,6 +6587,52 @@ A residual for the LIVE layer, not the engine: when a full close is itself below
 `REASON_BELOW_MIN_ORDER_FMT` and trades nothing. Most brokers exempt a full
 close-position from the minimum, so the submit path may be able to send it anyway;
 that is a live-layer decision and the engine deliberately does not assume it.
+
+**THIRD COMMIT — fresh-eyes review, two Critical fixes.** A full read of the engine
+against the spec (the first, since it was built in ten slices) found two ways to
+liquidate a portfolio by accident. Both are fixed; spec conformance was otherwise
+clean across every decision.
+
+3. **`cost` mode sized a SELL off the market price, not the average cost.**
+   `cost_basis` is `quantity x avg_entry_price`, so a basis gap converts to shares at
+   the AVERAGE COST; only the BUY leg converts at the price. Dividing by the price
+   made every trim wrong by `price / avg_cost`: with the price HALVED it asked for
+   twice the shares and the hold-clamp turned a 50% trim into a **full liquidation**,
+   with no reason string to distinguish it from an ordinary trim; with the price
+   doubled it under-trimmed and never converged. `compute_allocation`'s cost branch
+   now picks the divisor per leg and `round_delta_quantity`'s second parameter is
+   renamed `price` → `unit_value` to stop the same mistake recurring. With the right
+   divisor a basis gap can no longer exceed the basis, so the hold-clamp became
+   mathematically unreachable from this path — it is kept as defence in depth and
+   tested directly. *Test rewritten:* `test_cost_mode_never_oversells_more_than_is_held`
+   pinned the DEFECT (asserting a full liquidation where a 7.5-share trim is right);
+   it is now `test_cost_mode_trims_towards_the_target_basis_rounding_down`.
+4. **A `None` or negative `base_notional` silently liquidated everything.**
+   `float(base_notional or 0.0)` made a missing base a base of zero — i.e. a target of
+   zero for every managed symbol. `compute_allocation` now raises `ValueError` on
+   `None` and on negative, matching `compute_base_notional`; also on a `None`
+   `available_buying_power`, and `compute_label_investment` on a `None` `amount` or
+   buying power. Zero remains legal (a real, flat account).
+
+Also in that commit: a precheck REJECTION is zeroed like every other no-order row
+(it kept `side=BUY` and its quantity, so it rendered as a live BUY); market mode
+re-rounds the DELTA onto the broker's increment (an on-grid target minus an off-grid
+holding is off-grid); `AllocationPlan` gained `valuation_mode`, recorded in
+`to_dict()` and propagated through `apply_order_impacts`, so `plan_json` can be read
+back correctly; a scaled-away buy that was actually stopped by `min_order_size` now
+says which rule stopped it; `REASON_MULTI_LABEL_FMT` reworded `"⚠ also in {labels}"` →
+`"⚠ in {labels}"` (it renders inside one of the labels it names); `estimated_fees` and
+the precheck's `warnings` now reach the row; the empty-label warning is suppressed at
+0%; `MONEY_EPSILON` split from `QUANTITY_EPSILON`; and `__all__` added.
+*Test also rewritten:* `test_compute_label_investment_arithmetic_is_identical_in_both_modes`
+compared whole `to_dict()`s, which now legitimately differ by `valuation_mode`; it
+compares the rows and the money totals and asserts the modes ARE recorded differently.
+
+Five test gaps closed, three of which had surviving mutants: the
+`compute_base_notional` mode guard (only observable with an empty managed list),
+`sell_rows` ordering, decision 2 (margin changes a target's COST, not its SIZE),
+never-short in both modes and against a pre-existing short, and `market_value` being
+display-only. All five mutations are now killed.
 
 ---
 

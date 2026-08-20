@@ -29,6 +29,35 @@ from typing import Any, Dict, List, Optional, Tuple
 from ba2_common.core.account_types import MarginInfo, OrderImpact  # noqa: F401 (re-exported)
 from ba2_common.core.types import OrderDirection
 
+#: Public API. The in-tree module is a whole-module alias shim, so everything here
+#: is reachable as ``ba2_trade_platform.core.portfolio_allocation.<name>`` too.
+#: ``MarginInfo`` / ``OrderImpact`` are deliberate re-exports: a caller building
+#: engine inputs should not have to import from two modules.
+__all__ = [
+    # value objects and the fetch-failure sentinel
+    "PositionState", "SymbolTarget", "LabelTarget", "AllocationRow", "AllocationPlan",
+    "PositionFetchFailed", "MarginInfo", "OrderImpact",
+    # modes
+    "ALLOCATION_MODE_REBALANCE", "ALLOCATION_MODE_INVEST_LABEL",
+    "VALUATION_MODE_COST", "VALUATION_MODE_MARKET",
+    # tolerances and grid
+    "DEFAULT_FRACTIONAL_DECIMALS", "LABEL_TOTAL_TOLERANCE_PCT",
+    "QUANTITY_EPSILON", "MONEY_EPSILON",
+    # reason / warning / error strings
+    "REASON_NO_PRICE", "REASON_NOT_MARGINABLE", "REASON_FRACTIONAL",
+    "REASON_WHOLE_SHARE_FLOOR", "REASON_NEGATIVE_CLAMPED", "REASON_CLOSE_TO_ZERO",
+    "REASON_BELOW_MIN_ORDER_FMT", "REASON_MULTI_LABEL_FMT", "REASON_SCALED_FMT",
+    "REASON_SCALED_PREFIX", "WARNING_EMPTY_LABEL_FMT", "WARNING_PRECHECK_DISAGREED_FMT",
+    "ERROR_LABEL_TOTAL_FMT", "ERROR_LABEL_NEGATIVE_FMT", "ERROR_LABEL_DUPLICATE_FMT",
+    "ERROR_LABEL_NO_SYMBOLS_FMT", "ERROR_SYMBOL_TOTAL_FMT", "ERROR_SYMBOL_NEGATIVE_FMT",
+    "ERROR_SYMBOL_DUPLICATE_FMT",
+    # engine
+    "current_value", "round_quantity", "round_delta_quantity", "even_split_pct",
+    "build_symbol_targets", "validate_symbol_weights", "validate_label_targets",
+    "compute_base_notional", "compute_allocation", "compute_label_investment",
+    "apply_order_impacts", "consume_income_events",
+]
+
 # ---- module constants (exact spellings; use these, never bare literals) ----
 
 ALLOCATION_MODE_REBALANCE = "REBALANCE"
@@ -46,8 +75,15 @@ DEFAULT_FRACTIONAL_DECIMALS = 4
 #: Tolerance (percentage points) when checking that label targets total 100.
 LABEL_TOTAL_TOLERANCE_PCT = 0.01
 
-#: Quantities closer to zero than this are exactly zero (float noise guard).
+#: SHARE quantities closer to zero than this are exactly zero (float noise guard).
+#: Shares only -- money has its own tolerance, because the two are different units
+#: and tightening one must never silently move the other.
 QUANTITY_EPSILON = 1e-9
+
+#: MONEY amounts closer to zero than this are exactly zero. Looser than
+#: QUANTITY_EPSILON: a tenth of a microdollar of residual income is not worth a
+#: ledger write, whereas 1e-9 of a share can matter on a fractional grid.
+MONEY_EPSILON = 1e-6
 
 # Reason strings attached to AllocationRow.reasons / AllocationPlan.warnings.
 # Pinned here so the UI and the tests agree on the exact text.
@@ -57,8 +93,13 @@ REASON_FRACTIONAL = "fractional"
 REASON_WHOLE_SHARE_FLOOR = "rounded down to whole shares"
 REASON_NEGATIVE_CLAMPED = "negative target clamped to 0"
 REASON_CLOSE_TO_ZERO = "target 0 - close position"
-REASON_BELOW_MIN_ORDER_FMT = "below broker min order size {size:g} - position held"
-REASON_MULTI_LABEL_FMT = "⚠ also in {labels}"
+#: Says only that no order is sent -- NOT what happens to the position, which
+#: differs by branch (a suppressed trim holds; a suppressed top-up never opens).
+#: "position held" here contradicted REASON_CLOSE_TO_ZERO on an unsendable close.
+REASON_BELOW_MIN_ORDER_FMT = "below broker min order size {size:g} - no order"
+#: Renders INSIDE a label's panel, so it must not read as "also in <this panel>";
+#: the full list including the current label is the useful information.
+REASON_MULTI_LABEL_FMT = "⚠ in {labels}"
 REASON_SCALED_FMT = "scaled ×{factor:.2f} to fit buying power"
 #: The fixed part of REASON_SCALED_FMT, derived from it so the two cannot drift.
 #: Used to RECOGNISE a scaling reason a row already carries, so that a plan scaled
@@ -165,6 +206,10 @@ class AllocationRow:
     bp_factor: float = 1.0
     fractional: bool = False
     skipped: bool = False
+    #: The broker precheck's own fee estimate, when one was run and accepted
+    #: (``OrderImpact.estimated_fees``). ``None`` means "not prechecked", never
+    #: "free" -- no fallback value for a number the broker did not supply.
+    estimated_fees: Optional[float] = None
     reasons: List[str] = field(default_factory=list)
 
     @property
@@ -192,6 +237,7 @@ class AllocationRow:
             "bp_factor": self.bp_factor,
             "fractional": self.fractional,
             "skipped": self.skipped,
+            "estimated_fees": self.estimated_fees,
             "reasons": list(self.reasons),
         }
 
@@ -206,6 +252,18 @@ class AllocationPlan:
     (empty labels, skipped no-price symbols) and shows in the dry-run as cash
     left over. ``required_buying_power`` is the POST-scaling figure -- what the
     plan as displayed actually needs.
+
+    ``base_notional`` carries TWO meanings depending on which solver built the
+    plan: in a REBALANCE it is the ALLOCATABLE BASE (buying power plus the current
+    value of managed positions, which the label percentages divide up), and in an
+    INVEST_LABEL run it is simply THE BUDGET being spent. One field, because both
+    are "the money this plan is dividing", but a caller rendering it must know
+    which run produced the plan.
+
+    ``valuation_mode`` records what "current value" MEANT for every number here --
+    the base, the percentages and every delta (decision 5a). It is a user-flippable
+    toggle, so a ``plan_json`` without it cannot be reproduced or even read
+    correctly six months later.
     """
     rows: List[AllocationRow] = field(default_factory=list)
     base_notional: float = 0.0
@@ -217,6 +275,7 @@ class AllocationPlan:
     total_buy_value: float = 0.0
     total_sell_value: float = 0.0
     allow_fractional: bool = False
+    valuation_mode: str = VALUATION_MODE_MARKET
     warnings: List[str] = field(default_factory=list)
 
     @property
@@ -250,6 +309,7 @@ class AllocationPlan:
             "total_buy_value": self.total_buy_value,
             "total_sell_value": self.total_sell_value,
             "allow_fractional": self.allow_fractional,
+            "valuation_mode": self.valuation_mode,
             "warnings": list(self.warnings),
         }
 
@@ -288,28 +348,81 @@ def current_value(state: Optional[PositionState], valuation_mode: str) -> float:
     return float(state.cost_basis or 0.0)
 
 
-def round_delta_quantity(delta_notional: float, price: float,
+def _round_shares(raw: float, margin: Optional[MarginInfo], *,
+                  allow_fractional: bool) -> float:
+    """Round a POSITIVE share count DOWN onto the broker's tradeable grid.
+
+    The single definition of that grid: whole shares unless fractional trading is
+    on AND the broker calls the symbol fractionable, then the published
+    ``min_trade_increment`` or ``DEFAULT_FRACTIONAL_DECIMALS`` places. Everything
+    that produces a quantity goes through here, so a target and a delta can never
+    be rounded onto two different grids.
+    """
+    if raw is None or raw <= 0:
+        return 0.0
+    if allow_fractional and margin is not None and margin.fractionable:
+        inc = margin.min_trade_increment
+        if inc and inc > 0:
+            qty = round(math.floor(round(raw / inc, 9)) * inc, 10)
+        else:
+            f = 10.0 ** DEFAULT_FRACTIONAL_DECIMALS
+            qty = math.floor(raw * f) / f
+    else:
+        qty = float(math.floor(raw))
+    return qty if qty > 0 else 0.0
+
+
+def _round_delta_shares(delta: float, margin: Optional[MarginInfo], *,
+                        allow_fractional: bool, current_quantity: float) -> float:
+    """Round a SIGNED share delta onto the grid, preserving sign, never shorting.
+
+    The DELTA is what the broker receives, so the delta is what has to sit on the
+    increment -- an on-grid target minus an off-grid holding is off-grid.
+
+    A sell is clamped to ``max(0, current_quantity)``: it can never exceed the
+    holding, and against a SHORT position it is clamped to zero rather than to the
+    negative quantity, so the engine can only ever buy a short back (targets are
+    long-only).
+    """
+    magnitude = _round_shares(abs(float(delta or 0.0)), margin,
+                              allow_fractional=allow_fractional)
+    if delta >= 0:
+        return magnitude
+    return -min(magnitude, max(0.0, float(current_quantity or 0.0)))
+
+
+def round_delta_quantity(delta_notional: float, unit_value: float,
                          margin: Optional[MarginInfo], *, allow_fractional: bool,
                          current_quantity: float,
-                         apply_min_order_size: bool = True) -> float:
-    """Turn a SIGNED notional delta into a SIGNED, tradeable share delta.
+                         apply_min_order_size: bool = False) -> float:
+    """Turn a SIGNED money delta into a SIGNED, tradeable share delta.
 
-    Used by ``cost`` valuation mode, where the target is expressed against the
-    purchase value rather than the share count. The magnitude is rounded DOWN by
-    ``round_quantity`` (so trade increments still hold) and a sell is CLAMPED to
-    ``current_quantity`` -- long-only, never oversell.
+    ``unit_value`` is THE MONEY ONE SHARE MOVES, and it is NOT always the price.
+    Used by ``cost`` valuation mode, where the gap being closed is a COST BASIS
+    gap: buying a share adds ``price`` to the basis, but selling one removes the
+    AVERAGE COST (``cost_basis / quantity``), so the two legs convert with
+    different divisors. Passing the market price for a sell is the bug that made a
+    50%-down position liquidate instead of half-trim -- see ``compute_allocation``.
 
-    ``apply_min_order_size=False`` defers the minimum-order check to AFTER that
-    clamp, which is the only place it can be applied to the quantity actually
-    being sent; ``compute_allocation`` does this so the suppressed row also gets
-    a ``REASON_BELOW_MIN_ORDER_FMT`` explaining itself.
+    The magnitude is rounded DOWN onto the broker's grid and a sell is clamped to
+    the holding (never oversell, never short).
+
+    ``apply_min_order_size`` defaults to FALSE. A minimum ORDER size must be
+    checked on the final signed delta, after the clamp, by the caller -- which
+    also gets to attach ``REASON_BELOW_MIN_ORDER_FMT`` instead of silently
+    returning zero. The keyword remains for a standalone caller that wants the
+    check inline.
     """
-    magnitude = round_quantity(abs(float(delta_notional or 0.0)), price, margin,
-                               allow_fractional=allow_fractional,
-                               apply_min_order_size=apply_min_order_size)
-    if delta_notional >= 0:
-        return magnitude
-    return -min(magnitude, float(current_quantity or 0.0))
+    if unit_value is None or unit_value <= 0:
+        return 0.0
+    delta = _round_delta_shares(float(delta_notional or 0.0) / float(unit_value),
+                                margin, allow_fractional=allow_fractional,
+                                current_quantity=current_quantity)
+    if (apply_min_order_size and delta and margin is not None
+            and margin.min_order_size is not None
+            and abs(delta) < float(margin.min_order_size)):
+        return 0.0
+    return delta
 
 
 def _suppress_below_min_order(delta: float, margin: Optional[MarginInfo],
@@ -523,16 +636,8 @@ def round_quantity(target_notional: float, price: float, margin: Optional[Margin
         return 0.0
     if target_notional is None or target_notional <= 0:
         return 0.0
-    raw = float(target_notional) / float(price)
-    if allow_fractional and margin is not None and margin.fractionable:
-        inc = margin.min_trade_increment
-        if inc and inc > 0:
-            qty = round(math.floor(round(raw / inc, 9)) * inc, 10)
-        else:
-            f = 10.0 ** DEFAULT_FRACTIONAL_DECIMALS
-            qty = math.floor(raw * f) / f
-    else:
-        qty = float(math.floor(raw))
+    qty = _round_shares(float(target_notional) / float(price), margin,
+                        allow_fractional=allow_fractional)
     if qty <= 0:
         return 0.0
     if (apply_min_order_size and margin is not None
@@ -559,7 +664,10 @@ def _apply_bp_scaling(rows: List[AllocationRow], available_buying_power: float, 
     back through ``round_quantity`` (so increments and min order sizes still
     hold) and each row's ``bp_cost`` is scaled by the SAME quantity ratio rather
     than recomputed, which preserves a broker-precheck cost when one has been
-    substituted. A buy that scales to zero shares is marked ``skipped``.
+    substituted. A buy that scales to zero shares is marked ``skipped`` with its
+    ``side`` cleared, and one stopped by ``min_order_size`` rather than by the
+    scaling itself also gets ``REASON_BELOW_MIN_ORDER_FMT`` -- the two have
+    different fixes and must not be confused for each other.
 
     ``margin`` may be omitted (the precheck path has no margin dict); a
     fractional row then keeps its fractional grid via a synthetic MarginInfo.
@@ -578,7 +686,12 @@ def _apply_bp_scaling(rows: List[AllocationRow], available_buying_power: float, 
             m = MarginInfo(symbol=r.symbol, bp_factor=r.bp_factor, fractionable=True)
         prev_qty = r.delta_quantity
         qty = round_quantity(r.estimated_value * scale, r.price, m,
-                             allow_fractional=allow_fractional)
+                             allow_fractional=allow_fractional,
+                             apply_min_order_size=False)
+        # Scaling and the minimum order size are different causes with different
+        # fixes (add buying power vs. nothing the user can do), so a row stopped by
+        # the minimum must say so rather than blame the scaling alone.
+        qty = _suppress_below_min_order(qty, m, r.reasons)
         ratio = (qty / prev_qty) if prev_qty > 0 else 0.0
         r.delta_quantity = qty
         r.target_quantity = r.current_quantity + qty
@@ -602,7 +715,8 @@ def compute_allocation(base_notional: float, available_buying_power: float,
     """Solve a full REBALANCE: every managed label, buys and sells.
 
     Args:
-        base_notional: the allocatable base from ``compute_base_notional``.
+        base_notional: the allocatable base from ``compute_base_notional``. MUST be
+            a real, non-negative number -- see Raises.
         available_buying_power: broker buying power, the FEASIBILITY constraint
             (targets are notional, not buying power -- decision 2).
         labels: managed labels with ``target_pct`` (1-100) and symbol weights.
@@ -621,9 +735,10 @@ def compute_allocation(base_notional: float, available_buying_power: float,
             pinned behaviour -- but live code always passes the account's
             configured mode explicitly.
 
-    Behaviour on degenerate input (never raises, always records a reason):
+    Behaviour on degenerate DATA (records a reason, never raises -- contrast the
+    degenerate MONEY inputs under Raises, which must never be guessed at):
         * a label with no symbols -> allocates nothing, ``target_pct`` added to
-          ``plan.unallocatable_pct`` and a ``WARNING_EMPTY_LABEL_FMT`` warning;
+          ``plan.unallocatable_pct`` and, above 0%, a ``WARNING_EMPTY_LABEL_FMT``;
         * a symbol whose ``PositionState.price`` is ``None`` or <= 0 -> skipped
           with ``REASON_NO_PRICE`` (no guessed price -- no-fallback rule);
         * a negative computed target -> clamped to 0 with ``REASON_NEGATIVE_CLAMPED``;
@@ -639,22 +754,45 @@ def compute_allocation(base_notional: float, available_buying_power: float,
     the base and leaves the rest as cash. Blocking submission is
     ``validate_label_targets``' job, not this function's.
 
-    No minimum order threshold: every non-zero delta becomes a row (decision 11).
-    Short positions are out of scope -- targets are long-only.
+    No minimum order threshold of our own: every non-zero delta becomes a row
+    (decision 11); only the BROKER's ``min_order_size`` suppresses one.
+
+    Targets are LONG-ONLY. A sell can never exceed the holding, and against a
+    pre-existing SHORT the engine buys back towards the target rather than
+    extending it -- a zero target on a short buys it to flat.
 
     Returns:
         AllocationPlan: one AllocationRow per managed symbol (including zero-delta
-        and skipped rows, so the UI can show them) plus plan-level totals.
+        and skipped rows, so the UI can show them) plus plan-level totals, tagged
+        with the ``valuation_mode`` every number in it was measured in.
+
+    Raises:
+        ValueError: on an unknown ``valuation_mode``; on a ``None`` or NEGATIVE
+        ``base_notional``; or on a ``None`` ``available_buying_power``. These are
+        money inputs and there is no fallback for them (platform rule): a base
+        coerced to zero is indistinguishable from "sell everything", which is
+        precisely the accident ``PositionFetchFailed`` exists to prevent.
     """
     if valuation_mode not in (VALUATION_MODE_COST, VALUATION_MODE_MARKET):
         raise ValueError(
             f"Unknown valuation_mode {valuation_mode!r}; expected "
             f"{VALUATION_MODE_COST!r} or {VALUATION_MODE_MARKET!r}")
+    # A missing or negative base is NOT a base of zero. Coercing it made every
+    # managed target 0, i.e. a full liquidation -- the exact accident
+    # PositionFetchFailed exists to prevent, through a different door.
+    if base_notional is None:
+        raise ValueError("compute_allocation: base_notional is None")
+    if float(base_notional) < 0:
+        raise ValueError(
+            f"compute_allocation: base_notional is negative ({base_notional})")
+    if available_buying_power is None:
+        raise ValueError("compute_allocation: available_buying_power is None")
     current = current or {}
     margin = margin or {}
-    plan = AllocationPlan(base_notional=float(base_notional or 0.0),
-                          available_buying_power=float(available_buying_power or 0.0),
-                          allow_fractional=bool(allow_fractional))
+    plan = AllocationPlan(base_notional=float(base_notional),
+                          available_buying_power=float(available_buying_power),
+                          allow_fractional=bool(allow_fractional),
+                          valuation_mode=valuation_mode)
     targets = {}
     target_pcts = {}
     sym_labels = {}
@@ -662,8 +800,11 @@ def compute_allocation(base_notional: float, available_buying_power: float,
         pct = float(lt.target_pct or 0.0)
         if not lt.symbols:
             # An empty label cannot absorb its percentage: it becomes cash left over.
+            # At 0% there is nothing to absorb and nothing to warn about.
             plan.unallocatable_pct += max(0.0, pct)
-            plan.warnings.append(WARNING_EMPTY_LABEL_FMT.format(label=lt.label, pct=pct))
+            if pct > 0:
+                plan.warnings.append(
+                    WARNING_EMPTY_LABEL_FMT.format(label=lt.label, pct=pct))
             continue
         for st in lt.symbols:
             share = pct * float(st.weight_pct or 0.0) / 100.0
@@ -709,20 +850,39 @@ def compute_allocation(base_notional: float, available_buying_power: float,
             delta = -row.current_quantity
             row.reasons.append(REASON_CLOSE_TO_ZERO)
         elif valuation_mode == VALUATION_MODE_COST:
-            # Target a PURCHASE VALUE: spend the gap between it and the cost basis.
+            # Target a PURCHASE VALUE: close the gap to the current cost basis.
+            #
+            # The two legs convert at DIFFERENT rates. Buying a share adds the
+            # market PRICE to the basis, but selling one removes the AVERAGE COST
+            # (cost_basis is quantity x avg_entry_price). Dividing a basis
+            # reduction by the price is wrong by price/avg_cost -- with the price
+            # halved it asks for twice the shares, which the hold-clamp then turns
+            # into a full liquidation of a position that only wanted trimming.
+            basis = current_value(ps, VALUATION_MODE_COST)
+            gap = target_notional - basis
+            unit_value = row.price
+            if gap < 0:
+                avg_cost = (basis / row.current_quantity
+                            if row.current_quantity > 0 else 0.0)
+                if avg_cost <= 0:
+                    # No usable average cost (no shares, or a non-positive basis):
+                    # there is nothing to trim and nothing to guess from.
+                    gap = 0.0
+                else:
+                    unit_value = avg_cost
             delta = round_delta_quantity(
-                target_notional - current_value(ps, VALUATION_MODE_COST),
-                row.price, m, allow_fractional=allow_fractional,
-                current_quantity=row.current_quantity,
-                apply_min_order_size=False)
+                gap, unit_value, m, allow_fractional=allow_fractional,
+                current_quantity=row.current_quantity)
         else:
             # Target a SHARE COUNT: target_notional / price, delta vs what is held.
             ideal_quantity = round_quantity(target_notional, row.price, m,
                                             allow_fractional=allow_fractional,
                                             apply_min_order_size=False)
-            delta = ideal_quantity - row.current_quantity
-            if not frac:
-                delta = float(math.floor(delta) if delta > 0 else -math.floor(-delta))
+            # Round the DELTA, not just the target: an on-grid target minus an
+            # off-grid holding is off-grid, and the delta is what is submitted.
+            delta = _round_delta_shares(ideal_quantity - row.current_quantity, m,
+                                        allow_fractional=allow_fractional,
+                                        current_quantity=row.current_quantity)
         if abs(delta) < QUANTITY_EPSILON:
             delta = 0.0
         # ONE minimum-order check, on the signed delta both branches produce -- the
@@ -767,20 +927,34 @@ def compute_label_investment(label: LabelTarget, amount: float,
     on ``validate_symbol_weights``: a 150% set deploys 150% of ``amount`` and a 60%
     set leaves 40% of it as cash, neither of which this function refuses.
 
-    ``valuation_mode`` is accepted for call-site symmetry and validated, but does
-    not change the arithmetic: an INVEST_LABEL run ADDS a budget on top of the
-    existing position rather than rebalancing towards a target value.
+    ``valuation_mode`` is accepted for call-site symmetry and validated, and is
+    RECORDED on the returned plan, but does not change the arithmetic: an
+    INVEST_LABEL run ADDS a budget on top of the existing position rather than
+    rebalancing towards a target value.
+
+    The returned plan's ``base_notional`` is the BUDGET, not an allocatable base.
+
+    Raises:
+        ValueError: on an unknown ``valuation_mode``, or on a ``None`` ``amount``
+        or ``available_buying_power`` -- money inputs have no fallback, and a
+        budget silently coerced to zero would report "nothing to do" for what was
+        actually a caller bug.
     """
     if valuation_mode not in (VALUATION_MODE_COST, VALUATION_MODE_MARKET):
         raise ValueError(
             f"Unknown valuation_mode {valuation_mode!r}; expected "
             f"{VALUATION_MODE_COST!r} or {VALUATION_MODE_MARKET!r}")
+    if amount is None:
+        raise ValueError("compute_label_investment: amount is None")
+    if available_buying_power is None:
+        raise ValueError("compute_label_investment: available_buying_power is None")
     current = current or {}
     margin = margin or {}
-    budget = max(0.0, float(amount or 0.0))
+    budget = max(0.0, float(amount))
     plan = AllocationPlan(base_notional=budget,
-                          available_buying_power=float(available_buying_power or 0.0),
-                          allow_fractional=bool(allow_fractional))
+                          available_buying_power=float(available_buying_power),
+                          allow_fractional=bool(allow_fractional),
+                          valuation_mode=valuation_mode)
     if not label.symbols:
         plan.unallocatable_pct = 100.0
         plan.warnings.append(WARNING_EMPTY_LABEL_FMT.format(label=label.label, pct=100.0))
@@ -845,8 +1019,15 @@ def apply_order_impacts(plan: AllocationPlan, impacts: Dict[str, OrderImpact], *
     For each row with a matching ``OrderImpact``, replaces the estimated
     ``bp_cost`` with ``impact.bp_cost`` (the positive, sign-corrected value) and
     re-runs the pro-rata buying-power scaling. A symbol with no impact keeps its
-    estimated cost. ``impact.accepted is False`` marks the row ``skipped`` and
-    copies ``impact.errors`` into ``row.reasons``.
+    estimated cost. ``impact.warnings`` are copied onto ``row.reasons`` and
+    ``impact.estimated_fees`` onto ``row.estimated_fees``, so the broker's own
+    advisory output reaches the dry-run instead of being dropped.
+
+    ``impact.accepted is False`` ZEROES the row -- ``skipped``, ``side`` cleared,
+    delta, value and cost to 0, ``target_quantity`` back to what is held -- and
+    copies ``impact.errors`` into ``row.reasons``. A refused order that kept its
+    side and quantity would render as a live BUY to anything reading the raw
+    fields, which the dry-run table does.
 
     Pass the SAME ``margin`` dict the plan was solved with: without it the
     re-solve rebuilds a bare ``MarginInfo`` for each fractional row and so rounds
@@ -871,17 +1052,27 @@ def apply_order_impacts(plan: AllocationPlan, impacts: Dict[str, OrderImpact], *
         available_buying_power=float(available_buying_power or 0.0),
         unallocatable_pct=plan.unallocatable_pct,
         allow_fractional=plan.allow_fractional,
+        valuation_mode=plan.valuation_mode,
         warnings=list(plan.warnings),
     )
     for row in out.rows:
         impact = (impacts or {}).get(row.symbol)
         if impact is None:
             continue
+        if impact.warnings:
+            row.reasons.extend(impact.warnings)
         if not impact.accepted:
+            # ONE shape for "no order" -- a refused order that kept its side and
+            # quantity renders as a live BUY to anything reading the raw fields.
             row.skipped = True
+            row.side = None
+            row.delta_quantity = 0.0
+            row.target_quantity = row.current_quantity
+            row.estimated_value = 0.0
             row.bp_cost = 0.0
             row.reasons.extend(impact.errors)
             continue
+        row.estimated_fees = impact.estimated_fees
         if row.is_buy and abs(impact.bp_cost - row.bp_cost) > 0.005:
             out.warnings.append(WARNING_PRECHECK_DISAGREED_FMT.format(symbol=row.symbol))
             row.bp_cost = impact.bp_cost
@@ -923,7 +1114,7 @@ def consume_income_events(events: List[Tuple[int, float]],
     if remaining <= 0:
         return out
     for event_id, open_amount in events or []:
-        if remaining <= QUANTITY_EPSILON:
+        if remaining <= MONEY_EPSILON:
             break
         available = float(open_amount or 0.0)
         if available <= 0:
