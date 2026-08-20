@@ -11,6 +11,13 @@ Turns target percentages into per-symbol share deltas:
 
 When ``sum(bp_cost of buys) > available_buying_power`` every BUY scales down
 pro-rata and the plan records ``scale_factor``. Sells never scale.
+
+Percentages are validated to total 100 within ``LABEL_TOTAL_TOLERANCE_PCT`` (0.01
+PERCENTAGE POINTS) at BOTH levels: label targets across the account, and symbol
+weights within each label. That tolerance is tight enough to reject a naive 2dp
+even split -- ``3 x 33.33 == 99.99`` misses by a hair MORE than 0.01 -- so ALWAYS
+generate default percentages with ``even_split_pct``, which drops the remainder on
+the last slot and totals exactly 100.0. Never hand-roll a split.
 """
 
 import copy
@@ -60,6 +67,9 @@ ERROR_LABEL_TOTAL_FMT = "label targets total {total:.2f}% - must total 100%"
 ERROR_LABEL_NEGATIVE_FMT = "label '{label}' has a negative target ({pct:.2f}%)"
 ERROR_LABEL_DUPLICATE_FMT = "duplicate label '{label}'"
 ERROR_LABEL_NO_SYMBOLS_FMT = "label '{label}' has target {pct:.2f}% but no symbols"
+ERROR_SYMBOL_TOTAL_FMT = "label '{label}' symbol weights total {total:.2f}% - must total 100%"
+ERROR_SYMBOL_NEGATIVE_FMT = "label '{label}' symbol '{symbol}' has a negative weight ({pct:.2f}%)"
+ERROR_SYMBOL_DUPLICATE_FMT = "label '{label}' has duplicate symbol '{symbol}'"
 
 
 class PositionFetchFailed(RuntimeError):
@@ -281,14 +291,28 @@ def validate_label_targets(labels: List[LabelTarget], *,
                            tolerance: float = LABEL_TOTAL_TOLERANCE_PCT) -> List[str]:
     """Validate a REBALANCE label set. Pure -- returns problems, never raises.
 
-    Checks: targets total 100 +/- ``tolerance`` (0.01 PERCENTAGE POINTS by
+    LABEL level: targets total 100 +/- ``tolerance`` (0.01 PERCENTAGE POINTS by
     default, so 99.995 passes and 99.98 does not); no negative ``target_pct``; no
     duplicate label names; every non-zero label has at least one symbol.
 
+    SYMBOL level, per label that HAS symbols: weights total 100 +/- the same
+    ``tolerance``; no negative weight; no symbol repeated within the label. The
+    same symbol appearing in DIFFERENT labels is legal and its targets sum
+    (decision 7) -- only a repeat inside one label is an error. Without these
+    checks a hand-edited weight set totalling 150% would silently over-deploy its
+    label, since ``compute_allocation`` multiplies the weights straight through.
+
+    A label with no symbols is skipped here (an empty label at 0% stays valid; a
+    non-zero one is already reported by ``ERROR_LABEL_NO_SYMBOLS_FMT``).
+
+    Note that ``tolerance`` rejects a naive 2dp split (``3 x 33.33 == 99.99``);
+    build defaults with ``even_split_pct`` and both levels pass by construction.
+
     Returns:
         List[str]: human-readable error strings built from the ``ERROR_LABEL_*``
-        formats; EMPTY means valid. Submit must be blocked while this is
-        non-empty (decision 3).
+        and ``ERROR_SYMBOL_*`` formats, each naming the offending label (and
+        symbol) so the UI can show it verbatim; EMPTY means valid. Submit must be
+        blocked while this is non-empty (decision 3).
     """
     errors = []
     total = sum(float(lt.target_pct or 0.0) for lt in labels or [])
@@ -304,6 +328,21 @@ def validate_label_targets(labels: List[LabelTarget], *,
             errors.append(ERROR_LABEL_NEGATIVE_FMT.format(label=lt.label, pct=pct))
         if pct > 0 and not lt.symbols:
             errors.append(ERROR_LABEL_NO_SYMBOLS_FMT.format(label=lt.label, pct=pct))
+        if not lt.symbols:
+            continue
+        weight_total = sum(float(st.weight_pct or 0.0) for st in lt.symbols)
+        if abs(weight_total - 100.0) > tolerance:
+            errors.append(ERROR_SYMBOL_TOTAL_FMT.format(label=lt.label, total=weight_total))
+        seen_symbols = set()
+        for st in lt.symbols:
+            weight = float(st.weight_pct or 0.0)
+            if st.symbol in seen_symbols:
+                errors.append(ERROR_SYMBOL_DUPLICATE_FMT.format(label=lt.label,
+                                                                symbol=st.symbol))
+            seen_symbols.add(st.symbol)
+            if weight < 0:
+                errors.append(ERROR_SYMBOL_NEGATIVE_FMT.format(label=lt.label,
+                                                               symbol=st.symbol, pct=weight))
     return errors
 
 

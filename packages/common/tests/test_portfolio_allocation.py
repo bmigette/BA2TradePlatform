@@ -430,3 +430,60 @@ def test_compute_base_notional_counts_a_repeated_symbol_once():
 def test_compute_base_notional_raises_when_buying_power_is_none():
     with pytest.raises(ValueError):
         pa.compute_base_notional(None, {}, ["AAA"])
+
+
+def test_validate_label_targets_rejects_symbol_weights_totalling_one_fifty():
+    """The page lets a user type symbol weights directly; 100+50 must not silently
+    over-deploy the label."""
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("AAA", 100.0), SymbolTarget("BBB", 50.0)])]
+    errors = pa.validate_label_targets(labels)
+    assert errors == [pa.ERROR_SYMBOL_TOTAL_FMT.format(label="A", total=150.0)]
+    assert errors == ["label 'A' symbol weights total 150.00% - must total 100%"]
+
+
+def test_validate_label_targets_rejects_a_naive_two_dp_symbol_split():
+    """3 x 33.33 = 99.99, one hair OUTSIDE the 0.01pp tolerance -- use even_split_pct."""
+    labels = [LabelTarget("A", 100.0, [SymbolTarget(s, 33.33) for s in ("AAA", "BBB", "CCC")])]
+    assert pa.validate_label_targets(labels) == [
+        pa.ERROR_SYMBOL_TOTAL_FMT.format(label="A", total=99.99)]
+
+
+def test_validate_label_targets_rejects_symbol_weights_just_over_the_tolerance():
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("AAA", 100.01)])]
+    assert pa.validate_label_targets(labels) == [
+        pa.ERROR_SYMBOL_TOTAL_FMT.format(label="A", total=100.01)]
+
+
+def test_validate_label_targets_accepts_an_even_split_pct_symbol_set():
+    """The whole point of even_split_pct: its output always passes this check."""
+    syms = [SymbolTarget(s, p) for s, p in zip(("AAA", "BBB", "CCC"), pa.even_split_pct(3))]
+    assert pa.validate_label_targets([LabelTarget("A", 100.0, syms)]) == []
+
+
+def test_validate_label_targets_rejects_a_negative_symbol_weight():
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("AAA", 120.0), SymbolTarget("BBB", -20.0)])]
+    errors = pa.validate_label_targets(labels)
+    assert pa.ERROR_SYMBOL_NEGATIVE_FMT.format(label="A", symbol="BBB", pct=-20.0) in errors
+    assert any("A" in e and "BBB" in e and "negative" in e for e in errors)
+
+
+def test_validate_label_targets_rejects_a_duplicate_symbol_inside_one_label():
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("AAA", 50.0), SymbolTarget("AAA", 50.0)])]
+    errors = pa.validate_label_targets(labels)
+    assert pa.ERROR_SYMBOL_DUPLICATE_FMT.format(label="A", symbol="AAA") in errors
+    assert any("A" in e and "AAA" in e and "duplicate" in e for e in errors)
+
+
+def test_validate_label_targets_allows_the_same_symbol_in_two_different_labels():
+    """Decision 7: a symbol MAY sit in several labels and its targets sum. Only a
+    repeat WITHIN one label is an error."""
+    labels = [LabelTarget("A", 50.0, [SymbolTarget("XXX", 100.0)]),
+              LabelTarget("B", 50.0, [SymbolTarget("XXX", 100.0)])]
+    assert pa.validate_label_targets(labels) == []
+
+
+def test_validate_label_targets_empty_label_with_a_zero_target_stays_valid():
+    """An empty label at 0% is not an error -- and gets no symbol-total error either."""
+    labels = [LabelTarget("FULL", 100.0, [SymbolTarget("AAA", 100.0)]),
+              LabelTarget("EMPTY", 0.0, [])]
+    assert pa.validate_label_targets(labels) == []
