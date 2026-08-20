@@ -9186,6 +9186,84 @@ git commit -m "fix(alpaca): force DAY time-in-force on fractional market orders,
 
 ---
 
+**AS-LANDED AMENDMENT (Section D review fixes).** An adversarial review of the
+landed Section D returned CHANGES REQUESTED. Six of the fixes changed a
+CONTRACT, including four previously-passing tests that were pinning the old
+behaviour (two of them pinning outright bugs). Sections E-G should treat the
+list below, not the task text above, as the seam's behaviour. Final counts:
+`tests` **1405**, `packages/common/tests` **534**, `packages/experts/tests`
+**484**, `packages/providers/tests` **196**.
+
+1. **`bp_factor` is 1.0 for EVERY symbol on a 1x account (Task 32).** `initial_rate`
+   is now `0.5 if (marginable and multiplier > 1.0) else 1.0`. `Asset.marginable`
+   describes the SECURITY; Alpaca reports `multiplier="1"` for cash and
+   limited-margin accounts (and drops a margin account to 1 below $2,000 equity),
+   where `buying_power == cash` and nothing is lent. The old 0.5 let the engine's
+   `sum(notional * bp_factor) <= available_buying_power` test approve TWICE the
+   notional such an account can pay for. 2:1 and 4:1 are unchanged.
+   *Test rewritten:* `test_marginable_symbol_in_a_cash_account_consumes_half` →
+   `..._consumes_the_full_notional`, asserting 1.0. It was asserting the bug.
+
+2. **`maintenance_margin_requirement` FLOORS the initial rate (Task 32).**
+   `initial_rate = max(initial_rate, maint / 100.0)` when Alpaca publishes one. A
+   100%-maintenance name that is still flagged marginable can no longer be sized as
+   if half of it were borrowable.
+
+3. **`_margin_info_cache` entries EXPIRE (Task 32).** Shape is now
+   `{symbol: (fetched_at, MarginInfo)}` with `AlpacaAccount._MARGIN_INFO_CACHE_TTL`
+   (24h), plus a new `clear_margin_info_cache()` for **Section F to call on an
+   explicit Refresh**. The account object is process-wide, not per-request, and
+   Alpaca revokes marginability / fractionability on individual names.
+
+4. **`MarginInfo` is `@dataclass(frozen=True)` (Task 27).** Cached instances are
+   returned by reference; derive changes with `dataclasses.replace()`.
+
+5. **A dividend's `external_id` is `DIV:<broker activity id>` (Task 33).**
+   `get_dividends()` now copies the activity `id` into `div_record`, and
+   `get_cash_transfers()` keys on it, falling back to `DIV:<symbol>:<date>` only
+   when there is none. The old symbol/date key upserted two DIV activities for one
+   payer on one pay date into a single row. **Section F must land after this** —
+   changing the key namespace once `portfolio_income_event` has rows would
+   duplicate every synced dividend.
+   *Tests rewritten:* `test_a_dividend_carries_its_payer_symbol_and_a_stable_external_id`
+   → `test_a_dividend_is_keyed_by_the_broker_activity_id_when_there_is_one`;
+   `test_resyncing_the_same_window_yields_the_same_external_ids` and
+   `test_a_dividend_id_can_never_collide_with_a_cash_transfer_id` re-keyed. A
+   dividend with no payer symbol is still dropped (attribution, not identity).
+
+6. **The tolerant base normalises two AccountSnapshot contract rules (Task 28),**
+   so **Section E's TastyTrade adapter does not have to**: `equity` /
+   `net_liquidation` are mirrored when the broker publishes only one (a
+   `portfolio_value`-only broker previously left `net_liquidation` None), and a
+   positive `short_market_value` magnitude is negated.
+
+7. **Both share actions FLOOR their quantity (Task 34).**
+   `IncreaseInstrumentShareAction` uses `math.floor` and returns `success=False`
+   at 0 — `max(1.0, round(...))` defeated the buying-power clamp entirely (0 BP
+   emitted a BUY 1; $150 at $100/share emitted a BUY 2).
+   `DecreaseInstrumentShareAction` uses
+   `min(math.floor(reduction_value / price), abs(current_position_qty))` — `round()`
+   plus a min-share clamp gated on `target_percent > 0` let a 2.6-share holding at
+   a 0% target emit SELL 3, i.e. an oversell into a short taken off another
+   expert's slice. `create_order_record` is annotated `-> Optional[int]`, which is
+   what it always returned and what caused both double-save crashes.
+
+8. **The fractional gate covers the wash-trade escape (Task 35).** A MARKET order
+   with `use_complex_order` goes out as BRACKET/OTO, which Alpaca will not take
+   fractional either, so it now takes the floor branch. The floor warning also
+   names the consequence (`"{n} shares of the position are left uncovered"`).
+   *Test renamed:* `test_fractional_limit_order_is_retried_once_at_floor_qty` →
+   `..._is_floored_before_submission`; there is no retry, the quantity is
+   pre-floored and submitted once.
+
+**Left for Section F to decide (not changed here).** `CashTransfer.description`
+is populated by the Alpaca adapter (the CSD/CSW activity text) but
+`PortfolioIncomeEvent` has no column for it, so it is dropped at persist time.
+Section F owns that table; the recommendation is to DROP the field from the
+ledger and keep it on the value object — see the review report.
+
+---
+
 ## Section E — TastyTrade trading surface
 
 > **Depends on Section D**, which must already have landed: `ba2_common/core/account_types.py`
@@ -16202,6 +16280,9 @@ git commit -m "feat(allocation): allocatable-base snapshot for the wizard"
 > of truth. A `MARGIN_SOURCE_PRECHECK` entry's `bp_factor` is already ABSOLUTE, not
 > multiplier-relative, so caching one there would get it multiplied a second time. Either keep
 > precheck results out of that cache entirely, or give them an explicit `initial_margin_rate`.
+> (As landed, a cached entry with `initial_margin_rate is None` is skipped by the repricing and
+> returned unchanged, so a precheck entry survives a cache hit intact. It would still be dropped
+> after 24h by `_MARGIN_INFO_CACHE_TTL`, and the entry is a frozen dataclass.)
 
 
 Pure-testable: `build_position_states` (fake account + in-memory DB), `fetch_margin_info`,
