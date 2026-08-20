@@ -2198,7 +2198,7 @@ def test_create_all_emits_a_unique_index_named_ix_instrument_name(test_engine):
 ```
 
 The three routed sub-items are covered in the same file, because the constraint and the code that
-has to survive it land together. As written it holds 10 tests:
+has to survive it land together. As written it holds 16 tests:
 
 - `test_inserting_a_second_instrument_with_the_same_name_is_rejected` (above)
 - `test_create_all_emits_a_unique_index_named_ix_instrument_name` (above)
@@ -2222,7 +2222,23 @@ has to survive it land together. As written it holds 10 tests:
   `_build_engine` and point `ba2_common.core.db._engine` at it. `get_db` is wrapped so each thread
   parks on a `threading.Barrier` after its first query: both leave their SELECT having missed, and
   both then INSERT. `_add_instrument_if_missing` swallows and logs its exceptions, so "no
-  exception" is asserted against a logger spy.
+  exception" is asserted against a logger spy, and each test also asserts the
+  "created/added concurrently" INFO — otherwise "one row survived" would pass just as well if the
+  barrier had failed to interleave and no race had happened.
+- `test_the_loser_of_an_auto_add_race_carries_its_labels_to_the_surviving_row` — the two threads
+  auto-add under DIFFERENT expert labels, so whichever loses, its label is only on the surviving
+  row if the loser carried it over. Mutation-tested: switching the handler's reassignment to
+  `winner.labels.extend(...)` makes it fail.
+- `test_a_lost_auto_add_race_logs_no_error_anywhere` — spies on `ba2_common.core.db`'s logger as
+  well, pinning that a handled race emits no ERROR + traceback from `@retry_on_lock`.
+- `test_the_model_normalises_the_name_so_no_writer_can_skip_it`,
+  `test_assignment_normalises_too_not_just_construction`,
+  `test_a_writer_that_forgets_to_normalise_collides_instead_of_duplicating` — the model-level
+  normalisation. The third is the one that matters: a writer that forgets `normalize_symbol` now
+  collides with the existing row instead of quietly creating a lowercase duplicate.
+- `test_a_none_name_is_still_rejected_loudly_by_the_not_null_column` — a characterisation test.
+  It passed before the change too; it is here to pin the deliberate decision NOT to normalise
+  `None` to `''`.
 
 - [x] **Step 2: Run test to verify it fails**
 
@@ -2256,6 +2272,42 @@ with:
 it already imports the models through the shim. Verified: the emitted `CREATE TABLE instrument` is
 byte-identical before and after (only the index is added).
 
+The index alone is not enough, though: it is BINARY, so `AAPL`, `aapl` and `' AAPL'` remain
+acceptable side by side and uniqueness holds only while every writer remembers to call
+`normalize_symbol`. One that forgets reintroduces the duplicate groups in lowercase. So the same
+class also normalises on the model:
+
+```python
+    def __setattr__(self, key, value):
+        if key == "name" and value is not None:
+            # Local import: ba2_common.core.utils imports this module.
+            from ba2_common.core.utils import normalize_symbol
+            value = normalize_symbol(value)
+        super().__setattr__(key, value)
+```
+
+Four approaches were probed against SQLModel 0.0.37 / pydantic 2.12.5 before settling on this one:
+
+| approach | at construction | on assignment |
+| --- | --- | --- |
+| pydantic `@field_validator` alone | **not applied** | not applied |
+| SQLAlchemy `@validates` | **not applied** | not applied |
+| `@field_validator` + `model_config = {"validate_assignment": True}` | applied | applied |
+| `__setattr__` override (chosen) | applied | applied |
+
+Table models skip pydantic validation in `__init__`, and `SQLModel.__setattr__` writes the raw
+value into the SQLAlchemy-instrumented attribute *before* pydantic sees it — so a `@validates`
+hook's normalised value is clobbered by the raw one on the very next line. `validate_assignment`
+does work, but it switches on full pydantic validation for *every* field of the model (it starts
+coercing `instrument_type='stock'` to the enum member, for instance); the `__setattr__` override
+gets the same guarantee touching only `name`. `COLLATE NOCASE` was rejected: it needs a table
+rebuild and would still admit `' AAPL'`.
+
+`None` is deliberately NOT normalised to `''`: the column is NOT NULL, and that loud failure beats
+silently storing the first nameless row. Verified there is no circular import on the cold path
+(`import ba2_common.core.models` then construct) and no import leak (the cleanroom gate reports
+CLEAN with `PYTHONPATH` set).
+
 Then the three routed sub-items.
 
 **a. `ui/pages/settings.py`** — in the add/edit dialog's `save()`, guard above the `is_edit` branch
@@ -2281,10 +2333,10 @@ open a session):
                 logger.info(f"Auto-added instrument '{symbol}' to database with label 'auto_added'")
             except IntegrityError:
                 session.rollback()
-                existing_instrument = session.exec(
+                winner = session.exec(
                     select(Instrument).where(Instrument.name == symbol)
                 ).first()
-                if existing_instrument is None:
+                if winner is None:
                     raise
                 logger.info(f"Instrument '{symbol}' was created concurrently; using the existing row")
 ```
@@ -2298,34 +2350,64 @@ and in `submit_market_analysis`, immediately after `symbol = ensure_instrument_e
 
 (also documented in the method's `Raises:` block).
 
-**c. `core/InstrumentAutoAdder.py`** — `from sqlalchemy.exc import IntegrityError`, then wrap the
-insert. `add_instance` owns its session and its `with Session(...)` already rolled back and closed
-it, so the handler only re-selects:
+**c. `core/InstrumentAutoAdder.py`** — `from sqlalchemy.exc import IntegrityError`, then commit the
+insert on our OWN session instead of through `add_instance`, and adopt the winner's row on a lost
+race:
 
 ```python
-            try:
-                instrument_id = add_instance(instrument)
-            except IntegrityError:
-                with get_db() as session:
+            with get_db() as session:
+                session.add(instrument)
+                try:
+                    session.commit()
+                    instrument_id = instrument.id
+                except IntegrityError:
+                    session.rollback()
                     winner = session.exec(
                         select(Instrument).where(Instrument.name == symbol)
                     ).first()
                     if winner is None:
                         raise
-                    logger.info(f"Instrument {symbol} was added concurrently (ID {winner.id}); keeping the existing row")
-                return
+                    wanted = ([expert_shortname] if expert_shortname else []) + list(extra_labels or [])
+                    missing = [lbl for lbl in wanted if lbl not in (winner.labels or [])]
+                    if missing:
+                        # REASSIGN, never append: plain JSON column, no MutableList.
+                        winner.labels = list(winner.labels or []) + missing
+                        session.add(winner)
+                        session.commit()
+                    logger.info(f"Instrument {symbol} was added concurrently (ID {winner.id}); keeping the existing row and adding labels {missing}")
+                    return
 ```
 
-The re-select in (b) and (c) is load-bearing: if the row is still missing, the `IntegrityError` was
-some other constraint and is re-raised rather than silently treated as a lost race.
+Two things here are not incidental:
+
+- **Not `add_instance`.** It is wrapped by `@retry_on_lock`, which logs every non-lock exception at
+  ERROR *with a full traceback* before re-raising (`db.py:266`). Routing the insert through it made
+  the handled, expected lost race print a `UNIQUE constraint failed` traceback for operators to
+  chase, directly above the INFO saying everything was fine. Owning the session — as
+  `ensure_instrument_exists` already does — keeps the benign case quiet. This also drops the
+  now-unused `add_instance` from the module's imports.
+- **The loser must carry its labels over, by REASSIGNING the list.** Otherwise a lost race silently
+  loses that expert's label, and nothing will ever repair it: the `existing` branch at `:106-112`
+  appends to `Instrument.labels` IN PLACE, and that is a plain `Column(JSON)` with no `MutableList`
+  wrapper, so the change is not change-detected and never persists. There is no self-healing pass
+  and the merge migration is one-shot. (Those in-place appends are the documented out-of-scope
+  `InstrumentAutoAdder` bug and are deliberately left alone — fixing them would start persisting
+  thousands of expert labels.)
+
+The re-select in (b) and (c) is load-bearing: if the row is still missing, the `IntegrityError` came
+from some other constraint, and the bare `raise` re-raises it — surfacing to the caller in (b),
+and in (c) landing in the method's own `except Exception` at `:181`, which logs it with a traceback
+rather than swallowing it as a lost race.
 
 - [x] **Step 4: Run test to verify it passes**
 
 Run: `venv/bin/python -m pytest tests/test_instrument_unique_constraint.py -v`
-Expected: PASS (10 passed).
+Expected: PASS (16 passed).
 
 Now re-run every test that writes Instrument rows, per file (the full suite is flaky from a
-pre-existing session leak):
+pre-existing session leak). Note the `PYTHONPATH` on the last one — point 20 above: its leak gate
+shells out to a subprocess that does NOT inherit pytest's `pythonpath` ini setting, so without the
+prefix it fails with `ModuleNotFoundError: No module named 'ba2_common'` and gates nothing:
 
 ```bash
 venv/bin/python -m pytest tests/test_instrument_labels.py -v
@@ -2334,12 +2416,22 @@ venv/bin/python -m pytest tests/test_instrument_symbol_import.py -v
 venv/bin/python -m pytest tests/test_instrument_merge.py -v
 venv/bin/python -m pytest tests/test_instrument_unique_migration.py -v
 venv/bin/python -m pytest tests/test_models.py -v
-venv/bin/python -m pytest packages/common/tests/test_utils_pure.py -v
+PYTHONPATH=packages/common:packages/providers:packages/experts \
+    venv/bin/python -m pytest packages/common/tests/test_utils_pure.py -v
 ```
 
-Expected: all PASS. (`tests/test_instrument_merge.py` and `tests/test_instrument_unique_migration.py`
-build their `instrument` table with raw SQL precisely so the new unique index cannot stop them
-from inserting the duplicates they exist to merge.)
+Expected: all PASS — 15 / 6 / 5 / 15 / 28 / 12 / 7. (`tests/test_instrument_merge.py` and
+`tests/test_instrument_unique_migration.py` build their `instrument` table with raw SQL precisely so
+the new unique index cannot stop them from inserting the duplicates they exist to merge.)
+
+As built, the wider sweep is: `tests/` 1282 passed; and with the same `PYTHONPATH` prefix,
+`packages/experts/tests` 483 passed, `packages/providers/tests` 195 passed,
+`packages/common/tests` 5 failed / 357 passed. Those 5 are `test_new_option_actions.py` and are
+**pre-existing suite-order pollution, not this change**: the file passes 18/18 in isolation both
+with and without it, and the whole-suite run fails identically on a stashed clean tree. Setting the
+`PYTHONPATH` prefix is also what turns the three cleanroom leak gates from masked failures into
+gates that actually run — with it set they pass, confirming `ba2_common.core.models` still pulls
+nothing forbidden despite the new validator.
 
 - [x] **Step 5: Commit**
 

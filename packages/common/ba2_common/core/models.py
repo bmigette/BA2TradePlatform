@@ -552,6 +552,28 @@ class Instrument(SQLModel, table=True):
     instrument_type: InstrumentType | None = Field(default=None)
     categories: list[str] = Field(sa_column=Column(JSON), default_factory=list)
     labels: list[str] = Field(sa_column=Column(JSON), default_factory=list)
+
+    def __setattr__(self, key, value):
+        """Normalise ``name`` on the model, so no writer can skip it.
+
+        The unique index is BINARY: it holds 'AAPL', 'aapl' and ' AAPL' side by
+        side quite happily, so uniqueness is only as real as every call site's
+        memory to call ``normalize_symbol`` first. One new writer that forgets
+        silently reintroduces the duplicate groups in lowercase. Normalising here
+        makes it a guarantee instead of a convention, and covers construction too:
+        SQLModel's ``__init__`` assigns every field through ``__setattr__``.
+
+        ``None`` is deliberately left alone rather than normalised to ``''`` --
+        the column is NOT NULL, and that loud failure beats silently storing a
+        nameless row. A COLLATE NOCASE index was the alternative; it would need a
+        table rebuild and would still let ``' AAPL'`` through.
+        """
+        if key == "name" and value is not None:
+            # Local import: ba2_common.core.utils imports this module.
+            from ba2_common.core.utils import normalize_symbol
+            value = normalize_symbol(value)
+        super().__setattr__(key, value)
+
     def __str__(self):
         return f"{self.name} ({self.instrument_type})"
 

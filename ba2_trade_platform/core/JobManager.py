@@ -141,10 +141,10 @@ def ensure_instrument_exists(symbol: str) -> str:
                 # -- the row we wanted exists -- but anything else that violates a
                 # constraint must still surface.
                 session.rollback()
-                existing_instrument = session.exec(
+                winner = session.exec(
                     select(Instrument).where(Instrument.name == symbol)
                 ).first()
-                if existing_instrument is None:
+                if winner is None:
                     raise
                 logger.info(f"Instrument '{symbol}' was created concurrently; using the existing row")
     return symbol

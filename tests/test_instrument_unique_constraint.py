@@ -55,6 +55,45 @@ def test_create_all_emits_a_unique_index_named_ix_instrument_name(test_engine):
     assert unique_on_name == ['ix_instrument_name']
 
 
+def test_the_model_normalises_the_name_so_no_writer_can_skip_it():
+    """The index is BINARY: it happily holds 'AAPL' and 'aapl' side by side.
+
+    Uniqueness is therefore only as real as every writer's memory to call
+    normalize_symbol first. Normalising on the model closes that: a new call site
+    that forgets cannot reintroduce the lowercase duplicate groups Section A exists
+    to eliminate.
+    """
+    add_instance(Instrument(name='  aapl ', labels=[]))
+    assert _names() == ['AAPL']
+
+
+def test_assignment_normalises_too_not_just_construction():
+    add_instance(Instrument(name='AAPL', labels=[]))
+    with get_db() as session:
+        instrument = session.exec(select(Instrument).where(Instrument.name == 'AAPL')).first()
+        instrument.name = '  msft '
+        session.add(instrument)
+        session.commit()
+    assert _names() == ['MSFT']
+
+
+def test_a_writer_that_forgets_to_normalise_collides_instead_of_duplicating():
+    add_instance(Instrument(name='AAPL', labels=[]))
+    with pytest.raises(IntegrityError):
+        add_instance(Instrument(name=' aapl ', labels=[]))
+
+
+def test_a_none_name_is_still_rejected_loudly_by_the_not_null_column():
+    """`None` is deliberately NOT normalised to ''.
+
+    normalize_symbol maps None to '' by design, but silently storing a nameless
+    row (the first one would be accepted; only the second would collide) is worse
+    than the NOT NULL failure the column already gives.
+    """
+    with pytest.raises(IntegrityError):
+        add_instance(Instrument(name=None, labels=[]))
+
+
 def test_create_all_ddl_is_byte_identical_to_the_migrations_ddl():
     """Pin the emitted SQL, not just the presence of an index.
 
@@ -360,29 +399,52 @@ def test_two_threads_calling_ensure_instrument_exists_create_one_row(tmp_path, m
             'the loser must have gone through the IntegrityError branch'
 
 
-def test_two_threads_auto_adding_the_same_symbol_create_one_row(tmp_path, monkeypatch):
+def _run_auto_add_race(tmp_path, monkeypatch):
+    """Two threads auto-add RACE at once under DIFFERENT expert labels.
+
+    Returns (auto-adder log spy, db log spy, the surviving row's labels). Different
+    labels per thread are what makes label adoption observable: whichever thread
+    loses, its label is only on the surviving row if the loser carried it over.
+    """
+    import ba2_common.core.db as pkg_db
     import ba2_trade_platform.core.InstrumentAutoAdder as auto_adder_module
 
+    barrier = threading.Barrier(2, timeout=30)
+    monkeypatch.setattr(auto_adder_module, 'get_db',
+                        _barriered_get_db(auto_adder_module.get_db, barrier))
+    spy = _LoggerSpy(auto_adder_module.logger)
+    monkeypatch.setattr(auto_adder_module, 'logger', spy)
+    # The DB helpers log on their own logger, which is where a lost race used to
+    # print an ERROR + traceback from @retry_on_lock.
+    db_spy = _LoggerSpy(pkg_db.logger)
+    monkeypatch.setattr(pkg_db, 'logger', db_spy)
+
+    async def fake_fetch(symbol):
+        return {'name': symbol, 'category': 'Technology', 'company_name': 'Fake Corp'}
+
+    def go(expert_shortname, extra_labels):
+        adder = auto_adder_module.InstrumentAutoAdder()
+        adder._fetch_instrument_data = fake_fetch
+        asyncio.run(adder._add_instrument_if_missing('RACE', expert_shortname, 'expert', extra_labels))
+
+    threads = [
+        threading.Thread(target=go, args=('expert-1', [])),
+        threading.Thread(target=go, args=('expert-2', ['extra-b'])),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=60)
+
+    with get_db() as session:
+        row = session.exec(select(Instrument).where(Instrument.name == 'RACE')).first()
+        labels = list(row.labels or []) if row else None
+    return spy, db_spy, labels
+
+
+def test_two_threads_auto_adding_the_same_symbol_create_one_row(tmp_path, monkeypatch):
     with _shared_file_db(tmp_path):
-        barrier = threading.Barrier(2, timeout=30)
-        monkeypatch.setattr(auto_adder_module, 'get_db',
-                            _barriered_get_db(auto_adder_module.get_db, barrier))
-        spy = _LoggerSpy(auto_adder_module.logger)
-        monkeypatch.setattr(auto_adder_module, 'logger', spy)
-
-        async def fake_fetch(symbol):
-            return {'name': symbol, 'category': 'Technology', 'company_name': 'Fake Corp'}
-
-        def go():
-            adder = auto_adder_module.InstrumentAutoAdder()
-            adder._fetch_instrument_data = fake_fetch
-            asyncio.run(adder._add_instrument_if_missing('RACE', 'expert-1', 'expert', []))
-
-        threads = [threading.Thread(target=go) for _ in range(2)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=60)
+        spy, _db_spy, _labels = _run_auto_add_race(tmp_path, monkeypatch)
 
         # _add_instrument_if_missing swallows and logs its exceptions, so "no
         # exception" is asserted against the log, not against the thread.
@@ -390,3 +452,35 @@ def test_two_threads_auto_adding_the_same_symbol_create_one_row(tmp_path, monkey
         assert _names() == ['RACE']
         assert [m for m in spy.infos if 'added concurrently' in m], \
             'the loser must have gone through the IntegrityError branch'
+
+
+def test_the_loser_of_an_auto_add_race_carries_its_labels_to_the_surviving_row(tmp_path, monkeypatch):
+    """Losing the race must not cost the loser's labels.
+
+    Before the unique index the loser inserted its own row and its labels lived on
+    there until the merge united them. Now there is one row, and nothing else will
+    ever add them: the `existing` branch appends to `Instrument.labels` IN PLACE,
+    and that is a plain JSON column with no MutableList wrapper, so the change is
+    not tracked and never persists. There is no self-healing pass.
+    """
+    with _shared_file_db(tmp_path):
+        _spy, _db_spy, labels = _run_auto_add_race(tmp_path, monkeypatch)
+
+        assert labels is not None
+        assert {'expert-1', 'expert-2', 'extra-b'} <= set(labels), \
+            f'the losing thread dropped its labels: {labels}'
+
+
+def test_a_lost_auto_add_race_logs_no_error_anywhere(tmp_path, monkeypatch):
+    """A benign lost race must not print an ERROR with a traceback.
+
+    `add_instance` is wrapped by @retry_on_lock, which logs any non-lock exception
+    at ERROR with exc_info before re-raising -- so routing the insert through it
+    made the handled, expected case emit a UNIQUE-constraint traceback for
+    operators to chase, directly above the INFO saying everything is fine.
+    """
+    with _shared_file_db(tmp_path):
+        spy, db_spy, _labels = _run_auto_add_race(tmp_path, monkeypatch)
+
+        assert spy.errors == []
+        assert db_spy.errors == [], 'the DB layer logged an error for a handled race'

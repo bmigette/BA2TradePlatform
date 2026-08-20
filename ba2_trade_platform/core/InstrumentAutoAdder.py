@@ -12,7 +12,7 @@ from typing import List, Optional, Dict, Any
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 from ..core.models import Instrument
-from ..core.db import get_db, add_instance, get_instance
+from ..core.db import get_db, get_instance
 from ..logger import logger
 # straight from the package: ..core.utils would drag in the expert/account registries
 from ba2_common.core.utils import normalize_symbol
@@ -154,24 +154,43 @@ class InstrumentAutoAdder:
                 labels=labels,
             )
             
-            # Add to database
-            try:
-                instrument_id = add_instance(instrument)
-            except IntegrityError:
-                # instrument.name is UNIQUE and the existence check above is a
-                # separate transaction: another writer (a second auto-add task, or
-                # JobManager.ensure_instrument_exists) inserted this symbol inside
-                # the window. add_instance's session is already rolled back and
-                # closed, so re-select to confirm the row is there; if it is not,
-                # some other constraint was violated and must surface.
-                with get_db() as session:
+            # Add to database. Committed on our own session rather than through
+            # add_instance(): add_instance is wrapped by @retry_on_lock, which logs
+            # every non-lock exception at ERROR with a full traceback before
+            # re-raising it. The lost race below is expected and handled, so going
+            # through add_instance would print a UNIQUE-constraint traceback for
+            # operators to chase, immediately above the INFO saying all is well.
+            with get_db() as session:
+                session.add(instrument)
+                try:
+                    session.commit()
+                    instrument_id = instrument.id
+                except IntegrityError:
+                    # instrument.name is UNIQUE and the existence check above ran in
+                    # a separate transaction: another writer (a second auto-add task,
+                    # or JobManager.ensure_instrument_exists) inserted this symbol
+                    # inside the window. Adopt the winner's row -- but carry our
+                    # labels over to it, because nothing else ever will: the
+                    # `existing` branch above appends to `labels` IN PLACE, and that
+                    # is a plain JSON column with no MutableList wrapper, so the
+                    # change is not tracked and never persists.
+                    session.rollback()
                     winner = session.exec(
                         select(Instrument).where(Instrument.name == symbol)
                     ).first()
                     if winner is None:
+                        # Not the race we assumed -- a different constraint was
+                        # violated. Re-raise for the handler below to log.
                         raise
-                    logger.info(f"Instrument {symbol} was added concurrently (ID {winner.id}); keeping the existing row")
-                return
+                    wanted = ([expert_shortname] if expert_shortname else []) + list(extra_labels or [])
+                    missing = [lbl for lbl in wanted if lbl not in (winner.labels or [])]
+                    if missing:
+                        # REASSIGN, never append: see above.
+                        winner.labels = list(winner.labels or []) + missing
+                        session.add(winner)
+                        session.commit()
+                    logger.info(f"Instrument {symbol} was added concurrently (ID {winner.id}); keeping the existing row and adding labels {missing}")
+                    return
 
             if instrument_id:
                 logger.info(f"Successfully added instrument {symbol} with ID {instrument_id}")
