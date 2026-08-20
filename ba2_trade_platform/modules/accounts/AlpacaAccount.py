@@ -2,7 +2,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest, LimitOrderRequest, StopOrderRequest, StopLimitOrderRequest, ReplaceOrderRequest, TakeProfitRequest, StopLossRequest, OptionLegRequest
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, OrderClass, PositionIntent
 from alpaca.common.exceptions import APIError
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import replace
 from datetime import datetime, timezone, timedelta
 import math
@@ -80,6 +80,11 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
     Also implements OptionsAccountInterface (option chain/quote/ATM-IV market data;
     positions / order submission / close / IV-rank land in later tasks).
     """
+
+    # Lifetime of one _margin_info_cache entry. A CLASS attribute so that a bare
+    # instance built with object.__new__ (the test idiom) still has it.
+    _MARGIN_INFO_CACHE_TTL = 24 * 60 * 60
+
     def __init__(self, id: int):
         """
         Initialize the AlpacaAccount with API credentials.
@@ -97,12 +102,19 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         self.client = None
         self._authentication_error = None
 
-        # Per-symbol margin metadata cache. Alpaca has NO bulk asset endpoint, so
-        # get_symbol_margin_info() costs one get_asset() HTTP call per NEW symbol;
-        # the allocation page asks for the same basket on every refresh and the
-        # ASSET facts do not change intraday, so cache for this instance's
-        # lifetime. bp_factor is re-derived on every hit (the multiplier moves).
-        self._margin_info_cache: Dict[str, MarginInfo] = {}
+        # Per-symbol margin metadata cache, {symbol: (fetched_at, MarginInfo)}.
+        # Alpaca has NO bulk asset endpoint, so get_symbol_margin_info() costs one
+        # get_asset() HTTP call per symbol not already cached, and the allocation page
+        # asks for the same basket on every refresh.
+        #
+        # The entries EXPIRE after _MARGIN_INFO_CACHE_TTL. The ASSET facts do not change
+        # intraday, but get_account_instance_from_id() hands out the same account object
+        # for the whole PROCESS lifetime, and on a server up for weeks Alpaca does revoke
+        # marginability / fractionability on individual names -- a frozen marginable=True
+        # understates bp_cost. clear_margin_info_cache() drops them on demand for an
+        # explicit user Refresh. bp_factor is re-derived on every hit (the multiplier
+        # moves between 1/2/4 far more often than the asset facts do).
+        self._margin_info_cache: Dict[str, Tuple[float, MarginInfo]] = {}
 
         # Balance cache (5s TTL; serves stale value on fetch failure)
         self._balance_cache: Optional[float] = None
@@ -1719,21 +1731,28 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             return {}
 
         cache = self._margin_info_cache
+        now = time.time()
         out: Dict[str, MarginInfo] = {}
         for raw_symbol in symbols:
             symbol = (raw_symbol or '').strip().upper()
             if not symbol:
                 continue
 
-            cached = cache.get(symbol)
-            if cached is not None:
+            entry = cache.get(symbol)
+            if entry is not None and (now - entry[0]) >= self._MARGIN_INFO_CACHE_TTL:
+                logger.debug(f"[Account {self.id}] Margin info for {symbol} expired; refetching")
+                entry = None
+            if entry is not None:
+                fetched_at, cached = entry
                 # Only the Asset facts are cached; bp_factor is re-derived from the
                 # multiplier read on THIS call. The None guard keeps an entry from a
-                # future non-asset source (a precheck) out of the arithmetic.
+                # future non-asset source (a precheck, whose bp_factor the broker
+                # measured and which carries no initial rate to multiply) out of the
+                # REPRICING -- the entry is still returned as-is.
                 rate = cached.initial_margin_rate
                 if rate is not None and cached.bp_factor != rate * multiplier:
                     cached = replace(cached, bp_factor=rate * multiplier)
-                    cache[symbol] = cached
+                    cache[symbol] = (fetched_at, cached)
                 out[symbol] = cached
                 continue
 
@@ -1773,10 +1792,22 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 maintenance_margin_rate=(maint / 100.0) if maint is not None else None,
                 source=MARGIN_SOURCE_ASSET,
             )
-            cache[symbol] = margin_info
+            cache[symbol] = (now, margin_info)
             out[symbol] = margin_info
 
         return out
+
+    def clear_margin_info_cache(self) -> None:
+        """Drop every cached per-symbol margin fact so the next call refetches.
+
+        The cache expires on its own after _MARGIN_INFO_CACHE_TTL; this is the
+        EXPLICIT path, for a user who hits Refresh because they know the broker
+        changed something (Alpaca revokes marginability / fractionability on
+        individual names, and this account object lives for the whole process).
+        """
+        count = len(self._margin_info_cache)
+        self._margin_info_cache = {}
+        logger.debug(f"[Account {self.id}] Cleared {count} cached symbol margin entries")
 
     def _safe_float(self, value: Any) -> Optional[float]:
         """Coerce a broker-supplied number to a plain float, None when not numeric.

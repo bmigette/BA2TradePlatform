@@ -16,6 +16,7 @@ one is 1.0 * 2 = 2.0. In a 1x account everything is 1.0, i.e. exactly cash.
 
 No live API call: client is a MagicMock returning real alpaca-py model objects.
 """
+import time
 from unittest.mock import MagicMock
 from uuid import uuid4
 
@@ -233,6 +234,107 @@ def test_a_cached_symbol_is_repriced_when_the_account_multiplier_changes():
 
     assert acct.get_symbol_margin_info(["AAPL"])["AAPL"].bp_factor == 2.0
     assert acct.client.get_asset.call_count == 1     # still no second asset fetch
+
+
+def test_a_precheck_sourced_cache_entry_is_not_repriced_by_the_multiplier():
+    """The repricing arithmetic is skipped when initial_margin_rate is None.
+
+    A future non-asset entry (MARGIN_SOURCE_PRECHECK) carries a broker-measured
+    bp_factor and NO initial rate to multiply, so ``rate * multiplier`` would be
+    a TypeError on None. It is still RETURNED -- the guard keeps it out of the
+    repricing, not out of the result. Without this test the mutation
+    ``if rate is not None`` -> ``if True`` passes the whole suite.
+    """
+    from ba2_trade_platform.core.account_types import MARGIN_SOURCE_PRECHECK
+    from ba2_trade_platform.core.account_types import MarginInfo
+
+    acct = _bare_account(multiplier="2")
+    acct._margin_info_cache["AAPL"] = (
+        time.time(),
+        MarginInfo(symbol="AAPL", bp_factor=0.77, initial_margin_rate=None,
+                   source=MARGIN_SOURCE_PRECHECK),
+    )
+
+    info = acct.get_symbol_margin_info(["AAPL"])["AAPL"]
+
+    assert info.bp_factor == 0.77            # NOT 0.77 * 2, and not dropped
+    assert info.source == MARGIN_SOURCE_PRECHECK
+    acct.client.get_asset.assert_not_called()
+
+
+def test_a_blank_symbol_is_skipped_without_a_broker_round_trip():
+    """`` `` / None in the basket must not become a get_asset("") call."""
+    acct = _bare_account()
+    acct.client.get_asset.side_effect = lambda s: _asset(s)
+
+    infos = acct.get_symbol_margin_info(["", "   ", None, "AAPL"])
+
+    assert set(infos) == {"AAPL"}
+    assert acct.client.get_asset.call_count == 1
+
+
+def test_a_cache_entry_older_than_the_ttl_is_refetched():
+    """Alpaca REVOKES marginability and fractionability on individual names, and
+    get_account_instance_from_id() hands out the same account object for the whole
+    process lifetime -- a server up for weeks would otherwise freeze a symbol's
+    facts at first sight. A stale marginable=True UNDERSTATES bp_cost, the same
+    direction as the 1x bug."""
+    acct = _bare_account()
+    acct.client.get_asset.side_effect = lambda s: _asset(s, marginable=True)
+
+    acct.get_symbol_margin_info(["AAPL"])
+    # Age the entry past the TTL rather than sleeping.
+    stamp, cached = acct._margin_info_cache["AAPL"]
+    acct._margin_info_cache["AAPL"] = (stamp - AlpacaAccount._MARGIN_INFO_CACHE_TTL - 1, cached)
+
+    acct.client.get_asset.side_effect = lambda s: _asset(s, marginable=False)
+    info = acct.get_symbol_margin_info(["AAPL"])["AAPL"]
+
+    assert acct.client.get_asset.call_count == 2
+    assert info.marginable is False
+    assert info.bp_factor == 2.0
+
+
+def test_a_cache_entry_within_the_ttl_is_not_refetched():
+    acct = _bare_account()
+    acct.client.get_asset.side_effect = lambda s: _asset(s)
+
+    acct.get_symbol_margin_info(["AAPL"])
+    stamp, cached = acct._margin_info_cache["AAPL"]
+    acct._margin_info_cache["AAPL"] = (stamp - AlpacaAccount._MARGIN_INFO_CACHE_TTL + 60, cached)
+    acct.get_symbol_margin_info(["AAPL"])
+
+    assert acct.client.get_asset.call_count == 1
+
+
+def test_clear_margin_info_cache_forces_the_next_call_to_refetch():
+    """The explicit Refresh path: a user who knows the broker changed a name
+    must not have to restart the process to see it."""
+    acct = _bare_account()
+    acct.client.get_asset.side_effect = lambda s: _asset(s)
+
+    acct.get_symbol_margin_info(["AAPL", "MSFT"])
+    acct.clear_margin_info_cache()
+    acct.get_symbol_margin_info(["AAPL", "MSFT"])
+
+    assert acct.client.get_asset.call_count == 4
+    assert acct._margin_info_cache != {}     # repopulated, not just emptied
+
+
+def test_margin_info_is_frozen_so_a_cached_object_cannot_be_mutated_in_place():
+    """get_symbol_margin_info hands out the CACHED object by reference; a caller
+    that adjusted bp_factor on it would silently poison every later reader."""
+    import dataclasses
+    import pytest
+
+    from ba2_trade_platform.core.account_types import MarginInfo
+
+    acct = _bare_account()
+    acct.client.get_asset.return_value = _asset("AAPL")
+    info = acct.get_symbol_margin_info(["AAPL"])["AAPL"]
+
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        info.bp_factor = 99.0
 
 
 def test_no_margin_info_at_all_when_the_account_multiplier_is_unknown():

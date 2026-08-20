@@ -106,14 +106,21 @@ class CashTransfer:
         )
 
 
-@dataclass
+@dataclass(frozen=True)
 class MarginInfo:
     """Per-symbol margin / fractionability metadata used to size buying power.
 
     ``bp_factor`` = ``initial_margin_rate * account_multiplier`` -- the dollars of
     buying power one dollar of NOTIONAL consumes. A fully marginable stock in a
     2:1 account is ``0.5 * 2 = 1.0`` (dollar for dollar); a non-marginable one is
-    ``1.0 * 2 = 2.0`` (double).
+    ``1.0 * 2 = 2.0`` (double). Note ``initial_margin_rate`` is a property of the
+    ACCOUNT as much as the symbol: where the account cannot borrow at all
+    (multiplier 1) it is 1.0 even for a marginable name.
+
+    FROZEN: adapters cache these and hand the SAME object to every caller
+    (``AlpacaAccount._margin_info_cache``), so an in-place edit would silently
+    poison every later reader. Derive a changed copy with
+    ``dataclasses.replace()``.
 
     ``min_order_size`` / ``min_trade_increment`` mirror Alpaca ``Asset`` field
     names exactly.
