@@ -22,6 +22,12 @@ from ...core.interfaces.OptionsAccountInterface import OptionsAccountInterface
 from ...core.db import get_db, get_instance, update_instance, add_instance
 from sqlmodel import Session, select
 
+# Namespace of the SYNTHETIC external_id get_cash_transfers() mints for dividends,
+# whose broker activity id get_dividends() drops. Keeps the dividend key space
+# disjoint from the verbatim CSD/CSW broker ids sharing the same upsert column.
+_DIVIDEND_KEY_PREFIX = "DIV:"
+
+
 def alpaca_api_retry(func):
     """
     Decorator to retry Alpaca API calls with exponential backoff on rate limit errors.
@@ -1669,6 +1675,134 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         except (TypeError, ValueError):
             logger.warning(f"[Account {self.id}] Non-numeric broker value {value!r}")
             return None
+
+    def _fetch_activities(self, act_type: str,
+                          params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """Raw non-trade activities of one type, always a list, [] on failure.
+
+        TradingClient exposes no get_account_activities, so every caller here
+        (get_cash_transfers, get_balance_history) goes through the raw REST get()
+        and has to normalise the single-object / None responses the same way.
+        One activity type failing never aborts the others.
+        """
+        try:
+            raw = self.client.get(f"/account/activities/{act_type}", params or None)
+        except Exception as e:
+            # Loud: both callers silently degrade (an empty ledger window, a
+            # transfer-blind P/L) rather than surfacing this to the user.
+            logger.error(f"[Account {self.id}] Could not fetch {act_type} activities: {e}",
+                         exc_info=True)
+            return []
+        if isinstance(raw, list):
+            return raw
+        return [raw] if raw else []
+
+    def get_cash_transfers(self, start_date=None, end_date=None) -> List[CashTransfer]:
+        """Deposits, withdrawals and dividends over a window, from the activities API.
+
+        Reuses the request idiom of get_balance_history and get_dividends
+        (raw REST get() on /account/activities/<TYPE> with after/until), shared
+        through _fetch_activities().
+
+        external_id is the (account_id, external_id) idempotency key of
+        portfolio_income_event, so it must be stable across re-syncs. CSD/CSW
+        activities carry the broker's own id and it is passed through verbatim;
+        get_dividends() deliberately drops it (it nets DIVNRA tax withholding
+        into the amount, which is the number we want), so dividends get the
+        stable synthetic key DIV:<symbol>:<YYYY-MM-DD> -- unique per payer per
+        pay date, and namespaced so it cannot be mistaken for a broker id.
+
+        event_date is the ACTIVITY date, not the T+1 settled date that
+        get_balance_history shifts to. That shift exists to line a transfer up
+        with the equity-curve day it moved equity (a P/L attribution concern);
+        the ledger instead answers "what money arrived", and the shift target
+        depends on which portfolio-history days happen to be in the window, so
+        it would make event_date wobble between syncs.
+
+        Signs are only normalised where that cannot destroy information: a CSW
+        is forced negative (a WITHDRAWAL is never income, so its sign carries
+        nothing), but a CSD keeps the broker's sign, because a NEGATIVE deposit
+        is a clawed-back ACH and CashTransfer.is_income's ``amount > 0`` guard
+        exists precisely to reject it.
+
+        Returns [] and logs on failure -- this seam does NOT distinguish a broker
+        outage from a genuinely empty window.
+        """
+        if not self._check_authentication():
+            return []
+
+        params: Dict[str, Any] = {}
+        if start_date:
+            params["after"] = start_date.isoformat()
+        if end_date:
+            params["until"] = end_date.isoformat()
+
+        def _as_date(raw):
+            try:
+                return datetime.fromisoformat(str(raw)[:10]).date()
+            except (ValueError, TypeError):
+                return None
+
+        transfers: List[CashTransfer] = []
+
+        for act_type, event_type in (("CSD", CASH_TRANSFER_DEPOSIT),
+                                     ("CSW", CASH_TRANSFER_WITHDRAWAL)):
+            for act in self._fetch_activities(act_type, params):
+                event_date = _as_date(act.get('date') or act.get('transaction_time'))
+                if event_date is None:
+                    logger.warning(f"[Account {self.id}] Skipping {act_type} activity "
+                                   f"with no usable date: {act}")
+                    continue
+                amount = self._safe_float(act.get('net_amount'))
+                if amount is None:
+                    logger.warning(f"[Account {self.id}] Skipping {act_type} activity "
+                                   f"with no usable amount: {act}")
+                    continue
+                external_id = str(act.get('id')
+                                  or f"{act_type}:{event_date.isoformat()}:{amount}")
+                if external_id.startswith(_DIVIDEND_KEY_PREFIX):
+                    # Unreachable with real Alpaca ids (<17 digits>::<uuid>), but
+                    # external_id is an UPSERT key: a broker id that shadowed a
+                    # synthetic dividend key would silently merge two different
+                    # events into one ledger row. Namespace it instead of hoping.
+                    external_id = f"{act_type}:{external_id}"
+                transfers.append(CashTransfer(
+                    external_id=external_id,
+                    event_date=event_date,
+                    event_type=event_type,
+                    amount=amount if event_type == CASH_TRANSFER_DEPOSIT else -abs(amount),
+                    symbol=None,
+                    description=act.get('description'),
+                ))
+
+        for div in self.get_dividends(start_date=start_date, end_date=end_date):
+            event_date = _as_date(div.get('date'))
+            if event_date is None:
+                logger.warning(f"[Account {self.id}] Skipping dividend with no usable date: {div}")
+                continue
+            symbol = div.get('symbol')
+            if not symbol:
+                # DIV:None:<date> would be a fabricated identity, and external_id
+                # is an upsert key -- drop it loudly rather than key on a guess.
+                logger.warning(f"[Account {self.id}] Skipping dividend with no payer "
+                               f"symbol (no stable external_id): {div}")
+                continue
+            amount = self._safe_float(div.get('amount'))
+            if amount is None:
+                logger.warning(f"[Account {self.id}] Skipping dividend with no usable "
+                               f"amount: {div}")
+                continue
+            transfers.append(CashTransfer(
+                external_id=f"{_DIVIDEND_KEY_PREFIX}{symbol}:{event_date.isoformat()}",
+                event_date=event_date,
+                event_type=CASH_TRANSFER_DIVIDEND,
+                amount=amount,
+                symbol=symbol,
+                description=None,
+            ))
+
+        logger.debug(f"[Account {self.id}] Retrieved {len(transfers)} cash transfers")
+        return transfers
 
     @alpaca_api_retry
     def symbols_exist(self, symbols: List[str]) -> Dict[str, bool]:
@@ -4538,15 +4672,13 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             # Alpaca's profit_loss from portfolio history does NOT exclude withdrawals,
             # so we need to subtract transfer amounts from equity changes ourselves.
             transfer_by_date = {}
-            try:
-                for act_type in ['CSD', 'CSW']:
-                    activities = self.client.get(f'/account/activities/{act_type}')
-                    for act in activities:
-                        act_date = str(act.get('date', ''))[:10]
-                        amount = float(act.get('net_amount', 0))
-                        transfer_by_date[act_date] = transfer_by_date.get(act_date, 0.0) + amount
-            except Exception as e:
-                logger.warning(f"[Account {self.id}] Could not fetch transfer activities: {e}")
+            for act_type in ['CSD', 'CSW']:
+                for act in self._fetch_activities(act_type):
+                    act_date = str(act.get('date', ''))[:10]
+                    amount = self._safe_float(act.get('net_amount'))
+                    if amount is None:
+                        continue
+                    transfer_by_date[act_date] = transfer_by_date.get(act_date, 0.0) + amount
 
             snapshots = []
             timestamps = getattr(history, 'timestamp', []) or []

@@ -8311,8 +8311,30 @@ carry a broker `id`. `get_dividends()` deliberately drops it (it nets DIVNRA tax
 withholding into the amount, which is the number we want), so dividends get the
 stable synthetic key `DIV:<symbol>:<YYYY-MM-DD>` — unique per payer per pay date.
 
+**Answers to the two routed findings (settled while implementing):**
+
+1. *Id spaces.* They cannot collide **in practice** — an Alpaca non-trade activity id is
+   `<17 digits>::<uuid>`, which can never spell `DIV:<symbol>:<date>` — but "cannot in
+   practice" is not the same as "cannot". The `DIV:` namespace is hoisted to a module
+   constant `_DIVIDEND_KEY_PREFIX` and a CSD/CSW broker id that *starts with it* is
+   re-namespaced to `<TYPE>:<id>`. Real ids are still carried through **verbatim**
+   (`external_id == "act-1"`), so this costs nothing and removes the "hoping".
+2. *Activity date vs T+1 settled date.* The ledger stores the **activity** date. The T+1
+   shift in `get_balance_history` exists to line a transfer up with the equity-curve day
+   it moved equity — a P/L-attribution concern. The ledger instead answers "what money
+   arrived", and the shift target depends on which portfolio-history days happen to be in
+   the requested window, so a shifted `event_date` would *wobble between syncs* for a
+   rolling 30-day window.
+
+**Sign handling is asymmetric, deliberately.** A CSW is forced negative (`-abs`) because a
+WITHDRAWAL is never income, so its sign carries no information. A CSD **keeps the broker's
+sign**: a negative deposit is a clawed-back ACH, and `CashTransfer.is_income`'s `amount > 0`
+guard exists precisely to reject it (pinned by
+`packages/common/tests/test_account_types.py::test_cash_transfer_negative_amount_deposit_is_not_income`).
+`abs()`-ing a deposit would resurrect the clawback as new money to allocate.
+
 **Files:**
-- Modify: `ba2_trade_platform/modules/accounts/AlpacaAccount.py` (insert after the `get_symbol_margin_info` added in Task 32)
+- Modify: `ba2_trade_platform/modules/accounts/AlpacaAccount.py` (insert after the `get_symbol_margin_info` added in Task 32; also adds the shared `_fetch_activities()` helper and switches `get_balance_history`'s inline CSD/CSW loop onto it)
 - Test: `tests/test_alpaca_cash_transfers.py`
 
 - [ ] **Step 1: Write the failing test**
@@ -8370,6 +8392,16 @@ def test_a_deposit_becomes_a_positive_income_event_keyed_by_the_broker_activity_
     assert ev.is_income is True
 
 
+def test_the_external_id_is_the_real_alpaca_activity_id_not_a_synthesised_one():
+    """Alpaca non-trade activity ids look like <17 digits>::<uuid>; the ledger
+    upserts on (account_id, external_id), so it must be carried through verbatim."""
+    broker_id = "20260801000000000::9b8e1b4e-1a2f-4c3d-9e5a-6f7a8b9c0d1e"
+    acct = _bare_account({"CSD": [{"id": broker_id, "date": "2026-08-01",
+                                   "net_amount": "1000"}]})
+
+    assert acct.get_cash_transfers()[0].external_id == broker_id
+
+
 def test_a_withdrawal_is_negative_and_is_not_income():
     acct = _bare_account({"CSW": [{"id": "act-2", "date": "2026-08-05",
                                    "net_amount": "-250"}]})
@@ -8386,6 +8418,22 @@ def test_a_withdrawal_reported_with_a_positive_amount_is_still_negated():
                                    "net_amount": "250"}]})
 
     assert _by_type(acct.get_cash_transfers())[CASH_TRANSFER_WITHDRAWAL].amount == -250.0
+
+
+def test_a_reversed_deposit_keeps_its_negative_sign_and_is_not_income():
+    """A clawed-back ACH arrives as a CSD with a NEGATIVE net_amount.
+
+    CashTransfer.is_income guards this with ``amount > 0`` (pinned by
+    packages/common/tests/test_account_types.py), so the adapter must NOT
+    abs() a deposit -- that would resurrect the clawback as new money.
+    """
+    acct = _bare_account({"CSD": [{"id": "act-6", "date": "2026-08-07",
+                                   "net_amount": "-1000"}]})
+
+    ev = _by_type(acct.get_cash_transfers())[CASH_TRANSFER_DEPOSIT]
+
+    assert ev.amount == -1000.0
+    assert ev.is_income is False
 
 
 def test_a_dividend_carries_its_payer_symbol_and_a_stable_external_id():
@@ -8410,6 +8458,14 @@ def test_a_dividend_amount_is_net_of_the_nra_tax_withholding():
     assert _by_type(acct.get_cash_transfers())[CASH_TRANSFER_DIVIDEND].amount == 85.0
 
 
+def test_a_dividend_without_a_payer_symbol_is_skipped_rather_than_keyed_on_none():
+    """DIV:None:<date> is a fabricated identity; the ledger key must be real."""
+    acct = _bare_account({"DIV": [{"id": "act-3", "symbol": None,
+                                   "date": "2026-08-10", "net_amount": "12.34"}]})
+
+    assert acct.get_cash_transfers() == []
+
+
 def test_all_three_activity_kinds_come_back_from_one_call():
     acct = _bare_account({
         "CSD": [{"id": "act-1", "date": "2026-08-01", "net_amount": "1000"}],
@@ -8418,6 +8474,38 @@ def test_all_three_activity_kinds_come_back_from_one_call():
     })
 
     assert len(acct.get_cash_transfers()) == 3
+
+
+def test_a_dividend_id_can_never_collide_with_a_cash_transfer_id():
+    """Two id spaces: CSD/CSW carry the broker's own id, dividends a DIV: key.
+
+    Worst case -- the broker hands the DIV activity the very id we would have
+    synthesised -- the two events must still be distinct ledger rows.
+    """
+    acct = _bare_account({
+        "CSD": [{"id": "DIV:AAPL:2026-08-10", "date": "2026-08-10", "net_amount": "1000"}],
+        "DIV": [{"id": "act-3", "symbol": "AAPL", "date": "2026-08-10", "net_amount": "12.34"}],
+    })
+
+    ids = [t.external_id for t in acct.get_cash_transfers()]
+
+    assert len(ids) == 2
+    assert len(set(ids)) == 2
+
+
+def test_resyncing_the_same_window_yields_the_same_external_ids():
+    """The (account_id, external_id) upsert key must be stable across calls."""
+    payload = {
+        "CSD": [{"id": "act-1", "date": "2026-08-01", "net_amount": "1000"}],
+        "CSW": [{"id": "act-2", "date": "2026-08-05", "net_amount": "-250"}],
+        "DIV": [{"id": "act-3", "symbol": "AAPL", "date": "2026-08-10", "net_amount": "12.34"}],
+    }
+    acct = _bare_account(payload)
+
+    first = [t.external_id for t in acct.get_cash_transfers()]
+    second = [t.external_id for t in acct.get_cash_transfers()]
+
+    assert first == second == ["act-1", "act-2", "DIV:AAPL:2026-08-10"]
 
 
 def test_the_date_window_is_passed_to_the_broker_as_after_and_until():
@@ -8438,6 +8526,13 @@ def test_an_activity_with_no_usable_date_is_skipped_rather_than_guessed():
     assert [t.external_id for t in transfers] == ["act-9"]
 
 
+def test_an_activity_with_no_usable_amount_is_skipped_rather_than_zeroed():
+    acct = _bare_account({"CSD": [{"id": "act-1", "date": "2026-08-01", "net_amount": None},
+                                  {"id": "act-9", "date": "2026-08-02", "net_amount": "5"}]})
+
+    assert [t.external_id for t in acct.get_cash_transfers()] == ["act-9"]
+
+
 def test_a_failing_activities_endpoint_yields_an_empty_list_not_an_exception():
     """This seam does NOT distinguish failure from emptiness -- it logs and returns []."""
     acct = _bare_account({})
@@ -8450,23 +8545,70 @@ def test_a_failing_activities_endpoint_yields_an_empty_list_not_an_exception():
 
 Run: `venv/bin/python -m pytest tests/test_alpaca_cash_transfers.py -v`
 
-Expected: FAIL — the base returns `[]`, so the first test fails with `KeyError: 'DEPOSIT'`
+Expected: FAIL (13 failed, 2 passed) — the base returns `[]`, so the first test fails
+with `KeyError: 'DEPOSIT'`. The 2 that pass are the vacuous ones whose assertion is
+literally `== []` (the no-symbol dividend and the failing endpoint); they only become
+meaningful once the method is real.
 
 - [ ] **Step 3: Write minimal implementation**
 
-Insert immediately after the `get_symbol_margin_info` added in Task 32:
+Insert immediately after the `_safe_float` added in Task 32 (module constant near the
+imports; `_fetch_activities` is shared with `get_balance_history`, see Step 3b):
 ```python
+# Namespace of the SYNTHETIC external_id get_cash_transfers() mints for dividends,
+# whose broker activity id get_dividends() drops. Keeps the dividend key space
+# disjoint from the verbatim CSD/CSW broker ids sharing the same upsert column.
+_DIVIDEND_KEY_PREFIX = "DIV:"
+
+
+    def _fetch_activities(self, act_type: str,
+                          params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """Raw non-trade activities of one type, always a list, [] on failure.
+
+        TradingClient exposes no get_account_activities, so every caller here
+        (get_cash_transfers, get_balance_history) goes through the raw REST get()
+        and has to normalise the single-object / None responses the same way.
+        One activity type failing never aborts the others.
+        """
+        try:
+            raw = self.client.get(f"/account/activities/{act_type}", params or None)
+        except Exception as e:
+            # Loud: both callers silently degrade (an empty ledger window, a
+            # transfer-blind P/L) rather than surfacing this to the user.
+            logger.error(f"[Account {self.id}] Could not fetch {act_type} activities: {e}",
+                         exc_info=True)
+            return []
+        if isinstance(raw, list):
+            return raw
+        return [raw] if raw else []
+
     def get_cash_transfers(self, start_date=None, end_date=None) -> List[CashTransfer]:
         """Deposits, withdrawals and dividends over a window, from the activities API.
 
-        Reuses the request idiom of get_balance_history (:4354, CSD/CSW inline at
-        :4376-4382) and get_dividends (:4283): TradingClient does not expose
-        get_account_activities, so both use the raw REST get().
+        Reuses the request idiom of get_balance_history and get_dividends
+        (raw REST get() on /account/activities/<TYPE> with after/until), shared
+        through _fetch_activities().
 
         external_id is the (account_id, external_id) idempotency key of
-        portfolio_income_event. CSD/CSW activities carry a broker id; get_dividends()
-        drops it (it nets DIVNRA tax withholding into the amount, which is the number
-        we want), so dividends get the stable synthetic key DIV:<symbol>:<date>.
+        portfolio_income_event, so it must be stable across re-syncs. CSD/CSW
+        activities carry the broker's own id and it is passed through verbatim;
+        get_dividends() deliberately drops it (it nets DIVNRA tax withholding
+        into the amount, which is the number we want), so dividends get the
+        stable synthetic key DIV:<symbol>:<YYYY-MM-DD> -- unique per payer per
+        pay date, and namespaced so it cannot be mistaken for a broker id.
+
+        event_date is the ACTIVITY date, not the T+1 settled date that
+        get_balance_history shifts to. That shift exists to line a transfer up
+        with the equity-curve day it moved equity (a P/L attribution concern);
+        the ledger instead answers "what money arrived", and the shift target
+        depends on which portfolio-history days happen to be in the window, so
+        it would make event_date wobble between syncs.
+
+        Signs are only normalised where that cannot destroy information: a CSW
+        is forced negative (a WITHDRAWAL is never income, so its sign carries
+        nothing), but a CSD keeps the broker's sign, because a NEGATIVE deposit
+        is a clawed-back ACH and CashTransfer.is_income's ``amount > 0`` guard
+        exists precisely to reject it.
 
         Returns [] and logs on failure -- this seam does NOT distinguish a broker
         outage from a genuinely empty window.
@@ -8490,34 +8632,30 @@ Insert immediately after the `get_symbol_margin_info` added in Task 32:
 
         for act_type, event_type in (("CSD", CASH_TRANSFER_DEPOSIT),
                                      ("CSW", CASH_TRANSFER_WITHDRAWAL)):
-            try:
-                raw = self.client.get(f"/account/activities/{act_type}", params or None)
-            except Exception as e:
-                logger.error(f"[Account {self.id}] Could not fetch {act_type} activities: {e}",
-                             exc_info=True)
-                continue
-            if not isinstance(raw, list):
-                raw = [raw] if raw else []
-            for act in raw:
+            for act in self._fetch_activities(act_type, params):
                 event_date = _as_date(act.get('date') or act.get('transaction_time'))
                 if event_date is None:
                     logger.warning(f"[Account {self.id}] Skipping {act_type} activity "
                                    f"with no usable date: {act}")
                     continue
-                try:
-                    amount = float(act.get('net_amount'))
-                except (TypeError, ValueError):
+                amount = self._safe_float(act.get('net_amount'))
+                if amount is None:
                     logger.warning(f"[Account {self.id}] Skipping {act_type} activity "
                                    f"with no usable amount: {act}")
                     continue
                 external_id = str(act.get('id')
                                   or f"{act_type}:{event_date.isoformat()}:{amount}")
+                if external_id.startswith(_DIVIDEND_KEY_PREFIX):
+                    # Unreachable with real Alpaca ids (<17 digits>::<uuid>), but
+                    # external_id is an UPSERT key: a broker id that shadowed a
+                    # synthetic dividend key would silently merge two different
+                    # events into one ledger row. Namespace it instead of hoping.
+                    external_id = f"{act_type}:{external_id}"
                 transfers.append(CashTransfer(
                     external_id=external_id,
                     event_date=event_date,
                     event_type=event_type,
-                    # Normalise the sign ourselves rather than trusting the broker's.
-                    amount=abs(amount) if event_type == CASH_TRANSFER_DEPOSIT else -abs(amount),
+                    amount=amount if event_type == CASH_TRANSFER_DEPOSIT else -abs(amount),
                     symbol=None,
                     description=act.get('description'),
                 ))
@@ -8528,24 +8666,49 @@ Insert immediately after the `get_symbol_margin_info` added in Task 32:
                 logger.warning(f"[Account {self.id}] Skipping dividend with no usable date: {div}")
                 continue
             symbol = div.get('symbol')
+            if not symbol:
+                # DIV:None:<date> would be a fabricated identity, and external_id
+                # is an upsert key -- drop it loudly rather than key on a guess.
+                logger.warning(f"[Account {self.id}] Skipping dividend with no payer "
+                               f"symbol (no stable external_id): {div}")
+                continue
+            amount = self._safe_float(div.get('amount'))
+            if amount is None:
+                logger.warning(f"[Account {self.id}] Skipping dividend with no usable "
+                               f"amount: {div}")
+                continue
             transfers.append(CashTransfer(
-                external_id=f"DIV:{symbol}:{event_date.isoformat()}",
+                external_id=f"{_DIVIDEND_KEY_PREFIX}{symbol}:{event_date.isoformat()}",
                 event_date=event_date,
                 event_type=CASH_TRANSFER_DIVIDEND,
-                amount=float(div.get('amount') or 0.0),
+                amount=amount,
                 symbol=symbol,
                 description=None,
             ))
 
         logger.debug(f"[Account {self.id}] Retrieved {len(transfers)} cash transfers")
         return transfers
+```
 
+- [ ] **Step 3b: Consolidate `get_balance_history` onto the shared helper**
+
+Its inline CSD/CSW fetch becomes (one `try/except` per activity type instead of one
+around both, so a CSD outage no longer skips CSW entirely):
+```python
+            transfer_by_date = {}
+            for act_type in ['CSD', 'CSW']:
+                for act in self._fetch_activities(act_type):
+                    act_date = str(act.get('date', ''))[:10]
+                    amount = self._safe_float(act.get('net_amount'))
+                    if amount is None:
+                        continue
+                    transfer_by_date[act_date] = transfer_by_date.get(act_date, 0.0) + amount
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `venv/bin/python -m pytest tests/test_alpaca_cash_transfers.py -v`
-Expected: PASS (9 passed)
+Expected: PASS (15 passed)
 
 - [ ] **Step 5: Commit**
 ```bash
