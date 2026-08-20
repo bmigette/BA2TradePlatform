@@ -824,3 +824,143 @@ class OptionActivity(SQLModel, table=True):
     price: float | None = Field(default=None)
     processed_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), index=True)
     result: str | None = Field(default=None, description="What reconciliation did")
+
+
+class PortfolioAllocationConfig(SQLModel, table=True):
+    """Per-account Portfolio Allocation page state that CHANGES MONEY.
+
+    ``valuation_mode`` selects what "current value" means everywhere at once --
+    the allocatable base, the ``% of label`` / ``% of total`` columns, and every
+    delta -- so it belongs in a table rather than in session storage: a mode the
+    user cannot see would silently reinterpret every number on the page.
+
+    ``valuation_mode`` is a PLAIN str column (matching OptionActivity.activity_type):
+    "cost" or "market" -- use ``VALUATION_MODE_COST`` / ``VALUATION_MODE_MARKET``
+    from ``ba2_common.core.portfolio_allocation``, never a bare literal. One row
+    per account, created on first use with the defaults "cost" and False.
+    """
+    __tablename__ = "portfolio_allocation_config"
+
+    id: int | None = Field(default=None, primary_key=True)
+    account_id: int = Field(foreign_key="accountdefinition.id", ondelete="CASCADE",
+                            index=True, unique=True)
+    valuation_mode: str = Field(default="cost", description="cost | market (plain str, see core.portfolio_allocation)")
+    allow_fractional: bool = Field(default=False, description="Last fractional-shares choice, pre-filled into the wizard")
+    updated_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), index=True)
+
+
+class PortfolioAllocationLabel(SQLModel, table=True):
+    """A label the user has chosen to MANAGE for an account's portfolio allocation.
+
+    The row's EXISTENCE is the "managed" flag, so label selection needs no
+    separate table -- deleting the row unmanages the label. ``target_pct`` is
+    1-100 and, summed across all rows of one account, must equal exactly 100
+    before a REBALANCE run may be submitted.
+    """
+    __tablename__ = "portfolio_allocation_label"
+    __table_args__ = (
+        UniqueConstraint('account_id', 'label', name='uix_pf_alloc_label_account_label'),
+    )
+
+    id: int | None = Field(default=None, primary_key=True)
+    account_id: int = Field(foreign_key="accountdefinition.id", ondelete="CASCADE", index=True)
+    label: str = Field(index=True, description="Instrument label being managed (e.g. 'ARK26')")
+    target_pct: float = Field(default=0.0, description="Target % of the base notional (1-100)")
+    sort_order: int = Field(default=0, description="Display order of the label expansion on the page")
+    comment: str | None = Field(default=None, description="Free-text note shown on the label header")
+    created_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), index=True)
+
+
+class PortfolioAllocationSymbol(SQLModel, table=True):
+    """A symbol's weight WITHIN a managed label.
+
+    Rows are created LAZILY: a symbol with no row uses the even-split default, so
+    absence is meaningful and must never be backfilled for every symbol. A symbol
+    may legitimately appear under several labels (its targets then SUM; the page
+    shows a warning icon).
+    """
+    __tablename__ = "portfolio_allocation_symbol"
+    __table_args__ = (
+        UniqueConstraint('account_id', 'label', 'symbol',
+                         name='uix_pf_alloc_symbol_account_label_symbol'),
+    )
+
+    id: int | None = Field(default=None, primary_key=True)
+    account_id: int = Field(foreign_key="accountdefinition.id", ondelete="CASCADE", index=True)
+    label: str = Field(index=True)
+    symbol: str = Field(index=True, description="Normalised (.strip().upper()) instrument symbol")
+    weight_pct: float = Field(default=0.0, description="Weight % WITHIN the label (1-100)")
+    comment: str | None = Field(default=None, description="Free-text note shown on the symbol row")
+    created_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), index=True)
+
+
+class PortfolioIncomeEvent(SQLModel, table=True):
+    """One deposit or dividend, consumed oldest-first by allocation runs.
+
+    ``event_type`` is a PLAIN str column (matching OptionActivity.activity_type):
+    "DEPOSIT" or "DIVIDEND" -- use ``CASH_TRANSFER_DEPOSIT`` /
+    ``CASH_TRANSFER_DIVIDEND`` from ``ba2_common.core.account_types``, never a
+    bare literal. Withdrawals are NOT income and are never persisted here.
+
+    ``(account_id, external_id)`` is the idempotency key: re-syncing the broker
+    ledger upserts instead of duplicating, exactly as ``OptionActivity`` does.
+    An event can be PARTIALLY consumed; the remainder stays open.
+    """
+    __tablename__ = "portfolio_income_event"
+    __table_args__ = (
+        UniqueConstraint('account_id', 'external_id', name='uix_pf_income_account_externalid'),
+    )
+
+    id: int | None = Field(default=None, primary_key=True)
+    account_id: int = Field(foreign_key="accountdefinition.id", ondelete="CASCADE", index=True)
+    external_id: str = Field(index=True, description="Broker activity id (idempotency key)")
+    event_date: date = Field(index=True, description="Broker settlement / pay date")
+    event_type: str = Field(description="DEPOSIT | DIVIDEND (plain str, see core.account_types)")
+    symbol: str | None = Field(default=None, index=True, description="Payer symbol for DIVIDEND; None for DEPOSIT")
+    amount: float = Field(description="Positive cash amount in the account currency")
+    consumed_amount: float = Field(default=0.0, description="How much of `amount` allocation runs have already spent")
+    created_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), index=True)
+
+    @property
+    def open_amount(self) -> float:
+        """Un-consumed remainder of this event; never negative."""
+        return max(0.0, (self.amount or 0.0) - (self.consumed_amount or 0.0))
+
+
+class PortfolioAllocationRun(SQLModel, table=True):
+    """Audit row for one SUBMITTED allocation run.
+
+    ``mode`` is a PLAIN str column: "REBALANCE" or "INVEST_LABEL" -- use
+    ``ALLOCATION_MODE_REBALANCE`` / ``ALLOCATION_MODE_INVEST_LABEL`` from
+    ``ba2_common.core.portfolio_allocation``.
+
+    ``plan_json`` is ``AllocationPlan.to_dict()`` captured at SUBMIT time, which
+    keeps a dry-run reproducible after the weights change. Income consumption is
+    driven by the NET buy value (``net_buy_value`` below): a rebalance funded
+    entirely by its own sells consumes no income.
+
+    ``base_notional`` mirrors ``AllocationPlan.base_notional`` and so carries TWO
+    meanings depending on ``mode``: in a REBALANCE it is the ALLOCATABLE BASE
+    (buying power plus the current value of managed positions, at plan time); in
+    an INVEST_LABEL run it is simply THE BUDGET being spent. Read it together
+    with ``mode``.
+    """
+    __tablename__ = "portfolio_allocation_run"
+
+    id: int | None = Field(default=None, primary_key=True)
+    account_id: int = Field(foreign_key="accountdefinition.id", ondelete="CASCADE", index=True)
+    mode: str = Field(index=True, description="REBALANCE | INVEST_LABEL (plain str)")
+    scope_label: str | None = Field(default=None, description="Label targeted by an INVEST_LABEL run; None for REBALANCE")
+    base_notional: float = Field(default=0.0, description="REBALANCE: buying_power + current value of managed positions, at plan time. INVEST_LABEL: the budget being spent")
+    available_buying_power: float = Field(default=0.0, description="Broker buying power snapshotted at plan time")
+    allow_fractional: bool = Field(default=False, description="Whether fractional shares were opted in for this run")
+    plan_json: Dict[str, Any] = Field(sa_column=Column(JSON), default_factory=dict, description="AllocationPlan.to_dict() at submit time")
+    submitted_buy_value: float = Field(default=0.0, description="Sum of estimated value of BUY orders actually submitted")
+    submitted_sell_value: float = Field(default=0.0, description="Sum of estimated value of SELL orders actually submitted")
+    order_ids: List[int] = Field(sa_column=Column(JSON), default_factory=list, description="TradingOrder ids created by this run")
+    created_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), index=True)
+
+    @property
+    def net_buy_value(self) -> float:
+        """``max(0, buys - sells)`` -- what this run consumes from the income ledger."""
+        return max(0.0, (self.submitted_buy_value or 0.0) - (self.submitted_sell_value or 0.0))

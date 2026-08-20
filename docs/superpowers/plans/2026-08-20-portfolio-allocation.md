@@ -2537,7 +2537,7 @@ Run per file — the full suite fails non-deterministically from a pre-existing 
 ### Task 7: The five allocation tables
 
 **Files:**
-- Modify: `packages/common/ba2_common/core/models.py` (append at end of file, currently 801 lines)
+- Modify: `packages/common/ba2_common/core/models.py` (append at end of file, currently 826 lines)
 - Modify: `tests/conftest.py:22`
 - Test: `tests/test_portfolio_allocation_models.py`
 
@@ -2795,6 +2795,12 @@ class PortfolioAllocationRun(SQLModel, table=True):
     keeps a dry-run reproducible after the weights change. Income consumption is
     driven by the NET buy value (``net_buy_value`` below): a rebalance funded
     entirely by its own sells consumes no income.
+
+    ``base_notional`` mirrors ``AllocationPlan.base_notional`` and so carries TWO
+    meanings depending on ``mode``: in a REBALANCE it is the ALLOCATABLE BASE
+    (buying power plus the current value of managed positions, at plan time); in
+    an INVEST_LABEL run it is simply THE BUDGET being spent. Read it together
+    with ``mode``.
     """
     __tablename__ = "portfolio_allocation_run"
 
@@ -2802,7 +2808,7 @@ class PortfolioAllocationRun(SQLModel, table=True):
     account_id: int = Field(foreign_key="accountdefinition.id", ondelete="CASCADE", index=True)
     mode: str = Field(index=True, description="REBALANCE | INVEST_LABEL (plain str)")
     scope_label: str | None = Field(default=None, description="Label targeted by an INVEST_LABEL run; None for REBALANCE")
-    base_notional: float = Field(default=0.0, description="buying_power + current value of managed positions, at plan time")
+    base_notional: float = Field(default=0.0, description="REBALANCE: buying_power + current value of managed positions, at plan time. INVEST_LABEL: the budget being spent")
     available_buying_power: float = Field(default=0.0, description="Broker buying power snapshotted at plan time")
     allow_fractional: bool = Field(default=False, description="Whether fractional shares were opted in for this run")
     plan_json: Dict[str, Any] = Field(sa_column=Column(JSON), default_factory=dict, description="AllocationPlan.to_dict() at submit time")

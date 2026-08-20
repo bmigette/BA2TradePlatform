@@ -20,6 +20,8 @@ from ba2_trade_platform.core.models import (
     TradeActionResult, ActivityLog, Instrument, Position,
     AnalysisOutput, PersistedQueueTask, LLMUsageLog, SmartRiskManagerJob,
     OptionIVSnapshot, OptionActivity,
+    PortfolioAllocationConfig, PortfolioAllocationLabel, PortfolioAllocationSymbol,
+    PortfolioIncomeEvent, PortfolioAllocationRun,
 )
 from ba2_trade_platform.core.types import (
     OrderStatus, OrderDirection, OrderType, OrderOpenType,
