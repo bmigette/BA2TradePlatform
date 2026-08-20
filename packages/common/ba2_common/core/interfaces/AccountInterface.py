@@ -6,6 +6,7 @@ from ba2_common.core.models import TradingOrder, Transaction, ExpertRecommendati
 from ba2_common.core.types import (
     OrderOpenType, OrderDirection, OrderType, OrderStatus, TransactionStatus, BrokerOrderErrorReason,
 )
+from ba2_common.core.account_types import OrderImpact
 from ba2_common.core.interfaces.ReadOnlyAccountInterface import ReadOnlyAccountInterface
 from ba2_common.core.db import add_instance, get_db, get_instance, update_instance
 
@@ -50,6 +51,35 @@ class AccountInterface(ReadOnlyAccountInterface):
             Any: The created order object if successful. Returns None or raises an exception if failed.
         """
         pass
+
+    def preview_order_impact(self, trading_order: TradingOrder) -> Optional[OrderImpact]:
+        """Broker-side dry-run of ONE order: what it would cost in buying power.
+
+        CONCRETE, returns ``None`` by default. ``None`` means "this broker has no
+        precheck", NOT "the order is free" -- a caller that treats ``None`` as a
+        zero impact will over-commit. Alpaca has no order-preview endpoint and
+        keeps the base ``None``, so it relies on ``get_symbol_margin_info()``.
+        TastyTrade implements it with
+        ``Account.place_order(session, order, dry_run=True)``.
+
+        MUST NOT send a live order.
+        ``tastytrade.account.Account.place_order``'s ``dry_run`` parameter
+        DEFAULTS TO ``True`` (site-packages/tastytrade/account.py:877-879) --
+        pass it explicitly here anyway, and never rely on that default at a real
+        submission call site.
+
+        Args:
+            trading_order: a candidate TradingOrder (saved or unsaved) describing
+                the order. This method must NOT mutate or persist it, and must
+                not set ``broker_order_id``.
+
+        Returns:
+            Optional[OrderImpact]: ``None`` when the broker does not support
+            prechecks OR when the preview call itself failed -- log the failure
+            (``logger.error(..., exc_info=True)`` inside the except block); do not
+            fabricate a zero impact.
+        """
+        return None
 
     def _classify_order_error(self, exc: Exception) -> BrokerOrderErrorReason:
         """Map this broker's NATIVE submission error onto the shared, broker-agnostic
