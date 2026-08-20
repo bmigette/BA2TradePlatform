@@ -72,9 +72,28 @@ def test_cash_transfer_zero_amount_deposit_is_not_income():
     assert ev.is_income is False
 
 
+def test_cash_transfer_negative_amount_deposit_is_not_income():
+    """A reversed/returned deposit arrives as a DEPOSIT with a negative amount.
+
+    This is the case the ``amount > 0`` guard exists for: without it, a clawback
+    would be counted as new money to allocate.
+    """
+    ev = CashTransfer(external_id="act-5", event_date=date(2026, 8, 7),
+                      event_type=CASH_TRANSFER_DEPOSIT, amount=-1000.0)
+    assert ev.is_income is False
+
+
+def test_cash_transfer_event_type_literals_are_the_persisted_spellings():
+    """These strings go into portfolio_income_event.event_type, so they are a
+    schema contract: respelling one orphans every row already stored under it."""
+    assert CASH_TRANSFER_DEPOSIT == "DEPOSIT"
+    assert CASH_TRANSFER_WITHDRAWAL == "WITHDRAWAL"
+    assert CASH_TRANSFER_DIVIDEND == "DIVIDEND"
+
+
 def test_margin_info_defaults_to_the_conservative_source():
     info = MarginInfo(symbol="AAPL", bp_factor=2.0)
-    assert info.source == MARGIN_SOURCE_DEFAULT
+    assert info.source == MARGIN_SOURCE_DEFAULT == "default"
     assert info.marginable is True
     assert info.fractionable is False
     assert info.min_order_size is None
@@ -97,6 +116,12 @@ def test_order_impact_bp_cost_flips_the_brokers_negative_buy_sign():
 
 def test_order_impact_bp_cost_is_zero_when_the_order_frees_buying_power():
     impact = OrderImpact(symbol="AAPL", change_in_buying_power=900.0)
+    assert impact.bp_cost == 0.0
+
+
+def test_order_impact_bp_cost_is_zero_at_exactly_zero_change():
+    """The boundary of the ``< 0`` branch: a no-op order consumes nothing."""
+    impact = OrderImpact(symbol="AAPL", change_in_buying_power=0.0)
     assert impact.bp_cost == 0.0
 
 

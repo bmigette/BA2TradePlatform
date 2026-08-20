@@ -5858,9 +5858,28 @@ def test_cash_transfer_zero_amount_deposit_is_not_income():
     assert ev.is_income is False
 
 
+def test_cash_transfer_negative_amount_deposit_is_not_income():
+    """A reversed/returned deposit arrives as a DEPOSIT with a negative amount.
+
+    This is the case the ``amount > 0`` guard exists for: without it, a clawback
+    would be counted as new money to allocate.
+    """
+    ev = CashTransfer(external_id="act-5", event_date=date(2026, 8, 7),
+                      event_type=CASH_TRANSFER_DEPOSIT, amount=-1000.0)
+    assert ev.is_income is False
+
+
+def test_cash_transfer_event_type_literals_are_the_persisted_spellings():
+    """These strings go into portfolio_income_event.event_type, so they are a
+    schema contract: respelling one orphans every row already stored under it."""
+    assert CASH_TRANSFER_DEPOSIT == "DEPOSIT"
+    assert CASH_TRANSFER_WITHDRAWAL == "WITHDRAWAL"
+    assert CASH_TRANSFER_DIVIDEND == "DIVIDEND"
+
+
 def test_margin_info_defaults_to_the_conservative_source():
     info = MarginInfo(symbol="AAPL", bp_factor=2.0)
-    assert info.source == MARGIN_SOURCE_DEFAULT
+    assert info.source == MARGIN_SOURCE_DEFAULT == "default"
     assert info.marginable is True
     assert info.fractionable is False
     assert info.min_order_size is None
@@ -5886,6 +5905,12 @@ def test_order_impact_bp_cost_is_zero_when_the_order_frees_buying_power():
     assert impact.bp_cost == 0.0
 
 
+def test_order_impact_bp_cost_is_zero_at_exactly_zero_change():
+    """The boundary of the ``< 0`` branch: a no-op order consumes nothing."""
+    impact = OrderImpact(symbol="AAPL", change_in_buying_power=0.0)
+    assert impact.bp_cost == 0.0
+
+
 def test_order_impact_defaults_to_accepted_with_no_errors():
     impact = OrderImpact(symbol="AAPL", change_in_buying_power=-10.0)
     assert impact.accepted is True
@@ -5901,6 +5926,7 @@ Phase 6 alias shims swap themselves out of sys.modules so that both import paths
 resolve to one module object; a shim that merely re-exported would give
 unittest.mock.patch two different targets.
 """
+from datetime import date
 
 
 def test_in_tree_account_types_is_the_package_module():
@@ -5921,7 +5947,8 @@ def test_in_tree_import_path_exposes_the_value_objects():
     assert AccountSnapshot().buying_power is None
     assert MarginInfo(symbol="A", bp_factor=1.0).symbol == "A"
     assert OrderImpact(symbol="A", change_in_buying_power=-1.0).bp_cost == 1.0
-    assert CashTransfer.__name__ == "CashTransfer"
+    assert CashTransfer(external_id="a", event_date=date(2026, 8, 1),
+                        event_type=CASH_TRANSFER_DEPOSIT, amount=5.0).is_income is True
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -5939,6 +5966,13 @@ Expected: collection error — `ModuleNotFoundError: No module named 'ba2_common
 ``get_account_info()`` returns a pydantic ``TradeAccount`` on Alpaca, a dict on
 IBKR and TastyTrade, and ``None`` on Alpaca auth failure. These dataclasses are
 the single shape every broker adapter maps ONTO, so no call site has to guess.
+
+Every money field is a plain ``float``, and the ADAPTER coerces at the mapping
+boundary: Alpaca publishes its balances as strings and TastyTrade's
+``BuyingPowerEffect.change_in_buying_power`` is a ``Decimal``. Nothing here
+re-coerces -- an uncoerced ``OrderImpact`` would make ``bp_cost`` return a
+``Decimal`` in breach of its own ``-> float`` annotation, and that is the
+adapter bug surfacing rather than being masked.
 
 stdlib imports only -- this module must stay importable from both
 ``core/interfaces/*`` and ``core/portfolio_allocation.py`` with no cycle.
@@ -5976,6 +6010,22 @@ class AccountSnapshot:
     ``margin_multiplier`` is Alpaca's ``TradeAccount.multiplier`` (a STRING there:
     "1" / "2" / "4"), i.e. how many dollars of buying power one dollar of equity
     yields. It is the conservative ``default_bp_factor`` fed to the engine.
+
+    ``equity`` is cash plus positions marked to market (Alpaca
+    ``TradeAccount.equity``); ``net_liquidation`` is what the account would be
+    worth if every position were closed right now (TastyTrade
+    ``net-liquidating-value``). They are the same number for a cash/equities
+    account and diverge only where liquidation value is not the mark. An adapter
+    whose broker publishes only one MUST set BOTH to that value rather than
+    leave one ``None``. Neither is the allocation denominator -- the engine's
+    base is ``buying_power`` plus the managed position value (see
+    ``build_base_snapshot``) -- so report ``net_liquidation`` as the account's
+    headline total value.
+
+    ``short_market_value`` is NEGATIVE while shorts are held (the Alpaca
+    convention). A broker that publishes a positive magnitude instead
+    (TastyTrade's ``short-equity-value``) MUST be negated by its adapter, so
+    that gross exposure is one formula for every broker.
     """
     cash: Optional[float] = None
     equity: Optional[float] = None

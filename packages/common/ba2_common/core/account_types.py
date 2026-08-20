@@ -4,6 +4,13 @@
 IBKR and TastyTrade, and ``None`` on Alpaca auth failure. These dataclasses are
 the single shape every broker adapter maps ONTO, so no call site has to guess.
 
+Every money field is a plain ``float``, and the ADAPTER coerces at the mapping
+boundary: Alpaca publishes its balances as strings and TastyTrade's
+``BuyingPowerEffect.change_in_buying_power`` is a ``Decimal``. Nothing here
+re-coerces -- an uncoerced ``OrderImpact`` would make ``bp_cost`` return a
+``Decimal`` in breach of its own ``-> float`` annotation, and that is the
+adapter bug surfacing rather than being masked.
+
 stdlib imports only -- this module must stay importable from both
 ``core/interfaces/*`` and ``core/portfolio_allocation.py`` with no cycle.
 """
@@ -40,6 +47,22 @@ class AccountSnapshot:
     ``margin_multiplier`` is Alpaca's ``TradeAccount.multiplier`` (a STRING there:
     "1" / "2" / "4"), i.e. how many dollars of buying power one dollar of equity
     yields. It is the conservative ``default_bp_factor`` fed to the engine.
+
+    ``equity`` is cash plus positions marked to market (Alpaca
+    ``TradeAccount.equity``); ``net_liquidation`` is what the account would be
+    worth if every position were closed right now (TastyTrade
+    ``net-liquidating-value``). They are the same number for a cash/equities
+    account and diverge only where liquidation value is not the mark. An adapter
+    whose broker publishes only one MUST set BOTH to that value rather than
+    leave one ``None``. Neither is the allocation denominator -- the engine's
+    base is ``buying_power`` plus the managed position value (see
+    ``build_base_snapshot``) -- so report ``net_liquidation`` as the account's
+    headline total value.
+
+    ``short_market_value`` is NEGATIVE while shorts are held (the Alpaca
+    convention). A broker that publishes a positive magnitude instead
+    (TastyTrade's ``short-equity-value``) MUST be negated by its adapter, so
+    that gross exposure is one formula for every broker.
     """
     cash: Optional[float] = None
     equity: Optional[float] = None
