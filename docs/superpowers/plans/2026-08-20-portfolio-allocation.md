@@ -939,6 +939,16 @@ def _make_db(tmp_path, rows):
     return engine
 
 
+def _write_raw_labels(engine, row_id, raw):
+    """Store a labels value EXACTLY as given, bypassing the fixture's json.dumps.
+
+    The malformed values live rows can hold cannot be produced by json.dumps.
+    """
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE instrument SET labels = :raw WHERE id = :id"),
+                     {"raw": raw, "id": row_id})
+
+
 def _dump(engine):
     with engine.connect() as conn:
         return [
@@ -1070,6 +1080,56 @@ def test_merge_tolerates_null_json_columns(tmp_path):
     assert _dump(engine) == [(1, 'GOOG', 'STOCK', None, [], ['x'])]
 
 
+def test_merge_drops_malformed_label_values_instead_of_stringifying_them(tmp_path):
+    """Non-strings must be DROPPED, never coerced into plausible-looking labels.
+
+    ``str()`` would write a JSON null through as a real label named 'None' -- and
+    only into rows the migration is already rewriting, so nobody would notice.
+    """
+    engine = _make_db(tmp_path, [
+        (1, 'AAPL', None, [], [], None),
+        (2, 'AAPL', 'STOCK', [], [], None),
+        (3, 'AAPL', None, [], [], None),
+    ])
+    _write_raw_labels(engine, 1, '[1, 2.5, null, true, "keeper"]')   # non-string members
+    _write_raw_labels(engine, 2, 'not json at all')                  # undecodable
+    _write_raw_labels(engine, 3, '{"a": 1}')                         # decodes, but not a list
+    with engine.begin() as conn:
+        merge_duplicate_instruments(conn)
+    assert _dump(engine) == [(1, 'AAPL', 'STOCK', None, [], ['keeper'])]
+
+
+def test_merge_keeps_the_lowest_ids_company_name_when_they_conflict(tmp_path):
+    """Coalesce is first-non-null by id, so a conflict resolves to the keeper's."""
+    engine = _make_db(tmp_path, [
+        (4, 'AAPL', 'STOCK', [], [], 'Apple Inc'),
+        (5, 'AAPL', 'STOCK', [], [], 'Apple Computer Inc'),
+        (6, 'AAPL', 'STOCK', [], [], 'APPLE INC.'),
+    ])
+    with engine.begin() as conn:
+        stats = merge_duplicate_instruments(conn)
+    assert stats['rows_deleted'] == 2
+    assert _dump(engine) == [(4, 'AAPL', 'STOCK', 'Apple Inc', [], [])]
+
+
+def test_merge_writes_nothing_when_the_caller_never_commits(tmp_path):
+    """The CALLER owns the transaction: connect() with no commit is a total no-op.
+
+    Pinned because the stats come back fully populated either way -- the only
+    signal that the merge was lost is the unchanged table.
+    """
+    engine = _make_db(tmp_path, [
+        (1, 'AAPL', None, [], ['a'], None),
+        (2, 'AAPL', 'STOCK', [], ['b'], None),
+    ])
+    before = _dump(engine)
+    conn = engine.connect()
+    stats = merge_duplicate_instruments(conn)
+    conn.close()                        # no commit: SQLAlchemy 2.0 rolls back
+    assert stats['rows_deleted'] == 1   # the work was reported...
+    assert _dump(engine) == before      # ...but none of it survived
+
+
 def test_merge_on_an_empty_table_is_a_no_op(tmp_path):
     engine = _make_db(tmp_path, [])
     with engine.begin() as conn:
@@ -1138,25 +1198,54 @@ _UPDATE_ROW = text(
 _DELETE_ROW = text("DELETE FROM instrument WHERE id = :id")
 
 
-def _as_list(raw) -> List[str]:
+def _as_list(raw, *, row_id=None, column: str = "") -> List[str]:
     """Decode a JSON list column read through a RAW connection.
 
     SQLAlchemy's JSON type only decodes when its Core type is attached; a textual
     SELECT hands back the stored TEXT. Anything that is not a JSON list (NULL, an
     empty string, a stray scalar) decodes to ``[]``.
+
+    Only genuine strings survive. Coercing members with ``str()`` would turn a
+    JSON ``null`` into a real label named ``"None"`` and a nested ``["a"]`` into
+    ``"['a']"`` -- plausible-looking garbage written into exactly the rows this
+    migration rewrites, which is worse than dropping it. Every discard is logged
+    with the row it came from, because a silent drop here is silent data loss.
+
+    Args:
+        raw: the stored column value: TEXT, an already-decoded list, or NULL.
+        row_id: the ``instrument.id`` the value came from, named in the log.
+        column: the column name (``"labels"`` / ``"categories"``), named in the log.
+
+    Returns:
+        List[str]: the string members of the decoded list, in stored order.
     """
+    where = f"row id={row_id} {column}".strip()
     if raw is None or raw == "":
         return []
     if isinstance(raw, list):
-        return [str(v) for v in raw]
-    try:
-        decoded = json.loads(raw)
-    except (TypeError, ValueError):
-        logger.warning(f"instrument merge: undecodable JSON value {raw!r} treated as empty")
+        decoded = raw
+    else:
+        try:
+            decoded = json.loads(raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                f"instrument merge: {where} holds undecodable JSON {raw!r}, treated as empty"
+            )
+            return []
+    if decoded is None:          # a stored JSON `null` is just the ordinary empty case
         return []
     if not isinstance(decoded, list):
+        logger.warning(
+            f"instrument merge: {where} holds non-list JSON {raw!r}, treated as empty"
+        )
         return []
-    return [str(v) for v in decoded]
+    kept = [v for v in decoded if isinstance(v, str)]
+    if len(kept) != len(decoded):
+        dropped = [v for v in decoded if not isinstance(v, str)]
+        logger.warning(
+            f"instrument merge: {where} dropped {len(dropped)} non-string value(s) {dropped!r}"
+        )
+    return kept
 
 
 def _union_preserving_order(lists) -> List[str]:
@@ -1182,7 +1271,7 @@ def report_duplicate_instruments(connection) -> List[Dict[str, Any]]:
 
     Args:
         connection: an open SQLAlchemy ``Connection`` (``op.get_bind()`` inside a
-            migration).
+            migration). Read-only here, so no transaction is required.
 
     Returns:
         List[Dict[str, Any]]: one entry per group needing work, sorted by name,
@@ -1210,8 +1299,12 @@ def report_duplicate_instruments(connection) -> List[Dict[str, Any]]:
             "delete_ids": [m[0] for m in members[1:]],
             "instrument_type": _first_non_null([m[2] for m in members]),
             "company_name": _first_non_null([m[3] for m in members]),
-            "categories": _union_preserving_order([_as_list(m[4]) for m in members]),
-            "labels": _union_preserving_order([_as_list(m[5]) for m in members]),
+            "categories": _union_preserving_order(
+                [_as_list(m[4], row_id=m[0], column="categories") for m in members]
+            ),
+            "labels": _union_preserving_order(
+                [_as_list(m[5], row_id=m[0], column="labels") for m in members]
+            ),
         })
     return plan
 
@@ -1223,14 +1316,24 @@ def merge_duplicate_instruments(connection, *, dry_run: bool = False) -> Dict[st
     ``company_name`` to the first non-null value, union ``labels`` and
     ``categories`` preserving order, delete the other rows.
 
+    THE CALLER OWNS THE TRANSACTION. This function issues UPDATEs and DELETEs but
+    never commits, so ``engine.connect()`` -> merge -> ``close()`` reports a full
+    set of stats and silently writes NOTHING (SQLAlchemy 2.0 rolls back on close).
+    Use ``engine.begin()``, or ``op.get_bind()`` inside a migration, which is
+    already inside Alembic's transaction. That is deliberate: a failure part-way
+    through must not leave the table half-merged.
+
     Args:
-        connection: an open SQLAlchemy ``Connection``.
+        connection: an open SQLAlchemy ``Connection`` in a transaction the caller
+            will commit.
         dry_run: when True, compute and log the plan and write NOTHING.
 
     Returns:
         Dict[str, int]: ``groups`` (rows rewritten), ``duplicate_groups`` (groups
-        that had more than one row), ``rows_deleted`` and ``rows_renamed`` (names
-        that were not already normalised).
+        that had more than one row), ``rows_deleted``, and ``rows_renamed``
+        (groups whose SURVIVING name changed -- a group whose keeper was already
+        normalised does not count, even when a mis-cased duplicate was deleted
+        from it).
     """
     plan = report_duplicate_instruments(connection)
     stats = {
@@ -1303,7 +1406,7 @@ _modules[_me] = _target
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `venv/bin/python -m pytest tests/test_instrument_merge.py -v`
-Expected: PASS (12 passed).
+Expected: PASS (15 passed).
 
 Run: `venv/bin/python -m pytest tests/test_alias_shim_race.py -v`
 Expected: PASS (the new shim satisfies the race-guard ordering checks).

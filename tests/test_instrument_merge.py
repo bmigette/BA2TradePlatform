@@ -49,6 +49,16 @@ def _make_db(tmp_path, rows):
     return engine
 
 
+def _write_raw_labels(engine, row_id, raw):
+    """Store a labels value EXACTLY as given, bypassing the fixture's json.dumps.
+
+    The malformed values live rows can hold cannot be produced by json.dumps.
+    """
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE instrument SET labels = :raw WHERE id = :id"),
+                     {"raw": raw, "id": row_id})
+
+
 def _dump(engine):
     with engine.connect() as conn:
         return [
@@ -178,6 +188,56 @@ def test_merge_tolerates_null_json_columns(tmp_path):
     with engine.begin() as conn:
         merge_duplicate_instruments(conn)
     assert _dump(engine) == [(1, 'GOOG', 'STOCK', None, [], ['x'])]
+
+
+def test_merge_drops_malformed_label_values_instead_of_stringifying_them(tmp_path):
+    """Non-strings must be DROPPED, never coerced into plausible-looking labels.
+
+    ``str()`` would write a JSON null through as a real label named 'None' -- and
+    only into rows the migration is already rewriting, so nobody would notice.
+    """
+    engine = _make_db(tmp_path, [
+        (1, 'AAPL', None, [], [], None),
+        (2, 'AAPL', 'STOCK', [], [], None),
+        (3, 'AAPL', None, [], [], None),
+    ])
+    _write_raw_labels(engine, 1, '[1, 2.5, null, true, "keeper"]')   # non-string members
+    _write_raw_labels(engine, 2, 'not json at all')                  # undecodable
+    _write_raw_labels(engine, 3, '{"a": 1}')                         # decodes, but not a list
+    with engine.begin() as conn:
+        merge_duplicate_instruments(conn)
+    assert _dump(engine) == [(1, 'AAPL', 'STOCK', None, [], ['keeper'])]
+
+
+def test_merge_keeps_the_lowest_ids_company_name_when_they_conflict(tmp_path):
+    """Coalesce is first-non-null by id, so a conflict resolves to the keeper's."""
+    engine = _make_db(tmp_path, [
+        (4, 'AAPL', 'STOCK', [], [], 'Apple Inc'),
+        (5, 'AAPL', 'STOCK', [], [], 'Apple Computer Inc'),
+        (6, 'AAPL', 'STOCK', [], [], 'APPLE INC.'),
+    ])
+    with engine.begin() as conn:
+        stats = merge_duplicate_instruments(conn)
+    assert stats['rows_deleted'] == 2
+    assert _dump(engine) == [(4, 'AAPL', 'STOCK', 'Apple Inc', [], [])]
+
+
+def test_merge_writes_nothing_when_the_caller_never_commits(tmp_path):
+    """The CALLER owns the transaction: connect() with no commit is a total no-op.
+
+    Pinned because the stats come back fully populated either way -- the only
+    signal that the merge was lost is the unchanged table.
+    """
+    engine = _make_db(tmp_path, [
+        (1, 'AAPL', None, [], ['a'], None),
+        (2, 'AAPL', 'STOCK', [], ['b'], None),
+    ])
+    before = _dump(engine)
+    conn = engine.connect()
+    stats = merge_duplicate_instruments(conn)
+    conn.close()                        # no commit: SQLAlchemy 2.0 rolls back
+    assert stats['rows_deleted'] == 1   # the work was reported...
+    assert _dump(engine) == before      # ...but none of it survived
 
 
 def test_merge_on_an_empty_table_is_a_no_op(tmp_path):

@@ -38,25 +38,54 @@ _UPDATE_ROW = text(
 _DELETE_ROW = text("DELETE FROM instrument WHERE id = :id")
 
 
-def _as_list(raw) -> List[str]:
+def _as_list(raw, *, row_id=None, column: str = "") -> List[str]:
     """Decode a JSON list column read through a RAW connection.
 
     SQLAlchemy's JSON type only decodes when its Core type is attached; a textual
     SELECT hands back the stored TEXT. Anything that is not a JSON list (NULL, an
     empty string, a stray scalar) decodes to ``[]``.
+
+    Only genuine strings survive. Coercing members with ``str()`` would turn a
+    JSON ``null`` into a real label named ``"None"`` and a nested ``["a"]`` into
+    ``"['a']"`` -- plausible-looking garbage written into exactly the rows this
+    migration rewrites, which is worse than dropping it. Every discard is logged
+    with the row it came from, because a silent drop here is silent data loss.
+
+    Args:
+        raw: the stored column value: TEXT, an already-decoded list, or NULL.
+        row_id: the ``instrument.id`` the value came from, named in the log.
+        column: the column name (``"labels"`` / ``"categories"``), named in the log.
+
+    Returns:
+        List[str]: the string members of the decoded list, in stored order.
     """
+    where = f"row id={row_id} {column}".strip()
     if raw is None or raw == "":
         return []
     if isinstance(raw, list):
-        return [str(v) for v in raw]
-    try:
-        decoded = json.loads(raw)
-    except (TypeError, ValueError):
-        logger.warning(f"instrument merge: undecodable JSON value {raw!r} treated as empty")
+        decoded = raw
+    else:
+        try:
+            decoded = json.loads(raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                f"instrument merge: {where} holds undecodable JSON {raw!r}, treated as empty"
+            )
+            return []
+    if decoded is None:          # a stored JSON `null` is just the ordinary empty case
         return []
     if not isinstance(decoded, list):
+        logger.warning(
+            f"instrument merge: {where} holds non-list JSON {raw!r}, treated as empty"
+        )
         return []
-    return [str(v) for v in decoded]
+    kept = [v for v in decoded if isinstance(v, str)]
+    if len(kept) != len(decoded):
+        dropped = [v for v in decoded if not isinstance(v, str)]
+        logger.warning(
+            f"instrument merge: {where} dropped {len(dropped)} non-string value(s) {dropped!r}"
+        )
+    return kept
 
 
 def _union_preserving_order(lists) -> List[str]:
@@ -82,7 +111,7 @@ def report_duplicate_instruments(connection) -> List[Dict[str, Any]]:
 
     Args:
         connection: an open SQLAlchemy ``Connection`` (``op.get_bind()`` inside a
-            migration).
+            migration). Read-only here, so no transaction is required.
 
     Returns:
         List[Dict[str, Any]]: one entry per group needing work, sorted by name,
@@ -110,8 +139,12 @@ def report_duplicate_instruments(connection) -> List[Dict[str, Any]]:
             "delete_ids": [m[0] for m in members[1:]],
             "instrument_type": _first_non_null([m[2] for m in members]),
             "company_name": _first_non_null([m[3] for m in members]),
-            "categories": _union_preserving_order([_as_list(m[4]) for m in members]),
-            "labels": _union_preserving_order([_as_list(m[5]) for m in members]),
+            "categories": _union_preserving_order(
+                [_as_list(m[4], row_id=m[0], column="categories") for m in members]
+            ),
+            "labels": _union_preserving_order(
+                [_as_list(m[5], row_id=m[0], column="labels") for m in members]
+            ),
         })
     return plan
 
@@ -123,14 +156,24 @@ def merge_duplicate_instruments(connection, *, dry_run: bool = False) -> Dict[st
     ``company_name`` to the first non-null value, union ``labels`` and
     ``categories`` preserving order, delete the other rows.
 
+    THE CALLER OWNS THE TRANSACTION. This function issues UPDATEs and DELETEs but
+    never commits, so ``engine.connect()`` -> merge -> ``close()`` reports a full
+    set of stats and silently writes NOTHING (SQLAlchemy 2.0 rolls back on close).
+    Use ``engine.begin()``, or ``op.get_bind()`` inside a migration, which is
+    already inside Alembic's transaction. That is deliberate: a failure part-way
+    through must not leave the table half-merged.
+
     Args:
-        connection: an open SQLAlchemy ``Connection``.
+        connection: an open SQLAlchemy ``Connection`` in a transaction the caller
+            will commit.
         dry_run: when True, compute and log the plan and write NOTHING.
 
     Returns:
         Dict[str, int]: ``groups`` (rows rewritten), ``duplicate_groups`` (groups
-        that had more than one row), ``rows_deleted`` and ``rows_renamed`` (names
-        that were not already normalised).
+        that had more than one row), ``rows_deleted``, and ``rows_renamed``
+        (groups whose SURVIVING name changed -- a group whose keeper was already
+        normalised does not count, even when a mis-cased duplicate was deleted
+        from it).
     """
     plan = report_duplicate_instruments(connection)
     stats = {
