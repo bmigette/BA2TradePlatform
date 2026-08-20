@@ -1338,6 +1338,27 @@ git commit -m "feat(instruments): shared, idempotent duplicate-instrument merge"
 > the unique index instead of tripping it. That is latent, not live: do NOT add blank-row deletion
 > to this revision on account of it. Task 6 guards the write paths.
 
+> **FIRST STEP OF THIS TASK: make alembic runnable at all.** On this machine `ba2_common` is not
+> importable outside pytest — `venv/`'s editable install points at
+> `/Users/bmigette/Documents/dev/BA2/BA2TradeCommon`, which does not exist, and only `pytest.ini`'s
+> `pythonpath = packages/common packages/providers packages/experts` makes the imports resolve.
+> `alembic/env.py:11` inserts only the repo root. Verified today:
+>
+> ```
+> venv/bin/python -m alembic current
+>   -> ModuleNotFoundError: No module named 'ba2_common'
+>      (raised at ba2_trade_platform/config.py:6, before env.py reaches the models)
+>
+> PYTHONPATH=packages/common:packages/providers:packages/experts venv/bin/python -m alembic current
+>   -> d5e1b9a3c842
+> ```
+>
+> So `python migrate.py upgrade` is broken today, independently of this feature. Fix it in
+> `alembic/env.py` next to the existing `sys.path.insert` — append the three `packages/*`
+> directories the same way — so alembic and `migrate.py` are self-sufficient and nobody has to
+> remember a prefix. Add a test that asserts `alembic current` exits 0 with a bare
+> `venv/bin/python`. This is a prerequisite for testing your revision, not optional cleanup.
+
 
 Head is `0a3e0bd24598` (verified: `venv/bin/python -m alembic heads` prints exactly
 `0a3e0bd24598 (head)`, single head), so `down_revision = '0a3e0bd24598'`. The revision imports
