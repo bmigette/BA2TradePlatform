@@ -5105,7 +5105,7 @@ git commit -m "feat(allocation): signed deltas against held positions, close on 
 - Modify: `packages/common/ba2_common/core/portfolio_allocation.py`
 - Test: `packages/common/tests/test_portfolio_allocation.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to the end of `packages/common/tests/test_portfolio_allocation.py`:
 
@@ -5155,7 +5155,7 @@ def test_quantity_below_min_order_size_is_dropped_to_zero():
     assert plan.rows[0].delta_quantity == 0.0
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `venv/bin/python -m pytest packages/common/tests/test_portfolio_allocation.py -v -k "four_decimals or min_trade_increment or non_fractionable or min_order_size"`
 
@@ -5167,7 +5167,7 @@ E   AssertionError: assert 'rounded down to whole shares' in []
 E   AssertionError: assert 3.0 == 0.0
 ```
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Replace the whole `round_quantity` function with:
 
@@ -5236,15 +5236,20 @@ with:
             delta = -row.current_quantity
             row.reasons.append(REASON_CLOSE_TO_ZERO)
         elif not frac:
-            delta = math.floor(delta) if delta > 0 else -math.floor(-delta)
+            delta = float(math.floor(delta) if delta > 0 else -math.floor(-delta))
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+(The `float()` wrap keeps `delta_quantity: float` honest: `math.floor()` returns
+an `int`, so before Task 19 the whole-share path stored an `int` in a field
+annotated `float` and `to_dict()` serialised `9` rather than `9.0`. The
+fractional path returns genuine floats, so this is the natural place to fix it.)
+
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `venv/bin/python -m pytest packages/common/tests/test_portfolio_allocation.py -v`
 Expected: PASS — `24 passed`
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add packages/common/ba2_common/core/portfolio_allocation.py packages/common/tests/test_portfolio_allocation.py
 git commit -m "feat(allocation): fractional-share rounding with min increment and min order size"
@@ -6419,7 +6424,7 @@ Then replace this block:
             delta = -row.current_quantity
             row.reasons.append(REASON_CLOSE_TO_ZERO)
         elif not frac:
-            delta = math.floor(delta) if delta > 0 else -math.floor(-delta)
+            delta = float(math.floor(delta) if delta > 0 else -math.floor(-delta))
 ```
 
 with:
@@ -6450,7 +6455,7 @@ with:
                                                  allow_fractional=allow_fractional)
             delta = row.target_quantity - row.current_quantity
             if not frac:
-                delta = math.floor(delta) if delta > 0 else -math.floor(-delta)
+                delta = float(math.floor(delta) if delta > 0 else -math.floor(-delta))
 ```
 
 **3d.** In `compute_label_investment`, add the same keyword for signature symmetry — an

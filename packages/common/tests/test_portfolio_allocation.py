@@ -205,3 +205,48 @@ def test_whole_share_mode_never_emits_a_fractional_delta():
     plan = pa.compute_allocation(2_000.0, 1_000_000.0, labels, current, {},
                                  allow_fractional=False, default_bp_factor=1.0)
     assert plan.rows[0].delta_quantity == 9.0
+
+
+def test_fractional_on_without_increment_rounds_to_four_decimals():
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
+    margin = {"XXX": MarginInfo(symbol="XXX", bp_factor=1.0, fractionable=True)}
+    plan = pa.compute_allocation(1_000.0, 1_000_000.0, labels,
+                                 {"XXX": _pos("XXX", 300.0)}, margin,
+                                 allow_fractional=True, default_bp_factor=1.0)
+    row = plan.rows[0]
+    assert row.target_quantity == pytest.approx(3.3333)
+    assert row.fractional is True
+    assert pa.REASON_FRACTIONAL in row.reasons
+
+
+def test_fractional_on_rounds_down_to_the_brokers_min_trade_increment():
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
+    margin = {"XXX": MarginInfo(symbol="XXX", bp_factor=1.0, fractionable=True,
+                                min_trade_increment=0.01)}
+    plan = pa.compute_allocation(1_000.0, 1_000_000.0, labels,
+                                 {"XXX": _pos("XXX", 300.0)}, margin,
+                                 allow_fractional=True, default_bp_factor=1.0)
+    assert plan.rows[0].target_quantity == pytest.approx(3.33)
+
+
+def test_fractional_requested_on_a_non_fractionable_symbol_falls_back_to_whole_shares():
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
+    margin = {"XXX": MarginInfo(symbol="XXX", bp_factor=1.0, fractionable=False)}
+    plan = pa.compute_allocation(1_000.0, 1_000_000.0, labels,
+                                 {"XXX": _pos("XXX", 300.0)}, margin,
+                                 allow_fractional=True, default_bp_factor=1.0)
+    row = plan.rows[0]
+    assert row.target_quantity == 3.0
+    assert row.fractional is False
+    assert pa.REASON_WHOLE_SHARE_FLOOR in row.reasons
+
+
+def test_quantity_below_min_order_size_is_dropped_to_zero():
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
+    margin = {"XXX": MarginInfo(symbol="XXX", bp_factor=1.0, fractionable=True,
+                                min_order_size=5.0)}
+    plan = pa.compute_allocation(1_000.0, 1_000_000.0, labels,
+                                 {"XXX": _pos("XXX", 300.0)}, margin,
+                                 allow_fractional=True, default_bp_factor=1.0)
+    assert plan.rows[0].target_quantity == 0.0
+    assert plan.rows[0].delta_quantity == 0.0

@@ -235,17 +235,37 @@ class AllocationPlan:
 
 def round_quantity(target_notional: float, price: float, margin: Optional[MarginInfo],
                    *, allow_fractional: bool) -> float:
-    """Convert a notional to a tradeable share quantity. Always rounds DOWN, so a
-    plan never over-spends its notional. Whole shares only for now.
+    """Convert a notional to a tradeable share quantity.
 
-    Returns 0.0 when ``price <= 0``; the caller must have already skipped a
-    ``None`` price.
+    Fractional OFF: ``floor(target_notional / price)``.
+    Fractional ON: rounded DOWN to ``margin.min_trade_increment`` when the broker
+    publishes one, otherwise to ``DEFAULT_FRACTIONAL_DECIMALS`` (4) places.
+    Fractional ON but ``margin`` is None or ``margin.fractionable`` is False:
+    falls back to whole shares.
+
+    Always rounds DOWN, so a plan never over-spends its notional. Returns 0.0
+    when ``price <= 0``; the caller must have already skipped a ``None`` price.
+    A result below ``margin.min_order_size`` is returned as 0.0.
     """
     if price is None or price <= 0:
         return 0.0
     if target_notional is None or target_notional <= 0:
         return 0.0
-    return float(math.floor(float(target_notional) / float(price)))
+    raw = float(target_notional) / float(price)
+    if allow_fractional and margin is not None and margin.fractionable:
+        inc = margin.min_trade_increment
+        if inc and inc > 0:
+            qty = round(math.floor(round(raw / inc, 9)) * inc, 10)
+        else:
+            f = 10.0 ** DEFAULT_FRACTIONAL_DECIMALS
+            qty = math.floor(raw * f) / f
+    else:
+        qty = float(math.floor(raw))
+    if qty <= 0:
+        return 0.0
+    if margin is not None and margin.min_order_size is not None and qty < margin.min_order_size:
+        return 0.0
+    return qty
 
 
 def _finalise_totals(plan: AllocationPlan) -> None:
@@ -266,8 +286,9 @@ def compute_allocation(base_notional: float, available_buying_power: float,
     ``delta_quantity = target_quantity - current_quantity``, signed. A target of
     zero on a held symbol closes it outright (``REASON_CLOSE_TO_ZERO``) --
     including a fractional holding, which a broker will always let you flatten.
-    Any other delta is rounded TOWARDS ZERO to whole shares, so whole-share mode
-    can never emit a 0.37-share order.
+    In whole-share mode any other delta is rounded TOWARDS ZERO to whole shares,
+    so the plan can never emit a 0.37-share order; in fractional mode the target
+    already sits on the broker's grid and the delta keeps its decimals.
     """
     current = current or {}
     margin = margin or {}
@@ -294,14 +315,20 @@ def compute_allocation(base_notional: float, available_buying_power: float,
         if len(row.labels) > 1:
             row.reasons.append(REASON_MULTI_LABEL_FMT.format(labels=", ".join(row.labels)))
         row.target_notional = target_notional
+        frac = bool(allow_fractional and m is not None and m.fractionable)
+        row.fractional = frac
         row.target_quantity = round_quantity(target_notional, row.price, m,
                                              allow_fractional=allow_fractional)
+        if frac:
+            row.reasons.append(REASON_FRACTIONAL)
+        elif allow_fractional:
+            row.reasons.append(REASON_WHOLE_SHARE_FLOOR)
         delta = row.target_quantity - row.current_quantity
         if row.target_quantity <= 0 and row.current_quantity > 0:
             delta = -row.current_quantity
             row.reasons.append(REASON_CLOSE_TO_ZERO)
-        else:
-            delta = math.floor(delta) if delta > 0 else -math.floor(-delta)
+        elif not frac:
+            delta = float(math.floor(delta) if delta > 0 else -math.floor(-delta))
         if abs(delta) < QUANTITY_EPSILON:
             delta = 0.0
         row.delta_quantity = delta
