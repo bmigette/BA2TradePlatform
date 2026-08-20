@@ -15897,6 +15897,20 @@ git commit -m "feat(allocation): allocatable-base snapshot for the wizard"
 
 ### Task 69: Wire the engine to real data — positions, prices, margin info, precheck
 
+> **Guard the precheck call site — a bare call raises rather than returning `None`.**
+> `preview_order_impact` lives on `AccountInterface` only, not `ReadOnlyAccountInterface`, because
+> previewing is a trading capability. So `acct.preview_order_impact(...)` on a read-only account
+> raises `AttributeError` instead of yielding the intended "this broker cannot preview". Use
+> `getattr(acct, "preview_order_impact", None)`, or gate on `supports_trading` /
+> `isinstance(acct, AccountInterface)` — and make that path produce `None`, meaning *not asked*,
+> never a zero-valued `OrderImpact`.
+>
+> **Key "did I get an impact?" off `is None`, never off falsiness.** `OrderImpact.bp_cost` returns
+> `0.0` for an order that FREES buying power. That is a real zero and semantically different from no
+> impact at all; treating it as falsy silently drops the re-solve for exactly the orders that would
+> have given headroom back.
+
+
 Pure-testable: `build_position_states` (fake account + in-memory DB), `fetch_margin_info`,
 `precheck_plan` (fake account, no DB). Eyeball-only: nothing.
 
