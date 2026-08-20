@@ -3115,7 +3115,7 @@ def downgrade() -> None:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_migration.py -v`
-Expected: PASS — `14 passed`
+Expected: PASS — `15 passed` (5 standalone tests plus two 5-way parametrisations)
 
 If `test_migration_indexes_match_the_model` fails on `portfolio_allocation_config`, compare the
 reported sets: SQLModel's `unique=True, index=True` emits exactly one unique index named
