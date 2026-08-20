@@ -449,7 +449,7 @@ is moved into the pure `parse_instrument_symbol_list` helper (added in Task 1), 
 the test bites.
 
 **Files:**
-- Modify: `ba2_trade_platform/ui/pages/settings.py:11`, `:367`, `:379`, `:469`, `:479`
+- Modify: `ba2_trade_platform/ui/pages/settings.py:11`, `:367`, `:379`, `:469`, `:479`, `:488`
 - Test: `tests/test_instrument_symbol_import.py`
 
 - [ ] **Step 1: Write the failing test**
@@ -482,6 +482,20 @@ def test_parse_symbol_list_dedupes_case_variants_preserving_first_seen_order():
 def test_parse_symbol_list_empty_input_returns_empty_list():
     assert parse_instrument_symbol_list("") == []
     assert parse_instrument_symbol_list(None) == []
+
+
+def test_settings_module_binds_normalisers():
+    """The settings module must still import and actually bind the normalisers.
+
+    The write sites are closures inside NiceGUI dialogs and unreachable from a
+    test, so they are covered by inspection -- but the import itself is cheaply
+    testable, and a missed re-export through the core.utils split-shim would
+    otherwise only surface as an ImportError in production.
+    """
+    import ba2_trade_platform.ui.pages.settings as s
+
+    assert s.normalize_symbol("  aapl ") == "AAPL"
+    assert s.parse_instrument_symbol_list("aapl\nAAPL") == ["AAPL"]
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -527,40 +541,66 @@ with:
                         existing_instruments = {normalize_symbol(inst.name): inst for inst in session.exec(select(Instrument)).all()}
 ```
 
-Edit 4 — line 469, in the dialog's `save()` edit branch, replace:
+Edit 4 — in the dialog's `save()`, hoist the normalisation above the `if is_edit:` branch so
+the log lines and the writes can never disagree, replace:
 
 ```python
+                    if is_edit:
+                        logger.debug(f'Editing instrument {instrument.id}: {name_input.value}')
                         instrument.name = name_input.value
 ```
 
 with:
 
 ```python
-                        instrument.name = normalize_symbol(name_input.value)
+                    # Normalise once, then log and store the same value: a log line
+                    # saying '  aapl ' next to a row holding 'AAPL' is a debugging trap.
+                    name = normalize_symbol(name_input.value)
+                    if is_edit:
+                        logger.debug(f'Editing instrument {instrument.id}: {name}')
+                        instrument.name = name
 ```
 
-Edit 5 — line 479, in the dialog's `save()` create branch, replace:
+Edit 5 — in the dialog's `save()` create branch, use that same `name` for both the log lines
+and the write, replace:
 
 ```python
+                        logger.debug(f'Adding new instrument: {name_input.value}')
+                        inst = Instrument(
                             name=name_input.value,
 ```
 
 with:
 
 ```python
-                            name=normalize_symbol(name_input.value),
+                        logger.debug(f'Adding new instrument: {name}')
+                        inst = Instrument(
+                            name=name,
+```
+
+and replace:
+
+```python
+                        logger.info(f'Instrument {name_input.value} added')
+```
+
+with:
+
+```python
+                        logger.info(f'Instrument {name} added')
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `venv/bin/python -m pytest tests/test_instrument_symbol_import.py -v`
-Expected: PASS (4 passed).
+Expected: PASS (5 passed).
 
-Then verify the five UI edits actually landed (the closures have no test coverage):
+Then verify the UI edits actually landed (the closures have no test coverage):
 Run: `grep -n "parse_instrument_symbol_list\|normalize_symbol" ba2_trade_platform/ui/pages/settings.py`
-Expected: exactly 5 lines — the import at `:11`, `names = parse_instrument_symbol_list(content)`,
-the `existing_instruments` dict comprehension, `instrument.name = normalize_symbol(...)` and
-`name=normalize_symbol(name_input.value),`.
+Expected: exactly 4 lines — the import at `:11`, `names = parse_instrument_symbol_list(content)`,
+the `existing_instruments` dict comprehension, and the hoisted
+`name = normalize_symbol(name_input.value)` in the dialog's `save()`. (The two dialog write
+sites now read that one `name` local, so they do not appear in this grep; confirm them by eye.)
 
 - [ ] **Step 5: Commit**
 

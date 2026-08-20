@@ -466,9 +466,12 @@ class InstrumentSettingsTab:
                 def save():
                     session = get_db()
                     labels = [l.strip() for l in labels_input.value.split(',')] if labels_input.value else []
+                    # Normalise once, then log and store the same value: a log line
+                    # saying '  aapl ' next to a row holding 'AAPL' is a debugging trap.
+                    name = normalize_symbol(name_input.value)
                     if is_edit:
-                        logger.debug(f'Editing instrument {instrument.id}: {name_input.value}')
-                        instrument.name = normalize_symbol(name_input.value)
+                        logger.debug(f'Editing instrument {instrument.id}: {name}')
+                        instrument.name = name
                         instrument.instrument_type = type_input.value
                         instrument.labels = labels
                         update_instance(instrument, session)
@@ -476,16 +479,16 @@ class InstrumentSettingsTab:
                         logger.info(f'Instrument {instrument.id} updated')
                         ui.notify('Instrument updated!', type='positive')
                     else:
-                        logger.debug(f'Adding new instrument: {name_input.value}')
+                        logger.debug(f'Adding new instrument: {name}')
                         inst = Instrument(
-                            name=normalize_symbol(name_input.value),
+                            name=name,
                             instrument_type=type_input.value,
                             categories=[],
                             labels=labels
                         )
                         add_instance(inst, session)
                         session.commit()
-                        logger.info(f'Instrument {name_input.value} added')
+                        logger.info(f'Instrument {name} added')
                         ui.notify('Instrument added!', type='positive')
                     self.add_dialog.close()
                     self._update_table_rows()

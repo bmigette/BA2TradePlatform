@@ -23,3 +23,17 @@ def test_parse_symbol_list_dedupes_case_variants_preserving_first_seen_order():
 def test_parse_symbol_list_empty_input_returns_empty_list():
     assert parse_instrument_symbol_list("") == []
     assert parse_instrument_symbol_list(None) == []
+
+
+def test_settings_module_binds_normalisers():
+    """The settings module must still import and actually bind the normalisers.
+
+    The write sites are closures inside NiceGUI dialogs and unreachable from a
+    test, so they are covered by inspection -- but the import itself is cheaply
+    testable, and a missed re-export through the core.utils split-shim would
+    otherwise only surface as an ImportError in production.
+    """
+    import ba2_trade_platform.ui.pages.settings as s
+
+    assert s.normalize_symbol("  aapl ") == "AAPL"
+    assert s.parse_instrument_symbol_list("aapl\nAAPL") == ["AAPL"]
