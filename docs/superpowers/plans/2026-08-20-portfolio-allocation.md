@@ -153,17 +153,19 @@ name, so nothing else can be trusted until this is done.
 
 `add_label_to_instruments` / `remove_label_from_instruments` resolve a symbol with
 `.first()`, and `get_labels_by_symbol` keys the result by the stored name. Feed any of them a
-differently-cased symbol today and you silently create or miss a row. This task adds one pure
-helper, `normalize_symbol`, and routes all four helpers through it.
+differently-cased symbol today and you silently create or miss a row. This task adds the pure
+helper `normalize_symbol`, routes all four helpers through it, and resynchronises the
+`overview.py` read path so it looks up by the same normalised key the helpers now return.
 
 **Files:**
 - Modify: `packages/common/ba2_common/core/utils.py:19-94`
 - Modify: `packages/common/tests/test_utils_pure.py:52` and `:68`
+- Modify: `ba2_trade_platform/ui/pages/overview.py` (5 lookup sites — see Step 3b)
 - Test: `tests/test_instrument_labels.py`
 
 - [ ] **Step 1: Write the failing test**
 
-Append these five methods to the end of the existing `class TestInstrumentLabels` in
+Append these seven methods to the end of the existing `class TestInstrumentLabels` in
 `tests/test_instrument_labels.py` (the file already imports `select`, `get_db`, `Instrument`
 and the four helpers at module level, and already defines the `_labels()` helper):
 
@@ -174,6 +176,17 @@ and the four helpers at module level, and already defines the `_labels()` helper
         assert normalize_symbol('AAPL') == 'AAPL'
         assert normalize_symbol(None) == ''
         assert normalize_symbol('   ') == ''
+
+    def test_normalize_symbol_rejects_non_strings(self):
+        from ba2_trade_platform.core.utils import normalize_symbol
+        assert normalize_symbol(123) == ''
+        assert normalize_symbol(False) == ''
+        assert normalize_symbol({'a': 1}) == ''
+
+    def test_add_label_ignores_non_string_symbols(self):
+        """A non-string symbol must never fabricate an Instrument row."""
+        assert add_label_to_instruments([0], 'tech') == 0
+        assert _labels('0') is None
 
     def test_add_label_stores_normalised_symbol(self):
         assert add_label_to_instruments(['  aapl  '], 'tech') == 1
@@ -224,11 +237,14 @@ Run: `venv/bin/python -m pytest tests/test_instrument_labels.py -v`
 Expected: FAIL — `test_normalize_symbol_strips_and_uppercases` errors with
 `ImportError: cannot import name 'normalize_symbol' from 'ba2_trade_platform.core.utils'`, and
 `test_add_label_stores_normalised_symbol` fails with `AssertionError: assert None == ['tech']`.
+The two non-string tests fail the same way against a `str()`-coercing draft:
+`assert '123' == ''` and `assert 1 == 0` (the `1` is a fabricated `Instrument(name='0')`).
 
 - [ ] **Step 3: Write minimal implementation**
 
 In `packages/common/ba2_common/core/utils.py`, replace lines 19-94 (the four label helpers)
-with the following. `normalize_symbol` and `parse_instrument_symbol_list` are inserted ahead of
+with the following. `normalize_symbol`, the module-private `_normalized_symbols` and
+`parse_instrument_symbol_list` are inserted ahead of
 them so the helpers can use them, and the lazy `from ba2_common.core.models import Instrument`
 inside every function body is preserved — `packages/common/tests/test_utils_pure.py:32-38` runs
 a subprocess gate asserting that importing this module pulls in no models/providers/nicegui.
@@ -237,14 +253,23 @@ a subprocess gate asserting that importing this module pulls in no models/provid
 def normalize_symbol(symbol) -> str:
     """Normalise an instrument symbol to its one canonical stored form.
 
-    ``instrument.name`` is UNIQUE, but a unique index does not stop ``aapl`` and
-    ``AAPL`` from coexisting -- uniqueness is only real if every read and write
-    goes through here first. ``None``, blanks and non-strings collapse to ``""``;
-    callers drop empties rather than writing a nameless Instrument.
+    ``instrument.name`` will be UNIQUE once the merge migration lands, but a
+    unique index does not stop ``aapl`` and ``AAPL`` from coexisting --
+    uniqueness is only real if every read and write goes through here first.
+    ``None``, blanks and non-strings collapse to ``""``; callers drop empties
+    rather than writing a nameless Instrument. Non-strings are NOT coerced with
+    ``str()``: that would turn ``0`` into a real ``Instrument(name='0')`` and
+    report success. These helpers take user input from the Settings UI, so a bad
+    symbol is dropped rather than raised on.
     """
-    if symbol is None:
+    if not isinstance(symbol, str):
         return ""
-    return str(symbol).strip().upper()
+    return symbol.strip().upper()
+
+
+def _normalized_symbols(symbols) -> List[str]:
+    """Sorted, de-duplicated normalised symbols, with empties dropped."""
+    return sorted({n for s in symbols if (n := normalize_symbol(s))})
 
 
 def parse_instrument_symbol_list(text) -> List[str]:
@@ -273,7 +298,7 @@ def get_labels_by_symbol(symbols) -> Dict[str, List[str]]:
     omitted, so the caller can default to an empty list.
     """
     from ba2_common.core.models import Instrument
-    syms = sorted({normalize_symbol(s) for s in symbols if normalize_symbol(s)})
+    syms = _normalized_symbols(symbols)
     if not syms:
         return {}
     out: Dict[str, List[str]] = {}
@@ -319,7 +344,7 @@ def add_label_to_instruments(symbols, label: str) -> int:
         return 0
     changed = 0
     with get_db() as session:
-        for sym in sorted({normalize_symbol(s) for s in symbols if normalize_symbol(s)}):
+        for sym in _normalized_symbols(symbols):
             inst = session.exec(select(Instrument).where(Instrument.name == sym)).first()
             if inst is None:
                 session.add(Instrument(name=sym, labels=[label]))
@@ -344,7 +369,7 @@ def remove_label_from_instruments(symbols, label: str) -> int:
         return 0
     changed = 0
     with get_db() as session:
-        for sym in sorted({normalize_symbol(s) for s in symbols if normalize_symbol(s)}):
+        for sym in _normalized_symbols(symbols):
             inst = session.exec(select(Instrument).where(Instrument.name == sym)).first()
             if inst and label in (inst.labels or []):
                 inst.labels = [l for l in inst.labels if l != label]
@@ -357,21 +382,59 @@ def remove_label_from_instruments(symbols, label: str) -> int:
 
 No import changes are needed: `Dict`, `List`, `select` and `get_db` are already imported at the
 top of the file. No shim change is needed either — `ba2_trade_platform/core/utils.py` does
-`from ba2_common.core.utils import *`, so both new helpers are re-exported automatically.
+`from ba2_common.core.utils import *`, so both new public helpers are re-exported automatically
+(`_normalized_symbols` is private, so `import *` skips it and the purity gate's exported-helper
+list does not need it).
+
+- [ ] **Step 3b: Resynchronise the `overview.py` read path**
+
+`get_labels_by_symbol` now returns NORMALISED keys, but all five callers still index the dict
+with the raw symbol. Before this task both sides were raw — consistently wrong but consistent;
+leaving them raw now means a non-uppercase symbol writes a label the next read cannot see. At
+the three `or ['Unlabeled']` sites the miss is silent: the position's market value is
+mis-bucketed in the label allocation chart with no error.
+
+In `ba2_trade_platform/ui/pages/overview.py`, add `normalize_symbol` to the existing
+`from ...core.utils import ...` on line 11, then wrap the lookup key at all five sites:
+
+| Line | Before | After |
+| --- | --- | --- |
+| 1385 | `labels_by_symbol.get(p.get('symbol'), [])` | `labels_by_symbol.get(normalize_symbol(p.get('symbol')), [])` |
+| 1580 | `refreshed.get(row.get('symbol'), [])` | `refreshed.get(normalize_symbol(row.get('symbol')), [])` |
+| 5245 | `labels_by_symbol.get(sym)` | `labels_by_symbol.get(normalize_symbol(sym))` |
+| 5259 | `labels_by_symbol.get(div.get('symbol'))` | `labels_by_symbol.get(normalize_symbol(div.get('symbol')))` |
+| 5315 | `symbol_labels.get(pos.symbol)` | `symbol_labels.get(normalize_symbol(pos.symbol))` |
+
+Only the dict lookup changes. The surrounding raw-symbol uses stay raw: the
+`if row.get('symbol') in symbols` membership test at 1579 compares raw against the raw selected
+list, and `symbol_info.setdefault(pos.symbol, ...)` at 5316 is a local grouping keyed
+consistently by the raw symbol.
+
+Out of scope: `overview.py:5775-5796` and `:6098-6111` build their own `symbol_labels` dict
+directly from `Instrument` rows, bypassing `get_labels_by_symbol` and this normalisation
+entirely. Task 76 owns that chart and fixes them there.
 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `venv/bin/python -m pytest tests/test_instrument_labels.py -v`
-Expected: PASS (13 passed — the 8 original tests plus the 5 new ones).
+Expected: PASS (15 passed — the 8 original tests plus the 7 new ones).
 
 Then run the package gates, which must also stay green:
-Run: `venv/bin/python -m pytest packages/common/tests/test_utils_pure.py -v`
+Run: `PYTHONPATH=packages/common:packages/providers:packages/experts venv/bin/python -m pytest packages/common/tests/test_utils_pure.py -v`
 Expected: PASS (the subprocess leak gate proves `normalize_symbol` did not drag models in).
+The `PYTHONPATH` prefix is REQUIRED: that gate shells out with `subprocess.run([sys.executable,
+"-c", ...])`, and the subprocess does not inherit pytest's `pythonpath` ini, so without it the
+child dies with `ModuleNotFoundError: No module named 'ba2_common'` and the gate fails for a
+reason unrelated to the code under test (it fails that way at HEAD too).
+
+There are no `tests/test_overview*.py` files, so Step 3b is covered only by import/compile
+checks: `venv/bin/python -m py_compile ba2_trade_platform/ui/pages/overview.py` plus
+`venv/bin/python -m pytest tests/test_boot_smoke.py tests/test_phase6_golden.py -q`.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add packages/common/ba2_common/core/utils.py packages/common/tests/test_utils_pure.py tests/test_instrument_labels.py
+git add packages/common/ba2_common/core/utils.py packages/common/tests/test_utils_pure.py tests/test_instrument_labels.py ba2_trade_platform/ui/pages/overview.py
 git commit -m "feat(instruments): normalise symbols in the shared label helpers"
 ```
 

@@ -68,6 +68,17 @@ class TestInstrumentLabels:
         assert normalize_symbol(None) == ''
         assert normalize_symbol('   ') == ''
 
+    def test_normalize_symbol_rejects_non_strings(self):
+        from ba2_trade_platform.core.utils import normalize_symbol
+        assert normalize_symbol(123) == ''
+        assert normalize_symbol(False) == ''
+        assert normalize_symbol({'a': 1}) == ''
+
+    def test_add_label_ignores_non_string_symbols(self):
+        """A non-string symbol must never fabricate an Instrument row."""
+        assert add_label_to_instruments([0], 'tech') == 0
+        assert _labels('0') is None
+
     def test_add_label_stores_normalised_symbol(self):
         assert add_label_to_instruments(['  aapl  '], 'tech') == 1
         assert _labels('AAPL') == ['tech']

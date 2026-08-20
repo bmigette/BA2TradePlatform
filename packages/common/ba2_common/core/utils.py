@@ -19,14 +19,23 @@ if TYPE_CHECKING:
 def normalize_symbol(symbol) -> str:
     """Normalise an instrument symbol to its one canonical stored form.
 
-    ``instrument.name`` is UNIQUE, but a unique index does not stop ``aapl`` and
-    ``AAPL`` from coexisting -- uniqueness is only real if every read and write
-    goes through here first. ``None``, blanks and non-strings collapse to ``""``;
-    callers drop empties rather than writing a nameless Instrument.
+    ``instrument.name`` will be UNIQUE once the merge migration lands, but a
+    unique index does not stop ``aapl`` and ``AAPL`` from coexisting --
+    uniqueness is only real if every read and write goes through here first.
+    ``None``, blanks and non-strings collapse to ``""``; callers drop empties
+    rather than writing a nameless Instrument. Non-strings are NOT coerced with
+    ``str()``: that would turn ``0`` into a real ``Instrument(name='0')`` and
+    report success. These helpers take user input from the Settings UI, so a bad
+    symbol is dropped rather than raised on.
     """
-    if symbol is None:
+    if not isinstance(symbol, str):
         return ""
-    return str(symbol).strip().upper()
+    return symbol.strip().upper()
+
+
+def _normalized_symbols(symbols) -> List[str]:
+    """Sorted, de-duplicated normalised symbols, with empties dropped."""
+    return sorted({n for s in symbols if (n := normalize_symbol(s))})
 
 
 def parse_instrument_symbol_list(text) -> List[str]:
@@ -55,7 +64,7 @@ def get_labels_by_symbol(symbols) -> Dict[str, List[str]]:
     omitted, so the caller can default to an empty list.
     """
     from ba2_common.core.models import Instrument
-    syms = sorted({normalize_symbol(s) for s in symbols if normalize_symbol(s)})
+    syms = _normalized_symbols(symbols)
     if not syms:
         return {}
     out: Dict[str, List[str]] = {}
@@ -101,7 +110,7 @@ def add_label_to_instruments(symbols, label: str) -> int:
         return 0
     changed = 0
     with get_db() as session:
-        for sym in sorted({normalize_symbol(s) for s in symbols if normalize_symbol(s)}):
+        for sym in _normalized_symbols(symbols):
             inst = session.exec(select(Instrument).where(Instrument.name == sym)).first()
             if inst is None:
                 session.add(Instrument(name=sym, labels=[label]))
@@ -126,7 +135,7 @@ def remove_label_from_instruments(symbols, label: str) -> int:
         return 0
     changed = 0
     with get_db() as session:
-        for sym in sorted({normalize_symbol(s) for s in symbols if normalize_symbol(s)}):
+        for sym in _normalized_symbols(symbols):
             inst = session.exec(select(Instrument).where(Instrument.name == sym)).first()
             if inst and label in (inst.labels or []):
                 inst.labels = [l for l in inst.labels if l != label]

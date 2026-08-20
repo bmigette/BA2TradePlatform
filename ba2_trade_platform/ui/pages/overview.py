@@ -8,7 +8,7 @@ from ...core.db import get_all_instances, get_db, get_instance, update_instance
 from ...core.models import AccountDefinition, MarketAnalysis, ExpertRecommendation, ExpertInstance, AppSetting, TradingOrder, Transaction
 from ...core.types import MarketAnalysisStatus, OrderRecommendation, OrderStatus, OrderOpenType, OrderType
 from ...core.utils import get_expert_instance_from_id, get_market_analysis_id_from_order_id, get_account_instance_from_id, get_expert_options_for_ui, calculate_transaction_pnl
-from ...core.utils import get_labels_by_symbol, add_label_to_instruments, remove_label_from_instruments, get_all_instrument_labels
+from ...core.utils import get_labels_by_symbol, add_label_to_instruments, remove_label_from_instruments, get_all_instrument_labels, normalize_symbol
 from ...core.TransactionHelper import TransactionHelper
 from ...core.ModelBillingUsage import ModelBillingUsage
 from ...modules.accounts import providers
@@ -1382,7 +1382,7 @@ class AccountOverviewTab:
                 logger.warning(f"Failed to load instrument labels: {e}")
                 labels_by_symbol = {}
             for p in all_positions:
-                lbls = labels_by_symbol.get(p.get('symbol'), [])
+                lbls = labels_by_symbol.get(normalize_symbol(p.get('symbol')), [])
                 p['labels_list'] = lbls               # for chip rendering
                 p['labels'] = ', '.join(lbls)         # for filtering / fallback display
 
@@ -1577,7 +1577,7 @@ class AccountOverviewTab:
                     refreshed = get_labels_by_symbol(symbols)
                     for row in positions_table.rows:
                         if row.get('symbol') in symbols:
-                            lbls = refreshed.get(row.get('symbol'), [])
+                            lbls = refreshed.get(normalize_symbol(row.get('symbol')), [])
                             row['labels_list'] = lbls
                             row['labels'] = ', '.join(lbls)
                     positions_table.selected = []
@@ -5242,7 +5242,7 @@ class AccountGrowthTab:
                     month = dt.strftime('%Y-%m') if hasattr(dt, 'strftime') else str(dt)[:7]
                     monthly_income.setdefault(month, {'pnl': 0.0, 'div': 0.0})['pnl'] += realized
                     mlbl = monthly_by_label.setdefault(month, {})
-                    for lb in (labels_by_symbol.get(sym) or ['Unlabeled']):
+                    for lb in (labels_by_symbol.get(normalize_symbol(sym)) or ['Unlabeled']):
                         mlbl[lb] = mlbl.get(lb, 0.0) + realized
                         labels_set.add(lb)
 
@@ -5256,7 +5256,7 @@ class AccountGrowthTab:
             amount = float(div.get('amount', 0))
             monthly_income.setdefault(month, {'pnl': 0.0, 'div': 0.0})['div'] += amount
             mlbl = monthly_by_label.setdefault(month, {})
-            for lb in (labels_by_symbol.get(div.get('symbol')) or ['Unlabeled']):
+            for lb in (labels_by_symbol.get(normalize_symbol(div.get('symbol'))) or ['Unlabeled']):
                 mlbl[lb] = mlbl.get(lb, 0.0) + amount
                 labels_set.add(lb)
 
@@ -5312,7 +5312,7 @@ class AccountGrowthTab:
             symbol_labels = get_labels_by_symbol([p.symbol for p in all_positions]) or {}
             symbol_info = {}
             for pos in all_positions:
-                lbls = symbol_labels.get(pos.symbol) or ['Unlabeled']
+                lbls = symbol_labels.get(normalize_symbol(pos.symbol)) or ['Unlabeled']
                 si = symbol_info.setdefault(pos.symbol, {'qty': 0.0, 'labels': lbls})
                 si['qty'] += float(getattr(pos, 'qty', 0) or 0)
             pdates = sorted({d for sp in historical_prices.values() for d in sp.keys()})
