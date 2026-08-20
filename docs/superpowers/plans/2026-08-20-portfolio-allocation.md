@@ -6153,6 +6153,27 @@ git commit -m "feat(allocation): precheck re-solve and FIFO income-event consump
 > position — "hold ~3.33 shares" becomes a full exit. Re-key to `target_notional <= 0`. Task 21's
 > negative clamp writes `target_notional = 0.0` as well as the quantity, so a genuinely negative
 > target still liquidates correctly; add a test pinning both directions.
+>
+> **Two defects Task 24 found in `apply_order_impacts` — fold them in here rather than making a
+> third edit to that function later.**
+>
+> 1. **The margin dict is dropped on the precheck re-solve.** It calls `_apply_bp_scaling` with no
+>    `margin=`, so a `fractional=True` row is rebuilt as `MarginInfo(symbol, bp_factor,
+>    fractionable=True)` with `min_order_size=None` and `min_trade_increment=None`. The re-solve then
+>    rounds on the default 4-dp grid and skips the min-order-size filter, so it can emit a quantity
+>    off the broker's increment or below its minimum. This is a broker-side rejection, not an
+>    overspend — the money invariant holds — and it needs a broker with BOTH order preview AND
+>    published fractional metadata, which is plausibly the empty set today (TastyTrade has the
+>    preview, Alpaca the metadata). Latent, but cheap: add
+>    `margin: Optional[Dict[str, MarginInfo]] = None` to `apply_order_impacts` and forward it.
+> 2. **`out.scale_factor` overwrites rather than compounds.** If the first solve scaled to 0.6 and
+>    the precheck forces another 0.5, the returned plan reports `0.5` when the true cumulative factor
+>    against the original target is `0.3`, and affected rows accumulate a second `REASON_SCALED_FMT`.
+>    Multiply into the incoming factor and de-duplicate the reason.
+>
+> Deliberate and NOT to be changed: a favourable precheck lowers `bp_cost` but never re-deploys the
+> freed buying power, because `_apply_bp_scaling` only scales down. Never overspending beats fully
+> deploying. On record so it is a decision rather than an accident.
 
 
 Spec decision 5a. "How much of my portfolio is in this symbol" has two defensible answers, and
