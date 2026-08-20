@@ -49,7 +49,7 @@ def test_instance_factory_funcs_moved_to_live_registry():
 
 
 def test_pure_subset_functions_present():
-    """All 24 pure-subset helpers named in the plan's split list are present."""
+    """Every pure-subset helper named in the plan's split list, plus the symbol helpers."""
     import ba2_common.core.utils as u
     expected = [
         "get_labels_by_symbol", "get_all_instrument_labels",
@@ -66,6 +66,7 @@ def test_pure_subset_functions_present():
         "log_manual_analysis", "parse_fmp_amount_range",
         "calculate_fmp_trade_metrics", "get_setting_safe",
         "get_expert_options_for_ui",
+        "normalize_symbol", "parse_instrument_symbol_list",
     ]
     for name in expected:
         assert callable(getattr(u, name, None)), f"missing pure helper: {name}"

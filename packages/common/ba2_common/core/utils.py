@@ -16,38 +16,80 @@ if TYPE_CHECKING:
     from ba2_common.core.interfaces import MarketExpertInterface
 
 
+def normalize_symbol(symbol) -> str:
+    """Normalise an instrument symbol to its one canonical stored form.
+
+    ``instrument.name`` is UNIQUE, but a unique index does not stop ``aapl`` and
+    ``AAPL`` from coexisting -- uniqueness is only real if every read and write
+    goes through here first. ``None``, blanks and non-strings collapse to ``""``;
+    callers drop empties rather than writing a nameless Instrument.
+    """
+    if symbol is None:
+        return ""
+    return str(symbol).strip().upper()
+
+
+def parse_instrument_symbol_list(text) -> List[str]:
+    """Parse a pasted/uploaded symbol list (one per line) into stored symbols.
+
+    Blank lines are dropped, every symbol is normalised, and duplicates are
+    removed while preserving first-seen order -- so one import file can never
+    ask for two rows of the same instrument.
+    """
+    if not text:
+        return []
+    out: List[str] = []
+    for line in str(text).splitlines():
+        symbol = normalize_symbol(line)
+        if symbol and symbol not in out:
+            out.append(symbol)
+    return out
+
+
 def get_labels_by_symbol(symbols) -> Dict[str, List[str]]:
     """Return ``{symbol: [labels]}`` for symbols that have an Instrument row.
 
-    Symbols without an Instrument (or with no labels) are simply omitted, so the
-    caller can default to an empty list.
+    Both the lookup and the returned keys are normalised (.strip().upper()), so
+    ``get_labels_by_symbol(['aapl'])`` finds the ``AAPL`` row and returns it under
+    ``'AAPL'``. Symbols without an Instrument (or with no labels) are simply
+    omitted, so the caller can default to an empty list.
     """
     from ba2_common.core.models import Instrument
-    syms = [s for s in {s for s in symbols} if s]
+    syms = sorted({normalize_symbol(s) for s in symbols if normalize_symbol(s)})
     if not syms:
         return {}
     out: Dict[str, List[str]] = {}
     with get_db() as session:
         rows = session.exec(select(Instrument).where(Instrument.name.in_(syms))).all()
         for inst in rows:
-            out[inst.name] = list(inst.labels or [])
+            out[normalize_symbol(inst.name)] = list(inst.labels or [])
     return out
 
 
 def get_all_instrument_labels() -> List[str]:
-    """Return the sorted, de-duplicated set of all labels in use across instruments."""
+    """Return the sorted, de-duplicated set of all labels in use across instruments.
+
+    Labels are stripped and blanks dropped, so a legacy row holding ``' tech '``
+    and a new one holding ``'tech'`` collapse to a single entry.
+    """
     from ba2_common.core.models import Instrument
     labels = set()
     with get_db() as session:
         for inst in session.exec(select(Instrument)).all():
             for lbl in (inst.labels or []):
-                labels.add(lbl)
+                cleaned = (lbl or "").strip()
+                if cleaned:
+                    labels.add(cleaned)
     return sorted(labels)
 
 
 def add_label_to_instruments(symbols, label: str) -> int:
     """Add ``label`` to each symbol's Instrument, creating a minimal Instrument row
     when one doesn't exist. No-op for a blank label or a label already present.
+
+    Symbols are normalised (.strip().upper()) before the lookup AND the insert, so
+    ``['aapl']`` updates the existing ``AAPL`` row instead of creating a second one
+    that the unique index would reject.
 
     The labels list is REASSIGNED (not mutated in place) so SQLAlchemy reliably
     detects the change on the JSON column. Returns the number of instruments
@@ -59,7 +101,7 @@ def add_label_to_instruments(symbols, label: str) -> int:
         return 0
     changed = 0
     with get_db() as session:
-        for sym in {s for s in symbols if s}:
+        for sym in sorted({normalize_symbol(s) for s in symbols if normalize_symbol(s)}):
             inst = session.exec(select(Instrument).where(Instrument.name == sym)).first()
             if inst is None:
                 session.add(Instrument(name=sym, labels=[label]))
@@ -75,15 +117,16 @@ def add_label_to_instruments(symbols, label: str) -> int:
 
 def remove_label_from_instruments(symbols, label: str) -> int:
     """Remove ``label`` from each symbol's Instrument (if present). Returns the
-    number of instruments updated. The labels list is reassigned for change
-    detection on the JSON column."""
+    number of instruments updated. Symbols are normalised (.strip().upper()) before
+    the lookup, and the labels list is reassigned for change detection on the JSON
+    column."""
     from ba2_common.core.models import Instrument
     label = (label or "").strip()
     if not label:
         return 0
     changed = 0
     with get_db() as session:
-        for sym in {s for s in symbols if s}:
+        for sym in sorted({normalize_symbol(s) for s in symbols if normalize_symbol(s)}):
             inst = session.exec(select(Instrument).where(Instrument.name == sym)).first()
             if inst and label in (inst.labels or []):
                 inst.labels = [l for l in inst.labels if l != label]
