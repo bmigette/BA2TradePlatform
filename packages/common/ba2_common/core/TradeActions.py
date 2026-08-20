@@ -1702,31 +1702,26 @@ class DecreaseInstrumentShareAction(TradeAction):
             else:
                 side = "BUY"   # Cover short position
             
-            # Create market order
-            order = self.create_order_record(
+            # Create market order. create_order_record() ALREADY persists the row and
+            # returns its integer id (see SellAction, which uses it correctly) -- the old
+            # code fed that int back into add_instance(), raising UnmappedInstanceError
+            # ("Class 'builtins.int' is not mapped") on every single invocation. Same
+            # defect as IncreaseInstrumentShareAction, but this path needs no
+            # buying-power read to reach it, so it was broken on EVERY broker.
+            order_id = self.create_order_record(
                 side=side,
                 quantity=reduction_qty,
                 order_type="market"
             )
-            
-            if not order:
+
+            if not order_id:
                 return self.create_and_save_action_result(
                     action_type=ExpertActionType.DECREASE_INSTRUMENT_SHARE.value,
                     success=False,
                     message="Failed to create order record",
                     data={}
                 )
-            
-            # Save order to database
-            order_id = add_instance(order)
-            if not order_id:
-                return self.create_and_save_action_result(
-                    action_type=ExpertActionType.DECREASE_INSTRUMENT_SHARE.value,
-                    success=False,
-                    message="Failed to save order to database",
-                    data={}
-                )
-            
+
             logger.info(f"Created decrease share order {order_id}: {side} {reduction_qty} {self.instrument_name}")
             
             return self.create_and_save_action_result(
