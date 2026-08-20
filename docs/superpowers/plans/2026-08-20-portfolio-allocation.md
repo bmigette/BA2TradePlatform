@@ -1569,6 +1569,17 @@ git commit -m "feat(db): migration merging duplicate instruments and adding ix_i
 
 ### Task 6: `unique=True` on `Instrument.name`
 
+> **Guard the empty name before the index lands.** `normalize_symbol` returns `""` for blank or
+> non-string input by design (it must not raise on Settings-UI input), and the add/edit dialog in
+> `ba2_trade_platform/ui/pages/settings.py` (~`:471` edit branch, ~`:481` create branch) has no
+> emptiness check — so a whitespace-only entry writes `Instrument(name='')`. With the unique index
+> in place the FIRST such row is accepted and the SECOND raises `IntegrityError`, which surfaces as
+> an unhandled exception in the UI. Add a guard in the dialog that rejects an empty normalised name
+> with `ui.notify(..., type='negative')` and leaves the dialog open. Do NOT use `type='error'` —
+> that is invalid, and the two existing uses at `settings.py:1023` and `:1041` are a known bug you
+> are not fixing here.
+
+
 The migration gives an existing database the index; this makes the ORM (and `init_db()`'s
 `create_all` on a fresh database) agree with it.
 
