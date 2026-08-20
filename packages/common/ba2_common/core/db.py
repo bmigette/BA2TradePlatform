@@ -356,17 +356,159 @@ def _inmem_route(instance_or_model) -> bool:
     return _ts.is_inmem_model(model)
 
 
+# --- genesis stamp: a schema create_all() just built IS the alembic baseline ------
+#
+# The migration chain was authored against databases SQLModel had ALREADY created
+# (46 revisions, 9 create_table calls, 21 of the 28 tables in SQLModel.metadata
+# created by no revision at all), so it cannot be replayed from an empty database.
+# create_all() is therefore the genesis path -- and a database it has just built is
+# already AT head. Unless it says so in alembic_version, `migrate.py upgrade` walks
+# the whole chain from base and dies on the first duplicate column, which is why no
+# fresh install has ever been able to run a migration.
+#
+# Everything below is best-effort and imported lazily. alembic is a dev/ops tool,
+# not a runtime dependency of this package (the test platform imports ba2_common
+# without needing it), db.py is deliberately import-light, and a failed stamp must
+# never stop the app from starting -- so every failure path logs and returns.
+
+_UNRESOLVED = object()
+_alembic_head_script = _UNRESOLVED   # memoized (ScriptDirectory, head) | None
+
+
+def _find_alembic_dir():
+    """Locate the repo's ``alembic/`` migration-scripts directory, or None.
+
+    Looks for an ``alembic.ini`` sitting next to an ``alembic/versions/`` directory,
+    walking up from this file (repo root is 5 levels above
+    ``packages/common/ba2_common/core/db.py``) and then from the cwd. Returns None
+    when this package is installed without the repo around it: there is then no
+    chain to stamp against and we do nothing.
+    """
+    import pathlib
+    here = pathlib.Path(__file__).resolve()
+    cwd = pathlib.Path.cwd().resolve()
+    # Bounded walks -- an unbounded climb to "/" could match some unrelated project.
+    bases = list(here.parents)[:6] + [cwd] + list(cwd.parents)[:3]
+    for base in bases:
+        if (base / "alembic.ini").is_file() and (base / "alembic" / "versions").is_dir():
+            return str(base / "alembic")
+    return None
+
+
+def _resolve_alembic_head():
+    """``(ScriptDirectory, head_revision)`` for the migration chain, or None.
+
+    The head is READ from the revision scripts, never hardcoded. Returns None -- and
+    stamps nothing -- if alembic is unavailable, the scripts are not there, or the
+    history has branched into several heads (guessing which one a fresh schema
+    corresponds to is exactly the kind of wrong-by-default this fixes).
+
+    Memoized (successes AND failures) because scanning versions/ is not free and
+    init_db() runs once per backtest run.
+    """
+    global _alembic_head_script
+    if _alembic_head_script is not _UNRESOLVED:
+        return _alembic_head_script
+    _alembic_head_script = None
+    try:
+        from alembic.config import Config
+        from alembic.script import ScriptDirectory
+    except Exception as e:  # noqa: BLE001 -- alembic is optional at runtime
+        logger.warning(f"alembic is not available ({e}); a new database will not be stamped")
+        return None
+    script_location = _find_alembic_dir()
+    if script_location is None:
+        logger.debug("no alembic/ migration directory found; a new database will not be stamped")
+        return None
+    try:
+        # A BARE Config carrying only script_location: reading alembic.ini would apply
+        # its prepend_sys_path (mutating sys.path in the live process), and running
+        # env.py would import the whole live platform and re-point the engine.
+        cfg = Config()
+        cfg.set_main_option("script_location", script_location)
+        script = ScriptDirectory.from_config(cfg)
+        heads = script.get_heads()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"could not read alembic revisions in {script_location}: {e}")
+        return None
+    if len(heads) != 1:
+        logger.warning(
+            f"alembic history has {len(heads)} heads {heads}; refusing to guess -- "
+            "the new database is left unstamped (run `python migrate.py stamp <rev>`)"
+        )
+        return None
+    _alembic_head_script = (script, heads[0])
+    return _alembic_head_script
+
+
+def _schema_is_absent(engine) -> bool:
+    """True iff ``engine``'s database currently holds NO tables -- a brand-new file.
+
+    Deliberately strict, and deliberately called BEFORE create_all(). A database that
+    has tables but no ``alembic_version`` row is NOT a fresh install: it is the
+    known-broken existing state, and stamping it to head would silently skip real
+    pending migrations. In-memory databases are excluded too -- they are throwaway
+    backtest DBs that are never migrated. On any error the answer is "not fresh":
+    never stamp on doubt.
+    """
+    try:
+        if engine.url.database in (None, "", ":memory:"):
+            return False
+        from sqlalchemy import inspect as sa_inspect
+        tables = [t for t in sa_inspect(engine).get_table_names()
+                  if not t.startswith("sqlite_")]
+        return not tables
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"could not inspect the database before create_all ({e}); "
+                       "treating it as an existing install and not stamping")
+        return False
+
+
+def _stamp_alembic_head(engine) -> None:
+    """Write the migration chain's head into ``alembic_version`` on a just-created
+    schema. Only ever called when ``_schema_is_absent()`` was true before create_all.
+    Never raises."""
+    resolved = _resolve_alembic_head()
+    if resolved is None:
+        return
+    script, head = resolved
+    try:
+        from alembic.runtime.migration import MigrationContext
+        with engine.begin() as connection:
+            context = MigrationContext.configure(connection)
+            existing = context.get_current_heads()
+            if existing:
+                # Someone (a concurrent process, or a pre-stamped file) got there first.
+                logger.debug(f"alembic_version already holds {existing}; not stamping")
+                return
+            context.stamp(script, head)
+        logger.info(f"New database: schema created by SQLModel and stamped at alembic "
+                    f"head {head} (migrations are up to date)")
+    except Exception as e:
+        logger.warning(f"could not stamp the new database at alembic head {head}: {e}",
+                       exc_info=True)
+
+
 def init_db():
     """
     Import models and create all database tables if they do not exist.
     Ensures the database directory exists before table creation.
+
+    When the database turns out to be brand new -- i.e. create_all() is what creates
+    the schema -- ``alembic_version`` is stamped at head, because that schema IS the
+    head schema. Existing databases are never touched.
     """
     logger.debug("Importing models for table creation")
     from ba2_common.core import models  # Import the models module to register all models
     logger.debug("Models imported successfully")
     # get_engine() lazily creates the engine (and the DB directory) on first use
-    SQLModel.metadata.create_all(get_engine())
+    engine = get_engine()
+    # Must be observed BEFORE create_all -- afterwards every database looks populated.
+    fresh_install = _schema_is_absent(engine)
+    SQLModel.metadata.create_all(engine)
     logger.info("Database initialized with WAL mode enabled")
+    if fresh_install:
+        _stamp_alembic_head(engine)
 
     # Start activity log worker thread
     _start_activity_log_worker()
