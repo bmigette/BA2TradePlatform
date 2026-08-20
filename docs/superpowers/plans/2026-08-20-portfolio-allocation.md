@@ -7946,6 +7946,17 @@ git commit -m "feat(alpaca): get_account_snapshot() from the pydantic TradeAccou
 
 ### Task 32: `AlpacaAccount.get_symbol_margin_info()` — one `get_asset()` per symbol, cached
 
+> **Alpaca publishes a MAINTENANCE requirement, not an initial rate.** `Asset` exposes
+> `maintenance_margin_requirement`; the contract wants
+> `bp_factor = initial_margin_rate × account_multiplier`. Do not silently substitute the maintenance
+> number. Derive the initial rate explicitly and document it: Reg-T is `marginable → 0.5`, otherwise
+> `1.0`, which is what makes the docstring's worked examples come out at 1.0 and 2.0 in a 2:1 account.
+>
+> **`bp_factor` is required and has no default**, so a symbol you can only partially describe must be
+> OMITTED from the returned dict rather than given a guessed factor. The `{}`-means-fall-back-to-the-
+> account-multiplier contract is only conservative if overrides honour omission.
+
+
 **Alpaca has no bulk asset endpoint.** `TradingClient.get_asset(symbol_or_asset_id)`
 (alpaca/trading/client.py:399) takes exactly one symbol, so a 40-symbol basket costs
 40 HTTP calls. That is why the result is cached on the instance for its whole
@@ -8213,6 +8224,18 @@ git commit -m "feat(alpaca): get_symbol_margin_info() from Asset metadata, cache
 ---
 
 ### Task 33: `AlpacaAccount.get_cash_transfers()` from the CSD/CSW activities + dividends
+
+> **`external_id` is the highest-risk detail in this task.** The existing inline CSD/CSW code at
+> `AlpacaAccount.py:4375-4381` reads only `act.get('date')` and `act.get('net_amount')` — it never
+> touches the activity id. `CashTransfer.external_id` MUST carry `act['id']`, because the income
+> ledger upserts on `(account_id, external_id)` and that key is the only thing making a re-sync
+> idempotent. Get this wrong and every refresh duplicates the ledger.
+>
+> **Dividends and cash transfers are two id spaces.** This override composes the CSD/CSW activities
+> *and* `get_dividends()`. Confirm the dividend records carry a stable broker id that cannot collide
+> with a CSD/CSW id — if they can, namespace the `external_id` (e.g. prefix by source) rather than
+> hoping. A collision silently drops one of the two events.
+
 
 Before writing this, **read** `AlpacaAccount.get_balance_history` (`:4354`, whose
 CSD/CSW loop is inline at `:4376-4382`) and `AlpacaAccount.get_dividends` (`:4283`).
