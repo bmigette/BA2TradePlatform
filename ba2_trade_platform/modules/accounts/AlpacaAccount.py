@@ -23,9 +23,10 @@ from ...core.interfaces.OptionsAccountInterface import OptionsAccountInterface
 from ...core.db import get_db, get_instance, update_instance, add_instance
 from sqlmodel import Session, select
 
-# Namespace of the SYNTHETIC external_id get_cash_transfers() mints for dividends,
-# whose broker activity id get_dividends() drops. Keeps the dividend key space
-# disjoint from the verbatim CSD/CSW broker ids sharing the same upsert column.
+# Namespace of the external_id get_cash_transfers() mints for dividends, whether
+# from the broker's own DIV activity id or from the symbol/date fallback. Keeps the
+# dividend key space disjoint from the verbatim CSD/CSW broker ids that share the
+# same upsert column.
 _DIVIDEND_KEY_PREFIX = "DIV:"
 
 
@@ -1853,12 +1854,16 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         through _fetch_activities().
 
         external_id is the (account_id, external_id) idempotency key of
-        portfolio_income_event, so it must be stable across re-syncs. CSD/CSW
-        activities carry the broker's own id and it is passed through verbatim;
-        get_dividends() deliberately drops it (it nets DIVNRA tax withholding
-        into the amount, which is the number we want), so dividends get the
-        stable synthetic key DIV:<symbol>:<YYYY-MM-DD> -- unique per payer per
-        pay date, and namespaced so it cannot be mistaken for a broker id.
+        portfolio_income_event, so it must be stable across re-syncs AND unique
+        per event. CSD/CSW activities carry the broker's own id and it is passed
+        through verbatim. Dividends carry one too -- Alpaca stamps an id on every
+        non-trade activity -- so they are keyed DIV:<activity id>, namespaced so
+        a dividend key can never be mistaken for, or collide with, a CSD/CSW id.
+        Only when an activity arrives with no id does the synthetic
+        DIV:<symbol>:<YYYY-MM-DD> fallback apply; that form cannot separate two
+        DIV activities for one payer on one pay date (a special dividend
+        alongside the regular one, a correction) and would upsert them into a
+        single ledger row.
 
         event_date is the ACTIVITY date, not the T+1 settled date that
         get_balance_history shifts to. That shift exists to line a transfer up
@@ -1930,18 +1935,27 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 continue
             symbol = div.get('symbol')
             if not symbol:
-                # DIV:None:<date> would be a fabricated identity, and external_id
-                # is an upsert key -- drop it loudly rather than key on a guess.
+                # Dropped even when the broker id below could key it: a dividend that
+                # names no payer cannot be attributed to an instrument, and the
+                # fallback key DIV:None:<date> would be a fabricated identity on an
+                # UPSERT column. Loud, never guessed.
                 logger.warning(f"[Account {self.id}] Skipping dividend with no payer "
-                               f"symbol (no stable external_id): {div}")
+                               f"symbol: {div}")
                 continue
             amount = self._safe_float(div.get('amount'))
             if amount is None:
                 logger.warning(f"[Account {self.id}] Skipping dividend with no usable "
                                f"amount: {div}")
                 continue
+            # Prefer the broker's own DIV activity id -- it is the only thing that
+            # separates two dividends from one payer on one pay date. The
+            # symbol/date form stays as the fallback for an activity that somehow
+            # arrives without one.
+            div_id = div.get('id')
+            external_id = (f"{_DIVIDEND_KEY_PREFIX}{div_id}" if div_id
+                           else f"{_DIVIDEND_KEY_PREFIX}{symbol}:{event_date.isoformat()}")
             transfers.append(CashTransfer(
-                external_id=f"{_DIVIDEND_KEY_PREFIX}{symbol}:{event_date.isoformat()}",
+                external_id=external_id,
                 event_date=event_date,
                 event_type=CASH_TRANSFER_DIVIDEND,
                 amount=amount,
@@ -4782,6 +4796,13 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
 
                 gross = float(activity.get('net_amount', 0) or 0)
                 div_record = {
+                    # Alpaca stamps an id on every non-trade activity. It is the only
+                    # thing that tells two DIV activities for one payer on one date
+                    # apart (a special dividend alongside the regular one, a
+                    # correction), so get_cash_transfers() keys the income ledger on
+                    # it. Netting DIVNRA withholding into `amount` below is a separate
+                    # concern and does not make the id any less the broker's.
+                    'id': activity.get('id'),
                     'symbol': act_symbol,
                     'amount': round(gross - tax_withheld, 2),   # NET dividend (income kept)
                     'gross_amount': gross,

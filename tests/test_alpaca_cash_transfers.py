@@ -93,7 +93,17 @@ def test_a_reversed_deposit_keeps_its_negative_sign_and_is_not_income():
     assert ev.is_income is False
 
 
-def test_a_dividend_carries_its_payer_symbol_and_a_stable_external_id():
+def test_a_dividend_is_keyed_by_the_broker_activity_id_when_there_is_one():
+    """CONTRACT: the key is DIV:<broker activity id>, not DIV:<symbol>:<date>.
+
+    This test previously asserted "DIV:AAPL:2026-08-10". Alpaca supplies an ``id``
+    on every non-trade activity; get_dividends() simply never copied it into
+    div_record, and netting DIVNRA withholding into the AMOUNT says nothing about
+    the DIV activity's own id. Keying on symbol+date collapsed two DIV activities
+    for one payer on one date -- a special dividend paid alongside the regular
+    one, or a correction -- into a single ledger row, because external_id is the
+    (account_id, external_id) UPSERT key.
+    """
     acct = _bare_account({"DIV": [{"id": "act-3", "symbol": "AAPL",
                                    "date": "2026-08-10", "net_amount": "12.34"}]})
 
@@ -102,8 +112,58 @@ def test_a_dividend_carries_its_payer_symbol_and_a_stable_external_id():
     assert ev.symbol == "AAPL"
     assert ev.amount == 12.34
     assert ev.event_date == date(2026, 8, 10)
-    assert ev.external_id == "DIV:AAPL:2026-08-10"
+    assert ev.external_id == "DIV:act-3"
     assert ev.is_income is True
+
+
+def test_two_dividends_from_one_payer_on_one_date_stay_two_ledger_rows():
+    """The whole point of I1. A special dividend alongside the regular one, or a
+    correction, shares symbol AND pay date; under the old symbol/date key the two
+    upserted onto each other and one payment vanished from the ledger."""
+    acct = _bare_account({"DIV": [
+        {"id": "act-3", "symbol": "AAPL", "date": "2026-08-10", "net_amount": "12.34"},
+        {"id": "act-4", "symbol": "AAPL", "date": "2026-08-10", "net_amount": "500.00"},
+    ]})
+
+    transfers = acct.get_cash_transfers()
+
+    assert len(transfers) == 2
+    assert {t.external_id for t in transfers} == {"DIV:act-3", "DIV:act-4"}
+    assert sorted(t.amount for t in transfers) == [12.34, 500.0]
+
+
+def test_a_dividend_with_no_broker_id_falls_back_to_the_symbol_and_date_key():
+    """The synthetic key is the FALLBACK now, not the only option -- still stable,
+    still namespaced so it cannot be mistaken for a broker id."""
+    acct = _bare_account({"DIV": [{"symbol": "AAPL", "date": "2026-08-10",
+                                   "net_amount": "12.34"}]})
+
+    ev = _by_type(acct.get_cash_transfers())[CASH_TRANSFER_DIVIDEND]
+
+    assert ev.external_id == "DIV:AAPL:2026-08-10"
+
+
+def test_the_nra_netting_does_not_cost_the_dividend_its_broker_id():
+    """The old rationale for dropping the id was that get_dividends() nets DIVNRA
+    withholding into the amount. Netting the amount and carrying the id are
+    independent -- pin that they now coexist."""
+    acct = _bare_account({
+        "DIV": [{"id": "act-3", "symbol": "AAPL", "date": "2026-08-10", "net_amount": "100.00"}],
+        "DIVNRA": [{"symbol": "AAPL", "date": "2026-08-10", "net_amount": "-15.00"}],
+    })
+
+    ev = _by_type(acct.get_cash_transfers())[CASH_TRANSFER_DIVIDEND]
+
+    assert ev.amount == 85.0
+    assert ev.external_id == "DIV:act-3"
+
+
+def test_get_dividends_exposes_the_broker_activity_id():
+    """The seam I1 actually widened: div_record now carries 'id'."""
+    acct = _bare_account({"DIV": [{"id": "act-3", "symbol": "AAPL",
+                                   "date": "2026-08-10", "net_amount": "12.34"}]})
+
+    assert acct.get_dividends()[0]["id"] == "act-3"
 
 
 def test_a_dividend_amount_is_net_of_the_nra_tax_withholding():
@@ -115,8 +175,14 @@ def test_a_dividend_amount_is_net_of_the_nra_tax_withholding():
     assert _by_type(acct.get_cash_transfers())[CASH_TRANSFER_DIVIDEND].amount == 85.0
 
 
-def test_a_dividend_without_a_payer_symbol_is_skipped_rather_than_keyed_on_none():
-    """DIV:None:<date> is a fabricated identity; the ledger key must be real."""
+def test_a_dividend_without_a_payer_symbol_is_still_skipped():
+    """Unchanged behaviour, but the reason narrowed.
+
+    It used to be "DIV:None:<date> is a fabricated identity". Now that the broker
+    id keys the row, the identity would be real -- and the row is STILL dropped,
+    because a dividend that names no payer cannot be attributed to an instrument
+    and the income ledger is per-symbol. Loud (a warning), never guessed.
+    """
     acct = _bare_account({"DIV": [{"id": "act-3", "symbol": None,
                                    "date": "2026-08-10", "net_amount": "12.34"}]})
 
@@ -136,11 +202,11 @@ def test_all_three_activity_kinds_come_back_from_one_call():
 def test_a_dividend_id_can_never_collide_with_a_cash_transfer_id():
     """Two id spaces: CSD/CSW carry the broker's own id, dividends a DIV: key.
 
-    Worst case -- the broker hands the DIV activity the very id we would have
-    synthesised -- the two events must still be distinct ledger rows.
+    Worst case -- the broker hands a CSD the very id a dividend would produce --
+    the two events must still be distinct ledger rows.
     """
     acct = _bare_account({
-        "CSD": [{"id": "DIV:AAPL:2026-08-10", "date": "2026-08-10", "net_amount": "1000"}],
+        "CSD": [{"id": "DIV:act-3", "date": "2026-08-10", "net_amount": "1000"}],
         "DIV": [{"id": "act-3", "symbol": "AAPL", "date": "2026-08-10", "net_amount": "12.34"}],
     })
 
@@ -162,7 +228,7 @@ def test_resyncing_the_same_window_yields_the_same_external_ids():
     first = [t.external_id for t in acct.get_cash_transfers()]
     second = [t.external_id for t in acct.get_cash_transfers()]
 
-    assert first == second == ["act-1", "act-2", "DIV:AAPL:2026-08-10"]
+    assert first == second == ["act-1", "act-2", "DIV:act-3"]
 
 
 def test_the_date_window_is_passed_to_the_broker_as_after_and_until():
