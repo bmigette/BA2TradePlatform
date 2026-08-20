@@ -366,7 +366,7 @@ class DistributedEvaluator:
             self._worker_epochs[w["name"]] = self._worker_epochs.get(w["name"], 0) + 1
         return not already_down
 
-    def _shed_remote_slot(self, worker_name: str, gov, why: str) -> bool:
+    def _shed_remote_slot(self, worker_name: str, gov, why: str, worker: dict = None) -> bool:
         """Drop ONE dispatch slot for *worker_name*. Returns True if anything changed.
 
         One at a time, deliberately. Halving was tried first and is wrong: it overshoots (a box a
@@ -380,6 +380,21 @@ class DistributedEvaluator:
             return False
         self.log(f"[{worker_name}] dispatch slots {before} -> {gov.current} ({why}); "
                  f"in-flight trials finish normally, full concurrency returns at the next job")
+        # AND SHRINK THE POOL TO MATCH. Cutting concurrency alone does not reclaim anything:
+        # ProcessPoolExecutor spreads work over every child, so all N children end up holding
+        # a working set however few run at once. Measured on the small cap band (2026-08-20):
+        # dispatch walked 6 -> 2 while six children stayed at ~9 GB and the box never left
+        # 5-6% free. Resizing the pool is the only operation that returns a child to the OS.
+        if worker is not None:
+            try:
+                out = worker_client.resize_pool(worker, gov.current, force=True)
+                if out.get("changed"):
+                    worker["capacity"] = max(1, int(out.get("capacity") or gov.current))
+                    self.log(f"[{worker_name}] pool shrunk to {worker['capacity']} child(ren) "
+                             f"-- resident memory released")
+            except Exception as e:  # noqa: BLE001 -- an older worker has no /pool/resize;
+                # the concurrency cut above still stands, which is the pre-existing behaviour.
+                self.log(f"[{worker_name}] pool shrink to {gov.current} unavailable ({e})")
         return True
 
     def _remote_memory_watchdog(self) -> None:
@@ -408,7 +423,8 @@ class DistributedEvaluator:
                         self._shed_remote_slot(
                             name, gov,
                             f"{free_pct:.1f}% free < {_REMOTE_MEM_FLOOR_PCT:.0f}% floor "
-                            f"({mem.get('free_mb')} MB of {mem.get('total_mb')} MB)")
+                            f"({mem.get('free_mb')} MB of {mem.get('total_mb')} MB)",
+                            worker=w)
                 except Exception as e:  # noqa: BLE001 -- a poll failure must never stop the loop
                     self.log(f"[{name}] memory poll failed: {e!r}")
 

@@ -636,11 +636,19 @@ def pool_resize(body: dict, authorization: str = Header(default=None)):
         return {"ok": True, "capacity": _CAPACITY, "changed": False,
                 "reason": "already at that size"}
     busy = _busy_job_count()
-    if busy:
+    if busy and not bool(body.get("force")):
         logger.warning("refusing pool resize %d -> %d: %d trial(s) in flight",
                        _CAPACITY, want, busy)
         return {"ok": False, "capacity": _CAPACITY, "changed": False,
                 "reason": f"{busy} trial(s) in flight"}
+    if busy:
+        # FORCED, and only the memory governor does this. Rebuilding cancels the in-flight
+        # trials; the master requeues them (they say nothing about the genome) and that is
+        # far cheaper than the measured alternative -- a box pinned at 5% free for the rest
+        # of the job because concurrency shedding cannot evict a resident pool child.
+        logger.warning("FORCED pool resize %d -> %d with %d trial(s) in flight "
+                       "(memory pressure); those trials are cancelled and will be requeued",
+                       _CAPACITY, want, busy)
     was = _CAPACITY
     _CAPACITY = want
     logger.warning("resizing trial pool %d -> %d slots (per-job sizing from the master)",
