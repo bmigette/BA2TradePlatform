@@ -22,9 +22,9 @@ N% of equity" implementation and it has **never worked on Alpaca** — it calls
 ## Goal
 
 A `Portfolio Allocation` page for accounts flagged as manually traded. It shows
-the account's current allocation by purchase value, grouped by the labels you
-choose to manage, and runs a wizard that turns target percentages into reviewed
-broker orders.
+the account's current allocation — by purchase value or by market value, your
+choice — grouped by the labels you choose to manage, and runs a wizard that turns
+target percentages into reviewed broker orders.
 
 ## Non-goals
 
@@ -39,11 +39,12 @@ implementation.
 
 | # | Decision |
 |---|---|
-| 1 | Allocatable base = broker `buying_power` **+** cost basis of positions carrying a managed label. |
-| 2 | Targets are **notional** (purchase value). Buying power is a feasibility constraint, not the unit of allocation. |
+| 1 | Allocatable base = broker `buying_power` **+** the current value of positions carrying a managed label, where "current value" follows the valuation mode. |
+| 2 | Targets are **notional**. Buying power is a feasibility constraint, not the unit of allocation. |
 | 3 | Managed label percentages must total exactly 100%. Submit is blocked otherwise. |
 | 4 | Symbol weights are percentages **within** their label, defaulting to even, and are persisted. |
-| 5 | The default view shows current allocation by **cost basis**, with two columns: `% of label` and `% of total`. |
+| 5 | The default view shows current allocation with two columns, `% of label` and `% of total`, measured per the valuation mode. |
+| 5a | **Valuation mode** is a per-account toggle, `cost` (purchase value) or `market` (`qty × price`), defaulting to `cost`. It selects what "current value" means everywhere: the base, the displayed percentages, and every delta. |
 | 6 | Only symbols carrying a managed label are listed. Unmanaged positions are invisible; they reduce `buying_power` naturally. |
 | 7 | A symbol in more than one managed label gets a ⚠ and a tooltip. Targets **sum**. No enforcement. |
 | 8 | The page refuses to run when the account has any enabled expert. |
@@ -56,6 +57,7 @@ implementation.
 | 15 | Broker precheck replaces the two-pass estimate wherever it is available. |
 | 16 | TastyTrade gets the full trading surface, unit-tested against a mocked SDK. Live verification is the user's. |
 | 17 | `Instrument.name` becomes unique. Duplicate rows are merged by a data migration, and symbol writes are normalised in the shared helpers. |
+| 18 | The label selection on the Overview account-growth chart persists in `app.storage.user`. Session storage, not the database. |
 
 ## Architecture
 
@@ -66,7 +68,7 @@ Per CLAUDE.md, shared and pure code belongs in the sibling packages; the in-tree
 
 **`packages/common/ba2_common/` (REAL — the source of truth):**
 
-- `core/models.py` — four new tables (below), plus `unique=True` on
+- `core/models.py` — five new tables (below), plus `unique=True` on
   `Instrument.name`.
 - `core/portfolio_allocation.py` — **new**, the allocation engine. Pure, IO-free,
   unit-tested without a DB or a broker.
@@ -95,6 +97,7 @@ returns plain data, so the whole of the maths is testable in isolation:
 ```python
 def compute_allocation(
     base_notional: float,
+    valuation_mode: str,                # 'cost' | 'market'
     available_buying_power: float,
     labels: list[LabelTarget],          # label, target_pct, symbols[SymbolTarget]
     current: dict[str, PositionState],  # symbol -> qty, cost_basis, price
@@ -121,6 +124,24 @@ the plan records the scale factor. Sells never scale.
 **Rounding.** With fractional off, `qty = floor(target_notional / price)`. With
 fractional on, quantity is rounded to the broker's `min_trade_increment` where
 one is known, otherwise to 4 decimal places.
+
+**Valuation mode.** A position's price moves after you buy it, so "how much of
+my portfolio is in this symbol" has two defensible answers. `compute_allocation`
+takes a `valuation_mode` of `cost` or `market` and derives each symbol's current
+value as `cost_basis` or `qty × price` accordingly. `PositionState` already
+carries `qty`, `cost_basis` and `price`, so no extra broker data is needed.
+
+The mode is not cosmetic — it selects the meaning of "current value" in three
+places at once, and they must never disagree:
+
+1. the allocatable base, `buying_power + Σ current value of managed positions`;
+2. the `% of label` and `% of total` columns in the default view;
+3. every `delta = target_notional − current value`.
+
+In `market` mode a position that has doubled reads as over-weight and gets
+trimmed; in `cost` mode it reads at its purchase weight and is left alone. The
+page states which mode produced the numbers on screen, and switching modes
+re-computes rather than silently reinterpreting.
 
 **Degenerate inputs.** A managed label with no symbols cannot absorb its
 percentage; the engine allocates it nothing and records an
@@ -182,13 +203,18 @@ be indefensible.
 
 ### Data model
 
-Four tables in `packages/common/ba2_common/core/models.py`, following the
+Five tables in `packages/common/ba2_common/core/models.py`, following the
 `OptionActivity` conventions verified there: explicit snake_case `__tablename__`,
 inline `foreign_key=... ondelete="CASCADE" index=True`, `DateTime.now(timezone.utc)`
 default factories, uniqueness via `__table_args__`, and **plain `str` columns
 rather than enums** (matching `OptionActivity.activity_type`, and avoiding the
 SQLModel str-enum-stored-by-name migration trap).
 
+- **`portfolio_allocation_config`** — `account_id` (unique), `valuation_mode`
+  (`cost` | `market`), `allow_fractional`, `updated_at`. One row per account,
+  created on first use with the defaults `cost` and `False`. This is page state
+  that changes money, so it belongs in a table rather than in session storage or
+  in the broker's settings.
 - **`portfolio_allocation_label`** — `account_id`, `label`, `target_pct`,
   `sort_order`, `comment`. Unique on `(account_id, label)`. A row's existence *is*
   the "managed" flag, so the label selection needs no separate table.
@@ -206,7 +232,7 @@ SQLModel str-enum-stored-by-name migration trap).
   weights change, and `submitted_buy_value` is what drives income consumption.
 
 Two hand-written Alembic revisions, chained off `0a3e0bd24598` (the verified
-head): first the instrument merge and unique index, then the four new tables.
+head): first the instrument merge and unique index, then the five new tables.
 Keeping them separate means the destructive data migration can be run, inspected
 and if necessary re-run on its own, without the schema additions riding along.
 `alembic/env.py` needs no change — its import of the
@@ -247,7 +273,8 @@ edits persist eagerly rather than on a Save button.
 ### Default view
 
 One `ui.expansion` per managed label. Each row is a symbol in that label with
-cost basis, `% of label`, `% of total`, quantity, live price and market value;
+current value (per the valuation mode), `% of label`, `% of total`, quantity,
+cost basis, live price and market value;
 symbols with no position show zero and are still editable. Label headers carry
 the label total, its current versus target percent, and the label comment. A ⚠
 marks symbols in more than one managed label.
@@ -390,6 +417,24 @@ not as a failure.
 Results are written to `portfolio_allocation_run`, logged via `log_activity`, and
 shown as a per-row outcome table. Partial failure is normal and reported per row;
 it never rolls back what already filled.
+
+## Adjacent fix: growth-chart label persistence
+
+`OverviewTab._render_growth_by_label_charts` builds its "Labels shown" selector
+at `ui/pages/overview.py:5453-5455` with
+`default_labels = [l for l in labels if l != 'auto_added']`, and the selection is
+lost on every reload. It persists to `app.storage.user` under a
+`overview_growth_labels` key, seeded from the existing default when absent and
+intersected with the currently available labels so a deleted label cannot break
+the chart.
+
+`ui/pages/symbol360.py:40` and `:165-179` are the precedent, including the
+constraint that matters: `app.storage.user` raises `RuntimeError` outside a UI
+context, so reads and writes must be guarded and must not happen from a thread
+pool. The storage secret is already configured at `ui/main.py:173`.
+
+This is unrelated to allocation, but it is the same label machinery and the user
+asked for it alongside. Session storage is sufficient; no table.
 
 ## TastyTrade
 
