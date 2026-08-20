@@ -4397,7 +4397,7 @@ it fails non-deterministically from a pre-existing session leak.
 - Create: `packages/common/ba2_common/core/portfolio_allocation.py`
 - Test: `packages/common/tests/test_portfolio_allocation.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `packages/common/tests/test_portfolio_allocation.py`:
 
@@ -4463,7 +4463,7 @@ def test_position_fetch_failed_is_a_runtime_error_subclass():
     assert issubclass(pa.PositionFetchFailed, RuntimeError)
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `venv/bin/python -m pytest packages/common/tests/test_portfolio_allocation.py -v`
 
@@ -4474,7 +4474,7 @@ packages/common/tests/test_portfolio_allocation.py:6: in <module>
 E   ImportError: cannot import name 'portfolio_allocation' from 'ba2_common.core'
 ```
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Create `packages/common/ba2_common/core/portfolio_allocation.py`:
 
@@ -4724,12 +4724,12 @@ def compute_allocation(base_notional: float, available_buying_power: float,
                           allow_fractional=bool(allow_fractional))
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `venv/bin/python -m pytest packages/common/tests/test_portfolio_allocation.py -v`
 Expected: PASS — `7 passed`
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 ```bash
 git add packages/common/ba2_common/core/portfolio_allocation.py packages/common/tests/test_portfolio_allocation.py
 git commit -m "feat(allocation): pure allocation engine value objects and empty plan"
