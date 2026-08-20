@@ -6141,6 +6141,20 @@ git commit -m "feat(allocation): precheck re-solve and FIFO income-event consump
 
 ### Task 25: Valuation mode — `cost` vs `market`
 
+> **Also make the skipped-row `side` consistent.** Task 21 leaves a no-price skip with `side=None`
+> (it `continue`s before `side` is assigned), while Task 20's scaling branch leaves a scaled-away
+> buy with `side="BUY"` even though `skipped=True`. Both are correctly excluded by `is_buy`/`is_sell`,
+> but a consumer reading the raw `side` field — and Section G's dry-run table will — sees two
+> different shapes for "no order". Clear `side = None` in the scaling branch when `qty <= 0`, and
+> add a test asserting both kinds of skipped row serialise `side: null`.
+>
+> **And re-key the close branch, which is the live bug this task exists to fix.** It currently keys
+> on `target_quantity <= 0`, so a `min_order_size` that zeroes a positive target liquidates the whole
+> position — "hold ~3.33 shares" becomes a full exit. Re-key to `target_notional <= 0`. Task 21's
+> negative clamp writes `target_notional = 0.0` as well as the quantity, so a genuinely negative
+> target still liquidates correctly; add a test pinning both directions.
+
+
 Spec decision 5a. "How much of my portfolio is in this symbol" has two defensible answers, and
 the mode selects the meaning of *current value* in three places at once — the allocatable base,
 the displayed percentages, and every delta. They must never disagree.
