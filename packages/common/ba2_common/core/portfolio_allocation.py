@@ -572,3 +572,70 @@ def compute_allocation(base_notional: float, available_buying_power: float,
                                           allow_fractional=allow_fractional, margin=margin)
     _finalise_totals(plan)
     return plan
+
+
+def compute_label_investment(label: LabelTarget, amount: float,
+                             current: Dict[str, PositionState],
+                             margin: Dict[str, MarginInfo], *,
+                             available_buying_power: float, allow_fractional: bool,
+                             default_bp_factor: float) -> AllocationPlan:
+    """Solve an INVEST_LABEL run: put ``amount`` into ONE label. Buys only.
+
+    ``amount`` is split by the label's symbol weights. ``label.target_pct`` is
+    IGNORED -- the amount is the whole budget, and it is ADDED to whatever the
+    account already holds rather than rebalanced towards. No sells are ever
+    produced, so ``plan.total_sell_value`` is always 0.0 and
+    ``plan.net_buy_value == plan.total_buy_value``. Buying-power scaling,
+    rounding, missing prices and missing margin info behave exactly as in
+    ``compute_allocation``.
+    """
+    current = current or {}
+    margin = margin or {}
+    budget = max(0.0, float(amount or 0.0))
+    plan = AllocationPlan(base_notional=budget,
+                          available_buying_power=float(available_buying_power or 0.0),
+                          allow_fractional=bool(allow_fractional))
+    if not label.symbols:
+        plan.unallocatable_pct = 100.0
+        plan.warnings.append(WARNING_EMPTY_LABEL_FMT.format(label=label.label, pct=100.0))
+        return plan
+    for st in label.symbols:
+        weight = float(st.weight_pct or 0.0)
+        target_notional = budget * weight / 100.0
+        ps = current.get(st.symbol)
+        m = margin.get(st.symbol)
+        row = AllocationRow(symbol=st.symbol, labels=[label.label])
+        row.bp_factor = float(m.bp_factor) if m is not None else float(default_bp_factor)
+        row.current_quantity = float(ps.quantity) if ps is not None else 0.0
+        row.current_cost_basis = float(ps.cost_basis) if ps is not None else 0.0
+        row.price = ps.price if ps is not None else None
+        if m is not None and not m.marginable:
+            row.reasons.append(REASON_NOT_MARGINABLE)
+        if target_notional < 0:
+            target_notional = 0.0
+            row.reasons.append(REASON_NEGATIVE_CLAMPED)
+        row.target_notional = target_notional
+        if row.price is None or row.price <= 0:
+            row.skipped = True
+            row.reasons.append(REASON_NO_PRICE)
+            plan.unallocatable_pct += max(0.0, weight)
+            plan.rows.append(row)
+            continue
+        frac = bool(allow_fractional and m is not None and m.fractionable)
+        row.fractional = frac
+        qty = round_quantity(target_notional, row.price, m, allow_fractional=allow_fractional)
+        if frac:
+            row.reasons.append(REASON_FRACTIONAL)
+        elif allow_fractional:
+            row.reasons.append(REASON_WHOLE_SHARE_FLOOR)
+        row.delta_quantity = qty
+        row.target_quantity = row.current_quantity + qty
+        if qty > 0:
+            row.side = OrderDirection.BUY
+        row.estimated_value = qty * row.price
+        row.bp_cost = row.estimated_value * row.bp_factor
+        plan.rows.append(row)
+    plan.scale_factor = _apply_bp_scaling(plan.rows, plan.available_buying_power,
+                                          allow_fractional=allow_fractional, margin=margin)
+    _finalise_totals(plan)
+    return plan

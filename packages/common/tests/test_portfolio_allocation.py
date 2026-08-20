@@ -487,3 +487,35 @@ def test_validate_label_targets_empty_label_with_a_zero_target_stays_valid():
     labels = [LabelTarget("FULL", 100.0, [SymbolTarget("AAA", 100.0)]),
               LabelTarget("EMPTY", 0.0, [])]
     assert pa.validate_label_targets(labels) == []
+
+
+def test_label_investment_splits_the_amount_and_only_buys():
+    label = LabelTarget("ARK26", 40.0, [SymbolTarget("AAA", 60.0), SymbolTarget("BBB", 40.0)])
+    current = {"AAA": _pos("AAA", 100.0, quantity=7.0, cost_basis=700.0),
+               "BBB": _pos("BBB", 50.0, quantity=1000.0, cost_basis=50_000.0)}
+    plan = pa.compute_label_investment(label, 10_000.0, current, {},
+                                       available_buying_power=1_000_000.0,
+                                       allow_fractional=False, default_bp_factor=1.0)
+    by = {r.symbol: r for r in plan.rows}
+    assert by["AAA"].delta_quantity == 60.0
+    assert by["AAA"].target_quantity == 67.0
+    assert by["BBB"].delta_quantity == 80.0
+    assert plan.total_sell_value == 0.0
+    assert plan.net_buy_value == plan.total_buy_value == 10_000.0
+
+
+def test_label_investment_scales_down_to_available_buying_power():
+    label = LabelTarget("ARK26", 100.0, [SymbolTarget("AAA", 100.0)])
+    plan = pa.compute_label_investment(label, 10_000.0, {"AAA": _pos("AAA", 100.0)}, {},
+                                       available_buying_power=2_500.0,
+                                       allow_fractional=False, default_bp_factor=1.0)
+    assert plan.scale_factor == pytest.approx(0.25)
+    assert plan.rows[0].delta_quantity == 25.0
+
+
+def test_label_investment_on_an_empty_label_allocates_nothing():
+    plan = pa.compute_label_investment(LabelTarget("EMPTY", 100.0, []), 10_000.0, {}, {},
+                                       available_buying_power=1_000_000.0,
+                                       allow_fractional=False, default_bp_factor=1.0)
+    assert plan.rows == []
+    assert plan.unallocatable_pct == 100.0
