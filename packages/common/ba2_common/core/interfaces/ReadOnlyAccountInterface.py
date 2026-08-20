@@ -1,6 +1,7 @@
 from abc import abstractmethod
 from typing import Any, Dict, Optional, List
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
+from ba2_common.core.account_types import AccountSnapshot, CashTransfer, MarginInfo
 from threading import Lock
 from ba2_common.logger import logger
 from ba2_common.core.models import AccountSetting
@@ -90,6 +91,74 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                 - etc.
         """
         pass
+
+    def get_account_snapshot(self) -> AccountSnapshot:
+        """Broker-agnostic view of this account's cash / equity / buying power.
+
+        CONCRETE ON PURPOSE: an ``@abstractmethod`` here would break every
+        existing subclass's instantiation (IBKRAccount, TastyTradeAccount).
+
+        The base implementation reads ``get_account_info()`` TOLERANTLY, in the
+        manner of ``MarketExpertInterface._get_actual_available_balance``
+        (MarketExpertInterface.py:815): the return may be a pydantic object
+        (Alpaca ``TradeAccount``), a dict (IBKR, TastyTrade) or ``None`` (Alpaca
+        auth failure), so every field is probed with a
+        ``obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)``
+        helper and coerced with ``float()`` (Alpaca ships them as STRINGS).
+        Alpaca and TastyTrade override this properly.
+
+        NEVER fabricates a number: a field the broker did not supply is left as
+        ``None`` and the caller must raise rather than substitute a default
+        (platform rule: no fallback values for prices/balances/quantities).
+
+        Returns:
+            AccountSnapshot: populated as far as the broker allows. An
+            all-``None`` snapshot is a legitimate "the broker told us nothing"
+            result, NOT an error -- it is the caller that must refuse to plan.
+        """
+        try:
+            info = self.get_account_info()
+        except Exception as e:
+            logger.error(f"Account {self.id}: get_account_info() failed: {e}", exc_info=True)
+            info = None
+
+        if info is None:
+            return AccountSnapshot()
+
+        def _field(obj: Any, name: str) -> Optional[float]:
+            val = obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+            if val is None:
+                return None
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                return None
+
+        def _first(*names: str) -> Optional[float]:
+            """First of these field names the broker actually publishes."""
+            for n in names:
+                v = _field(info, n)
+                if v is not None:
+                    return v
+            return None
+
+        multiplier = _first("multiplier", "margin_multiplier")
+        equity = _first("equity", "net_liquidating_value", "portfolio_value")
+        return AccountSnapshot(
+            cash=_first("cash", "cash_balance"),
+            equity=equity,
+            net_liquidation=_first("net_liquidation", "net_liquidating_value", "equity"),
+            buying_power=_first("buying_power", "equity_buying_power", "derivative_buying_power"),
+            non_marginable_buying_power=_first("non_marginable_buying_power",
+                                               "cash_available_to_withdraw"),
+            margin_multiplier=multiplier,
+            is_margin_account=bool(multiplier is not None and multiplier > 1.0),
+            long_market_value=_first("long_market_value"),
+            short_market_value=_first("short_market_value"),
+            pending_transfer_in=_first("pending_transfer_in"),
+            supports_fractional=False,
+            raw=dict(info) if isinstance(info, dict) else {},
+        )
 
     @abstractmethod
     def get_positions(self) -> Any:
