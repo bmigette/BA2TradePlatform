@@ -8,7 +8,21 @@ from sqlalchemy import pool
 from alembic import context
 
 # Add the parent directory to sys.path so we can import ba2_trade_platform
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _REPO_ROOT)
+
+# ...and the three Phase 6 packages the same way. ba2_trade_platform.config imports
+# ba2_common at module scope, and the venv's editable installs of
+# ba2_common/ba2_providers/ba2_experts point at absolute paths that need not exist
+# in this checkout (they resolve to the MAIN worktree, or to nothing at all). Only
+# pytest.ini's `pythonpath` made those imports work, so `alembic <anything>` and
+# `python migrate.py upgrade` died with ModuleNotFoundError unless the caller
+# remembered a PYTHONPATH prefix. Prepending -- like pytest does -- so THIS
+# checkout's packages win over any stale editable install.
+for _pkg in ("common", "providers", "experts"):
+    _pkg_path = os.path.join(_REPO_ROOT, "packages", _pkg)
+    if _pkg_path not in sys.path:
+        sys.path.insert(0, _pkg_path)
 
 # Import SQLModel metadata and configure database
 from sqlmodel import SQLModel
