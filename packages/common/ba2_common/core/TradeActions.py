@@ -1489,8 +1489,20 @@ class IncreaseInstrumentShareAction(TradeAction):
                     data={"current_value": current_value, "target_value": target_value}
                 )
 
-            # Check available balance
-            account_balance = self.account.get_account_info().get('buying_power', 0)
+            # Check available balance. get_account_info() is a pydantic TradeAccount on
+            # Alpaca (no .get()), a dict on IBKR/TastyTrade and None on auth failure, so
+            # read it through the broker-agnostic snapshot seam instead. buying_power is
+            # None when the broker did not publish one -- refuse to size rather than
+            # substituting a number (platform rule: no fallback values for balances).
+            snapshot = self.account.get_account_snapshot()
+            account_balance = snapshot.buying_power
+            if account_balance is None:
+                return self.create_and_save_action_result(
+                    action_type=ExpertActionType.INCREASE_INSTRUMENT_SHARE.value,
+                    success=False,
+                    message=f"Buying power unavailable for account {self.account.id}",
+                    data={},
+                )
             if additional_value > account_balance:
                 logger.warning(f"Additional value ${additional_value:.2f} exceeds available balance ${account_balance:.2f}")
                 additional_value = account_balance
@@ -1510,31 +1522,24 @@ class IncreaseInstrumentShareAction(TradeAction):
             else:
                 side = "SELL"  # Short position - sell more
             
-            # Create market order
-            order = self.create_order_record(
+            # Create market order. create_order_record() ALREADY persists the row and
+            # returns its integer id (see SellAction, which uses it correctly) -- the old
+            # code fed that int back into add_instance(), raising UnmappedInstanceError
+            # ("Class 'builtins.int' is not mapped") on every single invocation.
+            order_id = self.create_order_record(
                 side=side,
                 quantity=additional_qty,
                 order_type="market"
             )
-            
-            if not order:
+
+            if not order_id:
                 return self.create_and_save_action_result(
                     action_type=ExpertActionType.INCREASE_INSTRUMENT_SHARE.value,
                     success=False,
                     message="Failed to create order record",
                     data={}
                 )
-            
-            # Save order to database
-            order_id = add_instance(order)
-            if not order_id:
-                return self.create_and_save_action_result(
-                    action_type=ExpertActionType.INCREASE_INSTRUMENT_SHARE.value,
-                    success=False,
-                    message="Failed to save order to database",
-                    data={}
-                )
-            
+
             logger.info(f"Created increase share order {order_id}: {side} {additional_qty} {self.instrument_name}")
             
             return self.create_and_save_action_result(
