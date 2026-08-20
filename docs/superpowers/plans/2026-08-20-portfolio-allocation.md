@@ -1625,6 +1625,12 @@ git commit -m "feat(db): migration merging duplicate instruments and adding ix_i
 > with `ui.notify(..., type='negative')` and leaves the dialog open. Do NOT use `type='error'` —
 > that is invalid, and the two existing uses at `settings.py:1023` and `:1041` are a known bug you
 > are not fixing here.
+>
+> **Cover the submit path too.** `JobManager.submit_market_analysis` now calls
+> `ensure_instrument_exists(symbol)`, which correctly writes nothing for a blank symbol and returns
+> `""` — but the method then goes on to submit an analysis task for `""`. The old behaviour created
+> an `Instrument(name='  ')`; both are wrong. Reject a blank normalised symbol there rather than
+> submitting the task.
 
 
 The migration gives an existing database the index; this makes the ORM (and `init_db()`'s
