@@ -149,6 +149,54 @@ def test_increase_share_clamps_the_order_to_the_available_buying_power():
     assert result["data"]["quantity"] == 5.0
 
 
+def test_the_clamp_holds_when_the_buying_power_is_not_a_whole_number_of_shares():
+    """The 500/100 case above divides EVENLY, so it passes against the broken
+    arithmetic too -- `max(1.0, round(1.5))` is 2 only when the division is
+    ragged. 150 of buying power at 100 a share funds ONE share, not two: round()
+    would have sent a 200 order into a 150 account.
+    """
+    result = _run(_action(_AlpacaShapedAccount(1, buying_power="150")))
+
+    assert result["success"] is True, result["message"]
+    assert result["data"]["quantity"] == 1.0
+
+
+def test_increase_share_never_rounds_up_past_the_buying_power():
+    """Sweep the ragged remainders: the order must never cost more than the
+    clamp allowed. floor(), never round(), and never a `max(1.0, ...)` floor."""
+    for bp in ("100", "150", "199", "250", "349", "999"):
+        result = _run(_action(_AlpacaShapedAccount(1, buying_power=bp)))
+        assert result["success"] is True, result["message"]
+        assert result["data"]["quantity"] * 100.0 <= float(bp), bp
+
+
+def test_zero_buying_power_produces_no_order_at_all():
+    """`max(1.0, round(0))` emitted a BUY 1 into an account with nothing in it.
+    The order is doomed at the broker, and the only thing downstream of it that
+    could reject it is the known-broken SmartRiskManagerQueue .get()-on-pydantic
+    site, so nothing reliably stops it on Alpaca today."""
+    result = _run(_action(_AlpacaShapedAccount(1, buying_power="0")))
+
+    assert result["success"] is False
+    assert "one share" in result["message"].lower()
+    assert result["data"].get("order_id") is None
+
+
+def test_a_target_increase_smaller_than_one_share_is_refused_not_rounded_up():
+    """Not a buying-power problem: plenty of BP, but 2% of 10000 = 200 against a
+    150-value holding leaves 50, half a share. round() bought a whole one and
+    overshot the target; floor() declines, and the message says which constraint
+    actually bound."""
+    action = _action(_AlpacaShapedAccount(1, buying_power="50000"))
+    action.target_percent = 2.0
+    action.get_expert_position = lambda: 1.5      # 1.5 * 100 = 150 held
+
+    result = _run(action)
+
+    assert result["success"] is False
+    assert "less than one share" in result["message"].lower()
+
+
 def test_increase_share_refuses_to_size_when_buying_power_is_unknown():
     """No fabricated balance: an unreadable buying power blocks the order."""
     class _Blind(_AlpacaShapedAccount):

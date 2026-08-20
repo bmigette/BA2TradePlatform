@@ -92,10 +92,10 @@ def _action(target_percent=5.0):
     return action
 
 
-def _run_holding(quantity, side):
+def _run_holding(quantity, side, target_percent=5.0):
     """Run a decrease against a real open Transaction, so get_expert_position() reads the
     position through its genuine code path instead of being monkeypatched."""
-    action = _action()
+    action = _action(target_percent)
     previous = instance_resolver.get_instance_resolver()
     instance_resolver.set_instance_resolver(_FakeResolver())
     try:
@@ -134,3 +134,53 @@ def test_decrease_share_reads_no_broker_balance():
     result = _run_holding(20.0, OrderDirection.BUY)
 
     assert result["success"] is True, result["message"]
+
+
+# ---------------------------------------------------------------------------
+# Never sell more than is held (a fractional holding must not go short)
+# ---------------------------------------------------------------------------
+
+def test_a_fractional_holding_taken_to_zero_percent_is_not_oversold_into_a_short():
+    """2.6 shares, target 0%: `round(2.6)` was 3 -- a SELL 3 against a 2.6 holding.
+
+    The "keep at least 1 share" clamp below the rounding is gated on
+    `target_percent > 0`, so a 0% target skipped it entirely and nothing else
+    looked at the holding. The action even REPORTED remaining_qty=-0.4 and no
+    caller reads that field. Worse, get_expert_position() returns this EXPERT's
+    slice while the broker nets every expert into one position, so the oversell
+    can succeed at the broker by taking 0.4 shares off another expert.
+    """
+    result = _run_holding(2.6, OrderDirection.BUY, target_percent=0.0)
+
+    assert result["success"] is True, result["message"]
+    assert result["data"]["quantity"] <= 2.6
+    assert result["data"]["quantity"] == 2.0
+    assert result["data"]["remaining_qty"] >= 0
+
+
+def test_a_short_leg_is_not_overbought_past_the_position_either():
+    """Mirror case: a 2.6-share SHORT covered to 0% must BUY at most 2.6."""
+    result = _run_holding(2.6, OrderDirection.SELL, target_percent=0.0)
+
+    assert result["success"] is True, result["message"]
+    assert result["data"]["side"] == "BUY"
+    assert result["data"]["quantity"] == 2.0
+
+
+def test_a_holding_smaller_than_one_share_produces_no_order_rather_than_a_short():
+    """0.6 shares at target 0%: `round(0.6)` was 1, i.e. a SELL 1 that ends 0.4
+    short. There is no whole share to sell, so there is no order."""
+    result = _run_holding(0.6, OrderDirection.BUY, target_percent=0.0)
+
+    assert result["success"] is False
+    assert result["data"].get("order_id") is None
+
+
+def test_the_reduction_is_floored_so_a_ragged_trim_never_oversells():
+    """25.4 held, target 5% of 10000 = 500 at 100 => reduce by 20.4 shares' worth.
+    round() would sell 20 here by luck; the sweep below is what pins the rule."""
+    for held in (2.6, 3.4, 7.5, 10.9, 25.4):
+        result = _run_holding(held, OrderDirection.BUY, target_percent=0.0)
+        if result["success"]:
+            assert result["data"]["quantity"] <= held, held
+            assert result["data"]["remaining_qty"] >= 0, held

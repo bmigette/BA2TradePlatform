@@ -196,9 +196,9 @@ class TradeAction(ABC):
     def create_order_record(self, side: str, quantity: float, order_type: str = "market",
                           limit_price: Optional[float] = None, stop_price: Optional[float] = None,
                           linked_order_id: Optional[int] = None,
-                          extra_data: Optional[Dict[str, Any]] = None) -> Optional[TradingOrder]:
+                          extra_data: Optional[Dict[str, Any]] = None) -> Optional[int]:
         """
-        Create a TradingOrder database record.
+        Create (and PERSIST) a TradingOrder database record.
 
         Args:
             side: Order side ("buy" or "sell", case-insensitive)
@@ -211,7 +211,15 @@ class TradeAction(ABC):
                 so the risk manager sizes the order in round lots)
 
         Returns:
-            TradingOrder instance or None if creation failed
+            The integer id of the saved TradingOrder, or None if creation failed.
+
+            An INT, not the object: the row is already committed and a detached
+            instance would raise DetachedInstanceError on attribute access (see the
+            add_instance call at the end of this method). This was annotated
+            ``Optional[TradingOrder]`` while returning an int, and both share
+            actions read the annotation, fed the int back into ``add_instance()``
+            and died with "Class 'builtins.int' is not mapped" on every single
+            invocation. Callers want ``order_id = self.create_order_record(...)``.
         """
         try:
             # Convert side to uppercase to match OrderDirection enum values (BUY, SELL)
@@ -1503,15 +1511,39 @@ class IncreaseInstrumentShareAction(TradeAction):
                     message=f"Buying power unavailable for account {self.account.id}",
                     data={},
                 )
-            if additional_value > account_balance:
+            clamped_to_buying_power = additional_value > account_balance
+            if clamped_to_buying_power:
                 logger.warning(f"Additional value ${additional_value:.2f} exceeds available balance ${account_balance:.2f}")
                 additional_value = account_balance
 
-            # Calculate additional quantity needed
-            additional_qty = additional_value / current_price
+            # FLOOR, never round, and never `max(1.0, ...)`. The clamp above is the only
+            # thing standing between this action and an order the account cannot pay for,
+            # and `max(1.0, round(x))` defeated it outright: 0 buying power still emitted
+            # a BUY 1, and $150 of buying power at $100 a share emitted a BUY 2. The
+            # downstream catch is SmartRiskManagerQueue's own broken pydantic .get(), so
+            # nothing reliably rejects an oversized order on Alpaca today -- the number
+            # has to be right here.
+            additional_qty = float(math.floor(additional_value / current_price))
 
-            # Round to appropriate lot size (minimum 1 share)
-            additional_qty = max(1.0, round(additional_qty))
+            if additional_qty <= 0:
+                # Emitting a doomed order is worse than declining: it fails at the broker,
+                # leaves an ERROR row and tells the user nothing. Name the binding
+                # constraint instead.
+                message = (
+                    f"Insufficient buying power for one share of {self.instrument_name} "
+                    f"(${account_balance:.2f} available, ${current_price:.2f} per share)"
+                    if clamped_to_buying_power else
+                    f"Increase of ${additional_value:.2f} is less than one share of "
+                    f"{self.instrument_name} at ${current_price:.2f}"
+                )
+                logger.info(f"Not increasing {self.instrument_name}: {message}")
+                return self.create_and_save_action_result(
+                    action_type=ExpertActionType.INCREASE_INSTRUMENT_SHARE.value,
+                    success=False,
+                    message=message,
+                    data={"current_value": current_value, "target_value": target_value,
+                          "buying_power": account_balance},
+                )
 
             logger.info(f"Increasing {self.instrument_name}: expert_qty={current_position_qty}, additional={additional_qty}, "
                        f"target_value=${target_value:.2f} ({self.target_percent}% of ${virtual_equity:.2f})")
@@ -1674,11 +1706,24 @@ class DecreaseInstrumentShareAction(TradeAction):
                     data={"current_value": current_value, "target_value": target_value}
                 )
 
-            # Calculate quantity to sell
-            reduction_qty = reduction_value / current_price
+            # Calculate quantity to sell. FLOOR, and cap at what is actually held:
+            # `round()` rounds UP, and the "keep at least 1 share" clamp below is gated
+            # on `target_percent > 0`, so a 0% target on a 2.6-share holding produced a
+            # SELL 3 -- an oversell straight into a 0.4-share SHORT. get_expert_position()
+            # returns this EXPERT's slice while the broker nets every expert into one
+            # position, so that oversell can even SUCCEED, by taking shares off another
+            # expert. Flooring under-trims instead, which is recoverable.
+            reduction_qty = min(math.floor(reduction_value / current_price),
+                                abs(current_position_qty))
 
-            # Round appropriately
-            reduction_qty = round(reduction_qty)
+            if reduction_qty <= 0:
+                return self.create_and_save_action_result(
+                    action_type=ExpertActionType.DECREASE_INSTRUMENT_SHARE.value,
+                    success=False,
+                    message=(f"Reduction of ${reduction_value:.2f} is less than one share "
+                             f"of {self.instrument_name} at ${current_price:.2f}"),
+                    data={"current_value": current_value, "target_value": target_value},
+                )
 
             # Ensure we keep at least 1 share if not closing completely
             remaining_qty = abs(current_position_qty) - reduction_qty
