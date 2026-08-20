@@ -605,3 +605,60 @@ def test_label_investment_coalescing_preserves_first_appearance_order():
                                        allow_fractional=False, default_bp_factor=1.0)
     assert [r.symbol for r in plan.rows] == ["BBB", "AAA"]
     assert [r.delta_quantity for r in plan.rows] == [50.0, 50.0]
+
+
+def test_apply_order_impacts_replaces_the_estimated_bp_cost():
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
+    plan = pa.compute_allocation(10_000.0, 1_000_000.0, labels,
+                                 {"XXX": _pos("XXX", 100.0)}, {},
+                                 allow_fractional=False, default_bp_factor=1.0)
+    assert plan.rows[0].bp_cost == 10_000.0
+    impacts = {"XXX": OrderImpact(symbol="XXX", change_in_buying_power=-25_000.0)}
+    out = pa.apply_order_impacts(plan, impacts, available_buying_power=1_000_000.0)
+    assert out.rows[0].bp_cost == 25_000.0
+    assert "broker precheck disagreed on XXX - re-solved" in out.warnings
+    assert plan.rows[0].bp_cost == 10_000.0
+
+
+def test_apply_order_impacts_rescales_when_the_precheck_no_longer_fits():
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
+    plan = pa.compute_allocation(10_000.0, 10_000.0, labels,
+                                 {"XXX": _pos("XXX", 100.0)}, {},
+                                 allow_fractional=False, default_bp_factor=1.0)
+    impacts = {"XXX": OrderImpact(symbol="XXX", change_in_buying_power=-20_000.0)}
+    out = pa.apply_order_impacts(plan, impacts, available_buying_power=10_000.0)
+    assert out.scale_factor == pytest.approx(0.5)
+    assert out.rows[0].delta_quantity == 50.0
+    assert out.rows[0].bp_cost == pytest.approx(10_000.0)
+
+
+def test_apply_order_impacts_skips_a_rejected_order():
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
+    plan = pa.compute_allocation(10_000.0, 1_000_000.0, labels,
+                                 {"XXX": _pos("XXX", 100.0)}, {},
+                                 allow_fractional=False, default_bp_factor=1.0)
+    impacts = {"XXX": OrderImpact(symbol="XXX", change_in_buying_power=0.0,
+                                  accepted=False, errors=["symbol not tradeable"])}
+    out = pa.apply_order_impacts(plan, impacts, available_buying_power=1_000_000.0)
+    assert out.rows[0].skipped is True
+    assert "symbol not tradeable" in out.rows[0].reasons
+    assert out.total_buy_value == 0.0
+
+
+def test_consume_income_events_takes_oldest_first_and_partially_consumes_the_last():
+    out = pa.consume_income_events([(1, 100.0), (2, 250.0), (3, 500.0)], 300.0)
+    assert out == [(1, 100.0), (2, 200.0)]
+
+
+def test_consume_income_events_returns_nothing_for_a_sell_funded_run():
+    assert pa.consume_income_events([(1, 100.0)], 0.0) == []
+    assert pa.consume_income_events([(1, 100.0)], -50.0) == []
+
+
+def test_consume_income_events_with_an_empty_ledger_returns_empty():
+    assert pa.consume_income_events([], 500.0) == []
+
+
+def test_consume_income_events_never_takes_more_than_the_ledger_holds():
+    out = pa.consume_income_events([(1, 100.0), (2, 50.0)], 1_000.0)
+    assert sum(a for _, a in out) == pytest.approx(150.0)

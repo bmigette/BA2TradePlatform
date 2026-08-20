@@ -682,3 +682,75 @@ def compute_label_investment(label: LabelTarget, amount: float,
                                           allow_fractional=allow_fractional, margin=margin)
     _finalise_totals(plan)
     return plan
+
+
+def apply_order_impacts(plan: AllocationPlan, impacts: Dict[str, OrderImpact], *,
+                        available_buying_power: float) -> AllocationPlan:
+    """Re-solve a plan against broker PRECHECK results (precheck over estimation).
+
+    For each row with a matching ``OrderImpact``, replaces the estimated
+    ``bp_cost`` with ``impact.bp_cost`` (the positive, sign-corrected value) and
+    re-runs the pro-rata buying-power scaling. A symbol with no impact keeps its
+    estimated cost. ``impact.accepted is False`` marks the row ``skipped`` and
+    copies ``impact.errors`` into ``row.reasons``.
+
+    Returns a NEW AllocationPlan; ``plan`` is not mutated. Adds
+    ``WARNING_PRECHECK_DISAGREED_FMT`` for each row whose cost changed.
+    """
+    out = AllocationPlan(
+        rows=[copy.deepcopy(r) for r in plan.rows],
+        base_notional=plan.base_notional,
+        available_buying_power=float(available_buying_power or 0.0),
+        unallocatable_pct=plan.unallocatable_pct,
+        allow_fractional=plan.allow_fractional,
+        warnings=list(plan.warnings),
+    )
+    for row in out.rows:
+        impact = (impacts or {}).get(row.symbol)
+        if impact is None:
+            continue
+        if not impact.accepted:
+            row.skipped = True
+            row.bp_cost = 0.0
+            row.reasons.extend(impact.errors)
+            continue
+        if row.is_buy and abs(impact.bp_cost - row.bp_cost) > 0.005:
+            out.warnings.append(WARNING_PRECHECK_DISAGREED_FMT.format(symbol=row.symbol))
+            row.bp_cost = impact.bp_cost
+    out.scale_factor = _apply_bp_scaling(out.rows, out.available_buying_power,
+                                         allow_fractional=out.allow_fractional)
+    _finalise_totals(out)
+    return out
+
+
+def consume_income_events(events: List[Tuple[int, float]],
+                          net_buy_value: float) -> List[Tuple[int, float]]:
+    """FIFO-consume the income ledger against a run's NET buy value. Pure.
+
+    Args:
+        events: ``[(income_event_id, open_amount)]``, ALREADY sorted oldest-first
+            by ``event_date`` then ``id``. Pass plain tuples, not ORM rows, so
+            this stays IO-free and unit-testable.
+        net_buy_value: ``max(0, submitted_buy_value - submitted_sell_value)`` -- a
+            rebalance funded entirely by its own sells consumes nothing.
+
+    Returns:
+        List[Tuple[int, float]]: ``[(income_event_id, amount_to_consume)]``, only
+        for events actually touched. The last one may be PARTIAL; its remainder
+        stays open. Empty when ``net_buy_value <= 0`` or the ledger is empty.
+        The caller adds each amount to ``PortfolioIncomeEvent.consumed_amount``.
+    """
+    remaining = float(net_buy_value or 0.0)
+    out = []
+    if remaining <= 0:
+        return out
+    for event_id, open_amount in events or []:
+        if remaining <= QUANTITY_EPSILON:
+            break
+        available = float(open_amount or 0.0)
+        if available <= 0:
+            continue
+        take = min(available, remaining)
+        out.append((event_id, take))
+        remaining -= take
+    return out
