@@ -17574,6 +17574,15 @@ be guarded and must not happen from a thread pool. The storage secret is already
 
 ### Task 76: Persist the Overview growth-chart label selection
 
+> **Also fix the two label-normalisation bypasses in this chart's own code.** Task 1 made the
+> shared helpers normalise symbols to `.strip().upper()`, but `overview.py:5775-5796` **and**
+> `overview.py:6098-6111` are two independent copies of a pattern that builds
+> `symbol_labels[inst.name] = inst.labels` straight from `Instrument` rows and then looks up with
+> `pos.symbol`, bypassing `get_labels_by_symbol` and therefore all of that normalisation. Route both
+> through `get_labels_by_symbol`, or normalise both the key and the lookup. Fix BOTH sites — fixing
+> only the first leaves the same bug in the second chart.
+
+
 Pure-testable: `resolve_growth_labels` (Steps 1-4), plus the two storage helpers' RuntimeError
 guards. Eyeball-only: the two-line wiring in `overview.py`.
 
