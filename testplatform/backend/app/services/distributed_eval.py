@@ -521,18 +521,20 @@ class DistributedEvaluator:
                 gov = self._remote_govs.get(worker_name)
             if gov is None:
                 return
-            verdict = gov.assess(mem)
-            # ACT on the verdict. 'release' already decremented gov.current inside assess(), which
-            # the dispatchers observe before their next claim. 'emergency' does NOT touch current
-            # -- that branch was written for the LOCAL owner, which responds by breaking its
-            # process pool. A remote owner cannot do that, so before this it shed NOTHING: on
-            # 2026-08-18 remote150 fell to 85 MB free of 65 GB on the mid band (765 screened
-            # symbols vs ~105 on large) and the emergency logged a pool-break that never happened.
-            # Sheds ONE slot, and the watchdog steps again a minute later if the box is
-            # still under the floor -- halving was tried and rejected: it overshoots and
-            # cannot converge on the concurrency the band actually affords.
+            # OBSERVE ONLY. verdict() is the non-mutating query; assess() would decrement
+            # `current` here as a side effect, which is a SECOND actuator on a ceiling the
+            # memory watchdog owns and sizes by calculation. That is precisely what walked
+            # remote150 from the watchdog's computed 4 down to 1 while the box sat 71.7%
+            # free -- and it hid because the two paths log different strings.
+            verdict = gov.verdict(mem)
             if verdict == "emergency":
-                self._shed_remote_slot(worker_name, gov, "emergency (trial snapshot)")
+                # Do not act, but do not sit on a stale settling deadline either: let the
+                # watchdog re-measure and re-calculate on its very next poll.
+                import time as _t
+                self._remote_settle_until[worker_name] = 0.0
+                self.log(f"[{worker_name}] trial snapshot reports "
+                         f"{(mem.get('sys') or {}).get('pct_free')}% free -- clearing the "
+                         f"settling window so the pool is re-sized on the next poll")
         except Exception as e:  # noqa: BLE001 -- governing must never fail a healthy trial
             self.log(f"remote governor assess failed for {worker_name}: {e!r}")
 

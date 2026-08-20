@@ -417,8 +417,31 @@ class MemoryGovernor:
             self.log(f"memory governor: restoring concurrency {self.current} -> {self.full} ({why})")
         self.current = self.full
 
+    def verdict(self, mem: Any) -> str:
+        """Classify a snapshot as 'ok' | 'release' | 'emergency' WITHOUT changing anything.
+
+        The pure query. assess() below mutates `current` as a side effect of classifying,
+        which is right for the LOCAL governor (it owns a pool it can act on) and wrong for
+        any caller that only wants to observe -- a remote worker's ceiling is owned by the
+        memory watchdog, which sizes it by calculation. Two actuators on one governor is
+        what drove remote150 to a single slot on a box that was 71.7% free.
+        """
+        if not isinstance(mem, dict):
+            return "ok"
+        pct = (mem.get("sys") or {}).get("pct_free")
+        if pct is None:
+            return "ok"
+        if pct < _MEM_EMERGENCY_PCT:
+            return "emergency"
+        if pct < _MEM_THROTTLE_PCT:
+            return "release"
+        return "ok"
+
     def assess(self, mem: Any) -> str:
-        """Return 'ok' | 'release' | 'emergency' from a per-trial snapshot. Never raises."""
+        """Classify a snapshot AND act on it (reduces `current` on 'release').
+
+        For the LOCAL governor only. Remote callers want verdict() -- see its docstring.
+        Never raises."""
         if not isinstance(mem, dict):
             return "ok"
         sys_mem = mem.get("sys") or {}
