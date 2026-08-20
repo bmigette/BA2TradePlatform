@@ -519,3 +519,89 @@ def test_label_investment_on_an_empty_label_allocates_nothing():
                                        allow_fractional=False, default_bp_factor=1.0)
     assert plan.rows == []
     assert plan.unallocatable_pct == 100.0
+
+
+def test_validate_symbol_weights_accepts_an_even_split():
+    syms = [SymbolTarget(s, p) for s, p in zip(("AAA", "BBB", "CCC"), pa.even_split_pct(3))]
+    assert pa.validate_symbol_weights(LabelTarget("A", 40.0, syms)) == []
+
+
+def test_validate_symbol_weights_rejects_a_one_fifty_total():
+    """The INVEST_LABEL gate: 150% would turn a 10k budget into 15k of buys."""
+    label = LabelTarget("A", 40.0, [SymbolTarget("AAA", 100.0), SymbolTarget("BBB", 50.0)])
+    assert pa.validate_symbol_weights(label) == [
+        pa.ERROR_SYMBOL_TOTAL_FMT.format(label="A", total=150.0)]
+    assert pa.validate_symbol_weights(label) == [
+        "label 'A' symbol weights total 150.00% - must total 100%"]
+
+
+def test_validate_symbol_weights_rejects_a_total_under_one_hundred():
+    """Concern 3: weights totalling 60 would silently leave 40% of the budget as cash."""
+    label = LabelTarget("A", 40.0, [SymbolTarget("AAA", 60.0)])
+    assert pa.validate_symbol_weights(label) == [
+        pa.ERROR_SYMBOL_TOTAL_FMT.format(label="A", total=60.0)]
+
+
+def test_validate_symbol_weights_rejects_a_negative_weight():
+    label = LabelTarget("A", 40.0, [SymbolTarget("AAA", 120.0), SymbolTarget("BBB", -20.0)])
+    assert pa.validate_symbol_weights(label) == [
+        pa.ERROR_SYMBOL_NEGATIVE_FMT.format(label="A", symbol="BBB", pct=-20.0)]
+
+
+def test_validate_symbol_weights_rejects_a_duplicate_symbol():
+    """The engine now COALESCES a duplicate, so validation is what reports it."""
+    label = LabelTarget("A", 40.0, [SymbolTarget("AAA", 50.0), SymbolTarget("AAA", 50.0)])
+    assert pa.validate_symbol_weights(label) == [
+        pa.ERROR_SYMBOL_DUPLICATE_FMT.format(label="A", symbol="AAA")]
+
+
+def test_validate_symbol_weights_on_an_empty_label_returns_no_errors():
+    """An empty label cannot have bad weights; whether it may be INVESTED into is
+    the caller's call, not this check's."""
+    assert pa.validate_symbol_weights(LabelTarget("EMPTY", 40.0, [])) == []
+
+
+def test_validate_symbol_weights_ignores_the_labels_own_target_pct():
+    """The whole reason this is separate: an INVEST_LABEL run picks ONE label, whose
+    target_pct is meaningless, so validate_label_targets' total-100 rule cannot apply."""
+    assert pa.validate_symbol_weights(LabelTarget("A", 40.0, [SymbolTarget("AAA", 100.0)])) == []
+    assert pa.validate_symbol_weights(LabelTarget("A", 0.0, [SymbolTarget("AAA", 100.0)])) == []
+
+
+def test_validate_label_targets_reports_exactly_what_validate_symbol_weights_does():
+    """One implementation behind two entry points -- the strings cannot drift."""
+    label = LabelTarget("A", 100.0, [SymbolTarget("AAA", 120.0), SymbolTarget("AAA", -20.0)])
+    assert pa.validate_label_targets([label]) == pa.validate_symbol_weights(label)
+    assert len(pa.validate_symbol_weights(label)) == 2
+
+
+def test_validate_label_targets_forwards_its_tolerance_to_the_symbol_check():
+    """Pre-existing behaviour: a widened tolerance loosens BOTH levels, not just labels."""
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("AAA", 99.0)])]
+    assert pa.validate_label_targets(labels) == [
+        pa.ERROR_SYMBOL_TOTAL_FMT.format(label="A", total=99.0)]
+    assert pa.validate_label_targets(labels, tolerance=5.0) == []
+    assert pa.validate_symbol_weights(labels[0], tolerance=5.0) == []
+
+
+def test_label_investment_coalesces_a_duplicated_symbol_into_one_row():
+    """Two rows for one symbol means two independent orders for it in the same run --
+    which is what compute_allocation's per-symbol dict already prevents."""
+    label = LabelTarget("L", 100.0, [SymbolTarget("AAA", 50.0), SymbolTarget("AAA", 50.0)])
+    plan = pa.compute_label_investment(label, 10_000.0, {"AAA": _pos("AAA", 100.0)}, {},
+                                       available_buying_power=1_000_000.0,
+                                       allow_fractional=False, default_bp_factor=1.0)
+    assert [r.symbol for r in plan.rows] == ["AAA"]
+    assert plan.rows[0].delta_quantity == 100.0
+    assert plan.total_buy_value == pytest.approx(10_000.0)
+
+
+def test_label_investment_coalescing_preserves_first_appearance_order():
+    label = LabelTarget("L", 100.0, [SymbolTarget("BBB", 25.0), SymbolTarget("AAA", 50.0),
+                                     SymbolTarget("BBB", 25.0)])
+    plan = pa.compute_label_investment(label, 10_000.0,
+                                       {"AAA": _pos("AAA", 100.0), "BBB": _pos("BBB", 100.0)}, {},
+                                       available_buying_power=1_000_000.0,
+                                       allow_fractional=False, default_bp_factor=1.0)
+    assert [r.symbol for r in plan.rows] == ["BBB", "AAA"]
+    assert [r.delta_quantity for r in plan.rows] == [50.0, 50.0]

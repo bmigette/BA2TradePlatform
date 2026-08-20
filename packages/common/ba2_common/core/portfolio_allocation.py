@@ -287,6 +287,50 @@ def build_symbol_targets(symbols: List[str],
     return [SymbolTarget(symbol=s, weight_pct=weights[s]) for s in syms]
 
 
+def validate_symbol_weights(label: LabelTarget, *,
+                            tolerance: float = LABEL_TOTAL_TOLERANCE_PCT) -> List[str]:
+    """Validate ONE label's symbol weights. Pure -- returns problems, never raises.
+
+    Checks, in this order: weights total 100 +/- ``tolerance`` (0.01 PERCENTAGE
+    POINTS by default); no negative weight; no symbol repeated within the label.
+
+    The label's OWN ``target_pct`` is deliberately NOT checked, which is why this
+    is separate from ``validate_label_targets``: an INVEST_LABEL run picks a
+    SINGLE label and spends an explicit amount on it, so that label's percentage
+    is meaningless and the labels-total-100 rule would fire spuriously.
+
+    This is the INVEST_LABEL submit gate. Without it ``compute_label_investment``
+    multiplies whatever weights it is handed straight through, so a hand-edited
+    150% set turns a 10,000 budget into 15,000 of buys, and a 60% set silently
+    leaves 40% of the amount as cash with nothing on the plan to say so.
+
+    A label with NO symbols returns no errors -- it has no weights to be wrong.
+    Whether an empty label may be invested into is the caller's decision.
+
+    Returns:
+        List[str]: ``ERROR_SYMBOL_*`` strings naming the offending label and
+        symbol, ready to show verbatim; EMPTY means valid. ``validate_label_targets``
+        calls this for its per-label symbol checks, so the two can never drift.
+    """
+    errors = []
+    if not label.symbols:
+        return errors
+    weight_total = sum(float(st.weight_pct or 0.0) for st in label.symbols)
+    if abs(weight_total - 100.0) > tolerance:
+        errors.append(ERROR_SYMBOL_TOTAL_FMT.format(label=label.label, total=weight_total))
+    seen_symbols = set()
+    for st in label.symbols:
+        weight = float(st.weight_pct or 0.0)
+        if st.symbol in seen_symbols:
+            errors.append(ERROR_SYMBOL_DUPLICATE_FMT.format(label=label.label,
+                                                            symbol=st.symbol))
+        seen_symbols.add(st.symbol)
+        if weight < 0:
+            errors.append(ERROR_SYMBOL_NEGATIVE_FMT.format(label=label.label,
+                                                           symbol=st.symbol, pct=weight))
+    return errors
+
+
 def validate_label_targets(labels: List[LabelTarget], *,
                            tolerance: float = LABEL_TOTAL_TOLERANCE_PCT) -> List[str]:
     """Validate a REBALANCE label set. Pure -- returns problems, never raises.
@@ -295,12 +339,14 @@ def validate_label_targets(labels: List[LabelTarget], *,
     default, so 99.995 passes and 99.98 does not); no negative ``target_pct``; no
     duplicate label names; every non-zero label has at least one symbol.
 
-    SYMBOL level, per label that HAS symbols: weights total 100 +/- the same
-    ``tolerance``; no negative weight; no symbol repeated within the label. The
-    same symbol appearing in DIFFERENT labels is legal and its targets sum
-    (decision 7) -- only a repeat inside one label is an error. Without these
-    checks a hand-edited weight set totalling 150% would silently over-deploy its
-    label, since ``compute_allocation`` multiplies the weights straight through.
+    SYMBOL level, per label that HAS symbols: delegated in full to
+    ``validate_symbol_weights`` (weights total 100 +/- the same ``tolerance``; no
+    negative weight; no symbol repeated within the label) so that the REBALANCE
+    gate here and the INVEST_LABEL gate there can never disagree. The same symbol
+    appearing in DIFFERENT labels is legal and its targets sum (decision 7) --
+    only a repeat inside one label is an error. Without these checks a hand-edited
+    weight set totalling 150% would silently over-deploy its label, since
+    ``compute_allocation`` multiplies the weights straight through.
 
     A label with no symbols is skipped here (an empty label at 0% stays valid; a
     non-zero one is already reported by ``ERROR_LABEL_NO_SYMBOLS_FMT``).
@@ -328,21 +374,7 @@ def validate_label_targets(labels: List[LabelTarget], *,
             errors.append(ERROR_LABEL_NEGATIVE_FMT.format(label=lt.label, pct=pct))
         if pct > 0 and not lt.symbols:
             errors.append(ERROR_LABEL_NO_SYMBOLS_FMT.format(label=lt.label, pct=pct))
-        if not lt.symbols:
-            continue
-        weight_total = sum(float(st.weight_pct or 0.0) for st in lt.symbols)
-        if abs(weight_total - 100.0) > tolerance:
-            errors.append(ERROR_SYMBOL_TOTAL_FMT.format(label=lt.label, total=weight_total))
-        seen_symbols = set()
-        for st in lt.symbols:
-            weight = float(st.weight_pct or 0.0)
-            if st.symbol in seen_symbols:
-                errors.append(ERROR_SYMBOL_DUPLICATE_FMT.format(label=lt.label,
-                                                                symbol=st.symbol))
-            seen_symbols.add(st.symbol)
-            if weight < 0:
-                errors.append(ERROR_SYMBOL_NEGATIVE_FMT.format(label=lt.label,
-                                                               symbol=st.symbol, pct=weight))
+        errors.extend(validate_symbol_weights(lt, tolerance=tolerance))
     return errors
 
 
@@ -587,7 +619,12 @@ def compute_label_investment(label: LabelTarget, amount: float,
     produced, so ``plan.total_sell_value`` is always 0.0 and
     ``plan.net_buy_value == plan.total_buy_value``. Buying-power scaling,
     rounding, missing prices and missing margin info behave exactly as in
-    ``compute_allocation``.
+    ``compute_allocation``, and a symbol repeated inside the label COALESCES into
+    one row whose weight is the sum -- again as in ``compute_allocation``.
+
+    The weights are multiplied straight through, so the caller MUST gate submission
+    on ``validate_symbol_weights``: a 150% set deploys 150% of ``amount`` and a 60%
+    set leaves 40% of it as cash, neither of which this function refuses.
     """
     current = current or {}
     margin = margin or {}
@@ -599,12 +636,18 @@ def compute_label_investment(label: LabelTarget, amount: float,
         plan.unallocatable_pct = 100.0
         plan.warnings.append(WARNING_EMPTY_LABEL_FMT.format(label=label.label, pct=100.0))
         return plan
+    weights: Dict[str, float] = {}
     for st in label.symbols:
-        weight = float(st.weight_pct or 0.0)
+        # A symbol repeated inside one label SUMS into a single row, exactly as
+        # compute_allocation's per-symbol dict does. Two rows would submit two
+        # independent orders for the same symbol in one run, which nothing
+        # downstream expects. validate_symbol_weights is what REPORTS the duplicate.
+        weights[st.symbol] = weights.get(st.symbol, 0.0) + float(st.weight_pct or 0.0)
+    for symbol, weight in weights.items():
         target_notional = budget * weight / 100.0
-        ps = current.get(st.symbol)
-        m = margin.get(st.symbol)
-        row = AllocationRow(symbol=st.symbol, labels=[label.label])
+        ps = current.get(symbol)
+        m = margin.get(symbol)
+        row = AllocationRow(symbol=symbol, labels=[label.label])
         row.bp_factor = float(m.bp_factor) if m is not None else float(default_bp_factor)
         row.current_quantity = float(ps.quantity) if ps is not None else 0.0
         row.current_cost_basis = float(ps.cost_basis) if ps is not None else 0.0
