@@ -20,10 +20,12 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.job import Job
+from sqlmodel import select
 
+from ba2_common.core.utils import normalize_symbol
 from ..core.utils import get_expert_instance_from_id
 from ..logger import logger
-from .db import get_all_instances, get_instance, get_setting
+from .db import get_all_instances, get_db, get_instance, get_setting
 from .interfaces import MarketExpertInterface
 from .models import ExpertInstance, ExpertSetting, Instrument
 from .WorkerQueue import get_worker_queue, AnalysisTask

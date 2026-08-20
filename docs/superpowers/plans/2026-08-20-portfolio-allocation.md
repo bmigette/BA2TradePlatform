@@ -613,7 +613,7 @@ git commit -m "feat(ui): normalise instrument symbols on the Settings import and
 
 ### Task 3: Normalise the two background instrument-creation paths
 
-> **Also normalise the un-normalised instrument READ at `ba2_trade_platform/ui/pages/settings.py:2082`.**
+> **Also normalise the un-normalised instrument READ at `ba2_trade_platform/ui/pages/settings.py` (the file's only `Instrument.name == symbol`; it was `:2082` when the plan was written and is `:2085` after Task 2's hoist — grep for it rather than trusting the number).**
 > It does `select(Instrument).where(Instrument.name == symbol)` when loading expert instrument
 > config. Every WRITE path normalises as of Tasks 1-2, so this read can now miss a row it should
 > find. It is one line — wrap the comparison value in `normalize_symbol(...)`. `normalize_symbol` is
@@ -1625,6 +1625,14 @@ git commit -m "feat(db): migration merging duplicate instruments and adding ix_i
 > with `ui.notify(..., type='negative')` and leaves the dialog open. Do NOT use `type='error'` —
 > that is invalid, and the two existing uses at `settings.py:1023` and `:1041` are a known bug you
 > are not fixing here.
+>
+> **The insert becomes a race the moment the index exists.** Both
+> `JobManager.ensure_instrument_exists` and `InstrumentAutoAdder._add_instrument_if_missing` do
+> select-then-insert, and both can run concurrently — the auto-adder has its own worker thread and
+> APScheduler runs jobs on a pool. Today two threads that both miss the same symbol produce a
+> harmless duplicate row; with `unique=True` the loser gets an `IntegrityError`. Wrap both inserts
+> in `except IntegrityError: session.rollback()` and re-select, and add a test that two concurrent
+> inserts of the same symbol yield one row and no exception.
 >
 > **Cover the submit path too.** `JobManager.submit_market_analysis` now calls
 > `ensure_instrument_exists(symbol)`, which correctly writes nothing for a blank symbol and returns
