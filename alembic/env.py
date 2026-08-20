@@ -17,12 +17,23 @@ sys.path.insert(0, _REPO_ROOT)
 # in this checkout (they resolve to the MAIN worktree, or to nothing at all). Only
 # pytest.ini's `pythonpath` made those imports work, so `alembic <anything>` and
 # `python migrate.py upgrade` died with ModuleNotFoundError unless the caller
-# remembered a PYTHONPATH prefix. Prepending -- like pytest does -- so THIS
-# checkout's packages win over any stale editable install.
-for _pkg in ("common", "providers", "experts"):
-    _pkg_path = os.path.join(_REPO_ROOT, "packages", _pkg)
-    if _pkg_path not in sys.path:
-        sys.path.insert(0, _pkg_path)
+# remembered a PYTHONPATH prefix.
+#
+# PREPENDED, not appended -- like pytest.ini's `pythonpath` -- so THIS checkout's
+# packages win over a stale editable install pointing at another worktree. The cost
+# is that these directories, and the repo root, sit ahead of site-packages: any
+# top-level module under packages/*/ (its `tests` package), or under the repo root
+# (`tools`, `test_files`, `logs`), now shadows a same-named installed distribution.
+# Nothing collides today, but that is the surface being traded for correctness.
+#
+# Sliced in one go rather than insert(0) in a loop: three separate insert(0) calls
+# would leave the reversed order (experts, providers, common) on sys.path, which is
+# not what the tuple reads like.
+_PACKAGE_PATHS = [
+    os.path.join(_REPO_ROOT, "packages", _pkg)
+    for _pkg in ("common", "providers", "experts")
+]
+sys.path[0:0] = [_p for _p in _PACKAGE_PATHS if _p not in sys.path]
 
 # Import SQLModel metadata and configure database
 from sqlmodel import SQLModel

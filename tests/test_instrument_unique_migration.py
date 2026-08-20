@@ -89,6 +89,18 @@ def _indexes(engine):
         return {r[1]: r[2] for r in conn.execute(text("PRAGMA index_list(instrument)"))}
 
 
+@pytest.fixture(autouse=True)
+def _no_ambient_dry_run(monkeypatch):
+    """Every test starts with BA2_INSTRUMENT_MERGE_DRY_RUN unset.
+
+    The flag is fail-safe: anything that is not explicitly false means dry run. So
+    a value left in the developer's shell would turn every real-run test in this
+    file into a silent no-op that still passed its "nothing was written" asserts.
+    The dry-run tests opt back in explicitly.
+    """
+    monkeypatch.delenv("BA2_INSTRUMENT_MERGE_DRY_RUN", raising=False)
+
+
 def test_alembic_runs_without_a_pythonpath_prefix(tmp_path):
     """`alembic current` must work with a bare interpreter, no PYTHONPATH prefix.
 
@@ -125,7 +137,13 @@ def test_alembic_heads_is_this_revision_alone_without_a_pythonpath_prefix(tmp_pa
         cwd=REPO, env=env, capture_output=True, text=True, timeout=300,
     )
     assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-    assert result.stdout.split() == ['f1a7c2e9b4d0', '(head)'], result.stdout
+    # The id is deliberately NOT pinned: Task 8 chains f1c8a24b7e05 onto this
+    # revision, which would break the assert without anything being wrong. What
+    # matters here is that the command runs at all (no module-scope app import)
+    # and that the chain has not accidentally forked.
+    heads = [line for line in result.stdout.splitlines() if line.strip()]
+    assert len(heads) == 1, f"expected exactly one head, got:\n{result.stdout}"
+    assert '(head)' in heads[0], result.stdout
 
 
 def test_migration_declares_the_verified_head_as_its_parent():
@@ -222,6 +240,98 @@ def test_dry_run_env_var_reports_and_aborts_without_touching_the_database(tmp_pa
     printed = capsys.readouterr().out
     assert "AAPL" in printed and "MSFT" in printed
     assert _rows(engine) == before
+    assert 'ix_instrument_name' not in _indexes(engine)
+
+
+@pytest.mark.parametrize("value", ['1', 'true', 'TRUE', 'yes', ' 1 ', 'on', 'ON', 'Y', 'enabled', '2'])
+def test_any_value_that_is_not_explicitly_false_means_dry_run(tmp_path, monkeypatch, value):
+    """A truthy-value WHITELIST here would irreversibly delete production rows.
+
+    'on', 'Y', 'enabled' and '2' are all things an operator plausibly types when
+    they mean "just show me". Under a whitelist every one of them falls through to
+    the real merge -- the exact failure this flag exists to prevent -- so anything
+    unrecognised must abort instead.
+    """
+    engine = _build_premerge_db(tmp_path)
+    before = _rows(engine)
+    monkeypatch.setenv("BA2_INSTRUMENT_MERGE_DRY_RUN", value)
+
+    with pytest.raises(RuntimeError, match="BA2_INSTRUMENT_MERGE_DRY_RUN"):
+        _run_upgrade(engine, _load_migration_module())
+
+    assert _rows(engine) == before
+    assert 'ix_instrument_name' not in _indexes(engine)
+
+
+@pytest.mark.parametrize("value", ['', '0', 'false', 'FALSE', 'no', ' no '])
+def test_only_explicit_falsiness_arms_the_real_merge(tmp_path, monkeypatch, value):
+    """The other direction: disarming still has to work, or the flag is a wall."""
+    engine = _build_premerge_db(tmp_path)
+    monkeypatch.setenv("BA2_INSTRUMENT_MERGE_DRY_RUN", value)
+
+    _run_upgrade(engine, _load_migration_module())
+
+    assert _rows(engine) == [(1, 'AAPL'), (3, 'MSFT'), (4, 'NVDA')]
+    assert _indexes(engine).get('ix_instrument_name') == 1
+
+
+@pytest.mark.parametrize("ddl", [
+    "CREATE INDEX ix_instrument_name ON instrument (name)",          # right column, not unique
+    "CREATE UNIQUE INDEX ix_instrument_name ON instrument (id)",     # unique, wrong column
+])
+def test_upgrade_refuses_an_index_that_only_borrows_the_name(tmp_path, ddl):
+    """An index merely NAMED ix_instrument_name must not satisfy the guard.
+
+    Skipping on the name alone means the migration reports success and stamps the
+    revision while uniqueness is not enforced at all -- every downstream task then
+    builds on an invariant that silently does not hold. Loud failure only.
+    """
+    engine = _build_premerge_db(tmp_path)
+    with engine.begin() as conn:
+        conn.execute(text(ddl))
+    before = _rows(engine)
+
+    with pytest.raises(RuntimeError, match="not UNIQUE"):
+        _run_upgrade(engine, _load_migration_module())
+
+    # and the merge went back with it: untouched, not half-migrated
+    assert _rows(engine) == before
+
+
+class _CreateIndexExplodes:
+    """Real Operations, except create_index raises -- a mid-migration failure."""
+
+    def __init__(self, ops):
+        self._ops = ops
+
+    def __getattr__(self, name):
+        return getattr(self._ops, name)
+
+    def create_index(self, *args, **kwargs):
+        raise RuntimeError("simulated failure during CREATE UNIQUE INDEX")
+
+
+def test_a_failure_at_index_creation_rolls_the_entire_merge_back(tmp_path):
+    """The property the whole recovery story rests on: all-or-nothing.
+
+    `merge_duplicate_instruments` deliberately does not open or commit its own
+    transaction, so the merge and the CREATE UNIQUE INDEX live or die together.
+    That is what makes "if it fails, just re-run it" true, and what makes
+    hand-repairing rows the wrong move.
+    """
+    engine = _build_premerge_db(tmp_path)
+    module = _load_migration_module()
+    before = _rows(engine)
+    assert before == [(1, 'AAPL'), (2, 'AAPL'), (3, 'msft'), (4, 'NVDA')]
+
+    with pytest.raises(RuntimeError, match="simulated failure"):
+        with engine.begin() as conn:
+            ctx = MigrationContext.configure(conn, opts={"as_batch": True})
+            module.op = _CreateIndexExplodes(Operations(ctx))
+            module.sa = sqlalchemy
+            module.upgrade()
+
+    assert _rows(engine) == before      # deleted row back, 'msft' still lower-case
     assert 'ix_instrument_name' not in _indexes(engine)
 
 

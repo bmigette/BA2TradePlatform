@@ -1462,9 +1462,15 @@ git commit -m "feat(instruments): shared, idempotent duplicate-instrument merge"
 > remember a prefix. Add a test that asserts `alembic current` exits 0 with a bare
 > `venv/bin/python`. This is a prerequisite for testing your revision, not optional cleanup.
 >
-> **AS BUILT (Task 5).** The three directories are `sys.path.insert(0, ...)`-ed, not appended:
-> the existing repo-root line prepends, and so does pytest.ini's `pythonpath`, so *this*
-> checkout's `packages/*` must win over the stale editable installs pointing elsewhere.
+> **AS BUILT (Task 5).** The three directories are prepended, not appended: the existing
+> repo-root line prepends, and so does pytest.ini's `pythonpath`, so *this* checkout's
+> `packages/*` must win over the stale editable installs pointing elsewhere. They go on in one
+> `sys.path[0:0] = [...]` slice — three separate `insert(0, ...)` calls would leave the
+> REVERSED order (`experts, providers, common`) on `sys.path`, which is not what the tuple
+> reads like. Verified order after the fix: `common, providers, experts, <repo root>`.
+> The tradeoff, stated so it is not a surprise later: prepending puts `packages/*/tests` and
+> the repo root's `tools`, `test_files` and `logs` ahead of site-packages, so any top-level
+> module there now shadows a same-named installed distribution. Nothing collides today.
 >
 > **AS BUILT: this fix does not cover every alembic command.** `alembic heads` / `history` /
 > `branches` (i.e. `migrate.py heads|history`) import every revision module but never run
@@ -1491,6 +1497,25 @@ also carries a dry-run mode so the affected names can be inspected against the p
 database before anything is written.
 
 **This revision's id, `f1a7c2e9b4d0`, is the `down_revision` of Task 8's revision.**
+
+**AS BUILT — three hardening changes after code review, all with tests:**
+
+1. **The dry-run flag is fail-SAFE, not fail-dangerous.** A truthy whitelist
+   (`1`/`true`/`yes`) meant `on`, `ON`, `Y`, `enabled`, `2` and `dry-run` all fell through and
+   performed the real, irreversible merge. On the one flag whose entire job is to stop an
+   operator deleting 124 production rows, an unrecognised value must never mean "go ahead".
+   Inverted: only `''`, `0`, `false`, `no` disarm; everything else reports and aborts.
+2. **The index guard checks the DEFINITION, not just the name.** An index merely *named*
+   `ix_instrument_name` (non-unique, or over another column) used to satisfy the skip, so the
+   migration reported success and stamped the revision while uniqueness was not enforced at
+   all. It now raises. `downgrade()` got the same care — it refuses to drop an index it does
+   not own rather than destroying someone else's.
+3. **A production runbook lives in the revision docstring**, because `MIGRATIONS.md` only has
+   generic advice: stop the app, back up (the only way back), catch up to `0a3e0bd24598`
+   FIRST so the dry run is genuinely read-only, dry run (exit 1 + RuntimeError is SUCCESS),
+   real run with the variable UNSET, verification queries, "if it fails just re-run — it rolls
+   back atomically", and: **must not reach production before Task 6 ships in the same
+   deployment.**
 
 **Files:**
 - Modify: `alembic/env.py` (the sys.path prerequisite above)
@@ -1593,6 +1618,18 @@ def _indexes(engine):
         return {r[1]: r[2] for r in conn.execute(text("PRAGMA index_list(instrument)"))}
 
 
+@pytest.fixture(autouse=True)
+def _no_ambient_dry_run(monkeypatch):
+    """Every test starts with BA2_INSTRUMENT_MERGE_DRY_RUN unset.
+
+    The flag is fail-safe: anything that is not explicitly false means dry run. So
+    a value left in the developer's shell would turn every real-run test in this
+    file into a silent no-op that still passed its "nothing was written" asserts.
+    The dry-run tests opt back in explicitly.
+    """
+    monkeypatch.delenv("BA2_INSTRUMENT_MERGE_DRY_RUN", raising=False)
+
+
 def test_alembic_runs_without_a_pythonpath_prefix(tmp_path):
     """`alembic current` must work with a bare interpreter, no PYTHONPATH prefix.
 
@@ -1629,7 +1666,13 @@ def test_alembic_heads_is_this_revision_alone_without_a_pythonpath_prefix(tmp_pa
         cwd=REPO, env=env, capture_output=True, text=True, timeout=300,
     )
     assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-    assert result.stdout.split() == ['f1a7c2e9b4d0', '(head)'], result.stdout
+    # The id is deliberately NOT pinned: Task 8 chains f1c8a24b7e05 onto this
+    # revision, which would break the assert without anything being wrong. What
+    # matters here is that the command runs at all (no module-scope app import)
+    # and that the chain has not accidentally forked.
+    heads = [line for line in result.stdout.splitlines() if line.strip()]
+    assert len(heads) == 1, f"expected exactly one head, got:\n{result.stdout}"
+    assert '(head)' in heads[0], result.stdout
 
 
 def test_migration_declares_the_verified_head_as_its_parent():
@@ -1729,6 +1772,98 @@ def test_dry_run_env_var_reports_and_aborts_without_touching_the_database(tmp_pa
     assert 'ix_instrument_name' not in _indexes(engine)
 
 
+@pytest.mark.parametrize("value", ['1', 'true', 'TRUE', 'yes', ' 1 ', 'on', 'ON', 'Y', 'enabled', '2'])
+def test_any_value_that_is_not_explicitly_false_means_dry_run(tmp_path, monkeypatch, value):
+    """A truthy-value WHITELIST here would irreversibly delete production rows.
+
+    'on', 'Y', 'enabled' and '2' are all things an operator plausibly types when
+    they mean "just show me". Under a whitelist every one of them falls through to
+    the real merge -- the exact failure this flag exists to prevent -- so anything
+    unrecognised must abort instead.
+    """
+    engine = _build_premerge_db(tmp_path)
+    before = _rows(engine)
+    monkeypatch.setenv("BA2_INSTRUMENT_MERGE_DRY_RUN", value)
+
+    with pytest.raises(RuntimeError, match="BA2_INSTRUMENT_MERGE_DRY_RUN"):
+        _run_upgrade(engine, _load_migration_module())
+
+    assert _rows(engine) == before
+    assert 'ix_instrument_name' not in _indexes(engine)
+
+
+@pytest.mark.parametrize("value", ['', '0', 'false', 'FALSE', 'no', ' no '])
+def test_only_explicit_falsiness_arms_the_real_merge(tmp_path, monkeypatch, value):
+    """The other direction: disarming still has to work, or the flag is a wall."""
+    engine = _build_premerge_db(tmp_path)
+    monkeypatch.setenv("BA2_INSTRUMENT_MERGE_DRY_RUN", value)
+
+    _run_upgrade(engine, _load_migration_module())
+
+    assert _rows(engine) == [(1, 'AAPL'), (3, 'MSFT'), (4, 'NVDA')]
+    assert _indexes(engine).get('ix_instrument_name') == 1
+
+
+@pytest.mark.parametrize("ddl", [
+    "CREATE INDEX ix_instrument_name ON instrument (name)",          # right column, not unique
+    "CREATE UNIQUE INDEX ix_instrument_name ON instrument (id)",     # unique, wrong column
+])
+def test_upgrade_refuses_an_index_that_only_borrows_the_name(tmp_path, ddl):
+    """An index merely NAMED ix_instrument_name must not satisfy the guard.
+
+    Skipping on the name alone means the migration reports success and stamps the
+    revision while uniqueness is not enforced at all -- every downstream task then
+    builds on an invariant that silently does not hold. Loud failure only.
+    """
+    engine = _build_premerge_db(tmp_path)
+    with engine.begin() as conn:
+        conn.execute(text(ddl))
+    before = _rows(engine)
+
+    with pytest.raises(RuntimeError, match="not UNIQUE"):
+        _run_upgrade(engine, _load_migration_module())
+
+    # and the merge went back with it: untouched, not half-migrated
+    assert _rows(engine) == before
+
+
+class _CreateIndexExplodes:
+    """Real Operations, except create_index raises -- a mid-migration failure."""
+
+    def __init__(self, ops):
+        self._ops = ops
+
+    def __getattr__(self, name):
+        return getattr(self._ops, name)
+
+    def create_index(self, *args, **kwargs):
+        raise RuntimeError("simulated failure during CREATE UNIQUE INDEX")
+
+
+def test_a_failure_at_index_creation_rolls_the_entire_merge_back(tmp_path):
+    """The property the whole recovery story rests on: all-or-nothing.
+
+    `merge_duplicate_instruments` deliberately does not open or commit its own
+    transaction, so the merge and the CREATE UNIQUE INDEX live or die together.
+    That is what makes "if it fails, just re-run it" true, and what makes
+    hand-repairing rows the wrong move.
+    """
+    engine = _build_premerge_db(tmp_path)
+    module = _load_migration_module()
+    before = _rows(engine)
+    assert before == [(1, 'AAPL'), (2, 'AAPL'), (3, 'msft'), (4, 'NVDA')]
+
+    with pytest.raises(RuntimeError, match="simulated failure"):
+        with engine.begin() as conn:
+            ctx = MigrationContext.configure(conn, opts={"as_batch": True})
+            module.op = _CreateIndexExplodes(Operations(ctx))
+            module.sa = sqlalchemy
+            module.upgrade()
+
+    assert _rows(engine) == before      # deleted row back, 'msft' still lower-case
+    assert 'ix_instrument_name' not in _indexes(engine)
+
+
 def test_downgrade_drops_the_index_but_keeps_the_merged_rows(tmp_path):
     engine = _build_premerge_db(tmp_path)
     module = _load_migration_module()
@@ -1751,8 +1886,12 @@ Expected: FAIL — every migration test errors with
 `AssertionError: missing migration file .../alembic/versions/f1a7c2e9b4d0_merge_duplicate_instruments_unique_name.py`,
 and the two alembic-bootstrap tests fail on `returncode == 1` /
 `ModuleNotFoundError: No module named 'ba2_common'`.
-ACTUAL: `7 failed` for exactly those reasons (the 124-group test was added later, with the
-migration already in place — it is the one test in this file never observed red).
+ACTUAL: `7 failed` for exactly those reasons. Three later tests were added with the migration
+already in place and so were never observed red as written; each was instead proven non-vacuous
+by reverting the behaviour it guards and watching it fail — the truthy-whitelist revert failed
+`[on] [ON] [Y] [enabled] [2]`, the name-only index guard revert failed both impostor cases, and
+injecting a `connection.commit()` mid-migration failed the rollback test. The 124-group
+production-shape test is the only one with no such demonstration.
 
 - [x] **Step 3: Write minimal implementation**
 
@@ -1793,13 +1932,62 @@ declared `Field(unique=True, index=True)`, which makes SQLModel's create_all emi
 (verified by probe). Any other name here and a migrated database would disagree
 with a freshly created one forever.
 
-DRY RUN -- inspect the affected names before committing to the merge. This prints
-every group and aborts before writing anything, so it is read-only:
-
-    BA2_INSTRUMENT_MERGE_DRY_RUN=1 BA2_DB_FILE=/path/to/db.sqlite \
-        venv/bin/python -m alembic upgrade head
-
 The merge is NOT reversible: downgrade only drops the index.
+
+PRODUCTION RUNBOOK
+==================
+For ~/Documents/ba2/trade/db.sqlite. The order is load-bearing; do not skip ahead.
+
+0. SHIP THIS TOGETHER WITH TASK 6, NEVER BEFORE IT. Once the unique index exists,
+   write paths that today insert a silent duplicate start raising IntegrityError.
+   Task 6 is what normalises and guards them. Same deployment, or not at all.
+
+1. STOP THE APP FIRST. InstrumentAutoAdder and JobManager add instruments from
+   background threads. One insert landing between the merge and the CREATE UNIQUE
+   INDEX re-introduces a duplicate and fails the index creation.
+
+2. BACK UP. THIS IS THE ONLY WAY BACK. `downgrade` drops the index but CANNOT
+   restore the deleted rows -- no downgrade, no undo, only this copy:
+
+       cp ~/Documents/ba2/trade/db.sqlite ~/Documents/ba2/trade/db.sqlite.bak-YYYYMMDD
+
+3. CATCH UP TO THIS REVISION'S PARENT FIRST, ON ITS OWN. Production was last seen
+   at d5e1b9a3c842, which is behind 0a3e0bd24598. Step 4 is only read-only if
+   there is nothing left in front of it to apply:
+
+       venv/bin/python -m alembic upgrade 0a3e0bd24598
+
+4. DRY RUN. Read-only ONLY from 0a3e0bd24598 -- from any earlier revision alembic
+   commits the intervening migrations before reaching this one (observed, not
+   theorised), so step 3 is not optional:
+
+       BA2_INSTRUMENT_MERGE_DRY_RUN=1 venv/bin/python -m alembic upgrade f1a7c2e9b4d0
+
+   EXIT CODE 1 WITH A RuntimeError TRACEBACK IS SUCCESS, NOT FAILURE. Raising is
+   how the dry run refuses to write. Now read the printed group count: 124 was the
+   verified figure on 2026-08-20. Materially different means the table moved under
+   you -- STOP and re-check instead of proceeding.
+
+5. REAL RUN. UNSET the variable -- do not set it to 0. Any value this flag does not
+   recognise as explicitly false means DRY RUN, so an unset variable is the only
+   unambiguous way to ask for the real, irreversible merge:
+
+       unset BA2_INSTRUMENT_MERGE_DRY_RUN
+       venv/bin/python -m alembic upgrade f1a7c2e9b4d0
+
+6. VERIFY, before restarting the app:
+
+       sqlite3 db.sqlite "SELECT count(*), count(DISTINCT name) FROM instrument;"
+         -> 2353|2353   (2477 rows before; 124 deleted)
+       sqlite3 db.sqlite "SELECT sql FROM sqlite_master WHERE name='ix_instrument_name';"
+         -> CREATE UNIQUE INDEX ix_instrument_name ON instrument (name)
+       venv/bin/python -m alembic current
+         -> f1a7c2e9b4d0
+
+7. IF IT FAILS, JUST RE-RUN IT. The merge and the index creation share one alembic
+   transaction -- verified by injecting a failure at create_index against a copy of
+   the real database, where all 124 merged groups rolled back intact. The table is
+   either fully merged or untouched. Do NOT hand-repair rows.
 """
 import os
 from typing import Sequence, Union
@@ -1816,10 +2004,35 @@ depends_on: Union[str, Sequence[str], None] = None
 
 INDEX_NAME = 'ix_instrument_name'
 
+# Only these disarm the dry run. See _dry_run_requested.
+_EXPLICITLY_NOT_A_DRY_RUN = ('', '0', 'false', 'no')
+
 
 def _dry_run_requested() -> bool:
-    """Whether BA2_INSTRUMENT_MERGE_DRY_RUN asks for a report-only run."""
-    return os.environ.get('BA2_INSTRUMENT_MERGE_DRY_RUN', '').strip().lower() in ('1', 'true', 'yes')
+    """Whether BA2_INSTRUMENT_MERGE_DRY_RUN asks for a report-only run.
+
+    FAIL-SAFE, NOT FAIL-DANGEROUS: anything that is not explicitly false means
+    yes. A whitelist of truthy spellings would silently perform the real,
+    irreversible deletion of ~124 production rows for an operator who typed
+    ``on``, ``Y``, ``enabled`` or ``2`` and believed they had asked for a report.
+    On this flag, an unrecognised value must never mean "go ahead"; the cost of
+    guessing wrong in this direction is one wasted, harmless run.
+    """
+    raw = os.environ.get('BA2_INSTRUMENT_MERGE_DRY_RUN', '').strip().lower()
+    return raw not in _EXPLICITLY_NOT_A_DRY_RUN
+
+
+def _find_index(connection):
+    """The reflected definition of INDEX_NAME on `instrument`, or None."""
+    for index in sa.inspect(connection).get_indexes('instrument'):
+        if index['name'] == INDEX_NAME:
+            return index
+    return None
+
+
+def _is_unique_on_name(index) -> bool:
+    """Whether a reflected index really is UNIQUE over exactly (name)."""
+    return bool(index.get('unique')) and list(index.get('column_names') or []) == ['name']
 
 
 def upgrade() -> None:
@@ -1856,24 +2069,46 @@ def upgrade() -> None:
         f"deleted {stats['rows_deleted']} row(s), normalised {stats['rows_renamed']} name(s)"
     )
 
-    existing = {ix['name'] for ix in sa.inspect(connection).get_indexes('instrument')}
-    if INDEX_NAME not in existing:
+    # Checked by DEFINITION, not just by name. Skipping on the name alone lets an
+    # index that merely happens to be called ix_instrument_name -- non-unique, or
+    # over the wrong column -- satisfy the guard: the migration would report
+    # success, stamp the revision, and leave uniqueness unenforced, which is the
+    # single invariant every downstream task is built on. Fail loudly instead.
+    existing = _find_index(connection)
+    if existing is None:
         op.create_index(INDEX_NAME, 'instrument', ['name'], unique=True)
+    elif not _is_unique_on_name(existing):
+        raise RuntimeError(
+            f"{INDEX_NAME} already exists but is not UNIQUE(name): {existing!r}. "
+            "Uniqueness is NOT enforced. Drop that index and re-run this migration."
+        )
 
 
 def downgrade() -> None:
     """Downgrade schema. The row merge cannot be undone; only the index is dropped."""
     connection = op.get_bind()
-    existing = {ix['name'] for ix in sa.inspect(connection).get_indexes('instrument')}
-    if INDEX_NAME in existing:
-        op.drop_index(INDEX_NAME, table_name='instrument')
+
+    # Same care as upgrade(): drop only the index this revision created. Dropping
+    # whatever else happens to carry the name would destroy someone else's index
+    # and report success.
+    existing = _find_index(connection)
+    if existing is None:
+        return
+    if not _is_unique_on_name(existing):
+        raise RuntimeError(
+            f"{INDEX_NAME} exists but is not the UNIQUE(name) index this revision "
+            f"created: {existing!r}. Refusing to drop an index this migration does "
+            "not own; inspect it and drop it by hand if that is really what you want."
+        )
+    op.drop_index(INDEX_NAME, table_name='instrument')
 ```
 
 - [x] **Step 4: Run test to verify it passes**
 
 Run: `venv/bin/python -m pytest tests/test_instrument_unique_migration.py -v`
-Expected: PASS. ACTUAL: `9 passed` (6 from the plan, + 2 alembic-bootstrap, + the 124-group
-production-shape test).
+Expected: PASS. ACTUAL: `28 passed` — 6 from the plan, 2 alembic-bootstrap, the 124-group
+production-shape test, 16 parametrised dry-run-flag cases (both directions), 2 impostor-index
+cases, and the merge-rolls-back-when-index-creation-fails test.
 
 Then confirm the revision chain still has exactly one head — no PYTHONPATH prefix any more,
 that is the whole point of the prerequisite:
