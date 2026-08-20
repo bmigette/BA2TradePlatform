@@ -5,6 +5,7 @@ from alpaca.common.exceptions import APIError
 from typing import Any, Dict, List, Optional
 from dataclasses import replace
 from datetime import datetime, timezone, timedelta
+import math
 import time
 import threading
 import functools
@@ -847,6 +848,33 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             return BrokerOrderErrorReason.INSUFFICIENT_QTY
         return BrokerOrderErrorReason.UNKNOWN
 
+    def _record_fractional_adjustment(self, trading_order: TradingOrder,
+                                      quantity: Optional[float], reason: str) -> None:
+        """Persist a submission-time fractional-quantity adjustment onto the order row.
+
+        ``quantity`` is the whole-share quantity actually being sent, or ``None`` when
+        nothing is being sent at all (the SKIP case: flooring left 0 shares). A skip is
+        marked CANCELED — terminal, but deliberately NOT ERROR: no broker rejected
+        anything and the account is healthy, there was simply no whole share left to
+        trade, so it must not show up as a broker failure in the UI or the logs.
+
+        The reason is appended to ``comment`` (same convention as
+        ``_handle_order_submit_error``) so it is legible in the Pending Orders UI and not
+        only in the log.
+        """
+        fresh_order = get_instance(TradingOrder, trading_order.id)
+        if not fresh_order:
+            logger.error(
+                f"Could not find order {trading_order.id} to record fractional adjustment: {reason}")
+            return
+        if quantity is None:
+            fresh_order.status = OrderStatus.CANCELED
+        else:
+            fresh_order.quantity = quantity
+        fresh_order.comment = (
+            f"{fresh_order.comment} | {reason}" if fresh_order.comment else reason)[:500]
+        update_instance(fresh_order)
+
     @alpaca_api_retry
     def _submit_order_impl(self, trading_order: TradingOrder, tp_price: Optional[float] = None, sl_price: Optional[float] = None, is_closing_order: bool = False, use_complex_order: bool = False) -> TradingOrder:
         """
@@ -966,7 +994,61 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             
             # Import OrderType enum from core.types to compare values
             from ...core.types import OrderType as CoreOrderType
-            
+
+            # ---- Fractional quantities -----------------------------------------------
+            # Alpaca accepts a fractional quantity ONLY on a DAY MARKET order. Two traps:
+            #
+            #  1. tif_map above resolves an unknown/absent good_for to GTC, and the
+            #     allocation actions build their orders with no good_for at all — so a
+            #     fractional order would go out GTC and be refused by the broker. Force
+            #     DAY rather than trusting every future caller to remember.
+            #  2. Every non-MARKET type (limit / stop / stop-limit / OCO) refuses
+            #     fractional outright — including a protective TP/SL leg whose quantity
+            #     was inherited from a fractional position. Those fall back ONCE to
+            #     floor(qty) whole shares: it is a guaranteed rejection otherwise, and
+            #     flooring under-fills rather than overspending the target. The floored
+            #     quantity is written back so the ledger matches what the broker got.
+            #
+            # A floor of 0 leaves nothing to send. That is a SKIP, not a failure —
+            # nothing was rejected and nothing is wrong with the account — so the row is
+            # marked CANCELED with the reason, never ERROR.
+            #
+            # Sizing itself is NOT re-derived here: the allocation engine already decided
+            # fractional-vs-whole (opt-in per run, gated on the broker's own per-symbol
+            # `fractionable` flag) and did the rounding. This is submission-time
+            # enforcement of a broker constraint only.
+            quantity_value = float(trading_order.quantity or 0.0)
+            if quantity_value != int(quantity_value):
+                if order_type_value == CoreOrderType.MARKET.value.lower():
+                    if time_in_force != TimeInForce.DAY:
+                        logger.info(
+                            f"Order {trading_order.id} ({trading_order.symbol}) has fractional "
+                            f"qty={quantity_value}; forcing time_in_force DAY (was "
+                            f"{time_in_force.value}) — Alpaca rejects fractional on any other TIF"
+                        )
+                        time_in_force = TimeInForce.DAY
+                else:
+                    whole_shares = float(math.floor(quantity_value))
+                    reason = (f"fractional qty {quantity_value} is not accepted by Alpaca on a "
+                              f"{order_type_value} order")
+                    if whole_shares <= 0:
+                        logger.warning(
+                            f"Order {trading_order.id} ({trading_order.symbol}) skipped: "
+                            f"{reason}, and flooring leaves 0 whole shares — nothing submitted"
+                        )
+                        self._record_fractional_adjustment(
+                            trading_order, None,
+                            f"skipped: {reason}; flooring leaves 0 whole shares")
+                        return None
+                    logger.warning(
+                        f"Order {trading_order.id} ({trading_order.symbol}): {reason}; "
+                        f"submitting {whole_shares} whole shares instead of {quantity_value}"
+                    )
+                    trading_order.quantity = whole_shares
+                    self._record_fractional_adjustment(
+                        trading_order, whole_shares,
+                        f"{reason}; floored to {whole_shares} whole shares")
+
             # Note: We do NOT create bracket orders. TP/SL will be handled separately
             # as STOP_LIMIT orders after the entry order fills.
             # The parent AccountInterface.submit_order() will create pending_trigger orders.
@@ -1556,12 +1638,26 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
 
         # TradeAccount carries no fractional flag; AccountConfiguration does.
         # A failure here must not lose the balances we already have.
+        #
+        # This flag stays BOOLEAN, not tri-state, on purpose. "Couldn't ask" and "known
+        # not fractional" are collapsed to False because the only defensible handling of
+        # an unknown is the same as False -- and the failure is one-directional: a
+        # degraded read can only SUPPRESS fractional sizing (a smaller, always-legal
+        # whole-share order), never wrongly enable it. Fractional also requires the
+        # per-symbol `fractionable` flag from get_symbol_margin_info(), an independent
+        # read from a different endpoint, so this is not a single point of truth. What
+        # a tri-state would really have bought is visibility, and that is what the
+        # WARNING below gives -- a silent debug line was the actual defect.
         supports_fractional = False
         try:
             supports_fractional = bool(getattr(self.client.get_account_configurations(),
                                                'fractional_trading', False))
         except Exception as e:
-            logger.debug(f"[Account {self.id}] Could not read account configurations: {e}")
+            logger.warning(
+                f"[Account {self.id}] Could not read account configurations ({e}) — "
+                f"reporting supports_fractional=False; this run will size whole shares "
+                f"even if the account is fractional-capable"
+            )
 
         return AccountSnapshot(
             cash=_f('cash'),

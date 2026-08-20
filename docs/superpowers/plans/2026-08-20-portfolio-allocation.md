@@ -8971,169 +8971,217 @@ git commit -m "fix(actions): IncreaseInstrumentShareAction reads buying power vi
 > the next reader knows it was weighed rather than missed.
 
 
-Read `AlpacaAccount.py:832-980` before touching this. The relevant fact is at
-`:934-940`: `good_for` is mapped through a `tif_map` dict whose keys are
+Read `AlpacaAccount.py:851-1000` before touching this (the line numbers in the
+original draft, `:832-980`, drifted by ~19 as Tasks 31-34 landed). The relevant fact
+is at `:951-959`: `good_for` is mapped through a `tif_map` dict whose keys are
 `'day','gtc','opg','ioc','fok','cls'`, and the lookup is
 `time_in_force = tif_map.get(good_for_value, TimeInForce.GTC)` — so a `good_for` of
 `None` or anything unrecognised silently becomes **GTC**. Alpaca rejects fractional
 quantities on GTC and on any non-market order type, so a fractional order built
-without an explicit `good_for='day'` is guaranteed to be refused by the broker.
+without an explicit `good_for='day'` is guaranteed to be refused by the broker. The
+allocation actions in `TradeActions.py` build their orders with `order_type="market"`
+and no `good_for` at all, so this is the live path, not a hypothetical one.
 
 Rather than trusting every future caller to set `good_for` correctly, the adapter
-enforces it: a fractional MARKET order is forced to DAY, and a fractional non-market
-order is refused loudly at our end instead of at the broker's.
+enforces it: a fractional MARKET order is forced to DAY.
+
+**Deviation from the original draft (implemented as described here).** The draft
+`raise`d on a fractional non-market order. It does NOT raise: it falls back ONCE to
+`floor(qty)` whole shares and submits the same order type. Raising is wrong for the
+real producer of fractional non-market orders — a protective TP/SL leg whose quantity
+was inherited from a fractional position (`AccountInterface.submit_order` syncs a
+leg's quantity to its parent entry). Raising there marks the leg ERROR and leaves the
+position with **no** exit; flooring protects the whole-share part of it. Flooring never
+rounds up, so it can only under-fill, never overspend the target. The floored quantity
+is written back to the row so the ledger matches what the broker actually received.
+
+Converting a fractional non-market order to MARKET was considered and rejected: it
+would silently discard the caller's price protection and could fill at any price.
+
+A floor of 0 leaves nothing to send. That is a **SKIP, not a failure** — no broker
+rejected anything and the account is healthy — so the row is marked `CANCELED`
+(terminal, non-error) with the reason in `comment`, no broker round-trip is made, and
+`_submit_order_impl` returns `None` so `submit_order` does not chain TP/SL legs onto a
+position that was never opened. There is no `OrderStatus.SKIPPED`; adding one would
+ripple through every `OrderStatus` consumer for no behavioural gain, so `CANCELED` +
+a `skipped:` comment prefix carries it.
+
+**Decision on the routed tri-state question: `supports_fractional` stays BOOLEAN.**
+"Couldn't ask" and "known not fractional" are deliberately collapsed to `False`,
+because (a) the only defensible handling of an unknown is identical to `False`, so a
+tri-state would add a type and change Task 31's signature to produce the same
+behaviour; (b) the failure is one-directional — a degraded read can only *suppress*
+fractional sizing (a smaller, always-legal whole-share order), never wrongly enable
+it; and (c) it is not a single point of truth anyway, since a fractional order also
+requires the per-symbol `fractionable` flag from `get_symbol_margin_info()`, an
+independent read from a different endpoint. What a tri-state would really have bought
+is *visibility*, so the swallowed `logger.debug` in Task 31's `get_account_snapshot`
+was raised to a `logger.warning` naming the consequence. The silent debug line was the
+actual defect, not the type.
 
 **Files:**
-- Modify: `ba2_trade_platform/modules/accounts/AlpacaAccount.py:949` (insert immediately after the local `from ...core.types import OrderType as CoreOrderType` line inside `_submit_order_impl`)
+- Modify: `ba2_trade_platform/modules/accounts/AlpacaAccount.py` — add `import math`; add the
+  `_record_fractional_adjustment` helper just above `_submit_order_impl`; insert the fractional
+  block immediately after the local `from ...core.types import OrderType as CoreOrderType`
+  line inside `_submit_order_impl`; raise the `get_account_snapshot` fractional-read log
+  from `debug` to `warning`.
 - Test: `tests/test_alpaca_fractional_submission.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
-`tests/test_alpaca_fractional_submission.py`:
-```python
-"""Alpaca rejects fractional quantities unless the order is a DAY MARKET order.
+See `tests/test_alpaca_fractional_submission.py` (10 tests). Structure:
 
-tif_map at AlpacaAccount.py:934-940 defaults to GTC whenever good_for is None or
-unrecognised, so a fractional order built by a caller that forgot good_for='day'
-would be refused by the broker. The adapter enforces it instead.
+- `_alpaca_response()` returns a `SimpleNamespace`, **not** a `MagicMock`:
+  `alpaca_order_to_tradingorder` reads the response with `getattr(..., None)` into a
+  pydantic `TradingOrder`, and MagicMock attributes fail validation where a
+  SimpleNamespace's missing attributes correctly fall back to `None`.
+- `_bare_account()` is `object.__new__(AlpacaAccount)` with `id`, a MagicMock `client`
+  (so `_check_authentication()` passes and nothing reaches the network),
+  `_margin_info_cache`, and a real `_balance_cache_lock` — the post-submit path calls
+  `invalidate_balance_cache()`, and without the lock the whole submission would land in
+  the `except` block and be marked ERROR while the assertions still passed.
 
-No live API call: client is a MagicMock, so client.submit_order records the request
-object that WOULD have gone to Alpaca.
-"""
-from unittest.mock import MagicMock
+Coverage:
+1. `test_fractional_market_order_goes_out_as_day_even_when_good_for_is_unset`
+2. `test_fractional_market_order_overrides_an_explicit_gtc`
+3. `test_whole_share_market_order_keeps_the_existing_gtc_default` *(regression guard — passes before the change)*
+4. `test_whole_share_order_with_an_explicit_day_still_goes_out_as_day` *(regression guard)*
+5. `test_fractional_quantity_is_never_sent_on_a_limit_order`
+6. `test_fractional_limit_order_is_retried_once_at_floor_qty` — one submit call, `qty == 1.0`, DB row updated to 1.0
+7. `test_fractional_stop_limit_leg_also_floors` — proves it is not limit-specific
+8. `test_whole_share_limit_order_is_untouched_by_the_fractional_path` *(regression guard)*
+9. `test_fractional_limit_order_that_floors_to_zero_is_skipped_not_failed` — no broker call, returns `None`, status `CANCELED` (not `ERROR`), comment contains `skipped` and `fractional`
+10. `test_a_skipped_order_does_not_keep_the_fractional_quantity_as_if_it_were_live` — no `broker_order_id`
 
-from alpaca.trading.enums import TimeInForce
-
-from ba2_trade_platform.core.db import add_instance, get_instance
-from ba2_trade_platform.core.models import TradingOrder
-from ba2_trade_platform.core.types import OrderDirection, OrderStatus, OrderType
-from ba2_trade_platform.modules.accounts.AlpacaAccount import AlpacaAccount
-
-
-def _bare_account():
-    acct = object.__new__(AlpacaAccount)
-    acct.id = 1
-    acct.client = MagicMock()
-    acct._margin_info_cache = {}
-    return acct
-
-
-def _saved_order(**kwargs):
-    """Persist the row, then hand back a detached copy -- _submit_order_impl looks
-    the row up again after submitting."""
-    defaults = dict(account_id=1, symbol="AAPL", quantity=1.5, side=OrderDirection.BUY,
-                    order_type=OrderType.MARKET, status=OrderStatus.PENDING, good_for=None)
-    defaults.update(kwargs)
-    return get_instance(TradingOrder, add_instance(TradingOrder(**defaults)))
-
-
-def _submitted_request(acct):
-    return acct.client.submit_order.call_args[0][0]
-
-
-def test_fractional_market_order_goes_out_as_day_even_when_good_for_is_unset():
-    acct = _bare_account()
-
-    acct._submit_order_impl(_saved_order(quantity=1.5, good_for=None))
-
-    assert _submitted_request(acct).time_in_force == TimeInForce.DAY
-    assert float(_submitted_request(acct).qty) == 1.5
-
-
-def test_fractional_market_order_overrides_an_explicit_gtc():
-    """A caller asking for GTC on a fractional quantity is asking for a rejection."""
-    acct = _bare_account()
-
-    acct._submit_order_impl(_saved_order(quantity=0.25, good_for='gtc'))
-
-    assert _submitted_request(acct).time_in_force == TimeInForce.DAY
-
-
-def test_whole_share_market_order_keeps_the_existing_gtc_default():
-    """The fix must not quietly re-time-in-force every order in the platform."""
-    acct = _bare_account()
-
-    acct._submit_order_impl(_saved_order(quantity=3.0, good_for=None))
-
-    assert _submitted_request(acct).time_in_force == TimeInForce.GTC
-
-
-def test_whole_share_order_with_an_explicit_day_still_goes_out_as_day():
-    acct = _bare_account()
-
-    acct._submit_order_impl(_saved_order(quantity=3.0, good_for='day'))
-
-    assert _submitted_request(acct).time_in_force == TimeInForce.DAY
-
-
-def test_fractional_quantity_on_a_limit_order_is_refused_before_it_reaches_alpaca():
-    """Alpaca only accepts fractional on MARKET. Fail at our end, with a reason,
-    rather than burning a broker round-trip on a guaranteed rejection."""
-    acct = _bare_account()
-
-    result = acct._submit_order_impl(
-        _saved_order(quantity=1.5, order_type=OrderType.BUY_LIMIT,
-                     limit_price=100.0, good_for='day'))
-
-    assert result is None
-    acct.client.submit_order.assert_not_called()
-```
-
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `venv/bin/python -m pytest tests/test_alpaca_fractional_submission.py -v`
 
-Expected: FAIL — `test_fractional_market_order_goes_out_as_day_even_when_good_for_is_unset` fails
-with `assert <TimeInForce.GTC: 'gtc'> == <TimeInForce.DAY: 'day'>`, and
-`test_fractional_quantity_on_a_limit_order_is_refused_before_it_reaches_alpaca` fails on
-`acct.client.submit_order.assert_not_called()` raising
-`AssertionError: Expected 'submit_order' to not have been called`
+Actual: **7 failed, 3 passed** — `assert <TimeInForce.GTC: 'gtc'> == <TimeInForce.DAY: 'day'>`
+for the two TIF tests, `fractional qty 1.5 reached Alpaca` / `assert 4.25 == 4.0` for the
+floor tests, and `Expected 'submit_order' to not have been called. Called 1 times.` for the
+skip test. The 3 that passed are the whole-share regression guards (3, 4, 8), which are
+supposed to pass both before and after.
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
-In `ba2_trade_platform/modules/accounts/AlpacaAccount.py`, inside `_submit_order_impl`, find
-lines 948-950:
+Add `import math` to the module imports, and this helper immediately above
+`_submit_order_impl`:
+```python
+    def _record_fractional_adjustment(self, trading_order: TradingOrder,
+                                      quantity: Optional[float], reason: str) -> None:
+        """Persist a submission-time fractional-quantity adjustment onto the order row.
+
+        ``quantity`` is the whole-share quantity actually being sent, or ``None`` when
+        nothing is being sent at all (the SKIP case: flooring left 0 shares). A skip is
+        marked CANCELED -- terminal, but deliberately NOT ERROR: no broker rejected
+        anything and the account is healthy, there was simply no whole share left to
+        trade, so it must not show up as a broker failure in the UI or the logs.
+
+        The reason is appended to ``comment`` (same convention as
+        ``_handle_order_submit_error``) so it is legible in the Pending Orders UI and not
+        only in the log.
+        """
+        fresh_order = get_instance(TradingOrder, trading_order.id)
+        if not fresh_order:
+            logger.error(
+                f"Could not find order {trading_order.id} to record fractional adjustment: {reason}")
+            return
+        if quantity is None:
+            fresh_order.status = OrderStatus.CANCELED
+        else:
+            fresh_order.quantity = quantity
+        fresh_order.comment = (
+            f"{fresh_order.comment} | {reason}" if fresh_order.comment else reason)[:500]
+        update_instance(fresh_order)
+```
+
+Then, inside `_submit_order_impl`, find:
 ```python
             # Import OrderType enum from core.types to compare values
             from ...core.types import OrderType as CoreOrderType
-            
 ```
 and insert this block immediately after the import line (before the bracket-order comment):
 ```python
 
-            # Fractional quantities: Alpaca accepts them ONLY on a DAY MARKET order.
-            # tif_map above defaults to GTC whenever good_for is None/unrecognised, and a
-            # GTC or non-market fractional order is rejected by the broker, so force DAY
-            # here and refuse a non-market fractional order outright rather than burning
-            # a round-trip on a guaranteed rejection.
+            # ---- Fractional quantities -----------------------------------------------
+            # Alpaca accepts a fractional quantity ONLY on a DAY MARKET order. Two traps:
+            #
+            #  1. tif_map above resolves an unknown/absent good_for to GTC, and the
+            #     allocation actions build their orders with no good_for at all -- so a
+            #     fractional order would go out GTC and be refused by the broker. Force
+            #     DAY rather than trusting every future caller to remember.
+            #  2. Every non-MARKET type (limit / stop / stop-limit / OCO) refuses
+            #     fractional outright -- including a protective TP/SL leg whose quantity
+            #     was inherited from a fractional position. Those fall back ONCE to
+            #     floor(qty) whole shares: it is a guaranteed rejection otherwise, and
+            #     flooring under-fills rather than overspending the target. The floored
+            #     quantity is written back so the ledger matches what the broker got.
+            #
+            # A floor of 0 leaves nothing to send. That is a SKIP, not a failure --
+            # nothing was rejected and nothing is wrong with the account -- so the row is
+            # marked CANCELED with the reason, never ERROR.
+            #
+            # Sizing itself is NOT re-derived here: the allocation engine already decided
+            # fractional-vs-whole (opt-in per run, gated on the broker's own per-symbol
+            # `fractionable` flag) and did the rounding. This is submission-time
+            # enforcement of a broker constraint only.
             quantity_value = float(trading_order.quantity or 0.0)
             if quantity_value != int(quantity_value):
-                if order_type_value != CoreOrderType.MARKET.value.lower():
-                    raise ValueError(
-                        f"Alpaca rejects fractional quantities on {order_type_value} orders; "
-                        f"order {trading_order.id} ({trading_order.symbol}) has qty={quantity_value}"
+                if order_type_value == CoreOrderType.MARKET.value.lower():
+                    if time_in_force != TimeInForce.DAY:
+                        logger.info(
+                            f"Order {trading_order.id} ({trading_order.symbol}) has fractional "
+                            f"qty={quantity_value}; forcing time_in_force DAY (was "
+                            f"{time_in_force.value}) — Alpaca rejects fractional on any other TIF"
+                        )
+                        time_in_force = TimeInForce.DAY
+                else:
+                    whole_shares = float(math.floor(quantity_value))
+                    reason = (f"fractional qty {quantity_value} is not accepted by Alpaca on a "
+                              f"{order_type_value} order")
+                    if whole_shares <= 0:
+                        logger.warning(
+                            f"Order {trading_order.id} ({trading_order.symbol}) skipped: "
+                            f"{reason}, and flooring leaves 0 whole shares — nothing submitted"
+                        )
+                        self._record_fractional_adjustment(
+                            trading_order, None,
+                            f"skipped: {reason}; flooring leaves 0 whole shares")
+                        return None
+                    logger.warning(
+                        f"Order {trading_order.id} ({trading_order.symbol}): {reason}; "
+                        f"submitting {whole_shares} whole shares instead of {quantity_value}"
                     )
-                if time_in_force != TimeInForce.DAY:
-                    logger.info(
-                        f"Order {trading_order.id} ({trading_order.symbol}) has fractional "
-                        f"qty={quantity_value}; forcing time_in_force DAY (was "
-                        f"{time_in_force.value})"
-                    )
-                    time_in_force = TimeInForce.DAY
+                    trading_order.quantity = whole_shares
+                    self._record_fractional_adjustment(
+                        trading_order, whole_shares,
+                        f"{reason}; floored to {whole_shares} whole shares")
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+A negative quantity needs no special case: `math.floor` of a negative is more negative,
+and the `<= 0` branch catches it as a skip. Quantities are validated positive upstream
+by `_validate_trading_order` anyway.
+
+Finally, in `get_account_snapshot`, raise the swallowed fractional-read log from
+`logger.debug` to `logger.warning` and name the consequence (see the tri-state decision
+above).
+
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `venv/bin/python -m pytest tests/test_alpaca_fractional_submission.py -v`
-Expected: PASS (5 passed)
+Actual: **10 passed**
 
-Run: `venv/bin/python -m pytest tests/test_accounts/test_alpaca_idempotency.py tests/test_accounts/test_broker_error_handling.py tests/test_alpaca_order_type_mapping.py tests/test_alpaca_options.py -v`
-Expected: PASS (proves whole-share submission is untouched)
+Run: `venv/bin/python -m pytest tests/test_accounts/test_alpaca_idempotency.py tests/test_accounts/test_broker_error_handling.py tests/test_alpaca_order_type_mapping.py tests/test_alpaca_options.py tests/test_alpaca_account_snapshot.py tests/test_alpaca_margin_info.py tests/test_alpaca_cash_transfers.py -v`
+Actual: **78 passed** (proves whole-share submission and Tasks 31-33 are untouched)
 
-- [ ] **Step 5: Commit**
+Full suites: `tests` **1387** (1377 + 10 new), `packages/common/tests` **517**,
+`packages/experts/tests` **484**, `packages/providers/tests` **196**.
+
+- [x] **Step 5: Commit**
 ```bash
 git add ba2_trade_platform/modules/accounts/AlpacaAccount.py tests/test_alpaca_fractional_submission.py
-git commit -m "fix(alpaca): force DAY time-in-force on fractional market orders, refuse fractional non-market"
+git commit -m "fix(alpaca): force DAY time-in-force on fractional market orders, floor fractional non-market"
 ```
 
 ---
