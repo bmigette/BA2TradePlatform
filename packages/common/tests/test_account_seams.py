@@ -88,6 +88,86 @@ def test_snapshot_from_a_dict_broker_reads_the_plain_field_names():
     assert snap.short_market_value == 0.0
 
 
+def test_a_broker_publishing_only_portfolio_value_gets_both_equity_and_net_liquidation():
+    """AccountSnapshot's contract (account_types.py): "An adapter whose broker
+    publishes only one MUST set BOTH to that value rather than leave one None."
+
+    ``portfolio_value`` was in the equity chain but not the net_liquidation one,
+    so such a broker got equity set and net_liquidation None -- and
+    net_liquidation is the headline total value the page reports. The base
+    mirrors whichever one it found rather than making every adapter remember.
+    """
+    snap = _DictAccount(1, {"portfolio_value": "48000.00"}).get_account_snapshot()
+
+    assert snap.equity == 48000.00
+    assert snap.net_liquidation == 48000.00
+
+
+def test_a_broker_publishing_only_net_liquidation_gets_equity_too():
+    """The mirror runs both ways -- it is one rule, not a portfolio_value patch."""
+    snap = _DictAccount(1, {"net_liquidation": "31000.00"}).get_account_snapshot()
+
+    assert snap.net_liquidation == 31000.00
+    assert snap.equity == 31000.00
+
+
+def test_the_two_are_left_alone_when_the_broker_publishes_both():
+    """They legitimately DIVERGE where liquidation value is not the mark; the
+    mirror must only fill a hole, never overwrite."""
+    snap = _DictAccount(1, {"equity": "50000", "net_liquidation": "49500"}).get_account_snapshot()
+
+    assert snap.equity == 50000.0
+    assert snap.net_liquidation == 49500.0
+
+
+def test_a_positive_short_magnitude_is_negated_to_the_platform_convention():
+    """AccountSnapshot: short_market_value is NEGATIVE while shorts are held.
+
+    TastyTrade publishes ``short-equity-value`` as a positive MAGNITUDE. Left
+    unnegated it flips the sign of gross exposure, so the base normalises it and
+    no adapter has to remember.
+    """
+    snap = _DictAccount(1, {"short_market_value": "2500.00"}).get_account_snapshot()
+
+    assert snap.short_market_value == -2500.00
+
+
+def test_an_already_negative_short_value_is_untouched():
+    """Alpaca's convention is already negative -- do not double-negate it."""
+    snap = _DictAccount(1, {"short_market_value": "-2500.00"}).get_account_snapshot()
+
+    assert snap.short_market_value == -2500.00
+
+
+def test_a_flat_account_reports_a_zero_short_value_not_minus_zero():
+    snap = _DictAccount(1, {"short_market_value": "0"}).get_account_snapshot()
+
+    assert snap.short_market_value == 0.0
+
+
+def test_derivative_buying_power_is_the_last_resort_for_buying_power():
+    """The third name in the chain, and the only one an options-only TastyTrade
+    account may publish. It had no coverage at all."""
+    snap = _DictAccount(1, {"derivative_buying_power": "7500.00"}).get_account_snapshot()
+
+    assert snap.buying_power == 7500.00
+
+
+def test_the_plain_buying_power_name_wins_over_the_derivative_one():
+    snap = _DictAccount(1, {"buying_power": "9000",
+                            "derivative_buying_power": "7500"}).get_account_snapshot()
+
+    assert snap.buying_power == 9000.0
+
+
+def test_pending_transfer_in_is_read_on_the_dict_path_too():
+    """Only the attribute path asserted it (as None); an incoming ACH is money
+    the allocation page must see."""
+    snap = _DictAccount(1, {"pending_transfer_in": "1000.00"}).get_account_snapshot()
+
+    assert snap.pending_transfer_in == 1000.00
+
+
 def test_snapshot_multiplier_above_one_marks_the_account_as_margin():
     assert _DictAccount(1, {"multiplier": "4"}).get_account_snapshot().is_margin_account is True
 

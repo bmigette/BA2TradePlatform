@@ -111,6 +111,18 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         ``None`` and the caller must raise rather than substitute a default
         (platform rule: no fallback values for prices/balances/quantities).
 
+        Two AccountSnapshot contract rules are enforced HERE so no adapter has to
+        remember them (TastyTrade breaks both if left to itself):
+
+          * ``equity`` and ``net_liquidation`` are mirrored when the broker
+            publishes only one of them -- the contract says a broker with a
+            single number MUST set both;
+          * ``short_market_value`` is forced NEGATIVE, because a broker may
+            publish a positive magnitude and gross exposure has to be one
+            formula for every broker.
+
+        Neither invents a value: both only act on what the broker did publish.
+
         Returns:
             AccountSnapshot: populated as far as the broker allows. An
             all-``None`` snapshot is a legitimate "the broker told us nothing"
@@ -143,18 +155,39 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
             return None
 
         multiplier = _first("multiplier", "margin_multiplier")
+
+        # AccountSnapshot's contract: a broker that publishes only ONE of
+        # equity / net_liquidation MUST have BOTH set to it. The two chains do not
+        # cover the same names (a broker publishing only `portfolio_value` matched
+        # the equity chain and left net_liquidation None -- and net_liquidation is
+        # the headline total value), so mirror whichever one was found. Only a hole
+        # is filled: where the broker publishes both they legitimately diverge.
         equity = _first("equity", "net_liquidating_value", "portfolio_value")
+        net_liquidation = _first("net_liquidation", "net_liquidating_value", "equity")
+        if equity is None:
+            equity = net_liquidation
+        elif net_liquidation is None:
+            net_liquidation = equity
+
+        # short_market_value is NEGATIVE while shorts are held (the Alpaca
+        # convention, so gross exposure is one formula everywhere). A broker that
+        # publishes a positive MAGNITUDE instead -- TastyTrade's
+        # `short-equity-value` -- is normalised here rather than in every adapter.
+        short_market_value = _first("short_market_value")
+        if short_market_value is not None and short_market_value > 0:
+            short_market_value = -short_market_value
+
         return AccountSnapshot(
             cash=_first("cash", "cash_balance"),
             equity=equity,
-            net_liquidation=_first("net_liquidation", "net_liquidating_value", "equity"),
+            net_liquidation=net_liquidation,
             buying_power=_first("buying_power", "equity_buying_power", "derivative_buying_power"),
             non_marginable_buying_power=_first("non_marginable_buying_power",
                                                "cash_available_to_withdraw"),
             margin_multiplier=multiplier,
             is_margin_account=bool(multiplier is not None and multiplier > 1.0),
             long_market_value=_first("long_market_value"),
-            short_market_value=_first("short_market_value"),
+            short_market_value=short_market_value,
             pending_transfer_in=_first("pending_transfer_in"),
             supports_fractional=False,
             raw=dict(info) if isinstance(info, dict) else {},
