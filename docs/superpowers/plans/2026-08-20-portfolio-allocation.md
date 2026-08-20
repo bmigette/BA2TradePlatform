@@ -7534,7 +7534,9 @@ Insert immediately after the `get_account_snapshot` method added in Task 28 (sti
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `venv/bin/python -m pytest packages/common/tests/test_account_seams.py -v`
-Expected: PASS (10 passed)
+Expected: PASS (11 passed -- Task 28 added an 8th snapshot test,
+`test_snapshot_from_an_attribute_broker_uses_the_getattr_branch`, beyond the 7 the
+plan originally listed, so this file holds 8 snapshot tests + these 3)
 
 - [ ] **Step 5: Commit**
 ```bash

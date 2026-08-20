@@ -160,6 +160,60 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
             raw=dict(info) if isinstance(info, dict) else {},
         )
 
+    def get_cash_transfers(
+        self,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+    ) -> List[CashTransfer]:
+        """Cash movements (deposits, withdrawals, dividends) over a date window.
+
+        CONCRETE, returns ``[]`` by default so no existing broker breaks. Alpaca
+        overrides it from the ``CSD``/``CSW`` activity endpoint that
+        ``get_balance_history`` already calls inline (AlpacaAccount.py:4376-4382)
+        plus the existing ``get_dividends()``; TastyTrade from
+        ``get_history(types=["Money Movement"], page_offset=None)``.
+
+        ``CashTransfer.external_id`` MUST be the broker's own activity id: it is
+        the ``(account_id, external_id)`` idempotency key of
+        ``portfolio_income_event``, so re-syncing the same window upserts rather
+        than duplicating -- exactly as ``OptionActivity`` does.
+
+        Args:
+            start_date: inclusive lower bound; ``None`` means "broker default".
+                A ``datetime`` is accepted (``date`` is its supertype).
+            end_date: inclusive upper bound; ``None`` means "up to now".
+
+        Returns:
+            List[CashTransfer]: empty when the broker has none OR when the broker
+            does not implement this seam. Unlike ``get_positions()``, this seam
+            does NOT distinguish failure from emptiness -- an implementation that
+            fails must log the error and return ``[]``.
+        """
+        return []
+
+    def get_symbol_margin_info(self, symbols: List[str]) -> Dict[str, MarginInfo]:
+        """Per-symbol margin / fractionability metadata, for buying-power sizing.
+
+        CONCRETE, returns ``{}`` by default. Alpaca derives each entry from
+        ``Asset.marginable``, ``Asset.maintenance_margin_requirement``,
+        ``Asset.fractionable``, ``Asset.min_order_size`` and
+        ``Asset.min_trade_increment`` combined with ``TradeAccount.multiplier``.
+
+        ``bp_factor = initial_margin_rate * account_multiplier`` -- the dollars of
+        buying power one dollar of notional consumes. A fully marginable stock in
+        a 2:1 account is ``0.5 * 2 = 1.0``; a non-marginable one is ``1.0 * 2 = 2.0``.
+
+        Args:
+            symbols: symbols to describe, already normalised (.strip().upper()).
+
+        Returns:
+            Dict[str, MarginInfo]: keyed by symbol. A symbol the broker cannot
+            describe is OMITTED, never defaulted here -- the caller falls back to
+            the conservative ``bp_factor = account multiplier`` (assume no
+            leverage), which under-deploys rather than over-committing.
+        """
+        return {}
+
     @abstractmethod
     def get_positions(self) -> Any:
         """

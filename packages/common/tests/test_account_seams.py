@@ -146,3 +146,21 @@ def test_snapshot_survives_a_broker_that_raises():
             raise RuntimeError("connection reset")
 
     assert _Boom(1, None).get_account_snapshot() == AccountSnapshot()
+
+
+def test_get_cash_transfers_defaults_to_empty_for_a_broker_that_does_not_implement_it():
+    """[] by default so no existing broker breaks. Alpaca and TastyTrade override it."""
+    assert _DictAccount(1, {}).get_cash_transfers() == []
+
+
+def test_get_cash_transfers_accepts_a_date_window_without_complaining():
+    from datetime import date
+    acct = _DictAccount(1, {})
+    assert acct.get_cash_transfers(start_date=date(2026, 8, 1),
+                                   end_date=date(2026, 8, 31)) == []
+
+
+def test_get_symbol_margin_info_defaults_to_empty_so_the_caller_falls_back():
+    """A symbol the broker cannot describe is OMITTED, never defaulted here -- the
+    caller substitutes the conservative bp_factor = account multiplier."""
+    assert _DictAccount(1, {}).get_symbol_margin_info(["AAPL", "MSFT"]) == {}
