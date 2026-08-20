@@ -55,6 +55,7 @@ implementation.
 | 14 | One Transaction per symbol: trims and adds adjust the existing one; a zero target closes it. |
 | 15 | Broker precheck replaces the two-pass estimate wherever it is available. |
 | 16 | TastyTrade gets the full trading surface, unit-tested against a mocked SDK. Live verification is the user's. |
+| 17 | `Instrument.name` becomes unique. Duplicate rows are merged by a data migration, and symbol writes are normalised in the shared helpers. |
 
 ## Architecture
 
@@ -65,7 +66,8 @@ Per CLAUDE.md, shared and pure code belongs in the sibling packages; the in-tree
 
 **`packages/common/ba2_common/` (REAL — the source of truth):**
 
-- `core/models.py` — four new tables (below).
+- `core/models.py` — four new tables (below), plus `unique=True` on
+  `Instrument.name`.
 - `core/portfolio_allocation.py` — **new**, the allocation engine. Pure, IO-free,
   unit-tested without a DB or a broker.
 - `core/utils.py` — one new helper, `get_symbols_by_label()`.
@@ -81,6 +83,8 @@ Per CLAUDE.md, shared and pure code belongs in the sibling packages; the in-tree
 - `modules/accounts/AlpacaAccount.py` — snapshot, cash transfers, margin info,
   fractional-aware submission.
 - `modules/accounts/TastyTradeAccount.py` — the trading surface.
+- `core/InstrumentAutoAdder.py`, `core/JobManager.py`, `ui/pages/settings.py` —
+  symbol normalisation at the instrument-creation paths.
 
 ### The allocation engine
 
@@ -201,8 +205,11 @@ SQLModel str-enum-stored-by-name migration trap).
   `created_at`. The `plan_json` snapshot makes a dry-run reproducible after the
   weights change, and `submitted_buy_value` is what drives income consumption.
 
-One hand-written Alembic migration with `down_revision = '0a3e0bd24598'` (the
-verified head). `alembic/env.py` needs no change — its import of the
+Two hand-written Alembic revisions, chained off `0a3e0bd24598` (the verified
+head): first the instrument merge and unique index, then the four new tables.
+Keeping them separate means the destructive data migration can be run, inspected
+and if necessary re-run on its own, without the schema additions riding along.
+`alembic/env.py` needs no change — its import of the
 `ba2_trade_platform.core.models` shim registers the new tables automatically. The
 new classes go into the `tests/conftest.py` import list for consistency.
 
@@ -263,9 +270,48 @@ escape hatch. Add and remove symbols on any label whether or not they are held,
 via `add_label_to_instruments` / `remove_label_from_instruments`. Attach a
 free-text comment to any label and any symbol.
 
-Symbols are normalised to `.strip().upper()` before every label write. The
-shared helpers are left alone — `overview.py` and the existing tests depend on
-their current behaviour — so normalisation happens at the page boundary.
+Symbol normalisation happens inside the shared helpers rather than at the page
+boundary — see "Instrument uniqueness" below.
+
+### Instrument uniqueness
+
+`instrument.name` has no unique constraint and no index. The live database holds
+2477 rows under 2353 distinct names — **124 duplicate groups**. Because
+`add_label_to_instruments` and `remove_label_from_instruments` resolve a symbol
+with `.first()` while `get_labels_by_symbol` keys by name so the last row wins,
+label writes on those 124 symbols land on an arbitrary row and may be invisible
+to the next read. An allocation engine cannot be built on that.
+
+The merge is unusually safe: **no table has a foreign key to `instrument`**
+(verified against the live schema via `pragma_foreign_key_list`, and by grepping
+for `foreign_key="instrument`). Every consumer resolves instruments by `name`;
+the only `Instrument.id` use is the transient settings edit dialog
+(`ui/pages/settings.py:3934`). So rows can be merged without repointing
+anything.
+
+A data migration, run before the new allocation tables are created:
+
+1. For each duplicated `name`, keep the lowest `id`.
+2. Coalesce `instrument_type` and `company_name` to the first non-null value in
+   the group — in the live data the conflict is always one row holding `'STOCK'`
+   and the other `NULL`.
+3. Union the `labels` and `categories` JSON lists, preserving order and
+   de-duplicating.
+4. Delete the surviving group members.
+5. Create `UNIQUE INDEX uix_instrument_name ON instrument (name)`, and set
+   `unique=True` on the model field so the schema and the ORM agree.
+
+The migration must be idempotent and must log the merge count, because it runs
+against a 399 MB production database.
+
+A unique index on `name` does not by itself prevent `aapl` and `AAPL`
+coexisting, so uniqueness is only real if writes are normalised. All four label
+helpers in `ba2_common/core/utils.py` and every instrument-creation path
+(`InstrumentAutoAdder`, `JobManager`, the two Settings paths) normalise symbols
+to `.strip().upper()`. This is a behaviour change to the shared helpers that
+`ui/pages/overview.py` and `tests/test_instrument_labels.py` both exercise, so
+both are updated with it. All 2477 live names are already uppercase, so the
+migration itself has no case collisions to resolve.
 
 ### Income ledger
 
@@ -397,10 +443,17 @@ empty label, and weights that do not total 100%.
 
 **Helper tests** extend `tests/test_instrument_labels.py` for
 `get_symbols_by_label`, including a symbol carrying several labels and a label
-with no symbols. `packages/common/tests/test_utils_pure.py:52-72` asserts the
-exported pure-helper list and that the module imports nothing from the live
-tree — the new helper must be added there and must not break the purity
-assertion.
+with no symbols, and for symbol normalisation — `add_label_to_instruments(['aapl'],
+…)` must find the existing `AAPL` row rather than create a second one.
+`packages/common/tests/test_utils_pure.py:52-72` asserts the exported
+pure-helper list and that the module imports nothing from the live tree — the new
+helper must be added there and must not break the purity assertion.
+
+**Migration tests** cover the instrument merge on a fixture database: two rows
+for one name where one holds `instrument_type` and the other `NULL`, disjoint
+label lists, overlapping label lists, and a name with three rows. The merge must
+be idempotent — running it twice leaves the same result — and the unique index
+must exist afterwards.
 
 **Mocked broker tests** cover `AlpacaAccount.get_account_snapshot` against a
 pydantic `TradeAccount` and `TastyTradeAccount.get_account_snapshot` against a
@@ -418,20 +471,19 @@ Alembic does not know about. `migrate.py upgrade` may fail with a duplicate
 column error. Check `PRAGMA table_info` and consider `alembic stamp` before
 adding the new revision.
 
-**124 duplicate-name `Instrument` rows**, with no unique constraint or index on
-`name`. `add_label_to_instruments` and `remove_label_from_instruments` use
-`.first()`, so they hit an arbitrary row, while `get_labels_by_symbol` keys by
-name so the last row wins. Label writes on those symbols are non-deterministic
-today. Deduplication is **out of scope** for this branch — it is a data migration
-with its own blast radius — but the page warns when a managed label contains an
-affected symbol.
+**The instrument merge is destructive and irreversible.** It deletes 124 rows
+from a 399 MB production database, and its `downgrade` cannot restore them. Take
+a database copy before running it, and run the merge as a reporting dry-run
+first so the affected names can be eyeballed.
 
 **`InstrumentAutoAdder.py:96-101` appends to `existing.labels` in place** on a
 plain JSON column with no `MutableList` wrapper, so SQLAlchemy records no history
 and the subsequent commit emits no UPDATE. Every label the auto-adder tries to
-add to an existing instrument is silently lost. Also out of scope: the two-line
-fix would start persisting thousands of expert labels and further pollute the
-label list, which deserves its own decision.
+add to an existing instrument is silently lost. Out of scope: the two-line fix
+would start persisting thousands of expert labels and further pollute the label
+list, which deserves its own decision. It is called out here because the
+uniqueness work touches the same file, and because it explains why the live
+label distribution looks sparser than the code suggests it should.
 
 **`buying_power` shrinks as buys fill**, so a plan sized against a snapshot can
 run out of room mid-submission. Buys are submitted in descending value order so
