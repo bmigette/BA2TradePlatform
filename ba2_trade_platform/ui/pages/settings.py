@@ -8,7 +8,7 @@ from ...logger import logger
 from ...core.db import get_db, get_all_instances, delete_instance, add_instance, update_instance, get_instance
 from ...modules.accounts import providers
 from ...core.interfaces import AccountInterface
-from ...core.utils import get_account_instance_from_id, get_expert_instance_from_id
+from ...core.utils import get_account_instance_from_id, get_expert_instance_from_id, normalize_symbol, parse_instrument_symbol_list
 from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_numeric_event, is_adjustment_action, is_share_adjustment_action, is_option_action, AnalysisUseCase, MarketAnalysisStatus, get_action_type_display_label, get_operator_options
 from ...core.cleanup import preview_cleanup, execute_cleanup, get_cleanup_statistics
 from yahooquery import Ticker, search as yq_search
@@ -364,7 +364,9 @@ class InstrumentSettingsTab:
                         # NiceGUI 3.0+: e.file is the UploadFile object directly, read() is async
                         content_bytes = await e.file.read()
                         content = content_bytes.decode('utf-8')
-                        names = [line.strip() for line in content.splitlines() if line.strip()]
+                        # instrument.name is UNIQUE: normalise + de-duplicate the file
+                        # so an import can never ask for two rows of one instrument.
+                        names = parse_instrument_symbol_list(content)
                         
                         # Parse labels
                         labels = []
@@ -376,7 +378,7 @@ class InstrumentSettingsTab:
                         updated = 0
                         
                         # Get existing instruments
-                        existing_instruments = {inst.name: inst for inst in session.exec(select(Instrument)).all()}
+                        existing_instruments = {normalize_symbol(inst.name): inst for inst in session.exec(select(Instrument)).all()}
                         
                         for name in names:
                             if name in existing_instruments:
@@ -466,7 +468,7 @@ class InstrumentSettingsTab:
                     labels = [l.strip() for l in labels_input.value.split(',')] if labels_input.value else []
                     if is_edit:
                         logger.debug(f'Editing instrument {instrument.id}: {name_input.value}')
-                        instrument.name = name_input.value
+                        instrument.name = normalize_symbol(name_input.value)
                         instrument.instrument_type = type_input.value
                         instrument.labels = labels
                         update_instance(instrument, session)
@@ -476,7 +478,7 @@ class InstrumentSettingsTab:
                     else:
                         logger.debug(f'Adding new instrument: {name_input.value}')
                         inst = Instrument(
-                            name=name_input.value,
+                            name=normalize_symbol(name_input.value),
                             instrument_type=type_input.value,
                             categories=[],
                             labels=labels
