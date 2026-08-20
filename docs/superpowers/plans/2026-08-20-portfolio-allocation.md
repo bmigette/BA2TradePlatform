@@ -16588,6 +16588,19 @@ git commit -m "feat(allocation): dry-run wizard dialog with tickable rows and pl
 > **Generate every default percentage through `even_split_pct`, never by hand.** The 0.01pp tolerance
 > is deliberately tight enough to reject a naive 2dp split — `3 x 33.33 = 99.99` fails — which is
 > what forces the remainder onto the last slot (`[33.33, 33.33, 33.34]`).
+>
+> **`steps_validation_messages` as written double-reports every symbol-total error.** Its own loop
+> re-appends `ERROR_SYMBOL_TOTAL_FMT` after already calling `validate_label_targets`, but that loop
+> predates Task 22 folding the symbol checks into the validator. Simulated against the shipped
+> engine it emits the identical string twice. Delete the loop — the body is now just
+> `return validate_label_targets(labels, tolerance=tolerance)`.
+>
+> **Gate INVEST_LABEL separately.** `validate_label_targets` cannot be reused for it: a single
+> chosen label at 40% would spuriously fail the labels-total-100 check. Task 23 shipped
+> `validate_symbol_weights(label: LabelTarget, *, tolerance: float = LABEL_TOTAL_TOLERANCE_PCT) -> List[str]`
+> for exactly this — same list-of-strings contract, symbol level only, ignores `target_pct`. Without
+> it a 150% weight set turns a $10,000 budget into $15,000 of buys with nothing blocking it
+> (verified). `validate_invest_amount` checks only the amount, so both are needed on that path.
 
 
 Spec "The wizard": **Rebalance** — step 1 sets label percentages, validated to total exactly 100%,
