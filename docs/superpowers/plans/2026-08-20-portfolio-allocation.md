@@ -1319,6 +1319,26 @@ git commit -m "feat(instruments): shared, idempotent duplicate-instrument merge"
 
 ### Task 5: The Alembic revision — merge, then the unique index
 
+> **Verified state of the live DB (`~/Documents/ba2/trade/db.sqlite`), queried read-only on
+> 2026-08-20 — you do not need to re-derive this:**
+>
+> | Query | Result |
+> |---|---|
+> | `COUNT(*) FROM instrument` | 2477 |
+> | `COUNT(DISTINCT name)` | 2353 |
+> | duplicate groups after normalising | **124** |
+> | `trim(coalesce(name,'')) = ''` | **0** |
+> | `name IS NULL` | **0** |
+> | `name <> upper(trim(name))` | **0** |
+>
+> So on this database the merge does no renaming at all — it only collapses the 124 exact-duplicate
+> groups — and the blank-name case cannot arise. Task 4 raised it because
+> `merge_duplicate_instruments` groups by `normalize_symbol`, which maps blanks and non-strings to
+> `""`, so several blank rows would collapse onto one row literally named `''` that then SATISFIES
+> the unique index instead of tripping it. That is latent, not live: do NOT add blank-row deletion
+> to this revision on account of it. Task 6 guards the write paths.
+
+
 Head is `0a3e0bd24598` (verified: `venv/bin/python -m alembic heads` prints exactly
 `0a3e0bd24598 (head)`, single head), so `down_revision = '0a3e0bd24598'`. The revision imports
 the merge through the in-tree alias shim, exactly as `alembic/env.py:16` imports models, and
