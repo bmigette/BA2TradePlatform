@@ -7287,6 +7287,36 @@ def test_snapshot_leaves_a_non_numeric_field_as_none_rather_than_guessing():
     assert snap.cash == 100.0
 
 
+def test_snapshot_from_an_attribute_broker_uses_the_getattr_branch():
+    """The other half of the tolerant probe: an object, not a dict.
+
+    This is the shape that broke TradeActions.py:1493 -- ``.get()`` on a pydantic
+    TradeAccount raises AttributeError. Task 31 tests AlpacaAccount's OVERRIDE, so
+    without this the base's ``getattr`` branch would have no coverage at all.
+    ``raw`` stays {} because only a dict can be copied into it.
+    """
+    class _Attrs:
+        cash = "500.00"
+        equity = "10000.00"
+        buying_power = "20000.00"
+        long_market_value = "9500.00"
+        short_market_value = "-250.00"
+        multiplier = "2"
+
+    snap = _DictAccount(1, _Attrs()).get_account_snapshot()
+    assert snap.cash == 500.0
+    assert snap.equity == 10000.0
+    assert snap.buying_power == 20000.0
+    assert snap.long_market_value == 9500.0
+    assert snap.short_market_value == -250.0
+    assert snap.margin_multiplier == 2.0
+    assert snap.is_margin_account is True
+    assert snap.raw == {}
+    # A field the object simply does not carry stays unknown, never 0.0.
+    assert snap.pending_transfer_in is None
+    assert snap.non_marginable_buying_power is None
+
+
 def test_snapshot_survives_a_broker_that_raises():
     class _Boom(_DictAccount):
         def get_account_info(self):
@@ -7389,7 +7419,7 @@ pair (line 96-97 as of HEAD, i.e. right after `get_account_info`'s closing `pass
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `venv/bin/python -m pytest packages/common/tests/test_account_seams.py -v`
-Expected: PASS (7 passed)
+Expected: PASS (8 passed)
 
 Run: `venv/bin/python -m pytest packages/common/tests/test_interfaces_import.py -v`
 Expected: PASS (proves no subclass lost the ability to instantiate)
