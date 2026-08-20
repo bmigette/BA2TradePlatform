@@ -573,6 +573,13 @@ git commit -m "feat(ui): normalise instrument symbols on the Settings import and
 
 ### Task 3: Normalise the two background instrument-creation paths
 
+> **Also normalise the un-normalised instrument READ at `ba2_trade_platform/ui/pages/settings.py:2082`.**
+> It does `select(Instrument).where(Instrument.name == symbol)` when loading expert instrument
+> config. Every WRITE path normalises as of Tasks 1-2, so this read can now miss a row it should
+> find. It is one line — wrap the comparison value in `normalize_symbol(...)`. `normalize_symbol` is
+> already imported in that module at `:11`.
+
+
 `InstrumentAutoAdder._add_instrument_if_missing` and the auto-add block inside
 `JobManager.submit_market_analysis` both do "SELECT by name, INSERT if missing" with the raw
 symbol. The JobManager block is buried in a 200-line method that needs a live worker queue, so
