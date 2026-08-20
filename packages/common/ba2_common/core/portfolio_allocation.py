@@ -58,6 +58,11 @@ REASON_NEGATIVE_CLAMPED = "negative target clamped to 0"
 REASON_CLOSE_TO_ZERO = "target 0 - close position"
 REASON_MULTI_LABEL_FMT = "⚠ also in {labels}"
 REASON_SCALED_FMT = "scaled ×{factor:.2f} to fit buying power"
+#: The fixed part of REASON_SCALED_FMT, derived from it so the two cannot drift.
+#: Used to RECOGNISE a scaling reason a row already carries, so that a plan scaled
+#: twice (first solve, then broker precheck) reports ONE reason with the compounded
+#: factor instead of two that each tell half the story.
+REASON_SCALED_PREFIX = REASON_SCALED_FMT.split("{", 1)[0]
 WARNING_EMPTY_LABEL_FMT = "label '{label}' has no symbols - {pct:.2f}% unallocated"
 WARNING_PRECHECK_DISAGREED_FMT = "broker precheck disagreed on {symbol} - re-solved"
 
@@ -243,6 +248,57 @@ class AllocationPlan:
         }
 
 
+def current_value(state: Optional[PositionState], valuation_mode: str) -> float:
+    """A position's CURRENT VALUE under the selected valuation mode (decision 5a).
+
+    ``cost``   -> ``cost_basis`` (what you paid).
+    ``market`` -> ``quantity * price`` (what it is worth now).
+
+    A symbol with no position is 0.0 in both modes. In ``market`` mode a symbol
+    with no price is 0.0 too -- the caller has already skipped it with
+    ``REASON_NO_PRICE``, and inventing a value here would be exactly the
+    guessed-price the platform forbids.
+
+    ``PositionState.market_value`` -- the broker's OWN figure -- is deliberately
+    not consulted: it can be stamped at a different price from ``price`` (a
+    previous close, a delayed quote), and the allocatable base, the displayed
+    percentages and every delta must all be measured with the SAME price or they
+    disagree. This is the single definition all three go through.
+
+    Raises:
+        ValueError: on any other mode string. A typo would silently reinterpret
+        every percentage on the page.
+    """
+    if valuation_mode not in (VALUATION_MODE_COST, VALUATION_MODE_MARKET):
+        raise ValueError(
+            f"Unknown valuation_mode {valuation_mode!r}; expected "
+            f"{VALUATION_MODE_COST!r} or {VALUATION_MODE_MARKET!r}")
+    if state is None:
+        return 0.0
+    if valuation_mode == VALUATION_MODE_MARKET:
+        if state.price is None or state.price <= 0:
+            return 0.0
+        return float(state.quantity or 0.0) * float(state.price)
+    return float(state.cost_basis or 0.0)
+
+
+def round_delta_quantity(delta_notional: float, price: float,
+                         margin: Optional[MarginInfo], *, allow_fractional: bool,
+                         current_quantity: float) -> float:
+    """Turn a SIGNED notional delta into a SIGNED, tradeable share delta.
+
+    Used by ``cost`` valuation mode, where the target is expressed against the
+    purchase value rather than the share count. The magnitude is rounded DOWN by
+    ``round_quantity`` (so increments and min order sizes still hold) and a sell
+    is CLAMPED to ``current_quantity`` -- long-only, never oversell.
+    """
+    magnitude = round_quantity(abs(float(delta_notional or 0.0)), price, margin,
+                               allow_fractional=allow_fractional)
+    if delta_notional >= 0:
+        return magnitude
+    return -min(magnitude, float(current_quantity or 0.0))
+
+
 def even_split_pct(count: int) -> List[float]:
     """Split 100% evenly across ``count`` slots, exact to 2dp.
 
@@ -380,28 +436,34 @@ def validate_label_targets(labels: List[LabelTarget], *,
 
 def compute_base_notional(available_buying_power: float,
                           current: Dict[str, PositionState],
-                          managed_symbols: List[str]) -> float:
-    """Allocatable base = broker buying power + cost basis of MANAGED positions.
+                          managed_symbols: List[str],
+                          *, valuation_mode: str = VALUATION_MODE_COST) -> float:
+    """Allocatable base = broker buying power + current value of MANAGED positions.
 
-    Decision 1 of the design. Unmanaged positions are deliberately excluded: they
-    are invisible to the page and already reduce ``available_buying_power``
-    naturally. Symbols in ``managed_symbols`` with no ``current`` entry
-    contribute 0; a repeated symbol is counted once.
+    Decision 1 of the design; ``valuation_mode`` (decision 5a) selects whether
+    "current value" is the cost basis or ``qty x price``. Unmanaged positions are
+    deliberately excluded: they are invisible to the page and already reduce
+    ``available_buying_power`` naturally. Symbols in ``managed_symbols`` with no
+    ``current`` entry contribute 0; a repeated symbol is counted once.
 
-    Task 25 adds a ``valuation_mode`` keyword so ``market`` mode can measure the
-    same positions at ``qty x price`` instead.
+    The Python default is ``cost``, this function's pinned behaviour. Live code
+    passes the account's configured mode EXPLICITLY and relies on no default.
 
     Raises:
         ValueError: if ``available_buying_power`` is None (no fallback for
-        balances -- the caller must not have got here without a real number).
+        balances), or if ``valuation_mode`` is unknown.
     """
     if available_buying_power is None:
         raise ValueError("compute_base_notional: available_buying_power is None")
+    if valuation_mode not in (VALUATION_MODE_COST, VALUATION_MODE_MARKET):
+        # Explicit, so a typo still raises on an account holding NOTHING managed
+        # (the loop below would otherwise never reach current_value's own check).
+        raise ValueError(
+            f"Unknown valuation_mode {valuation_mode!r}; expected "
+            f"{VALUATION_MODE_COST!r} or {VALUATION_MODE_MARKET!r}")
     base = float(available_buying_power)
     for sym in dict.fromkeys(managed_symbols or []):
-        ps = (current or {}).get(sym)
-        if ps is not None:
-            base += float(ps.cost_basis or 0.0)
+        base += current_value((current or {}).get(sym), valuation_mode)
     return base
 
 
@@ -485,14 +547,19 @@ def _apply_bp_scaling(rows: List[AllocationRow], available_buying_power: float, 
         r.bp_cost = r.bp_cost * ratio
         r.reasons.append(REASON_SCALED_FMT.format(factor=scale))
         if qty <= 0:
+            # ONE shape for "no order": a scaled-away buy reads exactly like a
+            # no-price skip (side None, skipped True) to anything inspecting the
+            # raw field rather than is_buy/is_sell.
             r.skipped = True
+            r.side = None
     return scale
 
 
 def compute_allocation(base_notional: float, available_buying_power: float,
                        labels: List[LabelTarget], current: Dict[str, PositionState],
                        margin: Dict[str, MarginInfo], *, allow_fractional: bool,
-                       default_bp_factor: float) -> AllocationPlan:
+                       default_bp_factor: float,
+                       valuation_mode: str = VALUATION_MODE_MARKET) -> AllocationPlan:
     """Solve a full REBALANCE: every managed label, buys and sells.
 
     Args:
@@ -508,6 +575,12 @@ def compute_allocation(base_notional: float, available_buying_power: float,
         allow_fractional: opt-in per run (decision 12).
         default_bp_factor: conservative fallback == the account margin multiplier
             (assume no leverage); under-deploys rather than over-commits.
+        valuation_mode: ``cost`` or ``market`` (decision 5a). ``market`` targets
+            a SHARE COUNT (``target_notional / price``) and deltas against the
+            held quantity; ``cost`` targets a PURCHASE VALUE and deltas against
+            ``cost_basis``. The Python default is ``market`` -- this function's
+            pinned behaviour -- but live code always passes the account's
+            configured mode explicitly.
 
     Behaviour on degenerate input (never raises, always records a reason):
         * a label with no symbols -> allocates nothing, ``target_pct`` added to
@@ -531,6 +604,10 @@ def compute_allocation(base_notional: float, available_buying_power: float,
         AllocationPlan: one AllocationRow per managed symbol (including zero-delta
         and skipped rows, so the UI can show them) plus plan-level totals.
     """
+    if valuation_mode not in (VALUATION_MODE_COST, VALUATION_MODE_MARKET):
+        raise ValueError(
+            f"Unknown valuation_mode {valuation_mode!r}; expected "
+            f"{VALUATION_MODE_COST!r} or {VALUATION_MODE_MARKET!r}")
     current = current or {}
     margin = margin or {}
     plan = AllocationPlan(base_notional=float(base_notional or 0.0),
@@ -577,18 +654,33 @@ def compute_allocation(base_notional: float, available_buying_power: float,
             continue
         frac = bool(allow_fractional and m is not None and m.fractionable)
         row.fractional = frac
-        row.target_quantity = round_quantity(target_notional, row.price, m,
-                                             allow_fractional=allow_fractional)
         if frac:
             row.reasons.append(REASON_FRACTIONAL)
         elif allow_fractional:
             row.reasons.append(REASON_WHOLE_SHARE_FLOOR)
-        delta = row.target_quantity - row.current_quantity
-        if row.target_quantity <= 0 and row.current_quantity > 0:
+
+        if target_notional <= 0 and row.current_quantity > 0:
+            # Same in both modes: a zero target flattens the position outright.
+            # Keyed on the NOTIONAL, never on the rounded quantity -- a
+            # min_order_size that rounds a positive target down to 0 shares is
+            # not an instruction to liquidate.
+            row.target_quantity = 0.0
             delta = -row.current_quantity
             row.reasons.append(REASON_CLOSE_TO_ZERO)
-        elif not frac:
-            delta = float(math.floor(delta) if delta > 0 else -math.floor(-delta))
+        elif valuation_mode == VALUATION_MODE_COST:
+            # Target a PURCHASE VALUE: spend the gap between it and the cost basis.
+            delta = round_delta_quantity(
+                target_notional - current_value(ps, VALUATION_MODE_COST),
+                row.price, m, allow_fractional=allow_fractional,
+                current_quantity=row.current_quantity)
+            row.target_quantity = row.current_quantity + delta
+        else:
+            # Target a SHARE COUNT: target_notional / price, delta vs what is held.
+            row.target_quantity = round_quantity(target_notional, row.price, m,
+                                                 allow_fractional=allow_fractional)
+            delta = row.target_quantity - row.current_quantity
+            if not frac:
+                delta = float(math.floor(delta) if delta > 0 else -math.floor(-delta))
         if abs(delta) < QUANTITY_EPSILON:
             delta = 0.0
         row.delta_quantity = delta
@@ -610,7 +702,8 @@ def compute_label_investment(label: LabelTarget, amount: float,
                              current: Dict[str, PositionState],
                              margin: Dict[str, MarginInfo], *,
                              available_buying_power: float, allow_fractional: bool,
-                             default_bp_factor: float) -> AllocationPlan:
+                             default_bp_factor: float,
+                             valuation_mode: str = VALUATION_MODE_MARKET) -> AllocationPlan:
     """Solve an INVEST_LABEL run: put ``amount`` into ONE label. Buys only.
 
     ``amount`` is split by the label's symbol weights. ``label.target_pct`` is
@@ -625,7 +718,15 @@ def compute_label_investment(label: LabelTarget, amount: float,
     The weights are multiplied straight through, so the caller MUST gate submission
     on ``validate_symbol_weights``: a 150% set deploys 150% of ``amount`` and a 60%
     set leaves 40% of it as cash, neither of which this function refuses.
+
+    ``valuation_mode`` is accepted for call-site symmetry and validated, but does
+    not change the arithmetic: an INVEST_LABEL run ADDS a budget on top of the
+    existing position rather than rebalancing towards a target value.
     """
+    if valuation_mode not in (VALUATION_MODE_COST, VALUATION_MODE_MARKET):
+        raise ValueError(
+            f"Unknown valuation_mode {valuation_mode!r}; expected "
+            f"{VALUATION_MODE_COST!r} or {VALUATION_MODE_MARKET!r}")
     current = current or {}
     margin = margin or {}
     budget = max(0.0, float(amount or 0.0))
@@ -685,7 +786,8 @@ def compute_label_investment(label: LabelTarget, amount: float,
 
 
 def apply_order_impacts(plan: AllocationPlan, impacts: Dict[str, OrderImpact], *,
-                        available_buying_power: float) -> AllocationPlan:
+                        available_buying_power: float,
+                        margin: Optional[Dict[str, MarginInfo]] = None) -> AllocationPlan:
     """Re-solve a plan against broker PRECHECK results (precheck over estimation).
 
     For each row with a matching ``OrderImpact``, replaces the estimated
@@ -693,6 +795,20 @@ def apply_order_impacts(plan: AllocationPlan, impacts: Dict[str, OrderImpact], *
     re-runs the pro-rata buying-power scaling. A symbol with no impact keeps its
     estimated cost. ``impact.accepted is False`` marks the row ``skipped`` and
     copies ``impact.errors`` into ``row.reasons``.
+
+    Pass the SAME ``margin`` dict the plan was solved with: without it the
+    re-solve rebuilds a bare ``MarginInfo`` for each fractional row and so rounds
+    on the default 4dp grid, losing ``min_trade_increment`` and
+    ``min_order_size`` -- a broker-side rejection waiting to happen.
+
+    ``scale_factor`` COMPOUNDS: a plan already scaled to 0.6 that the precheck
+    halves again reports 0.3, the true factor against the ORIGINAL target, and
+    the affected rows carry one ``REASON_SCALED_FMT`` saying so rather than two
+    that each tell half the story.
+
+    Deliberately NOT done: a FAVOURABLE precheck lowers ``bp_cost`` but the freed
+    buying power is never re-deployed, because ``_apply_bp_scaling`` only ever
+    scales down. Never overspending beats fully deploying.
 
     Returns a NEW AllocationPlan; ``plan`` is not mutated. Adds
     ``WARNING_PRECHECK_DISAGREED_FMT`` for each row whose cost changed.
@@ -717,8 +833,18 @@ def apply_order_impacts(plan: AllocationPlan, impacts: Dict[str, OrderImpact], *
         if row.is_buy and abs(impact.bp_cost - row.bp_cost) > 0.005:
             out.warnings.append(WARNING_PRECHECK_DISAGREED_FMT.format(symbol=row.symbol))
             row.bp_cost = impact.bp_cost
-    out.scale_factor = _apply_bp_scaling(out.rows, out.available_buying_power,
-                                         allow_fractional=out.allow_fractional)
+    factor = _apply_bp_scaling(out.rows, out.available_buying_power,
+                               allow_fractional=out.allow_fractional, margin=margin)
+    out.scale_factor = float(plan.scale_factor) * factor
+    if factor < 1.0:
+        for row in out.rows:
+            # Every buy still standing was scaled by BOTH passes (the first was
+            # plan-wide), so collapsing its two reasons into the compounded factor
+            # is exact. A row the precheck rejected keeps its first-pass reason.
+            if len([r for r in row.reasons if r.startswith(REASON_SCALED_PREFIX)]) > 1:
+                row.reasons = [r for r in row.reasons
+                               if not r.startswith(REASON_SCALED_PREFIX)]
+                row.reasons.append(REASON_SCALED_FMT.format(factor=out.scale_factor))
     _finalise_totals(out)
     return out
 
