@@ -20,6 +20,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.job import Job
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 
 from ba2_common.core.utils import normalize_symbol
@@ -130,8 +131,22 @@ def ensure_instrument_exists(symbol: str) -> str:
                 categories=[],
                 labels=['auto_added'],
             ))
-            session.commit()
-            logger.info(f"Auto-added instrument '{symbol}' to database with label 'auto_added'")
+            try:
+                session.commit()
+                logger.info(f"Auto-added instrument '{symbol}' to database with label 'auto_added'")
+            except IntegrityError:
+                # instrument.name is UNIQUE and this is a select-then-insert: another
+                # thread (the auto-adder worker, or a second scheduled job) inserted
+                # the same symbol inside the window. Losing that race is not an error
+                # -- the row we wanted exists -- but anything else that violates a
+                # constraint must still surface.
+                session.rollback()
+                existing_instrument = session.exec(
+                    select(Instrument).where(Instrument.name == symbol)
+                ).first()
+                if existing_instrument is None:
+                    raise
+                logger.info(f"Instrument '{symbol}' was created concurrently; using the existing row")
     return symbol
 
 
@@ -372,7 +387,8 @@ class JobManager:
             Task ID for tracking, or None if submission was skipped
             
         Raises:
-            ValueError: If expert instance not found or duplicate task exists
+            ValueError: If expert instance not found, the symbol is blank, or a
+                duplicate task exists
             RuntimeError: If worker queue is not running
         """
         
@@ -408,7 +424,11 @@ class JobManager:
         # symbol is used from here on, so the analysis and the Instrument row
         # always agree on spelling.
         symbol = ensure_instrument_exists(symbol)
-        
+        if not symbol:
+            # Blank in, blank out: no Instrument row was written, so there is
+            # nothing to analyse either.
+            raise ValueError("Cannot submit market analysis for a blank symbol")
+
         # Validate subtype
         try:
             analysis_use_case = AnalysisUseCase(subtype)

@@ -9,6 +9,7 @@ by experts or selected by AI, running in background to avoid blocking execution.
 import asyncio
 import threading
 from typing import List, Optional, Dict, Any
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import select
 from ..core.models import Instrument
 from ..core.db import get_db, add_instance, get_instance
@@ -154,7 +155,24 @@ class InstrumentAutoAdder:
             )
             
             # Add to database
-            instrument_id = add_instance(instrument)
+            try:
+                instrument_id = add_instance(instrument)
+            except IntegrityError:
+                # instrument.name is UNIQUE and the existence check above is a
+                # separate transaction: another writer (a second auto-add task, or
+                # JobManager.ensure_instrument_exists) inserted this symbol inside
+                # the window. add_instance's session is already rolled back and
+                # closed, so re-select to confirm the row is there; if it is not,
+                # some other constraint was violated and must surface.
+                with get_db() as session:
+                    winner = session.exec(
+                        select(Instrument).where(Instrument.name == symbol)
+                    ).first()
+                    if winner is None:
+                        raise
+                    logger.info(f"Instrument {symbol} was added concurrently (ID {winner.id}); keeping the existing row")
+                return
+
             if instrument_id:
                 logger.info(f"Successfully added instrument {symbol} with ID {instrument_id}")
             else:

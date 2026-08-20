@@ -544,7 +544,10 @@ class TradingOrder(SQLModel, table=True):
 
 class Instrument(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
-    name: str 
+    # unique+index emits `CREATE UNIQUE INDEX ix_instrument_name ON instrument (name)`,
+    # byte-identical to what Alembic revision f1a7c2e9b4d0 creates -- so a migrated
+    # database and a fresh create_all() one end up with the same schema.
+    name: str = Field(unique=True, index=True)
     company_name: str | None = Field(default=None)
     instrument_type: InstrumentType | None = Field(default=None)
     categories: list[str] = Field(sa_column=Column(JSON), default_factory=list)

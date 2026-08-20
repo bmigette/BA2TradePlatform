@@ -464,11 +464,20 @@ class InstrumentSettingsTab:
                 ).classes('w-full')
                 labels_input = ui.input(label='Labels (comma separated)', value=(', '.join(instrument.labels) if is_edit and hasattr(instrument, 'labels') else ''))
                 def save():
-                    session = get_db()
-                    labels = [l.strip() for l in labels_input.value.split(',')] if labels_input.value else []
                     # Normalise once, then log and store the same value: a log line
                     # saying '  aapl ' next to a row holding 'AAPL' is a debugging trap.
                     name = normalize_symbol(name_input.value)
+                    # instrument.name is UNIQUE and normalize_symbol returns '' for
+                    # blank input, so a whitespace-only entry would insert name=''
+                    # once and then raise IntegrityError in the UI on the next try.
+                    # Guarded before the session is opened, so a rejected click costs
+                    # nothing and the dialog stays open for the name to be fixed.
+                    if not name:
+                        logger.warning('Rejected instrument save: name is empty after normalisation')
+                        ui.notify('Instrument name is required', type='negative')
+                        return
+                    session = get_db()
+                    labels = [l.strip() for l in labels_input.value.split(',')] if labels_input.value else []
                     if is_edit:
                         logger.debug(f'Editing instrument {instrument.id}: {name}')
                         instrument.name = name
