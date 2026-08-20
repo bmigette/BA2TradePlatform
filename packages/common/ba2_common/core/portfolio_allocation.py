@@ -323,12 +323,41 @@ def compute_allocation(base_notional: float, available_buying_power: float,
                        default_bp_factor: float) -> AllocationPlan:
     """Solve a full REBALANCE: every managed label, buys and sells.
 
-    ``delta_quantity = target_quantity - current_quantity``, signed. A target of
-    zero on a held symbol closes it outright (``REASON_CLOSE_TO_ZERO``) --
-    including a fractional holding, which a broker will always let you flatten.
-    In whole-share mode any other delta is rounded TOWARDS ZERO to whole shares,
-    so the plan can never emit a 0.37-share order; in fractional mode the target
-    already sits on the broker's grid and the delta keeps its decimals.
+    Args:
+        base_notional: the allocatable base from ``compute_base_notional``.
+        available_buying_power: broker buying power, the FEASIBILITY constraint
+            (targets are notional, not buying power -- decision 2).
+        labels: managed labels with ``target_pct`` (1-100) and symbol weights.
+        current: ``{symbol: PositionState}``; a symbol absent here is treated as
+            flat. The CALLER must have refused to build this dict when
+            ``get_positions()`` returned ``None`` (fetch failure, not flat).
+        margin: ``{symbol: MarginInfo}``; a symbol MISSING here falls back to
+            ``default_bp_factor``.
+        allow_fractional: opt-in per run (decision 12).
+        default_bp_factor: conservative fallback == the account margin multiplier
+            (assume no leverage); under-deploys rather than over-commits.
+
+    Behaviour on degenerate input (never raises, always records a reason):
+        * a label with no symbols -> allocates nothing, ``target_pct`` added to
+          ``plan.unallocatable_pct`` and a ``WARNING_EMPTY_LABEL_FMT`` warning;
+        * a symbol whose ``PositionState.price`` is ``None`` or <= 0 -> skipped
+          with ``REASON_NO_PRICE`` (no guessed price -- no-fallback rule);
+        * a negative computed target -> clamped to 0 with ``REASON_NEGATIVE_CLAMPED``;
+        * a symbol in several managed labels -> targets SUM, one row, and
+          ``REASON_MULTI_LABEL_FMT`` (no enforcement -- decision 7);
+        * ``sum(bp_cost of buys) > available_buying_power`` -> every buy scaled
+          pro-rata, ``plan.scale_factor`` set and ``REASON_SCALED_FMT`` added.
+
+    Label percentages are NOT renormalised: a set totalling 90% deploys 90% of
+    the base and leaves the rest as cash. Blocking submission is
+    ``validate_label_targets``' job, not this function's.
+
+    No minimum order threshold: every non-zero delta becomes a row (decision 11).
+    Short positions are out of scope -- targets are long-only.
+
+    Returns:
+        AllocationPlan: one AllocationRow per managed symbol (including zero-delta
+        and skipped rows, so the UI can show them) plus plan-level totals.
     """
     current = current or {}
     margin = margin or {}
@@ -336,12 +365,19 @@ def compute_allocation(base_notional: float, available_buying_power: float,
                           available_buying_power=float(available_buying_power or 0.0),
                           allow_fractional=bool(allow_fractional))
     targets = {}
+    target_pcts = {}
     sym_labels = {}
     for lt in labels or []:
         pct = float(lt.target_pct or 0.0)
-        for st in lt.symbols or []:
+        if not lt.symbols:
+            # An empty label cannot absorb its percentage: it becomes cash left over.
+            plan.unallocatable_pct += max(0.0, pct)
+            plan.warnings.append(WARNING_EMPTY_LABEL_FMT.format(label=lt.label, pct=pct))
+            continue
+        for st in lt.symbols:
             share = pct * float(st.weight_pct or 0.0) / 100.0
             targets[st.symbol] = targets.get(st.symbol, 0.0) + plan.base_notional * share / 100.0
+            target_pcts[st.symbol] = target_pcts.get(st.symbol, 0.0) + share
             sym_labels.setdefault(st.symbol, []).append(lt.label)
 
     for symbol, target_notional in targets.items():
@@ -356,7 +392,17 @@ def compute_allocation(base_notional: float, available_buying_power: float,
             row.reasons.append(REASON_MULTI_LABEL_FMT.format(labels=", ".join(row.labels)))
         if m is not None and not m.marginable:
             row.reasons.append(REASON_NOT_MARGINABLE)
+        if target_notional < 0:
+            target_notional = 0.0
+            row.reasons.append(REASON_NEGATIVE_CLAMPED)
         row.target_notional = target_notional
+        if row.price is None or row.price <= 0:
+            # No fallback price for live data -- skip the symbol and report it.
+            row.skipped = True
+            row.reasons.append(REASON_NO_PRICE)
+            plan.unallocatable_pct += max(0.0, target_pcts.get(symbol, 0.0))
+            plan.rows.append(row)
+            continue
         frac = bool(allow_fractional and m is not None and m.fractionable)
         row.fractional = frac
         row.target_quantity = round_quantity(target_notional, row.price, m,

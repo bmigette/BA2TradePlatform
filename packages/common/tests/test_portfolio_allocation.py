@@ -294,3 +294,48 @@ def test_zero_buying_power_skips_every_buy():
                                  allow_fractional=False, default_bp_factor=1.0)
     assert plan.rows[0].skipped is True
     assert plan.total_buy_value == 0.0
+
+
+def test_symbol_without_a_price_is_skipped_not_guessed():
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("AAA", 60.0), SymbolTarget("BBB", 40.0)])]
+    current = {"AAA": _pos("AAA", None), "BBB": _pos("BBB", 50.0)}
+    plan = pa.compute_allocation(10_000.0, 1_000_000.0, labels, current, {},
+                                 allow_fractional=False, default_bp_factor=1.0)
+    by = {r.symbol: r for r in plan.rows}
+    assert by["AAA"].skipped is True
+    assert by["AAA"].delta_quantity == 0.0
+    assert pa.REASON_NO_PRICE in by["AAA"].reasons
+    assert plan.unallocatable_pct == pytest.approx(60.0)
+    assert by["BBB"].target_quantity == 80.0
+
+
+def test_symbol_with_a_zero_price_is_skipped():
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("AAA", 100.0)])]
+    plan = pa.compute_allocation(10_000.0, 1_000_000.0, labels,
+                                 {"AAA": _pos("AAA", 0.0)}, {},
+                                 allow_fractional=False, default_bp_factor=1.0)
+    assert plan.rows[0].skipped is True
+    assert pa.REASON_NO_PRICE in plan.rows[0].reasons
+
+
+def test_empty_managed_label_contributes_to_unallocatable_pct():
+    labels = [LabelTarget("FULL", 70.0, [SymbolTarget("AAA", 100.0)]),
+              LabelTarget("EMPTY", 30.0, [])]
+    plan = pa.compute_allocation(10_000.0, 1_000_000.0, labels,
+                                 {"AAA": _pos("AAA", 100.0)}, {},
+                                 allow_fractional=False, default_bp_factor=1.0)
+    assert [r.symbol for r in plan.rows] == ["AAA"]
+    assert plan.rows[0].target_quantity == 70.0
+    assert plan.unallocatable_pct == pytest.approx(30.0)
+    assert "label 'EMPTY' has no symbols - 30.00% unallocated" in plan.warnings
+
+
+def test_negative_label_target_is_clamped_to_zero():
+    labels = [LabelTarget("A", -20.0, [SymbolTarget("XXX", 100.0)])]
+    current = {"XXX": _pos("XXX", 100.0, quantity=10.0, cost_basis=1_000.0)}
+    plan = pa.compute_allocation(10_000.0, 0.0, labels, current, {},
+                                 allow_fractional=False, default_bp_factor=1.0)
+    row = plan.rows[0]
+    assert row.target_notional == 0.0
+    assert pa.REASON_NEGATIVE_CLAMPED in row.reasons
+    assert row.delta_quantity == -10.0
