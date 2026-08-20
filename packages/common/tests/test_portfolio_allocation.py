@@ -339,3 +339,94 @@ def test_negative_label_target_is_clamped_to_zero():
     assert row.target_notional == 0.0
     assert pa.REASON_NEGATIVE_CLAMPED in row.reasons
     assert row.delta_quantity == -10.0
+
+
+def test_even_split_of_three_totals_exactly_one_hundred():
+    assert pa.even_split_pct(3) == [33.33, 33.33, 33.34]
+    assert sum(pa.even_split_pct(3)) == 100.0
+
+
+def test_even_split_of_seven_still_totals_exactly_one_hundred():
+    parts = pa.even_split_pct(7)
+    assert len(parts) == 7
+    assert parts[0] == pytest.approx(14.28)
+    assert sum(parts) == pytest.approx(100.0)
+
+
+def test_even_split_of_zero_symbols_is_empty():
+    assert pa.even_split_pct(0) == []
+    assert pa.even_split_pct(-4) == []
+
+
+def test_build_symbol_targets_defaults_to_even_when_nothing_stored():
+    out = pa.build_symbol_targets(["A", "B", "C", "D"])
+    assert [t.weight_pct for t in out] == [25.0, 25.0, 25.0, 25.0]
+    assert [t.symbol for t in out] == ["A", "B", "C", "D"]
+
+
+def test_build_symbol_targets_shares_the_remainder_among_unstored_symbols():
+    out = pa.build_symbol_targets(["A", "B", "C"], {"A": 50.0})
+    assert {t.symbol: t.weight_pct for t in out} == {"A": 50.0, "B": 25.0, "C": 25.0}
+
+
+def test_validate_label_targets_accepts_a_valid_hundred_percent_set():
+    labels = [LabelTarget("A", 60.0, [SymbolTarget("AAA", 100.0)]),
+              LabelTarget("B", 40.0, [SymbolTarget("BBB", 100.0)])]
+    assert pa.validate_label_targets(labels) == []
+
+
+def test_validate_label_targets_rejects_a_total_below_one_hundred():
+    labels = [LabelTarget("A", 60.0, [SymbolTarget("AAA", 100.0)])]
+    errors = pa.validate_label_targets(labels)
+    assert errors == [pa.ERROR_LABEL_TOTAL_FMT.format(total=60.0)]
+    assert errors == ["label targets total 60.00% - must total 100%"]
+
+
+def test_validate_label_targets_accepts_a_total_inside_the_tolerance():
+    """LABEL_TOTAL_TOLERANCE_PCT is 0.01 PERCENTAGE POINTS: 33.33+33.33+33.34 passes."""
+    labels = [LabelTarget("A", 33.33, [SymbolTarget("AAA", 100.0)]),
+              LabelTarget("B", 33.33, [SymbolTarget("BBB", 100.0)]),
+              LabelTarget("C", 33.34, [SymbolTarget("CCC", 100.0)])]
+    assert pa.validate_label_targets(labels) == []
+
+
+def test_validate_label_targets_rejects_a_non_zero_label_with_no_symbols():
+    labels = [LabelTarget("A", 60.0, [SymbolTarget("AAA", 100.0)]),
+              LabelTarget("B", 40.0, [])]
+    errors = pa.validate_label_targets(labels)
+    assert pa.ERROR_LABEL_NO_SYMBOLS_FMT.format(label="B", pct=40.0) in errors
+    assert any("B" in e and "no symbols" in e for e in errors)
+
+
+def test_validate_label_targets_rejects_duplicates():
+    labels = [LabelTarget("A", 50.0, [SymbolTarget("AAA", 100.0)]),
+              LabelTarget("A", 50.0, [SymbolTarget("BBB", 100.0)])]
+    assert pa.ERROR_LABEL_DUPLICATE_FMT.format(label="A") in pa.validate_label_targets(labels)
+
+
+def test_validate_label_targets_rejects_a_negative_target():
+    labels = [LabelTarget("A", 120.0, [SymbolTarget("AAA", 100.0)]),
+              LabelTarget("B", -20.0, [SymbolTarget("BBB", 100.0)])]
+    errors = pa.validate_label_targets(labels)
+    assert any("negative" in e for e in errors)
+
+
+def test_compute_base_notional_adds_managed_cost_basis_to_buying_power():
+    current = {"AAA": _pos("AAA", 100.0, quantity=10.0, cost_basis=900.0),
+               "ZZZ": _pos("ZZZ", 100.0, quantity=99.0, cost_basis=9_900.0)}
+    assert pa.compute_base_notional(5_000.0, current, ["AAA"]) == 5_900.0
+
+
+def test_compute_base_notional_managed_symbol_with_no_position_contributes_zero():
+    current = {"AAA": _pos("AAA", 100.0, quantity=10.0, cost_basis=1500.0)}
+    assert pa.compute_base_notional(10_000.0, current, ["AAA", "NVDA"]) == 11_500.0
+
+
+def test_compute_base_notional_counts_a_repeated_symbol_once():
+    current = {"AAA": _pos("AAA", 100.0, quantity=10.0, cost_basis=900.0)}
+    assert pa.compute_base_notional(5_000.0, current, ["AAA", "AAA"]) == 5_900.0
+
+
+def test_compute_base_notional_raises_when_buying_power_is_none():
+    with pytest.raises(ValueError):
+        pa.compute_base_notional(None, {}, ["AAA"])

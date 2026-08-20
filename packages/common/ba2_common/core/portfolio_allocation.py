@@ -233,6 +233,107 @@ class AllocationPlan:
         }
 
 
+def even_split_pct(count: int) -> List[float]:
+    """Split 100% evenly across ``count`` slots, exact to 2dp.
+
+    The remainder lands on the LAST slot so the list always totals exactly 100.0
+    (``even_split_pct(3) == [33.33, 33.33, 33.34]``). Returns ``[]`` for
+    ``count <= 0`` -- an empty label gets nothing, not a ZeroDivisionError.
+    """
+    if count <= 0:
+        return []
+    each = math.floor(100.0 / count * 100.0) / 100.0
+    out = [each] * count
+    out[-1] = round(100.0 - each * (count - 1), 2)
+    return out
+
+
+def build_symbol_targets(symbols: List[str],
+                         stored_weights: Optional[Dict[str, float]] = None) -> List[SymbolTarget]:
+    """Resolve a label's symbol weights, filling in the even-split default.
+
+    ``stored_weights`` is ``{symbol: weight_pct}`` from
+    ``portfolio_allocation_symbol`` -- absent symbols are NOT an error, they take
+    the even-split default (rows are created lazily by design).
+
+    If ANY weight is stored for the label, the un-stored symbols share what is
+    left of 100% evenly; if none are, every symbol gets ``even_split_pct``.
+    Order of ``symbols`` is preserved.
+    """
+    syms = list(symbols or [])
+    if not syms:
+        return []
+    stored = stored_weights or {}
+    known = {s: float(stored[s]) for s in syms if s in stored}
+    if not known:
+        return [SymbolTarget(symbol=s, weight_pct=p)
+                for s, p in zip(syms, even_split_pct(len(syms)))]
+    unknown = [s for s in syms if s not in known]
+    weights = dict(known)
+    if unknown:
+        remaining = max(0.0, 100.0 - sum(known.values()))
+        for s, p in zip(unknown, even_split_pct(len(unknown))):
+            weights[s] = round(remaining * p / 100.0, 4)
+    return [SymbolTarget(symbol=s, weight_pct=weights[s]) for s in syms]
+
+
+def validate_label_targets(labels: List[LabelTarget], *,
+                           tolerance: float = LABEL_TOTAL_TOLERANCE_PCT) -> List[str]:
+    """Validate a REBALANCE label set. Pure -- returns problems, never raises.
+
+    Checks: targets total 100 +/- ``tolerance`` (0.01 PERCENTAGE POINTS by
+    default, so 99.995 passes and 99.98 does not); no negative ``target_pct``; no
+    duplicate label names; every non-zero label has at least one symbol.
+
+    Returns:
+        List[str]: human-readable error strings built from the ``ERROR_LABEL_*``
+        formats; EMPTY means valid. Submit must be blocked while this is
+        non-empty (decision 3).
+    """
+    errors = []
+    total = sum(float(lt.target_pct or 0.0) for lt in labels or [])
+    if abs(total - 100.0) > tolerance:
+        errors.append(ERROR_LABEL_TOTAL_FMT.format(total=total))
+    seen = set()
+    for lt in labels or []:
+        pct = float(lt.target_pct or 0.0)
+        if lt.label in seen:
+            errors.append(ERROR_LABEL_DUPLICATE_FMT.format(label=lt.label))
+        seen.add(lt.label)
+        if pct < 0:
+            errors.append(ERROR_LABEL_NEGATIVE_FMT.format(label=lt.label, pct=pct))
+        if pct > 0 and not lt.symbols:
+            errors.append(ERROR_LABEL_NO_SYMBOLS_FMT.format(label=lt.label, pct=pct))
+    return errors
+
+
+def compute_base_notional(available_buying_power: float,
+                          current: Dict[str, PositionState],
+                          managed_symbols: List[str]) -> float:
+    """Allocatable base = broker buying power + cost basis of MANAGED positions.
+
+    Decision 1 of the design. Unmanaged positions are deliberately excluded: they
+    are invisible to the page and already reduce ``available_buying_power``
+    naturally. Symbols in ``managed_symbols`` with no ``current`` entry
+    contribute 0; a repeated symbol is counted once.
+
+    Task 25 adds a ``valuation_mode`` keyword so ``market`` mode can measure the
+    same positions at ``qty x price`` instead.
+
+    Raises:
+        ValueError: if ``available_buying_power`` is None (no fallback for
+        balances -- the caller must not have got here without a real number).
+    """
+    if available_buying_power is None:
+        raise ValueError("compute_base_notional: available_buying_power is None")
+    base = float(available_buying_power)
+    for sym in dict.fromkeys(managed_symbols or []):
+        ps = (current or {}).get(sym)
+        if ps is not None:
+            base += float(ps.cost_basis or 0.0)
+    return base
+
+
 def round_quantity(target_notional: float, price: float, margin: Optional[MarginInfo],
                    *, allow_fractional: bool) -> float:
     """Convert a notional to a tradeable share quantity.
