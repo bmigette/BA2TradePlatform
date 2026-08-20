@@ -3,6 +3,7 @@ from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest, LimitO
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, OrderClass, PositionIntent
 from alpaca.common.exceptions import APIError
 from typing import Any, Dict, List, Optional
+from dataclasses import replace
 from datetime import datetime, timezone, timedelta
 import time
 import threading
@@ -88,6 +89,13 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         # Initialize client as None first
         self.client = None
         self._authentication_error = None
+
+        # Per-symbol margin metadata cache. Alpaca has NO bulk asset endpoint, so
+        # get_symbol_margin_info() costs one get_asset() HTTP call per NEW symbol;
+        # the allocation page asks for the same basket on every refresh and the
+        # ASSET facts do not change intraday, so cache for this instance's
+        # lifetime. bp_factor is re-derived on every hit (the multiplier moves).
+        self._margin_info_cache: Dict[str, MarginInfo] = {}
 
         # Balance cache (5s TTL; serves stale value on fetch failure)
         self._balance_cache: Optional[float] = None
@@ -1564,6 +1572,103 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             raw={'account_number': getattr(info, 'account_number', None),
                  'status': str(getattr(info, 'status', None))},
         )
+
+    def get_symbol_margin_info(self, symbols: List[str]) -> Dict[str, MarginInfo]:
+        """Per-symbol margin / fractionability metadata for buying-power sizing.
+
+        Alpaca has NO bulk asset endpoint -- TradingClient.get_asset() takes one
+        symbol -- so this is one HTTP call per symbol NOT already cached. Callers
+        should therefore pass the whole basket once and reuse the result.
+
+        Alpaca's Asset exposes no INITIAL margin field, only
+        maintenance_margin_requirement (a percentage, e.g. 30.0), so the initial
+        rate is DERIVED: marginable -> 0.5 (Reg-T), otherwise 1.0. The
+        maintenance number is reported separately as maintenance_margin_rate and
+        is NEVER substituted for the initial rate. Then
+        bp_factor = initial_rate * account multiplier -- 1.0 for a marginable
+        symbol and 2.0 for a non-marginable one in a 2:1 account.
+
+        The multiplier is read from get_account_info() (ONE get_account() call),
+        not from get_account_snapshot(), which would add a get_account_configurations()
+        round-trip for a fractional flag this method does not use. It is read
+        fresh on every call and re-applied to cached entries, because Alpaca
+        moves an account between 1/2/4 and this process is long-lived; only the
+        Asset facts, which do not change intraday, are actually cached.
+
+        A symbol the broker cannot describe is OMITTED, never defaulted here --
+        the caller falls back to the conservative bp_factor = account multiplier.
+        One symbol's failure never aborts the batch.
+        """
+        if not self._check_authentication():
+            return {}
+
+        info = self.get_account_info()
+        multiplier = self._safe_float(getattr(info, 'multiplier', None)) if info is not None else None
+        if multiplier is None:
+            logger.warning(f"[Account {self.id}] No account multiplier -- cannot size bp_factor")
+            return {}
+
+        cache = self._margin_info_cache
+        out: Dict[str, MarginInfo] = {}
+        for raw_symbol in symbols:
+            symbol = (raw_symbol or '').strip().upper()
+            if not symbol:
+                continue
+
+            cached = cache.get(symbol)
+            if cached is not None:
+                # Only the Asset facts are cached; bp_factor is re-derived from the
+                # multiplier read on THIS call. The None guard keeps an entry from a
+                # future non-asset source (a precheck) out of the arithmetic.
+                rate = cached.initial_margin_rate
+                if rate is not None and cached.bp_factor != rate * multiplier:
+                    cached = replace(cached, bp_factor=rate * multiplier)
+                    cache[symbol] = cached
+                out[symbol] = cached
+                continue
+
+            try:
+                asset = self.client.get_asset(symbol)
+            except Exception as e:
+                logger.warning(f"[Account {self.id}] get_asset({symbol}) failed: {e}")
+                continue
+            if asset is None:
+                logger.warning(f"[Account {self.id}] get_asset({symbol}) returned nothing")
+                continue
+
+            marginable = bool(getattr(asset, 'marginable', False))
+            initial_rate = 0.5 if marginable else 1.0
+            maint = self._safe_float(getattr(asset, 'maintenance_margin_requirement', None))
+            margin_info = MarginInfo(
+                symbol=symbol,
+                bp_factor=initial_rate * multiplier,
+                marginable=marginable,
+                fractionable=bool(getattr(asset, 'fractionable', False)),
+                min_order_size=self._safe_float(getattr(asset, 'min_order_size', None)),
+                min_trade_increment=self._safe_float(getattr(asset, 'min_trade_increment', None)),
+                initial_margin_rate=initial_rate,
+                maintenance_margin_rate=(maint / 100.0) if maint is not None else None,
+                source=MARGIN_SOURCE_ASSET,
+            )
+            cache[symbol] = margin_info
+            out[symbol] = margin_info
+
+        return out
+
+    def _safe_float(self, value: Any) -> Optional[float]:
+        """Coerce a broker-supplied number to a plain float, None when not numeric.
+
+        Alpaca types these Optional[str] or Optional[float] depending on the
+        field (TradeAccount.multiplier is a string, Asset.min_order_size a float),
+        and the value dataclasses only carry floats.
+        """
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            logger.warning(f"[Account {self.id}] Non-numeric broker value {value!r}")
+            return None
 
     @alpaca_api_retry
     def symbols_exist(self, symbols: List[str]) -> Dict[str, bool]:

@@ -8113,6 +8113,24 @@ def test_a_second_request_for_the_same_symbol_hits_the_cache_not_the_api():
     assert acct.client.get_asset.call_count == 2
 
 
+def test_a_cached_symbol_is_repriced_when_the_account_multiplier_changes():
+    """The cache holds the ASSET facts (marginability, increments), which do not
+    change intraday. The multiplier does -- Alpaca moves an account between 1/2/4
+    as it crosses the PDT threshold -- and this process is long-lived, so a cache
+    hit must re-derive bp_factor from the multiplier read on THIS call."""
+    acct = _bare_account(multiplier="2")
+    acct.client.get_asset.side_effect = lambda s: _asset(s, marginable=True)
+
+    assert acct.get_symbol_margin_info(["AAPL"])["AAPL"].bp_factor == 1.0
+
+    acct.client.get_account.return_value = TradeAccount(
+        id=uuid4(), account_number="PA1", status=AccountStatus.ACTIVE,
+        cash="1000", equity="25000", buying_power="100000", multiplier="4")
+
+    assert acct.get_symbol_margin_info(["AAPL"])["AAPL"].bp_factor == 2.0
+    assert acct.client.get_asset.call_count == 1     # still no second asset fetch
+
+
 def test_no_margin_info_at_all_when_the_account_multiplier_is_unknown():
     """Without a multiplier there is no honest bp_factor to compute."""
     acct = _bare_account()
@@ -8126,7 +8144,10 @@ def test_no_margin_info_at_all_when_the_account_multiplier_is_unknown():
 
 Run: `venv/bin/python -m pytest tests/test_alpaca_margin_info.py -v`
 
-Expected: FAIL — the base returns `{}`, so the first test fails with `KeyError: 'AAPL'`
+Expected: FAIL — the base returns `{}`, so the first test fails with `KeyError: 'AAPL'`.
+`test_no_margin_info_at_all_when_the_account_multiplier_is_unknown` PASSES vacuously
+against that same `{}`, so the run is `8 failed, 1 passed` before the repricing test
+is added and `9 failed, 1 passed` after.
 
 - [ ] **Step 3: Write minimal implementation**
 
@@ -8140,12 +8161,15 @@ with:
         # Per-symbol margin metadata cache. Alpaca has NO bulk asset endpoint, so
         # get_symbol_margin_info() costs one get_asset() HTTP call per NEW symbol;
         # the allocation page asks for the same basket on every refresh and the
-        # data does not change intraday, so cache for this instance's lifetime.
+        # ASSET facts do not change intraday, so cache for this instance's
+        # lifetime. bp_factor is re-derived on every hit (the multiplier moves).
         self._margin_info_cache: Dict[str, MarginInfo] = {}
 
         # Balance cache (5s TTL; serves stale value on fetch failure)
         self._balance_cache: Optional[float] = None
 ```
+
+Add `from dataclasses import replace` to the imports (used to reprice a cache hit).
 
 Then insert this method immediately after the `get_account_snapshot` added in Task 31:
 ```python
@@ -8158,16 +8182,28 @@ Then insert this method immediately after the `get_account_snapshot` added in Ta
 
         Alpaca's Asset exposes no INITIAL margin field, only
         maintenance_margin_requirement (a percentage, e.g. 30.0), so the initial
-        rate is derived: marginable -> 0.5 (Reg-T), otherwise 1.0. Then
-        bp_factor = initial_rate * account multiplier.
+        rate is DERIVED: marginable -> 0.5 (Reg-T), otherwise 1.0. The
+        maintenance number is reported separately as maintenance_margin_rate and
+        is NEVER substituted for the initial rate. Then
+        bp_factor = initial_rate * account multiplier -- 1.0 for a marginable
+        symbol and 2.0 for a non-marginable one in a 2:1 account.
+
+        The multiplier is read from get_account_info() (ONE get_account() call),
+        not from get_account_snapshot(), which would add a get_account_configurations()
+        round-trip for a fractional flag this method does not use. It is read
+        fresh on every call and re-applied to cached entries, because Alpaca
+        moves an account between 1/2/4 and this process is long-lived; only the
+        Asset facts, which do not change intraday, are actually cached.
 
         A symbol the broker cannot describe is OMITTED, never defaulted here --
         the caller falls back to the conservative bp_factor = account multiplier.
+        One symbol's failure never aborts the batch.
         """
         if not self._check_authentication():
             return {}
 
-        multiplier = self.get_account_snapshot().margin_multiplier
+        info = self.get_account_info()
+        multiplier = self._safe_float(getattr(info, 'multiplier', None)) if info is not None else None
         if multiplier is None:
             logger.warning(f"[Account {self.id}] No account multiplier -- cannot size bp_factor")
             return {}
@@ -8178,42 +8214,68 @@ Then insert this method immediately after the `get_account_snapshot` added in Ta
             symbol = (raw_symbol or '').strip().upper()
             if not symbol:
                 continue
-            if symbol in cache:
-                out[symbol] = cache[symbol]
+
+            cached = cache.get(symbol)
+            if cached is not None:
+                # Only the Asset facts are cached; bp_factor is re-derived from the
+                # multiplier read on THIS call. The None guard keeps an entry from a
+                # future non-asset source (a precheck) out of the arithmetic.
+                rate = cached.initial_margin_rate
+                if rate is not None and cached.bp_factor != rate * multiplier:
+                    cached = replace(cached, bp_factor=rate * multiplier)
+                    cache[symbol] = cached
+                out[symbol] = cached
                 continue
+
             try:
                 asset = self.client.get_asset(symbol)
             except Exception as e:
                 logger.warning(f"[Account {self.id}] get_asset({symbol}) failed: {e}")
                 continue
             if asset is None:
+                logger.warning(f"[Account {self.id}] get_asset({symbol}) returned nothing")
                 continue
 
             marginable = bool(getattr(asset, 'marginable', False))
             initial_rate = 0.5 if marginable else 1.0
-            maint = getattr(asset, 'maintenance_margin_requirement', None)
-            info = MarginInfo(
+            maint = self._safe_float(getattr(asset, 'maintenance_margin_requirement', None))
+            margin_info = MarginInfo(
                 symbol=symbol,
                 bp_factor=initial_rate * multiplier,
                 marginable=marginable,
                 fractionable=bool(getattr(asset, 'fractionable', False)),
-                min_order_size=getattr(asset, 'min_order_size', None),
-                min_trade_increment=getattr(asset, 'min_trade_increment', None),
+                min_order_size=self._safe_float(getattr(asset, 'min_order_size', None)),
+                min_trade_increment=self._safe_float(getattr(asset, 'min_trade_increment', None)),
                 initial_margin_rate=initial_rate,
-                maintenance_margin_rate=(float(maint) / 100.0) if maint is not None else None,
+                maintenance_margin_rate=(maint / 100.0) if maint is not None else None,
                 source=MARGIN_SOURCE_ASSET,
             )
-            cache[symbol] = info
-            out[symbol] = info
+            cache[symbol] = margin_info
+            out[symbol] = margin_info
 
         return out
+
+    def _safe_float(self, value: Any) -> Optional[float]:
+        """Coerce a broker-supplied number to a plain float, None when not numeric.
+
+        Alpaca types these Optional[str] or Optional[float] depending on the
+        field (TradeAccount.multiplier is a string, Asset.min_order_size a float),
+        and the value dataclasses only carry floats.
+        """
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            logger.warning(f"[Account {self.id}] Non-numeric broker value {value!r}")
+            return None
 
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `venv/bin/python -m pytest tests/test_alpaca_margin_info.py -v`
-Expected: PASS (9 passed)
+Expected: PASS (10 passed)
 
 - [ ] **Step 5: Commit**
 ```bash
