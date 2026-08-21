@@ -1059,3 +1059,121 @@ def test_record_allocation_run_takes_filled_values_too(account_id):
                                       filled_buy_value=0.0, filled_sell_value=0.0)
     assert run.filled_buy_value == 0.0
     assert run.filled_sell_value == 0.0
+
+
+# --- deferred finalisation: orders still working at the broker ---------------
+
+def test_finalising_with_unsettled_orders_records_totals_but_spends_nothing(account_id):
+    """An order still working is worth 0 right now, and 0 must not be STAMPED as
+    the final answer -- the stamp is one-shot, so it would strand the income."""
+    store.upsert_income_event(account_id, "dep-1", date(2026, 8, 1), "DEPOSIT", 5000.0)
+    run = store.record_allocation_run(account_id, "REBALANCE", {})
+
+    finalised = store.finalise_allocation_run(
+        run.id, filled_buy_value=0.0, filled_sell_value=0.0,
+        order_ids=[101, 102], orders_settled=False)
+
+    assert finalised.order_ids == [101, 102]
+    assert finalised.income_consumed_at is None
+    assert finalised.is_income_consumed is False
+    assert finalised.income_consumed_amount == 0.0
+    assert store.get_open_income_total(account_id) == pytest.approx(5000.0)
+
+
+def test_a_deferred_run_records_the_part_that_did_fill(account_id):
+    """A partial fill is real money and belongs in the audit row even though the
+    ledger is not spent yet."""
+    run = store.record_allocation_run(account_id, "REBALANCE", {})
+
+    finalised = store.finalise_allocation_run(
+        run.id, filled_buy_value=640.0, filled_sell_value=0.0,
+        order_ids=[101], orders_settled=False)
+
+    assert finalised.filled_buy_value == pytest.approx(640.0)
+    assert finalised.is_income_consumed is False
+
+
+def test_a_deferred_run_stays_in_the_recovery_view(account_id):
+    run = store.record_allocation_run(account_id, "REBALANCE", {})
+    store.finalise_allocation_run(run.id, filled_buy_value=0.0, filled_sell_value=0.0,
+                                  order_ids=[101], orders_settled=False)
+    assert [r.id for r in store.get_unconsumed_runs(account_id)] == [run.id]
+
+
+def test_a_deferred_run_consumes_when_it_is_finalised_again_as_settled(account_id):
+    """The recovery path. Same run, re-measured once its orders settled."""
+    store.upsert_income_event(account_id, "dep-1", date(2026, 8, 1), "DEPOSIT", 5000.0)
+    run = store.record_allocation_run(account_id, "REBALANCE", {})
+    store.finalise_allocation_run(run.id, filled_buy_value=0.0, filled_sell_value=0.0,
+                                  order_ids=[101], orders_settled=False)
+
+    settled = store.finalise_allocation_run(
+        run.id, filled_buy_value=1600.0, filled_sell_value=0.0,
+        order_ids=[101], orders_settled=True)
+
+    assert settled.income_consumed_amount == pytest.approx(1600.0)
+    assert settled.filled_buy_value == pytest.approx(1600.0)
+    assert store.get_open_income_total(account_id) == pytest.approx(3400.0)
+    assert store.get_unconsumed_runs(account_id) == []
+
+
+def test_a_deferred_run_that_ends_up_filling_nothing_consumes_nothing(account_id):
+    """Deferred, then every order came back rejected. Zero is now the TRUE answer,
+    so it is stamped -- the run leaves the recovery view having spent nothing."""
+    store.upsert_income_event(account_id, "dep-1", date(2026, 8, 1), "DEPOSIT", 5000.0)
+    run = store.record_allocation_run(account_id, "REBALANCE", {})
+    store.finalise_allocation_run(run.id, filled_buy_value=0.0, filled_sell_value=0.0,
+                                  order_ids=[101], orders_settled=False)
+
+    settled = store.finalise_allocation_run(
+        run.id, filled_buy_value=0.0, filled_sell_value=0.0,
+        order_ids=[101], orders_settled=True)
+
+    assert settled.is_income_consumed is True
+    assert settled.income_consumed_amount == 0.0
+    assert store.get_open_income_total(account_id) == pytest.approx(5000.0)
+    assert store.get_unconsumed_runs(account_id) == []
+
+
+def test_deferring_never_un_consumes_an_already_consumed_run(account_id):
+    """A run that already spent must not be re-opened by a late 'still working'
+    report. The replay guard outranks the settled flag."""
+    store.upsert_income_event(account_id, "dep-1", date(2026, 8, 1), "DEPOSIT", 5000.0)
+    run = store.record_allocation_run(account_id, "REBALANCE", {})
+    store.finalise_allocation_run(run.id, filled_buy_value=1600.0, filled_sell_value=0.0,
+                                  order_ids=[101])
+
+    again = store.finalise_allocation_run(
+        run.id, filled_buy_value=1600.0, filled_sell_value=0.0,
+        order_ids=[101], orders_settled=False)
+
+    assert again.is_income_consumed is True
+    assert again.income_consumed_amount == pytest.approx(1600.0)
+    assert store.get_open_income_total(account_id) == pytest.approx(3400.0)
+
+
+def test_orders_settled_defaults_to_true(account_id):
+    """Every existing caller keeps its meaning: pass nothing, consume as before."""
+    import inspect
+    signature = inspect.signature(store.finalise_allocation_run)
+    assert signature.parameters["orders_settled"].default is True
+
+
+def test_the_deferred_path_still_takes_the_write_lock_before_reading(account_id, monkeypatch):
+    """BEGIN IMMEDIATE is not conditional on consuming. The deferred path still
+    does a check-then-act (read the stamp, write the totals), and dropping the lock
+    for it would reopen the exact race _begin_write_transaction closes."""
+    calls = []
+    original = store._begin_write_transaction
+
+    def spy(session):
+        calls.append(True)
+        return original(session)
+
+    monkeypatch.setattr(store, "_begin_write_transaction", spy)
+    run = store.record_allocation_run(account_id, "REBALANCE", {})
+
+    store.finalise_allocation_run(run.id, filled_buy_value=0.0, filled_sell_value=0.0,
+                                  order_ids=[], orders_settled=False)
+
+    assert calls == [True]

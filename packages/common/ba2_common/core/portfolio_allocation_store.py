@@ -607,7 +607,8 @@ def record_allocation_run(account_id: int, mode: str, plan_json: Dict[str, Any],
 def finalise_allocation_run(run_id: int, *,
                             filled_buy_value: float,
                             filled_sell_value: float,
-                            order_ids: List[int]) -> PortfolioAllocationRun:
+                            order_ids: List[int],
+                            orders_settled: bool = True) -> PortfolioAllocationRun:
     """Close out a run: write what it FILLED AND spend the income ledger, atomically.
 
     Call this ONCE per run, after the submission loop, whether or not every order
@@ -629,6 +630,18 @@ def finalise_allocation_run(run_id: int, *,
     window in which a crash meant money spent at the broker but still showing as
     unallocated income, so the next run would spend it again. One transaction, no
     window.
+
+    **``orders_settled=False`` records the run WITHOUT spending the ledger.** Pass
+    it when at least one of the run's orders can still fill, so its filled value is
+    not final yet. The totals and ``order_ids`` are written, but
+    ``income_consumed_at`` stays NULL and no income is taken -- which leaves the run
+    listed by ``get_unconsumed_runs()``, to be finalised again (as settled) once the
+    broker has decided. This is the ONLY safe answer for a working order: consuming
+    its planned value spends income that was never deployed, and stamping a zero
+    strands income that is about to be, and the one-shot stamp makes either
+    permanent. It never UN-consumes: a run that already spent keeps its stamp and
+    its breakdown regardless of what this flag says. Expect this path OFTEN -- a
+    rebalance that trims positions routinely leaves a WAITING_TRIGGER order behind.
 
     **Idempotent per run.** ``income_consumed_at`` is checked and set inside that
     same transaction, so a service-layer retry re-states the totals but takes
@@ -671,8 +684,10 @@ def finalise_allocation_run(run_id: int, *,
             f"'nothing was submitted'")
 
     with get_db() as session:
-        # BEFORE the first read, not just before the first write: everything
-        # below is a check-then-act on money. See _begin_write_transaction.
+        # BEGIN IMMEDIATE BEFORE the first read, not just before the first write:
+        # everything below is a check-then-act on money, on BOTH paths. Making this
+        # conditional on `orders_settled` would reopen the double-spend race. See
+        # _begin_write_transaction.
         _begin_write_transaction(session)
         row = session.exec(
             select(PortfolioAllocationRun).where(PortfolioAllocationRun.id == run_id)
@@ -681,12 +696,15 @@ def finalise_allocation_run(run_id: int, *,
             raise InstanceNotFound(f"PortfolioAllocationRun {run_id} not found")
         account_id = row.account_id
         replayed = row.income_consumed_at is not None
+        deferred = not replayed and not orders_settled
         row.filled_buy_value = float(filled_buy_value)
         row.filled_sell_value = float(filled_sell_value)
         row.order_ids = list(order_ids or [])
-        if replayed:
-            # The ledger is NOT touched again. The totals above are re-stated
-            # because restating them is harmless; spending twice is not.
+        if replayed or deferred:
+            # replayed: the ledger is NOT touched again. The totals above are
+            # re-stated because restating them is harmless; spending twice is not.
+            # deferred: the filled value is not final, so there is nothing correct
+            # to spend yet -- and no stamp, so the run stays recoverable.
             consumed = [tuple(pair) for pair in (row.income_consumed_events or [])]
         else:
             consumed = _apply_income_consumption(session, account_id, row.net_buy_value)
@@ -702,6 +720,13 @@ def finalise_allocation_run(run_id: int, *,
             f"Allocation run {run_id} of account {account_id} was finalised again; its "
             f"totals were re-stated but the income ledger was left alone (it already "
             f"consumed {row.income_consumed_amount:.2f} from {len(consumed)} event(s))")
+    elif deferred:
+        logger.warning(
+            f"Allocation run {run_id} of account {account_id} recorded filled buys "
+            f"{row.filled_buy_value:.2f} / sells {row.filled_sell_value:.2f} but did NOT "
+            f"consume income: at least one of its {len(row.order_ids)} order(s) can still "
+            f"fill. The run stays in get_unconsumed_runs() and is finalised for real once "
+            f"the broker settles it")
     else:
         logger.info(
             f"Finalised allocation run {run_id} for account {account_id}: buys "
@@ -714,11 +739,16 @@ def finalise_allocation_run(run_id: int, *,
 def get_unconsumed_runs(account_id: int, limit: int = 20) -> List[PortfolioAllocationRun]:
     """Runs that never reached ``finalise_allocation_run()``, NEWEST first.
 
-    The recovery view: a row here submitted orders (or died trying) but its
-    ``income_consumed_at`` is still NULL, so the income that funded it is still
-    showing as unallocated and the NEXT run would spend it a second time. Normally
-    empty -- anything in it wants a human, because only the broker knows what
-    actually went out.
+    The recovery view, and it is NOT normally empty. A row here either submitted
+    orders and died before finalising, or was finalised with ``orders_settled=False``
+    because at least one order could still fill -- the ordinary outcome of a
+    rebalance that trims held positions. Either way its ``income_consumed_at`` is
+    NULL, so the income that funded it still shows as unallocated and the NEXT run
+    would spend it a second time.
+    ``portfolio_allocation_service.reconcile_unconsumed_runs()`` drains this list at
+    the start of every run AND on every income-panel refresh; anything that survives
+    several passes wants a human, because only the broker knows what actually went
+    out.
 
     A run that consumed nothing legitimately (a rebalance funded by its own sells)
     is NOT here: it is stamped, with an empty ``income_consumed_events``.
