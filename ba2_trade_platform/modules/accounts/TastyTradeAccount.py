@@ -2,6 +2,7 @@ import asyncio
 import threading
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone, date, timedelta
+from concurrent.futures import TimeoutError as FutureTimeoutError
 
 from ...logger import logger
 from ...core.models import Position
@@ -45,10 +46,33 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
             logger.error(f"Failed to initialize TastyTrade session for account {id}: {e}", exc_info=True)
             raise
 
-    def _run_async(self, coro):
-        """Run an async coroutine on this account's persistent event loop."""
+    #: Wall-clock budget for ONE SDK call. The old hardcoded 30s was routinely
+    #: exceeded by paginated calls (a full order history, a year of transactions),
+    #: and because every caller wraps _run_async in `except Exception: return []`,
+    #: a timeout surfaced as "the broker has no data" instead of as a failure.
+    _ASYNC_TIMEOUT_SECONDS = 180
+
+    def _run_async(self, coro, timeout: Optional[float] = None):
+        """Run an async coroutine on this account's persistent event loop.
+
+        Args:
+            coro: the coroutine to drive.
+            timeout: seconds to wait; ``None`` uses ``_ASYNC_TIMEOUT_SECONDS``.
+
+        Raises:
+            TimeoutError: naming the account and the budget, so the caller's
+                ``logger.error`` says WHY it produced nothing. The pending future is
+                cancelled first so the loop does not keep the request alive.
+        """
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return future.result(timeout=30)
+        limit = self._ASYNC_TIMEOUT_SECONDS if timeout is None else timeout
+        try:
+            return future.result(timeout=limit)
+        except FutureTimeoutError as e:
+            future.cancel()
+            raise TimeoutError(
+                f"[Account {self.id}] TastyTrade call timed out after {limit}s"
+            ) from e
 
     def _is_sandbox(self) -> bool:
         """Whether this account targets TastyTrade's sandbox (certification) API.

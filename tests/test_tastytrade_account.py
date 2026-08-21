@@ -204,3 +204,54 @@ def test_is_sandbox_with_unsaved_setting_returns_interface_default():
 def test_is_sandbox_with_saved_true_returns_true():
     acct = _bare_account(settings={"is_test": True})
     assert acct._is_sandbox() is True
+
+
+# ---------------------------------------------------------------------------
+# _run_async
+# ---------------------------------------------------------------------------
+
+def _looped_account():
+    """A bare account with a REAL persistent event loop, for testing _run_async itself."""
+    acct = object.__new__(TastyTradeAccount)
+    acct.id = 7
+    acct._authentication_error = None
+    acct._session = SimpleNamespace(label="tasty-session")
+    acct._account = SimpleNamespace(account_number="5WX00000")
+    acct._settings_cache = {}
+    acct._loop = asyncio.new_event_loop()
+    acct._loop_thread = threading.Thread(target=acct._loop.run_forever, daemon=True)
+    acct._loop_thread.start()
+    return acct
+
+
+def _stop_loop(acct):
+    acct._loop.call_soon_threadsafe(acct._loop.stop)
+    acct._loop_thread.join(timeout=5)
+
+
+def test_run_async_returns_the_coroutine_result():
+    acct = _looped_account()
+    try:
+        async def _work():
+            return {"items": [1, 2, 3]}
+
+        assert acct._run_async(_work()) == {"items": [1, 2, 3]}
+    finally:
+        _stop_loop(acct)
+
+
+def test_run_async_raises_timeout_error_naming_the_budget():
+    """A slow SDK call must fail as an ERROR that says it timed out, not silently
+    bubble a bare concurrent.futures timeout that every caller turns into `[]`."""
+    acct = _looped_account()
+    try:
+        with pytest.raises(TimeoutError) as excinfo:
+            acct._run_async(asyncio.sleep(5), timeout=0.05)
+        assert "timed out after 0.05" in str(excinfo.value)
+    finally:
+        _stop_loop(acct)
+
+
+def test_run_async_default_budget_exceeds_the_old_thirty_second_limit():
+    """Paginated history calls routinely exceed 30s; the default must be generous."""
+    assert TastyTradeAccount._ASYNC_TIMEOUT_SECONDS >= 120
