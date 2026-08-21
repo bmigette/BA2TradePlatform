@@ -569,3 +569,138 @@ def test_get_order_returns_a_trading_order():
 
     assert isinstance(order, TradingOrder)
     assert order.broker_order_id == "987654"
+
+
+# ---------------------------------------------------------------------------
+# Order submission
+# ---------------------------------------------------------------------------
+
+def _tt_trading_order(**kwargs):
+    """A PERSISTED TradingOrder owned by a persisted TastyTrade AccountDefinition."""
+    from tests.factories import create_account_definition, create_trading_order
+    from ba2_trade_platform.core.types import OrderDirection, OrderStatus, OrderType
+
+    account_def = create_account_definition(name="TastyTrade Test", provider="TastyTrade")
+    defaults = dict(symbol="AAPL", quantity=3.0, side=OrderDirection.BUY,
+                    order_type=OrderType.MARKET, status=OrderStatus.PENDING,
+                    good_for="day")
+    defaults.update(kwargs)
+    order = create_trading_order(account_id=account_def.id, **defaults)
+    return account_def, order
+
+
+def test_submit_order_impl_places_a_live_order_and_records_the_broker_id():
+    from ba2_trade_platform.core.types import OrderStatus
+
+    account_def, order = _tt_trading_order()
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.place_order = AsyncMock(
+        return_value=_placed_order_response(
+            _placed_order(order_id=987654, status=TTOrderStatus.RECEIVED)))
+
+    with patch("tastytrade.instruments.Equity.get",
+               new=AsyncMock(return_value=_FakeEquity("AAPL"))):
+        result = acct._submit_order_impl(order)
+
+    assert result.broker_order_id == "987654"
+    assert result.status == OrderStatus.NEW  # TastyTrade "Received"
+
+
+def test_submit_order_impl_passes_dry_run_false_explicitly():
+    """place_order's dry_run parameter DEFAULTS TO True (tastytrade/account.py:877)."""
+    account_def, order = _tt_trading_order()
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.place_order = AsyncMock(
+        return_value=_placed_order_response(_placed_order()))
+
+    with patch("tastytrade.instruments.Equity.get",
+               new=AsyncMock(return_value=_FakeEquity("AAPL"))):
+        acct._submit_order_impl(order)
+
+    assert acct._account.place_order.call_args.kwargs["dry_run"] is False
+
+
+def test_submit_order_impl_builds_a_buy_to_open_leg_tagged_with_our_row_id():
+    account_def, order = _tt_trading_order(quantity=3.0)
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.place_order = AsyncMock(
+        return_value=_placed_order_response(_placed_order()))
+
+    with patch("tastytrade.instruments.Equity.get",
+               new=AsyncMock(return_value=_FakeEquity("AAPL"))):
+        acct._submit_order_impl(order)
+
+    sent = acct._account.place_order.call_args.args[1]
+    assert sent.legs[0].action == OrderAction.BUY_TO_OPEN
+    assert sent.legs[0].quantity == Decimal("3")
+    assert sent.time_in_force == OrderTimeInForce.DAY
+    assert sent.order_type == TTOrderType.MARKET
+    # external_identifier is TastyTrade's client_order_id equivalent -- refresh_orders
+    # matches on it.
+    assert sent.external_identifier == str(order.id)
+
+
+def test_submit_order_impl_closing_sell_uses_sell_to_close():
+    from ba2_trade_platform.core.types import OrderDirection
+
+    account_def, order = _tt_trading_order(side=OrderDirection.SELL)
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.place_order = AsyncMock(
+        return_value=_placed_order_response(_placed_order()))
+
+    with patch("tastytrade.instruments.Equity.get",
+               new=AsyncMock(return_value=_FakeEquity("AAPL"))):
+        acct._submit_order_impl(order, is_closing_order=True)
+
+    assert acct._account.place_order.call_args.args[1].legs[0].action == OrderAction.SELL_TO_CLOSE
+
+
+def test_build_new_order_prices_a_buy_limit_as_a_negative_debit():
+    """NewOrder.price_effect is a COMPUTED field derived from the sign of `price`
+    (order.py:264-276): negative = debit. It must never be set by hand."""
+    from ba2_trade_platform.core.types import OrderType
+
+    account_def, order = _tt_trading_order(order_type=OrderType.BUY_LIMIT, limit_price=142.5)
+    acct = _bare_account()
+    acct.id = account_def.id
+
+    with patch("tastytrade.instruments.Equity.get",
+               new=AsyncMock(return_value=_FakeEquity("AAPL"))):
+        new_order = acct._build_new_order(order)
+
+    assert new_order.price == Decimal("-142.5")
+    assert new_order.price_effect == PriceEffect.DEBIT
+
+
+def test_build_new_order_prices_a_sell_limit_as_a_positive_credit():
+    from ba2_trade_platform.core.types import OrderDirection, OrderType
+
+    account_def, order = _tt_trading_order(side=OrderDirection.SELL,
+                                           order_type=OrderType.SELL_LIMIT,
+                                           limit_price=161.4)
+    acct = _bare_account()
+    acct.id = account_def.id
+
+    with patch("tastytrade.instruments.Equity.get",
+               new=AsyncMock(return_value=_FakeEquity("AAPL"))):
+        new_order = acct._build_new_order(order)
+
+    assert new_order.price == Decimal("161.4")
+    assert new_order.price_effect == PriceEffect.CREDIT
+
+
+def test_submit_order_impl_skips_an_order_that_already_has_a_broker_id():
+    """Idempotency guard: an order already sent to the broker is never re-sent."""
+    account_def, order = _tt_trading_order(broker_order_id="987654")
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.place_order = AsyncMock()
+
+    result = acct._submit_order_impl(order)
+
+    assert result is order
+    acct._account.place_order.assert_not_called()

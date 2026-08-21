@@ -2,13 +2,16 @@ import asyncio
 import threading
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone, date, timedelta
+from decimal import Decimal
 from concurrent.futures import TimeoutError as FutureTimeoutError
 
 from tastytrade.order import InstrumentType as TTInstrumentType
+from tastytrade.order import NewOrder, OrderAction, OrderTimeInForce
 from tastytrade.order import OrderStatus as TTOrderStatus
 from tastytrade.order import OrderType as TTOrderType
 
 from ...logger import logger
+from ...core.db import add_instance, get_instance, update_instance
 from ...core.models import Position, TradingOrder
 from ...core.types import OrderDirection, OrderStatus
 from ...core.types import OrderType as CoreOrderType
@@ -569,6 +572,149 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
             logger.error(f"[Account {self.id}] Error getting price: {e}", exc_info=True)
             if isinstance(symbol_or_symbols, list):
                 return {s: None for s in symbol_or_symbols}
+            return None
+
+    #: platform TradingOrder.good_for -> TastyTrade TIF. An absent/unknown value falls
+    #: back to GTC, matching AlpacaAccount._submit_order_impl's tif_map default.
+    _TT_TIF_MAP = {
+        "day": OrderTimeInForce.DAY,
+        "gtc": OrderTimeInForce.GTC,
+        "gtd": OrderTimeInForce.GTD,
+        "ext": OrderTimeInForce.EXT,
+        "gtc_ext": OrderTimeInForce.GTC_EXT,
+        "ioc": OrderTimeInForce.IOC,
+    }
+
+    @staticmethod
+    def _tt_action(side: OrderDirection, is_closing_order: bool) -> OrderAction:
+        """The equity ``OrderAction`` for a side plus an open/close intent."""
+        if side == OrderDirection.BUY:
+            return OrderAction.BUY_TO_CLOSE if is_closing_order else OrderAction.BUY_TO_OPEN
+        return OrderAction.SELL_TO_CLOSE if is_closing_order else OrderAction.SELL_TO_OPEN
+
+    @staticmethod
+    def _signed_price(price: float, side: OrderDirection) -> Decimal:
+        """TastyTrade encodes the direction of cash flow in the SIGN of ``NewOrder.price``.
+
+        Negative = debit (you pay: a BUY), positive = credit (a SELL). The
+        ``price_effect`` field is COMPUTED from this sign (order.py:264-276) with
+        ``abs()`` applied on serialisation, so it must never be set by hand.
+        """
+        magnitude = abs(Decimal(str(price)))
+        return -magnitude if side == OrderDirection.BUY else magnitude
+
+    def _build_new_order(self, trading_order: TradingOrder,
+                         is_closing_order: bool = False) -> NewOrder:
+        """Build the SDK ``NewOrder`` for a TradingOrder.
+
+        Shared by the live submit and by ``preview_order_impact``'s dry run, so a
+        preview always prices exactly the order that would be sent.
+
+        ``external_identifier`` carries our own row id -- TastyTrade's equivalent of
+        Alpaca's ``client_order_id`` -- which is how ``refresh_orders`` matches broker
+        orders back to database rows.
+
+        Raises:
+            ValueError: when a required price is missing, or the order type is not one
+                TastyTrade equity submission supports here (OCO/OTO are out of scope).
+        """
+        from tastytrade.instruments import Equity
+
+        equity = self._run_async(Equity.get(self._session, trading_order.symbol))
+        action = self._tt_action(trading_order.side, is_closing_order)
+        leg = equity.build_leg(Decimal(str(trading_order.quantity)), action)
+
+        kwargs = {
+            "time_in_force": self._TT_TIF_MAP.get(
+                (trading_order.good_for or "").lower(), OrderTimeInForce.GTC),
+            "legs": [leg],
+            "external_identifier": str(trading_order.id) if trading_order.id else None,
+        }
+
+        core_type = trading_order.order_type
+        if core_type == CoreOrderType.MARKET:
+            kwargs["order_type"] = TTOrderType.MARKET
+        elif core_type in (CoreOrderType.BUY_LIMIT, CoreOrderType.SELL_LIMIT):
+            if trading_order.limit_price is None:
+                raise ValueError(f"Limit price is required for {core_type.value} orders")
+            kwargs["order_type"] = TTOrderType.LIMIT
+            kwargs["price"] = self._signed_price(trading_order.limit_price, trading_order.side)
+        elif core_type in (CoreOrderType.BUY_STOP, CoreOrderType.SELL_STOP):
+            if trading_order.stop_price is None:
+                raise ValueError(f"Stop price is required for {core_type.value} orders")
+            kwargs["order_type"] = TTOrderType.STOP
+            kwargs["stop_trigger"] = Decimal(str(trading_order.stop_price))
+        elif core_type in (CoreOrderType.BUY_STOP_LIMIT, CoreOrderType.SELL_STOP_LIMIT):
+            if trading_order.stop_price is None or trading_order.limit_price is None:
+                raise ValueError("Stop and limit prices are both required for stop-limit orders")
+            kwargs["order_type"] = TTOrderType.STOP_LIMIT
+            kwargs["stop_trigger"] = Decimal(str(trading_order.stop_price))
+            kwargs["price"] = self._signed_price(trading_order.limit_price, trading_order.side)
+        else:
+            raise ValueError(
+                f"TastyTrade equity submission does not support order type {core_type}")
+
+        return NewOrder(**kwargs)
+
+    def _submit_order_impl(self, trading_order: TradingOrder, tp_price: Optional[float] = None,
+                           sl_price: Optional[float] = None, is_closing_order: bool = False,
+                           use_complex_order: bool = False) -> Optional[TradingOrder]:
+        """Send ONE equity order to TastyTrade.
+
+        NEVER override ``submit_order``: the template method on AccountInterface owns
+        validation, transaction creation, the wash-trade gate and protective legs.
+        Overriding it is exactly what disabled IBKRAccount (IBKRAccount.py:27-40).
+
+        ``tp_price`` / ``sl_price`` / ``use_complex_order`` are accepted for interface
+        compatibility and IGNORED: TastyTrade complex orders are out of scope here, so
+        a protective leg has to be placed as its own order.
+
+        Returns:
+            Optional[TradingOrder]: the refreshed database row on success, ``None`` on
+            failure.
+        """
+        if not self._check_authentication():
+            return None
+
+        # Idempotency guard: an order that already carries a broker_order_id was
+        # already sent. Never re-submit it.
+        if trading_order.broker_order_id:
+            logger.warning(
+                f"Order {trading_order.id} already has broker_order_id "
+                f"{trading_order.broker_order_id} -- skipping re-submission")
+            return trading_order
+
+        if tp_price is not None or sl_price is not None:
+            logger.warning(
+                f"Order {trading_order.id}: TastyTrade does not attach TP/SL legs at "
+                f"submission (tp={tp_price}, sl={sl_price} ignored); place them separately")
+
+        try:
+            if trading_order.id is None:
+                trading_order.status = OrderStatus.PENDING
+                trading_order.id = add_instance(trading_order, expunge_after_flush=True)
+                logger.info(
+                    f"Created new order {trading_order.id} in database with status PENDING")
+
+            new_order = self._build_new_order(trading_order, is_closing_order=is_closing_order)
+
+            # dry_run DEFAULTS TO True in the SDK (tastytrade/account.py:877-879).
+            # Pass it explicitly so a signature change can never turn a live order
+            # into a silent no-op.
+            response = self._run_async(
+                self._account.place_order(self._session, new_order, dry_run=False))
+
+            fresh_order = get_instance(TradingOrder, trading_order.id)
+            fresh_order.broker_order_id = str(response.order.id)
+            fresh_order.status = self._map_order_status(response.order.status)
+            update_instance(fresh_order)
+            logger.info(
+                f"Submitted TastyTrade order {fresh_order.id}: "
+                f"broker_order_id={fresh_order.broker_order_id}, status={fresh_order.status}")
+            return fresh_order
+        except Exception as e:
+            logger.error(
+                f"Error submitting order {trading_order.id} to TastyTrade: {e}", exc_info=True)
             return None
 
     def refresh_positions(self) -> bool:
