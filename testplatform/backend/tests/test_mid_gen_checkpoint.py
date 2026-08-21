@@ -1,6 +1,7 @@
 """Mid-generation checkpoint + resume."""
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -426,3 +427,135 @@ def test_a_batch_fitness_that_predates_on_result_still_works():
 
     res = opt.optimize(fitness_function=lambda p: 0.0, batch_fitness=batch_fitness)
     assert res["best_fitness"] == 1.0
+
+
+# ---------------------------------------------------------------------------------------------
+# Task 6: end-to-end interrupt and resume
+#
+# NOTE. The plan's version asserts ``len(evaluated_second) == 2`` against an optimizer with
+# n_generations=3, but a resumed run continues through generations 1 and 2 and evaluates their
+# offspring too, so that counter is ~10, not 2. The claim being made is about the RESUMED
+# GENERATION, so the assertion is on the first batch of the resumed run.
+# ---------------------------------------------------------------------------------------------
+
+def test_interrupted_generation_resumes_without_rerunning_finished_trials():
+    """THE POINT OF THIS FEATURE. Interrupt a generation after 4 of 6 individuals, resume, and
+    assert the 4 are NOT re-evaluated. Before this work the resume re-ran all 6 -- measured at
+    ~3h of wasted compute per restart on the small cap band."""
+    opt = _opt()
+    opt.partial_checkpoint_every = 1
+    saved: dict = {}
+
+    class _Stop(Exception):
+        pass
+
+    evaluated_first = []
+
+    def batch_fitness(param_dicts, on_result=None):
+        for i in range(len(param_dicts)):
+            if i >= 4:
+                raise _Stop()               # die mid-generation, like a killed grid master
+            evaluated_first.append(i)
+            on_result(i, float(i))
+        return [float(i) for i in range(len(param_dicts))]
+
+    def checkpoint_cb(gen, pop, partial=False):
+        saved.clear()
+        saved.update(opt.get_checkpoint_data(gen, pop))
+        saved["partial"] = partial
+
+    with pytest.raises(_Stop):
+        opt.optimize(fitness_function=lambda p: 0.0, batch_fitness=batch_fitness,
+                     checkpoint_callback=checkpoint_cb)
+
+    assert evaluated_first == [0, 1, 2, 3]
+    assert saved.get("partial") is True
+    assert saved["generation"] == 0
+    assert sum(1 for f in saved["fitnesses"] if f is not None) == 4
+
+    # A checkpoint lives in a JSON DB column (TaskQueue.checkpoint_data): make the resume read
+    # what the database would actually hand back, not the in-memory dict.
+    saved = json.loads(json.dumps(saved))
+    unfinished = [g for g, f in zip(saved["population"], saved["fitnesses"]) if f is None]
+    assert len(unfinished) == 2
+
+    # --- resume ---
+    opt2 = _opt()
+    start_gen, pop, fits = opt2.resume_from_checkpoint(saved)
+    assert start_gen == saved["generation"], "must resume INTO the generation, not after it"
+
+    batches = []
+    first_batch_params = []
+    boundary_fitnesses = []
+
+    def batch_fitness2(param_dicts, on_result=None):
+        batches.append(len(param_dicts))
+        if len(batches) == 1:
+            first_batch_params.extend(param_dicts)
+        for i in range(len(param_dicts)):
+            on_result(i, 9.0)
+        return [9.0] * len(param_dicts)
+
+    def checkpoint_cb2(gen, pop_, partial=False):
+        if not partial:
+            boundary_fitnesses.append(opt2.get_checkpoint_data(gen, pop_)["fitnesses"])
+
+    opt2.optimize(fitness_function=lambda p: 0.0, batch_fitness=batch_fitness2,
+                  start_generation=start_gen, initial_population=pop, restored_fitnesses=fits,
+                  checkpoint_callback=checkpoint_cb2)
+
+    assert batches[0] == 2, \
+        f"only the 2 unfinished individuals should re-run, got {batches[0]}"
+    assert first_batch_params == [opt2.decode_individual(g) for g in unfinished], \
+        "the re-run individuals are not the ones that were left unevaluated"
+    assert sorted(boundary_fitnesses[0]) == [0.0, 1.0, 2.0, 3.0, 9.0, 9.0], \
+        "the 4 finished individuals lost the fitness the checkpoint carried"
+
+
+def test_a_boundary_resume_re_evaluates_nothing():
+    """The non-partial half of the same story -- Task 1's standalone win.
+
+    A generation-boundary checkpoint holds a FULLY evaluated population, so restoring it must
+    leave DEAP's invalid_ind empty and the resumed generation must dispatch zero trials. Before
+    fitness was persisted, invalid_ind was the entire population and every resume re-ran it:
+    ~3h of compute on the small cap band, for a result the checkpoint already contained.
+
+    (The resumed generation does no NEW work either way -- the checkpoint is taken before
+    selection/crossover, so that generation's offspring were never persisted. That lost
+    generation is pre-existing behaviour; what changes here is that it now costs nothing
+    instead of a full round of backtests.)
+    """
+    opt = _opt()
+    saved: dict = {}
+
+    def batch_fitness(param_dicts, on_result=None):
+        return [float(i) for i in range(len(param_dicts))]
+
+    def checkpoint_cb(gen, pop, partial=False):
+        saved.clear()
+        saved.update(opt.get_checkpoint_data(gen, pop))
+        saved["partial"] = partial
+
+    opt.optimize(fitness_function=lambda p: 0.0, batch_fitness=batch_fitness,
+                 checkpoint_callback=checkpoint_cb)
+
+    assert saved["partial"] is False
+    assert all(f is not None for f in saved["fitnesses"]), "a boundary population is fully scored"
+
+    opt2 = _opt(n_generations=saved["generation"] + 2)   # exactly one more generation to run
+    start_gen, pop, fits = opt2.resume_from_checkpoint(saved)
+    assert start_gen == saved["generation"] + 1
+
+    batches = []
+
+    def batch_fitness2(param_dicts, on_result=None):
+        batches.append(len(param_dicts))
+        return [1.0] * len(param_dicts)
+
+    opt2.optimize(fitness_function=lambda p: 0.0, batch_fitness=batch_fitness2,
+                  start_generation=start_gen, initial_population=pop, restored_fitnesses=fits)
+
+    assert batches == [], (
+        f"a boundary resume dispatched {batches} trials for a population that was already fully "
+        "scored in the checkpoint; before fitness was persisted this was the WHOLE population, "
+        "every single time")
