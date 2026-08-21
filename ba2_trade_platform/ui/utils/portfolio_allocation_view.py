@@ -8,6 +8,7 @@ Lives under ``ui/utils/`` rather than beside the page because
 ``ui/pages/__init__.py`` imports the whole page set (and through it the LLM/expert
 stack); ``ui/utils/`` holds only perf_logger and imports in milliseconds.
 """
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -300,3 +301,49 @@ def build_label_views(managed,
         ))
 
     return views
+
+
+#: Machine-written instrument tags that must not appear in the managed-label picker.
+MACHINE_LABELS = frozenset({'auto_added', 'expert_selected', 'ai_selected', 'not_found'})
+
+#: Per-expert-instance tags written by InstrumentAutoAdder: 'penny-17',
+#: 'tradingagents-16', 'fmprating-18'. The bare family name without an index
+#: ('Penny') is a USER label and is deliberately NOT matched.
+MACHINE_LABEL_FAMILY_RE = re.compile(r'^(?:penny|tradingagents|fmprating)-\d+$',
+                                     re.IGNORECASE)
+
+
+def is_machine_label(label) -> bool:
+    """True when ``label`` was written by the platform rather than by the user.
+
+    Case-insensitive on both the exact tags and the numbered families. A blank or
+    ``None`` label is not a machine label (it is simply dropped by the caller).
+    """
+    text = (label or "").strip()
+    if not text:
+        return False
+    if text.lower() in MACHINE_LABELS:
+        return True
+    return bool(MACHINE_LABEL_FAMILY_RE.match(text))
+
+
+def filter_selectable_labels(all_labels, show_all: bool = False) -> List[str]:
+    """The labels offered in the managed-label picker. Pure.
+
+    Args:
+        all_labels: everything ``get_all_instrument_labels()`` returned.
+        show_all: the picker's escape hatch — when True nothing is hidden, so a
+            user who really does want to manage 'auto_added' still can.
+
+    Returns:
+        List[str]: de-duplicated, blank-stripped, sorted case-insensitively.
+    """
+    seen, kept = set(), []
+    for label in (all_labels or []):
+        text = (label or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        if show_all or not is_machine_label(text):
+            kept.append(text)
+    return sorted(kept, key=lambda s: s.lower())

@@ -10,7 +10,8 @@ import pytest
 from ba2_trade_platform.core.portfolio_allocation import PositionFetchFailed
 from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
     GATE_HAS_EXPERTS, GATE_NOT_MANUAL, GATE_NO_ACCOUNT, GATE_OK,
-    ManagedLabel, build_label_views, evaluate_gate, positions_by_symbol,
+    ManagedLabel, build_label_views, evaluate_gate, filter_selectable_labels,
+    is_machine_label, positions_by_symbol,
 )
 
 
@@ -239,3 +240,49 @@ def test_build_label_views_current_value_is_purchase_value_not_market_value():
     # Both cost 1000, so cost-based weights are 50/50 despite 90/10 market values.
     assert aapl.pct_of_label == 50.0
     assert views[0].current_value == 2000.0
+
+
+# The label set actually present in the live database on 2026-08-20.
+LIVE_LABELS = [
+    'auto_added', 'expert_selected', 'Penny', 'penny-17', 'sp500', 'ARK26',
+    'ai_selected', 'fmprating-18', 'penny-4', 'NASDAQ30', 'HighRisk', 'not_found',
+    'tradingagents-16', 'ai_selector', 'tech', 'megacap',
+]
+
+
+def test_filter_selectable_labels_hides_the_four_machine_tags():
+    out = filter_selectable_labels(LIVE_LABELS)
+    for tag in ('auto_added', 'expert_selected', 'ai_selected', 'not_found'):
+        assert tag not in out
+
+
+def test_filter_selectable_labels_hides_the_numbered_expert_families():
+    out = filter_selectable_labels(LIVE_LABELS)
+    for tag in ('penny-17', 'penny-4', 'fmprating-18', 'tradingagents-16'):
+        assert tag not in out
+
+
+def test_filter_selectable_labels_keeps_user_labels_including_bare_penny():
+    """'Penny' with no -N index is a user basket, not a machine tag."""
+    out = filter_selectable_labels(LIVE_LABELS)
+    assert set(out) == {'Penny', 'sp500', 'ARK26', 'NASDAQ30', 'HighRisk',
+                        'ai_selector', 'tech', 'megacap'}
+
+
+def test_filter_selectable_labels_show_all_is_the_escape_hatch():
+    out = filter_selectable_labels(LIVE_LABELS, show_all=True)
+    assert 'auto_added' in out
+    assert 'penny-17' in out
+    assert len(out) == len(LIVE_LABELS)
+
+
+def test_filter_selectable_labels_is_sorted_case_insensitively_and_deduped():
+    out = filter_selectable_labels(['zeta', 'ARK26', 'alpha', 'ARK26', '  ', None])
+    assert out == ['alpha', 'ARK26', 'zeta']
+
+
+def test_is_machine_label_is_case_insensitive():
+    assert is_machine_label('AUTO_ADDED') is True
+    assert is_machine_label('Penny-4') is True
+    assert is_machine_label('Penny') is False
+    assert is_machine_label('') is False
