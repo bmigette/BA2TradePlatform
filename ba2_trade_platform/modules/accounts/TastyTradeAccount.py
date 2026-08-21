@@ -10,8 +10,10 @@ from tastytrade.order import NewOrder, OrderAction, OrderTimeInForce
 from tastytrade.order import OrderStatus as TTOrderStatus
 from tastytrade.order import OrderType as TTOrderType
 
+from sqlmodel import select
+
 from ...logger import logger
-from ...core.db import add_instance, get_instance, update_instance
+from ...core.db import add_instance, get_db, get_instance, update_instance, InstanceNotFound
 from ...core.models import Position, TradingOrder
 from ...core.types import OrderDirection, OrderStatus
 from ...core.types import OrderType as CoreOrderType
@@ -716,6 +718,68 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
             logger.error(
                 f"Error submitting order {trading_order.id} to TastyTrade: {e}", exc_info=True)
             return None
+
+    def cancel_order(self, order_id: str) -> bool:
+        """Cancel an order. ``order_id`` may be our DATABASE id or the BROKER id.
+
+        AlpacaAccount.cancel_order tells the two apart by looking for a '-' (its broker
+        ids are UUIDs). TastyTrade broker ids are integers, exactly like our database
+        ids, so resolution is by LOOKUP instead: our own row first (scoped to this
+        account), then by ``broker_order_id``.
+
+        Returns:
+            bool: True when the cancel was accepted by the broker.
+        """
+        if not self._check_authentication():
+            return False
+
+        db_order = None
+        try:
+            candidate = get_instance(TradingOrder, int(str(order_id).strip()))
+            if candidate.account_id == self.id:
+                db_order = candidate
+        except (InstanceNotFound, TypeError, ValueError):
+            db_order = None
+
+        if db_order is None:
+            with get_db() as session:
+                found = session.exec(
+                    select(TradingOrder).where(
+                        TradingOrder.broker_order_id == str(order_id),
+                        TradingOrder.account_id == self.id,
+                    )
+                ).first()
+                found_id = found.id if found else None
+            db_order = get_instance(TradingOrder, found_id) if found_id else None
+
+        if db_order is None:
+            logger.error(f"[Account {self.id}] Order {order_id} not found in database")
+            return False
+        if not db_order.broker_order_id:
+            logger.error(
+                f"[Account {self.id}] Order {db_order.id} has no broker_order_id "
+                f"-- it was never sent to TastyTrade")
+            return False
+
+        try:
+            self._run_async(
+                self._account.delete_order(self._session, int(db_order.broker_order_id)))
+        except Exception as e:
+            logger.error(
+                f"[Account {self.id}] Error cancelling TastyTrade order {order_id}: {e}",
+                exc_info=True)
+            return False
+
+        # PENDING_CANCEL, not CANCELED: the cancel has only been REQUESTED.
+        # refresh_orders promotes it once the broker confirms and the qty is actually
+        # released -- same rule as AlpacaAccount.cancel_order.
+        fresh_order = get_instance(TradingOrder, db_order.id)
+        fresh_order.status = OrderStatus.PENDING_CANCEL
+        update_instance(fresh_order)
+        logger.info(
+            f"[Account {self.id}] Requested cancel of TastyTrade order "
+            f"broker_order_id={db_order.broker_order_id} (db id={db_order.id})")
+        return True
 
     def refresh_positions(self) -> bool:
         # Positions are always fetched live from API

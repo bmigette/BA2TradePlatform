@@ -704,3 +704,68 @@ def test_submit_order_impl_skips_an_order_that_already_has_a_broker_id():
 
     assert result is order
     acct._account.place_order.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# cancel_order
+# ---------------------------------------------------------------------------
+
+def test_cancel_order_by_database_id_deletes_the_broker_order():
+    account_def, order = _tt_trading_order(broker_order_id="987654")
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.delete_order = AsyncMock(return_value=None)
+
+    assert acct.cancel_order(order.id) is True
+    assert acct._account.delete_order.call_args.args[1] == 987654
+
+
+def test_cancel_order_by_broker_id_resolves_the_same_row():
+    from ba2_trade_platform.core.db import get_instance
+    from ba2_trade_platform.core.models import TradingOrder
+    from ba2_trade_platform.core.types import OrderStatus
+
+    account_def, order = _tt_trading_order(broker_order_id="987654")
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.delete_order = AsyncMock(return_value=None)
+
+    assert acct.cancel_order("987654") is True
+    assert get_instance(TradingOrder, order.id).status == OrderStatus.PENDING_CANCEL
+
+
+def test_cancel_order_marks_pending_cancel_not_canceled():
+    """The cancel has only been REQUESTED. refresh_orders promotes it once the broker
+    confirms -- a dependent replacement must not fire before the qty is released."""
+    from ba2_trade_platform.core.db import get_instance
+    from ba2_trade_platform.core.models import TradingOrder
+    from ba2_trade_platform.core.types import OrderStatus
+
+    account_def, order = _tt_trading_order(broker_order_id="987654")
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.delete_order = AsyncMock(return_value=None)
+
+    acct.cancel_order(order.id)
+
+    assert get_instance(TradingOrder, order.id).status == OrderStatus.PENDING_CANCEL
+
+
+def test_cancel_order_without_a_broker_id_fails_without_calling_the_broker():
+    account_def, order = _tt_trading_order()
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.delete_order = AsyncMock()
+
+    assert acct.cancel_order(order.id) is False
+    acct._account.delete_order.assert_not_called()
+
+
+def test_cancel_order_for_an_unknown_id_returns_false():
+    account_def, _order = _tt_trading_order()
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.delete_order = AsyncMock()
+
+    assert acct.cancel_order("999999999") is False
+    acct._account.delete_order.assert_not_called()
