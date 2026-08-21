@@ -33162,3 +33162,89 @@ git add packages/common/ba2_common/core/portfolio_allocation.py \
         tests/test_portfolio_allocation_wizard_ui.py
 git commit -m "feat(allocation): drain deferred runs on income refresh and tell the user why income is still open"
 ```
+
+---
+
+# AMENDMENT — live broker findings, 2026-08-21
+
+Verified against the user's REAL TastyTrade account (5WZ93866, production, `read trade` scope)
+with `dry_run=True` prechecks. Reproduce with `test_files/probe_tastytrade_dryrun.py`.
+**These OVERRIDE any contrary assumption in Sections E–G or in the Task 80-101 addendum.**
+
+## L1. Fractional equity orders are MARKET or NOTIONAL-MARKET only — never LIMIT.
+
+    HTTP 422  fractional_market_orders_only:
+    "Fractional equity orders can only be market or notional market orders"
+
+Alpaca has the identical rule (`alpaca/trading/requests.py:289`, "Fractional qty for stocks only
+with market orders"), and `AlpacaAccount.py:1039-1064` already enforces it by FLOORING a
+fractional non-market order to whole shares.
+
+**Consequence for the wizard:** fractional ⇒ market order ⇒ **must be inside the regular
+session**. The market-hours gate is not a convenience; it is what makes fractional possible at
+all. A "fractional + limit" combination must be refused locally, before the broker.
+
+## L2. Fractional orders have a $5 MINIMUM NOTIONAL. (Not previously known anywhere in this plan.)
+
+    HTTP 422  below_notional_value_minimum:
+    "Fractional equities orders cannot have a notional value less than $5."
+
+**This changes the floor-to-zero task (D1 in the addendum).** For a target under $5 the choice is
+NOT "fractional versus round to zero" — fractional is simply unavailable. The only options are one
+whole share, or nothing.
+
+On a $34 stock, one share is a ~7x overshoot of a $5 target, far outside
+`BUMP_TO_ONE_SHARE_MAX_MULTIPLE = 1.5`, so such targets will SKIP. The dry run must say so with
+the real reason ("below the broker's $5 fractional minimum, and one share overshoots by Nx"),
+not merely "rounds to zero".
+
+The addendum's bump-to-1 logic must therefore consider THREE thresholds, not one:
+the fractional notional floor ($5), the overshoot guard (1.5x), and the quantity precision.
+
+## L3. Quantity precision is `QuantityDecimalPrecision.value`, NOT `minimum_increment_precision`.
+
+    HTTP 422  fractional_equity_invalid_fractional_precision:
+    "Quantity decimal precision 6 exceeds maximum decimal precision of 5 for SCHD"
+
+The live generic EQUITY row is `value=5, minimum_increment_precision=0`. Reading the latter gave
+`increment = 1.0`, silently disabling fractional sizing on an account holding 18 fractional
+positions. Fixed in `a1873d3`. Note the broker phrases the limit PER SYMBOL even though the
+precision table currently publishes no per-symbol equity rows.
+
+## L4. Opening MARKET orders are refused while the market is closed.
+
+    HTTP 422  tif_no_after_hours_opening_market_orders:
+    "Opening market orders not allowed when market closed."
+
+Confirms the addendum's gate. `MarketStatus` is `Open` / `Closed` / `Pre-market` / `Extended`
+(`tastytrade/market_sessions.py:22`), and the observed pre-market state was `PRE_MARKET` — so
+gating on `MarketStatus.OPEN` alone correctly blocks it. The exchange enum member is
+`ExchangeType.NYSE` (value `"Equity"`); **there is no `ExchangeType.EQUITY`**.
+
+## L5. Every money field on `MarginReportEntry` and `BuyingPowerEffect` arrives NEGATIVE.
+
+Live: `initial_requirement` negative on 25 of 25 positions; an accepted dry run returned
+`change_in_buying_power=-17.013569054`, `isolated_order_margin_requirement=-17.0`,
+`total_fees=-0.001`.
+
+`set_sign_for` (`tastytrade/utils.py:292-305`) does not normalise a sign — it CREATES a negative
+one for any field whose `<field>-effect` is `Debit`. Tests that build these models with python
+kwargs bypass `model_validator(mode="before")` and therefore cannot see it. **Build them from raw
+dasherized payloads.**
+
+## L6. The Cap Req screen's "Requirement" column is MAINTENANCE, not initial.
+
+Screen totals: Requirement 2404.22, Initial Req 3117.07, Maintenance 2404.22, and the header's
+BP Usage tracks Requirement. SDK `margin_requirement` == `maintenance_requirement` == abs(
+`buying_power`) per entry; `initial_requirement` is the separate, larger number.
+
+Sizing a NEW purchase correctly uses `initial_requirement`: under Reg-T a new $X buy needs
+`0.5X` of excess, and Stock BP is `2 x` excess, so it consumes `X` of Stock BP — i.e.
+`bp_factor = initial_rate x multiplier ~= 1.0`. The adapter is right. Do not "fix" it to match
+the Requirement column, which describes positions already held.
+
+## L7. An empty `TastytradeError('')` almost always means an OAuth scope problem.
+
+`validate_response` (`tastytrade/utils.py:240-258`) builds its message only from errors carrying
+BOTH `code` and `message`. A 403 `{"error":{"message":"Token has insufficient scopes..."}}` has no
+`code`, so the reason is discarded entirely. Handled in `a86b873`.
