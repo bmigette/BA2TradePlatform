@@ -1,11 +1,12 @@
 """Portfolio allocation persistence: every read and write of the five allocation tables.
 
-Pure DB code -- it never talks to a broker and never touches NiceGUI. The only
-thing it borrows from the allocation ENGINE
-(``ba2_common.core.portfolio_allocation``) is the two ``VALUATION_MODE_*``
-constants, so that the page, the store and the engine cannot disagree on the
-spelling of a mode. The UI calls these helpers; the engine receives the plain
-values they produce.
+Pure DB code -- it never talks to a broker and never touches NiceGUI. What it
+borrows from the allocation ENGINE (``ba2_common.core.portfolio_allocation``) is
+deliberately tiny: the two ``VALUATION_MODE_*`` constants, so that the page, the
+store and the engine cannot disagree on the spelling of a mode, and
+``even_split_pct``, so that the default weights this module hands the page are
+bit-for-bit the ones the engine would compute. The UI calls these helpers; the
+engine receives the plain values they produce.
 
 Two rules the callers depend on:
 
@@ -30,6 +31,7 @@ from ba2_common.core.models import (
     PortfolioAllocationSymbol,
     PortfolioIncomeEvent,
 )
+from ba2_common.core.portfolio_allocation import even_split_pct
 from ba2_common.logger import logger
 
 
@@ -125,4 +127,146 @@ def remove_managed_label(account_id: int, label: str) -> bool:
         return False
     logger.info(f"Unmanaged allocation label '{label}' for account {account_id} "
                 f"({removed_symbols} symbol weight row(s) removed)")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Symbol weights (created lazily -- absence means "even-split default")
+# ---------------------------------------------------------------------------
+
+def _split_evenly(total_pct: float, count: int) -> List[float]:
+    """Split ``total_pct`` across ``count`` slots, remainder on the LAST slot.
+
+    ``_split_evenly(100.0, 3) == [33.33, 33.33, 33.34]``, which sums to exactly
+    100.0 -- a naive ``3 x 33.33`` totals 99.99 and the engine's
+    ``validate_symbol_weights`` (0.01pp tolerance) rejects it. Returns ``[]`` for
+    ``count <= 0`` (an empty label gets nothing, not a ZeroDivisionError).
+
+    The split itself is NOT re-derived here: it is the engine's ``even_split_pct``,
+    scaled down to ``total_pct`` exactly the way ``build_symbol_targets`` scales a
+    leftover (4dp). Sharing the one function is what makes it impossible for the
+    defaults shown on the page to drift from the ones the engine computes.
+    """
+    parts = even_split_pct(count)
+    if not parts:
+        return []
+    return [round(total_pct * pct / 100.0, 4) for pct in parts]
+
+
+def _normalise_symbols(symbols) -> List[str]:
+    """Uppercase, strip, drop blanks and de-duplicate, PRESERVING the given order."""
+    out: List[str] = []
+    seen = set()
+    for raw in symbols or []:
+        symbol = (raw or "").strip().upper()
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        out.append(symbol)
+    return out
+
+
+def get_symbol_rows(account_id: int, label: str) -> Dict[str, PortfolioAllocationSymbol]:
+    """The STORED weight rows of one label, keyed by symbol.
+
+    Only symbols the user has actually edited have a row, so this is normally a
+    subset of the label's symbols. Use ``get_symbol_weights()`` when you need a
+    weight for every symbol.
+    """
+    label = (label or "").strip()
+    if not label:
+        return {}
+    with get_db() as session:
+        rows = session.exec(
+            select(PortfolioAllocationSymbol).where(
+                PortfolioAllocationSymbol.account_id == account_id,
+                PortfolioAllocationSymbol.label == label,
+            )
+        ).all()
+        rows = list(rows)
+        session.expunge_all()
+        return {row.symbol: row for row in rows}
+
+
+def get_symbol_weights(account_id: int, label: str, symbols) -> Dict[str, float]:
+    """``{symbol: weight_pct}`` for every symbol of a label, defaults filled in.
+
+    Weights are 1-100 WITHIN the label. Rows are lazy, so a symbol with no row is
+    not an error: the un-stored symbols share whatever is left of 100% evenly
+    (all of it when nothing is stored), with the remainder on the last one.
+    Symbols are normalised (.strip().upper()), duplicates collapse, and the order
+    of ``symbols`` is preserved in the returned dict.
+
+    Unlike ``get_symbol_rows()``, this never returns an empty dict for a label you
+    passed symbols for -- ``{}`` here means you asked about no symbols at all.
+    """
+    syms = _normalise_symbols(symbols)
+    if not syms:
+        return {}
+    stored_rows = get_symbol_rows(account_id, label)
+    stored = {s: float(stored_rows[s].weight_pct) for s in syms if s in stored_rows}
+    unstored = [s for s in syms if s not in stored]
+    remaining = max(0.0, 100.0 - sum(stored.values()))
+    filled = dict(zip(unstored, _split_evenly(remaining, len(unstored))))
+    return {s: stored[s] if s in stored else filled[s] for s in syms}
+
+
+def set_symbol_weight(account_id: int, label: str, symbol: str, *,
+                      weight_pct: Optional[float] = None,
+                      comment: Optional[str] = None) -> PortfolioAllocationSymbol:
+    """Create or update ONE symbol's weight/comment inside a label.
+
+    ``None`` for a field leaves it unchanged; pass ``""`` to clear a comment.
+    Writing a row makes the weight explicit -- the symbol stops taking the
+    even-split default, which is exactly what the user asked for by editing it.
+
+    Raises:
+        ValueError: when ``label`` or ``symbol`` is blank.
+    """
+    label = (label or "").strip()
+    symbol = (symbol or "").strip().upper()
+    if not label or not symbol:
+        raise ValueError("set_symbol_weight requires a non-empty label and symbol")
+    with get_db() as session:
+        row = session.exec(
+            select(PortfolioAllocationSymbol).where(
+                PortfolioAllocationSymbol.account_id == account_id,
+                PortfolioAllocationSymbol.label == label,
+                PortfolioAllocationSymbol.symbol == symbol,
+            )
+        ).first()
+        if row is None:
+            row = PortfolioAllocationSymbol(account_id=account_id, label=label, symbol=symbol)
+            session.add(row)
+        if weight_pct is not None:
+            row.weight_pct = float(weight_pct)
+        if comment is not None:
+            row.comment = comment
+        session.commit()
+        session.refresh(row)
+        session.expunge(row)
+        return row
+
+
+def remove_symbol_weight(account_id: int, label: str, symbol: str) -> bool:
+    """Drop a symbol's stored weight so it returns to the even-split default.
+
+    Returns True when a row was deleted, False when the symbol had none.
+    """
+    label = (label or "").strip()
+    symbol = (symbol or "").strip().upper()
+    if not label or not symbol:
+        return False
+    with get_db() as session:
+        row = session.exec(
+            select(PortfolioAllocationSymbol).where(
+                PortfolioAllocationSymbol.account_id == account_id,
+                PortfolioAllocationSymbol.label == label,
+                PortfolioAllocationSymbol.symbol == symbol,
+            )
+        ).first()
+        if row is None:
+            return False
+        session.delete(row)
+        session.commit()
     return True

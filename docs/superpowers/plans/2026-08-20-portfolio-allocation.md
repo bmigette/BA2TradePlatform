@@ -2528,10 +2528,14 @@ This section adds the five allocation tables, the Alembic revision that creates 
 1. `packages/common/ba2_common/core/models.py` is the REAL model file. The in-tree
    `ba2_trade_platform/core/models.py` is an alias shim that swaps itself out of `sys.modules`;
    edits to it are discarded. Never edit a shim.
-2. The store's only cross-module import from the allocation engine is the two
-   `VALUATION_MODE_*` constants (Task 16 defines them). Everything else is self-contained:
-   `_split_evenly` here is the DB-free twin of the engine's `even_split_pct`, and the tests
-   below pin the exact numbers (`33.33 / 33.33 / 33.34`) so the two cannot drift.
+2. The store's cross-module imports from the allocation engine are deliberately tiny: the
+   two `VALUATION_MODE_*` constants (Task 16 defines them) and `even_split_pct`
+   (**amended in Task 10** — the store used to hand-roll a `_split_evenly` twin, but a
+   `round()`-based twin diverges from the engine's `math.floor()`-based `even_split_pct`
+   from 6 symbols up, e.g. `16.67 x 5 + 16.65` vs `16.66 x 5 + 16.70`; both total 100.0, so
+   the pinned `33.33 / 33.33 / 33.34` tests could never have caught it). `_split_evenly`
+   survives as a thin scaler over `even_split_pct`, so the defaults the page shows are
+   bit-for-bit the ones `build_symbol_targets` computes.
 3. **There is no `portfolio_allocation_repo.py`.** Task 63 appends the page's label/comment
    helpers to this same store module.
 
@@ -3238,6 +3242,9 @@ constants, so that the page, the store and the engine cannot disagree on the
 spelling of a mode. The UI calls these helpers; the engine receives the plain
 values they produce.
 
+(Task 10 widens that borrow to ``even_split_pct`` and rewords this paragraph --
+see Task 10 Step 3.)
+
 Two rules the callers depend on:
 
 * A ``portfolio_allocation_label`` row's EXISTENCE is the "this label is managed"
@@ -3415,7 +3422,7 @@ git commit -m "feat(allocation): managed-label CRUD in the portfolio allocation 
 - Modify: `packages/common/ba2_common/core/portfolio_allocation_store.py` (append)
 - Test: `tests/test_portfolio_allocation_store.py` (append)
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to the end of `tests/test_portfolio_allocation_store.py`:
 
@@ -3474,14 +3481,42 @@ def test_remove_symbol_weight_returns_false_when_no_row_exists(account_id):
     assert store.remove_symbol_weight(account_id, "ARK26", "TSLA") is False
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_store.py -v`
 Expected: FAIL — `AttributeError: module 'ba2_common.core.portfolio_allocation_store' has no attribute 'get_symbol_weights'` (and the same for `set_symbol_weight` / `get_symbol_rows` / `remove_symbol_weight`)
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
-Append to the end of `packages/common/ba2_common/core/portfolio_allocation_store.py`:
+First amend the header of `packages/common/ba2_common/core/portfolio_allocation_store.py`
+— reword the docstring's engine-borrow paragraph and import the engine's split:
+
+```python
+Pure DB code -- it never talks to a broker and never touches NiceGUI. What it
+borrows from the allocation ENGINE (``ba2_common.core.portfolio_allocation``) is
+deliberately tiny: the two ``VALUATION_MODE_*`` constants, so that the page, the
+store and the engine cannot disagree on the spelling of a mode, and
+``even_split_pct``, so that the default weights this module hands the page are
+bit-for-bit the ones the engine would compute. The UI calls these helpers; the
+engine receives the plain values they produce.
+```
+
+```python
+from ba2_common.core.portfolio_allocation import even_split_pct  # after the models import
+```
+
+**Amended (as landed, Task 10).** The original plan hand-rolled `_split_evenly` and said
+the store "deliberately does not import the engine's functions, so both must produce the
+same numbers". They did not: `round(100/6, 2) == 16.67` gives `16.67 x 5 + 16.65`, while
+the engine's `math.floor`-based `even_split_pct(6)` gives `16.66 x 5 + 16.70`. Both total
+exactly 100.0, so the pinned 3-symbol values (`33.33 / 33.33 / 33.34`, identical under both
+rules) could never have caught the drift — the page would simply have shown different
+defaults from the ones the engine allocated on, for any label of 6+ symbols. Sharing the one
+function removes the failure mode instead of testing for it. Verified: over 100
+symbol-count/stored-weight shapes, `get_symbol_weights` now equals
+`build_symbol_targets` exactly.
+
+Then append to the end of the same file:
 
 ```python
 
@@ -3491,23 +3526,22 @@ Append to the end of `packages/common/ba2_common/core/portfolio_allocation_store
 # ---------------------------------------------------------------------------
 
 def _split_evenly(total_pct: float, count: int) -> List[float]:
-    """Split ``total_pct`` across ``count`` slots, 2dp, remainder on the LAST slot.
+    """Split ``total_pct`` across ``count`` slots, remainder on the LAST slot.
 
-    ``_split_evenly(100.0, 3) == [33.33, 33.33, 33.34]`` -- the list always sums to
-    exactly ``total_pct``. Returns ``[]`` for ``count <= 0`` (an empty label gets
-    nothing, not a ZeroDivisionError).
+    ``_split_evenly(100.0, 3) == [33.33, 33.33, 33.34]``, which sums to exactly
+    100.0 -- a naive ``3 x 33.33`` totals 99.99 and the engine's
+    ``validate_symbol_weights`` (0.01pp tolerance) rejects it. Returns ``[]`` for
+    ``count <= 0`` (an empty label gets nothing, not a ZeroDivisionError).
 
-    The pure engine's ``portfolio_allocation.even_split_pct`` is the DB-free twin
-    of this rule. The store deliberately does not import the engine's functions,
-    so both must produce the same numbers; the tests pin the exact values on each
-    side.
+    The split itself is NOT re-derived here: it is the engine's ``even_split_pct``,
+    scaled down to ``total_pct`` exactly the way ``build_symbol_targets`` scales a
+    leftover (4dp). Sharing the one function is what makes it impossible for the
+    defaults shown on the page to drift from the ones the engine computes.
     """
-    if count <= 0:
+    parts = even_split_pct(count)
+    if not parts:
         return []
-    each = round(total_pct / count, 2)
-    out = [each] * count
-    out[-1] = round(total_pct - each * (count - 1), 2)
-    return out
+    return [round(total_pct * pct / 100.0, 4) for pct in parts]
 
 
 def _normalise_symbols(symbols) -> List[str]:
@@ -3550,9 +3584,12 @@ def get_symbol_weights(account_id: int, label: str, symbols) -> Dict[str, float]
 
     Weights are 1-100 WITHIN the label. Rows are lazy, so a symbol with no row is
     not an error: the un-stored symbols share whatever is left of 100% evenly
-    (all of it when nothing is stored), 2dp with the remainder on the last one.
+    (all of it when nothing is stored), with the remainder on the last one.
     Symbols are normalised (.strip().upper()), duplicates collapse, and the order
     of ``symbols`` is preserved in the returned dict.
+
+    Unlike ``get_symbol_rows()``, this never returns an empty dict for a label you
+    passed symbols for -- ``{}`` here means you asked about no symbols at all.
     """
     syms = _normalise_symbols(symbols)
     if not syms:
@@ -3626,13 +3663,13 @@ def remove_symbol_weight(account_id: int, label: str, symbol: str) -> bool:
     return True
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_store.py -v`
 Expected: PASS — `16 passed` (Task 9's deferred
 `test_remove_managed_label_also_removes_its_symbol_weights` is now green too)
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add packages/common/ba2_common/core/portfolio_allocation_store.py tests/test_portfolio_allocation_store.py
