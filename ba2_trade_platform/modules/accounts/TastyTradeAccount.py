@@ -17,6 +17,7 @@ from ...core.db import add_instance, get_db, get_instance, update_instance, Inst
 from ...core.models import Position, TradingOrder
 from ...core.types import OrderDirection, OrderStatus
 from ...core.types import OrderType as CoreOrderType
+from ...core.account_types import OrderImpact
 from ...core.interfaces import AccountInterface
 from ...core.models import Transaction
 
@@ -807,6 +808,54 @@ class TastyTradeAccount(AccountInterface):
             f"[Account {self.id}] Requested cancel of TastyTrade order "
             f"broker_order_id={db_order.broker_order_id} (db id={db_order.id})")
         return True
+
+    def preview_order_impact(self, trading_order: TradingOrder) -> Optional[OrderImpact]:
+        """Broker-side dry run of ONE order: what it would cost in buying power.
+
+        MUST NOT send a live order. ``place_order``'s ``dry_run`` parameter DEFAULTS
+        TO True (tastytrade/account.py:877-879) -- it is passed explicitly here anyway,
+        and must always be passed explicitly at real submission sites.
+
+        The order is built with the SAME ``_build_new_order`` the live submit uses, so
+        a preview prices exactly what would be sent. ``trading_order`` is neither
+        mutated nor persisted, and no ``broker_order_id`` is written.
+
+        Returns:
+            Optional[OrderImpact]: ``None`` when the preview call failed. ``None``
+            means "no precheck", NOT "the order is free" -- a zero impact is never
+            fabricated.
+        """
+        if not self._check_authentication():
+            return None
+        try:
+            new_order = self._build_new_order(trading_order)
+            response = self._run_async(
+                self._account.place_order(self._session, new_order, dry_run=True))
+        except Exception as e:
+            logger.error(
+                f"[Account {self.id}] Order preview failed for {trading_order.symbol}: {e}",
+                exc_info=True)
+            return None
+
+        effect = response.buying_power_effect
+        fees = getattr(response, "fee_calculation", None)
+        warnings = [str(w) for w in (response.warnings or [])]
+        errors = [str(err) for err in (response.errors or [])]
+        return OrderImpact(
+            symbol=trading_order.symbol,
+            # SIGNED: negative for a buy. Consume OrderImpact.bp_cost, never this.
+            change_in_buying_power=float(effect.change_in_buying_power),
+            margin_requirement=float(effect.isolated_order_margin_requirement),
+            estimated_fees=float(fees.total_fees) if fees is not None else None,
+            accepted=not errors,
+            warnings=warnings,
+            errors=errors,
+            raw={
+                "current_buying_power": float(effect.current_buying_power),
+                "new_buying_power": float(effect.new_buying_power),
+                "change_in_margin_requirement": float(effect.change_in_margin_requirement),
+            },
+        )
 
     # ------------------------------------------------------------------
     # Out of scope for TastyTrade (see class docstring). These are declared

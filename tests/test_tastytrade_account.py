@@ -946,3 +946,73 @@ def test_refresh_positions_returns_true_for_a_genuinely_flat_account():
     acct._account.get_positions = AsyncMock(return_value=[])
 
     assert acct.refresh_positions() is True
+
+
+# ---------------------------------------------------------------------------
+# preview_order_impact
+# ---------------------------------------------------------------------------
+
+def test_preview_order_impact_passes_dry_run_true_explicitly():
+    """It must never send a live order -- and must not rely on the SDK default."""
+    account_def, order = _tt_trading_order()
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.place_order = AsyncMock(
+        return_value=_placed_order_response(_placed_order(order_id=-1)))
+
+    with patch("tastytrade.instruments.Equity.get",
+               new=AsyncMock(return_value=_FakeEquity("AAPL"))):
+        acct.preview_order_impact(order)
+
+    assert acct._account.place_order.call_args.kwargs["dry_run"] is True
+
+
+def test_preview_order_impact_turns_a_signed_debit_into_a_positive_bp_cost():
+    """BuyingPowerEffect.change_in_buying_power is NEGATIVE for a buy (order.py:381)."""
+    account_def, order = _tt_trading_order()
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.place_order = AsyncMock(
+        return_value=_placed_order_response(_placed_order(order_id=-1),
+                                            change_in_buying_power="-1500",
+                                            isolated_requirement="1500",
+                                            total_fees="0.03"))
+
+    with patch("tastytrade.instruments.Equity.get",
+               new=AsyncMock(return_value=_FakeEquity("AAPL"))):
+        impact = acct.preview_order_impact(order)
+
+    assert impact.change_in_buying_power == -1500.0
+    assert impact.bp_cost == 1500.0
+    assert impact.margin_requirement == 1500.0
+    assert impact.estimated_fees == pytest.approx(0.03)
+    assert impact.accepted is True
+
+
+def test_preview_order_impact_marks_a_rejected_preview_as_not_accepted():
+    account_def, order = _tt_trading_order()
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.place_order = AsyncMock(
+        return_value=_placed_order_response(_placed_order(order_id=-1),
+                                            errors=["insufficient buying power"]))
+
+    with patch("tastytrade.instruments.Equity.get",
+               new=AsyncMock(return_value=_FakeEquity("AAPL"))):
+        impact = acct.preview_order_impact(order)
+
+    assert impact.accepted is False
+    assert any("insufficient buying power" in e for e in impact.errors)
+
+
+def test_preview_order_impact_returns_none_when_the_preview_call_fails():
+    """None means 'no precheck available', NOT 'the order is free'. It must never be
+    fabricated as a zero impact."""
+    account_def, order = _tt_trading_order()
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.place_order = AsyncMock(side_effect=RuntimeError("gateway timeout"))
+
+    with patch("tastytrade.instruments.Equity.get",
+               new=AsyncMock(return_value=_FakeEquity("AAPL"))):
+        assert acct.preview_order_impact(order) is None
