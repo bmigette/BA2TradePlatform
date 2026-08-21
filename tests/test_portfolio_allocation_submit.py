@@ -3,15 +3,24 @@
 Uses tests/conftest.py's in-memory SQLite (autouse `patch_db_engine`) and a
 duck-typed FakeAccount -- no broker, no NiceGUI.
 """
-import pytest
+from datetime import date, timedelta
 
-from ba2_trade_platform.core.account_types import MarginInfo, OrderImpact
-from ba2_trade_platform.core.db import add_instance, get_instance, update_instance
-from ba2_trade_platform.core.models import TradingOrder, Transaction
+import pytest
+from sqlmodel import select
+
+from ba2_trade_platform.core.account_types import (
+    CASH_TRANSFER_DEPOSIT, CASH_TRANSFER_DIVIDEND, CASH_TRANSFER_WITHDRAWAL,
+    CashTransfer, MarginInfo, OrderImpact,
+)
+from ba2_trade_platform.core.db import add_instance, get_db, get_instance, update_instance
+from ba2_trade_platform.core.models import (
+    PortfolioAllocationRun, PortfolioIncomeEvent, TradingOrder, Transaction,
+)
 from ba2_trade_platform.core.portfolio_allocation import (
     ACTION_ADJUST, ACTION_CLOSE, ACTION_NEW, ACTION_SKIP,
+    ALLOCATION_MODE_INVEST_LABEL, ALLOCATION_MODE_REBALANCE,
     REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_FMT,
-    AllocationPlan, AllocationRow, PositionFetchFailed, PositionState,
+    AllocationPlan, AllocationRow, BaseSnapshot, PositionFetchFailed, PositionState,
 )
 from ba2_trade_platform.core.TransactionHelper import TransactionHelper
 from ba2_trade_platform.core.types import (
@@ -47,7 +56,9 @@ class FakeAccount:
         self.prices = {}             # symbol -> float
         self.margin = {}             # symbol -> MarginInfo
         self.impacts = {}            # symbol -> OrderImpact
-        self.cash_transfers = []     # list[CashTransfer]
+        self.cash_transfers = []     # list[CashTransfer]; None = the broker gave nothing back
+        #: [(start_date, end_date)] the income sync asked the broker for.
+        self.cash_transfer_calls = []
         self.submitted = []          # [(symbol, side, quantity, comment)]
         self.previewed = []          # [(symbol, quantity, is_closing_order)]
         self.preview_raises = False
@@ -96,6 +107,9 @@ class FakeAccount:
         return self.impacts.get(trading_order.symbol)
 
     def get_cash_transfers(self, start_date=None, end_date=None):
+        self.cash_transfer_calls.append((start_date, end_date))
+        if self.cash_transfers is None:
+            return None
         return list(self.cash_transfers)
 
     def submit_order(self, trading_order, tp_price=None, sl_price=None,
@@ -1059,3 +1073,276 @@ def test_submit_plan_does_not_retry_whole_shares_after_a_washtrade_lock():
 
     assert [s[2] for s in account.submitted] == [2.5]
     assert outcomes[0].status == svc.OUTCOME_WASHTRADE_LOCKED
+
+
+# ---------------------------------------------------------------------------
+# Task 74: the income ledger -- broker sync + the page's read wrappers.
+#
+# The clock is frozen through ``svc._today`` rather than by patching
+# ``datetime``: the window start, the window end and the display cutoff are all
+# derived from that ONE read, so freezing it is what makes "the 30-day window"
+# a testable statement instead of a race against midnight.
+# ---------------------------------------------------------------------------
+
+FROZEN_TODAY = date(2026, 5, 14)
+
+
+@pytest.fixture
+def frozen_today(monkeypatch):
+    monkeypatch.setattr(svc, "_today", lambda: FROZEN_TODAY)
+    return FROZEN_TODAY
+
+
+def deposit(external_id, day, amount=5_000.0):
+    return CashTransfer(external_id=external_id, event_date=date(2026, 5, day),
+                        event_type=CASH_TRANSFER_DEPOSIT, amount=amount)
+
+
+def income_rows():
+    with get_db() as session:
+        return session.exec(select(PortfolioIncomeEvent)).all()
+
+
+def test_sync_income_events_writes_deposits_and_dividends(frozen_today):
+    account = FakeAccount(account_id=21)
+    account.cash_transfers = [
+        deposit("csd-1", 1),
+        CashTransfer(external_id="div-1", event_date=date(2026, 5, 5),
+                     event_type=CASH_TRANSFER_DIVIDEND, amount=42.5, symbol="AAPL"),
+    ]
+
+    written = svc.sync_income_events(account)
+
+    assert written == 2
+    rows = income_rows()
+    assert {r.external_id for r in rows} == {"csd-1", "div-1"}
+    assert {r.symbol for r in rows} == {None, "AAPL"}
+
+
+def test_sync_income_events_skips_withdrawals(frozen_today):
+    account = FakeAccount(account_id=22)
+    account.cash_transfers = [
+        CashTransfer(external_id="csw-1", event_date=date(2026, 5, 2),
+                     event_type=CASH_TRANSFER_WITHDRAWAL, amount=-1_000.0),
+    ]
+
+    assert svc.sync_income_events(account) == 0
+    assert income_rows() == []
+
+
+def test_sync_income_events_skips_a_reversed_deposit(frozen_today):
+    """A DEPOSIT can arrive NEGATIVE (a reversed ACH). ``CashTransfer.is_income``
+    is the rule -- filtering on the event TYPE alone would file a -1,000 reversal
+    as income and hand the next run a negative event to spend."""
+    account = FakeAccount(account_id=26)
+    account.cash_transfers = [
+        CashTransfer(external_id="csd-rev", event_date=date(2026, 5, 2),
+                     event_type=CASH_TRANSFER_DEPOSIT, amount=-1_000.0),
+    ]
+
+    assert svc.sync_income_events(account) == 0
+    assert income_rows() == []
+
+
+def test_sync_income_events_is_idempotent_on_the_broker_activity_id(frozen_today):
+    account = FakeAccount(account_id=23)
+    account.cash_transfers = [deposit("csd-9", 1)]
+
+    assert svc.sync_income_events(account) == 1
+    assert svc.sync_income_events(account) == 0
+
+    assert len(income_rows()) == 1
+
+
+def test_sync_income_events_overwrites_the_amount_instead_of_summing_it(frozen_today):
+    """The page re-syncs the WHOLE 30-day window on every load, so an event is
+    presented again and again. Accumulating instead of restating would inflate the
+    ledger on every page load until it funded a run out of thin air."""
+    account = FakeAccount(account_id=28)
+    account.cash_transfers = [deposit("csd-1", 1, amount=1_000.0)]
+
+    for _ in range(3):
+        svc.sync_income_events(account)
+
+    assert [r.amount for r in income_rows()] == [pytest.approx(1_000.0)]
+    assert svc.get_open_income_total(28) == pytest.approx(1_000.0)
+
+
+def test_sync_income_events_follows_a_restated_amount_down(frozen_today):
+    """The other half of "overwrite, never sum": a DIVNRA tax leg restates a
+    dividend NET of withholding, and the ledger has to follow it down."""
+    account = FakeAccount(account_id=29)
+    account.cash_transfers = [
+        CashTransfer(external_id="div-1", event_date=date(2026, 5, 5),
+                     event_type=CASH_TRANSFER_DIVIDEND, amount=100.0, symbol="KO"),
+    ]
+    svc.sync_income_events(account)
+
+    account.cash_transfers[0].amount = 85.0
+    assert svc.sync_income_events(account) == 0
+
+    assert svc.get_open_income_total(29) == pytest.approx(85.0)
+
+
+def test_sync_income_events_does_not_reset_what_a_run_already_consumed(frozen_today):
+    """Money already spent stays spent across a re-sync; otherwise every page load
+    would hand a finished run's income back to the next one."""
+    account = FakeAccount(account_id=30)
+    account.cash_transfers = [deposit("csd-1", 1, amount=1_000.0)]
+    svc.sync_income_events(account)
+    row = income_rows()[0]
+    row.consumed_amount = 400.0
+    update_instance(row)
+
+    svc.sync_income_events(account)
+
+    assert income_rows()[0].consumed_amount == pytest.approx(400.0)
+    assert svc.get_open_income_total(30) == pytest.approx(600.0)
+
+
+def test_sync_income_events_does_not_count_a_fully_consumed_event_as_new(frozen_today):
+    """"New" means "not in the ledger", not "not in the OPEN ledger". A deposit a
+    run has spent in full is still there, and re-reporting it as newly discovered
+    on every load makes the count meaningless."""
+    account = FakeAccount(account_id=36)
+    account.cash_transfers = [deposit("csd-1", 1, amount=1_000.0)]
+    svc.sync_income_events(account)
+    row = income_rows()[0]
+    row.consumed_amount = 1_000.0
+    update_instance(row)
+
+    assert svc.sync_income_events(account) == 0
+    assert len(income_rows()) == 1
+
+
+def test_sync_income_events_counts_only_the_events_it_had_never_seen(frozen_today):
+    account = FakeAccount(account_id=37)
+    account.cash_transfers = [deposit("csd-1", 1)]
+    svc.sync_income_events(account)
+
+    account.cash_transfers.append(deposit("csd-2", 3, amount=250.0))
+
+    assert svc.sync_income_events(account) == 1
+    assert len(income_rows()) == 2
+
+
+def test_sync_income_events_counts_an_event_older_than_the_window_only_once(frozen_today):
+    """A broker is free to ignore our date bounds. An event outside the window
+    that we nevertheless persist must not be rediscovered as "new" on every single
+    page load -- the known-set cutoff has to cover what is actually being written."""
+    account = FakeAccount(account_id=38)
+    account.cash_transfers = [
+        CashTransfer(external_id="csd-old", event_date=date(2026, 1, 4),
+                     event_type=CASH_TRANSFER_DEPOSIT, amount=900.0),
+    ]
+
+    assert svc.sync_income_events(account) == 1
+    assert svc.sync_income_events(account) == 0
+
+
+def test_sync_income_events_asks_the_broker_for_exactly_the_display_window(frozen_today):
+    account = FakeAccount(account_id=39)
+
+    svc.sync_income_events(account)
+
+    assert account.cash_transfer_calls == [
+        (FROZEN_TODAY - timedelta(days=svc.INCOME_WINDOW_DAYS), FROZEN_TODAY)]
+    assert svc.INCOME_WINDOW_DAYS == 30
+
+
+def test_sync_income_events_returns_zero_when_the_broker_call_fails(frozen_today):
+    """A broker outage must not look like "there was no income"; it is logged and
+    the existing ledger is left alone."""
+    account = FakeAccount(account_id=27)
+    add_instance(PortfolioIncomeEvent(
+        account_id=27, external_id="csd-1", event_date=date(2026, 5, 1),
+        event_type=CASH_TRANSFER_DEPOSIT, amount=5_000.0))
+
+    def _boom(start_date=None, end_date=None):
+        raise RuntimeError("gateway timeout")
+
+    account.get_cash_transfers = _boom
+    assert svc.sync_income_events(account) == 0
+    assert svc.get_open_income_total(27) == pytest.approx(5_000.0)
+
+
+def test_sync_income_events_tolerates_a_broker_that_returns_nothing(frozen_today):
+    """Unlike ``get_positions()``, this seam does NOT distinguish failure from
+    emptiness (``ReadOnlyAccountInterface.get_cash_transfers``), so ``None`` is
+    "no movements", not a fetch failure to raise on."""
+    account = FakeAccount(account_id=40)
+    account.cash_transfers = None
+
+    assert svc.sync_income_events(account) == 0
+    assert income_rows() == []
+
+
+def test_get_open_income_total_sums_only_what_is_left():
+    """The figure the page shows next to Invest. Consumption itself is exercised
+    through ``run_allocation`` in Task 75 -- the ledger is only ever spent on
+    behalf of a run, so there is nothing account-level to call here."""
+    add_instance(PortfolioIncomeEvent(
+        account_id=25, external_id="a", event_date=date(2026, 5, 1),
+        event_type=CASH_TRANSFER_DEPOSIT, amount=300.0, consumed_amount=300.0))
+    add_instance(PortfolioIncomeEvent(
+        account_id=25, external_id="b", event_date=date(2026, 5, 5),
+        event_type=CASH_TRANSFER_DIVIDEND, amount=500.0, consumed_amount=150.0))
+
+    assert svc.get_open_income_total(25) == pytest.approx(350.0)
+
+
+def test_get_open_income_total_is_scoped_to_one_account():
+    add_instance(PortfolioIncomeEvent(
+        account_id=41, external_id="a", event_date=date(2026, 5, 1),
+        event_type=CASH_TRANSFER_DEPOSIT, amount=300.0))
+    add_instance(PortfolioIncomeEvent(
+        account_id=42, external_id="a", event_date=date(2026, 5, 1),
+        event_type=CASH_TRANSFER_DEPOSIT, amount=900.0))
+
+    assert svc.get_open_income_total(41) == pytest.approx(300.0)
+
+
+def test_get_recent_income_events_returns_display_dicts_newest_first(frozen_today):
+    add_instance(PortfolioIncomeEvent(
+        account_id=43, external_id="old", event_date=date(2026, 5, 1),
+        event_type=CASH_TRANSFER_DEPOSIT, amount=300.0, consumed_amount=100.0))
+    add_instance(PortfolioIncomeEvent(
+        account_id=43, external_id="new", event_date=date(2026, 5, 10),
+        event_type=CASH_TRANSFER_DIVIDEND, amount=42.0, symbol="AAPL"))
+
+    events = svc.get_recent_income_events(43)
+
+    assert [e["external_id"] for e in events] == ["new", "old"]
+    assert events[1]["open_amount"] == pytest.approx(200.0)
+    assert events[0]["symbol"] == "AAPL"
+    assert events[1]["symbol"] is None
+
+
+def test_get_recent_income_events_excludes_events_older_than_the_window(frozen_today):
+    add_instance(PortfolioIncomeEvent(
+        account_id=44, external_id="ancient", event_date=date(2026, 1, 4),
+        event_type=CASH_TRANSFER_DEPOSIT, amount=300.0))
+    add_instance(PortfolioIncomeEvent(
+        account_id=44, external_id="inside", event_date=date(2026, 5, 10),
+        event_type=CASH_TRANSFER_DEPOSIT, amount=42.0))
+
+    assert [e["external_id"] for e in svc.get_recent_income_events(44)] == ["inside"]
+
+
+def test_get_recent_income_events_never_reports_a_negative_open_amount(frozen_today):
+    """Reachable: a DIVNRA tax leg restates a dividend BELOW what a run already
+    spent of it. ``consumed_amount`` is deliberately left alone as the true record
+    of the spend, so the panel must show 0 left, never a negative."""
+    add_instance(PortfolioIncomeEvent(
+        account_id=45, external_id="div-1", event_date=date(2026, 5, 10),
+        event_type=CASH_TRANSFER_DIVIDEND, amount=85.0, consumed_amount=100.0,
+        symbol="KO"))
+
+    events = svc.get_recent_income_events(45)
+
+    assert events[0]["open_amount"] == pytest.approx(0.0)
+    assert svc.get_open_income_total(45) == pytest.approx(0.0)
+
+
+def test_get_recent_income_events_is_empty_for_an_account_with_no_income(frozen_today):
+    assert svc.get_recent_income_events(46) == []

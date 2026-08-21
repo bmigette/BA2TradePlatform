@@ -531,3 +531,155 @@ def test_invest_mode_explains_but_does_not_block_an_amount_above_buying_power(ni
     assert any("exceeds available buying power" in t for t in errors)
     assert len(calls) == 1
     assert calls[0]["amount"] == pytest.approx(99_000.0)
+
+
+# ---------------------------------------------------------------------------
+# Task 74: the income panel. It NEVER polls -- it is refreshed by the page on
+# load and by the Refresh button, and nothing else, so the page issues no
+# background broker calls.
+# ---------------------------------------------------------------------------
+
+
+def _click(element):
+    """Fire an element's click handler with no browser and no event loop."""
+    fired = 0
+    for listener in element._event_listeners.values():
+        if listener.type == 'click':
+            listener.handler(None)
+            fired += 1
+    assert fired, 'element has no click handler'
+
+
+def _by_text(client, caption):
+    return [d for d in client.layout.descendants()
+            if getattr(d, 'text', None) == caption]
+
+
+def _income_events():
+    from datetime import date
+    return [
+        {"id": 2, "external_id": "div-1", "event_date": date(2026, 5, 10),
+         "event_type": "DIVIDEND", "symbol": "AAPL", "amount": 42.5,
+         "open_amount": 42.5},
+        {"id": 1, "external_id": "csd-1", "event_date": date(2026, 5, 1),
+         "event_type": "DEPOSIT", "symbol": None, "amount": 5_000.0,
+         "open_amount": 1_500.0},
+    ]
+
+
+def test_the_income_panel_draws_every_event_with_what_is_left(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wiz.render_income_panel(_income_events(), 1_542.5,
+                                on_sync=lambda: None, on_invest=lambda amount: None)
+        texts = _rendered_texts(nicegui_client.layout)
+
+    assert "DIVIDEND" in texts and "DEPOSIT" in texts
+    assert "2026-05-10" in texts and "2026-05-01" in texts
+    assert "42.50" in texts and "5,000.00" in texts
+    # What is LEFT, not what arrived: the deposit is 5,000 with 1,500 open.
+    assert "1,500.00" in texts
+    assert any("1,542.50" in t for t in texts)
+
+
+def test_the_income_panel_shows_a_dash_for_an_event_with_no_payer_symbol(nicegui_client):
+    """A deposit has no symbol. Rendering a bare ``None`` in the column would be
+    the string "None"."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wiz.render_income_panel(_income_events(), 1_542.5,
+                                on_sync=lambda: None, on_invest=lambda a: None)
+        texts = _rendered_texts(nicegui_client.layout)
+
+    assert "AAPL" in texts
+    assert "-" in texts
+    assert "None" not in texts
+
+
+def test_the_income_panel_says_so_when_there_is_no_income(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wiz.render_income_panel([], 0.0, on_sync=lambda: None, on_invest=lambda a: None)
+        texts = _rendered_texts(nicegui_client.layout)
+
+    assert any("No deposits or dividends" in t for t in texts)
+
+
+def test_the_income_panel_refresh_button_calls_the_sync(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    synced = []
+    invested = []
+    with nicegui_client:
+        wiz.render_income_panel(_income_events(), 1_542.5,
+                                on_sync=lambda: synced.append(True),
+                                on_invest=invested.append)
+        _click(_by_text(nicegui_client, 'Refresh')[0])
+
+    assert synced == [True]
+    assert invested == []
+
+
+def test_the_income_panel_invest_button_hands_over_the_unallocated_total(nicegui_client):
+    """The Invest shortcut pre-fills an INVEST_LABEL run with the OPEN total, not
+    with the sum of the amounts -- the consumed part is already spent."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    invested = []
+    with nicegui_client:
+        wiz.render_income_panel(_income_events(), 1_542.5,
+                                on_sync=lambda: None, on_invest=invested.append)
+        _click(_by_text(nicegui_client, 'Invest')[0])
+
+    assert invested == [pytest.approx(1_542.5)]
+
+
+def test_the_income_panel_cannot_invest_when_there_is_nothing_unallocated(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wiz.render_income_panel([], 0.0, on_sync=lambda: None,
+                                on_invest=lambda a: pytest.fail("nothing to invest"))
+        invest = _by_text(nicegui_client, 'Invest')[0]
+
+    assert invest.enabled is False
+
+
+def test_the_income_panel_never_polls(nicegui_client):
+    """Decision: the ledger syncs on page load and on explicit Refresh only. A
+    ``ui.timer`` here would put a broker call on a background schedule."""
+    from nicegui.elements.timer import Timer
+
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wiz.render_income_panel(_income_events(), 1_542.5,
+                                on_sync=lambda: pytest.fail("synced without being asked"),
+                                on_invest=lambda a: None)
+        timers = [d for d in nicegui_client.layout.descendants() if isinstance(d, Timer)]
+
+    assert timers == []
+
+
+def test_the_income_panel_shows_no_consumption_percentage(nicegui_client):
+    """``consumed_amount > amount`` is reachable -- a DIVNRA tax leg restates a
+    dividend below what a run already spent of it -- so any naive
+    consumed/amount fraction renders above 100%. The panel shows absolute
+    figures instead."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    over_consumed = [{"id": 1, "external_id": "div-1", "event_date": __import__('datetime').date(2026, 5, 10),
+                      "event_type": "DIVIDEND", "symbol": "KO", "amount": 85.0,
+                      "open_amount": 0.0}]
+    with nicegui_client:
+        wiz.render_income_panel(over_consumed, 0.0, on_sync=lambda: None,
+                                on_invest=lambda a: None)
+        texts = _rendered_texts(nicegui_client.layout)
+        bars = [d for d in nicegui_client.layout.descendants()
+                if getattr(d, 'tag', '') == 'q-linear-progress']
+
+    assert not any('%' in t for t in texts)
+    assert bars == []

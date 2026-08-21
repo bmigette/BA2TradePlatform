@@ -13,6 +13,7 @@ IS a shim (for the pure engine).
 """
 import re
 from dataclasses import dataclass, field
+from datetime import date as Date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlmodel import select
@@ -579,3 +580,119 @@ def _submit_new_order(account, row, quantity: float, *, run_tag: str, path: str)
     return RowOutcome(symbol=row.symbol, action=ACTION_NEW, status=OUTCOME_SUBMITTED,
                       quantity=quantity, filled_quantity=filled, path=path,
                       order_ids=[order_id])
+
+
+# ---------------------------------------------------------------------------
+# Income ledger (deposits + dividends), synced on page load and Refresh only.
+# ---------------------------------------------------------------------------
+
+#: How far back the page syncs and displays the ledger.
+INCOME_WINDOW_DAYS = 30
+
+
+def _today() -> Date:
+    """The ONE clock read behind the income window.
+
+    Not inlined as ``Date.today()`` at each use: the sync's window and the
+    panel's display cutoff have to be the same day or an event can be written by
+    one and hidden by the other across a midnight boundary. Having a single
+    named read also lets the tests freeze the date instead of racing it.
+    """
+    return Date.today()
+
+
+def sync_income_events(account, *, days: int = INCOME_WINDOW_DAYS) -> int:
+    """Upsert the broker's cash movements into ``portfolio_income_event``.
+
+    Only ``CashTransfer.is_income`` rows (POSITIVE deposits and dividends) are
+    persisted -- a withdrawal is not income, and neither is a reversed deposit,
+    which arrives as a NEGATIVE ``DEPOSIT``. The DB write is
+    ``portfolio_allocation_store.upsert_income_event``, keyed on
+    ``(account_id, external_id)``, so re-syncing the same window RESTATES each
+    event rather than duplicating or accumulating it -- the page presents the
+    whole window again on every load, so summing would inflate the ledger every
+    single time. ``consumed_amount`` is never touched: money already spent stays
+    spent.
+
+    Never runs on a timer: the caller invokes it on page load and on explicit
+    Refresh, so the page issues no background broker calls.
+
+    Returns:
+        int: how many NEW events were inserted (a restatement is not counted; a
+        broker failure is logged and returns 0 rather than looking like "no
+        income").
+    """
+    from .portfolio_allocation_store import get_income_events_since, upsert_income_event
+
+    end_date = _today()
+    start_date = end_date - timedelta(days=days)
+    try:
+        transfers = account.get_cash_transfers(start_date=start_date, end_date=end_date)
+    except Exception as e:
+        logger.error(f"get_cash_transfers failed for account {account.id}: {e}", exc_info=True)
+        return 0
+
+    # ``or []`` is correct HERE and nowhere near get_positions(): this seam is
+    # documented not to distinguish failure from emptiness
+    # (ReadOnlyAccountInterface.get_cash_transfers -- "an implementation that
+    # fails must log the error and return []"), so None means "nothing", not
+    # "the fetch failed".
+    income = [t for t in (transfers or []) if t.is_income]
+    if not income:
+        logger.info(f"Income sync for account {account.id}: 0 new event(s)")
+        return 0
+
+    # The known-set cutoff is the OLDEST event about to be written, not the
+    # window start: a broker is free to ignore our date bounds, and an event we
+    # persist but cannot see here would be re-counted as newly discovered on
+    # every page load. Read against the WHOLE ledger, open or not -- a deposit a
+    # run has already spent in full is still a known event.
+    cutoff = min([start_date] + [t.event_date for t in income])
+    known = {row.external_id for row in get_income_events_since(account.id, cutoff)}
+
+    inserted = 0
+    for transfer in income:
+        is_new = transfer.external_id not in known
+        upsert_income_event(account.id, transfer.external_id, transfer.event_date,
+                            transfer.event_type, transfer.amount, symbol=transfer.symbol)
+        if is_new:
+            inserted += 1
+            known.add(transfer.external_id)
+
+    logger.info(f"Income sync for account {account.id}: {inserted} new event(s)")
+    return inserted
+
+
+def get_recent_income_events(account_id: int, *,
+                             days: int = INCOME_WINDOW_DAYS) -> List[Dict[str, Any]]:
+    """The last ``days`` of income events, newest first, as display dicts.
+
+    ``open_amount`` is the model's clamped property, so it is never negative even
+    where ``consumed_amount`` exceeds ``amount`` -- reachable when a DIVNRA tax
+    leg restates a dividend below what a run already spent of it. Do NOT render
+    ``consumed / amount`` as a fraction from these two figures: that ratio goes
+    past 100% in exactly that case.
+    """
+    from .portfolio_allocation_store import get_income_events_since
+
+    cutoff = _today() - timedelta(days=days)
+    return [{
+        "id": row.id,
+        "external_id": row.external_id,
+        "event_date": row.event_date,
+        "event_type": row.event_type,
+        "symbol": row.symbol,
+        "amount": row.amount,
+        "open_amount": row.open_amount,
+    } for row in get_income_events_since(account_id, cutoff)]
+
+
+def get_open_income_total(account_id: int) -> float:
+    """Total un-consumed income for this account, across the WHOLE ledger.
+
+    Read-only. Spending the ledger is not reachable from here on purpose: it
+    happens inside ``portfolio_allocation_store.finalise_allocation_run``, keyed
+    on the run, so it cannot be replayed.
+    """
+    from .portfolio_allocation_store import get_open_income_total as _store_total
+    return _store_total(account_id)

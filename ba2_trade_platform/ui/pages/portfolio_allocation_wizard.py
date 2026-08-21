@@ -493,8 +493,46 @@ def open_allocation_steps(base: BaseSnapshot, labels: List[LabelTarget], *,
 def render_income_panel(events: List[Dict], open_total: float,
                         *, on_sync: Callable[[], None],
                         on_invest: Callable[[float], None]) -> None:
-    """Placeholder replaced in Task 74."""
-    ui.label(f'Unallocated income: {open_total:,.2f}')
+    """Last 30 days of income, the open total, and the Invest shortcut.
+
+    The panel NEVER polls. ``on_sync`` is wired to the Refresh button and is
+    additionally called once by the page on load; there is deliberately no
+    ``ui.timer`` here, so the page issues no background broker calls.
+
+    ``on_invest(open_total)`` opens the wizard in INVEST_LABEL mode pre-filled
+    with the UNALLOCATED amount -- what is left, not what arrived.
+
+    Only absolute figures are shown. ``consumed / amount`` is deliberately NOT
+    rendered as a fraction or a progress bar: ``consumed_amount > amount`` is a
+    reachable state (a DIVNRA tax leg restates a dividend downwards while the
+    consumed figure, the true record of the spend, is left alone), and a naive
+    percentage renders above 100%.
+    """
+    with ui.card().classes('w-full'):
+        with ui.row().classes('w-full items-center justify-between'):
+            ui.label('Income (last 30 days)').classes('text-lg font-bold')
+            with ui.row().classes('gap-2 items-center'):
+                ui.label(f'Unallocated: {open_total:,.2f}').classes('font-bold text-green-500')
+                ui.button('Refresh', on_click=on_sync).props('outline dense')
+                # Nothing to invest is not a run worth opening the wizard for.
+                ui.button('Invest', on_click=lambda: on_invest(open_total)) \
+                    .props('color=primary dense').set_enabled(open_total > 0)
+        if not events:
+            ui.label('No deposits or dividends in the last 30 days.') \
+                .classes('text-sm text-gray-400')
+            return
+        with ui.row().classes('w-full text-xs font-bold border-b py-1'):
+            for header, width in (('Date', 'w-28'), ('Type', 'w-24'), ('Symbol', 'w-24'),
+                                  ('Amount', 'w-28'), ('Open', 'w-28')):
+                ui.label(header).classes(width)
+        for event in events:
+            with ui.row().classes('w-full text-sm border-b py-1'):
+                ui.label(str(event['event_date'])).classes('w-28')
+                ui.label(event['event_type']).classes('w-24')
+                # A deposit has no payer symbol; a bare None would draw "None".
+                ui.label(event['symbol'] or '-').classes('w-24')
+                ui.label(f"{event['amount']:,.2f}").classes('w-28')
+                ui.label(f"{event['open_amount']:,.2f}").classes('w-28')
 
 
 def render_outcomes(outcomes: List, *, run_id: Optional[int] = None) -> None:
