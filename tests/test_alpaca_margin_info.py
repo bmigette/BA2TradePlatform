@@ -177,6 +177,25 @@ def test_fractionability_and_trade_increments_are_carried_through():
     assert info.min_trade_increment == 0.001
 
 
+def test_alpaca_publishes_no_fractional_notional_floor():
+    """The $5 fractional minimum is TASTYTRADE's rule, not a platform rule.
+
+    Alpaca's `Asset` carries no equivalent, so `min_fractional_notional` stays None
+    ("the broker published no floor"). The engine suppresses any fractional order
+    below this number, so hardcoding TastyTrade's $5 here -- or defaulting the
+    field to 5.0 in `MarginInfo` -- would silently refuse legal Alpaca orders that
+    this account places routinely: Alpaca's own minimum is 0.001 SHARES.
+    """
+    acct = _bare_account()
+    acct.client.get_asset.return_value = _asset(
+        "AAPL", fractionable=True, min_order_size=0.001, min_trade_increment=0.001)
+
+    info = acct.get_symbol_margin_info(["AAPL"])["AAPL"]
+
+    assert info.min_fractional_notional is None
+    assert info.min_order_size == 0.001      # SHARES -- the only minimum Alpaca has
+
+
 def test_symbols_are_normalised_before_lookup():
     acct = _bare_account()
     acct.client.get_asset.side_effect = lambda s: _asset(s)

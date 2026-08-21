@@ -243,6 +243,13 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         buying power one dollar of notional consumes. A fully marginable stock in
         a 2:1 account is ``0.5 * 2 = 1.0``; a non-marginable one is ``1.0 * 2 = 2.0``.
 
+        MIND THE UNITS on the three minimums. ``min_order_size`` and
+        ``min_trade_increment`` are SHARE quantities; ``min_fractional_notional``
+        is DOLLARS and binds FRACTIONAL orders only. An adapter that publishes a
+        money floor as a share count mis-sizes by the price of the symbol, in the
+        direction of never trading, and nothing raises. Alpaca has only the share
+        minimums; TastyTrade has only the money one (its $5 fractional floor).
+
         Args:
             symbols: symbols to describe, already normalised (.strip().upper()).
 
