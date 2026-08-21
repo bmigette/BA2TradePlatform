@@ -645,23 +645,41 @@ class TastyTradeAccount(AccountInterface):
     #: call (tastytrade/market_data.py:132), so symbol lists are chunked.
     _MARKET_DATA_CHUNK = 100
 
-    @staticmethod
-    def _pick_price(data, price_type: str) -> Optional[float]:
-        """Resolve one MarketData row to a price, falling back down the ladder.
+    #: Fallback ladder, applied AFTER the requested price type, best first.
+    #:
+    #: ``mark`` leads it because it is the only price field ``MarketData`` declares
+    #: REQUIRED (tastytrade/market_data.py) -- the broker's own consolidated live price,
+    #: present when bid/ask/mid are not, which is exactly the thin or after-hours case
+    #: the ladder exists for. It used to be missing entirely, so an ``ask`` request with
+    #: no ask fell through to ``last`` and then to ``close`` and could silently return
+    #: YESTERDAY'S CLOSE while a live mark sat unused.
+    _PRICE_FALLBACKS = ('mark', 'last', 'close')
+
+    #: price types a caller may ask for (ReadOnlyAccountInterface documents bid/ask/mid;
+    #: 'mark' is TastyTrade's own consolidated price). Anything else is a typo, and a
+    #: typo must not silently resolve to whatever the ladder happens to hit first.
+    _PRICE_TYPES = ('bid', 'ask', 'mid', 'mark')
+
+    @classmethod
+    def _pick_price(cls, data, price_type: str) -> Optional[float]:
+        """Resolve one MarketData row to a price: the requested type, then the ladder.
+
+        A zero is treated as NO quote (nobody can trade at 0.00), not as a price.
 
         Returns ``None`` when the row carries no usable price -- never a fabricated
-        number (platform rule: no fallback values for live data).
+        number (platform rule: no fallback values for live data). ``None`` propagates
+        to the caller as "unpriced", which every caller must refuse to size on; a
+        fabricated 0.0 reads as a real price.
         """
-        if price_type == 'bid' and data.bid:
-            return float(data.bid)
-        if price_type == 'ask' and data.ask:
-            return float(data.ask)
-        if price_type == 'mid' and data.mid:
-            return float(data.mid)
-        if data.last:
-            return float(data.last)
-        if data.close:
-            return float(data.close)
+        if price_type not in cls._PRICE_TYPES:
+            logger.warning(
+                f"Unknown price type {price_type!r}; falling back to "
+                f"{cls._PRICE_FALLBACKS[0]}")
+        ladder = [price_type] + [f for f in cls._PRICE_FALLBACKS if f != price_type]
+        for field_name in ladder:
+            value = getattr(data, field_name, None)
+            if value:
+                return float(value)
         return None
 
     def _get_instrument_current_price_impl(self, symbol_or_symbols, price_type='bid'):

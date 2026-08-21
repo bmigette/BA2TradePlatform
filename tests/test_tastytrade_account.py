@@ -22,7 +22,7 @@ THREE SDK traps these tests exist to guard:
 """
 import asyncio
 import threading
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -144,7 +144,8 @@ def _fill(quantity="10", fill_price="150.25"):
 
 
 def _buying_power_effect_payload(change_in_buying_power="1500", bp_effect="Debit",
-                                 isolated_requirement="1500"):
+                                 isolated_requirement="1500",
+                                 change_in_margin_requirement="900"):
     """RAW dasherized BuyingPowerEffect payload, WITH the `-effect` keys.
 
     Every value here is an unsigned MAGNITUDE, exactly as TastyTrade sends it on the
@@ -153,9 +154,15 @@ def _buying_power_effect_payload(change_in_buying_power="1500", bp_effect="Debit
     `change-in-buying-power` and `isolated-order-margin-requirement` are DEBITS, so the
     parsed model carries -1500 for each -- which is exactly what production sees and
     what a kwargs-built fixture never showed.
+
+    `change-in-margin-requirement` deliberately DIFFERS from
+    `isolated-order-margin-requirement`: they are different numbers on a real account
+    (the first is the whole account's margin delta, the second is this order in
+    isolation), and while the fixture made them equal, sourcing OrderImpact's
+    `margin_requirement` from the wrong one was invisible.
     """
     return {
-        "change-in-margin-requirement": "1500",
+        "change-in-margin-requirement": change_in_margin_requirement,
         "change-in-margin-requirement-effect": "Debit",
         "change-in-buying-power": change_in_buying_power,
         "change-in-buying-power-effect": bp_effect,
@@ -190,7 +197,8 @@ def _fee_calculation_payload(total_fees="0.03"):
 
 def _placed_order_response(order, change_in_buying_power="1500", bp_effect="Debit",
                            isolated_requirement="1500", total_fees="0.03",
-                           warnings=None, errors=None):
+                           warnings=None, errors=None,
+                           change_in_margin_requirement="900"):
     """A REAL PlacedOrderResponse parsed from a RAW dasherized payload.
 
     `model_validate` (not kwargs) so the nested BuyingPowerEffect / FeeCalculation
@@ -201,7 +209,8 @@ def _placed_order_response(order, change_in_buying_power="1500", bp_effect="Debi
     return PlacedOrderResponse.model_validate({
         "buying-power-effect": _buying_power_effect_payload(
             change_in_buying_power=change_in_buying_power, bp_effect=bp_effect,
-            isolated_requirement=isolated_requirement),
+            isolated_requirement=isolated_requirement,
+            change_in_margin_requirement=change_in_margin_requirement),
         "order": order,
         "fee-calculation": _fee_calculation_payload(total_fees=total_fees),
         "warnings": [{"code": "w", "message": w} for w in (warnings or [])],
@@ -363,6 +372,63 @@ def test_get_positions_returns_empty_list_when_genuinely_flat():
     acct._account.get_positions = AsyncMock(return_value=[])
 
     assert acct.get_positions() == []
+
+
+def test_get_positions_maps_a_long_to_the_buy_side():
+    """N05. Nothing asserted Position.side at all. Inverting it makes every long look
+    like a short: reconciliation would try to close it the wrong way, and exposure
+    would be counted with the wrong sign."""
+    from ba2_trade_platform.core.types import OrderDirection
+
+    acct = _bare_account()
+    acct._account.get_positions = AsyncMock(return_value=[
+        _tt_position(symbol="AAPL", direction="Long")])
+
+    assert acct.get_positions()[0].side == OrderDirection.BUY
+
+
+def test_get_positions_maps_a_short_to_the_sell_side():
+    """N05."""
+    from ba2_trade_platform.core.types import OrderDirection
+
+    acct = _bare_account()
+    acct._account.get_positions = AsyncMock(return_value=[
+        _tt_position(symbol="AAPL", direction="Short")])
+
+    assert acct.get_positions()[0].side == OrderDirection.SELL
+
+
+def test_get_positions_reports_quantity_as_a_positive_magnitude():
+    """N06/N07. Position.qty is a MAGNITUDE and `side` carries the direction -- the
+    Alpaca convention every consumer here assumes. A signed qty would make
+    market_value, cost_basis and every allocation weight negative for a short.
+    qty_available mirrors it: TastyTrade publishes no separate held-for-orders
+    quantity, so reporting anything else would understate what can be closed."""
+    acct = _bare_account()
+    acct._account.get_positions = AsyncMock(return_value=[
+        _tt_position(symbol="AAPL", quantity="-10", direction="Short",
+                     average_open_price="140", close_price="150", mark_price="155")])
+
+    position = acct.get_positions()[0]
+
+    assert position.qty == 10.0
+    assert position.qty_available == 10.0
+    assert position.cost_basis == pytest.approx(1400.0)
+    assert position.market_value == pytest.approx(1550.0)
+
+
+def test_get_positions_treats_an_absent_multiplier_as_one():
+    """N08. `multiplier` scales cost basis and market value. Defaulting an absent one
+    to anything but 1 would inflate an equity position's notional by that factor."""
+    acct = _bare_account()
+    acct._account.get_positions = AsyncMock(return_value=[
+        _tt_position(symbol="AAPL", quantity="10", average_open_price="140",
+                     mark_price="155", multiplier=None)])
+
+    position = acct.get_positions()[0]
+
+    assert position.cost_basis == pytest.approx(1400.0)
+    assert position.market_value == pytest.approx(1550.0)
 
 
 def test_get_positions_derives_change_today_from_the_previous_close():
@@ -716,6 +782,70 @@ def test_order_mapping_translates_broker_status_to_platform_status():
         _placed_order(status=TTOrderStatus.CANCEL_REQUESTED))
 
     assert mapped.status == OrderStatus.PENDING_CANCEL
+
+
+def test_order_mapping_refuses_to_store_a_dry_run_id_as_a_broker_id():
+    """N14. A dry run comes back with `id == -1`. Stored as a broker_order_id it would
+    make the _submit_order_impl idempotency guard reject the genuine submission that
+    follows -- the order would never be sent, and would look as if it had been."""
+    acct = _bare_account()
+
+    mapped = acct.tastytrade_order_to_tradingorder(_placed_order(order_id=-1))
+
+    assert mapped.broker_order_id is None
+
+
+def test_order_mapping_takes_quantity_from_the_order_size_not_the_fills():
+    """N15. `quantity` is what was ORDERED; `filled_qty` is what has filled. Reading
+    quantity off the fills makes a partially filled order look fully filled -- the
+    remaining quantity vanishes from every "how much is still working" sum."""
+    acct = _bare_account()
+
+    mapped = acct.tastytrade_order_to_tradingorder(
+        _placed_order(status=TTOrderStatus.LIVE, size="10",
+                      fills=[_fill(quantity="4", fill_price="150.00")]))
+
+    assert mapped.quantity == 10.0
+    assert mapped.filled_qty == 4.0
+
+
+def test_order_mapping_falls_back_to_the_filled_quantity_when_size_is_absent():
+    acct = _bare_account()
+    order = _placed_order(status=TTOrderStatus.FILLED, size="10",
+                          fills=[_fill(quantity="4", fill_price="150.00")])
+    object.__setattr__(order, "size", None)
+
+    assert acct.tastytrade_order_to_tradingorder(order).quantity == 4.0
+
+
+@pytest.mark.parametrize("legs", [None, []])
+def test_side_from_legs_returns_none_rather_than_guessing(legs):
+    """N16. There is no top-level side on a PlacedOrder. When no leg yields one, the
+    answer is "I do not know" -- defaulting to BUY puts the row on the wrong side of
+    the book, and every consumer of TradingOrder.side then acts on it."""
+    assert TastyTradeAccount._side_from_legs(legs) is None
+
+
+def test_side_from_legs_ignores_a_leg_with_no_action():
+    acct = _bare_account()
+    order = _placed_order()
+    object.__setattr__(order, "legs", [SimpleNamespace(action=None)])
+
+    assert acct._side_from_legs(order.legs) is None
+    assert acct.tastytrade_order_to_tradingorder(order) is None
+
+
+def test_get_orders_drops_a_row_whose_side_cannot_be_determined():
+    """N16. The undeterminable row is skipped, not defaulted onto the buy side."""
+    acct = _bare_account()
+    good = _placed_order(order_id=1)
+    sideless = _placed_order(order_id=2)
+    object.__setattr__(sideless, "legs", [])
+    acct._account.get_order_history = AsyncMock(return_value=[good, sideless])
+
+    orders = acct.get_orders()
+
+    assert [o.broker_order_id for o in orders] == ["1"]
 
 
 def test_get_orders_returns_trading_orders_not_raw_broker_objects():
@@ -1660,6 +1790,28 @@ def test_preview_order_impact_reports_the_margin_requirement_as_a_positive_cost(
     assert impact.margin_requirement == 1500.0
 
 
+def test_preview_order_impact_reports_the_isolated_requirement_not_the_account_delta():
+    """M10. `isolated_order_margin_requirement` is what THIS order ties up;
+    `change_in_margin_requirement` is the whole account's margin delta, which nets
+    against existing positions and can be far smaller (or zero for a hedge). Sourcing
+    OrderImpact.margin_requirement from the account delta understates the capital the
+    order commits. Both were 1500 in the fixture, so the swap was invisible."""
+    account_def, order = _tt_trading_order()
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.place_order = AsyncMock(
+        return_value=_placed_order_response(_placed_order(order_id=-1),
+                                            isolated_requirement="1500",
+                                            change_in_margin_requirement="900"))
+
+    with patch("tastytrade.instruments.Equity.get",
+               new=AsyncMock(return_value=_FakeEquity("AAPL"))):
+        impact = acct.preview_order_impact(order)
+
+    assert impact.margin_requirement == 1500.0
+    assert impact.raw["change_in_margin_requirement"] == -900.0
+
+
 def test_preview_order_impact_reports_estimated_fees_as_a_positive_cost():
     """I3. `FeeCalculation.total_fees` goes through `set_sign_for` too
     (order.py:407-419), and a fee is a DEBIT: the model carries -0.03. A NEGATIVE
@@ -1809,6 +1961,16 @@ def test_account_snapshot_leaves_an_absent_short_value_as_none():
     snapshot = acct.get_account_snapshot()
 
     assert snapshot.short_market_value is None
+
+
+def test_account_snapshot_declares_fractional_support():
+    """N09. TastyTrade supports fractional equity quantities; reporting otherwise makes
+    the allocation engine round every target to whole shares and silently drop any
+    position smaller than one share."""
+    acct = _bare_account()
+    acct._account.get_balances = AsyncMock(return_value=_balances())
+
+    assert acct.get_account_snapshot().supports_fractional is True
 
 
 def test_account_snapshot_on_failure_is_all_none_not_zeros():
@@ -2074,11 +2236,193 @@ def test_get_cash_transfers_ignores_the_drip_reinvestment_leg():
     assert acct.get_cash_transfers() == []
 
 
+def test_get_cash_transfers_refuses_a_negative_deposit():
+    """N25. `Transfer` is in BOTH the deposit and the withdrawal sub-type sets, so only
+    the sign tells them apart. Dropping the `net_value > 0` guard turns a clawback into
+    income: CashTransfer.is_income is true for a DEPOSIT, and the allocation engine
+    funds a run off income events."""
+    from ba2_trade_platform.core.account_types import CASH_TRANSFER_WITHDRAWAL
+
+    acct = _bare_account()
+    acct._account.get_history = AsyncMock(return_value=[
+        _money_movement(9701, "Transfer", "-500", description="ACAT TRANSFER OUT"),
+    ])
+
+    transfers = acct.get_cash_transfers()
+
+    assert [t.event_type for t in transfers] == [CASH_TRANSFER_WITHDRAWAL]
+    assert transfers[0].amount == -500.0
+    assert transfers[0].is_income is False
+
+
+def test_get_cash_transfers_never_reports_a_negative_amount_as_income():
+    """The invariant behind N25, asserted directly across a mixed history."""
+    acct = _bare_account()
+    acct._account.get_history = AsyncMock(return_value=[
+        _money_movement(9801, "Deposit", "2500"),
+        _money_movement(9802, "Deposit", "-2500", description="DEPOSIT REVERSAL"),
+        _money_movement(9803, "Transfer", "-500"),
+        _money_movement(9804, "Withdrawal", "-800"),
+        _money_movement(9805, "Dividend", "1.00", underlying_symbol="TIDL"),
+    ])
+
+    assert all(t.amount > 0 for t in acct.get_cash_transfers() if t.is_income)
+
+
+def test_get_cash_transfers_skips_a_row_with_no_broker_id():
+    """N27. `external_id` is the (account_id, external_id) idempotency key of
+    portfolio_income_event. A row with no broker id cannot be de-duplicated, so
+    re-syncing the window would credit it again on every run."""
+    acct = _bare_account()
+    acct._account.get_history = AsyncMock(return_value=[
+        _money_movement(None, "Deposit", "2500"),
+        _money_movement(9901, "Deposit", "1000"),
+    ])
+
+    assert [t.external_id for t in acct.get_cash_transfers()] == ["9901"]
+
+
+def test_get_cash_transfers_skips_a_row_with_no_event_date():
+    acct = _bare_account()
+    acct._account.get_history = AsyncMock(return_value=[
+        _money_movement(9902, "Deposit", "2500", transaction_date=None),
+    ])
+
+    assert acct.get_cash_transfers() == []
+
+
 def test_get_cash_transfers_returns_empty_list_on_failure():
     acct = _bare_account()
     acct._account.get_history = AsyncMock(side_effect=RuntimeError("gateway timeout"))
 
     assert acct.get_cash_transfers() == []
+
+
+# ---------------------------------------------------------------------------
+# get_dividends
+# ---------------------------------------------------------------------------
+
+def test_get_dividends_requests_both_history_legs_over_all_pages():
+    """M56/M57. TWO paginated calls, and neither was pinned: page_offset=0 would cap
+    each at the SDK's first page, so a year of dividends would silently be truncated
+    to whatever fits in 250 rows of transaction history."""
+    acct = _bare_account()
+    acct._account.get_history = _history_by_type()
+
+    acct.get_dividends(start_date=date(2026, 1, 1), end_date=date(2026, 8, 20))
+
+    calls = {tuple(call.kwargs["types"]): call.kwargs
+             for call in acct._account.get_history.call_args_list}
+    assert set(calls) == {("Receive Deliver",), ("Money Movement",)}
+    for kwargs in calls.values():
+        assert kwargs["page_offset"] is None
+        assert kwargs["start_date"] == date(2026, 1, 1)
+        assert kwargs["end_date"] == date(2026, 8, 20)
+
+
+def test_get_dividends_anchors_on_the_cash_leg_and_reports_the_breakdown():
+    """A cash (non-DRIP) dividend: no Receive Deliver leg exists at all, so anchoring
+    on the share receipt would report nothing."""
+    acct = _bare_account()
+    acct._account.get_history = _history_by_type(money_movement=[
+        _money_movement(9101, "Dividend", "1.57", underlying_symbol="TIDL"),
+        _money_movement(9102, "Dividend", "-0.24", underlying_symbol="TIDL"),
+    ])
+
+    dividends = acct.get_dividends()
+
+    assert dividends == [{
+        'symbol': 'TIDL', 'amount': 1.33, 'gross_amount': 1.57, 'tax_withheld': 0.24,
+        'date': date(2026, 8, 3), 'drip_quantity': None, 'drip_price': None,
+    }]
+
+
+def test_get_dividends_enriches_a_reinvested_dividend_with_the_share_receipt():
+    acct = _bare_account()
+    acct._account.get_history = _history_by_type(
+        money_movement=[_money_movement(9101, "Dividend", "1.33",
+                                        underlying_symbol="TIDL")],
+        receive_deliver=[SimpleNamespace(
+            id=9110, underlying_symbol="TIDL", symbol="TIDL",
+            transaction_date=date(2026, 8, 3), quantity=Decimal("0.05"),
+            price=Decimal("26.60"))])
+
+    dividend = acct.get_dividends()[0]
+
+    assert dividend['drip_quantity'] == pytest.approx(0.05)
+    assert dividend['drip_price'] == pytest.approx(26.60)
+
+
+def test_get_dividends_survives_the_drip_leg_fetch_failing():
+    """The share receipt is ENRICHMENT only -- losing it must not lose the dividend."""
+    def _answer(session, **kwargs):
+        if kwargs.get("types") == ["Receive Deliver"]:
+            raise RuntimeError("gateway timeout")
+        return [_money_movement(9101, "Dividend", "1.33", underlying_symbol="TIDL")]
+
+    acct = _bare_account()
+    acct._account.get_history = AsyncMock(side_effect=_answer)
+
+    assert [d['amount'] for d in acct.get_dividends()] == [1.33]
+
+
+def test_get_dividends_returns_empty_list_on_failure():
+    acct = _bare_account()
+    acct._account.get_history = AsyncMock(side_effect=RuntimeError("gateway timeout"))
+
+    assert acct.get_dividends() == []
+
+
+# ---------------------------------------------------------------------------
+# get_balance_history
+# ---------------------------------------------------------------------------
+
+def _snapshot(snapshot_date=date(2026, 8, 3), cash="25000", nlv="100000"):
+    return SimpleNamespace(snapshot_date=snapshot_date,
+                           cash_balance=Decimal(cash),
+                           net_liquidating_value=Decimal(nlv))
+
+
+def test_get_balance_history_requests_all_pages():
+    """M58. Untested entirely. per_page defaults to 250, so page_offset=0 would cap a
+    daily equity curve at 250 days and silently truncate the rest."""
+    acct = _bare_account()
+    acct._account.get_balance_snapshots = AsyncMock(return_value=[])
+
+    acct.get_balance_history(start_date=date(2026, 1, 1))
+
+    assert acct._account.get_balance_snapshots.call_args.kwargs["page_offset"] is None
+
+
+def test_get_balance_history_defaults_to_a_year_when_no_start_date_is_given():
+    """TastyTrade returns only a handful of snapshots without a start_date -- not a
+    daily series -- so the adapter must always send one."""
+    acct = _bare_account()
+    acct._account.get_balance_snapshots = AsyncMock(return_value=[])
+
+    acct.get_balance_history()
+
+    requested = acct._account.get_balance_snapshots.call_args.kwargs["start_date"]
+    assert requested == date.today() - timedelta(days=365)
+
+
+def test_get_balance_history_splits_net_liquidation_into_cash_and_equity():
+    acct = _bare_account()
+    acct._account.get_balance_snapshots = AsyncMock(
+        return_value=[_snapshot(cash="25000", nlv="100000")])
+
+    row = acct.get_balance_history(start_date=date(2026, 1, 1))[0]
+
+    assert row == {'date': date(2026, 8, 3), 'net_liquidating_value': 100000.0,
+                   'cash_balance': 25000.0, 'equity_value': 75000.0}
+
+
+def test_get_balance_history_returns_empty_list_on_failure():
+    acct = _bare_account()
+    acct._account.get_balance_snapshots = AsyncMock(
+        side_effect=RuntimeError("gateway timeout"))
+
+    assert acct.get_balance_history() == []
 
 
 # ---------------------------------------------------------------------------
@@ -2426,6 +2770,24 @@ def test_symbol_margin_info_reports_a_cash_account_as_not_marginable():
     assert info["AAPL"].bp_factor == 1.0
 
 
+def test_symbol_margin_info_requests_equity_metadata_over_all_pages():
+    """M51. The Equity lookup here caps at 250 symbols per page by default. A large
+    universe would silently lose every symbol past the first page -- and this method
+    OMITS a symbol with no Equity record, so the loss looks exactly like "the broker
+    does not know that symbol"."""
+    acct = _bare_account()
+    equity_get = AsyncMock(return_value=[_FakeEquity("AAPL")])
+    acct._account.get_margin_requirements = AsyncMock(return_value=_margin_report())
+    acct._account.get_positions = AsyncMock(return_value=[])
+
+    with patch("tastytrade.instruments.Equity.get", new=equity_get), \
+         patch("tastytrade.instruments.get_quantity_decimal_precisions",
+               new=AsyncMock(return_value=[_precision()])):
+        acct.get_symbol_margin_info(["AAPL"])
+
+    assert equity_get.call_args.kwargs["page_offset"] is None
+
+
 def test_symbol_margin_info_normalises_the_requested_symbols():
     """The docstring promises .strip().upper(); the returned dict must be keyed that
     way or every caller lookup misses. Added beyond the plan -- removing the
@@ -2446,7 +2808,13 @@ def test_symbol_margin_info_normalises_the_requested_symbols():
 # ---------------------------------------------------------------------------
 
 def _market_data(symbol, bid="149.90", ask="150.10", mid="150.00", last="150.05",
-                 close="148.00"):
+                 close="148.00", mark="150.02"):
+    """Stand-in for tastytrade MarketData.
+
+    `mark` is the only price field the real model declares REQUIRED (market_data.py):
+    bid, ask, mid, last and close are all Optional and routinely absent outside
+    regular hours.
+    """
     return SimpleNamespace(
         symbol=symbol,
         bid=Decimal(bid) if bid is not None else None,
@@ -2454,7 +2822,59 @@ def _market_data(symbol, bid="149.90", ask="150.10", mid="150.00", last="150.05"
         mid=Decimal(mid) if mid is not None else None,
         last=Decimal(last) if last is not None else None,
         close=Decimal(close) if close is not None else None,
+        mark=Decimal(mark) if mark is not None else None,
     )
+
+
+@pytest.mark.parametrize("price_type,expected", [("bid", 149.90), ("ask", 150.10),
+                                                 ("mid", 150.00), ("mark", 150.02)])
+def test_pick_price_returns_the_requested_price_when_present(price_type, expected):
+    assert TastyTradeAccount._pick_price(
+        _market_data("AAPL"), price_type) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("price_type", ["bid", "ask", "mid"])
+def test_pick_price_falls_back_to_the_mark_before_a_stale_close(price_type):
+    """M18. `mark` is the only REQUIRED price field on MarketData -- the broker's own
+    consolidated live price -- and the ladder never read it. An `ask` request with no
+    ask therefore fell through to `last` and then to `close`, so a thin or after-hours
+    symbol could be priced at YESTERDAY'S CLOSE while a live mark sat unused."""
+    data = _market_data("AAPL", bid=None, ask=None, mid=None,
+                        last="140.00", close="130.00", mark="150.02")
+
+    assert TastyTradeAccount._pick_price(data, price_type) == pytest.approx(150.02)
+
+
+def test_pick_price_falls_back_past_an_absent_mark_to_the_last_trade():
+    data = _market_data("AAPL", bid=None, ask=None, mid=None, mark=None,
+                        last="140.00", close="130.00")
+
+    assert TastyTradeAccount._pick_price(data, "ask") == pytest.approx(140.00)
+
+
+def test_pick_price_falls_back_to_the_close_when_nothing_else_traded():
+    data = _market_data("AAPL", bid=None, ask=None, mid=None, mark=None, last=None,
+                        close="130.00")
+
+    assert TastyTradeAccount._pick_price(data, "ask") == pytest.approx(130.00)
+
+
+def test_pick_price_returns_none_rather_than_fabricating_a_zero():
+    """N31. A row with no usable price means "the broker did not quote this", and the
+    platform rule is explicit: never a fallback value for live data. A fabricated 0.0
+    reads as a real price and sizes an infinite position."""
+    data = _market_data("AAPL", bid=None, ask=None, mid=None, mark=None, last=None,
+                        close=None)
+
+    assert TastyTradeAccount._pick_price(data, "bid") is None
+
+
+def test_pick_price_treats_a_zero_quote_as_no_quote():
+    """A 0.00 bid is not a price anyone can trade at."""
+    data = _market_data("AAPL", bid="0", ask=None, mid=None, mark="150.02", last=None,
+                        close=None)
+
+    assert TastyTradeAccount._pick_price(data, "bid") == pytest.approx(150.02)
 
 
 def test_bulk_quotes_chunk_at_the_hundred_symbol_api_limit():
