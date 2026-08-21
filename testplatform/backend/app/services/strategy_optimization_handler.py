@@ -1355,8 +1355,12 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             # KNOWN LIMITATION: ``all_results`` restarts empty, so this row records only the
             # trials evaluated AFTER the resume -- the earlier ones stay on the interrupted run's
             # own row. The SEARCH is unaffected (population, elites, best_individual and both RNG
-            # states are all restored), and elites re-appear in later generations, so best_params
-            # is intact; only the top-N candidate POOL is thinner than an uninterrupted run's.
+            # states are all restored -- true only since the Python RNG state was made to survive
+            # the JSON checkpoint column; before that its setstate() raised "state vector must be
+            # a tuple", was swallowed as a warning, and a resumed run silently diverged. See
+            # genetic._jsonable_to_py_state and tests/test_determinism_helpers.py), and elites
+            # re-appear in later generations, so best_params is intact; only the top-N candidate
+            # POOL is thinner than an uninterrupted run's.
             # Carrying all_results in the checkpoint would embed every trial's trades JSON in it.
         else:
             # Warm-start (NOT resume): seed this job's population from a DIFFERENT, already-run

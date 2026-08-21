@@ -41,6 +41,37 @@ def _jsonable_to_np_state(s):
     return (name, np.array(keys, dtype=np.uint32), int(pos), int(has_gauss), float(cached))
 
 
+def _py_state_to_jsonable(state):
+    """Convert the stdlib ``random`` state tuple to a JSON-serializable list.
+
+    random.getstate() returns (version, internal_state, gauss_next) where internal_state is a
+    625-int TUPLE; a plain list() of the outer tuple leaves it nested, and the JSON checkpoint
+    column then turns it into a list that setstate() refuses. Flatten it explicitly here so
+    _jsonable_to_py_state can rebuild it explicitly (mirrors the numpy pair above).
+    """
+    version, internal_state, gauss_next = state
+    return [
+        int(version),
+        [int(x) for x in internal_state],
+        None if gauss_next is None else float(gauss_next),
+    ]
+
+
+def _jsonable_to_py_state(s):
+    """Inverse of _py_state_to_jsonable: rebuild a stdlib random state tuple.
+
+    Both elements must be tuples again -- setstate() raises "state vector must be a tuple" on
+    the list JSON gives back. LEGACY checkpoints (written as list(random.getstate()) before this
+    pair existed) have the identical post-JSON shape, so they rebuild through here unchanged.
+    """
+    version, internal_state, gauss_next = s
+    return (
+        int(version),
+        tuple(int(x) for x in internal_state),
+        None if gauss_next is None else float(gauss_next),
+    )
+
+
 def _accepts_on_result(batch_fitness) -> bool:
     """Does this batch evaluator take the incremental-result callback?
 
@@ -361,10 +392,13 @@ class GeneticOptimizer:
         self.best_fitness = checkpoint.get('best_fitness')
         self.best_individual = checkpoint.get('best_individual')
 
-        # Restore random state if available
+        # Restore Python random state if available. tuple() alone is NOT enough: the checkpoint
+        # is a JSON column, so the inner 625-int state vector comes back as a list and
+        # setstate() rejects it ("state vector must be a tuple") -- which used to be swallowed
+        # into the warning below, leaving the resumed run on an un-restored RNG.
         if 'random_state' in checkpoint:
             try:
-                random.setstate(tuple(checkpoint['random_state']))
+                random.setstate(_jsonable_to_py_state(checkpoint['random_state']))
             except Exception as e:
                 logger.warning(f"Could not restore random state: {e}")
 
@@ -445,7 +479,7 @@ class GeneticOptimizer:
             'best_individual': list(self.best_individual) if self.best_individual else None,
             'best_fitness': self.best_fitness,
             'history': self.history,
-            'random_state': list(random.getstate()),
+            'random_state': _py_state_to_jsonable(random.getstate()),
             'np_random_state': _np_state_to_jsonable(np.random.get_state()),
         }
 
