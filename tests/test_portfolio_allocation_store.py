@@ -1,4 +1,5 @@
 """Repository layer for the portfolio-allocation tables, against the in-memory test DB."""
+import threading
 from datetime import date
 
 import pytest
@@ -10,6 +11,37 @@ from ba2_trade_platform.core import portfolio_allocation_store as store
 def account_id(mock_account_def):
     """The id of a persisted AccountDefinition (conftest fixture)."""
     return mock_account_def.id
+
+
+@pytest.fixture
+def file_backed_db(tmp_path):
+    """Repoint the store at a REAL, production-configured sqlite FILE.
+
+    The concurrency tests below cannot run on the session-wide in-memory engine
+    from conftest: ``create_engine("sqlite:///:memory:")`` gets SQLAlchemy's
+    ``SingletonThreadPool``, so a second thread opens a second connection to a
+    second, EMPTY in-memory database and the race under test cannot even be
+    expressed. Worse, it would pass for the wrong reason.
+
+    So the engine here is built by ``ba2_common.core.db._build_engine`` -- the
+    very function the live app uses -- which is what puts the assertions on the
+    real pragmas (``journal_mode=WAL``, ``busy_timeout=30000``) rather than on a
+    hand-rolled approximation of them. The autouse ``patch_db_engine`` fixture has
+    already installed the in-memory engine by the time this runs, so this saves
+    and restores whatever it finds.
+    """
+    import ba2_common.core.db as pkg_db
+    from sqlmodel import SQLModel
+
+    engine = pkg_db._build_engine(str(tmp_path / "allocation_race.sqlite"))
+    SQLModel.metadata.create_all(engine)
+    saved = pkg_db._engine
+    pkg_db._engine = engine
+    try:
+        yield engine
+    finally:
+        pkg_db._engine = saved
+        engine.dispose()
 
 
 def consume(account_id, net_buy_value, *, sell_value=0.0):
@@ -584,3 +616,188 @@ def test_the_declared_cascade_never_fires_so_cleanup_must_be_explicit(account_id
     counts = store.delete_account_allocation_data(account_id)
     assert counts == {"config": 1, "labels": 1, "symbols": 0, "income_events": 0, "runs": 0}
     assert store.get_managed_labels(account_id) == []
+
+
+# --- concurrent finalisation must not double-spend the ledger --------------
+#
+# These run against ``file_backed_db`` (a real sqlite file built by the live
+# ``_build_engine``), NOT the in-memory conftest engine -- see that fixture for
+# why the in-memory one cannot express the race at all.
+
+RACE_TRIALS = 25
+"""Trials per race test. The window is timing-dependent, so one trial proves
+nothing either way; the assertion is that ALL of them come out right. Before the
+fix roughly four in five went wrong, which makes 25 trials a certainty rather
+than a coin toss, and it costs well under a second."""
+
+
+def _finalise_concurrently(run_ids, *, buy_value):
+    """Finalise each of ``run_ids`` from its OWN thread, released together.
+
+    A ``threading.Barrier`` is what makes this a race rather than two sequential
+    calls: every thread parks until the last one arrives, so they all enter
+    ``finalise_allocation_run`` within microseconds of each other and interleave
+    the guard read with the ledger write.
+
+    Returns ``(results_by_slot, errors)``. Exceptions are collected rather than
+    raised in the worker, because a thread that dies takes its traceback with it
+    and would otherwise surface only as a mystified assertion on the ledger.
+    """
+    barrier = threading.Barrier(len(run_ids))
+    results = {}
+    errors = []
+
+    def worker(slot, run_id):
+        try:
+            barrier.wait(timeout=30)
+            results[slot] = store.finalise_allocation_run(
+                run_id, submitted_buy_value=buy_value, submitted_sell_value=0.0,
+                order_ids=[])
+        except BaseException as exc:            # noqa: BLE001 -- reported, not swallowed
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(slot, run_id))
+               for slot, run_id in enumerate(run_ids)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=120)
+    assert not any(t.is_alive() for t in threads), \
+        "a finalise_allocation_run thread never returned -- deadlock, not a race"
+    return results, errors
+
+
+def test_the_race_tests_run_on_a_wal_engine_with_a_busy_timeout(file_backed_db):
+    """The fix leans on the live pragmas, so pin that the fixture really has them.
+
+    ``BEGIN IMMEDIATE`` only makes concurrent finalisation SAFE if a blocked
+    writer WAITS: with the default zero busy timeout the loser would get an
+    instant ``database is locked`` instead of the right answer, and the race
+    tests below would be proving something else entirely.
+    """
+    with file_backed_db.connect() as connection:
+        journal = connection.exec_driver_sql("PRAGMA journal_mode").scalar()
+        busy = connection.exec_driver_sql("PRAGMA busy_timeout").scalar()
+    assert journal.lower() == "wal"
+    assert busy == 30000
+
+
+def test_two_threads_finalising_one_run_consume_the_ledger_exactly_once(file_backed_db):
+    """C-1. The replay guard is a check-then-act, so it needs a LOCK, not a read.
+
+    Two callers finalising the SAME run -- a retry racing the original, or two
+    NiceGUI tabs on one submit -- both read ``income_consumed_at`` as NULL,
+    because pysqlite issues no ``BEGIN`` ahead of a ``SELECT`` and so takes no
+    snapshot. Both then spend the ledger. Neither raises, and both report the
+    same, correct-looking ``income_consumed_amount``; the only visible trace is
+    that the deposit has been eaten twice.
+
+    400 consumed against a 1,000 deposit must leave 600 open. Anything else is
+    real income that has silently vanished from the figure the page shows and
+    pre-fills into the wizard.
+    """
+    from tests.factories import create_account_definition
+
+    wrong = []
+    for trial in range(RACE_TRIALS):
+        account = create_account_definition(name=f"Race one-run {trial}").id
+        store.upsert_income_event(account, "csd-1", date(2026, 8, 1), "DEPOSIT", 1000.0)
+        run = store.record_allocation_run(account, "REBALANCE", {})
+
+        results, errors = _finalise_concurrently([run.id, run.id], buy_value=400.0)
+        assert not errors, f"trial {trial} raised: {errors!r}"
+        assert len(results) == 2
+
+        open_total = round(store.get_open_income_total(account), 2)
+        if open_total != 600.0:
+            wrong.append((trial, open_total))
+
+    assert wrong == [], (
+        f"{len(wrong)}/{RACE_TRIALS} trials double-spent the income ledger "
+        f"(expected 600.0 open, got): {wrong}")
+
+
+LEDGER_READ_HOLD_SECONDS = 1.0
+"""How long the first racer holds open the "both have read, neither has written"
+window in the lost-update test. A plain barrier will NOT produce that window --
+over 125 measured trials the two threads serialised every single time -- so the
+gate below forces the interleaving instead of hoping for it. The wait is bounded
+because the FIXED code must be allowed to never arrive; see the test."""
+
+
+def _install_ledger_read_gate(monkeypatch):
+    """Make the first racer pause between reading the ledger and writing it.
+
+    Patches the FIFO helper the store calls after its ``SELECT`` of
+    ``portfolio_income_event`` and before it writes the takes back, which is
+    exactly the read-modify-write that must not interleave. The first caller to
+    arrive parks until the second one does; the second releases it and walks on.
+
+    The wait is bounded by ``LEDGER_READ_HOLD_SECONDS`` on purpose, and the bound
+    is the whole point rather than a safety net: once the store takes a write
+    lock before its first read, the second caller is BLOCKED OUTSIDE this
+    function and can never arrive. An unbounded rendezvous would then deadlock
+    the fix it is meant to certify. Timing out and carrying on is what "the other
+    thread is waiting its turn, as it should be" looks like from in here.
+    """
+    real_consume = store.consume_income_events
+    lock = threading.Lock()
+    seen = []
+    second_arrived = threading.Event()
+
+    def gated_consume(open_events, budget):
+        with lock:
+            seen.append(1)
+            arrival = len(seen)
+        if arrival == 1:
+            second_arrived.wait(timeout=LEDGER_READ_HOLD_SECONDS)
+        else:
+            second_arrived.set()
+        return real_consume(open_events, budget)
+
+    monkeypatch.setattr(store, "consume_income_events", gated_consume)
+
+
+def test_two_threads_finalising_different_runs_do_not_lose_a_consumption(
+        file_backed_db, monkeypatch):
+    """The narrower window: two DIFFERENT runs racing on the SAME ledger.
+
+    Nothing here is a replay -- both runs are entitled to their 400 -- so the
+    per-run ``income_consumed_at`` guard has nothing to say about it, and a
+    conditional ``UPDATE ... WHERE income_consumed_at IS NULL`` would not close
+    it either. What breaks is plain lost update: both read the deposit as fully
+    open, both write ``consumed_amount = 400``, and one run's spend silently
+    overwrites the other's. The ledger then shows 600 open where 200 is the
+    truth, and the next run cheerfully spends 400 that is already gone.
+
+    THE RUNS ARE RECORDED WITH THE TOTALS THEY ARE FINALISED WITH, and that is
+    load-bearing, not incidental. In the ordinary flow the run is recorded with
+    zeros, so ``finalise_allocation_run``'s totals assignment leaves the row
+    dirty and the very next ``session.exec`` AUTOFLUSHES it -- an ``UPDATE
+    portfolio_allocation_run`` that takes SQLite's write lock BEFORE the ledger
+    is read, incidentally serialising the two racers. (Verified by dumping the
+    blocked thread's stack: it sits in ``cursor.execute`` under
+    ``session._autoflush`` inside ``_apply_income_consumption``.) Pre-set totals
+    dirty nothing, no autoflush happens, no lock is taken, and the window is
+    wide open. Relying on an ORM flush ordering to protect the money ledger is
+    not a guarantee, so the store takes the write lock explicitly and this test
+    pins the case where the accident does not save it.
+    """
+    from tests.factories import create_account_definition
+
+    _install_ledger_read_gate(monkeypatch)
+
+    account = create_account_definition(name="Race two-runs").id
+    store.upsert_income_event(account, "csd-1", date(2026, 8, 1), "DEPOSIT", 1000.0)
+    recorded = dict(submitted_buy_value=400.0, submitted_sell_value=0.0, order_ids=[])
+    first = store.record_allocation_run(account, "REBALANCE", {}, **recorded)
+    second = store.record_allocation_run(account, "REBALANCE", {}, **recorded)
+
+    results, errors = _finalise_concurrently([first.id, second.id], buy_value=400.0)
+    assert not errors, f"a racer raised: {errors!r}"
+
+    booked = round(sum(r.income_consumed_amount for r in results.values()), 2)
+    assert booked == 800.0, "both runs must still record the 400 each of them spent"
+    assert round(store.get_open_income_total(account), 2) == 200.0, (
+        "the ledger lost one run's consumption: two runs spent 400 each out of a "
+        "1,000 deposit, so 200 must be left open")

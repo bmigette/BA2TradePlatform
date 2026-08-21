@@ -523,6 +523,34 @@ def _apply_income_consumption(session, account_id: int,
 # Run audit
 # ---------------------------------------------------------------------------
 
+def _begin_write_transaction(session) -> None:
+    """Take SQLite's single write lock NOW, before this transaction's first read.
+
+    ``get_db()`` hands back a plain ``Session(engine)`` on pysqlite, which issues
+    NO ``BEGIN`` ahead of a ``SELECT``: reads run in autocommit and see whatever
+    is committed at the instant they execute, taking no snapshot. A
+    check-then-act -- read a guard, decide, write -- is therefore completely
+    unprotected by default, because two callers' reads both land before either
+    write. ``BEGIN IMMEDIATE`` acquires the write lock up front, so the second
+    caller's transaction cannot even start until the first has committed and its
+    guard read sees the committed truth.
+
+    IMMEDIATE, not DEFERRED: a deferred transaction still takes the lock only at
+    the first write, which is exactly the moment that is too late here.
+
+    Safe to WAIT on rather than fail: ``_build_engine`` sets
+    ``busy_timeout=30000``, so a blocked writer parks for up to 30s instead of
+    getting an instant "database is locked". The lock is held for two SELECTs and
+    a handful of UPDATEs, and SQLite has only ONE write lock, so no ordering
+    deadlock is possible -- the wait is bounded by the other caller's commit.
+
+    SQLite-only by construction (``_build_engine`` builds nothing else), and
+    deliberately NOT conditional on the dialect: a silent no-op branch for some
+    other engine would quietly restore the double-spend it exists to prevent.
+    """
+    session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+
+
 def record_allocation_run(account_id: int, mode: str, plan_json: Dict[str, Any], *,
                           scope_label: Optional[str] = None,
                           base_notional: float = 0.0,
@@ -605,9 +633,19 @@ def finalise_allocation_run(run_id: int, *,
     from the ledger exactly once. A run that crashed before reaching this call
     has a NULL stamp and is listed by ``get_unconsumed_runs()``, so a recovery
     path can tell the difference between "consumed nothing" and "never got that
-    far". Two callers racing on ONE run cannot both spend either: SQLite refuses
-    the second writer's upgrade from the snapshot it read the stamp under, and
-    that transaction dies whole -- ledger takes included.
+    far".
+
+    **Serialised, because the stamp is a check-then-act.** The whole body runs
+    under ``_begin_write_transaction`` -- ``BEGIN IMMEDIATE`` before the first
+    read -- so concurrent callers queue instead of interleaving. Without it the
+    guard is worth nothing: pysqlite starts no transaction for a ``SELECT``, so
+    two callers on ONE run both read a NULL stamp and both spend. That was not
+    theoretical -- 400 against a 1,000 deposit left the ledger showing 200 open
+    instead of 600, silently, in four trials out of five. The same lock also
+    closes the narrower window between two DIFFERENT runs, where both read the
+    same ``consumed_amount`` and the second write erases the first; a conditional
+    ``UPDATE ... WHERE income_consumed_at IS NULL`` on the run row would have
+    fixed the replay but not that.
 
     Returns:
         PortfolioAllocationRun: the detached, refreshed row. Read
@@ -631,6 +669,9 @@ def finalise_allocation_run(run_id: int, *,
             f"'nothing was submitted'")
 
     with get_db() as session:
+        # BEFORE the first read, not just before the first write: everything
+        # below is a check-then-act on money. See _begin_write_transaction.
+        _begin_write_transaction(session)
         row = session.exec(
             select(PortfolioAllocationRun).where(PortfolioAllocationRun.id == run_id)
         ).first()

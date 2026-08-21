@@ -949,10 +949,17 @@ class PortfolioAllocationRun(SQLModel, table=True):
     means this run has never spent from ``portfolio_income_event``; a timestamp
     means it has, exactly once. ``portfolio_allocation_store.finalise_allocation_run``
     writes the ledger takes, ``income_consumed_events`` and this stamp in ONE
-    transaction, so a retry cannot consume twice and a crash cannot leave money
-    spent-but-unrecorded (or recorded-but-unspent). A run row whose totals are
-    written but whose stamp is NULL is a run that died mid-submit -- see
-    ``get_unconsumed_runs``.
+    transaction, so a crash cannot leave money spent-but-unrecorded (or
+    recorded-but-unspent). A run row whose totals are written but whose stamp is
+    NULL is a run that died mid-submit -- see ``get_unconsumed_runs``.
+
+    One transaction buys CRASH atomicity and nothing else: reading this column
+    and then writing it is a check-then-act, and on pysqlite a ``SELECT`` starts
+    no transaction and takes no snapshot, so two concurrent finalisers would both
+    read NULL and both spend. What makes the guard hold is that
+    ``finalise_allocation_run`` opens with ``BEGIN IMMEDIATE`` and so serialises
+    them. Any other writer of this column owes the same lock -- the column cannot
+    defend itself.
     """
     __tablename__ = "portfolio_allocation_run"
 
