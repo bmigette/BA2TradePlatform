@@ -1,6 +1,7 @@
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest, LimitOrderRequest, StopOrderRequest, StopLimitOrderRequest, ReplaceOrderRequest, TakeProfitRequest, StopLossRequest, OptionLegRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, OrderClass, PositionIntent
+from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest, LimitOrderRequest, StopOrderRequest, StopLimitOrderRequest, ReplaceOrderRequest, TakeProfitRequest, StopLossRequest, OptionLegRequest, GetAssetsRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, OrderClass, PositionIntent, AssetClass, AssetStatus
+from alpaca.trading.models import Asset
 from alpaca.common.exceptions import APIError
 from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import replace
@@ -111,6 +112,19 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
     # instance built with object.__new__ (the test idiom) still has it.
     _MARGIN_INFO_CACHE_TTL = 24 * 60 * 60
 
+    # Lifetime of one _asset_cache entry. Deliberately the SAME as the margin TTL:
+    # the margin entry is a pure derivation of the Asset, so two different lifetimes
+    # would let a "fresh" derived entry outlive the facts it was derived from.
+    _ASSET_CACHE_TTL = 24 * 60 * 60
+
+    # Cache misses at or above which one bulk /assets call beats N per-symbol calls.
+    # get_all_assets returns the whole active US-equity universe (~11k rows), so it is
+    # the wrong tool for three symbols and the only tool for two thousand. 20 is an
+    # engineering judgement, not a measurement: at Alpaca's 200 req/min trading-API
+    # limit, 20 sequential lookups is about where one large response stops costing
+    # more than N round trips.
+    _BULK_ASSET_FETCH_THRESHOLD = 20
+
     # Lifetime of the _account_snapshot_cache. Deliberately FIVE SECONDS, not the
     # margin cache's 24 hours: that one holds STATIC ASSET FACTS, this one holds
     # MONEY (equity, buying power, cash), and a stale equity used for a risk check
@@ -147,10 +161,19 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         self.client = None
         self._authentication_error = None
 
-        # Per-symbol margin metadata cache, {symbol: (fetched_at, MarginInfo)}.
-        # Alpaca has NO bulk asset endpoint, so get_symbol_margin_info() costs one
-        # get_asset() HTTP call per symbol not already cached, and the allocation page
-        # asks for the same basket on every refresh.
+        # RAW Asset facts, {symbol: (fetched_at, Asset)} -- the single fetch behind BOTH
+        # get_symbol_margin_info() and get_fractionability(), so the two consumers of
+        # `Asset.fractionable` can never disagree about a symbol.
+        #
+        # A cold basket of ~2,500 symbols is served by ONE get_all_assets() call
+        # (alpaca/trading/client.py:376) rather than 2,500 get_asset() calls, which at
+        # Alpaca's 200 req/min trading-API limit is ~12 minutes inside a page load.
+        # Small baskets stay on the per-symbol endpoint -- see _BULK_ASSET_FETCH_THRESHOLD.
+        self._asset_cache: Dict[str, Tuple[float, Asset]] = {}
+
+        # Per-symbol margin metadata cache, {symbol: (fetched_at, MarginInfo)} -- the
+        # DERIVED view, kept separately because a precheck-sourced entry
+        # (MARGIN_SOURCE_PRECHECK) has no Asset behind it at all.
         #
         # The entries EXPIRE after _MARGIN_INFO_CACHE_TTL. The ASSET facts do not change
         # intraday, but get_account_instance_from_id() hands out the same account object
@@ -1912,12 +1935,133 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             f"(open_at={hours.open_at}, close_at={hours.close_at})")
         return hours
 
+    @alpaca_api_retry
+    def _fetch_all_assets(self) -> List[Asset]:
+        """The whole ACTIVE US-equity universe in ONE /assets call (~11k rows).
+
+        Alpaca DOES have a bulk asset endpoint: `TradingClient.get_all_assets`
+        (alpaca/trading/client.py:376-397) with `GetAssetsRequest`
+        (alpaca/trading/requests.py:127-141). The comment that used to sit in this file
+        claiming otherwise is what made a cold basket cost one HTTP call per symbol.
+
+        Decorated with @alpaca_api_retry because it is ONE request whose 429 is worth
+        waiting out. The per-symbol path in _load_assets deliberately is NOT: it swallows
+        each symbol's exception so one bad ticker never aborts the basket, so the
+        decorator would never see anything to retry there.
+        """
+        return self.client.get_all_assets(
+            GetAssetsRequest(asset_class=AssetClass.US_EQUITY, status=AssetStatus.ACTIVE))
+
+    def _load_assets(self, symbols: List[str]) -> Dict[str, Asset]:
+        """Raw `Asset` rows for `symbols`, cached, bulk-fetched when that is cheaper.
+
+        Args:
+            symbols: symbols to describe; blanks are dropped and duplicates collapsed.
+
+        Returns:
+            Dict[str, Asset]: keyed by NORMALISED symbol (.strip().upper()). A symbol the
+            broker cannot describe is OMITTED, never defaulted -- one symbol's failure
+            never aborts the basket.
+        """
+        if not self._check_authentication():
+            return {}
+
+        now = time.time()
+        cache = self._asset_cache
+        out: Dict[str, Asset] = {}
+        missing: List[str] = []
+        seen = set()
+        for raw_symbol in symbols:
+            symbol = (raw_symbol or '').strip().upper()
+            if not symbol or symbol in seen:
+                continue
+            seen.add(symbol)
+            entry = cache.get(symbol)
+            if entry is not None and (now - entry[0]) >= self._ASSET_CACHE_TTL:
+                logger.debug(f"[Account {self.id}] Asset facts for {symbol} expired; refetching")
+                entry = None
+            if entry is not None:
+                out[symbol] = entry[1]
+            else:
+                missing.append(symbol)
+
+        if not missing:
+            return out
+
+        if len(missing) >= self._BULK_ASSET_FETCH_THRESHOLD:
+            try:
+                universe = self._fetch_all_assets()
+            except Exception as e:
+                logger.warning(
+                    f"[Account {self.id}] Bulk /assets fetch failed ({e}); falling back to "
+                    f"{len(missing)} per-symbol lookups")
+                universe = None
+            if universe is not None:
+                wanted = set(missing)
+                resolved = 0
+                for asset in universe:
+                    sym = (getattr(asset, 'symbol', '') or '').strip().upper()
+                    if sym in wanted:
+                        cache[sym] = (now, asset)
+                        out[sym] = asset
+                        resolved += 1
+                logger.debug(
+                    f"[Account {self.id}] Bulk /assets resolved {resolved}/{len(missing)} "
+                    f"requested symbols in one call")
+                missing = [s for s in missing if s not in out]
+                if missing:
+                    # The bulk list is ACTIVE US EQUITY only, so anything else has to be
+                    # asked for individually or it silently vanishes from the basket.
+                    logger.warning(
+                        f"[Account {self.id}] {len(missing)} symbol(s) absent from the active "
+                        f"US-equity universe; asking per symbol: {', '.join(missing[:10])}")
+
+        for symbol in missing:
+            try:
+                asset = self.client.get_asset(symbol)
+            except Exception as e:
+                logger.warning(f"[Account {self.id}] get_asset({symbol}) failed: {e}")
+                continue
+            if asset is None:
+                logger.warning(f"[Account {self.id}] get_asset({symbol}) returned nothing")
+                continue
+            cache[symbol] = (now, asset)
+            out[symbol] = asset
+
+        return out
+
+    def get_fractionability(self, symbols: List[str]) -> Dict[str, bool]:
+        """Which of these symbols Alpaca will trade in fractional quantities.
+
+        ALPACA-INTERNAL (contract 1.10). Nothing outside this class calls it; the
+        cross-broker eligibility channel is `MarginInfo.fractionable`, which this
+        adapter populates in get_symbol_margin_info() below.
+
+        Reads `Asset.fractionable` (alpaca/trading/models.py:65 -- REQUIRED, non-Optional)
+        through the shared asset cache, so this costs nothing extra when
+        get_symbol_margin_info() has already run for the same basket. Because the field
+        is non-Optional, a PRESENT entry in the returned dict is always a real broker
+        answer -- which is why a plain `Dict[str, bool]` is honest here.
+
+        Args:
+            symbols: symbols to describe; blanks dropped, duplicates collapsed.
+
+        Returns:
+            Dict[str, bool]: keyed by normalised symbol. A symbol the broker cannot
+            describe is OMITTED, and the caller MUST treat that absence as UNKNOWN
+            rather than as False -- a fabricated False makes the dry run promise a
+            whole-share rounding that will not happen, and a fabricated True promises a
+            fraction the broker then refuses.
+        """
+        return {symbol: bool(asset.fractionable)
+                for symbol, asset in self._load_assets(symbols).items()}
+
     def get_symbol_margin_info(self, symbols: List[str]) -> Dict[str, MarginInfo]:
         """Per-symbol margin / fractionability metadata for buying-power sizing.
 
-        Alpaca has NO bulk asset endpoint -- TradingClient.get_asset() takes one
-        symbol -- so this is one HTTP call per symbol NOT already cached. Callers
-        should therefore pass the whole basket once and reuse the result.
+        The `Asset` rows come from _load_assets(), which serves a cold basket with ONE
+        bulk /assets call and a warm one from cache -- so passing the whole basket at
+        once is both allowed and much cheaper than symbol-by-symbol calls.
 
         Alpaca's Asset exposes no INITIAL margin field, only
         maintenance_margin_requirement (a percentage, e.g. 30.0), so the initial
@@ -1942,9 +2086,19 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         moves an account between 1/2/4 and this process is long-lived; only the
         Asset facts, which do not change intraday, are actually cached.
 
+        `MarginInfo.fractionable` is TRI-STATE, Optional[bool] (contract 1.2), and is
+        the ONE cross-chunk carrier of per-symbol fractional eligibility.
+        `Asset.fractionable` is a REQUIRED non-Optional bool, so where there IS an
+        Asset the answer is a real True/False and is written as `bool(asset.fractionable)`
+        -- NEVER `bool(getattr(asset, 'fractionable', False))`, whose default silently
+        turns "the attribute was missing" into "the broker said no". Any MarginInfo ever
+        built here WITHOUT an Asset behind it (a future precheck-sourced entry) must pass
+        `fractionable=None`.
+
         A symbol the broker cannot describe is OMITTED, never defaulted here --
-        the caller falls back to the conservative bp_factor = account multiplier.
-        One symbol's failure never aborts the batch.
+        the caller falls back to the conservative bp_factor = account multiplier, and
+        the allocation engine reads the absent key as `m is None`, i.e. unknown
+        eligibility. One symbol's failure never aborts the batch.
         """
         if not self._check_authentication():
             return {}
@@ -1958,6 +2112,8 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         cache = self._margin_info_cache
         now = time.time()
         out: Dict[str, MarginInfo] = {}
+        needs_asset: List[str] = []
+        pending = set()
         for raw_symbol in symbols:
             symbol = (raw_symbol or '').strip().upper()
             if not symbol:
@@ -1967,6 +2123,10 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             if entry is not None and (now - entry[0]) >= self._MARGIN_INFO_CACHE_TTL:
                 logger.debug(f"[Account {self.id}] Margin info for {symbol} expired; refetching")
                 entry = None
+                # Drop the Asset it was derived from as well. The whole point of the
+                # expiry is to re-ask the broker; a still-fresh cached Asset would rebuild
+                # the identical MarginInfo from the identical stale facts.
+                self._asset_cache.pop(symbol, None)
             if entry is not None:
                 fetched_at, cached = entry
                 # Only the Asset facts are cached; bp_factor is re-derived from the
@@ -1981,13 +2141,17 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 out[symbol] = cached
                 continue
 
-            try:
-                asset = self.client.get_asset(symbol)
-            except Exception as e:
-                logger.warning(f"[Account {self.id}] get_asset({symbol}) failed: {e}")
-                continue
+            if symbol not in pending:
+                pending.add(symbol)
+                needs_asset.append(symbol)
+
+        assets = self._load_assets(needs_asset) if needs_asset else {}
+        for symbol in needs_asset:
+            asset = assets.get(symbol)
             if asset is None:
-                logger.warning(f"[Account {self.id}] get_asset({symbol}) returned nothing")
+                # _load_assets already logged why. OMITTED, never defaulted -- and
+                # never fabricated as fractionable=False, which would tell the engine
+                # the broker said no when it said nothing at all.
                 continue
 
             marginable = bool(getattr(asset, 'marginable', False))
@@ -2010,7 +2174,9 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 symbol=symbol,
                 bp_factor=initial_rate * multiplier,
                 marginable=marginable,
-                fractionable=bool(getattr(asset, 'fractionable', False)),
+                # REQUIRED non-Optional field (models.py:65) -- read it directly. A
+                # getattr default here is the failure-becomes-False antipattern.
+                fractionable=bool(asset.fractionable),
                 min_order_size=self._safe_float(getattr(asset, 'min_order_size', None)),
                 min_trade_increment=self._safe_float(getattr(asset, 'min_trade_increment', None)),
                 initial_margin_rate=initial_rate,
@@ -2022,6 +2188,18 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
 
         return out
 
+    def clear_asset_cache(self) -> None:
+        """Drop every cached raw Asset so the next lookup refetches.
+
+        The EXPLICIT path behind a user's Refresh, for the facts under both
+        get_symbol_margin_info() and get_fractionability(). Alpaca revokes marginability
+        and fractionability on individual names and this account object lives for the
+        whole process, so the automatic _ASSET_CACHE_TTL expiry is not always soon enough.
+        """
+        count = len(self._asset_cache)
+        self._asset_cache = {}
+        logger.debug(f"[Account {self.id}] Cleared {count} cached symbol asset entries")
+
     def clear_margin_info_cache(self) -> None:
         """Drop every cached per-symbol margin fact so the next call refetches.
 
@@ -2029,10 +2207,15 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         EXPLICIT path, for a user who hits Refresh because they know the broker
         changed something (Alpaca revokes marginability / fractionability on
         individual names, and this account object lives for the whole process).
+
+        Clears the raw Asset cache TOO: the margin entries are a pure derivation of
+        those assets, so keeping them would rebuild the identical MarginInfo from the
+        identical stale facts and make this a no-op.
         """
         count = len(self._margin_info_cache)
         self._margin_info_cache = {}
         logger.debug(f"[Account {self.id}] Cleared {count} cached symbol margin entries")
+        self.clear_asset_cache()
 
     def _safe_float(self, value: Any) -> Optional[float]:
         """Coerce a broker-supplied number to a plain float, None when not numeric.

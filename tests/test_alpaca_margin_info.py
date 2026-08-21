@@ -34,6 +34,7 @@ def _bare_account(multiplier="2"):
     acct.id = 1
     acct.client = MagicMock()
     acct._margin_info_cache = {}
+    acct._asset_cache = {}
     acct.client.get_account.return_value = TradeAccount(
         id=uuid4(), account_number="PA1", status=AccountStatus.ACTIVE,
         cash="1000", equity="25000", buying_power="50000", multiplier=multiplier)
