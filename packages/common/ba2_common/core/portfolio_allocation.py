@@ -24,19 +24,25 @@ the last slot and totals exactly 100.0. Never hand-roll a split.
 import copy
 import math
 from dataclasses import dataclass, field
+from datetime import datetime as DateTime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from ba2_common.core.account_types import MarginInfo, OrderImpact  # noqa: F401 (re-exported)
+from ba2_common.core.account_types import (  # noqa: F401 (re-exported)
+    AccountSnapshot, MarginInfo, OrderImpact,
+)
 from ba2_common.core.types import OrderDirection
+from ba2_common.logger import logger
 
 #: Public API. The in-tree module is a whole-module alias shim, so everything here
 #: is reachable as ``ba2_trade_platform.core.portfolio_allocation.<name>`` too.
-#: ``MarginInfo`` / ``OrderImpact`` are deliberate re-exports: a caller building
-#: engine inputs should not have to import from two modules.
+#: ``MarginInfo`` / ``OrderImpact`` / ``AccountSnapshot`` are deliberate re-exports:
+#: a caller building engine inputs should not have to import from two modules.
 __all__ = [
     # value objects and the fetch-failure sentinel
     "PositionState", "SymbolTarget", "LabelTarget", "AllocationRow", "AllocationPlan",
-    "PositionFetchFailed", "MarginInfo", "OrderImpact",
+    "PositionFetchFailed", "AccountSnapshot", "MarginInfo", "OrderImpact",
+    # wizard
+    "BaseSnapshot", "build_base_snapshot", "WARNING_NO_MULTIPLIER",
     # modes
     "ALLOCATION_MODE_REBALANCE", "ALLOCATION_MODE_INVEST_LABEL",
     "VALUATION_MODE_COST", "VALUATION_MODE_MARKET",
@@ -1191,3 +1197,91 @@ def consume_income_events(events: List[Tuple[int, float]],
         out.append((event_id, take))
         remaining -= take
     return out
+
+
+# ---------------------------------------------------------------------------
+# Wizard: the allocatable base, snapshotted when the wizard opens.
+# ---------------------------------------------------------------------------
+
+#: Added to ``BaseSnapshot.warnings`` when the broker published no multiplier.
+WARNING_NO_MULTIPLIER = "broker published no margin multiplier - assuming a cash account (1.0)"
+
+
+@dataclass
+class BaseSnapshot:
+    """Frozen-at-wizard-open view of what there is to allocate.
+
+    The wizard reads this ONCE when it opens and re-reads it only when the user
+    presses Refresh, so the numbers cannot move underneath an edit. That is the
+    whole point: buying power moves on every fill, dividend and mark, and a plan
+    solved against 10,000 but submitted against a base that has since become
+    9,000 is not the plan the user approved. ``taken_at`` is therefore part of
+    the value, not decoration -- it is what the wizard displays and what a later
+    submission compares against to decide the plan is stale.
+
+    ``managed_value`` is the current value of the managed positions under
+    ``valuation_mode`` (decision 5a), and ``base_notional`` is that plus buying
+    power (decision 1).
+
+    ``default_bp_factor`` is the conservative per-dollar buying-power cost fed to
+    the engine for symbols the broker could not describe. It is the account
+    margin multiplier when the broker publishes one; when it does not, it is
+    1.0 -- "one dollar of notional costs one dollar of buying power", i.e. a cash
+    account. Never guess HIGHER leverage than the broker admitted to.
+    """
+    available_buying_power: float
+    managed_value: float
+    base_notional: float
+    default_bp_factor: float
+    valuation_mode: str = VALUATION_MODE_COST
+    cash: Optional[float] = None
+    is_margin_account: bool = False
+    supports_fractional: bool = False
+    taken_at: DateTime = field(default_factory=lambda: DateTime.now(timezone.utc))
+    warnings: List[str] = field(default_factory=list)
+
+
+def build_base_snapshot(
+    snapshot: "AccountSnapshot",
+    current: Dict[str, PositionState],
+    managed_symbols: List[str],
+    *,
+    valuation_mode: str = VALUATION_MODE_COST,
+) -> BaseSnapshot:
+    """Turn a broker AccountSnapshot into the wizard's frozen base.
+
+    Raises:
+        ValueError: when there is no snapshot at all, when the broker published no
+        ``buying_power`` (a plan sized against a guessed balance is worse than no
+        plan), or when ``valuation_mode`` is unknown.
+    """
+    if snapshot is None:
+        raise ValueError("build_base_snapshot: no AccountSnapshot (the broker call failed).")
+    if snapshot.buying_power is None:
+        raise ValueError(
+            "build_base_snapshot: broker published no buying_power; refusing to plan "
+            "against a substituted default."
+        )
+    buying_power = float(snapshot.buying_power)
+    managed_value = compute_base_notional(0.0, current, managed_symbols,
+                                          valuation_mode=valuation_mode)
+
+    warnings: List[str] = []
+    if snapshot.margin_multiplier is None:
+        default_bp_factor = 1.0
+        warnings.append(WARNING_NO_MULTIPLIER)
+        logger.warning("build_base_snapshot: no margin multiplier; using default_bp_factor=1.0")
+    else:
+        default_bp_factor = float(snapshot.margin_multiplier)
+
+    return BaseSnapshot(
+        available_buying_power=buying_power,
+        managed_value=managed_value,
+        base_notional=buying_power + managed_value,
+        default_bp_factor=default_bp_factor,
+        valuation_mode=valuation_mode,
+        cash=snapshot.cash,
+        is_margin_account=bool(snapshot.is_margin_account),
+        supports_fractional=bool(snapshot.supports_fractional),
+        warnings=warnings,
+    )
