@@ -11,6 +11,7 @@ creating TradingOrder rows, and driving the run audit.
 Do not confuse it with ``ba2_trade_platform/core/portfolio_allocation.py``, which
 IS a shim (for the pure engine).
 """
+import inspect
 import re
 from dataclasses import dataclass, field
 from datetime import date as Date, timedelta
@@ -23,8 +24,10 @@ from .db import InstanceNotFound, add_instance, get_db, get_instance, log_activi
 from .models import Transaction, TradingOrder
 from .portfolio_allocation import (
     ACTION_ADJUST, ACTION_CLOSE, ACTION_NEW, ACTION_SKIP, FRACTIONAL_PATH_WHOLE,
-    AllocationPlan, BaseSnapshot, MarginInfo, PositionFetchFailed, PositionState,
-    apply_order_impacts, decide_symbol_action, plan_quantity_attempts, split_delta_fifo,
+    AllocationPlan, BaseSnapshot, FilledTotals, MarginInfo, OrderFill,
+    PositionFetchFailed, PositionState,
+    apply_order_impacts, decide_symbol_action, measure_filled_values,
+    plan_quantity_attempts, split_delta_fifo,
 )
 from .TransactionHelper import TransactionHelper
 from .types import (
@@ -380,11 +383,12 @@ def _leg_status(succeeded: float, failed: int) -> str:
 
     A row is one SYMBOL, but a close or a trim can be several transactions and
     each is its own order. Collapsing "2 of 3 legs went out" to FAILED is not a
-    conservative rounding: ``summarise_outcomes`` values a non-money-out row at
-    ZERO, so the two sells that really happened stop funding the buys they paid
-    for and the run over-consumes the income ledger by their whole value.
-    Collapsing it to SUBMITTED is the opposite lie -- the user is told the
-    position is at target when it is not.
+    conservative rounding: the run's audit row would then describe a symbol whose
+    sells really happened as one that did nothing, and the user reading it cannot
+    tell which two positions are now closed. (The MONEY is not at risk either way
+    -- ``collect_order_fills`` measures every order id the row created, whatever
+    the row's status -- but the report is.) Collapsing it to SUBMITTED is the
+    opposite lie: the user is told the position is at target when it is not.
     """
     if not failed:
         return OUTCOME_SUBMITTED
@@ -895,37 +899,6 @@ def get_open_income_total(account_id: int) -> float:
 # Run audit: portfolio_allocation_run + log_activity + income consumption.
 # ---------------------------------------------------------------------------
 
-#: Outcomes for which an order really is at the broker, so real money is
-#: committed and the income that funded it has to be marked as spent.
-#: OUTCOME_PARTIAL belongs here: a partially filled order has already moved the
-#: position and is still working. OUTCOME_WASHTRADE_LOCKED does NOT: that order
-#: is PENDING at our end, nothing was sent, and it is retried later.
-_MONEY_OUT_STATUSES = frozenset({OUTCOME_SUBMITTED, OUTCOME_PARTIAL})
-
-
-def _committed_quantity(outcome: RowOutcome) -> Optional[float]:
-    """How much of this row really went out, or None when nothing did.
-
-    Two ways money leaves the account, and the second one is the whole reason
-    this is not a set membership test:
-
-    * the order reached the broker (``_MONEY_OUT_STATUSES``) -> the quantity SENT,
-      because the order is live and will fill; and
-    * the row FAILED but the broker had already FILLED part of it -> the filled
-      quantity. A market order cancelled after filling 6 of 10 shares is reported
-      FAILED (correctly -- it did not do what was asked) and those 6 shares are
-      nevertheless bought and paid for. Valuing that row at zero leaves the income
-      that funded them looking unallocated, so the NEXT run spends it again, on
-      top of shares the account already owns. The run is STAMPED either way, so it
-      never appears in ``get_unconsumed_runs()`` and nothing else will ever
-      reconcile it.
-    """
-    if outcome.status in _MONEY_OUT_STATUSES:
-        return float(outcome.quantity)
-    if outcome.filled_quantity:
-        return float(outcome.filled_quantity)
-    return None
-
 #: The one-line activity-log summary of a run. Every outcome the vocabulary has
 #: is named: a line that mentions only "submitted" and "failed" hides a
 #: wash-trade lock completely, and that is an order the user never learns about.
@@ -934,88 +907,215 @@ RUN_ACTIVITY_FMT = (
     "{partial} partially filled, {locked} wash-trade locked, {failed} failed, "
     "{skipped} skipped")
 
+#: What the run really MOVED, appended to the line above. Submitted counts say
+#: how many orders went out; only this says how much money did.
+RUN_FILLED_FMT = "; {buys:.2f} bought / {sells:.2f} sold (filled)"
 
-def summarise_outcomes(plan: AllocationPlan, outcomes: List[RowOutcome]) -> Dict[str, Any]:
-    """What a run ACTUALLY committed, as opposed to what it planned. Pure.
-
-    Only rows whose order reached the broker count towards the money totals; the
-    value uses the quantity that really went in, so a fractional order that fell
-    back to whole shares is worth less than the plan said. The row's own estimate
-    is the fallback when there is no price to multiply by.
-
-    ``order_ids`` is EVERY TradingOrder row this run created, refused ones
-    included -- that is what the column says it holds, and an audit that cannot
-    point at the order the broker rejected cannot explain the failure it reports.
-
-    Note for the reader: these are SUBMITTED values. Replacing them with FILLED
-    values is its own piece of work (the ledger must not mark income as spent for
-    an order that never filled); the split between "what went out" and "what
-    filled" already exists on ``RowOutcome.quantity`` / ``.filled_quantity``.
-    """
-    by_symbol = {row.symbol: row for row in plan.rows}
-    buy_value = 0.0
-    sell_value = 0.0
-    order_ids: List[int] = []
-
-    for outcome in outcomes:
-        for order_id in outcome.order_ids:
-            if order_id not in order_ids:
-                order_ids.append(order_id)
-        quantity = _committed_quantity(outcome)
-        if quantity is None:
-            continue
-        row = by_symbol.get(outcome.symbol)
-        if row is None:
-            continue
-        if row.price:
-            value = float(row.price) * quantity
-        else:
-            # No price to multiply by, so the row's own estimate is all there is
-            # -- pro-rated, because it was struck for the WHOLE row and only part
-            # of the row may have gone out.
-            sent = abs(float(outcome.quantity)) or abs(float(row.delta_quantity))
-            fraction = min(1.0, quantity / sent) if sent else 1.0
-            value = float(row.estimated_value) * fraction
-        if row.is_buy:
-            buy_value += value
-        elif row.is_sell:
-            sell_value += value
-
-    return {
-        "filled_buy_value": buy_value,
-        "filled_sell_value": sell_value,
-        # Never negative: a rebalance funded entirely by its own sells consumes
-        # no income, and a negative would be handed to the ledger as a budget.
-        "net_buy_value": max(0.0, buy_value - sell_value),
-        "order_ids": order_ids,
-    }
+#: Appended when at least one order can still fill. The income was NOT consumed,
+#: and a line that did not say so would leave the user reading "0 failed" while
+#: their deposit still shows as unallocated.
+RUN_UNSETTLED_FMT = ("; {orders} order(s) still working, income not consumed yet "
+                     "- it is re-measured on the next Refresh or allocation run")
 
 
-def _finalise_run(run_id: int, totals: Dict[str, Any]) -> float:
-    """Write the run's totals and spend the ledger, in ONE store transaction.
+def _finalise_run(run_id: int, totals: FilledTotals, order_ids: List[int]) -> float:
+    """Write the run's FILLED totals and spend the ledger, in ONE store transaction.
 
     The net buy value is deliberately NOT passed: the store derives it from the
     totals it is writing, on the row as it re-reads it. That is what makes
     "consumed nothing because the caller handed over a stale zero" unrepresentable.
 
+    ``totals.settled`` decides whether the ledger is spent AT ALL. False means at
+    least one order can still fill, so the money figure is not final: the store
+    records it and leaves ``income_consumed_at`` NULL, keeping the run in
+    ``get_unconsumed_runs()`` for the next reconcile pass.
+
     Returns:
         float: what the ledger actually gave up -- possibly LESS than the net buy
         value, which is not an error (buying power, not the ledger, is the
-        feasibility constraint), and 0.0 when the run row could not be found.
+        feasibility constraint), 0.0 for a deferred run, and 0.0 when the run row
+        could not be found.
     """
     from .portfolio_allocation_store import finalise_allocation_run
 
     try:
         finalised = finalise_allocation_run(
             run_id,
-            filled_buy_value=totals["filled_buy_value"],
-            filled_sell_value=totals["filled_sell_value"],
-            order_ids=totals["order_ids"])
+            filled_buy_value=totals.buy_value,
+            filled_sell_value=totals.sell_value,
+            order_ids=list(order_ids),
+            orders_settled=totals.settled)
     except InstanceNotFound:
         logger.error(f"Allocation run {run_id} vanished before it could be finalised; "
                      f"its income was NOT consumed")
         return 0.0
     return finalised.income_consumed_amount
+
+
+# ---------------------------------------------------------------------------
+# What the run actually filled. The income ledger's only input.
+# ---------------------------------------------------------------------------
+
+def get_unconsumed_runs(account_id: int, limit: int = 20):
+    """Runs whose income was never consumed -- the recovery view. Read-only.
+
+    Re-exported here so the UI and the reconcile path have ONE service-level
+    surface; the query itself belongs to the store.
+    """
+    from .portfolio_allocation_store import get_unconsumed_runs as _store_runs
+    return _store_runs(account_id, limit)
+
+
+def refresh_orders_from_broker(account) -> bool:
+    """``account.refresh_orders(fetch_all=True)``, tolerant of three signatures.
+
+    Mirrors TradeManager.py:1600-1607, which does exactly this immediately after
+    its own submissions -- "important for market orders which fill immediately".
+
+    The signature is INSPECTED rather than the TypeError caught: AlpacaAccount
+    takes ``(heuristic_mapping, fetch_all)`` (:2180), TastyTradeAccount takes
+    ``**kwargs`` (:988), IBKRAccount takes nothing at all (:541). Catching TypeError
+    and retrying bare would also swallow a TypeError raised INSIDE a broker's
+    refresh and then run the whole thing a second time.
+
+    Returns:
+        bool: False when the refresh failed. The caller must then treat its fill
+        measurement as NOT settled -- our rows still say whatever they said before
+        the broker was asked, and consuming income against that is guessing.
+    """
+    try:
+        parameters = inspect.signature(account.refresh_orders).parameters
+        accepts_fetch_all = "fetch_all" in parameters or any(
+            p.kind == p.VAR_KEYWORD for p in parameters.values())
+        if accepts_fetch_all:
+            account.refresh_orders(fetch_all=True)
+        else:
+            account.refresh_orders()
+        return True
+    except Exception as e:
+        logger.error(f"[Account {account.id}] Could not refresh orders after an "
+                     f"allocation submission: {e}", exc_info=True)
+        return False
+
+
+def collect_order_fills(account_id: int, order_ids: List[int]) -> List[OrderFill]:
+    """Read the run's EXECUTION orders back out of the DB as pure fill facts.
+
+    ONLY ``OrderType.MARKET`` rows. A run's ``order_ids`` also carry the protective
+    legs that ``TransactionHelper.adjust_quantity_with_tpsl`` rebuilds around a
+    resized position -- OCO, SELL_LIMIT/BUY_LIMIT and SELL_STOP/BUY_STOP. Those are
+    not trades this run made; they sit unfilled for weeks by design. Counting them
+    would book a stop-loss as a sale, and waiting for them would stall the run's
+    income indefinitely. Every execution order IS a MARKET order: the new order,
+    the partial-close order and the add-to-position order.
+
+    An id with no row emits ``OrderFill(status=None)``, which ``measure_filled_values``
+    treats as still working -- a vanished order row is an inconsistency, and
+    stalling is the only safe reading of it. The query is scoped by ``account_id``
+    as well, so an order that belongs to somebody else reads as absent rather than
+    pricing this run from another account's fill.
+    """
+    if not order_ids:
+        return []
+    wanted = list(dict.fromkeys(int(order_id) for order_id in order_ids))
+    with get_db() as session:
+        rows = session.exec(
+            select(TradingOrder).where(
+                TradingOrder.account_id == account_id,
+                TradingOrder.id.in_(wanted),
+            )
+        ).all()
+        by_id = {row.id: (row.order_type, row.side, row.status,
+                          row.filled_qty, row.open_price) for row in rows}
+
+    fills: List[OrderFill] = []
+    for order_id in wanted:
+        found = by_id.get(order_id)
+        if found is None:
+            logger.error(f"[Account {account_id}] Allocation order {order_id} has no "
+                         f"TradingOrder row; its run cannot be income-consumed until "
+                         f"someone works out what happened to it")
+            fills.append(OrderFill(order_id=order_id))
+            continue
+        order_type, side, status, filled_qty, open_price = found
+        if order_type != OrderType.MARKET:
+            logger.debug(f"[Account {account_id}] Order {order_id} is a {order_type} "
+                         f"protective leg, not an execution order -- not measured")
+            continue
+        fills.append(OrderFill(
+            order_id=order_id, side=side, status=status,
+            filled_quantity=float(filled_qty or 0.0),
+            fill_price=float(open_price) if open_price is not None else None,
+        ))
+    return fills
+
+
+def measure_run_fills(account, order_ids: List[int]) -> FilledTotals:
+    """Ask the broker what really happened, then price it. The ledger's input.
+
+    Refresh once, read our own rows back, measure. No polling and no waiting: the
+    wizard submits MARKET orders during market hours, which is the case TradeManager
+    already relies on this single refresh for. Anything still working comes back
+    ``settled=False`` and is reconciled later -- by the income panel's Refresh or by
+    the next run.
+    """
+    refreshed = refresh_orders_from_broker(account)
+    totals = measure_filled_values(collect_order_fills(account.id, order_ids))
+    if not refreshed:
+        # Our rows say whatever they said BEFORE the broker was asked. Whatever
+        # they show, it is not evidence, so nothing may be consumed against it.
+        totals.settled = False
+    return totals
+
+
+def reconcile_unconsumed_runs(account) -> List[int]:
+    """Finalise every past run whose orders have settled since. The recovery drain.
+
+    ``get_unconsumed_runs`` lists runs with a NULL ``income_consumed_at``: ones that
+    died mid-submit, and ones deliberately deferred because an order could still
+    fill. This re-measures each and consumes the ledger for those now settled. Runs
+    still working are left exactly where they are.
+
+    Called from TWO places, both of them things the user just did: the top of
+    ``run_allocation`` (after the market gate, before anything is written), and
+    ``sync_income_events`` -- i.e. the income panel's Refresh and the allocation
+    page's load. Deferral is the common case, so waiting for the next allocation run
+    would leave a quarterly rebalancer's income open for a quarter. It is NOT a job
+    and NOT a timer: one function, two existing entry points, at most one extra
+    ``refresh_orders`` call, and only when there is something to reconcile.
+
+    Returns:
+        List[int]: the run ids that were consumed on this pass, oldest first.
+    """
+    from .portfolio_allocation_store import finalise_allocation_run
+
+    pending = list(reversed(get_unconsumed_runs(account.id)))
+    if not pending:
+        return []
+
+    logger.info(f"[Account {account.id}] Reconciling {len(pending)} allocation run(s) "
+                f"that never consumed income")
+    if not refresh_orders_from_broker(account):
+        logger.warning(f"[Account {account.id}] Skipping reconciliation: the order "
+                       f"refresh failed, so every fill figure would be stale")
+        return []
+
+    consumed: List[int] = []
+    for run in pending:
+        totals = measure_filled_values(collect_order_fills(account.id, run.order_ids or []))
+        try:
+            finalise_allocation_run(
+                run.id,
+                filled_buy_value=totals.buy_value,
+                filled_sell_value=totals.sell_value,
+                order_ids=list(run.order_ids or []),
+                orders_settled=totals.settled)
+        except InstanceNotFound:
+            logger.error(f"Allocation run {run.id} vanished during reconciliation")
+            continue
+        if totals.settled:
+            consumed.append(run.id)
+    return consumed
 
 
 def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionState],
@@ -1024,16 +1124,29 @@ def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionSta
     """Submit a reviewed plan and record it. The single Submit entry point.
 
     Order of operations:
-      0. GATE on market hours: if the market is not confirmed open, return
-         ``blocked=True`` having written nothing at all. This is the FIRST statement
-         in the function, before the store import and before any DB write.
-      1. INSERT the ``portfolio_allocation_run`` row with the plan snapshot and
-         zero submitted values, so its id can be stamped into every order comment.
-      2. Submit (sells first, buys descending, per-row outcomes).
-      3. FINALISE: write what was actually submitted AND consume the income
-         ledger by the resulting net buy value -- one call, one transaction,
-         idempotent on the run id.
-      4. log_activity.
+      0. GATE on market hours: if the market is not CONFIRMED open, return
+         ``blocked=True`` having written nothing at all -- no run row, no stamped
+         order comments and, above all, no income consumed. This is the FIRST
+         statement in the function, above the reconcile in step 1: a blocked
+         attempt must not move an earlier run's money either.
+      1. RECONCILE any earlier run whose income was left unconsumed, so this run's
+         ledger reflects reality before it spends from it.
+      2. INSERT the ``portfolio_allocation_run`` row with the plan snapshot and
+         zero values, so its id can be stamped into every order comment.
+      3. Submit (sells first, buys descending, per-row outcomes).
+      4. REFRESH from the broker and MEASURE what actually filled.
+      5. FINALISE: write the FILLED totals and consume the ledger by the resulting
+         net buy value -- one call, one transaction, idempotent on the run id. If
+         any order can still fill, the totals are written but the ledger is NOT
+         spent, and the run stays in ``get_unconsumed_runs()`` for step 1 of the
+         next run or the income panel's next Refresh. That is the COMMON outcome,
+         not an error.
+      6. log_activity.
+
+    Money never comes from the plan. ``row.price`` is a quote taken before
+    submission and ``outcome.quantity`` is what was SENT; the ledger is spent on
+    ``filled_qty * open_price``, which is the only number that describes cash that
+    left the account.
 
     Partial failure is normal and is reported per row; nothing is rolled back,
     and a run that submitted NOTHING is still finalised -- an unfinalised run
@@ -1042,6 +1155,13 @@ def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionSta
 
     ``allow_fractional`` is taken from the plan and from nowhere else: it is the
     setting the dry run the user approved was solved with.
+
+    Returns:
+        Dict[str, Any]: ``run_id``, ``outcomes``, ``order_ids``, ``income_consumed``,
+        ``filled_buy_value``, ``filled_sell_value``, ``settled``,
+        ``working_order_ids``, ``blocked``, ``blocked_reason``. When blocked the
+        money keys are 0.0, ``settled`` is True (nothing was submitted, so there is
+        nothing to wait for), ``working_order_ids`` is empty and ``run_id`` is None.
     """
     # Market-hours gate, FIRST, before anything is written. Disabling the Submit
     # button is a courtesy; this is the enforcement -- the wizard can sit open across
@@ -1068,6 +1188,12 @@ def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionSta
             "blocked_reason": f"{reason}. Nothing was submitted.",
         }
 
+    # Drain any earlier run whose income is still unconsumed BEFORE this one
+    # records anything. Deferral is the ordinary outcome (decision D3), so without
+    # this the previous rebalance's income would still look unallocated and this
+    # run would spend it a second time.
+    reconcile_unconsumed_runs(account)
+
     from .portfolio_allocation_store import record_allocation_run
 
     run = record_allocation_run(
@@ -1090,12 +1216,27 @@ def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionSta
         # nothing rather than leaving a phantom in the recovery queue forever.
         logger.error(f"Allocation run {run_id} was refused before any order was sent",
                      exc_info=True)
-        _finalise_run(run_id, {"filled_buy_value": 0.0, "filled_sell_value": 0.0,
-                               "order_ids": []})
+        _finalise_run(run_id, FilledTotals(), [])
         raise
 
-    totals = summarise_outcomes(plan, outcomes)
-    income_consumed = _finalise_run(run_id, totals)
+    # EVERY outcome's ids, not just the submitted ones. A hard submit failure leaves
+    # the row at OrderStatus.ERROR (AccountInterface.py:148) -- terminal, worth 0,
+    # settled, so it costs nothing to include. What it buys is the case that matters:
+    # submit_order returned None on a response timeout while the broker actually took
+    # the order. The refresh finds the fill and the ledger charges for it.
+    order_ids: List[int] = []
+    for outcome in outcomes:
+        for order_id in outcome.order_ids:
+            if order_id not in order_ids:
+                order_ids.append(order_id)
+
+    totals = measure_run_fills(account, order_ids)
+    if totals.unmeasurable_order_ids:
+        logger.error(f"Allocation run {run_id}: order(s) "
+                     f"{totals.unmeasurable_order_ids} report a fill with no usable "
+                     f"price or side; their value is NOT being guessed at, so this "
+                     f"run's income stays unconsumed until they can be read")
+    income_consumed = _finalise_run(run_id, totals, order_ids)
 
     counts = {status: sum(1 for o in outcomes if o.status == status)
               for status in (OUTCOME_SUBMITTED, OUTCOME_PARTIAL, OUTCOME_WASHTRADE_LOCKED,
@@ -1114,23 +1255,27 @@ def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionSta
         # Nothing at all got out. WARNING would read as "mostly fine".
         severity = ActivityLogSeverity.FAILURE
 
+    description = RUN_ACTIVITY_FMT.format(
+        run_id=run_id,
+        scope=f"{mode} / {scope_label}" if scope_label else mode,
+        submitted=counts[OUTCOME_SUBMITTED],
+        partial=counts[OUTCOME_PARTIAL],
+        locked=counts[OUTCOME_WASHTRADE_LOCKED],
+        failed=failed,
+        skipped=counts[OUTCOME_SKIPPED])
+    description += RUN_FILLED_FMT.format(buys=totals.buy_value, sells=totals.sell_value)
+    if not totals.settled:
+        description += RUN_UNSETTLED_FMT.format(orders=len(totals.working_order_ids))
+
     log_activity(
         severity,
         ActivityLogType.ORDER_SUBMITTED,
-        RUN_ACTIVITY_FMT.format(
-            run_id=run_id,
-            scope=f"{mode} / {scope_label}" if scope_label else mode,
-            submitted=counts[OUTCOME_SUBMITTED],
-            partial=counts[OUTCOME_PARTIAL],
-            locked=counts[OUTCOME_WASHTRADE_LOCKED],
-            failed=failed,
-            skipped=counts[OUTCOME_SKIPPED]),
+        description,
         data={
             "run_id": run_id,
             "mode": mode,
             "scope_label": scope_label,
-            "filled_buy_value": totals["filled_buy_value"],
-            "filled_sell_value": totals["filled_sell_value"],
+            "filled": totals.to_dict(),
             "income_consumed": income_consumed,
             "rows": [o.to_dict() for o in outcomes],
         },
@@ -1140,15 +1285,12 @@ def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionSta
     return {
         "run_id": run_id,
         "outcomes": outcomes,
-        "order_ids": totals["order_ids"],
+        "order_ids": order_ids,
         "income_consumed": income_consumed,
-        # The KEY NAMES are already final so no caller has to change twice; the
-        # MEASUREMENT behind them is still the submitted value, and chunk `ledger`
-        # replaces it with the actually-filled value in its rewrite.
-        "filled_buy_value": totals["filled_buy_value"],
-        "filled_sell_value": totals["filled_sell_value"],
-        "settled": True,          # ledger measures this from the fills
-        "working_order_ids": [],  # ledger fills this from the fills
+        "filled_buy_value": totals.buy_value,
+        "filled_sell_value": totals.sell_value,
+        "settled": totals.settled,
+        "working_order_ids": list(totals.working_order_ids),
         "blocked": False,
         "blocked_reason": None,
     }

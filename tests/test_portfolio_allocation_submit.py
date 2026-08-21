@@ -108,6 +108,16 @@ class FakeAccount:
             is_open=True, source=MARKET_HOURS_SOURCE_BROKER, as_of=FROZEN_NOW,
             open_at=None, close_at=MARKET_CLOSE, next_open=None, next_close=MARKET_CLOSE)
         self.market_hours_error = None
+        #: What the BROKER reports on the next ``refresh_orders()``, by symbol:
+        #:     symbol -> (OrderStatus, filled_qty, open_price)
+        #: A ``filled_qty`` of None means "that order's OWN quantity", which is how
+        #: a close of several transactions fills each leg at its own size. A symbol
+        #: with no entry is left exactly as ``submit_order`` left the DB row -- which
+        #: is how "still working at the broker" is expressed, and it is the ordinary
+        #: outcome, not an edge case.
+        self.fills = {}
+        self.refresh_calls = []
+        self.refresh_raises = None   # set to an Exception to simulate an outage
 
     def get_market_hours(self, *, now=None):
         """Mirrors ReadOnlyAccountInterface.get_market_hours' signature exactly."""
@@ -224,14 +234,62 @@ class FakeAccount:
         return True
 
     def close_transaction(self, transaction_id):
+        """Persist a real MARKET close order, as the live path does, and return its id.
+
+        A hardcoded ``close_order_id`` would point at no row at all, and the run's
+        fill measurement reads its orders back out of the DB: the SELL side of a
+        close would be invisible, so ``net_buy_value`` would come out too high and
+        the run would over-consume the income ledger.
+        """
         self.events.append(('close', transaction_id))
         if transaction_id in self.close_raises:
             raise self.close_raises[transaction_id]
         if transaction_id in self.close_failures:
             return {'success': False, 'message': self.close_failures[transaction_id]}
         self.closed.append(transaction_id)
+        txn = get_instance(Transaction, transaction_id)
+        close_order_id = add_instance(TradingOrder(
+            account_id=self.id, symbol=txn.symbol, quantity=abs(txn.quantity or 0.0),
+            side=OrderDirection.SELL, order_type=OrderType.MARKET, good_for='day',
+            status=OrderStatus.NEW, open_type=OrderOpenType.MANUAL,
+            transaction_id=transaction_id, comment="closing order",
+        ))
         return {'success': True, 'message': 'closed', 'canceled_count': 0,
-                'deleted_count': 0, 'close_order_id': 999}
+                'deleted_count': 0, 'close_order_id': close_order_id}
+
+    def _write_order(self, order_id, **fields):
+        """Write broker truth onto our DB row, the way a real refresh does."""
+        row = get_instance(TradingOrder, order_id)
+        if row is None:
+            return
+        for name, value in fields.items():
+            setattr(row, name, value)
+        update_instance(row)
+
+    def refresh_orders(self, heuristic_mapping=False, fetch_all=False):
+        """Apply ``self.fills`` to this account's DB rows, keyed by symbol.
+
+        Mirrors what ``AlpacaAccount.refresh_orders`` does: it writes the broker's
+        status, ``filled_qty`` and ``filled_avg_price`` onto the persisted row.
+        """
+        self.refresh_calls.append({'heuristic_mapping': heuristic_mapping,
+                                   'fetch_all': fetch_all})
+        if self.refresh_raises is not None:
+            raise self.refresh_raises
+        with get_db() as session:
+            rows = session.exec(select(TradingOrder).where(
+                TradingOrder.account_id == self.id)).all()
+            by_id = {row.id: (row.symbol, row.quantity) for row in rows}
+        for order_id, (symbol, quantity) in by_id.items():
+            reported = self.fills.get(symbol)
+            if reported is None:
+                continue
+            status, filled_qty, open_price = reported
+            self._write_order(
+                order_id, status=status,
+                filled_qty=float(quantity or 0.0) if filled_qty is None else filled_qty,
+                open_price=open_price)
+        return True
 
 
 class FakeReadOnlyAccount:
@@ -956,8 +1014,8 @@ def test_submit_plan_trim_across_two_transactions_closes_the_one_it_exhausts():
 
 def test_submit_plan_adjust_reports_partial_when_one_leg_of_the_split_fails():
     """I3. Half the trim really went out. Reporting the row FAILED values those
-    sells at ZERO in ``summarise_outcomes``, and the run then over-consumes the
-    income ledger by the whole amount they raised."""
+    sells at ZERO in the run's fill measurement, and the run then over-consumes
+    the income ledger by the whole amount they raised."""
     account = FakeAccount(account_id=96)
     account.positions = [FakePosition("AAPL", 30.0, 3000.0, 3200.0)]
     first = make_open_transaction(96, "AAPL", 20.0)
@@ -1022,8 +1080,8 @@ def test_submit_plan_close_keeps_going_after_one_transaction_refuses():
     other two open with the run reporting a single failure and nothing else.
 
     I3: 2 of the 3 closes really went to the broker, so the row is PARTIAL, not
-    FAILED. ``summarise_outcomes`` values a non-money-out row at ZERO, so calling
-    this FAILED tells the ledger those two sells raised nothing and the run
+    FAILED. A row whose order ids are dropped is valued at ZERO, so calling this
+    FAILED tells the ledger those two sells raised nothing and the run
     over-consumes the income they actually funded."""
     account = FakeAccount(account_id=59)
     a = make_open_transaction(59, "MSFT", 2.0)
@@ -1062,8 +1120,11 @@ def test_submit_plan_close_records_the_order_the_broker_was_given():
 
     outcomes = svc.submit_plan(account, plan, current, run_tag="100", allow_fractional=False)
 
-    assert outcomes[0].order_ids == [999]   # FakeAccount's close_order_id
-    assert svc.summarise_outcomes(plan, outcomes)["order_ids"] == [999]
+    # The id of the MARKET close order the fake persisted, and it must be a REAL
+    # row: the run reads its orders back out of the DB to measure what filled.
+    close_order_id = outcomes[0].order_ids[0]
+    assert get_instance(TradingOrder, close_order_id).symbol == "MSFT"
+    assert get_instance(TradingOrder, close_order_id).order_type == OrderType.MARKET
 
 
 def test_submit_plan_close_keeps_going_after_one_transaction_explodes():
@@ -1731,148 +1792,6 @@ def activity(monkeypatch):
     return calls
 
 
-def test_summarise_outcomes_counts_only_the_rows_that_were_submitted():
-    row_ok = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
-    row_bad = make_row("NVDA", OrderDirection.BUY, 4.0, 3600.0, 3600.0, price=900.0)
-    row_sell = make_row("MSFT", OrderDirection.SELL, -5.0, 2000.0, 0.0, price=400.0)
-    plan = AllocationPlan(rows=[row_ok, row_bad, row_sell], available_buying_power=10_000.0)
-
-    outcomes = [
-        svc.RowOutcome(symbol="AAPL", action=ACTION_NEW, status=svc.OUTCOME_SUBMITTED,
-                       quantity=10.0, order_ids=[101]),
-        svc.RowOutcome(symbol="NVDA", action=ACTION_NEW, status=svc.OUTCOME_FAILED,
-                       quantity=4.0, order_ids=[102]),
-        svc.RowOutcome(symbol="MSFT", action=ACTION_CLOSE, status=svc.OUTCOME_SUBMITTED,
-                       quantity=5.0, transaction_ids=[7]),
-    ]
-
-    totals = svc.summarise_outcomes(plan, outcomes)
-
-    assert totals["filled_buy_value"] == pytest.approx(1600.0)
-    assert totals["filled_sell_value"] == pytest.approx(2000.0)
-    assert totals["net_buy_value"] == pytest.approx(0.0)
-
-
-def test_summarise_outcomes_uses_the_quantity_that_actually_went_in():
-    # Fractional 2.5 was rejected and 2.0 whole shares filled instead.
-    row = make_row("NVDA", OrderDirection.BUY, 2.5, 2250.0, 2250.0, price=900.0)
-    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
-    outcomes = [svc.RowOutcome(symbol="NVDA", action=ACTION_NEW, status=svc.OUTCOME_SUBMITTED,
-                               quantity=2.0, path="whole", order_ids=[9])]
-
-    totals = svc.summarise_outcomes(plan, outcomes)
-
-    assert totals["filled_buy_value"] == pytest.approx(1800.0)
-
-
-def test_summarise_outcomes_counts_a_partial_fill_as_money_that_went_out():
-    """A PARTIALLY_FILLED order is live at the broker and has already moved the
-    position. Counting it as zero would leave the income that funded it showing
-    as unallocated, for the NEXT run to spend on top of shares already bought."""
-    row = make_row("NVDA", OrderDirection.BUY, 4.0, 3600.0, 3600.0, price=900.0)
-    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
-    outcomes = [svc.RowOutcome(symbol="NVDA", action=ACTION_NEW, status=svc.OUTCOME_PARTIAL,
-                               quantity=4.0, filled_quantity=1.0, order_ids=[9])]
-
-    assert svc.summarise_outcomes(plan, outcomes)["filled_buy_value"] == pytest.approx(3600.0)
-
-
-def test_summarise_outcomes_counts_the_shares_a_cancelled_order_had_already_filled():
-    """C3. The broker filled 6 of the 10 and then returned the order CANCELED --
-    the exact shape ``_submit_new_order`` already models. Those 6 shares are
-    REAL: the cash left the account. Valuing the row at zero because its status
-    is FAILED leaves the income that funded them showing as unallocated, for the
-    NEXT run to spend on top of shares that are already bought."""
-    row = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
-    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
-    outcomes = [svc.RowOutcome(symbol="AAPL", action=ACTION_NEW, status=svc.OUTCOME_FAILED,
-                               quantity=10.0, filled_quantity=6.0, order_ids=[9])]
-
-    # 6 shares at 160, not 10 at 160 and not zero.
-    assert svc.summarise_outcomes(plan, outcomes)["filled_buy_value"] == pytest.approx(960.0)
-
-
-def test_summarise_outcomes_still_values_a_failure_that_filled_nothing_at_zero():
-    row = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
-    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
-    outcomes = [svc.RowOutcome(symbol="AAPL", action=ACTION_NEW, status=svc.OUTCOME_FAILED,
-                               quantity=10.0, filled_quantity=0.0, order_ids=[9])]
-
-    assert svc.summarise_outcomes(plan, outcomes)["filled_buy_value"] == pytest.approx(0.0)
-
-
-def test_summarise_outcomes_ignores_a_washtrade_locked_row():
-    """The order is PENDING at our end and nothing has been sent, so no money has
-    moved and no income may be consumed against it."""
-    row = make_row("NVDA", OrderDirection.BUY, 4.0, 3600.0, 3600.0, price=900.0)
-    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
-    outcomes = [svc.RowOutcome(symbol="NVDA", action=ACTION_NEW,
-                               status=svc.OUTCOME_WASHTRADE_LOCKED, quantity=4.0,
-                               order_ids=[9])]
-
-    assert svc.summarise_outcomes(plan, outcomes)["filled_buy_value"] == pytest.approx(0.0)
-
-
-def test_summarise_outcomes_ignores_a_skipped_row():
-    row = make_row("NVDA", OrderDirection.BUY, 4.0, 3600.0, 3600.0, price=900.0)
-    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
-    outcomes = [svc.RowOutcome(symbol="NVDA", action=ACTION_SKIP, status=svc.OUTCOME_SKIPPED)]
-
-    totals = svc.summarise_outcomes(plan, outcomes)
-    assert totals["filled_buy_value"] == pytest.approx(0.0)
-    assert totals["order_ids"] == []
-
-
-def test_summarise_outcomes_reports_every_order_row_the_run_created():
-    """``portfolio_allocation_run.order_ids`` is "TradingOrder ids created by this
-    run", and the row the broker REFUSED is one of them -- it is persisted, marked
-    ERROR, and carries the reason. Recording only the accepted ones leaves the
-    audit unable to point at the failure it is reporting."""
-    row_ok = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
-    row_bad = make_row("NVDA", OrderDirection.BUY, 4.0, 3600.0, 3600.0, price=900.0)
-    plan = AllocationPlan(rows=[row_ok, row_bad], available_buying_power=10_000.0)
-    outcomes = [
-        svc.RowOutcome(symbol="AAPL", action=ACTION_NEW, status=svc.OUTCOME_SUBMITTED,
-                       quantity=10.0, order_ids=[101]),
-        # The fractional fallback: one refused order and one accepted one.
-        svc.RowOutcome(symbol="NVDA", action=ACTION_NEW, status=svc.OUTCOME_FAILED,
-                       quantity=4.0, order_ids=[102, 103]),
-    ]
-
-    assert svc.summarise_outcomes(plan, outcomes)["order_ids"] == [101, 102, 103]
-
-
-def test_summarise_outcomes_falls_back_to_the_row_estimate_when_there_is_no_price():
-    row = AllocationRow(symbol="AAPL", price=None, delta_quantity=10.0,
-                        side=OrderDirection.BUY, estimated_value=1600.0)
-    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
-    outcomes = [svc.RowOutcome(symbol="AAPL", action=ACTION_NEW,
-                               status=svc.OUTCOME_SUBMITTED, quantity=10.0)]
-
-    assert svc.summarise_outcomes(plan, outcomes)["filled_buy_value"] == pytest.approx(1600.0)
-
-
-def test_summarise_outcomes_never_reports_a_negative_net_buy_value():
-    """A rebalance funded entirely by its own sells consumes no income -- and a
-    negative net would be handed to the ledger as a budget."""
-    row = make_row("MSFT", OrderDirection.SELL, -5.0, 2000.0, 0.0, price=400.0)
-    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
-    outcomes = [svc.RowOutcome(symbol="MSFT", action=ACTION_CLOSE,
-                               status=svc.OUTCOME_SUBMITTED, quantity=5.0)]
-
-    totals = svc.summarise_outcomes(plan, outcomes)
-    assert totals["filled_sell_value"] == pytest.approx(2000.0)
-    assert totals["net_buy_value"] == pytest.approx(0.0)
-
-
-def test_summarise_outcomes_ignores_an_outcome_for_a_symbol_the_plan_never_had():
-    plan = AllocationPlan(rows=[], available_buying_power=10_000.0)
-    outcomes = [svc.RowOutcome(symbol="GHOST", action=ACTION_NEW,
-                               status=svc.OUTCOME_SUBMITTED, quantity=10.0)]
-
-    assert svc.summarise_outcomes(plan, outcomes)["filled_buy_value"] == pytest.approx(0.0)
-
-
 # -- run_allocation ---------------------------------------------------------
 
 
@@ -1887,6 +1806,7 @@ def _buy_plan(symbol="AAPL", quantity=10.0, price=160.0, **plan_kwargs):
 def test_run_allocation_persists_a_run_row_carrying_the_plan_and_the_order_ids(activity):
     account = FakeAccount(account_id=31)
     account.positions = []
+    account.fills = {"AAPL": (OrderStatus.FILLED, 10.0, 161.0)}
     plan = _buy_plan(base_notional=15_000.0, total_buy_value=1600.0)
 
     result = svc.run_allocation(account, plan, {}, make_base(),
@@ -1897,7 +1817,8 @@ def test_run_allocation_persists_a_run_row_carrying_the_plan_and_the_order_ids(a
     assert run.account_id == 31
     assert run.mode == ALLOCATION_MODE_REBALANCE
     assert run.base_notional == pytest.approx(15_000.0)
-    assert run.filled_buy_value == pytest.approx(1600.0)
+    # 10 @ 161 FILLED -- the FILL price, not the plan's 160 quote.
+    assert run.filled_buy_value == pytest.approx(1610.0)
     assert run.order_ids == result["outcomes"][0].order_ids
     assert run.plan_json["rows"][0]["symbol"] == "AAPL"
 
@@ -1926,10 +1847,11 @@ def test_run_allocation_stamps_the_run_id_into_every_order_comment(activity):
     assert "closing" not in comment.lower()
 
 
-def test_run_allocation_partial_failure_records_only_what_was_submitted(activity):
+def test_run_allocation_partial_failure_records_only_what_filled(activity):
     account = FakeAccount(account_id=33)
     account.positions = []
     account.reject_quantities = {4.0}
+    account.fills = {"AAPL": (OrderStatus.FILLED, 10.0, 160.0)}
     ok = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
     ok.target_quantity = 10.0
     bad = make_row("NVDA", OrderDirection.BUY, 4.0, 3600.0, 3600.0, price=900.0)
@@ -1964,9 +1886,10 @@ def test_run_allocation_finalises_a_run_in_which_every_row_failed(activity):
     assert get_unconsumed_runs(48) == []
 
 
-def test_run_allocation_consumes_income_up_to_the_net_buy_value(activity):
+def test_run_allocation_consumes_income_up_to_the_filled_net_buy_value(activity):
     account = FakeAccount(account_id=34)
     account.positions = []
+    account.fills = {"AAPL": (OrderStatus.FILLED, 10.0, 160.0)}
     add_instance(PortfolioIncomeEvent(account_id=34, external_id="dep-1",
                                       event_date=date(2026, 5, 1),
                                       event_type=CASH_TRANSFER_DEPOSIT, amount=5_000.0))
@@ -1983,6 +1906,7 @@ def test_run_allocation_reports_a_ledger_shortfall_without_calling_it_an_error(a
     more than the income it has, and the ledger simply gives up everything it has."""
     account = FakeAccount(account_id=49)
     account.positions = []
+    account.fills = {"AAPL": (OrderStatus.FILLED, 10.0, 160.0)}
     add_instance(PortfolioIncomeEvent(account_id=49, external_id="dep-1",
                                       event_date=date(2026, 5, 1),
                                       event_type=CASH_TRANSFER_DEPOSIT, amount=500.0))
@@ -1998,6 +1922,9 @@ def test_run_allocation_reports_a_ledger_shortfall_without_calling_it_an_error(a
 def test_run_allocation_of_a_rebalance_funded_by_its_own_sells_consumes_no_income(activity):
     account = FakeAccount(account_id=50)
     account.positions = []
+    account.fills = {"AAPL": (OrderStatus.FILLED, 10.0, 160.0),
+                     # None -> each MSFT order fills at its OWN quantity.
+                     "MSFT": (OrderStatus.FILLED, None, 400.0)}
     add_instance(PortfolioIncomeEvent(account_id=50, external_id="dep-1",
                                       event_date=date(2026, 5, 1),
                                       event_type=CASH_TRANSFER_DEPOSIT, amount=5_000.0))
@@ -2021,6 +1948,7 @@ def test_run_allocation_of_a_rebalance_funded_by_its_own_sells_consumes_no_incom
 def test_run_allocation_logs_the_activity_against_the_account(activity):
     account = FakeAccount(account_id=51)
     account.positions = []
+    account.fills = {"AAPL": (OrderStatus.FILLED, 10.0, 160.0)}
     add_instance(PortfolioIncomeEvent(account_id=51, external_id="dep-1",
                                       event_date=date(2026, 5, 1),
                                       event_type=CASH_TRANSFER_DEPOSIT, amount=5_000.0))
@@ -2063,6 +1991,7 @@ def test_run_allocation_spends_the_income_that_funded_a_cancelled_partial_fill(a
     account.positions = []
     account.partial_fills = {"AAPL": 6.0}
     account.terminal_statuses = {"AAPL": OrderStatus.CANCELED}
+    account.fills = {"AAPL": (OrderStatus.CANCELED, 6.0, 160.0)}
     add_instance(PortfolioIncomeEvent(account_id=103, external_id="dep-1",
                                       event_date=date(2026, 5, 1),
                                       event_type=CASH_TRANSFER_DEPOSIT, amount=5_000.0))
@@ -2109,6 +2038,8 @@ def test_run_allocation_counts_the_sells_a_partly_successful_close_really_made(a
     consumes the income ledger for money the sells had already raised."""
     account = FakeAccount(account_id=109)
     account.positions = [FakePosition("MSFT", 5.0, 1800.0, 2000.0)]
+    account.fills = {"AAPL": (OrderStatus.FILLED, 10.0, 160.0),
+                     "MSFT": (OrderStatus.FILLED, None, 400.0)}
     a = make_open_transaction(109, "MSFT", 2.0)
     b = make_open_transaction(109, "MSFT", 2.0)
     c = make_open_transaction(109, "MSFT", 1.0)
@@ -2499,6 +2430,7 @@ def test_a_blocked_run_returns_every_key_an_unblocked_one_does():
 def test_run_allocation_with_an_open_market_is_not_blocked():
     account = FakeAccount(account_id=58)
     account.positions = []
+    account.fills = {"AAPL": (OrderStatus.FILLED, 1.0, 160.0)}
     plan = AllocationPlan(rows=[make_row("AAPL", OrderDirection.BUY, 1.0, 160.0, 160.0,
                                          price=160.0)],
                           available_buying_power=10_000.0)
@@ -2507,7 +2439,10 @@ def test_run_allocation_with_an_open_market_is_not_blocked():
                                 mode=ALLOCATION_MODE_REBALANCE)
 
     assert result["blocked"] is False
+    assert result["blocked_reason"] is None
     assert result["run_id"] is not None
+    assert result["settled"] is True
+    assert result["filled_buy_value"] == pytest.approx(160.0)
     assert [s[0] for s in account.submitted] == ["AAPL"]
 
 
@@ -2541,3 +2476,438 @@ def test_the_two_unknown_market_hours_causes_are_distinguishable_in_the_log(monk
     assert svc.fetch_market_hours(silent) is None
     assert len(warnings) == 1, warnings
     assert "5302" in warnings[0] and "seam" not in warnings[0]
+
+
+# ---------------------------------------------------------------------------
+# The income ledger consumes FILLED value, never submitted value
+# ---------------------------------------------------------------------------
+
+def test_the_ledger_consumes_only_the_order_that_actually_filled(activity):
+    """THE regression test. Two orders go out and the broker takes both; one fills,
+    the other comes back REJECTED. Priced at plan value (the old behaviour) this
+    consumes 1600 + 3600 = 5200 of a 6000 deposit. Priced at FILLED value it
+    consumes 1600, and the 3600 that was never spent is still there to spend."""
+    account = FakeAccount(account_id=40)
+    account.positions = []
+    account.fills = {
+        "AAPL": (OrderStatus.FILLED, 10.0, 160.0),
+        "NVDA": (OrderStatus.REJECTED, 0.0, None),
+    }
+    add_instance(PortfolioIncomeEvent(account_id=40, external_id="dep-1",
+                                      event_date=date(2026, 8, 1),
+                                      event_type=CASH_TRANSFER_DEPOSIT, amount=6_000.0))
+    good = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
+    good.target_quantity = 10.0
+    doomed = make_row("NVDA", OrderDirection.BUY, 4.0, 3600.0, 3600.0, price=900.0)
+    doomed.target_quantity = 4.0
+    plan = AllocationPlan(rows=[good, doomed], available_buying_power=10_000.0)
+
+    result = svc.run_allocation(account, plan, {}, make_base(),
+                                mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    assert result["income_consumed"] == pytest.approx(1600.0)
+    assert svc.get_open_income_total(40) == pytest.approx(4_400.0)
+    run = the_run()
+    assert run.filled_buy_value == pytest.approx(1600.0)
+    assert run.is_income_consumed is True
+
+
+def test_a_partial_fill_consumes_only_the_filled_portion_and_defers_the_stamp(activity):
+    account = FakeAccount(account_id=41)
+    account.positions = []
+    account.fills = {"AAPL": (OrderStatus.PARTIALLY_FILLED, 4.0, 160.0)}
+    add_instance(PortfolioIncomeEvent(account_id=41, external_id="dep-1",
+                                      event_date=date(2026, 8, 1),
+                                      event_type=CASH_TRANSFER_DEPOSIT, amount=6_000.0))
+    row = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
+    row.target_quantity = 10.0
+    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
+
+    result = svc.run_allocation(account, plan, {}, make_base(),
+                                mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    # The 640 that filled is recorded, but the order can still fill more, so the
+    # ledger is untouched and the run waits in the recovery view.
+    run = the_run()
+    assert run.filled_buy_value == pytest.approx(640.0)
+    assert run.is_income_consumed is False
+    assert result["income_consumed"] == 0.0
+    assert result["settled"] is False
+    assert result["working_order_ids"] == run.order_ids
+    assert svc.get_open_income_total(41) == pytest.approx(6_000.0)
+    assert [r.id for r in svc.get_unconsumed_runs(41)] == [run.id]
+
+
+def test_an_order_still_working_at_the_broker_leaves_the_run_recoverable(activity):
+    account = FakeAccount(account_id=42)
+    account.positions = []
+    account.fills = {}   # the broker says nothing -> the row stays as submitted
+    row = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
+    row.target_quantity = 10.0
+    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
+
+    result = svc.run_allocation(account, plan, {}, make_base(),
+                                mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    assert result["settled"] is False
+    assert result["income_consumed"] == 0.0
+    assert [r.id for r in svc.get_unconsumed_runs(42)] == [result["run_id"]]
+
+
+def test_reconcile_unconsumed_runs_finalises_a_run_once_its_orders_settle(activity):
+    """The recovery drain. Yesterday's run left an order working; today it filled."""
+    account = FakeAccount(account_id=43)
+    account.positions = []
+    add_instance(PortfolioIncomeEvent(account_id=43, external_id="dep-1",
+                                      event_date=date(2026, 8, 1),
+                                      event_type=CASH_TRANSFER_DEPOSIT, amount=6_000.0))
+    row = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
+    row.target_quantity = 10.0
+    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
+    first = svc.run_allocation(account, plan, {}, make_base(),
+                               mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+    assert svc.get_open_income_total(43) == pytest.approx(6_000.0)
+
+    account.fills = {"AAPL": (OrderStatus.FILLED, 10.0, 158.0)}
+    reconciled = svc.reconcile_unconsumed_runs(account)
+
+    assert reconciled == [first["run_id"]]
+    assert svc.get_open_income_total(43) == pytest.approx(6_000.0 - 1580.0)
+    assert svc.get_unconsumed_runs(43) == []
+
+
+def test_reconcile_leaves_a_run_alone_while_its_orders_are_still_working(activity):
+    account = FakeAccount(account_id=44)
+    account.positions = []
+    row = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
+    row.target_quantity = 10.0
+    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
+    first = svc.run_allocation(account, plan, {}, make_base(),
+                               mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    assert svc.reconcile_unconsumed_runs(account) == []
+    assert [r.id for r in svc.get_unconsumed_runs(44)] == [first["run_id"]]
+
+
+def test_reconcile_is_a_no_op_and_asks_the_broker_nothing_when_nothing_is_pending():
+    """It runs at the top of EVERY allocation run and on every income refresh, so
+    the empty case must not cost a broker round trip."""
+    account = FakeAccount(account_id=45)
+
+    assert svc.reconcile_unconsumed_runs(account) == []
+    assert account.refresh_calls == []
+
+
+def test_a_protective_leg_is_neither_a_fill_nor_a_reason_to_wait():
+    """adjust_quantity_with_tpsl returns its rebuilt TP/SL legs in orders_created
+    (TransactionHelper.py:771/787/809). A SELL_STOP sitting unfilled for weeks must
+    not count as a sale, and must not stall the run's income forever."""
+    account = FakeAccount(account_id=46)
+    account.positions = []
+    market_id = add_instance(TradingOrder(
+        account_id=46, symbol="AAPL", quantity=10.0, side=OrderDirection.BUY,
+        order_type=OrderType.MARKET, good_for='day', status=OrderStatus.FILLED,
+        open_type=OrderOpenType.MANUAL, filled_qty=10.0, open_price=160.0))
+    stop_id = add_instance(TradingOrder(
+        account_id=46, symbol="AAPL", quantity=10.0, side=OrderDirection.SELL,
+        order_type=OrderType.SELL_STOP, good_for='gtc', status=OrderStatus.NEW,
+        open_type=OrderOpenType.MANUAL, stop_price=140.0))
+
+    fills = svc.collect_order_fills(46, [market_id, stop_id])
+
+    assert [f.order_id for f in fills] == [market_id]
+    totals = svc.measure_filled_values(fills)
+    assert totals.settled is True
+    assert totals.buy_value == pytest.approx(1600.0)
+    assert totals.sell_value == 0.0
+
+
+def test_collect_order_fills_reports_a_vanished_order_row_as_still_working():
+    """An id in the run with no row behind it is an inconsistency, not an
+    emptiness: stalling is the only safe reading, and it must be logged."""
+    fills = svc.collect_order_fills(46, [9_999_999])
+
+    assert [f.order_id for f in fills] == [9_999_999]
+    assert fills[0].status is None
+    assert svc.measure_filled_values(fills).settled is False
+
+
+def test_collect_order_fills_never_reads_another_accounts_order():
+    """The query is scoped by account_id as well as by id. Without that, an id
+    collision across accounts would price this run from someone else's fill."""
+    other = add_instance(TradingOrder(
+        account_id=999, symbol="AAPL", quantity=10.0, side=OrderDirection.BUY,
+        order_type=OrderType.MARKET, good_for='day', status=OrderStatus.FILLED,
+        open_type=OrderOpenType.MANUAL, filled_qty=10.0, open_price=160.0))
+
+    fills = svc.collect_order_fills(46, [other])
+
+    assert fills[0].status is None          # not visible == not measurable
+    assert svc.measure_filled_values(fills).buy_value == 0.0
+
+
+def test_a_full_close_counts_its_close_order_on_the_sell_side(activity):
+    """_close_symbol has to hand back close_order_id, or the SELL side of a close is
+    invisible and net_buy_value comes out too high -- over-consuming income."""
+    account = FakeAccount(account_id=46_1)
+    account.positions = [FakePosition("MSFT", 5.0, 1800.0, 2000.0)]
+    account.fills = {"MSFT": (OrderStatus.FILLED, 5.0, 398.0)}
+    txn_id = make_open_transaction(46_1, "MSFT", 5.0)
+    current = {"MSFT": PositionState(symbol="MSFT", quantity=5.0, price=400.0,
+                                     transaction_ids=[txn_id])}
+    row = make_row("MSFT", OrderDirection.SELL, -5.0, 2000.0, 0.0, price=400.0)
+    row.target_quantity = 0.0
+    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
+
+    svc.run_allocation(account, plan, current, make_base(),
+                       mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    run = the_run()
+    assert run.filled_sell_value == pytest.approx(1990.0)
+    assert run.filled_buy_value == 0.0
+    assert run.net_buy_value == 0.0
+    assert run.is_income_consumed is True
+
+
+def test_a_failed_refresh_never_consumes_income_against_stale_rows(activity, monkeypatch):
+    """If the broker cannot be reached, our rows say whatever they said before.
+    Consuming against that is guessing with money."""
+    errors = _capture_errors(monkeypatch)
+
+    account = FakeAccount(account_id=47)
+    account.positions = []
+    account.refresh_raises = RuntimeError("connection reset")
+    add_instance(PortfolioIncomeEvent(account_id=47, external_id="dep-1",
+                                      event_date=date(2026, 8, 1),
+                                      event_type=CASH_TRANSFER_DEPOSIT, amount=6_000.0))
+    row = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
+    row.target_quantity = 10.0
+    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
+
+    result = svc.run_allocation(account, plan, {}, make_base(),
+                                mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    assert result["income_consumed"] == 0.0
+    assert result["settled"] is False
+    assert svc.get_open_income_total(47) == pytest.approx(6_000.0)
+    assert any("connection reset" in e for e in errors), errors
+
+
+def test_a_failed_refresh_stops_a_reconcile_pass_rather_than_pricing_it_stale(
+        activity, monkeypatch):
+    """Same rule on the recovery path: a run left pending is safer than a run
+    consumed against rows the broker never confirmed."""
+    account = FakeAccount(account_id=48_1)
+    account.positions = []
+    add_instance(PortfolioIncomeEvent(account_id=48_1, external_id="dep-1",
+                                      event_date=date(2026, 8, 1),
+                                      event_type=CASH_TRANSFER_DEPOSIT, amount=6_000.0))
+    row = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
+    row.target_quantity = 10.0
+    first = svc.run_allocation(account, AllocationPlan(rows=[row],
+                                                       available_buying_power=10_000.0),
+                               {}, make_base(), mode=ALLOCATION_MODE_REBALANCE)
+
+    account.fills = {"AAPL": (OrderStatus.FILLED, 10.0, 160.0)}
+    account.refresh_raises = RuntimeError("connection reset")
+
+    assert svc.reconcile_unconsumed_runs(account) == []
+    assert [r.id for r in svc.get_unconsumed_runs(48_1)] == [first["run_id"]]
+    assert svc.get_open_income_total(48_1) == pytest.approx(6_000.0)
+
+
+def test_the_post_submit_refresh_asks_for_every_order(activity):
+    """fetch_all=True, mirroring TradeManager.py:1607 -- a freshly submitted order
+    is not in the 'open orders' window on every broker."""
+    account = FakeAccount(account_id=48)
+    account.positions = []
+    account.fills = {"AAPL": (OrderStatus.FILLED, 10.0, 160.0)}
+    row = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
+    row.target_quantity = 10.0
+    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
+
+    svc.run_allocation(account, plan, {}, make_base(),
+                       mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    assert account.refresh_calls == [{'heuristic_mapping': False, 'fetch_all': True}]
+
+
+def test_refresh_is_called_without_kwargs_for_a_broker_that_takes_none():
+    """IBKRAccount.refresh_orders(self) takes no arguments (IBKRAccount.py:541), so
+    refresh_orders(fetch_all=True) is a TypeError there."""
+    calls = []
+
+    class NoKwargsAccount:
+        id = 49
+
+        def refresh_orders(self):
+            calls.append("bare")
+            return True
+
+    assert svc.refresh_orders_from_broker(NoKwargsAccount()) is True
+    assert calls == ["bare"]
+
+
+def test_refresh_passes_fetch_all_to_a_broker_that_only_takes_kwargs():
+    """TastyTradeAccount.refresh_orders(self, **kwargs) (:988). fetch_all must
+    still go in, or a market order that filled instantly is never seen."""
+    calls = []
+
+    class KwargsOnlyAccount:
+        id = 50
+
+        def refresh_orders(self, **kwargs):
+            calls.append(kwargs)
+            return True
+
+    assert svc.refresh_orders_from_broker(KwargsOnlyAccount()) is True
+    assert calls == [{"fetch_all": True}]
+
+
+def test_a_typeerror_raised_inside_a_brokers_refresh_is_not_retried_bare(monkeypatch):
+    """The signature is INSPECTED, not the TypeError caught: catching it and
+    retrying without arguments would run a broker's whole refresh twice."""
+    calls = []
+
+    class ExplodingAccount:
+        id = 51
+
+        def refresh_orders(self, heuristic_mapping=False, fetch_all=False):
+            calls.append(fetch_all)
+            raise TypeError("something inside the adapter, not the signature")
+
+    assert svc.refresh_orders_from_broker(ExplodingAccount()) is False
+    assert calls == [True]
+
+
+# ---------------------------------------------------------------------------
+# The market gate stays FIRST, above everything this task added
+# ---------------------------------------------------------------------------
+
+def test_a_blocked_run_reports_the_full_money_contract_and_writes_nothing():
+    """The blocked branch, preserved: money zeroed, settled True (nothing was
+    submitted, so there is nothing to wait for), no working orders, no run row."""
+    account = FakeAccount(account_id=59)
+    account.positions = []
+    account.market_hours = _closed_hours()
+    plan = AllocationPlan(rows=[make_row("AAPL", OrderDirection.BUY, 1.0, 160.0, 160.0,
+                                         price=160.0)],
+                          available_buying_power=10_000.0)
+
+    result = svc.run_allocation(account, plan, {}, make_base(),
+                                mode=ALLOCATION_MODE_REBALANCE)
+
+    assert result["blocked"] is True
+    assert result["run_id"] is None
+    assert result["outcomes"] == []
+    assert result["order_ids"] == []
+    assert result["filled_buy_value"] == 0.0
+    assert result["filled_sell_value"] == 0.0
+    assert result["settled"] is True
+    assert result["working_order_ids"] == []
+    assert result["income_consumed"] == 0.0
+    assert "closed" in result["blocked_reason"].lower()
+    assert account.submitted == []
+    assert account.refresh_calls == []
+
+
+def test_a_blocked_run_does_not_reconcile_and_so_touches_no_earlier_run(activity):
+    """The gate is the FIRST statement, above reconcile_unconsumed_runs. A blocked
+    attempt must not spend an EARLIER run's income either."""
+    account = FakeAccount(account_id=60)
+    account.positions = []
+    add_instance(PortfolioIncomeEvent(account_id=60, external_id="dep-1",
+                                      event_date=date(2026, 8, 1),
+                                      event_type=CASH_TRANSFER_DEPOSIT, amount=6_000.0))
+    row = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
+    row.target_quantity = 10.0
+    first = svc.run_allocation(account, AllocationPlan(rows=[row],
+                                                       available_buying_power=10_000.0),
+                               {}, make_base(), mode=ALLOCATION_MODE_REBALANCE)
+    assert [r.id for r in svc.get_unconsumed_runs(60)] == [first["run_id"]]
+
+    account.fills = {"AAPL": (OrderStatus.FILLED, 10.0, 160.0)}
+    account.market_hours = _closed_hours()
+    blocked = svc.run_allocation(account, AllocationPlan(rows=[],
+                                                         available_buying_power=1.0),
+                                 {}, make_base(), mode=ALLOCATION_MODE_REBALANCE)
+
+    assert blocked["blocked"] is True
+    assert [r.id for r in svc.get_unconsumed_runs(60)] == [first["run_id"]]
+    assert svc.get_open_income_total(60) == pytest.approx(6_000.0)
+
+
+def test_an_earlier_deferred_run_is_reconciled_before_the_next_run_spends(activity):
+    """Step 1 of run_allocation. Without it this run's budget is computed against
+    income the previous run has already deployed, and spends it twice."""
+    account = FakeAccount(account_id=62_1)
+    account.positions = []
+    add_instance(PortfolioIncomeEvent(account_id=62_1, external_id="dep-1",
+                                      event_date=date(2026, 8, 1),
+                                      event_type=CASH_TRANSFER_DEPOSIT, amount=6_000.0))
+    row = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
+    row.target_quantity = 10.0
+    first = svc.run_allocation(account, AllocationPlan(rows=[row],
+                                                       available_buying_power=10_000.0),
+                               {}, make_base(), mode=ALLOCATION_MODE_REBALANCE)
+    assert svc.get_open_income_total(62_1) == pytest.approx(6_000.0)
+
+    account.fills = {"AAPL": (OrderStatus.FILLED, 10.0, 160.0)}
+    svc.run_allocation(account, AllocationPlan(rows=[], available_buying_power=10_000.0),
+                       {}, make_base(), mode=ALLOCATION_MODE_REBALANCE)
+
+    from ba2_trade_platform.core.portfolio_allocation_store import get_recent_runs
+    assert get_recent_runs(62_1)[-1].id == first["run_id"]
+    assert svc.get_open_income_total(62_1) == pytest.approx(4_400.0)
+
+
+def test_a_failed_refresh_forces_unsettled_even_when_the_rows_already_look_final():
+    """The dangerous shape: an EARLIER refresh left the rows FILLED, today's refresh
+    failed, and the row therefore looks like proof. It is not -- the broker was
+    never asked, so the fill figure is recorded for the audit but must not be
+    allowed to stamp the ledger."""
+    account = FakeAccount(account_id=52_1)
+    order_id = add_instance(TradingOrder(
+        account_id=52_1, symbol="AAPL", quantity=10.0, side=OrderDirection.BUY,
+        order_type=OrderType.MARKET, good_for='day', status=OrderStatus.FILLED,
+        open_type=OrderOpenType.MANUAL, filled_qty=10.0, open_price=160.0))
+    account.refresh_raises = RuntimeError("connection reset")
+
+    totals = svc.measure_run_fills(account, [order_id])
+
+    assert totals.buy_value == pytest.approx(1600.0)
+    assert totals.settled is False
+
+
+def test_a_successful_refresh_lets_a_settled_row_settle():
+    """The other half of the pair, so the forcing above cannot just be hardcoded."""
+    account = FakeAccount(account_id=52_2)
+    order_id = add_instance(TradingOrder(
+        account_id=52_2, symbol="AAPL", quantity=10.0, side=OrderDirection.BUY,
+        order_type=OrderType.MARKET, good_for='day', status=OrderStatus.FILLED,
+        open_type=OrderOpenType.MANUAL, filled_qty=10.0, open_price=160.0))
+
+    totals = svc.measure_run_fills(account, [order_id])
+
+    assert totals.buy_value == pytest.approx(1600.0)
+    assert totals.settled is True
+
+
+def test_the_reconcile_runs_after_the_market_gate_not_before_it(monkeypatch):
+    """Ordering, pinned directly: a blocked attempt must touch nothing at all, and
+    a reconcile above the gate would still refresh orders and spend the ledger."""
+    order = []
+    monkeypatch.setattr(svc, "reconcile_unconsumed_runs",
+                        lambda account: order.append("reconcile") or [])
+    real_gate = svc._market_blocked_reason
+    monkeypatch.setattr(svc, "_market_blocked_reason",
+                        lambda hours: order.append("gate") or real_gate(hours))
+
+    account = FakeAccount(account_id=53_1)
+    account.positions = []
+    account.market_hours = _closed_hours()
+
+    svc.run_allocation(account, AllocationPlan(rows=[]), {}, make_base(),
+                       mode=ALLOCATION_MODE_REBALANCE)
+
+    assert order == ["gate"]
