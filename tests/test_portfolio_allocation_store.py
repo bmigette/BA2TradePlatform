@@ -137,10 +137,50 @@ def test_symbol_weights_of_an_empty_label_are_empty(account_id):
     assert store.get_symbol_weights(account_id, "ARK26", []) == {}
 
 
+@pytest.mark.parametrize("count", [2, 3, 6, 7, 11, 15])
+def test_default_symbol_weights_are_bit_for_bit_the_engines_own_split(account_id, count):
+    """The defaults the PAGE shows must equal the ones the ENGINE would compute.
+
+    ``_split_evenly`` exists to delegate to ``even_split_pct`` rather than
+    re-derive the split, and this is what holds it to that. A hand-rolled
+    ``round(100 / n, 2)`` passes at n=2 and n=3 -- where the two happen to agree,
+    and where every other test in this file lives -- and then disagrees from n=6
+    on: 16.67 against the engine's 16.66. The page would offer weights the engine
+    immediately recomputes differently, and the drift is invisible until a plan
+    comes back with numbers nobody typed.
+
+    Compared against ``build_symbol_targets`` rather than a hard-coded list on
+    purpose: a literal here would just be a second place to get the split wrong.
+    """
+    from ba2_common.core.portfolio_allocation import build_symbol_targets
+
+    symbols = [f"SYM{i}" for i in range(count)]
+    assert store.get_symbol_weights(account_id, "ARK26", symbols) == {
+        target.symbol: target.weight_pct for target in build_symbol_targets(symbols)}
+
+
 def test_set_symbol_weight_stores_a_lowercase_symbol_uppercased(account_id):
     row = store.set_symbol_weight(account_id, "ARK26", " tsla ", weight_pct=60.0, comment="core")
     assert row.symbol == "TSLA"
     assert store.get_symbol_rows(account_id, "ARK26")["TSLA"].comment == "core"
+
+
+def test_set_symbol_weight_leaves_unpassed_fields_untouched(account_id):
+    """A comment-only write must not zero the weight. This bug happened once.
+
+    ``None`` means LEAVE UNCHANGED, and the difference between that and
+    ``float(weight_pct or 0.0)`` is silent: the row still exists, the comment
+    saves, and the weight is now 0. The engine reads 0 as "hold none of this",
+    so the next rebalance SELLS THE POSITION TO ZERO. Commit c63d34c exists
+    because it was found by hand; the label-side equivalent is pinned by
+    ``test_set_managed_label_leaves_unpassed_fields_untouched`` and the symbol
+    side was not.
+    """
+    store.set_symbol_weight(account_id, "ARK26", "TSLA", weight_pct=70.0, comment="core")
+    store.set_symbol_weight(account_id, "ARK26", "TSLA", comment="trimming into strength")
+    row = store.get_symbol_rows(account_id, "ARK26")["TSLA"]
+    assert row.weight_pct == 70.0
+    assert row.comment == "trimming into strength"
 
 
 def test_set_symbol_weight_rejects_a_blank_symbol(account_id):
@@ -512,6 +552,42 @@ def test_a_crashed_run_is_visibly_unconsumed_and_can_be_recovered(account_id):
     assert recovered.income_consumed_amount == pytest.approx(1600.0)
     assert store.get_open_income_total(account_id) == pytest.approx(3400.0)
     assert store.get_unconsumed_runs(account_id) == []
+
+
+def test_a_failed_consumption_takes_the_totals_down_with_it(account_id, monkeypatch):
+    """One transaction, or the crash window the design claims to have closed reopens.
+
+    If the totals were committed BEFORE the ledger step, a failure between the
+    two would leave a run carrying real submitted values and a NULL stamp --
+    which reads as "died mid-submit" and invites a recovery pass to consume
+    against totals whose orders may never have gone out. Worse, a run that looks
+    finalised is one nobody re-checks.
+
+    So the failure has to be total: no totals, no order ids, no stamp, and the
+    run still standing in ``get_unconsumed_runs()`` where a human will find it.
+    Inserting a ``session.commit()`` between the totals write and the
+    consumption is exactly the mutation this kills.
+    """
+    store.upsert_income_event(account_id, "csd-1", date(2026, 8, 1), "DEPOSIT", 5000.0)
+    run = store.record_allocation_run(account_id, "REBALANCE", {})
+
+    def explode(session, aid, net_buy_value):
+        raise RuntimeError("ledger unreachable mid-finalise")
+
+    monkeypatch.setattr(store, "_apply_income_consumption", explode)
+    with pytest.raises(RuntimeError, match="ledger unreachable"):
+        store.finalise_allocation_run(
+            run.id, submitted_buy_value=1600.0, submitted_sell_value=200.0,
+            order_ids=[101, 102])
+
+    stored = store.get_recent_runs(account_id)[0]
+    assert stored.id == run.id
+    assert stored.submitted_buy_value == 0.0
+    assert stored.submitted_sell_value == 0.0
+    assert stored.order_ids == []
+    assert stored.is_income_consumed is False
+    assert [r.id for r in store.get_unconsumed_runs(account_id)] == [run.id]
+    assert store.get_open_income_total(account_id) == pytest.approx(5000.0)
 
 
 def test_unconsumed_runs_are_scoped_to_one_account_and_newest_first(account_id):
