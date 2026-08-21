@@ -114,6 +114,11 @@ class AllocationWizard:
         self.dialog = None
         self._rows_container = None
         self._totals_container = None
+        self._submit_button = None
+        #: One-shot latch. See ``_submit``: NiceGUI runs a sync click handler
+        #: directly on the event loop, so the dialog stays on screen -- and
+        #: clickable -- for the whole of a blocking submit.
+        self._submitted = False
 
     # -- public -----------------------------------------------------------
     def open(self):
@@ -131,7 +136,8 @@ class AllocationWizard:
             with ui.row().classes('w-full justify-end gap-2 mt-4'):
                 ui.button('Refresh', on_click=lambda: self._refresh(self.allow_fractional)).props('outline')
                 ui.button('Cancel', on_click=dialog.close).props('flat')
-                ui.button('Submit', on_click=self._submit).props('color=primary')
+                self._submit_button = ui.button('Submit', on_click=self._submit) \
+                    .props('color=primary')
         dialog.open()
         return dialog
 
@@ -264,10 +270,39 @@ class AllocationWizard:
         ui.notify('Dry run refreshed', type='info')
 
     def _submit(self):
+        """Hand the ticked rows to ``on_submit``. ONCE, whatever the user clicks.
+
+        ``on_submit`` runs the whole allocation -- every order, synchronously,
+        for as long as the broker takes. NiceGUI dispatches a sync click handler
+        directly on the event loop (``nicegui/events.py:444-448``), so NOTHING
+        this method does reaches the browser until it returns: not
+        ``dialog.close()``, not ``set_enabled(False)``. The Submit button stays
+        on screen and stays clickable for the entire run, and a second click
+        submits the WHOLE plan again -- every buy placed twice.
+
+        The latch is one-shot and is never released. Clicks are dispatched
+        sequentially, so a flag cleared in a ``finally`` would already be back to
+        False by the time the queued second click ran; and it is set BEFORE
+        ``on_submit``, so a submit that dies half way -- with orders already at
+        the broker -- cannot be re-run on top of itself either. There is nothing
+        left to submit once the plan has gone: the dialog is closed and the
+        results table takes over.
+
+        An EMPTY submit does not latch: nothing was sent, and the user still has
+        to be able to tick a row and press Submit for real.
+        """
+        if self._submitted:
+            logger.warning('Allocation submit ignored: this dry run has already been '
+                           'submitted (a second click during a blocking submit)')
+            ui.notify('This allocation has already been submitted', type='warning')
+            return
         selected_plan = filter_plan_rows(self.plan, sorted(self.selected))
         if not selected_plan.rows:
             ui.notify('Nothing selected to submit', type='warning')
             return
+        self._submitted = True
+        if self._submit_button is not None:
+            self._submit_button.set_enabled(False)
         if self.dialog is not None:
             self.dialog.close()
         self.on_submit(selected_plan)

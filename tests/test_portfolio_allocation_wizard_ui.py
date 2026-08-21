@@ -241,6 +241,77 @@ def test_submitting_hands_on_only_the_ticked_rows(nicegui_client):
     assert submitted[0].total_buy_value == pytest.approx(1600.0)
 
 
+def test_a_second_click_on_submit_does_not_run_the_allocation_twice(nicegui_client):
+    """I5. NiceGUI calls a SYNC handler directly on the event loop
+    (nicegui/events.py:444-448), so nothing -- not even ``dialog.close()`` --
+    reaches the browser until ``on_submit`` returns, and ``on_submit`` blocks for
+    as long as the broker takes. The Submit button therefore stays visible and
+    clickable for the whole run, and a second click submits the WHOLE allocation
+    again: every buy placed twice.
+
+    The latch is deliberately one-shot and is never released. Queued clicks are
+    dispatched sequentially, so a flag cleared in a ``finally`` would be back to
+    False by the time the second one ran -- and there is nothing to re-submit
+    anyway once the plan has gone."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    submitted = []
+    with nicegui_client:
+        wizard = wiz.AllocationWizard(_base(), _mixed_plan(),
+                                      on_refresh=lambda f: None,
+                                      on_submit=submitted.append)
+        wizard.open()
+        wizard._submit()
+        wizard._submit()
+        wizard._submit()
+
+    assert len(submitted) == 1
+
+
+def test_a_submit_that_raises_still_blocks_a_second_run(nicegui_client):
+    """The broker call behind Submit can fail half way through -- with orders
+    already placed. Re-running the whole plan on top of that is the worst
+    possible response, so the latch is set BEFORE ``on_submit`` is called."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    calls = []
+
+    def _boom(plan):
+        calls.append(plan)
+        raise RuntimeError("broker connection reset mid-run")
+
+    with nicegui_client:
+        wizard = wiz.AllocationWizard(_base(), _mixed_plan(),
+                                      on_refresh=lambda f: None, on_submit=_boom)
+        wizard.open()
+        with pytest.raises(RuntimeError):
+            wizard._submit()
+        wizard._submit()
+
+    assert len(calls) == 1
+
+
+def test_submitting_nothing_leaves_the_wizard_usable(nicegui_client):
+    """An empty submit is not a submission: it must not latch the wizard shut,
+    or ticking a row and pressing Submit again would do nothing forever."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    submitted = []
+    with nicegui_client:
+        wizard = wiz.AllocationWizard(_base(), _mixed_plan(),
+                                      on_refresh=lambda f: None,
+                                      on_submit=submitted.append)
+        wizard.open()
+        for symbol in ("AAPL", "FRAC", "ONGRID", "MSFT"):
+            wizard._toggle(symbol, False)
+        wizard._submit()
+        wizard._toggle("AAPL", True)
+        wizard._submit()
+
+    assert len(submitted) == 1
+    assert [r.symbol for r in submitted[0].rows] == ["AAPL"]
+
+
 def test_submitting_nothing_does_not_call_on_submit(nicegui_client):
     from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
 
