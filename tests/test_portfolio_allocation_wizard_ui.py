@@ -58,6 +58,17 @@ def _base():
                         valuation_mode=VALUATION_MODE_MARKET, cash=10_000.0)
 
 
+def _open_market():
+    """An OPEN market gate. ``market`` is a REQUIRED keyword on the wizard -- a
+    default would let a caller submit into a closed market by omission -- so every
+    test states which world it is in, and these predate the gate: they are all
+    about the table, not about the clock."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        MARKET_GATE_OPEN, MarketGateResult,
+    )
+    return MarketGateResult(allowed=True, reason_code=MARKET_GATE_OPEN, message="")
+
+
 def _plan_with_a_suppressed_row():
     """One sendable buy, one order the broker's $5 fractional floor killed."""
     return AllocationPlan(
@@ -82,7 +93,7 @@ def test_wizard_does_not_pre_tick_an_order_the_broker_will_refuse():
     from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
 
     wizard = wiz.AllocationWizard(_base(), _plan_with_a_suppressed_row(),
-                                  on_refresh=lambda frac: pytest.fail("not called"),
+                                  market=_open_market(), on_refresh=lambda frac: pytest.fail("not called"),
                                   on_submit=lambda plan: pytest.fail("not called"))
 
     assert wizard.selected == {"AAPL"}
@@ -93,7 +104,7 @@ def test_wizard_carries_the_plans_fractional_setting_into_the_toggle():
 
     plan = _plan_with_a_suppressed_row()
     plan.allow_fractional = True
-    wizard = wiz.AllocationWizard(_base(), plan, on_refresh=lambda f: plan,
+    wizard = wiz.AllocationWizard(_base(), plan, market=_open_market(), on_refresh=lambda f: plan,
                                   on_submit=lambda p: None)
     assert wizard.allow_fractional is True
 
@@ -165,7 +176,7 @@ def test_the_dry_run_dialog_draws(nicegui_client):
 
     with nicegui_client:
         wizard = wiz.AllocationWizard(_base(), _mixed_plan(),
-                                      on_refresh=lambda f: _mixed_plan(),
+                                      market=_open_market(), on_refresh=lambda f: _mixed_plan(),
                                       on_submit=lambda p: None)
         wizard.open()
         texts = _rendered_texts(nicegui_client.layout)
@@ -182,7 +193,7 @@ def test_the_dry_run_says_per_symbol_whether_the_order_is_fractional(nicegui_cli
     from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
 
     with nicegui_client:
-        wiz.AllocationWizard(_base(), _mixed_plan(), on_refresh=lambda f: None,
+        wiz.AllocationWizard(_base(), _mixed_plan(), market=_open_market(), on_refresh=lambda f: None,
                              on_submit=lambda p: None).open()
         texts = _rendered_texts(nicegui_client.layout)
         order_kinds = _marked_texts(nicegui_client.layout, wiz.MARKER_ORDER_KIND)
@@ -201,7 +212,7 @@ def test_a_suppressed_row_cannot_be_ticked(nicegui_client):
     from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
 
     with nicegui_client:
-        wiz.AllocationWizard(_base(), _mixed_plan(), on_refresh=lambda f: None,
+        wiz.AllocationWizard(_base(), _mixed_plan(), market=_open_market(), on_refresh=lambda f: None,
                              on_submit=lambda p: None).open()
         ticks = [d for d in nicegui_client.layout.descendants()
                  if wiz.MARKER_ROW_TICK in getattr(d, '_markers', [])]
@@ -215,7 +226,7 @@ def test_the_dry_run_shows_the_brokers_own_suppression_reason(nicegui_client):
     from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
 
     with nicegui_client:
-        wiz.AllocationWizard(_base(), _mixed_plan(), on_refresh=lambda f: None,
+        wiz.AllocationWizard(_base(), _mixed_plan(), market=_open_market(), on_refresh=lambda f: None,
                              on_submit=lambda p: None).open()
         texts = _rendered_texts(nicegui_client.layout)
 
@@ -229,7 +240,7 @@ def test_submitting_hands_on_only_the_ticked_rows(nicegui_client):
     submitted = []
     with nicegui_client:
         wizard = wiz.AllocationWizard(_base(), _mixed_plan(),
-                                      on_refresh=lambda f: None,
+                                      market=_open_market(), on_refresh=lambda f: None,
                                       on_submit=submitted.append)
         wizard.open()
         wizard._toggle("FRAC", False)
@@ -258,7 +269,7 @@ def test_a_second_click_on_submit_does_not_run_the_allocation_twice(nicegui_clie
     submitted = []
     with nicegui_client:
         wizard = wiz.AllocationWizard(_base(), _mixed_plan(),
-                                      on_refresh=lambda f: None,
+                                      market=_open_market(), on_refresh=lambda f: None,
                                       on_submit=submitted.append)
         wizard.open()
         wizard._submit()
@@ -282,7 +293,7 @@ def test_a_submit_that_raises_still_blocks_a_second_run(nicegui_client):
 
     with nicegui_client:
         wizard = wiz.AllocationWizard(_base(), _mixed_plan(),
-                                      on_refresh=lambda f: None, on_submit=_boom)
+                                      market=_open_market(), on_refresh=lambda f: None, on_submit=_boom)
         wizard.open()
         with pytest.raises(RuntimeError):
             wizard._submit()
@@ -299,7 +310,7 @@ def test_submitting_nothing_leaves_the_wizard_usable(nicegui_client):
     submitted = []
     with nicegui_client:
         wizard = wiz.AllocationWizard(_base(), _mixed_plan(),
-                                      on_refresh=lambda f: None,
+                                      market=_open_market(), on_refresh=lambda f: None,
                                       on_submit=submitted.append)
         wizard.open()
         for symbol in ("AAPL", "FRAC", "ONGRID", "MSFT"):
@@ -318,7 +329,7 @@ def test_submitting_nothing_does_not_call_on_submit(nicegui_client):
     with nicegui_client:
         wizard = wiz.AllocationWizard(
             _base(), _mixed_plan(),
-            on_refresh=lambda f: None,
+            market=_open_market(), on_refresh=lambda f: None,
             on_submit=lambda p: pytest.fail("submitted an empty plan"))
         wizard.open()
         for symbol in ("AAPL", "FRAC", "ONGRID", "MSFT"):
@@ -337,7 +348,7 @@ def test_a_failing_refresh_keeps_the_previous_plan(nicegui_client):
         raise RuntimeError("broker said no")
 
     with nicegui_client:
-        wizard = wiz.AllocationWizard(_base(), original, on_refresh=_boom,
+        wizard = wiz.AllocationWizard(_base(), original, market=_open_market(), on_refresh=_boom,
                                       on_submit=lambda p: None)
         wizard.open()
         wizard._refresh(True)
@@ -352,7 +363,7 @@ def test_a_plan_with_no_cash_balance_says_so_instead_of_guessing(nicegui_client)
     base = _base()
     base.cash = None
     with nicegui_client:
-        wiz.AllocationWizard(base, _mixed_plan(), on_refresh=lambda f: None,
+        wiz.AllocationWizard(base, _mixed_plan(), market=_open_market(), on_refresh=lambda f: None,
                              on_submit=lambda p: None).open()
         texts = _rendered_texts(nicegui_client.layout)
 
@@ -947,3 +958,257 @@ def test_a_broker_that_cannot_split_shares_still_vetoes_the_remembered_choice(ni
                                           allow_fractional=True)
     assert steps.allow_fractional is False
     assert steps._fractional_switch.enabled is False
+
+
+# ---------------------------------------------------------------------------
+# Task 95: Submit gated on market hours; bumps, rounding and residuals prominent
+# ---------------------------------------------------------------------------
+
+def _closed_market():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        MARKET_GATE_CLOSED, MarketGateResult,
+    )
+    return MarketGateResult(
+        allowed=False, reason_code=MARKET_GATE_CLOSED, severity="warning",
+        message="Market closed — Submit is disabled. The next regular session "
+                "opens Fri 21 Aug 2026 09:30 ET (15h 30m from now).",
+        next_open_text="Fri 21 Aug 2026 09:30 ET", countdown_text="15h 30m")
+
+
+def _bumped_plan():
+    """A bumped row, a redistributed row and a row that gets no order at all."""
+    import ba2_trade_platform.core.portfolio_allocation as pa
+    return AllocationPlan(
+        rows=[
+            AllocationRow(symbol="AAPL", price=160.0, target_notional=1_600.0,
+                          target_quantity=10.0, delta_quantity=10.0,
+                          side=OrderDirection.BUY, estimated_value=1_600.0,
+                          bp_cost=1_600.0, bp_factor=1.0, fractional=True,
+                          redistributed=True, reasons=["weight adjusted"]),
+            AllocationRow(symbol="BUMPY", price=300.0, target_notional=200.0,
+                          target_quantity=1.0, delta_quantity=1.0,
+                          side=OrderDirection.BUY, estimated_value=300.0,
+                          bp_cost=300.0, bp_factor=1.0,
+                          sizing_outcome=pa.SIZING_OUTCOME_BUMPED,
+                          reasons=["BUMPED UP to 1 share(s), 150% of target"]),
+            AllocationRow(symbol="BRKA", price=650_000.0, target_notional=260_000.0,
+                          delta_quantity=0.0, side=None, unmet_notional=260_000.0,
+                          sizing_outcome=pa.SIZING_OUTCOME_SKIPPED_TOO_LARGE,
+                          reasons=["no order; over the 150% bump limit"]),
+        ],
+        base_notional=262_800.0, available_buying_power=300_000.0,
+        allow_fractional=True, valuation_mode=VALUATION_MODE_MARKET)
+
+
+def test_wizard_requires_the_market_gate_and_will_not_default_it():
+    """A default would let a caller submit into a closed market by omission."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    params = inspect.signature(wiz.open_allocation_wizard).parameters
+    assert "market" in params
+    assert params["market"].default is inspect.Parameter.empty
+
+    init_params = inspect.signature(wiz.AllocationWizard.__init__).parameters
+    assert "market" in init_params
+    assert init_params["market"].default is inspect.Parameter.empty
+
+
+def test_wizard_module_exposes_the_notice_renderers():
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    assert hasattr(wiz.AllocationWizard, "_render_market_banner")
+    assert hasattr(wiz.AllocationWizard, "_render_notices")
+    assert hasattr(wiz.AllocationWizard, "_render_no_order_rows")
+
+
+def test_wizard_submit_bails_on_the_gate_before_it_touches_anything_else(nicegui_client):
+    """The gate check is the FIRST thing ``_submit`` does.
+
+    Proven on an instance built with ``object.__new__``: it has no ``_submitted``
+    latch, no ``plan`` and no ``dialog``, so reading, filtering or closing any of
+    them ahead of the gate raises ``AttributeError`` instead of quietly returning.
+
+    A client context is entered because ``ui.notify`` needs a slot -- which it
+    always has in production, where this only ever runs from a click handler. The
+    plan's version omitted it and passed only when an earlier test happened to
+    leave a slot on the stack.
+    """
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    submitted = []
+    obj = object.__new__(wiz.AllocationWizard)
+    obj.market = _closed_market()
+    obj.on_submit = submitted.append
+
+    with nicegui_client:
+        obj._submit()
+
+    assert submitted == []
+    assert not hasattr(obj, "_submitted")     # the latch was never even reached
+
+
+def test_wizard_imports_the_engine_summary_helpers():
+    """The prominence work is engine-side and pure; the wizard only draws it."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    assert callable(wiz.fractional_summary)
+    assert callable(wiz.whole_share_notice)
+    assert callable(wiz.no_order_notice)
+    assert callable(wiz.bump_notice)
+    assert callable(wiz.redistribution_notice)
+    assert callable(wiz.no_order_rows)
+
+
+def test_render_income_panel_accepts_a_pre_computed_working_orders_note():
+    """D3: deferral is the common case, so the panel has to be able to say so. The
+    DECISION is the pure working_orders_notice(); this module only draws it."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    params = inspect.signature(wiz.render_income_panel).parameters
+    assert "working_note" in params
+    assert params["working_note"].default is None
+
+
+def test_the_dry_run_disables_submit_and_shows_why_when_the_market_is_shut(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wizard = wiz.AllocationWizard(_base(), _mixed_plan(), market=_closed_market(),
+                                      on_refresh=lambda f: _mixed_plan(),
+                                      on_submit=lambda p: None)
+        wizard.open()
+        texts = _rendered_texts(nicegui_client.layout)
+
+    assert wizard._submit_button.enabled is False
+    assert any("Fri 21 Aug 2026 09:30 ET" in t for t in texts)
+    # Everything else stays live: planning outside market hours is the normal case.
+    assert "Refresh" in texts and "Cancel" in texts
+
+
+def test_the_dry_run_draws_no_market_banner_at_all_when_the_market_is_open(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wizard = wiz.AllocationWizard(_base(), _mixed_plan(), market=_open_market(),
+                                      on_refresh=lambda f: _mixed_plan(),
+                                      on_submit=lambda p: None)
+        wizard.open()
+        texts = _rendered_texts(nicegui_client.layout)
+
+    assert wizard._submit_button.enabled is True
+    assert not any("Submit is disabled" in t for t in texts)
+
+
+def test_the_dry_run_shows_the_bump_the_rounding_and_the_weight_move(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wizard = wiz.AllocationWizard(_base(), _bumped_plan(), market=_open_market(),
+                                      on_refresh=lambda f: _bumped_plan(),
+                                      on_submit=lambda p: None)
+        wizard.open()
+        texts = _rendered_texts(nicegui_client.layout)
+
+    joined = " | ".join(texts)
+    assert "BUMPED UP" in joined                 # the notice, up top
+    assert "bumped-to-1" in texts                # the Outcome cell
+    assert "share count adjusted" in joined      # the redistribution notice
+    assert "NO order at all" in joined           # the no-order notice
+    assert any("→" in t for t in texts)          # asked -> actual weight
+
+
+def test_the_dry_run_lists_a_symbol_that_gets_no_order_with_its_unallocated_money(nicegui_client):
+    """A refused target used to vanish from the review screen entirely."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wizard = wiz.AllocationWizard(_base(), _bumped_plan(), market=_open_market(),
+                                      on_refresh=lambda f: _bumped_plan(),
+                                      on_submit=lambda p: None)
+        wizard.open()
+        texts = _rendered_texts(nicegui_client.layout)
+
+    assert "BRKA" in texts
+    assert any("Not traded (1)" in t and "260,000.00" in t for t in texts)
+
+
+def test_submitting_into_a_closed_market_hands_nothing_on(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    submitted = []
+    with nicegui_client:
+        wizard = wiz.AllocationWizard(_base(), _mixed_plan(), market=_closed_market(),
+                                      on_refresh=lambda f: _mixed_plan(),
+                                      on_submit=submitted.append)
+        wizard.open()
+        wizard._submit()
+
+    assert submitted == []
+    assert wizard._submitted is False      # nothing was sent, so nothing is latched
+
+
+def test_the_market_banner_is_drawn_only_when_the_gate_blocks(nicegui_client):
+    """Located by MARKER, not by text: the gate's message is also the Submit
+    button's tooltip, so a text search finds it whether or not the banner exists."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wiz.AllocationWizard(_base(), _mixed_plan(), market=_closed_market(),
+                             on_refresh=lambda f: None, on_submit=lambda p: None).open()
+        shut = _marked_texts(nicegui_client.layout, wiz.MARKER_MARKET_BANNER)
+    assert len(shut) == 1
+    assert "Fri 21 Aug 2026 09:30 ET" in shut[0]
+
+    with nicegui_client:
+        wiz.AllocationWizard(_base(), _mixed_plan(), market=_open_market(),
+                             on_refresh=lambda f: None, on_submit=lambda p: None).open()
+    # An open market draws NO banner at all -- not an empty one, which would leave
+    # a stray box on a screen that has nothing to say.
+    banners = [d for d in nicegui_client.layout.descendants()
+               if wiz.MARKER_MARKET_BANNER in getattr(d, '_markers', [])]
+    assert len(banners) == 1, "the open-market render added a second banner"
+
+
+def test_all_four_plan_notices_reach_the_screen(nicegui_client):
+    """Each is located by marker and matched on wording unique to the NOTICE: every
+    one of them quotes a phrase that also appears in some row's reasons cell, so a
+    plain text search cannot tell a missing notice from a present one."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    plan = _bumped_plan()
+    plan.rows[1].fractional = False          # so the whole-share notice fires too
+    with nicegui_client:
+        wiz.AllocationWizard(_base(), plan, market=_open_market(),
+                             on_refresh=lambda f: None, on_submit=lambda p: None).open()
+        notices = _marked_texts(nicegui_client.layout, wiz.MARKER_PLAN_NOTICE)
+
+    joined = " | ".join(notices)
+    assert len(notices) == 4, notices
+    assert "cannot trade fractionally" in joined     # whole_share_notice
+    assert "over-allocates them by" in joined        # bump_notice
+    assert "get NO order at all" in joined           # no_order_notice
+    assert "share count adjusted" in joined          # redistribution_notice
+
+
+def test_the_income_panel_draws_the_working_orders_line_it_is_given(nicegui_client):
+    """D3: the run's income is deliberately unconsumed while orders are working,
+    and with a quarter of the book on whole shares that is the common outcome."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import working_orders_notice
+
+    note = working_orders_notice(settled=False, working_order_ids=[7, 9])
+    with nicegui_client:
+        wiz.render_income_panel([], 0.0, on_sync=lambda: None, on_invest=lambda a: None,
+                                working_note=note)
+        drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_WORKING_ORDERS)
+    assert len(drawn) == 1
+    assert "2 order(s) still working" in drawn[0]
+
+
+def test_the_income_panel_draws_no_working_orders_line_when_the_run_settled(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wiz.render_income_panel([], 0.0, on_sync=lambda: None, on_invest=lambda a: None,
+                                working_note=None)
+        assert _marked_texts(nicegui_client.layout, wiz.MARKER_WORKING_ORDERS) == []

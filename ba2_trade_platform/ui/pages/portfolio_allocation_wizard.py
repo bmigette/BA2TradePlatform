@@ -14,8 +14,18 @@ rows start ticked; that is reachable without a client context and is pinned in
 
 Valid ``ui.notify`` types are 'positive' | 'negative' | 'warning' | 'info' --
 'error' is not one of them (settings.py gets this wrong; do not copy it).
+
+Market hours gate SUBMIT only. The dialog opens, refreshes and recomputes with the
+market shut, because planning outside market hours is the normal case; the button
+is disabled and the banner names the next open. ``run_allocation`` re-checks
+server-side, since this dialog can sit open across the close.
+
+The Outcome and Weight columns are not decoration. The engine bumps a target
+smaller than one share UP to one share, and moves quantities between a label's
+symbols to keep the label on target; both spend money the typed weights did not ask
+for, and both are only acceptable because these two columns show them.
 """
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from nicegui import ui
 
@@ -27,14 +37,21 @@ from ...core.portfolio_allocation import (
     LabelTarget,
     SymbolTarget,
     blocking_messages,
+    bump_notice,
     dry_run_rows,
     even_split_targets,
     filter_plan_rows,
+    fractional_summary,
     invest_validation_messages,
     is_blocking_message,
+    no_order_notice,
+    no_order_rows,
+    redistribution_notice,
     steps_validation_messages,
     summarise_plan,
+    whole_share_notice,
 )
+from ..utils.portfolio_allocation_view import MARKET_BANNER_CLASSES, MarketGateResult
 from ...core.portfolio_allocation_service import (
     OUTCOME_FAILED,
     OUTCOME_PARTIAL,
@@ -70,6 +87,16 @@ MARKER_ORDER_KIND = 'dry-run-order-kind'
 #: NiceGUI marker on the dry-run table's per-row tick box. Rendered in plan order.
 MARKER_ROW_TICK = 'dry-run-row-tick'
 
+#: NiceGUI marker on the market-hours banner's sentence, and on each of the four
+#: plan notices. Located by marker, not by text: the gate's message is ALSO the
+#: Submit button's tooltip, and every notice quotes wording that recurs in the
+#: reasons column, so a text search cannot tell whether the banner was drawn.
+MARKER_MARKET_BANNER = 'dry-run-market-banner'
+MARKER_PLAN_NOTICE = 'dry-run-plan-notice'
+
+#: Marker on the income panel's working-orders line, for the same reason.
+MARKER_WORKING_ORDERS = 'income-working-orders'
+
 #: Markers on the step 1 / step 2 percentage boxes, in label then symbol order.
 MARKER_LABEL_PCT = 'steps-label-pct'
 MARKER_SYMBOL_PCT = 'steps-symbol-pct'
@@ -92,7 +119,13 @@ class AllocationWizard:
     notional floor, the buying-power scaler or its own precheck already killed) is
     shown -- dropping it would tell the user there was nothing to do about a
     symbol they targeted -- but it is neither pre-ticked nor tickable: there is no
-    order to submit.
+    order to submit. The 'Not traded' section below the table gives those rows
+    their money: what was wanted, what will be held, and what never left the cash.
+
+    ``market`` gates Submit ONLY. When the market is closed the dialog still opens,
+    still refreshes and still recomputes: planning outside market hours is the
+    normal way to use this page. ``run_allocation`` re-checks the gate server-side,
+    because this dialog can sit open across the close.
     """
 
     def __init__(
@@ -100,19 +133,23 @@ class AllocationWizard:
         base: BaseSnapshot,
         plan: AllocationPlan,
         *,
+        market: MarketGateResult,
         on_refresh: Callable[[bool], AllocationPlan],
         on_submit: Callable[[AllocationPlan], None],
         title: str = 'Portfolio allocation - dry run',
     ):
         self.base = base
         self.plan = plan
+        self.market = market
         self.on_refresh = on_refresh
         self.on_submit = on_submit
         self.title = title
         self.allow_fractional = bool(plan.allow_fractional)
         self.selected = self._default_selection(plan)
         self.dialog = None
+        self._notices_container = None
         self._rows_container = None
+        self._no_order_container = None
         self._totals_container = None
         self._submit_button = None
         #: One-shot latch. See ``_submit``: NiceGUI runs a sync click handler
@@ -125,23 +162,96 @@ class AllocationWizard:
         with ui.dialog().props('maximized') as dialog, ui.card().classes('w-full h-full overflow-auto'):
             self.dialog = dialog
             ui.label(self.title).classes('text-xl font-bold')
+            self._render_market_banner()
             self._render_base_panel()
             ui.switch('Allow fractional shares', value=self.allow_fractional,
                       on_change=lambda e: self._refresh(bool(e.value)))
             ui.label(MARKET_ORDER_TIMING_NOTE).classes('text-xs text-orange-400')
+            self._notices_container = ui.column().classes('w-full')
             self._rows_container = ui.column().classes('w-full gap-0')
+            self._no_order_container = ui.column().classes('w-full')
             self._totals_container = ui.column().classes('w-full')
+            self._render_notices()
             self._render_rows()
+            self._render_no_order_rows()
             self._render_totals()
             with ui.row().classes('w-full justify-end gap-2 mt-4'):
                 ui.button('Refresh', on_click=lambda: self._refresh(self.allow_fractional)).props('outline')
                 ui.button('Cancel', on_click=dialog.close).props('flat')
                 self._submit_button = ui.button('Submit', on_click=self._submit) \
                     .props('color=primary')
+                if not self.market.allowed:
+                    # Disabled, not hidden: the user must see that Submit exists and
+                    # WHY it is off -- the banner right above says when it returns.
+                    self._submit_button.set_enabled(False)
+                    self._submit_button.tooltip(self.market.message)
         dialog.open()
         return dialog
 
     # -- internals --------------------------------------------------------
+    def _render_market_banner(self):
+        """The market-hours banner. Nothing at all when the market is open."""
+        if self.market.allowed:
+            return
+        css = MARKET_BANNER_CLASSES.get(self.market.severity, 'alert-banner warning')
+        with ui.element('div').classes(f'{css} w-full p-3'):
+            with ui.row().classes('items-center gap-2'):
+                ui.icon('schedule')
+                ui.label(self.market.message).classes('text-sm').mark(MARKER_MARKET_BANNER)
+
+    def _render_notices(self):
+        """The four plan-level sentences, up top.
+
+        About a quarter of this book cannot trade fractionally, some rows were
+        bumped UP to a whole share and some had their weight moved to keep a label
+        on target. Every one of those is the plan doing something the user did not
+        type, so none of them is a footnote.
+        """
+        self._notices_container.clear()
+        summary = fractional_summary(self.plan)
+        with self._notices_container:
+            for text in (whole_share_notice(summary), bump_notice(summary),
+                         no_order_notice(summary), redistribution_notice(summary)):
+                if not text:
+                    continue
+                with ui.element('div').classes('alert-banner warning w-full p-2 mt-2'):
+                    ui.label(text).classes('text-sm').mark(MARKER_PLAN_NOTICE)
+
+    def _render_no_order_rows(self):
+        """Symbols the plan wanted to trade and could not, with their money.
+
+        The table above lists what will be SENT, so on one of these rows its
+        quantity, side and value columns are all blank. This section says what was
+        WANTED instead -- the target, what will actually be held, and how much never
+        left the cash -- which is the whole point of surfacing them at all.
+        """
+        self._no_order_container.clear()
+        dropped = no_order_rows(self.plan)
+        if not dropped:
+            return
+        total = sum(r['unmet_notional'] for r in dropped)
+        with self._no_order_container:
+            with ui.expansion(f'Not traded ({len(dropped)}) - {total:,.2f} unallocated') \
+                    .classes('w-full mt-2'):
+                with ui.row().classes('w-full text-xs font-bold border-b py-1'):
+                    for header, width in (('Symbol', 'w-24'), ('Price', 'w-28'),
+                                          ('Outcome', 'w-32'), ('Target', 'w-28'),
+                                          ('Projected', 'w-28'), ('Unallocated', 'w-28'),
+                                          ('Why', 'flex-1')):
+                        ui.label(header).classes(width)
+                for row in dropped:
+                    with ui.row().classes('w-full text-sm items-center border-b py-1'):
+                        ui.label(row['symbol']).classes('w-24 font-medium')
+                        ui.label('-' if row['price'] is None
+                                 else f"{row['price']:,.2f}").classes('w-28')
+                        ui.label(row['outcome']).classes('w-32 text-xs text-orange-400')
+                        ui.label(f"{row['target_notional']:,.2f}").classes('w-28')
+                        projected = row['projected_notional']
+                        ui.label('-' if projected is None
+                                 else f"{projected:,.2f}").classes('w-28')
+                        ui.label(f"{row['unmet_notional']:,.2f}").classes('w-28 text-orange-400')
+                        ui.label(row['reasons']).classes('flex-1 text-xs text-gray-400')
+
     @staticmethod
     def _default_selection(plan: AllocationPlan) -> set:
         """Every row that will actually produce an order.
@@ -179,8 +289,11 @@ class AllocationWizard:
             with ui.row().classes('w-full text-xs font-bold border-b py-1'):
                 for header, width in (('', 'w-10'), ('Symbol', 'w-24'), ('Side', 'w-16'),
                                       ('Qty', 'w-28'), ('Order', 'w-28'),
-                                      ('Est. value', 'w-28'), ('BP cost', 'w-28'),
-                                      ('BP %', 'w-16'), ('Reasons', 'flex-1')):
+                                      ('Sizing', 'w-20'), ('Outcome', 'w-32'),
+                                      ('Est. value', 'w-28'), ('Target', 'w-28'),
+                                      ('Projected', 'w-28'), ('Weight', 'w-36'),
+                                      ('BP cost', 'w-28'), ('BP %', 'w-16'),
+                                      ('Reasons', 'flex-1')):
                     ui.label(header).classes(width)
             for row in rows:
                 self._render_row(row)
@@ -219,7 +332,26 @@ class AllocationWizard:
                 order_kind, order_class = 'whole shares', 'text-gray-400'
             ui.label(order_kind).classes('w-28 text-xs ' + order_class) \
                 .mark(MARKER_ORDER_KIND)
+            # The GRID the row was sized on, which is the column to scan when a
+            # quarter of the book cannot trade fractionally at all.
+            ui.label(row['sizing']).classes(
+                'w-20 text-xs ' + ('text-blue-400' if row['sizing'] == 'fractional'
+                                   else 'text-orange-400'))
+            # WHICH RULE produced the quantity. A bumped row holds MORE than the
+            # weights asked for, and that must never be silent.
+            ui.label(row['outcome']).classes(
+                'w-32 text-xs ' + ('text-orange-400' if row['outcome'] != 'normal'
+                                   else 'text-gray-400'))
             ui.label(f"{row['estimated_value']:,.2f}").classes('w-28')
+            ui.label(f"{row['target_notional']:,.2f}").classes('w-28')
+            projected = row['projected_notional']
+            ui.label('-' if projected is None else f"{projected:,.2f}").classes('w-28')
+            # ASKED -> ACTUAL. They differ whenever the grid, a bump or the label
+            # redistribution moved this row, and hiding that would be rewriting the
+            # user's weights behind their back.
+            ui.label(f"{row['weight_pct']:.2f}% → {row['projected_weight_pct']:.2f}%") \
+                .classes('w-36 text-xs ' + ('text-orange-400' if row['redistributed']
+                                            else 'text-gray-400'))
             ui.label(f"{row['bp_cost']:,.2f}").classes('w-28')
             ui.label(f"{row['bp_usage_pct']:.1f}%").classes('w-16')
             ui.label(row['reasons']).classes(
@@ -233,6 +365,7 @@ class AllocationWizard:
             totals = summarise_plan(selected_plan, cash=self.base.cash)
         except ValueError:
             totals = None
+        summary = fractional_summary(selected_plan)
         with self._totals_container:
             with ui.row().classes('w-full gap-6 mt-2 text-sm'):
                 ui.label(f"Sell value: {selected_plan.total_sell_value:,.2f}")
@@ -245,6 +378,19 @@ class AllocationWizard:
                 else:
                     ui.label('Est. cash after: unknown (broker published no cash balance)') \
                         .classes('text-orange-400')
+            with ui.row().classes('w-full gap-6 text-sm'):
+                # SIGNED: a bump's over-allocation nets against a rounding shortfall,
+                # which is what "how far off target will I be" actually means.
+                ui.label(f"Off target after rounding: {summary['residual_notional']:,.2f} "
+                         f"({summary['residual_pct']:.2f}% of base)") \
+                    .classes('text-orange-400' if abs(summary['residual_pct']) >= 1.0 else '')
+                ui.label(f"Fractional: {summary['fractional_rows']} / "
+                         f"whole shares: {summary['whole_share_rows']}"
+                         + (f" / eligibility unknown: {summary['unknown_rows']}"
+                            if summary['unknown_rows'] else ''))
+                if summary['bumped_rows']:
+                    ui.label(f"Bumped to 1 share: {summary['bumped_rows']} "
+                             f"(+{summary['bumped_notional']:,.2f})").classes('text-orange-400')
             if selected_plan.required_buying_power > selected_plan.available_buying_power:
                 ui.label('Required buying power exceeds available - the smallest buys will be '
                          'truncated as buying power runs out.').classes('text-xs text-orange-400')
@@ -265,7 +411,9 @@ class AllocationWizard:
             ui.notify(f'Refresh failed: {e}', type='negative')
             return
         self.selected = self._default_selection(self.plan)
+        self._render_notices()
         self._render_rows()
+        self._render_no_order_rows()
         self._render_totals()
         ui.notify('Dry run refreshed', type='info')
 
@@ -289,8 +437,17 @@ class AllocationWizard:
         results table takes over.
 
         An EMPTY submit does not latch: nothing was sent, and the user still has
-        to be able to tick a row and press Submit for real.
+        to be able to tick a row and press Submit for real. Neither does a submit
+        the MARKET GATE refuses.
         """
+        # FIRST, before touching any other state: the button is disabled, but a
+        # stale client or a keyboard activation must not get past this either. The
+        # real enforcement is in run_allocation, which re-reads the clock; this is
+        # the polite half, and it is deliberately ahead of the one-shot latch so a
+        # refused click leaves the dialog exactly as it found it.
+        if not self.market.allowed:
+            ui.notify(self.market.message, type=self.market.severity)
+            return
         if self._submitted:
             logger.warning('Allocation submit ignored: this dry run has already been '
                            'submitted (a second click during a blocking submit)')
@@ -312,12 +469,22 @@ def open_allocation_wizard(
     base: BaseSnapshot,
     plan: AllocationPlan,
     *,
+    market: MarketGateResult,
     on_refresh: Callable[[bool], AllocationPlan],
     on_submit: Callable[[AllocationPlan], None],
     title: str = 'Portfolio allocation - dry run',
 ) -> AllocationWizard:
-    """Open the dry-run dialog. Returns the wizard so the caller can keep a handle."""
-    wizard = AllocationWizard(base, plan, on_refresh=on_refresh, on_submit=on_submit, title=title)
+    """Open the dry-run dialog. Returns the wizard so the caller can keep a handle.
+
+    ``market`` is REQUIRED and has no default: a default would mean a caller that
+    forgets it submits into a closed market. Build it with
+    ``evaluate_market_gate(is_open=..., next_open=..., source=..., now=...)`` from
+    ``ui.utils.portfolio_allocation_view``, fed by
+    ``portfolio_allocation_service.fetch_market_hours(account)`` -- pass
+    ``is_open=None`` when that returns ``None`` OR when ``hours.is_known`` is False.
+    """
+    wizard = AllocationWizard(base, plan, market=market, on_refresh=on_refresh,
+                              on_submit=on_submit, title=title)
     wizard.open()
     return wizard
 
@@ -544,7 +711,8 @@ def open_allocation_steps(base: BaseSnapshot, labels: List[LabelTarget], *,
 
 def render_income_panel(events: List[Dict], open_total: float,
                         *, on_sync: Callable[[], None],
-                        on_invest: Callable[[float], None]) -> None:
+                        on_invest: Callable[[float], None],
+                        working_note: Optional[Tuple[str, str]] = None) -> None:
     """Last 30 days of income, the open total, and the Invest shortcut.
 
     The panel NEVER polls. ``on_sync`` is wired to the Refresh button and is
@@ -559,8 +727,20 @@ def render_income_panel(events: List[Dict], open_total: float,
     reachable state (a DIVNRA tax leg restates a dividend downwards while the
     consumed figure, the true record of the spend, is left alone), and a naive
     percentage renders above 100%.
+
+    ``working_note`` is the ``(text, severity)`` pair from
+    ``portfolio_allocation_view.working_orders_notice``, or ``None``. Orders still
+    working contribute ZERO to a run's ledger, so its income stays unconsumed until
+    they settle -- with a quarter of the book on whole shares that is the COMMON
+    outcome, and this is where the user is told. The decision and the wording are
+    pure and tested without NiceGUI; this function only draws them.
     """
     with ui.card().classes('w-full'):
+        if working_note is not None:
+            text, severity = working_note
+            css = MARKET_BANNER_CLASSES.get(severity, 'alert-banner warning')
+            with ui.element('div').classes(f'{css} w-full p-2'):
+                ui.label(text).classes('text-sm').mark(MARKER_WORKING_ORDERS)
         with ui.row().classes('w-full items-center justify-between'):
             ui.label('Income (last 30 days)').classes('text-lg font-bold')
             with ui.row().classes('gap-2 items-center'):
