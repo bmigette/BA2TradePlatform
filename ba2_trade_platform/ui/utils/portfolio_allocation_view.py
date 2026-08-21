@@ -9,7 +9,9 @@ Lives under ``ui/utils/`` rather than beside the page because
 stack); ``ui/utils/`` holds only perf_logger and imports in milliseconds.
 """
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
+
+from ...core.portfolio_allocation import PositionFetchFailed, PositionState
 
 # ---- gate reason codes (exact spellings; use these, never bare literals) ----
 
@@ -85,3 +87,68 @@ def evaluate_gate(account_id: Optional[int],
         )
 
     return GateResult(allowed=True, reason_code=GATE_OK, message="")
+
+
+def _probe(obj: Any, name: str) -> Any:
+    """Read ``name`` off a dict OR an object, tolerantly (brokers return both)."""
+    if isinstance(obj, dict):
+        return obj.get(name)
+    return getattr(obj, name, None)
+
+
+def positions_by_symbol(raw_positions) -> Dict[str, PositionState]:
+    """Turn a broker position list into ``{SYMBOL: PositionState}``.
+
+    Args:
+        raw_positions: whatever ``account.get_positions()`` returned — a list of
+            Position rows (objects or dicts), ``[]`` for a genuinely flat account,
+            or ``None`` for a FAILED fetch.
+
+    Returns:
+        Dict[str, PositionState]: keyed by normalised (.strip().upper()) symbol.
+        Duplicate rows for one symbol are summed.
+
+    Raises:
+        PositionFetchFailed: when ``raw_positions`` is ``None``. Defined in the
+            pure engine so the live service and this module raise the same class.
+        ValueError: when a row has no quantity or no cost basis — no fallback
+            values for quantities or balances (platform rule).
+    """
+    if raw_positions is None:
+        raise PositionFetchFailed(
+            "get_positions() returned None: the broker fetch FAILED. No allocation "
+            "may be computed against an unknown book — an empty list would mean "
+            "genuinely flat, None does not."
+        )
+
+    out: Dict[str, PositionState] = {}
+    for row in raw_positions:
+        raw_symbol = _probe(row, 'symbol')
+        if not raw_symbol:
+            continue
+        symbol = str(raw_symbol).strip().upper()
+
+        quantity = _probe(row, 'qty')
+        if quantity is None:
+            quantity = _probe(row, 'quantity')
+        if quantity is None:
+            raise ValueError(f"Position for {symbol} has no quantity — refusing to "
+                             f"substitute a default")
+
+        cost_basis = _probe(row, 'cost_basis')
+        if cost_basis is None:
+            raise ValueError(f"Position for {symbol} has no cost basis — refusing to "
+                             f"substitute a default")
+
+        market_value = _probe(row, 'market_value')
+
+        state = out.get(symbol)
+        if state is None:
+            state = PositionState(symbol=symbol)
+            out[symbol] = state
+        state.quantity += float(quantity)
+        state.cost_basis += float(cost_basis)
+        if market_value is not None:
+            state.market_value = (state.market_value or 0.0) + float(market_value)
+
+    return out
