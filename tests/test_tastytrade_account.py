@@ -769,3 +769,57 @@ def test_cancel_order_for_an_unknown_id_returns_false():
 
     assert acct.cancel_order("999999999") is False
     acct._account.delete_order.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Trading-capable class wiring
+# ---------------------------------------------------------------------------
+
+def test_tastytrade_account_is_a_trading_account_interface():
+    from ba2_trade_platform.core.interfaces import AccountInterface
+
+    assert issubclass(TastyTradeAccount, AccountInterface)
+
+
+def test_every_abstract_method_is_implemented_so_the_class_can_be_constructed():
+    """object.__new__ on an ABC raises unless every @abstractmethod is implemented."""
+    assert object.__new__(TastyTradeAccount) is not None
+
+
+def test_supports_trading_reads_true_from_the_provider_registry_class():
+    """ui/pages/settings.py:1435 reads it from the CLASS via the provider registry."""
+    from ba2_trade_platform.modules.accounts import providers
+
+    assert getattr(providers["TastyTrade"], "supports_trading", True) is True
+
+
+def test_supports_trading_reads_true_from_an_instance():
+    """core/TradeManager.py:921 and :1223 read it from the INSTANCE."""
+    assert getattr(_bare_account(), "supports_trading", True) is True
+
+
+def test_supports_trading_is_not_pinned_on_the_class_itself():
+    """A local pin is what made the class and instance reads disagree; inherit it."""
+    assert "supports_trading" not in TastyTradeAccount.__dict__
+
+
+def test_get_account_info_reports_trading_support():
+    acct = _bare_account()
+    acct._account.get_balances = AsyncMock(return_value=_balances())
+
+    assert acct.get_account_info()["supports_trading"] is True
+
+
+def test_modify_order_is_reported_as_unsupported():
+    assert _bare_account().modify_order("987654") is None
+
+
+def test_tp_sl_adjustment_is_reported_as_unsupported():
+    from tests.factories import create_transaction
+
+    acct = _bare_account()
+    transaction = create_transaction(symbol="AAPL")
+
+    assert acct.adjust_tp(transaction, 160.0) is False
+    assert acct.adjust_sl(transaction, 130.0) is False
+    assert acct.adjust_tp_sl(transaction, 160.0, 130.0) is False

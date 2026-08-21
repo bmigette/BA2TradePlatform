@@ -17,17 +17,36 @@ from ...core.db import add_instance, get_db, get_instance, update_instance, Inst
 from ...core.models import Position, TradingOrder
 from ...core.types import OrderDirection, OrderStatus
 from ...core.types import OrderType as CoreOrderType
-from ...core.interfaces import ReadOnlyAccountInterface
+from ...core.interfaces import AccountInterface
+from ...core.models import Transaction
 
 
-class TastyTradeAccount(ReadOnlyAccountInterface):
+class TastyTradeAccount(AccountInterface):
     """
-    Read-only account interface for TastyTrade brokerage.
+    Trading account interface for TastyTrade brokerage.
 
-    Uses the tastytrade Python SDK (async) with sync wrappers.
-    This account does NOT support trading operations.
+    Uses the tastytrade Python SDK 12.x (async) driven from a persistent
+    background event loop, so the httpx client's connections are never invalidated
+    by a closed loop.
+
+    ``supports_trading`` is deliberately NOT pinned here -- it is inherited as True
+    from AccountInterface. It is read from the CLASS at ui/pages/settings.py:1435 and
+    from the INSTANCE at core/TradeManager.py:921 and :1223; a local pin is exactly
+    what made those reads disagree.
+
+    Supported: equity market/limit/stop/stop-limit submission, cancellation, order and
+    position refresh, order preview (dry run), account snapshot, cash transfers and
+    per-symbol margin metadata.
+
+    Out of scope (explicitly unsupported below, never silently half-working):
+    ``modify_order``, TP/SL adjustment, complex orders and OptionsAccountInterface.
+
+    TWO SDK TRAPS:
+      * ``Account.place_order``'s ``dry_run`` DEFAULTS TO True (account.py:877) --
+        every real submission passes ``dry_run=False`` explicitly.
+      * ``NewOrder.price_effect`` is a computed field derived from the SIGN of
+        ``price`` (order.py:264-276) -- never set it by hand.
     """
-    supports_trading = False
 
     def __init__(self, id: int):
         super().__init__(id)
@@ -194,7 +213,7 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
                 "maintenance_requirement": float(balances.maintenance_requirement),
                 "pending_cash": float(balances.pending_cash),
                 "cash_available_to_withdraw": float(balances.cash_available_to_withdraw),
-                "supports_trading": False,
+                "supports_trading": self.supports_trading,
             }
         except Exception as e:
             logger.error(f"[Account {self.id}] Error getting account info: {e}", exc_info=True)
@@ -780,6 +799,46 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
             f"[Account {self.id}] Requested cancel of TastyTrade order "
             f"broker_order_id={db_order.broker_order_id} (db id={db_order.id})")
         return True
+
+    # ------------------------------------------------------------------
+    # Out of scope for TastyTrade (see class docstring). These are declared
+    # @abstractmethod on AccountInterface, so they must exist for the class to be
+    # instantiable -- but they fail LOUDLY rather than half-working.
+    # ------------------------------------------------------------------
+
+    def modify_order(self, order_id: str, trading_order: Optional[TradingOrder] = None):
+        """NOT SUPPORTED on TastyTrade.
+
+        The SDK exposes ``Account.replace_order``, but using it would need the whole
+        cancel/replace + dependent-order bookkeeping AlpacaAccount carries. Cancel the
+        order and submit a new one instead.
+        """
+        logger.error(
+            f"[Account {self.id}] modify_order is not supported for TastyTrade "
+            f"(order {order_id}); cancel and resubmit instead")
+        return None
+
+    def adjust_tp(self, transaction: Transaction, new_tp_price: float, source: str = "") -> bool:
+        """NOT SUPPORTED: TastyTrade protective-leg management is out of scope."""
+        logger.error(
+            f"[Account {self.id}] adjust_tp is not supported for TastyTrade "
+            f"(transaction {transaction.id}, requested {new_tp_price})")
+        return False
+
+    def adjust_sl(self, transaction: Transaction, new_sl_price: float, source: str = "") -> bool:
+        """NOT SUPPORTED: TastyTrade protective-leg management is out of scope."""
+        logger.error(
+            f"[Account {self.id}] adjust_sl is not supported for TastyTrade "
+            f"(transaction {transaction.id}, requested {new_sl_price})")
+        return False
+
+    def adjust_tp_sl(self, transaction: Transaction, new_tp_price: Optional[float] = None,
+                     new_sl_price: Optional[float] = None, source: str = "") -> bool:
+        """NOT SUPPORTED: TastyTrade protective-leg management is out of scope."""
+        logger.error(
+            f"[Account {self.id}] adjust_tp_sl is not supported for TastyTrade "
+            f"(transaction {transaction.id}, tp={new_tp_price}, sl={new_sl_price})")
+        return False
 
     def refresh_positions(self) -> bool:
         # Positions are always fetched live from API
