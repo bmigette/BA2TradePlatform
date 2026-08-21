@@ -3233,13 +3233,19 @@ def train_unified_optimization(
     checkpoint = load_ga_checkpoint(task_id)
     start_generation = 0
     initial_population = None
+    restored_fitnesses = None
 
     if checkpoint:
         logger.info(f"Resuming from checkpoint: gen {checkpoint.get('generation', 0)}")
         update_job_progress(task_id, progress_base, f"Resuming from generation {checkpoint.get('generation', 0)}")
         progress_state['all_individuals'] = checkpoint.get('all_individuals', [])
-        start_generation = checkpoint.get('generation', 0) + 1
+        # A PARTIAL checkpoint was written mid-evaluation, so resume INTO that generation rather
+        # than after it; 'fitnesses' says which individuals are already done.
+        start_generation = checkpoint.get('generation', 0)
+        if not checkpoint.get('partial'):
+            start_generation += 1
         initial_population = checkpoint.get('population', [])
+        restored_fitnesses = checkpoint.get('fitnesses')
     else:
         update_job_progress(task_id, progress_base, f"Starting unified optimization (pop={population_size}, gens={generations})")
 
@@ -3264,6 +3270,7 @@ def train_unified_optimization(
             callback=ga_callback,
             start_generation=start_generation,
             initial_population=initial_population,
+            restored_fitnesses=restored_fitnesses,
             checkpoint_callback=checkpoint_callback,
             on_generation_start=on_generation_start
         )

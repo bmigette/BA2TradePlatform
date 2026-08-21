@@ -63,8 +63,9 @@ def test_resume_backward_compatible_without_np_state():
         "history": [],
         "random_state": list(random.getstate()),
     }
-    start_gen, pop = opt.resume_from_checkpoint(legacy_cp)
+    start_gen, pop, fits = opt.resume_from_checkpoint(legacy_cp)
     assert start_gen == 1 and pop == [[0.5]]
+    assert fits is None          # pre-'fitnesses' checkpoint: everything re-evaluates
 
 
 def test_fitness_max_drawdown_negated():

@@ -324,7 +324,7 @@ class GeneticOptimizer:
             checkpoint: Saved checkpoint data containing population, generation, etc.
 
         Returns:
-            Tuple of (start_generation, population_data)
+            Tuple of (start_generation, population_data, fitnesses)
         """
         self.history = checkpoint.get('history', [])
         self.best_fitness = checkpoint.get('best_fitness')
@@ -346,7 +346,34 @@ class GeneticOptimizer:
                 logger.warning(f"Could not restore numpy random state: {e}")
 
         logger.info(f"Resuming from generation {checkpoint.get('generation', 0)}")
-        return checkpoint.get('generation', 0) + 1, checkpoint.get('population', [])
+        # partial=True means the stored generation was INTERRUPTED mid-evaluation, so resume INTO
+        # it rather than after it. The fitness list carries which individuals are already done.
+        next_gen = checkpoint.get('generation', 0)
+        if not checkpoint.get('partial'):
+            next_gen += 1
+        return next_gen, checkpoint.get('population', []), checkpoint.get('fitnesses')
+
+    def rebuild_population(self, genes: list, fitnesses: list = None) -> list:
+        """Rebuild a DEAP population from checkpointed genes + fitness values.
+
+        A ``None`` fitness (or a missing/short list) leaves that individual INVALID, which is
+        precisely the signal DEAP's ``invalid_ind`` filter acts on -- so an unevaluated
+        individual is re-run and an evaluated one is not. Never raises on a malformed list:
+        the worst outcome must be re-evaluating something, never crashing a resume.
+        """
+        population = []
+        for i, g in enumerate(genes):
+            ind = creator.Individual(g)
+            fit = None
+            if fitnesses is not None and i < len(fitnesses):
+                fit = fitnesses[i]
+            if fit is not None:
+                try:
+                    ind.fitness.values = (float(fit),)
+                except (TypeError, ValueError):
+                    pass          # unusable value -> leave invalid, it will be re-evaluated
+            population.append(ind)
+        return population
 
     def get_checkpoint_data(self, generation: int, population: list) -> Dict:
         """
@@ -362,6 +389,13 @@ class GeneticOptimizer:
         return {
             'generation': generation,
             'population': [list(ind) for ind in population],
+            # Fitness per individual, index-aligned with 'population'. None where the individual
+            # has not been evaluated -- which is what makes a MID-GENERATION checkpoint possible:
+            # on resume, DEAP's invalid-fitness filter re-runs exactly the Nones.
+            'fitnesses': [
+                ind.fitness.values[0] if ind.fitness.valid else None
+                for ind in population
+            ],
             'best_individual': list(self.best_individual) if self.best_individual else None,
             'best_fitness': self.best_fitness,
             'history': self.history,
@@ -375,6 +409,7 @@ class GeneticOptimizer:
         callback: Callable[[int, float, Dict], None] = None,
         start_generation: int = 0,
         initial_population: list = None,
+        restored_fitnesses: list = None,
         checkpoint_callback: Callable[[int, list], None] = None,
         on_generation_start: Callable[[int], None] = None,
         batch_fitness: Callable[[list], list] = None
@@ -387,7 +422,9 @@ class GeneticOptimizer:
             callback: Optional callback(generation, best_fitness, best_params) called after each generation
             start_generation: Generation to start from (for resume)
             initial_population: Initial population data (for resume)
-            checkpoint_callback: Called after each generation with (gen, population) for saving
+            restored_fitnesses: Fitness per restored individual, index-aligned with
+                initial_population. None entries stay INVALID and are re-evaluated.
+            checkpoint_callback: Called with (gen, population, partial=False) for saving
             on_generation_start: Optional callback(generation) called before evaluating each generation
 
         Returns:
@@ -397,8 +434,11 @@ class GeneticOptimizer:
 
         # Create or restore population
         if initial_population:
-            population = [creator.Individual(ind) for ind in initial_population]
-            logger.info(f"Restored population of {len(population)} individuals")
+            population = self.rebuild_population(initial_population, restored_fitnesses)
+            n_valid = sum(1 for ind in population if ind.fitness.valid)
+            logger.info(
+                f"Restored population of {len(population)} individuals "
+                f"({n_valid} already evaluated, {len(population) - n_valid} to run)")
         else:
             population = self.toolbox.population(n=self.population_size)
 

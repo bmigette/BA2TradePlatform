@@ -1315,7 +1315,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
 
             return batch_fitness
 
-        start_gen, init_pop = 0, None
+        start_gen, init_pop, init_fits = 0, None, None
         ckpt = _load_checkpoint(ckpt_task_id, ckpt_fingerprint)
         # EXHAUSTED CHECKPOINT: one written at (or past) the final generation leaves nothing to
         # run, and resuming into it produces a 0-trial run that reports "every backtest failed" --
@@ -1330,7 +1330,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
             _clear_checkpoint(ckpt_task_id)
             ckpt = None
         if ckpt:
-            start_gen, init_pop = optimizer.resume_from_checkpoint(ckpt)
+            start_gen, init_pop, init_fits = optimizer.resume_from_checkpoint(ckpt)
             logger.warning(
                 f"strategy_optimization {opt_id}: RESUMING {opt.name!r} at generation "
                 f"{start_gen}/{ga['generations']} from checkpoint {ckpt_task_id}")
@@ -1474,6 +1474,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 checkpoint_callback=checkpoint_cb,
                 start_generation=start_gen,
                 initial_population=init_pop,
+                restored_fitnesses=init_fits,
                 batch_fitness=batch_fitness,
             )
         except _FatalTrialError as e:

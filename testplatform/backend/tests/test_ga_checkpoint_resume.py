@@ -209,7 +209,8 @@ def test_saved_payload_survives_json_and_resumes(task_id):
     loaded = H._load_checkpoint(task_id, data["fingerprint"])
     assert loaded is not None
 
-    start_gen, population = opt.resume_from_checkpoint(loaded)
+    start_gen, population, fitnesses = opt.resume_from_checkpoint(loaded)
     assert start_gen == 3                      # resumes AFTER the checkpointed generation
     assert len(population) == 6
+    assert fitnesses == [None] * 6             # never evaluated -> all re-run
     assert all(len(ind) == len(pop[0]) for ind in population)
