@@ -786,3 +786,124 @@ def delete_account_allocation_data(account_id: int) -> Dict[str, int]:
         session.commit()
     logger.info(f"Deleted portfolio allocation data for account {account_id}: {counts}")
     return counts
+
+
+# ---------------------------------------------------------------------------
+# Page helpers: bulk label selection, symbol membership, comment reads
+# ---------------------------------------------------------------------------
+
+def replace_managed_labels(account_id: int, labels) -> Dict[str, int]:
+    """Make ``labels`` EXACTLY the account's managed set, in the given order.
+
+    This is the label-picker's writer; ``set_managed_label`` remains the writer
+    for ONE label's target/comment. A label that SURVIVES the change keeps its
+    row -- and therefore its ``target_pct`` and ``comment`` -- and only has its
+    ``sort_order`` restated: the picker fires on every change event, so
+    re-creating a survivor would wipe the user's target every time they ticked an
+    unrelated label. Unmanaging a label also deletes that account's lazy symbol
+    rows for it (the live DB runs with ``PRAGMA foreign_keys = 0``, so nothing
+    cascades on its own).
+
+    Returns:
+        Dict[str, int]: ``{'added': n, 'removed': n}``. Re-saving the same
+        selection returns zeroes, which lets an eager on-change handler skip a
+        pointless write.
+    """
+    wanted: List[str] = []
+    for label in (labels or []):
+        text = (label or "").strip()
+        if text and text not in wanted:
+            wanted.append(text)
+
+    added = removed = 0
+    with get_db() as session:
+        existing = session.exec(
+            select(PortfolioAllocationLabel)
+            .where(PortfolioAllocationLabel.account_id == account_id)
+        ).all()
+        by_label = {row.label: row for row in existing}
+
+        for label, row in list(by_label.items()):
+            if label in wanted:
+                continue
+            for srow in session.exec(select(PortfolioAllocationSymbol).where(
+                    PortfolioAllocationSymbol.account_id == account_id,
+                    PortfolioAllocationSymbol.label == label)).all():
+                session.delete(srow)
+            session.delete(row)
+            removed += 1
+
+        for order, label in enumerate(wanted):
+            row = by_label.get(label)
+            if row is None:
+                session.add(PortfolioAllocationLabel(
+                    account_id=account_id, label=label, target_pct=0.0, sort_order=order))
+                added += 1
+            elif row.sort_order != order:
+                row.sort_order = order
+                session.add(row)
+
+        session.commit()
+
+    logger.info(f"Managed labels for account {account_id}: +{added} / -{removed} -> {wanted}")
+    return {'added': added, 'removed': removed}
+
+
+def get_symbol_comments(account_id: int, label: str) -> Dict[str, str]:
+    """``{SYMBOL: comment}`` for one managed label; symbols with no comment are omitted."""
+    return {symbol: row.comment
+            for symbol, row in get_symbol_rows(account_id, label).items()
+            if row.comment}
+
+
+def add_symbols_to_label(account_id: int, label: str, symbols) -> int:
+    """Give ``symbols`` the instrument label ``label``. Returns instruments changed.
+
+    Instrument labels are GLOBAL (they live on the ``instrument`` row), so this
+    also affects any other account managing the same label. ``account_id`` is
+    accepted and logged for auditability.
+
+    A symbol does NOT need an open position: the page adds and removes label
+    membership for anything the user names, and the allocation engine treats a
+    labelled symbol with no position as a target to buy into.
+    """
+    from ba2_common.core.utils import add_label_to_instruments
+
+    lbl = (label or "").strip()
+    syms = _normalise_symbols(symbols)
+    if not lbl or not syms:
+        return 0
+    changed = add_label_to_instruments(syms, lbl)
+    logger.info(f"Account {account_id}: added label '{lbl}' to "
+                f"{changed}/{len(syms)} instrument(s)")
+    return changed
+
+
+def remove_symbols_from_label(account_id: int, label: str, symbols) -> int:
+    """Drop the instrument label AND delete this account's lazy symbol rows.
+
+    The row delete is scoped by ``(account_id, label, symbol)``: a symbol may sit
+    in several managed labels, and dropping it from one must not discard the
+    weight or comment it carries under another.
+
+    Returns the number of instruments whose label list changed.
+    """
+    from ba2_common.core.utils import remove_label_from_instruments
+
+    lbl = (label or "").strip()
+    syms = _normalise_symbols(symbols)
+    if not lbl or not syms:
+        return 0
+    changed = remove_label_from_instruments(syms, lbl)
+    with get_db() as session:
+        rows = session.exec(select(PortfolioAllocationSymbol).where(
+            PortfolioAllocationSymbol.account_id == account_id,
+            PortfolioAllocationSymbol.label == lbl,
+            PortfolioAllocationSymbol.symbol.in_(syms))).all()
+        for row in rows:
+            session.delete(row)
+        if rows:
+            session.commit()
+    logger.info(f"Account {account_id}: removed label '{lbl}' from "
+                f"{changed}/{len(syms)} instrument(s)")
+    return changed

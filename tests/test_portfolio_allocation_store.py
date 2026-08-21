@@ -877,3 +877,143 @@ def test_two_threads_finalising_different_runs_do_not_lose_a_consumption(
     assert round(store.get_open_income_total(account), 2) == 200.0, (
         "the ledger lost one run's consumption: two runs spent 400 each out of a "
         "1,000 deposit, so 200 must be left open")
+
+
+# --- page helpers: bulk label selection and symbol membership --------------
+
+def _instrument_labels(symbol):
+    from sqlmodel import select
+    from ba2_trade_platform.core.db import get_db as _get_db
+    from ba2_trade_platform.core.models import Instrument
+    with _get_db() as session:
+        inst = session.exec(select(Instrument).where(Instrument.name == symbol)).first()
+        return list(inst.labels) if inst else None
+
+
+def test_replace_managed_labels_creates_rows_in_selection_order(account_id):
+    store.replace_managed_labels(account_id, ['NASDAQ30', 'ARK26'])
+    labels = store.get_managed_labels(account_id)
+    assert [r.label for r in labels] == ['NASDAQ30', 'ARK26']
+    assert all(r.target_pct == 0.0 for r in labels)
+
+
+def test_replace_managed_labels_is_idempotent_and_reports_no_change(account_id):
+    store.replace_managed_labels(account_id, ['ARK26'])
+    assert store.replace_managed_labels(account_id, ['ARK26']) == {'added': 0, 'removed': 0}
+    assert [r.label for r in store.get_managed_labels(account_id)] == ['ARK26']
+
+
+def test_replace_managed_labels_unmanaging_deletes_the_symbol_rows(account_id):
+    store.replace_managed_labels(account_id, ['ARK26'])
+    store.set_symbol_weight(account_id, 'ARK26', 'TSLA', comment='core holding')
+    assert len(store.get_symbol_rows(account_id, 'ARK26')) == 1
+
+    assert store.replace_managed_labels(account_id, []) == {'added': 0, 'removed': 1}
+    assert store.get_managed_labels(account_id) == []
+    assert store.get_symbol_rows(account_id, 'ARK26') == {}
+
+
+def test_replace_managed_labels_is_scoped_per_account(account_id):
+    from tests.factories import create_account_definition
+    other = create_account_definition(name='Other Account')
+    store.replace_managed_labels(account_id, ['ARK26'])
+    store.replace_managed_labels(other.id, ['NASDAQ30'])
+    assert [r.label for r in store.get_managed_labels(account_id)] == ['ARK26']
+    assert [r.label for r in store.get_managed_labels(other.id)] == ['NASDAQ30']
+
+
+def test_replace_managed_labels_keeps_a_surviving_labels_target_and_comment(account_id):
+    """Re-saving the picker must not reset the labels the user KEPT.
+
+    This is the label-level twin of the comment-only-zeroes-the-weight bug
+    (``test_set_symbol_weight_leaves_unpassed_fields_untouched``): the picker
+    fires on every change event, so a bulk writer that re-created a surviving
+    row -- or wrote ``target_pct=0.0`` over it -- would wipe a 40% target every
+    time the user ticked an unrelated label, and the next rebalance would sell
+    the whole basket down to nothing.
+    """
+    store.set_managed_label(account_id, 'ARK26', target_pct=40.0, comment='growth')
+    store.replace_managed_labels(account_id, ['NASDAQ30', 'ARK26'])
+    kept = {r.label: r for r in store.get_managed_labels(account_id)}['ARK26']
+    assert kept.target_pct == 40.0
+    assert kept.comment == 'growth'
+
+
+def test_get_symbol_comments_returns_only_symbols_that_have_one(account_id):
+    store.replace_managed_labels(account_id, ['ARK26'])
+    assert store.get_symbol_comments(account_id, 'ARK26') == {}
+    store.set_symbol_weight(account_id, 'ARK26', ' tsla ', comment='trim on strength')
+    store.set_symbol_weight(account_id, 'ARK26', 'PLTR', weight_pct=25.0)
+    assert store.get_symbol_comments(account_id, 'ARK26') == {'TSLA': 'trim on strength'}
+
+
+def test_a_comment_only_write_on_an_unstored_symbol_creates_an_explicit_zero(account_id):
+    """Characterisation of the trap the PAGE has to avoid -- deliberately preserved.
+
+    ``set_symbol_weight`` creates the row with the model default
+    ``weight_pct=0.0`` and ``get_symbol_weights`` treats a row's EXISTENCE as an
+    explicit weight, so a bare comment write moves the symbol off its even-split
+    default onto a hard 0% and the next rebalance sells it out.
+
+    The invariant guarded here is the one the plan insists on: ``weight_pct ==
+    0.0`` stays a LEGITIMATE explicit zero and is never re-read as "unstored"
+    (doing that would re-introduce drift from the engine's
+    ``build_symbol_targets``). The fix therefore belongs at the call site --
+    see the test below -- and this test exists so that anyone who "fixes" it
+    here instead has to justify it.
+    """
+    store.set_symbol_weight(account_id, 'ARK26', 'TSLA', comment='core holding')
+    assert store.get_symbol_weights(account_id, 'ARK26', ['TSLA', 'PLTR']) == {
+        'TSLA': 0.0, 'PLTR': 100.0}
+
+
+def test_a_comment_written_with_the_effective_weight_preserves_the_allocation(account_id):
+    """The pattern the page uses: read the EFFECTIVE weight, write it with the comment.
+
+    Passing the even-split default back in makes the row explicit at exactly the
+    value it already had, so the comment saves and not one symbol's allocation
+    moves.
+    """
+    symbols = ['TSLA', 'PLTR']
+    before = store.get_symbol_weights(account_id, 'ARK26', symbols)
+    store.set_symbol_weight(account_id, 'ARK26', 'TSLA',
+                            weight_pct=before['TSLA'], comment='core holding')
+    assert store.get_symbol_weights(account_id, 'ARK26', symbols) == before
+    assert store.get_symbol_comments(account_id, 'ARK26') == {'TSLA': 'core holding'}
+
+
+def test_add_symbols_to_label_labels_the_instruments_normalised(account_id):
+    store.replace_managed_labels(account_id, ['ARK26'])
+    assert store.add_symbols_to_label(account_id, 'ARK26', [' tsla ', 'roku']) == 2
+    assert _instrument_labels('TSLA') == ['ARK26']
+    assert _instrument_labels('ROKU') == ['ARK26']
+
+
+def test_remove_symbols_from_label_unlabels_and_deletes_the_symbol_row(account_id):
+    store.replace_managed_labels(account_id, ['ARK26'])
+    store.add_symbols_to_label(account_id, 'ARK26', ['TSLA'])
+    store.set_symbol_weight(account_id, 'ARK26', 'TSLA', comment='core holding')
+
+    assert store.remove_symbols_from_label(account_id, 'ARK26', ['tsla']) == 1
+    assert _instrument_labels('TSLA') == []
+    assert store.get_symbol_rows(account_id, 'ARK26') == {}
+
+
+def test_remove_symbols_from_label_leaves_the_other_labels_rows_alone(account_id):
+    """A symbol may sit in two managed labels; removing it from one keeps the other.
+
+    The delete is scoped by ``(account_id, label, symbol)``. Widening it to
+    ``(account_id, symbol)`` would silently discard the weight and comment the
+    user set under the OTHER basket.
+    """
+    store.replace_managed_labels(account_id, ['ARK26', 'HighRisk'])
+    store.add_symbols_to_label(account_id, 'ARK26', ['TSLA'])
+    store.add_symbols_to_label(account_id, 'HighRisk', ['TSLA'])
+    store.set_symbol_weight(account_id, 'ARK26', 'TSLA', weight_pct=60.0, comment='ark note')
+    store.set_symbol_weight(account_id, 'HighRisk', 'TSLA', weight_pct=30.0, comment='hr note')
+
+    assert store.remove_symbols_from_label(account_id, 'ARK26', ['TSLA']) == 1
+    assert store.get_symbol_rows(account_id, 'ARK26') == {}
+    survivor = store.get_symbol_rows(account_id, 'HighRisk')['TSLA']
+    assert (survivor.weight_pct, survivor.comment) == (30.0, 'hr note')
+    assert _instrument_labels('TSLA') == ['HighRisk']
