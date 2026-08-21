@@ -57,6 +57,44 @@ def test_migration_indexes_match_the_model(migrated_engine, table_name):
     assert migrated == declared
 
 
+def test_the_migrated_schema_is_what_create_all_would_have_built(migrated_engine):
+    """Alembic's OWN comparator must see zero differences on the five tables.
+
+    The per-table column/index assertions above compare NAMES; this compares the
+    whole thing the way autogenerate does -- types, nullability, uniqueness,
+    added and removed columns -- so a column that exists in both places with the
+    wrong type or nullability cannot slip through. Every table that is not ours
+    is filtered out: the scratch DB holds only these five, so the rest of
+    ``SQLModel.metadata`` would otherwise show up as "add_table".
+    """
+    from alembic.autogenerate import compare_metadata
+
+    def _ours(obj, name, type_, reflected, compare_to):
+        if type_ == "table":
+            return (name or "").startswith("portfolio_")
+        return True
+
+    with migrated_engine.connect() as connection:
+        context = MigrationContext.configure(
+            connection, opts={"include_object": _ours, "compare_type": True})
+        diffs = compare_metadata(context, SQLModel.metadata)
+
+    assert diffs == [], f"migrated schema differs from create_all: {diffs}"
+
+
+def test_migration_records_the_income_consumption_guard(migrated_engine):
+    """``income_consumed_at`` is the replay guard, so it must exist and be NULLable.
+
+    NULL is what "this run has never spent from the ledger" is spelled as, and a
+    NOT NULL column with no server default would also break every raw-SQL insert
+    that predates it.
+    """
+    columns = {c["name"]: c for c in
+               inspect(migrated_engine).get_columns("portfolio_allocation_run")}
+    assert columns["income_consumed_at"]["nullable"] is True
+    assert columns["income_consumed_events"]["nullable"] is True
+
+
 def test_migration_enforces_the_income_idempotency_key(migrated_engine):
     unique = {tuple(u["column_names"])
               for u in inspect(migrated_engine).get_unique_constraints("portfolio_income_event")}

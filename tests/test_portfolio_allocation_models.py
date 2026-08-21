@@ -1,5 +1,5 @@
 """The five portfolio-allocation tables: round-trip, idempotency keys, computed properties."""
-from datetime import date
+from datetime import date, datetime as DateTime
 
 import pytest
 from sqlalchemy.exc import IntegrityError
@@ -79,6 +79,44 @@ def test_run_net_buy_value_is_zero_when_sells_exceed_buys():
     run = PortfolioAllocationRun(account_id=1, mode="REBALANCE",
                                  submitted_buy_value=1000.0, submitted_sell_value=4000.0)
     assert run.net_buy_value == 0.0
+
+
+def test_a_fresh_run_has_not_consumed_income():
+    """NULL ``income_consumed_at`` is what "this run has never spent from the
+    ledger" is spelled as -- the guard finalise_allocation_run checks."""
+    run = PortfolioAllocationRun(account_id=1, mode="REBALANCE")
+    assert run.income_consumed_at is None
+    assert run.is_income_consumed is False
+    assert run.income_consumed_amount == 0.0
+
+
+def test_run_income_consumed_amount_sums_the_breakdown():
+    run = PortfolioAllocationRun(account_id=1, mode="REBALANCE",
+                                 income_consumed_events=[[7, 100.0], [8, 150.5]])
+    assert run.income_consumed_amount == pytest.approx(250.5)
+
+
+def test_a_run_that_consumed_nothing_is_still_marked_consumed():
+    """A rebalance funded by its own sells takes 0.0 from the ledger, which is NOT
+    the same state as never having tried -- otherwise a recovery pass would
+    re-run it forever."""
+    run = PortfolioAllocationRun(account_id=1, mode="REBALANCE",
+                                 income_consumed_at=DateTime(2026, 8, 20, 12, 0),
+                                 income_consumed_events=[])
+    assert run.is_income_consumed is True
+    assert run.income_consumed_amount == 0.0
+
+
+def test_run_income_columns_round_trip(mock_account_def):
+    add_instance(PortfolioAllocationRun(
+        account_id=mock_account_def.id, mode="REBALANCE",
+        income_consumed_at=DateTime(2026, 8, 20, 12, 0),
+        income_consumed_events=[[3, 42.5]]))
+    with get_db() as session:
+        row = session.exec(select(PortfolioAllocationRun)).one()
+        assert row.is_income_consumed is True
+        assert row.income_consumed_events == [[3, 42.5]]
+        assert row.income_consumed_amount == pytest.approx(42.5)
 
 
 def test_run_json_columns_round_trip(mock_account_def):

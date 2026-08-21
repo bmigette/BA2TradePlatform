@@ -12,6 +12,23 @@ def account_id(mock_account_def):
     return mock_account_def.id
 
 
+def consume(account_id, net_buy_value, *, sell_value=0.0):
+    """Spend the income ledger the ONLY way the store allows: by finalising a run.
+
+    There is deliberately no ``consume_income(account_id, amount)`` any more --
+    money is spent on behalf of a run, once, so every consumption test has to go
+    through one. A "negative net buy value" is expressed the way the real thing
+    produces it: a run whose sells outweigh its buys.
+
+    Returns the ``[(income_event_id, amount)]`` the run actually took.
+    """
+    run = store.record_allocation_run(account_id, "REBALANCE", {})
+    finalised = store.finalise_allocation_run(
+        run.id, submitted_buy_value=net_buy_value, submitted_sell_value=sell_value,
+        order_ids=[])
+    return [tuple(pair) for pair in finalised.income_consumed_events]
+
+
 # --- managed labels --------------------------------------------------------
 
 def test_get_managed_labels_is_empty_for_a_new_account(account_id):
@@ -169,7 +186,7 @@ def test_reupserting_the_same_external_id_updates_instead_of_duplicating(account
 
 def test_reupserting_an_event_does_not_reset_what_was_already_consumed(account_id):
     store.upsert_income_event(account_id, "csd-1", date(2026, 8, 1), "DEPOSIT", 1000.0)
-    store.consume_income(account_id, 400.0)
+    consume(account_id, 400.0)
     store.upsert_income_event(account_id, "csd-1", date(2026, 8, 1), "DEPOSIT", 1000.0)
     assert store.get_open_income_total(account_id) == 600.0
 
@@ -196,9 +213,9 @@ def test_income_events_since_excludes_older_events(account_id):
 
 def test_consuming_with_a_zero_or_negative_net_buy_value_consumes_nothing(account_id):
     store.upsert_income_event(account_id, "csd-1", date(2026, 8, 1), "DEPOSIT", 1000.0)
-    assert store.consume_income(account_id, 0.0) == []
+    assert consume(account_id, 0.0) == []
     # A rebalance whose sells outweigh its buys is funded by itself, not by income.
-    assert store.consume_income(account_id, -250.0) == []
+    assert consume(account_id, 750.0, sell_value=1000.0) == []
     assert store.get_open_income_total(account_id) == pytest.approx(1000.0)
 
 
@@ -207,13 +224,13 @@ def test_consuming_a_sub_cent_net_buy_value_writes_nothing(account_id):
     Inherited from ``consume_income_events`` -- an inline FIFO walk here would
     instead persist a 1e-7 consumption on the oldest event."""
     store.upsert_income_event(account_id, "csd-1", date(2026, 8, 1), "DEPOSIT", 1000.0)
-    assert store.consume_income(account_id, 1e-7) == []
+    assert consume(account_id, 1e-7) == []
     assert store.get_open_income_events(account_id)[0].consumed_amount == 0.0
 
 
 def test_consuming_partially_leaves_a_remainder_open(account_id):
     event = store.upsert_income_event(account_id, "csd-1", date(2026, 8, 1), "DEPOSIT", 1000.0)
-    assert store.consume_income(account_id, 300.0) == [(event.id, 300.0)]
+    assert consume(account_id, 300.0) == [(event.id, 300.0)]
     open_events = store.get_open_income_events(account_id)
     assert len(open_events) == 1
     assert open_events[0].consumed_amount == pytest.approx(300.0)
@@ -223,7 +240,7 @@ def test_consuming_partially_leaves_a_remainder_open(account_id):
 def test_consuming_spends_the_oldest_event_first_then_spills_over(account_id):
     first = store.upsert_income_event(account_id, "a", date(2026, 8, 1), "DEPOSIT", 100.0)
     second = store.upsert_income_event(account_id, "b", date(2026, 8, 5), "DIVIDEND", 500.0)
-    assert store.consume_income(account_id, 250.0) == [(first.id, 100.0), (second.id, 150.0)]
+    assert consume(account_id, 250.0) == [(first.id, 100.0), (second.id, 150.0)]
     assert store.get_open_income_total(account_id) == pytest.approx(350.0)
 
 
@@ -232,7 +249,7 @@ def test_consuming_broker_cents_leaves_the_right_remainder(account_id):
     a = store.upsert_income_event(account_id, "a", date(2026, 8, 1), "DIVIDEND", 10.01, symbol="AAPL")
     b = store.upsert_income_event(account_id, "b", date(2026, 8, 2), "DIVIDEND", 20.02, symbol="MSFT")
     c = store.upsert_income_event(account_id, "c", date(2026, 8, 3), "DIVIDEND", 30.03, symbol="KO")
-    taken = store.consume_income(account_id, 45.0)
+    taken = consume(account_id, 45.0)
     assert [event_id for event_id, _ in taken] == [a.id, b.id, c.id]
     assert sum(amount for _, amount in taken) == pytest.approx(45.0)
     assert store.get_open_income_total(account_id) == pytest.approx(15.06)
@@ -240,18 +257,18 @@ def test_consuming_broker_cents_leaves_the_right_remainder(account_id):
 
 def test_consuming_more_than_the_ledger_holds_empties_it_without_error(account_id):
     store.upsert_income_event(account_id, "a", date(2026, 8, 1), "DEPOSIT", 100.0)
-    consumed = store.consume_income(account_id, 9999.0)
+    consumed = consume(account_id, 9999.0)
     assert sum(amount for _, amount in consumed) == pytest.approx(100.0)
     assert store.get_open_income_total(account_id) == 0.0
 
 
 def test_consuming_an_empty_ledger_returns_nothing(account_id):
-    assert store.consume_income(account_id, 500.0) == []
+    assert consume(account_id, 500.0) == []
 
 
 def test_fully_consumed_events_drop_out_of_the_open_list(account_id):
     store.upsert_income_event(account_id, "csd-1", date(2026, 8, 1), "DEPOSIT", 100.0)
-    store.consume_income(account_id, 100.0)
+    consume(account_id, 100.0)
     assert store.get_open_income_events(account_id) == []
     assert store.get_open_income_total(account_id) == 0.0
 
@@ -261,11 +278,11 @@ def test_an_event_restated_below_what_it_already_spent_is_skipped(account_id):
     dividend downward AFTER a run consumed the gross. ``open_amount`` clamps at 0,
     so the event must simply be skipped -- never contribute a negative take."""
     store.upsert_income_event(account_id, "div-1", date(2026, 8, 1), "DIVIDEND", 100.0, symbol="AAPL")
-    store.consume_income(account_id, 100.0)
+    consume(account_id, 100.0)
     store.upsert_income_event(account_id, "div-1", date(2026, 8, 1), "DIVIDEND", 60.0, symbol="AAPL")
     later = store.upsert_income_event(account_id, "csd-2", date(2026, 8, 2), "DEPOSIT", 500.0)
 
-    assert store.consume_income(account_id, 200.0) == [(later.id, 200.0)]
+    assert consume(account_id, 200.0) == [(later.id, 200.0)]
     assert store.get_open_income_total(account_id) == pytest.approx(300.0)
     over_consumed = {e.external_id: e for e in
                      store.get_income_events_since(account_id, date(2026, 8, 1))}["div-1"]
@@ -278,9 +295,29 @@ def test_consumption_is_scoped_to_one_account(account_id):
     other = create_account_definition(name="Other Account")
     store.upsert_income_event(account_id, "a", date(2026, 8, 1), "DEPOSIT", 100.0)
     store.upsert_income_event(other.id, "a", date(2026, 8, 1), "DEPOSIT", 100.0)
-    store.consume_income(account_id, 100.0)
+    consume(account_id, 100.0)
     assert store.get_open_income_total(account_id) == 0.0
     assert store.get_open_income_total(other.id) == pytest.approx(100.0)
+
+
+def test_two_runs_each_consume_their_own_share_oldest_first(account_id):
+    """Consecutive runs walk the same FIFO queue; the second picks up the remainder."""
+    first = store.upsert_income_event(account_id, "a", date(2026, 8, 1), "DEPOSIT", 300.0)
+    second = store.upsert_income_event(account_id, "b", date(2026, 8, 5), "DIVIDEND", 500.0)
+    assert consume(account_id, 200.0) == [(first.id, 200.0)]
+    assert consume(account_id, 400.0) == [(first.id, 100.0), (second.id, 300.0)]
+    assert store.get_open_income_total(account_id) == pytest.approx(200.0)
+
+
+def test_the_store_exposes_no_account_level_consume_entry_point():
+    """Money is spent on behalf of a RUN, so there is nothing to call without one.
+
+    The removed ``consume_income(account_id, net_buy_value)`` was replayable by
+    construction: nothing in it recorded which run had already spent. If it comes
+    back, this fails.
+    """
+    assert not hasattr(store, "consume_income")
+    assert not hasattr(store, "update_allocation_run_totals")
 
 
 # --- run audit -------------------------------------------------------------
@@ -310,12 +347,12 @@ def test_recent_runs_is_empty_for_an_account_that_never_ran(account_id):
     assert store.get_recent_runs(account_id) == []
 
 
-def test_update_allocation_run_totals_writes_back_what_was_actually_submitted(account_id):
+def test_finalise_allocation_run_writes_back_what_was_actually_submitted(account_id):
     """The run row is created BEFORE submission so its id can be stamped into every
-    order comment, then updated with the real totals afterwards."""
+    order comment, then finalised with the real totals afterwards."""
     run = store.record_allocation_run(account_id, "REBALANCE", {"rows": []},
                                       base_notional=10_000.0)
-    updated = store.update_allocation_run_totals(
+    updated = store.finalise_allocation_run(
         run.id, submitted_buy_value=1600.0, submitted_sell_value=400.0, order_ids=[101, 102])
     assert updated.submitted_buy_value == 1600.0
     assert updated.submitted_sell_value == 400.0
@@ -326,31 +363,45 @@ def test_update_allocation_run_totals_writes_back_what_was_actually_submitted(ac
 
 def test_a_run_funded_entirely_by_its_own_sells_has_no_net_buy_value(account_id):
     """``net_buy_value`` clamps at 0 so such a rebalance consumes NO income."""
-    run = store.record_allocation_run(account_id, "REBALANCE", {},
-                                      submitted_buy_value=4000.0, submitted_sell_value=9000.0)
-    assert run.net_buy_value == 0.0
-    assert store.consume_income(account_id, run.net_buy_value) == []
+    store.upsert_income_event(account_id, "csd-1", date(2026, 8, 1), "DEPOSIT", 1000.0)
+    run = store.record_allocation_run(account_id, "REBALANCE", {})
+    finalised = store.finalise_allocation_run(
+        run.id, submitted_buy_value=4000.0, submitted_sell_value=9000.0, order_ids=[])
+    assert finalised.net_buy_value == 0.0
+    assert finalised.income_consumed_events == []
+    assert finalised.income_consumed_amount == 0.0
+    assert store.get_open_income_total(account_id) == pytest.approx(1000.0)
+    # It still counts as consumed: the income step RAN and correctly took nothing,
+    # which is why it must not show up as unfinished work.
+    assert finalised.is_income_consumed is True
+    assert store.get_unconsumed_runs(account_id) == []
 
 
-def test_update_allocation_run_totals_rejects_a_missing_total(account_id):
+def test_finalise_allocation_run_rejects_a_missing_total(account_id):
     """A None total would silently understate net_buy_value and under-consume the
     ledger, so it must raise HERE -- not deep inside ``float(None)``."""
     run = store.record_allocation_run(account_id, "REBALANCE", {})
     with pytest.raises(ValueError, match="both totals"):
-        store.update_allocation_run_totals(
+        store.finalise_allocation_run(
             run.id, submitted_buy_value=None, submitted_sell_value=0.0, order_ids=[])
+    # The refusal is total: nothing was stamped, so the run is still recoverable.
+    assert [r.id for r in store.get_unconsumed_runs(account_id)] == [run.id]
 
 
-def test_update_allocation_run_totals_raises_when_the_run_is_gone():
+def test_finalise_allocation_run_raises_when_the_run_is_gone():
     from ba2_common.core.db import InstanceNotFound
     with pytest.raises(InstanceNotFound):
-        store.update_allocation_run_totals(
+        store.finalise_allocation_run(
             999_999, submitted_buy_value=1.0, submitted_sell_value=0.0, order_ids=[])
 
 
 def test_a_run_row_written_by_raw_sql_reads_back_with_null_json(account_id):
     """plan_json/order_ids are nullable JSON with PYTHON-side defaults, so a row
-    that did not go through this module lands NULL, not {}/[]. Reads must cope."""
+    that did not go through this module lands NULL, not {}/[]. Reads must cope.
+
+    ``income_consumed_at`` is nullable for the same reason it is the guard: a row
+    nobody stamped has NOT consumed income, and a NULL JSON breakdown must read as
+    0.0 rather than blowing up."""
     from sqlalchemy import text
     from ba2_common.core.db import get_db
     with get_db() as session:
@@ -365,6 +416,118 @@ def test_a_run_row_written_by_raw_sql_reads_back_with_null_json(account_id):
     assert row.plan_json is None
     assert row.order_ids is None
     assert row.net_buy_value == 0.0
+    assert row.income_consumed_events is None
+    assert row.is_income_consumed is False
+    assert row.income_consumed_amount == 0.0
+
+
+# --- income consumption is idempotent per run ------------------------------
+
+def test_finalising_the_same_run_twice_consumes_the_ledger_once(account_id):
+    """The replay guard. A service-layer retry re-states the totals but must NOT
+    spend the ledger a second time -- that is duplicated real money."""
+    event = store.upsert_income_event(account_id, "csd-1", date(2026, 8, 1), "DEPOSIT", 5000.0)
+    run = store.record_allocation_run(account_id, "INVEST_LABEL", {}, scope_label="ARK26")
+
+    first = store.finalise_allocation_run(
+        run.id, submitted_buy_value=1600.0, submitted_sell_value=0.0, order_ids=[101])
+    second = store.finalise_allocation_run(
+        run.id, submitted_buy_value=1600.0, submitted_sell_value=0.0, order_ids=[101])
+
+    assert first.income_consumed_amount == pytest.approx(1600.0)
+    # Same answer both times, and the ledger only moved once.
+    assert second.income_consumed_amount == pytest.approx(1600.0)
+    assert second.income_consumed_events == [[event.id, 1600.0]]
+    assert second.income_consumed_at == first.income_consumed_at
+    assert store.get_open_income_total(account_id) == pytest.approx(3400.0)
+
+
+def test_a_replayed_run_restates_its_totals_without_respending(account_id):
+    """A retry that submitted more on the second pass still consumes only once.
+
+    Restating the money that went out is harmless and useful; taking the ledger
+    again is the bug. The recorded consumption stays the one that happened.
+    """
+    store.upsert_income_event(account_id, "csd-1", date(2026, 8, 1), "DEPOSIT", 5000.0)
+    run = store.record_allocation_run(account_id, "REBALANCE", {})
+    store.finalise_allocation_run(run.id, submitted_buy_value=1000.0,
+                                  submitted_sell_value=0.0, order_ids=[1])
+
+    replayed = store.finalise_allocation_run(
+        run.id, submitted_buy_value=2500.0, submitted_sell_value=0.0, order_ids=[1, 2])
+
+    assert replayed.submitted_buy_value == pytest.approx(2500.0)
+    assert replayed.order_ids == [1, 2]
+    assert replayed.income_consumed_amount == pytest.approx(1000.0)
+    assert store.get_open_income_total(account_id) == pytest.approx(4000.0)
+
+
+def test_a_crashed_run_is_visibly_unconsumed_and_can_be_recovered(account_id):
+    """Crash recovery. A submit that died before finalising leaves the ledger
+    untouched AND the run un-stamped, so the money it spent at the broker is
+    findable instead of being silently re-allocated by the next run."""
+    store.upsert_income_event(account_id, "csd-1", date(2026, 8, 1), "DEPOSIT", 5000.0)
+    crashed = store.record_allocation_run(account_id, "REBALANCE", {})
+    # ... orders went out here, then the process died before finalise_allocation_run.
+
+    assert [r.id for r in store.get_unconsumed_runs(account_id)] == [crashed.id]
+    assert store.get_recent_runs(account_id)[0].is_income_consumed is False
+    assert store.get_open_income_total(account_id) == pytest.approx(5000.0)
+
+    recovered = store.finalise_allocation_run(
+        crashed.id, submitted_buy_value=1600.0, submitted_sell_value=0.0, order_ids=[101])
+
+    assert recovered.income_consumed_amount == pytest.approx(1600.0)
+    assert store.get_open_income_total(account_id) == pytest.approx(3400.0)
+    assert store.get_unconsumed_runs(account_id) == []
+
+
+def test_unconsumed_runs_are_scoped_to_one_account_and_newest_first(account_id):
+    from tests.factories import create_account_definition
+    other = create_account_definition(name="Other Account")
+    first = store.record_allocation_run(account_id, "REBALANCE", {}, scope_label="A")
+    second = store.record_allocation_run(account_id, "REBALANCE", {}, scope_label="B")
+    store.record_allocation_run(other.id, "REBALANCE", {}, scope_label="C")
+    store.finalise_allocation_run(first.id, submitted_buy_value=0.0,
+                                  submitted_sell_value=0.0, order_ids=[])
+
+    assert [r.id for r in store.get_unconsumed_runs(account_id)] == [second.id]
+    assert [r.scope_label for r in store.get_unconsumed_runs(other.id)] == ["C"]
+
+
+def test_the_consumption_breakdown_says_which_events_a_run_spent(account_id):
+    """Per-run attribution: which income paid for this run, and how much of each.
+
+    This is what a run id on a consumption row would have bought, without a
+    sixth table -- and consumption is many-to-many (one run spans several events,
+    one event is split across runs), so a scalar run id on the event could not
+    have expressed it anyway.
+    """
+    first = store.upsert_income_event(account_id, "a", date(2026, 8, 1), "DEPOSIT", 100.0)
+    second = store.upsert_income_event(account_id, "b", date(2026, 8, 5), "DIVIDEND", 500.0)
+    run = store.record_allocation_run(account_id, "REBALANCE", {})
+
+    finalised = store.finalise_allocation_run(
+        run.id, submitted_buy_value=250.0, submitted_sell_value=0.0, order_ids=[])
+
+    assert finalised.income_consumed_events == [[first.id, 100.0], [second.id, 150.0]]
+    assert finalised.income_consumed_amount == pytest.approx(250.0)
+    assert store.get_recent_runs(account_id)[0].income_consumed_amount == pytest.approx(250.0)
+
+
+def test_a_run_consuming_more_than_the_ledger_holds_is_still_stamped(account_id):
+    """A shortfall is not an error -- buying power is the constraint, not the
+    ledger -- but the run must still be marked consumed, or a recovery pass would
+    keep trying to spend income that was never there."""
+    store.upsert_income_event(account_id, "a", date(2026, 8, 1), "DEPOSIT", 100.0)
+    run = store.record_allocation_run(account_id, "REBALANCE", {})
+
+    finalised = store.finalise_allocation_run(
+        run.id, submitted_buy_value=9999.0, submitted_sell_value=0.0, order_ids=[])
+
+    assert finalised.income_consumed_amount == pytest.approx(100.0)
+    assert finalised.is_income_consumed is True
+    assert store.get_unconsumed_runs(account_id) == []
 
 
 # --- account deletion cleanup ---------------------------------------------

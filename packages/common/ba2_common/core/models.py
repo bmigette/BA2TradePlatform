@@ -944,6 +944,15 @@ class PortfolioAllocationRun(SQLModel, table=True):
     (buying power plus the current value of managed positions, at plan time); in
     an INVEST_LABEL run it is simply THE BUDGET being spent. Read it together
     with ``mode``.
+
+    ``income_consumed_at`` is the IDEMPOTENCY GUARD for the income ledger. NULL
+    means this run has never spent from ``portfolio_income_event``; a timestamp
+    means it has, exactly once. ``portfolio_allocation_store.finalise_allocation_run``
+    writes the ledger takes, ``income_consumed_events`` and this stamp in ONE
+    transaction, so a retry cannot consume twice and a crash cannot leave money
+    spent-but-unrecorded (or recorded-but-unspent). A run row whose totals are
+    written but whose stamp is NULL is a run that died mid-submit -- see
+    ``get_unconsumed_runs``.
     """
     __tablename__ = "portfolio_allocation_run"
 
@@ -958,9 +967,33 @@ class PortfolioAllocationRun(SQLModel, table=True):
     submitted_buy_value: float = Field(default=0.0, description="Sum of estimated value of BUY orders actually submitted")
     submitted_sell_value: float = Field(default=0.0, description="Sum of estimated value of SELL orders actually submitted")
     order_ids: List[int] = Field(sa_column=Column(JSON), default_factory=list, description="TradingOrder ids created by this run")
+    income_consumed_at: DateTime | None = Field(default=None, description="When this run consumed the income ledger; NULL means it never has (idempotency guard)")
+    income_consumed_events: List[Any] = Field(sa_column=Column(JSON), default_factory=list, description="[[income_event_id, amount], ...] this run actually took from the ledger")
     created_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), index=True)
 
     @property
     def net_buy_value(self) -> float:
         """``max(0, buys - sells)`` -- what this run consumes from the income ledger."""
         return max(0.0, (self.submitted_buy_value or 0.0) - (self.submitted_sell_value or 0.0))
+
+    @property
+    def is_income_consumed(self) -> bool:
+        """Has this run's income-ledger consumption already been applied?
+
+        The guard the store checks before spending: ``income_consumed_at`` is set
+        in the SAME transaction as the ledger writes, so True means the money was
+        taken and False means it was not -- there is no half-way state.
+        """
+        return self.income_consumed_at is not None
+
+    @property
+    def income_consumed_amount(self) -> float:
+        """Total taken from the income ledger by this run; 0.0 when it took nothing.
+
+        Derived from ``income_consumed_events`` rather than stored, so the total
+        and the per-event breakdown can never disagree. Reads 0.0 both for a run
+        that has not consumed yet and for one that legitimately consumed nothing
+        (a rebalance funded by its own sells) -- use ``is_income_consumed`` to
+        tell those apart.
+        """
+        return float(sum(amount for _, amount in (self.income_consumed_events or [])))

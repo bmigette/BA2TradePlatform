@@ -2557,7 +2557,7 @@ Create `tests/test_portfolio_allocation_models.py`:
 
 ```python
 """The five portfolio-allocation tables: round-trip, idempotency keys, computed properties."""
-from datetime import date
+from datetime import date, datetime as DateTime
 
 import pytest
 from sqlalchemy.exc import IntegrityError
@@ -2637,6 +2637,44 @@ def test_run_net_buy_value_is_zero_when_sells_exceed_buys():
     run = PortfolioAllocationRun(account_id=1, mode="REBALANCE",
                                  submitted_buy_value=1000.0, submitted_sell_value=4000.0)
     assert run.net_buy_value == 0.0
+
+
+def test_a_fresh_run_has_not_consumed_income():
+    """NULL ``income_consumed_at`` is what "this run has never spent from the
+    ledger" is spelled as -- the guard finalise_allocation_run checks."""
+    run = PortfolioAllocationRun(account_id=1, mode="REBALANCE")
+    assert run.income_consumed_at is None
+    assert run.is_income_consumed is False
+    assert run.income_consumed_amount == 0.0
+
+
+def test_run_income_consumed_amount_sums_the_breakdown():
+    run = PortfolioAllocationRun(account_id=1, mode="REBALANCE",
+                                 income_consumed_events=[[7, 100.0], [8, 150.5]])
+    assert run.income_consumed_amount == pytest.approx(250.5)
+
+
+def test_a_run_that_consumed_nothing_is_still_marked_consumed():
+    """A rebalance funded by its own sells takes 0.0 from the ledger, which is NOT
+    the same state as never having tried -- otherwise a recovery pass would
+    re-run it forever."""
+    run = PortfolioAllocationRun(account_id=1, mode="REBALANCE",
+                                 income_consumed_at=DateTime(2026, 8, 20, 12, 0),
+                                 income_consumed_events=[])
+    assert run.is_income_consumed is True
+    assert run.income_consumed_amount == 0.0
+
+
+def test_run_income_columns_round_trip(mock_account_def):
+    add_instance(PortfolioAllocationRun(
+        account_id=mock_account_def.id, mode="REBALANCE",
+        income_consumed_at=DateTime(2026, 8, 20, 12, 0),
+        income_consumed_events=[[3, 42.5]]))
+    with get_db() as session:
+        row = session.exec(select(PortfolioAllocationRun)).one()
+        assert row.is_income_consumed is True
+        assert row.income_consumed_events == [[3, 42.5]]
+        assert row.income_consumed_amount == pytest.approx(42.5)
 
 
 def test_run_json_columns_round_trip(mock_account_def):
@@ -2811,6 +2849,15 @@ class PortfolioAllocationRun(SQLModel, table=True):
     (buying power plus the current value of managed positions, at plan time); in
     an INVEST_LABEL run it is simply THE BUDGET being spent. Read it together
     with ``mode``.
+
+    ``income_consumed_at`` is the IDEMPOTENCY GUARD for the income ledger. NULL
+    means this run has never spent from ``portfolio_income_event``; a timestamp
+    means it has, exactly once. ``portfolio_allocation_store.finalise_allocation_run``
+    writes the ledger takes, ``income_consumed_events`` and this stamp in ONE
+    transaction, so a retry cannot consume twice and a crash cannot leave money
+    spent-but-unrecorded (or recorded-but-unspent). A run row whose totals are
+    written but whose stamp is NULL is a run that died mid-submit -- see
+    ``get_unconsumed_runs``.
     """
     __tablename__ = "portfolio_allocation_run"
 
@@ -2825,13 +2872,50 @@ class PortfolioAllocationRun(SQLModel, table=True):
     submitted_buy_value: float = Field(default=0.0, description="Sum of estimated value of BUY orders actually submitted")
     submitted_sell_value: float = Field(default=0.0, description="Sum of estimated value of SELL orders actually submitted")
     order_ids: List[int] = Field(sa_column=Column(JSON), default_factory=list, description="TradingOrder ids created by this run")
+    income_consumed_at: DateTime | None = Field(default=None, description="When this run consumed the income ledger; NULL means it never has (idempotency guard)")
+    income_consumed_events: List[Any] = Field(sa_column=Column(JSON), default_factory=list, description="[[income_event_id, amount], ...] this run actually took from the ledger")
     created_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), index=True)
 
     @property
     def net_buy_value(self) -> float:
         """``max(0, buys - sells)`` -- what this run consumes from the income ledger."""
         return max(0.0, (self.submitted_buy_value or 0.0) - (self.submitted_sell_value or 0.0))
+
+    @property
+    def is_income_consumed(self) -> bool:
+        """Has this run's income-ledger consumption already been applied?
+
+        The guard the store checks before spending: ``income_consumed_at`` is set
+        in the SAME transaction as the ledger writes, so True means the money was
+        taken and False means it was not -- there is no half-way state.
+        """
+        return self.income_consumed_at is not None
+
+    @property
+    def income_consumed_amount(self) -> float:
+        """Total taken from the income ledger by this run; 0.0 when it took nothing.
+
+        Derived from ``income_consumed_events`` rather than stored, so the total
+        and the per-event breakdown can never disagree. Reads 0.0 both for a run
+        that has not consumed yet and for one that legitimately consumed nothing
+        (a rebalance funded by its own sells) -- use ``is_income_consumed`` to
+        tell those apart.
+        """
+        return float(sum(amount for _, amount in (self.income_consumed_events or [])))
 ```
+
+> **Why two extra columns on this table (decided in Section B's exit review).** Income
+> consumption has to be idempotent PER RUN: `record_allocation_run` and the consumption are
+> separate transactions by necessity (the run id must exist before submission, to stamp into
+> the order comments), so without a guard a retry spends the ledger twice and a crash spends it
+> at the broker without ever marking it spent. The guard has to be written in the same
+> transaction as the ledger takes, which means it has to live on a row that already exists at
+> that point — this one. `income_consumed_events` carries the per-event breakdown that a
+> `run_id` on the consumption record would have given, without a sixth table: consumption is
+> MANY-TO-MANY (one run drains several events, one event is split across runs), so a scalar
+> `run_id` column on `portfolio_income_event` could not have expressed it in the first place.
+> `income_consumed_amount` is a `@property` over that JSON — no column, no migration, and the
+> total can never disagree with the breakdown.
 
 **3b.** In `tests/conftest.py`, extend the existing model import list. Replace line 22
 (`    OptionIVSnapshot, OptionActivity,`) with:
@@ -2848,7 +2932,7 @@ which resolves through the shim and registers the new tables on `SQLModel.metada
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_models.py -v`
-Expected: PASS — `12 passed`
+Expected: PASS — `16 passed`
 
 - [ ] **Step 5: Commit**
 
@@ -2933,6 +3017,44 @@ def test_migration_indexes_match_the_model(migrated_engine, table_name):
     assert migrated == declared
 
 
+def test_the_migrated_schema_is_what_create_all_would_have_built(migrated_engine):
+    """Alembic's OWN comparator must see zero differences on the five tables.
+
+    The per-table column/index assertions above compare NAMES; this compares the
+    whole thing the way autogenerate does -- types, nullability, uniqueness,
+    added and removed columns -- so a column that exists in both places with the
+    wrong type or nullability cannot slip through. Every table that is not ours
+    is filtered out: the scratch DB holds only these five, so the rest of
+    ``SQLModel.metadata`` would otherwise show up as "add_table".
+    """
+    from alembic.autogenerate import compare_metadata
+
+    def _ours(obj, name, type_, reflected, compare_to):
+        if type_ == "table":
+            return (name or "").startswith("portfolio_")
+        return True
+
+    with migrated_engine.connect() as connection:
+        context = MigrationContext.configure(
+            connection, opts={"include_object": _ours, "compare_type": True})
+        diffs = compare_metadata(context, SQLModel.metadata)
+
+    assert diffs == [], f"migrated schema differs from create_all: {diffs}"
+
+
+def test_migration_records_the_income_consumption_guard(migrated_engine):
+    """``income_consumed_at`` is the replay guard, so it must exist and be NULLable.
+
+    NULL is what "this run has never spent from the ledger" is spelled as, and a
+    NOT NULL column with no server default would also break every raw-SQL insert
+    that predates it.
+    """
+    columns = {c["name"]: c for c in
+               inspect(migrated_engine).get_columns("portfolio_allocation_run")}
+    assert columns["income_consumed_at"]["nullable"] is True
+    assert columns["income_consumed_events"]["nullable"] is True
+
+
 def test_migration_enforces_the_income_idempotency_key(migrated_engine):
     unique = {tuple(u["column_names"])
               for u in inspect(migrated_engine).get_unique_constraints("portfolio_income_event")}
@@ -3004,6 +3126,13 @@ Index names are the ones SQLAlchemy itself emits for these models
 an existing one agree. Foreign keys are declarative only -- the live DB runs with
 PRAGMA foreign_keys = 0 -- so account deletion must clear these tables
 explicitly (see portfolio_allocation_store.delete_account_allocation_data).
+
+Amended before ever being applied (the live DB is still two revisions behind, at
+d5e1b9a3c842, and no row of these tables exists anywhere) to add
+portfolio_allocation_run.income_consumed_at / income_consumed_events: the
+per-run idempotency guard for income consumption. Amending in place is only
+legal because nothing has run this revision yet; once it ships, the same change
+costs a second revision.
 """
 from typing import Sequence, Union
 
@@ -3105,6 +3234,12 @@ def upgrade() -> None:
         sa.Column("submitted_buy_value", sa.Float(), nullable=False),
         sa.Column("submitted_sell_value", sa.Float(), nullable=False),
         sa.Column("order_ids", sa.JSON(), nullable=True),
+        # Income-ledger replay guard. NULL = this run has never consumed income;
+        # a timestamp = it has, exactly once. Written in the SAME transaction as
+        # the portfolio_income_event updates (see finalise_allocation_run), so
+        # the check and the spend cannot interleave.
+        sa.Column("income_consumed_at", sa.DateTime(), nullable=True),
+        sa.Column("income_consumed_events", sa.JSON(), nullable=True),
         sa.Column("created_at", sa.DateTime(), nullable=False),
         sa.ForeignKeyConstraint(["account_id"], ["accountdefinition.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),
@@ -3125,7 +3260,7 @@ def downgrade() -> None:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_migration.py -v`
-Expected: PASS — `15 passed` (5 standalone tests plus two 5-way parametrisations)
+Expected: PASS — `17 passed` (7 standalone tests plus two 5-way parametrisations)
 
 If `test_migration_indexes_match_the_model` fails on `portfolio_allocation_config`, compare the
 reported sets: SQLModel's `unique=True, index=True` emits exactly one unique index named
@@ -3888,8 +4023,10 @@ def test_reupserting_the_same_external_id_updates_instead_of_duplicating(account
 
 
 def test_reupserting_an_event_does_not_reset_what_was_already_consumed(account_id):
+    # ``consume()`` is the run-based spend helper added in Task 13; this test is
+    # the deferred one that goes green at the end of Task 14.
     store.upsert_income_event(account_id, "csd-1", date(2026, 8, 1), "DEPOSIT", 1000.0)
-    store.consume_income(account_id, 400.0)
+    consume(account_id, 400.0)
     store.upsert_income_event(account_id, "csd-1", date(2026, 8, 1), "DEPOSIT", 1000.0)
     assert store.get_open_income_total(account_id) == 600.0
 
@@ -3912,9 +4049,9 @@ def test_income_events_since_excludes_older_events(account_id):
     assert [e.external_id for e in recent] == ["new"]
 ```
 
-`test_reupserting_an_event_does_not_reset_what_was_already_consumed` uses `consume_income`,
-which arrives in Task 13 — it stays red until then. That is the point: a re-sync must never
-resurrect money the platform already spent.
+`test_reupserting_an_event_does_not_reset_what_was_already_consumed` spends through the
+`consume()` run helper (Task 13) and the run audit behind it (Task 14) — it stays red until
+then. That is the point: a re-sync must never resurrect money the platform already spent.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -4003,7 +4140,7 @@ def upsert_income_event(account_id: int, external_id: str, event_date: Date,
 def get_open_income_events(account_id: int) -> List[PortfolioIncomeEvent]:
     """Income events with money left, OLDEST FIRST (event_date, then id).
 
-    That is exactly the order ``consume_income()`` spends them in.
+    That is exactly the order ``finalise_allocation_run()`` spends them in.
     """
     with get_db() as session:
         rows = session.exec(
@@ -4051,8 +4188,8 @@ def get_income_events_since(account_id: int, since: Date) -> List[PortfolioIncom
 
 Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_store.py -v`
 Expected: `27 passed, 1 failed` — the only failure is
-`test_reupserting_an_event_does_not_reset_what_was_already_consumed` with
-`AttributeError: ... has no attribute 'consume_income'`. Task 13 turns it green.
+`test_reupserting_an_event_does_not_reset_what_was_already_consumed`, which spends through the
+`consume()` run helper and so needs the run audit. Task 14 turns it green.
 
 - [ ] **Step 5: Commit**
 
@@ -4063,7 +4200,17 @@ git commit -m "feat(allocation): idempotent income-event upsert and ledger reads
 
 ---
 
-### Task 13: Store — FIFO income consumption
+### Task 13: Store — FIFO income consumption (private; spendable only through a run)
+
+> **There is no public `consume_income(account_id, net_buy_value)`.** Section B's exit review
+> killed it: an account-level "spend this much" call is replayable by construction — nothing in
+> it records which run already spent, so a service-layer retry consumes the ledger twice and a
+> crash between the totals write and the consume leaves money spent at the broker but still
+> showing as unallocated income. The FIFO walk below is therefore a PRIVATE helper that takes
+> the caller's session and does NOT commit; Task 14's `finalise_allocation_run` commits it
+> together with the run's `income_consumed_at` stamp, which is what makes consumption
+> idempotent per run. The tests below spend through a run for the same reason, and go green at
+> the end of Task 14 (the same deferred-test pattern as Task 12's re-upsert case).
 
 **Files:**
 - Modify: `packages/common/ba2_common/core/portfolio_allocation_store.py` (append)
@@ -4071,7 +4218,28 @@ git commit -m "feat(allocation): idempotent income-event upsert and ledger reads
 
 - [ ] **Step 1: Write the failing test**
 
-Append to the end of `tests/test_portfolio_allocation_store.py`:
+Add the run-based spend helper next to the `account_id` fixture at the top of
+`tests/test_portfolio_allocation_store.py`:
+
+```python
+def consume(account_id, net_buy_value, *, sell_value=0.0):
+    """Spend the income ledger the ONLY way the store allows: by finalising a run.
+
+    There is deliberately no ``consume_income(account_id, amount)`` any more --
+    money is spent on behalf of a run, once, so every consumption test has to go
+    through one. A "negative net buy value" is expressed the way the real thing
+    produces it: a run whose sells outweigh its buys.
+
+    Returns the ``[(income_event_id, amount)]`` the run actually took.
+    """
+    run = store.record_allocation_run(account_id, "REBALANCE", {})
+    finalised = store.finalise_allocation_run(
+        run.id, submitted_buy_value=net_buy_value, submitted_sell_value=sell_value,
+        order_ids=[])
+    return [tuple(pair) for pair in finalised.income_consumed_events]
+```
+
+and append to the end of the same file:
 
 ```python
 
@@ -4080,9 +4248,9 @@ Append to the end of `tests/test_portfolio_allocation_store.py`:
 
 def test_consuming_with_a_zero_or_negative_net_buy_value_consumes_nothing(account_id):
     store.upsert_income_event(account_id, "csd-1", date(2026, 8, 1), "DEPOSIT", 1000.0)
-    assert store.consume_income(account_id, 0.0) == []
+    assert consume(account_id, 0.0) == []
     # A rebalance whose sells outweigh its buys is funded by itself, not by income.
-    assert store.consume_income(account_id, -250.0) == []
+    assert consume(account_id, 750.0, sell_value=1000.0) == []
     assert store.get_open_income_total(account_id) == pytest.approx(1000.0)
 
 
@@ -4091,13 +4259,13 @@ def test_consuming_a_sub_cent_net_buy_value_writes_nothing(account_id):
     Inherited from ``consume_income_events`` -- an inline FIFO walk here would
     instead persist a 1e-7 consumption on the oldest event."""
     store.upsert_income_event(account_id, "csd-1", date(2026, 8, 1), "DEPOSIT", 1000.0)
-    assert store.consume_income(account_id, 1e-7) == []
+    assert consume(account_id, 1e-7) == []
     assert store.get_open_income_events(account_id)[0].consumed_amount == 0.0
 
 
 def test_consuming_partially_leaves_a_remainder_open(account_id):
     event = store.upsert_income_event(account_id, "csd-1", date(2026, 8, 1), "DEPOSIT", 1000.0)
-    assert store.consume_income(account_id, 300.0) == [(event.id, 300.0)]
+    assert consume(account_id, 300.0) == [(event.id, 300.0)]
     open_events = store.get_open_income_events(account_id)
     assert len(open_events) == 1
     assert open_events[0].consumed_amount == pytest.approx(300.0)
@@ -4107,7 +4275,7 @@ def test_consuming_partially_leaves_a_remainder_open(account_id):
 def test_consuming_spends_the_oldest_event_first_then_spills_over(account_id):
     first = store.upsert_income_event(account_id, "a", date(2026, 8, 1), "DEPOSIT", 100.0)
     second = store.upsert_income_event(account_id, "b", date(2026, 8, 5), "DIVIDEND", 500.0)
-    assert store.consume_income(account_id, 250.0) == [(first.id, 100.0), (second.id, 150.0)]
+    assert consume(account_id, 250.0) == [(first.id, 100.0), (second.id, 150.0)]
     assert store.get_open_income_total(account_id) == pytest.approx(350.0)
 
 
@@ -4116,7 +4284,7 @@ def test_consuming_broker_cents_leaves_the_right_remainder(account_id):
     a = store.upsert_income_event(account_id, "a", date(2026, 8, 1), "DIVIDEND", 10.01, symbol="AAPL")
     b = store.upsert_income_event(account_id, "b", date(2026, 8, 2), "DIVIDEND", 20.02, symbol="MSFT")
     c = store.upsert_income_event(account_id, "c", date(2026, 8, 3), "DIVIDEND", 30.03, symbol="KO")
-    taken = store.consume_income(account_id, 45.0)
+    taken = consume(account_id, 45.0)
     assert [event_id for event_id, _ in taken] == [a.id, b.id, c.id]
     assert sum(amount for _, amount in taken) == pytest.approx(45.0)
     assert store.get_open_income_total(account_id) == pytest.approx(15.06)
@@ -4124,18 +4292,18 @@ def test_consuming_broker_cents_leaves_the_right_remainder(account_id):
 
 def test_consuming_more_than_the_ledger_holds_empties_it_without_error(account_id):
     store.upsert_income_event(account_id, "a", date(2026, 8, 1), "DEPOSIT", 100.0)
-    consumed = store.consume_income(account_id, 9999.0)
+    consumed = consume(account_id, 9999.0)
     assert sum(amount for _, amount in consumed) == pytest.approx(100.0)
     assert store.get_open_income_total(account_id) == 0.0
 
 
 def test_consuming_an_empty_ledger_returns_nothing(account_id):
-    assert store.consume_income(account_id, 500.0) == []
+    assert consume(account_id, 500.0) == []
 
 
 def test_fully_consumed_events_drop_out_of_the_open_list(account_id):
     store.upsert_income_event(account_id, "csd-1", date(2026, 8, 1), "DEPOSIT", 100.0)
-    store.consume_income(account_id, 100.0)
+    consume(account_id, 100.0)
     assert store.get_open_income_events(account_id) == []
     assert store.get_open_income_total(account_id) == 0.0
 
@@ -4145,11 +4313,11 @@ def test_an_event_restated_below_what_it_already_spent_is_skipped(account_id):
     dividend downward AFTER a run consumed the gross. ``open_amount`` clamps at 0,
     so the event must simply be skipped -- never contribute a negative take."""
     store.upsert_income_event(account_id, "div-1", date(2026, 8, 1), "DIVIDEND", 100.0, symbol="AAPL")
-    store.consume_income(account_id, 100.0)
+    consume(account_id, 100.0)
     store.upsert_income_event(account_id, "div-1", date(2026, 8, 1), "DIVIDEND", 60.0, symbol="AAPL")
     later = store.upsert_income_event(account_id, "csd-2", date(2026, 8, 2), "DEPOSIT", 500.0)
 
-    assert store.consume_income(account_id, 200.0) == [(later.id, 200.0)]
+    assert consume(account_id, 200.0) == [(later.id, 200.0)]
     assert store.get_open_income_total(account_id) == pytest.approx(300.0)
     over_consumed = {e.external_id: e for e in
                      store.get_income_events_since(account_id, date(2026, 8, 1))}["div-1"]
@@ -4162,10 +4330,33 @@ def test_consumption_is_scoped_to_one_account(account_id):
     other = create_account_definition(name="Other Account")
     store.upsert_income_event(account_id, "a", date(2026, 8, 1), "DEPOSIT", 100.0)
     store.upsert_income_event(other.id, "a", date(2026, 8, 1), "DEPOSIT", 100.0)
-    store.consume_income(account_id, 100.0)
+    consume(account_id, 100.0)
     assert store.get_open_income_total(account_id) == 0.0
     assert store.get_open_income_total(other.id) == pytest.approx(100.0)
+
+
+def test_two_runs_each_consume_their_own_share_oldest_first(account_id):
+    """Consecutive runs walk the same FIFO queue; the second picks up the remainder."""
+    first = store.upsert_income_event(account_id, "a", date(2026, 8, 1), "DEPOSIT", 300.0)
+    second = store.upsert_income_event(account_id, "b", date(2026, 8, 5), "DIVIDEND", 500.0)
+    assert consume(account_id, 200.0) == [(first.id, 200.0)]
+    assert consume(account_id, 400.0) == [(first.id, 100.0), (second.id, 300.0)]
+    assert store.get_open_income_total(account_id) == pytest.approx(200.0)
+
+
+def test_the_store_exposes_no_account_level_consume_entry_point():
+    """Money is spent on behalf of a RUN, so there is nothing to call without one.
+
+    The removed ``consume_income(account_id, net_buy_value)`` was replayable by
+    construction: nothing in it recorded which run had already spent. If it comes
+    back, this fails.
+    """
+    assert not hasattr(store, "consume_income")
+    assert not hasattr(store, "update_allocation_run_totals")
 ```
+
+The earlier Task 12 test `test_reupserting_an_event_does_not_reset_what_was_already_consumed`
+uses the same `consume()` helper, which is why it stays red until Task 14.
 
 Totals are compared with `pytest.approx`: `get_open_income_total` SUMS floats, and real
 broker cents drift (10.01 + 20.02 + 30.03 consumed by 45.00 leaves `15.059999999999999`,
@@ -4175,7 +4366,7 @@ the next person copying an exact-equality assertion into a case where it flakes.
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_store.py -v`
-Expected: FAIL — `AttributeError: module 'ba2_common.core.portfolio_allocation_store' has no attribute 'consume_income'`
+Expected: FAIL — `AttributeError: module 'ba2_common.core.portfolio_allocation_store' has no attribute 'record_allocation_run'`
 
 - [ ] **Step 3: Write minimal implementation**
 
@@ -4209,8 +4400,16 @@ Then append to the end of the same file:
 ```python
 
 
-def consume_income(account_id: int, net_buy_value: float) -> List[Tuple[int, float]]:
-    """FIFO-consume the income ledger against a run's NET buy value.
+def _apply_income_consumption(session, account_id: int,
+                              net_buy_value: float) -> List[Tuple[int, float]]:
+    """FIFO-consume the income ledger against a run's NET buy value. NO COMMIT.
+
+    PRIVATE on purpose. It takes the caller's session and leaves it dirty so that
+    the ledger writes land in the SAME transaction as the run's
+    ``income_consumed_at`` stamp -- that single commit is what makes consumption
+    idempotent per run. A public "consume this much for this account" entry point
+    would be exactly the replay hazard this module is built to prevent, so there
+    isn't one: go through ``finalise_allocation_run()``.
 
     ``net_buy_value`` is ``max(0, submitted_buy_value - submitted_sell_value)``: a
     rebalance funded entirely by its own sells consumes nothing. Anything ``<= 0``
@@ -4223,7 +4422,7 @@ def consume_income(account_id: int, net_buy_value: float) -> List[Tuple[int, flo
     The FIFO arithmetic itself is NOT re-derived here: it is the engine's pure
     ``consume_income_events``, so the rule exists exactly once and the service
     layer's dry-run preview cannot drift from what this actually writes. All this
-    function adds is the IO -- load in order, apply the takes, commit.
+    function adds is the IO -- load in order, apply the takes.
 
     Events whose ``open_amount`` is 0 are skipped, which covers the over-consumed
     case: a DIVNRA tax leg can restate a dividend BELOW its ``consumed_amount``
@@ -4236,45 +4435,54 @@ def consume_income(account_id: int, net_buy_value: float) -> List[Tuple[int, flo
         ``net_buy_value`` when the ledger cannot cover it; buying power, not the
         ledger, is the feasibility constraint.
     """
-    budget = float(net_buy_value)
+    budget = float(net_buy_value or 0.0)
     if budget <= 0:
         return []
-    with get_db() as session:
-        rows = session.exec(
-            select(PortfolioIncomeEvent)
-            .where(PortfolioIncomeEvent.account_id == account_id)
-            .order_by(PortfolioIncomeEvent.event_date, PortfolioIncomeEvent.id)
-        ).all()
-        # open_amount is a PROPERTY, not a column, so it cannot be filtered in SQL;
-        # the rows are still attached here, which is what makes reading it legal.
-        open_rows = [row for row in rows if row.open_amount > 0]
-        consumed = consume_income_events(
-            [(row.id, row.open_amount) for row in open_rows], budget)
-        by_id = {row.id: row for row in open_rows}
-        for event_id, take in consumed:
-            row = by_id[event_id]
-            row.consumed_amount = (row.consumed_amount or 0.0) + take
-            session.add(row)
-        if consumed:
-            session.commit()
-    logger.info(f"Allocation run consumed {len(consumed)} income event(s) for account "
-                f"{account_id} against a net buy value of {net_buy_value:.2f}")
+    rows = session.exec(
+        select(PortfolioIncomeEvent)
+        .where(PortfolioIncomeEvent.account_id == account_id)
+        .order_by(PortfolioIncomeEvent.event_date, PortfolioIncomeEvent.id)
+    ).all()
+    # open_amount is a PROPERTY, not a column, so it cannot be filtered in SQL;
+    # the rows are still attached here, which is what makes reading it legal.
+    open_rows = [row for row in rows if row.open_amount > 0]
+    consumed = consume_income_events(
+        [(row.id, row.open_amount) for row in open_rows], budget)
+    by_id = {row.id: row for row in open_rows}
+    for event_id, take in consumed:
+        row = by_id[event_id]
+        row.consumed_amount = (row.consumed_amount or 0.0) + take
+        session.add(row)
     return consumed
 ```
 
-> **Why this delegates instead of walking the rows itself.** Task 74's
-> `consume_income_for_run` already documents this store function as the one that
-> "delegates the FIFO arithmetic to the pure `portfolio_allocation.consume_income_events`",
-> so an inline walk here would have been a second implementation of the rule and
-> contradicted the plan downstream. Delegating also inherits the engine's
-> `MONEY_EPSILON` stop condition: an inline `remaining <= 0` loop persists a 1e-7
-> consumption for a sub-cent net buy value, which the engine deliberately does not.
-> The direction is store -> engine only; the engine must never import the store.
+and extend the module docstring's "Two rules the callers depend on" into three, adding:
+
+```python
+* The income ledger is spent ONLY through ``finalise_allocation_run()``, which
+  writes a run's totals, the ledger takes and the run's ``income_consumed_at``
+  stamp in ONE transaction. There is deliberately no account-level "consume this
+  much" entry point: money is only ever spent on behalf of a run, exactly once,
+  and a run that never reached this call is visibly un-consumed
+  (``get_unconsumed_runs()``).
+```
+
+> **Why this delegates instead of walking the rows itself.** The FIFO rule must exist
+> exactly once, so the dry-run preview the service shows cannot drift from what actually
+> gets written. Delegating also inherits the engine's `MONEY_EPSILON` stop condition: an
+> inline `remaining <= 0` loop persists a 1e-7 consumption for a sub-cent net buy value,
+> which the engine deliberately does not. The direction is store -> engine only; the engine
+> must never import the store.
 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_store.py -v`
-Expected: PASS — `38 passed` (Task 12's deferred re-upsert test is now green too)
+
+Expected: the consumption tests are still RED with
+`AttributeError: ... has no attribute 'record_allocation_run'` — they spend through a run,
+and the run audit is Task 14. This step has no green of its own; the whole file goes green
+at Task 14 Step 4 (same deferred pattern as Task 12's re-upsert test). What Step 3 buys you
+is that the FIFO IO exists and is committed by exactly one caller.
 
 - [ ] **Step 5: Commit**
 
@@ -4285,7 +4493,17 @@ git commit -m "feat(allocation): FIFO income consumption against a run's net buy
 
 ---
 
-### Task 14: Store — allocation run audit
+### Task 14: Store — allocation run audit and the atomic finalise
+
+> **`update_allocation_run_totals` became `finalise_allocation_run`, and it consumes the
+> income ledger itself.** Section B's exit review found that "write the totals" and "consume
+> the ledger" as two transactions had no safe ordering: consume-after-totals leaves a crash
+> window where money is spent at the broker but still shows as unallocated income (so the next
+> run spends it again), and consume-before-totals reads a `net_buy_value` of 0.0 and stamps
+> the run as consumed forever. One call, one transaction, one commit removes the choice. It
+> also removes the "read `net_buy_value` off the CREATE result" footgun for good: the budget is
+> derived from the totals this call writes, on the row as re-read inside it — a caller cannot
+> pass the wrong number because a caller no longer passes it at all.
 
 **Files:**
 - Modify: `packages/common/ba2_common/core/portfolio_allocation_store.py` (append)
@@ -4325,12 +4543,12 @@ def test_recent_runs_is_empty_for_an_account_that_never_ran(account_id):
     assert store.get_recent_runs(account_id) == []
 
 
-def test_update_allocation_run_totals_writes_back_what_was_actually_submitted(account_id):
+def test_finalise_allocation_run_writes_back_what_was_actually_submitted(account_id):
     """The run row is created BEFORE submission so its id can be stamped into every
-    order comment, then updated with the real totals afterwards."""
+    order comment, then finalised with the real totals afterwards."""
     run = store.record_allocation_run(account_id, "REBALANCE", {"rows": []},
                                       base_notional=10_000.0)
-    updated = store.update_allocation_run_totals(
+    updated = store.finalise_allocation_run(
         run.id, submitted_buy_value=1600.0, submitted_sell_value=400.0, order_ids=[101, 102])
     assert updated.submitted_buy_value == 1600.0
     assert updated.submitted_sell_value == 400.0
@@ -4341,31 +4559,45 @@ def test_update_allocation_run_totals_writes_back_what_was_actually_submitted(ac
 
 def test_a_run_funded_entirely_by_its_own_sells_has_no_net_buy_value(account_id):
     """``net_buy_value`` clamps at 0 so such a rebalance consumes NO income."""
-    run = store.record_allocation_run(account_id, "REBALANCE", {},
-                                      submitted_buy_value=4000.0, submitted_sell_value=9000.0)
-    assert run.net_buy_value == 0.0
-    assert store.consume_income(account_id, run.net_buy_value) == []
+    store.upsert_income_event(account_id, "csd-1", date(2026, 8, 1), "DEPOSIT", 1000.0)
+    run = store.record_allocation_run(account_id, "REBALANCE", {})
+    finalised = store.finalise_allocation_run(
+        run.id, submitted_buy_value=4000.0, submitted_sell_value=9000.0, order_ids=[])
+    assert finalised.net_buy_value == 0.0
+    assert finalised.income_consumed_events == []
+    assert finalised.income_consumed_amount == 0.0
+    assert store.get_open_income_total(account_id) == pytest.approx(1000.0)
+    # It still counts as consumed: the income step RAN and correctly took nothing,
+    # which is why it must not show up as unfinished work.
+    assert finalised.is_income_consumed is True
+    assert store.get_unconsumed_runs(account_id) == []
 
 
-def test_update_allocation_run_totals_rejects_a_missing_total(account_id):
+def test_finalise_allocation_run_rejects_a_missing_total(account_id):
     """A None total would silently understate net_buy_value and under-consume the
     ledger, so it must raise HERE -- not deep inside ``float(None)``."""
     run = store.record_allocation_run(account_id, "REBALANCE", {})
     with pytest.raises(ValueError, match="both totals"):
-        store.update_allocation_run_totals(
+        store.finalise_allocation_run(
             run.id, submitted_buy_value=None, submitted_sell_value=0.0, order_ids=[])
+    # The refusal is total: nothing was stamped, so the run is still recoverable.
+    assert [r.id for r in store.get_unconsumed_runs(account_id)] == [run.id]
 
 
-def test_update_allocation_run_totals_raises_when_the_run_is_gone():
+def test_finalise_allocation_run_raises_when_the_run_is_gone():
     from ba2_common.core.db import InstanceNotFound
     with pytest.raises(InstanceNotFound):
-        store.update_allocation_run_totals(
+        store.finalise_allocation_run(
             999_999, submitted_buy_value=1.0, submitted_sell_value=0.0, order_ids=[])
 
 
 def test_a_run_row_written_by_raw_sql_reads_back_with_null_json(account_id):
     """plan_json/order_ids are nullable JSON with PYTHON-side defaults, so a row
-    that did not go through this module lands NULL, not {}/[]. Reads must cope."""
+    that did not go through this module lands NULL, not {}/[]. Reads must cope.
+
+    ``income_consumed_at`` is nullable for the same reason it is the guard: a row
+    nobody stamped has NOT consumed income, and a NULL JSON breakdown must read as
+    0.0 rather than blowing up."""
     from sqlalchemy import text
     from ba2_common.core.db import get_db
     with get_db() as session:
@@ -4380,10 +4612,124 @@ def test_a_run_row_written_by_raw_sql_reads_back_with_null_json(account_id):
     assert row.plan_json is None
     assert row.order_ids is None
     assert row.net_buy_value == 0.0
+    assert row.income_consumed_events is None
+    assert row.is_income_consumed is False
+    assert row.income_consumed_amount == 0.0
+
+
+# --- income consumption is idempotent per run ------------------------------
+
+def test_finalising_the_same_run_twice_consumes_the_ledger_once(account_id):
+    """The replay guard. A service-layer retry re-states the totals but must NOT
+    spend the ledger a second time -- that is duplicated real money."""
+    event = store.upsert_income_event(account_id, "csd-1", date(2026, 8, 1), "DEPOSIT", 5000.0)
+    run = store.record_allocation_run(account_id, "INVEST_LABEL", {}, scope_label="ARK26")
+
+    first = store.finalise_allocation_run(
+        run.id, submitted_buy_value=1600.0, submitted_sell_value=0.0, order_ids=[101])
+    second = store.finalise_allocation_run(
+        run.id, submitted_buy_value=1600.0, submitted_sell_value=0.0, order_ids=[101])
+
+    assert first.income_consumed_amount == pytest.approx(1600.0)
+    # Same answer both times, and the ledger only moved once.
+    assert second.income_consumed_amount == pytest.approx(1600.0)
+    assert second.income_consumed_events == [[event.id, 1600.0]]
+    assert second.income_consumed_at == first.income_consumed_at
+    assert store.get_open_income_total(account_id) == pytest.approx(3400.0)
+
+
+def test_a_replayed_run_restates_its_totals_without_respending(account_id):
+    """A retry that submitted more on the second pass still consumes only once.
+
+    Restating the money that went out is harmless and useful; taking the ledger
+    again is the bug. The recorded consumption stays the one that happened.
+    """
+    store.upsert_income_event(account_id, "csd-1", date(2026, 8, 1), "DEPOSIT", 5000.0)
+    run = store.record_allocation_run(account_id, "REBALANCE", {})
+    store.finalise_allocation_run(run.id, submitted_buy_value=1000.0,
+                                  submitted_sell_value=0.0, order_ids=[1])
+
+    replayed = store.finalise_allocation_run(
+        run.id, submitted_buy_value=2500.0, submitted_sell_value=0.0, order_ids=[1, 2])
+
+    assert replayed.submitted_buy_value == pytest.approx(2500.0)
+    assert replayed.order_ids == [1, 2]
+    assert replayed.income_consumed_amount == pytest.approx(1000.0)
+    assert store.get_open_income_total(account_id) == pytest.approx(4000.0)
+
+
+def test_a_crashed_run_is_visibly_unconsumed_and_can_be_recovered(account_id):
+    """Crash recovery. A submit that died before finalising leaves the ledger
+    untouched AND the run un-stamped, so the money it spent at the broker is
+    findable instead of being silently re-allocated by the next run."""
+    store.upsert_income_event(account_id, "csd-1", date(2026, 8, 1), "DEPOSIT", 5000.0)
+    crashed = store.record_allocation_run(account_id, "REBALANCE", {})
+    # ... orders went out here, then the process died before finalise_allocation_run.
+
+    assert [r.id for r in store.get_unconsumed_runs(account_id)] == [crashed.id]
+    assert store.get_recent_runs(account_id)[0].is_income_consumed is False
+    assert store.get_open_income_total(account_id) == pytest.approx(5000.0)
+
+    recovered = store.finalise_allocation_run(
+        crashed.id, submitted_buy_value=1600.0, submitted_sell_value=0.0, order_ids=[101])
+
+    assert recovered.income_consumed_amount == pytest.approx(1600.0)
+    assert store.get_open_income_total(account_id) == pytest.approx(3400.0)
+    assert store.get_unconsumed_runs(account_id) == []
+
+
+def test_unconsumed_runs_are_scoped_to_one_account_and_newest_first(account_id):
+    from tests.factories import create_account_definition
+    other = create_account_definition(name="Other Account")
+    first = store.record_allocation_run(account_id, "REBALANCE", {}, scope_label="A")
+    second = store.record_allocation_run(account_id, "REBALANCE", {}, scope_label="B")
+    store.record_allocation_run(other.id, "REBALANCE", {}, scope_label="C")
+    store.finalise_allocation_run(first.id, submitted_buy_value=0.0,
+                                  submitted_sell_value=0.0, order_ids=[])
+
+    assert [r.id for r in store.get_unconsumed_runs(account_id)] == [second.id]
+    assert [r.scope_label for r in store.get_unconsumed_runs(other.id)] == ["C"]
+
+
+def test_the_consumption_breakdown_says_which_events_a_run_spent(account_id):
+    """Per-run attribution: which income paid for this run, and how much of each.
+
+    This is what a run id on a consumption row would have bought, without a
+    sixth table -- and consumption is many-to-many (one run spans several events,
+    one event is split across runs), so a scalar run id on the event could not
+    have expressed it anyway.
+    """
+    first = store.upsert_income_event(account_id, "a", date(2026, 8, 1), "DEPOSIT", 100.0)
+    second = store.upsert_income_event(account_id, "b", date(2026, 8, 5), "DIVIDEND", 500.0)
+    run = store.record_allocation_run(account_id, "REBALANCE", {})
+
+    finalised = store.finalise_allocation_run(
+        run.id, submitted_buy_value=250.0, submitted_sell_value=0.0, order_ids=[])
+
+    assert finalised.income_consumed_events == [[first.id, 100.0], [second.id, 150.0]]
+    assert finalised.income_consumed_amount == pytest.approx(250.0)
+    assert store.get_recent_runs(account_id)[0].income_consumed_amount == pytest.approx(250.0)
+
+
+def test_a_run_consuming_more_than_the_ledger_holds_is_still_stamped(account_id):
+    """A shortfall is not an error -- buying power is the constraint, not the
+    ledger -- but the run must still be marked consumed, or a recovery pass would
+    keep trying to spend income that was never there."""
+    store.upsert_income_event(account_id, "a", date(2026, 8, 1), "DEPOSIT", 100.0)
+    run = store.record_allocation_run(account_id, "REBALANCE", {})
+
+    finalised = store.finalise_allocation_run(
+        run.id, submitted_buy_value=9999.0, submitted_sell_value=0.0, order_ids=[])
+
+    assert finalised.income_consumed_amount == pytest.approx(100.0)
+    assert finalised.is_income_consumed is True
+    assert store.get_unconsumed_runs(account_id) == []
 ```
 
-`net_buy_value` is a plain `@property` on `PortfolioAllocationRun` (added with the model in
-Task 7), NOT a column — no Alembic change is needed for any of this.
+`net_buy_value`, `is_income_consumed` and `income_consumed_amount` are plain `@property`
+declarations on `PortfolioAllocationRun` (added with the model in Task 7), NOT columns. The two
+things that ARE columns — `income_consumed_at` and `income_consumed_events` — went into Task 8's
+revision, which had not been applied anywhere yet.
 
 - [x] **Step 2: Run test to verify it fails**
 
@@ -4421,10 +4767,12 @@ def record_allocation_run(account_id: int, mode: str, plan_json: Dict[str, Any],
 
     The live service calls this BEFORE submitting, with zero submitted values, so
     the run id exists to stamp into every order comment; it then calls
-    ``update_allocation_run_totals`` with what was actually submitted.
+    ``finalise_allocation_run`` with what was actually submitted.
 
-    This does NOT consume income: call ``consume_income(account_id,
-    run.net_buy_value)`` next, so the two writes stay separately auditable.
+    This does NOT consume income, and the row it returns is a detached snapshot
+    whose totals are whatever you passed (normally zeros) -- never feed its
+    ``net_buy_value`` to anything. ``finalise_allocation_run`` re-reads the row
+    and consumes the ledger from the totals IT writes, in one transaction.
 
     Every argument is written WHOLESALE -- there is no "None means leave
     unchanged" here, because the row does not exist yet.
@@ -4451,16 +4799,47 @@ def record_allocation_run(account_id: int, mode: str, plan_json: Dict[str, Any],
         return row
 
 
-def update_allocation_run_totals(run_id: int, *,
-                                 submitted_buy_value: float,
-                                 submitted_sell_value: float,
-                                 order_ids: List[int]) -> PortfolioAllocationRun:
-    """Write back what a run ACTUALLY submitted, after the orders have gone out.
+def finalise_allocation_run(run_id: int, *,
+                            submitted_buy_value: float,
+                            submitted_sell_value: float,
+                            order_ids: List[int]) -> PortfolioAllocationRun:
+    """Close out a run: write what it submitted AND spend the income ledger, atomically.
+
+    Call this ONCE per run, after the submission loop, whether or not every order
+    made it out -- a partial submission still has to be recorded and still has to
+    consume what it actually bought.
 
     Both totals are RESTATED wholesale, never merged: they are the final tally of
     a finished submission loop, and ``None`` is rejected rather than read as
     "leave unchanged" -- a missing money figure would silently understate
     ``net_buy_value`` and so under-consume the income ledger.
+
+    **Why the totals and the consumption are one call.** The budget consumed is
+    ``net_buy_value``, which is derived from the totals written by this very
+    call, on the row as re-read here -- never from a value the caller carried
+    over from ``record_allocation_run`` (that object is a detached snapshot whose
+    totals are zero, and passing its ``net_buy_value`` would consume nothing and
+    silently leave the whole ledger open). Splitting the two writes also left a
+    window in which a crash meant money spent at the broker but still showing as
+    unallocated income, so the next run would spend it again. One transaction, no
+    window.
+
+    **Idempotent per run.** ``income_consumed_at`` is checked and set inside that
+    same transaction, so a service-layer retry re-states the totals but takes
+    from the ledger exactly once. A run that crashed before reaching this call
+    has a NULL stamp and is listed by ``get_unconsumed_runs()``, so a recovery
+    path can tell the difference between "consumed nothing" and "never got that
+    far". Two callers racing on ONE run cannot both spend either: SQLite refuses
+    the second writer's upgrade from the snapshot it read the stamp under, and
+    that transaction dies whole -- ledger takes included.
+
+    Returns:
+        PortfolioAllocationRun: the detached, refreshed row. Read
+        ``income_consumed_amount`` / ``income_consumed_events`` off it for what
+        the ledger actually gave up -- possibly LESS than ``net_buy_value``, which
+        is not an error: buying power, not the ledger, is the feasibility
+        constraint. On a repeat call those fields still describe the ONE
+        consumption that happened.
 
     Raises:
         ValueError: when either total is None.
@@ -4471,7 +4850,7 @@ def update_allocation_run_totals(run_id: int, *,
 
     if submitted_buy_value is None or submitted_sell_value is None:
         raise ValueError(
-            f"update_allocation_run_totals({run_id}) needs both totals as numbers, got "
+            f"finalise_allocation_run({run_id}) needs both totals as numbers, got "
             f"buys={submitted_buy_value!r} sells={submitted_sell_value!r}; pass 0.0 for "
             f"'nothing was submitted'")
 
@@ -4481,14 +4860,61 @@ def update_allocation_run_totals(run_id: int, *,
         ).first()
         if row is None:
             raise InstanceNotFound(f"PortfolioAllocationRun {run_id} not found")
+        account_id = row.account_id
+        replayed = row.income_consumed_at is not None
         row.submitted_buy_value = float(submitted_buy_value)
         row.submitted_sell_value = float(submitted_sell_value)
         row.order_ids = list(order_ids or [])
+        if replayed:
+            # The ledger is NOT touched again. The totals above are re-stated
+            # because restating them is harmless; spending twice is not.
+            consumed = [tuple(pair) for pair in (row.income_consumed_events or [])]
+        else:
+            consumed = _apply_income_consumption(session, account_id, row.net_buy_value)
+            row.income_consumed_events = [[event_id, amount] for event_id, amount in consumed]
+            row.income_consumed_at = DateTime.now(timezone.utc)
         session.add(row)
         session.commit()
         session.refresh(row)
         session.expunge(row)
-        return row
+
+    if replayed:
+        logger.warning(
+            f"Allocation run {run_id} of account {account_id} was finalised again; its "
+            f"totals were re-stated but the income ledger was left alone (it already "
+            f"consumed {row.income_consumed_amount:.2f} from {len(consumed)} event(s))")
+    else:
+        logger.info(
+            f"Finalised allocation run {run_id} for account {account_id}: buys "
+            f"{row.submitted_buy_value:.2f} / sells {row.submitted_sell_value:.2f}, "
+            f"consumed {row.income_consumed_amount:.2f} from {len(consumed)} income "
+            f"event(s) against a net buy value of {row.net_buy_value:.2f}")
+    return row
+
+
+def get_unconsumed_runs(account_id: int, limit: int = 20) -> List[PortfolioAllocationRun]:
+    """Runs that never reached ``finalise_allocation_run()``, NEWEST first.
+
+    The recovery view: a row here submitted orders (or died trying) but its
+    ``income_consumed_at`` is still NULL, so the income that funded it is still
+    showing as unallocated and the NEXT run would spend it a second time. Normally
+    empty -- anything in it wants a human, because only the broker knows what
+    actually went out.
+
+    A run that consumed nothing legitimately (a rebalance funded by its own sells)
+    is NOT here: it is stamped, with an empty ``income_consumed_events``.
+    """
+    with get_db() as session:
+        rows = session.exec(
+            select(PortfolioAllocationRun)
+            .where(PortfolioAllocationRun.account_id == account_id,
+                   PortfolioAllocationRun.income_consumed_at.is_(None))
+            .order_by(PortfolioAllocationRun.created_at.desc(), PortfolioAllocationRun.id.desc())
+            .limit(limit)
+        ).all()
+        rows = list(rows)
+        session.expunge_all()
+        return rows
 
 
 def get_recent_runs(account_id: int, limit: int = 20) -> List[PortfolioAllocationRun]:
@@ -4518,7 +4944,8 @@ whatever SQLite returns.
 - [x] **Step 4: Run test to verify it passes**
 
 Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_store.py -v`
-Expected: PASS — `46 passed` (Tasks 9-13 left 38 tests in this file; the 8 above are new).
+Expected: PASS — `54 passed` (Tasks 9-13 leave 38 tests in this file, all of Task 13's
+consumption cases going green here for the first time; the 16 above are new).
 
 - [x] **Step 5: Commit**
 
@@ -18763,16 +19190,23 @@ git commit -m "feat(allocation): fractional submission with a one-shot whole-sha
 > the amount downward while the consumed figure — a true record of what was spent — is deliberately
 > left alone. `open_amount` already clamps at 0 so nothing over-allocates, but a naive percentage
 > renders above 100%.
+>
+> **There is no `consume_income_for_run` service wrapper any more.** It used to take
+> `(account_id, net_buy_value)` and forward to a store function of the same shape; Section B's
+> exit review removed both, because an account-level "spend this much" call cannot tell a retry
+> from a first attempt and so consumes the ledger twice. Consumption now happens inside
+> `portfolio_allocation_store.finalise_allocation_run(run_id, ...)`, in the same transaction as
+> the run's totals and its `income_consumed_at` stamp — Task 75 calls it, this task does not.
 
 
-Pure-testable: the broker→ledger sync and the consumption wrappers against the FakeAccount +
+Pure-testable: the broker→ledger sync and the ledger reads against the FakeAccount +
 in-memory DB. Eyeball-only: `render_income_panel`'s layout — the automated check is the smoke
 test that the module still imports.
 
 The pure FIFO rule (`consume_income_events`) and the DB writes (`upsert_income_event`,
-`consume_income`, `get_open_income_total`, `get_income_events_since`) already exist — in the
-engine (Task 24) and in the store (Tasks 12-13). This task adds ONLY the broker-facing sync and
-thin service wrappers, so there is exactly one implementation of each rule.
+`_apply_income_consumption`, `get_open_income_total`, `get_income_events_since`) already exist —
+in the engine (Task 24) and in the store (Tasks 12-14). This task adds ONLY the broker-facing
+sync and thin read wrappers, so there is exactly one implementation of each rule.
 
 The ledger syncs on page load and on explicit Refresh **only** — never on a `ui.timer`, so the
 page never issues broker calls in the background.
@@ -18854,34 +19288,18 @@ def test_sync_income_events_returns_zero_when_the_broker_call_fails():
     assert svc.sync_income_events(account) == 0
 
 
-def test_consume_income_for_run_consumes_oldest_first_and_persists_the_remainder():
-    first = add_instance(PortfolioIncomeEvent(
+def test_get_open_income_total_sums_only_what_is_left():
+    """The figure the page shows next to Invest. Consumption itself is exercised
+    through ``run_allocation`` in Task 75 -- the ledger is only ever spent on
+    behalf of a run, so there is nothing account-level to call here."""
+    add_instance(PortfolioIncomeEvent(
         account_id=25, external_id="a", event_date=date(2026, 8, 1),
-        event_type=CASH_TRANSFER_DEPOSIT, amount=300.0))
-    second = add_instance(PortfolioIncomeEvent(
+        event_type=CASH_TRANSFER_DEPOSIT, amount=300.0, consumed_amount=300.0))
+    add_instance(PortfolioIncomeEvent(
         account_id=25, external_id="b", event_date=date(2026, 8, 5),
-        event_type=CASH_TRANSFER_DIVIDEND, amount=500.0))
+        event_type=CASH_TRANSFER_DIVIDEND, amount=500.0, consumed_amount=150.0))
 
-    taken = svc.consume_income_for_run(25, 450.0)
-
-    assert taken == [(first, pytest.approx(300.0)), (second, pytest.approx(150.0))]
-    with get_db() as session:
-        rows = {r.id: r for r in session.exec(select(PortfolioIncomeEvent)).all()}
-    assert rows[first].open_amount == pytest.approx(0.0)
-    assert rows[second].open_amount == pytest.approx(350.0)
-
-
-def test_consume_income_for_run_with_a_sell_funded_rebalance_consumes_nothing():
-    event_id = add_instance(PortfolioIncomeEvent(
-        account_id=26, external_id="a", event_date=date(2026, 8, 1),
-        event_type=CASH_TRANSFER_DEPOSIT, amount=300.0))
-
-    assert svc.consume_income_for_run(26, 0.0) == []
-
-    with get_db() as session:
-        row = session.exec(select(PortfolioIncomeEvent).where(
-            PortfolioIncomeEvent.id == event_id)).one()
-    assert row.consumed_amount == pytest.approx(0.0)
+    assert svc.get_open_income_total(25) == pytest.approx(350.0)
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -18962,25 +19380,14 @@ def get_recent_income_events(account_id: int, *,
 
 
 def get_open_income_total(account_id: int) -> float:
-    """Total un-consumed income for this account, across the WHOLE ledger."""
+    """Total un-consumed income for this account, across the WHOLE ledger.
+
+    Read-only. Spending the ledger is not reachable from here on purpose: it
+    happens inside ``portfolio_allocation_store.finalise_allocation_run``, keyed
+    on the run, so it cannot be replayed.
+    """
     from .portfolio_allocation_store import get_open_income_total as _store_total
     return _store_total(account_id)
-
-
-def consume_income_for_run(account_id: int, net_buy_value: float) -> List[Tuple[int, float]]:
-    """Consume the ledger oldest-first against a run's NET buy value.
-
-    Thin wrapper over ``portfolio_allocation_store.consume_income`` (which itself
-    delegates the FIFO arithmetic to the pure
-    ``portfolio_allocation.consume_income_events``), so there is exactly ONE
-    implementation of the rule and the service keeps one import surface.
-
-    Returns:
-        List[Tuple[int, float]]: ``[(income_event_id, amount_consumed)]``. Empty
-        when the run bought nothing net (a rebalance funded by its own sells).
-    """
-    from .portfolio_allocation_store import consume_income
-    return consume_income(account_id, net_buy_value)
 ```
 
 `get_open_income_events` is imported inside `sync_income_events` only to tell an insert from an
@@ -19031,7 +19438,7 @@ def render_income_panel(events: List[Dict], open_total: float,
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_submit.py -v`
-Expected: PASS — 23 passed
+Expected: PASS — 22 passed
 
 Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_wizard_ui.py -v`
 Expected: PASS — 3 passed
@@ -19047,20 +19454,28 @@ git commit -m "feat(allocation): income ledger sync, FIFO consumption wrapper an
 
 ### Task 75: Record the run, log the activity, show the per-row outcome table
 
-> **The call order is fixed, and one step of it is a live bug waiting to happen.**
+> **The call order is fixed, and it is now two DB calls, not three.**
 > `record_allocation_run(..., submitted_*=0.0, order_ids=[])` → stamp `run.id` into the order
-> comments → submit → `update_allocation_run_totals(...)` → `consume_income(account_id, net_buy_value)`.
+> comments → submit → `finalise_allocation_run(run_id, submitted_*=..., order_ids=...)`.
 >
-> The object returned by the CREATE call is a detached snapshot with **zero** totals. Read
-> `net_buy_value` off the object returned by `update_allocation_run_totals`, never off the create
-> result — doing the latter passes `0.0` to `consume_income`, which then consumes nothing and leaves
-> the whole ledger open. It would look like it worked.
+> That last call writes the totals AND consumes the income ledger in ONE transaction, keyed on
+> the run. The old shape — update the totals, then `consume_income(account_id, net_buy_value)` —
+> is gone, and with it two money bugs: reading `net_buy_value` off the CREATE result (a detached
+> snapshot with zero totals) consumed nothing and silently left the whole ledger open, and a
+> crash between the two writes left money spent at the broker but still showing as unallocated
+> income for the next run to spend again. **Never pass a net buy value anywhere; the store
+> derives it from the totals it is writing.**
 >
-> **On partial submission failure, still call `update_allocation_run_totals` with what actually went
-> out.** Otherwise the row keeps its zeros and the income is never consumed.
+> **On partial submission failure, still call `finalise_allocation_run` with what actually went
+> out.** Otherwise the row keeps its zeros, the income is never consumed, and the run sits in
+> `get_unconsumed_runs()` waiting for a human.
 >
-> **A shortfall is not an error.** `consume_income` can consume less than `net_buy_value` when the
-> ledger cannot cover it — buying power is the feasibility constraint, not the ledger.
+> **Retrying the whole run is safe.** `finalise_allocation_run` re-states the totals but takes
+> from the ledger exactly once (`income_consumed_at`), so a retried `run_allocation` reports the
+> same `income_consumed` figure instead of double-spending.
+>
+> **A shortfall is not an error.** The ledger can give up less than `net_buy_value` when it
+> cannot cover it — buying power is the feasibility constraint, not the ledger.
 
 
 Pure-testable: `summarise_outcomes` (no IO), and `run_allocation` against the FakeAccount +
@@ -19202,6 +19617,26 @@ def test_run_allocation_consumes_income_up_to_the_net_buy_value():
 
     assert result["income_consumed"] == pytest.approx(1600.0)
     assert svc.get_open_income_total(34) == pytest.approx(3_400.0)
+
+
+def test_finalising_a_run_twice_never_consumes_the_income_twice():
+    """A retried submit must not spend the ledger again. The guard is
+    ``portfolio_allocation_run.income_consumed_at``, checked and set in the same
+    transaction as the ledger writes, so there is no window to lose money in."""
+    from ba2_trade_platform.core.portfolio_allocation_store import (
+        finalise_allocation_run, record_allocation_run,
+    )
+    add_instance(PortfolioIncomeEvent(account_id=35, external_id="dep-1",
+                                      event_date=date(2026, 8, 1),
+                                      event_type=CASH_TRANSFER_DEPOSIT, amount=5_000.0))
+    run = record_allocation_run(35, ALLOCATION_MODE_REBALANCE, {})
+
+    for _ in range(2):
+        finalised = finalise_allocation_run(run.id, submitted_buy_value=1600.0,
+                                            submitted_sell_value=0.0, order_ids=[101])
+        assert finalised.income_consumed_amount == pytest.approx(1600.0)
+
+    assert svc.get_open_income_total(35) == pytest.approx(3_400.0)
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -19264,13 +19699,15 @@ def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionSta
       1. INSERT the ``portfolio_allocation_run`` row with the plan snapshot and
          zero submitted values, so its id can be stamped into every order comment.
       2. Submit (sells first, buys descending, per-row outcomes).
-      3. UPDATE the run row with what was actually submitted.
-      4. Consume the income ledger oldest-first by the NET buy value.
-      5. log_activity.
+      3. FINALISE: write what was actually submitted AND consume the income
+         ledger by the resulting net buy value -- one call, one transaction,
+         idempotent on the run id.
+      4. log_activity.
 
     Partial failure is normal and is reported per row; nothing is rolled back.
+    Retrying the whole thing consumes the ledger once, not twice.
     """
-    from .portfolio_allocation_store import record_allocation_run, update_allocation_run_totals
+    from .portfolio_allocation_store import finalise_allocation_run, record_allocation_run
 
     run = record_allocation_run(
         account.id, mode, plan.to_dict(),
@@ -19285,17 +19722,21 @@ def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionSta
                            allow_fractional=bool(plan.allow_fractional))
     totals = summarise_outcomes(plan, outcomes)
 
+    income_consumed = 0.0
     try:
-        update_allocation_run_totals(
+        # Writes the totals and spends the ledger in one transaction. The net buy
+        # value is NOT passed: the store derives it from the totals it is writing,
+        # which is what makes "consumed nothing because the caller handed over a
+        # stale zero" unrepresentable.
+        finalised = finalise_allocation_run(
             run_id,
             submitted_buy_value=totals["submitted_buy_value"],
             submitted_sell_value=totals["submitted_sell_value"],
             order_ids=totals["order_ids"])
+        income_consumed = finalised.income_consumed_amount
     except InstanceNotFound:
-        logger.error(f"Allocation run {run_id} vanished before its totals could be written")
-
-    consumed = consume_income_for_run(account.id, totals["net_buy_value"])
-    income_consumed = float(sum(amount for _, amount in consumed))
+        logger.error(f"Allocation run {run_id} vanished before it could be finalised; "
+                     f"its income was NOT consumed")
 
     submitted = sum(1 for o in outcomes if o.status == OUTCOME_SUBMITTED)
     failed = sum(1 for o in outcomes if o.status == OUTCOME_FAILED)

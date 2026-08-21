@@ -15,6 +15,13 @@ Index names are the ones SQLAlchemy itself emits for these models
 an existing one agree. Foreign keys are declarative only -- the live DB runs with
 PRAGMA foreign_keys = 0 -- so account deletion must clear these tables
 explicitly (see portfolio_allocation_store.delete_account_allocation_data).
+
+Amended before ever being applied (the live DB is still two revisions behind, at
+d5e1b9a3c842, and no row of these tables exists anywhere) to add
+portfolio_allocation_run.income_consumed_at / income_consumed_events: the
+per-run idempotency guard for income consumption. Amending in place is only
+legal because nothing has run this revision yet; once it ships, the same change
+costs a second revision.
 """
 from typing import Sequence, Union
 
@@ -116,6 +123,12 @@ def upgrade() -> None:
         sa.Column("submitted_buy_value", sa.Float(), nullable=False),
         sa.Column("submitted_sell_value", sa.Float(), nullable=False),
         sa.Column("order_ids", sa.JSON(), nullable=True),
+        # Income-ledger replay guard. NULL = this run has never consumed income;
+        # a timestamp = it has, exactly once. Written in the SAME transaction as
+        # the portfolio_income_event updates (see finalise_allocation_run), so
+        # the check and the spend cannot interleave.
+        sa.Column("income_consumed_at", sa.DateTime(), nullable=True),
+        sa.Column("income_consumed_events", sa.JSON(), nullable=True),
         sa.Column("created_at", sa.DateTime(), nullable=False),
         sa.ForeignKeyConstraint(["account_id"], ["accountdefinition.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),

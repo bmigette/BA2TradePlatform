@@ -10,13 +10,19 @@ that the FIFO rule exists exactly once. The UI calls these helpers; the engine
 receives the plain values they produce. The dependency only ever runs store ->
 engine: the engine stays IO-free and must never import this module.
 
-Two rules the callers depend on:
+Three rules the callers depend on:
 
 * A ``portfolio_allocation_label`` row's EXISTENCE is the "this label is managed"
   flag -- deleting the row unmanages the label.
 * ``portfolio_allocation_symbol`` rows are created LAZILY. A symbol with no row
   takes the even-split default, so ``get_symbol_weights()`` returns a computed
   weight for every symbol you ask about and never an empty dict.
+* The income ledger is spent ONLY through ``finalise_allocation_run()``, which
+  writes a run's totals, the ledger takes and the run's ``income_consumed_at``
+  stamp in ONE transaction. There is deliberately no account-level "consume this
+  much" entry point: money is only ever spent on behalf of a run, exactly once,
+  and a run that never reached this call is visibly un-consumed
+  (``get_unconsumed_runs()``).
 """
 from __future__ import annotations
 
@@ -425,7 +431,7 @@ def upsert_income_event(account_id: int, external_id: str, event_date: Date,
 def get_open_income_events(account_id: int) -> List[PortfolioIncomeEvent]:
     """Income events with money left, OLDEST FIRST (event_date, then id).
 
-    That is exactly the order ``consume_income()`` spends them in.
+    That is exactly the order ``finalise_allocation_run()`` spends them in.
     """
     with get_db() as session:
         rows = session.exec(
@@ -457,8 +463,16 @@ def get_income_events_since(account_id: int, since: Date) -> List[PortfolioIncom
         return rows
 
 
-def consume_income(account_id: int, net_buy_value: float) -> List[Tuple[int, float]]:
-    """FIFO-consume the income ledger against a run's NET buy value.
+def _apply_income_consumption(session, account_id: int,
+                              net_buy_value: float) -> List[Tuple[int, float]]:
+    """FIFO-consume the income ledger against a run's NET buy value. NO COMMIT.
+
+    PRIVATE on purpose. It takes the caller's session and leaves it dirty so that
+    the ledger writes land in the SAME transaction as the run's
+    ``income_consumed_at`` stamp -- that single commit is what makes consumption
+    idempotent per run. A public "consume this much for this account" entry point
+    would be exactly the replay hazard this module is built to prevent, so there
+    isn't one: go through ``finalise_allocation_run()``.
 
     ``net_buy_value`` is ``max(0, submitted_buy_value - submitted_sell_value)``: a
     rebalance funded entirely by its own sells consumes nothing. Anything ``<= 0``
@@ -471,7 +485,7 @@ def consume_income(account_id: int, net_buy_value: float) -> List[Tuple[int, flo
     The FIFO arithmetic itself is NOT re-derived here: it is the engine's pure
     ``consume_income_events``, so the rule exists exactly once and the service
     layer's dry-run preview cannot drift from what this actually writes. All this
-    function adds is the IO -- load in order, apply the takes, commit.
+    function adds is the IO -- load in order, apply the takes.
 
     Events whose ``open_amount`` is 0 are skipped, which covers the over-consumed
     case: a DIVNRA tax leg can restate a dividend BELOW its ``consumed_amount``
@@ -484,29 +498,24 @@ def consume_income(account_id: int, net_buy_value: float) -> List[Tuple[int, flo
         ``net_buy_value`` when the ledger cannot cover it; buying power, not the
         ledger, is the feasibility constraint.
     """
-    budget = float(net_buy_value)
+    budget = float(net_buy_value or 0.0)
     if budget <= 0:
         return []
-    with get_db() as session:
-        rows = session.exec(
-            select(PortfolioIncomeEvent)
-            .where(PortfolioIncomeEvent.account_id == account_id)
-            .order_by(PortfolioIncomeEvent.event_date, PortfolioIncomeEvent.id)
-        ).all()
-        # open_amount is a PROPERTY, not a column, so it cannot be filtered in SQL;
-        # the rows are still attached here, which is what makes reading it legal.
-        open_rows = [row for row in rows if row.open_amount > 0]
-        consumed = consume_income_events(
-            [(row.id, row.open_amount) for row in open_rows], budget)
-        by_id = {row.id: row for row in open_rows}
-        for event_id, take in consumed:
-            row = by_id[event_id]
-            row.consumed_amount = (row.consumed_amount or 0.0) + take
-            session.add(row)
-        if consumed:
-            session.commit()
-    logger.info(f"Allocation run consumed {len(consumed)} income event(s) for account "
-                f"{account_id} against a net buy value of {net_buy_value:.2f}")
+    rows = session.exec(
+        select(PortfolioIncomeEvent)
+        .where(PortfolioIncomeEvent.account_id == account_id)
+        .order_by(PortfolioIncomeEvent.event_date, PortfolioIncomeEvent.id)
+    ).all()
+    # open_amount is a PROPERTY, not a column, so it cannot be filtered in SQL;
+    # the rows are still attached here, which is what makes reading it legal.
+    open_rows = [row for row in rows if row.open_amount > 0]
+    consumed = consume_income_events(
+        [(row.id, row.open_amount) for row in open_rows], budget)
+    by_id = {row.id: row for row in open_rows}
+    for event_id, take in consumed:
+        row = by_id[event_id]
+        row.consumed_amount = (row.consumed_amount or 0.0) + take
+        session.add(row)
     return consumed
 
 
@@ -534,10 +543,12 @@ def record_allocation_run(account_id: int, mode: str, plan_json: Dict[str, Any],
 
     The live service calls this BEFORE submitting, with zero submitted values, so
     the run id exists to stamp into every order comment; it then calls
-    ``update_allocation_run_totals`` with what was actually submitted.
+    ``finalise_allocation_run`` with what was actually submitted.
 
-    This does NOT consume income: call ``consume_income(account_id,
-    run.net_buy_value)`` next, so the two writes stay separately auditable.
+    This does NOT consume income, and the row it returns is a detached snapshot
+    whose totals are whatever you passed (normally zeros) -- never feed its
+    ``net_buy_value`` to anything. ``finalise_allocation_run`` re-reads the row
+    and consumes the ledger from the totals IT writes, in one transaction.
 
     Every argument is written WHOLESALE -- there is no "None means leave
     unchanged" here, because the row does not exist yet.
@@ -564,16 +575,47 @@ def record_allocation_run(account_id: int, mode: str, plan_json: Dict[str, Any],
         return row
 
 
-def update_allocation_run_totals(run_id: int, *,
-                                 submitted_buy_value: float,
-                                 submitted_sell_value: float,
-                                 order_ids: List[int]) -> PortfolioAllocationRun:
-    """Write back what a run ACTUALLY submitted, after the orders have gone out.
+def finalise_allocation_run(run_id: int, *,
+                            submitted_buy_value: float,
+                            submitted_sell_value: float,
+                            order_ids: List[int]) -> PortfolioAllocationRun:
+    """Close out a run: write what it submitted AND spend the income ledger, atomically.
+
+    Call this ONCE per run, after the submission loop, whether or not every order
+    made it out -- a partial submission still has to be recorded and still has to
+    consume what it actually bought.
 
     Both totals are RESTATED wholesale, never merged: they are the final tally of
     a finished submission loop, and ``None`` is rejected rather than read as
     "leave unchanged" -- a missing money figure would silently understate
     ``net_buy_value`` and so under-consume the income ledger.
+
+    **Why the totals and the consumption are one call.** The budget consumed is
+    ``net_buy_value``, which is derived from the totals written by this very
+    call, on the row as re-read here -- never from a value the caller carried
+    over from ``record_allocation_run`` (that object is a detached snapshot whose
+    totals are zero, and passing its ``net_buy_value`` would consume nothing and
+    silently leave the whole ledger open). Splitting the two writes also left a
+    window in which a crash meant money spent at the broker but still showing as
+    unallocated income, so the next run would spend it again. One transaction, no
+    window.
+
+    **Idempotent per run.** ``income_consumed_at`` is checked and set inside that
+    same transaction, so a service-layer retry re-states the totals but takes
+    from the ledger exactly once. A run that crashed before reaching this call
+    has a NULL stamp and is listed by ``get_unconsumed_runs()``, so a recovery
+    path can tell the difference between "consumed nothing" and "never got that
+    far". Two callers racing on ONE run cannot both spend either: SQLite refuses
+    the second writer's upgrade from the snapshot it read the stamp under, and
+    that transaction dies whole -- ledger takes included.
+
+    Returns:
+        PortfolioAllocationRun: the detached, refreshed row. Read
+        ``income_consumed_amount`` / ``income_consumed_events`` off it for what
+        the ledger actually gave up -- possibly LESS than ``net_buy_value``, which
+        is not an error: buying power, not the ledger, is the feasibility
+        constraint. On a repeat call those fields still describe the ONE
+        consumption that happened.
 
     Raises:
         ValueError: when either total is None.
@@ -584,7 +626,7 @@ def update_allocation_run_totals(run_id: int, *,
 
     if submitted_buy_value is None or submitted_sell_value is None:
         raise ValueError(
-            f"update_allocation_run_totals({run_id}) needs both totals as numbers, got "
+            f"finalise_allocation_run({run_id}) needs both totals as numbers, got "
             f"buys={submitted_buy_value!r} sells={submitted_sell_value!r}; pass 0.0 for "
             f"'nothing was submitted'")
 
@@ -594,14 +636,61 @@ def update_allocation_run_totals(run_id: int, *,
         ).first()
         if row is None:
             raise InstanceNotFound(f"PortfolioAllocationRun {run_id} not found")
+        account_id = row.account_id
+        replayed = row.income_consumed_at is not None
         row.submitted_buy_value = float(submitted_buy_value)
         row.submitted_sell_value = float(submitted_sell_value)
         row.order_ids = list(order_ids or [])
+        if replayed:
+            # The ledger is NOT touched again. The totals above are re-stated
+            # because restating them is harmless; spending twice is not.
+            consumed = [tuple(pair) for pair in (row.income_consumed_events or [])]
+        else:
+            consumed = _apply_income_consumption(session, account_id, row.net_buy_value)
+            row.income_consumed_events = [[event_id, amount] for event_id, amount in consumed]
+            row.income_consumed_at = DateTime.now(timezone.utc)
         session.add(row)
         session.commit()
         session.refresh(row)
         session.expunge(row)
-        return row
+
+    if replayed:
+        logger.warning(
+            f"Allocation run {run_id} of account {account_id} was finalised again; its "
+            f"totals were re-stated but the income ledger was left alone (it already "
+            f"consumed {row.income_consumed_amount:.2f} from {len(consumed)} event(s))")
+    else:
+        logger.info(
+            f"Finalised allocation run {run_id} for account {account_id}: buys "
+            f"{row.submitted_buy_value:.2f} / sells {row.submitted_sell_value:.2f}, "
+            f"consumed {row.income_consumed_amount:.2f} from {len(consumed)} income "
+            f"event(s) against a net buy value of {row.net_buy_value:.2f}")
+    return row
+
+
+def get_unconsumed_runs(account_id: int, limit: int = 20) -> List[PortfolioAllocationRun]:
+    """Runs that never reached ``finalise_allocation_run()``, NEWEST first.
+
+    The recovery view: a row here submitted orders (or died trying) but its
+    ``income_consumed_at`` is still NULL, so the income that funded it is still
+    showing as unallocated and the NEXT run would spend it a second time. Normally
+    empty -- anything in it wants a human, because only the broker knows what
+    actually went out.
+
+    A run that consumed nothing legitimately (a rebalance funded by its own sells)
+    is NOT here: it is stamped, with an empty ``income_consumed_events``.
+    """
+    with get_db() as session:
+        rows = session.exec(
+            select(PortfolioAllocationRun)
+            .where(PortfolioAllocationRun.account_id == account_id,
+                   PortfolioAllocationRun.income_consumed_at.is_(None))
+            .order_by(PortfolioAllocationRun.created_at.desc(), PortfolioAllocationRun.id.desc())
+            .limit(limit)
+        ).all()
+        rows = list(rows)
+        session.expunge_all()
+        return rows
 
 
 def get_recent_runs(account_id: int, limit: int = 20) -> List[PortfolioAllocationRun]:
