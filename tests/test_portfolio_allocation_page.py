@@ -1181,45 +1181,57 @@ def test_the_allocate_flow_opens_the_wizard_and_submits_through_the_service(
 # ---------------------------------------------------------------------------
 
 def _service_call_sites():
-    """``(path, lineno, name, node)`` for every call into the service module.
+    """``(path, lineno, name, node, module)`` for every cross-module call the page
+    and the wizard make into the three modules they are glue for.
 
-    Parses the page and wizard with ``ast`` rather than importing and poking, so a
-    call inside a nested closure that no test happens to run is checked too.
-    Handles both the ``svc.<name>(...)`` alias and
-    ``from ...core.portfolio_allocation_service import <name>``.
+    Parses with ``ast`` rather than importing and poking, so a call inside a nested
+    closure that no test happens to run is checked too. Handles the
+    ``svc.<name>(...)`` alias and every ``from ... import <name>`` form.
+
+    The service is the module the CRITICAL bug was in, but the wizard and the view
+    are the same kind of seam and one of them (``open_allocation_wizard``'s
+    ``on_refresh``) has already changed shape once; they cost nothing extra here.
     """
     import ast
     import inspect as _inspect
 
     from ba2_trade_platform.core import portfolio_allocation_service as service
     from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wizard_module
+    from ba2_trade_platform.ui.utils import portfolio_allocation_view as view_module
 
-    modules = [page, wizard_module]
+    targets = {
+        'portfolio_allocation_service': service,
+        'portfolio_allocation_wizard': wizard_module,
+        'portfolio_allocation_view': view_module,
+    }
     out = []
-    for module in modules:
+    for module in (page, wizard_module):
         path = _inspect.getsourcefile(module)
         tree = ast.parse(open(path, encoding='utf-8').read(), path)
-        aliases = set()
+        aliases = {}
         direct = {}
         for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and (node.module or '').endswith(
-                    'portfolio_allocation_service'):
-                for item in node.names:
-                    direct[item.asname or item.name] = item.name
-            if isinstance(node, ast.ImportFrom) and (
-                    (node.module or '') == 'core' or (node.module or '').endswith('.core')):
-                for item in node.names:
-                    if item.name == 'portfolio_allocation_service':
-                        aliases.add(item.asname or item.name)
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            source = node.module or ''
+            for suffix, target in targets.items():
+                if source.endswith(suffix):
+                    for item in node.names:
+                        direct[item.asname or item.name] = (item.name, target)
+            # ``from ...core import portfolio_allocation_service as svc``
+            for item in node.names:
+                if item.name in targets:
+                    aliases[item.asname or item.name] = targets[item.name]
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
             func = node.func
             if (isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name)
                     and func.value.id in aliases):
-                out.append((path, node.lineno, func.attr, node, service))
+                out.append((path, node.lineno, func.attr, node, aliases[func.value.id]))
             elif isinstance(func, ast.Name) and func.id in direct:
-                out.append((path, node.lineno, direct[func.id], node, service))
+                name, target = direct[func.id]
+                out.append((path, node.lineno, name, node, target))
     return out
 
 
@@ -1227,7 +1239,10 @@ def test_the_page_really_does_call_into_the_service():
     """Guards the guard: an AST walk that finds nothing would pass vacuously."""
     names = {name for _p, _l, name, _n, _m in _service_call_sites()}
     assert {'precheck_plan', 'run_allocation', 'build_position_states',
-            'fetch_market_hours'} <= names
+            'fetch_market_hours', 'clear_market_hours_cache'} <= names
+    # ...and into the wizard and the view, whose contracts drift the same way.
+    assert {'open_allocation_wizard', 'open_allocation_steps',
+            'working_orders_notice', 'evaluate_market_gate'} <= names
 
 
 def test_every_page_call_into_the_service_matches_its_real_signature():
