@@ -4,6 +4,8 @@ from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone, date, timedelta
 from concurrent.futures import TimeoutError as FutureTimeoutError
 
+from tastytrade.order import InstrumentType as TTInstrumentType
+
 from ...logger import logger
 from ...core.models import Position
 from ...core.types import OrderDirection
@@ -190,55 +192,95 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
             logger.error(f"[Account {self.id}] Error getting account info: {e}", exc_info=True)
             return {}
 
-    def get_positions(self) -> List[Position]:
+    def get_positions(self) -> Optional[List[Position]]:
+        """Current EQUITY positions.
+
+        Returns:
+            Optional[List[Position]]: the equity book, ``[]`` when the account is
+            genuinely flat, and ``None`` when the FETCH ITSELF FAILED. That
+            distinction is load-bearing: ``reconcile_externally_closed_transactions``
+            and the overview position comparison treat an empty list as "the broker
+            confirmed it holds nothing", and a transient outage swallowed to ``[]``
+            once mass-closed 8 real open transactions (2026-07-03).
+
+        EQUITY_OPTION rows are excluded: their market value is multiplier-scaled
+        (x100), so including them would fold option notionals into equity weights.
+        Option exposure is read through OptionsAccountInterface, not here.
+        """
         if not self._check_authentication():
-            return []
+            return None
         try:
-            tt_positions = self._run_async(self._account.get_positions(self._session, include_marks=True))
-            positions = []
-            for pos in tt_positions:
-                qty = float(pos.quantity)
-                if qty == 0:
-                    continue
-
-                multiplier = int(pos.multiplier) if pos.multiplier else 1
-                avg_price = float(pos.average_open_price)
-                # mark_price is per-share; mark is total position value
-                current = float(pos.mark_price or pos.close_price or avg_price)
-                cost_basis = avg_price * abs(qty) * multiplier
-                market_val = current * abs(qty) * multiplier
-                unrealized_pl = market_val - cost_basis
-                unrealized_plpc = (unrealized_pl / cost_basis) if cost_basis else 0
-
-                side = OrderDirection.BUY if pos.quantity_direction == "Long" else OrderDirection.SELL
-
-                position = Position(
-                    asset_class=str(pos.instrument_type.value) if pos.instrument_type else "Equity",
-                    avg_entry_price=avg_price,
-                    avg_entry_swap_rate=None,
-                    change_today=0.0,
-                    cost_basis=cost_basis,
-                    current_price=current,
-                    exchange="",
-                    lastday_price=float(pos.close_price) if pos.close_price else current,
-                    market_value=market_val,
-                    qty=abs(qty),
-                    qty_available=abs(qty),
-                    side=side,
-                    swap_rate=None,
-                    symbol=pos.symbol,
-                    unrealized_intraday_pl=float(pos.realized_day_gain or 0),
-                    unrealized_intraday_plpc=0.0,
-                    unrealized_pl=unrealized_pl,
-                    unrealized_plpc=unrealized_plpc,
-                )
-                positions.append(position)
-
-            logger.debug(f"[Account {self.id}] Retrieved {len(positions)} positions from TastyTrade")
-            return positions
+            tt_positions = self._run_async(
+                self._account.get_positions(self._session, include_marks=True))
         except Exception as e:
             logger.error(f"[Account {self.id}] Error getting positions: {e}", exc_info=True)
-            return []
+            return None
+
+        positions = []
+        skipped_non_equity = 0
+        for pos in tt_positions:
+            if pos.instrument_type != TTInstrumentType.EQUITY:
+                skipped_non_equity += 1
+                continue
+
+            qty = float(pos.quantity)
+            if qty == 0:
+                continue
+
+            multiplier = int(pos.multiplier) if pos.multiplier else 1
+            avg_price = float(pos.average_open_price)
+            close_price = float(pos.close_price) if pos.close_price is not None else None
+            # mark_price is per-share (`mark` is the whole position); fall back to the
+            # previous close, then to the entry price. Never a fabricated constant.
+            if pos.mark_price is not None:
+                current = float(pos.mark_price)
+            elif close_price is not None:
+                current = close_price
+            else:
+                current = avg_price
+
+            abs_qty = abs(qty)
+            cost_basis = avg_price * abs_qty * multiplier
+            market_val = current * abs_qty * multiplier
+            unrealized_pl = market_val - cost_basis
+            unrealized_plpc = (unrealized_pl / cost_basis) if cost_basis else 0.0
+
+            # INTRADAY = move since the previous close, on the position still OPEN.
+            # (`realized_day_gain` is CLOSED-out P&L for the day -- a different number,
+            # and what this used to report.)
+            lastday_price = close_price if close_price is not None else current
+            change_today = ((current - lastday_price) / lastday_price) if lastday_price else 0.0
+            intraday_pl = (current - lastday_price) * abs_qty * multiplier
+            lastday_value = lastday_price * abs_qty * multiplier
+            intraday_plpc = (intraday_pl / lastday_value) if lastday_value else 0.0
+
+            side = OrderDirection.BUY if pos.quantity_direction == "Long" else OrderDirection.SELL
+
+            positions.append(Position(
+                asset_class="Equity",
+                avg_entry_price=avg_price,
+                avg_entry_swap_rate=None,
+                change_today=change_today,
+                cost_basis=cost_basis,
+                current_price=current,
+                exchange="",
+                lastday_price=lastday_price,
+                market_value=market_val,
+                qty=abs_qty,
+                qty_available=abs_qty,
+                side=side,
+                swap_rate=None,
+                symbol=pos.symbol,
+                unrealized_intraday_pl=intraday_pl,
+                unrealized_intraday_plpc=intraday_plpc,
+                unrealized_pl=unrealized_pl,
+                unrealized_plpc=unrealized_plpc,
+            ))
+
+        logger.debug(
+            f"[Account {self.id}] Retrieved {len(positions)} equity positions from "
+            f"TastyTrade ({skipped_non_equity} non-equity rows skipped)")
+        return positions
 
     def get_orders(self, status=None) -> Any:
         if not self._check_authentication():

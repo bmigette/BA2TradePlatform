@@ -282,3 +282,63 @@ def test_actual_available_balance_uses_margin_buying_power_not_cash():
                                equity_buying_power=Decimal("50000")))
 
     assert MarketExpertInterface._get_actual_available_balance(acct) == 50000.0
+
+
+# ---------------------------------------------------------------------------
+# get_positions
+# ---------------------------------------------------------------------------
+
+def test_get_positions_excludes_equity_option_rows():
+    """An option's market_value is multiplier-scaled (x100). Folding it in with
+    equities would blow up every allocation weight."""
+    acct = _bare_account()
+    acct._account.get_positions = AsyncMock(return_value=[
+        _tt_position(symbol="AAPL", instrument_type=TTInstrumentType.EQUITY),
+        _tt_position(symbol="AAPL  260918C00150000", multiplier=100,
+                     instrument_type=TTInstrumentType.EQUITY_OPTION),
+    ])
+
+    positions = acct.get_positions()
+
+    assert [p.symbol for p in positions] == ["AAPL"]
+
+
+def test_get_positions_returns_none_when_the_fetch_fails():
+    """None means FETCH FAILED, [] means genuinely flat. Reconciliation mass-closes
+    real transactions if a broker outage is allowed to look like an empty book."""
+    acct = _bare_account()
+    acct._account.get_positions = AsyncMock(side_effect=RuntimeError("connection reset"))
+
+    assert acct.get_positions() is None
+
+
+def test_get_positions_returns_empty_list_when_genuinely_flat():
+    acct = _bare_account()
+    acct._account.get_positions = AsyncMock(return_value=[])
+
+    assert acct.get_positions() == []
+
+
+def test_get_positions_derives_change_today_from_the_previous_close():
+    acct = _bare_account()
+    acct._account.get_positions = AsyncMock(return_value=[
+        _tt_position(symbol="AAPL", quantity="10", close_price="150", mark_price="155"),
+    ])
+
+    position = acct.get_positions()[0]
+
+    assert position.change_today == pytest.approx((155.0 - 150.0) / 150.0)
+
+
+def test_get_positions_intraday_pl_is_mark_minus_close_not_realized_day_gain():
+    """realized_day_gain is CLOSED-out P&L for the day; unrealized_intraday_pl is
+    the OPEN position's move since the previous close. They are different numbers."""
+    acct = _bare_account()
+    acct._account.get_positions = AsyncMock(return_value=[
+        _tt_position(symbol="AAPL", quantity="10", close_price="150", mark_price="155",
+                     realized_day_gain="3"),
+    ])
+
+    position = acct.get_positions()[0]
+
+    assert position.unrealized_intraday_pl == pytest.approx(50.0)
