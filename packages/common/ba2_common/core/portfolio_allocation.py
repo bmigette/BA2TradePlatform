@@ -235,15 +235,23 @@ REASON_REDISTRIBUTED_FMT = (
     "'{label}' on target")
 REASON_REDISTRIBUTED_PREFIX = REASON_REDISTRIBUTED_FMT.split("{", 1)[0]
 
-#: The label finished off target because nothing in it was ALLOWED to absorb the
-#: rest (buying power, a broker minimum, the no-negative-position clamp). Only
-#: raised when some member could physically have taken it: a residual smaller than
-#: one tradeable unit of every member is arithmetic, not a fault.
+#: The label finished off target at its FIXED POINT because nothing in it was
+#: ALLOWED to absorb the rest (buying power, a broker minimum, the
+#: no-negative-position clamp, an invest run's no-sell rule). Only raised when some
+#: member could physically have taken it: a residual smaller than one tradeable unit
+#: of every member is arithmetic, not a fault. "Smaller" is measured in the SAME
+#: money as the residual -- in cost mode one share of a held position moves the
+#: label by its AVERAGE COST, so comparing against the PRICE cries wolf on a
+#: leftover no member could have taken.
 WARNING_RESIDUAL_LEFT_FMT = (
     "label '{label}' is {residual:,.2f} off target after redistribution - nothing "
-    "in it can absorb the rest (buying power, broker minimums, or it would drive a "
-    "position to zero)")
-#: The label finished off target because the pass bound stopped the loop.
+    "in it can absorb the rest (buying power, broker minimums, an invest run never "
+    "sells, or it would drive a position to zero)")
+#: The label finished off target because the pass bound stopped a loop that was
+#: STILL MOVING -- the one case where a bigger bound would change the answer. A loop
+#: that reached its own fixed point is never reported this way even when it used its
+#: last allowed pass to get there: passes are not what is wrong with it, and sending
+#: the user after the bound hides the absorber that actually said no.
 WARNING_RESIDUAL_UNCONVERGED_FMT = (
     "label '{label}' is still {residual:,.2f} off target after the {passes} "
     "redistribution passes allowed")
@@ -2414,11 +2422,21 @@ def _absorber_order(members: List["AllocationRow"]) -> List["AllocationRow"]:
 
 def _smallest_absorbable(absorbers: List["AllocationRow"],
                          margin: Dict[str, MarginInfo], *,
-                         allow_fractional: bool) -> float:
-    """The cheapest single step any absorber could take, or +inf if there are none."""
-    units = [tradeable_unit(margin.get(r.symbol), allow_fractional=allow_fractional)
-             * float(r.price) for r in absorbers]
-    return min(units) if units else float("inf")
+                         allow_fractional: bool, residual: float,
+                         valuation_mode: str, allocation_basis: str) -> float:
+    """The cheapest single step any absorber could take, or +inf if there are none.
+
+    Measured in the SAME money as the residual, which is why it takes the mode, the
+    basis and the residual's sign: in ``cost`` mode a share off a position down 50%
+    moves the label by the AVERAGE COST, so a leftover under that is unabsorbable
+    even when it is comfortably over one share's PRICE. Comparing the two units
+    turns "the arithmetic does not divide" into a warning about a fault.
+    """
+    steps = [tradeable_unit(margin.get(r.symbol), allow_fractional=allow_fractional)
+             * _absorption_unit_money(r, valuation_mode, allocation_basis,
+                                      buying=_row_is_buying(r, residual))
+             for r in absorbers]
+    return min(steps) if steps else float("inf")
 
 
 def redistribute_label_residuals(plan: "AllocationPlan",
@@ -2484,8 +2502,13 @@ def redistribute_label_residuals(plan: "AllocationPlan",
         baselines = {r.symbol: float(r.delta_quantity or 0.0) for r in members}
         residual = _label_residual(target_total, members, mode, basis)
         passes = 0
-        moved_any = False
-        while passes < REDISTRIBUTION_MAX_PASSES and abs(residual) > MONEY_EPSILON:
+        # WHY the loop ended, which is the whole difference between the two
+        # warnings: True only when the loop was still moving and ran out of passes.
+        stopped_on_bound = False
+        while abs(residual) > MONEY_EPSILON:
+            if passes >= REDISTRIBUTION_MAX_PASSES:
+                stopped_on_bound = True
+                break
             passes += 1
             moved_this_pass = False
             for row in absorbers:
@@ -2499,18 +2522,22 @@ def redistribute_label_residuals(plan: "AllocationPlan",
                     continue
                 _apply_absorption(row, move, label, baselines[row.symbol])
                 moved_this_pass = True
-                moved_any = True
                 residual = _label_residual(target_total, members, mode, basis)
             if not moved_this_pass:
+                # The fixed point: another pass would walk the same list and move
+                # the same nothing. The bound is irrelevant to what happens next.
                 break
         out[label] = residual
+        # THREE outcomes, and each names a different cause, because each has a
+        # different fix: raise the bound / free up an absorber / nothing to do.
         if abs(residual) <= MONEY_EPSILON:
             continue
-        if passes >= REDISTRIBUTION_MAX_PASSES:
+        if stopped_on_bound:
             plan.warnings.append(WARNING_RESIDUAL_UNCONVERGED_FMT.format(
                 label=label, residual=residual, passes=REDISTRIBUTION_MAX_PASSES))
         elif abs(residual) >= _smallest_absorbable(
-                absorbers, margin, allow_fractional=allow_fractional):
+                absorbers, margin, allow_fractional=allow_fractional,
+                residual=residual, valuation_mode=mode, allocation_basis=basis):
             # Some member could physically have taken this and none was allowed to.
             plan.warnings.append(WARNING_RESIDUAL_LEFT_FMT.format(
                 label=label, residual=residual))

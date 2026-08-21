@@ -404,6 +404,48 @@ def test_the_pass_bound_stops_the_loop_and_the_plan_says_the_bound_stopped_it(mo
     assert any("400.00" in w for w in plan.warnings)
 
 
+def test_a_fixed_point_reached_on_the_last_allowed_pass_blames_the_absorbers(monkeypatch):
+    """THREE outcomes, and they are not interchangeable: the bound stopping a loop
+    that was still moving means "the answer may be wrong"; a loop that stopped
+    because nothing could move means "this is the answer, and it is off target".
+
+    Here buying power blocks the only absorber on pass 1, which is also the last
+    pass allowed. Nothing moved, so the loop is AT ITS FIXED POINT -- running a
+    hundred more passes would change nothing -- and blaming the bound would send
+    the user looking for a bigger number instead of at the buying power.
+    """
+    monkeypatch.setattr(pa, "REDISTRIBUTION_MAX_PASSES", 1)
+    row = _buy_row("AAA", 100.0, 2.0, target_notional=200.0)
+    plan = AllocationPlan(rows=[row], available_buying_power=200.0,
+                          valuation_mode=pa.VALUATION_MODE_MARKET)
+    left = pa.redistribute_label_residuals(plan, {"A": {"AAA": 1_200.0}},
+                                           {"AAA": _whole("AAA")}, allow_fractional=False)
+    assert left["A"] == pytest.approx(1_000.0)
+    assert any("can absorb the rest" in w for w in plan.warnings)
+    assert not any("redistribution passes" in w for w in plan.warnings)
+
+
+def test_a_cost_mode_leftover_under_one_units_TRUE_money_effect_is_not_a_warning():
+    """The silence threshold has to be measured in the same money as the residual.
+
+    HELD is down 50% (10 shares, 2,000 of basis, 100 price) and is selling 2, so its
+    projected basis is 1,600 against a 1,750 target: 150 short. One share of it moves
+    the label by the 200 AVERAGE COST, not by the 100 price, so no member can take
+    the 150 without overshooting -- arithmetic, which the module says twice is not a
+    fault. Comparing 150 against the PRICE calls it a fault and cries wolf.
+    """
+    row = _buy_row("HELD", 100.0, -2.0, current_quantity=10.0,
+                   current_cost_basis=2_000.0, target_notional=1_750.0)
+    plan = AllocationPlan(rows=[row], available_buying_power=100_000.0,
+                          valuation_mode=pa.VALUATION_MODE_COST)
+    left = pa.redistribute_label_residuals(plan, {"A": {"HELD": 1_750.0}},
+                                           {"HELD": _whole("HELD")},
+                                           allow_fractional=False)
+    assert row.delta_quantity == -2.0
+    assert left["A"] == pytest.approx(150.0)
+    assert plan.warnings == []
+
+
 def test_a_residual_nothing_may_absorb_is_reported_not_hidden():
     """Buying power blocks the only absorber. The money is real and the plan says so
     rather than pretending the label is on target."""
@@ -493,6 +535,8 @@ def test_a_budget_basis_residual_is_never_closed_by_opening_a_sell():
     assert held.side is None
     assert held.redistributed is False
     assert left["L"] == pytest.approx(-50.0)
+    # Reported, not swallowed -- and the message names the rule that refused.
+    assert any("an invest run never sells" in w for w in plan.warnings)
 
 
 def test_an_invest_label_run_reports_a_bumps_overshoot_rather_than_selling_it_off():
