@@ -19002,6 +19002,22 @@ git commit -m "feat(allocation): income ledger sync, FIFO consumption wrapper an
 
 ### Task 75: Record the run, log the activity, show the per-row outcome table
 
+> **The call order is fixed, and one step of it is a live bug waiting to happen.**
+> `record_allocation_run(..., submitted_*=0.0, order_ids=[])` → stamp `run.id` into the order
+> comments → submit → `update_allocation_run_totals(...)` → `consume_income(account_id, net_buy_value)`.
+>
+> The object returned by the CREATE call is a detached snapshot with **zero** totals. Read
+> `net_buy_value` off the object returned by `update_allocation_run_totals`, never off the create
+> result — doing the latter passes `0.0` to `consume_income`, which then consumes nothing and leaves
+> the whole ledger open. It would look like it worked.
+>
+> **On partial submission failure, still call `update_allocation_run_totals` with what actually went
+> out.** Otherwise the row keeps its zeros and the income is never consumed.
+>
+> **A shortfall is not an error.** `consume_income` can consume less than `net_buy_value` when the
+> ledger cannot cover it — buying power is the feasibility constraint, not the ledger.
+
+
 Pure-testable: `summarise_outcomes` (no IO), and `run_allocation` against the FakeAccount +
 in-memory DB. Eyeball-only: `render_outcomes`' layout.
 
