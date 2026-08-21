@@ -7,7 +7,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from ba2_trade_platform.core.portfolio_allocation import PositionFetchFailed
+from ba2_trade_platform.core.portfolio_allocation import (
+    VALUATION_MODE_COST, VALUATION_MODE_MARKET, PositionFetchFailed,
+)
 from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
     GATE_HAS_EXPERTS, GATE_NOT_MANUAL, GATE_NO_ACCOUNT, GATE_OK,
     ManagedLabel, build_label_views, collect_managed_symbols, diff_managed_labels,
@@ -364,3 +366,129 @@ def test_diff_managed_labels_is_case_sensitive_because_labels_are():
     """
     to_add, to_remove = diff_managed_labels(['ARK26'], ['ark26'])
     assert (to_add, to_remove) == (['ark26'], ['ARK26'])
+
+
+def test_label_views_in_cost_mode_measure_positions_at_their_cost_basis():
+    views = build_label_views([ManagedLabel('ARK26', 100.0)],
+                              {'ARK26': ['AAPL']},
+                              {'AAPL': _pos('AAPL', 10, 1000.0)},
+                              {'AAPL': 250.0},
+                              valuation_mode=VALUATION_MODE_COST)
+    assert views[0].current_value == 1000.0
+    assert views[0].rows[0].current_value == 1000.0
+    assert views[0].rows[0].market_value == 2500.0     # still reported, just not the basis
+
+
+def test_label_views_in_market_mode_measure_positions_at_quantity_times_price():
+    views = build_label_views([ManagedLabel('ARK26', 100.0)],
+                              {'ARK26': ['AAPL']},
+                              {'AAPL': _pos('AAPL', 10, 1000.0)},
+                              {'AAPL': 250.0},
+                              valuation_mode=VALUATION_MODE_MARKET)
+    assert views[0].current_value == 2500.0
+    assert views[0].rows[0].current_value == 2500.0
+    assert views[0].rows[0].cost_basis == 1000.0       # still reported
+
+
+def test_market_mode_changes_the_percentages_a_doubled_position_reports():
+    """AAPL doubled, MSFT flat. In cost mode they are 50/50; in market mode 67/33."""
+    positions = {'AAPL': _pos('AAPL', 10, 1000.0), 'MSFT': _pos('MSFT', 10, 1000.0)}
+    prices = {'AAPL': 200.0, 'MSFT': 100.0}
+    symbols = {'ARK26': ['AAPL', 'MSFT']}
+
+    cost = build_label_views([ManagedLabel('ARK26', 100.0)], symbols, positions, prices,
+                             valuation_mode=VALUATION_MODE_COST)
+    market = build_label_views([ManagedLabel('ARK26', 100.0)], symbols, positions, prices,
+                               valuation_mode=VALUATION_MODE_MARKET)
+
+    cost_by = {r.symbol: r for r in cost[0].rows}
+    market_by = {r.symbol: r for r in market[0].rows}
+    assert cost_by['AAPL'].pct_of_label == 50.0
+    assert market_by['AAPL'].pct_of_label == pytest.approx(66.67, abs=0.01)
+    assert market_by['MSFT'].pct_of_label == pytest.approx(33.33, abs=0.01)
+
+
+def test_market_mode_without_a_price_reports_zero_current_value_not_a_guess():
+    views = build_label_views([ManagedLabel('ARK26', 100.0)],
+                              {'ARK26': ['AAPL']},
+                              {'AAPL': _pos('AAPL', 10, 1000.0)},
+                              {'AAPL': None},
+                              valuation_mode=VALUATION_MODE_MARKET)
+    assert views[0].rows[0].current_value == 0.0
+    assert views[0].rows[0].price is None
+
+
+def test_build_label_views_defaults_to_cost_mode():
+    """The DB default is 'cost' (spec 5a); the helper agrees so an omitted argument
+    can never silently reinterpret the page."""
+    views = build_label_views([ManagedLabel('ARK26', 100.0)],
+                              {'ARK26': ['AAPL']},
+                              {'AAPL': _pos('AAPL', 10, 1000.0)},
+                              {'AAPL': 250.0})
+    assert views[0].current_value == 1000.0
+
+
+def test_build_label_views_rejects_an_unknown_valuation_mode():
+    with pytest.raises(ValueError):
+        build_label_views([ManagedLabel('ARK26', 100.0)], {'ARK26': ['AAPL']},
+                          {'AAPL': _pos('AAPL', 10, 1000.0)}, {},
+                          valuation_mode='marketish')
+
+
+def test_market_mode_leaves_the_labels_cost_basis_reporting_cost():
+    """``LabelView.cost_basis`` is the COST column and must not follow the mode.
+
+    Before the mode existed the two were the same number and the field was filled
+    from the same local, so a mode-aware total that forgot this field would make
+    the label's "cost basis" silently become its market value -- and the row-level
+    ``cost_basis`` beside it would then disagree with the label total above it.
+    """
+    views = build_label_views([ManagedLabel('ARK26', 100.0)],
+                              {'ARK26': ['AAPL', 'MSFT']},
+                              {'AAPL': _pos('AAPL', 10, 1000.0),
+                               'MSFT': _pos('MSFT', 10, 1000.0)},
+                              {'AAPL': 200.0, 'MSFT': 100.0},
+                              valuation_mode=VALUATION_MODE_MARKET)
+    assert views[0].current_value == 3000.0
+    assert views[0].cost_basis == 2000.0
+    assert sum(r.cost_basis for r in views[0].rows) == 2000.0
+
+
+def test_market_mode_counts_a_two_label_symbol_once_in_pct_of_total():
+    """The distinct-value denominator has to survive the mode change too.
+
+    AAPL carries both labels; if the market-mode total summed per label instead of
+    per distinct symbol it would count AAPL twice, and every pct_of_total on the
+    page would be quietly deflated.
+    """
+    views = build_label_views([ManagedLabel('ARK26', 50.0), ManagedLabel('TECH', 50.0)],
+                              {'ARK26': ['AAPL'], 'TECH': ['AAPL', 'MSFT']},
+                              {'AAPL': _pos('AAPL', 10, 100.0),
+                               'MSFT': _pos('MSFT', 10, 100.0)},
+                              {'AAPL': 30.0, 'MSFT': 10.0},
+                              valuation_mode=VALUATION_MODE_MARKET)
+    # Distinct managed market value is 300 + 100 = 400, NOT 300 + 300 + 100.
+    aapl = next(r for r in views[0].rows if r.symbol == 'AAPL')
+    assert aapl.pct_of_total == 75.0
+    assert views[0].pct_of_total == 75.0
+    assert views[1].pct_of_total == 100.0
+
+
+def test_market_mode_never_values_a_position_at_the_brokers_own_market_value():
+    """No price means 0, even when the broker stamped a market value on the row.
+
+    ``current_value``'s docstring is explicit that ``PositionState.market_value``
+    is not consulted: it can be stamped at a different price from the live quote,
+    and the base, the percentages and every delta must be measured with the SAME
+    price. The display column may still show the broker's figure -- the BASIS may
+    not be it.
+    """
+    views = build_label_views([ManagedLabel('ARK26', 100.0)],
+                              {'ARK26': ['AAPL']},
+                              {'AAPL': _pos('AAPL', 10, 1000.0, market_value=9000.0)},
+                              {'AAPL': None},
+                              valuation_mode=VALUATION_MODE_MARKET)
+    row = views[0].rows[0]
+    assert row.current_value == 0.0
+    assert row.market_value == 9000.0      # displayed, never used as the basis
+    assert views[0].current_value == 0.0

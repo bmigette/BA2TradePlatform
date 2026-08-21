@@ -12,7 +12,10 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from ...core.portfolio_allocation import PositionFetchFailed, PositionState
+from ...core.portfolio_allocation import (
+    VALUATION_MODE_COST, VALUATION_MODE_MARKET, PositionFetchFailed, PositionState,
+    current_value,
+)
 
 # ---- gate reason codes (exact spellings; use these, never bare literals) ----
 
@@ -207,11 +210,15 @@ def build_label_views(managed,
                       symbols_by_label,
                       positions,
                       prices,
-                      symbol_comments=None) -> List[LabelView]:
+                      symbol_comments=None,
+                      valuation_mode: str = VALUATION_MODE_COST) -> List[LabelView]:
     """Build the default view: one LabelView per managed label. Pure.
 
-    Current value is the COST BASIS here; Task 66 adds a ``valuation_mode``
-    keyword so ``market`` mode can measure the same positions at ``qty x price``.
+    ``valuation_mode`` (decision 5a) selects what "current value" means: ``cost``
+    (the cost basis) or ``market`` (``qty x price``). It drives BOTH percentage
+    columns and both totals, so the page must state which mode produced them.
+    Defaults to ``cost``, matching ``portfolio_allocation_config.valuation_mode``.
+    A market-mode symbol with no price contributes 0 rather than a guessed value.
 
     Args:
         managed: ``List[ManagedLabel]`` in display order.
@@ -231,6 +238,11 @@ def build_label_views(managed,
     """
     comments = symbol_comments or {}
 
+    if valuation_mode not in (VALUATION_MODE_COST, VALUATION_MODE_MARKET):
+        raise ValueError(
+            f"Unknown valuation_mode {valuation_mode!r}; expected "
+            f"{VALUATION_MODE_COST!r} or {VALUATION_MODE_MARKET!r}")
+
     def _clean(label: str) -> List[str]:
         seen, out = set(), []
         for sym in (symbols_by_label or {}).get(label, []) or []:
@@ -248,16 +260,28 @@ def build_label_views(managed,
             if entry.label not in membership[sym]:
                 membership[sym].append(entry.label)
 
-    total_value = 0.0
-    for sym in membership:
+    def _value_of(sym: str) -> float:
+        """This symbol's current value under the active mode, using the LIVE price.
+
+        ``PositionState.price`` is not populated on this path -- the page fetches
+        quotes in one bulk call -- so a shallow copy carrying the live price is fed
+        to the engine's ``current_value``, keeping ONE definition of the rule.
+        """
         state = positions.get(sym)
-        if state is not None:
-            total_value += state.cost_basis
+        if state is None:
+            return 0.0
+        if valuation_mode == VALUATION_MODE_COST:
+            return current_value(state, VALUATION_MODE_COST)
+        priced = PositionState(symbol=state.symbol, quantity=state.quantity,
+                               cost_basis=state.cost_basis, price=(prices or {}).get(sym))
+        return current_value(priced, VALUATION_MODE_MARKET)
+
+    total_value = sum(_value_of(sym) for sym in membership)
 
     views: List[LabelView] = []
     for entry in managed:
         symbols = _clean(entry.label)
-        label_value = sum(positions[s].cost_basis for s in symbols if s in positions)
+        label_value = sum(_value_of(s) for s in symbols)
         label_market_value: Optional[float] = None
         rows: List[SymbolRow] = []
 
@@ -275,16 +299,17 @@ def build_label_views(managed,
             if market_value is not None:
                 label_market_value = (label_market_value or 0.0) + market_value
 
+            row_value = _value_of(sym)
             rows.append(SymbolRow(
                 symbol=sym,
                 labels=list(membership.get(sym, [entry.label])),
                 quantity=quantity,
                 cost_basis=cost_basis,
-                current_value=cost_basis,
+                current_value=row_value,
                 price=price,
                 market_value=market_value,
-                pct_of_label=(cost_basis / label_value * 100.0) if label_value > 0 else 0.0,
-                pct_of_total=(cost_basis / total_value * 100.0) if total_value > 0 else 0.0,
+                pct_of_label=(row_value / label_value * 100.0) if label_value > 0 else 0.0,
+                pct_of_total=(row_value / total_value * 100.0) if total_value > 0 else 0.0,
                 comment=comments.get((entry.label, sym)),
             ))
 
@@ -294,7 +319,7 @@ def build_label_views(managed,
             target_pct=entry.target_pct,
             comment=entry.comment,
             current_value=label_value,
-            cost_basis=label_value,
+            cost_basis=sum(positions[s].cost_basis for s in symbols if s in positions),
             market_value=label_market_value,
             pct_of_total=(label_value / total_value * 100.0) if total_value > 0 else 0.0,
             rows=rows,

@@ -44,10 +44,11 @@ from sqlmodel import select
 
 from ...core.db import get_db
 from ...core.models import ExpertInstance
+from ...core.portfolio_allocation import VALUATION_MODE_COST, VALUATION_MODE_MARKET
 from ...core.portfolio_allocation_store import (
-    add_symbols_to_label, get_managed_labels, get_symbol_comments, get_symbol_weights,
-    remove_symbols_from_label, replace_managed_labels, set_managed_label,
-    set_symbol_weight,
+    add_symbols_to_label, get_allocation_config, get_managed_labels, get_symbol_comments,
+    get_symbol_weights, remove_symbols_from_label, replace_managed_labels,
+    set_allocation_config, set_managed_label, set_symbol_weight,
 )
 from ...logger import logger
 from ..account_filter_context import get_selected_account_id
@@ -96,8 +97,12 @@ def _load_gate(account_id: Optional[int]) -> GateResult:
     return evaluate_gate(account_id, manual, _enabled_expert_names(account_id))
 
 
-def _load_view_payload(account_id: int) -> Dict[str, Any]:
+def _load_view_payload(account_id: int, valuation_mode: str) -> Dict[str, Any]:
     """One render's worth of data: managed labels, membership, positions, prices.
+
+    ``valuation_mode`` is threaded through to ``build_label_views`` and echoed back
+    in the payload so the render names the mode that produced the numbers next to
+    them -- switching modes RE-COMPUTES rather than silently reinterpreting.
 
     Raises:
         PositionFetchFailed: the broker position fetch failed (NOT a flat account).
@@ -131,9 +136,16 @@ def _load_view_payload(account_id: int) -> Dict[str, Any]:
             comments[(entry.label, symbol)] = text
 
     return {
-        'views': build_label_views(managed, symbols_by_label, positions, prices, comments),
+        'views': build_label_views(managed, symbols_by_label, positions, prices, comments,
+                                   valuation_mode=valuation_mode),
         'symbols_by_label': symbols_by_label,
+        'valuation_mode': valuation_mode,
     }
+
+
+def _load_valuation_mode(account_id: int) -> str:
+    """The account's stored valuation mode, creating the config row on first use."""
+    return get_allocation_config(account_id).valuation_mode
 
 
 def _load_picker_data(account_id: int) -> Dict[str, List[str]]:
@@ -371,10 +383,13 @@ def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
             ui.label('No labels are managed for this account yet — click "Manage labels".')
         return
 
+    mode = payload['valuation_mode']
+    mode_label = ('cost basis (what you paid)' if mode == VALUATION_MODE_COST
+                  else 'market value (qty x price)')
     total = sum(v.current_value for v in views)
     with ui.row().classes('w-full gap-4'):
         with ui.column().classes('stat-card p-3'):
-            ui.label('Managed value').classes('text-xs text-secondary-custom')
+            ui.label(f'Managed value — {mode_label}').classes('text-xs text-secondary-custom')
             ui.label(f'${total:,.2f}').classes('text-lg font-bold')
         with ui.column().classes('stat-card p-3'):
             ui.label('Managed labels').classes('text-xs text-secondary-custom')
@@ -408,13 +423,15 @@ async def content() -> None:
 
         toolbar = ui.row().classes('w-full items-center gap-2')
         body = ui.column().classes('w-full gap-3')
+        mode_state = {'value': await asyncio.to_thread(_load_valuation_mode, account_id)}
 
         async def _refresh() -> None:
             body.clear()
             with body:
                 ui.spinner(size='lg').classes('self-center')
             try:
-                payload = await asyncio.to_thread(_load_view_payload, account_id)
+                payload = await asyncio.to_thread(
+                    _load_view_payload, account_id, mode_state['value'])
             except PositionFetchFailed as e:
                 logger.error(f"Portfolio allocation: position fetch failed: {e}")
                 body.clear()
@@ -436,7 +453,27 @@ async def content() -> None:
             with body:
                 _render_labels(account_id, payload, _refresh)
 
+        async def _set_mode(event) -> None:
+            """Persist the mode EAGERLY and RE-COMPUTE -- never reinterpret silently."""
+            chosen = event.value
+            if not chosen or chosen == mode_state['value']:
+                return
+            try:
+                await asyncio.to_thread(set_allocation_config, account_id,
+                                        valuation_mode=chosen)
+            except Exception as e:
+                logger.error(f"Saving valuation mode failed: {e}", exc_info=True)
+                ui.notify(f'Could not save valuation mode: {e}', type='negative')
+                return
+            mode_state['value'] = chosen
+            ui.notify(f'Valuation mode: {chosen}', type='info')
+            await _refresh()
+
         with toolbar:
+            ui.select({VALUATION_MODE_COST: 'Cost basis',
+                       VALUATION_MODE_MARKET: 'Market value'},
+                      value=mode_state['value'], label='Valuation',
+                      on_change=_set_mode).props('dense outlined').classes('w-44')
             ui.button('Manage labels', icon='pie_chart',
                       on_click=lambda: _open_label_picker(account_id, _refresh)).props('outline')
             ui.button('Refresh', icon='refresh', on_click=_refresh).props('outline')
