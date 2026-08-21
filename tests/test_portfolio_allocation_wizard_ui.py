@@ -1229,3 +1229,172 @@ def test_the_income_panel_draws_no_working_orders_line_when_the_run_settled(nice
         wiz.render_income_panel([], 0.0, on_sync=lambda: None, on_invest=lambda a: None,
                                 working_note=None)
         assert _marked_texts(nicegui_client.layout, wiz.MARKER_WORKING_ORDERS) == []
+
+
+# ---------------------------------------------------------------------------
+# I3 / I5: Refresh has to re-read the CLOCK, not just the plan.
+#
+# ``_solve_plan``'s docstring says "ONE read feeds both the banner and the gate",
+# and the page's ``_on_refresh`` threw the market hours away into ``_`` while
+# ``AllocationWizard._refresh`` never touched ``self.market``, the banner or the
+# Submit button. So a wizard opened before the bell kept a disabled Submit all
+# morning, and -- the dangerous direction -- one opened while OPEN kept an ENABLED
+# Submit right through the close, sending orders the server gate then refuses with
+# a screen of unexplained per-row failures.
+# ---------------------------------------------------------------------------
+
+def _fallback_open_market():
+    """OPEN, but on the OFFLINE calendar's word: the broker's clock never answered."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        MARKET_GATE_OPEN, MarketGateResult,
+    )
+    return MarketGateResult(allowed=True, reason_code=MARKET_GATE_OPEN, message="",
+                            from_fallback=True)
+
+
+def test_a_refresh_that_returns_only_a_plan_is_refused_not_half_applied(nicegui_client):
+    """The contract is ``(plan, market)``: one call, two answers, one solve.
+
+    A caller still on the old plan-only contract must fail LOUDLY. Unpacking is
+    what makes that automatic -- the TypeError lands in the same handler a broker
+    outage does, so the dialog keeps the plan and the gate it already had rather
+    than adopting half of a new one.
+    """
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    original = _mixed_plan()
+    with nicegui_client:
+        wizard = wiz.AllocationWizard(_base(), original, market=_closed_market(),
+                                      on_refresh=lambda f: _mixed_plan(),
+                                      on_submit=lambda p: None)
+        wizard.open()
+        wizard._refresh(wizard.allow_fractional)
+
+    assert wizard.plan is original
+    assert wizard.market.allowed is False
+    assert wizard._submit_button.enabled is False
+
+
+def test_refreshing_after_the_bell_re_enables_submit_and_drops_the_banner(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wizard = wiz.AllocationWizard(
+            _base(), _mixed_plan(), market=_closed_market(),
+            on_refresh=lambda f: (_mixed_plan(), _open_market()),
+            on_submit=lambda p: None)
+        wizard.open()
+        assert wizard._submit_button.enabled is False
+        assert len(_marked_texts(nicegui_client.layout, wiz.MARKER_MARKET_BANNER)) == 1
+
+        wizard._refresh(wizard.allow_fractional)
+
+        assert wizard.market.allowed is True
+        assert wizard._submit_button.enabled is True
+        assert _marked_texts(nicegui_client.layout, wiz.MARKER_MARKET_BANNER) == []
+
+
+def test_refreshing_after_the_close_disables_submit_and_raises_the_banner(nicegui_client):
+    """The direction that costs money: the dialog can sit open across 16:00."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wizard = wiz.AllocationWizard(
+            _base(), _mixed_plan(), market=_open_market(),
+            on_refresh=lambda f: (_mixed_plan(), _closed_market()),
+            on_submit=lambda p: None)
+        wizard.open()
+        assert wizard._submit_button.enabled is True
+
+        wizard._refresh(wizard.allow_fractional)
+
+        assert wizard.market.allowed is False
+        assert wizard._submit_button.enabled is False
+        banner = _marked_texts(nicegui_client.layout, wiz.MARKER_MARKET_BANNER)
+        assert len(banner) == 1
+        assert "Fri 21 Aug 2026 09:30 ET" in banner[0]
+
+
+def test_a_refresh_that_closed_the_market_also_refuses_the_next_submit(nicegui_client):
+    """The banner and the button are display; ``_submit``'s own check is the one
+    that has to be reading the SAME gate."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    submitted = []
+    with nicegui_client:
+        wizard = wiz.AllocationWizard(
+            _base(), _mixed_plan(), market=_open_market(),
+            on_refresh=lambda f: (_mixed_plan(), _closed_market()),
+            on_submit=submitted.append)
+        wizard.open()
+        wizard._refresh(wizard.allow_fractional)
+        wizard._submit()
+
+    assert submitted == []
+    assert wizard._submitted is False
+
+
+def test_a_failed_refresh_leaves_the_gate_exactly_where_it_was(nicegui_client):
+    """``on_refresh`` raising must not silently unlock Submit -- nor lock it."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    def _boom(_allow_fractional):
+        raise RuntimeError("broker down")
+
+    with nicegui_client:
+        wizard = wiz.AllocationWizard(_base(), _mixed_plan(), market=_closed_market(),
+                                      on_refresh=_boom, on_submit=lambda p: None)
+        wizard.open()
+        wizard._refresh(wizard.allow_fractional)
+
+    assert wizard.market.allowed is False
+    assert wizard._submit_button.enabled is False
+
+
+def test_an_open_market_the_broker_never_confirmed_is_flagged_on_screen(nicegui_client):
+    """I5: the gate ALLOWS on the offline calendar's word. Saying nothing lets a
+    submission go out on a timetable that cannot see an unscheduled halt."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wizard = wiz.AllocationWizard(_base(), _mixed_plan(),
+                                      market=_fallback_open_market(),
+                                      on_refresh=lambda f: (_mixed_plan(),
+                                                            _fallback_open_market()),
+                                      on_submit=lambda p: None)
+        wizard.open()
+        drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_MARKET_BANNER)
+
+    # Submit still works -- this is a caveat, not a block.
+    assert wizard._submit_button.enabled is True
+    assert len(drawn) == 1
+    assert "did not answer" in drawn[0]
+
+
+def test_a_broker_confirmed_open_market_draws_no_caveat(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wiz.AllocationWizard(_base(), _mixed_plan(), market=_open_market(),
+                             on_refresh=lambda f: (_mixed_plan(), _open_market()),
+                             on_submit=lambda p: None).open()
+        assert _marked_texts(nicegui_client.layout, wiz.MARKER_MARKET_BANNER) == []
+
+
+def test_refreshing_onto_a_fallback_open_raises_the_caveat_that_was_not_there(
+        nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wizard = wiz.AllocationWizard(
+            _base(), _mixed_plan(), market=_open_market(),
+            on_refresh=lambda f: (_mixed_plan(), _fallback_open_market()),
+            on_submit=lambda p: None)
+        wizard.open()
+        assert _marked_texts(nicegui_client.layout, wiz.MARKER_MARKET_BANNER) == []
+
+        wizard._refresh(wizard.allow_fractional)
+
+        drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_MARKET_BANNER)
+    assert len(drawn) == 1
+    assert "did not answer" in drawn[0]

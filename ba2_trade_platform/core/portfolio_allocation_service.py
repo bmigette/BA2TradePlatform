@@ -1476,6 +1476,40 @@ def fetch_market_hours(account):
     return hours
 
 
+def clear_market_hours_cache(account) -> bool:
+    """Drop the account's cached market-status answer so the next read refetches.
+
+    ``ReadOnlyAccountInterface.get_market_hours`` caches for ``min(TTL, the next
+    session boundary)``, which is right for the several reads one page render
+    makes and wrong for a user who pressed Refresh *because* they believe the bell
+    has gone. ``clear_market_hours_cache()`` is the interface's own EXPLICIT path
+    for that, and it documents itself as being "for a user who hits Refresh"; this
+    is the adapter that makes the docstring true, and it is called from the
+    wizard's Refresh (``ui/pages/portfolio_allocation.py:_on_refresh`` via
+    ``_solve_plan(force_market_refresh=True)``).
+
+    Tolerant in the same way ``fetch_market_hours`` is: a test double or an account
+    class that predates the seam simply has nothing to clear, and a broker whose
+    clear explodes must not take a dry run down with it -- the worst case is a
+    market-hours answer up to one TTL old, which is what the caller had anyway.
+
+    Returns:
+        bool: True when a cache was actually cleared.
+    """
+    clear = getattr(account, "clear_market_hours_cache", None)
+    if clear is None:
+        logger.debug(f"Account {getattr(account, 'id', '?')} publishes no market-hours "
+                     f"cache to clear")
+        return False
+    try:
+        clear()
+    except Exception as e:
+        logger.error(f"Could not clear the market-hours cache for account "
+                     f"{getattr(account, 'id', '?')}: {e}", exc_info=True)
+        return False
+    return True
+
+
 def _market_blocked_reason(hours) -> Optional[str]:
     """``None`` when the market is confirmed open, else the sentence to show.
 

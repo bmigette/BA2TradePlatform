@@ -1262,3 +1262,113 @@ def test_every_page_call_into_the_service_matches_its_real_signature():
                             f"(real signature: {name}{signature})")
     assert not problems, "page/wizard call sites that no longer match the service:\n" \
                          + "\n".join(problems)
+
+
+# ---------------------------------------------------------------------------
+# I3 / I4: the wizard's Refresh has to move the CLOCK, and re-read it for real
+# ---------------------------------------------------------------------------
+
+def _open_the_wizard(monkeypatch, nicegui_client, account, account_id):
+    """Run the Allocate flow up to the dry run and return the wizard's kwargs."""
+    _use_account(monkeypatch, account)
+    _capture_notifications(monkeypatch)
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL'], 'ARK26')
+    opened, steps, pending = {}, {}, []
+    monkeypatch.setattr(page, 'open_allocation_wizard',
+                        lambda *a, **kw: opened.update(kw, base=a[0], plan=a[1]))
+    monkeypatch.setattr(page, 'open_allocation_steps',
+                        lambda *a, **kw: steps.update(kw, base=a[0], labels=a[1]))
+    monkeypatch.setattr(page.ui, 'timer',
+                        lambda _delay, callback, once=False: pending.append(callback))
+    _run_in_client(nicegui_client, lambda: page._open_allocation_flow(
+        account_id, VALUATION_MODE_COST, _noop_refresh))
+    steps['on_dry_run'](mode=ALLOCATION_MODE_REBALANCE, labels=steps['labels'],
+                        scope_label=None, amount=0.0, allow_fractional=True)
+    _run_in_client(nicegui_client, pending.pop())
+    return opened
+
+
+def test_the_wizards_refresh_hands_back_a_fresh_market_gate_not_just_a_plan(
+        monkeypatch, nicegui_client, account_id):
+    """``_solve_plan`` reads the clock so that "ONE read feeds both the banner and
+    the gate" -- and ``_on_refresh`` used to drop it into ``_``. A wizard opened
+    before the bell then kept a disabled Submit all morning."""
+    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
+                            positions=[], prices={'AAPL': 100.0}, market_open=False)
+    opened = _open_the_wizard(monkeypatch, nicegui_client, account, account_id)
+    assert opened['market'].allowed is False           # opened before the bell
+
+    account.market_open = True                          # ...the bell goes
+    plan, market = opened['on_refresh'](True)
+
+    assert [r.symbol for r in plan.rows] == ['AAPL']
+    assert market.allowed is True
+
+
+def test_the_wizards_refresh_can_also_close_the_gate(monkeypatch, nicegui_client,
+                                                     account_id):
+    """The direction that costs money: the dialog sits open across 16:00."""
+    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
+                            positions=[], prices={'AAPL': 100.0}, market_open=True)
+    opened = _open_the_wizard(monkeypatch, nicegui_client, account, account_id)
+    assert opened['market'].allowed is True
+
+    account.market_open = False
+    _plan, market = opened['on_refresh'](True)
+
+    assert market.allowed is False
+    assert 'Submit is disabled' in market.message
+
+
+def test_the_wizards_refresh_drops_the_cached_market_hours_answer(
+        monkeypatch, nicegui_client, account_id):
+    """I4. ``get_market_hours`` caches for min(TTL, next session boundary), which is
+    right for one render's several reads and wrong for a user pressing Refresh at
+    09:31 precisely because they think the market has opened.
+    ``clear_market_hours_cache`` calls itself "the EXPLICIT path, for a user who
+    hits Refresh" and had no production caller at all."""
+    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
+                            positions=[], prices={'AAPL': 100.0})
+    opened = _open_the_wizard(monkeypatch, nicegui_client, account, account_id)
+    assert account.cache_clears == 0        # the first solve has nothing to drop
+
+    opened['on_refresh'](True)
+
+    assert account.cache_clears == 1
+    # ...and the clock really was re-read afterwards, not answered from the cache.
+    assert account.market_hours_calls >= 2
+
+
+def test_the_first_solve_of_a_flow_does_not_clear_the_cache(monkeypatch, account_id):
+    """Clearing on every solve would turn a per-render de-duplicator into a broker
+    round trip per read."""
+    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
+                            positions=[], prices={'AAPL': 100.0})
+    _use_account(monkeypatch, account)
+
+    page._solve_plan(account_id, mode=ALLOCATION_MODE_REBALANCE,
+                     labels=_alloc_labels(), scope_label=None, amount=0.0,
+                     allow_fractional=True, valuation_mode=VALUATION_MODE_COST)
+
+    assert account.cache_clears == 0
+
+
+def test_clearing_the_market_hours_cache_never_takes_a_dry_run_down(monkeypatch,
+                                                                    account_id):
+    """A broker whose clear explodes costs an answer up to one TTL old -- which is
+    what the caller had anyway. It must not cost the dry run."""
+    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
+                            positions=[], prices={'AAPL': 100.0})
+    account.clear_market_hours_cache = lambda: (_ for _ in ()).throw(
+        RuntimeError("cache is on fire"))
+    _use_account(monkeypatch, account)
+    _capture_errors(monkeypatch)
+
+    _base_out, plan, _current, hours = page._solve_plan(
+        account_id, mode=ALLOCATION_MODE_REBALANCE, labels=_alloc_labels(),
+        scope_label=None, amount=0.0, allow_fractional=True,
+        valuation_mode=VALUATION_MODE_COST, force_market_refresh=True)
+
+    assert [r.symbol for r in plan.rows] == ['AAPL']
+    assert hours.is_open is True

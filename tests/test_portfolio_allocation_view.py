@@ -1057,3 +1057,55 @@ def test_an_unknown_gate_never_claims_the_broker_answered():
     assert evaluate_market_gate(is_open=True, next_open=None,
                                 source=MARKET_SOURCE_BROKER,
                                 now=FROZEN_NOW).from_fallback is False
+
+
+# ---------------------------------------------------------------------------
+# I5: an ALLOW built on the offline calendar has to say so.
+#
+# ``from_fallback`` was set on all three branches and read by nobody. The CLOSED
+# branch at least folds MARKET_NOTE_FALLBACK into its own message; the ALLOW
+# branch had nowhere to put it, so a broker whose get_clock() failed could have
+# the built-in NYSE calendar wave a submission through -- and the calendar knows
+# nothing about an unscheduled halt, a broker-side trading suspension or the
+# account's own restrictions.
+# ---------------------------------------------------------------------------
+
+def test_no_provenance_notice_when_the_broker_itself_said_the_market_is_open():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        market_provenance_notice,
+    )
+    gate = evaluate_market_gate(is_open=True, next_open=None,
+                                source=MARKET_SOURCE_BROKER, now=FROZEN_NOW)
+    assert market_provenance_notice(gate) is None
+
+
+def test_an_allow_from_the_offline_calendar_warns_that_the_broker_never_answered():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        market_provenance_notice,
+    )
+    gate = evaluate_market_gate(is_open=True, next_open=None,
+                                source=MARKET_SOURCE_FALLBACK, now=FROZEN_NOW)
+    assert gate.allowed is True
+
+    text, severity = market_provenance_notice(gate)
+    assert "did not answer" in text
+    assert "halt" in text.lower()
+    assert severity == "warning"
+    assert severity in MARKET_BANNER_CLASSES
+
+
+def test_a_blocked_gate_gets_no_second_provenance_notice():
+    """The CLOSED and UNKNOWN branches already carry their own provenance wording
+    inside ``message``; a second banner saying it again is noise, and the one the
+    user must not miss is the one that let a submission THROUGH."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        MARKET_NOTE_FALLBACK, market_provenance_notice,
+    )
+    closed = evaluate_market_gate(is_open=False, next_open=NEXT_OPEN,
+                                  source=MARKET_SOURCE_FALLBACK, now=FROZEN_NOW)
+    assert MARKET_NOTE_FALLBACK in closed.message
+    assert market_provenance_notice(closed) is None
+
+    unknown = evaluate_market_gate(is_open=None, next_open=None,
+                                   source=MARKET_SOURCE_UNAVAILABLE, now=FROZEN_NOW)
+    assert market_provenance_notice(unknown) is None

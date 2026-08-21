@@ -52,7 +52,9 @@ from ...core.portfolio_allocation import (
     unconsumed_income_notice,
     whole_share_notice,
 )
-from ..utils.portfolio_allocation_view import MARKET_BANNER_CLASSES, MarketGateResult
+from ..utils.portfolio_allocation_view import (
+    MARKET_BANNER_CLASSES, MarketGateResult, market_provenance_notice,
+)
 from ...core.portfolio_allocation_service import (
     OUTCOME_FAILED,
     OUTCOME_PARTIAL,
@@ -127,6 +129,13 @@ class AllocationWizard:
     still refreshes and still recomputes: planning outside market hours is the
     normal way to use this page. ``run_allocation`` re-checks the gate server-side,
     because this dialog can sit open across the close.
+
+    Refresh re-reads the CLOCK as well as the plan. ``on_refresh`` returns
+    ``(plan, market)`` -- one call, both answers, from the same solve, exactly as
+    the initial open gets them -- and ``_refresh`` then re-renders the banner and
+    re-syncs the Submit button. Returning only a plan is what left a dialog opened
+    before the bell with Submit disabled all morning, and (the direction that costs
+    money) a dialog opened while OPEN with Submit still enabled after 16:00.
     """
 
     def __init__(
@@ -135,7 +144,7 @@ class AllocationWizard:
         plan: AllocationPlan,
         *,
         market: MarketGateResult,
-        on_refresh: Callable[[bool], AllocationPlan],
+        on_refresh: Callable[[bool], Tuple[AllocationPlan, MarketGateResult]],
         on_submit: Callable[[AllocationPlan], None],
         title: str = 'Portfolio allocation - dry run',
     ):
@@ -148,11 +157,13 @@ class AllocationWizard:
         self.allow_fractional = bool(plan.allow_fractional)
         self.selected = self._default_selection(plan)
         self.dialog = None
+        self._banner_container = None
         self._notices_container = None
         self._rows_container = None
         self._no_order_container = None
         self._totals_container = None
         self._submit_button = None
+        self._submit_tooltip = None
         #: One-shot latch. See ``_submit``: NiceGUI runs a sync click handler
         #: directly on the event loop, so the dialog stays on screen -- and
         #: clickable -- for the whole of a blocking submit.
@@ -163,6 +174,9 @@ class AllocationWizard:
         with ui.dialog().props('maximized') as dialog, ui.card().classes('w-full h-full overflow-auto'):
             self.dialog = dialog
             ui.label(self.title).classes('text-xl font-bold')
+            # A CONTAINER, not a bare render: Refresh re-reads the clock, and a
+            # banner drawn straight into the card could never be taken down again.
+            self._banner_container = ui.column().classes('w-full')
             self._render_market_banner()
             self._render_base_panel()
             ui.switch('Allow fractional shares', value=self.allow_fractional,
@@ -181,24 +195,61 @@ class AllocationWizard:
                 ui.button('Cancel', on_click=dialog.close).props('flat')
                 self._submit_button = ui.button('Submit', on_click=self._submit) \
                     .props('color=primary')
-                if not self.market.allowed:
-                    # Disabled, not hidden: the user must see that Submit exists and
-                    # WHY it is off -- the banner right above says when it returns.
-                    self._submit_button.set_enabled(False)
-                    self._submit_button.tooltip(self.market.message)
+                # Built ONCE and re-texted on refresh. ``Element.tooltip()`` creates
+                # a fresh q-tooltip on every call (nicegui/element.py), so calling
+                # it again from _refresh would stack one per refresh.
+                with self._submit_button:
+                    self._submit_tooltip = ui.tooltip('')
+                self._sync_submit_button()
         dialog.open()
         return dialog
 
     # -- internals --------------------------------------------------------
     def _render_market_banner(self):
-        """The market-hours banner. Nothing at all when the market is open."""
-        if self.market.allowed:
+        """The market-hours banner. Nothing at all when the BROKER said "open".
+
+        Two things reach this banner and they are not the same:
+
+        * the gate BLOCKING -- closed, or unknown -- which carries its own message
+          (including its own fallback wording, so it needs no second line); and
+        * the gate ALLOWING on an answer that did NOT come from the broker
+          (``market_provenance_notice``). That is the case worth shouting about:
+          the built-in NYSE calendar says "scheduled trading day" and Submit goes
+          live, on a timetable that cannot see an unscheduled halt.
+
+        Nothing is drawn when the broker itself confirmed the market open -- not an
+        empty box, which would leave a stray banner with nothing to say.
+        """
+        self._banner_container.clear()
+        if not self.market.allowed:
+            notice = (self.market.message, self.market.severity)
+        else:
+            notice = market_provenance_notice(self.market)
+        if notice is None:
             return
-        css = MARKET_BANNER_CLASSES.get(self.market.severity, 'alert-banner warning')
-        with ui.element('div').classes(f'{css} w-full p-3'):
-            with ui.row().classes('items-center gap-2'):
-                ui.icon('schedule')
-                ui.label(self.market.message).classes('text-sm').mark(MARKER_MARKET_BANNER)
+        text, severity = notice
+        css = MARKET_BANNER_CLASSES.get(severity, 'alert-banner warning')
+        with self._banner_container:
+            with ui.element('div').classes(f'{css} w-full p-3'):
+                with ui.row().classes('items-center gap-2'):
+                    ui.icon('schedule')
+                    ui.label(text).classes('text-sm').mark(MARKER_MARKET_BANNER)
+
+    def _sync_submit_button(self):
+        """Point the Submit button at the CURRENT gate. Idempotent.
+
+        Disabled, not hidden: the user must see that Submit exists and WHY it is
+        off -- the banner right above says when it returns. Called from ``open``
+        and from every ``_refresh``, because the gate moves while the dialog sits
+        there and the button is only a mirror of it.
+        """
+        if self._submit_button is None:
+            return
+        blocked = not self.market.allowed
+        self._submit_button.set_enabled(not blocked and not self._submitted)
+        if self._submit_tooltip is not None:
+            self._submit_tooltip.set_text(self.market.message if blocked else '')
+            self._submit_tooltip.set_visibility(blocked)
 
     def _render_notices(self):
         """The four plan-level sentences, up top.
@@ -404,14 +455,28 @@ class AllocationWizard:
         self._render_totals()
 
     def _refresh(self, allow_fractional: bool):
+        """Re-solve, and re-read the CLOCK with it.
+
+        ``on_refresh`` returns ``(plan, market)`` from ONE solve, which is the same
+        guarantee the initial open has: the banner and the gate can never describe
+        different instants. Refreshing only the plan is what left a wizard opened
+        at 09:00 with Submit disabled at 10:00, and a wizard opened at 15:00 with
+        Submit still enabled at 16:30.
+
+        A refresh that RAISES changes nothing at all -- not the plan, not the gate.
+        Unlocking Submit because the clock could not be re-read would be exactly
+        backwards.
+        """
         self.allow_fractional = allow_fractional
         try:
-            self.plan = self.on_refresh(allow_fractional)
+            self.plan, self.market = self.on_refresh(allow_fractional)
         except Exception as e:
             logger.error(f"Allocation dry-run refresh failed: {e}", exc_info=True)
             ui.notify(f'Refresh failed: {e}', type='negative')
             return
         self.selected = self._default_selection(self.plan)
+        self._render_market_banner()
+        self._sync_submit_button()
         self._render_notices()
         self._render_rows()
         self._render_no_order_rows()
@@ -471,7 +536,7 @@ def open_allocation_wizard(
     plan: AllocationPlan,
     *,
     market: MarketGateResult,
-    on_refresh: Callable[[bool], AllocationPlan],
+    on_refresh: Callable[[bool], Tuple[AllocationPlan, MarketGateResult]],
     on_submit: Callable[[AllocationPlan], None],
     title: str = 'Portfolio allocation - dry run',
 ) -> AllocationWizard:
@@ -483,6 +548,11 @@ def open_allocation_wizard(
     ``ui.utils.portfolio_allocation_view``, fed by
     ``portfolio_allocation_service.fetch_market_hours(account)`` -- pass
     ``is_open=None`` when that returns ``None`` OR when ``hours.is_known`` is False.
+
+    ``on_refresh(allow_fractional)`` must return ``(plan, market)``: a re-solve
+    re-reads the broker anyway, and the market hours it reads there are the ONLY
+    thing that can move the gate while this dialog is open. Returning just the plan
+    froze the gate at whatever it was when the wizard opened.
     """
     wizard = AllocationWizard(base, plan, market=market, on_refresh=on_refresh,
                               on_submit=on_submit, title=title)

@@ -215,12 +215,20 @@ def _load_flow_inputs(account_id: int, valuation_mode: str):
 
 
 def _solve_plan(account_id: int, *, mode: str, labels, scope_label, amount: float,
-                allow_fractional: bool, valuation_mode: str):
+                allow_fractional: bool, valuation_mode: str,
+                force_market_refresh: bool = False):
     """Solve one dry run against FRESH positions, prices and margin info. Blocking.
 
     Re-reads everything rather than reusing the open dialog's snapshot: Refresh
     exists precisely because the numbers move, and a plan solved against a stale
     price is a plan submitted at the wrong size.
+
+    ``force_market_refresh`` drops the account's cached market-hours answer first.
+    ``get_market_hours`` caches for ``min(TTL, next session boundary)``, which is
+    right for the several reads one render makes and wrong for a user who pressed
+    Refresh *because* they believe the market has opened. Only the wizard's Refresh
+    passes it: the first solve of a flow has nothing to invalidate, and clearing on
+    every solve would turn the de-duplicator into a broker call per read.
 
     Returns:
         Tuple: ``(base, plan, current, hours)``. ``hours`` is the broker's
@@ -231,6 +239,8 @@ def _solve_plan(account_id: int, *, mode: str, labels, scope_label, amount: floa
     account = get_account_instance_from_id(account_id)
     if account is None:
         raise RuntimeError(f"Account {account_id} could not be instantiated")
+    if force_market_refresh:
+        svc.clear_market_hours_cache(account)
     symbols = collect_managed_symbols(
         {lt.label: [st.symbol for st in lt.symbols] for lt in labels})
     current = svc.build_position_states(account, symbols)
@@ -813,16 +823,26 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
         state['current'] = current
 
         def _on_refresh(allow_fractional: bool):
-            """Called from the wizard (sync) -- re-solve and hand back the new plan."""
+            """Called from the wizard (sync): re-solve, and hand back the CLOCK too.
+
+            The market hours are part of the same solve -- ``_solve_plan`` reads
+            them once so the banner and the gate cannot describe different instants
+            -- and they used to be thrown away here into ``_``, which left the
+            wizard's gate frozen at whatever it was when the dialog opened. The
+            broker's cached answer is dropped first: a user pressing Refresh at
+            09:31 is asking exactly the question the cache is holding an old answer
+            to.
+            """
             state['allow_fractional'] = bool(allow_fractional)
             svc.remember_fractional_choice(account_id, bool(allow_fractional))
-            fresh_base, fresh_plan, fresh_current, _ = _solve_plan(
+            fresh_base, fresh_plan, fresh_current, fresh_hours = _solve_plan(
                 account_id, mode=state['mode'], labels=state['labels'],
                 scope_label=state['scope_label'], amount=state['amount'],
-                allow_fractional=bool(allow_fractional), valuation_mode=valuation_mode)
+                allow_fractional=bool(allow_fractional), valuation_mode=valuation_mode,
+                force_market_refresh=True)
             state['base'] = fresh_base
             state['current'] = fresh_current
-            return fresh_plan
+            return fresh_plan, _market_gate_for(fresh_hours)
 
         def _on_submit(selected_plan) -> None:
             ui.timer(0.1, lambda: _do_submit(selected_plan), once=True)

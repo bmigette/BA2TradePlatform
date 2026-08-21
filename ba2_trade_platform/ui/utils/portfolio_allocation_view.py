@@ -635,6 +635,18 @@ MARKET_NOTE_FALLBACK = (
     " These times come from the built-in NYSE calendar, not from the broker — the "
     "broker's own market-hours call did not answer, and the calendar covers the "
     "regular session only.")
+#: Shown when the gate ALLOWS on an answer that did not come from the broker. The
+#: closed and unknown branches fold their provenance into ``message``; an ALLOW had
+#: nowhere to put it, so the user was never told that the thing about to send real
+#: orders was a static calendar. Both sentences matter: the broker did not answer,
+#: and the calendar cannot know about a halt, a suspension or an account
+#: restriction -- only about the scheduled session.
+MARKET_MSG_OPEN_FROM_FALLBACK = (
+    "Market shown as open from the built-in NYSE calendar — the broker's own "
+    "market-hours call did not answer. The calendar knows the scheduled session "
+    "only: it cannot see an unscheduled halt, a broker-side suspension or a "
+    "restriction on this account. Check before submitting.")
+
 #: Post-submit / income-panel line. Orders that are still working contributed ZERO
 #: to the ledger, so the run's income is deliberately NOT consumed yet.
 WORKING_ORDERS_NOTICE_FMT = (
@@ -766,6 +778,31 @@ def evaluate_market_gate(*, is_open: Optional[bool], next_open: Optional[datetim
                             message=message, severity="warning",
                             next_open_text=when, countdown_text=countdown,
                             from_fallback=from_fallback)
+
+
+def market_provenance_notice(gate: MarketGateResult) -> Optional[Tuple[str, str]]:
+    """"This ALLOW came from the offline calendar" — or ``None``. Pure.
+
+    ``MarketGateResult.from_fallback`` is set on all three branches of
+    ``evaluate_market_gate`` and used to be read by nobody, which made the ALLOW
+    case silent in exactly the way that matters: if the broker's ``get_clock()``
+    fails, the built-in NYSE calendar answers instead, and on a scheduled trading
+    day it says OPEN. The gate then waves a real submission through on the
+    strength of a static timetable that cannot know about an unscheduled halt.
+
+    Only the ALLOW case produces a notice. The CLOSED branch already appends
+    ``MARKET_NOTE_FALLBACK`` to its own message and the UNKNOWN branch says
+    "unavailable" outright, so a second banner there would repeat them; and
+    neither of those lets anything be sent.
+
+    Returns:
+        Optional[Tuple[str, str]]: ``(text, severity)`` for ``ui.notify`` and for
+        ``MARKET_BANNER_CLASSES``, or ``None`` when the broker itself answered (or
+        when the gate blocks and has already said so).
+    """
+    if not gate.allowed or not gate.from_fallback:
+        return None
+    return MARKET_MSG_OPEN_FROM_FALLBACK, "warning"
 
 
 def working_orders_notice(*, settled: bool,
