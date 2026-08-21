@@ -28,6 +28,19 @@ class AccountInterface(ReadOnlyAccountInterface):
     # Trading accounts support trading operations
     supports_trading = True
 
+    #: Whether this broker can attach a protective TP/SL leg to a position at all,
+    #: i.e. whether ``adjust_tp`` / ``adjust_sl`` / ``adjust_tp_sl`` really work.
+    #:
+    #: Set it False on a broker whose adjust_* methods raise NotImplementedError.
+    #: ``submit_order`` then REFUSES a request that carries a tp_price/sl_price
+    #: instead of opening the position and merely logging that the stop could not be
+    #: placed -- which is what it used to do, handing the caller a live, UNPROTECTED
+    #: position as the success value. Once the entry is filled there is no honest
+    #: answer left (returning the order claims protection that does not exist;
+    #: returning None strands a real broker position the caller thinks never opened),
+    #: so the only safe place to fail is BEFORE the broker call.
+    supports_protective_legs = True
+
 
     @abstractmethod
     def _submit_order_impl(self, trading_order, tp_price: Optional[float] = None, sl_price: Optional[float] = None, is_closing_order: bool = False, use_complex_order: bool = False) -> Any:
@@ -182,7 +195,32 @@ class AccountInterface(ReadOnlyAccountInterface):
 
         Returns:
             Any: The created order object if successful. Returns None or raises an exception if failed.
+
+        Raises:
+            ValueError: when a tp_price/sl_price is requested from a broker that cannot
+                place protective legs (``supports_protective_legs`` is False). NOTHING is
+                submitted in that case -- see the guard below.
         """
+        # PROTECTIVE-LEG CAPABILITY GATE -- runs before ANY database write or broker call.
+        #
+        # The TP/SL block further down submits the entry FIRST and only then calls
+        # adjust_tp/adjust_sl, catching NotImplementedError with a mere logger.warning.
+        # The entry order is still returned as the success value, so all four sl_price=
+        # call sites (TradeManager x2, FactorRanker.portfolio, SmartRiskManagerToolkit)
+        # book a filled position and believe it is protected. That is a NAKED POSITION
+        # REPORTED AS SUCCESS, and no caller can tell it apart from a protected one.
+        #
+        # There is no honest recovery after the fill, so the request is refused before
+        # anything is opened: either the stop exists, or nothing was opened.
+        if (tp_price is not None or sl_price is not None) and not self.supports_protective_legs:
+            raise ValueError(
+                f"Broker {self.__class__.__name__} cannot place protective TP/SL legs "
+                f"(supports_protective_legs=False), so the requested protection for "
+                f"{trading_order.symbol} (tp={tp_price}, sl={sl_price}) cannot be honoured. "
+                f"Refusing to submit the entry: opening an unprotected position and "
+                f"reporting it as success is not an acceptable outcome."
+            )
+
         # Validate the trading order before submission
         validation_result = self._validate_trading_order(trading_order, is_closing_order=is_closing_order)
         if not validation_result['is_valid']:

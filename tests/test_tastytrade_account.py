@@ -814,15 +814,61 @@ def test_modify_order_is_reported_as_unsupported():
     assert _bare_account().modify_order("987654") is None
 
 
-def test_tp_sl_adjustment_is_reported_as_unsupported():
+def test_tp_sl_adjustment_raises_not_implemented():
+    """RETURNING False IS A LIE and it opened naked positions.
+
+    AccountInterface.submit_order detects "this broker cannot attach a protective
+    leg" with `except NotImplementedError` (AccountInterface.py:355-381). These
+    stubs returned False, so that guard branch was dead code: submit_order swallowed
+    the False, returned the successful ENTRY order, and the caller that asked for a
+    stop got a live, unprotected position reported as success.
+    """
     from tests.factories import create_transaction
 
     acct = _bare_account()
     transaction = create_transaction(symbol="AAPL")
 
-    assert acct.adjust_tp(transaction, 160.0) is False
-    assert acct.adjust_sl(transaction, 130.0) is False
-    assert acct.adjust_tp_sl(transaction, 160.0, 130.0) is False
+    with pytest.raises(NotImplementedError):
+        acct.adjust_tp(transaction, 160.0)
+    with pytest.raises(NotImplementedError):
+        acct.adjust_sl(transaction, 130.0)
+    with pytest.raises(NotImplementedError):
+        acct.adjust_tp_sl(transaction, 160.0, 130.0)
+
+
+def test_tastytrade_declares_that_it_cannot_place_protective_legs():
+    """The capability flag submit_order checks BEFORE opening anything."""
+    assert TastyTradeAccount.supports_protective_legs is False
+
+
+def test_submit_order_impl_raises_when_asked_for_a_native_complex_order():
+    """The wash-trade gate sets use_complex_order=True when it has a TP/SL to attach.
+    This used to be silently IGNORED: a plain order went out, submit_order then skipped
+    the adjust block entirely (AccountInterface.py:354), and the position ended up with
+    no complex legs AND no separate legs."""
+    account_def, order = _tt_trading_order()
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.place_order = AsyncMock()
+
+    with pytest.raises(NotImplementedError):
+        acct._submit_order_impl(order, sl_price=140.0, use_complex_order=True)
+
+    acct._account.place_order.assert_not_called()
+
+
+def test_submit_order_impl_raises_when_handed_a_protective_price():
+    """Reaching here with a tp/sl means submit_order's capability guard was bypassed.
+    Warning and sending the bare entry anyway is exactly the naked-position bug."""
+    account_def, order = _tt_trading_order()
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.place_order = AsyncMock()
+
+    with pytest.raises(NotImplementedError):
+        acct._submit_order_impl(order, sl_price=140.0)
+
+    acct._account.place_order.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

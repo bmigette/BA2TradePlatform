@@ -53,6 +53,14 @@ class TastyTradeAccount(AccountInterface):
         ``price`` (order.py:264-276) -- never set it by hand.
     """
 
+    #: TastyTrade protective-leg management is out of scope here, so the adjust_*
+    #: methods raise NotImplementedError. Declaring it makes
+    #: ``AccountInterface.submit_order`` refuse a ``tp_price``/``sl_price`` request
+    #: BEFORE it opens anything, instead of filling the entry and then logging that
+    #: the stop could not be placed -- which handed the caller a live, unprotected
+    #: position as the success value.
+    supports_protective_legs = False
+
     def __init__(self, id: int):
         super().__init__(id)
         self._session = None
@@ -777,13 +785,45 @@ class TastyTradeAccount(AccountInterface):
         Overriding it is exactly what disabled IBKRAccount (IBKRAccount.py:27-40).
 
         ``tp_price`` / ``sl_price`` / ``use_complex_order`` are accepted for interface
-        compatibility and IGNORED: TastyTrade complex orders are out of scope here, so
-        a protective leg has to be placed as its own order.
+        compatibility but CANNOT be honoured: TastyTrade complex orders are out of scope
+        here, and protective-leg management is unimplemented
+        (``supports_protective_legs = False``). They used to be swallowed with a
+        ``logger.warning``, which sent a bare entry to the broker and left the caller
+        holding an unprotected position it believed was covered:
+
+          * ``use_complex_order=True`` is set by ``submit_order``'s wash-trade gate when
+            it has a TP/SL to attach. Ignoring it produced NEITHER complex legs (this
+            method sent a plain order) NOR separate legs (``submit_order`` skips the
+            adjust block entirely for a complex submission).
+          * a bare ``tp_price``/``sl_price`` reaching here means the capability gate in
+            ``submit_order`` was bypassed.
+
+        Both are broken invariants, so both raise. ``submit_order`` refuses such
+        requests up front, so neither should ever be reachable through it.
+
+        Raises:
+            NotImplementedError: when a protective price or a complex order is requested.
 
         Returns:
             Optional[TradingOrder]: the refreshed database row on success, ``None`` on
             failure.
         """
+        # Raised BEFORE the auth check and before any DB write: nothing may be sent.
+        if use_complex_order:
+            raise NotImplementedError(
+                f"[Account {self.id}] TastyTrade does not support native complex "
+                f"(bracket/OTO) orders here, but submit_order requested one for "
+                f"{trading_order.symbol} (tp={tp_price}, sl={sl_price}). Silently sending "
+                f"a plain order would leave the position with no protective legs at all."
+            )
+        if tp_price is not None or sl_price is not None:
+            raise NotImplementedError(
+                f"[Account {self.id}] TastyTrade cannot attach TP/SL legs "
+                f"(tp={tp_price}, sl={sl_price}) for {trading_order.symbol}, and cannot "
+                f"place them separately either (supports_protective_legs=False). "
+                f"Submitting the bare entry would open an UNPROTECTED position."
+            )
+
         if not self._check_authentication():
             return None
 
@@ -794,11 +834,6 @@ class TastyTradeAccount(AccountInterface):
                 f"Order {trading_order.id} already has broker_order_id "
                 f"{trading_order.broker_order_id} -- skipping re-submission")
             return trading_order
-
-        if tp_price is not None or sl_price is not None:
-            logger.warning(
-                f"Order {trading_order.id}: TastyTrade does not attach TP/SL legs at "
-                f"submission (tp={tp_price}, sl={sl_price} ignored); place them separately")
 
         try:
             if trading_order.id is None:
@@ -964,27 +999,35 @@ class TastyTradeAccount(AccountInterface):
             f"(order {order_id}); cancel and resubmit instead")
         return None
 
+    # NotImplementedError, NOT `return False`. `False` means "I tried and the broker
+    # refused"; NotImplementedError means "this broker cannot do this at all", and it is
+    # the signal AccountInterface.submit_order documents and catches
+    # (AccountInterface.py, the adjust_* bracket block). Returning False made that guard
+    # DEAD CODE: submit_order swallowed the False, returned the successful entry order,
+    # and the caller that asked for a protective stop got a live NAKED position reported
+    # as success. Callers that want a boolean must catch it explicitly.
+
     def adjust_tp(self, transaction: Transaction, new_tp_price: float, source: str = "") -> bool:
         """NOT SUPPORTED: TastyTrade protective-leg management is out of scope."""
-        logger.error(
+        raise NotImplementedError(
             f"[Account {self.id}] adjust_tp is not supported for TastyTrade "
-            f"(transaction {transaction.id}, requested {new_tp_price})")
-        return False
+            f"(transaction {transaction.id}, requested {new_tp_price}): this broker "
+            f"cannot place a protective take-profit leg.")
 
     def adjust_sl(self, transaction: Transaction, new_sl_price: float, source: str = "") -> bool:
         """NOT SUPPORTED: TastyTrade protective-leg management is out of scope."""
-        logger.error(
+        raise NotImplementedError(
             f"[Account {self.id}] adjust_sl is not supported for TastyTrade "
-            f"(transaction {transaction.id}, requested {new_sl_price})")
-        return False
+            f"(transaction {transaction.id}, requested {new_sl_price}): this broker "
+            f"cannot place a protective stop leg.")
 
     def adjust_tp_sl(self, transaction: Transaction, new_tp_price: Optional[float] = None,
                      new_sl_price: Optional[float] = None, source: str = "") -> bool:
         """NOT SUPPORTED: TastyTrade protective-leg management is out of scope."""
-        logger.error(
+        raise NotImplementedError(
             f"[Account {self.id}] adjust_tp_sl is not supported for TastyTrade "
-            f"(transaction {transaction.id}, tp={new_tp_price}, sl={new_sl_price})")
-        return False
+            f"(transaction {transaction.id}, tp={new_tp_price}, sl={new_sl_price}): this "
+            f"broker cannot place protective legs.")
 
     def refresh_positions(self) -> bool:
         """Confirm the broker's equity book is readable.
