@@ -969,8 +969,22 @@ class TastyTradeAccount(AccountInterface):
             symbol=trading_order.symbol,
             # SIGNED: negative for a buy. Consume OrderImpact.bp_cost, never this.
             change_in_buying_power=float(effect.change_in_buying_power),
-            margin_requirement=float(effect.isolated_order_margin_requirement),
-            estimated_fees=float(fees.total_fees) if fees is not None else None,
+            # abs() ON BOTH -- LOAD-BEARING, NOT DEFENSIVE.
+            #
+            # `isolated_order_margin_requirement` and `total_fees` are both run through
+            # `tastytrade.utils.set_sign_for` by a `model_validator(mode="before")`
+            # (order.py:381-393 and :407-419). That helper does not NORMALISE a sign, it
+            # CREATES a negative one: `if data["<key>-effect"] == DEBIT:
+            # data[key] = -abs(...)`. A margin requirement and a fee are both debits, so
+            # in production these arrive as -1500 and -0.03.
+            #
+            # Unlike change_in_buying_power, neither has a re-signing property on
+            # OrderImpact: `margin_requirement` is a REQUIREMENT (capital tied up) and
+            # `estimated_fees` is a COST, and both are consumed directly. A negative
+            # requirement understates committed capital; a negative fee reads as a
+            # rebate. Take the magnitude.
+            margin_requirement=abs(float(effect.isolated_order_margin_requirement)),
+            estimated_fees=abs(float(fees.total_fees)) if fees is not None else None,
             accepted=not errors,
             warnings=warnings,
             errors=errors,

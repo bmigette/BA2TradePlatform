@@ -5,11 +5,20 @@ broker. Broker responses are either REAL SDK pydantic objects (where a validator
 a sign convention is part of what is being tested) or SimpleNamespace stand-ins
 (where the real model has 40+ required fields and the code only reads a handful).
 
-Two SDK traps these tests exist to guard:
+THREE SDK traps these tests exist to guard:
   * Account.place_order(session, order, dry_run=True) -- dry_run DEFAULTS TO TRUE
     (tastytrade/account.py:877). Real submissions must pass dry_run=False.
   * NewOrder.price_effect is a computed field derived from the SIGN of `price`
     (order.py:264-276): negative = debit. It must never be set by hand.
+  * `tastytrade.utils.set_sign_for` (utils.py:292-305) does NOT normalise a sign, it
+    CREATES a negative one: `if data["<key>-effect"] == DEBIT: data[key] = -abs(...)`.
+    It runs in a `model_validator(mode="before")`, which means CONSTRUCTING THESE
+    MODELS WITH PYTHON KWARGS BYPASSES IT ENTIRELY. A margin requirement and a fee are
+    both debits, so in production they arrive NEGATIVE (-1500, -0.03) while a kwargs
+    fixture hands the code a cheerful +1500 / +0.03 and every sign bug stays invisible.
+    So BuyingPowerEffect / FeeCalculation / MarginReport(Entry) are built here from
+    RAW DASHERIZED PAYLOADS INCLUDING THE `-effect` KEYS -- see
+    `_buying_power_effect_payload`, `_fee_calculation_payload` and `_margin_entry`.
 """
 import asyncio
 import threading
@@ -21,11 +30,8 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from tastytrade.order import (
-    BuyingPowerEffect,
-    FeeCalculation,
     InstrumentType as TTInstrumentType,
     Leg,
-    Message,
     OrderAction,
     OrderStatus as TTOrderStatus,
     OrderTimeInForce,
@@ -137,30 +143,70 @@ def _fill(quantity="10", fill_price="150.25"):
                     filled_at=datetime(2026, 8, 20, 14, 30, tzinfo=timezone.utc))
 
 
-def _placed_order_response(order, change_in_buying_power="-1500",
+def _buying_power_effect_payload(change_in_buying_power="1500", bp_effect="Debit",
+                                 isolated_requirement="1500"):
+    """RAW dasherized BuyingPowerEffect payload, WITH the `-effect` keys.
+
+    Every value here is an unsigned MAGNITUDE, exactly as TastyTrade sends it on the
+    wire; the sign is applied by `set_sign_for` inside the model's
+    `model_validator(mode="before")` (order.py:381-393). For a BUY, both
+    `change-in-buying-power` and `isolated-order-margin-requirement` are DEBITS, so the
+    parsed model carries -1500 for each -- which is exactly what production sees and
+    what a kwargs-built fixture never showed.
+    """
+    return {
+        "change-in-margin-requirement": "1500",
+        "change-in-margin-requirement-effect": "Debit",
+        "change-in-buying-power": change_in_buying_power,
+        "change-in-buying-power-effect": bp_effect,
+        "current-buying-power": "10000",
+        "current-buying-power-effect": "Credit",
+        "new-buying-power": "8500",
+        "new-buying-power-effect": "Credit",
+        "isolated-order-margin-requirement": isolated_requirement,
+        "isolated-order-margin-requirement-effect": "Debit",
+        "is-spread": False,
+        "impact": "1500",
+        "effect": "Debit",
+    }
+
+
+def _fee_calculation_payload(total_fees="0.03"):
+    """RAW dasherized FeeCalculation payload. A fee is a DEBIT, so the parsed
+    `total_fees` is NEGATIVE (order.py:407-419)."""
+    return {
+        "regulatory-fees": "0.01",
+        "regulatory-fees-effect": "Debit",
+        "clearing-fees": "0.02",
+        "clearing-fees-effect": "Debit",
+        "commission": "0",
+        "commission-effect": "None",
+        "proprietary-index-option-fees": "0",
+        "proprietary-index-option-fees-effect": "None",
+        "total-fees": total_fees,
+        "total-fees-effect": "Debit",
+    }
+
+
+def _placed_order_response(order, change_in_buying_power="1500", bp_effect="Debit",
                            isolated_requirement="1500", total_fees="0.03",
                            warnings=None, errors=None):
-    """A REAL PlacedOrderResponse. change_in_buying_power is SIGNED: a buy is negative."""
-    bpe = BuyingPowerEffect(
-        change_in_margin_requirement=Decimal("1500"),
-        change_in_buying_power=Decimal(change_in_buying_power),
-        current_buying_power=Decimal("10000"),
-        new_buying_power=Decimal("8500"),
-        isolated_order_margin_requirement=Decimal(isolated_requirement),
-        is_spread=False,
-        impact=Decimal("1500"),
-        effect=PriceEffect.DEBIT,
-    )
-    return PlacedOrderResponse(
-        buying_power_effect=bpe,
-        order=order,
-        fee_calculation=FeeCalculation(
-            regulatory_fees=Decimal("0.01"), clearing_fees=Decimal("0.02"),
-            commission=Decimal("0"), proprietary_index_option_fees=Decimal("0"),
-            total_fees=Decimal(total_fees)),
-        warnings=[Message(code="w", message=w) for w in (warnings or [])],
-        errors=[Message(code="e", message=e) for e in (errors or [])],
-    )
+    """A REAL PlacedOrderResponse parsed from a RAW dasherized payload.
+
+    `model_validate` (not kwargs) so the nested BuyingPowerEffect / FeeCalculation
+    `model_validator(mode="before")` actually runs and applies `set_sign_for`. The
+    numeric arguments are unsigned MAGNITUDES; `bp_effect` picks Debit (a buy, which
+    parses NEGATIVE) or Credit (a sell).
+    """
+    return PlacedOrderResponse.model_validate({
+        "buying-power-effect": _buying_power_effect_payload(
+            change_in_buying_power=change_in_buying_power, bp_effect=bp_effect,
+            isolated_requirement=isolated_requirement),
+        "order": order,
+        "fee-calculation": _fee_calculation_payload(total_fees=total_fees),
+        "warnings": [{"code": "w", "message": w} for w in (warnings or [])],
+        "errors": [{"code": "e", "message": e} for e in (errors or [])],
+    })
 
 
 class _FakeEquity:
@@ -1013,6 +1059,27 @@ def test_preview_order_impact_passes_dry_run_true_explicitly():
     assert acct._account.place_order.call_args.kwargs["dry_run"] is True
 
 
+def test_the_sdk_really_does_negate_a_debit_when_the_model_is_parsed():
+    """GUARD ON THE FIXTURES THEMSELVES.
+
+    Everything below only tests the sign bugs because `_placed_order_response` and
+    `_margin_entry` go through `model_validate` on raw dasherized payloads, so
+    `set_sign_for` runs. If someone "simplifies" them back to python kwargs or a
+    SimpleNamespace, the validator is bypassed, every value turns cheerfully positive
+    and the sign assertions below all pass vacuously. This test fails loudly instead.
+    """
+    from tastytrade.account import MarginReportEntry
+
+    response = _placed_order_response(_placed_order(order_id=-1))
+    assert response.buying_power_effect.change_in_buying_power == Decimal("-1500")
+    assert response.buying_power_effect.isolated_order_margin_requirement == Decimal("-1500")
+    assert response.fee_calculation.total_fees == Decimal("-0.03")
+
+    entry = _margin_report(_margin_entry("AAPL", "775")).groups[0]
+    assert isinstance(entry, MarginReportEntry)
+    assert entry.initial_requirement == Decimal("-775")
+
+
 def test_preview_order_impact_turns_a_signed_debit_into_a_positive_bp_cost():
     """BuyingPowerEffect.change_in_buying_power is NEGATIVE for a buy (order.py:381)."""
     account_def, order = _tt_trading_order()
@@ -1020,7 +1087,7 @@ def test_preview_order_impact_turns_a_signed_debit_into_a_positive_bp_cost():
     acct.id = account_def.id
     acct._account.place_order = AsyncMock(
         return_value=_placed_order_response(_placed_order(order_id=-1),
-                                            change_in_buying_power="-1500",
+                                            change_in_buying_power="1500",
                                             isolated_requirement="1500",
                                             total_fees="0.03"))
 
@@ -1030,9 +1097,46 @@ def test_preview_order_impact_turns_a_signed_debit_into_a_positive_bp_cost():
 
     assert impact.change_in_buying_power == -1500.0
     assert impact.bp_cost == 1500.0
-    assert impact.margin_requirement == 1500.0
-    assert impact.estimated_fees == pytest.approx(0.03)
     assert impact.accepted is True
+
+
+def test_preview_order_impact_reports_the_margin_requirement_as_a_positive_cost():
+    """I3. `isolated_order_margin_requirement` goes through `set_sign_for`
+    (order.py:381-393) and a margin requirement is a DEBIT, so the model carries
+    -1500. `OrderImpact.margin_requirement` is documented as a REQUIREMENT, not a
+    signed cash flow -- unlike `change_in_buying_power`, which has a `bp_cost`
+    property to re-sign it, this field is consumed directly. Passing -1500 through
+    understates the capital an order ties up by 2x its own size."""
+    account_def, order = _tt_trading_order()
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.place_order = AsyncMock(
+        return_value=_placed_order_response(_placed_order(order_id=-1),
+                                            isolated_requirement="1500"))
+
+    with patch("tastytrade.instruments.Equity.get",
+               new=AsyncMock(return_value=_FakeEquity("AAPL"))):
+        impact = acct.preview_order_impact(order)
+
+    assert impact.margin_requirement == 1500.0
+
+
+def test_preview_order_impact_reports_estimated_fees_as_a_positive_cost():
+    """I3. `FeeCalculation.total_fees` goes through `set_sign_for` too
+    (order.py:407-419), and a fee is a DEBIT: the model carries -0.03. A NEGATIVE
+    'estimated fee' reads as a rebate and makes an order look cheaper than free."""
+    account_def, order = _tt_trading_order()
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.place_order = AsyncMock(
+        return_value=_placed_order_response(_placed_order(order_id=-1),
+                                            total_fees="0.03"))
+
+    with patch("tastytrade.instruments.Equity.get",
+               new=AsyncMock(return_value=_FakeEquity("AAPL"))):
+        impact = acct.preview_order_impact(order)
+
+    assert impact.estimated_fees == pytest.approx(0.03)
 
 
 def test_preview_order_impact_marks_a_rejected_preview_as_not_accepted():
@@ -1246,15 +1350,69 @@ def test_get_cash_transfers_returns_empty_list_on_failure():
 # get_symbol_margin_info
 # ---------------------------------------------------------------------------
 
-def _margin_report(*entries):
-    """Stand-in for tastytrade MarginReport. `groups` legitimately contains EmptyDict
-    placeholders, which carry no attributes at all."""
-    return SimpleNamespace(groups=list(entries))
+def _margin_report(*group_payloads):
+    """A REAL tastytrade MarginReport parsed from a RAW dasherized payload.
+
+    NOT a SimpleNamespace. `MarginReportEntry` applies `set_sign_for` in a
+    `model_validator(mode="before")`, so an `initial-requirement` of 775 with
+    `initial-requirement-effect: Debit` parses as **-775**. A namespace fixture
+    hard-coding +775 cannot see that, and without `abs()` in the adapter the derived
+    rate goes NEGATIVE (-775/1550 = -0.5 -> bp_factor -1.0), which makes a buy report
+    negative buying-power consumption and lets the allocation engine's
+    `sum(notional * bp_factor) <= available_bp` check approve unbounded notional.
+
+    `groups` is `list[MarginReportEntry | EmptyDict]`; pass a bare `{}` for the
+    EmptyDict placeholders TastyTrade really does return.
+    """
+    from tastytrade.account import MarginReport
+
+    return MarginReport.model_validate({
+        "account-number": "5WX00000",
+        "description": "Total",
+        "margin-calculation-type": "IRA Margin",
+        "option-level": "No Restrictions",
+        "margin-requirement": "775",
+        "margin-requirement-effect": "Debit",
+        "maintenance-requirement": "775",
+        "maintenance-requirement-effect": "Debit",
+        "margin-equity": "100000",
+        "margin-equity-effect": "Credit",
+        "option-buying-power": "50000",
+        "option-buying-power-effect": "Credit",
+        "reg-t-margin-requirement": "775",
+        "reg-t-margin-requirement-effect": "Debit",
+        "reg-t-option-buying-power": "50000",
+        "reg-t-option-buying-power-effect": "Credit",
+        "maintenance-excess": "99225",
+        "maintenance-excess-effect": "Credit",
+        "last-state-timestamp": 1756000000000,
+        "initial-requirement": "775",
+        "initial-requirement-effect": "Debit",
+        "groups": list(group_payloads),
+    })
 
 
 def _margin_entry(underlying_symbol, initial_requirement):
-    return SimpleNamespace(underlying_symbol=underlying_symbol,
-                           initial_requirement=Decimal(initial_requirement))
+    """RAW dasherized MarginReportEntry payload, WITH the `-effect` keys.
+
+    `initial_requirement` is the unsigned MAGNITUDE the broker sends; the parsed model
+    carries the NEGATIVE of it, because a margin requirement is a Debit.
+    """
+    return {
+        "description": underlying_symbol,
+        "code": "EQUITY",
+        "underlying-symbol": underlying_symbol,
+        "underlying-type": "Equity",
+        "margin-calculation-type": "IRA Margin",
+        "buying-power": initial_requirement,
+        "buying-power-effect": "Debit",
+        "margin-requirement": initial_requirement,
+        "margin-requirement-effect": "Debit",
+        "initial-requirement": initial_requirement,
+        "initial-requirement-effect": "Debit",
+        "maintenance-requirement": initial_requirement,
+        "maintenance-requirement-effect": "Debit",
+    }
 
 
 def _precision(minimum_increment_precision=5, symbol=None,
@@ -1292,6 +1450,41 @@ def test_symbol_margin_info_derives_the_real_rate_for_a_held_symbol():
 
     assert info["AAPL"].initial_margin_rate == pytest.approx(0.5)
     assert info["AAPL"].bp_factor == pytest.approx(1.0)  # 0.5 rate x 2:1 account
+    assert info["AAPL"].source == MARGIN_SOURCE_POSITION
+
+
+def test_symbol_margin_info_takes_the_magnitude_of_a_debit_signed_requirement():
+    """D1. `MarginReportEntry.initial_requirement` goes through `set_sign_for`
+    (account.py:240-251) and a margin requirement is a DEBIT, so the parsed model
+    carries **-775**, never +775. Without `abs()` the derived rate is
+    `min(1.0, -775/1550) = -0.5` and `bp_factor = -1.0`: a BUY then reports NEGATIVE
+    buying-power consumption, and the allocation engine's
+    `sum(notional * bp_factor) <= available_bp` check approves unbounded notional --
+    every extra share makes the sum look *smaller*.
+
+    The `abs()` in TastyTradeAccount.get_symbol_margin_info is therefore load-bearing,
+    not belt-and-braces. It went untested only because the old fixture built the entry
+    with python kwargs, which bypasses the `model_validator(mode="before")` entirely.
+    """
+    from ba2_trade_platform.core.account_types import MARGIN_SOURCE_POSITION
+
+    acct = _bare_account()
+    acct._account.margin_or_cash = "Margin"
+    report = _margin_report(_margin_entry("AAPL", "775"))
+    # The premise, stated out loud: the broker's number reaches the adapter NEGATIVE.
+    assert report.groups[0].initial_requirement == Decimal("-775")
+
+    equity_patch, precision_patch = _wire_margin_sources(
+        acct, equities=[_FakeEquity("AAPL")], report=report,
+        precisions=[_precision()],
+        positions=[_tt_position(symbol="AAPL", quantity="10", mark_price="155")])
+
+    with equity_patch, precision_patch:
+        info = acct.get_symbol_margin_info(["AAPL"])
+
+    assert info["AAPL"].initial_margin_rate == pytest.approx(0.5)
+    assert info["AAPL"].bp_factor == pytest.approx(1.0)
+    assert info["AAPL"].bp_factor > 0, "a buy must never consume negative buying power"
     assert info["AAPL"].source == MARGIN_SOURCE_POSITION
 
 
@@ -1351,7 +1544,7 @@ def test_symbol_margin_info_skips_empty_margin_report_groups():
     acct._account.margin_or_cash = "Margin"
     equity_patch, precision_patch = _wire_margin_sources(
         acct, equities=[_FakeEquity("AAPL")],
-        report=_margin_report(SimpleNamespace(), _margin_entry("AAPL", "775")),
+        report=_margin_report({}, _margin_entry("AAPL", "775")),
         precisions=[_precision()],
         positions=[_tt_position(symbol="AAPL", quantity="10", mark_price="155")])
 
