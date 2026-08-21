@@ -100,8 +100,41 @@ def _probe(obj: Any, name: str) -> Any:
     return getattr(obj, name, None)
 
 
+#: ``Position.side`` spellings meaning "this is a SHORT". ``OrderDirection`` is a
+#: str enum, so its ``.value`` lands here; TastyTrade's own 'Short' does too.
+_SHORT_SIDES = frozenset({'sell', 'short'})
+_LONG_SIDES = frozenset({'buy', 'long'})
+
+
+def position_sign(side) -> Optional[int]:
+    """``-1`` for a short, ``+1`` for a long, ``None`` when the side is unknown.
+
+    ``None`` means "this row did not say", and the caller must then trust the
+    signs the broker already put on the numbers rather than invent a direction.
+    """
+    text = str(getattr(side, 'value', side) or "").strip().lower()
+    if text in _SHORT_SIDES:
+        return -1
+    if text in _LONG_SIDES:
+        return 1
+    return None
+
+
 def positions_by_symbol(raw_positions) -> Dict[str, PositionState]:
     """Turn a broker position list into ``{SYMBOL: PositionState}``.
+
+    **Shorts have ONE canonical representation here: signed negative.** A short's
+    quantity, cost basis and market value are all negative, so a label's value is
+    its NET exposure and every sum on the page is a plain sum. The two live
+    brokers disagree at source — Alpaca passes the broker's own negative signs
+    straight through (``alpaca_position_to_position``) while TastyTrade stores
+    ``qty=abs_qty`` and puts the direction in ``side``
+    (``TastyTradeAccount.py:520-547``) — so the same book used to render two
+    different pages. Reading ``side`` and forcing the sign is idempotent: an
+    already-negative Alpaca short is left alone rather than flipped back to a long.
+
+    Long rows are NOT rewritten: only a short forces a sign, so a broker's own
+    numbers are never "corrected" on the strength of a metadata field.
 
     Args:
         raw_positions: whatever ``account.get_positions()`` returned — a list of
@@ -110,13 +143,16 @@ def positions_by_symbol(raw_positions) -> Dict[str, PositionState]:
 
     Returns:
         Dict[str, PositionState]: keyed by normalised (.strip().upper()) symbol.
-        Duplicate rows for one symbol are summed.
+        Duplicate rows for one symbol are summed, so a long and a short of the
+        same symbol net out.
 
     Raises:
         PositionFetchFailed: when ``raw_positions`` is ``None``. Defined in the
             pure engine so the live service and this module raise the same class.
-        ValueError: when a row has no quantity or no cost basis — no fallback
-            values for quantities or balances (platform rule).
+        ValueError: when a row has no symbol, no quantity or no cost basis — no
+            fallback values for quantities or balances (platform rule). A nameless
+            row used to be skipped, which silently removed its money from every
+            total on the page.
     """
     if raw_positions is None:
         raise PositionFetchFailed(
@@ -126,11 +162,12 @@ def positions_by_symbol(raw_positions) -> Dict[str, PositionState]:
         )
 
     out: Dict[str, PositionState] = {}
-    for row in raw_positions:
+    for index, row in enumerate(raw_positions):
         raw_symbol = _probe(row, 'symbol')
-        if not raw_symbol:
-            continue
-        symbol = str(raw_symbol).strip().upper()
+        symbol = str(raw_symbol).strip().upper() if raw_symbol else ""
+        if not symbol:
+            raise ValueError(f"Position row {index} has no symbol — refusing to drop a "
+                             f"position whose money would vanish from every total")
 
         quantity = _probe(row, 'qty')
         if quantity is None:
@@ -145,6 +182,13 @@ def positions_by_symbol(raw_positions) -> Dict[str, PositionState]:
                              f"substitute a default")
 
         market_value = _probe(row, 'market_value')
+
+        sign = position_sign(_probe(row, 'side'))
+        if sign == -1:
+            quantity = -abs(float(quantity))
+            cost_basis = -abs(float(cost_basis))
+            if market_value is not None:
+                market_value = -abs(float(market_value))
 
         state = out.get(symbol)
         if state is None:
@@ -195,13 +239,24 @@ class SymbolRow:
 
 @dataclass
 class LabelView:
-    """A managed label's expansion: its totals and its symbol rows."""
+    """A managed label's expansion: its totals and its symbol rows.
+
+    ``target_pct`` is the stored target this label is measured against and is
+    what the allocation engine reads back as ``LabelTarget.target_pct`` — it is
+    carried through untouched, never re-derived.
+
+    There is deliberately NO label-level ``market_value``. The one that used to
+    live here summed a MIXED basis — the live quote for priced symbols, the
+    broker's own stamped figure for the rest — so it was not comparable with
+    anything, it was never rendered, and no test could say what it should be. The
+    rows keep their own ``market_value`` (a display column), and ``current_value``
+    remains the single mode-aware basis.
+    """
     label: str
     target_pct: float = 0.0
     comment: Optional[str] = None
     current_value: float = 0.0
     cost_basis: float = 0.0
-    market_value: Optional[float] = None
     pct_of_total: float = 0.0
     rows: List[SymbolRow] = field(default_factory=list)
 
@@ -282,7 +337,6 @@ def build_label_views(managed,
     for entry in managed:
         symbols = _clean(entry.label)
         label_value = sum(_value_of(s) for s in symbols)
-        label_market_value: Optional[float] = None
         rows: List[SymbolRow] = []
 
         for sym in symbols:
@@ -296,8 +350,6 @@ def build_label_views(managed,
                 market_value = state.market_value
             else:
                 market_value = None
-            if market_value is not None:
-                label_market_value = (label_market_value or 0.0) + market_value
 
             row_value = _value_of(sym)
             rows.append(SymbolRow(
@@ -308,8 +360,8 @@ def build_label_views(managed,
                 current_value=row_value,
                 price=price,
                 market_value=market_value,
-                pct_of_label=(row_value / label_value * 100.0) if label_value > 0 else 0.0,
-                pct_of_total=(row_value / total_value * 100.0) if total_value > 0 else 0.0,
+                pct_of_label=(row_value / label_value * 100.0) if label_value else 0.0,
+                pct_of_total=(row_value / total_value * 100.0) if total_value else 0.0,
                 comment=comments.get((entry.label, sym)),
             ))
 
@@ -320,12 +372,46 @@ def build_label_views(managed,
             comment=entry.comment,
             current_value=label_value,
             cost_basis=sum(positions[s].cost_basis for s in symbols if s in positions),
-            market_value=label_market_value,
-            pct_of_total=(label_value / total_value * 100.0) if total_value > 0 else 0.0,
+            pct_of_total=(label_value / total_value * 100.0) if total_value else 0.0,
             rows=rows,
         ))
 
     return views
+
+
+def managed_total_value(views) -> float:
+    """The DISTINCT managed value of a whole page: every symbol counted ONCE.
+
+    ``sum(v.current_value for v in views)`` is NOT this number. A symbol carrying
+    two managed labels contributes to both label totals, so summing them
+    double-counts it — 40 symbols currently carry two managed labels — while
+    ``build_label_views`` computes ``pct_of_total`` against the distinct
+    membership set (decision 7). Using the per-label sum for the headline puts a
+    different denominator directly above the rows it is supposed to explain.
+
+    A symbol's ``current_value`` is the same in every label that holds it (it is
+    one position under one valuation mode), so de-duplicating by symbol reproduces
+    exactly the denominator the rows were divided by.
+    """
+    seen: Dict[str, float] = {}
+    for view in (views or []):
+        for row in view.rows:
+            seen[row.symbol] = row.current_value
+    return float(sum(seen.values()))
+
+
+def missing_quote_symbols(views) -> List[str]:
+    """Symbols that are HELD but have no quote, sorted and de-duplicated.
+
+    In market mode an unpriced position contributes 0 to every total, which is
+    indistinguishable on screen from a position that is genuinely flat — a
+    bulk-quote outage renders the whole page at $0.00 with no hint that anything
+    is missing. The page names these instead. A symbol with no position and no
+    quote is not a loss (it is worth 0 either way) and is not reported.
+    """
+    out = {row.symbol for view in (views or []) for row in view.rows
+           if row.price is None and row.quantity}
+    return sorted(out)
 
 
 def collect_managed_symbols(symbols_by_label) -> List[str]:
@@ -351,34 +437,82 @@ def collect_managed_symbols(symbols_by_label) -> List[str]:
 #: Machine-written instrument tags that must not appear in the managed-label picker.
 MACHINE_LABELS = frozenset({'auto_added', 'expert_selected', 'ai_selected', 'not_found'})
 
-#: Per-expert-instance tags written by InstrumentAutoAdder: 'penny-17',
-#: 'tradingagents-16', 'fmprating-18'. The bare family name without an index
-#: ('Penny') is a USER label and is deliberately NOT matched.
-MACHINE_LABEL_FAMILY_RE = re.compile(r'^(?:penny|tradingagents|fmprating)-\d+$',
-                                     re.IGNORECASE)
+#: Families whose generating expert class no longer exists but whose tags are
+#: still on live instrument rows. 'penny-17' and 'penny-4' predate the rename of
+#: ``Penny`` to ``PennyMomentumTrader``, so no registry can produce 'penny' any
+#: more and a purely derived set would put both tags back in the user's picker.
+LEGACY_MACHINE_LABEL_FAMILIES = frozenset({'penny'})
+
+#: Used when the caller passes no families. The live set is DERIVED from the
+#: expert registry (``expert_shortname_families``) and passed in by the page; this
+#: is only the floor, so an un-wired caller still hides the tags we know about.
+DEFAULT_MACHINE_LABEL_FAMILIES = LEGACY_MACHINE_LABEL_FAMILIES | frozenset(
+    {'tradingagents', 'fmprating'})
 
 
-def is_machine_label(label) -> bool:
+def expert_shortname_families(expert_classes) -> frozenset:
+    """The ``<family>-<id>`` prefixes ``MarketExpertInterface.shortname`` generates.
+
+    ``shortname`` is ``f"{self.__class__.__name__.lower()}-{self.id}"`` for every
+    expert class that does not override it, and ``InstrumentAutoAdder`` writes that
+    string onto each instrument it touches. So the family of an expert is simply
+    its lower-cased class name — derive the filter from THAT rule and a newly
+    registered expert is hidden the day it ships, instead of leaking into the
+    picker until someone remembers to edit a literal.
+
+    Pure: takes the classes, reads only ``__name__``, imports nothing.
+    """
+    return frozenset(cls.__name__.lower() for cls in (expert_classes or [])
+                     if getattr(cls, '__name__', None))
+
+
+def _machine_family_re(families) -> 're.Pattern':
+    """``^(?:family|family|...)-\\d+$``, case-insensitive, families escaped.
+
+    The ``$`` is load-bearing: without it a user label 'penny-17-core' would be
+    classified as a machine tag and disappear from the picker. ``^`` likewise, or
+    'my-penny-17' would. Escaping is load-bearing too — a class name is
+    interpolated straight into this pattern.
+    """
+    names = sorted({str(f).strip().lower() for f in (families or []) if str(f).strip()})
+    if not names:
+        return re.compile(r'(?!)')      # matches nothing
+    return re.compile(r'^(?:' + '|'.join(re.escape(n) for n in names) + r')-\d+$',
+                      re.IGNORECASE)
+
+
+def is_machine_label(label, machine_families=None) -> bool:
     """True when ``label`` was written by the platform rather than by the user.
 
     Case-insensitive on both the exact tags and the numbered families. A blank or
     ``None`` label is not a machine label (it is simply dropped by the caller).
+
+    ``machine_families`` is the registry-derived set from
+    ``expert_shortname_families``; ``LEGACY_MACHINE_LABEL_FAMILIES`` is always
+    added to it, and ``DEFAULT_MACHINE_LABEL_FAMILIES`` is used when it is None.
+    The bare family name with no index ('Penny') is a USER label and is
+    deliberately not matched.
     """
     text = (label or "").strip()
     if not text:
         return False
     if text.lower() in MACHINE_LABELS:
         return True
-    return bool(MACHINE_LABEL_FAMILY_RE.match(text))
+    families = (DEFAULT_MACHINE_LABEL_FAMILIES if machine_families is None
+                else frozenset(machine_families) | LEGACY_MACHINE_LABEL_FAMILIES)
+    return bool(_machine_family_re(families).match(text))
 
 
-def filter_selectable_labels(all_labels, show_all: bool = False) -> List[str]:
+def filter_selectable_labels(all_labels, show_all: bool = False,
+                             machine_families=None) -> List[str]:
     """The labels offered in the managed-label picker. Pure.
 
     Args:
         all_labels: everything ``get_all_instrument_labels()`` returned.
         show_all: the picker's escape hatch — when True nothing is hidden, so a
             user who really does want to manage 'auto_added' still can.
+        machine_families: the expert families to hide, from
+            ``expert_shortname_families``; None uses the built-in floor.
 
     Returns:
         List[str]: de-duplicated, blank-stripped, sorted case-insensitively.
@@ -389,7 +523,36 @@ def filter_selectable_labels(all_labels, show_all: bool = False) -> List[str]:
         if not text or text in seen:
             continue
         seen.add(text)
-        if show_all or not is_machine_label(text):
+        if show_all or not is_machine_label(text, machine_families):
+            kept.append(text)
+    return sorted(kept, key=lambda s: s.lower())
+
+
+def picker_options(all_labels, managed, show_all: bool = False,
+                   machine_families=None) -> List[str]:
+    """The managed-label picker's OPTION list: selectable labels UNION managed ones.
+
+    A managed label MUST be an option, always. NiceGUI's ``Select`` drops any
+    selected value that is not in its options — ``_value_to_model_value`` skips
+    what ``self._values.index()`` cannot find, and ``_event_args_to_value`` ends
+    with ``[arg for arg in args if arg in self._values]`` — so an absent managed
+    label is invisible in the browser AND missing from the very first change
+    event. The picker's writer (``replace_managed_labels``) treats that event as
+    the whole truth and deletes the label's row along with every per-symbol weight
+    and comment beneath it. Silent, irreversible loss of user configuration.
+
+    Two ways a managed label ends up absent from ``all_labels``: its last
+    instrument lost the label (so no instrument row carries it any more), or it is
+    a machine tag the user deliberately manages while the 'show all' switch is off.
+    Both are covered by taking the union.
+    """
+    kept = filter_selectable_labels(all_labels, show_all=show_all,
+                                    machine_families=machine_families)
+    seen = set(kept)
+    for label in (managed or []):
+        text = (label or "").strip()
+        if text and text not in seen:
+            seen.add(text)
             kept.append(text)
     return sorted(kept, key=lambda s: s.lower())
 

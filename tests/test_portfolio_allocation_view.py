@@ -11,9 +11,11 @@ from ba2_trade_platform.core.portfolio_allocation import (
     VALUATION_MODE_COST, VALUATION_MODE_MARKET, PositionFetchFailed,
 )
 from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
-    GATE_HAS_EXPERTS, GATE_NOT_MANUAL, GATE_NO_ACCOUNT, GATE_OK,
+    DEFAULT_MACHINE_LABEL_FAMILIES, GATE_HAS_EXPERTS, GATE_NOT_MANUAL, GATE_NO_ACCOUNT,
+    GATE_OK, LEGACY_MACHINE_LABEL_FAMILIES,
     ManagedLabel, build_label_views, collect_managed_symbols, diff_managed_labels,
-    evaluate_gate, filter_selectable_labels, is_machine_label, positions_by_symbol,
+    evaluate_gate, expert_shortname_families, filter_selectable_labels, is_machine_label,
+    managed_total_value, missing_quote_symbols, picker_options, positions_by_symbol,
 )
 
 
@@ -492,3 +494,370 @@ def test_market_mode_never_values_a_position_at_the_brokers_own_market_value():
     assert row.current_value == 0.0
     assert row.market_value == 9000.0      # displayed, never used as the basis
     assert views[0].current_value == 0.0
+
+
+# ---------------------------------------------------------------------------
+# F-C1 -- the picker's option list must contain every MANAGED label
+# ---------------------------------------------------------------------------
+
+def test_picker_options_contain_a_managed_label_that_no_instrument_carries():
+    """The bug this pins is silent destruction of configuration.
+
+    NiceGUI's ``Select._event_args_to_value`` ends with
+    ``[arg for arg in args if arg in self._values]`` and
+    ``_value_to_model_value`` skips anything ``self._values.index()`` cannot find,
+    so a selected value that is not an OPTION is invisible to the browser and is
+    dropped from the very first change event. The picker then reports a selection
+    with that label missing, and ``replace_managed_labels`` deletes its row plus
+    every per-symbol weight and comment beneath it.
+
+    A managed label whose last instrument was removed is exactly that case, so the
+    options must be the UNION of the selectable labels and the managed ones.
+    """
+    out = picker_options(['ARK26', 'tech'], managed=['ARK26', 'GhostBasket'])
+    assert 'GhostBasket' in out
+    assert out == ['ARK26', 'GhostBasket', 'tech']
+
+
+def test_picker_options_keep_a_managed_machine_tag_even_though_it_is_hidden():
+    """Hiding a machine tag from the CHOICES must not delete it from the SELECTION.
+
+    Someone who deliberately managed 'penny-17' (the picker's 'show all' escape
+    hatch exists for exactly that) would otherwise lose it the moment they
+    re-opened the picker with the switch off.
+    """
+    out = picker_options(['penny-17', 'tech'], managed=['penny-17'])
+    assert out == ['penny-17', 'tech']
+
+
+def test_picker_options_do_not_duplicate_a_managed_label_that_is_also_in_use():
+    out = picker_options(['ARK26', 'tech'], managed=['ARK26'])
+    assert out.count('ARK26') == 1
+
+
+def test_picker_options_show_all_still_hides_nothing():
+    out = picker_options(['auto_added', 'tech'], managed=['GhostBasket'], show_all=True)
+    assert out == ['auto_added', 'GhostBasket', 'tech']
+
+
+def test_picker_options_ignore_blank_and_none_managed_entries():
+    assert picker_options(['tech'], managed=['', None, '  ']) == ['tech']
+
+
+def test_picker_options_strip_a_padded_managed_label():
+    """``get_all_instrument_labels`` strips; the managed side has to agree or the
+    padded spelling shows up as a second, unselectable option."""
+    assert picker_options(['tech'], managed=[' tech ']) == ['tech']
+
+
+# ---------------------------------------------------------------------------
+# F-I1 -- the headline total must use the SAME denominator as the rows
+# ---------------------------------------------------------------------------
+
+def test_managed_total_value_counts_a_two_label_symbol_once():
+    """``sum(v.current_value for v in views)`` double-counts every shared symbol.
+
+    ``build_label_views`` computes ``pct_of_total`` against the DISTINCT membership
+    set (decision 7), so summing the per-label totals for the headline puts a
+    different denominator above the rows it explains.
+    """
+    views = build_label_views(
+        [ManagedLabel('ARK26', 50.0), ManagedLabel('HighRisk', 50.0)],
+        {'ARK26': ['TSLA', 'AAPL'], 'HighRisk': ['TSLA']},
+        {'TSLA': _pos('TSLA', 10, 6000.0), 'AAPL': _pos('AAPL', 1, 1000.0)},
+        {},
+    )
+    assert sum(v.current_value for v in views) == 13000.0     # the double count
+    assert managed_total_value(views) == 7000.0
+
+
+def test_managed_total_value_is_the_denominator_pct_of_total_was_computed_with():
+    views = build_label_views(
+        [ManagedLabel('ARK26', 50.0), ManagedLabel('HighRisk', 50.0)],
+        {'ARK26': ['TSLA', 'AAPL'], 'HighRisk': ['TSLA']},
+        {'TSLA': _pos('TSLA', 10, 6000.0), 'AAPL': _pos('AAPL', 1, 1000.0)},
+        {},
+    )
+    total = managed_total_value(views)
+    row = next(r for v in views for r in v.rows if r.symbol == 'TSLA')
+    assert row.pct_of_total == pytest.approx(row.current_value / total * 100.0)
+
+
+def test_managed_total_value_of_no_views_is_zero():
+    assert managed_total_value([]) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# F-I2 -- the machine-tag families come from the rule, not from a snapshot
+# ---------------------------------------------------------------------------
+
+def test_expert_shortname_families_derives_the_prefix_shortname_generates():
+    """``MarketExpertInterface.shortname`` is
+    ``f"{self.__class__.__name__.lower()}-{self.id}"``, so the family of every
+    expert class is just its lower-cased class name."""
+    class WeeklyOptionsScalper:
+        pass
+
+    class FMPRating:
+        pass
+
+    assert expert_shortname_families([WeeklyOptionsScalper, FMPRating]) == frozenset(
+        {'weeklyoptionsscalper', 'fmprating'})
+
+
+def test_expert_shortname_families_of_nothing_is_empty():
+    assert expert_shortname_families([]) == frozenset()
+    assert expert_shortname_families(None) == frozenset()
+
+
+def test_a_newly_registered_expert_family_is_hidden_without_editing_the_regex():
+    """The literal snapshot could not know about this class; the rule can."""
+    class WeeklyOptionsScalper:
+        pass
+
+    families = expert_shortname_families([WeeklyOptionsScalper])
+    assert is_machine_label('weeklyoptionsscalper-9', families) is True
+    assert filter_selectable_labels(['weeklyoptionsscalper-9', 'tech'],
+                                    machine_families=families) == ['tech']
+
+
+def test_legacy_families_survive_a_registry_derived_set():
+    """'penny-17' is on live instrument rows but no class is named ``Penny`` any
+    more (it was renamed ``PennyMomentumTrader``). A purely registry-derived set
+    would un-hide those two live tags."""
+    assert 'penny' in LEGACY_MACHINE_LABEL_FAMILIES
+    assert 'penny' in DEFAULT_MACHINE_LABEL_FAMILIES
+
+    class FMPRating:
+        pass
+
+    families = expert_shortname_families([FMPRating])
+    assert is_machine_label('penny-17', families) is True
+
+
+def test_the_machine_family_pattern_is_end_anchored():
+    """Dropping the ``$`` would classify the user label 'penny-17-core' as a
+    machine tag and silently remove it from the picker."""
+    assert is_machine_label('penny-17-core') is False
+    assert is_machine_label('penny-17') is True
+    assert filter_selectable_labels(['penny-17-core']) == ['penny-17-core']
+
+
+def test_the_machine_family_pattern_is_start_anchored():
+    assert is_machine_label('my-penny-17') is False
+
+
+def test_a_family_name_is_matched_literally_not_as_a_pattern():
+    """The families are interpolated straight into a regex, so they must be escaped.
+
+    Class names cannot contain a metacharacter today, but the set is now DERIVED
+    from a registry rather than hand-written, so nothing here gets to assume that.
+    """
+    families = frozenset({'fmp.ating'})
+    assert is_machine_label('fmp.ating-3', families) is True
+    assert is_machine_label('fmpXating-3', families) is False
+
+
+# ---------------------------------------------------------------------------
+# F-I3 -- shorts: ONE signed representation, whichever broker reported them
+# ---------------------------------------------------------------------------
+
+def test_positions_by_symbol_signs_a_tastytrade_short_negative():
+    """TastyTrade stamps ``qty=abs_qty`` and records the direction in ``side``
+    (``TastyTradeAccount.py:520-547``). Read raw, a short reads as a long."""
+    out = positions_by_symbol([{'symbol': 'TSLA', 'qty': 10, 'cost_basis': 1500.0,
+                                'market_value': 1800.0, 'side': 'SELL'}])
+    assert out['TSLA'].quantity == -10.0
+    assert out['TSLA'].cost_basis == -1500.0
+    assert out['TSLA'].market_value == -1800.0
+
+
+def test_positions_by_symbol_does_not_flip_an_already_signed_alpaca_short():
+    """Alpaca passes the broker's own negative signs straight through
+    (``alpaca_position_to_position``), so normalising must be idempotent."""
+    out = positions_by_symbol([{'symbol': 'TSLA', 'qty': -10, 'cost_basis': -1500.0,
+                                'market_value': -1800.0, 'side': 'SELL'}])
+    assert out['TSLA'].quantity == -10.0
+    assert out['TSLA'].cost_basis == -1500.0
+    assert out['TSLA'].market_value == -1800.0
+
+
+def test_the_same_short_from_either_broker_renders_the_same_page():
+    alpaca = positions_by_symbol([{'symbol': 'TSLA', 'qty': -10, 'cost_basis': -1500.0,
+                                   'market_value': -1800.0, 'side': 'SELL'}])
+    tastytrade = positions_by_symbol([{'symbol': 'TSLA', 'qty': 10, 'cost_basis': 1500.0,
+                                       'market_value': 1800.0, 'side': 'SELL'}])
+    assert alpaca['TSLA'] == tastytrade['TSLA']
+
+
+def test_positions_by_symbol_reads_the_side_enum_as_well_as_the_string():
+    from ba2_trade_platform.core.types import OrderDirection
+    out = positions_by_symbol([{'symbol': 'TSLA', 'qty': 10, 'cost_basis': 1500.0,
+                                'market_value': 1800.0, 'side': OrderDirection.SELL}])
+    assert out['TSLA'].quantity == -10.0
+
+
+def test_positions_by_symbol_leaves_a_long_exactly_as_the_broker_reported_it():
+    out = positions_by_symbol([{'symbol': 'AAPL', 'qty': 10, 'cost_basis': 1500.0,
+                                'market_value': 1800.0, 'side': 'BUY'}])
+    assert out['AAPL'].quantity == 10.0
+    assert out['AAPL'].cost_basis == 1500.0
+
+
+def test_positions_by_symbol_without_a_side_trusts_the_signs_it_was_given():
+    """Not every source stamps a side; an unknown side must not silently rewrite
+    the numbers."""
+    out = positions_by_symbol([{'symbol': 'TSLA', 'qty': -10, 'cost_basis': -1500.0,
+                                'market_value': -1800.0}])
+    assert out['TSLA'].quantity == -10.0
+
+
+def test_a_long_and_a_short_of_one_symbol_net_out():
+    out = positions_by_symbol([
+        {'symbol': 'TSLA', 'qty': 10, 'cost_basis': 1000.0, 'market_value': 1200.0,
+         'side': 'BUY'},
+        {'symbol': 'TSLA', 'qty': 4, 'cost_basis': 400.0, 'market_value': 480.0,
+         'side': 'SELL'},
+    ])
+    assert out['TSLA'].quantity == 6.0
+    assert out['TSLA'].cost_basis == 600.0
+    assert out['TSLA'].market_value == 720.0
+
+
+def test_a_short_only_label_reports_percentages_rather_than_zeroes():
+    """``if label_value > 0`` zeroes EVERY percentage of a net-short label, so the
+    page showed a real position as 0% of a label worth -3000."""
+    views = build_label_views([ManagedLabel('Hedges', 100.0)],
+                              {'Hedges': ['TSLA']},
+                              {'TSLA': positions_by_symbol(
+                                  [{'symbol': 'TSLA', 'qty': 10, 'cost_basis': 3000.0,
+                                    'market_value': 3300.0, 'side': 'SELL'}])['TSLA']},
+                              {})
+    assert views[0].current_value == -3000.0
+    assert views[0].rows[0].pct_of_label == 100.0
+    assert views[0].rows[0].pct_of_total == 100.0
+    assert views[0].pct_of_total == 100.0
+
+
+def test_a_short_reduces_the_labels_value_instead_of_inflating_it():
+    """Mutation P11 (``+= abs(...)``) survived because no test modelled a short."""
+    positions = positions_by_symbol([
+        {'symbol': 'AAPL', 'qty': 10, 'cost_basis': 5000.0, 'market_value': 5000.0,
+         'side': 'BUY'},
+        {'symbol': 'TSLA', 'qty': 10, 'cost_basis': 2000.0, 'market_value': 2000.0,
+         'side': 'SELL'},
+    ])
+    views = build_label_views([ManagedLabel('Mixed', 100.0)],
+                              {'Mixed': ['AAPL', 'TSLA']}, positions, {})
+    assert views[0].current_value == 3000.0
+    assert views[0].cost_basis == 3000.0
+
+
+def test_a_label_whose_value_nets_to_exactly_zero_reports_zero_percentages():
+    """A zero denominator is the one case with no meaningful answer."""
+    positions = positions_by_symbol([
+        {'symbol': 'AAPL', 'qty': 10, 'cost_basis': 2000.0, 'market_value': 2000.0,
+         'side': 'BUY'},
+        {'symbol': 'TSLA', 'qty': 10, 'cost_basis': 2000.0, 'market_value': 2000.0,
+         'side': 'SELL'},
+    ])
+    views = build_label_views([ManagedLabel('Flat', 100.0)],
+                              {'Flat': ['AAPL', 'TSLA']}, positions, {})
+    assert views[0].current_value == 0.0
+    assert all(r.pct_of_label == 0.0 for r in views[0].rows)
+
+
+def test_a_short_in_market_mode_is_valued_at_a_negative_quantity_times_price():
+    positions = positions_by_symbol([{'symbol': 'TSLA', 'qty': 10, 'cost_basis': 3000.0,
+                                      'market_value': 3300.0, 'side': 'SELL'}])
+    views = build_label_views([ManagedLabel('Hedges', 100.0)], {'Hedges': ['TSLA']},
+                              positions, {'TSLA': 330.0},
+                              valuation_mode=VALUATION_MODE_MARKET)
+    assert views[0].rows[0].current_value == -3300.0
+    assert views[0].rows[0].market_value == -3300.0
+
+
+# ---------------------------------------------------------------------------
+# Previously unpinned: target_pct, the blank-symbol row, the missing-quote list
+# ---------------------------------------------------------------------------
+
+def test_label_view_carries_the_stored_target_pct_through_untouched():
+    """``LabelView.target_pct`` is what Section G's engine reads as
+    ``LabelTarget.target_pct``; mutation B24 (-> 0.0) survived the whole suite."""
+    views = build_label_views([ManagedLabel('ARK26', 37.5), ManagedLabel('EMPTY', 62.5)],
+                              {'ARK26': ['AAPL'], 'EMPTY': []},
+                              {'AAPL': _pos('AAPL', 1, 100.0)}, {})
+    assert views[0].target_pct == 37.5
+    assert views[1].target_pct == 62.5          # an empty label keeps its target too
+
+
+def test_positions_by_symbol_refuses_a_row_with_no_symbol():
+    """It already refuses a missing quantity and a missing cost basis; dropping a
+    nameless row silently loses money from every total on the page."""
+    with pytest.raises(ValueError):
+        positions_by_symbol([{'symbol': '', 'qty': 1, 'cost_basis': 100.0}])
+
+
+def test_missing_quote_symbols_names_the_positions_a_quote_outage_zeroed():
+    """In market mode an unpriced position contributes 0, which is indistinguishable
+    from 'flat' on screen. The page has to be able to say which ones."""
+    views = build_label_views([ManagedLabel('ARK26', 100.0)],
+                              {'ARK26': ['AAPL', 'MSFT', 'TSLA']},
+                              {'AAPL': _pos('AAPL', 10, 1000.0),
+                               'MSFT': _pos('MSFT', 10, 1000.0)},
+                              {'AAPL': 250.0, 'MSFT': None},
+                              valuation_mode=VALUATION_MODE_MARKET)
+    # MSFT is held but unpriced; TSLA is unpriced AND flat, so it is not a loss.
+    assert missing_quote_symbols(views) == ['MSFT']
+
+
+def test_missing_quote_symbols_is_empty_when_every_position_is_priced():
+    views = build_label_views([ManagedLabel('ARK26', 100.0)], {'ARK26': ['AAPL']},
+                              {'AAPL': _pos('AAPL', 10, 1000.0)}, {'AAPL': 250.0},
+                              valuation_mode=VALUATION_MODE_MARKET)
+    assert missing_quote_symbols(views) == []
+
+
+def test_missing_quote_symbols_reports_each_symbol_once_across_labels():
+    views = build_label_views([ManagedLabel('ARK26', 50.0), ManagedLabel('TECH', 50.0)],
+                              {'ARK26': ['MSFT'], 'TECH': ['MSFT']},
+                              {'MSFT': _pos('MSFT', 10, 1000.0)}, {'MSFT': None},
+                              valuation_mode=VALUATION_MODE_MARKET)
+    assert missing_quote_symbols(views) == ['MSFT']
+
+
+# ---------------------------------------------------------------------------
+# The import-purity gate this module exists to satisfy
+# ---------------------------------------------------------------------------
+
+def test_the_view_module_imports_without_nicegui_the_db_or_the_expert_stack():
+    """This module was split out of the page precisely so it stays cheap.
+
+    ``ui/pages/__init__.py`` pulls every page and through them langchain/openai/
+    torch — ~6s and a dozen heavy roots. A stray ``from nicegui import ui`` or a
+    DB/broker import here would drag that back and make the pure suite slow and
+    order-dependent. Checked in a SUBPROCESS: by the time this test runs in a full
+    suite, another module has long since imported nicegui.
+    """
+    import os
+    import subprocess
+    import sys
+    import time
+
+    script = (
+        "import sys, time\n"
+        "t = time.time()\n"
+        "import ba2_trade_platform.ui.utils.portfolio_allocation_view\n"
+        "elapsed = time.time() - t\n"
+        "banned = [m for m in ('nicegui', 'langchain_core', 'openai', 'torch',\n"
+        "                      'transformers', 'sqlalchemy')\n"
+        "          if m in sys.modules]\n"
+        "print(f'{elapsed:.3f}|{banned}')\n"
+    )
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(p for p in sys.path if p))
+    proc = subprocess.run([sys.executable, '-c', script], capture_output=True,
+                          text=True, env=env, timeout=120)
+    assert proc.returncode == 0, proc.stderr
+    elapsed, banned = proc.stdout.strip().splitlines()[-1].split('|')
+    assert banned == '[]', f"heavy imports leaked into the pure module: {banned}"
+    assert float(elapsed) < 2.0, f"import took {elapsed}s — something heavy crept in"

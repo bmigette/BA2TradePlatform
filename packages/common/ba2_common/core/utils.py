@@ -157,6 +157,14 @@ def get_symbols_by_label(labels) -> Dict[str, List[str]]:
     Labels live in a plain JSON column, so this scans the instrument table exactly
     as ``get_all_instrument_labels`` does. The ``Instrument`` import is LAZY (same
     as the other label helpers) to keep this module free of live-tree imports.
+
+    STORED labels are stripped before they are compared, on BOTH sides, because
+    ``get_all_instrument_labels`` strips too and the two are used as a pair: the UI
+    offers the labels in use and then resolves the chosen one here. Comparing the
+    stored value raw meant a legacy row holding ``' tech '`` was offered as
+    ``'tech'`` and then matched nothing, so the basket rendered silently empty.
+    Case is deliberately NOT folded -- 'ark26' and 'ARK26' are two different
+    baskets, exactly as ``diff_managed_labels`` documents.
     """
     from ba2_common.core.models import Instrument
     if isinstance(labels, str):
@@ -176,8 +184,9 @@ def get_symbols_by_label(labels) -> Dict[str, List[str]]:
             if not name:
                 continue
             for lbl in (inst.labels or []):
-                if lbl in wanted_set:
-                    out[lbl].append(name)
+                stored = (lbl or "").strip()
+                if stored in wanted_set:
+                    out[stored].append(name)
     for lbl in out:
         out[lbl] = sorted(set(out[lbl]))
     return out
