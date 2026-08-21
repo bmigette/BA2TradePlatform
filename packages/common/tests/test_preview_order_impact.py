@@ -53,3 +53,16 @@ def test_preview_order_impact_does_not_mutate_or_persist_the_candidate_order():
     assert order.id is None
     assert order.broker_order_id is None
     assert order.quantity == 10.0
+
+
+def test_preview_order_impact_accepts_the_closing_intent():
+    """I4. The seam has to carry ``is_closing_order`` or a preview cannot price a
+    CLOSE: without it every sell is built as a SELL_TO_OPEN, i.e. a short. A close
+    FREES buying power, a short open CONSUMES margin -- so on a cash or
+    short-unapproved account the dry run comes back with errors and accepted=False,
+    and the allocation engine skips a perfectly legitimate sell.
+
+    ``submit_order`` -> ``_submit_order_impl`` already carries the flag; the preview
+    seam is the one that dropped it, which broke its own documented promise that
+    "a preview prices exactly what would be sent"."""
+    assert _StubTradingAccount(1).preview_order_impact(_order(), is_closing_order=True) is None

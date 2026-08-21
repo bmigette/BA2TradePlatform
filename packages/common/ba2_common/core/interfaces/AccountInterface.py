@@ -65,7 +65,8 @@ class AccountInterface(ReadOnlyAccountInterface):
         """
         pass
 
-    def preview_order_impact(self, trading_order: TradingOrder) -> Optional[OrderImpact]:
+    def preview_order_impact(self, trading_order: TradingOrder,
+                             is_closing_order: bool = False) -> Optional[OrderImpact]:
         """Broker-side dry-run of ONE order: what it would cost in buying power.
 
         CONCRETE, returns ``None`` by default. ``None`` means "this broker has no
@@ -85,6 +86,15 @@ class AccountInterface(ReadOnlyAccountInterface):
             trading_order: a candidate TradingOrder (saved or unsaved) describing
                 the order. This method must NOT mutate or persist it, and must
                 not set ``broker_order_id``.
+            is_closing_order: True when the order would CLOSE an existing position.
+                It must be forwarded exactly as ``submit_order`` forwards it to
+                ``_submit_order_impl``, because on brokers that encode open/close in
+                the order itself (TastyTrade's SELL_TO_CLOSE vs SELL_TO_OPEN) the two
+                price completely differently: a close FREES buying power, while a
+                short open CONSUMES margin and needs short approval. Dropping it made
+                every closing preview come back rejected on a cash account, so the
+                allocation engine skipped legitimate sells -- while this docstring
+                claimed the preview prices exactly what would be sent.
 
         Returns:
             Optional[OrderImpact]: ``None`` when the broker does not support

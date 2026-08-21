@@ -933,7 +933,8 @@ class TastyTradeAccount(AccountInterface):
             f"broker_order_id={db_order.broker_order_id} (db id={db_order.id})")
         return True
 
-    def preview_order_impact(self, trading_order: TradingOrder) -> Optional[OrderImpact]:
+    def preview_order_impact(self, trading_order: TradingOrder,
+                             is_closing_order: bool = False) -> Optional[OrderImpact]:
         """Broker-side dry run of ONE order: what it would cost in buying power.
 
         MUST NOT send a live order. ``place_order``'s ``dry_run`` parameter DEFAULTS
@@ -944,6 +945,15 @@ class TastyTradeAccount(AccountInterface):
         a preview prices exactly what would be sent. ``trading_order`` is neither
         mutated nor persisted, and no ``broker_order_id`` is written.
 
+        ``is_closing_order`` MUST be forwarded, exactly as the live submit at
+        ``_submit_order_impl`` forwards it. TastyTrade encodes open/close in the LEG
+        ACTION, so the flag is the difference between SELL_TO_CLOSE and SELL_TO_OPEN --
+        i.e. between freeing buying power and opening a SHORT that consumes margin and
+        needs short approval. It used to default here while the live submit passed the
+        caller's value, so every closing preview priced a short: on a cash or
+        short-unapproved account the dry run returned errors, ``accepted=False``, and
+        the allocation engine skipped a legitimate sell.
+
         Returns:
             Optional[OrderImpact]: ``None`` when the preview call failed. ``None``
             means "no precheck", NOT "the order is free" -- a zero impact is never
@@ -952,7 +962,8 @@ class TastyTradeAccount(AccountInterface):
         if not self._check_authentication():
             return None
         try:
-            new_order = self._build_new_order(trading_order)
+            new_order = self._build_new_order(trading_order,
+                                              is_closing_order=is_closing_order)
             response = self._run_async(
                 self._account.place_order(self._session, new_order, dry_run=True))
         except Exception as e:

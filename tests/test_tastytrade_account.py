@@ -1139,6 +1139,50 @@ def test_preview_order_impact_reports_estimated_fees_as_a_positive_cost():
     assert impact.estimated_fees == pytest.approx(0.03)
 
 
+def test_preview_order_impact_prices_a_close_as_a_close_not_a_short_open():
+    """I4. The preview used to call `_build_new_order(order)` with the default
+    `is_closing_order=False` while the live submit passed the caller's value, so:
+
+        preview leg action : OrderAction.SELL_TO_OPEN
+        submit  leg action : OrderAction.SELL_TO_CLOSE
+
+    A close FREES buying power; a short open CONSUMES margin and needs short
+    approval. On a cash account the dry run therefore came back with errors and
+    accepted=False, and the allocation engine skipped a legitimate sell -- while the
+    docstring promised "a preview prices exactly what would be sent"."""
+    from ba2_trade_platform.core.types import OrderDirection
+
+    account_def, order = _tt_trading_order(side=OrderDirection.SELL)
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.place_order = AsyncMock(
+        return_value=_placed_order_response(_placed_order(order_id=-1)))
+
+    with patch("tastytrade.instruments.Equity.get",
+               new=AsyncMock(return_value=_FakeEquity("AAPL"))):
+        acct.preview_order_impact(order, is_closing_order=True)
+
+    previewed = acct._account.place_order.call_args.args[1]
+    assert previewed.legs[0].action == OrderAction.SELL_TO_CLOSE
+
+
+def test_preview_order_impact_still_prices_an_opening_sell_as_a_short():
+    """The default must stay OPEN -- the flag adds an intent, it does not invert one."""
+    from ba2_trade_platform.core.types import OrderDirection
+
+    account_def, order = _tt_trading_order(side=OrderDirection.SELL)
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.place_order = AsyncMock(
+        return_value=_placed_order_response(_placed_order(order_id=-1)))
+
+    with patch("tastytrade.instruments.Equity.get",
+               new=AsyncMock(return_value=_FakeEquity("AAPL"))):
+        acct.preview_order_impact(order)
+
+    assert acct._account.place_order.call_args.args[1].legs[0].action == OrderAction.SELL_TO_OPEN
+
+
 def test_preview_order_impact_marks_a_rejected_preview_as_not_accepted():
     account_def, order = _tt_trading_order()
     acct = _bare_account()
