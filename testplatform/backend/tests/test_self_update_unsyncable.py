@@ -2,6 +2,11 @@
 a remote worker's ``git pull`` (uncommitted version.py changes, or unpushed commits), so the
 resulting ~5min-per-worker retry-and-exclude loop gets a clear cause instead of a silent
 timeout. See the function's own docstring for the real incident this guards against.
+
+The version file it watches is ``testplatform/version.py`` since the trade/test split — that is
+the file carrying the string workers converge on. The behaviour under test is unchanged by the
+split (uncommitted -> reason, unpushed -> reason, clean -> None); WHICH path is passed to
+``git status`` is pinned separately, in ``test_self_update_version_split.py``.
 """
 from __future__ import annotations
 
@@ -23,7 +28,7 @@ def _run(returncode: int, stdout: str = ""):
 def test_unsyncable_reason_none_when_clean_and_pushed():
     with patch("app.services.self_update.subprocess.run") as mock_run:
         mock_run.side_effect = [
-            _run(0, ""),   # git status --porcelain -- version.py -> clean
+            _run(0, ""),   # git status --porcelain -- testplatform/version.py -> clean
             _run(0, "0"),  # git rev-list --count @{u}..HEAD -> 0 ahead
         ]
         assert unsyncable_reason(Path("C:/fake/repo")) is None
@@ -32,7 +37,7 @@ def test_unsyncable_reason_none_when_clean_and_pushed():
 def test_unsyncable_reason_flags_uncommitted_version_file():
     with patch("app.services.self_update.subprocess.run") as mock_run:
         mock_run.side_effect = [
-            _run(0, " M ba2_trade_platform/version.py\n"),  # dirty
+            _run(0, " M testplatform/version.py\n"),  # dirty
         ]
         reason = unsyncable_reason(Path("C:/fake/repo"))
         assert reason is not None

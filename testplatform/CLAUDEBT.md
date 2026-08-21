@@ -5,7 +5,30 @@
 - Store interesting findings (model, timeframe, prediction target, ...) in `.claudebtcache/findings.md`
 - Store what was done in `.claudebtcache/history.md` (check this when planning next steps to avoid duplicates)
 - Store next objectives/tasks in `.claudebtcache/plan.md`
-- If a bug is found or additional functions are needed, commit/push/restart remote
+- If a bug is found or additional functions are needed, commit/push/restart remote (see
+  **Versioning** below — a fix that isn't version-bumped never reaches the remote workers)
+
+## Versioning
+
+Two independent version files, both `YYYY.MM.NNNNN`. **Before every `git push`, increment the
+build number (NNNNN) by 1** in the file that matches what you changed:
+
+| What you changed | Bump |
+|---|---|
+| `ba2_trade_platform/` only | `ba2_trade_platform/version.py` (`APP_VERSION`) |
+| `testplatform/` **or `packages/`** | `testplatform/version.py` (`TEST_APP_VERSION`) |
+| both | both files |
+
+`packages/` counts as a test-platform change because the distributed GA workers decide whether to
+self-update by comparing `TEST_APP_VERSION` alone
+(`backend/app/services/worker_client.py:ensure_synced`, which deliberately does not key on the git
+commit so that ordinary pushes don't churn every worker mid-run). A shared-package change that
+does not bump it leaves workers running different `ba2_common` code from the master, which
+silently breaks trial reproducibility.
+
+Also: `unsyncable_reason` refuses a distributed run when `testplatform/version.py` is uncommitted
+or the branch is unpushed — a worker's `git pull` could never converge on it. Commit AND push the
+bump before dispatching.
 
 ## CLI & Remote Server
 - CLI: `python ba2cli.py --host 192.168.1.150 --port 8000`

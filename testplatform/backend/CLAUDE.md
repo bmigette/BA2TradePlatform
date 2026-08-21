@@ -24,6 +24,19 @@ Do NOT use system Python or `python` directly. Always use `./venv/bin/python`.
 ./venv/bin/python -m uvicorn app.main:app --reload
 ```
 
+## Versioning — bump `testplatform/version.py`, NOT the trade app's
+
+Any change under `testplatform/` **or `packages/`** must increment `TEST_APP_VERSION` (NNNNN + 1)
+in `testplatform/version.py` before the push. Only changes confined to `ba2_trade_platform/` bump
+`ba2_trade_platform/version.py`.
+
+This is not cosmetic: `worker_client.ensure_synced` decides whether a distributed GA worker
+self-updates by comparing `TEST_APP_VERSION` alone (deliberately not the git commit, so ordinary
+pushes don't churn every worker mid-run). Ship a `packages/` fix without bumping it and the
+workers keep running the old code while reporting "synced". Commit **and push** the bump —
+`unsyncable_reason` refuses the run otherwise, because a worker's `git pull` could never
+converge on an uncommitted or unpushed version.
+
 ## Key Directories
 
 - `app/` - FastAPI application and services

@@ -247,12 +247,29 @@ Most configuration is done via the web UI Settings page rather than environment 
 
 ## Versioning
 
-The application version is a static string in `ba2_trade_platform/version.py`:
+There are **TWO** independent version files, both static strings of the form `YYYY.MM.NNNNN`:
 
-```python
-APP_VERSION = "YYYY.MM.NNNNN"
-```
+- `ba2_trade_platform/version.py` -> `APP_VERSION` (the trade app; shown in the UI sidebar,
+  bottom-left)
+- `testplatform/version.py` -> `TEST_APP_VERSION` (the test platform, zero-padded so the two
+  sequences can never produce the same string)
 
-**Before every `git push`, increment the build number (NNNNN) by 1.**
-Update the year/month when they change.
-Current version is visible in the UI sidebar (bottom-left).
+**Before every `git push`, increment the build number (NNNNN) by 1** in the file that matches
+what you changed:
+
+| What you changed | Bump |
+|---|---|
+| `ba2_trade_platform/` only | `ba2_trade_platform/version.py` (`APP_VERSION`) |
+| `testplatform/` **or `packages/`** | `testplatform/version.py` (`TEST_APP_VERSION`) |
+| both | both files |
+
+`packages/` counts as a test-platform change because the distributed GA workers decide whether to
+self-update by comparing `TEST_APP_VERSION` alone
+(`testplatform/backend/app/services/worker_client.py:ensure_synced`, which deliberately does not
+key on the git commit so that ordinary pushes don't churn every worker mid-run). A shared-package
+change that does not bump it leaves workers running different `ba2_common` code from the master,
+which silently breaks trial reproducibility.
+
+Keeping the two files separate is what stops a test-platform-only change from needing a cosmetic
+trade bump to reach the workers (and stops a trade-only bump from making every worker re-sync for
+nothing). Update the year/month when they change.
