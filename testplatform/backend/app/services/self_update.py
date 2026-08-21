@@ -41,6 +41,13 @@ logger = logging.getLogger(__name__)
 # The three shared packages, installed in dependency order (common <- providers <- experts).
 _PACKAGE_DIRS = ("common", "providers", "experts")
 
+# Marks WHERE this build reads its ``app_version`` from. Builds before the trade/test version
+# split read ``ba2_trade_platform/version.py`` and report no scheme at all, so a master can tell
+# a pre-split worker apart from a converged one WITHOUT relying on the two version strings
+# happening to differ — see ``worker_client.ensure_synced``. Change this only if the source of
+# the version string changes again; every worker will then be forced through one update cycle.
+VERSION_SCHEME = "testplatform"
+
 
 def resolve_repo_root(start: Optional[Path] = None) -> Path:
     """Return the monorepo root: the nearest ancestor of *start* that contains ``.git``.
@@ -58,18 +65,34 @@ def resolve_repo_root(start: Optional[Path] = None) -> Path:
     return Path(__file__).resolve().parents[4]
 
 
-def _app_version(root: Path) -> str:
-    """Read ``APP_VERSION`` from ``ba2_trade_platform/version.py`` by FILE (not import).
+def _read_version_literal(version_file: Path, name: str) -> str:
+    """Extract ``<name> = "..."`` from *version_file* by TEXT, never by import.
 
-    The test venv does not install the trade app, so importing ``ba2_trade_platform.version``
-    would fail there; reading the file works from either venv and from the monorepo checkout.
+    Neither app is importable from every venv this runs in (the test venv does not install the
+    trade app; ``testplatform`` is not an installed package on a worker), so the version is
+    parsed out of the file. That also means a version file can never execute code here.
     """
-    vf = root / "ba2_trade_platform" / "version.py"
     try:
-        m = re.search(r"""APP_VERSION\s*=\s*["']([^"']+)["']""", vf.read_text(encoding="utf-8"))
+        m = re.search(rf"""{name}\s*=\s*["']([^"']+)["']""", version_file.read_text(encoding="utf-8"))
         return m.group(1) if m else "unknown"
     except OSError:
         return "unknown"
+
+
+def _app_version(root: Path) -> str:
+    """Read ``TEST_APP_VERSION`` from ``testplatform/version.py`` by FILE (not import).
+
+    This is the TEST platform's OWN version, deliberately independent of the trade app's
+    ``ba2_trade_platform/version.py``. Workers key their self-update decision on this string
+    (``worker_client.ensure_synced``), so a trade-app-only release must not churn them, and
+    conversely a testplatform/packages change must not need a cosmetic trade bump to reach them.
+    """
+    return _read_version_literal(root / "testplatform" / "version.py", "TEST_APP_VERSION")
+
+
+def _trade_app_version(root: Path) -> str:
+    """The TRADE app's ``APP_VERSION``. Reported for diagnosis only — nothing syncs on it."""
+    return _read_version_literal(root / "ba2_trade_platform" / "version.py", "APP_VERSION")
 
 
 def _git_commit(root: Path) -> Optional[str]:
@@ -87,12 +110,19 @@ def _git_commit(root: Path) -> Optional[str]:
 def get_version_info(root: Optional[Path] = None) -> dict:
     """Identity of the running code: app version + git commit + repo root.
 
+    ``app_version`` is the TEST platform's ``TEST_APP_VERSION`` — the string workers sync on.
+    ``trade_app_version`` is the trade app's, carried purely so a human reading ``/version`` can
+    see both. ``version_scheme`` says where ``app_version`` came from; a pre-split build omits it
+    entirely, which is how a master recognises a worker that has not pulled yet.
+
     The git commit is the authoritative equality check for "is this the same code?" — a worker
     compares it to the master's before claiming trials (determinism requirement).
     """
     root = root or resolve_repo_root()
     return {
         "app_version": _app_version(root),
+        "trade_app_version": _trade_app_version(root),
+        "version_scheme": VERSION_SCHEME,
         "git_commit": _git_commit(root),
         "editable": is_editable_install(root),
         "root": str(root),
@@ -104,7 +134,9 @@ def unsyncable_reason(root: Optional[Path] = None) -> Optional[str]:
     via ``git pull``; otherwise a human-readable reason it can't.
 
     Root cause this guards against (hit for real, 2026-07-18): ``app_version`` is read straight
-    from the ``version.py`` FILE (see ``_app_version``), which can differ from what's actually
+    from the ``testplatform/version.py`` FILE (see ``_app_version``) — the TEST platform's own
+    version file since the trade/test split, which is the one that must be checked here because
+    it is the only one workers converge on — which can differ from what's actually
     reachable by a worker's ``git pull`` in two ways — (a) the file was edited but never
     committed, or (b) it WAS committed but the commit was never pushed. Either way, a worker's
     ``ensure_synced`` retries its `/update` -> poll `/version` loop for the FULL ``max_wait``
@@ -119,13 +151,13 @@ def unsyncable_reason(root: Optional[Path] = None) -> Optional[str]:
     root = root or resolve_repo_root()
     try:
         r = subprocess.run(
-            ["git", "status", "--porcelain", "--", "ba2_trade_platform/version.py"],
+            ["git", "status", "--porcelain", "--", "testplatform/version.py"],
             cwd=str(root), capture_output=True, text=True, timeout=10,
         )
         if r.returncode == 0 and r.stdout.strip():
-            return ("version.py has UNCOMMITTED changes — a remote worker's `git pull` can "
-                    "never reach this app_version. Commit and push before running a distributed "
-                    "job, or workers will retry-and-exclude for the whole run.")
+            return ("testplatform/version.py has UNCOMMITTED changes — a remote worker's "
+                    "`git pull` can never reach this app_version. Commit and push before running "
+                    "a distributed job, or workers will retry-and-exclude for the whole run.")
     except (OSError, subprocess.SubprocessError):
         return None  # git unavailable — can't diagnose, but also can't confirm a problem
 

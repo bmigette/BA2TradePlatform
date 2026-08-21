@@ -13,7 +13,7 @@ from typing import Callable, Optional
 
 import httpx
 
-from app.services import cache_sync
+from app.services import cache_sync, self_update
 
 logger = logging.getLogger(__name__)
 
@@ -334,8 +334,31 @@ def push_secrets(worker: dict, settings: dict, log: Callable[[str], None] = logg
         return {"set": 0, "error": repr(e)}
 
 
+def _post_update(worker: dict) -> None:
+    """Fire the worker's ``/update`` (pull + reinstall + restart). The restart drops the
+    connection, so a raised exception here is the normal case, not a failure."""
+    try:
+        with httpx.Client(timeout=120.0) as c:
+            c.post(f"{_base(worker)}/update", headers=_headers(worker))
+    except Exception as e:  # noqa: BLE001 — the restart may drop the connection; that's expected
+        logger.debug(f"update call returned/dropped (expected on restart): {e}")
+
+
+def _is_pre_split(info: dict) -> bool:
+    """True if *info* came from a build that predates the trade/test version split.
+
+    Such a build reports ``ba2_trade_platform``'s ``APP_VERSION`` under the ``app_version`` key
+    and carries no ``version_scheme`` at all. Detecting it by the MISSING field rather than by
+    "the strings differ" is the point: both version files use the same ``YYYY.MM.NNNNN`` shape,
+    so the strings can coincide by accident (``2026.08.1067`` was a real trade version), and a
+    coincidence would otherwise read as "already converged" while the worker ran stale code.
+    """
+    return info.get("version_scheme") != self_update.VERSION_SCHEME
+
+
 def ensure_synced(worker: dict, master_version: Optional[str],
-                  log: Callable[[str], None] = logger.info, max_wait: float = 300.0) -> bool:
+                  log: Callable[[str], None] = logger.info, max_wait: float = 300.0,
+                  poll_interval: float = 3.0) -> bool:
     """Make the worker run a compatible build: if its app version differs from the master's,
     trigger its /update and wait (polling /version) until it matches. Returns True if usable,
     False to exclude.
@@ -343,28 +366,44 @@ def ensure_synced(worker: dict, master_version: Optional[str],
     Compatibility is keyed on ``app_version`` (not the git commit) so that ordinary pushes —
     docs, scratch scripts, unrelated fixes — don't force every connected worker to self-update
     mid-run. A worker only needs to re-sync when the app version is intentionally bumped.
+
+    Since the trade/test version split that string is ``TEST_APP_VERSION`` from
+    ``testplatform/version.py``. A worker that has not pulled since the split reports the TRADE
+    app's version under the same key, so equality alone is no longer sufficient evidence of
+    convergence — ``_is_pre_split`` forces such a worker through a full update cycle whatever its
+    version string says. One pull carries both the new ``self_update.py`` and
+    ``testplatform/version.py`` (same commit), so it converges in that single cycle; if it cannot,
+    it is excluded with an explicit reason instead of silently running stale code.
     """
     try:
-        wv = version(worker).get("app_version")
+        info = version(worker)
     except Exception as e:  # noqa: BLE001
         log(f"worker {worker['name']} unreachable ({e}); excluding")
         return False
-    if not master_version or not wv or wv == master_version:
+    wv = info.get("app_version")
+    pre_split = _is_pre_split(info)
+    if not master_version or not wv:
+        return True  # caller isn't version-gating (or the worker reports no version at all)
+    if wv == master_version and not pre_split:
         return True
-    log(f"worker {worker['name']} version {wv} != master {master_version}; updating + waiting...")
-    try:
-        with httpx.Client(timeout=120.0) as c:
-            c.post(f"{_base(worker)}/update", headers=_headers(worker))
-    except Exception as e:  # noqa: BLE001 — the restart may drop the connection; that's expected
-        logger.debug(f"update call returned/dropped (expected on restart): {e}")
+    if pre_split:
+        log(f"worker {worker['name']} is running PRE-SPLIT code (reports app_version {wv} from "
+            f"the trade app, no version_scheme); updating + waiting...")
+    else:
+        log(f"worker {worker['name']} version {wv} != master {master_version}; updating + waiting...")
+    _post_update(worker)
     deadline = time.time() + max_wait
     while time.time() < deadline:
-        time.sleep(3.0)
+        time.sleep(poll_interval)
         try:
-            if version(worker).get("app_version") == master_version:
-                log(f"worker {worker['name']} updated to {master_version}")
-                return True
+            info = version(worker)
         except Exception:  # noqa: BLE001 — still restarting
             continue
-    log(f"worker {worker['name']} did not converge to {master_version} in {max_wait:.0f}s; excluding")
+        pre_split = _is_pre_split(info)
+        if info.get("app_version") == master_version and not pre_split:
+            log(f"worker {worker['name']} updated to {master_version}")
+            return True
+    detail = " (still PRE-SPLIT — its `git pull` never reached the split commit)" if pre_split else ""
+    log(f"worker {worker['name']} did not converge to {master_version} in {max_wait:.0f}s{detail}; "
+        f"excluding")
     return False
