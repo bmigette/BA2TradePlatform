@@ -18548,6 +18548,21 @@ git commit -m "feat(allocation): fractional submission with a one-shot whole-sha
 
 ### Task 74: Income ledger — sync on load/Refresh only, FIFO consumption
 
+> **Decide what labels a deposit row before you build the panel.** `CashTransfer.description` is
+> populated for CSD/CSW but `portfolio_income_event` has no column for it, so it is dropped at
+> persist time. As it stands a DEPOSIT row reaches this UI with only a date and an amount — nothing
+> distinguishing two same-day ACHs. Section D's review recommended keeping `description` on the value
+> object and off the funding table (it is `None` for every dividend, unvalidated broker prose for
+> deposits, and adds a migration to the hot idempotency path). If this panel needs a label, get it by
+> re-reading the transfer at render time rather than adding a typed column.
+>
+> **Do not render `consumed_amount / amount` as a fraction or progress bar without clamping.**
+> `consumed_amount > amount` is a reachable state: a DIVNRA tax leg posting after its DIV restates
+> the amount downward while the consumed figure — a true record of what was spent — is deliberately
+> left alone. `open_amount` already clamps at 0 so nothing over-allocates, but a naive percentage
+> renders above 100%.
+
+
 Pure-testable: the broker→ledger sync and the consumption wrappers against the FakeAccount +
 in-memory DB. Eyeball-only: `render_income_panel`'s layout — the automated check is the smoke
 test that the module still imports.
