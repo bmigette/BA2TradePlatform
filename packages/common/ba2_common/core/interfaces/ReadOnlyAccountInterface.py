@@ -1,7 +1,13 @@
 from abc import abstractmethod
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Tuple
 from datetime import datetime, timezone, timedelta, date
-from ba2_common.core.account_types import AccountSnapshot, CashTransfer, MarginInfo
+from ba2_common.core.account_types import (
+    MARKET_HOURS_SOURCE_UNAVAILABLE,
+    AccountSnapshot,
+    CashTransfer,
+    MarginInfo,
+    MarketHours,
+)
 from threading import Lock
 from ba2_common.logger import logger
 from ba2_common.core.models import AccountSetting
@@ -260,6 +266,183 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
             leverage), which under-deploys rather than over-committing.
         """
         return {}
+
+    #: Upper bound on how stale a cached market-status answer may be, in seconds.
+    #: A CLASS attribute so a bare instance built with object.__new__ (the test
+    #: idiom) still has it. Short on purpose: this is a page-level de-duplicator --
+    #: the wizard asks once per render -- not a day-level cache. The real
+    #: invalidation is the session BOUNDARY below.
+    _MARKET_HOURS_CACHE_TTL = 60
+
+    #: ``(asked_at, answer)``. Declared on the CLASS so a bare instance has it, but
+    #: only ever REBOUND on the instance -- never mutated in place -- so there is no
+    #: shared mutable state between accounts (contrast the per-instance dict in
+    #: AlpacaAccount._margin_info_cache, which is built in __init__).
+    _market_hours_cache: Optional[Tuple[datetime, MarketHours]] = None
+
+    def get_market_hours(self, *, now: Optional[datetime] = None) -> MarketHours:
+        """Whether this account's market is trading, and when that next changes.
+
+        CONCRETE and effectively FINAL: it owns argument validation and the cache.
+        **DO NOT OVERRIDE THIS.** Override ``_get_market_hours_impl`` instead --
+        the same template/impl split as ``submit_order`` / ``_submit_order_impl``
+        (overriding the template with a different shape is what disabled
+        IBKRAccount; see IBKRAccount.py:27-40). An adapter that overrides this
+        method loses the boundary-expiry cache and, if it then calls
+        ``super().get_market_hours()`` from its ``_get_market_hours_impl``,
+        recurses forever.
+
+        CACHING. An entry is reused only while BOTH hold: it is younger than
+        ``_MARKET_HOURS_CACHE_TTL``, and ``now`` has not yet reached the answer's
+        own ``next_transition`` -- i.e. it expires at
+        ``min(now + TTL, next_transition)``. A plain elapsed-seconds TTL -- the
+        shape AlpacaAccount._margin_info_cache uses for asset metadata -- is WRONG
+        here: an entry taken at 15:59:30 would still claim the market is open at
+        16:00:15. ``clear_market_hours_cache()`` is the explicit path.
+
+        An answer whose ``source`` is ``MARKET_HOURS_SOURCE_UNAVAILABLE`` is
+        **never cached**. A failure is not a fact: caching one would keep the
+        wizard blocked for a full TTL after the broker recovered, and this seam is
+        called once per page render, not in a loop, so there is no storm to fear.
+        Broker and fallback answers ARE cached.
+
+        FAILS CLOSED. Any exception out of the implementation is logged and
+        becomes ``MarketHours(is_open=False, source=..._UNAVAILABLE, detail=...)``;
+        use ``MarketHours.is_known`` to tell "shut" from "we could not find out".
+        This method NEVER raises and never propagates.
+
+        Args:
+            now: the instant to describe; must be timezone-aware. Defaults to
+                ``datetime.now(timezone.utc)``. Passing it explicitly is THE way
+                tests freeze time -- preferred over monkeypatching an adapter's
+                ``_utcnow``/``_now_eastern`` -- and it also guarantees the age
+                check and the boundary check below read ONE clock and so cannot
+                disagree.
+
+        Returns:
+            MarketHours: never ``None``.
+
+        Raises:
+            ValueError: when ``now`` is naive. Read as UTC instead of Eastern, a
+                naive instant moves the boundary by four or five hours. This is
+                the ONE thing this method raises, and it is a programming error,
+                not a runtime condition.
+        """
+        if now is None:
+            now = datetime.now(timezone.utc)
+        if now.tzinfo is None or now.tzinfo.utcoffset(now) is None:
+            raise ValueError(
+                "get_market_hours(now=...) requires a timezone-aware datetime; a "
+                "naive one would silently shift the 09:30/16:00 ET boundaries")
+
+        entry = self._market_hours_cache
+        if entry is not None:
+            asked_at, cached = entry
+            age = now - asked_at
+            transition = cached.next_transition
+            if (timedelta(0) <= age < timedelta(seconds=self._MARKET_HOURS_CACHE_TTL)
+                    and (transition is None or now < transition)):
+                return cached
+            self._market_hours_cache = None
+
+        try:
+            hours = self._get_market_hours_impl(now)
+        except Exception as e:
+            logger.error(
+                f"[Account {self.id}] Could not determine market hours: {e}", exc_info=True)
+            hours = MarketHours(
+                is_open=False, source=MARKET_HOURS_SOURCE_UNAVAILABLE, as_of=now,
+                detail=f"Market hours could not be determined: {e}")
+
+        # A failure is retried on the very next call; a real answer is cached until
+        # the earlier of the TTL and the session boundary.
+        self._market_hours_cache = (now, hours) if hours.is_known else None
+        return hours
+
+    def _get_market_hours_impl(self, now: datetime) -> MarketHours:
+        """Broker-specific market status. THIS IS THE OVERRIDE POINT.
+
+        The default is the offline, holiday- and half-day-aware NYSE
+        REGULAR-session calendar (``ba2_common.core.market_calendar``), so a
+        broker that implements nothing still gets a correct answer for a US
+        equities account. It reports closed during extended hours. If the calendar
+        package itself is unusable this degrades to
+        ``MARKET_HOURS_SOURCE_UNAVAILABLE`` -- NOT to an ``is_open=False``
+        fallback, because fetch-failed is not the same as closed.
+
+        RULES FOR AN OVERRIDE:
+          * override THIS method and nothing else. Never override
+            ``get_market_hours`` or ``is_market_open``.
+          * USE the ``now`` you are given. Do not read the wall clock, ``_utcnow()``
+            or ``self._now_eastern()`` inside here -- ``now=`` is the clock-freeze
+            seam every test depends on.
+          * do NOT cache. ``get_market_hours`` already does, with the boundary
+            invariant. Do not add a TTL, a ``_market_hours_cache`` or a
+            session-boundary helper to an adapter.
+          * to fall back to the calendar, call
+            ``dataclasses.replace(super()._get_market_hours_impl(now), detail=reason)``.
+            **Never ``super().get_market_hours()``** -- that is the method that
+            calls this one, so it recurses until the stack dies. And do not force
+            ``source=FALLBACK`` on the result: if the calendar is dead too, the
+            honest answer is UNAVAILABLE.
+          * you MAY raise. ``get_market_hours`` logs it and fails closed.
+
+        Alpaca overrides it from ``TradingClient.get_clock()`` ->
+        ``Clock(timestamp, is_open, next_open, next_close)``
+        (alpaca/trading/models.py:348), leaving ``open_at`` ``None`` while the
+        session is live because ``Clock`` does not publish the current session's
+        start, and stamping ``source=MARKET_HOURS_SOURCE_BROKER``. TastyTrade
+        overrides it from the async ``get_market_sessions(session, exchanges)`` ->
+        ``MarketSession(status, open_at, close_at, next_session, ...)``
+        (tastytrade/market_sessions.py), bridged with ``_run_async``, carrying the
+        raw broker word in ``status``.
+
+        Args:
+            now: the tz-aware instant to describe. A broker that only reports
+                "right now" still stamps it into ``as_of``.
+
+        Returns:
+            MarketHours: with ``source`` set.
+        """
+        # Imported lazily: pandas_market_calendars parses the whole NYSE ruleset on
+        # first use, and merely importing this interface must not pay for that.
+        from ba2_common.core.market_calendar import (
+            MarketCalendarUnavailable, nyse_market_hours)
+        try:
+            return nyse_market_hours(now)
+        except MarketCalendarUnavailable as e:
+            logger.error(
+                f"[Account {self.id}] No offline NYSE calendar, so market hours are "
+                f"UNKNOWN rather than closed: {e}", exc_info=True)
+            return MarketHours(
+                is_open=False, source=MARKET_HOURS_SOURCE_UNAVAILABLE, as_of=now,
+                detail=f"No market-hours source available: {e}")
+
+    def is_market_open(self, *, now: Optional[datetime] = None) -> bool:
+        """Shorthand for ``get_market_hours(now=now).is_open``.
+
+        CONCRETE. **DO NOT OVERRIDE** -- an adapter that overrides this can
+        disagree with the banner, which reads ``get_market_hours()``.
+
+        REGULAR session under the default implementation -- False during extended
+        hours. The Portfolio Allocation wizard only SUBMITS while this is True.
+
+        A failed lookup returns False (fail closed); call ``get_market_hours()``
+        and read ``is_known`` when the caller needs to tell that apart from a
+        genuine closure.
+        """
+        return self.get_market_hours(now=now).is_open
+
+    def clear_market_hours_cache(self) -> None:
+        """Drop the cached market-status answer so the next call refetches.
+
+        The entry expires on its own at the earlier of the TTL and the next
+        session boundary; this is the EXPLICIT path, for a user who hits Refresh
+        -- the counterpart of ``AlpacaAccount.clear_margin_info_cache()``. It lives
+        HERE, on the interface, so no adapter needs one of its own.
+        """
+        self._market_hours_cache = None
+        logger.debug(f"[Account {self.id}] Cleared cached market hours")
 
     @abstractmethod
     def get_positions(self) -> Any:

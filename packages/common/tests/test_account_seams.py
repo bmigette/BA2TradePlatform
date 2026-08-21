@@ -7,8 +7,20 @@ TastyTradeAccount and every stub in the test suite.
 _DictAccount below is the IBKR / TastyTrade shape: get_account_info() returns a
 plain dict. AlpacaAccount's pydantic shape is covered in tests/test_alpaca_account_snapshot.py.
 """
-from ba2_common.core.account_types import AccountSnapshot
+import dataclasses
+from datetime import datetime
+
+import pytest
+
+from ba2_common.core.account_types import (
+    MARKET_HOURS_SOURCE_BROKER,
+    MARKET_HOURS_SOURCE_FALLBACK,
+    MARKET_HOURS_SOURCE_UNAVAILABLE,
+    AccountSnapshot,
+    MarketHours,
+)
 from ba2_common.core.interfaces.ReadOnlyAccountInterface import ReadOnlyAccountInterface
+from ba2_common.core.market_calendar import NY_TZ, clear_nyse_calendar_cache
 
 
 class _DictAccount(ReadOnlyAccountInterface):
@@ -365,3 +377,400 @@ def test_available_qty_never_returns_none():
 def test_symbol_matching_is_case_and_whitespace_insensitive():
     acct = _BookAccount([_Pos("AAPL", 10.0, 7.0)])
     assert acct.get_available_position_quantity(" aapl ") == 7.0
+
+
+# ---------------------------------------------------------------------------
+# Market hours
+# ---------------------------------------------------------------------------
+
+def _ny(year, month, day, hour=0, minute=0, second=0) -> datetime:
+    """A frozen instant in exchange-local time. Every test below pins one."""
+    return datetime(year, month, day, hour, minute, second, tzinfo=NY_TZ)
+
+
+def _capture_errors(monkeypatch):
+    """Collect ``logger.error`` messages emitted by ReadOnlyAccountInterface.
+
+    NOT caplog. Two independent reasons it cannot be used here:
+      * the package logger sets ``propagate = False``
+        (packages/common/ba2_common/logger.py:19, and
+        ba2_trade_platform/logger.py:24 for the app one), so caplog's ROOT handler
+        never sees the record; and
+      * tests/test_penny_gainers_fix.py:53 replaces the logger module with a
+        MagicMock at import time, so under a full-suite collection even
+        re-enabling propagation patches a mock rather than the real logger.
+    Patching the module-under-test's own ``logger`` is immune to both.
+    """
+    import sys
+    # sys.modules, not `from ...interfaces import ReadOnlyAccountInterface`: that
+    # package __init__ re-exports the CLASS under the same name, so the plain
+    # import binds the class and `.logger` would not exist on it.
+    module = sys.modules["ba2_common.core.interfaces.ReadOnlyAccountInterface"]
+    messages = []
+    monkeypatch.setattr(module.logger, "error", lambda msg, *a, **k: messages.append(str(msg)))
+    return messages
+
+
+class _CountingAccount(_DictAccount):
+    """Counts how many times the seam actually reached the implementation."""
+
+    def __init__(self, id=1, info=None):
+        super().__init__(id, info or {})
+        self.impl_calls = 0
+
+    def _get_market_hours_impl(self, now):
+        self.impl_calls += 1
+        return super()._get_market_hours_impl(now)
+
+
+class _BrokerAccount(_DictAccount):
+    """A broker that answers for itself -- the Alpaca / TastyTrade shape."""
+
+    def __init__(self, hours):
+        super().__init__(1, {})
+        self._hours = hours
+        self.seen_now = []
+
+    def _get_market_hours_impl(self, now):
+        self.seen_now.append(now)
+        return self._hours
+
+
+class _DegradingAccount(_DictAccount):
+    """The canonical adapter fallback: broker failed, so defer to super's calendar.
+
+    This is the shape BOTH broker adapters must use. Note super()._get_market_hours_impl,
+    NOT super().get_market_hours() -- the latter calls back into this method.
+    """
+
+    def __init__(self):
+        super().__init__(1, {})
+        self.impl_calls = 0
+
+    def _get_market_hours_impl(self, now):
+        self.impl_calls += 1
+        return dataclasses.replace(super()._get_market_hours_impl(now),
+                                   detail="broker clock endpoint 503")
+
+
+class _ExplodingAccount(_DictAccount):
+    def __init__(self):
+        super().__init__(1, {})
+        self.impl_calls = 0
+
+    def _get_market_hours_impl(self, now):
+        self.impl_calls += 1
+        raise RuntimeError("broker clock endpoint 503")
+
+
+def test_the_default_seam_answers_from_the_nyse_fallback():
+    """A broker that implements nothing still gets a real, holiday-aware answer."""
+    hours = _CountingAccount().get_market_hours(now=_ny(2026, 8, 19, 12, 0))
+
+    assert hours.is_open is True
+    assert hours.source == MARKET_HOURS_SOURCE_FALLBACK
+    assert hours.close_at == _ny(2026, 8, 19, 16, 0)
+
+
+def test_the_default_seam_is_closed_on_an_observed_holiday():
+    """2026-07-03 -- Independence Day observed, July 4 being a Saturday."""
+    assert _CountingAccount().is_market_open(now=_ny(2026, 7, 3, 12, 0)) is False
+
+
+def test_the_default_seam_is_closed_at_the_weekend():
+    assert _CountingAccount().is_market_open(now=_ny(2026, 8, 22, 12, 0)) is False
+
+
+def test_the_default_seam_respects_the_half_day_early_close():
+    acct = _CountingAccount()
+
+    assert acct.is_market_open(now=_ny(2026, 11, 27, 12, 0)) is True
+    acct.clear_market_hours_cache()
+    assert acct.is_market_open(now=_ny(2026, 11, 27, 14, 0)) is False
+
+
+def test_is_market_open_delegates_to_get_market_hours():
+    acct = _BrokerAccount(MarketHours(is_open=True, source=MARKET_HOURS_SOURCE_BROKER))
+
+    assert acct.is_market_open(now=_ny(2026, 8, 22, 12, 0)) is True  # broker overrides the calendar
+
+
+def test_a_broker_override_is_used_verbatim():
+    """The override point is _get_market_hours_impl, never get_market_hours itself,
+    and the broker's answer wins outright -- no cross-check against the calendar."""
+    published = MarketHours(
+        is_open=False,
+        next_open=_ny(2026, 8, 20, 9, 30),
+        next_close=_ny(2026, 8, 20, 16, 0),
+        source=MARKET_HOURS_SOURCE_BROKER,
+        status="Extended",
+    )
+    acct = _BrokerAccount(published)
+
+    assert acct.get_market_hours(now=_ny(2026, 8, 19, 18, 0)) is published
+
+
+def test_the_injected_now_is_handed_to_the_override_not_the_wall_clock():
+    """`now=` is THE clock-freeze seam. An override that ignores it and reads its
+    own clock makes every test of it non-deterministic."""
+    acct = _BrokerAccount(MarketHours(is_open=True, source=MARKET_HOURS_SOURCE_BROKER))
+    frozen = _ny(2026, 8, 19, 12, 0)
+
+    acct.get_market_hours(now=frozen)
+
+    assert acct.seen_now == [frozen]
+
+
+def test_an_adapter_degrades_through_super_impl_without_recursing():
+    """THE shape both broker adapters use on their failure path. If it were written
+    as super().get_market_hours(), this test would blow the stack instead of
+    passing -- get_market_hours() is what calls _get_market_hours_impl()."""
+    acct = _DegradingAccount()
+
+    hours = acct.get_market_hours(now=_ny(2026, 8, 19, 12, 0))
+
+    assert acct.impl_calls == 1
+    assert hours.source == MARKET_HOURS_SOURCE_FALLBACK
+    assert hours.is_open is True
+    assert hours.detail == "broker clock endpoint 503"
+
+
+# --- caching ---------------------------------------------------------------
+
+def test_a_second_call_inside_the_ttl_is_served_from_cache():
+    """The wizard page asks repeatedly; the status changes a few times a day."""
+    acct = _CountingAccount()
+    acct.get_market_hours(now=_ny(2026, 8, 19, 12, 0))
+    acct.get_market_hours(now=_ny(2026, 8, 19, 12, 0, 30))
+
+    assert acct.impl_calls == 1
+
+
+def test_the_ttl_expires():
+    acct = _CountingAccount()
+    acct.get_market_hours(now=_ny(2026, 8, 19, 12, 0))
+    acct.get_market_hours(now=_ny(2026, 8, 19, 12, 1, 1))
+
+    assert acct.impl_calls == 2
+
+
+def test_the_cache_expires_at_the_bell_even_inside_the_ttl():
+    """This is the whole reason a plain elapsed-seconds TTL is wrong here: an entry
+    taken at 15:59:30 must NOT still say "open" at 16:00:01."""
+    acct = _CountingAccount()
+    assert acct.get_market_hours(now=_ny(2026, 8, 19, 15, 59, 30)).is_open is True
+
+    later = acct.get_market_hours(now=_ny(2026, 8, 19, 16, 0, 1))
+
+    assert acct.impl_calls == 2
+    assert later.is_open is False
+
+
+def test_the_cache_expires_at_the_open_even_inside_the_ttl():
+    acct = _CountingAccount()
+    assert acct.get_market_hours(now=_ny(2026, 8, 19, 9, 29, 30)).is_open is False
+
+    assert acct.get_market_hours(now=_ny(2026, 8, 19, 9, 30, 1)).is_open is True
+    assert acct.impl_calls == 2
+
+
+def test_a_broker_answer_is_cached_like_any_other():
+    acct = _BrokerAccount(MarketHours(is_open=True, source=MARKET_HOURS_SOURCE_BROKER))
+    acct.get_market_hours(now=_ny(2026, 8, 19, 12, 0))
+    acct.get_market_hours(now=_ny(2026, 8, 19, 12, 0, 30))
+
+    assert len(acct.seen_now) == 1
+
+
+def test_clear_market_hours_cache_forces_a_refetch():
+    acct = _CountingAccount()
+    acct.get_market_hours(now=_ny(2026, 8, 19, 12, 0))
+    acct.clear_market_hours_cache()
+    acct.get_market_hours(now=_ny(2026, 8, 19, 12, 0, 5))
+
+    assert acct.impl_calls == 2
+
+
+def test_the_cache_is_per_instance_and_never_lands_on_the_class():
+    """A tuple rebound on the instance -- not a dict mutated on the class."""
+    first, second = _CountingAccount(1), _CountingAccount(2)
+    first.get_market_hours(now=_ny(2026, 8, 19, 12, 0))
+    second.get_market_hours(now=_ny(2026, 8, 19, 12, 0))
+
+    assert first.impl_calls == 1 and second.impl_calls == 1
+    assert ReadOnlyAccountInterface._market_hours_cache is None
+
+
+def test_a_cache_entry_is_not_reused_for_an_earlier_instant():
+    """Guards a backwards clock and any caller replaying an older `now`."""
+    acct = _CountingAccount()
+    acct.get_market_hours(now=_ny(2026, 8, 19, 12, 0))
+    acct.get_market_hours(now=_ny(2026, 8, 19, 11, 59))
+
+    assert acct.impl_calls == 2
+
+
+# --- failure -------------------------------------------------------------
+
+def test_a_failing_broker_lookup_fails_closed():
+    """Never "open" on an error. is_known then tells the UI it is a failure, not a
+    genuine closure, and detail carries the reason for the banner."""
+    hours = _ExplodingAccount().get_market_hours(now=_ny(2026, 8, 19, 12, 0))
+
+    assert hours.is_open is False
+    assert hours.source == MARKET_HOURS_SOURCE_UNAVAILABLE
+    assert hours.is_known is False
+    assert "503" in hours.detail
+
+
+def test_an_unavailable_answer_is_never_cached():
+    """A failure is not a fact. Caching it would keep the wizard blocked for a full
+    TTL after the broker recovered; the next call must retry."""
+    acct = _ExplodingAccount()
+    acct.get_market_hours(now=_ny(2026, 8, 19, 12, 0))
+    acct.get_market_hours(now=_ny(2026, 8, 19, 12, 0, 1))
+
+    assert acct.impl_calls == 2
+    assert acct._market_hours_cache is None
+
+
+def test_the_default_impl_degrades_to_unavailable_when_the_calendar_is_missing(monkeypatch):
+    """Broker silent AND calendar dead. Shut for the gate, "unknown" for the UI --
+    NOT a fallback answer, because nothing answered."""
+    import sys
+
+    clear_nyse_calendar_cache()
+    monkeypatch.setitem(sys.modules, "pandas_market_calendars", None)
+    try:
+        hours = _CountingAccount().get_market_hours(now=_ny(2026, 8, 19, 12, 0))
+    finally:
+        clear_nyse_calendar_cache()
+
+    assert hours.is_open is False
+    assert hours.source == MARKET_HOURS_SOURCE_UNAVAILABLE
+    assert hours.is_known is False
+    assert hours.detail
+
+
+def test_an_adapter_degrading_into_a_dead_calendar_reports_unavailable(monkeypatch):
+    """dataclasses.replace(super()._get_market_hours_impl(now), detail=...) must NOT
+    force source=FALLBACK: if the calendar is dead too, the honest answer is
+    UNAVAILABLE, and the UI must be allowed to say so."""
+    import sys
+
+    clear_nyse_calendar_cache()
+    monkeypatch.setitem(sys.modules, "pandas_market_calendars", None)
+    try:
+        hours = _DegradingAccount().get_market_hours(now=_ny(2026, 8, 19, 12, 0))
+    finally:
+        clear_nyse_calendar_cache()
+
+    assert hours.source == MARKET_HOURS_SOURCE_UNAVAILABLE
+    assert hours.is_known is False
+    assert hours.detail == "broker clock endpoint 503"
+
+
+def test_get_market_hours_never_propagates_an_exception():
+    """It is called from a UI render path and from the money path. Whatever an
+    adapter does, this returns a MarketHours."""
+    hours = _ExplodingAccount().get_market_hours(now=_ny(2026, 8, 19, 12, 0))
+
+    assert isinstance(hours, MarketHours)
+
+
+def test_is_market_open_is_false_when_the_lookup_failed():
+    assert _ExplodingAccount().is_market_open(now=_ny(2026, 8, 19, 12, 0)) is False
+
+
+def test_a_failing_lookup_is_logged_as_an_error(monkeypatch):
+    errors = _capture_errors(monkeypatch)
+
+    _ExplodingAccount().get_market_hours(now=_ny(2026, 8, 19, 12, 0))
+
+    assert any("market hours" in e.lower() for e in errors), errors
+
+
+def test_a_naive_now_is_refused_rather_than_guessed():
+    with pytest.raises(ValueError, match="timezone-aware"):
+        _CountingAccount().get_market_hours(now=datetime(2026, 8, 19, 12, 0))
+
+
+# --- gaps found by mutation ------------------------------------------------
+
+def test_a_naive_now_is_refused_BEFORE_the_implementation_is_reached():
+    """Found by mutation: deleting the seam's own naive check left
+    test_a_naive_now_is_refused_rather_than_guessed green, because the ValueError
+    then came from a DOUBLE FAULT instead -- the calendar raised, and building the
+    UNAVAILABLE MarketHours(as_of=<naive now>) raised again from inside the except
+    handler. Same exception type, same "timezone-aware" text, but
+    get_market_hours had propagated out of its own error path, breaking its
+    documented "NEVER raises and never propagates".
+
+    Pinning impl_calls == 0 is what distinguishes "the seam refused it up front"
+    from "it ran the whole lookup and blew up on the way out".
+    """
+    acct = _CountingAccount()
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        acct.get_market_hours(now=datetime(2026, 8, 19, 12, 0))
+
+    assert acct.impl_calls == 0
+
+
+def test_the_cache_is_already_stale_AT_the_bell_not_just_after_it():
+    """Found by mutation: `now <= transition` survived every other test, because
+    the nearest one asks at 16:00:01. The stale answer at exactly 16:00:00 is the
+    dangerous one -- it is the first instant an opening market order is refused,
+    and a cache taken 30 seconds earlier would still be saying "open".
+    """
+    acct = _CountingAccount()
+    assert acct.get_market_hours(now=_ny(2026, 8, 19, 15, 59, 30)).is_open is True
+
+    at_the_bell = acct.get_market_hours(now=_ny(2026, 8, 19, 16, 0, 0))
+
+    assert acct.impl_calls == 2
+    assert at_the_bell.is_open is False
+
+
+# --- the override contract, pinned structurally ----------------------------
+
+def test_get_market_hours_and_is_market_open_are_concrete_on_the_interface():
+    """The template/impl split, asserted on the CLASS rather than in prose.
+
+    ``get_market_hours`` and ``is_market_open`` are defined HERE and are
+    effectively FINAL; ``_get_market_hours_impl`` is the sole override point. An
+    adapter that overrides a template method loses the boundary-expiry cache --
+    the same mistake that disabled IBKRAccount's submit_order.
+    """
+    for name in ("get_market_hours", "is_market_open", "clear_market_hours_cache",
+                 "_get_market_hours_impl"):
+        assert name in vars(ReadOnlyAccountInterface), name
+        assert not getattr(getattr(ReadOnlyAccountInterface, name),
+                           "__isabstractmethod__", False), name
+
+
+def test_calling_super_get_market_hours_from_an_override_re_enters_the_template():
+    """WHY the contract says ``super()._get_market_hours_impl(now)``.
+
+    Both broker adapters were originally written with ``super().get_market_hours()``
+    on their failure path and it was caught in review. This pins what that costs,
+    because the damage is SILENT: ``get_market_hours`` catches Exception, and
+    RecursionError is one, so the stack blows and is then swallowed into a
+    permanent "unavailable" -- the wizard refuses to submit forever, with hundreds
+    of re-entries burned on every UI render, and nothing crashes to say so.
+    """
+    class _RecursingAccount(_DictAccount):
+        def __init__(self):
+            super().__init__(1, {})
+            self.impl_calls = 0
+
+        def _get_market_hours_impl(self, now):
+            self.impl_calls += 1
+            return self.get_market_hours(now=now)   # THE BUG: re-enters the template
+
+    acct = _RecursingAccount()
+    hours = acct.get_market_hours(now=_ny(2026, 8, 19, 12, 0))
+
+    assert acct.impl_calls > 50           # re-entered, not called once
+    assert hours.source == MARKET_HOURS_SOURCE_UNAVAILABLE
+    assert hours.is_known is False        # ... and swallowed, so nothing crashes
