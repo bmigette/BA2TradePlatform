@@ -10,8 +10,8 @@ import pytest
 from ba2_trade_platform.core.portfolio_allocation import PositionFetchFailed
 from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
     GATE_HAS_EXPERTS, GATE_NOT_MANUAL, GATE_NO_ACCOUNT, GATE_OK,
-    ManagedLabel, build_label_views, collect_managed_symbols, evaluate_gate,
-    filter_selectable_labels, is_machine_label, positions_by_symbol,
+    ManagedLabel, build_label_views, collect_managed_symbols, diff_managed_labels,
+    evaluate_gate, filter_selectable_labels, is_machine_label, positions_by_symbol,
 )
 
 
@@ -322,3 +322,45 @@ def test_collect_managed_symbols_normalises_before_it_dedupes():
     back to the broker's stale market value.
     """
     assert collect_managed_symbols({'ARK26': ['tsla'], 'HighRisk': [' TSLA ']}) == ['TSLA']
+
+
+# --- the label picker's eager-persistence diff -----------------------------
+
+def test_diff_managed_labels_reports_additions_and_removals():
+    to_add, to_remove = diff_managed_labels(['ARK26', 'HighRisk'], ['ARK26', 'NASDAQ30'])
+    assert to_add == ['NASDAQ30']
+    assert to_remove == ['HighRisk']
+
+
+def test_diff_managed_labels_unchanged_selection_is_two_empty_lists():
+    """Eager persistence fires on every change event; an unchanged selection must
+    be a no-op rather than a pointless write."""
+    assert diff_managed_labels(['ARK26'], ['ARK26']) == ([], [])
+
+
+def test_diff_managed_labels_is_order_independent():
+    assert diff_managed_labels(['A', 'B'], ['B', 'A']) == ([], [])
+
+
+def test_diff_managed_labels_from_nothing_adds_everything():
+    to_add, to_remove = diff_managed_labels([], ['ARK26', 'HighRisk'])
+    assert to_add == ['ARK26', 'HighRisk']
+    assert to_remove == []
+
+
+def test_diff_managed_labels_ignores_blank_and_none_entries():
+    to_add, to_remove = diff_managed_labels(['ARK26', None], ['ARK26', '  '])
+    assert (to_add, to_remove) == ([], [])
+
+
+def test_diff_managed_labels_is_case_sensitive_because_labels_are():
+    """'ark26' and 'ARK26' are two DIFFERENT baskets, not one typed two ways.
+
+    Instrument labels are matched raw by ``get_symbols_by_label``, so folding
+    case here would make the picker report "no change" while the account ends up
+    managing a label that resolves to no instruments at all. This is the same
+    deliberate asymmetry as ``filter_selectable_labels``, which sorts
+    case-insensitively but de-duplicates case-sensitively.
+    """
+    to_add, to_remove = diff_managed_labels(['ARK26'], ['ark26'])
+    assert (to_add, to_remove) == (['ark26'], ['ARK26'])

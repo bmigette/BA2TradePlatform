@@ -367,3 +367,20 @@ def filter_selectable_labels(all_labels, show_all: bool = False) -> List[str]:
         if show_all or not is_machine_label(text):
             kept.append(text)
     return sorted(kept, key=lambda s: s.lower())
+
+
+def diff_managed_labels(current, selected):
+    """Return ``(to_add, to_remove)`` for a managed-label selection change. Pure.
+
+    Both sides are normalised (stripped, de-duplicated, blank/None dropped) and the
+    results are sorted, so persistence is order-independent and idempotent:
+    re-saving the same selection returns two empty lists, which lets the eager
+    on-change handler skip a pointless write.
+
+    Case is NOT folded: ``get_symbols_by_label`` matches instrument labels raw, so
+    'ark26' and 'ARK26' are two different baskets and swapping one for the other
+    is a real change.
+    """
+    cur = {s.strip() for s in (current or []) if s and s.strip()}
+    sel = {s.strip() for s in (selected or []) if s and s.strip()}
+    return sorted(sel - cur), sorted(cur - sel)

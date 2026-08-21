@@ -1,9 +1,17 @@
 """Portfolio Allocation page — manually traded accounts only.
 
 Shows the account's current allocation, grouped by the instrument labels the user
-chose to manage. Every decision this page makes lives in the pure, unit-tested
-module ``ba2_trade_platform/ui/utils/portfolio_allocation_view.py``; this file only
-does IO (broker + DB) and draws widgets.
+chose to manage, and lets those labels, their symbols and their comments be
+edited. Every decision this page makes lives in the pure, unit-tested module
+``ba2_trade_platform/ui/utils/portfolio_allocation_view.py``; this file only does
+IO (broker + DB) and draws widgets.
+
+Everything persists ON CHANGE, not behind a Save button: switching the global
+account calls ``ui.run_javascript('window.location.reload()')``
+(``ui/layout.py``), so the page never gets a chance to flush a pending edit.
+Symbols can be added to or removed from a label whether or not they have an open
+position, and a symbol carrying two managed labels is allowed — it just gets a
+warning icon.
 
 Two house rules are load-bearing here:
 
@@ -36,12 +44,17 @@ from sqlmodel import select
 
 from ...core.db import get_db
 from ...core.models import ExpertInstance
-from ...core.portfolio_allocation_store import get_managed_labels, get_symbol_comments
+from ...core.portfolio_allocation_store import (
+    add_symbols_to_label, get_managed_labels, get_symbol_comments, get_symbol_weights,
+    remove_symbols_from_label, replace_managed_labels, set_managed_label,
+    set_symbol_weight,
+)
 from ...logger import logger
 from ..account_filter_context import get_selected_account_id
 from ..utils.portfolio_allocation_view import (
     GATE_NO_ACCOUNT, GateResult, ManagedLabel, PositionFetchFailed,
-    build_label_views, collect_managed_symbols, evaluate_gate, positions_by_symbol,
+    build_label_views, collect_managed_symbols, diff_managed_labels, evaluate_gate,
+    filter_selectable_labels, positions_by_symbol,
 )
 
 
@@ -123,6 +136,140 @@ def _load_view_payload(account_id: int) -> Dict[str, Any]:
     }
 
 
+def _load_picker_data(account_id: int) -> Dict[str, List[str]]:
+    """Current managed labels plus every label in use, for the picker dialog."""
+    from ...core.utils import get_all_instrument_labels
+
+    return {
+        'current': [row.label for row in get_managed_labels(account_id)],
+        'all_labels': get_all_instrument_labels(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Eager persistence handlers (no Save button -- switching the global account
+# hard-reloads the document, so a pending edit would be lost)
+# ---------------------------------------------------------------------------
+
+def _save_label_comment(account_id: int, label: str, value: str) -> None:
+    try:
+        set_managed_label(account_id, label, comment=value or "")
+    except Exception as e:
+        logger.error(f"Saving comment for label '{label}' failed: {e}", exc_info=True)
+        ui.notify(f'Could not save comment: {e}', type='negative')
+
+
+def _save_symbol_comment(account_id: int, label: str, symbol: str, value: str,
+                         label_symbols: List[str]) -> None:
+    """Persist a symbol's comment WITHOUT moving its allocation.
+
+    ``set_symbol_weight`` is the one writer for this row, and creating a row makes
+    the weight EXPLICIT — a bare ``comment=`` write would create it at the model
+    default of 0.0 and the engine reads 0 as "hold none of this", so the next
+    rebalance would sell a position the user only wrote a note about. So the
+    symbol's current EFFECTIVE weight (its stored value, or the even-split default
+    it was silently taking) is passed alongside the comment, which pins it at
+    exactly the number it already had. ``weight_pct == 0.0`` deliberately stays a
+    legitimate explicit zero and is never re-read as "unstored" — doing that would
+    re-introduce drift from the engine's ``build_symbol_targets``.
+
+    ``label_symbols`` must be the label's FULL symbol list: the even-split default
+    is only correct when every symbol sharing the 100% is known.
+
+    Side effect, accepted: the symbol's weight stops floating with the even split,
+    so a symbol added to the label later re-splits only what is left. That is the
+    documented meaning of a stored row, and it is strictly better than the zeroing
+    it replaces.
+    """
+    try:
+        effective = get_symbol_weights(account_id, label, label_symbols)
+        set_symbol_weight(account_id, label, symbol,
+                          weight_pct=effective.get(symbol), comment=value or "")
+    except Exception as e:
+        logger.error(f"Saving comment for {label}/{symbol} failed: {e}", exc_info=True)
+        ui.notify(f'Could not save comment: {e}', type='negative')
+
+
+def _open_add_symbol_dialog(account_id: int, label: str, refresh) -> None:
+    with ui.dialog() as dialog, ui.card().classes('min-w-[420px]'):
+        ui.label(f"Add symbols to '{label}'").classes('text-h6')
+        ui.label('Comma-separated. A symbol does not need an open position.'
+                 ).classes('text-xs text-secondary-custom')
+        entry = ui.input('Symbols', placeholder='AAPL, MSFT').classes('w-full')
+
+        async def _apply() -> None:
+            symbols = [s.strip().upper() for s in (entry.value or '').split(',') if s.strip()]
+            if not symbols:
+                ui.notify('Enter at least one symbol', type='warning')
+                return
+            try:
+                added = await asyncio.to_thread(add_symbols_to_label, account_id, label, symbols)
+            except Exception as e:
+                logger.error(f"Adding {symbols} to '{label}' failed: {e}", exc_info=True)
+                ui.notify(f'Could not add: {e}', type='negative')
+                return
+            ui.notify(f"Added {added} symbol(s) to '{label}'", type='positive')
+            dialog.close()
+            await refresh()
+
+        with ui.row().classes('w-full justify-end gap-2 mt-4'):
+            ui.button('Cancel', on_click=dialog.close).props('flat')
+            ui.button('Add', on_click=_apply).props('color=primary')
+    dialog.open()
+
+
+def _open_label_picker(account_id: int, refresh) -> None:
+    """Pick which labels this account manages. Persists on every change."""
+    try:
+        data = _load_picker_data(account_id)
+    except Exception as e:
+        logger.error(f"Loading labels for account {account_id} failed: {e}", exc_info=True)
+        ui.notify(f'Could not load labels: {e}', type='negative')
+        return
+
+    current = list(data['current'])
+    all_labels = data['all_labels']
+
+    with ui.dialog() as dialog, ui.card().classes('min-w-[520px]'):
+        ui.label('Managed labels').classes('text-h6')
+        ui.label('Machine tags (auto_added, expert_selected, ai_selected, not_found and '
+                 'the penny-N / tradingagents-N / fmprating-N families) are hidden.'
+                 ).classes('text-xs text-secondary-custom')
+
+        async def _persist(e) -> None:
+            selected = list(e.value or [])
+            to_add, to_remove = diff_managed_labels(current, selected)
+            if not to_add and not to_remove:
+                return
+            try:
+                await asyncio.to_thread(replace_managed_labels, account_id, selected)
+            except Exception as exc:
+                logger.error(f"Saving managed labels for account {account_id} failed: {exc}",
+                             exc_info=True)
+                ui.notify(f'Could not save: {exc}', type='negative')
+                return
+            current[:] = selected
+            ui.notify(f'Managed labels updated (+{len(to_add)} / -{len(to_remove)})',
+                      type='positive')
+
+        picker = ui.select(filter_selectable_labels(all_labels), value=list(current),
+                           multiple=True, label='Labels', on_change=_persist
+                           ).props('dense outlined use-chips').classes('w-full')
+
+        ui.switch('Show all labels (including machine tags)',
+                  on_change=lambda e: picker.set_options(
+                      filter_selectable_labels(all_labels, show_all=bool(e.value)),
+                      value=picker.value))
+
+        async def _close() -> None:
+            dialog.close()
+            await refresh()
+
+        with ui.row().classes('w-full justify-end gap-2 mt-4'):
+            ui.button('Close', on_click=_close).props('color=primary')
+    dialog.open()
+
+
 # ---------------------------------------------------------------------------
 # Rendering (eyeball-only; all decisions already made above)
 # ---------------------------------------------------------------------------
@@ -139,10 +286,17 @@ def _render_gate_blocked(gate: GateResult) -> None:
                           on_click=lambda: ui.navigate.to('/settings')).props('outline')
 
 
-def _render_label_body(view) -> None:
-    """One managed label's symbol table."""
-    if view.comment:
-        ui.label(view.comment).classes('text-xs text-secondary-custom')
+def _render_label_body(account_id: int, view, refresh) -> None:
+    """One managed label's comment box, symbol table and add/remove controls."""
+    label_symbols = [r.symbol for r in view.rows]
+
+    with ui.row().classes('w-full items-center gap-2'):
+        ui.input('Label comment', value=view.comment or '',
+                 on_change=lambda e, lbl=view.label: _save_label_comment(account_id, lbl, e.value)
+                 ).props('dense outlined').classes('flex-grow')
+        ui.button('Add symbol', icon='add',
+                  on_click=lambda lbl=view.label: _open_add_symbol_dialog(account_id, lbl, refresh)
+                  ).props('outline dense')
 
     rows = [{
         'flag': '⚠' if r.multi_label else '',
@@ -172,20 +326,49 @@ def _render_label_body(view) -> None:
         {'name': 'comment', 'label': 'Comment', 'field': 'comment', 'align': 'left'},
     ]
 
-    table = ui.table(columns=columns, rows=rows, row_key='symbol').classes('w-full dark-pagination')
+    table = ui.table(columns=columns, rows=rows, row_key='symbol',
+                     selection='multiple').classes('w-full dark-pagination')
     table.add_slot('body-cell-flag', r'''
         <q-td :props="props">
             <span v-if="props.value" :title="'Also in: ' + props.row.labels"
                   style="color:#f6ad55;font-weight:600">{{ props.value }}</span>
         </q-td>
     ''')
+    table.add_slot('body-cell-comment', r'''
+        <q-td :props="props">
+            <q-input :model-value="props.value" dense borderless
+                     @update:model-value="(val) => $parent.$emit('commentChange', props.row.symbol, val)" />
+        </q-td>
+    ''')
+    table.on('commentChange',
+             lambda e, lbl=view.label, syms=label_symbols: _save_symbol_comment(
+                 account_id, lbl, e.args[0], e.args[1], syms))
+
+    async def _remove_selected() -> None:
+        symbols = [r['symbol'] for r in (table.selected or [])]
+        if not symbols:
+            ui.notify('Tick one or more symbols first', type='warning')
+            return
+        try:
+            removed = await asyncio.to_thread(
+                remove_symbols_from_label, account_id, view.label, symbols)
+        except Exception as e:
+            logger.error(f"Removing {symbols} from '{view.label}' failed: {e}", exc_info=True)
+            ui.notify(f'Could not remove: {e}', type='negative')
+            return
+        ui.notify(f"Removed {removed} symbol(s) from '{view.label}'", type='positive')
+        await refresh()
+
+    with ui.row().classes('w-full justify-end'):
+        ui.button('Remove selected from label', icon='delete', on_click=_remove_selected
+                  ).props('outline color=negative dense')
 
 
-def _render_labels(payload: Dict[str, Any]) -> None:
+def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
     views = payload['views']
     if not views:
         with ui.element('div').classes('alert-banner info w-full p-3'):
-            ui.label('No labels are managed for this account yet.')
+            ui.label('No labels are managed for this account yet — click "Manage labels".')
         return
 
     total = sum(v.current_value for v in views)
@@ -205,7 +388,7 @@ def _render_labels(payload: Dict[str, Any]) -> None:
         header = (f'{view.label} — ${view.current_value:,.2f} '
                   f'({view.pct_of_total:.1f}% of managed, target {view.target_pct:.1f}%)')
         with ui.expansion(header, icon='label').classes('w-full'):
-            _render_label_body(view)
+            _render_label_body(account_id, view, refresh)
 
 
 async def content() -> None:
@@ -251,9 +434,11 @@ async def content() -> None:
                 return
             body.clear()
             with body:
-                _render_labels(payload)
+                _render_labels(account_id, payload, _refresh)
 
         with toolbar:
+            ui.button('Manage labels', icon='pie_chart',
+                      on_click=lambda: _open_label_picker(account_id, _refresh)).props('outline')
             ui.button('Refresh', icon='refresh', on_click=_refresh).props('outline')
 
         await _refresh()
