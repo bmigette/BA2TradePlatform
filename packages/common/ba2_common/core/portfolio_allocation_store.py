@@ -3,10 +3,12 @@
 Pure DB code -- it never talks to a broker and never touches NiceGUI. What it
 borrows from the allocation ENGINE (``ba2_common.core.portfolio_allocation``) is
 deliberately tiny: the two ``VALUATION_MODE_*`` constants, so that the page, the
-store and the engine cannot disagree on the spelling of a mode, and
+store and the engine cannot disagree on the spelling of a mode;
 ``even_split_pct``, so that the default weights this module hands the page are
-bit-for-bit the ones the engine would compute. The UI calls these helpers; the
-engine receives the plain values they produce.
+bit-for-bit the ones the engine would compute; and ``consume_income_events``, so
+that the FIFO rule exists exactly once. The UI calls these helpers; the engine
+receives the plain values they produce. The dependency only ever runs store ->
+engine: the engine stays IO-free and must never import this module.
 
 Two rules the callers depend on:
 
@@ -34,6 +36,7 @@ from ba2_common.core.models import (
 from ba2_common.core.portfolio_allocation import (
     VALUATION_MODE_COST,
     VALUATION_MODE_MARKET,
+    consume_income_events,
     even_split_pct,
 )
 from ba2_common.logger import logger
@@ -452,3 +455,56 @@ def get_income_events_since(account_id: int, since: Date) -> List[PortfolioIncom
         rows = list(rows)
         session.expunge_all()
         return rows
+
+
+def consume_income(account_id: int, net_buy_value: float) -> List[Tuple[int, float]]:
+    """FIFO-consume the income ledger against a run's NET buy value.
+
+    ``net_buy_value`` is ``max(0, submitted_buy_value - submitted_sell_value)``: a
+    rebalance funded entirely by its own sells consumes nothing. Anything ``<= 0``
+    consumes nothing and returns ``[]``.
+
+    Events are spent oldest-first -- ``event_date`` then ``id``, the SAME order
+    ``get_open_income_events()`` promises -- and the LAST one may be PARTIAL, its
+    remainder staying open for the next run.
+
+    The FIFO arithmetic itself is NOT re-derived here: it is the engine's pure
+    ``consume_income_events``, so the rule exists exactly once and the service
+    layer's dry-run preview cannot drift from what this actually writes. All this
+    function adds is the IO -- load in order, apply the takes, commit.
+
+    Events whose ``open_amount`` is 0 are skipped, which covers the over-consumed
+    case: a DIVNRA tax leg can restate a dividend BELOW its ``consumed_amount``
+    (deliberately left alone, as the true record of what was spent), and
+    ``open_amount`` clamps at 0 rather than going negative.
+
+    Returns:
+        List[Tuple[int, float]]: ``[(income_event_id, amount_consumed)]`` for the
+        events actually touched, oldest first. The total may be LESS than
+        ``net_buy_value`` when the ledger cannot cover it; buying power, not the
+        ledger, is the feasibility constraint.
+    """
+    budget = float(net_buy_value)
+    if budget <= 0:
+        return []
+    with get_db() as session:
+        rows = session.exec(
+            select(PortfolioIncomeEvent)
+            .where(PortfolioIncomeEvent.account_id == account_id)
+            .order_by(PortfolioIncomeEvent.event_date, PortfolioIncomeEvent.id)
+        ).all()
+        # open_amount is a PROPERTY, not a column, so it cannot be filtered in SQL;
+        # the rows are still attached here, which is what makes reading it legal.
+        open_rows = [row for row in rows if row.open_amount > 0]
+        consumed = consume_income_events(
+            [(row.id, row.open_amount) for row in open_rows], budget)
+        by_id = {row.id: row for row in open_rows}
+        for event_id, take in consumed:
+            row = by_id[event_id]
+            row.consumed_amount = (row.consumed_amount or 0.0) + take
+            session.add(row)
+        if consumed:
+            session.commit()
+    logger.info(f"Allocation run consumed {len(consumed)} income event(s) for account "
+                f"{account_id} against a net buy value of {net_buy_value:.2f}")
+    return consumed

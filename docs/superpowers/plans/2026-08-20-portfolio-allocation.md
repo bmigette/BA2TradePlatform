@@ -4078,10 +4078,21 @@ Append to the end of `tests/test_portfolio_allocation_store.py`:
 
 # --- FIFO consumption ------------------------------------------------------
 
-def test_consuming_with_a_zero_net_buy_value_consumes_nothing(account_id):
+def test_consuming_with_a_zero_or_negative_net_buy_value_consumes_nothing(account_id):
     store.upsert_income_event(account_id, "csd-1", date(2026, 8, 1), "DEPOSIT", 1000.0)
     assert store.consume_income(account_id, 0.0) == []
-    assert store.get_open_income_total(account_id) == 1000.0
+    # A rebalance whose sells outweigh its buys is funded by itself, not by income.
+    assert store.consume_income(account_id, -250.0) == []
+    assert store.get_open_income_total(account_id) == pytest.approx(1000.0)
+
+
+def test_consuming_a_sub_cent_net_buy_value_writes_nothing(account_id):
+    """Below the engine's MONEY_EPSILON there is nothing worth a ledger write.
+    Inherited from ``consume_income_events`` -- an inline FIFO walk here would
+    instead persist a 1e-7 consumption on the oldest event."""
+    store.upsert_income_event(account_id, "csd-1", date(2026, 8, 1), "DEPOSIT", 1000.0)
+    assert store.consume_income(account_id, 1e-7) == []
+    assert store.get_open_income_events(account_id)[0].consumed_amount == 0.0
 
 
 def test_consuming_partially_leaves_a_remainder_open(account_id):
@@ -4089,21 +4100,32 @@ def test_consuming_partially_leaves_a_remainder_open(account_id):
     assert store.consume_income(account_id, 300.0) == [(event.id, 300.0)]
     open_events = store.get_open_income_events(account_id)
     assert len(open_events) == 1
-    assert open_events[0].consumed_amount == 300.0
-    assert open_events[0].open_amount == 700.0
+    assert open_events[0].consumed_amount == pytest.approx(300.0)
+    assert open_events[0].open_amount == pytest.approx(700.0)
 
 
 def test_consuming_spends_the_oldest_event_first_then_spills_over(account_id):
     first = store.upsert_income_event(account_id, "a", date(2026, 8, 1), "DEPOSIT", 100.0)
     second = store.upsert_income_event(account_id, "b", date(2026, 8, 5), "DIVIDEND", 500.0)
     assert store.consume_income(account_id, 250.0) == [(first.id, 100.0), (second.id, 150.0)]
-    assert store.get_open_income_total(account_id) == 350.0
+    assert store.get_open_income_total(account_id) == pytest.approx(350.0)
+
+
+def test_consuming_broker_cents_leaves_the_right_remainder(account_id):
+    """Real amounts are not round, so the remainder is only approximately exact."""
+    a = store.upsert_income_event(account_id, "a", date(2026, 8, 1), "DIVIDEND", 10.01, symbol="AAPL")
+    b = store.upsert_income_event(account_id, "b", date(2026, 8, 2), "DIVIDEND", 20.02, symbol="MSFT")
+    c = store.upsert_income_event(account_id, "c", date(2026, 8, 3), "DIVIDEND", 30.03, symbol="KO")
+    taken = store.consume_income(account_id, 45.0)
+    assert [event_id for event_id, _ in taken] == [a.id, b.id, c.id]
+    assert sum(amount for _, amount in taken) == pytest.approx(45.0)
+    assert store.get_open_income_total(account_id) == pytest.approx(15.06)
 
 
 def test_consuming_more_than_the_ledger_holds_empties_it_without_error(account_id):
     store.upsert_income_event(account_id, "a", date(2026, 8, 1), "DEPOSIT", 100.0)
     consumed = store.consume_income(account_id, 9999.0)
-    assert sum(amount for _, amount in consumed) == 100.0
+    assert sum(amount for _, amount in consumed) == pytest.approx(100.0)
     assert store.get_open_income_total(account_id) == 0.0
 
 
@@ -4118,6 +4140,23 @@ def test_fully_consumed_events_drop_out_of_the_open_list(account_id):
     assert store.get_open_income_total(account_id) == 0.0
 
 
+def test_an_event_restated_below_what_it_already_spent_is_skipped(account_id):
+    """``consumed_amount > amount`` is reachable: a DIVNRA tax leg restates a
+    dividend downward AFTER a run consumed the gross. ``open_amount`` clamps at 0,
+    so the event must simply be skipped -- never contribute a negative take."""
+    store.upsert_income_event(account_id, "div-1", date(2026, 8, 1), "DIVIDEND", 100.0, symbol="AAPL")
+    store.consume_income(account_id, 100.0)
+    store.upsert_income_event(account_id, "div-1", date(2026, 8, 1), "DIVIDEND", 60.0, symbol="AAPL")
+    later = store.upsert_income_event(account_id, "csd-2", date(2026, 8, 2), "DEPOSIT", 500.0)
+
+    assert store.consume_income(account_id, 200.0) == [(later.id, 200.0)]
+    assert store.get_open_income_total(account_id) == pytest.approx(300.0)
+    over_consumed = {e.external_id: e for e in
+                     store.get_income_events_since(account_id, date(2026, 8, 1))}["div-1"]
+    assert over_consumed.consumed_amount == pytest.approx(100.0)   # the TRUE spend, not clamped
+    assert over_consumed.open_amount == 0.0
+
+
 def test_consumption_is_scoped_to_one_account(account_id):
     from tests.factories import create_account_definition
     other = create_account_definition(name="Other Account")
@@ -4125,8 +4164,13 @@ def test_consumption_is_scoped_to_one_account(account_id):
     store.upsert_income_event(other.id, "a", date(2026, 8, 1), "DEPOSIT", 100.0)
     store.consume_income(account_id, 100.0)
     assert store.get_open_income_total(account_id) == 0.0
-    assert store.get_open_income_total(other.id) == 100.0
+    assert store.get_open_income_total(other.id) == pytest.approx(100.0)
 ```
+
+Totals are compared with `pytest.approx`: `get_open_income_total` SUMS floats, and real
+broker cents drift (10.01 + 20.02 + 30.03 consumed by 45.00 leaves `15.059999999999999`,
+not `15.06`). The round-number cases would pass either way; using approx throughout stops
+the next person copying an exact-equality assertion into a case where it flakes.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -4135,7 +4179,32 @@ Expected: FAIL — `AttributeError: module 'ba2_common.core.portfolio_allocation
 
 - [ ] **Step 3: Write minimal implementation**
 
-Append to the end of `packages/common/ba2_common/core/portfolio_allocation_store.py`:
+Add `consume_income_events` to the existing engine import at the top of
+`packages/common/ba2_common/core/portfolio_allocation_store.py`:
+
+```python
+from ba2_common.core.portfolio_allocation import (
+    VALUATION_MODE_COST,
+    VALUATION_MODE_MARKET,
+    consume_income_events,
+    even_split_pct,
+)
+```
+
+and extend the module docstring's list of what the store borrows from the engine, so it
+stays an accurate inventory:
+
+```python
+deliberately tiny: the two ``VALUATION_MODE_*`` constants, so that the page, the
+store and the engine cannot disagree on the spelling of a mode;
+``even_split_pct``, so that the default weights this module hands the page are
+bit-for-bit the ones the engine would compute; and ``consume_income_events``, so
+that the FIFO rule exists exactly once. The UI calls these helpers; the engine
+receives the plain values they produce. The dependency only ever runs store ->
+engine: the engine stays IO-free and must never import this module.
+```
+
+Then append to the end of the same file:
 
 ```python
 
@@ -4147,8 +4216,19 @@ def consume_income(account_id: int, net_buy_value: float) -> List[Tuple[int, flo
     rebalance funded entirely by its own sells consumes nothing. Anything ``<= 0``
     consumes nothing and returns ``[]``.
 
-    Events are spent oldest-first and the LAST one may be PARTIAL -- its remainder
-    stays open for the next run.
+    Events are spent oldest-first -- ``event_date`` then ``id``, the SAME order
+    ``get_open_income_events()`` promises -- and the LAST one may be PARTIAL, its
+    remainder staying open for the next run.
+
+    The FIFO arithmetic itself is NOT re-derived here: it is the engine's pure
+    ``consume_income_events``, so the rule exists exactly once and the service
+    layer's dry-run preview cannot drift from what this actually writes. All this
+    function adds is the IO -- load in order, apply the takes, commit.
+
+    Events whose ``open_amount`` is 0 are skipped, which covers the over-consumed
+    case: a DIVNRA tax leg can restate a dividend BELOW its ``consumed_amount``
+    (deliberately left alone, as the true record of what was spent), and
+    ``open_amount`` clamps at 0 rather than going negative.
 
     Returns:
         List[Tuple[int, float]]: ``[(income_event_id, amount_consumed)]`` for the
@@ -4156,27 +4236,25 @@ def consume_income(account_id: int, net_buy_value: float) -> List[Tuple[int, flo
         ``net_buy_value`` when the ledger cannot cover it; buying power, not the
         ledger, is the feasibility constraint.
     """
-    remaining = float(net_buy_value)
-    if remaining <= 0:
+    budget = float(net_buy_value)
+    if budget <= 0:
         return []
-    consumed: List[Tuple[int, float]] = []
     with get_db() as session:
         rows = session.exec(
             select(PortfolioIncomeEvent)
             .where(PortfolioIncomeEvent.account_id == account_id)
             .order_by(PortfolioIncomeEvent.event_date, PortfolioIncomeEvent.id)
         ).all()
-        for row in rows:
-            if remaining <= 0:
-                break
-            open_amount = row.open_amount
-            if open_amount <= 0:
-                continue
-            take = min(open_amount, remaining)
+        # open_amount is a PROPERTY, not a column, so it cannot be filtered in SQL;
+        # the rows are still attached here, which is what makes reading it legal.
+        open_rows = [row for row in rows if row.open_amount > 0]
+        consumed = consume_income_events(
+            [(row.id, row.open_amount) for row in open_rows], budget)
+        by_id = {row.id: row for row in open_rows}
+        for event_id, take in consumed:
+            row = by_id[event_id]
             row.consumed_amount = (row.consumed_amount or 0.0) + take
             session.add(row)
-            consumed.append((row.id, take))
-            remaining -= take
         if consumed:
             session.commit()
     logger.info(f"Allocation run consumed {len(consumed)} income event(s) for account "
@@ -4184,10 +4262,19 @@ def consume_income(account_id: int, net_buy_value: float) -> List[Tuple[int, flo
     return consumed
 ```
 
+> **Why this delegates instead of walking the rows itself.** Task 74's
+> `consume_income_for_run` already documents this store function as the one that
+> "delegates the FIFO arithmetic to the pure `portfolio_allocation.consume_income_events`",
+> so an inline walk here would have been a second implementation of the rule and
+> contradicted the plan downstream. Delegating also inherits the engine's
+> `MONEY_EPSILON` stop condition: an inline `remaining <= 0` loop persists a 1e-7
+> consumption for a sub-cent net buy value, which the engine deliberately does not.
+> The direction is store -> engine only; the engine must never import the store.
+
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_store.py -v`
-Expected: PASS — `35 passed` (Task 12's deferred re-upsert test is now green too)
+Expected: PASS — `38 passed` (Task 12's deferred re-upsert test is now green too)
 
 - [ ] **Step 5: Commit**
 

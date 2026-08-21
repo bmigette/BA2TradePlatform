@@ -190,3 +190,94 @@ def test_income_events_since_excludes_older_events(account_id):
     store.upsert_income_event(account_id, "new", date(2026, 8, 15), "DEPOSIT", 200.0)
     recent = store.get_income_events_since(account_id, date(2026, 8, 1))
     assert [e.external_id for e in recent] == ["new"]
+
+
+# --- FIFO consumption ------------------------------------------------------
+
+def test_consuming_with_a_zero_or_negative_net_buy_value_consumes_nothing(account_id):
+    store.upsert_income_event(account_id, "csd-1", date(2026, 8, 1), "DEPOSIT", 1000.0)
+    assert store.consume_income(account_id, 0.0) == []
+    # A rebalance whose sells outweigh its buys is funded by itself, not by income.
+    assert store.consume_income(account_id, -250.0) == []
+    assert store.get_open_income_total(account_id) == pytest.approx(1000.0)
+
+
+def test_consuming_a_sub_cent_net_buy_value_writes_nothing(account_id):
+    """Below the engine's MONEY_EPSILON there is nothing worth a ledger write.
+    Inherited from ``consume_income_events`` -- an inline FIFO walk here would
+    instead persist a 1e-7 consumption on the oldest event."""
+    store.upsert_income_event(account_id, "csd-1", date(2026, 8, 1), "DEPOSIT", 1000.0)
+    assert store.consume_income(account_id, 1e-7) == []
+    assert store.get_open_income_events(account_id)[0].consumed_amount == 0.0
+
+
+def test_consuming_partially_leaves_a_remainder_open(account_id):
+    event = store.upsert_income_event(account_id, "csd-1", date(2026, 8, 1), "DEPOSIT", 1000.0)
+    assert store.consume_income(account_id, 300.0) == [(event.id, 300.0)]
+    open_events = store.get_open_income_events(account_id)
+    assert len(open_events) == 1
+    assert open_events[0].consumed_amount == pytest.approx(300.0)
+    assert open_events[0].open_amount == pytest.approx(700.0)
+
+
+def test_consuming_spends_the_oldest_event_first_then_spills_over(account_id):
+    first = store.upsert_income_event(account_id, "a", date(2026, 8, 1), "DEPOSIT", 100.0)
+    second = store.upsert_income_event(account_id, "b", date(2026, 8, 5), "DIVIDEND", 500.0)
+    assert store.consume_income(account_id, 250.0) == [(first.id, 100.0), (second.id, 150.0)]
+    assert store.get_open_income_total(account_id) == pytest.approx(350.0)
+
+
+def test_consuming_broker_cents_leaves_the_right_remainder(account_id):
+    """Real amounts are not round, so the remainder is only approximately exact."""
+    a = store.upsert_income_event(account_id, "a", date(2026, 8, 1), "DIVIDEND", 10.01, symbol="AAPL")
+    b = store.upsert_income_event(account_id, "b", date(2026, 8, 2), "DIVIDEND", 20.02, symbol="MSFT")
+    c = store.upsert_income_event(account_id, "c", date(2026, 8, 3), "DIVIDEND", 30.03, symbol="KO")
+    taken = store.consume_income(account_id, 45.0)
+    assert [event_id for event_id, _ in taken] == [a.id, b.id, c.id]
+    assert sum(amount for _, amount in taken) == pytest.approx(45.0)
+    assert store.get_open_income_total(account_id) == pytest.approx(15.06)
+
+
+def test_consuming_more_than_the_ledger_holds_empties_it_without_error(account_id):
+    store.upsert_income_event(account_id, "a", date(2026, 8, 1), "DEPOSIT", 100.0)
+    consumed = store.consume_income(account_id, 9999.0)
+    assert sum(amount for _, amount in consumed) == pytest.approx(100.0)
+    assert store.get_open_income_total(account_id) == 0.0
+
+
+def test_consuming_an_empty_ledger_returns_nothing(account_id):
+    assert store.consume_income(account_id, 500.0) == []
+
+
+def test_fully_consumed_events_drop_out_of_the_open_list(account_id):
+    store.upsert_income_event(account_id, "csd-1", date(2026, 8, 1), "DEPOSIT", 100.0)
+    store.consume_income(account_id, 100.0)
+    assert store.get_open_income_events(account_id) == []
+    assert store.get_open_income_total(account_id) == 0.0
+
+
+def test_an_event_restated_below_what_it_already_spent_is_skipped(account_id):
+    """``consumed_amount > amount`` is reachable: a DIVNRA tax leg restates a
+    dividend downward AFTER a run consumed the gross. ``open_amount`` clamps at 0,
+    so the event must simply be skipped -- never contribute a negative take."""
+    store.upsert_income_event(account_id, "div-1", date(2026, 8, 1), "DIVIDEND", 100.0, symbol="AAPL")
+    store.consume_income(account_id, 100.0)
+    store.upsert_income_event(account_id, "div-1", date(2026, 8, 1), "DIVIDEND", 60.0, symbol="AAPL")
+    later = store.upsert_income_event(account_id, "csd-2", date(2026, 8, 2), "DEPOSIT", 500.0)
+
+    assert store.consume_income(account_id, 200.0) == [(later.id, 200.0)]
+    assert store.get_open_income_total(account_id) == pytest.approx(300.0)
+    over_consumed = {e.external_id: e for e in
+                     store.get_income_events_since(account_id, date(2026, 8, 1))}["div-1"]
+    assert over_consumed.consumed_amount == pytest.approx(100.0)   # the TRUE spend, not clamped
+    assert over_consumed.open_amount == 0.0
+
+
+def test_consumption_is_scoped_to_one_account(account_id):
+    from tests.factories import create_account_definition
+    other = create_account_definition(name="Other Account")
+    store.upsert_income_event(account_id, "a", date(2026, 8, 1), "DEPOSIT", 100.0)
+    store.upsert_income_event(other.id, "a", date(2026, 8, 1), "DEPOSIT", 100.0)
+    store.consume_income(account_id, 100.0)
+    assert store.get_open_income_total(account_id) == 0.0
+    assert store.get_open_income_total(other.id) == pytest.approx(100.0)
