@@ -139,7 +139,9 @@ class MarginInfo:
         reading, so an adapter reports it even when its precision lookup failed.
       * anything smaller is the broker's published fractional step (Alpaca
         ``Asset.min_trade_increment``, TastyTrade's equity
-        ``minimum-increment-precision``).
+        ``QuantityDecimalPrecision.value`` -- ``value``, the quantity decimal
+        precision, NOT the sibling ``minimum-increment-precision``, which is 0
+        on the live equity row and would report whole shares).
     ``fractionable = True`` with ``min_trade_increment = None`` is therefore a
     legal, meaningful pair: the symbol can be split, but by an unknown step.
     """

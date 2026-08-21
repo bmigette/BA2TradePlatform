@@ -1546,8 +1546,27 @@ class TastyTradeAccount(AccountInterface):
             for precision in self._run_async(get_quantity_decimal_precisions(self._session)):
                 # The generic EQUITY row (symbol is None) is the one that applies to
                 # every equity; per-symbol overrides are not needed for sizing.
+                # (Live, 2026-08-21: 48 rows, exactly ONE equity row, and it IS the
+                # generic one -- there are no per-symbol equity overrides at all.)
                 if precision.instrument_type == TTInstrumentType.EQUITY and precision.symbol is None:
-                    increment = float(10 ** -int(precision.minimum_increment_precision))
+                    # `value` is the QUANTITY decimal precision -- read `value`, NOT
+                    # `minimum_increment_precision`. The live equity row is
+                    # `value=5, minimum_increment_precision=0`, and reading the latter
+                    # gave 10**-0 = 1.0, i.e. "fractionable, but whole shares only",
+                    # which quietly turned fractional trading off for this whole broker
+                    # (`_round_shares` floors every target onto this step). The account
+                    # holds 18 of its 25 positions at fractional quantities -- SCHD
+                    # 0.05715, VYMI 0.01955, MAIN 4.0685 -- and 5 decimal places is
+                    # exactly `value`.
+                    #
+                    # `minimum_increment_precision` is a DIFFERENT quantity: it equals
+                    # `value` for crypto but is 0 for equities, so it cannot be the
+                    # step an equity trades in. The reading consistent with both rows is
+                    # that it describes the ticket's whole-unit increment (an equity
+                    # steps by 1 share, a crypto by 1e-8) while `value` bounds how many
+                    # decimals a quantity may carry. Either way it is NOT the fractional
+                    # step, so do not "fix" this back.
+                    increment = float(10 ** -int(precision.value))
                     break
         except Exception as e:
             logger.warning(f"[Account {self.id}] Quantity precision fetch failed: {e}")

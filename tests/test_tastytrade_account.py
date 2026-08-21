@@ -2493,10 +2493,31 @@ def _margin_entry(underlying_symbol, initial_requirement):
     }
 
 
-def _precision(minimum_increment_precision=5, symbol=None,
-               instrument_type=TTInstrumentType.EQUITY):
-    return SimpleNamespace(instrument_type=instrument_type, value=5, symbol=symbol,
-                           minimum_increment_precision=minimum_increment_precision)
+def _precision(value=5, symbol=None, instrument_type="Equity",
+               minimum_increment_precision=0):
+    """RAW DASHERIZED QuantityDecimalPrecision payload, in the shape the API really sends.
+
+    Built through `model_validate` rather than python kwargs, for the same reason
+    `_margin_entry` is: kwargs go straight past the alias generator and any
+    `model_validator(mode="before")`, so a fixture built that way can quietly agree
+    with a bug instead of catching it. The previous stand-in was a SimpleNamespace
+    that set BOTH `value=5` and `minimum_increment_precision=5`, which made the two
+    fields indistinguishable and hid the fact that the adapter read the wrong one.
+
+    The defaults are the user's REAL production row (probed 2026-08-21): 48 rows in
+    the table, EXACTLY ONE equity row, and it is the generic one (`symbol is None`)
+    carrying `value=5, minimum-increment-precision=0`. `value` is the quantity
+    decimal precision -- that same account holds SCHD at 0.05715 and VYMI at 0.01955,
+    i.e. 5 decimal places, which matches `value`, not `minimum-increment-precision`.
+    """
+    from tastytrade.instruments import QuantityDecimalPrecision
+
+    return QuantityDecimalPrecision.model_validate({
+        "instrument-type": instrument_type,
+        "value": value,
+        "minimum-increment-precision": minimum_increment_precision,
+        "symbol": symbol,
+    })
 
 
 def _wire_margin_sources(acct, equities, report, precisions, positions):
@@ -2520,7 +2541,7 @@ def test_symbol_margin_info_derives_the_real_rate_for_a_held_symbol():
         equities=[_FakeEquity("AAPL")],
         # 10 shares marked at 155 = 1550 notional; 775 required = a 0.5 rate.
         report=_margin_report(_margin_entry("AAPL", "775")),
-        precisions=[_precision(minimum_increment_precision=5)],
+        precisions=[_precision(value=5)],
         positions=[_tt_position(symbol="AAPL", quantity="10", mark_price="155")])
 
     with equity_patch, precision_patch:
@@ -2603,7 +2624,7 @@ def test_symbol_margin_info_reports_fractionability_and_increment():
         acct,
         equities=[_FakeEquity("AAPL", is_fractional_quantity_eligible=True),
                   _FakeEquity("BRKA", is_fractional_quantity_eligible=False)],
-        report=_margin_report(), precisions=[_precision(minimum_increment_precision=5)],
+        report=_margin_report(), precisions=[_precision(value=5)],
         positions=[])
 
     with equity_patch, precision_patch:
@@ -2613,6 +2634,71 @@ def test_symbol_margin_info_reports_fractionability_and_increment():
     assert info["AAPL"].min_trade_increment == pytest.approx(1e-5)
     assert info["BRKA"].fractionable is False
     assert info["BRKA"].min_trade_increment == 1.0
+
+
+def test_symbol_margin_info_takes_the_quantity_step_from_value_not_increment_precision():
+    """The quantity decimal precision is `QuantityDecimalPrecision.value`, NOT
+    `minimum_increment_precision`, and reading the wrong one silently switched
+    fractional trading off for this whole broker.
+
+    Live evidence from the user's production account (2026-08-21): the precision
+    table has 48 rows and exactly ONE equity row, the generic one, reading
+    `value=5, minimum-increment-precision=0`. Reading
+    `10 ** -minimum_increment_precision` therefore yields 1.0 and the adapter
+    reported `SCHD frac=True min_trade_increment=1.0` -- "fractionable, but whole
+    shares only". Meanwhile 18 of that account's 25 positions are HELD at fractional
+    quantities (SCHD 0.05715, VYMI 0.01955, IDVO 2.03896, MAIN 4.0685), and 0.05715
+    is five decimal places: exactly `value`, not `minimum_increment_precision`.
+
+    The damage was downstream and silent: `_round_shares` floors every target onto
+    `min_trade_increment`, so a 1.0 step snapped every fractional target to a whole
+    share and no error was raised anywhere.
+    """
+    acct = _bare_account()
+    row = _precision(value=5, minimum_increment_precision=0)
+    # The premise, stated out loud: the two fields DISAGREE in production.
+    assert (row.value, row.minimum_increment_precision) == (5, 0)
+
+    equity_patch, precision_patch = _wire_margin_sources(
+        acct, equities=[_FakeEquity("SCHD", is_fractional_quantity_eligible=True)],
+        report=_margin_report(), precisions=[row], positions=[])
+
+    with equity_patch, precision_patch:
+        info = acct.get_symbol_margin_info(["SCHD"])
+
+    assert info["SCHD"].fractionable is True
+    assert info["SCHD"].min_trade_increment == pytest.approx(1e-5)
+
+    # And the step must TRACK `value`: on the live row alone, `10 ** -value` and a
+    # hardcoded 1e-5 are indistinguishable.
+    acct = _bare_account()
+    equity_patch, precision_patch = _wire_margin_sources(
+        acct, equities=[_FakeEquity("SCHD", is_fractional_quantity_eligible=True)],
+        report=_margin_report(),
+        precisions=[_precision(value=3, minimum_increment_precision=0)], positions=[])
+
+    with equity_patch, precision_patch:
+        info = acct.get_symbol_margin_info(["SCHD"])
+
+    assert info["SCHD"].min_trade_increment == pytest.approx(1e-3)
+
+
+def test_symbol_margin_info_ignores_precision_rows_for_other_instrument_types():
+    """The live table is 48 rows across many instrument types and the equity row is
+    not first. A crypto row (8 decimal places) must not become the equity step."""
+    acct = _bare_account()
+    equity_patch, precision_patch = _wire_margin_sources(
+        acct, equities=[_FakeEquity("AAPL", is_fractional_quantity_eligible=True)],
+        report=_margin_report(),
+        precisions=[_precision(value=8, instrument_type="Cryptocurrency",
+                               minimum_increment_precision=8),
+                    _precision(value=5)],
+        positions=[])
+
+    with equity_patch, precision_patch:
+        info = acct.get_symbol_margin_info(["AAPL"])
+
+    assert info["AAPL"].min_trade_increment == pytest.approx(1e-5)
 
 
 def test_symbol_margin_info_returns_nothing_when_the_position_fetch_fails(monkeypatch):
