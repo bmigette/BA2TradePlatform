@@ -40,6 +40,25 @@ def _jsonable_to_np_state(s):
     return (name, np.array(keys, dtype=np.uint32), int(pos), int(has_gauss), float(cached))
 
 
+def _accepts_on_result(batch_fitness) -> bool:
+    """Does this batch evaluator take the incremental-result callback?
+
+    Older/simpler evaluators (brute force, the ML GA) take only the param-dict list. An
+    unintrospectable callable is treated as NOT accepting it: falling back costs a
+    mid-generation checkpoint, whereas guessing wrong raises a TypeError that would be
+    indistinguishable from a failure inside the evaluation itself.
+    """
+    import inspect
+
+    try:
+        params = inspect.signature(batch_fitness).parameters
+    except (TypeError, ValueError):
+        return False
+    if "on_result" in params:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
 class GeneticOptimizer:
     """
     Genetic algorithm optimizer for model hyperparameters.
@@ -485,7 +504,24 @@ class GeneticOptimizer:
                 # CPU-bound work in worker PROCESSES (no GIL). All shared state (memo /
                 # bookkeeping / DB) stays in the caller's main process. Order is preserved.
                 param_dicts = [self.decode_individual(ind) for ind in invalid_ind]
-                fits = batch_fitness(param_dicts) if param_dicts else []
+
+                def _on_result(idx: int, fit: float, _inv=invalid_ind, _gen=gen):
+                    """Assign fitness the moment a trial lands so the population is
+                    checkpointable mid-generation. Guarded: a bad index must not kill the run."""
+                    try:
+                        _inv[idx].fitness.values = (float(fit),)
+                    except (IndexError, TypeError, ValueError):
+                        return
+
+                # Not every batch_fitness accepts on_result -- brute force and the ML GA supply
+                # one-argument callables. Probe rather than assume: a TypeError here would be
+                # indistinguishable from one raised INSIDE the evaluation.
+                if param_dicts:
+                    fits = (batch_fitness(param_dicts, on_result=_on_result)
+                            if _accepts_on_result(batch_fitness)
+                            else batch_fitness(param_dicts))
+                else:
+                    fits = []
                 fitnesses = [(float(f),) for f in fits]
             elif self.parallel_individuals > 1:
                 # Thread pool — only useful for I/O-bound or GPU work (the ML engine), NOT for

@@ -202,3 +202,72 @@ def test_memo_hits_are_reported_too():
     memo_branch = body[body.index("cached = memo.get(key)"):]
     memo_branch = memo_branch[:memo_branch.index("config = _build_daily_trial_config")]
     assert "_report_trial_result(on_result, i, cached)" in memo_branch
+
+
+# ---------------------------------------------------------------------------------------------
+# Task 3: assign fitness incrementally in the generation loop
+#
+# NOTE. The plan's version of the first test asserts only ``assert snapshots``, but its
+# ``snapshots.append(...)`` sits OUTSIDE the ``if on_result:`` guard -- so it is appended whether
+# or not the GA passes a callback, and the test passes green against unmodified code. Rewritten
+# to observe the thing that actually has to change: WHEN each individual's fitness is assigned.
+# ---------------------------------------------------------------------------------------------
+
+def test_fitness_is_assigned_as_results_arrive_not_after_the_batch():
+    """The population must be checkpointable DURING evaluation, which means individuals get
+    their fitness as results land rather than in one pass at the end."""
+    opt = _opt(n_generations=1)
+
+    # Capture the actual Individual objects the GA is about to evaluate: decode_individual is
+    # called on each of them, in order, immediately before batch_fitness runs.
+    inds: list = []
+    real_decode = opt.decode_individual
+    opt.decode_individual = lambda ind: (inds.append(ind), real_decode(ind))[1]
+
+    observed: list = []
+    evaluated: list = []
+
+    def batch_fitness(param_dicts, on_result=None):
+        assert on_result is not None, "the GA must pass on_result so trials can land early"
+        # Freeze the batch here: decode_individual is called again AFTER the loop (best_params,
+        # history), which would otherwise keep growing `inds`.
+        evaluated[:] = list(inds)
+        for i in range(len(param_dicts)):
+            on_result(i, 100.0 + i)
+            observed.append([ind.fitness.valid for ind in evaluated])
+        return [100.0 + i for i in range(len(param_dicts))]
+
+    opt.optimize(fitness_function=lambda p: 0.0, batch_fitness=batch_fitness)
+
+    assert observed, "batch_fitness was never called"
+    n = len(evaluated)
+    assert n == 6
+    assert observed[0] == [True] + [False] * (n - 1), (
+        "after the FIRST trial lands, exactly one individual may be valid -- if the whole "
+        "population flips at once, fitness is still being assigned after the batch")
+    assert all(observed[-1]), "every individual must be valid once the batch is done"
+    assert [ind.fitness.values[0] for ind in evaluated] == [100.0 + i for i in range(n)]
+
+
+def test_a_bad_index_from_on_result_does_not_kill_the_run():
+    """Defensive: a backend that reports a nonsense index must lose that one report, not the job."""
+    opt = _opt(n_generations=1)
+
+    def batch_fitness(param_dicts, on_result=None):
+        on_result(999, 1.0)               # out of range
+        on_result(0, "not-a-number")      # unusable value
+        return [1.0] * len(param_dicts)
+
+    res = opt.optimize(fitness_function=lambda p: 0.0, batch_fitness=batch_fitness)
+    assert res["best_fitness"] == 1.0
+
+
+def test_a_batch_fitness_that_predates_on_result_still_works():
+    """Backward compatibility: brute force and the ML GA pass a 1-argument batch_fitness."""
+    opt = _opt(n_generations=1)
+
+    def batch_fitness(param_dicts):
+        return [1.0] * len(param_dicts)
+
+    res = opt.optimize(fitness_function=lambda p: 0.0, batch_fitness=batch_fitness)
+    assert res["best_fitness"] == 1.0
