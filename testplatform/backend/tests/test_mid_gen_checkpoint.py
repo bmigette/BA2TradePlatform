@@ -559,3 +559,179 @@ def test_a_boundary_resume_re_evaluates_nothing():
         f"a boundary resume dispatched {batches} trials for a population that was already fully "
         "scored in the checkpoint; before fitness was persisted this was the WHOLE population, "
         "every single time")
+
+
+# ---------------------------------------------------------------------------------------------
+# Task 7: verification
+#
+# The plan's Task 7 is "verify against the live grid": bump the version, push dev and main, kill
+# the running grid by PID, relaunch, and read the resume line. None of that is available (or
+# permitted) here, so this is the offline stand-in: the same claims, made against the REAL
+# handler, the REAL TaskQueue checkpoint column, and a stubbed backtest. What it cannot cover is
+# wall-clock behaviour on real workers (plan Step 4).
+# ---------------------------------------------------------------------------------------------
+
+def _ckpt_strategy_id() -> int:
+    """A Strategy with a 2-gene optimizable entry bracket (tp 2..12, sl -6..-1)."""
+    from app.models.database import SessionLocal
+    from app.models.strategy import Strategy
+
+    db = SessionLocal()
+    try:
+        s = Strategy(
+            name="midgen-ckpt-test",
+            entry_rules=[{
+                "id": "bracket", "conditions": None, "continue_processing": False,
+                "actions": [
+                    {"action_type": "buy"},
+                    {"id": "e_tp", "action_type": "adjust_take_profit",
+                     "reference_value": "order_open_price", "action_value": 5.0,
+                     "action_value_optimize": True, "action_value_min": 2.0,
+                     "action_value_max": 12.0, "action_value_step": 1.0},
+                    {"id": "e_sl", "action_type": "adjust_stop_loss",
+                     "reference_value": "order_open_price", "action_value": -2.0,
+                     "action_value_optimize": True, "action_value_min": -6.0,
+                     "action_value_max": -1.0, "action_value_step": 1.0},
+                ],
+            }],
+        )
+        db.add(s)
+        db.commit()
+        db.refresh(s)
+        return s.id
+    finally:
+        db.close()
+
+
+def _seed_named_opt(strategy_id: int, name: str, generations: int) -> int:
+    from app.models.database import SessionLocal
+    from app.models.strategy_optimization import StrategyOptimization
+
+    db = SessionLocal()
+    try:
+        row = StrategyOptimization(
+            strategy_id=strategy_id, name=name, fitness_metric="sharpe",
+            optimization_type="genetic", status="pending",
+            optimization_config={
+                "populationSize": 8, "generations": generations, "crossoverProb": 0.7,
+                "mutationProb": 0.2, "earlyStoppingGenerations": 10, "elitismPercent": 10.0,
+                "seed": 42,
+                "backtest": {"engine": "stub", "start_date": "2024-01-02",
+                             "end_date": "2024-01-08", "seed": 42},
+            },
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return row.id
+    finally:
+        db.close()
+
+
+def _stub_backtest(backtest_cfg, hoisted, decoded):
+    return {"total_trades": 5, "sharpe_ratio": 1.0, "max_drawdown": 5.0,
+            "total_return": 1.0, "profit_factor": 1.5, "win_rate": 55.0}
+
+
+@pytest.fixture
+def _handler_env(monkeypatch):
+    from app.models.database import Base, SessionLocal, engine
+    from app.models import TaskQueue
+    from app.services import strategy_optimization_handler as H
+
+    Base.metadata.create_all(bind=engine)
+    monkeypatch.setattr(H, "_run_trial_backtest", _stub_backtest)
+    monkeypatch.setattr(H, "_build_hoisted_state", lambda cfg: {})
+    created: list = []
+    yield H, created
+    db = SessionLocal()
+    try:
+        for tid in created:
+            db.query(TaskQueue).filter(TaskQueue.task_id == tid).delete()
+        db.commit()
+    finally:
+        db.close()
+
+
+def _run_with_seeded_checkpoint(H, created, job_name, *, generations, ckpt):
+    """Seed *ckpt* under *job_name*'s real checkpoint key, run the handler, return what the
+    optimizer was actually asked to resume from."""
+    import app.services.genetic as genetic_mod
+
+    sid = _ckpt_strategy_id()
+    opt_id = _seed_named_opt(sid, job_name, generations)
+    tid = H.checkpoint_task_id(job_name, opt_id)
+    created.append(tid)
+    # No "fingerprint" key: _load_checkpoint accepts a stored checkpoint that has none, which
+    # keeps this test independent of how the handler happens to hash the gene space today.
+    H._save_checkpoint(tid, ckpt)
+
+    captured: dict = {}
+    Real = genetic_mod.GeneticOptimizer
+
+    class _Spy(Real):
+        def optimize(self, *a, **kw):
+            captured["start_generation"] = kw.get("start_generation")
+            captured["initial_population"] = kw.get("initial_population")
+            captured["restored_fitnesses"] = kw.get("restored_fitnesses")
+            return super().optimize(*a, **kw)
+
+    import app.services.strategy_optimization_handler as _H
+    orig = _H.GeneticOptimizer
+    _H.GeneticOptimizer = _Spy
+    try:
+        out = H.handle_strategy_optimization(f"t-{job_name}", {"optimization_id": opt_id})
+    finally:
+        _H.GeneticOptimizer = orig
+    return out, captured
+
+
+def test_handler_resumes_a_partial_checkpoint_into_its_own_generation(_handler_env):
+    """The live-grid claim, offline. A PARTIAL checkpoint on the FINAL generation must survive
+    the exhausted guard, resume INTO generation 1 (not 2), and carry its fitnesses through to
+    optimize() -- so only the 3 unevaluated individuals are dispatched."""
+    H, created = _handler_env
+    out, captured = _run_with_seeded_checkpoint(
+        H, created, "midgen-partial-resume", generations=2,
+        ckpt={"generation": 1, "partial": True,
+              "population": [[8.0, -3.0]] * 8,
+              "fitnesses": [7.0] * 5 + [None, None, None]},
+    )
+
+    assert out["status"] == "completed", out
+    assert captured["start_generation"] == 1, \
+        "a partial checkpoint on the last generation was discarded or skipped past"
+    assert captured["restored_fitnesses"] == [7.0] * 5 + [None, None, None]
+    assert len(captured["initial_population"]) == 8
+
+
+def test_handler_discards_a_completed_final_generation_checkpoint(_handler_env):
+    """The other side of the same guard: the SAME generation, not partial, is exhausted and must
+    be thrown away -- otherwise the run evaluates nobody and reports 'every backtest failed'."""
+    H, created = _handler_env
+    out, captured = _run_with_seeded_checkpoint(
+        H, created, "midgen-exhausted", generations=2,
+        ckpt={"generation": 1, "partial": False,
+              "population": [[8.0, -3.0]] * 8, "fitnesses": [7.0] * 8},
+    )
+
+    assert out["status"] == "completed", out
+    assert captured["start_generation"] == 0, "an exhausted checkpoint was resumed into"
+    assert captured["restored_fitnesses"] is None
+
+
+def test_the_resume_log_line_reports_what_still_has_to_run(caplog):
+    """Plan Step 3 reads this line off the live grid as the proof:
+        Restored population of 140 individuals (117 already evaluated, 23 to run)
+    Before this work the parenthetical said 140 to run, every time."""
+    import logging
+
+    opt = _opt(n_generations=1)
+    with caplog.at_level(logging.INFO, logger="app.services.genetic"):
+        opt.optimize(
+            fitness_function=lambda p: 0.0,
+            batch_fitness=lambda param_dicts, on_result=None: [1.0] * len(param_dicts),
+            initial_population=[[1, 1], [2, 2], [3, 3], [4, 4]],
+            restored_fitnesses=[5.0, 6.0, None, None],
+        )
+    assert "Restored population of 4 individuals (2 already evaluated, 2 to run)" in caplog.text
