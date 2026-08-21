@@ -362,6 +362,48 @@ def test_the_generation_end_checkpoint_is_not_partial():
     assert calls == [False]
 
 
+# ---------------------------------------------------------------------------------------------
+# Task 5: the exhausted-checkpoint guard must respect `partial`
+# ---------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("gen,partial,n_gens,expect_exhausted", [
+    (7, False, 8, True),    # finished the last generation -> nothing left
+    (7, True,  8, False),   # INTERRUPTED during the last generation -> work remains
+    (3, False, 8, False),
+    (3, True,  8, False),
+    (8, True,  8, True),    # partial past the end (a shrunken --generations) -> nothing left
+    (9, False, 8, True),
+])
+def test_exhausted_guard_respects_partial(gen, partial, n_gens, expect_exhausted):
+    from app.services.strategy_optimization_handler import _checkpoint_exhausted
+    assert _checkpoint_exhausted({"generation": gen, "partial": partial}, n_gens) is expect_exhausted
+
+
+def test_no_checkpoint_is_not_exhausted():
+    """None/{} means 'nothing saved', which is a fresh start -- not a finished search. The old
+    inline guard short-circuited on this and the extraction must keep doing so."""
+    from app.services.strategy_optimization_handler import _checkpoint_exhausted
+    assert _checkpoint_exhausted(None, 8) is False
+    assert _checkpoint_exhausted({}, 8) is False
+
+
+def test_a_checkpoint_without_a_partial_key_is_treated_as_complete():
+    """Every checkpoint written before this feature lacks the key; they are all generation-end
+    writes, so the old gen+1 >= n rule is the correct reading."""
+    from app.services.strategy_optimization_handler import _checkpoint_exhausted
+    assert _checkpoint_exhausted({"generation": 7}, 8) is True
+    assert _checkpoint_exhausted({"generation": 6}, 8) is False
+
+
+def test_the_handler_uses_the_helper_for_its_exhausted_guard():
+    """The guard is inline in handle_strategy_optimization; if the extraction is not actually
+    wired up, every test above passes while the live path keeps discarding partials."""
+    src = (Path(__file__).resolve().parents[1]
+           / "app" / "services" / "strategy_optimization_handler.py").read_text(encoding="utf-8")
+    assert 'if _checkpoint_exhausted(ckpt, ga["generations"]):' in src
+    assert 'int(ckpt.get("generation", -1)) + 1 >= int(ga["generations"])' not in src
+
+
 def test_a_batch_fitness_taking_kwargs_is_given_on_result():
     """A **kwargs evaluator can take it -- do not silently downgrade it to the legacy call."""
     opt = _opt(n_generations=1)

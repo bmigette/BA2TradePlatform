@@ -1339,8 +1339,9 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         # a confusing failure for what is really "this search already finished". Only reachable
         # when a run reached the last generation and then died before _clear_checkpoint (or when a
         # NEW job reuses a dead job's name), so discarding and searching from scratch is both the
-        # safe reading and the one that produces a result.
-        if ckpt and int(ckpt.get("generation", -1)) + 1 >= int(ga["generations"]):
+        # safe reading and the one that produces a result. A PARTIAL checkpoint on the final
+        # generation is the exception -- see _checkpoint_exhausted.
+        if _checkpoint_exhausted(ckpt, ga["generations"]):
             logger.warning(
                 f"strategy_optimization {opt_id}: checkpoint {ckpt_task_id} is at generation "
                 f"{ckpt.get('generation')} of {ga['generations']} — exhausted, starting fresh")
@@ -2064,6 +2065,21 @@ def checkpoint_task_id(opt_name: Optional[str], opt_id: int) -> str:
 
     key = (opt_name or f"opt-{opt_id}").strip()
     return "ckpt-" + hashlib.sha1(key.encode("utf-8")).hexdigest()[:24]
+
+
+def _checkpoint_exhausted(ckpt: dict, n_generations: int) -> bool:
+    """True when a checkpoint has no work left in it.
+
+    A checkpoint written AFTER the final generation is exhausted. A PARTIAL one written DURING
+    the final generation is not -- it still has unevaluated individuals, and discarding it would
+    throw away exactly the work partial checkpointing exists to save.
+    """
+    if not ckpt:
+        return False
+    gen = int(ckpt.get("generation", -1))
+    if ckpt.get("partial"):
+        return gen >= int(n_generations)
+    return gen + 1 >= int(n_generations)
 
 
 def _report_trial_result(on_result, idx: int, fitness: float) -> None:
