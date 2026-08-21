@@ -1089,3 +1089,108 @@ def test_account_snapshot_on_failure_is_all_none_not_zeros():
     assert snapshot.cash is None
     assert snapshot.buying_power is None
     assert snapshot.net_liquidation is None
+
+
+# ---------------------------------------------------------------------------
+# get_cash_transfers
+# ---------------------------------------------------------------------------
+
+def _money_movement(txn_id, sub_type, net_value, transaction_date=date(2026, 8, 3),
+                    symbol=None, description="", underlying_symbol=None):
+    """Stand-in for a tastytrade `Money Movement` Transaction."""
+    return SimpleNamespace(
+        id=txn_id,
+        transaction_type="Money Movement",
+        transaction_sub_type=sub_type,
+        net_value=Decimal(net_value),
+        transaction_date=transaction_date,
+        symbol=symbol,
+        underlying_symbol=underlying_symbol,
+        description=description,
+    )
+
+
+def test_get_cash_transfers_requests_money_movement_over_all_pages():
+    acct = _bare_account()
+    acct._account.get_history = AsyncMock(return_value=[])
+
+    acct.get_cash_transfers(start_date=date(2026, 7, 1), end_date=date(2026, 8, 20))
+
+    kwargs = acct._account.get_history.call_args.kwargs
+    assert kwargs["types"] == ["Money Movement"]
+    assert kwargs["page_offset"] is None
+    assert kwargs["start_date"] == date(2026, 7, 1)
+    assert kwargs["end_date"] == date(2026, 8, 20)
+
+
+def test_get_cash_transfers_reports_a_deposit_as_positive_income():
+    from ba2_trade_platform.core.account_types import CASH_TRANSFER_DEPOSIT
+
+    acct = _bare_account()
+    acct._account.get_history = AsyncMock(return_value=[
+        _money_movement(9001, "Deposit", "2500", description="ACH DEPOSIT"),
+    ])
+
+    transfers = acct.get_cash_transfers()
+
+    assert len(transfers) == 1
+    assert transfers[0].external_id == "9001"
+    assert transfers[0].event_type == CASH_TRANSFER_DEPOSIT
+    assert transfers[0].amount == 2500.0
+    assert transfers[0].is_income is True
+
+
+def test_get_cash_transfers_nets_dividend_tax_off_the_gross_leg():
+    """Gross and tax share (symbol, date). One row is emitted, keeping the GROSS leg's
+    own broker id so the (account_id, external_id) idempotency key stays 1:1."""
+    from ba2_trade_platform.core.account_types import CASH_TRANSFER_DIVIDEND
+
+    acct = _bare_account()
+    acct._account.get_history = AsyncMock(return_value=[
+        _money_movement(9101, "Dividend", "1.57", underlying_symbol="TIDL",
+                        description="TIDAL TRUST II"),
+        _money_movement(9102, "Dividend", "-0.24", underlying_symbol="TIDL",
+                        description="TIDAL TRUST II"),
+    ])
+
+    transfers = acct.get_cash_transfers()
+
+    assert len(transfers) == 1
+    assert transfers[0].external_id == "9101"
+    assert transfers[0].event_type == CASH_TRANSFER_DIVIDEND
+    assert transfers[0].symbol == "TIDL"
+    assert transfers[0].amount == pytest.approx(1.33)
+
+
+def test_get_cash_transfers_reports_a_withdrawal_as_negative_and_not_income():
+    from ba2_trade_platform.core.account_types import CASH_TRANSFER_WITHDRAWAL
+
+    acct = _bare_account()
+    acct._account.get_history = AsyncMock(return_value=[
+        _money_movement(9201, "Withdrawal", "-800", description="ACH WITHDRAWAL"),
+    ])
+
+    transfers = acct.get_cash_transfers()
+
+    assert transfers[0].event_type == CASH_TRANSFER_WITHDRAWAL
+    assert transfers[0].amount == -800.0
+    assert transfers[0].is_income is False
+
+
+def test_get_cash_transfers_ignores_the_drip_reinvestment_leg():
+    """A DRIP 'Withdrawal' never left the account -- it bought shares with the dividend
+    already recorded. Recording it would double-count the cash going out."""
+    acct = _bare_account()
+    acct._account.get_history = AsyncMock(return_value=[
+        _money_movement(9301, "Withdrawal", "-1.33",
+                        description="Cash dividend reinvested into TIDL"),
+    ])
+
+    assert acct.get_cash_transfers() == []
+
+
+def test_get_cash_transfers_returns_empty_list_on_failure():
+    acct = _bare_account()
+    acct._account.get_history = AsyncMock(side_effect=RuntimeError("gateway timeout"))
+
+    assert acct.get_cash_transfers() == []

@@ -1191,6 +1191,94 @@ class TastyTradeAccount(AccountInterface):
             logger.error(f"[Account {self.id}] Error fetching dividends: {e}", exc_info=True)
             return []
 
+    #: Money Movement sub-types that ADD cash to the account.
+    _TT_DEPOSIT_SUB_TYPES = ("Deposit", "Transfer")
+    #: Money Movement sub-types that REMOVE cash from the account.
+    _TT_WITHDRAWAL_SUB_TYPES = ("Withdrawal", "Transfer")
+
+    def get_cash_transfers(self, start_date=None, end_date=None) -> List[CashTransfer]:
+        """Deposits, withdrawals and dividends over a date window.
+
+        ``page_offset=None`` is the SDK "all pages" sentinel. ``external_id`` is the
+        broker transaction id -- the ``(account_id, external_id)`` idempotency key of
+        ``portfolio_income_event`` -- so re-syncing a window upserts instead of
+        duplicating.
+
+        A dividend arrives as a POSITIVE gross leg plus (optionally) a NEGATIVE tax leg
+        sharing the same ``(symbol, transaction_date)``. ONE CashTransfer is emitted per
+        GROSS leg, keeping that leg's own id, with the tax netted off its amount -- so
+        the ledger records the income actually KEPT and the id stays 1:1.
+
+        Returns:
+            List[CashTransfer]: ``[]`` on failure as well as on genuine emptiness (this
+            seam does not distinguish the two); the failure is logged.
+        """
+        if not self._check_authentication():
+            return []
+
+        params = {"types": ["Money Movement"], "sort": "Asc", "page_offset": None}
+        if start_date is not None:
+            params["start_date"] = start_date.date() if isinstance(start_date, datetime) else start_date
+        if end_date is not None:
+            params["end_date"] = end_date.date() if isinstance(end_date, datetime) else end_date
+
+        try:
+            transactions = self._run_async(self._account.get_history(self._session, **params))
+        except Exception as e:
+            logger.error(f"[Account {self.id}] Error fetching cash transfers: {e}", exc_info=True)
+            return []
+
+        # Pass 1: collect withholding tax per (symbol, date) so it can be netted off
+        # its OWN symbol's gross dividend and never emitted as a phantom negative one.
+        tax_by_key = {}
+        for txn in transactions:
+            if getattr(txn, "transaction_sub_type", None) != "Dividend":
+                continue
+            net_value = float(getattr(txn, "net_value", 0) or 0)
+            if net_value >= 0:
+                continue
+            key = (getattr(txn, "underlying_symbol", None) or getattr(txn, "symbol", None),
+                   getattr(txn, "transaction_date", None))
+            tax_by_key[key] = tax_by_key.get(key, 0.0) + abs(net_value)
+
+        transfers = []
+        for txn in transactions:
+            external_id = str(getattr(txn, "id", "") or "")
+            event_date = getattr(txn, "transaction_date", None)
+            if not external_id or event_date is None:
+                continue
+            sub_type = getattr(txn, "transaction_sub_type", None)
+            net_value = float(getattr(txn, "net_value", 0) or 0)
+            description = getattr(txn, "description", None)
+
+            if sub_type == "Dividend":
+                if net_value <= 0:
+                    continue  # a tax leg -- already netted onto its gross row
+                symbol = getattr(txn, "underlying_symbol", None) or getattr(txn, "symbol", None)
+                amount = round(net_value - tax_by_key.get((symbol, event_date), 0.0), 2)
+                transfers.append(CashTransfer(
+                    external_id=external_id, event_date=event_date,
+                    event_type=CASH_TRANSFER_DIVIDEND, amount=amount,
+                    symbol=symbol, description=description))
+            elif sub_type in self._TT_DEPOSIT_SUB_TYPES and net_value > 0:
+                transfers.append(CashTransfer(
+                    external_id=external_id, event_date=event_date,
+                    event_type=CASH_TRANSFER_DEPOSIT, amount=net_value,
+                    description=description))
+            elif sub_type in self._TT_WITHDRAWAL_SUB_TYPES and net_value < 0:
+                # A DRIP leg is a "Withdrawal" that never left the account: it bought
+                # shares with the dividend already recorded above. Emitting it would
+                # double-count the cash going out.
+                if "reinvest" in (description or "").lower():
+                    continue
+                transfers.append(CashTransfer(
+                    external_id=external_id, event_date=event_date,
+                    event_type=CASH_TRANSFER_WITHDRAWAL, amount=net_value,
+                    description=description))
+
+        logger.debug(f"[Account {self.id}] Retrieved {len(transfers)} cash transfers")
+        return transfers
+
     def get_balance_history(self, start_date=None, end_date=None) -> List[Dict]:
         if not self._check_authentication():
             return []
