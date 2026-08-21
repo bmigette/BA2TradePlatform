@@ -56,12 +56,16 @@ __all__ = [
     "QUANTITY_EPSILON", "MONEY_EPSILON", "BUMP_TO_ONE_SHARE_MAX_MULTIPLE",
     # per-row sizing outcomes (D1)
     "SIZING_OUTCOME_NORMAL", "SIZING_OUTCOME_BUMPED", "SIZING_OUTCOME_SKIPPED_TOO_LARGE",
+    # what a plan's target_notional MEANS, and the residual loop's bound (D2)
+    "ALLOCATION_BASIS_POSITION", "ALLOCATION_BASIS_BUDGET", "REDISTRIBUTION_MAX_PASSES",
     # reason / warning / error strings
     "REASON_NO_PRICE", "REASON_NOT_MARGINABLE", "REASON_FRACTIONAL",
     "REASON_WHOLE_SHARE_FLOOR", "REASON_FRACTIONAL_UNKNOWN",
     "REASON_NEGATIVE_CLAMPED", "REASON_CLOSE_TO_ZERO",
     "REASON_BUMPED_TO_ONE_SHARE_FMT", "REASON_BELOW_ONE_SHARE_FMT",
     "REASON_BUMP_BLOCKED_MIN_ORDER_FMT", "REASON_ROUNDS_TO_ZERO_FMT",
+    "REASON_REDISTRIBUTED_FMT", "REASON_REDISTRIBUTED_PREFIX",
+    "WARNING_RESIDUAL_LEFT_FMT", "WARNING_RESIDUAL_UNCONVERGED_FMT",
     "REASON_FRACTIONAL_FLOOR_BUMPED_FMT", "REASON_FRACTIONAL_FLOOR_SKIPPED_FMT",
     "REASON_BELOW_MIN_ORDER_FMT", "REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_FMT",
     "REASON_MULTI_LABEL_FMT", "REASON_SCALED_FMT",
@@ -76,7 +80,8 @@ __all__ = [
     "build_symbol_targets", "validate_symbol_weights", "validate_label_targets",
     "compute_base_notional", "compute_allocation", "compute_label_investment",
     "apply_order_impacts", "consume_income_events",
-    "tradeable_unit", "size_sub_unit_target",
+    "tradeable_unit", "size_sub_unit_target", "projected_value", "allocated_value",
+    "redistribute_label_residuals",
     # submission
     "ACTION_ADJUST", "ACTION_CLOSE", "ACTION_NEW", "ACTION_SKIP",
     "decide_symbol_action", "split_delta_fifo",
@@ -193,6 +198,46 @@ REASON_BUMP_BLOCKED_MIN_ORDER_FMT = (
 #: away. Never bumped: the position already exists, and turning a -0.4 trim into a
 #: whole-share sale is a trade nobody asked for.
 REASON_ROUNDS_TO_ZERO_FMT = "{raw:+.4f} shares rounds to 0 on the tradeable grid - no order"
+
+#: How many redistribution passes a label gets before the engine gives up and
+#: reports what is left. The loop is finite on its own arithmetic -- every step is
+#: floored onto the absorbing row's grid, so it can close the gap but never cross
+#: it, |residual| is monotone, and a pass that moves nothing ends the loop at its
+#: fixed point. In practice that happens on pass 1 or 2. This bound exists so that
+#: TERMINATION is guaranteed by the code rather than by the argument: a future
+#: absorber type that breaks the monotonicity still stops here, and says so.
+REDISTRIBUTION_MAX_PASSES = 3
+
+#: What ``AllocationRow.target_notional`` MEANS in a given plan, which differs by
+#: solver and cannot be guessed from the numbers.
+#:   position -- compute_allocation: the desired POST-TRADE holding value.
+#:   budget   -- compute_label_investment: money to DEPLOY on top of what is held.
+#: Comparing one against the other produces a nonsense residual, which is why the
+#: plan carries the answer instead of each caller assuming one.
+ALLOCATION_BASIS_POSITION = "position"
+ALLOCATION_BASIS_BUDGET = "budget"
+
+#: Stamped on a row whose quantity was moved to keep its LABEL on target. The
+#: weights the user typed are NOT rewritten (``target_notional`` is untouched); the
+#: quantity is, and this says so in shares. Silently changing a user's weights is
+#: unacceptable -- showing the change is what makes the change allowed.
+REASON_REDISTRIBUTED_FMT = (
+    "weight adjusted {before:+.4f} -> {after:+.4f} shares to keep label "
+    "'{label}' on target")
+REASON_REDISTRIBUTED_PREFIX = REASON_REDISTRIBUTED_FMT.split("{", 1)[0]
+
+#: The label finished off target because nothing in it was ALLOWED to absorb the
+#: rest (buying power, a broker minimum, the no-negative-position clamp). Only
+#: raised when some member could physically have taken it: a residual smaller than
+#: one tradeable unit of every member is arithmetic, not a fault.
+WARNING_RESIDUAL_LEFT_FMT = (
+    "label '{label}' is {residual:,.2f} off target after redistribution - nothing "
+    "in it can absorb the rest (buying power, broker minimums, or it would drive a "
+    "position to zero)")
+#: The label finished off target because the pass bound stopped the loop.
+WARNING_RESIDUAL_UNCONVERGED_FMT = (
+    "label '{label}' is still {residual:,.2f} off target after the {passes} "
+    "redistribution passes allowed")
 #: Says only that no order is sent -- NOT what happens to the position, which
 #: differs by branch (a suppressed trim holds; a suppressed top-up never opens).
 #: "position held" here contradicted REASON_CLOSE_TO_ZERO on an unsendable close.
@@ -413,6 +458,12 @@ class AllocationPlan:
     total_sell_value: float = 0.0
     allow_fractional: bool = False
     valuation_mode: str = VALUATION_MODE_MARKET
+    #: What every ``target_notional`` in ``rows`` MEANS -- ``ALLOCATION_BASIS_POSITION``
+    #: for a REBALANCE (the desired post-trade holding value) or
+    #: ``ALLOCATION_BASIS_BUDGET`` for an INVEST_LABEL run (money to deploy on top of
+    #: what is held). Every "is this plan on target?" measurement reads it; without
+    #: it the same arithmetic silently means two different things.
+    allocation_basis: str = ALLOCATION_BASIS_POSITION
     warnings: List[str] = field(default_factory=list)
 
     @property
@@ -447,6 +498,7 @@ class AllocationPlan:
             "total_sell_value": self.total_sell_value,
             "allow_fractional": self.allow_fractional,
             "valuation_mode": self.valuation_mode,
+            "allocation_basis": self.allocation_basis,
             "warnings": list(self.warnings),
         }
 
@@ -1123,6 +1175,9 @@ def compute_allocation(base_notional: float, available_buying_power: float,
     targets = {}
     target_pcts = {}
     sym_labels = {}
+    # The PER-LABEL split, which row.target_notional cannot carry: a symbol in two
+    # labels sums their shares into one row. Redistribution needs the split.
+    label_targets: Dict[str, Dict[str, float]] = {}
     for lt in labels or []:
         pct = float(lt.target_pct or 0.0)
         if not lt.symbols:
@@ -1138,6 +1193,9 @@ def compute_allocation(base_notional: float, available_buying_power: float,
             targets[st.symbol] = targets.get(st.symbol, 0.0) + plan.base_notional * share / 100.0
             target_pcts[st.symbol] = target_pcts.get(st.symbol, 0.0) + share
             sym_labels.setdefault(st.symbol, []).append(lt.label)
+            per_label = label_targets.setdefault(lt.label, {})
+            per_label[st.symbol] = (per_label.get(st.symbol, 0.0)
+                                    + plan.base_notional * share / 100.0)
 
     for symbol, target_notional in targets.items():
         ps = current.get(symbol)
@@ -1263,6 +1321,11 @@ def compute_allocation(base_notional: float, available_buying_power: float,
         row.bp_cost = row.estimated_value * row.bp_factor if delta > 0 else 0.0
         plan.rows.append(row)
 
+    # D2, BEFORE the buying-power pass: the label's own arithmetic first, the
+    # account-wide feasibility constraint second. Redistribution is capped by the
+    # live headroom, so it can never be the reason scaling has to fire.
+    redistribute_label_residuals(plan, label_targets, margin,
+                                 allow_fractional=allow_fractional)
     plan.scale_factor = _apply_bp_scaling(plan.rows, plan.available_buying_power,
                                           allow_fractional=allow_fractional, margin=margin)
     _finalise_totals(plan)
@@ -1320,7 +1383,10 @@ def compute_label_investment(label: LabelTarget, amount: float,
     plan = AllocationPlan(base_notional=budget,
                           available_buying_power=float(available_buying_power),
                           allow_fractional=bool(allow_fractional),
-                          valuation_mode=valuation_mode)
+                          valuation_mode=valuation_mode,
+                          # The target is money to DEPLOY, not a post-trade holding
+                          # value: this run ADDS to whatever is already owned.
+                          allocation_basis=ALLOCATION_BASIS_BUDGET)
     if not label.symbols:
         plan.unallocatable_pct = 100.0
         plan.warnings.append(WARNING_EMPTY_LABEL_FMT.format(label=label.label, pct=100.0))
@@ -1389,6 +1455,9 @@ def compute_label_investment(label: LabelTarget, amount: float,
         row.estimated_value = qty * row.price
         row.bp_cost = row.estimated_value * row.bp_factor
         plan.rows.append(row)
+    redistribute_label_residuals(
+        plan, {label.label: {sym: budget * w / 100.0 for sym, w in weights.items()}},
+        margin, allow_fractional=allow_fractional)
     plan.scale_factor = _apply_bp_scaling(plan.rows, plan.available_buying_power,
                                           allow_fractional=allow_fractional, margin=margin)
     _finalise_totals(plan)
@@ -1429,6 +1498,11 @@ def apply_order_impacts(plan: AllocationPlan, impacts: Dict[str, OrderImpact], *
     buying power is never re-deployed, because ``_apply_bp_scaling`` only ever
     scales down. Never overspending beats fully deploying.
 
+    Also deliberately NOT done: the label residual is not re-redistributed after a
+    precheck rejection. This function has no per-label target split in hand, the
+    user is looking at the plan at that moment, and the refused money is already
+    reported on the row as ``unmet_notional``.
+
     Returns a NEW AllocationPlan; ``plan`` is not mutated. Adds
     ``WARNING_PRECHECK_DISAGREED_FMT`` for each row whose cost changed.
     """
@@ -1439,6 +1513,7 @@ def apply_order_impacts(plan: AllocationPlan, impacts: Dict[str, OrderImpact], *
         unallocatable_pct=plan.unallocatable_pct,
         allow_fractional=plan.allow_fractional,
         valuation_mode=plan.valuation_mode,
+        allocation_basis=plan.allocation_basis,
         warnings=list(plan.warnings),
     )
     for row in out.rows:
@@ -1740,6 +1815,7 @@ def filter_plan_rows(plan: "AllocationPlan", selected_symbols: List[str]) -> "Al
         total_sell_value=sell_value,
         allow_fractional=plan.allow_fractional,
         valuation_mode=plan.valuation_mode,
+        allocation_basis=plan.allocation_basis,
         warnings=list(plan.warnings),
     )
 
@@ -2042,3 +2118,328 @@ def plan_quantity_attempts(
         return attempts
 
     return [(FRACTIONAL_PATH_WHOLE, whole)] if whole > 0 else []
+
+
+# ---------------------------------------------------------------------------
+# D2: the label rounding residual, redistributed inside the label, both ways.
+#
+# Whole-share rounding leaves a label short; D1's bumps can push it long. One
+# signed pass moves the difference onto the symbols that can absorb it. Pure.
+# ---------------------------------------------------------------------------
+
+
+def projected_value(row: "AllocationRow", valuation_mode: str) -> Optional[float]:
+    """The POST-TRADE value of one row, measured the same way as a REBALANCE target.
+
+    This is what makes "did the plan hit its target?" answerable: both sides of the
+    comparison are in the same unit. ``market`` mode projects
+    ``target_quantity * price``; ``cost`` mode projects the post-trade COST BASIS,
+    removing average cost on a sell exactly as ``compute_allocation`` adds price on
+    a buy -- the two legs convert at different rates and mixing them is the bug that
+    once turned a half-trim into a liquidation.
+
+    ``target_quantity`` is already the post-trade holding AFTER whole-share rounding
+    and after any redistribution, so this number is what the account will really be
+    worth, not an ideal the rounding never reaches.
+
+    Returns:
+        Optional[float]: ``None`` when the row has no usable price -- nothing can be
+        measured and no fallback price may be invented (platform rule).
+
+    Raises:
+        ValueError: on an unknown ``valuation_mode``.
+    """
+    if valuation_mode not in (VALUATION_MODE_COST, VALUATION_MODE_MARKET):
+        raise ValueError(
+            f"Unknown valuation_mode {valuation_mode!r}; expected "
+            f"{VALUATION_MODE_COST!r} or {VALUATION_MODE_MARKET!r}")
+    if row.price is None or row.price <= 0:
+        return None
+    if valuation_mode == VALUATION_MODE_MARKET:
+        return float(row.target_quantity) * float(row.price)
+    delta = float(row.delta_quantity or 0.0)
+    basis = float(row.current_cost_basis or 0.0)
+    if delta >= 0:
+        return basis + delta * float(row.price)
+    if row.current_quantity <= 0:
+        return basis
+    return basis * (float(row.target_quantity) / float(row.current_quantity))
+
+
+def allocated_value(row: "AllocationRow", valuation_mode: str,
+                    allocation_basis: str) -> Optional[float]:
+    """What this row ACTUALLY allocates, measured the way its plan's target means it.
+
+    ``ALLOCATION_BASIS_POSITION`` (a REBALANCE) -> ``projected_value``: the target is
+    a post-trade holding value. ``ALLOCATION_BASIS_BUDGET`` (an INVEST_LABEL run) ->
+    the money this row deploys, because the target is money to ADD on top of an
+    existing holding and the post-trade value would double-count what is already
+    owned.
+
+    Returns:
+        Optional[float]: ``None`` when the row has no usable price.
+
+    Raises:
+        ValueError: on an unknown basis or valuation mode.
+    """
+    if allocation_basis == ALLOCATION_BASIS_POSITION:
+        return projected_value(row, valuation_mode)
+    if allocation_basis != ALLOCATION_BASIS_BUDGET:
+        raise ValueError(
+            f"Unknown allocation_basis {allocation_basis!r}; expected "
+            f"{ALLOCATION_BASIS_POSITION!r} or {ALLOCATION_BASIS_BUDGET!r}")
+    if valuation_mode not in (VALUATION_MODE_COST, VALUATION_MODE_MARKET):
+        raise ValueError(f"Unknown valuation_mode {valuation_mode!r}")
+    if row.price is None or row.price <= 0:
+        return None
+    return float(row.delta_quantity or 0.0) * float(row.price)
+
+
+def _label_residual(target_total: float, members: List["AllocationRow"],
+                    valuation_mode: str, allocation_basis: str) -> float:
+    """SIGNED money the label is off its target: + is short, - is over."""
+    total = 0.0
+    for row in members:
+        value = allocated_value(row, valuation_mode, allocation_basis)
+        if value is not None:
+            total += value
+    return float(target_total) - total
+
+
+def _absorption_unit_money(row: "AllocationRow", valuation_mode: str,
+                           allocation_basis: str, *, buying: bool) -> float:
+    """How much the LABEL's measured total moves per share moved on this row.
+
+    Not always the price. In ``cost`` mode on a position basis, buying a share adds
+    the market PRICE to the basis but selling one removes the AVERAGE COST, exactly
+    as in ``compute_allocation``. Using the price for a cost-mode reduction
+    under-counts by ``price / avg_cost`` and the label never converges.
+    """
+    price = float(row.price)
+    if allocation_basis == ALLOCATION_BASIS_BUDGET:
+        return price
+    if valuation_mode == VALUATION_MODE_MARKET or buying:
+        return price
+    qty = float(row.current_quantity or 0.0)
+    if qty <= 0:
+        return price
+    avg = float(row.current_cost_basis or 0.0) / qty
+    return avg if avg > 0 else price
+
+
+def _buying_power_headroom(plan: "AllocationPlan") -> float:
+    """Buying power the plan is NOT already spending. Recomputed after every move."""
+    return (float(plan.available_buying_power or 0.0)
+            - sum(r.bp_cost for r in plan.rows if r.is_buy))
+
+
+def _absorb_residual(row: "AllocationRow", residual: float,
+                     margin: Optional[MarginInfo], *, allow_fractional: bool,
+                     valuation_mode: str, allocation_basis: str,
+                     bp_headroom: float) -> float:
+    """Move ONE row by whole grid units toward closing ``residual``. Pure arithmetic.
+
+    Returns the SIGNED quantity to move (0.0 when nothing may move). Every cap is
+    expressed in UNITS, so the result is always back on the row's own grid and never
+    needs re-rounding.
+
+    The step count is FLOORED: a step can close the gap but never cross it. That is
+    what makes ``|residual|`` monotone and the outer loop finite, and it is also why
+    redistribution cannot create a new overshoot.
+    """
+    price = float(row.price or 0.0)
+    unit = tradeable_unit(margin, allow_fractional=allow_fractional)
+    if price <= 0 or unit <= 0:
+        return 0.0
+    buying = residual > 0
+    unit_money = _absorption_unit_money(row, valuation_mode, allocation_basis,
+                                        buying=buying)
+    if unit_money <= 0:
+        return 0.0
+    steps = math.floor(abs(residual) / (unit_money * unit) + QUANTITY_EPSILON)
+    if steps < 1:
+        return 0.0
+    current = float(row.delta_quantity or 0.0)
+    if buying:
+        if current < 0:
+            # Selling LESS. Stop one unit short of deleting the order: a row the user
+            # reviewed must not vanish because a sibling rounded badly.
+            steps = min(steps, int(math.floor(abs(current) / unit + QUANTITY_EPSILON)) - 1)
+        else:
+            # Buying MORE. Never past the buying power the plan has left.
+            cost_per_unit = unit * price * float(row.bp_factor or 1.0)
+            if cost_per_unit <= 0:
+                return 0.0
+            steps = min(steps, int(math.floor(
+                max(0.0, bp_headroom) / cost_per_unit + QUANTITY_EPSILON)))
+    else:
+        if current > 0:
+            # Buying LESS, again never to zero.
+            steps = min(steps, int(math.floor(current / unit + QUANTITY_EPSILON)) - 1)
+        else:
+            # Selling MORE. Never below flat, and never all the way to flat: closing
+            # a position is a target decision, not a rounding fix. One unit stays.
+            room = float(row.current_quantity or 0.0) + current - unit
+            steps = min(steps, int(math.floor(max(0.0, room) / unit + QUANTITY_EPSILON)))
+    if steps < 1:
+        return 0.0
+    move = (1.0 if buying else -1.0) * steps * unit
+    proposed = round(current + move, 10)
+    min_size = None if margin is None else margin.min_order_size
+    if min_size is not None and 0 < abs(proposed) < float(min_size):
+        # The broker would refuse the order the move produces, so there is no move.
+        return 0.0
+    if _below_fractional_notional_floor(proposed, margin, price):
+        # Same rule, the other unit: a fractional order under the broker's money
+        # floor is refused outright, so producing one is not an option either.
+        return 0.0
+    return round(move, 10)
+
+
+def _apply_absorption(row: "AllocationRow", move: float, label: str,
+                      baseline: float) -> None:
+    """Write an absorbed move onto a row, and SAY SO in one reason, not two.
+
+    ``bp_cost`` is recomputed from the estimate rather than scaled, which is correct
+    here and only here: redistribution runs inside the two solvers, before any broker
+    precheck has substituted a cost.
+    """
+    after = round(float(row.delta_quantity or 0.0) + move, 10)
+    row.delta_quantity = after
+    row.target_quantity = float(row.current_quantity or 0.0) + after
+    row.estimated_value = abs(after) * float(row.price)
+    row.bp_cost = row.estimated_value * float(row.bp_factor or 1.0) if after > 0 else 0.0
+    row.side = (OrderDirection.BUY if after > 0
+                else OrderDirection.SELL if after < 0 else None)
+    row.redistributed = True
+    # One reason per row, always quoting the ORIGINAL quantity, however many passes
+    # touched it -- two half-truths side by side is worse than no reason at all.
+    row.reasons = [r for r in row.reasons if not r.startswith(REASON_REDISTRIBUTED_PREFIX)]
+    row.reasons.append(REASON_REDISTRIBUTED_FMT.format(
+        before=baseline, after=after, label=label))
+
+
+def _absorber_order(members: List["AllocationRow"]) -> List["AllocationRow"]:
+    """The rows a label may move, best first, deterministically.
+
+    FRACTIONABLE first (they absorb the residual almost exactly, on a 4dp grid,
+    instead of in whole-share lumps), then rows that are already trading (adjusting
+    an order the user has reviewed is less surprising than inventing a new one), then
+    by symbol so two identical plans produce two identical results.
+
+    EXCLUDED, and this is the rule that makes D1 and D2 compatible:
+      * a row D1 BUMPED -- the only way to absorb an overshoot on it is to sell it
+        back to zero, which re-creates the floor-to-zero D1 exists to remove, in a
+        loop. Bumps are one-way;
+      * a row the grid or the broker minimum already refused (``unmet_notional`` set,
+        or ``SIZING_OUTCOME_SKIPPED_TOO_LARGE``) -- it already says "no order" on its
+        face, and giving it one anyway makes the two halves of the row contradict
+        each other;
+      * a skipped or unpriced row -- there is nothing to measure or to trade.
+    """
+    absorbers = [r for r in members
+                 if r.sizing_outcome == SIZING_OUTCOME_NORMAL
+                 and float(r.unmet_notional or 0.0) <= MONEY_EPSILON]
+    return sorted(absorbers, key=lambda r: (0 if r.fractional else 1,
+                                            0 if r.delta_quantity else 1,
+                                            r.symbol))
+
+
+def _smallest_absorbable(absorbers: List["AllocationRow"],
+                         margin: Dict[str, MarginInfo], *,
+                         allow_fractional: bool) -> float:
+    """The cheapest single step any absorber could take, or +inf if there are none."""
+    units = [tradeable_unit(margin.get(r.symbol), allow_fractional=allow_fractional)
+             * float(r.price) for r in absorbers]
+    return min(units) if units else float("inf")
+
+
+def redistribute_label_residuals(plan: "AllocationPlan",
+                                 label_targets: Dict[str, Dict[str, float]],
+                                 margin: Dict[str, MarginInfo], *,
+                                 allow_fractional: bool) -> Dict[str, float]:
+    """Move whole grid units between a label's rows until the LABEL hits its total.
+
+    Decision D2. Rounding leaves a label short of its target; D1's bumps can push it
+    over. The difference is SIGNED and redistribution is BIDIRECTIONAL: it adds
+    weight to close a shortfall and REMOVES weight to close an overshoot. A
+    one-directional "top up" is wrong the moment a single symbol is bumped.
+
+    Mutates ``plan.rows`` in place and appends to ``plan.warnings``. Runs INSIDE the
+    two solvers, before ``_apply_bp_scaling`` -- and it can never be the reason that
+    scaling has to fire, because every upward move is capped by the plan's live
+    buying-power headroom.
+
+    Args:
+        plan: the solved plan. ``valuation_mode`` and ``allocation_basis`` decide
+            what "on target" means.
+        label_targets: ``{label: {symbol: target_notional_for_THIS_label}}`` -- the
+            per-label split, which ``AllocationRow.target_notional`` cannot provide
+            because a symbol in two labels carries their SUM.
+        margin: ``{symbol: MarginInfo}``, the same dict the plan was solved with, so
+            redistribution rounds on the same grid the sizing did.
+        allow_fractional: the run's toggle, again so the grids match.
+
+    Returns:
+        Dict[str, float]: ``{label: residual left over}``, signed. A label with no
+        movable member is absent.
+
+    Termination: every step is ``floor(|residual| / one_unit) * one_unit``, so it can
+    close the gap but never cross it; ``|residual|`` therefore decreases strictly
+    whenever anything moves. A pass walks a fixed absorber list once and recomputes
+    the residual after each row; a pass that moves nothing exits at the fixed point.
+    ``REDISTRIBUTION_MAX_PASSES`` bounds it regardless, and a bound that actually
+    stops the loop is REPORTED, never swallowed.
+    """
+    margin = margin or {}
+    mode = plan.valuation_mode
+    basis = plan.allocation_basis
+    out: Dict[str, float] = {}
+    for label in sorted(label_targets or {}):
+        wanted = label_targets[label] or {}
+        # Both sides of the comparison are restricted to the SAME member set: rows
+        # this label alone owns. A multi-label symbol is out of the scheme entirely,
+        # target and projection together, so the arithmetic stays self-consistent.
+        members = [r for r in plan.rows
+                   if len(r.labels) == 1 and r.labels[0] == label
+                   and not r.skipped and r.price is not None and r.price > 0]
+        if not members:
+            continue
+        target_total = sum(float(wanted.get(r.symbol, 0.0) or 0.0) for r in members)
+        absorbers = _absorber_order(members)
+        baselines = {r.symbol: float(r.delta_quantity or 0.0) for r in members}
+        residual = _label_residual(target_total, members, mode, basis)
+        passes = 0
+        moved_any = False
+        while passes < REDISTRIBUTION_MAX_PASSES and abs(residual) > MONEY_EPSILON:
+            passes += 1
+            moved_this_pass = False
+            for row in absorbers:
+                if abs(residual) <= MONEY_EPSILON:
+                    break
+                move = _absorb_residual(
+                    row, residual, margin.get(row.symbol),
+                    allow_fractional=allow_fractional, valuation_mode=mode,
+                    allocation_basis=basis, bp_headroom=_buying_power_headroom(plan))
+                if not move:
+                    continue
+                _apply_absorption(row, move, label, baselines[row.symbol])
+                moved_this_pass = True
+                moved_any = True
+                residual = _label_residual(target_total, members, mode, basis)
+            if not moved_this_pass:
+                break
+        out[label] = residual
+        if abs(residual) <= MONEY_EPSILON:
+            continue
+        if passes >= REDISTRIBUTION_MAX_PASSES:
+            plan.warnings.append(WARNING_RESIDUAL_UNCONVERGED_FMT.format(
+                label=label, residual=residual, passes=REDISTRIBUTION_MAX_PASSES))
+        elif abs(residual) >= _smallest_absorbable(
+                absorbers, margin, allow_fractional=allow_fractional):
+            # Some member could physically have taken this and none was allowed to.
+            plan.warnings.append(WARNING_RESIDUAL_LEFT_FMT.format(
+                label=label, residual=residual))
+        # Otherwise the leftover is under one tradeable unit of every absorber:
+        # pure arithmetic, reported as money by fractional_summary, not as a fault.
+    return out
