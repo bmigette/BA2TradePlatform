@@ -417,3 +417,51 @@ def test_get_orders_filled_filter_maps_to_the_tastytrade_filled_status():
     acct.get_orders(status=OrderStatus.FILLED)
 
     assert acct._account.get_order_history.call_args.kwargs["statuses"] == [TTOrderStatus.FILLED]
+
+
+# ---------------------------------------------------------------------------
+# get_order id handling
+# ---------------------------------------------------------------------------
+
+def _capture_errors(monkeypatch):
+    """Collect ``logger.error`` messages emitted by the TastyTradeAccount module.
+
+    NOT caplog. Two independent reasons it cannot be used here:
+      * ba2_trade_platform.logger installs its own handler and sets
+        propagate = False, so caplog's ROOT handler never sees the record; and
+      * tests/test_penny_gainers_fix.py:53 replaces
+        sys.modules["ba2_trade_platform.logger"] with a MagicMock at import time,
+        so under a full-suite collection even re-enabling propagation on the
+        object that import yields patches a mock, not the real logger.
+    Patching the module-under-test's own ``logger`` is immune to both.
+    """
+    import sys
+    TT = sys.modules[TastyTradeAccount.__module__]
+    messages = []
+    monkeypatch.setattr(TT.logger, "error", lambda msg, *a, **k: messages.append(str(msg)))
+    return messages
+
+
+def test_get_order_with_a_non_numeric_id_says_so_instead_of_blaming_the_broker(monkeypatch):
+    """TastyTrade order ids are integers. A UUID left on a migrated row must be
+    reported as a bad id, not logged as 'Error getting order ...' as if the broker
+    had failed."""
+    errors = _capture_errors(monkeypatch)
+
+    acct = _bare_account()
+    acct._account.get_order = AsyncMock()
+
+    assert acct.get_order("6e2d1f3a-0000-4c11-9c1e-8d2f3a4b5c6d") is None
+
+    assert any("is not a TastyTrade order id" in m for m in errors), errors
+    acct._account.get_order.assert_not_called()
+
+
+def test_get_order_with_numeric_id_queries_the_broker_with_an_int():
+    """Regression guard: a padded numeric id must still resolve."""
+    acct = _bare_account()
+    acct._account.get_order = AsyncMock(return_value=_placed_order(order_id=987654))
+
+    acct.get_order(" 987654 ")
+
+    assert acct._account.get_order.call_args.args[1] == 987654

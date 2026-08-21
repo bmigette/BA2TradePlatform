@@ -360,12 +360,24 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
             return []
 
     def get_order(self, order_id: str) -> Any:
+        """Fetch one order by its BROKER id.
+
+        TastyTrade order ids are integers. A non-numeric id -- an Alpaca UUID left on
+        a migrated row, or a caller handing over something else entirely -- is
+        rejected up front and logged as such, instead of raising ValueError out of a
+        bare ``int()`` and being reported as a broker failure.
+        """
         if not self._check_authentication():
             return None
         try:
-            from tastytrade.account import Account as TastyAccount
-            order = self._run_async(self._account.get_order(self._session, int(order_id)))
-            return order
+            broker_id = int(str(order_id).strip())
+        except (TypeError, ValueError):
+            logger.error(
+                f"[Account {self.id}] '{order_id}' is not a TastyTrade order id "
+                f"(broker ids are numeric)")
+            return None
+        try:
+            return self._run_async(self._account.get_order(self._session, broker_id))
         except Exception as e:
             logger.error(f"[Account {self.id}] Error getting order {order_id}: {e}", exc_info=True)
             return None
