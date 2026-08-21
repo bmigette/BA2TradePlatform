@@ -168,9 +168,16 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
             return {
                 "account_number": self._account.account_number,
                 "account_type": self._account.account_type_name,
+                # `buying_power` MUST be present and MUST come first among the
+                # spendable-balance keys: MarketExpertInterface._get_actual_available_balance
+                # probes buying_power -> cash -> cash_balance -> equity_buying_power and
+                # takes the FIRST hit. Without it the probe fell through to cash_balance
+                # and margin buying power was silently ignored.
+                "buying_power": float(balances.equity_buying_power),
                 "net_liquidating_value": float(balances.net_liquidating_value),
                 "cash_balance": float(balances.cash_balance),
                 "equity_buying_power": float(balances.equity_buying_power),
+                "derivative_buying_power": float(balances.derivative_buying_power),
                 "long_equity_value": float(balances.long_equity_value),
                 "short_equity_value": float(balances.short_equity_value),
                 "margin_equity": float(balances.margin_equity),

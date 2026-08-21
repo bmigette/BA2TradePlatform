@@ -255,3 +255,30 @@ def test_run_async_raises_timeout_error_naming_the_budget():
 def test_run_async_default_budget_exceeds_the_old_thirty_second_limit():
     """Paginated history calls routinely exceed 30s; the default must be generous."""
     assert TastyTradeAccount._ASYNC_TIMEOUT_SECONDS >= 120
+
+
+# ---------------------------------------------------------------------------
+# get_account_info
+# ---------------------------------------------------------------------------
+
+def test_get_account_info_publishes_buying_power_from_equity_buying_power():
+    acct = _bare_account()
+    acct._account.get_balances = AsyncMock(return_value=_balances())
+
+    info = acct.get_account_info()
+
+    assert info["buying_power"] == 50000.0
+
+
+def test_actual_available_balance_uses_margin_buying_power_not_cash():
+    """The expert probe stops at the FIRST of buying_power/cash/cash_balance/
+    equity_buying_power. Without a buying_power key it fell through to cash_balance
+    and a margin account was sized as if it were a cash account."""
+    from ba2_trade_platform.core.interfaces.MarketExpertInterface import MarketExpertInterface
+
+    acct = _bare_account()
+    acct._account.get_balances = AsyncMock(
+        return_value=_balances(cash_balance=Decimal("25000"),
+                               equity_buying_power=Decimal("50000")))
+
+    assert MarketExpertInterface._get_actual_available_balance(acct) == 50000.0
