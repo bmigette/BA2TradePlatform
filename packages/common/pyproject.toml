@@ -12,6 +12,7 @@ dependencies = [
     "sqlalchemy>=2.0.36",
     "pydantic>=2.10.0",
     "pandas>=2.2.0,<3.0.0",
+    "pandas-market-calendars>=5.1.1",
     "pyarrow>=15",
     "numpy>=2.0.0",
     "python-dateutil>=2.9.0",
