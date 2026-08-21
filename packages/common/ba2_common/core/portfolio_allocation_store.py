@@ -31,7 +31,11 @@ from ba2_common.core.models import (
     PortfolioAllocationSymbol,
     PortfolioIncomeEvent,
 )
-from ba2_common.core.portfolio_allocation import even_split_pct
+from ba2_common.core.portfolio_allocation import (
+    VALUATION_MODE_COST,
+    VALUATION_MODE_MARKET,
+    even_split_pct,
+)
 from ba2_common.logger import logger
 
 
@@ -270,3 +274,73 @@ def remove_symbol_weight(account_id: int, label: str, symbol: str) -> bool:
         session.delete(row)
         session.commit()
     return True
+
+
+# ---------------------------------------------------------------------------
+# Per-account config: valuation mode + the remembered fractional choice
+# ---------------------------------------------------------------------------
+
+def get_allocation_config(account_id: int) -> PortfolioAllocationConfig:
+    """The account's allocation config, CREATING it with the defaults on first use.
+
+    Defaults are ``valuation_mode="cost"`` and ``allow_fractional=False`` (spec
+    decision 5a). Always returns a row, never ``None``: the page must always be
+    able to state which valuation mode produced the numbers on screen.
+
+    Pass the returned ``valuation_mode`` EXPLICITLY to the engine. The engine's
+    own Python defaults deliberately disagree with each other
+    (``compute_base_notional`` defaults to cost, the solvers to market), so
+    relying on a default is how the base and the deltas end up on different
+    definitions of "current value".
+    """
+    with get_db() as session:
+        row = session.exec(
+            select(PortfolioAllocationConfig).where(
+                PortfolioAllocationConfig.account_id == account_id)
+        ).first()
+        if row is None:
+            row = PortfolioAllocationConfig(account_id=account_id)
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            logger.info(f"Created default allocation config for account {account_id} "
+                        f"(valuation_mode={VALUATION_MODE_COST}, allow_fractional=False)")
+        session.expunge(row)
+        return row
+
+
+def set_allocation_config(account_id: int, *,
+                          valuation_mode: Optional[str] = None,
+                          allow_fractional: Optional[bool] = None) -> PortfolioAllocationConfig:
+    """Update the account's allocation config; ``None`` leaves a field unchanged.
+
+    Raises:
+        ValueError: when ``valuation_mode`` is neither ``VALUATION_MODE_COST`` nor
+        ``VALUATION_MODE_MARKET``. A typo'd mode would silently reinterpret every
+        percentage on the page -- and the engine only rejects it later, at plan
+        time -- so it is refused here rather than stored.
+    """
+    if valuation_mode is not None and valuation_mode not in (
+            VALUATION_MODE_COST, VALUATION_MODE_MARKET):
+        raise ValueError(
+            f"Unknown valuation_mode {valuation_mode!r}; expected "
+            f"{VALUATION_MODE_COST!r} or {VALUATION_MODE_MARKET!r}")
+
+    get_allocation_config(account_id)   # ensure the row exists
+    with get_db() as session:
+        row = session.exec(
+            select(PortfolioAllocationConfig).where(
+                PortfolioAllocationConfig.account_id == account_id)
+        ).one()
+        if valuation_mode is not None:
+            row.valuation_mode = valuation_mode
+        if allow_fractional is not None:
+            row.allow_fractional = bool(allow_fractional)
+        row.updated_at = DateTime.now(timezone.utc)
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        session.expunge(row)
+        logger.info(f"Allocation config for account {account_id}: "
+                    f"valuation_mode={row.valuation_mode}, allow_fractional={row.allow_fractional}")
+        return row

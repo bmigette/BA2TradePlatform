@@ -3746,7 +3746,18 @@ Expected: FAIL — `AttributeError: module 'ba2_common.core.portfolio_allocation
 
 - [ ] **Step 3: Write minimal implementation**
 
-Append to the end of `packages/common/ba2_common/core/portfolio_allocation_store.py`:
+First widen the store's EXISTING module-level engine import (added in Task 10) in
+`packages/common/ba2_common/core/portfolio_allocation_store.py`:
+
+```python
+from ba2_common.core.portfolio_allocation import (
+    VALUATION_MODE_COST,
+    VALUATION_MODE_MARKET,
+    even_split_pct,
+)
+```
+
+Then append to the end of the same file:
 
 ```python
 
@@ -3761,6 +3772,12 @@ def get_allocation_config(account_id: int) -> PortfolioAllocationConfig:
     Defaults are ``valuation_mode="cost"`` and ``allow_fractional=False`` (spec
     decision 5a). Always returns a row, never ``None``: the page must always be
     able to state which valuation mode produced the numbers on screen.
+
+    Pass the returned ``valuation_mode`` EXPLICITLY to the engine. The engine's
+    own Python defaults deliberately disagree with each other
+    (``compute_base_notional`` defaults to cost, the solvers to market), so
+    relying on a default is how the base and the deltas end up on different
+    definitions of "current value".
     """
     with get_db() as session:
         row = session.exec(
@@ -3773,7 +3790,7 @@ def get_allocation_config(account_id: int) -> PortfolioAllocationConfig:
             session.commit()
             session.refresh(row)
             logger.info(f"Created default allocation config for account {account_id} "
-                        f"(valuation_mode=cost, allow_fractional=False)")
+                        f"(valuation_mode={VALUATION_MODE_COST}, allow_fractional=False)")
         session.expunge(row)
         return row
 
@@ -3786,12 +3803,9 @@ def set_allocation_config(account_id: int, *,
     Raises:
         ValueError: when ``valuation_mode`` is neither ``VALUATION_MODE_COST`` nor
         ``VALUATION_MODE_MARKET``. A typo'd mode would silently reinterpret every
-        percentage on the page, so it is rejected rather than stored.
+        percentage on the page -- and the engine only rejects it later, at plan
+        time -- so it is refused here rather than stored.
     """
-    from ba2_common.core.portfolio_allocation import (
-        VALUATION_MODE_COST, VALUATION_MODE_MARKET,
-    )
-
     if valuation_mode is not None and valuation_mode not in (
             VALUATION_MODE_COST, VALUATION_MODE_MARKET):
         raise ValueError(
@@ -3818,9 +3832,16 @@ def set_allocation_config(account_id: int, *,
         return row
 ```
 
-The `VALUATION_MODE_*` import is LOCAL to the function on purpose: it keeps the store's
-module-level import graph to `db` + `models` + `logger`, so importing the store never drags the
-engine in.
+**As landed:** the `VALUATION_MODE_*` import is MODULE-LEVEL, not function-local as this plan
+originally specified. The original rationale — "it keeps the store's module-level import graph to
+`db` + `models` + `logger`, so importing the store never drags the engine in" — was already false
+by the time this task ran: Task 10 added a module-level
+`from ba2_common.core.portfolio_allocation import even_split_pct`, and the store's module
+docstring already announces that it borrows both the two `VALUATION_MODE_*` constants and
+`even_split_pct` from the engine. A second, function-local import of the same module would have
+bought nothing and left two contradictory conventions in one file. The dependency stays
+one-directional and cycle-free (store -> engine, never the reverse), which is the property that
+actually mattered.
 
 - [ ] **Step 4: Run test to verify it passes**
 
