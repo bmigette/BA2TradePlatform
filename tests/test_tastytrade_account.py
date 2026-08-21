@@ -1249,7 +1249,6 @@ def _order_on_another_account(**kwargs):
     """A persisted TradingOrder belonging to a DIFFERENT account than the one under
     test, returned alongside an account whose id is not its owner's."""
     from tests.factories import create_account_definition
-    from ba2_trade_platform.core.types import OrderDirection, OrderStatus, OrderType
 
     other_def, order = _tt_trading_order(**kwargs)
     mine = create_account_definition(name="TastyTrade Mine", provider="TastyTrade")
