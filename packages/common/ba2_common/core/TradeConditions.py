@@ -17,6 +17,10 @@ from ba2_common.core.db import get_db
 from ba2_common.logger import logger
 from sqlmodel import select
 from ba2_common.core.failure_modes import absorb_if_benign
+# The established vocabulary for "the broker's position fetch FAILED" — reused rather
+# than re-invented so the engine, the live service, the UI and the conditions all raise
+# and catch the same class. See its docstring for the 2026-07-03 incident.
+from ba2_common.core.portfolio_allocation import PositionFetchFailed
 
 
 # --- Provider-injection seam -------------------------------------------------
@@ -150,21 +154,64 @@ class TradeCondition(ABC):
     def get_current_position(self) -> Optional[float]:
         """
         Get current position quantity for the instrument.
-        
+
+        ``get_positions()`` is TRI-STATE (see ``ReadOnlyAccountInterface.get_positions``):
+        a list of positions, ``[]`` for a CONFIRMED flat account, and ``None`` when the
+        FETCH ITSELF FAILED. This method collapses only the first two into a quantity;
+        the third is raised, because "we could not find out" must never be reported with
+        the same value as "we looked and there is nothing".
+
+        It used to return ``None`` for both. During a positions outage that made
+        ``has_account_position()`` False and ``HasNoPositionAccountCondition`` TRUE, so a
+        live "when there is no position, BUY" ruleset opened a DUPLICATE position on top
+        of one the broker was already holding. Same family as the 2026-07-03 incident, in
+        the opposite direction: there an unverified book mass-CLOSED, here it BUYS.
+
         Returns:
-            Position quantity (positive for long, negative for short, None if no position)
+            Position quantity (positive long / negative short) for this instrument, or
+            ``None`` when the fetch SUCCEEDED and this instrument is simply not held.
+
+        Raises:
+            PositionFetchFailed: the position book is UNVERIFIED. Callers must decide,
+                and every caller must decide NOT to act.
         """
         try:
             positions = self.account.get_positions()
-            for position in positions:
-                if hasattr(position, 'symbol') and position.symbol == self.instrument_name:
-                    return getattr(position, 'qty', None)
-            return None
         except Exception as e:
-            absorb_if_benign(e)
-            logger.error(f"Error getting current position: {e}", exc_info=True)
-            return None
-    
+            # A transport failure (OSError covers ConnectionError / socket.gaierror / timeouts)
+            # is a GENUINE runtime condition at this site, named per failure_modes' "say what
+            # you expect" rule; anything else is a defect and still propagates under enforce.
+            absorb_if_benign(e, OSError)
+            logger.error(
+                f"Position fetch RAISED for {self.instrument_name}: {e} — the account's "
+                f"position book is unverified", exc_info=True)
+            raise PositionFetchFailed(
+                f"get_positions() raised while checking {self.instrument_name}: {e}") from e
+
+        if positions is None:
+            # The documented failure signal. Every broker adapter is required to report an
+            # outage this way rather than as [] (a lie that reads as "the account is flat").
+            logger.error(
+                f"Position fetch FAILED for {self.instrument_name}: "
+                f"{type(self.account).__name__}.get_positions() returned None "
+                f"(fetch failure, NOT a flat account) — position-dependent conditions "
+                f"must refuse to fire")
+            raise PositionFetchFailed(
+                f"get_positions() returned None while checking {self.instrument_name}")
+
+        for position in positions:
+            # Dict-shaped books are real (some adapters/tests hand back plain dicts). The old
+            # `hasattr(position, 'symbol')` test silently skipped every one of them and
+            # answered "no position" — its own silent wrong answer.
+            if isinstance(position, dict):
+                symbol, qty = position.get('symbol'), position.get('qty')
+            else:
+                symbol, qty = getattr(position, 'symbol', None), getattr(position, 'qty', None)
+            if symbol == self.instrument_name:
+                return qty
+        return None
+
+
     def get_current_price(self) -> Optional[float]:
         """
         Get current market price for the instrument.
@@ -216,9 +263,20 @@ class TradeCondition(ABC):
         """
         Check if there's an open position for this instrument at the account level.
         This is the original account-level position check behavior.
-        
+
+        DELIBERATELY NOT TOTAL. ``PositionFetchFailed`` propagates instead of being
+        flattened into ``False``, because a bool cannot carry "unknown" and every
+        collapse of unknown-to-a-bool picks a direction that is wrong half the time:
+        ``False`` fires "no position -> BUY" (duplicate position), ``True`` fires
+        "has position -> CLOSE" (blind close). Callers must handle the third state
+        explicitly and refuse to act.
+
         Returns:
-            True if account has position exists, False otherwise
+            True if the account holds a non-zero position in this instrument.
+
+        Raises:
+            PositionFetchFailed: the position book is UNVERIFIED — see
+                :meth:`get_current_position`.
         """
         position = self.get_current_position()
         return position is not None and position != 0
@@ -427,38 +485,65 @@ class HasSellPositionCondition(FlagCondition):
 
 
 # Account-level Position Conditions
-class HasNoPositionAccountCondition(FlagCondition):
+class AccountPositionCondition(FlagCondition):
+    """Shared fail-safe wiring for the two account-level position conditions.
+
+    Both are FALSE when the position book is unverified. That is the only direction
+    that is safe for both of them at once: an outage must not read as "no position"
+    (which opens a duplicate on top of a real holding) NOR as "has position" (which
+    closes against a book nobody confirmed). Triggers are ANDed and never negated by
+    the evaluator, so a False condition simply means the rule does not fire.
+    """
+
+    def _has_account_position_or_none(self) -> Optional[bool]:
+        """True/False when the book is CONFIRMED, None when the fetch failed."""
+        self._fetch_failed = False
+        try:
+            self._has_position = self.has_account_position()
+        except PositionFetchFailed as e:
+            self._fetch_failed = True
+            self._has_position = None
+            logger.error(
+                f"{type(self).__name__} for {self.instrument_name} evaluates FALSE: the "
+                f"account position book is UNVERIFIED ({e}). An unverified book is not an "
+                f"empty book — refusing to act rather than guess.")
+        return self._has_position
+
+    def get_actual_value_display(self) -> Optional[str]:
+        if getattr(self, '_fetch_failed', False):
+            # Must not read like a confirmed "No" — that conflation is the bug.
+            return "Account position: UNKNOWN (broker position fetch failed)"
+        has_pos = getattr(self, '_has_position', None)
+        if has_pos is None:
+            return None
+        return f"Account position found: {'Yes' if has_pos else 'No'}"
+
+
+class HasNoPositionAccountCondition(AccountPositionCondition):
     """Check if there's no open position for the instrument at the account level."""
 
     def evaluate(self) -> bool:
-        self._has_position = self.has_account_position()
-        return not self._has_position
+        has_position = self._has_account_position_or_none()
+        if has_position is None:
+            return False        # unknown != "no position"
+        return not has_position
 
     def get_description(self) -> str:
         """Get description of account-level no position condition."""
         return f"Check if account has no open position for {self.instrument_name} (account-level)"
 
-    def get_actual_value_display(self) -> Optional[str]:
-        has_pos = getattr(self, '_has_position', None)
-        if has_pos is None:
-            return None
-        return f"Account position found: {'Yes' if has_pos else 'No'}"
 
-class HasPositionAccountCondition(FlagCondition):
+class HasPositionAccountCondition(AccountPositionCondition):
     """Check if there's an open position for the instrument at the account level."""
 
     def evaluate(self) -> bool:
-        self._has_position = self.has_account_position()
-        return self._has_position
+        has_position = self._has_account_position_or_none()
+        if has_position is None:
+            return False        # unknown != "has position"
+        return has_position
 
     def get_description(self) -> str:
         return f"Check if account has an open position for {self.instrument_name} (account-level)"
-
-    def get_actual_value_display(self) -> Optional[str]:
-        has_pos = getattr(self, '_has_position', None)
-        if has_pos is None:
-            return None
-        return f"Account position found: {'Yes' if has_pos else 'No'}"
 
 # Time Horizon Flag Conditions
 class LongTermCondition(FlagCondition):
