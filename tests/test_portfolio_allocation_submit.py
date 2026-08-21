@@ -3,14 +3,15 @@
 Uses tests/conftest.py's in-memory SQLite (autouse `patch_db_engine`) and a
 duck-typed FakeAccount -- no broker, no NiceGUI.
 """
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 from sqlmodel import select
 
 from ba2_trade_platform.core.account_types import (
     CASH_TRANSFER_DEPOSIT, CASH_TRANSFER_DIVIDEND, CASH_TRANSFER_WITHDRAWAL,
-    CashTransfer, MarginInfo, OrderImpact,
+    MARKET_HOURS_SOURCE_BROKER, MARKET_HOURS_SOURCE_UNAVAILABLE,
+    CashTransfer, MarginInfo, MarketHours, OrderImpact,
 )
 from ba2_trade_platform.core.db import add_instance, get_db, get_instance, update_instance
 from ba2_trade_platform.core.models import (
@@ -100,6 +101,19 @@ class FakeAccount:
         #: to pull the TP/SL leg, so nothing will ever trigger off its cancel).
         self.cancel_failures = set()
         self.canceled = []           # [order_id] the caller asked us to cancel
+        # Market hours: OPEN by default at a FROZEN instant, so every pre-existing
+        # submission test keeps meaning what it meant and none of them depends on
+        # the wall clock. Reassign to simulate a closed or unavailable market.
+        self.market_hours = MarketHours(
+            is_open=True, source=MARKET_HOURS_SOURCE_BROKER, as_of=FROZEN_NOW,
+            open_at=None, close_at=MARKET_CLOSE, next_open=None, next_close=MARKET_CLOSE)
+        self.market_hours_error = None
+
+    def get_market_hours(self, *, now=None):
+        """Mirrors ReadOnlyAccountInterface.get_market_hours' signature exactly."""
+        if self.market_hours_error is not None:
+            raise self.market_hours_error
+        return self.market_hours
 
     def get_positions(self):
         return self.positions
@@ -2288,3 +2302,242 @@ def test_run_allocation_remembers_the_fractional_choice_it_ran_with():
     svc.run_allocation(account, plan, {}, make_base(), mode=ALLOCATION_MODE_REBALANCE)
 
     assert get_allocation_config(41).allow_fractional is False
+
+
+# ---------------------------------------------------------------------------
+# Market-hours gating of the live Submit path
+# ---------------------------------------------------------------------------
+# Every market-hours test freezes the clock explicitly. 2026-08-20 17:00 UTC is
+# 13:00 ET, mid-session; the close is 20:00 UTC == 16:00 ET.
+FROZEN_NOW = datetime(2026, 8, 20, 17, 0, tzinfo=timezone.utc)
+MARKET_CLOSE = datetime(2026, 8, 20, 20, 0, tzinfo=timezone.utc)
+NEXT_OPEN = datetime(2026, 8, 21, 13, 30, tzinfo=timezone.utc)
+
+
+def _closed_hours(status=None, detail=None):
+    return MarketHours(is_open=False, source=MARKET_HOURS_SOURCE_BROKER,
+                       as_of=FROZEN_NOW, open_at=NEXT_OPEN, close_at=None,
+                       next_open=NEXT_OPEN, next_close=None,
+                       status=status, detail=detail)
+
+
+def _capture_errors(monkeypatch):
+    """Collect ``logger.error`` messages emitted by the service module.
+
+    NOT caplog. Two independent reasons it cannot be used here:
+      * ba2_trade_platform.logger installs its own handler and sets
+        propagate = False, so caplog's ROOT handler never sees the record; and
+      * tests/test_penny_gainers_fix.py replaces
+        sys.modules["ba2_trade_platform.logger"] with a MagicMock at import time, so
+        under a full-suite collection even re-enabling propagation patches a mock.
+    Patching the module-under-test's own ``logger`` is immune to both.
+    """
+    import sys
+    module = sys.modules[svc.__name__]
+    messages = []
+    monkeypatch.setattr(module.logger, "error", lambda msg, *a, **k: messages.append(str(msg)))
+    return messages
+
+
+def test_fetch_market_hours_returns_what_the_broker_published():
+    account = FakeAccount(account_id=51)
+    hours = svc.fetch_market_hours(account)
+    assert hours is not None
+    assert hours.is_open is True
+    assert hours.is_known is True
+
+
+def test_fetch_market_hours_returns_none_when_the_seam_raises():
+    account = FakeAccount(account_id=52)
+    account.market_hours_error = RuntimeError("clock endpoint 503")
+    assert svc.fetch_market_hours(account) is None
+
+
+def test_fetch_market_hours_returns_none_when_the_account_has_no_seam():
+    class NoSeam:
+        id = 53
+    assert svc.fetch_market_hours(NoSeam()) is None
+
+
+def test_fetch_market_hours_logs_the_failure_rather_than_swallowing_it(monkeypatch):
+    errors = _capture_errors(monkeypatch)
+
+    account = FakeAccount(account_id=54)
+    account.market_hours_error = RuntimeError("clock endpoint 503")
+    svc.fetch_market_hours(account)
+
+    assert any("market hours" in e.lower() for e in errors), errors
+
+
+def test_run_allocation_refuses_to_submit_while_the_market_is_closed():
+    account = FakeAccount(account_id=55)
+    account.positions = []
+    account.market_hours = _closed_hours()
+    row = make_row("AAPL", OrderDirection.BUY, 10.0, 1_600.0, 1_600.0, price=160.0)
+    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
+
+    result = svc.run_allocation(account, plan, {}, make_base(),
+                                mode=ALLOCATION_MODE_REBALANCE)
+
+    assert result["blocked"] is True
+    assert result["run_id"] is None
+    assert result["outcomes"] == []
+    assert account.submitted == []
+    assert "closed" in result["blocked_reason"].lower()
+
+
+def test_a_blocked_run_quotes_the_brokers_own_word_for_why():
+    """D4: the gate is regular-session only, so a user blocked at 17:00 must be told
+    that extended hours is not "open" here, not left guessing."""
+    account = FakeAccount(account_id=59)
+    account.positions = []
+    account.market_hours = _closed_hours(status="Extended")
+    plan = AllocationPlan(rows=[], available_buying_power=10_000.0)
+
+    result = svc.run_allocation(account, plan, {}, make_base(),
+                                mode=ALLOCATION_MODE_REBALANCE)
+
+    assert "Extended" in result["blocked_reason"]
+
+
+def test_run_allocation_blocked_by_a_closed_market_writes_no_run_row():
+    """No run row means no order comments to stamp and, above all, no income
+    consumed -- finalise_allocation_run is one-shot."""
+    account = FakeAccount(account_id=1_056)
+    account.positions = []
+    account.market_hours = _closed_hours()
+    plan = AllocationPlan(rows=[make_row("AAPL", OrderDirection.BUY, 1.0, 160.0, 160.0,
+                                         price=160.0)],
+                          available_buying_power=10_000.0)
+
+    svc.run_allocation(account, plan, {}, make_base(), mode=ALLOCATION_MODE_REBALANCE)
+
+    with get_db() as session:
+        rows = session.exec(select(PortfolioAllocationRun).where(
+            PortfolioAllocationRun.account_id == 1_056)).all()
+    assert rows == []
+
+
+def test_run_allocation_refuses_when_market_hours_cannot_be_read_at_all():
+    """Unknown is not open. The alternative is submitting on a guess."""
+    account = FakeAccount(account_id=57)
+    account.positions = []
+    account.market_hours_error = RuntimeError("clock endpoint 503")
+    plan = AllocationPlan(rows=[make_row("AAPL", OrderDirection.BUY, 1.0, 160.0, 160.0,
+                                         price=160.0)],
+                          available_buying_power=10_000.0)
+
+    result = svc.run_allocation(account, plan, {}, make_base(),
+                                mode=ALLOCATION_MODE_REBALANCE)
+
+    assert result["blocked"] is True
+    assert account.submitted == []
+    assert "not confirmed open" in result["blocked_reason"]
+
+
+def test_run_allocation_refuses_an_unavailable_answer_even_though_it_is_not_none():
+    """source=UNAVAILABLE carries is_open=False so the money path fails closed, and
+    is_known=False so nobody may read it as "the market is shut"."""
+    account = FakeAccount(account_id=60)
+    account.positions = []
+    account.market_hours = MarketHours(is_open=False, as_of=FROZEN_NOW,
+                                       source=MARKET_HOURS_SOURCE_UNAVAILABLE,
+                                       detail="broker and calendar both failed")
+    plan = AllocationPlan(rows=[], available_buying_power=10_000.0)
+
+    result = svc.run_allocation(account, plan, {}, make_base(),
+                                mode=ALLOCATION_MODE_REBALANCE)
+
+    assert result["blocked"] is True
+    assert "not confirmed open" in result["blocked_reason"]
+
+
+def test_a_blocked_run_consumes_no_income_and_leaves_the_ledger_alone():
+    """The reason the gate is the FIRST statement: finalise_allocation_run is
+    one-shot, so a run created for orders that were all refused would mark that
+    income spent forever."""
+    account = FakeAccount(account_id=1_057)
+    account.positions = []
+    account.market_hours = _closed_hours()
+    add_instance(PortfolioIncomeEvent(account_id=1_057, external_id="dep-1",
+                                      event_date=date(2026, 5, 1),
+                                      event_type=CASH_TRANSFER_DEPOSIT, amount=5_000.0))
+    plan = AllocationPlan(rows=[make_row("AAPL", OrderDirection.BUY, 10.0, 1_600.0,
+                                         1_600.0, price=160.0)],
+                          available_buying_power=10_000.0)
+
+    result = svc.run_allocation(account, plan, {}, make_base(),
+                                mode=ALLOCATION_MODE_REBALANCE)
+
+    assert result["income_consumed"] == 0.0
+    assert svc.get_open_income_total(1_057) == pytest.approx(5_000.0)
+
+
+def test_a_blocked_run_returns_every_key_an_unblocked_one_does():
+    """The two branches must never disagree on shape: a caller reading
+    result["filled_buy_value"] must not KeyError only when the market was open."""
+    blocked_account = FakeAccount(account_id=61)
+    blocked_account.positions = []
+    blocked_account.market_hours = _closed_hours()
+    open_account = FakeAccount(account_id=62)
+    open_account.positions = []
+
+    blocked = svc.run_allocation(blocked_account, AllocationPlan(rows=[]), {},
+                                 make_base(), mode=ALLOCATION_MODE_REBALANCE)
+    allowed = svc.run_allocation(open_account, AllocationPlan(rows=[]), {},
+                                 make_base(), mode=ALLOCATION_MODE_REBALANCE)
+
+    assert set(blocked) == set(allowed)
+    assert blocked["filled_buy_value"] == 0.0
+    assert blocked["filled_sell_value"] == 0.0
+    assert blocked["settled"] is True
+    assert blocked["working_order_ids"] == []
+    assert allowed["blocked"] is False
+    assert allowed["blocked_reason"] is None
+
+
+def test_run_allocation_with_an_open_market_is_not_blocked():
+    account = FakeAccount(account_id=58)
+    account.positions = []
+    plan = AllocationPlan(rows=[make_row("AAPL", OrderDirection.BUY, 1.0, 160.0, 160.0,
+                                         price=160.0)],
+                          available_buying_power=10_000.0)
+
+    result = svc.run_allocation(account, plan, {}, make_base(),
+                                mode=ALLOCATION_MODE_REBALANCE)
+
+    assert result["blocked"] is False
+    assert result["run_id"] is not None
+    assert [s[0] for s in account.submitted] == ["AAPL"]
+
+
+def _capture_warnings(monkeypatch):
+    import sys
+    module = sys.modules[svc.__name__]
+    messages = []
+    monkeypatch.setattr(module.logger, "warning",
+                        lambda msg, *a, **k: messages.append(str(msg)))
+    return messages
+
+
+def test_the_two_unknown_market_hours_causes_are_distinguishable_in_the_log(monkeypatch):
+    """Both block, and both are right to block -- but "this account class has no
+    market-hours seam" is a code defect that will block EVERY submission from now
+    on, while "the broker returned nothing" is a transient. Reporting them with the
+    same sentence makes the permanent one look like the transient one."""
+    warnings = _capture_warnings(monkeypatch)
+
+    class NoSeam:
+        id = 5_301
+
+    assert svc.fetch_market_hours(NoSeam()) is None
+    no_seam = list(warnings)
+    assert len(no_seam) == 1, no_seam
+    assert "5301" in no_seam[0] and "seam" in no_seam[0]
+
+    warnings.clear()
+    silent = FakeAccount(account_id=5_302)
+    silent.market_hours = None
+    assert svc.fetch_market_hours(silent) is None
+    assert len(warnings) == 1, warnings
+    assert "5302" in warnings[0] and "seam" not in warnings[0]

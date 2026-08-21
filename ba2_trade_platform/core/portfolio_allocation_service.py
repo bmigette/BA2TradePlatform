@@ -1024,6 +1024,9 @@ def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionSta
     """Submit a reviewed plan and record it. The single Submit entry point.
 
     Order of operations:
+      0. GATE on market hours: if the market is not confirmed open, return
+         ``blocked=True`` having written nothing at all. This is the FIRST statement
+         in the function, before the store import and before any DB write.
       1. INSERT the ``portfolio_allocation_run`` row with the plan snapshot and
          zero submitted values, so its id can be stamped into every order comment.
       2. Submit (sells first, buys descending, per-row outcomes).
@@ -1040,6 +1043,33 @@ def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionSta
     ``allow_fractional`` is taken from the plan and from nowhere else: it is the
     setting the dry run the user approved was solved with.
     """
+    # Market-hours gate, FIRST, before anything is written. Disabling the Submit
+    # button is a courtesy; this is the enforcement -- the wizard can sit open across
+    # 16:00. Blocking here means no run row, no stamped order comments and, above
+    # all, no income consumed: finalise_allocation_run is one-shot, so a run created
+    # for orders that were all rejected would mark that income spent forever.
+    # TastyTrade's closed-market refusal is a SERVER rule that arrives as an opaque
+    # Message, so without this the user would get a screen of unexplained per-row
+    # failures after the ledger had already been hit.
+    reason = _market_blocked_reason(fetch_market_hours(account))
+    if reason is not None:
+        logger.warning(f"Allocation run for account {account.id} BLOCKED: {reason}; "
+                       f"nothing was submitted and no run was recorded")
+        return {
+            "run_id": None,
+            "outcomes": [],
+            "order_ids": [],
+            "income_consumed": 0.0,
+            "filled_buy_value": 0.0,
+            "filled_sell_value": 0.0,
+            "submitted_buy_value": 0.0,   # transitional; chunk `ledger` deletes this line
+            "submitted_sell_value": 0.0,  # transitional; chunk `ledger` deletes this line
+            "settled": True,              # nothing was submitted, so nothing is pending
+            "working_order_ids": [],
+            "blocked": True,
+            "blocked_reason": f"{reason}. Nothing was submitted.",
+        }
+
     from .portfolio_allocation_store import record_allocation_run
 
     run = record_allocation_run(
@@ -1112,10 +1142,19 @@ def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionSta
     return {
         "run_id": run_id,
         "outcomes": outcomes,
-        "submitted_buy_value": totals["submitted_buy_value"],
-        "submitted_sell_value": totals["submitted_sell_value"],
         "order_ids": totals["order_ids"],
         "income_consumed": income_consumed,
+        # The KEY NAMES are already final so no caller has to change twice; the
+        # MEASUREMENT behind them is still the submitted value, and chunk `ledger`
+        # replaces it with the actually-filled value in its rewrite.
+        "filled_buy_value": totals["submitted_buy_value"],
+        "filled_sell_value": totals["submitted_sell_value"],
+        "submitted_buy_value": totals["submitted_buy_value"],   # ledger deletes this line
+        "submitted_sell_value": totals["submitted_sell_value"],  # ledger deletes this line
+        "settled": True,          # ledger measures this from the fills
+        "working_order_ids": [],  # ledger fills this from the fills
+        "blocked": False,
+        "blocked_reason": None,
     }
 
 
@@ -1132,3 +1171,65 @@ def remember_fractional_choice(account_id: int, allow_fractional: bool) -> None:
     except Exception as e:
         logger.error(f"Could not remember the fractional choice for account "
                      f"{account_id}: {e}", exc_info=True)
+
+
+def fetch_market_hours(account):
+    """The broker's market-hours answer, or ``None`` when there is not one.
+
+    Adapter only -- the DISPLAY decision is
+    ``ui.utils.portfolio_allocation_view.evaluate_market_gate``, which is pure and
+    takes plain values, and the MONEY decision is ``_market_blocked_reason`` below.
+    This module never imports the UI: ``core -> ui`` is a layering inversion.
+
+    ``None`` means "we do not know", which every caller must treat as NOT open. It
+    covers a seam that raised, a seam that returned nothing, and an account object
+    that predates the seam. ``get_market_hours`` is concrete on
+    ``ReadOnlyAccountInterface`` and documented never to raise, so a real account
+    always answers; the getattr guard and the try/except are for test doubles and for
+    an account class that has not been rebased yet.
+
+    Returns:
+        Optional[MarketHours]: the broker's answer, or ``None``. Note that a
+        ``MarketHours`` with ``is_known is False`` is NOT ``None`` -- it is a real
+        answer meaning "unavailable", and callers must check both.
+    """
+    getter = getattr(account, "get_market_hours", None)
+    if getter is None:
+        logger.warning(f"Account {getattr(account, 'id', '?')} publishes no market hours "
+                       f"seam; treating the market as unknown")
+        return None
+    try:
+        hours = getter()
+    except Exception as e:
+        logger.error(f"Could not read market hours for account "
+                     f"{getattr(account, 'id', '?')}: {e}", exc_info=True)
+        return None
+    if hours is None:
+        logger.warning(f"Account {getattr(account, 'id', '?')} returned no market hours; "
+                       f"treating the market as unknown")
+    return hours
+
+
+def _market_blocked_reason(hours) -> Optional[str]:
+    """``None`` when the market is confirmed open, else the sentence to show.
+
+    Derived from ``MarketHours`` DIRECTLY -- the view module owns the banner copy and
+    must not be imported here. The two pieces of prose are allowed to differ in
+    wording; they may not differ in the DECISION, which is why both are computed from
+    one ``fetch_market_hours`` call.
+    """
+    if hours is None:
+        return "Market hours could not be read, so the market is not confirmed open"
+    if not hours.is_known:
+        reason = "Market hours are unavailable, so the market is not confirmed open"
+    elif not hours.is_open:
+        reason = "Market is closed"
+        # The broker's OWN word, display-only and never branched on: it is what tells
+        # a user blocked at 17:00 that the gate is regular-session only.
+        if hours.status:
+            reason += f" (broker status: {hours.status})"
+    else:
+        return None
+    if hours.detail:
+        reason += f" - {hours.detail}"
+    return reason
