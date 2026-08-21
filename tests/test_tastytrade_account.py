@@ -823,3 +823,29 @@ def test_tp_sl_adjustment_is_reported_as_unsupported():
     assert acct.adjust_tp(transaction, 160.0) is False
     assert acct.adjust_sl(transaction, 130.0) is False
     assert acct.adjust_tp_sl(transaction, 160.0, 130.0) is False
+
+
+# ---------------------------------------------------------------------------
+# Submission failure handling
+# ---------------------------------------------------------------------------
+
+def test_submit_order_impl_marks_the_row_error_with_the_broker_message():
+    """A rejected order must not sit at PENDING forever with no reason recorded."""
+    from ba2_trade_platform.core.db import get_instance
+    from ba2_trade_platform.core.models import TradingOrder
+    from ba2_trade_platform.core.types import OrderStatus
+
+    account_def, order = _tt_trading_order()
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.place_order = AsyncMock(
+        side_effect=RuntimeError("preflight failed: account is restricted"))
+
+    with patch("tastytrade.instruments.Equity.get",
+               new=AsyncMock(return_value=_FakeEquity("AAPL"))):
+        result = acct._submit_order_impl(order)
+
+    assert result is None
+    stored = get_instance(TradingOrder, order.id)
+    assert stored.status == OrderStatus.ERROR
+    assert "account is restricted" in stored.comment

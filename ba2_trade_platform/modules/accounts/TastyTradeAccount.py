@@ -736,6 +736,14 @@ class TastyTradeAccount(AccountInterface):
         except Exception as e:
             logger.error(
                 f"Error submitting order {trading_order.id} to TastyTrade: {e}", exc_info=True)
+            # Broker-agnostic failure handling: classify the error, retry ONCE as a
+            # MARKET order when a stop was already through the market, and otherwise
+            # mark the row ERROR with the typed reason + broker message in `comment`
+            # (so it is visible in the Pending Orders UI, not just the log). Returns
+            # the resubmitted order on a successful retry, else None.
+            if trading_order.id:
+                return self._handle_order_submit_error(trading_order, e)
+            logger.warning("Cannot mark order as ERROR - order has no ID")
             return None
 
     def cancel_order(self, order_id: str) -> bool:
