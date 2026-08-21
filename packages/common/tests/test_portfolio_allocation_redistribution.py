@@ -6,6 +6,7 @@ individual clamps (buying power, the broker minimum, the no-negative rule) witho
 constructing an elaborate portfolio for each one.
 """
 import json
+import random
 
 import pytest
 
@@ -728,3 +729,103 @@ def test_the_fractionable_sibling_absorbs_first_so_fewer_typed_weights_move():
     assert aaa.delta_quantity == 2.0
     assert aaa.redistributed is False
     assert left["A"] == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# The termination argument, exercised rather than asserted
+# ---------------------------------------------------------------------------
+
+def _sign(quantity):
+    return 0 if abs(quantity) < 1e-12 else (1 if quantity > 0 else -1)
+
+
+def _fuzz_margin(rng, symbol):
+    """A broker's answer for one symbol, including the awkward ones: no row at all,
+    a tri-state ``None``, a coarse increment, a share minimum, a money floor."""
+    kind = rng.random()
+    if kind < 0.35:
+        return MarginInfo(symbol=symbol, bp_factor=1.0, fractionable=False,
+                          min_order_size=rng.choice([None, 1.0, 5.0]))
+    if kind < 0.5:
+        return None
+    return MarginInfo(symbol=symbol, bp_factor=1.0,
+                      fractionable=rng.choice([True, True, None]),
+                      min_trade_increment=rng.choice([None, 1e-5, 0.001, 0.25]),
+                      min_order_size=rng.choice([None, None, 2.0]),
+                      min_fractional_notional=rng.choice([None, 5.0]))
+
+
+def test_the_termination_argument_holds_across_three_thousand_random_labels(monkeypatch):
+    """Every property the loop's finiteness rests on, checked on every move it makes.
+
+    The argument in the module docstring is: each step is
+    ``floor(|residual| / one_unit) * one_unit``, so a move closes the gap but never
+    crosses it, ``|residual|`` therefore falls strictly, a BUMPED row is never an
+    absorber (letting it absorb re-creates the floor-to-zero in a loop), and
+    ``REDISTRIBUTION_MAX_PASSES`` backstops all of it. Those are four separate
+    claims, and the hand-written cases above each exercise one shape of input.
+
+    This walks 3,000 seeded pseudo-random labels instead -- mixed valuation modes,
+    both bases, whole-share and fractional grids down to 1e-5, coarse 0.25
+    increments, share minimums, the $5 money floor, absent margin rows, zero buying
+    power, bumped and refused siblings, held and flat positions -- and asserts on
+    each move that the residual fell, that it did not change sign, that the row did
+    not flip side, and that the move count cannot outrun the bound. Then it checks
+    the results are submittable: nothing shorted, and no sell invented in a budget
+    run. Seeded, so a failure is reproducible; it is a property test, not a
+    coverage sweep, and it costs about a tenth of a second.
+    """
+    rng = random.Random(20260821)
+    real_apply = pa._apply_absorption
+    ctx = {}
+
+    def _watch(row, move, label, baseline):
+        was = pa._label_residual(ctx["total"], ctx["members"], ctx["mode"], ctx["basis"])
+        side_before = _sign(row.delta_quantity)
+        real_apply(row, move, label, baseline)
+        now = pa._label_residual(ctx["total"], ctx["members"], ctx["mode"], ctx["basis"])
+        ctx["moves"] += 1
+        case = ctx["case"]
+        assert abs(now) < abs(was) - 1e-9, f"case {case}: |residual| did not fall"
+        assert abs(now) <= pa.MONEY_EPSILON or (was > 0) == (now > 0), (
+            f"case {case}: the move crossed the target ({was} -> {now})")
+        assert _sign(row.delta_quantity) in (0, side_before) or side_before == 0, (
+            f"case {case}: {row.symbol} changed side")
+        assert row.sizing_outcome == pa.SIZING_OUTCOME_NORMAL, (
+            f"case {case}: {row.symbol} was moved despite {row.sizing_outcome}")
+        assert ctx["moves"] <= pa.REDISTRIBUTION_MAX_PASSES * len(ctx["members"]), (
+            f"case {case}: more moves than the pass bound allows")
+
+    monkeypatch.setattr(pa, "_apply_absorption", _watch)
+    for case in range(3_000):
+        mode = rng.choice([pa.VALUATION_MODE_COST, pa.VALUATION_MODE_MARKET])
+        basis = rng.choice([pa.ALLOCATION_BASIS_POSITION, pa.ALLOCATION_BASIS_BUDGET])
+        allow_fractional = rng.random() < 0.6
+        rows, margin, wanted = [], {}, {}
+        for i in range(rng.randint(1, 4)):
+            symbol = f"S{i}"
+            price = rng.choice([0.5, 3.0, 34.0, 100.0, 650.0])
+            held = rng.choice([0.0, 0.0, 1.0, 3.7, 10.0, 250.0])
+            delta = max(rng.choice([0.0, 0.0, 1.0, 2.5, 7.0, -1.0, -3.0]), -held)
+            row = _buy_row(symbol, price, delta, current_quantity=held,
+                           current_cost_basis=held * price * rng.choice([0.5, 1.0, 2.0]),
+                           target_notional=rng.random() * 500.0, labels=("L",))
+            row.sizing_outcome = rng.choice(
+                [pa.SIZING_OUTCOME_NORMAL] * 5 + [pa.SIZING_OUTCOME_BUMPED,
+                                                  pa.SIZING_OUTCOME_SKIPPED_TOO_LARGE])
+            rows.append(row)
+            margin[symbol] = _fuzz_margin(rng, symbol)
+            wanted[symbol] = rng.choice([0.0, 50.0, 500.0, 5_000.0]) * rng.random()
+        plan = AllocationPlan(rows=rows,
+                              available_buying_power=rng.choice([0.0, 300.0, 1e6]),
+                              valuation_mode=mode, allocation_basis=basis)
+        started_at = {r.symbol: r.delta_quantity for r in rows}
+        ctx.update(case=case, mode=mode, basis=basis, members=list(rows),
+                   total=sum(wanted.values()), moves=0)
+        pa.redistribute_label_residuals(plan, {"L": wanted}, margin,
+                                        allow_fractional=allow_fractional)
+        for row in rows:
+            assert row.target_quantity >= -1e-9, f"case {case}: {row.symbol} went short"
+            if basis == pa.ALLOCATION_BASIS_BUDGET:
+                assert not (started_at[row.symbol] >= 0 > row.delta_quantity), (
+                    f"case {case}: a budget run opened a sell on {row.symbol}")
