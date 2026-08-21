@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 from datetime import datetime, date, timedelta
 from decimal import Decimal
 from concurrent.futures import TimeoutError as FutureTimeoutError
+from dataclasses import replace
 
 from tastytrade.order import InstrumentType as TTInstrumentType
 from tastytrade.order import NewOrder, OrderAction, OrderTimeInForce
@@ -19,9 +20,9 @@ from ...core.models import Position, TradingOrder, Transaction
 from ...core.types import BrokerOrderErrorReason, OrderDirection, OrderStatus
 from ...core.types import OrderType as CoreOrderType
 from ...core.account_types import (
-    AccountSnapshot, CashTransfer, MarginInfo, OrderImpact,
+    AccountSnapshot, CashTransfer, MarginInfo, MarketHours, OrderImpact,
     CASH_TRANSFER_DEPOSIT, CASH_TRANSFER_DIVIDEND, CASH_TRANSFER_WITHDRAWAL,
-    MARGIN_SOURCE_DEFAULT, MARGIN_SOURCE_POSITION,
+    MARGIN_SOURCE_DEFAULT, MARGIN_SOURCE_POSITION, MARKET_HOURS_SOURCE_BROKER,
 )
 from ...core.interfaces import AccountInterface
 
@@ -1893,6 +1894,194 @@ class TastyTradeAccount(AccountInterface):
                 source=source,
             )
         return result
+
+    # ------------------------------------------------------------------
+    # Market hours
+    # ------------------------------------------------------------------
+
+    #: The TastyTrade equity statuses that count as "the REGULAR session is running".
+    #: Pinned as the raw wire value rather than the enum so this module needs no
+    #: market_sessions import at module scope; tests assert it equals
+    #: MarketStatus.OPEN.value so a renamed member cannot slip through.
+    #:
+    #: 'Pre-market' and 'Extended' are DELIBERATELY absent (market_sessions.py:22-30) --
+    #: user decision D4, regular session only. Verified live on 2026-08-21: an opening
+    #: MARKET order outside the regular session comes back HTTP 422
+    #: `tif_no_after_hours_opening_market_orders: "Opening market orders not allowed
+    #: when market closed."`, and a FRACTIONAL order can only ever be a market order
+    #: (`fractional_market_orders_only`). That rule lives nowhere in the SDK and the
+    #: rejection surfaces only as an opaque Message(code, message) on
+    #: PlacedOrderResponse.errors (order.py:172-183). Calling Extended "open" would let
+    #: the allocation wizard submit a whole basket into a guaranteed rejection.
+    #:
+    #: NAME. Not ``_TT_OPEN_STATUSES`` -- that name is TAKEN, 1300 lines up, by the
+    #: tuple of ORDER statuses that mean "still working" which ``_tt_statuses_for``
+    #: turns into the server-side ``status[]`` filter for ``get_orders``. Defining
+    #: this one under that name later in the same class body silently REPLACES it,
+    #: and the replacement is a market word the order endpoint has never heard of --
+    #: so every "what is still working?" query comes back empty and ``refresh_orders``
+    #: sees no open orders at all. Nothing raises. ``MarketStatus`` and
+    #: ``order.OrderStatus`` are two unrelated TastyTrade enums that both spell
+    #: liveness as "open"; keep the two constants' names apart.
+    _TT_OPEN_SESSION_STATUSES = frozenset({"Open"})
+
+    def _now_eastern(self) -> datetime:
+        """Current time in the New York timezone, tz-aware.
+
+        A METHOD, not an inline call, so it can be frozen or inspected. Note that
+        ``_get_market_hours_impl`` does NOT read it as its clock -- it uses the ``now``
+        the interface injects, which is the canonical clock-freeze seam. What this
+        supplies there is the TIMEZONE for normalising a naive broker datetime.
+        """
+        from tastytrade.utils import now_in_new_york
+        return now_in_new_york()
+
+    def _fallback_market_hours(self, now: datetime, reason: str) -> MarketHours:
+        """The shared offline answer, tagged with WHY we are on it.
+
+        Delegates to ``super()._get_market_hours_impl(now)`` -- the IMPL hook, never the
+        public template method that wraps it. The template is what calls
+        ``_get_market_hours_impl``, i.e. this class's override, so reaching it from in
+        here is infinite recursion; and because the template catches Exception, and
+        RecursionError is one, the several-hundred re-entries collapse silently into a
+        permanent "unavailable" that blocks the wizard forever without crashing.
+
+        ``source`` is deliberately NOT forced to MARKET_HOURS_SOURCE_FALLBACK. When the
+        offline NYSE calendar is dead too, super returns
+        MARKET_HOURS_SOURCE_UNAVAILABLE and that honest "we could not determine it" must
+        survive to the UI, which then says "unknown" rather than "closed" (the submit
+        gate still fails closed because ``is_open`` is False). Only ``detail`` is
+        overwritten.
+
+        Nothing is cached here. ReadOnlyAccountInterface owns the one cache, expires it
+        at the session boundary and never caches an UNAVAILABLE answer; a second cache
+        in an adapter could disagree with the banner the user is reading.
+        """
+        return replace(super()._get_market_hours_impl(now), detail=reason)
+
+    def _get_market_hours_impl(self, now: datetime) -> MarketHours:
+        """Whether the REGULAR equity session is running, per TastyTrade itself.
+
+        THE OVERRIDE POINT, and the only one. The two public market-hours methods on
+        ReadOnlyAccountInterface are concrete, cached and effectively final, and are NOT
+        overridden here; the interface also wraps this method in try/except so it can
+        never raise out of a page render. Caching, session-boundary expiry and the
+        explicit cache-clear companion are all provided there.
+
+        ``now`` is injected and tz-aware, and this method MUST use it rather than
+        reading a clock of its own.
+
+        REGULAR SESSION ONLY -- see ``_TT_OPEN_SESSION_STATUSES``. ``close_at_ext`` (the
+        extended-hours close) is read off the wire and discarded: reporting it as
+        ``next_close`` would tell the wizard it has four more hours to submit market
+        orders that the broker will reject. ``status`` carries TastyTrade's own raw word
+        ("Open" / "Closed" / "Pre-market" / "Extended") so the banner can explain a
+        block; nothing ever branches on it.
+
+        ``next_open`` / ``next_close`` come straight off ``MarketSession`` and
+        ``MarketSession.next_session`` (market_sessions.py:44-57). There is no offline
+        calendar in this file: ``ba2_common.core.market_calendar`` is the only NYSE
+        session-time source in the codebase, and no adapter hardcodes the session times.
+        ``next_session`` is Optional, so both may legitimately be None -- which means
+        "unknown", never "now" and never a synthesised guess.
+
+        Returns:
+            MarketHours: ``source`` is ``MARKET_HOURS_SOURCE_BROKER`` when TastyTrade
+            answered. When it did not, this returns ``_fallback_market_hours(...)``,
+            whose source is whatever the shared offline calendar could manage --
+            FALLBACK if it answered, UNAVAILABLE if it could not -- with ``detail``
+            saying why.
+        """
+        if not self._check_authentication():
+            return self._fallback_market_hours(now, "TastyTrade account is not authenticated")
+
+        from tastytrade.market_sessions import ExchangeType, get_market_sessions
+
+        try:
+            sessions = self._run_async(
+                get_market_sessions(self._session, [ExchangeType.NYSE]))
+        except Exception as e:
+            described = self._describe_broker_error(e, "the market-session fetch")
+            logger.error(
+                f"[Account {self.id}] TastyTrade market-session fetch failed: {described}",
+                exc_info=True)
+            return self._fallback_market_hours(now, f"market-session fetch failed: {described}")
+
+        # ExchangeType.NYSE serialises as the instrument collection "Equity". There is
+        # no ExchangeType.EQUITY -- verified against the SDK enum on 2026-08-21.
+        wanted = ExchangeType.NYSE.value
+        session = next((s for s in (sessions or [])
+                        if s.instrument_collection == wanted), None)
+        if session is None:
+            logger.error(
+                f"[Account {self.id}] TastyTrade returned no '{wanted}' market session "
+                f"(got {[getattr(s, 'instrument_collection', '?') for s in (sessions or [])]}); "
+                f"falling back to the shared offline NYSE calendar")
+            return self._fallback_market_hours(now, f"broker returned no '{wanted}' session")
+
+        def _aware(value: Optional[datetime]) -> Optional[datetime]:
+            """The tz-awareness boundary.
+
+            TastyTrade publishes ISO timestamps WITH an offset, so this is normally a
+            passthrough. A naive one is read as NEW YORK -- the timezone
+            ``_now_eastern()`` already speaks, derived from
+            tastytrade.utils.now_in_new_york -- and never as UTC or as this machine's
+            local time. MarketHours.__post_init__ raises ValueError on any naive
+            datetime, so an unnormalised value would collapse a perfectly good broker
+            answer into UNAVAILABLE.
+            """
+            if value is None or value.tzinfo is not None:
+                return value
+            return value.replace(tzinfo=self._now_eastern().tzinfo)
+
+        current_open = _aware(session.open_at)
+        current_close = _aware(session.close_at)
+        snapshot = session.next_session
+        snapshot_open = _aware(getattr(snapshot, "open_at", None))
+        snapshot_close = _aware(getattr(snapshot, "close_at", None))
+
+        # next_open / next_close are STRICTLY FUTURE. The CURRENT session's own bounds
+        # are used while they are still ahead of `now` -- at 08:00 today's open has not
+        # happened yet -- and once they are behind, the next-session snapshot is the
+        # only future answer TastyTrade publishes. Both stay None when it publishes
+        # neither: None means unknown, never "now".
+        next_open = None
+        for candidate in (current_open, snapshot_open):
+            if candidate is not None and candidate > now:
+                next_open = candidate
+                break
+        next_close = None
+        for candidate in (current_close, snapshot_close):
+            if candidate is not None and candidate > now:
+                next_close = candidate
+                break
+
+        status = getattr(session.status, "value", None) or str(session.status)
+        is_open = status in self._TT_OPEN_SESSION_STATUSES
+
+        # OPEN -> the bounds describe the CURRENT session; CLOSED -> the NEXT one, where
+        # open_at == next_open and close_at == next_close.
+        if is_open:
+            open_at, close_at = current_open, current_close
+        else:
+            open_at, close_at = next_open, next_close
+
+        detail = f"TastyTrade equity session status {status!r}"
+        if not is_open:
+            detail += (" - regular session only; pre-market and extended hours do not "
+                       "count as open because TastyTrade rejects an equity market order "
+                       "outside the regular session")
+        return MarketHours(
+            is_open=is_open,
+            open_at=open_at,
+            close_at=close_at,
+            next_open=next_open,
+            next_close=next_close,
+            source=MARKET_HOURS_SOURCE_BROKER,
+            status=status,
+            detail=detail,
+            as_of=now,
+        )
 
     def get_balance_history(self, start_date=None, end_date=None) -> List[Dict]:
         if not self._check_authentication():

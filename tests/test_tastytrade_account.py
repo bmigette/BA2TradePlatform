@@ -26,6 +26,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -3416,3 +3417,395 @@ def test_an_empty_broker_error_explains_a_degraded_read_path(monkeypatch):
     assert acct.get_positions() is None
 
     assert any("scope" in m.lower() for m in errors), errors
+
+
+# ---------------------------------------------------------------------------
+# Market hours
+# ---------------------------------------------------------------------------
+
+_NY = ZoneInfo("America/New_York")
+
+
+def _ny(year, month, day, hour, minute=0):
+    """An AWARE New York datetime.
+
+    Every market-hours test freezes time explicitly by passing `now` in; none of them
+    may depend on when the suite runs. `America/New_York` is the canonical name
+    ba2_common.core.market_calendar.NY_TZ uses.
+    """
+    return datetime(year, month, day, hour, minute, tzinfo=_NY)
+
+
+def _snapshot_payload(open_at, close_at):
+    """RAW DASHERIZED MarketSessionSnapshot payload (market_sessions.py:32-42).
+
+    All five fields are required on the model; `start_at` is the pre-market start, two
+    and a half hours ahead of the regular open.
+    """
+    return {
+        "instrument-collection": "Equity",
+        "open-at": open_at.isoformat(),
+        "close-at": close_at.isoformat(),
+        "start-at": (open_at - timedelta(hours=2, minutes=30)).isoformat(),
+        "session-date": open_at.date().isoformat(),
+    }
+
+
+def _tt_session(status="Open", open_at=None, close_at=None, next_session=None,
+                close_at_ext=None, instrument_collection="Equity"):
+    """A REAL tastytrade MarketSession, built from a RAW DASHERIZED payload.
+
+    Not python kwargs and not a SimpleNamespace. `MarketSession.status` is
+    `Field(alias="state")` and every datetime is coerced by pydantic from the wire
+    string, so a kwargs-built stand-in silently skips exactly the parsing the adapter
+    depends on -- the same class of bypass that hid the `set_sign_for` sign bugs in
+    this file. `get_market_sessions` itself does `MarketSession(**i)` on the raw item
+    (market_sessions.py:81), so this is byte-for-byte what production parses.
+    """
+    from tastytrade.market_sessions import MarketSession
+
+    payload = {"state": status, "instrument-collection": instrument_collection}
+    if open_at is not None:
+        payload["open-at"] = open_at.isoformat()
+        payload["start-at"] = open_at.isoformat()
+    if close_at is not None:
+        payload["close-at"] = close_at.isoformat()
+    if close_at_ext is not None:
+        payload["close-at-ext"] = close_at_ext.isoformat()
+    if next_session is not None:
+        payload["next-session"] = next_session
+    return MarketSession(**payload)
+
+
+def _wire_sessions(sessions):
+    """Patch the ONE async SDK call this seam makes.
+
+    There is no holiday-calendar patch any more: the offline NYSE calendar belongs to
+    ba2_common.core.market_calendar (contract 3.2) and TastyTradeAccount never fetches
+    MarketCalendar.holidays / half_days.
+    """
+    return patch("tastytrade.market_sessions.get_market_sessions",
+                 new=AsyncMock(return_value=sessions))
+
+
+def test_open_session_statuses_are_pinned_to_the_sdk_enum():
+    """A renamed MarketStatus member must break HERE, not silently make the gate
+    permanently closed (or permanently open)."""
+    from tastytrade.market_sessions import MarketStatus
+
+    assert TastyTradeAccount._TT_OPEN_SESSION_STATUSES == frozenset({MarketStatus.OPEN.value})
+
+
+def test_the_market_session_gate_did_not_steal_the_order_status_filters_name():
+    """Two unrelated TastyTrade enums both spell liveness "open".
+
+    `_TT_OPEN_STATUSES` is the ORDER-status tuple `_tt_statuses_for` turns into the
+    server-side `status[]` filter for `get_orders`. Adding the market-session gate
+    under that same name -- which is what the plan for this task literally said --
+    silently rebinds it later in the same class body, so `get_orders(OPEN)` asks the
+    broker for the order status "Open", which does not exist, and every "what is
+    still working?" query comes back EMPTY. Nothing raises; `refresh_orders` just
+    stops seeing live orders.
+    """
+    from tastytrade.market_sessions import MarketStatus
+    from tastytrade.order import OrderStatus as TTOrderStatusEnum
+
+    order_statuses = TastyTradeAccount._TT_OPEN_STATUSES
+    session_statuses = TastyTradeAccount._TT_OPEN_SESSION_STATUSES
+
+    assert order_statuses is not session_statuses
+    # The order filter still holds real ORDER statuses...
+    assert TTOrderStatusEnum.LIVE in order_statuses
+    assert all(isinstance(s, TTOrderStatusEnum) for s in order_statuses)
+    # ...and the market word never leaked into it.
+    assert MarketStatus.OPEN.value not in {getattr(s, "value", s) for s in order_statuses}
+
+
+def test_tastytrade_overrides_the_impl_hook_and_nothing_else():
+    """The whole anti-recursion invariant, as a structural assertion.
+
+    `get_market_hours` is the interface's caching template and it CALLS
+    `_get_market_hours_impl`. An adapter that overrides the template and then delegates
+    to `super().get_market_hours()` never terminates. Caching and the offline calendar
+    both belong elsewhere (contract 3.2, 3.3), so none of those names may reappear here.
+    """
+    assert "_get_market_hours_impl" in TastyTradeAccount.__dict__
+    for banned in ("get_market_hours", "is_market_open", "_market_hours_cache",
+                   "clear_market_hours_cache", "_calendar_bounds", "_first_future",
+                   "_NY_REGULAR_OPEN", "_NY_REGULAR_CLOSE", "_NY_HALF_DAY_CLOSE"):
+        assert banned not in TastyTradeAccount.__dict__, banned
+
+
+def test_the_public_seam_routes_to_the_tastytrade_override():
+    from ba2_trade_platform.core.account_types import MARKET_HOURS_SOURCE_BROKER
+
+    acct = _bare_account()
+    session = _tt_session(
+        status="Open", open_at=_ny(2026, 8, 20, 9, 30), close_at=_ny(2026, 8, 20, 16, 0),
+        next_session=_snapshot_payload(_ny(2026, 8, 21, 9, 30), _ny(2026, 8, 21, 16, 0)))
+
+    with _wire_sessions([session]):
+        hours = acct.get_market_hours(now=_ny(2026, 8, 20, 11, 0))
+        assert acct.is_market_open(now=_ny(2026, 8, 20, 11, 0)) is True
+
+    assert hours.source == MARKET_HOURS_SOURCE_BROKER
+
+
+def test_market_hours_open_during_the_regular_session():
+    from ba2_trade_platform.core.account_types import MARKET_HOURS_SOURCE_BROKER
+
+    acct = _bare_account()
+    now = _ny(2026, 8, 20, 11, 0)  # Thursday, mid-session
+    session = _tt_session(
+        status="Open", open_at=_ny(2026, 8, 20, 9, 30), close_at=_ny(2026, 8, 20, 16, 0),
+        next_session=_snapshot_payload(_ny(2026, 8, 21, 9, 30), _ny(2026, 8, 21, 16, 0)))
+
+    with _wire_sessions([session]):
+        hours = acct._get_market_hours_impl(now)
+
+    assert hours.is_open is True
+    assert hours.source == MARKET_HOURS_SOURCE_BROKER
+    assert hours.status == "Open"
+    assert hours.as_of == now
+    # While OPEN, open_at/close_at are THIS session's bounds (contract 1.1)...
+    assert hours.open_at == _ny(2026, 8, 20, 9, 30)
+    assert hours.close_at == _ny(2026, 8, 20, 16, 0)
+    # ...while next_open / next_close are STRICTLY FUTURE: today's open is behind us.
+    assert hours.next_open == _ny(2026, 8, 21, 9, 30)
+    assert hours.next_close == _ny(2026, 8, 20, 16, 0)
+    assert hours.next_transition == _ny(2026, 8, 20, 16, 0)
+    assert hours.is_known is True
+
+
+def test_market_hours_extended_session_does_not_count_as_open():
+    """User decision D4, regular session only. TastyTrade's server rejects an equity
+    MARKET order outside the regular session, and the rejection is an opaque Message on
+    PlacedOrderResponse.errors. Reporting Extended as open would fire a whole allocation
+    basket into a guaranteed reject -- and `status` is what lets the banner say why."""
+    acct = _bare_account()
+    session = _tt_session(
+        status="Extended", open_at=_ny(2026, 8, 20, 9, 30),
+        close_at=_ny(2026, 8, 20, 16, 0), close_at_ext=_ny(2026, 8, 20, 20, 0),
+        next_session=_snapshot_payload(_ny(2026, 8, 21, 9, 30), _ny(2026, 8, 21, 16, 0)))
+
+    with _wire_sessions([session]):
+        hours = acct._get_market_hours_impl(_ny(2026, 8, 20, 17, 30))
+
+    assert hours.is_open is False
+    assert hours.status == "Extended"
+    assert hours.next_open == _ny(2026, 8, 21, 9, 30)
+    # close_at_ext (20:00) is the EXTENDED close and must never be reported as
+    # next_close; there is no MarketHours field for it at all.
+    assert hours.next_close == _ny(2026, 8, 21, 16, 0)
+    # CLOSED => the bounds describe the NEXT session (contract 1.1).
+    assert hours.open_at == hours.next_open
+    assert hours.close_at == hours.next_close
+
+
+def test_market_hours_pre_market_does_not_count_as_open():
+    acct = _bare_account()
+    session = _tt_session(
+        status="Pre-market", open_at=_ny(2026, 8, 20, 9, 30),
+        close_at=_ny(2026, 8, 20, 16, 0),
+        next_session=_snapshot_payload(_ny(2026, 8, 21, 9, 30), _ny(2026, 8, 21, 16, 0)))
+
+    with _wire_sessions([session]):
+        hours = acct._get_market_hours_impl(_ny(2026, 8, 20, 8, 0))
+
+    assert hours.is_open is False
+    assert hours.status == "Pre-market"
+    # Today's own open is still in the future at 08:00 -- it, not tomorrow's, is next.
+    assert hours.next_open == _ny(2026, 8, 20, 9, 30)
+    assert hours.next_close == _ny(2026, 8, 20, 16, 0)
+    assert hours.open_at == hours.next_open
+
+
+def test_next_open_and_next_close_are_STRICTLY_future_at_the_bell_itself():
+    """`next_open` / `next_close` are STRICTLY future instants -- `> now`, not `>= now`.
+
+    Two things break on `>=`, and both only at the exact bell:
+
+      * the boundary is reported as still ahead. At 09:30:00.000 the open is HAPPENING,
+        not upcoming, and a banner saying "opens at 09:30" while the market is already
+        open is the same class of lie as reporting Extended as open.
+      * `MarketHours.next_transition` becomes `now`, and
+        ReadOnlyAccountInterface.get_market_hours caches only while `now < transition`
+        -- so the entry expires the instant it is taken and the seam refetches on
+        every single page render.
+
+    Asked one microsecond apart on either side of the bell, the answer must move.
+    """
+    acct = _bare_account()
+    session = _tt_session(
+        status="Open", open_at=_ny(2026, 8, 20, 9, 30), close_at=_ny(2026, 8, 20, 16, 0),
+        next_session=_snapshot_payload(_ny(2026, 8, 21, 9, 30), _ny(2026, 8, 21, 16, 0)))
+
+    with _wire_sessions([session]):
+        at_the_open = acct._get_market_hours_impl(_ny(2026, 8, 20, 9, 30))
+        at_the_close = acct._get_market_hours_impl(_ny(2026, 8, 20, 16, 0))
+        just_before_the_open = acct._get_market_hours_impl(
+            _ny(2026, 8, 20, 9, 30) - timedelta(microseconds=1))
+
+    # AT the open, today's 09:30 is the PRESENT: tomorrow's is the next one.
+    assert at_the_open.next_open == _ny(2026, 8, 21, 9, 30)
+    assert at_the_open.next_transition > _ny(2026, 8, 20, 9, 30)
+    # AT the close, today's 16:00 is the present: tomorrow's is the next one.
+    assert at_the_close.next_close == _ny(2026, 8, 21, 16, 0)
+    assert at_the_close.next_transition > _ny(2026, 8, 20, 16, 0)
+    # ...and a microsecond earlier it genuinely IS still ahead. Without this the
+    # assertions above are equally satisfied by never reporting today's bounds at all.
+    assert just_before_the_open.next_open == _ny(2026, 8, 20, 9, 30)
+
+
+def test_market_hours_closed_on_a_weekend_points_at_the_next_session():
+    """MarketSession.open_at / close_at are Optional and TastyTrade leaves them empty on
+    a non-session day; next_session is then the only future answer it publishes."""
+    acct = _bare_account()
+    session = _tt_session(
+        status="Closed",
+        next_session=_snapshot_payload(_ny(2026, 8, 24, 9, 30), _ny(2026, 8, 24, 16, 0)))
+
+    with _wire_sessions([session]):
+        hours = acct._get_market_hours_impl(_ny(2026, 8, 22, 12, 0))  # Saturday
+
+    assert hours.is_open is False
+    assert hours.status == "Closed"
+    assert hours.next_open == _ny(2026, 8, 24, 9, 30)
+    assert hours.next_close == _ny(2026, 8, 24, 16, 0)
+    assert hours.open_at == _ny(2026, 8, 24, 9, 30)
+    assert hours.close_at == _ny(2026, 8, 24, 16, 0)
+
+
+def test_a_naive_broker_datetime_is_read_as_new_york_not_left_naive():
+    """Contract 1.13: every broker datetime is made tz-aware at the adapter boundary.
+    MarketHours.__post_init__ raises ValueError on a naive one, so an unnormalised
+    value would turn the whole answer into UNAVAILABLE instead of an honest session."""
+    acct = _bare_account()
+    session = _tt_session(
+        status="Open", open_at=datetime(2026, 8, 20, 9, 30),
+        close_at=datetime(2026, 8, 20, 16, 0),
+        next_session=_snapshot_payload(_ny(2026, 8, 21, 9, 30), _ny(2026, 8, 21, 16, 0)))
+
+    with _wire_sessions([session]):
+        hours = acct._get_market_hours_impl(_ny(2026, 8, 20, 11, 0))
+
+    from ba2_trade_platform.core.account_types import MARKET_HOURS_SOURCE_BROKER
+
+    # The BROKER path produced this, not the offline calendar that happens to agree.
+    assert hours.source == MARKET_HOURS_SOURCE_BROKER
+    assert hours.open_at.tzinfo is not None
+    assert hours.open_at == _ny(2026, 8, 20, 9, 30)
+    assert hours.close_at == _ny(2026, 8, 20, 16, 0)
+
+
+def test_the_holiday_calendar_is_never_fetched():
+    """The offline calendar belongs to ba2_common.core.market_calendar (contract 3.2).
+    This adapter no longer walks MarketCalendar.holidays / half_days to synthesise
+    session bounds, and no longer hardcodes 09:30 / 16:00 / 13:00."""
+    acct = _bare_account()
+    session = _tt_session(status="Closed")
+    holidays = AsyncMock()
+
+    with _wire_sessions([session]), \
+         patch("tastytrade.market_sessions.get_market_holidays", new=holidays):
+        hours = acct._get_market_hours_impl(_ny(2026, 11, 26, 12, 0))  # Thanksgiving
+
+    holidays.assert_not_awaited()
+    # Nothing future was published and nothing is invented: None means unknown.
+    assert hours.next_open is None
+    assert hours.next_close is None
+
+
+def test_market_hours_falls_back_and_says_why_when_the_broker_call_fails(monkeypatch):
+    from ba2_trade_platform.core.account_types import MARKET_HOURS_SOURCE_FALLBACK
+
+    errors = _capture_errors(monkeypatch)
+    acct = _bare_account()
+
+    with patch("tastytrade.market_sessions.get_market_sessions",
+               new=AsyncMock(side_effect=RuntimeError("503 upstream"))):
+        hours = acct._get_market_hours_impl(_ny(2026, 8, 20, 11, 0))
+
+    # The offline NYSE calendar answered, so this is FALLBACK, not UNAVAILABLE -- and
+    # 11:00 ET on Thursday 2026-08-20 is a regular session.
+    assert hours.source == MARKET_HOURS_SOURCE_FALLBACK
+    assert hours.is_open is True
+    assert "503 upstream" in (hours.detail or "")
+    assert any("market-session fetch failed" in m for m in errors), errors
+
+
+def test_market_hours_falls_back_when_no_equity_collection_comes_back(monkeypatch):
+    """get_market_sessions is asked for ExchangeType.NYSE ('Equity'). A response carrying
+    only futures collections is a broker fault, not an answer."""
+    from ba2_trade_platform.core.account_types import MARKET_HOURS_SOURCE_FALLBACK
+
+    errors = _capture_errors(monkeypatch)
+    acct = _bare_account()
+    session = _tt_session(
+        status="Open", instrument_collection="CME",
+        open_at=_ny(2026, 8, 20, 9, 30), close_at=_ny(2026, 8, 20, 16, 0))
+
+    with _wire_sessions([session]):
+        hours = acct._get_market_hours_impl(_ny(2026, 8, 20, 11, 0))
+
+    assert hours.source == MARKET_HOURS_SOURCE_FALLBACK
+    assert "no 'Equity' session" in (hours.detail or "")
+    assert any("no 'Equity' market session" in m for m in errors), errors
+
+
+def test_market_hours_falls_back_when_unauthenticated(monkeypatch):
+    from ba2_trade_platform.core.account_types import MARKET_HOURS_SOURCE_FALLBACK
+
+    _capture_errors(monkeypatch)
+    acct = _bare_account()
+    acct._session = None
+
+    hours = acct._get_market_hours_impl(_ny(2026, 8, 20, 11, 0))
+
+    assert hours.source == MARKET_HOURS_SOURCE_FALLBACK
+    assert "not authenticated" in (hours.detail or "")
+
+
+def test_the_fallback_keeps_supers_source_so_a_dead_calendar_reads_unavailable(monkeypatch):
+    """Contract 1.5 and 5.3.6: _fallback_market_hours must NOT force source=fallback.
+    Broker dead AND offline calendar dead is UNAVAILABLE -- is_open False so the submit
+    gate fails closed, is_known False so the UI says "unknown" rather than "closed".
+    That is the get_positions() None-vs-[] lesson, applied to market hours."""
+    from ba2_common.core.interfaces.ReadOnlyAccountInterface import ReadOnlyAccountInterface
+    from ba2_trade_platform.core.account_types import (
+        MARKET_HOURS_SOURCE_UNAVAILABLE, MarketHours,
+    )
+
+    _capture_errors(monkeypatch)
+    monkeypatch.setattr(
+        ReadOnlyAccountInterface, "_get_market_hours_impl",
+        lambda self, now: MarketHours(is_open=False,
+                                      source=MARKET_HOURS_SOURCE_UNAVAILABLE,
+                                      as_of=now, detail="pandas_market_calendars missing"))
+    acct = _bare_account()
+
+    with patch("tastytrade.market_sessions.get_market_sessions",
+               new=AsyncMock(side_effect=RuntimeError("503 upstream"))):
+        hours = acct._get_market_hours_impl(_ny(2026, 8, 20, 11, 0))
+
+    assert hours.source == MARKET_HOURS_SOURCE_UNAVAILABLE
+    assert hours.is_known is False
+    assert hours.is_open is False
+    assert "503 upstream" in (hours.detail or "")
+
+
+def test_a_broker_failure_does_not_recurse_through_the_public_seam(monkeypatch):
+    """The regression this rename exists for. With the override on `get_market_hours`
+    and `super().get_market_hours()` in `_fallback_market_hours`, this call raised
+    RecursionError instead of returning the offline answer."""
+    from ba2_trade_platform.core.account_types import MARKET_HOURS_SOURCE_FALLBACK
+
+    _capture_errors(monkeypatch)
+    acct = _bare_account()
+
+    with patch("tastytrade.market_sessions.get_market_sessions",
+               new=AsyncMock(side_effect=RuntimeError("503 upstream"))):
+        hours = acct.get_market_hours(now=_ny(2026, 8, 20, 11, 0))
+        assert acct.is_market_open(now=_ny(2026, 8, 20, 11, 0)) is True
+
+    assert hours.source == MARKET_HOURS_SOURCE_FALLBACK
