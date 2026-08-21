@@ -9,6 +9,7 @@ import numpy as np
 from datetime import datetime
 from typing import Dict, List, Any, Optional, Callable, Tuple
 import logging
+import os
 import random
 import json
 
@@ -38,6 +39,56 @@ def _jsonable_to_np_state(s):
     """Inverse of _np_state_to_jsonable: rebuild a numpy random state tuple."""
     name, keys, pos, has_gauss, cached = s
     return (name, np.array(keys, dtype=np.uint32), int(pos), int(has_gauss), float(cached))
+
+
+def _py_state_to_jsonable(state):
+    """Convert the stdlib ``random`` state tuple to a JSON-serializable list.
+
+    random.getstate() returns (version, internal_state, gauss_next) where internal_state is a
+    625-int TUPLE; a plain list() of the outer tuple leaves it nested, and the JSON checkpoint
+    column then turns it into a list that setstate() refuses. Flatten it explicitly here so
+    _jsonable_to_py_state can rebuild it explicitly (mirrors the numpy pair above).
+    """
+    version, internal_state, gauss_next = state
+    return [
+        int(version),
+        [int(x) for x in internal_state],
+        None if gauss_next is None else float(gauss_next),
+    ]
+
+
+def _jsonable_to_py_state(s):
+    """Inverse of _py_state_to_jsonable: rebuild a stdlib random state tuple.
+
+    Both elements must be tuples again -- setstate() raises "state vector must be a tuple" on
+    the list JSON gives back. LEGACY checkpoints (written as list(random.getstate()) before this
+    pair existed) have the identical post-JSON shape, so they rebuild through here unchanged.
+    """
+    version, internal_state, gauss_next = s
+    return (
+        int(version),
+        tuple(int(x) for x in internal_state),
+        None if gauss_next is None else float(gauss_next),
+    )
+
+
+def _accepts_on_result(batch_fitness) -> bool:
+    """Does this batch evaluator take the incremental-result callback?
+
+    Older/simpler evaluators (brute force, the ML GA) take only the param-dict list. An
+    unintrospectable callable is treated as NOT accepting it: falling back costs a
+    mid-generation checkpoint, whereas guessing wrong raises a TypeError that would be
+    indistinguishable from a failure inside the evaluation itself.
+    """
+    import inspect
+
+    try:
+        params = inspect.signature(batch_fitness).parameters
+    except (TypeError, ValueError):
+        return False
+    if "on_result" in params:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 class GeneticOptimizer:
@@ -105,6 +156,17 @@ class GeneticOptimizer:
         self.best_individual = None
         self.best_fitness = None
         self.history = []
+
+        # Write a partial checkpoint every N completed trials within a generation. Bounds what a
+        # restart loses to N trials instead of a whole generation. 0 disables.
+        try:
+            self.partial_checkpoint_every = int(os.getenv("BT_PARTIAL_CHECKPOINT_EVERY", "10"))
+        except ValueError:
+            logger.warning(
+                "BT_PARTIAL_CHECKPOINT_EVERY="
+                f"{os.getenv('BT_PARTIAL_CHECKPOINT_EVERY')!r} is not an integer; using 10")
+            self.partial_checkpoint_every = 10
+        self._partial_counter = 0
 
         self._setup_deap()
 
@@ -324,16 +386,19 @@ class GeneticOptimizer:
             checkpoint: Saved checkpoint data containing population, generation, etc.
 
         Returns:
-            Tuple of (start_generation, population_data)
+            Tuple of (start_generation, population_data, fitnesses)
         """
         self.history = checkpoint.get('history', [])
         self.best_fitness = checkpoint.get('best_fitness')
         self.best_individual = checkpoint.get('best_individual')
 
-        # Restore random state if available
+        # Restore Python random state if available. tuple() alone is NOT enough: the checkpoint
+        # is a JSON column, so the inner 625-int state vector comes back as a list and
+        # setstate() rejects it ("state vector must be a tuple") -- which used to be swallowed
+        # into the warning below, leaving the resumed run on an un-restored RNG.
         if 'random_state' in checkpoint:
             try:
-                random.setstate(tuple(checkpoint['random_state']))
+                random.setstate(_jsonable_to_py_state(checkpoint['random_state']))
             except Exception as e:
                 logger.warning(f"Could not restore random state: {e}")
 
@@ -346,7 +411,49 @@ class GeneticOptimizer:
                 logger.warning(f"Could not restore numpy random state: {e}")
 
         logger.info(f"Resuming from generation {checkpoint.get('generation', 0)}")
-        return checkpoint.get('generation', 0) + 1, checkpoint.get('population', [])
+        # partial=True means the stored generation was INTERRUPTED mid-evaluation, so resume INTO
+        # it rather than after it. The fitness list carries which individuals are already done.
+        next_gen = checkpoint.get('generation', 0)
+        if not checkpoint.get('partial'):
+            next_gen += 1
+        return next_gen, checkpoint.get('population', []), checkpoint.get('fitnesses')
+
+    def _maybe_partial_checkpoint(self, gen: int, population: list, checkpoint_callback) -> None:
+        """Checkpoint mid-generation every ``partial_checkpoint_every`` completed trials.
+
+        Best-effort: a checkpoint write must never fail an otherwise healthy generation.
+        """
+        if not self.partial_checkpoint_every:
+            return
+        self._partial_counter += 1
+        if self._partial_counter % self.partial_checkpoint_every:
+            return
+        try:
+            checkpoint_callback(gen, population, partial=True)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"partial checkpoint failed (ignored): {e}")
+
+    def rebuild_population(self, genes: list, fitnesses: list = None) -> list:
+        """Rebuild a DEAP population from checkpointed genes + fitness values.
+
+        A ``None`` fitness (or a missing/short list) leaves that individual INVALID, which is
+        precisely the signal DEAP's ``invalid_ind`` filter acts on -- so an unevaluated
+        individual is re-run and an evaluated one is not. Never raises on a malformed list:
+        the worst outcome must be re-evaluating something, never crashing a resume.
+        """
+        population = []
+        for i, g in enumerate(genes):
+            ind = creator.Individual(g)
+            fit = None
+            if fitnesses is not None and i < len(fitnesses):
+                fit = fitnesses[i]
+            if fit is not None:
+                try:
+                    ind.fitness.values = (float(fit),)
+                except (TypeError, ValueError):
+                    pass          # unusable value -> leave invalid, it will be re-evaluated
+            population.append(ind)
+        return population
 
     def get_checkpoint_data(self, generation: int, population: list) -> Dict:
         """
@@ -362,10 +469,17 @@ class GeneticOptimizer:
         return {
             'generation': generation,
             'population': [list(ind) for ind in population],
+            # Fitness per individual, index-aligned with 'population'. None where the individual
+            # has not been evaluated -- which is what makes a MID-GENERATION checkpoint possible:
+            # on resume, DEAP's invalid-fitness filter re-runs exactly the Nones.
+            'fitnesses': [
+                ind.fitness.values[0] if ind.fitness.valid else None
+                for ind in population
+            ],
             'best_individual': list(self.best_individual) if self.best_individual else None,
             'best_fitness': self.best_fitness,
             'history': self.history,
-            'random_state': list(random.getstate()),
+            'random_state': _py_state_to_jsonable(random.getstate()),
             'np_random_state': _np_state_to_jsonable(np.random.get_state()),
         }
 
@@ -375,6 +489,7 @@ class GeneticOptimizer:
         callback: Callable[[int, float, Dict], None] = None,
         start_generation: int = 0,
         initial_population: list = None,
+        restored_fitnesses: list = None,
         checkpoint_callback: Callable[[int, list], None] = None,
         on_generation_start: Callable[[int], None] = None,
         batch_fitness: Callable[[list], list] = None
@@ -387,7 +502,9 @@ class GeneticOptimizer:
             callback: Optional callback(generation, best_fitness, best_params) called after each generation
             start_generation: Generation to start from (for resume)
             initial_population: Initial population data (for resume)
-            checkpoint_callback: Called after each generation with (gen, population) for saving
+            restored_fitnesses: Fitness per restored individual, index-aligned with
+                initial_population. None entries stay INVALID and are re-evaluated.
+            checkpoint_callback: Called with (gen, population, partial=False) for saving
             on_generation_start: Optional callback(generation) called before evaluating each generation
 
         Returns:
@@ -397,8 +514,11 @@ class GeneticOptimizer:
 
         # Create or restore population
         if initial_population:
-            population = [creator.Individual(ind) for ind in initial_population]
-            logger.info(f"Restored population of {len(population)} individuals")
+            population = self.rebuild_population(initial_population, restored_fitnesses)
+            n_valid = sum(1 for ind in population if ind.fitness.valid)
+            logger.info(
+                f"Restored population of {len(population)} individuals "
+                f"({n_valid} already evaluated, {len(population) - n_valid} to run)")
         else:
             population = self.toolbox.population(n=self.population_size)
 
@@ -438,6 +558,9 @@ class GeneticOptimizer:
             # This prevents re-evaluating elites which would give different results
             # due to stochastic neural network training
             invalid_ind = [ind for ind in population if not ind.fitness.valid]
+            # Fresh throttle phase per generation: a carried-over counter would put this
+            # generation's first partial write at an arbitrary offset.
+            self._partial_counter = 0
 
             if batch_fitness is not None:
                 # TRUE multiprocessing path: the caller evaluates the whole batch of
@@ -445,7 +568,26 @@ class GeneticOptimizer:
                 # CPU-bound work in worker PROCESSES (no GIL). All shared state (memo /
                 # bookkeeping / DB) stays in the caller's main process. Order is preserved.
                 param_dicts = [self.decode_individual(ind) for ind in invalid_ind]
-                fits = batch_fitness(param_dicts) if param_dicts else []
+
+                def _on_result(idx: int, fit: float, _inv=invalid_ind, _gen=gen):
+                    """Assign fitness the moment a trial lands so the population is
+                    checkpointable mid-generation. Guarded: a bad index must not kill the run."""
+                    try:
+                        _inv[idx].fitness.values = (float(fit),)
+                    except (IndexError, TypeError, ValueError):
+                        return
+                    if checkpoint_callback:
+                        self._maybe_partial_checkpoint(_gen, population, checkpoint_callback)
+
+                # Not every batch_fitness accepts on_result -- brute force and the ML GA supply
+                # one-argument callables. Probe rather than assume: a TypeError here would be
+                # indistinguishable from one raised INSIDE the evaluation.
+                if param_dicts:
+                    fits = (batch_fitness(param_dicts, on_result=_on_result)
+                            if _accepts_on_result(batch_fitness)
+                            else batch_fitness(param_dicts))
+                else:
+                    fits = []
                 fitnesses = [(float(f),) for f in fits]
             elif self.parallel_individuals > 1:
                 # Thread pool — only useful for I/O-bound or GPU work (the ML engine), NOT for

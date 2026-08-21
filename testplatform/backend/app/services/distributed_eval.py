@@ -44,6 +44,13 @@ Job = Tuple[int, dict, str, dict]
 _MAX_WORKER_FAILURES = 3
 # How long a dispatcher waits out a worker's backpressure before claiming again.
 _BACKPRESSURE_WAIT_S = float(_os.getenv("BT_BACKPRESSURE_WAIT_S", "15"))
+# Fraction of a worker's RAM a trial pool may occupy. The rest absorbs a child's growth
+# through a trial (7.4 -> 13.0 GB measured on the small band) plus the OS and page cache.
+_REMOTE_POOL_BUDGET = float(_os.getenv('BT_REMOTE_POOL_BUDGET', '0.85'))
+# How long to ignore a worker's memory after resizing its pool. A rebuild respawns children
+# that immediately reload their universes, so a sample taken during that window measures the
+# reload, not the steady state -- and acting on it is what drove remote150 from 6 slots to 1.
+_REMOTE_SETTLE_S = float(_os.getenv('BT_REMOTE_SETTLE_S', '180'))
 
 # How often the master polls each remote worker's /health memory block, and the free-memory
 # floor it sheds slots to stay above. Polling on a TIMER rather than per completed trial is
@@ -71,6 +78,30 @@ def _log_memory_diagnostics(log, context: str) -> None:
             f"({vm.percent:.1f}% used)")
     except Exception as e:  # noqa: BLE001 — diagnostics are best-effort, never fatal
         log(f"{context}: memory diagnostics unavailable ({e!r})")
+
+
+def _target_pool_size(diag: Any, peak_mb: Any = None) -> Any:
+    """How many pool children *diag*'s box can actually hold, or None if unknowable yet.
+
+    Computed, not discovered by stepping: (total * budget - server_rss) / peak_child_rss.
+    Sizing on the PEAK child rather than the mean is deliberate -- children grow through a
+    trial, and a pool sized on the average is one simultaneous spike away from the
+    starvation this exists to prevent.
+
+    Children under 64 MB are ignored: multiprocessing's resource tracker sits at ~12 MB and
+    would otherwise drag the peak down and inflate the answer.
+    """
+    if not isinstance(diag, dict):
+        return None
+    total = diag.get('system_total_mb')
+    if not total:
+        return None
+    kids = [k for k in (diag.get('child_rss_mb') or []) if isinstance(k, (int, float)) and k > 64]
+    peak = max([k for k in (kids + [peak_mb]) if k], default=None)
+    if not peak:
+        return None
+    budget = float(total) * _REMOTE_POOL_BUDGET - float(diag.get('server_rss_mb') or 0)
+    return max(1, int(budget // float(peak)))
 
 
 def _is_backpressure(out: Any) -> bool:
@@ -161,6 +192,11 @@ class DistributedEvaluator:
         # epoch at spawn and retires itself as soon as the worker's epoch moves, so exactly
         # one generation is ever alive. Guarded by _worker_lock.
         self._worker_epochs: dict = {}
+        # Per-worker pool sizing state: the heaviest child ever seen (what the pool must be
+        # sized against) and a monotonic deadline before which memory readings are ignored
+        # because a resize is still settling.
+        self._remote_peak_child: dict = {}
+        self._remote_settle_until: dict = {}
         self._secrets: dict = {}
 
     # -- lifecycle ---------------------------------------------------------------------------
@@ -366,7 +402,31 @@ class DistributedEvaluator:
             self._worker_epochs[w["name"]] = self._worker_epochs.get(w["name"], 0) + 1
         return not already_down
 
-    def _shed_remote_slot(self, worker_name: str, gov, why: str) -> bool:
+    def _resize_remote_pool(self, w: dict, gov, target: int, why: str) -> bool:
+        """Take *w*'s pool straight to *target* children and start its settling window.
+
+        One move, not a walk: the target is calculated from measured footprint, so there is
+        nothing to discover by stepping -- and stepping is what let each resize's own reload
+        transient trigger the next one.
+        """
+        import time as _t
+        name = w["name"]
+        before = gov.current
+        gov.current = max(1, min(gov.full, int(target)))
+        # Start settling BEFORE the call: the rebuild begins the moment the worker accepts.
+        self._remote_settle_until[name] = _t.monotonic() + _REMOTE_SETTLE_S
+        self.log(f"[{name}] pool {before} -> {gov.current} child(ren) ({why}); "
+                 f"ignoring its memory for {_REMOTE_SETTLE_S:.0f}s while the pool settles")
+        try:
+            out = worker_client.resize_pool(w, gov.current, force=True)
+            if out.get("changed"):
+                w["capacity"] = max(1, int(out.get("capacity") or gov.current))
+        except Exception as e:  # noqa: BLE001 -- an older worker has no /pool/resize; the
+            # concurrency cut still stands, which is the pre-existing behaviour.
+            self.log(f"[{name}] pool resize to {gov.current} unavailable ({e})")
+        return gov.current != before
+
+    def _shed_remote_slot(self, worker_name: str, gov, why: str, worker: dict = None) -> bool:
         """Drop ONE dispatch slot for *worker_name*. Returns True if anything changed.
 
         One at a time, deliberately. Halving was tried first and is wrong: it overshoots (a box a
@@ -380,15 +440,31 @@ class DistributedEvaluator:
             return False
         self.log(f"[{worker_name}] dispatch slots {before} -> {gov.current} ({why}); "
                  f"in-flight trials finish normally, full concurrency returns at the next job")
+        # AND SHRINK THE POOL TO MATCH. Cutting concurrency alone does not reclaim anything:
+        # ProcessPoolExecutor spreads work over every child, so all N children end up holding
+        # a working set however few run at once. Measured on the small cap band (2026-08-20):
+        # dispatch walked 6 -> 2 while six children stayed at ~9 GB and the box never left
+        # 5-6% free. Resizing the pool is the only operation that returns a child to the OS.
+        if worker is not None:
+            try:
+                out = worker_client.resize_pool(worker, gov.current, force=True)
+                if out.get("changed"):
+                    worker["capacity"] = max(1, int(out.get("capacity") or gov.current))
+                    self.log(f"[{worker_name}] pool shrunk to {worker['capacity']} child(ren) "
+                             f"-- resident memory released")
+            except Exception as e:  # noqa: BLE001 -- an older worker has no /pool/resize;
+                # the concurrency cut above still stands, which is the pre-existing behaviour.
+                self.log(f"[{worker_name}] pool shrink to {gov.current} unavailable ({e})")
         return True
 
-    def _remote_memory_watchdog(self) -> None:
+    def _remote_memory_watchdog(self) -> None:  # noqa: C901
         """Poll every active worker's memory on a timer and shed a slot while it is under the floor.
 
         Runs until the evaluator stops. Independent of trial completion, which is the whole reason
         it exists (see _REMOTE_MEM_POLL_S). Best-effort throughout: a worker that cannot be reached
         is left to the existing failure/re-admission path rather than being throttled on a guess.
         """
+        import time as _time
         while not self._stop.wait(_REMOTE_MEM_POLL_S):
             with self._worker_lock:
                 active = list(self._active_workers)
@@ -404,11 +480,30 @@ class DistributedEvaluator:
                         gov = self._remote_govs.get(name)
                     if gov is None:
                         continue
-                    if free_pct < _REMOTE_MEM_FLOOR_PCT:
-                        self._shed_remote_slot(
-                            name, gov,
-                            f"{free_pct:.1f}% free < {_REMOTE_MEM_FLOOR_PCT:.0f}% floor "
-                            f"({mem.get('free_mb')} MB of {mem.get('total_mb')} MB)")
+                    if free_pct >= _REMOTE_MEM_FLOOR_PCT:
+                        continue
+                    # SETTLING. A pool rebuilt moments ago is still reloading universes; that
+                    # reading measures the reload, not the steady state. Acting on it is the
+                    # feedback loop that drove remote150 from 6 children to 1.
+                    if _time.monotonic() < self._remote_settle_until.get(name, 0.0):
+                        continue
+                    diag = worker_client.memory(w)
+                    peak = self._remote_peak_child.get(name)
+                    kids = [k for k in (diag.get('child_rss_mb') or []) if k > 64]
+                    if kids:
+                        peak = max(kids + ([peak] if peak else []))
+                        self._remote_peak_child[name] = peak
+                    target = _target_pool_size(diag, peak)
+                    if target is None or target >= gov.current:
+                        # The box is tight but not because the pool is too big (a co-tenant,
+                        # or a transient). Shrinking further would cost throughput and fix
+                        # nothing -- 74.3% free at ONE child is what that mistake looks like.
+                        continue
+                    self._resize_remote_pool(
+                        w, gov, target,
+                        f"{free_pct:.1f}% free < {_REMOTE_MEM_FLOOR_PCT:.0f}% floor "
+                        f"({mem.get('free_mb')} MB of {mem.get('total_mb')} MB), "
+                        f"peak child {peak} MB")
                 except Exception as e:  # noqa: BLE001 -- a poll failure must never stop the loop
                     self.log(f"[{name}] memory poll failed: {e!r}")
 
@@ -426,18 +521,20 @@ class DistributedEvaluator:
                 gov = self._remote_govs.get(worker_name)
             if gov is None:
                 return
-            verdict = gov.assess(mem)
-            # ACT on the verdict. 'release' already decremented gov.current inside assess(), which
-            # the dispatchers observe before their next claim. 'emergency' does NOT touch current
-            # -- that branch was written for the LOCAL owner, which responds by breaking its
-            # process pool. A remote owner cannot do that, so before this it shed NOTHING: on
-            # 2026-08-18 remote150 fell to 85 MB free of 65 GB on the mid band (765 screened
-            # symbols vs ~105 on large) and the emergency logged a pool-break that never happened.
-            # Sheds ONE slot, and the watchdog steps again a minute later if the box is
-            # still under the floor -- halving was tried and rejected: it overshoots and
-            # cannot converge on the concurrency the band actually affords.
+            # OBSERVE ONLY. verdict() is the non-mutating query; assess() would decrement
+            # `current` here as a side effect, which is a SECOND actuator on a ceiling the
+            # memory watchdog owns and sizes by calculation. That is precisely what walked
+            # remote150 from the watchdog's computed 4 down to 1 while the box sat 71.7%
+            # free -- and it hid because the two paths log different strings.
+            verdict = gov.verdict(mem)
             if verdict == "emergency":
-                self._shed_remote_slot(worker_name, gov, "emergency (trial snapshot)")
+                # Do not act, but do not sit on a stale settling deadline either: let the
+                # watchdog re-measure and re-calculate on its very next poll.
+                import time as _t
+                self._remote_settle_until[worker_name] = 0.0
+                self.log(f"[{worker_name}] trial snapshot reports "
+                         f"{(mem.get('sys') or {}).get('pct_free')}% free -- clearing the "
+                         f"settling window so the pool is re-sized on the next poll")
         except Exception as e:  # noqa: BLE001 -- governing must never fail a healthy trial
             self.log(f"remote governor assess failed for {worker_name}: {e!r}")
 

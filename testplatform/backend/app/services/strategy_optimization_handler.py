@@ -417,8 +417,31 @@ class MemoryGovernor:
             self.log(f"memory governor: restoring concurrency {self.current} -> {self.full} ({why})")
         self.current = self.full
 
+    def verdict(self, mem: Any) -> str:
+        """Classify a snapshot as 'ok' | 'release' | 'emergency' WITHOUT changing anything.
+
+        The pure query. assess() below mutates `current` as a side effect of classifying,
+        which is right for the LOCAL governor (it owns a pool it can act on) and wrong for
+        any caller that only wants to observe -- a remote worker's ceiling is owned by the
+        memory watchdog, which sizes it by calculation. Two actuators on one governor is
+        what drove remote150 to a single slot on a box that was 71.7% free.
+        """
+        if not isinstance(mem, dict):
+            return "ok"
+        pct = (mem.get("sys") or {}).get("pct_free")
+        if pct is None:
+            return "ok"
+        if pct < _MEM_EMERGENCY_PCT:
+            return "emergency"
+        if pct < _MEM_THROTTLE_PCT:
+            return "release"
+        return "ok"
+
     def assess(self, mem: Any) -> str:
-        """Return 'ok' | 'release' | 'emergency' from a per-trial snapshot. Never raises."""
+        """Classify a snapshot AND act on it (reduces `current` on 'release').
+
+        For the LOCAL governor only. Remote callers want verdict() -- see its docstring.
+        Never raises."""
         if not isinstance(mem, dict):
             return "ok"
         sys_mem = mem.get("sys") or {}
@@ -1043,9 +1066,10 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         ckpt_task_id = checkpoint_task_id(opt.name, opt_id)
         ckpt_fingerprint = checkpoint_fingerprint(param_space, ga)
 
-        def checkpoint_cb(generation: int, population: list):
+        def checkpoint_cb(generation: int, population: list, partial: bool = False):
             data = optimizer.get_checkpoint_data(generation, population)
             data["fingerprint"] = ckpt_fingerprint   # refuse to resume into a changed gene space
+            data["partial"] = partial               # resume INTO this generation, not after it
             _save_checkpoint(ckpt_task_id, data)
 
         def _trial_key_for(decoded_flat: Dict[str, Any]) -> str:
@@ -1113,7 +1137,13 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     yield (i, flat, key, fut.result())
 
         def make_batch_fitness(execute_jobs):
-            def batch_fitness(param_dicts: list) -> list:
+            def batch_fitness(param_dicts: list, on_result=None) -> list:
+                """Evaluate one generation's worth of genomes.
+
+                *on_result* (supplied by GeneticOptimizer) is called ``(index, fitness)`` the
+                moment each trial lands, so the GA can assign fitness incrementally and
+                checkpoint the population MID-generation instead of only at the boundary.
+                """
                 nonlocal _pool          # rebound by the batch-end recycle at the bottom
                 if tq.is_task_paused(task_id):
                     raise InterruptedError("paused/cancelled")
@@ -1126,6 +1156,10 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     cached = memo.get(key)
                     if cached is not None:
                         fits[i] = cached
+                        # A memo hit IS an evaluated individual. Report it, or a partial
+                        # checkpoint would record it as a None and re-run it after a restart --
+                        # and the in-process memo does not survive the restart.
+                        _report_trial_result(on_result, i, cached)
                         continue
                     config = _build_daily_trial_config(
                         backtest_cfg, decode_params(strategy, flat), hoisted
@@ -1173,6 +1207,12 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                         fit = float(out["fitness"])
                         fits[i] = fit
                         memo.put(key, fit)
+                        # Straight back to the GA, before anything else in this iteration: the
+                        # individual is done, so the population is now checkpointable with it
+                        # counted. Deliberately NOT done in the failure branch below -- a crash
+                        # is an environment event rather than a property of the genome (same
+                        # reasoning as the memo skip there), so a restart should re-run it.
+                        _report_trial_result(on_result, i, fit)
                         _log_trial_memory(gen, n_gens, done + 1, total_in_batch,
                                           out.get("mem"), out.get("secs"),
                                           fit_raw=out.get("fitness_raw"), fit_ranked=fit,
@@ -1292,30 +1332,35 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
 
             return batch_fitness
 
-        start_gen, init_pop = 0, None
+        start_gen, init_pop, init_fits = 0, None, None
         ckpt = _load_checkpoint(ckpt_task_id, ckpt_fingerprint)
         # EXHAUSTED CHECKPOINT: one written at (or past) the final generation leaves nothing to
         # run, and resuming into it produces a 0-trial run that reports "every backtest failed" --
         # a confusing failure for what is really "this search already finished". Only reachable
         # when a run reached the last generation and then died before _clear_checkpoint (or when a
         # NEW job reuses a dead job's name), so discarding and searching from scratch is both the
-        # safe reading and the one that produces a result.
-        if ckpt and int(ckpt.get("generation", -1)) + 1 >= int(ga["generations"]):
+        # safe reading and the one that produces a result. A PARTIAL checkpoint on the final
+        # generation is the exception -- see _checkpoint_exhausted.
+        if _checkpoint_exhausted(ckpt, ga["generations"]):
             logger.warning(
                 f"strategy_optimization {opt_id}: checkpoint {ckpt_task_id} is at generation "
                 f"{ckpt.get('generation')} of {ga['generations']} — exhausted, starting fresh")
             _clear_checkpoint(ckpt_task_id)
             ckpt = None
         if ckpt:
-            start_gen, init_pop = optimizer.resume_from_checkpoint(ckpt)
+            start_gen, init_pop, init_fits = optimizer.resume_from_checkpoint(ckpt)
             logger.warning(
                 f"strategy_optimization {opt_id}: RESUMING {opt.name!r} at generation "
                 f"{start_gen}/{ga['generations']} from checkpoint {ckpt_task_id}")
             # KNOWN LIMITATION: ``all_results`` restarts empty, so this row records only the
             # trials evaluated AFTER the resume -- the earlier ones stay on the interrupted run's
             # own row. The SEARCH is unaffected (population, elites, best_individual and both RNG
-            # states are all restored), and elites re-appear in later generations, so best_params
-            # is intact; only the top-N candidate POOL is thinner than an uninterrupted run's.
+            # states are all restored -- true only since the Python RNG state was made to survive
+            # the JSON checkpoint column; before that its setstate() raised "state vector must be
+            # a tuple", was swallowed as a warning, and a resumed run silently diverged. See
+            # genetic._jsonable_to_py_state and tests/test_determinism_helpers.py), and elites
+            # re-appear in later generations, so best_params is intact; only the top-N candidate
+            # POOL is thinner than an uninterrupted run's.
             # Carrying all_results in the checkpoint would embed every trial's trades JSON in it.
         else:
             # Warm-start (NOT resume): seed this job's population from a DIFFERENT, already-run
@@ -1451,6 +1496,7 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                 checkpoint_callback=checkpoint_cb,
                 start_generation=start_gen,
                 initial_population=init_pop,
+                restored_fitnesses=init_fits,
                 batch_fitness=batch_fitness,
             )
         except _FatalTrialError as e:
@@ -2023,6 +2069,41 @@ def checkpoint_task_id(opt_name: Optional[str], opt_id: int) -> str:
 
     key = (opt_name or f"opt-{opt_id}").strip()
     return "ckpt-" + hashlib.sha1(key.encode("utf-8")).hexdigest()[:24]
+
+
+def _checkpoint_exhausted(ckpt: dict, n_generations: int) -> bool:
+    """True when a checkpoint has no work left in it.
+
+    A checkpoint written AFTER the final generation is exhausted. A PARTIAL one written DURING
+    the final generation is not -- it still has unevaluated individuals, and discarding it would
+    throw away exactly the work partial checkpointing exists to save.
+    """
+    if not ckpt:
+        return False
+    gen = int(ckpt.get("generation", -1))
+    if ckpt.get("partial"):
+        return gen >= int(n_generations)
+    return gen + 1 >= int(n_generations)
+
+
+def _report_trial_result(on_result, idx: int, fitness: float) -> None:
+    """Hand ONE landed trial straight back to the GA, before the batch loop moves on.
+
+    This is what makes a mid-generation checkpoint possible: ``execute_jobs`` already yields per
+    trial, but the GA used to see nothing until the whole list came back, so an interrupted
+    generation looked entirely unevaluated. With this, the GA assigns fitness incrementally and
+    the population is checkpointable at any instant.
+
+    Best-effort by contract. ``on_result`` writes a checkpoint; a failing write (full disk, a
+    locked DB) must never abort an otherwise healthy generation, and callers that supply no
+    callback at all must pay nothing.
+    """
+    if on_result is None:
+        return
+    try:
+        on_result(idx, fitness)
+    except Exception as e:  # noqa: BLE001 -- progress reporting must never fail a batch
+        logger.warning(f"on_result callback failed (ignored): {e}")
 
 
 def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any]) -> str:

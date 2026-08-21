@@ -114,7 +114,8 @@ _NEVER_STARTED_GRACE = 420.0
 _NO_PROGRESS_TIMEOUT = 900.0
 
 
-def resize_pool(worker: dict, workers: int, timeout: float = 120.0) -> dict:
+def resize_pool(worker: dict, workers: int, timeout: float = 120.0,
+                force: bool = False) -> dict:
     """Ask *worker* to size its trial pool to *workers* slots for the coming job.
 
     Generous timeout: the worker tears its pool down and respawns, which on a box that has
@@ -123,7 +124,7 @@ def resize_pool(worker: dict, workers: int, timeout: float = 120.0) -> dict:
     """
     with httpx.Client(timeout=timeout) as c:
         r = c.post(f"{_base(worker)}/pool/resize", headers=_headers(worker),
-                   json={"workers": int(workers)})
+                   json={"workers": int(workers), "force": bool(force)})
         r.raise_for_status()
         return r.json()
 

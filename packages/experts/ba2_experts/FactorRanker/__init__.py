@@ -799,6 +799,15 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
                 "rank": i + 1,
                 "composite": round(comp.get(sym, 0.0), 4),
                 "factors": {name: round(z.get(sym, 0.0), 4) for name, z in zscores.items()},
+                # Raw (pre-z-score) factor values, ADDITIVE to "factors" above --
+                # purely informational, not consumed by ranking/rebalancing (which
+                # only ever use the z-scored "factors"/"composite"). Exists because
+                # a cross-sectional z-score against a universe of exactly 1 symbol
+                # has zero variance by definition and is ALWAYS 0.0 regardless of
+                # the real underlying value -- SYMBOL360's single-symbol export
+                # (FactorRanker._build_export_metrics) shows these instead, since
+                # they're the only numbers that differ from 0 in that case.
+                "factors_raw": {name: round(vals.get(sym, 0.0), 4) for name, vals in factor_values.items()},
                 "target_weight": round(targets.get(sym, 0.0), 4),
                 "action": action,
             })
@@ -893,19 +902,26 @@ class FactorRanker(ExpertDataExportInterface, MarketExpertInterface):
                     f"to that single symbol; returning no metrics rather than guessing.")
                 return []
 
-        # _build_book always writes round(...get(sym, 0.0), 4) for composite/factor
-        # z-scores, so these are real floats, never None -- the `or 0.0` below is
-        # defense-in-depth against a future _build_book change, not a known gap.
+        # A cross-sectional z-score against a universe of exactly 1 symbol has
+        # ZERO variance by definition (cross_sectional_zscore divides by a
+        # standard deviation of 0), so "composite"/"factors" are mathematically
+        # forced to exactly 0.0 here regardless of the real underlying values --
+        # not a bug, just meaningless for a single-symbol view. Show it with no
+        # signal badge and an explicit note, and show the RAW (pre-z-score)
+        # factor values instead as the numbers that actually differ by symbol
+        # (added to _build_book specifically for this).
         composite = row.get("composite") or 0.0
         out = [ExpertMetric(
-            "Composite factor score", composite, f"{composite:+.3f}",
-            "buy" if composite > 0 else ("sell" if composite < 0 else "neutral"),
-            f"Rank {row.get('rank')} of {book.get('universe_size', len(ranking))}")]
-        for name, z in (row.get("factors") or {}).items():
-            z = z or 0.0
+            "Composite factor score", composite, f"{composite:+.3f}", None,
+            "Cross-sectional z-score; always 0 for a single symbol (no peer "
+            "universe to compare against) -- see the raw factor values below "
+            "for numbers that actually vary.")]
+        for name, raw_val in (row.get("factors_raw") or {}).items():
+            raw_val = raw_val or 0.0
             out.append(ExpertMetric(
-                f"Factor: {name}", z, f"{z:+.3f}",
-                "buy" if z > 0 else ("sell" if z < 0 else "neutral")))
+                f"Factor: {name} (raw)", raw_val, f"{raw_val:+.4f}", None,
+                "Unscaled value, not compared against a peer universe -- no "
+                "buy/sell threshold is implied by its sign alone."))
         return out
 
     # ------------------------------------------------------------------

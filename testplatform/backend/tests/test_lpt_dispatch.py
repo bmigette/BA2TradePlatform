@@ -232,6 +232,7 @@ class _FakeEvaluator:
         import threading
         self._remote_govs = {"remote150": gov}
         self._remote_gov_lock = threading.Lock()
+        self._remote_settle_until = {}
         self.logged = []
 
     def log(self, m):
@@ -245,20 +246,20 @@ class _FakeEvaluator:
     _shed_remote_slot = _DE._shed_remote_slot
 
 
-def test_remote_emergency_sheds_exactly_one_slot():
-    """THE 2026-08-18 REGRESSION. remote150 hit 85 MB free of 65 GB on the mid band and the
-    emergency shed NOTHING: assess() only returns a verdict and assess_remote discarded it, while
-    the log claimed a pool-break that cannot happen on a remote box.
+def test_remote_emergency_does_not_shed_it_defers_to_the_watchdog():
+    """SUPERSEDED 2026-08-20. This test used to assert that a trial snapshot sheds one slot.
+    That WAS the behaviour, and it was the bug: the watchdog now sizes a remote pool by
+    calculation, so a second actuator stepping the same governor from here walked remote150 from
+    the computed 4 down to 1 while the box sat 71.7% free.
 
-    ONE slot, not half: halving overshoots (a box marginally over the line loses half its
-    throughput) and cannot converge. The watchdog re-polls a minute later and steps again if the
-    box is still under the floor, so concurrency walks down to what the band affords and stops."""
+    The trial-snapshot path now observes only. Its one action is to clear the settling window so
+    the watchdog re-measures promptly -- see tests/test_governor_single_actuator.py."""
     gov = MemoryGovernor(12, log=lambda *_: None)
     ev = _FakeEvaluator(gov)
     ev.assess_remote("remote150", _pressure(0.1))
-    assert gov.current == 11
+    assert gov.current == 12, "a snapshot must not move a ceiling the watchdog owns"
     ev.assess_remote("remote150", _pressure(0.1))
-    assert gov.current == 10, "repeated pressure keeps stepping down one at a time"
+    assert gov.current == 12
 
 
 def test_remote_emergency_never_parks_the_last_slot():
@@ -269,11 +270,12 @@ def test_remote_emergency_never_parks_the_last_slot():
     assert gov.current == 1, "a worker must never be throttled out of existence"
 
 
-def test_remote_throttle_still_sheds_one_slot():
+def test_remote_throttle_does_not_shed_either():
+    """Also superseded: a 'release' verdict used to decrement inside assess(). Now non-mutating."""
     gov = MemoryGovernor(12, log=lambda *_: None)
     ev = _FakeEvaluator(gov)
     ev.assess_remote("remote150", _pressure(8.0))   # <10% = release, not emergency
-    assert gov.current == 11
+    assert gov.current == 12
 
 
 def test_remote_ok_reading_changes_nothing():
@@ -291,12 +293,18 @@ def test_emergency_note_is_owner_specific():
     assert "breaking the pool" not in remote.emergency_note
 
 
-def test_assess_remote_surfaces_a_broken_shed_instead_of_silently_passing():
+def test_assess_remote_surfaces_an_internal_failure_instead_of_silently_passing():
     """The except-Exception in assess_remote must not turn a real defect into a silent no-op --
-    which is exactly how the original bug survived: it logged success and shed nothing."""
-    gov = MemoryGovernor(12, log=lambda *_: None)
+    which is exactly how the 2026-08-18 bug survived: it logged success and shed nothing.
+
+    The failure injected here moved when assess_remote stopped actuating (2026-08-20): the
+    breakable step is now the verdict itself, not the shed."""
+    class _Boom(MemoryGovernor):
+        def verdict(self, mem):
+            raise RuntimeError("classifier exploded")
+
+    gov = _Boom(12, log=lambda *_: None)
     ev = _FakeEvaluator(gov)
-    ev._shed_remote_slot = None          # simulate the method going missing
     ev.assess_remote("remote150", _pressure(0.1))
-    assert gov.current == 12, "nothing shed"
+    assert gov.current == 12, "nothing changed"
     assert any("assess failed" in m for m in ev.logged), "the failure must be LOGGED, not swallowed"
