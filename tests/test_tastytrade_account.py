@@ -1007,11 +1007,22 @@ def test_build_new_order_prices_a_sell_limit_as_a_positive_credit():
 # ---------------------------------------------------------------------------
 
 def _built_order(**order_kwargs):
+    """Build a NewOrder against the LIVE production quantity grid.
+
+    The precision table must be wired, not left to fail: `_build_new_order` now
+    quantises the leg through `_tradable_quantity`, and an unreachable table means
+    "the broker did not say", which floors an eligible symbol to whole shares. The
+    row here is the user's real generic equity row (`value=5`, probed 2026-08-21),
+    so a fractional quantity of up to 5 decimals survives exactly as production
+    would send it.
+    """
     account_def, order = _tt_trading_order(**order_kwargs)
     acct = _bare_account()
     acct.id = account_def.id
     with patch("tastytrade.instruments.Equity.get",
-               new=AsyncMock(return_value=_FakeEquity(order.symbol))):
+               new=AsyncMock(return_value=_FakeEquity(order.symbol))), \
+         patch("tastytrade.instruments.get_quantity_decimal_precisions",
+               new=AsyncMock(return_value=[_precision(value=5)])):
         return acct._build_new_order(order)
 
 
@@ -2858,10 +2869,17 @@ def test_symbol_margin_info_still_answers_for_a_genuinely_flat_account():
     assert info["AAPL"].bp_factor == 2.0
 
 
-def test_symbol_margin_info_leaves_the_increment_unknown_when_precision_is_unavailable():
-    """I7. `min_trade_increment` is the broker's published quantity step, and None
-    means "the broker did not say" -- never a fabricated or derived number. With the
-    precision table unreachable, a fractionable symbol's step is genuinely unknown."""
+def test_symbol_margin_info_reports_unknown_when_the_precision_table_is_unavailable():
+    """I7, restated for the tri-state. An eligible symbol whose STEP the broker never
+    published is reported `fractionable=None, min_trade_increment=1.0`, not
+    `True/None`.
+
+    `True/None` would let the engine size on DEFAULT_FRACTIONAL_DECIMALS' made-up 1e-4
+    grid while `_tradable_quantity` floors the very same order to whole shares -- the
+    plan and the execution would disagree. And `False` would be worse still: the broker
+    said the symbol IS eligible, so reporting "not fractionable" invents a broker fact.
+    None is the honest third state.
+    """
     acct = _bare_account()
     acct._account.get_margin_requirements = AsyncMock(return_value=_margin_report())
     acct._account.get_positions = AsyncMock(return_value=[])
@@ -2872,8 +2890,8 @@ def test_symbol_margin_info_leaves_the_increment_unknown_when_precision_is_unava
                new=AsyncMock(side_effect=RuntimeError("gateway timeout"))):
         info = acct.get_symbol_margin_info(["AAPL"])
 
-    assert info["AAPL"].fractionable is True
-    assert info["AAPL"].min_trade_increment is None
+    assert info["AAPL"].fractionable is None
+    assert info["AAPL"].min_trade_increment == 1.0
 
 
 def test_symbol_margin_info_reports_whole_shares_for_a_non_fractionable_symbol_even_without_precision():
@@ -2895,10 +2913,17 @@ def test_symbol_margin_info_reports_whole_shares_for_a_non_fractionable_symbol_e
     assert info["BRKA"].min_trade_increment == 1.0
 
 
-def test_symbol_margin_info_treats_an_unknown_fractionability_as_not_fractionable():
-    """M19. `is_fractional_quantity_eligible` is Optional in the SDK. None means the
-    broker did not say, which must NOT be read as "yes, split it" -- a fractional
-    quantity on a whole-share-only name is rejected at submission."""
+def test_symbol_margin_info_treats_an_unstated_eligibility_flag_as_unknown_never_as_false():
+    """M19, restated for the tri-state. `is_fractional_quantity_eligible` is
+    `bool | None` (instruments.py:262). None means the broker did not say, which must
+    NOT be read as "yes, split it" -- and must NOT be flattened into `False` either.
+    `MarginInfo.fractionable` is Optional[bool] for exactly this: the engine's
+    "fractionable unknown - whole shares" branch reads `m.fractionable is None`, and a
+    fabricated False would report it as a broker refusal instead.
+
+    The SIZING is identical either way (increment 1.0 -> whole shares), which is why
+    this is safe; only the REASON the operator is shown differs, and it should be true.
+    """
     acct = _bare_account()
     equity_patch, precision_patch = _wire_margin_sources(
         acct, equities=[_FakeEquity("AAPL", is_fractional_quantity_eligible=None)],
@@ -2907,7 +2932,7 @@ def test_symbol_margin_info_treats_an_unknown_fractionability_as_not_fractionabl
     with equity_patch, precision_patch:
         info = acct.get_symbol_margin_info(["AAPL"])
 
-    assert info["AAPL"].fractionable is False
+    assert info["AAPL"].fractionable is None
     assert info["AAPL"].min_trade_increment == 1.0
 
 
@@ -3809,3 +3834,475 @@ def test_a_broker_failure_does_not_recurse_through_the_public_seam(monkeypatch):
         assert acct.is_market_open(now=_ny(2026, 8, 20, 11, 0)) is True
 
     assert hours.source == MARKET_HOURS_SOURCE_FALLBACK
+
+
+# ---------------------------------------------------------------------------
+# Fractionability pre-check
+#
+# NOTE ON `_precision(...)`: the quantity decimal precision is
+# `QuantityDecimalPrecision.value`, NOT `minimum_increment_precision` (live finding
+# L3, 2026-08-21 -- the real generic equity row is `value=5,
+# minimum-increment-precision=0`). Every precision below is therefore expressed as
+# `value=`, and the helper's default `minimum_increment_precision=0` is left alone
+# on purpose so the two fields stay DISTINGUISHABLE.
+# ---------------------------------------------------------------------------
+
+def test_quantity_precisions_prefer_the_per_symbol_row_over_the_generic_one():
+    """QuantityDecimalPrecision publishes ONE generic equity row (symbol=None) plus
+    per-symbol rows that OVERRIDE it (instruments.py:76-85). Sizing an overridden name
+    on the generic grid gets the order rejected -- the broker phrases the limit PER
+    SYMBOL ("maximum decimal precision of 5 for SCHD") even though the live table
+    currently publishes no per-symbol equity rows at all."""
+    acct = _bare_account()
+
+    with patch("tastytrade.instruments.get_quantity_decimal_precisions",
+               new=AsyncMock(return_value=[
+                   _precision(value=5, symbol=None),
+                   _precision(value=2, symbol="BRKB"),
+                   _precision(value=8, symbol="BTC",
+                              instrument_type="Cryptocurrency"),
+               ])):
+        precisions = acct._equity_quantity_precisions()
+
+    assert precisions[None] == 5
+    assert precisions["BRKB"] == 2
+    # Non-equity rows are not equity precision.
+    assert "BTC" not in precisions
+
+
+def test_quantity_precisions_read_value_not_minimum_increment_precision():
+    """L3 again, at the new seam. The live equity row is `value=5,
+    minimum-increment-precision=0`; reading the latter yields 10**-0 == 1.0, i.e.
+    "fractionable, but whole shares only", which silently disables fractional sizing
+    for the whole broker. The two fields must stay told apart HERE too, not just in
+    get_symbol_margin_info."""
+    acct = _bare_account()
+    row = _precision(value=5, minimum_increment_precision=0)
+    assert (row.value, row.minimum_increment_precision) == (5, 0)
+
+    with patch("tastytrade.instruments.get_quantity_decimal_precisions",
+               new=AsyncMock(return_value=[row])):
+        assert acct._equity_quantity_precisions() == {None: 5}
+
+
+def test_quantity_precisions_are_fetched_once_and_cached():
+    acct = _bare_account()
+    fetch = AsyncMock(return_value=[_precision(value=5)])
+
+    with patch("tastytrade.instruments.get_quantity_decimal_precisions", new=fetch):
+        acct._equity_quantity_precisions()
+        acct._equity_quantity_precisions()
+
+    assert fetch.await_count == 1
+
+
+def test_quantity_precisions_return_empty_when_the_fetch_fails():
+    """{} means 'the broker did not say'. It must never be cached as if it had."""
+    acct = _bare_account()
+    fetch = AsyncMock(side_effect=RuntimeError("503"))
+
+    with patch("tastytrade.instruments.get_quantity_decimal_precisions", new=fetch):
+        assert acct._equity_quantity_precisions() == {}
+        acct._equity_quantity_precisions()
+
+    assert fetch.await_count == 2
+
+
+def test_the_quantity_precision_cache_is_never_shared_between_accounts():
+    """The cache is declared on the CLASS so a bare object.__new__ instance has it,
+    but it must only ever be REBOUND on the instance. Mutating the class attribute in
+    place would let one account's precision table answer for another's -- the bug the
+    frozen-MarginInfo rule exists to stop, one level up."""
+    first = _bare_account()
+    second = _bare_account()
+    fetch = AsyncMock(return_value=[_precision(value=5)])
+
+    with patch("tastytrade.instruments.get_quantity_decimal_precisions", new=fetch):
+        first._equity_quantity_precisions()
+
+    assert TastyTradeAccount._quantity_precision_cache is None
+    assert second.__dict__.get("_quantity_precision_cache") is None
+
+
+def test_clear_quantity_precision_cache_forces_the_next_lookup_to_refetch():
+    """Every TTL cache in this codebase ships an explicit clear companion (contract
+    1.11). A 24-hour TTL is not soon enough for a user who hits Refresh knowing
+    TastyTrade just published a step, and this account object lives for the whole
+    process."""
+    acct = _bare_account()
+    fetch = AsyncMock(return_value=[_precision(value=5)])
+
+    with patch("tastytrade.instruments.get_quantity_decimal_precisions", new=fetch):
+        acct._equity_quantity_precisions()
+        acct.clear_quantity_precision_cache()
+        assert acct._equity_quantity_precisions() == {None: 5}
+
+    assert fetch.await_count == 2
+
+
+def test_symbol_margin_info_uses_a_per_symbol_precision_override():
+    acct = _bare_account()
+    equity_patch, precision_patch = _wire_margin_sources(
+        acct,
+        equities=[_FakeEquity("BRKB", is_fractional_quantity_eligible=True)],
+        report=_margin_report(),
+        precisions=[_precision(value=5, symbol=None),
+                    _precision(value=2, symbol="BRKB")],
+        positions=[])
+
+    with equity_patch, precision_patch:
+        info = acct.get_symbol_margin_info(["BRKB"])
+
+    assert info["BRKB"].fractionable is True
+    assert info["BRKB"].min_trade_increment == pytest.approx(0.01)
+
+
+def test_symbol_margin_info_reports_unknown_when_no_precision_is_published(monkeypatch):
+    """The broker answered "eligible" and published no grid. No published grid is not
+    licence to invent one, and it is not licence to call the symbol ineligible either."""
+    _capture_errors(monkeypatch)
+    acct = _bare_account()
+    equity_patch, precision_patch = _wire_margin_sources(
+        acct, equities=[_FakeEquity("AAPL", is_fractional_quantity_eligible=True)],
+        report=_margin_report(), precisions=[], positions=[])
+
+    with equity_patch, precision_patch:
+        info = acct.get_symbol_margin_info(["AAPL"])
+
+    assert info["AAPL"].fractionable is None
+    assert info["AAPL"].min_trade_increment == 1.0
+
+
+def test_symbol_margin_info_reports_a_broker_no_as_a_real_false():
+    """The tri-state's other end. `is_fractional_quantity_eligible is False` is a real
+    broker answer and must reach the engine as `False`, distinct from the `None` the
+    two tests above produce -- False means "we asked and it said no"."""
+    acct = _bare_account()
+    equity_patch, precision_patch = _wire_margin_sources(
+        acct, equities=[_FakeEquity("BRKA", is_fractional_quantity_eligible=False)],
+        report=_margin_report(),
+        precisions=[_precision(value=5)], positions=[])
+
+    with equity_patch, precision_patch:
+        info = acct.get_symbol_margin_info(["BRKA"])
+
+    assert info["BRKA"].fractionable is False
+    assert info["BRKA"].min_trade_increment == 1.0
+
+
+def test_an_unknown_fractionability_carries_no_five_dollar_notional_floor():
+    """`min_fractional_notional` is the $5 floor on a FRACTIONAL order. A symbol
+    reported `fractionable=None` will be submitted as WHOLE SHARES
+    (min_trade_increment 1.0), so it can never place a fractional order and the floor
+    must not apply -- publishing it would suppress a perfectly legal 1-share buy of a
+    sub-$5 stock, which is exactly the reasoning that keeps it off a `False` symbol."""
+    acct = _bare_account()
+    equity_patch, precision_patch = _wire_margin_sources(
+        acct, equities=[_FakeEquity("AAPL", is_fractional_quantity_eligible=None)],
+        report=_margin_report(), precisions=[_precision(value=5)], positions=[])
+
+    with equity_patch, precision_patch:
+        info = acct.get_symbol_margin_info(["AAPL"])
+
+    assert info["AAPL"].fractionable is None
+    assert info["AAPL"].min_fractional_notional is None
+
+
+def test_symbol_margin_info_never_emits_a_none_increment_by_construction():
+    """A CONSEQUENCE of the table above, not a contract.
+
+    Every TastyTrade branch assigns either 1.0 or a real published step, so this
+    adapter happens never to produce `min_trade_increment=None`. That does NOT make
+    None illegal: account_types.py documents None as "the broker published no step",
+    Alpaca still emits it, and `fractionable=True, min_trade_increment=None` remains a
+    legal pair. Nothing may rely on TastyTrade's accident.
+    """
+    acct = _bare_account()
+    equity_patch, precision_patch = _wire_margin_sources(
+        acct,
+        equities=[_FakeEquity("AAPL", is_fractional_quantity_eligible=True),
+                  _FakeEquity("BRKA", is_fractional_quantity_eligible=False),
+                  _FakeEquity("MSFT", is_fractional_quantity_eligible=None)],
+        report=_margin_report(),
+        precisions=[_precision(value=5)], positions=[])
+
+    with equity_patch, precision_patch:
+        info = acct.get_symbol_margin_info(["AAPL", "BRKA", "MSFT"])
+
+    assert all(entry.min_trade_increment is not None for entry in info.values())
+
+
+def test_tradable_quantity_quantises_an_eligible_symbol_downward():
+    acct = _bare_account()
+
+    with patch("tastytrade.instruments.get_quantity_decimal_precisions",
+               new=AsyncMock(return_value=[_precision(value=4)])):
+        qty = acct._tradable_quantity(
+            _FakeEquity("AAPL", is_fractional_quantity_eligible=True), 0.43219)
+
+    # DOWN, never up: rounding up spends buying power the plan did not budget.
+    assert qty == Decimal("0.4321")
+    assert str(qty) == "0.4321"
+
+
+def test_tradable_quantity_keeps_a_whole_number_whole_on_the_wire():
+    """Decimal('100.00000') serialises as "100.00000" and Decimal.normalize() would turn
+    it into "1E+2" -- not a quantity any broker should be shown."""
+    acct = _bare_account()
+
+    with patch("tastytrade.instruments.get_quantity_decimal_precisions",
+               new=AsyncMock(return_value=[_precision(value=5)])):
+        qty = acct._tradable_quantity(
+            _FakeEquity("AAPL", is_fractional_quantity_eligible=True), 100.0)
+
+    assert str(qty) == "100"
+
+
+def test_tradable_quantity_floors_a_symbol_that_is_not_fractional_eligible(monkeypatch):
+    _capture_errors(monkeypatch)
+    acct = _bare_account()
+
+    with patch("tastytrade.instruments.get_quantity_decimal_precisions",
+               new=AsyncMock(return_value=[_precision(value=5)])):
+        qty = acct._tradable_quantity(
+            _FakeEquity("BRKA", is_fractional_quantity_eligible=False), 2.9)
+
+    assert qty == Decimal("2")
+
+
+def test_tradable_quantity_floors_a_symbol_whose_eligibility_is_unstated():
+    """`bool | None`, and None is not permission. Sizing 2.9 as 2.9 on a name the
+    broker never described gets the order rejected at submission."""
+    acct = _bare_account()
+
+    with patch("tastytrade.instruments.get_quantity_decimal_precisions",
+               new=AsyncMock(return_value=[_precision(value=5)])):
+        qty = acct._tradable_quantity(
+            _FakeEquity("AAPL", is_fractional_quantity_eligible=None), 2.9)
+
+    assert qty == Decimal("2")
+
+
+def test_tradable_quantity_does_not_fetch_precision_for_an_ineligible_symbol():
+    """A whole-share-only symbol needs no grid, and the table is a network call."""
+    acct = _bare_account()
+    fetch = AsyncMock(return_value=[_precision(value=5)])
+
+    with patch("tastytrade.instruments.get_quantity_decimal_precisions", new=fetch):
+        acct._tradable_quantity(
+            _FakeEquity("BRKA", is_fractional_quantity_eligible=False), 2.9)
+
+    fetch.assert_not_awaited()
+
+
+def test_tradable_quantity_floors_when_no_precision_is_published():
+    acct = _bare_account()
+
+    with patch("tastytrade.instruments.get_quantity_decimal_precisions",
+               new=AsyncMock(return_value=[])):
+        qty = acct._tradable_quantity(
+            _FakeEquity("AAPL", is_fractional_quantity_eligible=True), 2.9)
+
+    assert qty == Decimal("2")
+
+
+def test_tradable_quantity_uses_the_per_symbol_row_over_the_generic_one():
+    """2 decimals published for BRKB: 0.43219 must become 0.43, not 0.43219."""
+    acct = _bare_account()
+
+    with patch("tastytrade.instruments.get_quantity_decimal_precisions",
+               new=AsyncMock(return_value=[_precision(value=5, symbol=None),
+                                           _precision(value=2, symbol="BRKB")])):
+        qty = acct._tradable_quantity(
+            _FakeEquity("BRKB", is_fractional_quantity_eligible=True), 0.43219)
+
+    assert qty == Decimal("0.43")
+
+
+def test_tradable_quantity_raises_when_rounding_leaves_nothing():
+    from ba2_trade_platform.modules.accounts.TastyTradeAccount import _ZeroQuantityAfterRounding
+
+    acct = _bare_account()
+
+    with patch("tastytrade.instruments.get_quantity_decimal_precisions",
+               new=AsyncMock(return_value=[_precision(value=4)])):
+        with pytest.raises(_ZeroQuantityAfterRounding):
+            acct._tradable_quantity(
+                _FakeEquity("AAPL", is_fractional_quantity_eligible=True), 0.00004)
+        with pytest.raises(_ZeroQuantityAfterRounding):
+            acct._tradable_quantity(
+                _FakeEquity("BRKA", is_fractional_quantity_eligible=False), 0.6)
+
+
+@pytest.mark.parametrize("quantity", [0.0, -0.5, -3.0])
+def test_tradable_quantity_refuses_a_non_positive_quantity_before_asking_the_broker(quantity):
+    """A zero or negative quantity is refused UP FRONT, with its own reason.
+
+    The later floor-to-zero check would also stop all three (ROUND_DOWN is toward
+    zero), so this guard is not about safety -- it is about not paying a network
+    round trip for the precision table to size a quantity that was never sendable,
+    and about telling the truth afterwards: "-3.0 is not positive" is the actual
+    fault, whereas "floors to 0 on the broker's grid" blames the broker's grid for
+    an upstream sizing bug and sends whoever reads the CANCELED row hunting for a
+    precision problem that does not exist.
+    """
+    from ba2_trade_platform.modules.accounts.TastyTradeAccount import _ZeroQuantityAfterRounding
+
+    acct = _bare_account()
+    fetch = AsyncMock(return_value=[_precision(value=5)])
+
+    with patch("tastytrade.instruments.get_quantity_decimal_precisions", new=fetch):
+        with pytest.raises(_ZeroQuantityAfterRounding) as excinfo:
+            acct._tradable_quantity(
+                _FakeEquity("AAPL", is_fractional_quantity_eligible=True), quantity)
+
+    assert "is not positive" in str(excinfo.value)
+    fetch.assert_not_awaited()
+
+
+def test_the_plan_and_the_submission_agree_on_an_eligible_symbol_with_no_published_step():
+    """The reason the no-step case is reported as whole shares, in one assertion.
+
+    get_symbol_margin_info says `min_trade_increment=1.0` (whole shares) and
+    _tradable_quantity submits whole shares. Reporting `True` / `None` instead would
+    have the dry run promise 2.5 shares while the very next call floors it to 2.
+    """
+    acct = _bare_account()
+    equity_patch, precision_patch = _wire_margin_sources(
+        acct, equities=[_FakeEquity("AAPL", is_fractional_quantity_eligible=True)],
+        report=_margin_report(), precisions=[], positions=[])
+
+    with equity_patch, precision_patch:
+        info = acct.get_symbol_margin_info(["AAPL"])
+        qty = acct._tradable_quantity(
+            _FakeEquity("AAPL", is_fractional_quantity_eligible=True), 2.5)
+
+    assert info["AAPL"].fractionable is None
+    assert info["AAPL"].min_trade_increment == 1.0
+    assert qty == Decimal("2")
+
+
+def test_build_new_order_sends_a_fractional_leg_quantity_and_no_notional_field():
+    """Fractional is a fractional Leg.quantity (order.py:140 types it `Decimal | int |
+    None`). TastyTrade needs no notional order type and none is ever emitted."""
+    account_def, order = _tt_trading_order(quantity=0.4321)
+    acct = _bare_account()
+    acct.id = account_def.id
+
+    with patch("tastytrade.instruments.Equity.get",
+               new=AsyncMock(return_value=_FakeEquity(
+                   "AAPL", is_fractional_quantity_eligible=True))), \
+         patch("tastytrade.instruments.get_quantity_decimal_precisions",
+               new=AsyncMock(return_value=[_precision(value=5)])):
+        new_order = acct._build_new_order(order)
+
+    assert new_order.legs[0].quantity == Decimal("0.4321")
+    payload = new_order.model_dump_json(by_alias=True, exclude_none=True)
+    assert '"quantity":"0.4321"' in payload
+    assert "notional" not in payload
+    assert "value-effect" not in payload
+
+
+def test_build_new_order_floors_a_fractional_qty_on_an_ineligible_symbol(monkeypatch):
+    """The engine already resolves these (user decision D1 bumps a floor-to-zero to one
+    whole share, or skips the symbol when one share overshoots the bound). This is
+    submission-time enforcement for a manual order, or a plan built while the metadata
+    fetch was failing."""
+    _capture_errors(monkeypatch)
+    account_def, order = _tt_trading_order(symbol="BRKA", quantity=2.9)
+    acct = _bare_account()
+    acct.id = account_def.id
+
+    with patch("tastytrade.instruments.Equity.get",
+               new=AsyncMock(return_value=_FakeEquity(
+                   "BRKA", is_fractional_quantity_eligible=False))), \
+         patch("tastytrade.instruments.get_quantity_decimal_precisions",
+               new=AsyncMock(return_value=[_precision(value=5)])):
+        new_order = acct._build_new_order(order)
+
+    assert new_order.legs[0].quantity == Decimal("2")
+
+
+def test_submit_order_impl_cancels_rather_than_errors_when_rounding_leaves_zero(monkeypatch):
+    """Nothing was rejected and nothing is wrong with the account, so the row is CANCELED
+    with the reason -- never ERROR. Same rule, and now the same method name, as
+    AlpacaAccount._record_fractional_adjustment."""
+    from ba2_trade_platform.core.types import OrderStatus
+    from ba2_trade_platform.core.db import get_instance
+    from ba2_trade_platform.core.models import TradingOrder
+
+    _capture_errors(monkeypatch)
+    account_def, order = _tt_trading_order(symbol="BRKA", quantity=0.6)
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.place_order = AsyncMock()
+
+    with patch("tastytrade.instruments.Equity.get",
+               new=AsyncMock(return_value=_FakeEquity(
+                   "BRKA", is_fractional_quantity_eligible=False))), \
+         patch("tastytrade.instruments.get_quantity_decimal_precisions",
+               new=AsyncMock(return_value=[_precision(value=5)])):
+        result = acct._submit_order_impl(order)
+
+    assert result is None
+    acct._account.place_order.assert_not_called()
+    stored = get_instance(TradingOrder, order.id)
+    assert stored.status == OrderStatus.CANCELED
+    assert "floors to 0" in (stored.comment or "")
+
+
+def test_submit_order_impl_still_passes_dry_run_false_for_a_fractional_order():
+    """place_order's dry_run DEFAULTS TO True (tastytrade/account.py:877). The fractional
+    path must not become the one call site that forgets it."""
+    account_def, order = _tt_trading_order(quantity=0.4321)
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.place_order = AsyncMock(
+        return_value=_placed_order_response(_placed_order(size="0.4321")))
+
+    with patch("tastytrade.instruments.Equity.get",
+               new=AsyncMock(return_value=_FakeEquity(
+                   "AAPL", is_fractional_quantity_eligible=True))), \
+         patch("tastytrade.instruments.get_quantity_decimal_precisions",
+               new=AsyncMock(return_value=[_precision(value=5)])):
+        acct._submit_order_impl(order)
+
+    assert acct._account.place_order.call_args.kwargs["dry_run"] is False
+    assert acct._account.place_order.call_args.args[1].legs[0].quantity == Decimal("0.4321")
+
+
+def test_every_place_order_call_site_passes_dry_run_explicitly():
+    """The SDK default is dry_run=True (tastytrade/account.py:877), so an omitted
+    argument silently turns a live submit into a no-op -- or, the other way round, would
+    make a "preview" send a real order the day someone flips the default. There are
+    exactly two call sites and both must be explicit."""
+    import inspect
+    import sys
+
+    source = inspect.getsource(sys.modules[TastyTradeAccount.__module__])
+    call_sites = [line.strip() for line in source.splitlines() if ".place_order(" in line]
+
+    assert len(call_sites) == 2, call_sites
+    assert all("dry_run=" in line for line in call_sites), call_sites
+    assert sum("dry_run=False" in line for line in call_sites) == 1, call_sites
+    assert sum("dry_run=True" in line for line in call_sites) == 1, call_sites
+
+
+def test_no_tastytrade_order_is_ever_priced_by_dollar_value():
+    """Contract 1.12: fractional means a fractional share QUANTITY, never a dollar
+    amount. TastyTrade expresses a dollar-denominated order through a `value` /
+    `value-effect` pair, and the notional order TYPE is OrderType.NOTIONAL_MARKET;
+    none of them may appear in this module.
+
+    Asserting the bare substring "NOTIONAL" (as this test was first written) is wrong
+    now: MIN_FRACTIONAL_NOTIONAL_USD is the $5 fractional floor, a money constant that
+    has nothing to do with notional ORDERS, and it trips the substring. The intent is
+    the order type.
+    """
+    import inspect
+    import sys
+
+    source = inspect.getsource(sys.modules[TastyTradeAccount.__module__])
+
+    assert "value_effect" not in source
+    assert "NOTIONAL_MARKET" not in source

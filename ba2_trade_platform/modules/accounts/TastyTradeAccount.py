@@ -2,7 +2,7 @@ import asyncio
 import threading
 from typing import Any, Dict, List, Optional
 from datetime import datetime, date, timedelta
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import replace
 
@@ -50,6 +50,17 @@ class EmptyTastytradeError(TastytradeError):
     and ``__cause__`` still points at the original so the traceback is unchanged. The
     distinct TYPE is what lets ``_classify_order_error`` recognise the case after the
     message has been replaced, instead of pattern-matching text we ourselves wrote.
+    """
+
+
+class _ZeroQuantityAfterRounding(Exception):
+    """Rounding a quantity onto the broker's grid left nothing to send.
+
+    A SKIP, not a failure: nothing was rejected and nothing is wrong with the account,
+    so ``_submit_order_impl`` marks the row CANCELED with the reason and never ERROR --
+    the same rule AlpacaAccount applies through ``_record_fractional_adjustment``. It is
+    its own type precisely so it can be caught BEFORE the broad
+    ``except Exception -> _handle_order_submit_error`` that owns real broker faults.
     """
 
 
@@ -1028,7 +1039,7 @@ class TastyTradeAccount(AccountInterface):
 
         equity = self._run_async(Equity.get(self._session, trading_order.symbol))
         action = self._tt_action(trading_order.side, is_closing_order)
-        leg = equity.build_leg(Decimal(str(trading_order.quantity)), action)
+        leg = equity.build_leg(self._tradable_quantity(equity, trading_order.quantity), action)
 
         kwargs = {
             "time_in_force": self._tt_time_in_force(trading_order.good_for),
@@ -1128,7 +1139,16 @@ class TastyTradeAccount(AccountInterface):
                 logger.info(
                     f"Created new order {trading_order.id} in database with status PENDING")
 
-            new_order = self._build_new_order(trading_order, is_closing_order=is_closing_order)
+            try:
+                new_order = self._build_new_order(
+                    trading_order, is_closing_order=is_closing_order)
+            except _ZeroQuantityAfterRounding as e:
+                # A SKIP, not a failure -- CANCELED with the reason, never ERROR
+                # (AlpacaAccount._record_fractional_adjustment makes the same call).
+                logger.warning(
+                    f"Order {trading_order.id} ({trading_order.symbol}) skipped: {e}")
+                self._record_fractional_adjustment(trading_order, f"skipped: {e}")
+                return None
 
             # dry_run DEFAULTS TO True in the SDK (tastytrade/account.py:877-879).
             # Pass it explicitly so a signature change can never turn a live order
@@ -1741,6 +1761,179 @@ class TastyTradeAccount(AccountInterface):
         logger.debug(f"[Account {self.id}] Retrieved {len(transfers)} cash transfers")
         return transfers
 
+    #: One fetch of /instruments/quantity-decimal-precisions serves every symbol and
+    #: changes about as often as a listing does. A CLASS attribute so a bare instance
+    #: built with object.__new__ (the test idiom) still has it; only ever REBOUND on
+    #: the instance, never mutated in place, so two accounts cannot share one table.
+    _QUANTITY_PRECISION_TTL = 24 * 60 * 60
+    _quantity_precision_cache = None   # (fetched_at, {symbol_or_None: precision})
+
+    def _equity_quantity_precisions(self) -> Dict[Optional[str], int]:
+        """The QUANTITY decimal precision per EQUITY symbol, plus the generic row.
+
+        ``get_quantity_decimal_precisions`` is a MODULE-LEVEL coroutine, not a method,
+        and returns a flat list of every published precision: one generic row per
+        instrument type carrying ``symbol=None``, plus per-symbol rows that OVERRIDE
+        it. A symbol with no row of its own simply is not in the list -- there is no
+        server error path and no server default, because the endpoint cannot be asked
+        about a single symbol.
+
+        READS ``value``, NOT ``minimum_increment_precision``. They are different
+        quantities and they DISAGREE for equities: the live generic equity row is
+        ``value=5, minimum_increment_precision=0`` (probed 2026-08-21), so reading the
+        latter gives ``10 ** -0 == 1.0`` -- "fractionable, but whole shares only" --
+        which silently switches fractional trading off for the whole broker. The
+        broker's own rejection names the right one:
+        ``fractional_equity_invalid_fractional_precision: "Quantity decimal precision 6
+        exceeds maximum decimal precision of 5 for SCHD"``.
+
+        Callers must read ``precisions.get(symbol, precisions.get(None))`` and treat a
+        miss on BOTH as "the broker did not say" -- never as a guessed precision.
+
+        Returns:
+            Dict[Optional[str], int]: keyed by upper-cased symbol, with ``None`` holding
+            the generic equity row. ``{}`` when the fetch FAILED -- and that ``{}`` is
+            NOT cached, so the next caller retries rather than inheriting an outage. A
+            successful empty response is cached like any other answer.
+        """
+        import time
+        from tastytrade.instruments import get_quantity_decimal_precisions
+
+        now = time.time()
+        cached = self._quantity_precision_cache
+        if cached is not None and (now - cached[0]) < self._QUANTITY_PRECISION_TTL:
+            return cached[1]
+
+        try:
+            rows = self._run_async(get_quantity_decimal_precisions(self._session))
+        except Exception as e:
+            logger.warning(
+                f"[Account {self.id}] Quantity precision fetch failed: "
+                f"{self._describe_broker_error(e, 'the quantity-precision fetch')}")
+            return {}
+
+        precisions: Dict[Optional[str], int] = {}
+        for row in rows:
+            if row.instrument_type != TTInstrumentType.EQUITY:
+                continue
+            key = row.symbol.strip().upper() if row.symbol else None
+            precisions[key] = int(row.value)
+        self._quantity_precision_cache = (now, precisions)
+        return precisions
+
+    def clear_quantity_precision_cache(self) -> None:
+        """Drop the cached quantity-precision table so the next lookup refetches.
+
+        The EXPLICIT companion to ``_QUANTITY_PRECISION_TTL``: every TTL cache in this
+        codebase ships one (``AlpacaAccount.clear_margin_info_cache`` is the model). A
+        24-hour TTL is not soon enough for a user who hits Refresh because they know
+        TastyTrade just published a step for a name, and this account object lives for
+        the whole process.
+        """
+        cached = self._quantity_precision_cache
+        count = len(cached[1]) if cached else 0
+        self._quantity_precision_cache = None
+        logger.debug(
+            f"[Account {self.id}] Cleared {count} cached equity quantity precision(s)")
+
+    def _tradable_quantity(self, equity, quantity: float) -> Decimal:
+        """The quantity TastyTrade will actually accept for this equity.
+
+        Fractional here means a fractional ``Leg.quantity`` on an ORDINARY order --
+        order.py:140 types it ``Decimal | int | None`` and it serialises as
+        ``"quantity":"0.4321"``. TastyTrade needs no notional order type for fractional
+        and none is emitted anywhere in this class.
+
+        Two broker rules, both enforced by rounding DOWN. Never up: rounding up spends
+        buying power the allocation plan did not budget.
+
+          * A symbol whose ``is_fractional_quantity_eligible`` is not exactly ``True``
+            is floored to whole shares. The field is ``bool | None``
+            (instruments.py:262) and ``None`` means the broker did not say, which is
+            not permission.
+          * An eligible symbol is quantised onto the published decimal grid. A symbol
+            absent from the precision table inherits the generic equity row; absent
+            from BOTH, it is floored to whole shares rather than sized on a guessed
+            grid -- which is exactly what ``get_symbol_margin_info`` reports for that
+            case (``fractionable=None, min_trade_increment=1.0``), so the plan and the
+            execution cannot diverge.
+
+        This is submission-time ENFORCEMENT only, i.e. defence in depth. The allocation
+        engine already sized off these same two facts, published through
+        ``get_symbol_margin_info``, and it resolves a floor-to-zero itself -- bumping to
+        one whole share when one share is within the bounded multiple of the target
+        notional, and skipping the symbol with its unmet notional reported when it is
+        not. This path exists for a manual order, or for a plan built while the metadata
+        fetch was failing.
+
+        NOT enforced here: the $5 ``MIN_FRACTIONAL_NOTIONAL_USD`` floor. It is a
+        NOTIONAL rule and this method is handed no price, so it cannot evaluate it --
+        the engine suppresses those rows instead, from the ``min_fractional_notional``
+        this adapter publishes.
+
+        Raises:
+            _ZeroQuantityAfterRounding: when rounding leaves nothing to send.
+        """
+        symbol = (getattr(equity, "symbol", "") or "").strip().upper() or "?"
+        eligibility = getattr(equity, "is_fractional_quantity_eligible", None)
+        requested = Decimal(str(quantity))
+        if requested <= 0:
+            raise _ZeroQuantityAfterRounding(
+                f"quantity {quantity} for {symbol} is not positive - nothing to submit")
+
+        precision = None
+        if eligibility is True:
+            precisions = self._equity_quantity_precisions()
+            precision = precisions.get(symbol, precisions.get(None))
+
+        if precision is None:
+            allowed = requested.quantize(Decimal("1"), rounding=ROUND_DOWN)
+        else:
+            allowed = requested.quantize(Decimal(1).scaleb(-precision), rounding=ROUND_DOWN)
+
+        if allowed <= 0:
+            raise _ZeroQuantityAfterRounding(
+                f"qty {quantity} for {symbol} floors to 0 on the broker's grid "
+                f"(fractional_eligible={eligibility!r}, precision={precision}) "
+                f"- nothing submitted")
+
+        if allowed != requested:
+            logger.warning(
+                f"[Account {self.id}] {symbol}: requested qty {requested} is not tradable "
+                f"(fractional_eligible={eligibility!r}, precision={precision}); "
+                f"submitting {allowed} instead")
+
+        # Keep a whole number whole on the wire. Decimal('100.00000') serialises as
+        # "100.00000", and Decimal.normalize() would render it "1E+2" -- not a quantity
+        # any broker should be shown. normalize() is only reached for a NON-integral
+        # value, where it can never produce exponent notation.
+        integral = allowed.to_integral_value()
+        return integral if allowed == integral else allowed.normalize()
+
+    def _record_fractional_adjustment(self, trading_order: TradingOrder, reason: str) -> None:
+        """Mark a row CANCELED with WHY, so the Pending Orders UI shows it.
+
+        The TastyTrade twin of ``AlpacaAccount._record_fractional_adjustment``, and
+        deliberately the SAME NAME: same status, same comment-append, same 500-char cap.
+        Kept per-broker rather than lifted onto AccountInterface because only these two
+        brokers have a quantity grid -- the shared name is what makes the ~10-line
+        duplicate trivially liftable the day a third one arrives.
+
+        Alpaca's version also takes a replacement quantity; this one does not, because
+        TastyTrade's only caller is the SKIP path -- a floored (but non-zero) quantity
+        never reaches the database here, it is computed inside ``_build_new_order``.
+        """
+        fresh_order = get_instance(TradingOrder, trading_order.id)
+        if not fresh_order:
+            logger.error(
+                f"Could not find order {trading_order.id} to record fractional "
+                f"adjustment: {reason}")
+            return
+        fresh_order.status = OrderStatus.CANCELED
+        fresh_order.comment = (
+            f"{fresh_order.comment} | {reason}" if fresh_order.comment else reason)[:500]
+        update_instance(fresh_order)
+
     def get_symbol_margin_info(self, symbols: List[str]) -> Dict[str, MarginInfo]:
         """Per-symbol margin / fractionability metadata, for buying-power sizing.
 
@@ -1764,7 +1957,7 @@ class TastyTradeAccount(AccountInterface):
         Returns:
             Dict[str, MarginInfo]: keyed by the normalised symbol.
         """
-        from tastytrade.instruments import Equity, get_quantity_decimal_precisions
+        from tastytrade.instruments import Equity
 
         wanted = [s.strip().upper() for s in (symbols or []) if s and s.strip()]
         if not wanted or not self._check_authentication():
@@ -1782,37 +1975,10 @@ class TastyTradeAccount(AccountInterface):
                 f"[Account {self.id}] Equity metadata fetch failed: "
                 f"{self._describe_broker_error(e, 'the equity metadata fetch')}")
 
-        increment = None
-        try:
-            for precision in self._run_async(get_quantity_decimal_precisions(self._session)):
-                # The generic EQUITY row (symbol is None) is the one that applies to
-                # every equity; per-symbol overrides are not needed for sizing.
-                # (Live, 2026-08-21: 48 rows, exactly ONE equity row, and it IS the
-                # generic one -- there are no per-symbol equity overrides at all.)
-                if precision.instrument_type == TTInstrumentType.EQUITY and precision.symbol is None:
-                    # `value` is the QUANTITY decimal precision -- read `value`, NOT
-                    # `minimum_increment_precision`. The live equity row is
-                    # `value=5, minimum_increment_precision=0`, and reading the latter
-                    # gave 10**-0 = 1.0, i.e. "fractionable, but whole shares only",
-                    # which quietly turned fractional trading off for this whole broker
-                    # (`_round_shares` floors every target onto this step). The account
-                    # holds 18 of its 25 positions at fractional quantities -- SCHD
-                    # 0.05715, VYMI 0.01955, MAIN 4.0685 -- and 5 decimal places is
-                    # exactly `value`.
-                    #
-                    # `minimum_increment_precision` is a DIFFERENT quantity: it equals
-                    # `value` for crypto but is 0 for equities, so it cannot be the
-                    # step an equity trades in. The reading consistent with both rows is
-                    # that it describes the ticket's whole-unit increment (an equity
-                    # steps by 1 share, a crypto by 1e-8) while `value` bounds how many
-                    # decimals a quantity may carry. Either way it is NOT the fractional
-                    # step, so do not "fix" this back.
-                    increment = float(10 ** -int(precision.value))
-                    break
-        except Exception as e:
-            logger.warning(
-                f"[Account {self.id}] Quantity precision fetch failed: "
-                f"{self._describe_broker_error(e, 'the quantity-precision fetch')}")
+        # ONE fetch, cached, per-symbol rows honoured, and it reads
+        # QuantityDecimalPrecision.value -- see _equity_quantity_precisions for why
+        # `minimum_increment_precision` is the wrong field and what reading it broke.
+        precisions = self._equity_quantity_precisions()
 
         # get_positions() returns None when the FETCH FAILED and [] when the account is
         # genuinely flat -- the distinction this file documents at get_positions. `or []`
@@ -1860,10 +2026,42 @@ class TastyTradeAccount(AccountInterface):
             if symbol in requirement and notional.get(symbol):
                 rate = min(1.0, requirement[symbol] / notional[symbol])
                 source = MARGIN_SOURCE_POSITION
-            # `is_fractional_quantity_eligible` is Optional in the SDK; None means the
-            # broker did not say, which must read as "whole shares only". Assuming
-            # fractional gets the order rejected at submission.
-            fractionable = bool(getattr(equity, "is_fractional_quantity_eligible", False))
+            # TRI-STATE. `is_fractional_quantity_eligible` is `bool | None`
+            # (instruments.py:262) and `MarginInfo.fractionable` is Optional[bool] for
+            # exactly that reason: None is NOT False. Never coerce, and never report
+            # False for a symbol the broker did not describe -- that invents a broker
+            # fact, which is the failure mode this whole feature exists to kill.
+            #
+            #   False              -> False / 1.0   (a real broker "no")
+            #   None               -> None  / 1.0   (the broker did not say)
+            #   True + a precision -> True  / 10**-p
+            #   True, no precision -> None  / 1.0   (eligible, step unpublished)
+            #
+            # The last line is the subtle one. The step is unknown, so
+            # `_tradable_quantity` will submit WHOLE SHARES for this symbol; the plan
+            # must therefore say whole shares too, or the dry run promises 2.5 shares
+            # that the adapter floors to 2. Reporting True with increment None would
+            # instead push the engine onto DEFAULT_FRACTIONAL_DECIMALS' made-up 1e-4
+            # grid, and reporting False would claim the broker refused a symbol it
+            # actually approved.
+            eligibility = getattr(equity, "is_fractional_quantity_eligible", None)
+            precision = precisions.get(symbol, precisions.get(None))
+            if eligibility is False:
+                # Whole shares BY DEFINITION -- a fact about the symbol, not a reading,
+                # so it survives the precision table being unreachable.
+                fractionable = False
+                increment = 1.0
+            elif eligibility is True and precision is not None:
+                fractionable = True
+                increment = float(10 ** -precision)
+            else:
+                if eligibility is True:
+                    logger.warning(
+                        f"[Account {self.id}] {symbol} is fractional-eligible but the broker "
+                        f"published no quantity precision; reporting the step as whole shares "
+                        f"and the eligibility as UNKNOWN (not as 'not fractionable')")
+                fractionable = None
+                increment = 1.0
             result[symbol] = MarginInfo(
                 symbol=symbol,
                 bp_factor=(rate * multiplier) if rate is not None else multiplier,
@@ -1879,16 +2077,18 @@ class TastyTradeAccount(AccountInterface):
                 # DOLLARS. Only a FRACTIONAL order can breach it, which is why an
                 # unsplittable symbol reports None rather than a floor it can never
                 # hit -- see MIN_FRACTIONAL_NOTIONAL_USD for the broker's own words.
+                # `is True`, not truthiness: an UNKNOWN eligibility is sized as whole
+                # shares above, so it never places a fractional order either, and
+                # publishing the floor for it would refuse a legal 1-share buy of a
+                # sub-$5 stock.
                 min_fractional_notional=(MIN_FRACTIONAL_NOTIONAL_USD
-                                         if fractionable else None),
-                # MarginInfo.min_trade_increment = the smallest QUANTITY step the
-                # broker accepts for this symbol, None when it did not publish one.
-                # A whole-share-only symbol steps by 1.0 BY DEFINITION -- that is a
-                # fact about the symbol, not a reading, so it survives the precision
-                # table being unreachable. A fractionable one steps by the equity
-                # precision, and stays None when that fetch failed rather than
-                # inventing a step.
-                min_trade_increment=increment if fractionable else 1.0,
+                                         if fractionable is True else None),
+                # Already resolved above: 1.0, or a real published step. This adapter
+                # therefore happens never to emit None -- BY CONSTRUCTION, not by
+                # contract. account_types.py keeps None legal and meaningful ("the
+                # broker published no step") and Alpaca still emits it, so no caller
+                # may assume otherwise.
+                min_trade_increment=increment,
                 initial_margin_rate=rate,
                 maintenance_margin_rate=None,
                 source=source,
