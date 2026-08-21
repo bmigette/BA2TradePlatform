@@ -572,3 +572,216 @@ def diff_managed_labels(current, selected):
     cur = {s.strip() for s in (current or []) if s and s.strip()}
     sel = {s.strip() for s in (selected or []) if s and s.strip()}
     return sorted(sel - cur), sorted(cur - sel)
+
+
+# ---- market-hours gate ------------------------------------------------------
+#
+# The page and the dry run ALWAYS render: planning at 22:00 is the normal way to
+# use this screen. Only SUBMIT is gated. Pure -- `now` is required so no test can
+# depend on when it runs.
+
+from datetime import datetime, timedelta
+from typing import Sequence, Tuple
+
+from ba2_common.core.account_types import (
+    MARKET_HOURS_SOURCE_BROKER,
+    MARKET_HOURS_SOURCE_FALLBACK,
+    MARKET_HOURS_SOURCE_UNAVAILABLE,
+)
+from ba2_common.core.market_calendar import NY_TZ
+
+MARKET_GATE_OPEN = "OPEN"
+MARKET_GATE_CLOSED = "CLOSED"
+MARKET_GATE_UNKNOWN = "UNKNOWN"
+
+#: Provenance of the answer, as published in ``MarketHours.source``. RE-EXPORTS of
+#: the interface's constants, never re-spelled literals: a local copy of "broker"
+#: is how a broker answer ends up described to the user as a fallback one.
+MARKET_SOURCE_BROKER = MARKET_HOURS_SOURCE_BROKER
+MARKET_SOURCE_FALLBACK = MARKET_HOURS_SOURCE_FALLBACK
+MARKET_SOURCE_UNAVAILABLE = MARKET_HOURS_SOURCE_UNAVAILABLE
+
+#: Display label only. The CONVERSION goes through ``NY_TZ``, the one canonical New
+#: York tzinfo object (ba2_common.core.market_calendar).
+MARKET_TIMEZONE = "America/New_York"
+
+#: Severity -> stylesheet class. Only warning / danger / info / success exist
+#: (ui/static/styles.css); the severity strings themselves are the ``ui.notify``
+#: vocabulary ('positive' | 'negative' | 'warning' | 'info' -- 'error' is NOT one
+#: of them).
+MARKET_BANNER_CLASSES = {
+    "warning": "alert-banner warning",
+    "negative": "alert-banner danger",
+    "info": "alert-banner info",
+}
+
+MARKET_MSG_CLOSED_FMT = (
+    "Market closed — Submit is disabled. The next regular session opens {when} "
+    "({countdown} from now). You can still refresh and review this dry run.")
+MARKET_MSG_CLOSED_NO_COUNTDOWN_FMT = (
+    "Market closed — Submit is disabled. The next regular session opens {when}. "
+    "You can still refresh and review this dry run.")
+MARKET_MSG_CLOSED_NO_TIME = (
+    "Market closed — Submit is disabled. No next-open time was published, so we "
+    "cannot say when it re-enables. You can still refresh and review this dry run.")
+MARKET_MSG_UNKNOWN = (
+    "Market hours unavailable — Submit is disabled because the market could not be "
+    "confirmed open. You can still refresh and review this dry run.")
+#: Appended when the answer came from the offline calendar instead of the broker.
+#: Both halves matter: the broker did not answer, AND the calendar only knows the
+#: regular session, so it reads "closed" during extended hours and cannot know
+#: about a broker-specific halt.
+MARKET_NOTE_FALLBACK = (
+    " These times come from the built-in NYSE calendar, not from the broker — the "
+    "broker's own market-hours call did not answer, and the calendar covers the "
+    "regular session only.")
+#: Post-submit / income-panel line. Orders that are still working contributed ZERO
+#: to the ledger, so the run's income is deliberately NOT consumed yet.
+WORKING_ORDERS_NOTICE_FMT = (
+    "{count} order(s) still working — this run's income has NOT been consumed yet. "
+    "It is picked up automatically on the next refresh once the orders settle.")
+
+_WEEKDAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+_MONTH_NAMES = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def format_market_time(when: datetime) -> str:
+    """Render an aware datetime in the market's clock, e.g. ``Mon 05 Jan 2026 09:30 ET``.
+
+    Converts through ``NY_TZ`` -- the same tzinfo object the offline calendar builds
+    its sessions with, so a displayed open can never be one object's idea of New York
+    and the calculation another's.
+
+    Day and month names come from explicit tuples, not ``strftime('%a %b')``, which
+    is locale-dependent and would make the output depend on the machine.
+
+    Raises:
+        ValueError: on a naive datetime. Guessing a timezone here would move the
+        displayed open by up to a day.
+    """
+    if when.tzinfo is None or when.tzinfo.utcoffset(when) is None:
+        raise ValueError(f"format_market_time: {when!r} is naive; an aware datetime is required")
+    local = when.astimezone(NY_TZ)
+    return (f"{_WEEKDAY_NAMES[local.weekday()]} {local.day:02d} "
+            f"{_MONTH_NAMES[local.month - 1]} {local.year} "
+            f"{local.hour:02d}:{local.minute:02d} ET")
+
+
+def format_countdown(delta: timedelta) -> str:
+    """``2d 3h`` / ``15h 30m`` / ``42m``; EMPTY for anything at or below zero.
+
+    Empty rather than "0m" so the caller can drop the "(… from now)" clause entirely
+    instead of rendering a countdown that has already elapsed.
+    """
+    seconds = int(delta.total_seconds())
+    if seconds <= 0:
+        return ""
+    days, rem = divmod(seconds, 86_400)
+    hours, rem = divmod(rem, 3_600)
+    minutes = rem // 60
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
+@dataclass
+class MarketGateResult:
+    """May the wizard SUBMIT, and what to tell the user if not.
+
+    ``allowed is False`` disables the Submit button ONLY -- the page, the dry run
+    and Refresh all keep working, because planning while the market is shut is the
+    normal case.
+
+    ``severity`` is the ``ui.notify`` vocabulary ('warning' | 'negative' | 'info');
+    ``MARKET_BANNER_CLASSES`` maps it to a stylesheet class.
+    """
+    allowed: bool
+    reason_code: str
+    message: str
+    severity: str = "info"
+    next_open_text: str = ""
+    countdown_text: str = ""
+    from_fallback: bool = False
+
+
+def evaluate_market_gate(*, is_open: Optional[bool], next_open: Optional[datetime],
+                         source: str, now: datetime) -> MarketGateResult:
+    """Decide whether Submit may be pressed. Pure.
+
+    Args:
+        is_open: ``None`` when the answer is not known. The ONLY legal caller
+            mapping is ``None if (hours is None or not hours.is_known) else
+            hours.is_open`` -- an UNAVAILABLE ``MarketHours`` carries
+            ``is_open=False`` so the money path fails closed, but the UI must say
+            "unknown", not "closed". ``None`` BLOCKS: an unanswered market-hours
+            call is not permission to send orders.
+        next_open: ``MarketHours.next_open``, tz-AWARE. ``None`` is allowed (the
+            broker published none) and blocks with a message that says so.
+        source: ``MarketHours.source``, or ``MARKET_SOURCE_UNAVAILABLE`` when there
+            is no ``MarketHours`` at all. Anything other than
+            ``MARKET_SOURCE_BROKER`` is reported as not having come from the broker.
+        now: the reference instant, tz-aware. REQUIRED, so no caller and no test
+            silently depends on the wall clock.
+
+    Returns:
+        MarketGateResult: ``allowed=True`` only when ``is_open is True``.
+
+    Raises:
+        ValueError: if ``now`` or ``next_open`` is naive. Unreachable through the
+        seam -- ``MarketHours.__post_init__`` already refuses a naive field -- and
+        kept as defence-in-depth for hand-built scalars.
+    """
+    if now.tzinfo is None or now.tzinfo.utcoffset(now) is None:
+        raise ValueError(f"evaluate_market_gate: now={now!r} is naive")
+
+    if is_open is None:
+        return MarketGateResult(allowed=False, reason_code=MARKET_GATE_UNKNOWN,
+                                message=MARKET_MSG_UNKNOWN, severity="negative")
+    if is_open:
+        return MarketGateResult(allowed=True, reason_code=MARKET_GATE_OPEN,
+                                message="", severity="info",
+                                from_fallback=(source != MARKET_SOURCE_BROKER))
+
+    from_fallback = source != MARKET_SOURCE_BROKER
+    if next_open is None:
+        message = MARKET_MSG_CLOSED_NO_TIME
+        when = ""
+        countdown = ""
+    else:
+        when = format_market_time(next_open)       # raises on a naive next_open
+        countdown = format_countdown(next_open - now)
+        message = (MARKET_MSG_CLOSED_FMT.format(when=when, countdown=countdown)
+                   if countdown else
+                   MARKET_MSG_CLOSED_NO_COUNTDOWN_FMT.format(when=when))
+    if from_fallback:
+        message += MARKET_NOTE_FALLBACK
+    return MarketGateResult(allowed=False, reason_code=MARKET_GATE_CLOSED,
+                            message=message, severity="warning",
+                            next_open_text=when, countdown_text=countdown,
+                            from_fallback=from_fallback)
+
+
+def working_orders_notice(*, settled: bool,
+                          working_order_ids: Sequence[int]) -> Optional[Tuple[str, str]]:
+    """"N orders still working" — text and severity, or ``None`` when there is none.
+
+    Orders that have not settled contribute ZERO to a run's filled value, so the
+    run's income is deliberately left UNCONSUMED and reconciled later. That is the
+    common case here, not the rare one, so the fact has to reach the user rather than
+    only the log.
+
+    Takes plain values rather than a ``FilledTotals`` so it does not depend on the
+    ledger chunk: it lands first and starts saying something the moment real
+    ``settled`` / ``working_order_ids`` are supplied.
+
+    Returns:
+        Optional[Tuple[str, str]]: ``(text, severity)`` for ``ui.notify`` and for
+        ``MARKET_BANNER_CLASSES``, or ``None`` when the run settled.
+    """
+    if settled:
+        return None
+    return (WORKING_ORDERS_NOTICE_FMT.format(count=len(working_order_ids or [])),
+            "warning")

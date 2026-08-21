@@ -861,3 +861,186 @@ def test_the_view_module_imports_without_nicegui_the_db_or_the_expert_stack():
     elapsed, banned = proc.stdout.strip().splitlines()[-1].split('|')
     assert banned == '[]', f"heavy imports leaked into the pure module: {banned}"
     assert float(elapsed) < 2.0, f"import took {elapsed}s — something heavy crept in"
+
+
+# ---------------------------------------------------------------------------
+# Market-hours gate (Submit only; the page and the dry run always render)
+# ---------------------------------------------------------------------------
+from datetime import datetime, timedelta, timezone
+
+from ba2_common.core.account_types import (
+    MARKET_HOURS_SOURCE_BROKER,
+    MARKET_HOURS_SOURCE_FALLBACK,
+    MARKET_HOURS_SOURCE_UNAVAILABLE,
+)
+from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+    MARKET_BANNER_CLASSES,
+    MARKET_GATE_CLOSED,
+    MARKET_GATE_OPEN,
+    MARKET_GATE_UNKNOWN,
+    MARKET_SOURCE_BROKER,
+    MARKET_SOURCE_FALLBACK,
+    MARKET_SOURCE_UNAVAILABLE,
+    evaluate_market_gate,
+    format_countdown,
+    format_market_time,
+    working_orders_notice,
+)
+
+# Frozen explicitly, always: 2026-08-20 22:00 UTC == Thu 18:00 ET. The next regular
+# open is Fri 21 Aug 2026 09:30 ET == 13:30 UTC, 15h30m later.
+FROZEN_NOW = datetime(2026, 8, 20, 22, 0, tzinfo=timezone.utc)
+NEXT_OPEN = datetime(2026, 8, 21, 13, 30, tzinfo=timezone.utc)
+
+
+def test_the_source_constants_agree_with_the_interfaces_own():
+    """Re-spelling "broker" locally is how the banner ends up describing a broker
+    answer as a fallback one.
+
+    Deliberately EQUALITY, not ``is``: CPython interns short identifier-like string
+    literals, so ``"broker" is MARKET_HOURS_SOURCE_BROKER`` is already True and an
+    identity assertion here can never fail. The behavioural half is the test below,
+    which feeds a real ``MarketHours.source`` straight into the gate.
+    """
+    assert MARKET_SOURCE_BROKER == MARKET_HOURS_SOURCE_BROKER
+    assert MARKET_SOURCE_FALLBACK == MARKET_HOURS_SOURCE_FALLBACK
+    assert MARKET_SOURCE_UNAVAILABLE == MARKET_HOURS_SOURCE_UNAVAILABLE
+    assert len({MARKET_SOURCE_BROKER, MARKET_SOURCE_FALLBACK,
+                MARKET_SOURCE_UNAVAILABLE}) == 3
+
+
+def test_a_real_market_hours_source_is_understood_by_the_gate_as_published():
+    """The end the drift actually shows up at: the gate is fed
+    ``MarketHours.source`` verbatim, so a locally re-spelled constant that differs
+    from the interface's by so much as a capital letter reports every broker answer
+    as a fallback one."""
+    from ba2_common.core.account_types import MarketHours
+
+    broker = MarketHours(is_open=False, as_of=FROZEN_NOW, next_open=NEXT_OPEN,
+                         source=MARKET_HOURS_SOURCE_BROKER)
+    fallback = MarketHours(is_open=False, as_of=FROZEN_NOW, next_open=NEXT_OPEN,
+                           source=MARKET_HOURS_SOURCE_FALLBACK)
+    assert evaluate_market_gate(is_open=broker.is_open, next_open=broker.next_open,
+                                source=broker.source, now=FROZEN_NOW
+                                ).from_fallback is False
+    assert evaluate_market_gate(is_open=fallback.is_open, next_open=fallback.next_open,
+                                source=fallback.source, now=FROZEN_NOW
+                                ).from_fallback is True
+
+
+def test_market_gate_open_allows_submit_and_says_nothing():
+    gate = evaluate_market_gate(is_open=True, next_open=None,
+                                source=MARKET_SOURCE_BROKER, now=FROZEN_NOW)
+    assert gate.allowed is True
+    assert gate.reason_code == MARKET_GATE_OPEN
+    assert gate.message == ""
+
+
+def test_market_gate_closed_blocks_and_names_the_next_open_in_eastern_time():
+    gate = evaluate_market_gate(is_open=False, next_open=NEXT_OPEN,
+                                source=MARKET_SOURCE_BROKER, now=FROZEN_NOW)
+    assert gate.allowed is False
+    assert gate.reason_code == MARKET_GATE_CLOSED
+    assert gate.next_open_text == "Fri 21 Aug 2026 09:30 ET"
+    assert "Fri 21 Aug 2026 09:30 ET" in gate.message
+    assert "15h 30m" in gate.message
+    assert "still refresh and review this dry run" in gate.message
+    assert gate.severity == "warning"
+
+
+def test_market_gate_closed_from_the_fallback_calendar_says_where_the_time_came_from():
+    gate = evaluate_market_gate(is_open=False, next_open=NEXT_OPEN,
+                                source=MARKET_SOURCE_FALLBACK, now=FROZEN_NOW)
+    assert gate.from_fallback is True
+    assert "built-in NYSE calendar" in gate.message
+    assert "regular session" in gate.message
+
+
+def test_market_gate_closed_from_the_broker_does_not_mention_the_calendar():
+    gate = evaluate_market_gate(is_open=False, next_open=NEXT_OPEN,
+                                source=MARKET_SOURCE_BROKER, now=FROZEN_NOW)
+    assert gate.from_fallback is False
+    assert "NYSE calendar" not in gate.message
+
+
+def test_market_gate_closed_with_no_next_open_still_blocks_and_admits_it():
+    gate = evaluate_market_gate(is_open=False, next_open=None,
+                                source=MARKET_SOURCE_BROKER, now=FROZEN_NOW)
+    assert gate.allowed is False
+    assert gate.reason_code == MARKET_GATE_CLOSED
+    assert gate.next_open_text == ""
+    assert "No next-open time was published" in gate.message
+
+
+def test_market_gate_unknown_blocks_rather_than_assuming_open():
+    """An unanswered market-hours call is not permission to send orders -- and it is
+    reported as UNKNOWN, not CLOSED: the two have different fixes."""
+    gate = evaluate_market_gate(is_open=None, next_open=None,
+                                source=MARKET_SOURCE_UNAVAILABLE, now=FROZEN_NOW)
+    assert gate.allowed is False
+    assert gate.reason_code == MARKET_GATE_UNKNOWN
+    assert gate.severity == "negative"
+    assert "could not be confirmed open" in gate.message
+
+
+def test_market_gate_next_open_already_in_the_past_drops_the_countdown():
+    """A stale next_open must not render "in -2h 0m"."""
+    gate = evaluate_market_gate(is_open=False,
+                                next_open=FROZEN_NOW - timedelta(hours=2),
+                                source=MARKET_SOURCE_BROKER, now=FROZEN_NOW)
+    assert gate.countdown_text == ""
+    assert "from now" not in gate.message
+    assert gate.next_open_text
+
+
+def test_market_gate_rejects_a_naive_next_open_rather_than_guessing_its_zone():
+    """Unreachable through the seam -- MarketHours.__post_init__ raises on a naive
+    field -- and kept anyway, because a caller can hand-build these scalars."""
+    with pytest.raises(ValueError):
+        evaluate_market_gate(is_open=False, next_open=datetime(2026, 8, 21, 13, 30),
+                             source=MARKET_SOURCE_BROKER, now=FROZEN_NOW)
+
+
+def test_market_gate_rejects_a_naive_now():
+    with pytest.raises(ValueError):
+        evaluate_market_gate(is_open=True, next_open=None,
+                             source=MARKET_SOURCE_BROKER,
+                             now=datetime(2026, 8, 20, 22, 0))
+
+
+def test_format_market_time_is_locale_proof_and_in_eastern_time():
+    assert format_market_time(datetime(2026, 1, 5, 14, 30, tzinfo=timezone.utc)) == \
+        "Mon 05 Jan 2026 09:30 ET"
+
+
+def test_format_countdown_uses_days_hours_then_minutes():
+    assert format_countdown(timedelta(days=2, hours=3, minutes=40)) == "2d 3h"
+    assert format_countdown(timedelta(hours=15, minutes=30)) == "15h 30m"
+    assert format_countdown(timedelta(minutes=42)) == "42m"
+    assert format_countdown(timedelta(seconds=-1)) == ""
+
+
+def test_market_banner_classes_map_each_severity_to_a_real_stylesheet_class():
+    """styles.css defines warning / danger / info / success only."""
+    assert MARKET_BANNER_CLASSES["warning"] == "alert-banner warning"
+    assert MARKET_BANNER_CLASSES["negative"] == "alert-banner danger"
+    assert MARKET_BANNER_CLASSES["info"] == "alert-banner info"
+
+
+def test_working_orders_notice_is_none_when_the_run_settled():
+    assert working_orders_notice(settled=True, working_order_ids=[]) is None
+
+
+def test_working_orders_notice_names_the_count_when_orders_are_still_working():
+    text, severity = working_orders_notice(settled=False, working_order_ids=[7, 9])
+    assert "2 order(s) still working" in text
+    assert "income" in text.lower()
+    assert severity == "warning"
+
+
+def test_working_orders_notice_is_honest_when_it_cannot_count_the_orders():
+    """settled=False with no ids is still unconsumed income; saying nothing would
+    hide it, and inventing a count would be worse."""
+    text, severity = working_orders_notice(settled=False, working_order_ids=[])
+    assert "still working" in text
+    assert severity == "warning"
