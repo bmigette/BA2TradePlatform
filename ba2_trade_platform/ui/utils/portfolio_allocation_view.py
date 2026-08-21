@@ -303,6 +303,26 @@ def build_label_views(managed,
     return views
 
 
+def collect_managed_symbols(symbols_by_label) -> List[str]:
+    """Every distinct symbol across the managed labels, normalised and sorted.
+
+    This is the bulk-quote request list for
+    ``account.get_instrument_current_price(symbols)``: ONE call for the whole page,
+    deduplicated so a symbol carrying two managed labels is quoted once.
+
+    Normalisation happens BEFORE de-duplication, so a legacy ``tsla`` instrument
+    row and a modern ``TSLA`` one collapse to the single key
+    ``build_label_views`` will look the price up under.
+    """
+    out = set()
+    for symbols in (symbols_by_label or {}).values():
+        for sym in (symbols or []):
+            text = (sym or "").strip().upper()
+            if text:
+                out.add(text)
+    return sorted(out)
+
+
 #: Machine-written instrument tags that must not appear in the managed-label picker.
 MACHINE_LABELS = frozenset({'auto_added', 'expert_selected', 'ai_selected', 'not_found'})
 

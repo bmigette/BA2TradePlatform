@@ -10,8 +10,8 @@ import pytest
 from ba2_trade_platform.core.portfolio_allocation import PositionFetchFailed
 from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
     GATE_HAS_EXPERTS, GATE_NOT_MANUAL, GATE_NO_ACCOUNT, GATE_OK,
-    ManagedLabel, build_label_views, evaluate_gate, filter_selectable_labels,
-    is_machine_label, positions_by_symbol,
+    ManagedLabel, build_label_views, collect_managed_symbols, evaluate_gate,
+    filter_selectable_labels, is_machine_label, positions_by_symbol,
 )
 
 
@@ -286,3 +286,39 @@ def test_is_machine_label_is_case_insensitive():
     assert is_machine_label('Penny-4') is True
     assert is_machine_label('Penny') is False
     assert is_machine_label('') is False
+
+
+# --- the bulk-quote request list -------------------------------------------
+
+def test_collect_managed_symbols_dedupes_across_labels():
+    """A symbol in two managed labels must be quoted once, not twice."""
+    out = collect_managed_symbols({'ARK26': ['TSLA', 'ROKU'], 'HighRisk': ['TSLA']})
+    assert out == ['ROKU', 'TSLA']
+
+
+def test_collect_managed_symbols_normalises_and_sorts():
+    out = collect_managed_symbols({'ARK26': [' tsla ', 'aapl']})
+    assert out == ['AAPL', 'TSLA']
+
+
+def test_collect_managed_symbols_drops_blanks_and_empty_labels():
+    out = collect_managed_symbols({'ARK26': ['AAPL', '', None], 'EMPTY': []})
+    assert out == ['AAPL']
+
+
+def test_collect_managed_symbols_of_nothing_is_empty():
+    assert collect_managed_symbols({}) == []
+    assert collect_managed_symbols(None) == []
+
+
+def test_collect_managed_symbols_normalises_before_it_dedupes():
+    """Two spellings of one symbol are ONE quote, not two.
+
+    Normalising after the de-duplication (``sorted({s.strip() for ...})`` then
+    upper-casing) still returns two entries for a legacy ``tsla`` instrument row
+    and a modern ``TSLA`` one. That double-quotes the broker, and -- worse --
+    ``build_label_views`` keys ``prices`` on the NORMALISED symbol, so the
+    surviving lower-case entry would be silently unpriced and the row would fall
+    back to the broker's stale market value.
+    """
+    assert collect_managed_symbols({'ARK26': ['tsla'], 'HighRisk': [' TSLA ']}) == ['TSLA']
