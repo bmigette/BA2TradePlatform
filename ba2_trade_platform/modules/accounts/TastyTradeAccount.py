@@ -1493,8 +1493,24 @@ class TastyTradeAccount(AccountInterface):
         except Exception as e:
             logger.warning(f"[Account {self.id}] Quantity precision fetch failed: {e}")
 
+        # get_positions() returns None when the FETCH FAILED and [] when the account is
+        # genuinely flat -- the distinction this file documents at get_positions. `or []`
+        # collapsed the two: with the fetch failing, a HELD symbol carrying a real
+        # initial_requirement was reported bp_factor=multiplier / initial_margin_rate=None
+        # / source='default', byte-identical to an UNHELD one. Conservative in direction,
+        # but it silently discards the only real per-symbol margin data TastyTrade
+        # publishes and leaves the caller no way to know it fell back. Report NOTHING
+        # instead: an omitted symbol is this method's documented "you must fall back".
+        held = self.get_positions()
+        if held is None:
+            logger.error(
+                f"[Account {self.id}] position fetch failed; cannot derive per-symbol "
+                f"margin rates, returning no margin info for {len(wanted)} symbol(s) "
+                f"rather than reporting them as unheld")
+            return {}
+
         notional = {}
-        for position in (self.get_positions() or []):
+        for position in held:
             if position.market_value:
                 notional[position.symbol.strip().upper()] = abs(float(position.market_value))
 
@@ -1521,6 +1537,9 @@ class TastyTradeAccount(AccountInterface):
             if symbol in requirement and notional.get(symbol):
                 rate = min(1.0, requirement[symbol] / notional[symbol])
                 source = MARGIN_SOURCE_POSITION
+            # `is_fractional_quantity_eligible` is Optional in the SDK; None means the
+            # broker did not say, which must read as "whole shares only". Assuming
+            # fractional gets the order rejected at submission.
             fractionable = bool(getattr(equity, "is_fractional_quantity_eligible", False))
             result[symbol] = MarginInfo(
                 symbol=symbol,
@@ -1530,6 +1549,13 @@ class TastyTradeAccount(AccountInterface):
                 marginable=is_margin,
                 fractionable=fractionable,
                 min_order_size=None,
+                # MarginInfo.min_trade_increment = the smallest QUANTITY step the
+                # broker accepts for this symbol, None when it did not publish one.
+                # A whole-share-only symbol steps by 1.0 BY DEFINITION -- that is a
+                # fact about the symbol, not a reading, so it survives the precision
+                # table being unreachable. A fractionable one steps by the equity
+                # precision, and stays None when that fetch failed rather than
+                # inventing a step.
                 min_trade_increment=increment if fractionable else 1.0,
                 initial_margin_rate=rate,
                 maintenance_margin_rate=None,

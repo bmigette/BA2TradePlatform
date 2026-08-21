@@ -124,6 +124,24 @@ class MarginInfo:
 
     ``min_order_size`` / ``min_trade_increment`` mirror Alpaca ``Asset`` field
     names exactly.
+
+    ``min_trade_increment`` has ONE meaning across every adapter: the smallest
+    QUANTITY step the broker will accept for this symbol. It is a step in
+    SHARES, never in dollars, and never a hint derived from ``fractionable``.
+      * ``None`` means the broker did not publish one. It is NOT 1.0 and NOT
+        "no limit": the caller must fall back to whole shares rather than
+        assume a finer step (platform rule: no fabricated values for live
+        broker data). Alpaca leaves it ``None`` when ``Asset.min_trade_increment``
+        is absent; TastyTrade leaves it ``None`` when the quantity-precision
+        table could not be fetched.
+      * ``1.0`` means whole shares. A symbol with ``fractionable = False``
+        steps by 1.0 BY DEFINITION -- that is a fact about the symbol, not a
+        reading, so an adapter reports it even when its precision lookup failed.
+      * anything smaller is the broker's published fractional step (Alpaca
+        ``Asset.min_trade_increment``, TastyTrade's equity
+        ``minimum-increment-precision``).
+    ``fractionable = True`` with ``min_trade_increment = None`` is therefore a
+    legal, meaningful pair: the symbol can be split, but by an unknown step.
     """
     symbol: str
     bp_factor: float

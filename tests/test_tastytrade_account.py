@@ -1733,6 +1733,105 @@ def test_symbol_margin_info_reports_fractionability_and_increment():
     assert info["BRKA"].min_trade_increment == 1.0
 
 
+def test_symbol_margin_info_returns_nothing_when_the_position_fetch_fails(monkeypatch):
+    """I6. `get_positions()` returns None on a FETCH FAILURE and [] when the account is
+    genuinely flat -- a distinction this very file documents 50 lines earlier, and one
+    that once mass-closed 8 real transactions when it was collapsed.
+
+    `for position in (self.get_positions() or [])` collapsed it again: with the fetch
+    failing, a HELD AAPL carrying a real initial_requirement came back bp_factor=2.0,
+    initial_margin_rate=None, source='default' -- byte-identical to an UNHELD symbol.
+    Conservative in direction, but it silently discards the only real per-symbol margin
+    data TastyTrade publishes and gives the caller no way to know it fell back."""
+    errors = _capture_errors(monkeypatch)
+
+    acct = _bare_account()
+    acct._account.margin_or_cash = "Margin"
+    acct._account.get_margin_requirements = AsyncMock(
+        return_value=_margin_report(_margin_entry("AAPL", "775")))
+    acct._account.get_positions = AsyncMock(side_effect=RuntimeError("connection reset"))
+
+    with patch("tastytrade.instruments.Equity.get",
+               new=AsyncMock(return_value=[_FakeEquity("AAPL")])), \
+         patch("tastytrade.instruments.get_quantity_decimal_precisions",
+               new=AsyncMock(return_value=[_precision()])):
+        info = acct.get_symbol_margin_info(["AAPL"])
+
+    assert info == {}
+    assert any("position fetch failed" in m for m in errors), errors
+
+
+def test_symbol_margin_info_still_answers_for_a_genuinely_flat_account():
+    """The I6 guard must fire on None (fetch failed), NOT on [] (really flat) --
+    otherwise a brand-new account can never be sized at all."""
+    from ba2_trade_platform.core.account_types import MARGIN_SOURCE_DEFAULT
+
+    acct = _bare_account()
+    acct._account.margin_or_cash = "Margin"
+    equity_patch, precision_patch = _wire_margin_sources(
+        acct, equities=[_FakeEquity("AAPL")], report=_margin_report(),
+        precisions=[_precision()], positions=[])
+
+    with equity_patch, precision_patch:
+        info = acct.get_symbol_margin_info(["AAPL"])
+
+    assert info["AAPL"].source == MARGIN_SOURCE_DEFAULT
+    assert info["AAPL"].bp_factor == 2.0
+
+
+def test_symbol_margin_info_leaves_the_increment_unknown_when_precision_is_unavailable():
+    """I7. `min_trade_increment` is the broker's published quantity step, and None
+    means "the broker did not say" -- never a fabricated or derived number. With the
+    precision table unreachable, a fractionable symbol's step is genuinely unknown."""
+    acct = _bare_account()
+    acct._account.get_margin_requirements = AsyncMock(return_value=_margin_report())
+    acct._account.get_positions = AsyncMock(return_value=[])
+
+    with patch("tastytrade.instruments.Equity.get",
+               new=AsyncMock(return_value=[_FakeEquity("AAPL")])), \
+         patch("tastytrade.instruments.get_quantity_decimal_precisions",
+               new=AsyncMock(side_effect=RuntimeError("gateway timeout"))):
+        info = acct.get_symbol_margin_info(["AAPL"])
+
+    assert info["AAPL"].fractionable is True
+    assert info["AAPL"].min_trade_increment is None
+
+
+def test_symbol_margin_info_reports_whole_shares_for_a_non_fractionable_symbol_even_without_precision():
+    """I7. A symbol the broker will not split trades in WHOLE SHARES -- that is a fact
+    about the symbol, not a reading from the precision table, so it survives the
+    precision fetch failing."""
+    acct = _bare_account()
+    acct._account.get_margin_requirements = AsyncMock(return_value=_margin_report())
+    acct._account.get_positions = AsyncMock(return_value=[])
+
+    with patch("tastytrade.instruments.Equity.get",
+               new=AsyncMock(return_value=[
+                   _FakeEquity("BRKA", is_fractional_quantity_eligible=False)])), \
+         patch("tastytrade.instruments.get_quantity_decimal_precisions",
+               new=AsyncMock(side_effect=RuntimeError("gateway timeout"))):
+        info = acct.get_symbol_margin_info(["BRKA"])
+
+    assert info["BRKA"].fractionable is False
+    assert info["BRKA"].min_trade_increment == 1.0
+
+
+def test_symbol_margin_info_treats_an_unknown_fractionability_as_not_fractionable():
+    """M19. `is_fractional_quantity_eligible` is Optional in the SDK. None means the
+    broker did not say, which must NOT be read as "yes, split it" -- a fractional
+    quantity on a whole-share-only name is rejected at submission."""
+    acct = _bare_account()
+    equity_patch, precision_patch = _wire_margin_sources(
+        acct, equities=[_FakeEquity("AAPL", is_fractional_quantity_eligible=None)],
+        report=_margin_report(), precisions=[_precision()], positions=[])
+
+    with equity_patch, precision_patch:
+        info = acct.get_symbol_margin_info(["AAPL"])
+
+    assert info["AAPL"].fractionable is False
+    assert info["AAPL"].min_trade_increment == 1.0
+
+
 def test_symbol_margin_info_skips_empty_margin_report_groups():
     """MarginReport.groups is `list[MarginReportEntry | EmptyDict]` -- the EmptyDict
     placeholders have no attributes at all."""
