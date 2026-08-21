@@ -1107,6 +1107,101 @@ def test_cancel_order_without_a_broker_id_fails_without_calling_the_broker():
     acct._account.delete_order.assert_not_called()
 
 
+# --- Cross-account isolation -------------------------------------------------
+#
+# Both resolution paths in cancel_order (and both in refresh_orders) are scoped to
+# `account_id == self.id`. Without that scope, a platform running two brokerage
+# accounts lets one account cancel or mutate the other's rows -- and TastyTrade
+# broker ids are small integers, so an id collision between two accounts is not a
+# remote possibility, it is the normal case.
+
+def _order_on_another_account(**kwargs):
+    """A persisted TradingOrder belonging to a DIFFERENT account than the one under
+    test, returned alongside an account whose id is not its owner's."""
+    from tests.factories import create_account_definition
+    from ba2_trade_platform.core.types import OrderDirection, OrderStatus, OrderType
+
+    other_def, order = _tt_trading_order(**kwargs)
+    mine = create_account_definition(name="TastyTrade Mine", provider="TastyTrade")
+    assert mine.id != other_def.id
+    acct = _bare_account()
+    acct.id = mine.id
+    return acct, order
+
+
+def test_cancel_order_refuses_a_database_id_belonging_to_another_account():
+    """N02."""
+    from ba2_trade_platform.core.db import get_instance
+    from ba2_trade_platform.core.models import TradingOrder
+    from ba2_trade_platform.core.types import OrderStatus
+
+    acct, order = _order_on_another_account(broker_order_id="987654",
+                                            status=OrderStatus.ACCEPTED)
+    acct._account.delete_order = AsyncMock()
+
+    assert acct.cancel_order(order.id) is False
+    acct._account.delete_order.assert_not_called()
+    assert get_instance(TradingOrder, order.id).status == OrderStatus.ACCEPTED
+
+
+def test_cancel_order_refuses_a_broker_id_belonging_to_another_account():
+    """N03."""
+    from ba2_trade_platform.core.db import get_instance
+    from ba2_trade_platform.core.models import TradingOrder
+    from ba2_trade_platform.core.types import OrderStatus
+
+    acct, order = _order_on_another_account(broker_order_id="987654",
+                                            status=OrderStatus.ACCEPTED)
+    acct._account.delete_order = AsyncMock()
+
+    assert acct.cancel_order("987654") is False
+    acct._account.delete_order.assert_not_called()
+    assert get_instance(TradingOrder, order.id).status == OrderStatus.ACCEPTED
+
+
+def test_refresh_orders_ignores_an_external_identifier_owned_by_another_account():
+    """N04. external_identifier is OUR row id, and row ids are global -- so without the
+    account scope, account A's refresh would happily rewrite account B's order from a
+    broker response that has nothing to do with it."""
+    from ba2_trade_platform.core.db import get_instance
+    from ba2_trade_platform.core.models import TradingOrder
+    from ba2_trade_platform.core.types import OrderStatus
+
+    acct, order = _order_on_another_account(quantity=10.0, status=OrderStatus.ACCEPTED)
+    acct._account.get_order_history = AsyncMock(return_value=[
+        _placed_order(order_id=987654, status=TTOrderStatus.FILLED, size="10",
+                      external_identifier=str(order.id),
+                      fills=[_fill(quantity="10", fill_price="150.25")]),
+    ])
+
+    acct.refresh_orders()
+
+    stored = get_instance(TradingOrder, order.id)
+    assert stored.status == OrderStatus.ACCEPTED
+    assert stored.broker_order_id is None
+    assert stored.open_price is None
+
+
+def test_refresh_orders_ignores_a_broker_order_id_owned_by_another_account():
+    """N04, the fallback lookup."""
+    from ba2_trade_platform.core.db import get_instance
+    from ba2_trade_platform.core.models import TradingOrder
+    from ba2_trade_platform.core.types import OrderStatus
+
+    acct, order = _order_on_another_account(quantity=10.0, broker_order_id="987654",
+                                            status=OrderStatus.ACCEPTED)
+    acct._account.get_order_history = AsyncMock(return_value=[
+        _placed_order(order_id=987654, status=TTOrderStatus.FILLED, size="10",
+                      fills=[_fill(quantity="10", fill_price="150.25")]),
+    ])
+
+    acct.refresh_orders()
+
+    stored = get_instance(TradingOrder, order.id)
+    assert stored.status == OrderStatus.ACCEPTED
+    assert stored.open_price is None
+
+
 def test_cancel_order_for_an_unknown_id_returns_false():
     account_def, _order = _tt_trading_order()
     acct = _bare_account()
@@ -1298,6 +1393,150 @@ def test_refresh_orders_leaves_an_order_absent_from_the_response_untouched():
     acct = _bare_account()
     acct.id = account_def.id
     acct._account.get_order_history = AsyncMock(return_value=[])
+
+    acct.refresh_orders()
+
+    assert get_instance(TradingOrder, order.id).status == OrderStatus.ACCEPTED
+
+
+def test_refresh_orders_requests_all_pages():
+    """M53. `get_order_history`'s per_page DEFAULTS TO 50 (account.py:808), so without
+    the page_offset=None all-pages sentinel only the 50 NEWEST orders would ever sync
+    -- and everything older would sit at its last-known status forever, leaving its
+    transaction WAITING."""
+    account_def, _order = _tt_trading_order()
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.get_order_history = AsyncMock(return_value=[])
+
+    acct.refresh_orders()
+
+    assert acct._account.get_order_history.call_args.kwargs["page_offset"] is None
+
+
+def test_refresh_orders_keeps_pending_cancel_until_the_broker_reaches_a_final_state():
+    """N01. A cancel we REQUESTED has not happened yet: while the broker still reports
+    the order LIVE its quantity is not released, and promoting it to ACCEPTED lets a
+    dependent replacement fire against quantity that is still committed."""
+    from ba2_trade_platform.core.db import get_instance
+    from ba2_trade_platform.core.models import TradingOrder
+    from ba2_trade_platform.core.types import OrderStatus
+
+    account_def, order = _tt_trading_order(broker_order_id="987654",
+                                           status=OrderStatus.PENDING_CANCEL)
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.get_order_history = AsyncMock(return_value=[
+        _placed_order(order_id=987654, status=TTOrderStatus.LIVE,
+                      external_identifier=str(order.id)),
+    ])
+
+    acct.refresh_orders()
+
+    assert get_instance(TradingOrder, order.id).status == OrderStatus.PENDING_CANCEL
+
+
+def test_refresh_orders_promotes_pending_cancel_once_the_broker_confirms():
+    from ba2_trade_platform.core.db import get_instance
+    from ba2_trade_platform.core.models import TradingOrder
+    from ba2_trade_platform.core.types import OrderStatus
+
+    account_def, order = _tt_trading_order(broker_order_id="987654",
+                                           status=OrderStatus.PENDING_CANCEL)
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.get_order_history = AsyncMock(return_value=[
+        _placed_order(order_id=987654, status=TTOrderStatus.CANCELLED,
+                      external_identifier=str(order.id)),
+    ])
+
+    acct.refresh_orders()
+
+    assert get_instance(TradingOrder, order.id).status == OrderStatus.CANCELED
+
+
+def test_refresh_orders_promotes_pending_cancel_to_filled_when_the_cancel_lost_the_race():
+    """The order completed before the cancel landed -- that is a FILL, and the
+    transaction must be opened."""
+    from ba2_trade_platform.core.db import get_instance
+    from ba2_trade_platform.core.models import TradingOrder
+    from ba2_trade_platform.core.types import OrderStatus
+
+    account_def, order = _tt_trading_order(quantity=10.0, broker_order_id="987654",
+                                           status=OrderStatus.PENDING_CANCEL)
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.get_order_history = AsyncMock(return_value=[
+        _placed_order(order_id=987654, status=TTOrderStatus.FILLED, size="10",
+                      external_identifier=str(order.id),
+                      fills=[_fill(quantity="10", fill_price="150.25")]),
+    ])
+
+    acct.refresh_orders()
+
+    assert get_instance(TradingOrder, order.id).status == OrderStatus.FILLED
+
+
+def test_refresh_orders_skips_a_dry_run_row():
+    """N17. A dry run comes back with `id == -1`, which is not a broker id. Storing it
+    as broker_order_id would make the idempotency guard in _submit_order_impl reject
+    the genuine submission that follows."""
+    from ba2_trade_platform.core.db import get_instance
+    from ba2_trade_platform.core.models import TradingOrder
+    from ba2_trade_platform.core.types import OrderStatus
+
+    account_def, order = _tt_trading_order(quantity=10.0, status=OrderStatus.PENDING)
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.get_order_history = AsyncMock(return_value=[
+        _placed_order(order_id=-1, status=TTOrderStatus.RECEIVED, size="10",
+                      external_identifier=str(order.id)),
+    ])
+
+    acct.refresh_orders()
+
+    stored = get_instance(TradingOrder, order.id)
+    assert stored.broker_order_id is None
+    assert stored.status == OrderStatus.PENDING
+
+
+def test_refresh_orders_does_not_erase_a_known_fill_price():
+    """N18. A later broker snapshot may carry no fills (a partial history page, an
+    order re-reported after a replace). Overwriting a recorded open_price with None
+    destroys the entry price the whole P&L of the transaction is computed from."""
+    from ba2_trade_platform.core.db import get_instance
+    from ba2_trade_platform.core.models import TradingOrder
+    from ba2_trade_platform.core.types import OrderStatus
+
+    account_def, order = _tt_trading_order(quantity=10.0, broker_order_id="987654",
+                                           status=OrderStatus.FILLED, open_price=150.25)
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.get_order_history = AsyncMock(return_value=[
+        _placed_order(order_id=987654, status=TTOrderStatus.FILLED, size="10",
+                      external_identifier=str(order.id), fills=None),
+    ])
+
+    acct.refresh_orders()
+
+    assert get_instance(TradingOrder, order.id).open_price == pytest.approx(150.25)
+
+
+def test_refresh_orders_skips_a_row_whose_side_cannot_be_determined():
+    """N16 at the refresh seam: a row with no usable leg action is dropped, never
+    guessed onto the BUY side of the book."""
+    from ba2_trade_platform.core.db import get_instance
+    from ba2_trade_platform.core.models import TradingOrder
+    from ba2_trade_platform.core.types import OrderStatus
+
+    account_def, order = _tt_trading_order(quantity=10.0, broker_order_id="987654",
+                                           status=OrderStatus.ACCEPTED)
+    acct = _bare_account()
+    acct.id = account_def.id
+    sideless = _placed_order(order_id=987654, status=TTOrderStatus.FILLED, size="10",
+                             external_identifier=str(order.id))
+    object.__setattr__(sideless, "legs", [])
+    acct._account.get_order_history = AsyncMock(return_value=[sideless])
 
     acct.refresh_orders()
 
