@@ -33288,3 +33288,34 @@ flooring it to whole shares. Flooring would sometimes salvage it (2.4 shares at 
 2 shares is a legal $4.00), but that is a sizing decision needing an overshoot guard, which D1
 owns. Suppression never sends a refusable order and never overshoots; it only under-trades, and
 says so via `REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_FMT`.
+
+## L9. Task 79's bump rule is WRONG on this branch — it would move the version BACKWARDS
+
+Task 79 says: *"If the branch has moved on and the current value is higher than `2026.08.1067`,
+bump whatever is actually there by one instead."* Following that literally gives `2026.08.1069`.
+
+But `dev` and `origin/dev` are at **`2026.08.1071`** — the mid-generation checkpoint work
+(7 tasks + the Python-RNG restore fix) was written and pushed to `dev` on 2026-08-21, while
+`pf_allocation` branched earlier and still reads `2026.08.1068`. `pf_allocation` does NOT contain
+those commits.
+
+`1069` is BEHIND `1071`. The consequences are not cosmetic:
+
+- `worker_client.ensure_synced` compares the version STRING. A master advertising `1069` against
+  workers already converged on `1071` cannot be reasoned about — the counter is supposed to be
+  monotonic, and a decrease is a state the sync logic never anticipates.
+- Merging this branch into `dev` will conflict on `version.py`, and resolving it by taking the
+  branch's side silently reverts the pushed bump.
+
+**Correct action for Task 79 on this branch:**
+
+1. `ba2_trade_platform/version.py` -> **`2026.08.1072`** (one above `dev`, not one above the
+   branch), so the merge is monotonic whichever side wins the conflict.
+2. `testplatform/version.py` -> bump `TEST_APP_VERSION` from `2026.08.0001` by one, i.e.
+   **`2026.08.0002`**. This branch changes `packages/common` heavily — new models, the
+   label-helper normalisation, the account seams, the `TradeActions.py` fix — and per the Task 78
+   rule `packages/` counts as TEST platform, so the GA workers must re-sync.
+   Keep the zero-padded shape: Section I chose it deliberately so a stale pre-split worker
+   reporting the TRADE version can never collide with a test version.
+3. Before merging to `dev`, merge `dev` INTO `pf_allocation` first and resolve `version.py` to the
+   higher value. Do not resolve it by picking a side blindly.
