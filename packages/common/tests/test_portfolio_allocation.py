@@ -46,7 +46,8 @@ def test_plan_to_dict_is_json_serialisable():
 
 def test_compute_allocation_no_labels_returns_empty_plan():
     plan = pa.compute_allocation(0.0, 0.0, [], {}, {},
-                                 allow_fractional=False, default_bp_factor=1.0)
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
     assert plan.rows == []
     assert plan.total_buy_value == 0.0
     assert plan.scale_factor == 1.0
@@ -63,7 +64,8 @@ def test_even_split_two_symbols_targets_half_the_base_each():
     labels = [LabelTarget("ARK26", 100.0, [SymbolTarget("AAA", 50.0), SymbolTarget("BBB", 50.0)])]
     current = {"AAA": _pos("AAA", 100.0), "BBB": _pos("BBB", 50.0)}
     plan = pa.compute_allocation(100_000.0, 1_000_000.0, labels, current, {},
-                                 allow_fractional=False, default_bp_factor=1.0)
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
     by = {r.symbol: r for r in plan.rows}
     assert by["AAA"].target_notional == 50_000.0
     assert by["AAA"].target_quantity == 500.0
@@ -80,7 +82,8 @@ def test_uneven_label_and_symbol_weights_multiply_through():
     ]
     current = {"AAA": _pos("AAA", 100.0), "BBB": _pos("BBB", 20.0), "CCC": _pos("CCC", 250.0)}
     plan = pa.compute_allocation(100_000.0, 1_000_000.0, labels, current, {},
-                                 allow_fractional=False, default_bp_factor=1.0)
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
     by = {r.symbol: r for r in plan.rows}
     assert by["AAA"].target_quantity == 280.0
     assert by["BBB"].target_quantity == 600.0
@@ -94,7 +97,8 @@ def test_symbol_in_two_labels_sums_targets_into_one_row():
     ]
     plan = pa.compute_allocation(100_000.0, 1_000_000.0, labels,
                                  {"XXX": _pos("XXX", 100.0)}, {},
-                                 allow_fractional=False, default_bp_factor=1.0)
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
     assert len(plan.rows) == 1
     row = plan.rows[0]
     assert row.target_notional == 100_000.0
@@ -110,7 +114,8 @@ def test_labels_totalling_ninety_percent_leave_ten_percent_undeployed():
     ]
     current = {"AAA": _pos("AAA", 100.0), "BBB": _pos("BBB", 100.0)}
     plan = pa.compute_allocation(10_000.0, 1_000_000.0, labels, current, {},
-                                 allow_fractional=False, default_bp_factor=1.0)
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
     assert plan.total_buy_value == 9_000.0
 
 
@@ -118,7 +123,8 @@ def test_unknown_margin_uses_default_bp_factor():
     labels = [LabelTarget("A", 100.0, [SymbolTarget("AAA", 100.0)])]
     plan = pa.compute_allocation(10_000.0, 1_000_000.0, labels,
                                  {"AAA": _pos("AAA", 100.0)}, {},
-                                 allow_fractional=False, default_bp_factor=2.0)
+                                 allow_fractional=False, default_bp_factor=2.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
     assert plan.rows[0].bp_factor == 2.0
     assert plan.rows[0].bp_cost == 20_000.0
 
@@ -128,7 +134,8 @@ def test_held_symbol_with_no_managed_label_is_absent_from_the_plan():
     current = {"AAA": _pos("AAA", 100.0),
                "ZZZ": _pos("ZZZ", 100.0, quantity=50.0, cost_basis=5_000.0)}
     plan = pa.compute_allocation(10_000.0, 1_000_000.0, labels, current, {},
-                                 allow_fractional=False, default_bp_factor=1.0)
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
     assert [r.symbol for r in plan.rows] == ["AAA"]
 
 
@@ -136,7 +143,8 @@ def test_fractional_off_floors_the_quantity():
     labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
     plan = pa.compute_allocation(1_000.0, 1_000_000.0, labels,
                                  {"XXX": _pos("XXX", 300.0)}, {},
-                                 allow_fractional=False, default_bp_factor=1.0)
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
     assert plan.rows[0].target_quantity == 3.0
     assert plan.rows[0].estimated_value == 900.0
 
@@ -149,7 +157,8 @@ def test_held_above_target_produces_a_sell_of_the_difference():
     labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
     current = {"XXX": _pos("XXX", 100.0, quantity=100.0, cost_basis=10_000.0)}
     plan = pa.compute_allocation(5_000.0, 0.0, labels, current, {},
-                                 allow_fractional=False, default_bp_factor=1.0)
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
     row = plan.rows[0]
     assert row.target_quantity == 50.0
     assert row.delta_quantity == -50.0
@@ -160,10 +169,16 @@ def test_held_above_target_produces_a_sell_of_the_difference():
 
 
 def test_held_below_target_produces_a_top_up_buy():
+    """MARKET, and it MATTERS: this is the mode half of the same fixture
+    ``test_cost_mode_sizes_the_top_up_off_the_purchase_value_not_the_share_count``
+    uses. Holding 20 bought at 90 with the price now 100, market targets 100 SHARES
+    and buys 80; cost targets 10,000 of PURCHASE VALUE and buys 82. The 80 asserted
+    below is the market answer, and it used to come from the Python default."""
     labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
     current = {"XXX": _pos("XXX", 100.0, quantity=20.0, cost_basis=1_800.0)}
     plan = pa.compute_allocation(10_000.0, 1_000_000.0, labels, current, {},
-                                 allow_fractional=False, default_bp_factor=1.0)
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
     row = plan.rows[0]
     assert row.target_quantity == 100.0
     assert row.delta_quantity == 80.0
@@ -179,7 +194,8 @@ def test_zero_target_on_a_held_symbol_closes_the_position():
     current = {"AAA": _pos("AAA", 100.0),
                "BBB": _pos("BBB", 20.0, quantity=30.0, cost_basis=500.0)}
     plan = pa.compute_allocation(10_000.0, 1_000_000.0, labels, current, {},
-                                 allow_fractional=False, default_bp_factor=1.0)
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
     by = {r.symbol: r for r in plan.rows}
     assert by["BBB"].target_quantity == 0.0
     assert by["BBB"].delta_quantity == -30.0
@@ -191,7 +207,8 @@ def test_already_on_target_produces_no_order():
     labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
     current = {"XXX": _pos("XXX", 100.0, quantity=100.0, cost_basis=10_000.0)}
     plan = pa.compute_allocation(10_000.0, 1_000_000.0, labels, current, {},
-                                 allow_fractional=False, default_bp_factor=1.0)
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
     row = plan.rows[0]
     assert row.delta_quantity == 0.0
     assert row.side is None
@@ -203,7 +220,8 @@ def test_whole_share_mode_never_emits_a_fractional_delta():
     labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
     current = {"XXX": _pos("XXX", 100.0, quantity=10.5, cost_basis=1_050.0)}
     plan = pa.compute_allocation(2_000.0, 1_000_000.0, labels, current, {},
-                                 allow_fractional=False, default_bp_factor=1.0)
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
     assert plan.rows[0].delta_quantity == 9.0
 
 
@@ -212,7 +230,8 @@ def test_fractional_on_without_increment_rounds_to_four_decimals():
     margin = {"XXX": MarginInfo(symbol="XXX", bp_factor=1.0, fractionable=True)}
     plan = pa.compute_allocation(1_000.0, 1_000_000.0, labels,
                                  {"XXX": _pos("XXX", 300.0)}, margin,
-                                 allow_fractional=True, default_bp_factor=1.0)
+                                 allow_fractional=True, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
     row = plan.rows[0]
     assert row.target_quantity == pytest.approx(3.3333)
     assert row.fractional is True
@@ -225,7 +244,8 @@ def test_fractional_on_rounds_down_to_the_brokers_min_trade_increment():
                                 min_trade_increment=0.01)}
     plan = pa.compute_allocation(1_000.0, 1_000_000.0, labels,
                                  {"XXX": _pos("XXX", 300.0)}, margin,
-                                 allow_fractional=True, default_bp_factor=1.0)
+                                 allow_fractional=True, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
     assert plan.rows[0].target_quantity == pytest.approx(3.33)
 
 
@@ -234,7 +254,8 @@ def test_fractional_requested_on_a_non_fractionable_symbol_falls_back_to_whole_s
     margin = {"XXX": MarginInfo(symbol="XXX", bp_factor=1.0, fractionable=False)}
     plan = pa.compute_allocation(1_000.0, 1_000_000.0, labels,
                                  {"XXX": _pos("XXX", 300.0)}, margin,
-                                 allow_fractional=True, default_bp_factor=1.0)
+                                 allow_fractional=True, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
     row = plan.rows[0]
     assert row.target_quantity == 3.0
     assert row.fractional is False
@@ -256,7 +277,8 @@ def test_an_order_below_min_order_size_is_suppressed_and_the_target_kept():
                                 min_order_size=5.0)}
     plan = pa.compute_allocation(1_000.0, 1_000_000.0, labels,
                                  {"XXX": _pos("XXX", 300.0)}, margin,
-                                 allow_fractional=True, default_bp_factor=1.0)
+                                 allow_fractional=True, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
     row = plan.rows[0]
     assert row.delta_quantity == 0.0
     assert row.side is None
@@ -273,7 +295,8 @@ def test_buys_scale_pro_rata_when_they_exceed_buying_power():
         "NONM": MarginInfo(symbol="NONM", bp_factor=2.0, marginable=False),
     }
     plan = pa.compute_allocation(100_000.0, 60_000.0, labels, current, margin,
-                                 allow_fractional=False, default_bp_factor=2.0)
+                                 allow_fractional=False, default_bp_factor=2.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
     by = {r.symbol: r for r in plan.rows}
     assert plan.scale_factor == pytest.approx(0.4)
     assert by["MARG"].delta_quantity == 200.0
@@ -291,7 +314,8 @@ def test_sells_are_never_scaled_down():
     current = {"BUYME": _pos("BUYME", 100.0),
                "SELLME": _pos("SELLME", 100.0, quantity=1000.0, cost_basis=100_000.0)}
     plan = pa.compute_allocation(100_000.0, 1_000.0, labels, current, {},
-                                 allow_fractional=False, default_bp_factor=1.0)
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
     by = {r.symbol: r for r in plan.rows}
     assert by["SELLME"].delta_quantity == -500.0
     assert by["SELLME"].estimated_value == 50_000.0
@@ -304,7 +328,8 @@ def test_zero_buying_power_skips_every_buy():
     labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
     plan = pa.compute_allocation(10_000.0, 0.0, labels,
                                  {"XXX": _pos("XXX", 100.0)}, {},
-                                 allow_fractional=False, default_bp_factor=1.0)
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
     assert plan.rows[0].skipped is True
     assert plan.total_buy_value == 0.0
 
@@ -313,7 +338,8 @@ def test_symbol_without_a_price_is_skipped_not_guessed():
     labels = [LabelTarget("A", 100.0, [SymbolTarget("AAA", 60.0), SymbolTarget("BBB", 40.0)])]
     current = {"AAA": _pos("AAA", None), "BBB": _pos("BBB", 50.0)}
     plan = pa.compute_allocation(10_000.0, 1_000_000.0, labels, current, {},
-                                 allow_fractional=False, default_bp_factor=1.0)
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
     by = {r.symbol: r for r in plan.rows}
     assert by["AAA"].skipped is True
     assert by["AAA"].delta_quantity == 0.0
@@ -326,7 +352,8 @@ def test_symbol_with_a_zero_price_is_skipped():
     labels = [LabelTarget("A", 100.0, [SymbolTarget("AAA", 100.0)])]
     plan = pa.compute_allocation(10_000.0, 1_000_000.0, labels,
                                  {"AAA": _pos("AAA", 0.0)}, {},
-                                 allow_fractional=False, default_bp_factor=1.0)
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
     assert plan.rows[0].skipped is True
     assert pa.REASON_NO_PRICE in plan.rows[0].reasons
 
@@ -336,7 +363,8 @@ def test_empty_managed_label_contributes_to_unallocatable_pct():
               LabelTarget("EMPTY", 30.0, [])]
     plan = pa.compute_allocation(10_000.0, 1_000_000.0, labels,
                                  {"AAA": _pos("AAA", 100.0)}, {},
-                                 allow_fractional=False, default_bp_factor=1.0)
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
     assert [r.symbol for r in plan.rows] == ["AAA"]
     assert plan.rows[0].target_quantity == 70.0
     assert plan.unallocatable_pct == pytest.approx(30.0)
@@ -347,7 +375,8 @@ def test_negative_label_target_is_clamped_to_zero():
     labels = [LabelTarget("A", -20.0, [SymbolTarget("XXX", 100.0)])]
     current = {"XXX": _pos("XXX", 100.0, quantity=10.0, cost_basis=1_000.0)}
     plan = pa.compute_allocation(10_000.0, 0.0, labels, current, {},
-                                 allow_fractional=False, default_bp_factor=1.0)
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
     row = plan.rows[0]
     assert row.target_notional == 0.0
     assert pa.REASON_NEGATIVE_CLAMPED in row.reasons
@@ -427,22 +456,32 @@ def test_validate_label_targets_rejects_a_negative_target():
 def test_compute_base_notional_adds_managed_cost_basis_to_buying_power():
     current = {"AAA": _pos("AAA", 100.0, quantity=10.0, cost_basis=900.0),
                "ZZZ": _pos("ZZZ", 100.0, quantity=99.0, cost_basis=9_900.0)}
-    assert pa.compute_base_notional(5_000.0, current, ["AAA"]) == 5_900.0
+    assert pa.compute_base_notional(5_000.0, current, ["AAA"],
+                                    valuation_mode=pa.VALUATION_MODE_COST) == 5_900.0
 
 
 def test_compute_base_notional_managed_symbol_with_no_position_contributes_zero():
+    """COST mode: 10,000 buying power + AAA's 1,500 basis. NVDA is managed but not
+    held, so it adds nothing (market mode would make AAA 1,000 and the total 11,000
+    -- the arithmetic pinned here is the cost one)."""
     current = {"AAA": _pos("AAA", 100.0, quantity=10.0, cost_basis=1500.0)}
-    assert pa.compute_base_notional(10_000.0, current, ["AAA", "NVDA"]) == 11_500.0
+    assert pa.compute_base_notional(10_000.0, current, ["AAA", "NVDA"],
+                                    valuation_mode=pa.VALUATION_MODE_COST) == 11_500.0
 
 
 def test_compute_base_notional_counts_a_repeated_symbol_once():
+    """COST again: 5,000 + one 900 basis, not two (market would be 5,000 + 1,000)."""
     current = {"AAA": _pos("AAA", 100.0, quantity=10.0, cost_basis=900.0)}
-    assert pa.compute_base_notional(5_000.0, current, ["AAA", "AAA"]) == 5_900.0
+    assert pa.compute_base_notional(5_000.0, current, ["AAA", "AAA"],
+                                    valuation_mode=pa.VALUATION_MODE_COST) == 5_900.0
 
 
 def test_compute_base_notional_raises_when_buying_power_is_none():
+    """A VALID mode is passed so the raise is unambiguously about the buying power:
+    the None-balance check runs first, but an invalid mode would also raise ValueError
+    and the test would pass for the wrong reason."""
     with pytest.raises(ValueError):
-        pa.compute_base_notional(None, {}, ["AAA"])
+        pa.compute_base_notional(None, {}, ["AAA"], valuation_mode=pa.VALUATION_MODE_COST)
 
 
 def test_validate_label_targets_rejects_symbol_weights_totalling_one_fifty():
@@ -508,7 +547,8 @@ def test_label_investment_splits_the_amount_and_only_buys():
                "BBB": _pos("BBB", 50.0, quantity=1000.0, cost_basis=50_000.0)}
     plan = pa.compute_label_investment(label, 10_000.0, current, {},
                                        available_buying_power=1_000_000.0,
-                                       allow_fractional=False, default_bp_factor=1.0)
+                                       allow_fractional=False, default_bp_factor=1.0,
+                                       valuation_mode=pa.VALUATION_MODE_MARKET)
     by = {r.symbol: r for r in plan.rows}
     assert by["AAA"].delta_quantity == 60.0
     assert by["AAA"].target_quantity == 67.0
@@ -521,7 +561,8 @@ def test_label_investment_scales_down_to_available_buying_power():
     label = LabelTarget("ARK26", 100.0, [SymbolTarget("AAA", 100.0)])
     plan = pa.compute_label_investment(label, 10_000.0, {"AAA": _pos("AAA", 100.0)}, {},
                                        available_buying_power=2_500.0,
-                                       allow_fractional=False, default_bp_factor=1.0)
+                                       allow_fractional=False, default_bp_factor=1.0,
+                                       valuation_mode=pa.VALUATION_MODE_MARKET)
     assert plan.scale_factor == pytest.approx(0.25)
     assert plan.rows[0].delta_quantity == 25.0
 
@@ -529,7 +570,8 @@ def test_label_investment_scales_down_to_available_buying_power():
 def test_label_investment_on_an_empty_label_allocates_nothing():
     plan = pa.compute_label_investment(LabelTarget("EMPTY", 100.0, []), 10_000.0, {}, {},
                                        available_buying_power=1_000_000.0,
-                                       allow_fractional=False, default_bp_factor=1.0)
+                                       allow_fractional=False, default_bp_factor=1.0,
+                                       valuation_mode=pa.VALUATION_MODE_MARKET)
     assert plan.rows == []
     assert plan.unallocatable_pct == 100.0
 
@@ -603,7 +645,8 @@ def test_label_investment_coalesces_a_duplicated_symbol_into_one_row():
     label = LabelTarget("L", 100.0, [SymbolTarget("AAA", 50.0), SymbolTarget("AAA", 50.0)])
     plan = pa.compute_label_investment(label, 10_000.0, {"AAA": _pos("AAA", 100.0)}, {},
                                        available_buying_power=1_000_000.0,
-                                       allow_fractional=False, default_bp_factor=1.0)
+                                       allow_fractional=False, default_bp_factor=1.0,
+                                       valuation_mode=pa.VALUATION_MODE_MARKET)
     assert [r.symbol for r in plan.rows] == ["AAA"]
     assert plan.rows[0].delta_quantity == 100.0
     assert plan.total_buy_value == pytest.approx(10_000.0)
@@ -615,7 +658,8 @@ def test_label_investment_coalescing_preserves_first_appearance_order():
     plan = pa.compute_label_investment(label, 10_000.0,
                                        {"AAA": _pos("AAA", 100.0), "BBB": _pos("BBB", 100.0)}, {},
                                        available_buying_power=1_000_000.0,
-                                       allow_fractional=False, default_bp_factor=1.0)
+                                       allow_fractional=False, default_bp_factor=1.0,
+                                       valuation_mode=pa.VALUATION_MODE_MARKET)
     assert [r.symbol for r in plan.rows] == ["BBB", "AAA"]
     assert [r.delta_quantity for r in plan.rows] == [50.0, 50.0]
 
@@ -624,7 +668,8 @@ def test_apply_order_impacts_replaces_the_estimated_bp_cost():
     labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
     plan = pa.compute_allocation(10_000.0, 1_000_000.0, labels,
                                  {"XXX": _pos("XXX", 100.0)}, {},
-                                 allow_fractional=False, default_bp_factor=1.0)
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
     assert plan.rows[0].bp_cost == 10_000.0
     impacts = {"XXX": OrderImpact(symbol="XXX", change_in_buying_power=-25_000.0)}
     out = pa.apply_order_impacts(plan, impacts, available_buying_power=1_000_000.0)
@@ -637,7 +682,8 @@ def test_apply_order_impacts_rescales_when_the_precheck_no_longer_fits():
     labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
     plan = pa.compute_allocation(10_000.0, 10_000.0, labels,
                                  {"XXX": _pos("XXX", 100.0)}, {},
-                                 allow_fractional=False, default_bp_factor=1.0)
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
     impacts = {"XXX": OrderImpact(symbol="XXX", change_in_buying_power=-20_000.0)}
     out = pa.apply_order_impacts(plan, impacts, available_buying_power=10_000.0)
     assert out.scale_factor == pytest.approx(0.5)
@@ -649,7 +695,8 @@ def test_apply_order_impacts_skips_a_rejected_order():
     labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
     plan = pa.compute_allocation(10_000.0, 1_000_000.0, labels,
                                  {"XXX": _pos("XXX", 100.0)}, {},
-                                 allow_fractional=False, default_bp_factor=1.0)
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
     impacts = {"XXX": OrderImpact(symbol="XXX", change_in_buying_power=0.0,
                                   accepted=False, errors=["symbol not tradeable"])}
     out = pa.apply_order_impacts(plan, impacts, available_buying_power=1_000_000.0)
@@ -815,15 +862,29 @@ def test_compute_allocation_rejects_an_unknown_valuation_mode():
                               valuation_mode="marketish")
 
 
-def test_the_python_defaults_match_each_functions_pinned_behaviour():
-    """compute_base_notional defaults to COST; compute_allocation defaults to MARKET.
-    Live code always passes the mode explicitly and relies on neither."""
+def test_all_three_entry_points_require_an_explicit_valuation_mode():
+    """CONTRACT CHANGED: there is no Python default on ANY of the three.
+
+    They used to have defaults that DISAGREED -- ``compute_base_notional`` fell back
+    to cost (its pinned behaviour, "buying power + cost basis") and the two solvers
+    to market (theirs, "shares vs shares") -- and this test pinned exactly that.
+    But the mode picks the meaning of "current value" for the allocatable base, the
+    displayed percentages and every delta AT ONCE, so a call site that forgot the
+    keyword got a cost base and market deltas: no exception, no warning, just wrong
+    money. Since no single default is right for every caller, none of them has one
+    and the omission is a TypeError at the call site instead.
+    """
     current = {"AAA": _pos("AAA", 200.0, quantity=10.0, cost_basis=900.0)}
-    assert pa.compute_base_notional(0.0, current, ["AAA"]) == 900.0
     labels = [LabelTarget("A", 100.0, [SymbolTarget("AAA", 100.0)])]
-    plan = pa.compute_allocation(2_000.0, 1_000_000.0, labels, current, {},
-                                 allow_fractional=False, default_bp_factor=1.0)
-    assert plan.rows[0].delta_quantity == 0.0    # market: 2000/200 = 10 shares, already held
+    with pytest.raises(TypeError):
+        pa.compute_base_notional(0.0, current, ["AAA"])
+    with pytest.raises(TypeError):
+        pa.compute_allocation(2_000.0, 1_000_000.0, labels, current, {},
+                              allow_fractional=False, default_bp_factor=1.0)
+    with pytest.raises(TypeError):
+        pa.compute_label_investment(labels[0], 1_000.0, current, {},
+                                    available_buying_power=1_000_000.0,
+                                    allow_fractional=False, default_bp_factor=1.0)
 
 
 def test_compute_label_investment_rejects_an_unknown_valuation_mode():
@@ -935,7 +996,8 @@ def test_an_order_at_the_min_order_size_still_trades():
     margin = {"XXX": MarginInfo(symbol="XXX", bp_factor=1.0, min_order_size=5.0)}
     current = {"XXX": _pos("XXX", 100.0, quantity=10.0, cost_basis=1_000.0)}
     row = pa.compute_allocation(1_600.0, 1_000_000.0, labels, current, margin,
-                                allow_fractional=False, default_bp_factor=1.0).rows[0]
+                                allow_fractional=False, default_bp_factor=1.0,
+                                valuation_mode=pa.VALUATION_MODE_MARKET).rows[0]
     assert row.delta_quantity == 6.0
     assert row.side == OrderDirection.BUY
     assert row.target_quantity == 16.0
@@ -948,7 +1010,8 @@ def test_a_sell_below_min_order_size_is_suppressed_too():
     margin = {"XXX": MarginInfo(symbol="XXX", bp_factor=1.0, min_order_size=5.0)}
     current = {"XXX": _pos("XXX", 100.0, quantity=10.0, cost_basis=1_000.0)}
     row = pa.compute_allocation(800.0, 1_000_000.0, labels, current, margin,
-                                allow_fractional=False, default_bp_factor=1.0).rows[0]
+                                allow_fractional=False, default_bp_factor=1.0,
+                                valuation_mode=pa.VALUATION_MODE_MARKET).rows[0]
     assert row.delta_quantity == 0.0
     assert row.side is None
     assert row.target_quantity == 10.0
@@ -963,7 +1026,8 @@ def test_label_investment_suppresses_an_order_below_min_order_size():
     current = {"XXX": _pos("XXX", 300.0, quantity=2.0, cost_basis=600.0)}
     plan = pa.compute_label_investment(label, 1_000.0, current, margin,
                                        available_buying_power=1_000_000.0,
-                                       allow_fractional=True, default_bp_factor=1.0)
+                                       allow_fractional=True, default_bp_factor=1.0,
+                                       valuation_mode=pa.VALUATION_MODE_MARKET)
     row = plan.rows[0]
     assert row.delta_quantity == 0.0
     assert row.side is None
@@ -1015,7 +1079,8 @@ def test_both_kinds_of_skipped_row_serialise_a_null_side():
     labels = [LabelTarget("A", 100.0, [SymbolTarget("AAA", 50.0), SymbolTarget("BBB", 50.0)])]
     current = {"AAA": _pos("AAA", None), "BBB": _pos("BBB", 100.0)}
     plan = pa.compute_allocation(10_000.0, 10.0, labels, current, {},
-                                 allow_fractional=False, default_bp_factor=1.0)
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
     by = {r.symbol: r for r in plan.rows}
     assert by["AAA"].skipped is True and pa.REASON_NO_PRICE in by["AAA"].reasons
     assert by["BBB"].skipped is True and any("scaled" in r for r in by["BBB"].reasons)
@@ -1032,7 +1097,8 @@ def test_apply_order_impacts_keeps_the_min_trade_increment_on_the_re_solve():
                                 min_trade_increment=0.25)}
     plan = pa.compute_allocation(1_000.0, 1_000_000.0, labels,
                                  {"XXX": _pos("XXX", 300.0)}, margin,
-                                 allow_fractional=True, default_bp_factor=1.0)
+                                 allow_fractional=True, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
     assert plan.rows[0].delta_quantity == pytest.approx(3.25)
     impacts = {"XXX": OrderImpact(symbol="XXX", change_in_buying_power=-1_950.0)}
     out = pa.apply_order_impacts(plan, impacts, available_buying_power=975.0,
@@ -1048,7 +1114,8 @@ def test_apply_order_impacts_keeps_the_min_order_size_on_the_re_solve():
                                 min_order_size=2.0)}
     plan = pa.compute_allocation(1_000.0, 1_000_000.0, labels,
                                  {"XXX": _pos("XXX", 300.0)}, margin,
-                                 allow_fractional=True, default_bp_factor=1.0)
+                                 allow_fractional=True, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
     assert plan.rows[0].delta_quantity == pytest.approx(3.3333)
     impacts = {"XXX": OrderImpact(symbol="XXX", change_in_buying_power=-2_000.0)}
     out = pa.apply_order_impacts(plan, impacts, available_buying_power=500.0,
@@ -1063,7 +1130,8 @@ def test_apply_order_impacts_compounds_the_scale_factor_and_keeps_one_reason():
     labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
     plan = pa.compute_allocation(100_000.0, 60_000.0, labels,
                                  {"XXX": _pos("XXX", 100.0)}, {},
-                                 allow_fractional=False, default_bp_factor=1.0)
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
     assert plan.scale_factor == pytest.approx(0.6)
     assert plan.rows[0].delta_quantity == 600.0
     impacts = {"XXX": OrderImpact(symbol="XXX", change_in_buying_power=-120_000.0)}
@@ -1080,7 +1148,8 @@ def test_apply_order_impacts_leaves_a_single_scale_reason_untouched():
     labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
     plan = pa.compute_allocation(10_000.0, 1_000_000.0, labels,
                                  {"XXX": _pos("XXX", 100.0)}, {},
-                                 allow_fractional=False, default_bp_factor=1.0)
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
     assert plan.scale_factor == 1.0
     impacts = {"XXX": OrderImpact(symbol="XXX", change_in_buying_power=-20_000.0)}
     out = pa.apply_order_impacts(plan, impacts, available_buying_power=10_000.0)
@@ -1090,6 +1159,11 @@ def test_apply_order_impacts_leaves_a_single_scale_reason_untouched():
 
 
 # --- CRITICAL 2: a missing base must never be read as "hold nothing" -----------
+#
+# The three guards below all pass a VALID valuation_mode on purpose. The mode check
+# runs FIRST inside compute_allocation and also raises ValueError, so an omitted or
+# typo'd mode would make every one of them pass without ever reaching the money
+# guard they exist to pin.
 
 def test_compute_allocation_refuses_a_none_base_notional():
     """`float(None or 0.0)` used to make this a zero base -- i.e. a target of 0 for
@@ -1099,7 +1173,8 @@ def test_compute_allocation_refuses_a_none_base_notional():
     current = {"XXX": _pos("XXX", 100.0, quantity=100.0, cost_basis=10_000.0)}
     with pytest.raises(ValueError):
         pa.compute_allocation(None, 1_000_000.0, labels, current, {},
-                              allow_fractional=False, default_bp_factor=1.0)
+                              allow_fractional=False, default_bp_factor=1.0,
+                              valuation_mode=pa.VALUATION_MODE_MARKET)
 
 
 def test_compute_allocation_refuses_a_negative_base_notional():
@@ -1108,7 +1183,8 @@ def test_compute_allocation_refuses_a_negative_base_notional():
     labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
     with pytest.raises(ValueError):
         pa.compute_allocation(-1.0, 1_000_000.0, labels, {"XXX": _pos("XXX", 100.0)}, {},
-                              allow_fractional=False, default_bp_factor=1.0)
+                              allow_fractional=False, default_bp_factor=1.0,
+                              valuation_mode=pa.VALUATION_MODE_MARKET)
 
 
 def test_compute_allocation_refuses_a_none_buying_power():
@@ -1116,24 +1192,30 @@ def test_compute_allocation_refuses_a_none_buying_power():
     labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
     with pytest.raises(ValueError):
         pa.compute_allocation(10_000.0, None, labels, {"XXX": _pos("XXX", 100.0)}, {},
-                              allow_fractional=False, default_bp_factor=1.0)
+                              allow_fractional=False, default_bp_factor=1.0,
+                              valuation_mode=pa.VALUATION_MODE_MARKET)
 
 
 def test_compute_allocation_accepts_a_zero_base():
     """Zero is a real answer (a flat, empty account); only None and negative are not."""
     plan = pa.compute_allocation(0.0, 0.0, [], {}, {},
-                                 allow_fractional=False, default_bp_factor=1.0)
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
     assert plan.rows == []
 
 
 def test_compute_label_investment_refuses_a_none_amount_or_buying_power():
+    """Valid mode again, for the same reason: the mode check runs before both money
+    guards and raises the same exception type."""
     label = LabelTarget("A", 100.0, [SymbolTarget("AAA", 100.0)])
     with pytest.raises(ValueError):
         pa.compute_label_investment(label, None, {}, {}, available_buying_power=1_000.0,
-                                    allow_fractional=False, default_bp_factor=1.0)
+                                    allow_fractional=False, default_bp_factor=1.0,
+                                    valuation_mode=pa.VALUATION_MODE_MARKET)
     with pytest.raises(ValueError):
         pa.compute_label_investment(label, 1_000.0, {}, {}, available_buying_power=None,
-                                    allow_fractional=False, default_bp_factor=1.0)
+                                    allow_fractional=False, default_bp_factor=1.0,
+                                    valuation_mode=pa.VALUATION_MODE_MARKET)
 
 
 # --- 3: one shape for "no order", including a precheck rejection ---------------
@@ -1144,7 +1226,8 @@ def test_a_precheck_rejection_is_zeroed_like_every_other_no_order():
     labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
     plan = pa.compute_allocation(10_000.0, 1_000_000.0, labels,
                                  {"XXX": _pos("XXX", 100.0, quantity=5.0, cost_basis=500.0)},
-                                 {}, allow_fractional=False, default_bp_factor=1.0)
+                                 {}, allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
     assert plan.rows[0].delta_quantity == 95.0
     impacts = {"XXX": OrderImpact(symbol="XXX", change_in_buying_power=0.0,
                                   accepted=False, errors=["symbol not tradeable"])}
@@ -1198,7 +1281,8 @@ def test_an_invest_label_plan_records_the_budget_as_its_base_notional():
     label = LabelTarget("A", 100.0, [SymbolTarget("AAA", 100.0)])
     plan = pa.compute_label_investment(label, 7_500.0, {"AAA": _pos("AAA", 100.0)}, {},
                                        available_buying_power=1_000_000.0,
-                                       allow_fractional=False, default_bp_factor=1.0)
+                                       allow_fractional=False, default_bp_factor=1.0,
+                                       valuation_mode=pa.VALUATION_MODE_MARKET)
     assert plan.base_notional == 7_500.0
 
 
@@ -1211,7 +1295,8 @@ def test_a_buy_scaled_below_min_order_size_says_which_rule_stopped_it():
     margin = {"XXX": MarginInfo(symbol="XXX", bp_factor=1.0, min_order_size=5.0)}
     plan = pa.compute_allocation(10_000.0, 200.0, labels,
                                  {"XXX": _pos("XXX", 100.0)}, margin,
-                                 allow_fractional=False, default_bp_factor=1.0)
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
     row = plan.rows[0]
     assert row.delta_quantity == 0.0
     assert row.skipped is True
@@ -1226,7 +1311,8 @@ def test_a_suppressed_row_never_claims_the_position_is_held_and_closed_at_once()
     row = pa.compute_allocation(10_000.0, 1_000_000.0, labels,
                                 {"XXX": _pos("XXX", 100.0, quantity=3.0, cost_basis=300.0)},
                                 margin, allow_fractional=False,
-                                default_bp_factor=1.0).rows[0]
+                                default_bp_factor=1.0,
+                                valuation_mode=pa.VALUATION_MODE_MARKET).rows[0]
     assert row.delta_quantity == 0.0
     assert row.target_quantity == 3.0
     assert "held" not in " ".join(row.reasons)
@@ -1239,7 +1325,8 @@ def test_the_multi_label_reason_does_not_name_the_panel_it_renders_in():
               LabelTarget("HighRisk", 50.0, [SymbolTarget("XXX", 100.0)])]
     plan = pa.compute_allocation(1_000.0, 1_000_000.0, labels,
                                  {"XXX": _pos("XXX", 100.0)}, {},
-                                 allow_fractional=False, default_bp_factor=1.0)
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
     assert "⚠ in ARK26, HighRisk" in plan.rows[0].reasons
     assert not any("also in" in r for r in plan.rows[0].reasons)
 
@@ -1250,7 +1337,8 @@ def test_the_row_carries_the_prechecks_fees_and_warnings():
     labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
     plan = pa.compute_allocation(10_000.0, 1_000_000.0, labels,
                                  {"XXX": _pos("XXX", 100.0)}, {},
-                                 allow_fractional=False, default_bp_factor=1.0)
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
     impacts = {"XXX": OrderImpact(symbol="XXX", change_in_buying_power=-10_000.0,
                                   estimated_fees=1.37,
                                   warnings=["extended hours pricing"])}
@@ -1268,7 +1356,8 @@ def test_an_empty_label_at_zero_percent_warns_about_nothing():
               LabelTarget("EMPTY", 0.0, [])]
     plan = pa.compute_allocation(1_000.0, 1_000_000.0, labels,
                                  {"AAA": _pos("AAA", 100.0)}, {},
-                                 allow_fractional=False, default_bp_factor=1.0)
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
     assert plan.warnings == []
     assert plan.unallocatable_pct == 0.0
 
@@ -1315,7 +1404,8 @@ def test_decision_2_margin_changes_the_cost_of_a_target_not_its_size():
     margin = {"MARG": MarginInfo(symbol="MARG", bp_factor=1.0, marginable=True),
               "NONM": MarginInfo(symbol="NONM", bp_factor=2.0, marginable=False)}
     plan = pa.compute_allocation(100_000.0, 10_000_000.0, labels, current, margin,
-                                 allow_fractional=False, default_bp_factor=2.0)
+                                 allow_fractional=False, default_bp_factor=2.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
     by = {r.symbol: r for r in plan.rows}
     assert plan.scale_factor == 1.0
     assert by["MARG"].delta_quantity == by["NONM"].delta_quantity == 500.0

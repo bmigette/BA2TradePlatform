@@ -3773,11 +3773,12 @@ def get_allocation_config(account_id: int) -> PortfolioAllocationConfig:
     decision 5a). Always returns a row, never ``None``: the page must always be
     able to state which valuation mode produced the numbers on screen.
 
-    Pass the returned ``valuation_mode`` EXPLICITLY to the engine. The engine's
-    own Python defaults deliberately disagree with each other
-    (``compute_base_notional`` defaults to cost, the solvers to market), so
-    relying on a default is how the base and the deltas end up on different
-    definitions of "current value".
+    Pass the returned ``valuation_mode`` to the engine. It has to be passed: all
+    three engine entry points (``compute_base_notional``, ``compute_allocation``,
+    ``compute_label_investment``) take it as a REQUIRED keyword with no default,
+    precisely so the base and the deltas cannot end up on different definitions of
+    "current value". Their defaults used to disagree -- cost for the base, market
+    for the solvers -- and a call site that forgot the keyword got both.
     """
     with get_db() as session:
         row = session.exec(
@@ -6251,18 +6252,22 @@ Spec decision 5a. "How much of my portfolio is in this symbol" has two defensibl
 the mode selects the meaning of *current value* in three places at once — the allocatable base,
 the displayed percentages, and every delta. They must never disagree.
 
-**A wart to be explicit about.** The two engine entry points keep DIFFERENT parameter defaults,
-because each default is that function's already-pinned behaviour and 55 passing tests depend on
-it:
+**A wart to be explicit about — SINCE CLOSED, see amendment 5 below.** The task as written gave
+the three entry points DIFFERENT parameter defaults, because each default was that function's
+already-pinned behaviour and 55 passing tests depended on it:
 
-| Function | Python default | Why |
+| Function | Python default (as written) | Why |
 |---|---|---|
 | `compute_base_notional` | `VALUATION_MODE_COST` | Its pinned behaviour is "buying power + **cost basis** of managed positions" |
 | `compute_allocation` / `compute_label_investment` | `VALUATION_MODE_MARKET` | Their pinned behaviour is `target_quantity - current_quantity`, i.e. shares vs shares, which IS market valuation |
 
+That is a trap, and it was removed before Sections F and G were written: **all three now take
+`valuation_mode` as a REQUIRED keyword with no default.** Build the signatures that way (the
+Step 3 blocks below already show them without defaults) and pass the mode at every call site,
+including in the tests appended by the earlier Section C tasks.
+
 The **DB and page default is `cost`** (spec 5a; `portfolio_allocation_config.valuation_mode`
-defaults to `"cost"`), and the page ALWAYS passes the mode explicitly to all three. Never rely
-on a Python default in live code.
+defaults to `"cost"`), and the page ALWAYS passes the mode explicitly to all three.
 
 **Files:**
 - Modify: `packages/common/ba2_common/core/portfolio_allocation.py`
@@ -6371,20 +6376,46 @@ def test_compute_allocation_rejects_an_unknown_valuation_mode():
                               valuation_mode="marketish")
 
 
-def test_the_python_defaults_match_each_functions_pinned_behaviour():
-    """compute_base_notional defaults to COST; compute_allocation defaults to MARKET.
-    Live code always passes the mode explicitly and relies on neither."""
+def test_all_three_entry_points_require_an_explicit_valuation_mode():
+    """CONTRACT CHANGED: there is no Python default on ANY of the three.
+
+    They used to have defaults that DISAGREED -- ``compute_base_notional`` fell back
+    to cost (its pinned behaviour, "buying power + cost basis") and the two solvers
+    to market (theirs, "shares vs shares") -- and this test pinned exactly that.
+    But the mode picks the meaning of "current value" for the allocatable base, the
+    displayed percentages and every delta AT ONCE, so a call site that forgot the
+    keyword got a cost base and market deltas: no exception, no warning, just wrong
+    money. Since no single default is right for every caller, none of them has one
+    and the omission is a TypeError at the call site instead.
+    """
     current = {"AAA": _pos("AAA", 200.0, quantity=10.0, cost_basis=900.0)}
-    assert pa.compute_base_notional(0.0, current, ["AAA"]) == 900.0
     labels = [LabelTarget("A", 100.0, [SymbolTarget("AAA", 100.0)])]
-    plan = pa.compute_allocation(2_000.0, 1_000_000.0, labels, current, {},
-                                 allow_fractional=False, default_bp_factor=1.0)
-    assert plan.rows[0].delta_quantity == 0.0    # market: 2000/200 = 10 shares, already held
+    with pytest.raises(TypeError):
+        pa.compute_base_notional(0.0, current, ["AAA"])
+    with pytest.raises(TypeError):
+        pa.compute_allocation(2_000.0, 1_000_000.0, labels, current, {},
+                              allow_fractional=False, default_bp_factor=1.0)
+    with pytest.raises(TypeError):
+        pa.compute_label_investment(labels[0], 1_000.0, current, {},
+                                    available_buying_power=1_000_000.0,
+                                    allow_fractional=False, default_bp_factor=1.0)
 ```
+
+**Also, in the same step:** every call to the three entry points already in the test file from
+Tasks 16-24 is BARE and will now raise `TypeError`. Add an explicit `valuation_mode=` to each —
+`VALUATION_MODE_COST` for the three `compute_base_notional` asserts (their numbers are cost-basis
+arithmetic: `5_000 + 900`, `10_000 + 1_500`) and `VALUATION_MODE_MARKET` for the
+`compute_allocation` / `compute_label_investment` calls (which is what their assertions were
+silently getting). One of them is genuinely mode-sensitive:
+`test_held_below_target_produces_a_top_up_buy` asserts a delta of **80** and is the MARKET half
+of the fixture `test_cost_mode_sizes_the_top_up_off_the_purchase_value_not_the_share_count` uses
+for **82** — pass `VALUATION_MODE_MARKET` there or it breaks. The guard tests
+(`refuses_a_none_base_notional` and friends) must pass a VALID mode: the mode check runs FIRST
+and raises the same `ValueError`, so an omitted one would make them pass for the wrong reason.
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `venv/bin/python -m pytest packages/common/tests/test_portfolio_allocation.py -v -k "current_value or valuation_mode or cost_mode or market_mode or python_defaults or base_notional_in_market"`
+Run: `venv/bin/python -m pytest packages/common/tests/test_portfolio_allocation.py -v -k "current_value or valuation_mode or cost_mode or market_mode or explicit_valuation_mode or base_notional_in_market"`
 
 Expected: FAIL — `12 failed`, including
 ```
@@ -6450,7 +6481,7 @@ def round_delta_quantity(delta_notional: float, price: float,
 def compute_base_notional(available_buying_power: float,
                           current: Dict[str, PositionState],
                           managed_symbols: List[str],
-                          *, valuation_mode: str = VALUATION_MODE_COST) -> float:
+                          *, valuation_mode: str) -> float:
     """Allocatable base = broker buying power + current value of MANAGED positions.
 
     Decision 1 of the design; ``valuation_mode`` (decision 5a) selects whether
@@ -6459,12 +6490,13 @@ def compute_base_notional(available_buying_power: float,
     ``available_buying_power`` naturally. Symbols in ``managed_symbols`` with no
     ``current`` entry contribute 0; a repeated symbol is counted once.
 
-    The Python default is ``cost``, this function's pinned behaviour. Live code
-    passes the account's configured mode EXPLICITLY and relies on no default.
+    ``valuation_mode`` is REQUIRED and has NO Python default -- see the note on
+    ``compute_allocation``. Pass the account's configured mode.
 
     Raises:
         ValueError: if ``available_buying_power`` is None (no fallback for
         balances), or if ``valuation_mode`` is unknown.
+        TypeError: if ``valuation_mode`` is omitted.
     """
     if available_buying_power is None:
         raise ValueError("compute_base_notional: available_buying_power is None")
@@ -6491,18 +6523,16 @@ def compute_allocation(base_notional: float, available_buying_power: float,
                        labels: List[LabelTarget], current: Dict[str, PositionState],
                        margin: Dict[str, MarginInfo], *, allow_fractional: bool,
                        default_bp_factor: float,
-                       valuation_mode: str = VALUATION_MODE_MARKET) -> AllocationPlan:
+                       valuation_mode: str) -> AllocationPlan:
 ```
 
 Add this paragraph to its docstring, immediately after the `default_bp_factor:` argument line:
 
 ```
-        valuation_mode: ``cost`` or ``market`` (decision 5a). ``market`` targets
-            a SHARE COUNT (``target_notional / price``) and deltas against the
-            held quantity; ``cost`` targets a PURCHASE VALUE and deltas against
-            ``cost_basis``. The Python default is ``market`` -- this function's
-            pinned behaviour -- but live code always passes the account's
-            configured mode explicitly.
+        valuation_mode: ``cost`` or ``market`` (decision 5a), REQUIRED. ``market``
+            targets a SHARE COUNT (``target_notional / price``) and deltas against
+            the held quantity; ``cost`` targets a PURCHASE VALUE and deltas against
+            ``cost_basis``. Pass the same mode used to build ``base_notional``.
 ```
 
 Add this guard as the FIRST statement of the function body, above `current = current or {}`:
@@ -6585,7 +6615,7 @@ def compute_label_investment(label: LabelTarget, amount: float,
                              margin: Dict[str, MarginInfo], *,
                              available_buying_power: float, allow_fractional: bool,
                              default_bp_factor: float,
-                             valuation_mode: str = VALUATION_MODE_MARKET) -> AllocationPlan:
+                             valuation_mode: str) -> AllocationPlan:
 ```
 
 and add this line to its docstring, at the end:
@@ -6704,6 +6734,47 @@ Five test gaps closed, three of which had surviving mutants: the
 `sell_rows` ordering, decision 2 (margin changes a target's COST, not its SIZE),
 never-short in both modes and against a pre-existing short, and `market_value` being
 display-only. All five mutations are now killed.
+
+**FOURTH COMMIT — `valuation_mode` is now REQUIRED on all three entry points.**
+Closed before Sections F and G were written, i.e. before there was a single caller
+to break.
+
+5. **The three Python defaults deliberately disagreed, and that was the bug.**
+   `compute_base_notional` defaulted to `cost` and `compute_allocation` /
+   `compute_label_investment` to `market`, each matching its own historically-pinned
+   behaviour (the "wart" table at the top of this task). But the mode selects the
+   meaning of "current value" in THREE places at once — the allocatable base, the
+   displayed percentages and every delta — and they must never disagree. One call
+   site that forgot the keyword would get a **cost base with market deltas**: no
+   exception, no warning, just wrong money on a page that submits real orders.
+   All three now take `valuation_mode` as a **required keyword-only argument with
+   no default**; omitting it is a `TypeError` at the call site. There is no default
+   that is right for every caller, so there is no default at all.
+   *Test rewritten:* `test_the_python_defaults_match_each_functions_pinned_behaviour`
+   existed only to pin the disagreement; it is now
+   `test_all_three_entry_points_require_an_explicit_valuation_mode`, which asserts
+   the `TypeError` on all three. Count unchanged at `127 passed`.
+   *Every other call site in the file gained an explicit mode:* `VALUATION_MODE_COST`
+   for the three `compute_base_notional` asserts (their numbers are cost-basis
+   arithmetic and would be wrong under market), `VALUATION_MODE_MARKET` everywhere
+   else. Only ONE behavioural test was genuinely mode-sensitive —
+   `test_held_below_target_produces_a_top_up_buy` asserts a delta of 80, the MARKET
+   half of the same fixture `test_cost_mode_sizes_the_top_up_off_the_purchase_value_not_the_share_count`
+   uses for 82 — every other holding in the file happens to sit at `avg_cost ==
+   price` or hits the zero-target close branch, where the two modes agree. The
+   `refuses_a_none_*` guards now pass a VALID mode on purpose: the mode check runs
+   first and raises the same `ValueError`, so a bare call would have made them pass
+   for the wrong reason.
+   `portfolio_allocation_store.get_allocation_config`'s docstring, which described
+   the disagreement as a live hazard, was updated to describe the fix.
+
+**Still open, for whoever writes Sections F and G.** Two functions those sections
+introduce carry a `valuation_mode` default of their own — `build_base_snapshot`
+(Task 68) and `build_label_views` (Task 66), both `VALUATION_MODE_COST`. Each
+default matches the DB default so neither can produce the cost-base/market-delta
+split above, but both are the same SHAPE of omission-degrades-silently. Decide
+deliberately rather than by inheritance. Separately, `apply_order_impacts`'
+`margin=None` is a live instance of that shape: see the note on Task 69.
 
 ---
 
@@ -16111,6 +16182,9 @@ Pure-testable: all of it. Eyeball-only: nothing.
 `BaseSnapshot` wrapper that carries the split, the conservative `default_bp_factor` and the
 timestamp the wizard displays.
 
+Note that `compute_base_notional`'s `valuation_mode` is a REQUIRED keyword with no default
+(Task 25, amendment 5) — every call below passes one, including in the tests.
+
 **Files:**
 - Modify: `packages/common/ba2_common/core/portfolio_allocation.py` (append at end of file)
 - Test: `packages/common/tests/test_portfolio_allocation_wizard.py` (create)
@@ -16147,7 +16221,10 @@ def test_base_notional_adds_cost_basis_of_managed_positions_only():
         "TSLA": PositionState(symbol="TSLA", quantity=3, cost_basis=900.0, price=300.0),
     }
     # TSLA is held but NOT managed -> it must not inflate the base.
-    base = compute_base_notional(10_000.0, current, ["AAPL", "MSFT"])
+    # valuation_mode is REQUIRED (no default, see the Task 25 amendment) and COST is
+    # what 1500 + 2000 is: at market those two positions are 1600 + 2050.
+    base = compute_base_notional(10_000.0, current, ["AAPL", "MSFT"],
+                                 valuation_mode=VALUATION_MODE_COST)
     assert base == pytest.approx(13_500.0)
 
 
@@ -16726,6 +16803,19 @@ def precheck_plan(account, plan: AllocationPlan, *, available_buying_power: floa
     logger.info(f"Allocation precheck returned {len(impacts)} broker impact(s); re-solving")
     return apply_order_impacts(plan, impacts, available_buying_power=available_buying_power)
 ```
+
+> **OPEN QUESTION — `apply_order_impacts(margin=...)` is omitted here, and that is not free.**
+> The engine's own docstring says "Pass the SAME `margin` dict the plan was solved with:
+> without it the re-solve rebuilds a bare `MarginInfo` for each fractional row and so rounds
+> on the default 4dp grid, losing `min_trade_increment` and `min_order_size` — a broker-side
+> rejection waiting to happen." `precheck_plan` as written above does not take a `margin`
+> dict, so it cannot pass one; the caller already has it (it fetched it for the solve). Two
+> engine tests, `test_apply_order_impacts_keeps_the_min_trade_increment_on_the_re_solve` and
+> `..._keeps_the_min_order_size_on_the_re_solve`, exist precisely because this degrades
+> silently. Before implementing, decide: thread `margin` through `precheck_plan` and pass it,
+> and/or make the engine's `margin` parameter required. Same shape as the `valuation_mode`
+> trap closed in the Task 25 amendment — an omission that produces a plausible-looking wrong
+> answer instead of an error.
 
 The module-level import of `plan_quantity_attempts` / `FRACTIONAL_PATH_WHOLE` /
 `decide_symbol_action` / `split_delta_fifo` / the `ACTION_*` constants anticipates Tasks 72-73;

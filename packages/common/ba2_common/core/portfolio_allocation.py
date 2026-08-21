@@ -583,7 +583,7 @@ def validate_label_targets(labels: List[LabelTarget], *,
 def compute_base_notional(available_buying_power: float,
                           current: Dict[str, PositionState],
                           managed_symbols: List[str],
-                          *, valuation_mode: str = VALUATION_MODE_COST) -> float:
+                          *, valuation_mode: str) -> float:
     """Allocatable base = broker buying power + current value of MANAGED positions.
 
     Decision 1 of the design; ``valuation_mode`` (decision 5a) selects whether
@@ -592,12 +592,13 @@ def compute_base_notional(available_buying_power: float,
     ``available_buying_power`` naturally. Symbols in ``managed_symbols`` with no
     ``current`` entry contribute 0; a repeated symbol is counted once.
 
-    The Python default is ``cost``, this function's pinned behaviour. Live code
-    passes the account's configured mode EXPLICITLY and relies on no default.
+    ``valuation_mode`` is REQUIRED and has NO Python default -- see the note on
+    ``compute_allocation``. Pass the account's configured mode.
 
     Raises:
         ValueError: if ``available_buying_power`` is None (no fallback for
         balances), or if ``valuation_mode`` is unknown.
+        TypeError: if ``valuation_mode`` is omitted.
     """
     if available_buying_power is None:
         raise ValueError("compute_base_notional: available_buying_power is None")
@@ -711,8 +712,20 @@ def compute_allocation(base_notional: float, available_buying_power: float,
                        labels: List[LabelTarget], current: Dict[str, PositionState],
                        margin: Dict[str, MarginInfo], *, allow_fractional: bool,
                        default_bp_factor: float,
-                       valuation_mode: str = VALUATION_MODE_MARKET) -> AllocationPlan:
+                       valuation_mode: str) -> AllocationPlan:
     """Solve a full REBALANCE: every managed label, buys and sells.
+
+    ``valuation_mode`` is REQUIRED on all three entry points
+    (``compute_base_notional``, this, and ``compute_label_investment``) and NONE of
+    them has a Python default. They used to have defaults that DISAGREED -- the
+    base fell back to ``cost`` and the two solvers to ``market``, each matching its
+    own historically-pinned behaviour -- so a single call site that forgot the
+    keyword measured its base one way and its deltas another. The mode selects the
+    meaning of "current value" in three places at once (the allocatable base, the
+    displayed percentages, and every delta) and they must never disagree; a
+    ``TypeError`` at the call site is the only version of that mistake anyone ever
+    sees. There is no default that would be right for every caller, so there is no
+    default at all.
 
     Args:
         base_notional: the allocatable base from ``compute_base_notional``. MUST be
@@ -728,12 +741,10 @@ def compute_allocation(base_notional: float, available_buying_power: float,
         allow_fractional: opt-in per run (decision 12).
         default_bp_factor: conservative fallback == the account margin multiplier
             (assume no leverage); under-deploys rather than over-commits.
-        valuation_mode: ``cost`` or ``market`` (decision 5a). ``market`` targets
-            a SHARE COUNT (``target_notional / price``) and deltas against the
-            held quantity; ``cost`` targets a PURCHASE VALUE and deltas against
-            ``cost_basis``. The Python default is ``market`` -- this function's
-            pinned behaviour -- but live code always passes the account's
-            configured mode explicitly.
+        valuation_mode: ``cost`` or ``market`` (decision 5a), REQUIRED. ``market``
+            targets a SHARE COUNT (``target_notional / price``) and deltas against
+            the held quantity; ``cost`` targets a PURCHASE VALUE and deltas against
+            ``cost_basis``. Pass the same mode used to build ``base_notional``.
 
     Behaviour on degenerate DATA (records a reason, never raises -- contrast the
     degenerate MONEY inputs under Raises, which must never be guessed at):
@@ -767,6 +778,7 @@ def compute_allocation(base_notional: float, available_buying_power: float,
         with the ``valuation_mode`` every number in it was measured in.
 
     Raises:
+        TypeError: if ``valuation_mode`` is omitted (it has no default).
         ValueError: on an unknown ``valuation_mode``; on a ``None`` or NEGATIVE
         ``base_notional``; or on a ``None`` ``available_buying_power``. These are
         money inputs and there is no fallback for them (platform rule): a base
@@ -911,7 +923,7 @@ def compute_label_investment(label: LabelTarget, amount: float,
                              margin: Dict[str, MarginInfo], *,
                              available_buying_power: float, allow_fractional: bool,
                              default_bp_factor: float,
-                             valuation_mode: str = VALUATION_MODE_MARKET) -> AllocationPlan:
+                             valuation_mode: str) -> AllocationPlan:
     """Solve an INVEST_LABEL run: put ``amount`` into ONE label. Buys only.
 
     ``amount`` is split by the label's symbol weights. ``label.target_pct`` is
@@ -930,11 +942,14 @@ def compute_label_investment(label: LabelTarget, amount: float,
     ``valuation_mode`` is accepted for call-site symmetry and validated, and is
     RECORDED on the returned plan, but does not change the arithmetic: an
     INVEST_LABEL run ADDS a budget on top of the existing position rather than
-    rebalancing towards a target value.
+    rebalancing towards a target value. It is REQUIRED and has NO default anyway
+    (see ``compute_allocation``): the plan is STAMPED with it, and a plan stamped
+    with a mode nobody chose cannot be read back correctly six months later.
 
     The returned plan's ``base_notional`` is the BUDGET, not an allocatable base.
 
     Raises:
+        TypeError: if ``valuation_mode`` is omitted (it has no default).
         ValueError: on an unknown ``valuation_mode``, or on a ``None`` ``amount``
         or ``available_buying_power`` -- money inputs have no fallback, and a
         budget silently coerced to zero would report "nothing to do" for what was

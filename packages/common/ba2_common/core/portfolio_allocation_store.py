@@ -287,11 +287,12 @@ def get_allocation_config(account_id: int) -> PortfolioAllocationConfig:
     decision 5a). Always returns a row, never ``None``: the page must always be
     able to state which valuation mode produced the numbers on screen.
 
-    Pass the returned ``valuation_mode`` EXPLICITLY to the engine. The engine's
-    own Python defaults deliberately disagree with each other
-    (``compute_base_notional`` defaults to cost, the solvers to market), so
-    relying on a default is how the base and the deltas end up on different
-    definitions of "current value".
+    Pass the returned ``valuation_mode`` to the engine. It has to be passed: all
+    three engine entry points (``compute_base_notional``, ``compute_allocation``,
+    ``compute_label_investment``) take it as a REQUIRED keyword with no default,
+    precisely so the base and the deltas cannot end up on different definitions of
+    "current value". Their defaults used to disagree -- cost for the base, market
+    for the solvers -- and a call site that forgot the keyword got both.
     """
     with get_db() as session:
         row = session.exec(
