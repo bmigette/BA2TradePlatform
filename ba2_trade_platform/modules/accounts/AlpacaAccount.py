@@ -16,9 +16,11 @@ from ...core.models import TradingOrder, Position, Transaction
 from ...core.types import OrderDirection, OrderStatus, OrderOpenType, OrderType as CoreOrderType, TransactionStatus
 from ...core.interfaces import AccountInterface
 from ...core.account_types import (
-    AccountSnapshot, CashTransfer, MarginInfo, MarketHours,
+    AccountSnapshot, CashTransfer, MarginInfo, MarketHours, FractionalPreview,
     CASH_TRANSFER_DEPOSIT, CASH_TRANSFER_WITHDRAWAL, CASH_TRANSFER_DIVIDEND,
     MARGIN_SOURCE_ASSET, MARKET_HOURS_SOURCE_BROKER,
+    FRACTIONAL_OUTCOME_WHOLE, FRACTIONAL_OUTCOME_KEPT, FRACTIONAL_OUTCOME_FLOORED,
+    FRACTIONAL_OUTCOME_SKIPPED, FRACTIONAL_OUTCOME_REJECTED,
 )
 import pytz
 from ...core.interfaces.OptionsAccountInterface import OptionsAccountInterface
@@ -54,6 +56,94 @@ def _to_market_utc(value: Optional[datetime]) -> Optional[datetime]:
     if value.tzinfo is None:
         return _MARKET_TZ.localize(value).astimezone(pytz.utc)
     return value.astimezone(pytz.utc)
+
+
+def plan_fractional_submission(symbol: str, quantity: float, order_type_value: str,
+                               use_complex_order: bool = False,
+                               fractionable: Optional[bool] = None) -> FractionalPreview:
+    """Alpaca's fractional-quantity rule, as a pure function. THE single definition.
+
+    Both callers share it on purpose: `_submit_order_impl` (which then performs the
+    logging and the DB write) and `AlpacaAccount.preview_fractional_submission` (which
+    hands the answer to the allocation dry run). Because it is the same function, the
+    dry run cannot promise 2.5 shares and then have the submission cancel the row.
+
+    ALPACA-INTERNAL. Nothing outside this module calls it.
+
+    The rule, in precedence order -- the same order the submission path applies it:
+
+    1. A whole quantity is nothing to do.
+    2. Every NON plain-market request refuses a fraction outright: limit, stop,
+       stop-limit, and a MARKET order routed through the wash-trade escape, which goes
+       to Alpaca re-classed as BRACKET/OTO. Those are FLOORED before the request is even
+       built -- nothing fractional is ever put on the wire, and flooring under-fills
+       rather than overspending the target. A floor of 0 is a SKIP: nothing is sent,
+       nothing was rejected, and nothing is wrong with the account.
+    3. On a plain market order the fraction stands, and Alpaca then requires DAY -- see
+       requires_day_tif. If the broker does not make this SYMBOL fractionable
+       (`Asset.fractionable`, alpaca/trading/models.py:65) the fraction reaches the wire
+       and is REFUSED; the dry run says so instead of letting an ERROR row explain it
+       afterwards.
+
+    Every quantity here is a QUANTITY IN SHARES. No branch produces a dollar-value order.
+
+    Args:
+        symbol: the instrument, for the human-readable strings.
+        quantity: the quantity as sized (may be fractional).
+        order_type_value: the CORE OrderType value, lower-cased ("market", "buy_limit"...).
+        use_complex_order: the wash-trade escape, which re-classes the request.
+        fractionable: the broker's per-symbol flag; None means UNKNOWN and is treated as
+            permissive, matching what the submission path did before this function
+            existed. Never coerce an unknown to False.
+
+    Returns:
+        FractionalPreview: what would actually happen, including the exact sentence to
+        log, display and persist.
+    """
+    qty = float(quantity or 0.0)
+    if qty == int(qty):
+        return FractionalPreview(symbol=symbol, requested_quantity=qty,
+                                 submit_quantity=qty, outcome=FRACTIONAL_OUTCOME_WHOLE,
+                                 fractionable=fractionable)
+
+    is_plain_market = (order_type_value == CoreOrderType.MARKET.value.lower()
+                       and not use_complex_order)
+    if not is_plain_market:
+        whole_shares = float(math.floor(qty))
+        as_complex = (" order submitted as a complex (BRACKET/OTO) order"
+                      if use_complex_order else " order")
+        constraint = (f"fractional qty {qty} is not accepted by Alpaca on a "
+                      f"{order_type_value}{as_complex}")
+        if whole_shares <= 0:
+            return FractionalPreview(
+                symbol=symbol, requested_quantity=qty, submit_quantity=None,
+                outcome=FRACTIONAL_OUTCOME_SKIPPED, fractionable=fractionable,
+                constraint=constraint,
+                reason=f"skipped: {constraint}; flooring leaves 0 whole shares")
+        return FractionalPreview(
+            symbol=symbol, requested_quantity=qty, submit_quantity=whole_shares,
+            outcome=FRACTIONAL_OUTCOME_FLOORED, fractionable=fractionable,
+            constraint=constraint,
+            reason=f"{constraint}; floored to {whole_shares} whole shares")
+
+    if fractionable is False:
+        constraint = f"Alpaca does not make {symbol} fractionable"
+        return FractionalPreview(
+            symbol=symbol, requested_quantity=qty, submit_quantity=qty,
+            outcome=FRACTIONAL_OUTCOME_REJECTED, requires_day_tif=True,
+            fractionable=False, constraint=constraint,
+            reason=(f"{constraint}; a fractional qty {qty} would be refused by the broker "
+                    f"— size this symbol in whole shares"))
+
+    if fractionable is True:
+        reason = f"fractional qty {qty} is accepted on a plain DAY market order"
+    else:
+        reason = (f"fractional qty {qty} is accepted on a plain DAY market order "
+                  f"(Alpaca's fractionable flag for {symbol} is unknown)")
+    return FractionalPreview(
+        symbol=symbol, requested_quantity=qty, submit_quantity=qty,
+        outcome=FRACTIONAL_OUTCOME_KEPT, requires_day_tif=True,
+        fractionable=fractionable, reason=reason)
 
 
 def alpaca_api_retry(func):
@@ -1088,72 +1178,53 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             from ...core.types import OrderType as CoreOrderType
 
             # ---- Fractional quantities -----------------------------------------------
-            # Alpaca accepts a fractional quantity ONLY on a DAY MARKET order. Two traps:
+            # THE RULE LIVES IN ONE PLACE: plan_fractional_submission() at module level,
+            # which is the SAME function the allocation dry run reaches through
+            # preview_fractional_submission(). Everything below is side effects --
+            # logging, and writing the adjustment back onto the row -- and no arithmetic,
+            # precisely so that what the dry run promised and what is submitted cannot
+            # drift apart.
             #
-            #  1. tif_map above resolves an unknown/absent good_for to GTC, and the
-            #     allocation actions build their orders with no good_for at all — so a
-            #     fractional order would go out GTC and be refused by the broker. Force
-            #     DAY rather than trusting every future caller to remember.
-            #  2. Every non-MARKET type (limit / stop / stop-limit / OCO) refuses
-            #     fractional outright — including a protective TP/SL leg whose quantity
-            #     was inherited from a fractional position. Those are pre-floored to
-            #     floor(qty) whole shares and submitted ONCE (this is NOT a retry —
-            #     nothing fractional is ever put on the wire): it is a guaranteed
-            #     rejection otherwise, and flooring under-fills rather than overspending
-            #     the target. The floored quantity is written back so the ledger matches
-            #     what the broker got.
-            #     `use_complex_order` (the wash-trade escape) belongs on this branch even
-            #     for a MARKET order: it re-classes the request as BRACKET/OTO, and
-            #     Alpaca refuses a fractional quantity on those too.
-            #
-            # A floor of 0 leaves nothing to send. That is a SKIP, not a failure —
-            # nothing was rejected and nothing is wrong with the account — so the row is
-            # marked CANCELED with the reason, never ERROR.
-            #
-            # Sizing itself is NOT re-derived here: the allocation engine already decided
-            # fractional-vs-whole (opt-in per run, gated on the broker's own per-symbol
-            # `fractionable` flag) and did the rounding. This is submission-time
-            # enforcement of a broker constraint only.
+            # `fractionable` is deliberately NOT looked up here. The allocation engine
+            # already gated sizing on the broker's per-symbol flag
+            # (MarginInfo.fractionable), and an asset round-trip on the hot order path
+            # would buy nothing. Passing it as unknown reproduces exactly the behaviour
+            # this method had before the rule was extracted.
             quantity_value = float(trading_order.quantity or 0.0)
-            if quantity_value != int(quantity_value):
-                is_plain_market = (order_type_value == CoreOrderType.MARKET.value.lower()
-                                   and not use_complex_order)
-                if is_plain_market:
-                    if time_in_force != TimeInForce.DAY:
-                        logger.info(
-                            f"Order {trading_order.id} ({trading_order.symbol}) has fractional "
-                            f"qty={quantity_value}; forcing time_in_force DAY (was "
-                            f"{time_in_force.value}) — Alpaca rejects fractional on any other TIF"
-                        )
-                        time_in_force = TimeInForce.DAY
-                else:
-                    whole_shares = float(math.floor(quantity_value))
-                    as_complex = (" order submitted as a complex (BRACKET/OTO) order"
-                                  if use_complex_order else " order")
-                    reason = (f"fractional qty {quantity_value} is not accepted by Alpaca on a "
-                              f"{order_type_value}{as_complex}")
-                    if whole_shares <= 0:
-                        logger.warning(
-                            f"Order {trading_order.id} ({trading_order.symbol}) skipped: "
-                            f"{reason}, and flooring leaves 0 whole shares — nothing submitted"
-                        )
-                        self._record_fractional_adjustment(
-                            trading_order, None,
-                            f"skipped: {reason}; flooring leaves 0 whole shares")
-                        return None
-                    # Name the CONSEQUENCE, not just the arithmetic: a protective leg
-                    # floored off a fractional parent covers less than the position, and
-                    # this line is the only place that ever gets said.
-                    logger.warning(
-                        f"Order {trading_order.id} ({trading_order.symbol}): {reason}; "
-                        f"submitting {whole_shares} whole shares instead of {quantity_value}; "
-                        f"{quantity_value - whole_shares:g} shares of the position are "
-                        f"left uncovered"
-                    )
-                    trading_order.quantity = whole_shares
-                    self._record_fractional_adjustment(
-                        trading_order, whole_shares,
-                        f"{reason}; floored to {whole_shares} whole shares")
+            fractional = plan_fractional_submission(
+                trading_order.symbol, quantity_value, order_type_value,
+                use_complex_order=use_complex_order)
+
+            if fractional.outcome == FRACTIONAL_OUTCOME_SKIPPED:
+                logger.warning(
+                    f"Order {trading_order.id} ({trading_order.symbol}) skipped: "
+                    f"{fractional.constraint}, and flooring leaves 0 whole shares — "
+                    f"nothing submitted"
+                )
+                self._record_fractional_adjustment(
+                    trading_order, None, fractional.reason)
+                return None
+            if fractional.outcome == FRACTIONAL_OUTCOME_FLOORED:
+                whole_shares = fractional.submit_quantity
+                # Name the CONSEQUENCE, not just the arithmetic: a protective leg
+                # floored off a fractional parent covers less than the position, and
+                # this line is the only place that ever gets said.
+                logger.warning(
+                    f"Order {trading_order.id} ({trading_order.symbol}): "
+                    f"{fractional.constraint}; submitting {whole_shares} whole shares "
+                    f"instead of {quantity_value}; {quantity_value - whole_shares:g} "
+                    f"shares of the position are left uncovered"
+                )
+                trading_order.quantity = whole_shares
+                self._record_fractional_adjustment(
+                    trading_order, whole_shares, fractional.reason)
+            elif fractional.requires_day_tif and time_in_force != TimeInForce.DAY:
+                logger.info(
+                    f"Order {trading_order.id} ({trading_order.symbol}) has fractional "
+                    f"qty={quantity_value}; forcing time_in_force DAY (was "
+                    f"{time_in_force.value}) — Alpaca rejects fractional on any other TIF"
+                )
+                time_in_force = TimeInForce.DAY
 
             # Note: We do NOT create bracket orders. TP/SL will be handled separately
             # as STOP_LIMIT orders after the entry order fills.
@@ -2187,6 +2258,45 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             out[symbol] = margin_info
 
         return out
+
+    def preview_fractional_submission(self, symbol: str, quantity: float,
+                                      order_type: Any = CoreOrderType.MARKET,
+                                      use_complex_order: bool = False) -> FractionalPreview:
+        """What Alpaca would do with this quantity, computed BEFORE anything is sent.
+
+        ALPACA-INTERNAL (contract 1.10). There is no interface default for this and no
+        `getattr` guard is needed anywhere, because nothing outside AlpacaAccount calls
+        it. The cross-broker eligibility channel is `MarginInfo.fractionable`.
+
+        The allocation dry run's window into the submission path: it calls the same
+        `plan_fractional_submission()` that `_submit_order_impl` calls, so a row the
+        wizard reports as "2.5 shares" cannot come back as a silently CANCELED order.
+
+        The one fact this knows and the submission path does not is the broker's
+        per-symbol `Asset.fractionable` flag, read through the shared asset cache
+        (`get_fractionability`, one bulk call for a whole basket). A symbol the broker
+        cannot describe yields ``fractionable=None`` -- UNKNOWN, never coerced to False.
+
+        Args:
+            symbol: the instrument; normalised here (.strip().upper()).
+            quantity: the quantity as sized, fractional or not. Shares, never dollars.
+            order_type: the core OrderType enum, or its lower-case string value.
+            use_complex_order: True when the wash-trade escape will re-class the request
+                as BRACKET/OTO, which refuses fractions even on a market order.
+
+        Returns:
+            FractionalPreview: the outcome, the quantity that would really trade, and the
+            sentence to show the operator.
+        """
+        if hasattr(order_type, 'value'):
+            order_type_value = str(order_type.value).lower()
+        else:
+            order_type_value = str(order_type).lower()
+        normalised = (symbol or '').strip().upper()
+        fractionable = self.get_fractionability([normalised]).get(normalised)
+        return plan_fractional_submission(
+            normalised, quantity, order_type_value,
+            use_complex_order=use_complex_order, fractionable=fractionable)
 
     def clear_asset_cache(self) -> None:
         """Drop every cached raw Asset so the next lookup refetches.

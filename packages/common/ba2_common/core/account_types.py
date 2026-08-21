@@ -335,3 +335,71 @@ class MarketHours:
         submit gate treats both as not-open; only the copy differs.
         """
         return self.source != MARKET_HOURS_SOURCE_UNAVAILABLE
+
+
+# What a broker would actually do with a fractional order quantity. PLAIN str, like
+# the CASH_TRANSFER_*, MARGIN_SOURCE_* and MARKET_HOURS_SOURCE_* families above;
+# always use the constant.
+#
+# ALPACA-INTERNAL. These and FractionalPreview below live here only because
+# account_types.py is where this codebase keeps its cross-layer value objects; no
+# non-Alpaca code reads them. The cross-broker per-symbol eligibility carrier is
+# MarginInfo.fractionable.
+FRACTIONAL_OUTCOME_WHOLE = "whole"        # nothing fractional about it
+FRACTIONAL_OUTCOME_KEPT = "kept"          # the fraction reaches the broker as sized
+FRACTIONAL_OUTCOME_FLOORED = "floored"    # floored to whole shares BEFORE submission
+FRACTIONAL_OUTCOME_SKIPPED = "skipped"    # floors to 0: nothing is sent at all
+FRACTIONAL_OUTCOME_REJECTED = "rejected"  # the fraction would reach the broker and be refused
+
+
+@dataclass(frozen=True)
+class FractionalPreview:
+    """What a broker would do with one order quantity, computed BEFORE submitting.
+
+    Exists so the allocation dry run can state the truth about rounding instead of
+    discovering it from a rejection or a silently CANCELED row. Roughly a quarter of a
+    real book is not fractionable, so mixed eligibility is the normal case.
+
+    ``submit_quantity`` is what would actually reach the broker: equal to
+    ``requested_quantity`` for WHOLE and KEPT, the floored share count for FLOORED,
+    ``None`` for SKIPPED (nothing is sent), and the unchanged fraction for REJECTED
+    (it is sent, and refused). It is always a QUANTITY IN SHARES -- there is no
+    dollar-denominated order anywhere in this codebase.
+
+    ``fractionable`` is TRI-STATE, exactly like ``MarginInfo.fractionable``. ``None``
+    means the broker did not say -- never coerce it to ``False``: a fabricated
+    ``False`` makes the dry run promise a whole-share rounding that will not happen,
+    and a fabricated ``True`` promises a fraction the broker then refuses. This is a
+    LOCAL copy of the flag because a preview is a submission-planning object, not a
+    cross-boundary carrier; ``MarginInfo.fractionable`` remains the one flag that
+    crosses module boundaries.
+
+    ``constraint`` is the bare broker rule that was hit ("fractional qty 4.25 is not
+    accepted by Alpaca on a sell_limit order"); ``reason`` is the full sentence shown to
+    the operator and persisted on the order row, and it INCLUDES the constraint.
+
+    FROZEN: previews are handed to the UI and to the submission path; an in-place edit
+    would let one reader change what another was promised.
+    """
+    symbol: str
+    requested_quantity: float
+    submit_quantity: Optional[float]
+    outcome: str
+    requires_day_tif: bool = False
+    fractionable: Optional[bool] = None
+    constraint: Optional[str] = None
+    reason: Optional[str] = None
+
+    @property
+    def will_submit(self) -> bool:
+        """False only when nothing at all reaches the broker (the SKIP case)."""
+        return self.outcome != FRACTIONAL_OUTCOME_SKIPPED
+
+    @property
+    def is_adjusted(self) -> bool:
+        """True when the quantity the caller asked for is not the quantity that trades.
+
+        This is the flag a dry run counts to decide how prominent the rounding warning
+        has to be.
+        """
+        return self.outcome in (FRACTIONAL_OUTCOME_FLOORED, FRACTIONAL_OUTCOME_SKIPPED)

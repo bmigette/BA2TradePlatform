@@ -378,3 +378,51 @@ def test_is_open_is_REQUIRED_so_no_adapter_can_half_fill_this_into_an_open():
 
     with pytest.raises(TypeError):
         MarketHours()
+
+
+# ---------------------------------------------------------------------------
+# FractionalPreview -- what the broker would actually do with a quantity
+# ---------------------------------------------------------------------------
+
+def test_fractional_preview_defaults_say_nothing_was_adjusted():
+    from ba2_common.core.account_types import (
+        FRACTIONAL_OUTCOME_WHOLE, FractionalPreview,
+    )
+
+    preview = FractionalPreview(symbol="AAPL", requested_quantity=3.0,
+                                submit_quantity=3.0, outcome=FRACTIONAL_OUTCOME_WHOLE)
+
+    assert preview.requires_day_tif is False
+    assert preview.fractionable is None      # unknown, NOT "not fractionable"
+    assert preview.reason is None
+    assert preview.constraint is None
+    assert preview.is_adjusted is False
+    assert preview.will_submit is True
+
+
+def test_a_skipped_preview_submits_nothing_and_counts_as_adjusted():
+    from ba2_common.core.account_types import (
+        FRACTIONAL_OUTCOME_SKIPPED, FractionalPreview,
+    )
+
+    preview = FractionalPreview(symbol="AAPL", requested_quantity=0.4,
+                                submit_quantity=None,
+                                outcome=FRACTIONAL_OUTCOME_SKIPPED,
+                                reason="skipped: ...; flooring leaves 0 whole shares")
+
+    assert preview.will_submit is False
+    assert preview.is_adjusted is True
+
+
+def test_the_preview_is_frozen_so_a_shared_row_cannot_be_edited_in_place():
+    import dataclasses
+    import pytest
+    from ba2_common.core.account_types import (
+        FRACTIONAL_OUTCOME_KEPT, FractionalPreview,
+    )
+
+    preview = FractionalPreview(symbol="AAPL", requested_quantity=2.5,
+                                submit_quantity=2.5, outcome=FRACTIONAL_OUTCOME_KEPT)
+
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        preview.submit_quantity = 2.0
