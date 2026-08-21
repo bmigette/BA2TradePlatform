@@ -3148,7 +3148,7 @@ git commit -m "feat(db): alembic revision creating the five portfolio allocation
 - Create: `ba2_trade_platform/core/portfolio_allocation_store.py` (SHIM)
 - Test: `tests/test_portfolio_allocation_store.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `tests/test_portfolio_allocation_store.py`:
 
@@ -3217,13 +3217,14 @@ def test_remove_managed_label_returns_false_when_not_managed(account_id):
 `set_symbol_weight` / `get_symbol_rows`, which arrive in Task 10 — so it stays red until then.
 That is intentional: unmanaging a label must not orphan its weight rows.
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_store.py -v`
-Expected: a collection ERROR:
-`ModuleNotFoundError: No module named 'ba2_trade_platform.core.portfolio_allocation_store'`
+Expected: a collection ERROR. AS LANDED the message is the `from ... import` form,
+not the dotted-module form, because the test imports the submodule off the package:
+`ImportError: cannot import name 'portfolio_allocation_store' from 'ba2_trade_platform.core'`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Create `packages/common/ba2_common/core/portfolio_allocation_store.py`:
 
@@ -3389,7 +3390,7 @@ globals().update({k: v for k, v in vars(_pkg).items() if not k.startswith('__')}
 _modules[_me] = _target
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_store.py -v`
 Expected: `6 passed, 1 failed` — the only failure is
@@ -3399,7 +3400,7 @@ Expected: `6 passed, 1 failed` — the only failure is
 Run: `venv/bin/python -m pytest tests/test_alias_shim_race.py -v`
 Expected: PASS (the new shim satisfies the race-guard ordering checks).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add packages/common/ba2_common/core/portfolio_allocation_store.py ba2_trade_platform/core/portfolio_allocation_store.py tests/test_portfolio_allocation_store.py
