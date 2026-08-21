@@ -263,15 +263,33 @@ class IBKRAccount(AccountInterface):
             logger.error(f"Error getting buying power: {e}", exc_info=True)
             return 0.0
     
-    def get_positions(self, with_orders: bool = False) -> List[Position]:
+    def get_positions(self, with_orders: bool = False) -> Optional[List[Position]]:
         """
         Get all positions from IBKR.
-        
+
+        TRI-STATE, per ``ReadOnlyAccountInterface.get_positions`` and matching
+        ``AlpacaAccount``/``TastyTradeAccount``:
+
+          * a non-empty list — the positions IBKR actually holds;
+          * ``[]``           — the fetch SUCCEEDED and this account is genuinely FLAT
+                               (including the case where every row belongs to a
+                               different account number and is filtered out);
+          * ``None``         — the FETCH ITSELF FAILED (TWS down, socket closed, API
+                               error).
+
+        This used to ``return []`` on any exception. That is a CONTRACT VIOLATION,
+        not a harmless default: it tells every caller "the broker holds nothing" and
+        therefore DEFEATS every correct ``is None`` guard in the codebase. Most
+        sharply, ``reconcile_externally_closed_transactions`` would read a transient
+        TWS hiccup as an empty book and mass-close the entire IBKR position set in
+        the DB — precisely the 2026-07-03 Alpaca incident (8 real open transactions
+        closed during a DNS outage) with the broker name swapped.
+
         Args:
             with_orders: Whether to include related orders
-            
+
         Returns:
-            List of Position objects
+            List of Position objects, or ``None`` if the fetch failed.
         """
         try:
             self._ensure_connected()
@@ -298,9 +316,12 @@ class IBKRAccount(AccountInterface):
             return positions
             
         except Exception as e:
-            logger.error(f"Error getting IBKR positions: {e}", exc_info=True)
-            return []
-    
+            # None, never []: an unverified book is not an empty book. See the docstring.
+            logger.error(
+                f"Error getting IBKR positions: {e} — reporting the FETCH FAILURE as None "
+                f"(not a flat account)", exc_info=True)
+            return None
+
     def submit_order(self, order: TradingOrder, tp_price: Optional[float] = None,
                      sl_price: Optional[float] = None, is_closing_order: bool = False) -> TradingOrder:
         """
