@@ -2911,3 +2911,82 @@ def test_the_reconcile_runs_after_the_market_gate_not_before_it(monkeypatch):
                        mode=ALLOCATION_MODE_REBALANCE)
 
     assert order == ["gate"]
+
+
+# ---------------------------------------------------------------------------
+# The deferral is drained and reported, not just logged (decision D3)
+# ---------------------------------------------------------------------------
+
+def test_describe_unconsumed_runs_counts_the_runs_and_their_working_orders(activity):
+    account = FakeAccount(account_id=70)
+    account.positions = []
+    account.fills = {}   # nothing settles -> the run defers
+    row = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
+    row.target_quantity = 10.0
+    result = svc.run_allocation(account, AllocationPlan(rows=[row],
+                                                        available_buying_power=10_000.0),
+                                {}, make_base(), mode=ALLOCATION_MODE_REBALANCE)
+
+    described = svc.describe_unconsumed_runs(70)
+
+    assert described["run_ids"] == [result["run_id"]]
+    assert described["working_order_ids"] == result["working_order_ids"]
+
+
+def test_describe_unconsumed_runs_is_empty_for_a_clean_account():
+    assert svc.describe_unconsumed_runs(71) == {"run_ids": [], "working_order_ids": []}
+
+
+def test_describe_unconsumed_runs_never_calls_the_broker(activity):
+    """It renders a panel. A DB read is fine there; a broker round trip is not."""
+    account = FakeAccount(account_id=72)
+    account.positions = []
+    account.fills = {}
+    row = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
+    row.target_quantity = 10.0
+    svc.run_allocation(account, AllocationPlan(rows=[row], available_buying_power=10_000.0),
+                       {}, make_base(), mode=ALLOCATION_MODE_REBALANCE)
+    account.refresh_calls.clear()
+
+    svc.describe_unconsumed_runs(72)
+
+    assert account.refresh_calls == []
+
+
+def test_syncing_income_also_drains_the_deferred_runs(activity):
+    """The income panel's Refresh (and the page's load call) is the hook. Without
+    it a quarterly rebalancer's deferred income stays open for a quarter."""
+    account = FakeAccount(account_id=73)
+    account.positions = []
+    account.fills = {}
+    add_instance(PortfolioIncomeEvent(account_id=73, external_id="dep-1",
+                                      event_date=date(2026, 8, 1),
+                                      event_type=CASH_TRANSFER_DEPOSIT, amount=6_000.0))
+    row = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
+    row.target_quantity = 10.0
+    first = svc.run_allocation(account, AllocationPlan(rows=[row],
+                                                       available_buying_power=10_000.0),
+                               {}, make_base(), mode=ALLOCATION_MODE_REBALANCE)
+    assert [r.id for r in svc.get_unconsumed_runs(73)] == [first["run_id"]]
+
+    account.fills = {"AAPL": (OrderStatus.FILLED, 10.0, 160.0)}
+    svc.sync_income_events(account)
+
+    assert svc.get_unconsumed_runs(73) == []
+    assert svc.get_open_income_total(73) == pytest.approx(4_400.0)
+
+
+def test_a_reconcile_failure_never_stops_the_income_sync(activity, monkeypatch):
+    """The sync is what refills the ledger display. A broken drain must degrade to
+    "income not consumed yet", not to an empty income panel."""
+    errors = _capture_errors(monkeypatch)
+    monkeypatch.setattr(svc, "reconcile_unconsumed_runs",
+                        lambda account: (_ for _ in ()).throw(RuntimeError("drain broke")))
+    account = FakeAccount(account_id=74)
+    account.cash_transfers = [CashTransfer(
+        external_id="dep-9", event_date=date(2026, 8, 1),
+        event_type=CASH_TRANSFER_DEPOSIT, amount=1_000.0)]
+
+    assert svc.sync_income_events(account) == 1
+    assert svc.get_open_income_total(74) == pytest.approx(1_000.0)
+    assert any("drain broke" in e for e in errors), errors

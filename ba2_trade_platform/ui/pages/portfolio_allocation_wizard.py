@@ -49,6 +49,7 @@ from ...core.portfolio_allocation import (
     redistribution_notice,
     steps_validation_messages,
     summarise_plan,
+    unconsumed_income_notice,
     whole_share_notice,
 )
 from ..utils.portfolio_allocation_view import MARKET_BANNER_CLASSES, MarketGateResult
@@ -712,7 +713,7 @@ def open_allocation_steps(base: BaseSnapshot, labels: List[LabelTarget], *,
 def render_income_panel(events: List[Dict], open_total: float,
                         *, on_sync: Callable[[], None],
                         on_invest: Callable[[float], None],
-                        working_note: Optional[Tuple[str, str]] = None) -> None:
+                        working_note: Optional[Tuple[str, str]]) -> None:
     """Last 30 days of income, the open total, and the Invest shortcut.
 
     The panel NEVER polls. ``on_sync`` is wired to the Refresh button and is
@@ -728,12 +729,19 @@ def render_income_panel(events: List[Dict], open_total: float,
     consumed figure, the true record of the spend, is left alone), and a naive
     percentage renders above 100%.
 
-    ``working_note`` is the ``(text, severity)`` pair from
-    ``portfolio_allocation_view.working_orders_notice``, or ``None``. Orders still
+    ``working_note`` is a ``(text, severity)`` pair, or ``None``. Orders still
     working contribute ZERO to a run's ledger, so its income stays unconsumed until
     they settle -- with a quarter of the book on whole shares that is the COMMON
-    outcome, and this is where the user is told. The decision and the wording are
-    pure and tested without NiceGUI; this function only draws them.
+    outcome, and this is where the user is told. Either pure builder produces it:
+    ``portfolio_allocation.unconsumed_income_notice`` for the account's standing
+    backlog (what the panel shows) or
+    ``portfolio_allocation_view.working_orders_notice`` for the run just submitted.
+    The decision and the wording are pure and tested without NiceGUI; this function
+    only draws them.
+
+    It is a REQUIRED keyword. With a default of ``None`` the page glue simply never
+    passed it, and the panel showed an "unallocated" figure that never went down
+    and never said why -- which is the one fact decision D3 exists to surface.
     """
     with ui.card().classes('w-full'):
         if working_note is not None:

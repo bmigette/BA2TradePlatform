@@ -2202,3 +2202,50 @@ def test_filled_totals_to_dict_hands_back_copies_not_its_own_lists():
     blob = totals.to_dict()
     blob["working_order_ids"].append(999)
     assert totals.working_order_ids == [2]
+
+
+# ---------------------------------------------------------------------------
+# unconsumed_income_notice -- the income panel's deferral copy. Pure.
+# ---------------------------------------------------------------------------
+
+from ba2_common.core.portfolio_allocation import unconsumed_income_notice  # noqa: E402
+
+
+def test_no_notice_when_nothing_is_outstanding():
+    assert unconsumed_income_notice(0, 0) is None
+
+
+def test_the_notice_counts_orders_and_runs_and_warns():
+    """The two counts must land the right way round: "3 orders from 2 runs", not
+    "2 orders from 3 runs". Asserting only that both digits appear cannot tell
+    the difference, and the swapped sentence is a plausible typo."""
+    text, severity = unconsumed_income_notice(2, 3)
+
+    assert "3 order(s)" in text
+    assert "2 allocation run(s)" in text
+    assert "not consumed" in text.lower()
+    assert severity == "warning"
+
+
+def test_a_run_with_no_working_orders_still_gets_its_own_sentence():
+    """A run that died mid-submit has an open stamp but no working order. Saying
+    "0 orders still working" would be nonsense, and saying nothing would hide it."""
+    text, severity = unconsumed_income_notice(1, 0)
+
+    assert "0 order" not in text
+    assert "1" in text
+    assert severity == "warning"
+
+
+def test_a_negative_count_is_treated_as_nothing_outstanding():
+    """<= 0, not == 0: a caller that subtracted its way to -1 must not be told
+    there is a problem it cannot name."""
+    assert unconsumed_income_notice(-1, 4) is None
+
+
+def test_the_severity_is_a_valid_nicegui_notify_type():
+    """'error' is NOT one of 'positive' | 'negative' | 'warning' | 'info'
+    (settings.py gets this wrong; do not copy it)."""
+    _, severity = unconsumed_income_notice(1, 1)
+
+    assert severity in {"positive", "negative", "warning", "info"}

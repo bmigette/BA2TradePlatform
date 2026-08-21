@@ -194,10 +194,45 @@ def test_the_page_reports_a_failed_position_fetch_instead_of_planning_on_a_guess
 def test_the_page_wires_the_unconsumed_run_reconcile_hook():
     """D3: with a quarter of the book on whole shares, runs will regularly finalise
     unsettled. The recovery pass has to actually RUN somewhere -- being named in a
-    docstring is not wiring."""
+    docstring is not wiring.
+
+    It runs inside ``svc.sync_income_events``, which is the panel's Refresh handler
+    AND the page's load call, so this asserts the panel loader really syncs. The
+    drain itself is pinned service-side by
+    ``test_syncing_income_also_drains_the_deferred_runs``."""
     body = _function_source(_page_source(), "_load_income_panel")
-    assert 'getattr(svc, "reconcile_unconsumed_runs"' in body
-    assert "reconcile(account)" in body
+    assert "svc.sync_income_events(" in body
+
+
+def _render_income_panel_note_argument(source: str):
+    """The NAME bound to ``render_income_panel(working_note=...)``, or None.
+
+    Returns None when the keyword is missing, and the literal's repr when it is a
+    constant -- both of which are the failure this pins.
+    """
+    for node in ast.walk(ast.parse(source)):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "render_income_panel"):
+            for keyword in node.keywords:
+                if keyword.arg == "working_note":
+                    return (keyword.value.id if isinstance(keyword.value, ast.Name)
+                            else ast.dump(keyword.value))
+            return None
+    raise AssertionError("the page never calls render_income_panel")
+
+
+def test_the_page_asks_what_is_still_outstanding_and_tells_the_panel():
+    """The other half of D3: draining is invisible unless the panel SAYS the income
+    has not been consumed yet. A panel rendered without the note shows an
+    unallocated figure that never goes down and never explains itself."""
+    source = _page_source()
+    body = _function_source(source, "_load_income_panel")
+    assert "svc.describe_unconsumed_runs(" in body
+    assert "unconsumed_income_notice(" in body
+    # ...and the render call must be handed the COMPUTED note. `working_note=None`
+    # satisfies a substring check while dropping the whole point of the task, so
+    # the keyword's value is read off the AST and has to be a variable.
+    assert _render_income_panel_note_argument(source) == "working_note"
 
 
 def test_the_page_shows_the_service_reason_when_a_submit_is_blocked():

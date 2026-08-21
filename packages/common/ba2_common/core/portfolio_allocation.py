@@ -82,6 +82,8 @@ __all__ = [
     "apply_order_impacts", "consume_income_events",
     # filled-value measurement (the income ledger's input)
     "SETTLED_ORDER_STATUSES", "OrderFill", "FilledTotals", "measure_filled_values",
+    "UNCONSUMED_RUNS_NOTICE_FMT", "UNFINISHED_RUNS_NOTICE_FMT",
+    "unconsumed_income_notice",
     "tradeable_unit", "size_sub_unit_target", "projected_value", "allocated_value",
     "redistribute_label_residuals",
     # mixed eligibility, bumps and redistribution, surfaced for the dry run
@@ -2798,3 +2800,54 @@ def measure_filled_values(fills: List[OrderFill]) -> FilledTotals:
         elif fill.side == OrderDirection.SELL:
             totals.sell_value += value
     return totals
+
+
+#: Income-panel copy for a run whose orders have not settled. Decision D3 makes
+#: this the COMMON case, so it is a first-class message, not a log line.
+UNCONSUMED_RUNS_NOTICE_FMT = (
+    "Income not consumed yet - {orders} order(s) from {runs} allocation run(s) are "
+    "still working at the broker. They are re-measured automatically on the next "
+    "Refresh or allocation run.")
+
+#: Same situation, but the run has no working order to point at: it died between
+#: submitting and recording. Saying "0 orders still working" would be nonsense.
+UNFINISHED_RUNS_NOTICE_FMT = (
+    "Income not consumed yet - {runs} allocation run(s) never finished recording. "
+    "They are re-checked on the next Refresh or allocation run.")
+
+
+def unconsumed_income_notice(run_count: int,
+                             order_count: int) -> Optional[Tuple[str, str]]:
+    """``(text, severity)`` for the income panel, or ``None`` when nothing is open.
+
+    PURE, and deliberately shaped like ``whole_share_notice`` / ``no_order_notice``:
+    the wizard module only DRAWS it, so the wording is testable without a NiceGUI
+    client.
+
+    Distinct from ``ui.utils.portfolio_allocation_view.working_orders_notice``,
+    which speaks about ONE run the user has just submitted ("2 orders still
+    working"). This one speaks about the ACCOUNT's backlog -- every run whose
+    income is still unconsumed -- which is what the income panel shows. Both return
+    the same ``(text, severity)`` shape, so ``render_income_panel`` draws either.
+
+    ``severity`` is a NiceGUI notify/badge word -- one of
+    ``positive`` | ``negative`` | ``warning`` | ``info``. ``error`` is NOT one of
+    them (settings.py gets that wrong; do not copy it).
+
+    Args:
+        run_count: how many of the account's runs still have a NULL
+            ``income_consumed_at``.
+        order_count: how many MARKET orders across those runs are still working.
+
+    Returns:
+        Optional[Tuple[str, str]]: ``None`` when ``run_count <= 0``. Otherwise the
+        sentence and ``"warning"`` -- unallocated income that the user believes is
+        already invested is worth interrupting for, but it is not an error: the
+        recovery path is automatic.
+    """
+    if run_count <= 0:
+        return None
+    if order_count <= 0:
+        return (UNFINISHED_RUNS_NOTICE_FMT.format(runs=run_count), "warning")
+    return (UNCONSUMED_RUNS_NOTICE_FMT.format(orders=order_count, runs=run_count),
+            "warning")

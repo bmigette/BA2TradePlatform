@@ -59,7 +59,7 @@ from ...core.portfolio_allocation import (
     ALLOCATION_MODE_INVEST_LABEL, ALLOCATION_MODE_REBALANCE,
     VALUATION_MODE_COST, VALUATION_MODE_MARKET,
     LabelTarget, SymbolTarget, build_base_snapshot, compute_allocation,
-    compute_label_investment,
+    compute_label_investment, unconsumed_income_notice,
 )
 from ...core.portfolio_allocation_store import (
     add_symbols_to_label, get_allocation_config, get_managed_labels, get_symbol_comments,
@@ -268,33 +268,35 @@ def _submit_plan(account_id: int, plan, current, base, *, mode: str, scope_label
 
 
 def _load_income_panel(account_id: int):
-    """Sync the ledger from the broker and read it back. Blocking.
+    """Sync the ledger from the broker, read it back, and say what is still owed.
 
-    Also runs the unconsumed-run reconcile pass. Runs whose orders were still working
-    when they finalised consumed NO income, and with about a quarter of the book on
-    whole shares that is the common outcome, not the rare one -- without this call the
-    money would sit unconsumed until the next submission.
-    ``reconcile_unconsumed_runs`` is authored by the ledger chunk, which lands after
-    this task; the lookup is what keeps this page working in between.
+    Blocking; always called through ``asyncio.to_thread``.
+
+    ``svc.sync_income_events`` runs the unconsumed-run reconcile pass first (it is
+    the panel's Refresh handler AND this page's load call, so that one hook covers
+    both). Runs whose orders were still working when they finalised consumed NO
+    income, and with about a quarter of the book on whole shares that is the common
+    outcome, not the rare one -- so the drain has to be automatic, and what SURVIVES
+    it has to be visible. ``describe_unconsumed_runs`` is the DB-only read behind
+    that sentence: without it the panel shows an unallocated figure that never goes
+    down and never explains itself.
+
+    Returns:
+        ``(events, open_total, working_note)`` where ``working_note`` is the
+        ``(text, severity)`` pair or ``None``.
     """
     from ...core.utils import get_account_instance_from_id
 
     account = get_account_instance_from_id(account_id)
     if account is None:
         raise RuntimeError(f"Account {account_id} could not be instantiated")
-    reconcile = getattr(svc, "reconcile_unconsumed_runs", None)
-    if reconcile is not None:
-        try:
-            reconciled = reconcile(account)
-            if reconciled:
-                logger.info(f"Reconciled {len(reconciled)} unconsumed allocation run(s) "
-                            f"for account {account_id}")
-        except Exception as e:
-            logger.error(f"Reconciling unconsumed allocation runs failed: {e}",
-                         exc_info=True)
     svc.sync_income_events(account)
+    outstanding = svc.describe_unconsumed_runs(account_id)
+    working_note = unconsumed_income_notice(len(outstanding["run_ids"]),
+                                            len(outstanding["working_order_ids"]))
     return (svc.get_recent_income_events(account_id),
-            svc.get_open_income_total(account_id))
+            svc.get_open_income_total(account_id),
+            working_note)
 
 
 def _expert_label_families() -> frozenset:
@@ -932,15 +934,15 @@ async def content() -> None:
             with body:
                 _render_labels(account_id, payload, _refresh)
                 try:
-                    events, open_total = await asyncio.to_thread(
+                    events, open_total, working_note = await asyncio.to_thread(
                         _load_income_panel, account_id)
                 except Exception as e:
                     logger.error(f"Income panel failed to load: {e}", exc_info=True)
-                    events, open_total = [], 0.0
+                    events, open_total, working_note = [], 0.0, None
                     ui.label(f'Income could not be loaded: {e}') \
                         .classes('text-xs text-orange-400')
                 render_income_panel(
-                    events, open_total,
+                    events, open_total, working_note=working_note,
                     on_sync=lambda: ui.timer(0.1, _refresh, once=True),
                     on_invest=lambda amount: ui.timer(
                         0.1, lambda: _open_invest_flow(

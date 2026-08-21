@@ -657,7 +657,7 @@ def test_the_income_panel_draws_every_event_with_what_is_left(nicegui_client):
     from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
 
     with nicegui_client:
-        wiz.render_income_panel(_income_events(), 1_542.5,
+        wiz.render_income_panel(_income_events(), 1_542.5, working_note=None,
                                 on_sync=lambda: None, on_invest=lambda amount: None)
         texts = _rendered_texts(nicegui_client.layout)
 
@@ -675,7 +675,7 @@ def test_the_income_panel_shows_a_dash_for_an_event_with_no_payer_symbol(nicegui
     from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
 
     with nicegui_client:
-        wiz.render_income_panel(_income_events(), 1_542.5,
+        wiz.render_income_panel(_income_events(), 1_542.5, working_note=None,
                                 on_sync=lambda: None, on_invest=lambda a: None)
         texts = _rendered_texts(nicegui_client.layout)
 
@@ -688,7 +688,8 @@ def test_the_income_panel_says_so_when_there_is_no_income(nicegui_client):
     from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
 
     with nicegui_client:
-        wiz.render_income_panel([], 0.0, on_sync=lambda: None, on_invest=lambda a: None)
+        wiz.render_income_panel([], 0.0, working_note=None,
+                                on_sync=lambda: None, on_invest=lambda a: None)
         texts = _rendered_texts(nicegui_client.layout)
 
     assert any("No deposits or dividends" in t for t in texts)
@@ -702,7 +703,7 @@ def test_the_income_panel_refresh_button_calls_the_sync(nicegui_client):
     with nicegui_client:
         wiz.render_income_panel(_income_events(), 1_542.5,
                                 on_sync=lambda: synced.append(True),
-                                on_invest=invested.append)
+                                on_invest=invested.append, working_note=None)
         _click(_by_text(nicegui_client, 'Refresh')[0])
 
     assert synced == [True]
@@ -716,7 +717,7 @@ def test_the_income_panel_invest_button_hands_over_the_unallocated_total(nicegui
 
     invested = []
     with nicegui_client:
-        wiz.render_income_panel(_income_events(), 1_542.5,
+        wiz.render_income_panel(_income_events(), 1_542.5, working_note=None,
                                 on_sync=lambda: None, on_invest=invested.append)
         _click(_by_text(nicegui_client, 'Invest')[0])
 
@@ -728,7 +729,8 @@ def test_the_income_panel_cannot_invest_when_there_is_nothing_unallocated(nicegu
 
     with nicegui_client:
         wiz.render_income_panel([], 0.0, on_sync=lambda: None,
-                                on_invest=lambda a: pytest.fail("nothing to invest"))
+                                on_invest=lambda a: pytest.fail("nothing to invest"),
+                                working_note=None)
         invest = _by_text(nicegui_client, 'Invest')[0]
 
     assert invest.enabled is False
@@ -744,7 +746,7 @@ def test_the_income_panel_never_polls(nicegui_client):
     with nicegui_client:
         wiz.render_income_panel(_income_events(), 1_542.5,
                                 on_sync=lambda: pytest.fail("synced without being asked"),
-                                on_invest=lambda a: None)
+                                on_invest=lambda a: None, working_note=None)
         timers = [d for d in nicegui_client.layout.descendants() if isinstance(d, Timer)]
 
     assert timers == []
@@ -762,7 +764,7 @@ def test_the_income_panel_shows_no_consumption_percentage(nicegui_client):
                       "open_amount": 0.0}]
     with nicegui_client:
         wiz.render_income_panel(over_consumed, 0.0, on_sync=lambda: None,
-                                on_invest=lambda a: None)
+                                on_invest=lambda a: None, working_note=None)
         texts = _rendered_texts(nicegui_client.layout)
         bars = [d for d in nicegui_client.layout.descendants()
                 if getattr(d, 'tag', '') == 'q-linear-progress']
@@ -1059,14 +1061,29 @@ def test_wizard_imports_the_engine_summary_helpers():
     assert callable(wiz.no_order_rows)
 
 
-def test_render_income_panel_accepts_a_pre_computed_working_orders_note():
-    """D3: deferral is the common case, so the panel has to be able to say so. The
-    DECISION is the pure working_orders_notice(); this module only draws it."""
+def test_render_income_panel_requires_the_working_orders_note():
+    """D3: deferral is the common case, so the panel has to say so -- and a DEFAULT
+    would let the page glue drop the one fact D3 exists to surface, showing an
+    "unallocated" figure with no explanation of why it did not go down. That is
+    exactly what the optional version allowed: the page never passed it.
+
+    The DECISION is pure (``unconsumed_income_notice`` in the engine, or
+    ``working_orders_notice`` in the view module for the post-submit line); this
+    module only draws whichever one it is handed."""
     from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
 
     params = inspect.signature(wiz.render_income_panel).parameters
     assert "working_note" in params
-    assert params["working_note"].default is None
+    assert params["working_note"].default is inspect.Parameter.empty
+    assert params["working_note"].kind is inspect.Parameter.KEYWORD_ONLY
+
+
+def test_the_income_panel_draws_the_engines_unconsumed_income_notice_too():
+    """The panel takes ``(text, severity)``, so it draws the ENGINE's deferred-income
+    sentence and the view's post-submit one through the same slot."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    assert callable(wiz.unconsumed_income_notice)
 
 
 def test_the_dry_run_disables_submit_and_shows_why_when_the_market_is_shut(nicegui_client):

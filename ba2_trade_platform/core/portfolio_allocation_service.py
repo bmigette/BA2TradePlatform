@@ -819,6 +819,19 @@ def sync_income_events(account, *, days: int = INCOME_WINDOW_DAYS) -> int:
         broker failure is logged and returns 0 rather than looking like "no
         income").
     """
+    # Decision D3: a deferred run's income stays open until something re-measures
+    # it, and deferral is the common case. This is the income panel's Refresh AND
+    # the allocation page's load call, so draining here is what stops a quarterly
+    # rebalancer's income from sitting unallocated for a quarter. DB-only unless
+    # there is genuinely something pending. Never fatal: the sync is what refills
+    # the panel, and a broken drain must degrade to "not consumed yet", not to an
+    # empty income panel.
+    try:
+        reconcile_unconsumed_runs(account)
+    except Exception as e:
+        logger.error(f"Reconciling unconsumed allocation runs failed for account "
+                     f"{account.id}: {e}", exc_info=True)
+
     from .portfolio_allocation_store import get_income_events_since, upsert_income_event
 
     end_date = _today()
@@ -1116,6 +1129,26 @@ def reconcile_unconsumed_runs(account) -> List[int]:
         if totals.settled:
             consumed.append(run.id)
     return consumed
+
+
+def describe_unconsumed_runs(account_id: int) -> Dict[str, Any]:
+    """Which runs still owe the ledger, and how many of their orders are working.
+
+    DB ONLY -- no broker call, because this renders a panel. The actual re-measure
+    is ``reconcile_unconsumed_runs``, which the same Refresh already ran.
+
+    Returns:
+        Dict[str, Any]: ``{"run_ids": [...], "working_order_ids": [...]}``, both
+        oldest-first. Feed the two lengths to
+        ``ba2_common.core.portfolio_allocation.unconsumed_income_notice`` for the
+        panel's sentence.
+    """
+    runs = list(reversed(get_unconsumed_runs(account_id)))
+    working: List[int] = []
+    for run in runs:
+        totals = measure_filled_values(collect_order_fills(account_id, run.order_ids or []))
+        working.extend(totals.working_order_ids)
+    return {"run_ids": [run.id for run in runs], "working_order_ids": working}
 
 
 def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionState],
