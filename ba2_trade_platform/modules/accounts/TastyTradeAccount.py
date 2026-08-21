@@ -286,7 +286,10 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
         if not self._check_authentication():
             return []
         try:
-            orders = self._run_async(self._account.get_order_history(self._session))
+            # page_offset=None is the SDK's "walk every page" sentinel
+            # (session.py:389-419). Without it only the first 50 rows come back.
+            orders = self._run_async(
+                self._account.get_order_history(self._session, page_offset=None))
             logger.debug(f"[Account {self.id}] Retrieved {len(orders)} orders from TastyTrade")
             return orders
         except Exception as e:
@@ -311,7 +314,9 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
             from tastytrade.instruments import Equity
             result = {}
             try:
-                equities = self._run_async(Equity.get(self._session, symbols))
+                # page_offset=None -> all pages; the default of 0 caps the lookup at 250.
+                equities = self._run_async(
+                    Equity.get(self._session, symbols, page_offset=None))
                 if isinstance(equities, list):
                     found_symbols = {e.symbol for e in equities}
                 else:
@@ -533,6 +538,8 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
             params = {
                 "types": ["Trade"],
                 "sort": "Asc",
+                # page_offset=None -> all pages; the default of 0 caps history at 250 rows.
+                "page_offset": None,
             }
             if symbol:
                 params["symbol"] = symbol

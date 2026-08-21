@@ -342,3 +342,37 @@ def test_get_positions_intraday_pl_is_mark_minus_close_not_realized_day_gain():
     position = acct.get_positions()[0]
 
     assert position.unrealized_intraday_pl == pytest.approx(50.0)
+
+
+# ---------------------------------------------------------------------------
+# Pagination: the SDK only walks every page when page_offset is None
+# (tastytrade/session.py:389-419). Omitting it truncates silently.
+# ---------------------------------------------------------------------------
+
+def test_get_orders_requests_all_pages():
+    acct = _bare_account()
+    acct._account.get_order_history = AsyncMock(return_value=[])
+
+    acct.get_orders()
+
+    assert acct._account.get_order_history.call_args.kwargs["page_offset"] is None
+
+
+def test_get_filled_trades_requests_all_pages():
+    acct = _bare_account()
+    acct._account.get_history = AsyncMock(return_value=[])
+
+    acct.get_filled_trades()
+
+    assert acct._account.get_history.call_args.kwargs["page_offset"] is None
+
+
+def test_symbols_exist_requests_all_pages():
+    acct = _bare_account()
+    fake_get = AsyncMock(return_value=[_FakeEquity("AAPL"), _FakeEquity("MSFT")])
+
+    with patch("tastytrade.instruments.Equity.get", new=fake_get):
+        result = acct.symbols_exist(["AAPL", "MSFT"])
+
+    assert result == {"AAPL": True, "MSFT": True}
+    assert fake_get.call_args.kwargs["page_offset"] is None
