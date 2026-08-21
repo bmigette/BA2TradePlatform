@@ -1461,3 +1461,145 @@ def test_position_market_value_is_display_only_and_never_sizes_a_plan():
                                   allow_fractional=False, default_bp_factor=1.0,
                                   valuation_mode=mode)
         assert a.to_dict() == b.to_dict(), mode
+
+
+# ---------------------------------------------------------------------------
+# MarginInfo.min_fractional_notional -- the broker's $5 fractional money floor.
+#
+# TastyTrade, live dry-run 2026-08-21, HTTP 422:
+#     below_notional_value_minimum: Fractional equities orders cannot have a
+#     notional value less than $5.
+# The engine is PURE and never calls a broker, so the rule reaches it only as data
+# on MarginInfo -- the same way `fractionable` and `min_trade_increment` do. Every
+# number below is the real case: SCHD at ~$34 on a 5-decimal quantity grid.
+# ---------------------------------------------------------------------------
+
+def _schd_margin(min_fractional_notional=5.0):
+    return {"SCHD": MarginInfo(symbol="SCHD", bp_factor=1.0, fractionable=True,
+                               min_trade_increment=1e-5,
+                               min_fractional_notional=min_fractional_notional)}
+
+
+def test_a_fractional_buy_below_the_brokers_notional_floor_is_suppressed():
+    """The exact order the broker refused: ~0.057 shares of SCHD, under $2."""
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("SCHD", 100.0)])]
+    plan = pa.compute_allocation(1.95, 1_000_000.0, labels,
+                                 {"SCHD": _pos("SCHD", 34.0)}, _schd_margin(),
+                                 allow_fractional=True, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
+    row = plan.rows[0]
+    assert row.delta_quantity == 0.0
+    assert row.side is None
+    assert row.estimated_value == 0.0
+    assert row.target_notional == 1.95          # the TARGET is never rewritten
+    assert pa.REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_FMT.format(
+        value=0.05735 * 34.0, minimum=5.0) in row.reasons
+
+
+def test_a_fractional_buy_above_the_notional_floor_still_trades():
+    """The guard must be narrow: a normal fractional order is the common case on
+    this account, which holds 18 of its 25 positions fractionally."""
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("SCHD", 100.0)])]
+    plan = pa.compute_allocation(100.0, 1_000_000.0, labels,
+                                 {"SCHD": _pos("SCHD", 34.0)}, _schd_margin(),
+                                 allow_fractional=True, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
+    row = plan.rows[0]
+    assert row.delta_quantity == pytest.approx(2.94117)
+    assert row.side == OrderDirection.BUY
+    assert not any("below the broker" in r for r in row.reasons)
+
+
+def test_the_notional_floor_keys_on_the_quantity_not_on_the_symbol_flag():
+    """The broker's rule is worded "FRACTIONAL equities orders ...". A WHOLE-share
+    order is exempt even in a fractionable symbol, so a legal 1-share buy of a $3
+    stock must not be refused for being worth less than $5."""
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("SCHD", 100.0)])]
+    plan = pa.compute_allocation(3.0, 1_000_000.0, labels,
+                                 {"SCHD": _pos("SCHD", 3.0)}, _schd_margin(),
+                                 allow_fractional=True, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
+    row = plan.rows[0]
+    assert row.delta_quantity == 1.0
+    assert row.side == OrderDirection.BUY
+    assert row.estimated_value == 3.0
+
+
+def test_a_fractional_trim_below_the_notional_floor_is_suppressed_too():
+    """Suppression is on the MAGNITUDE, like min_order_size: the broker refuses an
+    unsendable SELL for exactly the same reason it refuses an unsendable buy."""
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("SCHD", 100.0)])]
+    current = {"SCHD": _pos("SCHD", 34.0, quantity=1.0, cost_basis=34.0)}
+    plan = pa.compute_allocation(32.90, 1_000_000.0, labels, current, _schd_margin(),
+                                 allow_fractional=True, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
+    row = plan.rows[0]
+    assert row.delta_quantity == 0.0
+    assert row.side is None
+    assert row.target_quantity == 1.0           # the position is HELD, not rewritten
+    assert any("below the broker" in r for r in row.reasons)
+
+
+def test_a_fractional_position_too_small_to_close_says_so_instead_of_going_quiet():
+    """A 0.05715-share holding is worth under $2, so the broker will not take the
+    closing order either. The row must carry BOTH "close position" and the reason
+    that stopped it -- a close that silently does not happen is the worst shape."""
+    labels = [LabelTarget("A", 0.0, [SymbolTarget("SCHD", 100.0)])]
+    current = {"SCHD": _pos("SCHD", 34.0, quantity=0.05715, cost_basis=1.94)}
+    plan = pa.compute_allocation(1_000.0, 1_000_000.0, labels, current, _schd_margin(),
+                                 allow_fractional=True, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
+    row = plan.rows[0]
+    assert row.delta_quantity == 0.0
+    assert pa.REASON_CLOSE_TO_ZERO in row.reasons
+    assert any("below the broker" in r for r in row.reasons)
+
+
+def test_no_notional_floor_is_applied_when_the_broker_published_none():
+    """This is broker DATA, never a rule the engine invents. Alpaca publishes no
+    such floor, and a hardcoded $5 would silently suppress legal Alpaca orders."""
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("SCHD", 100.0)])]
+    plan = pa.compute_allocation(1.95, 1_000_000.0, labels,
+                                 {"SCHD": _pos("SCHD", 34.0)},
+                                 _schd_margin(min_fractional_notional=None),
+                                 allow_fractional=True, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
+    row = plan.rows[0]
+    assert row.delta_quantity == pytest.approx(0.05735)
+    assert row.side == OrderDirection.BUY
+
+
+def test_label_investment_applies_the_fractional_notional_floor_too():
+    """The same rule on the INVEST_LABEL path, with the same reason string."""
+    label = LabelTarget("A", 100.0, [SymbolTarget("SCHD", 100.0)])
+    plan = pa.compute_label_investment(label, 1.95, {"SCHD": _pos("SCHD", 34.0)},
+                                       _schd_margin(),
+                                       available_buying_power=1_000_000.0,
+                                       allow_fractional=True, default_bp_factor=1.0,
+                                       valuation_mode=pa.VALUATION_MODE_MARKET)
+    row = plan.rows[0]
+    assert row.delta_quantity == 0.0
+    assert row.side is None
+    assert plan.total_buy_value == 0.0
+    assert any("below the broker" in r for r in row.reasons)
+
+
+def test_the_notional_floor_reason_is_exported_so_the_ui_cannot_drift():
+    assert "REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_FMT" in pa.__all__
+
+
+def test_a_buy_scaled_under_the_notional_floor_says_which_rule_stopped_it():
+    """Scaling a buy down to fit buying power is exactly what pushes a fractional
+    order under the $5 floor, and the two causes have different fixes (add buying
+    power vs. nothing the user can do), so the row must name both."""
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("SCHD", 100.0)])]
+    plan = pa.compute_allocation(100.0, 2.0, labels, {"SCHD": _pos("SCHD", 34.0)},
+                                 _schd_margin(), allow_fractional=True,
+                                 default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
+    row = plan.rows[0]
+    assert row.delta_quantity == 0.0
+    assert row.skipped is True
+    assert row.side is None
+    assert any(r.startswith(pa.REASON_SCALED_PREFIX) for r in row.reasons)
+    assert any("below the broker" in r for r in row.reasons)

@@ -46,7 +46,8 @@ __all__ = [
     # reason / warning / error strings
     "REASON_NO_PRICE", "REASON_NOT_MARGINABLE", "REASON_FRACTIONAL",
     "REASON_WHOLE_SHARE_FLOOR", "REASON_NEGATIVE_CLAMPED", "REASON_CLOSE_TO_ZERO",
-    "REASON_BELOW_MIN_ORDER_FMT", "REASON_MULTI_LABEL_FMT", "REASON_SCALED_FMT",
+    "REASON_BELOW_MIN_ORDER_FMT", "REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_FMT",
+    "REASON_MULTI_LABEL_FMT", "REASON_SCALED_FMT",
     "REASON_SCALED_PREFIX", "WARNING_EMPTY_LABEL_FMT", "WARNING_PRECHECK_DISAGREED_FMT",
     "ERROR_LABEL_TOTAL_FMT", "ERROR_LABEL_NEGATIVE_FMT", "ERROR_LABEL_DUPLICATE_FMT",
     "ERROR_LABEL_NO_SYMBOLS_FMT", "ERROR_SYMBOL_TOTAL_FMT", "ERROR_SYMBOL_NEGATIVE_FMT",
@@ -97,6 +98,12 @@ REASON_CLOSE_TO_ZERO = "target 0 - close position"
 #: differs by branch (a suppressed trim holds; a suppressed top-up never opens).
 #: "position held" here contradicted REASON_CLOSE_TO_ZERO on an unsendable close.
 REASON_BELOW_MIN_ORDER_FMT = "below broker min order size {size:g} - no order"
+#: The MONEY floor, and the "$" is load-bearing: REASON_BELOW_MIN_ORDER_FMT above
+#: is a SHARE count and the two must never read as the same rule. Carries the
+#: order's own value because "under $5" is only actionable next to "this one is
+#: $1.95". Applies to FRACTIONAL quantities only -- see MarginInfo.
+REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_FMT = (
+    "fractional order ${value:.2f} below the broker's ${minimum:g} minimum - no order")
 #: Renders INSIDE a label's panel, so it must not read as "also in <this panel>";
 #: the full list including the current label is the useful information.
 REASON_MULTI_LABEL_FMT = "⚠ in {labels}"
@@ -425,23 +432,67 @@ def round_delta_quantity(delta_notional: float, unit_value: float,
     return delta
 
 
+def _is_fractional_quantity(quantity: float) -> bool:
+    """True when this share count is NOT a whole number of shares.
+
+    Tested against ``QUANTITY_EPSILON`` from BOTH sides, because a quantity that
+    came off a fractional grid can land at 2.9999999999 as easily as at
+    3.0000000001, and calling either of those "fractional" would apply a
+    fractional-only broker rule to what is really a 3-share order.
+    """
+    part = abs(float(quantity)) % 1.0
+    return min(part, 1.0 - part) > QUANTITY_EPSILON
+
+
 def _suppress_below_min_order(delta: float, margin: Optional[MarginInfo],
-                              reasons: List[str]) -> float:
+                              reasons: List[str],
+                              price: Optional[float] = None) -> float:
     """Zero a signed share delta the broker would refuse as too small, with a reason.
 
-    ``min_order_size`` constrains the ORDER, not the TARGET: when the trade cannot
-    be sent, the right answer is to LEAVE THE POSITION WHERE IT IS, not to rewrite
+    TWO independent minimums, in DIFFERENT UNITS, and conflating them is the bug
+    this signature exists to prevent:
+
+      * ``margin.min_order_size`` -- a SHARE count;
+      * ``margin.min_fractional_notional`` -- DOLLARS, and only for a FRACTIONAL
+        quantity. TastyTrade returns HTTP 422 ``below_notional_value_minimum``
+        ("Fractional equities orders cannot have a notional value less than $5.")
+        Needs ``price``; with no price the check is skipped rather than guessed at.
+
+    The fractional floor is applied to the QUANTITY, not to the symbol's
+    ``fractionable`` flag: the broker's rule is worded "Fractional equities
+    orders ...", so a whole-share order is exempt even in a splittable symbol, and
+    a legal 1-share buy of a $3 stock must not be refused.
+
+    Both minimums constrain the ORDER, not the TARGET: when the trade cannot be
+    sent, the right answer is to LEAVE THE POSITION WHERE IT IS, not to rewrite
     what we want to hold. Filtering the target instead used to turn "hold the
     3.3333 shares you already have" into a full liquidation.
+
+    Suppression, deliberately, rather than flooring the quantity to whole shares.
+    Flooring would sometimes salvage the order (2.4 shares at $2 is $4.80, but 2
+    shares is a legal $4.00 whole-share order), and it is the right answer -- but
+    it is a SIZING policy, bounded by an overshoot guard, and it belongs to the
+    bump-to-one-share task that owns that guard. Suppressing here never sends an
+    order the broker would refuse and never overshoots a target; it only
+    under-trades, and it says so.
 
     Tests the MAGNITUDE, so an unsendable trim is suppressed exactly like an
     unsendable top-up. Appends to ``reasons`` in place -- a silently absent order
     is its own kind of wrong. Returns the delta to use.
     """
-    if (delta and margin is not None and margin.min_order_size is not None
+    if not delta or margin is None:
+        return delta
+    if (margin.min_order_size is not None
             and abs(delta) < float(margin.min_order_size)):
         reasons.append(REASON_BELOW_MIN_ORDER_FMT.format(size=margin.min_order_size))
         return 0.0
+    if (margin.min_fractional_notional is not None and price is not None
+            and price > 0 and _is_fractional_quantity(delta)):
+        value = abs(delta) * float(price)
+        if value < float(margin.min_fractional_notional):
+            reasons.append(REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_FMT.format(
+                value=value, minimum=margin.min_fractional_notional))
+            return 0.0
     return delta
 
 
@@ -692,7 +743,7 @@ def _apply_bp_scaling(rows: List[AllocationRow], available_buying_power: float, 
         # Scaling and the minimum order size are different causes with different
         # fixes (add buying power vs. nothing the user can do), so a row stopped by
         # the minimum must say so rather than blame the scaling alone.
-        qty = _suppress_below_min_order(qty, m, r.reasons)
+        qty = _suppress_below_min_order(qty, m, r.reasons, r.price)
         ratio = (qty / prev_qty) if prev_qty > 0 else 0.0
         r.delta_quantity = qty
         r.target_quantity = r.current_quantity + qty
@@ -899,7 +950,7 @@ def compute_allocation(base_notional: float, available_buying_power: float,
             delta = 0.0
         # ONE minimum-order check, on the signed delta both branches produce -- the
         # only quantity that is actually sent to the broker.
-        delta = _suppress_below_min_order(delta, m, row.reasons)
+        delta = _suppress_below_min_order(delta, m, row.reasons, row.price)
         row.delta_quantity = delta
         # target_quantity is the POST-TRADE holding in every mode and every branch:
         # what the account owns if this row executes, never an unreachable ideal.
@@ -1012,7 +1063,7 @@ def compute_label_investment(label: LabelTarget, amount: float,
         elif allow_fractional:
             row.reasons.append(REASON_WHOLE_SHARE_FLOOR)
         # Buys only here, so the budget IS the order: same suppression, same reason.
-        qty = _suppress_below_min_order(qty, m, row.reasons)
+        qty = _suppress_below_min_order(qty, m, row.reasons, row.price)
         row.delta_quantity = qty
         row.target_quantity = row.current_quantity + qty
         if qty > 0:
@@ -1046,8 +1097,10 @@ def apply_order_impacts(plan: AllocationPlan, impacts: Dict[str, OrderImpact], *
 
     Pass the SAME ``margin`` dict the plan was solved with: without it the
     re-solve rebuilds a bare ``MarginInfo`` for each fractional row and so rounds
-    on the default 4dp grid, losing ``min_trade_increment`` and
-    ``min_order_size`` -- a broker-side rejection waiting to happen.
+    on the default 4dp grid, losing ``min_trade_increment``, ``min_order_size``
+    AND ``min_fractional_notional`` -- a broker-side rejection waiting to happen,
+    and the notional floor is the one most likely to bite, because scaling a buy
+    down is exactly what pushes a fractional order under it.
 
     ``scale_factor`` COMPOUNDS: a plan already scaled to 0.6 that the precheck
     halves again reports 0.3, the true factor against the ORIGINAL target, and
