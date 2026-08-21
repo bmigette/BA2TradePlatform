@@ -1085,8 +1085,19 @@ class AccountInterface(ReadOnlyAccountInterface):
                         f"(${additional_value:.2f}) exceeds expert {expert_instance.id} available balance ${available_balance:.2f}"
                     )
         except Exception as balance_error:
-            logger.warning(f"Error checking expert available balance: {balance_error}")
-        
+            # Same rule as _validate_position_size_limits: an exception inside a risk
+            # control must not be reported to the caller as "validation passed".
+            logger.error(
+                f"EXPERT BALANCE VALIDATION FAILED TO RUN for {trading_order.symbol} "
+                f"on account {self.id}: {balance_error}",
+                exc_info=True,
+            )
+            errors.append(
+                f"Expert available-balance validation could not be completed "
+                f"({type(balance_error).__name__}: {balance_error}). Refusing the order "
+                f"rather than treating an unrun risk check as passed."
+            )
+
         return errors
 
     def _validate_position_size_limits(self, trading_order: TradingOrder) -> List[str]:
@@ -1131,13 +1142,36 @@ class AccountInterface(ReadOnlyAccountInterface):
                 # Setting not defined - skip validation
                 return errors
             
-            # Calculate expert's virtual equity
-            account_info = self.get_account_info()
-            if not account_info:
-                logger.warning("Could not get account info for position size validation")
+            # Calculate expert's virtual equity.
+            #
+            # READ EQUITY THROUGH THE TYPED SEAM, never off get_account_info(). That
+            # return value is BROKER-SHAPED: a pydantic TradeAccount on Alpaca, a plain
+            # dict on IBKR/TastyTrade, {} on auth failure. `float(account_info.equity)`
+            # therefore raised AttributeError for every dict-shaped broker, the broad
+            # `except Exception` below swallowed it, and BOTH guards -- the
+            # per-instrument cap AND the expert virtual-balance check below -- silently
+            # returned "no problems". get_account_snapshot() is the broker-agnostic
+            # seam that exists for exactly this (same fix as TradeActions.py Task 34).
+            snapshot = self.get_account_snapshot()
+            account_equity = snapshot.equity
+            if account_equity is None:
+                # REFUSE TO VALIDATE, do not pass. `None` means the broker published no
+                # equity at all -- there is no denominator, so the cap cannot be
+                # checked. Reporting that as success is what made this bug invisible.
+                logger.error(
+                    f"POSITION SIZE VALIDATION CANNOT RUN for {trading_order.symbol}: "
+                    f"account {self.id} published no equity "
+                    f"({self.__class__.__name__}.get_account_snapshot().equity is None). "
+                    f"Rejecting the order rather than treating an unrun risk check as passed."
+                )
+                errors.append(
+                    f"Cannot validate position size limits: account equity is unavailable "
+                    f"from {self.__class__.__name__}. Refusing the order rather than "
+                    f"skipping the check."
+                )
                 return errors
-            
-            account_equity = float(account_info.equity)
+
+            account_equity = float(account_equity)
             virtual_equity_pct = expert_instance.virtual_equity_pct
             virtual_equity = account_equity * (virtual_equity_pct / 100.0)
             
@@ -1161,10 +1195,22 @@ class AccountInterface(ReadOnlyAccountInterface):
             errors.extend(balance_errors)
                 
         except Exception as e:
-            # Don't fail the entire validation if position size check has an error
-            # Just log it and continue
-            logger.warning(f"Error during position size validation: {e}")
-        
+            # A CRASH IN A RISK CONTROL IS NOT A PASS. This used to log a warning and
+            # return an empty list, which every caller reads as "no problems found" --
+            # so an AttributeError here was indistinguishable from a clean validation
+            # and disabled the position-size cap for a whole broker without a single
+            # failing test. An unrun check is reported as a failure to validate.
+            logger.error(
+                f"POSITION SIZE VALIDATION FAILED TO RUN for {trading_order.symbol} "
+                f"on account {self.id}: {e}",
+                exc_info=True,
+            )
+            errors.append(
+                f"Position size validation could not be completed "
+                f"({type(e).__name__}: {e}). Refusing the order rather than treating "
+                f"an unrun risk check as passed."
+            )
+
         return errors
 
     @abstractmethod
