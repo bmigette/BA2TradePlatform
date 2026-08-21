@@ -14593,6 +14593,19 @@ git commit -m "feat(ui): filter machine tags out of the managed-label picker"
 
 ### Task 63: Store — bulk label selection, symbol membership and comments
 
+> **A comment-only write silently zeroes a symbol's weight — this task as written hits it.**
+> `set_symbol_weight` creates the row with the model default `weight_pct=0.0`, and
+> `get_symbol_weights` treats the EXISTENCE of a row as an explicit weight. This task's UI code does
+> `set_symbol_weight(account_id, label, symbol, comment=value or "")`, so a user typing a note on an
+> unweighted symbol drops it from its even-split default to a hard 0% — it stops receiving any
+> allocation. No test here asserts a weight after a comment-only write, so it would land silently.
+>
+> Fix by passing the symbol's current EFFECTIVE weight alongside the comment. Do **not** try to treat
+> `weight_pct == 0.0` as "unstored": that breaks a legitimate explicit 0% and re-introduces drift
+> from the engine's `build_symbol_targets`. Add a test asserting the weight is unchanged after a
+> comment-only write.
+
+
 The page needs four things the store does not have yet: replace the whole managed-label set in
 one call (the picker), read back per-symbol comments, and add/remove symbols from a label.
 
