@@ -19,15 +19,18 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlmodel import select
 
 from ..logger import logger
-from .db import InstanceNotFound, add_instance, get_db, get_instance
+from .db import InstanceNotFound, add_instance, get_db, get_instance, log_activity
 from .models import Transaction, TradingOrder
 from .portfolio_allocation import (
     ACTION_ADJUST, ACTION_CLOSE, ACTION_NEW, ACTION_SKIP, FRACTIONAL_PATH_WHOLE,
-    AllocationPlan, MarginInfo, PositionFetchFailed, PositionState, apply_order_impacts,
-    decide_symbol_action, plan_quantity_attempts, split_delta_fifo,
+    AllocationPlan, BaseSnapshot, MarginInfo, PositionFetchFailed, PositionState,
+    apply_order_impacts, decide_symbol_action, plan_quantity_attempts, split_delta_fifo,
 )
 from .TransactionHelper import TransactionHelper
-from .types import OrderDirection, OrderOpenType, OrderStatus, OrderType, TransactionStatus
+from .types import (
+    ActivityLogSeverity, ActivityLogType,
+    OrderDirection, OrderOpenType, OrderStatus, OrderType, TransactionStatus,
+)
 
 
 def _open_transaction_ids(account_id: int, symbols: List[str]) -> Dict[str, List[int]]:
@@ -696,3 +699,195 @@ def get_open_income_total(account_id: int) -> float:
     """
     from .portfolio_allocation_store import get_open_income_total as _store_total
     return _store_total(account_id)
+
+
+# ---------------------------------------------------------------------------
+# Run audit: portfolio_allocation_run + log_activity + income consumption.
+# ---------------------------------------------------------------------------
+
+#: Outcomes for which an order really is at the broker, so real money is
+#: committed and the income that funded it has to be marked as spent.
+#: OUTCOME_PARTIAL belongs here: a partially filled order has already moved the
+#: position and is still working. OUTCOME_WASHTRADE_LOCKED does NOT: that order
+#: is PENDING at our end, nothing was sent, and it is retried later.
+_MONEY_OUT_STATUSES = frozenset({OUTCOME_SUBMITTED, OUTCOME_PARTIAL})
+
+#: The one-line activity-log summary of a run. Every outcome the vocabulary has
+#: is named: a line that mentions only "submitted" and "failed" hides a
+#: wash-trade lock completely, and that is an order the user never learns about.
+RUN_ACTIVITY_FMT = (
+    "Portfolio allocation run {run_id} ({scope}): {submitted} submitted, "
+    "{partial} partially filled, {locked} wash-trade locked, {failed} failed, "
+    "{skipped} skipped")
+
+
+def summarise_outcomes(plan: AllocationPlan, outcomes: List[RowOutcome]) -> Dict[str, Any]:
+    """What a run ACTUALLY committed, as opposed to what it planned. Pure.
+
+    Only rows whose order reached the broker count towards the money totals; the
+    value uses the quantity that really went in, so a fractional order that fell
+    back to whole shares is worth less than the plan said. The row's own estimate
+    is the fallback when there is no price to multiply by.
+
+    ``order_ids`` is EVERY TradingOrder row this run created, refused ones
+    included -- that is what the column says it holds, and an audit that cannot
+    point at the order the broker rejected cannot explain the failure it reports.
+
+    Note for the reader: these are SUBMITTED values. Replacing them with FILLED
+    values is its own piece of work (the ledger must not mark income as spent for
+    an order that never filled); the split between "what went out" and "what
+    filled" already exists on ``RowOutcome.quantity`` / ``.filled_quantity``.
+    """
+    by_symbol = {row.symbol: row for row in plan.rows}
+    buy_value = 0.0
+    sell_value = 0.0
+    order_ids: List[int] = []
+
+    for outcome in outcomes:
+        for order_id in outcome.order_ids:
+            if order_id not in order_ids:
+                order_ids.append(order_id)
+        if outcome.status not in _MONEY_OUT_STATUSES:
+            continue
+        row = by_symbol.get(outcome.symbol)
+        if row is None:
+            continue
+        if row.price and outcome.quantity:
+            value = float(row.price) * float(outcome.quantity)
+        else:
+            value = float(row.estimated_value)
+        if row.is_buy:
+            buy_value += value
+        elif row.is_sell:
+            sell_value += value
+
+    return {
+        "submitted_buy_value": buy_value,
+        "submitted_sell_value": sell_value,
+        # Never negative: a rebalance funded entirely by its own sells consumes
+        # no income, and a negative would be handed to the ledger as a budget.
+        "net_buy_value": max(0.0, buy_value - sell_value),
+        "order_ids": order_ids,
+    }
+
+
+def _finalise_run(run_id: int, totals: Dict[str, Any]) -> float:
+    """Write the run's totals and spend the ledger, in ONE store transaction.
+
+    The net buy value is deliberately NOT passed: the store derives it from the
+    totals it is writing, on the row as it re-reads it. That is what makes
+    "consumed nothing because the caller handed over a stale zero" unrepresentable.
+
+    Returns:
+        float: what the ledger actually gave up -- possibly LESS than the net buy
+        value, which is not an error (buying power, not the ledger, is the
+        feasibility constraint), and 0.0 when the run row could not be found.
+    """
+    from .portfolio_allocation_store import finalise_allocation_run
+
+    try:
+        finalised = finalise_allocation_run(
+            run_id,
+            submitted_buy_value=totals["submitted_buy_value"],
+            submitted_sell_value=totals["submitted_sell_value"],
+            order_ids=totals["order_ids"])
+    except InstanceNotFound:
+        logger.error(f"Allocation run {run_id} vanished before it could be finalised; "
+                     f"its income was NOT consumed")
+        return 0.0
+    return finalised.income_consumed_amount
+
+
+def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionState],
+                   base: BaseSnapshot, *, mode: str,
+                   scope_label: Optional[str] = None) -> Dict[str, Any]:
+    """Submit a reviewed plan and record it. The single Submit entry point.
+
+    Order of operations:
+      1. INSERT the ``portfolio_allocation_run`` row with the plan snapshot and
+         zero submitted values, so its id can be stamped into every order comment.
+      2. Submit (sells first, buys descending, per-row outcomes).
+      3. FINALISE: write what was actually submitted AND consume the income
+         ledger by the resulting net buy value -- one call, one transaction,
+         idempotent on the run id.
+      4. log_activity.
+
+    Partial failure is normal and is reported per row; nothing is rolled back,
+    and a run that submitted NOTHING is still finalised -- an unfinalised run
+    sits in ``get_unconsumed_runs()``, which is meant to mean "money may have
+    moved and only the broker knows", not "this run had nothing to do".
+
+    ``allow_fractional`` is taken from the plan and from nowhere else: it is the
+    setting the dry run the user approved was solved with.
+    """
+    from .portfolio_allocation_store import record_allocation_run
+
+    run = record_allocation_run(
+        account.id, mode, plan.to_dict(),
+        scope_label=scope_label,
+        base_notional=base.base_notional,
+        available_buying_power=base.available_buying_power,
+        allow_fractional=bool(plan.allow_fractional),
+    )
+    run_id = run.id
+
+    try:
+        outcomes = submit_plan(account, plan, current, run_tag=str(run_id),
+                               allow_fractional=bool(plan.allow_fractional))
+    except Exception:
+        # submit_plan validates BEFORE its first order and catches per row, so a
+        # raise out of it means nothing went out. Stamp the run as having taken
+        # nothing rather than leaving a phantom in the recovery queue forever.
+        logger.error(f"Allocation run {run_id} was refused before any order was sent",
+                     exc_info=True)
+        _finalise_run(run_id, {"submitted_buy_value": 0.0, "submitted_sell_value": 0.0,
+                               "order_ids": []})
+        raise
+
+    totals = summarise_outcomes(plan, outcomes)
+    income_consumed = _finalise_run(run_id, totals)
+
+    counts = {status: sum(1 for o in outcomes if o.status == status)
+              for status in (OUTCOME_SUBMITTED, OUTCOME_PARTIAL, OUTCOME_WASHTRADE_LOCKED,
+                             OUTCOME_FAILED, OUTCOME_SKIPPED)}
+    failed = counts[OUTCOME_FAILED]
+    reached_the_broker = counts[OUTCOME_SUBMITTED] + counts[OUTCOME_PARTIAL]
+    if not failed:
+        severity = ActivityLogSeverity.SUCCESS
+    elif reached_the_broker:
+        severity = ActivityLogSeverity.WARNING
+    else:
+        # Nothing at all got out. WARNING would read as "mostly fine".
+        severity = ActivityLogSeverity.FAILURE
+
+    log_activity(
+        severity,
+        ActivityLogType.ORDER_SUBMITTED,
+        RUN_ACTIVITY_FMT.format(
+            run_id=run_id,
+            scope=f"{mode} / {scope_label}" if scope_label else mode,
+            submitted=counts[OUTCOME_SUBMITTED],
+            partial=counts[OUTCOME_PARTIAL],
+            locked=counts[OUTCOME_WASHTRADE_LOCKED],
+            failed=failed,
+            skipped=counts[OUTCOME_SKIPPED]),
+        data={
+            "run_id": run_id,
+            "mode": mode,
+            "scope_label": scope_label,
+            "submitted_buy_value": totals["submitted_buy_value"],
+            "submitted_sell_value": totals["submitted_sell_value"],
+            "income_consumed": income_consumed,
+            "rows": [o.to_dict() for o in outcomes],
+        },
+        source_account_id=account.id,
+    )
+
+    return {
+        "run_id": run_id,
+        "outcomes": outcomes,
+        "submitted_buy_value": totals["submitted_buy_value"],
+        "submitted_sell_value": totals["submitted_sell_value"],
+        "order_ids": totals["order_ids"],
+        "income_consumed": income_consumed,
+    }

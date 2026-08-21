@@ -683,3 +683,151 @@ def test_the_income_panel_shows_no_consumption_percentage(nicegui_client):
 
     assert not any('%' in t for t in texts)
     assert bars == []
+
+
+# ---------------------------------------------------------------------------
+# Task 75: the per-row outcome table. Partial failure is NORMAL -- a failed row
+# sits next to a filled one and nothing is rolled back -- so the table has to
+# describe what happened at the broker, not what was intended.
+# ---------------------------------------------------------------------------
+
+
+def _outcomes():
+    from ba2_trade_platform.core import portfolio_allocation_service as svc
+
+    return [
+        svc.RowOutcome(symbol="MSFT", action="close", status=svc.OUTCOME_SUBMITTED,
+                       quantity=5.0, filled_quantity=5.0, transaction_ids=[7]),
+        svc.RowOutcome(symbol="AAPL", action="new", status=svc.OUTCOME_SUBMITTED,
+                       quantity=10.0, path="whole", order_ids=[101]),
+        svc.RowOutcome(symbol="NVDA", action="new", status=svc.OUTCOME_PARTIAL,
+                       quantity=4.0, filled_quantity=1.5, path="fractional",
+                       order_ids=[102], message="partially filled: 1.5 of 4.0"),
+        svc.RowOutcome(symbol="TSLA", action="new", status=svc.OUTCOME_FAILED,
+                       quantity=2.0, path="whole", order_ids=[103],
+                       message="insufficient buying power"),
+        svc.RowOutcome(symbol="KO", action="new", status=svc.OUTCOME_WASHTRADE_LOCKED,
+                       quantity=3.0, order_ids=[104],
+                       message="wash-trade gate locked this symbol"),
+        svc.RowOutcome(symbol="SCHD", action="skip", status=svc.OUTCOME_SKIPPED,
+                       message="below the broker's $5 fractional minimum"),
+    ]
+
+
+@pytest.fixture
+def notifications(monkeypatch):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    seen = []
+    monkeypatch.setattr(wiz.ui, 'notify',
+                        lambda message, **kwargs: seen.append((message, kwargs.get('type'))))
+    return seen
+
+
+def test_the_outcome_table_lists_every_row_with_its_own_status(nicegui_client, notifications):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wiz.render_outcomes(_outcomes(), run_id=21)
+        texts = _rendered_texts(nicegui_client.layout)
+
+    for symbol in ("MSFT", "AAPL", "NVDA", "TSLA", "KO", "SCHD"):
+        assert symbol in texts
+    for status in ("submitted", "partially_filled", "failed", "washtrade_locked", "skipped"):
+        assert status in texts
+    assert any("21" in t for t in texts)
+
+
+def test_the_outcome_table_shows_a_failed_row_next_to_a_submitted_one(nicegui_client,
+                                                                     notifications):
+    """Nothing is rolled back, so the table is not "the run worked" or "the run
+    failed" -- it is per row, with the broker's own words on the failure."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wiz.render_outcomes(_outcomes(), run_id=21)
+        texts = _rendered_texts(nicegui_client.layout)
+
+    assert "insufficient buying power" in texts
+    assert "below the broker's $5 fractional minimum" in texts
+
+
+def test_the_outcome_table_shows_what_filled_when_it_differs_from_what_was_sent(
+        nicegui_client, notifications):
+    """A 4-share order that filled 1.5 is not a 4-share result. Showing only the
+    submitted quantity is the run reporting its intention as its outcome."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wiz.render_outcomes(_outcomes(), run_id=21)
+        filled = _marked_texts(nicegui_client.layout, wiz.MARKER_OUTCOME_FILLED)
+
+    # Row order is outcome order: MSFT, AAPL, NVDA, TSLA, KO, SCHD.
+    assert filled == ["5.0000", "-", "1.5000", "-", "-", "-"]
+
+
+def test_the_outcome_table_says_unknown_rather_than_zero_for_an_unreported_fill(
+        nicegui_client, notifications):
+    """``filled_quantity is None`` means the broker said nothing, which is not the
+    same as "nothing filled" -- an accepted market order before the open looks
+    exactly like this."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+    from ba2_trade_platform.core import portfolio_allocation_service as svc
+
+    with nicegui_client:
+        wiz.render_outcomes([svc.RowOutcome(symbol="AAPL", action="new",
+                                            status=svc.OUTCOME_SUBMITTED, quantity=10.0)])
+        filled = _marked_texts(nicegui_client.layout, wiz.MARKER_OUTCOME_FILLED)
+
+    assert filled == ["-"]
+
+
+def test_the_outcome_colour_map_covers_every_outcome_the_service_can_produce():
+    """The colours and the failure count are keyed on the service's own status
+    strings. Duplicating them as literals here is how a renamed constant silently
+    turns a run in which everything failed into a green "submitted"."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+    from ba2_trade_platform.core import portfolio_allocation_service as svc
+
+    assert set(wiz.OUTCOME_COLOURS) == {
+        svc.OUTCOME_SUBMITTED, svc.OUTCOME_PARTIAL, svc.OUTCOME_SKIPPED,
+        svc.OUTCOME_FAILED, svc.OUTCOME_WASHTRADE_LOCKED,
+    }
+
+
+def test_the_outcome_table_warns_when_a_row_failed(nicegui_client, notifications):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wiz.render_outcomes(_outcomes(), run_id=21)
+
+    assert notifications[-1][1] == 'warning'
+    assert '1 row(s) failed' in notifications[-1][0]
+
+
+def test_the_outcome_table_confirms_a_run_in_which_nothing_failed(nicegui_client,
+                                                                  notifications):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+    from ba2_trade_platform.core import portfolio_allocation_service as svc
+
+    with nicegui_client:
+        wiz.render_outcomes([svc.RowOutcome(symbol="AAPL", action="new",
+                                            status=svc.OUTCOME_SUBMITTED, quantity=10.0)])
+
+    assert notifications[-1][1] == 'positive'
+
+
+def test_the_outcome_table_says_when_a_symbol_is_wash_trade_locked(nicegui_client,
+                                                                   notifications):
+    """Not a failure -- the order is PENDING and gets retried -- but silence would
+    leave the user believing the symbol was traded."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+    from ba2_trade_platform.core import portfolio_allocation_service as svc
+
+    with nicegui_client:
+        wiz.render_outcomes([svc.RowOutcome(symbol="KO", action="new",
+                                            status=svc.OUTCOME_WASHTRADE_LOCKED,
+                                            quantity=3.0)])
+
+    assert notifications[-1][1] == 'warning'
+    assert 'wash-trade' in notifications[-1][0]

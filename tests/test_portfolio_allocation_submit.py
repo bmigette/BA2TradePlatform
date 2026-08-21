@@ -24,6 +24,7 @@ from ba2_trade_platform.core.portfolio_allocation import (
 )
 from ba2_trade_platform.core.TransactionHelper import TransactionHelper
 from ba2_trade_platform.core.types import (
+    ActivityLogSeverity, ActivityLogType,
     OrderDirection, OrderOpenType, OrderStatus, OrderType, TransactionStatus,
 )
 from ba2_trade_platform.core import portfolio_allocation_service as svc
@@ -1346,3 +1347,445 @@ def test_get_recent_income_events_never_reports_a_negative_open_amount(frozen_to
 
 def test_get_recent_income_events_is_empty_for_an_account_with_no_income(frozen_today):
     assert svc.get_recent_income_events(46) == []
+
+
+# ---------------------------------------------------------------------------
+# Task 75: what a run actually committed, the run row, and the activity log.
+# ---------------------------------------------------------------------------
+
+
+def make_base(buying_power=10_000.0, managed_value=5_000.0, cash=4_000.0):
+    return BaseSnapshot(
+        available_buying_power=buying_power,
+        managed_value=managed_value,
+        base_notional=buying_power + managed_value,
+        default_bp_factor=1.0,
+        cash=cash,
+    )
+
+
+def the_run():
+    with get_db() as session:
+        return session.exec(select(PortfolioAllocationRun)).one()
+
+
+@pytest.fixture
+def activity(monkeypatch):
+    """Capture log_activity instead of queueing it onto the async worker."""
+    calls = []
+    monkeypatch.setattr(
+        svc, "log_activity",
+        lambda severity, activity_type, description, data=None,
+        source_expert_id=None, source_account_id=None: calls.append({
+            "severity": severity, "type": activity_type, "description": description,
+            "data": data, "account_id": source_account_id,
+        }))
+    return calls
+
+
+def test_summarise_outcomes_counts_only_the_rows_that_were_submitted():
+    row_ok = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
+    row_bad = make_row("NVDA", OrderDirection.BUY, 4.0, 3600.0, 3600.0, price=900.0)
+    row_sell = make_row("MSFT", OrderDirection.SELL, -5.0, 2000.0, 0.0, price=400.0)
+    plan = AllocationPlan(rows=[row_ok, row_bad, row_sell], available_buying_power=10_000.0)
+
+    outcomes = [
+        svc.RowOutcome(symbol="AAPL", action=ACTION_NEW, status=svc.OUTCOME_SUBMITTED,
+                       quantity=10.0, order_ids=[101]),
+        svc.RowOutcome(symbol="NVDA", action=ACTION_NEW, status=svc.OUTCOME_FAILED,
+                       quantity=4.0, order_ids=[102]),
+        svc.RowOutcome(symbol="MSFT", action=ACTION_CLOSE, status=svc.OUTCOME_SUBMITTED,
+                       quantity=5.0, transaction_ids=[7]),
+    ]
+
+    totals = svc.summarise_outcomes(plan, outcomes)
+
+    assert totals["submitted_buy_value"] == pytest.approx(1600.0)
+    assert totals["submitted_sell_value"] == pytest.approx(2000.0)
+    assert totals["net_buy_value"] == pytest.approx(0.0)
+
+
+def test_summarise_outcomes_uses_the_quantity_that_actually_went_in():
+    # Fractional 2.5 was rejected and 2.0 whole shares filled instead.
+    row = make_row("NVDA", OrderDirection.BUY, 2.5, 2250.0, 2250.0, price=900.0)
+    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
+    outcomes = [svc.RowOutcome(symbol="NVDA", action=ACTION_NEW, status=svc.OUTCOME_SUBMITTED,
+                               quantity=2.0, path="whole", order_ids=[9])]
+
+    totals = svc.summarise_outcomes(plan, outcomes)
+
+    assert totals["submitted_buy_value"] == pytest.approx(1800.0)
+
+
+def test_summarise_outcomes_counts_a_partial_fill_as_money_that_went_out():
+    """A PARTIALLY_FILLED order is live at the broker and has already moved the
+    position. Counting it as zero would leave the income that funded it showing
+    as unallocated, for the NEXT run to spend on top of shares already bought."""
+    row = make_row("NVDA", OrderDirection.BUY, 4.0, 3600.0, 3600.0, price=900.0)
+    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
+    outcomes = [svc.RowOutcome(symbol="NVDA", action=ACTION_NEW, status=svc.OUTCOME_PARTIAL,
+                               quantity=4.0, filled_quantity=1.0, order_ids=[9])]
+
+    assert svc.summarise_outcomes(plan, outcomes)["submitted_buy_value"] == pytest.approx(3600.0)
+
+
+def test_summarise_outcomes_ignores_a_washtrade_locked_row():
+    """The order is PENDING at our end and nothing has been sent, so no money has
+    moved and no income may be consumed against it."""
+    row = make_row("NVDA", OrderDirection.BUY, 4.0, 3600.0, 3600.0, price=900.0)
+    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
+    outcomes = [svc.RowOutcome(symbol="NVDA", action=ACTION_NEW,
+                               status=svc.OUTCOME_WASHTRADE_LOCKED, quantity=4.0,
+                               order_ids=[9])]
+
+    assert svc.summarise_outcomes(plan, outcomes)["submitted_buy_value"] == pytest.approx(0.0)
+
+
+def test_summarise_outcomes_ignores_a_skipped_row():
+    row = make_row("NVDA", OrderDirection.BUY, 4.0, 3600.0, 3600.0, price=900.0)
+    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
+    outcomes = [svc.RowOutcome(symbol="NVDA", action=ACTION_SKIP, status=svc.OUTCOME_SKIPPED)]
+
+    totals = svc.summarise_outcomes(plan, outcomes)
+    assert totals["submitted_buy_value"] == pytest.approx(0.0)
+    assert totals["order_ids"] == []
+
+
+def test_summarise_outcomes_reports_every_order_row_the_run_created():
+    """``portfolio_allocation_run.order_ids`` is "TradingOrder ids created by this
+    run", and the row the broker REFUSED is one of them -- it is persisted, marked
+    ERROR, and carries the reason. Recording only the accepted ones leaves the
+    audit unable to point at the failure it is reporting."""
+    row_ok = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
+    row_bad = make_row("NVDA", OrderDirection.BUY, 4.0, 3600.0, 3600.0, price=900.0)
+    plan = AllocationPlan(rows=[row_ok, row_bad], available_buying_power=10_000.0)
+    outcomes = [
+        svc.RowOutcome(symbol="AAPL", action=ACTION_NEW, status=svc.OUTCOME_SUBMITTED,
+                       quantity=10.0, order_ids=[101]),
+        # The fractional fallback: one refused order and one accepted one.
+        svc.RowOutcome(symbol="NVDA", action=ACTION_NEW, status=svc.OUTCOME_FAILED,
+                       quantity=4.0, order_ids=[102, 103]),
+    ]
+
+    assert svc.summarise_outcomes(plan, outcomes)["order_ids"] == [101, 102, 103]
+
+
+def test_summarise_outcomes_falls_back_to_the_row_estimate_when_there_is_no_price():
+    row = AllocationRow(symbol="AAPL", price=None, delta_quantity=10.0,
+                        side=OrderDirection.BUY, estimated_value=1600.0)
+    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
+    outcomes = [svc.RowOutcome(symbol="AAPL", action=ACTION_NEW,
+                               status=svc.OUTCOME_SUBMITTED, quantity=10.0)]
+
+    assert svc.summarise_outcomes(plan, outcomes)["submitted_buy_value"] == pytest.approx(1600.0)
+
+
+def test_summarise_outcomes_never_reports_a_negative_net_buy_value():
+    """A rebalance funded entirely by its own sells consumes no income -- and a
+    negative net would be handed to the ledger as a budget."""
+    row = make_row("MSFT", OrderDirection.SELL, -5.0, 2000.0, 0.0, price=400.0)
+    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
+    outcomes = [svc.RowOutcome(symbol="MSFT", action=ACTION_CLOSE,
+                               status=svc.OUTCOME_SUBMITTED, quantity=5.0)]
+
+    totals = svc.summarise_outcomes(plan, outcomes)
+    assert totals["submitted_sell_value"] == pytest.approx(2000.0)
+    assert totals["net_buy_value"] == pytest.approx(0.0)
+
+
+def test_summarise_outcomes_ignores_an_outcome_for_a_symbol_the_plan_never_had():
+    plan = AllocationPlan(rows=[], available_buying_power=10_000.0)
+    outcomes = [svc.RowOutcome(symbol="GHOST", action=ACTION_NEW,
+                               status=svc.OUTCOME_SUBMITTED, quantity=10.0)]
+
+    assert svc.summarise_outcomes(plan, outcomes)["submitted_buy_value"] == pytest.approx(0.0)
+
+
+# -- run_allocation ---------------------------------------------------------
+
+
+def _buy_plan(symbol="AAPL", quantity=10.0, price=160.0, **plan_kwargs):
+    row = make_row(symbol, OrderDirection.BUY, quantity, quantity * price,
+                   quantity * price, price=price)
+    row.target_quantity = quantity
+    plan_kwargs.setdefault("available_buying_power", 10_000.0)
+    return AllocationPlan(rows=[row], **plan_kwargs)
+
+
+def test_run_allocation_persists_a_run_row_carrying_the_plan_and_the_order_ids(activity):
+    account = FakeAccount(account_id=31)
+    account.positions = []
+    plan = _buy_plan(base_notional=15_000.0, total_buy_value=1600.0)
+
+    result = svc.run_allocation(account, plan, {}, make_base(),
+                                mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    run = the_run()
+    assert run.id == result["run_id"]
+    assert run.account_id == 31
+    assert run.mode == ALLOCATION_MODE_REBALANCE
+    assert run.base_notional == pytest.approx(15_000.0)
+    assert run.submitted_buy_value == pytest.approx(1600.0)
+    assert run.order_ids == result["outcomes"][0].order_ids
+    assert run.plan_json["rows"][0]["symbol"] == "AAPL"
+
+
+def test_run_allocation_carries_the_scope_label_of_an_invest_run(activity):
+    account = FakeAccount(account_id=47)
+    account.positions = []
+
+    svc.run_allocation(account, _buy_plan(), {}, make_base(),
+                       mode=ALLOCATION_MODE_INVEST_LABEL, scope_label="ARK26")
+
+    run = the_run()
+    assert run.mode == ALLOCATION_MODE_INVEST_LABEL
+    assert run.scope_label == "ARK26"
+
+
+def test_run_allocation_stamps_the_run_id_into_every_order_comment(activity):
+    account = FakeAccount(account_id=32)
+    account.positions = []
+
+    result = svc.run_allocation(account, _buy_plan(), {}, make_base(),
+                                mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    comment = account.submitted[0][3]
+    assert str(result["run_id"]) in comment
+    assert "closing" not in comment.lower()
+
+
+def test_run_allocation_partial_failure_records_only_what_was_submitted(activity):
+    account = FakeAccount(account_id=33)
+    account.positions = []
+    account.reject_quantities = {4.0}
+    ok = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
+    ok.target_quantity = 10.0
+    bad = make_row("NVDA", OrderDirection.BUY, 4.0, 3600.0, 3600.0, price=900.0)
+    bad.target_quantity = 4.0
+    plan = AllocationPlan(rows=[ok, bad], available_buying_power=10_000.0)
+
+    result = svc.run_allocation(account, plan, {}, make_base(),
+                                mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    run = the_run()
+    assert run.submitted_buy_value == pytest.approx(1600.0)
+    statuses = {o.symbol: o.status for o in result["outcomes"]}
+    assert statuses["AAPL"] == svc.OUTCOME_SUBMITTED
+    assert statuses["NVDA"] == svc.OUTCOME_FAILED
+
+
+def test_run_allocation_finalises_a_run_in_which_every_row_failed(activity):
+    """A run that submitted nothing must still be finalised. Left unstamped it
+    sits in ``get_unconsumed_runs()`` looking like a run that died mid-submit --
+    the one signal that is supposed to mean "a human has to check the broker"."""
+    from ba2_trade_platform.core.portfolio_allocation_store import get_unconsumed_runs
+
+    account = FakeAccount(account_id=48)
+    account.positions = []
+    account.reject_quantities = {10.0}
+
+    result = svc.run_allocation(account, _buy_plan(), {}, make_base(),
+                                mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    assert result["submitted_buy_value"] == pytest.approx(0.0)
+    assert the_run().submitted_buy_value == pytest.approx(0.0)
+    assert get_unconsumed_runs(48) == []
+
+
+def test_run_allocation_consumes_income_up_to_the_net_buy_value(activity):
+    account = FakeAccount(account_id=34)
+    account.positions = []
+    add_instance(PortfolioIncomeEvent(account_id=34, external_id="dep-1",
+                                      event_date=date(2026, 5, 1),
+                                      event_type=CASH_TRANSFER_DEPOSIT, amount=5_000.0))
+
+    result = svc.run_allocation(account, _buy_plan(), {}, make_base(),
+                                mode=ALLOCATION_MODE_INVEST_LABEL, scope_label="ARK26")
+
+    assert result["income_consumed"] == pytest.approx(1600.0)
+    assert svc.get_open_income_total(34) == pytest.approx(3_400.0)
+
+
+def test_run_allocation_reports_a_ledger_shortfall_without_calling_it_an_error(activity):
+    """Buying power, not the ledger, is the feasibility constraint: a run may buy
+    more than the income it has, and the ledger simply gives up everything it has."""
+    account = FakeAccount(account_id=49)
+    account.positions = []
+    add_instance(PortfolioIncomeEvent(account_id=49, external_id="dep-1",
+                                      event_date=date(2026, 5, 1),
+                                      event_type=CASH_TRANSFER_DEPOSIT, amount=500.0))
+
+    result = svc.run_allocation(account, _buy_plan(), {}, make_base(),
+                                mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    assert result["submitted_buy_value"] == pytest.approx(1600.0)
+    assert result["income_consumed"] == pytest.approx(500.0)
+    assert svc.get_open_income_total(49) == pytest.approx(0.0)
+
+
+def test_run_allocation_of_a_rebalance_funded_by_its_own_sells_consumes_no_income(activity):
+    account = FakeAccount(account_id=50)
+    account.positions = []
+    add_instance(PortfolioIncomeEvent(account_id=50, external_id="dep-1",
+                                      event_date=date(2026, 5, 1),
+                                      event_type=CASH_TRANSFER_DEPOSIT, amount=5_000.0))
+    txn_id = make_open_transaction(50, "MSFT", 5.0)
+    buy = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
+    buy.target_quantity = 10.0
+    sell = make_row("MSFT", OrderDirection.SELL, -5.0, 2000.0, 0.0, price=400.0)
+    sell.target_quantity = 0.0
+    plan = AllocationPlan(rows=[buy, sell], available_buying_power=10_000.0)
+    current = {"MSFT": PositionState(symbol="MSFT", quantity=5.0, price=400.0,
+                                     transaction_ids=[txn_id])}
+
+    result = svc.run_allocation(account, plan, current, make_base(),
+                                mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    assert result["submitted_sell_value"] == pytest.approx(2000.0)
+    assert result["income_consumed"] == pytest.approx(0.0)
+    assert svc.get_open_income_total(50) == pytest.approx(5_000.0)
+
+
+def test_run_allocation_logs_the_activity_against_the_account(activity):
+    account = FakeAccount(account_id=51)
+    account.positions = []
+    add_instance(PortfolioIncomeEvent(account_id=51, external_id="dep-1",
+                                      event_date=date(2026, 5, 1),
+                                      event_type=CASH_TRANSFER_DEPOSIT, amount=5_000.0))
+
+    result = svc.run_allocation(account, _buy_plan(), {}, make_base(),
+                                mode=ALLOCATION_MODE_INVEST_LABEL, scope_label="ARK26")
+
+    assert len(activity) == 1
+    entry = activity[0]
+    assert entry["severity"] == ActivityLogSeverity.SUCCESS
+    assert entry["type"] == ActivityLogType.ORDER_SUBMITTED
+    assert entry["account_id"] == 51
+    assert str(result["run_id"]) in entry["description"]
+    assert "ARK26" in entry["description"]
+    assert entry["data"]["run_id"] == result["run_id"]
+    assert entry["data"]["income_consumed"] == pytest.approx(1600.0)
+    assert entry["data"]["rows"][0]["symbol"] == "AAPL"
+
+
+def test_run_allocation_logs_a_failure_when_nothing_reached_the_broker(activity):
+    """WARNING would read as "mostly fine" for a run in which every order was
+    refused. ActivityLogSeverity.FAILURE exists for exactly this."""
+    account = FakeAccount(account_id=52)
+    account.positions = []
+    account.reject_quantities = {10.0}
+
+    svc.run_allocation(account, _buy_plan(), {}, make_base(),
+                       mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    assert activity[0]["severity"] == ActivityLogSeverity.FAILURE
+
+
+def test_run_allocation_logs_a_warning_when_only_some_rows_failed(activity):
+    account = FakeAccount(account_id=53)
+    account.positions = []
+    account.reject_quantities = {4.0}
+    ok = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
+    ok.target_quantity = 10.0
+    bad = make_row("NVDA", OrderDirection.BUY, 4.0, 3600.0, 3600.0, price=900.0)
+    bad.target_quantity = 4.0
+    plan = AllocationPlan(rows=[ok, bad], available_buying_power=10_000.0)
+
+    svc.run_allocation(account, plan, {}, make_base(),
+                       mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    assert activity[0]["severity"] == ActivityLogSeverity.WARNING
+
+
+def test_run_allocation_submits_on_the_plans_own_fractional_setting(activity, monkeypatch):
+    """Never on a flag the caller passes alongside: that is the setting the DRY
+    RUN was solved with, and the two disagreeing sends quantities nobody saw."""
+    seen = {}
+
+    def _fake_submit(account, plan, current, *, run_tag, allow_fractional):
+        seen.update(run_tag=run_tag, allow_fractional=allow_fractional)
+        return []
+
+    monkeypatch.setattr(svc, "submit_plan", _fake_submit)
+    account = FakeAccount(account_id=54)
+    plan = _buy_plan()
+    plan.allow_fractional = True
+
+    result = svc.run_allocation(account, plan, {}, make_base(),
+                                mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    assert seen == {"run_tag": str(result["run_id"]), "allow_fractional": True}
+    assert the_run().allow_fractional is True
+
+
+def test_run_allocation_records_an_empty_run_when_submission_refuses_the_plan(
+        activity, monkeypatch):
+    """``submit_plan`` validates BEFORE its first order and catches per row, so a
+    raise out of it means nothing went out. Leaving the run unstamped would put a
+    phantom into ``get_unconsumed_runs()`` -- the queue that is supposed to mean
+    "money may have moved and only the broker knows"."""
+    from ba2_trade_platform.core.portfolio_allocation_store import get_unconsumed_runs
+
+    def _refuse(*args, **kwargs):
+        raise ValueError("the dry run the user approved is not what would be sent")
+
+    monkeypatch.setattr(svc, "submit_plan", _refuse)
+    account = FakeAccount(account_id=55)
+    add_instance(PortfolioIncomeEvent(account_id=55, external_id="dep-1",
+                                      event_date=date(2026, 5, 1),
+                                      event_type=CASH_TRANSFER_DEPOSIT, amount=5_000.0))
+
+    with pytest.raises(ValueError):
+        svc.run_allocation(account, _buy_plan(), {}, make_base(),
+                           mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    run = the_run()
+    assert run.submitted_buy_value == pytest.approx(0.0)
+    assert get_unconsumed_runs(55) == []
+    assert svc.get_open_income_total(55) == pytest.approx(5_000.0)
+
+
+def test_finalising_a_run_twice_never_consumes_the_income_twice():
+    """A retried submit must not spend the ledger again. The guard is
+    ``portfolio_allocation_run.income_consumed_at``, checked and set in the same
+    transaction as the ledger writes, so there is no window to lose money in."""
+    from ba2_trade_platform.core.portfolio_allocation_store import (
+        finalise_allocation_run, record_allocation_run,
+    )
+    add_instance(PortfolioIncomeEvent(account_id=35, external_id="dep-1",
+                                      event_date=date(2026, 5, 1),
+                                      event_type=CASH_TRANSFER_DEPOSIT, amount=5_000.0))
+    run = record_allocation_run(35, ALLOCATION_MODE_REBALANCE, {})
+
+    for _ in range(2):
+        finalised = finalise_allocation_run(run.id, submitted_buy_value=1600.0,
+                                            submitted_sell_value=0.0, order_ids=[101])
+        assert finalised.income_consumed_amount == pytest.approx(1600.0)
+
+    assert svc.get_open_income_total(35) == pytest.approx(3_400.0)
+
+
+def test_run_allocation_finalises_a_run_that_had_nothing_to_submit(activity):
+    """No order rows at all -- every row was suppressed by the engine. The run
+    still has to be stamped: ``get_unconsumed_runs()`` means "money may have moved
+    and only the broker knows", and a run that never created an order is the exact
+    opposite of that. Finalising is also what proves it consumed no income."""
+    from ba2_trade_platform.core.portfolio_allocation_store import get_unconsumed_runs
+
+    account = FakeAccount(account_id=56)
+    account.positions = []
+    add_instance(PortfolioIncomeEvent(account_id=56, external_id="dep-1",
+                                      event_date=date(2026, 5, 1),
+                                      event_type=CASH_TRANSFER_DEPOSIT, amount=5_000.0))
+    suppressed = AllocationRow(
+        symbol="SCHD", price=3.0, delta_quantity=0.0, side=None, fractional=True,
+        reasons=[REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_FMT.format(value=1.95, minimum=5.0)])
+    plan = AllocationPlan(rows=[suppressed], available_buying_power=10_000.0)
+
+    result = svc.run_allocation(account, plan, {}, make_base(),
+                                mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    assert account.submitted == [] and account.closed == []
+    assert result["order_ids"] == []
+    assert get_unconsumed_runs(56) == []
+    assert svc.get_open_income_total(56) == pytest.approx(5_000.0)

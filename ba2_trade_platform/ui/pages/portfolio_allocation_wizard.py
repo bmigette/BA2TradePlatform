@@ -35,6 +35,13 @@ from ...core.portfolio_allocation import (
     steps_validation_messages,
     summarise_plan,
 )
+from ...core.portfolio_allocation_service import (
+    OUTCOME_FAILED,
+    OUTCOME_PARTIAL,
+    OUTCOME_SKIPPED,
+    OUTCOME_SUBMITTED,
+    OUTCOME_WASHTRADE_LOCKED,
+)
 from ...logger import logger
 
 #: Shown above the dry-run table whenever any row will be sent as a FRACTIONAL
@@ -535,6 +542,66 @@ def render_income_panel(events: List[Dict], open_total: float,
                 ui.label(f"{event['open_amount']:,.2f}").classes('w-28')
 
 
+#: Status -> colour class. Keyed on the SERVICE's own constants, never on
+#: literals: a renamed constant would silently stop matching, and the failure
+#: count below would then read 0 for a run in which everything failed.
+OUTCOME_COLOURS = {
+    OUTCOME_SUBMITTED: 'text-green-500',
+    OUTCOME_PARTIAL: 'text-yellow-500',
+    OUTCOME_SKIPPED: 'text-gray-400',
+    OUTCOME_WASHTRADE_LOCKED: 'text-orange-400',
+    OUTCOME_FAILED: 'text-red-500',
+}
+
+#: NiceGUI marker on the outcome table's "Filled" cell, so a test can read the
+#: column without matching on a quantity string that also appears in "Qty".
+MARKER_OUTCOME_FILLED = 'outcome-filled'
+
+
 def render_outcomes(outcomes: List, *, run_id: Optional[int] = None) -> None:
-    """Placeholder replaced in Task 75."""
-    ui.label(f'{len(outcomes)} row(s) processed')
+    """Per-row outcome table shown after Submit.
+
+    Partial failure is normal: a failed row sits next to a filled one and nothing
+    is rolled back, so every row is listed with its own status and message.
+
+    ``Filled`` is shown next to ``Qty`` because they differ in the cases that
+    matter: a partially filled order, and a fractional order that fell back to
+    whole shares. ``filled_quantity is None`` means the broker reported no fill
+    at all -- an accepted market order before the open looks exactly like that --
+    and is drawn as "-", never as 0, which would read as "nothing filled".
+    """
+    with ui.dialog() as dialog, ui.card().classes('w-full max-w-3xl'):
+        title = f'Allocation run {run_id} - results' if run_id else 'Allocation run - results'
+        ui.label(title).classes('text-lg font-bold')
+        with ui.row().classes('w-full text-xs font-bold border-b py-1'):
+            for header, width in (('Symbol', 'w-24'), ('Action', 'w-24'), ('Status', 'w-36'),
+                                  ('Qty', 'w-24'), ('Filled', 'w-24'), ('Path', 'w-24'),
+                                  ('Detail', 'flex-1')):
+                ui.label(header).classes(width)
+        for outcome in outcomes:
+            with ui.row().classes('w-full text-sm border-b py-1'):
+                ui.label(outcome.symbol).classes('w-24 font-medium')
+                ui.label(outcome.action).classes('w-24')
+                ui.label(outcome.status).classes(
+                    'w-36 ' + OUTCOME_COLOURS.get(outcome.status, ''))
+                ui.label(f'{outcome.quantity:,.4f}').classes('w-24')
+                ui.label('-' if outcome.filled_quantity is None
+                         else f'{outcome.filled_quantity:,.4f}') \
+                    .classes('w-24').mark(MARKER_OUTCOME_FILLED)
+                ui.label(outcome.path or '-').classes('w-24')
+                ui.label(outcome.message or '').classes('flex-1 text-xs text-gray-400')
+        with ui.row().classes('w-full justify-end mt-2'):
+            ui.button('Close', on_click=dialog.close).props('flat')
+    dialog.open()
+
+    failed = sum(1 for o in outcomes if o.status == OUTCOME_FAILED)
+    locked = sum(1 for o in outcomes if o.status == OUTCOME_WASHTRADE_LOCKED)
+    if failed:
+        ui.notify(f'{failed} row(s) failed - see the results table', type='warning')
+    elif locked:
+        # Not a failure: the order is PENDING at our end and is retried once the
+        # blocker clears. Saying nothing would leave the user believing it traded.
+        ui.notify(f'{locked} row(s) are wash-trade locked and will be retried',
+                  type='warning')
+    else:
+        ui.notify('Allocation run submitted', type='positive')
