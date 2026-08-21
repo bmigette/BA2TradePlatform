@@ -251,8 +251,13 @@ def _solve_plan(account_id: int, *, mode: str, labels, scope_label, amount: floa
             base.base_notional, base.available_buying_power, labels, current, margin,
             allow_fractional=allow_fractional,
             default_bp_factor=base.default_bp_factor, valuation_mode=valuation_mode)
+    # ``margin`` is REQUIRED and is the SAME dict the plan above was solved with:
+    # the precheck may re-solve, and a re-solve without it rebuilds a bare
+    # MarginInfo per fractional row and rounds on the default 4dp grid, losing
+    # min_trade_increment / min_order_size / min_fractional_notional.
     plan = svc.precheck_plan(account, plan,
-                             available_buying_power=base.available_buying_power)
+                             available_buying_power=base.available_buying_power,
+                             margin=margin)
     return base, plan, current, svc.fetch_market_hours(account)
 
 

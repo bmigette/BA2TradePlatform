@@ -928,3 +928,337 @@ def test_the_comment_inputs_are_debounced_rather_than_saving_per_keystroke(
                  if isinstance(el, ui.table))
     template = table.slots['body-cell-comment'].template
     assert f'debounce="{page.COMMENT_DEBOUNCE_MS}"' in template
+
+
+# ---------------------------------------------------------------------------
+# The page -> service seam, driven END TO END
+#
+# Everything above this line stops at the page's own helpers. Nothing exercised
+# ``_solve_plan`` or the Allocate flow, so
+# ``svc.precheck_plan(account, plan, available_buying_power=...)`` -- a call
+# missing the REQUIRED keyword-only ``margin`` -- shipped, and every live dry run
+# raised TypeError at the last line of the solve. A 2,300-test suite was green.
+#
+# Two guards, deliberately different in kind:
+#   * these behavioural tests, which run the real page functions against a fake
+#     broker and would have caught it as a broken dry run; and
+#   * ``test_every_page_call_into_the_service_matches_its_real_signature``, which
+#     binds every call site with ``inspect.signature`` and catches drift in a call
+#     no behavioural test happens to reach.
+# ---------------------------------------------------------------------------
+
+from datetime import datetime, timedelta, timezone            # noqa: E402
+
+from ba2_trade_platform.core.account_types import (           # noqa: E402
+    MARKET_HOURS_SOURCE_BROKER, AccountSnapshot, MarginInfo, MarketHours,
+)
+from ba2_trade_platform.core.portfolio_allocation import (    # noqa: E402
+    ALLOCATION_MODE_INVEST_LABEL, ALLOCATION_MODE_REBALANCE, LabelTarget, SymbolTarget,
+)
+
+#: A frozen instant inside a regular session, so nothing here depends on when the
+#: suite runs. 2026-01-05 is a Monday.
+_FROZEN_NOW = datetime(2026, 1, 5, 15, 0, tzinfo=timezone.utc)
+
+
+class _AllocAccount(_Account):
+    """``_Account`` plus every seam the allocation service actually reaches.
+
+    Deliberately NOT a bespoke duck type: it inherits the page tests' own account
+    double, so the gate, the label view and the allocation flow all run against
+    one object -- which is what makes a signature drift between the page and the
+    service show up as a failing behavioural test rather than as a TypeError in
+    front of a user.
+    """
+
+    def __init__(self, account_id, settings=None, *, buying_power=50_000.0,
+                 cash=50_000.0, market_open=True, **kwargs):
+        super().__init__(account_id, settings, **kwargs)
+        self.buying_power = buying_power
+        self.cash = cash
+        self.market_open = market_open
+        self.margin = {}                 # symbol -> MarginInfo
+        self.previewed = []              # [(symbol, quantity, is_closing_order)]
+        self.margin_requests = []        # [[symbols]]
+        self.market_hours_calls = 0
+        self.cache_clears = 0
+        self.submitted = []              # [(symbol, side, quantity)]
+        self.refresh_calls = 0
+
+    # -- ReadOnlyAccountInterface seams ---------------------------------------
+    def get_account_snapshot(self):
+        return AccountSnapshot(cash=self.cash, equity=self.cash,
+                               net_liquidation=self.cash,
+                               buying_power=self.buying_power,
+                               margin_multiplier=1.0, is_margin_account=False,
+                               supports_fractional=True)
+
+    def get_symbol_margin_info(self, symbols):
+        self.margin_requests.append(list(symbols))
+        return {s: self.margin[s] for s in symbols if s in self.margin}
+
+    def get_market_hours(self, *, now=None):
+        self.market_hours_calls += 1
+        return MarketHours(
+            is_open=self.market_open, source=MARKET_HOURS_SOURCE_BROKER,
+            as_of=_FROZEN_NOW,
+            next_open=None if self.market_open else _FROZEN_NOW + timedelta(hours=18))
+
+    def clear_market_hours_cache(self):
+        self.cache_clears += 1
+
+    def get_cash_transfers(self, start_date=None, end_date=None):
+        return []
+
+    # -- AccountInterface seams -----------------------------------------------
+    def preview_order_impact(self, trading_order, is_closing_order=False):
+        self.previewed.append((trading_order.symbol, trading_order.quantity,
+                               is_closing_order))
+        return None                      # "this broker has no precheck"
+
+    def submit_order(self, order, is_closing_order=False):
+        from ba2_trade_platform.core.db import add_instance
+        from ba2_trade_platform.core.types import OrderStatus
+        if order.id is None:
+            order.status = OrderStatus.PENDING
+            order.id = add_instance(order, expunge_after_flush=True)
+        self.submitted.append((order.symbol, order.side, order.quantity))
+        order.status = OrderStatus.FILLED
+        order.filled_qty = order.quantity
+        order.open_price = self._prices.get(order.symbol, 100.0)
+        return order
+
+    def refresh_orders(self, heuristic_mapping=False, fetch_all=False):
+        from ba2_trade_platform.core.db import get_db, update_instance
+        from ba2_trade_platform.core.models import TradingOrder
+        from ba2_trade_platform.core.types import OrderStatus
+        from sqlmodel import select as sqlmodel_select
+        self.refresh_calls += 1
+        with get_db() as session:
+            rows = list(session.exec(sqlmodel_select(TradingOrder).where(
+                TradingOrder.account_id == self.id)).all())
+            ids = [r.id for r in rows]
+        for order_id in ids:
+            from ba2_trade_platform.core.db import get_instance
+            row = get_instance(TradingOrder, order_id)
+            row.status = OrderStatus.FILLED
+            row.filled_qty = row.quantity
+            row.open_price = self._prices.get(row.symbol, 100.0)
+            update_instance(row)
+        return True
+
+
+def _alloc_labels(label='ARK26', symbols=('AAPL',)):
+    weight = 100.0 / len(symbols)
+    return [LabelTarget(label=label, target_pct=100.0,
+                        symbols=[SymbolTarget(symbol=s, weight_pct=weight)
+                                 for s in symbols])]
+
+
+def test_solve_plan_runs_the_whole_dry_run_against_a_broker(monkeypatch, account_id):
+    """The live dry run, end to end. This is the test the CRITICAL bug needed.
+
+    ``_solve_plan`` is the ONLY producer of the plan the wizard shows and of the
+    market hours that gate its Submit button, and every one of its broker reads
+    plus the service precheck runs on this path. Before the fix it raised
+    ``TypeError: precheck_plan() missing 1 required keyword-only argument:
+    'margin'`` on its very last statement, for every account and every mode.
+    """
+    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
+                            positions=[], prices={'AAPL': 200.0})
+    _use_account(monkeypatch, account)
+
+    base, plan, current, hours = page._solve_plan(
+        account_id, mode=ALLOCATION_MODE_REBALANCE, labels=_alloc_labels(),
+        scope_label=None, amount=0.0, allow_fractional=True,
+        valuation_mode=VALUATION_MODE_COST)
+
+    assert base.available_buying_power == 50_000.0
+    assert [r.symbol for r in plan.rows] == ['AAPL']
+    assert plan.buy_rows and plan.buy_rows[0].delta_quantity > 0
+    assert current['AAPL'].price == 200.0
+    assert hours is not None and hours.is_open is True
+
+
+def test_solve_plan_hands_the_precheck_the_margin_grid_the_plan_was_solved_on(
+        monkeypatch, account_id):
+    """``margin`` is not decoration: without it the re-solve rounds on the default
+    4dp grid and loses ``min_trade_increment`` / ``min_fractional_notional``, so a
+    plan that looks right up to submission is rejected by the broker."""
+    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
+                            positions=[], prices={'AAPL': 200.0})
+    account.margin = {'AAPL': MarginInfo(symbol='AAPL', fractionable=True,
+                                         bp_factor=1.0, min_trade_increment=0.25)}
+    _use_account(monkeypatch, account)
+
+    seen = {}
+    real_precheck = page.svc.precheck_plan
+
+    def _spy(acct, plan, **kwargs):
+        seen.update(kwargs)
+        return real_precheck(acct, plan, **kwargs)
+
+    monkeypatch.setattr(page.svc, 'precheck_plan', _spy)
+    page._solve_plan(account_id, mode=ALLOCATION_MODE_REBALANCE,
+                     labels=_alloc_labels(), scope_label=None, amount=0.0,
+                     allow_fractional=True, valuation_mode=VALUATION_MODE_COST)
+
+    assert set(seen) == {'available_buying_power', 'margin'}
+    assert seen['margin']['AAPL'].min_trade_increment == 0.25
+
+
+def test_solve_plan_in_invest_mode_reaches_the_service_too(monkeypatch, account_id):
+    """The income panel's Invest button takes the OTHER branch of ``_solve_plan``,
+    and it lands on the same precheck call."""
+    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
+                            positions=[], prices={'AAPL': 100.0})
+    _use_account(monkeypatch, account)
+
+    base, plan, current, hours = page._solve_plan(
+        account_id, mode=ALLOCATION_MODE_INVEST_LABEL, labels=_alloc_labels(),
+        scope_label='ARK26', amount=1_000.0, allow_fractional=True,
+        valuation_mode=VALUATION_MODE_COST)
+
+    assert plan.buy_rows and plan.buy_rows[0].symbol == 'AAPL'
+    assert hours.is_open is True
+
+
+def test_the_allocate_flow_opens_the_wizard_and_submits_through_the_service(
+        monkeypatch, nicegui_client, account_id):
+    """Allocate -> steps -> dry run -> Submit, with only the broker faked.
+
+    Drives the page's real closures (``_run_dry_run``, ``_on_dry_run``,
+    ``_do_submit``) rather than re-implementing them, so a drift anywhere between
+    the page, the wizard and the service surfaces here.
+    """
+    from ba2_trade_platform.core.portfolio_allocation_store import get_recent_runs
+
+    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
+                            positions=[], prices={'AAPL': 100.0})
+    _use_account(monkeypatch, account)
+    _capture_notifications(monkeypatch)
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL'], 'ARK26')
+
+    # The two dialog openers are captured rather than drawn: what is under test is
+    # the page's glue and the service beneath it, and the wizard's own rendering
+    # already has tests/test_portfolio_allocation_wizard_ui.py.
+    opened, steps, pending = {}, {}, []
+    monkeypatch.setattr(page, 'open_allocation_wizard',
+                        lambda *a, **kw: opened.update(kw, base=a[0], plan=a[1]))
+    monkeypatch.setattr(page, 'open_allocation_steps',
+                        lambda *a, **kw: steps.update(kw, base=a[0], labels=a[1]))
+    # The page uses ui.timer only to hop off a sync handler; queue the callback
+    # instead so the test can await it with the client's slot stack active.
+    monkeypatch.setattr(page.ui, 'timer',
+                        lambda _delay, callback, once=False: pending.append(callback))
+
+    _run_in_client(nicegui_client, lambda: page._open_allocation_flow(
+        account_id, VALUATION_MODE_COST, _noop_refresh))
+
+    # Step 1-3 opened with the account's real labels.
+    assert [lt.label for lt in steps['labels']] == ['ARK26']
+
+    # The user presses Continue.
+    steps['on_dry_run'](mode=ALLOCATION_MODE_REBALANCE, labels=steps['labels'],
+                        scope_label=None, amount=0.0, allow_fractional=True)
+    _run_in_client(nicegui_client, pending.pop())
+
+    assert opened['market'].allowed is True
+    assert [r.symbol for r in opened['plan'].rows] == ['AAPL']
+
+    # ...and Submit.
+    opened['on_submit'](opened['plan'])
+    _run_in_client(nicegui_client, pending.pop())
+
+    assert [s[0] for s in account.submitted] == ['AAPL']
+    runs = get_recent_runs(account_id)
+    assert len(runs) == 1 and runs[0].order_ids
+
+
+# ---------------------------------------------------------------------------
+# Signature drift: bind EVERY page/wizard call into the service
+# ---------------------------------------------------------------------------
+
+def _service_call_sites():
+    """``(path, lineno, name, node)`` for every call into the service module.
+
+    Parses the page and wizard with ``ast`` rather than importing and poking, so a
+    call inside a nested closure that no test happens to run is checked too.
+    Handles both the ``svc.<name>(...)`` alias and
+    ``from ...core.portfolio_allocation_service import <name>``.
+    """
+    import ast
+    import inspect as _inspect
+
+    from ba2_trade_platform.core import portfolio_allocation_service as service
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wizard_module
+
+    modules = [page, wizard_module]
+    out = []
+    for module in modules:
+        path = _inspect.getsourcefile(module)
+        tree = ast.parse(open(path, encoding='utf-8').read(), path)
+        aliases = set()
+        direct = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and (node.module or '').endswith(
+                    'portfolio_allocation_service'):
+                for item in node.names:
+                    direct[item.asname or item.name] = item.name
+            if isinstance(node, ast.ImportFrom) and (
+                    (node.module or '') == 'core' or (node.module or '').endswith('.core')):
+                for item in node.names:
+                    if item.name == 'portfolio_allocation_service':
+                        aliases.add(item.asname or item.name)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if (isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name)
+                    and func.value.id in aliases):
+                out.append((path, node.lineno, func.attr, node, service))
+            elif isinstance(func, ast.Name) and func.id in direct:
+                out.append((path, node.lineno, direct[func.id], node, service))
+    return out
+
+
+def test_the_page_really_does_call_into_the_service():
+    """Guards the guard: an AST walk that finds nothing would pass vacuously."""
+    names = {name for _p, _l, name, _n, _m in _service_call_sites()}
+    assert {'precheck_plan', 'run_allocation', 'build_position_states',
+            'fetch_market_hours'} <= names
+
+
+def test_every_page_call_into_the_service_matches_its_real_signature():
+    """Bind every page/wizard -> service call against ``inspect.signature``.
+
+    ``precheck_plan`` gained a REQUIRED keyword-only ``margin`` and the page's call
+    was never updated: every live dry run raised TypeError, and the whole suite
+    stayed green because nothing drove the page's solve. Reading the signature
+    from the module rather than from a hand-copied list means this keeps working
+    when a parameter is added, renamed or made required.
+    """
+    import ast
+    import inspect as _inspect
+
+    problems = []
+    for path, lineno, name, node, service in _service_call_sites():
+        target = getattr(service, name, None)
+        if target is None:
+            problems.append(f"{path}:{lineno} svc.{name} does not exist on the service")
+            continue
+        if not callable(target):
+            continue
+        if (any(isinstance(a, ast.Starred) for a in node.args)
+                or any(kw.arg is None for kw in node.keywords)):
+            continue                      # */** unpacking: not statically bindable
+        signature = _inspect.signature(target)
+        try:
+            signature.bind(*[None] * len(node.args),
+                           **{kw.arg: None for kw in node.keywords})
+        except TypeError as e:
+            problems.append(f"{path}:{lineno} svc.{name}(...) -> {e} "
+                            f"(real signature: {name}{signature})")
+    assert not problems, "page/wizard call sites that no longer match the service:\n" \
+                         + "\n".join(problems)
