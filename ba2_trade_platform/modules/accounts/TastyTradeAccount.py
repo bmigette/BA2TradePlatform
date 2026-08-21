@@ -5,10 +5,11 @@ from datetime import datetime, timezone, date, timedelta
 from concurrent.futures import TimeoutError as FutureTimeoutError
 
 from tastytrade.order import InstrumentType as TTInstrumentType
+from tastytrade.order import OrderStatus as TTOrderStatus
 
 from ...logger import logger
 from ...core.models import Position
-from ...core.types import OrderDirection
+from ...core.types import OrderDirection, OrderStatus
 from ...core.interfaces import ReadOnlyAccountInterface
 
 
@@ -282,14 +283,76 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
             f"TastyTrade ({skipped_non_equity} non-equity rows skipped)")
         return positions
 
+    #: TastyTrade order status -> platform OrderStatus. TastyTrade's enum lives in
+    #: tastytrade.order (imported here as TTOrderStatus); the platform's is
+    #: ba2_common.core.types.OrderStatus. Keep this the ONE place they meet.
+    _TT_STATUS_MAP = {
+        TTOrderStatus.RECEIVED: OrderStatus.NEW,
+        TTOrderStatus.ROUTED: OrderStatus.NEW,
+        TTOrderStatus.IN_FLIGHT: OrderStatus.PENDING_NEW,
+        TTOrderStatus.LIVE: OrderStatus.ACCEPTED,
+        TTOrderStatus.CONTINGENT: OrderStatus.WAITING_TRIGGER,
+        TTOrderStatus.FILLED: OrderStatus.FILLED,
+        TTOrderStatus.CANCELLED: OrderStatus.CANCELED,
+        TTOrderStatus.CANCEL_REQUESTED: OrderStatus.PENDING_CANCEL,
+        TTOrderStatus.REPLACE_REQUESTED: OrderStatus.PENDING_REPLACE,
+        TTOrderStatus.EXPIRED: OrderStatus.EXPIRED,
+        TTOrderStatus.REJECTED: OrderStatus.REJECTED,
+        TTOrderStatus.REMOVED: OrderStatus.CANCELED,
+        TTOrderStatus.PARTIALLY_REMOVED: OrderStatus.CANCELED,
+    }
+
+    #: TastyTrade statuses that mean "still working at the broker".
+    _TT_OPEN_STATUSES = (TTOrderStatus.RECEIVED, TTOrderStatus.ROUTED,
+                         TTOrderStatus.IN_FLIGHT, TTOrderStatus.LIVE,
+                         TTOrderStatus.CONTINGENT)
+
+    #: TastyTrade statuses that mean "done, one way or another".
+    _TT_CLOSED_STATUSES = (TTOrderStatus.FILLED, TTOrderStatus.CANCELLED,
+                           TTOrderStatus.EXPIRED, TTOrderStatus.REJECTED,
+                           TTOrderStatus.REMOVED)
+
+    @classmethod
+    def _tt_statuses_for(cls, status) -> Optional[List["TTOrderStatus"]]:
+        """Translate a platform status filter into the SDK's ``statuses=[...]`` list.
+
+        Returns ``None`` for "no filter" -- i.e. ``status`` is ``None`` or
+        ``OrderStatus.ALL``. The SDK filters server-side via the ``status[]`` query
+        param, so the argument must never be silently dropped (which is what
+        ``get_orders`` used to do, returning every order ever placed).
+        """
+        if status is None or status == OrderStatus.ALL:
+            return None
+        if status == OrderStatus.OPEN:
+            return list(cls._TT_OPEN_STATUSES)
+        if status == OrderStatus.CLOSED:
+            return list(cls._TT_CLOSED_STATUSES)
+        matches = [tt for tt, core in cls._TT_STATUS_MAP.items() if core == status]
+        if not matches:
+            logger.warning(
+                f"No TastyTrade order status maps to {status!r}; fetching unfiltered")
+            return None
+        return matches
+
     def get_orders(self, status=None) -> Any:
+        """All orders for this account, optionally filtered by platform OrderStatus.
+
+        Args:
+            status: a ``ba2_common.core.types.OrderStatus``. ``None`` and ``ALL``
+                mean unfiltered; ``OPEN``/``CLOSED`` expand to the matching
+                TastyTrade statuses.
+        """
         if not self._check_authentication():
             return []
         try:
             # page_offset=None is the SDK's "walk every page" sentinel
             # (session.py:389-419). Without it only the first 50 rows come back.
+            kwargs = {"page_offset": None}
+            statuses = self._tt_statuses_for(status)
+            if statuses:
+                kwargs["statuses"] = statuses
             orders = self._run_async(
-                self._account.get_order_history(self._session, page_offset=None))
+                self._account.get_order_history(self._session, **kwargs))
             logger.debug(f"[Account {self.id}] Retrieved {len(orders)} orders from TastyTrade")
             return orders
         except Exception as e:

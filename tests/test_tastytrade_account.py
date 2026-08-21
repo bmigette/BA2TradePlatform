@@ -376,3 +376,44 @@ def test_symbols_exist_requests_all_pages():
 
     assert result == {"AAPL": True, "MSFT": True}
     assert fake_get.call_args.kwargs["page_offset"] is None
+
+
+# ---------------------------------------------------------------------------
+# get_orders status filter
+# ---------------------------------------------------------------------------
+
+def test_get_orders_open_filter_asks_the_broker_for_working_statuses_only():
+    from ba2_trade_platform.core.types import OrderStatus
+
+    acct = _bare_account()
+    acct._account.get_order_history = AsyncMock(return_value=[])
+
+    acct.get_orders(status=OrderStatus.OPEN)
+
+    requested = acct._account.get_order_history.call_args.kwargs["statuses"]
+    assert set(requested) == {
+        TTOrderStatus.RECEIVED, TTOrderStatus.ROUTED, TTOrderStatus.IN_FLIGHT,
+        TTOrderStatus.LIVE, TTOrderStatus.CONTINGENT,
+    }
+
+
+def test_get_orders_all_filter_sends_no_status_filter():
+    from ba2_trade_platform.core.types import OrderStatus
+
+    acct = _bare_account()
+    acct._account.get_order_history = AsyncMock(return_value=[])
+
+    acct.get_orders(status=OrderStatus.ALL)
+
+    assert "statuses" not in acct._account.get_order_history.call_args.kwargs
+
+
+def test_get_orders_filled_filter_maps_to_the_tastytrade_filled_status():
+    from ba2_trade_platform.core.types import OrderStatus
+
+    acct = _bare_account()
+    acct._account.get_order_history = AsyncMock(return_value=[])
+
+    acct.get_orders(status=OrderStatus.FILLED)
+
+    assert acct._account.get_order_history.call_args.kwargs["statuses"] == [TTOrderStatus.FILLED]
