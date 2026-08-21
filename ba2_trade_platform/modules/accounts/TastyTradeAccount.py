@@ -618,55 +618,72 @@ class TastyTradeAccount(AccountInterface):
             logger.error(f"[Account {self.id}] Error checking symbols: {e}", exc_info=True)
             return {s: False for s in symbols}
 
+    #: get_market_data_by_type's COMBINED limit across ALL instrument types is 100 per
+    #: call (tastytrade/market_data.py:132), so symbol lists are chunked.
+    _MARKET_DATA_CHUNK = 100
+
+    @staticmethod
+    def _pick_price(data, price_type: str) -> Optional[float]:
+        """Resolve one MarketData row to a price, falling back down the ladder.
+
+        Returns ``None`` when the row carries no usable price -- never a fabricated
+        number (platform rule: no fallback values for live data).
+        """
+        if price_type == 'bid' and data.bid:
+            return float(data.bid)
+        if price_type == 'ask' and data.ask:
+            return float(data.ask)
+        if price_type == 'mid' and data.mid:
+            return float(data.mid)
+        if data.last:
+            return float(data.last)
+        if data.close:
+            return float(data.close)
+        return None
+
     def _get_instrument_current_price_impl(self, symbol_or_symbols, price_type='bid'):
+        """Fetch a single price or a bulk price map.
+
+        The list branch uses ``get_market_data_by_type``, which returns a whole batch
+        in ONE round trip -- chunked at ``_MARKET_DATA_CHUNK`` because the SDK's
+        combined limit is 100 symbols per call. A failing chunk leaves its symbols at
+        ``None`` rather than aborting the whole fetch.
+        """
         if not self._check_authentication():
             if isinstance(symbol_or_symbols, list):
                 return {s: None for s in symbol_or_symbols}
             return None
 
-        try:
-            from tastytrade.market_data import get_market_data
-            from tastytrade.order import InstrumentType
+        from tastytrade.market_data import get_market_data, get_market_data_by_type
+        from tastytrade.order import InstrumentType
 
-            if isinstance(symbol_or_symbols, str):
-                data = self._run_async(get_market_data(self._session, symbol_or_symbols, InstrumentType.EQUITY))
-                if price_type == 'bid' and data.bid:
-                    return float(data.bid)
-                elif price_type == 'ask' and data.ask:
-                    return float(data.ask)
-                elif price_type == 'mid' and data.mid:
-                    return float(data.mid)
-                elif data.last:
-                    return float(data.last)
-                elif data.close:
-                    return float(data.close)
+        if isinstance(symbol_or_symbols, str):
+            try:
+                data = self._run_async(
+                    get_market_data(self._session, symbol_or_symbols, InstrumentType.EQUITY))
+                return self._pick_price(data, price_type)
+            except Exception as e:
+                logger.error(
+                    f"[Account {self.id}] Error getting price for {symbol_or_symbols}: {e}",
+                    exc_info=True)
                 return None
-            else:
-                result = {}
-                for symbol in symbol_or_symbols:
-                    try:
-                        data = self._run_async(get_market_data(self._session, symbol, InstrumentType.EQUITY))
-                        if price_type == 'bid' and data.bid:
-                            result[symbol] = float(data.bid)
-                        elif price_type == 'ask' and data.ask:
-                            result[symbol] = float(data.ask)
-                        elif price_type == 'mid' and data.mid:
-                            result[symbol] = float(data.mid)
-                        elif data.last:
-                            result[symbol] = float(data.last)
-                        elif data.close:
-                            result[symbol] = float(data.close)
-                        else:
-                            result[symbol] = None
-                    except Exception as e:
-                        logger.warning(f"[Account {self.id}] Error fetching price for {symbol}: {e}")
-                        result[symbol] = None
-                return result
-        except Exception as e:
-            logger.error(f"[Account {self.id}] Error getting price: {e}", exc_info=True)
-            if isinstance(symbol_or_symbols, list):
-                return {s: None for s in symbol_or_symbols}
-            return None
+
+        symbols = list(symbol_or_symbols)
+        result = {s: None for s in symbols}
+        for start in range(0, len(symbols), self._MARKET_DATA_CHUNK):
+            chunk = symbols[start:start + self._MARKET_DATA_CHUNK]
+            try:
+                rows = self._run_async(
+                    get_market_data_by_type(self._session, equities=chunk))
+            except Exception as e:
+                logger.warning(
+                    f"[Account {self.id}] Bulk quote fetch failed for {len(chunk)} symbols "
+                    f"starting at {chunk[0]}: {e}")
+                continue
+            for row in rows:
+                if row.symbol in result:
+                    result[row.symbol] = self._pick_price(row, price_type)
+        return result
 
     #: platform TradingOrder.good_for -> TastyTrade TIF. An absent/unknown value falls
     #: back to GTC, matching AlpacaAccount._submit_order_impl's tif_map default.

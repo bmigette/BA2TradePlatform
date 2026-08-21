@@ -1366,3 +1366,71 @@ def test_symbol_margin_info_normalises_the_requested_symbols():
         info = acct.get_symbol_margin_info(["  aapl "])
 
     assert list(info) == ["AAPL"]
+
+
+# ---------------------------------------------------------------------------
+# Bulk quotes
+# ---------------------------------------------------------------------------
+
+def _market_data(symbol, bid="149.90", ask="150.10", mid="150.00", last="150.05",
+                 close="148.00"):
+    return SimpleNamespace(
+        symbol=symbol,
+        bid=Decimal(bid) if bid is not None else None,
+        ask=Decimal(ask) if ask is not None else None,
+        mid=Decimal(mid) if mid is not None else None,
+        last=Decimal(last) if last is not None else None,
+        close=Decimal(close) if close is not None else None,
+    )
+
+
+def test_bulk_quotes_chunk_at_the_hundred_symbol_api_limit():
+    """get_market_data_by_type's COMBINED limit across all types is 100 per call."""
+    acct = _bare_account()
+    symbols = [f"SYM{i:03d}" for i in range(150)]
+    bulk = AsyncMock(side_effect=lambda session, equities: [_market_data(s) for s in equities])
+
+    with patch("tastytrade.market_data.get_market_data_by_type", new=bulk):
+        acct._get_instrument_current_price_impl(symbols, price_type="mid")
+
+    chunk_sizes = [len(call.kwargs["equities"]) for call in bulk.call_args_list]
+    assert chunk_sizes == [100, 50]
+
+
+def test_bulk_quotes_return_the_requested_price_type():
+    acct = _bare_account()
+    bulk = AsyncMock(return_value=[_market_data("AAPL", bid="149.90", ask="150.10")])
+
+    with patch("tastytrade.market_data.get_market_data_by_type", new=bulk):
+        prices = acct._get_instrument_current_price_impl(["AAPL"], price_type="ask")
+
+    assert prices == {"AAPL": 150.10}
+
+
+def test_bulk_quotes_leave_a_missing_symbol_as_none():
+    """No fabricated price for a symbol the broker did not return."""
+    acct = _bare_account()
+    bulk = AsyncMock(return_value=[_market_data("AAPL")])
+
+    with patch("tastytrade.market_data.get_market_data_by_type", new=bulk):
+        prices = acct._get_instrument_current_price_impl(["AAPL", "NOSUCH"], price_type="mid")
+
+    assert prices["AAPL"] == 150.00
+    assert prices["NOSUCH"] is None
+
+
+def test_bulk_quotes_survive_a_failing_chunk():
+    acct = _bare_account()
+    symbols = [f"SYM{i:03d}" for i in range(150)]
+
+    def _fail_first(session, equities):
+        if equities[0] == "SYM000":
+            raise RuntimeError("gateway timeout")
+        return [_market_data(s) for s in equities]
+
+    bulk = AsyncMock(side_effect=_fail_first)
+    with patch("tastytrade.market_data.get_market_data_by_type", new=bulk):
+        prices = acct._get_instrument_current_price_impl(symbols, price_type="mid")
+
+    assert prices["SYM000"] is None
+    assert prices["SYM100"] == 150.00
