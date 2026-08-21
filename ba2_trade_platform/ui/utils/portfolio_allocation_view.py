@@ -738,8 +738,12 @@ def evaluate_market_gate(*, is_open: Optional[bool], next_open: Optional[datetim
         raise ValueError(f"evaluate_market_gate: now={now!r} is naive")
 
     if is_open is None:
+        # ``from_fallback`` means the same thing in all three branches: this answer
+        # did not come from the broker. Leaving it False here would have an
+        # unanswered lookup claim broker provenance.
         return MarketGateResult(allowed=False, reason_code=MARKET_GATE_UNKNOWN,
-                                message=MARKET_MSG_UNKNOWN, severity="negative")
+                                message=MARKET_MSG_UNKNOWN, severity="negative",
+                                from_fallback=(source != MARKET_SOURCE_BROKER))
     if is_open:
         return MarketGateResult(allowed=True, reason_code=MARKET_GATE_OPEN,
                                 message="", severity="info",

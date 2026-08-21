@@ -46,14 +46,21 @@ keeps the registries out of THIS module's own graph, so the deferral survives if
 the package ``__init__`` is ever trimmed.
 """
 import asyncio
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from nicegui import ui
 from sqlmodel import select
 
+from ...core import portfolio_allocation_service as svc
 from ...core.db import get_db
 from ...core.models import ExpertInstance
-from ...core.portfolio_allocation import VALUATION_MODE_COST, VALUATION_MODE_MARKET
+from ...core.portfolio_allocation import (
+    ALLOCATION_MODE_INVEST_LABEL, ALLOCATION_MODE_REBALANCE,
+    VALUATION_MODE_COST, VALUATION_MODE_MARKET,
+    LabelTarget, SymbolTarget, build_base_snapshot, compute_allocation,
+    compute_label_investment,
+)
 from ...core.portfolio_allocation_store import (
     add_symbols_to_label, get_allocation_config, get_managed_labels, get_symbol_comments,
     get_symbol_rows, get_symbol_weights, remove_symbols_from_label, replace_managed_labels,
@@ -62,10 +69,14 @@ from ...core.portfolio_allocation_store import (
 from ...logger import logger
 from ..account_filter_context import get_selected_account_id
 from ..utils.portfolio_allocation_view import (
-    DEFAULT_MACHINE_LABEL_FAMILIES, GATE_NO_ACCOUNT, GateResult, ManagedLabel,
+    DEFAULT_MACHINE_LABEL_FAMILIES, GATE_NO_ACCOUNT, MARKET_SOURCE_UNAVAILABLE,
+    GateResult, ManagedLabel,
     PositionFetchFailed, build_label_views, collect_managed_symbols, diff_managed_labels,
-    evaluate_gate, expert_shortname_families, managed_total_value, missing_quote_symbols,
-    picker_options, positions_by_symbol,
+    evaluate_gate, evaluate_market_gate, expert_shortname_families, managed_total_value,
+    missing_quote_symbols, picker_options, positions_by_symbol, working_orders_notice,
+)
+from .portfolio_allocation_wizard import (
+    open_allocation_steps, open_allocation_wizard, render_income_panel, render_outcomes,
 )
 
 #: Quasar debounce (ms) for the comment inputs. Every keystroke used to run a
@@ -162,6 +173,128 @@ def _load_view_payload(account_id: int, valuation_mode: str) -> Dict[str, Any]:
 def _load_valuation_mode(account_id: int) -> str:
     """The account's stored valuation mode, creating the config row on first use."""
     return get_allocation_config(account_id).valuation_mode
+
+
+def _load_flow_inputs(account_id: int, valuation_mode: str):
+    """Everything the wizard needs to OPEN, in one thread hop. Blocking.
+
+    Returns:
+        Tuple: ``(base, labels, allow_fractional)`` -- the frozen base snapshot, the
+        managed labels with their symbol weights, and the account's remembered
+        fractional choice.
+
+    Raises:
+        PositionFetchFailed: the broker's position fetch failed. NOT a flat account,
+            and the wizard must not open on the difference.
+        RuntimeError: the account could not be instantiated.
+        ValueError: the broker published no buying power (``build_base_snapshot``).
+    """
+    from ...core.utils import get_account_instance_from_id, get_symbols_by_label
+
+    account = get_account_instance_from_id(account_id)
+    if account is None:
+        raise RuntimeError(f"Account {account_id} could not be instantiated")
+    managed = get_managed_labels(account_id)
+    symbols_by_label = get_symbols_by_label([row.label for row in managed])
+    symbols = collect_managed_symbols(symbols_by_label)
+
+    labels = []
+    for row in managed:
+        members = symbols_by_label.get(row.label, [])
+        weights = get_symbol_weights(account_id, row.label, members)
+        labels.append(LabelTarget(
+            label=row.label, target_pct=float(row.target_pct or 0.0),
+            symbols=[SymbolTarget(symbol=s, weight_pct=float(weights.get(s, 0.0)))
+                     for s in members],
+            comment=row.comment))
+
+    current = svc.build_position_states(account, symbols)
+    base = build_base_snapshot(account.get_account_snapshot(), current, symbols,
+                               valuation_mode=valuation_mode)
+    return base, labels, bool(get_allocation_config(account_id).allow_fractional)
+
+
+def _solve_plan(account_id: int, *, mode: str, labels, scope_label, amount: float,
+                allow_fractional: bool, valuation_mode: str):
+    """Solve one dry run against FRESH positions, prices and margin info. Blocking.
+
+    Re-reads everything rather than reusing the open dialog's snapshot: Refresh
+    exists precisely because the numbers move, and a plan solved against a stale
+    price is a plan submitted at the wrong size.
+
+    Returns:
+        Tuple: ``(base, plan, current, hours)``. ``hours`` is the broker's
+        ``MarketHours`` or ``None``; ONE read feeds both the banner and the gate.
+    """
+    from ...core.utils import get_account_instance_from_id
+
+    account = get_account_instance_from_id(account_id)
+    if account is None:
+        raise RuntimeError(f"Account {account_id} could not be instantiated")
+    symbols = collect_managed_symbols(
+        {lt.label: [st.symbol for st in lt.symbols] for lt in labels})
+    current = svc.build_position_states(account, symbols)
+    margin = svc.fetch_margin_info(account, symbols)
+    base = build_base_snapshot(account.get_account_snapshot(), current, symbols,
+                               valuation_mode=valuation_mode)
+    if mode == ALLOCATION_MODE_INVEST_LABEL:
+        scope = next((lt for lt in labels if lt.label == scope_label), None)
+        if scope is None:
+            raise ValueError(f"Label {scope_label!r} is no longer managed")
+        plan = compute_label_investment(
+            scope, float(amount), current, margin,
+            available_buying_power=base.available_buying_power,
+            allow_fractional=allow_fractional, default_bp_factor=base.default_bp_factor,
+            valuation_mode=valuation_mode)
+    else:
+        plan = compute_allocation(
+            base.base_notional, base.available_buying_power, labels, current, margin,
+            allow_fractional=allow_fractional,
+            default_bp_factor=base.default_bp_factor, valuation_mode=valuation_mode)
+    plan = svc.precheck_plan(account, plan,
+                             available_buying_power=base.available_buying_power)
+    return base, plan, current, svc.fetch_market_hours(account)
+
+
+def _submit_plan(account_id: int, plan, current, base, *, mode: str, scope_label):
+    """Submit a reviewed plan. Blocking. The service re-checks the market gate."""
+    from ...core.utils import get_account_instance_from_id
+
+    account = get_account_instance_from_id(account_id)
+    if account is None:
+        raise RuntimeError(f"Account {account_id} could not be instantiated")
+    return svc.run_allocation(account, plan, current, base, mode=mode,
+                              scope_label=scope_label)
+
+
+def _load_income_panel(account_id: int):
+    """Sync the ledger from the broker and read it back. Blocking.
+
+    Also runs the unconsumed-run reconcile pass. Runs whose orders were still working
+    when they finalised consumed NO income, and with about a quarter of the book on
+    whole shares that is the common outcome, not the rare one -- without this call the
+    money would sit unconsumed until the next submission.
+    ``reconcile_unconsumed_runs`` is authored by the ledger chunk, which lands after
+    this task; the lookup is what keeps this page working in between.
+    """
+    from ...core.utils import get_account_instance_from_id
+
+    account = get_account_instance_from_id(account_id)
+    if account is None:
+        raise RuntimeError(f"Account {account_id} could not be instantiated")
+    reconcile = getattr(svc, "reconcile_unconsumed_runs", None)
+    if reconcile is not None:
+        try:
+            reconciled = reconcile(account)
+            if reconciled:
+                logger.info(f"Reconciled {len(reconciled)} unconsumed allocation run(s) "
+                            f"for account {account_id}")
+        except Exception as e:
+            logger.error(f"Reconciling unconsumed allocation runs failed: {e}",
+                         exc_info=True)
+    svc.sync_income_events(account)
+    return (svc.get_recent_income_events(account_id),
+            svc.get_open_income_total(account_id))
 
 
 def _expert_label_families() -> frozenset:
@@ -611,6 +744,131 @@ def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
             _render_label_body(account_id, view, refresh)
 
 
+def _market_gate_for(hours):
+    """Build the banner's gate from a MarketHours. The ONLY legal caller mapping.
+
+    An UNAVAILABLE answer carries ``is_open=False`` so the money path fails closed,
+    but ``is_known`` is False, so the UI must say "unknown" rather than "closed" --
+    they have different fixes. ``now`` is passed explicitly; the pure function has no
+    clock of its own.
+    """
+    is_open = None if (hours is None or not hours.is_known) else hours.is_open
+    source = hours.source if hours is not None else MARKET_SOURCE_UNAVAILABLE
+    return evaluate_market_gate(is_open=is_open,
+                                next_open=(hours.next_open if hours is not None else None),
+                                source=source, now=datetime.now(timezone.utc))
+
+
+async def _open_allocation_flow(account_id: int, valuation_mode: str,
+                                refresh, *, mode: str = ALLOCATION_MODE_REBALANCE,
+                                invest_amount: float = 0.0) -> None:
+    """The Allocate button: steps 1-3, then the dry run, then Submit.
+
+    Every blocking call is dispatched through ``asyncio.to_thread``: broker IO on the
+    event loop freezes the app for every connected client.
+    """
+    try:
+        base, labels, allow_fractional = await asyncio.to_thread(
+            _load_flow_inputs, account_id, valuation_mode)
+    except PositionFetchFailed as e:
+        logger.error(f"Portfolio allocation: position fetch failed: {e}")
+        ui.notify(f'Broker position fetch FAILED: {e} - nothing is planned against a '
+                  f'guess', type='negative')
+        return
+    except Exception as e:
+        logger.error(f"Could not open the allocation wizard: {e}", exc_info=True)
+        ui.notify(f'Could not open the allocation wizard: {e}', type='negative')
+        return
+    if not labels:
+        ui.notify('No managed labels yet - use "Manage labels" first', type='warning')
+        return
+
+    state = {'mode': mode, 'scope_label': None, 'amount': float(invest_amount or 0.0),
+             'labels': labels, 'allow_fractional': allow_fractional,
+             'base': base, 'current': {}}
+
+    async def _run_dry_run() -> None:
+        try:
+            new_base, plan, current, hours = await asyncio.to_thread(
+                _solve_plan, account_id, mode=state['mode'], labels=state['labels'],
+                scope_label=state['scope_label'], amount=state['amount'],
+                allow_fractional=state['allow_fractional'],
+                valuation_mode=valuation_mode)
+        except PositionFetchFailed as e:
+            logger.error(f"Portfolio allocation dry run: position fetch failed: {e}")
+            ui.notify(f'Broker position fetch FAILED: {e}', type='negative')
+            return
+        except Exception as e:
+            logger.error(f"Allocation dry run failed: {e}", exc_info=True)
+            ui.notify(f'Dry run failed: {e}', type='negative')
+            return
+        state['base'] = new_base
+        state['current'] = current
+
+        def _on_refresh(allow_fractional: bool):
+            """Called from the wizard (sync) -- re-solve and hand back the new plan."""
+            state['allow_fractional'] = bool(allow_fractional)
+            svc.remember_fractional_choice(account_id, bool(allow_fractional))
+            fresh_base, fresh_plan, fresh_current, _ = _solve_plan(
+                account_id, mode=state['mode'], labels=state['labels'],
+                scope_label=state['scope_label'], amount=state['amount'],
+                allow_fractional=bool(allow_fractional), valuation_mode=valuation_mode)
+            state['base'] = fresh_base
+            state['current'] = fresh_current
+            return fresh_plan
+
+        def _on_submit(selected_plan) -> None:
+            ui.timer(0.1, lambda: _do_submit(selected_plan), once=True)
+
+        open_allocation_wizard(new_base, plan, market=_market_gate_for(hours),
+                               on_refresh=_on_refresh, on_submit=_on_submit)
+
+    async def _do_submit(selected_plan) -> None:
+        try:
+            result = await asyncio.to_thread(
+                _submit_plan, account_id, selected_plan, state['current'],
+                state['base'], mode=state['mode'], scope_label=state['scope_label'])
+        except Exception as e:
+            logger.error(f"Allocation submission failed: {e}", exc_info=True)
+            ui.notify(f'Submission failed: {e}', type='negative')
+            return
+        if result['blocked']:
+            # The service re-checked the gate on its own, freshly: this dialog can
+            # sit open across 16:00 and the banner it was built with is now stale.
+            ui.notify(result['blocked_reason'], type='warning')
+            return
+        render_outcomes(result['outcomes'], run_id=result['run_id'])
+        note = working_orders_notice(settled=result['settled'],
+                                     working_order_ids=result['working_order_ids'])
+        if note is not None:
+            ui.notify(note[0], type=note[1])
+        await refresh()
+
+    def _on_dry_run(*, mode: str, labels, scope_label, amount: float,
+                    allow_fractional: bool) -> None:
+        """Called by the steps dialog (sync). Persist the choice, then solve."""
+        state.update({'mode': mode, 'labels': labels, 'scope_label': scope_label,
+                      'amount': float(amount or 0.0),
+                      'allow_fractional': bool(allow_fractional)})
+        # Persisted on every dry run, not only on submit: a user who plans, closes
+        # the dialog and comes back tomorrow keeps the switch they chose.
+        svc.remember_fractional_choice(account_id, bool(allow_fractional))
+        ui.timer(0.1, _run_dry_run, once=True)
+
+    open_allocation_steps(base, labels, on_dry_run=_on_dry_run,
+                          allow_fractional=allow_fractional,
+                          mode=state['mode'], invest_amount=state['amount'])
+
+
+async def _open_invest_flow(account_id: int, valuation_mode: str, amount: float,
+                            refresh) -> None:
+    """The income panel's Invest button: the same flow, opened in INVEST_LABEL mode
+    and pre-filled with the unallocated income."""
+    await _open_allocation_flow(account_id, valuation_mode, refresh,
+                                mode=ALLOCATION_MODE_INVEST_LABEL,
+                                invest_amount=amount)
+
+
 async def content() -> None:
     """Entry point for the /portfolioallocation route."""
     account_id = get_selected_account_id()
@@ -673,6 +931,21 @@ async def content() -> None:
             body.clear()
             with body:
                 _render_labels(account_id, payload, _refresh)
+                try:
+                    events, open_total = await asyncio.to_thread(
+                        _load_income_panel, account_id)
+                except Exception as e:
+                    logger.error(f"Income panel failed to load: {e}", exc_info=True)
+                    events, open_total = [], 0.0
+                    ui.label(f'Income could not be loaded: {e}') \
+                        .classes('text-xs text-orange-400')
+                render_income_panel(
+                    events, open_total,
+                    on_sync=lambda: ui.timer(0.1, _refresh, once=True),
+                    on_invest=lambda amount: ui.timer(
+                        0.1, lambda: _open_invest_flow(
+                            account_id, mode_state['value'], amount, _refresh),
+                        once=True))
 
         async def _set_mode(event) -> None:
             """Persist the mode EAGERLY and RE-COMPUTE -- never reinterpret silently."""
@@ -691,6 +964,10 @@ async def content() -> None:
             await _refresh()
 
         with toolbar:
+            ui.button('Allocate', icon='account_balance',
+                      on_click=lambda: _open_allocation_flow(
+                          account_id, mode_state['value'], _refresh)) \
+                .props('color=primary')
             ui.select({VALUATION_MODE_COST: 'Cost basis',
                        VALUATION_MODE_MARKET: 'Market value'},
                       value=mode_state['value'], label='Valuation',

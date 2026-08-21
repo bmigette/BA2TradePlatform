@@ -1044,3 +1044,16 @@ def test_working_orders_notice_is_honest_when_it_cannot_count_the_orders():
     text, severity = working_orders_notice(settled=False, working_order_ids=[])
     assert "still working" in text
     assert severity == "warning"
+
+
+def test_an_unknown_gate_never_claims_the_broker_answered():
+    """``from_fallback`` means the same thing in all three branches. An unanswered
+    lookup certainly did not come from the broker, and saying otherwise would let
+    the banner cite a provenance nothing supplied."""
+    unknown = evaluate_market_gate(is_open=None, next_open=None,
+                                   source=MARKET_SOURCE_UNAVAILABLE, now=FROZEN_NOW)
+    assert unknown.from_fallback is True
+    # And a broker that DID answer, with "open", is not a fallback.
+    assert evaluate_market_gate(is_open=True, next_open=None,
+                                source=MARKET_SOURCE_BROKER,
+                                now=FROZEN_NOW).from_fallback is False
