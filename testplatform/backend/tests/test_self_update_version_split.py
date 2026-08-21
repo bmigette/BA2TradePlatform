@@ -26,7 +26,11 @@ it converged and silently run stale code on the whole grid. See
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 from app.services import self_update, worker_client
 
@@ -132,6 +136,40 @@ def test_unsyncable_reason_git_statuses_the_testplatform_version_file():
     status_cmd = mock_run.call_args_list[0].args[0]
     assert status_cmd[:4] == ["git", "status", "--porcelain", "--"]
     assert status_cmd[4] == "testplatform/version.py"
+
+
+def _git(repo: Path, *args: str) -> None:
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                    "-c", "commit.gpgsign=false", *args],
+                   cwd=str(repo), check=True, capture_output=True, text=True)
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git not available")
+def test_unsyncable_reason_end_to_end_against_a_real_git_repo(tmp_path):
+    """The same guard, driven by REAL ``git status`` rather than a mocked ``subprocess.run``.
+
+    The mocked tests can only prove we pass the right argv; this proves git agrees. It also
+    pins the half of the decoupling that the mocked tests cannot see: a dirty TRADE version
+    file must no longer block a distributed run. That false alarm is the 300s-per-worker
+    retry-and-exclude burn this whole split exists to remove.
+    """
+    _write(tmp_path, "testplatform/version.py", 'TEST_APP_VERSION = "2026.08.0001"\n')
+    _write(tmp_path, "ba2_trade_platform/version.py", 'APP_VERSION = "2026.08.1068"\n')
+    _git(tmp_path, "init", "-q", ".")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "init")
+
+    # Committed and no upstream configured -> nothing to report.
+    assert self_update.unsyncable_reason(tmp_path) is None
+
+    # A dirty TRADE version file is now irrelevant to worker convergence.
+    _write(tmp_path, "ba2_trade_platform/version.py", 'APP_VERSION = "2026.08.1069"\n')
+    assert self_update.unsyncable_reason(tmp_path) is None
+
+    # A dirty TEST version file still blocks: a worker's `git pull` could never reach it.
+    _write(tmp_path, "testplatform/version.py", 'TEST_APP_VERSION = "2026.08.0002"\n')
+    reason = self_update.unsyncable_reason(tmp_path)
+    assert reason is not None and "UNCOMMITTED" in reason
 
 
 # --------------------------------------------------------------------------------------
