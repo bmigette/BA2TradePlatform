@@ -465,3 +465,107 @@ def test_get_order_with_numeric_id_queries_the_broker_with_an_int():
     acct.get_order(" 987654 ")
 
     assert acct._account.get_order.call_args.args[1] == 987654
+
+
+# ---------------------------------------------------------------------------
+# PlacedOrder -> TradingOrder mapping
+# ---------------------------------------------------------------------------
+
+def test_order_mapping_derives_buy_side_from_the_leg_action():
+    """PlacedOrder carries no top-level side -- it is on each leg's OrderAction."""
+    from ba2_trade_platform.core.types import OrderDirection
+
+    acct = _bare_account()
+    mapped = acct.tastytrade_order_to_tradingorder(
+        _placed_order(action=OrderAction.BUY_TO_OPEN))
+
+    assert mapped.side == OrderDirection.BUY
+
+
+def test_order_mapping_derives_sell_side_from_a_closing_leg_action():
+    from ba2_trade_platform.core.types import OrderDirection
+
+    acct = _bare_account()
+    mapped = acct.tastytrade_order_to_tradingorder(
+        _placed_order(action=OrderAction.SELL_TO_CLOSE))
+
+    assert mapped.side == OrderDirection.SELL
+
+
+def test_order_mapping_makes_a_sell_limit_type_from_side_plus_limit():
+    """TastyTrade's order type is non-directional; ours is directional."""
+    from ba2_trade_platform.core.types import OrderType
+
+    acct = _bare_account()
+    mapped = acct.tastytrade_order_to_tradingorder(
+        _placed_order(order_type=TTOrderType.LIMIT, action=OrderAction.SELL_TO_CLOSE,
+                      price=Decimal("161.40")))
+
+    assert mapped.order_type == OrderType.SELL_LIMIT
+
+
+def test_order_mapping_stores_limit_price_unsigned():
+    """PlacedOrder.price is SIGNED (negative = debit). TradingOrder.limit_price is a
+    plain price."""
+    acct = _bare_account()
+    mapped = acct.tastytrade_order_to_tradingorder(
+        _placed_order(order_type=TTOrderType.LIMIT, action=OrderAction.BUY_TO_OPEN,
+                      price=Decimal("-142.50")))
+
+    assert mapped.limit_price == 142.50
+
+
+def test_order_mapping_summarises_fills_into_quantity_and_average_price():
+    acct = _bare_account()
+    mapped = acct.tastytrade_order_to_tradingorder(
+        _placed_order(status=TTOrderStatus.FILLED, size="10",
+                      fills=[_fill(quantity="4", fill_price="150.00"),
+                             _fill(quantity="6", fill_price="151.00")]))
+
+    assert mapped.filled_qty == 10.0
+    assert mapped.open_price == pytest.approx(150.6)
+
+
+def test_order_mapping_leaves_open_price_none_when_nothing_filled():
+    """No fabricated fill price -- None means 'not filled', never zero."""
+    acct = _bare_account()
+    mapped = acct.tastytrade_order_to_tradingorder(_placed_order(status=TTOrderStatus.LIVE))
+
+    assert mapped.filled_qty == 0.0
+    assert mapped.open_price is None
+
+
+def test_order_mapping_translates_broker_status_to_platform_status():
+    from ba2_trade_platform.core.types import OrderStatus
+
+    acct = _bare_account()
+    mapped = acct.tastytrade_order_to_tradingorder(
+        _placed_order(status=TTOrderStatus.CANCEL_REQUESTED))
+
+    assert mapped.status == OrderStatus.PENDING_CANCEL
+
+
+def test_get_orders_returns_trading_orders_not_raw_broker_objects():
+    from ba2_trade_platform.core.models import TradingOrder
+
+    acct = _bare_account()
+    acct._account.get_order_history = AsyncMock(return_value=[
+        _placed_order(order_id=1), _placed_order(order_id=2)])
+
+    orders = acct.get_orders()
+
+    assert len(orders) == 2
+    assert all(isinstance(o, TradingOrder) for o in orders)
+    assert [o.broker_order_id for o in orders] == ["1", "2"]
+
+
+def test_get_order_returns_a_trading_order():
+    from ba2_trade_platform.core.models import TradingOrder
+
+    acct = _bare_account()
+    acct._account.get_order = AsyncMock(return_value=_placed_order(order_id=987654))
+
+    order = acct.get_order("987654")
+
+    assert isinstance(order, TradingOrder)
+    assert order.broker_order_id == "987654"

@@ -6,10 +6,12 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 
 from tastytrade.order import InstrumentType as TTInstrumentType
 from tastytrade.order import OrderStatus as TTOrderStatus
+from tastytrade.order import OrderType as TTOrderType
 
 from ...logger import logger
-from ...core.models import Position
+from ...core.models import Position, TradingOrder
 from ...core.types import OrderDirection, OrderStatus
+from ...core.types import OrderType as CoreOrderType
 from ...core.interfaces import ReadOnlyAccountInterface
 
 
@@ -334,6 +336,115 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
             return None
         return matches
 
+    @classmethod
+    def _map_order_status(cls, tt_status) -> OrderStatus:
+        """TastyTrade order status -> platform OrderStatus. UNKNOWN for anything unmapped."""
+        if tt_status is None:
+            return OrderStatus.UNKNOWN
+        try:
+            return cls._TT_STATUS_MAP[TTOrderStatus(tt_status)]
+        except (ValueError, KeyError):
+            logger.warning(f"Unmapped TastyTrade order status {tt_status!r}; recording UNKNOWN")
+            return OrderStatus.UNKNOWN
+
+    @staticmethod
+    def _map_order_type(tt_type, side: OrderDirection) -> CoreOrderType:
+        """Map a TastyTrade order type onto our DIRECTIONAL OrderType.
+
+        TastyTrade's ``order_type`` is non-directional (Market / Limit / Stop /
+        Stop Limit / Marketable Limit / Notional Market); ours is directional for the
+        limit and stop variants, so it must be combined with the side. Unknown types
+        fall back to MARKET, exactly as ``AlpacaAccount._map_order_type`` does.
+        """
+        if tt_type is None:
+            return CoreOrderType.MARKET
+        value = str(getattr(tt_type, "value", tt_type))
+        is_buy = side == OrderDirection.BUY
+        if value in ("Market", "Notional Market"):
+            return CoreOrderType.MARKET
+        if value in ("Limit", "Marketable Limit"):
+            return CoreOrderType.BUY_LIMIT if is_buy else CoreOrderType.SELL_LIMIT
+        if value == "Stop":
+            return CoreOrderType.BUY_STOP if is_buy else CoreOrderType.SELL_STOP
+        if value == "Stop Limit":
+            return CoreOrderType.BUY_STOP_LIMIT if is_buy else CoreOrderType.SELL_STOP_LIMIT
+        logger.warning(f"Unmapped TastyTrade order type {value!r}; recording MARKET")
+        return CoreOrderType.MARKET
+
+    @staticmethod
+    def _side_from_legs(legs) -> Optional[OrderDirection]:
+        """Derive the order side from its legs.
+
+        A ``PlacedOrder`` has NO top-level side: it lives on each leg's
+        ``OrderAction`` ('Buy to Open', 'Sell to Close', ...). Equity orders here are
+        always single-leg, so the first leg decides. Returns ``None`` when no leg
+        yields a side -- the caller must skip the order rather than guess, because a
+        fabricated side puts the row on the wrong side of the book.
+        """
+        for leg in legs or []:
+            raw = getattr(leg, "action", None)
+            action = str(getattr(raw, "value", raw) or "")
+            if action.startswith("Buy"):
+                return OrderDirection.BUY
+            if action.startswith("Sell"):
+                return OrderDirection.SELL
+        return None
+
+    @staticmethod
+    def _fills_summary(legs):
+        """(total filled quantity, quantity-weighted average fill price) across legs.
+
+        Returns ``(0.0, None)`` when nothing has filled -- never a fabricated price.
+        """
+        total_qty = 0.0
+        total_notional = 0.0
+        for leg in legs or []:
+            for fill in (getattr(leg, "fills", None) or []):
+                quantity = float(fill.quantity)
+                total_qty += quantity
+                total_notional += quantity * float(fill.fill_price)
+        if total_qty <= 0:
+            return 0.0, None
+        return total_qty, total_notional / total_qty
+
+    def tastytrade_order_to_tradingorder(self, order) -> Optional[TradingOrder]:
+        """Convert a tastytrade ``PlacedOrder`` into an UNSAVED TradingOrder.
+
+        Returns ``None`` when the side cannot be determined from the legs.
+        ``PlacedOrder.price`` is SIGNED (negative = debit) but ``limit_price`` is a
+        plain price, so it is stored as an absolute value. A dry-run order has
+        ``id == -1``, which is not a broker id and is stored as ``None``.
+        """
+        side = self._side_from_legs(getattr(order, "legs", None))
+        if side is None:
+            logger.error(
+                f"[Account {self.id}] Cannot determine side for TastyTrade order "
+                f"{getattr(order, 'id', None)} -- skipping")
+            return None
+
+        filled_qty, avg_fill_price = self._fills_summary(getattr(order, "legs", None))
+        raw_id = getattr(order, "id", None)
+        size = getattr(order, "size", None)
+        price = getattr(order, "price", None)
+        stop_trigger = getattr(order, "stop_trigger", None)
+        tif = getattr(order, "time_in_force", None)
+
+        return TradingOrder(
+            broker_order_id=str(raw_id) if raw_id not in (None, -1) else None,
+            symbol=getattr(order, "underlying_symbol", None),
+            quantity=float(size) if size is not None else filled_qty,
+            side=side,
+            order_type=self._map_order_type(getattr(order, "order_type", None), side),
+            good_for=(str(getattr(tif, "value", tif)) if tif is not None else None),
+            limit_price=abs(float(price)) if price is not None else None,
+            stop_price=float(stop_trigger) if stop_trigger is not None else None,
+            status=self._map_order_status(getattr(order, "status", None)),
+            filled_qty=filled_qty,
+            open_price=avg_fill_price,
+            comment=None,
+            created_at=getattr(order, "received_at", None) or getattr(order, "updated_at", None),
+        )
+
     def get_orders(self, status=None) -> Any:
         """All orders for this account, optionally filtered by platform OrderStatus.
 
@@ -351,8 +462,10 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
             statuses = self._tt_statuses_for(status)
             if statuses:
                 kwargs["statuses"] = statuses
-            orders = self._run_async(
+            raw_orders = self._run_async(
                 self._account.get_order_history(self._session, **kwargs))
+            orders = [o for o in (self.tastytrade_order_to_tradingorder(r) for r in raw_orders)
+                      if o is not None]
             logger.debug(f"[Account {self.id}] Retrieved {len(orders)} orders from TastyTrade")
             return orders
         except Exception as e:
@@ -377,7 +490,8 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
                 f"(broker ids are numeric)")
             return None
         try:
-            return self._run_async(self._account.get_order(self._session, broker_id))
+            raw = self._run_async(self._account.get_order(self._session, broker_id))
+            return self.tastytrade_order_to_tradingorder(raw)
         except Exception as e:
             logger.error(f"[Account {self.id}] Error getting order {order_id}: {e}", exc_info=True)
             return None
