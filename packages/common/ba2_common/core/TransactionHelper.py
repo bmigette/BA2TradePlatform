@@ -19,6 +19,12 @@ from ba2_common.core.types import OrderStatus, OrderDirection, OrderType, Transa
 from ba2_common.core.db import get_db, update_instance, add_instance, get_instance
 from ba2_common.logger import logger
 
+#: Statuses on an order handed back by ``AccountInterface.submit_order`` that mean
+#: the broker is NOT working it. WASHTRADE_LOCKED is in here deliberately: that
+#: order is PENDING at OUR end, the gate held it back, and nothing was sent.
+_SUBMISSION_DEAD_STATUSES = frozenset(
+    OrderStatus.get_terminal_statuses() | {OrderStatus.WASHTRADE_LOCKED})
+
 if TYPE_CHECKING:
     from ba2_common.core.interfaces.AccountInterface import AccountInterface
 
@@ -607,6 +613,63 @@ class TransactionHelper:
         return {"tp_order": tp_order_dict, "sl_order": sl_order_dict}
 
     @staticmethod
+    def submission_was_refused(submitted_order) -> bool:
+        """Did ``AccountInterface.submit_order`` fail to place this order?
+
+        The adapter returning an OBJECT is not the same as the broker accepting
+        the order, and returning None is not the same as raising:
+
+        * ``None`` -- ``_handle_order_submit_error`` has already stamped the
+          persisted row ERROR with the broker's own words and handed back None.
+          Treating that as success is how a REFUSED add-to-position came to be
+          reported as filled.
+        * ``WASHTRADE_LOCKED`` -- the gate held the order at our end. It is
+          PENDING in the database, nothing went out, and it is retried later.
+        * any other terminal status with NOTHING filled -- the broker took it and
+          killed it.
+
+        A terminal status WITH a fill is NOT a refusal: a cancel that raced a
+        partial execution really did move the position, and pretending otherwise
+        loses shares that exist.
+
+        Returns:
+            bool: True when nothing is working at the broker as a result of this
+            call.
+        """
+        if submitted_order is None:
+            return True
+        status = getattr(submitted_order, "status", None)
+        if status == OrderStatus.WASHTRADE_LOCKED:
+            return True
+        if status in _SUBMISSION_DEAD_STATUSES:
+            try:
+                filled = float(getattr(submitted_order, "filled_qty", 0) or 0)
+            except (TypeError, ValueError):
+                filled = 0.0
+            return filled <= 0
+        return False
+
+    @staticmethod
+    def _mark_order_canceled(order_id: Optional[int], reason: str) -> None:
+        """Kill an order chain we created and then could not arm.
+
+        Leaving it PENDING/WAITING_TRIGGER would let it fire later, long after
+        the caller has been told the adjustment failed -- the position would then
+        shrink for no reason anybody can trace.
+        """
+        if not order_id:
+            return
+        try:
+            order = get_instance(TradingOrder, order_id)
+            if order is None:
+                return
+            order.status = OrderStatus.CANCELED
+            order.comment = (f"{order.comment} | {reason}" if order.comment else reason)[:500]
+            update_instance(order)
+        except Exception as e:  # noqa: BLE001 -- must not mask the real failure
+            logger.error(f"Could not cancel stranded order {order_id}: {e}", exc_info=True)
+
+    @staticmethod
     def adjust_quantity_with_tpsl(
         account: "AccountInterface",
         transaction: Transaction,
@@ -741,10 +804,11 @@ class TransactionHelper:
                 close_order_id = add_instance(close_order)
                 result["orders_created"].append(close_order_id)
                 logger.info(
-                    f"Created WAITING_TRIGGER partial close order {close_order_id} for {close_qty} shares, "
-                    f"will trigger when order {trigger_order_id} is CANCELED"
+                    f"Created partial close order {close_order_id} for {close_qty} shares; "
+                    + (f"will trigger when order {trigger_order_id} is CANCELED"
+                       if trigger_order_id else "submitting it directly (no TP/SL to trigger off)")
                 )
-                
+
                 # Step 2: Cancel existing TP/SL orders (this will trigger the close order)
                 for tpsl_order in existing_tpsl_orders:
                     try:
@@ -756,7 +820,59 @@ class TransactionHelper:
                             logger.warning(f"Failed to cancel TP/SL order {tpsl_order.id}")
                     except Exception as e:
                         logger.error(f"Error canceling TP/SL order {tpsl_order.id}: {e}", exc_info=True)
-                
+
+                # Step 2b: MAKE SURE THE SELL ACTUALLY HAPPENS.
+                #
+                # The close order above only ever reaches the broker by one of two
+                # routes, and both of them can be absent:
+                #
+                #  * WAITING_TRIGGER on `trigger_order_id` reaching CANCELED --
+                #    TradeManager._check_all_waiting_trigger_orders submits it then.
+                #    If the cancel of that ONE order was refused, the trigger can
+                #    never fire and the order waits forever.
+                #  * ...and when there is no TP/SL leg at all (the DEFAULT for a
+                #    position opened without protective legs) the order is created
+                #    PENDING, which NOTHING submits -- TradeManager's PENDING sweep
+                #    DELETES such rows.
+                #
+                # Either way the caller used to be told the trim succeeded and the
+                # transaction was written down to a size the account never reached.
+                if trigger_order_id is None:
+                    fresh_close = get_instance(TradingOrder, close_order_id)
+                    try:
+                        submitted_close = account.submit_order(fresh_close, is_closing_order=True)
+                    except Exception as e:
+                        logger.error(
+                            f"Error submitting partial close order {close_order_id}: {e}",
+                            exc_info=True)
+                        TransactionHelper._mark_order_canceled(
+                            close_order_id, "partial close submission raised")
+                        result["message"] = f"Failed to submit partial close order: {str(e)}"
+                        return result
+                    if TransactionHelper.submission_was_refused(submitted_close):
+                        logger.error(
+                            f"Broker refused the partial close order {close_order_id} for "
+                            f"{close_qty} {symbol}; transaction {transaction.id} left at "
+                            f"{current_qty}")
+                        result["message"] = (
+                            f"Broker refused the partial close of {close_qty} {symbol}; "
+                            f"the position is unchanged at {current_qty}")
+                        return result
+                elif trigger_order_id not in result["orders_canceled"]:
+                    # The chain is dead on arrival: nothing will ever put this order
+                    # in front of the broker. Kill it rather than leave it armed.
+                    TransactionHelper._mark_order_canceled(
+                        close_order_id,
+                        f"trigger order {trigger_order_id} could not be canceled")
+                    logger.error(
+                        f"Could not cancel TP/SL order {trigger_order_id}; the partial close "
+                        f"of {close_qty} {symbol} can never trigger and was canceled")
+                    result["message"] = (
+                        f"Could not cancel the existing TP/SL order {trigger_order_id}, so the "
+                        f"partial close could never be triggered; the position is unchanged at "
+                        f"{current_qty}")
+                    return result
+
                 # Step 3: Create WAITING_TRIGGER OCO order (or single TP/SL if only one is set)
                 # These will be triggered when the close order is FILLED
                 if remaining_qty > 0 and (tp_price or sl_price):
@@ -871,17 +987,38 @@ class TransactionHelper:
                 
                 try:
                     submitted_order = account.submit_order(add_order)
-                    if submitted_order and hasattr(submitted_order, 'id'):
-                        result["orders_created"].append(submitted_order.id)
-                        logger.info(f"Submitted add-to-position order {submitted_order.id} for {add_qty} shares")
-                    elif add_order.id:
-                        result["orders_created"].append(add_order.id)
-                        logger.info(f"Submitted add-to-position order {add_order.id} for {add_qty} shares")
                 except Exception as e:
                     logger.error(f"Error submitting add-to-position order: {e}", exc_info=True)
+                    if getattr(add_order, 'id', None):
+                        result["orders_created"].append(add_order.id)
                     result["message"] = f"Failed to submit add-to-position order: {str(e)}"
                     return result
-                
+
+                # The order row is reported either way: on a refusal
+                # ``_handle_order_submit_error`` has stamped it ERROR with the broker's
+                # own words, and an audit that cannot point at the refused row cannot
+                # explain the failure it reports.
+                add_order_id = getattr(submitted_order, 'id', None) or getattr(add_order, 'id', None)
+                if add_order_id:
+                    result["orders_created"].append(add_order_id)
+
+                # submit_order returning None -- or handing the order straight back
+                # dead, or WASHTRADE_LOCKED -- means the broker has NOTHING. Falling
+                # through from here cancels the live TP/SL legs protecting the real
+                # position and writes the transaction UP to a size the account never
+                # reached, while the caller is told it succeeded.
+                if TransactionHelper.submission_was_refused(submitted_order):
+                    logger.error(
+                        f"Broker refused the add-to-position order {add_order_id} for {add_qty} "
+                        f"{symbol}; transaction {transaction.id} left at {current_qty}")
+                    result["message"] = (
+                        f"Broker refused the add of {add_qty} {symbol}; the position is "
+                        f"unchanged at {current_qty}")
+                    return result
+
+                logger.info(f"Submitted add-to-position order {add_order_id} for {add_qty} shares")
+
+
                 # Step 2: Get trigger order ID before canceling, then cancel existing TP/SL orders
                 trigger_order_id = None
                 if existing_tpsl_orders:

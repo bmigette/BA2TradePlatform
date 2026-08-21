@@ -28,7 +28,7 @@ from .portfolio_allocation import (
 )
 from .TransactionHelper import TransactionHelper
 from .types import (
-    ActivityLogSeverity, ActivityLogType,
+    ActivityLogSeverity, ActivityLogType, BrokerOrderErrorReason,
     OrderDirection, OrderOpenType, OrderStatus, OrderType, TransactionStatus,
 )
 
@@ -224,6 +224,38 @@ _CLOSING_REPLACEMENT = "clos-ing"
 #: silent empty string: "failed" with no reason is unactionable.
 _REJECTION_FALLBACK = "broker rejected the order"
 
+#: Classified rejection reasons that can ONLY be produced by parsing a REPLY from
+#: the broker -- ``_classify_order_error`` reaches them by recognising the
+#: broker's own error body -- so each of them is positive proof that the order
+#: was seen, refused and never worked.
+#:
+#: UNKNOWN is deliberately absent, and that is the whole point of the set. It is
+#: the fall-through for every error nobody has characterised: BOTH live
+#: classifiers return it for any non-APIError / non-auth exception, which is
+#: exactly where a socket read timeout, a dropped connection or an SDK bug lands.
+#: An order can be ACCEPTED by the broker and still produce one, so UNKNOWN means
+#: "we do not know", never "it was refused".
+_PROVEN_REJECTION_REASONS = frozenset({
+    BrokerOrderErrorReason.INSUFFICIENT_FUNDS.value,
+    BrokerOrderErrorReason.INSUFFICIENT_QTY.value,
+    BrokerOrderErrorReason.WASH_TRADE.value,
+    BrokerOrderErrorReason.INVALID_SYMBOL.value,
+    BrokerOrderErrorReason.STOP_THROUGH_MARKET.value,
+    BrokerOrderErrorReason.UNAUTHORIZED.value,
+})
+
+#: ``AccountInterface._handle_order_submit_error`` renders ``[{reason.value}]
+#: {broker message}`` onto the order's comment. That tag is the only
+#: machine-readable trace of the classification anywhere in the system.
+_REASON_TAG_RE = re.compile(r"\[([a-z_]+)\]")
+
+#: Appended to a failed row that will NOT be retried at whole shares. It has to
+#: name the action a human must take: "failed" alone would read as "nothing
+#: happened", and the whole reason we stopped is that something might have.
+_AMBIGUOUS_NO_RETRY_NOTE = (
+    "not retried at whole shares - this failure does not prove the order never "
+    "reached the broker, and a retry could place a SECOND order; check the broker")
+
 
 def _run_comment(run_tag: Any, side: Any, symbol: str) -> str:
     """The order comment for one allocation order, with "closing" made impossible.
@@ -343,6 +375,63 @@ def _submit_row(account, row, state, *, run_tag: str, allow_fractional: bool) ->
                           message=str(e) or e.__class__.__name__)
 
 
+def _leg_status(succeeded: float, failed: int) -> str:
+    """The row status for a multi-leg symbol: SUBMITTED / PARTIAL / FAILED.
+
+    A row is one SYMBOL, but a close or a trim can be several transactions and
+    each is its own order. Collapsing "2 of 3 legs went out" to FAILED is not a
+    conservative rounding: ``summarise_outcomes`` values a non-money-out row at
+    ZERO, so the two sells that really happened stop funding the buys they paid
+    for and the run over-consumes the income ledger by their whole value.
+    Collapsing it to SUBMITTED is the opposite lie -- the user is told the
+    position is at target when it is not.
+    """
+    if not failed:
+        return OUTCOME_SUBMITTED
+    return OUTCOME_PARTIAL if succeeded > 0 else OUTCOME_FAILED
+
+
+def _transaction_quantity(txn_id: int) -> float:
+    """The open quantity of one transaction, or 0.0 when it cannot be read.
+
+    Never raises: this is only ever used to measure what a leg is worth, and a
+    row that vanished must not take the rest of the symbol down with it.
+    """
+    try:
+        return float(get_instance(Transaction, txn_id).quantity or 0.0)
+    except Exception as e:  # noqa: BLE001 -- InstanceNotFound and anything else
+        logger.warning(f"Allocation: could not read transaction {txn_id} quantity: {e}")
+        return 0.0
+
+
+def _close_one_transaction(account, txn_id: int, symbol: str) -> Tuple[bool, List[int], str]:
+    """``close_transaction`` for ONE transaction.
+
+    Returns:
+        (ok, order_ids, message). ``order_ids`` carries the broker order the
+        close created -- ``close_transaction`` documents it as ``close_order_id``
+        (AccountInterface.py:1567) and it is a TradingOrder this run is
+        responsible for, so dropping it leaves the run audit unable to show the
+        orders that closed the positions.
+    """
+    try:
+        result = account.close_transaction(txn_id)
+    except Exception as e:
+        logger.error(f"Allocation close of transaction {txn_id} ({symbol}) failed: {e}",
+                     exc_info=True)
+        return False, [], f"txn {txn_id}: {e or e.__class__.__name__}"
+
+    result = result or {}
+    close_order_id = result.get('close_order_id')
+    # A FAILED close still documents `close_order_id: None`, so truthiness rather
+    # than presence -- and a refused close that nevertheless created an order row
+    # still reports it.
+    order_ids = [close_order_id] if close_order_id else []
+    if result.get('success'):
+        return True, order_ids, ""
+    return False, order_ids, f"txn {txn_id}: {result.get('message', 'close failed')}"
+
+
 def _close_symbol(account, row, state) -> RowOutcome:
     """Target 0 on a held symbol -> close every open transaction for it.
 
@@ -352,31 +441,43 @@ def _close_symbol(account, row, state) -> RowOutcome:
     """
     messages: List[str] = []
     closed: List[int] = []
-    ok = True
+    order_ids: List[int] = []
+    sent = 0.0
+    failed = 0
     for txn_id in state.transaction_ids:
-        try:
-            result = account.close_transaction(txn_id)
-        except Exception as e:
-            ok = False
-            messages.append(f"txn {txn_id}: {e or e.__class__.__name__}")
-            logger.error(f"Allocation close of transaction {txn_id} ({row.symbol}) "
-                         f"failed: {e}", exc_info=True)
-            continue
-        if result and result.get('success'):
+        # Read BEFORE the close: that is the quantity the close order is built
+        # from (``submit_close_order_for_transaction`` sizes it off the
+        # transaction), and it is what the row really put on the market.
+        quantity = _transaction_quantity(txn_id)
+        ok, ids, message = _close_one_transaction(account, txn_id, row.symbol)
+        order_ids.extend(ids)
+        if ok:
             closed.append(txn_id)
+            sent += quantity
         else:
-            ok = False
-            messages.append(f"txn {txn_id}: {(result or {}).get('message', 'close failed')}")
+            failed += 1
+            messages.append(message)
     return RowOutcome(
         symbol=row.symbol, action=ACTION_CLOSE,
-        status=OUTCOME_SUBMITTED if ok else OUTCOME_FAILED,
-        quantity=abs(row.delta_quantity), transaction_ids=closed,
+        status=_leg_status(sent, failed),
+        quantity=sent, order_ids=order_ids, transaction_ids=closed,
         message="; ".join(messages),
     )
 
 
 def _adjust_symbol(account, row, state) -> RowOutcome:
-    """Held, target > 0 -> resize the existing transaction(s), FIFO."""
+    """Held, target > 0 -> resize the existing transaction(s), FIFO.
+
+    A leg that EXACTLY EXHAUSTS its transaction goes through ``close_transaction``
+    rather than ``adjust_quantity_with_tpsl``. That is not a workaround, it is the
+    right API: the helper is a PARTIAL-close facility and refuses
+    ``close_qty >= current_qty`` outright, while ``split_delta_fifo`` produces an
+    exhausting leg BY CONSTRUCTION for every trim that spans more than one
+    transaction (30 shares held as 20 + 10, sell 25 -> [(t1,-20),(t2,-5)]). Routed
+    the old way the first leg was simply rejected, so the trim under-sold and
+    could never converge while the dry run promised the whole thing. Closing a
+    transaction outright is exactly what that leg means.
+    """
     quantities: List[Tuple[int, float]] = []
     for txn_id in state.transaction_ids:
         try:
@@ -391,37 +492,54 @@ def _adjust_symbol(account, row, state) -> RowOutcome:
         return RowOutcome(symbol=row.symbol, action=ACTION_ADJUST, status=OUTCOME_SKIPPED,
                           message="no open transaction quantity to adjust")
 
+    held = dict(quantities)
     order_ids: List[int] = []
     touched: List[int] = []
     messages: List[str] = []
-    ok = True
+    sent = 0.0
+    failed = 0
     for txn_id, qty_change in splits:
+        magnitude = abs(float(qty_change))
+        current = held.get(txn_id, 0.0)
+
+        if qty_change < 0 and current > 0 and magnitude >= current:
+            ok, ids, message = _close_one_transaction(account, txn_id, row.symbol)
+            order_ids.extend(ids)
+            if ok:
+                touched.append(txn_id)
+                sent += current
+            else:
+                failed += 1
+                messages.append(message)
+            continue
+
         try:
             txn = get_instance(Transaction, txn_id)
         except InstanceNotFound:
-            ok = False
+            failed += 1
             messages.append(f"txn {txn_id}: vanished")
             continue
         try:
             result = TransactionHelper.adjust_quantity_with_tpsl(account, txn, qty_change)
         except Exception as e:
-            ok = False
+            failed += 1
             messages.append(f"txn {txn_id}: {e or e.__class__.__name__}")
             logger.error(f"Allocation adjustment of transaction {txn_id} ({row.symbol}) "
                          f"failed: {e}", exc_info=True)
             continue
-        touched.append(txn_id)
-        order_ids.extend((result or {}).get('orders_created') or [])
-        if not (result or {}).get('success'):
-            ok = False
-            messages.append(f"txn {txn_id}: {(result or {}).get('message')}")
+        result = result or {}
+        order_ids.extend(result.get('orders_created') or [])
+        if result.get('success'):
+            touched.append(txn_id)
+            sent += magnitude
+        else:
+            failed += 1
+            messages.append(f"txn {txn_id}: {result.get('message')}")
 
-    # A HALF-applied trim is not a success: reporting it as SUBMITTED would tell
-    # the user the position is at target when it is not.
     return RowOutcome(
         symbol=row.symbol, action=ACTION_ADJUST,
-        status=OUTCOME_SUBMITTED if ok else OUTCOME_FAILED,
-        quantity=abs(row.delta_quantity), order_ids=order_ids,
+        status=_leg_status(sent, failed),
+        quantity=sent, order_ids=order_ids,
         transaction_ids=touched, message="; ".join(messages),
     )
 
@@ -439,6 +557,12 @@ def _open_symbol(account, row, *, run_tag: str, allow_fractional: bool) -> RowOu
     order after filling part of it has already moved the position, and topping
     that up with the whole-share retry would overshoot the target the user
     approved -- an overshoot created by the recovery path itself.
+
+    It is ALSO abandoned on any failure that does not PROVE the order never
+    reached the broker (``_nothing_was_placed``). A rejection and a lost response
+    look identical from here -- both arrive as ``submit_order`` returning None --
+    and retrying the second one places a second order for the same intent. Under-
+    investing is recoverable on the next run; buying the position twice is not.
     """
     attempts = plan_quantity_attempts(
         row.delta_quantity,
@@ -458,8 +582,9 @@ def _open_symbol(account, row, *, run_tag: str, allow_fractional: bool) -> RowOu
     # one that worked.
     created: List[int] = []
     last = None
-    for path, quantity in attempts:
-        last = _submit_new_order(account, row, quantity, run_tag=run_tag, path=path)
+    for index, (path, quantity) in enumerate(attempts):
+        last, nothing_was_placed = _submit_new_order(
+            account, row, quantity, run_tag=run_tag, path=path)
         for order_id in last.order_ids:
             if order_id not in created:
                 created.append(order_id)
@@ -473,9 +598,23 @@ def _open_symbol(account, row, *, run_tag: str, allow_fractional: bool) -> RowOu
                 f"overshoot the approved target"
             )
             return last
+        if index == len(attempts) - 1:
+            logger.warning(f"Allocation: {row.symbol} rejected at qty={quantity} "
+                           f"({path}); no retry left")
+            return last
+        if not nothing_was_placed:
+            logger.error(
+                f"Allocation: {row.symbol} failed at qty={quantity} ({path}) with a "
+                f"failure that does not prove the order never reached the broker; "
+                f"NOT retrying at whole shares - a retry could double-place it. "
+                f"Check the broker."
+            )
+            last.message = (f"{last.message} | {_AMBIGUOUS_NO_RETRY_NOTE}"
+                            if last.message else _AMBIGUOUS_NO_RETRY_NOTE)
+            return last
         logger.warning(
             f"Allocation: {row.symbol} rejected at qty={quantity} ({path}); "
-            f"{'retrying at whole shares' if path != FRACTIONAL_PATH_WHOLE else 'no retry left'}"
+            f"retrying at whole shares"
         )
     return last
 
@@ -488,6 +627,45 @@ def _fresh_comment(order_id: int) -> str:
         logger.warning(f"Allocation: could not re-read order {order_id} for its "
                        f"rejection reason: {e}")
         return ""
+
+
+def _last_classified_reason(comment: str) -> Optional[str]:
+    """The LAST ``[reason]`` tag on an order comment, or None when there is none.
+
+    The last one, because ``_handle_order_submit_error`` APPENDS: a stop that was
+    auto-converted to a market order and then failed again carries two, and it is
+    the final verdict that describes the state the row ended in.
+    """
+    tags = _REASON_TAG_RE.findall(comment or "")
+    return tags[-1] if tags else None
+
+
+def _nothing_was_placed(order_id: Optional[int], status: Any,
+                        filled: Optional[float]) -> bool:
+    """Does this failure PROVE the broker never took the order? Conservative.
+
+    True only on positive evidence, because the consequence of guessing wrong is
+    a duplicate order:
+
+    * the broker itself handed the order back REJECTED / CANCELED / EXPIRED with
+      nothing filled -- we have its answer and the order is dead; or
+    * the persisted row carries a classified reason from
+      ``_handle_order_submit_error`` that only a broker REPLY can produce
+      (``_PROVEN_REJECTION_REASONS``); or
+    * there is no order row at all, so nothing was ever sent.
+
+    Everything else is False: an ``[unknown]`` classification, no classification
+    at all, an exception out of ``submit_order``, or anything that filled. See
+    ``_PROVEN_REJECTION_REASONS`` for why UNKNOWN is on this side of the line.
+    """
+    if filled:
+        return False
+    if order_id is None:
+        return True
+    if status in (OrderStatus.REJECTED, OrderStatus.CANCELED, OrderStatus.EXPIRED):
+        return True
+    reason = _last_classified_reason(_fresh_comment(order_id))
+    return reason in _PROVEN_REJECTION_REASONS
 
 
 def _rejection_reason(order, order_id: int, stamped: str) -> str:
@@ -510,7 +688,8 @@ def _rejection_reason(order, order_id: int, stamped: str) -> str:
     return " | ".join(parts) or _REJECTION_FALLBACK
 
 
-def _submit_new_order(account, row, quantity: float, *, run_tag: str, path: str) -> RowOutcome:
+def _submit_new_order(account, row, quantity: float, *, run_tag: str,
+                      path: str) -> Tuple[RowOutcome, bool]:
     """Persist one TradingOrder and put it through the PUBLIC submit_order seam.
 
     Public, not ``_submit_order_impl``: that is what runs order validation,
@@ -518,10 +697,16 @@ def _submit_new_order(account, row, quantity: float, *, run_tag: str, path: str)
     gate. ``is_closing_order`` is passed EXPLICITLY -- an allocation buy always
     OPENS, and a close mispriced as a short open is commit 1d099e8.
 
-    Never raises: a broker adapter that throws (TastyTrade refuses a fractional
-    priced order locally with a ValueError naming ``fractional_market_orders_only``)
-    comes back as a FAILED outcome, so the whole-share fallback can act on it
+    Never raises: a broker adapter that throws comes back as a FAILED outcome
     instead of a traceback reaching the user.
+
+    Returns:
+        Tuple[RowOutcome, bool]: the outcome, and whether the failure PROVES
+        nothing was placed at the broker (``_nothing_was_placed``). The second
+        value is meaningless unless the outcome FAILED, and it is what decides
+        whether the whole-share fallback may run. It is returned rather than put
+        on ``RowOutcome`` because it is an internal retry decision, not something
+        the run audit records.
     """
     stamped = _run_comment(run_tag, row.side, row.symbol)
     order = TradingOrder(
@@ -542,9 +727,10 @@ def _submit_new_order(account, row, quantity: float, *, run_tag: str, path: str)
     )
     order_id = add_instance(order, expunge_after_flush=True)
     if not order_id:
+        # Nothing was persisted, so nothing was sent: a retry cannot duplicate it.
         return RowOutcome(symbol=row.symbol, action=ACTION_NEW, status=OUTCOME_FAILED,
                           quantity=quantity, path=path,
-                          message="could not persist the TradingOrder")
+                          message="could not persist the TradingOrder"), True
 
     try:
         result = account.submit_order(order, is_closing_order=False)
@@ -553,7 +739,8 @@ def _submit_new_order(account, row, quantity: float, *, run_tag: str, path: str)
                      f"({path}): {e}", exc_info=True)
         return RowOutcome(symbol=row.symbol, action=ACTION_NEW, status=OUTCOME_FAILED,
                           quantity=quantity, path=path, order_ids=[order_id],
-                          message=str(e) or e.__class__.__name__)
+                          message=str(e) or e.__class__.__name__), \
+            _nothing_was_placed(order_id, None, None)
 
     # submit_order returns a TRUTHY order with status WASHTRADE_LOCKED when the
     # gate fires, and None on hard failure with the reason on .comment. Inspect
@@ -561,28 +748,31 @@ def _submit_new_order(account, row, quantity: float, *, run_tag: str, path: str)
     if result is None:
         return RowOutcome(symbol=row.symbol, action=ACTION_NEW, status=OUTCOME_FAILED,
                           quantity=quantity, path=path, order_ids=[order_id],
-                          message=_rejection_reason(order, order_id, stamped))
+                          message=_rejection_reason(order, order_id, stamped)), \
+            _nothing_was_placed(order_id, None, None)
 
     status = getattr(result, 'status', None)
     filled = getattr(result, 'filled_qty', None)
     if status == OrderStatus.WASHTRADE_LOCKED:
         return RowOutcome(symbol=row.symbol, action=ACTION_NEW,
                           status=OUTCOME_WASHTRADE_LOCKED, quantity=quantity, path=path,
-                          order_ids=[order_id], message="wash-trade gate locked this symbol")
+                          order_ids=[order_id],
+                          message="wash-trade gate locked this symbol"), False
     if status in _DEAD_ON_ARRIVAL_STATUSES:
         return RowOutcome(
             symbol=row.symbol, action=ACTION_NEW, status=OUTCOME_FAILED,
             quantity=quantity, filled_quantity=filled, path=path, order_ids=[order_id],
             message=f"broker returned the order {status.value}: "
-                    f"{_rejection_reason(result, order_id, stamped)}")
+                    f"{_rejection_reason(result, order_id, stamped)}"), \
+            _nothing_was_placed(order_id, status, filled)
     if status == OrderStatus.PARTIALLY_FILLED:
         return RowOutcome(
             symbol=row.symbol, action=ACTION_NEW, status=OUTCOME_PARTIAL,
             quantity=quantity, filled_quantity=filled, path=path, order_ids=[order_id],
-            message=f"partially filled: {filled} of {quantity}")
+            message=f"partially filled: {filled} of {quantity}"), False
     return RowOutcome(symbol=row.symbol, action=ACTION_NEW, status=OUTCOME_SUBMITTED,
                       quantity=quantity, filled_quantity=filled, path=path,
-                      order_ids=[order_id])
+                      order_ids=[order_id]), False
 
 
 # ---------------------------------------------------------------------------
@@ -712,6 +902,30 @@ def get_open_income_total(account_id: int) -> float:
 #: is PENDING at our end, nothing was sent, and it is retried later.
 _MONEY_OUT_STATUSES = frozenset({OUTCOME_SUBMITTED, OUTCOME_PARTIAL})
 
+
+def _committed_quantity(outcome: RowOutcome) -> Optional[float]:
+    """How much of this row really went out, or None when nothing did.
+
+    Two ways money leaves the account, and the second one is the whole reason
+    this is not a set membership test:
+
+    * the order reached the broker (``_MONEY_OUT_STATUSES``) -> the quantity SENT,
+      because the order is live and will fill; and
+    * the row FAILED but the broker had already FILLED part of it -> the filled
+      quantity. A market order cancelled after filling 6 of 10 shares is reported
+      FAILED (correctly -- it did not do what was asked) and those 6 shares are
+      nevertheless bought and paid for. Valuing that row at zero leaves the income
+      that funded them looking unallocated, so the NEXT run spends it again, on
+      top of shares the account already owns. The run is STAMPED either way, so it
+      never appears in ``get_unconsumed_runs()`` and nothing else will ever
+      reconcile it.
+    """
+    if outcome.status in _MONEY_OUT_STATUSES:
+        return float(outcome.quantity)
+    if outcome.filled_quantity:
+        return float(outcome.filled_quantity)
+    return None
+
 #: The one-line activity-log summary of a run. Every outcome the vocabulary has
 #: is named: a line that mentions only "submitted" and "failed" hides a
 #: wash-trade lock completely, and that is an order the user never learns about.
@@ -747,15 +961,21 @@ def summarise_outcomes(plan: AllocationPlan, outcomes: List[RowOutcome]) -> Dict
         for order_id in outcome.order_ids:
             if order_id not in order_ids:
                 order_ids.append(order_id)
-        if outcome.status not in _MONEY_OUT_STATUSES:
+        quantity = _committed_quantity(outcome)
+        if quantity is None:
             continue
         row = by_symbol.get(outcome.symbol)
         if row is None:
             continue
-        if row.price and outcome.quantity:
-            value = float(row.price) * float(outcome.quantity)
+        if row.price:
+            value = float(row.price) * quantity
         else:
-            value = float(row.estimated_value)
+            # No price to multiply by, so the row's own estimate is all there is
+            # -- pro-rated, because it was struck for the WHOLE row and only part
+            # of the row may have gone out.
+            sent = abs(float(outcome.quantity)) or abs(float(row.delta_quantity))
+            fraction = min(1.0, quantity / sent) if sent else 1.0
+            value = float(row.estimated_value) * fraction
         if row.is_buy:
             buy_value += value
         elif row.is_sell:
@@ -852,7 +1072,11 @@ def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionSta
                              OUTCOME_FAILED, OUTCOME_SKIPPED)}
     failed = counts[OUTCOME_FAILED]
     reached_the_broker = counts[OUTCOME_SUBMITTED] + counts[OUTCOME_PARTIAL]
-    if not failed:
+    # A PARTIAL row is not a success even with nothing FAILED beside it: a close
+    # where 2 of 3 transactions went out, or an order the broker part-filled,
+    # leaves the account somewhere the user never approved. The one-line summary
+    # is all most people read, and SUCCESS on it would end the conversation.
+    if not failed and not counts[OUTCOME_PARTIAL]:
         severity = ActivityLogSeverity.SUCCESS
     elif reached_the_broker:
         severity = ActivityLogSeverity.WARNING

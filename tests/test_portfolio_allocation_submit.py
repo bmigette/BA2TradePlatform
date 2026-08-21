@@ -24,7 +24,7 @@ from ba2_trade_platform.core.portfolio_allocation import (
 )
 from ba2_trade_platform.core.TransactionHelper import TransactionHelper
 from ba2_trade_platform.core.types import (
-    ActivityLogSeverity, ActivityLogType,
+    ActivityLogSeverity, ActivityLogType, BrokerOrderErrorReason,
     OrderDirection, OrderOpenType, OrderStatus, OrderType, TransactionStatus,
 )
 from ba2_trade_platform.core import portfolio_allocation_service as svc
@@ -65,7 +65,13 @@ class FakeAccount:
         self.preview_raises = False
         self.margin_raises = False
         self.closed = []             # [transaction_id]
+        #: Quantities the broker refuses UNAMBIGUOUSLY -- it answered, and the
+        #: answer was "no". Stamped the way _handle_order_submit_error does.
         self.reject_quantities = set()
+        #: quantity -> message for a failure that PROVES NOTHING. The adapter
+        #: classified it UNKNOWN (a lost response, a socket timeout) and returned
+        #: None, which is indistinguishable from a clean rejection.
+        self.ambiguous_quantities = {}
         self.washtrade_symbols = set()
         #: ONE timeline across every branch. `submitted` and `closed` are per-path
         #: lists and cannot show that a close happened BEFORE a buy; the
@@ -86,6 +92,14 @@ class FakeAccount:
         #: market order placed before the open, and the only outcome that is a
         #: success with no fill to show for it.
         self.accepted_symbols = set()
+        #: When True EVERY submission is refused, whatever its quantity. Used by
+        #: the tests that drive the REAL TransactionHelper, which builds its own
+        #: orders and so has no quantity for the caller to pre-register.
+        self.reject_everything = False
+        #: transaction_id -> False returned by cancel_order (the broker refused
+        #: to pull the TP/SL leg, so nothing will ever trigger off its cancel).
+        self.cancel_failures = set()
+        self.canceled = []           # [order_id] the caller asked us to cancel
 
     def get_positions(self):
         return self.positions
@@ -113,8 +127,30 @@ class FakeAccount:
             return None
         return list(self.cash_transfers)
 
+    def _handle_submit_error(self, trading_order, reason: str):
+        """What ``AccountInterface._handle_order_submit_error`` really does.
+
+        It re-reads the row from the DATABASE, stamps it ERROR, appends
+        ``[<classified reason>] <broker message>`` to its comment and returns
+        None. The caller's own object never sees any of it.
+        """
+        fresh = get_instance(TradingOrder, trading_order.id)
+        fresh.status = OrderStatus.ERROR
+        fresh.comment = f"{fresh.comment} | {reason}" if fresh.comment else reason
+        update_instance(fresh)
+        return None
+
     def submit_order(self, trading_order, tp_price=None, sl_price=None,
                      is_closing_order=NOT_PASSED):
+        # AccountInterface.submit_order persists an unsaved order BEFORE it goes
+        # anywhere near the broker (AccountInterface.py:335, and again in every
+        # _submit_order_impl's `if trading_order.id is None`), and every failure
+        # path below then writes onto that PERSISTED row. TransactionHelper hands
+        # this seam brand-new TradingOrder objects, so without this the helper's
+        # own orders would never exist in the database at all.
+        if trading_order.id is None:
+            trading_order.status = OrderStatus.PENDING
+            trading_order.id = add_instance(trading_order, expunge_after_flush=True)
         self.submitted.append((trading_order.symbol, trading_order.side,
                                trading_order.quantity, trading_order.comment))
         self.submit_closing_flags.append(is_closing_order)
@@ -122,15 +158,23 @@ class FakeAccount:
         if trading_order.quantity in self.raise_quantities:
             raise self.raise_quantities[trading_order.quantity]
         if trading_order.quantity in self.db_reject_quantities:
-            # The reason lands on the DATABASE row, not on this object.
+            # The reason lands on the DATABASE row, not on this object -- and
+            # WITHOUT a classified reason, the way an adapter that never called
+            # _handle_order_submit_error leaves it.
             fresh = get_instance(TradingOrder, trading_order.id)
             reason = self.db_reject_quantities[trading_order.quantity]
             fresh.comment = f"{fresh.comment} | {reason}" if fresh.comment else reason
             update_instance(fresh)
             return None
-        if trading_order.quantity in self.reject_quantities:
-            trading_order.comment = f"{trading_order.comment or ''} | broker rejected"
-            return None
+        if trading_order.quantity in self.ambiguous_quantities:
+            return self._handle_submit_error(
+                trading_order,
+                f"[{BrokerOrderErrorReason.UNKNOWN.value}] "
+                f"{self.ambiguous_quantities[trading_order.quantity]}")
+        if self.reject_everything or trading_order.quantity in self.reject_quantities:
+            return self._handle_submit_error(
+                trading_order,
+                f"[{BrokerOrderErrorReason.INSUFFICIENT_FUNDS.value}] broker rejected")
         if trading_order.symbol in self.washtrade_symbols:
             trading_order.status = OrderStatus.WASHTRADE_LOCKED
             return trading_order
@@ -150,6 +194,20 @@ class FakeAccount:
         trading_order.status = OrderStatus.FILLED
         trading_order.filled_qty = trading_order.quantity
         return trading_order
+
+    def cancel_order(self, order_id):
+        """TransactionHelper pulls the live TP/SL legs through this seam.
+
+        Returns False for the ids in ``cancel_failures``: a leg the broker would
+        not pull is a leg that never reaches CANCELED, so nothing triggers off it.
+        """
+        self.canceled.append(order_id)
+        if order_id in self.cancel_failures:
+            return False
+        fresh = get_instance(TradingOrder, order_id)
+        fresh.status = OrderStatus.CANCELED
+        update_instance(fresh)
+        return True
 
     def close_transaction(self, transaction_id):
         self.events.append(('close', transaction_id))
@@ -188,6 +246,34 @@ def make_open_transaction(account_id: int, symbol: str, quantity: float) -> int:
         transaction_id=txn_id,
     ))
     return txn_id
+
+
+def make_active_tp_order(account_id: int, txn_id: int, symbol: str,
+                         quantity: float) -> int:
+    """An ACCEPTED take-profit leg hanging off the transaction's entry order.
+
+    ``TransactionHelper`` recognises a TP/SL leg by ``depends_on_order`` being
+    set, and only a NON-terminal one counts, so this is the shape that makes
+    ``adjust_quantity_with_tpsl`` take its triggered-chain path instead of the
+    bare one.
+    """
+    with get_db() as session:
+        entry = session.exec(select(TradingOrder).where(
+            TradingOrder.transaction_id == txn_id,
+            TradingOrder.depends_on_order.is_(None),
+        )).first()
+        entry_id = entry.id
+    return add_instance(TradingOrder(
+        account_id=account_id, symbol=symbol, quantity=quantity,
+        side=OrderDirection.SELL, order_type=OrderType.SELL_LIMIT,
+        limit_price=999.0, status=OrderStatus.ACCEPTED,
+        depends_on_order=entry_id, transaction_id=txn_id,
+        comment="TP leg",
+    ))
+
+
+def txn_quantity(txn_id: int) -> float:
+    return float(get_instance(Transaction, txn_id).quantity or 0.0)
 
 
 def make_row(symbol, side, delta, value, bp_cost, price=100.0):
@@ -674,71 +760,232 @@ def test_submit_plan_never_surfaces_a_raw_broker_exception():
 
 
 # ---------------------------------------------------------------------------
-# submit_plan -- the ADJUST branch
+# submit_plan -- the ADJUST branch.
+#
+# NOTHING here monkeypatches TransactionHelper. The three bugs this section now
+# pins (a rejected add reported as submitted, a trim that sends nothing, a
+# multi-transaction trim the helper refuses outright) all live INSIDE the helper
+# or in the contract between it and the service, and every one of them survived
+# a suite whose ADJUST tests replaced the helper with a lambda that returned
+# success. The broker is faked at the ACCOUNT seam instead.
 # ---------------------------------------------------------------------------
 
-def test_submit_plan_trim_on_a_held_symbol_adjusts_the_transaction_fifo(monkeypatch):
+def _trim_plan(symbol="AAPL", delta=-25.0, target=5.0, price=106.0):
+    row = make_row(symbol, OrderDirection.SELL, delta, abs(delta) * price, 0.0,
+                   price=price)
+    row.target_quantity = target
+    return AllocationPlan(rows=[row], available_buying_power=10_000.0)
+
+
+def test_submit_plan_trim_on_a_position_with_no_tpsl_legs_reaches_the_broker():
+    """C2. A position this feature opened has NO active TP/SL legs --
+    ``_submit_new_order`` attaches none -- so the helper's triggered chain has
+    nothing to hang off. The partial-close order it creates is left PENDING, and
+    TradeManager's ``_check_all_waiting_trigger_orders`` only ever looks at
+    WAITING_TRIGGER rows (its PENDING sweep DELETES them). Nothing would ever
+    send it, while the run reported the trim as submitted and wrote the
+    transaction down to the target."""
     account = FakeAccount(account_id=9)
     account.positions = [FakePosition("AAPL", 30.0, 3000.0, 3200.0)]
-    first = make_open_transaction(9, "AAPL", 20.0)
-    second = make_open_transaction(9, "AAPL", 10.0)
-    calls = []
-
-    def fake_adjust(acct, transaction, qty_change, tp_price=None, sl_price=None, expert_id=None):
-        calls.append((transaction.id, qty_change))
-        return {'success': True, 'message': 'ok', 'orders_created': [111], 'orders_canceled': []}
-
-    monkeypatch.setattr(TransactionHelper, 'adjust_quantity_with_tpsl', staticmethod(fake_adjust))
-
-    row = make_row("AAPL", OrderDirection.SELL, -25.0, 2650.0, 0.0, price=106.0)
-    row.target_quantity = 5.0
-    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
+    txn_id = make_open_transaction(9, "AAPL", 30.0)
     current = {"AAPL": PositionState(symbol="AAPL", quantity=30.0, price=106.0,
-                                     transaction_ids=[first, second])}
+                                     transaction_ids=[txn_id])}
 
-    outcomes = svc.submit_plan(account, plan, current, run_tag="22", allow_fractional=False)
+    outcomes = svc.submit_plan(account, _trim_plan(), current, run_tag="22",
+                               allow_fractional=False)
 
-    assert calls == [(first, -20.0), (second, -5.0)]
+    assert [(s[0], s[1], s[2]) for s in account.submitted] == [
+        ("AAPL", OrderDirection.SELL, 25.0)]
     assert outcomes[0].action == ACTION_ADJUST
     assert outcomes[0].status == svc.OUTCOME_SUBMITTED
+    assert outcomes[0].quantity == pytest.approx(25.0)
+    assert txn_quantity(txn_id) == pytest.approx(5.0)
 
 
-def test_submit_plan_adjust_reports_failed_when_one_leg_of_the_split_fails(monkeypatch):
+def test_submit_plan_trim_the_broker_refuses_does_not_write_the_transaction_down():
+    """C2, the other half. The sell never happened, so the position is still 30
+    shares. Writing it down to 5 anyway makes every later valuation, every later
+    delta and the next run's dry run wrong -- and reports the row as submitted."""
+    account = FakeAccount(account_id=91)
+    account.positions = [FakePosition("AAPL", 30.0, 3000.0, 3200.0)]
+    account.reject_everything = True
+    txn_id = make_open_transaction(91, "AAPL", 30.0)
+    current = {"AAPL": PositionState(symbol="AAPL", quantity=30.0, price=106.0,
+                                     transaction_ids=[txn_id])}
+
+    outcomes = svc.submit_plan(account, _trim_plan(), current, run_tag="91",
+                               allow_fractional=False)
+
+    assert outcomes[0].status == svc.OUTCOME_FAILED
+    assert txn_quantity(txn_id) == pytest.approx(30.0)
+
+
+def test_submit_plan_trim_arms_the_triggered_chain_when_there_is_a_live_tpsl_leg():
+    """The designed path, pinned so the C2 fix cannot swallow it: with a live
+    TP/SL leg the partial close is created WAITING_TRIGGER on that leg's cancel
+    and TradeManager submits it when the cancel lands. Sending it from here as
+    well would put TWO sells against one position."""
+    account = FakeAccount(account_id=92)
+    account.positions = [FakePosition("AAPL", 30.0, 3000.0, 3200.0)]
+    txn_id = make_open_transaction(92, "AAPL", 30.0)
+    tp_id = make_active_tp_order(92, txn_id, "AAPL", 30.0)
+    current = {"AAPL": PositionState(symbol="AAPL", quantity=30.0, price=106.0,
+                                     transaction_ids=[txn_id])}
+
+    outcomes = svc.submit_plan(account, _trim_plan(), current, run_tag="92",
+                               allow_fractional=False)
+
+    assert account.canceled == [tp_id]
+    assert account.submitted == []          # the chain is armed, not fired
+    assert outcomes[0].status == svc.OUTCOME_SUBMITTED
+    chain = [get_instance(TradingOrder, i) for i in outcomes[0].order_ids]
+    assert [o.status for o in chain] == [OrderStatus.WAITING_TRIGGER]
+    assert txn_quantity(txn_id) == pytest.approx(5.0)
+
+
+def test_submit_plan_trim_whose_tpsl_cancel_the_broker_refuses_sends_nothing():
+    """C2 again, by a different route. The partial close waits on that ONE leg
+    reaching CANCELED. A cancel the broker refuses leaves it waiting forever --
+    nothing is sent, and the transaction must not be written down for it."""
+    account = FakeAccount(account_id=93)
+    account.positions = [FakePosition("AAPL", 30.0, 3000.0, 3200.0)]
+    txn_id = make_open_transaction(93, "AAPL", 30.0)
+    tp_id = make_active_tp_order(93, txn_id, "AAPL", 30.0)
+    account.cancel_failures = {tp_id}
+    current = {"AAPL": PositionState(symbol="AAPL", quantity=30.0, price=106.0,
+                                     transaction_ids=[txn_id])}
+
+    outcomes = svc.submit_plan(account, _trim_plan(), current, run_tag="93",
+                               allow_fractional=False)
+
+    assert account.submitted == []
+    assert outcomes[0].status == svc.OUTCOME_FAILED
+    assert txn_quantity(txn_id) == pytest.approx(30.0)
+    # ...and the stranded close order can never fire later.
+    stranded = [get_instance(TradingOrder, i) for i in outcomes[0].order_ids]
+    assert all(o.status == OrderStatus.CANCELED for o in stranded), stranded
+
+
+def test_submit_plan_add_to_position_the_broker_refused_is_not_reported_submitted():
+    """C1. ``adjust_quantity_with_tpsl`` submitted the add order, got None back
+    -- the row already stamped ERROR by ``_handle_order_submit_error`` -- and
+    carried on to write the transaction UP as though it had filled. The account
+    holds 10 shares; the run said 15 and spent the income ledger for 5 shares
+    that do not exist."""
+    account = FakeAccount(account_id=94)
+    account.positions = [FakePosition("AAPL", 10.0, 1060.0, 1060.0)]
+    account.reject_everything = True
+    txn_id = make_open_transaction(94, "AAPL", 10.0)
+    row = make_row("AAPL", OrderDirection.BUY, 5.0, 530.0, 530.0, price=106.0)
+    row.target_quantity = 15.0
+    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
+    current = {"AAPL": PositionState(symbol="AAPL", quantity=10.0, price=106.0,
+                                     transaction_ids=[txn_id])}
+
+    outcomes = svc.submit_plan(account, plan, current, run_tag="94",
+                               allow_fractional=False)
+
+    assert outcomes[0].action == ACTION_ADJUST
+    assert outcomes[0].status == svc.OUTCOME_FAILED
+    assert txn_quantity(txn_id) == pytest.approx(10.0)
+    # The refused row is still reported, so the audit can point at it.
+    assert outcomes[0].order_ids
+    refused = get_instance(TradingOrder, outcomes[0].order_ids[0])
+    assert refused.status == OrderStatus.ERROR
+
+
+def test_submit_plan_add_to_position_the_broker_took_is_reported_submitted():
+    """The companion to C1: the accepted add still works, end to end."""
+    account = FakeAccount(account_id=95)
+    account.positions = [FakePosition("AAPL", 10.0, 1060.0, 1060.0)]
+    txn_id = make_open_transaction(95, "AAPL", 10.0)
+    row = make_row("AAPL", OrderDirection.BUY, 5.0, 530.0, 530.0, price=106.0)
+    row.target_quantity = 15.0
+    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
+    current = {"AAPL": PositionState(symbol="AAPL", quantity=10.0, price=106.0,
+                                     transaction_ids=[txn_id])}
+
+    outcomes = svc.submit_plan(account, plan, current, run_tag="95",
+                               allow_fractional=False)
+
+    assert [(s[0], s[1], s[2]) for s in account.submitted] == [
+        ("AAPL", OrderDirection.BUY, 5.0)]
+    assert outcomes[0].status == svc.OUTCOME_SUBMITTED
+    assert txn_quantity(txn_id) == pytest.approx(15.0)
+
+
+def test_submit_plan_trim_across_two_transactions_closes_the_one_it_exhausts():
+    """I1. ``split_delta_fifo`` returns [(t1,-20),(t2,-5)] for 30 shares held as
+    20 + 10 -- the first leg EXACTLY exhausts t1, by construction, whenever a
+    trim spans more than one transaction. ``adjust_quantity_with_tpsl`` is a
+    PARTIAL-close API and refuses ``close_qty >= current_qty``, so that leg used
+    to be rejected outright: the trim under-sold by 20 shares and could never
+    converge, while the dry run promised the full 25."""
     account = FakeAccount(account_id=55)
+    account.positions = [FakePosition("AAPL", 30.0, 3000.0, 3200.0)]
     first = make_open_transaction(55, "AAPL", 20.0)
     second = make_open_transaction(55, "AAPL", 10.0)
-
-    def fake_adjust(acct, transaction, qty_change, tp_price=None, sl_price=None, expert_id=None):
-        if transaction.id == second:
-            return {'success': False, 'message': 'held_for_orders',
-                    'orders_created': [], 'orders_canceled': []}
-        return {'success': True, 'message': 'ok', 'orders_created': [111], 'orders_canceled': []}
-
-    monkeypatch.setattr(TransactionHelper, 'adjust_quantity_with_tpsl', staticmethod(fake_adjust))
-
-    row = make_row("AAPL", OrderDirection.SELL, -25.0, 2650.0, 0.0, price=106.0)
-    row.target_quantity = 5.0
-    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
     current = {"AAPL": PositionState(symbol="AAPL", quantity=30.0, price=106.0,
                                      transaction_ids=[first, second])}
 
-    outcomes = svc.submit_plan(account, plan, current, run_tag="56", allow_fractional=False)
+    outcomes = svc.submit_plan(account, _trim_plan(), current, run_tag="56",
+                               allow_fractional=False)
 
-    # HALF the trim went through. Reporting it as SUBMITTED would tell the user
-    # the position is at target when it is not.
+    # The exhausting leg goes through close_transaction; the remainder through
+    # the adjust path. Together they really do sell 25.
+    assert account.closed == [first]
+    assert [(s[0], s[2]) for s in account.submitted] == [("AAPL", 5.0)]
+    assert txn_quantity(second) == pytest.approx(5.0)
+    assert outcomes[0].status == svc.OUTCOME_SUBMITTED
+    assert outcomes[0].quantity == pytest.approx(25.0)
+
+
+def test_submit_plan_adjust_reports_partial_when_one_leg_of_the_split_fails():
+    """I3. Half the trim really went out. Reporting the row FAILED values those
+    sells at ZERO in ``summarise_outcomes``, and the run then over-consumes the
+    income ledger by the whole amount they raised."""
+    account = FakeAccount(account_id=96)
+    account.positions = [FakePosition("AAPL", 30.0, 3000.0, 3200.0)]
+    first = make_open_transaction(96, "AAPL", 20.0)
+    second = make_open_transaction(96, "AAPL", 10.0)
+    account.close_failures = {first: "held for another order"}
+    current = {"AAPL": PositionState(symbol="AAPL", quantity=30.0, price=106.0,
+                                     transaction_ids=[first, second])}
+
+    outcomes = svc.submit_plan(account, _trim_plan(), current, run_tag="97",
+                               allow_fractional=False)
+
+    assert outcomes[0].status == svc.OUTCOME_PARTIAL
+    assert outcomes[0].quantity == pytest.approx(5.0)   # what really went out
+    assert "held for another order" in outcomes[0].message
+    assert txn_quantity(first) == pytest.approx(20.0)
+    assert txn_quantity(second) == pytest.approx(5.0)
+
+
+def test_submit_plan_adjust_reports_failed_when_every_leg_fails():
+    account = FakeAccount(account_id=98)
+    account.positions = [FakePosition("AAPL", 30.0, 3000.0, 3200.0)]
+    first = make_open_transaction(98, "AAPL", 20.0)
+    second = make_open_transaction(98, "AAPL", 10.0)
+    account.close_failures = {first: "held for another order"}
+    account.reject_everything = True
+    current = {"AAPL": PositionState(symbol="AAPL", quantity=30.0, price=106.0,
+                                     transaction_ids=[first, second])}
+
+    outcomes = svc.submit_plan(account, _trim_plan(), current, run_tag="99",
+                               allow_fractional=False)
+
     assert outcomes[0].status == svc.OUTCOME_FAILED
-    assert "held_for_orders" in outcomes[0].message
-    assert outcomes[0].order_ids == [111]
+    assert outcomes[0].quantity == pytest.approx(0.0)
+    assert txn_quantity(first) == pytest.approx(20.0)
+    assert txn_quantity(second) == pytest.approx(10.0)
 
 
-def test_submit_plan_adjust_with_no_remaining_transaction_quantity_is_skipped(monkeypatch):
+def test_submit_plan_adjust_with_no_remaining_transaction_quantity_is_skipped():
     """Every open transaction is already at zero: there is nothing to trim, and
     sending a zero-quantity adjustment is an order the broker cancels."""
     account = FakeAccount(account_id=57)
     empty = make_open_transaction(57, "AAPL", 0.0)
-    called = []
-    monkeypatch.setattr(TransactionHelper, 'adjust_quantity_with_tpsl',
-                        staticmethod(lambda *a, **k: called.append(a)))
 
     row = make_row("AAPL", OrderDirection.SELL, -5.0, 530.0, 0.0, price=106.0)
     row.target_quantity = 5.0
@@ -748,7 +995,7 @@ def test_submit_plan_adjust_with_no_remaining_transaction_quantity_is_skipped(mo
 
     outcomes = svc.submit_plan(account, plan, current, run_tag="58", allow_fractional=False)
 
-    assert called == []
+    assert account.submitted == [] and account.closed == []
     assert outcomes[0].status == svc.OUTCOME_SKIPPED
 
 
@@ -758,7 +1005,12 @@ def test_submit_plan_adjust_with_no_remaining_transaction_quantity_is_skipped(mo
 
 def test_submit_plan_close_keeps_going_after_one_transaction_refuses():
     """Three transactions in one symbol: a refusal on the first must not leave the
-    other two open with the run reporting a single failure and nothing else."""
+    other two open with the run reporting a single failure and nothing else.
+
+    I3: 2 of the 3 closes really went to the broker, so the row is PARTIAL, not
+    FAILED. ``summarise_outcomes`` values a non-money-out row at ZERO, so calling
+    this FAILED tells the ledger those two sells raised nothing and the run
+    over-consumes the income they actually funded."""
     account = FakeAccount(account_id=59)
     a = make_open_transaction(59, "MSFT", 2.0)
     b = make_open_transaction(59, "MSFT", 2.0)
@@ -775,9 +1027,29 @@ def test_submit_plan_close_keeps_going_after_one_transaction_refuses():
 
     assert account.closed == [b, c]
     assert outcomes[0].action == ACTION_CLOSE
-    assert outcomes[0].status == svc.OUTCOME_FAILED
+    assert outcomes[0].status == svc.OUTCOME_PARTIAL
+    assert outcomes[0].quantity == pytest.approx(3.0)   # b + c, not the full 5
     assert outcomes[0].transaction_ids == [b, c]
     assert "held for another order" in outcomes[0].message
+
+
+def test_submit_plan_close_records_the_order_the_broker_was_given():
+    """I2. ``close_transaction`` hands back ``close_order_id`` (documented at
+    AccountInterface.py:1567). Throwing it away leaves ``order_ids`` -- the
+    column that says "every TradingOrder this run created" -- with no trace of
+    the orders that closed the positions."""
+    account = FakeAccount(account_id=100)
+    txn_id = make_open_transaction(100, "MSFT", 5.0)
+    row = make_row("MSFT", OrderDirection.SELL, -5.0, 2000.0, 0.0, price=400.0)
+    row.target_quantity = 0.0
+    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
+    current = {"MSFT": PositionState(symbol="MSFT", quantity=5.0, price=400.0,
+                                     transaction_ids=[txn_id])}
+
+    outcomes = svc.submit_plan(account, plan, current, run_tag="100", allow_fractional=False)
+
+    assert outcomes[0].order_ids == [999]   # FakeAccount's close_order_id
+    assert svc.summarise_outcomes(plan, outcomes)["order_ids"] == [999]
 
 
 def test_submit_plan_close_keeps_going_after_one_transaction_explodes():
@@ -795,8 +1067,27 @@ def test_submit_plan_close_keeps_going_after_one_transaction_explodes():
     outcomes = svc.submit_plan(account, plan, current, run_tag="62", allow_fractional=False)
 
     assert account.closed == [b]
-    assert outcomes[0].status == svc.OUTCOME_FAILED
+    assert outcomes[0].status == svc.OUTCOME_PARTIAL
+    assert outcomes[0].quantity == pytest.approx(3.0)
     assert "broker timeout" in outcomes[0].message
+
+
+def test_submit_plan_close_reports_failed_when_every_transaction_refuses():
+    account = FakeAccount(account_id=101)
+    a = make_open_transaction(101, "MSFT", 2.0)
+    b = make_open_transaction(101, "MSFT", 3.0)
+    account.close_failures = {a: "held", b: "held"}
+
+    row = make_row("MSFT", OrderDirection.SELL, -5.0, 2000.0, 0.0, price=400.0)
+    row.target_quantity = 0.0
+    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
+    current = {"MSFT": PositionState(symbol="MSFT", quantity=5.0, price=400.0,
+                                     transaction_ids=[a, b])}
+
+    outcomes = svc.submit_plan(account, plan, current, run_tag="102", allow_fractional=False)
+
+    assert outcomes[0].status == svc.OUTCOME_FAILED
+    assert outcomes[0].quantity == pytest.approx(0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -875,6 +1166,10 @@ def _fractional_plan(symbol="NVDA", delta=2.5, price=900.0):
 
 
 def test_submit_plan_retries_whole_shares_once_when_the_fractional_order_is_rejected():
+    """I4's other side: the fallback still fires on a PROVEN refusal. A
+    classified reason such as ``[insufficient_funds]`` can only be produced by
+    parsing a REPLY from the broker, and a reply that says "no" is proof the
+    order was not taken."""
     account = FakeAccount(account_id=11)
     account.positions = []
     account.reject_quantities = {2.5}   # broker refuses the fractional quantity
@@ -931,23 +1226,62 @@ def test_submit_plan_reports_skipped_not_failed_when_the_whole_share_floor_is_ze
     assert "whole share" in outcomes[0].message
 
 
-def test_submit_plan_falls_back_to_whole_shares_when_the_adapter_refuses_locally():
-    """L1: TastyTrade refuses a fractional priced order in the adapter, BEFORE any
-    round trip, by raising a ValueError naming ``fractional_market_orders_only``.
-    That has to drive the same fallback as a broker-side rejection, not reach the
-    user as a traceback."""
+def test_submit_plan_does_not_retry_whole_shares_when_submit_order_raised():
+    """I4. An exception out of ``submit_order`` proves NOTHING about broker state.
+
+    ``AccountInterface.submit_order`` documents "Returns None **or raises an
+    exception** if failed" and says nothing about whether the order was placed;
+    it also runs code AFTER ``_submit_order_impl`` has handed back a LIVE order
+    (the protective-leg block), so a raise is not evidence the broker is empty.
+    Retrying on it can place a SECOND order for the same intent, and no amount of
+    under-investing is worth that."""
     account = FakeAccount(account_id=67)
     account.positions = []
-    account.raise_quantities = {2.5: ValueError(
-        "TastyTrade will not accept the fractional quantity 2.5 of NVDA ... "
-        "fractional_market_orders_only")}
+    account.raise_quantities = {2.5: RuntimeError(
+        "HTTPSConnectionPool: Read timed out waiting for the order response")}
 
     outcomes = svc.submit_plan(account, _fractional_plan(), {}, run_tag="68",
                                allow_fractional=True)
 
-    assert [s[2] for s in account.submitted] == [2.5, 2.0]
-    assert outcomes[0].status == svc.OUTCOME_SUBMITTED
-    assert outcomes[0].path == "whole"
+    assert [s[2] for s in account.submitted] == [2.5]
+    assert outcomes[0].status == svc.OUTCOME_FAILED
+    assert "check the broker" in outcomes[0].message
+
+
+def test_submit_plan_does_not_retry_whole_shares_after_an_ambiguous_failure():
+    """I4, the probed case. The fractional BUY reached the broker and was
+    accepted, but the HTTP response was lost. ``_classify_order_error`` returns
+    UNKNOWN for every error nobody has characterised -- which is exactly where a
+    socket read timeout lands -- and ``_handle_order_submit_error`` then stamps
+    the row ERROR and returns None, indistinguishable from a clean rejection.
+    Firing the whole-share fallback here buys the position TWICE."""
+    account = FakeAccount(account_id=104)
+    account.positions = []
+    account.ambiguous_quantities = {2.5: "connection reset while reading the response"}
+
+    outcomes = svc.submit_plan(account, _fractional_plan(), {}, run_tag="105",
+                               allow_fractional=True)
+
+    assert [s[2] for s in account.submitted] == [2.5]
+    assert outcomes[0].status == svc.OUTCOME_FAILED
+    assert outcomes[0].path == "fractional"
+    assert "connection reset" in outcomes[0].message
+    assert "check the broker" in outcomes[0].message
+
+
+def test_submit_plan_does_not_retry_when_the_rejection_carries_no_classification():
+    """An adapter that wrote words onto the row without going through
+    ``_handle_order_submit_error`` left no ``[reason]`` tag, so there is nothing
+    to reason from. Absence of evidence is not evidence of a refusal."""
+    account = FakeAccount(account_id=106)
+    account.positions = []
+    account.db_reject_quantities = {2.5: "the broker said something we cannot parse"}
+
+    outcomes = svc.submit_plan(account, _fractional_plan(), {}, run_tag="107",
+                               allow_fractional=True)
+
+    assert [s[2] for s in account.submitted] == [2.5]
+    assert outcomes[0].status == svc.OUTCOME_FAILED
 
 
 def test_submit_plan_reports_the_last_failure_when_the_whole_share_retry_also_fails():
@@ -1429,6 +1763,30 @@ def test_summarise_outcomes_counts_a_partial_fill_as_money_that_went_out():
     assert svc.summarise_outcomes(plan, outcomes)["submitted_buy_value"] == pytest.approx(3600.0)
 
 
+def test_summarise_outcomes_counts_the_shares_a_cancelled_order_had_already_filled():
+    """C3. The broker filled 6 of the 10 and then returned the order CANCELED --
+    the exact shape ``_submit_new_order`` already models. Those 6 shares are
+    REAL: the cash left the account. Valuing the row at zero because its status
+    is FAILED leaves the income that funded them showing as unallocated, for the
+    NEXT run to spend on top of shares that are already bought."""
+    row = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
+    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
+    outcomes = [svc.RowOutcome(symbol="AAPL", action=ACTION_NEW, status=svc.OUTCOME_FAILED,
+                               quantity=10.0, filled_quantity=6.0, order_ids=[9])]
+
+    # 6 shares at 160, not 10 at 160 and not zero.
+    assert svc.summarise_outcomes(plan, outcomes)["submitted_buy_value"] == pytest.approx(960.0)
+
+
+def test_summarise_outcomes_still_values_a_failure_that_filled_nothing_at_zero():
+    row = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
+    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
+    outcomes = [svc.RowOutcome(symbol="AAPL", action=ACTION_NEW, status=svc.OUTCOME_FAILED,
+                               quantity=10.0, filled_quantity=0.0, order_ids=[9])]
+
+    assert svc.summarise_outcomes(plan, outcomes)["submitted_buy_value"] == pytest.approx(0.0)
+
+
 def test_summarise_outcomes_ignores_a_washtrade_locked_row():
     """The order is PENDING at our end and nothing has been sent, so no money has
     moved and no income may be consumed against it."""
@@ -1679,6 +2037,108 @@ def test_run_allocation_logs_a_failure_when_nothing_reached_the_broker(activity)
                        mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
 
     assert activity[0]["severity"] == ActivityLogSeverity.FAILURE
+
+
+def test_run_allocation_spends_the_income_that_funded_a_cancelled_partial_fill(activity):
+    """C3 end to end. 6 of 10 shares filled and the broker cancelled the rest.
+    The run IS stamped, so it never reaches ``get_unconsumed_runs()`` either --
+    valuing it at zero means nothing will EVER reconcile the money that left."""
+    from ba2_trade_platform.core.portfolio_allocation_store import get_unconsumed_runs
+
+    account = FakeAccount(account_id=103)
+    account.positions = []
+    account.partial_fills = {"AAPL": 6.0}
+    account.terminal_statuses = {"AAPL": OrderStatus.CANCELED}
+    add_instance(PortfolioIncomeEvent(account_id=103, external_id="dep-1",
+                                      event_date=date(2026, 5, 1),
+                                      event_type=CASH_TRANSFER_DEPOSIT, amount=5_000.0))
+
+    result = svc.run_allocation(account, _buy_plan(), {}, make_base(),
+                                mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    assert result["outcomes"][0].status == svc.OUTCOME_FAILED
+    assert result["outcomes"][0].filled_quantity == pytest.approx(6.0)
+    assert result["submitted_buy_value"] == pytest.approx(960.0)
+    assert result["income_consumed"] == pytest.approx(960.0)
+    assert svc.get_open_income_total(103) == pytest.approx(4_040.0)
+    assert get_unconsumed_runs(103) == []
+
+
+def test_run_allocation_does_not_spend_income_on_an_add_the_broker_refused(activity):
+    """C1 end to end. The add never happened, so no income may be consumed for
+    it -- and the transaction must still say 10 shares, not 15."""
+    account = FakeAccount(account_id=108)
+    account.positions = [FakePosition("AAPL", 10.0, 1060.0, 1060.0)]
+    account.reject_everything = True
+    txn_id = make_open_transaction(108, "AAPL", 10.0)
+    add_instance(PortfolioIncomeEvent(account_id=108, external_id="dep-1",
+                                      event_date=date(2026, 5, 1),
+                                      event_type=CASH_TRANSFER_DEPOSIT, amount=5_000.0))
+    row = make_row("AAPL", OrderDirection.BUY, 5.0, 530.0, 530.0, price=106.0)
+    row.target_quantity = 15.0
+    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
+    current = {"AAPL": PositionState(symbol="AAPL", quantity=10.0, price=106.0,
+                                     transaction_ids=[txn_id])}
+
+    result = svc.run_allocation(account, plan, current, make_base(),
+                                mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    assert result["submitted_buy_value"] == pytest.approx(0.0)
+    assert result["income_consumed"] == pytest.approx(0.0)
+    assert svc.get_open_income_total(108) == pytest.approx(5_000.0)
+    assert txn_quantity(txn_id) == pytest.approx(10.0)
+
+
+def test_run_allocation_counts_the_sells_a_partly_successful_close_really_made(activity):
+    """I3 end to end. Two of three transactions closed. Reporting the row FAILED
+    values those two sells at ZERO, so the run treats the buys as unfunded and
+    consumes the income ledger for money the sells had already raised."""
+    account = FakeAccount(account_id=109)
+    account.positions = [FakePosition("MSFT", 5.0, 1800.0, 2000.0)]
+    a = make_open_transaction(109, "MSFT", 2.0)
+    b = make_open_transaction(109, "MSFT", 2.0)
+    c = make_open_transaction(109, "MSFT", 1.0)
+    account.close_failures = {a: "held for another order"}
+    add_instance(PortfolioIncomeEvent(account_id=109, external_id="dep-1",
+                                      event_date=date(2026, 5, 1),
+                                      event_type=CASH_TRANSFER_DEPOSIT, amount=5_000.0))
+    buy = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
+    buy.target_quantity = 10.0
+    sell = make_row("MSFT", OrderDirection.SELL, -5.0, 2000.0, 0.0, price=400.0)
+    sell.target_quantity = 0.0
+    plan = AllocationPlan(rows=[buy, sell], available_buying_power=10_000.0)
+    current = {"MSFT": PositionState(symbol="MSFT", quantity=5.0, price=400.0,
+                                     transaction_ids=[a, b, c])}
+
+    result = svc.run_allocation(account, plan, current, make_base(),
+                                mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    # 3 of the 5 shares really were sold: 3 * 400 = 1200 against a 1600 buy.
+    assert result["submitted_sell_value"] == pytest.approx(1200.0)
+    assert result["income_consumed"] == pytest.approx(400.0)
+    assert svc.get_open_income_total(109) == pytest.approx(4_600.0)
+
+
+def test_run_allocation_logs_a_warning_when_a_row_only_partly_went_out(activity):
+    """A run in which a symbol only half executed is not a SUCCESS: the account
+    is not where the user approved it should be, and the one-line summary is all
+    most people ever read."""
+    account = FakeAccount(account_id=110)
+    account.positions = [FakePosition("MSFT", 5.0, 1800.0, 2000.0)]
+    a = make_open_transaction(110, "MSFT", 2.0)
+    b = make_open_transaction(110, "MSFT", 3.0)
+    account.close_failures = {a: "held for another order"}
+    sell = make_row("MSFT", OrderDirection.SELL, -5.0, 2000.0, 0.0, price=400.0)
+    sell.target_quantity = 0.0
+    plan = AllocationPlan(rows=[sell], available_buying_power=10_000.0)
+    current = {"MSFT": PositionState(symbol="MSFT", quantity=5.0, price=400.0,
+                                     transaction_ids=[a, b])}
+
+    svc.run_allocation(account, plan, current, make_base(),
+                       mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    assert activity[0]["severity"] == ActivityLogSeverity.WARNING
+    assert "1 partially filled" in activity[0]["description"]
 
 
 def test_run_allocation_logs_a_warning_when_only_some_rows_failed(activity):

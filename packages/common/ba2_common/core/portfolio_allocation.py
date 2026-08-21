@@ -1663,6 +1663,20 @@ def split_delta_fifo(
         transaction touched is an extra broker order and an extra TP/SL rebuild.
         An add lands entirely on the OLDEST transaction, so the account keeps one
         transaction per symbol (decision 14). Empty when there is nothing to do.
+
+    CALLER CONTRACT -- a trim leg may EXACTLY EXHAUST its transaction, and by
+    construction it does whenever the trim spans more than one of them (30 shares
+    held as 20 + 10, sell 25 -> ``[(t1, -20), (t2, -5)]``: the first leg takes all
+    of t1). Such a leg is a CLOSE, not an adjustment, and must be routed to
+    ``close_transaction``. ``TransactionHelper.adjust_quantity_with_tpsl`` is a
+    PARTIAL-close facility and refuses ``close_qty >= current_qty`` outright, so
+    handing it an exhausting leg silently under-sells by that leg's whole size and
+    the position can never converge on the target the dry run promised.
+
+    The clamp is deliberately NOT relaxed to leave a share behind on each
+    transaction: dust remainders are un-closeable positions, they can fall under
+    the broker's minimum order size or its fractional notional floor, and they
+    would make the quantity submitted differ from the quantity the user approved.
     """
     if not transaction_quantities or delta_quantity == 0:
         return []
