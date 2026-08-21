@@ -26,6 +26,21 @@ from ...core.account_types import (
 from ...core.interfaces import AccountInterface
 
 
+#: The smallest DOLLAR value TastyTrade will accept for a FRACTIONAL equity order.
+#: Verified against the user's real production account on 2026-08-21 by
+#: ``POST /accounts/{n}/orders/dry-run``, which rejected BOTH a 0.05 and a 0.05715
+#: share order of SCHD (~$34, so ~$1.70 and ~$1.94 of value) with HTTP 422:
+#:
+#:     below_notional_value_minimum: Fractional equities orders cannot have a
+#:     notional value less than $5.
+#:
+#: DOLLARS, not shares -- it is published on ``MarginInfo.min_fractional_notional``
+#: and must never be written to ``MarginInfo.min_order_size``, which is a SHARE
+#: count. It binds FRACTIONAL orders only (the broker's own wording), so a
+#: whole-share order in a sub-$5 stock is unaffected.
+MIN_FRACTIONAL_NOTIONAL_USD = 5.0
+
+
 class EmptyTastytradeError(TastytradeError):
     """A ``TastytradeError`` the SDK raised with NO message, re-raised carrying a diagnostic.
 
@@ -1807,7 +1822,16 @@ class TastyTradeAccount(AccountInterface):
                 # reports whether the ACCOUNT is a margin account.
                 marginable=is_margin,
                 fractionable=fractionable,
+                # SHARES, and TastyTrade publishes no per-symbol share minimum at
+                # all -- so this stays None ("the broker did not say"). The $5
+                # floor below is MONEY and belongs in its own field: parked here it
+                # would read as "5 shares" and suppress every SCHD order under $170.
                 min_order_size=None,
+                # DOLLARS. Only a FRACTIONAL order can breach it, which is why an
+                # unsplittable symbol reports None rather than a floor it can never
+                # hit -- see MIN_FRACTIONAL_NOTIONAL_USD for the broker's own words.
+                min_fractional_notional=(MIN_FRACTIONAL_NOTIONAL_USD
+                                         if fractionable else None),
                 # MarginInfo.min_trade_increment = the smallest QUANTITY step the
                 # broker accepts for this symbol, None when it did not publish one.
                 # A whole-share-only symbol steps by 1.0 BY DEFINITION -- that is a

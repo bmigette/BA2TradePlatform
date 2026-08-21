@@ -100,6 +100,33 @@ def test_margin_info_defaults_to_the_conservative_source():
     assert info.min_trade_increment is None
 
 
+def test_margin_info_defaults_the_fractional_money_floor_to_unknown():
+    """``None`` means "the broker published no floor", never 0.0 -- the same
+    no-fabricated-values rule ``min_trade_increment`` follows."""
+    assert MarginInfo(symbol="AAPL", bp_factor=1.0).min_fractional_notional is None
+
+
+def test_margin_info_separates_a_share_minimum_from_a_money_minimum():
+    """UNITS, and they are NOT interchangeable.
+
+    ``min_order_size`` is a SHARE COUNT: it mirrors Alpaca's
+    ``Asset.min_order_size`` and the engine compares it against a rounded share
+    quantity (``portfolio_allocation.round_quantity`` -> ``qty < min_order_size``).
+    ``min_fractional_notional`` is DOLLARS.
+
+    TastyTrade publishes only the money one -- verbatim, from a live dry-run:
+    ``below_notional_value_minimum: Fractional equities orders cannot have a
+    notional value less than $5.`` Parking that 5.0 in ``min_order_size`` would be
+    read by the engine as "5 SHARES": on a $34 ETF that suppresses every order
+    below $170 instead of every order below $5, i.e. a 34x over-suppression that
+    silently stops the account trading and looks like nothing at all.
+    """
+    info = MarginInfo(symbol="SCHD", bp_factor=1.0, fractionable=True,
+                      min_fractional_notional=5.0)
+    assert info.min_fractional_notional == 5.0
+    assert info.min_order_size is None      # different number, different UNIT
+
+
 def test_margin_info_records_where_the_factor_came_from():
     info = MarginInfo(symbol="AAPL", bp_factor=1.0, initial_margin_rate=0.5,
                       source=MARGIN_SOURCE_ASSET)

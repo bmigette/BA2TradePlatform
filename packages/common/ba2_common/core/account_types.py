@@ -123,7 +123,21 @@ class MarginInfo:
     ``dataclasses.replace()``.
 
     ``min_order_size`` / ``min_trade_increment`` mirror Alpaca ``Asset`` field
-    names exactly.
+    names exactly, and BOTH ARE SHARE QUANTITIES. ``min_order_size`` is the
+    smallest number of SHARES the broker will accept in one order; the engine
+    compares it directly against a rounded share count
+    (``portfolio_allocation.round_quantity``, ``_suppress_below_min_order``).
+    A MONEY floor must never be stored here -- 5.0 meaning "$5" would be read as
+    "5 shares", which on a $34 ETF suppresses every order below $170 instead of
+    every order below $5, and looks like nothing at all from the outside.
+
+    ``min_fractional_notional`` is the money floor, in DOLLARS, and applies only
+    to an order whose quantity is FRACTIONAL. TastyTrade publishes one (see
+    ``TastyTradeAccount.MIN_FRACTIONAL_NOTIONAL_USD``); Alpaca does not, and
+    leaves it ``None``. ``None`` means "the broker published no floor", never 0.0.
+    It is deliberately NOT applied to whole-share orders: the broker's rule is
+    worded "Fractional equities orders ...", so enforcing it on every order would
+    refuse a legal 1-share buy of a stock trading under $5.
 
     ``min_trade_increment`` has ONE meaning across every adapter: the smallest
     QUANTITY step the broker will accept for this symbol. It is a step in
@@ -149,8 +163,9 @@ class MarginInfo:
     bp_factor: float
     marginable: bool = True
     fractionable: bool = False
-    min_order_size: Optional[float] = None
-    min_trade_increment: Optional[float] = None
+    min_order_size: Optional[float] = None          # SHARES
+    min_trade_increment: Optional[float] = None     # SHARES
+    min_fractional_notional: Optional[float] = None  # DOLLARS, fractional orders only
     initial_margin_rate: Optional[float] = None
     maintenance_margin_rate: Optional[float] = None
     source: str = MARGIN_SOURCE_DEFAULT

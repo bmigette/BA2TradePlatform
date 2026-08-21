@@ -2889,6 +2889,90 @@ def test_symbol_margin_info_normalises_the_requested_symbols():
 
 
 # ---------------------------------------------------------------------------
+# get_symbol_margin_info: the $5 fractional notional floor
+#
+# Verified against the user's REAL production account on 2026-08-21 with
+# POST /accounts/{n}/orders/dry-run. A 0.05 AND a 0.05715 share order of SCHD at
+# ~$34 (so ~$1.70 and ~$1.94 of notional) both came back HTTP 422:
+#     below_notional_value_minimum: Fractional equities orders cannot have a
+#     notional value less than $5.
+# Nothing in the adapter knew this, so every such order was planned, submitted and
+# rejected at the broker.
+# ---------------------------------------------------------------------------
+
+def test_symbol_margin_info_publishes_the_fractional_notional_floor():
+    """The engine is pure and never calls a broker, so a broker rule it must honour
+    can only reach it as DATA on MarginInfo -- exactly how `fractionable` and
+    `min_trade_increment` already travel."""
+    from ba2_trade_platform.modules.accounts.TastyTradeAccount import (
+        MIN_FRACTIONAL_NOTIONAL_USD)
+
+    acct = _bare_account()
+    equity_patch, precision_patch = _wire_margin_sources(
+        acct, equities=[_FakeEquity("SCHD", is_fractional_quantity_eligible=True)],
+        report=_margin_report(), precisions=[_precision(value=5)], positions=[])
+
+    with equity_patch, precision_patch:
+        info = acct.get_symbol_margin_info(["SCHD"])
+
+    assert info["SCHD"].min_fractional_notional == 5.0
+    # And it must TRACK the named constant, not a coincidentally equal literal.
+    assert info["SCHD"].min_fractional_notional == MIN_FRACTIONAL_NOTIONAL_USD
+
+
+def test_symbol_margin_info_never_reports_the_dollar_floor_as_a_share_minimum():
+    """UNITS. `min_order_size` is a SHARE COUNT -- the engine compares it against a
+    rounded share quantity. Putting the $5 there would read as "5 SHARES", which on
+    a $34 ETF suppresses every order under $170 instead of every order under $5.
+
+    TastyTrade publishes no per-symbol share minimum at all, so `min_order_size`
+    stays None ("the broker did not say"), and the money floor lives in its own
+    correctly-named field.
+    """
+    acct = _bare_account()
+    equity_patch, precision_patch = _wire_margin_sources(
+        acct, equities=[_FakeEquity("SCHD", is_fractional_quantity_eligible=True)],
+        report=_margin_report(), precisions=[_precision(value=5)], positions=[])
+
+    with equity_patch, precision_patch:
+        info = acct.get_symbol_margin_info(["SCHD"])
+
+    assert info["SCHD"].min_order_size is None
+    assert info["SCHD"].min_fractional_notional == 5.0
+
+
+def test_symbol_margin_info_leaves_the_notional_floor_off_a_whole_share_symbol():
+    """The broker's rule is spelled "Fractional equities orders ...". A symbol that
+    cannot be split never places one, so claiming a $5 floor for it would refuse a
+    perfectly legal 1-share order in a stock trading under $5."""
+    acct = _bare_account()
+    equity_patch, precision_patch = _wire_margin_sources(
+        acct, equities=[_FakeEquity("BRKA", is_fractional_quantity_eligible=False)],
+        report=_margin_report(), precisions=[_precision(value=5)], positions=[])
+
+    with equity_patch, precision_patch:
+        info = acct.get_symbol_margin_info(["BRKA"])
+
+    assert info["BRKA"].fractionable is False
+    assert info["BRKA"].min_fractional_notional is None
+
+
+def test_the_fractional_notional_floor_is_one_named_constant():
+    """A money threshold spelled as a bare literal at its use site is a threshold
+    nobody can find when the broker moves it."""
+    import inspect
+    import sys
+
+    from ba2_trade_platform.modules.accounts.TastyTradeAccount import (
+        MIN_FRACTIONAL_NOTIONAL_USD)
+
+    assert MIN_FRACTIONAL_NOTIONAL_USD == 5.0
+    source = inspect.getsource(sys.modules[TastyTradeAccount.__module__])
+    # The broker's verbatim rejection must sit next to the number.
+    assert "notional value less than $5" in source
+
+
+# ---------------------------------------------------------------------------
 # Bulk quotes
 # ---------------------------------------------------------------------------
 
