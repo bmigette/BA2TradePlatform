@@ -1046,14 +1046,22 @@ class AccountDefinitionsTab:
                 for setting in settings:
                     delete_instance(setting, session)
                 logger.info(f"Deleted {len(settings)} settings for account: {account.name}")
-            
+
+            # Then the portfolio-allocation rows. The live DB runs with
+            # PRAGMA foreign_keys = 0, so the ondelete="CASCADE" declared on those
+            # five tables NEVER fires -- an id reused by a future account would
+            # otherwise inherit this account's labels, weights, ledger and runs.
+            from ...core.portfolio_allocation_store import delete_account_allocation_data
+            counts = delete_account_allocation_data(account.id)
+            logger.info(f"Deleted allocation data for account {account.name}: {counts}")
+
             # Then delete the account
             delete_instance(account)
             logger.info(f"Deleted account: {account.name}")
             self._update_table_rows()
         except Exception as e:
             logger.error(f"Error deleting account: {str(e)}", exc_info=True)
-            ui.notify("Error deleting account", type="error")
+            ui.notify("Error deleting account", type="negative")
 
     def show_dialog(self, account: Optional[AccountDefinition] = None) -> None:
         logger.debug(f'Showing account dialog for account: {account.name if account else "new account"}')
