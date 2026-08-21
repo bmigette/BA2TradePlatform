@@ -27,3 +27,16 @@ def test_in_tree_import_path_exposes_the_value_objects():
     assert OrderImpact(symbol="A", change_in_buying_power=-1.0).bp_cost == 1.0
     assert CashTransfer(external_id="a", event_date=date(2026, 8, 1),
                         event_type=CASH_TRANSFER_DEPOSIT, amount=5.0).is_income is True
+
+
+def test_the_wholesale_alias_exports_market_hours_without_a_shim_edit():
+    """The shim copies the package namespace wholesale and swaps itself out of
+    sys.modules, so a NEW dataclass needs no shim change. This pins that."""
+    from ba2_trade_platform.core.account_types import (
+        MARKET_HOURS_SOURCE_FALLBACK,
+        MARKET_HOURS_SOURCE_UNAVAILABLE,
+        MarketHours,
+    )
+    assert MARKET_HOURS_SOURCE_FALLBACK == "fallback"
+    assert MARKET_HOURS_SOURCE_UNAVAILABLE == "unavailable"
+    assert MarketHours(is_open=False).is_open is False

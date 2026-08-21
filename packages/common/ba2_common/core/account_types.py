@@ -15,7 +15,7 @@ stdlib imports only -- this module must stay importable from both
 ``core/interfaces/*`` and ``core/portfolio_allocation.py`` with no cycle.
 """
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from typing import Any, Dict, List, Optional
 
 
@@ -33,6 +33,13 @@ MARGIN_SOURCE_PRECHECK = "precheck"    # broker order dry-run (preview_order_imp
 MARGIN_SOURCE_ASSET = "asset"          # per-asset metadata (Alpaca Asset + multiplier)
 MARGIN_SOURCE_POSITION = "position"    # derived from a held position's requirement
 MARGIN_SOURCE_DEFAULT = "default"      # conservative fallback = account multiplier
+
+# Provenance of a MarketHours answer. PLAIN str (same reasoning as the
+# CASH_TRANSFER_* constants); always use the constant, never a bare literal.
+# No module outside this one may re-declare these strings.
+MARKET_HOURS_SOURCE_BROKER = "broker"            # the broker's own clock/session endpoint
+MARKET_HOURS_SOURCE_FALLBACK = "fallback"        # our offline NYSE regular-session calendar
+MARKET_HOURS_SOURCE_UNAVAILABLE = "unavailable"  # the lookup FAILED -- caller must fail closed
 
 
 @dataclass
@@ -139,6 +146,27 @@ class MarginInfo:
     worded "Fractional equities orders ...", so enforcing it on every order would
     refuse a legal 1-share buy of a stock trading under $5.
 
+    ``fractionable`` is TRI-STATE, and it is the ONE canonical per-symbol
+    fractional-eligibility flag that crosses adapter/engine boundaries:
+      * ``True``  -- the broker SAYS the symbol can be traded in fractions
+        (Alpaca ``Asset.fractionable is True``; TastyTrade
+        ``Equity.is_fractional_quantity_eligible is True`` AND a quantity step
+        is known).
+      * ``False`` -- the broker SAYS it cannot (Alpaca ``Asset.fractionable is
+        False``; TastyTrade ``is_fractional_quantity_eligible is False``).
+      * ``None``  -- the broker DID NOT SAY. This is the default, and it covers
+        TastyTrade's ``is_fractional_quantity_eligible is None``, an eligible
+        symbol with no published step, and any lookup that failed. A symbol
+        OMITTED from ``get_symbol_margin_info()``'s dict is implicitly in this
+        state too.
+    Never write ``bool(x)`` or ``getattr(obj, 'fractionable', False)`` at an
+    adapter boundary: that is the failure-becomes-``False`` antipattern, and it
+    reports a broker fact nobody published. Code that must tell the three apart
+    tests ``is True`` / ``is False`` / ``is None``, never truthiness. ``None`` is
+    falsy, so ``_round_shares`` (portfolio_allocation.py:351-372) keeps taking the
+    conservative whole-share branch unchanged -- the widening is
+    behaviour-compatible.
+
     ``min_trade_increment`` has ONE meaning across every adapter: the smallest
     QUANTITY step the broker will accept for this symbol. It is a step in
     SHARES, never in dollars, and never a hint derived from ``fractionable``.
@@ -162,7 +190,7 @@ class MarginInfo:
     symbol: str
     bp_factor: float
     marginable: bool = True
-    fractionable: bool = False
+    fractionable: Optional[bool] = None    # TRI-STATE: True / False / None = "broker did not say"
     min_order_size: Optional[float] = None          # SHARES
     min_trade_increment: Optional[float] = None     # SHARES
     min_fractional_notional: Optional[float] = None  # DOLLARS, fractional orders only
@@ -193,3 +221,117 @@ class OrderImpact:
     def bp_cost(self) -> float:
         """Positive buying power CONSUMED by this order (0.0 when it frees BP)."""
         return -self.change_in_buying_power if self.change_in_buying_power < 0 else 0.0
+
+
+@dataclass(frozen=True)
+class MarketHours:
+    """Whether the market is trading right now, and when that next changes.
+
+    Defined ONCE, here. Every broker adapter maps onto this shape; no adapter
+    declares its own market-hours type, its own source strings or its own session
+    times.
+
+    The field set maps 1:1 onto Alpaca's ``Clock``
+    (alpaca/trading/models.py:348 -- ``timestamp``, ``is_open``, ``next_open``,
+    ``next_close``), because that adapter has the least freedom. ``Clock``
+    publishes no "when did the CURRENT session start", so ``open_at`` stays
+    ``None`` there while a session is live; TastyTrade's ``MarketSession``
+    (tastytrade/market_sessions.py) publishes ``open_at``/``close_at`` and fills
+    everything.
+
+    ``next_open`` and ``next_close`` are both STRICTLY FUTURE instants, so while
+    the market is open ``next_open`` is tomorrow's open and ``next_close`` is
+    today's. When the market is SHUT, ``open_at``/``close_at`` describe the
+    UPCOMING session and therefore equal ``next_open``/``next_close`` -- so a
+    caller that just wants "the session in question" can read ``open_at`` in both
+    states without branching. A field an adapter cannot supply stays ``None``;
+    ``None`` never means "now" and never means "unknown, so guess".
+
+    ``source`` is one of the three ``MARKET_HOURS_SOURCE_*`` constants.
+    ``unavailable`` means the lookup FAILED -- the broker could not answer AND the
+    offline calendar could not either. In that state ``is_open`` is ``False`` so
+    the submit gate fails closed, but ``is_known`` is ``False`` so the UI says
+    "unknown" rather than lying that the market is closed. This is the
+    ``get_positions() -> None vs []`` rule applied to a clock: failure is a third
+    state, not ``False``.
+
+    ``status`` is the BROKER'S OWN raw word -- "Open", "Extended", "Pre-market" --
+    unnormalised and DISPLAY-ONLY. Never branch on it. It is what lets the banner
+    explain an extended-hours block; there is deliberately no ``close_at_ext``
+    field and ``is_open`` stays regular-session-only.
+
+    ``detail`` is a human sentence: the fallback's cause, or the broker's error
+    text. Never parsed.
+
+    Every datetime is timezone-aware and ``__post_init__`` REFUSES a naive one, so
+    a naive broker datetime cannot escape into the UI. Read as UTC instead of
+    Eastern it moves the boundary by four or five hours, which is the difference
+    between "submit" and "the broker rejects the batch". Adapters normalise at
+    their own boundary (``AlpacaAccount._to_market_utc``, TastyTrade's
+    ``now_in_new_york``-derived values); this is the backstop.
+
+    ``is_open`` has no default -- it is required -- and every other field defaults
+    to the SHUT / unknown direction on purpose. An adapter that only half-fills
+    this must not be able to produce an accidental "open".
+
+    FROZEN: ``ReadOnlyAccountInterface.get_market_hours()`` caches one instance
+    and hands the same object to every caller, so an in-place edit would silently
+    poison every later reader (the ``MarginInfo`` rule). Derive a changed copy
+    with ``dataclasses.replace()`` -- which is exactly what an adapter's fallback
+    path does.
+
+    REJECTED spellings, not to be introduced anywhere: ``opens_at``, ``closes_at``,
+    ``open``, ``close``, ``open_now``, ``reason``, ``checked_at``.
+    """
+    is_open: bool
+    open_at: Optional[datetime] = None
+    close_at: Optional[datetime] = None
+    next_open: Optional[datetime] = None
+    next_close: Optional[datetime] = None
+    source: str = MARKET_HOURS_SOURCE_FALLBACK
+    status: Optional[str] = None
+    detail: Optional[str] = None
+    as_of: Optional[datetime] = None
+
+    def __post_init__(self) -> None:
+        """Refuse any naive datetime. The invariant every consumer assumes.
+
+        Raises:
+            ValueError: naming the offending field. No guess is made about which
+                timezone was meant: assuming UTC shifts the 09:30/16:00 ET
+                boundaries by four or five hours, and assuming Eastern hides a
+                genuine adapter bug.
+        """
+        for name in ("open_at", "close_at", "next_open", "next_close", "as_of"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+                raise ValueError(
+                    f"MarketHours.{name} must be timezone-aware; got the naive "
+                    f"{value!r}. Normalise at the adapter boundary "
+                    f"(AlpacaAccount._to_market_utc / TastyTrade's "
+                    f"now_in_new_york-derived instants) -- a naive value here would "
+                    f"silently shift the 09:30/16:00 ET boundaries")
+
+    @property
+    def next_transition(self) -> Optional[datetime]:
+        """The next instant at which ``is_open`` flips, or ``None`` if unknown.
+
+        This is the correct cache-expiry key for this object. A plain elapsed-time
+        TTL cannot express "valid until 16:00" and will happily serve ``is_open =
+        True`` one second after the bell.
+        """
+        candidates = [t for t in (self.next_open, self.next_close) if t is not None]
+        return min(candidates) if candidates else None
+
+    @property
+    def is_known(self) -> bool:
+        """False only when the lookup FAILED (``source == "unavailable"``).
+
+        ``is_open is False`` alone cannot be distinguished from "we have no idea",
+        and the UI needs to say which -- "Market closed, opens Monday 09:30 ET" is
+        a very different message from "Could not determine market status". The
+        submit gate treats both as not-open; only the copy differs.
+        """
+        return self.source != MARKET_HOURS_SOURCE_UNAVAILABLE
