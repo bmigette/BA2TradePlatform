@@ -20487,3 +20487,12678 @@ upgrade with a duplicate-column error. See Task 5's runbook.
    live database, so live verification is the user's.
 5. **Out of scope for TastyTrade:** `modify_order`, TP/SL adjustment, complex orders and the
    whole of `OptionsAccountInterface`.
+
+---
+
+# Portfolio Allocation - Addendum: market hours, fractional pre-check, filled-value ledger
+
+> **For agentic workers:** REQUIRED SUB-SKILL: superpowers:subagent-driven-development.
+> Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Gate allocation submission on market hours; pre-check per-symbol fractionability and
+fall back to whole shares; consume the income ledger on FILLED value rather than submitted value.
+
+**Why this exists:** TastyTrade rejects opening market orders while the market is closed (Alpaca
+merely queues them). ~25% of the user's real target symbols are NOT fractionable, so mixed
+eligibility is the normal case rather than an edge case. And an unfilled or rejected order
+currently marks dividend/deposit income as permanently spent.
+
+**Locked decisions.** Notional / dollar-value orders were considered and DROPPED - fractional
+means a fractional share QUANTITY. Floor-to-zero targets are BUMPED to 1 share within a bounded
+overshoot guard, and skipped above it. Label residuals are REDISTRIBUTED bidirectionally.
+Working orders contribute ZERO at finalisation and the run stays recoverable.
+
+Tasks are numbered from 80, continuing the main plan.
+
+---
+
+## Block A - Shared market-hours seam, MarketHours, NYSE fallback
+
+These four tasks belong at the **end of Section D — Account seams and Alpaca** (plan `:7540-10060`), after Task 35, and **before** Section F's gating work. They are pure-package work: nothing here touches `TastyTradeAccount.py` or `AlpacaAccount.py`, so they can land while Section E is in flight.
+
+They are **Block A of the market-gating feature and a hard serial prefix**: N1 → N2 → N3 → N4, in
+that order, and nothing in the Alpaca / TastyTrade / engine-ui / ledger chunks compiles before N2.
+
+**What this chunk OWNS outright**, so that no other chunk re-authors it:
+
+- the `pandas-market-calendars` pin — `requirements.txt`, `packages/common/pyproject.toml` **and**
+  the `_requirement_names()` helper plus its assertion in `tests/test_broker_sdk_pins.py` (the
+  TastyTrade chunk deletes its version of all three);
+- the offline holiday- and half-day-aware NYSE fallback (`market_calendar.py`) — the **only** NYSE
+  session-time source in the codebase; no broker adapter hardcodes 09:30 / 16:00 / 13:00;
+- the market-hours cache and its boundary-expiry invariant, on `ReadOnlyAccountInterface`. Neither
+  adapter defines a market-hours cache, TTL, `is_market_open()` or session-boundary helper;
+- `MarketHours` — defined **exactly once**, in `packages/common/ba2_common/core/account_types.py`;
+- the widening of `MarginInfo.fractionable` to the tri-state `Optional[bool]`.
+
+**The override contract, stated once and binding on every adapter.**
+`get_market_hours()` and `is_market_open()` are CONCRETE and effectively FINAL — an adapter must
+never override either. The single override point is `_get_market_hours_impl(self, now)`, which
+receives an aware `now` and MUST use it rather than its own clock. An adapter's failure path must
+call `super()._get_market_hours_impl(now)`. Calling `super().get_market_hours()` from inside
+`_get_market_hours_impl` is **infinite recursion**, because `get_market_hours()` is exactly what
+calls `_get_market_hours_impl()`.
+
+Run tests **per file**. The venv is `venv/`, not `.venv/`.
+
+---
+
+### Task 80: Pin `pandas-market-calendars` — the fallback's offline path must not be a lucky transitive
+
+The holiday-aware NYSE fallback in Task 82 needs `pandas_market_calendars`. It is installed today
+**only** because `tastytrade` drags it in —
+`venv/lib/python3.12/site-packages/tastytrade-12.0.2.dist-info/METADATA:60` reads
+`Requires-Dist: pandas-market-calendars>=5.1.1` — and grepping `requirements.txt` for both
+`pandas-market-calendars` and `exchange-calendars` returns nothing. The day the `tastytrade==12.0.2`
+pin at `requirements.txt:4` moves, or TastyTrade support is dropped, the market-hours gate silently
+loses its offline path. Because Task 83 fails CLOSED, the visible symptom would be "the wizard
+refuses to submit, forever" — better than "the wizard thinks the market is open", but still a
+production outage caused by an undeclared dependency.
+
+`ba2_common` is a separately installable package (`packages/common/pyproject.toml:10-23` has its own
+`dependencies` list), so the pin has to go in **both** places or a standalone `ba2_common` install
+is broken.
+
+**This chunk owns the pin and its test.** The test lives in `tests/test_broker_sdk_pins.py`, next to
+the `tastytrade` and `alpaca-py` pin assertions, rather than in a new file of its own: the pin's
+test belongs with the pin, and one parser of `requirements.txt` is enough. `_pinned_versions()`
+(`tests/test_broker_sdk_pins.py:15-24`) only recognises exact `name==version` lines and this pin is
+a FLOOR (`>=5.1.1`), so it needs a second parser — `_requirement_names()` — which is added here.
+
+Note that `zoneinfo` needs the `tzdata` wheel on Windows and `tzdata` is *also* absent from
+`requirements.txt` — but that one is genuinely guaranteed:
+`venv/lib/python3.12/site-packages/pandas-2.3.3.dist-info/METADATA:1281` is
+`Requires-Dist: tzdata>=2022.7`, and `requirements.txt:22` pins `pandas<3`. No action needed there;
+this task only documents it.
+
+**Files:**
+- Modify: `requirements.txt` (after line 4)
+- Modify: `packages/common/pyproject.toml` (the `dependencies` list, lines 10-23)
+- Test: `tests/test_broker_sdk_pins.py`
+
+- [ ] **Step 1: Write the failing test**
+
+In `tests/test_broker_sdk_pins.py`, append this paragraph to the module docstring (after the
+sentence ending `...TradeAccount/Asset field shapes).`):
+
+```
+pandas-market-calendars is guarded here too. It is not an SDK we write against, but it is the
+offline NYSE holiday/half-day calendar behind ba2_common.core.market_calendar, which is the
+fallback under ReadOnlyAccountInterface.get_market_hours(). It reaches this venv only through
+tastytrade's own `Requires-Dist: pandas-market-calendars>=5.1.1`, so moving the tastytrade pin
+would silently delete the market-hours gate's offline path.
+```
+
+Add the `PYPROJECT` path constant immediately after the existing `REQUIREMENTS` constant (line 12):
+
+```python
+PYPROJECT = Path(__file__).resolve().parents[1] / "packages" / "common" / "pyproject.toml"
+```
+
+and append to the end of the file:
+
+```python
+def _requirement_names():
+    """Lower-cased distribution names declared in requirements.txt, comments stripped.
+
+    Unlike ``_pinned_versions()`` this keeps FLOOR pins (``name>=x``) and bare names,
+    because pandas-market-calendars is pinned as a floor rather than to an exact
+    version: the NYSE holiday rules only ever get more complete, and 5.1.1 is what
+    tastytrade already requires.
+    """
+    names = []
+    for raw_line in REQUIREMENTS.read_text(encoding="utf-8").splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line or line.startswith("-"):
+            continue
+        for separator in ("==", ">=", "<=", "~=", ">", "<"):
+            if separator in line:
+                line = line.partition(separator)[0]
+                break
+        names.append(line.strip().lower())
+    return names
+
+
+def test_pandas_market_calendars_is_declared_not_merely_transitive():
+    """The offline NYSE calendar behind the market-hours fallback must be OURS to pin.
+
+    Today it reaches this venv only through tastytrade's own
+    `Requires-Dist: pandas-market-calendars>=5.1.1`. Relying on that means the day the
+    tastytrade pin moves, the gate loses its offline path and every account reports
+    source == "unavailable" -- so the allocation wizard refuses to submit, forever.
+    """
+    assert "pandas-market-calendars" in _requirement_names()
+
+
+def test_ba2_common_declares_pandas_market_calendars():
+    """ba2_common is separately installable (packages/common/pyproject.toml has its own
+    dependencies list), and ba2_common.core.market_calendar imports the package. A
+    standalone `pip install ba2trade-common` must therefore pull it in."""
+    text = PYPROJECT.read_text(encoding="utf-8")
+    assert "pandas-market-calendars" in text, (
+        "packages/common/pyproject.toml must list pandas-market-calendars; "
+        "ba2_common.core.market_calendar imports it")
+
+
+def test_the_nyse_calendar_builds_offline():
+    """No network: pandas_market_calendars ships the NYSE holiday rules as DATA."""
+    from pandas_market_calendars import get_calendar
+
+    assert get_calendar("NYSE") is not None
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `venv/bin/python -m pytest tests/test_broker_sdk_pins.py -v`
+
+Expected: FAIL — 2 failed, 3 passed.
+`test_pandas_market_calendars_is_declared_not_merely_transitive` fails with
+`AssertionError: assert 'pandas-market-calendars' in ['nicegui', 'alpaca-py', 'tastytrade', 'sqlmodel', 'python-dotenv', ...]`
+and `test_ba2_common_declares_pandas_market_calendars` with
+`AssertionError: packages/common/pyproject.toml must list pandas-market-calendars; ba2_common.core.market_calendar imports it`.
+`test_the_nyse_calendar_builds_offline` and the two existing SDK pin tests pass already (the
+transitive install is present).
+
+- [ ] **Step 3: Write minimal implementation**
+
+In `requirements.txt`, insert this line immediately **after** line 4 (the `tastytrade==12.0.2` pin),
+so the two sit together:
+
+```
+pandas-market-calendars>=5.1.1  # pin: NOT just a tastytrade transitive. ba2_common.core.market_calendar uses it for the offline holiday/half-day NYSE fallback behind get_market_hours(); losing it makes the allocation wizard's submit gate report "unavailable" and block forever.
+```
+
+In `packages/common/pyproject.toml`, add one entry to the `dependencies` list — insert it
+immediately after the `"pandas>=2.2.0,<3.0.0",` line (line 14):
+
+```
+    "pandas-market-calendars>=5.1.1",
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `venv/bin/python -m pytest tests/test_broker_sdk_pins.py -v`
+
+Expected: 5 passed.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add requirements.txt packages/common/pyproject.toml tests/test_broker_sdk_pins.py
+git commit -m "build: pin pandas-market-calendars directly for the NYSE market-hours fallback"
+```
+
+---
+
+### Task 81: The `MarketHours` value object, and `MarginInfo.fractionable` widened to tri-state
+
+Two changes to one file, in one commit, because four other chunks import from it and neither change
+compiles usefully without the other.
+
+**(a) `MarketHours`** — the fifth broker-seam value object, alongside the four Task 27 created
+(`packages/common/ba2_common/core/account_types.py`). There is currently **no market-hours
+awareness anywhere** in the account/order path — nothing to extend, so this is the shape every
+broker maps onto, and it is defined **exactly once, here**.
+
+**Field semantics are chosen to map 1:1 onto Alpaca's `Clock`**
+(`venv/lib/python3.12/site-packages/alpaca/trading/models.py:348`, which carries `timestamp`,
+`is_open`, `next_open`, `next_close`), because that is the adapter with the least room to
+manoeuvre. `Clock` publishes no "when did the current session start", so `open_at` is `Optional`
+and the Alpaca override leaves it `None` while the session is live. TastyTrade's
+`MarketSession` (`venv/lib/python3.12/site-packages/tastytrade/market_sessions.py`) carries
+`open_at` / `close_at` / `next_session`, so it fills everything, and it needs `status` (its raw
+word — `"Open"` / `"Extended"` / `"Pre-market"`) and `detail`.
+
+`status` is **display-only and never branched on**: it is what lets the banner say "extended hours"
+without a `close_at_ext` field. `detail` is a human sentence — a fallback cause or a broker error
+string — and is never parsed.
+
+`source` exists so the UI can say *which* answer it got. `"broker"` is authoritative; `"fallback"`
+is our NYSE calendar (regular session only — it does not know about a broker's extended-hours
+window); `"unavailable"` means the lookup itself FAILED. That third state is the
+`get_positions() -> None vs []` lesson applied to a clock: failure is not `False`. In the
+`unavailable` state `is_open` is `False` so the submit gate fails closed, but `is_known` is `False`
+so the UI says "unknown", not "closed". `next_transition` is the cache-expiry hook for Task 83: a
+wall-clock TTL alone can hold "open" across the 16:00 boundary, which is the exact failure the
+margin-info cache pattern (`AlpacaAccount.py:1755-1758`) would inherit if copied blindly.
+
+`__post_init__` refuses **any** naive datetime. That is the invariant every other chunk assumes: a
+naive broker datetime read as UTC instead of Eastern moves the boundary by four or five hours, and
+the seam must be physically incapable of emitting one. Adapters normalise at their own boundary
+(`AlpacaAccount._to_market_utc`, TastyTrade's `now_in_new_york`-derived values); this is the
+backstop, not the primary defence.
+
+FROZEN, like `MarginInfo` (`account_types.py:110`), because Task 83 caches one instance and hands
+the same object to every caller. No `raw: Dict` field: a mutable dict inside a frozen object that
+is cached and shared is a poisoning hazard, and nothing needs the broker's raw payload here.
+Because it is a `dataclass`, adapters derive variants with `dataclasses.replace()`.
+
+**Rejected names, not to be used anywhere:** `opens_at`, `closes_at`, `open`, `close`, `open_now`,
+`reason`, `checked_at`.
+
+**(b) `MarginInfo.fractionable: bool = False` → `Optional[bool] = None`.** This is a WIDENING of a
+landed field, and it makes that field the ONE canonical per-symbol fractional-eligibility flag that
+crosses chunk boundaries — replacing three privately invented "unknown" channels (Alpaca's
+omission-means-unknown dict, TastyTrade's `is not True`, and the engine's `m is None`). It is
+behaviour-compatible: `None` is falsy, so `_round_shares`
+(`packages/common/ba2_common/core/portfolio_allocation.py:351-372`) keeps taking the conservative
+whole-share branch and every existing `if ... and m.fractionable` keeps working. The
+`min_trade_increment` paragraph in the docstring is kept **verbatim** — `None` there still means
+"the broker published no step", and `fractionable=True, min_trade_increment=None` remains a legal,
+meaningful pair. No chunk may declare `min_trade_increment` "never None".
+
+**The in-tree alias shim needs NO change.** `ba2_trade_platform/core/account_types.py` is a
+*wholesale* alias — it does `globals().update({k: v for k, v in vars(_pkg).items() ...})` and then
+`_modules[_me] = _target`, i.e. it swaps the package module object into `sys.modules` under the
+in-tree name. There is no per-symbol re-export list to extend, so a new dataclass is exported
+automatically. Only the shim's *test* gets a new assertion, to pin that fact.
+
+**Files:**
+- Modify: `packages/common/ba2_common/core/account_types.py` (import at line 18; constants after line 35; `MarginInfo` docstring and field at lines 111-149; new dataclass appended after line 179)
+- Test: `packages/common/tests/test_account_types.py`
+- Test: `tests/test_account_types_shim.py`
+
+- [ ] **Step 1: Write the failing test**
+
+In `packages/common/tests/test_account_types.py`, replace the single assertion at line 98
+(`assert info.fractionable is False`) with:
+
+```python
+    assert info.fractionable is None       # TRI-STATE: "the broker did not say"
+```
+
+and append to the end of the file:
+
+```python
+# ---------------------------------------------------------------------------
+# MarginInfo.fractionable is TRI-STATE
+# ---------------------------------------------------------------------------
+
+def test_margin_info_fractionable_carries_all_three_states():
+    """False means the broker SAID no. None means it said nothing. Collapsing the
+    two is how "the lookup failed" becomes "this symbol is not fractionable"."""
+    said_yes = MarginInfo(symbol="AAPL", bp_factor=1.0, fractionable=True)
+    said_no = MarginInfo(symbol="BRKA", bp_factor=1.0, fractionable=False)
+    said_nothing = MarginInfo(symbol="XYZ", bp_factor=1.0)
+
+    assert said_yes.fractionable is True
+    assert said_no.fractionable is False
+    assert said_nothing.fractionable is None
+
+
+def test_unknown_fractionability_is_falsy_so_the_whole_share_fallback_is_unchanged():
+    """The widening must not change any landed behaviour: _round_shares tests
+    `margin.fractionable` for truth, and None is falsy, so an undescribed symbol
+    still rounds to whole shares -- the conservative direction."""
+    assert not MarginInfo(symbol="XYZ", bp_factor=1.0).fractionable
+
+
+def test_fractionable_true_with_an_unknown_step_is_still_a_legal_pair():
+    """The landed min_trade_increment contract is unchanged: None means the broker
+    published no step, and the caller falls back to whole shares."""
+    info = MarginInfo(symbol="AAPL", bp_factor=1.0, fractionable=True,
+                      min_trade_increment=None)
+    assert info.fractionable is True
+    assert info.min_trade_increment is None
+
+
+# ---------------------------------------------------------------------------
+# MarketHours
+# ---------------------------------------------------------------------------
+
+def test_market_hours_defaults_to_closed_with_nothing_known():
+    """The zero value must be SHUT. A default of is_open=True would let a
+    half-built adapter authorise submission into a closed market."""
+    from ba2_common.core.account_types import (
+        MARKET_HOURS_SOURCE_FALLBACK, MarketHours)
+
+    hours = MarketHours(is_open=False)
+
+    assert hours.is_open is False
+    assert hours.open_at is None
+    assert hours.close_at is None
+    assert hours.next_open is None
+    assert hours.next_close is None
+    assert hours.status is None
+    assert hours.detail is None
+    assert hours.as_of is None
+    assert hours.source == MARKET_HOURS_SOURCE_FALLBACK
+
+
+def test_market_hours_is_frozen():
+    """Task 83 caches one instance and hands it to every caller; an in-place edit
+    would poison every later reader (same rule as MarginInfo)."""
+    import dataclasses
+    import pytest
+    from ba2_common.core.account_types import MarketHours
+
+    hours = MarketHours(is_open=True)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        hours.is_open = False
+
+
+def test_dataclasses_replace_is_how_an_adapter_derives_a_variant():
+    """The adapters' fallback path is
+    `dataclasses.replace(super()._get_market_hours_impl(now), detail=reason)`,
+    so replace() must work on this type and must not disturb `source`."""
+    import dataclasses
+    from ba2_common.core.account_types import MARKET_HOURS_SOURCE_FALLBACK, MarketHours
+
+    base = MarketHours(is_open=False, source=MARKET_HOURS_SOURCE_FALLBACK)
+    derived = dataclasses.replace(base, detail="broker clock endpoint 503")
+
+    assert derived.detail == "broker clock endpoint 503"
+    assert derived.source == MARKET_HOURS_SOURCE_FALLBACK
+    assert base.detail is None
+
+
+def test_status_carries_the_brokers_own_word_unnormalised():
+    """The banner says "extended hours" from THIS field. There is no close_at_ext
+    field and is_open stays regular-session-only."""
+    from ba2_common.core.account_types import MarketHours
+
+    hours = MarketHours(is_open=False, status="Extended",
+                        detail="Extended-hours session; regular session is closed")
+
+    assert hours.status == "Extended"
+    assert hours.is_open is False
+
+
+def test_next_transition_is_the_earlier_of_next_open_and_next_close():
+    """While the market is OPEN the next status change is today's close, even
+    though next_open (tomorrow morning) is also populated."""
+    from datetime import datetime, timezone
+    from ba2_common.core.account_types import MarketHours
+
+    hours = MarketHours(
+        is_open=True,
+        next_close=datetime(2026, 8, 19, 20, 0, tzinfo=timezone.utc),
+        next_open=datetime(2026, 8, 20, 13, 30, tzinfo=timezone.utc),
+    )
+
+    assert hours.next_transition == datetime(2026, 8, 19, 20, 0, tzinfo=timezone.utc)
+
+
+def test_next_transition_while_shut_is_the_next_open():
+    from datetime import datetime, timezone
+    from ba2_common.core.account_types import MarketHours
+
+    hours = MarketHours(
+        is_open=False,
+        next_open=datetime(2026, 8, 24, 13, 30, tzinfo=timezone.utc),
+        next_close=datetime(2026, 8, 24, 20, 0, tzinfo=timezone.utc),
+    )
+
+    assert hours.next_transition == datetime(2026, 8, 24, 13, 30, tzinfo=timezone.utc)
+
+
+def test_next_transition_is_none_when_no_boundary_is_known():
+    """An "unavailable" answer has no boundary, so nothing can be cached against one."""
+    from ba2_common.core.account_types import MarketHours
+
+    assert MarketHours(is_open=False).next_transition is None
+
+
+def test_is_known_is_false_only_for_the_unavailable_source():
+    from ba2_common.core.account_types import (
+        MARKET_HOURS_SOURCE_BROKER,
+        MARKET_HOURS_SOURCE_FALLBACK,
+        MARKET_HOURS_SOURCE_UNAVAILABLE,
+        MarketHours,
+    )
+
+    assert MarketHours(is_open=True, source=MARKET_HOURS_SOURCE_BROKER).is_known is True
+    assert MarketHours(is_open=False, source=MARKET_HOURS_SOURCE_FALLBACK).is_known is True
+    assert MarketHours(is_open=False, source=MARKET_HOURS_SOURCE_UNAVAILABLE).is_known is False
+
+
+def test_an_unavailable_answer_is_shut_but_not_known():
+    """The whole reason for the third constant: the submit gate fails closed while
+    the banner still says "unknown" rather than lying that the market is closed."""
+    from ba2_common.core.account_types import (
+        MARKET_HOURS_SOURCE_UNAVAILABLE, MarketHours)
+
+    hours = MarketHours(is_open=False, source=MARKET_HOURS_SOURCE_UNAVAILABLE,
+                        detail="broker clock endpoint 503 and no offline calendar")
+
+    assert hours.is_open is False
+    assert hours.is_known is False
+    assert "503" in hours.detail
+
+
+def test_the_three_source_spellings_are_exactly_these():
+    from ba2_common.core.account_types import (
+        MARKET_HOURS_SOURCE_BROKER,
+        MARKET_HOURS_SOURCE_FALLBACK,
+        MARKET_HOURS_SOURCE_UNAVAILABLE,
+    )
+
+    assert MARKET_HOURS_SOURCE_BROKER == "broker"
+    assert MARKET_HOURS_SOURCE_FALLBACK == "fallback"
+    assert MARKET_HOURS_SOURCE_UNAVAILABLE == "unavailable"
+
+
+# --- the naive-datetime invariant every other chunk relies on ----------------
+
+def test_a_naive_datetime_in_any_slot_is_refused_at_construction():
+    """Read as UTC instead of Eastern, a naive instant moves the 09:30/16:00
+    boundary by four or five hours -- the difference between "submit" and "the
+    broker rejects the batch". The seam must be UNABLE to emit one."""
+    from datetime import datetime
+    import pytest
+    from ba2_common.core.account_types import MarketHours
+
+    naive = datetime(2026, 8, 19, 12, 0)
+    for slot in ("open_at", "close_at", "next_open", "next_close", "as_of"):
+        with pytest.raises(ValueError, match="timezone-aware"):
+            MarketHours(is_open=True, **{slot: naive})
+
+
+def test_the_naive_error_names_the_offending_field():
+    from datetime import datetime
+    import pytest
+    from ba2_common.core.account_types import MarketHours
+
+    with pytest.raises(ValueError, match="next_open"):
+        MarketHours(is_open=False, next_open=datetime(2026, 8, 24, 9, 30))
+
+
+def test_aware_datetimes_in_every_slot_are_accepted():
+    from datetime import datetime, timezone
+    from ba2_common.core.account_types import MarketHours
+
+    when = datetime(2026, 8, 19, 13, 30, tzinfo=timezone.utc)
+    hours = MarketHours(is_open=True, open_at=when, close_at=when,
+                        next_open=when, next_close=when, as_of=when)
+
+    assert hours.as_of == when
+```
+
+Append to `tests/test_account_types_shim.py`:
+
+```python
+def test_the_wholesale_alias_exports_market_hours_without_a_shim_edit():
+    """The shim copies the package namespace wholesale and swaps itself out of
+    sys.modules, so a NEW dataclass needs no shim change. This pins that."""
+    from ba2_trade_platform.core.account_types import (
+        MARKET_HOURS_SOURCE_FALLBACK,
+        MARKET_HOURS_SOURCE_UNAVAILABLE,
+        MarketHours,
+    )
+    assert MARKET_HOURS_SOURCE_FALLBACK == "fallback"
+    assert MARKET_HOURS_SOURCE_UNAVAILABLE == "unavailable"
+    assert MarketHours(is_open=False).is_open is False
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `venv/bin/python -m pytest packages/common/tests/test_account_types.py tests/test_account_types_shim.py -v`
+
+Expected: FAIL. Every `MarketHours` test errors with
+`ImportError: cannot import name 'MarketHours' from 'ba2_common.core.account_types'`; the
+tri-state tests fail with `AssertionError: assert False is None` (the landed default is still
+`False`); and the edited line in `test_margin_info_defaults_to_the_conservative_source` fails the
+same way. `test_unknown_fractionability_is_falsy_...` and
+`test_fractionable_true_with_an_unknown_step_is_still_a_legal_pair` pass already — they are the
+behaviour-compatibility guards, and they must stay green through the change.
+
+- [ ] **Step 3: Write minimal implementation**
+
+In `packages/common/ba2_common/core/account_types.py`, change the import on line 18 from
+`from datetime import date` to:
+
+```python
+from datetime import date, datetime
+```
+
+Immediately **after** line 35 (`MARGIN_SOURCE_DEFAULT = "default"      # conservative fallback = account multiplier`),
+add:
+
+```python
+
+# Provenance of a MarketHours answer. PLAIN str (same reasoning as the
+# CASH_TRANSFER_* constants); always use the constant, never a bare literal.
+# No module outside this one may re-declare these strings.
+MARKET_HOURS_SOURCE_BROKER = "broker"            # the broker's own clock/session endpoint
+MARKET_HOURS_SOURCE_FALLBACK = "fallback"        # our offline NYSE regular-session calendar
+MARKET_HOURS_SOURCE_UNAVAILABLE = "unavailable"  # the lookup FAILED -- caller must fail closed
+```
+
+In `MarginInfo`, insert this paragraph into the docstring immediately **before** the
+``min_trade_increment`` paragraph that begins ```` ``min_trade_increment`` has ONE meaning ````
+(line 128) — leave that paragraph and everything after it untouched:
+
+```
+    ``fractionable`` is TRI-STATE, and it is the ONE canonical per-symbol
+    fractional-eligibility flag that crosses adapter/engine boundaries:
+      * ``True``  -- the broker SAYS the symbol can be traded in fractions
+        (Alpaca ``Asset.fractionable is True``; TastyTrade
+        ``Equity.is_fractional_quantity_eligible is True`` AND a quantity step
+        is known).
+      * ``False`` -- the broker SAYS it cannot (Alpaca ``Asset.fractionable is
+        False``; TastyTrade ``is_fractional_quantity_eligible is False``).
+      * ``None``  -- the broker DID NOT SAY. This is the default, and it covers
+        TastyTrade's ``is_fractional_quantity_eligible is None``, an eligible
+        symbol with no published step, and any lookup that failed. A symbol
+        OMITTED from ``get_symbol_margin_info()``'s dict is implicitly in this
+        state too.
+    Never write ``bool(x)`` or ``getattr(obj, 'fractionable', False)`` at an
+    adapter boundary: that is the failure-becomes-``False`` antipattern, and it
+    reports a broker fact nobody published. Code that must tell the three apart
+    tests ``is True`` / ``is False`` / ``is None``, never truthiness. ``None`` is
+    falsy, so ``_round_shares`` (portfolio_allocation.py:351-372) keeps taking the
+    conservative whole-share branch unchanged -- the widening is
+    behaviour-compatible.
+```
+
+and change the field at line 149 from `fractionable: bool = False` to:
+
+```python
+    fractionable: Optional[bool] = None    # TRI-STATE: True / False / None = "broker did not say"
+```
+
+Append to the **end** of the file (after `OrderImpact.bp_cost`, currently line 179):
+
+```python
+
+
+@dataclass(frozen=True)
+class MarketHours:
+    """Whether the market is trading right now, and when that next changes.
+
+    Defined ONCE, here. Every broker adapter maps onto this shape; no adapter
+    declares its own market-hours type, its own source strings or its own session
+    times.
+
+    The field set maps 1:1 onto Alpaca's ``Clock``
+    (alpaca/trading/models.py:348 -- ``timestamp``, ``is_open``, ``next_open``,
+    ``next_close``), because that adapter has the least freedom. ``Clock``
+    publishes no "when did the CURRENT session start", so ``open_at`` stays
+    ``None`` there while a session is live; TastyTrade's ``MarketSession``
+    (tastytrade/market_sessions.py) publishes ``open_at``/``close_at`` and fills
+    everything.
+
+    ``next_open`` and ``next_close`` are both STRICTLY FUTURE instants, so while
+    the market is open ``next_open`` is tomorrow's open and ``next_close`` is
+    today's. When the market is SHUT, ``open_at``/``close_at`` describe the
+    UPCOMING session and therefore equal ``next_open``/``next_close`` -- so a
+    caller that just wants "the session in question" can read ``open_at`` in both
+    states without branching. A field an adapter cannot supply stays ``None``;
+    ``None`` never means "now" and never means "unknown, so guess".
+
+    ``source`` is one of the three ``MARKET_HOURS_SOURCE_*`` constants.
+    ``unavailable`` means the lookup FAILED -- the broker could not answer AND the
+    offline calendar could not either. In that state ``is_open`` is ``False`` so
+    the submit gate fails closed, but ``is_known`` is ``False`` so the UI says
+    "unknown" rather than lying that the market is closed. This is the
+    ``get_positions() -> None vs []`` rule applied to a clock: failure is a third
+    state, not ``False``.
+
+    ``status`` is the BROKER'S OWN raw word -- "Open", "Extended", "Pre-market" --
+    unnormalised and DISPLAY-ONLY. Never branch on it. It is what lets the banner
+    explain an extended-hours block; there is deliberately no ``close_at_ext``
+    field and ``is_open`` stays regular-session-only.
+
+    ``detail`` is a human sentence: the fallback's cause, or the broker's error
+    text. Never parsed.
+
+    Every datetime is timezone-aware and ``__post_init__`` REFUSES a naive one, so
+    a naive broker datetime cannot escape into the UI. Read as UTC instead of
+    Eastern it moves the boundary by four or five hours, which is the difference
+    between "submit" and "the broker rejects the batch". Adapters normalise at
+    their own boundary (``AlpacaAccount._to_market_utc``, TastyTrade's
+    ``now_in_new_york``-derived values); this is the backstop.
+
+    ``is_open`` has no default -- it is required -- and every other field defaults
+    to the SHUT / unknown direction on purpose. An adapter that only half-fills
+    this must not be able to produce an accidental "open".
+
+    FROZEN: ``ReadOnlyAccountInterface.get_market_hours()`` caches one instance
+    and hands the same object to every caller, so an in-place edit would silently
+    poison every later reader (the ``MarginInfo`` rule). Derive a changed copy
+    with ``dataclasses.replace()`` -- which is exactly what an adapter's fallback
+    path does.
+
+    REJECTED spellings, not to be introduced anywhere: ``opens_at``, ``closes_at``,
+    ``open``, ``close``, ``open_now``, ``reason``, ``checked_at``.
+    """
+    is_open: bool
+    open_at: Optional[datetime] = None
+    close_at: Optional[datetime] = None
+    next_open: Optional[datetime] = None
+    next_close: Optional[datetime] = None
+    source: str = MARKET_HOURS_SOURCE_FALLBACK
+    status: Optional[str] = None
+    detail: Optional[str] = None
+    as_of: Optional[datetime] = None
+
+    def __post_init__(self) -> None:
+        """Refuse any naive datetime. The invariant every consumer assumes.
+
+        Raises:
+            ValueError: naming the offending field. No guess is made about which
+                timezone was meant: assuming UTC shifts the 09:30/16:00 ET
+                boundaries by four or five hours, and assuming Eastern hides a
+                genuine adapter bug.
+        """
+        for name in ("open_at", "close_at", "next_open", "next_close", "as_of"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+                raise ValueError(
+                    f"MarketHours.{name} must be timezone-aware; got the naive "
+                    f"{value!r}. Normalise at the adapter boundary "
+                    f"(AlpacaAccount._to_market_utc / TastyTrade's "
+                    f"now_in_new_york-derived instants) -- a naive value here would "
+                    f"silently shift the 09:30/16:00 ET boundaries")
+
+    @property
+    def next_transition(self) -> Optional[datetime]:
+        """The next instant at which ``is_open`` flips, or ``None`` if unknown.
+
+        This is the correct cache-expiry key for this object. A plain elapsed-time
+        TTL cannot express "valid until 16:00" and will happily serve ``is_open =
+        True`` one second after the bell.
+        """
+        candidates = [t for t in (self.next_open, self.next_close) if t is not None]
+        return min(candidates) if candidates else None
+
+    @property
+    def is_known(self) -> bool:
+        """False only when the lookup FAILED (``source == "unavailable"``).
+
+        ``is_open is False`` alone cannot be distinguished from "we have no idea",
+        and the UI needs to say which -- "Market closed, opens Monday 09:30 ET" is
+        a very different message from "Could not determine market status". The
+        submit gate treats both as not-open; only the copy differs.
+        """
+        return self.source != MARKET_HOURS_SOURCE_UNAVAILABLE
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `venv/bin/python -m pytest packages/common/tests/test_account_types.py tests/test_account_types_shim.py -v`
+
+Expected: all pass.
+
+Then prove the widening broke nothing that consumes `MarginInfo` (these are the landed readers of
+the flag):
+
+```bash
+venv/bin/python -m pytest packages/common/tests/test_portfolio_allocation.py -v
+venv/bin/python -m pytest tests/test_alpaca_margin_info.py -v
+venv/bin/python -m pytest tests/test_tastytrade_account.py -v
+```
+
+Expected: all pass. Nothing in them depends on the DEFAULT being `False` — every case that cares
+passes `fractionable=` explicitly, and the cases that do not rely on falsiness, which `None`
+preserves.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add packages/common/ba2_common/core/account_types.py packages/common/tests/test_account_types.py tests/test_account_types_shim.py
+git commit -m "feat(accounts): MarketHours value object and tri-state MarginInfo.fractionable"
+```
+
+---
+
+### Task 82: The offline, holiday- and half-day-aware NYSE fallback
+
+The default behind the seam, and **the only NYSE session-time source in the codebase** — no broker
+adapter hardcodes 09:30 / 16:00 / 13:00, and none walks its own holiday list. Modelled on
+`venv/lib/python3.12/site-packages/tastytrade/utils.py:44-57` `is_market_open_now()`, which is the
+right *algorithm* —
+
+```python
+    sched = NYSE.schedule(start_date=today, end_date=today)
+    if sched.empty:
+        # Closed full day (weekend or holiday)
+        return False
+    market_open: Timestamp = sched.iloc[0]["market_open"]
+    market_close: Timestamp = sched.iloc[0]["market_close"]
+    return market_open <= now_in_new_york() < market_close
+```
+
+— but the wrong *thing to depend on*. It is a vendor SDK internal tied to the `tastytrade==12.0.2`
+pin at `requirements.txt:4`; it answers a bare `bool` with no session bounds and no next open/close,
+which is most of what the wizard needs to render; and it reads the wall clock itself
+(`now_in_new_york()`, `utils.py:30-34`), so nothing can freeze time around it. Reimplement here.
+
+Two facts verified against the installed `pandas_market_calendars` 5.3.0, offline:
+`NYSE.schedule()` **omits** weekends and holidays entirely (`2026-07-03`, the observed Independence
+Day — July 4 2026 is a Saturday — returns an empty frame), and it carries the **real early close**
+on a half day (`2026-11-27` returns `market_close = 18:00Z = 13:00 EST`, not 16:00). Both cases
+therefore fall out of the data rather than needing rules here.
+
+Semantics: **regular session only.** This returns `False` during Alpaca's extended-hours window,
+which is precisely what the wizard's submit gate wants, but must never be read as "can I trade at
+all".
+
+The calendar object is built lazily and memoised: `tastytrade/utils.py:15` builds it at MODULE
+import (`NYSE: Any = get_calendar("NYSE")`), and this module must not add that cost to every
+`ba2_common` import. On failure it raises `MarketCalendarUnavailable` rather than guessing — the
+*caller* picks the safe direction, and every caller in this codebase fails closed.
+
+**Files:**
+- Create: `packages/common/ba2_common/core/market_calendar.py`
+- Test: `packages/common/tests/test_market_calendar.py`
+
+No in-tree alias shim is needed: nothing under `ba2_trade_platform/` imports this module directly —
+`ReadOnlyAccountInterface` (itself inside `ba2_common`) imports it lazily, and the UI imports only
+`NY_TZ` from it.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `packages/common/tests/test_market_calendar.py`:
+
+```python
+"""ba2_common.core.market_calendar: the offline NYSE regular-session fallback.
+
+EVERY test here pins an explicit instant. A market-hours test that reads the wall
+clock passes at 11:00 and fails at 17:00, and the failure looks like a code bug.
+
+The dates are real 2026 NYSE facts, verified against pandas_market_calendars
+5.3.0 offline: 2026-08-19 is an ordinary Wednesday (09:30-16:00 EDT); 2026-07-03
+is the OBSERVED Independence Day holiday (July 4 falls on a Saturday); 2026-01-19
+is MLK Day; 2026-11-26 is Thanksgiving and 2026-11-27 is the half day after it,
+closing at 13:00 EST.
+"""
+from datetime import datetime, timezone
+
+import pytest
+
+from ba2_common.core.account_types import MARKET_HOURS_SOURCE_FALLBACK
+from ba2_common.core.market_calendar import (
+    NY_TZ,
+    MarketCalendarUnavailable,
+    clear_nyse_calendar_cache,
+    nyse_market_hours,
+    nyse_regular_sessions,
+)
+
+
+def _ny(year, month, day, hour=0, minute=0, second=0) -> datetime:
+    """A frozen instant in exchange-local time."""
+    return datetime(year, month, day, hour, minute, second, tzinfo=NY_TZ)
+
+
+# ---------------------------------------------------------------------------
+# Open / closed
+# ---------------------------------------------------------------------------
+
+def test_weekday_mid_session_is_open():
+    hours = nyse_market_hours(_ny(2026, 8, 19, 12, 0))
+
+    assert hours.is_open is True
+    assert hours.source == MARKET_HOURS_SOURCE_FALLBACK
+    assert hours.open_at == _ny(2026, 8, 19, 9, 30)
+    assert hours.close_at == _ny(2026, 8, 19, 16, 0)
+    assert hours.as_of == _ny(2026, 8, 19, 12, 0)
+
+
+def test_the_fallback_publishes_no_broker_status_and_stays_known():
+    """`status` is the BROKER's word; the calendar has none. `is_known` is True --
+    a fallback answer is a real answer, not a failure."""
+    hours = nyse_market_hours(_ny(2026, 8, 19, 12, 0))
+
+    assert hours.status is None
+    assert hours.is_known is True
+
+
+def test_saturday_is_closed_and_points_at_monday():
+    hours = nyse_market_hours(_ny(2026, 8, 22, 12, 0))
+
+    assert hours.is_open is False
+    assert hours.next_open == _ny(2026, 8, 24, 9, 30)
+
+
+def test_sunday_is_closed():
+    assert nyse_market_hours(_ny(2026, 8, 23, 12, 0)).is_open is False
+
+
+def test_a_real_nyse_holiday_is_closed():
+    """2026-07-04 is a Saturday, so Independence Day is OBSERVED on Friday the 3rd.
+    A plain weekday check would call this an ordinary trading day."""
+    hours = nyse_market_hours(_ny(2026, 7, 3, 12, 0))
+
+    assert hours.is_open is False
+    assert hours.next_open == _ny(2026, 7, 6, 9, 30)
+
+
+def test_martin_luther_king_day_is_closed():
+    assert nyse_market_hours(_ny(2026, 1, 19, 12, 0)).is_open is False
+
+
+def test_thanksgiving_is_closed():
+    assert nyse_market_hours(_ny(2026, 11, 26, 12, 0)).is_open is False
+
+
+# ---------------------------------------------------------------------------
+# Half day -- the case a hardcoded 16:00 gets wrong
+# ---------------------------------------------------------------------------
+
+def test_half_day_is_open_before_the_early_close():
+    hours = nyse_market_hours(_ny(2026, 11, 27, 12, 0))
+
+    assert hours.is_open is True
+    assert hours.close_at == _ny(2026, 11, 27, 13, 0)
+
+
+def test_half_day_is_closed_after_the_early_close():
+    """13:00 ET, not 16:00. Submitting into this hour is what the gate prevents."""
+    hours = nyse_market_hours(_ny(2026, 11, 27, 14, 0))
+
+    assert hours.is_open is False
+    assert hours.next_open == _ny(2026, 11, 30, 9, 30)
+
+
+# ---------------------------------------------------------------------------
+# The exact boundary minutes
+# ---------------------------------------------------------------------------
+
+def test_one_second_before_the_open_is_closed():
+    assert nyse_market_hours(_ny(2026, 8, 19, 9, 29, 59)).is_open is False
+
+
+def test_the_opening_instant_is_open():
+    """Open is INCLUSIVE (open <= now), matching tastytrade/utils.py:56."""
+    assert nyse_market_hours(_ny(2026, 8, 19, 9, 30, 0)).is_open is True
+
+
+def test_one_second_before_the_close_is_open():
+    assert nyse_market_hours(_ny(2026, 8, 19, 15, 59, 59)).is_open is True
+
+
+def test_the_closing_instant_is_closed():
+    """Close is EXCLUSIVE (now < close). 16:00:00 is already shut."""
+    assert nyse_market_hours(_ny(2026, 8, 19, 16, 0, 0)).is_open is False
+
+
+def test_the_half_day_closing_instant_is_closed():
+    assert nyse_market_hours(_ny(2026, 11, 27, 13, 0, 0)).is_open is False
+
+
+# ---------------------------------------------------------------------------
+# next_open / next_close / next_transition
+# ---------------------------------------------------------------------------
+
+def test_while_open_the_next_transition_is_todays_close():
+    hours = nyse_market_hours(_ny(2026, 8, 19, 12, 0))
+
+    assert hours.next_close == _ny(2026, 8, 19, 16, 0)
+    assert hours.next_open == _ny(2026, 8, 20, 9, 30)
+    assert hours.next_transition == _ny(2026, 8, 19, 16, 0)
+
+
+def test_before_the_open_the_next_transition_is_todays_open():
+    hours = nyse_market_hours(_ny(2026, 8, 19, 7, 0))
+
+    assert hours.next_open == _ny(2026, 8, 19, 9, 30)
+    assert hours.next_transition == _ny(2026, 8, 19, 9, 30)
+
+
+def test_when_shut_the_session_bounds_describe_the_upcoming_session():
+    hours = nyse_market_hours(_ny(2026, 8, 22, 12, 0))
+
+    assert hours.open_at == hours.next_open
+    assert hours.close_at == hours.next_close
+
+
+# ---------------------------------------------------------------------------
+# Input contract, session listing, failure
+# ---------------------------------------------------------------------------
+
+def test_a_naive_datetime_is_refused_rather_than_guessed():
+    """Reading a naive instant as UTC shifts the 09:30/16:00 boundary by 4 hours."""
+    with pytest.raises(ValueError, match="timezone-aware"):
+        nyse_market_hours(datetime(2026, 8, 19, 12, 0))
+
+
+def test_a_utc_instant_is_accepted_and_answered_in_exchange_terms():
+    """16:00 UTC on 2026-08-19 is 12:00 EDT -- mid-session."""
+    hours = nyse_market_hours(datetime(2026, 8, 19, 16, 0, tzinfo=timezone.utc))
+
+    assert hours.is_open is True
+
+
+def test_sessions_omit_weekends_and_holidays_entirely():
+    sessions = nyse_regular_sessions(_ny(2026, 7, 1).date(), _ny(2026, 7, 7).date())
+    days = sorted(o.astimezone(NY_TZ).date().isoformat() for o, _ in sessions)
+
+    # Wed 1st, Thu 2nd, Mon 6th, Tue 7th. No Fri 3rd (observed holiday), no weekend.
+    assert days == ["2026-07-01", "2026-07-02", "2026-07-06", "2026-07-07"]
+
+
+def test_a_missing_calendar_package_raises_rather_than_claiming_open(monkeypatch):
+    """Fail LOUD here; the callers fail CLOSED. Never silently "open".
+
+    Setting the entry to None makes CPython's import machinery raise ImportError
+    ("import of pandas_market_calendars halted; None in sys.modules"), which is a
+    faithful stand-in for the package being absent.
+    """
+    import sys
+
+    clear_nyse_calendar_cache()
+    monkeypatch.setitem(sys.modules, "pandas_market_calendars", None)
+    try:
+        with pytest.raises(MarketCalendarUnavailable):
+            nyse_market_hours(_ny(2026, 8, 19, 12, 0))
+    finally:
+        # monkeypatch restores sys.modules, but the memo must not survive either way.
+        clear_nyse_calendar_cache()
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `venv/bin/python -m pytest packages/common/tests/test_market_calendar.py -v`
+
+Expected: FAIL at collection —
+`ModuleNotFoundError: No module named 'ba2_common.core.market_calendar'`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+Create `packages/common/ba2_common/core/market_calendar.py`:
+
+```python
+"""Holiday- and half-day-aware NYSE regular-session calendar (pure, offline).
+
+This is the ONLY NYSE session-time source in the codebase; no adapter hardcodes
+09:30/16:00/13:00 and no adapter walks its own holiday list.
+
+It is the FALLBACK behind ``ReadOnlyAccountInterface.get_market_hours()``: the
+answer used when the broker publishes no market-hours endpoint, when its adapter
+has not implemented one yet, or when the broker's own lookup failed.
+
+REGULAR SESSION ONLY -- 09:30-16:00 ET, 09:30-13:00 ET on a half day. This
+returns False during Alpaca's extended-hours window. That is exactly the
+semantics the Portfolio Allocation wizard's submit gate wants, but it must not be
+read as "can I trade at all".
+
+Modelled on ``tastytrade/utils.py:44-57`` ``is_market_open_now()``, but
+reimplemented rather than imported: that helper is a vendor SDK internal tied to
+the ``tastytrade==12.0.2`` pin, it answers a bare bool (no session bounds, no
+next open/close), and it reads the wall clock itself, so nothing can freeze time
+around it.
+
+Offline: ``pandas_market_calendars`` ships the NYSE holiday and half-day rules as
+DATA, so no network call is ever made here.
+"""
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, List, Optional, Tuple
+from zoneinfo import ZoneInfo
+
+from ba2_common.core.account_types import (
+    MARKET_HOURS_SOURCE_FALLBACK,
+    MarketHours,
+)
+from ba2_common.logger import logger
+
+#: The exchange timezone, and THE canonical NY tz object for the packages and for
+#: the UI's ``format_market_time``. ``America/New_York`` (not the ``US/Eastern``
+#: alias tastytrade uses) because that is the canonical IANA name; both resolve to
+#: the same rules. ZoneInfo needs the ``tzdata`` wheel on Windows -- guaranteed
+#: here by the ``pandas<3`` pin in requirements.txt (pandas requires tzdata>=2022.7).
+NY_TZ = ZoneInfo("America/New_York")
+
+#: How far ahead to look for the next session. The longest NYSE closure is four
+#: calendar days (a Friday or Monday holiday plus the weekend), so ten days always
+#: contains at least one future session.
+LOOKAHEAD_DAYS = 10
+
+#: Memoised NYSE calendar. Building it parses the whole holiday ruleset, so it is
+#: built once per process, LAZILY -- importing this module must not cost that
+#: (``tastytrade/utils.py:15`` does it at module import; we deliberately do not).
+_CALENDAR: Any = None
+
+
+class MarketCalendarUnavailable(RuntimeError):
+    """``pandas-market-calendars`` could not be imported or built.
+
+    Raised, never swallowed here: the CALLER decides the safe direction. Every
+    caller in this codebase fails CLOSED -- ``_get_market_hours_impl`` converts it
+    to ``MARKET_HOURS_SOURCE_UNAVAILABLE``, which is shut for the submit gate and
+    "unknown" for the banner.
+    """
+
+
+def _nyse_calendar() -> Any:
+    """The memoised NYSE calendar.
+
+    Raises:
+        MarketCalendarUnavailable: when ``pandas-market-calendars`` is missing or
+            unusable. It is pinned in requirements.txt and in
+            packages/common/pyproject.toml, but it originally arrived only as a
+            TRANSITIVE dep of ``tastytrade``, so this failure is worth naming.
+    """
+    global _CALENDAR
+    if _CALENDAR is None:
+        try:
+            from pandas_market_calendars import get_calendar
+            _CALENDAR = get_calendar("NYSE")
+        except Exception as e:
+            logger.error(f"NYSE market calendar unavailable: {e}", exc_info=True)
+            raise MarketCalendarUnavailable(
+                f"pandas-market-calendars could not provide the NYSE calendar: {e}") from e
+    return _CALENDAR
+
+
+def clear_nyse_calendar_cache() -> None:
+    """Drop the memoised calendar so the next call rebuilds it.
+
+    The holiday ruleset only changes when the package is upgraded, so this exists
+    for tests and for a long-lived process that has had the package replaced
+    underneath it. It is NOT the market-status cache -- that one lives on the
+    account (``ReadOnlyAccountInterface.clear_market_hours_cache``).
+    """
+    global _CALENDAR
+    _CALENDAR = None
+
+
+def _require_aware(moment: datetime) -> datetime:
+    """Normalise a caller-supplied instant to UTC, refusing a naive one.
+
+    A naive datetime here is not a small ambiguity: read as UTC it moves the
+    session boundary by four or five hours, which is the difference between
+    "submit" and "the broker rejects the whole batch". No guess is made.
+
+    Raises:
+        ValueError: when ``moment`` has no usable tzinfo.
+    """
+    if moment.tzinfo is None or moment.tzinfo.utcoffset(moment) is None:
+        raise ValueError(
+            "market-hours instants must be timezone-aware; a naive datetime "
+            "would silently shift the 09:30/16:00 ET boundaries")
+    return moment.astimezone(timezone.utc)
+
+
+def nyse_regular_sessions(first_day: date, last_day: date) -> List[Tuple[datetime, datetime]]:
+    """Regular-session ``(open, close)`` pairs, in UTC, over an inclusive day range.
+
+    Holiday and half-day handling both fall out of the DATA rather than needing
+    rules here: ``pandas_market_calendars`` emits no row at all for a weekend or a
+    holiday, and a half day carries its real early close (13:00 ET).
+
+    Args:
+        first_day: inclusive first calendar day (exchange-local).
+        last_day: inclusive last calendar day (exchange-local).
+
+    Returns:
+        List[Tuple[datetime, datetime]]: ascending, tz-aware UTC. Empty when the
+        range contains no trading day.
+
+    Raises:
+        MarketCalendarUnavailable: see ``_nyse_calendar``.
+    """
+    schedule = _nyse_calendar().schedule(start_date=first_day, end_date=last_day)
+    sessions = [
+        (row.market_open.to_pydatetime().astimezone(timezone.utc),
+         row.market_close.to_pydatetime().astimezone(timezone.utc))
+        for row in schedule.itertuples()
+    ]
+    sessions.sort()
+    return sessions
+
+
+def nyse_market_hours(now: Optional[datetime] = None) -> MarketHours:
+    """Regular-session market status at ``now``, from the NYSE calendar.
+
+    The session is open-INCLUSIVE and close-EXCLUSIVE (``open <= now < close``),
+    matching ``tastytrade/utils.py:56``: 09:30:00 ET is open, 16:00:00 ET is not.
+
+    Args:
+        now: the instant to describe; must be timezone-aware. Defaults to
+            ``datetime.now(timezone.utc)``. Callers that need a reproducible
+            answer (every test, and the account seam's cache) pass it explicitly.
+
+    Returns:
+        MarketHours: ``source == MARKET_HOURS_SOURCE_FALLBACK``, ``status`` left
+        ``None`` (that field is the BROKER's word and there is no broker here).
+        When the market is shut, ``open_at``/``close_at`` describe the UPCOMING
+        session and so equal ``next_open``/``next_close``.
+
+    Raises:
+        ValueError: when ``now`` is naive.
+        MarketCalendarUnavailable: see ``_nyse_calendar``.
+    """
+    now_utc = _require_aware(now if now is not None else datetime.now(timezone.utc))
+
+    # Start a day early so a session still running past midnight UTC (any EDT
+    # afternoon) is still in the window.
+    first_day = now_utc.astimezone(NY_TZ).date() - timedelta(days=1)
+    sessions = nyse_regular_sessions(first_day, first_day + timedelta(days=LOOKAHEAD_DAYS))
+
+    current = next(((o, c) for o, c in sessions if o <= now_utc < c), None)
+    next_open = next((o for o, _ in sessions if o > now_utc), None)
+    next_close = next((c for _, c in sessions if c > now_utc), None)
+
+    return MarketHours(
+        is_open=current is not None,
+        open_at=current[0] if current is not None else next_open,
+        close_at=current[1] if current is not None else next_close,
+        next_open=next_open,
+        next_close=next_close,
+        source=MARKET_HOURS_SOURCE_FALLBACK,
+        as_of=now_utc,
+    )
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `venv/bin/python -m pytest packages/common/tests/test_market_calendar.py -v`
+
+Expected: 21 passed.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add packages/common/ba2_common/core/market_calendar.py packages/common/tests/test_market_calendar.py
+git commit -m "feat(accounts): offline holiday/half-day-aware NYSE regular-session calendar"
+```
+
+---
+
+### Task 83: The market-hours seam — one template method, one override point, one cache
+
+The seam itself, alongside `get_account_snapshot` (`ReadOnlyAccountInterface.py:95`),
+`get_cash_transfers` (`:196`) and `get_symbol_margin_info` (`:227`). It goes on the READ-ONLY
+interface, not `AccountInterface`, because the wizard's gate is a read-only question and
+TastyTrade's read-only surface must be able to answer it.
+
+**THE OVERRIDE CONTRACT. Read this before writing any adapter.**
+
+```
+get_market_hours(self, *, now=None)  -> CONCRETE, cached, NEVER raises.
+                                        Effectively FINAL. DO NOT OVERRIDE.
+is_market_open(self, *, now=None)    -> CONCRETE. DO NOT OVERRIDE.
+_get_market_hours_impl(self, now)    -> THE OVERRIDE POINT. Adapters override
+                                        THIS AND ONLY THIS.
+```
+
+An adapter override:
+- receives an **aware `now`** and MUST use it, not `datetime.now()`, not `_utcnow()`, not
+  `self._now_eastern()`. That is what makes every market-hours test reproducible;
+- MUST NOT cache. `get_market_hours()` already does, and does it correctly;
+- MUST NOT define its own TTL, its own `_market_hours_cache`, its own `is_market_open()` or its own
+  session-boundary helper;
+- reaches the offline fallback by calling **`super()._get_market_hours_impl(now)`**, typically as
+  `dataclasses.replace(super()._get_market_hours_impl(now), detail=<why the broker failed>)`.
+  Calling `super().get_market_hours()` from inside `_get_market_hours_impl` is **infinite
+  recursion** — `get_market_hours()` is precisely the function that calls
+  `_get_market_hours_impl()`. There is no guard against it; it is a stack overflow on a money path;
+- may raise. `get_market_hours()` catches everything and converts it to an UNAVAILABLE answer.
+
+A broker's answer **wins outright** over the calendar. There is no cross-check and no divergence
+logging: two sources that disagree need a tie-break rule nobody has, and the broker is the one that
+will accept or reject the order.
+
+**Deliberate deviation from the Section D seam shape, and why.** The other four seams are a single
+concrete method that brokers override outright. Here that would be wrong: every override would have
+to reimplement the cache, and the *interesting* part of this seam is the cache invariant (see
+below). So this follows the repo's other established pattern — the `submit_order` /
+`_submit_order_impl` template (Task 45: *"Never override `submit_order`"*, and
+`IBKRAccount.py:27-40` for what happens when someone does).
+
+**Why not a plain TTL.** The margin-info cache (`AlpacaAccount.py:85-87`, `:1755-1758`) expires on
+elapsed seconds, which is right for asset metadata and wrong here: a 60-second entry fetched at
+15:59:30 would still claim `is_open = True` at 16:00:15. The cache is therefore valid only while
+**both** hold: it is younger than `_MARKET_HOURS_CACHE_TTL`, **and** `now` has not reached
+`MarketHours.next_transition`. Expiry is `min(now + TTL, result.next_transition)`.
+`clear_market_hours_cache()` mirrors `clear_margin_info_cache()` (`AlpacaAccount.py:1815-1824`) for
+the user who hits Refresh. 60 seconds is right because the wizard asks once per page render; the
+correctness-bearing invalidation is the boundary, not the TTL.
+
+**UNAVAILABLE answers are NEVER cached.** Broker answers and fallback answers are. A failure is not
+a fact: caching it would keep the wizard blocked for a full TTL after the broker came back, and a
+transient 503 must be retried on the very next call. The request-storm worry does not apply — this
+seam is called once per page render, not in a loop.
+
+**Failure is CLOSED, and the two failure levels are distinct.** A broker override that fails but
+whose `super()._get_market_hours_impl(now)` succeeds yields a FALLBACK answer — the calendar
+answered, so we know. Only when the calendar fails too does the answer become UNAVAILABLE:
+`is_open=False`, `is_known=False`. Fetch-failed is never reported as a plain "closed".
+
+**`now` is injectable on every method.** That is how tests freeze time — no monkeypatching of
+`datetime`, no `freezegun`, and it is preferred over patching an adapter's `_utcnow`/`_now_eastern`.
+It also means the cache uses ONE clock for both the age check and the boundary check, so the two
+can never disagree.
+
+The cache is declared as a CLASS attribute defaulting to `None` and only ever REBOUND on the
+instance — never mutated in place — so it is per-instance in practice while still being present on a
+bare `object.__new__` instance (the test idiom that `_MARGIN_INFO_CACHE_TTL`'s comment at
+`AlpacaAccount.py:85-86` exists for). A tuple, not a dict, so there is no shared mutable state.
+
+**Files:**
+- Modify: `packages/common/ba2_common/core/interfaces/ReadOnlyAccountInterface.py` (imports at lines 2 and 4; new methods inserted between line 248 `return {}` and line 250 `@abstractmethod`)
+- Test: `packages/common/tests/test_account_seams.py`
+
+- [ ] **Step 1: Write the failing test**
+
+In `packages/common/tests/test_account_seams.py`, replace the import block at the top (currently
+lines 10-11) with:
+
+```python
+import dataclasses
+from datetime import datetime
+
+import pytest
+
+from ba2_common.core.account_types import (
+    MARKET_HOURS_SOURCE_BROKER,
+    MARKET_HOURS_SOURCE_FALLBACK,
+    MARKET_HOURS_SOURCE_UNAVAILABLE,
+    AccountSnapshot,
+    MarketHours,
+)
+from ba2_common.core.interfaces.ReadOnlyAccountInterface import ReadOnlyAccountInterface
+from ba2_common.core.market_calendar import NY_TZ, clear_nyse_calendar_cache
+```
+
+Then append to the end of the file:
+
+```python
+# ---------------------------------------------------------------------------
+# Market hours
+# ---------------------------------------------------------------------------
+
+def _ny(year, month, day, hour=0, minute=0, second=0) -> datetime:
+    """A frozen instant in exchange-local time. Every test below pins one."""
+    return datetime(year, month, day, hour, minute, second, tzinfo=NY_TZ)
+
+
+def _capture_errors(monkeypatch):
+    """Collect ``logger.error`` messages emitted by ReadOnlyAccountInterface.
+
+    NOT caplog. Two independent reasons it cannot be used here:
+      * the package logger sets ``propagate = False``
+        (packages/common/ba2_common/logger.py:19, and
+        ba2_trade_platform/logger.py:24 for the app one), so caplog's ROOT handler
+        never sees the record; and
+      * tests/test_penny_gainers_fix.py:53 replaces the logger module with a
+        MagicMock at import time, so under a full-suite collection even
+        re-enabling propagation patches a mock rather than the real logger.
+    Patching the module-under-test's own ``logger`` is immune to both.
+    """
+    import sys
+    # sys.modules, not `from ...interfaces import ReadOnlyAccountInterface`: that
+    # package __init__ re-exports the CLASS under the same name, so the plain
+    # import binds the class and `.logger` would not exist on it.
+    module = sys.modules["ba2_common.core.interfaces.ReadOnlyAccountInterface"]
+    messages = []
+    monkeypatch.setattr(module.logger, "error", lambda msg, *a, **k: messages.append(str(msg)))
+    return messages
+
+
+class _CountingAccount(_DictAccount):
+    """Counts how many times the seam actually reached the implementation."""
+
+    def __init__(self, id=1, info=None):
+        super().__init__(id, info or {})
+        self.impl_calls = 0
+
+    def _get_market_hours_impl(self, now):
+        self.impl_calls += 1
+        return super()._get_market_hours_impl(now)
+
+
+class _BrokerAccount(_DictAccount):
+    """A broker that answers for itself -- the Alpaca / TastyTrade shape."""
+
+    def __init__(self, hours):
+        super().__init__(1, {})
+        self._hours = hours
+        self.seen_now = []
+
+    def _get_market_hours_impl(self, now):
+        self.seen_now.append(now)
+        return self._hours
+
+
+class _DegradingAccount(_DictAccount):
+    """The canonical adapter fallback: broker failed, so defer to super's calendar.
+
+    This is the shape BOTH broker adapters must use. Note super()._get_market_hours_impl,
+    NOT super().get_market_hours() -- the latter calls back into this method.
+    """
+
+    def __init__(self):
+        super().__init__(1, {})
+        self.impl_calls = 0
+
+    def _get_market_hours_impl(self, now):
+        self.impl_calls += 1
+        return dataclasses.replace(super()._get_market_hours_impl(now),
+                                   detail="broker clock endpoint 503")
+
+
+class _ExplodingAccount(_DictAccount):
+    def __init__(self):
+        super().__init__(1, {})
+        self.impl_calls = 0
+
+    def _get_market_hours_impl(self, now):
+        self.impl_calls += 1
+        raise RuntimeError("broker clock endpoint 503")
+
+
+def test_the_default_seam_answers_from_the_nyse_fallback():
+    """A broker that implements nothing still gets a real, holiday-aware answer."""
+    hours = _CountingAccount().get_market_hours(now=_ny(2026, 8, 19, 12, 0))
+
+    assert hours.is_open is True
+    assert hours.source == MARKET_HOURS_SOURCE_FALLBACK
+    assert hours.close_at == _ny(2026, 8, 19, 16, 0)
+
+
+def test_the_default_seam_is_closed_on_an_observed_holiday():
+    """2026-07-03 -- Independence Day observed, July 4 being a Saturday."""
+    assert _CountingAccount().is_market_open(now=_ny(2026, 7, 3, 12, 0)) is False
+
+
+def test_the_default_seam_is_closed_at_the_weekend():
+    assert _CountingAccount().is_market_open(now=_ny(2026, 8, 22, 12, 0)) is False
+
+
+def test_the_default_seam_respects_the_half_day_early_close():
+    acct = _CountingAccount()
+
+    assert acct.is_market_open(now=_ny(2026, 11, 27, 12, 0)) is True
+    acct.clear_market_hours_cache()
+    assert acct.is_market_open(now=_ny(2026, 11, 27, 14, 0)) is False
+
+
+def test_is_market_open_delegates_to_get_market_hours():
+    acct = _BrokerAccount(MarketHours(is_open=True, source=MARKET_HOURS_SOURCE_BROKER))
+
+    assert acct.is_market_open(now=_ny(2026, 8, 22, 12, 0)) is True  # broker overrides the calendar
+
+
+def test_a_broker_override_is_used_verbatim():
+    """The override point is _get_market_hours_impl, never get_market_hours itself,
+    and the broker's answer wins outright -- no cross-check against the calendar."""
+    published = MarketHours(
+        is_open=False,
+        next_open=_ny(2026, 8, 20, 9, 30),
+        next_close=_ny(2026, 8, 20, 16, 0),
+        source=MARKET_HOURS_SOURCE_BROKER,
+        status="Extended",
+    )
+    acct = _BrokerAccount(published)
+
+    assert acct.get_market_hours(now=_ny(2026, 8, 19, 18, 0)) is published
+
+
+def test_the_injected_now_is_handed_to_the_override_not_the_wall_clock():
+    """`now=` is THE clock-freeze seam. An override that ignores it and reads its
+    own clock makes every test of it non-deterministic."""
+    acct = _BrokerAccount(MarketHours(is_open=True, source=MARKET_HOURS_SOURCE_BROKER))
+    frozen = _ny(2026, 8, 19, 12, 0)
+
+    acct.get_market_hours(now=frozen)
+
+    assert acct.seen_now == [frozen]
+
+
+def test_an_adapter_degrades_through_super_impl_without_recursing():
+    """THE shape both broker adapters use on their failure path. If it were written
+    as super().get_market_hours(), this test would blow the stack instead of
+    passing -- get_market_hours() is what calls _get_market_hours_impl()."""
+    acct = _DegradingAccount()
+
+    hours = acct.get_market_hours(now=_ny(2026, 8, 19, 12, 0))
+
+    assert acct.impl_calls == 1
+    assert hours.source == MARKET_HOURS_SOURCE_FALLBACK
+    assert hours.is_open is True
+    assert hours.detail == "broker clock endpoint 503"
+
+
+# --- caching ---------------------------------------------------------------
+
+def test_a_second_call_inside_the_ttl_is_served_from_cache():
+    """The wizard page asks repeatedly; the status changes a few times a day."""
+    acct = _CountingAccount()
+    acct.get_market_hours(now=_ny(2026, 8, 19, 12, 0))
+    acct.get_market_hours(now=_ny(2026, 8, 19, 12, 0, 30))
+
+    assert acct.impl_calls == 1
+
+
+def test_the_ttl_expires():
+    acct = _CountingAccount()
+    acct.get_market_hours(now=_ny(2026, 8, 19, 12, 0))
+    acct.get_market_hours(now=_ny(2026, 8, 19, 12, 1, 1))
+
+    assert acct.impl_calls == 2
+
+
+def test_the_cache_expires_at_the_bell_even_inside_the_ttl():
+    """This is the whole reason a plain elapsed-seconds TTL is wrong here: an entry
+    taken at 15:59:30 must NOT still say "open" at 16:00:01."""
+    acct = _CountingAccount()
+    assert acct.get_market_hours(now=_ny(2026, 8, 19, 15, 59, 30)).is_open is True
+
+    later = acct.get_market_hours(now=_ny(2026, 8, 19, 16, 0, 1))
+
+    assert acct.impl_calls == 2
+    assert later.is_open is False
+
+
+def test_the_cache_expires_at_the_open_even_inside_the_ttl():
+    acct = _CountingAccount()
+    assert acct.get_market_hours(now=_ny(2026, 8, 19, 9, 29, 30)).is_open is False
+
+    assert acct.get_market_hours(now=_ny(2026, 8, 19, 9, 30, 1)).is_open is True
+    assert acct.impl_calls == 2
+
+
+def test_a_broker_answer_is_cached_like_any_other():
+    acct = _BrokerAccount(MarketHours(is_open=True, source=MARKET_HOURS_SOURCE_BROKER))
+    acct.get_market_hours(now=_ny(2026, 8, 19, 12, 0))
+    acct.get_market_hours(now=_ny(2026, 8, 19, 12, 0, 30))
+
+    assert len(acct.seen_now) == 1
+
+
+def test_clear_market_hours_cache_forces_a_refetch():
+    acct = _CountingAccount()
+    acct.get_market_hours(now=_ny(2026, 8, 19, 12, 0))
+    acct.clear_market_hours_cache()
+    acct.get_market_hours(now=_ny(2026, 8, 19, 12, 0, 5))
+
+    assert acct.impl_calls == 2
+
+
+def test_the_cache_is_per_instance_and_never_lands_on_the_class():
+    """A tuple rebound on the instance -- not a dict mutated on the class."""
+    first, second = _CountingAccount(1), _CountingAccount(2)
+    first.get_market_hours(now=_ny(2026, 8, 19, 12, 0))
+    second.get_market_hours(now=_ny(2026, 8, 19, 12, 0))
+
+    assert first.impl_calls == 1 and second.impl_calls == 1
+    assert ReadOnlyAccountInterface._market_hours_cache is None
+
+
+def test_a_cache_entry_is_not_reused_for_an_earlier_instant():
+    """Guards a backwards clock and any caller replaying an older `now`."""
+    acct = _CountingAccount()
+    acct.get_market_hours(now=_ny(2026, 8, 19, 12, 0))
+    acct.get_market_hours(now=_ny(2026, 8, 19, 11, 59))
+
+    assert acct.impl_calls == 2
+
+
+# --- failure -------------------------------------------------------------
+
+def test_a_failing_broker_lookup_fails_closed():
+    """Never "open" on an error. is_known then tells the UI it is a failure, not a
+    genuine closure, and detail carries the reason for the banner."""
+    hours = _ExplodingAccount().get_market_hours(now=_ny(2026, 8, 19, 12, 0))
+
+    assert hours.is_open is False
+    assert hours.source == MARKET_HOURS_SOURCE_UNAVAILABLE
+    assert hours.is_known is False
+    assert "503" in hours.detail
+
+
+def test_an_unavailable_answer_is_never_cached():
+    """A failure is not a fact. Caching it would keep the wizard blocked for a full
+    TTL after the broker recovered; the next call must retry."""
+    acct = _ExplodingAccount()
+    acct.get_market_hours(now=_ny(2026, 8, 19, 12, 0))
+    acct.get_market_hours(now=_ny(2026, 8, 19, 12, 0, 1))
+
+    assert acct.impl_calls == 2
+    assert acct._market_hours_cache is None
+
+
+def test_the_default_impl_degrades_to_unavailable_when_the_calendar_is_missing(monkeypatch):
+    """Broker silent AND calendar dead. Shut for the gate, "unknown" for the UI --
+    NOT a fallback answer, because nothing answered."""
+    import sys
+
+    clear_nyse_calendar_cache()
+    monkeypatch.setitem(sys.modules, "pandas_market_calendars", None)
+    try:
+        hours = _CountingAccount().get_market_hours(now=_ny(2026, 8, 19, 12, 0))
+    finally:
+        clear_nyse_calendar_cache()
+
+    assert hours.is_open is False
+    assert hours.source == MARKET_HOURS_SOURCE_UNAVAILABLE
+    assert hours.is_known is False
+    assert hours.detail
+
+
+def test_an_adapter_degrading_into_a_dead_calendar_reports_unavailable(monkeypatch):
+    """dataclasses.replace(super()._get_market_hours_impl(now), detail=...) must NOT
+    force source=FALLBACK: if the calendar is dead too, the honest answer is
+    UNAVAILABLE, and the UI must be allowed to say so."""
+    import sys
+
+    clear_nyse_calendar_cache()
+    monkeypatch.setitem(sys.modules, "pandas_market_calendars", None)
+    try:
+        hours = _DegradingAccount().get_market_hours(now=_ny(2026, 8, 19, 12, 0))
+    finally:
+        clear_nyse_calendar_cache()
+
+    assert hours.source == MARKET_HOURS_SOURCE_UNAVAILABLE
+    assert hours.is_known is False
+    assert hours.detail == "broker clock endpoint 503"
+
+
+def test_get_market_hours_never_propagates_an_exception():
+    """It is called from a UI render path and from the money path. Whatever an
+    adapter does, this returns a MarketHours."""
+    hours = _ExplodingAccount().get_market_hours(now=_ny(2026, 8, 19, 12, 0))
+
+    assert isinstance(hours, MarketHours)
+
+
+def test_is_market_open_is_false_when_the_lookup_failed():
+    assert _ExplodingAccount().is_market_open(now=_ny(2026, 8, 19, 12, 0)) is False
+
+
+def test_a_failing_lookup_is_logged_as_an_error(monkeypatch):
+    errors = _capture_errors(monkeypatch)
+
+    _ExplodingAccount().get_market_hours(now=_ny(2026, 8, 19, 12, 0))
+
+    assert any("market hours" in e.lower() for e in errors), errors
+
+
+def test_a_naive_now_is_refused_rather_than_guessed():
+    with pytest.raises(ValueError, match="timezone-aware"):
+        _CountingAccount().get_market_hours(now=datetime(2026, 8, 19, 12, 0))
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `venv/bin/python -m pytest packages/common/tests/test_account_seams.py -v -k "market_hours or market_open or nyse_fallback or half_day or observed_holiday or cache or fails_closed or naive_now or broker_override or degrad or unavailable or injected_now or never_propagates"`
+
+Expected: FAIL — every new test errors with
+`AttributeError: 'ReadOnlyAccountInterface' object has no attribute 'get_market_hours'` (and
+`'_CountingAccount' object has no attribute 'clear_market_hours_cache'` /
+`type object 'ReadOnlyAccountInterface' has no attribute '_market_hours_cache'`). The
+pre-existing snapshot/transfer/margin tests in the file stay green.
+
+- [ ] **Step 3: Write minimal implementation**
+
+In `packages/common/ba2_common/core/interfaces/ReadOnlyAccountInterface.py`, change line 2 from
+`from typing import Any, Dict, Optional, List` to:
+
+```python
+from typing import Any, Dict, Optional, List, Tuple
+```
+
+and line 4 from
+`from ba2_common.core.account_types import AccountSnapshot, CashTransfer, MarginInfo` to:
+
+```python
+from ba2_common.core.account_types import (
+    MARKET_HOURS_SOURCE_UNAVAILABLE,
+    AccountSnapshot,
+    CashTransfer,
+    MarginInfo,
+    MarketHours,
+)
+```
+
+(`datetime`, `timezone` and `timedelta` are already imported on line 3.)
+
+Insert these class attributes and methods between line 248 (the `return {}` that ends
+`get_symbol_margin_info`) and line 250 (`@abstractmethod`, above `get_positions`):
+
+```python
+
+    #: Upper bound on how stale a cached market-status answer may be, in seconds.
+    #: A CLASS attribute so a bare instance built with object.__new__ (the test
+    #: idiom) still has it. Short on purpose: this is a page-level de-duplicator --
+    #: the wizard asks once per render -- not a day-level cache. The real
+    #: invalidation is the session BOUNDARY below.
+    _MARKET_HOURS_CACHE_TTL = 60
+
+    #: ``(asked_at, answer)``. Declared on the CLASS so a bare instance has it, but
+    #: only ever REBOUND on the instance -- never mutated in place -- so there is no
+    #: shared mutable state between accounts (contrast the per-instance dict in
+    #: AlpacaAccount._margin_info_cache, which is built in __init__).
+    _market_hours_cache: Optional[Tuple[datetime, MarketHours]] = None
+
+    def get_market_hours(self, *, now: Optional[datetime] = None) -> MarketHours:
+        """Whether this account's market is trading, and when that next changes.
+
+        CONCRETE and effectively FINAL: it owns argument validation and the cache.
+        **DO NOT OVERRIDE THIS.** Override ``_get_market_hours_impl`` instead --
+        the same template/impl split as ``submit_order`` / ``_submit_order_impl``
+        (overriding the template with a different shape is what disabled
+        IBKRAccount; see IBKRAccount.py:27-40). An adapter that overrides this
+        method loses the boundary-expiry cache and, if it then calls
+        ``super().get_market_hours()`` from its ``_get_market_hours_impl``,
+        recurses forever.
+
+        CACHING. An entry is reused only while BOTH hold: it is younger than
+        ``_MARKET_HOURS_CACHE_TTL``, and ``now`` has not yet reached the answer's
+        own ``next_transition`` -- i.e. it expires at
+        ``min(now + TTL, next_transition)``. A plain elapsed-seconds TTL -- the
+        shape AlpacaAccount._margin_info_cache uses for asset metadata -- is WRONG
+        here: an entry taken at 15:59:30 would still claim the market is open at
+        16:00:15. ``clear_market_hours_cache()`` is the explicit path.
+
+        An answer whose ``source`` is ``MARKET_HOURS_SOURCE_UNAVAILABLE`` is
+        **never cached**. A failure is not a fact: caching one would keep the
+        wizard blocked for a full TTL after the broker recovered, and this seam is
+        called once per page render, not in a loop, so there is no storm to fear.
+        Broker and fallback answers ARE cached.
+
+        FAILS CLOSED. Any exception out of the implementation is logged and
+        becomes ``MarketHours(is_open=False, source=..._UNAVAILABLE, detail=...)``;
+        use ``MarketHours.is_known`` to tell "shut" from "we could not find out".
+        This method NEVER raises and never propagates.
+
+        Args:
+            now: the instant to describe; must be timezone-aware. Defaults to
+                ``datetime.now(timezone.utc)``. Passing it explicitly is THE way
+                tests freeze time -- preferred over monkeypatching an adapter's
+                ``_utcnow``/``_now_eastern`` -- and it also guarantees the age
+                check and the boundary check below read ONE clock and so cannot
+                disagree.
+
+        Returns:
+            MarketHours: never ``None``.
+
+        Raises:
+            ValueError: when ``now`` is naive. Read as UTC instead of Eastern, a
+                naive instant moves the boundary by four or five hours. This is
+                the ONE thing this method raises, and it is a programming error,
+                not a runtime condition.
+        """
+        if now is None:
+            now = datetime.now(timezone.utc)
+        if now.tzinfo is None or now.tzinfo.utcoffset(now) is None:
+            raise ValueError(
+                "get_market_hours(now=...) requires a timezone-aware datetime; a "
+                "naive one would silently shift the 09:30/16:00 ET boundaries")
+
+        entry = self._market_hours_cache
+        if entry is not None:
+            asked_at, cached = entry
+            age = now - asked_at
+            transition = cached.next_transition
+            if (timedelta(0) <= age < timedelta(seconds=self._MARKET_HOURS_CACHE_TTL)
+                    and (transition is None or now < transition)):
+                return cached
+            self._market_hours_cache = None
+
+        try:
+            hours = self._get_market_hours_impl(now)
+        except Exception as e:
+            logger.error(
+                f"[Account {self.id}] Could not determine market hours: {e}", exc_info=True)
+            hours = MarketHours(
+                is_open=False, source=MARKET_HOURS_SOURCE_UNAVAILABLE, as_of=now,
+                detail=f"Market hours could not be determined: {e}")
+
+        # A failure is retried on the very next call; a real answer is cached until
+        # the earlier of the TTL and the session boundary.
+        self._market_hours_cache = (now, hours) if hours.is_known else None
+        return hours
+
+    def _get_market_hours_impl(self, now: datetime) -> MarketHours:
+        """Broker-specific market status. THIS IS THE OVERRIDE POINT.
+
+        The default is the offline, holiday- and half-day-aware NYSE
+        REGULAR-session calendar (``ba2_common.core.market_calendar``), so a
+        broker that implements nothing still gets a correct answer for a US
+        equities account. It reports closed during extended hours. If the calendar
+        package itself is unusable this degrades to
+        ``MARKET_HOURS_SOURCE_UNAVAILABLE`` -- NOT to an ``is_open=False``
+        fallback, because fetch-failed is not the same as closed.
+
+        RULES FOR AN OVERRIDE:
+          * override THIS method and nothing else. Never override
+            ``get_market_hours`` or ``is_market_open``.
+          * USE the ``now`` you are given. Do not read the wall clock, ``_utcnow()``
+            or ``self._now_eastern()`` inside here -- ``now=`` is the clock-freeze
+            seam every test depends on.
+          * do NOT cache. ``get_market_hours`` already does, with the boundary
+            invariant. Do not add a TTL, a ``_market_hours_cache`` or a
+            session-boundary helper to an adapter.
+          * to fall back to the calendar, call
+            ``dataclasses.replace(super()._get_market_hours_impl(now), detail=reason)``.
+            **Never ``super().get_market_hours()``** -- that is the method that
+            calls this one, so it recurses until the stack dies. And do not force
+            ``source=FALLBACK`` on the result: if the calendar is dead too, the
+            honest answer is UNAVAILABLE.
+          * you MAY raise. ``get_market_hours`` logs it and fails closed.
+
+        Alpaca overrides it from ``TradingClient.get_clock()`` ->
+        ``Clock(timestamp, is_open, next_open, next_close)``
+        (alpaca/trading/models.py:348), leaving ``open_at`` ``None`` while the
+        session is live because ``Clock`` does not publish the current session's
+        start, and stamping ``source=MARKET_HOURS_SOURCE_BROKER``. TastyTrade
+        overrides it from the async ``get_market_sessions(session, exchanges)`` ->
+        ``MarketSession(status, open_at, close_at, next_session, ...)``
+        (tastytrade/market_sessions.py), bridged with ``_run_async``, carrying the
+        raw broker word in ``status``.
+
+        Args:
+            now: the tz-aware instant to describe. A broker that only reports
+                "right now" still stamps it into ``as_of``.
+
+        Returns:
+            MarketHours: with ``source`` set.
+        """
+        # Imported lazily: pandas_market_calendars parses the whole NYSE ruleset on
+        # first use, and merely importing this interface must not pay for that.
+        from ba2_common.core.market_calendar import (
+            MarketCalendarUnavailable, nyse_market_hours)
+        try:
+            return nyse_market_hours(now)
+        except MarketCalendarUnavailable as e:
+            logger.error(
+                f"[Account {self.id}] No offline NYSE calendar, so market hours are "
+                f"UNKNOWN rather than closed: {e}", exc_info=True)
+            return MarketHours(
+                is_open=False, source=MARKET_HOURS_SOURCE_UNAVAILABLE, as_of=now,
+                detail=f"No market-hours source available: {e}")
+
+    def is_market_open(self, *, now: Optional[datetime] = None) -> bool:
+        """Shorthand for ``get_market_hours(now=now).is_open``.
+
+        CONCRETE. **DO NOT OVERRIDE** -- an adapter that overrides this can
+        disagree with the banner, which reads ``get_market_hours()``.
+
+        REGULAR session under the default implementation -- False during extended
+        hours. The Portfolio Allocation wizard only SUBMITS while this is True.
+
+        A failed lookup returns False (fail closed); call ``get_market_hours()``
+        and read ``is_known`` when the caller needs to tell that apart from a
+        genuine closure.
+        """
+        return self.get_market_hours(now=now).is_open
+
+    def clear_market_hours_cache(self) -> None:
+        """Drop the cached market-status answer so the next call refetches.
+
+        The entry expires on its own at the earlier of the TTL and the next
+        session boundary; this is the EXPLICIT path, for a user who hits Refresh
+        -- the counterpart of ``AlpacaAccount.clear_margin_info_cache()``. It lives
+        HERE, on the interface, so no adapter needs one of its own.
+        """
+        self._market_hours_cache = None
+        logger.debug(f"[Account {self.id}] Cleared cached market hours")
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `venv/bin/python -m pytest packages/common/tests/test_account_seams.py -v`
+
+Then confirm nothing downstream of the interface broke:
+
+Run: `venv/bin/python -m pytest packages/common/tests/test_interfaces_import.py tests/test_alpaca_account_snapshot.py tests/test_alpaca_margin_info.py tests/test_tastytrade_account.py -v`
+
+Expected: all pass.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add packages/common/ba2_common/core/interfaces/ReadOnlyAccountInterface.py packages/common/tests/test_account_seams.py
+git commit -m "feat(accounts): market-hours seam on ReadOnlyAccountInterface with boundary-aware cache"
+```
+
+---
+
+## Block B - AlpacaAccount: broker clock + fractionability pre-check
+
+These three tasks extend **Section D — Account seams and Alpaca** and slot in directly after
+Task 35 (`Fractional-aware submission in AlpacaAccount._submit_order_impl`). They must run in
+order: N3 imports the asset cache built in N2.
+
+**Ordering against the other chunks (contract §4).** All three tasks are Block B or later, so the
+whole of chunk `interface` (its N1-N4) has to land first. Specifically:
+
+* N1 needs interface N2 (`MarketHours`, `MARKET_HOURS_SOURCE_BROKER` / `_FALLBACK` /
+  `_UNAVAILABLE` in `packages/common/ba2_common/core/account_types.py`), interface N3
+  (`packages/common/ba2_common/core/market_calendar.py`) and above all interface N4 — the
+  `ReadOnlyAccountInterface` template method. **The override point is
+  `_get_market_hours_impl(self, now: datetime) -> MarketHours`.** `get_market_hours()` and
+  `is_market_open()` are concrete, cached and effectively final on the interface; this chunk must
+  not override either of them, and must reach the offline fallback with
+  `super()._get_market_hours_impl(now)`. Calling `super().get_market_hours()` from inside
+  `_get_market_hours_impl` is infinite recursion, because the template method calls the impl.
+* N2 and N3 need interface N2's widening of `MarginInfo.fractionable` to `Optional[bool] = None`.
+* N3 appends to `packages/common/ba2_common/core/account_types.py`. That append must run **after**
+  interface N2's append to the same file (contract §3.7), or the two edits conflict.
+
+Note that `ba2_trade_platform/core/account_types.py` is a wholesale `sys.modules` alias of
+`ba2_common.core.account_types`, so everything interface N2 and this chunk's N3 add is visible
+under both import paths with no shim edit.
+
+**No notional anywhere.** Contract §1.12: fractional means a fractional share QUANTITY
+(`qty=2.5431`), never a dollar amount. No task here emits `OrderType.NOTIONAL_MARKET` or Alpaca's
+`notional=` request field, and N3 adds a test that pins that for the whole module.
+
+---
+
+### Task 84: `AlpacaAccount._get_market_hours_impl()` — the broker's own clock, degrading to the shared calendar
+
+The wizard only submits while the market is open, and right now nothing in the account path knows
+whether it is. Alpaca publishes the answer directly: `TradingClient.get_clock()`
+(`venv/lib/python3.12/site-packages/alpaca/trading/client.py:422`) returns
+`Clock(timestamp, is_open, next_open, next_close)` (`alpaca/trading/models.py:348-362` — all four
+fields REQUIRED and non-Optional), and `self.client` already exists at `AlpacaAccount.py:137`.
+
+Three things this task has to get right, none of them obvious.
+
+**This is an override of `_get_market_hours_impl`, not of `get_market_hours`.** Contract §1.4 makes
+`get_market_hours(self, *, now=None)` a concrete caching template method on
+`ReadOnlyAccountInterface` that calls `self._get_market_hours_impl(now)` inside a
+`try/except Exception`. Overriding `get_market_hours` here and then calling
+`super().get_market_hours()` on the failure path — which is how this task was first written — is an
+infinite loop: super's template calls the impl, the impl is this class's, and it calls the template
+again. The failure path is `super()._get_market_hours_impl(now)`.
+
+**The current session's OPEN is not on the clock, and is not worth a second HTTP call.**
+While the market is open, `clock.next_open` is *tomorrow's* 09:30 — reporting that as this session's
+open would be a lie in the one state where the operator most wants the truth. Contract §1.5 settles
+it: `open_at` is `clock.next_open` **only when the market is closed** (where `open_at == next_open`
+is exactly the §1.1 invariant), and stays `None` while it is open. `/calendar` is not read at all.
+
+**`Clock` timestamps are exchange time and `Calendar.open` / `.close` are NAIVE Eastern.**
+`Calendar.__init__` (`alpaca/trading/models.py:374-388`) builds them with
+`datetime.strptime(data["date"] + " " + data["open"], "%Y-%m-%d %H:%M")` — no tzinfo at all. This
+task no longer reads `Calendar`, but `_to_market_utc` stays the boundary normaliser for every
+datetime entering `MarketHours` (contract §1.13), and it must keep using `pytz.localize()`:
+`zoneinfo` plus `replace(tzinfo=...)` attaches LMT (-4:56) and is 56 minutes out.
+
+`Clock.is_open` is the REGULAR session only. Alpaca will still *accept* a DAY market order outside
+it and queue it to the next open (`alpaca/trading/enums.py:237`), so this seam answers "submit
+now?", not "can I trade at all?" — which is precisely user decision D4 (regular session only,
+because market orders are rejected outside it) and why `MarketHours.status` exists to explain a
+block. Alpaca's `Clock` publishes no status word, so this adapter leaves `status=None`.
+
+**Caching, boundary expiry and `clear_market_hours_cache()` are provided by
+`ReadOnlyAccountInterface.get_market_hours()`** (contract §3.3). This class defines no
+`_MARKET_HOURS_CACHE_TTL`, no `_market_hours_cache`, no `_session_open_utc` and no
+`is_market_open()`. The interface's cache expires at `min(now + 60s, result.next_transition)` and
+never caches an `UNAVAILABLE` answer, which is the same invariant this task used to implement
+locally — one copy, on the interface. There is also no module-level `_utcnow()` seam: `now=` on
+`get_market_hours()` is the canonical clock-freeze seam (contract §2), and `_get_market_hours_impl`
+must use the `now` it is handed rather than reading a clock of its own.
+
+**Files:**
+- Modify: `ba2_trade_platform/modules/accounts/AlpacaAccount.py`
+- Test: `tests/test_alpaca_market_hours.py`
+
+- [ ] **Step 1: Write the failing test**
+
+Create `tests/test_alpaca_market_hours.py`:
+
+```python
+"""AlpacaAccount market hours, against a mocked TradingClient.
+
+No live call anywhere: `client` is a MagicMock returning real alpaca-py `Clock`
+model objects.
+
+Every test FREEZES time explicitly -- either by passing `now` straight into
+`_get_market_hours_impl(now)`, or through the interface's `get_market_hours(now=...)`
+keyword, which contract 1.4 makes THE clock-freeze seam. None of these assertions may
+depend on when the suite happens to run: a market-hours test that passes at 11:00 and
+fails at 17:00 is worse than no test.
+
+Timezone care: `Clock` timestamps come back tz-aware from the API, but a naive Eastern
+datetime must never be read as UTC (that is four or five hours early depending on the
+season), so `_to_market_utc` is pinned in both EDT and EST.
+
+Structural care: AlpacaAccount overrides `_get_market_hours_impl` ONLY. Overriding
+`get_market_hours` and then calling `super().get_market_hours()` on the failure path is
+infinite recursion, because the interface's template method calls the impl. Two tests
+below exist purely to keep that from coming back.
+"""
+import sys
+import threading
+from datetime import datetime, timezone
+from unittest.mock import MagicMock
+
+import pytz
+
+from alpaca.trading.models import Clock
+
+from ba2_common.core.interfaces.ReadOnlyAccountInterface import ReadOnlyAccountInterface
+from ba2_trade_platform.core.account_types import (
+    MARKET_HOURS_SOURCE_BROKER, MARKET_HOURS_SOURCE_FALLBACK,
+    MARKET_HOURS_SOURCE_UNAVAILABLE, MarketHours,
+)
+from ba2_trade_platform.modules.accounts.AlpacaAccount import AlpacaAccount
+
+AA = sys.modules[AlpacaAccount.__module__]
+_ET = pytz.timezone("America/New_York")
+
+
+def _et(year, month, day, hour, minute):
+    """A tz-aware Eastern datetime, the way Alpaca's clock publishes them."""
+    return _ET.localize(datetime(year, month, day, hour, minute))
+
+
+def _utc(year, month, day, hour, minute, second=0):
+    return datetime(year, month, day, hour, minute, second, tzinfo=timezone.utc)
+
+
+def _bare_account():
+    """An AlpacaAccount without __init__ (no credentials, no broker connection).
+
+    Deliberately does NOT set a market-hours cache attribute: the cache lives on
+    ReadOnlyAccountInterface as a CLASS attribute with a default (contract 1.4), so a
+    bare instance already has it and the first real answer shadows it per instance.
+    """
+    acct = object.__new__(AlpacaAccount)
+    acct.id = 1
+    acct.client = MagicMock()
+    acct._authentication_error = None
+    acct._balance_cache_lock = threading.Lock()
+    return acct
+
+
+def _open_clock():
+    """11:00 ET on Thursday 2026-08-20, mid-session."""
+    return Clock(timestamp=_et(2026, 8, 20, 11, 0), is_open=True,
+                 next_open=_et(2026, 8, 21, 9, 30), next_close=_et(2026, 8, 20, 16, 0))
+
+
+def _closed_clock():
+    """18:00 ET on Thursday 2026-08-20, after the bell."""
+    return Clock(timestamp=_et(2026, 8, 20, 18, 0), is_open=False,
+                 next_open=_et(2026, 8, 21, 9, 30), next_close=_et(2026, 8, 21, 16, 0))
+
+
+def _capture_warnings(monkeypatch):
+    """Collect logger.warning text without caplog.
+
+    ba2_trade_platform/logger.py:24 sets propagate = False so caplog never sees these
+    records, and tests/test_penny_gainers_fix.py:53 replaces the logger module with a
+    MagicMock under full-suite collection. Assert on the call itself -- the idiom from
+    tests/test_alpaca_fractional_submission.py:220-222.
+    """
+    messages = []
+    monkeypatch.setattr(AA.logger, "warning", lambda msg, *a, **k: messages.append(str(msg)))
+    return messages
+
+
+# ---------------------------------------------------------------------------
+# Naive Eastern -> UTC
+# ---------------------------------------------------------------------------
+
+def test_a_naive_broker_datetime_is_read_as_eastern_not_as_utc():
+    """Alpaca publishes some datetimes naive (Calendar.open, models.py:374-388).
+    Reading 09:30 as UTC would put the open four or five hours early."""
+    assert AA._to_market_utc(datetime(2026, 8, 20, 9, 30)) == _utc(2026, 8, 20, 13, 30)  # EDT
+    assert AA._to_market_utc(datetime(2026, 1, 5, 9, 30)) == _utc(2026, 1, 5, 14, 30)    # EST
+
+
+def test_an_already_aware_datetime_is_converted_not_relabelled():
+    assert AA._to_market_utc(_et(2026, 8, 20, 16, 0)) == _utc(2026, 8, 20, 20, 0)
+
+
+# ---------------------------------------------------------------------------
+# Shape: exactly one override point
+# ---------------------------------------------------------------------------
+
+def test_alpaca_overrides_the_impl_hook_and_nothing_else():
+    """The whole anti-recursion invariant, as a structural assertion.
+
+    `get_market_hours` is the interface's caching template and it CALLS
+    `_get_market_hours_impl`. An adapter that overrides the template and then delegates
+    to `super().get_market_hours()` never terminates. Caching, boundary expiry and
+    `clear_market_hours_cache()` all belong to ReadOnlyAccountInterface (contract 3.3),
+    so none of those names may reappear here either.
+    """
+    assert "_get_market_hours_impl" in AlpacaAccount.__dict__
+    for banned in ("get_market_hours", "is_market_open", "_market_hours_cache",
+                   "_MARKET_HOURS_CACHE_TTL", "_session_open_utc",
+                   "clear_market_hours_cache"):
+        assert banned not in AlpacaAccount.__dict__, banned
+
+
+def test_the_public_seam_routes_to_the_alpaca_override():
+    acct = _bare_account()
+    acct.client.get_clock.return_value = _open_clock()
+
+    hours = acct.get_market_hours(now=_utc(2026, 8, 20, 15, 0))
+
+    assert hours.source == MARKET_HOURS_SOURCE_BROKER
+    assert acct.is_market_open(now=_utc(2026, 8, 20, 15, 0)) is True
+
+
+# ---------------------------------------------------------------------------
+# Open / closed, straight off the broker clock
+# ---------------------------------------------------------------------------
+
+def test_market_open_reports_the_current_close_and_leaves_the_session_open_none():
+    """Clock does not publish the CURRENT session's open -- while the market is open
+    `next_open` is tomorrow's 09:30. Contract 1.5: leave `open_at` None rather than
+    substituting a confidently wrong answer, and never spend a /calendar call on it."""
+    acct = _bare_account()
+    acct.client.get_clock.return_value = _open_clock()
+
+    hours = acct._get_market_hours_impl(_utc(2026, 8, 20, 15, 0))
+
+    assert hours.is_open is True
+    assert hours.source == MARKET_HOURS_SOURCE_BROKER
+    assert hours.open_at is None
+    assert hours.close_at == _utc(2026, 8, 20, 20, 0)
+    assert hours.next_open == _utc(2026, 8, 21, 13, 30)
+    assert hours.next_close == _utc(2026, 8, 20, 20, 0)
+    # as_of is the BROKER's own timestamp, normalised -- 11:00 ET is 15:00Z.
+    assert hours.as_of == _utc(2026, 8, 20, 15, 0)
+    # Alpaca's Clock publishes no status word; `status` is display-only and stays None.
+    assert hours.status is None
+    assert hours.is_known is True
+    assert hours.next_transition == _utc(2026, 8, 20, 20, 0)
+
+
+def test_market_closed_reports_the_next_session_on_both_pairs():
+    """Contract 1.1: when is_open is False, open_at == next_open and
+    close_at == next_close -- the bounds describe the NEXT session."""
+    acct = _bare_account()
+    acct.client.get_clock.return_value = _closed_clock()
+
+    hours = acct._get_market_hours_impl(_utc(2026, 8, 20, 22, 0))
+
+    assert hours.is_open is False
+    assert hours.source == MARKET_HOURS_SOURCE_BROKER
+    assert hours.open_at == _utc(2026, 8, 21, 13, 30)
+    assert hours.close_at == _utc(2026, 8, 21, 20, 0)
+    assert hours.open_at == hours.next_open
+    assert hours.close_at == hours.next_close
+
+
+def test_an_early_close_day_comes_straight_off_the_clock():
+    """2026-11-27 is the day after Thanksgiving: the session ends at 13:00 EST. The
+    broker's own clock already knows; no calendar lookup and no hardcoded 13:00."""
+    acct = _bare_account()
+    acct.client.get_clock.return_value = Clock(
+        timestamp=_et(2026, 11, 27, 10, 0), is_open=True,
+        next_open=_et(2026, 11, 30, 9, 30), next_close=_et(2026, 11, 27, 13, 0))
+
+    hours = acct._get_market_hours_impl(_utc(2026, 11, 27, 15, 0))
+
+    assert hours.source == MARKET_HOURS_SOURCE_BROKER
+    assert hours.close_at == _utc(2026, 11, 27, 18, 0)     # 13:00 EST
+    assert hours.next_open == _utc(2026, 11, 30, 14, 30)   # 09:30 EST
+
+
+def test_the_calendar_endpoint_is_never_called():
+    """/calendar and the _session_open_utc helper that used it are gone (contract 3.3);
+    the shared offline calendar in ba2_common.core.market_calendar owns session times."""
+    acct = _bare_account()
+    acct.client.get_clock.return_value = _open_clock()
+
+    acct._get_market_hours_impl(_utc(2026, 8, 20, 15, 0))
+
+    acct.client.get_calendar.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Failure -> super's offline calendar, LOUDLY, and without recursing
+# ---------------------------------------------------------------------------
+
+def test_a_clock_failure_degrades_to_the_shared_offline_calendar_and_says_why(monkeypatch):
+    """A broker hiccup must not raise out of a page render, and it must not silently
+    masquerade as the broker's own answer -- `source` says which one you got and
+    `detail` says why you got it."""
+    warnings = _capture_warnings(monkeypatch)
+    acct = _bare_account()
+    acct.client.get_clock.side_effect = RuntimeError("connection reset")
+
+    hours = acct._get_market_hours_impl(_utc(2026, 8, 20, 15, 0))
+
+    assert hours.source == MARKET_HOURS_SOURCE_FALLBACK
+    assert hours.is_open is True      # 11:00 ET on a Thursday, per the offline calendar
+    assert "connection reset" in (hours.detail or "")
+    assert any("connection reset" in w and "fall back" in w for w in warnings), warnings
+
+
+def test_an_empty_clock_response_degrades_too(monkeypatch):
+    warnings = _capture_warnings(monkeypatch)
+    acct = _bare_account()
+    acct.client.get_clock.return_value = None
+
+    hours = acct._get_market_hours_impl(_utc(2026, 8, 20, 15, 0))
+
+    assert hours.source == MARKET_HOURS_SOURCE_FALLBACK
+    assert "returned nothing" in (hours.detail or "")
+    assert any("returned nothing" in w for w in warnings), warnings
+
+
+def test_an_unauthenticated_account_degrades_without_touching_the_client(monkeypatch):
+    _capture_warnings(monkeypatch)
+    acct = _bare_account()
+    acct.client = None
+    acct._authentication_error = "missing api_key"
+
+    hours = acct._get_market_hours_impl(_utc(2026, 8, 20, 15, 0))
+
+    assert hours.source == MARKET_HOURS_SOURCE_FALLBACK
+    assert "not authenticated" in (hours.detail or "")
+
+
+def test_the_fallback_keeps_supers_source_so_a_dead_calendar_reads_unavailable(monkeypatch):
+    """Contract 1.5: the failure path is dataclasses.replace(super()..., detail=...) and
+    must NOT force source=fallback. Broker dead AND calendar dead is UNAVAILABLE --
+    is_open False so the submit gate fails closed, is_known False so the UI says
+    "unknown" rather than "closed". That is the get_positions() None-vs-[] lesson."""
+    _capture_warnings(monkeypatch)
+    frozen = _utc(2026, 8, 20, 15, 0)
+    monkeypatch.setattr(
+        ReadOnlyAccountInterface, "_get_market_hours_impl",
+        lambda self, now: MarketHours(is_open=False,
+                                      source=MARKET_HOURS_SOURCE_UNAVAILABLE,
+                                      as_of=now, detail="pandas_market_calendars missing"))
+    acct = _bare_account()
+    acct.client.get_clock.side_effect = RuntimeError("connection reset")
+
+    hours = acct._get_market_hours_impl(frozen)
+
+    assert hours.source == MARKET_HOURS_SOURCE_UNAVAILABLE
+    assert hours.is_known is False
+    assert hours.is_open is False
+    assert "connection reset" in (hours.detail or "")
+
+
+def test_a_broker_failure_does_not_recurse_through_the_public_seam(monkeypatch):
+    """The regression this whole rename exists for. With the override on
+    `get_market_hours` and `super().get_market_hours()` on the failure path, this call
+    raised RecursionError instead of returning a fallback."""
+    _capture_warnings(monkeypatch)
+    acct = _bare_account()
+    acct.client.get_clock.side_effect = RuntimeError("connection reset")
+
+    hours = acct.get_market_hours(now=_utc(2026, 8, 20, 15, 0))
+
+    assert hours.source == MARKET_HOURS_SOURCE_FALLBACK
+    assert acct.is_market_open(now=_utc(2026, 8, 20, 15, 0)) is True
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `venv/bin/python -m pytest tests/test_alpaca_market_hours.py -v`
+
+Expected: FAIL — 11 failed, 2 passed. The first two tests fail with
+`AttributeError: module 'ba2_trade_platform.modules.accounts.AlpacaAccount' has no attribute '_to_market_utc'`;
+`test_alpaca_overrides_the_impl_hook_and_nothing_else` fails with
+`AssertionError: assert '_get_market_hours_impl' in mappingproxy({...})`; and every test that calls
+`acct._get_market_hours_impl(...)` reaches the INHERITED default, so
+`test_market_open_reports_the_current_close_and_leaves_the_session_open_none` fails with
+`AssertionError: assert 'fallback' == 'broker'`.
+
+Two pass already and are deliberate guards rather than new behaviour:
+`test_the_calendar_endpoint_is_never_called` (nothing calls `get_calendar` yet — it pins that Step 3
+does not reintroduce it) and `test_a_broker_failure_does_not_recurse_through_the_public_seam`
+(there is no override to recurse into yet — it is the regression guard for after Step 3, and it is
+the test that would have caught the original `super().get_market_hours()` bug).
+
+- [ ] **Step 3: Write minimal implementation**
+
+Three edits in `ba2_trade_platform/modules/accounts/AlpacaAccount.py`.
+
+(a) Replace lines 17-21, which read exactly:
+
+```python
+from ...core.account_types import (
+    AccountSnapshot, CashTransfer, MarginInfo,
+    CASH_TRANSFER_DEPOSIT, CASH_TRANSFER_WITHDRAWAL, CASH_TRANSFER_DIVIDEND,
+    MARGIN_SOURCE_ASSET,
+)
+```
+
+with:
+
+```python
+from ...core.account_types import (
+    AccountSnapshot, CashTransfer, MarginInfo, MarketHours,
+    CASH_TRANSFER_DEPOSIT, CASH_TRANSFER_WITHDRAWAL, CASH_TRANSFER_DIVIDEND,
+    MARGIN_SOURCE_ASSET, MARKET_HOURS_SOURCE_BROKER,
+)
+import pytz
+```
+
+(`replace` is already imported from `dataclasses` at line 6, and `datetime` at line 7.)
+
+(b) Insert immediately after the `_DIVIDEND_KEY_PREFIX = "DIV:"` line (line 29), i.e. directly
+above `def alpaca_api_retry(func):`:
+
+```python
+# Every datetime Alpaca's trading API publishes is EXCHANGE time. `Clock` arrives
+# tz-aware; other endpoints do not -- `Calendar.open` / `.close` arrive NAIVE, built by
+# Calendar.__init__ with strptime("%Y-%m-%d %H:%M") (alpaca/trading/models.py:374-388).
+_MARKET_TZ = pytz.timezone("America/New_York")
+
+
+def _to_market_utc(value: Optional[datetime]) -> Optional[datetime]:
+    """Normalise a broker datetime to tz-aware UTC.
+
+    A NAIVE value is read as EASTERN -- not as UTC, and not as this machine's local
+    time. pytz's localize() (never `replace(tzinfo=...)`) is what picks EST vs EDT
+    correctly; `replace` would attach pytz's LMT offset and be 56 minutes out. This is
+    why this adapter keeps pytz rather than moving to the packages' `NY_TZ` ZoneInfo.
+
+    Idempotent on an already-aware value, and this is the tz-awareness boundary
+    contract 1.13 requires: `MarketHours.__post_init__` raises ValueError on any naive
+    datetime, so nothing may reach it unnormalised.
+    """
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return _MARKET_TZ.localize(value).astimezone(pytz.utc)
+    return value.astimezone(pytz.utc)
+```
+
+(c) Insert this method immediately above
+`    def get_symbol_margin_info(self, symbols: List[str]) -> Dict[str, MarginInfo]:` (line 1808).
+
+That position matters for sequencing: Task 85 replaces the contiguous
+`get_symbol_margin_info` … `clear_margin_info_cache` block wholesale, so this method must sit
+ABOVE that block, not inside it.
+
+```python
+    def _get_market_hours_impl(self, now: datetime) -> MarketHours:
+        """US equity regular-session hours, from Alpaca's own clock.
+
+        THE OVERRIDE POINT, per contract 1.4. `get_market_hours()` and
+        `is_market_open()` are concrete, cached and effectively final on
+        ReadOnlyAccountInterface and are NOT overridden here. Caching, session-boundary
+        expiry and `clear_market_hours_cache()` are provided by
+        `ReadOnlyAccountInterface.get_market_hours()`, which also wraps this method in
+        try/except so it can never raise out of a page render.
+
+        `now` is injected and tz-aware, and this method MUST use it rather than reading
+        a clock of its own -- `now=` is the canonical clock-freeze seam for tests.
+
+        `TradingClient.get_clock()` (alpaca/trading/client.py:422) returns
+        `Clock(timestamp, is_open, next_open, next_close)` (models.py:348-362); all four
+        fields are REQUIRED and non-Optional, so they are read directly rather than
+        through `getattr(..., None)` defaults.
+
+        `is_open` covers the REGULAR session only -- user decision D4. Alpaca still
+        ACCEPTS a DAY market order outside it and queues it to the next open
+        (alpaca/trading/enums.py:237), so this seam answers "submit now?", not "can I
+        trade at all?".
+
+        Field mapping (contract 1.5). `close_at` is always `clock.next_close`. `open_at`
+        is `clock.next_open` ONLY while the market is closed -- where contract 1.1
+        requires `open_at == next_open` -- and is None while it is open, because `Clock`
+        does not publish the CURRENT session's start and `next_open` is then TOMORROW's
+        09:30. It is left None, never guessed and never fetched from /calendar.
+        `status` stays None: Alpaca publishes no status word, and `status` is a
+        display-only echo of the broker's own vocabulary.
+
+        On ANY failure (no credentials, clock error, empty response) this returns
+        `dataclasses.replace(super()._get_market_hours_impl(now), detail=<reason>)` --
+        the shared offline NYSE calendar in `ba2_common.core.market_calendar`, tagged
+        with why we are on it. It calls `super()._get_market_hours_impl(now)` and NOT
+        `super().get_market_hours()`: the latter is the template method that calls this
+        one, i.e. infinite recursion. The source is deliberately NOT forced to
+        `fallback` -- when the offline calendar is dead too, super returns
+        `MARKET_HOURS_SOURCE_UNAVAILABLE` and that honest "we do not know" must survive
+        to the UI instead of being flattened into "closed".
+        """
+        if not self._check_authentication():
+            logger.warning(
+                f"[Account {self.id}] Not authenticated — market hours fall back to the "
+                f"shared offline NYSE calendar")
+            return replace(super()._get_market_hours_impl(now),
+                           detail="Alpaca account is not authenticated")
+
+        try:
+            clock = self.client.get_clock()
+        except Exception as e:
+            logger.warning(
+                f"[Account {self.id}] get_clock() failed: {e} — market hours fall back to "
+                f"the shared offline NYSE calendar")
+            return replace(super()._get_market_hours_impl(now),
+                           detail=f"Alpaca get_clock() failed: {e}")
+        if clock is None:
+            logger.warning(
+                f"[Account {self.id}] get_clock() returned nothing — market hours fall back "
+                f"to the shared offline NYSE calendar")
+            return replace(super()._get_market_hours_impl(now),
+                           detail="Alpaca get_clock() returned nothing")
+
+        is_open = bool(clock.is_open)
+        next_open = _to_market_utc(clock.next_open)
+        next_close = _to_market_utc(clock.next_close)
+        hours = MarketHours(
+            is_open=is_open,
+            open_at=(None if is_open else next_open),
+            close_at=next_close,
+            next_open=next_open,
+            next_close=next_close,
+            source=MARKET_HOURS_SOURCE_BROKER,
+            status=None,
+            detail=None,
+            as_of=_to_market_utc(clock.timestamp),
+        )
+        logger.debug(
+            f"[Account {self.id}] Market {'OPEN' if is_open else 'CLOSED'} per Alpaca "
+            f"(open_at={hours.open_at}, close_at={hours.close_at})")
+        return hours
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `venv/bin/python -m pytest tests/test_alpaca_market_hours.py -v`
+
+Expected: PASS — 13 passed.
+
+Then confirm nothing else on the Alpaca surface moved:
+
+Run: `venv/bin/python -m pytest tests/test_alpaca_account_snapshot.py tests/test_alpaca_margin_info.py tests/test_alpaca_fractional_submission.py tests/test_alpaca_order_type_mapping.py -v`
+
+Expected: PASS — no failures.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add ba2_trade_platform/modules/accounts/AlpacaAccount.py tests/test_alpaca_market_hours.py
+git commit -m "feat(alpaca): _get_market_hours_impl from get_clock, degrading to the shared NYSE calendar"
+```
+
+---
+
+### Task 85: One bulk `/assets` call instead of 2,500 — a shared asset cache and a fractionability read
+
+`AlpacaAccount.py:126-127` and `:1810-1812` both assert *"Alpaca has NO bulk asset endpoint --
+TradingClient.get_asset() takes one symbol"*. **That is false.**
+`venv/lib/python3.12/site-packages/alpaca/trading/client.py:376-397`:
+
+```python
+    def get_all_assets(
+        self, filter: Optional[GetAssetsRequest] = None
+    ) -> Union[List[Asset], RawData]:
+        ...
+        response = self.get(f"/assets", params)
+        ...
+        return TypeAdapter(List[Asset]).validate_python(response)
+```
+
+with `GetAssetsRequest(status, asset_class, exchange, attributes)`
+(`alpaca/trading/requests.py:127-141`). The user's own probe already calls it
+(`test_files/check_fractionable.py:47-49`).
+
+The cost of the false comment is real: the book is ~2,500 symbols, so a cold cache costs 2,500
+sequential `get_asset()` calls at `AlpacaAccount.py:1878`, and Alpaca's trading API allows 200
+requests per minute — roughly twelve minutes of wall clock inside a wizard load. One
+`get_all_assets` call returns the whole active US-equity universe instead.
+
+This task introduces ONE asset cache shared by both consumers — `get_symbol_margin_info` (which
+already reads `fractionable` at `:1906`) and the new `get_fractionability()` — so the two can never
+disagree about a symbol. Small baskets keep using `get_asset()`: pulling ~11k rows to answer three
+questions is the worse trade, and `_BULK_ASSET_FETCH_THRESHOLD = 20` makes that explicit. That
+threshold is an unmeasured engineering judgement — 20 misses is roughly where one ~11k-row response
+stops being more expensive than N round trips at 200 req/min — and it is an implementation note,
+not an open question; both threshold tests below pin the behaviour either side of it.
+
+This is NOT duplication of TastyTrade's `_quantity_precision_cache` (contract §3.4). Different
+brokers, different endpoints, genuinely different data; both stay in their own adapter and neither
+is lifted to the interface.
+
+**Two eligibility rules this task fixes, both instances of the same antipattern.**
+
+`Asset.fractionable` is a REQUIRED, non-Optional `bool`
+(`venv/lib/python3.12/site-packages/alpaca/trading/models.py:65`). The landed code reads it as
+`bool(getattr(asset, 'fractionable', False))` (`:1906`) — a default that silently turns "the
+attribute was missing" into "the broker said no". Write `bool(asset.fractionable)`. This codebase
+has been bitten by exactly this collapse before: `get_positions()` returning `None` versus `[]` is
+documented three times in these two files for the same reason.
+
+And `MarginInfo.fractionable` is now `Optional[bool] = None` (contract §1.2, widened by interface
+N2) — the ONE canonical cross-chunk carrier of per-symbol fractional eligibility. `True` = the
+broker says yes, `False` = the broker says no, `None` = the broker did not say. A symbol Alpaca
+cannot describe is still OMITTED from the returned dict entirely, and the engine reads that absence
+as unknown (`m is None or m.fractionable is None` ⇒ `REASON_FRACTIONAL_UNKNOWN`). **Any `MarginInfo`
+built here for a symbol without an `Asset` behind it must pass `fractionable=None`, never `False`.**
+
+`get_fractionability()` stays `Dict[str, bool]` with omission meaning unknown, and stays
+**Alpaca-internal** (contract §1.10): `Asset.fractionable` is non-Optional, so a present entry is
+always a real broker answer, and no other chunk calls this method.
+
+Two coupling rules fall out and are pinned by tests. An EXPIRED margin entry must also drop the
+`Asset` it was derived from, otherwise expiry rebuilds the identical `MarginInfo` from the identical
+stale facts and means nothing. And `clear_margin_info_cache()` — the Refresh button's path — must
+drop the assets too, for the same reason.
+
+**Files:**
+- Modify: `ba2_trade_platform/modules/accounts/AlpacaAccount.py`
+- Modify: `tests/test_alpaca_margin_info.py` (its `_bare_account` helper needs the new cache attr)
+- Test: `tests/test_alpaca_asset_cache.py`
+
+- [ ] **Step 1: Write the failing test**
+
+Create `tests/test_alpaca_asset_cache.py`:
+
+```python
+"""The shared Alpaca Asset cache: one bulk /assets call, not one call per symbol.
+
+Alpaca DOES have a bulk asset endpoint -- get_all_assets + GetAssetsRequest
+(alpaca/trading/client.py:376-397). The book is ~2,500 symbols and the trading API
+allows 200 req/min, so the per-symbol path on a cold cache is ~12 minutes of wall
+clock inside a page load.
+
+Small baskets deliberately keep the per-symbol endpoint: fetching ~11,000 rows to
+answer three questions is the worse trade.
+
+MarginInfo.fractionable is TRI-STATE (contract 1.2): True / False / None, where None
+means the broker did not say. Every assertion below uses `is True` / `is False` /
+`is None` rather than truthiness, because that distinction is the point.
+
+No live call: client is a MagicMock returning real alpaca-py Asset objects.
+"""
+from unittest.mock import MagicMock
+from uuid import uuid4
+
+from alpaca.trading.enums import (
+    AccountStatus, AssetClass, AssetExchange, AssetStatus,
+)
+from alpaca.trading.models import Asset, TradeAccount
+
+from ba2_trade_platform.modules.accounts.AlpacaAccount import AlpacaAccount
+
+
+def _asset(symbol="AAPL", fractionable=True, marginable=True):
+    # `asset_class` is exposed under the pydantic alias "class", so it must be passed
+    # via a dict splat -- Asset(asset_class=...) raises "Field required".
+    return Asset(
+        id=uuid4(), **{"class": AssetClass.US_EQUITY}, exchange=AssetExchange.NASDAQ,
+        symbol=symbol, status=AssetStatus.ACTIVE, tradable=True, marginable=marginable,
+        shortable=True, easy_to_borrow=True, fractionable=fractionable,
+        min_order_size=0.001, min_trade_increment=0.001,
+        maintenance_margin_requirement=30.0)
+
+
+def _bare_account():
+    acct = object.__new__(AlpacaAccount)
+    acct.id = 1
+    acct.client = MagicMock()
+    acct._authentication_error = None
+    acct._asset_cache = {}
+    acct._margin_info_cache = {}
+    acct.client.get_account.return_value = TradeAccount(
+        id=uuid4(), account_number="PA1", status=AccountStatus.ACTIVE,
+        cash="1000", equity="25000", buying_power="50000", multiplier="2")
+    acct.client.get_asset.side_effect = lambda s: _asset(s)
+    return acct
+
+
+def _basket(n):
+    return [f"SYM{i:04d}" for i in range(n)]
+
+
+# ---------------------------------------------------------------------------
+# Bulk vs per-symbol
+# ---------------------------------------------------------------------------
+
+def test_a_large_basket_costs_one_bulk_call_not_one_call_per_symbol():
+    """The whole point: 60 symbols must not be 60 HTTP round trips."""
+    acct = _bare_account()
+    symbols = _basket(60)
+    acct.client.get_all_assets.return_value = [_asset(s) for s in symbols]
+
+    assets = acct._load_assets(symbols)
+
+    assert acct.client.get_all_assets.call_count == 1
+    assert acct.client.get_asset.call_count == 0
+    assert sorted(assets) == sorted(symbols)
+
+
+def test_the_bulk_request_asks_for_active_us_equities():
+    acct = _bare_account()
+    symbols = _basket(60)
+    acct.client.get_all_assets.return_value = [_asset(s) for s in symbols]
+
+    acct._load_assets(symbols)
+
+    request = acct.client.get_all_assets.call_args[0][0]
+    assert request.asset_class == AssetClass.US_EQUITY
+    assert request.status == AssetStatus.ACTIVE
+
+
+def test_a_small_basket_still_uses_the_per_symbol_endpoint():
+    """Pulling ~11,000 rows to answer three questions is the worse trade."""
+    acct = _bare_account()
+
+    acct._load_assets(["AAPL", "MSFT", "NVDA"])
+
+    acct.client.get_all_assets.assert_not_called()
+    assert acct.client.get_asset.call_count == 3
+
+
+def test_symbols_absent_from_the_bulk_response_fall_back_to_the_per_symbol_endpoint():
+    """The bulk list is ACTIVE US EQUITY only. Anything else -- an OTC name, a
+    delisted ticker -- has to be asked for individually or it silently vanishes."""
+    acct = _bare_account()
+    symbols = _basket(60)
+    acct.client.get_all_assets.return_value = [_asset(s) for s in symbols[:-1]]
+
+    assets = acct._load_assets(symbols)
+
+    assert acct.client.get_asset.call_count == 1
+    assert acct.client.get_asset.call_args[0][0] == symbols[-1]
+    assert sorted(assets) == sorted(symbols)
+
+
+def test_a_bulk_failure_degrades_to_per_symbol_fetches_rather_than_returning_nothing():
+    acct = _bare_account()
+    symbols = _basket(60)
+    acct.client.get_all_assets.side_effect = RuntimeError("503 unavailable")
+
+    assets = acct._load_assets(symbols)
+
+    assert acct.client.get_asset.call_count == 60
+    assert sorted(assets) == sorted(symbols)
+
+
+# ---------------------------------------------------------------------------
+# get_fractionability -- Alpaca-internal, omission means unknown
+# ---------------------------------------------------------------------------
+
+def test_get_fractionability_reports_the_brokers_own_flag():
+    acct = _bare_account()
+    acct.client.get_asset.side_effect = lambda s: _asset(s, fractionable=(s == "AAPL"))
+
+    flags = acct.get_fractionability(["AAPL", "BRK.A"])
+
+    assert flags == {"AAPL": True, "BRK.A": False}
+
+
+def test_a_symbol_the_broker_cannot_describe_is_omitted_never_defaulted():
+    """Omission means "unknown". Defaulting it to False would make the dry run promise
+    a whole-share rounding that will not happen; defaulting it to True would promise a
+    fraction the broker then rejects."""
+    acct = _bare_account()
+
+    def _get(symbol):
+        if symbol == "NOSUCH":
+            raise RuntimeError("404 asset not found")
+        return _asset(symbol)
+
+    acct.client.get_asset.side_effect = _get
+
+    flags = acct.get_fractionability(["AAPL", "NOSUCH"])
+
+    assert flags == {"AAPL": True}
+    assert "NOSUCH" not in flags
+
+
+def test_symbols_are_normalised_before_the_lookup():
+    acct = _bare_account()
+
+    assert acct.get_fractionability(["  aapl "]) == {"AAPL": True}
+    assert acct.client.get_asset.call_args[0][0] == "AAPL"
+
+
+def test_blank_entries_never_become_a_lookup():
+    acct = _bare_account()
+
+    acct.get_fractionability(["AAPL", "", None])
+
+    assert acct.client.get_asset.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# The tri-state carrier: MarginInfo.fractionable
+# ---------------------------------------------------------------------------
+
+def test_margin_info_reports_a_broker_no_as_a_real_false():
+    """Asset.fractionable is a REQUIRED non-Optional bool (models.py:65), so a present
+    Asset always carries a real answer. False here means the broker said no -- it is
+    NOT the same state as "we could not ask", which is an omitted row."""
+    acct = _bare_account()
+    acct.client.get_asset.side_effect = lambda s: _asset(s, fractionable=False)
+
+    info = acct.get_symbol_margin_info(["BRK.A"])["BRK.A"]
+
+    assert info.fractionable is False
+
+
+def test_a_symbol_the_broker_cannot_describe_has_no_margin_info_row():
+    """The tri-state's third value reaches the engine as an ABSENT key, which
+    compute_allocation reads as `m is None` -> REASON_FRACTIONAL_UNKNOWN. Fabricating
+    a MarginInfo with fractionable=False here would turn "did not answer" into "said
+    no" -- the exact failure this feature exists to kill."""
+    acct = _bare_account()
+    acct.client.get_asset.side_effect = RuntimeError("404 asset not found")
+
+    assert acct.get_symbol_margin_info(["NOSUCH"]) == {}
+
+
+# ---------------------------------------------------------------------------
+# Caching and invalidation
+# ---------------------------------------------------------------------------
+
+def test_a_second_request_for_the_same_symbol_hits_the_cache():
+    acct = _bare_account()
+
+    acct.get_fractionability(["AAPL"])
+    acct.get_fractionability(["AAPL"])
+
+    assert acct.client.get_asset.call_count == 1
+
+
+def test_margin_info_and_fractionability_share_one_asset_fetch():
+    """Two consumers of the same fact must not cost two round trips -- and cannot
+    disagree about a symbol, because there is only one cached Asset behind both."""
+    acct = _bare_account()
+
+    acct.get_fractionability(["AAPL"])
+    info = acct.get_symbol_margin_info(["AAPL"])["AAPL"]
+
+    assert acct.client.get_asset.call_count == 1
+    assert info.fractionable is True
+
+
+def test_an_expired_asset_entry_is_refetched():
+    acct = _bare_account()
+    acct.get_fractionability(["AAPL"])
+    stamp, cached = acct._asset_cache["AAPL"]
+    acct._asset_cache["AAPL"] = (stamp - AlpacaAccount._ASSET_CACHE_TTL - 1, cached)
+    acct.client.get_asset.side_effect = lambda s: _asset(s, fractionable=False)
+
+    assert acct.get_fractionability(["AAPL"]) == {"AAPL": False}
+    assert acct.client.get_asset.call_count == 2
+
+
+def test_clear_asset_cache_forces_the_next_call_to_refetch():
+    acct = _bare_account()
+    acct.get_fractionability(["AAPL"])
+
+    acct.clear_asset_cache()
+    acct.get_fractionability(["AAPL"])
+
+    assert acct.client.get_asset.call_count == 2
+    assert acct._asset_cache != {}     # repopulated, not just emptied
+
+
+def test_clearing_the_margin_cache_also_drops_the_assets_behind_it():
+    """Refresh means "re-ask the broker". Keeping the Asset would rebuild the identical
+    MarginInfo from the identical stale facts and make the button a no-op."""
+    acct = _bare_account()
+    acct.get_symbol_margin_info(["AAPL"])
+
+    acct.clear_margin_info_cache()
+
+    assert acct._asset_cache == {}
+
+
+def test_an_expired_margin_entry_also_drops_the_asset_it_was_derived_from():
+    acct = _bare_account()
+    acct.get_symbol_margin_info(["AAPL"])
+    stamp, cached = acct._margin_info_cache["AAPL"]
+    acct._margin_info_cache["AAPL"] = (
+        stamp - AlpacaAccount._MARGIN_INFO_CACHE_TTL - 1, cached)
+    acct.client.get_asset.side_effect = lambda s: _asset(s, marginable=False)
+
+    info = acct.get_symbol_margin_info(["AAPL"])["AAPL"]
+
+    assert acct.client.get_asset.call_count == 2
+    assert info.marginable is False
+
+
+def test_an_unauthenticated_account_loads_no_assets():
+    acct = _bare_account()
+    acct.client = None
+    acct._authentication_error = "missing api_key"
+
+    assert acct._load_assets(["AAPL"]) == {}
+    assert acct.get_fractionability(["AAPL"]) == {}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `venv/bin/python -m pytest tests/test_alpaca_asset_cache.py -v`
+
+Expected: FAIL — every test errors with
+`AttributeError: 'AlpacaAccount' object has no attribute '_load_assets'` /
+`... has no attribute 'get_fractionability'` /
+`... has no attribute 'clear_asset_cache'`, and
+`test_an_expired_asset_entry_is_refetched` fails first at
+`AttributeError: type object 'AlpacaAccount' has no attribute '_ASSET_CACHE_TTL'`.
+`test_margin_info_reports_a_broker_no_as_a_real_false` passes already (the landed
+`bool(getattr(...))` happens to give the right answer when the attribute IS present) — it is a
+regression pin for the `getattr` default removal, not a new behaviour.
+
+- [ ] **Step 3: Write minimal implementation**
+
+Six edits.
+
+(a) In `ba2_trade_platform/modules/accounts/AlpacaAccount.py`, replace line 3, which reads
+exactly:
+
+```python
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, OrderClass, PositionIntent
+```
+
+with:
+
+```python
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, OrderClass, PositionIntent, AssetClass, AssetStatus
+from alpaca.trading.models import Asset
+```
+
+(b) Replace line 2, which reads exactly:
+
+```python
+from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest, LimitOrderRequest, StopOrderRequest, StopLimitOrderRequest, ReplaceOrderRequest, TakeProfitRequest, StopLossRequest, OptionLegRequest
+```
+
+with:
+
+```python
+from alpaca.trading.requests import GetOrdersRequest, MarketOrderRequest, LimitOrderRequest, StopOrderRequest, StopLimitOrderRequest, ReplaceOrderRequest, TakeProfitRequest, StopLossRequest, OptionLegRequest, GetAssetsRequest
+```
+
+(c) Replace lines 85-87, which read exactly:
+
+```python
+    # Lifetime of one _margin_info_cache entry. A CLASS attribute so that a bare
+    # instance built with object.__new__ (the test idiom) still has it.
+    _MARGIN_INFO_CACHE_TTL = 24 * 60 * 60
+```
+
+with:
+
+```python
+    # Lifetime of one _margin_info_cache entry. A CLASS attribute so that a bare
+    # instance built with object.__new__ (the test idiom) still has it.
+    _MARGIN_INFO_CACHE_TTL = 24 * 60 * 60
+
+    # Lifetime of one _asset_cache entry. Deliberately the SAME as the margin TTL:
+    # the margin entry is a pure derivation of the Asset, so two different lifetimes
+    # would let a "fresh" derived entry outlive the facts it was derived from.
+    _ASSET_CACHE_TTL = 24 * 60 * 60
+
+    # Cache misses at or above which one bulk /assets call beats N per-symbol calls.
+    # get_all_assets returns the whole active US-equity universe (~11k rows), so it is
+    # the wrong tool for three symbols and the only tool for two thousand. 20 is an
+    # engineering judgement, not a measurement: at Alpaca's 200 req/min trading-API
+    # limit, 20 sequential lookups is about where one large response stops costing
+    # more than N round trips.
+    _BULK_ASSET_FETCH_THRESHOLD = 20
+```
+
+(d) Replace lines 125-137, which read exactly:
+
+```python
+        # Per-symbol margin metadata cache, {symbol: (fetched_at, MarginInfo)}.
+        # Alpaca has NO bulk asset endpoint, so get_symbol_margin_info() costs one
+        # get_asset() HTTP call per symbol not already cached, and the allocation page
+        # asks for the same basket on every refresh.
+        #
+        # The entries EXPIRE after _MARGIN_INFO_CACHE_TTL. The ASSET facts do not change
+        # intraday, but get_account_instance_from_id() hands out the same account object
+        # for the whole PROCESS lifetime, and on a server up for weeks Alpaca does revoke
+        # marginability / fractionability on individual names -- a frozen marginable=True
+        # understates bp_cost. clear_margin_info_cache() drops them on demand for an
+        # explicit user Refresh. bp_factor is re-derived on every hit (the multiplier
+        # moves between 1/2/4 far more often than the asset facts do).
+        self._margin_info_cache: Dict[str, Tuple[float, MarginInfo]] = {}
+```
+
+with:
+
+```python
+        # RAW Asset facts, {symbol: (fetched_at, Asset)} -- the single fetch behind BOTH
+        # get_symbol_margin_info() and get_fractionability(), so the two consumers of
+        # `Asset.fractionable` can never disagree about a symbol.
+        #
+        # A cold basket of ~2,500 symbols is served by ONE get_all_assets() call
+        # (alpaca/trading/client.py:376) rather than 2,500 get_asset() calls, which at
+        # Alpaca's 200 req/min trading-API limit is ~12 minutes inside a page load.
+        # Small baskets stay on the per-symbol endpoint -- see _BULK_ASSET_FETCH_THRESHOLD.
+        self._asset_cache: Dict[str, Tuple[float, Asset]] = {}
+
+        # Per-symbol margin metadata cache, {symbol: (fetched_at, MarginInfo)} -- the
+        # DERIVED view, kept separately because a precheck-sourced entry
+        # (MARGIN_SOURCE_PRECHECK) has no Asset behind it at all.
+        #
+        # The entries EXPIRE after _MARGIN_INFO_CACHE_TTL. The ASSET facts do not change
+        # intraday, but get_account_instance_from_id() hands out the same account object
+        # for the whole PROCESS lifetime, and on a server up for weeks Alpaca does revoke
+        # marginability / fractionability on individual names -- a frozen marginable=True
+        # understates bp_cost. clear_margin_info_cache() drops them on demand for an
+        # explicit user Refresh. bp_factor is re-derived on every hit (the multiplier
+        # moves between 1/2/4 far more often than the asset facts do).
+        self._margin_info_cache: Dict[str, Tuple[float, MarginInfo]] = {}
+```
+
+(e) Replace the contiguous block that runs from
+`    def get_symbol_margin_info(self, symbols: List[str]) -> Dict[str, MarginInfo]:`
+down to and including
+`        logger.debug(f"[Account {self.id}] Cleared {count} cached symbol margin entries")`
+— i.e. the whole of `get_symbol_margin_info` plus the whole of `clear_margin_info_cache`, which are
+adjacent (lines 1808-1928 before Task 84, shifted down by the lines N1 inserted above them).
+`_get_market_hours_impl` (Task 84) sits immediately ABOVE this block and is NOT part of the
+replacement; `_safe_float` sits immediately below it and is likewise untouched. Replace with:
+
+```python
+    @alpaca_api_retry
+    def _fetch_all_assets(self) -> List[Asset]:
+        """The whole ACTIVE US-equity universe in ONE /assets call (~11k rows).
+
+        Alpaca DOES have a bulk asset endpoint: `TradingClient.get_all_assets`
+        (alpaca/trading/client.py:376-397) with `GetAssetsRequest`
+        (alpaca/trading/requests.py:127-141). The comment that used to sit in this file
+        claiming otherwise is what made a cold basket cost one HTTP call per symbol.
+
+        Decorated with @alpaca_api_retry because it is ONE request whose 429 is worth
+        waiting out. The per-symbol path in _load_assets deliberately is NOT: it swallows
+        each symbol's exception so one bad ticker never aborts the basket, so the
+        decorator would never see anything to retry there.
+        """
+        return self.client.get_all_assets(
+            GetAssetsRequest(asset_class=AssetClass.US_EQUITY, status=AssetStatus.ACTIVE))
+
+    def _load_assets(self, symbols: List[str]) -> Dict[str, Asset]:
+        """Raw `Asset` rows for `symbols`, cached, bulk-fetched when that is cheaper.
+
+        Args:
+            symbols: symbols to describe; blanks are dropped and duplicates collapsed.
+
+        Returns:
+            Dict[str, Asset]: keyed by NORMALISED symbol (.strip().upper()). A symbol the
+            broker cannot describe is OMITTED, never defaulted -- one symbol's failure
+            never aborts the basket.
+        """
+        if not self._check_authentication():
+            return {}
+
+        now = time.time()
+        cache = self._asset_cache
+        out: Dict[str, Asset] = {}
+        missing: List[str] = []
+        seen = set()
+        for raw_symbol in symbols:
+            symbol = (raw_symbol or '').strip().upper()
+            if not symbol or symbol in seen:
+                continue
+            seen.add(symbol)
+            entry = cache.get(symbol)
+            if entry is not None and (now - entry[0]) >= self._ASSET_CACHE_TTL:
+                logger.debug(f"[Account {self.id}] Asset facts for {symbol} expired; refetching")
+                entry = None
+            if entry is not None:
+                out[symbol] = entry[1]
+            else:
+                missing.append(symbol)
+
+        if not missing:
+            return out
+
+        if len(missing) >= self._BULK_ASSET_FETCH_THRESHOLD:
+            try:
+                universe = self._fetch_all_assets()
+            except Exception as e:
+                logger.warning(
+                    f"[Account {self.id}] Bulk /assets fetch failed ({e}); falling back to "
+                    f"{len(missing)} per-symbol lookups")
+                universe = None
+            if universe is not None:
+                wanted = set(missing)
+                resolved = 0
+                for asset in universe:
+                    sym = (getattr(asset, 'symbol', '') or '').strip().upper()
+                    if sym in wanted:
+                        cache[sym] = (now, asset)
+                        out[sym] = asset
+                        resolved += 1
+                logger.debug(
+                    f"[Account {self.id}] Bulk /assets resolved {resolved}/{len(missing)} "
+                    f"requested symbols in one call")
+                missing = [s for s in missing if s not in out]
+                if missing:
+                    # The bulk list is ACTIVE US EQUITY only, so anything else has to be
+                    # asked for individually or it silently vanishes from the basket.
+                    logger.warning(
+                        f"[Account {self.id}] {len(missing)} symbol(s) absent from the active "
+                        f"US-equity universe; asking per symbol: {', '.join(missing[:10])}")
+
+        for symbol in missing:
+            try:
+                asset = self.client.get_asset(symbol)
+            except Exception as e:
+                logger.warning(f"[Account {self.id}] get_asset({symbol}) failed: {e}")
+                continue
+            if asset is None:
+                logger.warning(f"[Account {self.id}] get_asset({symbol}) returned nothing")
+                continue
+            cache[symbol] = (now, asset)
+            out[symbol] = asset
+
+        return out
+
+    def get_fractionability(self, symbols: List[str]) -> Dict[str, bool]:
+        """Which of these symbols Alpaca will trade in fractional quantities.
+
+        ALPACA-INTERNAL (contract 1.10). Nothing outside this class calls it; the
+        cross-broker eligibility channel is `MarginInfo.fractionable`, which this
+        adapter populates in get_symbol_margin_info() below.
+
+        Reads `Asset.fractionable` (alpaca/trading/models.py:65 -- REQUIRED, non-Optional)
+        through the shared asset cache, so this costs nothing extra when
+        get_symbol_margin_info() has already run for the same basket. Because the field
+        is non-Optional, a PRESENT entry in the returned dict is always a real broker
+        answer -- which is why a plain `Dict[str, bool]` is honest here.
+
+        Args:
+            symbols: symbols to describe; blanks dropped, duplicates collapsed.
+
+        Returns:
+            Dict[str, bool]: keyed by normalised symbol. A symbol the broker cannot
+            describe is OMITTED, and the caller MUST treat that absence as UNKNOWN
+            rather than as False -- a fabricated False makes the dry run promise a
+            whole-share rounding that will not happen, and a fabricated True promises a
+            fraction the broker then refuses.
+        """
+        return {symbol: bool(asset.fractionable)
+                for symbol, asset in self._load_assets(symbols).items()}
+
+    def get_symbol_margin_info(self, symbols: List[str]) -> Dict[str, MarginInfo]:
+        """Per-symbol margin / fractionability metadata for buying-power sizing.
+
+        The `Asset` rows come from _load_assets(), which serves a cold basket with ONE
+        bulk /assets call and a warm one from cache -- so passing the whole basket at
+        once is both allowed and much cheaper than symbol-by-symbol calls.
+
+        Alpaca's Asset exposes no INITIAL margin field, only
+        maintenance_margin_requirement (a percentage, e.g. 30.0), so the initial
+        rate is DERIVED from three facts:
+
+          * marginable -> 0.5 (Reg-T), otherwise 1.0;
+          * but only where the ACCOUNT can borrow: at multiplier 1 (cash /
+            limited-margin, or a margin account under $2,000 equity)
+            buying_power == cash, so the rate is 1.0 for every symbol;
+          * floored by maintenance_margin_requirement / 100 -- an initial
+            requirement below the maintenance requirement is not a thing.
+
+        The maintenance number is also reported separately as
+        maintenance_margin_rate. Then bp_factor = initial_rate * account
+        multiplier -- 1.0 for an ordinary marginable symbol and 2.0 for a
+        non-marginable one in a 2:1 account, and 1.0 for everything at 1x.
+
+        The multiplier is read from get_account_info() (ONE get_account() call),
+        not from get_account_snapshot(), which would add a get_account_configurations()
+        round-trip for a fractional flag this method does not use. It is read
+        fresh on every call and re-applied to cached entries, because Alpaca
+        moves an account between 1/2/4 and this process is long-lived; only the
+        Asset facts, which do not change intraday, are actually cached.
+
+        `MarginInfo.fractionable` is TRI-STATE, Optional[bool] (contract 1.2), and is
+        the ONE cross-chunk carrier of per-symbol fractional eligibility.
+        `Asset.fractionable` is a REQUIRED non-Optional bool, so where there IS an
+        Asset the answer is a real True/False and is written as `bool(asset.fractionable)`
+        -- NEVER `bool(getattr(asset, 'fractionable', False))`, whose default silently
+        turns "the attribute was missing" into "the broker said no". Any MarginInfo ever
+        built here WITHOUT an Asset behind it (a future precheck-sourced entry) must pass
+        `fractionable=None`.
+
+        A symbol the broker cannot describe is OMITTED, never defaulted here --
+        the caller falls back to the conservative bp_factor = account multiplier, and
+        the allocation engine reads the absent key as `m is None`, i.e. unknown
+        eligibility. One symbol's failure never aborts the batch.
+        """
+        if not self._check_authentication():
+            return {}
+
+        info = self.get_account_info()
+        multiplier = self._safe_float(getattr(info, 'multiplier', None)) if info is not None else None
+        if multiplier is None:
+            logger.warning(f"[Account {self.id}] No account multiplier -- cannot size bp_factor")
+            return {}
+
+        cache = self._margin_info_cache
+        now = time.time()
+        out: Dict[str, MarginInfo] = {}
+        needs_asset: List[str] = []
+        pending = set()
+        for raw_symbol in symbols:
+            symbol = (raw_symbol or '').strip().upper()
+            if not symbol:
+                continue
+
+            entry = cache.get(symbol)
+            if entry is not None and (now - entry[0]) >= self._MARGIN_INFO_CACHE_TTL:
+                logger.debug(f"[Account {self.id}] Margin info for {symbol} expired; refetching")
+                entry = None
+                # Drop the Asset it was derived from as well. The whole point of the
+                # expiry is to re-ask the broker; a still-fresh cached Asset would rebuild
+                # the identical MarginInfo from the identical stale facts.
+                self._asset_cache.pop(symbol, None)
+            if entry is not None:
+                fetched_at, cached = entry
+                # Only the Asset facts are cached; bp_factor is re-derived from the
+                # multiplier read on THIS call. The None guard keeps an entry from a
+                # future non-asset source (a precheck, whose bp_factor the broker
+                # measured and which carries no initial rate to multiply) out of the
+                # REPRICING -- the entry is still returned as-is.
+                rate = cached.initial_margin_rate
+                if rate is not None and cached.bp_factor != rate * multiplier:
+                    cached = replace(cached, bp_factor=rate * multiplier)
+                    cache[symbol] = (fetched_at, cached)
+                out[symbol] = cached
+                continue
+
+            if symbol not in pending:
+                pending.add(symbol)
+                needs_asset.append(symbol)
+
+        assets = self._load_assets(needs_asset) if needs_asset else {}
+        for symbol in needs_asset:
+            asset = assets.get(symbol)
+            if asset is None:
+                # _load_assets already logged why. OMITTED, never defaulted -- and
+                # never fabricated as fractionable=False, which would tell the engine
+                # the broker said no when it said nothing at all.
+                continue
+
+            marginable = bool(getattr(asset, 'marginable', False))
+            maint = self._safe_float(getattr(asset, 'maintenance_margin_requirement', None))
+            # `Asset.marginable` describes the SECURITY, not the ACCOUNT. Alpaca reports
+            # multiplier="1" for cash and limited-margin accounts (and drops a margin
+            # account to 1 while its equity is under $2,000); there buying_power == cash
+            # and nothing is lent, so Reg-T's 50% does not apply to ANY symbol and the
+            # effective initial requirement is 100%. Without the multiplier gate the
+            # asset-sourced answer was HALF the conservative fallback that is used when
+            # the lookup fails -- more information made the plan bigger, which is the
+            # wrong direction for a feasibility guard.
+            initial_rate = 0.5 if (marginable and multiplier > 1.0) else 1.0
+            # An initial requirement below the MAINTENANCE requirement is not a thing:
+            # Alpaca publishes 30/50/75/100 per name and still flags hard-to-margin
+            # names marginable, so the derived Reg-T rate is floored by it.
+            if maint is not None:
+                initial_rate = max(initial_rate, maint / 100.0)
+            margin_info = MarginInfo(
+                symbol=symbol,
+                bp_factor=initial_rate * multiplier,
+                marginable=marginable,
+                # REQUIRED non-Optional field (models.py:65) -- read it directly. A
+                # getattr default here is the failure-becomes-False antipattern.
+                fractionable=bool(asset.fractionable),
+                min_order_size=self._safe_float(getattr(asset, 'min_order_size', None)),
+                min_trade_increment=self._safe_float(getattr(asset, 'min_trade_increment', None)),
+                initial_margin_rate=initial_rate,
+                maintenance_margin_rate=(maint / 100.0) if maint is not None else None,
+                source=MARGIN_SOURCE_ASSET,
+            )
+            cache[symbol] = (now, margin_info)
+            out[symbol] = margin_info
+
+        return out
+
+    def clear_asset_cache(self) -> None:
+        """Drop every cached raw Asset so the next lookup refetches.
+
+        The EXPLICIT path behind a user's Refresh, for the facts under both
+        get_symbol_margin_info() and get_fractionability(). Alpaca revokes marginability
+        and fractionability on individual names and this account object lives for the
+        whole process, so the automatic _ASSET_CACHE_TTL expiry is not always soon enough.
+        """
+        count = len(self._asset_cache)
+        self._asset_cache = {}
+        logger.debug(f"[Account {self.id}] Cleared {count} cached symbol asset entries")
+
+    def clear_margin_info_cache(self) -> None:
+        """Drop every cached per-symbol margin fact so the next call refetches.
+
+        The cache expires on its own after _MARGIN_INFO_CACHE_TTL; this is the
+        EXPLICIT path, for a user who hits Refresh because they know the broker
+        changed something (Alpaca revokes marginability / fractionability on
+        individual names, and this account object lives for the whole process).
+
+        Clears the raw Asset cache TOO: the margin entries are a pure derivation of
+        those assets, so keeping them would rebuild the identical MarginInfo from the
+        identical stale facts and make this a no-op.
+        """
+        count = len(self._margin_info_cache)
+        self._margin_info_cache = {}
+        logger.debug(f"[Account {self.id}] Cleared {count} cached symbol margin entries")
+        self.clear_asset_cache()
+```
+
+(f) In `tests/test_alpaca_margin_info.py`, the bare account now needs the new cache attribute.
+Replace the line that reads exactly:
+
+```python
+    acct._margin_info_cache = {}
+```
+
+with:
+
+```python
+    acct._margin_info_cache = {}
+    acct._asset_cache = {}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `venv/bin/python -m pytest tests/test_alpaca_asset_cache.py tests/test_alpaca_margin_info.py -v`
+
+Expected: PASS — 18 passed in `test_alpaca_asset_cache.py` and all existing
+`test_alpaca_margin_info.py` tests still green, in particular
+`test_a_cache_entry_older_than_the_ttl_is_refetched` (which only passes because an expired margin
+entry now also drops its Asset) and `test_clear_margin_info_cache_forces_the_next_call_to_refetch`
+(which only passes because `clear_margin_info_cache` now clears both).
+
+Then:
+
+Run: `venv/bin/python -m pytest tests/test_alpaca_account_snapshot.py tests/test_alpaca_fractional_submission.py tests/test_alpaca_options.py tests/test_alpaca_order_type_mapping.py tests/test_alpaca_market_hours.py -v`
+
+Expected: PASS — no failures.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add ba2_trade_platform/modules/accounts/AlpacaAccount.py tests/test_alpaca_asset_cache.py tests/test_alpaca_margin_info.py
+git commit -m "perf(alpaca): one bulk /assets call behind a shared asset cache; tri-state fractionable"
+```
+
+---
+
+### Task 86: Fractionability pre-check — the dry run and the submission share one rule
+
+The fractional block inside `_submit_order_impl` (lines 1042-1108 in the file as it stands before
+Tasks N1 and N2 shift them; find it by the
+`# ---- Fractional quantities ----` comment) is the submission-time fractional gate. Its
+non-plain-market branch reads:
+
+```python
+                else:
+                    whole_shares = float(math.floor(quantity_value))
+                    as_complex = (" order submitted as a complex (BRACKET/OTO) order"
+                                  if use_complex_order else " order")
+                    reason = (f"fractional qty {quantity_value} is not accepted by Alpaca on a "
+                              f"{order_type_value}{as_complex}")
+                    if whole_shares <= 0:
+                        logger.warning(
+                            f"Order {trading_order.id} ({trading_order.symbol}) skipped: "
+                            f"{reason}, and flooring leaves 0 whole shares — nothing submitted"
+                        )
+                        self._record_fractional_adjustment(
+                            trading_order, None,
+                            f"skipped: {reason}; flooring leaves 0 whole shares")
+                        return None
+```
+
+That behaviour is correct and stays exactly as it is: flooring under-fills rather than overspending,
+and a floor to zero is a SKIP (CANCELED with a reason, never ERROR — nothing was rejected and
+nothing is wrong with the account). What is wrong is *when the operator finds out*. Today the first
+sign that a 0.4-share row will never trade is a CANCELED row after the wizard has already reported
+success. With ~25% of the book non-fractionable, that is not an edge case.
+
+This task makes the outcome visible BEFORE anything is sent, without duplicating or contradicting
+the rule — by moving the DECISION (and only the decision; every log line and every DB write stays
+put) into one pure function that both callers use:
+
+* `_submit_order_impl` calls it and performs the side effects exactly as before;
+* `preview_fractional_submission()` calls it with one extra fact the submission path does not have —
+  the broker's per-symbol `Asset.fractionable` flag from Task 85 — and returns the answer.
+
+Because it is literally the same function, a dry run cannot promise 2.5 shares and then have the
+submission quietly cancel the row.
+
+**Both are ALPACA-INTERNAL** (contract §1.10 and §2). `FractionalPreview`,
+`plan_fractional_submission`, `preview_fractional_submission` and the `FRACTIONAL_OUTCOME_*`
+constants are used only inside `AlpacaAccount`. No interface default is added for
+`preview_fractional_submission`, no `getattr` guard is needed anywhere, and no other chunk calls it:
+the cross-broker eligibility channel is `MarginInfo.fractionable`. A second parallel eligibility
+channel is exactly the duplication the contract exists to remove.
+
+The submission path deliberately passes `fractionable=None` (unknown), which the planner treats
+exactly as today's code did — a fractional plain-market order goes out as sized. Sizing is not
+re-derived on the hot order path: the allocation engine already gated it on `MarginInfo.fractionable`
+and a per-submission asset round-trip would buy nothing. The preview reports
+`FRACTIONAL_OUTCOME_REJECTED` for the one case the submission cannot defend against — a fraction
+reaching the wire on a symbol Alpaca does not make fractionable — which is not a contradiction but a
+truthful prediction of the broker's rejection.
+
+`FractionalPreview.fractionable` is `Optional[bool] = None` and keeps its own copy of the flag
+because it is a submission-planning object, not a cross-boundary carrier (contract §3.5).
+
+**Sequencing:** the `account_types.py` append below must run AFTER interface N2's append to the same
+file (contract §3.7 / §4 step 7), or the two edits conflict.
+
+**No notional.** Contract §1.12: fractional means a fractional share QUANTITY. This task emits no
+`notional=` request field and no `OrderType.NOTIONAL_MARKET`, and pins that with a source-scan test.
+
+**Files:**
+- Modify: `packages/common/ba2_common/core/account_types.py`
+- Modify: `ba2_trade_platform/modules/accounts/AlpacaAccount.py`
+- Test: `packages/common/tests/test_account_types.py`
+- Test: `tests/test_alpaca_fractional_precheck.py`
+
+- [ ] **Step 1: Write the failing test**
+
+Append to `packages/common/tests/test_account_types.py`:
+
+```python
+# ---------------------------------------------------------------------------
+# FractionalPreview -- what the broker would actually do with a quantity
+# ---------------------------------------------------------------------------
+
+def test_fractional_preview_defaults_say_nothing_was_adjusted():
+    from ba2_common.core.account_types import (
+        FRACTIONAL_OUTCOME_WHOLE, FractionalPreview,
+    )
+
+    preview = FractionalPreview(symbol="AAPL", requested_quantity=3.0,
+                                submit_quantity=3.0, outcome=FRACTIONAL_OUTCOME_WHOLE)
+
+    assert preview.requires_day_tif is False
+    assert preview.fractionable is None      # unknown, NOT "not fractionable"
+    assert preview.reason is None
+    assert preview.constraint is None
+    assert preview.is_adjusted is False
+    assert preview.will_submit is True
+
+
+def test_a_skipped_preview_submits_nothing_and_counts_as_adjusted():
+    from ba2_common.core.account_types import (
+        FRACTIONAL_OUTCOME_SKIPPED, FractionalPreview,
+    )
+
+    preview = FractionalPreview(symbol="AAPL", requested_quantity=0.4,
+                                submit_quantity=None,
+                                outcome=FRACTIONAL_OUTCOME_SKIPPED,
+                                reason="skipped: ...; flooring leaves 0 whole shares")
+
+    assert preview.will_submit is False
+    assert preview.is_adjusted is True
+
+
+def test_the_preview_is_frozen_so_a_shared_row_cannot_be_edited_in_place():
+    import dataclasses
+    import pytest
+    from ba2_common.core.account_types import (
+        FRACTIONAL_OUTCOME_KEPT, FractionalPreview,
+    )
+
+    preview = FractionalPreview(symbol="AAPL", requested_quantity=2.5,
+                                submit_quantity=2.5, outcome=FRACTIONAL_OUTCOME_KEPT)
+
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        preview.submit_quantity = 2.0
+```
+
+Create `tests/test_alpaca_fractional_precheck.py`:
+
+```python
+"""The fractionability pre-check: what the dry run promises is what submission does.
+
+`plan_fractional_submission()` is the ONE place the rule lives. `_submit_order_impl`
+calls it and performs the side effects; `preview_fractional_submission()` calls it with
+the broker's per-symbol `Asset.fractionable` flag and returns the answer. The last two
+tests here pin that the two agree, which is the whole point -- at ~25% non-fractionable
+symbols, a wizard that reports success and then leaves CANCELED rows behind is worse
+than one that refuses to size the row.
+
+All three symbols are ALPACA-INTERNAL (contract 1.10). Nothing outside AlpacaAccount
+imports them; the cross-broker eligibility channel is MarginInfo.fractionable.
+
+No live call: client is a MagicMock returning real alpaca-py Asset objects.
+"""
+import threading
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+from uuid import uuid4
+
+from alpaca.trading.enums import AssetClass, AssetExchange, AssetStatus
+from alpaca.trading.models import Asset
+
+from ba2_trade_platform.core.account_types import (
+    FRACTIONAL_OUTCOME_FLOORED, FRACTIONAL_OUTCOME_KEPT, FRACTIONAL_OUTCOME_REJECTED,
+    FRACTIONAL_OUTCOME_SKIPPED, FRACTIONAL_OUTCOME_WHOLE,
+)
+from ba2_trade_platform.core.db import add_instance, get_instance
+from ba2_trade_platform.core.models import TradingOrder
+from ba2_trade_platform.core.types import OrderDirection, OrderStatus, OrderType
+from ba2_trade_platform.modules.accounts.AlpacaAccount import (
+    AlpacaAccount, plan_fractional_submission,
+)
+
+
+def _asset(symbol="AAPL", fractionable=True):
+    return Asset(
+        id=uuid4(), **{"class": AssetClass.US_EQUITY}, exchange=AssetExchange.NASDAQ,
+        symbol=symbol, status=AssetStatus.ACTIVE, tradable=True, marginable=True,
+        shortable=True, easy_to_borrow=True, fractionable=fractionable,
+        min_order_size=0.001, min_trade_increment=0.001,
+        maintenance_margin_requirement=30.0)
+
+
+def _alpaca_response(order_id="brk-1", order_type="market"):
+    """SimpleNamespace, not MagicMock: alpaca_order_to_tradingorder reads the response
+    with getattr(..., None) into a pydantic TradingOrder, and a MagicMock attribute
+    would fail validation instead of falling back to None."""
+    return SimpleNamespace(
+        id=order_id, symbol="AAPL", qty="1", side="buy", type=order_type,
+        status="new", time_in_force="day", order_class=None, legs=None,
+        filled_qty="0", filled_avg_price=None, created_at=None,
+        limit_price=None, stop_price=None)
+
+
+def _bare_account(fractionable=True):
+    acct = object.__new__(AlpacaAccount)
+    acct.id = 1
+    acct.client = MagicMock()
+    acct._authentication_error = None
+    acct._asset_cache = {}
+    acct._margin_info_cache = {}
+    acct._balance_cache_lock = threading.Lock()
+    acct._balance_cache_time = 0.0
+    acct.client.get_asset.side_effect = lambda s: _asset(s, fractionable=fractionable)
+    acct.client.submit_order.return_value = _alpaca_response()
+    return acct
+
+
+def _saved_order(**kwargs):
+    defaults = dict(account_id=1, symbol="AAPL", quantity=1.5, side=OrderDirection.BUY,
+                    order_type=OrderType.MARKET, status=OrderStatus.PENDING, good_for=None)
+    defaults.update(kwargs)
+    return get_instance(TradingOrder, add_instance(TradingOrder(**defaults)))
+
+
+# ---------------------------------------------------------------------------
+# The pure rule
+# ---------------------------------------------------------------------------
+
+def test_a_whole_quantity_needs_no_adjustment_at_all():
+    preview = plan_fractional_submission("AAPL", 3.0, "market")
+
+    assert preview.outcome == FRACTIONAL_OUTCOME_WHOLE
+    assert preview.submit_quantity == 3.0
+    assert preview.requires_day_tif is False
+    assert preview.is_adjusted is False
+
+
+def test_a_fractionable_symbol_keeps_its_fraction_on_a_plain_market_order():
+    preview = plan_fractional_submission("AAPL", 2.5, "market", fractionable=True)
+
+    assert preview.outcome == FRACTIONAL_OUTCOME_KEPT
+    assert preview.submit_quantity == 2.5
+    assert preview.requires_day_tif is True     # Alpaca refuses fractional on any other TIF
+    assert preview.is_adjusted is False
+
+
+def test_a_non_fractionable_symbol_is_reported_as_a_broker_rejection():
+    """Alpaca accepts a fraction only where Asset.fractionable is true. Saying so up
+    front is the difference between "size this whole" and an ERROR row after the fact."""
+    preview = plan_fractional_submission("BRK.A", 2.5, "market", fractionable=False)
+
+    assert preview.outcome == FRACTIONAL_OUTCOME_REJECTED
+    assert preview.fractionable is False
+    assert "fractionable" in preview.reason
+    assert "whole shares" in preview.reason
+
+
+def test_an_unknown_fractionability_stays_unknown_rather_than_becoming_ineligible():
+    """Absence of the flag is not evidence of ineligibility -- coercing it to False
+    would make the dry run claim a rounding that never happens."""
+    preview = plan_fractional_submission("AAPL", 2.5, "market", fractionable=None)
+
+    assert preview.outcome == FRACTIONAL_OUTCOME_KEPT
+    assert preview.fractionable is None
+    assert "unknown" in preview.reason
+
+
+def test_a_fraction_on_a_limit_order_is_reported_as_floored_before_submission():
+    preview = plan_fractional_submission("AAPL", 2.5, "buy_limit", fractionable=True)
+
+    assert preview.outcome == FRACTIONAL_OUTCOME_FLOORED
+    assert preview.submit_quantity == 2.0
+    assert preview.is_adjusted is True
+    assert "floored to 2.0 whole shares" in preview.reason
+
+
+def test_a_fraction_that_floors_to_zero_is_reported_as_skipped_not_as_a_silent_cancel():
+    preview = plan_fractional_submission("AAPL", 0.4, "buy_limit", fractionable=True)
+
+    assert preview.outcome == FRACTIONAL_OUTCOME_SKIPPED
+    assert preview.submit_quantity is None
+    assert preview.will_submit is False
+    assert "flooring leaves 0 whole shares" in preview.reason
+
+
+def test_the_order_type_rule_wins_over_fractionability():
+    """A non-fractionable symbol on a LIMIT order is floored, not rejected: the floor
+    happens before anything reaches the wire, so the broker never sees a fraction."""
+    preview = plan_fractional_submission("BRK.A", 2.5, "buy_limit", fractionable=False)
+
+    assert preview.outcome == FRACTIONAL_OUTCOME_FLOORED
+
+
+def test_the_wash_trade_escape_counts_as_a_complex_order():
+    """use_complex_order re-classes a MARKET request as BRACKET/OTO, which Alpaca
+    refuses fractionally just like a limit order."""
+    preview = plan_fractional_submission("AAPL", 2.5, "market", use_complex_order=True,
+                                         fractionable=True)
+
+    assert preview.outcome == FRACTIONAL_OUTCOME_FLOORED
+    assert "BRACKET/OTO" in preview.reason
+
+
+# ---------------------------------------------------------------------------
+# The account-level pre-check
+# ---------------------------------------------------------------------------
+
+def test_the_precheck_reads_the_brokers_own_fractionable_flag():
+    acct = _bare_account(fractionable=False)
+
+    preview = acct.preview_fractional_submission("BRK.A", 2.5)
+
+    assert preview.fractionable is False
+    assert preview.outcome == FRACTIONAL_OUTCOME_REJECTED
+
+
+def test_the_precheck_normalises_the_symbol():
+    acct = _bare_account()
+
+    preview = acct.preview_fractional_submission("  aapl ", 2.5)
+
+    assert preview.symbol == "AAPL"
+    assert acct.client.get_asset.call_args[0][0] == "AAPL"
+
+
+def test_the_precheck_reports_unknown_when_the_asset_lookup_fails():
+    acct = _bare_account()
+    acct.client.get_asset.side_effect = RuntimeError("404 asset not found")
+
+    preview = acct.preview_fractional_submission("NOSUCH", 2.5)
+
+    assert preview.fractionable is None
+    assert preview.outcome == FRACTIONAL_OUTCOME_KEPT
+
+
+def test_the_precheck_accepts_the_core_order_type_enum():
+    acct = _bare_account()
+
+    preview = acct.preview_fractional_submission("AAPL", 2.5, OrderType.BUY_LIMIT)
+
+    assert preview.outcome == FRACTIONAL_OUTCOME_FLOORED
+
+
+# ---------------------------------------------------------------------------
+# Preview and submission cannot drift apart
+# ---------------------------------------------------------------------------
+
+def test_the_preview_predicts_the_exact_quantity_the_submission_sends():
+    acct = _bare_account()
+    acct.client.submit_order.return_value = _alpaca_response(order_type="limit")
+    order = _saved_order(quantity=4.25, order_type=OrderType.SELL_LIMIT,
+                         side=OrderDirection.SELL, limit_price=100.0, good_for='day')
+
+    preview = acct.preview_fractional_submission("AAPL", 4.25, OrderType.SELL_LIMIT)
+    acct._submit_order_impl(order)
+
+    sent_qty = float(acct.client.submit_order.call_args[0][0].qty)
+    assert preview.submit_quantity == 4.0
+    assert sent_qty == preview.submit_quantity
+
+
+def test_the_preview_of_a_skip_matches_the_row_the_submission_actually_cancels():
+    """The failure this whole task exists to prevent: the wizard reporting a 0.4-share
+    buy as submitted, and a CANCELED row appearing afterwards with no warning."""
+    acct = _bare_account()
+    order = _saved_order(quantity=0.4, order_type=OrderType.BUY_LIMIT, limit_price=100.0)
+
+    preview = acct.preview_fractional_submission("AAPL", 0.4, OrderType.BUY_LIMIT)
+    result = acct._submit_order_impl(order)
+
+    assert preview.outcome == FRACTIONAL_OUTCOME_SKIPPED
+    assert preview.will_submit is False
+    acct.client.submit_order.assert_not_called()
+    assert result is None
+    stored = get_instance(TradingOrder, order.id)
+    assert stored.status == OrderStatus.CANCELED
+    # The dry run's sentence and the persisted comment are the SAME string.
+    assert stored.comment == preview.reason
+
+
+# ---------------------------------------------------------------------------
+# No notional, anywhere (contract 1.12)
+# ---------------------------------------------------------------------------
+
+def test_no_alpaca_request_is_ever_built_with_a_notional_field():
+    """Fractional means a fractional share QUANTITY (qty=2.5431), never a dollar
+    amount. Alpaca's requests DO expose a `notional=` field and an OrderType.NOTIONAL
+    family; this module must never reach for either."""
+    import inspect
+    import sys
+
+    source = inspect.getsource(sys.modules[AlpacaAccount.__module__])
+
+    assert "notional=" not in source
+    assert "NOTIONAL" not in source
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `venv/bin/python -m pytest packages/common/tests/test_account_types.py -v -k fractional`
+
+Expected: FAIL — 3 failures, each
+`ImportError: cannot import name 'FractionalPreview' from 'ba2_common.core.account_types'`.
+
+Run: `venv/bin/python -m pytest tests/test_alpaca_fractional_precheck.py -v`
+
+Expected: FAIL — collection error at
+`ImportError: cannot import name 'FRACTIONAL_OUTCOME_FLOORED' from 'ba2_trade_platform.core.account_types'`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+(a) Append to `packages/common/ba2_common/core/account_types.py` (AFTER interface N2's append):
+
+```python
+# What a broker would actually do with a fractional order quantity. PLAIN str, like
+# the CASH_TRANSFER_*, MARGIN_SOURCE_* and MARKET_HOURS_SOURCE_* families above;
+# always use the constant.
+#
+# ALPACA-INTERNAL. These and FractionalPreview below live here only because
+# account_types.py is where this codebase keeps its cross-layer value objects; no
+# non-Alpaca code reads them. The cross-broker per-symbol eligibility carrier is
+# MarginInfo.fractionable.
+FRACTIONAL_OUTCOME_WHOLE = "whole"        # nothing fractional about it
+FRACTIONAL_OUTCOME_KEPT = "kept"          # the fraction reaches the broker as sized
+FRACTIONAL_OUTCOME_FLOORED = "floored"    # floored to whole shares BEFORE submission
+FRACTIONAL_OUTCOME_SKIPPED = "skipped"    # floors to 0: nothing is sent at all
+FRACTIONAL_OUTCOME_REJECTED = "rejected"  # the fraction would reach the broker and be refused
+
+
+@dataclass(frozen=True)
+class FractionalPreview:
+    """What a broker would do with one order quantity, computed BEFORE submitting.
+
+    Exists so the allocation dry run can state the truth about rounding instead of
+    discovering it from a rejection or a silently CANCELED row. Roughly a quarter of a
+    real book is not fractionable, so mixed eligibility is the normal case.
+
+    ``submit_quantity`` is what would actually reach the broker: equal to
+    ``requested_quantity`` for WHOLE and KEPT, the floored share count for FLOORED,
+    ``None`` for SKIPPED (nothing is sent), and the unchanged fraction for REJECTED
+    (it is sent, and refused). It is always a QUANTITY IN SHARES -- there is no
+    dollar-denominated / notional order anywhere in this codebase.
+
+    ``fractionable`` is TRI-STATE, exactly like ``MarginInfo.fractionable``. ``None``
+    means the broker did not say -- never coerce it to ``False``: a fabricated
+    ``False`` makes the dry run promise a whole-share rounding that will not happen,
+    and a fabricated ``True`` promises a fraction the broker then refuses. This is a
+    LOCAL copy of the flag because a preview is a submission-planning object, not a
+    cross-boundary carrier; ``MarginInfo.fractionable`` remains the one flag that
+    crosses module boundaries.
+
+    ``constraint`` is the bare broker rule that was hit ("fractional qty 4.25 is not
+    accepted by Alpaca on a sell_limit order"); ``reason`` is the full sentence shown to
+    the operator and persisted on the order row, and it INCLUDES the constraint.
+
+    FROZEN: previews are handed to the UI and to the submission path; an in-place edit
+    would let one reader change what another was promised.
+    """
+    symbol: str
+    requested_quantity: float
+    submit_quantity: Optional[float]
+    outcome: str
+    requires_day_tif: bool = False
+    fractionable: Optional[bool] = None
+    constraint: Optional[str] = None
+    reason: Optional[str] = None
+
+    @property
+    def will_submit(self) -> bool:
+        """False only when nothing at all reaches the broker (the SKIP case)."""
+        return self.outcome != FRACTIONAL_OUTCOME_SKIPPED
+
+    @property
+    def is_adjusted(self) -> bool:
+        """True when the quantity the caller asked for is not the quantity that trades.
+
+        This is the flag a dry run counts to decide how prominent the rounding warning
+        has to be.
+        """
+        return self.outcome in (FRACTIONAL_OUTCOME_FLOORED, FRACTIONAL_OUTCOME_SKIPPED)
+```
+
+(b) In `ba2_trade_platform/modules/accounts/AlpacaAccount.py`, replace the account-types import
+block (as left by Task 84) which reads exactly:
+
+```python
+from ...core.account_types import (
+    AccountSnapshot, CashTransfer, MarginInfo, MarketHours,
+    CASH_TRANSFER_DEPOSIT, CASH_TRANSFER_WITHDRAWAL, CASH_TRANSFER_DIVIDEND,
+    MARGIN_SOURCE_ASSET, MARKET_HOURS_SOURCE_BROKER,
+)
+```
+
+with:
+
+```python
+from ...core.account_types import (
+    AccountSnapshot, CashTransfer, MarginInfo, MarketHours, FractionalPreview,
+    CASH_TRANSFER_DEPOSIT, CASH_TRANSFER_WITHDRAWAL, CASH_TRANSFER_DIVIDEND,
+    MARGIN_SOURCE_ASSET, MARKET_HOURS_SOURCE_BROKER,
+    FRACTIONAL_OUTCOME_WHOLE, FRACTIONAL_OUTCOME_KEPT, FRACTIONAL_OUTCOME_FLOORED,
+    FRACTIONAL_OUTCOME_SKIPPED, FRACTIONAL_OUTCOME_REJECTED,
+)
+```
+
+(c) Insert this module-level function directly below `_to_market_utc` (added in Task 84) and above
+`def alpaca_api_retry(func):`:
+
+```python
+def plan_fractional_submission(symbol: str, quantity: float, order_type_value: str,
+                               use_complex_order: bool = False,
+                               fractionable: Optional[bool] = None) -> FractionalPreview:
+    """Alpaca's fractional-quantity rule, as a pure function. THE single definition.
+
+    Both callers share it on purpose: `_submit_order_impl` (which then performs the
+    logging and the DB write) and `AlpacaAccount.preview_fractional_submission` (which
+    hands the answer to the allocation dry run). Because it is the same function, the
+    dry run cannot promise 2.5 shares and then have the submission cancel the row.
+
+    ALPACA-INTERNAL. Nothing outside this module calls it.
+
+    The rule, in precedence order -- the same order the submission path applies it:
+
+    1. A whole quantity is nothing to do.
+    2. Every NON plain-market request refuses a fraction outright: limit, stop,
+       stop-limit, and a MARKET order routed through the wash-trade escape, which goes
+       to Alpaca re-classed as BRACKET/OTO. Those are FLOORED before the request is even
+       built -- nothing fractional is ever put on the wire, and flooring under-fills
+       rather than overspending the target. A floor of 0 is a SKIP: nothing is sent,
+       nothing was rejected, and nothing is wrong with the account.
+    3. On a plain market order the fraction stands, and Alpaca then requires DAY -- see
+       requires_day_tif. If the broker does not make this SYMBOL fractionable
+       (`Asset.fractionable`, alpaca/trading/models.py:65) the fraction reaches the wire
+       and is REFUSED; the dry run says so instead of letting an ERROR row explain it
+       afterwards.
+
+    Every quantity here is a QUANTITY IN SHARES. No branch produces a notional /
+    dollar-value order.
+
+    Args:
+        symbol: the instrument, for the human-readable strings.
+        quantity: the quantity as sized (may be fractional).
+        order_type_value: the CORE OrderType value, lower-cased ("market", "buy_limit"...).
+        use_complex_order: the wash-trade escape, which re-classes the request.
+        fractionable: the broker's per-symbol flag; None means UNKNOWN and is treated as
+            permissive, matching what the submission path did before this function
+            existed. Never coerce an unknown to False.
+
+    Returns:
+        FractionalPreview: what would actually happen, including the exact sentence to
+        log, display and persist.
+    """
+    qty = float(quantity or 0.0)
+    if qty == int(qty):
+        return FractionalPreview(symbol=symbol, requested_quantity=qty,
+                                 submit_quantity=qty, outcome=FRACTIONAL_OUTCOME_WHOLE,
+                                 fractionable=fractionable)
+
+    is_plain_market = (order_type_value == CoreOrderType.MARKET.value.lower()
+                       and not use_complex_order)
+    if not is_plain_market:
+        whole_shares = float(math.floor(qty))
+        as_complex = (" order submitted as a complex (BRACKET/OTO) order"
+                      if use_complex_order else " order")
+        constraint = (f"fractional qty {qty} is not accepted by Alpaca on a "
+                      f"{order_type_value}{as_complex}")
+        if whole_shares <= 0:
+            return FractionalPreview(
+                symbol=symbol, requested_quantity=qty, submit_quantity=None,
+                outcome=FRACTIONAL_OUTCOME_SKIPPED, fractionable=fractionable,
+                constraint=constraint,
+                reason=f"skipped: {constraint}; flooring leaves 0 whole shares")
+        return FractionalPreview(
+            symbol=symbol, requested_quantity=qty, submit_quantity=whole_shares,
+            outcome=FRACTIONAL_OUTCOME_FLOORED, fractionable=fractionable,
+            constraint=constraint,
+            reason=f"{constraint}; floored to {whole_shares} whole shares")
+
+    if fractionable is False:
+        constraint = f"Alpaca does not make {symbol} fractionable"
+        return FractionalPreview(
+            symbol=symbol, requested_quantity=qty, submit_quantity=qty,
+            outcome=FRACTIONAL_OUTCOME_REJECTED, requires_day_tif=True,
+            fractionable=False, constraint=constraint,
+            reason=(f"{constraint}; a fractional qty {qty} would be refused by the broker "
+                    f"— size this symbol in whole shares"))
+
+    if fractionable is True:
+        reason = f"fractional qty {qty} is accepted on a plain DAY market order"
+    else:
+        reason = (f"fractional qty {qty} is accepted on a plain DAY market order "
+                  f"(Alpaca's fractionable flag for {symbol} is unknown)")
+    return FractionalPreview(
+        symbol=symbol, requested_quantity=qty, submit_quantity=qty,
+        outcome=FRACTIONAL_OUTCOME_KEPT, requires_day_tif=True,
+        fractionable=fractionable, reason=reason)
+```
+
+(d) Inside `_submit_order_impl`, replace the block from the comment line
+`            # ---- Fractional quantities -----------------------------------------------`
+down to and including
+`                        f"{reason}; floored to {whole_shares} whole shares")`
+(lines 1042-1108 before Tasks N1 and N2 shifted them) — with:
+
+```python
+            # ---- Fractional quantities -----------------------------------------------
+            # THE RULE LIVES IN ONE PLACE: plan_fractional_submission() at module level,
+            # which is the SAME function the allocation dry run reaches through
+            # preview_fractional_submission(). Everything below is side effects --
+            # logging, and writing the adjustment back onto the row -- and no arithmetic,
+            # precisely so that what the dry run promised and what is submitted cannot
+            # drift apart.
+            #
+            # `fractionable` is deliberately NOT looked up here. The allocation engine
+            # already gated sizing on the broker's per-symbol flag
+            # (MarginInfo.fractionable), and an asset round-trip on the hot order path
+            # would buy nothing. Passing it as unknown reproduces exactly the behaviour
+            # this method had before the rule was extracted.
+            quantity_value = float(trading_order.quantity or 0.0)
+            fractional = plan_fractional_submission(
+                trading_order.symbol, quantity_value, order_type_value,
+                use_complex_order=use_complex_order)
+
+            if fractional.outcome == FRACTIONAL_OUTCOME_SKIPPED:
+                logger.warning(
+                    f"Order {trading_order.id} ({trading_order.symbol}) skipped: "
+                    f"{fractional.constraint}, and flooring leaves 0 whole shares — "
+                    f"nothing submitted"
+                )
+                self._record_fractional_adjustment(
+                    trading_order, None, fractional.reason)
+                return None
+            if fractional.outcome == FRACTIONAL_OUTCOME_FLOORED:
+                whole_shares = fractional.submit_quantity
+                # Name the CONSEQUENCE, not just the arithmetic: a protective leg
+                # floored off a fractional parent covers less than the position, and
+                # this line is the only place that ever gets said.
+                logger.warning(
+                    f"Order {trading_order.id} ({trading_order.symbol}): "
+                    f"{fractional.constraint}; submitting {whole_shares} whole shares "
+                    f"instead of {quantity_value}; {quantity_value - whole_shares:g} "
+                    f"shares of the position are left uncovered"
+                )
+                trading_order.quantity = whole_shares
+                self._record_fractional_adjustment(
+                    trading_order, whole_shares, fractional.reason)
+            elif fractional.requires_day_tif and time_in_force != TimeInForce.DAY:
+                logger.info(
+                    f"Order {trading_order.id} ({trading_order.symbol}) has fractional "
+                    f"qty={quantity_value}; forcing time_in_force DAY (was "
+                    f"{time_in_force.value}) — Alpaca rejects fractional on any other TIF"
+                )
+                time_in_force = TimeInForce.DAY
+```
+
+(e) Insert this method immediately above `def clear_asset_cache(self) -> None:` (added in Task 85):
+
+```python
+    def preview_fractional_submission(self, symbol: str, quantity: float,
+                                      order_type: Any = CoreOrderType.MARKET,
+                                      use_complex_order: bool = False) -> FractionalPreview:
+        """What Alpaca would do with this quantity, computed BEFORE anything is sent.
+
+        ALPACA-INTERNAL (contract 1.10). There is no interface default for this and no
+        `getattr` guard is needed anywhere, because nothing outside AlpacaAccount calls
+        it. The cross-broker eligibility channel is `MarginInfo.fractionable`.
+
+        The allocation dry run's window into the submission path: it calls the same
+        `plan_fractional_submission()` that `_submit_order_impl` calls, so a row the
+        wizard reports as "2.5 shares" cannot come back as a silently CANCELED order.
+
+        The one fact this knows and the submission path does not is the broker's
+        per-symbol `Asset.fractionable` flag, read through the shared asset cache
+        (`get_fractionability`, one bulk call for a whole basket). A symbol the broker
+        cannot describe yields ``fractionable=None`` -- UNKNOWN, never coerced to False.
+
+        Args:
+            symbol: the instrument; normalised here (.strip().upper()).
+            quantity: the quantity as sized, fractional or not. Shares, never dollars.
+            order_type: the core OrderType enum, or its lower-case string value.
+            use_complex_order: True when the wash-trade escape will re-class the request
+                as BRACKET/OTO, which refuses fractions even on a market order.
+
+        Returns:
+            FractionalPreview: the outcome, the quantity that would really trade, and the
+            sentence to show the operator.
+        """
+        if hasattr(order_type, 'value'):
+            order_type_value = str(order_type.value).lower()
+        else:
+            order_type_value = str(order_type).lower()
+        normalised = (symbol or '').strip().upper()
+        fractionable = self.get_fractionability([normalised]).get(normalised)
+        return plan_fractional_submission(
+            normalised, quantity, order_type_value,
+            use_complex_order=use_complex_order, fractionable=fractionable)
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `venv/bin/python -m pytest packages/common/tests/test_account_types.py -v`
+
+Expected: PASS — all existing tests plus the 3 new `FractionalPreview` ones.
+
+Run: `venv/bin/python -m pytest tests/test_alpaca_fractional_precheck.py -v`
+
+Expected: PASS — 15 passed.
+
+Now the reconciliation pin — the extracted rule must have changed submission behaviour by exactly
+nothing:
+
+Run: `venv/bin/python -m pytest tests/test_alpaca_fractional_submission.py -v`
+
+Expected: PASS — 11 passed, unchanged, including
+`test_the_floor_log_names_the_uncovered_remainder` (the warning still names the uncovered
+remainder) and `test_fractional_limit_order_that_floors_to_zero_is_skipped_not_failed` (the row is
+still CANCELED with a comment containing both "skipped" and "fractional").
+
+Run: `venv/bin/python -m pytest tests/test_alpaca_asset_cache.py tests/test_alpaca_margin_info.py tests/test_alpaca_market_hours.py tests/test_alpaca_account_snapshot.py tests/test_alpaca_order_type_mapping.py tests/test_alpaca_options.py -v`
+
+Expected: PASS — no failures.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add packages/common/ba2_common/core/account_types.py packages/common/tests/test_account_types.py ba2_trade_platform/modules/accounts/AlpacaAccount.py tests/test_alpaca_fractional_precheck.py
+git commit -m "feat(alpaca): fractionability pre-check sharing one rule with the submission path"
+```
+
+---
+
+## Block C - TastyTradeAccount: market sessions + fractionability
+
+## Section E addendum — TastyTrade market-hours gate and fractionability pre-check
+
+These two tasks land AFTER Section E Tasks 52-55. They assume the current
+`ba2_trade_platform/modules/accounts/TastyTradeAccount.py` (1718 lines) already contains
+`_is_sandbox`, `_run_async`/`_ASYNC_TIMEOUT_SECONDS`, `_check_authentication`,
+`_is_margin_account`, `get_account_snapshot`, `_tt_action`, `_signed_price`, `_TT_TIF_MAP`,
+`_build_new_order` (`:785`), `_submit_order_impl` (`:837`), `preview_order_impact` (`:995`),
+`get_cash_transfers` and `get_symbol_margin_info` (`:1505`); and that
+`tests/test_tastytrade_account.py` already contains `_sync_run`, `_bare_account`, `_balances`,
+`_tt_position`, `_placed_order`, `_placed_order_response`, `_fill`, `_FakeEquity`,
+`_capture_errors`, `_tt_trading_order`, `_margin_report`, `_margin_entry`, `_precision`,
+`_wire_margin_sources`. None of them is redefined below.
+
+The Section E test-command block already lists both files, so no change is needed there.
+
+**Deleted from this chunk — the `pandas-market-calendars` pin.** This chunk previously opened with
+a task pinning `pandas-market-calendars>=5.1.1` in `requirements.txt` plus a `_requirement_names()`
+helper in `tests/test_broker_sdk_pins.py`. Chunk `interface` owns that pin outright, including both
+declaration sites and the pin test (contract §3.1). **The `pandas-market-calendars` dependency is
+declared by the interface chunk; `TastyTradeAccount` does not import it.** The pin is load-bearing
+and stays — the shared offline fallback really does use the package — the question of dropping it is
+closed. The remaining two tasks are renumbered N1 and N2.
+
+**Ordering against the other chunks (contract §4).** Both tasks are Block B, so the whole of chunk
+`interface` (its N1-N4) lands first:
+
+* N1 needs interface N2 (`MarketHours` plus `MARKET_HOURS_SOURCE_BROKER` / `_FALLBACK` /
+  `_UNAVAILABLE` in `packages/common/ba2_common/core/account_types.py`), interface N3
+  (`packages/common/ba2_common/core/market_calendar.py`, the sole offline NYSE calendar) and
+  interface N4 — the `ReadOnlyAccountInterface` template method. **The override point is
+  `_get_market_hours_impl(self, now: datetime) -> MarketHours`.** `get_market_hours()` and
+  `is_market_open()` are concrete, cached and effectively final on the interface; this chunk
+  overrides neither, and reaches the offline fallback with `super()._get_market_hours_impl(now)`.
+  Calling `super().get_market_hours()` from inside `_get_market_hours_impl` is infinite recursion,
+  because the template method calls the impl.
+* N2 needs interface N2's widening of `MarginInfo.fractionable` to `Optional[bool] = None`.
+
+`MarketHours` **is** a `@dataclass(frozen=True)`, so `dataclasses.replace()` works on it.
+
+---
+
+### Task 87: TastyTrade `_get_market_hours_impl()` — REGULAR session only
+
+The Portfolio Allocation wizard submits only while the market is open, and it needs a truthful
+answer from TastyTrade rather than a guess. TastyTrade publishes it:
+`venv/lib/python3.12/site-packages/tastytrade/market_sessions.py:69-82`
+
+```python
+async def get_market_sessions(
+    session: Session, exchanges: Iterable[ExchangeType]
+) -> list[MarketSession]:
+```
+
+returning `MarketSession` (`market_sessions.py:44-57`) with
+`status: MarketStatus = Field(alias="state")`, `open_at`, `close_at`, `close_at_ext`,
+`start_at`, `next_session`, `previous_session`.
+
+**Only `MarketStatus.OPEN` counts as open.** `market_sessions.py:22-30` publishes four values:
+
+```python
+    OPEN = "Open"
+    CLOSED = "Closed"
+    PRE_MARKET = "Pre-market"
+    EXTENDED = "Extended"
+```
+
+`PRE_MARKET` and `EXTENDED` are NOT open for this seam's purposes — user decision D4, regular
+session only, because market orders are rejected outside the regular session. TastyTrade's server
+rejects an equity market order outside it, that rule is absent from the SDK, and the rejection
+arrives only as an opaque `Message(code, message)` (`tastytrade/order.py:172-183`, surfaced through
+`PlacedOrderResponse.errors` and read by `TastyTradeAccount.preview_order_impact` at `:995`).
+Reporting "open" at 17:00 ET would let the wizard fire a whole basket into a guaranteed rejection.
+
+`close_at_ext` is read and deliberately discarded for the same reason. There is no new
+`MarketHours` field for extended hours: `MarketHours.status` carries TastyTrade's own raw word
+("Extended", "Pre-market") for display, which is how the banner explains *why* the gate blocked
+without any branch ever reading it.
+
+**This is an override of `_get_market_hours_impl`, not of `get_market_hours`.** Contract §1.4 makes
+`get_market_hours(self, *, now=None)` a concrete caching template method on
+`ReadOnlyAccountInterface` that calls `self._get_market_hours_impl(now)` inside a
+`try/except Exception`. Overriding `get_market_hours` here and then calling
+`super().get_market_hours()` on the fallback path — which is how this task was first written — is an
+infinite loop: super's template calls the impl, the impl is this class's, and it calls the template
+again. The fallback path is `super()._get_market_hours_impl(now)`. There is likewise no
+`is_market_open()` override: the interface's concrete version is `return
+self.get_market_hours(now=now).is_open`, which by construction cannot drift from what this method
+returns.
+
+**Caching, boundary expiry and `clear_market_hours_cache()` are provided by
+`ReadOnlyAccountInterface.get_market_hours()`** (contract §3.3). This class defines no
+`_market_hours_cache` and no `(valid_until, hours)` tuple. The interface expires at
+`min(now + 60s, result.next_transition)` — the same "expire at the state TRANSITION, not on elapsed
+seconds" invariant this task used to implement locally — and it never caches an `UNAVAILABLE`
+answer, which preserves this chunk's original "a broker outage must not pin a wrong answer" intent.
+`clear_market_hours_cache()` exists, on the interface; that open question is closed.
+
+**No offline calendar lives here.** `_calendar_bounds`, `_first_future`, `_NY_REGULAR_OPEN`,
+`_NY_REGULAR_CLOSE`, `_NY_HALF_DAY_CLOSE` and the 11-day walk over TastyTrade's
+`MarketCalendar.holidays` / `half_days` are all gone. Chunk `interface` owns the one offline
+holiday-aware NYSE calendar (`ba2_common/core/market_calendar.py`) and it is the only NYSE
+session-time source in the codebase — **no adapter hardcodes 09:30 / 16:00 / 13:00 any more**, which
+retires this chunk's risk about drifting session-time constants. `next_open` and `next_close` come
+straight off `MarketSession` and `MarketSession.next_session`, and `get_market_holidays` is never
+called.
+
+`MarketSession.next_session` is `Optional` (`market_sessions.py:54`), so `next_open` / `next_close`
+can still come back `None`. That is now the honest answer: `None` in `MarketHours` never means "now"
+and never means "guess" (contract §1.1), and the interface's cache simply falls back to the 60 s TTL
+when there is no `next_transition` to expire on.
+
+**Files:**
+- Modify: `ba2_trade_platform/modules/accounts/TastyTradeAccount.py` (two import edits; the new
+  block inserted above `get_balance_history`, line 1625)
+- Test: `tests/test_tastytrade_account.py`
+
+- [ ] **Step 1: Write the failing test**
+
+Add `ZoneInfo` to the test module's imports — after the existing
+`from unittest.mock import AsyncMock, patch` line (`tests/test_tastytrade_account.py:28`), insert:
+
+```python
+from zoneinfo import ZoneInfo
+```
+
+Append to `tests/test_tastytrade_account.py`:
+
+```python
+# ---------------------------------------------------------------------------
+# Market hours
+# ---------------------------------------------------------------------------
+
+_NY = ZoneInfo("America/New_York")
+
+
+def _ny(year, month, day, hour, minute=0):
+    """An AWARE New York datetime.
+
+    Every market-hours test freezes time explicitly by passing `now` in; none of them
+    may depend on when the suite runs. `America/New_York` is the canonical name
+    ba2_common.core.market_calendar.NY_TZ uses.
+    """
+    return datetime(year, month, day, hour, minute, tzinfo=_NY)
+
+
+def _snapshot_payload(open_at, close_at):
+    """RAW DASHERIZED MarketSessionSnapshot payload (market_sessions.py:32-42).
+
+    All five fields are required on the model; `start_at` is the pre-market start, two
+    and a half hours ahead of the regular open.
+    """
+    return {
+        "instrument-collection": "Equity",
+        "open-at": open_at.isoformat(),
+        "close-at": close_at.isoformat(),
+        "start-at": (open_at - timedelta(hours=2, minutes=30)).isoformat(),
+        "session-date": open_at.date().isoformat(),
+    }
+
+
+def _tt_session(status="Open", open_at=None, close_at=None, next_session=None,
+                close_at_ext=None, instrument_collection="Equity"):
+    """A REAL tastytrade MarketSession, built from a RAW DASHERIZED payload.
+
+    Not python kwargs and not a SimpleNamespace. `MarketSession.status` is
+    `Field(alias="state")` and every datetime is coerced by pydantic from the wire
+    string, so a kwargs-built stand-in silently skips exactly the parsing the adapter
+    depends on -- the same class of bypass that hid the `set_sign_for` sign bugs in
+    this file. `get_market_sessions` itself does `MarketSession(**i)` on the raw item
+    (market_sessions.py:81), so this is byte-for-byte what production parses.
+    """
+    from tastytrade.market_sessions import MarketSession
+
+    payload = {"state": status, "instrument-collection": instrument_collection}
+    if open_at is not None:
+        payload["open-at"] = open_at.isoformat()
+        payload["start-at"] = open_at.isoformat()
+    if close_at is not None:
+        payload["close-at"] = close_at.isoformat()
+    if close_at_ext is not None:
+        payload["close-at-ext"] = close_at_ext.isoformat()
+    if next_session is not None:
+        payload["next-session"] = next_session
+    return MarketSession(**payload)
+
+
+def _wire_sessions(sessions):
+    """Patch the ONE async SDK call this seam makes.
+
+    There is no holiday-calendar patch any more: the offline NYSE calendar belongs to
+    ba2_common.core.market_calendar (contract 3.2) and TastyTradeAccount never fetches
+    MarketCalendar.holidays / half_days.
+    """
+    return patch("tastytrade.market_sessions.get_market_sessions",
+                 new=AsyncMock(return_value=sessions))
+
+
+def test_open_statuses_are_pinned_to_the_sdk_enum():
+    """A renamed MarketStatus member must break HERE, not silently make the gate
+    permanently closed (or permanently open)."""
+    from tastytrade.market_sessions import MarketStatus
+
+    assert TastyTradeAccount._TT_OPEN_STATUSES == frozenset({MarketStatus.OPEN.value})
+
+
+def test_tastytrade_overrides_the_impl_hook_and_nothing_else():
+    """The whole anti-recursion invariant, as a structural assertion.
+
+    `get_market_hours` is the interface's caching template and it CALLS
+    `_get_market_hours_impl`. An adapter that overrides the template and then delegates
+    to `super().get_market_hours()` never terminates. Caching and the offline calendar
+    both belong elsewhere (contract 3.2, 3.3), so none of those names may reappear here.
+    """
+    assert "_get_market_hours_impl" in TastyTradeAccount.__dict__
+    for banned in ("get_market_hours", "is_market_open", "_market_hours_cache",
+                   "clear_market_hours_cache", "_calendar_bounds", "_first_future",
+                   "_NY_REGULAR_OPEN", "_NY_REGULAR_CLOSE", "_NY_HALF_DAY_CLOSE"):
+        assert banned not in TastyTradeAccount.__dict__, banned
+
+
+def test_the_public_seam_routes_to_the_tastytrade_override():
+    from ba2_trade_platform.core.account_types import MARKET_HOURS_SOURCE_BROKER
+
+    acct = _bare_account()
+    session = _tt_session(
+        status="Open", open_at=_ny(2026, 8, 20, 9, 30), close_at=_ny(2026, 8, 20, 16, 0),
+        next_session=_snapshot_payload(_ny(2026, 8, 21, 9, 30), _ny(2026, 8, 21, 16, 0)))
+
+    with _wire_sessions([session]):
+        hours = acct.get_market_hours(now=_ny(2026, 8, 20, 11, 0))
+        assert acct.is_market_open(now=_ny(2026, 8, 20, 11, 0)) is True
+
+    assert hours.source == MARKET_HOURS_SOURCE_BROKER
+
+
+def test_market_hours_open_during_the_regular_session():
+    from ba2_trade_platform.core.account_types import MARKET_HOURS_SOURCE_BROKER
+
+    acct = _bare_account()
+    now = _ny(2026, 8, 20, 11, 0)  # Thursday, mid-session
+    session = _tt_session(
+        status="Open", open_at=_ny(2026, 8, 20, 9, 30), close_at=_ny(2026, 8, 20, 16, 0),
+        next_session=_snapshot_payload(_ny(2026, 8, 21, 9, 30), _ny(2026, 8, 21, 16, 0)))
+
+    with _wire_sessions([session]):
+        hours = acct._get_market_hours_impl(now)
+
+    assert hours.is_open is True
+    assert hours.source == MARKET_HOURS_SOURCE_BROKER
+    assert hours.status == "Open"
+    assert hours.as_of == now
+    # While OPEN, open_at/close_at are THIS session's bounds (contract 1.1)...
+    assert hours.open_at == _ny(2026, 8, 20, 9, 30)
+    assert hours.close_at == _ny(2026, 8, 20, 16, 0)
+    # ...while next_open / next_close are STRICTLY FUTURE: today's open is behind us.
+    assert hours.next_open == _ny(2026, 8, 21, 9, 30)
+    assert hours.next_close == _ny(2026, 8, 20, 16, 0)
+    assert hours.next_transition == _ny(2026, 8, 20, 16, 0)
+    assert hours.is_known is True
+
+
+def test_market_hours_extended_session_does_not_count_as_open():
+    """User decision D4, regular session only. TastyTrade's server rejects an equity
+    MARKET order outside the regular session, and the rejection is an opaque Message on
+    PlacedOrderResponse.errors. Reporting Extended as open would fire a whole allocation
+    basket into a guaranteed reject -- and `status` is what lets the banner say why."""
+    acct = _bare_account()
+    session = _tt_session(
+        status="Extended", open_at=_ny(2026, 8, 20, 9, 30),
+        close_at=_ny(2026, 8, 20, 16, 0), close_at_ext=_ny(2026, 8, 20, 20, 0),
+        next_session=_snapshot_payload(_ny(2026, 8, 21, 9, 30), _ny(2026, 8, 21, 16, 0)))
+
+    with _wire_sessions([session]):
+        hours = acct._get_market_hours_impl(_ny(2026, 8, 20, 17, 30))
+
+    assert hours.is_open is False
+    assert hours.status == "Extended"
+    assert hours.next_open == _ny(2026, 8, 21, 9, 30)
+    # close_at_ext (20:00) is the EXTENDED close and must never be reported as
+    # next_close; there is no MarketHours field for it at all.
+    assert hours.next_close == _ny(2026, 8, 21, 16, 0)
+    # CLOSED => the bounds describe the NEXT session (contract 1.1).
+    assert hours.open_at == hours.next_open
+    assert hours.close_at == hours.next_close
+
+
+def test_market_hours_pre_market_does_not_count_as_open():
+    acct = _bare_account()
+    session = _tt_session(
+        status="Pre-market", open_at=_ny(2026, 8, 20, 9, 30),
+        close_at=_ny(2026, 8, 20, 16, 0),
+        next_session=_snapshot_payload(_ny(2026, 8, 21, 9, 30), _ny(2026, 8, 21, 16, 0)))
+
+    with _wire_sessions([session]):
+        hours = acct._get_market_hours_impl(_ny(2026, 8, 20, 8, 0))
+
+    assert hours.is_open is False
+    assert hours.status == "Pre-market"
+    # Today's own open is still in the future at 08:00 -- it, not tomorrow's, is next.
+    assert hours.next_open == _ny(2026, 8, 20, 9, 30)
+    assert hours.next_close == _ny(2026, 8, 20, 16, 0)
+    assert hours.open_at == hours.next_open
+
+
+def test_market_hours_closed_on_a_weekend_points_at_the_next_session():
+    """MarketSession.open_at / close_at are Optional and TastyTrade leaves them empty on
+    a non-session day; next_session is then the only future answer it publishes."""
+    acct = _bare_account()
+    session = _tt_session(
+        status="Closed",
+        next_session=_snapshot_payload(_ny(2026, 8, 24, 9, 30), _ny(2026, 8, 24, 16, 0)))
+
+    with _wire_sessions([session]):
+        hours = acct._get_market_hours_impl(_ny(2026, 8, 22, 12, 0))  # Saturday
+
+    assert hours.is_open is False
+    assert hours.status == "Closed"
+    assert hours.next_open == _ny(2026, 8, 24, 9, 30)
+    assert hours.next_close == _ny(2026, 8, 24, 16, 0)
+    assert hours.open_at == _ny(2026, 8, 24, 9, 30)
+    assert hours.close_at == _ny(2026, 8, 24, 16, 0)
+
+
+def test_a_naive_broker_datetime_is_read_as_new_york_not_left_naive():
+    """Contract 1.13: every broker datetime is made tz-aware at the adapter boundary.
+    MarketHours.__post_init__ raises ValueError on a naive one, so an unnormalised
+    value would turn the whole answer into UNAVAILABLE instead of an honest session."""
+    acct = _bare_account()
+    session = _tt_session(
+        status="Open", open_at=datetime(2026, 8, 20, 9, 30),
+        close_at=datetime(2026, 8, 20, 16, 0),
+        next_session=_snapshot_payload(_ny(2026, 8, 21, 9, 30), _ny(2026, 8, 21, 16, 0)))
+
+    with _wire_sessions([session]):
+        hours = acct._get_market_hours_impl(_ny(2026, 8, 20, 11, 0))
+
+    from ba2_trade_platform.core.account_types import MARKET_HOURS_SOURCE_BROKER
+
+    # The BROKER path produced this, not the offline calendar that happens to agree.
+    assert hours.source == MARKET_HOURS_SOURCE_BROKER
+    assert hours.open_at.tzinfo is not None
+    assert hours.open_at == _ny(2026, 8, 20, 9, 30)
+    assert hours.close_at == _ny(2026, 8, 20, 16, 0)
+
+
+def test_the_holiday_calendar_is_never_fetched():
+    """The offline calendar belongs to ba2_common.core.market_calendar (contract 3.2).
+    This adapter no longer walks MarketCalendar.holidays / half_days to synthesise
+    session bounds, and no longer hardcodes 09:30 / 16:00 / 13:00."""
+    acct = _bare_account()
+    session = _tt_session(status="Closed")
+    holidays = AsyncMock()
+
+    with _wire_sessions([session]), \
+         patch("tastytrade.market_sessions.get_market_holidays", new=holidays):
+        hours = acct._get_market_hours_impl(_ny(2026, 11, 26, 12, 0))  # Thanksgiving
+
+    holidays.assert_not_awaited()
+    # Nothing future was published and nothing is invented: None means unknown.
+    assert hours.next_open is None
+    assert hours.next_close is None
+
+
+def test_market_hours_falls_back_and_says_why_when_the_broker_call_fails(monkeypatch):
+    from ba2_trade_platform.core.account_types import MARKET_HOURS_SOURCE_FALLBACK
+
+    errors = _capture_errors(monkeypatch)
+    acct = _bare_account()
+
+    with patch("tastytrade.market_sessions.get_market_sessions",
+               new=AsyncMock(side_effect=RuntimeError("503 upstream"))):
+        hours = acct._get_market_hours_impl(_ny(2026, 8, 20, 11, 0))
+
+    # The offline NYSE calendar answered, so this is FALLBACK, not UNAVAILABLE -- and
+    # 11:00 ET on Thursday 2026-08-20 is a regular session.
+    assert hours.source == MARKET_HOURS_SOURCE_FALLBACK
+    assert hours.is_open is True
+    assert "503 upstream" in (hours.detail or "")
+    assert any("market-session fetch failed" in m for m in errors), errors
+
+
+def test_market_hours_falls_back_when_no_equity_collection_comes_back(monkeypatch):
+    """get_market_sessions is asked for ExchangeType.NYSE ('Equity'). A response carrying
+    only futures collections is a broker fault, not an answer."""
+    from ba2_trade_platform.core.account_types import MARKET_HOURS_SOURCE_FALLBACK
+
+    errors = _capture_errors(monkeypatch)
+    acct = _bare_account()
+    session = _tt_session(
+        status="Open", instrument_collection="CME",
+        open_at=_ny(2026, 8, 20, 9, 30), close_at=_ny(2026, 8, 20, 16, 0))
+
+    with _wire_sessions([session]):
+        hours = acct._get_market_hours_impl(_ny(2026, 8, 20, 11, 0))
+
+    assert hours.source == MARKET_HOURS_SOURCE_FALLBACK
+    assert "no 'Equity' session" in (hours.detail or "")
+    assert any("no 'Equity' market session" in m for m in errors), errors
+
+
+def test_market_hours_falls_back_when_unauthenticated(monkeypatch):
+    from ba2_trade_platform.core.account_types import MARKET_HOURS_SOURCE_FALLBACK
+
+    _capture_errors(monkeypatch)
+    acct = _bare_account()
+    acct._session = None
+
+    hours = acct._get_market_hours_impl(_ny(2026, 8, 20, 11, 0))
+
+    assert hours.source == MARKET_HOURS_SOURCE_FALLBACK
+    assert "not authenticated" in (hours.detail or "")
+
+
+def test_the_fallback_keeps_supers_source_so_a_dead_calendar_reads_unavailable(monkeypatch):
+    """Contract 1.5 and 5.3.6: _fallback_market_hours must NOT force source=fallback.
+    Broker dead AND offline calendar dead is UNAVAILABLE -- is_open False so the submit
+    gate fails closed, is_known False so the UI says "unknown" rather than "closed".
+    That is the get_positions() None-vs-[] lesson, applied to market hours."""
+    from ba2_common.core.interfaces.ReadOnlyAccountInterface import ReadOnlyAccountInterface
+    from ba2_trade_platform.core.account_types import (
+        MARKET_HOURS_SOURCE_UNAVAILABLE, MarketHours,
+    )
+
+    _capture_errors(monkeypatch)
+    monkeypatch.setattr(
+        ReadOnlyAccountInterface, "_get_market_hours_impl",
+        lambda self, now: MarketHours(is_open=False,
+                                      source=MARKET_HOURS_SOURCE_UNAVAILABLE,
+                                      as_of=now, detail="pandas_market_calendars missing"))
+    acct = _bare_account()
+
+    with patch("tastytrade.market_sessions.get_market_sessions",
+               new=AsyncMock(side_effect=RuntimeError("503 upstream"))):
+        hours = acct._get_market_hours_impl(_ny(2026, 8, 20, 11, 0))
+
+    assert hours.source == MARKET_HOURS_SOURCE_UNAVAILABLE
+    assert hours.is_known is False
+    assert hours.is_open is False
+    assert "503 upstream" in (hours.detail or "")
+
+
+def test_a_broker_failure_does_not_recurse_through_the_public_seam(monkeypatch):
+    """The regression this rename exists for. With the override on `get_market_hours`
+    and `super().get_market_hours()` in `_fallback_market_hours`, this call raised
+    RecursionError instead of returning the offline answer."""
+    from ba2_trade_platform.core.account_types import MARKET_HOURS_SOURCE_FALLBACK
+
+    _capture_errors(monkeypatch)
+    acct = _bare_account()
+
+    with patch("tastytrade.market_sessions.get_market_sessions",
+               new=AsyncMock(side_effect=RuntimeError("503 upstream"))):
+        hours = acct.get_market_hours(now=_ny(2026, 8, 20, 11, 0))
+        assert acct.is_market_open(now=_ny(2026, 8, 20, 11, 0)) is True
+
+    assert hours.source == MARKET_HOURS_SOURCE_FALLBACK
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `venv/bin/python -m pytest tests/test_tastytrade_account.py -v -k "market_hours or open_statuses or impl_hook or naive_broker or holiday_calendar or dead_calendar or public_seam"`
+
+Expected: FAIL — 13 failed, 1 passed.
+`test_open_statuses_are_pinned_to_the_sdk_enum` fails with
+`AttributeError: type object 'TastyTradeAccount' has no attribute '_TT_OPEN_STATUSES'`.
+`test_tastytrade_overrides_the_impl_hook_and_nothing_else` fails with
+`AssertionError: assert '_get_market_hours_impl' in mappingproxy({...})`.
+`test_market_hours_open_during_the_regular_session` fails with
+`AssertionError: assert 'fallback' == 'broker'` — the inherited `ReadOnlyAccountInterface` default
+runs, so `source` is never `broker` and `get_market_sessions` is never awaited.
+
+`test_a_broker_failure_does_not_recurse_through_the_public_seam` passes already: there is no
+override to recurse into yet. It is the regression guard for after Step 3, and it is the test that
+would have caught the original `super().get_market_hours()` bug.
+
+- [ ] **Step 3: Write minimal implementation**
+
+**(a)** In `ba2_trade_platform/modules/accounts/TastyTradeAccount.py`, replace line 6, which reads
+exactly:
+
+```python
+from concurrent.futures import TimeoutError as FutureTimeoutError
+```
+
+with:
+
+```python
+from concurrent.futures import TimeoutError as FutureTimeoutError
+from dataclasses import replace
+```
+
+**(b)** Replace lines 20-24, which read exactly:
+
+```python
+from ...core.account_types import (
+    AccountSnapshot, CashTransfer, MarginInfo, OrderImpact,
+    CASH_TRANSFER_DEPOSIT, CASH_TRANSFER_DIVIDEND, CASH_TRANSFER_WITHDRAWAL,
+    MARGIN_SOURCE_DEFAULT, MARGIN_SOURCE_POSITION,
+)
+```
+
+with:
+
+```python
+from ...core.account_types import (
+    AccountSnapshot, CashTransfer, MarginInfo, MarketHours, OrderImpact,
+    CASH_TRANSFER_DEPOSIT, CASH_TRANSFER_DIVIDEND, CASH_TRANSFER_WITHDRAWAL,
+    MARGIN_SOURCE_DEFAULT, MARGIN_SOURCE_POSITION, MARKET_HOURS_SOURCE_BROKER,
+)
+```
+
+`MARKET_HOURS_SOURCE_FALLBACK` is deliberately NOT imported: this adapter never sets `source`
+itself on the fallback path — it lets super's source through, so a dead offline calendar surfaces
+honestly as `UNAVAILABLE`.
+
+**(c)** Insert the following block immediately above `def get_balance_history` (line 1625):
+
+```python
+    # ------------------------------------------------------------------
+    # Market hours
+    # ------------------------------------------------------------------
+
+    #: The TastyTrade equity statuses that count as "the REGULAR session is running".
+    #: Pinned as the raw wire value rather than the enum so this module needs no
+    #: market_sessions import at module scope; tests assert it equals
+    #: MarketStatus.OPEN.value so a renamed member cannot slip through.
+    #:
+    #: 'Pre-market' and 'Extended' are DELIBERATELY absent (market_sessions.py:22-30) --
+    #: user decision D4, regular session only. TastyTrade's server rejects an equity
+    #: MARKET order outside the regular session, that rule lives nowhere in the SDK, and
+    #: the rejection surfaces only as an opaque Message(code, message) on
+    #: PlacedOrderResponse.errors (order.py:172-183). Calling Extended "open" would let
+    #: the allocation wizard submit a whole basket into a guaranteed rejection.
+    _TT_OPEN_STATUSES = frozenset({"Open"})
+
+    def _now_eastern(self) -> datetime:
+        """Current time in the New York timezone, tz-aware.
+
+        A METHOD, not an inline call, so it can be frozen or inspected. Note that
+        `_get_market_hours_impl` does NOT read it as its clock -- it uses the `now` the
+        interface injects, which is the canonical clock-freeze seam. What this supplies
+        there is the TIMEZONE for normalising a naive broker datetime, per contract 1.13
+        ("now_in_new_york-derived on TastyTrade").
+        """
+        from tastytrade.utils import now_in_new_york
+        return now_in_new_york()
+
+    def _fallback_market_hours(self, now: datetime, reason: str) -> MarketHours:
+        """The shared offline answer, tagged with WHY we are on it.
+
+        `super()._get_market_hours_impl(now)` -- NOT `super().get_market_hours()`, which
+        is the caching TEMPLATE method that calls `_get_market_hours_impl`, i.e. this
+        class's override, i.e. infinite recursion.
+
+        `source` is deliberately NOT forced to MARKET_HOURS_SOURCE_FALLBACK. When the
+        offline NYSE calendar is dead too, super returns MARKET_HOURS_SOURCE_UNAVAILABLE
+        and that honest "we could not determine it" must survive to the UI, which then
+        says "unknown" rather than "closed" (the submit gate still fails closed because
+        `is_open` is False). Only `detail` is overwritten.
+
+        Nothing is cached here: `ReadOnlyAccountInterface.get_market_hours()` owns the
+        cache and never caches an UNAVAILABLE answer.
+        """
+        return replace(super()._get_market_hours_impl(now), detail=reason)
+
+    def _get_market_hours_impl(self, now: datetime) -> MarketHours:
+        """Whether the REGULAR equity session is running, per TastyTrade itself.
+
+        THE OVERRIDE POINT, per contract 1.4. `get_market_hours()` and `is_market_open()`
+        are concrete, cached and effectively final on ReadOnlyAccountInterface and are
+        NOT overridden here; the interface also wraps this method in try/except so it can
+        never raise out of a page render. Caching, session-boundary expiry and
+        `clear_market_hours_cache()` are provided by
+        `ReadOnlyAccountInterface.get_market_hours()`.
+
+        `now` is injected and tz-aware, and this method MUST use it rather than reading a
+        clock of its own.
+
+        REGULAR SESSION ONLY -- see `_TT_OPEN_STATUSES` and user decision D4.
+        `close_at_ext` (the extended-hours close) is read off the wire and discarded:
+        reporting it as `next_close` would tell the wizard it has four more hours to
+        submit market orders that the broker will reject. `status` carries TastyTrade's
+        own raw word ("Open" / "Closed" / "Pre-market" / "Extended") so the banner can
+        explain a block; nothing ever branches on it.
+
+        `next_open` / `next_close` come straight off `MarketSession` and
+        `MarketSession.next_session` (market_sessions.py:44-57). There is no offline
+        calendar in this file: `ba2_common.core.market_calendar` is the only NYSE
+        session-time source in the codebase, and no adapter hardcodes 09:30/16:00/13:00.
+        `next_session` is Optional, so both may legitimately be None -- which means
+        "unknown", never "now" and never a synthesised guess.
+
+        Returns:
+            MarketHours: ``source`` is ``MARKET_HOURS_SOURCE_BROKER`` when TastyTrade
+            answered. When it did not, this returns `_fallback_market_hours(...)`, whose
+            source is whatever the shared offline calendar could manage -- FALLBACK if it
+            answered, UNAVAILABLE if it could not -- with ``detail`` saying why.
+        """
+        if not self._check_authentication():
+            return self._fallback_market_hours(now, "TastyTrade account is not authenticated")
+
+        from tastytrade.market_sessions import ExchangeType, get_market_sessions
+
+        try:
+            sessions = self._run_async(
+                get_market_sessions(self._session, [ExchangeType.NYSE]))
+        except Exception as e:
+            logger.error(
+                f"[Account {self.id}] TastyTrade market-session fetch failed: {e}",
+                exc_info=True)
+            return self._fallback_market_hours(now, f"market-session fetch failed: {e}")
+
+        # ExchangeType.NYSE serialises as the instrument collection "Equity".
+        wanted = ExchangeType.NYSE.value
+        session = next((s for s in (sessions or [])
+                        if s.instrument_collection == wanted), None)
+        if session is None:
+            logger.error(
+                f"[Account {self.id}] TastyTrade returned no '{wanted}' market session "
+                f"(got {[getattr(s, 'instrument_collection', '?') for s in (sessions or [])]}); "
+                f"falling back to the shared offline NYSE calendar")
+            return self._fallback_market_hours(now, f"broker returned no '{wanted}' session")
+
+        def _aware(value: Optional[datetime]) -> Optional[datetime]:
+            """The tz-awareness boundary (contract 1.13).
+
+            TastyTrade publishes ISO timestamps WITH an offset, so this is normally a
+            passthrough. A naive one is read as NEW YORK -- the timezone
+            `_now_eastern()` already speaks, derived from
+            tastytrade.utils.now_in_new_york -- and never as UTC or as this machine's
+            local time. MarketHours.__post_init__ raises ValueError on any naive
+            datetime, so an unnormalised value would collapse a perfectly good broker
+            answer into UNAVAILABLE.
+            """
+            if value is None or value.tzinfo is not None:
+                return value
+            return value.replace(tzinfo=self._now_eastern().tzinfo)
+
+        current_open = _aware(session.open_at)
+        current_close = _aware(session.close_at)
+        snapshot = session.next_session
+        snapshot_open = _aware(getattr(snapshot, "open_at", None))
+        snapshot_close = _aware(getattr(snapshot, "close_at", None))
+
+        # next_open / next_close are STRICTLY FUTURE (contract 1.1). The CURRENT
+        # session's own bounds are used while they are still ahead of `now` -- at 08:00
+        # today's 09:30 open has not happened yet -- and once they are behind, the
+        # next-session snapshot is the only future answer TastyTrade publishes. Both
+        # stay None when it publishes neither: None means unknown, never "now".
+        next_open = None
+        for candidate in (current_open, snapshot_open):
+            if candidate is not None and candidate > now:
+                next_open = candidate
+                break
+        next_close = None
+        for candidate in (current_close, snapshot_close):
+            if candidate is not None and candidate > now:
+                next_close = candidate
+                break
+
+        status = getattr(session.status, "value", None) or str(session.status)
+        is_open = status in self._TT_OPEN_STATUSES
+
+        # OPEN -> the bounds describe the CURRENT session; CLOSED -> the NEXT one, where
+        # contract 1.1 requires open_at == next_open and close_at == next_close.
+        if is_open:
+            open_at, close_at = current_open, current_close
+        else:
+            open_at, close_at = next_open, next_close
+
+        detail = f"TastyTrade equity session status {status!r}"
+        if not is_open:
+            detail += (" - regular session only; pre-market and extended hours do not "
+                       "count as open because TastyTrade rejects an equity market order "
+                       "outside the regular session")
+        return MarketHours(
+            is_open=is_open,
+            open_at=open_at,
+            close_at=close_at,
+            next_open=next_open,
+            next_close=next_close,
+            source=MARKET_HOURS_SOURCE_BROKER,
+            status=status,
+            detail=detail,
+            as_of=now,
+        )
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `venv/bin/python -m pytest tests/test_tastytrade_account.py -v`
+
+Expected: every test in the file passes, including the 14 new ones.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add ba2_trade_platform/modules/accounts/TastyTradeAccount.py tests/test_tastytrade_account.py
+git commit -m "feat(tastytrade): _get_market_hours_impl from get_market_sessions, regular session only"
+```
+
+---
+
+### Task 88: Fractionability pre-check — per-symbol precision, a tri-state flag, and a submit-time quantity guard
+
+Three gaps remain after Task 54.
+
+**Gap 1: per-symbol precision overrides are discarded.** Task 54's precision loop matches only
+the generic row (`TastyTradeAccount.py:1543-1548`):
+
+```python
+                if precision.instrument_type == TTInstrumentType.EQUITY and precision.symbol is None:
+```
+
+But `QuantityDecimalPrecision` carries an optional `symbol` (`tastytrade/instruments.py:76-85`),
+and a row WITH a symbol overrides the generic one for that symbol. A name published at 2 decimals
+therefore gets sized on the generic 1e-5 grid, and the order is rejected on submission — exactly the
+"discovered by failure" outcome the locked decisions forbid.
+
+**Gap 2: a symbol with no published precision at all is sized on a guessed grid.** Task 54 sets
+`increment = None` when the fetch fails and then `min_trade_increment=increment if fractionable
+else 1.0` (`:1617`), so a fractional-eligible symbol reaches the engine with
+`min_trade_increment=None`. `packages/common/ba2_common/core/portfolio_allocation.py:351-372` reads
+that as "no increment" and falls through to `DEFAULT_FRACTIONAL_DECIMALS = 4` (`:73`) — a made-up
+1e-4 grid. That is a fabricated broker fact.
+
+**Gap 3: the eligibility flag is coerced.** `is_fractional_quantity_eligible` is declared
+`bool | None` (`instruments.py:262`) and Task 54 reads it as
+`bool(getattr(equity, "is_fractional_quantity_eligible", False))` (`:1602`). `None` is NOT `False`.
+
+**The fix for gaps 2 and 3 is one thing: report the tri-state honestly.** `MarginInfo.fractionable`
+is now `Optional[bool] = None` (contract §1.2, widened by interface N2) and is the ONE canonical
+per-symbol fractional-eligibility flag that crosses chunk boundaries. This method must report:
+
+| `Equity.is_fractional_quantity_eligible` | precision row | → `fractionable` | → `min_trade_increment` |
+|---|---|---|---|
+| `False` | any | `False` | `1.0` |
+| `None` | any | `None` | `1.0` |
+| `True` | symbol row, else the generic `symbol=None` row | `True` | `10 ** -p` |
+| `True` | none (or the fetch returned `{}`) | `None` | `1.0` |
+
+The last row is the one that was previously written as `fractionable=False`, and it was wrong twice
+over. Reporting `False` for a symbol the broker never described **invents a broker fact** — the
+broker said the symbol IS eligible, it just published no step. And reporting `True` with
+`min_trade_increment=None` would let the engine size 2.5 shares that `_tradable_quantity` then
+floors to 2. Reporting `None` / `1.0` is the only answer where **the plan and the execution agree**:
+`_tradable_quantity` submits whole shares in exactly this case, so the dry run must say whole shares
+too, and the engine's `m.fractionable is None` branch says "fractionable unknown - whole shares"
+rather than promising a fractional fill.
+
+**Delete the claim that `MarginInfo.min_trade_increment` is "now never `None`".** The landed
+docstring (`account_types.py:128-144`) says `None` is legal and meaningful — the broker published no
+step — and `fractionable=True, min_trade_increment=None` remains a legal pair that Alpaca still
+emits. TastyTrade merely never *produces* `None`, by construction (every branch above assigns either
+`1.0` or a real published step), not by contract. Nothing may rely on that.
+
+**Submit-time enforcement.** `_build_new_order` (`:785`) already has the instrument in hand at
+`:804`:
+
+```python
+        equity = self._run_async(Equity.get(self._session, trading_order.symbol))
+```
+
+so the guard costs no extra fetch. It floors an ineligible symbol to whole shares and quantises an
+eligible one onto the published grid — always DOWN, never up, because rounding up spends buying
+power the plan did not budget. A manual order, or a plan built while the metadata fetch was failing,
+is the case this exists for; the allocation engine already sized off the same two facts.
+
+This is defence-in-depth, not the primary path. Under user decision D1 the pure engine no longer
+simply floors a target to zero and drops it: it bumps the row to **one whole share** when one
+share's notional is within the bounded multiple of the target, and **skips** the symbol with its
+unmet notional reported when it is not. Either way the engine hands this adapter a quantity it has
+already reconciled with the broker's grid, and `_tradable_quantity` only has to catch the callers
+that never went through the engine.
+
+Flooring to zero is a SKIP, not a failure. `AlpacaAccount._record_fractional_adjustment`
+(`AlpacaAccount.py:895-920`) marks that row CANCELED, never ERROR; TastyTrade must agree, so a
+dedicated `_ZeroQuantityAfterRounding` carries it past the broad
+`except Exception -> _handle_order_submit_error` in `_submit_order_impl` (`:920`). This adapter's
+recorder is named `_record_fractional_adjustment` too, matching Alpaca's exactly, so the ~10-line
+duplicate is trivially liftable later. **Keep the duplication; do not refactor it onto
+`AccountInterface` in this feature.**
+
+**Every cache ships a `clear_*` companion** (contract §1.11). The new `_quantity_precision_cache`
+therefore gets `clear_quantity_precision_cache()`. Its empty-on-failure `{}` stays uncached, so an
+outage is retried rather than inherited. This cache is NOT duplication of Alpaca's `_asset_cache`
+(contract §3.4) — different broker, different endpoint, genuinely different data — and neither is
+lifted to the interface.
+
+**No notional order is emitted anywhere.** Contract §1.12: fractional is a fractional `Leg.quantity`
+(`tastytrade/order.py:140` types it `Decimal | int | None`), and a `NewOrder` built this way
+serialises as `{"quantity":"0.4321"}` with no notional key and no `value` / `value-effect` pair at
+all. Two tests below pin that.
+
+**`dry_run` is passed explicitly at every call site.** `Account.place_order`'s `dry_run` DEFAULTS TO
+`True` in the tastytrade 12.x SDK (`tastytrade/account.py:877`), so relying on the default silently
+turns a live submit into a no-op — or, read the other way, a preview into a live order. There are
+exactly two call sites in this class: `_submit_order_impl` (`:910`, `dry_run=False`) and
+`preview_order_impact` (`:1027`, `dry_run=True`). Step 4 greps for both, and a test asserts it.
+
+`preview_order_impact` shares `_build_new_order`, so a preview of an order that floors to zero
+returns `None` through its existing `except Exception` (`:1029`) — "no precheck", which is the
+documented meaning, not a fabricated zero impact.
+
+A note on the existing test helpers this task reuses: `_placed_order_response`, `_margin_report` and
+`_margin_entry` build their models through `model_validate` on RAW DASHERIZED payloads and must stay
+that way. `tastytrade.utils.set_sign_for` does not normalise a sign — it CREATES a negative one for
+any field whose `<field>-effect` is `"Debit"` — and it runs from a `model_validator(mode="before")`,
+which python kwargs and `SimpleNamespace` both bypass. Simplifying those helpers would make every
+value cheerfully positive and every sign assertion pass vacuously.
+
+**Files:**
+- Modify: `ba2_trade_platform/modules/accounts/TastyTradeAccount.py` (one import line; new
+  `_ZeroQuantityAfterRounding` above the class; `_equity_quantity_precisions`,
+  `clear_quantity_precision_cache`, `_tradable_quantity`, `_record_fractional_adjustment` added; the
+  precision block and the fractionability lines inside `get_symbol_margin_info` replaced; one line
+  changed in `_build_new_order` `:804` and one in `_submit_order_impl` `:904`)
+- Test: `tests/test_tastytrade_account.py`
+
+All line numbers below are for the file **as it stands before Task 87**; Task 87 adds one import
+line at the top (`from dataclasses import replace`) and a block above `get_balance_history`, so
+everything from line 6 down shifts by one. Every edit is anchored on exact text, so use the anchors
+rather than the numbers.
+
+- [ ] **Step 1: Write the failing test**
+
+Two LANDED tests assert the pre-tri-state behaviour and must be rewritten first — they are the
+contract change, so they belong in this step.
+
+Replace, in `tests/test_tastytrade_account.py`, the test that reads exactly:
+
+```python
+def test_symbol_margin_info_leaves_the_increment_unknown_when_precision_is_unavailable():
+    """I7. `min_trade_increment` is the broker's published quantity step, and None
+    means "the broker did not say" -- never a fabricated or derived number. With the
+    precision table unreachable, a fractionable symbol's step is genuinely unknown."""
+    acct = _bare_account()
+    acct._account.get_margin_requirements = AsyncMock(return_value=_margin_report())
+    acct._account.get_positions = AsyncMock(return_value=[])
+
+    with patch("tastytrade.instruments.Equity.get",
+               new=AsyncMock(return_value=[_FakeEquity("AAPL")])), \
+         patch("tastytrade.instruments.get_quantity_decimal_precisions",
+               new=AsyncMock(side_effect=RuntimeError("gateway timeout"))):
+        info = acct.get_symbol_margin_info(["AAPL"])
+
+    assert info["AAPL"].fractionable is True
+    assert info["AAPL"].min_trade_increment is None
+```
+
+with:
+
+```python
+def test_symbol_margin_info_reports_unknown_when_the_precision_table_is_unavailable():
+    """I7, restated for the tri-state. An eligible symbol whose STEP the broker never
+    published is reported `fractionable=None, min_trade_increment=1.0`, not
+    `True/None`.
+
+    `True/None` would let the engine size on DEFAULT_FRACTIONAL_DECIMALS' made-up 1e-4
+    grid while `_tradable_quantity` floors the very same order to whole shares -- the
+    plan and the execution would disagree. And `False` would be worse still: the broker
+    said the symbol IS eligible, so reporting "not fractionable" invents a broker fact.
+    None is the honest third state.
+    """
+    acct = _bare_account()
+    acct._account.get_margin_requirements = AsyncMock(return_value=_margin_report())
+    acct._account.get_positions = AsyncMock(return_value=[])
+
+    with patch("tastytrade.instruments.Equity.get",
+               new=AsyncMock(return_value=[_FakeEquity("AAPL")])), \
+         patch("tastytrade.instruments.get_quantity_decimal_precisions",
+               new=AsyncMock(side_effect=RuntimeError("gateway timeout"))):
+        info = acct.get_symbol_margin_info(["AAPL"])
+
+    assert info["AAPL"].fractionable is None
+    assert info["AAPL"].min_trade_increment == 1.0
+```
+
+Replace the test that reads exactly:
+
+```python
+def test_symbol_margin_info_treats_an_unknown_fractionability_as_not_fractionable():
+    """M19. `is_fractional_quantity_eligible` is Optional in the SDK. None means the
+    broker did not say, which must NOT be read as "yes, split it" -- a fractional
+    quantity on a whole-share-only name is rejected at submission."""
+    acct = _bare_account()
+    equity_patch, precision_patch = _wire_margin_sources(
+        acct, equities=[_FakeEquity("AAPL", is_fractional_quantity_eligible=None)],
+        report=_margin_report(), precisions=[_precision()], positions=[])
+
+    with equity_patch, precision_patch:
+        info = acct.get_symbol_margin_info(["AAPL"])
+
+    assert info["AAPL"].fractionable is False
+    assert info["AAPL"].min_trade_increment == 1.0
+```
+
+with:
+
+```python
+def test_symbol_margin_info_treats_an_unstated_eligibility_flag_as_unknown_never_as_false():
+    """M19, restated for the tri-state. `is_fractional_quantity_eligible` is
+    `bool | None` (instruments.py:262). None means the broker did not say, which must
+    NOT be read as "yes, split it" -- and must NOT be flattened into `False` either.
+    `MarginInfo.fractionable` is Optional[bool] for exactly this: the engine's
+    "fractionable unknown - whole shares" branch reads `m.fractionable is None`, and a
+    fabricated False would report it as a broker refusal instead.
+
+    The SIZING is identical either way (increment 1.0 -> whole shares), which is why
+    this is safe; only the REASON the operator is shown differs, and it should be true.
+    """
+    acct = _bare_account()
+    equity_patch, precision_patch = _wire_margin_sources(
+        acct, equities=[_FakeEquity("AAPL", is_fractional_quantity_eligible=None)],
+        report=_margin_report(), precisions=[_precision()], positions=[])
+
+    with equity_patch, precision_patch:
+        info = acct.get_symbol_margin_info(["AAPL"])
+
+    assert info["AAPL"].fractionable is None
+    assert info["AAPL"].min_trade_increment == 1.0
+```
+
+Then append to `tests/test_tastytrade_account.py`:
+
+```python
+# ---------------------------------------------------------------------------
+# Fractionability pre-check
+# ---------------------------------------------------------------------------
+
+def test_quantity_precisions_prefer_the_per_symbol_row_over_the_generic_one():
+    """QuantityDecimalPrecision publishes ONE generic equity row (symbol=None) plus
+    per-symbol rows that OVERRIDE it (instruments.py:76-85). Sizing an overridden name
+    on the generic grid gets the order rejected."""
+    acct = _bare_account()
+
+    with patch("tastytrade.instruments.get_quantity_decimal_precisions",
+               new=AsyncMock(return_value=[
+                   _precision(minimum_increment_precision=5, symbol=None),
+                   _precision(minimum_increment_precision=2, symbol="BRKB"),
+                   _precision(minimum_increment_precision=8,
+                              symbol="BTC", instrument_type=TTInstrumentType.CRYPTOCURRENCY),
+               ])):
+        precisions = acct._equity_quantity_precisions()
+
+    assert precisions[None] == 5
+    assert precisions["BRKB"] == 2
+    # Non-equity rows are not equity precision.
+    assert "BTC" not in precisions
+
+
+def test_quantity_precisions_are_fetched_once_and_cached():
+    acct = _bare_account()
+    fetch = AsyncMock(return_value=[_precision(minimum_increment_precision=5)])
+
+    with patch("tastytrade.instruments.get_quantity_decimal_precisions", new=fetch):
+        acct._equity_quantity_precisions()
+        acct._equity_quantity_precisions()
+
+    assert fetch.await_count == 1
+
+
+def test_quantity_precisions_return_empty_when_the_fetch_fails():
+    """{} means 'the broker did not say'. It must never be cached as if it had."""
+    acct = _bare_account()
+    fetch = AsyncMock(side_effect=RuntimeError("503"))
+
+    with patch("tastytrade.instruments.get_quantity_decimal_precisions", new=fetch):
+        assert acct._equity_quantity_precisions() == {}
+        acct._equity_quantity_precisions()
+
+    assert fetch.await_count == 2
+
+
+def test_clear_quantity_precision_cache_forces_the_next_lookup_to_refetch():
+    """Every TTL cache in this codebase ships an explicit clear companion (contract
+    1.11). A 24-hour TTL is not soon enough for a user who hits Refresh knowing
+    TastyTrade just published a step, and this account object lives for the whole
+    process."""
+    acct = _bare_account()
+    fetch = AsyncMock(return_value=[_precision(minimum_increment_precision=5)])
+
+    with patch("tastytrade.instruments.get_quantity_decimal_precisions", new=fetch):
+        acct._equity_quantity_precisions()
+        acct.clear_quantity_precision_cache()
+        assert acct._equity_quantity_precisions() == {None: 5}
+
+    assert fetch.await_count == 2
+
+
+def test_symbol_margin_info_uses_a_per_symbol_precision_override():
+    acct = _bare_account()
+    equity_patch, precision_patch = _wire_margin_sources(
+        acct,
+        equities=[_FakeEquity("BRKB", is_fractional_quantity_eligible=True)],
+        report=_margin_report(),
+        precisions=[_precision(minimum_increment_precision=5, symbol=None),
+                    _precision(minimum_increment_precision=2, symbol="BRKB")],
+        positions=[])
+
+    with equity_patch, precision_patch:
+        info = acct.get_symbol_margin_info(["BRKB"])
+
+    assert info["BRKB"].fractionable is True
+    assert info["BRKB"].min_trade_increment == pytest.approx(0.01)
+
+
+def test_symbol_margin_info_reports_unknown_when_no_precision_is_published(monkeypatch):
+    """The broker answered "eligible" and published no grid. No published grid is not
+    licence to invent one, and it is not licence to call the symbol ineligible either."""
+    _capture_errors(monkeypatch)
+    acct = _bare_account()
+    equity_patch, precision_patch = _wire_margin_sources(
+        acct, equities=[_FakeEquity("AAPL", is_fractional_quantity_eligible=True)],
+        report=_margin_report(), precisions=[], positions=[])
+
+    with equity_patch, precision_patch:
+        info = acct.get_symbol_margin_info(["AAPL"])
+
+    assert info["AAPL"].fractionable is None
+    assert info["AAPL"].min_trade_increment == 1.0
+
+
+def test_symbol_margin_info_reports_a_broker_no_as_a_real_false():
+    """The tri-state's other end. `is_fractional_quantity_eligible is False` is a real
+    broker answer and must reach the engine as `False`, distinct from the `None` the
+    two tests above produce -- False means "we asked and it said no"."""
+    acct = _bare_account()
+    equity_patch, precision_patch = _wire_margin_sources(
+        acct, equities=[_FakeEquity("BRKA", is_fractional_quantity_eligible=False)],
+        report=_margin_report(),
+        precisions=[_precision(minimum_increment_precision=5)], positions=[])
+
+    with equity_patch, precision_patch:
+        info = acct.get_symbol_margin_info(["BRKA"])
+
+    assert info["BRKA"].fractionable is False
+    assert info["BRKA"].min_trade_increment == 1.0
+
+
+def test_symbol_margin_info_never_emits_a_none_increment_by_construction():
+    """A CONSEQUENCE of the table above, not a contract.
+
+    Every TastyTrade branch assigns either 1.0 or a real published step, so this
+    adapter happens never to produce `min_trade_increment=None`. That does NOT make
+    None illegal: account_types.py:131-136 documents None as "the broker published no
+    step", Alpaca still emits it, and `fractionable=True, min_trade_increment=None`
+    remains a legal pair. Nothing may rely on TastyTrade's accident.
+    """
+    acct = _bare_account()
+    equity_patch, precision_patch = _wire_margin_sources(
+        acct,
+        equities=[_FakeEquity("AAPL", is_fractional_quantity_eligible=True),
+                  _FakeEquity("BRKA", is_fractional_quantity_eligible=False),
+                  _FakeEquity("MSFT", is_fractional_quantity_eligible=None)],
+        report=_margin_report(),
+        precisions=[_precision(minimum_increment_precision=5)], positions=[])
+
+    with equity_patch, precision_patch:
+        info = acct.get_symbol_margin_info(["AAPL", "BRKA", "MSFT"])
+
+    assert all(entry.min_trade_increment is not None for entry in info.values())
+
+
+def test_tradable_quantity_quantises_an_eligible_symbol_downward():
+    acct = _bare_account()
+
+    with patch("tastytrade.instruments.get_quantity_decimal_precisions",
+               new=AsyncMock(return_value=[_precision(minimum_increment_precision=4)])):
+        qty = acct._tradable_quantity(
+            _FakeEquity("AAPL", is_fractional_quantity_eligible=True), 0.43219)
+
+    # DOWN, never up: rounding up spends buying power the plan did not budget.
+    assert qty == Decimal("0.4321")
+    assert str(qty) == "0.4321"
+
+
+def test_tradable_quantity_keeps_a_whole_number_whole_on_the_wire():
+    """Decimal('100.00000') serialises as "100.00000" and Decimal.normalize() would turn
+    it into "1E+2" -- not a quantity any broker should be shown."""
+    acct = _bare_account()
+
+    with patch("tastytrade.instruments.get_quantity_decimal_precisions",
+               new=AsyncMock(return_value=[_precision(minimum_increment_precision=5)])):
+        qty = acct._tradable_quantity(
+            _FakeEquity("AAPL", is_fractional_quantity_eligible=True), 100.0)
+
+    assert str(qty) == "100"
+
+
+def test_tradable_quantity_floors_a_symbol_that_is_not_fractional_eligible(monkeypatch):
+    _capture_errors(monkeypatch)
+    acct = _bare_account()
+
+    with patch("tastytrade.instruments.get_quantity_decimal_precisions",
+               new=AsyncMock(return_value=[_precision(minimum_increment_precision=5)])):
+        qty = acct._tradable_quantity(
+            _FakeEquity("BRKA", is_fractional_quantity_eligible=False), 2.9)
+
+    assert qty == Decimal("2")
+
+
+def test_tradable_quantity_floors_when_no_precision_is_published():
+    acct = _bare_account()
+
+    with patch("tastytrade.instruments.get_quantity_decimal_precisions",
+               new=AsyncMock(return_value=[])):
+        qty = acct._tradable_quantity(
+            _FakeEquity("AAPL", is_fractional_quantity_eligible=True), 2.9)
+
+    assert qty == Decimal("2")
+
+
+def test_tradable_quantity_raises_when_rounding_leaves_nothing():
+    from ba2_trade_platform.modules.accounts.TastyTradeAccount import _ZeroQuantityAfterRounding
+
+    acct = _bare_account()
+
+    with patch("tastytrade.instruments.get_quantity_decimal_precisions",
+               new=AsyncMock(return_value=[_precision(minimum_increment_precision=4)])):
+        with pytest.raises(_ZeroQuantityAfterRounding):
+            acct._tradable_quantity(
+                _FakeEquity("AAPL", is_fractional_quantity_eligible=True), 0.00004)
+        with pytest.raises(_ZeroQuantityAfterRounding):
+            acct._tradable_quantity(
+                _FakeEquity("BRKA", is_fractional_quantity_eligible=False), 0.6)
+
+
+def test_the_plan_and_the_submission_agree_on_an_eligible_symbol_with_no_published_step():
+    """The reason the no-step case is reported as whole shares, in one assertion.
+
+    get_symbol_margin_info says `min_trade_increment=1.0` (whole shares) and
+    _tradable_quantity submits whole shares. Reporting `True` / `None` instead would
+    have the dry run promise 2.5 shares while the very next call floors it to 2.
+    """
+    acct = _bare_account()
+    equity_patch, precision_patch = _wire_margin_sources(
+        acct, equities=[_FakeEquity("AAPL", is_fractional_quantity_eligible=True)],
+        report=_margin_report(), precisions=[], positions=[])
+
+    with equity_patch, precision_patch:
+        info = acct.get_symbol_margin_info(["AAPL"])
+        qty = acct._tradable_quantity(
+            _FakeEquity("AAPL", is_fractional_quantity_eligible=True), 2.5)
+
+    assert info["AAPL"].fractionable is None
+    assert info["AAPL"].min_trade_increment == 1.0
+    assert qty == Decimal("2")
+
+
+def test_build_new_order_sends_a_fractional_leg_quantity_and_no_notional_field():
+    """Fractional is a fractional Leg.quantity (order.py:140 types it `Decimal | int |
+    None`). TastyTrade needs no notional order type and none is ever emitted."""
+    account_def, order = _tt_trading_order(quantity=0.4321)
+    acct = _bare_account()
+    acct.id = account_def.id
+
+    with patch("tastytrade.instruments.Equity.get",
+               new=AsyncMock(return_value=_FakeEquity(
+                   "AAPL", is_fractional_quantity_eligible=True))), \
+         patch("tastytrade.instruments.get_quantity_decimal_precisions",
+               new=AsyncMock(return_value=[_precision(minimum_increment_precision=5)])):
+        new_order = acct._build_new_order(order)
+
+    assert new_order.legs[0].quantity == Decimal("0.4321")
+    payload = new_order.model_dump_json(by_alias=True, exclude_none=True)
+    assert '"quantity":"0.4321"' in payload
+    assert "notional" not in payload
+    assert "value-effect" not in payload
+
+
+def test_build_new_order_floors_a_fractional_qty_on_an_ineligible_symbol(monkeypatch):
+    """The engine already resolves these (user decision D1 bumps a floor-to-zero to one
+    whole share, or skips the symbol when one share overshoots the bound). This is
+    submission-time enforcement for a manual order, or a plan built while the metadata
+    fetch was failing."""
+    _capture_errors(monkeypatch)
+    account_def, order = _tt_trading_order(symbol="BRKA", quantity=2.9)
+    acct = _bare_account()
+    acct.id = account_def.id
+
+    with patch("tastytrade.instruments.Equity.get",
+               new=AsyncMock(return_value=_FakeEquity(
+                   "BRKA", is_fractional_quantity_eligible=False))), \
+         patch("tastytrade.instruments.get_quantity_decimal_precisions",
+               new=AsyncMock(return_value=[_precision(minimum_increment_precision=5)])):
+        new_order = acct._build_new_order(order)
+
+    assert new_order.legs[0].quantity == Decimal("2")
+
+
+def test_submit_order_impl_cancels_rather_than_errors_when_rounding_leaves_zero(monkeypatch):
+    """Nothing was rejected and nothing is wrong with the account, so the row is CANCELED
+    with the reason -- never ERROR. Same rule, and now the same method name, as
+    AlpacaAccount._record_fractional_adjustment (AlpacaAccount.py:895-920)."""
+    from ba2_trade_platform.core.types import OrderStatus
+    from ba2_trade_platform.core.db import get_instance
+    from ba2_trade_platform.core.models import TradingOrder
+
+    _capture_errors(monkeypatch)
+    account_def, order = _tt_trading_order(symbol="BRKA", quantity=0.6)
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.place_order = AsyncMock()
+
+    with patch("tastytrade.instruments.Equity.get",
+               new=AsyncMock(return_value=_FakeEquity(
+                   "BRKA", is_fractional_quantity_eligible=False))), \
+         patch("tastytrade.instruments.get_quantity_decimal_precisions",
+               new=AsyncMock(return_value=[_precision(minimum_increment_precision=5)])):
+        result = acct._submit_order_impl(order)
+
+    assert result is None
+    acct._account.place_order.assert_not_called()
+    stored = get_instance(TradingOrder, order.id)
+    assert stored.status == OrderStatus.CANCELED
+    assert "floors to 0" in (stored.comment or "")
+
+
+def test_submit_order_impl_still_passes_dry_run_false_for_a_fractional_order():
+    """place_order's dry_run DEFAULTS TO True (tastytrade/account.py:877). The fractional
+    path must not become the one call site that forgets it."""
+    account_def, order = _tt_trading_order(quantity=0.4321)
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.place_order = AsyncMock(
+        return_value=_placed_order_response(_placed_order(size="0.4321")))
+
+    with patch("tastytrade.instruments.Equity.get",
+               new=AsyncMock(return_value=_FakeEquity(
+                   "AAPL", is_fractional_quantity_eligible=True))), \
+         patch("tastytrade.instruments.get_quantity_decimal_precisions",
+               new=AsyncMock(return_value=[_precision(minimum_increment_precision=5)])):
+        acct._submit_order_impl(order)
+
+    assert acct._account.place_order.call_args.kwargs["dry_run"] is False
+    assert acct._account.place_order.call_args.args[1].legs[0].quantity == Decimal("0.4321")
+
+
+def test_every_place_order_call_site_passes_dry_run_explicitly():
+    """The SDK default is dry_run=True (tastytrade/account.py:877), so an omitted
+    argument silently turns a live submit into a no-op -- or, the other way round, would
+    make a "preview" send a real order the day someone flips the default. There are
+    exactly two call sites and both must be explicit."""
+    import inspect
+    import sys
+
+    source = inspect.getsource(sys.modules[TastyTradeAccount.__module__])
+    call_sites = [line.strip() for line in source.splitlines() if ".place_order(" in line]
+
+    assert len(call_sites) == 2, call_sites
+    assert all("dry_run=" in line for line in call_sites), call_sites
+    assert sum("dry_run=False" in line for line in call_sites) == 1, call_sites
+    assert sum("dry_run=True" in line for line in call_sites) == 1, call_sites
+
+
+def test_no_tastytrade_order_is_ever_priced_by_dollar_value():
+    """Contract 1.12: fractional means a fractional share QUANTITY, never a dollar
+    amount. TastyTrade expresses a dollar-denominated order through a `value` /
+    `value-effect` pair; neither may appear in this module."""
+    import inspect
+    import sys
+
+    source = inspect.getsource(sys.modules[TastyTradeAccount.__module__])
+
+    assert "value_effect" not in source
+    assert "NOTIONAL" not in source
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `venv/bin/python -m pytest tests/test_tastytrade_account.py -v -k "precision or tradable_quantity or fractional or margin_info or notional or rounding or dollar_value or place_order_call_site or published_step"`
+
+Expected: FAIL — `test_quantity_precisions_prefer_the_per_symbol_row_over_the_generic_one` fails
+with `AttributeError: 'TastyTradeAccount' object has no attribute '_equity_quantity_precisions'`;
+`test_clear_quantity_precision_cache_forces_the_next_lookup_to_refetch` fails with
+`AttributeError: 'TastyTradeAccount' object has no attribute 'clear_quantity_precision_cache'`;
+`test_tradable_quantity_raises_when_rounding_leaves_nothing` fails at import with
+`ImportError: cannot import name '_ZeroQuantityAfterRounding' from
+'ba2_trade_platform.modules.accounts.TastyTradeAccount'`;
+`test_symbol_margin_info_uses_a_per_symbol_precision_override` fails with
+`assert 1e-05 == 0.01` (the generic row wins);
+`test_symbol_margin_info_reports_unknown_when_the_precision_table_is_unavailable` fails with
+`assert True is None`;
+`test_symbol_margin_info_treats_an_unstated_eligibility_flag_as_unknown_never_as_false` fails with
+`assert False is None`;
+`test_build_new_order_sends_a_fractional_leg_quantity_and_no_notional_field` passes already
+(the leg is built straight from `Decimal(str(quantity))`), and
+`test_build_new_order_floors_a_fractional_qty_on_an_ineligible_symbol` fails with
+`assert Decimal('2.9') == Decimal('2')`.
+`test_every_place_order_call_site_passes_dry_run_explicitly` and
+`test_no_tastytrade_order_is_ever_priced_by_dollar_value` pass already — they are regression pins
+for behaviour this task must not break.
+
+- [ ] **Step 3: Write minimal implementation**
+
+In `ba2_trade_platform/modules/accounts/TastyTradeAccount.py`:
+
+**(a)** Change the decimal import at line 5, which reads exactly:
+
+```python
+from decimal import Decimal
+```
+
+to:
+
+```python
+from decimal import Decimal, ROUND_DOWN
+```
+
+**(b)** Insert immediately above `class TastyTradeAccount(AccountInterface):` (line 28):
+
+```python
+class _ZeroQuantityAfterRounding(Exception):
+    """Rounding a quantity onto the broker's grid left nothing to send.
+
+    A SKIP, not a failure: nothing was rejected and nothing is wrong with the account,
+    so ``_submit_order_impl`` marks the row CANCELED with the reason and never ERROR --
+    the same rule AlpacaAccount applies through ``_record_fractional_adjustment``
+    (AlpacaAccount.py:895-920). It is its own type precisely so it can be caught BEFORE
+    the broad ``except Exception -> _handle_order_submit_error`` that owns real broker
+    faults.
+    """
+```
+
+**(c)** Insert these four methods immediately above `def get_symbol_margin_info` (line 1505):
+
+```python
+    #: One fetch of /instruments/quantity-decimal-precisions serves every symbol and
+    #: changes about as often as a listing does. A CLASS attribute so a bare instance
+    #: built with object.__new__ (the test idiom) still has it.
+    _QUANTITY_PRECISION_TTL = 24 * 60 * 60
+    _quantity_precision_cache = None   # (fetched_at, {symbol_or_None: precision})
+
+    def _equity_quantity_precisions(self) -> Dict[Optional[str], int]:
+        """``minimum_increment_precision`` per EQUITY symbol, plus the generic row.
+
+        ``get_quantity_decimal_precisions`` (instruments.py:948-958) is a MODULE-LEVEL
+        coroutine, not a method, and returns a flat list of every published precision:
+        one generic row per instrument type carrying ``symbol=None``, plus per-symbol
+        rows that OVERRIDE it. A symbol with no row of its own simply is not in the
+        list -- there is no server error path and no server default, because the
+        endpoint cannot be asked about a single symbol.
+
+        Callers must therefore read ``precisions.get(symbol, precisions.get(None))`` and
+        treat a miss on BOTH as "the broker did not say" -- never as a guessed precision.
+
+        Returns:
+            Dict[Optional[str], int]: keyed by upper-cased symbol, with ``None`` holding
+            the generic equity row. ``{}`` when the fetch FAILED -- and that ``{}`` is
+            NOT cached, so the next caller retries rather than inheriting an outage. A
+            successful empty response is cached like any other answer.
+        """
+        import time
+        from tastytrade.instruments import get_quantity_decimal_precisions
+
+        now = time.time()
+        cached = self._quantity_precision_cache
+        if cached is not None and (now - cached[0]) < self._QUANTITY_PRECISION_TTL:
+            return cached[1]
+
+        try:
+            rows = self._run_async(get_quantity_decimal_precisions(self._session))
+        except Exception as e:
+            logger.warning(f"[Account {self.id}] Quantity precision fetch failed: {e}")
+            return {}
+
+        precisions: Dict[Optional[str], int] = {}
+        for row in rows:
+            if row.instrument_type != TTInstrumentType.EQUITY:
+                continue
+            key = row.symbol.strip().upper() if row.symbol else None
+            precisions[key] = int(row.minimum_increment_precision)
+        self._quantity_precision_cache = (now, precisions)
+        return precisions
+
+    def clear_quantity_precision_cache(self) -> None:
+        """Drop the cached quantity-precision table so the next lookup refetches.
+
+        The EXPLICIT companion to ``_QUANTITY_PRECISION_TTL``: every TTL cache in this
+        codebase ships one (AlpacaAccount.clear_margin_info_cache is the model). A
+        24-hour TTL is not soon enough for a user who hits Refresh because they know
+        TastyTrade just published a step for a name, and this account object lives for
+        the whole process.
+        """
+        cached = self._quantity_precision_cache
+        count = len(cached[1]) if cached else 0
+        self._quantity_precision_cache = None
+        logger.debug(
+            f"[Account {self.id}] Cleared {count} cached equity quantity precision(s)")
+
+    def _tradable_quantity(self, equity, quantity: float) -> Decimal:
+        """The quantity TastyTrade will actually accept for this equity.
+
+        Fractional here means a fractional ``Leg.quantity`` on an ORDINARY order --
+        order.py:140 types it ``Decimal | int | None`` and it serialises as
+        ``"quantity":"0.4321"``. TastyTrade needs no notional order type for fractional
+        and none is emitted anywhere in this class.
+
+        Two broker rules, both enforced by rounding DOWN. Never up: rounding up spends
+        buying power the allocation plan did not budget.
+
+          * A symbol whose ``is_fractional_quantity_eligible`` is not exactly ``True``
+            is floored to whole shares. The field is ``bool | None``
+            (instruments.py:262) and ``None`` means the broker did not say, which is
+            not permission.
+          * An eligible symbol is quantised onto the published decimal grid. A symbol
+            absent from the precision table inherits the generic equity row; absent
+            from BOTH, it is floored to whole shares rather than sized on a guessed
+            grid -- which is exactly what ``get_symbol_margin_info`` reports for that
+            case (``fractionable=None, min_trade_increment=1.0``), so the plan and the
+            execution cannot diverge.
+
+        This is submission-time ENFORCEMENT only, i.e. defence in depth. The allocation
+        engine already sized off these same two facts, published through
+        ``get_symbol_margin_info``, and under user decision D1 it resolves a
+        floor-to-zero itself -- bumping to one whole share when one share is within the
+        bounded multiple of the target notional, and skipping the symbol with its unmet
+        notional reported when it is not. This path exists for a manual order, or for a
+        plan built while the metadata fetch was failing.
+
+        Raises:
+            _ZeroQuantityAfterRounding: when rounding leaves nothing to send.
+        """
+        symbol = (getattr(equity, "symbol", "") or "").strip().upper() or "?"
+        eligibility = getattr(equity, "is_fractional_quantity_eligible", None)
+        requested = Decimal(str(quantity))
+        if requested <= 0:
+            raise _ZeroQuantityAfterRounding(
+                f"quantity {quantity} for {symbol} is not positive - nothing to submit")
+
+        precision = None
+        if eligibility is True:
+            precisions = self._equity_quantity_precisions()
+            precision = precisions.get(symbol, precisions.get(None))
+
+        if precision is None:
+            allowed = requested.quantize(Decimal("1"), rounding=ROUND_DOWN)
+        else:
+            allowed = requested.quantize(Decimal(1).scaleb(-precision), rounding=ROUND_DOWN)
+
+        if allowed <= 0:
+            raise _ZeroQuantityAfterRounding(
+                f"qty {quantity} for {symbol} floors to 0 on the broker's grid "
+                f"(fractional_eligible={eligibility!r}, precision={precision}) "
+                f"- nothing submitted")
+
+        if allowed != requested:
+            logger.warning(
+                f"[Account {self.id}] {symbol}: requested qty {requested} is not tradable "
+                f"(fractional_eligible={eligibility!r}, precision={precision}); "
+                f"submitting {allowed} instead")
+
+        # Keep a whole number whole on the wire. Decimal('100.00000') serialises as
+        # "100.00000", and Decimal.normalize() would render it "1E+2" -- not a quantity
+        # any broker should be shown. normalize() is only reached for a NON-integral
+        # value, where it can never produce exponent notation.
+        integral = allowed.to_integral_value()
+        return integral if allowed == integral else allowed.normalize()
+
+    def _record_fractional_adjustment(self, trading_order: TradingOrder, reason: str) -> None:
+        """Mark a row CANCELED with WHY, so the Pending Orders UI shows it.
+
+        The TastyTrade twin of ``AlpacaAccount._record_fractional_adjustment``
+        (AlpacaAccount.py:895-920), and deliberately the SAME NAME: same status, same
+        comment-append, same 500-char cap. Kept per-broker rather than lifted onto
+        AccountInterface because only these two brokers have a quantity grid -- the
+        shared name is what makes the ~10-line duplicate trivially liftable the day a
+        third one arrives.
+
+        Alpaca's version also takes a replacement quantity; this one does not, because
+        TastyTrade's only caller is the SKIP path -- a floored (but non-zero) quantity
+        never reaches the database here, it is computed inside ``_build_new_order``.
+        """
+        fresh_order = get_instance(TradingOrder, trading_order.id)
+        if not fresh_order:
+            logger.error(
+                f"Could not find order {trading_order.id} to record fractional "
+                f"adjustment: {reason}")
+            return
+        fresh_order.status = OrderStatus.CANCELED
+        fresh_order.comment = (
+            f"{fresh_order.comment} | {reason}" if fresh_order.comment else reason)[:500]
+        update_instance(fresh_order)
+```
+
+**(d)** In `get_symbol_margin_info`, change the import line at the top of the method, which reads
+exactly:
+
+```python
+        from tastytrade.instruments import Equity, get_quantity_decimal_precisions
+```
+
+to:
+
+```python
+        from tastytrade.instruments import Equity
+```
+
+Then delete the whole inline precision block, which reads exactly:
+
+```python
+        increment = None
+        try:
+            for precision in self._run_async(get_quantity_decimal_precisions(self._session)):
+                # The generic EQUITY row (symbol is None) is the one that applies to
+                # every equity; per-symbol overrides are not needed for sizing.
+                if precision.instrument_type == TTInstrumentType.EQUITY and precision.symbol is None:
+                    increment = float(10 ** -int(precision.minimum_increment_precision))
+                    break
+        except Exception as e:
+            logger.warning(f"[Account {self.id}] Quantity precision fetch failed: {e}")
+```
+
+and replace it with:
+
+```python
+        precisions = self._equity_quantity_precisions()
+```
+
+Then replace the per-symbol fractionability lines, which read exactly:
+
+```python
+            # `is_fractional_quantity_eligible` is Optional in the SDK; None means the
+            # broker did not say, which must read as "whole shares only". Assuming
+            # fractional gets the order rejected at submission.
+            fractionable = bool(getattr(equity, "is_fractional_quantity_eligible", False))
+```
+
+with:
+
+```python
+            # TRI-STATE. `is_fractional_quantity_eligible` is `bool | None`
+            # (instruments.py:262) and `MarginInfo.fractionable` is Optional[bool] for
+            # exactly that reason: None is NOT False. Never coerce, and never report
+            # False for a symbol the broker did not describe -- that invents a broker
+            # fact, which is the failure mode this whole feature exists to kill.
+            #
+            #   False              -> False / 1.0   (a real broker "no")
+            #   None               -> None  / 1.0   (the broker did not say)
+            #   True + a precision -> True  / 10**-p
+            #   True, no precision -> None  / 1.0   (eligible, step unpublished)
+            #
+            # The last line is the subtle one. The step is unknown, so
+            # `_tradable_quantity` will submit WHOLE SHARES for this symbol; the plan
+            # must therefore say whole shares too, or the dry run promises 2.5 shares
+            # that the adapter floors to 2. Reporting True with increment None would
+            # instead push the engine onto DEFAULT_FRACTIONAL_DECIMALS' made-up 1e-4
+            # grid (portfolio_allocation.py:351-372), and reporting False would claim
+            # the broker refused a symbol it actually approved.
+            eligibility = getattr(equity, "is_fractional_quantity_eligible", None)
+            precision = precisions.get(symbol, precisions.get(None))
+            if eligibility is False:
+                # Whole shares BY DEFINITION -- a fact about the symbol, not a reading,
+                # so it survives the precision table being unreachable.
+                fractionable = False
+                increment = 1.0
+            elif eligibility is True and precision is not None:
+                fractionable = True
+                increment = float(10 ** -precision)
+            else:
+                if eligibility is True:
+                    logger.warning(
+                        f"[Account {self.id}] {symbol} is fractional-eligible but the broker "
+                        f"published no quantity precision; reporting the step as whole shares "
+                        f"and the eligibility as UNKNOWN (not as 'not fractionable')")
+                fractionable = None
+                increment = 1.0
+```
+
+Finally, change the `MarginInfo(...)` construction's increment line, which reads exactly:
+
+```python
+                min_trade_increment=increment if fractionable else 1.0,
+```
+
+to:
+
+```python
+                # Already resolved above: 1.0, or a real published step. This adapter
+                # therefore happens never to emit None -- BY CONSTRUCTION, not by
+                # contract. account_types.py:131-136 keeps None legal and meaningful
+                # ("the broker published no step") and Alpaca still emits it, so no
+                # caller may assume otherwise.
+                min_trade_increment=increment,
+```
+
+**(e)** In `_build_new_order` (line 804), change
+
+```python
+        leg = equity.build_leg(Decimal(str(trading_order.quantity)), action)
+```
+
+to
+
+```python
+        leg = equity.build_leg(self._tradable_quantity(equity, trading_order.quantity), action)
+```
+
+**(f)** In `_submit_order_impl` (line 904), replace
+
+```python
+            new_order = self._build_new_order(trading_order, is_closing_order=is_closing_order)
+```
+
+with
+
+```python
+            try:
+                new_order = self._build_new_order(
+                    trading_order, is_closing_order=is_closing_order)
+            except _ZeroQuantityAfterRounding as e:
+                # A SKIP, not a failure -- CANCELED with the reason, never ERROR
+                # (AlpacaAccount._record_fractional_adjustment makes the same call).
+                logger.warning(
+                    f"Order {trading_order.id} ({trading_order.symbol}) skipped: {e}")
+                self._record_fractional_adjustment(trading_order, f"skipped: {e}")
+                return None
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+First the explicit `dry_run` check demanded by the money-path rules — every `place_order` call site
+must name it, because the SDK default is `True`:
+
+Run: `grep -n "\.place_order(" ba2_trade_platform/modules/accounts/TastyTradeAccount.py`
+
+Expected: exactly two lines —
+`self._account.place_order(self._session, new_order, dry_run=False))` inside `_submit_order_impl`,
+and `self._account.place_order(self._session, new_order, dry_run=True))` inside
+`preview_order_impact`. No third call site, and no call without `dry_run=`.
+
+Then:
+
+Run: `venv/bin/python -m pytest tests/test_tastytrade_account.py -v`
+
+Expected: every test in the file passes, including the 20 new ones and the two rewritten
+`test_symbol_margin_info_*` tests. The other pre-existing `test_symbol_margin_info_*` tests from
+Task 54 are unaffected: `test_symbol_margin_info_reports_fractionability_and_increment` still gets
+`fractionable is True` / `1e-5` for the eligible symbol and `fractionable is False` / `1.0` for the
+ineligible one, because the generic `_precision(minimum_increment_precision=5, symbol=None)` row is
+present in that fixture, and
+`test_symbol_margin_info_reports_whole_shares_for_a_non_fractionable_symbol_even_without_precision`
+still gets `False` / `1.0` because a broker "no" is a fact about the symbol, not a reading.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add ba2_trade_platform/modules/accounts/TastyTradeAccount.py tests/test_tastytrade_account.py
+git commit -m "feat(tastytrade): per-symbol quantity precision, tri-state fractionable, submit-time guard"
+```
+
+---
+
+## Block D - Allocation engine and wizard: gating, bump, redistribute
+
+## Section G2 — Market-hours gating, mixed fractional eligibility, bump-and-redistribute
+
+Eight tasks. **All eight are BRAND NEW.** None replaces an existing numbered task, but each one
+edits code an earlier Section F/G task creates, so they must land *after* it:
+
+| New task | Edits code created by | Also edits landed code |
+|---|---|---|
+| N1 | — | `packages/common/ba2_common/core/portfolio_allocation.py` (Section C, landed) |
+| N2 | — | same engine module |
+| N3 | Task 70 (`dry_run_rows`, `filter_plan_rows`) | same engine module |
+| N4 | Task 71 (`AllocationSteps`), Task 75 (`run_allocation`) | `models.py`, `portfolio_allocation_store.py`, `tests/test_portfolio_allocation_store.py`, `tests/test_portfolio_allocation_models.py` (all landed) |
+| N5 | Task 59 (`ui/utils/portfolio_allocation_view.py`) | — |
+| N6 | Task 69 (`portfolio_allocation_service.py`, `FakeAccount`), Task 75 (`run_allocation`) | — |
+| N7 | Task 70 (`AllocationWizard`), Task 71 (`AllocationSteps`), Task 74 (`render_income_panel`) | — |
+| N8 | Task 58/61/64/66 (`ui/pages/portfolio_allocation.py`), Tasks 68-75 | — |
+
+Order: N1 → N2 → N3 → N4 → N5 → N6 → N7 → N8, all after Task 75 and before Section H.
+
+**Cross-chunk position (binding, from the canonical contract).**
+
+* Everything here depends on chunk `interface`'s Block A having landed: `MarketHours`, the three
+  `MARKET_HOURS_SOURCE_*` constants, `MarginInfo.fractionable: Optional[bool] = None`,
+  `market_calendar.NY_TZ` and the `ReadOnlyAccountInterface.get_market_hours()` template. **This
+  chunk never defines or re-spells any of them.**
+* N6 lands the `blocked` / `blocked_reason` half of `run_allocation`. Chunk `ledger` rewrites the
+  same function immediately afterwards and **must preserve the blocked early-return**. N6 therefore
+  emits the FULL merged key set (see the table in N6), so no consumer sees a key appear or vanish
+  between the two landings.
+* **Layering:** `run_allocation` must NOT import `ui/utils/portfolio_allocation_view.py`. The
+  service re-derives the gate straight from `MarketHours`; the banner copy lives only in the view.
+* **Eligibility is `MarginInfo.fractionable`, and nothing else.** Do not call Alpaca's
+  `preview_fractional_submission` / `get_fractionability` from anywhere in this chunk — they are
+  Alpaca-internal. `None` means "the broker did not say" and must never collapse to `False`.
+* **No notional / dollar-value orders anywhere.** Fractional means a fractional share QUANTITY.
+  `unmet_notional`, `target_notional`, `projected_notional`, `residual_notional`, `base_notional`
+  and `no_order_notional` are MEASUREMENTS, explicitly whitelisted by the contract — do not
+  "correct" them into quantities.
+* The engine stays PURE: eligibility arrives as DATA (`margin: Dict[str, MarginInfo]`). The engine
+  never calls a broker.
+* Regular session only (decision D4). `MarketHours.status` carries the broker's own word
+  ("Extended", "Pre-market") for display, and the service quotes it in `blocked_reason` so a user
+  blocked at 17:00 is told *why*.
+
+**The two user decisions this section implements (2026-08-21).**
+
+* **D1 — floor-to-zero is BUMPED to one share, within a bounded multiple.** A non-fractionable
+  target that rounds to 0 shares gets one share so the symbol actually gets a position — but only
+  when one share's notional is within `BUMP_TO_ONE_SHARE_MAX_MULTIPLE` of the target. Above that
+  bound the symbol is skipped and the miss is priced. Task 89.
+* **D2 — the rounding residual is REDISTRIBUTED inside the label, in BOTH directions.** Whole-share
+  rounding leaves the label short; D1's bumps can push it long. One signed pass moves the
+  difference onto the symbols that can absorb it. Task 90.
+
+D1 and D2 pull against each other by construction — a bump creates the overshoot that
+redistribution then wants to remove, and removing it would re-create the floor-to-zero D1 exists to
+prevent. The rule that stops the fight is in N2 and is load-bearing: **a row that D1 bumped is
+never an absorber.**
+
+---
+
+### Task 89: Floor-to-zero — bump to one share inside a bounded multiple, skip and price it outside
+
+A small target on a high-priced, non-fractionable symbol is **silently dropped today**. Trace it
+through the landed engine: `compute_allocation` at
+`packages/common/ba2_common/core/portfolio_allocation.py:890-892` computes
+`ideal_quantity = round_quantity(target_notional, row.price, m, ...)`, which for a $200 target on a
+$300 share returns `0.0` (`_round_shares:371` — `qty = float(math.floor(raw))`); the delta is then
+`0.0`, `_suppress_below_min_order` (`:441-445`) adds no reason because `delta` is falsy, and the row
+lands with `side=None`, `delta_quantity=0.0`, `skipped=False` and **an empty `reasons` list**.
+`dry_run_rows` (Task 70) then drops it outright — `if row.side is None or row.delta_quantity == 0:
+continue`. About a quarter of this user's symbols are not fractionable, so this is not a corner
+case; it is a recurring, invisible under-allocation.
+
+**Decision (D1): bump the target up to one tradeable unit — but only when one unit is within
+`BUMP_TO_ONE_SHARE_MAX_MULTIPLE` of the target.** Every targeted symbol should end up holding
+something; a plan that quietly owns nothing in a quarter of its names is not the plan the user
+typed. But the bump cannot be unconditional, because it is an *over*-allocation: a $50 target on a
+$500 share is a 10x overspend that eats buying power promised to the rest of the plan, and for a
+BRK.A-class name it may not fit in the account at all. So the bump is bounded, and above the bound
+the old behaviour — skip, and price the miss — remains, now as the exception rather than the rule.
+
+```python
+BUMP_TO_ONE_SHARE_MAX_MULTIPLE = 1.5
+```
+
+**Why 1.5, and why one named constant.** One constant, module level, in `__all__`, so the number is
+tunable in one place and quotable in the reason string; a literal scattered across two solvers is
+how the two solvers eventually disagree. The value is chosen so that the two worked examples in the
+decision land on opposite sides of it: a $200 target on a $300 stock (one share = 150% of target) is
+the case the user wants filled, and it is exactly the bound; a $50 target on a $500 stock (1000%) is
+the case the user wants refused. 1.5 also bounds the damage: the worst bump over-allocates its
+symbol by 50% of that symbol's target, and since a symbol is a fraction of its label, that overshoot
+is normally inside what Task 90's redistribution can take back off the label's fractionable
+siblings. At 2x and above the excess routinely exceeds what the siblings hold, and the label ends up
+structurally over target with nothing able to fix it. The bound is INCLUSIVE (`<=`), so the 150%
+example bumps.
+
+**Three per-symbol outcomes, and the bump is never silent.** A new `AllocationRow.sizing_outcome`
+records which of the three happened, so the dry run can colour and count them instead of
+pattern-matching reason prose:
+
+| `sizing_outcome` | meaning |
+|---|---|
+| `SIZING_OUTCOME_NORMAL` (`"normal"`) | sized by ordinary grid rounding — including a row whose bump was refused because the broker's `min_order_size` exceeds one share |
+| `SIZING_OUTCOME_BUMPED` (`"bumped-to-1"`) | the whole intended position was under one unit and one unit was inside the bound: **deliberate over-allocation** |
+| `SIZING_OUTCOME_SKIPPED_TOO_LARGE` (`"skipped-too-large"`) | under one unit and one unit was over the bound: no order, `unmet_notional` set |
+
+**What is NOT bumped, and why.** The bump fires only when the sub-unit amount IS the symbol's whole
+intended position — a flat holding in `compute_allocation`, or a symbol's share of the budget in
+`compute_label_investment`. A sub-unit *adjustment* to a position that already exists (hold 10, want
+9.6) is left alone with `REASON_ROUNDS_TO_ZERO_FMT`: the symbol already has its position, bumping a
+-0.4 trim into a full 1-share sale would be an unrequested trade in the wrong direction, and the
+landed rule for "the trade cannot be sent" is already *leave the position where it is*
+(`_suppress_below_min_order`'s docstring). A pre-existing SHORT is not bumped either — the engine's
+targets are long-only and it only ever buys a short back.
+
+**Buying power.** A bump is an ordinary buy: it flows into `_apply_bp_scaling` with every other buy
+and is scaled (possibly to nothing) if the plan does not fit. Nothing special is needed, and nothing
+here can overspend the account.
+
+The same `unmet_notional` field is set on the three other places the engine already zeroes a live
+intent — `min_order_size` suppression, buying-power scaling to zero, and a precheck rejection — so
+"we wanted to move this money and could not" has one carrier instead of four reason strings the UI
+would have to pattern-match.
+
+Two wording constraints, both pinned by landed tests: no new reason may contain the word `held`
+(`packages/common/tests/test_portfolio_allocation.py:1318` —
+`assert "held" not in " ".join(row.reasons)`) and none may start with `below`
+(`:1004` — `assert not any(r.startswith("below") for r in row.reasons)`). Every string added below
+starts with `target`, `one`, `weight` or a signed number.
+
+Finally this task splits "the broker says this symbol is not fractionable" from "the broker told us
+nothing about it", using the contract's canonical three-branch block. `MarginInfo.fractionable` is
+`Optional[bool]` after chunk `interface`'s widening: `True` / `False` / `None`, where `None` is
+*the broker did not say* — TastyTrade's own flag is tri-state
+(`venv/lib/python3.12/site-packages/tastytrade/instruments.py:262`,
+`is_fractional_quantity_eligible: bool | None = None`). `None` must NOT collapse to `False`: one is
+a data gap the user can fix with Refresh, the other is a fact about the instrument.
+
+**Files:**
+- Modify: `packages/common/ba2_common/core/portfolio_allocation.py`
+- Test: `packages/common/tests/test_portfolio_allocation.py` (append)
+
+- [ ] **Step 1: Write the failing test**
+
+Append to `packages/common/tests/test_portfolio_allocation.py`:
+
+```python
+# ---------------------------------------------------------------------------
+# D1: a target under one tradeable unit is bumped to one unit inside the bound,
+# and skipped-with-its-price outside it. Never silently dropped.
+# ---------------------------------------------------------------------------
+
+def test_one_share_inside_the_bound_is_bumped_and_says_so():
+    """$200 of a $300 share is 0.6667 shares. One share is 150% of target, which is
+    exactly the bound, so the symbol gets its position."""
+    qty, outcome, reason = pa.size_sub_unit_target(
+        200.0, 300.0, MarginInfo(symbol="XXX", bp_factor=1.0, fractionable=False),
+        allow_fractional=True)
+    assert qty == 1.0
+    assert outcome == pa.SIZING_OUTCOME_BUMPED
+    assert "BUMPED UP" in reason
+    assert "150% of target" in reason
+
+
+def test_the_bump_bound_is_inclusive_at_exactly_the_multiple():
+    """The boundary itself bumps. 1.5 x 200 == 300 exactly in binary, so this is a
+    real equality test, not a tolerance one."""
+    margin = MarginInfo(symbol="XXX", bp_factor=1.0, fractionable=False)
+    at_bound = 200.0 * pa.BUMP_TO_ONE_SHARE_MAX_MULTIPLE
+    assert pa.size_sub_unit_target(200.0, at_bound, margin,
+                                   allow_fractional=True)[1] == pa.SIZING_OUTCOME_BUMPED
+    just_over = at_bound + 1.0
+    assert pa.size_sub_unit_target(200.0, just_over, margin,
+                                   allow_fractional=True)[1] == pa.SIZING_OUTCOME_SKIPPED_TOO_LARGE
+
+
+def test_one_share_outside_the_bound_is_refused_and_quotes_the_limit():
+    """$50 of a $500 share is a 10x overspend. Skipped, with the arithmetic."""
+    qty, outcome, reason = pa.size_sub_unit_target(
+        50.0, 500.0, MarginInfo(symbol="XXX", bp_factor=1.0, fractionable=False),
+        allow_fractional=True)
+    assert qty == 0.0
+    assert outcome == pa.SIZING_OUTCOME_SKIPPED_TOO_LARGE
+    assert "1000% of target" in reason
+    assert "150% bump limit" in reason
+    assert not reason.startswith("below")
+    assert "held" not in reason
+
+
+def test_a_bump_the_broker_minimum_order_size_forbids_is_not_attempted():
+    """One share is inside the bound but under the broker's minimum ORDER size, so
+    there is no order to place. That is neither a bump nor a bound problem."""
+    qty, outcome, reason = pa.size_sub_unit_target(
+        200.0, 300.0,
+        MarginInfo(symbol="XXX", bp_factor=1.0, fractionable=False, min_order_size=5.0),
+        allow_fractional=True)
+    assert qty == 0.0
+    assert outcome == pa.SIZING_OUTCOME_NORMAL
+    assert "minimum order size 5" in reason
+
+
+def test_the_tradeable_unit_is_one_share_unless_the_broker_publishes_a_step():
+    assert pa.tradeable_unit(None, allow_fractional=True) == 1.0
+    assert pa.tradeable_unit(MarginInfo(symbol="X", bp_factor=1.0, fractionable=False),
+                             allow_fractional=True) == 1.0
+    assert pa.tradeable_unit(MarginInfo(symbol="X", bp_factor=1.0, fractionable=True),
+                             allow_fractional=True) == pytest.approx(0.0001)
+    assert pa.tradeable_unit(MarginInfo(symbol="X", bp_factor=1.0, fractionable=True,
+                                        min_trade_increment=0.25),
+                             allow_fractional=True) == 0.25
+    # Toggle OFF: the grid is whole shares no matter what the broker publishes.
+    assert pa.tradeable_unit(MarginInfo(symbol="X", bp_factor=1.0, fractionable=True,
+                                        min_trade_increment=0.25),
+                             allow_fractional=False) == 1.0
+
+
+def test_a_sub_one_share_buy_inside_the_bound_ends_up_holding_one_share():
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
+    margin = {"XXX": MarginInfo(symbol="XXX", bp_factor=1.0, fractionable=False)}
+    row = pa.compute_allocation(200.0, 1_000_000.0, labels,
+                                {"XXX": _pos("XXX", 300.0)}, margin,
+                                allow_fractional=True, default_bp_factor=1.0,
+                                valuation_mode=pa.VALUATION_MODE_MARKET).rows[0]
+    assert row.delta_quantity == 1.0
+    assert row.side == OrderDirection.BUY
+    assert row.target_quantity == 1.0
+    assert row.sizing_outcome == pa.SIZING_OUTCOME_BUMPED
+    assert row.unmet_notional == 0.0          # money MOVED -- more than asked, not less
+    assert row.estimated_value == pytest.approx(300.0)
+
+
+def test_a_sub_one_share_buy_outside_the_bound_records_the_unmet_target():
+    """$260k of a $650k share is 0.4 shares and one share is 250% of target: no
+    order, and the row carries the $260k it failed to deploy."""
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("BRKA", 100.0)])]
+    margin = {"BRKA": MarginInfo(symbol="BRKA", bp_factor=1.0, fractionable=False)}
+    row = pa.compute_allocation(260_000.0, 1_000_000.0, labels,
+                                {"BRKA": _pos("BRKA", 650_000.0)}, margin,
+                                allow_fractional=True, default_bp_factor=1.0,
+                                valuation_mode=pa.VALUATION_MODE_MARKET).rows[0]
+    assert row.delta_quantity == 0.0
+    assert row.side is None
+    assert row.sizing_outcome == pa.SIZING_OUTCOME_SKIPPED_TOO_LARGE
+    assert row.unmet_notional == pytest.approx(260_000.0)
+    reason = " ".join(row.reasons)
+    assert "buys 0.4000 shares" in reason
+    assert "250% of target" in reason
+    # Pinned by the landed suite: no "held", nothing starting with "below".
+    assert "held" not in reason
+    assert not any(r.startswith("below") for r in row.reasons)
+
+
+def test_a_trim_that_rounds_to_zero_is_never_bumped():
+    """Holding 10, want 9.6 -> -0.4 shares. The position already exists; bumping
+    would sell a whole share nobody asked to sell."""
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
+    margin = {"XXX": MarginInfo(symbol="XXX", bp_factor=1.0, fractionable=False)}
+    current = {"XXX": _pos("XXX", 100.0, quantity=10.0, cost_basis=1_000.0)}
+    row = pa.compute_allocation(960.0, 1_000_000.0, labels, current, margin,
+                                allow_fractional=False, default_bp_factor=1.0,
+                                valuation_mode=pa.VALUATION_MODE_MARKET).rows[0]
+    assert row.delta_quantity == 0.0
+    assert row.sizing_outcome == pa.SIZING_OUTCOME_NORMAL
+    assert row.unmet_notional == pytest.approx(40.0)
+    assert any("rounds to 0" in r for r in row.reasons)
+
+
+def test_a_row_already_on_target_records_no_unmet_notional():
+    """Exactly on target: zero delta, zero unmet, and no new reason."""
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
+    margin = {"XXX": MarginInfo(symbol="XXX", bp_factor=1.0, fractionable=False)}
+    current = {"XXX": _pos("XXX", 100.0, quantity=10.0, cost_basis=1_000.0)}
+    row = pa.compute_allocation(1_000.0, 1_000_000.0, labels, current, margin,
+                                allow_fractional=False, default_bp_factor=1.0,
+                                valuation_mode=pa.VALUATION_MODE_MARKET).rows[0]
+    assert row.delta_quantity == 0.0
+    assert row.unmet_notional == 0.0
+    assert row.sizing_outcome == pa.SIZING_OUTCOME_NORMAL
+    assert not any("rounds to 0" in r for r in row.reasons)
+
+
+def test_cost_mode_bumps_a_sub_one_share_target_too():
+    """The cost-basis branch converts through the same grid and takes the same
+    decision: one share costs `price` of BASIS, so the bound reads the same."""
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
+    margin = {"XXX": MarginInfo(symbol="XXX", bp_factor=1.0, fractionable=False)}
+    row = pa.compute_allocation(200.0, 1_000_000.0, labels,
+                                {"XXX": _pos("XXX", 300.0)}, margin,
+                                allow_fractional=False, default_bp_factor=1.0,
+                                valuation_mode=pa.VALUATION_MODE_COST).rows[0]
+    assert row.delta_quantity == 1.0
+    assert row.sizing_outcome == pa.SIZING_OUTCOME_BUMPED
+
+
+def test_cost_mode_refuses_the_bump_outside_the_bound():
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("BRKA", 100.0)])]
+    margin = {"BRKA": MarginInfo(symbol="BRKA", bp_factor=1.0, fractionable=False)}
+    row = pa.compute_allocation(260_000.0, 1_000_000.0, labels,
+                                {"BRKA": _pos("BRKA", 650_000.0)}, margin,
+                                allow_fractional=False, default_bp_factor=1.0,
+                                valuation_mode=pa.VALUATION_MODE_COST).rows[0]
+    assert row.delta_quantity == 0.0
+    assert row.unmet_notional == pytest.approx(260_000.0)
+
+
+def test_an_order_suppressed_by_min_order_size_records_the_unmet_notional():
+    """A real 3-share trim the broker will not accept is unmet money, not nothing."""
+    labels = [LabelTarget("EXIT", 0.0, [SymbolTarget("XXX", 100.0)])]
+    margin = {"XXX": MarginInfo(symbol="XXX", bp_factor=1.0, min_order_size=5.0)}
+    row = pa.compute_allocation(10_000.0, 1_000_000.0, labels,
+                                {"XXX": _pos("XXX", 100.0, quantity=3.0, cost_basis=300.0)},
+                                margin, allow_fractional=False, default_bp_factor=1.0,
+                                valuation_mode=pa.VALUATION_MODE_MARKET).rows[0]
+    assert row.delta_quantity == 0.0
+    assert row.unmet_notional == pytest.approx(300.0)
+
+
+def test_a_buy_scaled_away_by_buying_power_records_the_unmet_notional():
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
+    margin = {"XXX": MarginInfo(symbol="XXX", bp_factor=1.0, min_order_size=5.0)}
+    row = pa.compute_allocation(10_000.0, 200.0, labels,
+                                {"XXX": _pos("XXX", 100.0)}, margin,
+                                allow_fractional=False, default_bp_factor=1.0,
+                                valuation_mode=pa.VALUATION_MODE_MARKET).rows[0]
+    assert row.delta_quantity == 0.0
+    assert row.skipped is True
+    assert row.unmet_notional == pytest.approx(10_000.0)
+
+
+def test_a_precheck_rejection_records_the_unmet_notional():
+    plan = AllocationPlan(
+        rows=[AllocationRow(symbol="XXX", price=100.0, delta_quantity=10.0,
+                            side=OrderDirection.BUY, estimated_value=1_000.0,
+                            bp_cost=1_000.0, bp_factor=1.0)],
+        available_buying_power=50_000.0)
+    impacts = {"XXX": OrderImpact(symbol="XXX", change_in_buying_power=0.0,
+                                  accepted=False, errors=["symbol not tradeable"])}
+    out = pa.apply_order_impacts(plan, impacts, available_buying_power=50_000.0)
+    assert out.rows[0].unmet_notional == pytest.approx(1_000.0)
+
+
+def test_missing_margin_info_with_fractional_on_says_eligibility_is_unknown():
+    """No MarginInfo row at all is a DATA GAP, not "the broker said no"."""
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
+    row = pa.compute_allocation(1_000.0, 1_000_000.0, labels,
+                                {"XXX": _pos("XXX", 300.0)}, {},
+                                allow_fractional=True, default_bp_factor=1.0,
+                                valuation_mode=pa.VALUATION_MODE_MARKET).rows[0]
+    assert row.fractional is False
+    assert pa.REASON_FRACTIONAL_UNKNOWN in row.reasons
+    assert pa.REASON_WHOLE_SHARE_FLOOR not in row.reasons
+
+
+def test_a_none_fractionable_flag_is_unknown_and_never_collapses_to_false():
+    """The broker answered, but not about fractionability. Tri-state, explicitly."""
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
+    margin = {"XXX": MarginInfo(symbol="XXX", bp_factor=1.0, fractionable=None)}
+    row = pa.compute_allocation(1_000.0, 1_000_000.0, labels,
+                                {"XXX": _pos("XXX", 300.0)}, margin,
+                                allow_fractional=True, default_bp_factor=1.0,
+                                valuation_mode=pa.VALUATION_MODE_MARKET).rows[0]
+    assert row.fractional is False
+    assert pa.REASON_FRACTIONAL_UNKNOWN in row.reasons
+    assert pa.REASON_WHOLE_SHARE_FLOOR not in row.reasons
+
+
+def test_a_non_fractionable_symbol_says_whole_share_floor_not_unknown_eligibility():
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
+    margin = {"XXX": MarginInfo(symbol="XXX", bp_factor=1.0, fractionable=False)}
+    row = pa.compute_allocation(1_000.0, 1_000_000.0, labels,
+                                {"XXX": _pos("XXX", 300.0)}, margin,
+                                allow_fractional=True, default_bp_factor=1.0,
+                                valuation_mode=pa.VALUATION_MODE_MARKET).rows[0]
+    assert pa.REASON_WHOLE_SHARE_FLOOR in row.reasons
+    assert pa.REASON_FRACTIONAL_UNKNOWN not in row.reasons
+
+
+def test_the_new_row_fields_round_trip_through_to_dict():
+    row = AllocationRow(symbol="XXX", unmet_notional=1_234.5,
+                        sizing_outcome=pa.SIZING_OUTCOME_BUMPED)
+    blob = json.loads(json.dumps(row.to_dict()))
+    assert blob["unmet_notional"] == 1_234.5
+    assert blob["sizing_outcome"] == "bumped-to-1"
+    assert blob["redistributed"] is False
+
+
+def test_label_investment_bumps_a_sub_one_share_budget_share():
+    """The budget IS the intended allocation, so a sub-unit share of it bumps even
+    when the symbol is already held -- deploying nothing is the wrong answer."""
+    label = LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])
+    margin = {"XXX": MarginInfo(symbol="XXX", bp_factor=1.0, fractionable=False)}
+    plan = pa.compute_label_investment(label, 200.0,
+                                       {"XXX": _pos("XXX", 300.0, quantity=4.0,
+                                                    cost_basis=1_200.0)}, margin,
+                                       available_buying_power=1_000_000.0,
+                                       allow_fractional=True, default_bp_factor=1.0,
+                                       valuation_mode=pa.VALUATION_MODE_MARKET)
+    row = plan.rows[0]
+    assert row.delta_quantity == 1.0
+    assert row.sizing_outcome == pa.SIZING_OUTCOME_BUMPED
+    assert row.target_quantity == 5.0
+
+
+def test_label_investment_outside_the_bound_records_the_unmet_target():
+    label = LabelTarget("A", 100.0, [SymbolTarget("BRKA", 100.0)])
+    margin = {"BRKA": MarginInfo(symbol="BRKA", bp_factor=1.0, fractionable=False)}
+    plan = pa.compute_label_investment(label, 260_000.0,
+                                       {"BRKA": _pos("BRKA", 650_000.0)}, margin,
+                                       available_buying_power=1_000_000.0,
+                                       allow_fractional=True, default_bp_factor=1.0,
+                                       valuation_mode=pa.VALUATION_MODE_MARKET)
+    row = plan.rows[0]
+    assert row.delta_quantity == 0.0
+    assert row.sizing_outcome == pa.SIZING_OUTCOME_SKIPPED_TOO_LARGE
+    assert row.unmet_notional == pytest.approx(260_000.0)
+    assert any("buys 0.4000 shares" in r for r in row.reasons)
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run:
+`venv/bin/python -m pytest packages/common/tests/test_portfolio_allocation.py -v -k "bump or bound or unmet or rounds_to_zero or tradeable_unit or eligibility or sub_one_share or already_on_target or to_dict or fractionable_flag"`
+
+Expected: FAIL — 22 collected, 20 failed, 2 passed. The two that pass are landed and unaffected
+(`test_plan_to_dict_is_json_serialisable` and `test_already_on_target_produces_no_order`, both
+caught by the selector). The first failures are `AttributeError: module 'ba2_common.core.portfolio_allocation' has no attribute
+'size_sub_unit_target'` and `AttributeError: 'AllocationRow' object has no attribute
+'unmet_notional'`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+**3a.** In `packages/common/ba2_common/core/portfolio_allocation.py`, in the `__all__` list, replace
+the two blocks
+
+```python
+    # tolerances and grid
+    "DEFAULT_FRACTIONAL_DECIMALS", "LABEL_TOTAL_TOLERANCE_PCT",
+    "QUANTITY_EPSILON", "MONEY_EPSILON",
+    # reason / warning / error strings
+    "REASON_NO_PRICE", "REASON_NOT_MARGINABLE", "REASON_FRACTIONAL",
+    "REASON_WHOLE_SHARE_FLOOR", "REASON_NEGATIVE_CLAMPED", "REASON_CLOSE_TO_ZERO",
+    "REASON_BELOW_MIN_ORDER_FMT", "REASON_MULTI_LABEL_FMT", "REASON_SCALED_FMT",
+    "REASON_SCALED_PREFIX", "WARNING_EMPTY_LABEL_FMT", "WARNING_PRECHECK_DISAGREED_FMT",
+```
+
+with
+
+```python
+    # tolerances and grid
+    "DEFAULT_FRACTIONAL_DECIMALS", "LABEL_TOTAL_TOLERANCE_PCT",
+    "QUANTITY_EPSILON", "MONEY_EPSILON", "BUMP_TO_ONE_SHARE_MAX_MULTIPLE",
+    # per-row sizing outcomes (D1)
+    "SIZING_OUTCOME_NORMAL", "SIZING_OUTCOME_BUMPED", "SIZING_OUTCOME_SKIPPED_TOO_LARGE",
+    # reason / warning / error strings
+    "REASON_NO_PRICE", "REASON_NOT_MARGINABLE", "REASON_FRACTIONAL",
+    "REASON_WHOLE_SHARE_FLOOR", "REASON_FRACTIONAL_UNKNOWN", "REASON_NEGATIVE_CLAMPED",
+    "REASON_CLOSE_TO_ZERO", "REASON_BUMPED_TO_ONE_SHARE_FMT", "REASON_BELOW_ONE_SHARE_FMT",
+    "REASON_BUMP_BLOCKED_MIN_ORDER_FMT", "REASON_ROUNDS_TO_ZERO_FMT",
+    "REASON_BELOW_MIN_ORDER_FMT", "REASON_MULTI_LABEL_FMT", "REASON_SCALED_FMT",
+    "REASON_SCALED_PREFIX", "WARNING_EMPTY_LABEL_FMT", "WARNING_PRECHECK_DISAGREED_FMT",
+```
+
+and replace the `# engine` block's last line (`"apply_order_impacts", "consume_income_events",`)
+with:
+
+```python
+    "apply_order_impacts", "consume_income_events",
+    "tradeable_unit", "size_sub_unit_target",
+```
+
+**3b.** Immediately after the line `REASON_WHOLE_SHARE_FLOOR = "rounded down to whole shares"`,
+insert:
+
+```python
+#: Fractional was requested but the broker did not SAY whether this symbol is
+#: eligible: either no ``MarginInfo`` row at all, or one whose ``fractionable`` is
+#: ``None``. DISTINCT from REASON_WHOLE_SHARE_FLOOR, which means the broker
+#: positively answered "not fractionable". One is a data gap the user can fix with
+#: Refresh; the other is a fact about the instrument. TastyTrade's own flag is
+#: tri-state (``Equity.is_fractional_quantity_eligible: bool | None``,
+#: tastytrade/instruments.py:262), so "unknown" is a real state, not a bug.
+REASON_FRACTIONAL_UNKNOWN = "fractionable unknown - whole shares"
+```
+
+**3c.** Immediately after the line `REASON_CLOSE_TO_ZERO = "target 0 - close position"`, insert:
+
+```python
+#: How far ONE tradeable unit may overshoot a target before the bump is refused.
+#: 1.5 == "one share may cost at most 150% of what this symbol was allocated".
+#:
+#: ONE constant, quoted in the refusal message, never a scattered literal. The value
+#: is set so the two worked examples of the decision land on opposite sides of it: a
+#: 200 target on a 300 share (150%) is the case that must be filled and sits exactly
+#: ON the bound (the comparison is inclusive), and a 50 target on a 500 share (1000%)
+#: is the case that must be refused. It also bounds the damage: the worst bump
+#: over-allocates its symbol by 50% of that symbol's target, which is normally inside
+#: what ``redistribute_label_residuals`` can take back off the label's fractionable
+#: siblings. At 2x and above the excess routinely exceeds what the siblings hold and
+#: the label is left structurally over target with nothing able to fix it.
+BUMP_TO_ONE_SHARE_MAX_MULTIPLE = 1.5
+
+#: What the sizing rules DID to a row, so the dry run never has to pattern-match
+#: reason prose. A bump is a deliberate over-allocation and must be visible.
+SIZING_OUTCOME_NORMAL = "normal"                       #: ordinary grid rounding
+SIZING_OUTCOME_BUMPED = "bumped-to-1"                  #: under one unit, bumped UP
+SIZING_OUTCOME_SKIPPED_TOO_LARGE = "skipped-too-large"  #: under one unit, one unit too big
+
+#: The bump happened: the whole intended position was smaller than one tradeable
+#: unit and one unit was inside BUMP_TO_ONE_SHARE_MAX_MULTIPLE, so the symbol is
+#: OVER-allocated on purpose and the sentence says by how much.
+#: Must not start with "below" and must not contain "held" -- both are pinned by
+#: the landed suite (test_portfolio_allocation.py:1004 and :1318).
+REASON_BUMPED_TO_ONE_SHARE_FMT = (
+    "target {target:,.2f} buys {raw:.4f} shares at {price:,.2f} - BUMPED UP to "
+    "{unit:g} share(s), {pct:.0f}% of target")
+#: The bump was refused: one unit would overshoot past the bound. No order, and the
+#: row carries the shortfall in ``unmet_notional`` so the user can widen the weight.
+REASON_BELOW_ONE_SHARE_FMT = (
+    "target {target:,.2f} buys {raw:.4f} shares at {price:,.2f} - no order; one "
+    "whole share is {pct:.0f}% of target, over the {limit:.0f}% bump limit")
+#: The bump was not even attempted: one share is under the broker's minimum ORDER
+#: size, so there is no order to place at any size.
+REASON_BUMP_BLOCKED_MIN_ORDER_FMT = (
+    "target {target:,.2f} buys {raw:.4f} shares at {price:,.2f} - no order; one "
+    "share is under the broker minimum order size {size:g}")
+#: A non-zero ADJUSTMENT to an existing position that the tradeable grid rounded
+#: away. Never bumped: the position already exists, and turning a -0.4 trim into a
+#: whole-share sale is a trade nobody asked for.
+REASON_ROUNDS_TO_ZERO_FMT = "{raw:+.4f} shares rounds to 0 on the tradeable grid - no order"
+```
+
+**3d.** In `class AllocationRow`, insert these three fields between `estimated_fees` and `reasons`:
+
+```python
+    #: Money this row INTENDED to move and could not: the tradeable grid, the broker
+    #: minimum order size, the buying-power scaling or a precheck rejection took it
+    #: away. 0.0 on a row that traded -- including a BUMPED row, which moved MORE
+    #: than asked, not less. Deliberately 0.0 on a NO-PRICE row too: that row's whole
+    #: target is already reported through ``AllocationPlan.unallocatable_pct``, and
+    #: counting it in both places would double the money the dry run shows as
+    #: unallocated.
+    unmet_notional: float = 0.0
+    #: Which sizing rule produced this row: ``SIZING_OUTCOME_NORMAL``,
+    #: ``SIZING_OUTCOME_BUMPED`` (deliberate over-allocation to one unit) or
+    #: ``SIZING_OUTCOME_SKIPPED_TOO_LARGE`` (one unit would have overshot the bound).
+    sizing_outcome: str = SIZING_OUTCOME_NORMAL
+    #: True when ``redistribute_label_residuals`` moved this row off the quantity the
+    #: user's weights implied, to keep its LABEL on target. The dry run must show it.
+    redistributed: bool = False
+```
+
+and add to the docstring of `AllocationRow`, after the sentence ending
+``not merely when the resulting quantity has a decimal part.``:
+
+```
+    ``unmet_notional`` is why a row with no order is still worth displaying: it is
+    the money the plan wanted to move for this symbol and could not.
+    ``sizing_outcome`` and ``redistributed`` are why a row with an order is worth a
+    second look: the quantity may be MORE than the weights asked for.
+```
+
+and in `AllocationRow.to_dict`, insert between the `"estimated_fees"` and `"reasons"` entries:
+
+```python
+            "unmet_notional": self.unmet_notional,
+            "sizing_outcome": self.sizing_outcome,
+            "redistributed": self.redistributed,
+```
+
+**3e.** Immediately after `_round_delta_shares` (before `round_delta_quantity`), insert:
+
+```python
+def tradeable_unit(margin: Optional[MarginInfo], *, allow_fractional: bool) -> float:
+    """The SMALLEST quantity this symbol can trade -- one step of the grid.
+
+    1.0 on the whole-share grid; the broker's published ``min_trade_increment`` on
+    the fractional one, or ``10 ** -DEFAULT_FRACTIONAL_DECIMALS`` when fractional
+    trading is allowed but no step was published (``fractionable=True,
+    min_trade_increment=None`` is a legal pair).
+
+    Deliberately mirrors ``_round_shares``' branch exactly, including the tri-state
+    read: only ``fractionable is True`` selects the fractional grid, so ``None``
+    ("the broker did not say") sizes as whole shares -- the conservative direction,
+    and the same one the rounding itself takes. Plan and execution must never round
+    on two different grids.
+    """
+    if allow_fractional and margin is not None and margin.fractionable is True:
+        inc = margin.min_trade_increment
+        if inc and inc > 0:
+            return float(inc)
+        return 10.0 ** -DEFAULT_FRACTIONAL_DECIMALS
+    return 1.0
+
+
+def size_sub_unit_target(target_notional: float, price: float,
+                         margin: Optional[MarginInfo], *,
+                         allow_fractional: bool) -> Tuple[float, str, str]:
+    """Decide what to do with a WHOLE intended allocation smaller than one unit.
+
+    Decision D1: bump it UP to one tradeable unit so the symbol actually gets a
+    position -- but only when one unit costs at most
+    ``BUMP_TO_ONE_SHARE_MAX_MULTIPLE`` times the target. A bump is an intentional
+    over-allocation, it takes buying power promised to the rest of the plan, and
+    past the bound it stops being a rounding fix and becomes a different trade.
+
+    Call this ONLY for the case where the sub-unit amount IS the symbol's whole
+    intended position (a flat holding being opened, or a symbol's share of an
+    INVEST_LABEL budget). A sub-unit ADJUSTMENT to a position that already exists
+    is left alone with ``REASON_ROUNDS_TO_ZERO_FMT``: the position exists, and
+    bumping a -0.4 trim into a whole-share sale is a trade nobody requested.
+
+    Returns:
+        Tuple[float, str, str]: ``(quantity, sizing_outcome, reason)``.
+        ``(unit, SIZING_OUTCOME_BUMPED, ...)`` when the bump is taken;
+        ``(0.0, SIZING_OUTCOME_SKIPPED_TOO_LARGE, ...)`` when one unit overshoots
+        the bound; ``(0.0, SIZING_OUTCOME_NORMAL, ...)`` when one unit is under the
+        broker's minimum ORDER size, which is neither a bump nor a bound problem --
+        there is simply no order to place at any size.
+
+    Raises:
+        ValueError: on a non-positive price or target. Both callers have already
+        skipped a no-price row and clamped a negative target; there is no fallback
+        price or fallback target in this platform.
+    """
+    if price is None or float(price) <= 0:
+        raise ValueError(f"size_sub_unit_target: price must be positive, got {price!r}")
+    if target_notional is None or float(target_notional) <= 0:
+        raise ValueError(
+            f"size_sub_unit_target: target_notional must be positive, got {target_notional!r}")
+    px = float(price)
+    target = float(target_notional)
+    unit = tradeable_unit(margin, allow_fractional=allow_fractional)
+    raw = target / px
+    unit_notional = unit * px
+    pct = unit_notional / target * 100.0
+    limit_pct = BUMP_TO_ONE_SHARE_MAX_MULTIPLE * 100.0
+    # INCLUSIVE bound: exactly 150% bumps. MONEY_EPSILON absorbs the float noise of
+    # a target computed through two percentage multiplications.
+    if unit_notional > target * BUMP_TO_ONE_SHARE_MAX_MULTIPLE + MONEY_EPSILON:
+        return 0.0, SIZING_OUTCOME_SKIPPED_TOO_LARGE, REASON_BELOW_ONE_SHARE_FMT.format(
+            target=target, raw=raw, price=px, pct=pct, limit=limit_pct)
+    min_size = None if margin is None else margin.min_order_size
+    if min_size is not None and unit < float(min_size):
+        # The broker will not accept an order this small, so there is nothing to
+        # bump TO. Reported as NORMAL: the bound had nothing to do with it.
+        return 0.0, SIZING_OUTCOME_NORMAL, REASON_BUMP_BLOCKED_MIN_ORDER_FMT.format(
+            target=target, raw=raw, price=px, size=float(min_size))
+    return unit, SIZING_OUTCOME_BUMPED, REASON_BUMPED_TO_ONE_SHARE_FMT.format(
+        target=target, raw=raw, price=px, unit=unit, pct=pct)
+```
+
+**3f.** In `_apply_bp_scaling`, replace:
+
+```python
+        if qty <= 0:
+            # ONE shape for "no order": a scaled-away buy reads exactly like a
+            # no-price skip (side None, skipped True) to anything inspecting the
+            # raw field rather than is_buy/is_sell.
+            r.skipped = True
+            r.side = None
+```
+
+with:
+
+```python
+        if qty <= 0:
+            # ONE shape for "no order": a scaled-away buy reads exactly like a
+            # no-price skip (side None, skipped True) to anything inspecting the
+            # raw field rather than is_buy/is_sell.
+            r.skipped = True
+            r.side = None
+            # The whole pre-scaling intent is unmet, not just the scaled part.
+            r.unmet_notional = abs(prev_qty) * float(r.price or 0.0)
+```
+
+**3g.** In `compute_allocation`, replace the fractional-mode block:
+
+```python
+        frac = bool(allow_fractional and m is not None and m.fractionable)
+        row.fractional = frac
+        if frac:
+            row.reasons.append(REASON_FRACTIONAL)
+        elif allow_fractional:
+            row.reasons.append(REASON_WHOLE_SHARE_FLOOR)
+```
+
+with the canonical three-branch block:
+
+```python
+        # Tri-state, explicitly. `m.fractionable is None` means the broker did not
+        # SAY -- a data gap Refresh can fix -- and must never be reported as "not
+        # fractionable", which is a fact about the instrument.
+        frac = bool(allow_fractional and m is not None and m.fractionable is True)
+        row.fractional = frac
+        if frac:
+            row.reasons.append(REASON_FRACTIONAL)
+        elif allow_fractional and (m is None or m.fractionable is None):
+            row.reasons.append(REASON_FRACTIONAL_UNKNOWN)
+        elif allow_fractional:
+            row.reasons.append(REASON_WHOLE_SHARE_FLOOR)
+```
+
+**3h.** Still in `compute_allocation`, replace the delta block from
+`if target_notional <= 0 and row.current_quantity > 0:` through
+`delta = _suppress_below_min_order(delta, m, row.reasons)` with:
+
+```python
+        if target_notional <= 0 and row.current_quantity > 0:
+            # Same in both modes: a zero target flattens the position outright.
+            # Keyed on the NOTIONAL, never on the rounded quantity: only an
+            # actual instruction to hold nothing may liquidate, never a rounding
+            # rule that happened to produce 0 shares.
+            delta = -row.current_quantity
+            raw_delta = delta
+            row.reasons.append(REASON_CLOSE_TO_ZERO)
+        elif valuation_mode == VALUATION_MODE_COST:
+            # Target a PURCHASE VALUE: close the gap to the current cost basis.
+            #
+            # The two legs convert at DIFFERENT rates. Buying a share adds the
+            # market PRICE to the basis, but selling one removes the AVERAGE COST
+            # (cost_basis is quantity x avg_entry_price). Dividing a basis
+            # reduction by the price is wrong by price/avg_cost -- with the price
+            # halved it asks for twice the shares, which the hold-clamp then turns
+            # into a full liquidation of a position that only wanted trimming.
+            basis = current_value(ps, VALUATION_MODE_COST)
+            gap = target_notional - basis
+            unit_value = row.price
+            if gap < 0:
+                avg_cost = (basis / row.current_quantity
+                            if row.current_quantity > 0 else 0.0)
+                if avg_cost <= 0:
+                    # No usable average cost (no shares, or a non-positive basis):
+                    # there is nothing to trim and nothing to guess from.
+                    gap = 0.0
+                else:
+                    unit_value = avg_cost
+            # The UNROUNDED intent, kept so a row the grid zeroes can say by how
+            # much it missed instead of rendering as "nothing to do".
+            raw_delta = (gap / unit_value) if unit_value and unit_value > 0 else 0.0
+            delta = round_delta_quantity(
+                gap, unit_value, m, allow_fractional=allow_fractional,
+                current_quantity=row.current_quantity)
+        else:
+            # Target a SHARE COUNT: target_notional / price, delta vs what is held.
+            ideal_quantity = round_quantity(target_notional, row.price, m,
+                                            allow_fractional=allow_fractional,
+                                            apply_min_order_size=False)
+            raw_delta = float(target_notional) / float(row.price) - row.current_quantity
+            # Round the DELTA, not just the target: an on-grid target minus an
+            # off-grid holding is off-grid, and the delta is what is submitted.
+            delta = _round_delta_shares(ideal_quantity - row.current_quantity, m,
+                                        allow_fractional=allow_fractional,
+                                        current_quantity=row.current_quantity)
+        if abs(delta) < QUANTITY_EPSILON:
+            delta = 0.0
+        if delta == 0.0 and abs(raw_delta) >= QUANTITY_EPSILON:
+            # The GRID, not the target, zeroed this row. Without this branch the row
+            # renders as "already on target" and the allocation disappears -- about
+            # a quarter of this account's symbols cannot trade fractionally.
+            if row.current_quantity == 0.0 and target_notional > 0 and raw_delta > 0:
+                # The whole intended POSITION is under one unit: decision D1.
+                delta, outcome, reason = size_sub_unit_target(
+                    target_notional, row.price, m, allow_fractional=allow_fractional)
+                row.sizing_outcome = outcome
+                row.reasons.append(reason)
+                if delta <= 0:
+                    row.unmet_notional = abs(raw_delta) * row.price
+            else:
+                # A sub-unit ADJUSTMENT to an existing position (or to a short).
+                # Never bumped: the position exists, and the landed rule for a trade
+                # that cannot be sent is to LEAVE THE POSITION WHERE IT IS.
+                row.reasons.append(REASON_ROUNDS_TO_ZERO_FMT.format(raw=raw_delta))
+                row.unmet_notional = abs(raw_delta) * row.price
+        # ONE minimum-order check, on the signed delta all three branches produce --
+        # the only quantity that is actually sent to the broker.
+        before_min_order = delta
+        delta = _suppress_below_min_order(delta, m, row.reasons)
+        if delta == 0.0 and before_min_order != 0.0:
+            row.unmet_notional = abs(before_min_order) * row.price
+```
+
+**3i.** In `compute_label_investment`, replace:
+
+```python
+        frac = bool(allow_fractional and m is not None and m.fractionable)
+        row.fractional = frac
+        qty = round_quantity(target_notional, row.price, m,
+                             allow_fractional=allow_fractional,
+                             apply_min_order_size=False)
+        if frac:
+            row.reasons.append(REASON_FRACTIONAL)
+        elif allow_fractional:
+            row.reasons.append(REASON_WHOLE_SHARE_FLOOR)
+        # Buys only here, so the budget IS the order: same suppression, same reason.
+        qty = _suppress_below_min_order(qty, m, row.reasons)
+```
+
+with:
+
+```python
+        frac = bool(allow_fractional and m is not None and m.fractionable is True)
+        row.fractional = frac
+        qty = round_quantity(target_notional, row.price, m,
+                             allow_fractional=allow_fractional,
+                             apply_min_order_size=False)
+        raw_qty = float(target_notional) / float(row.price)
+        if frac:
+            row.reasons.append(REASON_FRACTIONAL)
+        elif allow_fractional and (m is None or m.fractionable is None):
+            row.reasons.append(REASON_FRACTIONAL_UNKNOWN)
+        elif allow_fractional:
+            row.reasons.append(REASON_WHOLE_SHARE_FLOOR)
+        if qty <= 0 and raw_qty >= QUANTITY_EPSILON:
+            # The budget share IS the intended allocation for this symbol, so D1
+            # applies even when the symbol is already held: deploying nothing is the
+            # wrong answer to "put this money into this label".
+            qty, outcome, reason = size_sub_unit_target(
+                target_notional, row.price, m, allow_fractional=allow_fractional)
+            row.sizing_outcome = outcome
+            row.reasons.append(reason)
+            if qty <= 0:
+                row.unmet_notional = raw_qty * row.price
+        # Buys only here, so the budget IS the order: same suppression, same reason.
+        before_min_order = qty
+        qty = _suppress_below_min_order(qty, m, row.reasons)
+        if qty == 0.0 and before_min_order != 0.0:
+            row.unmet_notional = before_min_order * row.price
+```
+
+**3j.** In `apply_order_impacts`, replace:
+
+```python
+        if not impact.accepted:
+            # ONE shape for "no order" -- a refused order that kept its side and
+            # quantity renders as a live BUY to anything reading the raw fields.
+            row.skipped = True
+            row.side = None
+            row.delta_quantity = 0.0
+```
+
+with:
+
+```python
+        if not impact.accepted:
+            # ONE shape for "no order" -- a refused order that kept its side and
+            # quantity renders as a live BUY to anything reading the raw fields.
+            row.skipped = True
+            row.side = None
+            # What the broker refused is unmet money, exactly like a grid-zeroed row.
+            row.unmet_notional = abs(row.delta_quantity) * float(row.price or 0.0)
+            row.delta_quantity = 0.0
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run:
+`venv/bin/python -m pytest packages/common/tests/test_portfolio_allocation.py -v -k "bump or bound or unmet or rounds_to_zero or tradeable_unit or eligibility or sub_one_share or already_on_target or to_dict or fractionable_flag"`
+Expected: PASS — 22 passed (the 20 new ones plus the 2 landed tests the selector also catches).
+
+Run: `venv/bin/python -m pytest packages/common/tests/test_portfolio_allocation.py -v`
+Expected: PASS — 147 passed (the 127 landed tests plus these 20); no failures, no errors.
+
+Two behaviour changes land here, and neither is covered by a landed test — verified by reading the
+file, not assumed:
+
+* the bump only fires on a FLAT row whose whole target is under one unit. Every landed sub-unit
+  scenario in that file is a `min_order_size` one (`:283`, `:969`, `:986`, `:1015`, `:1032`,
+  `:1301`, `:1316`), and each of those is either not flat or blocked by the minimum-order check
+  inside `size_sub_unit_target`;
+* the reason split (`REASON_FRACTIONAL_UNKNOWN`) only changes rows where `allow_fractional` is on
+  AND the symbol has no usable eligibility answer. Every landed fractional test passes an explicit
+  `MarginInfo(..., fractionable=True/False)`, so it cannot fire in them.
+
+Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_shim.py tests/test_portfolio_allocation_store.py -v`
+Expected: PASS — 65 passed (2 shim + 63 store); the shim re-exports `__all__`, which just grew.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add packages/common/ba2_common/core/portfolio_allocation.py packages/common/tests/test_portfolio_allocation.py
+git commit -m "feat(allocation): bump a sub-one-share target inside a bounded multiple, price the rest"
+```
+
+---
+### Task 90: The label residual — redistribute it, in both directions, and terminate
+
+Whole-share rounding leaves a label off its target. Five names at 20% of a $10,000 label, each on a
+$300 whole-share grid, each floored down: the label deploys $9,000 and quietly misses by $1,000.
+Task 89 makes that miss *visible*; decision **D2** makes the plan *fix* it: **after rounding and
+after any D1 bump, recompute the label's actual total and move the signed difference onto the
+symbols that can absorb it.**
+
+**The residual is SIGNED, and the negative case is the one that is easy to get wrong.** A
+one-directional "top up the shortfall" implementation is wrong here, because D1 now pushes in the
+opposite direction: bumping three symbols up to one share each can put the label *above* its target,
+and the only correct response is to take weight *off* the fractionable siblings. `_apply_bp_scaling`
+is no precedent — it only ever scales down, and only against buying power, never against a label
+target.
+
+**D1 and D2 fight by construction, and this is the rule that stops them.** Redistribution's obvious
+absorber for a bump-induced overshoot is the bumped row itself: sell it back to zero and the
+overshoot disappears. That is exactly the floor-to-zero D1 exists to prevent, and doing it in a loop
+is how an engine hangs. So:
+
+> **A row D1 bumped is never an absorber, and neither is a row the grid or the broker minimum
+> already zeroed.** Bumps are one-way. Redistribution may work around them; it may not undo them.
+
+**Termination, stated as an invariant rather than hoped for.** Every step is
+`floor(|residual| / one_unit_of_that_row) * one_unit`, so a step can close the gap but can never
+cross it: `|residual|` is monotonically non-increasing and strictly decreases by at least one unit's
+notional whenever any step is applied. A pass visits a fixed absorber list once, recomputing the
+residual after each row; a pass that applies nothing ends the loop at its fixed point. Absorbers are
+never bumped rows, so no bump/un-bump cycle exists; a step never zeroes an order and never flips a
+side, so no new floor-to-zero is created; a step never crosses the target, so no new overshoot is
+created. The loop is therefore finite on its own arithmetic, and
+
+```python
+REDISTRIBUTION_MAX_PASSES = 3
+```
+
+is the *guarantee* rather than the mechanism. In practice the fixed point is reached on the first or
+second pass — the third exists so that a future absorber type which breaks monotonicity still
+terminates. **When the bound is reached with a residual outstanding, the plan says so** through
+`WARNING_RESIDUAL_UNCONVERGED_FMT`, naming the bound; when the fixed point leaves a residual that
+some member could physically have absorbed but none was allowed to (buying power, a broker minimum,
+the no-negative-position clamp), the plan says that instead through `WARNING_RESIDUAL_LEFT_FMT`. A
+residual smaller than one tradeable unit of every member is arithmetic, not a problem, and is
+reported as money by `fractional_summary` (Task 91) rather than as a warning.
+
+**The hard constraints, all of them enforced in one place:**
+
+* **Never negative.** The post-trade holding never goes below zero, and redistribution never
+  liquidates a position outright — it leaves at least one unit. Exiting a symbol is a position
+  decision; a rounding residual is not allowed to make it.
+* **Never past the buying power.** An upward move is capped by the plan's live headroom
+  (`available_buying_power - sum(bp_cost of buys)`), recomputed after every applied move, so
+  redistribution can never be the reason `_apply_bp_scaling` has to fire.
+* **Never below the broker's `min_order_size`.**
+* **Never a new order shape.** A step never turns a buy into a sell, never deletes an order, and
+  never resurrects one the grid or the broker already refused.
+* **One label at a time, and only symbols that belong to exactly one label.** A symbol carried by
+  two managed labels has a target that is the SUM of two labels' shares (landed behaviour,
+  `REASON_MULTI_LABEL_FMT`); no single label owns it, and moving it would move both. Such a row is
+  excluded from the measured total AND from the absorbers — both sides of the comparison are
+  restricted to the same member set, so the label's arithmetic stays self-consistent.
+
+**Measuring "the label's actual total" needs to know what the target MEANS**, and that differs by
+solver: in a REBALANCE `target_notional` is the desired post-trade POSITION value, but in an
+INVEST_LABEL run it is the money to DEPLOY on top of whatever is already held. Comparing one against
+the other silently produces a nonsense residual, so the plan now records which it is:
+
+```python
+ALLOCATION_BASIS_POSITION = "position"   # compute_allocation
+ALLOCATION_BASIS_BUDGET   = "budget"     # compute_label_investment
+```
+
+and `allocated_value(row, valuation_mode, allocation_basis)` is the single measure both this task
+and Task 91's summary read. In `cost` valuation mode the per-share conversion is asymmetric exactly
+as it is in `compute_allocation`: buying a share adds the market PRICE to the basis, selling one
+removes the AVERAGE COST. Redistribution uses the same rule, so a cost-mode label lands on its
+target instead of overshooting by `price / avg_cost`.
+
+**The user's weights are not silently rewritten — they are visibly rewritten.** `target_notional`
+keeps the number the user typed; only the quantity moves, the row is stamped `redistributed=True`
+with a `REASON_REDISTRIBUTED_FMT` naming the before and after share counts, and Task 91 puts the
+post-redistribution weight next to the typed one in the dry run. Showing the change is the whole
+point of being allowed to make it.
+
+`apply_order_impacts` deliberately does NOT re-redistribute after a precheck rejection: it has no
+label targets in hand, the user is looking at the plan at that moment, and the rejected money is
+already reported as `unmet_notional`.
+
+**Files:**
+- Modify: `packages/common/ba2_common/core/portfolio_allocation.py`
+- Test: `packages/common/tests/test_portfolio_allocation_redistribution.py` (new file)
+
+- [ ] **Step 1: Write the failing test**
+
+Create `packages/common/tests/test_portfolio_allocation_redistribution.py`:
+
+```python
+"""D2: the label rounding residual is redistributed inside the label, both ways.
+
+Pure-function tests. Several build an AllocationPlan by hand and call
+``redistribute_label_residuals`` directly -- that is the only way to pin the
+individual clamps (buying power, the broker minimum, the no-negative rule) without
+constructing an elaborate portfolio for each one.
+"""
+import json
+
+import pytest
+
+from ba2_common.core import portfolio_allocation as pa
+from ba2_common.core.portfolio_allocation import (
+    AllocationPlan, AllocationRow, LabelTarget, PositionState, SymbolTarget,
+)
+from ba2_common.core.account_types import MarginInfo
+from ba2_common.core.types import OrderDirection
+
+
+def _pos(symbol, price, quantity=0.0, cost_basis=0.0):
+    return PositionState(symbol=symbol, quantity=quantity, cost_basis=cost_basis, price=price)
+
+
+def _frac(symbol, increment=None):
+    return MarginInfo(symbol=symbol, bp_factor=1.0, fractionable=True,
+                      min_trade_increment=increment)
+
+
+def _whole(symbol, min_order_size=None):
+    return MarginInfo(symbol=symbol, bp_factor=1.0, fractionable=False,
+                      min_order_size=min_order_size)
+
+
+def _buy_row(symbol, price, delta, *, fractional=False, current_quantity=0.0,
+             current_cost_basis=0.0, target_notional=0.0, labels=("A",)):
+    side = (OrderDirection.BUY if delta > 0
+            else OrderDirection.SELL if delta < 0 else None)
+    return AllocationRow(
+        symbol=symbol, labels=list(labels), price=price,
+        current_quantity=current_quantity, current_cost_basis=current_cost_basis,
+        target_notional=target_notional,
+        target_quantity=current_quantity + delta, delta_quantity=delta, side=side,
+        estimated_value=abs(delta) * price,
+        bp_cost=(delta * price if delta > 0 else 0.0), bp_factor=1.0,
+        fractional=fractional)
+
+
+# ---------------------------------------------------------------------------
+# The measurement the residual is computed from
+# ---------------------------------------------------------------------------
+
+def test_projected_value_in_market_mode_is_the_post_trade_holding_at_price():
+    row = _buy_row("X", 400.0, 2.0)
+    assert pa.projected_value(row, pa.VALUATION_MODE_MARKET) == pytest.approx(800.0)
+
+
+def test_projected_value_in_cost_mode_adds_the_buy_at_price_to_the_basis():
+    row = _buy_row("X", 100.0, 3.0, current_quantity=5.0, current_cost_basis=400.0)
+    assert pa.projected_value(row, pa.VALUATION_MODE_COST) == pytest.approx(700.0)
+
+
+def test_projected_value_in_cost_mode_removes_average_cost_on_a_sell():
+    """Basis 400 over 5 shares = 80/share; selling 2 leaves 240, not 400 - 2*price."""
+    row = _buy_row("X", 100.0, -2.0, current_quantity=5.0, current_cost_basis=400.0)
+    assert pa.projected_value(row, pa.VALUATION_MODE_COST) == pytest.approx(240.0)
+
+
+def test_projected_value_of_a_priceless_row_is_none_never_zero():
+    assert pa.projected_value(AllocationRow(symbol="X", price=None),
+                              pa.VALUATION_MODE_MARKET) is None
+
+
+def test_projected_value_rejects_an_unknown_valuation_mode():
+    with pytest.raises(ValueError):
+        pa.projected_value(_buy_row("X", 100.0, 1.0), "nominal")
+
+
+def test_allocated_value_in_the_budget_basis_is_the_money_deployed():
+    """An INVEST_LABEL target is money to ADD, so the comparable figure is the money
+    this row deploys -- NOT the post-trade holding, which includes what was already
+    owned."""
+    row = _buy_row("X", 100.0, 3.0, current_quantity=5.0, current_cost_basis=400.0)
+    assert pa.allocated_value(row, pa.VALUATION_MODE_MARKET,
+                              pa.ALLOCATION_BASIS_BUDGET) == pytest.approx(300.0)
+    assert pa.allocated_value(row, pa.VALUATION_MODE_MARKET,
+                              pa.ALLOCATION_BASIS_POSITION) == pytest.approx(800.0)
+
+
+def test_allocated_value_rejects_an_unknown_basis():
+    with pytest.raises(ValueError):
+        pa.allocated_value(_buy_row("X", 100.0, 1.0), pa.VALUATION_MODE_MARKET, "vibes")
+
+
+# ---------------------------------------------------------------------------
+# Positive residual: the label is short, the shortfall is deployed
+# ---------------------------------------------------------------------------
+
+def test_a_whole_share_shortfall_is_absorbed_by_the_fractionable_sibling():
+    """XXX floors to 1 share of a 500 target; FRAC picks up the missing 200 so the
+    LABEL deploys its full 1,000."""
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 50.0),
+                                       SymbolTarget("FRAC", 50.0)])]
+    current = {"XXX": _pos("XXX", 300.0), "FRAC": _pos("FRAC", 100.0)}
+    margin = {"XXX": _whole("XXX"), "FRAC": _frac("FRAC")}
+    plan = pa.compute_allocation(1_000.0, 1_000_000.0, labels, current, margin,
+                                 allow_fractional=True, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
+    by = {r.symbol: r for r in plan.rows}
+    assert by["XXX"].delta_quantity == 1.0
+    assert by["FRAC"].delta_quantity == pytest.approx(7.0)
+    assert by["FRAC"].redistributed is True
+    assert by["XXX"].redistributed is False
+    assert sum(r.estimated_value for r in plan.rows) == pytest.approx(1_000.0)
+    assert any("weight adjusted" in r for r in by["FRAC"].reasons)
+    assert plan.warnings == []
+
+
+def test_the_user_typed_weight_is_kept_next_to_the_redistributed_quantity():
+    """target_notional is NEVER rewritten -- the dry run has to show both numbers."""
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 50.0),
+                                       SymbolTarget("FRAC", 50.0)])]
+    current = {"XXX": _pos("XXX", 300.0), "FRAC": _pos("FRAC", 100.0)}
+    margin = {"XXX": _whole("XXX"), "FRAC": _frac("FRAC")}
+    row = {r.symbol: r for r in pa.compute_allocation(
+        1_000.0, 1_000_000.0, labels, current, margin, allow_fractional=True,
+        default_bp_factor=1.0, valuation_mode=pa.VALUATION_MODE_MARKET).rows}["FRAC"]
+    assert row.target_notional == pytest.approx(500.0)      # what the user typed
+    assert row.estimated_value == pytest.approx(700.0)      # what will be traded
+
+
+# ---------------------------------------------------------------------------
+# Negative residual: D1's bumps pushed the label OVER, so weight comes back off
+# ---------------------------------------------------------------------------
+
+def test_a_bump_pushes_the_label_over_target_and_the_excess_is_taken_back_off():
+    """BIG's 200 target bumps to one 300 share (150%, on the bound). The label is now
+    100 over, so FRAC gives one share back. Redistribution is BIDIRECTIONAL."""
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("BIG", 20.0),
+                                       SymbolTarget("FRAC", 80.0)])]
+    current = {"BIG": _pos("BIG", 300.0), "FRAC": _pos("FRAC", 100.0)}
+    margin = {"BIG": _whole("BIG"), "FRAC": _frac("FRAC")}
+    plan = pa.compute_allocation(1_000.0, 1_000_000.0, labels, current, margin,
+                                 allow_fractional=True, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
+    by = {r.symbol: r for r in plan.rows}
+    assert by["BIG"].sizing_outcome == pa.SIZING_OUTCOME_BUMPED
+    assert by["BIG"].delta_quantity == 1.0
+    assert by["FRAC"].delta_quantity == pytest.approx(7.0)   # 8 rounded, minus one
+    assert sum(r.estimated_value for r in plan.rows) == pytest.approx(1_000.0)
+
+
+def test_a_bumped_row_is_never_the_row_that_gives_the_weight_back():
+    """The obvious absorber for a bump-induced overshoot is the bumped row itself,
+    and taking it back to zero re-creates the floor-to-zero D1 exists to remove --
+    in a loop. Bumps are one-way."""
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("BIG", 20.0),
+                                       SymbolTarget("WHOLE", 80.0)])]
+    current = {"BIG": _pos("BIG", 300.0), "WHOLE": _pos("WHOLE", 790.0)}
+    margin = {"BIG": _whole("BIG"), "WHOLE": _whole("WHOLE")}
+    plan = pa.compute_allocation(1_000.0, 1_000_000.0, labels, current, margin,
+                                 allow_fractional=True, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
+    by = {r.symbol: r for r in plan.rows}
+    assert by["BIG"].delta_quantity == 1.0        # still bumped
+    assert by["BIG"].redistributed is False
+    assert by["WHOLE"].delta_quantity == 1.0      # 800 target, one 790 share
+    # 1,090 deployed against a 1,000 target: over, and nothing may give it back.
+    assert sum(r.estimated_value for r in plan.rows) == pytest.approx(1_090.0)
+
+
+# ---------------------------------------------------------------------------
+# Whole-share absorbers move in lumps and never cross the target
+# ---------------------------------------------------------------------------
+
+def test_a_whole_share_sibling_absorbs_one_lump_and_stops_short_of_crossing():
+    """575 each on a 100 grid is 5 shares each and 150 left over. One more share
+    fits; the remaining 50 does not, and buying it would OVERSHOOT the label."""
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("AAA", 50.0),
+                                       SymbolTarget("BBB", 50.0)])]
+    current = {"AAA": _pos("AAA", 100.0), "BBB": _pos("BBB", 100.0)}
+    margin = {"AAA": _whole("AAA"), "BBB": _whole("BBB")}
+    plan = pa.compute_allocation(1_150.0, 1_000_000.0, labels, current, margin,
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
+    by = {r.symbol: r for r in plan.rows}
+    assert sorted([by["AAA"].delta_quantity, by["BBB"].delta_quantity]) == [5.0, 6.0]
+    assert sum(r.estimated_value for r in plan.rows) == pytest.approx(1_100.0)
+    assert plan.warnings == []          # 50 left is under one share: arithmetic, not a fault
+
+
+# ---------------------------------------------------------------------------
+# The clamps
+# ---------------------------------------------------------------------------
+
+def test_redistribution_never_drives_a_position_negative_or_liquidates_it():
+    """A 300 overshoot against a row holding 3 shares: it may give two back, never
+    all three. Exiting a symbol is a position decision, not a rounding fix -- and
+    the 100 it could not give back is reported instead of being taken anyway."""
+    row = _buy_row("HELD", 100.0, 0.0, current_quantity=3.0, target_notional=0.0)
+    plan = AllocationPlan(rows=[row], base_notional=300.0,
+                          available_buying_power=100_000.0,
+                          valuation_mode=pa.VALUATION_MODE_MARKET)
+    left = pa.redistribute_label_residuals(plan, {"A": {"HELD": 0.0}},
+                                           {"HELD": _whole("HELD")},
+                                           allow_fractional=False)
+    assert row.delta_quantity == -2.0
+    assert row.target_quantity == 1.0
+    assert left["A"] == pytest.approx(-100.0)
+    assert any("can absorb the rest" in w for w in plan.warnings)
+
+
+def test_redistribution_cannot_sell_a_symbol_that_is_not_held():
+    row = _buy_row("FLAT", 100.0, 0.0, target_notional=0.0)
+    plan = AllocationPlan(rows=[row], available_buying_power=100_000.0,
+                          valuation_mode=pa.VALUATION_MODE_MARKET)
+    pa.redistribute_label_residuals(plan, {"A": {"FLAT": -500.0}},
+                                    {"FLAT": _whole("FLAT")}, allow_fractional=False)
+    assert row.delta_quantity == 0.0
+    assert row.side is None
+
+
+def test_redistribution_never_exceeds_the_available_buying_power():
+    """Headroom is 50 of a 100 share, so nothing moves; at 150 exactly one does."""
+    row = _buy_row("AAA", 100.0, 2.0, target_notional=200.0)
+    plan = AllocationPlan(rows=[row], available_buying_power=250.0,
+                          valuation_mode=pa.VALUATION_MODE_MARKET)
+    pa.redistribute_label_residuals(plan, {"A": {"AAA": 1_200.0}},
+                                    {"AAA": _whole("AAA")}, allow_fractional=False)
+    assert row.delta_quantity == 2.0
+
+    row2 = _buy_row("AAA", 100.0, 2.0, target_notional=200.0)
+    plan2 = AllocationPlan(rows=[row2], available_buying_power=350.0,
+                           valuation_mode=pa.VALUATION_MODE_MARKET)
+    pa.redistribute_label_residuals(plan2, {"A": {"AAA": 1_200.0}},
+                                    {"AAA": _whole("AAA")}, allow_fractional=False)
+    assert row2.delta_quantity == 3.0
+    assert row2.bp_cost == pytest.approx(300.0)
+
+
+def test_redistribution_shrinks_an_order_but_never_deletes_it():
+    """Removing the last unit would silently drop a row the user reviewed."""
+    row = _buy_row("AAA", 100.0, 3.0, target_notional=300.0)
+    plan = AllocationPlan(rows=[row], available_buying_power=100_000.0,
+                          valuation_mode=pa.VALUATION_MODE_MARKET)
+    pa.redistribute_label_residuals(plan, {"A": {"AAA": 0.0}},
+                                    {"AAA": _whole("AAA")}, allow_fractional=False)
+    assert row.delta_quantity == 1.0
+    assert row.side == OrderDirection.BUY
+    assert row.estimated_value == pytest.approx(100.0)
+
+
+def test_redistribution_respects_the_broker_minimum_order_size():
+    row = _buy_row("AAA", 100.0, 0.0, target_notional=0.0)
+    plan = AllocationPlan(rows=[row], available_buying_power=100_000.0,
+                          valuation_mode=pa.VALUATION_MODE_MARKET)
+    pa.redistribute_label_residuals(plan, {"A": {"AAA": 300.0}},
+                                    {"AAA": _whole("AAA", min_order_size=5.0)},
+                                    allow_fractional=False)
+    assert row.delta_quantity == 0.0
+
+
+def test_a_row_the_grid_already_refused_is_not_resurrected_as_an_absorber():
+    """It carries "no order" in its reasons and unmet money on its face; giving it an
+    order anyway would make the two halves of the row contradict each other."""
+    row = _buy_row("SKIP", 650_000.0, 0.0, target_notional=260_000.0)
+    row.sizing_outcome = pa.SIZING_OUTCOME_SKIPPED_TOO_LARGE
+    row.unmet_notional = 260_000.0
+    plan = AllocationPlan(rows=[row], available_buying_power=10_000_000.0,
+                          valuation_mode=pa.VALUATION_MODE_MARKET)
+    pa.redistribute_label_residuals(plan, {"A": {"SKIP": 260_000.0}},
+                                    {"SKIP": _whole("SKIP")}, allow_fractional=False)
+    assert row.delta_quantity == 0.0
+    assert row.redistributed is False
+
+
+def test_a_symbol_in_two_labels_is_left_out_of_the_redistribution_entirely():
+    """Its target is the SUM of two labels' shares, so no single label owns it and
+    moving it would move both. Excluded from the total AND from the absorbers."""
+    shared = _buy_row("XXX", 100.0, 5.0, target_notional=500.0, labels=("A", "B"))
+    plan = AllocationPlan(rows=[shared], available_buying_power=100_000.0,
+                          valuation_mode=pa.VALUATION_MODE_MARKET)
+    left = pa.redistribute_label_residuals(plan, {"A": {"XXX": 900.0}}, {},
+                                           allow_fractional=False)
+    assert shared.delta_quantity == 5.0
+    assert left == {}
+    assert plan.warnings == []
+
+
+# ---------------------------------------------------------------------------
+# Cost mode converts at the right rate in both directions
+# ---------------------------------------------------------------------------
+
+def test_a_cost_mode_reduction_removes_average_cost_not_the_market_price():
+    """Basis 1,000 over 10 shares (avg 100) at a 200 price, target basis 900. One
+    share off the basis is 100, not 200: divide by the price and nothing moves."""
+    row = _buy_row("HELD", 200.0, 0.0, current_quantity=10.0,
+                   current_cost_basis=1_000.0, target_notional=900.0)
+    plan = AllocationPlan(rows=[row], available_buying_power=100_000.0,
+                          valuation_mode=pa.VALUATION_MODE_COST)
+    left = pa.redistribute_label_residuals(plan, {"A": {"HELD": 900.0}},
+                                           {"HELD": _whole("HELD")},
+                                           allow_fractional=False)
+    assert row.delta_quantity == -1.0
+    assert pa.projected_value(row, pa.VALUATION_MODE_COST) == pytest.approx(900.0)
+    assert left["A"] == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# Convergence and the bound
+# ---------------------------------------------------------------------------
+
+def test_redistribution_converges_and_leaves_no_warning():
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 50.0),
+                                       SymbolTarget("FRAC", 50.0)])]
+    current = {"XXX": _pos("XXX", 300.0), "FRAC": _pos("FRAC", 100.0)}
+    margin = {"XXX": _whole("XXX"), "FRAC": _frac("FRAC")}
+    plan = pa.compute_allocation(1_000.0, 1_000_000.0, labels, current, margin,
+                                 allow_fractional=True, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
+    assert plan.warnings == []
+    total = sum(r.estimated_value for r in plan.rows)
+    assert total == pytest.approx(1_000.0)
+
+
+def test_the_pass_bound_stops_the_loop_and_the_plan_says_the_bound_stopped_it(monkeypatch):
+    """Pinned by driving the bound to zero: the loop must be bounded by the constant,
+    not by the argument that it converges."""
+    monkeypatch.setattr(pa, "REDISTRIBUTION_MAX_PASSES", 0)
+    row = _buy_row("AAA", 100.0, 5.0, target_notional=500.0)
+    plan = AllocationPlan(rows=[row], available_buying_power=100_000.0,
+                          valuation_mode=pa.VALUATION_MODE_MARKET)
+    left = pa.redistribute_label_residuals(plan, {"A": {"AAA": 900.0}},
+                                           {"AAA": _whole("AAA")}, allow_fractional=False)
+    assert row.delta_quantity == 5.0
+    assert left["A"] == pytest.approx(400.0)
+    assert any("redistribution passes" in w for w in plan.warnings)
+    assert any("400.00" in w for w in plan.warnings)
+
+
+def test_a_residual_nothing_may_absorb_is_reported_not_hidden():
+    """Buying power blocks the only absorber. The money is real and the plan says so
+    rather than pretending the label is on target."""
+    row = _buy_row("AAA", 100.0, 2.0, target_notional=200.0)
+    plan = AllocationPlan(rows=[row], available_buying_power=200.0,
+                          valuation_mode=pa.VALUATION_MODE_MARKET)
+    left = pa.redistribute_label_residuals(plan, {"A": {"AAA": 1_200.0}},
+                                           {"AAA": _whole("AAA")}, allow_fractional=False)
+    assert row.delta_quantity == 2.0
+    assert left["A"] == pytest.approx(1_000.0)
+    assert any("can absorb the rest" in w for w in plan.warnings)
+
+
+def test_a_residual_under_one_share_is_not_a_warning():
+    row = _buy_row("AAA", 100.0, 5.0, target_notional=500.0)
+    plan = AllocationPlan(rows=[row], available_buying_power=100_000.0,
+                          valuation_mode=pa.VALUATION_MODE_MARKET)
+    left = pa.redistribute_label_residuals(plan, {"A": {"AAA": 550.0}},
+                                           {"AAA": _whole("AAA")}, allow_fractional=False)
+    assert row.delta_quantity == 5.0
+    assert left["A"] == pytest.approx(50.0)
+    assert plan.warnings == []
+
+
+def test_redistribution_is_deterministic():
+    def _solve():
+        labels = [LabelTarget("A", 100.0, [SymbolTarget("AAA", 34.0),
+                                           SymbolTarget("BBB", 33.0),
+                                           SymbolTarget("CCC", 33.0)])]
+        current = {"AAA": _pos("AAA", 170.0), "BBB": _pos("BBB", 90.0),
+                   "CCC": _pos("CCC", 55.0)}
+        margin = {"AAA": _whole("AAA"), "BBB": _whole("BBB"), "CCC": _frac("CCC")}
+        return pa.compute_allocation(3_333.0, 1_000_000.0, labels, current, margin,
+                                     allow_fractional=True, default_bp_factor=1.0,
+                                     valuation_mode=pa.VALUATION_MODE_MARKET)
+    first, second = _solve(), _solve()
+    assert [r.to_dict() for r in first.rows] == [r.to_dict() for r in second.rows]
+    assert json.dumps(first.to_dict()) == json.dumps(second.to_dict())
+
+
+# ---------------------------------------------------------------------------
+# INVEST_LABEL: the budget basis
+# ---------------------------------------------------------------------------
+
+def test_an_invest_label_run_redistributes_against_the_budget_not_the_holding():
+    """AAA already holds 1,000 of stock. The label is investing 1,000 MORE, so the
+    residual is measured on the money deployed, never on the post-trade value."""
+    label = LabelTarget("L", 100.0, [SymbolTarget("AAA", 50.0),
+                                     SymbolTarget("FRAC", 50.0)])
+    current = {"AAA": _pos("AAA", 300.0, quantity=10.0, cost_basis=1_000.0),
+               "FRAC": _pos("FRAC", 100.0)}
+    margin = {"AAA": _whole("AAA"), "FRAC": _frac("FRAC")}
+    plan = pa.compute_label_investment(label, 1_000.0, current, margin,
+                                       available_buying_power=1_000_000.0,
+                                       allow_fractional=True, default_bp_factor=1.0,
+                                       valuation_mode=pa.VALUATION_MODE_MARKET)
+    by = {r.symbol: r for r in plan.rows}
+    assert plan.allocation_basis == pa.ALLOCATION_BASIS_BUDGET
+    assert by["AAA"].delta_quantity == 1.0                     # 500 buys one 300 share
+    assert by["FRAC"].delta_quantity == pytest.approx(7.0)     # 5 + the missing 200
+    assert plan.total_buy_value == pytest.approx(1_000.0)
+
+
+def test_a_rebalance_plan_is_stamped_with_the_position_basis():
+    plan = pa.compute_allocation(0.0, 0.0, [], {}, {}, allow_fractional=False,
+                                 default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
+    assert plan.allocation_basis == pa.ALLOCATION_BASIS_POSITION
+    assert json.loads(json.dumps(plan.to_dict()))["allocation_basis"] == "position"
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `venv/bin/python -m pytest packages/common/tests/test_portfolio_allocation_redistribution.py -v`
+
+Expected: FAIL — 27 collected, 27 failed with
+`AttributeError: module 'ba2_common.core.portfolio_allocation' has no attribute 'projected_value'`
+and `AttributeError: module 'ba2_common.core.portfolio_allocation' has no attribute
+'redistribute_label_residuals'`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+**3a.** In `__all__`, replace
+
+```python
+    # per-row sizing outcomes (D1)
+    "SIZING_OUTCOME_NORMAL", "SIZING_OUTCOME_BUMPED", "SIZING_OUTCOME_SKIPPED_TOO_LARGE",
+```
+
+with
+
+```python
+    # per-row sizing outcomes (D1)
+    "SIZING_OUTCOME_NORMAL", "SIZING_OUTCOME_BUMPED", "SIZING_OUTCOME_SKIPPED_TOO_LARGE",
+    # what a plan's target_notional MEANS, and the residual loop's bound (D2)
+    "ALLOCATION_BASIS_POSITION", "ALLOCATION_BASIS_BUDGET", "REDISTRIBUTION_MAX_PASSES",
+```
+
+and in the reason block replace `"REASON_ROUNDS_TO_ZERO_FMT",` with
+
+```python
+    "REASON_ROUNDS_TO_ZERO_FMT", "REASON_REDISTRIBUTED_FMT", "REASON_REDISTRIBUTED_PREFIX",
+    "WARNING_RESIDUAL_LEFT_FMT", "WARNING_RESIDUAL_UNCONVERGED_FMT",
+```
+
+and in the `# engine` block replace `"tradeable_unit", "size_sub_unit_target",` with
+
+```python
+    "tradeable_unit", "size_sub_unit_target", "projected_value", "allocated_value",
+    "redistribute_label_residuals",
+```
+
+**3b.** Immediately after the `REASON_ROUNDS_TO_ZERO_FMT` line added by Task 89, insert:
+
+```python
+#: How many redistribution passes a label gets before the engine gives up and
+#: reports what is left. The loop is finite on its own arithmetic -- every step is
+#: floored onto the absorbing row's grid, so it can close the gap but never cross
+#: it, |residual| is monotone, and a pass that moves nothing ends the loop at its
+#: fixed point. In practice that happens on pass 1 or 2. This bound exists so that
+#: TERMINATION is guaranteed by the code rather than by the argument: a future
+#: absorber type that breaks the monotonicity still stops here, and says so.
+REDISTRIBUTION_MAX_PASSES = 3
+
+#: What ``AllocationRow.target_notional`` MEANS in a given plan, which differs by
+#: solver and cannot be guessed from the numbers.
+#:   position -- compute_allocation: the desired POST-TRADE holding value.
+#:   budget   -- compute_label_investment: money to DEPLOY on top of what is held.
+#: Comparing one against the other produces a nonsense residual, which is why the
+#: plan carries the answer instead of each caller assuming one.
+ALLOCATION_BASIS_POSITION = "position"
+ALLOCATION_BASIS_BUDGET = "budget"
+
+#: Stamped on a row whose quantity was moved to keep its LABEL on target. The
+#: weights the user typed are NOT rewritten (``target_notional`` is untouched); the
+#: quantity is, and this says so in shares. Silently changing a user's weights is
+#: unacceptable -- showing the change is what makes the change allowed.
+REASON_REDISTRIBUTED_FMT = (
+    "weight adjusted {before:+.4f} -> {after:+.4f} shares to keep label "
+    "'{label}' on target")
+REASON_REDISTRIBUTED_PREFIX = REASON_REDISTRIBUTED_FMT.split("{", 1)[0]
+
+#: The label finished off target because nothing in it was ALLOWED to absorb the
+#: rest (buying power, a broker minimum, the no-negative-position clamp). Only
+#: raised when some member could physically have taken it: a residual smaller than
+#: one tradeable unit of every member is arithmetic, not a fault.
+WARNING_RESIDUAL_LEFT_FMT = (
+    "label '{label}' is {residual:,.2f} off target after redistribution - nothing "
+    "in it can absorb the rest (buying power, broker minimums, or it would drive a "
+    "position to zero)")
+#: The label finished off target because the pass bound stopped the loop.
+WARNING_RESIDUAL_UNCONVERGED_FMT = (
+    "label '{label}' is still {residual:,.2f} off target after the {passes} "
+    "redistribution passes allowed")
+```
+
+**3c.** In `class AllocationPlan`, insert after the `valuation_mode` field:
+
+```python
+    #: What every ``target_notional`` in ``rows`` MEANS -- ``ALLOCATION_BASIS_POSITION``
+    #: for a REBALANCE (the desired post-trade holding value) or
+    #: ``ALLOCATION_BASIS_BUDGET`` for an INVEST_LABEL run (money to deploy on top of
+    #: what is held). Every "is this plan on target?" measurement reads it; without
+    #: it the same arithmetic silently means two different things.
+    allocation_basis: str = ALLOCATION_BASIS_POSITION
+```
+
+and in `AllocationPlan.to_dict`, insert after the `"valuation_mode"` entry:
+
+```python
+            "allocation_basis": self.allocation_basis,
+```
+
+**3d.** Append at the end of `packages/common/ba2_common/core/portfolio_allocation.py`:
+
+```python
+# ---------------------------------------------------------------------------
+# D2: the label rounding residual, redistributed inside the label, both ways.
+#
+# Whole-share rounding leaves a label short; D1's bumps can push it long. One
+# signed pass moves the difference onto the symbols that can absorb it. Pure.
+# ---------------------------------------------------------------------------
+
+
+def projected_value(row: "AllocationRow", valuation_mode: str) -> Optional[float]:
+    """The POST-TRADE value of one row, measured the same way as a REBALANCE target.
+
+    This is what makes "did the plan hit its target?" answerable: both sides of the
+    comparison are in the same unit. ``market`` mode projects
+    ``target_quantity * price``; ``cost`` mode projects the post-trade COST BASIS,
+    removing average cost on a sell exactly as ``compute_allocation`` adds price on
+    a buy -- the two legs convert at different rates and mixing them is the bug that
+    once turned a half-trim into a liquidation.
+
+    ``target_quantity`` is already the post-trade holding AFTER whole-share rounding
+    and after any redistribution, so this number is what the account will really be
+    worth, not an ideal the rounding never reaches.
+
+    Returns:
+        Optional[float]: ``None`` when the row has no usable price -- nothing can be
+        measured and no fallback price may be invented (platform rule).
+
+    Raises:
+        ValueError: on an unknown ``valuation_mode``.
+    """
+    if valuation_mode not in (VALUATION_MODE_COST, VALUATION_MODE_MARKET):
+        raise ValueError(
+            f"Unknown valuation_mode {valuation_mode!r}; expected "
+            f"{VALUATION_MODE_COST!r} or {VALUATION_MODE_MARKET!r}")
+    if row.price is None or row.price <= 0:
+        return None
+    if valuation_mode == VALUATION_MODE_MARKET:
+        return float(row.target_quantity) * float(row.price)
+    delta = float(row.delta_quantity or 0.0)
+    basis = float(row.current_cost_basis or 0.0)
+    if delta >= 0:
+        return basis + delta * float(row.price)
+    if row.current_quantity <= 0:
+        return basis
+    return basis * (float(row.target_quantity) / float(row.current_quantity))
+
+
+def allocated_value(row: "AllocationRow", valuation_mode: str,
+                    allocation_basis: str) -> Optional[float]:
+    """What this row ACTUALLY allocates, measured the way its plan's target means it.
+
+    ``ALLOCATION_BASIS_POSITION`` (a REBALANCE) -> ``projected_value``: the target is
+    a post-trade holding value. ``ALLOCATION_BASIS_BUDGET`` (an INVEST_LABEL run) ->
+    the money this row deploys, because the target is money to ADD on top of an
+    existing holding and the post-trade value would double-count what is already
+    owned.
+
+    Returns:
+        Optional[float]: ``None`` when the row has no usable price.
+
+    Raises:
+        ValueError: on an unknown basis or valuation mode.
+    """
+    if allocation_basis == ALLOCATION_BASIS_POSITION:
+        return projected_value(row, valuation_mode)
+    if allocation_basis != ALLOCATION_BASIS_BUDGET:
+        raise ValueError(
+            f"Unknown allocation_basis {allocation_basis!r}; expected "
+            f"{ALLOCATION_BASIS_POSITION!r} or {ALLOCATION_BASIS_BUDGET!r}")
+    if valuation_mode not in (VALUATION_MODE_COST, VALUATION_MODE_MARKET):
+        raise ValueError(f"Unknown valuation_mode {valuation_mode!r}")
+    if row.price is None or row.price <= 0:
+        return None
+    return float(row.delta_quantity or 0.0) * float(row.price)
+
+
+def _label_residual(target_total: float, members: List["AllocationRow"],
+                    valuation_mode: str, allocation_basis: str) -> float:
+    """SIGNED money the label is off its target: + is short, - is over."""
+    total = 0.0
+    for row in members:
+        value = allocated_value(row, valuation_mode, allocation_basis)
+        if value is not None:
+            total += value
+    return float(target_total) - total
+
+
+def _absorption_unit_money(row: "AllocationRow", valuation_mode: str,
+                           allocation_basis: str, *, buying: bool) -> float:
+    """How much the LABEL's measured total moves per share moved on this row.
+
+    Not always the price. In ``cost`` mode on a position basis, buying a share adds
+    the market PRICE to the basis but selling one removes the AVERAGE COST, exactly
+    as in ``compute_allocation``. Using the price for a cost-mode reduction
+    under-counts by ``price / avg_cost`` and the label never converges.
+    """
+    price = float(row.price)
+    if allocation_basis == ALLOCATION_BASIS_BUDGET:
+        return price
+    if valuation_mode == VALUATION_MODE_MARKET or buying:
+        return price
+    qty = float(row.current_quantity or 0.0)
+    if qty <= 0:
+        return price
+    avg = float(row.current_cost_basis or 0.0) / qty
+    return avg if avg > 0 else price
+
+
+def _buying_power_headroom(plan: "AllocationPlan") -> float:
+    """Buying power the plan is NOT already spending. Recomputed after every move."""
+    return (float(plan.available_buying_power or 0.0)
+            - sum(r.bp_cost for r in plan.rows if r.is_buy))
+
+
+def _absorb_residual(row: "AllocationRow", residual: float,
+                     margin: Optional[MarginInfo], *, allow_fractional: bool,
+                     valuation_mode: str, allocation_basis: str,
+                     bp_headroom: float) -> float:
+    """Move ONE row by whole grid units toward closing ``residual``. Pure arithmetic.
+
+    Returns the SIGNED quantity to move (0.0 when nothing may move). Every cap is
+    expressed in UNITS, so the result is always back on the row's own grid and never
+    needs re-rounding.
+
+    The step count is FLOORED: a step can close the gap but never cross it. That is
+    what makes ``|residual|`` monotone and the outer loop finite, and it is also why
+    redistribution cannot create a new overshoot.
+    """
+    price = float(row.price or 0.0)
+    unit = tradeable_unit(margin, allow_fractional=allow_fractional)
+    if price <= 0 or unit <= 0:
+        return 0.0
+    buying = residual > 0
+    unit_money = _absorption_unit_money(row, valuation_mode, allocation_basis,
+                                        buying=buying)
+    if unit_money <= 0:
+        return 0.0
+    steps = math.floor(abs(residual) / (unit_money * unit) + QUANTITY_EPSILON)
+    if steps < 1:
+        return 0.0
+    current = float(row.delta_quantity or 0.0)
+    if buying:
+        if current < 0:
+            # Selling LESS. Stop one unit short of deleting the order: a row the user
+            # reviewed must not vanish because a sibling rounded badly.
+            steps = min(steps, int(math.floor(abs(current) / unit + QUANTITY_EPSILON)) - 1)
+        else:
+            # Buying MORE. Never past the buying power the plan has left.
+            cost_per_unit = unit * price * float(row.bp_factor or 1.0)
+            if cost_per_unit <= 0:
+                return 0.0
+            steps = min(steps, int(math.floor(
+                max(0.0, bp_headroom) / cost_per_unit + QUANTITY_EPSILON)))
+    else:
+        if current > 0:
+            # Buying LESS, again never to zero.
+            steps = min(steps, int(math.floor(current / unit + QUANTITY_EPSILON)) - 1)
+        else:
+            # Selling MORE. Never below flat, and never all the way to flat: closing
+            # a position is a target decision, not a rounding fix. One unit stays.
+            room = float(row.current_quantity or 0.0) + current - unit
+            steps = min(steps, int(math.floor(max(0.0, room) / unit + QUANTITY_EPSILON)))
+    if steps < 1:
+        return 0.0
+    move = (1.0 if buying else -1.0) * steps * unit
+    proposed = round(current + move, 10)
+    min_size = None if margin is None else margin.min_order_size
+    if min_size is not None and 0 < abs(proposed) < float(min_size):
+        # The broker would refuse the order the move produces, so there is no move.
+        return 0.0
+    return round(move, 10)
+
+
+def _apply_absorption(row: "AllocationRow", move: float, label: str,
+                      baseline: float) -> None:
+    """Write an absorbed move onto a row, and SAY SO in one reason, not two.
+
+    ``bp_cost`` is recomputed from the estimate rather than scaled, which is correct
+    here and only here: redistribution runs inside the two solvers, before any broker
+    precheck has substituted a cost.
+    """
+    after = round(float(row.delta_quantity or 0.0) + move, 10)
+    row.delta_quantity = after
+    row.target_quantity = float(row.current_quantity or 0.0) + after
+    row.estimated_value = abs(after) * float(row.price)
+    row.bp_cost = row.estimated_value * float(row.bp_factor or 1.0) if after > 0 else 0.0
+    row.side = (OrderDirection.BUY if after > 0
+                else OrderDirection.SELL if after < 0 else None)
+    row.redistributed = True
+    # One reason per row, always quoting the ORIGINAL quantity, however many passes
+    # touched it -- two half-truths side by side is worse than no reason at all.
+    row.reasons = [r for r in row.reasons if not r.startswith(REASON_REDISTRIBUTED_PREFIX)]
+    row.reasons.append(REASON_REDISTRIBUTED_FMT.format(
+        before=baseline, after=after, label=label))
+
+
+def _absorber_order(members: List["AllocationRow"]) -> List["AllocationRow"]:
+    """The rows a label may move, best first, deterministically.
+
+    FRACTIONABLE first (they absorb the residual almost exactly, on a 4dp grid,
+    instead of in whole-share lumps), then rows that are already trading (adjusting
+    an order the user has reviewed is less surprising than inventing a new one), then
+    by symbol so two identical plans produce two identical results.
+
+    EXCLUDED, and this is the rule that makes D1 and D2 compatible:
+      * a row D1 BUMPED -- the only way to absorb an overshoot on it is to sell it
+        back to zero, which re-creates the floor-to-zero D1 exists to remove, in a
+        loop. Bumps are one-way;
+      * a row the grid or the broker minimum already refused (``unmet_notional`` set,
+        or ``SIZING_OUTCOME_SKIPPED_TOO_LARGE``) -- it already says "no order" on its
+        face, and giving it one anyway makes the two halves of the row contradict
+        each other;
+      * a skipped or unpriced row -- there is nothing to measure or to trade.
+    """
+    absorbers = [r for r in members
+                 if r.sizing_outcome == SIZING_OUTCOME_NORMAL
+                 and float(r.unmet_notional or 0.0) <= MONEY_EPSILON]
+    return sorted(absorbers, key=lambda r: (0 if r.fractional else 1,
+                                            0 if r.delta_quantity else 1,
+                                            r.symbol))
+
+
+def _smallest_absorbable(absorbers: List["AllocationRow"],
+                         margin: Dict[str, MarginInfo], *,
+                         allow_fractional: bool) -> float:
+    """The cheapest single step any absorber could take, or +inf if there are none."""
+    units = [tradeable_unit(margin.get(r.symbol), allow_fractional=allow_fractional)
+             * float(r.price) for r in absorbers]
+    return min(units) if units else float("inf")
+
+
+def redistribute_label_residuals(plan: "AllocationPlan",
+                                 label_targets: Dict[str, Dict[str, float]],
+                                 margin: Dict[str, MarginInfo], *,
+                                 allow_fractional: bool) -> Dict[str, float]:
+    """Move whole grid units between a label's rows until the LABEL hits its total.
+
+    Decision D2. Rounding leaves a label short of its target; D1's bumps can push it
+    over. The difference is SIGNED and redistribution is BIDIRECTIONAL: it adds
+    weight to close a shortfall and REMOVES weight to close an overshoot. A
+    one-directional "top up" is wrong the moment a single symbol is bumped.
+
+    Mutates ``plan.rows`` in place and appends to ``plan.warnings``. Runs INSIDE the
+    two solvers, before ``_apply_bp_scaling`` -- and it can never be the reason that
+    scaling has to fire, because every upward move is capped by the plan's live
+    buying-power headroom.
+
+    Args:
+        plan: the solved plan. ``valuation_mode`` and ``allocation_basis`` decide
+            what "on target" means.
+        label_targets: ``{label: {symbol: target_notional_for_THIS_label}}`` -- the
+            per-label split, which ``AllocationRow.target_notional`` cannot provide
+            because a symbol in two labels carries their SUM.
+        margin: ``{symbol: MarginInfo}``, the same dict the plan was solved with, so
+            redistribution rounds on the same grid the sizing did.
+        allow_fractional: the run's toggle, again so the grids match.
+
+    Returns:
+        Dict[str, float]: ``{label: residual left over}``, signed. A label with no
+        movable member is absent.
+
+    Termination: every step is ``floor(|residual| / one_unit) * one_unit``, so it can
+    close the gap but never cross it; ``|residual|`` therefore decreases strictly
+    whenever anything moves. A pass walks a fixed absorber list once and recomputes
+    the residual after each row; a pass that moves nothing exits at the fixed point.
+    ``REDISTRIBUTION_MAX_PASSES`` bounds it regardless, and a bound that actually
+    stops the loop is REPORTED, never swallowed.
+    """
+    margin = margin or {}
+    mode = plan.valuation_mode
+    basis = plan.allocation_basis
+    out: Dict[str, float] = {}
+    for label in sorted(label_targets or {}):
+        wanted = label_targets[label] or {}
+        # Both sides of the comparison are restricted to the SAME member set: rows
+        # this label alone owns. A multi-label symbol is out of the scheme entirely,
+        # target and projection together, so the arithmetic stays self-consistent.
+        members = [r for r in plan.rows
+                   if len(r.labels) == 1 and r.labels[0] == label
+                   and not r.skipped and r.price is not None and r.price > 0]
+        if not members:
+            continue
+        target_total = sum(float(wanted.get(r.symbol, 0.0) or 0.0) for r in members)
+        absorbers = _absorber_order(members)
+        baselines = {r.symbol: float(r.delta_quantity or 0.0) for r in members}
+        residual = _label_residual(target_total, members, mode, basis)
+        passes = 0
+        moved_any = False
+        while passes < REDISTRIBUTION_MAX_PASSES and abs(residual) > MONEY_EPSILON:
+            passes += 1
+            moved_this_pass = False
+            for row in absorbers:
+                if abs(residual) <= MONEY_EPSILON:
+                    break
+                move = _absorb_residual(
+                    row, residual, margin.get(row.symbol),
+                    allow_fractional=allow_fractional, valuation_mode=mode,
+                    allocation_basis=basis, bp_headroom=_buying_power_headroom(plan))
+                if not move:
+                    continue
+                _apply_absorption(row, move, label, baselines[row.symbol])
+                moved_this_pass = True
+                moved_any = True
+                residual = _label_residual(target_total, members, mode, basis)
+            if not moved_this_pass:
+                break
+        out[label] = residual
+        if abs(residual) <= MONEY_EPSILON:
+            continue
+        if passes >= REDISTRIBUTION_MAX_PASSES:
+            plan.warnings.append(WARNING_RESIDUAL_UNCONVERGED_FMT.format(
+                label=label, residual=residual, passes=REDISTRIBUTION_MAX_PASSES))
+        elif abs(residual) >= _smallest_absorbable(
+                absorbers, margin, allow_fractional=allow_fractional):
+            # Some member could physically have taken this and none was allowed to.
+            plan.warnings.append(WARNING_RESIDUAL_LEFT_FMT.format(
+                label=label, residual=residual))
+        elif not moved_any:
+            # Under one unit of every absorber: pure arithmetic. Reported as money by
+            # fractional_summary, never as a warning.
+            pass
+    return out
+```
+
+**3e.** In `compute_allocation`, replace
+
+```python
+    targets = {}
+    target_pcts = {}
+    sym_labels = {}
+```
+
+with
+
+```python
+    targets = {}
+    target_pcts = {}
+    sym_labels = {}
+    # The PER-LABEL split, which row.target_notional cannot carry: a symbol in two
+    # labels sums their shares into one row. Redistribution needs the split.
+    label_targets: Dict[str, Dict[str, float]] = {}
+```
+
+and, inside the `for st in lt.symbols:` loop, immediately after the
+`sym_labels.setdefault(...)` line, add:
+
+```python
+            per_label = label_targets.setdefault(lt.label, {})
+            per_label[st.symbol] = (per_label.get(st.symbol, 0.0)
+                                    + plan.base_notional * share / 100.0)
+```
+
+and replace
+
+```python
+    plan.scale_factor = _apply_bp_scaling(plan.rows, plan.available_buying_power,
+                                          allow_fractional=allow_fractional, margin=margin)
+    _finalise_totals(plan)
+    return plan
+```
+
+(the copy at the end of `compute_allocation`) with
+
+```python
+    # D2, BEFORE the buying-power pass: the label's own arithmetic first, the
+    # account-wide feasibility constraint second. Redistribution is capped by the
+    # live headroom, so it can never be the reason scaling has to fire.
+    redistribute_label_residuals(plan, label_targets, margin,
+                                 allow_fractional=allow_fractional)
+    plan.scale_factor = _apply_bp_scaling(plan.rows, plan.available_buying_power,
+                                          allow_fractional=allow_fractional, margin=margin)
+    _finalise_totals(plan)
+    return plan
+```
+
+**3f.** In `compute_label_investment`, replace
+
+```python
+    plan = AllocationPlan(base_notional=budget,
+                          available_buying_power=float(available_buying_power),
+                          allow_fractional=bool(allow_fractional),
+                          valuation_mode=valuation_mode)
+```
+
+with
+
+```python
+    plan = AllocationPlan(base_notional=budget,
+                          available_buying_power=float(available_buying_power),
+                          allow_fractional=bool(allow_fractional),
+                          valuation_mode=valuation_mode,
+                          # The target is money to DEPLOY, not a post-trade holding
+                          # value: this run ADDS to whatever is already owned.
+                          allocation_basis=ALLOCATION_BASIS_BUDGET)
+```
+
+and replace its closing
+
+```python
+    plan.scale_factor = _apply_bp_scaling(plan.rows, plan.available_buying_power,
+                                          allow_fractional=allow_fractional, margin=margin)
+    _finalise_totals(plan)
+    return plan
+```
+
+with
+
+```python
+    redistribute_label_residuals(
+        plan, {label.label: {sym: budget * w / 100.0 for sym, w in weights.items()}},
+        margin, allow_fractional=allow_fractional)
+    plan.scale_factor = _apply_bp_scaling(plan.rows, plan.available_buying_power,
+                                          allow_fractional=allow_fractional, margin=margin)
+    _finalise_totals(plan)
+    return plan
+```
+
+**3g.** In `apply_order_impacts`, add the basis to the copied plan — replace
+
+```python
+        allow_fractional=plan.allow_fractional,
+        valuation_mode=plan.valuation_mode,
+```
+
+with
+
+```python
+        allow_fractional=plan.allow_fractional,
+        valuation_mode=plan.valuation_mode,
+        allocation_basis=plan.allocation_basis,
+```
+
+and add to its docstring, after the paragraph beginning ``Deliberately NOT done:``:
+
+```
+    Also deliberately NOT done: the label residual is not re-redistributed after a
+    precheck rejection. This function has no per-label target split in hand, the user
+    is looking at the plan at that moment, and the refused money is already reported
+    on the row as ``unmet_notional``.
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `venv/bin/python -m pytest packages/common/tests/test_portfolio_allocation_redistribution.py -v`
+Expected: PASS — 27 passed.
+
+Run: `venv/bin/python -m pytest packages/common/tests/test_portfolio_allocation.py -v`
+Expected: PASS — 147 passed, no failures. Redistribution is a no-op on every landed test, and that
+is arithmetic rather than luck: in a single-symbol label the leftover is by construction smaller
+than one unit of the only member (the initial rounding floored onto that same grid), so no step is
+ever taken; and every multi-symbol label in that file divides exactly (`50_000/100`, `12_000/20`,
+`60_000/250`, `4_000/50`, `6_000/100`, ...), leaving a residual of zero. The `min_order_size`
+scenarios at `:283`, `:969`, `:986`, `:1015`, `:1032` and `:1316` carry `unmet_notional`, so their
+rows are not absorbers at all and no warning is raised — verified against
+`test_an_empty_label_at_zero_percent_warns_about_nothing` (`:1361`, `assert plan.warnings == []`),
+which still holds because its one label divides exactly.
+
+Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_shim.py -v`
+Expected: PASS — 2 passed.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add packages/common/ba2_common/core/portfolio_allocation.py packages/common/tests/test_portfolio_allocation_redistribution.py
+git commit -m "feat(allocation): redistribute the label rounding residual in both directions"
+```
+
+---
+### Task 91: Show it per symbol — sizing mode, the bump, the skip, and the weight the plan will really use
+
+The engine now takes three decisions the user never typed: it rounds onto a per-symbol grid, it
+bumps a sub-unit target up to one share (N1), and it moves quantities between siblings to keep a
+label on target (N2). Every one of them is defensible and none of them may be invisible. This task
+is the reporting layer — pure, no NiceGUI, no broker.
+
+`compute_allocation` already threads per-symbol eligibility as **data**: the `margin: Dict[str,
+MarginInfo]` argument (`portfolio_allocation.py:713`), whose `MarginInfo.fractionable` is consulted
+in exactly one place, `_round_shares:363`. The engine never calls a broker; the live fetch is
+`fetch_margin_info(account, symbols)` (Task 69). **Nothing new is needed to get eligibility in.**
+What is missing is getting it back OUT, per symbol.
+
+Five additions and two edits, all pure:
+
+* `fractional_summary(plan)` — the counts and the money: how many rows were sized on which grid, how
+  many were bumped and by how much, how many got no order, how many were redistributed, and the
+  signed `residual_notional` the whole plan is off target.
+* `no_order_rows(plan)` — one entry per row the plan wanted to trade and could not, biggest first.
+  `dry_run_rows` structurally cannot show them: it filters on `row.side is None or
+  row.delta_quantity == 0`, which is exactly what these rows are. Selected by `unmet_notional`, so
+  the reason strings never have to be pattern-matched.
+* `whole_share_notice` / `no_order_notice` / `bump_notice` / `redistribution_notice` — one sentence
+  each, or `None` when there is nothing to say. Text only; the caller picks the styling. Every UI
+  banner in this plan is a pure function returning text, tested without NiceGUI.
+* `dry_run_rows` gains `sizing`, `outcome`, `redistributed`, `target_notional`,
+  `projected_notional`, `residual_notional`, `weight_pct` and `projected_weight_pct`. The last two
+  are the D2 requirement in one column pair: **what the user typed, and what the plan will actually
+  hold.** Existing keys are unchanged.
+* `filter_plan_rows` gains `valuation_mode` and `allocation_basis`. This is a real bug fix: Task
+  70's version rebuilds `AllocationPlan` without them, so un-ticking one row silently reinterpreted
+  a `cost`-mode plan as `market`, and every projected number in the footer with it.
+
+`unmet_notional`, `target_notional`, `projected_notional`, `residual_notional` and
+`no_order_notional` are MEASUREMENTS, whitelisted by the contract. They are not order fields and the
+no-notional-orders rule does not touch them. Nobody may "correct" them into share counts.
+
+`unknown_rows` counts rows carrying `REASON_FRACTIONAL_UNKNOWN`, which is exactly the contract's
+"rows where `m is None or m.fractionable is None`" seen from a plan: those are the only rows that
+reason is appended to. With the toggle OFF no eligibility reason is appended at all, so
+`unknown_rows` is 0 — correct, because eligibility was never consulted.
+
+**Files:**
+- Modify: `packages/common/ba2_common/core/portfolio_allocation.py` (append; plus `filter_plan_rows` and `dry_run_rows` from Task 70)
+- Test: `packages/common/tests/test_portfolio_allocation_wizard.py` (append)
+
+- [ ] **Step 1: Write the failing test**
+
+Append to `packages/common/tests/test_portfolio_allocation_wizard.py`:
+
+```python
+# ---------------------------------------------------------------------------
+# Mixed fractional eligibility, bumps and redistribution: what the dry run shows
+# ---------------------------------------------------------------------------
+from ba2_common.core import portfolio_allocation as pa
+from ba2_common.core.portfolio_allocation import (
+    VALUATION_MODE_COST,
+    VALUATION_MODE_MARKET,
+    bump_notice,
+    fractional_summary,
+    no_order_notice,
+    no_order_rows,
+    redistribution_notice,
+    whole_share_notice,
+)
+
+
+def _mixed_plan():
+    """One fractional buy, one whole-share buy, one bumped row, one refused row."""
+    return AllocationPlan(
+        rows=[
+            AllocationRow(symbol="AAPL", price=160.0, current_quantity=0.0,
+                          target_notional=1_600.0, target_quantity=10.0,
+                          delta_quantity=10.0, side=OrderDirection.BUY,
+                          estimated_value=1_600.0, bp_cost=1_600.0, bp_factor=1.0,
+                          fractional=True, redistributed=True,
+                          reasons=["fractional",
+                                   "weight adjusted +9.0000 -> +10.0000 shares to "
+                                   "keep label 'A' on target"]),
+            AllocationRow(symbol="MSFT", price=400.0, current_quantity=0.0,
+                          target_notional=1_000.0, target_quantity=2.0,
+                          delta_quantity=2.0, side=OrderDirection.BUY,
+                          estimated_value=800.0, bp_cost=800.0, bp_factor=1.0,
+                          fractional=False, reasons=["rounded down to whole shares"]),
+            AllocationRow(symbol="BUMPY", price=300.0, current_quantity=0.0,
+                          target_notional=200.0, target_quantity=1.0,
+                          delta_quantity=1.0, side=OrderDirection.BUY,
+                          estimated_value=300.0, bp_cost=300.0, bp_factor=1.0,
+                          fractional=False,
+                          sizing_outcome=pa.SIZING_OUTCOME_BUMPED,
+                          reasons=["target 200.00 buys 0.6667 shares at 300.00 - "
+                                   "BUMPED UP to 1 share(s), 150% of target"]),
+            AllocationRow(symbol="BRKA", price=650_000.0, current_quantity=0.0,
+                          target_notional=260_000.0, target_quantity=0.0,
+                          delta_quantity=0.0, side=None, unmet_notional=260_000.0,
+                          fractional=False,
+                          sizing_outcome=pa.SIZING_OUTCOME_SKIPPED_TOO_LARGE,
+                          reasons=["target 260,000.00 buys 0.4000 shares at "
+                                   "650,000.00 - no order; one whole share is 250% "
+                                   "of target, over the 150% bump limit"]),
+        ],
+        base_notional=262_800.0,
+        available_buying_power=300_000.0,
+        allow_fractional=True,
+        valuation_mode=VALUATION_MODE_MARKET,
+    )
+
+
+def test_fractional_summary_counts_fractional_and_whole_share_rows():
+    summary = fractional_summary(_mixed_plan())
+    assert summary["total_rows"] == 4
+    assert summary["fractional_rows"] == 1
+    assert summary["whole_share_rows"] == 3
+    assert summary["whole_share_symbols"] == ["BRKA", "BUMPY", "MSFT"]
+    assert summary["whole_share_pct"] == pytest.approx(75.0)
+
+
+def test_fractional_summary_residual_is_the_money_the_plan_is_off_target():
+    """MSFT wants 1,000 and gets 800; BRKA wants 260,000 and gets nothing; BUMPY
+    wants 200 and gets 300. The residual is SIGNED and nets them."""
+    summary = fractional_summary(_mixed_plan())
+    assert summary["target_notional"] == pytest.approx(262_800.0)
+    assert summary["projected_notional"] == pytest.approx(2_700.0)
+    assert summary["residual_notional"] == pytest.approx(260_100.0)
+
+
+def test_fractional_summary_counts_the_bumps_and_prices_the_over_allocation():
+    summary = fractional_summary(_mixed_plan())
+    assert summary["bumped_rows"] == 1
+    assert summary["bumped_notional"] == pytest.approx(100.0)
+    assert summary["skipped_too_large_rows"] == 1
+
+
+def test_fractional_summary_counts_the_rows_redistribution_moved():
+    assert fractional_summary(_mixed_plan())["redistributed_rows"] == 1
+
+
+def test_fractional_summary_counts_the_rows_with_no_order_and_their_money():
+    summary = fractional_summary(_mixed_plan())
+    assert summary["no_order_rows"] == 1
+    assert summary["no_order_notional"] == pytest.approx(260_000.0)
+
+
+def test_fractional_summary_counts_unknown_eligibility_separately():
+    plan = _mixed_plan()
+    plan.rows[1].reasons = [pa.REASON_FRACTIONAL_UNKNOWN]
+    assert fractional_summary(plan)["unknown_rows"] == 1
+
+
+def test_fractional_summary_ignores_a_row_with_no_price():
+    """Its whole target is already reported through unallocatable_pct; counting it
+    here too would double the money the dry run calls unallocated."""
+    plan = _mixed_plan()
+    plan.rows.append(AllocationRow(symbol="NOPRICE", price=None, skipped=True,
+                                   target_notional=5_000.0))
+    summary = fractional_summary(plan)
+    assert summary["total_rows"] == 4
+    assert summary["target_notional"] == pytest.approx(262_800.0)
+
+
+def test_whole_share_notice_names_the_count_and_the_residual():
+    notice = whole_share_notice(fractional_summary(_mixed_plan()))
+    assert "3 of 4" in notice
+    assert "260,100.00" in notice
+
+
+def test_whole_share_notice_is_none_when_every_row_is_fractional():
+    plan = _mixed_plan()
+    plan.rows = [plan.rows[0]]
+    assert whole_share_notice(fractional_summary(plan)) is None
+
+
+def test_whole_share_notice_says_fractional_is_off_when_the_toggle_is_off():
+    plan = _mixed_plan()
+    plan.allow_fractional = False
+    for row in plan.rows:
+        row.fractional = False
+    notice = whole_share_notice(fractional_summary(plan))
+    assert notice.startswith("Fractional shares are OFF")
+
+
+def test_bump_notice_names_the_over_allocation_it_is_asking_permission_for():
+    notice = bump_notice(fractional_summary(_mixed_plan()))
+    assert "1 symbol" in notice
+    assert "100.00" in notice
+    assert "over-allocat" in notice
+
+
+def test_bump_notice_is_none_when_nothing_was_bumped():
+    plan = _mixed_plan()
+    plan.rows[2].sizing_outcome = pa.SIZING_OUTCOME_NORMAL
+    assert bump_notice(fractional_summary(plan)) is None
+
+
+def test_no_order_notice_names_the_count_the_money_and_the_bump_limit():
+    notice = no_order_notice(fractional_summary(_mixed_plan()))
+    assert "1 symbol" in notice
+    assert "260,000.00" in notice
+    assert "150%" in notice
+
+
+def test_redistribution_notice_tells_the_user_their_weights_moved():
+    notice = redistribution_notice(fractional_summary(_mixed_plan()))
+    assert "1 symbol" in notice
+    assert "Weight" in notice
+
+
+def test_redistribution_notice_is_none_when_nothing_moved():
+    plan = _mixed_plan()
+    plan.rows[0].redistributed = False
+    assert redistribution_notice(fractional_summary(plan)) is None
+
+
+def test_no_order_rows_surfaces_the_symbol_the_dry_run_table_drops():
+    plan = _mixed_plan()
+    assert [r["symbol"] for r in dry_run_rows(plan)] == ["AAPL", "MSFT", "BUMPY"]
+    dropped = no_order_rows(plan)
+    assert [r["symbol"] for r in dropped] == ["BRKA"]
+    assert dropped[0]["unmet_notional"] == pytest.approx(260_000.0)
+    assert dropped[0]["outcome"] == "skipped-too-large"
+    assert "over the 150% bump limit" in dropped[0]["reasons"]
+
+
+def test_dry_run_rows_report_the_sizing_mode_and_the_outcome_per_symbol():
+    rows = {r["symbol"]: r for r in dry_run_rows(_mixed_plan())}
+    assert rows["AAPL"]["sizing"] == "fractional"
+    assert rows["MSFT"]["sizing"] == "whole"
+    assert rows["MSFT"]["outcome"] == "normal"
+    assert rows["BUMPY"]["outcome"] == "bumped-to-1"
+    assert rows["AAPL"]["redistributed"] is True
+
+
+def test_dry_run_rows_carry_the_target_the_projection_and_the_residual():
+    rows = {r["symbol"]: r for r in dry_run_rows(_mixed_plan())}
+    assert rows["MSFT"]["target_notional"] == pytest.approx(1_000.0)
+    assert rows["MSFT"]["projected_notional"] == pytest.approx(800.0)
+    assert rows["MSFT"]["residual_notional"] == pytest.approx(200.0)
+    # A bump is an OVER-allocation, so its residual is negative. Visible, not hidden.
+    assert rows["BUMPY"]["residual_notional"] == pytest.approx(-100.0)
+
+
+def test_dry_run_rows_show_the_weight_the_plan_will_really_use():
+    """D2 rewrites quantities, so the typed weight and the resulting weight are two
+    different numbers and BOTH have to be on screen."""
+    rows = {r["symbol"]: r for r in dry_run_rows(_mixed_plan())}
+    assert rows["MSFT"]["weight_pct"] == pytest.approx(1_000.0 / 262_800.0 * 100.0)
+    assert rows["MSFT"]["projected_weight_pct"] == pytest.approx(800.0 / 262_800.0 * 100.0)
+    assert rows["BUMPY"]["projected_weight_pct"] > rows["BUMPY"]["weight_pct"]
+
+
+def test_dry_run_rows_weights_are_zero_when_there_is_no_base_to_divide_by():
+    plan = _mixed_plan()
+    plan.base_notional = 0.0
+    rows = {r["symbol"]: r for r in dry_run_rows(plan)}
+    assert rows["MSFT"]["weight_pct"] == 0.0
+    assert rows["MSFT"]["projected_weight_pct"] == 0.0
+
+
+def test_filter_plan_rows_keeps_the_valuation_mode_and_the_allocation_basis():
+    """A cost-mode plan silently became market-mode when a row was un-ticked, which
+    reinterprets every projected number in the footer."""
+    plan = _mixed_plan()
+    plan.valuation_mode = VALUATION_MODE_COST
+    plan.allocation_basis = pa.ALLOCATION_BASIS_BUDGET
+    filtered = filter_plan_rows(plan, ["AAPL"])
+    assert filtered.valuation_mode == VALUATION_MODE_COST
+    assert filtered.allocation_basis == pa.ALLOCATION_BASIS_BUDGET
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `venv/bin/python -m pytest packages/common/tests/test_portfolio_allocation_wizard.py -v -k "fractional_summary or notice or no_order or sizing or residual or weight or allocation_basis"`
+
+Expected: FAIL at collection with
+`ImportError: cannot import name 'bump_notice' from 'ba2_common.core.portfolio_allocation'`
+
+- [ ] **Step 3: Write minimal implementation**
+
+**3a.** In `__all__`, replace
+
+```python
+    "tradeable_unit", "size_sub_unit_target", "projected_value", "allocated_value",
+    "redistribute_label_residuals",
+```
+
+with
+
+```python
+    "tradeable_unit", "size_sub_unit_target", "projected_value", "allocated_value",
+    "redistribute_label_residuals",
+    # mixed eligibility, bumps and redistribution, surfaced for the dry run
+    "fractional_summary", "no_order_rows", "whole_share_notice", "no_order_notice",
+    "bump_notice", "redistribution_notice",
+    "WHOLE_SHARE_NOTICE_FMT", "WHOLE_SHARE_NOTICE_OFF_FMT", "NO_ORDER_NOTICE_FMT",
+    "BUMP_NOTICE_FMT", "REDISTRIBUTION_NOTICE_FMT",
+```
+
+**3b.** In `filter_plan_rows` (added by Task 70), add two lines to the returned
+`AllocationPlan(...)`, immediately after `allow_fractional=plan.allow_fractional,`:
+
+```python
+        valuation_mode=plan.valuation_mode,
+        allocation_basis=plan.allocation_basis,
+```
+
+**3c.** In `dry_run_rows` (added by Task 70), replace the whole function body with:
+
+```python
+    available = float(plan.available_buying_power or 0.0)
+    base = float(plan.base_notional or 0.0)
+    mode = plan.valuation_mode
+    basis = plan.allocation_basis
+    out: List[Dict[str, Any]] = []
+    for row in plan.rows:
+        if row.side is None or row.delta_quantity == 0:
+            continue
+        projected = allocated_value(row, mode, basis)
+        out.append({
+            "symbol": row.symbol,
+            "side": row.side.value,
+            "quantity": round(abs(row.delta_quantity), 4),
+            "price": row.price,
+            "estimated_value": round(row.estimated_value, 2),
+            "bp_cost": round(row.bp_cost, 2),
+            "bp_usage_pct": round(row.bp_cost / available * 100.0, 2) if available else 0.0,
+            # SIZING MODE, not "does the number have a decimal part": at ~25%
+            # ineligibility this column is the one the user scans.
+            "sizing": "fractional" if row.fractional else "whole",
+            # WHICH RULE produced the quantity -- a bumped row holds MORE than the
+            # weights asked for, and that must never be silent.
+            "outcome": row.sizing_outcome,
+            "redistributed": bool(row.redistributed),
+            "target_notional": round(row.target_notional, 2),
+            # Already reflects whole-share rounding, the bump and the redistribution:
+            # what is displayed is what will be owned.
+            "projected_notional": None if projected is None else round(projected, 2),
+            "residual_notional": (None if projected is None
+                                  else round(row.target_notional - projected, 2)),
+            # The weight the user TYPED and the weight the plan will really use. They
+            # differ whenever the grid, a bump or redistribution moved the row, and
+            # showing both is what makes moving it acceptable.
+            "weight_pct": round(row.target_notional / base * 100.0, 3) if base > 0 else 0.0,
+            "projected_weight_pct": (round(projected / base * 100.0, 3)
+                                     if base > 0 and projected is not None else 0.0),
+            "reasons": ", ".join(row.reasons),
+            "skipped": bool(row.skipped),
+        })
+    return out
+```
+
+**3d.** Append at the end of `packages/common/ba2_common/core/portfolio_allocation.py`:
+
+```python
+# ---------------------------------------------------------------------------
+# Reporting. About a quarter of a real book is not fractionable, the engine bumps
+# some rows up and redistributes others, and every one of those decisions has to
+# reach the screen. Pure: text and numbers, no styling, no widgets.
+# ---------------------------------------------------------------------------
+
+#: Shown when fractional is ON but some symbols could not use it.
+WHOLE_SHARE_NOTICE_FMT = (
+    "{count} of {total} symbols cannot trade fractionally ({pct:.0f}%) - their orders "
+    "round to whole shares, leaving the plan {residual:,.2f} off target. The "
+    "Projected columns already reflect this.")
+#: Shown when the fractional toggle itself is off -- every row rounds down.
+WHOLE_SHARE_NOTICE_OFF_FMT = (
+    "Fractional shares are OFF - every order rounds to whole shares, leaving the "
+    "plan {residual:,.2f} off target. The Projected columns already reflect this.")
+#: Shown when at least one symbol was BUMPED UP to one whole share. This is the plan
+#: spending more than the weights asked for, so it is stated as money, up front.
+BUMP_NOTICE_FMT = (
+    "{count} symbol(s) had a target smaller than one whole share and were BUMPED UP "
+    "to one, so they get a position at all - that over-allocates them by {total:,.2f} "
+    "in total. Marked 'bumped-to-1' in the Outcome column.")
+#: Shown when at least one symbol gets no order at all.
+NO_ORDER_NOTICE_FMT = (
+    "{count} symbol(s) get NO order at all, leaving {total:,.2f} unallocated - see "
+    "'Not traded' below. One whole share of each would be more than {limit:.0f}% of "
+    "its target, so buying one is a different trade, not a rounding fix.")
+#: Shown when redistribution moved a row off the quantity the weights implied.
+REDISTRIBUTION_NOTICE_FMT = (
+    "{count} symbol(s) had their share count adjusted so their label still hits its "
+    "total after rounding. The Weight columns show what you asked for and what the "
+    "plan will actually hold.")
+
+
+def fractional_summary(plan: "AllocationPlan") -> Dict[str, Any]:
+    """How the plan's rows were SIZED, and what the sizing rules cost. Pure.
+
+    Rows with no usable price are excluded from every count and from the residual:
+    their whole target is already reported through ``plan.unallocatable_pct``, and
+    counting it here too would double the money the dry run calls unallocated.
+
+    ``residual_notional`` is ``sum(target_notional - allocated_value)`` over the
+    priced rows: SIGNED, so a bump's over-allocation nets against a rounding
+    shortfall, which is what "how far off target will I be" actually means.
+
+    ``unknown_rows`` counts rows carrying ``REASON_FRACTIONAL_UNKNOWN`` -- exactly
+    the rows where the broker published no eligibility answer (no ``MarginInfo`` at
+    all, or ``fractionable is None``). With the fractional toggle OFF no eligibility
+    reason is appended at all and this is 0, correctly: nothing was consulted.
+
+    Returns:
+        Dict[str, Any]: ``allow_fractional``, ``total_rows``, ``fractional_rows``,
+        ``whole_share_rows``, ``unknown_rows``, ``whole_share_symbols`` (sorted),
+        ``whole_share_pct``, ``target_notional``, ``projected_notional``,
+        ``residual_notional``, ``residual_pct`` (of ``base_notional``),
+        ``no_order_rows``, ``no_order_notional``, ``bumped_rows``,
+        ``bumped_notional`` (the deliberate over-allocation), and
+        ``skipped_too_large_rows``, ``redistributed_rows``.
+    """
+    mode = plan.valuation_mode
+    basis = plan.allocation_basis
+    priced = [r for r in plan.rows if r.price is not None and r.price > 0]
+    total = len(priced)
+    whole = [r for r in priced if not r.fractional]
+    unknown = [r for r in priced if REASON_FRACTIONAL_UNKNOWN in r.reasons]
+    bumped = [r for r in priced if r.sizing_outcome == SIZING_OUTCOME_BUMPED]
+    too_large = [r for r in priced if r.sizing_outcome == SIZING_OUTCOME_SKIPPED_TOO_LARGE]
+
+    target_total = sum(float(r.target_notional or 0.0) for r in priced)
+    projected_total = 0.0
+    bumped_over = 0.0
+    for r in priced:
+        value = allocated_value(r, mode, basis)
+        if value is None:
+            continue
+        projected_total += value
+        if r.sizing_outcome == SIZING_OUTCOME_BUMPED:
+            bumped_over += max(0.0, value - float(r.target_notional or 0.0))
+
+    dropped = [r for r in plan.rows if float(r.unmet_notional or 0.0) > MONEY_EPSILON]
+    base = float(plan.base_notional or 0.0)
+    residual = target_total - projected_total
+
+    return {
+        "allow_fractional": bool(plan.allow_fractional),
+        "total_rows": total,
+        "fractional_rows": len([r for r in priced if r.fractional]),
+        "whole_share_rows": len(whole),
+        "unknown_rows": len(unknown),
+        "whole_share_symbols": sorted(r.symbol for r in whole),
+        "whole_share_pct": (len(whole) / total * 100.0) if total else 0.0,
+        "target_notional": target_total,
+        "projected_notional": projected_total,
+        "residual_notional": residual,
+        "residual_pct": (residual / base * 100.0) if base > 0 else 0.0,
+        "no_order_rows": len(dropped),
+        "no_order_notional": sum(float(r.unmet_notional or 0.0) for r in dropped),
+        "bumped_rows": len(bumped),
+        "bumped_notional": bumped_over,
+        "skipped_too_large_rows": len(too_large),
+        "redistributed_rows": len([r for r in plan.rows if r.redistributed]),
+    }
+
+
+def no_order_rows(plan: "AllocationPlan") -> List[Dict[str, Any]]:
+    """One display dict per row the plan wanted to trade and could NOT, biggest first.
+
+    ``dry_run_rows`` cannot show these -- it filters on ``side is None or
+    delta_quantity == 0``, which is exactly what these rows are. Without this list a
+    target that one whole share would have overshot simply disappears from the review
+    screen, which is what used to happen to every one of them.
+
+    Selected by ``unmet_notional``, so the reason strings never have to be
+    pattern-matched: whatever zeroed the row -- the bump bound, the broker minimum,
+    buying-power scaling, a precheck rejection -- set that field.
+    """
+    mode = plan.valuation_mode
+    basis = plan.allocation_basis
+    base = float(plan.base_notional or 0.0)
+    out: List[Dict[str, Any]] = []
+    for row in plan.rows:
+        if float(row.unmet_notional or 0.0) <= MONEY_EPSILON:
+            continue
+        projected = allocated_value(row, mode, basis)
+        out.append({
+            "symbol": row.symbol,
+            "price": row.price,
+            "current_quantity": row.current_quantity,
+            "outcome": row.sizing_outcome,
+            "target_notional": round(row.target_notional, 2),
+            "weight_pct": round(row.target_notional / base * 100.0, 3) if base > 0 else 0.0,
+            "projected_notional": None if projected is None else round(projected, 2),
+            "unmet_notional": round(float(row.unmet_notional), 2),
+            "reasons": ", ".join(row.reasons),
+        })
+    return sorted(out, key=lambda d: d["unmet_notional"], reverse=True)
+
+
+def whole_share_notice(summary: Dict[str, Any]) -> Optional[str]:
+    """The prominent whole-share warning for the dry run, or ``None`` if there is none.
+
+    ``None`` means every priced row was sized on the fractional grid, so there is
+    nothing to warn about. Text only: the caller picks the banner styling.
+    """
+    if summary["whole_share_rows"] <= 0:
+        return None
+    if not summary["allow_fractional"]:
+        return WHOLE_SHARE_NOTICE_OFF_FMT.format(residual=summary["residual_notional"])
+    return WHOLE_SHARE_NOTICE_FMT.format(
+        count=summary["whole_share_rows"],
+        total=summary["total_rows"],
+        pct=summary["whole_share_pct"],
+        residual=summary["residual_notional"])
+
+
+def bump_notice(summary: Dict[str, Any]) -> Optional[str]:
+    """The "we are spending more than you asked" warning, or ``None``.
+
+    A bump is a deliberate over-allocation taken so that a symbol gets a position at
+    all. It is the one thing in this plan that spends money the weights did not ask
+    for, so it gets its own sentence with its own number.
+    """
+    if summary["bumped_rows"] <= 0:
+        return None
+    return BUMP_NOTICE_FMT.format(count=summary["bumped_rows"],
+                                  total=summary["bumped_notional"])
+
+
+def no_order_notice(summary: Dict[str, Any]) -> Optional[str]:
+    """The "some symbols get nothing" warning, or ``None`` when every row trades."""
+    if summary["no_order_rows"] <= 0:
+        return None
+    return NO_ORDER_NOTICE_FMT.format(count=summary["no_order_rows"],
+                                      total=summary["no_order_notional"],
+                                      limit=BUMP_TO_ONE_SHARE_MAX_MULTIPLE * 100.0)
+
+
+def redistribution_notice(summary: Dict[str, Any]) -> Optional[str]:
+    """The "your weights moved" warning, or ``None`` when none of them did.
+
+    Redistribution is allowed to change a quantity the user's weights implied ONLY
+    because the change is shown. This sentence, plus the Weight columns, is that
+    showing.
+    """
+    if summary["redistributed_rows"] <= 0:
+        return None
+    return REDISTRIBUTION_NOTICE_FMT.format(count=summary["redistributed_rows"])
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `venv/bin/python -m pytest packages/common/tests/test_portfolio_allocation_wizard.py -v -k "fractional_summary or notice or no_order or sizing or residual or weight or allocation_basis"`
+Expected: PASS — 21 passed.
+
+Run: `venv/bin/python -m pytest packages/common/tests/test_portfolio_allocation_wizard.py packages/common/tests/test_portfolio_allocation.py packages/common/tests/test_portfolio_allocation_redistribution.py -v`
+Expected: PASS — no failures, no errors.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add packages/common/ba2_common/core/portfolio_allocation.py packages/common/tests/test_portfolio_allocation_wizard.py
+git commit -m "feat(allocation): per-symbol sizing outcome, projected weight and the plan notices"
+```
+
+---
+
+### Task 92: Fractional shares default ON, and the choice persists
+
+Two places currently hard-code OFF. `PortfolioAllocationConfig.allow_fractional`
+(`packages/common/ba2_common/core/models.py:848`) is
+`Field(default=False, description="Last fractional-shares choice, pre-filled into the wizard")`,
+and Task 71's steps dialog opens with the literal
+`self.allow_fractional = bool(base.supports_fractional and False)`. The user wants it ON.
+
+**No Alembic revision is needed.** The column was created without a server default —
+`alembic/versions/f1c8a24b7e05_add_portfolio_allocation_tables.py:153`,
+`sa.Column("allow_fractional", sa.Boolean(), nullable=False)` — so the value of every new row comes
+from the SQLModel field default, evaluated in Python. Existing rows keep whatever was written, and
+there are none in practice: `get_allocation_config` (`portfolio_allocation_store.py:292`) is the
+only creator and no shipped code calls it yet (the page is Section F, unlanded).
+
+**Sequence:** this `models.py` edit must land BEFORE chunk `ledger`'s `PortfolioAllocationRun`
+rename in the same file (they touch lines ~848 and ~974 respectively, so they do not conflict as
+long as this one goes first).
+
+`supports_fractional` still wins: a broker that cannot do fractional at all forces the switch off,
+which is why the expression is `base.supports_fractional and allow_fractional` rather than a bare
+default. Per-symbol eligibility is not this switch's business — that is `MarginInfo.fractionable`,
+inside the engine, and it degrades to whole shares per symbol without touching the toggle.
+
+Persistence: the choice is remembered in `portfolio_allocation_config`, written by a new
+`remember_fractional_choice()` in the service. `run_allocation` calls it, so a submitted run always
+persists what it used; Task 96's `on_dry_run` handler calls it too, so the choice survives even when
+the user never submits.
+
+**Files:**
+- Modify: `packages/common/ba2_common/core/models.py:848`
+- Modify: `packages/common/ba2_common/core/portfolio_allocation_store.py` (`get_allocation_config` docstring + log)
+- Modify: `ba2_trade_platform/core/portfolio_allocation_service.py` (append `remember_fractional_choice`; call it from `run_allocation`)
+- Modify: `ba2_trade_platform/ui/pages/portfolio_allocation_wizard.py` (`AllocationSteps`, `open_allocation_steps`)
+- Test: `tests/test_portfolio_allocation_models.py` (modify)
+- Test: `tests/test_portfolio_allocation_store.py` (modify)
+- Test: `tests/test_portfolio_allocation_submit.py` (append)
+- Test: `tests/test_portfolio_allocation_wizard_ui.py` (append)
+
+- [ ] **Step 1: Write the failing test**
+
+In `tests/test_portfolio_allocation_models.py`, replace
+`test_allocation_config_defaults_to_cost_mode_and_whole_shares` with:
+
+```python
+def test_allocation_config_defaults_to_cost_mode_and_fractional_shares(mock_account_def):
+    """Fractional defaults ON: about three quarters of the user's symbols ARE
+    fractionable, and the quarter that is not falls back to whole shares per symbol
+    inside the engine anyway."""
+    add_instance(PortfolioAllocationConfig(account_id=mock_account_def.id))
+    with get_db() as session:
+        row = session.exec(select(PortfolioAllocationConfig)).one()
+        assert row.valuation_mode == "cost"
+        assert row.allow_fractional is True
+```
+
+In `tests/test_portfolio_allocation_store.py`, replace
+`test_get_allocation_config_creates_the_row_with_spec_defaults` with:
+
+```python
+def test_get_allocation_config_creates_the_row_with_spec_defaults(account_id):
+    config = store.get_allocation_config(account_id)
+    assert config.valuation_mode == "cost"
+    assert config.allow_fractional is True
+    # Reading twice must not create a second row (account_id is unique).
+    assert store.get_allocation_config(account_id).id == config.id
+```
+
+and, in the same file, replace `test_set_allocation_config_leaves_unpassed_fields_untouched` with:
+
+```python
+def test_set_allocation_config_leaves_unpassed_fields_untouched(account_id):
+    store.set_allocation_config(account_id, valuation_mode="market", allow_fractional=False)
+    store.set_allocation_config(account_id, valuation_mode="cost")
+    config = store.get_allocation_config(account_id)
+    assert config.valuation_mode == "cost"
+    assert config.allow_fractional is False
+
+
+def test_set_allocation_config_can_turn_fractional_back_off(account_id):
+    """False must be storable even though it is falsy -- the guard is `is not None`."""
+    store.set_allocation_config(account_id, allow_fractional=False)
+    assert store.get_allocation_config(account_id).allow_fractional is False
+```
+
+Append to `tests/test_portfolio_allocation_submit.py`:
+
+```python
+# ---------------------------------------------------------------------------
+# The fractional choice is remembered
+# ---------------------------------------------------------------------------
+
+def test_remember_fractional_choice_persists_the_flag():
+    from ba2_trade_platform.core.portfolio_allocation_store import get_allocation_config
+    from tests.factories import create_account_definition
+
+    account_def = create_account_definition(name="Frac Memo", provider="Alpaca")
+    svc.remember_fractional_choice(account_def.id, False)
+    assert get_allocation_config(account_def.id).allow_fractional is False
+    svc.remember_fractional_choice(account_def.id, True)
+    assert get_allocation_config(account_def.id).allow_fractional is True
+
+
+def test_remember_fractional_choice_never_raises(monkeypatch):
+    """Forgetting a preference must not take down a submission."""
+    import sys
+    module = sys.modules[svc.__name__]
+    errors = []
+    monkeypatch.setattr(module.logger, "error", lambda msg, *a, **k: errors.append(str(msg)))
+    monkeypatch.setattr("ba2_trade_platform.core.portfolio_allocation_store."
+                        "set_allocation_config",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db gone")))
+
+    svc.remember_fractional_choice(4_242, True)
+
+    assert any("fractional choice" in e for e in errors), errors
+
+
+def test_run_allocation_remembers_the_fractional_choice_it_ran_with():
+    from ba2_trade_platform.core.portfolio_allocation_store import get_allocation_config
+
+    account = FakeAccount(account_id=41)
+    account.positions = []
+    plan = AllocationPlan(rows=[], available_buying_power=1_000.0, allow_fractional=False)
+
+    svc.run_allocation(account, plan, {}, make_base(), mode="REBALANCE")
+
+    assert get_allocation_config(41).allow_fractional is False
+```
+
+Append to `tests/test_portfolio_allocation_wizard_ui.py`:
+
+```python
+def test_open_allocation_steps_requires_an_explicit_fractional_default():
+    """The literal `base.supports_fractional and False` is gone; the caller passes
+    the account's remembered choice, which now defaults ON."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    params = inspect.signature(wiz.open_allocation_steps).parameters
+    assert "allow_fractional" in params
+    assert params["allow_fractional"].default is inspect.Parameter.empty
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_models.py tests/test_portfolio_allocation_store.py -v -k "defaults or fractional"`
+
+Expected: FAIL — `test_allocation_config_defaults_to_cost_mode_and_fractional_shares` fails with
+`assert False is True`, and `test_get_allocation_config_creates_the_row_with_spec_defaults` fails
+the same way.
+
+Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_wizard_ui.py -v -k fractional`
+Expected: FAIL — `AssertionError: assert 'allow_fractional' in ...`.
+
+Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_submit.py -v -k "remember or fractional_choice"`
+Expected: FAIL — `AttributeError: module 'ba2_trade_platform.core.portfolio_allocation_service' has
+no attribute 'remember_fractional_choice'`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+**3a.** `packages/common/ba2_common/core/models.py:848` — replace that line with:
+
+```python
+    allow_fractional: bool = Field(default=True, description="Last fractional-shares choice, pre-filled into the wizard (defaults ON)")
+```
+
+and add to the `PortfolioAllocationConfig` docstring, replacing the sentence ending
+``One row per account, created on first use with the defaults "cost" and False.``:
+
+```
+    One row per account, created on first use with the defaults "cost" and
+    allow_fractional=True. Fractional defaults ON because roughly three quarters of
+    this book IS fractionable; the quarter that is not falls back to whole shares
+    per symbol inside the engine (``MarginInfo.fractionable``), so the default costs
+    nothing on the ineligible names. The column has NO server default -- this Python
+    default is what every new row gets, which is why changing it needs no Alembic
+    revision.
+```
+
+**3b.** In `packages/common/ba2_common/core/portfolio_allocation_store.py`, in
+`get_allocation_config`, replace
+
+```python
+    Defaults are ``valuation_mode="cost"`` and ``allow_fractional=False`` (spec
+    decision 5a). Always returns a row, never ``None``: the page must always be
+```
+
+with
+
+```python
+    Defaults are ``valuation_mode="cost"`` (spec decision 5a) and
+    ``allow_fractional=True``. Always returns a row, never ``None``: the page must always be
+```
+
+and replace
+
+```python
+            logger.info(f"Created default allocation config for account {account_id} "
+                        f"(valuation_mode={VALUATION_MODE_COST}, allow_fractional=False)")
+```
+
+with
+
+```python
+            logger.info(f"Created default allocation config for account {account_id} "
+                        f"(valuation_mode={row.valuation_mode}, "
+                        f"allow_fractional={row.allow_fractional})")
+```
+
+**3c.** Append to `ba2_trade_platform/core/portfolio_allocation_service.py`:
+
+```python
+def remember_fractional_choice(account_id: int, allow_fractional: bool) -> None:
+    """Persist the fractional-shares choice so the next wizard opens on it.
+
+    Never raises: forgetting a preference must not take down a submission. The
+    default when nothing has ever been stored is ON
+    (``PortfolioAllocationConfig.allow_fractional``).
+    """
+    from .portfolio_allocation_store import set_allocation_config
+    try:
+        set_allocation_config(account_id, allow_fractional=bool(allow_fractional))
+    except Exception as e:
+        logger.error(f"Could not remember the fractional choice for account "
+                     f"{account_id}: {e}", exc_info=True)
+```
+
+**3d.** In `run_allocation` (Task 75), insert immediately after the `run_id = run.id` line:
+
+```python
+    # Remember what this run actually used, so the next wizard opens on it.
+    remember_fractional_choice(account.id, bool(plan.allow_fractional))
+```
+
+**3e.** In `ba2_trade_platform/ui/pages/portfolio_allocation_wizard.py`, in
+`AllocationSteps.__init__`, replace the signature with:
+
+```python
+    def __init__(self, base: BaseSnapshot, labels: List[LabelTarget], *,
+                 on_dry_run: Callable[..., None],
+                 allow_fractional: bool,
+                 mode: str = ALLOCATION_MODE_REBALANCE,
+                 invest_amount: float = 0.0):
+```
+
+and replace
+
+```python
+        self.allow_fractional = bool(base.supports_fractional and False)
+```
+
+with
+
+```python
+        # The account's REMEMBERED choice (defaults ON), still vetoed by a broker
+        # that cannot do fractional at all. Per-symbol eligibility is the engine's
+        # job -- MarginInfo.fractionable -- not this switch's.
+        self.allow_fractional = bool(base.supports_fractional and allow_fractional)
+```
+
+**3f.** Replace `open_allocation_steps` with:
+
+```python
+def open_allocation_steps(base: BaseSnapshot, labels: List[LabelTarget], *,
+                          on_dry_run: Callable[..., None],
+                          allow_fractional: bool,
+                          mode: str = ALLOCATION_MODE_REBALANCE,
+                          invest_amount: float = 0.0) -> AllocationSteps:
+    """Open steps 1-3. ``on_dry_run`` is called with keyword arguments
+    ``mode``, ``labels``, ``scope_label``, ``amount`` and ``allow_fractional``.
+
+    ``allow_fractional`` is REQUIRED and has no default: the caller passes
+    ``get_allocation_config(account_id).allow_fractional`` (itself defaulting to
+    True), and persists any change through
+    ``portfolio_allocation_service.remember_fractional_choice``."""
+    steps = AllocationSteps(base, labels, on_dry_run=on_dry_run,
+                            allow_fractional=allow_fractional, mode=mode,
+                            invest_amount=invest_amount)
+    steps.open()
+    return steps
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_models.py tests/test_portfolio_allocation_store.py -v`
+Expected: PASS — 80 passed (16 model tests, 64 store tests after the one added above); no failures.
+
+Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_submit.py -v -k "remember or fractional_choice"`
+Expected: PASS — 3 passed.
+
+Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_wizard_ui.py -v`
+Expected: PASS — no failures.
+
+Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_migration.py -v`
+Expected: PASS — the migration is untouched; the column still has no server default.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add packages/common/ba2_common/core/models.py packages/common/ba2_common/core/portfolio_allocation_store.py ba2_trade_platform/core/portfolio_allocation_service.py ba2_trade_platform/ui/pages/portfolio_allocation_wizard.py tests/test_portfolio_allocation_models.py tests/test_portfolio_allocation_store.py tests/test_portfolio_allocation_submit.py tests/test_portfolio_allocation_wizard_ui.py
+git commit -m "feat(allocation): default fractional shares ON and remember the choice"
+```
+
+---
+### Task 93: The pure market-hours gate, its exact copy, and the working-orders line
+
+The wizard must keep working when the market is closed — planning at 22:00 is the normal way to use
+this page — but Submit must be off, and it must say when it comes back. This task is the pure
+decision plus the exact wording; nothing here imports NiceGUI, a broker, or a clock.
+
+It lives in `ba2_trade_platform/ui/utils/portfolio_allocation_view.py` (Task 59), beside
+`evaluate_gate`, and follows the same shape: a result object with `allowed`, a reason code and a
+message. `now` is a REQUIRED argument so no test can depend on when it runs.
+
+**Three states, not two.** `is_open=None` is "the seam failed or the answer is unavailable, and we
+do not know". It BLOCKS — "we could not confirm the market is open" is not a licence to send orders
+— but it is reported as UNKNOWN, not as CLOSED, because they have different fixes. The caller
+mapping is fixed by the contract and is the ONLY legal one:
+
+```python
+is_open = None if (hours is None or not hours.is_known) else hours.is_open
+source  = hours.source if hours is not None else MARKET_HOURS_SOURCE_UNAVAILABLE
+```
+
+**The source constants are IMPORTED, never re-spelled.** `MARKET_HOURS_SOURCE_BROKER` /
+`_FALLBACK` / `_UNAVAILABLE` are owned by `ba2_common.core.account_types` (chunk `interface`). This
+module re-exports them under its own historical names so existing view code keeps reading, but the
+literals `"broker"` and `"fallback"` appear nowhere outside `account_types.py`.
+
+**Times are rendered through `NY_TZ`**, imported from `ba2_common.core.market_calendar` — the one
+canonical New York tzinfo object in the codebase. `MARKET_TIMEZONE` survives as a display label
+only. Day and month names come from explicit tuples rather than `strftime("%a %b")`, which is
+locale-dependent and would make the output depend on the machine.
+
+Provenance is user-visible. The fallback path is the offline NYSE calendar (chunk `interface`'s
+`market_calendar.py`), which knows the regular session only — it reports closed during Alpaca's
+extended hours, and it cannot know about a broker-specific halt. When the answer did not come from
+the broker the banner says so, in one sentence appended to the message.
+
+**Naive datetimes cannot reach here** — `MarketHours.__post_init__` raises on construction, so the
+seam physically cannot emit one. `evaluate_market_gate` keeps its own `ValueError` guard as
+defence-in-depth (a caller can always hand-build the scalars), but it is unreachable through the
+seam and no caller needs a `try/except` for it.
+
+This task also lands the **working-orders line** decision D3 requires. Deferral is the COMMON case,
+not the rare one: with about a quarter of the book non-fractionable and an ADJUST path that leaves
+orders working, a run will regularly finalise with zero filled value and stay unconsumed. The user
+has to be told, so the copy is a pure function here, tested here, and merely DRAWN by the income
+panel in Task 95. It takes plain values rather than chunk `ledger`'s `FilledTotals`, so it lands
+before that chunk and lights up automatically when `FilledTotals.to_dict()` starts supplying real
+ones.
+
+**Files:**
+- Modify: `ba2_trade_platform/ui/utils/portfolio_allocation_view.py` (append)
+- Test: `tests/test_portfolio_allocation_view.py` (append)
+
+- [ ] **Step 1: Write the failing test**
+
+Append to `tests/test_portfolio_allocation_view.py`:
+
+```python
+# ---------------------------------------------------------------------------
+# Market-hours gate (Submit only; the page and the dry run always render)
+# ---------------------------------------------------------------------------
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from ba2_common.core.account_types import (
+    MARKET_HOURS_SOURCE_BROKER,
+    MARKET_HOURS_SOURCE_FALLBACK,
+    MARKET_HOURS_SOURCE_UNAVAILABLE,
+)
+from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+    MARKET_BANNER_CLASSES,
+    MARKET_GATE_CLOSED,
+    MARKET_GATE_OPEN,
+    MARKET_GATE_UNKNOWN,
+    MARKET_SOURCE_BROKER,
+    MARKET_SOURCE_FALLBACK,
+    MARKET_SOURCE_UNAVAILABLE,
+    evaluate_market_gate,
+    format_countdown,
+    format_market_time,
+    working_orders_notice,
+)
+
+# Frozen explicitly, always: 2026-08-20 22:00 UTC == Thu 18:00 ET. The next regular
+# open is Fri 21 Aug 2026 09:30 ET == 13:30 UTC, 15h30m later.
+FROZEN_NOW = datetime(2026, 8, 20, 22, 0, tzinfo=timezone.utc)
+NEXT_OPEN = datetime(2026, 8, 21, 13, 30, tzinfo=timezone.utc)
+
+
+def test_the_source_constants_are_the_interfaces_own_objects_not_copies():
+    """Re-spelling "broker" locally is how the banner ends up describing a broker
+    answer as a fallback one. Same objects, one definition."""
+    assert MARKET_SOURCE_BROKER is MARKET_HOURS_SOURCE_BROKER
+    assert MARKET_SOURCE_FALLBACK is MARKET_HOURS_SOURCE_FALLBACK
+    assert MARKET_SOURCE_UNAVAILABLE is MARKET_HOURS_SOURCE_UNAVAILABLE
+
+
+def test_market_gate_open_allows_submit_and_says_nothing():
+    gate = evaluate_market_gate(is_open=True, next_open=None,
+                                source=MARKET_SOURCE_BROKER, now=FROZEN_NOW)
+    assert gate.allowed is True
+    assert gate.reason_code == MARKET_GATE_OPEN
+    assert gate.message == ""
+
+
+def test_market_gate_closed_blocks_and_names_the_next_open_in_eastern_time():
+    gate = evaluate_market_gate(is_open=False, next_open=NEXT_OPEN,
+                                source=MARKET_SOURCE_BROKER, now=FROZEN_NOW)
+    assert gate.allowed is False
+    assert gate.reason_code == MARKET_GATE_CLOSED
+    assert gate.next_open_text == "Fri 21 Aug 2026 09:30 ET"
+    assert "Fri 21 Aug 2026 09:30 ET" in gate.message
+    assert "15h 30m" in gate.message
+    assert "still refresh and review this dry run" in gate.message
+    assert gate.severity == "warning"
+
+
+def test_market_gate_closed_from_the_fallback_calendar_says_where_the_time_came_from():
+    gate = evaluate_market_gate(is_open=False, next_open=NEXT_OPEN,
+                                source=MARKET_SOURCE_FALLBACK, now=FROZEN_NOW)
+    assert gate.from_fallback is True
+    assert "built-in NYSE calendar" in gate.message
+    assert "regular session" in gate.message
+
+
+def test_market_gate_closed_from_the_broker_does_not_mention_the_calendar():
+    gate = evaluate_market_gate(is_open=False, next_open=NEXT_OPEN,
+                                source=MARKET_SOURCE_BROKER, now=FROZEN_NOW)
+    assert gate.from_fallback is False
+    assert "NYSE calendar" not in gate.message
+
+
+def test_market_gate_closed_with_no_next_open_still_blocks_and_admits_it():
+    gate = evaluate_market_gate(is_open=False, next_open=None,
+                                source=MARKET_SOURCE_BROKER, now=FROZEN_NOW)
+    assert gate.allowed is False
+    assert gate.reason_code == MARKET_GATE_CLOSED
+    assert gate.next_open_text == ""
+    assert "No next-open time was published" in gate.message
+
+
+def test_market_gate_unknown_blocks_rather_than_assuming_open():
+    """An unanswered market-hours call is not permission to send orders -- and it is
+    reported as UNKNOWN, not CLOSED: the two have different fixes."""
+    gate = evaluate_market_gate(is_open=None, next_open=None,
+                                source=MARKET_SOURCE_UNAVAILABLE, now=FROZEN_NOW)
+    assert gate.allowed is False
+    assert gate.reason_code == MARKET_GATE_UNKNOWN
+    assert gate.severity == "negative"
+    assert "could not be confirmed open" in gate.message
+
+
+def test_market_gate_next_open_already_in_the_past_drops_the_countdown():
+    """A stale next_open must not render "in -2h 0m"."""
+    gate = evaluate_market_gate(is_open=False,
+                                next_open=FROZEN_NOW - timedelta(hours=2),
+                                source=MARKET_SOURCE_BROKER, now=FROZEN_NOW)
+    assert gate.countdown_text == ""
+    assert "from now" not in gate.message
+    assert gate.next_open_text
+
+
+def test_market_gate_rejects_a_naive_next_open_rather_than_guessing_its_zone():
+    """Unreachable through the seam -- MarketHours.__post_init__ raises on a naive
+    field -- and kept anyway, because a caller can hand-build these scalars."""
+    with pytest.raises(ValueError):
+        evaluate_market_gate(is_open=False, next_open=datetime(2026, 8, 21, 13, 30),
+                             source=MARKET_SOURCE_BROKER, now=FROZEN_NOW)
+
+
+def test_market_gate_rejects_a_naive_now():
+    with pytest.raises(ValueError):
+        evaluate_market_gate(is_open=True, next_open=None,
+                             source=MARKET_SOURCE_BROKER,
+                             now=datetime(2026, 8, 20, 22, 0))
+
+
+def test_format_market_time_is_locale_proof_and_in_eastern_time():
+    assert format_market_time(datetime(2026, 1, 5, 14, 30, tzinfo=timezone.utc)) == \
+        "Mon 05 Jan 2026 09:30 ET"
+
+
+def test_format_countdown_uses_days_hours_then_minutes():
+    assert format_countdown(timedelta(days=2, hours=3, minutes=40)) == "2d 3h"
+    assert format_countdown(timedelta(hours=15, minutes=30)) == "15h 30m"
+    assert format_countdown(timedelta(minutes=42)) == "42m"
+    assert format_countdown(timedelta(seconds=-1)) == ""
+
+
+def test_market_banner_classes_map_each_severity_to_a_real_stylesheet_class():
+    """styles.css:450-469 defines warning / danger / info / success only."""
+    assert MARKET_BANNER_CLASSES["warning"] == "alert-banner warning"
+    assert MARKET_BANNER_CLASSES["negative"] == "alert-banner danger"
+    assert MARKET_BANNER_CLASSES["info"] == "alert-banner info"
+
+
+def test_working_orders_notice_is_none_when_the_run_settled():
+    assert working_orders_notice(settled=True, working_order_ids=[]) is None
+
+
+def test_working_orders_notice_names_the_count_when_orders_are_still_working():
+    text, severity = working_orders_notice(settled=False, working_order_ids=[7, 9])
+    assert "2 order(s) still working" in text
+    assert "income" in text.lower()
+    assert severity == "warning"
+
+
+def test_working_orders_notice_is_honest_when_it_cannot_count_the_orders():
+    """settled=False with no ids is still unconsumed income; saying nothing would
+    hide it, and inventing a count would be worse."""
+    text, severity = working_orders_notice(settled=False, working_order_ids=[])
+    assert "still working" in text
+    assert severity == "warning"
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_view.py -v -k "market_gate or format_market_time or format_countdown or market_banner or working_orders or source_constants"`
+
+Expected: FAIL at collection with
+`ImportError: cannot import name 'MARKET_BANNER_CLASSES' from
+'ba2_trade_platform.ui.utils.portfolio_allocation_view'`
+
+- [ ] **Step 3: Write minimal implementation**
+
+Append to `ba2_trade_platform/ui/utils/portfolio_allocation_view.py`:
+
+```python
+# ---- market-hours gate ------------------------------------------------------
+#
+# The page and the dry run ALWAYS render: planning at 22:00 is the normal way to
+# use this screen. Only SUBMIT is gated. Pure -- `now` is required so no test can
+# depend on when it runs.
+
+from datetime import datetime, timedelta
+from typing import List, Optional, Sequence, Tuple
+
+from ba2_common.core.account_types import (
+    MARKET_HOURS_SOURCE_BROKER,
+    MARKET_HOURS_SOURCE_FALLBACK,
+    MARKET_HOURS_SOURCE_UNAVAILABLE,
+)
+from ba2_common.core.market_calendar import NY_TZ
+
+MARKET_GATE_OPEN = "OPEN"
+MARKET_GATE_CLOSED = "CLOSED"
+MARKET_GATE_UNKNOWN = "UNKNOWN"
+
+#: Provenance of the answer, as published in ``MarketHours.source``. RE-EXPORTS of
+#: the interface's constants, never re-spelled literals: a local copy of "broker"
+#: is how a broker answer ends up described to the user as a fallback one.
+MARKET_SOURCE_BROKER = MARKET_HOURS_SOURCE_BROKER
+MARKET_SOURCE_FALLBACK = MARKET_HOURS_SOURCE_FALLBACK
+MARKET_SOURCE_UNAVAILABLE = MARKET_HOURS_SOURCE_UNAVAILABLE
+
+#: Display label only. The CONVERSION goes through ``NY_TZ``, the one canonical New
+#: York tzinfo object (ba2_common.core.market_calendar).
+MARKET_TIMEZONE = "America/New_York"
+
+#: Severity -> stylesheet class. Only warning / danger / info / success exist
+#: (ui/static/styles.css:450-469); the severity strings themselves are the
+#: ui.notify vocabulary ('positive' | 'negative' | 'warning' | 'info' -- 'error'
+#: is NOT one of them).
+MARKET_BANNER_CLASSES = {
+    "warning": "alert-banner warning",
+    "negative": "alert-banner danger",
+    "info": "alert-banner info",
+}
+
+MARKET_MSG_CLOSED_FMT = (
+    "Market closed — Submit is disabled. The next regular session opens {when} "
+    "({countdown} from now). You can still refresh and review this dry run.")
+MARKET_MSG_CLOSED_NO_COUNTDOWN_FMT = (
+    "Market closed — Submit is disabled. The next regular session opens {when}. "
+    "You can still refresh and review this dry run.")
+MARKET_MSG_CLOSED_NO_TIME = (
+    "Market closed — Submit is disabled. No next-open time was published, so we "
+    "cannot say when it re-enables. You can still refresh and review this dry run.")
+MARKET_MSG_UNKNOWN = (
+    "Market hours unavailable — Submit is disabled because the market could not be "
+    "confirmed open. You can still refresh and review this dry run.")
+#: Appended when the answer came from the offline calendar instead of the broker.
+#: Both halves matter: the broker did not answer, AND the calendar only knows the
+#: regular session, so it reads "closed" during extended hours and cannot know
+#: about a broker-specific halt.
+MARKET_NOTE_FALLBACK = (
+    " These times come from the built-in NYSE calendar, not from the broker — the "
+    "broker's own market-hours call did not answer, and the calendar covers the "
+    "regular session only.")
+#: Post-submit / income-panel line. Orders that are still working contributed ZERO
+#: to the ledger, so the run's income is deliberately NOT consumed yet.
+WORKING_ORDERS_NOTICE_FMT = (
+    "{count} order(s) still working — this run's income has NOT been consumed yet. "
+    "It is picked up automatically on the next refresh once the orders settle.")
+
+_WEEKDAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+_MONTH_NAMES = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def format_market_time(when: datetime) -> str:
+    """Render an aware datetime in the market's clock, e.g. ``Mon 05 Jan 2026 09:30 ET``.
+
+    Converts through ``NY_TZ`` -- the same tzinfo object the offline calendar builds
+    its sessions with, so a displayed open can never be one object's idea of New York
+    and the calculation another's.
+
+    Day and month names come from explicit tuples, not ``strftime('%a %b')``, which
+    is locale-dependent and would make the output depend on the machine.
+
+    Raises:
+        ValueError: on a naive datetime. Guessing a timezone here would move the
+        displayed open by up to a day.
+    """
+    if when.tzinfo is None or when.tzinfo.utcoffset(when) is None:
+        raise ValueError(f"format_market_time: {when!r} is naive; an aware datetime is required")
+    local = when.astimezone(NY_TZ)
+    return (f"{_WEEKDAY_NAMES[local.weekday()]} {local.day:02d} "
+            f"{_MONTH_NAMES[local.month - 1]} {local.year} "
+            f"{local.hour:02d}:{local.minute:02d} ET")
+
+
+def format_countdown(delta: timedelta) -> str:
+    """``2d 3h`` / ``15h 30m`` / ``42m``; EMPTY for anything at or below zero.
+
+    Empty rather than "0m" so the caller can drop the "(… from now)" clause entirely
+    instead of rendering a countdown that has already elapsed.
+    """
+    seconds = int(delta.total_seconds())
+    if seconds <= 0:
+        return ""
+    days, rem = divmod(seconds, 86_400)
+    hours, rem = divmod(rem, 3_600)
+    minutes = rem // 60
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
+@dataclass
+class MarketGateResult:
+    """May the wizard SUBMIT, and what to tell the user if not.
+
+    ``allowed is False`` disables the Submit button ONLY -- the page, the dry run
+    and Refresh all keep working, because planning while the market is shut is the
+    normal case.
+
+    ``severity`` is the ``ui.notify`` vocabulary ('warning' | 'negative' | 'info');
+    ``MARKET_BANNER_CLASSES`` maps it to a stylesheet class.
+    """
+    allowed: bool
+    reason_code: str
+    message: str
+    severity: str = "info"
+    next_open_text: str = ""
+    countdown_text: str = ""
+    from_fallback: bool = False
+
+
+def evaluate_market_gate(*, is_open: Optional[bool], next_open: Optional[datetime],
+                         source: str, now: datetime) -> MarketGateResult:
+    """Decide whether Submit may be pressed. Pure.
+
+    Args:
+        is_open: ``None`` when the answer is not known. The ONLY legal caller
+            mapping is ``None if (hours is None or not hours.is_known) else
+            hours.is_open`` -- an UNAVAILABLE ``MarketHours`` carries
+            ``is_open=False`` so the money path fails closed, but the UI must say
+            "unknown", not "closed". ``None`` BLOCKS: an unanswered market-hours
+            call is not permission to send orders.
+        next_open: ``MarketHours.next_open``, tz-AWARE. ``None`` is allowed (the
+            broker published none) and blocks with a message that says so.
+        source: ``MarketHours.source``, or ``MARKET_SOURCE_UNAVAILABLE`` when there
+            is no ``MarketHours`` at all. Anything other than
+            ``MARKET_SOURCE_BROKER`` is reported as not having come from the broker.
+        now: the reference instant, tz-aware. REQUIRED, so no caller and no test
+            silently depends on the wall clock.
+
+    Returns:
+        MarketGateResult: ``allowed=True`` only when ``is_open is True``.
+
+    Raises:
+        ValueError: if ``now`` or ``next_open`` is naive. Unreachable through the
+        seam -- ``MarketHours.__post_init__`` already refuses a naive field -- and
+        kept as defence-in-depth for hand-built scalars.
+    """
+    if now.tzinfo is None or now.tzinfo.utcoffset(now) is None:
+        raise ValueError(f"evaluate_market_gate: now={now!r} is naive")
+
+    if is_open is None:
+        return MarketGateResult(allowed=False, reason_code=MARKET_GATE_UNKNOWN,
+                                message=MARKET_MSG_UNKNOWN, severity="negative")
+    if is_open:
+        return MarketGateResult(allowed=True, reason_code=MARKET_GATE_OPEN,
+                                message="", severity="info",
+                                from_fallback=(source != MARKET_SOURCE_BROKER))
+
+    from_fallback = source != MARKET_SOURCE_BROKER
+    if next_open is None:
+        message = MARKET_MSG_CLOSED_NO_TIME
+        when = ""
+        countdown = ""
+    else:
+        when = format_market_time(next_open)       # raises on a naive next_open
+        countdown = format_countdown(next_open - now)
+        message = (MARKET_MSG_CLOSED_FMT.format(when=when, countdown=countdown)
+                   if countdown else
+                   MARKET_MSG_CLOSED_NO_COUNTDOWN_FMT.format(when=when))
+    if from_fallback:
+        message += MARKET_NOTE_FALLBACK
+    return MarketGateResult(allowed=False, reason_code=MARKET_GATE_CLOSED,
+                            message=message, severity="warning",
+                            next_open_text=when, countdown_text=countdown,
+                            from_fallback=from_fallback)
+
+
+def working_orders_notice(*, settled: bool,
+                          working_order_ids: Sequence[int]) -> Optional[Tuple[str, str]]:
+    """"N orders still working" — text and severity, or ``None`` when there is none.
+
+    Orders that have not settled contribute ZERO to a run's filled value, so the
+    run's income is deliberately left UNCONSUMED and reconciled later. That is the
+    common case here, not the rare one, so the fact has to reach the user rather than
+    only the log.
+
+    Takes plain values rather than a ``FilledTotals`` so it does not depend on the
+    ledger chunk: it lands first and starts saying something the moment real
+    ``settled`` / ``working_order_ids`` are supplied.
+
+    Returns:
+        Optional[Tuple[str, str]]: ``(text, severity)`` for ``ui.notify`` and for
+        ``MARKET_BANNER_CLASSES``, or ``None`` when the run settled.
+    """
+    if settled:
+        return None
+    return (WORKING_ORDERS_NOTICE_FMT.format(count=len(working_order_ids or [])),
+            "warning")
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_view.py -v -k "market_gate or format_market_time or format_countdown or market_banner or working_orders or source_constants"`
+Expected: PASS — 16 passed. (The selector is spelled out rather than a bare `market` so it cannot also
+catch Task 66's "market value" valuation-mode tests and make the count unverifiable.)
+
+Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_view.py -v`
+Expected: PASS — no failures (the Task 59-66 view tests are untouched).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add ba2_trade_platform/ui/utils/portfolio_allocation_view.py tests/test_portfolio_allocation_view.py
+git commit -m "feat(allocation): pure market-hours gate, next-open copy and the working-orders line"
+```
+
+---
+
+### Task 94: Read the broker's market hours, and refuse to submit into a closed market
+
+Two live pieces. `fetch_market_hours(account)` calls the `get_market_hours()` seam and returns
+`None` on any problem, so the pure gate never has to know about brokers. And `run_allocation`
+(Task 75) refuses to submit when the market is not confirmed open.
+
+The second one is the real safety. Disabling a button is a UI courtesy; the wizard can sit open
+across 16:00 and the user can press Submit at 16:01. `run_allocation` is the single Submit entry
+point, so the check is the **first statement in the function** — before `record_allocation_run` and
+before anything else writes — so a blocked attempt creates no run row, stamps no order comments and,
+critically, consumes no income ledger. The one-shot `finalise_allocation_run`
+(`portfolio_allocation_store.py:606`) makes a wrongly-created run permanently expensive.
+
+TastyTrade's closed-market rejection is a server rule that arrives as an opaque
+`Message(code, message)` (`tastytrade/order.py:172-183`), so without this check a closed-market run
+turns into a screen full of unexplained per-row failures — after the ledger has already been spent
+against them.
+
+**The gate is derived in the SERVICE, from `MarketHours` directly:**
+
+```python
+blocked = hours is None or not hours.is_known or not hours.is_open
+```
+
+`run_allocation` must **not** import `ui/utils/portfolio_allocation_view.py` — `core → ui` is a
+layering inversion. The banner copy lives only in the view; the service builds its own plain
+sentence, and quotes `MarketHours.status` (the broker's own word) when there is one, so a user
+blocked at 17:00 is told it is because the regular session is over even though the broker would have
+queued the order. That is decision D4's "status explains why", on the money path.
+
+**The return dict.** Chunk `ledger` rewrites this function immediately after this task and replaces
+the *measurement* behind the money keys (submitted value → actually-filled value). To make sure no
+caller sees a key appear or disappear between the two landings, this task emits the **full merged
+key set** on BOTH branches, with the final names already in place:
+
+| key | type | blocked | not blocked (this task) | after chunk `ledger` |
+|---|---|---|---|---|
+| `run_id` | `Optional[int]` | `None` | the run id | unchanged |
+| `outcomes` | `List[RowOutcome]` | `[]` | per-row outcomes | unchanged |
+| `order_ids` | `List[int]` | `[]` | submitted order ids | unchanged |
+| `income_consumed` | `float` | `0.0` | as today | unchanged |
+| `filled_buy_value` | `float` | `0.0` | Task 75's submitted value | REAL filled value |
+| `filled_sell_value` | `float` | `0.0` | Task 75's submitted value | REAL filled value |
+| `settled` | `bool` | `True` | `True` | measured from the fills |
+| `working_order_ids` | `List[int]` | `[]` | `[]` | the orders still working |
+| `blocked` | `bool` | `True` | `False` | **preserved** |
+| `blocked_reason` | `Optional[str]` | a sentence | `None` | **preserved** |
+| `submitted_buy_value` | `float` | `0.0` | Task 75's value | **DELETED by ledger** |
+| `submitted_sell_value` | `float` | `0.0` | Task 75's value | **DELETED by ledger** |
+
+The two `submitted_*` keys are transitional and marked as such in the code so ledger's author
+deletes exactly two lines. Nothing here references `summarise_outcomes` beyond what Task 75 already
+wrote — ledger deletes that function, and this task must not add a new call to it.
+
+`FakeAccount` (Task 69) gains the seam so the existing submission suite keeps meaning what it meant;
+the default is an open market, at a frozen instant.
+
+**Files:**
+- Modify: `ba2_trade_platform/core/portfolio_allocation_service.py` (append `fetch_market_hours`; guard `run_allocation`)
+- Test: `tests/test_portfolio_allocation_submit.py` (modify `FakeAccount`, append tests)
+
+- [ ] **Step 1: Write the failing test**
+
+In `tests/test_portfolio_allocation_submit.py`, add these imports at the top of the file:
+
+```python
+from datetime import datetime, timezone
+
+from ba2_common.core.account_types import (
+    MARKET_HOURS_SOURCE_BROKER, MARKET_HOURS_SOURCE_UNAVAILABLE, MarketHours,
+)
+```
+
+and add to `class FakeAccount.__init__` (after the existing attribute assignments):
+
+```python
+        # Market hours: OPEN by default at a FROZEN instant, so every pre-existing
+        # submission test keeps meaning what it meant and none of them depends on
+        # the wall clock. Reassign to simulate a closed or unavailable market.
+        self.market_hours = MarketHours(
+            is_open=True, source=MARKET_HOURS_SOURCE_BROKER, as_of=FROZEN_NOW,
+            open_at=None, close_at=MARKET_CLOSE, next_open=None, next_close=MARKET_CLOSE)
+        self.market_hours_error = None
+```
+
+and add this method to `FakeAccount`:
+
+```python
+    def get_market_hours(self, *, now=None):
+        """Mirrors ReadOnlyAccountInterface.get_market_hours' signature exactly."""
+        if self.market_hours_error is not None:
+            raise self.market_hours_error
+        return self.market_hours
+```
+
+Append to `tests/test_portfolio_allocation_submit.py` (``FROZEN_NOW`` and ``MARKET_CLOSE`` are
+defined here, at the bottom of the file, and referenced by ``FakeAccount.__init__`` above:
+module globals resolve when the constructor RUNS, which is inside a test, long after import):
+
+```python
+# ---------------------------------------------------------------------------
+# Market-hours gating of the live Submit path
+# ---------------------------------------------------------------------------
+# Every market-hours test freezes the clock explicitly. 2026-08-20 17:00 UTC is
+# 13:00 ET, mid-session; the close is 20:00 UTC == 16:00 ET.
+FROZEN_NOW = datetime(2026, 8, 20, 17, 0, tzinfo=timezone.utc)
+MARKET_CLOSE = datetime(2026, 8, 20, 20, 0, tzinfo=timezone.utc)
+NEXT_OPEN = datetime(2026, 8, 21, 13, 30, tzinfo=timezone.utc)
+
+
+def _closed_hours(status=None, detail=None):
+    return MarketHours(is_open=False, source=MARKET_HOURS_SOURCE_BROKER,
+                       as_of=FROZEN_NOW, open_at=NEXT_OPEN, close_at=None,
+                       next_open=NEXT_OPEN, next_close=None,
+                       status=status, detail=detail)
+
+
+def _capture_errors(monkeypatch):
+    """Collect ``logger.error`` messages emitted by the service module.
+
+    NOT caplog. Two independent reasons it cannot be used here:
+      * ba2_trade_platform.logger installs its own handler and sets
+        propagate = False (logger.py:24), so caplog's ROOT handler never sees the
+        record; and
+      * tests/test_penny_gainers_fix.py:53 replaces
+        sys.modules["ba2_trade_platform.logger"] with a MagicMock at import time, so
+        under a full-suite collection even re-enabling propagation patches a mock.
+    Patching the module-under-test's own ``logger`` is immune to both. Same shape as
+    tests/test_tastytrade_account.py:665.
+    """
+    import sys
+    module = sys.modules[svc.__name__]
+    messages = []
+    monkeypatch.setattr(module.logger, "error", lambda msg, *a, **k: messages.append(str(msg)))
+    return messages
+
+
+def test_fetch_market_hours_returns_what_the_broker_published():
+    account = FakeAccount(account_id=51)
+    hours = svc.fetch_market_hours(account)
+    assert hours is not None
+    assert hours.is_open is True
+    assert hours.is_known is True
+
+
+def test_fetch_market_hours_returns_none_when_the_seam_raises():
+    account = FakeAccount(account_id=52)
+    account.market_hours_error = RuntimeError("clock endpoint 503")
+    assert svc.fetch_market_hours(account) is None
+
+
+def test_fetch_market_hours_returns_none_when_the_account_has_no_seam():
+    class NoSeam:
+        id = 53
+    assert svc.fetch_market_hours(NoSeam()) is None
+
+
+def test_fetch_market_hours_logs_the_failure_rather_than_swallowing_it(monkeypatch):
+    errors = _capture_errors(monkeypatch)
+
+    account = FakeAccount(account_id=54)
+    account.market_hours_error = RuntimeError("clock endpoint 503")
+    svc.fetch_market_hours(account)
+
+    assert any("market hours" in e.lower() for e in errors), errors
+
+
+def test_run_allocation_refuses_to_submit_while_the_market_is_closed():
+    account = FakeAccount(account_id=55)
+    account.positions = []
+    account.market_hours = _closed_hours()
+    row = make_row("AAPL", OrderDirection.BUY, 10.0, 1_600.0, 1_600.0, price=160.0)
+    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
+
+    result = svc.run_allocation(account, plan, {}, make_base(), mode="REBALANCE")
+
+    assert result["blocked"] is True
+    assert result["run_id"] is None
+    assert result["outcomes"] == []
+    assert account.submitted == []
+    assert "closed" in result["blocked_reason"].lower()
+
+
+def test_a_blocked_run_quotes_the_brokers_own_word_for_why():
+    """D4: the gate is regular-session only, so a user blocked at 17:00 must be told
+    that extended hours is not "open" here, not left guessing."""
+    account = FakeAccount(account_id=59)
+    account.positions = []
+    account.market_hours = _closed_hours(status="Extended")
+    plan = AllocationPlan(rows=[], available_buying_power=10_000.0)
+
+    result = svc.run_allocation(account, plan, {}, make_base(), mode="REBALANCE")
+
+    assert "Extended" in result["blocked_reason"]
+
+
+def test_run_allocation_blocked_by_a_closed_market_writes_no_run_row():
+    """No run row means no order comments to stamp and, above all, no income
+    consumed -- finalise_allocation_run is one-shot."""
+    from ba2_trade_platform.core.db import get_db
+    from ba2_trade_platform.core.models import PortfolioAllocationRun
+    from sqlmodel import select
+
+    account = FakeAccount(account_id=56)
+    account.positions = []
+    account.market_hours = _closed_hours()
+    plan = AllocationPlan(rows=[make_row("AAPL", OrderDirection.BUY, 1.0, 160.0, 160.0,
+                                         price=160.0)],
+                          available_buying_power=10_000.0)
+
+    svc.run_allocation(account, plan, {}, make_base(), mode="REBALANCE")
+
+    with get_db() as session:
+        rows = session.exec(select(PortfolioAllocationRun).where(
+            PortfolioAllocationRun.account_id == 56)).all()
+    assert rows == []
+
+
+def test_run_allocation_refuses_when_market_hours_cannot_be_read_at_all():
+    """Unknown is not open. The alternative is submitting on a guess."""
+    account = FakeAccount(account_id=57)
+    account.positions = []
+    account.market_hours_error = RuntimeError("clock endpoint 503")
+    plan = AllocationPlan(rows=[make_row("AAPL", OrderDirection.BUY, 1.0, 160.0, 160.0,
+                                         price=160.0)],
+                          available_buying_power=10_000.0)
+
+    result = svc.run_allocation(account, plan, {}, make_base(), mode="REBALANCE")
+
+    assert result["blocked"] is True
+    assert account.submitted == []
+    assert "not confirmed open" in result["blocked_reason"]
+
+
+def test_run_allocation_refuses_an_unavailable_answer_even_though_it_is_not_none():
+    """source=UNAVAILABLE carries is_open=False so the money path fails closed, and
+    is_known=False so nobody may read it as "the market is shut"."""
+    account = FakeAccount(account_id=60)
+    account.positions = []
+    account.market_hours = MarketHours(is_open=False, as_of=FROZEN_NOW,
+                                       source=MARKET_HOURS_SOURCE_UNAVAILABLE,
+                                       detail="broker and calendar both failed")
+    plan = AllocationPlan(rows=[], available_buying_power=10_000.0)
+
+    result = svc.run_allocation(account, plan, {}, make_base(), mode="REBALANCE")
+
+    assert result["blocked"] is True
+    assert "not confirmed open" in result["blocked_reason"]
+
+
+def test_a_blocked_run_returns_every_key_an_unblocked_one_does():
+    """The two branches must never disagree on shape: a caller reading
+    result["filled_buy_value"] must not KeyError only when the market was open."""
+    blocked_account = FakeAccount(account_id=61)
+    blocked_account.positions = []
+    blocked_account.market_hours = _closed_hours()
+    open_account = FakeAccount(account_id=62)
+    open_account.positions = []
+
+    blocked = svc.run_allocation(blocked_account, AllocationPlan(rows=[]), {},
+                                 make_base(), mode="REBALANCE")
+    allowed = svc.run_allocation(open_account, AllocationPlan(rows=[]), {},
+                                 make_base(), mode="REBALANCE")
+
+    assert set(blocked) == set(allowed)
+    assert blocked["filled_buy_value"] == 0.0
+    assert blocked["filled_sell_value"] == 0.0
+    assert blocked["settled"] is True
+    assert blocked["working_order_ids"] == []
+    assert allowed["blocked"] is False
+    assert allowed["blocked_reason"] is None
+
+
+def test_run_allocation_with_an_open_market_is_not_blocked():
+    account = FakeAccount(account_id=58)
+    account.positions = []
+    plan = AllocationPlan(rows=[make_row("AAPL", OrderDirection.BUY, 1.0, 160.0, 160.0,
+                                         price=160.0)],
+                          available_buying_power=10_000.0)
+
+    result = svc.run_allocation(account, plan, {}, make_base(), mode="REBALANCE")
+
+    assert result["blocked"] is False
+    assert result["run_id"] is not None
+    assert [s[0] for s in account.submitted] == ["AAPL"]
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_submit.py -v -k "market_hours or refuses or blocked or not_blocked or brokers_own_word or every_key"`
+
+Expected: FAIL — `AttributeError: module 'ba2_trade_platform.core.portfolio_allocation_service'
+has no attribute 'fetch_market_hours'`, and the `run_allocation` cases fail with
+`KeyError: 'blocked'`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+**3a.** Append to `ba2_trade_platform/core/portfolio_allocation_service.py`:
+
+```python
+def fetch_market_hours(account):
+    """The broker's market-hours answer, or ``None`` when there is not one.
+
+    Adapter only -- the DISPLAY decision is
+    ``ui.utils.portfolio_allocation_view.evaluate_market_gate``, which is pure and
+    takes plain values, and the MONEY decision is inline in ``run_allocation``. This
+    module never imports the UI: ``core -> ui`` is a layering inversion.
+
+    ``None`` means "we do not know", which every caller must treat as NOT open. It
+    covers a seam that raised, a seam that returned nothing, and an account object
+    that predates the seam. ``get_market_hours`` is concrete on
+    ``ReadOnlyAccountInterface`` and documented never to raise, so a real account
+    always answers; the getattr guard and the try/except are for test doubles and for
+    an account class that has not been rebased yet.
+
+    Returns:
+        Optional[MarketHours]: the broker's answer, or ``None``. Note that a
+        ``MarketHours`` with ``is_known is False`` is NOT ``None`` -- it is a real
+        answer meaning "unavailable", and callers must check both.
+    """
+    getter = getattr(account, "get_market_hours", None)
+    if getter is None:
+        logger.warning(f"Account {getattr(account, 'id', '?')} publishes no market hours "
+                       f"seam; treating the market as unknown")
+        return None
+    try:
+        hours = getter()
+    except Exception as e:
+        logger.error(f"Could not read market hours for account "
+                     f"{getattr(account, 'id', '?')}: {e}", exc_info=True)
+        return None
+    if hours is None:
+        logger.warning(f"Account {getattr(account, 'id', '?')} returned no market hours; "
+                       f"treating the market as unknown")
+    return hours
+
+
+def _market_blocked_reason(hours) -> Optional[str]:
+    """``None`` when the market is confirmed open, else the sentence to show.
+
+    Derived from ``MarketHours`` DIRECTLY -- the view module owns the banner copy and
+    must not be imported here. The two pieces of prose are allowed to differ in
+    wording; they may not differ in the DECISION, which is why both are computed from
+    one ``fetch_market_hours`` call.
+    """
+    if hours is None:
+        return "Market hours could not be read, so the market is not confirmed open"
+    if not hours.is_known:
+        reason = "Market hours are unavailable, so the market is not confirmed open"
+    elif not hours.is_open:
+        reason = "Market is closed"
+        # The broker's OWN word, display-only and never branched on: it is what tells
+        # a user blocked at 17:00 that the gate is regular-session only.
+        if hours.status:
+            reason += f" (broker status: {hours.status})"
+    else:
+        return None
+    if hours.detail:
+        reason += f" - {hours.detail}"
+    return reason
+```
+
+**3b.** In `run_allocation`, insert immediately after the docstring, BEFORE
+`from .portfolio_allocation_store import ...` and before anything else in the body:
+
+```python
+    # Market-hours gate, FIRST, before anything is written. Disabling the Submit
+    # button is a courtesy; this is the enforcement -- the wizard can sit open across
+    # 16:00. Blocking here means no run row, no stamped order comments and, above
+    # all, no income consumed: finalise_allocation_run is one-shot, so a run created
+    # for orders that were all rejected would mark that income spent forever.
+    # TastyTrade's closed-market refusal is a SERVER rule that arrives as an opaque
+    # Message (tastytrade/order.py:172-183), so without this the user would get a
+    # screen of unexplained per-row failures after the ledger had already been hit.
+    reason = _market_blocked_reason(fetch_market_hours(account))
+    if reason is not None:
+        logger.warning(f"Allocation run for account {account.id} BLOCKED: {reason}; "
+                       f"nothing was submitted and no run was recorded")
+        return {
+            "run_id": None,
+            "outcomes": [],
+            "order_ids": [],
+            "income_consumed": 0.0,
+            "filled_buy_value": 0.0,
+            "filled_sell_value": 0.0,
+            "submitted_buy_value": 0.0,   # transitional; chunk `ledger` deletes this line
+            "submitted_sell_value": 0.0,  # transitional; chunk `ledger` deletes this line
+            "settled": True,              # nothing was submitted, so nothing is pending
+            "working_order_ids": [],
+            "blocked": True,
+            "blocked_reason": f"{reason}. Nothing was submitted.",
+        }
+```
+
+**3c.** Still in `run_allocation`, replace the returned dict at the end of the function with:
+
+```python
+    return {
+        "run_id": run_id,
+        "outcomes": outcomes,
+        "order_ids": totals["order_ids"],
+        "income_consumed": income_consumed,
+        # The KEY NAMES are already final so no caller has to change twice; the
+        # MEASUREMENT behind them is still Task 75's submitted value, and chunk
+        # `ledger` replaces it with the actually-filled value in its rewrite.
+        "filled_buy_value": totals["submitted_buy_value"],
+        "filled_sell_value": totals["submitted_sell_value"],
+        "submitted_buy_value": totals["submitted_buy_value"],   # ledger deletes this line
+        "submitted_sell_value": totals["submitted_sell_value"],  # ledger deletes this line
+        "settled": True,          # ledger measures this from the fills
+        "working_order_ids": [],  # ledger fills this from the fills
+        "blocked": False,
+        "blocked_reason": None,
+    }
+```
+
+**3d.** In `run_allocation`'s docstring, insert immediately above the existing step 1 of
+``Order of operations:``:
+
+```
+      0. GATE on market hours: if the market is not confirmed open, return
+         ``blocked=True`` having written nothing at all. This is the FIRST statement
+         in the function, before the store import and before any DB write.
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_submit.py -v -k "market_hours or refuses or blocked or not_blocked or brokers_own_word or every_key"`
+Expected: PASS — 11 passed.
+
+Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_submit.py -v`
+Expected: PASS — no failures. `FakeAccount` reports an open market by default, so the Task 72-75
+tests are unaffected.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add ba2_trade_platform/core/portfolio_allocation_service.py tests/test_portfolio_allocation_submit.py
+git commit -m "feat(allocation): refuse to submit an allocation run into a closed market"
+```
+
+---
+
+### Task 95: The wizard — Submit disabled when closed, the bump and the rounding made prominent
+
+The dialog written in Task 70 draws rows and totals and nothing else. Four changes:
+
+1. **`market` becomes a REQUIRED keyword on `AllocationWizard` and `open_allocation_wizard`.** A
+   default would mean a caller that forgets it submits into a closed market. When `market.allowed`
+   is false the Submit button is disabled and a banner carries `market.message` — which already
+   names the next open in ET and, when the answer came from the offline calendar rather than the
+   broker, says so (Task 93). Refresh, the fractional switch, the row ticks and Cancel all stay
+   live: planning is the point.
+2. **Four notices at the top, above the table**, from `whole_share_notice()`, `bump_notice()`,
+   `no_order_notice()` and `redistribution_notice()` (Task 91). At ~25% ineligibility these are not
+   footnotes, and two of them describe money the plan is moving that the user did not type.
+3. **New columns and a "Not traded" section.** `Sizing` says fractional or whole; `Outcome` says
+   normal / bumped-to-1 / skipped-too-large; `Target` and `Projected` sit side by side so the
+   rounding is visible as money; `Weight` shows *asked → actual* so a redistributed row cannot hide.
+   The "Not traded" section renders `no_order_rows()` — the symbols the table itself cannot show
+   because they produce no order at all.
+4. **The income panel gains the working-orders line** (decision D3). `render_income_panel` takes an
+   optional pre-computed `working_note` — the `(text, severity)` pair from
+   `working_orders_notice()` — and draws it. The decision and the wording are pure and already
+   tested in Task 93; this module only draws.
+
+Layout is eyeball-only, as everywhere else in Section G; the automated check is the import +
+signature smoke test, in the style Sections F/G already use.
+
+**Files:**
+- Modify: `ba2_trade_platform/ui/pages/portfolio_allocation_wizard.py` (replace `AllocationWizard`, `open_allocation_wizard`, `render_income_panel`)
+- Test: `tests/test_portfolio_allocation_wizard_ui.py` (append)
+
+- [ ] **Step 1: Write the failing test**
+
+Append to `tests/test_portfolio_allocation_wizard_ui.py`:
+
+```python
+def test_wizard_requires_the_market_gate_and_will_not_default_it():
+    """A default would let a caller submit into a closed market by omission."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    params = inspect.signature(wiz.open_allocation_wizard).parameters
+    assert "market" in params
+    assert params["market"].default is inspect.Parameter.empty
+
+    init_params = inspect.signature(wiz.AllocationWizard.__init__).parameters
+    assert "market" in init_params
+    assert init_params["market"].default is inspect.Parameter.empty
+
+
+def test_wizard_module_exposes_the_notice_renderers():
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    assert hasattr(wiz.AllocationWizard, "_render_market_banner")
+    assert hasattr(wiz.AllocationWizard, "_render_notices")
+    assert hasattr(wiz.AllocationWizard, "_render_no_order_rows")
+
+
+def test_wizard_submit_is_a_no_op_while_the_market_gate_blocks():
+    """No NiceGUI context here: _submit must bail on the gate BEFORE it touches any
+    widget, so calling it on a bare instance must not call on_submit and must not
+    raise."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        MARKET_GATE_CLOSED, MarketGateResult,
+    )
+
+    submitted = []
+    obj = object.__new__(wiz.AllocationWizard)
+    obj.market = MarketGateResult(allowed=False, reason_code=MARKET_GATE_CLOSED,
+                                  message="Market closed", severity="warning")
+    obj.on_submit = submitted.append
+
+    obj._submit()
+
+    assert submitted == []
+
+
+def test_wizard_imports_the_engine_summary_helpers():
+    """The prominence work is engine-side and pure; the wizard only draws it."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    assert callable(wiz.fractional_summary)
+    assert callable(wiz.whole_share_notice)
+    assert callable(wiz.no_order_notice)
+    assert callable(wiz.bump_notice)
+    assert callable(wiz.redistribution_notice)
+    assert callable(wiz.no_order_rows)
+
+
+def test_render_income_panel_accepts_a_pre_computed_working_orders_note():
+    """D3: deferral is the common case, so the panel has to be able to say so. The
+    DECISION is the pure working_orders_notice(); this module only draws it."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    params = inspect.signature(wiz.render_income_panel).parameters
+    assert "working_note" in params
+    assert params["working_note"].default is None
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_wizard_ui.py -v -k "market or notice or engine_summary or working"`
+
+Expected: FAIL — `AssertionError: assert 'market' in ...` on the signature test, and
+`AttributeError: module 'ba2_trade_platform.ui.pages.portfolio_allocation_wizard' has no attribute
+'fractional_summary'`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+**3a.** In `ba2_trade_platform/ui/pages/portfolio_allocation_wizard.py`, replace the engine import
+block with:
+
+```python
+from ...core.portfolio_allocation import (
+    AllocationPlan,
+    BaseSnapshot,
+    bump_notice,
+    dry_run_rows,
+    filter_plan_rows,
+    fractional_summary,
+    no_order_notice,
+    no_order_rows,
+    redistribution_notice,
+    summarise_plan,
+    whole_share_notice,
+)
+from ..utils.portfolio_allocation_view import MARKET_BANNER_CLASSES, MarketGateResult
+```
+
+**3b.** Replace the whole of `class AllocationWizard` (from `class AllocationWizard:` down to, but
+not including, `def open_allocation_wizard(`) with:
+
+```python
+class AllocationWizard:
+    """The dry-run dialog: base panel, fractional toggle, tickable rows, totals.
+
+    Nothing is written to the database until the user presses Submit, which hands
+    the FILTERED plan (ticked rows only) to ``on_submit``.
+
+    ``market`` gates Submit ONLY. When the market is closed the dialog still opens,
+    still refreshes and still recomputes: planning outside market hours is the
+    normal way to use this page. ``run_allocation`` re-checks the gate server-side,
+    because this dialog can sit open across the close.
+    """
+
+    def __init__(
+        self,
+        base: BaseSnapshot,
+        plan: AllocationPlan,
+        *,
+        market: MarketGateResult,
+        on_refresh: Callable[[bool], AllocationPlan],
+        on_submit: Callable[[AllocationPlan], None],
+        title: str = 'Portfolio allocation - dry run',
+    ):
+        self.base = base
+        self.plan = plan
+        self.market = market
+        self.on_refresh = on_refresh
+        self.on_submit = on_submit
+        self.title = title
+        self.allow_fractional = bool(plan.allow_fractional)
+        self.selected = {r['symbol'] for r in dry_run_rows(plan) if not r['skipped']}
+        self.dialog = None
+        self._notices_container = None
+        self._rows_container = None
+        self._no_order_container = None
+        self._totals_container = None
+        self._submit_button = None
+
+    # -- public -----------------------------------------------------------
+    def open(self):
+        with ui.dialog().props('maximized') as dialog, ui.card().classes('w-full h-full overflow-auto'):
+            self.dialog = dialog
+            ui.label(self.title).classes('text-xl font-bold')
+            self._render_market_banner()
+            self._render_base_panel()
+            ui.switch('Allow fractional shares', value=self.allow_fractional,
+                      on_change=lambda e: self._refresh(bool(e.value)))
+            ui.label('Market orders placed outside market hours queue until the open '
+                     'and may fill away from these prices.').classes('text-xs text-orange-400')
+            self._notices_container = ui.column().classes('w-full')
+            self._rows_container = ui.column().classes('w-full gap-0')
+            self._no_order_container = ui.column().classes('w-full')
+            self._totals_container = ui.column().classes('w-full')
+            self._render_notices()
+            self._render_rows()
+            self._render_no_order_rows()
+            self._render_totals()
+            with ui.row().classes('w-full justify-end gap-2 mt-4'):
+                ui.button('Refresh', on_click=lambda: self._refresh(self.allow_fractional)).props('outline')
+                ui.button('Cancel', on_click=dialog.close).props('flat')
+                self._submit_button = ui.button('Submit', on_click=self._submit).props('color=primary')
+                if not self.market.allowed:
+                    # Disabled, not hidden: the user must see that Submit exists and
+                    # WHY it is off -- the banner right above says when it returns.
+                    self._submit_button.set_enabled(False)
+                    self._submit_button.tooltip(self.market.message)
+        dialog.open()
+        return dialog
+
+    # -- internals --------------------------------------------------------
+    def _render_market_banner(self):
+        """The market-hours banner. Nothing at all when the market is open."""
+        if self.market.allowed:
+            return
+        css = MARKET_BANNER_CLASSES.get(self.market.severity, 'alert-banner warning')
+        with ui.element('div').classes(f'{css} w-full p-3'):
+            with ui.row().classes('items-center gap-2'):
+                ui.icon('schedule')
+                ui.label(self.market.message).classes('text-sm')
+
+    def _render_base_panel(self):
+        with ui.row().classes('w-full gap-6 items-center'):
+            ui.label(f'Buying power: {self.base.available_buying_power:,.2f}')
+            ui.label(f'Managed value ({self.base.valuation_mode}): '
+                     f'{self.base.managed_value:,.2f}')
+            ui.label(f'Base notional: {self.base.base_notional:,.2f}').classes('font-bold')
+            ui.label(f"as of {self.base.taken_at:%Y-%m-%d %H:%M UTC}").classes('text-xs text-gray-400')
+        for warning in self.base.warnings:
+            ui.label(warning).classes('text-xs text-orange-400')
+        for warning in self.plan.warnings:
+            ui.label(warning).classes('text-xs text-orange-400')
+
+    def _render_notices(self):
+        """The four plan-level sentences, up top.
+
+        About a quarter of this book cannot trade fractionally, some rows were bumped
+        UP to a whole share and some had their weight moved to keep a label on
+        target. Every one of those is the plan doing something the user did not type,
+        so none of them is a footnote.
+        """
+        self._notices_container.clear()
+        summary = fractional_summary(self.plan)
+        with self._notices_container:
+            for text in (whole_share_notice(summary), bump_notice(summary),
+                         no_order_notice(summary), redistribution_notice(summary)):
+                if not text:
+                    continue
+                with ui.element('div').classes('alert-banner warning w-full p-2 mt-2'):
+                    ui.label(text).classes('text-sm')
+
+    def _render_rows(self):
+        self._rows_container.clear()
+        rows = dry_run_rows(self.plan)
+        with self._rows_container:
+            if not rows:
+                ui.label('No orders required - the account already matches its targets.') \
+                    .classes('text-sm text-gray-400')
+                return
+            with ui.row().classes('w-full text-xs font-bold border-b py-1'):
+                for header, width in (('', 'w-10'), ('Symbol', 'w-24'), ('Side', 'w-16'),
+                                      ('Qty', 'w-24'), ('Sizing', 'w-20'),
+                                      ('Outcome', 'w-32'), ('Est. value', 'w-28'),
+                                      ('Target', 'w-28'), ('Projected', 'w-28'),
+                                      ('Weight', 'w-32'), ('BP cost', 'w-28'),
+                                      ('BP %', 'w-16'), ('Reasons', 'flex-1')):
+                    ui.label(header).classes(width)
+            for row in rows:
+                with ui.row().classes('w-full text-sm items-center border-b py-1'):
+                    ui.checkbox(
+                        value=row['symbol'] in self.selected,
+                        on_change=lambda e, s=row['symbol']: self._toggle(s, bool(e.value)),
+                    ).classes('w-10').set_enabled(not row['skipped'])
+                    ui.label(row['symbol']).classes('w-24 font-medium')
+                    ui.label(row['side']).classes(
+                        'w-16 ' + ('text-green-500' if row['side'] == 'BUY' else 'text-red-500'))
+                    ui.label(f"{row['quantity']:,.4f}").classes('w-24')
+                    ui.label(row['sizing']).classes(
+                        'w-20 text-xs ' + ('text-blue-400' if row['sizing'] == 'fractional'
+                                           else 'text-orange-400'))
+                    ui.label(row['outcome']).classes(
+                        'w-32 text-xs ' + ('text-orange-400'
+                                           if row['outcome'] != 'normal' else 'text-gray-400'))
+                    ui.label(f"{row['estimated_value']:,.2f}").classes('w-28')
+                    ui.label(f"{row['target_notional']:,.2f}").classes('w-28')
+                    projected = row['projected_notional']
+                    ui.label('-' if projected is None else f"{projected:,.2f}").classes('w-28')
+                    # ASKED -> ACTUAL. They differ whenever the grid, a bump or the
+                    # label redistribution moved this row, and hiding that would be
+                    # rewriting the user's weights behind their back.
+                    ui.label(f"{row['weight_pct']:.2f}% → {row['projected_weight_pct']:.2f}%") \
+                        .classes('w-32 text-xs ' + ('text-orange-400' if row['redistributed']
+                                                    else 'text-gray-400'))
+                    ui.label(f"{row['bp_cost']:,.2f}").classes('w-28')
+                    ui.label(f"{row['bp_usage_pct']:.1f}%").classes('w-16')
+                    ui.label(row['reasons']).classes('flex-1 text-xs text-gray-400')
+
+    def _render_no_order_rows(self):
+        """Symbols the plan wanted to trade and could not.
+
+        These cannot appear in the table above -- it lists orders, and these have
+        none -- so without this section they simply vanish, which is exactly the
+        bug: a target one whole share would have overshot used to disappear from the
+        review screen entirely.
+        """
+        self._no_order_container.clear()
+        dropped = no_order_rows(self.plan)
+        if not dropped:
+            return
+        total = sum(r['unmet_notional'] for r in dropped)
+        with self._no_order_container:
+            with ui.expansion(f'Not traded ({len(dropped)}) - {total:,.2f} unallocated') \
+                    .classes('w-full mt-2'):
+                with ui.row().classes('w-full text-xs font-bold border-b py-1'):
+                    for header, width in (('Symbol', 'w-24'), ('Price', 'w-28'),
+                                          ('Outcome', 'w-32'), ('Target', 'w-28'),
+                                          ('Projected', 'w-28'), ('Unallocated', 'w-28'),
+                                          ('Why', 'flex-1')):
+                        ui.label(header).classes(width)
+                for row in dropped:
+                    with ui.row().classes('w-full text-sm items-center border-b py-1'):
+                        ui.label(row['symbol']).classes('w-24 font-medium')
+                        ui.label('-' if row['price'] is None
+                                 else f"{row['price']:,.2f}").classes('w-28')
+                        ui.label(row['outcome']).classes('w-32 text-xs text-orange-400')
+                        ui.label(f"{row['target_notional']:,.2f}").classes('w-28')
+                        projected = row['projected_notional']
+                        ui.label('-' if projected is None
+                                 else f"{projected:,.2f}").classes('w-28')
+                        ui.label(f"{row['unmet_notional']:,.2f}").classes('w-28 text-orange-400')
+                        ui.label(row['reasons']).classes('flex-1 text-xs text-gray-400')
+
+    def _render_totals(self):
+        self._totals_container.clear()
+        selected_plan = filter_plan_rows(self.plan, sorted(self.selected))
+        try:
+            totals = summarise_plan(selected_plan, cash=self.base.cash)
+        except ValueError:
+            totals = None
+        summary = fractional_summary(selected_plan)
+        with self._totals_container:
+            with ui.row().classes('w-full gap-6 mt-2 text-sm'):
+                ui.label(f"Sell value: {selected_plan.total_sell_value:,.2f}")
+                ui.label(f"Buy value: {selected_plan.total_buy_value:,.2f}")
+                ui.label(f"Required BP: {selected_plan.required_buying_power:,.2f} "
+                         f"/ {selected_plan.available_buying_power:,.2f} "
+                         f"({selected_plan.bp_usage_pct:.1f}%)")
+                if totals is not None:
+                    ui.label(f"Est. cash after: {totals['estimated_cash_after']:,.2f}")
+                else:
+                    ui.label('Est. cash after: unknown (broker published no cash balance)') \
+                        .classes('text-orange-400')
+            with ui.row().classes('w-full gap-6 text-sm'):
+                # SIGNED: a bump's over-allocation nets against a rounding shortfall,
+                # which is what "how far off target will I be" actually means.
+                ui.label(f"Off target after rounding: {summary['residual_notional']:,.2f} "
+                         f"({summary['residual_pct']:.2f}% of base)") \
+                    .classes('text-orange-400' if abs(summary['residual_pct']) >= 1.0 else '')
+                ui.label(f"Fractional: {summary['fractional_rows']} / "
+                         f"whole shares: {summary['whole_share_rows']}"
+                         + (f" / eligibility unknown: {summary['unknown_rows']}"
+                            if summary['unknown_rows'] else ''))
+                if summary['bumped_rows']:
+                    ui.label(f"Bumped to 1 share: {summary['bumped_rows']} "
+                             f"(+{summary['bumped_notional']:,.2f})").classes('text-orange-400')
+            if selected_plan.required_buying_power > selected_plan.available_buying_power:
+                ui.label('Required buying power exceeds available - the smallest buys will be '
+                         'truncated as buying power runs out.').classes('text-xs text-orange-400')
+
+    def _toggle(self, symbol: str, checked: bool):
+        if checked:
+            self.selected.add(symbol)
+        else:
+            self.selected.discard(symbol)
+        self._render_totals()
+
+    def _refresh(self, allow_fractional: bool):
+        self.allow_fractional = allow_fractional
+        try:
+            self.plan = self.on_refresh(allow_fractional)
+        except Exception as e:
+            logger.error(f"Allocation dry-run refresh failed: {e}", exc_info=True)
+            ui.notify(f'Refresh failed: {e}', type='negative')
+            return
+        self.selected = {r['symbol'] for r in dry_run_rows(self.plan) if not r['skipped']}
+        self._render_notices()
+        self._render_rows()
+        self._render_no_order_rows()
+        self._render_totals()
+        ui.notify('Dry run refreshed', type='info')
+
+    def _submit(self):
+        # FIRST, before touching any widget: the button is disabled, but a stale
+        # client or a keyboard activation must not get past this either. The real
+        # enforcement is in run_allocation; this is the polite half.
+        if not self.market.allowed:
+            ui.notify(self.market.message, type=self.market.severity)
+            return
+        selected_plan = filter_plan_rows(self.plan, sorted(self.selected))
+        if not selected_plan.rows:
+            ui.notify('Nothing selected to submit', type='warning')
+            return
+        if self.dialog is not None:
+            self.dialog.close()
+        self.on_submit(selected_plan)
+```
+
+**3c.** Replace `open_allocation_wizard` with:
+
+```python
+def open_allocation_wizard(
+    base: BaseSnapshot,
+    plan: AllocationPlan,
+    *,
+    market: MarketGateResult,
+    on_refresh: Callable[[bool], AllocationPlan],
+    on_submit: Callable[[AllocationPlan], None],
+    title: str = 'Portfolio allocation - dry run',
+) -> AllocationWizard:
+    """Open the dry-run dialog. Returns the wizard so the caller can keep a handle.
+
+    ``market`` is REQUIRED and has no default. Build it with
+    ``evaluate_market_gate(is_open=..., next_open=..., source=..., now=...)`` from
+    ``ui.utils.portfolio_allocation_view``, fed by
+    ``portfolio_allocation_service.fetch_market_hours(account)`` -- pass
+    ``is_open=None`` when that returns ``None`` OR when ``hours.is_known`` is False.
+    """
+    wizard = AllocationWizard(base, plan, market=market, on_refresh=on_refresh,
+                              on_submit=on_submit, title=title)
+    wizard.open()
+    return wizard
+```
+
+**3d.** In `render_income_panel` (Task 74), replace the signature and the opening of the card with:
+
+```python
+def render_income_panel(events: List[Dict], open_total: float,
+                        *, on_sync: Callable[[], None],
+                        on_invest: Callable[[float], None],
+                        working_note: Optional[Tuple[str, str]] = None) -> None:
+    """Last 30 days of income, the open total, and the Invest shortcut.
+
+    The panel NEVER polls. ``on_sync`` is wired to the Refresh button and is
+    additionally called once by the page on load; there is deliberately no
+    ``ui.timer`` here, so the page issues no background broker calls.
+
+    ``on_invest(open_total)`` opens the wizard in INVEST_LABEL mode pre-filled
+    with the unallocated amount.
+
+    ``working_note`` is the ``(text, severity)`` pair from
+    ``portfolio_allocation_view.working_orders_notice``, or ``None``. Orders still
+    working contribute ZERO to a run's ledger, so its income stays unconsumed until
+    they settle -- with a quarter of the book on whole shares that is the COMMON
+    outcome, and this is where the user is told. The decision and the wording are
+    pure and tested without NiceGUI; this function only draws them.
+    """
+    with ui.card().classes('w-full'):
+        if working_note is not None:
+            text, severity = working_note
+            css = MARKET_BANNER_CLASSES.get(severity, 'alert-banner warning')
+            with ui.element('div').classes(f'{css} w-full p-2'):
+                ui.label(text).classes('text-sm')
+        with ui.row().classes('w-full items-center justify-between'):
+```
+
+(the rest of the function body is unchanged).
+
+**3e.** In the module docstring, after the paragraph ending
+``both of which are unit-tested without NiceGUI.``, add:
+
+```
+Market hours gate SUBMIT only. The dialog opens, refreshes and recomputes with the
+market shut, because planning outside market hours is the normal case; the button
+is disabled and the banner names the next open. ``run_allocation`` re-checks
+server-side, since this dialog can sit open across the close.
+
+The Outcome and Weight columns are not decoration. The engine bumps a target
+smaller than one share UP to one share, and moves quantities between a label's
+symbols to keep the label on target; both spend money the typed weights did not ask
+for, and both are only acceptable because these two columns show them.
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_wizard_ui.py -v`
+Expected: PASS — no failures (the 5 new tests plus every earlier smoke test).
+
+Run: `venv/bin/python -m pytest tests/test_boot_smoke.py -v`
+Expected: PASS — the wizard module still imports cleanly under full app boot.
+
+Run: `venv/bin/python -m pytest packages/common/tests/test_portfolio_allocation_wizard.py tests/test_portfolio_allocation_view.py tests/test_portfolio_allocation_submit.py -v`
+Expected: PASS — no failures.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add ba2_trade_platform/ui/pages/portfolio_allocation_wizard.py tests/test_portfolio_allocation_wizard_ui.py
+git commit -m "feat(allocation): gate Submit on market hours and surface bumps, rounding and residuals"
+```
+
+---
+
+### Task 96: The page → wizard glue — the Allocate button and its four handlers
+
+**Nothing in the plan calls `open_allocation_steps()` or `open_allocation_wizard()`.** Sections F-G
+build the page, the steps dialog, the dry-run dialog, the submission path and the income panel, and
+then stop: there is no "Allocate" button, no `on_dry_run`, no `on_refresh`, no `on_submit`, and no
+caller for `fetch_market_hours` or `render_income_panel`. Per decision D6 this chunk owns that glue,
+and this task is it. Until it exists the market banner has no live caller and only `run_allocation`
+enforces the gate.
+
+Four handlers, each a thin wire between things that are already built and already tested:
+
+* **`on_dry_run(mode, labels, scope_label, amount, allow_fractional)`** — called by the steps
+  dialog. Persists the fractional choice (`remember_fractional_choice`, so it survives even when the
+  user never submits), solves, prechecks, evaluates the market gate and opens the wizard.
+* **`on_refresh(allow_fractional)`** — called by the wizard's Refresh button and by its fractional
+  switch. Re-reads positions and prices and re-solves. Returns the new plan; the wizard redraws.
+* **`on_submit(plan)`** — hands the FILTERED plan to `run_allocation`, then renders the outcomes.
+  When the service reports `blocked`, nothing was submitted and the reason is shown as-is.
+* **`on_sync` / `on_invest`** — the income panel's two buttons, and the INVEST_LABEL entry point.
+
+**Rules this glue obeys:**
+
+* **Every blocking call goes through `asyncio.to_thread`.** Broker IO on the event loop freezes the
+  whole app for every connected client.
+* **One `fetch_market_hours` call feeds both the banner and the money path.** The service re-derives
+  its own gate inside `run_allocation` from a fresh read (correct — the dialog can sit open across
+  the close), but the copy the user sees comes from `evaluate_market_gate` over the same
+  `MarketHours` shape, so the two can never describe different worlds. The caller mapping is the
+  contract's, verbatim:
+  `is_open = None if (hours is None or not hours.is_known) else hours.is_open`.
+* **`now` is passed explicitly** to `evaluate_market_gate` — `datetime.now(timezone.utc)` at the
+  call site, never a default inside the pure function.
+* **A failed position fetch is not a flat account.** `PositionFetchFailed` is caught and reported;
+  the wizard never opens on a guess.
+* **The reconcile hook (D3) is wired, not TODO.** The page calls
+  `portfolio_allocation_service.reconcile_unconsumed_runs(account)` on load and on income Refresh
+  when that function exists. It is authored by chunk `ledger`, which lands AFTER this task, so the
+  call is made through a `getattr` lookup with a comment naming the owner — the alternative is
+  shipping this task broken for the duration of one chunk, or leaving the hook unwired, which
+  decision D3 explicitly refuses.
+* Valid `ui.notify` types are `'positive' | 'negative' | 'warning' | 'info'` — `'error'` is not one
+  of them (`settings.py` gets this wrong; do not copy it).
+
+Layout is eyeball-only. The automated check is structural, in the style Section F already uses for
+this page (`tests/test_portfolio_allocation_route.py` parses the source with `ast` rather than
+importing `ui.main`, which pulls the whole expert/LLM stack).
+
+**Files:**
+- Modify: `ba2_trade_platform/ui/pages/portfolio_allocation.py`
+- Test: `tests/test_portfolio_allocation_route.py` (append)
+
+- [ ] **Step 1: Write the failing test**
+
+Append to `tests/test_portfolio_allocation_route.py`:
+
+```python
+# ---------------------------------------------------------------------------
+# The page -> wizard glue. Structural: importing the page module pulls the whole
+# expert/LLM stack, which does not finish inside five minutes.
+# ---------------------------------------------------------------------------
+
+def _page_source() -> str:
+    return PAGE_PY.read_text(encoding="utf-8")
+
+
+def test_the_page_defines_every_wizard_handler():
+    """Without these the wizard has no caller at all: no Allocate button, no dry
+    run, no submit, and the market banner is never built."""
+    names = _toplevel_function_names(_page_source())
+    assert {"_open_allocation_flow", "_load_flow_inputs", "_solve_plan",
+            "_submit_plan", "_load_income_panel"} <= names
+
+
+def test_the_page_opens_the_steps_dialog_and_the_wizard():
+    source = _page_source()
+    assert "open_allocation_steps(" in source
+    assert "open_allocation_wizard(" in source
+    assert "render_income_panel(" in source
+    assert "render_outcomes(" in source
+
+
+def test_the_page_builds_the_market_gate_from_the_service_seam():
+    source = _page_source()
+    assert "fetch_market_hours(" in source
+    assert "evaluate_market_gate(" in source
+    # The contract's caller mapping, verbatim: an UNAVAILABLE answer is UNKNOWN, not
+    # closed, and it must not be read off is_open alone.
+    assert "hours is None or not hours.is_known" in source
+
+
+def test_the_page_remembers_the_fractional_choice_on_every_dry_run():
+    assert "remember_fractional_choice(" in _page_source()
+
+
+def test_the_page_never_blocks_the_event_loop_on_broker_io():
+    """Every one of these does broker or DB IO; on the event loop they freeze the
+    app for every connected client."""
+    source = _page_source()
+    for blocking in ("_load_flow_inputs", "_solve_plan", "_submit_plan",
+                     "_load_income_panel"):
+        assert f"asyncio.to_thread({blocking}" in source, blocking
+
+
+def test_the_page_wires_the_unconsumed_run_reconcile_hook():
+    """D3: with a quarter of the book on whole shares, runs will regularly finalise
+    unsettled. The recovery pass has to actually run somewhere."""
+    assert "reconcile_unconsumed_runs" in _page_source()
+
+
+def test_the_page_never_uses_the_invalid_notify_type():
+    """Valid types are positive | negative | warning | info."""
+    assert "type='error'" not in _page_source()
+    assert 'type="error"' not in _page_source()
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_route.py -v -k "handler or wizard or gate or fractional or event_loop or reconcile or notify"`
+
+Expected: FAIL — `AssertionError: assert {'_load_flow_inputs', '_load_income_panel',
+'_open_allocation_flow', '_solve_plan', '_submit_plan'} <= {...}` on the first test, and
+`assert 'open_allocation_steps(' in ...` on the second.
+
+- [ ] **Step 3: Write minimal implementation**
+
+**3a.** In `ba2_trade_platform/ui/pages/portfolio_allocation.py`, add to the import block:
+
+```python
+from datetime import datetime, timezone
+
+from ...core import portfolio_allocation_service as svc
+from ...core.portfolio_allocation import (
+    ALLOCATION_MODE_INVEST_LABEL, ALLOCATION_MODE_REBALANCE, LabelTarget, SymbolTarget,
+    build_base_snapshot, compute_allocation, compute_label_investment,
+)
+from ...core.portfolio_allocation_store import get_allocation_config, get_symbol_weights
+from ..utils.portfolio_allocation_view import (
+    MARKET_SOURCE_UNAVAILABLE, evaluate_market_gate, working_orders_notice,
+)
+from .portfolio_allocation_wizard import (
+    open_allocation_steps, open_allocation_wizard, render_income_panel, render_outcomes,
+)
+```
+
+**3b.** Append the blocking helpers, next to `_load_view_payload`:
+
+```python
+def _load_flow_inputs(account_id: int, valuation_mode: str):
+    """Everything the wizard needs to OPEN, in one thread hop. Blocking.
+
+    Returns:
+        Tuple: ``(base, labels, allow_fractional)`` -- the frozen base snapshot, the
+        managed labels with their symbol weights, and the account's remembered
+        fractional choice.
+
+    Raises:
+        PositionFetchFailed: the broker's position fetch failed. NOT a flat account,
+            and the wizard must not open on the difference.
+        RuntimeError: the account could not be instantiated.
+        ValueError: the broker published no buying power (``build_base_snapshot``).
+    """
+    account = get_account_instance_from_id(account_id)
+    if account is None:
+        raise RuntimeError(f"Account {account_id} could not be instantiated")
+    managed = get_managed_labels(account_id)
+    symbols_by_label = get_symbols_by_label([row.label for row in managed])
+    symbols = collect_managed_symbols(symbols_by_label)
+
+    labels = []
+    for row in managed:
+        members = symbols_by_label.get(row.label, [])
+        weights = get_symbol_weights(account_id, row.label, members)
+        labels.append(LabelTarget(
+            label=row.label, target_pct=float(row.target_pct or 0.0),
+            symbols=[SymbolTarget(symbol=s, weight_pct=float(weights.get(s, 0.0)))
+                     for s in members],
+            comment=row.comment))
+
+    current = svc.build_position_states(account, symbols)
+    base = build_base_snapshot(account.get_account_snapshot(), current, symbols,
+                               valuation_mode=valuation_mode)
+    return base, labels, bool(get_allocation_config(account_id).allow_fractional)
+
+
+def _solve_plan(account_id: int, *, mode: str, labels, scope_label, amount: float,
+                allow_fractional: bool, valuation_mode: str):
+    """Solve one dry run against FRESH positions, prices and margin info. Blocking.
+
+    Re-reads everything rather than reusing the open dialog's snapshot: Refresh
+    exists precisely because the numbers move, and a plan solved against a stale
+    price is a plan submitted at the wrong size.
+
+    Returns:
+        Tuple: ``(base, plan, current, hours)``. ``hours`` is the broker's
+        ``MarketHours`` or ``None``; ONE read feeds both the banner and the gate.
+    """
+    account = get_account_instance_from_id(account_id)
+    if account is None:
+        raise RuntimeError(f"Account {account_id} could not be instantiated")
+    symbols = collect_managed_symbols(
+        {lt.label: [st.symbol for st in lt.symbols] for lt in labels})
+    current = svc.build_position_states(account, symbols)
+    margin = svc.fetch_margin_info(account, symbols)
+    base = build_base_snapshot(account.get_account_snapshot(), current, symbols,
+                               valuation_mode=valuation_mode)
+    if mode == ALLOCATION_MODE_INVEST_LABEL:
+        scope = next((lt for lt in labels if lt.label == scope_label), None)
+        if scope is None:
+            raise ValueError(f"Label {scope_label!r} is no longer managed")
+        plan = compute_label_investment(
+            scope, float(amount), current, margin,
+            available_buying_power=base.available_buying_power,
+            allow_fractional=allow_fractional, default_bp_factor=base.default_bp_factor,
+            valuation_mode=valuation_mode)
+    else:
+        plan = compute_allocation(
+            base.base_notional, base.available_buying_power, labels, current, margin,
+            allow_fractional=allow_fractional,
+            default_bp_factor=base.default_bp_factor, valuation_mode=valuation_mode)
+    plan = svc.precheck_plan(account, plan,
+                             available_buying_power=base.available_buying_power)
+    return base, plan, current, svc.fetch_market_hours(account)
+
+
+def _submit_plan(account_id: int, plan, current, base, *, mode: str, scope_label):
+    """Submit a reviewed plan. Blocking. The service re-checks the market gate."""
+    account = get_account_instance_from_id(account_id)
+    if account is None:
+        raise RuntimeError(f"Account {account_id} could not be instantiated")
+    return svc.run_allocation(account, plan, current, base, mode=mode,
+                              scope_label=scope_label)
+
+
+def _load_income_panel(account_id: int):
+    """Sync the ledger from the broker and read it back. Blocking.
+
+    Also runs the unconsumed-run reconcile pass. Runs whose orders were still working
+    when they finalised consumed NO income, and with about a quarter of the book on
+    whole shares that is the common outcome, not the rare one -- without this call the
+    money would sit unconsumed until the next submission.
+    ``reconcile_unconsumed_runs`` is authored by the ledger chunk, which lands after
+    this task; the lookup is what keeps this page working in between.
+    """
+    account = get_account_instance_from_id(account_id)
+    if account is None:
+        raise RuntimeError(f"Account {account_id} could not be instantiated")
+    reconcile = getattr(svc, "reconcile_unconsumed_runs", None)
+    if reconcile is not None:
+        try:
+            reconciled = reconcile(account)
+            if reconciled:
+                logger.info(f"Reconciled {len(reconciled)} unconsumed allocation run(s) "
+                            f"for account {account_id}")
+        except Exception as e:
+            logger.error(f"Reconciling unconsumed allocation runs failed: {e}",
+                         exc_info=True)
+    svc.sync_income_events(account)
+    return (svc.get_recent_income_events(account_id),
+            svc.get_open_income_total(account_id))
+```
+
+**3c.** Append the flow itself, next to the render helpers:
+
+```python
+def _market_gate_for(hours):
+    """Build the banner's gate from a MarketHours. The ONLY legal caller mapping.
+
+    An UNAVAILABLE answer carries ``is_open=False`` so the money path fails closed,
+    but ``is_known`` is False, so the UI must say "unknown" rather than "closed" --
+    they have different fixes. ``now`` is passed explicitly; the pure function has no
+    clock of its own.
+    """
+    is_open = None if (hours is None or not hours.is_known) else hours.is_open
+    source = hours.source if hours is not None else MARKET_SOURCE_UNAVAILABLE
+    return evaluate_market_gate(is_open=is_open,
+                                next_open=(hours.next_open if hours is not None else None),
+                                source=source, now=datetime.now(timezone.utc))
+
+
+async def _open_allocation_flow(account_id: int, valuation_mode: str,
+                                refresh) -> None:
+    """The Allocate button: steps 1-3, then the dry run, then Submit.
+
+    Every blocking call is dispatched through ``asyncio.to_thread``: broker IO on the
+    event loop freezes the app for every connected client.
+    """
+    try:
+        base, labels, allow_fractional = await asyncio.to_thread(
+            _load_flow_inputs, account_id, valuation_mode)
+    except PositionFetchFailed as e:
+        logger.error(f"Portfolio allocation: position fetch failed: {e}")
+        ui.notify(f'Broker position fetch FAILED: {e} - nothing is planned against a '
+                  f'guess', type='negative')
+        return
+    except Exception as e:
+        logger.error(f"Could not open the allocation wizard: {e}", exc_info=True)
+        ui.notify(f'Could not open the allocation wizard: {e}', type='negative')
+        return
+    if not labels:
+        ui.notify('No managed labels yet - use "Manage labels" first', type='warning')
+        return
+
+    state = {'mode': ALLOCATION_MODE_REBALANCE, 'scope_label': None, 'amount': 0.0,
+             'labels': labels, 'allow_fractional': allow_fractional}
+
+    async def _run_dry_run() -> None:
+        try:
+            new_base, plan, current, hours = await asyncio.to_thread(
+                _solve_plan, account_id, mode=state['mode'], labels=state['labels'],
+                scope_label=state['scope_label'], amount=state['amount'],
+                allow_fractional=state['allow_fractional'],
+                valuation_mode=valuation_mode)
+        except PositionFetchFailed as e:
+            logger.error(f"Portfolio allocation dry run: position fetch failed: {e}")
+            ui.notify(f'Broker position fetch FAILED: {e}', type='negative')
+            return
+        except Exception as e:
+            logger.error(f"Allocation dry run failed: {e}", exc_info=True)
+            ui.notify(f'Dry run failed: {e}', type='negative')
+            return
+        state['base'] = new_base
+        state['current'] = current
+
+        def _on_refresh(allow_fractional: bool):
+            """Called from the wizard (sync) -- re-solve and hand back the new plan."""
+            state['allow_fractional'] = bool(allow_fractional)
+            svc.remember_fractional_choice(account_id, bool(allow_fractional))
+            fresh_base, fresh_plan, fresh_current, _ = _solve_plan(
+                account_id, mode=state['mode'], labels=state['labels'],
+                scope_label=state['scope_label'], amount=state['amount'],
+                allow_fractional=bool(allow_fractional), valuation_mode=valuation_mode)
+            state['base'] = fresh_base
+            state['current'] = fresh_current
+            return fresh_plan
+
+        def _on_submit(selected_plan) -> None:
+            ui.timer(0.1, lambda: _do_submit(selected_plan), once=True)
+
+        open_allocation_wizard(new_base, plan, market=_market_gate_for(hours),
+                               on_refresh=_on_refresh, on_submit=_on_submit)
+
+    async def _do_submit(selected_plan) -> None:
+        try:
+            result = await asyncio.to_thread(
+                _submit_plan, account_id, selected_plan, state['current'],
+                state['base'], mode=state['mode'], scope_label=state['scope_label'])
+        except Exception as e:
+            logger.error(f"Allocation submission failed: {e}", exc_info=True)
+            ui.notify(f'Submission failed: {e}', type='negative')
+            return
+        if result['blocked']:
+            # The service re-checked the gate on its own, freshly: this dialog can
+            # sit open across 16:00 and the banner it was built with is now stale.
+            ui.notify(result['blocked_reason'], type='warning')
+            return
+        render_outcomes(result['outcomes'], run_id=result['run_id'])
+        note = working_orders_notice(settled=result['settled'],
+                                     working_order_ids=result['working_order_ids'])
+        if note is not None:
+            ui.notify(note[0], type=note[1])
+        await refresh()
+
+    def _on_dry_run(*, mode: str, labels, scope_label, amount: float,
+                    allow_fractional: bool) -> None:
+        """Called by the steps dialog (sync). Persist the choice, then solve."""
+        state.update({'mode': mode, 'labels': labels, 'scope_label': scope_label,
+                      'amount': float(amount or 0.0),
+                      'allow_fractional': bool(allow_fractional)})
+        # Persisted on every dry run, not only on submit: a user who plans, closes
+        # the dialog and comes back tomorrow keeps the switch they chose.
+        svc.remember_fractional_choice(account_id, bool(allow_fractional))
+        ui.timer(0.1, _run_dry_run, once=True)
+
+    open_allocation_steps(base, labels, on_dry_run=_on_dry_run,
+                          allow_fractional=allow_fractional,
+                          mode=state['mode'], invest_amount=0.0)
+
+
+async def _open_invest_flow(account_id: int, valuation_mode: str, amount: float,
+                            refresh) -> None:
+    """The income panel's Invest button: the same flow, pre-filled with the
+    unallocated income and scoped to one label."""
+    try:
+        base, labels, allow_fractional = await asyncio.to_thread(
+            _load_flow_inputs, account_id, valuation_mode)
+    except Exception as e:
+        logger.error(f"Could not open the invest wizard: {e}", exc_info=True)
+        ui.notify(f'Could not open the invest wizard: {e}', type='negative')
+        return
+    if not labels:
+        ui.notify('No managed labels yet - use "Manage labels" first', type='warning')
+        return
+    await _open_allocation_flow(account_id, valuation_mode, refresh)
+```
+
+**3d.** In `content`, add the two buttons to the toolbar and the income panel to the body — replace
+
+```python
+            body.clear()
+            with body:
+                _render_labels(account_id, payload, _refresh)
+```
+
+with
+
+```python
+            body.clear()
+            with body:
+                _render_labels(account_id, payload, _refresh)
+                try:
+                    events, open_total = await asyncio.to_thread(
+                        _load_income_panel, account_id)
+                except Exception as e:
+                    logger.error(f"Income panel failed to load: {e}", exc_info=True)
+                    events, open_total = [], 0.0
+                    ui.label(f'Income could not be loaded: {e}') \
+                        .classes('text-xs text-orange-400')
+                render_income_panel(
+                    events, open_total,
+                    on_sync=lambda: ui.timer(0.1, _refresh, once=True),
+                    on_invest=lambda amount: ui.timer(
+                        0.1, lambda: _open_invest_flow(
+                            account_id, mode_state['value'], amount, _refresh),
+                        once=True))
+```
+
+and replace
+
+```python
+        with toolbar:
+            ui.select({VALUATION_MODE_COST: 'Cost basis',
+                       VALUATION_MODE_MARKET: 'Market value'},
+                      value=mode_state['value'], label='Valuation',
+                      on_change=_set_mode).props('dense outlined').classes('w-44')
+```
+
+with
+
+```python
+        with toolbar:
+            ui.button('Allocate', icon='account_balance',
+                      on_click=lambda: _open_allocation_flow(
+                          account_id, mode_state['value'], _refresh)) \
+                .props('color=primary')
+            ui.select({VALUATION_MODE_COST: 'Cost basis',
+                       VALUATION_MODE_MARKET: 'Market value'},
+                      value=mode_state['value'], label='Valuation',
+                      on_change=_set_mode).props('dense outlined').classes('w-44')
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_route.py -v`
+Expected: PASS — no failures (the 7 new structural tests plus Section F's route tests).
+
+Run: `venv/bin/python -m pytest tests/test_boot_smoke.py -v`
+Expected: PASS — the page still imports cleanly under full app boot.
+
+Run these per-file (the full suite is flaky from a pre-existing session leak):
+```bash
+venv/bin/python -m pytest tests/test_portfolio_allocation_view.py -v
+venv/bin/python -m pytest tests/test_portfolio_allocation_submit.py -v
+venv/bin/python -m pytest tests/test_portfolio_allocation_wizard_ui.py -v
+venv/bin/python -m pytest packages/common/tests/test_portfolio_allocation.py -v
+venv/bin/python -m pytest packages/common/tests/test_portfolio_allocation_redistribution.py -v
+venv/bin/python -m pytest packages/common/tests/test_portfolio_allocation_wizard.py -v
+```
+Expected: PASS for all six.
+
+Eyeball check (the only way to verify the widgets): start the app with `venv/bin/python main.py`,
+open `http://localhost:8080/portfolioallocation` on an account with managed labels, and confirm in
+turn — (1) "Allocate" opens steps 1-3 with the fractional switch already ON; (2) Continue opens the
+dry run, and OUTSIDE market hours the banner names the next open in ET and Submit is disabled while
+Refresh still works; (3) a label containing a high-priced non-fractionable symbol shows either a
+`bumped-to-1` row with its Weight column reading e.g. `0.76% → 1.14%`, or a "Not traded" entry
+quoting the bump limit; (4) toggling the fractional switch off re-solves and the whole-share notice
+appears; (5) the income panel lists the last 30 days and its Invest button is enabled only when the
+unallocated total is positive.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add ba2_trade_platform/ui/pages/portfolio_allocation.py tests/test_portfolio_allocation_route.py
+git commit -m "feat(ui): wire the allocation page to the wizard, the market gate and the income panel"
+```
+
+---
+
+## Block E - Income ledger consumes FILLED value, not submitted
+
+## Section G addendum — the income ledger must consume FILLED value
+
+> **These five tasks run LAST.** They are Block D of the market-gating / fractional / filled-value
+> feature: they land after Section G Tasks 71-75 **and** after the `engine-ui` chunk's Section G2
+> work — specifically after its `models.py` `PortfolioAllocationConfig.allow_fractional` default
+> flip, after its appends to `packages/common/ba2_common/core/portfolio_allocation.py`, and after
+> its `portfolio_allocation_service.py` market-hours gate. Task 100 below is an edit of
+> **engine-ui's** `run_allocation`, not of Task 75's. Each task restates this at the top.
+>
+> **The bug, stated once.** `finalise_allocation_run` is handed
+> `submitted_buy_value` / `submitted_sell_value`, the model derives
+> `net_buy_value = max(0, buys - sells)`
+> (`packages/common/ba2_common/core/models.py:984`), and the consumption stamp is ONE-SHOT
+> (`portfolio_allocation_store.py:681-692` — `replayed = row.income_consumed_at is not None`,
+> and a replay "re-states the totals but leaves the ledger alone"). Task 75 as written computes
+> those totals from `row.price * outcome.quantity` — the PLAN's quote times the SUBMITTED
+> quantity — for every `OUTCOME_SUBMITTED` row. So an order the broker accepted and then
+> rejected, or one that simply never filled, PERMANENTLY marks dividend/deposit income as spent
+> when nothing was bought. Tasks N1–N4 replace the intended numbers with the real ones.
+>
+> **Deferral is the COMMON case, not the rare one — this is user decision D3.** Working orders
+> contribute ZERO at finalisation and the run stays in `get_unconsumed_runs()` to be reconciled
+> later. With roughly a quarter of this user's symbols non-fractionable, and with the ADJUST/trim
+> path creating a `WAITING_TRIGGER` MARKET partial-close order
+> (`packages/common/ba2_common/core/TransactionHelper.py:733`) that only submits once TradeManager
+> notices the TP/SL cancel landed, `settled=False` will be the ordinary outcome of a rebalance.
+> Task 101 therefore **wires** the recovery drain to something the user actually touches and puts
+> "N orders still working" in front of them. Neither is a TODO and neither is optional.
+>
+> **No new machinery.** `TradingOrder.filled_qty` (`models.py:389`) and `TradingOrder.open_price`
+> (`models.py:390`) are populated from the broker by `refresh_orders`
+> (`AlpacaAccount.py:2284-2314`: `alpaca_open_price = getattr(raw_order, 'filled_avg_price', None)`
+> … `db_order.open_price = alpaca_open_price`; `TastyTradeAccount.py:1091-1096` does the same).
+> `TradeManager.py:1600-1607` already runs `account.refresh_orders(fetch_all=True)` right after
+> its own submissions, commented *"Refresh order statuses from broker to detect if any orders are
+> already FILLED / This is important for market orders which fill immediately"*. The allocation
+> run mirrors that, once, and reads the rows back. There is no poller and no background job.
+>
+> **Nothing here is a dollar-value order.** No `notional=`, no `value`/`value_effect` pair.
+> `unmet_notional`, `target_notional`, `projected_notional`, `residual_notional` and
+> `base_notional` are MEASUREMENTS and are untouched by that ban — do not "correct" them.
+
+Run tests **per file** (the full suite has a known session-leak flakiness; judge per file). The
+venv is `venv/`, not `.venv/`.
+
+---
+
+### Task 97: Rename the run's money columns from `submitted_*` to `filled_*`
+
+> Runs after Section G Tasks 71-75 and after engine-ui's Section G2 service gate. Both files this
+> task renames through — `ba2_trade_platform/core/portfolio_allocation_service.py` and
+> `tests/test_portfolio_allocation_submit.py` — only exist once those have landed, and the service
+> already contains engine-ui's `blocked` early-return by the time this runs.
+
+`PortfolioAllocationRun.submitted_buy_value` / `submitted_sell_value`
+(`packages/common/ba2_common/core/models.py:974-975`) are described as *"Sum of estimated value
+of BUY orders actually submitted"*, and that is exactly what the next three tasks stop writing
+into them. Renaming first, as a mechanical no-behaviour-change step, means Task 100's diff is
+about arithmetic and nothing else — and it makes the *column* a liar-free record: a reader of
+`portfolio_allocation_run` should not have to know that "submitted" secretly meant "filled".
+
+The rename reaches the DB column. That is safe here and only here: revision `f1c8a24b7e05` has
+never been applied anywhere — its own docstring records that the live DB is behind it (*"the live
+DB is still two revisions behind, at d5e1b9a3c842, and no row of these tables exists anywhere"*,
+`alembic/versions/f1c8a24b7e05_add_portfolio_allocation_tables.py:20-26`) — and no revision chains
+off it (`grep -rln f1c8a24b7e05 alembic/versions/` returns only the file itself). So the
+`create_table` is AMENDED IN PLACE, the same precedent that file already set for
+`income_consumed_at`, rather than costing a second revision. A developer database built by
+`init_db()`'s `create_all` on an older checkout WILL have the old column names, and the
+`_create_table_if_absent` guard would skip right past it — hence the new
+`_rename_column_if_present` guard, which is the same idempotence discipline the rest of that
+revision already follows.
+
+The plan file `docs/superpowers/plans/2026-08-20-portfolio-allocation.md` still spells these
+`submitted_*` at Tasks 8/14/15 (already executed, so those blocks are historical) and at Task 75's
+`:19640-19735` (executed just before this addendum, then corrected by Task 100). **This task is the
+correction of record**; the plan's older blocks are not re-edited.
+
+**Files:**
+- Modify: `packages/common/ba2_common/core/models.py:930-984`
+- Modify: `packages/common/ba2_common/core/portfolio_allocation_store.py` (lines 477, 559-560, 593-594, 602, 607-608, 665-668, 682-683, 706)
+- Modify: `packages/common/ba2_common/core/portfolio_allocation.py:1118`
+- Modify: `alembic/versions/f1c8a24b7e05_add_portfolio_allocation_tables.py`
+- Modify: `ba2_trade_platform/core/portfolio_allocation_service.py`
+- Modify: `docs/superpowers/specs/2026-08-20-portfolio-allocation-design.md:230-232, 359`
+- Test: `tests/test_portfolio_allocation_models.py`
+- Test: `tests/test_portfolio_allocation_store.py`
+- Test: `tests/test_portfolio_allocation_submit.py`
+
+- [ ] **Step 1: Write the failing test**
+
+Replace the two tests at `tests/test_portfolio_allocation_models.py:72-81` with:
+
+```python
+def test_run_net_buy_value_is_filled_buys_minus_filled_sells():
+    """The columns are FILLED value, not submitted value. A run whose orders never
+    filled has zeros here and so consumes nothing from the income ledger."""
+    run = PortfolioAllocationRun(account_id=1, mode="REBALANCE",
+                                 filled_buy_value=5000.0, filled_sell_value=1200.0)
+    assert run.filled_buy_value == 5000.0
+    assert run.filled_sell_value == 1200.0
+    assert run.net_buy_value == 3800.0
+
+
+def test_run_net_buy_value_is_zero_when_sells_exceed_buys():
+    run = PortfolioAllocationRun(account_id=1, mode="REBALANCE",
+                                 filled_buy_value=1000.0, filled_sell_value=4000.0)
+    assert run.net_buy_value == 0.0
+
+
+def test_run_with_nothing_filled_has_no_net_buy_value():
+    """The whole point of the rename: submitted-but-unfilled is worth 0 here."""
+    run = PortfolioAllocationRun(account_id=1, mode="REBALANCE")
+    assert run.filled_buy_value == 0.0
+    assert run.filled_sell_value == 0.0
+    assert run.net_buy_value == 0.0
+```
+
+Append to `tests/test_portfolio_allocation_store.py`:
+
+```python
+def test_finalise_allocation_run_takes_filled_values_not_submitted_ones(account_id):
+    """The keyword names ARE the contract. ``submitted_buy_value`` invited callers to
+    pass what they intended to trade; ``filled_buy_value`` asks for what the broker
+    actually did, which is the only number the income ledger may be spent against."""
+    store.upsert_income_event(account_id, "dep-rename", date(2026, 8, 1), "DEPOSIT", 5000.0)
+    run = store.record_allocation_run(account_id, "REBALANCE", {})
+
+    finalised = store.finalise_allocation_run(
+        run.id, filled_buy_value=1600.0, filled_sell_value=400.0, order_ids=[101, 102])
+
+    assert finalised.filled_buy_value == 1600.0
+    assert finalised.filled_sell_value == 400.0
+    assert finalised.net_buy_value == 1200.0
+    assert finalised.income_consumed_amount == pytest.approx(1200.0)
+
+
+def test_record_allocation_run_takes_filled_values_too(account_id):
+    """Same spelling on the CREATE path, which normally passes zeros."""
+    run = store.record_allocation_run(account_id, "REBALANCE", {},
+                                      filled_buy_value=0.0, filled_sell_value=0.0)
+    assert run.filled_buy_value == 0.0
+    assert run.filled_sell_value == 0.0
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_models.py tests/test_portfolio_allocation_store.py -v -k "filled"`
+
+Expected: FAIL — 5 failures. The model tests fail with
+`AttributeError: 'PortfolioAllocationRun' object has no attribute 'filled_buy_value'` (SQLModel
+`table=True` classes silently DROP an unknown constructor kwarg rather than raising, so the
+failure lands on the read, not the construction — verified:
+`PortfolioAllocationRun(account_id=1, mode='REBALANCE', filled_buy_value=5.0)` constructs and
+`getattr(r, 'filled_buy_value', '<absent>')` returns `<absent>`). The store tests fail with
+`TypeError: finalise_allocation_run() got an unexpected keyword argument 'filled_buy_value'` and
+`TypeError: record_allocation_run() got an unexpected keyword argument 'filled_buy_value'`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+In `packages/common/ba2_common/core/models.py`, replace lines 974-975:
+
+```python
+    filled_buy_value: float = Field(default=0.0, description="Sum of filled_qty * open_price over this run's BUY orders, measured after refresh_orders")
+    filled_sell_value: float = Field(default=0.0, description="Sum of filled_qty * open_price over this run's SELL orders, measured after refresh_orders")
+```
+
+and replace lines 981-984:
+
+```python
+    @property
+    def net_buy_value(self) -> float:
+        """``max(0, filled buys - filled sells)`` -- what this run consumes from the ledger."""
+        return max(0.0, (self.filled_buy_value or 0.0) - (self.filled_sell_value or 0.0))
+```
+
+and insert this paragraph into the class docstring, immediately after the
+`plan_json` paragraph that ends `...consumes no income.` (`models.py:940`):
+
+```
+    ``filled_buy_value`` / ``filled_sell_value`` are FILLED money, never intended
+    money: ``filled_qty * open_price`` summed over the run's own MARKET orders
+    AFTER ``account.refresh_orders()`` has brought the broker's truth back. An
+    order that was submitted and then rejected, or that never filled, is worth
+    exactly 0 here. They were called ``submitted_*`` until the rename, and the old
+    spelling was a money bug: consuming the income ledger against value that was
+    only ever INTENDED marks a dividend spent when nothing was bought, and the
+    ``income_consumed_at`` stamp makes that permanent.
+```
+
+In `packages/common/ba2_common/core/portfolio_allocation_store.py`, replace the
+`record_allocation_run` docstring sentence at lines 573-574:
+
+```
+    The live service calls this BEFORE submitting, with zero values, so the run id
+    exists to stamp into every order comment; it then refreshes the orders from the
+    broker and calls ``finalise_allocation_run`` with what actually FILLED.
+```
+
+and the `finalise_allocation_run` opening line (line 610):
+
+```
+    """Close out a run: write what it FILLED AND spend the income ledger, atomically.
+```
+
+and its second paragraph (lines 616-619):
+
+```
+    Both totals are RESTATED wholesale, never merged: they are the final tally of a
+    finished submission loop as measured from the broker's own fills, and ``None``
+    is rejected rather than read as "leave unchanged" -- a missing money figure
+    would silently understate ``net_buy_value`` and so under-consume the ledger.
+    They are FILLED value: see ``PortfolioAllocationRun``.
+```
+
+Then rename the identifiers everywhere else mechanically:
+
+```bash
+perl -pi -e 's/\bsubmitted_buy_value\b/filled_buy_value/g; s/\bsubmitted_sell_value\b/filled_sell_value/g' \
+  packages/common/ba2_common/core/portfolio_allocation_store.py \
+  packages/common/ba2_common/core/portfolio_allocation.py \
+  ba2_trade_platform/core/portfolio_allocation_service.py \
+  tests/test_portfolio_allocation_store.py \
+  tests/test_portfolio_allocation_submit.py \
+  alembic/versions/f1c8a24b7e05_add_portfolio_allocation_tables.py \
+  docs/superpowers/specs/2026-08-20-portfolio-allocation-design.md
+```
+
+That sweep also renames the two keys in engine-ui's `blocked` early-return inside
+`run_allocation`. That is intended; Task 100 then adds `settled` / `working_order_ids` to the same
+branch. **It must not disturb the branch itself** — confirm with:
+
+```bash
+grep -n "blocked" ba2_trade_platform/core/portfolio_allocation_service.py
+```
+
+which must still show the `blocked=True` early return and the `"blocked": False` success key.
+
+Then fix the one spec sentence the rename left semantically stale — replace
+`docs/superpowers/specs/2026-08-20-portfolio-allocation-design.md:231-232`:
+
+```
+  `created_at`. The `plan_json` snapshot makes a dry-run reproducible after the
+  weights change, and `filled_buy_value` — measured from the broker's fills after
+  submission, not from the plan's intent — is what drives income consumption.
+```
+
+In `alembic/versions/f1c8a24b7e05_add_portfolio_allocation_tables.py`, append this
+paragraph to the module docstring, directly after the existing "Amended before ever
+being applied…" paragraph (lines 20-26):
+
+```
+Amended a SECOND time, on the same grounds (still unapplied; nothing chains off
+it), to rename portfolio_allocation_run.submitted_buy_value /
+submitted_sell_value to filled_buy_value / filled_sell_value. The columns hold
+what the broker FILLED, not what the platform submitted, and the income ledger is
+spent against them. A developer database that `init_db()` built with create_all
+on an older checkout has the OLD column names and would be skipped by
+_create_table_if_absent, so _rename_column_if_present fixes it up in place.
+```
+
+add this helper next to the other two guards (after `_create_index_if_absent`,
+around line 145):
+
+```python
+def _rename_column_if_present(table_name: str, old_name: str, new_name: str) -> None:
+    """Rename a column that an older create_all left behind under its old name.
+
+    Converges the three states this revision can meet: table absent (nothing to
+    do -- the CREATE above already used the new name), table present with the new
+    name (nothing to do), table present with the OLD name (rename it). Anything
+    else is a schema we do not recognise and must not guess at.
+
+    batch_alter_table because SQLite has no ALTER COLUMN: alembic copies the table
+    and its indexes. Only ever reached on a developer database.
+    """
+    inspector = sa.inspect(op.get_bind())
+    if not inspector.has_table(table_name):
+        return
+    names = {column["name"] for column in inspector.get_columns(table_name)}
+    if new_name in names:
+        print(f"[pf-allocation] {table_name}.{new_name} already named correctly -- skipped")
+        return
+    if old_name not in names:
+        raise RuntimeError(
+            f"{table_name} has neither {old_name} nor {new_name}; refusing to guess")
+    with op.batch_alter_table(table_name, schema=None) as batch_op:
+        batch_op.alter_column(old_name, new_column_name=new_name,
+                              existing_type=sa.Float(), existing_nullable=False)
+    print(f"[pf-allocation] renamed {table_name}.{old_name} -> {new_name}")
+```
+
+and call it at the very end of `upgrade()`, after the three
+`ix_portfolio_allocation_run_*` index calls:
+
+```python
+    _rename_column_if_present("portfolio_allocation_run",
+                              "submitted_buy_value", "filled_buy_value")
+    _rename_column_if_present("portfolio_allocation_run",
+                              "submitted_sell_value", "filled_sell_value")
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run each file separately:
+
+```bash
+venv/bin/python -m pytest tests/test_portfolio_allocation_models.py -v
+venv/bin/python -m pytest tests/test_portfolio_allocation_store.py -v
+venv/bin/python -m pytest tests/test_portfolio_allocation_migration.py -v
+venv/bin/python -m pytest tests/test_portfolio_allocation_submit.py -v
+venv/bin/python -m pytest packages/common/tests/test_portfolio_allocation.py -v
+```
+
+Expected: PASS on all five. `test_portfolio_allocation_migration.py` is the one that matters
+most — it runs alembic's own autogenerate comparator over the migrated database against
+`SQLModel.metadata` and asserts ZERO differences, so it is what proves the model rename and the
+migration rename agree.
+
+Then prove nothing was missed — this must print nothing at all:
+
+```bash
+grep -rn "submitted_buy_value\|submitted_sell_value" --include="*.py" \
+  ba2_trade_platform packages tests alembic
+```
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add packages/common/ba2_common/core/models.py \
+        packages/common/ba2_common/core/portfolio_allocation_store.py \
+        packages/common/ba2_common/core/portfolio_allocation.py \
+        ba2_trade_platform/core/portfolio_allocation_service.py \
+        alembic/versions/f1c8a24b7e05_add_portfolio_allocation_tables.py \
+        docs/superpowers/specs/2026-08-20-portfolio-allocation-design.md \
+        tests/test_portfolio_allocation_models.py \
+        tests/test_portfolio_allocation_store.py \
+        tests/test_portfolio_allocation_submit.py
+git commit -m "refactor(allocation): rename the run's money columns submitted_* -> filled_*"
+```
+
+---
+
+### Task 98: `measure_filled_values` — turn broker fills into the two totals. Pure.
+
+> Runs after Task 97 and after engine-ui's appends to the same module
+> (`REASON_FRACTIONAL_UNKNOWN`, `unmet_notional`, `projected_value`, `fractional_summary`,
+> `no_order_rows`, `whole_share_notice`, `no_order_notice`). This task APPENDS below them and
+> touches none of them.
+
+The arithmetic that decides how much income a run may spend must be unit-testable without a
+broker, a DB or a NiceGUI client, exactly like `consume_income_events`
+(`packages/common/ba2_common/core/portfolio_allocation.py:1110`) already is. This task adds the
+value object (`OrderFill`), the settled-status set, and `measure_filled_values`; Task 100 does the
+IO around it.
+
+Three rules carry all the money risk, so they live here where they can be pinned:
+
+1. **A fill is `filled_qty * open_price`, full stop.** No fallback to the plan's quote and no
+   fallback to `estimated_value`. The project rule is explicit
+   (`CLAUDE.md`, "Live Data - No Fallbacks"), and here a fallback would resurrect precisely the
+   bug being fixed. An order that reports a fill but carries no price is *unmeasurable*, not
+   *worth its estimate*.
+2. **Settled is not the same as terminal.** `OrderStatus.get_terminal_statuses()`
+   (`packages/common/ba2_common/core/types.py:111-119`) omits `FILLED`, which is the single most
+   common settled state. `DONE_FOR_DAY` and `WASHTRADE_LOCKED` also never fill again. `UNKNOWN`
+   is deliberately NOT settled — "we do not know" is not "it is over". **`DONE_FOR_DAY` counting
+   as settled is user decision D5**; the question is closed, and it is one member of a frozenset
+   if it ever needs reversing.
+3. **A partial fill contributes its filled part AND blocks the stamp.** The value is real, so it
+   belongs in the totals for the audit row; the order can still fill more, so the ledger must not
+   be spent yet.
+
+`FilledTotals`' two list fields use `field(default_factory=list)`. A bare `= []` on a dataclass
+field raises `ValueError: mutable default <class 'list'> for field working_order_ids is not
+allowed` at import time — and if it did not, every `FilledTotals()` would share one list.
+
+**Files:**
+- Modify: `packages/common/ba2_common/core/portfolio_allocation.py` (append at end of file; add to `__all__`)
+- Test: `packages/common/tests/test_portfolio_allocation.py` (append)
+
+- [ ] **Step 1: Write the failing test**
+
+Append to `packages/common/tests/test_portfolio_allocation.py`:
+
+```python
+# ---------------------------------------------------------------------------
+# measure_filled_values -- FILLED money, and whether the answer is final
+# ---------------------------------------------------------------------------
+
+from ba2_common.core.portfolio_allocation import (  # noqa: E402
+    SETTLED_ORDER_STATUSES, FilledTotals, OrderFill, measure_filled_values,
+)
+from ba2_common.core.types import OrderStatus  # noqa: E402
+
+
+def _fill(order_id, side, status, qty=0.0, price=None):
+    return OrderFill(order_id=order_id, side=side, status=status,
+                     filled_quantity=qty, fill_price=price)
+
+
+def test_a_filled_buy_is_worth_its_filled_quantity_times_its_fill_price():
+    totals = measure_filled_values([
+        _fill(1, OrderDirection.BUY, OrderStatus.FILLED, qty=10.0, price=161.25)])
+    assert totals.buy_value == pytest.approx(1612.5)
+    assert totals.sell_value == 0.0
+    assert totals.settled is True
+    assert totals.net_buy_value == pytest.approx(1612.5)
+
+
+def test_a_rejected_order_is_worth_nothing_and_is_settled():
+    """THE bug. A rejected order used to consume income at its planned value."""
+    totals = measure_filled_values([
+        _fill(1, OrderDirection.BUY, OrderStatus.REJECTED, qty=0.0, price=None)])
+    assert totals.buy_value == 0.0
+    assert totals.settled is True
+    assert totals.working_order_ids == []
+
+
+def test_a_canceled_order_that_never_filled_is_worth_nothing():
+    totals = measure_filled_values([
+        _fill(1, OrderDirection.BUY, OrderStatus.CANCELED, qty=0.0, price=None)])
+    assert totals.buy_value == 0.0
+    assert totals.settled is True
+
+
+def test_an_order_that_errored_before_reaching_the_broker_is_worth_nothing():
+    """AccountInterface.py:148 stamps ERROR on a hard submit failure."""
+    totals = measure_filled_values([
+        _fill(1, OrderDirection.BUY, OrderStatus.ERROR)])
+    assert totals.buy_value == 0.0
+    assert totals.settled is True
+
+
+def test_a_washtrade_locked_order_is_settled_and_worth_nothing():
+    """Our own gate: never sent, so it is as final as an order gets."""
+    totals = measure_filled_values([
+        _fill(1, OrderDirection.BUY, OrderStatus.WASHTRADE_LOCKED)])
+    assert totals.settled is True
+    assert totals.buy_value == 0.0
+
+
+def test_done_for_day_is_settled_per_decision_d5():
+    """The broker sends no further update today, so an unfilled residue never
+    fills; waiting would strand this run's income overnight."""
+    totals = measure_filled_values([
+        _fill(1, OrderDirection.BUY, OrderStatus.DONE_FOR_DAY, qty=6.0, price=100.0)])
+    assert totals.settled is True
+    assert totals.buy_value == pytest.approx(600.0)
+
+
+def test_a_partial_fill_contributes_only_the_filled_part_and_blocks_settlement():
+    totals = measure_filled_values([
+        _fill(1, OrderDirection.BUY, OrderStatus.PARTIALLY_FILLED, qty=3.0, price=100.0)])
+    assert totals.buy_value == pytest.approx(300.0)
+    assert totals.settled is False
+    assert totals.working_order_ids == [1]
+
+
+def test_a_partial_fill_that_was_then_canceled_is_settled_at_the_filled_part():
+    """Cancelled after a partial: the 3 shares are real and nothing more is coming."""
+    totals = measure_filled_values([
+        _fill(1, OrderDirection.BUY, OrderStatus.CANCELED, qty=3.0, price=100.0)])
+    assert totals.buy_value == pytest.approx(300.0)
+    assert totals.settled is True
+
+
+def test_a_still_working_order_blocks_settlement():
+    for status in (OrderStatus.PENDING, OrderStatus.NEW, OrderStatus.ACCEPTED,
+                   OrderStatus.HELD, OrderStatus.WAITING_TRIGGER, OrderStatus.UNKNOWN):
+        totals = measure_filled_values([_fill(1, OrderDirection.BUY, status)])
+        assert totals.settled is False, status
+        assert totals.working_order_ids == [1], status
+
+
+def test_sells_and_buys_are_kept_apart_and_net_is_clamped_at_zero():
+    totals = measure_filled_values([
+        _fill(1, OrderDirection.BUY, OrderStatus.FILLED, qty=10.0, price=100.0),
+        _fill(2, OrderDirection.SELL, OrderStatus.FILLED, qty=5.0, price=400.0),
+    ])
+    assert totals.buy_value == pytest.approx(1000.0)
+    assert totals.sell_value == pytest.approx(2000.0)
+    assert totals.net_buy_value == 0.0
+    assert totals.settled is True
+
+
+def test_a_negative_broker_quantity_is_normalised_by_side_not_by_sign():
+    """abs() + `side` is the canonical signed-field normalisation at this boundary,
+    the same rule OrderImpact.bp_cost applies to change_in_buying_power. A broker
+    that reports a sell as filled_qty=-5 must still book 5 shares SOLD."""
+    totals = measure_filled_values([
+        _fill(1, OrderDirection.SELL, OrderStatus.FILLED, qty=-5.0, price=400.0)])
+    assert totals.sell_value == pytest.approx(2000.0)
+    assert totals.buy_value == 0.0
+
+
+def test_a_fill_with_no_price_is_unmeasurable_never_estimated():
+    """No fallback to the plan's quote: a priceless fill must stall the ledger, not
+    be guessed at. Guessing is how the platform spends money it did not spend."""
+    totals = measure_filled_values([
+        _fill(1, OrderDirection.BUY, OrderStatus.FILLED, qty=10.0, price=None)])
+    assert totals.buy_value == 0.0
+    assert totals.settled is False
+    assert totals.unmeasurable_order_ids == [1]
+
+
+def test_a_fill_with_a_zero_price_is_unmeasurable_too():
+    totals = measure_filled_values([
+        _fill(1, OrderDirection.BUY, OrderStatus.FILLED, qty=10.0, price=0.0)])
+    assert totals.settled is False
+    assert totals.unmeasurable_order_ids == [1]
+
+
+def test_a_fill_with_no_side_is_unmeasurable():
+    totals = measure_filled_values([
+        _fill(1, None, OrderStatus.FILLED, qty=10.0, price=100.0)])
+    assert totals.buy_value == 0.0
+    assert totals.settled is False
+    assert totals.unmeasurable_order_ids == [1]
+
+
+def test_a_missing_order_row_reads_as_status_none_and_blocks_settlement():
+    """The live collector emits this for an order id whose row has vanished. It is
+    a real inconsistency; stalling is the only safe answer."""
+    totals = measure_filled_values([_fill(1, None, None)])
+    assert totals.settled is False
+    assert totals.working_order_ids == [1]
+
+
+def test_measuring_no_orders_at_all_is_settled_and_worth_nothing():
+    """A run whose every row was skipped. Settled, zero, consumes nothing."""
+    totals = measure_filled_values([])
+    assert totals == FilledTotals()
+    assert totals.settled is True
+    assert totals.net_buy_value == 0.0
+
+
+def test_two_filled_totals_do_not_share_their_lists():
+    """field(default_factory=list), not `= []`. A bare list default is a dataclass
+    ValueError at import; if it somehow were not, every run would append into one
+    shared list and every run would look unsettled."""
+    first, second = FilledTotals(), FilledTotals()
+    first.working_order_ids.append(1)
+    assert second.working_order_ids == []
+
+
+def test_a_sub_epsilon_filled_quantity_is_not_a_fill():
+    totals = measure_filled_values([
+        _fill(1, OrderDirection.BUY, OrderStatus.FILLED, qty=1e-12, price=100.0)])
+    assert totals.buy_value == 0.0
+    assert totals.settled is True
+    assert totals.unmeasurable_order_ids == []
+
+
+def test_settled_statuses_cover_every_terminal_status_plus_filled():
+    assert OrderStatus.get_terminal_statuses() <= SETTLED_ORDER_STATUSES
+    assert OrderStatus.FILLED in SETTLED_ORDER_STATUSES
+    assert OrderStatus.DONE_FOR_DAY in SETTLED_ORDER_STATUSES
+    assert OrderStatus.WASHTRADE_LOCKED in SETTLED_ORDER_STATUSES
+    assert OrderStatus.PARTIALLY_FILLED not in SETTLED_ORDER_STATUSES
+    assert OrderStatus.UNKNOWN not in SETTLED_ORDER_STATUSES
+
+
+def test_filled_totals_to_dict_is_json_safe():
+    totals = measure_filled_values([
+        _fill(1, OrderDirection.BUY, OrderStatus.FILLED, qty=2.0, price=50.0),
+        _fill(2, OrderDirection.SELL, OrderStatus.PENDING),
+    ])
+    assert json.loads(json.dumps(totals.to_dict())) == {
+        "buy_value": 100.0, "sell_value": 0.0, "net_buy_value": 100.0,
+        "settled": False, "working_order_ids": [2], "unmeasurable_order_ids": [],
+    }
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `venv/bin/python -m pytest packages/common/tests/test_portfolio_allocation.py -v -k "filled or settled"`
+
+Expected: FAIL at collection with
+`ImportError: cannot import name 'SETTLED_ORDER_STATUSES' from 'ba2_common.core.portfolio_allocation'`
+
+- [ ] **Step 3: Write minimal implementation**
+
+In `packages/common/ba2_common/core/portfolio_allocation.py`, change the types import at line 30
+from `from ba2_common.core.types import OrderDirection` to:
+
+```python
+from ba2_common.core.types import OrderDirection, OrderStatus
+```
+
+add these names to the `"# engine"` block of `__all__` (after `"consume_income_events",`):
+
+```python
+    # filled-value measurement (the income ledger's input)
+    "SETTLED_ORDER_STATUSES", "OrderFill", "FilledTotals", "measure_filled_values",
+```
+
+and append at the end of the file:
+
+```python
+# ---------------------------------------------------------------------------
+# What a run ACTUALLY filled. Pure -- the live service does the IO around it.
+# ---------------------------------------------------------------------------
+
+#: Statuses after which a TradingOrder can never fill any further.
+#:
+#: ``OrderStatus.get_terminal_statuses()`` (types.py:111) is the broker-side
+#: "will not change anymore" set -- CLOSED / REJECTED / CANCELED / EXPIRED /
+#: STOPPED / ERROR / REPLACED. Three more belong here for the ledger's purposes:
+#:
+#:   FILLED            complete by definition, and NOT in the terminal set.
+#:   DONE_FOR_DAY      the broker will send no further update today, so an
+#:                     unfilled residue never fills; waiting on it would wedge
+#:                     the run's income overnight. (User decision D5.)
+#:   WASHTRADE_LOCKED  our own gate. The order was never sent, so it is as final
+#:                     as an order can be, and it is worth exactly 0.
+#:
+#: UNKNOWN is deliberately ABSENT. "We do not know what this order did" is not
+#: "this order is over", and the difference is whether income gets spent.
+SETTLED_ORDER_STATUSES = frozenset(OrderStatus.get_terminal_statuses()) | {
+    OrderStatus.FILLED,
+    OrderStatus.DONE_FOR_DAY,
+    OrderStatus.WASHTRADE_LOCKED,
+}
+
+
+@dataclass(frozen=True)
+class OrderFill:
+    """One order's fill facts, lifted off a ``TradingOrder`` row.
+
+    Plain values, not an ORM row, so this stays IO-free and unit-testable -- the
+    same contract ``consume_income_events`` uses for the ledger.
+
+    ``status=None`` is the live collector's spelling for "that order id has no row
+    any more", which is an inconsistency, not an emptiness: it is treated as still
+    working so the run stalls instead of quietly consuming income.
+    """
+    order_id: int
+    side: Optional[OrderDirection] = None
+    status: Optional[OrderStatus] = None
+    filled_quantity: float = 0.0
+    fill_price: Optional[float] = None
+
+
+@dataclass
+class FilledTotals:
+    """What a run's orders REALLY moved, and whether that answer is final.
+
+    ``settled`` is the gate on income consumption. False means at least one order
+    can still fill (or could not be valued), so the ledger must NOT be spent yet --
+    ``finalise_allocation_run(..., orders_settled=False)`` records the totals and
+    leaves ``income_consumed_at`` NULL, which keeps the run in
+    ``get_unconsumed_runs()`` where a later reconcile pass picks it up. With ~25%
+    of symbols non-fractionable and the ADJUST path creating WAITING_TRIGGER
+    orders, False is the COMMON outcome, not an edge case (user decision D3), so
+    ``settled`` and ``working_order_ids`` are user-facing facts, not just logging.
+
+    Both list fields use ``field(default_factory=list)``: a bare ``= []`` default
+    is a dataclass ``ValueError`` at import, and would otherwise share one list
+    across every instance.
+    """
+    buy_value: float = 0.0
+    sell_value: float = 0.0
+    settled: bool = True
+    working_order_ids: List[int] = field(default_factory=list)
+    unmeasurable_order_ids: List[int] = field(default_factory=list)
+
+    @property
+    def net_buy_value(self) -> float:
+        """``max(0, filled buys - filled sells)``, mirroring the model property."""
+        return max(0.0, self.buy_value - self.sell_value)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """JSON-safe, for the activity log's data blob and the income panel's copy."""
+        return {
+            "buy_value": self.buy_value,
+            "sell_value": self.sell_value,
+            "net_buy_value": self.net_buy_value,
+            "settled": self.settled,
+            "working_order_ids": list(self.working_order_ids),
+            "unmeasurable_order_ids": list(self.unmeasurable_order_ids),
+        }
+
+
+def measure_filled_values(fills: List[OrderFill]) -> FilledTotals:
+    """Sum what a run's orders actually filled, and say whether that is final. Pure.
+
+    Value is ``abs(filled_quantity) * fill_price``, with the DIRECTION taken from
+    ``side`` -- the same signed-field normalisation ``OrderImpact.bp_cost`` applies
+    to the broker's ``change_in_buying_power``. Never infer a sell from a negative
+    quantity: ``side`` is the fact, the sign is a broker convention.
+
+    There is NO fallback to a planned price or an estimated value: an order
+    reporting a fill it cannot price is UNMEASURABLE, and unmeasurable stalls the
+    ledger rather than guessing. Guessing is the bug this function exists to kill --
+    income consumed against money that was only ever intended, made permanent by
+    the one-shot ``income_consumed_at``.
+
+    A partial fill counts its filled part (that money moved) AND blocks settlement
+    (more can still move). A rejected, cancelled, errored or wash-trade-locked
+    order contributes zero and is settled.
+
+    Args:
+        fills: one entry per EXECUTION order of the run. The caller is responsible
+            for having excluded protective TP/SL legs -- see
+            ``portfolio_allocation_service.collect_order_fills``.
+
+    Returns:
+        FilledTotals: buy/sell money, plus ``settled`` and the two id lists that
+        explain a False. Empty input is settled and worth zero: a run whose every
+        row was skipped consumes nothing, which is correct, not a stall.
+    """
+    totals = FilledTotals()
+    for fill in fills or []:
+        if fill.status not in SETTLED_ORDER_STATUSES:
+            totals.settled = False
+            totals.working_order_ids.append(fill.order_id)
+
+        quantity = float(fill.filled_quantity or 0.0)
+        if abs(quantity) <= QUANTITY_EPSILON:
+            continue
+
+        price = fill.fill_price
+        if fill.side is None or price is None or float(price) <= 0:
+            totals.settled = False
+            totals.unmeasurable_order_ids.append(fill.order_id)
+            continue
+
+        value = abs(quantity) * float(price)
+        if fill.side == OrderDirection.BUY:
+            totals.buy_value += value
+        elif fill.side == OrderDirection.SELL:
+            totals.sell_value += value
+    return totals
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `venv/bin/python -m pytest packages/common/tests/test_portfolio_allocation.py -v`
+
+Expected: PASS — the 20 new tests pass alongside the existing engine tests.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add packages/common/ba2_common/core/portfolio_allocation.py \
+        packages/common/tests/test_portfolio_allocation.py
+git commit -m "feat(allocation): measure_filled_values - filled money, and whether it is final"
+```
+
+---
+
+### Task 99: `finalise_allocation_run` refuses to spend the ledger while orders are still working
+
+> Runs after Task 97 (which renamed this function's kwargs) and Task 98.
+
+`finalise_allocation_run` currently consumes unconditionally
+(`portfolio_allocation_store.py:689-692`). Once Task 100 feeds it FILLED value, an order still
+working at the broker would be worth 0 at finalise time — and the one-shot stamp would make that
+zero permanent. That is the reported bug with its sign flipped: instead of spending income that
+was never deployed, the platform would leave income open that IS about to be deployed, and the
+next run would spend it a second time. Both directions are unrecoverable once stamped.
+
+**The decision, and why (user decision D3).** A still-working order contributes ZERO *and does not
+stamp*. The totals and `order_ids` are still written (the audit row must record what went out), but
+`income_consumed_at` stays NULL, so the run remains in `get_unconsumed_runs()` —
+the recovery view that already exists and is already documented for exactly this
+(`portfolio_allocation_store.py:712-723`, *"a row here submitted orders (or died trying) but its
+`income_consumed_at` is still NULL"*). A later reconcile pass re-finalises it, at which point the
+orders have settled and the ledger is spent against real fills. The rejected alternative —
+*finalisation waits* — needs a poll loop or a background job to sit on the UI thread while the
+market moves, which is out of scope and worse.
+
+**This path is the ordinary one, not the exception.** A rebalance that trims held positions
+creates a `WAITING_TRIGGER` MARKET partial-close order (`TransactionHelper.py:733`) that submits
+only once TradeManager notices the TP/SL cancel landed, so it is normal for a run to finish
+`settled=False`. That is why Task 101 wires the drain to the income panel's Refresh and shows the
+user how many orders are outstanding, instead of leaving the fact in the log.
+
+**`BEGIN IMMEDIATE` stays first, unconditionally, on both paths.** The deferred path still writes
+the totals, and the whole point of `_begin_write_transaction`
+(`portfolio_allocation_store.py:526-551`) is that the lock is taken before the first READ, not
+before the first write. Its own docstring records what happens without it — two concurrent
+finalisers both read a NULL stamp and both spend, silently, in four trials out of five. **Do not
+make the lock conditional and do not move it below the first `select`.**
+
+**Files:**
+- Modify: `packages/common/ba2_common/core/portfolio_allocation_store.py:606-734`
+- Test: `tests/test_portfolio_allocation_store.py` (append)
+
+- [ ] **Step 1: Write the failing test**
+
+Append to `tests/test_portfolio_allocation_store.py`:
+
+```python
+# --- deferred finalisation: orders still working at the broker ---------------
+
+def test_finalising_with_unsettled_orders_records_totals_but_spends_nothing(account_id):
+    """An order still working is worth 0 right now, and 0 must not be STAMPED as
+    the final answer -- the stamp is one-shot, so it would strand the income."""
+    store.upsert_income_event(account_id, "dep-1", date(2026, 8, 1), "DEPOSIT", 5000.0)
+    run = store.record_allocation_run(account_id, "REBALANCE", {})
+
+    finalised = store.finalise_allocation_run(
+        run.id, filled_buy_value=0.0, filled_sell_value=0.0,
+        order_ids=[101, 102], orders_settled=False)
+
+    assert finalised.order_ids == [101, 102]
+    assert finalised.income_consumed_at is None
+    assert finalised.is_income_consumed is False
+    assert finalised.income_consumed_amount == 0.0
+    assert store.get_open_income_total(account_id) == pytest.approx(5000.0)
+
+
+def test_a_deferred_run_records_the_part_that_did_fill(account_id):
+    """A partial fill is real money and belongs in the audit row even though the
+    ledger is not spent yet."""
+    run = store.record_allocation_run(account_id, "REBALANCE", {})
+
+    finalised = store.finalise_allocation_run(
+        run.id, filled_buy_value=640.0, filled_sell_value=0.0,
+        order_ids=[101], orders_settled=False)
+
+    assert finalised.filled_buy_value == pytest.approx(640.0)
+    assert finalised.is_income_consumed is False
+
+
+def test_a_deferred_run_stays_in_the_recovery_view(account_id):
+    run = store.record_allocation_run(account_id, "REBALANCE", {})
+    store.finalise_allocation_run(run.id, filled_buy_value=0.0, filled_sell_value=0.0,
+                                  order_ids=[101], orders_settled=False)
+    assert [r.id for r in store.get_unconsumed_runs(account_id)] == [run.id]
+
+
+def test_a_deferred_run_consumes_when_it_is_finalised_again_as_settled(account_id):
+    """The recovery path. Same run, re-measured once its orders settled."""
+    store.upsert_income_event(account_id, "dep-1", date(2026, 8, 1), "DEPOSIT", 5000.0)
+    run = store.record_allocation_run(account_id, "REBALANCE", {})
+    store.finalise_allocation_run(run.id, filled_buy_value=0.0, filled_sell_value=0.0,
+                                  order_ids=[101], orders_settled=False)
+
+    settled = store.finalise_allocation_run(
+        run.id, filled_buy_value=1600.0, filled_sell_value=0.0,
+        order_ids=[101], orders_settled=True)
+
+    assert settled.income_consumed_amount == pytest.approx(1600.0)
+    assert settled.filled_buy_value == pytest.approx(1600.0)
+    assert store.get_open_income_total(account_id) == pytest.approx(3400.0)
+    assert store.get_unconsumed_runs(account_id) == []
+
+
+def test_a_deferred_run_that_ends_up_filling_nothing_consumes_nothing(account_id):
+    """Deferred, then every order came back rejected. Zero is now the TRUE answer,
+    so it is stamped -- the run leaves the recovery view having spent nothing."""
+    store.upsert_income_event(account_id, "dep-1", date(2026, 8, 1), "DEPOSIT", 5000.0)
+    run = store.record_allocation_run(account_id, "REBALANCE", {})
+    store.finalise_allocation_run(run.id, filled_buy_value=0.0, filled_sell_value=0.0,
+                                  order_ids=[101], orders_settled=False)
+
+    settled = store.finalise_allocation_run(
+        run.id, filled_buy_value=0.0, filled_sell_value=0.0,
+        order_ids=[101], orders_settled=True)
+
+    assert settled.is_income_consumed is True
+    assert settled.income_consumed_amount == 0.0
+    assert store.get_open_income_total(account_id) == pytest.approx(5000.0)
+    assert store.get_unconsumed_runs(account_id) == []
+
+
+def test_deferring_never_un_consumes_an_already_consumed_run(account_id):
+    """A run that already spent must not be re-opened by a late 'still working'
+    report. The replay guard outranks the settled flag."""
+    store.upsert_income_event(account_id, "dep-1", date(2026, 8, 1), "DEPOSIT", 5000.0)
+    run = store.record_allocation_run(account_id, "REBALANCE", {})
+    store.finalise_allocation_run(run.id, filled_buy_value=1600.0, filled_sell_value=0.0,
+                                  order_ids=[101])
+
+    again = store.finalise_allocation_run(
+        run.id, filled_buy_value=1600.0, filled_sell_value=0.0,
+        order_ids=[101], orders_settled=False)
+
+    assert again.is_income_consumed is True
+    assert again.income_consumed_amount == pytest.approx(1600.0)
+    assert store.get_open_income_total(account_id) == pytest.approx(3400.0)
+
+
+def test_orders_settled_defaults_to_true(account_id):
+    """Every existing caller keeps its meaning: pass nothing, consume as before."""
+    import inspect
+    signature = inspect.signature(store.finalise_allocation_run)
+    assert signature.parameters["orders_settled"].default is True
+
+
+def test_the_deferred_path_still_takes_the_write_lock_before_reading(account_id, monkeypatch):
+    """BEGIN IMMEDIATE is not conditional on consuming. The deferred path still
+    does a check-then-act (read the stamp, write the totals), and dropping the lock
+    for it would reopen the exact race _begin_write_transaction closes."""
+    calls = []
+    original = store._begin_write_transaction
+
+    def spy(session):
+        calls.append(True)
+        return original(session)
+
+    monkeypatch.setattr(store, "_begin_write_transaction", spy)
+    run = store.record_allocation_run(account_id, "REBALANCE", {})
+
+    store.finalise_allocation_run(run.id, filled_buy_value=0.0, filled_sell_value=0.0,
+                                  order_ids=[], orders_settled=False)
+
+    assert calls == [True]
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_store.py -v -k "defer or unsettled or orders_settled or recovery_view"`
+
+Expected: FAIL — 8 failures, all
+`TypeError: finalise_allocation_run() got an unexpected keyword argument 'orders_settled'`
+(`test_orders_settled_defaults_to_true` fails differently, with
+`KeyError: 'orders_settled'`).
+
+- [ ] **Step 3: Write minimal implementation**
+
+In `packages/common/ba2_common/core/portfolio_allocation_store.py`, replace the signature at
+lines 606-609:
+
+```python
+def finalise_allocation_run(run_id: int, *,
+                            filled_buy_value: float,
+                            filled_sell_value: float,
+                            order_ids: List[int],
+                            orders_settled: bool = True) -> PortfolioAllocationRun:
+```
+
+insert this section into the docstring immediately before the `**Idempotent per run.**`
+paragraph:
+
+```
+    **``orders_settled=False`` records the run WITHOUT spending the ledger.** Pass
+    it when at least one of the run's orders can still fill, so its filled value is
+    not final yet. The totals and ``order_ids`` are written, but
+    ``income_consumed_at`` stays NULL and no income is taken -- which leaves the run
+    listed by ``get_unconsumed_runs()``, to be finalised again (as settled) once the
+    broker has decided. This is the ONLY safe answer for a working order: consuming
+    its planned value spends income that was never deployed, and stamping a zero
+    strands income that is about to be, and the one-shot stamp makes either
+    permanent. It never UN-consumes: a run that already spent keeps its stamp and
+    its breakdown regardless of what this flag says. Expect this path OFTEN -- a
+    rebalance that trims positions routinely leaves a WAITING_TRIGGER order behind.
+```
+
+and replace the body from line 665 (`if submitted_buy_value is None ...`, now
+`if filled_buy_value is None ...`) through line 709 (`return row`) with:
+
+```python
+    if filled_buy_value is None or filled_sell_value is None:
+        raise ValueError(
+            f"finalise_allocation_run({run_id}) needs both totals as numbers, got "
+            f"buys={filled_buy_value!r} sells={filled_sell_value!r}; pass 0.0 for "
+            f"'nothing filled'")
+
+    with get_db() as session:
+        # BEGIN IMMEDIATE BEFORE the first read, not just before the first write:
+        # everything below is a check-then-act on money, on BOTH paths. Making this
+        # conditional on `orders_settled` would reopen the double-spend race. See
+        # _begin_write_transaction.
+        _begin_write_transaction(session)
+        row = session.exec(
+            select(PortfolioAllocationRun).where(PortfolioAllocationRun.id == run_id)
+        ).first()
+        if row is None:
+            raise InstanceNotFound(f"PortfolioAllocationRun {run_id} not found")
+        account_id = row.account_id
+        replayed = row.income_consumed_at is not None
+        deferred = not replayed and not orders_settled
+        row.filled_buy_value = float(filled_buy_value)
+        row.filled_sell_value = float(filled_sell_value)
+        row.order_ids = list(order_ids or [])
+        if replayed or deferred:
+            # replayed: the ledger is NOT touched again. The totals above are
+            # re-stated because restating them is harmless; spending twice is not.
+            # deferred: the filled value is not final, so there is nothing correct
+            # to spend yet -- and no stamp, so the run stays recoverable.
+            consumed = [tuple(pair) for pair in (row.income_consumed_events or [])]
+        else:
+            consumed = _apply_income_consumption(session, account_id, row.net_buy_value)
+            row.income_consumed_events = [[event_id, amount] for event_id, amount in consumed]
+            row.income_consumed_at = DateTime.now(timezone.utc)
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        session.expunge(row)
+
+    if replayed:
+        logger.warning(
+            f"Allocation run {run_id} of account {account_id} was finalised again; its "
+            f"totals were re-stated but the income ledger was left alone (it already "
+            f"consumed {row.income_consumed_amount:.2f} from {len(consumed)} event(s))")
+    elif deferred:
+        logger.warning(
+            f"Allocation run {run_id} of account {account_id} recorded filled buys "
+            f"{row.filled_buy_value:.2f} / sells {row.filled_sell_value:.2f} but did NOT "
+            f"consume income: at least one of its {len(row.order_ids)} order(s) can still "
+            f"fill. The run stays in get_unconsumed_runs() and is finalised for real once "
+            f"the broker settles it")
+    else:
+        logger.info(
+            f"Finalised allocation run {run_id} for account {account_id}: filled buys "
+            f"{row.filled_buy_value:.2f} / sells {row.filled_sell_value:.2f}, "
+            f"consumed {row.income_consumed_amount:.2f} from {len(consumed)} income "
+            f"event(s) against a net buy value of {row.net_buy_value:.2f}")
+    return row
+```
+
+Finally, replace the second paragraph of `get_unconsumed_runs`' docstring (lines 715-719) with:
+
+```
+    The recovery view, and it is NOT normally empty. A row here either submitted
+    orders and died before finalising, or was finalised with ``orders_settled=False``
+    because at least one order could still fill -- the ordinary outcome of a
+    rebalance that trims held positions. Either way its ``income_consumed_at`` is
+    NULL, so the income that funded it still shows as unallocated and the NEXT run
+    would spend it a second time.
+    ``portfolio_allocation_service.reconcile_unconsumed_runs()`` drains this list at
+    the start of every run AND on every income-panel refresh; anything that survives
+    several passes wants a human, because only the broker knows what actually went
+    out.
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_store.py -v`
+
+Expected: PASS — the 8 new tests pass and every pre-existing test in the file still passes,
+including `test_finalising_the_same_run_twice_consumes_the_ledger_once` and the two
+`file_backed_db` concurrency tests (which prove `BEGIN IMMEDIATE` survived).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add packages/common/ba2_common/core/portfolio_allocation_store.py \
+        tests/test_portfolio_allocation_store.py
+git commit -m "fix(allocation): never stamp the income ledger while an order can still fill"
+```
+
+---
+
+### Task 100: Refresh from the broker, measure the fills, and consume only those
+
+> Runs after Tasks N1-N3 **and after engine-ui's service gate**. This is an edit of
+> **engine-ui's** `run_allocation`, not of Task 75's: engine-ui already added the market-hours
+> gate, the `blocked` early return and the `blocked` / `blocked_reason` keys. **Both survive this
+> rewrite unchanged in position and meaning** — the gate stays the FIRST statement in the
+> function, above `reconcile_unconsumed_runs`, so a blocked run still writes nothing at all.
+
+This is the fix. Task 75's `summarise_outcomes` prices `OUTCOME_SUBMITTED` rows at
+`row.price * outcome.quantity` — the plan's quote times the quantity that was *sent* — and falls
+back to `row.estimated_value` when there is no price. Both are intent. It is deleted here and
+replaced by: gate → reconcile → record → submit → `refresh_orders` → read the rows back →
+`measure_filled_values` → finalise.
+
+Four live details that the pure function cannot know:
+
+- **Only `OrderType.MARKET` rows among the run's `order_ids` are execution orders.** The ADJUST
+  path returns `orders_created` from `TransactionHelper.adjust_quantity_with_tpsl`, and that list
+  includes the protective legs it rebuilds — `OrderType.OCO`
+  (`packages/common/ba2_common/core/TransactionHelper.py:771`), `SELL_LIMIT`/`BUY_LIMIT` (`:787`)
+  and `SELL_STOP`/`BUY_STOP` (`:809`). Those are not fills, and they sit unfilled for weeks: left
+  in, they would count a stop-loss as a sale AND stall the run's income forever. The execution
+  orders are all MARKET — the new order (`_submit_new_order`), the partial-close order
+  (`TransactionHelper.py:733`) and the add-to-position order (`:864`).
+- **Every outcome's `order_ids` are collected, not just the submitted ones.** A hard submit
+  failure stamps the row `OrderStatus.ERROR` (`AccountInterface.py:148`), which is terminal, so a
+  failed row is worth 0 and settles immediately. Including it costs nothing and buys the case
+  that matters: `submit_order` returned `None` on a response timeout while the broker actually
+  took the order. The refresh finds the fill and the ledger charges for it.
+- **`_close_symbol` must hand back the close order id.** `close_transaction` returns it
+  (`AccountInterface.py:1442`, `:1461`, and the contract at `:1494`), and without it the SELL side
+  of a full close is invisible to the measurement — which would OVERSTATE `net_buy_value` and
+  over-consume income.
+- **`refresh_orders` is not one signature.** `AlpacaAccount.py:2180` takes
+  `(heuristic_mapping=False, fetch_all=True)`, `TastyTradeAccount.py:988` takes `**kwargs`,
+  `IBKRAccount.py:541` takes NOTHING — so a bare `refresh_orders(fetch_all=True)` is a `TypeError`
+  on IBKR. The signature is inspected rather than the `TypeError` caught, because a `TypeError`
+  raised *inside* a broker's refresh must not be mistaken for a signature mismatch and retried.
+  If the refresh fails at all, the totals are forced `settled=False`: consuming income against
+  pre-refresh rows is consuming against stale data.
+
+`reconcile_unconsumed_runs` is the recovery drain. It runs **after** the market gate and **before**
+`record_allocation_run`, so this run's budget reflects reality before it spends from it, while a
+blocked run still touches nothing. Task 101 wires the same function to the income panel, because
+under decision D3 waiting for the next allocation run is too long.
+
+`plan.to_dict()` now carries `unmet_notional` on every row (engine-ui). Leave it there; `plan_json`
+is a verbatim snapshot and the dry run reads it back.
+
+**Files:**
+- Modify: `ba2_trade_platform/core/portfolio_allocation_service.py` (replace `_close_symbol`, delete `summarise_outcomes`, replace `run_allocation`, append the new functions)
+- Test: `tests/test_portfolio_allocation_submit.py` (extend `FakeAccount`, delete 2 tests, replace 4, edit 2, append 13)
+
+- [ ] **Step 1: Write the failing test**
+
+In `tests/test_portfolio_allocation_submit.py`, replace `FakeAccount.__init__`,
+`FakeAccount.submit_order` and `FakeAccount.close_transaction` with the following, and add the
+two new methods. Note that the market-hours attributes engine-ui added now hold a REAL
+`MarketHours`, not a `SimpleNamespace`: the service reads `.is_known` as well as `.is_open`, and a
+fake that cannot answer that is a fake that hides a bug.
+
+```python
+    def __init__(self, account_id: int = 1):
+        self.id = account_id
+        self.positions = []          # list[FakePosition]; None means FETCH FAILED
+        self.prices = {}             # symbol -> float
+        self.margin = {}             # symbol -> MarginInfo
+        self.impacts = {}            # symbol -> OrderImpact
+        self.cash_transfers = []     # list[CashTransfer]
+        self.submitted = []          # [(symbol, side, quantity, comment)]
+        self.closed = []             # [transaction_id]
+        self.reject_quantities = set()
+        self.washtrade_symbols = set()
+        # Market hours: OPEN, from the broker, by default -- so every pre-existing
+        # submission test keeps meaning what it meant. A REAL MarketHours, because
+        # the gate reads .is_known as well as .is_open.
+        self.market_hours = MarketHours(is_open=True, source=MARKET_HOURS_SOURCE_BROKER)
+        self.market_hours_error = None
+        # What the BROKER reports on the next refresh_orders(), by symbol:
+        #   symbol -> (OrderStatus, filled_qty, open_price)
+        # A symbol with no entry is left exactly as submit_order left it, which is
+        # how "still working at the broker" is expressed.
+        self.fills = {}
+        self.refresh_calls = []
+        self.refresh_raises = None   # set to an Exception to simulate an outage
+
+    def get_market_hours(self):
+        if self.market_hours_error is not None:
+            raise self.market_hours_error
+        return self.market_hours
+
+    def _write_order(self, order_id, **fields):
+        """Write broker truth onto our DB row, the way a real refresh does."""
+        from ba2_trade_platform.core.db import get_instance, update_instance
+        row = get_instance(TradingOrder, order_id)
+        if row is None:
+            return
+        for name, value in fields.items():
+            setattr(row, name, value)
+        update_instance(row)
+
+    def submit_order(self, trading_order, tp_price=None, sl_price=None, is_closing_order=False):
+        self.submitted.append((trading_order.symbol, trading_order.side,
+                               trading_order.quantity, trading_order.comment))
+        if trading_order.quantity in self.reject_quantities:
+            trading_order.comment = f"{trading_order.comment or ''} | broker rejected"
+            # AccountInterface.py:148 stamps ERROR on the DB row before returning
+            # None. The fake owes the same, or the row would look "still working".
+            self._write_order(trading_order.id, status=OrderStatus.ERROR,
+                              comment=trading_order.comment)
+            return None
+        if trading_order.symbol in self.washtrade_symbols:
+            trading_order.status = OrderStatus.WASHTRADE_LOCKED
+            self._write_order(trading_order.id, status=OrderStatus.WASHTRADE_LOCKED)
+            return trading_order
+        trading_order.status = OrderStatus.NEW
+        self._write_order(trading_order.id, status=OrderStatus.NEW)
+        return trading_order
+
+    def close_transaction(self, transaction_id):
+        """Persist a real MARKET close order, as the live path does, and return its id."""
+        from ba2_trade_platform.core.db import add_instance, get_instance
+        self.closed.append(transaction_id)
+        txn = get_instance(Transaction, transaction_id)
+        close_order_id = add_instance(TradingOrder(
+            account_id=self.id, symbol=txn.symbol, quantity=abs(txn.quantity or 0.0),
+            side=OrderDirection.SELL, order_type=OrderType.MARKET, good_for='day',
+            status=OrderStatus.NEW, open_type=OrderOpenType.MANUAL,
+            transaction_id=transaction_id, comment="closing order",
+        ))
+        return {'success': True, 'message': 'closed', 'canceled_count': 0,
+                'deleted_count': 0, 'close_order_id': close_order_id}
+
+    def refresh_orders(self, heuristic_mapping=False, fetch_all=False):
+        """Apply self.fills to this account's DB rows, keyed by symbol."""
+        from sqlmodel import select as _select
+        from ba2_trade_platform.core.db import get_db
+        self.refresh_calls.append({'heuristic_mapping': heuristic_mapping,
+                                   'fetch_all': fetch_all})
+        if self.refresh_raises is not None:
+            raise self.refresh_raises
+        with get_db() as session:
+            rows = session.exec(_select(TradingOrder).where(
+                TradingOrder.account_id == self.id)).all()
+            order_ids = [row.id for row in rows]
+            by_id = {row.id: row.symbol for row in rows}
+        for order_id in order_ids:
+            reported = self.fills.get(by_id[order_id])
+            if reported is None:
+                continue
+            status, filled_qty, open_price = reported
+            self._write_order(order_id, status=status, filled_qty=filled_qty,
+                              open_price=open_price)
+        return True
+```
+
+Add to the imports at the top of the file:
+
+```python
+from ba2_trade_platform.core.account_types import (
+    MARKET_HOURS_SOURCE_BROKER, MARKET_HOURS_SOURCE_UNAVAILABLE, MarketHours,
+)
+```
+
+and delete the now-unused `from types import SimpleNamespace` import that engine-ui added —
+`grep -n "SimpleNamespace" tests/test_portfolio_allocation_submit.py` must print nothing when
+this task is done.
+
+In engine-ui's two market-gate tests, replace the `SimpleNamespace` market-hours objects with real
+ones. In `test_run_allocation_refuses_to_submit_while_the_market_is_closed` and in
+`test_run_allocation_blocked_by_a_closed_market_writes_no_run_row`, replace
+
+```python
+    account.market_hours = SimpleNamespace(is_open=False, next_open=None,
+                                           next_close=None, source="broker")
+```
+
+with
+
+```python
+    account.market_hours = MarketHours(is_open=False, source=MARKET_HOURS_SOURCE_BROKER)
+```
+
+Delete `test_summarise_outcomes_counts_only_the_rows_that_were_submitted` and
+`test_summarise_outcomes_uses_the_quantity_that_actually_went_in` — `summarise_outcomes` is being
+deleted, and both of them assert the intent-priced behaviour that is the bug.
+
+Replace `test_run_allocation_persists_a_run_row_carrying_the_plan_and_the_order_ids`,
+`test_run_allocation_partial_failure_records_only_what_was_submitted`,
+`test_run_allocation_consumes_income_up_to_the_net_buy_value` and engine-ui's
+`test_run_allocation_with_an_open_market_is_not_blocked` with:
+
+```python
+def test_run_allocation_persists_a_run_row_carrying_the_plan_and_the_order_ids():
+    account = FakeAccount(account_id=31)
+    account.positions = []
+    account.fills = {"AAPL": (OrderStatus.FILLED, 10.0, 161.0)}
+    row = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
+    row.target_quantity = 10.0
+    plan = AllocationPlan(rows=[row], base_notional=15_000.0,
+                          available_buying_power=10_000.0, total_buy_value=1600.0)
+
+    result = svc.run_allocation(account, plan, {}, make_base(),
+                                mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    with get_db() as session:
+        run = session.exec(select(PortfolioAllocationRun)).one()
+    assert run.id == result["run_id"]
+    assert run.mode == ALLOCATION_MODE_REBALANCE
+    assert run.base_notional == pytest.approx(15_000.0)
+    # 10 @ 161 FILLED -- the FILL price, not the plan's 160 quote.
+    assert run.filled_buy_value == pytest.approx(1610.0)
+    assert run.order_ids == result["outcomes"][0].order_ids
+    assert run.plan_json["rows"][0]["symbol"] == "AAPL"
+
+
+def test_run_allocation_partial_failure_records_only_what_filled():
+    account = FakeAccount(account_id=33)
+    account.positions = []
+    account.reject_quantities = {4.0}
+    account.fills = {"AAPL": (OrderStatus.FILLED, 10.0, 160.0)}
+    ok = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
+    ok.target_quantity = 10.0
+    bad = make_row("NVDA", OrderDirection.BUY, 4.0, 3600.0, 3600.0, price=900.0)
+    bad.target_quantity = 4.0
+    plan = AllocationPlan(rows=[ok, bad], available_buying_power=10_000.0)
+
+    result = svc.run_allocation(account, plan, {}, make_base(),
+                                mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    with get_db() as session:
+        run = session.exec(select(PortfolioAllocationRun)).one()
+    assert run.filled_buy_value == pytest.approx(1600.0)
+    statuses = {o.symbol: o.status for o in result["outcomes"]}
+    assert statuses["AAPL"] == svc.OUTCOME_SUBMITTED
+    assert statuses["NVDA"] == svc.OUTCOME_FAILED
+
+
+def test_run_allocation_consumes_income_up_to_the_filled_net_buy_value():
+    account = FakeAccount(account_id=34)
+    account.positions = []
+    account.fills = {"AAPL": (OrderStatus.FILLED, 10.0, 160.0)}
+    add_instance(PortfolioIncomeEvent(account_id=34, external_id="dep-1",
+                                      event_date=date(2026, 8, 1),
+                                      event_type=CASH_TRANSFER_DEPOSIT, amount=5_000.0))
+    row = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
+    row.target_quantity = 10.0
+    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
+
+    result = svc.run_allocation(account, plan, {}, make_base(),
+                                mode=ALLOCATION_MODE_INVEST_LABEL, scope_label="ARK26")
+
+    assert result["income_consumed"] == pytest.approx(1600.0)
+    assert svc.get_open_income_total(34) == pytest.approx(3_400.0)
+
+
+def test_run_allocation_with_an_open_market_is_not_blocked():
+    account = FakeAccount(account_id=58)
+    account.positions = []
+    account.fills = {"AAPL": (OrderStatus.FILLED, 1.0, 160.0)}
+    plan = AllocationPlan(rows=[make_row("AAPL", OrderDirection.BUY, 1.0, 160.0, 160.0,
+                                         price=160.0)],
+                          available_buying_power=10_000.0)
+
+    result = svc.run_allocation(account, plan, {}, make_base(), mode="REBALANCE")
+
+    assert result["blocked"] is False
+    assert result["blocked_reason"] is None
+    assert result["run_id"] is not None
+    assert result["settled"] is True
+    assert result["filled_buy_value"] == pytest.approx(160.0)
+    assert [s[0] for s in account.submitted] == ["AAPL"]
+```
+
+Append:
+
+```python
+# ---------------------------------------------------------------------------
+# The income ledger consumes FILLED value, never submitted value
+# ---------------------------------------------------------------------------
+
+def test_the_ledger_consumes_only_the_order_that_actually_filled():
+    """THE regression test. Two orders go out and the broker takes both; one fills,
+    the other comes back REJECTED. Priced at plan value (the old behaviour) this
+    consumes 1600 + 3600 = 5200 of a 6000 deposit. Priced at FILLED value it
+    consumes 1600, and the 3600 that was never spent is still there to spend."""
+    account = FakeAccount(account_id=40)
+    account.positions = []
+    account.fills = {
+        "AAPL": (OrderStatus.FILLED, 10.0, 160.0),
+        "NVDA": (OrderStatus.REJECTED, 0.0, None),
+    }
+    add_instance(PortfolioIncomeEvent(account_id=40, external_id="dep-1",
+                                      event_date=date(2026, 8, 1),
+                                      event_type=CASH_TRANSFER_DEPOSIT, amount=6_000.0))
+    good = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
+    good.target_quantity = 10.0
+    doomed = make_row("NVDA", OrderDirection.BUY, 4.0, 3600.0, 3600.0, price=900.0)
+    doomed.target_quantity = 4.0
+    plan = AllocationPlan(rows=[good, doomed], available_buying_power=10_000.0)
+
+    result = svc.run_allocation(account, plan, {}, make_base(),
+                                mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    assert result["income_consumed"] == pytest.approx(1600.0)
+    assert svc.get_open_income_total(40) == pytest.approx(4_400.0)
+    with get_db() as session:
+        run = session.exec(select(PortfolioAllocationRun)).one()
+    assert run.filled_buy_value == pytest.approx(1600.0)
+    assert run.is_income_consumed is True
+
+
+def test_a_partial_fill_consumes_only_the_filled_portion_and_defers_the_stamp():
+    account = FakeAccount(account_id=41)
+    account.positions = []
+    account.fills = {"AAPL": (OrderStatus.PARTIALLY_FILLED, 4.0, 160.0)}
+    add_instance(PortfolioIncomeEvent(account_id=41, external_id="dep-1",
+                                      event_date=date(2026, 8, 1),
+                                      event_type=CASH_TRANSFER_DEPOSIT, amount=6_000.0))
+    row = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
+    row.target_quantity = 10.0
+    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
+
+    result = svc.run_allocation(account, plan, {}, make_base(),
+                                mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    # The 640 that filled is recorded, but the order can still fill more, so the
+    # ledger is untouched and the run waits in the recovery view.
+    with get_db() as session:
+        run = session.exec(select(PortfolioAllocationRun)).one()
+    assert run.filled_buy_value == pytest.approx(640.0)
+    assert run.is_income_consumed is False
+    assert result["income_consumed"] == 0.0
+    assert result["settled"] is False
+    assert result["working_order_ids"] == run.order_ids
+    assert svc.get_open_income_total(41) == pytest.approx(6_000.0)
+    assert [r.id for r in svc.get_unconsumed_runs(41)] == [run.id]
+
+
+def test_an_order_still_working_at_the_broker_leaves_the_run_recoverable():
+    account = FakeAccount(account_id=42)
+    account.positions = []
+    account.fills = {}   # the broker says nothing -> the row stays NEW
+    row = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
+    row.target_quantity = 10.0
+    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
+
+    result = svc.run_allocation(account, plan, {}, make_base(),
+                                mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    assert result["settled"] is False
+    assert result["income_consumed"] == 0.0
+    assert [r.id for r in svc.get_unconsumed_runs(42)] == [result["run_id"]]
+
+
+def test_reconcile_unconsumed_runs_finalises_a_run_once_its_orders_settle():
+    """The recovery drain. Yesterday's run left an order working; today it filled."""
+    account = FakeAccount(account_id=43)
+    account.positions = []
+    add_instance(PortfolioIncomeEvent(account_id=43, external_id="dep-1",
+                                      event_date=date(2026, 8, 1),
+                                      event_type=CASH_TRANSFER_DEPOSIT, amount=6_000.0))
+    row = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
+    row.target_quantity = 10.0
+    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
+    first = svc.run_allocation(account, plan, {}, make_base(),
+                               mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+    assert svc.get_open_income_total(43) == pytest.approx(6_000.0)
+
+    account.fills = {"AAPL": (OrderStatus.FILLED, 10.0, 158.0)}
+    reconciled = svc.reconcile_unconsumed_runs(account)
+
+    assert reconciled == [first["run_id"]]
+    assert svc.get_open_income_total(43) == pytest.approx(6_000.0 - 1580.0)
+    assert svc.get_unconsumed_runs(43) == []
+
+
+def test_reconcile_leaves_a_run_alone_while_its_orders_are_still_working():
+    account = FakeAccount(account_id=44)
+    account.positions = []
+    row = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
+    row.target_quantity = 10.0
+    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
+    first = svc.run_allocation(account, plan, {}, make_base(),
+                               mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    assert svc.reconcile_unconsumed_runs(account) == []
+    assert [r.id for r in svc.get_unconsumed_runs(44)] == [first["run_id"]]
+
+
+def test_a_protective_leg_is_neither_a_fill_nor_a_reason_to_wait():
+    """adjust_quantity_with_tpsl returns its rebuilt TP/SL legs in orders_created
+    (TransactionHelper.py:771/787/809). A SELL_STOP sitting unfilled for weeks must
+    not count as a sale, and must not stall the run's income forever."""
+    from ba2_trade_platform.core.types import OrderType as _OrderType
+
+    account = FakeAccount(account_id=45)
+    account.positions = []
+    account.fills = {"AAPL": (OrderStatus.FILLED, 10.0, 160.0)}
+    market_id = add_instance(TradingOrder(
+        account_id=45, symbol="AAPL", quantity=10.0, side=OrderDirection.BUY,
+        order_type=_OrderType.MARKET, good_for='day', status=OrderStatus.FILLED,
+        open_type=OrderOpenType.MANUAL, filled_qty=10.0, open_price=160.0))
+    stop_id = add_instance(TradingOrder(
+        account_id=45, symbol="AAPL", quantity=10.0, side=OrderDirection.SELL,
+        order_type=_OrderType.SELL_STOP, good_for='gtc', status=OrderStatus.NEW,
+        open_type=OrderOpenType.MANUAL, stop_price=140.0))
+
+    fills = svc.collect_order_fills(45, [market_id, stop_id])
+
+    assert [f.order_id for f in fills] == [market_id]
+    totals = svc.measure_filled_values(fills)
+    assert totals.settled is True
+    assert totals.buy_value == pytest.approx(1600.0)
+    assert totals.sell_value == 0.0
+
+
+def test_a_full_close_counts_its_close_order_on_the_sell_side():
+    """_close_symbol has to hand back close_order_id, or the SELL side of a close is
+    invisible and net_buy_value comes out too high -- over-consuming income."""
+    account = FakeAccount(account_id=46)
+    account.positions = [FakePosition("MSFT", 5.0, 1800.0, 2000.0)]
+    account.fills = {"MSFT": (OrderStatus.FILLED, 5.0, 398.0)}
+    txn_id = make_open_transaction(46, "MSFT", 5.0)
+    current = {"MSFT": PositionState(symbol="MSFT", quantity=5.0, price=400.0,
+                                     transaction_ids=[txn_id])}
+    row = make_row("MSFT", OrderDirection.SELL, -5.0, 2000.0, 0.0, price=400.0)
+    row.target_quantity = 0.0
+    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
+
+    svc.run_allocation(account, plan, current, make_base(),
+                       mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    with get_db() as session:
+        run = session.exec(select(PortfolioAllocationRun)).one()
+    assert run.filled_sell_value == pytest.approx(1990.0)
+    assert run.filled_buy_value == 0.0
+    assert run.net_buy_value == 0.0
+    assert run.is_income_consumed is True
+
+
+def test_a_failed_refresh_never_consumes_income_against_stale_rows(monkeypatch):
+    """If the broker cannot be reached, our rows say NEW no matter what really
+    happened. Consuming against that is guessing with money."""
+    errors = _capture_service_errors(monkeypatch)
+
+    account = FakeAccount(account_id=47)
+    account.positions = []
+    account.refresh_raises = RuntimeError("connection reset")
+    add_instance(PortfolioIncomeEvent(account_id=47, external_id="dep-1",
+                                      event_date=date(2026, 8, 1),
+                                      event_type=CASH_TRANSFER_DEPOSIT, amount=6_000.0))
+    row = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
+    row.target_quantity = 10.0
+    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
+
+    result = svc.run_allocation(account, plan, {}, make_base(),
+                                mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    assert result["income_consumed"] == 0.0
+    assert result["settled"] is False
+    assert svc.get_open_income_total(47) == pytest.approx(6_000.0)
+    assert any("connection reset" in e for e in errors), errors
+
+
+def test_the_post_submit_refresh_asks_for_every_order():
+    """fetch_all=True, mirroring TradeManager.py:1607 -- a freshly submitted order
+    is not in the 'open orders' window on every broker."""
+    account = FakeAccount(account_id=48)
+    account.positions = []
+    account.fills = {"AAPL": (OrderStatus.FILLED, 10.0, 160.0)}
+    row = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
+    row.target_quantity = 10.0
+    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
+
+    svc.run_allocation(account, plan, {}, make_base(),
+                       mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    assert account.refresh_calls == [{'heuristic_mapping': False, 'fetch_all': True}]
+
+
+def test_refresh_is_called_without_kwargs_for_a_broker_that_takes_none():
+    """IBKRAccount.refresh_orders(self) takes no arguments (IBKRAccount.py:541), so
+    refresh_orders(fetch_all=True) is a TypeError there."""
+    calls = []
+
+    class NoKwargsAccount:
+        id = 49
+
+        def refresh_orders(self):
+            calls.append("bare")
+            return True
+
+    assert svc.refresh_orders_from_broker(NoKwargsAccount()) is True
+    assert calls == ["bare"]
+
+
+# ---------------------------------------------------------------------------
+# The market gate stays FIRST, above everything this task added
+# ---------------------------------------------------------------------------
+
+def test_a_blocked_run_reports_the_full_money_contract_and_writes_nothing():
+    """engine-ui's blocked branch, preserved: money zeroed, settled True (nothing
+    was submitted, so there is nothing to wait for), no working orders, no run row."""
+    account = FakeAccount(account_id=59)
+    account.positions = []
+    account.market_hours = MarketHours(is_open=False, source=MARKET_HOURS_SOURCE_BROKER)
+    plan = AllocationPlan(rows=[make_row("AAPL", OrderDirection.BUY, 1.0, 160.0, 160.0,
+                                         price=160.0)],
+                          available_buying_power=10_000.0)
+
+    result = svc.run_allocation(account, plan, {}, make_base(), mode="REBALANCE")
+
+    assert result["blocked"] is True
+    assert result["run_id"] is None
+    assert result["outcomes"] == []
+    assert result["order_ids"] == []
+    assert result["filled_buy_value"] == 0.0
+    assert result["filled_sell_value"] == 0.0
+    assert result["settled"] is True
+    assert result["working_order_ids"] == []
+    assert result["income_consumed"] == 0.0
+    assert "closed" in result["blocked_reason"].lower()
+    assert account.submitted == []
+    assert account.refresh_calls == []
+
+
+def test_a_blocked_run_does_not_reconcile_and_so_touches_no_earlier_run():
+    """The gate is the FIRST statement, above reconcile_unconsumed_runs. A blocked
+    attempt must not spend an EARLIER run's income either."""
+    account = FakeAccount(account_id=60)
+    account.positions = []
+    add_instance(PortfolioIncomeEvent(account_id=60, external_id="dep-1",
+                                      event_date=date(2026, 8, 1),
+                                      event_type=CASH_TRANSFER_DEPOSIT, amount=6_000.0))
+    row = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
+    row.target_quantity = 10.0
+    first = svc.run_allocation(account, AllocationPlan(rows=[row],
+                                                       available_buying_power=10_000.0),
+                               {}, make_base(), mode="REBALANCE")
+    assert [r.id for r in svc.get_unconsumed_runs(60)] == [first["run_id"]]
+
+    account.fills = {"AAPL": (OrderStatus.FILLED, 10.0, 160.0)}
+    account.market_hours = MarketHours(is_open=False, source=MARKET_HOURS_SOURCE_BROKER)
+    blocked = svc.run_allocation(account, AllocationPlan(rows=[], available_buying_power=1.0),
+                                 {}, make_base(), mode="REBALANCE")
+
+    assert blocked["blocked"] is True
+    assert [r.id for r in svc.get_unconsumed_runs(60)] == [first["run_id"]]
+    assert svc.get_open_income_total(60) == pytest.approx(6_000.0)
+
+
+def test_an_unknown_market_answer_blocks_even_if_it_claims_to_be_open():
+    """`is_known` is checked as well as `is_open`. An adapter should never build
+    this object, but if it does, "we could not find out" must not authorise a
+    submission."""
+    account = FakeAccount(account_id=61)
+    account.positions = []
+    account.market_hours = MarketHours(is_open=True,
+                                       source=MARKET_HOURS_SOURCE_UNAVAILABLE)
+    plan = AllocationPlan(rows=[make_row("AAPL", OrderDirection.BUY, 1.0, 160.0, 160.0,
+                                         price=160.0)],
+                          available_buying_power=10_000.0)
+
+    result = svc.run_allocation(account, plan, {}, make_base(), mode="REBALANCE")
+
+    assert result["blocked"] is True
+    assert account.submitted == []
+```
+
+and add this helper next to the other module-level helpers in the file (it is used by the failed
+refresh test above and by Task 101):
+
+```python
+def _capture_service_errors(monkeypatch):
+    """Collect ``logger.error`` from portfolio_allocation_service.
+
+    NOT caplog: ba2_trade_platform/logger.py:24 sets ``propagate = False`` so
+    caplog's root handler never sees the record, and
+    tests/test_penny_gainers_fix.py:53 swaps the logger module for a MagicMock at
+    import time, so under a full-suite collection even re-enabling propagation
+    patches a mock. Patching the module-under-test's own ``logger`` is immune to
+    both.
+    """
+    import sys
+    module = sys.modules[svc.__name__]
+    messages = []
+    monkeypatch.setattr(module.logger, "error", lambda msg, *a, **k: messages.append(str(msg)))
+    return messages
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_submit.py -v`
+
+Expected: FAIL — the new tests fail at
+`AttributeError: module 'ba2_trade_platform.core.portfolio_allocation_service' has no attribute 'collect_order_fills'`
+(likewise `reconcile_unconsumed_runs`, `refresh_orders_from_broker`, `measure_filled_values`), and
+the replaced `run_allocation` tests fail on the value — e.g.
+`assert 1600.0 == 1610.0` for the fill-priced AAPL,
+`KeyError: 'settled'` in `test_a_blocked_run_reports_the_full_money_contract_and_writes_nothing`,
+and `assert 5200.0 == approx(1600.0)` in
+`test_the_ledger_consumes_only_the_order_that_actually_filled`, which is the money bug printing
+itself out.
+
+- [ ] **Step 3: Write minimal implementation**
+
+In `ba2_trade_platform/core/portfolio_allocation_service.py`, extend the
+`.portfolio_allocation` import block with the three new names:
+
+```python
+from .portfolio_allocation import (
+    ACTION_ADJUST, ACTION_CLOSE, ACTION_NEW, ACTION_SKIP,
+    AllocationPlan, BaseSnapshot, PositionFetchFailed, PositionState,
+    FilledTotals, OrderFill, measure_filled_values,
+    apply_order_impacts, decide_symbol_action, plan_quantity_attempts, split_delta_fifo,
+    FRACTIONAL_PATH_WHOLE,
+)
+```
+
+and add `inspect` to the stdlib imports at the top:
+
+```python
+import inspect
+```
+
+Replace `_close_symbol` with:
+
+```python
+def _close_symbol(account, row, state) -> RowOutcome:
+    """Target 0 on a held symbol -> close every open transaction for it.
+
+    The close ORDER ids are collected, not just the transaction ids: they are the
+    SELL side of this run, and the income ledger is spent on
+    ``filled buys - filled sells``. Drop them and every full close silently
+    inflates the run's net buy value, over-consuming income.
+    ``close_transaction`` returns ``close_order_id`` (AccountInterface.py:1494); it
+    is None when the close needed no new order (only unfilled orders were
+    cancelled), which is a real outcome and not an error.
+    """
+    messages: List[str] = []
+    closed: List[int] = []
+    order_ids: List[int] = []
+    ok = True
+    for txn_id in state.transaction_ids:
+        result = account.close_transaction(txn_id)
+        if result and result.get('success'):
+            closed.append(txn_id)
+            close_order_id = result.get('close_order_id')
+            if close_order_id:
+                order_ids.append(close_order_id)
+        else:
+            ok = False
+            messages.append(f"txn {txn_id}: {(result or {}).get('message', 'close failed')}")
+    return RowOutcome(
+        symbol=row.symbol, action=ACTION_CLOSE,
+        status=OUTCOME_SUBMITTED if ok else OUTCOME_FAILED,
+        quantity=abs(row.delta_quantity), order_ids=order_ids,
+        transaction_ids=closed, message="; ".join(messages),
+    )
+```
+
+Delete `summarise_outcomes` entirely and replace `run_allocation` with the following (and append
+the four helpers above it). `fetch_market_hours` stays exactly where engine-ui put it — it is not
+re-declared here:
+
+```python
+# ---------------------------------------------------------------------------
+# What the run actually filled. The income ledger's only input.
+# ---------------------------------------------------------------------------
+
+def refresh_orders_from_broker(account) -> bool:
+    """``account.refresh_orders(fetch_all=True)``, tolerant of three signatures.
+
+    Mirrors TradeManager.py:1600-1607, which does exactly this immediately after
+    its own submissions -- "important for market orders which fill immediately".
+
+    The signature is INSPECTED rather than the TypeError caught: AlpacaAccount
+    takes ``(heuristic_mapping, fetch_all)`` (:2180), TastyTradeAccount takes
+    ``**kwargs`` (:988), IBKRAccount takes nothing at all (:541). Catching TypeError
+    and retrying bare would also swallow a TypeError raised INSIDE a broker's
+    refresh and then run the whole thing a second time.
+
+    Returns:
+        bool: False when the refresh failed. The caller must then treat its fill
+        measurement as NOT settled -- our rows still say whatever they said before
+        the broker was asked, and consuming income against that is guessing.
+    """
+    try:
+        parameters = inspect.signature(account.refresh_orders).parameters
+        accepts_fetch_all = "fetch_all" in parameters or any(
+            p.kind == p.VAR_KEYWORD for p in parameters.values())
+        if accepts_fetch_all:
+            account.refresh_orders(fetch_all=True)
+        else:
+            account.refresh_orders()
+        return True
+    except Exception as e:
+        logger.error(f"[Account {account.id}] Could not refresh orders after an "
+                     f"allocation submission: {e}", exc_info=True)
+        return False
+
+
+def collect_order_fills(account_id: int, order_ids: List[int]) -> List[OrderFill]:
+    """Read the run's EXECUTION orders back out of the DB as pure fill facts.
+
+    ONLY ``OrderType.MARKET`` rows. A run's ``order_ids`` also carry the protective
+    legs that ``TransactionHelper.adjust_quantity_with_tpsl`` rebuilds around a
+    resized position -- OCO (TransactionHelper.py:771), SELL_LIMIT/BUY_LIMIT (:787)
+    and SELL_STOP/BUY_STOP (:809). Those are not trades this run made; they sit
+    unfilled for weeks by design. Counting them would book a stop-loss as a sale,
+    and waiting for them would stall the run's income indefinitely. Every execution
+    order IS a MARKET order: the new order, the partial-close order
+    (TransactionHelper.py:733) and the add-to-position order (:864).
+
+    An id with no row emits ``OrderFill(status=None)``, which ``measure_filled_values``
+    treats as still working -- a vanished order row is an inconsistency, and
+    stalling is the only safe reading of it.
+    """
+    if not order_ids:
+        return []
+    wanted = list(dict.fromkeys(int(order_id) for order_id in order_ids))
+    with get_db() as session:
+        rows = session.exec(
+            select(TradingOrder).where(
+                TradingOrder.account_id == account_id,
+                TradingOrder.id.in_(wanted),
+            )
+        ).all()
+        by_id = {row.id: (row.order_type, row.side, row.status,
+                          row.filled_qty, row.open_price) for row in rows}
+
+    fills: List[OrderFill] = []
+    for order_id in wanted:
+        found = by_id.get(order_id)
+        if found is None:
+            logger.error(f"[Account {account_id}] Allocation order {order_id} has no "
+                         f"TradingOrder row; its run cannot be income-consumed until "
+                         f"someone works out what happened to it")
+            fills.append(OrderFill(order_id=order_id))
+            continue
+        order_type, side, status, filled_qty, open_price = found
+        if order_type != OrderType.MARKET:
+            logger.debug(f"[Account {account_id}] Order {order_id} is a {order_type} "
+                         f"protective leg, not an execution order -- not measured")
+            continue
+        fills.append(OrderFill(
+            order_id=order_id, side=side, status=status,
+            filled_quantity=float(filled_qty or 0.0),
+            fill_price=float(open_price) if open_price is not None else None,
+        ))
+    return fills
+
+
+def measure_run_fills(account, order_ids: List[int]) -> FilledTotals:
+    """Ask the broker what really happened, then price it. The ledger's input.
+
+    Refresh once, read our own rows back, measure. No polling and no waiting: the
+    wizard submits MARKET orders during market hours, which is the case TradeManager
+    already relies on this single refresh for. Anything still working comes back
+    ``settled=False`` and is reconciled later -- by the income panel's Refresh or by
+    the next run.
+    """
+    if not refresh_orders_from_broker(account):
+        totals = measure_filled_values(collect_order_fills(account.id, order_ids))
+        totals.settled = False
+        return totals
+    return measure_filled_values(collect_order_fills(account.id, order_ids))
+
+
+def reconcile_unconsumed_runs(account) -> List[int]:
+    """Finalise every past run whose orders have settled since. The recovery drain.
+
+    ``get_unconsumed_runs`` lists runs with a NULL ``income_consumed_at``: ones that
+    died mid-submit, and ones deliberately deferred because an order could still
+    fill. This re-measures each and consumes the ledger for those now settled. Runs
+    still working are left exactly where they are.
+
+    Called from TWO places, both of them things the user just did: the top of
+    ``run_allocation`` (after the market gate, before anything is written), and
+    ``sync_income_events`` -- i.e. the income panel's Refresh and the allocation
+    page's load. Deferral is the common case, so waiting for the next allocation run
+    would leave a quarterly rebalancer's income open for a quarter. It is NOT a job
+    and NOT a timer: one function, two existing entry points, at most one extra
+    ``refresh_orders`` call, and only when there is something to reconcile.
+
+    Returns:
+        List[int]: the run ids that were consumed on this pass, oldest first.
+    """
+    from .portfolio_allocation_store import finalise_allocation_run, get_unconsumed_runs
+
+    pending = list(reversed(get_unconsumed_runs(account.id)))
+    if not pending:
+        return []
+
+    logger.info(f"[Account {account.id}] Reconciling {len(pending)} allocation run(s) "
+                f"that never consumed income")
+    if not refresh_orders_from_broker(account):
+        logger.warning(f"[Account {account.id}] Skipping reconciliation: the order "
+                       f"refresh failed, so every fill figure would be stale")
+        return []
+
+    consumed: List[int] = []
+    for run in pending:
+        totals = measure_filled_values(collect_order_fills(account.id, run.order_ids or []))
+        try:
+            finalise_allocation_run(
+                run.id,
+                filled_buy_value=totals.buy_value,
+                filled_sell_value=totals.sell_value,
+                order_ids=list(run.order_ids or []),
+                orders_settled=totals.settled)
+        except InstanceNotFound:
+            logger.error(f"Allocation run {run.id} vanished during reconciliation")
+            continue
+        if totals.settled:
+            consumed.append(run.id)
+    return consumed
+
+
+def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionState],
+                   base: BaseSnapshot, *, mode: str,
+                   scope_label: Optional[str] = None) -> Dict[str, Any]:
+    """Submit a reviewed plan and record it. The single Submit entry point.
+
+    Order of operations:
+      0. GATE on market hours. If the market is not CONFIRMED open, return
+         ``blocked=True`` having written nothing at all -- no run row, no stamped
+         order comments and, above all, no income consumed. This is the FIRST
+         statement in the function, above the reconcile in step 1: a blocked
+         attempt must not move an earlier run's money either.
+      1. RECONCILE any earlier run whose income was left unconsumed, so this run's
+         ledger reflects reality before it spends from it.
+      2. INSERT the ``portfolio_allocation_run`` row with the plan snapshot and zero
+         values, so its id can be stamped into every order comment.
+      3. Submit (sells first, buys descending, per-row outcomes).
+      4. REFRESH from the broker and MEASURE what actually filled.
+      5. FINALISE: write the FILLED totals and consume the ledger by the resulting
+         net buy value -- one call, one transaction, idempotent on the run id. If
+         any order can still fill, the totals are written but the ledger is NOT
+         spent, and the run stays in ``get_unconsumed_runs()`` for step 1 of the
+         next run or the income panel's next Refresh. That is the COMMON outcome,
+         not an error.
+      6. log_activity.
+
+    Money never comes from the plan. ``row.price`` is a quote taken before
+    submission and ``outcome.quantity`` is what was SENT; the ledger is spent on
+    ``filled_qty * open_price``, which is the only number that describes cash that
+    left the account.
+
+    Partial failure is normal and is reported per row; nothing is rolled back.
+    Retrying the whole thing consumes the ledger once, not twice.
+
+    Returns:
+        Dict[str, Any]: ``run_id``, ``outcomes``, ``order_ids``, ``income_consumed``,
+        ``filled_buy_value``, ``filled_sell_value``, ``settled``,
+        ``working_order_ids``, ``blocked``, ``blocked_reason``. When blocked the
+        money keys are 0.0, ``settled`` is True (nothing was submitted, so there is
+        nothing to wait for), ``working_order_ids`` is empty and ``run_id`` is None.
+    """
+    from .portfolio_allocation_store import finalise_allocation_run, record_allocation_run
+
+    # Market-hours gate, BEFORE anything is written or reconciled. Disabling the
+    # Submit button is a courtesy; this is the enforcement -- the wizard can sit
+    # open across 16:00 and the user can press Submit at 16:01. Blocking here means
+    # no run row, no stamped order comments and, above all, no income consumed:
+    # finalise_allocation_run is one-shot, so a run created for orders that were all
+    # rejected would mark that income spent forever. TastyTrade's closed-market
+    # refusal is a SERVER rule that arrives as an opaque Message
+    # (tastytrade/order.py:172-183), so without this the user would get a screen of
+    # unexplained per-row failures after the ledger had already been hit.
+    #
+    # `is_known` is checked as well as `is_open`: an UNAVAILABLE answer means the
+    # lookup FAILED, and "we could not find out" never authorises a submission. The
+    # banner copy for all of this lives in ui/utils/portfolio_allocation_view.py --
+    # this module must NOT import it (core -> ui is a layering inversion), so the
+    # sentence below is built here and deliberately kept plain.
+    hours = fetch_market_hours(account)
+    if hours is None:
+        reason = "Market hours could not be read, so the market is not confirmed open"
+    elif not hours.is_known:
+        reason = "Market status could not be determined, so the market is not confirmed open"
+    elif not hours.is_open:
+        reason = "Market is closed"
+    else:
+        reason = None
+    if reason is not None:
+        logger.warning(f"Allocation run for account {account.id} BLOCKED: {reason}; "
+                       f"nothing was submitted and no run was recorded")
+        return {
+            "run_id": None,
+            "outcomes": [],
+            "order_ids": [],
+            "income_consumed": 0.0,
+            "filled_buy_value": 0.0,
+            "filled_sell_value": 0.0,
+            "settled": True,
+            "working_order_ids": [],
+            "blocked": True,
+            "blocked_reason": f"{reason} - nothing was submitted.",
+        }
+
+    reconcile_unconsumed_runs(account)
+
+    run = record_allocation_run(
+        account.id, mode, plan.to_dict(),
+        scope_label=scope_label,
+        base_notional=base.base_notional,
+        available_buying_power=base.available_buying_power,
+        allow_fractional=bool(plan.allow_fractional),
+    )
+    run_id = run.id
+
+    outcomes = submit_plan(account, plan, current, run_tag=str(run_id),
+                           allow_fractional=bool(plan.allow_fractional))
+
+    # EVERY outcome's ids, not just the submitted ones. A hard submit failure leaves
+    # the row at OrderStatus.ERROR (AccountInterface.py:148) -- terminal, worth 0,
+    # settled, so it costs nothing to include. What it buys is the case that matters:
+    # submit_order returned None on a response timeout while the broker actually took
+    # the order. The refresh finds the fill and the ledger charges for it.
+    order_ids: List[int] = []
+    for outcome in outcomes:
+        order_ids.extend(outcome.order_ids)
+
+    totals = measure_run_fills(account, order_ids)
+    if totals.unmeasurable_order_ids:
+        logger.error(f"Allocation run {run_id}: order(s) "
+                     f"{totals.unmeasurable_order_ids} report a fill with no usable "
+                     f"price or side; their value is NOT being guessed at, so this "
+                     f"run's income stays unconsumed until they can be read")
+
+    income_consumed = 0.0
+    try:
+        finalised = finalise_allocation_run(
+            run_id,
+            filled_buy_value=totals.buy_value,
+            filled_sell_value=totals.sell_value,
+            order_ids=order_ids,
+            orders_settled=totals.settled)
+        income_consumed = finalised.income_consumed_amount
+    except InstanceNotFound:
+        logger.error(f"Allocation run {run_id} vanished before it could be finalised; "
+                     f"its income was NOT consumed")
+
+    submitted = sum(1 for o in outcomes if o.status == OUTCOME_SUBMITTED)
+    failed = sum(1 for o in outcomes if o.status == OUTCOME_FAILED)
+    log_activity(
+        ActivityLogSeverity.SUCCESS if failed == 0 else ActivityLogSeverity.WARNING,
+        ActivityLogType.ORDER_SUBMITTED,
+        f"Portfolio allocation run {run_id} ({mode}"
+        f"{' / ' + scope_label if scope_label else ''}): "
+        f"{submitted} submitted, {failed} failed, "
+        f"{totals.buy_value:.2f} bought / {totals.sell_value:.2f} sold (filled)"
+        f"{'' if totals.settled else f'; {len(totals.working_order_ids)} order(s) still working, income not consumed'}",
+        data={
+            "run_id": run_id,
+            "mode": mode,
+            "scope_label": scope_label,
+            "filled": totals.to_dict(),
+            "income_consumed": income_consumed,
+            "rows": [o.to_dict() for o in outcomes],
+        },
+        source_account_id=account.id,
+    )
+
+    return {
+        "run_id": run_id,
+        "outcomes": outcomes,
+        "order_ids": order_ids,
+        "income_consumed": income_consumed,
+        "filled_buy_value": totals.buy_value,
+        "filled_sell_value": totals.sell_value,
+        "settled": totals.settled,
+        "working_order_ids": list(totals.working_order_ids),
+        "blocked": False,
+        "blocked_reason": None,
+    }
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+```bash
+venv/bin/python -m pytest tests/test_portfolio_allocation_submit.py -v
+venv/bin/python -m pytest tests/test_portfolio_allocation_store.py -v
+venv/bin/python -m pytest packages/common/tests/test_portfolio_allocation.py -v
+venv/bin/python -m pytest tests/test_portfolio_allocation_view.py -v
+venv/bin/python -m pytest tests/test_portfolio_allocation_wizard_ui.py -v
+venv/bin/python -m pytest tests/test_boot_smoke.py -v
+```
+
+Expected: PASS on all six.
+
+Then prove the intent-priced path is gone — all three of these must print nothing:
+
+```bash
+grep -rn "summarise_outcomes" --include="*.py" ba2_trade_platform packages tests
+grep -rn "estimated_value" ba2_trade_platform/core/portfolio_allocation_service.py
+grep -n "SimpleNamespace" tests/test_portfolio_allocation_submit.py
+```
+
+And prove the gate survived — this must still print both keys:
+
+```bash
+grep -n '"blocked"\|"blocked_reason"' ba2_trade_platform/core/portfolio_allocation_service.py
+```
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add ba2_trade_platform/core/portfolio_allocation_service.py \
+        tests/test_portfolio_allocation_submit.py
+git commit -m "fix(allocation): consume the income ledger on FILLED value, never submitted value"
+```
+
+---
+
+### Task 101: Surface the deferral — wire the drain to the income panel and say how many orders are working
+
+> Runs after Task 100, and after Task 74 (which created `sync_income_events` and
+> `render_income_panel`) and engine-ui's Task N6 (which replaces `AllocationWizard` and
+> `open_allocation_wizard` in the same file — a different pair of symbols; this task touches only
+> `render_income_panel`).
+
+User decision **D3** accepted "consume filled only, recover later" *on the condition that the
+recovery is visible and automatic*. Task 100 leaves `reconcile_unconsumed_runs` wired to exactly one
+caller — the top of `run_allocation` — which is not enough: a user who rebalances quarterly would
+leave a deferred run's income open for a quarter, and the only record that anything was pending
+would be a `logger.warning`. Two additions close that, and neither is new machinery.
+
+**1. The drain runs on every income sync.** `sync_income_events(account)` (Task 74) is the income
+panel's Refresh handler *and* the call the page makes on load, so putting the reconcile at its top
+covers both entry points in one line. It costs a DB read; `reconcile_unconsumed_runs` only reaches
+the broker when there is actually something pending.
+
+**2. The panel says so.** The copy is a PURE function returning `(text, severity)` — the plan's UI
+rule, the same shape as `whole_share_notice()` / `no_order_notice()`, and it lives next to them in
+the pure engine module so it can be tested with no NiceGUI client. The panel only draws it.
+`FilledTotals.to_dict()` already carries `settled` and `working_order_ids`; this task adds the
+DB-side count and the sentence.
+
+`render_income_panel` gains a REQUIRED keyword. A default of `None` would let the page glue forget
+it and silently drop the one fact D3 exists to surface — the same reasoning that makes engine-ui's
+`market: MarketGateResult` required.
+
+**Files:**
+- Modify: `packages/common/ba2_common/core/portfolio_allocation.py` (append; add to `__all__`)
+- Modify: `ba2_trade_platform/core/portfolio_allocation_service.py` (append `describe_unconsumed_runs`; one line at the top of `sync_income_events`)
+- Modify: `ba2_trade_platform/ui/pages/portfolio_allocation_wizard.py` (`render_income_panel`)
+- Test: `packages/common/tests/test_portfolio_allocation.py` (append)
+- Test: `tests/test_portfolio_allocation_submit.py` (append)
+- Test: `tests/test_portfolio_allocation_wizard_ui.py` (append)
+
+- [ ] **Step 1: Write the failing test**
+
+Append to `packages/common/tests/test_portfolio_allocation.py`:
+
+```python
+# ---------------------------------------------------------------------------
+# working_orders_notice -- the income panel's deferral copy. Pure.
+# ---------------------------------------------------------------------------
+
+from ba2_common.core.portfolio_allocation import working_orders_notice  # noqa: E402
+
+
+def test_no_notice_when_nothing_is_outstanding():
+    assert working_orders_notice(0, 0) is None
+
+
+def test_the_notice_counts_orders_and_runs_and_warns():
+    text, severity = working_orders_notice(2, 3)
+
+    assert "3" in text and "2" in text
+    assert "not consumed" in text.lower()
+    assert severity == "warning"
+
+
+def test_a_run_with_no_working_orders_still_gets_its_own_sentence():
+    """A run that died mid-submit has an open stamp but no working order. Saying
+    "0 orders still working" would be nonsense, and saying nothing would hide it."""
+    text, severity = working_orders_notice(1, 0)
+
+    assert "0 order" not in text
+    assert "1" in text
+    assert severity == "warning"
+
+
+def test_the_severity_is_a_valid_nicegui_notify_type():
+    """'error' is NOT one of 'positive' | 'negative' | 'warning' | 'info'
+    (settings.py gets this wrong; do not copy it)."""
+    _, severity = working_orders_notice(1, 1)
+
+    assert severity in {"positive", "negative", "warning", "info"}
+```
+
+Append to `tests/test_portfolio_allocation_submit.py`:
+
+```python
+# ---------------------------------------------------------------------------
+# The deferral is drained and reported, not just logged (decision D3)
+# ---------------------------------------------------------------------------
+
+def test_describe_unconsumed_runs_counts_the_runs_and_their_working_orders():
+    account = FakeAccount(account_id=70)
+    account.positions = []
+    account.fills = {}   # nothing settles -> the run defers
+    row = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
+    row.target_quantity = 10.0
+    result = svc.run_allocation(account, AllocationPlan(rows=[row],
+                                                        available_buying_power=10_000.0),
+                                {}, make_base(), mode="REBALANCE")
+
+    described = svc.describe_unconsumed_runs(70)
+
+    assert described["run_ids"] == [result["run_id"]]
+    assert described["working_order_ids"] == result["working_order_ids"]
+
+
+def test_describe_unconsumed_runs_is_empty_for_a_clean_account():
+    assert svc.describe_unconsumed_runs(71) == {"run_ids": [], "working_order_ids": []}
+
+
+def test_describe_unconsumed_runs_never_calls_the_broker():
+    """It renders a panel. A DB read is fine there; a broker round trip is not."""
+    account = FakeAccount(account_id=72)
+    account.positions = []
+    account.fills = {}
+    row = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
+    row.target_quantity = 10.0
+    svc.run_allocation(account, AllocationPlan(rows=[row], available_buying_power=10_000.0),
+                       {}, make_base(), mode="REBALANCE")
+    account.refresh_calls.clear()
+
+    svc.describe_unconsumed_runs(72)
+
+    assert account.refresh_calls == []
+
+
+def test_syncing_income_also_drains_the_deferred_runs():
+    """The income panel's Refresh (and the page's load call) is the hook. Without
+    it a quarterly rebalancer's deferred income stays open for a quarter."""
+    account = FakeAccount(account_id=73)
+    account.positions = []
+    account.fills = {}
+    add_instance(PortfolioIncomeEvent(account_id=73, external_id="dep-1",
+                                      event_date=date(2026, 8, 1),
+                                      event_type=CASH_TRANSFER_DEPOSIT, amount=6_000.0))
+    row = make_row("AAPL", OrderDirection.BUY, 10.0, 1600.0, 1600.0, price=160.0)
+    row.target_quantity = 10.0
+    first = svc.run_allocation(account, AllocationPlan(rows=[row],
+                                                       available_buying_power=10_000.0),
+                               {}, make_base(), mode="REBALANCE")
+    assert [r.id for r in svc.get_unconsumed_runs(73)] == [first["run_id"]]
+
+    account.fills = {"AAPL": (OrderStatus.FILLED, 10.0, 160.0)}
+    svc.sync_income_events(account)
+
+    assert svc.get_unconsumed_runs(73) == []
+    assert svc.get_open_income_total(73) == pytest.approx(4_400.0)
+```
+
+Append to `tests/test_portfolio_allocation_wizard_ui.py`:
+
+```python
+def test_income_panel_requires_the_working_orders_notice():
+    """A default would let the page glue drop the one fact decision D3 exists to
+    surface: that the income has NOT been consumed yet."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    params = inspect.signature(wiz.render_income_panel).parameters
+    assert "working" in params
+    assert params["working"].default is inspect.Parameter.empty
+
+
+def test_income_panel_draws_the_notice_but_does_not_compose_it():
+    """The copy is pure and lives in the engine; the panel only imports it."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    assert callable(wiz.working_orders_notice)
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+```bash
+venv/bin/python -m pytest packages/common/tests/test_portfolio_allocation.py -v -k "notice"
+venv/bin/python -m pytest tests/test_portfolio_allocation_submit.py -v -k "unconsumed_runs or syncing_income"
+venv/bin/python -m pytest tests/test_portfolio_allocation_wizard_ui.py -v -k "income_panel"
+```
+
+Expected: FAIL —
+`ImportError: cannot import name 'working_orders_notice' from 'ba2_common.core.portfolio_allocation'`;
+`AttributeError: module 'ba2_trade_platform.core.portfolio_allocation_service' has no attribute 'describe_unconsumed_runs'`
+and `assert [] == [3]` in `test_syncing_income_also_drains_the_deferred_runs` (the run is still
+unconsumed); `KeyError: 'working'` in `test_income_panel_requires_the_working_orders_notice` and
+`AttributeError: module ... has no attribute 'working_orders_notice'`.
+
+- [ ] **Step 3: Write minimal implementation**
+
+**3a.** In `packages/common/ba2_common/core/portfolio_allocation.py`, add to the same `__all__`
+block Task 98 extended:
+
+```python
+    "WORKING_ORDERS_NOTICE_FMT", "UNFINISHED_RUNS_NOTICE_FMT", "working_orders_notice",
+```
+
+and append at the end of the file:
+
+```python
+#: Income-panel copy for a run whose orders have not settled. Decision D3 makes
+#: this the COMMON case, so it is a first-class message, not a log line.
+WORKING_ORDERS_NOTICE_FMT = (
+    "Income not consumed yet - {orders} order(s) from {runs} allocation run(s) are "
+    "still working at the broker. They are re-measured automatically on the next "
+    "Refresh or allocation run.")
+
+#: Same situation, but the run has no working order to point at: it died between
+#: submitting and recording. Saying "0 orders still working" would be nonsense.
+UNFINISHED_RUNS_NOTICE_FMT = (
+    "Income not consumed yet - {runs} allocation run(s) never finished recording. "
+    "They are re-checked on the next Refresh or allocation run.")
+
+
+def working_orders_notice(run_count: int, order_count: int) -> Optional[Tuple[str, str]]:
+    """``(text, severity)`` for the income panel, or ``None`` when nothing is open.
+
+    PURE, and deliberately shaped like ``whole_share_notice`` / ``no_order_notice``:
+    the wizard module only DRAWS it, so the wording is testable without a NiceGUI
+    client.
+
+    ``severity`` is a NiceGUI notify/badge word -- one of
+    ``positive`` | ``negative`` | ``warning`` | ``info``. ``error`` is NOT one of
+    them (settings.py gets that wrong; do not copy it).
+
+    Args:
+        run_count: how many of the account's runs still have a NULL
+            ``income_consumed_at``.
+        order_count: how many MARKET orders across those runs are still working.
+
+    Returns:
+        Optional[Tuple[str, str]]: ``None`` when ``run_count <= 0``. Otherwise the
+        sentence and ``"warning"`` -- unallocated income that the user believes is
+        already invested is worth interrupting for, but it is not an error: the
+        recovery path is automatic.
+    """
+    if run_count <= 0:
+        return None
+    if order_count <= 0:
+        return (UNFINISHED_RUNS_NOTICE_FMT.format(runs=run_count), "warning")
+    return (WORKING_ORDERS_NOTICE_FMT.format(orders=order_count, runs=run_count), "warning")
+```
+
+**3b.** In `ba2_trade_platform/core/portfolio_allocation_service.py`, insert this as the FIRST
+statement in the body of `sync_income_events` (Task 74), directly under its docstring:
+
+```python
+    # Decision D3: a deferred run's income stays open until something re-measures
+    # it, and deferral is the common case. This is the income panel's Refresh AND
+    # the allocation page's load call, so draining here is what stops a quarterly
+    # rebalancer's income from sitting unallocated for a quarter. DB-only unless
+    # there is genuinely something pending.
+    reconcile_unconsumed_runs(account)
+```
+
+and append:
+
+```python
+def describe_unconsumed_runs(account_id: int) -> Dict[str, Any]:
+    """Which runs still owe the ledger, and how many of their orders are working.
+
+    DB ONLY -- no broker call, because this renders a panel. The actual re-measure
+    is ``reconcile_unconsumed_runs``, which the same Refresh already ran.
+
+    Returns:
+        Dict[str, Any]: ``{"run_ids": [...], "working_order_ids": [...]}``, both
+        oldest-first. Feed the two lengths to
+        ``ba2_common.core.portfolio_allocation.working_orders_notice`` for the
+        panel's sentence.
+    """
+    from .portfolio_allocation_store import get_unconsumed_runs
+
+    runs = list(reversed(get_unconsumed_runs(account_id)))
+    working: List[int] = []
+    for run in runs:
+        totals = measure_filled_values(collect_order_fills(account_id, run.order_ids or []))
+        working.extend(totals.working_order_ids)
+    return {"run_ids": [run.id for run in runs], "working_order_ids": working}
+```
+
+**3c.** In `ba2_trade_platform/ui/pages/portfolio_allocation_wizard.py`, add to the engine imports
+at the top of the module:
+
+```python
+from ba2_common.core.portfolio_allocation import working_orders_notice
+```
+
+and replace `render_income_panel` with:
+
+```python
+def render_income_panel(events: List[Dict], open_total: float,
+                        *, working: Optional[Tuple[str, str]],
+                        on_sync: Callable[[], None],
+                        on_invest: Callable[[float], None]) -> None:
+    """Last 30 days of income, the open total, the deferral notice, and Invest.
+
+    The panel NEVER polls. ``on_sync`` is wired to the Refresh button and is
+    additionally called once by the page on load; there is deliberately no
+    ``ui.timer`` here, so the page issues no background broker calls.
+
+    ``working`` is ``working_orders_notice(...)``'s ``(text, severity)`` or
+    ``None``. It is a REQUIRED keyword: under decision D3 an allocation run
+    routinely finishes without consuming its income, and a caller that forgot to
+    pass this would show the user an "unallocated" figure with no explanation of
+    why it did not go down. Composing the sentence is the engine's job; this
+    function only draws it.
+
+    ``on_invest(open_total)`` opens the wizard in INVEST_LABEL mode pre-filled
+    with the unallocated amount.
+    """
+    with ui.card().classes('w-full'):
+        with ui.row().classes('w-full items-center justify-between'):
+            ui.label('Income (last 30 days)').classes('text-lg font-bold')
+            with ui.row().classes('gap-2 items-center'):
+                ui.label(f'Unallocated: {open_total:,.2f}').classes('font-bold text-green-500')
+                ui.button('Refresh', on_click=on_sync).props('outline dense')
+                ui.button('Invest', on_click=lambda: on_invest(open_total)) \
+                    .props('color=primary dense').set_enabled(open_total > 0)
+        if working is not None:
+            text, severity = working
+            colour = 'text-red-500' if severity == 'negative' else 'text-orange-400'
+            ui.label(text).classes(f'w-full text-sm {colour}')
+        if not events:
+            ui.label('No deposits or dividends in the last 30 days.') \
+                .classes('text-sm text-gray-400')
+            return
+        with ui.row().classes('w-full text-xs font-bold border-b py-1'):
+            for header, width in (('Date', 'w-28'), ('Type', 'w-24'), ('Symbol', 'w-24'),
+                                  ('Amount', 'w-28'), ('Open', 'w-28')):
+                ui.label(header).classes(width)
+        for event in events:
+            with ui.row().classes('w-full text-sm border-b py-1'):
+                ui.label(str(event['event_date'])).classes('w-28')
+                ui.label(event['event_type']).classes('w-24')
+                ui.label(event['symbol'] or '-').classes('w-24')
+                ui.label(f"{event['amount']:,.2f}").classes('w-28')
+                ui.label(f"{event['open_amount']:,.2f}").classes('w-28')
+```
+
+If `Tuple` is not already in that module's `typing` import, add it.
+
+- [ ] **Step 4: Run test to verify it passes**
+
+```bash
+venv/bin/python -m pytest packages/common/tests/test_portfolio_allocation.py -v
+venv/bin/python -m pytest tests/test_portfolio_allocation_submit.py -v
+venv/bin/python -m pytest tests/test_portfolio_allocation_store.py -v
+venv/bin/python -m pytest tests/test_portfolio_allocation_wizard_ui.py -v
+venv/bin/python -m pytest tests/test_boot_smoke.py -v
+```
+
+Expected: PASS on all five.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add packages/common/ba2_common/core/portfolio_allocation.py \
+        packages/common/tests/test_portfolio_allocation.py \
+        ba2_trade_platform/core/portfolio_allocation_service.py \
+        ba2_trade_platform/ui/pages/portfolio_allocation_wizard.py \
+        tests/test_portfolio_allocation_submit.py \
+        tests/test_portfolio_allocation_wizard_ui.py
+git commit -m "feat(allocation): drain deferred runs on income refresh and tell the user why income is still open"
+```
