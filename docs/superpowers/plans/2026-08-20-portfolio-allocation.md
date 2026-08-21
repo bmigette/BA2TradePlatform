@@ -33248,3 +33248,43 @@ the Requirement column, which describes positions already held.
 `validate_response` (`tastytrade/utils.py:240-258`) builds its message only from errors carrying
 BOTH `code` and `message`. A 403 `{"error":{"message":"Token has insufficient scopes..."}}` has no
 `code`, so the reason is discarded entirely. Handled in `a86b873`.
+
+## L8. Consequences for the Task 80-101 addendum, from landing L1-L2 in the adapter
+
+Commits `4cf4f12`, `39c16cd`, `35e4169`, `46607bd`.
+
+**L8a. `min_order_size` is a SHARE COUNT. The $5 lives in a new `MarginInfo.min_fractional_notional`, in DOLLARS.**
+Settled from the engine's behaviour, not prose: `round_quantity` compares `min_order_size` against
+a rounded share count, and `test_an_order_below_min_order_size_leaves_the_position_untouched`
+suppresses a $200 gap with `min_order_size=5.0`. Storing the $5 there would suppress every SCHD
+order below $170 rather than below $5. `min_fractional_notional` is `None` for non-fractionable
+symbols, because the broker's rule says "**Fractional** equities orders" — a $5 floor on an
+unsplittable name would refuse a legal 1-share buy of a sub-$5 stock.
+
+**L8b. HARD ORDERING CONSTRAINT for D1 (bump-to-one-share).**
+The notional-floor suppression runs inside `_suppress_below_min_order`, called from
+`compute_allocation:902` on the FINAL SIGNED DELTA. A bump-to-1 must therefore run **before** that
+call, or it will find a row the floor has already zeroed and conclude there is nothing to bump.
+D1 must weigh all three thresholds together — the $5 fractional floor, the 1.5x overshoot guard,
+and the quantity precision — not apply them in sequence.
+
+**L8c. An addendum test as written will now fail.**
+Task N3's `test_no_tastytrade_order_is_ever_priced_by_dollar_value` asserts
+`"NOTIONAL" not in source` for `TastyTradeAccount.py`. The new money constant
+`MIN_FRACTIONAL_NOTIONAL_USD` trips that substring. The test's real intent is "never emit
+`OrderType.NOTIONAL_MARKET`" — tighten it to `assert "NOTIONAL_MARKET" not in source`.
+
+**L8d. Task 81's line pointers have moved.** `MarginInfo` at `account_types.py:111-149` shifted
+~11 lines (units docstring + the new field); `test_account_types.py:98` shifted by two new tests.
+The planned widening of `fractionable` to `Optional[bool]` remains compatible.
+
+**L8e. Residual gap, documented not fixed.** `_apply_bp_scaling`'s synthetic `MarginInfo` — built
+when the `margin` dict is absent, i.e. the precheck path — carries no notional floor. Scaling a buy
+DOWN is exactly what pushes it under $5, so a caller that omits the margin dict can still produce a
+refusable order.
+
+**Policy choice worth revisiting:** the engine SUPPRESSES a sub-$5 fractional order rather than
+flooring it to whole shares. Flooring would sometimes salvage it (2.4 shares at $2 is $4.80, but
+2 shares is a legal $4.00), but that is a sizing decision needing an overshoot guard, which D1
+owns. Suppression never sends a refusable order and never overshoots; it only under-trades, and
+says so via `REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_FMT`.
