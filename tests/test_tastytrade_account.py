@@ -919,3 +919,30 @@ def test_refresh_orders_returns_false_when_the_fetch_fails():
     acct._account.get_order_history = AsyncMock(side_effect=RuntimeError("gateway timeout"))
 
     assert acct.refresh_orders() is False
+
+
+# ---------------------------------------------------------------------------
+# refresh_positions
+# ---------------------------------------------------------------------------
+
+def test_refresh_positions_returns_false_when_the_fetch_fails():
+    """A stub that always returns True tells callers the book was confirmed when it
+    was not."""
+    acct = _bare_account()
+    acct._account.get_positions = AsyncMock(side_effect=RuntimeError("connection reset"))
+
+    assert acct.refresh_positions() is False
+
+
+def test_refresh_positions_returns_true_when_the_book_was_read():
+    acct = _bare_account()
+    acct._account.get_positions = AsyncMock(return_value=[_tt_position(symbol="AAPL")])
+
+    assert acct.refresh_positions() is True
+
+
+def test_refresh_positions_returns_true_for_a_genuinely_flat_account():
+    acct = _bare_account()
+    acct._account.get_positions = AsyncMock(return_value=[])
+
+    assert acct.refresh_positions() is True

@@ -849,7 +849,19 @@ class TastyTradeAccount(AccountInterface):
         return False
 
     def refresh_positions(self) -> bool:
-        # Positions are always fetched live from API
+        """Confirm the broker's equity book is readable.
+
+        TastyTrade positions are always fetched live, so there is no cache to refresh
+        -- but the return value is a real signal that the broker answered. ``None``
+        from ``get_positions`` means the FETCH FAILED (not a flat account), so it maps
+        to False here, exactly as AlpacaAccount.refresh_positions does.
+        """
+        positions = self.get_positions()
+        if positions is None:
+            logger.error(f"[Account {self.id}] Error refreshing positions from TastyTrade: fetch failed")
+            return False
+        logger.info(
+            f"[Account {self.id}] Successfully refreshed {len(positions)} positions from TastyTrade")
         return True
 
     def refresh_orders(self, **kwargs) -> bool:
