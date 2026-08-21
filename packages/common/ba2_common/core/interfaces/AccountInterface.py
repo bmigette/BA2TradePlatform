@@ -1702,46 +1702,67 @@ class AccountInterface(ReadOnlyAccountInterface):
                                 broker_positions = None
                                 try:
                                     broker_positions = self.get_positions()
-                                    position_exists = any(
-                                        pos.get('symbol') == transaction.symbol if isinstance(pos, dict) 
-                                        else getattr(pos, 'symbol', None) == transaction.symbol
-                                        for pos in (broker_positions or [])
-                                    )
-                                    
-                                    if not position_exists:
-                                        logger.info(
-                                            f"Position {transaction.symbol} no longer exists at broker - "
-                                            f"marking transaction {transaction_id} as CLOSED without retry"
+                                    # get_positions() is TRI-STATE: a list on success, [] when the
+                                    # account is genuinely flat, and None when the FETCH ITSELF
+                                    # FAILED (network/DNS/auth). Collapsing None into [] via
+                                    # `broker_positions or []` made a transient broker outage read
+                                    # as "the position is gone" and FORCE-CLOSE a real, still-open
+                                    # transaction as position_not_at_broker (the 2026-07-03 DNS
+                                    # incident, in the shape AlpacaAccount.get_positions' docstring
+                                    # warns about). An unverified book is NOT an empty book: abort
+                                    # the close decision and fall through to the retry, exactly as
+                                    # the `except` branch below does for an exception and as
+                                    # ReadOnlyAccountInterface.reconcile_externally_closed_transactions
+                                    # does with `if positions is None: return 0`.
+                                    if broker_positions is None:
+                                        logger.error(
+                                            f"Cannot verify whether position {transaction.symbol} still exists "
+                                            f"at broker for transaction {transaction_id}: "
+                                            f"{self.__class__.__name__}.get_positions() returned None "
+                                            f"(FETCH FAILURE, not a flat account). Refusing to conclude the "
+                                            f"position is gone; proceeding with close order retry."
                                         )
-                                        # Mark the ERROR order as CANCELED (not needed anymore)
-                                        existing_close_order.status = OrderStatus.CANCELED
-                                        # Mark transaction as CLOSED with logging
-                                        from ba2_common.core.utils import close_transaction_with_logging
-                                        close_transaction_with_logging(
-                                            transaction=transaction,
-                                            account_id=self.id,
-                                            close_reason="position_not_at_broker",
-                                            session=session
+                                    else:
+                                        position_exists = any(
+                                            pos.get('symbol') == transaction.symbol if isinstance(pos, dict)
+                                            else getattr(pos, 'symbol', None) == transaction.symbol
+                                            for pos in broker_positions
                                         )
-                                        if inmem:
-                                            update_instance(existing_close_order)
-                                            update_instance(transaction)
-                                        else:
-                                            session.add(existing_close_order)
-                                            session.add(transaction)
-                                            session.commit()
-                                        
-                                        result['success'] = True
-                                        result['message'] = f'Transaction closed (position no longer at broker)'
-                                        logger.info(f"Transaction {transaction_id} marked as CLOSED - position already closed externally")
-                                        
-                                        # Skip the retry - position is already closed
-                                        if result['canceled_count'] > 0 or result['deleted_count'] > 0:
-                                            result['message'] += f' ({result["canceled_count"]} orders canceled, {result["deleted_count"]} waiting orders deleted)'
-                                        
-                                        # Continue to next transaction (don't retry order)
-                                        return result
-                                        
+
+                                        if not position_exists:
+                                            logger.info(
+                                                f"Position {transaction.symbol} no longer exists at broker - "
+                                                f"marking transaction {transaction_id} as CLOSED without retry"
+                                            )
+                                            # Mark the ERROR order as CANCELED (not needed anymore)
+                                            existing_close_order.status = OrderStatus.CANCELED
+                                            # Mark transaction as CLOSED with logging
+                                            from ba2_common.core.utils import close_transaction_with_logging
+                                            close_transaction_with_logging(
+                                                transaction=transaction,
+                                                account_id=self.id,
+                                                close_reason="position_not_at_broker",
+                                                session=session
+                                            )
+                                            if inmem:
+                                                update_instance(existing_close_order)
+                                                update_instance(transaction)
+                                            else:
+                                                session.add(existing_close_order)
+                                                session.add(transaction)
+                                                session.commit()
+
+                                            result['success'] = True
+                                            result['message'] = f'Transaction closed (position no longer at broker)'
+                                            logger.info(f"Transaction {transaction_id} marked as CLOSED - position already closed externally")
+
+                                            # Skip the retry - position is already closed
+                                            if result['canceled_count'] > 0 or result['deleted_count'] > 0:
+                                                result['message'] += f' ({result["canceled_count"]} orders canceled, {result["deleted_count"]} waiting orders deleted)'
+
+                                            # Continue to next transaction (don't retry order)
+                                            return result
+
                                 except Exception as pos_check_err:
                                     logger.warning(
                                         f"Could not verify if position {transaction.symbol} exists at broker: {pos_check_err}. "

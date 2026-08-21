@@ -252,6 +252,28 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         """
         Retrieve all current open positions in the account.
 
+        TRI-STATE CONTRACT -- ``None`` IS NOT ``[]``. This is the ONE seam in this
+        interface where a failure is reported as a distinct sentinel rather than
+        an empty result, and it is load-bearing:
+
+          * a non-empty list -- the positions the broker actually holds;
+          * ``[]``           -- the fetch SUCCEEDED and the account is genuinely FLAT;
+          * ``None``         -- the FETCH ITSELF FAILED (network/DNS/auth/API error).
+
+        IMPLEMENTERS: catch your broker's errors and ``return None``. Returning
+        ``[]`` on an exception is a CONTRACT VIOLATION -- it tells every caller
+        "the broker holds nothing", which is the input that auto-close logic acts
+        on. On 2026-07-03 a transient local DNS outage did exactly that and
+        force-closed 8 real open transactions in the DB while the broker held them
+        the entire time (see ``AlpacaAccount.get_positions``).
+
+        CALLERS: never write ``for pos in (positions or [])`` in code that decides
+        to CLOSE, CANCEL or SIZE something -- that idiom silently re-conflates the
+        two states and reintroduces the incident. Test ``is None`` FIRST and abort
+        the decision (``reconcile_externally_closed_transactions`` returns 0;
+        ``close_transaction`` falls through to a retry). ``or []`` is only
+        acceptable in read-only display code that must not crash.
+
         Returns:
             Any: A list or collection of position objects containing information such as:
                 - symbol: The asset symbol
@@ -259,6 +281,7 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                 - average_price: Average entry price
                 - current_price: Current market price
                 - unrealized_pl: Unrealized profit/loss
+            or ``None`` if the fetch failed.
         """
         pass
 
