@@ -1356,6 +1356,158 @@ def test_get_cash_transfers_nets_dividend_tax_off_the_gross_leg():
     assert transfers[0].amount == pytest.approx(1.33)
 
 
+def _history_by_type(money_movement=(), receive_deliver=()):
+    """A get_history side_effect that answers by the ``types`` it was asked for.
+
+    ``get_dividends`` makes TWO history calls (Receive Deliver / Dividend for the DRIP
+    share-receipt legs, then Money Movement for the cash) while ``get_cash_transfers``
+    makes one. Feeding both seams through this lets a single fixture drive them and be
+    compared -- which is the only direct way to see them disagree.
+    """
+    def _answer(session, **kwargs):
+        if kwargs.get("types") == ["Receive Deliver"]:
+            return list(receive_deliver)
+        return list(money_movement)
+    return AsyncMock(side_effect=_answer)
+
+
+def test_get_cash_transfers_nets_dividend_tax_once_across_two_gross_legs():
+    """I5 (MONEY BUG). A regular dividend and a special dividend can share a
+    (symbol, date) with ONE withholding line. The tax used to be subtracted from
+    EVERY gross leg, so a 1.00 + 0.57 pair with 0.24 tax posted 0.76 + 0.33 = 1.09
+    to the ledger instead of the 1.33 actually kept -- the account was under-credited
+    by the full tax again, once per extra leg."""
+    from ba2_trade_platform.core.account_types import CASH_TRANSFER_DIVIDEND
+
+    acct = _bare_account()
+    acct._account.get_history = AsyncMock(return_value=[
+        _money_movement(9101, "Dividend", "1.00", underlying_symbol="TIDL"),
+        _money_movement(9102, "Dividend", "0.57", underlying_symbol="TIDL"),
+        _money_movement(9103, "Dividend", "-0.24", underlying_symbol="TIDL"),
+    ])
+
+    transfers = acct.get_cash_transfers()
+
+    assert [t.event_type for t in transfers] == [CASH_TRANSFER_DIVIDEND] * 2
+    # Each gross leg keeps its OWN broker id: (account_id, external_id) is the
+    # portfolio_income_event idempotency key, so a re-sync must upsert both rows.
+    assert [t.external_id for t in transfers] == ["9101", "9102"]
+    assert sum(t.amount for t in transfers) == pytest.approx(1.33)
+
+
+def test_get_cash_transfers_allocates_dividend_tax_pro_rata_across_the_legs():
+    """The 0.24 tax belongs to the whole (symbol, date), so it is split in proportion
+    to each leg's gross -- and the split sums to the cent."""
+    acct = _bare_account()
+    acct._account.get_history = AsyncMock(return_value=[
+        _money_movement(9101, "Dividend", "1.00", underlying_symbol="TIDL"),
+        _money_movement(9102, "Dividend", "0.57", underlying_symbol="TIDL"),
+        _money_movement(9103, "Dividend", "-0.24", underlying_symbol="TIDL"),
+    ])
+
+    by_id = {t.external_id: t.amount for t in acct.get_cash_transfers()}
+
+    assert by_id == {"9101": pytest.approx(0.85), "9102": pytest.approx(0.48)}
+
+
+def test_get_cash_transfers_never_emits_a_negative_dividend_for_a_tiny_correction():
+    """I5. A 0.10 correction alongside a 1.47 regular dividend with 0.24 tax used to
+    emit `amount=-0.14` for the correction: a NEGATIVE dividend, though CashTransfer
+    documents `amount` as POSITIVE for dividends and `is_income` gates on amount > 0.
+    A clawback must never be published as negative income."""
+    acct = _bare_account()
+    acct._account.get_history = AsyncMock(return_value=[
+        _money_movement(9201, "Dividend", "0.10", underlying_symbol="TIDL"),
+        _money_movement(9202, "Dividend", "1.47", underlying_symbol="TIDL"),
+        _money_movement(9203, "Dividend", "-0.24", underlying_symbol="TIDL"),
+    ])
+
+    transfers = acct.get_cash_transfers()
+
+    assert all(t.amount >= 0 for t in transfers), [t.amount for t in transfers]
+    assert sum(t.amount for t in transfers) == pytest.approx(1.33)
+
+
+def test_get_cash_transfers_floors_a_dividend_at_zero_when_tax_exceeds_the_gross():
+    """Withholding larger than the gross it belongs to is a CORRECTION, not negative
+    income. The row is still emitted (keeping its broker id, so a re-sync overwrites
+    a previously credited amount) but at 0.00, which `is_income` rejects."""
+    acct = _bare_account()
+    acct._account.get_history = AsyncMock(return_value=[
+        _money_movement(9301, "Dividend", "1.00", underlying_symbol="TIDL"),
+        _money_movement(9302, "Dividend", "-1.50", underlying_symbol="TIDL"),
+    ])
+
+    transfers = acct.get_cash_transfers()
+
+    assert [t.external_id for t in transfers] == ["9301"]
+    assert transfers[0].amount == 0.0
+    assert transfers[0].is_income is False
+
+
+def test_get_cash_transfers_keeps_each_symbols_tax_on_its_own_dividend():
+    """Two symbols paying on the SAME date must not cross-net."""
+    acct = _bare_account()
+    acct._account.get_history = AsyncMock(return_value=[
+        _money_movement(9401, "Dividend", "1.00", underlying_symbol="TIDL"),
+        _money_movement(9402, "Dividend", "-0.20", underlying_symbol="TIDL"),
+        _money_movement(9403, "Dividend", "5.00", underlying_symbol="SCHD"),
+    ])
+
+    by_symbol = {t.symbol: t.amount for t in acct.get_cash_transfers()}
+
+    assert by_symbol == {"TIDL": pytest.approx(0.80), "SCHD": pytest.approx(5.00)}
+
+
+@pytest.mark.parametrize("legs", [
+    # one gross leg + tax (the plain case)
+    [("Dividend", "1.57"), ("Dividend", "-0.24")],
+    # regular + special sharing one withholding line
+    [("Dividend", "1.00"), ("Dividend", "0.57"), ("Dividend", "-0.24")],
+    # a tiny correction alongside the regular dividend
+    [("Dividend", "0.10"), ("Dividend", "1.47"), ("Dividend", "-0.24")],
+    # withholding bigger than the gross
+    [("Dividend", "1.00"), ("Dividend", "-1.50")],
+    # no withholding at all
+    [("Dividend", "2.25")],
+])
+def test_cash_transfers_and_dividends_agree_on_the_same_history(legs):
+    """I5. `get_cash_transfers` and `get_dividends` are two seams onto ONE broker
+    history, and the ledger reads the first while the reporting UI reads the second.
+    They disagreed by exactly the withholding for every multi-leg dividend, which is
+    the clearest symptom of the double-subtraction. Pin the agreement directly."""
+    from ba2_trade_platform.core.account_types import CASH_TRANSFER_DIVIDEND
+
+    rows = [_money_movement(9500 + i, sub_type, value, underlying_symbol="TIDL")
+            for i, (sub_type, value) in enumerate(legs)]
+
+    ledger = _bare_account()
+    ledger._account.get_history = _history_by_type(money_movement=rows)
+    reported = _bare_account()
+    reported._account.get_history = _history_by_type(money_movement=rows)
+
+    from_transfers = sum(t.amount for t in ledger.get_cash_transfers()
+                         if t.event_type == CASH_TRANSFER_DIVIDEND)
+    from_dividends = sum(d["amount"] for d in reported.get_dividends())
+
+    assert from_transfers == pytest.approx(from_dividends)
+
+
+def test_get_dividends_never_reports_a_negative_amount():
+    """The same floor as the ledger seam: a withholding correction is 0.00 income."""
+    acct = _bare_account()
+    acct._account.get_history = _history_by_type(money_movement=[
+        _money_movement(9601, "Dividend", "1.00", underlying_symbol="TIDL"),
+        _money_movement(9602, "Dividend", "-1.50", underlying_symbol="TIDL"),
+    ])
+
+    dividends = acct.get_dividends()
+
+    assert [d["amount"] for d in dividends] == [0.0]
+    assert dividends[0]["gross_amount"] == 1.00
+    assert dividends[0]["tax_withheld"] == 1.50
+
+
 def test_get_cash_transfers_reports_a_withdrawal_as_negative_and_not_income():
     from ba2_trade_platform.core.account_types import CASH_TRANSFER_WITHDRAWAL
 

@@ -1177,6 +1177,68 @@ class TastyTradeAccount(AccountInterface):
             f"{mapped_count} mapped via external_identifier")
         return True
 
+    @staticmethod
+    def _net_dividend(gross_total: float, tax_total: float) -> float:
+        """The NET dividend kept for ONE ``(symbol, transaction_date)``.
+
+        THE single definition of a net dividend for this adapter: both
+        ``get_dividends`` and ``get_cash_transfers`` derive from it, so the two seams
+        can never disagree about the same broker history (they did: a multi-leg
+        dividend came out of the ledger seam short by the whole withholding).
+
+        FLOORED AT ZERO. ``CashTransfer.amount`` is documented POSITIVE for a dividend
+        and ``is_income`` gates the ledger on ``amount > 0``; withholding larger than
+        the gross it belongs to is a CORRECTION, not negative income.
+        """
+        gross = round(float(gross_total), 2)
+        tax = round(abs(float(tax_total)), 2)
+        if tax > gross:
+            logger.warning(
+                f"Dividend withholding {tax:.2f} exceeds the {gross:.2f} gross it "
+                f"belongs to; reporting 0.00 income rather than a negative dividend")
+        net = round(gross - tax, 2)
+        return net if net > 0 else 0.0
+
+    @classmethod
+    def _net_dividend_legs(cls, gross_values, tax_total) -> List[float]:
+        """Split ONE ``(symbol, date)``'s net dividend back across its GROSS legs.
+
+        TastyTrade posts a dividend as one or MORE positive ``Money Movement`` /
+        ``Dividend`` legs (a regular dividend, a special dividend, a correction) plus
+        at most one negative withholding leg, all sharing ``(symbol,
+        transaction_date)``.
+
+        The tax is allocated PRO RATA across that key's gross legs. The two
+        alternatives were both worse:
+          * subtracting the key's whole tax from EVERY gross leg -- what this used to
+            do -- charged the tax once per leg (1.00 + 0.57 with 0.24 tax posted 1.09
+            instead of 1.33) and could drive a small leg NEGATIVE; and
+          * collapsing the key to a single row would drop the other legs' broker ids,
+            and ``(account_id, external_id)`` is the ``portfolio_income_event``
+            idempotency key -- a previously synced leg would be stranded at its old,
+            wrong amount forever instead of being upserted.
+
+        Returns:
+            List[float]: one net amount per gross leg, in the given order, each
+            rounded to cents, each ``>= 0``, summing EXACTLY to
+            ``_net_dividend(sum(gross), tax)``.
+        """
+        gross = [round(float(g), 2) for g in gross_values]
+        if not gross:
+            return []
+        total_gross = round(sum(gross), 2)
+        target = cls._net_dividend(total_gross, tax_total)
+        if total_gross <= 0 or target <= 0:
+            return [0.0] * len(gross)
+        nets = [round(g * target / total_gross, 2) for g in gross]
+        # Largest-remainder: park the rounding residual on the BIGGEST leg so the
+        # allocation sums to the key's net to the cent.
+        residual = round(target - round(sum(nets), 2), 2)
+        if residual:
+            biggest = max(range(len(gross)), key=lambda i: gross[i])
+            nets[biggest] = round(nets[biggest] + residual, 2)
+        return [n if n > 0 else 0.0 for n in nets]
+
     def get_dividends(self, symbol=None, start_date=None, end_date=None) -> List[Dict]:
         """Return one record per dividend the account received.
 
@@ -1262,7 +1324,9 @@ class TastyTradeAccount(AccountInterface):
                 drip_qty, drip_price = drip_map.get(key, (None, None))
                 dividends.append({
                     'symbol': sym,
-                    'amount': round(gross - tax, 2),   # NET dividend (income kept)
+                    # NET dividend (income kept). Same helper get_cash_transfers uses,
+                    # so the two seams cannot disagree about the same history.
+                    'amount': self._net_dividend(gross, tax),
                     'gross_amount': gross,
                     'tax_withheld': tax,
                     'date': d,
@@ -1289,10 +1353,12 @@ class TastyTradeAccount(AccountInterface):
         ``portfolio_income_event`` -- so re-syncing a window upserts instead of
         duplicating.
 
-        A dividend arrives as a POSITIVE gross leg plus (optionally) a NEGATIVE tax leg
-        sharing the same ``(symbol, transaction_date)``. ONE CashTransfer is emitted per
-        GROSS leg, keeping that leg's own id, with the tax netted off its amount -- so
-        the ledger records the income actually KEPT and the id stays 1:1.
+        A dividend arrives as one or MORE positive gross legs plus (optionally) a
+        NEGATIVE tax leg, all sharing the same ``(symbol, transaction_date)``. ONE
+        CashTransfer is emitted per GROSS leg, keeping that leg's own id, and the key's
+        withholding is netted ONCE -- allocated pro rata across its legs by
+        ``_net_dividend_legs`` -- so the ledger records the income actually KEPT and the
+        id stays 1:1. A DIVIDEND amount is never negative.
 
         Returns:
             List[CashTransfer]: ``[]`` on failure as well as on genuine emptiness (this
@@ -1313,21 +1379,34 @@ class TastyTradeAccount(AccountInterface):
             logger.error(f"[Account {self.id}] Error fetching cash transfers: {e}", exc_info=True)
             return []
 
-        # Pass 1: collect withholding tax per (symbol, date) so it can be netted off
-        # its OWN symbol's gross dividend and never emitted as a phantom negative one.
-        tax_by_key = {}
-        for txn in transactions:
+        # Pass 1: GROUP the dividend legs by (symbol, date). Withholding belongs to the
+        # whole key, so it must be netted ONCE across that key's gross legs -- taking
+        # the key's whole tax off EVERY gross leg charged it once per leg.
+        gross_legs = {}   # (symbol, date) -> [(row index, gross amount), ...]
+        tax_by_key = {}   # (symbol, date) -> withholding, as a positive magnitude
+        for index, txn in enumerate(transactions):
             if getattr(txn, "transaction_sub_type", None) != "Dividend":
                 continue
             net_value = float(getattr(txn, "net_value", 0) or 0)
-            if net_value >= 0:
-                continue
             key = (getattr(txn, "underlying_symbol", None) or getattr(txn, "symbol", None),
                    getattr(txn, "transaction_date", None))
-            tax_by_key[key] = tax_by_key.get(key, 0.0) + abs(net_value)
+            if net_value > 0:
+                gross_legs.setdefault(key, []).append((index, net_value))
+            elif net_value < 0:
+                tax_by_key[key] = tax_by_key.get(key, 0.0) + abs(net_value)
+
+        # Pass 2: allocate each key's tax across its OWN gross legs, pro rata. An
+        # orphan tax line (no matching gross) is simply never emitted -- it is not a
+        # phantom negative dividend.
+        net_by_index = {}
+        for key, legs in gross_legs.items():
+            nets = self._net_dividend_legs([gross for _, gross in legs],
+                                           tax_by_key.get(key, 0.0))
+            for (index, _), net in zip(legs, nets):
+                net_by_index[index] = net
 
         transfers = []
-        for txn in transactions:
+        for index, txn in enumerate(transactions):
             external_id = str(getattr(txn, "id", "") or "")
             event_date = getattr(txn, "transaction_date", None)
             if not external_id or event_date is None:
@@ -1338,9 +1417,9 @@ class TastyTradeAccount(AccountInterface):
 
             if sub_type == "Dividend":
                 if net_value <= 0:
-                    continue  # a tax leg -- already netted onto its gross row
+                    continue  # a tax leg -- already netted across its key's gross rows
                 symbol = getattr(txn, "underlying_symbol", None) or getattr(txn, "symbol", None)
-                amount = round(net_value - tax_by_key.get((symbol, event_date), 0.0), 2)
+                amount = net_by_index[index]
                 transfers.append(CashTransfer(
                     external_id=external_id, event_date=event_date,
                     event_type=CASH_TRANSFER_DIVIDEND, amount=amount,
