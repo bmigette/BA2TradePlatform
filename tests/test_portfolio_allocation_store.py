@@ -281,3 +281,87 @@ def test_consumption_is_scoped_to_one_account(account_id):
     store.consume_income(account_id, 100.0)
     assert store.get_open_income_total(account_id) == 0.0
     assert store.get_open_income_total(other.id) == pytest.approx(100.0)
+
+
+# --- run audit -------------------------------------------------------------
+
+def test_record_allocation_run_persists_the_plan_and_order_ids(account_id):
+    run = store.record_allocation_run(
+        account_id, "REBALANCE", {"rows": [{"symbol": "TSLA"}], "scale_factor": 0.61},
+        base_notional=50_000.0, available_buying_power=20_000.0, allow_fractional=True,
+        submitted_buy_value=8000.0, submitted_sell_value=3000.0, order_ids=[7, 8])
+    assert run.id is not None
+    stored = store.get_recent_runs(account_id)[0]
+    assert stored.mode == "REBALANCE"
+    assert stored.plan_json["scale_factor"] == 0.61
+    assert stored.order_ids == [7, 8]
+    assert stored.allow_fractional is True
+    assert stored.net_buy_value == 5000.0
+
+
+def test_recent_runs_are_newest_first_and_respect_the_limit(account_id):
+    for i in range(3):
+        store.record_allocation_run(account_id, "INVEST_LABEL", {}, scope_label=f"L{i}")
+    runs = store.get_recent_runs(account_id, limit=2)
+    assert [r.scope_label for r in runs] == ["L2", "L1"]
+
+
+def test_recent_runs_is_empty_for_an_account_that_never_ran(account_id):
+    assert store.get_recent_runs(account_id) == []
+
+
+def test_update_allocation_run_totals_writes_back_what_was_actually_submitted(account_id):
+    """The run row is created BEFORE submission so its id can be stamped into every
+    order comment, then updated with the real totals afterwards."""
+    run = store.record_allocation_run(account_id, "REBALANCE", {"rows": []},
+                                      base_notional=10_000.0)
+    updated = store.update_allocation_run_totals(
+        run.id, submitted_buy_value=1600.0, submitted_sell_value=400.0, order_ids=[101, 102])
+    assert updated.submitted_buy_value == 1600.0
+    assert updated.submitted_sell_value == 400.0
+    assert updated.order_ids == [101, 102]
+    assert updated.net_buy_value == 1200.0
+    assert store.get_recent_runs(account_id)[0].order_ids == [101, 102]
+
+
+def test_a_run_funded_entirely_by_its_own_sells_has_no_net_buy_value(account_id):
+    """``net_buy_value`` clamps at 0 so such a rebalance consumes NO income."""
+    run = store.record_allocation_run(account_id, "REBALANCE", {},
+                                      submitted_buy_value=4000.0, submitted_sell_value=9000.0)
+    assert run.net_buy_value == 0.0
+    assert store.consume_income(account_id, run.net_buy_value) == []
+
+
+def test_update_allocation_run_totals_rejects_a_missing_total(account_id):
+    """A None total would silently understate net_buy_value and under-consume the
+    ledger, so it must raise HERE -- not deep inside ``float(None)``."""
+    run = store.record_allocation_run(account_id, "REBALANCE", {})
+    with pytest.raises(ValueError, match="both totals"):
+        store.update_allocation_run_totals(
+            run.id, submitted_buy_value=None, submitted_sell_value=0.0, order_ids=[])
+
+
+def test_update_allocation_run_totals_raises_when_the_run_is_gone():
+    from ba2_common.core.db import InstanceNotFound
+    with pytest.raises(InstanceNotFound):
+        store.update_allocation_run_totals(
+            999_999, submitted_buy_value=1.0, submitted_sell_value=0.0, order_ids=[])
+
+
+def test_a_run_row_written_by_raw_sql_reads_back_with_null_json(account_id):
+    """plan_json/order_ids are nullable JSON with PYTHON-side defaults, so a row
+    that did not go through this module lands NULL, not {}/[]. Reads must cope."""
+    from sqlalchemy import text
+    from ba2_common.core.db import get_db
+    with get_db() as session:
+        session.exec(text(
+            "INSERT INTO portfolio_allocation_run "
+            "(account_id, mode, base_notional, available_buying_power, allow_fractional, "
+            " submitted_buy_value, submitted_sell_value, created_at) "
+            "VALUES (:aid, 'REBALANCE', 0, 0, 0, 0, 0, '2026-08-20 00:00:00')"
+        ), params={"aid": account_id})
+        session.commit()
+    row = store.get_recent_runs(account_id)[0]
+    assert row.plan_json is None
+    assert row.order_ids is None
+    assert row.net_buy_value == 0.0

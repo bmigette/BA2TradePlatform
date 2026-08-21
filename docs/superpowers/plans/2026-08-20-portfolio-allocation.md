@@ -4291,7 +4291,7 @@ git commit -m "feat(allocation): FIFO income consumption against a run's net buy
 - Modify: `packages/common/ba2_common/core/portfolio_allocation_store.py` (append)
 - Test: `tests/test_portfolio_allocation_store.py` (append)
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Append to the end of `tests/test_portfolio_allocation_store.py`:
 
@@ -4337,14 +4337,60 @@ def test_update_allocation_run_totals_writes_back_what_was_actually_submitted(ac
     assert updated.order_ids == [101, 102]
     assert updated.net_buy_value == 1200.0
     assert store.get_recent_runs(account_id)[0].order_ids == [101, 102]
+
+
+def test_a_run_funded_entirely_by_its_own_sells_has_no_net_buy_value(account_id):
+    """``net_buy_value`` clamps at 0 so such a rebalance consumes NO income."""
+    run = store.record_allocation_run(account_id, "REBALANCE", {},
+                                      submitted_buy_value=4000.0, submitted_sell_value=9000.0)
+    assert run.net_buy_value == 0.0
+    assert store.consume_income(account_id, run.net_buy_value) == []
+
+
+def test_update_allocation_run_totals_rejects_a_missing_total(account_id):
+    """A None total would silently understate net_buy_value and under-consume the
+    ledger, so it must raise HERE -- not deep inside ``float(None)``."""
+    run = store.record_allocation_run(account_id, "REBALANCE", {})
+    with pytest.raises(ValueError, match="both totals"):
+        store.update_allocation_run_totals(
+            run.id, submitted_buy_value=None, submitted_sell_value=0.0, order_ids=[])
+
+
+def test_update_allocation_run_totals_raises_when_the_run_is_gone():
+    from ba2_common.core.db import InstanceNotFound
+    with pytest.raises(InstanceNotFound):
+        store.update_allocation_run_totals(
+            999_999, submitted_buy_value=1.0, submitted_sell_value=0.0, order_ids=[])
+
+
+def test_a_run_row_written_by_raw_sql_reads_back_with_null_json(account_id):
+    """plan_json/order_ids are nullable JSON with PYTHON-side defaults, so a row
+    that did not go through this module lands NULL, not {}/[]. Reads must cope."""
+    from sqlalchemy import text
+    from ba2_common.core.db import get_db
+    with get_db() as session:
+        session.exec(text(
+            "INSERT INTO portfolio_allocation_run "
+            "(account_id, mode, base_notional, available_buying_power, allow_fractional, "
+            " submitted_buy_value, submitted_sell_value, created_at) "
+            "VALUES (:aid, 'REBALANCE', 0, 0, 0, 0, 0, '2026-08-20 00:00:00')"
+        ), params={"aid": account_id})
+        session.commit()
+    row = store.get_recent_runs(account_id)[0]
+    assert row.plan_json is None
+    assert row.order_ids is None
+    assert row.net_buy_value == 0.0
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+`net_buy_value` is a plain `@property` on `PortfolioAllocationRun` (added with the model in
+Task 7), NOT a column — no Alembic change is needed for any of this.
+
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_store.py -v`
 Expected: FAIL — `AttributeError: module 'ba2_common.core.portfolio_allocation_store' has no attribute 'record_allocation_run'`
 
-- [ ] **Step 3: Write minimal implementation**
+- [x] **Step 3: Write minimal implementation**
 
 Append to the end of `packages/common/ba2_common/core/portfolio_allocation_store.py`:
 
@@ -4368,7 +4414,10 @@ def record_allocation_run(account_id: int, mode: str, plan_json: Dict[str, Any],
     ``mode`` is a plain str -- pass ``ALLOCATION_MODE_REBALANCE`` or
     ``ALLOCATION_MODE_INVEST_LABEL`` from ``ba2_common.core.portfolio_allocation``.
     ``plan_json`` is ``AllocationPlan.to_dict()`` captured at submit time, which
-    keeps the dry-run reproducible after the weights change.
+    keeps the dry-run reproducible after the weights change -- including its
+    ``valuation_mode``, so the row stays interpretable after the account's mode
+    toggle changes. Note ``base_notional`` carries the plan's TWO meanings: the
+    allocatable base in a REBALANCE, the budget in an INVEST_LABEL run.
 
     The live service calls this BEFORE submitting, with zero submitted values, so
     the run id exists to stamp into every order comment; it then calls
@@ -4376,6 +4425,9 @@ def record_allocation_run(account_id: int, mode: str, plan_json: Dict[str, Any],
 
     This does NOT consume income: call ``consume_income(account_id,
     run.net_buy_value)`` next, so the two writes stay separately auditable.
+
+    Every argument is written WHOLESALE -- there is no "None means leave
+    unchanged" here, because the row does not exist yet.
     """
     with get_db() as session:
         row = PortfolioAllocationRun(
@@ -4405,11 +4457,23 @@ def update_allocation_run_totals(run_id: int, *,
                                  order_ids: List[int]) -> PortfolioAllocationRun:
     """Write back what a run ACTUALLY submitted, after the orders have gone out.
 
+    Both totals are RESTATED wholesale, never merged: they are the final tally of
+    a finished submission loop, and ``None`` is rejected rather than read as
+    "leave unchanged" -- a missing money figure would silently understate
+    ``net_buy_value`` and so under-consume the income ledger.
+
     Raises:
+        ValueError: when either total is None.
         InstanceNotFound: when the run row is gone. That is a real inconsistency
         (the run was recorded seconds earlier) and must not be swallowed.
     """
     from ba2_common.core.db import InstanceNotFound
+
+    if submitted_buy_value is None or submitted_sell_value is None:
+        raise ValueError(
+            f"update_allocation_run_totals({run_id}) needs both totals as numbers, got "
+            f"buys={submitted_buy_value!r} sells={submitted_sell_value!r}; pass 0.0 for "
+            f"'nothing was submitted'")
 
     with get_db() as session:
         row = session.exec(
@@ -4428,7 +4492,13 @@ def update_allocation_run_totals(run_id: int, *,
 
 
 def get_recent_runs(account_id: int, limit: int = 20) -> List[PortfolioAllocationRun]:
-    """The account's most recent allocation runs, NEWEST first."""
+    """The account's most recent allocation runs, NEWEST first.
+
+    ``plan_json`` / ``order_ids`` come back as ``None`` -- not ``{}`` / ``[]`` --
+    on a row written outside this module (raw SQL, an old migration), because the
+    columns are nullable JSON whose defaults are applied Python-side. Callers
+    must tolerate that.
+    """
     with get_db() as session:
         rows = session.exec(
             select(PortfolioAllocationRun)
@@ -4445,12 +4515,12 @@ The `id.desc()` tiebreak on top of `created_at.desc()` matters: three runs recor
 test tick share a `created_at` to the microsecond, and without the tiebreak their order is
 whatever SQLite returns.
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_store.py -v`
-Expected: PASS — `39 passed`
+Expected: PASS — `46 passed` (Tasks 9-13 left 38 tests in this file; the 8 above are new).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add packages/common/ba2_common/core/portfolio_allocation_store.py tests/test_portfolio_allocation_store.py

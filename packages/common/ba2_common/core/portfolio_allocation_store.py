@@ -508,3 +508,117 @@ def consume_income(account_id: int, net_buy_value: float) -> List[Tuple[int, flo
     logger.info(f"Allocation run consumed {len(consumed)} income event(s) for account "
                 f"{account_id} against a net buy value of {net_buy_value:.2f}")
     return consumed
+
+
+# ---------------------------------------------------------------------------
+# Run audit
+# ---------------------------------------------------------------------------
+
+def record_allocation_run(account_id: int, mode: str, plan_json: Dict[str, Any], *,
+                          scope_label: Optional[str] = None,
+                          base_notional: float = 0.0,
+                          available_buying_power: float = 0.0,
+                          allow_fractional: bool = False,
+                          submitted_buy_value: float = 0.0,
+                          submitted_sell_value: float = 0.0,
+                          order_ids: Optional[List[int]] = None) -> PortfolioAllocationRun:
+    """Persist the audit row for one allocation run.
+
+    ``mode`` is a plain str -- pass ``ALLOCATION_MODE_REBALANCE`` or
+    ``ALLOCATION_MODE_INVEST_LABEL`` from ``ba2_common.core.portfolio_allocation``.
+    ``plan_json`` is ``AllocationPlan.to_dict()`` captured at submit time, which
+    keeps the dry-run reproducible after the weights change -- including its
+    ``valuation_mode``, so the row stays interpretable after the account's mode
+    toggle changes. Note ``base_notional`` carries the plan's TWO meanings: the
+    allocatable base in a REBALANCE, the budget in an INVEST_LABEL run.
+
+    The live service calls this BEFORE submitting, with zero submitted values, so
+    the run id exists to stamp into every order comment; it then calls
+    ``update_allocation_run_totals`` with what was actually submitted.
+
+    This does NOT consume income: call ``consume_income(account_id,
+    run.net_buy_value)`` next, so the two writes stay separately auditable.
+
+    Every argument is written WHOLESALE -- there is no "None means leave
+    unchanged" here, because the row does not exist yet.
+    """
+    with get_db() as session:
+        row = PortfolioAllocationRun(
+            account_id=account_id,
+            mode=mode,
+            scope_label=scope_label,
+            base_notional=float(base_notional),
+            available_buying_power=float(available_buying_power),
+            allow_fractional=bool(allow_fractional),
+            plan_json=plan_json or {},
+            submitted_buy_value=float(submitted_buy_value),
+            submitted_sell_value=float(submitted_sell_value),
+            order_ids=list(order_ids or []),
+        )
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        session.expunge(row)
+        logger.info(f"Recorded allocation run {row.id} ({mode}) for account {account_id}: "
+                    f"buys {row.submitted_buy_value:.2f} / sells {row.submitted_sell_value:.2f}")
+        return row
+
+
+def update_allocation_run_totals(run_id: int, *,
+                                 submitted_buy_value: float,
+                                 submitted_sell_value: float,
+                                 order_ids: List[int]) -> PortfolioAllocationRun:
+    """Write back what a run ACTUALLY submitted, after the orders have gone out.
+
+    Both totals are RESTATED wholesale, never merged: they are the final tally of
+    a finished submission loop, and ``None`` is rejected rather than read as
+    "leave unchanged" -- a missing money figure would silently understate
+    ``net_buy_value`` and so under-consume the income ledger.
+
+    Raises:
+        ValueError: when either total is None.
+        InstanceNotFound: when the run row is gone. That is a real inconsistency
+        (the run was recorded seconds earlier) and must not be swallowed.
+    """
+    from ba2_common.core.db import InstanceNotFound
+
+    if submitted_buy_value is None or submitted_sell_value is None:
+        raise ValueError(
+            f"update_allocation_run_totals({run_id}) needs both totals as numbers, got "
+            f"buys={submitted_buy_value!r} sells={submitted_sell_value!r}; pass 0.0 for "
+            f"'nothing was submitted'")
+
+    with get_db() as session:
+        row = session.exec(
+            select(PortfolioAllocationRun).where(PortfolioAllocationRun.id == run_id)
+        ).first()
+        if row is None:
+            raise InstanceNotFound(f"PortfolioAllocationRun {run_id} not found")
+        row.submitted_buy_value = float(submitted_buy_value)
+        row.submitted_sell_value = float(submitted_sell_value)
+        row.order_ids = list(order_ids or [])
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        session.expunge(row)
+        return row
+
+
+def get_recent_runs(account_id: int, limit: int = 20) -> List[PortfolioAllocationRun]:
+    """The account's most recent allocation runs, NEWEST first.
+
+    ``plan_json`` / ``order_ids`` come back as ``None`` -- not ``{}`` / ``[]`` --
+    on a row written outside this module (raw SQL, an old migration), because the
+    columns are nullable JSON whose defaults are applied Python-side. Callers
+    must tolerate that.
+    """
+    with get_db() as session:
+        rows = session.exec(
+            select(PortfolioAllocationRun)
+            .where(PortfolioAllocationRun.account_id == account_id)
+            .order_by(PortfolioAllocationRun.created_at.desc(), PortfolioAllocationRun.id.desc())
+            .limit(limit)
+        ).all()
+        rows = list(rows)
+        session.expunge_all()
+        return rows
