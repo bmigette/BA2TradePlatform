@@ -53,10 +53,16 @@ __all__ = [
     "VALUATION_MODE_COST", "VALUATION_MODE_MARKET",
     # tolerances and grid
     "DEFAULT_FRACTIONAL_DECIMALS", "LABEL_TOTAL_TOLERANCE_PCT",
-    "QUANTITY_EPSILON", "MONEY_EPSILON",
+    "QUANTITY_EPSILON", "MONEY_EPSILON", "BUMP_TO_ONE_SHARE_MAX_MULTIPLE",
+    # per-row sizing outcomes (D1)
+    "SIZING_OUTCOME_NORMAL", "SIZING_OUTCOME_BUMPED", "SIZING_OUTCOME_SKIPPED_TOO_LARGE",
     # reason / warning / error strings
     "REASON_NO_PRICE", "REASON_NOT_MARGINABLE", "REASON_FRACTIONAL",
-    "REASON_WHOLE_SHARE_FLOOR", "REASON_NEGATIVE_CLAMPED", "REASON_CLOSE_TO_ZERO",
+    "REASON_WHOLE_SHARE_FLOOR", "REASON_FRACTIONAL_UNKNOWN",
+    "REASON_NEGATIVE_CLAMPED", "REASON_CLOSE_TO_ZERO",
+    "REASON_BUMPED_TO_ONE_SHARE_FMT", "REASON_BELOW_ONE_SHARE_FMT",
+    "REASON_BUMP_BLOCKED_MIN_ORDER_FMT", "REASON_ROUNDS_TO_ZERO_FMT",
+    "REASON_FRACTIONAL_FLOOR_BUMPED_FMT", "REASON_FRACTIONAL_FLOOR_SKIPPED_FMT",
     "REASON_BELOW_MIN_ORDER_FMT", "REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_FMT",
     "REASON_MULTI_LABEL_FMT", "REASON_SCALED_FMT",
     "REASON_SCALED_PREFIX", "REASON_BELOW_MIN_ORDER_PREFIX",
@@ -70,6 +76,7 @@ __all__ = [
     "build_symbol_targets", "validate_symbol_weights", "validate_label_targets",
     "compute_base_notional", "compute_allocation", "compute_label_investment",
     "apply_order_impacts", "consume_income_events",
+    "tradeable_unit", "size_sub_unit_target",
     # submission
     "ACTION_ADJUST", "ACTION_CLOSE", "ACTION_NEW", "ACTION_SKIP",
     "decide_symbol_action", "split_delta_fifo",
@@ -118,8 +125,74 @@ REASON_NO_PRICE = "no price - skipped"
 REASON_NOT_MARGINABLE = "⚠ not marginable"
 REASON_FRACTIONAL = "fractional"
 REASON_WHOLE_SHARE_FLOOR = "rounded down to whole shares"
+#: Fractional was requested but the broker did not SAY whether this symbol is
+#: eligible: either no ``MarginInfo`` row at all, or one whose ``fractionable`` is
+#: ``None``. DISTINCT from REASON_WHOLE_SHARE_FLOOR, which means the broker
+#: positively answered "not fractionable". One is a data gap the user can fix with
+#: Refresh; the other is a fact about the instrument. TastyTrade's own flag is
+#: tri-state (``Equity.is_fractional_quantity_eligible: bool | None``), so
+#: "unknown" is a real state, not a bug.
+REASON_FRACTIONAL_UNKNOWN = "fractionable unknown - whole shares"
 REASON_NEGATIVE_CLAMPED = "negative target clamped to 0"
 REASON_CLOSE_TO_ZERO = "target 0 - close position"
+
+#: How far ONE tradeable unit may overshoot a target before the bump is refused.
+#: 1.5 == "one share may cost at most 150% of what this symbol was allocated".
+#:
+#: ONE constant, quoted in the refusal message, never a scattered literal. The value
+#: is set so the two worked examples of the decision land on opposite sides of it: a
+#: 200 target on a 300 share (150%) is the case that must be filled and sits exactly
+#: ON the bound (the comparison is inclusive), and a 50 target on a 500 share (1000%)
+#: is the case that must be refused. It also bounds the damage: the worst bump
+#: over-allocates its symbol by 50% of that symbol's target, which is normally inside
+#: what ``redistribute_label_residuals`` can take back off the label's fractionable
+#: siblings. At 2x and above the excess routinely exceeds what the siblings hold and
+#: the label is left structurally over target with nothing able to fix it.
+BUMP_TO_ONE_SHARE_MAX_MULTIPLE = 1.5
+
+#: What the sizing rules DID to a row, so the dry run never has to pattern-match
+#: reason prose. A bump is a deliberate over-allocation and must be visible.
+SIZING_OUTCOME_NORMAL = "normal"                        #: ordinary grid rounding
+SIZING_OUTCOME_BUMPED = "bumped-to-1"                   #: under one unit, bumped UP
+SIZING_OUTCOME_SKIPPED_TOO_LARGE = "skipped-too-large"  #: under one unit, one unit too big
+
+#: The bump happened: the whole intended position was smaller than one tradeable
+#: unit and one unit was inside BUMP_TO_ONE_SHARE_MAX_MULTIPLE, so the symbol is
+#: OVER-allocated on purpose and the sentence says by how much.
+#: Must not start with "below" and must not contain "held" -- both are pinned by
+#: the landed suite (test_portfolio_allocation.py's min-order-size scenarios).
+REASON_BUMPED_TO_ONE_SHARE_FMT = (
+    "target {target:,.2f} buys {raw:.4f} shares at {price:,.2f} - BUMPED UP to "
+    "{unit:g} share(s), {pct:.0f}% of target")
+#: The bump was refused: one unit would overshoot past the bound. No order, and the
+#: row carries the shortfall in ``unmet_notional`` so the user can widen the weight.
+REASON_BELOW_ONE_SHARE_FMT = (
+    "target {target:,.2f} buys {raw:.4f} shares at {price:,.2f} - no order; the "
+    "smallest tradeable order is {unit:g} share(s), {pct:.0f}% of target, over "
+    "the {limit:.0f}% bump limit")
+#: The FRACTIONAL variants of the two above. The fraction was legal on the grid but
+#: is under the broker's fractional NOTIONAL floor (TastyTrade HTTP 422
+#: ``below_notional_value_minimum``), which closes the fractional path entirely --
+#: a WHOLE share is exempt from that rule, so the only options are one whole share
+#: or nothing. Saying "rounds to zero" here would be a lie: the quantity was fine,
+#: the money was not.
+REASON_FRACTIONAL_FLOOR_BUMPED_FMT = (
+    "target {target:,.2f} is under the broker's ${minimum:g} fractional minimum "
+    "so no fraction can be sent - BUMPED UP to {unit:g} whole share(s) at "
+    "{price:,.2f}, {pct:.0f}% of target")
+REASON_FRACTIONAL_FLOOR_SKIPPED_FMT = (
+    "target {target:,.2f} is under the broker's ${minimum:g} fractional minimum "
+    "so no fraction can be sent - no order; {unit:g} whole share(s) at "
+    "{price:,.2f} is {pct:.0f}% of target, over the {limit:.0f}% bump limit")
+#: The bump was not even attempted: one share is under the broker's minimum ORDER
+#: size, so there is no order to place at any size.
+REASON_BUMP_BLOCKED_MIN_ORDER_FMT = (
+    "target {target:,.2f} buys {raw:.4f} shares at {price:,.2f} - no order; one "
+    "share is under the broker minimum order size {size:g}")
+#: A non-zero ADJUSTMENT to an existing position that the tradeable grid rounded
+#: away. Never bumped: the position already exists, and turning a -0.4 trim into a
+#: whole-share sale is a trade nobody asked for.
+REASON_ROUNDS_TO_ZERO_FMT = "{raw:+.4f} shares rounds to 0 on the tradeable grid - no order"
 #: Says only that no order is sent -- NOT what happens to the position, which
 #: differs by branch (a suppressed trim holds; a suppressed top-up never opens).
 #: "position held" here contradicted REASON_CLOSE_TO_ZERO on an unsendable close.
@@ -232,6 +305,11 @@ class AllocationRow:
     scale. ``fractional`` records the SIZING MODE: True when this row was rounded
     on the fractional grid (toggle on AND the broker calls the symbol
     fractionable), not merely when the resulting quantity has a decimal part.
+
+    ``unmet_notional`` is why a row with no order is still worth displaying: it is
+    the money the plan wanted to move for this symbol and could not.
+    ``sizing_outcome`` and ``redistributed`` are why a row with an order is worth a
+    second look: the quantity may be MORE than the weights asked for.
     """
     symbol: str
     labels: List[str] = field(default_factory=list)
@@ -251,6 +329,21 @@ class AllocationRow:
     #: (``OrderImpact.estimated_fees``). ``None`` means "not prechecked", never
     #: "free" -- no fallback value for a number the broker did not supply.
     estimated_fees: Optional[float] = None
+    #: Money this row INTENDED to move and could not: the tradeable grid, the broker
+    #: minimum order size, the fractional notional floor, the buying-power scaling
+    #: or a precheck rejection took it away. 0.0 on a row that traded -- including a
+    #: BUMPED row, which moved MORE than asked, not less. Deliberately 0.0 on a
+    #: NO-PRICE row too: that row's whole target is already reported through
+    #: ``AllocationPlan.unallocatable_pct``, and counting it in both places would
+    #: double the money the dry run shows as unallocated.
+    unmet_notional: float = 0.0
+    #: Which sizing rule produced this row: ``SIZING_OUTCOME_NORMAL``,
+    #: ``SIZING_OUTCOME_BUMPED`` (deliberate over-allocation to one unit) or
+    #: ``SIZING_OUTCOME_SKIPPED_TOO_LARGE`` (one unit would have overshot the bound).
+    sizing_outcome: str = SIZING_OUTCOME_NORMAL
+    #: True when ``redistribute_label_residuals`` moved this row off the quantity the
+    #: user's weights implied, to keep its LABEL on target. The dry run must show it.
+    redistributed: bool = False
     reasons: List[str] = field(default_factory=list)
 
     @property
@@ -279,6 +372,9 @@ class AllocationRow:
             "fractional": self.fractional,
             "skipped": self.skipped,
             "estimated_fees": self.estimated_fees,
+            "unmet_notional": self.unmet_notional,
+            "sizing_outcome": self.sizing_outcome,
+            "redistributed": self.redistributed,
             "reasons": list(self.reasons),
         }
 
@@ -430,6 +526,138 @@ def _round_delta_shares(delta: float, margin: Optional[MarginInfo], *,
     if delta >= 0:
         return magnitude
     return -min(magnitude, max(0.0, float(current_quantity or 0.0)))
+
+
+def tradeable_unit(margin: Optional[MarginInfo], *, allow_fractional: bool) -> float:
+    """The SMALLEST quantity this symbol can trade -- one step of the grid.
+
+    1.0 on the whole-share grid; the broker's published ``min_trade_increment`` on
+    the fractional one, or ``10 ** -DEFAULT_FRACTIONAL_DECIMALS`` when fractional
+    trading is allowed but no step was published (``fractionable=True,
+    min_trade_increment=None`` is a legal pair).
+
+    Deliberately mirrors ``_round_shares``' branch exactly, including the tri-state
+    read: only ``fractionable is True`` selects the fractional grid, so ``None``
+    ("the broker did not say") sizes as whole shares -- the conservative direction,
+    and the same one the rounding itself takes. Plan and execution must never round
+    on two different grids.
+
+    This is the QUANTITY grid only. It says nothing about whether an order of that
+    size is ACCEPTABLE: ``min_order_size`` (shares) and ``min_fractional_notional``
+    (dollars) are separate thresholds, weighed together in ``size_sub_unit_target``.
+    """
+    if allow_fractional and margin is not None and margin.fractionable is True:
+        inc = margin.min_trade_increment
+        if inc and inc > 0:
+            return float(inc)
+        return 10.0 ** -DEFAULT_FRACTIONAL_DECIMALS
+    return 1.0
+
+
+def size_sub_unit_target(target_notional: float, price: float,
+                         margin: Optional[MarginInfo], *,
+                         allow_fractional: bool) -> Tuple[float, str, str]:
+    """Decide what to do with a WHOLE intended allocation the grid cannot send.
+
+    Decision D1: bump it UP to the smallest SENDABLE quantity so the symbol
+    actually gets a position -- but only when that quantity costs at most
+    ``BUMP_TO_ONE_SHARE_MAX_MULTIPLE`` times the target. A bump is an intentional
+    over-allocation, it takes buying power promised to the rest of the plan, and
+    past the bound it stops being a rounding fix and becomes a different trade.
+
+    THREE thresholds are weighed TOGETHER, never in sequence (live finding L8b):
+
+      * the quantity grid (``tradeable_unit``);
+      * the broker's fractional NOTIONAL floor (``min_fractional_notional``,
+        DOLLARS). Under it no FRACTION can be sent at all, and a WHOLE share is
+        exempt from the rule, so the bump destination escalates to one whole
+        share and the reason says the floor is why -- not "rounds to zero", which
+        would be false: the quantity was legal, the money was not;
+      * the broker's minimum ORDER size (``min_order_size``, SHARES). One unit
+        under it means there is no order to place at any size, which is neither a
+        bump nor a bound problem.
+
+    Call this ONLY for the case where the sub-unit amount IS the symbol's whole
+    intended position (a flat holding being opened, or a symbol's share of an
+    INVEST_LABEL budget). A sub-unit ADJUSTMENT to a position that already exists
+    is left alone with ``REASON_ROUNDS_TO_ZERO_FMT``: the position exists, and
+    bumping a -0.4 trim into a whole-share sale is a trade nobody requested.
+
+    Returns:
+        Tuple[float, str, str]: ``(quantity, sizing_outcome, reason)``.
+        ``(unit, SIZING_OUTCOME_BUMPED, ...)`` when the bump is taken;
+        ``(0.0, SIZING_OUTCOME_SKIPPED_TOO_LARGE, ...)`` when the smallest
+        sendable order overshoots the bound; ``(0.0, SIZING_OUTCOME_NORMAL, ...)``
+        when one unit is under the broker's minimum ORDER size, which is neither a
+        bump nor a bound problem -- there is simply no order to place at any size.
+
+    Raises:
+        ValueError: on a non-positive price or target. Both callers have already
+        skipped a no-price row and clamped a negative target; there is no fallback
+        price or fallback target in this platform.
+    """
+    if price is None or float(price) <= 0:
+        raise ValueError(f"size_sub_unit_target: price must be positive, got {price!r}")
+    if target_notional is None or float(target_notional) <= 0:
+        raise ValueError(
+            f"size_sub_unit_target: target_notional must be positive, got {target_notional!r}")
+    px = float(price)
+    target = float(target_notional)
+    raw = target / px
+    unit = tradeable_unit(margin, allow_fractional=allow_fractional)
+
+    # The MONEY floor, weighed here rather than left to _suppress_below_min_order:
+    # by the time that runs the row is already zero and there is nothing to decide.
+    floor_usd = None if margin is None else margin.min_fractional_notional
+    hit_floor = False
+    if (floor_usd is not None and _is_fractional_quantity(unit)
+            and unit * px < float(floor_usd)):
+        # No fraction of this symbol can clear the floor at this size, and whole
+        # shares are exempt from it, so one whole share is the only other option.
+        unit = 1.0
+        hit_floor = True
+
+    unit_notional = unit * px
+    pct = unit_notional / target * 100.0
+    limit_pct = BUMP_TO_ONE_SHARE_MAX_MULTIPLE * 100.0
+    # INCLUSIVE bound: exactly 150% bumps. MONEY_EPSILON absorbs the float noise of
+    # a target computed through two percentage multiplications.
+    if unit_notional > target * BUMP_TO_ONE_SHARE_MAX_MULTIPLE + MONEY_EPSILON:
+        if hit_floor:
+            return 0.0, SIZING_OUTCOME_SKIPPED_TOO_LARGE, (
+                REASON_FRACTIONAL_FLOOR_SKIPPED_FMT.format(
+                    target=target, minimum=float(floor_usd), unit=unit, price=px,
+                    pct=pct, limit=limit_pct))
+        return 0.0, SIZING_OUTCOME_SKIPPED_TOO_LARGE, REASON_BELOW_ONE_SHARE_FMT.format(
+            target=target, raw=raw, price=px, unit=unit, pct=pct, limit=limit_pct)
+    min_size = None if margin is None else margin.min_order_size
+    if min_size is not None and unit < float(min_size):
+        # The broker will not accept an order this small, so there is nothing to
+        # bump TO. Reported as NORMAL: the bound had nothing to do with it.
+        return 0.0, SIZING_OUTCOME_NORMAL, REASON_BUMP_BLOCKED_MIN_ORDER_FMT.format(
+            target=target, raw=raw, price=px, size=float(min_size))
+    if hit_floor:
+        return unit, SIZING_OUTCOME_BUMPED, REASON_FRACTIONAL_FLOOR_BUMPED_FMT.format(
+            target=target, minimum=float(floor_usd), unit=unit, price=px, pct=pct)
+    return unit, SIZING_OUTCOME_BUMPED, REASON_BUMPED_TO_ONE_SHARE_FMT.format(
+        target=target, raw=raw, price=px, unit=unit, pct=pct)
+
+
+def _below_fractional_notional_floor(delta: float, margin: Optional[MarginInfo],
+                                     price: Optional[float]) -> bool:
+    """True when ``_suppress_below_min_order`` would zero this delta on the $5 rule.
+
+    A non-mutating twin of that check, so the D1 sizing decision can run BEFORE the
+    suppression instead of finding a row it has already zeroed (live finding L8b).
+    The two must agree exactly, which is why both read the same three fields.
+    """
+    if not delta or margin is None or margin.min_fractional_notional is None:
+        return False
+    if price is None or float(price) <= 0:
+        return False
+    if not _is_fractional_quantity(delta):
+        return False
+    return abs(delta) * float(price) < float(margin.min_fractional_notional)
 
 
 def round_delta_quantity(delta_notional: float, unit_value: float,
@@ -790,6 +1018,8 @@ def _apply_bp_scaling(rows: List[AllocationRow], available_buying_power: float, 
             # raw field rather than is_buy/is_sell.
             r.skipped = True
             r.side = None
+            # The whole pre-scaling intent is unmet, not just the scaled-away part.
+            r.unmet_notional = abs(prev_qty) * float(r.price or 0.0)
     return scale
 
 
@@ -932,10 +1162,15 @@ def compute_allocation(base_notional: float, available_buying_power: float,
             plan.unallocatable_pct += max(0.0, target_pcts.get(symbol, 0.0))
             plan.rows.append(row)
             continue
-        frac = bool(allow_fractional and m is not None and m.fractionable)
+        # Tri-state, explicitly. ``m.fractionable is None`` means the broker did
+        # not SAY -- a data gap Refresh can fix -- and must never be reported as
+        # "not fractionable", which is a fact about the instrument.
+        frac = bool(allow_fractional and m is not None and m.fractionable is True)
         row.fractional = frac
         if frac:
             row.reasons.append(REASON_FRACTIONAL)
+        elif allow_fractional and (m is None or m.fractionable is None):
+            row.reasons.append(REASON_FRACTIONAL_UNKNOWN)
         elif allow_fractional:
             row.reasons.append(REASON_WHOLE_SHARE_FLOOR)
 
@@ -945,6 +1180,7 @@ def compute_allocation(base_notional: float, available_buying_power: float,
             # actual instruction to hold nothing may liquidate, never a rounding
             # rule that happened to produce 0 shares.
             delta = -row.current_quantity
+            raw_delta = delta
             row.reasons.append(REASON_CLOSE_TO_ZERO)
         elif valuation_mode == VALUATION_MODE_COST:
             # Target a PURCHASE VALUE: close the gap to the current cost basis.
@@ -967,6 +1203,9 @@ def compute_allocation(base_notional: float, available_buying_power: float,
                     gap = 0.0
                 else:
                     unit_value = avg_cost
+            # The UNROUNDED intent, kept so a row the grid zeroes can say by how
+            # much it missed instead of rendering as "nothing to do".
+            raw_delta = (gap / unit_value) if unit_value and unit_value > 0 else 0.0
             delta = round_delta_quantity(
                 gap, unit_value, m, allow_fractional=allow_fractional,
                 current_quantity=row.current_quantity)
@@ -975,6 +1214,7 @@ def compute_allocation(base_notional: float, available_buying_power: float,
             ideal_quantity = round_quantity(target_notional, row.price, m,
                                             allow_fractional=allow_fractional,
                                             apply_min_order_size=False)
+            raw_delta = float(target_notional) / float(row.price) - row.current_quantity
             # Round the DELTA, not just the target: an on-grid target minus an
             # off-grid holding is off-grid, and the delta is what is submitted.
             delta = _round_delta_shares(ideal_quantity - row.current_quantity, m,
@@ -982,9 +1222,35 @@ def compute_allocation(base_notional: float, available_buying_power: float,
                                         current_quantity=row.current_quantity)
         if abs(delta) < QUANTITY_EPSILON:
             delta = 0.0
-        # ONE minimum-order check, on the signed delta both branches produce -- the
+        # D1, and it runs BEFORE _suppress_below_min_order on purpose (L8b): the
+        # suppression zeroes the row, and a bump that runs afterwards finds nothing
+        # left to decide about.
+        whole_position = (row.current_quantity == 0.0 and target_notional > 0
+                          and raw_delta > 0)
+        grid_zeroed = (delta == 0.0 and abs(raw_delta) >= QUANTITY_EPSILON)
+        floor_refuses = _below_fractional_notional_floor(delta, m, row.price)
+        if whole_position and (grid_zeroed or floor_refuses):
+            # The whole intended POSITION cannot be sent as sized: decision D1
+            # weighs the grid, the $5 fractional floor and the overshoot guard
+            # together and either bumps to one sendable unit or prices the miss.
+            delta, outcome, reason = size_sub_unit_target(
+                target_notional, row.price, m, allow_fractional=allow_fractional)
+            row.sizing_outcome = outcome
+            row.reasons.append(reason)
+            if delta <= 0:
+                row.unmet_notional = abs(raw_delta) * row.price
+        elif grid_zeroed:
+            # A sub-unit ADJUSTMENT to an existing position (or to a short).
+            # Never bumped: the position exists, and the landed rule for a trade
+            # that cannot be sent is to LEAVE THE POSITION WHERE IT IS.
+            row.reasons.append(REASON_ROUNDS_TO_ZERO_FMT.format(raw=raw_delta))
+            row.unmet_notional = abs(raw_delta) * row.price
+        # ONE minimum-order check, on the signed delta every branch produces -- the
         # only quantity that is actually sent to the broker.
+        before_min_order = delta
         delta = _suppress_below_min_order(delta, m, row.reasons, row.price)
+        if delta == 0.0 and before_min_order != 0.0:
+            row.unmet_notional = abs(before_min_order) * row.price
         row.delta_quantity = delta
         # target_quantity is the POST-TRADE holding in every mode and every branch:
         # what the account owns if this row executes, never an unreachable ideal.
@@ -1087,17 +1353,35 @@ def compute_label_investment(label: LabelTarget, amount: float,
             plan.unallocatable_pct += max(0.0, weight)
             plan.rows.append(row)
             continue
-        frac = bool(allow_fractional and m is not None and m.fractionable)
+        frac = bool(allow_fractional and m is not None and m.fractionable is True)
         row.fractional = frac
         qty = round_quantity(target_notional, row.price, m,
                              allow_fractional=allow_fractional,
                              apply_min_order_size=False)
+        raw_qty = float(target_notional) / float(row.price)
         if frac:
             row.reasons.append(REASON_FRACTIONAL)
+        elif allow_fractional and (m is None or m.fractionable is None):
+            row.reasons.append(REASON_FRACTIONAL_UNKNOWN)
         elif allow_fractional:
             row.reasons.append(REASON_WHOLE_SHARE_FLOOR)
+        if raw_qty >= QUANTITY_EPSILON and (
+                qty <= 0 or _below_fractional_notional_floor(qty, m, row.price)):
+            # The budget share IS the intended allocation for this symbol, so D1
+            # applies even when the symbol is already held: deploying nothing is the
+            # wrong answer to "put this money into this label". Runs BEFORE the
+            # suppression below, for the reason given in compute_allocation (L8b).
+            qty, outcome, reason = size_sub_unit_target(
+                target_notional, row.price, m, allow_fractional=allow_fractional)
+            row.sizing_outcome = outcome
+            row.reasons.append(reason)
+            if qty <= 0:
+                row.unmet_notional = raw_qty * row.price
         # Buys only here, so the budget IS the order: same suppression, same reason.
+        before_min_order = qty
         qty = _suppress_below_min_order(qty, m, row.reasons, row.price)
+        if qty == 0.0 and before_min_order != 0.0:
+            row.unmet_notional = before_min_order * row.price
         row.delta_quantity = qty
         row.target_quantity = row.current_quantity + qty
         if qty > 0:
@@ -1168,6 +1452,8 @@ def apply_order_impacts(plan: AllocationPlan, impacts: Dict[str, OrderImpact], *
             # quantity renders as a live BUY to anything reading the raw fields.
             row.skipped = True
             row.side = None
+            # What the broker refused is unmet money, exactly like a grid-zeroed row.
+            row.unmet_notional = abs(row.delta_quantity) * float(row.price or 0.0)
             row.delta_quantity = 0.0
             row.target_quantity = row.current_quantity
             row.estimated_value = 0.0
@@ -1340,19 +1626,24 @@ def _is_suppressed_row(row: "AllocationRow") -> bool:
         counted in ``plan.unallocatable_pct``, and no order was ever possible;
       * SUPPRESSED -- a real target that produced a real delta which was then
         zeroed by a broker rule (``min_order_size``, ``min_fractional_notional``),
-        by the buying-power scaler, or by the broker's own precheck refusing it.
+        by the tradeable grid, by D1's bump bound, by the buying-power scaler, or
+        by the broker's own precheck refusing it.
 
     Only the third is suppression. Reporting it is the point: the sub-$5
     fractional floor (TastyTrade ``below_notional_value_minimum``) does not mean
     "this rounds to zero", it means fractional is UNAVAILABLE at that size, and a
     table that drops the row tells the user there was nothing to do.
 
-    Detected from the reasons rather than from a flag because the engine's
-    suppression paths are several and each already records WHY -- a parallel
-    boolean would be one more thing to forget to set.
+    ``unmet_notional`` is the primary test and covers every path the engine has:
+    whatever zeroed a live intent SET that field, so this cannot fall behind a new
+    suppression path the way a reason-prefix list does. The prefix scan is kept
+    behind it for a hand-built or stored row that carries the reason without the
+    number (``plan_json`` written before ``unmet_notional`` existed).
     """
     if abs(float(row.delta_quantity or 0.0)) > QUANTITY_EPSILON:
         return False
+    if float(row.unmet_notional or 0.0) > MONEY_EPSILON:
+        return True
     if any(reason.startswith(prefix)
            for reason in row.reasons for prefix in _SUPPRESSION_REASON_PREFIXES):
         return True

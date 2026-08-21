@@ -1481,7 +1481,12 @@ def _schd_margin(min_fractional_notional=5.0):
 
 
 def test_a_fractional_buy_below_the_brokers_notional_floor_is_suppressed():
-    """The exact order the broker refused: ~0.057 shares of SCHD, under $2."""
+    """The exact order the broker refused: ~0.057 shares of SCHD, under $2.
+
+    Still not sent -- but D1 now owns this case and prices it: the fraction is
+    unavailable under the $5 floor, and one whole share of a $34 ETF is 1744% of
+    a $1.95 target, far outside the 1.5x bump guard. The row says both.
+    """
     labels = [LabelTarget("A", 100.0, [SymbolTarget("SCHD", 100.0)])]
     plan = pa.compute_allocation(1.95, 1_000_000.0, labels,
                                  {"SCHD": _pos("SCHD", 34.0)}, _schd_margin(),
@@ -1492,8 +1497,11 @@ def test_a_fractional_buy_below_the_brokers_notional_floor_is_suppressed():
     assert row.side is None
     assert row.estimated_value == 0.0
     assert row.target_notional == 1.95          # the TARGET is never rewritten
-    assert pa.REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_FMT.format(
-        value=0.05735 * 34.0, minimum=5.0) in row.reasons
+    assert row.sizing_outcome == pa.SIZING_OUTCOME_SKIPPED_TOO_LARGE
+    assert row.unmet_notional == pytest.approx(1.95)
+    reason = " ".join(row.reasons)
+    assert "$5 fractional minimum" in reason
+    assert "1744% of target" in reason
 
 
 def test_a_fractional_buy_above_the_notional_floor_still_trades():
@@ -1570,7 +1578,7 @@ def test_no_notional_floor_is_applied_when_the_broker_published_none():
 
 
 def test_label_investment_applies_the_fractional_notional_floor_too():
-    """The same rule on the INVEST_LABEL path, with the same reason string."""
+    """The same rule on the INVEST_LABEL path, priced the same way by D1."""
     label = LabelTarget("A", 100.0, [SymbolTarget("SCHD", 100.0)])
     plan = pa.compute_label_investment(label, 1.95, {"SCHD": _pos("SCHD", 34.0)},
                                        _schd_margin(),
@@ -1581,7 +1589,8 @@ def test_label_investment_applies_the_fractional_notional_floor_too():
     assert row.delta_quantity == 0.0
     assert row.side is None
     assert plan.total_buy_value == 0.0
-    assert any("below the broker" in r for r in row.reasons)
+    assert row.sizing_outcome == pa.SIZING_OUTCOME_SKIPPED_TOO_LARGE
+    assert any("$5 fractional minimum" in r for r in row.reasons)
 
 
 def test_the_notional_floor_reason_is_exported_so_the_ui_cannot_drift():
@@ -1603,3 +1612,396 @@ def test_a_buy_scaled_under_the_notional_floor_says_which_rule_stopped_it():
     assert row.side is None
     assert any(r.startswith(pa.REASON_SCALED_PREFIX) for r in row.reasons)
     assert any("below the broker" in r for r in row.reasons)
+
+
+# ---------------------------------------------------------------------------
+# D1: a target under one tradeable unit is bumped to one unit inside the bound,
+# and skipped-with-its-price outside it. Never silently dropped.
+# ---------------------------------------------------------------------------
+
+def test_one_share_inside_the_bound_is_bumped_and_says_so():
+    """$200 of a $300 share is 0.6667 shares. One share is 150% of target, which is
+    exactly the bound, so the symbol gets its position."""
+    qty, outcome, reason = pa.size_sub_unit_target(
+        200.0, 300.0, MarginInfo(symbol="XXX", bp_factor=1.0, fractionable=False),
+        allow_fractional=True)
+    assert qty == 1.0
+    assert outcome == pa.SIZING_OUTCOME_BUMPED
+    assert "BUMPED UP" in reason
+    assert "150% of target" in reason
+
+
+def test_the_bump_bound_is_inclusive_at_exactly_the_multiple():
+    """The boundary itself bumps. 1.5 x 200 == 300 exactly in binary, so this is a
+    real equality test, not a tolerance one."""
+    margin = MarginInfo(symbol="XXX", bp_factor=1.0, fractionable=False)
+    at_bound = 200.0 * pa.BUMP_TO_ONE_SHARE_MAX_MULTIPLE
+    assert pa.size_sub_unit_target(200.0, at_bound, margin,
+                                   allow_fractional=True)[1] == pa.SIZING_OUTCOME_BUMPED
+    just_over = at_bound + 1.0
+    assert pa.size_sub_unit_target(200.0, just_over, margin,
+                                   allow_fractional=True)[1] == pa.SIZING_OUTCOME_SKIPPED_TOO_LARGE
+
+
+def test_one_share_outside_the_bound_is_refused_and_quotes_the_limit():
+    """$50 of a $500 share is a 10x overspend. Skipped, with the arithmetic."""
+    qty, outcome, reason = pa.size_sub_unit_target(
+        50.0, 500.0, MarginInfo(symbol="XXX", bp_factor=1.0, fractionable=False),
+        allow_fractional=True)
+    assert qty == 0.0
+    assert outcome == pa.SIZING_OUTCOME_SKIPPED_TOO_LARGE
+    assert "1000% of target" in reason
+    assert "150% bump limit" in reason
+    assert not reason.startswith("below")
+    assert "held" not in reason
+
+
+def test_a_bump_the_broker_minimum_order_size_forbids_is_not_attempted():
+    """One share is inside the bound but under the broker's minimum ORDER size, so
+    there is no order to place. That is neither a bump nor a bound problem."""
+    qty, outcome, reason = pa.size_sub_unit_target(
+        200.0, 300.0,
+        MarginInfo(symbol="XXX", bp_factor=1.0, fractionable=False, min_order_size=5.0),
+        allow_fractional=True)
+    assert qty == 0.0
+    assert outcome == pa.SIZING_OUTCOME_NORMAL
+    assert "minimum order size 5" in reason
+
+
+def test_the_tradeable_unit_is_one_share_unless_the_broker_publishes_a_step():
+    assert pa.tradeable_unit(None, allow_fractional=True) == 1.0
+    assert pa.tradeable_unit(MarginInfo(symbol="X", bp_factor=1.0, fractionable=False),
+                             allow_fractional=True) == 1.0
+    assert pa.tradeable_unit(MarginInfo(symbol="X", bp_factor=1.0, fractionable=True),
+                             allow_fractional=True) == pytest.approx(0.0001)
+    assert pa.tradeable_unit(MarginInfo(symbol="X", bp_factor=1.0, fractionable=True,
+                                        min_trade_increment=0.25),
+                             allow_fractional=True) == 0.25
+    # Toggle OFF: the grid is whole shares no matter what the broker publishes.
+    assert pa.tradeable_unit(MarginInfo(symbol="X", bp_factor=1.0, fractionable=True,
+                                        min_trade_increment=0.25),
+                             allow_fractional=False) == 1.0
+
+
+def test_the_five_dollar_fractional_floor_escalates_the_bump_to_one_whole_share():
+    """L2/L8b: below the broker's $5 fractional minimum the fractional path is
+    CLOSED, so the only options are one WHOLE share or nothing -- the three
+    thresholds are weighed together, never in sequence."""
+    margin = MarginInfo(symbol="SCHD", bp_factor=1.0, fractionable=True,
+                        min_trade_increment=0.00001, min_fractional_notional=5.0)
+    qty, outcome, reason = pa.size_sub_unit_target(3.0, 4.0, margin,
+                                                   allow_fractional=True)
+    assert qty == 1.0
+    assert outcome == pa.SIZING_OUTCOME_BUMPED
+    assert "$5 fractional minimum" in reason
+
+
+def test_a_thirty_four_dollar_share_under_the_fractional_floor_skips_with_the_real_reason():
+    """The live case: a $3 slice of a $34 ETF. One share overshoots ~11x, far
+    outside the 1.5x guard, so it SKIPS -- and it must say the floor is why the
+    fraction was unavailable, not "rounds to zero"."""
+    margin = MarginInfo(symbol="SCHD", bp_factor=1.0, fractionable=True,
+                        min_trade_increment=0.00001, min_fractional_notional=5.0)
+    qty, outcome, reason = pa.size_sub_unit_target(3.0, 34.0, margin,
+                                                   allow_fractional=True)
+    assert qty == 0.0
+    assert outcome == pa.SIZING_OUTCOME_SKIPPED_TOO_LARGE
+    assert "$5 fractional minimum" in reason
+    assert "1133% of target" in reason
+    assert "rounds to 0" not in reason
+    assert not reason.startswith("below")
+
+
+def test_the_engine_weighs_the_fractional_floor_before_it_suppresses_the_row():
+    """L8b's ORDERING constraint, end to end: the $5 suppression must not get to
+    the row first and leave the bump nothing to decide about."""
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("SCHD", 100.0)])]
+    margin = {"SCHD": MarginInfo(symbol="SCHD", bp_factor=1.0, fractionable=True,
+                                 min_trade_increment=0.00001,
+                                 min_fractional_notional=5.0)}
+    row = pa.compute_allocation(3.0, 1_000_000.0, labels,
+                                {"SCHD": _pos("SCHD", 34.0)}, margin,
+                                allow_fractional=True, default_bp_factor=1.0,
+                                valuation_mode=pa.VALUATION_MODE_MARKET).rows[0]
+    assert row.delta_quantity == 0.0
+    assert row.sizing_outcome == pa.SIZING_OUTCOME_SKIPPED_TOO_LARGE
+    assert row.unmet_notional == pytest.approx(3.0)
+    reason = " ".join(row.reasons)
+    assert "$5 fractional minimum" in reason
+    assert pa.REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_PREFIX not in reason
+
+
+def test_a_sub_one_share_buy_inside_the_bound_ends_up_holding_one_share():
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
+    margin = {"XXX": MarginInfo(symbol="XXX", bp_factor=1.0, fractionable=False)}
+    row = pa.compute_allocation(200.0, 1_000_000.0, labels,
+                                {"XXX": _pos("XXX", 300.0)}, margin,
+                                allow_fractional=True, default_bp_factor=1.0,
+                                valuation_mode=pa.VALUATION_MODE_MARKET).rows[0]
+    assert row.delta_quantity == 1.0
+    assert row.side == OrderDirection.BUY
+    assert row.target_quantity == 1.0
+    assert row.sizing_outcome == pa.SIZING_OUTCOME_BUMPED
+    assert row.unmet_notional == 0.0          # money MOVED -- more than asked, not less
+    assert row.estimated_value == pytest.approx(300.0)
+
+
+def test_a_sub_one_share_buy_outside_the_bound_records_the_unmet_target():
+    """$260k of a $650k share is 0.4 shares and one share is 250% of target: no
+    order, and the row carries the $260k it failed to deploy."""
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("BRKA", 100.0)])]
+    margin = {"BRKA": MarginInfo(symbol="BRKA", bp_factor=1.0, fractionable=False)}
+    row = pa.compute_allocation(260_000.0, 1_000_000.0, labels,
+                                {"BRKA": _pos("BRKA", 650_000.0)}, margin,
+                                allow_fractional=True, default_bp_factor=1.0,
+                                valuation_mode=pa.VALUATION_MODE_MARKET).rows[0]
+    assert row.delta_quantity == 0.0
+    assert row.side is None
+    assert row.sizing_outcome == pa.SIZING_OUTCOME_SKIPPED_TOO_LARGE
+    assert row.unmet_notional == pytest.approx(260_000.0)
+    reason = " ".join(row.reasons)
+    assert "buys 0.4000 shares" in reason
+    assert "250% of target" in reason
+    # Pinned by the landed suite: no "held", nothing starting with "below".
+    assert "held" not in reason
+    assert not any(r.startswith("below") for r in row.reasons)
+
+
+def test_a_trim_that_rounds_to_zero_is_never_bumped():
+    """Holding 10.4, want 10 -> -0.4 shares on a whole-share grid. The position
+    already exists; bumping would sell a whole share nobody asked to sell."""
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
+    margin = {"XXX": MarginInfo(symbol="XXX", bp_factor=1.0, fractionable=False)}
+    current = {"XXX": _pos("XXX", 100.0, quantity=10.4, cost_basis=1_040.0)}
+    row = pa.compute_allocation(1_000.0, 1_000_000.0, labels, current, margin,
+                                allow_fractional=False, default_bp_factor=1.0,
+                                valuation_mode=pa.VALUATION_MODE_MARKET).rows[0]
+    assert row.delta_quantity == 0.0
+    assert row.sizing_outcome == pa.SIZING_OUTCOME_NORMAL
+    assert row.unmet_notional == pytest.approx(40.0)
+    assert any("rounds to 0" in r for r in row.reasons)
+
+
+def test_a_row_already_on_target_records_no_unmet_notional():
+    """Exactly on target: zero delta, zero unmet, and no new reason."""
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
+    margin = {"XXX": MarginInfo(symbol="XXX", bp_factor=1.0, fractionable=False)}
+    current = {"XXX": _pos("XXX", 100.0, quantity=10.0, cost_basis=1_000.0)}
+    row = pa.compute_allocation(1_000.0, 1_000_000.0, labels, current, margin,
+                                allow_fractional=False, default_bp_factor=1.0,
+                                valuation_mode=pa.VALUATION_MODE_MARKET).rows[0]
+    assert row.delta_quantity == 0.0
+    assert row.unmet_notional == 0.0
+    assert row.sizing_outcome == pa.SIZING_OUTCOME_NORMAL
+    assert not any("rounds to 0" in r for r in row.reasons)
+
+
+def test_cost_mode_bumps_a_sub_one_share_target_too():
+    """The cost-basis branch converts through the same grid and takes the same
+    decision: one share costs `price` of BASIS, so the bound reads the same."""
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
+    margin = {"XXX": MarginInfo(symbol="XXX", bp_factor=1.0, fractionable=False)}
+    row = pa.compute_allocation(200.0, 1_000_000.0, labels,
+                                {"XXX": _pos("XXX", 300.0)}, margin,
+                                allow_fractional=False, default_bp_factor=1.0,
+                                valuation_mode=pa.VALUATION_MODE_COST).rows[0]
+    assert row.delta_quantity == 1.0
+    assert row.sizing_outcome == pa.SIZING_OUTCOME_BUMPED
+
+
+def test_cost_mode_refuses_the_bump_outside_the_bound():
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("BRKA", 100.0)])]
+    margin = {"BRKA": MarginInfo(symbol="BRKA", bp_factor=1.0, fractionable=False)}
+    row = pa.compute_allocation(260_000.0, 1_000_000.0, labels,
+                                {"BRKA": _pos("BRKA", 650_000.0)}, margin,
+                                allow_fractional=False, default_bp_factor=1.0,
+                                valuation_mode=pa.VALUATION_MODE_COST).rows[0]
+    assert row.delta_quantity == 0.0
+    assert row.unmet_notional == pytest.approx(260_000.0)
+
+
+def test_an_order_suppressed_by_min_order_size_records_the_unmet_notional():
+    """A real 3-share trim the broker will not accept is unmet money, not nothing."""
+    labels = [LabelTarget("EXIT", 0.0, [SymbolTarget("XXX", 100.0)])]
+    margin = {"XXX": MarginInfo(symbol="XXX", bp_factor=1.0, min_order_size=5.0)}
+    row = pa.compute_allocation(10_000.0, 1_000_000.0, labels,
+                                {"XXX": _pos("XXX", 100.0, quantity=3.0, cost_basis=300.0)},
+                                margin, allow_fractional=False, default_bp_factor=1.0,
+                                valuation_mode=pa.VALUATION_MODE_MARKET).rows[0]
+    assert row.delta_quantity == 0.0
+    assert row.unmet_notional == pytest.approx(300.0)
+
+
+def test_a_buy_scaled_away_by_buying_power_records_the_unmet_notional():
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
+    margin = {"XXX": MarginInfo(symbol="XXX", bp_factor=1.0, min_order_size=5.0)}
+    row = pa.compute_allocation(10_000.0, 200.0, labels,
+                                {"XXX": _pos("XXX", 100.0)}, margin,
+                                allow_fractional=False, default_bp_factor=1.0,
+                                valuation_mode=pa.VALUATION_MODE_MARKET).rows[0]
+    assert row.delta_quantity == 0.0
+    assert row.skipped is True
+    assert row.unmet_notional == pytest.approx(10_000.0)
+
+
+def test_a_precheck_rejection_records_the_unmet_notional():
+    plan = AllocationPlan(
+        rows=[AllocationRow(symbol="XXX", price=100.0, delta_quantity=10.0,
+                            side=OrderDirection.BUY, estimated_value=1_000.0,
+                            bp_cost=1_000.0, bp_factor=1.0)],
+        available_buying_power=50_000.0)
+    impacts = {"XXX": OrderImpact(symbol="XXX", change_in_buying_power=0.0,
+                                  accepted=False, errors=["symbol not tradeable"])}
+    out = pa.apply_order_impacts(plan, impacts, available_buying_power=50_000.0)
+    assert out.rows[0].unmet_notional == pytest.approx(1_000.0)
+
+
+def test_missing_margin_info_with_fractional_on_says_eligibility_is_unknown():
+    """No MarginInfo row at all is a DATA GAP, not "the broker said no"."""
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
+    row = pa.compute_allocation(1_000.0, 1_000_000.0, labels,
+                                {"XXX": _pos("XXX", 300.0)}, {},
+                                allow_fractional=True, default_bp_factor=1.0,
+                                valuation_mode=pa.VALUATION_MODE_MARKET).rows[0]
+    assert row.fractional is False
+    assert pa.REASON_FRACTIONAL_UNKNOWN in row.reasons
+    assert pa.REASON_WHOLE_SHARE_FLOOR not in row.reasons
+
+
+def test_a_none_fractionable_flag_is_unknown_and_never_collapses_to_false():
+    """The broker answered, but not about fractionability. Tri-state, explicitly."""
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
+    margin = {"XXX": MarginInfo(symbol="XXX", bp_factor=1.0, fractionable=None)}
+    row = pa.compute_allocation(1_000.0, 1_000_000.0, labels,
+                                {"XXX": _pos("XXX", 300.0)}, margin,
+                                allow_fractional=True, default_bp_factor=1.0,
+                                valuation_mode=pa.VALUATION_MODE_MARKET).rows[0]
+    assert row.fractional is False
+    assert pa.REASON_FRACTIONAL_UNKNOWN in row.reasons
+    assert pa.REASON_WHOLE_SHARE_FLOOR not in row.reasons
+
+
+def test_a_non_fractionable_symbol_says_whole_share_floor_not_unknown_eligibility():
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
+    margin = {"XXX": MarginInfo(symbol="XXX", bp_factor=1.0, fractionable=False)}
+    row = pa.compute_allocation(1_000.0, 1_000_000.0, labels,
+                                {"XXX": _pos("XXX", 300.0)}, margin,
+                                allow_fractional=True, default_bp_factor=1.0,
+                                valuation_mode=pa.VALUATION_MODE_MARKET).rows[0]
+    assert pa.REASON_WHOLE_SHARE_FLOOR in row.reasons
+    assert pa.REASON_FRACTIONAL_UNKNOWN not in row.reasons
+
+
+def test_the_new_row_fields_round_trip_through_to_dict():
+    row = AllocationRow(symbol="XXX", unmet_notional=1_234.5,
+                        sizing_outcome=pa.SIZING_OUTCOME_BUMPED)
+    blob = json.loads(json.dumps(row.to_dict()))
+    assert blob["unmet_notional"] == 1_234.5
+    assert blob["sizing_outcome"] == "bumped-to-1"
+    assert blob["redistributed"] is False
+
+
+def test_label_investment_bumps_a_sub_one_share_budget_share():
+    """The budget IS the intended allocation, so a sub-unit share of it bumps even
+    when the symbol is already held -- deploying nothing is the wrong answer."""
+    label = LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])
+    margin = {"XXX": MarginInfo(symbol="XXX", bp_factor=1.0, fractionable=False)}
+    plan = pa.compute_label_investment(label, 200.0,
+                                       {"XXX": _pos("XXX", 300.0, quantity=4.0,
+                                                    cost_basis=1_200.0)}, margin,
+                                       available_buying_power=1_000_000.0,
+                                       allow_fractional=True, default_bp_factor=1.0,
+                                       valuation_mode=pa.VALUATION_MODE_MARKET)
+    row = plan.rows[0]
+    assert row.delta_quantity == 1.0
+    assert row.sizing_outcome == pa.SIZING_OUTCOME_BUMPED
+    assert row.target_quantity == 5.0
+
+
+def test_label_investment_outside_the_bound_records_the_unmet_target():
+    label = LabelTarget("A", 100.0, [SymbolTarget("BRKA", 100.0)])
+    margin = {"BRKA": MarginInfo(symbol="BRKA", bp_factor=1.0, fractionable=False)}
+    plan = pa.compute_label_investment(label, 260_000.0,
+                                       {"BRKA": _pos("BRKA", 650_000.0)}, margin,
+                                       available_buying_power=1_000_000.0,
+                                       allow_fractional=True, default_bp_factor=1.0,
+                                       valuation_mode=pa.VALUATION_MODE_MARKET)
+    row = plan.rows[0]
+    assert row.delta_quantity == 0.0
+    assert row.sizing_outcome == pa.SIZING_OUTCOME_SKIPPED_TOO_LARGE
+    assert row.unmet_notional == pytest.approx(260_000.0)
+    assert any("buys 0.4000 shares" in r for r in row.reasons)
+
+
+def test_label_investment_weighs_the_fractional_floor_before_suppressing():
+    """L8b again, on the INVEST_LABEL path: the $5 floor must not zero the row
+    before D1 has weighed one whole share against the bound."""
+    label = LabelTarget("A", 100.0, [SymbolTarget("SCHD", 100.0)])
+    margin = {"SCHD": MarginInfo(symbol="SCHD", bp_factor=1.0, fractionable=True,
+                                 min_trade_increment=0.00001,
+                                 min_fractional_notional=5.0)}
+    plan = pa.compute_label_investment(label, 3.0, {"SCHD": _pos("SCHD", 4.0)}, margin,
+                                       available_buying_power=1_000_000.0,
+                                       allow_fractional=True, default_bp_factor=1.0,
+                                       valuation_mode=pa.VALUATION_MODE_MARKET)
+    row = plan.rows[0]
+    assert row.delta_quantity == 1.0
+    assert row.sizing_outcome == pa.SIZING_OUTCOME_BUMPED
+    assert any("$5 fractional minimum" in r for r in row.reasons)
+
+
+def test_a_sub_unit_TOP_UP_to_an_existing_position_is_never_bumped():
+    """The mirror of the trim case, and the dangerous one: holding 10 at 100 with
+    a 1,050 target wants +0.5 shares. Bumping that to a whole share buys 100 of
+    stock to close a 50 gap -- an unrequested trade twice the size of the miss.
+    D1 fires ONLY when the sub-unit amount is the symbol's WHOLE position."""
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("XXX", 100.0)])]
+    margin = {"XXX": MarginInfo(symbol="XXX", bp_factor=1.0, fractionable=False)}
+    current = {"XXX": _pos("XXX", 100.0, quantity=10.0, cost_basis=1_000.0)}
+    row = pa.compute_allocation(1_050.0, 1_000_000.0, labels, current, margin,
+                                allow_fractional=False, default_bp_factor=1.0,
+                                valuation_mode=pa.VALUATION_MODE_MARKET).rows[0]
+    assert row.delta_quantity == 0.0
+    assert row.side is None
+    assert row.sizing_outcome == pa.SIZING_OUTCOME_NORMAL
+    assert row.unmet_notional == pytest.approx(50.0)
+    assert any("rounds to 0" in r for r in row.reasons)
+
+
+def test_the_bump_bound_survives_the_float_noise_of_a_percentage_chain():
+    """What makes the bound INCLUSIVE is MONEY_EPSILON, not the comparison
+    operator: a target computed through two percentage multiplications lands a few
+    ulps off, and without the tolerance a symbol exactly on the bound flips to
+    SKIPPED depending on the arithmetic that produced its target."""
+    margin = MarginInfo(symbol="XXX", bp_factor=1.0, fractionable=False)
+    target = 924.1170589305282
+    # Exactly half again the target -- but reached by a different arithmetic route
+    # (a percentage chain, which is how the engine gets there), landing 2.3e-13
+    # ABOVE ``target * 1.5``. Without the tolerance this share is refused while an
+    # identical one written ``target * 1.5`` is bumped.
+    price = target * 15.0 / 10.0
+    assert price > target * 1.5                     # the noise is real, not imagined
+    assert price - target * 1.5 < 1e-9
+    assert pa.size_sub_unit_target(target, price, margin,
+                                   allow_fractional=True)[1] == pa.SIZING_OUTCOME_BUMPED
+    # A hair of slack is all it gets: a genuinely larger share still skips.
+    assert pa.size_sub_unit_target(target, price * 1.001, margin,
+                                   allow_fractional=True)[1] == pa.SIZING_OUTCOME_SKIPPED_TOO_LARGE
+
+
+def test_a_legal_whole_share_order_under_five_dollars_is_not_refused_by_the_floor():
+    """The floor is worded "FRACTIONAL equities orders", so 2 whole shares of a $2
+    stock is a legal $4.00 order. Reading the floor without the whole-share
+    exemption would bump this to ONE share and under-deploy by half."""
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("CHEAP", 100.0)])]
+    margin = {"CHEAP": MarginInfo(symbol="CHEAP", bp_factor=1.0, fractionable=True,
+                                  min_trade_increment=0.00001,
+                                  min_fractional_notional=5.0)}
+    row = pa.compute_allocation(4.0, 1_000_000.0, labels,
+                                {"CHEAP": _pos("CHEAP", 2.0)}, margin,
+                                allow_fractional=True, default_bp_factor=1.0,
+                                valuation_mode=pa.VALUATION_MODE_MARKET).rows[0]
+    assert row.delta_quantity == pytest.approx(2.0)
+    assert row.side == OrderDirection.BUY
+    assert row.sizing_outcome == pa.SIZING_OUTCOME_NORMAL
+    assert row.unmet_notional == 0.0

@@ -299,8 +299,11 @@ def test_dry_run_rows_shows_a_sub_minimum_fractional_target_as_suppressed():
     assert row["suppressed"] is True
     assert row["quantity"] == 0.0
     assert row["side"] == ""            # no order, so no side
-    assert REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_FMT.format(
-        value=1.95, minimum=5.0) in row["reasons"]
+    # D1 owns this case now and prices it: no fraction can be sent under the $5
+    # floor, and one whole share of a $3 stock is 154% of a $1.95 target -- just
+    # outside the 1.5x bump guard.
+    assert "$5 fractional minimum" in row["reasons"]
+    assert "154% of target" in row["reasons"]
 
 
 def test_dry_run_rows_shows_a_below_min_order_size_row_as_suppressed():
