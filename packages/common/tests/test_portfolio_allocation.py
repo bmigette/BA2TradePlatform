@@ -2005,3 +2005,200 @@ def test_a_legal_whole_share_order_under_five_dollars_is_not_refused_by_the_floo
     assert row.side == OrderDirection.BUY
     assert row.sizing_outcome == pa.SIZING_OUTCOME_NORMAL
     assert row.unmet_notional == 0.0
+
+
+# ---------------------------------------------------------------------------
+# measure_filled_values -- FILLED money, and whether the answer is final
+# ---------------------------------------------------------------------------
+
+from ba2_common.core.portfolio_allocation import (  # noqa: E402
+    SETTLED_ORDER_STATUSES, FilledTotals, OrderFill, measure_filled_values,
+)
+from ba2_common.core.types import OrderStatus  # noqa: E402
+
+
+def _fill(order_id, side, status, qty=0.0, price=None):
+    return OrderFill(order_id=order_id, side=side, status=status,
+                     filled_quantity=qty, fill_price=price)
+
+
+def test_a_filled_buy_is_worth_its_filled_quantity_times_its_fill_price():
+    totals = measure_filled_values([
+        _fill(1, OrderDirection.BUY, OrderStatus.FILLED, qty=10.0, price=161.25)])
+    assert totals.buy_value == pytest.approx(1612.5)
+    assert totals.sell_value == 0.0
+    assert totals.settled is True
+    assert totals.net_buy_value == pytest.approx(1612.5)
+
+
+def test_a_rejected_order_is_worth_nothing_and_is_settled():
+    """THE bug. A rejected order used to consume income at its planned value."""
+    totals = measure_filled_values([
+        _fill(1, OrderDirection.BUY, OrderStatus.REJECTED, qty=0.0, price=None)])
+    assert totals.buy_value == 0.0
+    assert totals.settled is True
+    assert totals.working_order_ids == []
+
+
+def test_a_canceled_order_that_never_filled_is_worth_nothing():
+    totals = measure_filled_values([
+        _fill(1, OrderDirection.BUY, OrderStatus.CANCELED, qty=0.0, price=None)])
+    assert totals.buy_value == 0.0
+    assert totals.settled is True
+
+
+def test_an_order_that_errored_before_reaching_the_broker_is_worth_nothing():
+    """AccountInterface.py:148 stamps ERROR on a hard submit failure."""
+    totals = measure_filled_values([
+        _fill(1, OrderDirection.BUY, OrderStatus.ERROR)])
+    assert totals.buy_value == 0.0
+    assert totals.settled is True
+
+
+def test_a_washtrade_locked_order_is_settled_and_worth_nothing():
+    """Our own gate: never sent, so it is as final as an order gets."""
+    totals = measure_filled_values([
+        _fill(1, OrderDirection.BUY, OrderStatus.WASHTRADE_LOCKED)])
+    assert totals.settled is True
+    assert totals.buy_value == 0.0
+
+
+def test_done_for_day_is_settled_per_decision_d5():
+    """The broker sends no further update today, so an unfilled residue never
+    fills; waiting would strand this run's income overnight."""
+    totals = measure_filled_values([
+        _fill(1, OrderDirection.BUY, OrderStatus.DONE_FOR_DAY, qty=6.0, price=100.0)])
+    assert totals.settled is True
+    assert totals.buy_value == pytest.approx(600.0)
+
+
+def test_a_partial_fill_contributes_only_the_filled_part_and_blocks_settlement():
+    totals = measure_filled_values([
+        _fill(1, OrderDirection.BUY, OrderStatus.PARTIALLY_FILLED, qty=3.0, price=100.0)])
+    assert totals.buy_value == pytest.approx(300.0)
+    assert totals.settled is False
+    assert totals.working_order_ids == [1]
+
+
+def test_a_partial_fill_that_was_then_canceled_is_settled_at_the_filled_part():
+    """Cancelled after a partial: the 3 shares are real and nothing more is coming."""
+    totals = measure_filled_values([
+        _fill(1, OrderDirection.BUY, OrderStatus.CANCELED, qty=3.0, price=100.0)])
+    assert totals.buy_value == pytest.approx(300.0)
+    assert totals.settled is True
+
+
+def test_a_still_working_order_blocks_settlement():
+    for status in (OrderStatus.PENDING, OrderStatus.NEW, OrderStatus.ACCEPTED,
+                   OrderStatus.HELD, OrderStatus.WAITING_TRIGGER, OrderStatus.UNKNOWN):
+        totals = measure_filled_values([_fill(1, OrderDirection.BUY, status)])
+        assert totals.settled is False, status
+        assert totals.working_order_ids == [1], status
+
+
+def test_sells_and_buys_are_kept_apart_and_net_is_clamped_at_zero():
+    totals = measure_filled_values([
+        _fill(1, OrderDirection.BUY, OrderStatus.FILLED, qty=10.0, price=100.0),
+        _fill(2, OrderDirection.SELL, OrderStatus.FILLED, qty=5.0, price=400.0),
+    ])
+    assert totals.buy_value == pytest.approx(1000.0)
+    assert totals.sell_value == pytest.approx(2000.0)
+    assert totals.net_buy_value == 0.0
+    assert totals.settled is True
+
+
+def test_a_negative_broker_quantity_is_normalised_by_side_not_by_sign():
+    """abs() + `side` is the canonical signed-field normalisation at this boundary,
+    the same rule OrderImpact.bp_cost applies to change_in_buying_power. A broker
+    that reports a sell as filled_qty=-5 must still book 5 shares SOLD."""
+    totals = measure_filled_values([
+        _fill(1, OrderDirection.SELL, OrderStatus.FILLED, qty=-5.0, price=400.0)])
+    assert totals.sell_value == pytest.approx(2000.0)
+    assert totals.buy_value == 0.0
+
+
+def test_a_fill_with_no_price_is_unmeasurable_never_estimated():
+    """No fallback to the plan's quote: a priceless fill must stall the ledger, not
+    be guessed at. Guessing is how the platform spends money it did not spend."""
+    totals = measure_filled_values([
+        _fill(1, OrderDirection.BUY, OrderStatus.FILLED, qty=10.0, price=None)])
+    assert totals.buy_value == 0.0
+    assert totals.settled is False
+    assert totals.unmeasurable_order_ids == [1]
+
+
+def test_a_fill_with_a_zero_price_is_unmeasurable_too():
+    totals = measure_filled_values([
+        _fill(1, OrderDirection.BUY, OrderStatus.FILLED, qty=10.0, price=0.0)])
+    assert totals.settled is False
+    assert totals.unmeasurable_order_ids == [1]
+
+
+def test_a_fill_with_no_side_is_unmeasurable():
+    totals = measure_filled_values([
+        _fill(1, None, OrderStatus.FILLED, qty=10.0, price=100.0)])
+    assert totals.buy_value == 0.0
+    assert totals.settled is False
+    assert totals.unmeasurable_order_ids == [1]
+
+
+def test_a_missing_order_row_reads_as_status_none_and_blocks_settlement():
+    """The live collector emits this for an order id whose row has vanished. It is
+    a real inconsistency; stalling is the only safe answer."""
+    totals = measure_filled_values([_fill(1, None, None)])
+    assert totals.settled is False
+    assert totals.working_order_ids == [1]
+
+
+def test_measuring_no_orders_at_all_is_settled_and_worth_nothing():
+    """A run whose every row was skipped. Settled, zero, consumes nothing."""
+    totals = measure_filled_values([])
+    assert totals == FilledTotals()
+    assert totals.settled is True
+    assert totals.net_buy_value == 0.0
+
+
+def test_two_filled_totals_do_not_share_their_lists():
+    """field(default_factory=list), not `= []`. A bare list default is a dataclass
+    ValueError at import; if it somehow were not, every run would append into one
+    shared list and every run would look unsettled."""
+    first, second = FilledTotals(), FilledTotals()
+    first.working_order_ids.append(1)
+    assert second.working_order_ids == []
+
+
+def test_a_sub_epsilon_filled_quantity_is_not_a_fill():
+    totals = measure_filled_values([
+        _fill(1, OrderDirection.BUY, OrderStatus.FILLED, qty=1e-12, price=100.0)])
+    assert totals.buy_value == 0.0
+    assert totals.settled is True
+    assert totals.unmeasurable_order_ids == []
+
+
+def test_settled_statuses_cover_every_terminal_status_plus_filled():
+    assert OrderStatus.get_terminal_statuses() <= SETTLED_ORDER_STATUSES
+    assert OrderStatus.FILLED in SETTLED_ORDER_STATUSES
+    assert OrderStatus.DONE_FOR_DAY in SETTLED_ORDER_STATUSES
+    assert OrderStatus.WASHTRADE_LOCKED in SETTLED_ORDER_STATUSES
+    assert OrderStatus.PARTIALLY_FILLED not in SETTLED_ORDER_STATUSES
+    assert OrderStatus.UNKNOWN not in SETTLED_ORDER_STATUSES
+
+
+def test_filled_totals_to_dict_is_json_safe():
+    totals = measure_filled_values([
+        _fill(1, OrderDirection.BUY, OrderStatus.FILLED, qty=2.0, price=50.0),
+        _fill(2, OrderDirection.SELL, OrderStatus.PENDING),
+    ])
+    assert json.loads(json.dumps(totals.to_dict())) == {
+        "buy_value": 100.0, "sell_value": 0.0, "net_buy_value": 100.0,
+        "settled": False, "working_order_ids": [2], "unmeasurable_order_ids": [],
+    }
+
+
+def test_filled_totals_to_dict_hands_back_copies_not_its_own_lists():
+    """The dict goes into the activity log's JSON blob and into the panel's copy;
+    handing out the live lists would let a caller edit the run's own measurement."""
+    totals = measure_filled_values([_fill(2, OrderDirection.SELL, OrderStatus.PENDING)])
+    blob = totals.to_dict()
+    blob["working_order_ids"].append(999)
+    assert totals.working_order_ids == [2]

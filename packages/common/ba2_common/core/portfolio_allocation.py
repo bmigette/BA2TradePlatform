@@ -30,7 +30,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from ba2_common.core.account_types import (  # noqa: F401 (re-exported)
     AccountSnapshot, MarginInfo, OrderImpact,
 )
-from ba2_common.core.types import OrderDirection
+from ba2_common.core.types import OrderDirection, OrderStatus
 from ba2_common.logger import logger
 
 #: Public API. The in-tree module is a whole-module alias shim, so everything here
@@ -80,6 +80,8 @@ __all__ = [
     "build_symbol_targets", "validate_symbol_weights", "validate_label_targets",
     "compute_base_notional", "compute_allocation", "compute_label_investment",
     "apply_order_impacts", "consume_income_events",
+    # filled-value measurement (the income ledger's input)
+    "SETTLED_ORDER_STATUSES", "OrderFill", "FilledTotals", "measure_filled_values",
     "tradeable_unit", "size_sub_unit_target", "projected_value", "allocated_value",
     "redistribute_label_residuals",
     # mixed eligibility, bumps and redistribution, surfaced for the dry run
@@ -2660,3 +2662,139 @@ def redistribution_notice(summary: Dict[str, Any]) -> Optional[str]:
     if summary["redistributed_rows"] <= 0:
         return None
     return REDISTRIBUTION_NOTICE_FMT.format(count=summary["redistributed_rows"])
+
+
+# ---------------------------------------------------------------------------
+# What a run ACTUALLY filled. Pure -- the live service does the IO around it.
+# ---------------------------------------------------------------------------
+
+#: Statuses after which a TradingOrder can never fill any further.
+#:
+#: ``OrderStatus.get_terminal_statuses()`` is the broker-side "will not change
+#: anymore" set -- CLOSED / REJECTED / CANCELED / EXPIRED / STOPPED / ERROR /
+#: REPLACED. Three more belong here for the ledger's purposes:
+#:
+#:   FILLED            complete by definition, and NOT in the terminal set.
+#:   DONE_FOR_DAY      the broker will send no further update today, so an
+#:                     unfilled residue never fills; waiting on it would wedge
+#:                     the run's income overnight. (User decision D5.)
+#:   WASHTRADE_LOCKED  our own gate. The order was never sent, so it is as final
+#:                     as an order can be, and it is worth exactly 0.
+#:
+#: UNKNOWN is deliberately ABSENT. "We do not know what this order did" is not
+#: "this order is over", and the difference is whether income gets spent.
+SETTLED_ORDER_STATUSES = frozenset(OrderStatus.get_terminal_statuses()) | {
+    OrderStatus.FILLED,
+    OrderStatus.DONE_FOR_DAY,
+    OrderStatus.WASHTRADE_LOCKED,
+}
+
+
+@dataclass(frozen=True)
+class OrderFill:
+    """One order's fill facts, lifted off a ``TradingOrder`` row.
+
+    Plain values, not an ORM row, so this stays IO-free and unit-testable -- the
+    same contract ``consume_income_events`` uses for the ledger.
+
+    ``status=None`` is the live collector's spelling for "that order id has no row
+    any more", which is an inconsistency, not an emptiness: it is treated as still
+    working so the run stalls instead of quietly consuming income.
+    """
+    order_id: int
+    side: Optional[OrderDirection] = None
+    status: Optional[OrderStatus] = None
+    filled_quantity: float = 0.0
+    fill_price: Optional[float] = None
+
+
+@dataclass
+class FilledTotals:
+    """What a run's orders REALLY moved, and whether that answer is final.
+
+    ``settled`` is the gate on income consumption. False means at least one order
+    can still fill (or could not be valued), so the ledger must NOT be spent yet --
+    ``finalise_allocation_run(..., orders_settled=False)`` records the totals and
+    leaves ``income_consumed_at`` NULL, which keeps the run in
+    ``get_unconsumed_runs()`` where a later reconcile pass picks it up. With ~25%
+    of symbols non-fractionable and the ADJUST path creating WAITING_TRIGGER
+    orders, False is the COMMON outcome, not an edge case (user decision D3), so
+    ``settled`` and ``working_order_ids`` are user-facing facts, not just logging.
+
+    Both list fields use ``field(default_factory=list)``: a bare ``= []`` default
+    is a dataclass ``ValueError`` at import, and would otherwise share one list
+    across every instance.
+    """
+    buy_value: float = 0.0
+    sell_value: float = 0.0
+    settled: bool = True
+    working_order_ids: List[int] = field(default_factory=list)
+    unmeasurable_order_ids: List[int] = field(default_factory=list)
+
+    @property
+    def net_buy_value(self) -> float:
+        """``max(0, filled buys - filled sells)``, mirroring the model property."""
+        return max(0.0, self.buy_value - self.sell_value)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """JSON-safe, for the activity log's data blob and the income panel's copy."""
+        return {
+            "buy_value": self.buy_value,
+            "sell_value": self.sell_value,
+            "net_buy_value": self.net_buy_value,
+            "settled": self.settled,
+            "working_order_ids": list(self.working_order_ids),
+            "unmeasurable_order_ids": list(self.unmeasurable_order_ids),
+        }
+
+
+def measure_filled_values(fills: List[OrderFill]) -> FilledTotals:
+    """Sum what a run's orders actually filled, and say whether that is final. Pure.
+
+    Value is ``abs(filled_quantity) * fill_price``, with the DIRECTION taken from
+    ``side`` -- the same signed-field normalisation ``OrderImpact.bp_cost`` applies
+    to the broker's ``change_in_buying_power``. Never infer a sell from a negative
+    quantity: ``side`` is the fact, the sign is a broker convention.
+
+    There is NO fallback to a planned price or an estimated value: an order
+    reporting a fill it cannot price is UNMEASURABLE, and unmeasurable stalls the
+    ledger rather than guessing. Guessing is the bug this function exists to kill --
+    income consumed against money that was only ever intended, made permanent by
+    the one-shot ``income_consumed_at``.
+
+    A partial fill counts its filled part (that money moved) AND blocks settlement
+    (more can still move). A rejected, cancelled, errored or wash-trade-locked
+    order contributes zero and is settled.
+
+    Args:
+        fills: one entry per EXECUTION order of the run. The caller is responsible
+            for having excluded protective TP/SL legs -- see
+            ``portfolio_allocation_service.collect_order_fills``.
+
+    Returns:
+        FilledTotals: buy/sell money, plus ``settled`` and the two id lists that
+        explain a False. Empty input is settled and worth zero: a run whose every
+        row was skipped consumes nothing, which is correct, not a stall.
+    """
+    totals = FilledTotals()
+    for fill in fills or []:
+        if fill.status not in SETTLED_ORDER_STATUSES:
+            totals.settled = False
+            totals.working_order_ids.append(fill.order_id)
+
+        quantity = float(fill.filled_quantity or 0.0)
+        if abs(quantity) <= QUANTITY_EPSILON:
+            continue
+
+        price = fill.fill_price
+        if fill.side is None or price is None or float(price) <= 0:
+            totals.settled = False
+            totals.unmeasurable_order_ids.append(fill.order_id)
+            continue
+
+        value = abs(quantity) * float(price)
+        if fill.side == OrderDirection.BUY:
+            totals.buy_value += value
+        elif fill.side == OrderDirection.SELL:
+            totals.sell_value += value
+    return totals
