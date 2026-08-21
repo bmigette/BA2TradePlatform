@@ -1,21 +1,24 @@
 from nicegui import ui
-from . import svg 
+from . import svg
+
+
+# Module-level so the navigation contract is unit-testable without rendering
+# anything (importing ui.main to inspect routes pulls the whole expert stack).
+MENU_ITEMS = [
+    {'icon': 'dashboard', 'label': 'Overview', 'route': '/', 'description': 'Dashboard & Stats'},
+    {'icon': 'analytics', 'label': 'Market Analysis', 'route': '/marketanalysis', 'description': 'Experts Analysis'},
+    {'icon': 'receipt_long', 'label': 'Activity Monitor', 'route': '/activitymonitor', 'description': 'System Logs'},
+    {'icon': 'trending_up', 'label': 'Live Trades', 'route': '/livetrades', 'description': 'Active Positions'},
+    {'icon': 'pie_chart', 'label': 'Portfolio Allocation', 'route': '/portfolioallocation', 'description': 'Manual Rebalancing'},
+    {'icon': 'build', 'label': 'Tools', 'route': '/tools', 'description': 'Utilities'},
+    {'icon': 'settings', 'label': 'Settings', 'route': '/settings', 'description': 'Configuration'},
+]
 
 
 def sidemenu() -> None:
     """Modern sidebar navigation menu"""
-    
-    menu_items = [
-        {'icon': 'dashboard', 'label': 'Overview', 'route': '/', 'description': 'Dashboard & Stats'},
-        {'icon': 'analytics', 'label': 'Market Analysis', 'route': '/marketanalysis', 'description': 'Experts Analysis'},
-        {'icon': 'receipt_long', 'label': 'Activity Monitor', 'route': '/activitymonitor', 'description': 'System Logs'},
-        {'icon': 'trending_up', 'label': 'Live Trades', 'route': '/livetrades', 'description': 'Active Positions'},
-        {'icon': 'build', 'label': 'Tools', 'route': '/tools', 'description': 'Utilities'},
-        {'icon': 'settings', 'label': 'Settings', 'route': '/settings', 'description': 'Configuration'},
-    ]
-    
     with ui.column().classes('w-full gap-1 px-2'):
-        for item in menu_items:
+        for item in MENU_ITEMS:
             with ui.item(on_click=lambda r=item['route']: ui.navigate.to(r)).classes('rounded-lg hover:bg-white/10'):
                 with ui.item_section().props('avatar'):
                     ui.icon(item['icon']).classes('text-accent')

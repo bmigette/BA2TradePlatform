@@ -1,5 +1,5 @@
 from nicegui import ui, Client, app
-from .pages import overview, settings, marketanalysis, market_analysis_detail, rulesettest, marketanalysishistory, smart_risk_manager_detail, activity_monitor, live_trades, tools
+from .pages import overview, settings, marketanalysis, market_analysis_detail, rulesettest, marketanalysishistory, smart_risk_manager_detail, activity_monitor, live_trades, tools, portfolio_allocation
 from .layout import layout_render
 from . import api_routes
 from pathlib import Path
@@ -125,6 +125,12 @@ def tools_page() -> None:
     logger.debug("[ROUTE] /tools - Loading tools page")
     with layout_render('Tools'):
         tools.content()
+
+@ui.page('/portfolioallocation')
+async def portfolio_allocation_page() -> None:
+    logger.debug("[ROUTE] /portfolioallocation - Loading portfolio allocation page")
+    with layout_render('Portfolio Allocation'):
+        await portfolio_allocation.content()
 
 STATICPATH = Path(__file__).parent / 'static'
 FAVICO = (STATICPATH / 'favicon.ico')
