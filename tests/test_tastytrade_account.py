@@ -1088,6 +1088,116 @@ def test_build_new_order_refuses_an_order_type_tastytrade_cannot_send(unsupporte
     assert "does not support order type" in str(excinfo.value)
 
 
+# ---------------------------------------------------------------------------
+# _build_new_order: a FRACTIONAL quantity is market-only.
+#
+# Live dry-run against the user's production account, 2026-08-21: a fractional
+# LIMIT comes back HTTP 422 with
+#     fractional_market_orders_only: Fractional equity orders can only be market
+#     or notional market orders
+# The adapter used to build it happily and let the broker say no. Refusing locally
+# is faster, and the sentence survives even when the SDK hands us an error with no
+# message at all (see EmptyTastytradeError).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("order_type,prices", [
+    ("BUY_LIMIT", {"limit_price": 34.0}),
+    ("SELL_LIMIT", {"limit_price": 34.0}),
+    ("BUY_STOP", {"stop_price": 33.0}),
+    ("SELL_STOP", {"stop_price": 33.0}),
+    ("BUY_STOP_LIMIT", {"stop_price": 33.0, "limit_price": 34.0}),
+    ("SELL_STOP_LIMIT", {"stop_price": 33.0, "limit_price": 34.0}),
+])
+def test_build_new_order_refuses_a_fractional_quantity_on_a_priced_order(order_type, prices):
+    """Every non-market equity type is refused, not just LIMIT: the broker's rule is
+    "market or notional market ONLY", so a stop and a stop-limit are out too."""
+    from ba2_trade_platform.core.types import OrderType
+
+    with pytest.raises(ValueError) as excinfo:
+        _built_order(order_type=getattr(OrderType, order_type), quantity=0.05715,
+                     **prices)
+
+    message = str(excinfo.value)
+    # The message must name the BROKER's rule, not our own invention.
+    assert "fractional_market_orders_only" in message
+    assert "can only be market or notional market orders" in message
+    assert "0.05715" in message
+
+
+def test_build_new_order_refuses_a_fractional_limit_without_asking_the_broker():
+    """Half the point of failing locally is that it costs no round trip -- and the
+    Equity lookup is a network call. Refusing after it would still be correct but
+    would make every rejected order pay for a broker request."""
+    from ba2_trade_platform.core.types import OrderType
+
+    account_def, order = _tt_trading_order(order_type=OrderType.BUY_LIMIT,
+                                           quantity=0.05715, limit_price=34.0)
+    acct = _bare_account()
+    acct.id = account_def.id
+    equity_get = AsyncMock(return_value=_FakeEquity("AAPL"))
+
+    with patch("tastytrade.instruments.Equity.get", new=equity_get):
+        with pytest.raises(ValueError):
+            acct._build_new_order(order)
+
+    equity_get.assert_not_called()
+
+
+def test_build_new_order_allows_a_fractional_market_order():
+    """The refusal must be narrow. MARKET is exactly what the broker DOES accept
+    fractionally, and this account holds 18 of its 25 positions fractionally."""
+    from ba2_trade_platform.core.types import OrderType
+
+    new_order = _built_order(order_type=OrderType.MARKET, quantity=0.05715)
+
+    assert new_order.order_type == TTOrderType.MARKET
+    # Full precision preserved -- no silent rounding to whole shares.
+    assert new_order.legs[0].quantity == Decimal("0.05715")
+
+
+def test_build_new_order_still_allows_a_whole_share_limit_order():
+    """A guard that refuses every limit order would disable resting orders entirely."""
+    from ba2_trade_platform.core.types import OrderType
+
+    new_order = _built_order(order_type=OrderType.BUY_LIMIT, quantity=3.0,
+                             limit_price=34.0)
+
+    assert new_order.order_type == TTOrderType.LIMIT
+    assert new_order.legs[0].quantity == Decimal("3.0")
+
+
+def test_build_new_order_treats_a_float_valued_whole_quantity_as_whole():
+    """TradingOrder.quantity is a float, so a whole share arrives as 12.0. Testing
+    it with a naive truthiness or string check would refuse a legal order."""
+    from ba2_trade_platform.core.types import OrderType
+
+    new_order = _built_order(order_type=OrderType.BUY_LIMIT, quantity=12.0,
+                             limit_price=34.0)
+
+    assert new_order.legs[0].quantity == Decimal("12.0")
+
+
+def test_submit_order_impl_does_not_send_a_fractional_limit_to_the_broker():
+    """The local refusal has to actually stop the submission -- otherwise it is just
+    a log line in front of the same 422."""
+    from ba2_trade_platform.core.db import get_instance
+    from ba2_trade_platform.core.models import TradingOrder
+    from ba2_trade_platform.core.types import OrderStatus, OrderType
+
+    account_def, order = _tt_trading_order(order_type=OrderType.BUY_LIMIT,
+                                           quantity=0.05715, limit_price=34.0)
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.place_order = AsyncMock()
+
+    with patch("tastytrade.instruments.Equity.get",
+               new=AsyncMock(return_value=_FakeEquity("AAPL"))):
+        assert acct._submit_order_impl(order) is None
+
+    acct._account.place_order.assert_not_called()
+    assert get_instance(TradingOrder, order.id).status == OrderStatus.ERROR
+
+
 def test_submit_order_impl_does_not_send_an_order_it_cannot_build():
     """The ValueError must stop the submission, not be reported as a broker failure
     after something has already gone out."""

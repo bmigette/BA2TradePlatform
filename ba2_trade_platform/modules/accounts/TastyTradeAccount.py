@@ -960,6 +960,50 @@ class TastyTradeAccount(AccountInterface):
         magnitude = abs(Decimal(str(price)))
         return -magnitude if side == OrderDirection.BUY else magnitude
 
+    #: Every equity order type here that carries a price. TastyTrade accepts a
+    #: FRACTIONAL quantity on NONE of them -- see ``_refuse_fractional_priced_order``.
+    _TT_PRICED_ORDER_TYPES = frozenset({
+        CoreOrderType.BUY_LIMIT, CoreOrderType.SELL_LIMIT,
+        CoreOrderType.BUY_STOP, CoreOrderType.SELL_STOP,
+        CoreOrderType.BUY_STOP_LIMIT, CoreOrderType.SELL_STOP_LIMIT,
+    })
+
+    def _refuse_fractional_priced_order(self, trading_order: TradingOrder) -> None:
+        """Raise if this order pairs a FRACTIONAL quantity with a priced order type.
+
+        The broker's rule, HTTP 422 from ``POST /accounts/{n}/orders/dry-run``
+        against the user's live account on 2026-08-21::
+
+            fractional_market_orders_only: Fractional equity orders can only be
+            market or notional market orders
+
+        We used to build the order and let the broker say no. Refusing here is
+        better on two counts: it costs no round trip (the ``Equity.get`` lookup
+        below is a network call), and the sentence survives the SDK occasionally
+        raising a ``TastytradeError`` with no message at all, which is what
+        ``EmptyTastytradeError`` exists to paper over.
+
+        The quantity is converted with the SAME ``Decimal(str(...))`` the leg uses,
+        so the number tested is exactly the number that would be sent. A whole
+        share arriving as the float ``12.0`` is NOT fractional.
+
+        Raises:
+            ValueError: on a fractional limit / stop / stop-limit.
+        """
+        if trading_order.order_type not in self._TT_PRICED_ORDER_TYPES:
+            return
+        quantity = Decimal(str(trading_order.quantity))
+        if quantity % 1 == 0:
+            return
+        raise ValueError(
+            f"[Account {self.id}] TastyTrade will not accept the fractional "
+            f"quantity {trading_order.quantity} of {trading_order.symbol} on a "
+            f"{trading_order.order_type.value} order. The broker's own rule is "
+            f"fractional_market_orders_only: 'Fractional equity orders can only be "
+            f"market or notional market orders'. Send it as a market order, or "
+            f"round the quantity to whole shares."
+        )
+
     def _build_new_order(self, trading_order: TradingOrder,
                          is_closing_order: bool = False) -> NewOrder:
         """Build the SDK ``NewOrder`` for a TradingOrder.
@@ -972,10 +1016,14 @@ class TastyTradeAccount(AccountInterface):
         orders back to database rows.
 
         Raises:
-            ValueError: when a required price is missing, or the order type is not one
-                TastyTrade equity submission supports here (OCO/OTO are out of scope).
+            ValueError: when a required price is missing, when the order type is not one
+                TastyTrade equity submission supports here (OCO/OTO are out of scope),
+                or when a fractional quantity is paired with a priced order type.
         """
         from tastytrade.instruments import Equity
+
+        # BEFORE the Equity lookup: this refusal must not cost a broker round trip.
+        self._refuse_fractional_priced_order(trading_order)
 
         equity = self._run_async(Equity.get(self._session, trading_order.symbol))
         action = self._tt_action(trading_order.side, is_closing_order)
