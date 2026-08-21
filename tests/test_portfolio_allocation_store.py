@@ -1177,3 +1177,82 @@ def test_the_deferred_path_still_takes_the_write_lock_before_reading(account_id,
                                   order_ids=[], orders_settled=False)
 
     assert calls == [True]
+
+
+# --- append_run_order_ids: durability at SUBMISSION time --------------------
+#
+# record_allocation_run writes no order ids and finalise_allocation_run is the
+# only other writer, so for the whole of the submission loop the run row claimed
+# the run had created nothing. A crash in there stranded orders that had really
+# reached the broker in a run the recovery drain then priced at zero.
+
+def test_append_run_order_ids_adds_an_id_to_an_empty_run(account_id):
+    run = store.record_allocation_run(account_id, "REBALANCE", {})
+    assert run.order_ids == []
+
+    assert store.append_run_order_ids(run.id, [7]) == [7]
+    assert store.get_recent_runs(account_id)[0].order_ids == [7]
+
+
+def test_append_run_order_ids_keeps_what_is_already_there(account_id):
+    run = store.record_allocation_run(account_id, "REBALANCE", {}, order_ids=[3])
+
+    store.append_run_order_ids(run.id, [9])
+
+    assert store.get_recent_runs(account_id)[0].order_ids == [3, 9]
+
+
+def test_append_run_order_ids_never_duplicates_an_id(account_id):
+    """A retried whole-share fallback re-reports the id of the order it already
+    created; a run listing it twice would be measured twice."""
+    run = store.record_allocation_run(account_id, "REBALANCE", {}, order_ids=[3])
+
+    store.append_run_order_ids(run.id, [3, 4, 4])
+
+    assert store.get_recent_runs(account_id)[0].order_ids == [3, 4]
+
+
+def test_append_run_order_ids_with_nothing_to_add_writes_nothing(account_id):
+    run = store.record_allocation_run(account_id, "REBALANCE", {}, order_ids=[3])
+    assert store.append_run_order_ids(run.id, []) == [3]
+    assert store.get_recent_runs(account_id)[0].order_ids == [3]
+
+
+def test_append_run_order_ids_takes_the_write_lock_before_reading(account_id, monkeypatch):
+    """Read-modify-write on a JSON column, called once per order while another
+    caller may be finalising the same run. BEGIN IMMEDIATE or the append is lost."""
+    calls = []
+    original = store._begin_write_transaction
+
+    def spy(session):
+        calls.append(True)
+        return original(session)
+
+    monkeypatch.setattr(store, "_begin_write_transaction", spy)
+    run = store.record_allocation_run(account_id, "REBALANCE", {})
+
+    store.append_run_order_ids(run.id, [1])
+
+    assert calls == [True]
+
+
+def test_append_run_order_ids_raises_for_a_run_that_does_not_exist():
+    from ba2_trade_platform.core.db import InstanceNotFound
+
+    with pytest.raises(InstanceNotFound):
+        store.append_run_order_ids(987654, [1])
+
+
+def test_appending_to_an_already_consumed_run_still_records_the_order(account_id):
+    """The stamp closes the LEDGER, not the audit. An order that turns up after a
+    run consumed still belongs to it, and hiding it would leave a broker order no
+    run in the system admits to."""
+    run = store.record_allocation_run(account_id, "REBALANCE", {})
+    store.finalise_allocation_run(run.id, filled_buy_value=0.0, filled_sell_value=0.0,
+                                  order_ids=[1])
+
+    store.append_run_order_ids(run.id, [2])
+
+    stored = store.get_recent_runs(account_id)[0]
+    assert stored.order_ids == [1, 2]
+    assert stored.income_consumed_at is not None

@@ -604,6 +604,77 @@ def record_allocation_run(account_id: int, mode: str, plan_json: Dict[str, Any],
         return row
 
 
+def append_run_order_ids(run_id: int, order_ids: List[int]) -> List[int]:
+    """Record order ids on a run AS SOON AS THEY EXIST, without touching anything else.
+
+    ``record_allocation_run`` writes no ids and ``finalise_allocation_run`` runs
+    only after the whole submission loop, so between them the run row claimed the
+    run had created nothing -- for the whole of the slow, failure-prone part. A
+    process killed in there, or an exception on the way to the measurement, left
+    orders that had REALLY REACHED THE BROKER attached to a run whose ``order_ids``
+    was ``[]``; ``reconcile_unconsumed_runs`` then measured that as "filled
+    nothing", stamped the run and dropped it out of ``get_unconsumed_runs()``
+    permanently. Money moved and the ledger could never learn of it.
+
+    The caller must invoke this at the EARLIEST durable point for each id -- for a
+    new order that is straight after the ``TradingOrder`` row is persisted and
+    BEFORE it is handed to the broker, so the id is on disk while the order is
+    still incapable of filling.
+
+    APPEND-ONLY and idempotent: ids already on the row are kept and an id supplied
+    twice (the whole-share fallback re-reports the order it already created) is
+    stored once, because ``collect_order_fills`` would otherwise measure it twice.
+    Nothing else on the row is touched -- in particular this NEVER consumes income
+    and never stamps ``income_consumed_at``; a run that only ever reaches this
+    call stays fully recoverable, which is the entire point.
+
+    Appending to an ALREADY-consumed run is allowed. The stamp closes the ledger,
+    not the audit: an order that surfaces afterwards still belongs to the run, and
+    refusing it would leave a live broker order that no run in the system admits to.
+
+    Serialised under ``BEGIN IMMEDIATE`` like every other writer here: this is a
+    read-modify-write of a JSON column that runs once per order, potentially while
+    another caller is finalising the same run, so without the lock an append is
+    silently lost.
+
+    Returns:
+        List[int]: the run's ids AFTER the append, in order.
+
+    Raises:
+        InstanceNotFound: when the run row is gone -- a real inconsistency (it was
+        recorded seconds earlier) that must not be swallowed, because the caller is
+        about to send an order that would then belong to nothing.
+    """
+    from ba2_common.core.db import InstanceNotFound
+
+    with get_db() as session:
+        _begin_write_transaction(session)
+        row = session.exec(
+            select(PortfolioAllocationRun).where(PortfolioAllocationRun.id == run_id)
+        ).first()
+        if row is None:
+            raise InstanceNotFound(f"PortfolioAllocationRun {run_id} not found")
+        merged = list(row.order_ids or [])
+        added = []
+        for raw in (order_ids or []):
+            order_id = int(raw)
+            if order_id not in merged:
+                merged.append(order_id)
+                added.append(order_id)
+        if added:
+            # Reassign rather than mutate: order_ids is a JSON column, and
+            # SQLAlchemy does not track in-place mutation of a plain list.
+            row.order_ids = merged
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+        result = list(row.order_ids or [])
+        session.expunge(row)
+    if added:
+        logger.debug(f"Allocation run {run_id} now owns order(s) {result}")
+    return result
+
+
 def finalise_allocation_run(run_id: int, *,
                             filled_buy_value: float,
                             filled_sell_value: float,

@@ -312,12 +312,52 @@ class RowOutcome:
         }
 
 
+def _noop_order_id(order_id: int) -> None:
+    """The default ``on_order_id``: remember nothing.
+
+    A separate named function rather than ``lambda _: None`` so that a caller that
+    forgot to pass a recorder is visible in a traceback, and so the parameter can
+    never be ``None`` at a call site.
+    """
+
+
+def _record_order_ids(on_order_id, order_ids) -> None:
+    """Hand each id to the recorder, and never let the recorder break a submission.
+
+    Swallowing is the lesser evil in BOTH directions. Before a new order goes out,
+    raising would abort a submission over a bookkeeping write; after a close, the
+    order is already at the broker and raising would lose the whole row's outcome
+    as well as the id. The recorder's other job -- the in-process list
+    ``run_allocation`` keeps -- happens before the DB write, so a failed write
+    still leaves the ids in the finalise call.
+    """
+    for order_id in (order_ids or []):
+        if order_id is None:
+            continue
+        try:
+            on_order_id(order_id)
+        except Exception as e:  # noqa: BLE001 -- a bookkeeping write, not the money path
+            logger.error(f"Allocation: could not record order {order_id} against its "
+                         f"run: {e}", exc_info=True)
+
+
 def submit_plan(account, plan: AllocationPlan, current: Dict[str, PositionState],
-                *, run_tag: str, allow_fractional: bool) -> List[RowOutcome]:
+                *, run_tag: str, allow_fractional: bool,
+                on_order_id=_noop_order_id) -> List[RowOutcome]:
     """Submit a plan: every SELL first, then the BUYs by descending value.
 
     Decision 13 (sells before buys) and the "buying_power shrinks as buys fill"
     risk: descending value means a shortfall truncates the SMALLEST positions.
+
+    ``on_order_id`` is called with each TradingOrder id THE MOMENT it exists, not
+    at the end. For a new order that is after the row is persisted and BEFORE the
+    broker is handed it, so the id is durable while the order is still incapable
+    of filling; for a close or an adjustment the id is minted inside the adapter,
+    so the earliest possible point is the instant the adapter returns it -- which
+    is still before the NEXT row is attempted. The outcomes carry the same ids, but
+    only for the rows that survived to return one: the backstop in ``_submit_row``
+    turns any unexpected raise into an outcome with an EMPTY id list, and a run
+    that then dies has no other record of the orders it really sent.
 
     A sell that FAILS does not abandon the buys. ``_apply_bp_scaling`` sized the
     buys against the buying power the account had BEFORE any sell, so a refused
@@ -344,10 +384,12 @@ def submit_plan(account, plan: AllocationPlan, current: Dict[str, PositionState]
 
     for row in plan.sell_rows:
         outcomes.append(_submit_row(account, row, current.get(row.symbol),
-                                    run_tag=run_tag, allow_fractional=allow_fractional))
+                                    run_tag=run_tag, allow_fractional=allow_fractional,
+                                    on_order_id=on_order_id))
     for row in plan.buy_rows:
         outcomes.append(_submit_row(account, row, current.get(row.symbol),
-                                    run_tag=run_tag, allow_fractional=allow_fractional))
+                                    run_tag=run_tag, allow_fractional=allow_fractional,
+                                    on_order_id=on_order_id))
 
     traded = {o.symbol for o in outcomes}
     for row in plan.rows:
@@ -359,17 +401,19 @@ def submit_plan(account, plan: AllocationPlan, current: Dict[str, PositionState]
     return outcomes
 
 
-def _submit_row(account, row, state, *, run_tag: str, allow_fractional: bool) -> RowOutcome:
+def _submit_row(account, row, state, *, run_tag: str, allow_fractional: bool,
+                on_order_id=_noop_order_id) -> RowOutcome:
     action = decide_symbol_action(row, state)
     try:
         if action == ACTION_SKIP:
             return RowOutcome(symbol=row.symbol, action=ACTION_SKIP, status=OUTCOME_SKIPPED,
                               message="; ".join(row.reasons) or "nothing to do")
         if action == ACTION_CLOSE:
-            return _close_symbol(account, row, state)
+            return _close_symbol(account, row, state, on_order_id=on_order_id)
         if action == ACTION_ADJUST:
-            return _adjust_symbol(account, row, state)
-        return _open_symbol(account, row, run_tag=run_tag, allow_fractional=allow_fractional)
+            return _adjust_symbol(account, row, state, on_order_id=on_order_id)
+        return _open_symbol(account, row, run_tag=run_tag,
+                            allow_fractional=allow_fractional, on_order_id=on_order_id)
     except Exception as e:
         # Backstop only -- every branch below catches its own IO per unit of work,
         # so that one dead transaction does not abandon the rest of the symbol.
@@ -408,7 +452,8 @@ def _transaction_quantity(txn_id: int) -> float:
         return 0.0
 
 
-def _close_one_transaction(account, txn_id: int, symbol: str) -> Tuple[bool, List[int], str]:
+def _close_one_transaction(account, txn_id: int, symbol: str,
+                           on_order_id=_noop_order_id) -> Tuple[bool, List[int], str]:
     """``close_transaction`` for ONE transaction.
 
     Returns:
@@ -416,7 +461,10 @@ def _close_one_transaction(account, txn_id: int, symbol: str) -> Tuple[bool, Lis
         close created -- ``close_transaction`` documents it as ``close_order_id``
         (AccountInterface.py:1567) and it is a TradingOrder this run is
         responsible for, so dropping it leaves the run audit unable to show the
-        orders that closed the positions.
+        orders that closed the positions. It is ALSO handed to ``on_order_id``
+        here rather than only returned, because a symbol can be several
+        transactions and a raise on a later leg would take the earlier legs' ids
+        down with the row.
     """
     try:
         result = account.close_transaction(txn_id)
@@ -431,12 +479,13 @@ def _close_one_transaction(account, txn_id: int, symbol: str) -> Tuple[bool, Lis
     # than presence -- and a refused close that nevertheless created an order row
     # still reports it.
     order_ids = [close_order_id] if close_order_id else []
+    _record_order_ids(on_order_id, order_ids)
     if result.get('success'):
         return True, order_ids, ""
     return False, order_ids, f"txn {txn_id}: {result.get('message', 'close failed')}"
 
 
-def _close_symbol(account, row, state) -> RowOutcome:
+def _close_symbol(account, row, state, *, on_order_id=_noop_order_id) -> RowOutcome:
     """Target 0 on a held symbol -> close every open transaction for it.
 
     Each transaction is closed independently: one refusal or one exception must
@@ -453,7 +502,8 @@ def _close_symbol(account, row, state) -> RowOutcome:
         # from (``submit_close_order_for_transaction`` sizes it off the
         # transaction), and it is what the row really put on the market.
         quantity = _transaction_quantity(txn_id)
-        ok, ids, message = _close_one_transaction(account, txn_id, row.symbol)
+        ok, ids, message = _close_one_transaction(account, txn_id, row.symbol,
+                                                  on_order_id)
         order_ids.extend(ids)
         if ok:
             closed.append(txn_id)
@@ -469,7 +519,7 @@ def _close_symbol(account, row, state) -> RowOutcome:
     )
 
 
-def _adjust_symbol(account, row, state) -> RowOutcome:
+def _adjust_symbol(account, row, state, *, on_order_id=_noop_order_id) -> RowOutcome:
     """Held, target > 0 -> resize the existing transaction(s), FIFO.
 
     A leg that EXACTLY EXHAUSTS its transaction goes through ``close_transaction``
@@ -507,7 +557,8 @@ def _adjust_symbol(account, row, state) -> RowOutcome:
         current = held.get(txn_id, 0.0)
 
         if qty_change < 0 and current > 0 and magnitude >= current:
-            ok, ids, message = _close_one_transaction(account, txn_id, row.symbol)
+            ok, ids, message = _close_one_transaction(account, txn_id, row.symbol,
+                                                      on_order_id)
             order_ids.extend(ids)
             if ok:
                 touched.append(txn_id)
@@ -532,7 +583,9 @@ def _adjust_symbol(account, row, state) -> RowOutcome:
                          f"failed: {e}", exc_info=True)
             continue
         result = result or {}
-        order_ids.extend(result.get('orders_created') or [])
+        created = list(result.get('orders_created') or [])
+        order_ids.extend(created)
+        _record_order_ids(on_order_id, created)
         if result.get('success'):
             touched.append(txn_id)
             sent += magnitude
@@ -548,7 +601,8 @@ def _adjust_symbol(account, row, state) -> RowOutcome:
     )
 
 
-def _open_symbol(account, row, *, run_tag: str, allow_fractional: bool) -> RowOutcome:
+def _open_symbol(account, row, *, run_tag: str, allow_fractional: bool,
+                 on_order_id=_noop_order_id) -> RowOutcome:
     """Not held, target > 0 -> a brand new MARKET order, with the fractional fallback.
 
     A fractional equity quantity is legal on a MARKET order and on nothing else
@@ -588,7 +642,8 @@ def _open_symbol(account, row, *, run_tag: str, allow_fractional: bool) -> RowOu
     last = None
     for index, (path, quantity) in enumerate(attempts):
         last, nothing_was_placed = _submit_new_order(
-            account, row, quantity, run_tag=run_tag, path=path)
+            account, row, quantity, run_tag=run_tag, path=path,
+            on_order_id=on_order_id)
         for order_id in last.order_ids:
             if order_id not in created:
                 created.append(order_id)
@@ -693,7 +748,7 @@ def _rejection_reason(order, order_id: int, stamped: str) -> str:
 
 
 def _submit_new_order(account, row, quantity: float, *, run_tag: str,
-                      path: str) -> Tuple[RowOutcome, bool]:
+                      path: str, on_order_id=_noop_order_id) -> Tuple[RowOutcome, bool]:
     """Persist one TradingOrder and put it through the PUBLIC submit_order seam.
 
     Public, not ``_submit_order_impl``: that is what runs order validation,
@@ -735,6 +790,13 @@ def _submit_new_order(account, row, quantity: float, *, run_tag: str,
         return RowOutcome(symbol=row.symbol, action=ACTION_NEW, status=OUTCOME_FAILED,
                           quantity=quantity, path=path,
                           message="could not persist the TradingOrder"), True
+
+    # HERE, and not one line later. The order row exists and the broker has not
+    # been told about it yet, so this is the last instant at which the id can be
+    # made durable while the order is still incapable of filling. Everything below
+    # -- the submit itself, the classification, the whole-share retry -- can raise,
+    # time out or be killed with the order live at the broker.
+    _record_order_ids(on_order_id, [order_id])
 
     try:
         result = account.submit_order(order, is_closing_order=False)
@@ -1227,7 +1289,7 @@ def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionSta
     # run would spend it a second time.
     reconcile_unconsumed_runs(account)
 
-    from .portfolio_allocation_store import record_allocation_run
+    from .portfolio_allocation_store import append_run_order_ids, record_allocation_run
 
     run = record_allocation_run(
         account.id, mode, plan.to_dict(),
@@ -1240,16 +1302,43 @@ def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionSta
     # Remember what this run actually used, so the next wizard opens on it.
     remember_fractional_choice(account.id, bool(plan.allow_fractional))
 
+    # Every order id, written to the run row THE MOMENT it exists. Until this
+    # existed the row said "created nothing" for the whole of the submission loop,
+    # so a process killed in there -- or an OperationalError out of the measurement
+    # below -- stranded orders that had really reached the broker in a run the
+    # recovery drain then priced at zero, stamped, and dropped forever.
+    recorded_ids: List[int] = []
+
+    def _remember(order_id: int) -> None:
+        # In-memory FIRST: the local list is what the finalise call uses, and it
+        # must survive a DB write that fails. append_run_order_ids is what survives
+        # the process instead.
+        if order_id in recorded_ids:
+            return
+        recorded_ids.append(order_id)
+        append_run_order_ids(run_id, [order_id])
+
     try:
         outcomes = submit_plan(account, plan, current, run_tag=str(run_id),
-                               allow_fractional=bool(plan.allow_fractional))
+                               allow_fractional=bool(plan.allow_fractional),
+                               on_order_id=_remember)
     except Exception:
-        # submit_plan validates BEFORE its first order and catches per row, so a
-        # raise out of it means nothing went out. Stamp the run as having taken
-        # nothing rather than leaving a phantom in the recovery queue forever.
-        logger.error(f"Allocation run {run_id} was refused before any order was sent",
-                     exc_info=True)
-        _finalise_run(run_id, FilledTotals(), [])
+        if recorded_ids:
+            # An id was recorded, so this raise did NOT come before the first order:
+            # something is live at the broker. Stamping FilledTotals() here would
+            # mark the run "took nothing" PERMANENTLY (the stamp is one-shot).
+            # Leaving it unfinalised is exactly what get_unconsumed_runs() is for.
+            logger.error(f"Allocation run {run_id} raised with order(s) {recorded_ids} "
+                         f"already created; leaving it UNCONSUMED for the reconcile "
+                         f"drain rather than stamping it as having taken nothing",
+                         exc_info=True)
+        else:
+            # submit_plan validates BEFORE its first order and catches per row, so a
+            # raise with nothing recorded really does mean nothing went out. Stamp
+            # the run rather than leaving a phantom in the recovery queue forever.
+            logger.error(f"Allocation run {run_id} was refused before any order was sent",
+                         exc_info=True)
+            _finalise_run(run_id, FilledTotals(), [])
         raise
 
     # EVERY outcome's ids, not just the submitted ones. A hard submit failure leaves
@@ -1257,7 +1346,13 @@ def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionSta
     # settled, so it costs nothing to include. What it buys is the case that matters:
     # submit_order returned None on a response timeout while the broker actually took
     # the order. The refresh finds the fill and the ledger charges for it.
-    order_ids: List[int] = []
+    #
+    # Seeded from what was RECORDED, because the two are not the same set: the
+    # backstop in _submit_row turns an unexpected raise into an outcome with no ids
+    # at all, and finalise_allocation_run restates order_ids wholesale, so building
+    # this from the outcomes alone would erase from the row an order the run had
+    # already persisted.
+    order_ids: List[int] = list(recorded_ids)
     for outcome in outcomes:
         for order_id in outcome.order_ids:
             if order_id not in order_ids:

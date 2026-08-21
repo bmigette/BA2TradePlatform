@@ -2107,7 +2107,7 @@ def test_run_allocation_submits_on_the_plans_own_fractional_setting(activity, mo
     RUN was solved with, and the two disagreeing sends quantities nobody saw."""
     seen = {}
 
-    def _fake_submit(account, plan, current, *, run_tag, allow_fractional):
+    def _fake_submit(account, plan, current, *, run_tag, allow_fractional, on_order_id):
         seen.update(run_tag=run_tag, allow_fractional=allow_fractional)
         return []
 
@@ -2990,3 +2990,294 @@ def test_a_reconcile_failure_never_stops_the_income_sync(activity, monkeypatch):
     assert svc.sync_income_events(account) == 1
     assert svc.get_open_income_total(74) == pytest.approx(1_000.0)
     assert any("drain broke" in e for e in errors), errors
+
+
+# ---------------------------------------------------------------------------
+# I1: an order id must be DURABLE before the order can possibly fill.
+#
+# record_allocation_run wrote no order ids and _finalise_run was the only writer,
+# so between them -- across the whole submission loop, the slow and failure-prone
+# part -- the run row said "this run created no orders". Anything that killed the
+# process or raised in there (an OperationalError out of collect_order_fills, a
+# restart) left a run whose orders REALLY REACHED THE BROKER with order_ids=[].
+# The recovery drain then measured it as "filled nothing", stamped it, and dropped
+# it out of get_unconsumed_runs() forever. Real money, no ledger.
+# ---------------------------------------------------------------------------
+
+def _one_buy_plan(symbol="AAPL", quantity=10.0, price=160.0):
+    row = make_row(symbol, OrderDirection.BUY, quantity, quantity * price,
+                   quantity * price, price=price)
+    row.target_quantity = quantity
+    return AllocationPlan(rows=[row], available_buying_power=10_000.0)
+
+
+def _run_order_ids(run_id: int):
+    return list(get_instance(PortfolioAllocationRun, run_id).order_ids or [])
+
+
+def test_a_new_orders_id_is_on_the_run_row_before_it_is_sent_to_the_broker(activity):
+    """The durability point: BEFORE submit_order, not after the loop.
+
+    _submit_new_order persists the TradingOrder and only then hands it to the
+    broker, so the row id exists while the order is still incapable of filling.
+    That instant -- and no later one -- is when it has to reach the run row.
+    """
+    account = FakeAccount(account_id=101)
+    account.positions = []
+    seen = {}
+
+    original_submit = account.submit_order
+
+    def _spy(trading_order, **kwargs):
+        # What the run row said at the moment the order went to the broker.
+        run = the_run()
+        seen['ids_at_submit'] = list(run.order_ids or [])
+        seen['order_id'] = trading_order.id
+        return original_submit(trading_order, **kwargs)
+
+    account.submit_order = _spy
+    svc.run_allocation(account, _one_buy_plan(), {}, make_base(),
+                       mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    assert seen['order_id'] in seen['ids_at_submit'], (
+        f"order {seen['order_id']} was sent to the broker while the run row listed "
+        f"{seen['ids_at_submit']} - a crash here loses it forever")
+
+
+def test_a_close_order_reaches_the_run_row_as_soon_as_the_broker_names_it(activity):
+    """A close's order id is minted inside the adapter, so the earliest durable
+    point is the instant close_transaction hands it back -- which must be before
+    the NEXT row is attempted, not after the whole loop."""
+    account = FakeAccount(account_id=102)
+    txn_a = make_open_transaction(102, "AAPL", 10.0)
+    txn_b = make_open_transaction(102, "MSFT", 4.0)
+    account.positions = [FakePosition("AAPL", 10.0, 1000.0, 1200.0),
+                         FakePosition("MSFT", 4.0, 1200.0, 1600.0)]
+    seen = []
+    original_close = account.close_transaction
+
+    def _spy(transaction_id):
+        seen.append((transaction_id, list(the_run().order_ids or [])))
+        return original_close(transaction_id)
+
+    account.close_transaction = _spy
+    rows = [make_row("AAPL", OrderDirection.SELL, -10.0, -1200.0, 0.0, price=120.0),
+            make_row("MSFT", OrderDirection.SELL, -4.0, -1600.0, 0.0, price=400.0)]
+    for row in rows:
+        row.target_quantity = 0.0
+    current = {"AAPL": PositionState(symbol="AAPL", quantity=10.0, cost_basis=1000.0,
+                                     price=120.0, transaction_ids=[txn_a]),
+               "MSFT": PositionState(symbol="MSFT", quantity=4.0, cost_basis=1200.0,
+                                     price=400.0, transaction_ids=[txn_b])}
+    result = svc.run_allocation(account, AllocationPlan(rows=rows,
+                                                        available_buying_power=10_000.0),
+                                current, make_base(), mode=ALLOCATION_MODE_REBALANCE)
+
+    # By the time the SECOND close was attempted, the FIRST close's order was
+    # already recorded against the run.
+    assert len(seen) == 2
+    assert seen[1][1], "the first close's order id had not been persisted yet"
+    assert set(seen[1][1]) <= set(result["order_ids"])
+
+
+def test_a_run_that_dies_between_submitting_and_measuring_keeps_its_order_ids(
+        activity, monkeypatch):
+    """The exact incident: measurement explodes AFTER the orders are at the broker.
+
+    Nothing rolls back a broker order, so the run row is the only record that they
+    exist. If it says [] the drain prices the run at zero, stamps it, and the money
+    is invisible for good.
+    """
+    account = FakeAccount(account_id=103)
+    account.positions = []
+    account.fills = {"AAPL": (OrderStatus.FILLED, 10.0, 160.0)}
+    add_instance(PortfolioIncomeEvent(account_id=103, external_id="dep-1",
+                                      event_date=date(2026, 8, 1),
+                                      event_type=CASH_TRANSFER_DEPOSIT, amount=6_000.0))
+    monkeypatch.setattr(svc, "collect_order_fills",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            RuntimeError("database is locked")))
+
+    with pytest.raises(RuntimeError):
+        svc.run_allocation(account, _one_buy_plan(), {}, make_base(),
+                           mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    run = the_run()
+    assert run.income_consumed_at is None       # still recoverable
+    assert run.order_ids, "the run forgot the order it really sent to the broker"
+    assert [r.symbol for r in account.get_positions() or []] == []
+    submitted_ids = [o.id for o in _account_orders(103)]
+    assert sorted(run.order_ids) == sorted(submitted_ids)
+
+    # ...and the drain now prices it correctly instead of stamping a zero.
+    monkeypatch.undo()
+    assert svc.reconcile_unconsumed_runs(account) == [run.id]
+    assert svc.get_open_income_total(103) == pytest.approx(6_000.0 - 1600.0)
+
+
+def _account_orders(account_id: int):
+    with get_db() as session:
+        rows = list(session.exec(select(TradingOrder).where(
+            TradingOrder.account_id == account_id)).all())
+        session.expunge_all()
+        return rows
+
+
+def test_the_backstop_swallowing_a_rows_ids_does_not_erase_them_from_the_run(
+        activity, monkeypatch):
+    """``_submit_row``'s backstop exists for the unforeseen -- and it returns an
+    outcome with an EMPTY id list.
+
+    ``finalise_allocation_run`` restates order_ids WHOLESALE, so a final list built
+    from the outcomes alone would delete from the run row an order that had already
+    been persisted and sent. The run's ids are therefore seeded from what was
+    RECORDED during submission, not from what the outcomes survived to report.
+    """
+    _capture_errors(monkeypatch)
+    account = FakeAccount(account_id=109)
+    txn_id = make_open_transaction(109, "AAPL", 10.0)
+    account.positions = [FakePosition("AAPL", 10.0, 1000.0, 1200.0)]
+    real_close_symbol = svc._close_symbol
+
+    def _close_then_die(*args, **kwargs):
+        real_close_symbol(*args, **kwargs)          # the order really goes out
+        raise RuntimeError("something nobody foresaw, which is what a backstop is for")
+
+    monkeypatch.setattr(svc, "_close_symbol", _close_then_die)
+    row = make_row("AAPL", OrderDirection.SELL, -10.0, -1200.0, 0.0, price=120.0)
+    row.target_quantity = 0.0
+    current = {"AAPL": PositionState(symbol="AAPL", quantity=10.0, cost_basis=1000.0,
+                                     price=120.0, transaction_ids=[txn_id])}
+
+    result = svc.run_allocation(account, AllocationPlan(rows=[row],
+                                                        available_buying_power=10_000.0),
+                                current, make_base(), mode=ALLOCATION_MODE_REBALANCE)
+
+    assert result["outcomes"][0].order_ids == []     # the backstop lost them
+    assert result["order_ids"], "the close order the run really placed was dropped"
+    assert _run_order_ids(result["run_id"]) == result["order_ids"]
+
+
+def test_a_durability_write_that_fails_neither_breaks_nor_silences_the_run(
+        activity, monkeypatch):
+    """The per-order write is bookkeeping, not the money path.
+
+    Raising out of it would abort a submission (or, after a close, lose a whole
+    row's outcome) over a JSON column. So it is swallowed -- but LOUDLY, and the
+    id is kept in memory first, so the finalise call still puts it on the row.
+    """
+    errors = _capture_errors(monkeypatch)
+    account = FakeAccount(account_id=108)
+    account.positions = []
+    account.fills = {"AAPL": (OrderStatus.FILLED, 10.0, 160.0)}
+    import ba2_common.core.portfolio_allocation_store as store_module
+    monkeypatch.setattr(store_module, "append_run_order_ids",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            RuntimeError("database is locked")))
+
+    result = svc.run_allocation(account, _one_buy_plan(), {}, make_base(),
+                                mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    assert [o.status for o in result["outcomes"]] == [svc.OUTCOME_SUBMITTED]
+    assert result["order_ids"]
+    assert _run_order_ids(result["run_id"]) == result["order_ids"]
+    assert any("could not record order" in e.lower() for e in errors), errors
+
+
+def test_a_run_that_raised_after_creating_orders_is_not_stamped_as_having_taken_nothing(
+        activity, monkeypatch):
+    """submit_plan's backstop used to stamp FilledTotals() -- 'this run took
+    nothing' -- on ANY raise out of it. Once an order id has been recorded that is
+    a lie, and it is a permanent one: the stamp is one-shot."""
+    account = FakeAccount(account_id=104)
+    account.positions = []
+    errors = _capture_errors(monkeypatch)
+    plan = _one_buy_plan()
+
+    real_submit_row = svc._submit_row
+    calls = []
+
+    def _explode_after_the_first(*args, **kwargs):
+        calls.append(1)
+        outcome = real_submit_row(*args, **kwargs)
+        raise RuntimeError("the loop died holding a live order")
+
+    monkeypatch.setattr(svc, "_submit_row", _explode_after_the_first)
+    with pytest.raises(RuntimeError):
+        svc.run_allocation(account, plan, {}, make_base(),
+                           mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    run = the_run()
+    assert run.income_consumed_at is None
+    assert run.order_ids, "the order that reached the broker was forgotten"
+    assert any("leaving it UNCONSUMED" in e or "recoverable" in e.lower()
+               for e in errors), errors
+
+
+# ---------------------------------------------------------------------------
+# I2: two mutations that turn a recoverable run into a permanent zero-stamp.
+# ---------------------------------------------------------------------------
+
+def test_a_reconcile_pass_whose_refresh_failed_prices_nothing_at_all(
+        activity, monkeypatch):
+    """Kills the mutation that deletes reconcile's `if not
+    refresh_orders_from_broker(...): return []` guard.
+
+    The pre-existing test only passed because ITS run was unmeasurable anyway.
+    Here the DB rows already look FINAL -- a FILLED market order -- so a pass that
+    skipped the guard would happily consume the ledger against numbers the broker
+    was never asked about. Stale rows and true ones are indistinguishable from
+    inside; the only defence is refusing to price a pass whose refresh failed.
+    """
+    account = FakeAccount(account_id=106)
+    account.positions = []
+    account.fills = {"AAPL": (OrderStatus.ACCEPTED, 0.0, None)}   # still working
+    add_instance(PortfolioIncomeEvent(account_id=106, external_id="dep-1",
+                                      event_date=date(2026, 8, 1),
+                                      event_type=CASH_TRANSFER_DEPOSIT, amount=6_000.0))
+    first = svc.run_allocation(account, _one_buy_plan(), {}, make_base(),
+                               mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+    assert [r.id for r in svc.get_unconsumed_runs(106)] == [first["run_id"]]
+
+    # The broker later filled it and our row was updated out of band, so the rows
+    # LOOK final -- but this pass's refresh fails, so we have not confirmed a thing.
+    for order in _account_orders(106):
+        account._write_order(order.id, status=OrderStatus.FILLED, filled_qty=10.0,
+                             open_price=160.0)
+    _capture_errors(monkeypatch)
+    account.refresh_raises = RuntimeError("broker 503")
+
+    assert svc.reconcile_unconsumed_runs(account) == []
+    assert svc.get_open_income_total(106) == pytest.approx(6_000.0)
+    assert [r.id for r in svc.get_unconsumed_runs(106)] == [first["run_id"]]
+    assert get_instance(PortfolioAllocationRun,
+                        first["run_id"]).income_consumed_at is None
+
+
+def test_a_reconcile_pass_that_defers_a_run_leaves_its_order_ids_intact(activity):
+    """Kills the mutation that passes `order_ids=[]` at reconcile's finalise call.
+
+    finalise_allocation_run RESTATES order_ids wholesale, so a pass that hands it
+    an empty list ERASES the run's only record of what it sent -- and the very next
+    pass then measures no orders, calls that settled, consumes nothing and stamps
+    the run. Two passes is the shape of the bug, so two passes is the test.
+    """
+    account = FakeAccount(account_id=107)
+    account.positions = []
+    account.fills = {}                       # nothing reported: still working
+    add_instance(PortfolioIncomeEvent(account_id=107, external_id="dep-1",
+                                      event_date=date(2026, 8, 1),
+                                      event_type=CASH_TRANSFER_DEPOSIT, amount=6_000.0))
+    first = svc.run_allocation(account, _one_buy_plan(), {}, make_base(),
+                               mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+    submitted = _run_order_ids(first["run_id"])
+    assert submitted
+
+    # Pass 1: still working, so nothing is consumed -- and nothing is forgotten.
+    assert svc.reconcile_unconsumed_runs(account) == []
+    assert _run_order_ids(first["run_id"]) == submitted
+
+    # Pass 2: it filled. The run can only be priced from the ids pass 1 preserved.
+    account.fills = {"AAPL": (OrderStatus.FILLED, 10.0, 160.0)}
+    assert svc.reconcile_unconsumed_runs(account) == [first["run_id"]]
+    assert svc.get_open_income_total(107) == pytest.approx(6_000.0 - 1600.0)
