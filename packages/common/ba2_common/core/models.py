@@ -837,7 +837,13 @@ class PortfolioAllocationConfig(SQLModel, table=True):
     ``valuation_mode`` is a PLAIN str column (matching OptionActivity.activity_type):
     "cost" or "market" -- use ``VALUATION_MODE_COST`` / ``VALUATION_MODE_MARKET``
     from ``ba2_common.core.portfolio_allocation``, never a bare literal. One row
-    per account, created on first use with the defaults "cost" and False.
+    per account, created on first use with the defaults "cost" and
+    allow_fractional=True. Fractional defaults ON because roughly three quarters of
+    this book IS fractionable; the quarter that is not falls back to whole shares
+    per symbol inside the engine (``MarginInfo.fractionable``), so the default costs
+    nothing on the ineligible names. The column has NO server default -- this Python
+    default is what every new row gets, which is why changing it needs no Alembic
+    revision.
     """
     __tablename__ = "portfolio_allocation_config"
 
@@ -845,7 +851,7 @@ class PortfolioAllocationConfig(SQLModel, table=True):
     account_id: int = Field(foreign_key="accountdefinition.id", ondelete="CASCADE",
                             index=True, unique=True)
     valuation_mode: str = Field(default="cost", description="cost | market (plain str, see core.portfolio_allocation)")
-    allow_fractional: bool = Field(default=False, description="Last fractional-shares choice, pre-filled into the wizard")
+    allow_fractional: bool = Field(default=True, description="Last fractional-shares choice, pre-filled into the wizard (defaults ON)")
     updated_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), index=True)
 
 

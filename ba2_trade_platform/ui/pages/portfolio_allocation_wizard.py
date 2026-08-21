@@ -345,6 +345,7 @@ class AllocationSteps:
 
     def __init__(self, base: BaseSnapshot, labels: List[LabelTarget], *,
                  on_dry_run: Callable[..., None],
+                 allow_fractional: bool,
                  mode: str = ALLOCATION_MODE_REBALANCE,
                  invest_amount: float = 0.0):
         self.base = base
@@ -356,9 +357,10 @@ class AllocationSteps:
         self.on_dry_run = on_dry_run
         self.mode = mode
         self.invest_amount = float(invest_amount or 0.0)
-        # Fractional is opt-in PER RUN (decision 12), so it always starts off --
-        # never inherited from the account, and never on by default.
-        self.allow_fractional = False
+        # The account's REMEMBERED choice (defaults ON), still vetoed by a broker
+        # that cannot do fractional at all. Per-symbol eligibility is the engine's
+        # job -- MarginInfo.fractionable -- not this switch's.
+        self.allow_fractional = bool(base.supports_fractional and allow_fractional)
         self.scope_label = self.labels[0].label if self.labels else None
         self.dialog = None
         self._errors_container = None
@@ -522,11 +524,19 @@ class AllocationSteps:
 
 def open_allocation_steps(base: BaseSnapshot, labels: List[LabelTarget], *,
                           on_dry_run: Callable[..., None],
+                          allow_fractional: bool,
                           mode: str = ALLOCATION_MODE_REBALANCE,
                           invest_amount: float = 0.0) -> AllocationSteps:
     """Open steps 1-3. ``on_dry_run`` is called with keyword arguments
-    ``mode``, ``labels``, ``scope_label``, ``amount`` and ``allow_fractional``."""
-    steps = AllocationSteps(base, labels, on_dry_run=on_dry_run, mode=mode,
+    ``mode``, ``labels``, ``scope_label``, ``amount`` and ``allow_fractional``.
+
+    ``allow_fractional`` is REQUIRED and has no default: the caller passes
+    ``get_allocation_config(account_id).allow_fractional`` (itself defaulting to
+    True), and persists any change through
+    ``portfolio_allocation_service.remember_fractional_choice``. A default here
+    would silently re-answer a question the account has already answered."""
+    steps = AllocationSteps(base, labels, on_dry_run=on_dry_run,
+                            allow_fractional=allow_fractional, mode=mode,
                             invest_amount=invest_amount)
     steps.open()
     return steps

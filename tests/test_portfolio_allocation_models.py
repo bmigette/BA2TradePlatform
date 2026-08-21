@@ -131,12 +131,15 @@ def test_run_json_columns_round_trip(mock_account_def):
         assert row.order_ids == [11, 12, 13]
 
 
-def test_allocation_config_defaults_to_cost_mode_and_whole_shares(mock_account_def):
+def test_allocation_config_defaults_to_cost_mode_and_fractional_shares(mock_account_def):
+    """Fractional defaults ON: about three quarters of the user's symbols ARE
+    fractionable, and the quarter that is not falls back to whole shares per symbol
+    inside the engine anyway."""
     add_instance(PortfolioAllocationConfig(account_id=mock_account_def.id))
     with get_db() as session:
         row = session.exec(select(PortfolioAllocationConfig)).one()
         assert row.valuation_mode == "cost"
-        assert row.allow_fractional is False
+        assert row.allow_fractional is True
 
 
 def test_allocation_config_round_trips_market_mode(mock_account_def):

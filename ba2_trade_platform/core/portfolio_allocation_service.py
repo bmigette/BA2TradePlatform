@@ -1050,6 +1050,8 @@ def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionSta
         allow_fractional=bool(plan.allow_fractional),
     )
     run_id = run.id
+    # Remember what this run actually used, so the next wizard opens on it.
+    remember_fractional_choice(account.id, bool(plan.allow_fractional))
 
     try:
         outcomes = submit_plan(account, plan, current, run_tag=str(run_id),
@@ -1115,3 +1117,18 @@ def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionSta
         "order_ids": totals["order_ids"],
         "income_consumed": income_consumed,
     }
+
+
+def remember_fractional_choice(account_id: int, allow_fractional: bool) -> None:
+    """Persist the fractional-shares choice so the next wizard opens on it.
+
+    Never raises: forgetting a preference must not take down a submission. The
+    default when nothing has ever been stored is ON
+    (``PortfolioAllocationConfig.allow_fractional``).
+    """
+    from .portfolio_allocation_store import set_allocation_config
+    try:
+        set_allocation_config(account_id, allow_fractional=bool(allow_fractional))
+    except Exception as e:
+        logger.error(f"Could not remember the fractional choice for account "
+                     f"{account_id}: {e}", exc_info=True)

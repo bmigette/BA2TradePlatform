@@ -292,8 +292,8 @@ def remove_symbol_weight(account_id: int, label: str, symbol: str) -> bool:
 def get_allocation_config(account_id: int) -> PortfolioAllocationConfig:
     """The account's allocation config, CREATING it with the defaults on first use.
 
-    Defaults are ``valuation_mode="cost"`` and ``allow_fractional=False`` (spec
-    decision 5a). Always returns a row, never ``None``: the page must always be
+    Defaults are ``valuation_mode="cost"`` (spec decision 5a) and
+    ``allow_fractional=True``. Always returns a row, never ``None``: the page must always be
     able to state which valuation mode produced the numbers on screen.
 
     Pass the returned ``valuation_mode`` to the engine. It has to be passed: all
@@ -314,7 +314,8 @@ def get_allocation_config(account_id: int) -> PortfolioAllocationConfig:
             session.commit()
             session.refresh(row)
             logger.info(f"Created default allocation config for account {account_id} "
-                        f"(valuation_mode={VALUATION_MODE_COST}, allow_fractional=False)")
+                        f"(valuation_mode={row.valuation_mode}, "
+                        f"allow_fractional={row.allow_fractional})")
         session.expunge(row)
         return row
 

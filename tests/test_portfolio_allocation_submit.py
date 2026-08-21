@@ -2249,3 +2249,42 @@ def test_run_allocation_finalises_a_run_that_had_nothing_to_submit(activity):
     assert result["order_ids"] == []
     assert get_unconsumed_runs(56) == []
     assert svc.get_open_income_total(56) == pytest.approx(5_000.0)
+
+
+# ---------------------------------------------------------------------------
+# The fractional choice is remembered
+# ---------------------------------------------------------------------------
+
+def test_remember_fractional_choice_persists_the_flag():
+    from ba2_trade_platform.core.portfolio_allocation_store import get_allocation_config
+
+    svc.remember_fractional_choice(4_101, False)
+    assert get_allocation_config(4_101).allow_fractional is False
+    svc.remember_fractional_choice(4_101, True)
+    assert get_allocation_config(4_101).allow_fractional is True
+
+
+def test_remember_fractional_choice_never_raises(monkeypatch):
+    """Forgetting a preference must not take down a submission."""
+    import sys
+    module = sys.modules[svc.__name__]
+    errors = []
+    monkeypatch.setattr(module.logger, "error", lambda msg, *a, **k: errors.append(str(msg)))
+    monkeypatch.setattr("ba2_common.core.portfolio_allocation_store.set_allocation_config",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db gone")))
+
+    svc.remember_fractional_choice(4_242, True)
+
+    assert any("fractional choice" in e for e in errors), errors
+
+
+def test_run_allocation_remembers_the_fractional_choice_it_ran_with():
+    from ba2_trade_platform.core.portfolio_allocation_store import get_allocation_config
+
+    account = FakeAccount(account_id=41)
+    account.positions = []
+    plan = AllocationPlan(rows=[], available_buying_power=1_000.0, allow_fractional=False)
+
+    svc.run_allocation(account, plan, {}, make_base(), mode=ALLOCATION_MODE_REBALANCE)
+
+    assert get_allocation_config(41).allow_fractional is False

@@ -375,6 +375,9 @@ def _labels():
 def _open_steps(client, wiz, labels=None, **kwargs):
     calls = []
     kwargs.setdefault('on_dry_run', lambda **kw: calls.append(kw))
+    # These tests predate the remembered choice and were written against a switch
+    # that always opened OFF; passing False keeps them meaning what they meant.
+    kwargs.setdefault('allow_fractional', False)
     with client:
         steps = wiz.open_allocation_steps(_base(), labels if labels is not None else _labels(),
                                           **kwargs)
@@ -500,9 +503,9 @@ def test_continue_hands_the_edited_targets_to_the_dry_run(nicegui_client):
     assert call["allow_fractional"] is False
 
 
-def test_fractional_is_off_by_default_and_unavailable_without_broker_support(nicegui_client):
-    """Opt-in per run (decision 12), and only offerable when the broker splits
-    shares at all."""
+def test_fractional_follows_the_caller_and_is_unavailable_without_broker_support(nicegui_client):
+    """The switch opens on the choice the CALLER passes (the account's remembered
+    one), and is only offerable when the broker splits shares at all."""
     from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
 
     steps, _ = _open_steps(nicegui_client, wiz)
@@ -512,7 +515,8 @@ def test_fractional_is_off_by_default_and_unavailable_without_broker_support(nic
     base = _base()
     base.supports_fractional = True
     with nicegui_client:
-        supported = wiz.open_allocation_steps(base, _labels(), on_dry_run=lambda **kw: None)
+        supported = wiz.open_allocation_steps(base, _labels(), on_dry_run=lambda **kw: None,
+                                              allow_fractional=False)
     assert supported.allow_fractional is False
     assert supported._fractional_switch.enabled is True
 
@@ -902,3 +906,44 @@ def test_the_outcome_table_says_when_a_symbol_is_wash_trade_locked(nicegui_clien
 
     assert notifications[-1][1] == 'warning'
     assert 'wash-trade' in notifications[-1][0]
+
+
+def test_open_allocation_steps_requires_an_explicit_fractional_default():
+    """The hardcoded ``self.allow_fractional = False`` is gone; the caller passes
+    the account's remembered choice, which now defaults ON."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    params = inspect.signature(wiz.open_allocation_steps).parameters
+    assert "allow_fractional" in params
+    assert params["allow_fractional"].default is inspect.Parameter.empty
+
+    init_params = inspect.signature(wiz.AllocationSteps.__init__).parameters
+    assert "allow_fractional" in init_params
+    assert init_params["allow_fractional"].default is inspect.Parameter.empty
+
+
+def test_the_steps_dialog_opens_on_the_remembered_fractional_choice(nicegui_client):
+    """ON when the account remembers ON and the broker can split shares."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    base = _base()
+    base.supports_fractional = True
+    with nicegui_client:
+        steps = wiz.open_allocation_steps(base, _labels(), on_dry_run=lambda **kw: None,
+                                          allow_fractional=True)
+    assert steps.allow_fractional is True
+    assert steps._fractional_switch.value is True
+
+
+def test_a_broker_that_cannot_split_shares_still_vetoes_the_remembered_choice(nicegui_client):
+    """``supports_fractional`` wins: offering a grid the broker does not have would
+    plan orders it cannot accept."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    base = _base()
+    base.supports_fractional = False
+    with nicegui_client:
+        steps = wiz.open_allocation_steps(base, _labels(), on_dry_run=lambda **kw: None,
+                                          allow_fractional=True)
+    assert steps.allow_fractional is False
+    assert steps._fractional_switch.enabled is False

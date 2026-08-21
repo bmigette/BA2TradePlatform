@@ -204,7 +204,7 @@ def test_remove_symbol_weight_returns_false_when_no_row_exists(account_id):
 def test_get_allocation_config_creates_the_row_with_spec_defaults(account_id):
     config = store.get_allocation_config(account_id)
     assert config.valuation_mode == "cost"
-    assert config.allow_fractional is False
+    assert config.allow_fractional is True
     # Reading twice must not create a second row (account_id is unique).
     assert store.get_allocation_config(account_id).id == config.id
 
@@ -220,6 +220,22 @@ def test_set_allocation_config_leaves_unpassed_fields_untouched(account_id):
     config = store.get_allocation_config(account_id)
     assert config.valuation_mode == "market"
     assert config.allow_fractional is False
+
+
+def test_set_allocation_config_leaves_the_fractional_choice_untouched(account_id):
+    """The mirror of the test above: a mode-only write must not reset the switch
+    back to its default. The guard is ``is not None``, not truthiness."""
+    store.set_allocation_config(account_id, valuation_mode="market", allow_fractional=False)
+    store.set_allocation_config(account_id, valuation_mode="cost")
+    config = store.get_allocation_config(account_id)
+    assert config.valuation_mode == "cost"
+    assert config.allow_fractional is False
+
+
+def test_set_allocation_config_can_turn_fractional_back_off(account_id):
+    """False must be storable even though it is falsy -- the guard is `is not None`."""
+    store.set_allocation_config(account_id, allow_fractional=False)
+    assert store.get_allocation_config(account_id).allow_fractional is False
 
 
 def test_set_allocation_config_rejects_an_unknown_valuation_mode(account_id):
