@@ -305,6 +305,73 @@ def test_a_cost_mode_reduction_removes_average_cost_not_the_market_price():
     assert left["A"] == pytest.approx(0.0)
 
 
+def test_cost_mode_converts_a_buying_row_at_price_even_when_the_label_is_OVER():
+    """The rate belongs to the ROW BEING MOVED, not to the label's residual.
+
+    HELD is down 50%: 10 shares carrying 2,000 of basis (200 average) at a 100
+    price, and it is buying 8 more. Its projected BASIS is 2,000 + 800 = 2,800
+    against a 2,400 target, so the label is 400 OVER and the give-back is a SELL
+    direction on a BUYING row -- the two signs disagree.
+
+    One share bought less removes the PRICE from the basis (100), never the average
+    cost (200), so exactly 4 shares come off. Sizing that give-back at the average
+    cost halves it: 2 shares, and the label finishes 100 over target with a warning
+    on it. That is the cost-mode-divides-by-the-wrong-rate bug, one level up.
+    """
+    row = _buy_row("HELD", 100.0, 8.0, current_quantity=10.0,
+                   current_cost_basis=2_000.0, target_notional=2_400.0)
+    plan = AllocationPlan(rows=[row], available_buying_power=1_000_000.0,
+                          valuation_mode=pa.VALUATION_MODE_COST)
+    left = pa.redistribute_label_residuals(plan, {"A": {"HELD": 2_400.0}},
+                                           {"HELD": _whole("HELD")},
+                                           allow_fractional=False)
+    assert row.delta_quantity == pytest.approx(4.0)
+    assert pa.projected_value(row, pa.VALUATION_MODE_COST) == pytest.approx(2_400.0)
+    assert left["A"] == pytest.approx(0.0)
+    assert plan.warnings == []
+
+
+def test_cost_mode_converts_a_selling_row_at_average_cost_even_when_the_label_is_SHORT():
+    """The same rule with the signs disagreeing the other way round.
+
+    HELD is up 100%: 10 shares carrying 500 of basis (50 average) at a 100 price,
+    and it is selling 8. Its projected basis is 500 x 2/10 = 100 against a 300
+    target, so the label is 200 SHORT and the top-up is a BUY direction on a
+    SELLING row. Selling one share fewer puts the AVERAGE COST back (50), not the
+    price (100), so 4 shares of the sell are cancelled, not 2.
+    """
+    row = _buy_row("HELD", 100.0, -8.0, current_quantity=10.0,
+                   current_cost_basis=500.0, target_notional=300.0)
+    plan = AllocationPlan(rows=[row], available_buying_power=1_000_000.0,
+                          valuation_mode=pa.VALUATION_MODE_COST)
+    left = pa.redistribute_label_residuals(plan, {"A": {"HELD": 300.0}},
+                                           {"HELD": _whole("HELD")},
+                                           allow_fractional=False)
+    assert row.delta_quantity == pytest.approx(-4.0)
+    assert pa.projected_value(row, pa.VALUATION_MODE_COST) == pytest.approx(300.0)
+    assert left["A"] == pytest.approx(0.0)
+    assert plan.warnings == []
+
+
+def test_a_cost_mode_row_not_trading_yet_absorbs_a_shortfall_at_price():
+    """The boundary of "which side is this row on": a row with NO order yet takes a
+    shortfall by BUYING, so it converts at the price even though it is held at a 200
+    average. The gap is exactly one share at the price and half a share at the
+    average, so reading the zero as a sell floors the step to nothing and the label
+    is left short with a warning on it.
+    """
+    row = _buy_row("HELD", 100.0, 0.0, current_quantity=10.0,
+                   current_cost_basis=2_000.0, target_notional=2_100.0)
+    plan = AllocationPlan(rows=[row], available_buying_power=1_000_000.0,
+                          valuation_mode=pa.VALUATION_MODE_COST)
+    left = pa.redistribute_label_residuals(plan, {"A": {"HELD": 2_100.0}},
+                                           {"HELD": _whole("HELD")},
+                                           allow_fractional=False)
+    assert row.delta_quantity == pytest.approx(1.0)
+    assert pa.projected_value(row, pa.VALUATION_MODE_COST) == pytest.approx(2_100.0)
+    assert left["A"] == pytest.approx(0.0)
+
+
 # ---------------------------------------------------------------------------
 # Convergence and the bound
 # ---------------------------------------------------------------------------

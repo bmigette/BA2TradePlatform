@@ -2239,9 +2239,27 @@ def _label_residual(target_total: float, members: List["AllocationRow"],
     return float(target_total) - total
 
 
+def _row_is_buying(row: "AllocationRow", residual: float) -> bool:
+    """Which SIDE the row will be on once ``_absorb_residual`` has moved it.
+
+    The conversion rate belongs to the ROW, never to the label's residual, and the
+    two disagree constantly: closing a shortfall by selling LESS moves a row that is
+    still a SELL, and closing an overshoot by buying LESS moves a row that is still a
+    BUY. Mirrors ``_absorb_residual``'s four branches exactly, and it is safe to
+    decide this BEFORE the move because none of those branches may flip a row's sign:
+    the two "never delete the order" clamps stop one whole unit short of zero.
+    """
+    current = float(row.delta_quantity or 0.0)
+    return current >= 0 if residual > 0 else current > 0
+
+
 def _absorption_unit_money(row: "AllocationRow", valuation_mode: str,
                            allocation_basis: str, *, buying: bool) -> float:
     """How much the LABEL's measured total moves per share moved on this row.
+
+    ``buying`` is the side of the ROW being moved (``_row_is_buying``), NOT the sign
+    of the label's residual: a row selling less to close a shortfall is still a sell
+    and still converts at a sell's rate.
 
     Not always the price. In ``cost`` mode on a position basis, buying a share adds
     the market PRICE to the basis but selling one removes the AVERAGE COST, exactly
@@ -2285,8 +2303,12 @@ def _absorb_residual(row: "AllocationRow", residual: float,
     if price <= 0 or unit <= 0:
         return 0.0
     buying = residual > 0
+    # The DIRECTION of the move comes from the residual; the RATE comes from the
+    # row. In cost mode on a position basis those differ whenever the row's own side
+    # disagrees with the residual's sign, and converting at the label's sign moves
+    # every share at the wrong price.
     unit_money = _absorption_unit_money(row, valuation_mode, allocation_basis,
-                                        buying=buying)
+                                        buying=_row_is_buying(row, residual))
     if unit_money <= 0:
         return 0.0
     steps = math.floor(abs(residual) / (unit_money * unit) + QUANTITY_EPSILON)
