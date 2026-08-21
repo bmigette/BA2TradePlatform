@@ -1483,9 +1483,11 @@ def _schd_margin(min_fractional_notional=5.0):
 def test_a_fractional_buy_below_the_brokers_notional_floor_is_suppressed():
     """The exact order the broker refused: ~0.057 shares of SCHD, under $2.
 
-    Still not sent -- but D1 now owns this case and prices it: the fraction is
-    unavailable under the $5 floor, and one whole share of a $34 ETF is 1744% of
-    a $1.95 target, far outside the 1.5x bump guard. The row says both.
+    Still not sent -- but D1 now owns this case and prices it: nothing that small
+    can be sent under the $5 floor, and the CHEAPEST order that clears it (0.14706
+    shares, $5.00) is 256% of a $1.95 target, outside the 1.5x bump guard. The row
+    quotes the cheapest legal order, not one whole share ($34, 1744%): the number
+    the user is being refused has to be the one the engine actually considered.
     """
     labels = [LabelTarget("A", 100.0, [SymbolTarget("SCHD", 100.0)])]
     plan = pa.compute_allocation(1.95, 1_000_000.0, labels,
@@ -1501,7 +1503,7 @@ def test_a_fractional_buy_below_the_brokers_notional_floor_is_suppressed():
     assert row.unmet_notional == pytest.approx(1.95)
     reason = " ".join(row.reasons)
     assert "$5 fractional minimum" in reason
-    assert "1744% of target" in reason
+    assert "256% of target" in reason
 
 
 def test_a_fractional_buy_above_the_notional_floor_still_trades():
@@ -1684,9 +1686,11 @@ def test_the_tradeable_unit_is_one_share_unless_the_broker_publishes_a_step():
 
 
 def test_the_five_dollar_fractional_floor_escalates_the_bump_to_one_whole_share():
-    """L2/L8b: below the broker's $5 fractional minimum the fractional path is
-    CLOSED, so the only options are one WHOLE share or nothing -- the three
-    thresholds are weighed together, never in sequence."""
+    """L2/L8b: the three thresholds are weighed together, never in sequence.
+
+    A WHOLE share is exempt from the money floor, so when it is the CHEAPER of the
+    two legal destinations it wins: one share of this $4 stock costs $4 against the
+    $5.00 (1.25 shares) the smallest clearing fraction would cost."""
     margin = MarginInfo(symbol="SCHD", bp_factor=1.0, fractionable=True,
                         min_trade_increment=0.00001, min_fractional_notional=5.0)
     qty, outcome, reason = pa.size_sub_unit_target(3.0, 4.0, margin,
@@ -1696,10 +1700,51 @@ def test_the_five_dollar_fractional_floor_escalates_the_bump_to_one_whole_share(
     assert "$5 fractional minimum" in reason
 
 
+def test_the_money_floor_escalates_to_the_smallest_FRACTION_that_clears_it():
+    """The $5 rule is a minimum NOTIONAL, not a ban on fractions: a BIGGER fraction
+    clears it, and it is usually far cheaper than a whole share.
+
+    A $4 slice of a $34 ETF on a 5-decimal grid: 0.14706 shares is $5.00004, legal
+    and 125% of target -- inside the bump bound. Escalating straight to one whole
+    share asks for $34, 850% of target, which the bound then refuses, so the symbol
+    gets NOTHING when a legal order was sitting there.
+    """
+    margin = MarginInfo(symbol="SCHD", bp_factor=1.0, fractionable=True,
+                        min_trade_increment=0.00001, min_fractional_notional=5.0)
+    qty, outcome, reason = pa.size_sub_unit_target(4.0, 34.0, margin,
+                                                   allow_fractional=True)
+    assert qty == pytest.approx(0.14706)
+    assert qty * 34.0 >= 5.0                    # the broker will take this one
+    assert outcome == pa.SIZING_OUTCOME_BUMPED
+    assert "$5 fractional minimum" in reason
+    assert "125% of target" in reason
+
+
+def test_the_four_dollar_slice_reaches_the_plan_as_a_real_order():
+    """The same case end to end -- the row that used to read "no order"."""
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("SCHD", 100.0)])]
+    plan = pa.compute_allocation(4.0, 1_000_000.0, labels,
+                                 {"SCHD": _pos("SCHD", 34.0)}, _schd_margin(),
+                                 allow_fractional=True, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
+    row = plan.rows[0]
+    assert row.delta_quantity == pytest.approx(0.14706)
+    assert row.side == OrderDirection.BUY
+    assert row.estimated_value == pytest.approx(5.00004)
+    assert row.unmet_notional == 0.0
+    assert row.sizing_outcome == pa.SIZING_OUTCOME_BUMPED
+    # And it survives the suppression that refuses sub-$5 fractions.
+    assert pa.REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_PREFIX not in " ".join(row.reasons)
+
+
 def test_a_thirty_four_dollar_share_under_the_fractional_floor_skips_with_the_real_reason():
-    """The live case: a $3 slice of a $34 ETF. One share overshoots ~11x, far
-    outside the 1.5x guard, so it SKIPS -- and it must say the floor is why the
-    fraction was unavailable, not "rounds to zero"."""
+    """The live case: a $3 slice of a $34 ETF. Even the cheapest order that clears
+    the floor -- 0.14706 shares for $5.00 -- is 167% of target, outside the 1.5x
+    guard, so it SKIPS. It must say the floor is why the small fraction was
+    unavailable, not "rounds to zero". One dollar more of target and this same case
+    becomes a legal order (see the 125% test above), which is exactly why the
+    quoted percentage has to come off the cheapest legal order and not off the
+    $34 whole share (1133%)."""
     margin = MarginInfo(symbol="SCHD", bp_factor=1.0, fractionable=True,
                         min_trade_increment=0.00001, min_fractional_notional=5.0)
     qty, outcome, reason = pa.size_sub_unit_target(3.0, 34.0, margin,
@@ -1707,7 +1752,7 @@ def test_a_thirty_four_dollar_share_under_the_fractional_floor_skips_with_the_re
     assert qty == 0.0
     assert outcome == pa.SIZING_OUTCOME_SKIPPED_TOO_LARGE
     assert "$5 fractional minimum" in reason
-    assert "1133% of target" in reason
+    assert "167% of target" in reason
     assert "rounds to 0" not in reason
     assert not reason.startswith("below")
 

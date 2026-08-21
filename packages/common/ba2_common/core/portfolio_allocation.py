@@ -192,11 +192,11 @@ REASON_BELOW_ONE_SHARE_FMT = (
 #: the money was not.
 REASON_FRACTIONAL_FLOOR_BUMPED_FMT = (
     "target {target:,.2f} is under the broker's ${minimum:g} fractional minimum "
-    "so no fraction can be sent - BUMPED UP to {unit:g} whole share(s) at "
+    "so no fraction that small can be sent - BUMPED UP to {unit:g} share(s) at "
     "{price:,.2f}, {pct:.0f}% of target")
 REASON_FRACTIONAL_FLOOR_SKIPPED_FMT = (
     "target {target:,.2f} is under the broker's ${minimum:g} fractional minimum "
-    "so no fraction can be sent - no order; {unit:g} whole share(s) at "
+    "so no fraction that small can be sent - no order; {unit:g} share(s) at "
     "{price:,.2f} is {pct:.0f}% of target, over the {limit:.0f}% bump limit")
 #: The bump was not even attempted: one share is under the broker's minimum ORDER
 #: size, so there is no order to place at any size.
@@ -681,9 +681,18 @@ def size_sub_unit_target(target_notional: float, price: float,
     hit_floor = False
     if (floor_usd is not None and _is_fractional_quantity(unit)
             and unit * px < float(floor_usd)):
-        # No fraction of this symbol can clear the floor at this size, and whole
-        # shares are exempt from it, so one whole share is the only other option.
-        unit = 1.0
+        # No fraction THIS SMALL can be sent -- but the rule is a minimum NOTIONAL,
+        # not a ban on fractions, so a BIGGER fraction clears it. Two legal
+        # destinations: the smallest multiple of the grid worth ``floor_usd``, and
+        # one WHOLE share (exempt from the rule). Take the cheaper of the two.
+        # Escalating straight to a whole share throws the symbol away whenever the
+        # share is the dearer one: a $4 slice of a $34 ETF clears the floor at
+        # 0.14706 shares (125% of target, inside the bump bound) while one share is
+        # 850% and gets refused, so the user ends up with no order at all.
+        # ``ceil`` without a tolerance on purpose: rounding UP by one increment
+        # costs a fraction of a cent, rounding down puts the order under the floor.
+        clearing = round(math.ceil(float(floor_usd) / (px * unit)) * unit, 10)
+        unit = clearing if 0 < clearing < 1.0 else 1.0
         hit_floor = True
 
     unit_notional = unit * px
