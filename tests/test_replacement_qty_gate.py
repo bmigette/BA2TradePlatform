@@ -9,7 +9,9 @@ submit path: defer (keep WAITING_TRIGGER, retry next refresh) while the broker's
 available qty is still short of what the replacement needs.
 """
 from ba2_trade_platform.core.TradeManager import replacement_blocked_by_qty
+from ba2_trade_platform.core.interfaces.ReadOnlyAccountInterface import ReadOnlyAccountInterface
 from ba2_trade_platform.core.types import OrderStatus
+from tests.conftest import MockAccount
 
 
 class TestReplacementBlockedByQty:
@@ -38,3 +40,48 @@ class TestReplacementBlockedByQty:
         assert replacement_blocked_by_qty("canceled", 0.0, 6.0) is True
         assert replacement_blocked_by_qty("CANCELED", 0.0, 6.0) is True
         assert replacement_blocked_by_qty("filled", 0.0, 6.0) is False
+
+
+class TestGateIsNotAlpacaOnly:
+    """I9: the guard was a PERMANENT NO-OP on every broker but Alpaca.
+
+    ``get_available_position_quantity`` existed only on ``AlpacaAccount``, so
+    TradeManager's ``except Exception: available_qty = None`` fired for every other
+    account and ``replacement_blocked_by_qty(None)`` returned False -- the whole
+    protection against dropping a stop to a 40310000 rejection was simply absent.
+    """
+
+    def test_the_seam_lives_on_the_interface_not_just_alpaca(self):
+        assert hasattr(ReadOnlyAccountInterface, "get_available_position_quantity")
+
+    def test_a_plain_broker_answers_the_gate_without_an_override(self):
+        """MockAccount defines no override -- it must still get a real answer."""
+        acct = MockAccount(1)
+        acct._positions = [{"symbol": "AAPL", "qty": 10.0, "qty_available": 0.0}]
+
+        available = acct.get_available_position_quantity("AAPL")
+
+        assert available == 0.0
+        assert replacement_blocked_by_qty(OrderStatus.CANCELED, available, 6.0) is True
+
+    def test_a_released_qty_lets_the_replacement_through(self):
+        acct = MockAccount(1)
+        acct._positions = [{"symbol": "AAPL", "qty": 10.0, "qty_available": 10.0}]
+
+        available = acct.get_available_position_quantity("AAPL")
+
+        assert available == 10.0
+        assert replacement_blocked_by_qty(OrderStatus.CANCELED, available, 6.0) is False
+
+    def test_a_broker_that_cannot_answer_blocks_instead_of_submitting(self):
+        """The DEFAULT for "cannot answer" is 0.0 (defer and retry next refresh),
+        never None (submit blind). A fetch failure must not be read as "the qty is
+        free" -- that is the direction that gets the order rejected and hard-ERRORed,
+        silently dropping the position's protection."""
+        acct = MockAccount(1)
+        acct._positions = None  # positions fetch FAILED
+
+        available = acct.get_available_position_quantity("AAPL")
+
+        assert available == 0.0
+        assert replacement_blocked_by_qty(OrderStatus.CANCELED, available, 6.0) is True

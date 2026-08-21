@@ -930,11 +930,24 @@ class TradeManager:
                     # held qty; submitting too early is rejected (40310000 insufficient qty)
                     # and hard-ERRORs, silently dropping the position's protection. If the
                     # qty isn't free yet, leave this order WAITING_TRIGGER to retry next refresh.
-                    available_qty = None
+                    #
+                    # get_available_position_quantity is a CONCRETE seam on
+                    # ReadOnlyAccountInterface (I9). It used to exist only on
+                    # AlpacaAccount, so on every other broker this raised AttributeError,
+                    # the except set None, and replacement_blocked_by_qty(None) returned
+                    # False — the guard was a PERMANENT NO-OP everywhere but Alpaca.
+                    # The except now falls back to 0.0 (defer and retry), not None
+                    # (submit blind): a broker whose answer we could not obtain is the
+                    # case that must NOT be read as "the qty is free".
                     try:
                         available_qty = account.get_available_position_quantity(dependent_order.symbol)
-                    except Exception:
-                        available_qty = None
+                    except Exception as e:
+                        self.logger.warning(
+                            f"get_available_position_quantity({dependent_order.symbol}) raised "
+                            f"on account {dependent_order.account_id}: {e} — treating as 0 "
+                            f"available (defer, retry next refresh)"
+                        )
+                        available_qty = 0.0
                     if replacement_blocked_by_qty(
                         dependent_order.depends_order_status_trigger, available_qty,
                         dependent_order.quantity,

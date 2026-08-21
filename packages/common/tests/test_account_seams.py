@@ -244,3 +244,124 @@ def test_get_symbol_margin_info_defaults_to_empty_so_the_caller_falls_back():
     """A symbol the broker cannot describe is OMITTED, never defaulted here -- the
     caller substitutes the conservative bp_factor = account multiplier."""
     assert _DictAccount(1, {}).get_symbol_margin_info(["AAPL", "MSFT"]) == {}
+
+
+# ---------------------------------------------------------------------------
+# get_available_position_quantity -- the cancel-and-replace gate (I9)
+#
+# It used to exist ONLY on AlpacaAccount, so TradeManager's
+# `except Exception: available_qty = None` fired on every other broker and
+# replacement_blocked_by_qty(None) returned False -- the guard that stops a
+# 40310000 "insufficient qty" rejection from dropping a position's protective
+# stop was a permanent no-op everywhere but Alpaca.
+#
+# The base DERIVES it from get_positions() (the mandatory seam every broker
+# implements), the same way get_account_snapshot() derives from
+# get_account_info(). It NEVER returns None: "cannot answer" is 0.0, which
+# BLOCKS (defer, retry next refresh) rather than submitting blind.
+# ---------------------------------------------------------------------------
+
+class _BookAccount(_DictAccount):
+    """A broker whose get_positions() returns whatever the test sets."""
+
+    def __init__(self, book):
+        super().__init__(1, {})
+        self._book = book
+
+    def get_positions(self):
+        if isinstance(self._book, Exception):
+            raise self._book
+        return self._book
+
+
+class _Pos:
+    """The attribute-shaped position (Alpaca / IBKR return a Position model)."""
+
+    def __init__(self, symbol, qty, qty_available=None):
+        self.symbol = symbol
+        self.qty = qty
+        self.qty_available = qty_available
+
+
+def test_available_qty_reads_the_brokers_qty_available_for_a_dict_position():
+    acct = _BookAccount([{"symbol": "AAPL", "qty": 10.0, "qty_available": 4.0}])
+    assert acct.get_available_position_quantity("AAPL") == 4.0
+
+
+def test_available_qty_reads_the_brokers_qty_available_for_an_object_position():
+    acct = _BookAccount([_Pos("AAPL", 10.0, 4.0)])
+    assert acct.get_available_position_quantity("AAPL") == 4.0
+
+
+def test_available_qty_is_absolute_so_a_short_works_too():
+    """A short holds -100; the buy-to-cover replacement needs 100 of them."""
+    acct = _BookAccount([_Pos("AAPL", -100.0, -100.0)])
+    assert acct.get_available_position_quantity("AAPL") == 100.0
+
+
+def test_a_fully_encumbered_position_reports_zero_and_therefore_blocks():
+    """The exact 40310000 shape: the broker still holds the shares against the
+    just-canceled order, so none are available yet."""
+    acct = _BookAccount([_Pos("AAPL", 6.0, 0.0)])
+    assert acct.get_available_position_quantity("AAPL") == 0.0
+
+
+def test_a_symbol_the_broker_does_not_hold_is_zero_not_unknown():
+    """A protective stop for shares the broker does not have is a GUARANTEED
+    rejection. 0.0 defers it (WAITING_TRIGGER, retried next refresh) instead of
+    submitting it into a hard ERROR."""
+    acct = _BookAccount([_Pos("MSFT", 10.0, 10.0)])
+    assert acct.get_available_position_quantity("AAPL") == 0.0
+
+
+def test_a_flat_book_is_zero():
+    assert _BookAccount([]).get_available_position_quantity("AAPL") == 0.0
+
+
+def test_a_positions_FETCH_FAILURE_blocks_rather_than_submitting_blind():
+    """get_positions() returns None when the fetch FAILED (tri-state contract).
+    An unverified book must never be read as "the qty is free" -- that is the
+    direction that gets the replacement rejected and the stop dropped. 0.0 defers
+    and the next refresh retries, so this is self-healing."""
+    assert _BookAccount(None).get_available_position_quantity("AAPL") == 0.0
+
+
+def test_a_broker_that_raises_blocks_too():
+    assert _BookAccount(RuntimeError("connection reset")
+                        ).get_available_position_quantity("AAPL") == 0.0
+
+
+def test_a_broker_that_publishes_no_qty_available_falls_back_to_the_held_qty():
+    """IBKR builds Position without qty_available. The broker CONFIRMS it holds
+    the shares; only the transient encumbrance is unknown. Blocking such a broker
+    forever would convert a seconds-long race into a PERMANENT, silent absence of
+    protection -- strictly worse than the rejection this gate avoids. The gate
+    still bites where it matters: a stale leg asking for more than the position's
+    total size is deferred instead of submitted into a rejection."""
+    acct = _BookAccount([_Pos("AAPL", 100.0, None)])
+    assert acct.get_available_position_quantity("AAPL") == 100.0
+
+
+def test_a_stale_leg_larger_than_the_whole_position_still_blocks_on_such_a_broker():
+    acct = _BookAccount([_Pos("AAPL", 100.0, None)])
+    available = acct.get_available_position_quantity("AAPL")
+    # 181-share leg vs a 100-share position -> the broker would reject it.
+    assert available is not None and available < 181.0
+
+
+def test_a_non_numeric_quantity_blocks_rather_than_guessing():
+    acct = _BookAccount([_Pos("AAPL", "n/a", "n/a")])
+    assert acct.get_available_position_quantity("AAPL") == 0.0
+
+
+def test_available_qty_never_returns_none():
+    """None means "don't block" to replacement_blocked_by_qty. The base must not
+    be able to produce it -- that is the whole point of the hoist."""
+    for book in (None, [], RuntimeError("boom"), [_Pos("MSFT", 1.0, 1.0)],
+                 [_Pos("AAPL", "n/a", None)]):
+        assert _BookAccount(book).get_available_position_quantity("AAPL") is not None
+
+
+def test_symbol_matching_is_case_and_whitespace_insensitive():
+    acct = _BookAccount([_Pos("AAPL", 10.0, 7.0)])
+    assert acct.get_available_position_quantity(" aapl ") == 7.0

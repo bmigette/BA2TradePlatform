@@ -285,6 +285,110 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
         """
         pass
 
+    def get_available_position_quantity(self, symbol: str) -> float:
+        """Broker-side AVAILABLE (not held-for-orders) quantity for ``symbol``.
+
+        Used by ``TradeManager.replacement_blocked_by_qty`` to confirm a prior
+        order has actually RELEASED its held quantity before a cancel-and-replace
+        order (a trailing-stop raise / OCO swap) is submitted. Submitting too
+        early is rejected by the broker -- Alpaca 40310000 "insufficient qty
+        available" -- and the rejected order hard-ERRORs, silently leaving the
+        position with NO protective stop.
+
+        CONCRETE ON PURPOSE, and DERIVED from ``get_positions()`` -- the mandatory
+        seam every broker already implements -- exactly as ``get_account_snapshot()``
+        is derived from ``get_account_info()``. This method previously existed only
+        on ``AlpacaAccount``, so the caller's ``except AttributeError`` branch set
+        the qty to ``None`` on every other broker and the gate was a PERMANENT
+        NO-OP there. A broker with a cheaper direct endpoint should override it
+        (AlpacaAccount uses ``get_open_position(symbol).qty_available``, one
+        targeted call instead of the whole book).
+
+        NEVER RETURNS ``None``. ``None`` is the caller's "unknown -> do NOT block"
+        value, and "we could not find out" is precisely the case that must NOT
+        submit blind: an unverifiable answer is returned as ``0.0``, which DEFERS
+        the replacement (it stays WAITING_TRIGGER and the next account refresh
+        retries), so the degraded path is self-healing rather than a hard ERROR.
+
+        The full table:
+
+          * position found, broker publishes ``qty_available`` -> ``abs()`` of it
+            (``abs`` because a short reports a negative quantity and the
+            buy-to-cover replacement needs the magnitude);
+          * position found, broker publishes NO ``qty_available`` (IBKR builds
+            ``Position`` without it) -> ``abs(qty)``, the total held. The broker
+            CONFIRMS it holds the shares; only the transient encumbrance is
+            unknown. Reporting 0.0 here would block such a broker FOREVER, turning
+            a seconds-long race into a permanent, silent absence of protection --
+            strictly worse than the rejection this gate exists to avoid, which at
+            least surfaces as ERROR. The gate still bites where it matters: a
+            stale leg asking for more than the position's total size is deferred
+            instead of submitted into a certain rejection;
+          * symbol NOT in the book -> ``0.0``. A protective stop for shares the
+            broker does not hold is a guaranteed rejection; deferring is right,
+            and it is not a permanent hang (a position that never comes back gets
+            its transaction reconciled closed, which cancels the staged leg);
+          * ``get_positions()`` returned ``None`` (FETCH FAILED) or raised ->
+            ``0.0``. The tri-state contract again: an unverified book is not an
+            empty book and must not be acted on. Compare the 2026-07-03 incident.
+
+        Args:
+            symbol: the instrument to look up; matched case- and
+                whitespace-insensitively against the broker's book.
+
+        Returns:
+            float: available quantity, always >= 0, never ``None``.
+        """
+        wanted = (symbol or '').strip().upper()
+        try:
+            positions = self.get_positions()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"[Account {self.id}] get_available_position_quantity({symbol}): "
+                f"position fetch raised ({e}); reporting 0 available (defer, retry next refresh)"
+            )
+            return 0.0
+        if positions is None:
+            logger.warning(
+                f"[Account {self.id}] get_available_position_quantity({symbol}): "
+                f"get_positions() returned None (FETCH FAILURE, not a flat account); "
+                f"reporting 0 available (defer, retry next refresh)"
+            )
+            return 0.0
+
+        for pos in positions:
+            pos_symbol = (pos.get('symbol') if isinstance(pos, dict)
+                          else getattr(pos, 'symbol', None))
+            if (pos_symbol or '').strip().upper() != wanted:
+                continue
+            for field in ('qty_available', 'qty'):
+                raw = (pos.get(field) if isinstance(pos, dict)
+                       else getattr(pos, field, None))
+                if raw is None:
+                    continue
+                try:
+                    return abs(float(raw))
+                except (TypeError, ValueError):
+                    logger.warning(
+                        f"[Account {self.id}] position {wanted}.{field}={raw!r} is not numeric"
+                    )
+            logger.warning(
+                f"[Account {self.id}] position {wanted} publishes no usable quantity; "
+                f"reporting 0 available (defer, retry next refresh)"
+            )
+            return 0.0
+
+        # Broker holds nothing in this symbol. Logged rather than silent: this
+        # DEFERS the replacement every refresh, and while that is self-limiting
+        # (a position that never returns has its transaction reconciled closed,
+        # which cancels the staged leg) a repeating line is what makes a genuine
+        # hang visible instead of a stop that quietly never appears.
+        logger.warning(
+            f"[Account {self.id}] get_available_position_quantity({symbol}): broker's book "
+            f"holds no position for this symbol; reporting 0 available (defer, retry next refresh)"
+        )
+        return 0.0
+
     @abstractmethod
     def get_orders(self, status: Optional[str] = None) -> Any:
         """

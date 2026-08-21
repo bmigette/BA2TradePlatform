@@ -1532,25 +1532,57 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             logger.error(f"Error listing Alpaca positions: {e}", exc_info=True)
             return None
 
-    def get_available_position_quantity(self, symbol: str) -> Optional[float]:
+    def get_available_position_quantity(self, symbol: str) -> float:
         """Broker-side AVAILABLE (not held-for-orders) quantity for ``symbol``.
 
         Used to confirm a prior order has actually released its qty before a
-        cancel-and-replace order is submitted. Returns the absolute available qty
-        (works for long and short), or ``None`` when there's no position or the
-        lookup fails (treated as "unknown" by callers — do not block on it).
+        cancel-and-replace order is submitted, so the replacement isn't rejected
+        with 40310000 "insufficient qty available" and hard-ERRORed — which leaves
+        the position with no protective stop.
+
+        This is a FAST override of the interface default: ``get_open_position``
+        is ONE targeted call, where the base has to pull the whole book via
+        ``get_positions()``. It honours the same contract (see
+        ``ReadOnlyAccountInterface.get_available_position_quantity``) and in
+        particular NEVER RETURNS ``None``: ``None`` is the caller's "unknown → do
+        NOT block" value, so every case where we cannot get a real answer —
+        including the 404 Alpaca raises when the account holds nothing in the
+        symbol, and any network failure — is reported as ``0.0``. That DEFERS the
+        replacement (it stays WAITING_TRIGGER and the next refresh retries)
+        instead of submitting it blind into a certain rejection.
+
+        Returns the absolute quantity (a short reports negative; the buy-to-cover
+        replacement needs the magnitude).
         """
         try:
             position = self.client.get_open_position(symbol)
-        except Exception:
-            return None
-        qa = getattr(position, "qty_available", None)
-        if qa is None:
-            return None
-        try:
-            return abs(float(qa))
-        except (TypeError, ValueError):
-            return None
+        except Exception as e:
+            # Includes the 404 "position does not exist" — the broker holds
+            # nothing, so nothing is available — and any transport failure.
+            logger.debug(
+                f"[Account {self.id}] get_available_position_quantity({symbol}): "
+                f"get_open_position failed ({e}); reporting 0 available "
+                f"(defer, retry next refresh)"
+            )
+            return 0.0
+        # qty_available is the number Alpaca actually enforces; qty is the fallback
+        # for the (unexpected) case where it is absent — the broker has confirmed
+        # it HOLDS the shares and only the encumbrance is unknown.
+        for field in ("qty_available", "qty"):
+            raw = getattr(position, field, None)
+            if raw is None:
+                continue
+            try:
+                return abs(float(raw))
+            except (TypeError, ValueError):
+                logger.warning(
+                    f"[Account {self.id}] position {symbol}.{field}={raw!r} is not numeric"
+                )
+        logger.warning(
+            f"[Account {self.id}] position {symbol} publishes no usable quantity; "
+            f"reporting 0 available (defer, retry next refresh)"
+        )
+        return 0.0
 
     def invalidate_balance_cache(self) -> None:
         """Invalidate the balance cache so the next call fetches a fresh value."""
