@@ -50,12 +50,25 @@ class TastyTradeAccount(ReadOnlyAccountInterface):
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
         return future.result(timeout=30)
 
+    def _is_sandbox(self) -> bool:
+        """Whether this account targets TastyTrade's sandbox (certification) API.
+
+        Read through ``get_setting_with_interface_default`` rather than
+        ``self.settings.get('is_test', False)``. The settings property seeds every
+        DECLARED key to ``None``, so ``.get(key, default)`` never returns the default
+        for a never-saved key; and a legacy row holding the literal string ``"None"``
+        (the str(None) write bug) coerces to ``True`` under ``bool()``, which would
+        silently point a PRODUCTION account at the sandbox.
+        ``get_setting_with_interface_default`` treats ``"None"`` as unset.
+        """
+        return bool(self.get_setting_with_interface_default("is_test", log_warning=False))
+
     def _connect(self):
         """Establish connection to TastyTrade API."""
         from tastytrade.session import Session as TastySession
         from tastytrade.account import Account as TastyAccount
 
-        is_test = bool(self.settings.get("is_test", False))
+        is_test = self._is_sandbox()
 
         # Create session on the persistent loop so httpx client binds to it
         self._session = self._run_async(self._create_session_async(
