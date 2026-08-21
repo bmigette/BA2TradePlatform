@@ -186,10 +186,11 @@ REASON_BELOW_ONE_SHARE_FMT = (
     "the {limit:.0f}% bump limit")
 #: The FRACTIONAL variants of the two above. The fraction was legal on the grid but
 #: is under the broker's fractional NOTIONAL floor (TastyTrade HTTP 422
-#: ``below_notional_value_minimum``), which closes the fractional path entirely --
-#: a WHOLE share is exempt from that rule, so the only options are one whole share
-#: or nothing. Saying "rounds to zero" here would be a lie: the quantity was fine,
-#: the money was not.
+#: ``below_notional_value_minimum``). That floor is a minimum in MONEY, so the two
+#: ways out are a BIGGER fraction (the smallest grid multiple worth the floor) and
+#: one WHOLE share (exempt from the rule); ``{unit}`` is whichever is cheaper, which
+#: is why these say "share(s)" and not "whole share(s)". Saying "rounds to zero"
+#: here would be a lie: the quantity was fine, the money was not.
 REASON_FRACTIONAL_FLOOR_BUMPED_FMT = (
     "target {target:,.2f} is under the broker's ${minimum:g} fractional minimum "
     "so no fraction that small can be sent - BUMPED UP to {unit:g} share(s) at "
@@ -1373,10 +1374,10 @@ def compute_label_investment(label: LabelTarget, amount: float,
     ``plan.net_buy_value == plan.total_buy_value`` -- redistribution is inside that
     promise: on a budget basis it may only make a BUY smaller, never open a sale, so
     a bump that overshoots the budget is reported rather than sold back off.
-    Buying-power scaling,
-    rounding, missing prices and missing margin info behave exactly as in
-    ``compute_allocation``, and a symbol repeated inside the label COALESCES into
-    one row whose weight is the sum -- again as in ``compute_allocation``.
+    Buying-power scaling, rounding, missing prices and missing margin info behave
+    exactly as in ``compute_allocation``, and a symbol repeated inside the label
+    COALESCES into one row whose weight is the sum -- again as in
+    ``compute_allocation``.
 
     The weights are multiplied straight through, so the caller MUST gate submission
     on ``validate_symbol_weights``: a 150% set deploys 150% of ``amount`` and a 60%
