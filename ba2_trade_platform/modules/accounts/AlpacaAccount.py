@@ -15,10 +15,11 @@ from ...core.models import TradingOrder, Position, Transaction
 from ...core.types import OrderDirection, OrderStatus, OrderOpenType, OrderType as CoreOrderType, TransactionStatus
 from ...core.interfaces import AccountInterface
 from ...core.account_types import (
-    AccountSnapshot, CashTransfer, MarginInfo,
+    AccountSnapshot, CashTransfer, MarginInfo, MarketHours,
     CASH_TRANSFER_DEPOSIT, CASH_TRANSFER_WITHDRAWAL, CASH_TRANSFER_DIVIDEND,
-    MARGIN_SOURCE_ASSET,
+    MARGIN_SOURCE_ASSET, MARKET_HOURS_SOURCE_BROKER,
 )
+import pytz
 from ...core.interfaces.OptionsAccountInterface import OptionsAccountInterface
 from ...core.db import get_db, get_instance, update_instance, add_instance
 from sqlmodel import Session, select
@@ -28,6 +29,30 @@ from sqlmodel import Session, select
 # dividend key space disjoint from the verbatim CSD/CSW broker ids that share the
 # same upsert column.
 _DIVIDEND_KEY_PREFIX = "DIV:"
+
+# Every datetime Alpaca's trading API publishes is EXCHANGE time. `Clock` arrives
+# tz-aware; other endpoints do not -- `Calendar.open` / `.close` arrive NAIVE, built by
+# Calendar.__init__ with strptime("%Y-%m-%d %H:%M") (alpaca/trading/models.py:374-388).
+_MARKET_TZ = pytz.timezone("America/New_York")
+
+
+def _to_market_utc(value: Optional[datetime]) -> Optional[datetime]:
+    """Normalise a broker datetime to tz-aware UTC.
+
+    A NAIVE value is read as EASTERN -- not as UTC, and not as this machine's local
+    time. pytz's localize() (never `replace(tzinfo=...)`) is what picks EST vs EDT
+    correctly; `replace` would attach pytz's LMT offset and be 56 minutes out. This is
+    why this adapter keeps pytz rather than moving to the packages' `NY_TZ` ZoneInfo.
+
+    Idempotent on an already-aware value, and this is the tz-awareness boundary
+    contract 1.13 requires: `MarketHours.__post_init__` raises ValueError on any naive
+    datetime, so nothing may reach it unnormalised.
+    """
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return _MARKET_TZ.localize(value).astimezone(pytz.utc)
+    return value.astimezone(pytz.utc)
 
 
 def alpaca_api_retry(func):
@@ -1804,6 +1829,88 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         """
         self._account_snapshot_cache = None
         logger.debug(f"[Account {self.id}] Cleared cached account snapshot")
+
+    def _get_market_hours_impl(self, now: datetime) -> MarketHours:
+        """US equity regular-session hours, from Alpaca's own clock.
+
+        THE OVERRIDE POINT, per contract 1.4. `get_market_hours()` and
+        `is_market_open()` are concrete, cached and effectively final on
+        ReadOnlyAccountInterface and are NOT overridden here. Caching, session-boundary
+        expiry and the explicit cache-clearing entry point are all provided by
+        `ReadOnlyAccountInterface.get_market_hours()`, which also wraps this method in
+        try/except so it can never raise out of a page render.
+
+        `now` is injected and tz-aware, and this method MUST use it rather than reading
+        a clock of its own -- `now=` is the canonical clock-freeze seam for tests.
+
+        `TradingClient.get_clock()` (alpaca/trading/client.py:422) returns
+        `Clock(timestamp, is_open, next_open, next_close)` (models.py:348-362); all four
+        fields are REQUIRED and non-Optional, so they are read directly rather than
+        through `getattr(..., None)` defaults.
+
+        `is_open` covers the REGULAR session only -- user decision D4. Alpaca still
+        ACCEPTS a DAY market order outside it and queues it to the next open
+        (alpaca/trading/enums.py:237), so this seam answers "submit now?", not "can I
+        trade at all?".
+
+        Field mapping (contract 1.5). `close_at` is always `clock.next_close`. `open_at`
+        is `clock.next_open` ONLY while the market is closed -- where contract 1.1
+        requires `open_at == next_open` -- and is None while it is open, because `Clock`
+        does not publish the CURRENT session's start and `next_open` is then TOMORROW's
+        opening bell. It is left None, never guessed and never fetched from /calendar.
+        `status` stays None: Alpaca publishes no status word, and `status` is a
+        display-only echo of the broker's own vocabulary.
+
+        On ANY failure (no credentials, clock error, empty response) this returns
+        `dataclasses.replace(super()._get_market_hours_impl(now), detail=<reason>)` --
+        the shared offline NYSE calendar in `ba2_common.core.market_calendar`, tagged
+        with why we are on it. It calls `super()._get_market_hours_impl(now)` and NEVER
+        the public template method on super, which is what calls THIS one -- delegating
+        to it from here is infinite recursion. The source is deliberately NOT forced to
+        `fallback` -- when the offline calendar is dead too, super returns
+        `MARKET_HOURS_SOURCE_UNAVAILABLE` and that honest "we do not know" must survive
+        to the UI instead of being flattened into "closed".
+        """
+        if not self._check_authentication():
+            logger.warning(
+                f"[Account {self.id}] Not authenticated — market hours fall back to the "
+                f"shared offline NYSE calendar")
+            return replace(super()._get_market_hours_impl(now),
+                           detail="Alpaca account is not authenticated")
+
+        try:
+            clock = self.client.get_clock()
+        except Exception as e:
+            logger.warning(
+                f"[Account {self.id}] get_clock() failed: {e} — market hours fall back to "
+                f"the shared offline NYSE calendar")
+            return replace(super()._get_market_hours_impl(now),
+                           detail=f"Alpaca get_clock() failed: {e}")
+        if clock is None:
+            logger.warning(
+                f"[Account {self.id}] get_clock() returned nothing — market hours fall back "
+                f"to the shared offline NYSE calendar")
+            return replace(super()._get_market_hours_impl(now),
+                           detail="Alpaca get_clock() returned nothing")
+
+        is_open = bool(clock.is_open)
+        next_open = _to_market_utc(clock.next_open)
+        next_close = _to_market_utc(clock.next_close)
+        hours = MarketHours(
+            is_open=is_open,
+            open_at=(None if is_open else next_open),
+            close_at=next_close,
+            next_open=next_open,
+            next_close=next_close,
+            source=MARKET_HOURS_SOURCE_BROKER,
+            status=None,
+            detail=None,
+            as_of=_to_market_utc(clock.timestamp),
+        )
+        logger.debug(
+            f"[Account {self.id}] Market {'OPEN' if is_open else 'CLOSED'} per Alpaca "
+            f"(open_at={hours.open_at}, close_at={hours.close_at})")
+        return hours
 
     def get_symbol_margin_info(self, symbols: List[str]) -> Dict[str, MarginInfo]:
         """Per-symbol margin / fractionability metadata for buying-power sizing.
