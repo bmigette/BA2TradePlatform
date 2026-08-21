@@ -14,6 +14,10 @@ from ...core.ModelBillingUsage import ModelBillingUsage
 from ...modules.accounts import providers
 from ...logger import logger
 from ..utils.perf_logger import PerfLogger
+from ..utils.growth_label_storage import (
+    GROWTH_LABELS_STORAGE_KEY, MONTHLY_PROFIT_LABELS_STORAGE_KEY,
+    read_growth_labels, resolve_growth_labels, write_growth_labels,
+)
 from ..components import ProfitPerExpertChart, InstrumentDistributionChart, BalanceUsagePerExpertChart
 from ..components.FloatingPLPerExpertWidget import FloatingPLPerExpertWidget
 from ..components.FloatingPLPerAccountWidget import FloatingPLPerAccountWidget
@@ -5450,13 +5454,18 @@ class AccountGrowthTab:
                     'series': series,
                 }
 
-            default_labels = [l for l in labels if l != 'auto_added'] or list(labels)
+            # The selection persists in app.storage.user (session, not the DB) and is
+            # intersected with the labels that still exist, so a deleted label cannot
+            # break the chart. See ui/utils/growth_label_storage.py.
+            default_labels = resolve_growth_labels(
+                read_growth_labels(MONTHLY_PROFIT_LABELS_STORAGE_KEY), list(labels))
             label_select = ui.select(options=list(labels), value=default_labels, multiple=True,
                                      label='Labels shown').classes('w-72 mb-2')
             chart_container = ui.column().classes('w-full')
 
             def rebuild():
                 visible = list(label_select.value) if label_select.value else []
+                write_growth_labels(visible, MONTHLY_PROFIT_LABELS_STORAGE_KEY)
                 chart_container.clear()
                 with chart_container:
                     ui.echart(build_options(visible, mode.value == '%')).classes('w-full').style('height: 320px')
@@ -5761,29 +5770,22 @@ class AccountGrowthTab:
 
     def _render_growth_by_label_charts(self, all_positions, historical_prices=None, all_dividends=None, all_filled_trades=None):
         """Render historical growth line chart grouped by instrument labels."""
-        from ...core.models import Instrument
-        from ...core.db import get_db
         from ...core.InstrumentAutoAdder import get_instrument_auto_adder
-        from sqlmodel import select as sql_select
 
         if not all_positions:
             return
 
         historical_prices = historical_prices or {}
 
-        # Get all instruments and their labels
-        symbol_labels = {}
-        try:
-            with get_db() as session:
-                instruments = session.exec(sql_select(Instrument)).all()
-                for inst in instruments:
-                    if inst.labels:
-                        symbol_labels[inst.name] = inst.labels
-        except Exception as e:
-            logger.warning(f"Could not load instrument labels: {e}")
+        # Get all instruments and their labels. get_labels_by_symbol normalises both
+        # the lookup and its keys (.strip().upper()), so every read below must go
+        # through normalize_symbol too -- building the map by hand off inst.name
+        # bypassed that and silently lost the labels of any mis-cased row.
+        symbol_labels = get_labels_by_symbol([pos.symbol for pos in all_positions]) or {}
 
         # Auto-add instruments not found in database
-        missing_symbols = [pos.symbol for pos in all_positions if pos.symbol not in symbol_labels]
+        missing_symbols = [pos.symbol for pos in all_positions
+                           if normalize_symbol(pos.symbol) not in symbol_labels]
         if missing_symbols:
             unique_missing = list(set(missing_symbols))
             logger.info(f"Auto-adding {len(unique_missing)} missing instruments from positions: {unique_missing}")
@@ -5793,7 +5795,7 @@ class AccountGrowthTab:
         # Build position map: symbol -> {qty, cost_basis, labels}
         symbol_info = {}
         for pos in all_positions:
-            labels = symbol_labels.get(pos.symbol, ['Unlabeled'])
+            labels = symbol_labels.get(normalize_symbol(pos.symbol)) or ['Unlabeled']
             if pos.symbol not in symbol_info:
                 symbol_info[pos.symbol] = {'qty': 0, 'cost_basis': 0, 'labels': labels}
             symbol_info[pos.symbol]['qty'] += pos.qty
@@ -6052,9 +6054,11 @@ class AccountGrowthTab:
                     'series': series,
                 }
 
-            default_labels = [l for l in all_labels if l != 'auto_added']
-            if not default_labels:
-                default_labels = all_labels
+            # The selection persists in app.storage.user (session, not the DB) and is
+            # intersected with the labels that still exist, so a deleted label cannot
+            # break the chart. See ui/utils/growth_label_storage.py.
+            default_labels = resolve_growth_labels(
+                read_growth_labels(GROWTH_LABELS_STORAGE_KEY), list(all_labels))
 
             # Controls: visible labels + per-category show/hide toggles
             with ui.row().classes('w-full gap-4 items-center mb-2'):
@@ -6069,6 +6073,7 @@ class AccountGrowthTab:
 
             def rebuild_label_chart():
                 visible = sorted(list(label_select.value)) if label_select.value else []
+                write_growth_labels(visible, GROWTH_LABELS_STORAGE_KEY)
                 chart_container.clear()
                 with chart_container:
                     ui.echart(build_chart_options(
@@ -6085,30 +6090,20 @@ class AccountGrowthTab:
 
     def _render_growth_by_position_in_label_charts(self, all_positions, historical_prices=None, all_dividends=None, all_filled_trades=None):
         """Render historical growth line chart for individual positions within a selected label."""
-        from ...core.models import Instrument
-        from ...core.db import get_db
-        from sqlmodel import select as sql_select
-
         if not all_positions:
             return
 
         historical_prices = historical_prices or {}
 
-        # Get all instruments and their labels
-        symbol_labels = {}
-        try:
-            with get_db() as session:
-                instruments = session.exec(sql_select(Instrument)).all()
-                for inst in instruments:
-                    if inst.labels:
-                        symbol_labels[inst.name] = inst.labels
-        except Exception as e:
-            logger.warning(f"Could not load instrument labels: {e}")
+        # Get all instruments and their labels. Same normalisation contract as
+        # _render_growth_by_label_charts: keys come back .strip().upper()ed from
+        # get_labels_by_symbol, so the lookup has to be normalised as well.
+        symbol_labels = get_labels_by_symbol([pos.symbol for pos in all_positions]) or {}
 
         # Build position map: symbol -> {qty, cost_basis, labels}
         symbol_info = {}
         for pos in all_positions:
-            labels = symbol_labels.get(pos.symbol, ['Unlabeled'])
+            labels = symbol_labels.get(normalize_symbol(pos.symbol)) or ['Unlabeled']
             if pos.symbol not in symbol_info:
                 symbol_info[pos.symbol] = {'qty': 0, 'cost_basis': 0, 'labels': labels}
             symbol_info[pos.symbol]['qty'] += pos.qty
