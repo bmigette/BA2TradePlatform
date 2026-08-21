@@ -1136,7 +1136,13 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     yield (i, flat, key, fut.result())
 
         def make_batch_fitness(execute_jobs):
-            def batch_fitness(param_dicts: list) -> list:
+            def batch_fitness(param_dicts: list, on_result=None) -> list:
+                """Evaluate one generation's worth of genomes.
+
+                *on_result* (supplied by GeneticOptimizer) is called ``(index, fitness)`` the
+                moment each trial lands, so the GA can assign fitness incrementally and
+                checkpoint the population MID-generation instead of only at the boundary.
+                """
                 nonlocal _pool          # rebound by the batch-end recycle at the bottom
                 if tq.is_task_paused(task_id):
                     raise InterruptedError("paused/cancelled")
@@ -1149,6 +1155,10 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                     cached = memo.get(key)
                     if cached is not None:
                         fits[i] = cached
+                        # A memo hit IS an evaluated individual. Report it, or a partial
+                        # checkpoint would record it as a None and re-run it after a restart --
+                        # and the in-process memo does not survive the restart.
+                        _report_trial_result(on_result, i, cached)
                         continue
                     config = _build_daily_trial_config(
                         backtest_cfg, decode_params(strategy, flat), hoisted
@@ -1196,6 +1206,12 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
                         fit = float(out["fitness"])
                         fits[i] = fit
                         memo.put(key, fit)
+                        # Straight back to the GA, before anything else in this iteration: the
+                        # individual is done, so the population is now checkpointable with it
+                        # counted. Deliberately NOT done in the failure branch below -- a crash
+                        # is an environment event rather than a property of the genome (same
+                        # reasoning as the memo skip there), so a restart should re-run it.
+                        _report_trial_result(on_result, i, fit)
                         _log_trial_memory(gen, n_gens, done + 1, total_in_batch,
                                           out.get("mem"), out.get("secs"),
                                           fit_raw=out.get("fitness_raw"), fit_ranked=fit,
@@ -2047,6 +2063,26 @@ def checkpoint_task_id(opt_name: Optional[str], opt_id: int) -> str:
 
     key = (opt_name or f"opt-{opt_id}").strip()
     return "ckpt-" + hashlib.sha1(key.encode("utf-8")).hexdigest()[:24]
+
+
+def _report_trial_result(on_result, idx: int, fitness: float) -> None:
+    """Hand ONE landed trial straight back to the GA, before the batch loop moves on.
+
+    This is what makes a mid-generation checkpoint possible: ``execute_jobs`` already yields per
+    trial, but the GA used to see nothing until the whole list came back, so an interrupted
+    generation looked entirely unevaluated. With this, the GA assigns fitness incrementally and
+    the population is checkpointable at any instant.
+
+    Best-effort by contract. ``on_result`` writes a checkpoint; a failing write (full disk, a
+    locked DB) must never abort an otherwise healthy generation, and callers that supply no
+    callback at all must pay nothing.
+    """
+    if on_result is None:
+        return
+    try:
+        on_result(idx, fitness)
+    except Exception as e:  # noqa: BLE001 -- progress reporting must never fail a batch
+        logger.warning(f"on_result callback failed (ignored): {e}")
 
 
 def checkpoint_fingerprint(param_space: Dict[str, Any], ga: Dict[str, Any]) -> str:
