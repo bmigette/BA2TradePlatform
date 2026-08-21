@@ -2873,10 +2873,11 @@ def test_a_failed_refresh_forces_unsettled_even_when_the_rows_already_look_final
         open_type=OrderOpenType.MANUAL, filled_qty=10.0, open_price=160.0))
     account.refresh_raises = RuntimeError("connection reset")
 
-    totals = svc.measure_run_fills(account, [order_id])
+    totals, refreshed = svc.measure_run_fills(account, [order_id])
 
     assert totals.buy_value == pytest.approx(1600.0)
     assert totals.settled is False
+    assert refreshed is False
 
 
 def test_a_successful_refresh_lets_a_settled_row_settle():
@@ -2887,10 +2888,11 @@ def test_a_successful_refresh_lets_a_settled_row_settle():
         order_type=OrderType.MARKET, good_for='day', status=OrderStatus.FILLED,
         open_type=OrderOpenType.MANUAL, filled_qty=10.0, open_price=160.0))
 
-    totals = svc.measure_run_fills(account, [order_id])
+    totals, refreshed = svc.measure_run_fills(account, [order_id])
 
     assert totals.buy_value == pytest.approx(1600.0)
     assert totals.settled is True
+    assert refreshed is True
 
 
 def test_the_reconcile_runs_after_the_market_gate_not_before_it(monkeypatch):
@@ -3281,3 +3283,203 @@ def test_a_reconcile_pass_that_defers_a_run_leaves_its_order_ids_intact(activity
     account.fills = {"AAPL": (OrderStatus.FILLED, 10.0, 160.0)}
     assert svc.reconcile_unconsumed_runs(account) == [first["run_id"]]
     assert svc.get_open_income_total(107) == pytest.approx(6_000.0 - 1600.0)
+
+
+# ---------------------------------------------------------------------------
+# MINOR: sync_income_events drained BEFORE it upserted the window, so a
+# backdated event discovered by that very refresh could not fund the run it was
+# meant to -- and the drain stamped the run first, permanently.
+# ---------------------------------------------------------------------------
+
+def test_a_backdated_deposit_found_by_this_refresh_funds_the_run_it_should(
+        activity, frozen_today):
+    """The dividend/deposit and the fill turn up in the same Refresh.
+
+    Draining first meant the run was measured against an EMPTY ledger, consumed
+    nothing and was stamped -- and the stamp is one-shot, so the deposit that
+    funded it stayed 100% unallocated for good while the position sat in the book.
+    """
+    account = FakeAccount(account_id=110)
+    account.positions = []
+    account.fills = {}                       # the buy is still working when it runs
+    first = svc.run_allocation(account, _one_buy_plan(), {}, make_base(),
+                               mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+    assert [r.id for r in svc.get_unconsumed_runs(110)] == [first["run_id"]]
+    assert svc.get_open_income_total(110) == pytest.approx(0.0)
+
+    # One Refresh later: the broker reports the (backdated) deposit AND the fill.
+    account.cash_transfers = [CashTransfer(
+        external_id="dep-backdated", event_date=date(2026, 8, 2),
+        event_type=CASH_TRANSFER_DEPOSIT, amount=6_000.0)]
+    account.fills = {"AAPL": (OrderStatus.FILLED, 10.0, 160.0)}
+
+    assert svc.sync_income_events(account) == 1
+
+    assert svc.get_unconsumed_runs(110) == []
+    assert svc.get_open_income_total(110) == pytest.approx(6_000.0 - 1600.0)
+
+
+def test_the_drain_still_runs_when_the_brokers_income_call_fails(activity,
+                                                                 frozen_today,
+                                                                 monkeypatch):
+    """Moving the drain after the upsert must not park it behind the early return
+    that a failed get_cash_transfers takes: the drain is DB-only and is the one
+    thing that can still make progress while the broker's activity feed is down."""
+    _capture_errors(monkeypatch)
+    account = FakeAccount(account_id=111)
+    account.positions = []
+    account.fills = {}
+    add_instance(PortfolioIncomeEvent(account_id=111, external_id="dep-1",
+                                      event_date=date(2026, 8, 1),
+                                      event_type=CASH_TRANSFER_DEPOSIT, amount=6_000.0))
+    first = svc.run_allocation(account, _one_buy_plan(), {}, make_base(),
+                               mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+    assert [r.id for r in svc.get_unconsumed_runs(111)] == [first["run_id"]]
+
+    account.fills = {"AAPL": (OrderStatus.FILLED, 10.0, 160.0)}
+    account.get_cash_transfers = lambda **kw: (_ for _ in ()).throw(
+        RuntimeError("activity endpoint 503"))
+
+    assert svc.sync_income_events(account) == 0
+
+    assert svc.get_unconsumed_runs(111) == []
+    assert svc.get_open_income_total(111) == pytest.approx(6_000.0 - 1600.0)
+
+
+# ---------------------------------------------------------------------------
+# MINOR: "0 order(s) still working" is what a FAILED broker refresh looked like.
+# ---------------------------------------------------------------------------
+
+def test_a_run_whose_refresh_failed_says_so_in_its_result(activity, monkeypatch):
+    """The dangerous shape: our rows already look FILLED, so nothing is "working",
+    and the refresh that would have confirmed them failed.
+
+    ``measure_run_fills`` forces ``settled=False`` -- our rows are not evidence --
+    but ``working_order_ids`` is EMPTY, so a caller reading only those two told the
+    user "0 order(s) still working": a run with nothing outstanding, rather than
+    one nobody has been able to price.
+    """
+    _capture_errors(monkeypatch)
+    account = FakeAccount(account_id=112)
+    account.positions = []
+    # The adapter marks the row FILLED as it submits, the way a market order that
+    # crossed immediately leaves it; the confirming refresh then dies.
+    original_submit = account.submit_order
+
+    def _submit_and_mark_filled(trading_order, **kwargs):
+        result = original_submit(trading_order, **kwargs)
+        account._write_order(trading_order.id, status=OrderStatus.FILLED,
+                             filled_qty=trading_order.quantity, open_price=160.0)
+        return result
+
+    account.submit_order = _submit_and_mark_filled
+    account.refresh_raises = RuntimeError("broker 503")
+
+    result = svc.run_allocation(account, _one_buy_plan(), {}, make_base(),
+                                mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    assert result["settled"] is False
+    assert result["working_order_ids"] == []
+    assert result["refresh_failed"] is True
+    assert result["income_consumed"] == 0.0
+
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        working_orders_notice,
+    )
+    text, severity = working_orders_notice(
+        settled=result["settled"], working_order_ids=result["working_order_ids"],
+        refresh_failed=result["refresh_failed"])
+    assert "0 order(s)" not in text
+    assert "FAILED" in text and severity == "negative"
+
+
+def test_a_run_whose_refresh_worked_does_not_claim_it_failed(activity):
+    account = FakeAccount(account_id=113)
+    account.positions = []
+    account.fills = {"AAPL": (OrderStatus.FILLED, 10.0, 160.0)}
+
+    result = svc.run_allocation(account, _one_buy_plan(), {}, make_base(),
+                                mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    assert result["settled"] is True
+    assert result["refresh_failed"] is False
+
+
+def test_a_blocked_run_reports_refresh_failed_too():
+    """Key parity: the caller reads one dict either way, and a missing key is a
+    KeyError in the submit handler."""
+    account = FakeAccount(account_id=114)
+    account.market_hours = _closed_hours()
+
+    result = svc.run_allocation(account, _one_buy_plan(), {}, make_base(),
+                                mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
+
+    assert result["blocked"] is True
+    assert result["refresh_failed"] is False      # nothing was asked, nothing failed
+
+
+def test_measure_run_fills_reports_whether_the_refresh_actually_happened():
+    account = FakeAccount(account_id=115)
+    order_id = add_instance(TradingOrder(
+        account_id=115, symbol="AAPL", quantity=10.0, side=OrderDirection.BUY,
+        order_type=OrderType.MARKET, good_for='day', status=OrderStatus.FILLED,
+        open_type=OrderOpenType.MANUAL, filled_qty=10.0, open_price=160.0))
+
+    totals, refreshed = svc.measure_run_fills(account, [order_id])
+    assert refreshed is True and totals.settled is True
+
+    account.refresh_raises = RuntimeError("broker 503")
+    totals, refreshed = svc.measure_run_fills(account, [order_id])
+    assert refreshed is False and totals.settled is False
+
+
+# ---------------------------------------------------------------------------
+# MINOR: get_unconsumed_runs(limit=20) silently capped the drain AND the panel.
+# ---------------------------------------------------------------------------
+
+def _defer_runs(account, count: int):
+    """``count`` runs, each left unconsumed with one order still working."""
+    account.fills = {}
+    return [svc.run_allocation(account, _one_buy_plan(), {}, make_base(),
+                               mode=ALLOCATION_MODE_REBALANCE)["run_id"]
+            for _ in range(count)]
+
+
+def test_one_reconcile_pass_drains_more_than_twenty_deferred_runs(activity):
+    """25 deferred runs used to leave 5 behind on every pass, forever -- and the
+    income that funded them showed as unallocated the whole time."""
+    account = FakeAccount(account_id=116)
+    account.positions = []
+    add_instance(PortfolioIncomeEvent(account_id=116, external_id="dep-1",
+                                      event_date=date(2026, 8, 1),
+                                      event_type=CASH_TRANSFER_DEPOSIT, amount=60_000.0))
+    run_ids = _defer_runs(account, 25)
+    assert len(svc.get_unconsumed_runs(116, limit=None)) == 25
+
+    account.fills = {"AAPL": (OrderStatus.FILLED, 10.0, 160.0)}
+    consumed = svc.reconcile_unconsumed_runs(account)
+
+    assert sorted(consumed) == sorted(run_ids)
+    assert svc.get_unconsumed_runs(116, limit=None) == []
+
+
+def test_the_panel_counts_every_deferred_run_not_just_the_first_twenty(activity):
+    account = FakeAccount(account_id=117)
+    account.positions = []
+    run_ids = _defer_runs(account, 25)
+
+    described = svc.describe_unconsumed_runs(117)
+
+    assert sorted(described["run_ids"]) == sorted(run_ids)
+    assert len(described["working_order_ids"]) == 25
+
+
+def test_get_unconsumed_runs_still_honours_an_explicit_limit(activity):
+    """The cap is still available -- it is just no longer the DEFAULT that the
+    money paths silently inherit."""
+    account = FakeAccount(account_id=118)
+    account.positions = []
+    _defer_runs(account, 25)
+
+    assert len(svc.get_unconsumed_runs(118, limit=5)) == 5
+    assert len(svc.get_unconsumed_runs(118, limit=None)) == 25

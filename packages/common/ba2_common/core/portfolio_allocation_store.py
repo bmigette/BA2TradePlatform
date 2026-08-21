@@ -807,8 +807,16 @@ def finalise_allocation_run(run_id: int, *,
     return row
 
 
-def get_unconsumed_runs(account_id: int, limit: int = 20) -> List[PortfolioAllocationRun]:
+def get_unconsumed_runs(account_id: int,
+                        limit: Optional[int] = 20) -> List[PortfolioAllocationRun]:
     """Runs that never reached ``finalise_allocation_run()``, NEWEST first.
+
+    ``limit=None`` means NO cap, and that is what the drain and the panel pass.
+    The default 20 is a display convenience, and inheriting it silently is a bug:
+    25 deferred runs left 5 behind on every reconcile pass -- the same 5, forever,
+    because the pass consumes the newest 20 and the next pass sees the same
+    oldest 5 fall outside the window again -- while the panel reported a backlog
+    of 20 out of 25 and an unallocated total that never came down.
 
     The recovery view, and it is NOT normally empty. A row here either submitted
     orders and died before finalising, or was finalised with ``orders_settled=False``

@@ -1109,3 +1109,35 @@ def test_a_blocked_gate_gets_no_second_provenance_notice():
     unknown = evaluate_market_gate(is_open=None, next_open=None,
                                    source=MARKET_SOURCE_UNAVAILABLE, now=FROZEN_NOW)
     assert market_provenance_notice(unknown) is None
+
+
+def test_a_failed_broker_refresh_is_not_reported_as_zero_orders_working():
+    """MINOR: ``measure_run_fills`` forces ``settled=False`` on a failed refresh
+    while ``working_order_ids`` stays EMPTY, so the count line read "0 order(s)
+    still working" -- i.e. "nothing outstanding" -- for the one case where orders
+    may have reached the broker and nobody can say."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
+        REFRESH_FAILED_NOTICE,
+    )
+    text, severity = working_orders_notice(settled=False, working_order_ids=[],
+                                           refresh_failed=True)
+    assert text == REFRESH_FAILED_NOTICE
+    assert "0 order(s)" not in text
+    assert "FAILED" in text and "check the broker" in text.lower()
+    assert severity == "negative"
+
+
+def test_the_refresh_failure_outranks_a_settled_looking_run():
+    """A failed refresh with rows that LOOK final is exactly the dangerous shape:
+    settled would be True on our own numbers, and they are not evidence."""
+    assert working_orders_notice(settled=True, working_order_ids=[],
+                                 refresh_failed=True) is not None
+
+
+def test_a_working_refresh_keeps_the_old_two_sentences():
+    assert working_orders_notice(settled=True, working_order_ids=[],
+                                 refresh_failed=False) is None
+    text, severity = working_orders_notice(settled=False, working_order_ids=[7],
+                                           refresh_failed=False)
+    assert "1 order(s) still working" in text
+    assert severity == "warning"

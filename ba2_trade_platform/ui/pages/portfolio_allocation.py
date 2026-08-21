@@ -866,7 +866,8 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
             return
         render_outcomes(result['outcomes'], run_id=result['run_id'])
         note = working_orders_notice(settled=result['settled'],
-                                     working_order_ids=result['working_order_ids'])
+                                     working_order_ids=result['working_order_ids'],
+                                     refresh_failed=result['refresh_failed'])
         if note is not None:
             ui.notify(note[0], type=note[1])
         await refresh()

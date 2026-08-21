@@ -876,24 +876,51 @@ def sync_income_events(account, *, days: int = INCOME_WINDOW_DAYS) -> int:
     Never runs on a timer: the caller invokes it on page load and on explicit
     Refresh, so the page issues no background broker calls.
 
+    ORDER MATTERS, and it is upsert THEN drain. The two halves of a Refresh --
+    "what money arrived" and "what did the last run really spend" -- routinely
+    surface together: a dividend is credited and the buy it funded fills on the
+    same day. Draining first measured the deferred run against a ledger that did
+    not yet hold the backdated event, so it consumed nothing AND stamped itself,
+    and ``finalise_allocation_run``'s stamp is one-shot -- the deposit then showed
+    as 100% unallocated for good while its position sat in the book.
+
     Returns:
         int: how many NEW events were inserted (a restatement is not counted; a
         broker failure is logged and returns 0 rather than looking like "no
         income").
     """
+    inserted = _upsert_income_window(account, days=days)
+
     # Decision D3: a deferred run's income stays open until something re-measures
     # it, and deferral is the common case. This is the income panel's Refresh AND
     # the allocation page's load call, so draining here is what stops a quarterly
     # rebalancer's income from sitting unallocated for a quarter. DB-only unless
-    # there is genuinely something pending. Never fatal: the sync is what refills
-    # the panel, and a broken drain must degrade to "not consumed yet", not to an
-    # empty income panel.
+    # there is genuinely something pending.
+    #
+    # Outside the upsert's own error handling on purpose: it is the one half that
+    # can still make progress when the broker's activity feed is down, so it must
+    # not sit behind that failure's early return. Never fatal either way -- the
+    # sync is what refills the panel, and a broken drain must degrade to "not
+    # consumed yet", not to an empty income panel.
     try:
         reconcile_unconsumed_runs(account)
     except Exception as e:
         logger.error(f"Reconciling unconsumed allocation runs failed for account "
                      f"{account.id}: {e}", exc_info=True)
 
+    return inserted
+
+
+def _upsert_income_window(account, *, days: int) -> int:
+    """The broker half of ``sync_income_events``: read the window, write the ledger.
+
+    Split out so the drain above it can run unconditionally -- inline, its early
+    returns took the drain with them.
+
+    Returns:
+        int: how many NEW events were inserted. 0 for a broker failure, which is
+        logged; a restatement is not counted.
+    """
     from .portfolio_allocation_store import get_income_events_since, upsert_income_event
 
     end_date = _today()
@@ -992,6 +1019,15 @@ RUN_FILLED_FMT = "; {buys:.2f} bought / {sells:.2f} sold (filled)"
 RUN_UNSETTLED_FMT = ("; {orders} order(s) still working, income not consumed yet "
                      "- it is re-measured on the next Refresh or allocation run")
 
+#: Said INSTEAD of the line above when the broker refresh itself failed. The two
+#: are not the same fact and must not share wording: "0 order(s) still working"
+#: describes a run with nothing outstanding, while this one means our rows were
+#: never confirmed at all, so whatever they say is not evidence.
+RUN_REFRESH_FAILED_FMT = (
+    "; the broker order refresh FAILED, so nothing about this run's fills is "
+    "confirmed and no income was consumed - it is re-measured on the next Refresh "
+    "or allocation run")
+
 
 def _finalise_run(run_id: int, totals: FilledTotals, order_ids: List[int]) -> float:
     """Write the run's FILLED totals and spend the ledger, in ONE store transaction.
@@ -1031,11 +1067,13 @@ def _finalise_run(run_id: int, totals: FilledTotals, order_ids: List[int]) -> fl
 # What the run actually filled. The income ledger's only input.
 # ---------------------------------------------------------------------------
 
-def get_unconsumed_runs(account_id: int, limit: int = 20):
+def get_unconsumed_runs(account_id: int, limit: Optional[int] = 20):
     """Runs whose income was never consumed -- the recovery view. Read-only.
 
     Re-exported here so the UI and the reconcile path have ONE service-level
-    surface; the query itself belongs to the store.
+    surface; the query itself belongs to the store. ``limit=None`` means no cap,
+    and both money paths below pass it -- see the store's docstring for why
+    inheriting the display default silently strands the oldest runs forever.
     """
     from .portfolio_allocation_store import get_unconsumed_runs as _store_runs
     return _store_runs(account_id, limit)
@@ -1125,7 +1163,7 @@ def collect_order_fills(account_id: int, order_ids: List[int]) -> List[OrderFill
     return fills
 
 
-def measure_run_fills(account, order_ids: List[int]) -> FilledTotals:
+def measure_run_fills(account, order_ids: List[int]) -> Tuple[FilledTotals, bool]:
     """Ask the broker what really happened, then price it. The ledger's input.
 
     Refresh once, read our own rows back, measure. No polling and no waiting: the
@@ -1133,6 +1171,17 @@ def measure_run_fills(account, order_ids: List[int]) -> FilledTotals:
     already relies on this single refresh for. Anything still working comes back
     ``settled=False`` and is reconciled later -- by the income panel's Refresh or by
     the next run.
+
+    Returns:
+        Tuple[FilledTotals, bool]: the totals, and whether the broker refresh
+        SUCCEEDED. The flag is returned rather than folded into the totals because
+        the two unsettled cases read identically otherwise and need different
+        words: "N orders are still working" versus "we could not ask". A failed
+        refresh forces ``settled=False`` with ``working_order_ids`` EMPTY -- our
+        rows may well say FILLED, they are just not evidence -- and a caller with
+        only the totals then tells the user "0 order(s) still working", which
+        describes a run with nothing outstanding rather than one nobody could
+        price.
     """
     refreshed = refresh_orders_from_broker(account)
     totals = measure_filled_values(collect_order_fills(account.id, order_ids))
@@ -1140,7 +1189,7 @@ def measure_run_fills(account, order_ids: List[int]) -> FilledTotals:
         # Our rows say whatever they said BEFORE the broker was asked. Whatever
         # they show, it is not evidence, so nothing may be consumed against it.
         totals.settled = False
-    return totals
+    return totals, refreshed
 
 
 def reconcile_unconsumed_runs(account) -> List[int]:
@@ -1164,7 +1213,11 @@ def reconcile_unconsumed_runs(account) -> List[int]:
     """
     from .portfolio_allocation_store import finalise_allocation_run
 
-    pending = list(reversed(get_unconsumed_runs(account.id)))
+    # limit=None: EVERY unconsumed run, not the display default of 20. With 25
+    # deferred runs the capped query drains the newest 20 and re-reads the same
+    # oldest 5 into the window on the next pass, so those 5 never settle and their
+    # income never comes off the "unallocated" figure.
+    pending = list(reversed(get_unconsumed_runs(account.id, limit=None)))
     if not pending:
         return []
 
@@ -1205,7 +1258,9 @@ def describe_unconsumed_runs(account_id: int) -> Dict[str, Any]:
         ``ba2_common.core.portfolio_allocation.unconsumed_income_notice`` for the
         panel's sentence.
     """
-    runs = list(reversed(get_unconsumed_runs(account_id)))
+    # limit=None, for the same reason the drain passes it: the panel's whole job
+    # is to say how much is outstanding, and a capped count under-reports it.
+    runs = list(reversed(get_unconsumed_runs(account_id, limit=None)))
     working: List[int] = []
     for run in runs:
         totals = measure_filled_values(collect_order_fills(account_id, run.order_ids or []))
@@ -1254,9 +1309,16 @@ def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionSta
     Returns:
         Dict[str, Any]: ``run_id``, ``outcomes``, ``order_ids``, ``income_consumed``,
         ``filled_buy_value``, ``filled_sell_value``, ``settled``,
-        ``working_order_ids``, ``blocked``, ``blocked_reason``. When blocked the
-        money keys are 0.0, ``settled`` is True (nothing was submitted, so there is
-        nothing to wait for), ``working_order_ids`` is empty and ``run_id`` is None.
+        ``working_order_ids``, ``refresh_failed``, ``blocked``, ``blocked_reason``.
+        When blocked the money keys are 0.0, ``settled`` is True (nothing was
+        submitted, so there is nothing to wait for), ``working_order_ids`` is
+        empty, ``refresh_failed`` is False (the broker was never asked) and
+        ``run_id`` is None.
+
+        ``refresh_failed`` is NOT redundant with ``settled``. A failed refresh
+        forces ``settled=False`` with an EMPTY ``working_order_ids``, so a caller
+        reading only those two tells the user "0 order(s) still working" -- which
+        reads as "nothing outstanding" for a run nobody has been able to price.
     """
     # Market-hours gate, FIRST, before anything is written. Disabling the Submit
     # button is a courtesy; this is the enforcement -- the wizard can sit open across
@@ -1279,6 +1341,7 @@ def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionSta
             "filled_sell_value": 0.0,
             "settled": True,              # nothing was submitted, so nothing is pending
             "working_order_ids": [],
+            "refresh_failed": False,      # the broker was never asked anything
             "blocked": True,
             "blocked_reason": f"{reason}. Nothing was submitted.",
         }
@@ -1358,7 +1421,7 @@ def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionSta
             if order_id not in order_ids:
                 order_ids.append(order_id)
 
-    totals = measure_run_fills(account, order_ids)
+    totals, refreshed = measure_run_fills(account, order_ids)
     if totals.unmeasurable_order_ids:
         logger.error(f"Allocation run {run_id}: order(s) "
                      f"{totals.unmeasurable_order_ids} report a fill with no usable "
@@ -1392,7 +1455,9 @@ def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionSta
         failed=failed,
         skipped=counts[OUTCOME_SKIPPED])
     description += RUN_FILLED_FMT.format(buys=totals.buy_value, sells=totals.sell_value)
-    if not totals.settled:
+    if not refreshed:
+        description += RUN_REFRESH_FAILED_FMT
+    elif not totals.settled:
         description += RUN_UNSETTLED_FMT.format(orders=len(totals.working_order_ids))
 
     log_activity(
@@ -1419,6 +1484,7 @@ def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionSta
         "filled_sell_value": totals.sell_value,
         "settled": totals.settled,
         "working_order_ids": list(totals.working_order_ids),
+        "refresh_failed": not refreshed,
         "blocked": False,
         "blocked_reason": None,
     }

@@ -652,6 +652,14 @@ MARKET_MSG_OPEN_FROM_FALLBACK = (
 WORKING_ORDERS_NOTICE_FMT = (
     "{count} order(s) still working — this run's income has NOT been consumed yet. "
     "It is picked up automatically on the next refresh once the orders settle.")
+#: Said INSTEAD of the line above when the broker refresh FAILED. Not a variant of
+#: it: a failed refresh leaves ``working_order_ids`` empty, so the count line reads
+#: "0 order(s) still working" — i.e. "nothing outstanding" — for a run whose fills
+#: were never confirmed at all.
+REFRESH_FAILED_NOTICE = (
+    "The broker order refresh FAILED, so nothing about this run's fills is "
+    "confirmed and its income has NOT been consumed. Orders may well have gone "
+    "out — check the broker. It is re-measured on the next refresh.")
 
 _WEEKDAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 _MONTH_NAMES = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -806,7 +814,8 @@ def market_provenance_notice(gate: MarketGateResult) -> Optional[Tuple[str, str]
 
 
 def working_orders_notice(*, settled: bool,
-                          working_order_ids: Sequence[int]) -> Optional[Tuple[str, str]]:
+                          working_order_ids: Sequence[int],
+                          refresh_failed: bool = False) -> Optional[Tuple[str, str]]:
     """"N orders still working" — text and severity, or ``None`` when there is none.
 
     Orders that have not settled contribute ZERO to a run's filled value, so the
@@ -814,14 +823,24 @@ def working_orders_notice(*, settled: bool,
     common case here, not the rare one, so the fact has to reach the user rather than
     only the log.
 
+    ``refresh_failed`` WINS over the count, and that is the whole reason it exists.
+    ``measure_run_fills`` forces ``settled=False`` when the broker refresh failed,
+    but ``working_order_ids`` then comes back EMPTY — our own rows may say FILLED,
+    they are simply not evidence — so the count line rendered "0 order(s) still
+    working". That reads as "nothing outstanding" for the one case where orders may
+    have gone out and nobody can say. Different fact, different sentence.
+
     Takes plain values rather than a ``FilledTotals`` so it does not depend on the
     ledger chunk: it lands first and starts saying something the moment real
     ``settled`` / ``working_order_ids`` are supplied.
 
     Returns:
         Optional[Tuple[str, str]]: ``(text, severity)`` for ``ui.notify`` and for
-        ``MARKET_BANNER_CLASSES``, or ``None`` when the run settled.
+        ``MARKET_BANNER_CLASSES``, or ``None`` when the run settled with a working
+        refresh.
     """
+    if refresh_failed:
+        return REFRESH_FAILED_NOTICE, "negative"
     if settled:
         return None
     return (WORKING_ORDERS_NOTICE_FMT.format(count=len(working_order_ids or [])),
