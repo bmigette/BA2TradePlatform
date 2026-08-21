@@ -1,7 +1,7 @@
 # my tools
 nicegui>=3.0.0  # Requires NiceGUI 3.0+ - see migration notes in docs/NICEGUI_3_MIGRATION.md
-alpaca-py
-tastytrade
+alpaca-py==0.43.2
+tastytrade==12.0.2  # pin: 12.x is the OAuth-only ASYNC rewrite (Account.place_order is a coroutine whose dry_run defaults to True). Do not float this line.
 sqlmodel
 python-dotenv
 yahooquery
