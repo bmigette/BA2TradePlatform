@@ -86,6 +86,25 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
     # instance built with object.__new__ (the test idiom) still has it.
     _MARGIN_INFO_CACHE_TTL = 24 * 60 * 60
 
+    # Lifetime of the _account_snapshot_cache. Deliberately FIVE SECONDS, not the
+    # margin cache's 24 hours: that one holds STATIC ASSET FACTS, this one holds
+    # MONEY (equity, buying power, cash), and a stale equity used for a risk check
+    # is its own bug.
+    #
+    # 5.0 because it is the SAME NUMBER as _BALANCE_CACHE_TTL and the same
+    # underlying endpoint (client.get_account()) publishing the same fields. Two
+    # different staleness windows over one source would let get_balance() and
+    # get_account_snapshot().equity disagree in the same pass for no reason.
+    #
+    # It is short enough to stay honest -- the position-size cap is a PERCENTAGE of
+    # equity (typically 5-20%), and intraday equity cannot move enough in 5 s to
+    # flip such a comparison -- and long enough to collapse the real burst, which is
+    # an allocation / rebalance pass validating and submitting a whole basket
+    # back-to-back inside one second. The events that DO move buying power
+    # discontinuously are OUR OWN submissions, and those are handled by explicit
+    # invalidation (invalidate_balance_cache), not by waiting out a TTL.
+    _ACCOUNT_SNAPSHOT_CACHE_TTL = 5.0
+
     def __init__(self, id: int):
         """
         Initialize the AlpacaAccount with API credentials.
@@ -116,6 +135,18 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         # explicit user Refresh. bp_factor is re-derived on every hit (the multiplier
         # moves between 1/2/4 far more often than the asset facts do).
         self._margin_info_cache: Dict[str, Tuple[float, MarginInfo]] = {}
+
+        # Account-level snapshot cache, (fetched_at, AccountSnapshot) or None.
+        #
+        # get_account_snapshot() costs TWO REST round trips on Alpaca -- get_account()
+        # for the money plus get_account_configurations() for the fractional flag --
+        # and it is on the LIVE order path: _validate_position_size_limits reads
+        # equity through it on every market-order validation, so a basket paid for
+        # two calls per order. See _ACCOUNT_SNAPSHOT_CACHE_TTL for why the window is
+        # 5 s and not the margin cache's 24 h. Cleared explicitly by
+        # clear_account_snapshot_cache(), and by invalidate_balance_cache() because a
+        # submitted order changes the buying power this snapshot carries.
+        self._account_snapshot_cache: Optional[Tuple[float, AccountSnapshot]] = None
 
         # Balance cache (5s TTL; serves stale value on fetch failure)
         self._balance_cache: Optional[float] = None
@@ -1588,6 +1619,11 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         """Invalidate the balance cache so the next call fetches a fresh value."""
         with self._balance_cache_lock:
             self._balance_cache_time = 0.0
+        # The snapshot carries the SAME buying_power / cash / equity off the SAME
+        # get_account() call, so anything that stales the balance stales it too --
+        # otherwise the next TradeActions.increase_instrument_share would size
+        # against pre-trade buying power for up to a full TTL.
+        self.clear_account_snapshot_cache()
         logger.debug("Balance cache invalidated")
 
     def get_balance(self) -> Optional[float]:
@@ -1676,7 +1712,26 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
         Returns an ALL-None AccountSnapshot (never None) when get_account_info()
         returns None on auth failure: the type stays stable and the caller must
         refuse to plan rather than substitute zeros.
+
+        CACHED for _ACCOUNT_SNAPSHOT_CACHE_TTL (5 s). Those two endpoints are the
+        cost of reading equity, and _validate_position_size_limits reads equity on
+        every market-order validation, so a basket used to pay two REST round trips
+        per order. The window is deliberately tiny because this is money -- see
+        _ACCOUNT_SNAPSHOT_CACHE_TTL -- and it is dropped outright by
+        invalidate_balance_cache() after every submission, so the one event that
+        moves these numbers discontinuously never waits it out.
+
+        A FAILED read is NOT cached: caching the all-None snapshot would keep a
+        recovered account looking dead for the rest of the window.
         """
+        cached_entry = getattr(self, '_account_snapshot_cache', None)
+        if cached_entry is not None:
+            fetched_at, cached = cached_entry
+            if (time.time() - fetched_at) < self._ACCOUNT_SNAPSHOT_CACHE_TTL:
+                logger.debug(f"[Account {self.id}] Account snapshot served from cache")
+                return cached
+            self._account_snapshot_cache = None
+
         info = self.get_account_info()
         if info is None:
             logger.error(f"[Account {self.id}] get_account_info() returned None -- empty snapshot")
@@ -1718,7 +1773,7 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
                 f"even if the account is fractional-capable"
             )
 
-        return AccountSnapshot(
+        snapshot = AccountSnapshot(
             cash=_f('cash'),
             equity=equity,
             net_liquidation=equity,
@@ -1733,6 +1788,22 @@ class AlpacaAccount(AccountInterface, OptionsAccountInterface):
             raw={'account_number': getattr(info, 'account_number', None),
                  'status': str(getattr(info, 'status', None))},
         )
+        self._account_snapshot_cache = (time.time(), snapshot)
+        return snapshot
+
+    def clear_account_snapshot_cache(self) -> None:
+        """Drop the cached account snapshot so the next call refetches.
+
+        The companion to _ACCOUNT_SNAPSHOT_CACHE_TTL, mirroring
+        clear_margin_info_cache(). The TTL alone is not enough: the account object
+        lives for the whole PROCESS, and the moment these numbers change
+        discontinuously is a submission of our own, which must not be allowed to
+        read pre-trade buying power for the rest of the window. Called by
+        invalidate_balance_cache() (i.e. after every submit) and available for an
+        explicit user Refresh.
+        """
+        self._account_snapshot_cache = None
+        logger.debug(f"[Account {self.id}] Cleared cached account snapshot")
 
     def get_symbol_margin_info(self, symbols: List[str]) -> Dict[str, MarginInfo]:
         """Per-symbol margin / fractionability metadata for buying-power sizing.
