@@ -70,6 +70,9 @@ __all__ = [
     "build_symbol_targets", "validate_symbol_weights", "validate_label_targets",
     "compute_base_notional", "compute_allocation", "compute_label_investment",
     "apply_order_impacts", "consume_income_events",
+    # submission
+    "ACTION_ADJUST", "ACTION_CLOSE", "ACTION_NEW", "ACTION_SKIP",
+    "decide_symbol_action", "split_delta_fifo",
 ]
 
 # ---- module constants (exact spellings; use these, never bare literals) ----
@@ -1604,3 +1607,77 @@ def blocking_messages(messages: List[str]) -> List[str]:
     amount over buying power is worth showing and not worth refusing.
     """
     return [m for m in messages or [] if is_blocking_message(m)]
+
+
+# ---------------------------------------------------------------------------
+# Submission decisions. Pure -- the live service does the IO around them.
+# ---------------------------------------------------------------------------
+
+ACTION_ADJUST = "adjust"   # held, target > 0, delta != 0 -> adjust_quantity_with_tpsl
+ACTION_CLOSE = "close"     # held, target == 0            -> close_transaction
+ACTION_NEW = "new"         # not held, target > 0         -> new TradingOrder
+ACTION_SKIP = "skip"       # nothing to do (or nothing we are willing to do)
+
+
+def decide_symbol_action(row: "AllocationRow", state: Optional["PositionState"]) -> str:
+    """Which of the three submission paths this row takes (decision 14). Pure.
+
+    Long-only: a SELL on a symbol we do not hold would open a short, so it is
+    skipped rather than submitted. A row that the engine already marked
+    ``skipped`` (no price, precheck rejected) is never traded, and neither is a
+    row whose delta was zeroed -- a suppressed trim HOLDS the position, it does
+    not become a liquidation.
+
+    "Held" means held BY US: a position with no open Transaction of ours cannot
+    be adjusted, because the adjust path resizes a transaction. A BUY there opens
+    a fresh transaction; a SELL is refused rather than trimming a position this
+    platform does not track.
+    """
+    if row.skipped or row.side is None or row.delta_quantity == 0:
+        return ACTION_SKIP
+
+    held = state is not None and (state.quantity or 0.0) > 0 and bool(state.transaction_ids)
+    if held:
+        return ACTION_CLOSE if row.target_quantity <= 0 else ACTION_ADJUST
+
+    return ACTION_NEW if row.side == OrderDirection.BUY else ACTION_SKIP
+
+
+def split_delta_fifo(
+    delta_quantity: float,
+    transaction_quantities: List[Tuple[int, float]],
+) -> List[Tuple[int, float]]:
+    """Spread a signed delta across a symbol's open transactions, oldest first. Pure.
+
+    Args:
+        delta_quantity: SIGNED. Negative trims, positive adds.
+        transaction_quantities: ``[(transaction_id, quantity)]``, ALREADY sorted
+            oldest first.
+
+    Returns:
+        List[Tuple[int, float]]: ``[(transaction_id, signed_qty_change)]``, only
+        for transactions actually touched. A trim consumes them FIFO and is
+        CLAMPED to what is actually held (never oversells), stops at the first
+        transaction that covers it, and skips an empty one -- every extra
+        transaction touched is an extra broker order and an extra TP/SL rebuild.
+        An add lands entirely on the OLDEST transaction, so the account keeps one
+        transaction per symbol (decision 14). Empty when there is nothing to do.
+    """
+    if not transaction_quantities or delta_quantity == 0:
+        return []
+
+    if delta_quantity > 0:
+        return [(transaction_quantities[0][0], float(delta_quantity))]
+
+    remaining = abs(float(delta_quantity))
+    out: List[Tuple[int, float]] = []
+    for txn_id, quantity in transaction_quantities:
+        if remaining <= 0:
+            break
+        available = float(quantity or 0.0)
+        if available <= 0:
+            continue
+        take = min(available, remaining)
+        out.append((txn_id, -take))
+        remaining -= take
+    return out

@@ -8,6 +8,10 @@ import pytest
 
 from ba2_common.core.account_types import AccountSnapshot, MarginInfo
 from ba2_common.core.portfolio_allocation import (
+    ACTION_ADJUST,
+    ACTION_CLOSE,
+    ACTION_NEW,
+    ACTION_SKIP,
     ERROR_INVEST_AMOUNT_FMT,
     ERROR_INVEST_LABEL_EMPTY_FMT,
     ERROR_INVEST_NO_LABEL,
@@ -28,10 +32,12 @@ from ba2_common.core.portfolio_allocation import (
     build_base_snapshot,
     compute_allocation,
     compute_base_notional,
+    decide_symbol_action,
     dry_run_rows,
     even_split_targets,
     filter_plan_rows,
     invest_validation_messages,
+    split_delta_fifo,
     steps_validation_messages,
     summarise_plan,
     validate_invest_amount,
@@ -483,3 +489,120 @@ def test_blocking_messages_keeps_every_rebalance_error():
     labels = [LabelTarget("A", 55.0, [SymbolTarget("AAA", 100.0)])]
     messages = steps_validation_messages(labels)
     assert messages and blocking_messages(messages) == messages
+
+
+# ---------------------------------------------------------------------------
+# Task 72: decide_symbol_action -- which of the three submission paths a row takes
+# ---------------------------------------------------------------------------
+
+def test_decide_symbol_action_not_held_with_a_buy_is_a_new_position():
+    row = AllocationRow(symbol="NVDA", price=900.0, delta_quantity=4.0,
+                        side=OrderDirection.BUY, target_quantity=4.0)
+    assert decide_symbol_action(row, None) == ACTION_NEW
+
+
+def test_decide_symbol_action_held_with_a_non_zero_target_is_an_adjustment():
+    row = AllocationRow(symbol="AAPL", price=160.0, delta_quantity=-3.0,
+                        side=OrderDirection.SELL, target_quantity=7.0)
+    state = PositionState(symbol="AAPL", quantity=10.0, transaction_ids=[1])
+    assert decide_symbol_action(row, state) == ACTION_ADJUST
+
+
+def test_decide_symbol_action_held_with_a_zero_target_is_a_close():
+    row = AllocationRow(symbol="AAPL", price=160.0, delta_quantity=-10.0,
+                        side=OrderDirection.SELL, target_quantity=0.0)
+    state = PositionState(symbol="AAPL", quantity=10.0, transaction_ids=[1])
+    assert decide_symbol_action(row, state) == ACTION_CLOSE
+
+
+def test_decide_symbol_action_skipped_row_is_never_traded():
+    row = AllocationRow(symbol="TSLA", price=None, delta_quantity=5.0,
+                        side=OrderDirection.BUY, skipped=True,
+                        reasons=["no price - skipped"])
+    assert decide_symbol_action(row, None) == ACTION_SKIP
+
+
+def test_decide_symbol_action_sell_of_an_unheld_symbol_is_skipped():
+    # Long-only: there is nothing to sell, so this must not become a short.
+    row = AllocationRow(symbol="NVDA", price=900.0, delta_quantity=-2.0,
+                        side=OrderDirection.SELL, target_quantity=0.0)
+    assert decide_symbol_action(row, None) == ACTION_SKIP
+
+
+def test_decide_symbol_action_topping_up_a_held_symbol_is_an_adjustment():
+    """A BUY into a symbol we already hold must resize the EXISTING transaction,
+    not open a second one alongside it (decision 14: one transaction per symbol)."""
+    row = AllocationRow(symbol="AAPL", price=160.0, delta_quantity=5.0,
+                        side=OrderDirection.BUY, target_quantity=15.0)
+    state = PositionState(symbol="AAPL", quantity=10.0, transaction_ids=[1])
+    assert decide_symbol_action(row, state) == ACTION_ADJUST
+
+
+def test_decide_symbol_action_a_broker_position_we_do_not_track_is_not_adjustable():
+    """Held at the broker but with no open Transaction of ours: there is nothing
+    to adjust, so a BUY opens a fresh transaction and a SELL is refused rather
+    than trimming a position this platform does not own."""
+    buy = AllocationRow(symbol="AAPL", price=160.0, delta_quantity=5.0,
+                        side=OrderDirection.BUY, target_quantity=15.0)
+    sell = AllocationRow(symbol="AAPL", price=160.0, delta_quantity=-5.0,
+                         side=OrderDirection.SELL, target_quantity=5.0)
+    untracked = PositionState(symbol="AAPL", quantity=10.0, transaction_ids=[])
+    assert decide_symbol_action(buy, untracked) == ACTION_NEW
+    assert decide_symbol_action(sell, untracked) == ACTION_SKIP
+
+
+def test_decide_symbol_action_a_suppressed_row_is_skipped_not_closed():
+    """The $5 fractional floor zeroes the DELTA and leaves target_quantity at the
+    CURRENT holding. A close is decided on the TARGET, so an unsendable trim of a
+    position down to zero must not be promoted into a full liquidation."""
+    row = AllocationRow(
+        symbol="SCHD", price=25.0, delta_quantity=0.0, side=None,
+        target_quantity=0.0,
+        reasons=[REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_FMT.format(value=1.95, minimum=5)])
+    state = PositionState(symbol="SCHD", quantity=3.0, transaction_ids=[1])
+    assert decide_symbol_action(row, state) == ACTION_SKIP
+
+
+# ---------------------------------------------------------------------------
+# Task 72: split_delta_fifo
+# ---------------------------------------------------------------------------
+
+def test_split_delta_fifo_sell_spans_two_transactions_oldest_first():
+    assert split_delta_fifo(-30.0, [(11, 20.0), (12, 15.0)]) == [(11, -20.0), (12, -10.0)]
+
+
+def test_split_delta_fifo_sell_larger_than_held_is_clamped_to_what_exists():
+    assert split_delta_fifo(-50.0, [(11, 20.0), (12, 15.0)]) == [(11, -20.0), (12, -15.0)]
+
+
+def test_split_delta_fifo_buy_lands_entirely_on_the_oldest_transaction():
+    assert split_delta_fifo(7.0, [(11, 20.0), (12, 15.0)]) == [(11, 7.0)]
+
+
+def test_split_delta_fifo_with_no_transactions_returns_empty():
+    assert split_delta_fifo(-5.0, []) == []
+    assert split_delta_fifo(0.0, [(11, 20.0)]) == []
+
+
+def test_split_delta_fifo_stops_at_the_first_transaction_that_covers_the_trim():
+    """A trim that the oldest transaction absorbs must not touch the newer one --
+    every extra transaction touched is an extra broker order and an extra TP/SL
+    rebuild."""
+    assert split_delta_fifo(-5.0, [(11, 20.0), (12, 15.0)]) == [(11, -5.0)]
+
+
+def test_split_delta_fifo_skips_an_empty_transaction():
+    """A fully-consumed-but-still-open transaction has nothing to give; sending it
+    a zero-quantity adjustment is an order the broker cancels."""
+    assert split_delta_fifo(-5.0, [(11, 0.0), (12, 15.0)]) == [(12, -5.0)]
+
+
+def test_decide_symbol_action_a_zero_delta_that_still_carries_a_side_is_skipped():
+    """``side`` and ``delta_quantity`` are INDEPENDENT fields of ``to_dict()``, so a
+    plan replayed from ``plan_json`` can present both. A zero-quantity order is one
+    the broker cancels, so the delta -- not the side -- decides."""
+    row = AllocationRow(symbol="AAPL", price=160.0, delta_quantity=0.0,
+                        side=OrderDirection.BUY, target_quantity=10.0)
+    assert decide_symbol_action(row, None) == ACTION_SKIP
+    state = PositionState(symbol="AAPL", quantity=10.0, transaction_ids=[1])
+    assert decide_symbol_action(row, state) == ACTION_SKIP
