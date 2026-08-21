@@ -1279,6 +1279,100 @@ class TastyTradeAccount(AccountInterface):
         logger.debug(f"[Account {self.id}] Retrieved {len(transfers)} cash transfers")
         return transfers
 
+    def get_symbol_margin_info(self, symbols: List[str]) -> Dict[str, MarginInfo]:
+        """Per-symbol margin / fractionability metadata, for buying-power sizing.
+
+        Three SDK inputs are combined:
+          * ``Account.get_margin_requirements()`` -> per-underlying
+            ``initial_requirement``. Divided by the position's own notional (from
+            ``get_positions``) that is the REAL initial margin rate for a HELD symbol
+            -- the data behind TastyTrade's Cap Req screen.
+          * ``Equity.is_fractional_quantity_eligible`` -> ``fractionable``.
+          * ``get_quantity_decimal_precisions()`` -> the equity trade increment.
+
+        A symbol with NO Equity record is OMITTED, never defaulted here -- the caller
+        must know it fell back. A symbol that has an Equity record but is not held gets
+        ``bp_factor = account multiplier``, which is EXACTLY the caller's own
+        conservative fallback (assume no leverage), so reporting it over-commits
+        nothing while still supplying real fractionability data.
+
+        Args:
+            symbols: symbols to describe; normalised here to ``.strip().upper()``.
+
+        Returns:
+            Dict[str, MarginInfo]: keyed by the normalised symbol.
+        """
+        from tastytrade.instruments import Equity, get_quantity_decimal_precisions
+
+        wanted = [s.strip().upper() for s in (symbols or []) if s and s.strip()]
+        if not wanted or not self._check_authentication():
+            return {}
+
+        is_margin = self._is_margin_account()
+        multiplier = 2.0 if is_margin else 1.0
+
+        equities = {}
+        try:
+            found = self._run_async(Equity.get(self._session, wanted, page_offset=None))
+            equities = {e.symbol.strip().upper(): e for e in found}
+        except Exception as e:
+            logger.warning(f"[Account {self.id}] Equity metadata fetch failed: {e}")
+
+        increment = None
+        try:
+            for precision in self._run_async(get_quantity_decimal_precisions(self._session)):
+                # The generic EQUITY row (symbol is None) is the one that applies to
+                # every equity; per-symbol overrides are not needed for sizing.
+                if precision.instrument_type == TTInstrumentType.EQUITY and precision.symbol is None:
+                    increment = float(10 ** -int(precision.minimum_increment_precision))
+                    break
+        except Exception as e:
+            logger.warning(f"[Account {self.id}] Quantity precision fetch failed: {e}")
+
+        notional = {}
+        for position in (self.get_positions() or []):
+            if position.market_value:
+                notional[position.symbol.strip().upper()] = abs(float(position.market_value))
+
+        requirement = {}
+        try:
+            report = self._run_async(self._account.get_margin_requirements(self._session))
+            for group in (getattr(report, "groups", None) or []):
+                # `groups` is list[MarginReportEntry | EmptyDict]; the EmptyDict
+                # placeholders carry no attributes, hence getattr with defaults.
+                symbol = getattr(group, "underlying_symbol", None)
+                initial = getattr(group, "initial_requirement", None)
+                if symbol and initial is not None:
+                    requirement[symbol.strip().upper()] = abs(float(initial))
+        except Exception as e:
+            logger.warning(f"[Account {self.id}] Margin requirement fetch failed: {e}")
+
+        result = {}
+        for symbol in wanted:
+            equity = equities.get(symbol)
+            if equity is None:
+                continue
+            rate = None
+            source = MARGIN_SOURCE_DEFAULT
+            if symbol in requirement and notional.get(symbol):
+                rate = min(1.0, requirement[symbol] / notional[symbol])
+                source = MARGIN_SOURCE_POSITION
+            fractionable = bool(getattr(equity, "is_fractional_quantity_eligible", False))
+            result[symbol] = MarginInfo(
+                symbol=symbol,
+                bp_factor=(rate * multiplier) if rate is not None else multiplier,
+                # TastyTrade publishes no PER-SYMBOL marginability flag, so this
+                # reports whether the ACCOUNT is a margin account.
+                marginable=is_margin,
+                fractionable=fractionable,
+                min_order_size=None,
+                min_trade_increment=increment if fractionable else 1.0,
+                initial_margin_rate=rate,
+                maintenance_margin_rate=None,
+                source=source,
+            )
+        return result
+
     def get_balance_history(self, start_date=None, end_date=None) -> List[Dict]:
         if not self._check_authentication():
             return []

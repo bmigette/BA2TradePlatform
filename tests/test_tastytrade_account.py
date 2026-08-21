@@ -1194,3 +1194,175 @@ def test_get_cash_transfers_returns_empty_list_on_failure():
     acct._account.get_history = AsyncMock(side_effect=RuntimeError("gateway timeout"))
 
     assert acct.get_cash_transfers() == []
+
+
+# ---------------------------------------------------------------------------
+# get_symbol_margin_info
+# ---------------------------------------------------------------------------
+
+def _margin_report(*entries):
+    """Stand-in for tastytrade MarginReport. `groups` legitimately contains EmptyDict
+    placeholders, which carry no attributes at all."""
+    return SimpleNamespace(groups=list(entries))
+
+
+def _margin_entry(underlying_symbol, initial_requirement):
+    return SimpleNamespace(underlying_symbol=underlying_symbol,
+                           initial_requirement=Decimal(initial_requirement))
+
+
+def _precision(minimum_increment_precision=5, symbol=None,
+               instrument_type=TTInstrumentType.EQUITY):
+    return SimpleNamespace(instrument_type=instrument_type, value=5, symbol=symbol,
+                           minimum_increment_precision=minimum_increment_precision)
+
+
+def _wire_margin_sources(acct, equities, report, precisions, positions):
+    acct._account.get_margin_requirements = AsyncMock(return_value=report)
+    acct._account.get_positions = AsyncMock(return_value=positions)
+    return (
+        patch("tastytrade.instruments.Equity.get", new=AsyncMock(return_value=equities)),
+        patch("tastytrade.instruments.get_quantity_decimal_precisions",
+              new=AsyncMock(return_value=precisions)),
+    )
+
+
+def test_symbol_margin_info_derives_the_real_rate_for_a_held_symbol():
+    """initial_requirement / position notional is the actual Reg-T rate charged."""
+    from ba2_trade_platform.core.account_types import MARGIN_SOURCE_POSITION
+
+    acct = _bare_account()
+    acct._account.margin_or_cash = "Margin"
+    equity_patch, precision_patch = _wire_margin_sources(
+        acct,
+        equities=[_FakeEquity("AAPL")],
+        # 10 shares marked at 155 = 1550 notional; 775 required = a 0.5 rate.
+        report=_margin_report(_margin_entry("AAPL", "775")),
+        precisions=[_precision(minimum_increment_precision=5)],
+        positions=[_tt_position(symbol="AAPL", quantity="10", mark_price="155")])
+
+    with equity_patch, precision_patch:
+        info = acct.get_symbol_margin_info(["AAPL"])
+
+    assert info["AAPL"].initial_margin_rate == pytest.approx(0.5)
+    assert info["AAPL"].bp_factor == pytest.approx(1.0)  # 0.5 rate x 2:1 account
+    assert info["AAPL"].source == MARGIN_SOURCE_POSITION
+
+
+def test_symbol_margin_info_falls_back_to_the_account_multiplier_when_unheld():
+    """Unheld symbols get bp_factor == the account multiplier -- exactly the caller's
+    own conservative fallback, so nothing is over-committed."""
+    from ba2_trade_platform.core.account_types import MARGIN_SOURCE_DEFAULT
+
+    acct = _bare_account()
+    acct._account.margin_or_cash = "Margin"
+    equity_patch, precision_patch = _wire_margin_sources(
+        acct, equities=[_FakeEquity("MSFT")], report=_margin_report(),
+        precisions=[_precision()], positions=[])
+
+    with equity_patch, precision_patch:
+        info = acct.get_symbol_margin_info(["MSFT"])
+
+    assert info["MSFT"].bp_factor == 2.0
+    assert info["MSFT"].initial_margin_rate is None
+    assert info["MSFT"].source == MARGIN_SOURCE_DEFAULT
+
+
+def test_symbol_margin_info_omits_a_symbol_the_broker_cannot_describe():
+    """Omission, not a default -- the caller must know it fell back."""
+    acct = _bare_account()
+    equity_patch, precision_patch = _wire_margin_sources(
+        acct, equities=[], report=_margin_report(), precisions=[_precision()], positions=[])
+
+    with equity_patch, precision_patch:
+        info = acct.get_symbol_margin_info(["NOSUCH"])
+
+    assert info == {}
+
+
+def test_symbol_margin_info_reports_fractionability_and_increment():
+    acct = _bare_account()
+    equity_patch, precision_patch = _wire_margin_sources(
+        acct,
+        equities=[_FakeEquity("AAPL", is_fractional_quantity_eligible=True),
+                  _FakeEquity("BRKA", is_fractional_quantity_eligible=False)],
+        report=_margin_report(), precisions=[_precision(minimum_increment_precision=5)],
+        positions=[])
+
+    with equity_patch, precision_patch:
+        info = acct.get_symbol_margin_info(["AAPL", "BRKA"])
+
+    assert info["AAPL"].fractionable is True
+    assert info["AAPL"].min_trade_increment == pytest.approx(1e-5)
+    assert info["BRKA"].fractionable is False
+    assert info["BRKA"].min_trade_increment == 1.0
+
+
+def test_symbol_margin_info_skips_empty_margin_report_groups():
+    """MarginReport.groups is `list[MarginReportEntry | EmptyDict]` -- the EmptyDict
+    placeholders have no attributes at all."""
+    acct = _bare_account()
+    acct._account.margin_or_cash = "Margin"
+    equity_patch, precision_patch = _wire_margin_sources(
+        acct, equities=[_FakeEquity("AAPL")],
+        report=_margin_report(SimpleNamespace(), _margin_entry("AAPL", "775")),
+        precisions=[_precision()],
+        positions=[_tt_position(symbol="AAPL", quantity="10", mark_price="155")])
+
+    with equity_patch, precision_patch:
+        info = acct.get_symbol_margin_info(["AAPL"])
+
+    assert info["AAPL"].initial_margin_rate == pytest.approx(0.5)
+
+
+def test_symbol_margin_info_clamps_a_rate_above_one_to_fully_cash_secured():
+    """A requirement ABOVE the position's notional (a concentration/hard-to-borrow
+    add-on) must not report a >100% initial margin rate: 1.0 is 'fully cash secured',
+    and the account multiplier already carries the leverage. Added beyond the plan --
+    dropping the min(1.0, ...) clamp left every planned test green."""
+    acct = _bare_account()
+    acct._account.margin_or_cash = "Margin"
+    equity_patch, precision_patch = _wire_margin_sources(
+        acct, equities=[_FakeEquity("AAPL")],
+        # 1550 notional but 2000 required -> a raw ratio of ~1.29.
+        report=_margin_report(_margin_entry("AAPL", "2000")),
+        precisions=[_precision()],
+        positions=[_tt_position(symbol="AAPL", quantity="10", mark_price="155")])
+
+    with equity_patch, precision_patch:
+        info = acct.get_symbol_margin_info(["AAPL"])
+
+    assert info["AAPL"].initial_margin_rate == 1.0
+    assert info["AAPL"].bp_factor == 2.0
+
+
+def test_symbol_margin_info_reports_a_cash_account_as_not_marginable():
+    """TastyTrade has no per-symbol marginability flag, so `marginable` mirrors the
+    ACCOUNT. Added beyond the plan -- hardcoding marginable=True left every planned
+    test green, and a cash account cannot borrow against anything."""
+    acct = _bare_account()
+    acct._account.margin_or_cash = "Cash"
+    equity_patch, precision_patch = _wire_margin_sources(
+        acct, equities=[_FakeEquity("AAPL")], report=_margin_report(),
+        precisions=[_precision()], positions=[])
+
+    with equity_patch, precision_patch:
+        info = acct.get_symbol_margin_info(["AAPL"])
+
+    assert info["AAPL"].marginable is False
+    assert info["AAPL"].bp_factor == 1.0
+
+
+def test_symbol_margin_info_normalises_the_requested_symbols():
+    """The docstring promises .strip().upper(); the returned dict must be keyed that
+    way or every caller lookup misses. Added beyond the plan -- removing the
+    normalisation left every planned test green."""
+    acct = _bare_account()
+    equity_patch, precision_patch = _wire_margin_sources(
+        acct, equities=[_FakeEquity("AAPL")], report=_margin_report(),
+        precisions=[_precision()], positions=[])
+
+    with equity_patch, precision_patch:
+        info = acct.get_symbol_margin_info(["  aapl "])
+
+    assert list(info) == ["AAPL"]
