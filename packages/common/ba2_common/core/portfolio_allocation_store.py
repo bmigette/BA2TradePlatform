@@ -622,3 +622,37 @@ def get_recent_runs(account_id: int, limit: int = 20) -> List[PortfolioAllocatio
         rows = list(rows)
         session.expunge_all()
         return rows
+
+
+# ---------------------------------------------------------------------------
+# Account deletion
+# ---------------------------------------------------------------------------
+
+def delete_account_allocation_data(account_id: int) -> Dict[str, int]:
+    """Delete every allocation row of an account. Returns per-table delete counts.
+
+    The live DB runs with ``PRAGMA foreign_keys = 0``, so the ``ondelete="CASCADE"``
+    declared on these tables NEVER fires. Account deletion must call this
+    explicitly, exactly as the ``AccountSetting`` cleanup loop in
+    ``ui/pages/settings.py`` does. Skipping it strands five tables of rows on a
+    dead ``account_id`` -- and because ``portfolio_allocation_config.account_id`` is
+    UNIQUE, the next account to reuse that id would collide with the corpse.
+
+    The returned counts are the ONLY surviving record that this account ever
+    tracked income: deleting the events discards their ``consumed_amount``
+    history, which is right for a deletion but unrecoverable. Hence the log line.
+    """
+    counts: Dict[str, int] = {}
+    with get_db() as session:
+        for key, model in (("config", PortfolioAllocationConfig),
+                           ("labels", PortfolioAllocationLabel),
+                           ("symbols", PortfolioAllocationSymbol),
+                           ("income_events", PortfolioIncomeEvent),
+                           ("runs", PortfolioAllocationRun)):
+            rows = session.exec(select(model).where(model.account_id == account_id)).all()
+            for row in rows:
+                session.delete(row)
+            counts[key] = len(rows)
+        session.commit()
+    logger.info(f"Deleted portfolio allocation data for account {account_id}: {counts}")
+    return counts

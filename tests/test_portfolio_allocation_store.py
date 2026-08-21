@@ -365,3 +365,59 @@ def test_a_run_row_written_by_raw_sql_reads_back_with_null_json(account_id):
     assert row.plan_json is None
     assert row.order_ids is None
     assert row.net_buy_value == 0.0
+
+
+# --- account deletion cleanup ---------------------------------------------
+
+def test_deleting_account_allocation_data_removes_every_table_row(account_id):
+    from ba2_common.core.db import get_instance
+    from ba2_common.core.models import AccountDefinition
+    store.set_managed_label(account_id, "ARK26", target_pct=100.0)
+    store.set_symbol_weight(account_id, "ARK26", "TSLA", weight_pct=100.0)
+    store.upsert_income_event(account_id, "csd-1", date(2026, 8, 1), "DEPOSIT", 100.0)
+    store.record_allocation_run(account_id, "REBALANCE", {})
+    store.set_allocation_config(account_id, valuation_mode="market")
+    counts = store.delete_account_allocation_data(account_id)
+    assert counts == {"config": 1, "labels": 1, "symbols": 1, "income_events": 1, "runs": 1}
+    assert store.get_managed_labels(account_id) == []
+    assert store.get_symbol_rows(account_id, "ARK26") == {}
+    assert store.get_open_income_events(account_id) == []
+    assert store.get_recent_runs(account_id) == []
+    # The config row is gone, so the next read recreates it with the defaults.
+    assert store.get_allocation_config(account_id).valuation_mode == "cost"
+    # The parent AccountDefinition is still here: no FK cascade can have done ANY
+    # of the work above, because a cascade only fires on a parent delete.
+    assert get_instance(AccountDefinition, account_id).id == account_id
+
+
+def test_deleting_allocation_data_leaves_other_accounts_alone(account_id):
+    from tests.factories import create_account_definition
+    other = create_account_definition(name="Other Account")
+    store.set_managed_label(account_id, "ARK26", target_pct=100.0)
+    store.set_managed_label(other.id, "ARK26", target_pct=100.0)
+    store.delete_account_allocation_data(account_id)
+    assert [r.label for r in store.get_managed_labels(other.id)] == ["ARK26"]
+
+
+def test_the_declared_cascade_never_fires_so_cleanup_must_be_explicit(account_id):
+    """Why this helper has to exist.
+
+    Every allocation table declares ``ondelete="CASCADE"`` on ``account_id``, but
+    SQLite enforces foreign keys only under ``PRAGMA foreign_keys = ON`` and
+    NOTHING turns it on: ``ba2_common.core.db._build_engine`` sets journal_mode,
+    synchronous and busy_timeout only, and the test engine sets no pragmas at all,
+    so both run at SQLite's default of OFF. Deleting the parent AccountDefinition
+    therefore ORPHANS the allocation rows rather than removing them -- this test
+    pins that, so the day someone enables enforcement it fails loudly instead of
+    letting the cascade quietly stand in for the explicit delete.
+    """
+    from ba2_common.core.db import delete_instance, get_instance
+    from ba2_common.core.models import AccountDefinition
+    store.set_managed_label(account_id, "ARK26", target_pct=100.0)
+    store.set_allocation_config(account_id, valuation_mode="market")
+    delete_instance(get_instance(AccountDefinition, account_id))
+    # The cascade did NOT fire: the rows outlived the account they belong to.
+    assert [r.label for r in store.get_managed_labels(account_id)] == ["ARK26"]
+    counts = store.delete_account_allocation_data(account_id)
+    assert counts == {"config": 1, "labels": 1, "symbols": 0, "income_events": 0, "runs": 0}
+    assert store.get_managed_labels(account_id) == []

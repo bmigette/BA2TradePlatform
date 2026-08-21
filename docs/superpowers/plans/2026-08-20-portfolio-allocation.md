@@ -4536,6 +4536,12 @@ Foreign keys on these tables are declarative only: the live DB runs with
 otherwise orphan its allocation rows forever, and the next account to reuse that id would
 inherit them. Task 67 wires this helper into `ui/pages/settings.py:delete_account`.
 
+VERIFIED (2026-08-21) by querying each engine directly: `PRAGMA foreign_keys` returns `0` for
+the live file engine, for the `:memory:` backtest engine (both built by
+`ba2_common.core.db._build_engine`, which sets journal_mode/synchronous/busy_timeout and
+nothing else) AND for the `tests/conftest.py` engine (no pragmas at all). Enforcement is OFF
+everywhere, so no test in this task can be satisfied by a cascade.
+
 **Files:**
 - Modify: `packages/common/ba2_common/core/portfolio_allocation_store.py` (append)
 - Test: `tests/test_portfolio_allocation_store.py` (append)
@@ -4550,6 +4556,8 @@ Append to the end of `tests/test_portfolio_allocation_store.py`:
 # --- account deletion cleanup ---------------------------------------------
 
 def test_deleting_account_allocation_data_removes_every_table_row(account_id):
+    from ba2_common.core.db import get_instance
+    from ba2_common.core.models import AccountDefinition
     store.set_managed_label(account_id, "ARK26", target_pct=100.0)
     store.set_symbol_weight(account_id, "ARK26", "TSLA", weight_pct=100.0)
     store.upsert_income_event(account_id, "csd-1", date(2026, 8, 1), "DEPOSIT", 100.0)
@@ -4563,6 +4571,9 @@ def test_deleting_account_allocation_data_removes_every_table_row(account_id):
     assert store.get_recent_runs(account_id) == []
     # The config row is gone, so the next read recreates it with the defaults.
     assert store.get_allocation_config(account_id).valuation_mode == "cost"
+    # The parent AccountDefinition is still here: no FK cascade can have done ANY
+    # of the work above, because a cascade only fires on a parent delete.
+    assert get_instance(AccountDefinition, account_id).id == account_id
 
 
 def test_deleting_allocation_data_leaves_other_accounts_alone(account_id):
@@ -4572,6 +4583,30 @@ def test_deleting_allocation_data_leaves_other_accounts_alone(account_id):
     store.set_managed_label(other.id, "ARK26", target_pct=100.0)
     store.delete_account_allocation_data(account_id)
     assert [r.label for r in store.get_managed_labels(other.id)] == ["ARK26"]
+
+
+def test_the_declared_cascade_never_fires_so_cleanup_must_be_explicit(account_id):
+    """Why this helper has to exist.
+
+    Every allocation table declares ``ondelete="CASCADE"`` on ``account_id``, but
+    SQLite enforces foreign keys only under ``PRAGMA foreign_keys = ON`` and
+    NOTHING turns it on: ``ba2_common.core.db._build_engine`` sets journal_mode,
+    synchronous and busy_timeout only, and the test engine sets no pragmas at all,
+    so both run at SQLite's default of OFF. Deleting the parent AccountDefinition
+    therefore ORPHANS the allocation rows rather than removing them -- this test
+    pins that, so the day someone enables enforcement it fails loudly instead of
+    letting the cascade quietly stand in for the explicit delete.
+    """
+    from ba2_common.core.db import delete_instance, get_instance
+    from ba2_common.core.models import AccountDefinition
+    store.set_managed_label(account_id, "ARK26", target_pct=100.0)
+    store.set_allocation_config(account_id, valuation_mode="market")
+    delete_instance(get_instance(AccountDefinition, account_id))
+    # The cascade did NOT fire: the rows outlived the account they belong to.
+    assert [r.label for r in store.get_managed_labels(account_id)] == ["ARK26"]
+    counts = store.delete_account_allocation_data(account_id)
+    assert counts == {"config": 1, "labels": 1, "symbols": 0, "income_events": 0, "runs": 0}
+    assert store.get_managed_labels(account_id) == []
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -4586,13 +4621,23 @@ Append to the end of `packages/common/ba2_common/core/portfolio_allocation_store
 ```python
 
 
+# ---------------------------------------------------------------------------
+# Account deletion
+# ---------------------------------------------------------------------------
+
 def delete_account_allocation_data(account_id: int) -> Dict[str, int]:
     """Delete every allocation row of an account. Returns per-table delete counts.
 
     The live DB runs with ``PRAGMA foreign_keys = 0``, so the ``ondelete="CASCADE"``
     declared on these tables NEVER fires. Account deletion must call this
     explicitly, exactly as the ``AccountSetting`` cleanup loop in
-    ``ui/pages/settings.py`` does.
+    ``ui/pages/settings.py`` does. Skipping it strands five tables of rows on a
+    dead ``account_id`` -- and because ``portfolio_allocation_config.account_id`` is
+    UNIQUE, the next account to reuse that id would collide with the corpse.
+
+    The returned counts are the ONLY surviving record that this account ever
+    tracked income: deleting the events discards their ``consumed_amount``
+    history, which is right for a deletion but unrecoverable. Hence the log line.
     """
     counts: Dict[str, int] = {}
     with get_db() as session:
@@ -4613,7 +4658,7 @@ def delete_account_allocation_data(account_id: int) -> Dict[str, int]:
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `venv/bin/python -m pytest tests/test_portfolio_allocation_store.py -v`
-Expected: PASS — `41 passed`
+Expected: PASS — `49 passed`
 
 Then re-run the other two files in this section to confirm nothing regressed:
 
@@ -4622,7 +4667,7 @@ venv/bin/python -m pytest tests/test_portfolio_allocation_models.py -v
 venv/bin/python -m pytest tests/test_portfolio_allocation_migration.py -v
 ```
 
-Expected: `12 passed` and `14 passed`.
+Expected: `12 passed` and `15 passed`.
 
 - [ ] **Step 5: Commit**
 
