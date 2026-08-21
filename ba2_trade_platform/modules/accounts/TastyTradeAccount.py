@@ -17,7 +17,11 @@ from ...core.db import add_instance, get_db, get_instance, update_instance, Inst
 from ...core.models import Position, TradingOrder
 from ...core.types import OrderDirection, OrderStatus
 from ...core.types import OrderType as CoreOrderType
-from ...core.account_types import OrderImpact
+from ...core.account_types import (
+    AccountSnapshot, CashTransfer, MarginInfo, OrderImpact,
+    CASH_TRANSFER_DEPOSIT, CASH_TRANSFER_DIVIDEND, CASH_TRANSFER_WITHDRAWAL,
+    MARGIN_SOURCE_DEFAULT, MARGIN_SOURCE_POSITION,
+)
 from ...core.interfaces import AccountInterface
 from ...core.models import Transaction
 
@@ -219,6 +223,74 @@ class TastyTradeAccount(AccountInterface):
         except Exception as e:
             logger.error(f"[Account {self.id}] Error getting account info: {e}", exc_info=True)
             return {}
+
+    def _is_margin_account(self) -> bool:
+        """Whether this is a Reg-T margin account (``Account.margin_or_cash``)."""
+        return str(getattr(self._account, "margin_or_cash", "") or "").strip().lower() == "margin"
+
+    def get_account_snapshot(self) -> AccountSnapshot:
+        """Broker-agnostic cash / equity / buying-power view of this account.
+
+        Overrides the base tolerant probe: TastyTrade returns a typed AccountBalance,
+        so every field is read directly.
+
+        Never fabricates a number -- a field TastyTrade did not supply stays ``None``,
+        and a failed fetch returns an ALL-NONE snapshot, which is a legitimate "the
+        broker told us nothing" result the caller must refuse to plan on. Zeros would
+        be indistinguishable from a real flat account.
+
+        ``margin_multiplier`` is the Reg-T leverage the allocation engine uses as its
+        conservative ``default_bp_factor``: 2.0 for a margin account, 1.0 for cash.
+        """
+        if not self._check_authentication():
+            return AccountSnapshot()
+        try:
+            balances = self._run_async(self._account.get_balances(self._session))
+        except Exception as e:
+            logger.error(f"[Account {self.id}] Error getting account snapshot: {e}", exc_info=True)
+            return AccountSnapshot()
+
+        def _num(name):
+            value = getattr(balances, name, None)
+            if value is None:
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        is_margin = self._is_margin_account()
+        net_liquidation = _num("net_liquidating_value")
+        return AccountSnapshot(
+            cash=_num("cash_balance"),
+            equity=net_liquidation,
+            net_liquidation=net_liquidation,
+            buying_power=_num("equity_buying_power"),
+            non_marginable_buying_power=_num("cash_available_to_withdraw"),
+            margin_multiplier=2.0 if is_margin else 1.0,
+            is_margin_account=is_margin,
+            long_market_value=_num("long_equity_value"),
+            # NEGATED ON PURPOSE. AccountSnapshot pins short_market_value as NEGATIVE
+            # while shorts are held (the Alpaca convention), but TastyTrade's
+            # short-equity-value is a POSITIVE MAGNITUDE. Passing it through unchanged
+            # makes gross exposure broker-dependent: long + abs(short) and long - short
+            # disagree, and no fixture with a zero short can tell the difference.
+            short_market_value=(
+                -_num("short_equity_value")
+                if _num("short_equity_value") is not None
+                else None
+            ),
+            # TastyTrade's pending_cash is SIGNED (positive = incoming); it is reported
+            # as-is rather than clamped, so the caller sees what the broker said.
+            pending_transfer_in=_num("pending_cash"),
+            supports_fractional=True,
+            raw={
+                "margin_equity": _num("margin_equity"),
+                "maintenance_requirement": _num("maintenance_requirement"),
+                "derivative_buying_power": _num("derivative_buying_power"),
+                "margin_or_cash": getattr(self._account, "margin_or_cash", None),
+            },
+        )
 
     def get_positions(self) -> Optional[List[Position]]:
         """Current EQUITY positions.

@@ -1016,3 +1016,76 @@ def test_preview_order_impact_returns_none_when_the_preview_call_fails():
     with patch("tastytrade.instruments.Equity.get",
                new=AsyncMock(return_value=_FakeEquity("AAPL"))):
         assert acct.preview_order_impact(order) is None
+
+
+# ---------------------------------------------------------------------------
+# get_account_snapshot
+# ---------------------------------------------------------------------------
+
+def test_account_snapshot_maps_a_margin_account():
+    acct = _bare_account()
+    acct._account.margin_or_cash = "Margin"
+    acct._account.get_balances = AsyncMock(return_value=_balances())
+
+    snapshot = acct.get_account_snapshot()
+
+    assert snapshot.cash == 25000.0
+    assert snapshot.buying_power == 50000.0
+    assert snapshot.net_liquidation == 100000.0
+    assert snapshot.equity == 100000.0
+    assert snapshot.long_market_value == 75000.0
+    assert snapshot.is_margin_account is True
+    assert snapshot.margin_multiplier == 2.0
+
+
+def test_account_snapshot_of_a_cash_account_has_no_leverage():
+    acct = _bare_account()
+    acct._account.margin_or_cash = "Cash"
+    acct._account.get_balances = AsyncMock(return_value=_balances())
+
+    snapshot = acct.get_account_snapshot()
+
+    assert snapshot.is_margin_account is False
+    assert snapshot.margin_multiplier == 1.0
+
+
+def test_account_snapshot_negates_tastytrades_positive_short_magnitude():
+    """AccountSnapshot pins short_market_value as NEGATIVE while shorts are held
+    (the Alpaca convention), but TastyTrade reports short-equity-value as a POSITIVE
+    magnitude. If the adapter passes it through, gross exposure becomes
+    broker-dependent — and every other fixture here uses a zero short, which is
+    sign-agnostic and would never catch it."""
+    acct = _bare_account()
+    acct._account.margin_or_cash = "Margin"
+    balances = _balances()
+    balances.short_equity_value = Decimal("12000")
+    acct._account.get_balances = AsyncMock(return_value=balances)
+
+    snapshot = acct.get_account_snapshot()
+
+    assert snapshot.short_market_value == -12000.0
+
+
+def test_account_snapshot_leaves_an_absent_short_value_as_none():
+    """None means 'the broker did not say', which must not be negated into -0.0."""
+    acct = _bare_account()
+    balances = _balances()
+    balances.short_equity_value = None
+    acct._account.get_balances = AsyncMock(return_value=balances)
+
+    snapshot = acct.get_account_snapshot()
+
+    assert snapshot.short_market_value is None
+
+
+def test_account_snapshot_on_failure_is_all_none_not_zeros():
+    """An all-None snapshot is a legitimate 'the broker told us nothing'. Zeros would
+    be a fabricated balance, which the caller cannot distinguish from a real one."""
+    acct = _bare_account()
+    acct._account.get_balances = AsyncMock(side_effect=RuntimeError("gateway timeout"))
+
+    snapshot = acct.get_account_snapshot()
+
+    assert snapshot.cash is None
+    assert snapshot.buying_power is None
+    assert snapshot.net_liquidation is None
