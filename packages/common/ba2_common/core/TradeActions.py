@@ -101,19 +101,55 @@ class TradeAction(ABC):
         """
         Get current position quantity for the instrument.
 
+        Same tri-state contract as ``TradeConditions.TradeCondition.get_current_position``
+        (see there for the full rationale and the 2026-07-03 incident): ``None`` means
+        ONLY "the fetch succeeded and this instrument is not held". An unverified book
+        raises instead, because the two must not share a value.
+
+        The consumers here (``SellAction``, ``CloseAction``) already fail CLOSED on
+        ``None``, so the old swallow was misleading rather than money-losing: an outage
+        produced "No long position to sell for AAPL", a confident claim about a book
+        nobody managed to read.
+
         Returns:
-            Position quantity (positive for long, negative for short, None if no position)
+            Position quantity (positive long / negative short), or ``None`` when the
+            fetch SUCCEEDED and this instrument is not held.
+
+        Raises:
+            PositionFetchFailed: the position book is UNVERIFIED.
         """
+        from ba2_common.core.portfolio_allocation import PositionFetchFailed
+
         try:
             positions = self.account.get_positions()
-            for position in positions:
-                if hasattr(position, 'symbol') and position.symbol == self.instrument_name:
-                    return getattr(position, 'qty', None)
-            return None
         except Exception as e:
-            absorb_if_benign(e, InstanceNotFound)
-            logger.error(f"Error getting current position for {self.instrument_name}: {e}", exc_info=True)
-            return None
+            # See TradeConditions: a transport failure is a genuine runtime condition at
+            # this site; a defect still propagates under BA2_ERROR_MODE=enforce.
+            absorb_if_benign(e, InstanceNotFound, OSError)
+            logger.error(
+                f"Position fetch RAISED for {self.instrument_name}: {e} — the account's "
+                f"position book is unverified", exc_info=True)
+            raise PositionFetchFailed(
+                f"get_positions() raised while checking {self.instrument_name}: {e}") from e
+
+        if positions is None:
+            logger.error(
+                f"Position fetch FAILED for {self.instrument_name}: "
+                f"{type(self.account).__name__}.get_positions() returned None "
+                f"(fetch failure, NOT a flat account)")
+            raise PositionFetchFailed(
+                f"get_positions() returned None while checking {self.instrument_name}")
+
+        for position in positions:
+            # Dict-shaped books were silently skipped by the old `hasattr(position,
+            # 'symbol')` test, which then answered "no position".
+            if isinstance(position, dict):
+                symbol, qty = position.get('symbol'), position.get('qty')
+            else:
+                symbol, qty = getattr(position, 'symbol', None), getattr(position, 'qty', None)
+            if symbol == self.instrument_name:
+                return qty
+        return None
 
     def get_expert_position(self) -> Optional[float]:
         """
@@ -380,9 +416,23 @@ class SellAction(TradeAction):
         Returns:
             TradeActionResult object containing execution results
         """
+        from ba2_common.core.portfolio_allocation import PositionFetchFailed
+
         try:
             # Get current position to validate we can sell
-            current_position = self.get_current_position()
+            try:
+                current_position = self.get_current_position()
+            except PositionFetchFailed as e:
+                # Refuse, exactly as for a confirmed-flat book — but SAY which one it was.
+                # "No long position to sell" would be a claim about a book nobody read.
+                logger.error(f"SellAction refusing {self.instrument_name}: {e}")
+                return self.create_and_save_action_result(
+                    action_type=ExpertActionType.SELL.value,
+                    success=False,
+                    message=(f"Position book unverified for {self.instrument_name} "
+                             f"(broker position fetch failed) - refusing to sell"),
+                    data={"position_fetch_failed": True}
+                )
             if current_position is None or current_position <= 0:
                 return self.create_and_save_action_result(
                     action_type=ExpertActionType.SELL.value,
@@ -390,7 +440,7 @@ class SellAction(TradeAction):
                     message=f"No long position to sell for {self.instrument_name}",
                     data={}
                 )
-            
+
             # Create PENDING order record with quantity=0 (to be set by risk management)
             # Risk management will determine the actual quantity to sell
             order_id = self.create_order_record(
@@ -570,7 +620,19 @@ class CloseAction(TradeAction):
                 )
 
             # Fallback: no transaction context — use broker position (legacy path)
-            current_position = self.get_current_position()
+            from ba2_common.core.portfolio_allocation import PositionFetchFailed
+            try:
+                current_position = self.get_current_position()
+            except PositionFetchFailed as e:
+                # Refuse, as for a confirmed-flat book — but do not claim the book is empty.
+                logger.error(f"CloseAction refusing {self.instrument_name}: {e}")
+                return self.create_and_save_action_result(
+                    action_type=ExpertActionType.CLOSE.value,
+                    success=False,
+                    message=(f"Position book unverified for {self.instrument_name} "
+                             f"(broker position fetch failed) - refusing to close"),
+                    data={"position_fetch_failed": True}
+                )
             if current_position is None or current_position == 0:
                 return self.create_and_save_action_result(
                     action_type=ExpertActionType.CLOSE.value,
