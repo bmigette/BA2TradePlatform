@@ -82,6 +82,11 @@ __all__ = [
     "apply_order_impacts", "consume_income_events",
     "tradeable_unit", "size_sub_unit_target", "projected_value", "allocated_value",
     "redistribute_label_residuals",
+    # mixed eligibility, bumps and redistribution, surfaced for the dry run
+    "fractional_summary", "no_order_rows", "whole_share_notice", "no_order_notice",
+    "bump_notice", "redistribution_notice",
+    "WHOLE_SHARE_NOTICE_FMT", "WHOLE_SHARE_NOTICE_OFF_FMT", "NO_ORDER_NOTICE_FMT",
+    "BUMP_NOTICE_FMT", "REDISTRIBUTION_NOTICE_FMT",
     # submission
     "ACTION_ADJUST", "ACTION_CLOSE", "ACTION_NEW", "ACTION_SKIP",
     "decide_symbol_action", "split_delta_fifo",
@@ -1756,11 +1761,15 @@ def dry_run_rows(plan: "AllocationPlan") -> List[Dict[str, Any]]:
     ``sized_fractional`` and the reason string carry the story instead.
     """
     available = float(plan.available_buying_power or 0.0)
+    base = float(plan.base_notional or 0.0)
+    mode = plan.valuation_mode
+    basis = plan.allocation_basis
     out: List[Dict[str, Any]] = []
     for row in plan.rows:
         suppressed = _is_suppressed_row(row)
         if not suppressed and (row.side is None or row.delta_quantity == 0):
             continue
+        projected = allocated_value(row, mode, basis)
         out.append({
             "symbol": row.symbol,
             "side": row.side.value if row.side is not None else "",
@@ -1770,6 +1779,26 @@ def dry_run_rows(plan: "AllocationPlan") -> List[Dict[str, Any]]:
             "bp_cost": round(row.bp_cost, 2),
             "bp_usage_pct": (round(row.bp_cost / available * 100.0, 2)
                              if available > 0 else 0.0),
+            # SIZING MODE, not "does the number have a decimal part": at ~25%
+            # ineligibility this column is the one the user scans.
+            "sizing": "fractional" if row.fractional else "whole",
+            # WHICH RULE produced the quantity -- a bumped row holds MORE than the
+            # weights asked for, and that must never be silent.
+            "outcome": row.sizing_outcome,
+            "redistributed": bool(row.redistributed),
+            "target_notional": round(row.target_notional, 2),
+            # Already reflects whole-share rounding, the bump and the redistribution:
+            # what is displayed is what will be owned.
+            "projected_notional": None if projected is None else round(projected, 2),
+            "residual_notional": (None if projected is None
+                                  else round(row.target_notional - projected, 2)),
+            # The weight the user TYPED and the weight the plan will really use. They
+            # differ whenever the grid, a bump or redistribution moved the row, and
+            # showing both is what makes moving it acceptable.
+            "weight_pct": round(row.target_notional / base * 100.0, 3) if base > 0 else 0.0,
+            "projected_weight_pct": (round(projected / base * 100.0, 3)
+                                     if base > 0 and projected is not None else 0.0),
+            "unmet_notional": round(float(row.unmet_notional or 0.0), 2),
             "reasons": ", ".join(row.reasons),
             "fractional": _is_fractional_quantity(row.delta_quantity),
             "sized_fractional": bool(row.fractional),
@@ -2443,3 +2472,191 @@ def redistribute_label_residuals(plan: "AllocationPlan",
         # Otherwise the leftover is under one tradeable unit of every absorber:
         # pure arithmetic, reported as money by fractional_summary, not as a fault.
     return out
+
+
+# ---------------------------------------------------------------------------
+# Reporting. About a quarter of a real book is not fractionable, the engine bumps
+# some rows up and redistributes others, and every one of those decisions has to
+# reach the screen. Pure: text and numbers, no styling, no widgets.
+# ---------------------------------------------------------------------------
+
+#: Shown when fractional is ON but some symbols could not use it.
+WHOLE_SHARE_NOTICE_FMT = (
+    "{count} of {total} symbols cannot trade fractionally ({pct:.0f}%) - their orders "
+    "round to whole shares, leaving the plan {residual:,.2f} off target. The "
+    "Projected columns already reflect this.")
+#: Shown when the fractional toggle itself is off -- every row rounds down.
+WHOLE_SHARE_NOTICE_OFF_FMT = (
+    "Fractional shares are OFF - every order rounds to whole shares, leaving the "
+    "plan {residual:,.2f} off target. The Projected columns already reflect this.")
+#: Shown when at least one symbol was BUMPED UP to one whole share. This is the plan
+#: spending more than the weights asked for, so it is stated as money, up front.
+BUMP_NOTICE_FMT = (
+    "{count} symbol(s) had a target smaller than one whole share and were BUMPED UP "
+    "to one, so they get a position at all - that over-allocates them by {total:,.2f} "
+    "in total. Marked 'bumped-to-1' in the Outcome column.")
+#: Shown when at least one symbol gets no order at all.
+NO_ORDER_NOTICE_FMT = (
+    "{count} symbol(s) get NO order at all, leaving {total:,.2f} unallocated - see "
+    "'Not traded' below. One whole share of each would be more than {limit:.0f}% of "
+    "its target, so buying one is a different trade, not a rounding fix.")
+#: Shown when redistribution moved a row off the quantity the weights implied.
+REDISTRIBUTION_NOTICE_FMT = (
+    "{count} symbol(s) had their share count adjusted so their label still hits its "
+    "total after rounding. The Weight columns show what you asked for and what the "
+    "plan will actually hold.")
+
+
+def fractional_summary(plan: "AllocationPlan") -> Dict[str, Any]:
+    """How the plan's rows were SIZED, and what the sizing rules cost. Pure.
+
+    Rows with no usable price are excluded from every count and from the residual:
+    their whole target is already reported through ``plan.unallocatable_pct``, and
+    counting it here too would double the money the dry run calls unallocated.
+
+    ``residual_notional`` is ``sum(target_notional - allocated_value)`` over the
+    priced rows: SIGNED, so a bump's over-allocation nets against a rounding
+    shortfall, which is what "how far off target will I be" actually means.
+
+    ``unknown_rows`` counts rows carrying ``REASON_FRACTIONAL_UNKNOWN`` -- exactly
+    the rows where the broker published no eligibility answer (no ``MarginInfo`` at
+    all, or ``fractionable is None``). With the fractional toggle OFF no eligibility
+    reason is appended at all and this is 0, correctly: nothing was consulted.
+
+    Returns:
+        Dict[str, Any]: ``allow_fractional``, ``total_rows``, ``fractional_rows``,
+        ``whole_share_rows``, ``unknown_rows``, ``whole_share_symbols`` (sorted),
+        ``whole_share_pct``, ``target_notional``, ``projected_notional``,
+        ``residual_notional``, ``residual_pct`` (of ``base_notional``),
+        ``no_order_rows``, ``no_order_notional``, ``bumped_rows``,
+        ``bumped_notional`` (the deliberate over-allocation),
+        ``skipped_too_large_rows`` and ``redistributed_rows``.
+    """
+    mode = plan.valuation_mode
+    basis = plan.allocation_basis
+    priced = [r for r in plan.rows if r.price is not None and r.price > 0]
+    total = len(priced)
+    whole = [r for r in priced if not r.fractional]
+    unknown = [r for r in priced if REASON_FRACTIONAL_UNKNOWN in r.reasons]
+    bumped = [r for r in priced if r.sizing_outcome == SIZING_OUTCOME_BUMPED]
+    too_large = [r for r in priced if r.sizing_outcome == SIZING_OUTCOME_SKIPPED_TOO_LARGE]
+
+    target_total = sum(float(r.target_notional or 0.0) for r in priced)
+    projected_total = 0.0
+    bumped_over = 0.0
+    for r in priced:
+        value = allocated_value(r, mode, basis)
+        if value is None:
+            continue
+        projected_total += value
+        if r.sizing_outcome == SIZING_OUTCOME_BUMPED:
+            bumped_over += max(0.0, value - float(r.target_notional or 0.0))
+
+    dropped = [r for r in plan.rows if float(r.unmet_notional or 0.0) > MONEY_EPSILON]
+    base = float(plan.base_notional or 0.0)
+    residual = target_total - projected_total
+
+    return {
+        "allow_fractional": bool(plan.allow_fractional),
+        "total_rows": total,
+        "fractional_rows": len([r for r in priced if r.fractional]),
+        "whole_share_rows": len(whole),
+        "unknown_rows": len(unknown),
+        "whole_share_symbols": sorted(r.symbol for r in whole),
+        "whole_share_pct": (len(whole) / total * 100.0) if total else 0.0,
+        "target_notional": target_total,
+        "projected_notional": projected_total,
+        "residual_notional": residual,
+        "residual_pct": (residual / base * 100.0) if base > 0 else 0.0,
+        "no_order_rows": len(dropped),
+        "no_order_notional": sum(float(r.unmet_notional or 0.0) for r in dropped),
+        "bumped_rows": len(bumped),
+        "bumped_notional": bumped_over,
+        "skipped_too_large_rows": len(too_large),
+        "redistributed_rows": len([r for r in plan.rows if r.redistributed]),
+    }
+
+
+def no_order_rows(plan: "AllocationPlan") -> List[Dict[str, Any]]:
+    """One display dict per row the plan wanted to trade and could NOT, biggest first.
+
+    The DETAIL view for the money. ``dry_run_rows`` lists what will be SENT, so on
+    one of these rows its quantity, side and value columns are all blank -- there is
+    no order to describe. This says what was WANTED instead: the target, the weight
+    it came from, what will actually be held, and how much never left the cash.
+
+    Selected by ``unmet_notional``, so the reason strings never have to be
+    pattern-matched: whatever zeroed the row -- the bump bound, the tradeable grid,
+    the broker minimum, buying-power scaling, a precheck rejection -- set that field.
+    """
+    mode = plan.valuation_mode
+    basis = plan.allocation_basis
+    base = float(plan.base_notional or 0.0)
+    out: List[Dict[str, Any]] = []
+    for row in plan.rows:
+        if float(row.unmet_notional or 0.0) <= MONEY_EPSILON:
+            continue
+        projected = allocated_value(row, mode, basis)
+        out.append({
+            "symbol": row.symbol,
+            "price": row.price,
+            "current_quantity": row.current_quantity,
+            "outcome": row.sizing_outcome,
+            "target_notional": round(row.target_notional, 2),
+            "weight_pct": round(row.target_notional / base * 100.0, 3) if base > 0 else 0.0,
+            "projected_notional": None if projected is None else round(projected, 2),
+            "unmet_notional": round(float(row.unmet_notional), 2),
+            "reasons": ", ".join(row.reasons),
+        })
+    return sorted(out, key=lambda d: d["unmet_notional"], reverse=True)
+
+
+def whole_share_notice(summary: Dict[str, Any]) -> Optional[str]:
+    """The prominent whole-share warning for the dry run, or ``None`` if there is none.
+
+    ``None`` means every priced row was sized on the fractional grid, so there is
+    nothing to warn about. Text only: the caller picks the banner styling.
+    """
+    if summary["whole_share_rows"] <= 0:
+        return None
+    if not summary["allow_fractional"]:
+        return WHOLE_SHARE_NOTICE_OFF_FMT.format(residual=summary["residual_notional"])
+    return WHOLE_SHARE_NOTICE_FMT.format(
+        count=summary["whole_share_rows"],
+        total=summary["total_rows"],
+        pct=summary["whole_share_pct"],
+        residual=summary["residual_notional"])
+
+
+def bump_notice(summary: Dict[str, Any]) -> Optional[str]:
+    """The "we are spending more than you asked" warning, or ``None``.
+
+    A bump is a deliberate over-allocation taken so that a symbol gets a position at
+    all. It is the one thing in this plan that spends money the weights did not ask
+    for, so it gets its own sentence with its own number.
+    """
+    if summary["bumped_rows"] <= 0:
+        return None
+    return BUMP_NOTICE_FMT.format(count=summary["bumped_rows"],
+                                  total=summary["bumped_notional"])
+
+
+def no_order_notice(summary: Dict[str, Any]) -> Optional[str]:
+    """The "some symbols get nothing" warning, or ``None`` when every row trades."""
+    if summary["no_order_rows"] <= 0:
+        return None
+    return NO_ORDER_NOTICE_FMT.format(count=summary["no_order_rows"],
+                                      total=summary["no_order_notional"],
+                                      limit=BUMP_TO_ONE_SHARE_MAX_MULTIPLE * 100.0)
+
+
+def redistribution_notice(summary: Dict[str, Any]) -> Optional[str]:
+    """The "your weights moved" warning, or ``None`` when none of them did.
+
+    Redistribution is allowed to change a quantity the user's weights implied ONLY
+    because the change is shown. This sentence, plus the Weight columns, is that
+    showing.
+    """
+    if summary["redistributed_rows"] <= 0:
+        return None
+    return REDISTRIBUTION_NOTICE_FMT.format(count=summary["redistributed_rows"])

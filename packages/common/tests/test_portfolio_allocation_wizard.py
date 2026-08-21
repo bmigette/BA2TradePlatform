@@ -679,3 +679,263 @@ def test_plan_quantity_attempts_offers_at_most_one_retry():
 
 def test_plan_quantity_attempts_of_zero_has_nothing_to_attempt():
     assert plan_quantity_attempts(0.0, allow_fractional=True, fractionable=True) == []
+
+
+# ---------------------------------------------------------------------------
+# Mixed fractional eligibility, bumps and redistribution: what the dry run shows
+# ---------------------------------------------------------------------------
+from ba2_common.core import portfolio_allocation as pa
+from ba2_common.core.portfolio_allocation import (
+    bump_notice,
+    fractional_summary,
+    no_order_notice,
+    no_order_rows,
+    redistribution_notice,
+    whole_share_notice,
+)
+
+
+def _mixed_eligibility_plan():
+    """One fractional buy, one whole-share buy, one bumped row, one refused row."""
+    return AllocationPlan(
+        rows=[
+            AllocationRow(symbol="AAPL", price=160.0, current_quantity=0.0,
+                          target_notional=1_600.0, target_quantity=10.0,
+                          delta_quantity=10.0, side=OrderDirection.BUY,
+                          estimated_value=1_600.0, bp_cost=1_600.0, bp_factor=1.0,
+                          fractional=True, redistributed=True,
+                          reasons=["fractional",
+                                   "weight adjusted +9.0000 -> +10.0000 shares to "
+                                   "keep label 'A' on target"]),
+            AllocationRow(symbol="MSFT", price=400.0, current_quantity=0.0,
+                          target_notional=1_000.0, target_quantity=2.0,
+                          delta_quantity=2.0, side=OrderDirection.BUY,
+                          estimated_value=800.0, bp_cost=800.0, bp_factor=1.0,
+                          fractional=False, reasons=["rounded down to whole shares"]),
+            AllocationRow(symbol="BUMPY", price=300.0, current_quantity=0.0,
+                          target_notional=200.0, target_quantity=1.0,
+                          delta_quantity=1.0, side=OrderDirection.BUY,
+                          estimated_value=300.0, bp_cost=300.0, bp_factor=1.0,
+                          fractional=False,
+                          sizing_outcome=pa.SIZING_OUTCOME_BUMPED,
+                          reasons=["target 200.00 buys 0.6667 shares at 300.00 - "
+                                   "BUMPED UP to 1 share(s), 150% of target"]),
+            AllocationRow(symbol="BRKA", price=650_000.0, current_quantity=0.0,
+                          target_notional=260_000.0, target_quantity=0.0,
+                          delta_quantity=0.0, side=None, unmet_notional=260_000.0,
+                          fractional=False,
+                          sizing_outcome=pa.SIZING_OUTCOME_SKIPPED_TOO_LARGE,
+                          reasons=["target 260,000.00 buys 0.4000 shares at "
+                                   "650,000.00 - no order; the smallest tradeable "
+                                   "order is 1 share(s), 250% of target, over the "
+                                   "150% bump limit"]),
+        ],
+        base_notional=262_800.0,
+        available_buying_power=300_000.0,
+        allow_fractional=True,
+        valuation_mode=VALUATION_MODE_MARKET,
+    )
+
+
+def test_fractional_summary_counts_fractional_and_whole_share_rows():
+    summary = fractional_summary(_mixed_eligibility_plan())
+    assert summary["total_rows"] == 4
+    assert summary["fractional_rows"] == 1
+    assert summary["whole_share_rows"] == 3
+    assert summary["whole_share_symbols"] == ["BRKA", "BUMPY", "MSFT"]
+    assert summary["whole_share_pct"] == pytest.approx(75.0)
+
+
+def test_fractional_summary_residual_is_the_money_the_plan_is_off_target():
+    """MSFT wants 1,000 and gets 800; BRKA wants 260,000 and gets nothing; BUMPY
+    wants 200 and gets 300. The residual is SIGNED and nets them."""
+    summary = fractional_summary(_mixed_eligibility_plan())
+    assert summary["target_notional"] == pytest.approx(262_800.0)
+    assert summary["projected_notional"] == pytest.approx(2_700.0)
+    assert summary["residual_notional"] == pytest.approx(260_100.0)
+
+
+def test_fractional_summary_counts_the_bumps_and_prices_the_over_allocation():
+    summary = fractional_summary(_mixed_eligibility_plan())
+    assert summary["bumped_rows"] == 1
+    assert summary["bumped_notional"] == pytest.approx(100.0)
+    assert summary["skipped_too_large_rows"] == 1
+
+
+def test_fractional_summary_counts_the_rows_redistribution_moved():
+    assert fractional_summary(_mixed_eligibility_plan())["redistributed_rows"] == 1
+
+
+def test_fractional_summary_counts_the_rows_with_no_order_and_their_money():
+    summary = fractional_summary(_mixed_eligibility_plan())
+    assert summary["no_order_rows"] == 1
+    assert summary["no_order_notional"] == pytest.approx(260_000.0)
+
+
+def test_fractional_summary_counts_unknown_eligibility_separately():
+    plan = _mixed_eligibility_plan()
+    plan.rows[1].reasons = [pa.REASON_FRACTIONAL_UNKNOWN]
+    assert fractional_summary(plan)["unknown_rows"] == 1
+
+
+def test_fractional_summary_ignores_a_row_with_no_price():
+    """Its whole target is already reported through unallocatable_pct; counting it
+    here too would double the money the dry run calls unallocated."""
+    plan = _mixed_eligibility_plan()
+    plan.rows.append(AllocationRow(symbol="NOPRICE", price=None, skipped=True,
+                                   target_notional=5_000.0))
+    summary = fractional_summary(plan)
+    assert summary["total_rows"] == 4
+    assert summary["target_notional"] == pytest.approx(262_800.0)
+
+
+def test_whole_share_notice_names_the_count_and_the_residual():
+    notice = whole_share_notice(fractional_summary(_mixed_eligibility_plan()))
+    assert "3 of 4" in notice
+    assert "260,100.00" in notice
+
+
+def test_whole_share_notice_is_none_when_every_row_is_fractional():
+    plan = _mixed_eligibility_plan()
+    plan.rows = [plan.rows[0]]
+    assert whole_share_notice(fractional_summary(plan)) is None
+
+
+def test_whole_share_notice_says_fractional_is_off_when_the_toggle_is_off():
+    plan = _mixed_eligibility_plan()
+    plan.allow_fractional = False
+    for row in plan.rows:
+        row.fractional = False
+    notice = whole_share_notice(fractional_summary(plan))
+    assert notice.startswith("Fractional shares are OFF")
+
+
+def test_bump_notice_names_the_over_allocation_it_is_asking_permission_for():
+    notice = bump_notice(fractional_summary(_mixed_eligibility_plan()))
+    assert "1 symbol" in notice
+    assert "100.00" in notice
+    assert "over-allocat" in notice
+
+
+def test_bump_notice_is_none_when_nothing_was_bumped():
+    plan = _mixed_eligibility_plan()
+    plan.rows[2].sizing_outcome = pa.SIZING_OUTCOME_NORMAL
+    assert bump_notice(fractional_summary(plan)) is None
+
+
+def test_no_order_notice_names_the_count_the_money_and_the_bump_limit():
+    notice = no_order_notice(fractional_summary(_mixed_eligibility_plan()))
+    assert "1 symbol" in notice
+    assert "260,000.00" in notice
+    assert "150%" in notice
+
+
+def test_redistribution_notice_tells_the_user_their_weights_moved():
+    notice = redistribution_notice(fractional_summary(_mixed_eligibility_plan()))
+    assert "1 symbol" in notice
+    assert "Weight" in notice
+
+
+def test_redistribution_notice_is_none_when_nothing_moved():
+    plan = _mixed_eligibility_plan()
+    plan.rows[0].redistributed = False
+    assert redistribution_notice(fractional_summary(plan)) is None
+
+
+def test_no_order_rows_carries_the_money_the_main_table_cannot_show():
+    """The main table lists what will be SENT; a refused row has no quantity, no
+    side and no value to put in those columns. ``no_order_rows`` is the detail
+    view: what was wanted, what will be held, and how much never left the cash.
+    Selected by ``unmet_notional``, so no reason string is ever pattern-matched."""
+    plan = _mixed_eligibility_plan()
+    dropped = no_order_rows(plan)
+    assert [r["symbol"] for r in dropped] == ["BRKA"]
+    assert dropped[0]["unmet_notional"] == pytest.approx(260_000.0)
+    assert dropped[0]["outcome"] == "skipped-too-large"
+    assert dropped[0]["target_notional"] == pytest.approx(260_000.0)
+    assert "over the 150% bump limit" in dropped[0]["reasons"]
+    # And it is NOT lost from the review screen either: the table still lists it,
+    # marked as carrying no order.
+    table = {r["symbol"]: r for r in dry_run_rows(plan)}
+    assert table["BRKA"]["suppressed"] is True
+    assert table["BRKA"]["side"] == ""
+
+
+def test_no_order_rows_are_biggest_first():
+    plan = _mixed_eligibility_plan()
+    plan.rows[1].delta_quantity = 0.0
+    plan.rows[1].side = None
+    plan.rows[1].unmet_notional = 1_000.0
+    assert [r["symbol"] for r in no_order_rows(plan)] == ["BRKA", "MSFT"]
+
+
+def test_dry_run_rows_report_the_sizing_mode_and_the_outcome_per_symbol():
+    rows = {r["symbol"]: r for r in dry_run_rows(_mixed_eligibility_plan())}
+    assert rows["AAPL"]["sizing"] == "fractional"
+    assert rows["MSFT"]["sizing"] == "whole"
+    assert rows["MSFT"]["outcome"] == "normal"
+    assert rows["BUMPY"]["outcome"] == "bumped-to-1"
+    assert rows["AAPL"]["redistributed"] is True
+
+
+def test_dry_run_rows_carry_the_target_the_projection_and_the_residual():
+    rows = {r["symbol"]: r for r in dry_run_rows(_mixed_eligibility_plan())}
+    assert rows["MSFT"]["target_notional"] == pytest.approx(1_000.0)
+    assert rows["MSFT"]["projected_notional"] == pytest.approx(800.0)
+    assert rows["MSFT"]["residual_notional"] == pytest.approx(200.0)
+    # A bump is an OVER-allocation, so its residual is negative. Visible, not hidden.
+    assert rows["BUMPY"]["residual_notional"] == pytest.approx(-100.0)
+
+
+def test_dry_run_rows_show_the_weight_the_plan_will_really_use():
+    """D2 rewrites quantities, so the typed weight and the resulting weight are two
+    different numbers and BOTH have to be on screen."""
+    rows = {r["symbol"]: r for r in dry_run_rows(_mixed_eligibility_plan())}
+    # Rounded to 3dp for display, like every other percentage in this table.
+    assert rows["MSFT"]["weight_pct"] == pytest.approx(1_000.0 / 262_800.0 * 100.0,
+                                                       abs=5e-4)
+    assert rows["MSFT"]["projected_weight_pct"] == pytest.approx(
+        800.0 / 262_800.0 * 100.0, abs=5e-4)
+    assert rows["BUMPY"]["projected_weight_pct"] > rows["BUMPY"]["weight_pct"]
+
+
+def test_dry_run_rows_weights_are_zero_when_there_is_no_base_to_divide_by():
+    plan = _mixed_eligibility_plan()
+    plan.base_notional = 0.0
+    rows = {r["symbol"]: r for r in dry_run_rows(plan)}
+    assert rows["MSFT"]["weight_pct"] == 0.0
+    assert rows["MSFT"]["projected_weight_pct"] == 0.0
+
+
+def test_dry_run_rows_keep_every_key_the_landed_table_already_drew():
+    """The new columns are ADDITIVE. Dropping one of these silently blanks a column
+    the wizard is already rendering."""
+    row = dry_run_rows(_mixed_eligibility_plan())[0]
+    for key in ("symbol", "side", "quantity", "price", "estimated_value", "bp_cost",
+                "bp_usage_pct", "reasons", "fractional", "sized_fractional",
+                "suppressed", "skipped"):
+        assert key in row, key
+
+
+def test_filter_plan_rows_keeps_the_valuation_mode_and_the_allocation_basis():
+    """A cost-mode plan silently became market-mode when a row was un-ticked, which
+    reinterprets every projected number in the footer."""
+    plan = _mixed_eligibility_plan()
+    plan.valuation_mode = VALUATION_MODE_COST
+    plan.allocation_basis = pa.ALLOCATION_BASIS_BUDGET
+    filtered = filter_plan_rows(plan, ["AAPL"])
+    assert filtered.valuation_mode == VALUATION_MODE_COST
+    assert filtered.allocation_basis == pa.ALLOCATION_BASIS_BUDGET
+
+
+def test_a_plan_that_ends_OVER_target_reports_a_NEGATIVE_residual():
+    """The residual is SIGNED. A plan whose bumps outweigh its rounding shortfalls
+    is over target, and reporting the magnitude would tell the user they still have
+    money to deploy when in fact they have over-committed."""
+    plan = _mixed_eligibility_plan()
+    plan.rows = [r for r in plan.rows if r.symbol == "BUMPY"]
+    plan.base_notional = 200.0
+    summary = fractional_summary(plan)
+    assert summary["residual_notional"] == pytest.approx(-100.0)
+    assert summary["residual_pct"] == pytest.approx(-50.0)
+    assert "-100.00" in whole_share_notice(summary)
