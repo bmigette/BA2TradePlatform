@@ -3942,9 +3942,22 @@ def upsert_income_event(account_id: int, external_id: str, event_date: Date,
     existing event refreshes date/type/amount/symbol and NEVER touches
     ``consumed_amount``: money already spent stays spent.
 
+    The refresh OVERWRITES the amount, it does not accumulate: a re-sync presents
+    every event of the window again, so summing would inflate the ledger on every
+    single sync. Overwriting is also what makes a late DIVNRA tax withholding
+    correct -- the broker re-states the dividend net of tax and the ledger follows.
+    Its one lossy case is two DIV activities for one payer on one pay date that
+    BOTH arrive with no broker id (see ``AlpacaAccount.get_cash_transfers``): they
+    share the synthetic fallback key and the second overwrites the first. That has
+    to be fixed where the duplicate is produced -- by aggregating per key inside
+    the seam -- because this function cannot tell a duplicate apart from a re-sync.
+
     ``event_type`` is a plain str -- pass ``CASH_TRANSFER_DEPOSIT`` or
     ``CASH_TRANSFER_DIVIDEND`` from ``ba2_common.core.account_types``, never a
     bare literal. Withdrawals are not income and must not be sent here.
+
+    Unlike the setters above, ``symbol=None`` here means "this event has no payer
+    symbol", not "leave it unchanged": an upsert restates the whole event.
 
     Raises:
         ValueError: when ``external_id`` is blank -- the idempotency key would
@@ -3967,6 +3980,16 @@ def upsert_income_event(account_id: int, external_id: str, event_date: Date,
             )
             session.add(row)
         else:
+            if float(amount) < (row.consumed_amount or 0.0):
+                # open_amount clamps at 0 so nothing over-allocates from here on,
+                # but the platform has already spent more than the event turned out
+                # to be worth (a dividend re-stated net of DIVNRA tax after a run
+                # consumed the gross). consumed_amount keeps the TRUE spend rather
+                # than being clamped, so say so instead of leaving it silent.
+                logger.warning(
+                    f"Income event {external_id} of account {account_id} was restated "
+                    f"from {row.amount} to {float(amount)}, below the "
+                    f"{row.consumed_amount} already consumed by allocation runs")
             row.event_date = event_date
             row.event_type = event_type
             row.amount = float(amount)
@@ -4011,6 +4034,18 @@ def get_income_events_since(account_id: int, since: Date) -> List[PortfolioIncom
         session.expunge_all()
         return rows
 ```
+
+> **As landed:** the upsert stays LAST-WRITE-WINS (it must — a re-sync re-presents
+> every event, so an accumulating upsert would inflate the ledger on every sync),
+> and gained a `logger.warning` for the one state it can leave behind: an amount
+> restated BELOW what allocation runs already consumed, which makes
+> `consumed_amount > amount`. `open_amount` clamps at 0 so nothing over-allocates
+> and the event simply drops out of the open list, but the over-spend was
+> otherwise silent. **Tasks 13/74 must therefore treat `consumed_amount > amount`
+> as reachable** — never render `consumed_amount` as a fraction of `amount`
+> without clamping. Two duplicate fallback-keyed dividends in one window remain
+> lossy here by construction; the fix belongs in `get_cash_transfers()`, which
+> should aggregate per `external_id` before returning.
 
 - [ ] **Step 4: Run test to verify it passes**
 

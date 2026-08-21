@@ -149,3 +149,44 @@ def test_set_allocation_config_bumps_updated_at(account_id):
     first = store.get_allocation_config(account_id).updated_at
     store.set_allocation_config(account_id, valuation_mode="market")
     assert store.get_allocation_config(account_id).updated_at >= first
+
+
+# --- income ledger ---------------------------------------------------------
+
+def test_upsert_income_event_inserts_a_new_event(account_id):
+    row = store.upsert_income_event(account_id, "csd-1", date(2026, 8, 1), "DEPOSIT", 1000.0)
+    assert row.id is not None
+    assert store.get_open_income_total(account_id) == 1000.0
+
+
+def test_reupserting_the_same_external_id_updates_instead_of_duplicating(account_id):
+    store.upsert_income_event(account_id, "csd-1", date(2026, 8, 1), "DEPOSIT", 1000.0)
+    store.upsert_income_event(account_id, "csd-1", date(2026, 8, 1), "DEPOSIT", 1250.0)
+    events = store.get_open_income_events(account_id)
+    assert len(events) == 1
+    assert events[0].amount == 1250.0
+
+
+def test_reupserting_an_event_does_not_reset_what_was_already_consumed(account_id):
+    store.upsert_income_event(account_id, "csd-1", date(2026, 8, 1), "DEPOSIT", 1000.0)
+    store.consume_income(account_id, 400.0)
+    store.upsert_income_event(account_id, "csd-1", date(2026, 8, 1), "DEPOSIT", 1000.0)
+    assert store.get_open_income_total(account_id) == 600.0
+
+
+def test_upsert_income_event_rejects_a_blank_external_id(account_id):
+    with pytest.raises(ValueError):
+        store.upsert_income_event(account_id, "  ", date(2026, 8, 1), "DEPOSIT", 100.0)
+
+
+def test_open_income_events_are_ordered_oldest_first(account_id):
+    store.upsert_income_event(account_id, "b", date(2026, 8, 10), "DIVIDEND", 50.0, symbol="AAPL")
+    store.upsert_income_event(account_id, "a", date(2026, 8, 1), "DEPOSIT", 500.0)
+    assert [e.external_id for e in store.get_open_income_events(account_id)] == ["a", "b"]
+
+
+def test_income_events_since_excludes_older_events(account_id):
+    store.upsert_income_event(account_id, "old", date(2026, 6, 1), "DEPOSIT", 100.0)
+    store.upsert_income_event(account_id, "new", date(2026, 8, 15), "DEPOSIT", 200.0)
+    recent = store.get_income_events_since(account_id, date(2026, 8, 1))
+    assert [e.external_id for e in recent] == ["new"]

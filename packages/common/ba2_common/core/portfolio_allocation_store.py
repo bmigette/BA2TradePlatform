@@ -345,3 +345,110 @@ def set_allocation_config(account_id: int, *,
         logger.info(f"Allocation config for account {account_id}: "
                     f"valuation_mode={row.valuation_mode}, allow_fractional={row.allow_fractional}")
         return row
+
+
+# ---------------------------------------------------------------------------
+# Income ledger
+# ---------------------------------------------------------------------------
+
+def upsert_income_event(account_id: int, external_id: str, event_date: Date,
+                        event_type: str, amount: float,
+                        symbol: Optional[str] = None) -> PortfolioIncomeEvent:
+    """Insert or update one deposit/dividend, keyed on ``(account_id, external_id)``.
+
+    ``external_id`` is the BROKER's own activity id, which makes re-syncing the
+    same window idempotent -- exactly as ``OptionActivity`` does. Re-upserting an
+    existing event refreshes date/type/amount/symbol and NEVER touches
+    ``consumed_amount``: money already spent stays spent.
+
+    The refresh OVERWRITES the amount, it does not accumulate: a re-sync presents
+    every event of the window again, so summing would inflate the ledger on every
+    single sync. Overwriting is also what makes a late DIVNRA tax withholding
+    correct -- the broker re-states the dividend net of tax and the ledger follows.
+    Its one lossy case is two DIV activities for one payer on one pay date that
+    BOTH arrive with no broker id (see ``AlpacaAccount.get_cash_transfers``): they
+    share the synthetic fallback key and the second overwrites the first. That has
+    to be fixed where the duplicate is produced -- by aggregating per key inside
+    the seam -- because this function cannot tell a duplicate apart from a re-sync.
+
+    ``event_type`` is a plain str -- pass ``CASH_TRANSFER_DEPOSIT`` or
+    ``CASH_TRANSFER_DIVIDEND`` from ``ba2_common.core.account_types``, never a
+    bare literal. Withdrawals are not income and must not be sent here.
+
+    Unlike the setters above, ``symbol=None`` here means "this event has no payer
+    symbol", not "leave it unchanged": an upsert restates the whole event.
+
+    Raises:
+        ValueError: when ``external_id`` is blank -- the idempotency key would
+        collapse every event of the account onto one row.
+    """
+    external_id = (external_id or "").strip()
+    if not external_id:
+        raise ValueError("upsert_income_event requires a non-empty external_id")
+    with get_db() as session:
+        row = session.exec(
+            select(PortfolioIncomeEvent).where(
+                PortfolioIncomeEvent.account_id == account_id,
+                PortfolioIncomeEvent.external_id == external_id,
+            )
+        ).first()
+        if row is None:
+            row = PortfolioIncomeEvent(
+                account_id=account_id, external_id=external_id, event_date=event_date,
+                event_type=event_type, amount=float(amount), symbol=symbol,
+            )
+            session.add(row)
+        else:
+            if float(amount) < (row.consumed_amount or 0.0):
+                # open_amount clamps at 0 so nothing over-allocates from here on,
+                # but the platform has already spent more than the event turned out
+                # to be worth (a dividend re-stated net of DIVNRA tax after a run
+                # consumed the gross). consumed_amount keeps the TRUE spend rather
+                # than being clamped, so say so instead of leaving it silent.
+                logger.warning(
+                    f"Income event {external_id} of account {account_id} was restated "
+                    f"from {row.amount} to {float(amount)}, below the "
+                    f"{row.consumed_amount} already consumed by allocation runs")
+            row.event_date = event_date
+            row.event_type = event_type
+            row.amount = float(amount)
+            row.symbol = symbol
+        session.commit()
+        session.refresh(row)
+        session.expunge(row)
+        return row
+
+
+def get_open_income_events(account_id: int) -> List[PortfolioIncomeEvent]:
+    """Income events with money left, OLDEST FIRST (event_date, then id).
+
+    That is exactly the order ``consume_income()`` spends them in.
+    """
+    with get_db() as session:
+        rows = session.exec(
+            select(PortfolioIncomeEvent)
+            .where(PortfolioIncomeEvent.account_id == account_id)
+            .order_by(PortfolioIncomeEvent.event_date, PortfolioIncomeEvent.id)
+        ).all()
+        rows = [row for row in rows if row.open_amount > 0]
+        session.expunge_all()
+        return rows
+
+
+def get_open_income_total(account_id: int) -> float:
+    """Total un-consumed income of an account; 0.0 when the ledger is empty."""
+    return float(sum(row.open_amount for row in get_open_income_events(account_id)))
+
+
+def get_income_events_since(account_id: int, since: Date) -> List[PortfolioIncomeEvent]:
+    """Every income event on or after ``since``, NEWEST first -- the 30-day panel."""
+    with get_db() as session:
+        rows = session.exec(
+            select(PortfolioIncomeEvent)
+            .where(PortfolioIncomeEvent.account_id == account_id,
+                   PortfolioIncomeEvent.event_date >= since)
+            .order_by(PortfolioIncomeEvent.event_date.desc(), PortfolioIncomeEvent.id.desc())
+        ).all()
+        rows = list(rows)
+        session.expunge_all()
+        return rows
