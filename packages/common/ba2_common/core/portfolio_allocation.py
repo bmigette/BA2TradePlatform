@@ -43,6 +43,7 @@ __all__ = [
     "PositionFetchFailed", "AccountSnapshot", "MarginInfo", "OrderImpact",
     # wizard
     "BaseSnapshot", "build_base_snapshot", "WARNING_NO_MULTIPLIER",
+    "dry_run_rows", "filter_plan_rows", "summarise_plan", "DRY_RUN_QUANTITY_DECIMALS",
     # modes
     "ALLOCATION_MODE_REBALANCE", "ALLOCATION_MODE_INVEST_LABEL",
     "VALUATION_MODE_COST", "VALUATION_MODE_MARKET",
@@ -54,7 +55,9 @@ __all__ = [
     "REASON_WHOLE_SHARE_FLOOR", "REASON_NEGATIVE_CLAMPED", "REASON_CLOSE_TO_ZERO",
     "REASON_BELOW_MIN_ORDER_FMT", "REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_FMT",
     "REASON_MULTI_LABEL_FMT", "REASON_SCALED_FMT",
-    "REASON_SCALED_PREFIX", "WARNING_EMPTY_LABEL_FMT", "WARNING_PRECHECK_DISAGREED_FMT",
+    "REASON_SCALED_PREFIX", "REASON_BELOW_MIN_ORDER_PREFIX",
+    "REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_PREFIX",
+    "WARNING_EMPTY_LABEL_FMT", "WARNING_PRECHECK_DISAGREED_FMT",
     "ERROR_LABEL_TOTAL_FMT", "ERROR_LABEL_NEGATIVE_FMT", "ERROR_LABEL_DUPLICATE_FMT",
     "ERROR_LABEL_NO_SYMBOLS_FMT", "ERROR_SYMBOL_TOTAL_FMT", "ERROR_SYMBOL_NEGATIVE_FMT",
     "ERROR_SYMBOL_DUPLICATE_FMT",
@@ -78,6 +81,15 @@ VALUATION_MODE_MARKET = "market"
 #: Decimal places used for a fractional quantity when the broker publishes no
 #: ``min_trade_increment``.
 DEFAULT_FRACTIONAL_DECIMALS = 4
+
+#: Decimal places the DRY-RUN TABLE shows a share quantity to. Deliberately wider
+#: than DEFAULT_FRACTIONAL_DECIMALS: that 4 is a SIZING fallback, this is a
+#: DISPLAY guard against float noise, and the two must not be tied together.
+#: TastyTrade's equity ``QuantityDecimalPrecision.value`` is 5, so displaying at 4
+#: would print 1.6667 for an order that is really 1.66666 -- the dry-run's whole
+#: job is to state what will be sent, so it may never round the number tighter
+#: than the broker's own grid.
+DRY_RUN_QUANTITY_DECIMALS = 8
 
 #: Tolerance (percentage points) when checking that label targets total 100.
 LABEL_TOTAL_TOLERANCE_PCT = 0.01
@@ -119,6 +131,14 @@ REASON_SCALED_FMT = "scaled ×{factor:.2f} to fit buying power"
 #: twice (first solve, then broker precheck) reports ONE reason with the compounded
 #: factor instead of two that each tell half the story.
 REASON_SCALED_PREFIX = REASON_SCALED_FMT.split("{", 1)[0]
+#: The fixed parts of the two ``_suppress_below_min_order`` reasons, derived from
+#: the formats so they cannot drift. Used by the dry-run table to RECOGNISE a row
+#: whose order was suppressed: those rows carry a zero delta, so without this they
+#: would vanish from the review exactly like a row that never had a target, and
+#: the user would be told "nothing to do" about an order the broker refused.
+REASON_BELOW_MIN_ORDER_PREFIX = REASON_BELOW_MIN_ORDER_FMT.split("{", 1)[0]
+REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_PREFIX = (
+    REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_FMT.split("{", 1)[0])
 WARNING_EMPTY_LABEL_FMT = "label '{label}' has no symbols - {pct:.2f}% unallocated"
 WARNING_PRECHECK_DISAGREED_FMT = "broker precheck disagreed on {symbol} - re-solved"
 
@@ -1285,3 +1305,166 @@ def build_base_snapshot(
         supports_fractional=bool(snapshot.supports_fractional),
         warnings=warnings,
     )
+
+
+# ---------------------------------------------------------------------------
+# Wizard step 4: the dry-run table. Pure -- the NiceGUI module only draws these.
+# ---------------------------------------------------------------------------
+
+#: A zero-delta row carrying one of these reason prefixes had an order and lost
+#: it. Kept together so the dry-run and anything auditing a stored plan agree on
+#: what "suppressed" means.
+_SUPPRESSION_REASON_PREFIXES = (
+    REASON_BELOW_MIN_ORDER_PREFIX,
+    REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_PREFIX,
+    REASON_SCALED_PREFIX,
+)
+
+
+def _is_suppressed_row(row: "AllocationRow") -> bool:
+    """True when this row WANTED an order and will not get one.
+
+    The distinction the dry-run turns on. A zero delta has three very different
+    causes and only two of them are worth the user's attention:
+
+      * already on target -- nothing to review, and nothing to say;
+      * NO PRICE -- there was never a target to miss, the symbol is already
+        counted in ``plan.unallocatable_pct``, and no order was ever possible;
+      * SUPPRESSED -- a real target that produced a real delta which was then
+        zeroed by a broker rule (``min_order_size``, ``min_fractional_notional``),
+        by the buying-power scaler, or by the broker's own precheck refusing it.
+
+    Only the third is suppression. Reporting it is the point: the sub-$5
+    fractional floor (TastyTrade ``below_notional_value_minimum``) does not mean
+    "this rounds to zero", it means fractional is UNAVAILABLE at that size, and a
+    table that drops the row tells the user there was nothing to do.
+
+    Detected from the reasons rather than from a flag because the engine's
+    suppression paths are several and each already records WHY -- a parallel
+    boolean would be one more thing to forget to set.
+    """
+    if abs(float(row.delta_quantity or 0.0)) > QUANTITY_EPSILON:
+        return False
+    if any(reason.startswith(prefix)
+           for reason in row.reasons for prefix in _SUPPRESSION_REASON_PREFIXES):
+        return True
+    # A row the broker's precheck REFUSED is zeroed and marked skipped with the
+    # broker's own error strings, which match no format of ours. A no-price skip
+    # is the one skip that never had an order, so it is the one exclusion.
+    return bool(row.skipped) and REASON_NO_PRICE not in row.reasons
+
+
+def dry_run_rows(plan: "AllocationPlan") -> List[Dict[str, Any]]:
+    """One display dict per row the user must look at, in plan order.
+
+    Included: every row with a NON-ZERO delta (the orders that will be sent), and
+    every SUPPRESSED row (see ``_is_suppressed_row`` -- an order that was wanted
+    and will not be sent). Excluded: rows already on target and rows skipped for
+    want of a price, neither of which represents a decision.
+
+    ``quantity`` and every money figure is a POSITIVE magnitude; the direction is
+    in ``side``, which is ``""`` on a suppressed row because no order means no
+    side. ``quantity`` is rounded only to ``DRY_RUN_QUANTITY_DECIMALS``, wide
+    enough that the figure shown is the figure submitted.
+
+    Two DIFFERENT fractional facts, both needed and routinely confused:
+
+      * ``fractional`` -- the ORDER: its quantity is not a whole number of
+        shares. This is the one that carries broker consequences. A fractional
+        equity order is MARKET-only (never a limit) at both TastyTrade and
+        Alpaca, and it is the only kind the $5 notional floor applies to.
+      * ``sized_fractional`` -- the GRID the row was sized on (``AllocationRow.
+        fractional``): the toggle was on AND the broker calls the symbol
+        fractionable. A row sized on that grid can still land on exactly 5.0
+        shares, and that order is an ordinary whole-share order.
+
+    On a suppressed row ``fractional`` is False -- there is no order to describe;
+    ``sized_fractional`` and the reason string carry the story instead.
+    """
+    available = float(plan.available_buying_power or 0.0)
+    out: List[Dict[str, Any]] = []
+    for row in plan.rows:
+        suppressed = _is_suppressed_row(row)
+        if not suppressed and (row.side is None or row.delta_quantity == 0):
+            continue
+        out.append({
+            "symbol": row.symbol,
+            "side": row.side.value if row.side is not None else "",
+            "quantity": round(abs(row.delta_quantity), DRY_RUN_QUANTITY_DECIMALS),
+            "price": row.price,
+            "estimated_value": round(row.estimated_value, 2),
+            "bp_cost": round(row.bp_cost, 2),
+            "bp_usage_pct": (round(row.bp_cost / available * 100.0, 2)
+                             if available > 0 else 0.0),
+            "reasons": ", ".join(row.reasons),
+            "fractional": _is_fractional_quantity(row.delta_quantity),
+            "sized_fractional": bool(row.fractional),
+            "suppressed": suppressed,
+            "skipped": bool(row.skipped),
+        })
+    return out
+
+
+def filter_plan_rows(plan: "AllocationPlan", selected_symbols: List[str]) -> "AllocationPlan":
+    """A NEW plan holding only the ticked symbols, with the totals recomputed.
+
+    Un-ticking a row must change the buy/sell totals and the buying-power
+    requirement the user is about to commit to, so this is what Submit consumes
+    -- never the unfiltered plan. ``plan`` is not mutated (the rows are shared by
+    reference; nothing here writes to one).
+
+    Every plan-level field that filtering does not change is carried across,
+    ``valuation_mode`` included: the filtered plan is what gets persisted into
+    ``portfolio_allocation_run.plan_json``, and a cost-basis plan stored without
+    its mode reads back as a market one.
+    """
+    wanted = {s.strip().upper() for s in selected_symbols}
+    rows = [r for r in plan.rows if r.symbol.strip().upper() in wanted]
+
+    buy_value = sum(r.estimated_value for r in rows if r.is_buy)
+    sell_value = sum(r.estimated_value for r in rows if r.is_sell)
+    required = sum(r.bp_cost for r in rows if r.is_buy)
+    available = float(plan.available_buying_power or 0.0)
+
+    return AllocationPlan(
+        rows=rows,
+        base_notional=plan.base_notional,
+        available_buying_power=plan.available_buying_power,
+        required_buying_power=required,
+        bp_usage_pct=(required / available * 100.0) if available > 0 else 0.0,
+        scale_factor=plan.scale_factor,
+        # Not recomputed: it is a property of the BASE (labels that could absorb
+        # nothing), which un-ticking a row does not alter. Dropping it would
+        # silently report a plan as fully deployed when it never was.
+        unallocatable_pct=plan.unallocatable_pct,
+        total_buy_value=buy_value,
+        total_sell_value=sell_value,
+        allow_fractional=plan.allow_fractional,
+        valuation_mode=plan.valuation_mode,
+        warnings=list(plan.warnings),
+    )
+
+
+def summarise_plan(plan: "AllocationPlan", *, cash: float) -> Dict[str, float]:
+    """Plan-level totals for the dry-run footer.
+
+    ``estimated_cash_after = cash - buys + sells``. It is an ESTIMATE: market
+    orders fill at the fill price, not the quoted one, and off-hours orders queue
+    until the open.
+
+    Raises:
+        ValueError: if ``cash`` is None -- no fallback for a balance. Tested
+        against None specifically, never for falsiness: a genuinely empty account
+        has ``cash == 0.0`` and that is a real, usable number.
+    """
+    if cash is None:
+        raise ValueError("summarise_plan: cash is None; the broker published no cash balance.")
+    return {
+        "total_sell_value": plan.total_sell_value,
+        "total_buy_value": plan.total_buy_value,
+        "net_buy_value": plan.net_buy_value,
+        "required_buying_power": plan.required_buying_power,
+        "available_buying_power": plan.available_buying_power,
+        "bp_usage_pct": plan.bp_usage_pct,
+        "estimated_cash_after": float(cash) - plan.total_buy_value + plan.total_sell_value,
+    }
