@@ -410,14 +410,20 @@ class TastyTradeAccount(AccountInterface):
     }
 
     #: TastyTrade statuses that mean "still working at the broker".
+    #: CANCEL_REQUESTED and REPLACE_REQUESTED belong here: the broker has ACCEPTED the
+    #: request but the order is still live and its quantity is not yet released, so a
+    #: "what is still working?" query that omitted them missed exactly the orders a
+    #: dependent replacement is waiting on.
     _TT_OPEN_STATUSES = (TTOrderStatus.RECEIVED, TTOrderStatus.ROUTED,
                          TTOrderStatus.IN_FLIGHT, TTOrderStatus.LIVE,
-                         TTOrderStatus.CONTINGENT)
+                         TTOrderStatus.CONTINGENT, TTOrderStatus.CANCEL_REQUESTED,
+                         TTOrderStatus.REPLACE_REQUESTED)
 
     #: TastyTrade statuses that mean "done, one way or another".
+    #: PARTIALLY_REMOVED is terminal (it maps to CANCELED, like REMOVED).
     _TT_CLOSED_STATUSES = (TTOrderStatus.FILLED, TTOrderStatus.CANCELLED,
                            TTOrderStatus.EXPIRED, TTOrderStatus.REJECTED,
-                           TTOrderStatus.REMOVED)
+                           TTOrderStatus.REMOVED, TTOrderStatus.PARTIALLY_REMOVED)
 
     @classmethod
     def _tt_statuses_for(cls, status) -> Optional[List["TTOrderStatus"]]:
@@ -427,6 +433,13 @@ class TastyTradeAccount(AccountInterface):
         ``OrderStatus.ALL``. The SDK filters server-side via the ``status[]`` query
         param, so the argument must never be silently dropped (which is what
         ``get_orders`` used to do, returning every order ever placed).
+
+        Raises:
+            ValueError: when ``status`` has no TastyTrade equivalent. Returning the
+                "no filter" ``None`` for an unmapped status was strictly worse than
+                failing: combined with ``page_offset=None`` it walked EVERY order ever
+                placed and handed the caller the lot as though it were the filtered
+                answer. A filter this adapter cannot express is a caller bug.
         """
         if status is None or status == OrderStatus.ALL:
             return None
@@ -436,9 +449,9 @@ class TastyTradeAccount(AccountInterface):
             return list(cls._TT_CLOSED_STATUSES)
         matches = [tt for tt, core in cls._TT_STATUS_MAP.items() if core == status]
         if not matches:
-            logger.warning(
-                f"No TastyTrade order status maps to {status!r}; fetching unfiltered")
-            return None
+            raise ValueError(
+                f"No TastyTrade order status maps to {status.value!r}; refusing to "
+                f"fetch unfiltered (that would return every order ever placed)")
         return matches
 
     @classmethod
@@ -558,13 +571,15 @@ class TastyTradeAccount(AccountInterface):
                 mean unfiltered; ``OPEN``/``CLOSED`` expand to the matching
                 TastyTrade statuses.
         """
+        # OUTSIDE the try: an unexpressible filter is a caller bug, and swallowing the
+        # ValueError into the `return []` below would report "no such orders".
+        statuses = self._tt_statuses_for(status)
         if not self._check_authentication():
             return []
         try:
             # page_offset=None is the SDK's "walk every page" sentinel
             # (session.py:389-419). Without it only the first 50 rows come back.
             kwargs = {"page_offset": None}
-            statuses = self._tt_statuses_for(status)
             if statuses:
                 kwargs["statuses"] = statuses
             raw_orders = self._run_async(

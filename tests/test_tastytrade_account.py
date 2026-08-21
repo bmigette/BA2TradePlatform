@@ -439,7 +439,8 @@ def test_get_orders_open_filter_asks_the_broker_for_working_statuses_only():
     requested = acct._account.get_order_history.call_args.kwargs["statuses"]
     assert set(requested) == {
         TTOrderStatus.RECEIVED, TTOrderStatus.ROUTED, TTOrderStatus.IN_FLIGHT,
-        TTOrderStatus.LIVE, TTOrderStatus.CONTINGENT,
+        TTOrderStatus.LIVE, TTOrderStatus.CONTINGENT, TTOrderStatus.CANCEL_REQUESTED,
+        TTOrderStatus.REPLACE_REQUESTED,
     }
 
 
@@ -463,6 +464,132 @@ def test_get_orders_filled_filter_maps_to_the_tastytrade_filled_status():
     acct.get_orders(status=OrderStatus.FILLED)
 
     assert acct._account.get_order_history.call_args.kwargs["statuses"] == [TTOrderStatus.FILLED]
+
+
+def test_get_orders_closed_filter_asks_the_broker_for_finished_statuses_only():
+    """M49. The CLOSED set was pinned nowhere, so dropping or adding a member was
+    invisible."""
+    from ba2_trade_platform.core.types import OrderStatus
+
+    acct = _bare_account()
+    acct._account.get_order_history = AsyncMock(return_value=[])
+
+    acct.get_orders(status=OrderStatus.CLOSED)
+
+    requested = acct._account.get_order_history.call_args.kwargs["statuses"]
+    assert set(requested) == {
+        TTOrderStatus.FILLED, TTOrderStatus.CANCELLED, TTOrderStatus.EXPIRED,
+        TTOrderStatus.REJECTED, TTOrderStatus.REMOVED, TTOrderStatus.PARTIALLY_REMOVED,
+    }
+
+
+def test_every_mapped_broker_status_is_either_open_or_closed():
+    """M11. CANCEL_REQUESTED, REPLACE_REQUESTED and PARTIALLY_REMOVED were in
+    _TT_STATUS_MAP but in NEITHER _TT_OPEN_STATUSES nor _TT_CLOSED_STATUSES, so
+    get_orders(OPEN) missed an order the broker was still cancelling and
+    get_orders(CLOSED) missed one it had partially removed. Every status the adapter
+    can translate must be reachable through exactly one of the two filters."""
+    open_set = set(TastyTradeAccount._TT_OPEN_STATUSES)
+    closed_set = set(TastyTradeAccount._TT_CLOSED_STATUSES)
+
+    assert not (open_set & closed_set), "a status cannot be both working and finished"
+    assert open_set | closed_set == set(TastyTradeAccount._TT_STATUS_MAP)
+    # ... and the map itself must cover every status the SDK can hand us.
+    assert set(TastyTradeAccount._TT_STATUS_MAP) == set(TTOrderStatus)
+
+
+def test_get_orders_open_filter_includes_an_order_the_broker_is_still_cancelling():
+    """M11. A CANCEL_REQUESTED order is still working: the quantity is not released
+    and a dependent replacement must not fire yet. Omitting it from the OPEN filter
+    made it invisible to every 'what is still live?' query."""
+    from ba2_trade_platform.core.types import OrderStatus
+
+    acct = _bare_account()
+    acct._account.get_order_history = AsyncMock(return_value=[])
+
+    acct.get_orders(status=OrderStatus.OPEN)
+
+    requested = acct._account.get_order_history.call_args.kwargs["statuses"]
+    assert TTOrderStatus.CANCEL_REQUESTED in requested
+    assert TTOrderStatus.REPLACE_REQUESTED in requested
+
+
+def test_status_filter_refuses_a_platform_status_it_cannot_express():
+    """M12. `_tt_statuses_for` returned None -- the SDK's "no filter" sentinel -- for
+    any platform status with no TastyTrade equivalent. Combined with page_offset=None
+    that silently walked EVERY order ever placed and handed the caller the lot as if
+    it were the filtered answer. Fail loudly on a filter we cannot express."""
+    from ba2_trade_platform.core.types import OrderStatus
+
+    with pytest.raises(ValueError) as excinfo:
+        TastyTradeAccount._tt_statuses_for(OrderStatus.PARTIALLY_FILLED)
+
+    assert "partially_filled" in str(excinfo.value).lower()
+
+
+def test_get_orders_does_not_return_everything_for_an_unexpressible_filter():
+    from ba2_trade_platform.core.types import OrderStatus
+
+    acct = _bare_account()
+    acct._account.get_order_history = AsyncMock(return_value=[_placed_order(order_id=1)])
+
+    with pytest.raises(ValueError):
+        acct.get_orders(status=OrderStatus.DONE_FOR_DAY)
+
+    acct._account.get_order_history.assert_not_called()
+
+
+def test_status_filter_treats_none_and_all_as_unfiltered():
+    from ba2_trade_platform.core.types import OrderStatus
+
+    assert TastyTradeAccount._tt_statuses_for(None) is None
+    assert TastyTradeAccount._tt_statuses_for(OrderStatus.ALL) is None
+
+
+# ---------------------------------------------------------------------------
+# Broker status -> platform status
+# ---------------------------------------------------------------------------
+
+def test_an_unmapped_broker_status_records_unknown_not_filled():
+    """M40. An unrecognised broker status mapped to FILLED would open a transaction
+    and fire the TP/SL legs for an order that never filled. UNKNOWN is the only safe
+    answer: it is not an executed status, so nothing downstream acts on it."""
+    from ba2_trade_platform.core.types import OrderStatus
+
+    mapped = TastyTradeAccount._map_order_status("Reorganisation Pending")
+
+    assert mapped == OrderStatus.UNKNOWN
+    assert mapped not in OrderStatus.get_executed_statuses()
+
+
+def test_a_missing_broker_status_records_unknown_not_filled():
+    """M41. A PlacedOrder with no status at all must not be read as executed."""
+    from ba2_trade_platform.core.types import OrderStatus
+
+    mapped = TastyTradeAccount._map_order_status(None)
+
+    assert mapped == OrderStatus.UNKNOWN
+    assert mapped not in OrderStatus.get_executed_statuses()
+
+
+@pytest.mark.parametrize("tt_status,expected", [
+    (TTOrderStatus.RECEIVED, "new"),
+    (TTOrderStatus.ROUTED, "new"),
+    (TTOrderStatus.IN_FLIGHT, "pending_new"),
+    (TTOrderStatus.LIVE, "accepted"),
+    (TTOrderStatus.FILLED, "filled"),
+    (TTOrderStatus.CANCELLED, "canceled"),
+    (TTOrderStatus.CANCEL_REQUESTED, "pending_cancel"),
+    (TTOrderStatus.REPLACE_REQUESTED, "pending_replace"),
+    (TTOrderStatus.EXPIRED, "expired"),
+    (TTOrderStatus.REJECTED, "rejected"),
+    (TTOrderStatus.REMOVED, "canceled"),
+    (TTOrderStatus.PARTIALLY_REMOVED, "canceled"),
+])
+def test_broker_status_maps_to_the_documented_platform_status(tt_status, expected):
+    """Only FILLED may map to FILLED. Every other row is pinned so a mutation that
+    widens the mapping toward FILLED is caught."""
+    assert TastyTradeAccount._map_order_status(tt_status).value == expected
 
 
 # ---------------------------------------------------------------------------
