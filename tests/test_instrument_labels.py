@@ -5,7 +5,7 @@ from sqlmodel import select
 
 from ba2_trade_platform.core.utils import (
     add_label_to_instruments, remove_label_from_instruments,
-    get_labels_by_symbol, get_all_instrument_labels,
+    get_labels_by_symbol, get_all_instrument_labels, get_symbols_by_label,
 )
 from ba2_trade_platform.core.db import get_db
 from ba2_trade_platform.core.models import Instrument
@@ -100,3 +100,39 @@ class TestInstrumentLabels:
     def test_get_labels_by_symbol_normalises_query_and_keys(self):
         add_label_to_instruments(['AMZN'], 'retail')
         assert get_labels_by_symbol([' amzn ']) == {'AMZN': ['retail']}
+
+    def test_get_symbols_by_label_returns_sorted_symbols_per_label(self):
+        add_label_to_instruments(['MSFT', 'AAPL'], 'ARK26')
+        add_label_to_instruments(['NVDA'], 'NASDAQ30')
+        out = get_symbols_by_label(['ARK26', 'NASDAQ30'])
+        assert out['ARK26'] == ['AAPL', 'MSFT']
+        assert out['NASDAQ30'] == ['NVDA']
+
+    def test_get_symbols_by_label_symbol_with_two_labels_appears_under_both(self):
+        add_label_to_instruments(['TSLA'], 'ARK26')
+        add_label_to_instruments(['TSLA'], 'HighRisk')
+        out = get_symbols_by_label(['ARK26', 'HighRisk'])
+        assert out['ARK26'] == ['TSLA']
+        assert out['HighRisk'] == ['TSLA']
+
+    def test_get_symbols_by_label_label_with_no_instruments_maps_to_empty_list(self):
+        add_label_to_instruments(['AMZN'], 'ARK26')
+        out = get_symbols_by_label(['ARK26', 'NOBODY_HAS_THIS'])
+        assert out['ARK26'] == ['AMZN']
+        # The key is PRESENT: "managed but empty" must be distinguishable from
+        # "not managed" by the caller.
+        assert out['NOBODY_HAS_THIS'] == []
+
+    def test_get_symbols_by_label_blank_and_none_labels_are_ignored(self):
+        add_label_to_instruments(['GOOG'], 'ARK26')
+        out = get_symbols_by_label(['ARK26', '   ', None])
+        assert list(out.keys()) == ['ARK26']
+
+    def test_get_symbols_by_label_normalises_symbols_to_upper(self):
+        add_label_to_instruments(['spce'], 'ARK26')
+        assert get_symbols_by_label(['ARK26'])['ARK26'] == ['SPCE']
+
+    def test_get_symbols_by_label_is_the_inverse_of_get_labels_by_symbol(self):
+        add_label_to_instruments(['IBM'], 'ARK26')
+        assert 'ARK26' in get_labels_by_symbol(['IBM'])['IBM']
+        assert 'IBM' in get_symbols_by_label(['ARK26'])['ARK26']

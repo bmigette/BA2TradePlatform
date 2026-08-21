@@ -48,6 +48,7 @@ def test_pure_subset_functions_present():
         "calculate_fmp_trade_metrics", "get_setting_safe",
         "get_expert_options_for_ui",
         "normalize_symbol", "parse_instrument_symbol_list",
+        "get_symbols_by_label",
     ]
     for name in expected:
         assert callable(getattr(u, name, None)), f"missing pure helper: {name}"

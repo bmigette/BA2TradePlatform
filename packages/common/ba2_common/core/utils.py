@@ -146,6 +146,43 @@ def remove_label_from_instruments(symbols, label: str) -> int:
     return changed
 
 
+def get_symbols_by_label(labels) -> Dict[str, List[str]]:
+    """Return ``{label: [symbols]}`` for each requested label.
+
+    The inverse of ``get_labels_by_symbol``. A requested label with no instruments
+    maps to an EMPTY list -- the key is ALWAYS present, so the caller can tell
+    "managed but empty" from "not managed". Symbols are normalised
+    (.strip().upper()) and returned sorted; a blank/None label is ignored.
+
+    Labels live in a plain JSON column, so this scans the instrument table exactly
+    as ``get_all_instrument_labels`` does. The ``Instrument`` import is LAZY (same
+    as the other label helpers) to keep this module free of live-tree imports.
+    """
+    from ba2_common.core.models import Instrument
+    if isinstance(labels, str):
+        labels = [labels]
+    wanted: List[str] = []
+    for lbl in (labels or []):
+        text = (lbl or "").strip()
+        if text and text not in wanted:
+            wanted.append(text)
+    out: Dict[str, List[str]] = {lbl: [] for lbl in wanted}
+    if not wanted:
+        return out
+    wanted_set = set(wanted)
+    with get_db() as session:
+        for inst in session.exec(select(Instrument)).all():
+            name = normalize_symbol(inst.name)
+            if not name:
+                continue
+            for lbl in (inst.labels or []):
+                if lbl in wanted_set:
+                    out[lbl].append(name)
+    for lbl in out:
+        out[lbl] = sorted(set(out[lbl]))
+    return out
+
+
 def expert_uses_risk_manager(expert_class) -> bool:
     """Resolve whether an expert class relies on the platform's risk manager.
 
