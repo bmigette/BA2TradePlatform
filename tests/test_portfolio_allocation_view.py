@@ -10,7 +10,7 @@ import pytest
 from ba2_trade_platform.core.portfolio_allocation import PositionFetchFailed
 from ba2_trade_platform.ui.utils.portfolio_allocation_view import (
     GATE_HAS_EXPERTS, GATE_NOT_MANUAL, GATE_NO_ACCOUNT, GATE_OK,
-    evaluate_gate, positions_by_symbol,
+    ManagedLabel, build_label_views, evaluate_gate, positions_by_symbol,
 )
 
 
@@ -116,3 +116,126 @@ def test_positions_by_symbol_missing_cost_basis_raises_rather_than_defaulting():
     with pytest.raises(ValueError) as exc:
         positions_by_symbol([{'symbol': 'AAPL', 'qty': 1, 'market_value': 120}])
     assert 'AAPL' in str(exc.value)
+
+
+def _pos(symbol, quantity, cost_basis, market_value=None):
+    """A PositionState as positions_by_symbol would have produced it."""
+    return positions_by_symbol([{'symbol': symbol, 'qty': quantity,
+                                 'cost_basis': cost_basis,
+                                 'market_value': market_value}])[symbol]
+
+
+def test_build_label_views_computes_pct_of_label_and_pct_of_total():
+    managed = [ManagedLabel('ARK26', 40.0), ManagedLabel('NASDAQ30', 60.0)]
+    symbols_by_label = {'ARK26': ['AAPL', 'MSFT'], 'NASDAQ30': ['NVDA']}
+    positions = {'AAPL': _pos('AAPL', 10, 6000.0),
+                 'MSFT': _pos('MSFT', 5, 2000.0),
+                 'NVDA': _pos('NVDA', 4, 2000.0)}
+    views = build_label_views(managed, symbols_by_label, positions, {})
+
+    ark = views[0]
+    assert ark.label == 'ARK26'
+    assert ark.current_value == 8000.0
+    assert ark.pct_of_total == 80.0
+    aapl = next(r for r in ark.rows if r.symbol == 'AAPL')
+    assert aapl.pct_of_label == 75.0
+    assert aapl.pct_of_total == 60.0
+    msft = next(r for r in ark.rows if r.symbol == 'MSFT')
+    assert msft.pct_of_label == 25.0
+    assert msft.pct_of_total == 20.0
+
+    nasdaq = views[1]
+    assert nasdaq.rows[0].pct_of_label == 100.0
+    assert nasdaq.rows[0].pct_of_total == 20.0
+
+
+def test_build_label_views_symbol_with_no_position_is_listed_with_zeroes():
+    """Symbols with no position must still appear — they are editable targets."""
+    views = build_label_views([ManagedLabel('ARK26', 100.0)],
+                              {'ARK26': ['AAPL', 'TSLA']},
+                              {'AAPL': _pos('AAPL', 10, 1000.0)},
+                              {})
+    tsla = next(r for r in views[0].rows if r.symbol == 'TSLA')
+    assert tsla.quantity == 0.0
+    assert tsla.cost_basis == 0.0
+    assert tsla.pct_of_label == 0.0
+
+
+def test_build_label_views_symbol_in_two_labels_is_flagged_and_counted_once():
+    """Decision 7: targets sum, but the managed total must not double count."""
+    views = build_label_views(
+        [ManagedLabel('ARK26', 50.0), ManagedLabel('HighRisk', 50.0)],
+        {'ARK26': ['TSLA'], 'HighRisk': ['TSLA']},
+        {'TSLA': _pos('TSLA', 10, 6000.0)},
+        {},
+    )
+    row = views[0].rows[0]
+    assert row.multi_label is True
+    assert row.labels == ['ARK26', 'HighRisk']
+    # Counted once: TSLA is 100% of total, not 50%.
+    assert row.pct_of_total == 100.0
+
+
+def test_build_label_views_empty_label_has_no_rows_and_zero_current_value():
+    views = build_label_views([ManagedLabel('EMPTY', 25.0)], {'EMPTY': []}, {}, {})
+    assert views[0].rows == []
+    assert views[0].current_value == 0.0
+    assert views[0].pct_of_total == 0.0
+
+
+def test_build_label_views_uses_live_price_for_market_value():
+    views = build_label_views([ManagedLabel('ARK26', 100.0)],
+                              {'ARK26': ['AAPL']},
+                              {'AAPL': _pos('AAPL', 10, 1000.0, market_value=1100.0)},
+                              {'AAPL': 250.0})
+    assert views[0].rows[0].price == 250.0
+    assert views[0].rows[0].market_value == 2500.0
+
+
+def test_build_label_views_missing_price_falls_back_to_broker_market_value():
+    """No price is NOT a guessed price: the broker's own market value is real data,
+    and a symbol with neither reports None."""
+    views = build_label_views([ManagedLabel('ARK26', 100.0)],
+                              {'ARK26': ['AAPL', 'TSLA']},
+                              {'AAPL': _pos('AAPL', 10, 1000.0, market_value=1100.0)},
+                              {'AAPL': None, 'TSLA': None})
+    aapl = next(r for r in views[0].rows if r.symbol == 'AAPL')
+    tsla = next(r for r in views[0].rows if r.symbol == 'TSLA')
+    assert aapl.price is None and aapl.market_value == 1100.0
+    assert tsla.price is None and tsla.market_value is None
+
+
+def test_build_label_views_rows_are_ordered_by_current_value_descending():
+    views = build_label_views([ManagedLabel('ARK26', 100.0)],
+                              {'ARK26': ['AAPL', 'MSFT', 'NVDA']},
+                              {'AAPL': _pos('AAPL', 1, 100.0),
+                               'MSFT': _pos('MSFT', 1, 900.0),
+                               'NVDA': _pos('NVDA', 1, 500.0)},
+                              {})
+    assert [r.symbol for r in views[0].rows] == ['MSFT', 'NVDA', 'AAPL']
+
+
+def test_build_label_views_attaches_per_symbol_comments():
+    views = build_label_views([ManagedLabel('ARK26', 100.0, comment='core basket')],
+                              {'ARK26': ['AAPL']},
+                              {'AAPL': _pos('AAPL', 1, 100.0)},
+                              {},
+                              symbol_comments={('ARK26', 'AAPL'): 'trim on strength'})
+    assert views[0].comment == 'core basket'
+    assert views[0].rows[0].comment == 'trim on strength'
+
+
+def test_build_label_views_current_value_is_purchase_value_not_market_value():
+    """The user asked for the default view to measure the book at COST. A position
+    whose market value has doubled must still show its purchase value."""
+    views = build_label_views([ManagedLabel('ARK26', 100.0)],
+                              {'ARK26': ['AAPL', 'MSFT']},
+                              {'AAPL': _pos('AAPL', 10, 1000.0, market_value=9000.0),
+                               'MSFT': _pos('MSFT', 10, 1000.0, market_value=100.0)},
+                              {'AAPL': 900.0, 'MSFT': 10.0})
+    aapl = next(r for r in views[0].rows if r.symbol == 'AAPL')
+    assert aapl.current_value == 1000.0
+    assert aapl.market_value == 9000.0
+    # Both cost 1000, so cost-based weights are 50/50 despite 90/10 market values.
+    assert aapl.pct_of_label == 50.0
+    assert views[0].current_value == 2000.0

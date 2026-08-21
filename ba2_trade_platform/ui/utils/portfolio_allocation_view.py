@@ -152,3 +152,151 @@ def positions_by_symbol(raw_positions) -> Dict[str, PositionState]:
             state.market_value = (state.market_value or 0.0) + float(market_value)
 
     return out
+
+
+@dataclass
+class ManagedLabel:
+    """One managed label as the page reads it out of ``portfolio_allocation_label``."""
+    label: str
+    target_pct: float = 0.0
+    comment: Optional[str] = None
+
+
+@dataclass
+class SymbolRow:
+    """One symbol's line in the default view.
+
+    ``current_value`` is what the account holds in this symbol under the active
+    valuation mode (cost basis, or ``qty x price`` -- see Task 66);
+    ``pct_of_label`` and ``pct_of_total`` are 1-100 of it. ``price`` is ``None``
+    when no quote is available; ``market_value`` then falls back to the broker's
+    own figure and is ``None`` when there is neither (never a guessed number).
+    """
+    symbol: str
+    labels: List[str] = field(default_factory=list)
+    quantity: float = 0.0
+    cost_basis: float = 0.0
+    current_value: float = 0.0
+    price: Optional[float] = None
+    market_value: Optional[float] = None
+    pct_of_label: float = 0.0
+    pct_of_total: float = 0.0
+    comment: Optional[str] = None
+
+    @property
+    def multi_label(self) -> bool:
+        """True when this symbol carries more than one MANAGED label (⚠ in the UI)."""
+        return len(self.labels) > 1
+
+
+@dataclass
+class LabelView:
+    """A managed label's expansion: its totals and its symbol rows."""
+    label: str
+    target_pct: float = 0.0
+    comment: Optional[str] = None
+    current_value: float = 0.0
+    cost_basis: float = 0.0
+    market_value: Optional[float] = None
+    pct_of_total: float = 0.0
+    rows: List[SymbolRow] = field(default_factory=list)
+
+
+def build_label_views(managed,
+                      symbols_by_label,
+                      positions,
+                      prices,
+                      symbol_comments=None) -> List[LabelView]:
+    """Build the default view: one LabelView per managed label. Pure.
+
+    Current value is the COST BASIS here; Task 66 adds a ``valuation_mode``
+    keyword so ``market`` mode can measure the same positions at ``qty x price``.
+
+    Args:
+        managed: ``List[ManagedLabel]`` in display order.
+        symbols_by_label: ``{label: [symbols]}`` from ``get_symbols_by_label`` — a
+            managed label with no instruments maps to an empty list and yields a
+            LabelView with no rows.
+        positions: ``{SYMBOL: PositionState}`` from ``positions_by_symbol``. A
+            symbol absent here is flat, NOT unknown (the caller must already have
+            refused a ``None`` fetch).
+        prices: ``{SYMBOL: price or None}`` from the bulk quote call.
+        symbol_comments: ``{(label, symbol): comment}``; optional.
+
+    Returns:
+        List[LabelView]: labels in the given order, rows within each ordered by
+        current value descending then symbol. ``pct_of_total`` is computed against
+        the DISTINCT managed value, so a symbol in two labels is counted once.
+    """
+    comments = symbol_comments or {}
+
+    def _clean(label: str) -> List[str]:
+        seen, out = set(), []
+        for sym in (symbols_by_label or {}).get(label, []) or []:
+            s = (sym or "").strip().upper()
+            if s and s not in seen:
+                seen.add(s)
+                out.append(s)
+        return out
+
+    # Membership first, so a multi-label symbol knows all of its managed labels.
+    membership: Dict[str, List[str]] = {}
+    for entry in managed:
+        for sym in _clean(entry.label):
+            membership.setdefault(sym, [])
+            if entry.label not in membership[sym]:
+                membership[sym].append(entry.label)
+
+    total_value = 0.0
+    for sym in membership:
+        state = positions.get(sym)
+        if state is not None:
+            total_value += state.cost_basis
+
+    views: List[LabelView] = []
+    for entry in managed:
+        symbols = _clean(entry.label)
+        label_value = sum(positions[s].cost_basis for s in symbols if s in positions)
+        label_market_value: Optional[float] = None
+        rows: List[SymbolRow] = []
+
+        for sym in symbols:
+            state = positions.get(sym)
+            quantity = state.quantity if state is not None else 0.0
+            cost_basis = state.cost_basis if state is not None else 0.0
+            price = (prices or {}).get(sym)
+            if price is not None:
+                market_value = quantity * price
+            elif state is not None:
+                market_value = state.market_value
+            else:
+                market_value = None
+            if market_value is not None:
+                label_market_value = (label_market_value or 0.0) + market_value
+
+            rows.append(SymbolRow(
+                symbol=sym,
+                labels=list(membership.get(sym, [entry.label])),
+                quantity=quantity,
+                cost_basis=cost_basis,
+                current_value=cost_basis,
+                price=price,
+                market_value=market_value,
+                pct_of_label=(cost_basis / label_value * 100.0) if label_value > 0 else 0.0,
+                pct_of_total=(cost_basis / total_value * 100.0) if total_value > 0 else 0.0,
+                comment=comments.get((entry.label, sym)),
+            ))
+
+        rows.sort(key=lambda r: (-r.current_value, r.symbol))
+        views.append(LabelView(
+            label=entry.label,
+            target_pct=entry.target_pct,
+            comment=entry.comment,
+            current_value=label_value,
+            cost_basis=label_value,
+            market_value=label_market_value,
+            pct_of_total=(label_value / total_value * 100.0) if total_value > 0 else 0.0,
+            rows=rows,
+        ))
+
+    return views
