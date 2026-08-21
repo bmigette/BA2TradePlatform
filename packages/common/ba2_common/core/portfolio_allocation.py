@@ -44,6 +44,10 @@ __all__ = [
     # wizard
     "BaseSnapshot", "build_base_snapshot", "WARNING_NO_MULTIPLIER",
     "dry_run_rows", "filter_plan_rows", "summarise_plan", "DRY_RUN_QUANTITY_DECIMALS",
+    "even_split_targets", "steps_validation_messages", "validate_invest_amount",
+    "invest_validation_messages", "is_blocking_message", "blocking_messages",
+    "ERROR_INVEST_AMOUNT_FMT", "ERROR_INVEST_NO_LABEL", "ERROR_INVEST_LABEL_EMPTY_FMT",
+    "WARNING_INVEST_EXCEEDS_BP_FMT", "ADVISORY_MESSAGE_FRAGMENTS",
     # modes
     "ALLOCATION_MODE_REBALANCE", "ALLOCATION_MODE_INVEST_LABEL",
     "VALUATION_MODE_COST", "VALUATION_MODE_MARKET",
@@ -1468,3 +1472,135 @@ def summarise_plan(plan: "AllocationPlan", *, cash: float) -> Dict[str, float]:
         "bp_usage_pct": plan.bp_usage_pct,
         "estimated_cash_after": float(cash) - plan.total_buy_value + plan.total_sell_value,
     }
+
+
+# ---------------------------------------------------------------------------
+# Wizard steps 1-3: label percentages, symbol weights, and the INVEST amount.
+# ---------------------------------------------------------------------------
+
+ERROR_INVEST_AMOUNT_FMT = "amount {amount:,.2f} must be greater than zero"
+ERROR_INVEST_NO_LABEL = "pick a label to invest into"
+ERROR_INVEST_LABEL_EMPTY_FMT = (
+    "label '{label}' has no symbols - there is nothing to invest into")
+
+#: Spelled out separately, and the WARNING built from it, because
+#: ``blocking_messages`` has to recognise this message and it CANNOT do so from a
+#: leading prefix: ERROR_INVEST_AMOUNT_FMT starts with the same "amount ", so
+#: prefix-matching would silently downgrade a real zero-amount error to advice.
+_INVEST_EXCEEDS_BP_FRAGMENT = " exceeds available buying power "
+WARNING_INVEST_EXCEEDS_BP_FMT = ("amount {amount:,.2f}" + _INVEST_EXCEEDS_BP_FRAGMENT
+                                 + "{available:,.2f} - the plan will be scaled down")
+
+#: Fragments identifying a message that EXPLAINS rather than blocks. Everything
+#: the validators produce blocks by default: a new error added without touching
+#: this tuple stops Submit, which is the safe direction to be wrong in.
+ADVISORY_MESSAGE_FRAGMENTS = (_INVEST_EXCEEDS_BP_FRAGMENT,)
+
+
+def even_split_targets(labels: List[LabelTarget]) -> List[LabelTarget]:
+    """The "Even split" button: every label gets an equal share of 100%.
+
+    Returns NEW LabelTarget objects with their own symbol LISTS (the SymbolTarget
+    objects inside are shared, which is fine -- step 2 replaces a weight by
+    assigning to the object the dialog is already editing), so the caller can
+    still cancel out of the dialog without having mutated its inputs. The
+    remainder lands on the LAST label so the set totals exactly 100.
+    """
+    items = list(labels or [])
+    if not items:
+        return []
+    return [LabelTarget(label=lt.label, target_pct=pct, symbols=list(lt.symbols),
+                        comment=lt.comment)
+            for lt, pct in zip(items, even_split_pct(len(items)))]
+
+
+def steps_validation_messages(labels: List[LabelTarget], *,
+                              tolerance: float = LABEL_TOTAL_TOLERANCE_PCT) -> List[str]:
+    """Every reason a REBALANCE cannot proceed, from step 1 AND step 2. Pure.
+
+    Step 1's rule (labels total 100, no duplicates, no negatives, no non-zero
+    label without symbols) and step 2's (weights total 100 inside each label, no
+    negatives, no symbol repeated in one label) are BOTH already covered by
+    ``validate_label_targets``, which delegates the symbol half to
+    ``validate_symbol_weights``. This is a named seam for the wizard, not a second
+    implementation: re-checking the symbol totals here emitted every one of them
+    twice.
+
+    Returns:
+        List[str]: EMPTY means the wizard may proceed to the dry-run.
+    """
+    return validate_label_targets(labels, tolerance=tolerance)
+
+
+def validate_invest_amount(amount: float, *, available_buying_power: float) -> List[str]:
+    """Validate an INVEST_LABEL amount. Pure -- returns problems, never raises.
+
+    A zero or negative amount is an ERROR. An amount above available buying power
+    is reported too, but as an explanation rather than a hard block: the engine
+    scales the plan down pro-rata and the dry-run shows the result, which is more
+    useful than refusing to compute it. Use ``blocking_messages`` to tell the two
+    apart -- do not test the strings by hand.
+    """
+    messages: List[str] = []
+    value = float(amount or 0.0)
+    if value <= 0:
+        messages.append(ERROR_INVEST_AMOUNT_FMT.format(amount=value))
+        return messages
+    available = float(available_buying_power or 0.0)
+    if value > available:
+        messages.append(WARNING_INVEST_EXCEEDS_BP_FMT.format(
+            amount=value, available=available))
+    return messages
+
+
+def invest_validation_messages(label: Optional[LabelTarget], amount: float, *,
+                               available_buying_power: float,
+                               tolerance: float = LABEL_TOTAL_TOLERANCE_PCT) -> List[str]:
+    """Every reason an INVEST_LABEL run cannot proceed. Pure.
+
+    The amount is NOT the only thing that can be wrong, and this is the half that
+    is easy to forget. ``compute_label_investment`` multiplies the label's symbol
+    weights straight through, so a hand-edited 150% set turns a 10,000 budget into
+    15,000 of buys and a 60% set silently leaves 40% of it as cash. Neither is
+    something ``validate_invest_amount`` can see.
+
+    ``validate_label_targets`` cannot be reused on this path: a single chosen
+    label at 40% would fail its labels-total-100 rule spuriously. Task 23's
+    ``validate_symbol_weights`` exists for exactly this -- symbol level only,
+    ``target_pct`` deliberately ignored.
+
+    Returns:
+        List[str]: EMPTY means the wizard may proceed to the dry-run. May contain
+        the buying-power ADVISORY, which explains rather than blocks; filter with
+        ``blocking_messages``.
+    """
+    if label is None:
+        return [ERROR_INVEST_NO_LABEL]
+    messages: List[str] = []
+    if not label.symbols:
+        # An empty label absorbs nothing, so the whole amount would sit as cash
+        # and the run would do literally nothing. Say so instead.
+        messages.append(ERROR_INVEST_LABEL_EMPTY_FMT.format(label=label.label))
+    messages.extend(validate_symbol_weights(label, tolerance=tolerance))
+    messages.extend(validate_invest_amount(
+        amount, available_buying_power=available_buying_power))
+    return messages
+
+
+def is_blocking_message(message: str) -> bool:
+    """True when this validation message must stop Submit. Pure.
+
+    Blocking is the DEFAULT: only the fragments in ``ADVISORY_MESSAGE_FRAGMENTS``
+    are advisory, so a validator gaining a new error keeps Submit blocked without
+    anyone remembering to update this.
+    """
+    return not any(fragment in message for fragment in ADVISORY_MESSAGE_FRAGMENTS)
+
+
+def blocking_messages(messages: List[str]) -> List[str]:
+    """The subset of ``messages`` that must stop Submit. Pure.
+
+    EMPTY means the wizard may proceed even though ``messages`` may not be: an
+    amount over buying power is worth showing and not worth refusing.
+    """
+    return [m for m in messages or [] if is_blocking_message(m)]

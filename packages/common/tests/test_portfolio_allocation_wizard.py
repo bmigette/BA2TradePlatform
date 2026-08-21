@@ -8,6 +8,10 @@ import pytest
 
 from ba2_common.core.account_types import AccountSnapshot, MarginInfo
 from ba2_common.core.portfolio_allocation import (
+    ERROR_INVEST_AMOUNT_FMT,
+    ERROR_INVEST_LABEL_EMPTY_FMT,
+    ERROR_INVEST_NO_LABEL,
+    ERROR_SYMBOL_TOTAL_FMT,
     REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_FMT,
     REASON_BELOW_MIN_ORDER_FMT,
     VALUATION_MODE_COST,
@@ -18,13 +22,19 @@ from ba2_common.core.portfolio_allocation import (
     LabelTarget,
     PositionState,
     SymbolTarget,
+    WARNING_INVEST_EXCEEDS_BP_FMT,
     WARNING_NO_MULTIPLIER,
+    blocking_messages,
     build_base_snapshot,
     compute_allocation,
     compute_base_notional,
     dry_run_rows,
+    even_split_targets,
     filter_plan_rows,
+    invest_validation_messages,
+    steps_validation_messages,
     summarise_plan,
+    validate_invest_amount,
 )
 from ba2_common.core.types import OrderDirection
 
@@ -327,3 +337,149 @@ def test_dry_run_rows_of_a_suppressed_row_is_not_counted_by_filter_plan_rows():
     filtered = filter_plan_rows(plan, ["PENNY"])
     assert filtered.total_buy_value == pytest.approx(0.0)
     assert filtered.required_buying_power == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# Task 71: wizard steps 1-3 -- label percentages, symbol weights, INVEST amount.
+# ---------------------------------------------------------------------------
+
+
+def test_even_split_targets_gives_each_label_an_equal_share_totalling_100():
+    labels = [LabelTarget("A", 0.0, [SymbolTarget("AAA", 100.0)]),
+              LabelTarget("B", 0.0, [SymbolTarget("BBB", 100.0)]),
+              LabelTarget("C", 0.0, [SymbolTarget("CCC", 100.0)])]
+    out = even_split_targets(labels)
+    assert [t.target_pct for t in out] == [33.33, 33.33, 33.34]
+    assert sum(t.target_pct for t in out) == pytest.approx(100.0)
+    assert [t.label for t in out] == ["A", "B", "C"]
+    # The originals are not mutated -- the dialog can still cancel.
+    assert [t.target_pct for t in labels] == [0.0, 0.0, 0.0]
+
+
+def test_even_split_targets_of_nothing_is_empty():
+    assert even_split_targets([]) == []
+
+
+def test_even_split_targets_gives_each_copy_its_own_symbol_list():
+    labels = [LabelTarget("A", 0.0, [SymbolTarget("AAA", 100.0)])]
+    out = even_split_targets(labels)
+    out[0].symbols.append(SymbolTarget("BBB", 0.0))
+    assert [st.symbol for st in labels[0].symbols] == ["AAA"]
+
+
+def test_even_split_targets_passes_its_own_output_to_the_validator():
+    """The 0.01pp tolerance is tight enough to reject a naive 3 x 33.33 = 99.99,
+    which is exactly why defaults must come from here and never by hand."""
+    labels = [LabelTarget(name, 0.0, [SymbolTarget(name * 3, 100.0)])
+              for name in ("A", "B", "C")]
+    assert steps_validation_messages(even_split_targets(labels)) == []
+
+
+def test_steps_validation_reports_the_label_total_and_the_symbol_totals():
+    labels = [LabelTarget("A", 60.0, [SymbolTarget("AAA", 40.0), SymbolTarget("BBB", 40.0)]),
+              LabelTarget("B", 40.0, [SymbolTarget("CCC", 100.0)])]
+    messages = steps_validation_messages(labels)
+    assert any("A" in m and "80.00" in m for m in messages)
+
+
+def test_steps_validation_does_not_report_a_symbol_total_twice():
+    """``validate_label_targets`` already folds in ``validate_symbol_weights``
+    (Task 22). A second loop here emitted the identical string a second time."""
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("AAA", 40.0), SymbolTarget("BBB", 40.0)])]
+    messages = steps_validation_messages(labels)
+    assert messages.count(ERROR_SYMBOL_TOTAL_FMT.format(label="A", total=80.0)) == 1
+
+
+def test_steps_validation_is_empty_for_a_fully_valid_set():
+    labels = [LabelTarget("A", 60.0, [SymbolTarget("AAA", 50.0), SymbolTarget("BBB", 50.0)]),
+              LabelTarget("B", 40.0, [SymbolTarget("CCC", 100.0)])]
+    assert steps_validation_messages(labels) == []
+
+
+def test_steps_validation_includes_the_label_target_errors_too():
+    """Step 1's rule (labels total 100) and step 2's rule (weights total 100 inside
+    each label) are reported together, so Submit is blocked on either."""
+    labels = [LabelTarget("A", 55.0, [SymbolTarget("AAA", 100.0)])]
+    messages = steps_validation_messages(labels)
+    assert any("must total 100%" in m for m in messages)
+
+
+def test_validate_invest_amount_accepts_a_positive_amount_within_buying_power():
+    assert validate_invest_amount(500.0, available_buying_power=10_000.0) == []
+
+
+def test_validate_invest_amount_rejects_zero_and_negative():
+    assert validate_invest_amount(0.0, available_buying_power=10_000.0) == [
+        ERROR_INVEST_AMOUNT_FMT.format(amount=0.0)]
+    assert validate_invest_amount(-5.0, available_buying_power=10_000.0)
+
+
+def test_validate_invest_amount_warns_when_it_exceeds_buying_power():
+    messages = validate_invest_amount(20_000.0, available_buying_power=10_000.0)
+    assert any("buying power" in m for m in messages)
+
+
+# -- the INVEST_LABEL gate: the amount is not the only thing that can be wrong --
+
+
+def test_invest_validation_blocks_a_symbol_weight_set_that_does_not_total_100():
+    """``compute_label_investment`` multiplies the weights straight through, so a
+    150% set turns a 10,000 budget into 15,000 of buys. ``validate_invest_amount``
+    only looks at the amount; the weights need their own gate."""
+    label = LabelTarget("Income", 40.0, [SymbolTarget("AAA", 100.0),
+                                         SymbolTarget("BBB", 50.0)])
+    messages = invest_validation_messages(label, 10_000.0,
+                                          available_buying_power=50_000.0)
+    assert messages == [ERROR_SYMBOL_TOTAL_FMT.format(label="Income", total=150.0)]
+
+
+def test_invest_validation_ignores_the_labels_own_percentage():
+    """A single label at 40% must not trip the labels-total-100 rule -- the amount
+    is the whole budget, so ``target_pct`` is meaningless on this path."""
+    label = LabelTarget("Income", 40.0, [SymbolTarget("AAA", 100.0)])
+    assert invest_validation_messages(label, 1_000.0,
+                                      available_buying_power=50_000.0) == []
+
+
+def test_invest_validation_requires_a_label():
+    assert invest_validation_messages(None, 1_000.0,
+                                      available_buying_power=50_000.0) == [
+        ERROR_INVEST_NO_LABEL]
+
+
+def test_invest_validation_rejects_a_label_that_can_absorb_nothing():
+    label = LabelTarget("Empty", 0.0, [])
+    assert invest_validation_messages(label, 1_000.0,
+                                      available_buying_power=50_000.0) == [
+        ERROR_INVEST_LABEL_EMPTY_FMT.format(label="Empty")]
+
+
+def test_invest_validation_reports_the_weights_and_the_amount_together():
+    label = LabelTarget("Income", 40.0, [SymbolTarget("AAA", 90.0)])
+    messages = invest_validation_messages(label, 0.0, available_buying_power=50_000.0)
+    assert ERROR_SYMBOL_TOTAL_FMT.format(label="Income", total=90.0) in messages
+    assert ERROR_INVEST_AMOUNT_FMT.format(amount=0.0) in messages
+
+
+def test_blocking_messages_drops_the_buying_power_advisory():
+    """Over-spending buying power EXPLAINS -- the engine scales the plan down and
+    the dry-run shows the result, which beats refusing to compute it."""
+    label = LabelTarget("Income", 40.0, [SymbolTarget("AAA", 100.0)])
+    messages = invest_validation_messages(label, 20_000.0,
+                                          available_buying_power=10_000.0)
+    assert messages == [WARNING_INVEST_EXCEEDS_BP_FMT.format(
+        amount=20_000.0, available=10_000.0)]
+    assert blocking_messages(messages) == []
+
+
+def test_blocking_messages_keeps_the_zero_amount_error():
+    """It and the advisory both start 'amount ...', so a leading-prefix test
+    would swallow a real error."""
+    messages = validate_invest_amount(0.0, available_buying_power=10_000.0)
+    assert blocking_messages(messages) == messages
+
+
+def test_blocking_messages_keeps_every_rebalance_error():
+    labels = [LabelTarget("A", 55.0, [SymbolTarget("AAA", 100.0)])]
+    messages = steps_validation_messages(labels)
+    assert messages and blocking_messages(messages) == messages
