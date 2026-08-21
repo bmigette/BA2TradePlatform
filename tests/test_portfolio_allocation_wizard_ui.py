@@ -27,6 +27,8 @@ from ba2_trade_platform.core.portfolio_allocation import (
     AllocationPlan,
     AllocationRow,
     BaseSnapshot,
+    LabelTarget,
+    SymbolTarget,
     VALUATION_MODE_MARKET,
 )
 from ba2_trade_platform.core.types import OrderDirection
@@ -285,3 +287,247 @@ def test_a_plan_with_no_cash_balance_says_so_instead_of_guessing(nicegui_client)
 
     assert any("Est. cash after: unknown" in t for t in texts)
     assert not any("Est. cash after: 0" in t for t in texts)
+
+
+# ---------------------------------------------------------------------------
+# Task 71: steps 1-3 (rebalance) and the INVEST_LABEL mode.
+# ---------------------------------------------------------------------------
+
+
+def _labels():
+    return [
+        LabelTarget("Growth", 60.0, [SymbolTarget("AAPL", 50.0), SymbolTarget("MSFT", 50.0)]),
+        LabelTarget("Income", 40.0, [SymbolTarget("KO", 100.0)]),
+    ]
+
+
+def _open_steps(client, wiz, labels=None, **kwargs):
+    calls = []
+    kwargs.setdefault('on_dry_run', lambda **kw: calls.append(kw))
+    with client:
+        steps = wiz.open_allocation_steps(_base(), labels if labels is not None else _labels(),
+                                          **kwargs)
+    return steps, calls
+
+
+def _numbers(client, wiz, marker):
+    return [d for d in client.layout.descendants()
+            if marker in getattr(d, '_markers', [])]
+
+
+def test_wizard_module_exposes_the_steps_entry_point():
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    assert callable(wiz.open_allocation_steps)
+    params = inspect.signature(wiz.open_allocation_steps).parameters
+    assert list(params)[:2] == ["base", "labels"]
+    assert "on_dry_run" in params
+    assert "mode" in params
+    assert "invest_amount" in params
+
+
+def test_the_steps_dialog_draws_both_rebalance_steps(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    steps, _ = _open_steps(nicegui_client, wiz)
+    texts = _rendered_texts(nicegui_client.layout)
+
+    for expected in ("Growth", "Income", "Even split", "Continue to dry run", "Cancel"):
+        assert expected in texts
+    assert steps._continue_button.enabled is True
+
+
+def test_the_steps_dialog_edits_a_copy_so_cancelling_changes_nothing(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    original = _labels()
+    steps, _ = _open_steps(nicegui_client, wiz, labels=original)
+    with nicegui_client:
+        _numbers(nicegui_client, wiz, wiz.MARKER_LABEL_PCT)[0].set_value(10.0)
+
+    assert steps.labels[0].target_pct == pytest.approx(10.0)
+    assert original[0].target_pct == pytest.approx(60.0)
+    assert original[0].symbols[0].weight_pct == pytest.approx(50.0)
+
+
+def test_each_label_box_edits_its_own_label(nicegui_client):
+    """The classic NiceGUI closure bug: without a default-argument capture every
+    on_change writes to the LAST label in the loop."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    steps, _ = _open_steps(nicegui_client, wiz)
+    with nicegui_client:
+        _numbers(nicegui_client, wiz, wiz.MARKER_LABEL_PCT)[0].set_value(70.0)
+
+    assert [lt.target_pct for lt in steps.labels] == [70.0, 40.0]
+
+
+def test_each_symbol_box_edits_its_own_symbol(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    steps, _ = _open_steps(nicegui_client, wiz)
+    with nicegui_client:
+        _numbers(nicegui_client, wiz, wiz.MARKER_SYMBOL_PCT)[0].set_value(30.0)
+
+    assert [st.weight_pct for st in steps.labels[0].symbols] == [30.0, 50.0]
+    assert [st.weight_pct for st in steps.labels[1].symbols] == [100.0]
+
+
+def test_a_label_total_that_is_not_100_blocks_continue(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    steps, calls = _open_steps(nicegui_client, wiz)
+    with nicegui_client:
+        _numbers(nicegui_client, wiz, wiz.MARKER_LABEL_PCT)[0].set_value(70.0)
+        errors = _rendered_texts(steps._errors_container)
+        assert steps._continue_button.enabled is False
+        steps._continue()
+
+    assert any("must total 100%" in t for t in errors)
+    assert calls == []
+
+
+def test_a_symbol_weight_total_that_is_not_100_blocks_continue(nicegui_client):
+    """Step 2's rule, not just step 1's."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    steps, calls = _open_steps(nicegui_client, wiz)
+    with nicegui_client:
+        _numbers(nicegui_client, wiz, wiz.MARKER_SYMBOL_PCT)[0].set_value(30.0)
+        assert steps._continue_button.enabled is False
+        steps._continue()
+
+    assert calls == []
+
+
+def test_even_split_rewrites_the_label_percentages_to_total_exactly_100(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    labels = [LabelTarget(name, 0.0, [SymbolTarget(name * 2, 100.0)])
+              for name in ("A", "B", "C")]
+    steps, _ = _open_steps(nicegui_client, wiz, labels=labels)
+    with nicegui_client:
+        steps._even_split()
+
+    assert [lt.target_pct for lt in steps.labels] == [33.33, 33.33, 33.34]
+    assert steps._continue_button.enabled is True
+
+
+def test_continue_hands_the_edited_targets_to_the_dry_run(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    steps, calls = _open_steps(nicegui_client, wiz)
+    with nicegui_client:
+        steps._continue()
+
+    assert len(calls) == 1
+    call = calls[0]
+    assert call["mode"] == wiz.ALLOCATION_MODE_REBALANCE
+    assert [lt.label for lt in call["labels"]] == ["Growth", "Income"]
+    assert call["scope_label"] is None
+    assert call["amount"] == 0.0
+    assert call["allow_fractional"] is False
+
+
+def test_fractional_is_off_by_default_and_unavailable_without_broker_support(nicegui_client):
+    """Opt-in per run (decision 12), and only offerable when the broker splits
+    shares at all."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    steps, _ = _open_steps(nicegui_client, wiz)
+    assert steps.allow_fractional is False
+    assert steps._fractional_switch.enabled is False   # _base() has no support
+
+    base = _base()
+    base.supports_fractional = True
+    with nicegui_client:
+        supported = wiz.open_allocation_steps(base, _labels(), on_dry_run=lambda **kw: None)
+    assert supported.allow_fractional is False
+    assert supported._fractional_switch.enabled is True
+
+
+# -- INVEST_LABEL -----------------------------------------------------------
+
+
+def test_invest_mode_draws_a_label_picker_and_an_amount(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    steps, _ = _open_steps(nicegui_client, wiz, mode=wiz.ALLOCATION_MODE_INVEST_LABEL,
+                           invest_amount=250.0)
+    texts = _rendered_texts(nicegui_client.layout)
+
+    assert steps.scope_label == "Growth"
+    assert steps.invest_amount == pytest.approx(250.0)
+    assert "Invest into one label" in texts
+    # Step 1's percentage editor belongs to REBALANCE only: the amount IS the
+    # budget here, so a label's target_pct is meaningless.
+    assert _numbers(nicegui_client, wiz, wiz.MARKER_LABEL_PCT) == []
+
+
+def test_invest_mode_does_not_apply_the_labels_total_100_rule(nicegui_client):
+    """A single label at 40% is legitimate on this path."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    steps, calls = _open_steps(nicegui_client, wiz,
+                               labels=[LabelTarget("Income", 40.0,
+                                                   [SymbolTarget("KO", 100.0)])],
+                               mode=wiz.ALLOCATION_MODE_INVEST_LABEL,
+                               invest_amount=250.0)
+    with nicegui_client:
+        assert steps._continue_button.enabled is True
+        steps._continue()
+
+    assert calls[0]["mode"] == wiz.ALLOCATION_MODE_INVEST_LABEL
+    assert [lt.label for lt in calls[0]["labels"]] == ["Income"]
+    assert calls[0]["scope_label"] == "Income"
+    assert calls[0]["amount"] == pytest.approx(250.0)
+
+
+def test_invest_mode_blocks_a_symbol_weight_set_that_does_not_total_100(nicegui_client):
+    """compute_label_investment multiplies the weights straight through, so a
+    150% set would spend 375 of a 250 budget with nothing stopping it."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    labels = [LabelTarget("Income", 40.0, [SymbolTarget("KO", 100.0),
+                                           SymbolTarget("PEP", 50.0)])]
+    steps, calls = _open_steps(nicegui_client, wiz, labels=labels,
+                               mode=wiz.ALLOCATION_MODE_INVEST_LABEL,
+                               invest_amount=250.0)
+    with nicegui_client:
+        errors = _rendered_texts(steps._errors_container)
+        assert steps._continue_button.enabled is False
+        steps._continue()
+
+    assert any("150.00" in t for t in errors)
+    assert calls == []
+
+
+def test_invest_mode_blocks_a_zero_amount(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    steps, calls = _open_steps(nicegui_client, wiz,
+                               mode=wiz.ALLOCATION_MODE_INVEST_LABEL,
+                               invest_amount=0.0)
+    with nicegui_client:
+        assert steps._continue_button.enabled is False
+        steps._continue()
+
+    assert calls == []
+
+
+def test_invest_mode_explains_but_does_not_block_an_amount_above_buying_power(nicegui_client):
+    """The engine scales the plan down and the dry-run shows the result, which is
+    more useful than refusing to compute it."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    steps, calls = _open_steps(nicegui_client, wiz,
+                               mode=wiz.ALLOCATION_MODE_INVEST_LABEL,
+                               invest_amount=99_000.0)
+    with nicegui_client:
+        errors = _rendered_texts(steps._errors_container)
+        assert steps._continue_button.enabled is True
+        steps._continue()
+
+    assert any("exceeds available buying power" in t for t in errors)
+    assert len(calls) == 1
+    assert calls[0]["amount"] == pytest.approx(99_000.0)

@@ -20,10 +20,19 @@ from typing import Callable, Dict, List, Optional
 from nicegui import ui
 
 from ...core.portfolio_allocation import (
+    ALLOCATION_MODE_INVEST_LABEL,
+    ALLOCATION_MODE_REBALANCE,
     AllocationPlan,
     BaseSnapshot,
+    LabelTarget,
+    SymbolTarget,
+    blocking_messages,
     dry_run_rows,
+    even_split_targets,
     filter_plan_rows,
+    invest_validation_messages,
+    is_blocking_message,
+    steps_validation_messages,
     summarise_plan,
 )
 from ...logger import logger
@@ -53,6 +62,17 @@ MARKER_ORDER_KIND = 'dry-run-order-kind'
 
 #: NiceGUI marker on the dry-run table's per-row tick box. Rendered in plan order.
 MARKER_ROW_TICK = 'dry-run-row-tick'
+
+#: Markers on the step 1 / step 2 percentage boxes, in label then symbol order.
+MARKER_LABEL_PCT = 'steps-label-pct'
+MARKER_SYMBOL_PCT = 'steps-symbol-pct'
+
+#: Shown under the INVEST_LABEL amount box.
+INVEST_SCOPE_NOTE = ('Pre-filled with the unallocated income total. Buys only - '
+                     'an INVEST run never sells.')
+
+#: Shown on the fractional switch when the broker does not split shares at all.
+NO_FRACTIONAL_SUPPORT_NOTE = 'This broker does not support fractional shares.'
 
 
 class AllocationWizard:
@@ -258,6 +278,216 @@ def open_allocation_wizard(
     wizard = AllocationWizard(base, plan, on_refresh=on_refresh, on_submit=on_submit, title=title)
     wizard.open()
     return wizard
+
+
+class AllocationSteps:
+    """Steps 1-3 of the wizard, drawn as three sections in ONE dialog.
+
+    This repo uses no ``ui.stepper``, so the three steps are stacked sections
+    with a single validated Continue button; the pure validators decide whether
+    Continue is enabled and their messages are shown verbatim.
+
+    REBALANCE mode edits label percentages (step 1) and symbol weights (step 2),
+    gated by ``steps_validation_messages``. INVEST_LABEL mode replaces step 1
+    with a label picker plus an amount box and skips the labels-total-100 rule
+    entirely -- the amount is the whole budget (decision: buys only, no sells) --
+    but it is NOT ungated: ``invest_validation_messages`` still holds the chosen
+    label's symbol weights to 100%, because ``compute_label_investment``
+    multiplies them straight through and a 150% set would overspend the budget by
+    half.
+
+    Nothing is written here, and the caller's ``labels`` are deep-copied on the
+    way in, so Cancel really cancels. Continue hands the edited targets to
+    ``on_dry_run``, which solves and opens ``AllocationWizard``.
+    """
+
+    def __init__(self, base: BaseSnapshot, labels: List[LabelTarget], *,
+                 on_dry_run: Callable[..., None],
+                 mode: str = ALLOCATION_MODE_REBALANCE,
+                 invest_amount: float = 0.0):
+        self.base = base
+        self.labels = [LabelTarget(label=lt.label, target_pct=lt.target_pct,
+                                   symbols=[SymbolTarget(st.symbol, st.weight_pct, st.comment)
+                                            for st in lt.symbols],
+                                   comment=lt.comment)
+                       for lt in labels or []]
+        self.on_dry_run = on_dry_run
+        self.mode = mode
+        self.invest_amount = float(invest_amount or 0.0)
+        # Fractional is opt-in PER RUN (decision 12), so it always starts off --
+        # never inherited from the account, and never on by default.
+        self.allow_fractional = False
+        self.scope_label = self.labels[0].label if self.labels else None
+        self.dialog = None
+        self._errors_container = None
+        self._continue_button = None
+        self._fractional_switch = None
+        self._labels_container = None
+
+    def open(self):
+        title = ('Rebalance - set targets' if self.mode == ALLOCATION_MODE_REBALANCE
+                 else 'Invest into one label')
+        with ui.dialog().props('maximized') as dialog, ui.card().classes('w-full h-full overflow-auto'):
+            self.dialog = dialog
+            ui.label(title).classes('text-xl font-bold')
+
+            if self.mode == ALLOCATION_MODE_REBALANCE:
+                self._render_step1_label_targets()
+                self._render_step2_symbol_weights()
+            else:
+                self._render_invest_scope()
+
+            self._render_step3_base_panel()
+            self._errors_container = ui.column().classes('w-full')
+            with ui.row().classes('w-full justify-end gap-2 mt-4'):
+                ui.button('Cancel', on_click=dialog.close).props('flat')
+                self._continue_button = ui.button('Continue to dry run',
+                                                  on_click=self._continue).props('color=primary')
+            self._revalidate()
+        dialog.open()
+        return dialog
+
+    # -- steps ------------------------------------------------------------
+    def _render_step1_label_targets(self):
+        ui.label('1. Label targets (% of the base notional, must total 100%)') \
+            .classes('text-lg font-bold mt-2')
+        ui.button('Even split', icon='balance', on_click=self._even_split).props('outline dense')
+        self._labels_container = ui.column().classes('w-full gap-1')
+        self._draw_label_targets()
+
+    def _draw_label_targets(self):
+        self._labels_container.clear()
+        with self._labels_container:
+            for lt in self.labels:
+                with ui.row().classes('w-full items-center gap-3'):
+                    ui.label(lt.label).classes('w-40 font-medium')
+                    # ``t=lt`` is load-bearing: without the default-argument
+                    # capture every box would write to the LAST label.
+                    ui.number(value=lt.target_pct, min=0, max=100, step=0.01, suffix='%',
+                              on_change=lambda e, t=lt: self._set_label_pct(t, e.value)
+                              ).props('dense outlined').classes('w-32').mark(MARKER_LABEL_PCT)
+
+    def _render_step2_symbol_weights(self):
+        ui.label('2. Symbol weights within each label (each label must total 100%)') \
+            .classes('text-lg font-bold mt-4')
+        for lt in self.labels:
+            with ui.expansion(f'{lt.label} - {len(lt.symbols)} symbol(s)').classes('w-full'):
+                if not lt.symbols:
+                    ui.label('No symbols carry this label - it can absorb no allocation.') \
+                        .classes('text-xs text-orange-400')
+                    continue
+                for st in lt.symbols:
+                    with ui.row().classes('w-full items-center gap-3'):
+                        ui.label(st.symbol).classes('w-32')
+                        ui.number(value=st.weight_pct, min=0, max=100, step=0.01, suffix='%',
+                                  on_change=lambda e, t=st: self._set_symbol_pct(t, e.value)
+                                  ).props('dense outlined').classes('w-32').mark(MARKER_SYMBOL_PCT)
+
+    def _render_invest_scope(self):
+        ui.label('1. Which label, and how much').classes('text-lg font-bold mt-2')
+        with ui.row().classes('w-full items-center gap-3'):
+            ui.select([lt.label for lt in self.labels], value=self.scope_label, label='Label',
+                      on_change=self._set_scope).props('dense outlined').classes('w-56')
+            ui.number(value=self.invest_amount, min=0, step=0.01, label='Amount',
+                      on_change=self._set_amount).props('dense outlined').classes('w-40')
+        ui.label(INVEST_SCOPE_NOTE).classes('text-xs text-secondary-custom')
+
+    def _render_step3_base_panel(self):
+        ui.label('3. What there is to allocate').classes('text-lg font-bold mt-4')
+        with ui.row().classes('w-full gap-6 items-center'):
+            ui.label(f'Buying power: {self.base.available_buying_power:,.2f}')
+            ui.label(f'Managed value ({self.base.valuation_mode}): '
+                     f'{self.base.managed_value:,.2f}')
+            ui.label(f'Base notional: {self.base.base_notional:,.2f}').classes('font-bold')
+            ui.label(f"as of {self.base.taken_at:%Y-%m-%d %H:%M UTC}").classes('text-xs text-gray-400')
+        for warning in self.base.warnings:
+            ui.label(warning).classes('text-xs text-orange-400')
+        self._fractional_switch = ui.switch(
+            'Allow fractional shares', value=self.allow_fractional,
+            on_change=lambda e: setattr(self, 'allow_fractional', bool(e.value)))
+        # Offering a toggle the broker cannot honour would produce a plan sized on
+        # a grid that does not exist; the engine silently falls back to whole
+        # shares, so the user would see targets they never asked for.
+        self._fractional_switch.set_enabled(bool(self.base.supports_fractional))
+        if not self.base.supports_fractional:
+            ui.label(NO_FRACTIONAL_SUPPORT_NOTE).classes('text-xs text-gray-400')
+
+    # -- state + validation ------------------------------------------------
+    def _even_split(self):
+        for edited, fresh in zip(self.labels, even_split_targets(self.labels)):
+            edited.target_pct = fresh.target_pct
+        self._draw_label_targets()
+        self._revalidate()
+
+    def _set_label_pct(self, target: LabelTarget, value):
+        target.target_pct = float(value or 0.0)
+        self._revalidate()
+
+    def _set_symbol_pct(self, target: SymbolTarget, value):
+        target.weight_pct = float(value or 0.0)
+        self._revalidate()
+
+    def _set_scope(self, event):
+        self.scope_label = event.value
+        self._revalidate()
+
+    def _set_amount(self, event):
+        self.invest_amount = float(event.value or 0.0)
+        self._revalidate()
+
+    def _scope_target(self) -> Optional[LabelTarget]:
+        return next((lt for lt in self.labels if lt.label == self.scope_label), None)
+
+    def _problems(self) -> List[str]:
+        if self.mode == ALLOCATION_MODE_REBALANCE:
+            return steps_validation_messages(self.labels)
+        return invest_validation_messages(
+            self._scope_target(), self.invest_amount,
+            available_buying_power=self.base.available_buying_power)
+
+    def _revalidate(self):
+        if self._errors_container is None:
+            return
+        messages = self._problems()
+        self._errors_container.clear()
+        with self._errors_container:
+            for message in messages:
+                blocking = is_blocking_message(message)
+                ui.label(('✖ ' if blocking else '⚠ ') + message).classes(
+                    'text-xs ' + ('text-red-500' if blocking else 'text-orange-400'))
+        if self._continue_button is not None:
+            self._continue_button.set_enabled(not blocking_messages(messages))
+
+    def _continue(self):
+        # Re-checked here and not only on the button's enabled state: the button
+        # is a mirror of this, and a mirror can be stale.
+        if blocking_messages(self._problems()):
+            ui.notify('Fix the highlighted problems first', type='warning')
+            return
+        if self.dialog is not None:
+            self.dialog.close()
+        if self.mode == ALLOCATION_MODE_REBALANCE:
+            self.on_dry_run(mode=ALLOCATION_MODE_REBALANCE, labels=self.labels,
+                            scope_label=None, amount=0.0,
+                            allow_fractional=self.allow_fractional)
+        else:
+            scope = self._scope_target()
+            self.on_dry_run(mode=ALLOCATION_MODE_INVEST_LABEL,
+                            labels=[scope] if scope else [], scope_label=self.scope_label,
+                            amount=self.invest_amount,
+                            allow_fractional=self.allow_fractional)
+
+
+def open_allocation_steps(base: BaseSnapshot, labels: List[LabelTarget], *,
+                          on_dry_run: Callable[..., None],
+                          mode: str = ALLOCATION_MODE_REBALANCE,
+                          invest_amount: float = 0.0) -> AllocationSteps:
+    """Open steps 1-3. ``on_dry_run`` is called with keyword arguments
+    ``mode``, ``labels``, ``scope_label``, ``amount`` and ``allow_fractional``."""
+    steps = AllocationSteps(base, labels, on_dry_run=on_dry_run, mode=mode,
+                            invest_amount=invest_amount)
+    steps.open()
+    return steps
 
 
 def render_income_panel(events: List[Dict], open_total: float,
