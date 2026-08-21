@@ -1,7 +1,7 @@
 import asyncio
 import threading
 from typing import Any, Dict, List, Optional
-from datetime import datetime, timezone, date, timedelta
+from datetime import datetime, date, timedelta
 from decimal import Decimal
 from concurrent.futures import TimeoutError as FutureTimeoutError
 
@@ -14,7 +14,7 @@ from sqlmodel import select
 
 from ...logger import logger
 from ...core.db import add_instance, get_db, get_instance, update_instance, InstanceNotFound
-from ...core.models import Position, TradingOrder
+from ...core.models import Position, TradingOrder, Transaction
 from ...core.types import OrderDirection, OrderStatus
 from ...core.types import OrderType as CoreOrderType
 from ...core.account_types import (
@@ -23,7 +23,6 @@ from ...core.account_types import (
     MARGIN_SOURCE_DEFAULT, MARGIN_SOURCE_POSITION,
 )
 from ...core.interfaces import AccountInterface
-from ...core.models import Transaction
 
 
 class TastyTradeAccount(AccountInterface):
@@ -131,7 +130,6 @@ class TastyTradeAccount(AccountInterface):
 
     def _connect(self):
         """Establish connection to TastyTrade API."""
-        from tastytrade.session import Session as TastySession
         from tastytrade.account import Account as TastyAccount
 
         is_test = self._is_sandbox()
@@ -696,12 +694,11 @@ class TastyTradeAccount(AccountInterface):
             return None
 
         from tastytrade.market_data import get_market_data, get_market_data_by_type
-        from tastytrade.order import InstrumentType
 
         if isinstance(symbol_or_symbols, str):
             try:
                 data = self._run_async(
-                    get_market_data(self._session, symbol_or_symbols, InstrumentType.EQUITY))
+                    get_market_data(self._session, symbol_or_symbols, TTInstrumentType.EQUITY))
                 return self._pick_price(data, price_type)
             except Exception as e:
                 logger.error(
