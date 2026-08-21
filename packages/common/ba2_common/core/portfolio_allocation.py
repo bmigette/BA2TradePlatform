@@ -1353,7 +1353,10 @@ def compute_label_investment(label: LabelTarget, amount: float,
     IGNORED -- the amount is the whole budget, and it is ADDED to whatever the
     account already holds rather than rebalanced towards. No sells are ever
     produced, so ``plan.total_sell_value`` is always 0.0 and
-    ``plan.net_buy_value == plan.total_buy_value``. Buying-power scaling,
+    ``plan.net_buy_value == plan.total_buy_value`` -- redistribution is inside that
+    promise: on a budget basis it may only make a BUY smaller, never open a sale, so
+    a bump that overshoots the budget is reported rather than sold back off.
+    Buying-power scaling,
     rounding, missing prices and missing margin info behave exactly as in
     ``compute_allocation``, and a symbol repeated inside the label COALESCES into
     one row whose weight is the sum -- again as in ``compute_allocation``.
@@ -2331,6 +2334,15 @@ def _absorb_residual(row: "AllocationRow", residual: float,
         if current > 0:
             # Buying LESS, again never to zero.
             steps = min(steps, int(math.floor(current / unit + QUANTITY_EPSILON)) - 1)
+        elif allocation_basis == ALLOCATION_BASIS_BUDGET:
+            # An INVEST_LABEL run DEPLOYS money and never sells -- the contract
+            # ``compute_label_investment`` states and everything downstream reads
+            # (``total_sell_value == 0``, ``net_buy_value == total_buy_value``, and
+            # so the income ledger's consumption). A bump can push such a label over
+            # its budget, and the honest answer is to buy less somewhere -- opening
+            # a SELL on a position the user never mentioned, to give back 50 of
+            # rounding, realises a gain and is a different trade. Reported instead.
+            return 0.0
         else:
             # Selling MORE. Never below flat, and never all the way to flat: closing
             # a position is a target decision, not a rounding fix. One unit stays.
@@ -2419,6 +2431,13 @@ def redistribute_label_residuals(plan: "AllocationPlan",
     over. The difference is SIGNED and redistribution is BIDIRECTIONAL: it adds
     weight to close a shortfall and REMOVES weight to close an overshoot. A
     one-directional "top up" is wrong the moment a single symbol is bumped.
+
+    On ``ALLOCATION_BASIS_BUDGET`` (an INVEST_LABEL run) removing weight means
+    BUYING LESS and nothing else: a row that is not already buying is left alone
+    rather than turned into a SELL. That flow's contract is "deploy this money", and
+    opening a sale of an existing holding to give back a bump's rounding is a
+    different trade with a realised gain behind it. The give-back that no buy can
+    absorb is reported as the label's residual instead.
 
     Mutates ``plan.rows`` in place and appends to ``plan.warnings``. Runs INSIDE the
     two solvers, before ``_apply_bp_scaling`` -- and it can never be the reason that

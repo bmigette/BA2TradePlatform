@@ -467,6 +467,54 @@ def test_an_invest_label_run_redistributes_against_the_budget_not_the_holding():
     assert plan.total_buy_value == pytest.approx(1_000.0)
 
 
+def test_a_budget_basis_residual_is_never_closed_by_opening_a_sell():
+    """``compute_label_investment`` promises "no sells are ever produced", and
+    redistribution is inside that promise.
+
+    BUMP was bumped to one 300 share against a 250 budget, so the label is 50 OVER.
+    The bumped row is one-way and cannot give it back, which leaves HELD -- flat in
+    this run, but holding 10 shares of a 25 stock. Selling 2 of them would balance
+    the arithmetic and would also be a trade nobody asked for, in a flow whose whole
+    contract is "deploy this money": it realises a gain, it moves a position the
+    user never mentioned, and it quietly shrinks ``net_buy_value``, which is what
+    consumes the income ledger. The 50 is REPORTED instead.
+    """
+    bump = _buy_row("BUMP", 300.0, 1.0, target_notional=250.0, labels=("L",))
+    bump.sizing_outcome = pa.SIZING_OUTCOME_BUMPED
+    held = _buy_row("HELD", 25.0, 0.0, current_quantity=10.0,
+                    current_cost_basis=250.0, target_notional=0.0, labels=("L",))
+    plan = AllocationPlan(rows=[bump, held], available_buying_power=100_000.0,
+                          valuation_mode=pa.VALUATION_MODE_COST,
+                          allocation_basis=pa.ALLOCATION_BASIS_BUDGET)
+    left = pa.redistribute_label_residuals(plan, {"L": {"BUMP": 250.0, "HELD": 0.0}},
+                                           {"BUMP": _whole("BUMP"), "HELD": _whole("HELD")},
+                                           allow_fractional=False)
+    assert held.delta_quantity == 0.0
+    assert held.side is None
+    assert held.redistributed is False
+    assert left["L"] == pytest.approx(-50.0)
+
+
+def test_an_invest_label_run_reports_a_bumps_overshoot_rather_than_selling_it_off():
+    """The same thing end to end, through the solver that makes the promise."""
+    label = LabelTarget("L", 100.0, [SymbolTarget("BUMP", 100.0),
+                                     SymbolTarget("HELD", 0.0)])
+    current = {"BUMP": _pos("BUMP", 300.0),
+               "HELD": _pos("HELD", 25.0, quantity=10.0, cost_basis=250.0)}
+    margin = {"BUMP": _whole("BUMP"), "HELD": _whole("HELD")}
+    plan = pa.compute_label_investment(label, 250.0, current, margin,
+                                       available_buying_power=1_000_000.0,
+                                       allow_fractional=False, default_bp_factor=1.0,
+                                       valuation_mode=pa.VALUATION_MODE_COST)
+    by = {r.symbol: r for r in plan.rows}
+    assert by["BUMP"].sizing_outcome == pa.SIZING_OUTCOME_BUMPED
+    assert by["BUMP"].delta_quantity == 1.0
+    assert by["HELD"].delta_quantity == 0.0
+    assert by["HELD"].side is None
+    assert plan.total_sell_value == 0.0
+    assert plan.net_buy_value == plan.total_buy_value == pytest.approx(300.0)
+
+
 def test_a_rebalance_plan_is_stamped_with_the_position_basis():
     plan = pa.compute_allocation(0.0, 0.0, [], {}, {}, allow_fractional=False,
                                  default_bp_factor=1.0,
