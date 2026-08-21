@@ -40,6 +40,13 @@ class ReadOnlyAccountInterface(ExtendableSettingsInterface):
                     "description": "Minimum equity threshold (%)",
                     "tooltip": "Minimum percentage of account balance that must remain available across all experts before new positions are blocked. This is an account-wide safety net."
                 },
+                "manual_trading_enabled": {
+                    "type": "bool",
+                    "required": False,
+                    "default": False,
+                    "description": "Manually traded account",
+                    "tooltip": "Enable the Portfolio Allocation page for this account. Only for accounts you trade by hand -- the page refuses to run when the account has any enabled expert."
+                },
             }
 
     # Class-level price cache shared across all instances
