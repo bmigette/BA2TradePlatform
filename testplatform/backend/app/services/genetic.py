@@ -9,6 +9,7 @@ import numpy as np
 from datetime import datetime
 from typing import Dict, List, Any, Optional, Callable, Tuple
 import logging
+import os
 import random
 import json
 
@@ -124,6 +125,17 @@ class GeneticOptimizer:
         self.best_individual = None
         self.best_fitness = None
         self.history = []
+
+        # Write a partial checkpoint every N completed trials within a generation. Bounds what a
+        # restart loses to N trials instead of a whole generation. 0 disables.
+        try:
+            self.partial_checkpoint_every = int(os.getenv("BT_PARTIAL_CHECKPOINT_EVERY", "10"))
+        except ValueError:
+            logger.warning(
+                "BT_PARTIAL_CHECKPOINT_EVERY="
+                f"{os.getenv('BT_PARTIAL_CHECKPOINT_EVERY')!r} is not an integer; using 10")
+            self.partial_checkpoint_every = 10
+        self._partial_counter = 0
 
         self._setup_deap()
 
@@ -372,6 +384,21 @@ class GeneticOptimizer:
             next_gen += 1
         return next_gen, checkpoint.get('population', []), checkpoint.get('fitnesses')
 
+    def _maybe_partial_checkpoint(self, gen: int, population: list, checkpoint_callback) -> None:
+        """Checkpoint mid-generation every ``partial_checkpoint_every`` completed trials.
+
+        Best-effort: a checkpoint write must never fail an otherwise healthy generation.
+        """
+        if not self.partial_checkpoint_every:
+            return
+        self._partial_counter += 1
+        if self._partial_counter % self.partial_checkpoint_every:
+            return
+        try:
+            checkpoint_callback(gen, population, partial=True)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"partial checkpoint failed (ignored): {e}")
+
     def rebuild_population(self, genes: list, fitnesses: list = None) -> list:
         """Rebuild a DEAP population from checkpointed genes + fitness values.
 
@@ -497,6 +524,9 @@ class GeneticOptimizer:
             # This prevents re-evaluating elites which would give different results
             # due to stochastic neural network training
             invalid_ind = [ind for ind in population if not ind.fitness.valid]
+            # Fresh throttle phase per generation: a carried-over counter would put this
+            # generation's first partial write at an arbitrary offset.
+            self._partial_counter = 0
 
             if batch_fitness is not None:
                 # TRUE multiprocessing path: the caller evaluates the whole batch of
@@ -512,6 +542,8 @@ class GeneticOptimizer:
                         _inv[idx].fitness.values = (float(fit),)
                     except (IndexError, TypeError, ValueError):
                         return
+                    if checkpoint_callback:
+                        self._maybe_partial_checkpoint(_gen, population, checkpoint_callback)
 
                 # Not every batch_fitness accepts on_result -- brute force and the ML GA supply
                 # one-argument callables. Probe rather than assume: a TypeError here would be

@@ -262,6 +262,119 @@ def test_a_bad_index_from_on_result_does_not_kill_the_run():
     assert res["best_fitness"] == 1.0
 
 
+# ---------------------------------------------------------------------------------------------
+# Task 4: write partial checkpoints, throttled
+# ---------------------------------------------------------------------------------------------
+
+def test_partial_checkpoints_are_throttled():
+    """One write per completed trial would be wasteful; one per N bounds the loss instead."""
+    opt = _opt()
+    opt.partial_checkpoint_every = 3
+    calls = []
+    pop = opt.toolbox.population(n=6)
+    for _ in range(7):
+        opt._maybe_partial_checkpoint(2, pop, lambda g, p, partial=False: calls.append(partial))
+    assert calls == [True, True], "7 results at every-3 -> 2 writes"
+
+
+def test_partial_checkpoint_is_flagged_partial():
+    opt = _opt()
+    opt.partial_checkpoint_every = 1
+    calls = []
+    opt._maybe_partial_checkpoint(2, opt.toolbox.population(n=2),
+                                  lambda g, p, partial=False: calls.append(partial))
+    assert calls == [True]
+
+
+def test_partial_checkpoint_passes_the_generation_and_population_through():
+    opt = _opt()
+    opt.partial_checkpoint_every = 1
+    seen = []
+    pop = opt.toolbox.population(n=2)
+    opt._maybe_partial_checkpoint(5, pop, lambda g, p, partial=False: seen.append((g, p)))
+    assert seen == [(5, pop)]
+
+
+def test_partial_checkpointing_can_be_disabled():
+    """0 disables it -- an escape hatch if a run ever needs the old behaviour."""
+    opt = _opt()
+    opt.partial_checkpoint_every = 0
+    calls = []
+    for _ in range(10):
+        opt._maybe_partial_checkpoint(2, [], lambda g, p, partial=False: calls.append(partial))
+    assert calls == []
+
+
+def test_a_failing_partial_checkpoint_never_fails_the_generation():
+    """A full disk or a locked task DB must cost a checkpoint, not several hours of compute."""
+    opt = _opt()
+    opt.partial_checkpoint_every = 1
+
+    def boom(g, p, partial=False):
+        raise OSError("no space left on device")
+
+    opt._maybe_partial_checkpoint(1, [], boom)      # must not raise
+
+
+def test_the_partial_counter_resets_between_generations():
+    """Otherwise a generation would inherit the previous one's phase and the first write would
+    land at an arbitrary offset."""
+    opt = _opt(n_generations=2)
+    opt.partial_checkpoint_every = 100          # high enough that nothing is ever written
+    counters = []
+
+    def batch_fitness(param_dicts, on_result=None):
+        counters.append(opt._partial_counter)   # the phase this generation starts from
+        for i in range(len(param_dicts)):
+            on_result(i, float(i))
+        return [float(i) for i in range(len(param_dicts))]
+
+    opt.optimize(fitness_function=lambda p: 0.0, batch_fitness=batch_fitness,
+                 checkpoint_callback=lambda g, p, partial=False: None)
+
+    assert len(counters) == 2
+    assert counters == [0, 0], "generation 2 inherited generation 1's throttle phase"
+
+
+def test_partial_checkpoint_defaults_to_every_10():
+    opt = _opt()
+    assert opt.partial_checkpoint_every == 10
+
+
+def test_partial_checkpoint_interval_is_env_overridable(monkeypatch):
+    monkeypatch.setenv("BT_PARTIAL_CHECKPOINT_EVERY", "25")
+    assert _opt().partial_checkpoint_every == 25
+
+
+def test_a_garbage_env_value_falls_back_to_the_default(monkeypatch):
+    """A typo in the environment must not make every GeneticOptimizer construction raise."""
+    monkeypatch.setenv("BT_PARTIAL_CHECKPOINT_EVERY", "ten")
+    assert _opt().partial_checkpoint_every == 10
+
+
+def test_the_generation_end_checkpoint_is_not_partial():
+    """The boundary write must CLEAR the partial flag, or a completed generation would be
+    resumed into as if it were still running."""
+    opt = _opt(n_generations=1)
+    calls = []
+    opt.optimize(fitness_function=lambda p: 0.0,
+                 checkpoint_callback=lambda g, p, partial=False: calls.append(partial))
+    assert calls == [False]
+
+
+def test_a_batch_fitness_taking_kwargs_is_given_on_result():
+    """A **kwargs evaluator can take it -- do not silently downgrade it to the legacy call."""
+    opt = _opt(n_generations=1)
+    got = {}
+
+    def batch_fitness(param_dicts, **kw):
+        got["on_result"] = kw.get("on_result")
+        return [1.0] * len(param_dicts)
+
+    opt.optimize(fitness_function=lambda p: 0.0, batch_fitness=batch_fitness)
+    assert callable(got["on_result"])
+
+
 def test_a_batch_fitness_that_predates_on_result_still_works():
     """Backward compatibility: brute force and the ML GA pass a 1-argument batch_fitness."""
     opt = _opt(n_generations=1)

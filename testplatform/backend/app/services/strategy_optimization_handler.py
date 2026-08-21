@@ -1066,9 +1066,10 @@ def handle_strategy_optimization(task_id: str, payload: Dict[str, Any]) -> Dict[
         ckpt_task_id = checkpoint_task_id(opt.name, opt_id)
         ckpt_fingerprint = checkpoint_fingerprint(param_space, ga)
 
-        def checkpoint_cb(generation: int, population: list):
+        def checkpoint_cb(generation: int, population: list, partial: bool = False):
             data = optimizer.get_checkpoint_data(generation, population)
             data["fingerprint"] = ckpt_fingerprint   # refuse to resume into a changed gene space
+            data["partial"] = partial               # resume INTO this generation, not after it
             _save_checkpoint(ckpt_task_id, data)
 
         def _trial_key_for(decoded_flat: Dict[str, Any]) -> str:

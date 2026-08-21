@@ -3223,10 +3223,15 @@ def train_unified_optimization(
             f"Gen {gen + 1}/{generations} complete, best fitness: {best_fitness:.4f}"
         )
 
-    def checkpoint_callback(gen: int, population: list):
-        """Save checkpoint after each generation for crash recovery."""
+    def checkpoint_callback(gen: int, population: list, partial: bool = False):
+        """Save checkpoint for crash recovery.
+
+        ``partial`` marks a write taken DURING a generation (some individuals still
+        unevaluated), which the resume path reads to continue INTO that generation.
+        """
         checkpoint_data = optimizer.get_checkpoint_data(gen, population)
         checkpoint_data['all_individuals'] = progress_state['all_individuals']
+        checkpoint_data['partial'] = partial
         save_ga_checkpoint(task_id, checkpoint_data)
 
     # Check for existing checkpoint (for resume)
