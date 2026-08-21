@@ -3012,3 +3012,213 @@ def test_bulk_quotes_survive_a_failing_chunk():
 
     assert prices["SYM000"] is None
     assert prices["SYM100"] == 150.00
+
+
+# ---------------------------------------------------------------------------
+# EMPTY broker errors
+#
+# LIVE EVIDENCE (2026-08-21, the user's real TastyTrade account): every write call
+# -- place_order(dry_run=True) included -- came back
+#
+#     HTTP 403  {"error":{"message":"Token has insufficient scopes for this request"}}
+#
+# and what the adapter actually caught was `TastytradeError('')`, args == ('',).
+#
+# The SDK throws the reason away: `tastytrade.utils.validate_response`
+# (utils.py:240-258) builds its message ONLY from error objects that carry BOTH a
+# `code` and a `message` (or a `domain` + `reason`). This 403 carries a `message`
+# and no `code`, so the loop appends nothing and `TastytradeError("")` is raised.
+# The vendor file lives in venv/ and is wiped by the next `pip install -r
+# requirements.txt`, so the fix belongs HERE, in the adapter.
+#
+# An empty string in `TradingOrder.comment` is the worst possible outcome: the
+# Pending Orders UI shows a failed order with no reason at all.
+# ---------------------------------------------------------------------------
+
+def _empty_broker_error():
+    """Exactly what the live 403 produced: TastytradeError with args == ('',)."""
+    from tastytrade.utils import TastytradeError
+    exc = TastytradeError("")
+    assert exc.args == ("",) and str(exc) == ""
+    return exc
+
+
+def test_an_empty_broker_error_still_explains_the_failed_submission(monkeypatch):
+    """The persisted comment (what the user sees) must name the operation and the
+    most likely cause, not be an empty string behind a bracketed reason."""
+    from ba2_trade_platform.core.db import get_instance
+    from ba2_trade_platform.core.models import TradingOrder
+    from ba2_trade_platform.core.types import OrderStatus
+
+    errors = _capture_errors(monkeypatch)
+    account_def, order = _tt_trading_order()
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.place_order = AsyncMock(side_effect=_empty_broker_error())
+
+    with patch("tastytrade.instruments.Equity.get",
+               new=AsyncMock(return_value=_FakeEquity("AAPL"))):
+        assert acct._submit_order_impl(order) is None
+
+    stored = get_instance(TradingOrder, order.id)
+    assert stored.status == OrderStatus.ERROR
+    comment = stored.comment or ""
+    # The degenerate pre-fix value was exactly "[unknown] " -- a reason tag and
+    # nothing else.
+    assert comment.replace("[unknown]", "").strip(), f"comment carries no reason: {comment!r}"
+    assert "submission" in comment.lower(), comment
+    assert "scope" in comment.lower(), comment
+    # AccountInterface._handle_order_submit_error truncates the message at 180 chars,
+    # so the diagnosis has to be FRONT-LOADED. Pinned here: a future edit that pushes
+    # the broker's own 403 wording past the cut would leave the UI with a comment that
+    # trails off mid-explanation, which is how this becomes useless again.
+    assert "insufficient scopes for this request" in comment, comment
+    assert any("scope" in m.lower() for m in errors), errors
+
+
+def test_a_real_broker_message_is_never_overwritten_by_the_empty_error_hint(monkeypatch):
+    """Only an EMPTY message is substituted. A broker that actually said something
+    keeps saying it, verbatim."""
+    from tastytrade.utils import TastytradeError
+    from ba2_trade_platform.core.db import get_instance
+    from ba2_trade_platform.core.models import TradingOrder
+
+    _capture_errors(monkeypatch)
+    account_def, order = _tt_trading_order()
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.place_order = AsyncMock(side_effect=TastytradeError(
+        "insufficient_buying_power: Account 5WX00000 has insufficient buying power"))
+
+    with patch("tastytrade.instruments.Equity.get",
+               new=AsyncMock(return_value=_FakeEquity("AAPL"))):
+        acct._submit_order_impl(order)
+
+    comment = get_instance(TradingOrder, order.id).comment or ""
+    assert "insufficient buying power" in comment
+    assert "OAuth" not in comment, comment
+
+
+def test_a_whitespace_only_broker_message_counts_as_empty(monkeypatch):
+    """`TastytradeError("\\n")` is just as useless as `TastytradeError("")` -- the SDK
+    appends a trailing newline per error object, so a single unparsed error can
+    produce exactly this."""
+    from tastytrade.utils import TastytradeError
+    from ba2_trade_platform.core.db import get_instance
+    from ba2_trade_platform.core.models import TradingOrder
+
+    _capture_errors(monkeypatch)
+    account_def, order = _tt_trading_order()
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.place_order = AsyncMock(side_effect=TastytradeError("   \n "))
+
+    with patch("tastytrade.instruments.Equity.get",
+               new=AsyncMock(return_value=_FakeEquity("AAPL"))):
+        acct._submit_order_impl(order)
+
+    assert "scope" in (get_instance(TradingOrder, order.id).comment or "").lower()
+
+
+def test_an_empty_broker_error_is_classified_as_an_auth_failure():
+    """UNKNOWN is not good enough: it is the bucket for "we have no idea", and this
+    one we DO know."""
+    from ba2_trade_platform.core.types import BrokerOrderErrorReason
+
+    acct = _bare_account()
+    reason = acct._classify_order_error(_empty_broker_error())
+
+    assert reason != BrokerOrderErrorReason.UNKNOWN
+    assert reason != BrokerOrderErrorReason.STOP_THROUGH_MARKET
+
+
+def test_the_explicit_scope_rejection_is_classified_as_an_auth_failure():
+    """The same 403 reaches us with a real message whenever the SDK manages to parse
+    it (or a future SDK fixes utils.py). Both spellings must classify the same."""
+    from tastytrade.utils import TastytradeError
+    from ba2_trade_platform.core.types import BrokerOrderErrorReason
+
+    acct = _bare_account()
+    exc = TastytradeError("Token has insufficient scopes for this request")
+
+    assert acct._classify_order_error(exc) == acct._classify_order_error(_empty_broker_error())
+    assert acct._classify_order_error(exc) != BrokerOrderErrorReason.UNKNOWN
+
+
+def test_an_unremarkable_broker_error_is_still_unknown():
+    """The classifier must not swallow everything into the auth bucket."""
+    from tastytrade.utils import TastytradeError
+    from ba2_trade_platform.core.types import BrokerOrderErrorReason
+
+    acct = _bare_account()
+    exc = TastytradeError("preflight-check-failure: order quantity is not a multiple of 1")
+
+    assert acct._classify_order_error(exc) == BrokerOrderErrorReason.UNKNOWN
+
+
+def test_a_scope_rejection_on_a_stop_order_is_not_retried_as_a_market_order(monkeypatch):
+    """THE failure mode to avoid. A 403 is permanent until the token is re-scoped, so
+    resubmitting is a guaranteed-losing loop -- and AccountInterface's
+    STOP_THROUGH_MARKET recovery would silently convert a protective stop into an
+    immediate MARKET order, which on an ACCEPTED token would dump the position at any
+    price. The broker must be called exactly ONCE."""
+    from ba2_trade_platform.core.db import get_instance
+    from ba2_trade_platform.core.models import TradingOrder
+    from ba2_trade_platform.core.types import OrderDirection, OrderStatus, OrderType
+
+    _capture_errors(monkeypatch)
+    account_def, order = _tt_trading_order(side=OrderDirection.SELL,
+                                           order_type=OrderType.SELL_STOP,
+                                           stop_price=52.88)
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.place_order = AsyncMock(side_effect=_empty_broker_error())
+
+    with patch("tastytrade.instruments.Equity.get",
+               new=AsyncMock(return_value=_FakeEquity("AAPL"))):
+        assert acct._submit_order_impl(order) is None
+
+    assert acct._account.place_order.await_count == 1, "the 403 was resubmitted"
+    stored = get_instance(TradingOrder, order.id)
+    assert stored.status == OrderStatus.ERROR
+    # Not converted to MARKET, and the stop it was protecting with is intact.
+    assert stored.order_type == OrderType.SELL_STOP
+    assert stored.stop_price == 52.88
+
+
+def test_an_empty_broker_error_explains_a_failed_cancellation(monkeypatch):
+    errors = _capture_errors(monkeypatch)
+    account_def, order = _tt_trading_order(broker_order_id="987654")
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.delete_order = AsyncMock(side_effect=_empty_broker_error())
+
+    assert acct.cancel_order(order.id) is False
+
+    assert any("scope" in m.lower() and "cancel" in m.lower() for m in errors), errors
+
+
+def test_an_empty_broker_error_explains_a_failed_preview(monkeypatch):
+    errors = _capture_errors(monkeypatch)
+    account_def, order = _tt_trading_order()
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.place_order = AsyncMock(side_effect=_empty_broker_error())
+
+    with patch("tastytrade.instruments.Equity.get",
+               new=AsyncMock(return_value=_FakeEquity("AAPL"))):
+        assert acct.preview_order_impact(order) is None
+
+    assert any("scope" in m.lower() and "preview" in m.lower() for m in errors), errors
+
+
+def test_an_empty_broker_error_explains_a_degraded_read_path(monkeypatch):
+    """get_positions returns None on failure and the caller only ever sees the log --
+    an empty message there is a silent outage."""
+    errors = _capture_errors(monkeypatch)
+    acct = _bare_account()
+    acct._account.get_positions = AsyncMock(side_effect=_empty_broker_error())
+
+    assert acct.get_positions() is None
+
+    assert any("scope" in m.lower() for m in errors), errors

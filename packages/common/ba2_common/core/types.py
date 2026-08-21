@@ -288,6 +288,14 @@ class BrokerOrderErrorReason(str, Enum):
     WASH_TRADE = "wash_trade"                        # opposing order already working this symbol
     STOP_THROUGH_MARKET = "stop_through_market"      # stop/trigger price already breached by market
     INVALID_SYMBOL = "invalid_symbol"                # broker doesn't recognize/support the symbol
+    # The CREDENTIAL was refused, not the order: a 401/403, an expired token, or an OAuth
+    # token missing the scope this endpoint needs. Distinct from UNKNOWN because it is
+    # PERMANENT until a human re-authorizes -- nothing about the order can be adjusted to
+    # make it succeed, and every retry is guaranteed to fail the same way. Recorded live on
+    # 2026-08-21: a read-only TastyTrade token 403s every write endpoint (submit, cancel,
+    # preview) and the SDK surfaced it as TastytradeError('') -- see
+    # TastyTradeAccount._describe_broker_error.
+    UNAUTHORIZED = "unauthorized"
     UNKNOWN = "unknown"                              # unmapped — broker message kept verbatim
 
 class OrderOpenType(str, Enum):

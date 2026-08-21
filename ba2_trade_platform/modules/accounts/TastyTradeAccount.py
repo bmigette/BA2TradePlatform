@@ -9,13 +9,14 @@ from tastytrade.order import InstrumentType as TTInstrumentType
 from tastytrade.order import NewOrder, OrderAction, OrderTimeInForce
 from tastytrade.order import OrderStatus as TTOrderStatus
 from tastytrade.order import OrderType as TTOrderType
+from tastytrade.utils import TastytradeError
 
 from sqlmodel import select
 
 from ...logger import logger
 from ...core.db import add_instance, get_db, get_instance, update_instance, InstanceNotFound
 from ...core.models import Position, TradingOrder, Transaction
-from ...core.types import OrderDirection, OrderStatus
+from ...core.types import BrokerOrderErrorReason, OrderDirection, OrderStatus
 from ...core.types import OrderType as CoreOrderType
 from ...core.account_types import (
     AccountSnapshot, CashTransfer, MarginInfo, OrderImpact,
@@ -23,6 +24,17 @@ from ...core.account_types import (
     MARGIN_SOURCE_DEFAULT, MARGIN_SOURCE_POSITION,
 )
 from ...core.interfaces import AccountInterface
+
+
+class EmptyTastytradeError(TastytradeError):
+    """A ``TastytradeError`` the SDK raised with NO message, re-raised carrying a diagnostic.
+
+    Subclasses ``TastytradeError`` on purpose: anything already catching the SDK error
+    (including the broad ``except Exception`` blocks in this adapter) keeps catching it,
+    and ``__cause__`` still points at the original so the traceback is unchanged. The
+    distinct TYPE is what lets ``_classify_order_error`` recognise the case after the
+    message has been replaced, instead of pattern-matching text we ourselves wrote.
+    """
 
 
 class TastyTradeAccount(AccountInterface):
@@ -83,8 +95,10 @@ class TastyTradeAccount(AccountInterface):
             self._connect()
             logger.info(f"TastyTrade session initialized for account {id}.")
         except Exception as e:
-            self._authentication_error = str(e)
-            logger.error(f"Failed to initialize TastyTrade session for account {id}: {e}", exc_info=True)
+            self._authentication_error = self._describe_broker_error(e, "session initialisation")
+            logger.error(
+                f"Failed to initialize TastyTrade session for account {id}: "
+                f"{self._authentication_error}", exc_info=True)
             raise
 
     #: Wall-clock budget for ONE SDK call. The old hardcoded 30s was routinely
@@ -164,6 +178,145 @@ class TastyTradeAccount(AccountInterface):
             return False
         return True
 
+    # ------------------------------------------------------------------
+    # EMPTY BROKER ERRORS
+    #
+    # `tastytrade.utils.validate_response` (venv .../tastytrade/utils.py:240-258)
+    # builds its exception message ONLY from error objects that carry BOTH a `code`
+    # and a `message` (or a `domain` + a `reason`):
+    #
+    #     errors = content.get("errors") or [content]
+    #     message = ""
+    #     for error in errors:
+    #         if "code" in error and "message" in error: message += ...
+    #         elif "domain" in error and "reason" in error: message += ...
+    #         else: logger.debug(f"Unknown error type: {error}")
+    #     raise TastytradeError(message)
+    #
+    # An error carrying a `message` and NO `code` therefore appends nothing and the
+    # reason is thrown away: `TastytradeError("")`, args == ("",).
+    #
+    # That is not hypothetical. Probing the live account on 2026-08-21, EVERY write
+    # endpoint -- place_order with dry_run=True included -- answered
+    #     HTTP 403 {"error":{"message":"Token has insufficient scopes for this request"}}
+    # and the adapter caught `TastytradeError('')`. Submission recorded a
+    # `TradingOrder.comment` of exactly "[unknown] ": a failed order with, literally,
+    # no explanation for the user.
+    #
+    # The vendor file lives in venv/ and is wiped by the next
+    # `pip install -r requirements.txt`, so the substitution is made HERE.
+    # ------------------------------------------------------------------
+
+    #: Appended to an empty error. FRONT-LOADED ON PURPOSE:
+    #: `AccountInterface._handle_order_submit_error` truncates the message at 180 chars
+    #: for `TradingOrder.comment`, and that comment is the whole of what the Pending
+    #: Orders UI shows. The operation, the diagnosis and the broker's own 403 wording
+    #: therefore all sit inside the first 180 characters; the SDK forensics and the
+    #: next action come after, where truncation costs nothing. Do not reorder this.
+    _EMPTY_BROKER_ERROR_HINT = (
+        "most likely the OAuth token lacks the scope this endpoint needs "
+        "(HTTP 403 'Token has insufficient scopes for this request'). "
+        "The SDK builds its message only from errors that carry a 'code', so that 403 "
+        "-- which carries none -- reaches us as TastytradeError('') with the reason "
+        "discarded (tastytrade/utils.py:240-258). Check the token's scopes first: a "
+        "read-only token 403s every write endpoint."
+    )
+
+    @classmethod
+    def _describe_broker_error(cls, exc: Exception, operation: str) -> str:
+        """A human-actionable rendering of a broker exception, for logs and comments.
+
+        A NON-EMPTY broker message is returned VERBATIM -- the broker knows more about
+        its own rejection than this adapter does, and overwriting real detail with a
+        guess would be a worse bug than the one being fixed here.
+
+        Only an empty (or whitespace-only) message is substituted, and the substitute
+        names the OPERATION plus the cause an empty TastyTrade error actually had in
+        production. Whitespace counts as empty because the SDK's loop appends
+        "{code}: {message}\\n" per error, so a partially unparsed response yields a
+        bare newline.
+
+        Args:
+            exc: the exception caught from an SDK call.
+            operation: what was being attempted, as a noun phrase ("order submission",
+                "order cancellation", ...). It is what tells the reader WHICH call
+                lost its reason -- a comment saying only "empty error" is barely
+                better than the empty string.
+        """
+        message = str(exc).strip()
+        if message:
+            return message
+        if isinstance(exc, TastytradeError):
+            return (f"empty TastytradeError during {operation} -- "
+                    f"{cls._EMPTY_BROKER_ERROR_HINT}")
+        # Not a broker error at all (an SDK-internal failure, say). The scope hint
+        # would be a fabricated diagnosis, so only the type and the operation are
+        # reported -- still strictly more than the empty string.
+        return (f"{type(exc).__name__} raised with NO message during {operation}; "
+                f"the failure carried no reason at all")
+
+    def _explain_broker_error(self, exc: Exception, operation: str) -> Exception:
+        """The exception to hand to code that renders ``str(exc)`` for a HUMAN.
+
+        Returns ``exc`` unchanged whenever it already says something. An empty one is
+        re-wrapped in ``EmptyTastytradeError`` carrying ``_describe_broker_error``'s
+        diagnostic, with ``__cause__`` set to the original.
+
+        This exists because ``AccountInterface._handle_order_submit_error`` writes
+        ``f"[{reason.value}] {str(exc)[:180]}"`` into ``TradingOrder.comment``:
+        classifying the failure is not enough on its own, the MESSAGE has to carry the
+        explanation too, and that is the only thing the Pending Orders UI shows.
+        """
+        if str(exc).strip():
+            return exc
+        explained = EmptyTastytradeError(self._describe_broker_error(exc, operation))
+        explained.__cause__ = exc
+        return explained
+
+    #: Substrings marking a rejection as an AUTH/PERMISSION failure rather than an
+    #: order problem. Matched against the LOWERCASED message. Deliberately narrow:
+    #: every one of these is unambiguously about the credential, so none can swallow a
+    #: genuine order rejection into the auth bucket.
+    _AUTH_ERROR_MARKERS = (
+        "insufficient scope",   # covers "insufficient scopes" too
+        "unauthorized",
+        "not authorized",
+        "forbidden",
+        "invalid_grant",
+        "invalid token",
+        "token expired",
+        "expired token",
+    )
+
+    def _classify_order_error(self, exc: Exception) -> BrokerOrderErrorReason:
+        """Map a TastyTrade submission failure onto the shared taxonomy.
+
+        Recognises exactly ONE class of failure today -- the auth/scope rejection that
+        was observed live -- and leaves everything else UNKNOWN. Guessing at
+        INSUFFICIENT_FUNDS / WASH_TRADE from message text this broker has never
+        actually been seen to emit would be inventing a mapping; UNKNOWN already keeps
+        the broker's own words in the comment, which is the honest answer for a
+        rejection nobody has characterised yet.
+
+        UNAUTHORIZED (not UNKNOWN) matters because the two are acted on differently by
+        a human: UNKNOWN says "read the broker's message", UNAUTHORIZED says "the
+        credential is refused, nothing about the order will help". It is NEVER
+        STOP_THROUGH_MARKET, which is the only reason
+        ``AccountInterface._handle_order_submit_error`` resubmits on -- a 403 is
+        permanent until the token is re-authorized, so a retry can only loop.
+        """
+        message = str(exc).strip().lower()
+        # An empty TastytradeError IS the scope rejection in every case observed so
+        # far; matched on TYPE so it still classifies after _explain_broker_error has
+        # replaced the message.
+        if isinstance(exc, EmptyTastytradeError):
+            return BrokerOrderErrorReason.UNAUTHORIZED
+        if isinstance(exc, TastytradeError) and not message:
+            return BrokerOrderErrorReason.UNAUTHORIZED
+        if any(marker in message for marker in self._AUTH_ERROR_MARKERS):
+            return BrokerOrderErrorReason.UNAUTHORIZED
+        return BrokerOrderErrorReason.UNKNOWN
+
     @staticmethod
     def get_settings_definitions() -> Dict[str, Any]:
         return {
@@ -197,7 +350,8 @@ class TastyTradeAccount(AccountInterface):
             balances = self._run_async(self._account.get_balances(self._session))
             return float(balances.net_liquidating_value)
         except Exception as e:
-            logger.error(f"[Account {self.id}] Error getting balance: {e}", exc_info=True)
+            logger.error(f"[Account {self.id}] Error getting balance: "
+                f"{self._describe_broker_error(e, 'the balance fetch')}", exc_info=True)
             return None
 
     def get_account_info(self) -> Dict[str, Any]:
@@ -227,7 +381,8 @@ class TastyTradeAccount(AccountInterface):
                 "supports_trading": self.supports_trading,
             }
         except Exception as e:
-            logger.error(f"[Account {self.id}] Error getting account info: {e}", exc_info=True)
+            logger.error(f"[Account {self.id}] Error getting account info: "
+                f"{self._describe_broker_error(e, 'the account-info fetch')}", exc_info=True)
             return {}
 
     def _is_margin_account(self) -> bool:
@@ -253,7 +408,8 @@ class TastyTradeAccount(AccountInterface):
         try:
             balances = self._run_async(self._account.get_balances(self._session))
         except Exception as e:
-            logger.error(f"[Account {self.id}] Error getting account snapshot: {e}", exc_info=True)
+            logger.error(f"[Account {self.id}] Error getting account snapshot: "
+                f"{self._describe_broker_error(e, 'the account-snapshot fetch')}", exc_info=True)
             return AccountSnapshot()
 
         def _num(name):
@@ -319,7 +475,8 @@ class TastyTradeAccount(AccountInterface):
             tt_positions = self._run_async(
                 self._account.get_positions(self._session, include_marks=True))
         except Exception as e:
-            logger.error(f"[Account {self.id}] Error getting positions: {e}", exc_info=True)
+            logger.error(f"[Account {self.id}] Error getting positions: "
+                f"{self._describe_broker_error(e, 'the position fetch')}", exc_info=True)
             return None
 
         positions = []
@@ -587,7 +744,8 @@ class TastyTradeAccount(AccountInterface):
             logger.debug(f"[Account {self.id}] Retrieved {len(orders)} orders from TastyTrade")
             return orders
         except Exception as e:
-            logger.error(f"[Account {self.id}] Error getting orders: {e}", exc_info=True)
+            logger.error(f"[Account {self.id}] Error getting orders: "
+                f"{self._describe_broker_error(e, 'the order-history fetch')}", exc_info=True)
             return []
 
     def get_order(self, order_id: str) -> Any:
@@ -611,7 +769,8 @@ class TastyTradeAccount(AccountInterface):
             raw = self._run_async(self._account.get_order(self._session, broker_id))
             return self.tastytrade_order_to_tradingorder(raw)
         except Exception as e:
-            logger.error(f"[Account {self.id}] Error getting order {order_id}: {e}", exc_info=True)
+            logger.error(f"[Account {self.id}] Error getting order {order_id}: "
+                f"{self._describe_broker_error(e, 'the single-order fetch')}", exc_info=True)
             return None
 
     def symbols_exist(self, symbols: List[str]) -> Dict[str, bool]:
@@ -629,14 +788,17 @@ class TastyTradeAccount(AccountInterface):
                 else:
                     found_symbols = {equities.symbol}
             except Exception as e:
-                logger.warning(f"[Account {self.id}] Symbol lookup failed: {e}")
+                logger.warning(
+                    f"[Account {self.id}] Symbol lookup failed: "
+                    f"{self._describe_broker_error(e, 'the symbol lookup')}")
                 found_symbols = set()
 
             for s in symbols:
                 result[s] = s in found_symbols
             return result
         except Exception as e:
-            logger.error(f"[Account {self.id}] Error checking symbols: {e}", exc_info=True)
+            logger.error(f"[Account {self.id}] Error checking symbols: "
+                f"{self._describe_broker_error(e, 'the symbol-existence check')}", exc_info=True)
             return {s: False for s in symbols}
 
     #: get_market_data_by_type's COMBINED limit across ALL instrument types is 100 per
@@ -702,7 +864,8 @@ class TastyTradeAccount(AccountInterface):
                 return self._pick_price(data, price_type)
             except Exception as e:
                 logger.error(
-                    f"[Account {self.id}] Error getting price for {symbol_or_symbols}: {e}",
+                    f"[Account {self.id}] Error getting price for {symbol_or_symbols}: "
+                    f"{self._describe_broker_error(e, 'the quote fetch')}",
                     exc_info=True)
                 return None
 
@@ -716,7 +879,7 @@ class TastyTradeAccount(AccountInterface):
             except Exception as e:
                 logger.warning(
                     f"[Account {self.id}] Bulk quote fetch failed for {len(chunk)} symbols "
-                    f"starting at {chunk[0]}: {e}")
+                    f"starting at {chunk[0]}: {self._describe_broker_error(e, 'the bulk quote fetch')}")
                 continue
             for row in rows:
                 if row.symbol in result:
@@ -918,15 +1081,20 @@ class TastyTradeAccount(AccountInterface):
                 f"broker_order_id={fresh_order.broker_order_id}, status={fresh_order.status}")
             return fresh_order
         except Exception as e:
+            # Replace the EXCEPTION, not just the log line: _handle_order_submit_error
+            # renders `str(exc)[:180]` into TradingOrder.comment, and that comment is
+            # the only explanation the Pending Orders UI ever shows the user.
+            explained = self._explain_broker_error(e, "order submission")
             logger.error(
-                f"Error submitting order {trading_order.id} to TastyTrade: {e}", exc_info=True)
+                f"Error submitting order {trading_order.id} to TastyTrade: {explained}",
+                exc_info=True)
             # Broker-agnostic failure handling: classify the error, retry ONCE as a
             # MARKET order when a stop was already through the market, and otherwise
             # mark the row ERROR with the typed reason + broker message in `comment`
             # (so it is visible in the Pending Orders UI, not just the log). Returns
             # the resubmitted order on a successful retry, else None.
             if trading_order.id:
-                return self._handle_order_submit_error(trading_order, e)
+                return self._handle_order_submit_error(trading_order, explained)
             logger.warning("Cannot mark order as ERROR - order has no ID")
             return None
 
@@ -977,7 +1145,8 @@ class TastyTradeAccount(AccountInterface):
                 self._account.delete_order(self._session, int(db_order.broker_order_id)))
         except Exception as e:
             logger.error(
-                f"[Account {self.id}] Error cancelling TastyTrade order {order_id}: {e}",
+                f"[Account {self.id}] Error cancelling TastyTrade order {order_id}: "
+                f"{self._describe_broker_error(e, 'order cancellation')}",
                 exc_info=True)
             return False
 
@@ -1027,7 +1196,8 @@ class TastyTradeAccount(AccountInterface):
                 self._account.place_order(self._session, new_order, dry_run=True))
         except Exception as e:
             logger.error(
-                f"[Account {self.id}] Order preview failed for {trading_order.symbol}: {e}",
+                f"[Account {self.id}] Order preview failed for {trading_order.symbol}: "
+                f"{self._describe_broker_error(e, 'the order preview (dry run)')}",
                 exc_info=True)
             return None
 
@@ -1156,7 +1326,8 @@ class TastyTradeAccount(AccountInterface):
                 self._account.get_order_history(self._session, page_offset=None))
         except Exception as e:
             logger.error(
-                f"[Account {self.id}] Error refreshing orders from TastyTrade: {e}",
+                f"[Account {self.id}] Error refreshing orders from TastyTrade: "
+                f"{self._describe_broker_error(e, 'the order refresh')}",
                 exc_info=True)
             return False
 
@@ -1346,7 +1517,9 @@ class TastyTradeAccount(AccountInterface):
                     if sym and d and qty > 0:
                         drip_map[(sym, d)] = (qty, float(getattr(txn, 'price', 0) or 0))
             except Exception as e:
-                logger.warning(f"[Account {self.id}] DRIP share-receipt fetch failed: {e}")
+                logger.warning(
+                    f"[Account {self.id}] DRIP share-receipt fetch failed: "
+                    f"{self._describe_broker_error(e, 'the DRIP share-receipt fetch')}")
 
             # Cash dividends + tax: Money Movement transactions, sub_type "Dividend"
             # only (excludes the "Withdrawal" reinvest leg, ACH deposits, fee
@@ -1396,7 +1569,8 @@ class TastyTradeAccount(AccountInterface):
             logger.debug(f"[Account {self.id}] Retrieved {len(dividends)} dividend records")
             return dividends
         except Exception as e:
-            logger.error(f"[Account {self.id}] Error fetching dividends: {e}", exc_info=True)
+            logger.error(f"[Account {self.id}] Error fetching dividends: "
+                f"{self._describe_broker_error(e, 'the dividend fetch')}", exc_info=True)
             return []
 
     #: Money Movement sub-types that ADD cash to the account.
@@ -1435,7 +1609,8 @@ class TastyTradeAccount(AccountInterface):
         try:
             transactions = self._run_async(self._account.get_history(self._session, **params))
         except Exception as e:
-            logger.error(f"[Account {self.id}] Error fetching cash transfers: {e}", exc_info=True)
+            logger.error(f"[Account {self.id}] Error fetching cash transfers: "
+                f"{self._describe_broker_error(e, 'the cash-transfer fetch')}", exc_info=True)
             return []
 
         # Pass 1: GROUP the dividend legs by (symbol, date). Withholding belongs to the
@@ -1539,7 +1714,9 @@ class TastyTradeAccount(AccountInterface):
             found = self._run_async(Equity.get(self._session, wanted, page_offset=None))
             equities = {e.symbol.strip().upper(): e for e in found}
         except Exception as e:
-            logger.warning(f"[Account {self.id}] Equity metadata fetch failed: {e}")
+            logger.warning(
+                f"[Account {self.id}] Equity metadata fetch failed: "
+                f"{self._describe_broker_error(e, 'the equity metadata fetch')}")
 
         increment = None
         try:
@@ -1569,7 +1746,9 @@ class TastyTradeAccount(AccountInterface):
                     increment = float(10 ** -int(precision.value))
                     break
         except Exception as e:
-            logger.warning(f"[Account {self.id}] Quantity precision fetch failed: {e}")
+            logger.warning(
+                f"[Account {self.id}] Quantity precision fetch failed: "
+                f"{self._describe_broker_error(e, 'the quantity-precision fetch')}")
 
         # get_positions() returns None when the FETCH FAILED and [] when the account is
         # genuinely flat -- the distinction this file documents at get_positions. `or []`
@@ -1603,7 +1782,9 @@ class TastyTradeAccount(AccountInterface):
                 if symbol and initial is not None:
                     requirement[symbol.strip().upper()] = abs(float(initial))
         except Exception as e:
-            logger.warning(f"[Account {self.id}] Margin requirement fetch failed: {e}")
+            logger.warning(
+                f"[Account {self.id}] Margin requirement fetch failed: "
+                f"{self._describe_broker_error(e, 'the margin-requirement fetch')}")
 
         result = {}
         for symbol in wanted:
@@ -1678,7 +1859,8 @@ class TastyTradeAccount(AccountInterface):
             logger.debug(f"[Account {self.id}] Retrieved {len(result)} balance history snapshots")
             return result
         except Exception as e:
-            logger.error(f"[Account {self.id}] Error fetching balance history: {e}", exc_info=True)
+            logger.error(f"[Account {self.id}] Error fetching balance history: "
+                f"{self._describe_broker_error(e, 'the balance-history fetch')}", exc_info=True)
             return []
 
     def get_filled_trades(self, symbol=None, start_date=None, end_date=None) -> List[Dict]:
@@ -1733,5 +1915,6 @@ class TastyTradeAccount(AccountInterface):
             return trades
 
         except Exception as e:
-            logger.error(f"[Account {self.id}] Error fetching filled trades: {e}", exc_info=True)
+            logger.error(f"[Account {self.id}] Error fetching filled trades: "
+                f"{self._describe_broker_error(e, 'the filled-trade fetch')}", exc_info=True)
             return []
