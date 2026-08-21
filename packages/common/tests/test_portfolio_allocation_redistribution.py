@@ -152,7 +152,15 @@ def test_a_bump_pushes_the_label_over_target_and_the_excess_is_taken_back_off():
 def test_a_bumped_row_is_never_the_row_that_gives_the_weight_back():
     """The obvious absorber for a bump-induced overshoot is the bumped row itself,
     and taking it back to zero re-creates the floor-to-zero D1 exists to remove --
-    in a loop. Bumps are one-way."""
+    in a loop. Bumps are one-way.
+
+    The list is asserted directly, not just the quantities, and that is deliberate.
+    A bumped row's delta is EXACTLY one unit, so the "buy less, never to zero" clamp
+    would floor its give-back to nothing even if the filter let it in: the two guards
+    overlap in this direction, and the numbers alone therefore cannot tell whether
+    the exclusion is still there. ``test_a_bumped_row_does_not_soak_up_a_siblings_
+    shortfall_either`` covers the direction where they do not overlap.
+    """
     labels = [LabelTarget("A", 100.0, [SymbolTarget("BIG", 20.0),
                                        SymbolTarget("WHOLE", 80.0)])]
     current = {"BIG": _pos("BIG", 300.0), "WHOLE": _pos("WHOLE", 790.0)}
@@ -161,6 +169,8 @@ def test_a_bumped_row_is_never_the_row_that_gives_the_weight_back():
                                  allow_fractional=True, default_bp_factor=1.0,
                                  valuation_mode=pa.VALUATION_MODE_MARKET)
     by = {r.symbol: r for r in plan.rows}
+    assert by["BIG"].sizing_outcome == pa.SIZING_OUTCOME_BUMPED
+    assert [r.symbol for r in pa._absorber_order(plan.rows)] == ["WHOLE"]
     assert by["BIG"].delta_quantity == 1.0        # still bumped
     assert by["BIG"].redistributed is False
     assert by["WHOLE"].delta_quantity == 1.0      # 800 target, one 790 share
@@ -247,6 +257,64 @@ def test_redistribution_shrinks_an_order_but_never_deletes_it():
     assert row.delta_quantity == 1.0
     assert row.side == OrderDirection.BUY
     assert row.estimated_value == pytest.approx(100.0)
+
+
+def test_redistribution_shrinks_a_SELL_but_never_deletes_it_either():
+    """The mirror of the rule above, and the untested half of it: a row SELLING 2
+    shares absorbs a 250 shortfall by selling ONE fewer, not two. Letting the last
+    unit go deletes an order the user reviewed -- the position silently stays where
+    it is -- and it is the same "never trade a row to nothing" rule, so it may not
+    hold in one direction and lapse in the other.
+    """
+    row = _buy_row("HELD", 100.0, -2.0, current_quantity=5.0, target_notional=300.0)
+    plan = AllocationPlan(rows=[row], available_buying_power=100_000.0,
+                          valuation_mode=pa.VALUATION_MODE_MARKET)
+    left = pa.redistribute_label_residuals(plan, {"A": {"HELD": 550.0}},
+                                           {"HELD": _whole("HELD")},
+                                           allow_fractional=False)
+    assert row.delta_quantity == -1.0
+    assert row.side == OrderDirection.SELL
+    assert row.estimated_value == pytest.approx(100.0)
+    assert left["A"] == pytest.approx(150.0)
+
+
+def test_redistribution_will_not_propose_a_fraction_under_the_brokers_money_floor():
+    """Live-verified: TastyTrade answers `below_notional_value_minimum` to a
+    fractional order worth under $5, so proposing one wastes the whole submission.
+
+    The real numbers: SCHD at 34.00 on a 0.001 grid. A 3.40 shortfall is exactly
+    0.1 shares, legal on the grid and worth $3.40 -- under the floor. The engine
+    weighs the money floor as well as the quantity grid when it SIZES a row, and
+    redistribution is sizing.
+    """
+    margin = {"SCHD": MarginInfo(symbol="SCHD", bp_factor=1.0, fractionable=True,
+                                 min_trade_increment=0.001,
+                                 min_fractional_notional=5.0)}
+    row = _buy_row("SCHD", 34.0, 0.0, target_notional=0.0, fractional=True)
+    plan = AllocationPlan(rows=[row], available_buying_power=100_000.0,
+                          valuation_mode=pa.VALUATION_MODE_MARKET)
+    left = pa.redistribute_label_residuals(plan, {"A": {"SCHD": 3.40}}, margin,
+                                           allow_fractional=True)
+    assert row.delta_quantity == 0.0
+    assert row.side is None
+    assert left["A"] == pytest.approx(3.40)
+    assert any("can absorb the rest" in w for w in plan.warnings)
+
+
+def test_the_money_floor_does_not_block_a_fractional_absorption_that_clears_it():
+    """The guard must be narrow: the same row takes a 6.80 shortfall, because 0.2
+    shares of a 34.00 stock is $6.80 and the broker accepts that one."""
+    margin = {"SCHD": MarginInfo(symbol="SCHD", bp_factor=1.0, fractionable=True,
+                                 min_trade_increment=0.001,
+                                 min_fractional_notional=5.0)}
+    row = _buy_row("SCHD", 34.0, 0.0, target_notional=0.0, fractional=True)
+    plan = AllocationPlan(rows=[row], available_buying_power=100_000.0,
+                          valuation_mode=pa.VALUATION_MODE_MARKET)
+    left = pa.redistribute_label_residuals(plan, {"A": {"SCHD": 6.80}}, margin,
+                                           allow_fractional=True)
+    assert row.delta_quantity == pytest.approx(0.2)
+    assert row.side == OrderDirection.BUY
+    assert left["A"] == pytest.approx(0.0)
 
 
 def test_redistribution_respects_the_broker_minimum_order_size():
@@ -402,6 +470,40 @@ def test_the_pass_bound_stops_the_loop_and_the_plan_says_the_bound_stopped_it(mo
     assert left["A"] == pytest.approx(400.0)
     assert any("redistribution passes" in w for w in plan.warnings)
     assert any("400.00" in w for w in plan.warnings)
+
+
+def test_the_pass_bound_is_the_only_thing_stopping_a_loop_that_cannot_converge(monkeypatch):
+    """REDISTRIBUTION_MAX_PASSES is the module's stated TERMINATION GUARANTEE, and a
+    guarantee nothing pins is decorative: the constant could be raised to 100,000 --
+    or the bound dropped entirely -- and every other test in both suites would still
+    pass, because they all converge in one or two passes on their own arithmetic.
+
+    So take the arithmetic away. With absorbed moves that never stick, the residual
+    is the same 400 at the start of every pass and each pass moves the same 4 shares
+    -- exactly the "future absorber type that breaks the monotonicity" the module's
+    comment says this bound exists for. Nothing but the bound can end this loop, so
+    the call count IS the bound, and the plan has to say the bound is what stopped
+    it rather than reporting a fixed point it never reached.
+    """
+    moves = []
+
+    def _never_sticks(row, move, label, baseline):
+        moves.append(move)
+        if len(moves) > 20:                     # the loop is not going to stop
+            raise AssertionError(
+                f"redistribution ran {len(moves)} absorptions without converging - "
+                "REDISTRIBUTION_MAX_PASSES no longer bounds the loop")
+
+    monkeypatch.setattr(pa, "_apply_absorption", _never_sticks)
+    row = _buy_row("AAA", 100.0, 5.0, target_notional=500.0)
+    plan = AllocationPlan(rows=[row], available_buying_power=100_000.0,
+                          valuation_mode=pa.VALUATION_MODE_MARKET)
+    left = pa.redistribute_label_residuals(plan, {"A": {"AAA": 900.0}},
+                                           {"AAA": _whole("AAA")}, allow_fractional=False)
+    assert moves == [4.0, 4.0, 4.0]             # one per pass, and the bound is 3
+    assert len(moves) == pa.REDISTRIBUTION_MAX_PASSES == 3
+    assert left["A"] == pytest.approx(400.0)
+    assert any("redistribution passes" in w for w in plan.warnings)
 
 
 def test_a_fixed_point_reached_on_the_last_allowed_pass_blames_the_absorbers(monkeypatch):
