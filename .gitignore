@@ -176,3 +176,7 @@ fetch_5min*.log
 
 # Git worktrees (superpowers:using-git-worktrees)
 .worktrees/
+
+# Stray SQLite files created by the testplatform backend suite
+testplatform/backend/db
+testplatform/backend/OTHER_DB
