@@ -708,8 +708,14 @@ class TastyTradeAccount(AccountInterface):
                     result[row.symbol] = self._pick_price(row, price_type)
         return result
 
-    #: platform TradingOrder.good_for -> TastyTrade TIF. An absent/unknown value falls
-    #: back to GTC, matching AlpacaAccount._submit_order_impl's tif_map default.
+    #: platform TradingOrder.good_for -> TastyTrade TIF, keyed by the NORMALISED
+    #: spelling (see ``_tt_time_in_force``). Both our own snake_case spelling and the
+    #: broker's own display value must resolve, because ``good_for`` is written from
+    #: BOTH sides: our submission path stores "day"/"gtc", while
+    #: ``tastytrade_order_to_tradingorder`` stores the SDK enum's value -- "GTC Ext",
+    #: which normalises to "gtc_ext". Looking that up as a bare ``.lower()`` missed,
+    #: and the round trip silently resubmitted a GTC-Ext order as plain GTC: a
+    #: different expiry, and no extended-session trading.
     _TT_TIF_MAP = {
         "day": OrderTimeInForce.DAY,
         "gtc": OrderTimeInForce.GTC,
@@ -718,6 +724,30 @@ class TastyTradeAccount(AccountInterface):
         "gtc_ext": OrderTimeInForce.GTC_EXT,
         "ioc": OrderTimeInForce.IOC,
     }
+
+    #: The fallback when ``good_for`` is absent or unrecognised, matching
+    #: AlpacaAccount._submit_order_impl's tif_map default.
+    _TT_DEFAULT_TIF = OrderTimeInForce.GTC
+
+    @classmethod
+    def _tt_time_in_force(cls, good_for: Optional[str]) -> OrderTimeInForce:
+        """Resolve a ``TradingOrder.good_for`` to a TastyTrade time in force.
+
+        Normalises case and the space/underscore difference between our spelling
+        ("gtc_ext") and the broker's ("GTC Ext"), so a broker order round-trips
+        unchanged. An unrecognised value is LOGGED before falling back -- silently
+        downgrading a TIF changes when an order dies.
+        """
+        key = str(good_for or "").strip().lower().replace(" ", "_").replace("-", "_")
+        if not key:
+            return cls._TT_DEFAULT_TIF
+        tif = cls._TT_TIF_MAP.get(key)
+        if tif is None:
+            logger.warning(
+                f"Unrecognised time in force {good_for!r}; sending "
+                f"{cls._TT_DEFAULT_TIF.value} instead")
+            return cls._TT_DEFAULT_TIF
+        return tif
 
     @staticmethod
     def _tt_action(side: OrderDirection, is_closing_order: bool) -> OrderAction:
@@ -759,8 +789,7 @@ class TastyTradeAccount(AccountInterface):
         leg = equity.build_leg(Decimal(str(trading_order.quantity)), action)
 
         kwargs = {
-            "time_in_force": self._TT_TIF_MAP.get(
-                (trading_order.good_for or "").lower(), OrderTimeInForce.GTC),
+            "time_in_force": self._tt_time_in_force(trading_order.good_for),
             "legs": [leg],
             "external_identifier": str(trading_order.id) if trading_order.id else None,
         }

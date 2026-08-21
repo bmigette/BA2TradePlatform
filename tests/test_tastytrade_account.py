@@ -866,6 +866,179 @@ def test_build_new_order_prices_a_sell_limit_as_a_positive_credit():
     assert new_order.price_effect == PriceEffect.CREDIT
 
 
+# ---------------------------------------------------------------------------
+# _build_new_order: the stop / stop-limit surface.
+#
+# Nothing exercised this at all, so a stop-limit could send its stop price AS the
+# limit, a stop could go out with no trigger, an unsupported type could quietly
+# become a MARKET order and a missing price could become a penny order -- all with
+# the suite green.
+# ---------------------------------------------------------------------------
+
+def _built_order(**order_kwargs):
+    account_def, order = _tt_trading_order(**order_kwargs)
+    acct = _bare_account()
+    acct.id = account_def.id
+    with patch("tastytrade.instruments.Equity.get",
+               new=AsyncMock(return_value=_FakeEquity(order.symbol))):
+        return acct._build_new_order(order)
+
+
+def test_build_new_order_sends_a_stop_with_its_trigger_and_no_limit_price():
+    """N21. A STOP order whose stop_trigger is dropped becomes a resting order with no
+    trigger at all -- on TastyTrade a Stop with no stop-trigger is not a stop."""
+    from ba2_trade_platform.core.types import OrderType
+
+    new_order = _built_order(order_type=OrderType.BUY_STOP, stop_price=138.0)
+
+    assert new_order.order_type == TTOrderType.STOP
+    assert new_order.stop_trigger == Decimal("138.0")
+    # A plain stop carries no price: NewOrder.price is the LIMIT, and setting it would
+    # turn a stop into a stop-limit that may never fill.
+    assert new_order.price is None
+
+
+def test_build_new_order_sends_a_stop_limit_with_the_trigger_and_the_limit_apart():
+    """N20. `stop_trigger` is the trigger and `price` is the LIMIT (SDK: "For a
+    stop/stop limit order. If the latter, use price for the limit price"). Sending the
+    STOP price as the limit prices the order at the trigger, so a gap through the stop
+    leaves it resting unfilled at a price the market has already left."""
+    from ba2_trade_platform.core.types import OrderType
+
+    new_order = _built_order(order_type=OrderType.BUY_STOP_LIMIT,
+                             stop_price=138.0, limit_price=139.5)
+
+    assert new_order.order_type == TTOrderType.STOP_LIMIT
+    assert new_order.stop_trigger == Decimal("138.0")
+    # Signed: a BUY is a DEBIT, and the magnitude is the LIMIT, not the trigger.
+    assert new_order.price == Decimal("-139.5")
+    assert new_order.price_effect == PriceEffect.DEBIT
+
+
+def test_build_new_order_sends_a_sell_stop_limit_as_a_credit_at_the_limit():
+    from ba2_trade_platform.core.types import OrderDirection, OrderType
+
+    new_order = _built_order(side=OrderDirection.SELL,
+                             order_type=OrderType.SELL_STOP_LIMIT,
+                             stop_price=142.0, limit_price=141.0)
+
+    assert new_order.stop_trigger == Decimal("142.0")
+    assert new_order.price == Decimal("141.0")
+    assert new_order.price_effect == PriceEffect.CREDIT
+
+
+@pytest.mark.parametrize("order_type,prices", [
+    ("BUY_LIMIT", {}),                              # N23: no limit price
+    ("SELL_LIMIT", {}),
+    ("BUY_STOP", {}),                               # N21: no stop price
+    ("BUY_STOP_LIMIT", {"stop_price": 138.0}),      # stop-limit missing the limit
+    ("BUY_STOP_LIMIT", {"limit_price": 139.5}),     # stop-limit missing the stop
+])
+def test_build_new_order_refuses_an_order_with_a_missing_required_price(order_type, prices):
+    """N23. A missing limit price must NOT be silently replaced -- least of all with a
+    fabricated 0.01, which sends a real penny order to the broker (platform rule: no
+    fallback values for live prices)."""
+    from ba2_trade_platform.core.types import OrderType
+
+    with pytest.raises(ValueError):
+        _built_order(order_type=getattr(OrderType, order_type), **prices)
+
+
+@pytest.mark.parametrize("unsupported", ["TRAILING_STOP", "OCO", "OTO"])
+def test_build_new_order_refuses_an_order_type_tastytrade_cannot_send(unsupported):
+    """N22. Falling through to MARKET turns a resting/conditional order into an
+    IMMEDIATE fill at whatever the market is -- the single most expensive way to
+    misread an order type."""
+    from ba2_trade_platform.core.types import OrderType
+
+    with pytest.raises(ValueError) as excinfo:
+        _built_order(order_type=getattr(OrderType, unsupported), limit_price=140.0,
+                     stop_price=138.0)
+
+    assert "does not support order type" in str(excinfo.value)
+
+
+def test_submit_order_impl_does_not_send_an_order_it_cannot_build():
+    """The ValueError must stop the submission, not be reported as a broker failure
+    after something has already gone out."""
+    from ba2_trade_platform.core.db import get_instance
+    from ba2_trade_platform.core.models import TradingOrder
+    from ba2_trade_platform.core.types import OrderStatus, OrderType
+
+    account_def, order = _tt_trading_order(order_type=OrderType.BUY_LIMIT,
+                                           limit_price=None)
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.place_order = AsyncMock()
+
+    with patch("tastytrade.instruments.Equity.get",
+               new=AsyncMock(return_value=_FakeEquity("AAPL"))):
+        assert acct._submit_order_impl(order) is None
+
+    acct._account.place_order.assert_not_called()
+    assert get_instance(TradingOrder, order.id).status == OrderStatus.ERROR
+
+
+# ---------------------------------------------------------------------------
+# Time in force
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("tif", list(OrderTimeInForce))
+def test_time_in_force_survives_a_broker_round_trip(tif):
+    """M13. `tastytrade_order_to_tradingorder` stores the broker's TIF VALUE
+    ("GTC Ext"), and `_build_new_order` looked it up as `good_for.lower()` against a
+    map keyed "gtc_ext" -- so the lookup missed and a GTC-Ext order was silently
+    resubmitted as plain GTC, which expires at a different time and does not trade the
+    extended session. Every TIF the SDK can report must come back unchanged."""
+    acct = _bare_account()
+    mapped = acct.tastytrade_order_to_tradingorder(_placed_order(time_in_force=tif))
+    assert mapped.good_for == tif.value
+
+    account_def, order = _tt_trading_order(good_for=mapped.good_for)
+    acct.id = account_def.id
+    with patch("tastytrade.instruments.Equity.get",
+               new=AsyncMock(return_value=_FakeEquity("AAPL"))):
+        rebuilt = acct._build_new_order(order)
+
+    assert rebuilt.time_in_force == tif
+
+
+@pytest.mark.parametrize("good_for", [None, "", "  ", "banana"])
+def test_an_unknown_time_in_force_falls_back_to_gtc(good_for):
+    """N19. The documented default, matching AlpacaAccount's tif_map default."""
+    new_order = _built_order(good_for=good_for)
+
+    assert new_order.time_in_force == OrderTimeInForce.GTC
+
+
+def test_an_unrecognised_time_in_force_is_logged_rather_than_silently_downgraded(monkeypatch):
+    import sys
+    TT = sys.modules[TastyTradeAccount.__module__]
+    warnings = []
+    monkeypatch.setattr(TT.logger, "warning", lambda msg, *a, **k: warnings.append(str(msg)))
+
+    _built_order(good_for="banana")
+
+    assert any("banana" in w for w in warnings), warnings
+
+
+# ---------------------------------------------------------------------------
+# _signed_price
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("price", [142.5, -142.5])
+def test_signed_price_encodes_the_side_not_the_input_sign(price):
+    """M07. TastyTrade derives `price_effect` from the SIGN of `price`: negative =
+    debit (a buy), positive = credit (a sell). The MAGNITUDE is taken because the
+    caller's price is a plain, unsigned limit -- but a TradingOrder that ever carries a
+    signed price (round-tripped from a broker row) would otherwise flip a BUY into a
+    CREDIT and be rejected, or worse, filled as the wrong cash flow."""
+    from ba2_trade_platform.core.types import OrderDirection
+
+    assert TastyTradeAccount._signed_price(price, OrderDirection.BUY) == Decimal("-142.5")
+    assert TastyTradeAccount._signed_price(price, OrderDirection.SELL) == Decimal("142.5")
+
+
 def test_submit_order_impl_skips_an_order_that_already_has_a_broker_id():
     """Idempotency guard: an order already sent to the broker is never re-sent."""
     account_def, order = _tt_trading_order(broker_order_id="987654")
