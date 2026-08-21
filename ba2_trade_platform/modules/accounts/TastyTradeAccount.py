@@ -853,7 +853,110 @@ class TastyTradeAccount(AccountInterface):
         return True
 
     def refresh_orders(self, **kwargs) -> bool:
-        # Orders are always fetched live from API
+        """Sync our TradingOrder rows with TastyTrade's order book.
+
+        Without this, ``refresh_transactions``
+        (ReadOnlyAccountInterface.refresh_transactions) has nothing to derive from and
+        every transaction stays WAITING forever.
+
+        Matching is on ``external_identifier`` first (we set it to our own row id at
+        submission -- TastyTrade's equivalent of Alpaca's ``client_order_id``), then on
+        ``broker_order_id``. Unlike AlpacaAccount.refresh_orders this does NOT cancel
+        rows that are missing from the response: TastyTrade's order history is
+        paginated and date-windowed, so absence is not evidence of cancellation.
+
+        Args:
+            **kwargs: absorbs the Alpaca-specific ``heuristic_mapping`` / ``fetch_all``
+                that ui/pages/overview.py and core/TradeManager.py pass by name.
+
+        Returns:
+            bool: False only when the broker fetch itself failed.
+        """
+        if not self._check_authentication():
+            return False
+        try:
+            raw_orders = self._run_async(
+                self._account.get_order_history(self._session, page_offset=None))
+        except Exception as e:
+            logger.error(
+                f"[Account {self.id}] Error refreshing orders from TastyTrade: {e}",
+                exc_info=True)
+            return False
+
+        updated_count = 0
+        mapped_count = 0
+        for raw in raw_orders:
+            raw_id = getattr(raw, "id", None)
+            if raw_id in (None, -1):
+                continue
+            broker_order_id = str(raw_id)
+
+            broker_state = self.tastytrade_order_to_tradingorder(raw)
+            if broker_state is None:
+                continue
+
+            db_order = None
+            external_identifier = getattr(raw, "external_identifier", None)
+            if external_identifier:
+                try:
+                    candidate = get_instance(TradingOrder, int(external_identifier))
+                except (InstanceNotFound, TypeError, ValueError):
+                    candidate = None
+                if candidate is not None and candidate.account_id == self.id:
+                    db_order = candidate
+                    if not db_order.broker_order_id:
+                        mapped_count += 1
+
+            if db_order is None:
+                with get_db() as session:
+                    found = session.exec(
+                        select(TradingOrder).where(
+                            TradingOrder.broker_order_id == broker_order_id,
+                            TradingOrder.account_id == self.id,
+                        )
+                    ).first()
+                    found_id = found.id if found else None
+                db_order = get_instance(TradingOrder, found_id) if found_id else None
+            if db_order is None:
+                continue
+
+            has_changes = False
+
+            # PENDING_CANCEL only advances once the broker reaches a FINAL state --
+            # a dependent replacement must not fire before the qty is released.
+            if db_order.status == OrderStatus.PENDING_CANCEL:
+                resolved = OrderStatus.resolve_pending_cancel(broker_state.status)
+                if resolved is not None and resolved != db_order.status:
+                    logger.info(
+                        f"Order {db_order.id} PENDING_CANCEL -> {resolved.value} "
+                        f"(broker reported {broker_state.status})")
+                    db_order.status = resolved
+                    has_changes = True
+            elif db_order.status != broker_state.status:
+                logger.debug(
+                    f"Order {db_order.id} status changed: {db_order.status} -> {broker_state.status}")
+                db_order.status = broker_state.status
+                has_changes = True
+
+            if float(db_order.filled_qty or 0.0) != float(broker_state.filled_qty or 0.0):
+                db_order.filled_qty = broker_state.filled_qty
+                has_changes = True
+
+            if broker_state.open_price is not None and db_order.open_price != broker_state.open_price:
+                db_order.open_price = broker_state.open_price
+                has_changes = True
+
+            if not db_order.broker_order_id:
+                db_order.broker_order_id = broker_order_id
+                has_changes = True
+
+            if has_changes:
+                update_instance(db_order)
+                updated_count += 1
+
+        logger.info(
+            f"[Account {self.id}] Refreshed TastyTrade orders: {updated_count} updated, "
+            f"{mapped_count} mapped via external_identifier")
         return True
 
     def get_dividends(self, symbol=None, start_date=None, end_date=None) -> List[Dict]:

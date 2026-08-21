@@ -849,3 +849,73 @@ def test_submit_order_impl_marks_the_row_error_with_the_broker_message():
     stored = get_instance(TradingOrder, order.id)
     assert stored.status == OrderStatus.ERROR
     assert "account is restricted" in stored.comment
+
+
+# ---------------------------------------------------------------------------
+# refresh_orders
+# ---------------------------------------------------------------------------
+
+def test_refresh_orders_promotes_a_filled_order_and_records_the_fill():
+    from ba2_trade_platform.core.db import get_instance
+    from ba2_trade_platform.core.models import TradingOrder
+    from ba2_trade_platform.core.types import OrderStatus
+
+    account_def, order = _tt_trading_order(quantity=10.0, broker_order_id="987654")
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.get_order_history = AsyncMock(return_value=[
+        _placed_order(order_id=987654, status=TTOrderStatus.FILLED, size="10",
+                      external_identifier=str(order.id),
+                      fills=[_fill(quantity="10", fill_price="150.25")]),
+    ])
+
+    assert acct.refresh_orders() is True
+    stored = get_instance(TradingOrder, order.id)
+    assert stored.status == OrderStatus.FILLED
+    assert stored.filled_qty == 10.0
+    assert stored.open_price == pytest.approx(150.25)
+
+
+def test_refresh_orders_backfills_broker_order_id_from_external_identifier():
+    """external_identifier is our own row id -- TastyTrade's client_order_id."""
+    from ba2_trade_platform.core.db import get_instance
+    from ba2_trade_platform.core.models import TradingOrder
+
+    account_def, order = _tt_trading_order(quantity=10.0)
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.get_order_history = AsyncMock(return_value=[
+        _placed_order(order_id=987654, status=TTOrderStatus.LIVE, size="10",
+                      external_identifier=str(order.id)),
+    ])
+
+    acct.refresh_orders()
+
+    assert get_instance(TradingOrder, order.id).broker_order_id == "987654"
+
+
+def test_refresh_orders_leaves_an_order_absent_from_the_response_untouched():
+    """TastyTrade's order history is paginated and date-windowed, so absence is NOT
+    evidence of cancellation. Unlike Alpaca's refresh, nothing is auto-canceled."""
+    from ba2_trade_platform.core.db import get_instance
+    from ba2_trade_platform.core.models import TradingOrder
+    from ba2_trade_platform.core.types import OrderStatus
+
+    account_def, order = _tt_trading_order(broker_order_id="111111",
+                                           status=OrderStatus.ACCEPTED)
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.get_order_history = AsyncMock(return_value=[])
+
+    acct.refresh_orders()
+
+    assert get_instance(TradingOrder, order.id).status == OrderStatus.ACCEPTED
+
+
+def test_refresh_orders_returns_false_when_the_fetch_fails():
+    account_def, _order = _tt_trading_order()
+    acct = _bare_account()
+    acct.id = account_def.id
+    acct._account.get_order_history = AsyncMock(side_effect=RuntimeError("gateway timeout"))
+
+    assert acct.refresh_orders() is False
