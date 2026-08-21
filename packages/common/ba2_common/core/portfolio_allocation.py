@@ -73,6 +73,7 @@ __all__ = [
     # submission
     "ACTION_ADJUST", "ACTION_CLOSE", "ACTION_NEW", "ACTION_SKIP",
     "decide_symbol_action", "split_delta_fifo",
+    "FRACTIONAL_PATH_FRACTIONAL", "FRACTIONAL_PATH_WHOLE", "plan_quantity_attempts",
 ]
 
 # ---- module constants (exact spellings; use these, never bare literals) ----
@@ -1681,3 +1682,58 @@ def split_delta_fifo(
         out.append((txn_id, -take))
         remaining -= take
     return out
+
+
+# ---------------------------------------------------------------------------
+# Fractional shares: which quantities to attempt, and in what order (decision 12).
+# ---------------------------------------------------------------------------
+
+FRACTIONAL_PATH_FRACTIONAL = "fractional"
+FRACTIONAL_PATH_WHOLE = "whole"
+
+
+def plan_quantity_attempts(
+    quantity: float,
+    *,
+    allow_fractional: bool,
+    fractionable: bool,
+) -> List[Tuple[str, float]]:
+    """The ordered submission attempts for one order quantity. Pure.
+
+    Fractional ON, symbol fractionable and the quantity really is fractional ->
+    try the fractional quantity first, then ONE retry at ``floor(quantity)``.
+    Anything else goes straight to whole shares.
+
+    ONE retry, deliberately: a loop that kept shrinking would walk a rejected
+    order down to a single share and buy something nobody reviewed.
+
+    "Really is fractional" is ``_is_fractional_quantity``, not ``q > floor(q)``.
+    A quantity off a fractional grid lands at 2.9999999999 as readily as at
+    3.0000000001; both ARE three shares, and flooring the low one would send two
+    where the dry run showed three.
+
+    A whole-share attempt is always an exact whole number, which is the whole
+    point of it: a fractional equity order is MARKET-only at both TastyTrade
+    (``fractional_market_orders_only``) and Alpaca, and it is the only kind the
+    broker's fractional notional floor applies to.
+
+    Returns:
+        List[Tuple[str, float]]: ``[(path, quantity)]``, first attempt first.
+        EMPTY when there is nothing sendable -- ``floor(quantity)`` is 0 and
+        fractional is unavailable, or the quantity is 0. The caller reports that
+        as SKIPPED, not as a failure.
+    """
+    magnitude = abs(float(quantity))
+
+    if not _is_fractional_quantity(magnitude):
+        settled = float(round(magnitude))
+        return [(FRACTIONAL_PATH_WHOLE, settled)] if settled > 0 else []
+
+    whole = float(math.floor(magnitude))
+    if allow_fractional and fractionable:
+        attempts = [(FRACTIONAL_PATH_FRACTIONAL, magnitude)]
+        if whole > 0:
+            attempts.append((FRACTIONAL_PATH_WHOLE, whole))
+        return attempts
+
+    return [(FRACTIONAL_PATH_WHOLE, whole)] if whole > 0 else []

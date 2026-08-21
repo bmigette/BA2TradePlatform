@@ -12,6 +12,8 @@ from ba2_common.core.portfolio_allocation import (
     ACTION_CLOSE,
     ACTION_NEW,
     ACTION_SKIP,
+    FRACTIONAL_PATH_FRACTIONAL,
+    FRACTIONAL_PATH_WHOLE,
     ERROR_INVEST_AMOUNT_FMT,
     ERROR_INVEST_LABEL_EMPTY_FMT,
     ERROR_INVEST_NO_LABEL,
@@ -37,6 +39,7 @@ from ba2_common.core.portfolio_allocation import (
     even_split_targets,
     filter_plan_rows,
     invest_validation_messages,
+    plan_quantity_attempts,
     split_delta_fifo,
     steps_validation_messages,
     summarise_plan,
@@ -606,3 +609,70 @@ def test_decide_symbol_action_a_zero_delta_that_still_carries_a_side_is_skipped(
     assert decide_symbol_action(row, None) == ACTION_SKIP
     state = PositionState(symbol="AAPL", quantity=10.0, transaction_ids=[1])
     assert decide_symbol_action(row, state) == ACTION_SKIP
+
+
+# ---------------------------------------------------------------------------
+# Task 73: plan_quantity_attempts -- fractional first, one whole-share retry
+# ---------------------------------------------------------------------------
+
+def test_plan_quantity_attempts_fractional_first_then_whole_shares():
+    attempts = plan_quantity_attempts(2.5, allow_fractional=True, fractionable=True)
+    assert attempts == [(FRACTIONAL_PATH_FRACTIONAL, 2.5), (FRACTIONAL_PATH_WHOLE, 2.0)]
+
+
+def test_plan_quantity_attempts_sub_one_share_has_no_whole_share_fallback():
+    attempts = plan_quantity_attempts(0.4, allow_fractional=True, fractionable=True)
+    assert attempts == [(FRACTIONAL_PATH_FRACTIONAL, 0.4)]
+
+
+def test_plan_quantity_attempts_sub_one_share_without_fractional_is_skipped():
+    # floor(0.4) == 0 -> nothing to attempt, which the caller reports as SKIPPED.
+    assert plan_quantity_attempts(0.4, allow_fractional=False, fractionable=True) == []
+
+
+def test_plan_quantity_attempts_already_whole_needs_no_fractional_attempt():
+    attempts = plan_quantity_attempts(3.0, allow_fractional=True, fractionable=True)
+    assert attempts == [(FRACTIONAL_PATH_WHOLE, 3.0)]
+
+
+def test_plan_quantity_attempts_non_fractionable_symbol_goes_straight_to_whole():
+    attempts = plan_quantity_attempts(2.5, allow_fractional=True, fractionable=False)
+    assert attempts == [(FRACTIONAL_PATH_WHOLE, 2.0)]
+
+
+def test_plan_quantity_attempts_uses_the_magnitude_of_a_signed_delta():
+    attempts = plan_quantity_attempts(-4.0, allow_fractional=False, fractionable=False)
+    assert attempts == [(FRACTIONAL_PATH_WHOLE, 4.0)]
+
+
+@pytest.mark.parametrize("quantity", [2.9999999999, 3.0000000001])
+def test_plan_quantity_attempts_does_not_floor_away_a_share_of_float_noise(quantity):
+    """A quantity off a fractional grid lands at 2.9999999999 as readily as at
+    3.0000000001, and both ARE three shares (`_is_fractional_quantity` tests
+    QUANTITY_EPSILON from both sides). Flooring the low one would send two shares
+    where the dry run showed three."""
+    assert plan_quantity_attempts(quantity, allow_fractional=True,
+                                  fractionable=True) == [(FRACTIONAL_PATH_WHOLE, 3.0)]
+
+
+@pytest.mark.parametrize("quantity", [0.4, 1.0, 2.5, 7.125, 99.99999, 1234.0])
+def test_plan_quantity_attempts_never_puts_a_fraction_on_the_whole_share_path(quantity):
+    """L1: a fractional equity order is MARKET-only at both brokers, so the retry
+    exists precisely to stop being fractional. A whole-share attempt that is not a
+    whole number would be refused for the same reason as the attempt it replaced."""
+    for path, attempt in plan_quantity_attempts(quantity, allow_fractional=True,
+                                                fractionable=True):
+        if path == FRACTIONAL_PATH_WHOLE:
+            assert attempt == float(int(attempt))
+            assert attempt > 0
+
+
+def test_plan_quantity_attempts_offers_at_most_one_retry():
+    """ONE retry. A loop that kept shrinking would walk a rejected order down to
+    a single share and buy something nobody asked for."""
+    assert len(plan_quantity_attempts(9.75, allow_fractional=True,
+                                      fractionable=True)) == 2
+
+
+def test_plan_quantity_attempts_of_zero_has_nothing_to_attempt():
+    assert plan_quantity_attempts(0.0, allow_fractional=True, fractionable=True) == []

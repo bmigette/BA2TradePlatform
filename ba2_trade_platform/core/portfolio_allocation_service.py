@@ -21,9 +21,9 @@ from ..logger import logger
 from .db import InstanceNotFound, add_instance, get_db, get_instance
 from .models import Transaction, TradingOrder
 from .portfolio_allocation import (
-    ACTION_ADJUST, ACTION_CLOSE, ACTION_NEW, ACTION_SKIP,
+    ACTION_ADJUST, ACTION_CLOSE, ACTION_NEW, ACTION_SKIP, FRACTIONAL_PATH_WHOLE,
     AllocationPlan, MarginInfo, PositionFetchFailed, PositionState, apply_order_impacts,
-    decide_symbol_action, split_delta_fifo,
+    decide_symbol_action, plan_quantity_attempts, split_delta_fifo,
 )
 from .TransactionHelper import TransactionHelper
 from .types import OrderDirection, OrderOpenType, OrderStatus, OrderType, TransactionStatus
@@ -423,9 +423,57 @@ def _adjust_symbol(account, row, state) -> RowOutcome:
 
 
 def _open_symbol(account, row, *, run_tag: str, allow_fractional: bool) -> RowOutcome:
-    """Not held, target > 0 -> a brand new MARKET order."""
-    quantity = abs(row.delta_quantity)
-    return _submit_new_order(account, row, quantity, run_tag=run_tag, path="whole")
+    """Not held, target > 0 -> a brand new MARKET order, with the fractional fallback.
+
+    A fractional equity quantity is legal on a MARKET order and on nothing else
+    (TastyTrade ``fractional_market_orders_only``; Alpaca refuses one on any
+    non-market type and on any TIF but DAY), so every attempt goes in as MARKET /
+    good_for='day'. On rejection the order is retried ONCE at floor(qty); a floor
+    of 0 is SKIPPED, not a failure. The row reports which path succeeded.
+
+    The retry is abandoned the moment anything FILLED. A broker that cancels an
+    order after filling part of it has already moved the position, and topping
+    that up with the whole-share retry would overshoot the target the user
+    approved -- an overshoot created by the recovery path itself.
+    """
+    attempts = plan_quantity_attempts(
+        row.delta_quantity,
+        allow_fractional=allow_fractional,
+        fractionable=bool(row.fractional),
+    )
+    if not attempts:
+        return RowOutcome(
+            symbol=row.symbol, action=ACTION_NEW, status=OUTCOME_SKIPPED,
+            quantity=abs(row.delta_quantity),
+            message="below one whole share and fractional is off - nothing submitted",
+        )
+
+    # Every attempt persists its own TradingOrder row, and the rejected one is
+    # left behind marked ERROR by the adapter. The outcome carries BOTH ids: the
+    # run audit has to be able to find the row the broker refused, not just the
+    # one that worked.
+    created: List[int] = []
+    last = None
+    for path, quantity in attempts:
+        last = _submit_new_order(account, row, quantity, run_tag=run_tag, path=path)
+        for order_id in last.order_ids:
+            if order_id not in created:
+                created.append(order_id)
+        last.order_ids = list(created)
+        if last.status != OUTCOME_FAILED:
+            return last
+        if last.filled_quantity:
+            logger.warning(
+                f"Allocation: {row.symbol} failed at qty={quantity} ({path}) AFTER "
+                f"filling {last.filled_quantity}; not retrying - a top-up would "
+                f"overshoot the approved target"
+            )
+            return last
+        logger.warning(
+            f"Allocation: {row.symbol} rejected at qty={quantity} ({path}); "
+            f"{'retrying at whole shares' if path != FRACTIONAL_PATH_WHOLE else 'no retry left'}"
+        )
+    return last
 
 
 def _fresh_comment(order_id: int) -> str:

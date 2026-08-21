@@ -70,6 +70,10 @@ class FakeAccount:
         self.partial_fills = {}      # symbol -> filled quantity (< submitted quantity)
         self.close_failures = {}     # transaction_id -> failure message
         self.close_raises = {}       # transaction_id -> Exception
+        #: Symbols the broker ACCEPTS but has not filled -- the normal shape of a
+        #: market order placed before the open, and the only outcome that is a
+        #: success with no fill to show for it.
+        self.accepted_symbols = set()
 
     def get_positions(self):
         return self.positions
@@ -115,12 +119,18 @@ class FakeAccount:
         if trading_order.symbol in self.washtrade_symbols:
             trading_order.status = OrderStatus.WASHTRADE_LOCKED
             return trading_order
-        if trading_order.symbol in self.terminal_statuses:
-            trading_order.status = self.terminal_statuses[trading_order.symbol]
+        if trading_order.symbol in self.accepted_symbols:
+            trading_order.status = OrderStatus.ACCEPTED
             return trading_order
         if trading_order.symbol in self.partial_fills:
-            trading_order.status = OrderStatus.PARTIALLY_FILLED
+            # A terminal status ON TOP of a partial fill is the "cancelled after
+            # filling some of it" case, which is exactly when a retry must not run.
             trading_order.filled_qty = self.partial_fills[trading_order.symbol]
+            trading_order.status = self.terminal_statuses.get(
+                trading_order.symbol, OrderStatus.PARTIALLY_FILLED)
+            return trading_order
+        if trading_order.symbol in self.terminal_statuses:
+            trading_order.status = self.terminal_statuses[trading_order.symbol]
             return trading_order
         trading_order.status = OrderStatus.FILLED
         trading_order.filled_qty = trading_order.quantity
@@ -834,3 +844,218 @@ def test_submit_plan_refuses_a_plan_solved_on_a_different_fractional_setting():
         svc.submit_plan(account, plan, {}, run_tag="66", allow_fractional=False)
 
     assert account.submitted == []
+
+
+# ---------------------------------------------------------------------------
+# Task 73: fractional shares with a one-shot whole-share fallback
+# ---------------------------------------------------------------------------
+
+def _fractional_plan(symbol="NVDA", delta=2.5, price=900.0):
+    row = make_row(symbol, OrderDirection.BUY, delta, abs(delta) * price,
+                   abs(delta) * price, price=price)
+    row.target_quantity = delta
+    row.fractional = True
+    return AllocationPlan(rows=[row], available_buying_power=10_000.0,
+                          allow_fractional=True)
+
+
+def test_submit_plan_retries_whole_shares_once_when_the_fractional_order_is_rejected():
+    account = FakeAccount(account_id=11)
+    account.positions = []
+    account.reject_quantities = {2.5}   # broker refuses the fractional quantity
+
+    outcomes = svc.submit_plan(account, _fractional_plan(), {}, run_tag="30",
+                               allow_fractional=True)
+
+    assert [s[2] for s in account.submitted] == [2.5, 2.0]
+    assert outcomes[0].status == svc.OUTCOME_SUBMITTED
+    assert outcomes[0].path == "whole"
+    assert outcomes[0].quantity == pytest.approx(2.0)
+
+
+def test_submit_plan_reports_the_fractional_path_when_it_is_accepted():
+    account = FakeAccount(account_id=12)
+    account.positions = []
+
+    outcomes = svc.submit_plan(account, _fractional_plan(), {}, run_tag="31",
+                               allow_fractional=True)
+
+    assert [s[2] for s in account.submitted] == [2.5]
+    assert outcomes[0].path == "fractional"
+
+
+def test_submit_plan_fractional_order_is_sent_good_for_day_as_a_market_order():
+    account = FakeAccount(account_id=13)
+    account.positions = []
+    sent = []
+    original = account.submit_order
+
+    def spy(order, tp_price=None, sl_price=None, is_closing_order=False):
+        sent.append((order.good_for, order.order_type))
+        return original(order, tp_price, sl_price, is_closing_order)
+
+    account.submit_order = spy
+
+    svc.submit_plan(account, _fractional_plan(), {}, run_tag="32", allow_fractional=True)
+
+    assert sent == [('day', OrderType.MARKET)]
+
+
+def test_submit_plan_reports_skipped_not_failed_when_the_whole_share_floor_is_zero():
+    account = FakeAccount(account_id=14)
+    account.positions = []
+    row = make_row("BRK.A", OrderDirection.BUY, 0.4, 260_000.0, 260_000.0, price=650_000.0)
+    row.target_quantity = 0.4
+    plan = AllocationPlan(rows=[row], available_buying_power=500_000.0,
+                          allow_fractional=False)
+
+    outcomes = svc.submit_plan(account, plan, {}, run_tag="33", allow_fractional=False)
+
+    assert account.submitted == []
+    assert outcomes[0].status == svc.OUTCOME_SKIPPED
+    assert "whole share" in outcomes[0].message
+
+
+def test_submit_plan_falls_back_to_whole_shares_when_the_adapter_refuses_locally():
+    """L1: TastyTrade refuses a fractional priced order in the adapter, BEFORE any
+    round trip, by raising a ValueError naming ``fractional_market_orders_only``.
+    That has to drive the same fallback as a broker-side rejection, not reach the
+    user as a traceback."""
+    account = FakeAccount(account_id=67)
+    account.positions = []
+    account.raise_quantities = {2.5: ValueError(
+        "TastyTrade will not accept the fractional quantity 2.5 of NVDA ... "
+        "fractional_market_orders_only")}
+
+    outcomes = svc.submit_plan(account, _fractional_plan(), {}, run_tag="68",
+                               allow_fractional=True)
+
+    assert [s[2] for s in account.submitted] == [2.5, 2.0]
+    assert outcomes[0].status == svc.OUTCOME_SUBMITTED
+    assert outcomes[0].path == "whole"
+
+
+def test_submit_plan_reports_the_last_failure_when_the_whole_share_retry_also_fails():
+    account = FakeAccount(account_id=69)
+    account.positions = []
+    account.reject_quantities = {2.5, 2.0}
+
+    outcomes = svc.submit_plan(account, _fractional_plan(), {}, run_tag="70",
+                               allow_fractional=True)
+
+    assert [s[2] for s in account.submitted] == [2.5, 2.0]
+    assert outcomes[0].status == svc.OUTCOME_FAILED
+    assert outcomes[0].path == "whole"
+    assert outcomes[0].quantity == pytest.approx(2.0)
+
+
+def test_submit_plan_does_not_retry_whole_shares_on_top_of_a_partial_fill():
+    """Cancelled AFTER filling 1.5 of the 2.5. Retrying at 2.0 would buy 3.5
+    shares of a 2.5-share target -- an OVERSHOOT created by the recovery path."""
+    account = FakeAccount(account_id=71)
+    account.positions = []
+    account.partial_fills = {"NVDA": 1.5}
+    account.terminal_statuses = {"NVDA": OrderStatus.CANCELED}
+
+    outcomes = svc.submit_plan(account, _fractional_plan(), {}, run_tag="72",
+                               allow_fractional=True)
+
+    assert [s[2] for s in account.submitted] == [2.5]
+    assert outcomes[0].status == svc.OUTCOME_FAILED
+    assert outcomes[0].filled_quantity == pytest.approx(1.5)
+
+
+def test_submit_plan_never_sends_a_fractional_quantity_for_a_non_fractionable_symbol():
+    """``row.fractional`` is False when the broker does not split the symbol. The
+    engine already sized it whole; submission must not re-introduce the fraction
+    even if the delta carries one."""
+    account = FakeAccount(account_id=73)
+    account.positions = []
+    row = make_row("BRK.A", OrderDirection.BUY, 2.5, 1_625_000.0, 1_625_000.0,
+                   price=650_000.0)
+    row.target_quantity = 2.5
+    row.fractional = False
+    plan = AllocationPlan(rows=[row], available_buying_power=5_000_000.0,
+                          allow_fractional=True)
+
+    outcomes = svc.submit_plan(account, plan, {}, run_tag="74", allow_fractional=True)
+
+    assert [s[2] for s in account.submitted] == [2.0]
+    assert outcomes[0].path == "whole"
+
+
+def test_submit_plan_never_puts_a_fraction_on_a_non_market_order():
+    """L1 end to end: whatever path a fractional row takes, every order that
+    reaches the broker with a fractional quantity is a MARKET order good for the
+    day -- the only shape either broker accepts one on."""
+    account = FakeAccount(account_id=75)
+    account.positions = []
+    account.reject_quantities = {2.5}
+    seen = []
+    original = account.submit_order
+
+    def spy(order, tp_price=None, sl_price=None, is_closing_order=False):
+        seen.append((order.quantity, order.order_type, order.good_for))
+        return original(order, tp_price, sl_price, is_closing_order)
+
+    account.submit_order = spy
+
+    svc.submit_plan(account, _fractional_plan(), {}, run_tag="76", allow_fractional=True)
+
+    assert len(seen) == 2
+    for quantity, order_type, good_for in seen:
+        if quantity != float(int(quantity)):
+            assert order_type == OrderType.MARKET
+            assert good_for == 'day'
+
+
+def test_submit_plan_reports_both_order_rows_the_fallback_created():
+    """The rejected fractional attempt leaves a persisted TradingOrder behind
+    (marked ERROR by the adapter). The run audit has to be able to find it, so
+    the outcome carries both ids -- not just the one that worked."""
+    account = FakeAccount(account_id=77)
+    account.positions = []
+    account.reject_quantities = {2.5}
+
+    outcomes = svc.submit_plan(account, _fractional_plan(), {}, run_tag="78",
+                               allow_fractional=True)
+
+    assert len(outcomes[0].order_ids) == 2
+    rejected, accepted = (get_instance(TradingOrder, i) for i in outcomes[0].order_ids)
+    assert rejected.quantity == pytest.approx(2.5)
+    assert accepted.quantity == pytest.approx(2.0)
+
+
+def test_submit_plan_does_not_follow_an_accepted_fractional_order_with_a_second_one():
+    """The broker ACCEPTED 2.5 shares and has not filled any of them yet, which
+    is the ordinary shape of a market order placed before the open. Nothing has
+    filled, so the "don't top up a partial fill" guard cannot help here: it is the
+    SUCCESS check that has to stop the loop. Without it the run buys 4.5 shares
+    against a 2.5-share target."""
+    account = FakeAccount(account_id=79)
+    account.positions = []
+    account.accepted_symbols = {"NVDA"}
+
+    outcomes = svc.submit_plan(account, _fractional_plan(), {}, run_tag="80",
+                               allow_fractional=True)
+
+    assert [s[2] for s in account.submitted] == [2.5]
+    assert outcomes[0].status == svc.OUTCOME_SUBMITTED
+    assert outcomes[0].path == "fractional"
+    assert outcomes[0].filled_quantity is None  # accepted is not filled
+
+
+def test_submit_plan_does_not_retry_whole_shares_after_a_washtrade_lock():
+    """A locked order is not a rejected one: it is PENDING at our end and will be
+    retried on the next refresh once the blocker clears. Sending a whole-share
+    order behind it queues a SECOND order for the same symbol, and both will
+    eventually fill."""
+    account = FakeAccount(account_id=81)
+    account.positions = []
+    account.washtrade_symbols = {"NVDA"}
+
+    outcomes = svc.submit_plan(account, _fractional_plan(), {}, run_tag="82",
+                               allow_fractional=True)
+
+    assert [s[2] for s in account.submitted] == [2.5]
+    assert outcomes[0].status == svc.OUTCOME_WASHTRADE_LOCKED
