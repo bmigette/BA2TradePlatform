@@ -227,9 +227,10 @@ SQLModel str-enum-stored-by-name migration trap).
   makes re-syncing idempotent exactly as `OptionActivity` does.
 - **`portfolio_allocation_run`** — `account_id`, `mode` (`REBALANCE` |
   `INVEST_LABEL`), `scope_label`, `base_notional`, `available_buying_power`,
-  `plan_json`, `submitted_buy_value`, `submitted_sell_value`, `order_ids`,
+  `plan_json`, `filled_buy_value`, `filled_sell_value`, `order_ids`,
   `created_at`. The `plan_json` snapshot makes a dry-run reproducible after the
-  weights change, and `submitted_buy_value` is what drives income consumption.
+  weights change, and `filled_buy_value` — measured from the broker's fills after
+  submission, not from the plan's intent — is what drives income consumption.
 
 Two hand-written Alembic revisions, chained off `0a3e0bd24598` (the verified
 head): first the instrument merge and unique index, then the five new tables.
@@ -356,7 +357,7 @@ broker calls in the background.
 The page shows the last 30 days, the open total, and a shortcut that opens the
 wizard in `INVEST_LABEL` mode pre-filled with that amount. On submit, a run
 consumes open events oldest-first up to its **net buy value**, defined as
-`max(0, submitted_buy_value − submitted_sell_value)` — a rebalance funded
+`max(0, filled_buy_value − filled_sell_value)` — a rebalance funded
 entirely by its own sells consumes no income. `consumed_amount` is written per
 event, so an event can be partially consumed and its remainder stays open.
 

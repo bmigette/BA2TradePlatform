@@ -56,7 +56,7 @@ def consume(account_id, net_buy_value, *, sell_value=0.0):
     """
     run = store.record_allocation_run(account_id, "REBALANCE", {})
     finalised = store.finalise_allocation_run(
-        run.id, submitted_buy_value=net_buy_value, submitted_sell_value=sell_value,
+        run.id, filled_buy_value=net_buy_value, filled_sell_value=sell_value,
         order_ids=[])
     return [tuple(pair) for pair in finalised.income_consumed_events]
 
@@ -414,7 +414,7 @@ def test_record_allocation_run_persists_the_plan_and_order_ids(account_id):
     run = store.record_allocation_run(
         account_id, "REBALANCE", {"rows": [{"symbol": "TSLA"}], "scale_factor": 0.61},
         base_notional=50_000.0, available_buying_power=20_000.0, allow_fractional=True,
-        submitted_buy_value=8000.0, submitted_sell_value=3000.0, order_ids=[7, 8])
+        filled_buy_value=8000.0, filled_sell_value=3000.0, order_ids=[7, 8])
     assert run.id is not None
     stored = store.get_recent_runs(account_id)[0]
     assert stored.mode == "REBALANCE"
@@ -441,9 +441,9 @@ def test_finalise_allocation_run_writes_back_what_was_actually_submitted(account
     run = store.record_allocation_run(account_id, "REBALANCE", {"rows": []},
                                       base_notional=10_000.0)
     updated = store.finalise_allocation_run(
-        run.id, submitted_buy_value=1600.0, submitted_sell_value=400.0, order_ids=[101, 102])
-    assert updated.submitted_buy_value == 1600.0
-    assert updated.submitted_sell_value == 400.0
+        run.id, filled_buy_value=1600.0, filled_sell_value=400.0, order_ids=[101, 102])
+    assert updated.filled_buy_value == 1600.0
+    assert updated.filled_sell_value == 400.0
     assert updated.order_ids == [101, 102]
     assert updated.net_buy_value == 1200.0
     assert store.get_recent_runs(account_id)[0].order_ids == [101, 102]
@@ -454,7 +454,7 @@ def test_a_run_funded_entirely_by_its_own_sells_has_no_net_buy_value(account_id)
     store.upsert_income_event(account_id, "csd-1", date(2026, 8, 1), "DEPOSIT", 1000.0)
     run = store.record_allocation_run(account_id, "REBALANCE", {})
     finalised = store.finalise_allocation_run(
-        run.id, submitted_buy_value=4000.0, submitted_sell_value=9000.0, order_ids=[])
+        run.id, filled_buy_value=4000.0, filled_sell_value=9000.0, order_ids=[])
     assert finalised.net_buy_value == 0.0
     assert finalised.income_consumed_events == []
     assert finalised.income_consumed_amount == 0.0
@@ -471,7 +471,7 @@ def test_finalise_allocation_run_rejects_a_missing_total(account_id):
     run = store.record_allocation_run(account_id, "REBALANCE", {})
     with pytest.raises(ValueError, match="both totals"):
         store.finalise_allocation_run(
-            run.id, submitted_buy_value=None, submitted_sell_value=0.0, order_ids=[])
+            run.id, filled_buy_value=None, filled_sell_value=0.0, order_ids=[])
     # The refusal is total: nothing was stamped, so the run is still recoverable.
     assert [r.id for r in store.get_unconsumed_runs(account_id)] == [run.id]
 
@@ -480,7 +480,7 @@ def test_finalise_allocation_run_raises_when_the_run_is_gone():
     from ba2_common.core.db import InstanceNotFound
     with pytest.raises(InstanceNotFound):
         store.finalise_allocation_run(
-            999_999, submitted_buy_value=1.0, submitted_sell_value=0.0, order_ids=[])
+            999_999, filled_buy_value=1.0, filled_sell_value=0.0, order_ids=[])
 
 
 def test_a_run_row_written_by_raw_sql_reads_back_with_null_json(account_id):
@@ -496,7 +496,7 @@ def test_a_run_row_written_by_raw_sql_reads_back_with_null_json(account_id):
         session.exec(text(
             "INSERT INTO portfolio_allocation_run "
             "(account_id, mode, base_notional, available_buying_power, allow_fractional, "
-            " submitted_buy_value, submitted_sell_value, created_at) "
+            " filled_buy_value, filled_sell_value, created_at) "
             "VALUES (:aid, 'REBALANCE', 0, 0, 0, 0, 0, '2026-08-20 00:00:00')"
         ), params={"aid": account_id})
         session.commit()
@@ -518,9 +518,9 @@ def test_finalising_the_same_run_twice_consumes_the_ledger_once(account_id):
     run = store.record_allocation_run(account_id, "INVEST_LABEL", {}, scope_label="ARK26")
 
     first = store.finalise_allocation_run(
-        run.id, submitted_buy_value=1600.0, submitted_sell_value=0.0, order_ids=[101])
+        run.id, filled_buy_value=1600.0, filled_sell_value=0.0, order_ids=[101])
     second = store.finalise_allocation_run(
-        run.id, submitted_buy_value=1600.0, submitted_sell_value=0.0, order_ids=[101])
+        run.id, filled_buy_value=1600.0, filled_sell_value=0.0, order_ids=[101])
 
     assert first.income_consumed_amount == pytest.approx(1600.0)
     # Same answer both times, and the ledger only moved once.
@@ -538,13 +538,13 @@ def test_a_replayed_run_restates_its_totals_without_respending(account_id):
     """
     store.upsert_income_event(account_id, "csd-1", date(2026, 8, 1), "DEPOSIT", 5000.0)
     run = store.record_allocation_run(account_id, "REBALANCE", {})
-    store.finalise_allocation_run(run.id, submitted_buy_value=1000.0,
-                                  submitted_sell_value=0.0, order_ids=[1])
+    store.finalise_allocation_run(run.id, filled_buy_value=1000.0,
+                                  filled_sell_value=0.0, order_ids=[1])
 
     replayed = store.finalise_allocation_run(
-        run.id, submitted_buy_value=2500.0, submitted_sell_value=0.0, order_ids=[1, 2])
+        run.id, filled_buy_value=2500.0, filled_sell_value=0.0, order_ids=[1, 2])
 
-    assert replayed.submitted_buy_value == pytest.approx(2500.0)
+    assert replayed.filled_buy_value == pytest.approx(2500.0)
     assert replayed.order_ids == [1, 2]
     assert replayed.income_consumed_amount == pytest.approx(1000.0)
     assert store.get_open_income_total(account_id) == pytest.approx(4000.0)
@@ -563,7 +563,7 @@ def test_a_crashed_run_is_visibly_unconsumed_and_can_be_recovered(account_id):
     assert store.get_open_income_total(account_id) == pytest.approx(5000.0)
 
     recovered = store.finalise_allocation_run(
-        crashed.id, submitted_buy_value=1600.0, submitted_sell_value=0.0, order_ids=[101])
+        crashed.id, filled_buy_value=1600.0, filled_sell_value=0.0, order_ids=[101])
 
     assert recovered.income_consumed_amount == pytest.approx(1600.0)
     assert store.get_open_income_total(account_id) == pytest.approx(3400.0)
@@ -593,13 +593,13 @@ def test_a_failed_consumption_takes_the_totals_down_with_it(account_id, monkeypa
     monkeypatch.setattr(store, "_apply_income_consumption", explode)
     with pytest.raises(RuntimeError, match="ledger unreachable"):
         store.finalise_allocation_run(
-            run.id, submitted_buy_value=1600.0, submitted_sell_value=200.0,
+            run.id, filled_buy_value=1600.0, filled_sell_value=200.0,
             order_ids=[101, 102])
 
     stored = store.get_recent_runs(account_id)[0]
     assert stored.id == run.id
-    assert stored.submitted_buy_value == 0.0
-    assert stored.submitted_sell_value == 0.0
+    assert stored.filled_buy_value == 0.0
+    assert stored.filled_sell_value == 0.0
     assert stored.order_ids == []
     assert stored.is_income_consumed is False
     assert [r.id for r in store.get_unconsumed_runs(account_id)] == [run.id]
@@ -612,8 +612,8 @@ def test_unconsumed_runs_are_scoped_to_one_account_and_newest_first(account_id):
     first = store.record_allocation_run(account_id, "REBALANCE", {}, scope_label="A")
     second = store.record_allocation_run(account_id, "REBALANCE", {}, scope_label="B")
     store.record_allocation_run(other.id, "REBALANCE", {}, scope_label="C")
-    store.finalise_allocation_run(first.id, submitted_buy_value=0.0,
-                                  submitted_sell_value=0.0, order_ids=[])
+    store.finalise_allocation_run(first.id, filled_buy_value=0.0,
+                                  filled_sell_value=0.0, order_ids=[])
 
     assert [r.id for r in store.get_unconsumed_runs(account_id)] == [second.id]
     assert [r.scope_label for r in store.get_unconsumed_runs(other.id)] == ["C"]
@@ -632,7 +632,7 @@ def test_the_consumption_breakdown_says_which_events_a_run_spent(account_id):
     run = store.record_allocation_run(account_id, "REBALANCE", {})
 
     finalised = store.finalise_allocation_run(
-        run.id, submitted_buy_value=250.0, submitted_sell_value=0.0, order_ids=[])
+        run.id, filled_buy_value=250.0, filled_sell_value=0.0, order_ids=[])
 
     assert finalised.income_consumed_events == [[first.id, 100.0], [second.id, 150.0]]
     assert finalised.income_consumed_amount == pytest.approx(250.0)
@@ -647,7 +647,7 @@ def test_a_run_consuming_more_than_the_ledger_holds_is_still_stamped(account_id)
     run = store.record_allocation_run(account_id, "REBALANCE", {})
 
     finalised = store.finalise_allocation_run(
-        run.id, submitted_buy_value=9999.0, submitted_sell_value=0.0, order_ids=[])
+        run.id, filled_buy_value=9999.0, filled_sell_value=0.0, order_ids=[])
 
     assert finalised.income_consumed_amount == pytest.approx(100.0)
     assert finalised.is_income_consumed is True
@@ -743,7 +743,7 @@ def _finalise_concurrently(run_ids, *, buy_value):
         try:
             barrier.wait(timeout=30)
             results[slot] = store.finalise_allocation_run(
-                run_id, submitted_buy_value=buy_value, submitted_sell_value=0.0,
+                run_id, filled_buy_value=buy_value, filled_sell_value=0.0,
                 order_ids=[])
         except BaseException as exc:            # noqa: BLE001 -- reported, not swallowed
             errors.append(exc)
@@ -881,7 +881,7 @@ def test_two_threads_finalising_different_runs_do_not_lose_a_consumption(
 
     account = create_account_definition(name="Race two-runs").id
     store.upsert_income_event(account, "csd-1", date(2026, 8, 1), "DEPOSIT", 1000.0)
-    recorded = dict(submitted_buy_value=400.0, submitted_sell_value=0.0, order_ids=[])
+    recorded = dict(filled_buy_value=400.0, filled_sell_value=0.0, order_ids=[])
     first = store.record_allocation_run(account, "REBALANCE", {}, **recorded)
     second = store.record_allocation_run(account, "REBALANCE", {}, **recorded)
 
@@ -1033,3 +1033,29 @@ def test_remove_symbols_from_label_leaves_the_other_labels_rows_alone(account_id
     survivor = store.get_symbol_rows(account_id, 'HighRisk')['TSLA']
     assert (survivor.weight_pct, survivor.comment) == (30.0, 'hr note')
     assert _instrument_labels('TSLA') == ['HighRisk']
+
+
+# --- filled_* is the contract, not submitted_* ------------------------------
+
+def test_finalise_allocation_run_takes_filled_values_not_submitted_ones(account_id):
+    """The keyword names ARE the contract. ``filled_buy_value`` invited callers to
+    pass what they intended to trade; ``filled_buy_value`` asks for what the broker
+    actually did, which is the only number the income ledger may be spent against."""
+    store.upsert_income_event(account_id, "dep-rename", date(2026, 8, 1), "DEPOSIT", 5000.0)
+    run = store.record_allocation_run(account_id, "REBALANCE", {})
+
+    finalised = store.finalise_allocation_run(
+        run.id, filled_buy_value=1600.0, filled_sell_value=400.0, order_ids=[101, 102])
+
+    assert finalised.filled_buy_value == 1600.0
+    assert finalised.filled_sell_value == 400.0
+    assert finalised.net_buy_value == 1200.0
+    assert finalised.income_consumed_amount == pytest.approx(1200.0)
+
+
+def test_record_allocation_run_takes_filled_values_too(account_id):
+    """Same spelling on the CREATE path, which normally passes zeros."""
+    run = store.record_allocation_run(account_id, "REBALANCE", {},
+                                      filled_buy_value=0.0, filled_sell_value=0.0)
+    assert run.filled_buy_value == 0.0
+    assert run.filled_sell_value == 0.0

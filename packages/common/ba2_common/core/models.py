@@ -945,6 +945,15 @@ class PortfolioAllocationRun(SQLModel, table=True):
     driven by the NET buy value (``net_buy_value`` below): a rebalance funded
     entirely by its own sells consumes no income.
 
+    ``filled_buy_value`` / ``filled_sell_value`` are FILLED money, never intended
+    money: ``filled_qty * open_price`` summed over the run's own MARKET orders
+    AFTER ``account.refresh_orders()`` has brought the broker's truth back. An
+    order that was submitted and then rejected, or that never filled, is worth
+    exactly 0 here. They were called ``submitted_*`` until the rename, and the old
+    spelling was a money bug: consuming the income ledger against value that was
+    only ever INTENDED marks a dividend spent when nothing was bought, and the
+    ``income_consumed_at`` stamp makes that permanent.
+
     ``base_notional`` mirrors ``AllocationPlan.base_notional`` and so carries TWO
     meanings depending on ``mode``: in a REBALANCE it is the ALLOCATABLE BASE
     (buying power plus the current value of managed positions, at plan time); in
@@ -977,8 +986,8 @@ class PortfolioAllocationRun(SQLModel, table=True):
     available_buying_power: float = Field(default=0.0, description="Broker buying power snapshotted at plan time")
     allow_fractional: bool = Field(default=False, description="Whether fractional shares were opted in for this run")
     plan_json: Dict[str, Any] = Field(sa_column=Column(JSON), default_factory=dict, description="AllocationPlan.to_dict() at submit time")
-    submitted_buy_value: float = Field(default=0.0, description="Sum of estimated value of BUY orders actually submitted")
-    submitted_sell_value: float = Field(default=0.0, description="Sum of estimated value of SELL orders actually submitted")
+    filled_buy_value: float = Field(default=0.0, description="Sum of filled_qty * open_price over this run's BUY orders, measured after refresh_orders")
+    filled_sell_value: float = Field(default=0.0, description="Sum of filled_qty * open_price over this run's SELL orders, measured after refresh_orders")
     order_ids: List[int] = Field(sa_column=Column(JSON), default_factory=list, description="TradingOrder ids created by this run")
     income_consumed_at: DateTime | None = Field(default=None, description="When this run consumed the income ledger; NULL means it never has (idempotency guard)")
     income_consumed_events: List[Any] = Field(sa_column=Column(JSON), default_factory=list, description="[[income_event_id, amount], ...] this run actually took from the ledger")
@@ -986,8 +995,8 @@ class PortfolioAllocationRun(SQLModel, table=True):
 
     @property
     def net_buy_value(self) -> float:
-        """``max(0, buys - sells)`` -- what this run consumes from the income ledger."""
-        return max(0.0, (self.submitted_buy_value or 0.0) - (self.submitted_sell_value or 0.0))
+        """``max(0, filled buys - filled sells)`` -- what this run consumes from the ledger."""
+        return max(0.0, (self.filled_buy_value or 0.0) - (self.filled_sell_value or 0.0))
 
     @property
     def is_income_consumed(self) -> bool:

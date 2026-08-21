@@ -23,6 +23,14 @@ per-run idempotency guard for income consumption. Amending in place is only
 legal because nothing has run this revision yet; once it ships, the same change
 costs a second revision.
 
+Amended a SECOND time, on the same grounds (still unapplied; nothing chains off
+it), to rename portfolio_allocation_run.submitted_buy_value /
+submitted_sell_value to filled_buy_value / filled_sell_value. The columns hold
+what the broker FILLED, not what the platform submitted, and the income ledger is
+spent against them. A developer database that `init_db()` built with create_all
+on an older checkout has the OLD column names and would be skipped by
+_create_table_if_absent, so _rename_column_if_present fixes it up in place.
+
 IDEMPOTENT ON PURPOSE
 =====================
 Every create is guarded by a `has_table` / `has_index` check, because THIS
@@ -144,6 +152,33 @@ def _create_index_if_absent(index_name: str, table_name: str, columns,
     op.create_index(index_name, table_name, columns, unique=unique)
 
 
+def _rename_column_if_present(table_name: str, old_name: str, new_name: str) -> None:
+    """Rename a column that an older create_all left behind under its old name.
+
+    Converges the three states this revision can meet: table absent (nothing to
+    do -- the CREATE above already used the new name), table present with the new
+    name (nothing to do), table present with the OLD name (rename it). Anything
+    else is a schema we do not recognise and must not guess at.
+
+    batch_alter_table because SQLite has no ALTER COLUMN: alembic copies the table
+    and its indexes. Only ever reached on a developer database.
+    """
+    inspector = sa.inspect(op.get_bind())
+    if not inspector.has_table(table_name):
+        return
+    names = {column["name"] for column in inspector.get_columns(table_name)}
+    if new_name in names:
+        print(f"[pf-allocation] {table_name}.{new_name} already named correctly -- skipped")
+        return
+    if old_name not in names:
+        raise RuntimeError(
+            f"{table_name} has neither {old_name} nor {new_name}; refusing to guess")
+    with op.batch_alter_table(table_name, schema=None) as batch_op:
+        batch_op.alter_column(old_name, new_column_name=new_name,
+                              existing_type=sa.Float(), existing_nullable=False)
+    print(f"[pf-allocation] renamed {table_name}.{old_name} -> {new_name}")
+
+
 def upgrade() -> None:
     _create_table_if_absent(
         "portfolio_allocation_config",
@@ -229,8 +264,8 @@ def upgrade() -> None:
         sa.Column("available_buying_power", sa.Float(), nullable=False),
         sa.Column("allow_fractional", sa.Boolean(), nullable=False),
         sa.Column("plan_json", sa.JSON(), nullable=True),
-        sa.Column("submitted_buy_value", sa.Float(), nullable=False),
-        sa.Column("submitted_sell_value", sa.Float(), nullable=False),
+        sa.Column("filled_buy_value", sa.Float(), nullable=False),
+        sa.Column("filled_sell_value", sa.Float(), nullable=False),
         sa.Column("order_ids", sa.JSON(), nullable=True),
         # Income-ledger replay guard. NULL = this run has never consumed income;
         # a timestamp = it has, exactly once. Written in the SAME transaction as
@@ -245,6 +280,11 @@ def upgrade() -> None:
     _create_index_if_absent("ix_portfolio_allocation_run_account_id", "portfolio_allocation_run", ["account_id"])
     _create_index_if_absent("ix_portfolio_allocation_run_mode", "portfolio_allocation_run", ["mode"])
     _create_index_if_absent("ix_portfolio_allocation_run_created_at", "portfolio_allocation_run", ["created_at"])
+
+    _rename_column_if_present("portfolio_allocation_run",
+                              "submitted_buy_value", "filled_buy_value")
+    _rename_column_if_present("portfolio_allocation_run",
+                              "submitted_sell_value", "filled_sell_value")
 
 
 def downgrade() -> None:

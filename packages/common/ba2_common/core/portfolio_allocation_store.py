@@ -475,7 +475,7 @@ def _apply_income_consumption(session, account_id: int,
     would be exactly the replay hazard this module is built to prevent, so there
     isn't one: go through ``finalise_allocation_run()``.
 
-    ``net_buy_value`` is ``max(0, submitted_buy_value - submitted_sell_value)``: a
+    ``net_buy_value`` is ``max(0, filled_buy_value - filled_sell_value)``: a
     rebalance funded entirely by its own sells consumes nothing. Anything ``<= 0``
     consumes nothing and returns ``[]``.
 
@@ -557,8 +557,8 @@ def record_allocation_run(account_id: int, mode: str, plan_json: Dict[str, Any],
                           base_notional: float = 0.0,
                           available_buying_power: float = 0.0,
                           allow_fractional: bool = False,
-                          submitted_buy_value: float = 0.0,
-                          submitted_sell_value: float = 0.0,
+                          filled_buy_value: float = 0.0,
+                          filled_sell_value: float = 0.0,
                           order_ids: Optional[List[int]] = None) -> PortfolioAllocationRun:
     """Persist the audit row for one allocation run.
 
@@ -570,9 +570,9 @@ def record_allocation_run(account_id: int, mode: str, plan_json: Dict[str, Any],
     toggle changes. Note ``base_notional`` carries the plan's TWO meanings: the
     allocatable base in a REBALANCE, the budget in an INVEST_LABEL run.
 
-    The live service calls this BEFORE submitting, with zero submitted values, so
-    the run id exists to stamp into every order comment; it then calls
-    ``finalise_allocation_run`` with what was actually submitted.
+    The live service calls this BEFORE submitting, with zero values, so the run id
+    exists to stamp into every order comment; it then refreshes the orders from the
+    broker and calls ``finalise_allocation_run`` with what actually FILLED.
 
     This does NOT consume income, and the row it returns is a detached snapshot
     whose totals are whatever you passed (normally zeros) -- never feed its
@@ -591,8 +591,8 @@ def record_allocation_run(account_id: int, mode: str, plan_json: Dict[str, Any],
             available_buying_power=float(available_buying_power),
             allow_fractional=bool(allow_fractional),
             plan_json=plan_json or {},
-            submitted_buy_value=float(submitted_buy_value),
-            submitted_sell_value=float(submitted_sell_value),
+            filled_buy_value=float(filled_buy_value),
+            filled_sell_value=float(filled_sell_value),
             order_ids=list(order_ids or []),
         )
         session.add(row)
@@ -600,24 +600,25 @@ def record_allocation_run(account_id: int, mode: str, plan_json: Dict[str, Any],
         session.refresh(row)
         session.expunge(row)
         logger.info(f"Recorded allocation run {row.id} ({mode}) for account {account_id}: "
-                    f"buys {row.submitted_buy_value:.2f} / sells {row.submitted_sell_value:.2f}")
+                    f"buys {row.filled_buy_value:.2f} / sells {row.filled_sell_value:.2f}")
         return row
 
 
 def finalise_allocation_run(run_id: int, *,
-                            submitted_buy_value: float,
-                            submitted_sell_value: float,
+                            filled_buy_value: float,
+                            filled_sell_value: float,
                             order_ids: List[int]) -> PortfolioAllocationRun:
-    """Close out a run: write what it submitted AND spend the income ledger, atomically.
+    """Close out a run: write what it FILLED AND spend the income ledger, atomically.
 
     Call this ONCE per run, after the submission loop, whether or not every order
     made it out -- a partial submission still has to be recorded and still has to
     consume what it actually bought.
 
-    Both totals are RESTATED wholesale, never merged: they are the final tally of
-    a finished submission loop, and ``None`` is rejected rather than read as
-    "leave unchanged" -- a missing money figure would silently understate
-    ``net_buy_value`` and so under-consume the income ledger.
+    Both totals are RESTATED wholesale, never merged: they are the final tally of a
+    finished submission loop as measured from the broker's own fills, and ``None``
+    is rejected rather than read as "leave unchanged" -- a missing money figure
+    would silently understate ``net_buy_value`` and so under-consume the ledger.
+    They are FILLED value: see ``PortfolioAllocationRun``.
 
     **Why the totals and the consumption are one call.** The budget consumed is
     ``net_buy_value``, which is derived from the totals written by this very
@@ -663,10 +664,10 @@ def finalise_allocation_run(run_id: int, *,
     """
     from ba2_common.core.db import InstanceNotFound
 
-    if submitted_buy_value is None or submitted_sell_value is None:
+    if filled_buy_value is None or filled_sell_value is None:
         raise ValueError(
             f"finalise_allocation_run({run_id}) needs both totals as numbers, got "
-            f"buys={submitted_buy_value!r} sells={submitted_sell_value!r}; pass 0.0 for "
+            f"buys={filled_buy_value!r} sells={filled_sell_value!r}; pass 0.0 for "
             f"'nothing was submitted'")
 
     with get_db() as session:
@@ -680,8 +681,8 @@ def finalise_allocation_run(run_id: int, *,
             raise InstanceNotFound(f"PortfolioAllocationRun {run_id} not found")
         account_id = row.account_id
         replayed = row.income_consumed_at is not None
-        row.submitted_buy_value = float(submitted_buy_value)
-        row.submitted_sell_value = float(submitted_sell_value)
+        row.filled_buy_value = float(filled_buy_value)
+        row.filled_sell_value = float(filled_sell_value)
         row.order_ids = list(order_ids or [])
         if replayed:
             # The ledger is NOT touched again. The totals above are re-stated
@@ -704,7 +705,7 @@ def finalise_allocation_run(run_id: int, *,
     else:
         logger.info(
             f"Finalised allocation run {run_id} for account {account_id}: buys "
-            f"{row.submitted_buy_value:.2f} / sells {row.submitted_sell_value:.2f}, "
+            f"{row.filled_buy_value:.2f} / sells {row.filled_sell_value:.2f}, "
             f"consumed {row.income_consumed_amount:.2f} from {len(consumed)} income "
             f"event(s) against a net buy value of {row.net_buy_value:.2f}")
     return row

@@ -225,3 +225,92 @@ def test_the_revision_is_chained_onto_the_instrument_revision():
     revision = script.get_revision("f1c8a24b7e05")
     assert revision.down_revision == "f1a7c2e9b4d0"
     assert script.get_revision(revision.down_revision) is not None
+
+
+# --- the submitted_* -> filled_* rename, on a developer database ------------
+
+_OLD_RUN_TABLE_SQL = """
+CREATE TABLE portfolio_allocation_run (
+    id INTEGER NOT NULL PRIMARY KEY,
+    account_id INTEGER NOT NULL,
+    mode VARCHAR NOT NULL,
+    scope_label VARCHAR,
+    base_notional FLOAT NOT NULL,
+    available_buying_power FLOAT NOT NULL,
+    allow_fractional BOOLEAN NOT NULL,
+    plan_json JSON,
+    submitted_buy_value FLOAT NOT NULL,
+    submitted_sell_value FLOAT NOT NULL,
+    order_ids JSON,
+    income_consumed_at DATETIME,
+    income_consumed_events JSON,
+    created_at DATETIME NOT NULL
+)
+"""
+
+
+def _old_shaped_run_table(engine):
+    """The run table as an OLDER checkout's create_all built it: submitted_*."""
+    from sqlalchemy import text
+    with engine.begin() as connection:
+        connection.execute(text(_OLD_RUN_TABLE_SQL))
+        connection.execute(text(
+            "INSERT INTO portfolio_allocation_run "
+            "(id, account_id, mode, base_notional, available_buying_power, "
+            " allow_fractional, submitted_buy_value, submitted_sell_value, created_at) "
+            "VALUES (1, 7, 'REBALANCE', 0.0, 0.0, 0, 1600.0, 400.0, '2026-08-01 00:00:00')"))
+
+
+def test_upgrade_renames_the_money_columns_a_stale_create_all_left_behind(tmp_path):
+    """A developer DB built before the rename has submitted_*; the CREATE guard
+    skips the table entirely, so without _rename_column_if_present the model and
+    the schema disagree forever and every finalise dies on a missing column."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'stale_names.sqlite'}")
+    _old_shaped_run_table(engine)
+
+    _upgrade(engine)
+
+    names = {c["name"] for c in inspect(engine).get_columns("portfolio_allocation_run")}
+    assert "filled_buy_value" in names and "filled_sell_value" in names
+    assert "submitted_buy_value" not in names and "submitted_sell_value" not in names
+
+
+def test_the_rename_carries_the_money_across_rather_than_dropping_it(tmp_path):
+    """batch_alter_table copies the table; a rename that lost the values would
+    zero every past run's totals and so mis-state what the ledger already spent."""
+    from sqlalchemy import text
+    engine = create_engine(f"sqlite:///{tmp_path / 'stale_values.sqlite'}")
+    _old_shaped_run_table(engine)
+
+    _upgrade(engine)
+
+    with engine.begin() as connection:
+        row = connection.execute(text(
+            "SELECT filled_buy_value, filled_sell_value FROM portfolio_allocation_run "
+            "WHERE id = 1")).one()
+    assert (row[0], row[1]) == (1600.0, 400.0)
+
+
+def test_the_rename_is_skipped_when_the_column_is_already_correct(migrated_engine):
+    """Idempotence, the same discipline the create guards follow: re-running this
+    revision over its own output must not raise."""
+    _upgrade(migrated_engine)
+
+    names = {c["name"] for c in inspect(migrated_engine).get_columns("portfolio_allocation_run")}
+    assert "filled_buy_value" in names
+
+
+def test_the_rename_refuses_to_guess_at_a_schema_it_does_not_recognise(tmp_path):
+    """Neither spelling present means this is not the table we think it is.
+    Renaming blind, or silently continuing, would hide a real schema drift."""
+    from sqlalchemy import text
+    engine = create_engine(f"sqlite:///{tmp_path / 'alien.sqlite'}")
+    with engine.begin() as connection:
+        # The indexed columns are present, so the revision reaches the rename
+        # rather than dying earlier on CREATE INDEX; the money columns are not.
+        connection.execute(text(
+            "CREATE TABLE portfolio_allocation_run (id INTEGER PRIMARY KEY, "
+            "account_id INTEGER, mode VARCHAR, created_at DATETIME)"))
+
+    with pytest.raises(RuntimeError, match="refusing to guess"):
+        _upgrade(engine)

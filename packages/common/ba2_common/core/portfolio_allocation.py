@@ -1568,7 +1568,7 @@ def consume_income_events(events: List[Tuple[int, float]],
         events: ``[(income_event_id, open_amount)]``, ALREADY sorted oldest-first
             by ``event_date`` then ``id``. Pass plain tuples, not ORM rows, so
             this stays IO-free and unit-testable.
-        net_buy_value: ``max(0, submitted_buy_value - submitted_sell_value)`` -- a
+        net_buy_value: ``max(0, filled_buy_value - filled_sell_value)`` -- a
             rebalance funded entirely by its own sells consumes nothing.
 
     Returns:

@@ -1748,8 +1748,8 @@ def test_summarise_outcomes_counts_only_the_rows_that_were_submitted():
 
     totals = svc.summarise_outcomes(plan, outcomes)
 
-    assert totals["submitted_buy_value"] == pytest.approx(1600.0)
-    assert totals["submitted_sell_value"] == pytest.approx(2000.0)
+    assert totals["filled_buy_value"] == pytest.approx(1600.0)
+    assert totals["filled_sell_value"] == pytest.approx(2000.0)
     assert totals["net_buy_value"] == pytest.approx(0.0)
 
 
@@ -1762,7 +1762,7 @@ def test_summarise_outcomes_uses_the_quantity_that_actually_went_in():
 
     totals = svc.summarise_outcomes(plan, outcomes)
 
-    assert totals["submitted_buy_value"] == pytest.approx(1800.0)
+    assert totals["filled_buy_value"] == pytest.approx(1800.0)
 
 
 def test_summarise_outcomes_counts_a_partial_fill_as_money_that_went_out():
@@ -1774,7 +1774,7 @@ def test_summarise_outcomes_counts_a_partial_fill_as_money_that_went_out():
     outcomes = [svc.RowOutcome(symbol="NVDA", action=ACTION_NEW, status=svc.OUTCOME_PARTIAL,
                                quantity=4.0, filled_quantity=1.0, order_ids=[9])]
 
-    assert svc.summarise_outcomes(plan, outcomes)["submitted_buy_value"] == pytest.approx(3600.0)
+    assert svc.summarise_outcomes(plan, outcomes)["filled_buy_value"] == pytest.approx(3600.0)
 
 
 def test_summarise_outcomes_counts_the_shares_a_cancelled_order_had_already_filled():
@@ -1789,7 +1789,7 @@ def test_summarise_outcomes_counts_the_shares_a_cancelled_order_had_already_fill
                                quantity=10.0, filled_quantity=6.0, order_ids=[9])]
 
     # 6 shares at 160, not 10 at 160 and not zero.
-    assert svc.summarise_outcomes(plan, outcomes)["submitted_buy_value"] == pytest.approx(960.0)
+    assert svc.summarise_outcomes(plan, outcomes)["filled_buy_value"] == pytest.approx(960.0)
 
 
 def test_summarise_outcomes_still_values_a_failure_that_filled_nothing_at_zero():
@@ -1798,7 +1798,7 @@ def test_summarise_outcomes_still_values_a_failure_that_filled_nothing_at_zero()
     outcomes = [svc.RowOutcome(symbol="AAPL", action=ACTION_NEW, status=svc.OUTCOME_FAILED,
                                quantity=10.0, filled_quantity=0.0, order_ids=[9])]
 
-    assert svc.summarise_outcomes(plan, outcomes)["submitted_buy_value"] == pytest.approx(0.0)
+    assert svc.summarise_outcomes(plan, outcomes)["filled_buy_value"] == pytest.approx(0.0)
 
 
 def test_summarise_outcomes_ignores_a_washtrade_locked_row():
@@ -1810,7 +1810,7 @@ def test_summarise_outcomes_ignores_a_washtrade_locked_row():
                                status=svc.OUTCOME_WASHTRADE_LOCKED, quantity=4.0,
                                order_ids=[9])]
 
-    assert svc.summarise_outcomes(plan, outcomes)["submitted_buy_value"] == pytest.approx(0.0)
+    assert svc.summarise_outcomes(plan, outcomes)["filled_buy_value"] == pytest.approx(0.0)
 
 
 def test_summarise_outcomes_ignores_a_skipped_row():
@@ -1819,7 +1819,7 @@ def test_summarise_outcomes_ignores_a_skipped_row():
     outcomes = [svc.RowOutcome(symbol="NVDA", action=ACTION_SKIP, status=svc.OUTCOME_SKIPPED)]
 
     totals = svc.summarise_outcomes(plan, outcomes)
-    assert totals["submitted_buy_value"] == pytest.approx(0.0)
+    assert totals["filled_buy_value"] == pytest.approx(0.0)
     assert totals["order_ids"] == []
 
 
@@ -1849,7 +1849,7 @@ def test_summarise_outcomes_falls_back_to_the_row_estimate_when_there_is_no_pric
     outcomes = [svc.RowOutcome(symbol="AAPL", action=ACTION_NEW,
                                status=svc.OUTCOME_SUBMITTED, quantity=10.0)]
 
-    assert svc.summarise_outcomes(plan, outcomes)["submitted_buy_value"] == pytest.approx(1600.0)
+    assert svc.summarise_outcomes(plan, outcomes)["filled_buy_value"] == pytest.approx(1600.0)
 
 
 def test_summarise_outcomes_never_reports_a_negative_net_buy_value():
@@ -1861,7 +1861,7 @@ def test_summarise_outcomes_never_reports_a_negative_net_buy_value():
                                status=svc.OUTCOME_SUBMITTED, quantity=5.0)]
 
     totals = svc.summarise_outcomes(plan, outcomes)
-    assert totals["submitted_sell_value"] == pytest.approx(2000.0)
+    assert totals["filled_sell_value"] == pytest.approx(2000.0)
     assert totals["net_buy_value"] == pytest.approx(0.0)
 
 
@@ -1870,7 +1870,7 @@ def test_summarise_outcomes_ignores_an_outcome_for_a_symbol_the_plan_never_had()
     outcomes = [svc.RowOutcome(symbol="GHOST", action=ACTION_NEW,
                                status=svc.OUTCOME_SUBMITTED, quantity=10.0)]
 
-    assert svc.summarise_outcomes(plan, outcomes)["submitted_buy_value"] == pytest.approx(0.0)
+    assert svc.summarise_outcomes(plan, outcomes)["filled_buy_value"] == pytest.approx(0.0)
 
 
 # -- run_allocation ---------------------------------------------------------
@@ -1897,7 +1897,7 @@ def test_run_allocation_persists_a_run_row_carrying_the_plan_and_the_order_ids(a
     assert run.account_id == 31
     assert run.mode == ALLOCATION_MODE_REBALANCE
     assert run.base_notional == pytest.approx(15_000.0)
-    assert run.submitted_buy_value == pytest.approx(1600.0)
+    assert run.filled_buy_value == pytest.approx(1600.0)
     assert run.order_ids == result["outcomes"][0].order_ids
     assert run.plan_json["rows"][0]["symbol"] == "AAPL"
 
@@ -1940,7 +1940,7 @@ def test_run_allocation_partial_failure_records_only_what_was_submitted(activity
                                 mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
 
     run = the_run()
-    assert run.submitted_buy_value == pytest.approx(1600.0)
+    assert run.filled_buy_value == pytest.approx(1600.0)
     statuses = {o.symbol: o.status for o in result["outcomes"]}
     assert statuses["AAPL"] == svc.OUTCOME_SUBMITTED
     assert statuses["NVDA"] == svc.OUTCOME_FAILED
@@ -1959,8 +1959,8 @@ def test_run_allocation_finalises_a_run_in_which_every_row_failed(activity):
     result = svc.run_allocation(account, _buy_plan(), {}, make_base(),
                                 mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
 
-    assert result["submitted_buy_value"] == pytest.approx(0.0)
-    assert the_run().submitted_buy_value == pytest.approx(0.0)
+    assert result["filled_buy_value"] == pytest.approx(0.0)
+    assert the_run().filled_buy_value == pytest.approx(0.0)
     assert get_unconsumed_runs(48) == []
 
 
@@ -1990,7 +1990,7 @@ def test_run_allocation_reports_a_ledger_shortfall_without_calling_it_an_error(a
     result = svc.run_allocation(account, _buy_plan(), {}, make_base(),
                                 mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
 
-    assert result["submitted_buy_value"] == pytest.approx(1600.0)
+    assert result["filled_buy_value"] == pytest.approx(1600.0)
     assert result["income_consumed"] == pytest.approx(500.0)
     assert svc.get_open_income_total(49) == pytest.approx(0.0)
 
@@ -2013,7 +2013,7 @@ def test_run_allocation_of_a_rebalance_funded_by_its_own_sells_consumes_no_incom
     result = svc.run_allocation(account, plan, current, make_base(),
                                 mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
 
-    assert result["submitted_sell_value"] == pytest.approx(2000.0)
+    assert result["filled_sell_value"] == pytest.approx(2000.0)
     assert result["income_consumed"] == pytest.approx(0.0)
     assert svc.get_open_income_total(50) == pytest.approx(5_000.0)
 
@@ -2072,7 +2072,7 @@ def test_run_allocation_spends_the_income_that_funded_a_cancelled_partial_fill(a
 
     assert result["outcomes"][0].status == svc.OUTCOME_FAILED
     assert result["outcomes"][0].filled_quantity == pytest.approx(6.0)
-    assert result["submitted_buy_value"] == pytest.approx(960.0)
+    assert result["filled_buy_value"] == pytest.approx(960.0)
     assert result["income_consumed"] == pytest.approx(960.0)
     assert svc.get_open_income_total(103) == pytest.approx(4_040.0)
     assert get_unconsumed_runs(103) == []
@@ -2097,7 +2097,7 @@ def test_run_allocation_does_not_spend_income_on_an_add_the_broker_refused(activ
     result = svc.run_allocation(account, plan, current, make_base(),
                                 mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
 
-    assert result["submitted_buy_value"] == pytest.approx(0.0)
+    assert result["filled_buy_value"] == pytest.approx(0.0)
     assert result["income_consumed"] == pytest.approx(0.0)
     assert svc.get_open_income_total(108) == pytest.approx(5_000.0)
     assert txn_quantity(txn_id) == pytest.approx(10.0)
@@ -2128,7 +2128,7 @@ def test_run_allocation_counts_the_sells_a_partly_successful_close_really_made(a
                                 mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
 
     # 3 of the 5 shares really were sold: 3 * 400 = 1200 against a 1600 buy.
-    assert result["submitted_sell_value"] == pytest.approx(1200.0)
+    assert result["filled_sell_value"] == pytest.approx(1200.0)
     assert result["income_consumed"] == pytest.approx(400.0)
     assert svc.get_open_income_total(109) == pytest.approx(4_600.0)
 
@@ -2214,7 +2214,7 @@ def test_run_allocation_records_an_empty_run_when_submission_refuses_the_plan(
                            mode=ALLOCATION_MODE_REBALANCE, scope_label=None)
 
     run = the_run()
-    assert run.submitted_buy_value == pytest.approx(0.0)
+    assert run.filled_buy_value == pytest.approx(0.0)
     assert get_unconsumed_runs(55) == []
     assert svc.get_open_income_total(55) == pytest.approx(5_000.0)
 
@@ -2232,8 +2232,8 @@ def test_finalising_a_run_twice_never_consumes_the_income_twice():
     run = record_allocation_run(35, ALLOCATION_MODE_REBALANCE, {})
 
     for _ in range(2):
-        finalised = finalise_allocation_run(run.id, submitted_buy_value=1600.0,
-                                            submitted_sell_value=0.0, order_ids=[101])
+        finalised = finalise_allocation_run(run.id, filled_buy_value=1600.0,
+                                            filled_sell_value=0.0, order_ids=[101])
         assert finalised.income_consumed_amount == pytest.approx(1600.0)
 
     assert svc.get_open_income_total(35) == pytest.approx(3_400.0)

@@ -69,15 +69,27 @@ def test_income_event_open_amount_never_goes_negative():
     assert event.open_amount == 0.0
 
 
-def test_run_net_buy_value_is_buys_minus_sells():
+def test_run_net_buy_value_is_filled_buys_minus_filled_sells():
+    """The columns are FILLED value, not submitted value. A run whose orders never
+    filled has zeros here and so consumes nothing from the income ledger."""
     run = PortfolioAllocationRun(account_id=1, mode="REBALANCE",
-                                 submitted_buy_value=5000.0, submitted_sell_value=1200.0)
+                                 filled_buy_value=5000.0, filled_sell_value=1200.0)
+    assert run.filled_buy_value == 5000.0
+    assert run.filled_sell_value == 1200.0
     assert run.net_buy_value == 3800.0
 
 
 def test_run_net_buy_value_is_zero_when_sells_exceed_buys():
     run = PortfolioAllocationRun(account_id=1, mode="REBALANCE",
-                                 submitted_buy_value=1000.0, submitted_sell_value=4000.0)
+                                 filled_buy_value=1000.0, filled_sell_value=4000.0)
+    assert run.net_buy_value == 0.0
+
+
+def test_run_with_nothing_filled_has_no_net_buy_value():
+    """The whole point of the rename: submitted-but-unfilled is worth 0 here."""
+    run = PortfolioAllocationRun(account_id=1, mode="REBALANCE")
+    assert run.filled_buy_value == 0.0
+    assert run.filled_sell_value == 0.0
     assert run.net_buy_value == 0.0
 
 

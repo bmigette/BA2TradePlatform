@@ -982,8 +982,8 @@ def summarise_outcomes(plan: AllocationPlan, outcomes: List[RowOutcome]) -> Dict
             sell_value += value
 
     return {
-        "submitted_buy_value": buy_value,
-        "submitted_sell_value": sell_value,
+        "filled_buy_value": buy_value,
+        "filled_sell_value": sell_value,
         # Never negative: a rebalance funded entirely by its own sells consumes
         # no income, and a negative would be handed to the ledger as a budget.
         "net_buy_value": max(0.0, buy_value - sell_value),
@@ -1008,8 +1008,8 @@ def _finalise_run(run_id: int, totals: Dict[str, Any]) -> float:
     try:
         finalised = finalise_allocation_run(
             run_id,
-            submitted_buy_value=totals["submitted_buy_value"],
-            submitted_sell_value=totals["submitted_sell_value"],
+            filled_buy_value=totals["filled_buy_value"],
+            filled_sell_value=totals["filled_sell_value"],
             order_ids=totals["order_ids"])
     except InstanceNotFound:
         logger.error(f"Allocation run {run_id} vanished before it could be finalised; "
@@ -1062,8 +1062,6 @@ def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionSta
             "income_consumed": 0.0,
             "filled_buy_value": 0.0,
             "filled_sell_value": 0.0,
-            "submitted_buy_value": 0.0,   # transitional; chunk `ledger` deletes this line
-            "submitted_sell_value": 0.0,  # transitional; chunk `ledger` deletes this line
             "settled": True,              # nothing was submitted, so nothing is pending
             "working_order_ids": [],
             "blocked": True,
@@ -1092,7 +1090,7 @@ def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionSta
         # nothing rather than leaving a phantom in the recovery queue forever.
         logger.error(f"Allocation run {run_id} was refused before any order was sent",
                      exc_info=True)
-        _finalise_run(run_id, {"submitted_buy_value": 0.0, "submitted_sell_value": 0.0,
+        _finalise_run(run_id, {"filled_buy_value": 0.0, "filled_sell_value": 0.0,
                                "order_ids": []})
         raise
 
@@ -1131,8 +1129,8 @@ def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionSta
             "run_id": run_id,
             "mode": mode,
             "scope_label": scope_label,
-            "submitted_buy_value": totals["submitted_buy_value"],
-            "submitted_sell_value": totals["submitted_sell_value"],
+            "filled_buy_value": totals["filled_buy_value"],
+            "filled_sell_value": totals["filled_sell_value"],
             "income_consumed": income_consumed,
             "rows": [o.to_dict() for o in outcomes],
         },
@@ -1147,10 +1145,8 @@ def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionSta
         # The KEY NAMES are already final so no caller has to change twice; the
         # MEASUREMENT behind them is still the submitted value, and chunk `ledger`
         # replaces it with the actually-filled value in its rewrite.
-        "filled_buy_value": totals["submitted_buy_value"],
-        "filled_sell_value": totals["submitted_sell_value"],
-        "submitted_buy_value": totals["submitted_buy_value"],   # ledger deletes this line
-        "submitted_sell_value": totals["submitted_sell_value"],  # ledger deletes this line
+        "filled_buy_value": totals["filled_buy_value"],
+        "filled_sell_value": totals["filled_sell_value"],
         "settled": True,          # ledger measures this from the fills
         "working_order_ids": [],  # ledger fills this from the fills
         "blocked": False,
