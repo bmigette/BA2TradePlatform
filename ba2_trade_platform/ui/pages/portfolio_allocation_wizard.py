@@ -46,10 +46,13 @@ from ...core.portfolio_allocation import (
     blocking_messages,
     bump_notice,
     can_even_split_symbols,
+    can_fill_remaining_symbol_weights,
+    can_wipe_symbol_weights,
     dry_run_rows,
     effective_target_pct,
     even_split_symbol_weights,
     even_split_targets,
+    fill_remaining_symbol_weights,
     filter_plan_rows,
     fractional_summary,
     LABEL_TOTAL_TOLERANCE_PCT,
@@ -68,6 +71,7 @@ from ...core.portfolio_allocation import (
     summarise_plan,
     unconsumed_income_notice,
     whole_share_notice,
+    wipe_symbol_weights,
 )
 from ..utils.portfolio_allocation_view import (
     MARKET_BANNER_CLASSES, MarketGateResult, market_provenance_notice,
@@ -262,6 +266,13 @@ MARKER_LOAD_LAST_SYMBOLS = 'steps-load-last-symbols'
 #: step 1 marker earns its keep as the guard that the LABEL splitter stays singular.
 MARKER_EVEN_SPLIT = 'steps-even-split'
 MARKER_EVEN_SPLIT_SYMBOLS = 'steps-even-split-symbols'
+
+#: Markers on step 2's "Fill rest" and "Wipe" buttons. Step-2 only: filling what is
+#: left across the empty boxes and clearing them are both about the weights INSIDE
+#: one label, and step 1 has an editable reserve that already owns "what is left"
+#: at the label scale.
+MARKER_FILL_REST_SYMBOLS = 'steps-fill-rest-symbols'
+MARKER_WIPE_SYMBOLS = 'steps-wipe-symbols'
 
 #: Markers on the read-only "now / last" captions beside each percentage box.
 #: ``ui.label``, deliberately NOT a second marked ``ui.number``: the landed suite
@@ -1063,6 +1074,10 @@ class AllocationSteps:
         #: ``{label: column}`` for step 2, so a per-label Load last can redraw just
         #: that expansion's boxes.
         self._symbol_containers = {}
+        #: ``{label: (fill_rest, wipe)}`` for step 2. The two buttons whose enabled
+        #: state depends on the WEIGHTS rather than on the label's shape, so they
+        #: have to be reachable from every edit -- see ``_refresh_symbol_buttons``.
+        self._symbol_live_buttons = {}
 
     def open(self):
         title = ('Rebalance - set targets' if self.mode == ALLOCATION_MODE_REBALANCE
@@ -1192,13 +1207,23 @@ class AllocationSteps:
         ui.label('2. Symbol weights within each label (each label must total 100%)') \
             .classes('text-lg font-bold mt-4')
         self._symbol_containers = {}
+        self._symbol_live_buttons = {}
         for lt in self.labels:
             with ui.expansion(f'{lt.label} - {len(lt.symbols)} symbol(s)').classes('w-full'):
-                # Same row, same order, same icons and same wording as step 1's
-                # pair, so the label-level and symbol-level controls read as one
-                # feature at two scopes. ``t=lt`` is load-bearing in BOTH lambdas:
-                # without the default-argument capture every button in step 2 would
-                # rewrite the LAST label's weights.
+                # Even split and Load last keep step 1's icons, wording and relative
+                # order, so the label-level and symbol-level controls still read as
+                # one feature at two scopes; Fill rest and Wipe are step-2 only,
+                # because step 1's editable reserve already owns "what is left" at
+                # the label scale.
+                #
+                # Constructive first, destructive last: Even split, Fill rest and
+                # Load last all put numbers in, Wipe is the only one that takes them
+                # out, and it sits at the end of the row where it is hardest to hit
+                # by accident.
+                #
+                # ``t=lt`` is load-bearing in EVERY lambda: without the
+                # default-argument capture every button in step 2 would rewrite the
+                # LAST label's weights.
                 with ui.row().classes('items-center gap-2'):
                     split = ui.button('Even split', icon='balance',
                                       on_click=lambda _e=None, t=lt: self._even_split_symbols(t)
@@ -1207,10 +1232,23 @@ class AllocationSteps:
                     # two symbols there is nothing to spread, and a control that
                     # vanishes is one the user cannot learn exists.
                     split.set_enabled(can_even_split_symbols(lt))
+                    fill = ui.button('Fill rest', icon='format_color_fill',
+                                     on_click=lambda _e=None, t=lt: self._fill_rest_symbols(t)
+                                     ).props('outline dense').mark(MARKER_FILL_REST_SYMBOLS)
                     last = ui.button('Load last', icon='history',
                                      on_click=lambda _e=None, t=lt: self._load_last_symbols(t)
                                      ).props('outline dense').mark(MARKER_LOAD_LAST_SYMBOLS)
                     last.set_enabled(has_previous_symbol_weights(lt))
+                    wipe = ui.button('Wipe', icon='clear_all',
+                                     on_click=lambda _e=None, t=lt: self._wipe_symbols(t)
+                                     ).props('outline dense').mark(MARKER_WIPE_SYMBOLS)
+                # These two, and only these two, are recomputed whenever the weights
+                # move: their predicates READ the numbers in the boxes, where
+                # ``can_even_split_symbols`` (a symbol count) and
+                # ``has_previous_symbol_weights`` (last run's figures, never written
+                # by step 2) cannot change while the dialog is open.
+                self._symbol_live_buttons[lt.label] = (fill, wipe)
+                self._refresh_symbol_buttons(lt)
                 if not lt.symbols:
                     ui.label('No symbols carry this label - it can absorb no allocation.') \
                         .classes('text-xs text-orange-400')
@@ -1218,6 +1256,25 @@ class AllocationSteps:
                 container = ui.column().classes('w-full gap-1')
                 self._symbol_containers[lt.label] = container
                 self._draw_symbol_weights(lt)
+
+    def _refresh_symbol_buttons(self, lt: LabelTarget):
+        """Re-ask whether Fill rest and Wipe still mean anything for ONE label.
+
+        ``set_enabled`` rather than a redraw of the row, and that matters: this runs
+        on every keystroke in a weight box, and rebuilding the row would tear down
+        the ``ui.number`` the change event came from.
+
+        An enabled state that never updates is decoration. Filling a label leaves
+        nothing to fill and wiping one leaves nothing to wipe, so each of these
+        buttons has to be able to grey ITSELF out -- and typing 100 into the last
+        empty box has to grey out Fill rest without anything being pressed at all.
+        """
+        pair = self._symbol_live_buttons.get(lt.label)
+        if pair is None:
+            return
+        fill, wipe = pair
+        fill.set_enabled(can_fill_remaining_symbol_weights(lt))
+        wipe.set_enabled(can_wipe_symbol_weights(lt))
 
     def _draw_symbol_weights(self, lt: LabelTarget):
         container = self._symbol_containers.get(lt.label)
@@ -1228,8 +1285,14 @@ class AllocationSteps:
             for st in lt.symbols:
                 with ui.row().classes('w-full items-center gap-3'):
                     ui.label(st.symbol).classes('w-32')
+                    # ``t=st`` AND ``owner=lt``: the first is which weight to write,
+                    # the second is whose Fill rest / Wipe to re-ask. Both are
+                    # default-argument captures for the same reason -- a bare
+                    # closure would make every box in step 2 write to the last
+                    # symbol of the last label.
                     ui.number(value=st.weight_pct, min=0, max=100, step=0.01, suffix='%',
-                              on_change=lambda e, t=st: self._set_symbol_pct(t, e.value)
+                              on_change=lambda e, t=st, owner=lt: self._set_symbol_pct(
+                                  t, e.value, owner)
                               ).props('dense outlined').classes('w-32').mark(MARKER_SYMBOL_PCT)
                     ui.label(self._symbol_current_caption(st)) \
                         .classes('text-xs text-secondary-custom').mark(MARKER_SYMBOL_CURRENT)
@@ -1316,6 +1379,7 @@ class AllocationSteps:
         for edited, fresh in zip(lt.symbols, even_split_symbol_weights(lt).symbols):
             edited.weight_pct = fresh.weight_pct
         self._draw_symbol_weights(lt)
+        self._refresh_symbol_buttons(lt)
         self._revalidate()
 
     def _load_last_symbols(self, lt: LabelTarget):
@@ -1324,6 +1388,52 @@ class AllocationSteps:
         for edited, fresh in zip(lt.symbols, load_previous_symbol_weights(lt).symbols):
             edited.weight_pct = fresh.weight_pct
         self._draw_symbol_weights(lt)
+        self._refresh_symbol_buttons(lt)
+        self._revalidate()
+
+    def _fill_rest_symbols(self, lt: LabelTarget):
+        """Share what is left of ONE label's 100 across the symbols still at zero.
+
+        The "define a few by hand, then fill the rest" half of the pair. Every
+        non-zero weight is left exactly as typed; the empty boxes divide the
+        remainder. Scoped to ``lt`` on exactly the terms ``_even_split_symbols`` is
+        -- no other label's weights move, and neither does this label's own
+        ``target_pct`` or the reserve above it.
+
+        The arithmetic is ``fill_remaining_symbol_weights``, which is
+        ``split_pct_across``, which is what ``even_split_pct`` is -- so filling an
+        untouched label lands on the identical numbers to pressing Even split.
+
+        REDRAWS, refreshes the row's live buttons and re-validates, for the reasons
+        spelled out on ``_load_last`` and ``_refresh_symbol_buttons``: a ``ui.number``
+        does not follow the object it was built from, a filled label has nothing
+        left to fill, and the total chip and Continue are ``_revalidate``'s job.
+        """
+        for edited, fresh in zip(lt.symbols, fill_remaining_symbol_weights(lt).symbols):
+            edited.weight_pct = fresh.weight_pct
+        self._draw_symbol_weights(lt)
+        self._refresh_symbol_buttons(lt)
+        self._revalidate()
+
+    def _wipe_symbols(self, lt: LabelTarget):
+        """Clear ONE label's symbol weights so the user can start it over.
+
+        What makes ``_fill_rest_symbols`` usable: filling treats a 0 as an empty
+        slot, so redoing a label means emptying it first rather than hunting down
+        whichever old weights are still sitting in boxes below the fold.
+
+        NO confirmation, deliberately, and the contrast is with ``_confirm_unmanage``
+        on the allocation page: that one asks because it writes to the database
+        immediately and destroys stored weights and comments with no undo. This edits
+        the dialog's own COPY of the labels, nothing is written until Submit two
+        steps and a dry run later, Cancel discards the lot, and Load last -- whose
+        history the wipe deliberately preserves -- undoes it in one click. Guarding
+        both would train the user through the confirmation that matters.
+        """
+        for edited, fresh in zip(lt.symbols, wipe_symbol_weights(lt).symbols):
+            edited.weight_pct = fresh.weight_pct
+        self._draw_symbol_weights(lt)
+        self._refresh_symbol_buttons(lt)
         self._revalidate()
 
     def _set_label_pct(self, target: LabelTarget, value):
@@ -1364,8 +1474,13 @@ class AllocationSteps:
         for lt, caption in self._label_captions:
             caption.set_text(self._label_current_caption(lt))
 
-    def _set_symbol_pct(self, target: SymbolTarget, value):
+    def _set_symbol_pct(self, target: SymbolTarget, value, owner: LabelTarget):
+        """One weight box. ``owner`` is the label it belongs to, and it is here so
+        that label's Fill rest and Wipe can follow the number being typed -- both
+        predicates read the boxes, so a 100 typed into the last empty one has to
+        grey out Fill rest without anything being pressed."""
         target.weight_pct = float(value or 0.0)
+        self._refresh_symbol_buttons(owner)
         self._revalidate()
 
     def _set_scope(self, event):

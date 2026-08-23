@@ -70,6 +70,8 @@ __all__ = [
     "load_previous_targets", "has_previous_targets",
     "load_previous_symbol_weights", "has_previous_symbol_weights",
     "even_split_symbol_weights", "can_even_split_symbols",
+    "fill_remaining_symbol_weights", "can_fill_remaining_symbol_weights",
+    "wipe_symbol_weights", "can_wipe_symbol_weights",
     "invest_validation_messages", "is_blocking_message", "blocking_messages",
     "ERROR_INVEST_AMOUNT_FMT", "ERROR_INVEST_NO_LABEL", "ERROR_INVEST_LABEL_EMPTY_FMT",
     "WARNING_INVEST_EXCEEDS_BP_FMT", "ADVISORY_MESSAGE_FRAGMENTS",
@@ -103,6 +105,7 @@ __all__ = [
     "ERROR_SYMBOL_DUPLICATE_FMT",
     # engine
     "current_value", "round_quantity", "round_delta_quantity", "even_split_pct",
+    "split_pct_across",
     "build_symbol_targets", "validate_symbol_weights", "validate_label_targets",
     "validate_unallocated_pct", "clamp_unallocated_pct",
     "investable_notional", "reserved_notional_for",
@@ -1059,19 +1062,46 @@ def _suppress_below_min_order(delta: float, margin: Optional[MarginInfo],
     return delta
 
 
+def split_pct_across(total_pct: float, count: int) -> List[float]:
+    """Split ``total_pct`` evenly across ``count`` slots, exact to 2dp.
+
+    Every slot gets the total FLOORED to the cent, and the residual lands on the
+    LAST one, so the parts sum to ``total_pct`` exactly in decimal
+    (``split_pct_across(40, 3) == [13.33, 13.33, 13.34]`` -- not 13.33 three times,
+    which loses a cent, and not 13.34 three times, which invents two). Returns
+    ``[]`` for ``count <= 0``: nothing to split across is an empty list, not a
+    ZeroDivisionError.
+
+    This is the ONE splitter. ``even_split_pct`` is this at a total of 100, and
+    "fill what is left of the 100 across the empty slots" is this at a total of the
+    remainder -- deliberately the same code rather than the same idea written
+    twice, because a second two-decimal split is exactly the thing that drifts. A
+    hand-rolled ``round(total / n, 2)`` agrees here at n=2, 3 and 5 and parts
+    company at n=6, where it produces a set ``validate_symbol_weights`` refuses.
+
+    Binary float addition of the returned parts can still drift by ~1e-14; the
+    guarantee is about CENTS, and ``LABEL_TOTAL_TOLERANCE_PCT`` sits twelve orders
+    of magnitude above that.
+    """
+    if count <= 0:
+        return []
+    each = math.floor(total_pct / count * 100.0) / 100.0
+    out = [each] * count
+    out[-1] = round(total_pct - each * (count - 1), 2)
+    return out
+
+
 def even_split_pct(count: int) -> List[float]:
     """Split 100% evenly across ``count`` slots, exact to 2dp.
 
     The remainder lands on the LAST slot so the list always totals exactly 100.0
     (``even_split_pct(3) == [33.33, 33.33, 33.34]``). Returns ``[]`` for
     ``count <= 0`` -- an empty label gets nothing, not a ZeroDivisionError.
+
+    A named alias for ``split_pct_across(100.0, count)``, and kept named because
+    "the even split" is what the two buttons and the stored default all mean.
     """
-    if count <= 0:
-        return []
-    each = math.floor(100.0 / count * 100.0) / 100.0
-    out = [each] * count
-    out[-1] = round(100.0 - each * (count - 1), 2)
-    return out
+    return split_pct_across(100.0, count)
 
 
 def build_symbol_targets(symbols: List[str],
@@ -2685,6 +2715,148 @@ def can_even_split_symbols(label: Optional[LabelTarget]) -> bool:
     if label is None:
         return False
     return len(label.symbols or []) > 1
+
+
+def _symbol_weight(target: SymbolTarget) -> float:
+    """One symbol's weight as a number. ``None`` is 0.0.
+
+    ``SymbolTarget.weight_pct`` is declared ``float``, but the wizard's setter
+    builds it with ``float(value or 0.0)`` from a ``ui.number`` that yields ``None``
+    when the box is cleared, and ``validate_symbol_weights`` already reads it
+    through the same ``or 0.0``. "Unset" and 0 are one fact here; this is the
+    single place that says so.
+    """
+    return float(target.weight_pct or 0.0)
+
+
+def _fill_remainder_pct(label: LabelTarget) -> float:
+    """What is left of this label's 100 after the weights the user typed.
+
+    Rounded to the CENT before anything looks at it, and that rounding is the
+    point rather than tidiness: 33.33 + 33.33 + 33.34 is exactly 100 in decimal and
+    99.99999999999999 in binary, and without the round a fully-spent label would
+    offer to fill a slot with a hundredth of nothing. Can be negative -- the
+    callers decide what to do about that, and they do not agree.
+    """
+    return round(100.0 - sum(_symbol_weight(st) for st in (label.symbols or [])), 2)
+
+
+def fill_remaining_symbol_weights(label: LabelTarget) -> LabelTarget:
+    """The per-label "Fill rest evenly": spread what is left over the EMPTY slots.
+
+    The workflow it exists for is "type the two you care about, let the rest sort
+    themselves out". Every symbol carrying a non-zero weight is left EXACTLY as
+    typed -- not re-normalised, not nudged onto the cent grid -- and what is left of
+    the label's 100 is divided among the symbols sitting at 0 or unset.
+
+    A 0 is therefore FILLABLE, not a deliberate "sell this position out to nothing".
+    That is a real cost and it was accepted knowingly: the alternative is a
+    per-symbol lock, which is a second piece of state on every row to protect a
+    case ``Wipe`` and a retype already cover. ``Wipe`` is the other half of this
+    feature for exactly that reason.
+
+    The arithmetic is ``split_pct_across``, which is ``even_split_pct``, which is
+    what ``build_symbol_targets`` fills an untouched label in with -- so filling a
+    COMPLETELY empty label produces the identical numbers to pressing Even split,
+    at every count. That equivalence is not a coincidence to be re-checked, it is
+    the same function called with a total of 100.
+
+    With nothing left to give (the typed weights already total 100 or more) the
+    empty slots are written 0.0 rather than a share of a negative. The UI never
+    reaches that branch -- ``can_fill_remaining_symbol_weights`` is False there, so
+    the button is disabled and the validator says why -- but a pure function that
+    only behaves while its own predicate agrees is a trap for the next caller.
+
+    A NEGATIVE weight is a value, not an empty slot, so it survives untouched and
+    inflates the remainder. Silently rewriting it would be this button repairing an
+    error the user needs to see; ``validate_symbol_weights`` owns that message.
+
+    Returns a NEW ``LabelTarget`` with NEW ``SymbolTarget`` objects, on exactly the
+    terms ``even_split_symbol_weights`` uses, carrying ``comment`` and
+    ``previous_weight_pct`` across -- the latter is what the Load-last button beside
+    it reads. The label's own ``target_pct`` is untouched: step 2 is about weights
+    WITHIN a label.
+    """
+    symbols = list(label.symbols or [])
+    empty = [i for i, st in enumerate(symbols) if _symbol_weight(st) == 0.0]
+    remainder = _fill_remainder_pct(label)
+    shares = (split_pct_across(remainder, len(empty)) if remainder > 0
+              else [0.0] * len(empty))
+    filled = {i: pct for i, pct in zip(empty, shares)}
+    return LabelTarget(
+        label=label.label, target_pct=label.target_pct, comment=label.comment,
+        previous_target_pct=label.previous_target_pct,
+        symbols=[SymbolTarget(symbol=st.symbol,
+                              weight_pct=filled.get(i, st.weight_pct),
+                              comment=st.comment,
+                              previous_weight_pct=st.previous_weight_pct)
+                 for i, st in enumerate(symbols)])
+
+
+def can_fill_remaining_symbol_weights(label: Optional[LabelTarget]) -> bool:
+    """True when there is a slot to fill AND something left to fill it with.
+
+    Both halves are required, and the second is why this is not simply "has an
+    empty box". A label whose typed weights already total 100 or more has no
+    remainder to hand out: filling would either write zeros over zeros (a click
+    that visibly does nothing) or negatives (a set no validator will pass). The
+    button is DISABLED there rather than made a silent no-op, on
+    ``can_even_split_symbols``' terms -- a control that does nothing when pressed
+    is indistinguishable from a broken one -- and the validator underneath already
+    names the real problem, that the label totals more than 100.
+
+    The user is never cornered by that: ``can_wipe_symbol_weights`` is True in
+    exactly the over-allocated case, so Wipe is always the way out.
+    """
+    if label is None or not label.symbols:
+        return False
+    if not any(_symbol_weight(st) == 0.0 for st in label.symbols):
+        return False
+    return _fill_remainder_pct(label) > 0
+
+
+def wipe_symbol_weights(label: LabelTarget) -> LabelTarget:
+    """The per-label "Wipe": clear ONE label's symbol weights and start over.
+
+    What makes ``fill_remaining_symbol_weights`` coherent. Filling treats a 0 as an
+    empty slot, so the honest way to redo a label is to empty it outright, type the
+    handful that matter and fill the rest -- rather than hunt down whichever old
+    weights are still lurking in the boxes below the fold.
+
+    Writes 0.0, not ``None``. ``SymbolTarget.weight_pct`` is declared ``float`` and
+    every solver does arithmetic on it; the wizard's own setter already turns a
+    cleared box into 0.0, so 0.0 IS "empty" in this model and ``None`` would buy a
+    marginally emptier looking box at the cost of the field's type being a lie.
+
+    ``previous_weight_pct`` and ``comment`` are carried across, and here that is
+    load-bearing rather than merely consistent: Load last is the control that UNDOES
+    a wipe, and a wipe that cleared the history would disable its own undo. Between
+    that, Even split, Fill rest and a dialog whose Cancel discards the whole edited
+    copy, the wipe is cheap enough to reverse that it is not worth a confirmation
+    step -- unlike removing a label from the managed set, which changes a stored,
+    cross-run fact.
+
+    The label's own ``target_pct`` does not move: step 2 is about weights WITHIN a
+    label.
+    """
+    return LabelTarget(
+        label=label.label, target_pct=label.target_pct, comment=label.comment,
+        previous_target_pct=label.previous_target_pct,
+        symbols=[SymbolTarget(symbol=st.symbol, weight_pct=0.0, comment=st.comment,
+                              previous_weight_pct=st.previous_weight_pct)
+                 for st in (label.symbols or [])])
+
+
+def can_wipe_symbol_weights(label: Optional[LabelTarget]) -> bool:
+    """True when this label has a weight worth destroying -- the button's state.
+
+    A label already at all-zero has nothing to clear and a label with no symbols has
+    no boxes at all; both draw the button DISABLED rather than hidden, on the same
+    terms as the three controls beside it.
+    """
+    if label is None:
+        return False
+    return any(_symbol_weight(st) != 0.0 for st in (label.symbols or []))
 
 
 def steps_validation_messages(labels: List[LabelTarget], *,

@@ -766,6 +766,378 @@ def test_even_split_symbol_weights_is_exported():
     assert "can_even_split_symbols" in pa.__all__
 
 
+# ---------------------------------------------------------------------------
+# ``split_pct_across`` -- the one splitter both "Even split" and "Fill rest" use.
+# ---------------------------------------------------------------------------
+
+
+def test_split_pct_across_is_even_split_pct_generalised_to_any_total():
+    """``even_split_pct(n)`` IS ``split_pct_across(100, n)``, at every count.
+
+    The point of hoisting the primitive rather than writing a second one: "fill
+    what is left" and "split the whole 100" are the same arithmetic over a
+    different total, and two implementations of it would eventually disagree about
+    the same symbols. Checked to 60 because the divergence counts are sparse --
+    6, 7, 15 and friends -- and a spot check at 2, 3 and 5 proves nothing.
+    """
+    for count in range(0, 61):
+        assert pa.split_pct_across(100.0, count) == pa.even_split_pct(count), count
+
+
+def test_split_pct_across_puts_the_residual_on_the_last_slot():
+    """The awkward totals, pinned by value. 40 across 3 is 13.33 / 13.33 / 13.34 --
+    NOT 13.33 x 3 (totals 39.99) and not 13.34 x 3 (totals 40.02)."""
+    assert pa.split_pct_across(40.0, 3) == [13.33, 13.33, 13.34]
+    assert pa.split_pct_across(100.0, 6) == [16.66, 16.66, 16.66, 16.66, 16.66, 16.7]
+    assert pa.split_pct_across(0.01, 3) == [0.0, 0.0, 0.01]
+    assert pa.split_pct_across(37.5, 1) == [37.5]
+    assert pa.split_pct_across(10.0, 0) == []
+    assert pa.split_pct_across(0.0, 3) == [0.0, 0.0, 0.0]
+
+
+def test_split_pct_across_totals_its_input_exactly_in_decimal():
+    """Exact in DECIMAL, which is the arithmetic the two-decimal weights actually
+    live in. Binary float addition of the parts drifts by ~1e-14, which is 12
+    orders of magnitude inside ``LABEL_TOTAL_TOLERANCE_PCT``; the discipline being
+    proved here is that no CENT goes missing."""
+    from decimal import Decimal
+
+    for count in range(1, 21):
+        for hundredths in range(1, 10_001, 137):
+            total = hundredths / 100.0
+            parts = pa.split_pct_across(total, count)
+            assert sum(Decimal(str(p)) for p in parts) == Decimal(str(total)), \
+                (total, count)
+
+
+# ---------------------------------------------------------------------------
+# The per-label "Fill rest evenly" -- spread what is left over the empty slots.
+# ---------------------------------------------------------------------------
+
+
+def test_fill_remaining_symbol_weights_spreads_the_remainder_over_the_zeros():
+    """Type a few by hand, press the button, and the rest share what is left.
+
+    60 is spoken for, so AAA / BBB / CCC divide 40: 13.33 / 13.33 / 13.34.
+    """
+    label = LabelTarget("A", 100.0, [
+        SymbolTarget("MANUAL", 60.0),
+        SymbolTarget("AAA", 0.0), SymbolTarget("BBB", 0.0), SymbolTarget("CCC", 0.0)])
+
+    out = pa.fill_remaining_symbol_weights(label)
+
+    assert [(st.symbol, st.weight_pct) for st in out.symbols] == [
+        ("MANUAL", 60.0), ("AAA", 13.33), ("BBB", 13.33), ("CCC", 13.34)]
+    # The label the dialog is editing is untouched -- Cancel must still mean
+    # cancel, exactly as ``even_split_symbol_weights`` leaves it.
+    assert [st.weight_pct for st in label.symbols] == [60.0, 0.0, 0.0, 0.0]
+
+
+def test_fill_remaining_symbol_weights_leaves_every_non_zero_weight_exactly_as_typed():
+    """The whole promise of the button: what the user typed is what survives. Not
+    re-normalised, not nudged onto the 2dp grid -- 12.3456 comes back 12.3456."""
+    label = LabelTarget("A", 100.0, [
+        SymbolTarget("KEEP1", 12.3456), SymbolTarget("FILL1", 0.0),
+        SymbolTarget("KEEP2", 7.5), SymbolTarget("FILL2", 0.0)])
+
+    out = pa.fill_remaining_symbol_weights(label)
+
+    assert out.symbols[0].weight_pct == 12.3456
+    assert out.symbols[2].weight_pct == 7.5
+    # 100 - 19.8456 = 80.1544, rounded to the cent grid = 80.15, halved.
+    assert [out.symbols[1].weight_pct, out.symbols[3].weight_pct] == [40.07, 40.08]
+    assert pa.validate_symbol_weights(out) == []
+
+
+def test_filling_a_completely_empty_label_is_the_even_split():
+    """The cheapest correctness check there is: with nothing spoken for, "fill what
+    is left across the empty slots" IS "split the 100 evenly", so the two buttons
+    must land on identical numbers at EVERY count. They share ``split_pct_across``
+    precisely so this cannot come apart."""
+    for count in range(1, 21):
+        symbols = [f"S{i}" for i in range(count)]
+        empty = LabelTarget("A", 100.0, [SymbolTarget(s, 0.0) for s in symbols])
+
+        filled = [st.weight_pct for st in pa.fill_remaining_symbol_weights(empty).symbols]
+        split = [st.weight_pct for st in pa.even_split_symbol_weights(empty).symbols]
+
+        assert filled == split, count
+        assert filled == pa.even_split_pct(count), count
+
+
+def test_fill_remaining_symbol_weights_treats_an_unset_weight_as_empty():
+    """``SymbolTarget.weight_pct`` is typed ``float``, but the wizard's own setter
+    coerces a cleared ``ui.number`` through ``float(value or 0.0)`` -- so "unset"
+    and 0 are the same fact here, and a ``None`` that reaches the engine from
+    anywhere else must not crash it or count as spoken for."""
+    label = LabelTarget("A", 100.0, [
+        SymbolTarget("MANUAL", 50.0),
+        SymbolTarget("NONE1", None), SymbolTarget("ZERO1", 0.0)])
+
+    out = pa.fill_remaining_symbol_weights(label)
+
+    assert [st.weight_pct for st in out.symbols] == [50.0, 25.0, 25.0]
+
+
+def test_fill_remaining_symbol_weights_gives_a_single_empty_slot_the_whole_remainder():
+    label = LabelTarget("A", 100.0, [
+        SymbolTarget("AAA", 30.0), SymbolTarget("BBB", 45.5), SymbolTarget("CCC", 0.0)])
+
+    out = pa.fill_remaining_symbol_weights(label)
+
+    assert out.symbols[2].weight_pct == 24.5
+    assert pa.validate_symbol_weights(out) == []
+
+
+def test_fill_remaining_symbol_weights_output_always_passes_the_validator():
+    """Across manual totals and slot counts: the filled set totals 100 to the
+    validator's satisfaction every time. A naive ``round(remainder / k, 2)`` misses
+    this the moment k does not divide the remainder cleanly."""
+    for manual_hundredths in range(0, 10_000, 311):
+        manual = manual_hundredths / 100.0
+        for count in range(1, 12):
+            label = LabelTarget("A", 100.0,
+                                [SymbolTarget("MANUAL", manual)]
+                                + [SymbolTarget(f"S{i}", 0.0) for i in range(count)])
+            out = pa.fill_remaining_symbol_weights(label)
+            assert pa.validate_symbol_weights(out) == [], (manual, count)
+
+
+def test_fill_remaining_symbol_weights_never_writes_a_negative_when_over_allocated():
+    """The manual weights already total 120. There is nothing to give away, so the
+    button writes NOTHING -- it does not hand out -10 each, and it does not quietly
+    rescale the numbers the user typed. ``can_fill_remaining_symbol_weights`` is
+    False here, so the UI never reaches this; the engine is defensive anyway
+    because a pure function that only behaves when its own predicate agrees is a
+    trap for the next caller."""
+    label = LabelTarget("A", 100.0, [
+        SymbolTarget("AAA", 70.0), SymbolTarget("BBB", 50.0),
+        SymbolTarget("CCC", 0.0), SymbolTarget("DDD", 0.0)])
+
+    out = pa.fill_remaining_symbol_weights(label)
+
+    assert [st.weight_pct for st in out.symbols] == [70.0, 50.0, 0.0, 0.0]
+    assert pa.can_fill_remaining_symbol_weights(label) is False
+
+
+def test_fill_remaining_symbol_weights_with_nothing_left_writes_zeros_not_negatives():
+    """Manual weights total EXACTLY 100. The empty slots are already right at 0 and
+    stay there -- the set is valid before and after."""
+    label = LabelTarget("A", 100.0, [
+        SymbolTarget("AAA", 60.0), SymbolTarget("BBB", 40.0), SymbolTarget("CCC", 0.0)])
+
+    out = pa.fill_remaining_symbol_weights(label)
+
+    assert [st.weight_pct for st in out.symbols] == [60.0, 40.0, 0.0]
+    assert pa.validate_symbol_weights(out) == []
+
+
+def test_fill_remaining_symbol_weights_with_no_empty_slot_changes_nothing():
+    label = LabelTarget("A", 100.0, [SymbolTarget("AAA", 30.0), SymbolTarget("BBB", 20.0)])
+
+    out = pa.fill_remaining_symbol_weights(label)
+
+    assert [st.weight_pct for st in out.symbols] == [30.0, 20.0]
+
+
+def test_fill_remaining_symbol_weights_leaves_a_negative_weight_for_the_validator():
+    """A negative is not "empty" -- it is a value, and the button's contract is that
+    values are left alone. Rewriting it would be the button silently repairing an
+    error the user needs to SEE; ``validate_symbol_weights`` owns that message."""
+    label = LabelTarget("A", 100.0, [SymbolTarget("BAD", -10.0), SymbolTarget("AAA", 0.0)])
+
+    out = pa.fill_remaining_symbol_weights(label)
+
+    assert out.symbols[0].weight_pct == -10.0
+    assert out.symbols[1].weight_pct == 110.0
+    assert pa.validate_symbol_weights(out) != []
+
+
+def test_fill_remaining_symbol_weights_keeps_the_labels_own_target():
+    """Step 2 is about shares WITHIN a label; the label itself must not move."""
+    label = LabelTarget("A", 42.0, [SymbolTarget("AAA", 60.0), SymbolTarget("BBB", 0.0)],
+                        comment="growth", previous_target_pct=11.0)
+
+    out = pa.fill_remaining_symbol_weights(label)
+
+    assert (out.label, out.target_pct, out.comment, out.previous_target_pct) == \
+        ("A", 42.0, "growth", 11.0)
+
+
+def test_fill_remaining_symbol_weights_keeps_the_history_and_the_comments():
+    """``previous_weight_pct`` is what the Load-last button beside it reads. Dropping
+    it would disable that button as a side effect of pressing this one."""
+    label = LabelTarget("A", 100.0, [
+        SymbolTarget("AAA", 60.0, "core holding", 30.0),
+        SymbolTarget("BBB", 0.0, "hedge", 70.0)])
+
+    out = pa.fill_remaining_symbol_weights(label)
+
+    assert [st.previous_weight_pct for st in out.symbols] == [30.0, 70.0]
+    assert [st.comment for st in out.symbols] == ["core holding", "hedge"]
+    assert pa.has_previous_symbol_weights(out) is True
+
+
+def test_fill_remaining_symbol_weights_of_an_empty_label_is_an_empty_label():
+    out = pa.fill_remaining_symbol_weights(LabelTarget("A", 100.0))
+    assert out.symbols == []
+    assert out.label == "A"
+
+
+def test_can_fill_remaining_symbol_weights_is_the_buttons_enabled_state():
+    """Two conditions, and BOTH have to hold: something to fill, and something left
+    to fill it with.
+
+    Over-allocated is DISABLED rather than a no-op click, on the Even-split
+    button's terms: a control that does nothing when pressed is indistinguishable
+    from a broken one, and the validator below already says why (the label totals
+    120%). The user is never stuck -- Wipe is enabled in exactly that case.
+    """
+    assert pa.can_fill_remaining_symbol_weights(None) is False
+    # No symbols at all.
+    assert pa.can_fill_remaining_symbol_weights(LabelTarget("A", 100.0)) is False
+    # Nothing empty to fill.
+    assert pa.can_fill_remaining_symbol_weights(
+        LabelTarget("A", 100.0, [SymbolTarget("AAA", 40.0),
+                                 SymbolTarget("BBB", 60.0)])) is False
+    # Empty slots and 40 left over.
+    assert pa.can_fill_remaining_symbol_weights(
+        LabelTarget("A", 100.0, [SymbolTarget("AAA", 60.0),
+                                 SymbolTarget("BBB", 0.0)])) is True
+    # A completely empty label: the whole 100 is up for grabs.
+    assert pa.can_fill_remaining_symbol_weights(
+        LabelTarget("A", 100.0, [SymbolTarget("AAA", 0.0),
+                                 SymbolTarget("BBB", None)])) is True
+    # Empty slot, but the manual weights already spend the whole 100.
+    assert pa.can_fill_remaining_symbol_weights(
+        LabelTarget("A", 100.0, [SymbolTarget("AAA", 60.0), SymbolTarget("BBB", 40.0),
+                                 SymbolTarget("CCC", 0.0)])) is False
+    # Empty slot, and the manual weights are already OVER 100.
+    assert pa.can_fill_remaining_symbol_weights(
+        LabelTarget("A", 100.0, [SymbolTarget("AAA", 130.0),
+                                 SymbolTarget("BBB", 0.0)])) is False
+
+
+def test_can_fill_remaining_symbol_weights_ignores_float_dust_in_the_manual_total():
+    """7.64 + 83.57 + 8.79 is exactly 100 in decimal and 99.99999999999999 in binary,
+    so the raw remainder is 1.4e-14 -- positive, and therefore "something left to
+    fill" to anything that does not round first.
+
+    The predicate rounds to the CENT before asking. Without that, a fully-spent
+    label offers an enabled Fill rest that can only write 0.00 into the empty box:
+    a button that does nothing when pressed, which is the exact failure the
+    disabled-not-hidden rule exists to avoid. Pinned with a set that genuinely
+    drifts -- 33.33 x 2 + 33.34 sums to 100.0 on the nose and proves nothing.
+    """
+    assert sum([7.64, 83.57, 8.79]) != 100.0                       # the premise
+    label = LabelTarget("A", 100.0, [
+        SymbolTarget("AAA", 7.64), SymbolTarget("BBB", 83.57),
+        SymbolTarget("CCC", 8.79), SymbolTarget("DDD", 0.0)])
+
+    assert pa.can_fill_remaining_symbol_weights(label) is False
+    # And the raw, unrounded remainder really would have said otherwise.
+    assert 100.0 - sum(st.weight_pct for st in label.symbols) > 0
+
+
+# ---------------------------------------------------------------------------
+# The per-label "Wipe" -- start this label's weights over.
+# ---------------------------------------------------------------------------
+
+
+def test_wipe_symbol_weights_clears_every_weight_in_the_label():
+    label = LabelTarget("A", 100.0, [SymbolTarget("AAA", 60.0), SymbolTarget("BBB", 40.0)])
+
+    out = pa.wipe_symbol_weights(label)
+
+    assert [st.weight_pct for st in out.symbols] == [0.0, 0.0]
+    # A copy, like every other step-2 control: Cancel must still mean cancel.
+    assert [st.weight_pct for st in label.symbols] == [60.0, 40.0]
+
+
+def test_wipe_symbol_weights_writes_zero_rather_than_none():
+    """``SymbolTarget.weight_pct`` is declared ``float`` and every solver does
+    arithmetic on it. The wizard's own setter already turns a cleared box into 0.0,
+    so 0.0 IS "empty" in this model -- writing ``None`` would buy a slightly emptier
+    looking box at the cost of the field's type being a lie."""
+    out = pa.wipe_symbol_weights(
+        LabelTarget("A", 100.0, [SymbolTarget("AAA", 60.0), SymbolTarget("BBB", None)]))
+
+    assert [st.weight_pct for st in out.symbols] == [0.0, 0.0]
+    assert all(isinstance(st.weight_pct, float) for st in out.symbols)
+
+
+def test_wipe_then_fill_rest_is_the_even_split():
+    """The workflow the button exists for, end to end: wipe, type a couple, fill the
+    rest. Wiping and filling with nothing typed lands exactly on Even split."""
+    label = LabelTarget("A", 100.0, [SymbolTarget(f"S{i}", 100.0 / 6.0) for i in range(6)])
+
+    out = pa.fill_remaining_symbol_weights(pa.wipe_symbol_weights(label))
+
+    assert [st.weight_pct for st in out.symbols] == pa.even_split_pct(6)
+    assert pa.validate_symbol_weights(out) == []
+
+
+def test_wipe_symbol_weights_keeps_the_history_and_the_comments():
+    """A wipe that dropped ``previous_weight_pct`` would disable Load last -- the one
+    control that undoes it. That is what makes the wipe recoverable, and it is why
+    it does not need a confirmation dialog."""
+    label = LabelTarget("A", 42.0, [
+        SymbolTarget("AAA", 60.0, "core holding", 30.0),
+        SymbolTarget("BBB", 40.0, "hedge", 70.0)], previous_target_pct=11.0)
+
+    out = pa.wipe_symbol_weights(label)
+
+    assert [st.previous_weight_pct for st in out.symbols] == [30.0, 70.0]
+    assert [st.comment for st in out.symbols] == ["core holding", "hedge"]
+    assert pa.has_previous_symbol_weights(out) is True
+    # And the label itself does not move: step 2 is about shares WITHIN a label.
+    assert (out.target_pct, out.previous_target_pct) == (42.0, 11.0)
+
+
+def test_wipe_symbol_weights_of_an_empty_label_is_an_empty_label():
+    out = pa.wipe_symbol_weights(LabelTarget("A", 100.0))
+    assert out.symbols == []
+    assert out.label == "A"
+
+
+def test_can_wipe_symbol_weights_is_the_buttons_enabled_state():
+    """Enabled when there is something to destroy. A label already at all-zero has
+    nothing to clear, and an empty label has no boxes at all -- DISABLED in both,
+    never hidden, on the same terms as the three controls beside it."""
+    assert pa.can_wipe_symbol_weights(None) is False
+    assert pa.can_wipe_symbol_weights(LabelTarget("A", 100.0)) is False
+    assert pa.can_wipe_symbol_weights(
+        LabelTarget("A", 100.0, [SymbolTarget("AAA", 0.0),
+                                 SymbolTarget("BBB", None)])) is False
+    assert pa.can_wipe_symbol_weights(
+        LabelTarget("A", 100.0, [SymbolTarget("AAA", 0.0),
+                                 SymbolTarget("BBB", 100.0)])) is True
+    # Over-allocated: Fill rest is disabled here, so Wipe MUST be enabled or the
+    # user has no way out of a 120% label except retyping every box.
+    assert pa.can_wipe_symbol_weights(
+        LabelTarget("A", 100.0, [SymbolTarget("AAA", 70.0), SymbolTarget("BBB", 50.0),
+                                 SymbolTarget("CCC", 0.0)])) is True
+
+
+def test_an_over_allocated_label_always_offers_a_way_out():
+    """The pair's escape-hatch invariant, stated directly: whenever Fill rest is
+    disabled because the label is over-allocated, Wipe is enabled."""
+    for weights in ([70.0, 50.0, 0.0], [120.0, 0.0], [50.0, 50.0, 0.01, 0.0]):
+        label = LabelTarget("A", 100.0,
+                            [SymbolTarget(f"S{i}", w) for i, w in enumerate(weights)])
+        assert pa.can_fill_remaining_symbol_weights(label) is False, weights
+        assert pa.can_wipe_symbol_weights(label) is True, weights
+
+
+def test_fill_rest_and_wipe_are_exported():
+    """The wizard imports all four by name from the package's public surface."""
+    assert "fill_remaining_symbol_weights" in pa.__all__
+    assert "can_fill_remaining_symbol_weights" in pa.__all__
+    assert "wipe_symbol_weights" in pa.__all__
+    assert "can_wipe_symbol_weights" in pa.__all__
+    assert "split_pct_across" in pa.__all__
+
+
 def test_load_previous_targets_output_still_passes_the_validator():
     """Whatever was last SAVED was last allocated with, so restoring it must not
     produce a set the wizard then refuses."""

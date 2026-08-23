@@ -2249,6 +2249,357 @@ def test_step_one_still_has_exactly_one_label_level_even_split(nicegui_client):
     assert [lt.target_pct for lt in steps.labels] == [50.0, 50.0]
 
 
+# ---------------------------------------------------------------------------
+# Step 2's per-label "Fill rest" and "Wipe" -- define a few by hand, fill the
+# remainder evenly across what is left; wipe to start the label over.
+# ---------------------------------------------------------------------------
+
+
+def _partly_filled_labels():
+    """Growth: 60 spoken for and three empty slots. Income: fully allocated.
+
+    So Growth's Fill rest is enabled and Income's is not, while BOTH can be wiped
+    -- the two predicates are independent and this fixture separates them.
+    """
+    return [
+        LabelTarget("Growth", 60.0,
+                    [SymbolTarget("MANUAL", 60.0)]
+                    + [SymbolTarget(f"S{i}", 0.0) for i in range(3)]),
+        LabelTarget("Income", 40.0, [SymbolTarget("KO", 70.0), SymbolTarget("PEP", 30.0)]),
+    ]
+
+
+def test_step_two_offers_a_fill_rest_per_label(nicegui_client):
+    """One per label, DISABLED where there is nothing left to fill -- Income's two
+    weights already spend its whole 100. Disabled, never hidden, on the same terms
+    as the Even-split and Load-last buttons beside it."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    _open_steps(nicegui_client, wiz, labels=_partly_filled_labels())
+
+    found = _buttons(nicegui_client, wiz.MARKER_FILL_REST_SYMBOLS)
+    assert len(found) == 2
+    assert [b.enabled for b in found] == [True, False]
+
+
+def test_step_two_offers_a_wipe_per_label(nicegui_client):
+    """One per label, DISABLED where every weight is already 0 -- there is nothing
+    to destroy. A label nothing carries draws it too, so the feature reads as
+    inapplicable rather than absent."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    labels = [LabelTarget("Growth", 100.0, [SymbolTarget("AAPL", 50.0),
+                                            SymbolTarget("MSFT", 50.0)]),
+              LabelTarget("Blank", 0.0, [SymbolTarget("AAA", 0.0),
+                                         SymbolTarget("BBB", 0.0)]),
+              LabelTarget("Empty", 0.0, [])]
+    _open_steps(nicegui_client, wiz, labels=labels)
+
+    found = _buttons(nicegui_client, wiz.MARKER_WIPE_SYMBOLS)
+    assert len(found) == 3
+    assert [b.enabled for b in found] == [True, False, False]
+
+
+def test_pressing_a_labels_fill_rest_touches_only_that_label(nicegui_client):
+    """The scoping proof, through the BUTTON so the ``t=lt`` default-argument
+    capture is under test: without it every one of these would rewrite the LAST
+    label. Growth's three empty slots divide the 40 that is left; the 60 the user
+    typed is untouched, Income keeps its 70/30, and neither label's own target
+    moves."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    steps, _calls = _open_steps(nicegui_client, wiz, labels=_partly_filled_labels())
+    with nicegui_client:
+        _click(_buttons(nicegui_client, wiz.MARKER_FILL_REST_SYMBOLS)[0])
+
+    assert [st.weight_pct for st in steps.labels[0].symbols] == [60.0, 13.33, 13.33, 13.34]
+    assert [st.weight_pct for st in steps.labels[1].symbols] == [70.0, 30.0]
+    assert [lt.target_pct for lt in steps.labels] == [60.0, 40.0]
+
+
+def test_pressing_a_labels_wipe_touches_only_that_label(nicegui_client):
+    """The same scoping proof for Wipe: one mis-scoped lambda and a click on
+    Growth's wipe would clear Income."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    steps, _calls = _open_steps(nicegui_client, wiz, labels=_partly_filled_labels())
+    with nicegui_client:
+        _click(_buttons(nicegui_client, wiz.MARKER_WIPE_SYMBOLS)[0])
+
+    assert [st.weight_pct for st in steps.labels[0].symbols] == [0.0, 0.0, 0.0, 0.0]
+    assert [st.weight_pct for st in steps.labels[1].symbols] == [70.0, 30.0]
+    assert [lt.target_pct for lt in steps.labels] == [60.0, 40.0]
+
+
+def test_filling_an_untouched_label_lands_exactly_on_the_even_split(nicegui_client):
+    """With nothing spoken for, "fill what is left" IS "split the 100 evenly", and
+    SIX is the count that catches a re-implementation: the engine's splitter floors
+    to 16.66 and puts 16.70 on the last slot, a hand-rolled ``round(100 / n, 2)``
+    produces 16.67 x 5 + 16.65. Pressed through both buttons on identical labels,
+    the two must agree symbol for symbol."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+    from ba2_trade_platform.core.portfolio_allocation import even_split_pct
+
+    labels = [LabelTarget("Fill", 50.0, [SymbolTarget(f"S{i}", 0.0) for i in range(6)]),
+              LabelTarget("Split", 50.0, [SymbolTarget(f"S{i}", 0.0) for i in range(6)])]
+    steps, _calls = _open_steps(nicegui_client, wiz, labels=labels)
+    with nicegui_client:
+        _click(_buttons(nicegui_client, wiz.MARKER_FILL_REST_SYMBOLS)[0])
+        _click(_buttons(nicegui_client, wiz.MARKER_EVEN_SPLIT_SYMBOLS)[1])
+
+    filled = [st.weight_pct for st in steps.labels[0].symbols]
+    assert filled == [st.weight_pct for st in steps.labels[1].symbols]
+    assert filled == even_split_pct(6)
+    assert filled == [16.66, 16.66, 16.66, 16.66, 16.66, 16.7]
+    assert sum(filled) == 100.0
+
+
+def test_fill_rest_redraws_the_boxes_rather_than_leaving_them_stale(nicegui_client):
+    """A ``ui.number`` does not follow the object it was built from -- the reason
+    every step-2 control redraws. Without it the user types over numbers that are
+    no longer what Continue will submit."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    steps, _calls = _open_steps(nicegui_client, wiz, labels=_partly_filled_labels())
+    with nicegui_client:
+        _click(_buttons(nicegui_client, wiz.MARKER_FILL_REST_SYMBOLS)[0])
+        drawn = [n.value for n in _numbers(nicegui_client, wiz, wiz.MARKER_SYMBOL_PCT)]
+
+    assert drawn[:4] == [60.0, 13.33, 13.33, 13.34]
+    assert drawn[4:] == [70.0, 30.0]
+
+
+def test_wipe_redraws_the_boxes_rather_than_leaving_them_stale(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    steps, _calls = _open_steps(nicegui_client, wiz, labels=_partly_filled_labels())
+    with nicegui_client:
+        _click(_buttons(nicegui_client, wiz.MARKER_WIPE_SYMBOLS)[0])
+        drawn = [n.value for n in _numbers(nicegui_client, wiz, wiz.MARKER_SYMBOL_PCT)]
+
+    assert drawn[:4] == [0.0, 0.0, 0.0, 0.0]
+    assert drawn[4:] == [70.0, 30.0]
+
+
+def test_fill_rest_revalidates_so_continue_follows(nicegui_client):
+    """The live total chip and Continue are driven by ``_revalidate``. Repairing a
+    broken label without it leaves Continue barred on a set that is now legal."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    labels = [LabelTarget("Growth", 100.0, [SymbolTarget("AAPL", 30.0),
+                                            SymbolTarget("MSFT", 0.0)])]
+    steps, _calls = _open_steps(nicegui_client, wiz, labels=labels)
+    assert steps._continue_button.enabled is False       # 30%, blocked
+
+    with nicegui_client:
+        _click(_buttons(nicegui_client, wiz.MARKER_FILL_REST_SYMBOLS)[0])
+
+    assert [st.weight_pct for st in steps.labels[0].symbols] == [30.0, 70.0]
+    assert steps._continue_button.enabled is True
+
+
+def test_wipe_revalidates_so_continue_stops_following(nicegui_client):
+    """The re-validate has to run in the DESTRUCTIVE direction too: a wipe takes a
+    legal label to 0% and Continue must go with it. Without it the user submits a
+    label they have just emptied."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    labels = [LabelTarget("Growth", 100.0, [SymbolTarget("AAPL", 50.0),
+                                            SymbolTarget("MSFT", 50.0)])]
+    steps, _calls = _open_steps(nicegui_client, wiz, labels=labels)
+    assert steps._continue_button.enabled is True
+
+    with nicegui_client:
+        _click(_buttons(nicegui_client, wiz.MARKER_WIPE_SYMBOLS)[0])
+
+    assert steps._continue_button.enabled is False
+
+
+def test_fill_rest_and_wipe_leave_the_reserve_and_the_label_total_alone(nicegui_client):
+    """Symbol weights have always been relative to their OWN label. The reserve and
+    the label percentages divide the base above this level, so neither control down
+    here may reach them."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    steps, _calls = _open_steps(nicegui_client, wiz, labels=_partly_filled_labels(),
+                                unallocated_pct=25.0)
+    with nicegui_client:
+        _click(_buttons(nicegui_client, wiz.MARKER_WIPE_SYMBOLS)[0])
+        _click(_buttons(nicegui_client, wiz.MARKER_FILL_REST_SYMBOLS)[0])
+
+    assert steps.unallocated_pct == 25.0
+    assert [lt.target_pct for lt in steps.labels] == [60.0, 40.0]
+    assert steps._continue_button.enabled is True
+
+
+def test_the_wipe_type_fill_workflow_end_to_end(nicegui_client):
+    """The feature as the user described it: wipe the label, type the couple that
+    matter, let the rest share what is left."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    labels = [LabelTarget("Growth", 100.0,
+                          [SymbolTarget(f"S{i}", 100.0 / 6.0) for i in range(6)])]
+    steps, _calls = _open_steps(nicegui_client, wiz, labels=labels)
+    with nicegui_client:
+        _click(_buttons(nicegui_client, wiz.MARKER_WIPE_SYMBOLS)[0])
+        # Through the boxes the user actually types in -- the wipe has just redrawn
+        # them, so these are the fresh ones.
+        boxes = _numbers(nicegui_client, wiz, wiz.MARKER_SYMBOL_PCT)
+        boxes[0].set_value(25.0)
+        boxes[1].set_value(15.0)
+        _click(_buttons(nicegui_client, wiz.MARKER_FILL_REST_SYMBOLS)[0])
+
+    # 40 typed, 60 shared four ways.
+    assert [st.weight_pct for st in steps.labels[0].symbols] == [25.0, 15.0, 15.0,
+                                                                 15.0, 15.0, 15.0]
+    assert steps._continue_button.enabled is True
+
+
+def test_fill_rest_disables_itself_once_the_label_is_full(nicegui_client):
+    """The enabled state has to follow the weights or it is decoration. Fill the
+    label and there is nothing left to fill, so the button greys out in place --
+    without a redraw of the row, which would rebuild boxes under the cursor."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    steps, _calls = _open_steps(nicegui_client, wiz, labels=_partly_filled_labels())
+    fill = _buttons(nicegui_client, wiz.MARKER_FILL_REST_SYMBOLS)[0]
+    assert fill.enabled is True
+
+    with nicegui_client:
+        _click(fill)
+
+    assert _buttons(nicegui_client, wiz.MARKER_FILL_REST_SYMBOLS)[0].enabled is False
+    # ... and Wipe, which was already live, stays live.
+    assert _buttons(nicegui_client, wiz.MARKER_WIPE_SYMBOLS)[0].enabled is True
+
+
+def test_wipe_disables_itself_once_the_label_is_clear(nicegui_client):
+    """Symmetrically: nothing left to destroy, and now everything to fill."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    steps, _calls = _open_steps(nicegui_client, wiz, labels=_partly_filled_labels())
+    with nicegui_client:
+        _click(_buttons(nicegui_client, wiz.MARKER_WIPE_SYMBOLS)[0])
+
+    assert _buttons(nicegui_client, wiz.MARKER_WIPE_SYMBOLS)[0].enabled is False
+    assert _buttons(nicegui_client, wiz.MARKER_FILL_REST_SYMBOLS)[0].enabled is True
+    # Income's pair is unaffected -- the refresh is per-label like everything else.
+    assert _buttons(nicegui_client, wiz.MARKER_WIPE_SYMBOLS)[1].enabled is True
+    assert _buttons(nicegui_client, wiz.MARKER_FILL_REST_SYMBOLS)[1].enabled is False
+
+
+def test_typing_a_weight_follows_through_to_the_two_new_buttons(nicegui_client):
+    """Both predicates depend on the numbers in the boxes, so typing has to refresh
+    them too -- otherwise a user who types 100 into the last empty box is still
+    offered a Fill rest that can only write zeros.
+
+    Driven through ``set_value`` on the marked box, so the weight box's own
+    per-label capture is under test: a refresh aimed at the wrong label would leave
+    Growth's pair stale and silently retarget Income's.
+    """
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    labels = [LabelTarget("Growth", 60.0, [SymbolTarget("AAPL", 0.0),
+                                           SymbolTarget("MSFT", 0.0)]),
+              LabelTarget("Income", 40.0, [SymbolTarget("KO", 70.0),
+                                           SymbolTarget("PEP", 30.0)])]
+    steps, _calls = _open_steps(nicegui_client, wiz, labels=labels)
+    assert _buttons(nicegui_client, wiz.MARKER_FILL_REST_SYMBOLS)[0].enabled is True
+    assert _buttons(nicegui_client, wiz.MARKER_WIPE_SYMBOLS)[0].enabled is False
+
+    with nicegui_client:
+        _numbers(nicegui_client, wiz, wiz.MARKER_SYMBOL_PCT)[0].set_value(100.0)
+
+    assert steps.labels[0].symbols[0].weight_pct == 100.0
+    assert _buttons(nicegui_client, wiz.MARKER_FILL_REST_SYMBOLS)[0].enabled is False
+    assert _buttons(nicegui_client, wiz.MARKER_WIPE_SYMBOLS)[0].enabled is True
+    # Income never moved, so its pair reads exactly as it did.
+    assert _buttons(nicegui_client, wiz.MARKER_FILL_REST_SYMBOLS)[1].enabled is False
+    assert _buttons(nicegui_client, wiz.MARKER_WIPE_SYMBOLS)[1].enabled is True
+
+
+def test_an_over_allocated_label_disables_fill_rest_but_never_wipe(nicegui_client):
+    """The escape hatch. 70 + 50 leaves nothing to hand out, so Fill rest is
+    disabled rather than a click that writes zeros or negatives -- and Wipe is
+    enabled in exactly that case, so the user is never cornered into retyping every
+    box by hand."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    labels = [LabelTarget("Growth", 100.0, [SymbolTarget("AAPL", 70.0),
+                                            SymbolTarget("MSFT", 50.0),
+                                            SymbolTarget("NVDA", 0.0)])]
+    steps, _calls = _open_steps(nicegui_client, wiz, labels=labels)
+
+    assert _buttons(nicegui_client, wiz.MARKER_FILL_REST_SYMBOLS)[0].enabled is False
+    assert _buttons(nicegui_client, wiz.MARKER_WIPE_SYMBOLS)[0].enabled is True
+    with nicegui_client:
+        _click(_buttons(nicegui_client, wiz.MARKER_WIPE_SYMBOLS)[0])
+        _click(_buttons(nicegui_client, wiz.MARKER_FILL_REST_SYMBOLS)[0])
+
+    assert [st.weight_pct for st in steps.labels[0].symbols] == [33.33, 33.33, 33.34]
+    assert steps._continue_button.enabled is True
+
+
+def test_wipe_does_not_ask_for_confirmation(nicegui_client):
+    """A deliberate NO, and this pins it.
+
+    ``_confirm_unmanage`` on the allocation page asks first because an unmanage
+    writes to the database at once and deletes stored weights and comments with no
+    undo. A wipe is the opposite on every count: it edits the dialog's own COPY of
+    the labels, nothing reaches the database until Submit two steps and a dry run
+    later, Cancel discards the lot, and Load last / Even split / Fill rest sit
+    beside it as one-click undos. Confirming both would teach the user to click
+    through confirmations, which is how the one that matters gets lost.
+    """
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+    from nicegui import ui as nicegui_ui
+
+    steps, _calls = _open_steps(nicegui_client, wiz, labels=_partly_filled_labels())
+    before = len([d for d in nicegui_client.layout.descendants()
+                  if isinstance(d, nicegui_ui.dialog)])
+    with nicegui_client:
+        _click(_buttons(nicegui_client, wiz.MARKER_WIPE_SYMBOLS)[0])
+
+    after = len([d for d in nicegui_client.layout.descendants()
+                 if isinstance(d, nicegui_ui.dialog)])
+    assert after == before
+    # The weights are gone in the same click, not after an await.
+    assert [st.weight_pct for st in steps.labels[0].symbols] == [0.0, 0.0, 0.0, 0.0]
+
+
+def test_wipe_keeps_load_last_available_as_its_undo(nicegui_client):
+    """The wipe carries ``previous_weight_pct`` across, so the control that undoes
+    it stays enabled. That is a large part of why it needs no confirmation."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    steps, _calls = _open_steps(nicegui_client, wiz, labels=_labels_with_history())
+    with nicegui_client:
+        _click(_buttons(nicegui_client, wiz.MARKER_WIPE_SYMBOLS)[0])
+    assert [st.weight_pct for st in steps.labels[0].symbols] == [0.0, 0.0]
+
+    last = _buttons(nicegui_client, wiz.MARKER_LOAD_LAST_SYMBOLS)[0]
+    assert last.enabled is True
+    with nicegui_client:
+        _click(last)
+
+    assert [st.weight_pct for st in steps.labels[0].symbols] == [50.0, 50.0]
+
+
+def test_step_two_draws_all_four_controls_for_every_label(nicegui_client):
+    """One row, four buttons, one set per label -- and step 1's own pair stays
+    singular. A marker collision here is how a test starts asserting against the
+    wrong button."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    _open_steps(nicegui_client, wiz, labels=_partly_filled_labels())
+
+    for marker in (wiz.MARKER_EVEN_SPLIT_SYMBOLS, wiz.MARKER_FILL_REST_SYMBOLS,
+                   wiz.MARKER_WIPE_SYMBOLS, wiz.MARKER_LOAD_LAST_SYMBOLS):
+        assert len(_buttons(nicegui_client, marker)) == 2, marker
+    assert len(_buttons(nicegui_client, wiz.MARKER_EVEN_SPLIT)) == 1
+    assert len(_buttons(nicegui_client, wiz.MARKER_LOAD_LAST)) == 1
+
+
 def test_step_two_shows_the_last_weight_beside_each_symbol(nicegui_client):
     from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
 
