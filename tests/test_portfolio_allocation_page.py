@@ -140,6 +140,18 @@ def _texts(root):
     return [el._text for el in root.descendants(include_self=True) if el._text]
 
 
+def _expansion_headers(root):
+    """The caption of every ``ui.expansion``.
+
+    ``_texts`` misses them: an expansion keeps its caption in ``_props['label']``
+    rather than in ``_text``, so the label group headers -- which is where the
+    current-versus-target comparison is drawn -- are invisible to it.
+    """
+    from nicegui import ui as nicegui_ui
+    return [el._props.get('label', '') for el in root.descendants()
+            if isinstance(el, nicegui_ui.expansion)]
+
+
 def _run_in_client(client, coro_factory):
     """Await a page coroutine with the client's slot stack ACTIVE.
 
@@ -791,8 +803,11 @@ async def _noop_refresh():
 # F-I1 and the missing-quote banner -- what the headline actually says
 # ---------------------------------------------------------------------------
 
-def _payload(views, mode=VALUATION_MODE_COST):
-    return {'views': views, 'symbols_by_label': {}, 'valuation_mode': mode}
+def _payload(views, mode=VALUATION_MODE_COST, *, base_notional=None,
+             available_buying_power=None):
+    return {'views': views, 'symbols_by_label': {}, 'valuation_mode': mode,
+            'base_notional': base_notional,
+            'available_buying_power': available_buying_power}
 
 
 def test_the_managed_value_headline_counts_a_two_label_symbol_once(nicegui_client):
@@ -1684,3 +1699,198 @@ def test_the_flow_passes_the_current_values_into_the_steps_dialog(
         account_id, VALUATION_MODE_MARKET, _noop_refresh))
 
     assert steps['symbol_values'] == {'AAPL': 2_500.0}
+
+
+# ---------------------------------------------------------------------------
+# W3: the page learns about buying power.
+# ---------------------------------------------------------------------------
+
+def test_the_page_reads_the_account_snapshot_so_it_can_show_free_buying_power(
+        monkeypatch, account_id):
+    """``_load_view_payload`` fetched only positions and prices, so the page could
+    not show cash or buying power at all -- and therefore could not show the
+    unallocated group requirement 3 asks for."""
+    set_managed_label(account_id, 'ARK26', target_pct=40.0)
+    add_label_to_instruments(['AAPL'], 'ARK26')
+    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
+                            buying_power=7_500.0,
+                            positions=[_pos('AAPL', 10, 1000.0, 2500.0)],
+                            prices={'AAPL': 250.0})
+    _use_account(monkeypatch, account)
+
+    payload = page._load_view_payload(account_id, VALUATION_MODE_MARKET)
+
+    assert payload['available_buying_power'] == 7_500.0
+    assert payload['base_notional'] == 10_000.0          # 7,500 + 2,500 managed
+
+
+def test_a_snapshot_the_broker_will_not_give_leaves_the_page_usable(monkeypatch,
+                                                                    account_id):
+    """The label table is the page's job; buying power is a bonus on top of it. A
+    broker that cannot answer must cost the reserve row, not the whole page."""
+    set_managed_label(account_id, 'ARK26', target_pct=40.0)
+    add_label_to_instruments(['AAPL'], 'ARK26')
+    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
+                            positions=[_pos('AAPL', 10, 1000.0, 2500.0)],
+                            prices={'AAPL': 250.0})
+    account.get_account_snapshot = lambda: (_ for _ in ()).throw(RuntimeError('503'))
+    _use_account(monkeypatch, account)
+
+    payload = page._load_view_payload(account_id, VALUATION_MODE_MARKET)
+
+    assert payload['available_buying_power'] is None
+    assert payload['base_notional'] is None
+    assert [v.label for v in payload['views']] == ['ARK26']
+
+
+def test_the_page_draws_the_unallocated_group_first_with_percent_and_dollars(
+        nicegui_client):
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import positions_by_symbol
+
+    positions = positions_by_symbol([_pos('AAPL', 10, 1000.0, 2500.0)])
+    views = build_label_views([ManagedLabel('ARK26', 40.0)], {'ARK26': ['AAPL']},
+                              positions, {'AAPL': 250.0},
+                              valuation_mode=VALUATION_MODE_MARKET,
+                              base_notional=10_000.0)
+    with nicegui_client:
+        page._render_labels(1, _payload(views, VALUATION_MODE_MARKET,
+                                        base_notional=10_000.0,
+                                        available_buying_power=7_500.0),
+                            _noop_refresh)
+        texts = _texts(nicegui_client.layout)
+
+    row = next(t for t in texts if 'Unallocated' in t)
+    assert '60.00%' in row              # 100 - 40
+    assert '6,000.00' in row            # 60% of the base
+    assert '7,500.00' in row            # what is ACTUALLY uninvested
+
+
+def test_the_page_shows_free_buying_power_as_a_third_stat_card(nicegui_client):
+    views = build_label_views([ManagedLabel('ARK26', 40.0)], {'ARK26': ['AAPL']},
+                              {}, {}, valuation_mode=VALUATION_MODE_MARKET,
+                              base_notional=10_000.0)
+    with nicegui_client:
+        page._render_labels(1, _payload(views, VALUATION_MODE_MARKET,
+                                        base_notional=10_000.0,
+                                        available_buying_power=7_500.0),
+                            _noop_refresh)
+        texts = ' | '.join(_texts(nicegui_client.layout))
+
+    assert 'Free buying power' in texts
+    assert '$7,500.00' in texts
+
+
+def test_the_page_omits_the_unallocated_group_when_the_broker_gave_no_base(
+        nicegui_client):
+    """Better a missing row than one measured against a guessed base."""
+    views = build_label_views([ManagedLabel('ARK26', 40.0)], {'ARK26': ['AAPL']},
+                              {}, {}, valuation_mode=VALUATION_MODE_MARKET)
+    with nicegui_client:
+        page._render_labels(1, _payload(views, VALUATION_MODE_MARKET), _noop_refresh)
+        texts = ' | '.join(_texts(nicegui_client.layout))
+
+    assert 'Unallocated' not in texts
+
+
+def test_the_label_header_measures_current_and_target_against_ONE_denominator(
+        nicegui_client):
+    """The defect: the header read ``(X% of managed, target Y%)`` while
+    ``pct_of_total`` divides by the managed value and ``target_pct`` divides by
+    buying power PLUS managed value. With 7,500 of buying power those are 100% and
+    40% of two different things, and the user is invited to compare them."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import positions_by_symbol
+
+    positions = positions_by_symbol([_pos('AAPL', 10, 1000.0, 2500.0)])
+    views = build_label_views([ManagedLabel('ARK26', 40.0)], {'ARK26': ['AAPL']},
+                              positions, {'AAPL': 250.0},
+                              valuation_mode=VALUATION_MODE_MARKET,
+                              base_notional=10_000.0)
+    with nicegui_client:
+        page._render_labels(1, _payload(views, VALUATION_MODE_MARKET,
+                                        base_notional=10_000.0,
+                                        available_buying_power=7_500.0),
+                            _noop_refresh)
+        header = ' | '.join(_expansion_headers(nicegui_client.layout))
+
+    assert '25.0% of base' in header         # 2,500 of a 10,000 base
+    assert 'target 40.0%' in header
+    assert '4,000.00' in header              # the target, as money
+    assert 'of managed' not in header
+
+
+def test_the_header_falls_back_to_percent_of_managed_when_there_is_no_base(
+        nicegui_client):
+    """Without a base there is no comparable pair to draw, so it says which
+    denominator it DID use rather than inventing one."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import positions_by_symbol
+
+    positions = positions_by_symbol([_pos('AAPL', 10, 1000.0, 2500.0)])
+    views = build_label_views([ManagedLabel('ARK26', 40.0)], {'ARK26': ['AAPL']},
+                              positions, {'AAPL': 250.0},
+                              valuation_mode=VALUATION_MODE_MARKET)
+    with nicegui_client:
+        page._render_labels(1, _payload(views, VALUATION_MODE_MARKET), _noop_refresh)
+        header = ' | '.join(_expansion_headers(nicegui_client.layout))
+
+    assert 'of managed' in header
+    assert 'of base' not in header
+
+
+def test_the_symbol_table_shows_a_target_percentage_and_a_target_value(nicegui_client):
+    """Requirement 2 at the instrument level. The page showed a target exactly once,
+    on the group header, and never per symbol."""
+    from nicegui import ui
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import positions_by_symbol
+
+    positions = positions_by_symbol([_pos('AAPL', 10, 1000.0, 2500.0)])
+    view = build_label_views([ManagedLabel('ARK26', 40.0)], {'ARK26': ['AAPL']},
+                             positions, {'AAPL': 250.0},
+                             valuation_mode=VALUATION_MODE_MARKET,
+                             base_notional=10_000.0,
+                             symbol_weights={'ARK26': {'AAPL': 100.0}})[0]
+    with nicegui_client:
+        page._render_label_body(1, view, _noop_refresh)
+        table = next(el for el in nicegui_client.layout.descendants()
+                     if isinstance(el, ui.table))
+
+    columns = {c['name'] for c in table.columns}
+    assert {'weight_pct', 'target_value'} <= columns
+    assert table.rows[0]['weight_pct'] == 100.0
+    assert table.rows[0]['target_value'] == 4_000.0
+
+
+def test_a_symbol_with_no_target_shows_a_blank_rather_than_a_zero(nicegui_client):
+    from nicegui import ui
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import positions_by_symbol
+
+    positions = positions_by_symbol([_pos('AAPL', 10, 1000.0, 2500.0)])
+    view = build_label_views([ManagedLabel('ARK26', 40.0)], {'ARK26': ['AAPL']},
+                             positions, {'AAPL': 250.0},
+                             valuation_mode=VALUATION_MODE_MARKET)[0]
+    with nicegui_client:
+        page._render_label_body(1, view, _noop_refresh)
+        table = next(el for el in nicegui_client.layout.descendants()
+                     if isinstance(el, ui.table))
+
+    assert table.rows[0]['weight_pct'] is None
+    assert table.rows[0]['target_value'] is None
+
+
+def test_the_page_feeds_the_stored_symbol_weights_into_the_view(monkeypatch,
+                                                                account_id):
+    """``_load_view_payload`` read only the COMMENTS off the symbol rows, so the
+    weights the user typed never reached the table they are supposed to appear in."""
+    set_managed_label(account_id, 'ARK26', target_pct=40.0)
+    add_label_to_instruments(['AAPL', 'MSFT'], 'ARK26')
+    set_symbol_weight(account_id, 'ARK26', 'AAPL', weight_pct=75.0)
+    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
+                            buying_power=7_500.0,
+                            positions=[_pos('AAPL', 10, 1000.0, 2500.0)],
+                            prices={'AAPL': 250.0, 'MSFT': 100.0})
+    _use_account(monkeypatch, account)
+
+    payload = page._load_view_payload(account_id, VALUATION_MODE_MARKET)
+
+    by_symbol = {r.symbol: r for r in payload['views'][0].rows}
+    assert by_symbol['AAPL'].weight_pct == 75.0
+    assert by_symbol['AAPL'].target_value == 3_000.0     # 75% of 40% of 10,000

@@ -49,6 +49,7 @@ from ...core.portfolio_allocation import (
     even_split_targets,
     filter_plan_rows,
     fractional_summary,
+    LABEL_TOTAL_TOLERANCE_PCT,
     has_previous_symbol_weights,
     has_previous_targets,
     held_no_price_block,
@@ -183,6 +184,45 @@ MARKER_WORKING_ORDERS = 'income-working-orders'
 #: Markers on the step 1 / step 2 percentage boxes, in label then symbol order.
 MARKER_LABEL_PCT = 'steps-label-pct'
 MARKER_SYMBOL_PCT = 'steps-symbol-pct'
+
+#: Marker on step 1's read-only UNALLOCATED row -- the derived remainder, at the
+#: TOP of the label list. By marker: the sentence is money and percent, both of
+#: which repeat in the rows beneath it.
+MARKER_UNALLOCATED = 'steps-unallocated'
+
+#: Marker on step 1's live running total.
+MARKER_LABEL_TOTAL = 'steps-label-total'
+
+#: Marker on the dry run's reserve chip.
+MARKER_RESERVED = 'dry-run-reserved'
+
+#: Marker on the footer line that puts the expected cash next to the reserve.
+MARKER_CASH_VS_RESERVE = 'dry-run-cash-vs-reserve'
+
+#: The footer's arithmetic check for requirement 3. The reserve is a share of
+#: ``base_notional`` -- buying power PLUS managed value -- so on a fully invested
+#: account RAISING it generates SELL orders to free the cash. That is correct and
+#: it has to be obvious rather than inferred from two numbers on different lines.
+CASH_VS_RESERVE_FMT = ('Est. cash after {cash:,.2f} vs reserve {reserved:,.2f} '
+                       '({delta:+,.2f})')
+
+#: Step 1's derived remainder, in percent AND dollars. READ-ONLY and DERIVED, by
+#: decision: you allocate to it by under-allocating elsewhere, so there is no
+#: second box to keep in sync and nothing is ever rewritten behind the user.
+UNALLOCATED_FMT = 'Unallocated (free buying power)  {pct:.2f}%  ({amount:,.2f})'
+
+#: The same row when the targets OVERSHOOT. A negative reserve is not a thing, and
+#: printing "-30.00%" there invites the user to read it as a number they can spend.
+UNALLOCATED_OVER_FMT = 'Unallocated (free buying power)  over by {over:.2f}%'
+
+#: Step 1's live running total. The messages list is built below step 3 and can sit
+#: under the fold in a maximized dialog, so the total has to be up where the boxes
+#: are.
+LABEL_TOTAL_FMT = 'Total: {total:.2f}%'
+
+#: The dry run's reserve chip, drawn only when there IS one. A "Reserved: 0.00" on
+#: every fully-allocated plan is noise, and noise is what hides the real case.
+RESERVED_FMT = 'Reserved (not allocated): {amount:,.2f} ({pct:.2f}% of base)'
 
 #: Markers on the step 1 / step 2 "Load last" buttons. Buttons, not labels, so the
 #: tests locate them by marker AND by type -- 'Load last' is short enough to collide
@@ -537,6 +577,12 @@ class AllocationWizard:
                      f'{self.base.managed_value:,.2f}')
             ui.label(f'Base notional: {self.base.base_notional:,.2f}').classes('font-bold')
             ui.label(f"as of {self.base.taken_at:%Y-%m-%d %H:%M UTC}").classes('text-xs text-gray-400')
+            # Only when there IS one: a "Reserved: 0.00" chip on every fully
+            # allocated plan is noise, and noise is what hides the real case.
+            if self.plan.reserved_pct > LABEL_TOTAL_TOLERANCE_PCT:
+                ui.label(RESERVED_FMT.format(amount=self.plan.reserved_notional,
+                                             pct=self.plan.reserved_pct)) \
+                    .classes('text-orange-400').mark(MARKER_RESERVED)
         # DANGER, not warning, and above the warnings: this one does not merely
         # qualify the numbers below it, it says they are wrong and Submit is off.
         base_block = self._base_block()
@@ -729,6 +775,18 @@ class AllocationWizard:
                 else:
                     ui.label('Est. cash after: unknown (broker published no cash balance)') \
                         .classes('text-orange-400')
+            # Only when a reserve was actually asked for, and only when the broker
+            # gave a cash balance to compare it against -- there is no fallback for
+            # a balance.
+            if totals is not None and selected_plan.reserved_pct > LABEL_TOTAL_TOLERANCE_PCT:
+                cash_after = totals['estimated_cash_after']
+                reserved = selected_plan.reserved_notional
+                with ui.row().classes('w-full text-sm'):
+                    ui.label(CASH_VS_RESERVE_FMT.format(
+                        cash=cash_after, reserved=reserved,
+                        delta=cash_after - reserved)) \
+                        .classes('text-orange-400' if cash_after < reserved else '') \
+                        .mark(MARKER_CASH_VS_RESERVE)
             with ui.row().classes('w-full gap-6 text-sm'):
                 ui.label(f"Held cost: {held_cost:,.2f}").classes('text-gray-400')
                 ui.label(f"Held value: {sum(priced):,.2f}"
@@ -944,6 +1002,8 @@ class AllocationSteps:
         self._continue_button = None
         self._fractional_switch = None
         self._labels_container = None
+        self._unallocated_label = None
+        self._total_label = None
         #: ``{label: column}`` for step 2, so a per-label Load last can redraw just
         #: that expansion's boxes.
         self._symbol_containers = {}
@@ -975,8 +1035,11 @@ class AllocationSteps:
 
     # -- steps ------------------------------------------------------------
     def _render_step1_label_targets(self):
-        ui.label('1. Label targets (% of the base notional, must total 100%)') \
+        ui.label('1. Label targets (% of the base notional, up to 100%)') \
             .classes('text-lg font-bold mt-2')
+        ui.label('Anything you do not allocate stays as free buying power - the '
+                 'Unallocated row below shows how much.') \
+            .classes('text-xs text-secondary-custom')
         with ui.row().classes('items-center gap-2'):
             ui.button('Even split', icon='balance',
                       on_click=self._even_split).props('outline dense')
@@ -988,6 +1051,21 @@ class AllocationSteps:
             last.set_enabled(has_previous_targets(self.labels))
         self._labels_container = ui.column().classes('w-full gap-1')
         self._draw_label_targets()
+
+    def _unallocated_caption(self) -> str:
+        """``100 - sum(targets)`` in percent and dollars, or the overshoot.
+
+        DERIVED, never stored: the reserve is implied by the label targets, and a
+        stored copy of a derivable number is a divergence waiting to happen. Both
+        halves are shown because a percentage alone does not tell the user whether
+        they are leaving 300 or 30,000 in cash.
+        """
+        total = sum(float(lt.target_pct or 0.0) for lt in self.labels)
+        if total > 100.0 + LABEL_TOTAL_TOLERANCE_PCT:
+            return UNALLOCATED_OVER_FMT.format(over=total - 100.0)
+        pct = max(0.0, 100.0 - total)
+        return UNALLOCATED_FMT.format(
+            pct=pct, amount=float(self.base.base_notional or 0.0) * pct / 100.0)
 
     def _label_current_caption(self, lt: LabelTarget) -> str:
         """The read-only "now X (Y% of base) · last Z%" beside a label's target box.
@@ -1007,6 +1085,17 @@ class AllocationSteps:
     def _draw_label_targets(self):
         self._labels_container.clear()
         with self._labels_container:
+            # FIRST, above the labels: this is the row that explains why the others
+            # do not add up, and below them it reads as a footnote. Always drawn,
+            # including at 0.00% -- a row that vanishes when it is zero teaches
+            # nothing about where the number went.
+            with ui.row().classes('w-full items-center gap-3'):
+                self._unallocated_label = ui.label(self._unallocated_caption()) \
+                    .classes('text-sm font-medium text-orange-400') \
+                    .mark(MARKER_UNALLOCATED)
+                self._total_label = ui.label(LABEL_TOTAL_FMT.format(
+                    total=sum(float(lt.target_pct or 0.0) for lt in self.labels))) \
+                    .classes('text-xs text-secondary-custom').mark(MARKER_LABEL_TOTAL)
             for lt in self.labels:
                 with ui.row().classes('w-full items-center gap-3'):
                     ui.label(lt.label).classes('w-40 font-medium')
@@ -1088,7 +1177,17 @@ class AllocationSteps:
 
     # -- state + validation ------------------------------------------------
     def _even_split(self):
-        for edited, fresh in zip(self.labels, even_split_targets(self.labels)):
+        """Split what is CURRENTLY allocated, not a flat 100.
+
+        On a book the user is deliberately holding 30% of in cash, an even split of
+        100 silently deploys that cash -- a real trade nobody asked for. An
+        UNTOUCHED set (every target 0) has no reserve to preserve, only an unusable
+        button, so that one case falls back to the whole 100.
+        """
+        allocated = sum(float(lt.target_pct or 0.0) for lt in self.labels)
+        total_pct = allocated if allocated > LABEL_TOTAL_TOLERANCE_PCT else 100.0
+        for edited, fresh in zip(self.labels,
+                                 even_split_targets(self.labels, total_pct=total_pct)):
             edited.target_pct = fresh.target_pct
         self._draw_label_targets()
         self._revalidate()
@@ -1119,7 +1218,19 @@ class AllocationSteps:
 
     def _set_label_pct(self, target: LabelTarget, value):
         target.target_pct = float(value or 0.0)
+        # The derived row and the running total are what the user is LOOKING at
+        # while they type; the validator's advisory below step 3 is the safety net,
+        # not the display. Redrawn in place, so the ``ui.number`` the event came
+        # from is not rebuilt underneath the cursor.
+        self._redraw_derived_row()
         self._revalidate()
+
+    def _redraw_derived_row(self):
+        if self._unallocated_label is not None:
+            self._unallocated_label.set_text(self._unallocated_caption())
+        if self._total_label is not None:
+            self._total_label.set_text(LABEL_TOTAL_FMT.format(
+                total=sum(float(lt.target_pct or 0.0) for lt in self.labels)))
 
     def _set_symbol_pct(self, target: SymbolTarget, value):
         target.weight_pct = float(value or 0.0)

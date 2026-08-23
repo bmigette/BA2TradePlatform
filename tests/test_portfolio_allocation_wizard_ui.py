@@ -755,7 +755,9 @@ def test_each_symbol_box_edits_its_own_symbol(nicegui_client):
     assert [st.weight_pct for st in steps.labels[1].symbols] == [100.0]
 
 
-def test_a_label_total_that_is_not_100_blocks_continue(nicegui_client):
+def test_a_label_total_ABOVE_100_blocks_continue(nicegui_client):
+    """The only hard rule left on the label totals. ``_labels()`` is 60/40, so
+    pushing the first to 70 makes 110."""
     from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
 
     steps, calls = _open_steps(nicegui_client, wiz)
@@ -765,8 +767,42 @@ def test_a_label_total_that_is_not_100_blocks_continue(nicegui_client):
         assert steps._continue_button.enabled is False
         steps._continue()
 
-    assert any("must total 100%" in t for t in errors)
+    assert any("over 100% by 10.00%" in t for t in errors), errors
     assert calls == []
+
+
+def test_a_label_total_BELOW_100_is_allowed_and_says_what_is_left(nicegui_client):
+    """The inversion. Under-allocating used to be refused; it is now the documented
+    way to hold free buying power, so Continue stays live and the wizard says how
+    much is being left in cash rather than blocking on it."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    steps, calls = _open_steps(nicegui_client, wiz)
+    with nicegui_client:
+        # 60/40 -> 30/40, so 30% is deliberately not deployed.
+        _numbers(nicegui_client, wiz, wiz.MARKER_LABEL_PCT)[0].set_value(30.0)
+        messages = _rendered_texts(steps._errors_container)
+        assert steps._continue_button.enabled is True
+        steps._continue()
+
+    assert any("30.00% left unallocated as free buying power" in t for t in messages), messages
+    assert len(calls) == 1
+    assert [lt.target_pct for lt in calls[0]["labels"]] == [30.0, 40.0]
+
+
+def test_the_unallocated_advisory_is_drawn_as_advice_not_as_an_error(nicegui_client):
+    """``_revalidate`` prefixes a blocking message with the red cross. If this one
+    were built as advice but still classified as blocking -- the default -- Continue
+    would stay disabled and the relaxation would be dead on arrival."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    steps, _calls = _open_steps(nicegui_client, wiz)
+    with nicegui_client:
+        _numbers(nicegui_client, wiz, wiz.MARKER_LABEL_PCT)[0].set_value(30.0)
+        messages = _rendered_texts(steps._errors_container)
+
+    assert any(t.startswith("\u26a0 ") for t in messages), messages
+    assert not any(t.startswith("\u2716 ") for t in messages), messages
 
 
 def test_a_symbol_weight_total_that_is_not_100_blocks_continue(nicegui_client):
@@ -2002,3 +2038,230 @@ def test_the_percentage_boxes_are_still_the_only_marked_numbers(nicegui_client):
 
     assert len(_numbers(nicegui_client, wiz, wiz.MARKER_LABEL_PCT)) == 2
     assert len(_numbers(nicegui_client, wiz, wiz.MARKER_SYMBOL_PCT)) == 3
+
+
+# ---------------------------------------------------------------------------
+# W3/W4/W5: the Unallocated group, and the >100 rule as the only hard one.
+#
+# READ-ONLY DERIVED: the row is 100 - sum(targets), in percent AND dollars, at the
+# TOP of the label list. There is no new column and nothing is rewritten behind
+# the user's back -- you "allocate to it" by under-allocating elsewhere.
+# ---------------------------------------------------------------------------
+
+def test_step_one_draws_the_unallocated_row_first_in_percent_and_dollars(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    # _labels() is 60/40, so nothing is unallocated to begin with.
+    steps, _calls = _open_steps(nicegui_client, wiz)
+    with nicegui_client:
+        _numbers(nicegui_client, wiz, wiz.MARKER_LABEL_PCT)[0].set_value(30.0)
+        drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_UNALLOCATED)
+
+    assert len(drawn) == 1
+    assert '30.00%' in drawn[0]
+    assert '3,000.00' in drawn[0]      # 30% of the 10,000 base
+
+
+def test_the_unallocated_row_is_the_first_thing_in_the_label_list(nicegui_client):
+    """At the TOP, because it is the row that explains why the others do not add
+    up. Below them it reads as a footnote."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    steps, _calls = _open_steps(nicegui_client, wiz)
+    with nicegui_client:
+        texts = _rendered_texts(steps._labels_container)
+
+    assert 'Unallocated' in texts[0], texts[:4]
+
+
+def test_a_fully_allocated_book_shows_zero_unallocated_rather_than_nothing(nicegui_client):
+    """Drawn always. A row that appears only when it is non-zero teaches the user
+    nothing about where the number went when it disappears."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    _open_steps(nicegui_client, wiz)          # 60/40
+    drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_UNALLOCATED)
+
+    assert len(drawn) == 1
+    assert '0.00%' in drawn[0]
+
+
+def test_an_over_allocated_book_shows_the_overshoot_not_a_negative_reserve(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    steps, _calls = _open_steps(nicegui_client, wiz)
+    with nicegui_client:
+        _numbers(nicegui_client, wiz, wiz.MARKER_LABEL_PCT)[0].set_value(90.0)   # 130
+        drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_UNALLOCATED)
+
+    assert 'over by 30.00%' in drawn[0], drawn
+    assert '-30' not in drawn[0]
+
+
+def test_the_unallocated_row_follows_every_keystroke(nicegui_client):
+    """Derived, live. The validator's advisory is the safety net; this row is the
+    thing the user is actually looking at while they type."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    steps, _calls = _open_steps(nicegui_client, wiz)
+    with nicegui_client:
+        boxes = _numbers(nicegui_client, wiz, wiz.MARKER_LABEL_PCT)
+        boxes[0].set_value(10.0)
+        assert '50.00%' in _marked_texts(nicegui_client.layout, wiz.MARKER_UNALLOCATED)[0]
+        boxes[1].set_value(10.0)
+        assert '80.00%' in _marked_texts(nicegui_client.layout, wiz.MARKER_UNALLOCATED)[0]
+
+
+def test_step_one_shows_a_live_running_total(nicegui_client):
+    """The messages list sits below step 3 in a maximized dialog, so it can be under
+    the fold. The total has to be visible where the numbers are typed."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    steps, _calls = _open_steps(nicegui_client, wiz)
+    with nicegui_client:
+        drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_LABEL_TOTAL)
+        assert 'Total: 100.00%' in drawn[0]
+        _numbers(nicegui_client, wiz, wiz.MARKER_LABEL_PCT)[0].set_value(30.0)
+        drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_LABEL_TOTAL)
+
+    assert 'Total: 70.00%' in drawn[0]
+
+
+def test_the_step_one_heading_no_longer_demands_exactly_one_hundred(nicegui_client):
+    """Step 1's rule relaxed; step 2's did NOT -- symbol weights inside a label must
+    still total exactly 100, because there is no per-label reserve."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    steps, _calls = _open_steps(nicegui_client, wiz)
+    with nicegui_client:
+        texts = _rendered_texts(nicegui_client.layout)
+
+    step1 = next(t for t in texts if t.startswith('1. Label targets'))
+    step2 = next(t for t in texts if t.startswith('2. Symbol weights'))
+    assert 'must total 100%' not in step1
+    assert 'up to 100%' in step1
+    assert 'must total 100%' in step2
+
+
+def test_even_split_in_the_steps_dialog_preserves_a_reserve(nicegui_client):
+    """"Even split" of 100 on a book the user is holding 30% of in cash silently
+    deploys that cash. It splits what is CURRENTLY allocated instead."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    labels = [LabelTarget("A", 40.0, [SymbolTarget("AA", 100.0)]),
+              LabelTarget("B", 30.0, [SymbolTarget("BB", 100.0)])]
+    steps, _calls = _open_steps(nicegui_client, wiz, labels=labels)
+    with nicegui_client:
+        steps._even_split()
+
+    assert [lt.target_pct for lt in steps.labels] == [35.0, 35.0]
+
+
+def test_even_split_of_a_fully_allocated_book_still_totals_one_hundred(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    steps, _calls = _open_steps(nicegui_client, wiz)          # 60/40
+    with nicegui_client:
+        steps._even_split()
+
+    assert [lt.target_pct for lt in steps.labels] == [50.0, 50.0]
+
+
+def test_even_split_of_an_untouched_book_still_deploys_the_whole_hundred(nicegui_client):
+    """A set that is all zeroes has no reserve to preserve -- it has never been
+    allocated. Splitting 0 would leave every label at 0 and the button useless."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    labels = [LabelTarget(n, 0.0, [SymbolTarget(n * 2, 100.0)]) for n in ("A", "B")]
+    steps, _calls = _open_steps(nicegui_client, wiz, labels=labels)
+    with nicegui_client:
+        steps._even_split()
+
+    assert [lt.target_pct for lt in steps.labels] == [50.0, 50.0]
+
+
+def _reserved_plan():
+    return AllocationPlan(
+        rows=[AllocationRow(symbol="AAPL", price=160.0, delta_quantity=10.0,
+                            side=OrderDirection.BUY, estimated_value=1_600.0,
+                            bp_cost=1_600.0, bp_factor=1.0)],
+        base_notional=10_000.0, available_buying_power=10_000.0,
+        required_buying_power=1_600.0, total_buy_value=1_600.0,
+        reserved_pct=30.0, reserved_notional=3_000.0,
+        valuation_mode=VALUATION_MODE_MARKET)
+
+
+def test_the_dry_run_base_panel_names_the_reserve(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wiz.AllocationWizard(_base(), _reserved_plan(), market=_open_market(),
+                             on_refresh=lambda f: (_reserved_plan(), _open_market()),
+                             on_submit=lambda p: None).open()
+        drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_RESERVED)
+
+    assert len(drawn) == 1
+    assert '3,000.00' in drawn[0] and '30.00%' in drawn[0]
+
+
+def test_the_dry_run_says_nothing_about_a_reserve_of_zero(nicegui_client):
+    """A "Reserved: 0.00" chip on every fully-allocated plan is noise, and noise is
+    what makes the non-zero case invisible."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wiz.AllocationWizard(_base(), _mixed_plan(), market=_open_market(),
+                             on_refresh=lambda f: (_mixed_plan(), _open_market()),
+                             on_submit=lambda p: None).open()
+        drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_RESERVED)
+
+    assert drawn == []
+
+
+def test_the_dry_run_footer_compares_the_cash_it_expects_against_the_reserve(
+        nicegui_client):
+    """Requirement 3's arithmetic check, in the one place the user can act on it.
+    The reserve is a share of ``base_notional`` -- buying power PLUS managed value --
+    so on a fully invested account raising it generates SELL orders to free the
+    cash. Correct, and it has to be obvious rather than inferred."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wiz.AllocationWizard(_base(), _reserved_plan(), market=_open_market(),
+                             on_refresh=lambda f: (_reserved_plan(), _open_market()),
+                             on_submit=lambda p: None).open()
+        drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_CASH_VS_RESERVE)
+
+    # ``_base()`` carries 10,000 cash; the plan buys 1,600, so 8,400 is left
+    # against a 3,000 reserve.
+    assert len(drawn) == 1
+    assert '8,400.00' in drawn[0] and '3,000.00' in drawn[0]
+
+
+def test_the_footer_says_nothing_about_a_reserve_of_zero(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wiz.AllocationWizard(_base(), _mixed_plan(), market=_open_market(),
+                             on_refresh=lambda f: (_mixed_plan(), _open_market()),
+                             on_submit=lambda p: None).open()
+        drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_CASH_VS_RESERVE)
+
+    assert drawn == []
+
+
+def test_the_cash_versus_reserve_line_follows_the_ticked_rows(nicegui_client):
+    """It is drawn from the FILTERED plan, like every other total: un-ticking the
+    only buy leaves all the cash, and the line has to say so."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wizard = wiz.AllocationWizard(
+            _base(), _reserved_plan(), market=_open_market(),
+            on_refresh=lambda f: (_reserved_plan(), _open_market()),
+            on_submit=lambda p: None)
+        wizard.open()
+        wizard._toggle('AAPL', False)
+        drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_CASH_VS_RESERVE)
+
+    assert '10,000.00' in drawn[0]

@@ -219,6 +219,14 @@ class SymbolRow:
     ``pct_of_label`` and ``pct_of_total`` are 1-100 of it. ``price`` is ``None``
     when no quote is available; ``market_value`` then falls back to the broker's
     own figure and is ``None`` when there is neither (never a guessed number).
+
+    ``weight_pct`` is the TARGET share of this symbol within its label, and
+    ``target_value`` the money that implies given the label's own target and the
+    allocatable base. Both are ``None`` when the caller supplied no stored weights
+    or no base notional -- there is no fallback, and a 0.00 there would be a fact
+    rather than an absence. They are the "target" half of requirement 2 at the
+    instrument level; the page previously showed a target exactly once, on the
+    group header.
     """
     symbol: str
     labels: List[str] = field(default_factory=list)
@@ -230,6 +238,8 @@ class SymbolRow:
     pct_of_label: float = 0.0
     pct_of_total: float = 0.0
     comment: Optional[str] = None
+    weight_pct: Optional[float] = None
+    target_value: Optional[float] = None
 
     @property
     def multi_label(self) -> bool:
@@ -251,6 +261,15 @@ class LabelView:
     anything, it was never rendered, and no test could say what it should be. The
     rows keep their own ``market_value`` (a display column), and ``current_value``
     remains the single mode-aware basis.
+
+    ``pct_of_total`` and ``pct_of_base`` are TWO DIFFERENT denominators and the
+    distinction is load-bearing. ``pct_of_total`` divides by the distinct MANAGED
+    value; ``target_pct`` is a share of ``base_notional`` (buying power PLUS managed
+    value). Whenever buying power is non-zero those two are not comparable, and the
+    page header printed them next to each other -- inviting the user to type a wrong
+    number. ``pct_of_base`` is the one that IS comparable with the target, and
+    ``target_value`` is the target as money. Both are ``None`` when no base notional
+    was supplied.
     """
     label: str
     target_pct: float = 0.0
@@ -259,6 +278,8 @@ class LabelView:
     cost_basis: float = 0.0
     pct_of_total: float = 0.0
     rows: List[SymbolRow] = field(default_factory=list)
+    pct_of_base: Optional[float] = None
+    target_value: Optional[float] = None
 
 
 def build_label_views(managed,
@@ -267,7 +288,9 @@ def build_label_views(managed,
                       prices,
                       symbol_comments=None,
                       *,
-                      valuation_mode: str) -> List[LabelView]:
+                      valuation_mode: str,
+                      base_notional: Optional[float] = None,
+                      symbol_weights=None) -> List[LabelView]:
     """Build the default view: one LabelView per managed label. Pure.
 
     ``valuation_mode`` (decision 5a) selects what "current value" means: ``cost``
@@ -292,6 +315,13 @@ def build_label_views(managed,
             refused a ``None`` fetch).
         prices: ``{SYMBOL: price or None}`` from the bulk quote call.
         symbol_comments: ``{(label, symbol): comment}``; optional.
+        base_notional: the allocatable base (buying power + managed value) the
+            TARGETS are shares of. Optional, and ``None`` propagates to
+            ``pct_of_base`` / ``target_value`` rather than becoming 0.0: a caller
+            that has no base has no answer, and 0.00% of base is a wrong one. Also
+            treated as absent when it is 0.
+        symbol_weights: ``{label: {symbol: weight_pct}}`` from ``get_symbol_weights``.
+            Optional, on the same terms.
 
     Returns:
         List[LabelView]: labels in the given order, rows within each ordered by
@@ -304,6 +334,11 @@ def build_label_views(managed,
         raise ValueError(
             f"Unknown valuation_mode {valuation_mode!r}; expected "
             f"{VALUATION_MODE_COST!r} or {VALUATION_MODE_MARKET!r}")
+
+    # 0 is treated as absent: dividing by it is undefined, and reporting 0.00% of
+    # base is a statement rather than an absence.
+    base = float(base_notional) if base_notional else None
+    weights_by_label = symbol_weights or {}
 
     def _clean(label: str) -> List[str]:
         seen, out = set(), []
@@ -344,6 +379,9 @@ def build_label_views(managed,
     for entry in managed:
         symbols = _clean(entry.label)
         label_value = sum(_value_of(s) for s in symbols)
+        label_target_value = (None if base is None
+                              else base * float(entry.target_pct or 0.0) / 100.0)
+        label_weights = weights_by_label.get(entry.label) or {}
         rows: List[SymbolRow] = []
 
         for sym in symbols:
@@ -370,6 +408,10 @@ def build_label_views(managed,
                 pct_of_label=(row_value / label_value * 100.0) if label_value else 0.0,
                 pct_of_total=(row_value / total_value * 100.0) if total_value else 0.0,
                 comment=comments.get((entry.label, sym)),
+                weight_pct=label_weights.get(sym),
+                target_value=(None if (label_target_value is None
+                                       or sym not in label_weights)
+                              else label_target_value * float(label_weights[sym]) / 100.0),
             ))
 
         rows.sort(key=lambda r: (-r.current_value, r.symbol))
@@ -381,9 +423,62 @@ def build_label_views(managed,
             cost_basis=sum(positions[s].cost_basis for s in symbols if s in positions),
             pct_of_total=(label_value / total_value * 100.0) if total_value else 0.0,
             rows=rows,
+            pct_of_base=(label_value / base * 100.0) if base else None,
+            target_value=label_target_value,
         ))
 
     return views
+
+
+@dataclass
+class UnallocatedRow:
+    """The free-buying-power row, at the TOP of the page's label list. Pure.
+
+    READ-ONLY and DERIVED, by decision. ``target_pct`` is ``100 - sum(label
+    targets)`` and there is NO stored column behind it: the reserve is implied by
+    the label targets, so a stored copy would be a divergence waiting to happen and
+    "allocating to it" is under-allocating everywhere else.
+
+    ``current_value`` is the account's AVAILABLE BUYING POWER -- what is actually
+    uninvested right now -- while ``target_value`` is what the targets say should
+    be. The two differ exactly when the book is off target, which is the whole
+    reason the row is worth drawing.
+
+    ``pct_of_base`` is the CURRENT figure as a share of the base, so it sits under
+    the same denominator as every ``LabelView.pct_of_base`` above it. ``None`` when
+    there is no base to divide by.
+
+    ``over_pct`` is non-zero only when the stored targets total MORE than 100. The
+    wizard refuses to submit such a set, but the PAGE renders whatever is stored --
+    including a set typed before the rule changed -- and a negative reserve read as
+    money the user could spend would be worse than saying nothing.
+    """
+    target_pct: float = 0.0
+    target_value: float = 0.0
+    current_value: float = 0.0
+    pct_of_base: Optional[float] = None
+    over_pct: float = 0.0
+
+
+def unallocated_row(views, *, base_notional: float,
+                    available_buying_power: float) -> UnallocatedRow:
+    """Build the derived free-buying-power row from the label views. Pure.
+
+    Sums ``target_pct`` across the views -- the stored targets, not anything
+    re-derived -- and reports the remainder in percent and money against
+    ``base_notional``, the SAME denominator those targets divide.
+    """
+    total = sum(float(v.target_pct or 0.0) for v in (views or []))
+    base = float(base_notional or 0.0)
+    remainder = max(0.0, 100.0 - total)
+    return UnallocatedRow(
+        target_pct=remainder,
+        target_value=base * remainder / 100.0,
+        current_value=float(available_buying_power or 0.0),
+        pct_of_base=((float(available_buying_power or 0.0) / base * 100.0)
+                     if base else None),
+        over_pct=max(0.0, total - 100.0),
+    )
 
 
 def managed_total_value(views) -> float:

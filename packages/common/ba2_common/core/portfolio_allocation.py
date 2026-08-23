@@ -13,12 +13,22 @@ Turns target percentages into per-symbol share deltas:
 When ``sum(bp_cost of buys) > available_buying_power`` every BUY scales down
 pro-rata and the plan records ``scale_factor``. Sells never scale.
 
-Percentages are validated to total 100 within ``LABEL_TOTAL_TOLERANCE_PCT`` (0.01
-PERCENTAGE POINTS) at BOTH levels: label targets across the account, and symbol
-weights within each label. That tolerance is tight enough to reject a naive 2dp
-even split -- ``3 x 33.33 == 99.99`` misses by a hair MORE than 0.01 -- so ALWAYS
-generate default percentages with ``even_split_pct``, which drops the remainder on
-the last slot and totals exactly 100.0. Never hand-roll a split.
+Percentages are validated within ``LABEL_TOTAL_TOLERANCE_PCT`` (0.01 PERCENTAGE
+POINTS), and the two levels have DIFFERENT rules:
+
+* LABEL targets across the account must total no MORE than 100. Under 100 is legal
+  and deliberate -- the engine deploys exactly ``sum(pct)%`` of the base and leaves
+  the rest as free buying power, which the plan records as ``reserved_pct`` -- and
+  is reported as an ADVISORY rather than an error.
+* SYMBOL weights within each label must still total EXACTLY 100. There is no
+  per-label reserve: ``compute_allocation`` multiplies those weights straight
+  through, so a 60% set would leave 40% of that label's money undeployed with
+  nothing on the plan to record it.
+
+The tolerance is tight enough to reject a naive 2dp even split -- ``3 x 33.33 ==
+99.99`` misses by a hair MORE than 0.01 -- so ALWAYS generate default percentages
+with ``even_split_pct``, which drops the remainder on the last slot and totals
+exactly 100.0. Never hand-roll a split.
 """
 
 import copy
@@ -76,7 +86,8 @@ __all__ = [
     "REASON_SCALED_PREFIX", "REASON_BELOW_MIN_ORDER_PREFIX",
     "REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_PREFIX",
     "WARNING_EMPTY_LABEL_FMT", "WARNING_PRECHECK_DISAGREED_FMT",
-    "ERROR_LABEL_TOTAL_FMT", "ERROR_LABEL_NEGATIVE_FMT", "ERROR_LABEL_DUPLICATE_FMT",
+    "ERROR_LABEL_TOTAL_FMT", "ADVISORY_LABEL_UNDER_FMT",
+    "ERROR_LABEL_NEGATIVE_FMT", "ERROR_LABEL_DUPLICATE_FMT",
     "ERROR_LABEL_NO_SYMBOLS_FMT", "ERROR_SYMBOL_TOTAL_FMT", "ERROR_SYMBOL_NEGATIVE_FMT",
     "ERROR_SYMBOL_DUPLICATE_FMT",
     # engine
@@ -321,7 +332,29 @@ WARNING_PRECHECK_DISAGREED_FMT = "broker precheck disagreed on {symbol} - re-sol
 
 # Validation messages from ``validate_label_targets``. Pinned so the UI and the
 # tests agree on the exact text.
-ERROR_LABEL_TOTAL_FMT = "label targets total {total:.2f}% - must total 100%"
+#: OVER 100 is the only hard rule left on the label totals (requirement 4). It has
+#: to stay hard: the plan cannot buy money the account does not have, and without
+#: this the buying-power scaler would silently shrink every row to fit instead.
+#: Names the OVERSHOOT as well as the total, because "118%" alone leaves the user
+#: doing the subtraction that tells them which box to change.
+ERROR_LABEL_TOTAL_FMT = "label targets total {total:.2f}% - over 100% by {over:.2f}%"
+
+#: UNDER 100 is legal (requirement 3): the solver already deploys exactly
+#: ``sum(pct)%`` of the base and leaves the rest as cash, so the remainder IS the
+#: free-buying-power reserve. ADVISORY, never blocking -- see
+#: ADVISORY_MESSAGE_FRAGMENTS -- but never silent either: "typed 60 instead of 80"
+#: and "wanted 40% in cash" produce identical numbers and only the user can tell
+#: them apart. That sentence plus the prominent Unallocated row is what makes
+#: relaxing the rule safe; do not ship one without the other.
+#:
+#: PERCENT only, no money. This validator is pure and takes no base notional, and
+#: the dollars belong on the Unallocated ROW, which has one and is where the user
+#: is looking.
+ADVISORY_LABEL_UNDER_FMT = "{unallocated:.2f}% left unallocated as free buying power"
+
+#: The fixed tail of the advisory, derived from the format so the two cannot drift.
+#: ``ADVISORY_MESSAGE_FRAGMENTS`` matches on it.
+_LABEL_UNDER_FRAGMENT = ADVISORY_LABEL_UNDER_FMT.split("}", 1)[1]
 ERROR_LABEL_NEGATIVE_FMT = "label '{label}' has a negative target ({pct:.2f}%)"
 ERROR_LABEL_DUPLICATE_FMT = "duplicate label '{label}'"
 ERROR_LABEL_NO_SYMBOLS_FMT = "label '{label}' has target {pct:.2f}% but no symbols"
@@ -397,9 +430,10 @@ class LabelTarget:
 
     ``target_pct`` is 1-100 of ``base_notional``. Across all managed labels of an
     account it must total no MORE than 100 before a REBALANCE may be submitted; the
-    remainder is deliberate free buying power. An empty ``symbols`` list cannot
-    absorb its percentage: the engine allocates it nothing and adds ``target_pct``
-    to ``AllocationPlan.unallocatable_pct``.
+    remainder is deliberate free buying power and is recorded as
+    ``AllocationPlan.reserved_pct``. An empty ``symbols`` list cannot absorb its
+    percentage: the engine allocates it nothing and adds ``target_pct`` to
+    ``AllocationPlan.unallocatable_pct`` instead -- that is a fault, not a reserve.
 
     ``previous_target_pct`` is a PURE CARRIER for the wizard's "Load last" button,
     on the same terms as ``SymbolTarget.previous_weight_pct``: read by the UI,
@@ -528,10 +562,16 @@ class AllocationPlan:
 
     ``scale_factor`` < 1.0 means every BUY was scaled down pro-rata because
     ``sum(bp_cost of buys) > available_buying_power``. Sells never scale.
-    ``unallocatable_pct`` is the share of the base that no label could absorb
-    (empty labels, skipped no-price symbols) and shows in the dry-run as cash
-    left over. ``required_buying_power`` is the POST-scaling figure -- what the
-    plan as displayed actually needs.
+    ``required_buying_power`` is the POST-scaling figure -- what the plan as
+    displayed actually needs.
+
+    TWO kinds of money end up as cash, and they are deliberately separate fields.
+    ``unallocatable_pct`` is the share of the base that no label COULD absorb
+    (empty labels, skipped no-price symbols) -- a fault, and something to fix.
+    ``reserved_pct`` / ``reserved_notional`` is what the user deliberately did not
+    allocate: ``100 - sum(label target_pct)``. Both show as cash left over on the
+    dry run, and telling them apart is the difference between "you asked for 30%
+    in cash" and "30% of your book had no price".
 
     ``base_notional`` carries TWO meanings depending on which solver built the
     plan: in a REBALANCE it is the ALLOCATABLE BASE (buying power plus the current
@@ -552,6 +592,15 @@ class AllocationPlan:
     bp_usage_pct: float = 0.0
     scale_factor: float = 1.0
     unallocatable_pct: float = 0.0
+    #: The DELIBERATE cash reserve: ``100 - sum(label target_pct)``, clamped at 0,
+    #: and the same share of ``base_notional`` in money. Kept SEPARATE from
+    #: ``unallocatable_pct``, which means "no label could absorb this" -- a fault
+    #: (an empty label, a no-price symbol). Merging them would leave the dry run
+    #: unable to tell a cash target from a pricing failure, which are opposite
+    #: problems with opposite fixes. Always 0.0 for an INVEST_LABEL plan, where
+    #: ``base_notional`` is the budget and "100 minus the percentages" means nothing.
+    reserved_pct: float = 0.0
+    reserved_notional: float = 0.0
     total_buy_value: float = 0.0
     total_sell_value: float = 0.0
     allow_fractional: bool = False
@@ -562,6 +611,13 @@ class AllocationPlan:
     #: what is held). Every "is this plan on target?" measurement reads it; without
     #: it the same arithmetic silently means two different things.
     allocation_basis: str = ALLOCATION_BASIS_POSITION
+    #: The label targets this plan was SOLVED with, for ``plan_json`` only. A stored
+    #: plan that cannot say which percentages produced it is not reproducible, and
+    #: nothing else on the plan carries them (a symbol in two labels merges into one
+    #: row, and a skipped no-price symbol's share vanishes into ``unallocatable_pct``).
+    #: Emphatically NOT the source for "load last" -- that is the ``previous_*``
+    #: columns, which survive a dry run the user cancelled.
+    labels: List[LabelTarget] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
 
     @property
@@ -592,11 +648,17 @@ class AllocationPlan:
             "bp_usage_pct": self.bp_usage_pct,
             "scale_factor": self.scale_factor,
             "unallocatable_pct": self.unallocatable_pct,
+            "reserved_pct": self.reserved_pct,
+            "reserved_notional": self.reserved_notional,
             "total_buy_value": self.total_buy_value,
             "total_sell_value": self.total_sell_value,
             "allow_fractional": self.allow_fractional,
             "valuation_mode": self.valuation_mode,
             "allocation_basis": self.allocation_basis,
+            "labels": [{"label": lt.label, "target_pct": lt.target_pct,
+                        "symbols": [{"symbol": st.symbol, "weight_pct": st.weight_pct}
+                                    for st in lt.symbols]}
+                       for lt in self.labels],
             "warnings": list(self.warnings),
         }
 
@@ -1009,9 +1071,22 @@ def validate_label_targets(labels: List[LabelTarget], *,
                            tolerance: float = LABEL_TOTAL_TOLERANCE_PCT) -> List[str]:
     """Validate a REBALANCE label set. Pure -- returns problems, never raises.
 
-    LABEL level: targets total 100 +/- ``tolerance`` (0.01 PERCENTAGE POINTS by
-    default, so 99.995 passes and 99.98 does not); no negative ``target_pct``; no
-    duplicate label names; every non-zero label has at least one symbol.
+    LABEL level: targets total no MORE than 100 +/- ``tolerance`` (0.01 PERCENTAGE
+    POINTS by default); no negative ``target_pct``; no duplicate label names; every
+    non-zero label has at least one symbol.
+
+    UNDER 100 IS LEGAL and produces an ADVISORY, not an error (requirement 3). The
+    solver already deploys exactly ``sum(pct)%`` of the base and leaves the rest as
+    cash -- verified: 70% of a 10,000 base gives 7,000 of buys, 3,000 of cash and no
+    warnings -- so the remainder is a deliberate free-buying-power reserve, not a
+    fault. It is still REPORTED, because "typed 60 instead of 80" and "wanted 40% in
+    cash" produce identical numbers; use ``blocking_messages`` to tell the two kinds
+    apart rather than testing the strings by hand.
+
+    SYMBOL weights inside a label are NOT relaxed with it. The reserve is a
+    label-level idea: a label whose weights total 60 leaves 40% of THAT label's
+    money undeployed with nothing on the plan to record it, because
+    ``compute_allocation`` multiplies the weights straight through.
 
     SYMBOL level, per label that HAS symbols: delegated in full to
     ``validate_symbol_weights`` (weights total 100 +/- the same ``tolerance``; no
@@ -1036,8 +1111,10 @@ def validate_label_targets(labels: List[LabelTarget], *,
     """
     errors = []
     total = sum(float(lt.target_pct or 0.0) for lt in labels or [])
-    if abs(total - 100.0) > tolerance:
-        errors.append(ERROR_LABEL_TOTAL_FMT.format(total=total))
+    if total > 100.0 + tolerance:
+        errors.append(ERROR_LABEL_TOTAL_FMT.format(total=total, over=total - 100.0))
+    elif total < 100.0 - tolerance:
+        errors.append(ADVISORY_LABEL_UNDER_FMT.format(unallocated=100.0 - total))
     seen = set()
     for lt in labels or []:
         pct = float(lt.target_pct or 0.0)
@@ -1304,7 +1381,16 @@ def compute_allocation(base_notional: float, available_buying_power: float,
     plan = AllocationPlan(base_notional=float(base_notional),
                           available_buying_power=float(available_buying_power),
                           allow_fractional=bool(allow_fractional),
-                          valuation_mode=valuation_mode)
+                          valuation_mode=valuation_mode,
+                          labels=list(labels or []))
+    # The DELIBERATE reserve, recorded before anything is sized. Clamped at 0: the
+    # validator refuses an over-100 set before a plan is ever solved, but this field
+    # is a money figure the dry-run footer prints and a negative reserve is not a
+    # thing. Kept out of ``unallocatable_pct``, which is for money no label COULD
+    # absorb -- see AllocationPlan.
+    plan.reserved_pct = max(0.0, 100.0 - sum(
+        float(lt.target_pct or 0.0) for lt in labels or []))
+    plan.reserved_notional = float(base_notional) * plan.reserved_pct / 100.0
     targets = {}
     target_pcts = {}
     sym_labels = {}
@@ -1523,7 +1609,10 @@ def compute_label_investment(label: LabelTarget, amount: float,
                           valuation_mode=valuation_mode,
                           # The target is money to DEPLOY, not a post-trade holding
                           # value: this run ADDS to whatever is already owned.
-                          allocation_basis=ALLOCATION_BASIS_BUDGET)
+                          allocation_basis=ALLOCATION_BASIS_BUDGET,
+                          # ``reserved_pct`` stays 0.0: base_notional IS the budget
+                          # here, so "100 minus the label percentages" means nothing.
+                          labels=[label] if label is not None else [])
     if not label.symbols:
         plan.unallocatable_pct = 100.0
         plan.warnings.append(WARNING_EMPTY_LABEL_FMT.format(label=label.label, pct=100.0))
@@ -1649,9 +1738,12 @@ def apply_order_impacts(plan: AllocationPlan, impacts: Dict[str, OrderImpact], *
         base_notional=plan.base_notional,
         available_buying_power=float(available_buying_power or 0.0),
         unallocatable_pct=plan.unallocatable_pct,
+        reserved_pct=plan.reserved_pct,
+        reserved_notional=plan.reserved_notional,
         allow_fractional=plan.allow_fractional,
         valuation_mode=plan.valuation_mode,
         allocation_basis=plan.allocation_basis,
+        labels=list(plan.labels),
         warnings=list(plan.warnings),
     )
     for row in out.rows:
@@ -2170,11 +2262,17 @@ def filter_plan_rows(plan: "AllocationPlan", selected_symbols: List[str]) -> "Al
         # nothing), which un-ticking a row does not alter. Dropping it would
         # silently report a plan as fully deployed when it never was.
         unallocatable_pct=plan.unallocatable_pct,
+        # Same reasoning as ``unallocatable_pct``: the reserve is a property of the
+        # TARGETS, which un-ticking a row does not change. Dropping it would report
+        # a plan as fully deployed when the user deliberately left cash aside.
+        reserved_pct=plan.reserved_pct,
+        reserved_notional=plan.reserved_notional,
         total_buy_value=buy_value,
         total_sell_value=sell_value,
         allow_fractional=plan.allow_fractional,
         valuation_mode=plan.valuation_mode,
         allocation_basis=plan.allocation_basis,
+        labels=list(plan.labels),
         warnings=list(plan.warnings),
     )
 
@@ -2194,6 +2292,8 @@ def summarise_plan(plan: "AllocationPlan", *, cash: float) -> Dict[str, float]:
     if cash is None:
         raise ValueError("summarise_plan: cash is None; the broker published no cash balance.")
     return {
+        "reserved_pct": plan.reserved_pct,
+        "reserved_notional": plan.reserved_notional,
         "total_sell_value": plan.total_sell_value,
         "total_buy_value": plan.total_buy_value,
         "net_buy_value": plan.net_buy_value,
@@ -2224,25 +2324,37 @@ WARNING_INVEST_EXCEEDS_BP_FMT = ("amount {amount:,.2f}" + _INVEST_EXCEEDS_BP_FRA
 #: Fragments identifying a message that EXPLAINS rather than blocks. Everything
 #: the validators produce blocks by default: a new error added without touching
 #: this tuple stops Submit, which is the safe direction to be wrong in.
-ADVISORY_MESSAGE_FRAGMENTS = (_INVEST_EXCEEDS_BP_FRAGMENT,)
+ADVISORY_MESSAGE_FRAGMENTS = (_INVEST_EXCEEDS_BP_FRAGMENT, _LABEL_UNDER_FRAGMENT)
 
 
-def even_split_targets(labels: List[LabelTarget]) -> List[LabelTarget]:
-    """The "Even split" button: every label gets an equal share of 100%.
+def even_split_targets(labels: List[LabelTarget], *,
+                       total_pct: float = 100.0) -> List[LabelTarget]:
+    """The "Even split" button: every label gets an equal share of ``total_pct``.
 
     Returns NEW LabelTarget objects with their own symbol LISTS (the SymbolTarget
     objects inside are shared, which is fine -- step 2 replaces a weight by
     assigning to the object the dialog is already editing), so the caller can
     still cancel out of the dialog without having mutated its inputs. The
-    remainder lands on the LAST label so the set totals exactly 100.
+    remainder lands on the LAST label so the set totals exactly ``total_pct``.
+
+    ``total_pct`` defaults to 100 and exists so that Even split does not WIPE a
+    reserve the user deliberately set aside: on a book held at 90% invested, an
+    even split of 100 silently deploys the last tenth. The scaling goes through
+    ``even_split_pct`` rather than re-deriving a split, and the remainder is put on
+    the last slot for the same reason it is there -- a naive 3 x 30.00 for 90 would
+    be fine, but 3 x 23.33 for 70 misses by 0.01 and the validator's tolerance is
+    exactly 0.01 percentage points.
     """
     items = list(labels or [])
     if not items:
         return []
+    parts = [round(float(total_pct) * pct / 100.0, 2)
+             for pct in even_split_pct(len(items))]
+    parts[-1] = round(float(total_pct) - sum(parts[:-1]), 2)
     return [LabelTarget(label=lt.label, target_pct=pct, symbols=list(lt.symbols),
                         comment=lt.comment,
                         previous_target_pct=lt.previous_target_pct)
-            for lt, pct in zip(items, even_split_pct(len(items)))]
+            for lt, pct in zip(items, parts)]
 
 
 def has_previous_targets(labels: Optional[List[LabelTarget]]) -> bool:

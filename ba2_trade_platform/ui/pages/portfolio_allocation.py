@@ -59,7 +59,8 @@ from ...core.portfolio_allocation import (
     ALLOCATION_MODE_INVEST_LABEL, ALLOCATION_MODE_REBALANCE,
     VALUATION_MODE_COST, VALUATION_MODE_MARKET,
     LabelTarget, SymbolTarget, build_base_snapshot, compute_allocation,
-    compute_label_investment, current_value, unconsumed_income_notice,
+    compute_base_notional, compute_label_investment, current_value,
+    unconsumed_income_notice,
 )
 from ...core.portfolio_allocation_store import (
     add_symbols_to_label, get_allocation_config, get_managed_labels, get_symbol_comments,
@@ -74,7 +75,8 @@ from ..utils.portfolio_allocation_view import (
     GateResult, ManagedLabel,
     PositionFetchFailed, build_label_views, collect_managed_symbols, diff_managed_labels,
     evaluate_gate, evaluate_market_gate, expert_shortname_families, managed_total_value,
-    missing_quote_symbols, picker_options, positions_by_symbol, working_orders_notice,
+    missing_quote_symbols, picker_options, positions_by_symbol, unallocated_row,
+    working_orders_notice,
 )
 from .portfolio_allocation_wizard import (
     open_allocation_steps, open_allocation_wizard, render_income_panel, render_outcomes,
@@ -132,6 +134,14 @@ def _load_view_payload(account_id: int, valuation_mode: str) -> Dict[str, Any]:
     in the payload so the render names the mode that produced the numbers next to
     them -- switching modes RE-COMPUTES rather than silently reinterpreting.
 
+    ALSO reads the account snapshot, which this function did not do at all before
+    W3: without buying power the page cannot show cash, cannot show the unallocated
+    group requirement 3 asks for, and cannot put the current and target percentages
+    under one denominator. The cost is bounded -- Alpaca caches the snapshot for 5s
+    -- and a broker that will not answer costs the RESERVE ROW, not the page:
+    ``base_notional`` and ``available_buying_power`` come back ``None`` and every
+    figure derived from them is omitted rather than guessed.
+
     Raises:
         PositionFetchFailed: the broker position fetch failed (NOT a flat account).
         RuntimeError: the account could not be instantiated.
@@ -158,16 +168,50 @@ def _load_view_payload(account_id: int, valuation_mode: str) -> Dict[str, Any]:
             logger.warning(f"Bulk price fetch returned {type(fetched).__name__}, "
                            f"expected a dict — rendering without prices")
 
+    # ``positions_by_symbol`` does not populate ``price`` -- quotes come from the
+    # bulk call above -- so stamp them on before anything measures a market value.
+    # ``build_label_views`` builds its own priced copy either way; what needs this
+    # is ``compute_base_notional`` below, which reads ``PositionState.price``
+    # directly and would otherwise value the whole book at 0 in market mode.
+    for symbol, state in positions.items():
+        if state.price is None:
+            state.price = prices.get(symbol)
+
     comments: Dict[tuple, str] = {}
+    weights: Dict[str, Dict[str, float]] = {}
     for entry in managed:
         for symbol, text in get_symbol_comments(account_id, entry.label).items():
             comments[(entry.label, symbol)] = text
+        weights[entry.label] = get_symbol_weights(
+            account_id, entry.label, symbols_by_label.get(entry.label, []))
+
+    buying_power = base_notional = None
+    try:
+        snapshot = account.get_account_snapshot()
+        if snapshot is not None and snapshot.buying_power is not None:
+            buying_power = float(snapshot.buying_power)
+            # Exactly ``compute_base_notional``'s rule, which is what the wizard's
+            # ``build_base_snapshot`` uses: buying power plus the DISTINCT managed
+            # value under the active mode. Anything else and the page's percentages
+            # would divide by a different base from the plan's.
+            base_notional = compute_base_notional(buying_power, positions, symbols,
+                                                  valuation_mode=valuation_mode)
+    except Exception as e:
+        # The label table is this page's job; buying power is a bonus on top of it.
+        # None propagates and the reserve row is simply not drawn -- better a
+        # missing row than one measured against a guessed base.
+        logger.warning(f"Account snapshot unavailable for account {account_id}: {e}; "
+                       f"the unallocated group and the % of base will be omitted")
 
     return {
         'views': build_label_views(managed, symbols_by_label, positions, prices, comments,
-                                   valuation_mode=valuation_mode),
+                                   valuation_mode=valuation_mode,
+                                   base_notional=base_notional,
+                                   symbol_weights=weights),
         'symbols_by_label': symbols_by_label,
         'valuation_mode': valuation_mode,
+        'base_notional': base_notional,
+        'available_buying_power': buying_power,
     }
 
 
@@ -672,6 +716,10 @@ def _render_label_body(account_id: int, view, refresh) -> None:
         'current_value': round(r.current_value, 2),
         'pct_of_label': round(r.pct_of_label, 2),
         'pct_of_total': round(r.pct_of_total, 2),
+        # None, never 0.0: a symbol with no stored weight and a page with no base
+        # notional have no target, and 0.00 there would be a claim rather than a gap.
+        'weight_pct': None if r.weight_pct is None else round(r.weight_pct, 2),
+        'target_value': None if r.target_value is None else round(r.target_value, 2),
         'quantity': round(r.quantity, 4),
         'cost_basis': round(r.cost_basis, 2),
         'price': None if r.price is None else round(r.price, 4),
@@ -686,6 +734,8 @@ def _render_label_body(account_id: int, view, refresh) -> None:
         {'name': 'current_value', 'label': 'Current value', 'field': 'current_value', 'sortable': True, 'align': 'right'},
         {'name': 'pct_of_label', 'label': '% of label', 'field': 'pct_of_label', 'sortable': True, 'align': 'right'},
         {'name': 'pct_of_total', 'label': '% of total', 'field': 'pct_of_total', 'sortable': True, 'align': 'right'},
+        {'name': 'weight_pct', 'label': 'Target %', 'field': 'weight_pct', 'sortable': True, 'align': 'right'},
+        {'name': 'target_value', 'label': 'Target value', 'field': 'target_value', 'sortable': True, 'align': 'right'},
         {'name': 'quantity', 'label': 'Qty', 'field': 'quantity', 'sortable': True, 'align': 'right'},
         {'name': 'cost_basis', 'label': 'Cost basis', 'field': 'cost_basis', 'sortable': True, 'align': 'right'},
         {'name': 'price', 'label': 'Price', 'field': 'price', 'sortable': True, 'align': 'right'},
@@ -742,6 +792,8 @@ def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
         return
 
     mode = payload['valuation_mode']
+    base_notional = payload['base_notional']
+    buying_power = payload['available_buying_power']
     mode_label = ('cost basis (what you paid)' if mode == VALUATION_MODE_COST
                   else 'market value (qty x price)')
     # NOT sum(v.current_value ...): that counts a symbol once per managed label,
@@ -754,6 +806,10 @@ def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
         with ui.column().classes('stat-card p-3'):
             ui.label('Managed labels').classes('text-xs text-secondary-custom')
             ui.label(str(len(views))).classes('text-lg font-bold')
+        if buying_power is not None:
+            with ui.column().classes('stat-card p-3'):
+                ui.label('Free buying power').classes('text-xs text-secondary-custom')
+                ui.label(f'${buying_power:,.2f}').classes('text-lg font-bold')
 
     # DANGER, not warning, since market became the default (W1). This is no longer
     # "your percentages are slightly off": those positions contribute 0 to the
@@ -778,9 +834,39 @@ def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
              'positions carry a negative quantity, cost basis and value.'
              ).classes('text-xs text-secondary-custom')
 
+    # The UNALLOCATED group, FIRST and not expandable: it is the row that explains
+    # why the others do not add up to the base, and below them it reads as a
+    # footnote. READ-ONLY and DERIVED (100 - the stored targets) -- you allocate to
+    # it by under-allocating elsewhere, so there is nothing here to edit. Omitted
+    # entirely when the broker gave no base: better a missing row than one measured
+    # against a guess.
+    if base_notional is not None and buying_power is not None:
+        reserve = unallocated_row(views, base_notional=base_notional,
+                                  available_buying_power=buying_power)
+        with ui.element('div').classes('alert-banner info w-full p-3'):
+            ui.label(f'Unallocated (free buying power) — ${reserve.current_value:,.2f} '
+                     f'({reserve.pct_of_base:.1f}% of base, target '
+                     f'{reserve.target_pct:.2f}% = ${reserve.target_value:,.2f})')
+            if reserve.over_pct:
+                ui.label(f'The stored label targets total '
+                         f'{100.0 + reserve.over_pct:.2f}% — over 100% by '
+                         f'{reserve.over_pct:.2f}%. Allocate will refuse this until '
+                         f'it comes back down.').classes('text-xs text-orange-400')
+
     for view in views:
-        header = (f'{view.label} — ${view.current_value:,.2f} '
-                  f'({view.pct_of_total:.1f}% of managed, target {view.target_pct:.1f}%)')
+        # ONE denominator when there is a base to use: ``pct_of_total`` divides by
+        # the managed value while ``target_pct`` is a share of buying power PLUS
+        # managed value, so printing them side by side invited a comparison that is
+        # false whenever buying power is non-zero. With no base, say which one was
+        # used rather than inventing the other.
+        if view.pct_of_base is not None:
+            header = (f'{view.label} — ${view.current_value:,.2f} '
+                      f'({view.pct_of_base:.1f}% of base, target {view.target_pct:.1f}% '
+                      f'= ${view.target_value:,.2f})')
+        else:
+            header = (f'{view.label} — ${view.current_value:,.2f} '
+                      f'({view.pct_of_total:.1f}% of managed, target '
+                      f'{view.target_pct:.1f}%)')
         with ui.expansion(header, icon='label').classes('w-full'):
             _render_label_body(account_id, view, refresh)
 

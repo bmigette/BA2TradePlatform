@@ -1158,3 +1158,126 @@ def test_a_working_refresh_keeps_the_old_two_sentences():
                                            refresh_failed=False)
     assert "1 order(s) still working" in text
     assert severity == "warning"
+
+
+# ---------------------------------------------------------------------------
+# W3: the page learns about buying power -- the reserve row, and ONE denominator.
+# ---------------------------------------------------------------------------
+
+def test_a_label_view_reports_its_share_of_the_base_when_it_is_given_one():
+    """``pct_of_total`` divides by the MANAGED value; ``target_pct`` is a share of
+    ``base_notional`` (buying power PLUS managed value). Whenever buying power is
+    non-zero those two are not comparable, and the page header printed them side by
+    side. ``pct_of_base`` is the one that IS comparable with the target."""
+    views = build_label_views([ManagedLabel('ARK26', 40.0)],
+                              {'ARK26': ['AAPL']},
+                              {'AAPL': _pos('AAPL', 10, 1000.0)},
+                              {'AAPL': 250.0},
+                              valuation_mode=VALUATION_MODE_MARKET,
+                              base_notional=10_000.0)
+    assert views[0].current_value == 2_500.0
+    assert views[0].pct_of_total == 100.0        # 100% of the managed value
+    assert views[0].pct_of_base == 25.0          # 25% of the allocatable base
+    assert views[0].target_value == 4_000.0      # 40% of 10,000
+
+
+def test_a_label_view_without_a_base_reports_none_rather_than_zero():
+    """No fallback for a number the caller did not supply: 0.00% of base would be a
+    fact, and a wrong one."""
+    views = build_label_views([ManagedLabel('ARK26', 40.0)], {'ARK26': ['AAPL']},
+                              {'AAPL': _pos('AAPL', 10, 1000.0)}, {'AAPL': 250.0},
+                              valuation_mode=VALUATION_MODE_MARKET)
+    assert views[0].pct_of_base is None
+    assert views[0].target_value is None
+
+
+def test_a_zero_base_reports_none_rather_than_dividing_by_it():
+    views = build_label_views([ManagedLabel('ARK26', 40.0)], {'ARK26': ['AAPL']},
+                              {}, {}, valuation_mode=VALUATION_MODE_MARKET,
+                              base_notional=0.0)
+    assert views[0].pct_of_base is None
+    assert views[0].target_value is None
+
+
+def test_a_symbol_row_carries_its_target_weight_and_the_money_that_implies():
+    """Requirement 2's "target" half at the instrument level: the page showed a
+    target once, on the group header, and never per symbol."""
+    views = build_label_views([ManagedLabel('ARK26', 40.0)],
+                              {'ARK26': ['AAPL', 'MSFT']},
+                              {'AAPL': _pos('AAPL', 10, 1000.0)},
+                              {'AAPL': 250.0, 'MSFT': 100.0},
+                              valuation_mode=VALUATION_MODE_MARKET,
+                              base_notional=10_000.0,
+                              symbol_weights={'ARK26': {'AAPL': 75.0, 'MSFT': 25.0}})
+    by_symbol = {r.symbol: r for r in views[0].rows}
+    assert by_symbol['AAPL'].weight_pct == 75.0
+    # 40% of 10,000 is 4,000 for the label; 75% of that is 3,000.
+    assert by_symbol['AAPL'].target_value == 3_000.0
+    assert by_symbol['MSFT'].target_value == 1_000.0
+
+
+def test_a_symbol_row_without_stored_weights_reports_none():
+    views = build_label_views([ManagedLabel('ARK26', 40.0)], {'ARK26': ['AAPL']},
+                              {'AAPL': _pos('AAPL', 10, 1000.0)}, {'AAPL': 250.0},
+                              valuation_mode=VALUATION_MODE_MARKET,
+                              base_notional=10_000.0)
+    assert views[0].rows[0].weight_pct is None
+    assert views[0].rows[0].target_value is None
+
+
+def test_the_unallocated_row_is_the_remainder_in_percent_and_dollars():
+    """READ-ONLY DERIVED: 100 - sum(targets), shown against the SAME base the
+    targets divide. Its "current" is the account's free buying power."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import unallocated_row
+
+    views = build_label_views([ManagedLabel('ARK26', 40.0), ManagedLabel('TECH', 30.0)],
+                              {'ARK26': ['AAPL'], 'TECH': ['MSFT']}, {}, {},
+                              valuation_mode=VALUATION_MODE_MARKET,
+                              base_notional=10_000.0)
+
+    row = unallocated_row(views, base_notional=10_000.0, available_buying_power=2_500.0)
+
+    assert row.target_pct == 30.0
+    assert row.target_value == 3_000.0
+    assert row.current_value == 2_500.0
+    assert row.pct_of_base == 25.0
+
+
+def test_the_unallocated_row_never_reports_a_negative_reserve():
+    """The wizard blocks an over-100 set, but this row is also drawn on the PAGE,
+    where the stored targets can be anything -- including a set typed before the
+    rule changed."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import unallocated_row
+
+    views = build_label_views([ManagedLabel('ARK26', 130.0)], {'ARK26': ['AAPL']}, {},
+                              {}, valuation_mode=VALUATION_MODE_MARKET,
+                              base_notional=10_000.0)
+
+    row = unallocated_row(views, base_notional=10_000.0, available_buying_power=0.0)
+
+    assert row.target_pct == 0.0
+    assert row.target_value == 0.0
+    assert row.over_pct == 30.0
+
+
+def test_the_unallocated_row_of_a_fully_allocated_account_is_zero_not_absent():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import unallocated_row
+
+    views = build_label_views([ManagedLabel('ARK26', 100.0)], {'ARK26': ['AAPL']}, {},
+                              {}, valuation_mode=VALUATION_MODE_MARKET,
+                              base_notional=10_000.0)
+
+    row = unallocated_row(views, base_notional=10_000.0, available_buying_power=100.0)
+
+    assert (row.target_pct, row.target_value, row.over_pct) == (0.0, 0.0, 0.0)
+    assert row.current_value == 100.0
+
+
+def test_the_unallocated_row_tolerates_a_zero_base():
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import unallocated_row
+
+    row = unallocated_row([], base_notional=0.0, available_buying_power=0.0)
+
+    assert row.target_pct == 100.0
+    assert row.target_value == 0.0
+    assert row.pct_of_base is None
