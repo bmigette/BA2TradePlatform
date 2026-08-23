@@ -104,7 +104,10 @@ __all__ = [
     "ERROR_LABEL_NO_SYMBOLS_FMT", "ERROR_SYMBOL_TOTAL_FMT", "ERROR_SYMBOL_NEGATIVE_FMT",
     "ERROR_SYMBOL_DUPLICATE_FMT",
     # engine
-    "current_value", "round_quantity", "round_delta_quantity", "even_split_pct",
+    "current_value", "UnrealisedPnL", "unrealised_pnl", "format_unrealised_pnl",
+    "PNL_UNMEASURABLE_MARK", "PNL_NO_PRICE_MARK", "PNL_PCT_FMT", "PNL_NO_COST_NOTE",
+    "PNL_UNPRICED_FMT", "PNL_FMT",
+    "round_quantity", "round_delta_quantity", "even_split_pct",
     "split_pct_across",
     "build_symbol_targets", "validate_symbol_weights", "validate_label_targets",
     "validate_unallocated_pct", "clamp_unallocated_pct",
@@ -778,6 +781,141 @@ def current_value(state: Optional[PositionState], valuation_mode: str) -> float:
             return 0.0
         return float(state.quantity or 0.0) * float(state.price)
     return float(state.cost_basis or 0.0)
+
+
+#: Drawn where an unrealised P&L would be when NOTHING is held. A dash, never a
+#: 0.00: "there is no position" and "this position is exactly break-even" are
+#: different facts and only one of them is worth a number.
+PNL_UNMEASURABLE_MARK = '-'
+
+#: Drawn when something IS held and not one lot of it could be priced. Names the
+#: reason, because here the dash is a MISSING measurement rather than an absent
+#: position -- a failed quote reading as "flat" or "break-even" is the incident
+#: class this whole module keeps guarding against.
+PNL_NO_PRICE_MARK = '- (no price)'
+
+#: The percentage half of the P&L string, inside the parentheses.
+PNL_PCT_FMT = '{pct:+.2f}%'
+
+#: Replaces the percentage when the cost basis is zero. There is no return on
+#: nothing, and a 0.00% or an inf there would both be inventions.
+PNL_NO_COST_NOTE = 'no cost basis'
+
+#: Appended inside the parentheses when the figure left holdings out. Same rule and
+#: nearly the same words as the dry run's "Held value" total: unpriced rows are
+#: EXCLUDED from the money and COUNTED in the sentence.
+PNL_UNPRICED_FMT = '{count} unpriced excluded'
+
+#: The whole thing: signed money, then the notes. The SIGN is what makes the column
+#: readable without colour -- colour is an accent here, never the message.
+PNL_FMT = '{amount:+,.2f} ({notes})'
+
+
+@dataclass
+class UnrealisedPnL:
+    """Unrealised profit on one holding, or on a group of them. Pure data.
+
+    ``amount`` is ``market_value - cost_basis`` -- SIGNED, and already correct for
+    a short: a short is stored signed negative (quantity, cost basis and market
+    value all), so a short that fell in price has a market value less negative than
+    its basis and nets out positive.
+
+    ``pct`` divides by ``abs_cost_basis`` -- ``sum(abs(cost))`` and NOT
+    ``abs(sum(cost))``. Two independent reasons, and they point the same way:
+
+    * a profitable short divided by its own signed basis renders as a LOSS; and
+    * a hedged label's signed cost basis nets towards zero, so ``abs(sum(cost))``
+      is a division by zero on a label that made real money, while the gross
+      capital deployed is a perfectly ordinary number.
+
+    For a single position the two are identical, so the per-symbol figure and the
+    per-label figure are the same rule at two scopes rather than two rules.
+
+    ``amount`` and ``pct`` are ``None``, never 0.0, when they cannot be measured:
+    ``amount`` when nothing could be priced, ``pct`` additionally when the priced
+    holdings cost nothing. A fabricated 0.00 in a money column is the failure mode
+    that has actually cost this platform money.
+
+    ``priced`` / ``unpriced`` count HOLDINGS, not symbols: a flat or absent symbol
+    is in neither, so a healthy label does not permanently report exclusions for
+    the managed symbols it happens not to own.
+    """
+    amount: Optional[float] = None
+    pct: Optional[float] = None
+    market_value: float = 0.0
+    cost_basis: float = 0.0
+    abs_cost_basis: float = 0.0
+    priced: int = 0
+    unpriced: int = 0
+
+
+def unrealised_pnl(states) -> UnrealisedPnL:
+    """Unrealised P&L over ``states``: money and percent. Pure; never raises.
+
+    **Takes no ``valuation_mode``, deliberately, and must never grow one.** In
+    COST valuation ``current_value`` IS the cost basis, so a P&L derived from the
+    mode-aware "current value" is identically 0.00 -- a column that silently reads
+    break-even for every position on the account's default mode. The true market
+    value is the only input from which this question has an answer, so it is the
+    only one taken.
+
+    Market value is ``quantity x price`` from the LIVE quote, exactly as
+    ``current_value(state, VALUATION_MODE_MARKET)`` defines it, and
+    ``PositionState.market_value`` -- the broker's own stamped figure -- is
+    deliberately not consulted even as a fallback. It can be stamped at a different
+    price (a previous close, a delayed quote), and mixing the two bases inside one
+    total is precisely why ``LabelView`` has no label-level market value any more.
+    A holding whose price is missing is therefore EXCLUDED and counted, never
+    valued at 0.
+
+    Args:
+        states: an iterable of ``Optional[PositionState]``. ``None`` entries and
+            genuinely flat states (no quantity AND no cost) are skipped entirely.
+            Pass one state for a symbol, or a label's whole membership for the
+            label total -- the label figure is then the same summation, which is
+            what makes it money-weighted rather than a mean of the symbols'
+            percentages.
+
+    Returns:
+        UnrealisedPnL: over the PRICED holdings only, with the unpriced counted.
+    """
+    out = UnrealisedPnL()
+    for state in (states or []):
+        if state is None:
+            continue
+        quantity = float(state.quantity or 0.0)
+        cost = float(state.cost_basis or 0.0)
+        if abs(quantity) <= QUANTITY_EPSILON and abs(cost) <= MONEY_EPSILON:
+            continue                      # flat: nothing owned, nothing paid
+        price = state.price
+        if price is None or float(price) <= 0:
+            out.unpriced += 1
+            continue
+        out.priced += 1
+        out.market_value += quantity * float(price)
+        out.cost_basis += cost
+        out.abs_cost_basis += abs(cost)
+
+    if out.priced:
+        out.amount = out.market_value - out.cost_basis
+        if out.abs_cost_basis > MONEY_EPSILON:
+            out.pct = out.amount / out.abs_cost_basis * 100.0
+    return out
+
+
+def format_unrealised_pnl(pnl: UnrealisedPnL) -> str:
+    """Render an ``UnrealisedPnL`` for a caption. Pure.
+
+    Lives beside the arithmetic rather than in the wizard because every branch here
+    is a DECISION about what may be shown -- blank versus 0.00, a percentage versus
+    "no cost basis" -- and those are exactly the ones worth pinning without NiceGUI.
+    """
+    if pnl.amount is None:
+        return PNL_NO_PRICE_MARK if pnl.unpriced else PNL_UNMEASURABLE_MARK
+    notes = [PNL_NO_COST_NOTE if pnl.pct is None else PNL_PCT_FMT.format(pct=pnl.pct)]
+    if pnl.unpriced:
+        notes.append(PNL_UNPRICED_FMT.format(count=pnl.unpriced))
+    return PNL_FMT.format(amount=pnl.amount, notes=', '.join(notes))
 
 
 def _round_shares(raw: float, margin: Optional[MarginInfo], *,

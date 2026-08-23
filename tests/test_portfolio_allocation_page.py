@@ -1632,7 +1632,7 @@ def test_the_wizard_opens_with_the_previous_targets_attached(monkeypatch, accoun
                             positions=[], prices={'AAPL': 100.0, 'MSFT': 100.0})
     _use_account(monkeypatch, account)
 
-    base, labels, allow_fractional, _values, _reserve = page._load_flow_inputs(
+    base, labels, allow_fractional, _values, _pos, _reserve = page._load_flow_inputs(
         account_id, VALUATION_MODE_MARKET)
 
     assert labels[0].target_pct == 80.0
@@ -1651,7 +1651,7 @@ def test_a_label_with_no_history_opens_with_no_previous_target(monkeypatch, acco
                             positions=[], prices={'AAPL': 100.0})
     _use_account(monkeypatch, account)
 
-    _base, labels, _frac, _values, _reserve = page._load_flow_inputs(
+    _base, labels, _frac, _values, _pos, _reserve = page._load_flow_inputs(
         account_id, VALUATION_MODE_MARKET)
 
     assert labels[0].previous_target_pct is None
@@ -1669,7 +1669,7 @@ def test_the_flow_hands_the_wizard_each_symbols_current_value(monkeypatch, accou
                             prices={'AAPL': 250.0})
     _use_account(monkeypatch, account)
 
-    _base, _labels, _frac, symbol_values, _reserve = page._load_flow_inputs(
+    _base, _labels, _frac, symbol_values, _pos, _reserve = page._load_flow_inputs(
         account_id, VALUATION_MODE_MARKET)
 
     assert symbol_values == {'AAPL': 2_500.0}
@@ -1684,7 +1684,7 @@ def test_the_flow_values_the_same_book_at_cost_when_that_is_the_mode(monkeypatch
                             prices={'AAPL': 250.0})
     _use_account(monkeypatch, account)
 
-    _base, _labels, _frac, symbol_values, _reserve = page._load_flow_inputs(
+    _base, _labels, _frac, symbol_values, _pos, _reserve = page._load_flow_inputs(
         account_id, VALUATION_MODE_COST)
 
     assert symbol_values == {'AAPL': 1_000.0}
@@ -2164,3 +2164,55 @@ def test_the_wizards_refresh_re_solves_with_the_SAME_reserve(monkeypatch,
     assert plan.reserved_pct == 10.0
     assert plan.reserved_notional == 1_000.0
     assert plan.total_buy_value == 9_000.0
+
+
+# ---------------------------------------------------------------------------
+# Unrealised P&L: the wizard needs the POSITIONS, not just their current value.
+#
+# ``symbol_values`` is measured under the account's valuation mode, and in COST
+# mode that IS the cost basis -- so a P&L derived from it is 0.00 on every row.
+# The flow therefore hands the dialog the position states themselves.
+# ---------------------------------------------------------------------------
+
+def test_the_flow_hands_the_wizard_the_position_states_themselves(monkeypatch,
+                                                                 account_id):
+    """Quantity, cost basis and PRICE, separately -- which is the only shape from
+    which an unrealised P&L can be measured in either valuation mode."""
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL'], 'ARK26')
+    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
+                            positions=[_held('AAPL', 10, 1000.0, 1100.0)],
+                            prices={'AAPL': 250.0})
+    _use_account(monkeypatch, account)
+
+    *_rest, positions, _reserve = page._load_flow_inputs(account_id, VALUATION_MODE_COST)
+
+    assert set(positions) == {'AAPL'}
+    assert positions['AAPL'].quantity == 10.0
+    assert positions['AAPL'].cost_basis == 1_000.0
+    # The LIVE quote, present even in COST mode -- without it the P&L would be
+    # blank on exactly the mode that most needs it.
+    assert positions['AAPL'].price == 250.0
+
+
+def test_the_flow_passes_the_positions_into_the_steps_dialog(monkeypatch,
+                                                             nicegui_client,
+                                                             account_id):
+    """The dialog is the only consumer, so an unwired map is an unwired feature."""
+    set_managed_label(account_id, 'ARK26', target_pct=100.0)
+    add_label_to_instruments(['AAPL'], 'ARK26')
+    account = _AllocAccount(account_id, {'manual_trading_enabled': True},
+                            positions=[_held('AAPL', 10, 1000.0, 1100.0)],
+                            prices={'AAPL': 250.0})
+    _use_account(monkeypatch, account)
+    _capture_notifications(monkeypatch)
+    steps = {}
+    monkeypatch.setattr(page, 'open_allocation_steps',
+                        lambda *a, **kw: steps.update(kw, base=a[0], labels=a[1]))
+
+    _run_in_client(nicegui_client, lambda: page._open_allocation_flow(
+        account_id, VALUATION_MODE_MARKET, _noop_refresh))
+
+    assert set(steps['positions']) == {'AAPL'}
+    assert steps['positions']['AAPL'].cost_basis == 1_000.0
+    assert steps['positions']['AAPL'].price == 250.0

@@ -42,7 +42,9 @@ from ...core.portfolio_allocation import (
     AllocationPlan,
     BaseSnapshot,
     LabelTarget,
+    PositionState,
     SymbolTarget,
+    UnrealisedPnL,
     blocking_messages,
     bump_notice,
     can_even_split_symbols,
@@ -54,6 +56,7 @@ from ...core.portfolio_allocation import (
     even_split_targets,
     fill_remaining_symbol_weights,
     filter_plan_rows,
+    format_unrealised_pnl,
     fractional_summary,
     LABEL_TOTAL_TOLERANCE_PCT,
     has_previous_symbol_weights,
@@ -70,6 +73,7 @@ from ...core.portfolio_allocation import (
     steps_validation_messages,
     summarise_plan,
     unconsumed_income_notice,
+    unrealised_pnl,
     whole_share_notice,
     wipe_symbol_weights,
 )
@@ -282,6 +286,20 @@ MARKER_WIPE_SYMBOLS = 'steps-wipe-symbols'
 MARKER_LABEL_CURRENT = 'steps-label-current'
 MARKER_SYMBOL_CURRENT = 'steps-symbol-current'
 
+#: Markers on the UNREALISED P&L captions -- per label in step 1, per symbol in
+#: step 2. A SEPARATE ``ui.label`` from the "now / last" caption beside it, not a
+#: fourth clause inside it, for one reason: this is the only figure on the line
+#: whose sign carries a verdict, so it is the only one that can be coloured, and
+#: NiceGUI colours whole elements. It is still a ``ui.label`` and not a second
+#: marked ``ui.number``, for the reason spelled out on the pair above.
+MARKER_LABEL_PNL = 'steps-label-pnl'
+MARKER_SYMBOL_PNL = 'steps-symbol-pnl'
+
+#: The P&L caption. The body comes from the engine's ``format_unrealised_pnl``,
+#: which owns every "may this be shown at all" branch -- blank versus 0.00, a
+#: percentage versus "no cost basis" -- so this string adds a name and nothing else.
+PNL_CAPTION_FMT = 'P&L {pnl}'
+
 #: Drawn where a percentage would be when there is no last. A dash, never 0.00%:
 #: "this has never run" and "last time this got nothing" are different facts, and
 #: 0.00% is a legitimate value of the second.
@@ -342,6 +360,21 @@ def _shares(quantity: float) -> str:
     broker's own grid. ``or '0'`` catches exactly 0.0, which strips to ''.
     """
     return f"{quantity:,.5f}".rstrip('0').rstrip('.') or '0'
+
+
+def _pnl_classes(pnl: UnrealisedPnL) -> str:
+    """CSS for a P&L caption. Pure; no ``ui`` call.
+
+    Colour is an ACCENT and never the message: ``format_unrealised_pnl`` signs both
+    numbers, so the caption reads correctly in monochrome, to a colour-blind user
+    and in a screen reader. Grey covers three different things on purpose --
+    nothing measurable, nothing held, and a genuine flat 0.00 -- because none of
+    them is a verdict, and painting "break-even" green or red would invent one.
+    """
+    if pnl.amount is None or abs(pnl.amount) <= MONEY_EPSILON:
+        return 'text-xs text-secondary-custom'
+    return 'text-xs font-medium ' + ('text-green-500' if pnl.amount > 0
+                                     else 'text-red-500')
 
 
 def _leverage_cell(row: Dict) -> Tuple[str, str, str]:
@@ -1027,6 +1060,7 @@ class AllocationSteps:
                  mode: str = ALLOCATION_MODE_REBALANCE,
                  invest_amount: float = 0.0,
                  symbol_values: Optional[Dict[str, float]] = None,
+                 positions: Optional[Dict[str, PositionState]] = None,
                  unallocated_pct: float = 0.0):
         self.base = base
         # The deep copy carries ``previous_*`` across UNCHANGED. They are what the
@@ -1048,6 +1082,17 @@ class AllocationSteps:
         #: draws 0.00 rather than guessing -- these are display-only and touch no
         #: target, so a missing map costs a caption and never a number that trades.
         self.symbol_values = dict(symbol_values or {})
+        #: ``{SYMBOL: PositionState}``, the SAME map the base snapshot was built
+        #: from. It is here and ``symbol_values`` is not enough because the
+        #: unrealised P&L may not be measured on the account's valuation mode: in
+        #: COST mode ``current_value`` IS the cost basis, so a P&L taken from
+        #: ``symbol_values`` is 0.00 on every row. These carry ``price``,
+        #: ``quantity`` and ``cost_basis`` separately, which is the only input from
+        #: which the question has an answer in both modes.
+        #:
+        #: ``{}`` when the caller supplied none, which draws a DASH rather than a
+        #: zero -- no position data is "not measurable", not "break-even".
+        self.positions = dict(positions or {})
         # The account's REMEMBERED choice (defaults ON), still vetoed by a broker
         # that cannot do fractional at all. Per-symbol eligibility is the engine's
         # job -- MarginInfo.fractionable -- not this switch's.
@@ -1160,6 +1205,27 @@ class AllocationSteps:
             target=effective_target_pct(lt.target_pct, self.unallocated_pct),
             previous=previous)
 
+    def _label_pnl(self, lt: LabelTarget) -> UnrealisedPnL:
+        """The label's TOTAL unrealised P&L, over its symbols' summed money.
+
+        ONE call over the whole membership, not a combination of per-symbol
+        results, and that is what makes the percentage money-weighted: the engine
+        sums market value and gross cost first and divides once. Averaging the
+        symbols' own percentages would weight a 1,000 holding exactly as heavily as
+        the 90,000 one beside it.
+        """
+        return unrealised_pnl([self.positions.get(st.symbol) for st in lt.symbols])
+
+    def _symbol_pnl(self, st: SymbolTarget) -> UnrealisedPnL:
+        """One symbol's unrealised P&L -- the same function at a scope of one, so a
+        row and the label above it cannot be measured by two different rules."""
+        return unrealised_pnl([self.positions.get(st.symbol)])
+
+    def _draw_pnl(self, pnl: UnrealisedPnL, marker: str) -> None:
+        """Draw one P&L caption. The arithmetic AND the wording are the engine's."""
+        ui.label(PNL_CAPTION_FMT.format(pnl=format_unrealised_pnl(pnl))) \
+            .classes(_pnl_classes(pnl)).mark(marker)
+
     def _draw_label_targets(self):
         self._labels_container.clear()
         # Rebuilt with the rows: the old ui.label objects have just been discarded,
@@ -1196,6 +1262,12 @@ class AllocationSteps:
                     caption = ui.label(self._label_current_caption(lt)) \
                         .classes('text-xs text-secondary-custom').mark(MARKER_LABEL_CURRENT)
                     self._label_captions.append((lt, caption))
+                    # NOT in ``_label_captions`` and NOT refreshed by
+                    # ``_redraw_derived_row``: the P&L is measured off the frozen
+                    # positions and prices the dialog opened with, so no keystroke
+                    # in a target or reserve box can move it. It is rebuilt here
+                    # whenever the row is, which is the only time it can change.
+                    self._draw_pnl(self._label_pnl(lt), MARKER_LABEL_PNL)
 
     def _symbol_current_caption(self, st: SymbolTarget) -> str:
         previous = (NO_PREVIOUS_MARK if st.previous_weight_pct is None
@@ -1296,6 +1368,7 @@ class AllocationSteps:
                               ).props('dense outlined').classes('w-32').mark(MARKER_SYMBOL_PCT)
                     ui.label(self._symbol_current_caption(st)) \
                         .classes('text-xs text-secondary-custom').mark(MARKER_SYMBOL_CURRENT)
+                    self._draw_pnl(self._symbol_pnl(st), MARKER_SYMBOL_PNL)
 
     def _render_invest_scope(self):
         ui.label('1. Which label, and how much').classes('text-lg font-bold mt-2')
@@ -1545,6 +1618,7 @@ def open_allocation_steps(base: BaseSnapshot, labels: List[LabelTarget], *,
                           mode: str = ALLOCATION_MODE_REBALANCE,
                           invest_amount: float = 0.0,
                           symbol_values: Optional[Dict[str, float]] = None,
+                          positions: Optional[Dict[str, PositionState]] = None,
                           unallocated_pct: float = 0.0
                           ) -> AllocationSteps:
     """Open steps 1-3. ``on_dry_run`` is called with keyword arguments
@@ -1559,10 +1633,18 @@ def open_allocation_steps(base: BaseSnapshot, labels: List[LabelTarget], *,
 
     ``unallocated_pct`` DOES default, to 0, and the asymmetry is deliberate: "no
     reserve" is both the safe answer and the true one for an account that has never
-    set one, whereas there is no fractional answer that is right by omission."""
+    set one, whereas there is no fractional answer that is right by omission.
+
+    ``positions`` is ``{SYMBOL: PositionState}`` and drives the UNREALISED P&L
+    captions only. It is optional and defaults to nothing, on the same terms as
+    ``symbol_values``: the figures are display-only, they reach no plan, and a
+    caller without them draws a dash rather than a fabricated 0.00. It is a
+    separate argument from ``symbol_values`` because the P&L may NOT be derived
+    from a mode-aware current value -- see ``AllocationSteps.positions``."""
     steps = AllocationSteps(base, labels, on_dry_run=on_dry_run,
                             allow_fractional=allow_fractional, mode=mode,
                             invest_amount=invest_amount, symbol_values=symbol_values,
+                            positions=positions,
                             unallocated_pct=unallocated_pct)
     steps.open()
     return steps

@@ -117,16 +117,32 @@ def test_wizard_carries_the_plans_fractional_setting_into_the_toggle():
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture
-def nicegui_client():
+def _fresh_client():
+    """A SECOND client, for a test that has to draw the same dialog twice.
+
+    The fixture yields one client per test, and everything drawn into it stays
+    there; a test comparing two renders of the same dialog would otherwise read
+    both sets of markers out of one layout and could not tell them apart.
+    """
     from nicegui.client import Client
     from nicegui.page import page as nicegui_page
 
-    client = Client(nicegui_page('/test-allocation-wizard'), request=None)
+    return Client(nicegui_page('/test-allocation-wizard'), request=None)
+
+
+def _drop_client(client):
+    from nicegui.client import Client
+
+    Client.instances.pop(client.id, None)
+
+
+@pytest.fixture
+def nicegui_client():
+    client = _fresh_client()
     try:
         yield client
     finally:
-        Client.instances.pop(client.id, None)
+        _drop_client(client)
 
 
 def _rendered_texts(element) -> list:
@@ -2969,3 +2985,223 @@ def test_the_cash_versus_reserve_line_follows_the_ticked_rows(nicegui_client):
         drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_CASH_VS_RESERVE)
 
     assert '10,000.00' in drawn[0]
+
+
+# ---------------------------------------------------------------------------
+# Unrealised P&L in the steps dialog: per symbol in step 2, per label in step 1.
+#
+# The arithmetic is pinned without NiceGUI in
+# ``packages/common/tests/test_portfolio_allocation_wizard.py``. What is pinned
+# HERE is that the dialog reaches for the mode-independent figure rather than for
+# the ``symbol_values`` map sitting right next to it -- which is the mistake that
+# renders 0.00 on every row in cost mode.
+# ---------------------------------------------------------------------------
+
+
+def _pnl_positions():
+    """One winner, one loser, one profitable short, across the standard labels.
+
+    Growth: AAPL 10 @ cost 1,500 now 1,600 (+100); MSFT 5 @ cost 2,000 now 1,900
+    (-100). Income: KO short 10 @ cost -600 now -500 (+100 on a short).
+    """
+    from ba2_trade_platform.core.portfolio_allocation import PositionState
+
+    return {
+        'AAPL': PositionState(symbol='AAPL', quantity=10.0, cost_basis=1_500.0, price=160.0),
+        'MSFT': PositionState(symbol='MSFT', quantity=5.0, cost_basis=2_000.0, price=380.0),
+        'KO': PositionState(symbol='KO', quantity=-10.0, cost_basis=-600.0, price=50.0),
+    }
+
+
+def _values_for(positions, mode):
+    """``{SYMBOL: current value}`` exactly as ``_load_flow_inputs`` builds it."""
+    from ba2_trade_platform.core.portfolio_allocation import current_value
+
+    return {s: current_value(state, mode) for s, state in positions.items()}
+
+
+def test_step_two_shows_each_symbols_unrealised_pnl_in_money_and_percent(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    positions = _pnl_positions()
+    _open_steps(nicegui_client, wiz,
+                symbol_values=_values_for(positions, 'market'), positions=positions)
+    drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_SYMBOL_PNL)
+
+    assert len(drawn) == 3
+    assert '+100.00' in drawn[0] and '+6.67%' in drawn[0]      # AAPL
+    assert '-100.00' in drawn[1] and '-5.00%' in drawn[1]      # MSFT
+    assert '+100.00' in drawn[2] and '+16.67%' in drawn[2]     # KO, a SHORT
+
+
+def test_step_one_shows_each_labels_TOTAL_unrealised_pnl(nicegui_client):
+    """Growth is +100 on AAPL and -100 on MSFT: zero dollars on 3,500 of cost."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    positions = _pnl_positions()
+    _open_steps(nicegui_client, wiz,
+                symbol_values=_values_for(positions, 'market'), positions=positions)
+    drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_LABEL_PNL)
+
+    assert len(drawn) == 2
+    assert '+0.00 (+0.00%)' in drawn[0], drawn[0]
+    assert '+100.00 (+16.67%)' in drawn[1], drawn[1]
+
+
+def test_the_pnl_is_IDENTICAL_in_cost_and_market_valuation(nicegui_client):
+    """THE defect this feature is easiest to ship with.
+
+    In cost mode ``current_value`` IS the cost basis, so a P&L taken from the
+    ``symbol_values`` map beside it is exactly 0.00 on every row -- silently
+    useless, and useless in the direction that reads as a fact. The P&L must come
+    from the true market value whichever mode the account is on, and the "now"
+    figures moving between the two runs is what proves the modes really differed.
+    """
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    positions = _pnl_positions()
+    in_mode = {}
+    for mode in ('cost', 'market'):
+        client = _fresh_client()
+        try:
+            _open_steps(client, wiz, symbol_values=_values_for(positions, mode),
+                        positions=positions)
+            in_mode[mode] = (
+                _marked_texts(client.layout, wiz.MARKER_SYMBOL_PNL),
+                _marked_texts(client.layout, wiz.MARKER_LABEL_PNL),
+                _marked_texts(client.layout, wiz.MARKER_SYMBOL_CURRENT),
+            )
+        finally:
+            _drop_client(client)
+
+    assert in_mode['cost'][0] == in_mode['market'][0]      # per symbol
+    assert in_mode['cost'][1] == in_mode['market'][1]      # per label
+    # ...and the modes really were different: "now" is the cost basis in one and
+    # the live value in the other.
+    assert in_mode['cost'][2] != in_mode['market'][2]
+    assert 'now 1,500.00' in in_mode['cost'][2][0]
+    assert 'now 1,600.00' in in_mode['market'][2][0]
+
+
+def test_a_profitable_short_is_not_rendered_as_a_loss(nicegui_client):
+    """Sold KO at 60, now 50: +100 on 600 of basis. Dividing by the SIGNED basis
+    turns that into -16.67% -- a winner painted red."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    positions = _pnl_positions()
+    _open_steps(nicegui_client, wiz,
+                symbol_values=_values_for(positions, 'market'), positions=positions)
+    drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_SYMBOL_PNL)
+
+    assert '+16.67%' in drawn[2], drawn[2]
+    assert '-16.67%' not in drawn[2], drawn[2]
+
+
+def _unpriced_positions():
+    """Growth holds a priced AAPL and an unquotable MSFT; Income holds nothing."""
+    from ba2_trade_platform.core.portfolio_allocation import PositionState
+
+    return {
+        'AAPL': PositionState(symbol='AAPL', quantity=10.0, cost_basis=1_500.0, price=160.0),
+        'MSFT': PositionState(symbol='MSFT', quantity=5.0, cost_basis=2_000.0, price=None),
+    }
+
+
+def test_an_unpriced_holding_renders_BLANK_rather_than_zero(nicegui_client):
+    """A failed quote reading as "flat" or "break-even" has caused real incidents
+    here. The dry run's Value column already draws '-'; this matches it."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    positions = _unpriced_positions()
+    _open_steps(nicegui_client, wiz,
+                symbol_values=_values_for(positions, 'market'), positions=positions)
+    drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_SYMBOL_PNL)
+
+    assert '0.00' not in drawn[1], drawn[1]
+    assert drawn[1].endswith('- (no price)'), drawn[1]
+
+
+def test_an_unpriced_holding_is_excluded_from_its_labels_total_and_COUNTED(
+        nicegui_client):
+    """Exactly the dry-run totals' rule: summing the unpriced row at 0 would report
+    the whole of its 2,000 cost as a loss."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    positions = _unpriced_positions()
+    _open_steps(nicegui_client, wiz,
+                symbol_values=_values_for(positions, 'market'), positions=positions)
+    drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_LABEL_PNL)
+
+    # +100 on AAPL's 1,500 alone. NOT -1,900, which is what including MSFT at 0 gives.
+    assert '+100.00 (+6.67%, 1 unpriced excluded)' in drawn[0], drawn[0]
+
+
+def test_a_label_that_holds_nothing_shows_a_dash_not_a_zero(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    _open_steps(nicegui_client, wiz, positions=_unpriced_positions())
+    drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_LABEL_PNL)
+
+    assert drawn[1].endswith('-'), drawn[1]        # Income holds no KO at all
+    assert '0.00' not in drawn[1], drawn[1]
+
+
+def test_a_zero_cost_holding_shows_the_money_and_no_percentage(nicegui_client):
+    """A gifted or fully written-down basis makes the return undefined. The money
+    is still a fact and is still shown; the percentage is not invented."""
+    from ba2_trade_platform.core.portfolio_allocation import PositionState
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    positions = {'KO': PositionState(symbol='KO', quantity=10.0, cost_basis=0.0,
+                                     price=50.0)}
+    _open_steps(nicegui_client, wiz, positions=positions)
+    drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_SYMBOL_PNL)
+
+    assert '+500.00 (no cost basis)' in drawn[2], drawn[2]
+
+
+def test_the_wizard_without_positions_draws_no_pnl_rather_than_a_zero(nicegui_client):
+    """``positions`` is optional and the page is the only caller that has one. A
+    caller that supplies none has no answer, and 0.00 would be a wrong one."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    _open_steps(nicegui_client, wiz)
+    for marker in (wiz.MARKER_LABEL_PNL, wiz.MARKER_SYMBOL_PNL):
+        drawn = _marked_texts(nicegui_client.layout, marker)
+        assert drawn, marker
+        assert all('0.00' not in text for text in drawn), (marker, drawn)
+
+
+def test_the_percentage_boxes_are_still_the_only_marked_numbers_with_pnl_drawn(
+        nicegui_client):
+    """The P&L is a ``ui.label``, for the reason the "now" captions are: the landed
+    suite indexes positionally into these two marker sets."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    _open_steps(nicegui_client, wiz, positions=_pnl_positions())
+
+    assert len(_numbers(nicegui_client, wiz, wiz.MARKER_LABEL_PCT)) == 2
+    assert len(_numbers(nicegui_client, wiz, wiz.MARKER_SYMBOL_PCT)) == 3
+
+
+def test_a_labels_percentage_is_money_weighted_not_a_mean_of_its_symbols(nicegui_client):
+    """A doubled 1,000 beside a flat 9,000 is +10% of the label, not +50%.
+
+    Averaging the rows weights the smallest holding exactly as heavily as the one
+    that dominates the label -- and on a label whose winners and losers cancel it
+    reports a return on a P&L of exactly zero dollars.
+    """
+    from ba2_trade_platform.core.portfolio_allocation import PositionState
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    positions = {
+        'AAPL': PositionState(symbol='AAPL', quantity=10.0, cost_basis=1_000.0,
+                              price=200.0),                      # 2,000: +100%
+        'MSFT': PositionState(symbol='MSFT', quantity=90.0, cost_basis=9_000.0,
+                              price=100.0),                      # 9,000: +0%
+    }
+    _open_steps(nicegui_client, wiz, positions=positions)
+    drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_LABEL_PNL)
+
+    assert '+1,000.00 (+10.00%)' in drawn[0], drawn[0]
+    assert '50.00%' not in drawn[0], drawn[0]

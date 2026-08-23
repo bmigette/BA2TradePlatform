@@ -2066,3 +2066,187 @@ def test_no_order_rows_weights_divide_the_same_base_as_the_main_table():
         260_000.0 / 262_800.0 * 100.0, abs=5e-4)
     assert dropped["BRKA"]["weight_pct"] != pytest.approx(
         260_000.0 / 197_100.0 * 100.0, abs=5e-4)
+
+
+# ---------------------------------------------------------------------------
+# Unrealised P&L (money and percent), for the wizard's step 1 / step 2 captions.
+#
+# The arithmetic is deliberately NOT parameterised by ``valuation_mode``: a P&L
+# measured on the COST basis is identically zero, so a mode-aware "current value"
+# is the one input this may never take.
+# ---------------------------------------------------------------------------
+
+
+def _held(symbol, quantity, cost_basis, price, market_value=None):
+    return PositionState(symbol=symbol, quantity=quantity, cost_basis=cost_basis,
+                         price=price, market_value=market_value)
+
+
+def test_unrealised_pnl_takes_no_valuation_mode_at_all():
+    """THE structural guarantee behind "the same P&L in both modes".
+
+    In cost mode ``current_value`` IS the cost basis, so a P&L derived from it is
+    0.00 on every row -- silently useless, and useless in the direction that looks
+    like a fact. The only way that cannot happen is for the function not to be able
+    to see the mode.
+    """
+    import inspect as _inspect
+
+    assert 'valuation_mode' not in _inspect.signature(pa.unrealised_pnl).parameters
+
+
+def test_unrealised_pnl_is_live_market_value_less_cost():
+    pnl = pa.unrealised_pnl([_held("AAPL", 10.0, 1_500.0, 160.0)])
+
+    assert pnl.market_value == pytest.approx(1_600.0)
+    assert pnl.cost_basis == pytest.approx(1_500.0)
+    assert pnl.amount == pytest.approx(100.0)
+    assert pnl.pct == pytest.approx(100.0 / 1_500.0 * 100.0)
+    assert (pnl.priced, pnl.unpriced) == (1, 0)
+
+
+def test_unrealised_pnl_ignores_the_brokers_own_market_value_figure():
+    """``PositionState.market_value`` can be stamped at a different price from
+    ``price`` (a previous close, a delayed quote). ``current_value`` refuses it for
+    exactly that reason, and this figure sits on the same line as that one."""
+    pnl = pa.unrealised_pnl([_held("AAPL", 10.0, 1_500.0, 160.0, market_value=9_999.0)])
+
+    assert pnl.market_value == pytest.approx(1_600.0)
+    assert pnl.amount == pytest.approx(100.0)
+
+
+def test_a_profitable_short_reports_a_POSITIVE_return():
+    """Shorts are stored signed negative. ``market_value - cost_basis`` is already
+    the right signed money; it is the DENOMINATOR that has to be absolute, or a
+    short that made 300 dollars renders as -20%."""
+    # Sold 10 at 150 (cost basis -1,500), now worth 120 -> market value -1,200.
+    pnl = pa.unrealised_pnl([_held("TSLA", -10.0, -1_500.0, 120.0)])
+
+    assert pnl.amount == pytest.approx(300.0)
+    assert pnl.pct == pytest.approx(20.0)
+    assert pnl.pct > 0
+
+
+def test_a_losing_short_reports_a_negative_return():
+    pnl = pa.unrealised_pnl([_held("TSLA", -10.0, -1_500.0, 180.0)])
+
+    assert pnl.amount == pytest.approx(-300.0)
+    assert pnl.pct == pytest.approx(-20.0)
+
+
+def test_an_unpriced_holding_is_EXCLUDED_and_counted_never_summed_as_zero():
+    """A failed quote is not a flat position and not a break-even one. Summing it
+    at 0 would report the whole of its cost as a loss."""
+    pnl = pa.unrealised_pnl([
+        _held("AAPL", 10.0, 1_500.0, 160.0),
+        _held("DARK", 5.0, 5_000.0, None),
+    ])
+
+    assert pnl.amount == pytest.approx(100.0)
+    assert pnl.cost_basis == pytest.approx(1_500.0)      # DARK's 5,000 is not in here
+    assert (pnl.priced, pnl.unpriced) == (1, 1)
+
+
+def test_a_holding_with_no_price_has_NO_measurable_pnl():
+    pnl = pa.unrealised_pnl([_held("DARK", 5.0, 5_000.0, None)])
+
+    assert pnl.amount is None
+    assert pnl.pct is None
+    assert (pnl.priced, pnl.unpriced) == (0, 1)
+
+
+def test_a_price_of_zero_is_no_price():
+    """``current_value`` guards ``price <= 0`` for the same reason: a broker that
+    answers 0.00 has not quoted the instrument."""
+    pnl = pa.unrealised_pnl([_held("DARK", 5.0, 5_000.0, 0.0)])
+
+    assert pnl.amount is None
+    assert (pnl.priced, pnl.unpriced) == (0, 1)
+
+
+def test_a_zero_cost_basis_leaves_the_percentage_undefined_rather_than_dividing():
+    pnl = pa.unrealised_pnl([_held("GIFT", 10.0, 0.0, 5.0)])
+
+    assert pnl.amount == pytest.approx(50.0)
+    assert pnl.pct is None
+
+
+def test_a_flat_or_absent_symbol_is_neither_priced_nor_unpriced():
+    """``build_position_states`` returns a FLAT state for every managed symbol the
+    account does not hold. Counting those as "unpriced" would put a permanent
+    "3 unpriced excluded" on a perfectly healthy label."""
+    pnl = pa.unrealised_pnl([None, _held("FLAT", 0.0, 0.0, None)])
+
+    assert pnl.amount is None
+    assert (pnl.priced, pnl.unpriced) == (0, 0)
+
+
+def test_a_labels_percentage_is_on_SUMMED_MONEY_not_an_average_of_its_symbols():
+    """A doubled 1,000 next to a flat 9,000 is +10% of the label, not +50%.
+
+    Averaging the per-symbol percentages weights a tiny holding exactly as heavily
+    as the position that dominates the label.
+    """
+    pnl = pa.unrealised_pnl([
+        _held("WIN", 10.0, 1_000.0, 200.0),      # 2,000 now: +100%
+        _held("FLATTISH", 90.0, 9_000.0, 100.0),  # 9,000 now: +0%
+    ])
+
+    assert pnl.amount == pytest.approx(1_000.0)
+    assert pnl.pct == pytest.approx(10.0)
+    assert pnl.pct != pytest.approx(50.0)
+
+
+def test_a_hedged_label_divides_GROSS_cost_so_the_percentage_cannot_explode():
+    """Long 10,000 against short 10,000 nets to a cost basis of ZERO. Dividing by
+    ``abs(sum(cost))`` there is a division by zero on a label that made real money;
+    ``sum(abs(cost))`` is the capital actually deployed and is what every
+    single-position case already reduces to."""
+    pnl = pa.unrealised_pnl([
+        _held("LONG", 100.0, 10_000.0, 106.0),     # 10,600 -> +600
+        _held("SHORT", -100.0, -10_000.0, 98.0),   # -9,800 -> +200
+    ])
+
+    assert pnl.cost_basis == pytest.approx(0.0)
+    assert pnl.abs_cost_basis == pytest.approx(20_000.0)
+    assert pnl.amount == pytest.approx(800.0)
+    assert pnl.pct == pytest.approx(4.0)
+
+
+def test_format_unrealised_pnl_signs_both_numbers():
+    text = pa.format_unrealised_pnl(pa.unrealised_pnl([_held("A", 10.0, 1_000.0, 120.0)]))
+
+    assert text == '+200.00 (+20.00%)'
+
+
+def test_format_unrealised_pnl_signs_a_loss():
+    text = pa.format_unrealised_pnl(pa.unrealised_pnl([_held("A", 10.0, 1_000.0, 80.0)]))
+
+    assert text == '-200.00 (-20.00%)'
+
+
+def test_format_unrealised_pnl_of_nothing_held_is_a_dash_never_a_zero():
+    assert pa.format_unrealised_pnl(pa.unrealised_pnl([])) == pa.PNL_UNMEASURABLE_MARK
+    assert '0.00' not in pa.format_unrealised_pnl(pa.unrealised_pnl([]))
+
+
+def test_format_unrealised_pnl_of_an_unpriced_holding_names_the_missing_price():
+    text = pa.format_unrealised_pnl(pa.unrealised_pnl([_held("DARK", 5.0, 5_000.0, None)]))
+
+    assert text == pa.PNL_NO_PRICE_MARK
+    assert '0.00' not in text
+
+
+def test_format_unrealised_pnl_says_how_many_rows_it_left_out():
+    text = pa.format_unrealised_pnl(pa.unrealised_pnl([
+        _held("A", 10.0, 1_000.0, 120.0),
+        _held("DARK", 5.0, 5_000.0, None),
+    ]))
+
+    assert text == '+200.00 (+20.00%, 1 unpriced excluded)'
+
+
+def test_format_unrealised_pnl_of_a_zero_cost_holding_shows_money_and_no_percent():
+    text = pa.format_unrealised_pnl(pa.unrealised_pnl([_held("GIFT", 10.0, 0.0, 5.0)]))
+
+    assert text == '+50.00 (no cost basis)'

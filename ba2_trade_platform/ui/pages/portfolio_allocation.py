@@ -231,17 +231,26 @@ def _load_flow_inputs(account_id: int, valuation_mode: str):
     """Everything the wizard needs to OPEN, in one thread hop. Blocking.
 
     Returns:
-        Tuple: ``(base, labels, allow_fractional, symbol_values, unallocated_pct)``
-        -- the frozen base snapshot, the managed labels with their symbol weights
-        AND the previous generation of both, the account's remembered fractional
-        choice, ``{SYMBOL: current value}`` under ``valuation_mode`` for the
-        wizard's read-only "now" captions, and the stored cash reserve that
+        Tuple: ``(base, labels, allow_fractional, symbol_values, positions,
+        unallocated_pct)`` -- the frozen base snapshot, the managed labels with
+        their symbol weights AND the previous generation of both, the account's
+        remembered fractional choice, ``{SYMBOL: current value}`` under
+        ``valuation_mode`` for the wizard's read-only "now" captions, the raw
+        ``{SYMBOL: PositionState}`` behind them, and the stored cash reserve that
         pre-fills the Unallocated box.
 
         ``symbol_values`` goes through the engine's own ``current_value`` rather
         than being re-derived, so the caption beside a target and the base that
         target divides are measured the same way. It is DISPLAY only -- nothing in
         it reaches a plan.
+
+        ``positions`` is the SAME map ``symbol_values`` and ``base`` were built
+        from, handed over unreduced because the wizard's unrealised P&L may not be
+        measured on a mode-aware current value: in COST mode ``current_value`` IS
+        the cost basis, so a P&L taken from ``symbol_values`` reads 0.00 on every
+        row. Quantity, cost basis and the live ``price`` are needed separately, and
+        ``build_position_states`` fetches quotes in BOTH modes, so the figure is
+        available whichever mode the account is on. Display only, like the values.
 
     Raises:
         PositionFetchFailed: the broker's position fetch failed. NOT a flat account,
@@ -278,7 +287,7 @@ def _load_flow_inputs(account_id: int, valuation_mode: str):
                                valuation_mode=valuation_mode)
     symbol_values = {s: current_value(current.get(s), valuation_mode) for s in symbols}
     config = get_allocation_config(account_id)
-    return (base, labels, bool(config.allow_fractional), symbol_values,
+    return (base, labels, bool(config.allow_fractional), symbol_values, current,
             float(config.unallocated_pct or 0.0))
 
 
@@ -939,7 +948,7 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
     event loop freezes the app for every connected client.
     """
     try:
-        (base, labels, allow_fractional, symbol_values,
+        (base, labels, allow_fractional, symbol_values, positions,
          unallocated_pct) = await asyncio.to_thread(
             _load_flow_inputs, account_id, valuation_mode)
     except PositionFetchFailed as e:
@@ -1098,7 +1107,7 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
     open_allocation_steps(base, labels, on_dry_run=_on_dry_run,
                           allow_fractional=allow_fractional,
                           mode=state['mode'], invest_amount=state['amount'],
-                          symbol_values=symbol_values,
+                          symbol_values=symbol_values, positions=positions,
                           unallocated_pct=unallocated_pct)
 
 
