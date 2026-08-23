@@ -198,6 +198,15 @@ def _pit_quotes(chain_row: Optional[dict],
     return close - half_spread, close + half_spread, close
 
 
+def _bar_volume(chain_row: dict, bar: Optional[dict]) -> int:
+    """Contracts traded on the as-of date: the bar's volume, else the chain column, else 0
+    ("no bar" == "did not trade" == a known zero). See the note at the call site."""
+    if bar is not None and bar.get("volume") is not None:
+        return bar["volume"]
+    v = chain_row.get("volume")
+    return v if v is not None else 0
+
+
 def _to_contract(r: dict, greeks_row: Optional[dict] = None) -> OptionContract:
     # greeks_row (the AS-OF-CLAMPED daily bar for this contract, when available) carries the
     # POINT-IN-TIME iv/greeks computed by fetch_options.py's Black-Scholes inversion of that
@@ -232,8 +241,19 @@ def _to_contract(r: dict, greeks_row: Optional[dict] = None) -> OptionContract:
         # participation cap (_OPTION_FILL_MAX_VOLUME_PARTICIPATION) — which reads the bar
         # directly — rejected the resulting orders. Prefer the bar; fall back to the chain
         # column so a differently-built cache that does populate it still works.
-        volume=(greeks_row.get("volume") if greeks_row is not None
-                and greeks_row.get("volume") is not None else r.get("volume")))
+        #
+        # NO BAR => VOLUME 0, NOT None (2026-08-23). A bar exists only for a contract that
+        # actually traded, so "no bar on or before the as-of date" is a KNOWN zero, not an
+        # unknown. Reporting None conflated the two, and once
+        # option_selector.check_liquidity_data_available started treating "no contract in the
+        # chain publishes this field" as a configuration error (see
+        # OptionLiquidityDataUnavailable), that conflation would have raised on any underlying
+        # whose whole DTE window happened to be untraded — a real 100% rejection misreported
+        # as a broken config. It also states, rather than accidentally implies, the second job
+        # min_volume has been doing: no-bar rows are exactly the ones still carrying the cache
+        # build's start-date quotes (weeks stale), so gating them out is deliberate.
+        # Selection is unchanged — any min_volume >= 1 rejects 0 exactly as it rejected None.
+        volume=_bar_volume(r, greeks_row))
 
 class HistoricalOptionsProvider:
     def __init__(self, cache_db: str):

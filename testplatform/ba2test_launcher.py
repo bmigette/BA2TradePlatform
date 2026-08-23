@@ -2138,7 +2138,9 @@ _OPTION_STRATS = {
         "option_strike_param_optimize": True, "option_strike_param_min": 8.0,
         "option_strike_param_max": 20.0, "option_strike_param_step": 2.0,
         "option_wing_width_optimize": True, "option_wing_width_min": 3.0,
-        "option_wing_width_max": 8.0, "option_wing_width_step": 1.0},
+        "option_wing_width_max": 8.0, "option_wing_width_step": 1.0,
+        "option_dte_optimize": True, "option_dte_min_range": 20,
+        "option_dte_max_range": 50, "option_dte_step": 5},
     "O_JL": {  # jade lizard (credit)
         "action_type": "open_jade_lizard", "option_strike_method": "percent_otm",
         "option_strike_param": 10.0, "option_dte_min": 25, "option_dte_max": 45,
@@ -2146,13 +2148,24 @@ _OPTION_STRATS = {
         "option_strike_param_optimize": True, "option_strike_param_min": 6.0,
         "option_strike_param_max": 16.0, "option_strike_param_step": 2.0,
         "option_wing_width_optimize": True, "option_wing_width_min": 3.0,
-        "option_wing_width_max": 8.0, "option_wing_width_step": 1.0},
+        "option_wing_width_max": 8.0, "option_wing_width_step": 1.0,
+        "option_dte_optimize": True, "option_dte_min_range": 20,
+        "option_dte_max_range": 50, "option_dte_step": 5},
     "O_BF": {  # long call butterfly (debit)
         "action_type": "open_call_butterfly", "option_strike_method": "percent_otm",
         "option_strike_param": 0.0, "option_dte_min": 25, "option_dte_max": 45,
         "option_sizing": 8.0, "option_wing_width_pct": 10.0,
         "option_wing_width_optimize": True, "option_wing_width_min": 5.0,
-        "option_wing_width_max": 15.0, "option_wing_width_step": 2.5},
+        "option_wing_width_max": 15.0, "option_wing_width_step": 2.5,
+        # The BODY (the 2x short leg) is where a butterfly's whole thesis lives -- it is the
+        # price the structure is betting the underlying pins to. It was frozen at 0.0 (always
+        # ATM), so the GA could only ever tune how WIDE the wings were around a bet it was
+        # never allowed to place. Kept modest (0-6% OTM): past that the debit collapses and
+        # the structure degenerates into a lottery ticket.
+        "option_strike_param_optimize": True, "option_strike_param_min": 0.0,
+        "option_strike_param_max": 6.0, "option_strike_param_step": 2.0,
+        "option_dte_optimize": True, "option_dte_min_range": 20,
+        "option_dte_max_range": 60, "option_dte_step": 5},
     "O_RS": {  # put ratio spread (credit/even)
         "action_type": "open_put_ratio_spread", "option_strike_method": "percent_otm",
         "option_strike_param": 5.0, "option_dte_min": 25, "option_dte_max": 45,
@@ -2160,7 +2173,9 @@ _OPTION_STRATS = {
         "option_strike_param_optimize": True, "option_strike_param_min": 2.0,
         "option_strike_param_max": 10.0, "option_strike_param_step": 2.0,
         "option_wing_width_optimize": True, "option_wing_width_min": 3.0,
-        "option_wing_width_max": 8.0, "option_wing_width_step": 1.0},
+        "option_wing_width_max": 8.0, "option_wing_width_step": 1.0,
+        "option_dte_optimize": True, "option_dte_min_range": 20,
+        "option_dte_max_range": 50, "option_dte_step": 5},
     "O_LP": {  # long put (debit) — the bearish mirror of O_LC; entry gates on the BEARISH
         # signal (see _OPTION_ENTRY_GATE), matching the live OPT-LongPut example which fired
         # on current_rating_negative. Needs the expert's sell signals enabled to ever trade.
@@ -2335,9 +2350,45 @@ def _option_entry_action_for(kind: str) -> dict:
     so it was inert and the selector kept handing the fill engine contracts it would reject.
     """
     cfg = dict(_OPTION_STRATS[kind])
+    _apply_option_min_volume(cfg)
+    return cfg
+
+
+def _apply_option_min_volume(cfg: dict) -> dict:
+    """Stamp the tradability floor onto ANY option action config, in place.
+
+    Split out of _option_entry_action_for (2026-08-23) because O_CC and O_PP do not have an
+    _OPTION_STRATS entry -- their option action is an OVERLAY on an equity strategy, hand-
+    written inline in the builder -- and so were the only two option paths in the grid with
+    no min_volume floor at all."""
     if _OPTION_MIN_VOLUME and _OPTION_MIN_VOLUME > 0:
         cfg.setdefault("option_min_volume", int(_OPTION_MIN_VOLUME))
     return cfg
+
+
+def _option_overlay_action(action_type: str, *, strike_param: float,
+                           dte_min: int = 25, dte_max: int = 45,
+                           strike_min: float, strike_max: float, strike_step: float,
+                           dte_min_range: int = 20, dte_max_range: int = 60,
+                           dte_step: int = 5) -> dict:
+    """The option action config for an EQUITY-entry overlay (O_CC's covered call, O_PP's
+    protective put).
+
+    These two were inline literals carrying only strike_method/strike_param/dte, which made
+    them the grid's only ungated AND unsearchable option legs: no ``option_min_volume``, and
+    no ``option_*_optimize`` flags, so their %OTM and DTE were constants the GA could not
+    touch while the same knobs were searched on every pure-option key. Sizing genuinely is
+    not a knob here -- both actions size off the HELD share count (1 contract per 100
+    shares), not option_sizing."""
+    return _apply_option_min_volume({
+        "action_type": action_type,
+        "option_strike_method": "percent_otm", "option_strike_param": strike_param,
+        "option_dte_min": dte_min, "option_dte_max": dte_max,
+        "option_strike_param_optimize": True, "option_strike_param_min": strike_min,
+        "option_strike_param_max": strike_max, "option_strike_param_step": strike_step,
+        "option_dte_optimize": True, "option_dte_min_range": dte_min_range,
+        "option_dte_max_range": dte_max_range, "option_dte_step": dte_step,
+    })
 
 
 def _screener_gate_base_for_strategy(kind: str) -> dict:
@@ -2572,9 +2623,9 @@ def _build_strategy_covered_call(kind: str):
          "continue_processing": False},
         {"id": "cc_sell",
          "conditions": {"type": "AND", "conditions": [{"id": "cc_hold", "field": "has_position"}]},
-         "actions": [{"action_type": "sell_covered_call",
-                      "option_strike_method": "percent_otm", "option_strike_param": 5.0,
-                      "option_dte_min": 25, "option_dte_max": 45}],
+         "actions": [_option_overlay_action(
+             "sell_covered_call", strike_param=5.0,
+             strike_min=2.0, strike_max=12.0, strike_step=2.0)],
          "continue_processing": False}]
     return s
 
@@ -2603,9 +2654,9 @@ def _build_strategy_protective_put(kind: str):
          "continue_processing": False},
         {"id": "pp_buy",
          "conditions": {"type": "AND", "conditions": [{"id": "pp_hold", "field": "has_position"}]},
-         "actions": [{"action_type": "buy_protective_put",
-                      "option_strike_method": "percent_otm", "option_strike_param": 8.0,
-                      "option_dte_min": 25, "option_dte_max": 45}],
+         "actions": [_option_overlay_action(
+             "buy_protective_put", strike_param=8.0,
+             strike_min=3.0, strike_max=15.0, strike_step=3.0)],
          "continue_processing": False}]
     return s
 

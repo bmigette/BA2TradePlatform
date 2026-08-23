@@ -29,6 +29,83 @@ from ba2_common.core.types import OptionRight
 _MIN_TRADEABLE_PREMIUM = 0.10
 
 
+class OptionSelectionConfigError(ValueError):
+    """A selection parameter is configured such that it can never select anything.
+
+    Raised INSTEAD of silently returning no contract, so a misconfigured rule is visible as
+    an error rather than as a strategy that quietly stops trading. Callers in
+    ``TradeActions._OptionEntryAction`` turn it into a failed TradeActionResult carrying the
+    message, so it is loud but contained (it never crashes a live cycle or a backtest)."""
+
+
+class OptionLiquidityDataUnavailable(OptionSelectionConfigError):
+    """A liquidity gate is enabled but NO contract in the chain publishes that field.
+
+    THE TRI-STATE. ``passes_liquidity`` fails CLOSED on ``None`` and that is deliberate:
+    "this contract's liquidity is unknown while its peers report theirs" is a red flag, and
+    flipping it to fail OPEN would let through exactly the illiquid contract the gate exists
+    to stop. But fail-closed is only meaningful when the field is PUBLISHED AT ALL. When the
+    data source emits it for nobody, "unknown" no longer distinguishes contracts — the gate
+    rejects 100% of them and reports the same "No liquid <structure>" as a genuinely thin
+    chain. Measured 2026-08-23 against the real cache: ``option_chain.open_interest`` is
+    NULL for all 6,757,055 rows, so ``min_open_interest=100`` (the LIVE UI DEFAULT, set on
+    all 14 live option entry actions) rejected 16/16 structures on 16/16 symbol-date-capital
+    combinations. So the three states are: published-and-good (pass), published-and-thin
+    (reject), and not-published-by-anyone (THIS — a configuration error, not a verdict on
+    any contract)."""
+
+    def __init__(self, field: str, gate_value, underlying: Optional[str] = None):
+        self.field = field
+        self.gate_value = gate_value
+        self.underlying = underlying
+        where = f" for {underlying}" if underlying else ""
+        super().__init__(
+            f"Liquidity gate '{field}' is set to {gate_value} but no contract in the option "
+            f"chain{where} publishes '{field}' — the data source does not provide it, so the "
+            f"gate would reject every contract. Clear this gate, or use a data source that "
+            f"publishes '{field}'.")
+
+
+class OptionDteWindowError(OptionSelectionConfigError):
+    """The configured DTE window cannot contain any expiry."""
+
+
+# field name -> "does this contract publish it?". `spread` is derived (needs BOTH sides of
+# the quote), which is why it is probed via spread_pct rather than a raw attribute.
+_LIQUIDITY_PROBES = {
+    "open_interest": lambda c: c.open_interest is not None,
+    "volume": lambda c: c.volume is not None,
+    "spread": lambda c: c.spread_pct is not None,
+}
+
+
+def check_liquidity_data_available(chain: List[OptionContract], *,
+                                   min_open_interest: Optional[int] = None,
+                                   max_spread_pct: Optional[float] = None,
+                                   min_volume: Optional[int] = None,
+                                   underlying: Optional[str] = None) -> None:
+    """Raise ``OptionLiquidityDataUnavailable`` for the first ENABLED gate whose field no
+    contract in ``chain`` publishes. See that exception for the reasoning.
+
+    Call this ONCE per action on the FULL fetched chain — never on a pre-filtered sublist
+    (e.g. the straddle's same-strike put candidates), where a single unpublished value is a
+    property of that one contract, not of the data source.
+
+    An EMPTY chain is a no-op: "no contracts at all" is its own condition and every caller
+    already reports it ("Empty option chain"); mislabelling it as a gate problem would send
+    the user to the wrong knob."""
+    if not chain:
+        return
+    for field, gate in (("open_interest", min_open_interest),
+                        ("volume", min_volume),
+                        ("spread", max_spread_pct)):
+        if gate is None:
+            continue
+        probe = _LIQUIDITY_PROBES[field]
+        if not any(probe(c) for c in chain):
+            raise OptionLiquidityDataUnavailable(field, gate, underlying)
+
+
 def passes_liquidity(c: OptionContract, min_open_interest: Optional[int],
                      max_spread_pct: Optional[float],
                      min_volume: Optional[int] = None) -> bool:
@@ -92,6 +169,17 @@ def _candidates(chain, option_type, dte_min, dte_max, today, min_oi, max_spread,
     return out
 
 
+# Expiry is the FINAL tie-break on every pick (2026-08-23). The cache lists the same strike
+# in more than one in-window expiry, so candidates routinely tie on BOTH the distance metric
+# and the strike, and ``min()`` then resolved them by INPUT-LIST ORDER — reversing the chain
+# flipped BAC240405C00037000 -> BAC240412C00037000, and every leg pinned to that leg's expiry
+# inherited the arbitrariness. Placing expiry LAST only orders pairs that were previously
+# unordered, so no pre-existing selection changes; earliest expiry wins (the front expiry is
+# the more liquid of two otherwise-identical contracts).
+def _tie(c):
+    return (c.strike, c.expiry)
+
+
 def _pick_by(method, cands, strike_param, spot, target_price, option_type):
     if not cands:
         return None
@@ -99,11 +187,11 @@ def _pick_by(method, cands, strike_param, spot, target_price, option_type):
         usable = [c for c in cands if c.delta is not None]
         if not usable:
             return None
-        return min(usable, key=lambda c: (abs(abs(c.delta) - abs(strike_param)), c.strike))
+        return min(usable, key=lambda c: (abs(abs(c.delta) - abs(strike_param)), *_tie(c)))
     ts = _target_strike(method, strike_param, spot, target_price, option_type)
     if ts is None:
         return None
-    return min(cands, key=lambda c: (abs(c.strike - ts), c.strike))
+    return min(cands, key=lambda c: (abs(c.strike - ts), *_tie(c)))
 
 
 def select_single(chain, *, method, strike_param, spot, option_type, dte_min, dte_max, today,
@@ -160,4 +248,4 @@ def select_wing(chain, *, center_strike, width_pct, option_type,
         target = center_strike * (1 + width_pct / 100.0)
     else:
         target = center_strike * (1 - width_pct / 100.0)
-    return min(cands, key=lambda c: (abs(c.strike - target), c.strike))
+    return min(cands, key=lambda c: (abs(c.strike - target), *_tie(c)))

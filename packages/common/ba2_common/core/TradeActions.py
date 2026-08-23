@@ -19,7 +19,9 @@ from ba2_common.core.types import (
 )
 from ba2_common.core.db import get_db, add_instance, update_instance, get_instance
 from ba2_common.core.option_types import OptionContract, OptionLeg, OptionPosition
-from ba2_common.core.option_selector import select_single, select_vertical_spread, select_wing, passes_liquidity
+from ba2_common.core.option_selector import (
+    select_single, select_vertical_spread, select_wing, passes_liquidity,
+    check_liquidity_data_available, OptionDteWindowError, OptionSelectionConfigError)
 from ba2_common.logger import logger
 from ba2_common.core.failure_modes import absorb_if_benign
 from ba2_common.core.db import InstanceNotFound
@@ -1943,12 +1945,52 @@ class _OptionEntryAction(TradeAction):
             logger.debug(f"_spot mid lookup failed for {self.instrument_name}: {e}")
         return self.get_current_price()
 
+    def _expiry_window(self, today: date) -> Tuple[date, date]:
+        """The [expiry_min, expiry_max] fetch window, or a LOUD config error.
+
+        ``dte_max`` used to default to ``today`` when unset, so a rule with dte_min=30 and no
+        dte_max asked the provider for the INVERTED window [today+30, today] — which of
+        course returns nothing, and was then reported as "Empty option chain", i.e. as a data
+        problem when it is a configuration problem. Same for dte_min > dte_max. A DTE window
+        that cannot contain any expiry is never what the user meant, so say so."""
+        if self.dte_max is None:
+            raise OptionDteWindowError(
+                f"Option DTE window for {self.instrument_name} is unusable: dte_max is not "
+                f"set (dte_min={self.dte_min}), which asks for the empty/inverted expiry "
+                f"window [today+{self.dte_min or 0}, today]. Set dte_max.")
+        if self.dte_min is not None and self.dte_min > self.dte_max:
+            raise OptionDteWindowError(
+                f"Option DTE window for {self.instrument_name} is inverted: "
+                f"dte_min={self.dte_min} > dte_max={self.dte_max}; no expiry can fall in it.")
+        expiry_min = today + timedelta(days=self.dte_min) if self.dte_min is not None else today
+        return expiry_min, today + timedelta(days=self.dte_max)
+
     def _chain(self, option_type: OptionRight) -> List[OptionContract]:
         today = self._today()
-        expiry_min = today + timedelta(days=self.dte_min) if self.dte_min is not None else today
-        expiry_max = today + timedelta(days=self.dte_max) if self.dte_max is not None else today
+        expiry_min, expiry_max = self._expiry_window(today)
         return self.account.get_option_chain(
             self.instrument_name, expiry_min, expiry_max, option_type)
+
+    def _liq(self, *chains: List[OptionContract]) -> Dict[str, Any]:
+        """The liquidity gates EVERY leg of this structure must be selected under.
+
+        Two jobs. (1) It validates the configured gates against the fetched chain(s) once —
+        see option_selector.OptionLiquidityDataUnavailable for why a gate nobody can answer
+        must be an error rather than a 100% rejection. Validating HERE (on the whole chain,
+        once per action) and not inside the selectors is deliberate: several structures call
+        a selector with an already-narrowed candidate list (the straddle's same-strike puts,
+        the short strangle's expiry re-pin), where a lone missing value says something about
+        that contract, not about the data source. (2) It is the SINGLE place the three gate
+        values are spelled out, so a leg physically cannot be selected under different gates
+        than its siblings — which is how ``min_volume`` came to be applied to the protective
+        wings of the iron condor / jade lizard / butterfly / ratio spread but NOT to their
+        risk-bearing short legs."""
+        gates = {"min_open_interest": self.min_open_interest,
+                 "max_spread_pct": self.max_spread_pct,
+                 "min_volume": self.min_volume}
+        universe = [c for ch in chains if ch for c in ch]
+        check_liquidity_data_available(universe, underlying=self.instrument_name, **gates)
+        return gates
 
     def _virtual_equity(self) -> Optional[float]:
         """balance * virtual_equity_pct/100 (defaults to balance when unknown)."""
@@ -2143,6 +2185,14 @@ class _OptionEntryAction(TradeAction):
             if not self._supports_options():
                 return self._result(False, f"Account does not support options for {self.instrument_name}")
             return self._build_and_submit()
+        except OptionSelectionConfigError as e:
+            # A parameter that can never select anything (a liquidity gate the data source
+            # cannot answer, an inverted DTE window). NOT a runtime failure and not a
+            # market condition — surface the exact knob instead of "No liquid <structure>",
+            # which reads as "the chain is thin" and sends the user hunting the wrong thing.
+            logger.error(f"{self._action_type_value()} for {self.instrument_name} is "
+                         f"misconfigured: {e}")
+            return self._result(False, str(e))
         except Exception as e:
             absorb_if_benign(e, InstanceNotFound)
             logger.error(f"Error executing {self._action_type_value()} for {self.instrument_name}: {e}",
@@ -2162,13 +2212,13 @@ class BuyCallAction(_OptionEntryAction):
         chain = self._chain(self.OPTION_TYPE)
         if not chain:
             return self._result(False, f"Empty option chain for {self.instrument_name}")
+        liq = self._liq(chain)
         spot = self._spot()
         contract = select_single(
             chain, method=self.strike_method, strike_param=self.strike_param, spot=spot,
             option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=self._consensus_target(),
-            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct,
-            min_volume=self.min_volume)
+            **liq)
         if contract is None:
             return self._result(False, f"No liquid call contract for {self.instrument_name}")
         if contract.ask is None or contract.ask <= 0:
@@ -2200,14 +2250,14 @@ class OpenBullCallSpreadAction(_OptionEntryAction):
         chain = self._chain(self.OPTION_TYPE)
         if not chain:
             return self._result(False, f"Empty option chain for {self.instrument_name}")
+        liq = self._liq(chain)
         spot = self._spot()
         long_param, short_param = self._spread_params()
         pair = select_vertical_spread(
             chain, method=self.strike_method, long_param=long_param, short_param=short_param,
             spot=spot, option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=self._consensus_target(),
-            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct,
-            min_volume=self.min_volume)
+            **liq)
         if pair is None:
             return self._result(False, f"No liquid bull call spread for {self.instrument_name}")
         long_c, short_c = pair
@@ -2256,13 +2306,13 @@ class BuyPutAction(_OptionEntryAction):
         chain = self._chain(self.OPTION_TYPE)
         if not chain:
             return self._result(False, f"Empty option chain for {self.instrument_name}")
+        liq = self._liq(chain)
         spot = self._spot()
         contract = select_single(
             chain, method=self.strike_method, strike_param=self.strike_param, spot=spot,
             option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=self._consensus_target(),
-            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct,
-            min_volume=self.min_volume)
+            **liq)
         if contract is None:
             return self._result(False, f"No liquid put contract for {self.instrument_name}")
         if contract.ask is None or contract.ask <= 0:
@@ -2294,14 +2344,14 @@ class OpenBearPutSpreadAction(_OptionEntryAction):
         chain = self._chain(self.OPTION_TYPE)
         if not chain:
             return self._result(False, f"Empty option chain for {self.instrument_name}")
+        liq = self._liq(chain)
         spot = self._spot()
         long_param, short_param = self._spread_params()
         pair = select_vertical_spread(
             chain, method=self.strike_method, long_param=long_param, short_param=short_param,
             spot=spot, option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=self._consensus_target(),
-            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct,
-            min_volume=self.min_volume)
+            **liq)
         if pair is None:
             return self._result(False, f"No liquid bear put spread for {self.instrument_name}")
         # For a PUT debit spread the selector returns (long, short) with long.strike > short.strike.
@@ -2358,13 +2408,13 @@ class SellCoveredCallAction(_OptionEntryAction):
         chain = self._chain(self.OPTION_TYPE)
         if not chain:
             return self._result(False, f"Empty option chain for {self.instrument_name}")
+        liq = self._liq(chain)
         spot = self._spot()
         contract = select_single(
             chain, method=self.strike_method, strike_param=self.strike_param, spot=spot,
             option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=self._consensus_target(),
-            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct,
-            min_volume=self.min_volume)
+            **liq)
         if contract is None:
             return self._result(False, f"No liquid call contract for covered call on {self.instrument_name}")
         if contract.bid is None or contract.bid <= 0:
@@ -2398,13 +2448,13 @@ class BuyProtectivePutAction(_OptionEntryAction):
         chain = self._chain(self.OPTION_TYPE)
         if not chain:
             return self._result(False, f"Empty option chain for {self.instrument_name}")
+        liq = self._liq(chain)
         spot = self._spot()
         contract = select_single(
             chain, method=self.strike_method, strike_param=self.strike_param, spot=spot,
             option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=self._consensus_target(),
-            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct,
-            min_volume=self.min_volume)
+            **liq)
         if contract is None:
             return self._result(False, f"No liquid put contract for protective put on {self.instrument_name}")
         if contract.ask is None or contract.ask <= 0:
@@ -2437,13 +2487,13 @@ class SellCashSecuredPutAction(_OptionEntryAction):
         chain = self._chain(self.OPTION_TYPE)
         if not chain:
             return self._result(False, f"Empty option chain for {self.instrument_name}")
+        liq = self._liq(chain)
         spot = self._spot()
         contract = select_single(
             chain, method=self.strike_method, strike_param=self.strike_param, spot=spot,
             option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=self._consensus_target(),
-            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct,
-            min_volume=self.min_volume)
+            **liq)
         if contract is None:
             return self._result(False, f"No liquid put contract for cash-secured put on {self.instrument_name}")
         if contract.bid is None or contract.bid <= 0:
@@ -2505,14 +2555,14 @@ class OpenBearCallSpreadAction(_OptionEntryAction):
         chain = self._chain(self.OPTION_TYPE)
         if not chain:
             return self._result(False, f"Empty option chain for {self.instrument_name}")
+        liq = self._liq(chain)
         spot = self._spot()
         long_param, short_param = self._spread_params()
         pair = select_vertical_spread(
             chain, method=self.strike_method, long_param=long_param, short_param=short_param,
             spot=spot, option_type=self.OPTION_TYPE, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=self._consensus_target(),
-            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct,
-            min_volume=self.min_volume)
+            **liq)
         if pair is None:
             return self._result(False, f"No liquid bear call spread for {self.instrument_name}")
         # For a CALL spread the selector returns (lo, hi) ordered by strike.
@@ -2578,14 +2628,14 @@ class OpenStraddleAction(_OptionEntryAction):
         put_chain = self._chain(OptionRight.PUT)
         if not call_chain or not put_chain:
             return self._result(False, f"Empty option chain for {self.instrument_name}")
+        liq = self._liq(call_chain, put_chain)
         spot = self._spot()
         # ATM: nearest-spot strike via percent_otm with strike_param=0 on the call chain.
         call_c = select_single(
             call_chain, method="percent_otm", strike_param=0, spot=spot,
             option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=None,
-            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct,
-            min_volume=self.min_volume)
+            **liq)
         if call_c is None:
             return self._result(False, f"No liquid ATM call for straddle on {self.instrument_name}")
         # Force the put to the SAME strike + expiry as the chosen call leg.
@@ -2595,8 +2645,7 @@ class OpenStraddleAction(_OptionEntryAction):
             put_candidates, method="percent_otm", strike_param=0, spot=spot,
             option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=None,
-            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct,
-            min_volume=self.min_volume)
+            **liq)
         if put_c is None:
             return self._result(False,
                                 f"No liquid ATM put at strike {call_c.strike} for straddle "
@@ -2643,22 +2692,21 @@ class OpenStrangleAction(_OptionEntryAction):
         put_chain = self._chain(OptionRight.PUT)
         if not call_chain or not put_chain:
             return self._result(False, f"Empty option chain for {self.instrument_name}")
+        liq = self._liq(call_chain, put_chain)
         spot = self._spot()
         otm_pct = self.strike_param if self.strike_param is not None else self.DEFAULT_OTM_PCT
         call_c = select_single(
             call_chain, method="percent_otm", strike_param=otm_pct, spot=spot,
             option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=None,
-            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct,
-            min_volume=self.min_volume)
+            **liq)
         if call_c is None:
             return self._result(False, f"No liquid OTM call for strangle on {self.instrument_name}")
         put_c = select_single(
             put_chain, method="percent_otm", strike_param=otm_pct, spot=spot,
             option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
             today=self._today(), target_price=None,
-            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct,
-            min_volume=self.min_volume)
+            **liq)
         if put_c is None:
             return self._result(False, f"No liquid OTM put for strangle on {self.instrument_name}")
         if call_c.ask is None or put_c.ask is None:
@@ -2699,12 +2747,12 @@ class OpenShortStraddleAction(_OptionEntryAction):
         put_chain = self._chain(OptionRight.PUT)
         if not call_chain or not put_chain:
             return self._result(False, f"Empty option chain for {self.instrument_name}")
+        liq = self._liq(call_chain, put_chain)
         spot = self._spot()
         call_c = select_single(
             call_chain, method="percent_otm", strike_param=0, spot=spot,
             option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
-            today=self._today(), min_open_interest=self.min_open_interest,
-            max_spread_pct=self.max_spread_pct)
+            today=self._today(), **liq)
         if call_c is None:
             return self._result(False, f"No liquid ATM call for short straddle on {self.instrument_name}")
         put_candidates = [c for c in put_chain
@@ -2712,8 +2760,7 @@ class OpenShortStraddleAction(_OptionEntryAction):
         put_c = select_single(
             put_candidates, method="percent_otm", strike_param=0, spot=spot,
             option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
-            today=self._today(), min_open_interest=self.min_open_interest,
-            max_spread_pct=self.max_spread_pct)
+            today=self._today(), **liq)
         if put_c is None:
             return self._result(False, f"No liquid ATM put for short straddle on {self.instrument_name}")
         if call_c.bid is None or put_c.bid is None:
@@ -2765,18 +2812,17 @@ class OpenShortStrangleAction(_OptionEntryAction):
         put_chain = self._chain(OptionRight.PUT)
         if not call_chain or not put_chain:
             return self._result(False, f"Empty option chain for {self.instrument_name}")
+        liq = self._liq(call_chain, put_chain)
         spot = self._spot()
         otm = self.strike_param if self.strike_param is not None else self.DEFAULT_OTM_PCT
         call_c = select_single(
             call_chain, method="percent_otm", strike_param=otm, spot=spot,
             option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
-            today=self._today(), min_open_interest=self.min_open_interest,
-            max_spread_pct=self.max_spread_pct)
+            today=self._today(), **liq)
         put_c = select_single(
             put_chain, method="percent_otm", strike_param=otm, spot=spot,
             option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
-            today=self._today(), min_open_interest=self.min_open_interest,
-            max_spread_pct=self.max_spread_pct)
+            today=self._today(), **liq)
         if call_c is None or put_c is None:
             return self._result(False, f"No liquid OTM legs for short strangle on {self.instrument_name}")
         # Pin both legs to the same expiry (use the call's expiry).
@@ -2785,8 +2831,7 @@ class OpenShortStrangleAction(_OptionEntryAction):
                 [c for c in put_chain if c.expiry == call_c.expiry],
                 method="percent_otm", strike_param=otm, spot=spot,
                 option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
-                today=self._today(), min_open_interest=self.min_open_interest,
-                max_spread_pct=self.max_spread_pct)
+                today=self._today(), **liq)
             if put_c is None:
                 return self._result(False, f"No same-expiry OTM put for short strangle on {self.instrument_name}")
         if call_c.bid is None or put_c.bid is None:
@@ -2835,30 +2880,27 @@ class OpenIronCondorAction(_OptionEntryAction):
         put_chain = self._chain(OptionRight.PUT)
         if not call_chain or not put_chain:
             return self._result(False, f"Empty option chain for {self.instrument_name}")
+        liq = self._liq(call_chain, put_chain)
         spot = self._spot()
         otm = self.strike_param if self.strike_param is not None else self.DEFAULT_OTM_PCT
         wing = self.wing_width_pct if self.wing_width_pct is not None else self.DEFAULT_WING_PCT
         sc = select_single(call_chain, method="percent_otm", strike_param=otm, spot=spot,
                            option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
-                           today=self._today(), min_open_interest=self.min_open_interest,
-                           max_spread_pct=self.max_spread_pct)
+                           today=self._today(), **liq)
         sp = select_single(put_chain, method="percent_otm", strike_param=otm, spot=spot,
                            option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
-                           today=self._today(), min_open_interest=self.min_open_interest,
-                           max_spread_pct=self.max_spread_pct)
+                           today=self._today(), **liq)
         if sc is None or sp is None:
             return self._result(False, f"No liquid short legs for iron condor on {self.instrument_name}")
         # Wings farther OTM, same expiry as the matching short leg.
         lc = select_wing(call_chain, center_strike=sc.strike, width_pct=wing,
                          option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
                          today=self._today(), expiry=sc.expiry,
-                         min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct,
-            min_volume=self.min_volume)
+                         **liq)
         lp = select_wing(put_chain, center_strike=sp.strike, width_pct=wing,
                          option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
                          today=self._today(), expiry=sp.expiry,
-                         min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct,
-            min_volume=self.min_volume)
+                         **liq)
         if lc is None or lp is None or lc.strike <= sc.strike or lp.strike >= sp.strike:
             return self._result(False, f"No valid wings for iron condor on {self.instrument_name}")
         if None in (sc.bid, sp.bid, lc.ask, lp.ask):
@@ -2910,24 +2952,22 @@ class OpenJadeLizardAction(_OptionEntryAction):
         put_chain = self._chain(OptionRight.PUT)
         if not call_chain or not put_chain:
             return self._result(False, f"Empty option chain for {self.instrument_name}")
+        liq = self._liq(call_chain, put_chain)
         spot = self._spot()
         otm = self.strike_param if self.strike_param is not None else self.DEFAULT_OTM_PCT
         wing = self.wing_width_pct if self.wing_width_pct is not None else self.DEFAULT_WING_PCT
         sc = select_single(call_chain, method="percent_otm", strike_param=otm, spot=spot,
                            option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
-                           today=self._today(), min_open_interest=self.min_open_interest,
-                           max_spread_pct=self.max_spread_pct)
+                           today=self._today(), **liq)
         sp = select_single(put_chain, method="percent_otm", strike_param=otm, spot=spot,
                            option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
-                           today=self._today(), min_open_interest=self.min_open_interest,
-                           max_spread_pct=self.max_spread_pct)
+                           today=self._today(), **liq)
         if sc is None or sp is None:
             return self._result(False, f"No liquid short legs for jade lizard on {self.instrument_name}")
         lc = select_wing(call_chain, center_strike=sc.strike, width_pct=wing,
                          option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
                          today=self._today(), expiry=sc.expiry,
-                         min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct,
-            min_volume=self.min_volume)
+                         **liq)
         if lc is None or lc.strike <= sc.strike:
             return self._result(False, f"No valid call wing for jade lizard on {self.instrument_name}")
         if None in (sc.bid, sp.bid, lc.ask):
@@ -2983,26 +3023,29 @@ class OpenCallButterflyAction(_OptionEntryAction):
         chain = self._chain(OptionRight.CALL)
         if not chain:
             return self._result(False, f"Empty option chain for {self.instrument_name}")
+        liq = self._liq(chain)
         spot = self._spot()
         body_otm = self.strike_param if self.strike_param is not None else self.DEFAULT_BODY_PCT
         wing = self.wing_width_pct if self.wing_width_pct is not None else self.DEFAULT_WING_PCT
         body = select_single(chain, method="percent_otm", strike_param=body_otm, spot=spot,
                              option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
-                             today=self._today(), min_open_interest=self.min_open_interest,
-                             max_spread_pct=self.max_spread_pct)
+                             today=self._today(), **liq)
         if body is None:
             return self._result(False, f"No liquid body call for butterfly on {self.instrument_name}")
         upper = select_wing(chain, center_strike=body.strike, width_pct=wing,
                             option_type=OptionRight.CALL, dte_min=self.dte_min, dte_max=self.dte_max,
                             today=self._today(), expiry=body.expiry,
-                            min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct,
-            min_volume=self.min_volume)
+                            **liq)
         # Lower wing: a call BELOW the body. Reuse select_wing with a PUT-style downward
         # target by searching for strike nearest body*(1 - wing%).
         lower_target = body.strike * (1 - wing / 100.0)
-        lower_cands = [c for c in chain if c.expiry == body.expiry and c.strike < body.strike
-                       and passes_liquidity(c, self.min_open_interest, self.max_spread_pct)]
-        lower = min(lower_cands, key=lambda c: abs(c.strike - lower_target)) if lower_cands else None
+        lower_cands = [c for c in chain
+                       if c.expiry == body.expiry and c.strike < body.strike
+                       and passes_liquidity(c, liq["min_open_interest"],
+                                            liq["max_spread_pct"], liq["min_volume"])]
+        # Same (distance, strike, expiry) key the selectors use — see option_selector._tie.
+        lower = (min(lower_cands, key=lambda c: (abs(c.strike - lower_target), c.strike, c.expiry))
+                 if lower_cands else None)
         if upper is None or lower is None or upper.strike <= body.strike or lower.strike >= body.strike:
             return self._result(False, f"No valid wings for butterfly on {self.instrument_name}")
         if None in (lower.ask, upper.ask, body.bid):
@@ -3046,20 +3089,19 @@ class OpenPutRatioSpreadAction(_OptionEntryAction):
         chain = self._chain(OptionRight.PUT)
         if not chain:
             return self._result(False, f"Empty option chain for {self.instrument_name}")
+        liq = self._liq(chain)
         spot = self._spot()
         otm = self.strike_param if self.strike_param is not None else self.DEFAULT_OTM_PCT
         wing = self.wing_width_pct if self.wing_width_pct is not None else self.DEFAULT_WING_PCT
         long_p = select_single(chain, method="percent_otm", strike_param=otm, spot=spot,
                                option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
-                               today=self._today(), min_open_interest=self.min_open_interest,
-                               max_spread_pct=self.max_spread_pct)
+                               today=self._today(), **liq)
         if long_p is None:
             return self._result(False, f"No liquid long put for ratio spread on {self.instrument_name}")
         short_p = select_wing(chain, center_strike=long_p.strike, width_pct=wing,
                               option_type=OptionRight.PUT, dte_min=self.dte_min, dte_max=self.dte_max,
                               today=self._today(), expiry=long_p.expiry,
-                              min_open_interest=self.min_open_interest, max_spread_pct=self.max_spread_pct,
-            min_volume=self.min_volume)
+                              **liq)
         if short_p is None or short_p.strike >= long_p.strike:
             return self._result(False, f"No valid short put wing for ratio spread on {self.instrument_name}")
         if long_p.ask is None or short_p.bid is None:

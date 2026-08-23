@@ -9,7 +9,7 @@ from ...core.db import get_db, get_all_instances, delete_instance, add_instance,
 from ...modules.accounts import providers
 from ...core.interfaces import AccountInterface
 from ...core.utils import get_account_instance_from_id, get_expert_instance_from_id, normalize_symbol, parse_instrument_symbol_list
-from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_numeric_event, is_adjustment_action, is_share_adjustment_action, is_option_action, AnalysisUseCase, MarketAnalysisStatus, get_action_type_display_label, get_operator_options
+from ...core.types import InstrumentType, ExpertEventRuleType, ExpertEventType, ExpertActionType, ReferenceValue, is_numeric_event, is_adjustment_action, is_share_adjustment_action, is_option_action, uses_wing_width, AnalysisUseCase, MarketAnalysisStatus, get_action_type_display_label, get_operator_options
 from ...core.cleanup import preview_cleanup, execute_cleanup, get_cleanup_statistics
 from yahooquery import Ticker, search as yq_search
 from nicegui.events import UploadEventArguments
@@ -5064,6 +5064,7 @@ class TradeSettingsTab:
                 sizing_input = None
                 min_oi_input = None
                 max_spread_input = None
+                wing_width_input = None
 
                 def update_action_inputs():
                     action_value_container.clear()
@@ -5108,7 +5109,8 @@ class TradeSettingsTab:
                         # held position), so only render widgets for entry actions.
                         with action_value_container:
                             nonlocal strike_method_select, strike_param_input, dte_min_input, \
-                                dte_max_input, sizing_input, min_oi_input, max_spread_input
+                                dte_max_input, sizing_input, min_oi_input, max_spread_input, \
+                                wing_width_input
 
                             is_close = selected_type == ExpertActionType.CLOSE_OPTION.value
                             if not is_close:
@@ -5154,6 +5156,21 @@ class TradeSettingsTab:
                                     step=0.5,
                                     format='%.1f'
                                 ).classes('w-28').props('dense')
+                                # Wing width: only the multi-leg structures read it (iron
+                                # condor, jade lizard, butterfly, put ratio spread). It was
+                                # plumbed all the way from rule_builders to the action ctor
+                                # but had NO field here, so a live 4-leg structure silently
+                                # fell back to its class constant (DEFAULT_WING_PCT) with no
+                                # way for the user to see or change it. Rendered only for the
+                                # structures that use it so it isn't a decoy on the others.
+                                if uses_wing_width(selected_type):
+                                    wing_width_input = ui.number(
+                                        label='Wing Width %',
+                                        value=action_config.get('wing_width_pct', 5.0) if action_config else 5.0,
+                                        min=0.0,
+                                        step=0.5,
+                                        format='%.1f'
+                                    ).classes('w-28').props('dense')
                             else:
                                 ui.label('Closes the held option position (no parameters).').classes('text-sm text-gray-500')
 
@@ -5174,7 +5191,8 @@ class TradeSettingsTab:
                     'dte_max_input': lambda: dte_max_input,
                     'sizing_input': lambda: sizing_input,
                     'min_oi_input': lambda: min_oi_input,
-                    'max_spread_input': lambda: max_spread_input
+                    'max_spread_input': lambda: max_spread_input,
+                    'wing_width_input': lambda: wing_width_input
                 }
     
     def _remove_action_row(self, action_id, action_card):
@@ -5260,6 +5278,7 @@ class TradeSettingsTab:
                         sz = action_refs['sizing_input']()
                         moi = action_refs['min_oi_input']()
                         msp = action_refs['max_spread_input']()
+                        wwp = action_refs['wing_width_input']()
 
                         if sm:
                             action_config['strike_method'] = sm.value
@@ -5282,6 +5301,15 @@ class TradeSettingsTab:
                             action_config['min_open_interest'] = int(moi.value)
                         if msp and msp.value is not None:
                             action_config['max_spread_pct'] = float(msp.value)
+                        if wwp and wwp.value is not None:
+                            action_config['wing_width_pct'] = float(wwp.value)
+                        # NOTE: min_volume is deliberately NOT offered here. AlpacaAccount's
+                        # chain comes from the option SNAPSHOT endpoint, whose payload
+                        # (alpaca.data.models.snapshots.OptionsSnapshot) carries no bar at
+                        # all -- symbol / latest_trade / latest_quote / implied_volatility /
+                        # greeks -- so OptionContract.volume is always None on the live path
+                        # and the gate could only ever raise OptionLiquidityDataUnavailable.
+                        # A field whose every value is an error is worse than no field.
 
                 actions_data[action_id] = action_config
             

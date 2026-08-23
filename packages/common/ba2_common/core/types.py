@@ -592,6 +592,28 @@ def is_option_action(action_value):
     return action_value in get_option_action_values()
 
 
+def get_wing_width_action_values():
+    """Option action types whose builder reads ``wing_width_pct``.
+
+    These four place a protective/second leg at a distance MEASURED FROM another leg's
+    strike, so the width is a real strategy parameter rather than a byproduct of the strike
+    method; every other structure ignores it. Kept next to the action enum (not in the UI)
+    so a producer can render the field for exactly the actions that consume it -- offering
+    it everywhere would be a decoy, and offering it nowhere is what left live iron condors /
+    jade lizards / butterflies / ratio spreads silently pinned to their class constants."""
+    return [
+        ExpertActionType.OPEN_IRON_CONDOR.value,
+        ExpertActionType.OPEN_JADE_LIZARD.value,
+        ExpertActionType.OPEN_CALL_BUTTERFLY.value,
+        ExpertActionType.OPEN_PUT_RATIO_SPREAD.value,
+    ]
+
+
+def uses_wing_width(action_value):
+    """Check whether an option action type reads ``wing_width_pct``."""
+    return action_value in get_wing_width_action_values()
+
+
 def get_action_type_display_label(action_value):
     """
     Get user-friendly display label for an ExpertActionType value.
