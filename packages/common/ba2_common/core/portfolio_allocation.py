@@ -339,7 +339,14 @@ REASON_SCALED_PREFIX = REASON_SCALED_FMT.split("{", 1)[0]
 REASON_BELOW_MIN_ORDER_PREFIX = REASON_BELOW_MIN_ORDER_FMT.split("{", 1)[0]
 REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_PREFIX = (
     REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_FMT.split("{", 1)[0])
-WARNING_EMPTY_LABEL_FMT = "label '{label}' has no symbols - {pct:.2f}% unallocated"
+#: An empty label, named with BOTH of its percentages. They are the same number
+#: only when there is no reserve: the weight is what the user typed into the box
+#: and divides the investable remainder, while the share of base is what actually
+#: goes idle and is the figure that lands in ``unallocatable_pct``. Naming only the
+#: first restates the field's own denominator defect in prose; naming only the
+#: second sends the user hunting for a box holding a percentage nobody typed.
+WARNING_EMPTY_LABEL_FMT = ("label '{label}' has no symbols - its {pct:.2f}% weight "
+                           "({base_pct:.2f}% of the base) can absorb nothing")
 WARNING_PRECHECK_DISAGREED_FMT = "broker precheck disagreed on {symbol} - re-solved"
 
 # Validation messages from ``validate_label_targets``. Pinned so the UI and the
@@ -448,8 +455,9 @@ class LabelTarget:
     raising or lowering it rewrites none of these numbers.
 
     An empty ``symbols`` list cannot absorb its percentage: the engine allocates it
-    nothing and adds ``target_pct`` to ``AllocationPlan.unallocatable_pct`` instead
-    -- that is a fault, not a reserve.
+    nothing and adds ``target_pct`` -- restated as a share of the BASE, since that
+    field's denominator is the base and this one's is the remainder -- to
+    ``AllocationPlan.unallocatable_pct`` instead. That is a fault, not a reserve.
 
     ``previous_target_pct`` is a PURE CARRIER for the wizard's "Load last" button,
     on the same terms as ``SymbolTarget.previous_weight_pct``: read by the UI,
@@ -581,13 +589,23 @@ class AllocationPlan:
     ``required_buying_power`` is the POST-scaling figure -- what the plan as
     displayed actually needs.
 
-    TWO kinds of money end up as cash, and they are deliberately separate fields.
-    ``unallocatable_pct`` is the share of the base that no label COULD absorb
+    TWO kinds of money end up idle, and they are deliberately separate fields.
+    ``unallocatable_pct`` is the share of the GROSS BASE that no label COULD absorb
     (empty labels, skipped no-price symbols) -- a fault, and something to fix.
     ``reserved_pct`` / ``reserved_notional`` is the STORED reserve the user asked
-    for (``PortfolioAllocationConfig.unallocated_pct``). Both show as cash left
+    for (``PortfolioAllocationConfig.unallocated_pct``). Both show as money left
     over on the dry run, and telling them apart is the difference between "you
-    asked for 30% in cash" and "30% of your book had no price".
+    asked for 30% to stay out of the market" and "30% of your book had no price".
+
+    Both divide ``base_notional``, and that is load-bearing rather than incidental.
+    ``unallocatable_pct`` is accumulated from RELATIVE label weights -- which are
+    shares of the investable remainder, not of the base -- and is restated against
+    the base as it is accumulated (``effective_target_pct``). Left relative it read
+    as a bigger number than it was: base 10,000, reserve 50%, labels 50 (held) / 50
+    (empty) reported ``reserved_pct=50`` AND ``unallocatable_pct=50``, which sums to
+    100 and says "the whole book is idle" on a plan that invests 2,500. They are two
+    answers to one question and a reader will add them; the only way that is safe is
+    for them to share a denominator with each other and with the money.
 
     A THIRD thing that is NOT either of them: ``scale_factor``. A buying-power
     shortfall is a constraint the plan HIT, not money set aside, and merging it
@@ -611,6 +629,11 @@ class AllocationPlan:
     required_buying_power: float = 0.0
     bp_usage_pct: float = 0.0
     scale_factor: float = 1.0
+    #: The share of ``base_notional`` no label COULD absorb -- an empty label, a
+    #: symbol with no price. A FAULT, and the same denominator as ``reserved_pct``
+    #: beneath it: accumulated from relative label weights and restated against the
+    #: base through ``effective_target_pct`` as it goes in. See the class docstring
+    #: for why the two must be addable.
     unallocatable_pct: float = 0.0
     #: The DELIBERATE cash reserve: the account's STORED ``unallocated_pct``, and
     #: the same share of ``base_notional`` in money. Kept SEPARATE from
@@ -680,6 +703,9 @@ class AllocationPlan:
             "required_buying_power": self.required_buying_power,
             "bp_usage_pct": self.bp_usage_pct,
             "scale_factor": self.scale_factor,
+            # Both of these divide ``base_notional``, so a reader may add them --
+            # see the class docstring. Neither is a share of the investable
+            # remainder, even though the label weights they are derived from are.
             "unallocatable_pct": self.unallocatable_pct,
             "reserved_pct": self.reserved_pct,
             "reserved_notional": self.reserved_notional,
@@ -1458,8 +1484,9 @@ def compute_allocation(base_notional: float, available_buying_power: float,
 
     Behaviour on degenerate DATA (records a reason, never raises -- contrast the
     degenerate MONEY inputs under Raises, which must never be guessed at):
-        * a label with no symbols -> allocates nothing, ``target_pct`` added to
-          ``plan.unallocatable_pct`` and, above 0%, a ``WARNING_EMPTY_LABEL_FMT``;
+        * a label with no symbols -> allocates nothing, ``target_pct`` restated as a
+          share of the base and added to ``plan.unallocatable_pct``, and above 0% a
+          ``WARNING_EMPTY_LABEL_FMT`` naming both percentages;
         * a symbol whose ``PositionState.price`` is ``None`` or <= 0 -> skipped
           with ``REASON_NO_PRICE`` (no guessed price -- no-fallback rule);
         * a negative computed target -> clamped to 0 with ``REASON_NEGATIVE_CLAMPED``;
@@ -1540,12 +1567,20 @@ def compute_allocation(base_notional: float, available_buying_power: float,
     for lt in labels or []:
         pct = float(lt.target_pct or 0.0)
         if not lt.symbols:
-            # An empty label cannot absorb its percentage: it becomes cash left over.
+            # An empty label cannot absorb its percentage: the money stays idle.
             # At 0% there is nothing to absorb and nothing to warn about.
-            plan.unallocatable_pct += max(0.0, pct)
+            #
+            # Restated against the BASE on the way in. ``pct`` is a relative weight
+            # on the investable remainder, and ``unallocatable_pct`` sits beside
+            # ``reserved_pct`` -- which is a share of the base -- as the other half
+            # of "what is not going to work". Two denominators there make the pair
+            # sum past what the account holds.
+            plan.unallocatable_pct += effective_target_pct(max(0.0, pct),
+                                                           plan.reserved_pct)
             if pct > 0:
-                plan.warnings.append(
-                    WARNING_EMPTY_LABEL_FMT.format(label=lt.label, pct=pct))
+                plan.warnings.append(WARNING_EMPTY_LABEL_FMT.format(
+                    label=lt.label, pct=pct,
+                    base_pct=effective_target_pct(pct, plan.reserved_pct)))
             continue
         for st in lt.symbols:
             share = pct * float(st.weight_pct or 0.0) / 100.0
@@ -1577,7 +1612,11 @@ def compute_allocation(base_notional: float, available_buying_power: float,
             # No fallback price for live data -- skip the symbol and report it.
             row.skipped = True
             row.reasons.append(REASON_NO_PRICE)
-            plan.unallocatable_pct += max(0.0, target_pcts.get(symbol, 0.0))
+            # A share of the INVESTABLE remainder like every other label figure
+            # here (it is ``label_pct x symbol_weight``), so it is restated against
+            # the base for the same reason the empty-label branch above is.
+            plan.unallocatable_pct += effective_target_pct(
+                max(0.0, target_pcts.get(symbol, 0.0)), plan.reserved_pct)
             plan.rows.append(row)
             continue
         # Tri-state, explicitly. ``m.fractionable is None`` means the broker did
@@ -1762,8 +1801,12 @@ def compute_label_investment(label: LabelTarget, amount: float,
                           # here, so "100 minus the label percentages" means nothing.
                           labels=[label] if label is not None else [])
     if not label.symbols:
+        # Both percentages are 100 and that is not a coincidence: an INVEST_LABEL
+        # run's ``base_notional`` IS the budget and its ``reserved_pct`` is always
+        # 0, so the weight and the share of base cannot diverge here.
         plan.unallocatable_pct = 100.0
-        plan.warnings.append(WARNING_EMPTY_LABEL_FMT.format(label=label.label, pct=100.0))
+        plan.warnings.append(WARNING_EMPTY_LABEL_FMT.format(
+            label=label.label, pct=100.0, base_pct=100.0))
         return plan
     weights: Dict[str, float] = {}
     for st in label.symbols:

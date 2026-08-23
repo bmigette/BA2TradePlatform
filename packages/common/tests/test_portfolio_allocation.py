@@ -368,7 +368,10 @@ def test_empty_managed_label_contributes_to_unallocatable_pct():
     assert [r.symbol for r in plan.rows] == ["AAA"]
     assert plan.rows[0].target_quantity == 70.0
     assert plan.unallocatable_pct == pytest.approx(30.0)
-    assert "label 'EMPTY' has no symbols - 30.00% unallocated" in plan.warnings
+    # No reserve, so the weight and the share of base are the same 30 -- the case
+    # that hid the two-denominator defect for as long as the reserve was always 0.
+    assert ("label 'EMPTY' has no symbols - its 30.00% weight (30.00% of the base) "
+            "can absorb nothing") in plan.warnings
 
 
 def test_negative_label_target_is_clamped_to_zero():
@@ -2521,7 +2524,11 @@ def test_investable_notional_on_a_plan_is_the_base_minus_what_is_reserved():
 
 def test_the_reserve_is_still_kept_apart_from_unallocatable_pct():
     """``unallocatable_pct`` means "no label COULD absorb this" -- an empty label, a
-    no-price symbol. The reserve is deliberate. Opposite problems, opposite fixes."""
+    no-price symbol. The reserve is deliberate. Opposite problems, opposite fixes.
+
+    SEPARATE, but measured the same way: the empty label's 20% weight buys 20% of
+    the 7,500 the reserve left, which is 15% of the base. Both fields divide
+    ``base_notional`` so that 25 + 15 + 60 accounts for the whole book."""
     current = {"AAA": _pos("AAA", 10.0)}
     margin = {"AAA": MarginInfo(symbol="AAA", fractionable=False, bp_factor=1.0)}
     labels = [LabelTarget("A", 80.0, [SymbolTarget("AAA", 100.0)]),
@@ -2533,9 +2540,100 @@ def test_the_reserve_is_still_kept_apart_from_unallocatable_pct():
                                  unallocated_pct=25.0)
 
     assert plan.reserved_pct == pytest.approx(25.0)
-    assert plan.unallocatable_pct == pytest.approx(20.0)
+    assert plan.unallocatable_pct == pytest.approx(15.0)
     # 80% of the 7,500 investable remainder, NOT of the 10,000 base.
     assert plan.total_buy_value == pytest.approx(6_000.0)
+    # 25 reserved + 15 unabsorbable + 60 deployed == the whole base.
+    assert plan.reserved_pct + plan.unallocatable_pct == pytest.approx(40.0)
+
+
+def test_unallocatable_pct_is_a_share_of_the_BASE_not_of_what_the_reserve_left():
+    """The denominator that changed under 8ba9a33 without the field saying so.
+
+    It is accumulated from raw label ``target_pct``, and those became shares of the
+    INVESTABLE remainder rather than of the base. Base 10,000 with a 50% reserve,
+    labels 50 (held) / 50 (EMPTY): the empty half can absorb 2,500, which is 25% of
+    the base -- but the raw weight is 50, so the plan reported ``reserved_pct=50``
+    AND ``unallocatable_pct=50``, summing to 100 and reading as "the whole book is
+    cash" on a plan that invests 2,500. They are the two halves of the same
+    question ("what is NOT going to work, and why") and they only add up if they
+    divide the same thing.
+    """
+    current = {"AAA": _pos("AAA", 10.0)}
+    margin = {"AAA": MarginInfo(symbol="AAA", fractionable=False, bp_factor=1.0)}
+    labels = [LabelTarget("HELD", 50.0, [SymbolTarget("AAA", 100.0)]),
+              LabelTarget("EMPTY", 50.0, [])]
+
+    plan = pa.compute_allocation(10_000.0, 10_000.0, labels, current, margin,
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET,
+                                 unallocated_pct=50.0)
+
+    assert plan.reserved_pct == pytest.approx(50.0)
+    assert plan.unallocatable_pct == pytest.approx(25.0)
+    # ...and the third quarter is the money that actually trades.
+    assert plan.total_buy_value == pytest.approx(2_500.0)
+    assert plan.reserved_pct + plan.unallocatable_pct < 100.0
+
+
+def test_a_no_price_symbols_share_is_reported_against_the_base_too():
+    """The second accumulation site. A skipped symbol's share arrives already
+    multiplied out of the label weight, so it carries the same relative
+    denominator and needs the same restatement."""
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("AAA", 60.0),
+                                       SymbolTarget("BBB", 40.0)])]
+    current = {"AAA": _pos("AAA", None), "BBB": _pos("BBB", 50.0)}
+
+    plan = pa.compute_allocation(10_000.0, 1_000_000.0, labels, current, {},
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET,
+                                 unallocated_pct=20.0)
+
+    # 60% of the 8,000 the reserve left is 4,800 -- 48% of the 10,000 base.
+    assert plan.unallocatable_pct == pytest.approx(48.0)
+
+
+def test_the_serialised_plan_reports_unallocatable_against_the_base():
+    """``plan_json`` is read by things that have no engine to re-derive anything
+    with, so the stored number has to be the one the docstring describes."""
+    import json
+
+    current = {"AAA": _pos("AAA", 10.0)}
+    margin = {"AAA": MarginInfo(symbol="AAA", fractionable=False, bp_factor=1.0)}
+    labels = [LabelTarget("HELD", 60.0, [SymbolTarget("AAA", 100.0)]),
+              LabelTarget("EMPTY", 40.0, [])]
+
+    plan = pa.compute_allocation(10_000.0, 10_000.0, labels, current, margin,
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET,
+                                 unallocated_pct=25.0)
+    blob = json.loads(json.dumps(plan.to_dict()))
+
+    assert blob["unallocatable_pct"] == pytest.approx(30.0)   # 40% of the 75% left
+    assert blob["reserved_pct"] == pytest.approx(25.0)
+    # 30% + 25% of the base is idle; the remaining 45% is what the plan deploys.
+    assert blob["total_buy_value"] == pytest.approx(4_500.0)
+
+
+def test_the_empty_label_warning_names_both_the_weight_and_the_share_of_base():
+    """The warning is what the user acts on, and under a reserve the two numbers
+    are different. Naming only the share of base leaves them hunting for a box
+    holding a percentage nobody typed; naming only the weight is the field's own
+    defect restated in prose."""
+    current = {"AAA": _pos("AAA", 10.0)}
+    margin = {"AAA": MarginInfo(symbol="AAA", fractionable=False, bp_factor=1.0)}
+    labels = [LabelTarget("HELD", 60.0, [SymbolTarget("AAA", 100.0)]),
+              LabelTarget("EMPTY", 40.0, [])]
+
+    plan = pa.compute_allocation(10_000.0, 10_000.0, labels, current, margin,
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET,
+                                 unallocated_pct=25.0)
+
+    warning = next(w for w in plan.warnings if "EMPTY" in w)
+    assert "40.00%" in warning, warning        # the weight the user typed
+    assert "30.00%" in warning, warning        # ...which is this much of the base
+    assert warning.index("40.00%") < warning.index("30.00%"), warning
 
 
 def test_a_hundred_percent_reserve_targets_nothing_and_sells_the_book():
