@@ -143,23 +143,29 @@ def test_run_json_columns_round_trip(mock_account_def):
         assert row.order_ids == [11, 12, 13]
 
 
-def test_allocation_config_defaults_to_cost_mode_and_fractional_shares(mock_account_def):
-    """Fractional defaults ON: about three quarters of the user's symbols ARE
+def test_allocation_config_defaults_to_market_mode_and_fractional_shares(mock_account_def):
+    """MARKET is the default: the requirement is "allocate by VALUE", and cost mode
+    understates the allocatable base by the whole unrealised P&L, so it buys MORE of
+    a winner instead of trimming it.
+
+    Fractional defaults ON: about three quarters of the user's symbols ARE
     fractionable, and the quarter that is not falls back to whole shares per symbol
     inside the engine anyway."""
     add_instance(PortfolioAllocationConfig(account_id=mock_account_def.id))
     with get_db() as session:
         row = session.exec(select(PortfolioAllocationConfig)).one()
-        assert row.valuation_mode == "cost"
+        assert row.valuation_mode == "market"
         assert row.allow_fractional is True
 
 
-def test_allocation_config_round_trips_market_mode(mock_account_def):
+def test_allocation_config_round_trips_cost_mode(mock_account_def):
+    """Cost basis is still a first-class, user-selectable mode -- it is the escape
+    hatch a held symbol with a failed quote sends the user to."""
     add_instance(PortfolioAllocationConfig(
-        account_id=mock_account_def.id, valuation_mode="market", allow_fractional=True))
+        account_id=mock_account_def.id, valuation_mode="cost", allow_fractional=True))
     with get_db() as session:
         row = session.exec(select(PortfolioAllocationConfig)).one()
-        assert row.valuation_mode == "market"
+        assert row.valuation_mode == "cost"
         assert row.allow_fractional is True
 
 

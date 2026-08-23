@@ -202,8 +202,10 @@ def test_remove_symbol_weight_returns_false_when_no_row_exists(account_id):
 # --- per-account allocation config (valuation mode) ------------------------
 
 def test_get_allocation_config_creates_the_row_with_spec_defaults(account_id):
+    # MARKET, not cost (W1): the requirement is to allocate by VALUE, and cost mode
+    # understates the allocatable base by the whole unrealised P&L.
     config = store.get_allocation_config(account_id)
-    assert config.valuation_mode == "cost"
+    assert config.valuation_mode == "market"
     assert config.allow_fractional is True
     # Reading twice must not create a second row (account_id is unique).
     assert store.get_allocation_config(account_id).id == config.id
@@ -246,8 +248,8 @@ def test_set_allocation_config_rejects_an_unknown_valuation_mode(account_id):
 def test_valuation_mode_is_scoped_per_account(account_id):
     from tests.factories import create_account_definition
     other = create_account_definition(name="Other Account")
-    store.set_allocation_config(account_id, valuation_mode="market")
-    assert store.get_allocation_config(other.id).valuation_mode == "cost"
+    store.set_allocation_config(account_id, valuation_mode="cost")
+    assert store.get_allocation_config(other.id).valuation_mode == "market"
 
 
 def test_set_allocation_config_bumps_updated_at(account_id):
@@ -671,7 +673,7 @@ def test_deleting_account_allocation_data_removes_every_table_row(account_id):
     assert store.get_open_income_events(account_id) == []
     assert store.get_recent_runs(account_id) == []
     # The config row is gone, so the next read recreates it with the defaults.
-    assert store.get_allocation_config(account_id).valuation_mode == "cost"
+    assert store.get_allocation_config(account_id).valuation_mode == "market"
     # The parent AccountDefinition is still here: no FK cascade can have done ANY
     # of the work above, because a cascade only fires on a parent delete.
     assert get_instance(AccountDefinition, account_id).id == account_id

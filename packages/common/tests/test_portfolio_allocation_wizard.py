@@ -67,7 +67,10 @@ def test_build_base_snapshot_splits_buying_power_from_managed_value():
                            is_margin_account=True, supports_fractional=True)
     current = {"AAPL": PositionState(symbol="AAPL", quantity=10, cost_basis=1500.0)}
 
-    base = build_base_snapshot(snap, current, ["AAPL"])
+    # COST explicitly: this position carries no price, so it is the cost basis that
+    # makes 1,500 a number at all. The market-mode split has its own test below.
+    base = build_base_snapshot(snap, current, ["AAPL"],
+                               valuation_mode=VALUATION_MODE_COST)
 
     assert isinstance(base, BaseSnapshot)
     assert base.available_buying_power == pytest.approx(10_000.0)
@@ -93,7 +96,7 @@ def test_build_base_snapshot_in_market_mode_values_positions_at_the_live_price()
 
 def test_build_base_snapshot_without_multiplier_assumes_cash_account():
     snap = AccountSnapshot(buying_power=5_000.0, margin_multiplier=None)
-    base = build_base_snapshot(snap, {}, [])
+    base = build_base_snapshot(snap, {}, [], valuation_mode=VALUATION_MODE_MARKET)
     assert base.default_bp_factor == pytest.approx(1.0)
     assert WARNING_NO_MULTIPLIER in base.warnings
 
@@ -101,12 +104,143 @@ def test_build_base_snapshot_without_multiplier_assumes_cash_account():
 def test_build_base_snapshot_missing_buying_power_raises():
     snap = AccountSnapshot(cash=1_000.0, buying_power=None)
     with pytest.raises(ValueError):
-        build_base_snapshot(snap, {}, [])
+        build_base_snapshot(snap, {}, [], valuation_mode=VALUATION_MODE_MARKET)
 
 
 def test_build_base_snapshot_with_no_snapshot_at_all_raises():
     with pytest.raises(ValueError):
-        build_base_snapshot(None, {}, [])
+        build_base_snapshot(None, {}, [], valuation_mode=VALUATION_MODE_MARKET)
+
+
+# ---------------------------------------------------------------------------
+# W1: VALUE (market) is the default valuation, and a HELD symbol with no quote
+# blocks a market-mode submission.
+# ---------------------------------------------------------------------------
+
+
+def test_base_snapshot_defaults_to_market_valuation():
+    """The shipped default is what the account gets when nobody touches the toggle,
+    and the requirement is "allocate by VALUE". Cost mode understates the base by
+    the whole unrealised P&L, so it tops winners up instead of trimming them."""
+    base = BaseSnapshot(available_buying_power=1.0, managed_value=0.0,
+                        base_notional=1.0, default_bp_factor=1.0)
+    assert base.valuation_mode == VALUATION_MODE_MARKET
+
+
+def test_build_base_snapshot_requires_an_explicit_valuation_mode():
+    """No Python default, exactly like the three solvers. A silent default here and
+    a different one at the solver is how the base and the deltas end up measured
+    with two different definitions of "current value"."""
+    snap = AccountSnapshot(buying_power=1_000.0, margin_multiplier=1.0)
+    with pytest.raises(TypeError):
+        build_base_snapshot(snap, {}, [])
+
+
+def test_a_held_symbol_with_no_price_is_reported_by_the_base_snapshot():
+    """In market mode a held position with no quote contributes 0 to the base, which
+    silently shrinks every other label's target. Measured: a 5,000 position with a
+    failed quote takes the base from 10,000 to 5,000 and halves every target."""
+    snap = AccountSnapshot(buying_power=5_000.0, margin_multiplier=1.0)
+    current = {"DARK": PositionState(symbol="DARK", quantity=100.0, cost_basis=5_000.0,
+                                     price=None)}
+
+    base = build_base_snapshot(snap, current, ["DARK"],
+                               valuation_mode=VALUATION_MODE_MARKET)
+
+    assert base.unpriced_held_symbols == ["DARK"]
+    assert base.managed_value == pytest.approx(0.0)
+
+
+def test_an_unheld_symbol_with_no_price_is_not_reported():
+    """Already handled correctly: the engine skips it with REASON_NO_PRICE and counts
+    its share in unallocatable_pct. It corrupts no denominator, so it is a non-event."""
+    snap = AccountSnapshot(buying_power=5_000.0, margin_multiplier=1.0)
+    current = {"NEW": PositionState(symbol="NEW", quantity=0.0, cost_basis=0.0, price=None)}
+
+    base = build_base_snapshot(snap, current, ["NEW"],
+                               valuation_mode=VALUATION_MODE_MARKET)
+
+    assert base.unpriced_held_symbols == []
+
+
+def test_cost_mode_reports_no_unpriced_held_symbols():
+    """Cost mode reads the cost basis and never looks at the price, so an absent quote
+    changes no number at all. Flagging it there would be a warning with no defect."""
+    snap = AccountSnapshot(buying_power=5_000.0, margin_multiplier=1.0)
+    current = {"DARK": PositionState(symbol="DARK", quantity=100.0, cost_basis=5_000.0,
+                                     price=None)}
+
+    base = build_base_snapshot(snap, current, ["DARK"],
+                               valuation_mode=VALUATION_MODE_COST)
+
+    assert base.unpriced_held_symbols == []
+    assert base.managed_value == pytest.approx(5_000.0)
+
+
+def test_a_zero_or_negative_price_counts_as_no_price():
+    """``current_value`` treats ``price <= 0`` exactly like ``None`` (it returns 0.0),
+    so the guard has to agree with it or a 0.0 quote slips through valued at nothing."""
+    snap = AccountSnapshot(buying_power=5_000.0, margin_multiplier=1.0)
+    current = {"ZERO": PositionState(symbol="ZERO", quantity=100.0, cost_basis=5_000.0,
+                                     price=0.0)}
+
+    base = build_base_snapshot(snap, current, ["ZERO"],
+                               valuation_mode=VALUATION_MODE_MARKET)
+
+    assert base.unpriced_held_symbols == ["ZERO"]
+
+
+def test_a_short_position_with_no_price_is_reported_too():
+    """A short carries a NEGATIVE quantity and a negative value, so it moves the base
+    just as much as a long does. Testing ``quantity > 0`` would miss it."""
+    snap = AccountSnapshot(buying_power=5_000.0, margin_multiplier=1.0)
+    current = {"SHRT": PositionState(symbol="SHRT", quantity=-50.0, cost_basis=-2_000.0,
+                                     price=None)}
+
+    base = build_base_snapshot(snap, current, ["SHRT"],
+                               valuation_mode=VALUATION_MODE_MARKET)
+
+    assert base.unpriced_held_symbols == ["SHRT"]
+
+
+def test_held_no_price_block_names_every_symbol_and_says_what_it_costs():
+    from ba2_common.core.portfolio_allocation import held_no_price_block
+
+    message = held_no_price_block(["DARK", "OTHER"])
+
+    assert message is not None
+    assert "DARK" in message and "OTHER" in message
+    assert "cost basis" in message      # the escape hatch, named
+
+
+def test_held_no_price_block_is_none_when_every_held_symbol_has_a_quote():
+    from ba2_common.core.portfolio_allocation import held_no_price_block
+
+    assert held_no_price_block([]) is None
+    assert held_no_price_block(None) is None
+
+
+def test_the_held_no_price_block_is_a_BLOCKING_message():
+    """It must not fall through ``ADVISORY_MESSAGE_FRAGMENTS``: the whole point is
+    that it stops a submission whose base is quietly wrong."""
+    from ba2_common.core.portfolio_allocation import (
+        held_no_price_block, is_blocking_message,
+    )
+
+    assert is_blocking_message(held_no_price_block(["DARK"])) is True
+
+
+def test_unpriced_held_symbols_keeps_the_managed_symbol_order_and_de_duplicates():
+    snap = AccountSnapshot(buying_power=1.0, margin_multiplier=1.0)
+    current = {
+        "BBB": PositionState(symbol="BBB", quantity=1.0, cost_basis=1.0, price=None),
+        "AAA": PositionState(symbol="AAA", quantity=1.0, cost_basis=1.0, price=None),
+    }
+
+    base = build_base_snapshot(snap, current, ["BBB", "AAA", "BBB"],
+                               valuation_mode=VALUATION_MODE_MARKET)
+
+    assert base.unpriced_held_symbols == ["BBB", "AAA"]
 
 
 # ---------------------------------------------------------------------------

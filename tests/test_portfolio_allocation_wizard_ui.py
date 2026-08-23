@@ -1029,6 +1029,8 @@ def test_wizard_submit_bails_on_the_gate_before_it_touches_anything_else(nicegui
     Proven on an instance built with ``object.__new__``: it has no ``_submitted``
     latch, no ``plan`` and no ``dialog``, so reading, filtering or closing any of
     them ahead of the gate raises ``AttributeError`` instead of quietly returning.
+    ``base`` IS supplied, because ``_base_block`` reads it and is deliberately
+    checked even earlier -- see the mirror test below.
 
     A client context is entered because ``ui.notify`` needs a slot -- which it
     always has in production, where this only ever runs from a click handler. The
@@ -1039,6 +1041,7 @@ def test_wizard_submit_bails_on_the_gate_before_it_touches_anything_else(nicegui
 
     submitted = []
     obj = object.__new__(wiz.AllocationWizard)
+    obj.base = _base()
     obj.market = _closed_market()
     obj.on_submit = submitted.append
 
@@ -1047,6 +1050,31 @@ def test_wizard_submit_bails_on_the_gate_before_it_touches_anything_else(nicegui
 
     assert submitted == []
     assert not hasattr(obj, "_submitted")     # the latch was never even reached
+
+
+def test_wizard_submit_bails_on_an_unpriced_holding_before_anything_else_too(
+        nicegui_client):
+    """The mirror of the test above for the OTHER refusal, and it is checked FIRST:
+    a held symbol with no quote is something the user can act on now, whereas a
+    closed market is something they can only wait out.
+
+    Same ``object.__new__`` instance with no latch, no plan and no dialog, and the
+    market gate deliberately OPEN so nothing but the base block can be doing the
+    refusing.
+    """
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    submitted = []
+    obj = object.__new__(wiz.AllocationWizard)
+    obj.base = _base_with_an_unpriced_holding()
+    obj.market = _open_market()
+    obj.on_submit = submitted.append
+
+    with nicegui_client:
+        obj._submit()
+
+    assert submitted == []
+    assert not hasattr(obj, "_submitted")
 
 
 def test_wizard_imports_the_engine_summary_helpers():
@@ -1398,3 +1426,83 @@ def test_refreshing_onto_a_fallback_open_raises_the_caveat_that_was_not_there(
         drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_MARKET_BANNER)
     assert len(drawn) == 1
     assert "did not answer" in drawn[0]
+
+
+# ---------------------------------------------------------------------------
+# W1: a HELD symbol with no quote blocks a MARKET-mode submission.
+#
+# In market mode such a position contributes 0 to the allocatable base, so every
+# label's target shrinks by its share of the missing money -- and the dry run
+# cannot show it, because every row is consistently too small. Disabling Submit
+# here is the courtesy half; ``run_allocation`` re-derives it server-side.
+# ---------------------------------------------------------------------------
+
+def _base_with_an_unpriced_holding():
+    return BaseSnapshot(available_buying_power=5_000.0, managed_value=0.0,
+                        base_notional=5_000.0, default_bp_factor=1.0,
+                        valuation_mode=VALUATION_MODE_MARKET, cash=5_000.0,
+                        unpriced_held_symbols=["DARK"])
+
+
+def test_an_unpriced_holding_disables_submit_even_with_the_market_open(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wizard = wiz.AllocationWizard(_base_with_an_unpriced_holding(), _mixed_plan(),
+                                      market=_open_market(),
+                                      on_refresh=lambda f: (_mixed_plan(), _open_market()),
+                                      on_submit=lambda p: pytest.fail("must not submit"))
+        wizard.open()
+        drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_BASE_BLOCK)
+
+    assert wizard._submit_button.enabled is False
+    assert len(drawn) == 1
+    assert "DARK" in drawn[0]
+
+
+def test_an_unpriced_holding_refuses_the_submit_click_itself(nicegui_client):
+    """The disabled button is a mirror and a mirror can be stale (a keyboard
+    activation, a stale client). The handler re-checks."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    calls = []
+    with nicegui_client:
+        wizard = wiz.AllocationWizard(_base_with_an_unpriced_holding(), _mixed_plan(),
+                                      market=_open_market(),
+                                      on_refresh=lambda f: (_mixed_plan(), _open_market()),
+                                      on_submit=lambda p: calls.append(p))
+        wizard.open()
+        wizard._submit()
+
+    assert calls == []
+    # NOT latched: nothing was sent, so a user who fixes the quote and reopens must
+    # still be able to submit for real.
+    assert wizard._submitted is False
+
+
+def test_a_fully_priced_book_draws_no_block_and_leaves_submit_alone(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wizard = wiz.AllocationWizard(_base(), _mixed_plan(), market=_open_market(),
+                                      on_refresh=lambda f: (_mixed_plan(), _open_market()),
+                                      on_submit=lambda p: None)
+        wizard.open()
+        drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_BASE_BLOCK)
+
+    assert drawn == []
+    assert wizard._submit_button.enabled is True
+
+
+def test_the_unpriced_holding_block_survives_a_closed_market(nicegui_client):
+    """Two independent reasons to refuse. Whichever is shown, Submit stays off."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wizard = wiz.AllocationWizard(_base_with_an_unpriced_holding(), _mixed_plan(),
+                                      market=_closed_market(),
+                                      on_refresh=lambda f: (_mixed_plan(), _open_market()),
+                                      on_submit=lambda p: pytest.fail("must not submit"))
+        wizard.open()
+
+    assert wizard._submit_button.enabled is False

@@ -740,14 +740,23 @@ def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
             ui.label('Managed labels').classes('text-xs text-secondary-custom')
             ui.label(str(len(views))).classes('text-lg font-bold')
 
+    # DANGER, not warning, since market became the default (W1). This is no longer
+    # "your percentages are slightly off": those positions contribute 0 to the
+    # allocatable base, so every label's target is understated by its share of the
+    # missing money, and both the wizard and ``run_allocation`` now REFUSE to
+    # submit against such a base (``held_no_price_block``). The banner has to look
+    # like the refusal it is, or the user reads past it and presses Allocate.
     unpriced = missing_quote_symbols(views)
     if unpriced and mode == VALUATION_MODE_MARKET:
-        with ui.element('div').classes('alert-banner warning w-full p-3'):
+        with ui.element('div').classes('alert-banner danger w-full p-3'):
             ui.label(f"No quote for {len(unpriced)} held symbol(s): "
                      f"{', '.join(unpriced)}")
             ui.label('They are valued at $0.00 in market mode, which is NOT the same '
                      'as being flat — switch to cost basis, or retry the quote.'
                      ).classes('text-xs text-secondary-custom')
+            ui.label('Allocate is blocked while this is true: those positions are '
+                     'missing from the allocatable base, so every target below is '
+                     'smaller than it should be.').classes('text-xs')
 
     ui.label('Prices are the broker feed (Alpaca defaults to delayed_sip — 15 minutes '
              'delayed). Only symbols carrying a managed label are listed. Short '

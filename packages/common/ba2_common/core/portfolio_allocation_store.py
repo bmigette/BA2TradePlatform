@@ -292,9 +292,15 @@ def remove_symbol_weight(account_id: int, label: str, symbol: str) -> bool:
 def get_allocation_config(account_id: int) -> PortfolioAllocationConfig:
     """The account's allocation config, CREATING it with the defaults on first use.
 
-    Defaults are ``valuation_mode="cost"`` (spec decision 5a) and
-    ``allow_fractional=True``. Always returns a row, never ``None``: the page must always be
-    able to state which valuation mode produced the numbers on screen.
+    Defaults are ``valuation_mode="market"`` and ``allow_fractional=True``. Always
+    returns a row, never ``None``: the page must always be able to state which
+    valuation mode produced the numbers on screen.
+
+    MARKET, not the original spec-5a "cost": the requirement is to allocate by
+    VALUE. Cost mode measures the allocatable base as ``buying power + what you
+    PAID``, understating it by the whole unrealised P&L, so it tops a winner UP
+    where market TRIMS it. Cost basis remains selectable and is the documented
+    escape hatch when a held symbol's quote fails.
 
     Pass the returned ``valuation_mode`` to the engine. It has to be passed: all
     three engine entry points (``compute_base_notional``, ``compute_allocation``,

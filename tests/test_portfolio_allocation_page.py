@@ -791,7 +791,7 @@ def test_the_managed_value_headline_counts_a_two_label_symbol_once(nicegui_clien
                                      _pos('AAPL', 1, 1000.0, 1000.0)])
     views = build_label_views([ManagedLabel('ARK26', 50.0), ManagedLabel('HighRisk', 50.0)],
                               {'ARK26': ['TSLA', 'AAPL'], 'HighRisk': ['TSLA']},
-                              positions, {})
+                              positions, {}, valuation_mode=VALUATION_MODE_COST)
     with nicegui_client:
         page._render_labels(1, _payload(views), _noop_refresh)
 
@@ -814,6 +814,28 @@ def test_market_mode_names_the_held_symbols_it_could_not_quote(nicegui_client):
     text = ' '.join(_texts(nicegui_client.layout))
     assert 'No quote for 1 held symbol(s): AAPL' in text
     assert 'NOT the same' in text
+    # W1 promoted this from an advisory to a REFUSAL: since market is the default
+    # mode, this is no longer "your percentages are a bit off", it is "the
+    # allocatable base is missing this position and Allocate will not run".
+    assert 'Allocate is blocked' in text
+
+
+def test_the_unpriced_holding_banner_is_drawn_as_a_danger_not_a_warning(nicegui_client):
+    """``alert-banner warning`` is the same orange the page uses for footnotes. A
+    refusal has to look like one, or the user reads past it and presses Allocate."""
+    from nicegui import ui
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import positions_by_symbol
+
+    positions = positions_by_symbol([_pos('AAPL', 10, 1000.0, 1100.0)])
+    views = build_label_views([ManagedLabel('ARK26', 100.0)], {'ARK26': ['AAPL']},
+                              positions, {'AAPL': None},
+                              valuation_mode=VALUATION_MODE_MARKET)
+    with nicegui_client:
+        page._render_labels(1, _payload(views, VALUATION_MODE_MARKET), _noop_refresh)
+        classes = [' '.join(el._classes) for el in nicegui_client.layout.descendants()
+                   if isinstance(el, ui.element)]
+
+    assert any('alert-banner danger' in c for c in classes)
 
 
 def test_cost_mode_does_not_warn_about_quotes_it_never_used(nicegui_client):
@@ -842,7 +864,11 @@ def test_content_draws_the_whole_page_for_a_manual_account(
 
     text = ' '.join(_texts(nicegui_client.layout))
     assert 'Portfolio Allocation' in text
-    assert '$6,000.00' in text                    # cost basis is the default mode
+    # MARKET is the default mode (W1): 10 shares at 800 is 8,000, not the 6,000
+    # they cost. The headline names the mode it used right next to the number.
+    assert '$8,000.00' in text
+    assert 'market value (qty x price)' in text
+    assert '$6,000.00' not in text
     assert 'Managed labels' in text
 
 
@@ -916,7 +942,8 @@ def test_the_comment_inputs_are_debounced_rather_than_saving_per_keystroke(
 
     positions = positions_by_symbol([_pos('AAPL', 10, 1000.0, 1100.0)])
     view = build_label_views([ManagedLabel('ARK26', 100.0)], {'ARK26': ['AAPL']},
-                             positions, {'AAPL': 110.0})[0]
+                             positions, {'AAPL': 110.0},
+                             valuation_mode=VALUATION_MODE_MARKET)[0]
     with nicegui_client:
         page._render_label_body(1, view, _noop_refresh)
 

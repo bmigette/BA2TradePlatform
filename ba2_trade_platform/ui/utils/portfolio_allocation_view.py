@@ -266,14 +266,21 @@ def build_label_views(managed,
                       positions,
                       prices,
                       symbol_comments=None,
-                      valuation_mode: str = VALUATION_MODE_COST) -> List[LabelView]:
+                      *,
+                      valuation_mode: str) -> List[LabelView]:
     """Build the default view: one LabelView per managed label. Pure.
 
     ``valuation_mode`` (decision 5a) selects what "current value" means: ``cost``
     (the cost basis) or ``market`` (``qty x price``). It drives BOTH percentage
     columns and both totals, so the page must state which mode produced them.
-    Defaults to ``cost``, matching ``portfolio_allocation_config.valuation_mode``.
     A market-mode symbol with no price contributes 0 rather than a guessed value.
+
+    It is REQUIRED and has NO default, matching ``build_base_snapshot`` and the
+    three solvers. Whichever way a default pointed, a caller that forgot the keyword
+    would get a PAGE measured on one definition of "current value" and a PLAN solved
+    on another; the account's stored mode
+    (``portfolio_allocation_config.valuation_mode``) is the only right answer and it
+    has to be passed in.
 
     Args:
         managed: ``List[ManagedLabel]`` in display order.

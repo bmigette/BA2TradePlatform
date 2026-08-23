@@ -35,7 +35,10 @@ def _seed(account_id):
     store.set_symbol_weight(account_id, 'ARK26', 'TSLA', weight_pct=100.0)
     store.upsert_income_event(account_id, 'csd-1', date(2026, 8, 1), 'DEPOSIT', 100.0)
     store.record_allocation_run(account_id, 'REBALANCE', {})
-    store.set_allocation_config(account_id, valuation_mode='market')
+    # NON-default on purpose: the default is 'market' (W1), so seeding 'cost' is
+    # what makes "a fresh read yields the DEFAULT" a real assertion rather than a
+    # tautology that a stranded row would also satisfy.
+    store.set_allocation_config(account_id, valuation_mode='cost')
 
 
 def _config_rows(account_id):
@@ -70,17 +73,17 @@ def test_deleting_an_account_clears_the_unique_config_row_it_would_collide_with(
     percentage on the page. The table is queried directly because
     ``get_allocation_config`` CREATES the row it cannot find, which would mask
     exactly the leak under test; the follow-up assertion then proves a fresh read
-    yields the DEFAULT 'cost' rather than the deleted account's 'market'.
+    yields the DEFAULT 'market' rather than the deleted account's 'cost'.
     """
     account = create_account_definition(name='Doomed')
     account_id = account.id
     _seed(account_id)
-    assert [r.valuation_mode for r in _config_rows(account_id)] == ['market']
+    assert [r.valuation_mode for r in _config_rows(account_id)] == ['cost']
 
     _delete_account(account)
 
     assert _config_rows(account_id) == []
-    assert store.get_allocation_config(account_id).valuation_mode == 'cost'
+    assert store.get_allocation_config(account_id).valuation_mode == 'market'
 
 
 def test_deleting_an_account_leaves_another_accounts_allocation_intact():
@@ -93,7 +96,7 @@ def test_deleting_an_account_leaves_another_accounts_allocation_intact():
 
     assert [r.label for r in store.get_managed_labels(keeper.id)] == ['ARK26']
     assert store.get_open_income_total(keeper.id) == 100.0
-    assert [r.valuation_mode for r in _config_rows(keeper.id)] == ['market']
+    assert [r.valuation_mode for r in _config_rows(keeper.id)] == ['cost']
     assert list(store.get_symbol_rows(keeper.id, 'ARK26')) == ['TSLA']
     assert len(store.get_recent_runs(keeper.id)) == 1
 

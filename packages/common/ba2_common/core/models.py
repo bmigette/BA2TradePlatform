@@ -837,12 +837,23 @@ class PortfolioAllocationConfig(SQLModel, table=True):
     ``valuation_mode`` is a PLAIN str column (matching OptionActivity.activity_type):
     "cost" or "market" -- use ``VALUATION_MODE_COST`` / ``VALUATION_MODE_MARKET``
     from ``ba2_common.core.portfolio_allocation``, never a bare literal. One row
-    per account, created on first use with the defaults "cost" and
-    allow_fractional=True. Fractional defaults ON because roughly three quarters of
-    this book IS fractionable; the quarter that is not falls back to whole shares
-    per symbol inside the engine (``MarginInfo.fractionable``), so the default costs
-    nothing on the ineligible names. The column has NO server default -- this Python
-    default is what every new row gets, which is why changing it needs no Alembic
+    per account, created on first use with the defaults "market" and
+    allow_fractional=True.
+
+    MARKET is the default because the requirement is to allocate by VALUE. Cost mode
+    measures the allocatable base as ``buying power + what you PAID``, which
+    understates it by the entire unrealised P&L and therefore buys MORE of a winner
+    instead of trimming it: on a book of 100 WIN (basis 2,000, now worth 12,000) and
+    100 FLAT (basis 2,000, now 2,000) with 6,000 of buying power, a 50/50 target
+    gives a 10,000 base and BUYS 25 more WIN in cost mode, against a 20,000 base that
+    SELLS 17 WIN at market. Cost basis stays a first-class choice -- it is the escape
+    hatch when a held symbol's quote fails.
+
+    Fractional defaults ON because roughly three quarters of this book IS
+    fractionable; the quarter that is not falls back to whole shares per symbol
+    inside the engine (``MarginInfo.fractionable``), so the default costs nothing on
+    the ineligible names. Neither column has a server default -- these Python
+    defaults are what every new row gets, which is why changing one needs no Alembic
     revision.
     """
     __tablename__ = "portfolio_allocation_config"
@@ -850,7 +861,7 @@ class PortfolioAllocationConfig(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     account_id: int = Field(foreign_key="accountdefinition.id", ondelete="CASCADE",
                             index=True, unique=True)
-    valuation_mode: str = Field(default="cost", description="cost | market (plain str, see core.portfolio_allocation)")
+    valuation_mode: str = Field(default="market", description="cost | market (plain str, see core.portfolio_allocation)")
     allow_fractional: bool = Field(default=True, description="Last fractional-shares choice, pre-filled into the wizard (defaults ON)")
     updated_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), index=True)
 

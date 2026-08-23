@@ -42,6 +42,7 @@ from ...core.portfolio_allocation import (
     even_split_targets,
     filter_plan_rows,
     fractional_summary,
+    held_no_price_block,
     invest_validation_messages,
     is_blocking_message,
     no_order_notice,
@@ -103,6 +104,12 @@ MARKER_WORKING_ORDERS = 'income-working-orders'
 #: Markers on the step 1 / step 2 percentage boxes, in label then symbol order.
 MARKER_LABEL_PCT = 'steps-label-pct'
 MARKER_SYMBOL_PCT = 'steps-symbol-pct'
+
+#: Marker on the base panel's BLOCKING banner -- today only the market-mode
+#: "a held symbol has no quote" refusal (``held_no_price_block``). Located by
+#: marker rather than by text: the symbol names it lists also appear in the table
+#: right below it, so a text search cannot tell whether the banner was drawn.
+MARKER_BASE_BLOCK = 'base-block'
 
 #: Shown under the INVEST_LABEL amount box.
 INVEST_SCOPE_NOTE = ('Pre-filled with the unallocated income total. Buys only - '
@@ -235,6 +242,27 @@ class AllocationWizard:
                     ui.icon('schedule')
                     ui.label(text).classes('text-sm').mark(MARKER_MARKET_BANNER)
 
+    def _base_block(self) -> Optional[str]:
+        """Why this BASE may not be submitted at all, or ``None``. Not the clock.
+
+        Today there is exactly one such reason and it is the one W1 makes live: in
+        MARKET valuation a symbol the account HOLDS but cannot price contributes 0
+        to ``base_notional``, so every label's target is understated by its share of
+        the missing money. The dry run cannot show that -- every row is
+        proportionally too small, so the table looks perfectly self-consistent.
+
+        Read off the base, not the plan: the plan's no-price rows are neither
+        pre-ticked nor tickable, so ``filter_plan_rows`` drops them and the FILTERED
+        plan Submit actually sends looks clean.
+
+        Taken at wizard-open and NOT re-derived by ``_refresh`` -- ``on_refresh``
+        returns ``(plan, market)`` and no new base. That errs the safe way in the
+        expensive direction (a quote that recovers leaves Submit off until the
+        dialog is reopened) and ``run_allocation`` re-derives it from the SOLVE-time
+        base, so a quote that FAILS between opening and submitting is still refused.
+        """
+        return held_no_price_block(self.base.unpriced_held_symbols)
+
     def _sync_submit_button(self):
         """Point the Submit button at the CURRENT gate. Idempotent.
 
@@ -242,13 +270,21 @@ class AllocationWizard:
         off -- the banner right above says when it returns. Called from ``open``
         and from every ``_refresh``, because the gate moves while the dialog sits
         there and the button is only a mirror of it.
+
+        TWO independent refusals, and the tooltip names whichever is in force: the
+        market-hours gate (moves while the dialog is open) and ``_base_block`` (a
+        held symbol with no quote, which does not). The base block is checked FIRST
+        because it is the one the user can act on straight away.
         """
         if self._submit_button is None:
             return
-        blocked = not self.market.allowed
+        base_block = self._base_block()
+        blocked = base_block is not None or not self.market.allowed
         self._submit_button.set_enabled(not blocked and not self._submitted)
         if self._submit_tooltip is not None:
-            self._submit_tooltip.set_text(self.market.message if blocked else '')
+            reason = base_block if base_block is not None else (
+                self.market.message if not self.market.allowed else '')
+            self._submit_tooltip.set_text(reason)
             self._submit_tooltip.set_visibility(blocked)
 
     def _render_notices(self):
@@ -323,6 +359,14 @@ class AllocationWizard:
                      f'{self.base.managed_value:,.2f}')
             ui.label(f'Base notional: {self.base.base_notional:,.2f}').classes('font-bold')
             ui.label(f"as of {self.base.taken_at:%Y-%m-%d %H:%M UTC}").classes('text-xs text-gray-400')
+        # DANGER, not warning, and above the warnings: this one does not merely
+        # qualify the numbers below it, it says they are wrong and Submit is off.
+        base_block = self._base_block()
+        if base_block is not None:
+            with ui.element('div').classes('alert-banner danger w-full p-3'):
+                with ui.row().classes('items-center gap-2'):
+                    ui.icon('price_change')
+                    ui.label(base_block).classes('text-sm').mark(MARKER_BASE_BLOCK)
         for warning in self.base.warnings:
             ui.label(warning).classes('text-xs text-orange-400')
         for warning in self.plan.warnings:
@@ -504,13 +548,18 @@ class AllocationWizard:
 
         An EMPTY submit does not latch: nothing was sent, and the user still has
         to be able to tick a row and press Submit for real. Neither does a submit
-        the MARKET GATE refuses.
+        the MARKET GATE or ``_base_block`` refuses.
         """
         # FIRST, before touching any other state: the button is disabled, but a
         # stale client or a keyboard activation must not get past this either. The
-        # real enforcement is in run_allocation, which re-reads the clock; this is
-        # the polite half, and it is deliberately ahead of the one-shot latch so a
-        # refused click leaves the dialog exactly as it found it.
+        # real enforcement is in run_allocation, which re-reads the clock AND
+        # re-derives the base block; this is the polite half, and it is deliberately
+        # ahead of the one-shot latch so a refused click leaves the dialog exactly
+        # as it found it.
+        base_block = self._base_block()
+        if base_block is not None:
+            ui.notify(base_block, type='negative')
+            return
         if not self.market.allowed:
             ui.notify(self.market.message, type=self.market.severity)
             return

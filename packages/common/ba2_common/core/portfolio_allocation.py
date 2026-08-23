@@ -44,6 +44,7 @@ __all__ = [
     "PositionFetchFailed", "AccountSnapshot", "MarginInfo", "OrderImpact",
     # wizard
     "BaseSnapshot", "build_base_snapshot", "WARNING_NO_MULTIPLIER",
+    "held_symbols_without_price", "held_no_price_block", "ERROR_HELD_NO_PRICE_FMT",
     "dry_run_rows", "filter_plan_rows", "summarise_plan", "DRY_RUN_QUANTITY_DECIMALS",
     "even_split_targets", "steps_validation_messages", "validate_invest_amount",
     "invest_validation_messages", "is_blocking_message", "blocking_messages",
@@ -325,6 +326,18 @@ ERROR_LABEL_NO_SYMBOLS_FMT = "label '{label}' has target {pct:.2f}% but no symbo
 ERROR_SYMBOL_TOTAL_FMT = "label '{label}' symbol weights total {total:.2f}% - must total 100%"
 ERROR_SYMBOL_NEGATIVE_FMT = "label '{label}' symbol '{symbol}' has a negative weight ({pct:.2f}%)"
 ERROR_SYMBOL_DUPLICATE_FMT = "label '{label}' has duplicate symbol '{symbol}'"
+
+#: MARKET mode, and a symbol the account HOLDS has no usable quote. BLOCKING, and
+#: it is the flip to market valuation that makes it live -- in cost mode the price
+#: is never read. The position contributes 0 to ``base_notional``, so every OTHER
+#: label's target shrinks by its share of the missing money, and the dry run cannot
+#: show it because every row is consistently too small. Names the symbols and the
+#: two ways out (retry the quote, or fall back to cost basis). Never merged with
+#: REASON_NO_PRICE: that one is about a row, this one is about the denominator.
+ERROR_HELD_NO_PRICE_FMT = (
+    "market valuation needs a live price for every HELD symbol - {count} have none "
+    "({symbols}). They count as 0 in the allocatable base, so every label's target "
+    "is understated. Retry the quote, or switch the page to cost basis.")
 
 
 class PositionFetchFailed(RuntimeError):
@@ -1726,17 +1739,85 @@ class BaseSnapshot:
     margin multiplier when the broker publishes one; when it does not, it is
     1.0 -- "one dollar of notional costs one dollar of buying power", i.e. a cash
     account. Never guess HIGHER leverage than the broker admitted to.
+
+    ``unpriced_held_symbols`` is the market-mode SUBMIT BLOCKER (see
+    ``held_symbols_without_price``): managed symbols the account HOLDS and has no
+    usable quote for. It is always empty in cost mode. Non-empty means every
+    percentage on this snapshot is measured against a base that is missing those
+    positions entirely -- feed it to ``held_no_price_block`` for the sentence.
     """
     available_buying_power: float
     managed_value: float
     base_notional: float
     default_bp_factor: float
-    valuation_mode: str = VALUATION_MODE_COST
+    valuation_mode: str = VALUATION_MODE_MARKET
     cash: Optional[float] = None
     is_margin_account: bool = False
     supports_fractional: bool = False
     taken_at: DateTime = field(default_factory=lambda: DateTime.now(timezone.utc))
     warnings: List[str] = field(default_factory=list)
+    unpriced_held_symbols: List[str] = field(default_factory=list)
+
+
+def held_symbols_without_price(current: Dict[str, PositionState],
+                               managed_symbols: List[str],
+                               *, valuation_mode: str) -> List[str]:
+    """Managed symbols the account HOLDS and cannot price. Pure. Market mode only.
+
+    In ``market`` mode ``current_value`` returns 0.0 for a position with no usable
+    quote, which is right (there is no fallback price in this platform) and
+    silently WRONG for the base: the position drops out of ``base_notional``
+    entirely, so every label's target shrinks by its share of the missing money.
+    Measured: a 5,000 held position with a failed quote takes a 10,000 base to
+    5,000 and HALVES every other label's target, with nothing on screen saying so.
+
+    An UNHELD unpriced symbol is a non-event and is deliberately excluded: the
+    solver already skips it with ``REASON_NO_PRICE`` and counts its share in
+    ``AllocationPlan.unallocatable_pct``, so it corrupts no denominator.
+
+    "Held" is ``quantity != 0``, tested on the MAGNITUDE: a short carries a
+    negative quantity and a negative value and moves the base exactly as much as a
+    long does. "No price" is ``None`` OR ``<= 0``, matching ``current_value``'s own
+    branch -- a broker that answers 0.0 values the position at nothing just as
+    surely as one that answers nothing at all.
+
+    Returns ``[]`` in cost mode, where the price is never read and its absence
+    changes no number.
+
+    Returns:
+        List[str]: in ``managed_symbols`` order, de-duplicated. EMPTY means the base
+        is measured on complete data.
+    """
+    if valuation_mode != VALUATION_MODE_MARKET:
+        return []
+    out: List[str] = []
+    for sym in dict.fromkeys(managed_symbols or []):
+        state = (current or {}).get(sym)
+        if state is None:
+            continue
+        if abs(float(state.quantity or 0.0)) <= QUANTITY_EPSILON:
+            continue
+        if state.price is None or float(state.price) <= 0:
+            out.append(sym)
+    return out
+
+
+def held_no_price_block(symbols: Optional[List[str]]) -> Optional[str]:
+    """The blocking sentence for ``held_symbols_without_price``, or ``None``. Pure.
+
+    ``None`` means "nothing to say", so a caller can write
+    ``if held_no_price_block(base.unpriced_held_symbols):`` and get the gate and the
+    wording from one call.
+
+    Deliberately NOT in ``ADVISORY_MESSAGE_FRAGMENTS``: this must BLOCK. The plan it
+    describes is not merely imprecise, it is sized against a base that is missing
+    whole positions, and the direction of the error (every target too small) is
+    invisible on the dry run because every row is consistently too small.
+    """
+    syms = list(symbols or [])
+    if not syms:
+        return None
+    return ERROR_HELD_NO_PRICE_FMT.format(count=len(syms), symbols=", ".join(syms))
 
 
 def build_base_snapshot(
@@ -1744,14 +1825,22 @@ def build_base_snapshot(
     current: Dict[str, PositionState],
     managed_symbols: List[str],
     *,
-    valuation_mode: str = VALUATION_MODE_COST,
+    valuation_mode: str,
 ) -> BaseSnapshot:
     """Turn a broker AccountSnapshot into the wizard's frozen base.
+
+    ``valuation_mode`` is REQUIRED and has NO Python default, exactly like the three
+    solvers (``compute_base_notional``, ``compute_allocation``,
+    ``compute_label_investment``). A default here and a different one at the solver
+    is how the base and the deltas end up measured with two definitions of "current
+    value"; making the omission a loud ``TypeError`` is cheaper than finding it in a
+    plan. Pass the account's configured mode.
 
     Raises:
         ValueError: when there is no snapshot at all, when the broker published no
         ``buying_power`` (a plan sized against a guessed balance is worse than no
         plan), or when ``valuation_mode`` is unknown.
+        TypeError: when ``valuation_mode`` is omitted.
     """
     if snapshot is None:
         raise ValueError("build_base_snapshot: no AccountSnapshot (the broker call failed).")
@@ -1772,6 +1861,15 @@ def build_base_snapshot(
     else:
         default_bp_factor = float(snapshot.margin_multiplier)
 
+    unpriced = held_symbols_without_price(current, managed_symbols,
+                                          valuation_mode=valuation_mode)
+    if unpriced:
+        logger.warning(
+            f"build_base_snapshot: {len(unpriced)} HELD symbol(s) have no usable quote "
+            f"in market mode ({', '.join(unpriced)}); they contribute 0 to the "
+            f"{buying_power + managed_value:,.2f} base, so every label target is "
+            f"understated. Submission is blocked until they price.")
+
     return BaseSnapshot(
         available_buying_power=buying_power,
         managed_value=managed_value,
@@ -1782,6 +1880,7 @@ def build_base_snapshot(
         is_margin_account=bool(snapshot.is_margin_account),
         supports_fractional=bool(snapshot.supports_fractional),
         warnings=warnings,
+        unpriced_held_symbols=unpriced,
     )
 
 

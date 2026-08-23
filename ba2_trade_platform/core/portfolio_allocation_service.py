@@ -26,8 +26,8 @@ from .portfolio_allocation import (
     ACTION_ADJUST, ACTION_CLOSE, ACTION_NEW, ACTION_SKIP, FRACTIONAL_PATH_WHOLE,
     AllocationPlan, BaseSnapshot, FilledTotals, MarginInfo, OrderFill,
     PositionFetchFailed, PositionState,
-    apply_order_impacts, decide_symbol_action, measure_filled_values,
-    plan_quantity_attempts, split_delta_fifo,
+    apply_order_impacts, decide_symbol_action, held_no_price_block,
+    measure_filled_values, plan_quantity_attempts, split_delta_fifo,
 )
 from .TransactionHelper import TransactionHelper
 from .types import (
@@ -1274,11 +1274,13 @@ def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionSta
     """Submit a reviewed plan and record it. The single Submit entry point.
 
     Order of operations:
-      0. GATE on market hours: if the market is not CONFIRMED open, return
+      0. GATE, twice: on the BASE (market valuation with a held symbol nobody could
+         price -- ``held_no_price_block``) and then on MARKET HOURS. Either returns
          ``blocked=True`` having written nothing at all -- no run row, no stamped
          order comments and, above all, no income consumed. This is the FIRST
          statement in the function, above the reconcile in step 1: a blocked
-         attempt must not move an earlier run's money either.
+         attempt must not move an earlier run's money either. The base gate comes
+         first because its reason is the one the user can act on immediately.
       1. RECONCILE any earlier run whose income was left unconsumed, so this run's
          ledger reflects reality before it spends from it.
       2. INSERT the ``portfolio_allocation_run`` row with the plan snapshot and
@@ -1328,7 +1330,20 @@ def run_allocation(account, plan: AllocationPlan, current: Dict[str, PositionSta
     # TastyTrade's closed-market refusal is a SERVER rule that arrives as an opaque
     # Message, so without this the user would get a screen of unexplained per-row
     # failures after the ledger had already been hit.
-    reason = _market_blocked_reason(fetch_market_hours(account))
+    # The BASE gate, ahead of the clock. In market valuation a symbol the account
+    # HOLDS but could not price contributes 0 to base_notional, so EVERY label's
+    # target is understated by its share of the missing money -- and the dry run
+    # cannot show it, because every row is proportionally too small and the table
+    # looks self-consistent. Read off the BASE and not the plan: the plan's
+    # no-price rows are never tickable, so filter_plan_rows drops them and the
+    # filtered plan that arrives here looks clean.
+    #
+    # Checked BEFORE the market gate on purpose: both refuse, but a failed quote is
+    # something the user can retry now while a closed market is only something to
+    # wait out, so the actionable reason is the one they are told.
+    reason = held_no_price_block(base.unpriced_held_symbols)
+    if reason is None:
+        reason = _market_blocked_reason(fetch_market_hours(account))
     if reason is not None:
         logger.warning(f"Allocation run for account {account.id} BLOCKED: {reason}; "
                        f"nothing was submitted and no run was recorded")

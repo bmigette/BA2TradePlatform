@@ -21,6 +21,7 @@ from ba2_trade_platform.core.portfolio_allocation import (
     ACTION_ADJUST, ACTION_CLOSE, ACTION_NEW, ACTION_SKIP,
     ALLOCATION_MODE_INVEST_LABEL, ALLOCATION_MODE_REBALANCE,
     REASON_BELOW_MIN_FRACTIONAL_NOTIONAL_FMT,
+    VALUATION_MODE_COST, VALUATION_MODE_MARKET,
     AllocationPlan, AllocationRow, BaseSnapshot, PositionFetchFailed, PositionState,
 )
 from ba2_trade_platform.core.TransactionHelper import TransactionHelper
@@ -3483,3 +3484,105 @@ def test_get_unconsumed_runs_still_honours_an_explicit_limit(activity):
 
     assert len(svc.get_unconsumed_runs(118, limit=5)) == 5
     assert len(svc.get_unconsumed_runs(118, limit=None)) == 25
+
+
+# ---------------------------------------------------------------------------
+# W1: market valuation + a HELD symbol with no quote = a refused run.
+#
+# The wizard disables Submit as a courtesy; THIS is the enforcement, exactly as
+# it is for market hours. The dialog can sit open across a quote outage, and the
+# base it submits against is the one the LAST solve produced.
+# ---------------------------------------------------------------------------
+
+def _open_account(account_id):
+    """A FakeAccount with no positions; its market hours default to OPEN."""
+    account = FakeAccount(account_id=account_id)
+    account.positions = []
+    return account
+
+
+def _base_with_an_unpriced_holding(symbols=("DARK",)):
+    return BaseSnapshot(
+        available_buying_power=5_000.0, managed_value=0.0, base_notional=5_000.0,
+        default_bp_factor=1.0, valuation_mode=VALUATION_MODE_MARKET, cash=5_000.0,
+        unpriced_held_symbols=list(symbols))
+
+
+def test_run_allocation_refuses_a_base_that_could_not_price_a_held_symbol():
+    account = _open_account(8_101)
+    row = make_row("AAPL", OrderDirection.BUY, 10.0, 1_600.0, 1_600.0, price=160.0)
+    plan = AllocationPlan(rows=[row], available_buying_power=10_000.0)
+
+    result = svc.run_allocation(account, plan, {}, _base_with_an_unpriced_holding(),
+                                mode=ALLOCATION_MODE_REBALANCE)
+
+    assert result["blocked"] is True
+    assert result["run_id"] is None
+    assert result["outcomes"] == []
+    assert account.submitted == []
+    assert "DARK" in result["blocked_reason"]
+
+
+def test_a_run_refused_for_an_unpriced_holding_writes_no_run_row():
+    """Same contract as the market-hours refusal: no run row means no stamped order
+    comments and, above all, no income consumed -- finalise_allocation_run is
+    one-shot, so a run created for orders that were never sent would mark that
+    income spent forever."""
+    account = _open_account(8_102)
+    plan = AllocationPlan(rows=[make_row("AAPL", OrderDirection.BUY, 1.0, 160.0, 160.0,
+                                         price=160.0)],
+                          available_buying_power=10_000.0)
+
+    svc.run_allocation(account, plan, {}, _base_with_an_unpriced_holding(),
+                       mode=ALLOCATION_MODE_REBALANCE)
+
+    with get_db() as session:
+        assert session.exec(select(PortfolioAllocationRun)).all() == []
+
+
+def test_a_run_refused_for_an_unpriced_holding_returns_every_key_an_allowed_one_does():
+    refused = svc.run_allocation(
+        _open_account(8_103), AllocationPlan(rows=[]), {},
+        _base_with_an_unpriced_holding(), mode=ALLOCATION_MODE_REBALANCE)
+    allowed = svc.run_allocation(
+        _open_account(8_104), AllocationPlan(rows=[]), {}, make_base(),
+        mode=ALLOCATION_MODE_REBALANCE)
+
+    assert refused["blocked"] is True
+    assert set(refused) == set(allowed)
+    assert refused["filled_buy_value"] == 0.0
+    assert refused["filled_sell_value"] == 0.0
+    assert refused["settled"] is True
+    assert refused["working_order_ids"] == []
+    assert refused["refresh_failed"] is False
+    assert allowed["blocked"] is False
+
+
+def test_a_cost_mode_base_is_never_refused_for_an_unpriced_holding():
+    """``held_symbols_without_price`` returns [] in cost mode, so the list on the base
+    is empty and nothing here can fire. Pinned because the guard is the live half of
+    the valuation flip and must not leak into the escape hatch from it."""
+    account = _open_account(8_105)
+    base = BaseSnapshot(available_buying_power=5_000.0, managed_value=5_000.0,
+                        base_notional=10_000.0, default_bp_factor=1.0,
+                        valuation_mode=VALUATION_MODE_COST, cash=5_000.0)
+
+    result = svc.run_allocation(account, AllocationPlan(rows=[]), {}, base,
+                                mode=ALLOCATION_MODE_REBALANCE)
+
+    assert result["blocked"] is False
+
+
+def test_the_unpriced_holding_refusal_is_checked_before_the_market_gate():
+    """Both refuse; the one the user can ACT on is the one they are told about. A
+    closed market is something you wait out, a failed quote is something you retry."""
+    account = FakeAccount(account_id=8_106)
+    account.positions = []
+    account.market_hours = _closed_hours()
+
+    result = svc.run_allocation(account, AllocationPlan(rows=[]), {},
+                                _base_with_an_unpriced_holding(),
+                                mode=ALLOCATION_MODE_REBALANCE)
+
+    assert result["blocked"] is True
+    assert "DARK" in result["blocked_reason"]

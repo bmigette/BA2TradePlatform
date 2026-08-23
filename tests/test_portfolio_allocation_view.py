@@ -136,7 +136,8 @@ def test_build_label_views_computes_pct_of_label_and_pct_of_total():
     positions = {'AAPL': _pos('AAPL', 10, 6000.0),
                  'MSFT': _pos('MSFT', 5, 2000.0),
                  'NVDA': _pos('NVDA', 4, 2000.0)}
-    views = build_label_views(managed, symbols_by_label, positions, {})
+    views = build_label_views(managed, symbols_by_label, positions, {},
+                              valuation_mode=VALUATION_MODE_COST)
 
     ark = views[0]
     assert ark.label == 'ARK26'
@@ -159,7 +160,7 @@ def test_build_label_views_symbol_with_no_position_is_listed_with_zeroes():
     views = build_label_views([ManagedLabel('ARK26', 100.0)],
                               {'ARK26': ['AAPL', 'TSLA']},
                               {'AAPL': _pos('AAPL', 10, 1000.0)},
-                              {})
+                              {}, valuation_mode=VALUATION_MODE_COST)
     tsla = next(r for r in views[0].rows if r.symbol == 'TSLA')
     assert tsla.quantity == 0.0
     assert tsla.cost_basis == 0.0
@@ -173,6 +174,7 @@ def test_build_label_views_symbol_in_two_labels_is_flagged_and_counted_once():
         {'ARK26': ['TSLA'], 'HighRisk': ['TSLA']},
         {'TSLA': _pos('TSLA', 10, 6000.0)},
         {},
+        valuation_mode=VALUATION_MODE_COST,
     )
     row = views[0].rows[0]
     assert row.multi_label is True
@@ -182,7 +184,8 @@ def test_build_label_views_symbol_in_two_labels_is_flagged_and_counted_once():
 
 
 def test_build_label_views_empty_label_has_no_rows_and_zero_current_value():
-    views = build_label_views([ManagedLabel('EMPTY', 25.0)], {'EMPTY': []}, {}, {})
+    views = build_label_views([ManagedLabel('EMPTY', 25.0)], {'EMPTY': []}, {}, {},
+                              valuation_mode=VALUATION_MODE_COST)
     assert views[0].rows == []
     assert views[0].current_value == 0.0
     assert views[0].pct_of_total == 0.0
@@ -192,7 +195,7 @@ def test_build_label_views_uses_live_price_for_market_value():
     views = build_label_views([ManagedLabel('ARK26', 100.0)],
                               {'ARK26': ['AAPL']},
                               {'AAPL': _pos('AAPL', 10, 1000.0, market_value=1100.0)},
-                              {'AAPL': 250.0})
+                              {'AAPL': 250.0}, valuation_mode=VALUATION_MODE_COST)
     assert views[0].rows[0].price == 250.0
     assert views[0].rows[0].market_value == 2500.0
 
@@ -203,7 +206,8 @@ def test_build_label_views_missing_price_falls_back_to_broker_market_value():
     views = build_label_views([ManagedLabel('ARK26', 100.0)],
                               {'ARK26': ['AAPL', 'TSLA']},
                               {'AAPL': _pos('AAPL', 10, 1000.0, market_value=1100.0)},
-                              {'AAPL': None, 'TSLA': None})
+                              {'AAPL': None, 'TSLA': None},
+                              valuation_mode=VALUATION_MODE_COST)
     aapl = next(r for r in views[0].rows if r.symbol == 'AAPL')
     tsla = next(r for r in views[0].rows if r.symbol == 'TSLA')
     assert aapl.price is None and aapl.market_value == 1100.0
@@ -216,7 +220,7 @@ def test_build_label_views_rows_are_ordered_by_current_value_descending():
                               {'AAPL': _pos('AAPL', 1, 100.0),
                                'MSFT': _pos('MSFT', 1, 900.0),
                                'NVDA': _pos('NVDA', 1, 500.0)},
-                              {})
+                              {}, valuation_mode=VALUATION_MODE_COST)
     assert [r.symbol for r in views[0].rows] == ['MSFT', 'NVDA', 'AAPL']
 
 
@@ -225,19 +229,22 @@ def test_build_label_views_attaches_per_symbol_comments():
                               {'ARK26': ['AAPL']},
                               {'AAPL': _pos('AAPL', 1, 100.0)},
                               {},
-                              symbol_comments={('ARK26', 'AAPL'): 'trim on strength'})
+                              symbol_comments={('ARK26', 'AAPL'): 'trim on strength'},
+                              valuation_mode=VALUATION_MODE_COST)
     assert views[0].comment == 'core basket'
     assert views[0].rows[0].comment == 'trim on strength'
 
 
 def test_build_label_views_current_value_is_purchase_value_not_market_value():
-    """The user asked for the default view to measure the book at COST. A position
-    whose market value has doubled must still show its purchase value."""
+    """In COST mode a position whose market value has doubled still shows its
+    purchase value. Cost is no longer the default (market is, see W1) but it stays a
+    supported mode, and this is what it means."""
     views = build_label_views([ManagedLabel('ARK26', 100.0)],
                               {'ARK26': ['AAPL', 'MSFT']},
                               {'AAPL': _pos('AAPL', 10, 1000.0, market_value=9000.0),
                                'MSFT': _pos('MSFT', 10, 1000.0, market_value=100.0)},
-                              {'AAPL': 900.0, 'MSFT': 10.0})
+                              {'AAPL': 900.0, 'MSFT': 10.0},
+                              valuation_mode=VALUATION_MODE_COST)
     aapl = next(r for r in views[0].rows if r.symbol == 'AAPL')
     assert aapl.current_value == 1000.0
     assert aapl.market_value == 9000.0
@@ -420,14 +427,19 @@ def test_market_mode_without_a_price_reports_zero_current_value_not_a_guess():
     assert views[0].rows[0].price is None
 
 
-def test_build_label_views_defaults_to_cost_mode():
-    """The DB default is 'cost' (spec 5a); the helper agrees so an omitted argument
-    can never silently reinterpret the page."""
-    views = build_label_views([ManagedLabel('ARK26', 100.0)],
-                              {'ARK26': ['AAPL']},
-                              {'AAPL': _pos('AAPL', 10, 1000.0)},
-                              {'AAPL': 250.0})
-    assert views[0].current_value == 1000.0
+def test_build_label_views_requires_an_explicit_valuation_mode():
+    """No default at all, matching ``build_base_snapshot`` and the three solvers.
+
+    A default here is worth nothing and costs a lot: whichever way it points, a
+    caller that forgets the keyword gets a page whose percentages are measured on a
+    different definition of "current value" from the plan the wizard then solves.
+    Omitting it must be a loud ``TypeError``, not a silent reinterpretation.
+    """
+    with pytest.raises(TypeError):
+        build_label_views([ManagedLabel('ARK26', 100.0)],
+                          {'ARK26': ['AAPL']},
+                          {'AAPL': _pos('AAPL', 10, 1000.0)},
+                          {'AAPL': 250.0})
 
 
 def test_build_label_views_rejects_an_unknown_valuation_mode():
@@ -566,6 +578,7 @@ def test_managed_total_value_counts_a_two_label_symbol_once():
         {'ARK26': ['TSLA', 'AAPL'], 'HighRisk': ['TSLA']},
         {'TSLA': _pos('TSLA', 10, 6000.0), 'AAPL': _pos('AAPL', 1, 1000.0)},
         {},
+        valuation_mode=VALUATION_MODE_COST,
     )
     assert sum(v.current_value for v in views) == 13000.0     # the double count
     assert managed_total_value(views) == 7000.0
@@ -577,6 +590,7 @@ def test_managed_total_value_is_the_denominator_pct_of_total_was_computed_with()
         {'ARK26': ['TSLA', 'AAPL'], 'HighRisk': ['TSLA']},
         {'TSLA': _pos('TSLA', 10, 6000.0), 'AAPL': _pos('AAPL', 1, 1000.0)},
         {},
+        valuation_mode=VALUATION_MODE_COST,
     )
     total = managed_total_value(views)
     row = next(r for v in views for r in v.rows if r.symbol == 'TSLA')
@@ -732,7 +746,7 @@ def test_a_short_only_label_reports_percentages_rather_than_zeroes():
                               {'TSLA': positions_by_symbol(
                                   [{'symbol': 'TSLA', 'qty': 10, 'cost_basis': 3000.0,
                                     'market_value': 3300.0, 'side': 'SELL'}])['TSLA']},
-                              {})
+                              {}, valuation_mode=VALUATION_MODE_COST)
     assert views[0].current_value == -3000.0
     assert views[0].rows[0].pct_of_label == 100.0
     assert views[0].rows[0].pct_of_total == 100.0
@@ -748,7 +762,8 @@ def test_a_short_reduces_the_labels_value_instead_of_inflating_it():
          'side': 'SELL'},
     ])
     views = build_label_views([ManagedLabel('Mixed', 100.0)],
-                              {'Mixed': ['AAPL', 'TSLA']}, positions, {})
+                              {'Mixed': ['AAPL', 'TSLA']}, positions, {},
+                              valuation_mode=VALUATION_MODE_COST)
     assert views[0].current_value == 3000.0
     assert views[0].cost_basis == 3000.0
 
@@ -762,7 +777,8 @@ def test_a_label_whose_value_nets_to_exactly_zero_reports_zero_percentages():
          'side': 'SELL'},
     ])
     views = build_label_views([ManagedLabel('Flat', 100.0)],
-                              {'Flat': ['AAPL', 'TSLA']}, positions, {})
+                              {'Flat': ['AAPL', 'TSLA']}, positions, {},
+                              valuation_mode=VALUATION_MODE_COST)
     assert views[0].current_value == 0.0
     assert all(r.pct_of_label == 0.0 for r in views[0].rows)
 
@@ -786,7 +802,8 @@ def test_label_view_carries_the_stored_target_pct_through_untouched():
     ``LabelTarget.target_pct``; mutation B24 (-> 0.0) survived the whole suite."""
     views = build_label_views([ManagedLabel('ARK26', 37.5), ManagedLabel('EMPTY', 62.5)],
                               {'ARK26': ['AAPL'], 'EMPTY': []},
-                              {'AAPL': _pos('AAPL', 1, 100.0)}, {})
+                              {'AAPL': _pos('AAPL', 1, 100.0)}, {},
+                              valuation_mode=VALUATION_MODE_COST)
     assert views[0].target_pct == 37.5
     assert views[1].target_pct == 62.5          # an empty label keeps its target too
 
