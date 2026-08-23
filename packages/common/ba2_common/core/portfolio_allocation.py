@@ -28,7 +28,8 @@ from datetime import datetime as DateTime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from ba2_common.core.account_types import (  # noqa: F401 (re-exported)
-    AccountSnapshot, MarginInfo, OrderImpact,
+    MARGIN_SOURCE_ASSET, MARGIN_SOURCE_DEFAULT, MARGIN_SOURCE_POSITION,
+    MARGIN_SOURCE_PRECHECK, AccountSnapshot, MarginInfo, OrderImpact,
 )
 from ba2_common.core.types import OrderDirection, OrderStatus
 from ba2_common.logger import logger
@@ -86,6 +87,12 @@ __all__ = [
     "unconsumed_income_notice",
     "tradeable_unit", "size_sub_unit_target", "projected_value", "allocated_value",
     "redistribute_label_residuals",
+    # per-row leverage, for the dry-run table (W6/W7)
+    "bp_leverage", "LEVERAGE_VERDICTS", "LEVERAGE_NONE", "LEVERAGE_LEVERAGED",
+    "LEVERAGE_PENALISED", "LEVERAGE_UNKNOWN", "LEVERAGE_NOT_APPLICABLE",
+    "LEVERAGE_RATIO_TOLERANCE",
+    "MARGIN_SOURCE_ASSET", "MARGIN_SOURCE_DEFAULT", "MARGIN_SOURCE_POSITION",
+    "MARGIN_SOURCE_PRECHECK",
     # mixed eligibility, bumps and redistribution, surfaced for the dry run
     "fractional_summary", "no_order_rows", "whole_share_notice", "no_order_notice",
     "bump_notice", "redistribution_notice",
@@ -132,6 +139,29 @@ QUANTITY_EPSILON = 1e-9
 #: QUANTITY_EPSILON: a tenth of a microdollar of residual income is not worth a
 #: ledger write, whereas 1e-9 of a share can matter on a fractional grid.
 MONEY_EPSILON = 1e-6
+
+#: The five verdicts ``bp_leverage`` can return, and the ONLY five the dry-run
+#: table knows how to draw. See ``bp_leverage`` for the predicate and the live
+#: numbers behind it; the short version is that the neutral point is 1.0 on every
+#: live account shape, so a HIGHER ratio means LESS leverage, not more.
+#:
+#: ``LEVERAGE_NONE``            ratio == 1.0 -- a dollar of stock costs a dollar of BP
+#: ``LEVERAGE_LEVERAGED``       ratio <  1.0 -- costs LESS BP than its notional
+#: ``LEVERAGE_PENALISED``       ratio >  1.0 -- costs MORE BP than its notional
+#: ``LEVERAGE_UNKNOWN``         the broker published no margin rate; no verdict
+#: ``LEVERAGE_NOT_APPLICABLE``  a SELL: it frees buying power, it never charges any
+LEVERAGE_NONE = "none"
+LEVERAGE_LEVERAGED = "leveraged"
+LEVERAGE_PENALISED = "penalised"
+LEVERAGE_UNKNOWN = "unknown"
+LEVERAGE_NOT_APPLICABLE = "n/a"
+LEVERAGE_VERDICTS = (LEVERAGE_NONE, LEVERAGE_LEVERAGED, LEVERAGE_PENALISED,
+                     LEVERAGE_UNKNOWN, LEVERAGE_NOT_APPLICABLE)
+
+#: How far a BP ratio may sit from 1.0 and still be called neutral. Its own
+#: constant and NOT MONEY_EPSILON: this is a dimensionless ratio, and a broker that
+#: publishes a rate to 4dp lands a hair off 1.0 through float division alone.
+LEVERAGE_RATIO_TOLERANCE = 1e-6
 
 # Reason strings attached to AllocationRow.reasons / AllocationPlan.warnings.
 # Pinned here so the UI and the tests agree on the exact text.
@@ -386,6 +416,24 @@ class AllocationRow:
     estimated_value: float = 0.0
     bp_cost: float = 0.0
     bp_factor: float = 1.0
+    #: Copied verbatim from this symbol's ``MarginInfo``, and CARRIED rather than
+    #: re-derived because the dry run cannot otherwise tell a broker-stated margin
+    #: rate from the conservative account-multiplier fallback -- which is the whole
+    #: difference between a leverage flag and a red badge on every new position.
+    #: The defaults are the "no MarginInfo at all" state, deliberately identical to
+    #: ``MarginInfo``'s own: ``marginable`` optimistic, the rate UNPUBLISHED (never
+    #: 1.0, which would be a fabricated broker fact) and the source the fallback.
+    #: Never read ``bp_factor`` and ``initial_margin_rate`` as if either implied the
+    #: other: ``bp_factor = initial_margin_rate x account_multiplier``, so 1.0 is the
+    #: neutral point and a rate of 0.5 and a rate of 1.0 both reach it.
+    marginable: bool = True
+    initial_margin_rate: Optional[float] = None
+    #: Which ``MARGIN_SOURCE_*`` the numbers above came from. ``MARGIN_SOURCE_DEFAULT``
+    #: means the broker published nothing per-symbol and the adapter fell back to the
+    #: account multiplier -- TastyTrade does exactly that for every symbol the account
+    #: does not already hold, so this field is what stops a first-time buy being read
+    #: as a leveraged one.
+    margin_source: str = MARGIN_SOURCE_DEFAULT
     fractional: bool = False
     skipped: bool = False
     #: The broker precheck's own fee estimate, when one was run and accepted
@@ -432,6 +480,9 @@ class AllocationRow:
             "estimated_value": self.estimated_value,
             "bp_cost": self.bp_cost,
             "bp_factor": self.bp_factor,
+            "marginable": self.marginable,
+            "initial_margin_rate": self.initial_margin_rate,
+            "margin_source": self.margin_source,
             "fractional": self.fractional,
             "skipped": self.skipped,
             "estimated_fees": self.estimated_fees,
@@ -1048,6 +1099,32 @@ def _finalise_totals(plan: AllocationPlan) -> None:
                          if plan.available_buying_power > 0 else 0.0)
 
 
+def _carry_margin_facts(row: AllocationRow, margin: Optional[MarginInfo]) -> None:
+    """Copy the margin facts the DISPLAY needs from ``MarginInfo`` onto the row.
+
+    Both solvers build their rows in their own loop, and both used to read
+    ``m.marginable`` for one reason string and then drop the object -- so a plan,
+    once solved, could no longer say whether the broker had published a margin rate
+    at all. That distinction is not cosmetic: it is the difference between "this
+    instrument is buying-power-penalised" and "this broker says nothing about
+    symbols you do not already hold".
+
+    ``margin is None`` leaves the dataclass defaults in place, which already ARE the
+    "no MarginInfo" state. Nothing is invented and nothing is coerced -- in
+    particular ``initial_margin_rate`` stays ``None`` rather than becoming a
+    plausible 1.0.
+
+    Deliberately does NOT touch ``bp_factor``: that one has a caller-supplied
+    fallback (``default_bp_factor``, the account multiplier) and each solver
+    already sets it on the line above.
+    """
+    if margin is None:
+        return
+    row.marginable = bool(margin.marginable)
+    row.initial_margin_rate = margin.initial_margin_rate
+    row.margin_source = margin.source
+
+
 def _apply_bp_scaling(rows: List[AllocationRow], available_buying_power: float, *,
                       allow_fractional: bool,
                       margin: Optional[Dict[str, MarginInfo]] = None) -> float:
@@ -1229,6 +1306,7 @@ def compute_allocation(base_notional: float, available_buying_power: float,
         m = margin.get(symbol)
         row = AllocationRow(symbol=symbol, labels=list(sym_labels[symbol]))
         row.bp_factor = float(m.bp_factor) if m is not None else float(default_bp_factor)
+        _carry_margin_facts(row, m)
         row.current_quantity = float(ps.quantity) if ps is not None else 0.0
         row.current_cost_basis = float(ps.cost_basis) if ps is not None else 0.0
         row.price = ps.price if ps is not None else None
@@ -1434,6 +1512,7 @@ def compute_label_investment(label: LabelTarget, amount: float,
         m = margin.get(symbol)
         row = AllocationRow(symbol=symbol, labels=[label.label])
         row.bp_factor = float(m.bp_factor) if m is not None else float(default_bp_factor)
+        _carry_margin_facts(row, m)
         row.current_quantity = float(ps.quantity) if ps is not None else 0.0
         row.current_cost_basis = float(ps.cost_basis) if ps is not None else 0.0
         row.price = ps.price if ps is not None else None
@@ -1758,6 +1837,70 @@ def _is_suppressed_row(row: "AllocationRow") -> bool:
     return bool(row.skipped) and REASON_NO_PRICE not in row.reasons
 
 
+def bp_leverage(row: "AllocationRow") -> Tuple[Optional[float], str]:
+    """How much buying power one dollar of this row's notional costs, and a verdict.
+
+    Pure, and DERIVED rather than stored: ``apply_order_impacts`` replaces
+    ``row.bp_cost`` with the broker's own measured figure and never touches
+    ``row.bp_factor``, so a flag computed once at solve time goes stale in exactly
+    the case that matters. The ratio is therefore
+    ``bp_cost / estimated_value`` -- the realised charge -- and falls back to
+    ``bp_factor`` only when there is no trade value to divide by (a suppressed row,
+    where the instrument's factor is still the honest thing to show next to the
+    reason the order died).
+
+    THE PREDICATE, and why it points the way it does.
+    ``bp_factor = initial_margin_rate x account_multiplier`` = the dollars of
+    buying power ONE DOLLAR OF NOTIONAL consumes, so the neutral point is 1.0 on
+    every live account shape, and a HIGHER number means LESS leverage:
+
+        ordinary marginable stock, Reg-T 2:1   0.500 x 2 = 1.000
+        cash / limited-margin account          1.000 x 1 = 1.000
+        leveraged ETF, 75% maintenance         0.750 x 2 = 1.500
+        LAZR (hard to borrow), verified live   0.989 x 2 = 1.978
+        non-marginable in a margin account     1.000 x 2 = 2.000
+
+    So "leveraged" in the plain sense -- consumes LESS buying power than its
+    notional -- is ``< 1.0``, and above 1.0 is a buying-power PENALTY, which is the
+    opposite. Both are named, because a single boolean cannot say which side of
+    neutral a row is on and the penalty is the side that actually occurs today.
+
+    THE GUARD, which is not optional. TastyTrade publishes no per-symbol margin
+    requirement for a symbol the account does not already hold, so its adapter
+    returns ``bp_factor = multiplier = 2.0``, ``initial_margin_rate = None`` and
+    ``source = MARGIN_SOURCE_DEFAULT`` -- its own docstring calls that "assume no
+    leverage". A first-time buy is unheld BY DEFINITION, so a bare ``ratio > 1.0``
+    would brand every new TastyTrade position as penalised. When the rate is
+    missing OR the source is the fallback, the ratio is still reported (it is what
+    the plan really charges) and the VERDICT is withheld as
+    ``LEVERAGE_UNKNOWN``.
+
+    A SELL gets ``(None, LEVERAGE_NOT_APPLICABLE)``: ``bp_cost`` is 0.0 for sells by
+    construction -- they free buying power -- so any ratio computed for one is an
+    artefact of that zero, not a fact about the instrument.
+
+    Returns:
+        Tuple[Optional[float], str]: ``(ratio, verdict)``. ``ratio`` is ``None``
+        only for a sell; ``verdict`` is always one of ``LEVERAGE_VERDICTS``.
+    """
+    if row.side == OrderDirection.SELL:
+        return None, LEVERAGE_NOT_APPLICABLE
+    estimated = float(row.estimated_value or 0.0)
+    if estimated > MONEY_EPSILON:
+        ratio = float(row.bp_cost or 0.0) / estimated
+    else:
+        ratio = float(row.bp_factor)
+    # The guard runs BEFORE the comparison, never after: an unpublished rate must
+    # produce no verdict at all, not a verdict that happens to be right.
+    if row.initial_margin_rate is None or row.margin_source == MARGIN_SOURCE_DEFAULT:
+        return ratio, LEVERAGE_UNKNOWN
+    if ratio > 1.0 + LEVERAGE_RATIO_TOLERANCE:
+        return ratio, LEVERAGE_PENALISED
+    if ratio < 1.0 - LEVERAGE_RATIO_TOLERANCE:
+        return ratio, LEVERAGE_LEVERAGED
+    return ratio, LEVERAGE_NONE
+
+
 def dry_run_rows(plan: "AllocationPlan") -> List[Dict[str, Any]]:
     """One display dict per row the user must look at, in plan order.
 
@@ -1784,6 +1927,23 @@ def dry_run_rows(plan: "AllocationPlan") -> List[Dict[str, Any]]:
 
     On a suppressed row ``fractional`` is False -- there is no order to describe;
     ``sized_fractional`` and the reason string carry the story instead.
+
+    COST AND VALUE, both, per row. ``current_quantity`` / ``current_cost_basis`` /
+    ``current_value`` are the holding the row is trading AGAINST -- what you own,
+    what you paid, what it is worth now -- and ``projected_cost`` /
+    ``projected_market`` are the same pair AFTER the trade. ``projected_notional``
+    is whichever of those two the plan's own ``valuation_mode`` selected, and it is
+    kept so the landed column keeps working; the point of emitting both is that one
+    basis at a time cannot answer "am I trading against my basis or against the
+    market?". ``current_value`` is ``None``, NEVER 0.0, when there is no price: 0.0
+    would report a holding as worthless, which is a fabricated live-data fallback.
+
+    ``bp_ratio`` / ``leverage`` come from ``bp_leverage`` -- read its docstring
+    before touching either, especially the ``MARGIN_SOURCE_DEFAULT`` guard.
+    ``marginable`` / ``initial_margin_rate`` / ``margin_source`` ride along
+    unrounded so the display can say WHY it reached its verdict: "the broker lends
+    against this" is ``initial_margin_rate < 1.0``, which is a DIFFERENT statement
+    from ``bp_ratio > 1.0`` and frequently the opposite one.
     """
     available = float(plan.available_buying_power or 0.0)
     base = float(plan.base_notional or 0.0)
@@ -1795,15 +1955,37 @@ def dry_run_rows(plan: "AllocationPlan") -> List[Dict[str, Any]]:
         if not suppressed and (row.side is None or row.delta_quantity == 0):
             continue
         projected = allocated_value(row, mode, basis)
+        projected_cost = allocated_value(row, VALUATION_MODE_COST, basis)
+        projected_market = allocated_value(row, VALUATION_MODE_MARKET, basis)
+        bp_ratio, leverage = bp_leverage(row)
         out.append({
             "symbol": row.symbol,
             "side": row.side.value if row.side is not None else "",
             "quantity": round(abs(row.delta_quantity), DRY_RUN_QUANTITY_DECIMALS),
             "price": row.price,
+            # WHERE THE ROW STARTS: the basis it is trading against. Without these
+            # the table's only holding figure is the post-trade projection, so the
+            # user cannot see what they already own.
+            "current_quantity": round(row.current_quantity, DRY_RUN_QUANTITY_DECIMALS),
+            "current_cost_basis": round(row.current_cost_basis, 2),
+            "current_value": (None if row.price is None
+                              else round(row.current_quantity * row.price, 2)),
             "estimated_value": round(row.estimated_value, 2),
+            # The broker precheck's own fee estimate. None means "not prechecked",
+            # never "free" -- there is no fallback for a number nobody published.
+            "estimated_fees": row.estimated_fees,
             "bp_cost": round(row.bp_cost, 2),
             "bp_usage_pct": (round(row.bp_cost / available * 100.0, 2)
                              if available > 0 else 0.0),
+            # Per-symbol leverage. See bp_leverage: the ratio is the REALISED
+            # charge, bp_factor is what the solver assumed, and after a precheck
+            # they disagree.
+            "bp_factor": row.bp_factor,
+            "bp_ratio": None if bp_ratio is None else round(bp_ratio, 4),
+            "leverage": leverage,
+            "marginable": bool(row.marginable),
+            "initial_margin_rate": row.initial_margin_rate,
+            "margin_source": row.margin_source,
             # SIZING MODE, not "does the number have a decimal part": at ~25%
             # ineligibility this column is the one the user scans.
             "sizing": "fractional" if row.fractional else "whole",
@@ -1815,6 +1997,14 @@ def dry_run_rows(plan: "AllocationPlan") -> List[Dict[str, Any]]:
             # Already reflects whole-share rounding, the bump and the redistribution:
             # what is displayed is what will be owned.
             "projected_notional": None if projected is None else round(projected, 2),
+            # The SAME projection measured both ways, so cost and value sit side by
+            # side instead of the table silently showing whichever one the global
+            # toggle happens to select. Equal to each other in an INVEST_LABEL run,
+            # where the target is money to deploy and the mode does not enter.
+            "projected_cost": (None if projected_cost is None
+                               else round(projected_cost, 2)),
+            "projected_market": (None if projected_market is None
+                                 else round(projected_market, 2)),
             "residual_notional": (None if projected is None
                                   else round(row.target_notional - projected, 2)),
             # The weight the user TYPED and the weight the plan will really use. They

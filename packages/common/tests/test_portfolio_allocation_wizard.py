@@ -939,3 +939,299 @@ def test_a_plan_that_ends_OVER_target_reports_a_NEGATIVE_residual():
     assert summary["residual_notional"] == pytest.approx(-100.0)
     assert summary["residual_pct"] == pytest.approx(-50.0)
     assert "-100.00" in whole_share_notice(summary)
+
+
+# ---------------------------------------------------------------------------
+# W7 + W6: the dry run shows COST and VALUE per row, and flags leverage.
+#
+# The predicate is the whole point of this section, so it is spelled out once
+# here. ``bp_factor = initial_margin_rate x account_multiplier`` = the dollars of
+# BUYING POWER one dollar of NOTIONAL consumes, so the neutral point is 1.0 on
+# EVERY live account shape:
+#
+#   ordinary marginable stock, Reg-T 2:1   0.500 x 2 = 1.000   dollar for dollar
+#   cash account (multiplier 1)            1.000 x 1 = 1.000   dollar for dollar
+#   leveraged ETF, 75% maintenance         0.750 x 2 = 1.500   BP-PENALISED
+#   LAZR (hard to borrow)                  0.989 x 2 = 1.978   BP-PENALISED
+#   non-marginable in a margin account     1.000 x 2 = 2.000   BP-PENALISED
+#
+# A HIGHER factor therefore means LESS leverage, not more. "Leveraged" in the
+# user's sense -- consumes LESS buying power than its notional -- is < 1.0, and
+# that is the direction ``LEVERAGE_LEVERAGED`` names.
+# ---------------------------------------------------------------------------
+
+
+def _margin(**kw):
+    """A MarginInfo with the adapter defaults, overridden per test."""
+    base = dict(symbol="X", bp_factor=1.0, marginable=True, fractionable=True)
+    base.update(kw)
+    return MarginInfo(**base)
+
+
+def _one_symbol_labels(symbol="LAZR"):
+    return [LabelTarget(label="A", target_pct=100.0,
+                        symbols=[SymbolTarget(symbol=symbol, weight_pct=100.0)])]
+
+
+def test_compute_allocation_carries_the_margin_facts_the_dry_run_must_show():
+    """``marginable`` / ``initial_margin_rate`` / ``source`` were read at the
+    solver boundary and thrown away, so the dry run could not tell a BROKER-STATED
+    margin rate from the conservative account-multiplier fallback -- which is the
+    difference between a real leverage flag and a red badge on every new buy."""
+    margin = {"LAZR": _margin(symbol="LAZR", bp_factor=1.978, marginable=False,
+                              initial_margin_rate=0.989,
+                              source=pa.MARGIN_SOURCE_POSITION)}
+    plan = compute_allocation(10_000.0, 20_000.0, _one_symbol_labels(),
+                              {"LAZR": PositionState(symbol="LAZR", quantity=0.0,
+                                                     cost_basis=0.0, price=10.0)},
+                              margin, allow_fractional=False,
+                              default_bp_factor=2.0,
+                              valuation_mode=VALUATION_MODE_MARKET)
+    row = plan.rows[0]
+    assert row.marginable is False
+    assert row.initial_margin_rate == pytest.approx(0.989)
+    assert row.margin_source == pa.MARGIN_SOURCE_POSITION
+
+
+def test_compute_allocation_without_margin_info_reports_the_rate_as_unpublished():
+    """No MarginInfo is not "no leverage": it is "the broker did not say", and the
+    row must carry that so the table can render ``?`` instead of a number."""
+    plan = compute_allocation(10_000.0, 20_000.0, _one_symbol_labels(),
+                              {"LAZR": PositionState(symbol="LAZR", quantity=0.0,
+                                                     cost_basis=0.0, price=10.0)},
+                              {}, allow_fractional=False, default_bp_factor=2.0,
+                              valuation_mode=VALUATION_MODE_MARKET)
+    row = plan.rows[0]
+    assert row.initial_margin_rate is None
+    assert row.margin_source == pa.MARGIN_SOURCE_DEFAULT
+    assert row.marginable is True
+
+
+def test_compute_label_investment_carries_the_same_margin_facts():
+    """The INVEST_LABEL solver builds its rows in its own loop; widening only
+    ``compute_allocation`` would leave every INVEST dry run unable to flag
+    anything."""
+    label = LabelTarget(label="A", target_pct=100.0,
+                        symbols=[SymbolTarget(symbol="LAZR", weight_pct=100.0)])
+    plan = pa.compute_label_investment(
+        label, 1_000.0,
+        {"LAZR": PositionState(symbol="LAZR", quantity=0.0, cost_basis=0.0,
+                               price=10.0)},
+        {"LAZR": _margin(symbol="LAZR", bp_factor=1.978, marginable=False,
+                         initial_margin_rate=0.989,
+                         source=pa.MARGIN_SOURCE_POSITION)},
+        available_buying_power=20_000.0,
+        allow_fractional=False, default_bp_factor=2.0,
+        valuation_mode=VALUATION_MODE_MARKET)
+    row = plan.rows[0]
+    assert row.marginable is False
+    assert row.initial_margin_rate == pytest.approx(0.989)
+    assert row.margin_source == pa.MARGIN_SOURCE_POSITION
+
+
+def test_allocation_row_to_dict_records_the_margin_facts_in_plan_json():
+    """``plan_json`` is the only record of what a run was told about an
+    instrument; a leverage badge nobody can reconstruct six months later is not
+    an audit trail."""
+    row = AllocationRow(symbol="LAZR", marginable=False, initial_margin_rate=0.989,
+                        margin_source=pa.MARGIN_SOURCE_POSITION)
+    d = row.to_dict()
+    assert d["marginable"] is False
+    assert d["initial_margin_rate"] == pytest.approx(0.989)
+    assert d["margin_source"] == pa.MARGIN_SOURCE_POSITION
+
+
+def _held_plan(**row_kw):
+    """One BUY row on top of an existing holding: 10 shares at 160, basis 1,200."""
+    kw = dict(symbol="AAPL", price=160.0, current_quantity=10.0,
+              current_cost_basis=1_200.0, target_notional=3_200.0,
+              target_quantity=20.0, delta_quantity=10.0,
+              side=OrderDirection.BUY, estimated_value=1_600.0, bp_cost=1_600.0,
+              bp_factor=1.0, initial_margin_rate=0.5,
+              margin_source=pa.MARGIN_SOURCE_ASSET)
+    kw.update(row_kw)
+    return AllocationPlan(rows=[AllocationRow(**kw)], base_notional=10_000.0,
+                          available_buying_power=10_000.0,
+                          valuation_mode=VALUATION_MODE_MARKET)
+
+
+def test_dry_run_rows_show_the_held_quantity_its_cost_and_its_value():
+    """The basis the user is trading against. Without it Cost and Value have no
+    denominator on screen and ``Projected`` is the only holding figure in the
+    table."""
+    row = dry_run_rows(_held_plan())[0]
+    assert row["current_quantity"] == pytest.approx(10.0)
+    assert row["current_cost_basis"] == pytest.approx(1_200.0)
+    assert row["current_value"] == pytest.approx(1_600.0)
+
+
+def test_dry_run_rows_report_no_current_value_rather_than_zero_when_there_is_no_price():
+    """0.0 would say "this holding is worthless", which is a live-data fallback and
+    a lie. None says "not measurable", which is the truth."""
+    row = dry_run_rows(_held_plan(price=None))[0]
+    assert row["current_value"] is None
+    # The cost basis is a recorded fact and survives a missing quote.
+    assert row["current_cost_basis"] == pytest.approx(1_200.0)
+
+
+def test_dry_run_rows_report_both_the_projected_cost_and_the_projected_market_value():
+    """``projected_notional`` silently means post-trade COST BASIS in cost mode and
+    ``target_quantity x price`` in market mode -- one basis at a time, when the
+    requirement is to see cost AND value side by side."""
+    row = dry_run_rows(_held_plan())[0]
+    # 20 shares x 160
+    assert row["projected_market"] == pytest.approx(3_200.0)
+    # basis 1,200 + 10 bought at 160
+    assert row["projected_cost"] == pytest.approx(2_800.0)
+
+
+def test_dry_run_rows_carry_the_brokers_own_fee_estimate():
+    """Fees are literally cost, and the precheck's figure was captured onto the row
+    and then dropped at the display boundary."""
+    row = dry_run_rows(_held_plan(estimated_fees=1.37))[0]
+    assert row["estimated_fees"] == pytest.approx(1.37)
+    assert dry_run_rows(_held_plan())[0]["estimated_fees"] is None
+
+
+# ---- the leverage predicate ------------------------------------------------
+
+
+def test_an_ordinary_marginable_stock_is_not_flagged_as_leveraged():
+    """0.5 x 2 = 1.0. A dollar of stock costs a dollar of buying power, which is
+    the NEUTRAL case on every live account shape -- not a leverage story."""
+    row = dry_run_rows(_held_plan())[0]
+    assert row["bp_ratio"] == pytest.approx(1.0)
+    assert row["leverage"] == pa.LEVERAGE_NONE
+
+
+def test_a_bp_penalised_instrument_is_flagged_from_a_broker_published_rate():
+    """LAZR: initial margin 98.9% on a 2:1 account = x1.978 buying power. It
+    consumes nearly TWICE its notional, so it is the opposite of leveraged, and the
+    table has to say which direction it is off neutral."""
+    row = dry_run_rows(_held_plan(symbol="LAZR", bp_cost=3_164.8, bp_factor=1.978,
+                                  initial_margin_rate=0.989,
+                                  margin_source=pa.MARGIN_SOURCE_POSITION))[0]
+    assert row["bp_ratio"] == pytest.approx(1.978)
+    assert row["leverage"] == pa.LEVERAGE_PENALISED
+
+
+def test_a_broker_sourced_ratio_below_one_is_the_only_real_leverage():
+    """"Leveraged" in the user's sense is "consumes LESS buying power than its
+    notional" -- ratio < 1.0. Unreachable on today's two adapters (Alpaca's
+    marginable branch bottoms out at exactly 1.0), reachable under portfolio
+    margin, and the only predicate that means what the word means."""
+    row = dry_run_rows(_held_plan(bp_cost=800.0, bp_factor=0.5,
+                                  initial_margin_rate=0.25,
+                                  margin_source=pa.MARGIN_SOURCE_POSITION))[0]
+    assert row["bp_ratio"] == pytest.approx(0.5)
+    assert row["leverage"] == pa.LEVERAGE_LEVERAGED
+
+
+def test_an_unheld_tastytrade_buy_is_not_flagged_as_leveraged():
+    """THE GUARD. TastyTrade publishes no per-symbol margin rate for a symbol the
+    account does not already hold, so its adapter returns
+    ``bp_factor = multiplier = 2.0``, ``initial_margin_rate = None``,
+    ``source = MARGIN_SOURCE_DEFAULT`` -- its own docstring calls this "assume no
+    leverage". A first-time buy is unheld BY DEFINITION, so an unguarded
+    ``ratio > 1.0`` paints every new TastyTrade position. The ratio is still
+    reported; the VERDICT is withheld."""
+    row = dry_run_rows(_held_plan(current_quantity=0.0, current_cost_basis=0.0,
+                                  bp_cost=3_200.0, bp_factor=2.0,
+                                  initial_margin_rate=None,
+                                  margin_source=pa.MARGIN_SOURCE_DEFAULT))[0]
+    assert row["bp_ratio"] == pytest.approx(2.0)
+    assert row["leverage"] == pa.LEVERAGE_UNKNOWN
+    assert row["leverage"] != pa.LEVERAGE_PENALISED
+
+
+def test_a_row_with_no_published_rate_is_unknown_whatever_the_source_says():
+    """First half of the guard, on its own. Alpaca stamps
+    ``source = MARGIN_SOURCE_ASSET`` from asset metadata; if the rate itself is
+    missing there is still no measured number to judge."""
+    row = dry_run_rows(_held_plan(bp_cost=3_200.0, bp_factor=2.0,
+                                  initial_margin_rate=None,
+                                  margin_source=pa.MARGIN_SOURCE_ASSET))[0]
+    assert row["leverage"] == pa.LEVERAGE_UNKNOWN
+
+
+def test_a_row_that_fell_back_to_the_account_multiplier_is_unknown_even_with_a_rate():
+    """Second half of the guard, on its own. On today's two adapters
+    ``source == MARGIN_SOURCE_DEFAULT`` and ``initial_margin_rate is None`` happen
+    to coincide, so testing only the pair would let a future adapter that stamps a
+    fallback rate alongside the fallback source walk straight through. The SOURCE is
+    the authority on whether a number was measured; the number's presence is not."""
+    row = dry_run_rows(_held_plan(bp_cost=3_164.8, bp_factor=1.978,
+                                  initial_margin_rate=0.989,
+                                  margin_source=pa.MARGIN_SOURCE_DEFAULT))[0]
+    assert row["bp_ratio"] == pytest.approx(1.978)
+    assert row["leverage"] == pa.LEVERAGE_UNKNOWN
+
+
+def test_a_sell_states_no_leverage_at_all():
+    """``bp_cost`` is 0.0 for a sell BY CONSTRUCTION -- sells free buying power --
+    so 0/notional would render every sell as infinitely leveraged."""
+    row = dry_run_rows(_held_plan(delta_quantity=-5.0, side=OrderDirection.SELL,
+                                  target_quantity=5.0, estimated_value=800.0,
+                                  bp_cost=0.0))[0]
+    assert row["bp_ratio"] is None
+    assert row["leverage"] == pa.LEVERAGE_NOT_APPLICABLE
+
+
+def test_the_leverage_ratio_uses_the_brokers_measured_cost_not_the_stale_factor():
+    """``apply_order_impacts`` overwrites ``bp_cost`` with the broker's own figure
+    and never touches ``bp_factor``, so after a precheck the factor is stale and
+    only ``bp_cost / estimated_value`` is true."""
+    row = dry_run_rows(_held_plan(bp_cost=3_200.0, bp_factor=1.0,
+                                  initial_margin_rate=0.989,
+                                  margin_source=pa.MARGIN_SOURCE_POSITION))[0]
+    assert row["bp_ratio"] == pytest.approx(2.0)
+    assert row["leverage"] == pa.LEVERAGE_PENALISED
+
+
+def test_the_leverage_ratio_falls_back_to_the_factor_when_nothing_will_be_traded():
+    """A suppressed row has no trade value to divide by, but the INSTRUMENT's
+    factor is still a fact worth showing next to the reason it was suppressed."""
+    plan = _held_plan(bp_factor=1.978, initial_margin_rate=0.989,
+                      margin_source=pa.MARGIN_SOURCE_POSITION,
+                      delta_quantity=0.0, side=None, skipped=True,
+                      estimated_value=0.0, bp_cost=0.0,
+                      reasons=["broker refused the order"])
+    row = dry_run_rows(plan)[0]
+    assert row["suppressed"] is True
+    assert row["bp_ratio"] == pytest.approx(1.978)
+    assert row["leverage"] == pa.LEVERAGE_PENALISED
+
+
+def test_dry_run_rows_carry_the_margin_facts_the_tooltip_needs():
+    """"The broker lends against this" is ``initial_margin_rate < 1.0``, which is a
+    DIFFERENT statement from ``bp_factor > 1.0``: under it LAZR at rate 0.989 is
+    nearly cash-collateralised, the opposite of what a bare red x1.98 suggests. The
+    table cannot say so unless the rate and its provenance reach it."""
+    row = dry_run_rows(_held_plan(symbol="LAZR", marginable=False, bp_cost=3_164.8,
+                                  bp_factor=1.978, initial_margin_rate=0.989,
+                                  margin_source=pa.MARGIN_SOURCE_POSITION))[0]
+    assert row["marginable"] is False
+    assert row["initial_margin_rate"] == pytest.approx(0.989)
+    assert row["margin_source"] == pa.MARGIN_SOURCE_POSITION
+    assert row["bp_factor"] == pytest.approx(1.978)
+
+
+def test_the_leverage_verdicts_are_the_five_the_table_can_draw():
+    """A sixth verdict would render as a blank cell rather than fail."""
+    assert {pa.LEVERAGE_NONE, pa.LEVERAGE_LEVERAGED, pa.LEVERAGE_PENALISED,
+            pa.LEVERAGE_UNKNOWN, pa.LEVERAGE_NOT_APPLICABLE} == set(
+                pa.LEVERAGE_VERDICTS)
+    assert len(pa.LEVERAGE_VERDICTS) == 5
+
+
+def test_dry_run_rows_keep_every_key_the_landed_table_already_drew_after_widening():
+    """Re-pinned with the new keys: the widening is ADDITIVE and nothing that was
+    already rendered may disappear."""
+    row = dry_run_rows(_mixed_eligibility_plan())[0]
+    for key in ("symbol", "side", "quantity", "price", "estimated_value", "bp_cost",
+                "bp_usage_pct", "reasons", "fractional", "sized_fractional",
+                "suppressed", "skipped", "current_quantity", "current_cost_basis",
+                "current_value", "projected_cost", "projected_market",
+                "estimated_fees", "bp_factor", "bp_ratio", "leverage",
+                "marginable", "initial_margin_rate", "margin_source"):
+        assert key in row, key
