@@ -124,8 +124,32 @@ def _function_source(source: str, name: str) -> str:
 
 def test_the_page_remembers_the_fractional_choice_on_every_dry_run():
     """Persisted on the DRY RUN, not only on Submit: a user who plans, closes the
-    dialog and comes back tomorrow keeps the switch they chose."""
-    assert "remember_fractional_choice(" in _function_source(_page_source(), "_on_dry_run")
+    dialog and comes back tomorrow keeps the switch they chose.
+
+    Scoped to ``_persist_choices`` since W0 gave the switch a companion -- the
+    label targets and symbol weights -- and moved both off the event loop into one
+    thread hop. ``_run_dry_run`` calling it is what keeps this on the CONTINUE
+    path; that half is pinned separately below.
+    """
+    assert "remember_fractional_choice(" in _function_source(_page_source(),
+                                                             "_persist_choices")
+
+
+def test_the_page_persists_the_targets_on_every_dry_run_too():
+    """W0. Until this the wizard was write-only-to-memory: every ``target_pct``
+    stayed at the 0.0 the label picker created it with, so there could never be a
+    "last" to load. Same trigger as the fractional switch -- Continue, not Submit --
+    because "last" means "what I chose to allocate with"."""
+    assert "save_allocation_targets(" in _function_source(_page_source(),
+                                                          "_persist_choices")
+
+
+def test_the_dry_run_path_actually_calls_the_persister():
+    """The two tests above only prove the CALL exists in a helper. This is the one
+    that proves the helper is on the Continue path at all -- without it both would
+    stay green against a helper nothing invokes."""
+    assert "_save_choices(" in _function_source(_page_source(), "_run_dry_run")
+    assert "_run_dry_run" in _function_source(_page_source(), "_on_dry_run")
 
 
 def test_the_page_also_remembers_the_choice_when_the_switch_is_toggled():

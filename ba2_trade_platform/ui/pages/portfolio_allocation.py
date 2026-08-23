@@ -64,7 +64,7 @@ from ...core.portfolio_allocation import (
 from ...core.portfolio_allocation_store import (
     add_symbols_to_label, get_allocation_config, get_managed_labels, get_symbol_comments,
     get_symbol_rows, get_symbol_weights, remove_symbols_from_label, replace_managed_labels,
-    set_allocation_config, set_managed_label, set_symbol_weight,
+    save_allocation_targets, set_allocation_config, set_managed_label, set_symbol_weight,
 )
 from ...logger import logger
 from ..account_filter_context import get_selected_account_id
@@ -813,7 +813,49 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
              'labels': labels, 'allow_fractional': allow_fractional,
              'base': base, 'current': {}}
 
+    def _persist_choices(mode: str, labels, allow_fractional: bool) -> None:
+        """Write what this run was launched with. Blocking; one thread hop.
+
+        Both writes happen on CONTINUE, not on Submit, and that is what "last"
+        means here: the numbers the user last chose to allocate with, whether or
+        not they went through with the orders. The fractional switch has been
+        persisted from exactly this point since it shipped
+        (``remember_fractional_choice``); the targets now follow it.
+
+        An INVEST_LABEL run passes ``save_label_targets=False``: it spends an
+        explicit amount on one label, so that label's percentage played no part and
+        recording it would store a choice the user never made. Its symbol weights
+        DID split the money, so they are still saved.
+        """
+        svc.remember_fractional_choice(account_id, bool(allow_fractional))
+        return save_allocation_targets(
+            account_id, labels,
+            save_label_targets=(mode != ALLOCATION_MODE_INVEST_LABEL))
+
+    async def _save_choices(mode: str, labels, allow_fractional: bool) -> None:
+        try:
+            written = await asyncio.to_thread(_persist_choices, mode, labels,
+                                              bool(allow_fractional))
+        except Exception as e:
+            # Reported, then out of the way. Persisting is a convenience; SOLVING is
+            # what the user pressed Continue for, and refusing to open the dry run
+            # over a failed write would be a much worse trade.
+            logger.error(f"Saving allocation targets for account {account_id} failed: {e}",
+                         exc_info=True)
+            ui.notify(f'Targets could not be saved: {e}', type='negative')
+            return
+        if written['skipped_labels']:
+            # Silently dropping these is how a user comes back tomorrow to numbers
+            # they did not choose.
+            ui.notify(f"{written['skipped_labels']} label(s) are no longer managed "
+                      f"and their targets were not saved — refresh the page",
+                      type='warning')
+
     async def _run_dry_run() -> None:
+        # Persist BEFORE solving. This is the Continue action, and Continue is what
+        # "last" means: the numbers the user last chose to allocate with, whether or
+        # not they then went through with the orders.
+        await _save_choices(state['mode'], state['labels'], state['allow_fractional'])
         try:
             new_base, plan, current, hours = await asyncio.to_thread(
                 _solve_plan, account_id, mode=state['mode'], labels=state['labels'],
@@ -883,13 +925,15 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
 
     def _on_dry_run(*, mode: str, labels, scope_label, amount: float,
                     allow_fractional: bool) -> None:
-        """Called by the steps dialog (sync). Persist the choice, then solve."""
+        """Called by the steps dialog (sync). Records the choices, then solves.
+
+        The write itself is in ``_run_dry_run``, off the event loop -- unlike the
+        fractional switch this is N labels and M symbols, and the page's own rule
+        is that blocking work goes through ``asyncio.to_thread``.
+        """
         state.update({'mode': mode, 'labels': labels, 'scope_label': scope_label,
                       'amount': float(amount or 0.0),
                       'allow_fractional': bool(allow_fractional)})
-        # Persisted on every dry run, not only on submit: a user who plans, closes
-        # the dialog and comes back tomorrow keeps the switch they chose.
-        svc.remember_fractional_choice(account_id, bool(allow_fractional))
         ui.timer(0.1, _run_dry_run, once=True)
 
     open_allocation_steps(base, labels, on_dry_run=_on_dry_run,

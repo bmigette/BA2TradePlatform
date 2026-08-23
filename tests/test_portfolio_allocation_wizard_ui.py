@@ -1803,3 +1803,45 @@ def test_the_unpriced_holding_block_survives_a_closed_market(nicegui_client):
         wizard.open()
 
     assert wizard._submit_button.enabled is False
+
+
+# ---------------------------------------------------------------------------
+# W0: Continue now WRITES, so the dialog has to say so.
+#
+# Until W0 nothing on this screen touched the database and "Cancel really
+# cancels" was a guarantee. It is not one any more: Continue persists the label
+# targets and the symbol weights (that is what makes "load last" possible), so a
+# dry run the user then abandons has already changed stored state.
+# ---------------------------------------------------------------------------
+
+def test_the_steps_dialog_says_that_continue_saves_the_targets(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    _open_steps(nicegui_client, wiz)
+    drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_CONTINUE_SAVES)
+
+    assert len(drawn) == 1
+    assert 'Cancel' in drawn[0]          # names what stopped being true
+
+
+def test_the_continue_saves_note_is_shown_in_invest_mode_too(nicegui_client):
+    """An INVEST run persists the chosen label's symbol weights, so the same
+    warning applies -- only the label percentage is left alone."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+    from ba2_trade_platform.core.portfolio_allocation import ALLOCATION_MODE_INVEST_LABEL
+
+    _open_steps(nicegui_client, wiz, mode=ALLOCATION_MODE_INVEST_LABEL,
+                invest_amount=1_000.0)
+
+    assert len(_marked_texts(nicegui_client.layout, wiz.MARKER_CONTINUE_SAVES)) == 1
+
+
+def test_the_steps_docstring_no_longer_promises_that_nothing_is_written():
+    """The class docstring said "Nothing is written here ... so Cancel really
+    cancels". After W0 that is false, and a docstring that lies about a write is
+    worse than none."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    doc = wiz.AllocationSteps.__doc__
+    assert 'Nothing is written here' not in doc
+    assert 'Continue' in doc

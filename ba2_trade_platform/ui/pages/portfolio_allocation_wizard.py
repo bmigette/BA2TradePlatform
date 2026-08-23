@@ -180,6 +180,18 @@ MARKER_WORKING_ORDERS = 'income-working-orders'
 MARKER_LABEL_PCT = 'steps-label-pct'
 MARKER_SYMBOL_PCT = 'steps-symbol-pct'
 
+#: Marker on the steps dialog's "Continue saves your targets" note. By marker: the
+#: sentence names Cancel, and 'Cancel' is also the label of the button beside it.
+MARKER_CONTINUE_SAVES = 'steps-continue-saves'
+
+#: Shown above Continue. W0 made Continue a WRITE -- it persists the label targets
+#: and symbol weights so "load last" has something to load -- which removed the old
+#: "nothing here touches the database" guarantee. Cancel still abandons the RUN; it
+#: no longer abandons the NUMBERS.
+CONTINUE_SAVES_NOTE = (
+    'Continue SAVES these targets for next time, then opens the dry run. Cancel '
+    'abandons the run, not the saved numbers.')
+
 #: Marker on the base panel's BLOCKING banner -- today only the market-mode
 #: "a held symbol has no quote" refusal (``held_no_price_block``). Located by
 #: marker rather than by text: the symbol names it lists also appear in the table
@@ -850,9 +862,17 @@ class AllocationSteps:
     multiplies them straight through and a 150% set would overspend the budget by
     half.
 
-    Nothing is written here, and the caller's ``labels`` are deep-copied on the
-    way in, so Cancel really cancels. Continue hands the edited targets to
-    ``on_dry_run``, which solves and opens ``AllocationWizard``.
+    CONTINUE WRITES (W0). The caller's ``labels`` are still deep-copied on the way
+    in, so nothing is mutated under an open dialog and Cancel abandons the RUN --
+    but ``on_dry_run`` now persists the label targets and the symbol weights before
+    it solves, because "load last" has to answer "what did I actually allocate to",
+    and the fractional switch has been saved from exactly this point since it
+    shipped. A dry run the user reviews and then abandons has therefore already
+    changed stored state, and ``CONTINUE_SAVES_NOTE`` says so on screen. Cancel no
+    longer abandons the NUMBERS.
+
+    Continue hands the edited targets to ``on_dry_run``, which persists them,
+    solves, and opens ``AllocationWizard``.
     """
 
     def __init__(self, base: BaseSnapshot, labels: List[LabelTarget], *,
@@ -895,6 +915,8 @@ class AllocationSteps:
 
             self._render_step3_base_panel()
             self._errors_container = ui.column().classes('w-full')
+            ui.label(CONTINUE_SAVES_NOTE).classes('text-xs text-orange-400 mt-2') \
+                .mark(MARKER_CONTINUE_SAVES)
             with ui.row().classes('w-full justify-end gap-2 mt-4'):
                 ui.button('Cancel', on_click=dialog.close).props('flat')
                 self._continue_button = ui.button('Continue to dry run',

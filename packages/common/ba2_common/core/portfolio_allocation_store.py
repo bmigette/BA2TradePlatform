@@ -261,6 +261,123 @@ def set_symbol_weight(account_id: int, label: str, symbol: str, *,
         return row
 
 
+def save_allocation_targets(account_id: int, labels, *,
+                            save_label_targets: bool = True) -> Dict[str, int]:
+    """Persist the targets an allocation RUN was launched with. ONE transaction.
+
+    ``labels`` is a list of the engine's ``LabelTarget``s -- exactly what the
+    wizard hands to ``on_dry_run`` -- so this writes every ``lt.target_pct`` and
+    every ``st.weight_pct`` in one go. It is the answer to "what did I actually
+    allocate to last time", which is why it is called on Continue and not on
+    Submit: a plan the user reviews and abandons is still the set of numbers they
+    last chose, and the fractional switch has been persisted from exactly that
+    point since it shipped (``remember_fractional_choice``).
+
+    **A SEPARATE WRITER, deliberately.** ``set_managed_label`` and
+    ``set_symbol_weight`` are untouched by this and must stay that way. The
+    comment-save path (``ui/pages/portfolio_allocation.py::_write_symbol_comment``)
+    re-writes ``weight_pct`` on EVERY debounced keystroke -- on purpose, because a
+    bare ``comment=`` write would create the row at the model default of 0.0 and the
+    engine reads 0 as "hold none of this". Anything this function grows later must
+    therefore live HERE and nowhere else; a flag threaded through the shared setters
+    would fire on every comment edit.
+
+    **Never resurrects a label.** ``set_managed_label`` creates the row it cannot
+    find, at ``target_pct=0``. A wizard opened before a label was unmanaged (in
+    another tab, in the picker) still holds it in memory, so a label with no row is
+    SKIPPED and counted, never re-created.
+
+    **Symbol rows become explicit.** A symbol that was silently taking the
+    even-split default gets a row. That is correct -- the user has just allocated
+    real money with that number -- and it carries the same documented consequence
+    ``_write_symbol_comment`` already accepts: a symbol added to the label later
+    re-splits only what is LEFT of 100%, not the whole of it.
+
+    ``save_label_targets=False`` writes the symbol weights ONLY. Pass it for an
+    INVEST_LABEL run: that spends an explicit AMOUNT on one label, so the label's
+    percentage played no part and restating it would record a choice the user never
+    made. The weights DID split the money, so they are still persisted.
+
+    Args:
+        account_id: the account whose rows are written.
+        labels: ``List[LabelTarget]``. ``None`` and ``[]`` are a no-op.
+        save_label_targets: whether to write ``target_pct`` as well as the weights.
+
+    Returns:
+        Dict[str, int]: ``{'labels': n, 'symbols': n, 'skipped_labels': n}`` --
+        what was written and what was dropped for being unmanaged. The caller shows
+        the skip count, because a silently ignored save is how a user comes back
+        tomorrow to numbers they did not choose.
+
+    Raises:
+        ValueError: on a blank label or a blank symbol, BEFORE anything is written.
+        A set that cannot be stored in full is not stored at all: half of a target
+        set is worse than none, because the next run would deploy against it.
+    """
+    items = list(labels or [])
+    if not items:
+        return {"labels": 0, "symbols": 0, "skipped_labels": 0}
+
+    # Validate the WHOLE set first, so the single transaction below cannot abort
+    # part way and leave the user's targets half-written.
+    cleaned = []
+    for lt in items:
+        label = (getattr(lt, "label", "") or "").strip()
+        if not label:
+            raise ValueError("save_allocation_targets: a label is blank")
+        weights = []
+        for st in (getattr(lt, "symbols", None) or []):
+            symbol = (getattr(st, "symbol", "") or "").strip().upper()
+            if not symbol:
+                raise ValueError(
+                    f"save_allocation_targets: label '{label}' has a blank symbol")
+            weights.append((symbol, float(st.weight_pct or 0.0)))
+        cleaned.append((label, float(getattr(lt, "target_pct", 0.0) or 0.0), weights))
+
+    written_labels = written_symbols = skipped = 0
+    with get_db() as session:
+        managed = {row.label: row for row in session.exec(
+            select(PortfolioAllocationLabel)
+            .where(PortfolioAllocationLabel.account_id == account_id)
+        ).all()}
+        symbol_rows = {(row.label, row.symbol): row for row in session.exec(
+            select(PortfolioAllocationSymbol)
+            .where(PortfolioAllocationSymbol.account_id == account_id)
+        ).all()}
+
+        for label, target_pct, weights in cleaned:
+            label_row = managed.get(label)
+            if label_row is None:
+                skipped += 1
+                logger.warning(
+                    f"Allocation targets for '{label}' were dropped: account "
+                    f"{account_id} no longer manages that label, and re-creating it "
+                    f"here would put a label the user deleted back into every "
+                    f"future rebalance")
+                continue
+            if save_label_targets:
+                label_row.target_pct = target_pct
+                session.add(label_row)
+            written_labels += 1
+            for symbol, weight_pct in weights:
+                row = symbol_rows.get((label, symbol))
+                if row is None:
+                    row = PortfolioAllocationSymbol(
+                        account_id=account_id, label=label, symbol=symbol)
+                    symbol_rows[(label, symbol)] = row
+                row.weight_pct = weight_pct
+                session.add(row)
+                written_symbols += 1
+
+        session.commit()
+
+    logger.info(f"Saved allocation targets for account {account_id}: "
+                f"{written_labels} label(s), {written_symbols} symbol weight(s)"
+                + (f", {skipped} label(s) skipped as unmanaged" if skipped else ""))
+    return {"labels": written_labels, "symbols": written_symbols,
+            "skipped_labels": skipped}
+
+
 def remove_symbol_weight(account_id: int, label: str, symbol: str) -> bool:
     """Drop a symbol's stored weight so it returns to the even-split default.
 

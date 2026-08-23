@@ -1258,3 +1258,159 @@ def test_appending_to_an_already_consumed_run_still_records_the_order(account_id
     stored = store.get_recent_runs(account_id)[0]
     assert stored.order_ids == [1, 2]
     assert stored.income_consumed_at is not None
+
+
+# ---------------------------------------------------------------------------
+# W0: persisting the targets the user actually allocated with.
+#
+# Until this existed the wizard was write-only-to-memory: ``_on_dry_run``
+# persisted only the fractional switch, so every ``target_pct`` stayed at the
+# 0.0 the label picker created it with and there could never be a "last".
+#
+# It is a SEPARATE writer on purpose. ``set_managed_label`` and
+# ``set_symbol_weight`` stay byte-identical, because the comment-save path
+# (``_write_symbol_comment``) deliberately re-writes ``weight_pct`` on every
+# debounced keystroke to avoid zeroing the row, and anything this function grows
+# later -- the previous-target shift of W2 above all -- must never fire there.
+# ---------------------------------------------------------------------------
+
+def _label_target(label, target_pct, symbols=()):
+    from ba2_trade_platform.core.portfolio_allocation import LabelTarget, SymbolTarget
+    return LabelTarget(label=label, target_pct=target_pct,
+                       symbols=[SymbolTarget(symbol=s, weight_pct=w) for s, w in symbols])
+
+
+def test_save_allocation_targets_writes_the_label_percentages(account_id):
+    store.set_managed_label(account_id, "ARK26")
+    store.set_managed_label(account_id, "TECH")
+
+    store.save_allocation_targets(account_id, [_label_target("ARK26", 60.0),
+                                               _label_target("TECH", 40.0)])
+
+    stored = {row.label: row.target_pct for row in store.get_managed_labels(account_id)}
+    assert stored == {"ARK26": 60.0, "TECH": 40.0}
+
+
+def test_save_allocation_targets_writes_the_symbol_weights(account_id):
+    store.set_managed_label(account_id, "ARK26")
+
+    store.save_allocation_targets(
+        account_id, [_label_target("ARK26", 100.0, [("AAPL", 70.0), ("MSFT", 30.0)])])
+
+    assert store.get_symbol_weights(account_id, "ARK26", ["AAPL", "MSFT"]) == {
+        "AAPL": 70.0, "MSFT": 30.0}
+
+
+def test_save_allocation_targets_makes_an_even_split_default_explicit(account_id):
+    """A symbol with no row was silently taking the even-split default. Once the
+    user has ALLOCATED with that number it stops being a default and becomes a
+    choice, so the row is created -- which is what "load last" then reads back.
+
+    Documented consequence, the same one the comment path already accepts: adding a
+    symbol to the label later re-splits only what is LEFT, not the whole 100%.
+    """
+    store.set_managed_label(account_id, "ARK26")
+    assert store.get_symbol_rows(account_id, "ARK26") == {}
+
+    store.save_allocation_targets(
+        account_id, [_label_target("ARK26", 100.0, [("AAPL", 50.0), ("MSFT", 50.0)])])
+
+    assert sorted(store.get_symbol_rows(account_id, "ARK26")) == ["AAPL", "MSFT"]
+
+
+def test_save_allocation_targets_leaves_comments_and_sort_order_alone(account_id):
+    store.set_managed_label(account_id, "ARK26", sort_order=3, comment="core basket")
+    store.set_symbol_weight(account_id, "ARK26", "AAPL", weight_pct=10.0,
+                            comment="trim on strength")
+
+    store.save_allocation_targets(
+        account_id, [_label_target("ARK26", 100.0, [("AAPL", 100.0)])])
+
+    label_row = store.get_managed_labels(account_id)[0]
+    assert label_row.comment == "core basket"
+    assert label_row.sort_order == 3
+    assert store.get_symbol_rows(account_id, "ARK26")["AAPL"].comment == "trim on strength"
+
+
+def test_save_allocation_targets_never_resurrects_an_unmanaged_label(account_id):
+    """``set_managed_label`` CREATES the row it cannot find, at target_pct=0. A
+    wizard opened before the label was unmanaged (another tab, the picker) still
+    holds it in memory, and re-creating it here would put a label the user deleted
+    back into every future rebalance."""
+    store.set_managed_label(account_id, "ARK26")
+
+    written = store.save_allocation_targets(
+        account_id, [_label_target("ARK26", 50.0, [("AAPL", 100.0)]),
+                     _label_target("GONE", 50.0, [("TSLA", 100.0)])])
+
+    assert [row.label for row in store.get_managed_labels(account_id)] == ["ARK26"]
+    assert store.get_symbol_rows(account_id, "GONE") == {}
+    assert written["skipped_labels"] == 1
+
+
+def test_save_allocation_targets_reports_what_it_wrote(account_id):
+    store.set_managed_label(account_id, "ARK26")
+
+    written = store.save_allocation_targets(
+        account_id, [_label_target("ARK26", 100.0, [("AAPL", 60.0), ("MSFT", 40.0)])])
+
+    assert written == {"labels": 1, "symbols": 2, "skipped_labels": 0}
+
+
+def test_save_allocation_targets_of_nothing_is_a_no_op(account_id):
+    assert store.save_allocation_targets(account_id, []) == {
+        "labels": 0, "symbols": 0, "skipped_labels": 0}
+    assert store.get_managed_labels(account_id) == []
+
+
+def test_save_allocation_targets_can_skip_the_label_percentages(account_id):
+    """An INVEST_LABEL run spends an explicit AMOUNT on one label; that label's
+    percentage is meaningless to it and must not be restated as if the user had
+    chosen it. Its symbol weights ARE what the money was split by, so those are
+    still what "last" should answer with."""
+    store.set_managed_label(account_id, "ARK26", target_pct=25.0)
+
+    store.save_allocation_targets(
+        account_id, [_label_target("ARK26", 99.0, [("AAPL", 100.0)])],
+        save_label_targets=False)
+
+    assert store.get_managed_labels(account_id)[0].target_pct == 25.0
+    assert store.get_symbol_weights(account_id, "ARK26", ["AAPL"]) == {"AAPL": 100.0}
+
+
+def test_save_allocation_targets_rejects_a_blank_symbol_before_writing_anything(account_id):
+    """One transaction: a set that cannot be written in full is not written at all,
+    so the stored targets can never be half of what the user allocated with."""
+    store.set_managed_label(account_id, "ARK26")
+    store.set_managed_label(account_id, "TECH")
+
+    with pytest.raises(ValueError):
+        store.save_allocation_targets(
+            account_id, [_label_target("ARK26", 50.0, [("AAPL", 100.0)]),
+                         _label_target("TECH", 50.0, [("  ", 100.0)])])
+
+    stored = {row.label: row.target_pct for row in store.get_managed_labels(account_id)}
+    assert stored == {"ARK26": 0.0, "TECH": 0.0}
+    assert store.get_symbol_rows(account_id, "ARK26") == {}
+
+
+def test_save_allocation_targets_normalises_symbols_like_every_other_writer(account_id):
+    store.set_managed_label(account_id, "ARK26")
+
+    store.save_allocation_targets(
+        account_id, [_label_target("ARK26", 100.0, [(" aapl ", 100.0)])])
+
+    assert list(store.get_symbol_rows(account_id, "ARK26")) == ["AAPL"]
+
+
+def test_save_allocation_targets_is_scoped_to_one_account(account_id):
+    from tests.factories import create_account_definition
+    other = create_account_definition(name="Other Account")
+    store.set_managed_label(account_id, "ARK26")
+    store.set_managed_label(other.id, "ARK26")
+
+    store.save_allocation_targets(account_id,
+                                  [_label_target("ARK26", 77.0, [("AAPL", 100.0)])])
+
+    assert store.get_managed_labels(other.id)[0].target_pct == 0.0
+    assert store.get_symbol_rows(other.id, "ARK26") == {}
