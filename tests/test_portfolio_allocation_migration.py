@@ -370,6 +370,32 @@ def test_adding_the_previous_columns_is_idempotent(migrated_engine, table_name, 
     assert names.count(column) == 1
 
 
+@pytest.mark.parametrize("table_name", ALLOCATION_TABLES)
+def test_the_migrated_column_ORDER_is_the_one_create_all_would_have_built(tmp_path,
+                                                                          table_name):
+    """The two paths have to produce the SAME table, not merely the same set of names.
+
+    This revision exists because ``init_db()``'s create_all and Alembic both build
+    these tables, on different databases, and must agree -- and column order is part
+    of that: it is what ``SELECT *`` and a positional ``INSERT INTO t VALUES (...)``
+    see, both of which this suite uses.
+
+    It is also the only thing that separates a column DECLARED in
+    ``op.create_table`` from one that arrives through the trailing
+    ``_add_column_if_absent`` repair, because a repair that fires appends to the END
+    of the table. Delete the column from the CREATE and every name-and-nullability
+    assertion still passes -- the repair silently covers for it -- while an alembic
+    database and a create_all database quietly stop being the same schema.
+    """
+    migrated = create_engine(f"sqlite:///{tmp_path / 'ordered_migration.sqlite'}")
+    _upgrade(migrated)
+    from_create_all = create_engine(f"sqlite:///{tmp_path / 'ordered_create_all.sqlite'}")
+    _create_all_allocation_tables(from_create_all)
+
+    assert ([c["name"] for c in inspect(migrated).get_columns(table_name)]
+            == [c["name"] for c in inspect(from_create_all).get_columns(table_name)])
+
+
 def test_adding_a_previous_column_preserves_the_rows_already_there(tmp_path):
     """``op.add_column`` is not a table rebuild, but pin it anyway: these two rows
     ARE the user's allocation configuration, and a migration that dropped them
@@ -393,3 +419,119 @@ def test_adding_a_previous_column_preserves_the_rows_already_there(tmp_path):
             "FROM portfolio_allocation_label WHERE id = 1")).one()
     assert (row[0], row[1]) == ('ARK26', 60.0)
     assert row[2] is None       # no last: the column is new, not back-filled
+
+
+# --- W8: unallocated_pct, the stored cash reserve ---------------------------
+#
+# Amended in place on the same grounds as the previous_* columns above, and it
+# lands in TWO places for the same reason they do: in ``op.create_table`` for a
+# database this revision builds, and in a trailing ``_add_column_if_absent`` for
+# the developer database ``init_db()``'s create_all got to first. Either one alone
+# leaves half the world without the column, and neither is redundant -- each is the
+# only path on its own kind of database.
+#
+# Unlike its two siblings this one is NOT NULL with a server default, and the
+# difference is a statement about history rather than about SQL: nobody who
+# predates the column ever reserved anything, so 0 is the true value and there is
+# nothing to guess. (SQLite accepts ADD COLUMN NOT NULL only BECAUSE of that
+# default; without one it refuses outright on a non-empty table.)
+
+def test_the_unallocated_reserve_column_is_not_null_with_a_zero_default(migrated_engine):
+    """NOT NULL and DEFAULT 0, which is the opposite choice from the previous_*
+    columns beside it and has to be pinned as such.
+
+    NULL there would mean "this account has not said", and there is no such state:
+    an account that never touched the box reserves nothing, which is a real answer
+    and the one every pre-existing row means. Nullable, the reserve would arrive at
+    ``compute_allocation`` as None on every legacy row and reach the arithmetic as a
+    guess -- and ``float(None or 0.0)`` would quietly make that guess look like a
+    decision.
+    """
+    columns = {c["name"]: c for c in
+               inspect(migrated_engine).get_columns("portfolio_allocation_config")}
+    assert "unallocated_pct" in columns
+    assert columns["unallocated_pct"]["nullable"] is False
+    assert str(columns["unallocated_pct"]["default"]).strip("'\"") == "0"
+
+
+def test_a_create_all_database_gains_the_unallocated_column_on_upgrade(tmp_path):
+    """The developer case. ``_create_table_if_absent`` SKIPS a table create_all has
+    already built, so a column added to the CREATE alone would never reach it: the
+    model would declare ``unallocated_pct`` and the schema would not have it, and
+    every read of the allocation config would die on a missing column."""
+    from sqlalchemy import text
+    engine = create_engine(f"sqlite:///{tmp_path / 'older_create_all_reserve.sqlite'}")
+    _create_all_allocation_tables(engine)
+    # Reproduce the OLD shape by dropping the column create_all has just made.
+    with engine.begin() as connection:
+        connection.execute(text("ALTER TABLE portfolio_allocation_config "
+                                "DROP COLUMN unallocated_pct"))
+    assert "unallocated_pct" not in {
+        c["name"] for c in inspect(engine).get_columns("portfolio_allocation_config")}
+
+    _upgrade(engine)
+
+    assert "unallocated_pct" in {
+        c["name"] for c in inspect(engine).get_columns("portfolio_allocation_config")}
+
+
+def test_the_repaired_unallocated_column_is_also_not_null_with_a_zero_default(tmp_path):
+    """The repair has to produce the same column the CREATE would have.
+
+    Two paths, one schema: a database that reached the column through
+    ``_add_column_if_absent`` must not end up with a nullable one, or "has this
+    account set a reserve?" answers differently depending on which build first
+    touched the database.
+    """
+    from sqlalchemy import text
+    engine = create_engine(f"sqlite:///{tmp_path / 'repaired_reserve.sqlite'}")
+    _create_all_allocation_tables(engine)
+    with engine.begin() as connection:
+        connection.execute(text("ALTER TABLE portfolio_allocation_config "
+                                "DROP COLUMN unallocated_pct"))
+
+    _upgrade(engine)
+
+    columns = {c["name"]: c for c in
+               inspect(engine).get_columns("portfolio_allocation_config")}
+    assert columns["unallocated_pct"]["nullable"] is False
+    assert str(columns["unallocated_pct"]["default"]).strip("'\"") == "0"
+
+
+def test_an_account_that_predates_the_reserve_reads_back_as_reserving_nothing(tmp_path):
+    """The back-fill, on a row that was configured before the column existed.
+
+    "No reserve" is what every such row MEANT, so 0.0 is history rather than a
+    default standing in for a missing answer -- and it is the value the whole
+    feature is safe at. A NULL here would reach ``compute_allocation`` on the next
+    dry run for an account nobody has touched since.
+    """
+    from sqlalchemy import text
+    engine = create_engine(f"sqlite:///{tmp_path / 'legacy_config_row.sqlite'}")
+    _create_all_allocation_tables(engine)
+    with engine.begin() as connection:
+        connection.execute(text("ALTER TABLE portfolio_allocation_config "
+                                "DROP COLUMN unallocated_pct"))
+        connection.execute(text(
+            "INSERT INTO portfolio_allocation_config "
+            "(id, account_id, valuation_mode, allow_fractional, updated_at) "
+            "VALUES (1, 7, 'market', 1, '2026-08-01 00:00:00')"))
+
+    _upgrade(engine)
+
+    with engine.begin() as connection:
+        row = connection.execute(text(
+            "SELECT account_id, valuation_mode, unallocated_pct "
+            "FROM portfolio_allocation_config WHERE id = 1")).one()
+    assert (row[0], row[1]) == (7, 'market')
+    assert row[2] == 0.0        # back-filled from the server default, never NULL
+
+
+def test_adding_the_unallocated_column_is_idempotent(migrated_engine):
+    """Re-running is the documented recovery, and ``op.add_column`` of a column that
+    is already there is a hard error on SQLite."""
+    _upgrade(migrated_engine)
+
+    names = [c["name"] for c in
+             inspect(migrated_engine).get_columns("portfolio_allocation_config")]
+    assert names.count("unallocated_pct") == 1
