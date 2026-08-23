@@ -258,6 +258,59 @@ def test_set_allocation_config_bumps_updated_at(account_id):
     assert store.get_allocation_config(account_id).updated_at >= first
 
 
+
+# --- the stored cash reserve (W8) -------------------------------------------
+
+def test_a_brand_new_config_reserves_nothing(account_id):
+    """0.0, not None: "no reserve" is a real answer and every existing account
+    means exactly that. A NULL here would make the wizard's box unfillable."""
+    assert store.get_allocation_config(account_id).unallocated_pct == 0.0
+
+
+def test_the_reserve_persists(account_id):
+    store.set_allocation_config(account_id, unallocated_pct=12.5)
+    assert store.get_allocation_config(account_id).unallocated_pct == 12.5
+
+
+def test_setting_the_reserve_leaves_the_other_choices_untouched(account_id):
+    store.set_allocation_config(account_id, valuation_mode="cost", allow_fractional=False)
+    store.set_allocation_config(account_id, unallocated_pct=30.0)
+    config = store.get_allocation_config(account_id)
+    assert (config.valuation_mode, config.allow_fractional) == ("cost", False)
+    assert config.unallocated_pct == 30.0
+
+
+def test_writing_the_other_choices_leaves_the_reserve_untouched(account_id):
+    """The guard is ``is not None``, so a mode-only write must not zero the reserve
+    -- which would silently deploy cash the user set aside."""
+    store.set_allocation_config(account_id, unallocated_pct=30.0)
+    store.set_allocation_config(account_id, valuation_mode="cost")
+    assert store.get_allocation_config(account_id).unallocated_pct == 30.0
+
+
+def test_the_reserve_can_be_taken_back_down_to_zero(account_id):
+    """0.0 is falsy and must still be storable -- the guard is ``is not None``."""
+    store.set_allocation_config(account_id, unallocated_pct=30.0)
+    store.set_allocation_config(account_id, unallocated_pct=0.0)
+    assert store.get_allocation_config(account_id).unallocated_pct == 0.0
+
+
+def test_a_reserve_outside_zero_to_one_hundred_is_refused_at_the_store(account_id):
+    """Refused where it would be WRITTEN, not only where it is typed: the UI is one
+    caller, and a stored -20 would inflate every future plan's base."""
+    for bad in (-0.01, 100.01, 250.0):
+        with pytest.raises(ValueError):
+            store.set_allocation_config(account_id, unallocated_pct=bad)
+    assert store.get_allocation_config(account_id).unallocated_pct == 0.0
+
+
+def test_the_reserve_is_scoped_per_account(account_id):
+    from tests.factories import create_account_definition
+    other = create_account_definition(name="Other Reserve Account")
+    store.set_allocation_config(account_id, unallocated_pct=40.0)
+    assert store.get_allocation_config(other.id).unallocated_pct == 0.0
+
+
 # --- income ledger ---------------------------------------------------------
 
 def test_upsert_income_event_inserts_a_new_event(account_id):

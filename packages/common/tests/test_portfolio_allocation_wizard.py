@@ -682,9 +682,9 @@ def test_steps_validation_is_empty_for_a_fully_valid_set():
 
 
 def test_steps_validation_includes_the_label_target_messages_too():
-    """Step 1's rule (labels total no MORE than 100) and step 2's (weights total
-    exactly 100 inside each label) are reported together, so Submit is blocked on
-    either -- and step 1's under-100 case is now reported as ADVICE."""
+    """Step 1's rule (labels total EXACTLY 100) and step 2's (weights total exactly
+    100 inside each label) are reported together, so Submit is blocked on either --
+    and BOTH sides of step 1's total block, the under case included."""
     over = steps_validation_messages(
         [LabelTarget("A", 70.0, [SymbolTarget("AAA", 100.0)]),
          LabelTarget("B", 48.0, [SymbolTarget("BBB", 100.0)])])
@@ -692,8 +692,8 @@ def test_steps_validation_includes_the_label_target_messages_too():
     assert blocking_messages(over) == over
 
     under = steps_validation_messages([LabelTarget("A", 55.0, [SymbolTarget("AAA", 100.0)])])
-    assert any("left unallocated" in m for m in under)
-    assert blocking_messages(under) == []
+    assert any("under 100%" in m for m in under)
+    assert blocking_messages(under) == under
 
     bad_weights = steps_validation_messages(
         [LabelTarget("A", 100.0, [SymbolTarget("AAA", 60.0)])])
@@ -784,14 +784,16 @@ def test_blocking_messages_keeps_every_rebalance_error():
     assert messages and blocking_messages(messages) == messages
 
 
-def test_blocking_messages_lets_the_unallocated_advisory_through():
-    """The other half of the relaxation. Without this fragment in
-    ADVISORY_MESSAGE_FRAGMENTS the message would be built as advice and then block
-    anyway, because blocking is the default."""
+def test_a_reserve_out_of_range_blocks_alongside_the_label_messages():
+    """The reserve is checked by the SAME seam the wizard already gates on, so a bad
+    reserve and a bad label total surface together rather than one at a time."""
     messages = steps_validation_messages(
-        [LabelTarget("A", 55.0, [SymbolTarget("AAA", 100.0)])])
-    assert messages
-    assert blocking_messages(messages) == []
+        [LabelTarget("A", 55.0, [SymbolTarget("AAA", 100.0)])], unallocated_pct=-5.0)
+
+    assert len(messages) == 2
+    assert any("under 100%" in m for m in messages)
+    assert any("outside 0-100%" in m for m in messages)
+    assert blocking_messages(messages) == messages
 
 
 # ---------------------------------------------------------------------------

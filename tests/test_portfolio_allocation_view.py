@@ -1225,17 +1225,19 @@ def test_a_symbol_row_without_stored_weights_reports_none():
     assert views[0].rows[0].target_value is None
 
 
-def test_the_unallocated_row_is_the_remainder_in_percent_and_dollars():
-    """READ-ONLY DERIVED: 100 - sum(targets), shown against the SAME base the
-    targets divide. Its "current" is the account's free buying power."""
+def test_the_unallocated_row_shows_the_STORED_reserve_in_percent_and_dollars():
+    """EDITABLE and STORED now, not derived from a label shortfall: the row reports
+    ``unallocated_pct`` against the SAME base the targets divide. Its "current" is
+    the account's free buying power, which is what is actually uninvested today."""
     from ba2_trade_platform.ui.utils.portfolio_allocation_view import unallocated_row
 
-    views = build_label_views([ManagedLabel('ARK26', 40.0), ManagedLabel('TECH', 30.0)],
+    views = build_label_views([ManagedLabel('ARK26', 70.0), ManagedLabel('TECH', 30.0)],
                               {'ARK26': ['AAPL'], 'TECH': ['MSFT']}, {}, {},
                               valuation_mode=VALUATION_MODE_MARKET,
-                              base_notional=10_000.0)
+                              base_notional=10_000.0, unallocated_pct=30.0)
 
-    row = unallocated_row(views, base_notional=10_000.0, available_buying_power=2_500.0)
+    row = unallocated_row(base_notional=10_000.0, available_buying_power=2_500.0,
+                          unallocated_pct=30.0)
 
     assert row.target_pct == 30.0
     assert row.target_value == 3_000.0
@@ -1243,41 +1245,102 @@ def test_the_unallocated_row_is_the_remainder_in_percent_and_dollars():
     assert row.pct_of_base == 25.0
 
 
-def test_the_unallocated_row_never_reports_a_negative_reserve():
-    """The wizard blocks an over-100 set, but this row is also drawn on the PAGE,
-    where the stored targets can be anything -- including a set typed before the
-    rule changed."""
+def test_the_unallocated_row_does_NOT_read_the_label_totals_any_more():
+    """The reversal, pinned. Labels totalling 100 with a 10% reserve is the normal
+    case: a row that derived itself from the shortfall would report 0."""
     from ba2_trade_platform.ui.utils.portfolio_allocation_view import unallocated_row
 
-    views = build_label_views([ManagedLabel('ARK26', 130.0)], {'ARK26': ['AAPL']}, {},
+    views = build_label_views([ManagedLabel('ARK26', 100.0)], {'ARK26': ['AAPL']}, {},
                               {}, valuation_mode=VALUATION_MODE_MARKET,
-                              base_notional=10_000.0)
+                              base_notional=10_000.0, unallocated_pct=10.0)
 
-    row = unallocated_row(views, base_notional=10_000.0, available_buying_power=0.0)
+    row = unallocated_row(base_notional=10_000.0, available_buying_power=0.0,
+                          unallocated_pct=10.0)
 
-    assert row.target_pct == 0.0
-    assert row.target_value == 0.0
-    assert row.over_pct == 30.0
+    assert (row.target_pct, row.target_value) == (10.0, 1_000.0)
 
 
-def test_the_unallocated_row_of_a_fully_allocated_account_is_zero_not_absent():
+def test_the_unallocated_row_of_an_account_reserving_nothing_is_zero_not_absent():
     from ba2_trade_platform.ui.utils.portfolio_allocation_view import unallocated_row
 
     views = build_label_views([ManagedLabel('ARK26', 100.0)], {'ARK26': ['AAPL']}, {},
                               {}, valuation_mode=VALUATION_MODE_MARKET,
                               base_notional=10_000.0)
 
-    row = unallocated_row(views, base_notional=10_000.0, available_buying_power=100.0)
+    row = unallocated_row(base_notional=10_000.0, available_buying_power=100.0,
+                          unallocated_pct=0.0)
 
-    assert (row.target_pct, row.target_value, row.over_pct) == (0.0, 0.0, 0.0)
+    assert (row.target_pct, row.target_value) == (0.0, 0.0)
     assert row.current_value == 100.0
 
 
 def test_the_unallocated_row_tolerates_a_zero_base():
     from ba2_trade_platform.ui.utils.portfolio_allocation_view import unallocated_row
 
-    row = unallocated_row([], base_notional=0.0, available_buying_power=0.0)
+    row = unallocated_row(base_notional=0.0, available_buying_power=0.0,
+                          unallocated_pct=100.0)
 
     assert row.target_pct == 100.0
     assert row.target_value == 0.0
     assert row.pct_of_base is None
+
+
+def test_the_unallocated_row_has_no_overshoot_field_any_more():
+    """``over_pct`` reported label targets summing past 100 -- a LABEL error, which
+    the validator now names directly. Reporting it on the reserve row conflated two
+    independent numbers."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import UnallocatedRow
+
+    assert not hasattr(UnallocatedRow(), "over_pct")
+
+
+def test_a_label_target_value_is_a_share_of_what_the_reserve_LEFT():
+    """THE REQUIREMENT, at the view layer. Base 10,000, reserve 10%, labels 50/30/20
+    -> 4,500 / 2,700 / 1,800 -- and the percentages on screen stay 50/30/20."""
+    views = build_label_views(
+        [ManagedLabel('A', 50.0), ManagedLabel('B', 30.0), ManagedLabel('C', 20.0)],
+        {'A': ['AAA'], 'B': ['BBB'], 'C': ['CCC']}, {}, {},
+        valuation_mode=VALUATION_MODE_MARKET,
+        base_notional=10_000.0, unallocated_pct=10.0)
+
+    assert [v.target_pct for v in views] == [50.0, 30.0, 20.0]
+    assert [v.target_value for v in views] == [4_500.0, 2_700.0, 1_800.0]
+    assert sum(v.target_value for v in views) == 9_000.0
+
+
+def test_pct_of_base_stays_on_the_GROSS_base_so_the_reserve_row_compares():
+    """Two denominators is the defect this page already had once. ``pct_of_base``
+    and the reserve row's ``pct_of_base`` must divide the same number, or a fully
+    invested book reads as 111% of a 90% base."""
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import unallocated_row
+
+    views = build_label_views([ManagedLabel('A', 100.0)], {'A': ['AAA']},
+                              {'AAA': _pos('AAA', 900, 10.0)}, {'AAA': 10.0},
+                              valuation_mode=VALUATION_MODE_MARKET,
+                              base_notional=10_000.0, unallocated_pct=10.0)
+    row = unallocated_row(base_notional=10_000.0, available_buying_power=1_000.0,
+                          unallocated_pct=10.0)
+
+    assert views[0].pct_of_base == 90.0          # 9,000 of a 10,000 GROSS base
+    assert row.pct_of_base == 10.0               # 1,000 of the SAME 10,000
+    assert views[0].pct_of_base + row.pct_of_base == 100.0
+
+
+def test_a_symbol_target_value_is_scaled_by_the_reserve_too():
+    """The symbol column divides its label's target, which the reserve already
+    scaled -- so it must NOT apply the factor a second time."""
+    views = build_label_views([ManagedLabel('A', 100.0)], {'A': ['AAA', 'BBB']}, {}, {},
+                              valuation_mode=VALUATION_MODE_MARKET,
+                              base_notional=10_000.0, unallocated_pct=10.0,
+                              symbol_weights={'A': {'AAA': 75.0, 'BBB': 25.0}})
+
+    by_symbol = {r.symbol: r.target_value for r in views[0].rows}
+    assert by_symbol == {'AAA': 6_750.0, 'BBB': 2_250.0}
+
+
+def test_no_reserve_leaves_every_target_value_exactly_where_it_was():
+    """The default path must be untouched: 0 is an identity, not an approximation."""
+    views = build_label_views([ManagedLabel('A', 40.0)], {'A': ['AAA']}, {}, {},
+                              valuation_mode=VALUATION_MODE_MARKET,
+                              base_notional=10_000.0)
+    assert views[0].target_value == 4_000.0

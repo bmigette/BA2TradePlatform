@@ -183,9 +183,12 @@ def _add_column_if_absent(table_name: str, column: sa.Column) -> None:
     re-running this revision safe, since ALTER TABLE ADD COLUMN of an existing
     column is a hard error on SQLite.
 
-    Only ever adds NULLABLE columns here. ADD COLUMN with NOT NULL and no server
-    default is rejected outright by SQLite on a non-empty table, and back-filling a
-    "previous target" nobody ever set would invent history.
+    A column added here is either NULLABLE or carries a SERVER DEFAULT. ADD COLUMN
+    with NOT NULL and NEITHER is rejected outright by SQLite on a non-empty table.
+    Which of the two is right is a question about history, not about SQL:
+    back-filling a "previous target" nobody ever set would invent one (NULLABLE),
+    while every row that predates ``unallocated_pct`` genuinely reserved nothing
+    (NOT NULL, server_default "0").
     """
     inspector = sa.inspect(op.get_bind())
     if not inspector.has_table(table_name):
@@ -232,6 +235,10 @@ def upgrade() -> None:
         sa.Column("account_id", sa.Integer(), nullable=False),
         sa.Column("valuation_mode", sa.String(), nullable=False),
         sa.Column("allow_fractional", sa.Boolean(), nullable=False),
+        # The deliberate cash reserve, 0-100. NOT NULL with a 0 default: "no
+        # reserve" is a real answer and is what every account predating the column
+        # meant, so there is nothing to back-fill and nothing to guess.
+        sa.Column("unallocated_pct", sa.Float(), nullable=False, server_default="0"),
         sa.Column("updated_at", sa.DateTime(), nullable=False),
         sa.ForeignKeyConstraint(["account_id"], ["accountdefinition.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),
@@ -342,6 +349,13 @@ def upgrade() -> None:
                           sa.Column("previous_target_pct", sa.Float(), nullable=True))
     _add_column_if_absent("portfolio_allocation_symbol",
                           sa.Column("previous_weight_pct", sa.Float(), nullable=True))
+    # Same story for the cash reserve, and NOT NULL is safe here precisely because
+    # it carries a server default: SQLite accepts ADD COLUMN NOT NULL when there is
+    # one to back-fill existing rows with, and 0 is the correct history ("nobody
+    # ever reserved anything") rather than an invented one.
+    _add_column_if_absent(
+        "portfolio_allocation_config",
+        sa.Column("unallocated_pct", sa.Float(), nullable=False, server_default="0"))
 
 
 def downgrade() -> None:

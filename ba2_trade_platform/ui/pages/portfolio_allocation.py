@@ -203,15 +203,22 @@ def _load_view_payload(account_id: int, valuation_mode: str) -> Dict[str, Any]:
         logger.warning(f"Account snapshot unavailable for account {account_id}: {e}; "
                        f"the unallocated group and the % of base will be omitted")
 
+    # The stored reserve, read from the SAME config row as the valuation mode. It
+    # scales the TARGET money the page shows so those figures match the ones the
+    # dry run will solve with; every "current" figure keeps dividing the gross base.
+    unallocated_pct = float(get_allocation_config(account_id).unallocated_pct or 0.0)
+
     return {
         'views': build_label_views(managed, symbols_by_label, positions, prices, comments,
                                    valuation_mode=valuation_mode,
                                    base_notional=base_notional,
-                                   symbol_weights=weights),
+                                   symbol_weights=weights,
+                                   unallocated_pct=unallocated_pct),
         'symbols_by_label': symbols_by_label,
         'valuation_mode': valuation_mode,
         'base_notional': base_notional,
         'available_buying_power': buying_power,
+        'unallocated_pct': unallocated_pct,
     }
 
 
@@ -224,11 +231,12 @@ def _load_flow_inputs(account_id: int, valuation_mode: str):
     """Everything the wizard needs to OPEN, in one thread hop. Blocking.
 
     Returns:
-        Tuple: ``(base, labels, allow_fractional, symbol_values)`` -- the frozen base
-        snapshot, the managed labels with their symbol weights AND the previous
-        generation of both, the account's remembered fractional choice, and
-        ``{SYMBOL: current value}`` under ``valuation_mode`` for the wizard's
-        read-only "now" captions.
+        Tuple: ``(base, labels, allow_fractional, symbol_values, unallocated_pct)``
+        -- the frozen base snapshot, the managed labels with their symbol weights
+        AND the previous generation of both, the account's remembered fractional
+        choice, ``{SYMBOL: current value}`` under ``valuation_mode`` for the
+        wizard's read-only "now" captions, and the stored cash reserve that
+        pre-fills the Unallocated box.
 
         ``symbol_values`` goes through the engine's own ``current_value`` rather
         than being re-derived, so the caption beside a target and the base that
@@ -269,18 +277,25 @@ def _load_flow_inputs(account_id: int, valuation_mode: str):
     base = build_base_snapshot(account.get_account_snapshot(), current, symbols,
                                valuation_mode=valuation_mode)
     symbol_values = {s: current_value(current.get(s), valuation_mode) for s in symbols}
-    return (base, labels, bool(get_allocation_config(account_id).allow_fractional),
-            symbol_values)
+    config = get_allocation_config(account_id)
+    return (base, labels, bool(config.allow_fractional), symbol_values,
+            float(config.unallocated_pct or 0.0))
 
 
 def _solve_plan(account_id: int, *, mode: str, labels, scope_label, amount: float,
                 allow_fractional: bool, valuation_mode: str,
+                unallocated_pct: float = 0.0,
                 force_market_refresh: bool = False):
     """Solve one dry run against FRESH positions, prices and margin info. Blocking.
 
     Re-reads everything rather than reusing the open dialog's snapshot: Refresh
     exists precisely because the numbers move, and a plan solved against a stale
     price is a plan submitted at the wrong size.
+
+    ``unallocated_pct`` is the cash reserve, and it reaches the REBALANCE branch
+    only. The invest branch deploys a specific amount the user named, so there is
+    no base for a share of it to be taken from -- see ``compute_label_investment``,
+    which deliberately has no such parameter.
 
     ``force_market_refresh`` drops the account's cached market-hours answer first.
     ``get_market_hours`` caches for ``min(TTL, next session boundary)``, which is
@@ -319,7 +334,8 @@ def _solve_plan(account_id: int, *, mode: str, labels, scope_label, amount: floa
         plan = compute_allocation(
             base.base_notional, base.available_buying_power, labels, current, margin,
             allow_fractional=allow_fractional,
-            default_bp_factor=base.default_bp_factor, valuation_mode=valuation_mode)
+            default_bp_factor=base.default_bp_factor, valuation_mode=valuation_mode,
+            unallocated_pct=unallocated_pct)
     # ``margin`` is REQUIRED and is the SAME dict the plan above was solved with:
     # the precheck may re-solve, and a re-solve without it rebuilds a bare
     # MarginInfo per fractional row and rounds on the default 4dp grid, losing
@@ -834,24 +850,27 @@ def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
              'positions carry a negative quantity, cost basis and value.'
              ).classes('text-xs text-secondary-custom')
 
-    # The UNALLOCATED group, FIRST and not expandable: it is the row that explains
-    # why the others do not add up to the base, and below them it reads as a
-    # footnote. READ-ONLY and DERIVED (100 - the stored targets) -- you allocate to
-    # it by under-allocating elsewhere, so there is nothing here to edit. Omitted
-    # entirely when the broker gave no base: better a missing row than one measured
-    # against a guess.
+    # The UNALLOCATED group, FIRST and not expandable: it is the row that says how
+    # much of the book is even in play, and below the labels it reads as a footnote.
+    # Its target is the STORED reserve; edit it in the Allocate wizard, which is
+    # where the change is validated and where the dry run that acts on it lives.
+    # Omitted entirely when the broker gave no base: better a missing row than one
+    # measured against a guess.
     if base_notional is not None and buying_power is not None:
-        reserve = unallocated_row(views, base_notional=base_notional,
-                                  available_buying_power=buying_power)
+        reserve = unallocated_row(base_notional=base_notional,
+                                  available_buying_power=buying_power,
+                                  unallocated_pct=payload['unallocated_pct'])
         with ui.element('div').classes('alert-banner info w-full p-3'):
             ui.label(f'Unallocated (free buying power) — ${reserve.current_value:,.2f} '
                      f'({reserve.pct_of_base:.1f}% of base, target '
                      f'{reserve.target_pct:.2f}% = ${reserve.target_value:,.2f})')
-            if reserve.over_pct:
-                ui.label(f'The stored label targets total '
-                         f'{100.0 + reserve.over_pct:.2f}% — over 100% by '
-                         f'{reserve.over_pct:.2f}%. Allocate will refuse this until '
-                         f'it comes back down.').classes('text-xs text-orange-400')
+            if reserve.target_pct:
+                # Said out loud, because it is the counter-intuitive half: a reserve
+                # on a fully invested book is funded by SELLING, and the dry run is
+                # where that becomes visible.
+                ui.label('The labels below divide what is left after this — raising '
+                         'it on a fully invested account will generate sell orders.'
+                         ).classes('text-xs text-secondary-custom')
 
     for view in views:
         # ONE denominator when there is a base to use: ``pct_of_total`` divides by
@@ -895,7 +914,8 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
     event loop freezes the app for every connected client.
     """
     try:
-        base, labels, allow_fractional, symbol_values = await asyncio.to_thread(
+        (base, labels, allow_fractional, symbol_values,
+         unallocated_pct) = await asyncio.to_thread(
             _load_flow_inputs, account_id, valuation_mode)
     except PositionFetchFailed as e:
         logger.error(f"Portfolio allocation: position fetch failed: {e}")
@@ -912,31 +932,38 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
 
     state = {'mode': mode, 'scope_label': None, 'amount': float(invest_amount or 0.0),
              'labels': labels, 'allow_fractional': allow_fractional,
+             'unallocated_pct': unallocated_pct,
              'base': base, 'current': {}}
 
-    def _persist_choices(mode: str, labels, allow_fractional: bool) -> None:
+    def _persist_choices(mode: str, labels, allow_fractional: bool,
+                         unallocated_pct: float) -> None:
         """Write what this run was launched with. Blocking; one thread hop.
 
-        Both writes happen on CONTINUE, not on Submit, and that is what "last"
+        All three writes happen on CONTINUE, not on Submit, and that is what "last"
         means here: the numbers the user last chose to allocate with, whether or
         not they went through with the orders. The fractional switch has been
         persisted from exactly this point since it shipped
-        (``remember_fractional_choice``); the targets now follow it.
+        (``remember_fractional_choice``); the targets and the reserve follow it.
 
-        An INVEST_LABEL run passes ``save_label_targets=False``: it spends an
-        explicit amount on one label, so that label's percentage played no part and
-        recording it would store a choice the user never made. Its symbol weights
+        An INVEST_LABEL run passes ``save_label_targets=False`` and does NOT touch
+        the reserve: it spends an explicit amount on one label, so that label's
+        percentage played no part, and its ``unallocated_pct`` is a hard 0 that
+        would ZERO a reserve the user set on the rebalance side. Its symbol weights
         DID split the money, so they are still saved.
         """
         svc.remember_fractional_choice(account_id, bool(allow_fractional))
+        if mode != ALLOCATION_MODE_INVEST_LABEL:
+            set_allocation_config(account_id, unallocated_pct=float(unallocated_pct))
         return save_allocation_targets(
             account_id, labels,
             save_label_targets=(mode != ALLOCATION_MODE_INVEST_LABEL))
 
-    async def _save_choices(mode: str, labels, allow_fractional: bool) -> None:
+    async def _save_choices(mode: str, labels, allow_fractional: bool,
+                            unallocated_pct: float) -> None:
         try:
             written = await asyncio.to_thread(_persist_choices, mode, labels,
-                                              bool(allow_fractional))
+                                              bool(allow_fractional),
+                                              float(unallocated_pct))
         except Exception as e:
             # Reported, then out of the way. Persisting is a convenience; SOLVING is
             # what the user pressed Continue for, and refusing to open the dry run
@@ -956,13 +983,15 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
         # Persist BEFORE solving. This is the Continue action, and Continue is what
         # "last" means: the numbers the user last chose to allocate with, whether or
         # not they then went through with the orders.
-        await _save_choices(state['mode'], state['labels'], state['allow_fractional'])
+        await _save_choices(state['mode'], state['labels'], state['allow_fractional'],
+                            state['unallocated_pct'])
         try:
             new_base, plan, current, hours = await asyncio.to_thread(
                 _solve_plan, account_id, mode=state['mode'], labels=state['labels'],
                 scope_label=state['scope_label'], amount=state['amount'],
                 allow_fractional=state['allow_fractional'],
-                valuation_mode=valuation_mode)
+                valuation_mode=valuation_mode,
+                unallocated_pct=state['unallocated_pct'])
         except PositionFetchFailed as e:
             logger.error(f"Portfolio allocation dry run: position fetch failed: {e}")
             ui.notify(f'Broker position fetch FAILED: {e}', type='negative')
@@ -991,6 +1020,9 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
                 account_id, mode=state['mode'], labels=state['labels'],
                 scope_label=state['scope_label'], amount=state['amount'],
                 allow_fractional=bool(allow_fractional), valuation_mode=valuation_mode,
+                # The reserve the dialog was CONTINUED with, not a re-read: Refresh
+                # re-prices the book, it does not re-open the question.
+                unallocated_pct=state['unallocated_pct'],
                 force_market_refresh=True)
             state['base'] = fresh_base
             state['current'] = fresh_current
@@ -1025,7 +1057,7 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
         await refresh()
 
     def _on_dry_run(*, mode: str, labels, scope_label, amount: float,
-                    allow_fractional: bool) -> None:
+                    allow_fractional: bool, unallocated_pct: float) -> None:
         """Called by the steps dialog (sync). Records the choices, then solves.
 
         The write itself is in ``_run_dry_run``, off the event loop -- unlike the
@@ -1034,13 +1066,15 @@ async def _open_allocation_flow(account_id: int, valuation_mode: str,
         """
         state.update({'mode': mode, 'labels': labels, 'scope_label': scope_label,
                       'amount': float(amount or 0.0),
-                      'allow_fractional': bool(allow_fractional)})
+                      'allow_fractional': bool(allow_fractional),
+                      'unallocated_pct': float(unallocated_pct or 0.0)})
         ui.timer(0.1, _run_dry_run, once=True)
 
     open_allocation_steps(base, labels, on_dry_run=_on_dry_run,
                           allow_fractional=allow_fractional,
                           mode=state['mode'], invest_amount=state['amount'],
-                          symbol_values=symbol_values)
+                          symbol_values=symbol_values,
+                          unallocated_pct=unallocated_pct)
 
 
 async def _open_invest_flow(account_id: int, valuation_mode: str, amount: float,

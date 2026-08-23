@@ -56,6 +56,7 @@ from ...core.portfolio_allocation import (
     load_previous_symbol_weights,
     load_previous_targets,
     invest_validation_messages,
+    investable_notional,
     is_blocking_message,
     no_order_notice,
     no_order_rows,
@@ -185,10 +186,13 @@ MARKER_WORKING_ORDERS = 'income-working-orders'
 MARKER_LABEL_PCT = 'steps-label-pct'
 MARKER_SYMBOL_PCT = 'steps-symbol-pct'
 
-#: Marker on step 1's read-only UNALLOCATED row -- the derived remainder, at the
-#: TOP of the label list. By marker: the sentence is money and percent, both of
-#: which repeat in the rows beneath it.
+#: Marker on the MONEY caption beside step 1's Unallocated box, at the TOP of the
+#: label list. By marker: the sentence is money, which repeats in the rows beneath.
 MARKER_UNALLOCATED = 'steps-unallocated'
+
+#: Marker on step 1's EDITABLE reserve input. Separate from the caption above so a
+#: test can assert the box exists and holds a value without matching on prose.
+MARKER_UNALLOCATED_PCT = 'steps-unallocated-pct'
 
 #: Marker on step 1's live running total.
 MARKER_LABEL_TOTAL = 'steps-label-total'
@@ -206,19 +210,21 @@ MARKER_CASH_VS_RESERVE = 'dry-run-cash-vs-reserve'
 CASH_VS_RESERVE_FMT = ('Est. cash after {cash:,.2f} vs reserve {reserved:,.2f} '
                        '({delta:+,.2f})')
 
-#: Step 1's derived remainder, in percent AND dollars. READ-ONLY and DERIVED, by
-#: decision: you allocate to it by under-allocating elsewhere, so there is no
-#: second box to keep in sync and nothing is ever rewritten behind the user.
-UNALLOCATED_FMT = 'Unallocated (free buying power)  {pct:.2f}%  ({amount:,.2f})'
-
-#: The same row when the targets OVERSHOOT. A negative reserve is not a thing, and
-#: printing "-30.00%" there invites the user to read it as a number they can spend.
-UNALLOCATED_OVER_FMT = 'Unallocated (free buying power)  over by {over:.2f}%'
+#: The money beside step 1's reserve box. BOTH halves, because the useful question
+#: is not "how much am I holding back" on its own but "...and what is left to
+#: divide" -- the number the label percentages below are shares of.
+UNALLOCATED_FMT = ('= {amount:,.2f} held as cash, leaving {investable:,.2f} '
+                   'for the labels below')
 
 #: Step 1's live running total. The messages list is built below step 3 and can sit
 #: under the fold in a maximized dialog, so the total has to be up where the boxes
 #: are.
 LABEL_TOTAL_FMT = 'Total: {total:.2f}%'
+
+#: The label on step 1's reserve box. Names it "free buying power" for continuity
+#: with the page, and says outright that the labels are unaffected -- that is the
+#: property the user is being asked to trust.
+UNALLOCATED_LABEL = 'Unallocated (free buying power)'
 
 #: The dry run's reserve chip, drawn only when there IS one. A "Reserved: 0.00" on
 #: every fully-allocated plan is noise, and noise is what hides the real case.
@@ -971,7 +977,8 @@ class AllocationSteps:
                  allow_fractional: bool,
                  mode: str = ALLOCATION_MODE_REBALANCE,
                  invest_amount: float = 0.0,
-                 symbol_values: Optional[Dict[str, float]] = None):
+                 symbol_values: Optional[Dict[str, float]] = None,
+                 unallocated_pct: float = 0.0):
         self.base = base
         # The deep copy carries ``previous_*`` across UNCHANGED. They are what the
         # Load-last buttons read, and a copy that dropped them would disable the
@@ -996,6 +1003,10 @@ class AllocationSteps:
         # that cannot do fractional at all. Per-symbol eligibility is the engine's
         # job -- MarginInfo.fractionable -- not this switch's.
         self.allow_fractional = bool(base.supports_fractional and allow_fractional)
+        #: The account's STORED cash reserve, pre-filled and edited in place. It is
+        #: NOT part of ``labels`` and never enters their total: they are relative
+        #: weights totalling 100, and this says what share of the base they divide.
+        self.unallocated_pct = float(unallocated_pct or 0.0)
         self.scope_label = self.labels[0].label if self.labels else None
         self.dialog = None
         self._errors_container = None
@@ -1003,6 +1014,7 @@ class AllocationSteps:
         self._fractional_switch = None
         self._labels_container = None
         self._unallocated_label = None
+        self._unallocated_input = None
         self._total_label = None
         #: ``{label: column}`` for step 2, so a per-label Load last can redraw just
         #: that expansion's boxes.
@@ -1035,10 +1047,11 @@ class AllocationSteps:
 
     # -- steps ------------------------------------------------------------
     def _render_step1_label_targets(self):
-        ui.label('1. Label targets (% of the base notional, up to 100%)') \
+        ui.label('1. Label targets (must total 100%, split between the labels)') \
             .classes('text-lg font-bold mt-2')
-        ui.label('Anything you do not allocate stays as free buying power - the '
-                 'Unallocated row below shows how much.') \
+        ui.label('These are RELATIVE weights. To hold cash, raise Unallocated below '
+                 '- the labels keep the percentages you typed and simply divide '
+                 'what is left.') \
             .classes('text-xs text-secondary-custom')
         with ui.row().classes('items-center gap-2'):
             ui.button('Even split', icon='balance',
@@ -1053,19 +1066,16 @@ class AllocationSteps:
         self._draw_label_targets()
 
     def _unallocated_caption(self) -> str:
-        """``100 - sum(targets)`` in percent and dollars, or the overshoot.
+        """The reserve in DOLLARS, and what it leaves the labels to divide.
 
-        DERIVED, never stored: the reserve is implied by the label targets, and a
-        stored copy of a derivable number is a divergence waiting to happen. Both
-        halves are shown because a percentage alone does not tell the user whether
-        they are leaving 300 or 30,000 in cash.
+        Both halves, because "10%" answers neither question the user actually has:
+        how much cash that is, and how much money the percentages below are shares
+        of. The money comes from the engine's own ``investable_notional``, so the
+        figure on screen is the one the plan will be solved with.
         """
-        total = sum(float(lt.target_pct or 0.0) for lt in self.labels)
-        if total > 100.0 + LABEL_TOTAL_TOLERANCE_PCT:
-            return UNALLOCATED_OVER_FMT.format(over=total - 100.0)
-        pct = max(0.0, 100.0 - total)
-        return UNALLOCATED_FMT.format(
-            pct=pct, amount=float(self.base.base_notional or 0.0) * pct / 100.0)
+        base = float(self.base.base_notional or 0.0)
+        investable = investable_notional(base, self.unallocated_pct)
+        return UNALLOCATED_FMT.format(amount=base - investable, investable=investable)
 
     def _label_current_caption(self, lt: LabelTarget) -> str:
         """The read-only "now X (Y% of base) · last Z%" beside a label's target box.
@@ -1085,14 +1095,22 @@ class AllocationSteps:
     def _draw_label_targets(self):
         self._labels_container.clear()
         with self._labels_container:
-            # FIRST, above the labels: this is the row that explains why the others
-            # do not add up, and below them it reads as a footnote. Always drawn,
-            # including at 0.00% -- a row that vanishes when it is zero teaches
-            # nothing about where the number went.
+            # FIRST, above the labels: this is the row that says how much of the
+            # book is even in play, and below them it reads as a footnote. Always
+            # drawn, including at 0.00% -- a box that appears only once it is
+            # non-zero is one the user cannot find when the validator tells them to
+            # use it.
             with ui.row().classes('w-full items-center gap-3'):
+                ui.label(UNALLOCATED_LABEL).classes('w-40 font-medium text-orange-400')
+                self._unallocated_input = ui.number(
+                    value=self.unallocated_pct, min=0, max=100, step=0.01, suffix='%',
+                    on_change=lambda e: self._set_unallocated_pct(e.value)
+                ).props('dense outlined').classes('w-32').mark(MARKER_UNALLOCATED_PCT)
                 self._unallocated_label = ui.label(self._unallocated_caption()) \
-                    .classes('text-sm font-medium text-orange-400') \
-                    .mark(MARKER_UNALLOCATED)
+                    .classes('text-sm text-orange-400').mark(MARKER_UNALLOCATED)
+                # The LABEL total, and only the label total. Folding the reserve in
+                # would put the user back to doing the subtraction this box exists
+                # to remove.
                 self._total_label = ui.label(LABEL_TOTAL_FMT.format(
                     total=sum(float(lt.target_pct or 0.0) for lt in self.labels))) \
                     .classes('text-xs text-secondary-custom').mark(MARKER_LABEL_TOTAL)
@@ -1177,17 +1195,14 @@ class AllocationSteps:
 
     # -- state + validation ------------------------------------------------
     def _even_split(self):
-        """Split what is CURRENTLY allocated, not a flat 100.
+        """Split the whole 100 among the labels, and leave the reserve alone.
 
-        On a book the user is deliberately holding 30% of in cash, an even split of
-        100 silently deploys that cash -- a real trade nobody asked for. An
-        UNTOUCHED set (every target 0) has no reserve to preserve, only an unusable
-        button, so that one case falls back to the whole 100.
+        It briefly split "what is currently allocated", to avoid wiping a reserve
+        that was DERIVED from the label shortfall. The reserve is its own box now,
+        so an even split of anything but 100 would just produce a set the validator
+        refuses.
         """
-        allocated = sum(float(lt.target_pct or 0.0) for lt in self.labels)
-        total_pct = allocated if allocated > LABEL_TOTAL_TOLERANCE_PCT else 100.0
-        for edited, fresh in zip(self.labels,
-                                 even_split_targets(self.labels, total_pct=total_pct)):
+        for edited, fresh in zip(self.labels, even_split_targets(self.labels)):
             edited.target_pct = fresh.target_pct
         self._draw_label_targets()
         self._revalidate()
@@ -1225,6 +1240,16 @@ class AllocationSteps:
         self._redraw_derived_row()
         self._revalidate()
 
+    def _set_unallocated_pct(self, value):
+        """The reserve box. Touches NO label percentage, by construction.
+
+        Redraws only the money caption beside it, in place: rebuilding the row
+        would rebuild the ``ui.number`` the event came from, underneath the cursor.
+        """
+        self.unallocated_pct = float(value or 0.0)
+        self._redraw_derived_row()
+        self._revalidate()
+
     def _redraw_derived_row(self):
         if self._unallocated_label is not None:
             self._unallocated_label.set_text(self._unallocated_caption())
@@ -1249,7 +1274,8 @@ class AllocationSteps:
 
     def _problems(self) -> List[str]:
         if self.mode == ALLOCATION_MODE_REBALANCE:
-            return steps_validation_messages(self.labels)
+            return steps_validation_messages(self.labels,
+                                             unallocated_pct=self.unallocated_pct)
         return invest_validation_messages(
             self._scope_target(), self.invest_amount,
             available_buying_power=self.base.available_buying_power)
@@ -1278,13 +1304,17 @@ class AllocationSteps:
         if self.mode == ALLOCATION_MODE_REBALANCE:
             self.on_dry_run(mode=ALLOCATION_MODE_REBALANCE, labels=self.labels,
                             scope_label=None, amount=0.0,
-                            allow_fractional=self.allow_fractional)
+                            allow_fractional=self.allow_fractional,
+                            unallocated_pct=self.unallocated_pct)
         else:
             scope = self._scope_target()
+            # 0.0, ALWAYS: an invest run spends a specific amount the user named,
+            # and there is no portfolio base for a reserve to be a share of.
             self.on_dry_run(mode=ALLOCATION_MODE_INVEST_LABEL,
                             labels=[scope] if scope else [], scope_label=self.scope_label,
                             amount=self.invest_amount,
-                            allow_fractional=self.allow_fractional)
+                            allow_fractional=self.allow_fractional,
+                            unallocated_pct=0.0)
 
 
 def open_allocation_steps(base: BaseSnapshot, labels: List[LabelTarget], *,
@@ -1292,19 +1322,26 @@ def open_allocation_steps(base: BaseSnapshot, labels: List[LabelTarget], *,
                           allow_fractional: bool,
                           mode: str = ALLOCATION_MODE_REBALANCE,
                           invest_amount: float = 0.0,
-                          symbol_values: Optional[Dict[str, float]] = None
+                          symbol_values: Optional[Dict[str, float]] = None,
+                          unallocated_pct: float = 0.0
                           ) -> AllocationSteps:
     """Open steps 1-3. ``on_dry_run`` is called with keyword arguments
-    ``mode``, ``labels``, ``scope_label``, ``amount`` and ``allow_fractional``.
+    ``mode``, ``labels``, ``scope_label``, ``amount``, ``allow_fractional`` and
+    ``unallocated_pct``.
 
     ``allow_fractional`` is REQUIRED and has no default: the caller passes
     ``get_allocation_config(account_id).allow_fractional`` (itself defaulting to
     True), and persists any change through
     ``portfolio_allocation_service.remember_fractional_choice``. A default here
-    would silently re-answer a question the account has already answered."""
+    would silently re-answer a question the account has already answered.
+
+    ``unallocated_pct`` DOES default, to 0, and the asymmetry is deliberate: "no
+    reserve" is both the safe answer and the true one for an account that has never
+    set one, whereas there is no fractional answer that is right by omission."""
     steps = AllocationSteps(base, labels, on_dry_run=on_dry_run,
                             allow_fractional=allow_fractional, mode=mode,
-                            invest_amount=invest_amount, symbol_values=symbol_values)
+                            invest_amount=invest_amount, symbol_values=symbol_values,
+                            unallocated_pct=unallocated_pct)
     steps.open()
     return steps
 

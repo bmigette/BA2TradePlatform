@@ -855,6 +855,19 @@ class PortfolioAllocationConfig(SQLModel, table=True):
     the ineligible names. Neither column has a server default -- these Python
     defaults are what every new row gets, which is why changing one needs no Alembic
     revision.
+
+    ``unallocated_pct`` is the deliberate CASH RESERVE: the share of the allocatable
+    base, 0-100, that a REBALANCE must NOT invest. It scales the investable base
+    once (``ba2_common.core.portfolio_allocation.investable_notional``), leaving the
+    label targets as pure relative weights that always total 100 among themselves --
+    so raising the reserve rewrites none of them and the user never does the
+    arithmetic. Stored rather than derived from a label shortfall, which is the one
+    place it could otherwise live: with both, "labels sum to 90" would mean either
+    "hold 10% in cash" or "you mistyped a box".
+
+    It defaults to 0.0 and is NOT NULL, because "no reserve" is a real answer and is
+    what every account that predates the column meant. A NULL would leave the
+    wizard's box unfillable and every reader guessing.
     """
     __tablename__ = "portfolio_allocation_config"
 
@@ -863,6 +876,7 @@ class PortfolioAllocationConfig(SQLModel, table=True):
                             index=True, unique=True)
     valuation_mode: str = Field(default="market", description="cost | market (plain str, see core.portfolio_allocation)")
     allow_fractional: bool = Field(default=True, description="Last fractional-shares choice, pre-filled into the wizard (defaults ON)")
+    unallocated_pct: float = Field(default=0.0, description="0-100: share of the base deliberately held as cash (scales the investable base)")
     updated_at: DateTime = Field(default_factory=lambda: DateTime.now(timezone.utc), index=True)
 
 

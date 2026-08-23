@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 
 from ...core.portfolio_allocation import (
     VALUATION_MODE_COST, VALUATION_MODE_MARKET, PositionFetchFailed, PositionState,
-    current_value,
+    current_value, investable_notional,
 )
 
 # ---- gate reason codes (exact spellings; use these, never bare literals) ----
@@ -290,7 +290,8 @@ def build_label_views(managed,
                       *,
                       valuation_mode: str,
                       base_notional: Optional[float] = None,
-                      symbol_weights=None) -> List[LabelView]:
+                      symbol_weights=None,
+                      unallocated_pct: float = 0.0) -> List[LabelView]:
     """Build the default view: one LabelView per managed label. Pure.
 
     ``valuation_mode`` (decision 5a) selects what "current value" means: ``cost``
@@ -322,6 +323,12 @@ def build_label_views(managed,
             treated as absent when it is 0.
         symbol_weights: ``{label: {symbol: weight_pct}}`` from ``get_symbol_weights``.
             Optional, on the same terms.
+        unallocated_pct: the account's stored cash reserve, 0-100. It scales the
+            TARGET money only -- ``target_value`` on the label and on every symbol
+            row -- because the label percentages divide what the reserve LEFT.
+            ``pct_of_base`` deliberately keeps dividing the GROSS base, so that it
+            and ``UnallocatedRow.pct_of_base`` sit under one denominator and add up
+            to 100; netting it here would make a fully invested book read 111%.
 
     Returns:
         List[LabelView]: labels in the given order, rows within each ordered by
@@ -338,6 +345,9 @@ def build_label_views(managed,
     # 0 is treated as absent: dividing by it is undefined, and reporting 0.00% of
     # base is a statement rather than an absence.
     base = float(base_notional) if base_notional else None
+    # The one scaling, from the engine's own helper so the page cannot show a
+    # target the solver would not have used.
+    investable = None if base is None else investable_notional(base, unallocated_pct)
     weights_by_label = symbol_weights or {}
 
     def _clean(label: str) -> List[str]:
@@ -379,8 +389,8 @@ def build_label_views(managed,
     for entry in managed:
         symbols = _clean(entry.label)
         label_value = sum(_value_of(s) for s in symbols)
-        label_target_value = (None if base is None
-                              else base * float(entry.target_pct or 0.0) / 100.0)
+        label_target_value = (None if investable is None
+                              else investable * float(entry.target_pct or 0.0) / 100.0)
         label_weights = weights_by_label.get(entry.label) or {}
         rows: List[SymbolRow] = []
 
@@ -432,52 +442,57 @@ def build_label_views(managed,
 
 @dataclass
 class UnallocatedRow:
-    """The free-buying-power row, at the TOP of the page's label list. Pure.
+    """The cash-reserve row, at the TOP of the page's label list. Pure.
 
-    READ-ONLY and DERIVED, by decision. ``target_pct`` is ``100 - sum(label
-    targets)`` and there is NO stored column behind it: the reserve is implied by
-    the label targets, so a stored copy would be a divergence waiting to happen and
-    "allocating to it" is under-allocating everywhere else.
+    ``target_pct`` is the account's STORED ``unallocated_pct`` -- an editable number
+    in its own right, not ``100 - sum(label targets)``. Deriving it from a shortfall
+    was tried and superseded: the labels now total 100 by rule, so a derived row
+    would read 0 on every correctly configured account, and "labels sum to 90" would
+    otherwise mean either a reserve or a typo.
 
     ``current_value`` is the account's AVAILABLE BUYING POWER -- what is actually
-    uninvested right now -- while ``target_value`` is what the targets say should
+    uninvested right now -- while ``target_value`` is what the reserve says should
     be. The two differ exactly when the book is off target, which is the whole
-    reason the row is worth drawing.
+    reason the row is worth drawing, and it is what makes "raising the reserve sells
+    something" visible BEFORE the dry run.
 
-    ``pct_of_base`` is the CURRENT figure as a share of the base, so it sits under
-    the same denominator as every ``LabelView.pct_of_base`` above it. ``None`` when
-    there is no base to divide by.
+    ``pct_of_base`` is the CURRENT figure as a share of the GROSS base, so it sits
+    under the same denominator as every ``LabelView.pct_of_base`` above it and the
+    column adds to 100. ``None`` when there is no base to divide by.
 
-    ``over_pct`` is non-zero only when the stored targets total MORE than 100. The
-    wizard refuses to submit such a set, but the PAGE renders whatever is stored --
-    including a set typed before the rule changed -- and a negative reserve read as
-    money the user could spend would be worse than saying nothing.
+    There is deliberately no ``over_pct``. It reported label targets summing past
+    100, which is a LABEL error the validator now names directly; carrying it on the
+    reserve row conflated two independent numbers on the one line meant to explain
+    the cash.
     """
     target_pct: float = 0.0
     target_value: float = 0.0
     current_value: float = 0.0
     pct_of_base: Optional[float] = None
-    over_pct: float = 0.0
 
 
-def unallocated_row(views, *, base_notional: float,
-                    available_buying_power: float) -> UnallocatedRow:
-    """Build the derived free-buying-power row from the label views. Pure.
+def unallocated_row(*, base_notional: float, available_buying_power: float,
+                    unallocated_pct: float) -> UnallocatedRow:
+    """Build the cash-reserve row. Pure.
 
-    Sums ``target_pct`` across the views -- the stored targets, not anything
-    re-derived -- and reports the remainder in percent and money against
-    ``base_notional``, the SAME denominator those targets divide.
+    Every argument is REQUIRED and keyword-only, ``unallocated_pct`` included --
+    unlike the same argument on ``build_label_views``, which has other work to do
+    without one. This row's entire content IS the reserve, so a caller that forgot
+    it would silently draw "0.00% held as cash" over a real one.
+
+    It no longer takes the label ``views``: the reserve used to be derived from
+    their shortfall, and now reads nothing but its own stored number. The money
+    goes through the engine's ``investable_notional`` so the row and the plan
+    cannot disagree about what a reserve is worth.
     """
-    total = sum(float(v.target_pct or 0.0) for v in (views or []))
     base = float(base_notional or 0.0)
-    remainder = max(0.0, 100.0 - total)
+    reserved_pct = max(0.0, min(100.0, float(unallocated_pct or 0.0)))
     return UnallocatedRow(
-        target_pct=remainder,
-        target_value=base * remainder / 100.0,
+        target_pct=reserved_pct,
+        target_value=base - investable_notional(base, reserved_pct),
         current_value=float(available_buying_power or 0.0),
         pct_of_base=((float(available_buying_power or 0.0) / base * 100.0)
                      if base else None),
-        over_pct=max(0.0, total - 100.0),
     )
 
 

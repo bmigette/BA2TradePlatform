@@ -417,20 +417,6 @@ def test_validate_label_targets_accepts_a_valid_hundred_percent_set():
     assert pa.validate_label_targets(labels) == []
 
 
-def test_a_total_below_one_hundred_is_ADVICE_and_names_the_free_buying_power():
-    """Requirement 3: under-allocating is legal -- what is left is deliberate free
-    buying power, and the solver already deploys exactly ``sum(pct)%`` and leaves
-    the rest as cash. The message still fires, because "typed 60 instead of 80" and
-    "wanted 40% in cash" produce identical numbers and only the user can tell them
-    apart."""
-    labels = [LabelTarget("A", 60.0, [SymbolTarget("AAA", 100.0)])]
-    messages = pa.validate_label_targets(labels)
-
-    assert messages == [pa.ADVISORY_LABEL_UNDER_FMT.format(unallocated=40.0)]
-    assert messages == ["40.00% left unallocated as free buying power"]
-    assert pa.blocking_messages(messages) == []
-
-
 def test_a_total_above_one_hundred_is_still_a_hard_ERROR():
     """The only rule left, and it has to stay hard: the plan cannot buy money the
     account does not have, and the buying-power scaler would silently shrink every
@@ -442,31 +428,6 @@ def test_a_total_above_one_hundred_is_still_a_hard_ERROR():
     assert messages == [pa.ERROR_LABEL_TOTAL_FMT.format(total=118.0, over=18.0)]
     assert messages == ["label targets total 118.00% - over 100% by 18.00%"]
     assert pa.blocking_messages(messages) == messages
-
-
-def test_the_under_one_hundred_advisory_does_not_fire_at_exactly_one_hundred():
-    labels = [LabelTarget("A", 60.0, [SymbolTarget("AAA", 100.0)]),
-              LabelTarget("B", 40.0, [SymbolTarget("BBB", 100.0)])]
-    assert pa.validate_label_targets(labels) == []
-
-
-def test_the_under_one_hundred_advisory_respects_the_tolerance():
-    """99.995 is 100 for this purpose, exactly as it always was -- the relaxation
-    changed which SIDE is fatal, not how wide the band is."""
-    labels = [LabelTarget("A", 99.995, [SymbolTarget("AAA", 100.0)])]
-    assert pa.validate_label_targets(labels) == []
-
-
-def test_the_over_one_hundred_error_respects_the_tolerance():
-    labels = [LabelTarget("A", 100.005, [SymbolTarget("AAA", 100.0)])]
-    assert pa.validate_label_targets(labels) == []
-
-
-def test_an_empty_label_set_is_reported_as_one_hundred_percent_unallocated():
-    """Not silence: an account that manages nothing has its whole base in cash, and
-    saying so is the point of the advisory."""
-    assert pa.validate_label_targets([]) == [
-        pa.ADVISORY_LABEL_UNDER_FMT.format(unallocated=100.0)]
 
 
 def test_symbol_weights_inside_a_label_must_STILL_total_exactly_one_hundred():
@@ -482,15 +443,15 @@ def test_symbol_weights_inside_a_label_must_STILL_total_exactly_one_hundred():
 
 
 def test_an_under_allocated_set_still_reports_its_real_errors():
-    """The advisory must not become an excuse to stop checking: a duplicate label
-    and a non-zero label with no symbols are still blocking underneath it."""
+    """The total rule must not become an excuse to stop checking: a duplicate
+    label and a non-zero label with no symbols are still blocking underneath it."""
     labels = [LabelTarget("A", 30.0, [SymbolTarget("AAA", 100.0)]),
               LabelTarget("A", 20.0, [SymbolTarget("BBB", 100.0)]),
               LabelTarget("B", 10.0)]
     messages = pa.validate_label_targets(labels)
 
-    assert pa.ADVISORY_LABEL_UNDER_FMT.format(unallocated=40.0) in messages
     blocking = pa.blocking_messages(messages)
+    assert pa.ERROR_LABEL_UNDER_FMT.format(total=60.0, under=40.0) in blocking
     assert pa.ERROR_LABEL_DUPLICATE_FMT.format(label="A") in blocking
     assert pa.ERROR_LABEL_NO_SYMBOLS_FMT.format(label="B", pct=10.0) in blocking
 
@@ -2371,41 +2332,6 @@ def test_the_severity_is_a_valid_nicegui_notify_type():
 # W3: the deliberate reserve, recorded separately from the accidental leftover.
 # ---------------------------------------------------------------------------
 
-def test_a_plan_records_the_deliberate_reserve_in_percent_and_money():
-    """70% of a 10,000 base deploys 7,000 and leaves 3,000. The solver already did
-    that; this is the plan learning to SAY it, so a dry run can distinguish "I asked
-    for 30% cash" from "30% of my book had no price"."""
-    current = {"AAA": _pos("AAA", 10.0)}
-    margin = {"AAA": MarginInfo(symbol="AAA", fractionable=False, bp_factor=1.0)}
-    labels = [LabelTarget("A", 70.0, [SymbolTarget("AAA", 100.0)])]
-
-    plan = pa.compute_allocation(10_000.0, 10_000.0, labels, current, margin,
-                                 allow_fractional=False, default_bp_factor=1.0,
-                                 valuation_mode=pa.VALUATION_MODE_MARKET)
-
-    assert plan.reserved_pct == pytest.approx(30.0)
-    assert plan.reserved_notional == pytest.approx(3_000.0)
-    assert plan.total_buy_value == pytest.approx(7_000.0)
-    assert plan.unallocatable_pct == 0.0          # nothing FAILED to absorb
-
-
-def test_the_reserve_is_not_folded_into_unallocatable_pct():
-    """``unallocatable_pct`` means "no label could absorb this" -- an empty label, a
-    no-price symbol. Merging the two makes the dry run unable to tell a deliberate
-    cash target from a pricing failure, which are opposite problems."""
-    current = {"AAA": _pos("AAA", 10.0)}
-    margin = {"AAA": MarginInfo(symbol="AAA", fractionable=False, bp_factor=1.0)}
-    labels = [LabelTarget("A", 50.0, [SymbolTarget("AAA", 100.0)]),
-              LabelTarget("EMPTY", 20.0, [])]
-
-    plan = pa.compute_allocation(10_000.0, 10_000.0, labels, current, margin,
-                                 allow_fractional=False, default_bp_factor=1.0,
-                                 valuation_mode=pa.VALUATION_MODE_MARKET)
-
-    assert plan.reserved_pct == pytest.approx(30.0)     # 100 - (50 + 20)
-    assert plan.unallocatable_pct == pytest.approx(20.0)
-
-
 def test_a_fully_allocated_plan_reserves_nothing():
     current = {"AAA": _pos("AAA", 10.0)}
     margin = {"AAA": MarginInfo(symbol="AAA", fractionable=False, bp_factor=1.0)}
@@ -2414,37 +2340,6 @@ def test_a_fully_allocated_plan_reserves_nothing():
     plan = pa.compute_allocation(10_000.0, 10_000.0, labels, current, margin,
                                  allow_fractional=False, default_bp_factor=1.0,
                                  valuation_mode=pa.VALUATION_MODE_MARKET)
-
-    assert plan.reserved_pct == 0.0
-    assert plan.reserved_notional == 0.0
-
-
-def test_an_over_allocated_plan_reserves_nothing_rather_than_a_negative():
-    """The validator blocks over-100 before a plan is ever solved, but the field is
-    a MONEY figure the footer prints and a negative reserve is not a thing."""
-    current = {"AAA": _pos("AAA", 10.0)}
-    margin = {"AAA": MarginInfo(symbol="AAA", fractionable=False, bp_factor=1.0)}
-    labels = [LabelTarget("A", 130.0, [SymbolTarget("AAA", 100.0)])]
-
-    plan = pa.compute_allocation(10_000.0, 10_000.0, labels, current, margin,
-                                 allow_fractional=False, default_bp_factor=1.0,
-                                 valuation_mode=pa.VALUATION_MODE_MARKET)
-
-    assert plan.reserved_pct == 0.0
-    assert plan.reserved_notional == 0.0
-
-
-def test_an_invest_run_reserves_nothing_because_the_amount_IS_the_budget():
-    """``base_notional`` means THE BUDGET in an INVEST_LABEL plan, so "100 minus the
-    label percentages" is meaningless there."""
-    current = {"AAA": _pos("AAA", 10.0)}
-    margin = {"AAA": MarginInfo(symbol="AAA", fractionable=False, bp_factor=1.0)}
-    label = LabelTarget("A", 40.0, [SymbolTarget("AAA", 100.0)])
-
-    plan = pa.compute_label_investment(label, 1_000.0, current, margin,
-                                       available_buying_power=10_000.0,
-                                       allow_fractional=False, default_bp_factor=1.0,
-                                       valuation_mode=pa.VALUATION_MODE_MARKET)
 
     assert plan.reserved_pct == 0.0
     assert plan.reserved_notional == 0.0
@@ -2504,29 +2399,349 @@ def test_a_plan_records_the_label_targets_it_ran_with():
          "symbols": [{"symbol": "AAA", "weight_pct": 100.0}]}]
 
 
-def test_even_split_can_split_less_than_the_whole_hundred():
-    """"Even split" must not wipe a reserve the user has deliberately set aside."""
-    labels = [LabelTarget(name, 0.0) for name in ("A", "B", "C")]
-
-    out = pa.even_split_targets(labels, total_pct=90.0)
-
-    assert [t.target_pct for t in out] == [30.0, 30.0, 30.0]
-    assert sum(t.target_pct for t in out) == pytest.approx(90.0)
+def test_investable_notional_is_the_base_less_the_reserve():
+    """The ONE place the reserve arithmetic lives. 10% off a 10,000 base leaves
+    9,000 to divide among labels that total 100."""
+    assert pa.investable_notional(10_000.0, 10.0) == pytest.approx(9_000.0)
+    assert pa.investable_notional(10_000.0, 0.0) == pytest.approx(10_000.0)
+    assert pa.investable_notional(10_000.0, 100.0) == pytest.approx(0.0)
 
 
-def test_even_split_of_less_than_a_hundred_lands_the_remainder_on_the_last_slot():
-    out = pa.even_split_targets([LabelTarget(n, 0.0) for n in "ABC"], total_pct=70.0)
-    assert [t.target_pct for t in out] == [23.33, 23.33, 23.34]
-    assert sum(t.target_pct for t in out) == pytest.approx(70.0)
+def test_investable_notional_clamps_a_nonsense_reserve_rather_than_inverting_the_base():
+    """A negative reserve would INFLATE the base into money the account does not
+    have, and a reserve above 100 would make it negative -- which
+    ``compute_allocation`` refuses outright. The validator blocks both before a
+    plan is solved; this is the arithmetic refusing to produce a monster anyway."""
+    assert pa.investable_notional(10_000.0, -25.0) == pytest.approx(10_000.0)
+    assert pa.investable_notional(10_000.0, 175.0) == pytest.approx(0.0)
 
 
-def test_even_split_still_defaults_to_the_whole_hundred():
+def test_reserved_notional_for_is_exactly_what_investable_left_behind():
+    """Defined in terms of ``investable_notional`` so the two cannot drift: what is
+    reserved plus what is investable IS the base, at every reserve."""
+    for pct in (0.0, 10.0, 33.33, 99.9, 100.0):
+        reserved = pa.reserved_notional_for(10_000.0, pct)
+        assert reserved + pa.investable_notional(10_000.0, pct) == pytest.approx(10_000.0)
+    assert pa.reserved_notional_for(10_000.0, 10.0) == pytest.approx(1_000.0)
+
+
+def test_the_reserve_scales_the_base_and_labels_still_total_one_hundred():
+    """THE WORKED EXAMPLE. Base 10,000, reserve 10%, labels 50/30/20 -> 4,500 /
+    2,700 / 1,800 of buys and 1,000 held as cash. Nothing the user typed was
+    rewritten: the percentages are still 50/30/20."""
+    current = {s: _pos(s, 1.0) for s in ("AAA", "BBB", "CCC")}
+    margin = {s: MarginInfo(symbol=s, fractionable=False, bp_factor=1.0)
+              for s in ("AAA", "BBB", "CCC")}
+    labels = [LabelTarget("A", 50.0, [SymbolTarget("AAA", 100.0)]),
+              LabelTarget("B", 30.0, [SymbolTarget("BBB", 100.0)]),
+              LabelTarget("C", 20.0, [SymbolTarget("CCC", 100.0)])]
+
+    plan = pa.compute_allocation(10_000.0, 10_000.0, labels, current, margin,
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET,
+                                 unallocated_pct=10.0)
+
+    by_symbol = {r.symbol: r.target_notional for r in plan.rows}
+    assert by_symbol == {"AAA": pytest.approx(4_500.0),
+                         "BBB": pytest.approx(2_700.0),
+                         "CCC": pytest.approx(1_800.0)}
+    assert plan.total_buy_value == pytest.approx(9_000.0)
+    assert plan.reserved_pct == pytest.approx(10.0)
+    assert plan.reserved_notional == pytest.approx(1_000.0)
+    assert plan.investable_notional == pytest.approx(9_000.0)
+    # The GROSS base is what the plan reports: reserved + investable == base.
+    assert plan.base_notional == pytest.approx(10_000.0)
+
+
+def test_the_plan_reserve_comes_from_the_STORED_reserve_not_from_a_label_shortfall():
+    """The reversal of 6fd532c. Labels that do not total 100 are now an ERROR, so
+    ``100 - sum(target_pct)`` is no longer a reserve -- it is a bug the validator
+    catches. Only ``unallocated_pct`` reserves money."""
+    current = {"AAA": _pos("AAA", 10.0)}
+    margin = {"AAA": MarginInfo(symbol="AAA", fractionable=False, bp_factor=1.0)}
+    labels = [LabelTarget("A", 70.0, [SymbolTarget("AAA", 100.0)])]
+
+    plan = pa.compute_allocation(10_000.0, 10_000.0, labels, current, margin,
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
+
+    assert plan.reserved_pct == 0.0
+    assert plan.reserved_notional == 0.0
+
+
+def test_investable_notional_on_a_plan_is_the_base_minus_what_is_reserved():
+    """A derived PROPERTY, not a stored field: a fourth money number that could
+    disagree with the other three is exactly the drift this model exists to stop."""
+    assert AllocationPlan(base_notional=10_000.0,
+                          reserved_notional=1_000.0).investable_notional == 9_000.0
+
+
+def test_the_reserve_is_still_kept_apart_from_unallocatable_pct():
+    """``unallocatable_pct`` means "no label COULD absorb this" -- an empty label, a
+    no-price symbol. The reserve is deliberate. Opposite problems, opposite fixes."""
+    current = {"AAA": _pos("AAA", 10.0)}
+    margin = {"AAA": MarginInfo(symbol="AAA", fractionable=False, bp_factor=1.0)}
+    labels = [LabelTarget("A", 80.0, [SymbolTarget("AAA", 100.0)]),
+              LabelTarget("EMPTY", 20.0, [])]
+
+    plan = pa.compute_allocation(10_000.0, 10_000.0, labels, current, margin,
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET,
+                                 unallocated_pct=25.0)
+
+    assert plan.reserved_pct == pytest.approx(25.0)
+    assert plan.unallocatable_pct == pytest.approx(20.0)
+    # 80% of the 7,500 investable remainder, NOT of the 10,000 base.
+    assert plan.total_buy_value == pytest.approx(6_000.0)
+
+
+def test_a_hundred_percent_reserve_targets_nothing_and_sells_the_book():
+    """The extreme, and it must be arithmetic rather than a special case: every
+    target is 0, so a held book is closed out."""
+    current = {"AAA": _pos("AAA", 10.0, quantity=100.0, cost_basis=1_000.0)}
+    margin = {"AAA": MarginInfo(symbol="AAA", fractionable=False, bp_factor=1.0)}
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("AAA", 100.0)])]
+
+    plan = pa.compute_allocation(10_000.0, 10_000.0, labels, current, margin,
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET,
+                                 unallocated_pct=100.0)
+
+    assert plan.reserved_notional == pytest.approx(10_000.0)
+    assert [(r.symbol, r.side, r.delta_quantity, r.target_quantity)
+            for r in plan.rows] == [("AAA", OrderDirection.SELL, -100.0, 0.0)]
+
+
+def test_raising_the_reserve_on_a_fully_invested_account_SELLS_to_free_the_cash():
+    """Arithmetically correct and it must be obvious on the dry run rather than a
+    surprise: a book worth its whole base has to shed 10% of itself to fund a 10%
+    reserve."""
+    current = {"AAA": _pos("AAA", 10.0, quantity=1_000.0, cost_basis=10_000.0)}
+    margin = {"AAA": MarginInfo(symbol="AAA", fractionable=False, bp_factor=1.0)}
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("AAA", 100.0)])]
+
+    flat = pa.compute_allocation(10_000.0, 0.0, labels, current, margin,
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET)
+    reserved = pa.compute_allocation(10_000.0, 0.0, labels, current, margin,
+                                     allow_fractional=False, default_bp_factor=1.0,
+                                     valuation_mode=pa.VALUATION_MODE_MARKET,
+                                     unallocated_pct=10.0)
+
+    # Already on target with no reserve: a row, but a ZERO-delta one -- no order.
+    assert [(r.symbol, r.side, r.delta_quantity) for r in flat.rows] == [
+        ("AAA", None, 0.0)]
+    assert flat.total_sell_value == 0.0
+    # With a 10% reserve the target drops to 9,000 and 100 shares have to go.
+    assert [(r.symbol, r.side, r.delta_quantity, r.target_quantity)
+            for r in reserved.rows] == [("AAA", OrderDirection.SELL, -100.0, 900.0)]
+    assert reserved.total_sell_value == pytest.approx(1_000.0)
+    assert reserved.reserved_notional == pytest.approx(1_000.0)
+
+
+def test_the_reserve_is_recorded_in_plan_json_from_the_stored_value():
+    current = {"AAA": _pos("AAA", 10.0)}
+    margin = {"AAA": MarginInfo(symbol="AAA", fractionable=False, bp_factor=1.0)}
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("AAA", 100.0)])]
+
+    plan = pa.compute_allocation(10_000.0, 10_000.0, labels, current, margin,
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET,
+                                 unallocated_pct=30.0)
+    blob = json.loads(json.dumps(plan.to_dict()))
+
+    assert blob["reserved_pct"] == pytest.approx(30.0)
+    assert blob["reserved_notional"] == pytest.approx(3_000.0)
+    assert blob["investable_notional"] == pytest.approx(7_000.0)
+
+
+def test_an_invest_run_takes_no_reserve_because_the_amount_IS_the_budget():
+    """Decided and pinned: an INVEST_LABEL run deploys a specific amount the user
+    named. Skimming a portfolio-level reserve off it would silently spend less than
+    they typed, and ``base_notional`` there is the budget, not the book."""
+    current = {"AAA": _pos("AAA", 10.0)}
+    margin = {"AAA": MarginInfo(symbol="AAA", fractionable=False, bp_factor=1.0)}
+    label = LabelTarget("A", 40.0, [SymbolTarget("AAA", 100.0)])
+
+    plan = pa.compute_label_investment(label, 1_000.0, current, margin,
+                                       available_buying_power=10_000.0,
+                                       allow_fractional=False, default_bp_factor=1.0,
+                                       valuation_mode=pa.VALUATION_MODE_MARKET)
+
+    assert plan.reserved_pct == 0.0
+    assert plan.reserved_notional == 0.0
+    assert plan.investable_notional == pytest.approx(1_000.0)
+    assert plan.total_buy_value == pytest.approx(1_000.0)
+
+
+def test_compute_label_investment_has_no_reserve_knob_at_all():
+    """Not merely defaulted to zero -- absent. A caller cannot pass one by accident
+    and quietly under-spend the amount the user named."""
+    import inspect
+    assert "unallocated_pct" not in inspect.signature(
+        pa.compute_label_investment).parameters
+
+
+# -- the rule: labels total EXACTLY 100 again --------------------------------
+
+def test_a_label_total_below_one_hundred_is_a_hard_ERROR_again():
+    """Reversal of 6fd532c. With a stored reserve, the reserve is the single
+    unambiguous way to hold cash; leaving under-100 legal too would make "labels
+    sum to 90" mean two different things."""
+    labels = [LabelTarget("A", 60.0, [SymbolTarget("AAA", 100.0)])]
+    messages = pa.validate_label_targets(labels)
+
+    assert messages == [pa.ERROR_LABEL_UNDER_FMT.format(total=60.0, under=40.0)]
+    assert messages == ["label targets total 60.00% - under 100% by 40.00%. "
+                        "Use the Unallocated box to hold cash."]
+    assert pa.blocking_messages(messages) == messages
+
+
+def test_nothing_in_the_advisory_fragments_lets_a_label_total_through_any_more():
+    """The advisory fragment 6fd532c added is GONE, so both halves of the rule
+    block by default -- the safe direction to be wrong in."""
+    assert pa.ADVISORY_MESSAGE_FRAGMENTS == (pa._INVEST_EXCEEDS_BP_FRAGMENT,)
+    assert not hasattr(pa, "ADVISORY_LABEL_UNDER_FMT")
+
+
+def test_an_empty_label_set_is_an_error_not_an_advisory():
+    messages = pa.validate_label_targets([])
+    assert messages == [pa.ERROR_LABEL_UNDER_FMT.format(total=0.0, under=100.0)]
+    assert pa.blocking_messages(messages) == messages
+
+
+def test_the_label_total_rule_still_respects_the_tolerance_on_both_sides():
+    assert pa.validate_label_targets(
+        [LabelTarget("A", 99.995, [SymbolTarget("AAA", 100.0)])]) == []
+    assert pa.validate_label_targets(
+        [LabelTarget("A", 100.005, [SymbolTarget("AAA", 100.0)])]) == []
+
+
+# -- the reserve's own validation --------------------------------------------
+
+def test_a_reserve_between_zero_and_one_hundred_is_accepted():
+    for pct in (0.0, 0.01, 10.0, 99.99, 100.0):
+        assert pa.validate_unallocated_pct(pct) == []
+
+
+def test_a_negative_reserve_is_refused():
+    messages = pa.validate_unallocated_pct(-5.0)
+    assert messages == [pa.ERROR_UNALLOCATED_RANGE_FMT.format(pct=-5.0)]
+    assert pa.blocking_messages(messages) == messages
+
+
+def test_a_reserve_above_one_hundred_is_refused():
+    """Above 100 the investable base goes NEGATIVE, which ``compute_allocation``
+    refuses outright -- so it is caught here, where the user can see which box."""
+    messages = pa.validate_unallocated_pct(120.0)
+    assert messages == [pa.ERROR_UNALLOCATED_RANGE_FMT.format(pct=120.0)]
+    assert pa.blocking_messages(messages) == messages
+
+
+def test_the_wizard_gate_checks_the_reserve_alongside_the_labels():
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("AAA", 100.0)])]
+
+    assert pa.steps_validation_messages(labels, unallocated_pct=10.0) == []
+    assert pa.steps_validation_messages(labels, unallocated_pct=140.0) == [
+        pa.ERROR_UNALLOCATED_RANGE_FMT.format(pct=140.0)]
+
+
+def test_the_wizard_gate_defaults_to_no_reserve():
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("AAA", 100.0)])]
+    assert pa.steps_validation_messages(labels) == []
+
+
+# -- even split is about the LABELS, and always totals 100 --------------------
+
+def test_even_split_always_totals_exactly_one_hundred():
+    """The reserve is stored separately now, so there is nothing for Even split to
+    preserve -- and a partial split would produce a label set the validator
+    refuses."""
     out = pa.even_split_targets([LabelTarget(n, 0.0) for n in "ABC"])
     assert [t.target_pct for t in out] == [33.33, 33.33, 33.34]
+    assert sum(t.target_pct for t in out) == pytest.approx(100.0)
 
 
-def test_an_even_split_of_a_reserved_total_passes_the_validator():
+def test_even_split_has_no_total_pct_knob_any_more():
+    """Removed rather than left defaulted: 100 is the only value the validator
+    accepts, so a knob here is a trap that produces an unsubmittable set."""
+    import inspect
+    assert "total_pct" not in inspect.signature(pa.even_split_targets).parameters
+
+
+def test_an_even_split_passes_the_validator_whatever_the_reserve_is():
     labels = [LabelTarget(n, 0.0, [SymbolTarget(n * 3, 100.0)]) for n in "ABC"]
-    messages = pa.validate_label_targets(pa.even_split_targets(labels, total_pct=90.0))
-    assert pa.blocking_messages(messages) == []
-    assert messages == [pa.ADVISORY_LABEL_UNDER_FMT.format(unallocated=10.0)]
+    for reserve in (0.0, 10.0, 90.0):
+        assert pa.steps_validation_messages(pa.even_split_targets(labels),
+                                            unallocated_pct=reserve) == []
+
+
+# -- the reserve is not a buying-power shortfall ------------------------------
+
+def test_the_reserve_and_the_buying_power_scaler_stay_separate_facts():
+    """A reserve is a TARGET; a bp shortfall is a CONSTRAINT the plan hit. Reporting
+    them as one number would tell a user to lower a reserve they never set."""
+    current = {"AAA": _pos("AAA", 10.0)}
+    margin = {"AAA": MarginInfo(symbol="AAA", fractionable=False, bp_factor=1.0)}
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("AAA", 100.0)])]
+
+    # Base 10,000 with a 10% reserve wants 9,000 of buys, but only 4,500 of buying
+    # power exists: the scaler halves the buys and the reserve does not move.
+    plan = pa.compute_allocation(10_000.0, 4_500.0, labels, current, margin,
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET,
+                                 unallocated_pct=10.0)
+
+    assert plan.scale_factor == pytest.approx(0.5)
+    assert plan.reserved_pct == pytest.approx(10.0)
+    assert plan.reserved_notional == pytest.approx(1_000.0)
+    assert plan.total_buy_value == pytest.approx(4_500.0)
+    assert any(any(pa.REASON_SCALED_PREFIX in reason for reason in r.reasons)
+               for r in plan.rows)
+
+
+def test_a_plan_that_fits_its_buying_power_never_scales_however_big_the_reserve():
+    """The mirror: the reserve SHRINKS the requirement, so it can only ever move the
+    scaler away from firing."""
+    current = {"AAA": _pos("AAA", 10.0)}
+    margin = {"AAA": MarginInfo(symbol="AAA", fractionable=False, bp_factor=1.0)}
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("AAA", 100.0)])]
+
+    plan = pa.compute_allocation(10_000.0, 9_000.0, labels, current, margin,
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET,
+                                 unallocated_pct=10.0)
+
+    assert plan.scale_factor == 1.0
+    assert plan.required_buying_power == pytest.approx(9_000.0)
+
+
+# -- redistribution against a scaled base -------------------------------------
+
+def test_redistribution_still_converges_against_a_reserved_base():
+    """``redistribute_label_residuals`` works on LABEL TOTALS, which are now shares
+    of the investable remainder. Its termination argument -- a bounded pass count
+    and a residual that only ever shrinks -- is untouched by which number the totals
+    were derived from."""
+    current = {"AAA": _pos("AAA", 300.0), "BBB": _pos("BBB", 100.0)}
+    margin = {s: MarginInfo(symbol=s, fractionable=False, bp_factor=1.0)
+              for s in ("AAA", "BBB")}
+    labels = [LabelTarget("A", 100.0, [SymbolTarget("AAA", 50.0),
+                                       SymbolTarget("BBB", 50.0)])]
+
+    # ``compute_allocation`` runs redistribution itself, against the label totals
+    # it just derived from the SCALED base -- which is the only thing the reserve
+    # changed.
+    plan = pa.compute_allocation(10_000.0, 10_000.0, labels, current, margin,
+                                 allow_fractional=False, default_bp_factor=1.0,
+                                 valuation_mode=pa.VALUATION_MODE_MARKET,
+                                 unallocated_pct=10.0)
+
+    # Whole shares of a 300 and a 100 name cannot land exactly on 4,500 each, so
+    # the residual is real. It CONVERGED: no unconverged warning, and the label
+    # ends up within one unit of the cheapest absorber of its 9,000 total.
+    assert not any(pa.WARNING_RESIDUAL_UNCONVERGED_FMT.split("{", 1)[0] in w
+                   for w in plan.warnings)
+    assert plan.total_buy_value <= 9_000.0 + pa.MONEY_EPSILON
+    assert plan.total_buy_value > 9_000.0 - 100.0     # inside one BBB share
+    assert plan.reserved_notional == pytest.approx(1_000.0)

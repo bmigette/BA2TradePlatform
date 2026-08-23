@@ -44,6 +44,7 @@ from ba2_common.core.portfolio_allocation import (
     VALUATION_MODE_MARKET,
     consume_income_events,
     even_split_pct,
+    validate_unallocated_pct,
 )
 from ba2_common.logger import logger
 
@@ -499,20 +500,36 @@ def get_allocation_config(account_id: int) -> PortfolioAllocationConfig:
 
 def set_allocation_config(account_id: int, *,
                           valuation_mode: Optional[str] = None,
-                          allow_fractional: Optional[bool] = None) -> PortfolioAllocationConfig:
+                          allow_fractional: Optional[bool] = None,
+                          unallocated_pct: Optional[float] = None
+                          ) -> PortfolioAllocationConfig:
     """Update the account's allocation config; ``None`` leaves a field unchanged.
+
+    ``None`` and not falsiness, for all three: ``allow_fractional=False`` and
+    ``unallocated_pct=0.0`` are both real choices, and a truthiness guard would
+    make "take the reserve back to zero" a silent no-op.
 
     Raises:
         ValueError: when ``valuation_mode`` is neither ``VALUATION_MODE_COST`` nor
         ``VALUATION_MODE_MARKET``. A typo'd mode would silently reinterpret every
         percentage on the page -- and the engine only rejects it later, at plan
         time -- so it is refused here rather than stored.
+        ValueError: when ``unallocated_pct`` is outside 0-100. Refused where it is
+        WRITTEN and not only where it is typed: the wizard is one caller, and a
+        stored -20 would inflate the investable base of every future plan into
+        money the account does not have.
     """
     if valuation_mode is not None and valuation_mode not in (
             VALUATION_MODE_COST, VALUATION_MODE_MARKET):
         raise ValueError(
             f"Unknown valuation_mode {valuation_mode!r}; expected "
             f"{VALUATION_MODE_COST!r} or {VALUATION_MODE_MARKET!r}")
+    if unallocated_pct is not None:
+        # The SAME rule the wizard shows, from the same function, so the box and
+        # the column can never disagree about what is storable.
+        problems = validate_unallocated_pct(unallocated_pct)
+        if problems:
+            raise ValueError("; ".join(problems))
 
     get_allocation_config(account_id)   # ensure the row exists
     with get_db() as session:
@@ -524,13 +541,17 @@ def set_allocation_config(account_id: int, *,
             row.valuation_mode = valuation_mode
         if allow_fractional is not None:
             row.allow_fractional = bool(allow_fractional)
+        if unallocated_pct is not None:
+            row.unallocated_pct = float(unallocated_pct)
         row.updated_at = DateTime.now(timezone.utc)
         session.add(row)
         session.commit()
         session.refresh(row)
         session.expunge(row)
         logger.info(f"Allocation config for account {account_id}: "
-                    f"valuation_mode={row.valuation_mode}, allow_fractional={row.allow_fractional}")
+                    f"valuation_mode={row.valuation_mode}, "
+                    f"allow_fractional={row.allow_fractional}, "
+                    f"unallocated_pct={row.unallocated_pct}")
         return row
 
 
