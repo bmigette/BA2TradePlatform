@@ -52,7 +52,11 @@ class OptionLiquidityDataUnavailable(OptionSelectionConfigError):
     all 14 live option entry actions) rejected 16/16 structures on 16/16 symbol-date-capital
     combinations. So the three states are: published-and-good (pass), published-and-thin
     (reject), and not-published-by-anyone (THIS — a configuration error, not a verdict on
-    any contract)."""
+    any contract).
+
+    "Not published" includes PRESENT-BUT-DEGENERATE, not just absent: the same cache has
+    ``bid == ask`` on all 6,757,055 rows, so ``spread_pct`` is a non-None constant 0.0 that
+    grades nothing. See ``_publishes_spread``."""
 
     def __init__(self, field: str, gate_value, underlying: Optional[str] = None):
         self.field = field
@@ -66,8 +70,75 @@ class OptionLiquidityDataUnavailable(OptionSelectionConfigError):
             f"publishes '{field}'.")
 
 
+class OptionLiquidityDataMissingToday(OptionLiquidityDataUnavailable):
+    """The gate's field is absent from THIS fetch, but the source has published it before.
+
+    NOT THE SAME BUG, AND NOT THE SAME ADVICE (2026-08-23). ``OptionLiquidityDataUnavailable``
+    tells the user to change their configuration, which is right when the source structurally
+    lacks the field (the historical cache's all-NULL ``open_interest``) and wrong when it is a
+    hole in one fetch. Live, Alpaca types ``open_interest`` as ``Optional`` and a snapshot page
+    can legitimately come back without it; telling someone to clear a gate they will want back
+    tomorrow — and shouting ERROR about it once per symbol per day — is worse than useless.
+
+    The two are distinguished by evidence, not by guessing: ``_FIELDS_SEEN_PUBLISHED`` records
+    every (source, field) this process has actually seen a value for. Having seen one proves
+    the source CAN publish it, so a later empty fetch is a gap. Never having seen one leaves
+    the structural reading, which is the loud one — the conservative direction, since the
+    first fetch of a fresh process is judged by the stricter rule.
+
+    Either way the action still FAILS: a gate nobody can answer is never applied to a chain it
+    cannot measure, so nothing illiquid slips through. Only the severity and the advice differ
+    (``_OptionEntryAction.execute`` logs this one at WARNING, not ERROR)."""
+
+    def __init__(self, field: str, gate_value, underlying: Optional[str] = None,
+                 source: Optional[str] = None):
+        self.field = field
+        self.gate_value = gate_value
+        self.underlying = underlying
+        self.source = source
+        where = f" for {underlying}" if underlying else ""
+        who = source or "this data source"
+        # NB: skips OptionLiquidityDataUnavailable.__init__ on purpose — same attributes,
+        # different message, and inheriting the "clear this gate" advice is the whole bug.
+        OptionSelectionConfigError.__init__(
+            self, f"Liquidity gate '{field}' is set to {gate_value} but no contract in "
+                  f"today's option chain{where} carries '{field}', although {who} has "
+                  f"published it before — treating this as a transient data gap, not a "
+                  f"misconfiguration. No order is placed for this cycle; nothing to change.")
+
+
 class OptionDteWindowError(OptionSelectionConfigError):
     """The configured DTE window cannot contain any expiry."""
+
+
+def _publishes_spread(c: OptionContract) -> bool:
+    """Does this contract carry a spread the ``max_spread_pct`` gate can actually measure?
+
+    A PRESENT-BUT-CONSTANT-ZERO FIELD IS A PLACEHOLDER, NOT DATA (2026-08-23). ``spread_pct``
+    is DERIVED — ``(ask - bid) / mid`` — so it is non-None whenever both columns are non-None,
+    even when the source wrote the same number into both. Measured read-only against the real
+    10 GB cache: ``SELECT sum(bid <> ask) FROM option_chain`` returns 0 over all 6,757,055
+    rows, so ``spread_pct`` is exactly 0.0 for every quoted contract there. An ``is not None``
+    probe therefore green-lit the gate, after which ``max_spread_pct`` measured nothing (0 is
+    under every ceiling) while STILL fail-closing the 2,428,468 rows that carry no quote at
+    all — a knob that silently drops a chunk of the chain and grades none of it.
+
+    So "published" means a spread that is present AND non-degenerate: strictly positive. Zero
+    means bid == ask (no market was quoted, only a close was copied into both sides), and
+    negative means a crossed book, which ``passes_liquidity`` refuses outright — a wholly
+    crossed chain would be another silent 100% rejection. Neither can grade liquidity.
+
+    This is deliberately NOT generalised to ``open_interest``/``volume``: those are OBSERVED
+    counts where 0 is a true, discriminating fact ("nobody traded it") and exactly what the
+    gate should reject. ``HistoricalOptionsProvider`` even coerces a bar-less row's volume to
+    a known 0 on purpose. Only the derived, two-column spread has a degenerate value that
+    means "not published".
+
+    COST: none beyond what the probe already paid. Detecting this needs no scan of the source
+    — the in-memory chain being filtered is the sample — and ``any()`` short-circuits on the
+    first contract with a real spread, so a healthy source stops at element 0."""
+    sp = c.spread_pct
+    return sp is not None and sp > 0
 
 
 # field name -> "does this contract publish it?". `spread` is derived (needs BOTH sides of
@@ -75,21 +146,34 @@ class OptionDteWindowError(OptionSelectionConfigError):
 _LIQUIDITY_PROBES = {
     "open_interest": lambda c: c.open_interest is not None,
     "volume": lambda c: c.volume is not None,
-    "spread": lambda c: c.spread_pct is not None,
+    "spread": _publishes_spread,
 }
+
+
+# (source, field) pairs this process has seen a real value for at least once. See
+# OptionLiquidityDataMissingToday for what it buys: it is the ONLY thing that can tell a
+# source which never publishes a field from a source whose fetch happened to come back
+# without one. Bounded by len(sources) * 3, so it never grows.
+_FIELDS_SEEN_PUBLISHED = set()
 
 
 def check_liquidity_data_available(chain: List[OptionContract], *,
                                    min_open_interest: Optional[int] = None,
                                    max_spread_pct: Optional[float] = None,
                                    min_volume: Optional[int] = None,
-                                   underlying: Optional[str] = None) -> None:
-    """Raise ``OptionLiquidityDataUnavailable`` for the first ENABLED gate whose field no
-    contract in ``chain`` publishes. See that exception for the reasoning.
+                                   underlying: Optional[str] = None,
+                                   source: Optional[str] = None) -> None:
+    """Raise for the first ENABLED gate whose field no contract in ``chain`` publishes:
+    ``OptionLiquidityDataMissingToday`` when ``source`` has published that field before in
+    this process, ``OptionLiquidityDataUnavailable`` when it never has. See those exceptions.
 
-    Call this ONCE per action on the FULL fetched chain — never on a pre-filtered sublist
+    Call this ONCE PER FETCHED CHAIN — on the full chain, never on a pre-filtered sublist
     (e.g. the straddle's same-strike put candidates), where a single unpublished value is a
-    property of that one contract, not of the data source.
+    property of that one contract rather than of the data source. Equally, never on several
+    chains POOLED together: calls and puts are separate fetches and a source can answer one
+    and not the other, so a flattened call+put universe lets one publishing call vouch for a
+    put chain that publishes nothing — re-arming the exact silent 100% rejection this guard
+    exists to abolish. ``TradeActions._liq`` therefore loops and checks each side on its own.
 
     An EMPTY chain is a no-op: "no contracts at all" is its own condition and every caller
     already reports it ("Empty option chain"); mislabelling it as a gate problem would send
@@ -102,8 +186,13 @@ def check_liquidity_data_available(chain: List[OptionContract], *,
         if gate is None:
             continue
         probe = _LIQUIDITY_PROBES[field]
-        if not any(probe(c) for c in chain):
-            raise OptionLiquidityDataUnavailable(field, gate, underlying)
+        key = (source or "", field)
+        if any(probe(c) for c in chain):
+            _FIELDS_SEEN_PUBLISHED.add(key)
+            continue
+        if key in _FIELDS_SEEN_PUBLISHED:
+            raise OptionLiquidityDataMissingToday(field, gate, underlying, source=source)
+        raise OptionLiquidityDataUnavailable(field, gate, underlying)
 
 
 def passes_liquidity(c: OptionContract, min_open_interest: Optional[int],

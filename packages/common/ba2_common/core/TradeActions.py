@@ -21,7 +21,8 @@ from ba2_common.core.db import get_db, add_instance, update_instance, get_instan
 from ba2_common.core.option_types import OptionContract, OptionLeg, OptionPosition
 from ba2_common.core.option_selector import (
     select_single, select_vertical_spread, select_wing, passes_liquidity,
-    check_liquidity_data_available, OptionDteWindowError, OptionSelectionConfigError)
+    check_liquidity_data_available, OptionDteWindowError, OptionSelectionConfigError,
+    OptionLiquidityDataMissingToday)
 from ba2_common.logger import logger
 from ba2_common.core.failure_modes import absorb_if_benign
 from ba2_common.core.db import InstanceNotFound
@@ -1984,12 +1985,26 @@ class _OptionEntryAction(TradeAction):
         values are spelled out, so a leg physically cannot be selected under different gates
         than its siblings — which is how ``min_volume`` came to be applied to the protective
         wings of the iron condor / jade lizard / butterfly / ratio spread but NOT to their
-        risk-bearing short legs."""
+        risk-bearing short legs.
+
+        EACH CHAIN IS CHECKED ON ITS OWN (2026-08-23). This used to flatten every argument
+        into one ``universe`` list, which quietly undid job (1) for two-sided structures: the
+        call chain and the put chain are separate fetches, so a source that answers one and
+        not the other left a single publishing call vouching for a put chain that published
+        nothing — the availability probe passed, every put was then fail-closed out, and the
+        result read "No liquid ATM put", i.e. a thin market. Which is precisely the silent
+        100% rejection the probe was added to abolish. The check has to be meaningful for the
+        chain each leg is actually selected from, so it runs once per chain."""
         gates = {"min_open_interest": self.min_open_interest,
                  "max_spread_pct": self.max_spread_pct,
                  "min_volume": self.min_volume}
-        universe = [c for ch in chains if ch for c in ch]
-        check_liquidity_data_available(universe, underlying=self.instrument_name, **gates)
+        # Which source is being asked, so a field it has never published (a structural gap,
+        # worth an ERROR and a config change) is not confused with one missing from today's
+        # fetch (transient, WARNING, nothing to change). See OptionLiquidityDataMissingToday.
+        source = type(self.account).__name__
+        for chain in chains:
+            check_liquidity_data_available(chain, underlying=self.instrument_name,
+                                           source=source, **gates)
         return gates
 
     def _virtual_equity(self) -> Optional[float]:
@@ -2185,6 +2200,14 @@ class _OptionEntryAction(TradeAction):
             if not self._supports_options():
                 return self._result(False, f"Account does not support options for {self.instrument_name}")
             return self._build_and_submit()
+        except OptionLiquidityDataMissingToday as e:
+            # NOT a misconfiguration: this source HAS published the field before, so today's
+            # chain simply came back without it (Alpaca types open_interest Optional). The
+            # entry is still refused — a gate is never applied to a chain that cannot answer
+            # it — but a transient broker gap must not shout ERROR once per symbol per day,
+            # nor tell the user to clear a gate they will want back tomorrow.
+            logger.warning(f"{self._action_type_value()} for {self.instrument_name}: {e}")
+            return self._result(False, str(e))
         except OptionSelectionConfigError as e:
             # A parameter that can never select anything (a liquidity gate the data source
             # cannot answer, an inverted DTE window). NOT a runtime failure and not a
@@ -3043,8 +3066,12 @@ class OpenCallButterflyAction(_OptionEntryAction):
                        if c.expiry == body.expiry and c.strike < body.strike
                        and passes_liquidity(c, liq["min_open_interest"],
                                             liq["max_spread_pct"], liq["min_volume"])]
-        # Same (distance, strike, expiry) key the selectors use — see option_selector._tie.
-        lower = (min(lower_cands, key=lambda c: (abs(c.strike - lower_target), c.strike, c.expiry))
+        # option_selector._tie's key, MINUS its expiry term: the candidates above are already
+        # pinned to body.expiry (a butterfly with legs in two expiries is a calendar), so an
+        # expiry component could never order anything. It was there anyway, reading like a
+        # rule that was being enforced — reversing it changed no test in the package suite.
+        # Nearest strike wins, then the lower strike, which is all that is left to decide.
+        lower = (min(lower_cands, key=lambda c: (abs(c.strike - lower_target), c.strike))
                  if lower_cands else None)
         if upper is None or lower is None or upper.strike <= body.strike or lower.strike >= body.strike:
             return self._result(False, f"No valid wings for butterfly on {self.instrument_name}")
