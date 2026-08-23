@@ -2101,6 +2101,154 @@ def test_pressing_a_labels_load_last_restores_only_that_labels_weights(nicegui_c
     assert steps.labels[0].target_pct == 70.0
 
 
+# ---------------------------------------------------------------------------
+# Step 2's per-label "Even split" -- the symbol-level pair to step 1's button.
+# ---------------------------------------------------------------------------
+
+
+def _six_symbol_labels():
+    """One label of SIX symbols, one of two.
+
+    Six is not arbitrary: it is the smallest count at which ``even_split_pct`` and
+    a hand-rolled ``round(100 / n, 2)`` disagree (16.66 with 16.70 on the last slot
+    against 16.67 with 16.65), so a button that re-implemented the split instead of
+    calling the engine fails here and passes at two, three or five.
+    """
+    return [
+        LabelTarget("Growth", 60.0,
+                    [SymbolTarget(f"S{i}", 100.0 / 6.0) for i in range(6)]),
+        LabelTarget("Income", 40.0,
+                    [SymbolTarget("KO", 70.0), SymbolTarget("PEP", 30.0)]),
+    ]
+
+
+def test_step_two_offers_an_even_split_per_label(nicegui_client):
+    """One per label, and DISABLED where it would be meaningless -- Income holds a
+    single symbol, which already owns the whole 100. Disabled, never hidden, on the
+    same terms as the Load-last buttons beside it."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    _open_steps(nicegui_client, wiz, labels=_labels_with_history())
+
+    found = _buttons(nicegui_client, wiz.MARKER_EVEN_SPLIT_SYMBOLS)
+    assert len(found) == 2
+    assert [b.enabled for b in found] == [True, False]
+
+
+def test_step_two_still_draws_a_disabled_even_split_for_a_label_with_no_symbols(nicegui_client):
+    """A label nothing carries draws the button too. Hiding it would make the
+    feature look absent rather than inapplicable."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    labels = [LabelTarget("Growth", 100.0, [SymbolTarget("AAPL", 50.0),
+                                            SymbolTarget("MSFT", 50.0)]),
+              LabelTarget("Empty", 0.0, [])]
+    _open_steps(nicegui_client, wiz, labels=labels)
+
+    found = _buttons(nicegui_client, wiz.MARKER_EVEN_SPLIT_SYMBOLS)
+    assert len(found) == 2
+    assert [b.enabled for b in found] == [True, False]
+
+
+def test_pressing_a_labels_even_split_touches_only_that_label(nicegui_client):
+    """The scoping proof, and it goes through the BUTTON rather than the method so
+    the ``t=lt`` default-argument capture is under test too: without it every one of
+    these buttons would re-split the LAST label. Growth's six symbols are re-split;
+    Income's two keep the 70/30 the user typed, and Growth's own target stays
+    step 1's business."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    steps, _calls = _open_steps(nicegui_client, wiz, labels=_six_symbol_labels())
+    with nicegui_client:
+        _click(_buttons(nicegui_client, wiz.MARKER_EVEN_SPLIT_SYMBOLS)[0])
+
+    assert [st.weight_pct for st in steps.labels[0].symbols] == [16.66, 16.66, 16.66,
+                                                                 16.66, 16.66, 16.7]
+    assert [st.weight_pct for st in steps.labels[1].symbols] == [70.0, 30.0]
+    assert steps.labels[0].target_pct == 60.0
+    assert steps.labels[1].target_pct == 40.0
+
+
+def test_an_even_split_of_six_symbols_uses_the_engines_own_splitter(nicegui_client):
+    """Byte-identical to ``even_split_pct(6)``, totalling exactly 100. A hand-rolled
+    two-decimal split lands on 16.67 x 5 + 16.65 here and the wizard would then
+    disagree with the stored default for the very same six symbols."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+    from ba2_trade_platform.core.portfolio_allocation import even_split_pct
+
+    steps, _calls = _open_steps(nicegui_client, wiz, labels=_six_symbol_labels())
+    with nicegui_client:
+        steps._even_split_symbols(steps.labels[0])
+
+    weights = [st.weight_pct for st in steps.labels[0].symbols]
+    assert weights == even_split_pct(6)
+    assert sum(weights) == 100.0
+
+
+def test_even_split_symbols_redraws_the_boxes_rather_than_leaving_them_stale(nicegui_client):
+    """A ``ui.number`` does not follow the object it was built from -- the reason
+    ``_even_split`` and ``_load_last_symbols`` both redraw. Without it the user
+    types over numbers that are no longer what Continue will submit."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    steps, _calls = _open_steps(nicegui_client, wiz, labels=_six_symbol_labels())
+    with nicegui_client:
+        steps._even_split_symbols(steps.labels[1])
+        drawn = [n.value for n in _numbers(nicegui_client, wiz, wiz.MARKER_SYMBOL_PCT)]
+
+    # Growth's six are untouched; Income's two are the new 50/50.
+    assert drawn[6:] == [50.0, 50.0]
+    assert drawn[:6] == [st.weight_pct for st in steps.labels[0].symbols]
+
+
+def test_even_split_symbols_revalidates_so_continue_follows(nicegui_client):
+    """The live total chip and Continue are driven by ``_revalidate``. Repairing a
+    broken label without it leaves Submit barred on a set that is now legal."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    labels = [LabelTarget("Growth", 100.0,
+                          [SymbolTarget("AAPL", 90.0), SymbolTarget("MSFT", 90.0)])]
+    steps, _calls = _open_steps(nicegui_client, wiz, labels=labels)
+    assert steps._continue_button.enabled is False       # 180%, blocked
+
+    with nicegui_client:
+        steps._even_split_symbols(steps.labels[0])
+
+    assert [st.weight_pct for st in steps.labels[0].symbols] == [50.0, 50.0]
+    assert steps._continue_button.enabled is True
+
+
+def test_the_symbol_even_split_leaves_the_reserve_and_the_label_total_alone(nicegui_client):
+    """Symbol weights have always been relative to their OWN label. The reserve and
+    the label percentages divide the base above this level, so a split down here
+    must not reach either."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    steps, _calls = _open_steps(nicegui_client, wiz, labels=_six_symbol_labels(),
+                                unallocated_pct=25.0)
+    with nicegui_client:
+        steps._even_split_symbols(steps.labels[0])
+
+    assert steps.unallocated_pct == 25.0
+    assert [lt.target_pct for lt in steps.labels] == [60.0, 40.0]
+    assert steps._continue_button.enabled is True
+
+
+def test_step_one_still_has_exactly_one_label_level_even_split(nicegui_client):
+    """Two labels now draw an "Even split" each in step 2. The step 1 button that
+    splits the LABELS must stay singular, and must stay the one that moves them."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    steps, _calls = _open_steps(nicegui_client, wiz, labels=_six_symbol_labels())
+
+    found = _buttons(nicegui_client, wiz.MARKER_EVEN_SPLIT)
+    assert len(found) == 1
+    with nicegui_client:
+        _click(found[0])
+
+    assert [lt.target_pct for lt in steps.labels] == [50.0, 50.0]
+
+
 def test_step_two_shows_the_last_weight_beside_each_symbol(nicegui_client):
     from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
 

@@ -45,8 +45,10 @@ from ...core.portfolio_allocation import (
     SymbolTarget,
     blocking_messages,
     bump_notice,
+    can_even_split_symbols,
     dry_run_rows,
     effective_target_pct,
+    even_split_symbol_weights,
     even_split_targets,
     filter_plan_rows,
     fractional_summary,
@@ -253,6 +255,13 @@ RESERVED_FMT = 'Reserved (not allocated): {amount:,.2f} ({pct:.2f}% of base)'
 #: with free text, and the per-label copies are indistinguishable by caption.
 MARKER_LOAD_LAST = 'steps-load-last'
 MARKER_LOAD_LAST_SYMBOLS = 'steps-load-last-symbols'
+
+#: Markers on the step 1 / step 2 "Even split" buttons, for exactly the reason the
+#: pair above carries them: step 2 draws one per label, so 'Even split' is no longer
+#: unique in the dialog and a caption match would find whichever came first. The
+#: step 1 marker earns its keep as the guard that the LABEL splitter stays singular.
+MARKER_EVEN_SPLIT = 'steps-even-split'
+MARKER_EVEN_SPLIT_SYMBOLS = 'steps-even-split-symbols'
 
 #: Markers on the read-only "now / last" captions beside each percentage box.
 #: ``ui.label``, deliberately NOT a second marked ``ui.number``: the landed suite
@@ -1090,7 +1099,8 @@ class AllocationSteps:
             .classes('text-xs text-secondary-custom')
         with ui.row().classes('items-center gap-2'):
             ui.button('Even split', icon='balance',
-                      on_click=self._even_split).props('outline dense')
+                      on_click=self._even_split).props('outline dense') \
+                .mark(MARKER_EVEN_SPLIT)
             # DISABLED, not hidden, when there is no last: the user has to be able
             # to see the feature exists and learn that this account has never run.
             last = ui.button('Load last', icon='history',
@@ -1184,10 +1194,23 @@ class AllocationSteps:
         self._symbol_containers = {}
         for lt in self.labels:
             with ui.expansion(f'{lt.label} - {len(lt.symbols)} symbol(s)').classes('w-full'):
-                last = ui.button('Load last', icon='history',
-                                 on_click=lambda _e=None, t=lt: self._load_last_symbols(t)
-                                 ).props('outline dense').mark(MARKER_LOAD_LAST_SYMBOLS)
-                last.set_enabled(has_previous_symbol_weights(lt))
+                # Same row, same order, same icons and same wording as step 1's
+                # pair, so the label-level and symbol-level controls read as one
+                # feature at two scopes. ``t=lt`` is load-bearing in BOTH lambdas:
+                # without the default-argument capture every button in step 2 would
+                # rewrite the LAST label's weights.
+                with ui.row().classes('items-center gap-2'):
+                    split = ui.button('Even split', icon='balance',
+                                      on_click=lambda _e=None, t=lt: self._even_split_symbols(t)
+                                      ).props('outline dense').mark(MARKER_EVEN_SPLIT_SYMBOLS)
+                    # DISABLED, not hidden, on the Load-last button's terms: below
+                    # two symbols there is nothing to spread, and a control that
+                    # vanishes is one the user cannot learn exists.
+                    split.set_enabled(can_even_split_symbols(lt))
+                    last = ui.button('Load last', icon='history',
+                                     on_click=lambda _e=None, t=lt: self._load_last_symbols(t)
+                                     ).props('outline dense').mark(MARKER_LOAD_LAST_SYMBOLS)
+                    last.set_enabled(has_previous_symbol_weights(lt))
                 if not lt.symbols:
                     ui.label('No symbols carry this label - it can absorb no allocation.') \
                         .classes('text-xs text-orange-400')
@@ -1268,6 +1291,31 @@ class AllocationSteps:
         for edited, fresh in zip(self.labels, load_previous_targets(self.labels)):
             edited.target_pct = fresh.target_pct
         self._draw_label_targets()
+        self._revalidate()
+
+    def _even_split_symbols(self, lt: LabelTarget):
+        """Give every symbol in ONE label an equal share of that label's 100.
+
+        The symbol-level pair to ``_even_split``, and it scopes to ``lt`` on exactly
+        the terms ``_load_last_symbols`` does: no other label's weights move, and
+        the label's own ``target_pct`` does not either -- step 2 is about shares
+        WITHIN a label. The reserve is further up still and is not reachable from
+        here at all.
+
+        The arithmetic is ``even_split_symbol_weights``, which is
+        ``even_split_pct``, which is what ``build_symbol_targets`` fills an
+        untouched label in with. One splitter, so the button and the stored default
+        cannot disagree about the same symbols.
+
+        REDRAWS, then re-validates, for the reason spelled out on ``_load_last``: a
+        ``ui.number`` does not follow the object it was built from, so without the
+        redraw the user would be typing over numbers that are no longer what
+        Continue will submit -- and without the re-validate the live total and the
+        Continue button would still be reporting the set the split just replaced.
+        """
+        for edited, fresh in zip(lt.symbols, even_split_symbol_weights(lt).symbols):
+            edited.weight_pct = fresh.weight_pct
+        self._draw_symbol_weights(lt)
         self._revalidate()
 
     def _load_last_symbols(self, lt: LabelTarget):

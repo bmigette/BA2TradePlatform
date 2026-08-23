@@ -652,6 +652,120 @@ def test_has_previous_symbol_weights_is_the_per_label_buttons_enabled_state():
         LabelTarget("A", 100.0, [SymbolTarget("AAA", 80.0, previous_weight_pct=0.0)])) is True
 
 
+# ---------------------------------------------------------------------------
+# The per-label "Even split" for SYMBOLS -- step 2's pair to ``even_split_targets``.
+# ---------------------------------------------------------------------------
+
+
+def test_even_split_symbol_weights_gives_every_symbol_an_equal_share():
+    label = LabelTarget("A", 100.0, [SymbolTarget("AAA", 80.0), SymbolTarget("BBB", 20.0)])
+
+    out = pa.even_split_symbol_weights(label)
+
+    assert [(st.symbol, st.weight_pct) for st in out.symbols] == [("AAA", 50.0),
+                                                                  ("BBB", 50.0)]
+    # The original label object the dialog is editing is untouched, exactly as
+    # ``load_previous_symbol_weights`` leaves it -- Cancel must still mean cancel.
+    assert [st.weight_pct for st in label.symbols] == [80.0, 20.0]
+
+
+def test_even_split_symbol_weights_delegates_to_even_split_pct_at_six():
+    """The anti-divergence pin, and SIX is the count that catches it.
+
+    A hand-rolled ``round(100 / n, 2)`` agrees with ``even_split_pct`` at n=2, 3
+    and 5, so a test at those counts proves nothing. At n=6 they part company:
+    ``even_split_pct`` floors to 16.66 and puts 16.70 on the last slot, the
+    hand-roll rounds to 16.67 and leaves 16.65 (or, flat, totals 100.02 and fails
+    the validator outright). Sharing ONE splitter with
+    ``build_symbol_targets`` is what stops the wizard's button and the stored
+    default disagreeing about the same six symbols.
+    """
+    symbols = [f"S{i}" for i in range(6)]
+    label = LabelTarget("A", 100.0, [SymbolTarget(s, 0.0) for s in symbols])
+
+    out = pa.even_split_symbol_weights(label)
+    weights = [st.weight_pct for st in out.symbols]
+
+    assert weights == pa.even_split_pct(6)
+    assert weights == [16.66, 16.66, 16.66, 16.66, 16.66, 16.7]
+    assert sum(weights) == 100.0
+
+
+def test_even_split_symbol_weights_is_byte_identical_to_the_stored_default():
+    """The button must land on the numbers ``build_symbol_targets`` would have
+    produced for the same symbols, at EVERY count -- otherwise pressing it on an
+    untouched label silently rewrites the weights it is showing."""
+    for count in range(1, 16):
+        symbols = [f"S{i}" for i in range(count)]
+        label = LabelTarget("A", 100.0, [SymbolTarget(s, 1.0) for s in symbols])
+
+        pressed = [st.weight_pct for st in pa.even_split_symbol_weights(label).symbols]
+        default = [st.weight_pct for st in pa.build_symbol_targets(symbols)]
+
+        assert pressed == default, count
+
+
+def test_even_split_symbol_weights_always_totals_exactly_one_hundred():
+    """The rule ``validate_symbol_weights`` enforces, at every count the button
+    can be pressed at -- an even split is exactly where a naive round misses it."""
+    for count in range(1, 16):
+        label = LabelTarget("A", 100.0,
+                            [SymbolTarget(f"S{i}", 0.0) for i in range(count)])
+        assert pa.validate_symbol_weights(pa.even_split_symbol_weights(label)) == [], count
+
+
+def test_even_split_symbol_weights_keeps_the_labels_own_target():
+    """Step 2 is about shares WITHIN a label; the label itself must not move."""
+    label = LabelTarget("A", 42.0, [SymbolTarget("AAA", 80.0), SymbolTarget("BBB", 20.0)],
+                        previous_target_pct=11.0)
+
+    out = pa.even_split_symbol_weights(label)
+
+    assert out.target_pct == 42.0
+    assert out.previous_target_pct == 11.0
+    assert out.label == "A"
+
+
+def test_even_split_symbol_weights_keeps_the_history_and_the_comments():
+    """``previous_weight_pct`` is what step 2's Load last reads. An even split that
+    dropped it would disable the button beside it as a side effect."""
+    label = LabelTarget("A", 100.0, [
+        SymbolTarget("AAA", 80.0, "core holding", 30.0),
+        SymbolTarget("BBB", 20.0, "hedge", 70.0)])
+
+    out = pa.even_split_symbol_weights(label)
+
+    assert [st.previous_weight_pct for st in out.symbols] == [30.0, 70.0]
+    assert [st.comment for st in out.symbols] == ["core holding", "hedge"]
+    assert pa.has_previous_symbol_weights(out) is True
+
+
+def test_even_split_symbol_weights_of_an_empty_label_is_an_empty_label():
+    """``even_split_pct(0)`` is [], not a ZeroDivisionError, and this inherits it."""
+    out = pa.even_split_symbol_weights(LabelTarget("A", 100.0))
+    assert out.symbols == []
+    assert out.label == "A"
+
+
+def test_can_even_split_symbols_is_the_per_label_buttons_enabled_state():
+    """Two or more. A label with none has nothing to split, and a label with one
+    already owns the whole 100 by construction -- both are drawn DISABLED rather
+    than hidden, so the feature is discoverable where it does not apply."""
+    assert pa.can_even_split_symbols(None) is False
+    assert pa.can_even_split_symbols(LabelTarget("A", 100.0)) is False
+    assert pa.can_even_split_symbols(
+        LabelTarget("A", 100.0, [SymbolTarget("AAA", 100.0)])) is False
+    assert pa.can_even_split_symbols(
+        LabelTarget("A", 100.0, [SymbolTarget("AAA", 60.0),
+                                 SymbolTarget("BBB", 40.0)])) is True
+
+
+def test_even_split_symbol_weights_is_exported():
+    """The wizard imports both by name from the package's public surface."""
+    assert "even_split_symbol_weights" in pa.__all__
+    assert "can_even_split_symbols" in pa.__all__
+
+
 def test_load_previous_targets_output_still_passes_the_validator():
     """Whatever was last SAVED was last allocated with, so restoring it must not
     produce a set the wizard then refuses."""

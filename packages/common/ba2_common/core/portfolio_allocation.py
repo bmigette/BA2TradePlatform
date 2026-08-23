@@ -69,6 +69,7 @@ __all__ = [
     "even_split_targets", "steps_validation_messages", "validate_invest_amount",
     "load_previous_targets", "has_previous_targets",
     "load_previous_symbol_weights", "has_previous_symbol_weights",
+    "even_split_symbol_weights", "can_even_split_symbols",
     "invest_validation_messages", "is_blocking_message", "blocking_messages",
     "ERROR_INVEST_AMOUNT_FMT", "ERROR_INVEST_NO_LABEL", "ERROR_INVEST_LABEL_EMPTY_FMT",
     "WARNING_INVEST_EXCEEDS_BP_FMT", "ADVISORY_MESSAGE_FRAGMENTS",
@@ -2634,6 +2635,56 @@ def load_previous_symbol_weights(label: LabelTarget) -> LabelTarget:
                         else float(st.previous_weight_pct)),
             comment=st.comment, previous_weight_pct=st.previous_weight_pct)
             for st in (label.symbols or [])])
+
+
+def even_split_symbol_weights(label: LabelTarget) -> LabelTarget:
+    """The per-label "Even split": ONE label's symbols share its 100% equally. Pure.
+
+    ``even_split_targets`` does this for the LABELS; this is its step-2 pair, and
+    the two are deliberately built the same way -- both defer the arithmetic to
+    ``even_split_pct``, so the remainder lands on the last slot and the set totals
+    exactly 100. That delegation is the whole point rather than a detail: a
+    hand-rolled ``round(100 / n, 2)`` agrees at n=2, 3 and 5 and then parts company
+    at n=6 (16.67 against 16.66, last slot 16.65 against 16.70), which is both a
+    set ``validate_symbol_weights`` refuses and a set that disagrees with the
+    stored default ``build_symbol_targets`` hands the very same symbols.
+
+    Returns a NEW ``LabelTarget`` with NEW ``SymbolTarget`` objects, on exactly the
+    terms ``load_previous_symbol_weights`` uses: this is the function that changes
+    them, so the caller can still cancel out of the dialog. ``comment`` and
+    ``previous_weight_pct`` are carried across -- the latter is what the Load-last
+    button beside it reads, and dropping it would disable that button as a side
+    effect of pressing this one.
+
+    The label's own ``target_pct`` is untouched. Step 2 is about weights WITHIN a
+    label, and those have always been relative to their own label: the reserve and
+    the label percentages divide the base ABOVE this level and no scaling of them
+    reaches these numbers.
+
+    An empty label comes back empty rather than raising -- ``even_split_pct(0)``
+    is ``[]``.
+    """
+    symbols = list(label.symbols or [])
+    return LabelTarget(
+        label=label.label, target_pct=label.target_pct, comment=label.comment,
+        previous_target_pct=label.previous_target_pct,
+        symbols=[SymbolTarget(symbol=st.symbol, weight_pct=pct, comment=st.comment,
+                              previous_weight_pct=st.previous_weight_pct)
+                 for st, pct in zip(symbols, even_split_pct(len(symbols)))])
+
+
+def can_even_split_symbols(label: Optional[LabelTarget]) -> bool:
+    """True when a label has two or more symbols -- the per-label button's state.
+
+    The mirror of ``has_previous_symbol_weights``, and its button is DISABLED
+    rather than hidden for the same reason: a control that vanishes is one the user
+    cannot learn exists. Below two there is nothing to spread -- an empty label has
+    no symbols and a single symbol already owns the whole 100 by construction, so
+    the button would be a no-op on the only set that label can legally hold.
+    """
+    if label is None:
+        return False
+    return len(label.symbols or []) > 1
 
 
 def steps_validation_messages(labels: List[LabelTarget], *,
