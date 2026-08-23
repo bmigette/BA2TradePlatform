@@ -1860,6 +1860,65 @@ def test_the_page_omits_the_unallocated_group_when_the_broker_gave_no_base(
     assert 'Unallocated' not in texts
 
 
+def test_the_reserve_and_the_labels_do_not_print_two_denominators_as_one_column(
+        nicegui_client):
+    """Base 10,000, reserve 25%, ONE label at 100%: the page rendered "target
+    25.00%" directly above "target 100.0%", in identical grammar, in one list.
+
+    They are not the same measurement. The reserve's is a share of the GROSS base;
+    a label's is a RELATIVE weight on what the reserve LEFT. Read as one column
+    they sum to 125% of a book that is fully described by 25 + 75. The wording now
+    names each denominator, and the label additionally states the share of base its
+    weight works out to -- which is the number that IS comparable with the reserve
+    row above it and with its own "% of base" holding.
+    """
+    views = build_label_views([ManagedLabel('ARK26', 100.0)], {'ARK26': ['AAPL']},
+                              {}, {}, valuation_mode=VALUATION_MODE_MARKET,
+                              base_notional=10_000.0, unallocated_pct=25.0)
+    with nicegui_client:
+        page._render_labels(1, _payload(views, VALUATION_MODE_MARKET,
+                                        base_notional=10_000.0,
+                                        available_buying_power=7_500.0,
+                                        unallocated_pct=25.0),
+                            _noop_refresh)
+        reserve_row = next(t for t in _texts(nicegui_client.layout) if 'Unallocated' in t)
+        header = ' | '.join(_expansion_headers(nicegui_client.layout))
+
+    assert 'target 25.00% of base' in reserve_row, reserve_row
+    # The label's own percentage is NOT a share of base and must not say it is...
+    assert 'target 100.0% of base' not in header, header
+    assert 'target 100.0% of what the reserve leaves' in header, header
+    # ...but the share of base it works out to is spelled out, so the two rows can
+    # be read as one column again: 25 + 75 = 100.
+    assert '75.0% of base' in header, header
+
+
+def test_a_base_of_exactly_zero_omits_the_reserve_row_instead_of_crashing(
+        nicegui_client):
+    """A brand-new or fully-withdrawn account renders the page, not a 500.
+
+    The guard used to be ``base_notional is not None``, which a base of EXACTLY
+    0.0 passes -- while ``unallocated_row`` sets ``pct_of_base`` to None for any
+    FALSY base, because 0 is not a denominator. The two disagreed by one value and
+    the row's ``f'{None:.1f}'`` raised, taking the whole page with it. 0.0 and None
+    mean the same thing here (there is no base to divide by) and must be treated
+    the same, exactly as ``build_label_views`` already treats them.
+    """
+    views = build_label_views([ManagedLabel('ARK26', 100.0)], {'ARK26': ['AAPL']},
+                              {}, {}, valuation_mode=VALUATION_MODE_MARKET)
+    with nicegui_client:
+        page._render_labels(1, _payload(views, VALUATION_MODE_MARKET,
+                                        base_notional=0.0,
+                                        available_buying_power=0.0,
+                                        unallocated_pct=10.0),
+                            _noop_refresh)
+        texts = ' | '.join(_texts(nicegui_client.layout))
+
+    assert 'Unallocated' not in texts
+    # ...and the rest of the page is still there.
+    assert 'Managed labels' in texts
+
+
 def test_the_label_header_measures_current_and_target_against_ONE_denominator(
         nicegui_client):
     """The defect: the header read ``(X% of managed, target Y%)`` while

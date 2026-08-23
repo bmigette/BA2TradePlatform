@@ -60,7 +60,7 @@ from ...core.portfolio_allocation import (
     VALUATION_MODE_COST, VALUATION_MODE_MARKET,
     LabelTarget, SymbolTarget, build_base_snapshot, compute_allocation,
     compute_base_notional, compute_label_investment, current_value,
-    unconsumed_income_notice,
+    effective_target_pct, unconsumed_income_notice,
 )
 from ...core.portfolio_allocation_store import (
     add_symbols_to_label, get_allocation_config, get_managed_labels, get_symbol_comments,
@@ -854,16 +854,29 @@ def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
     # much of the book is even in play, and below the labels it reads as a footnote.
     # Its target is the STORED reserve; edit it in the Allocate wizard, which is
     # where the change is validated and where the dry run that acts on it lives.
-    # Omitted entirely when the broker gave no base: better a missing row than one
+    # Omitted entirely when there is no base: better a missing row than one
     # measured against a guess.
-    if base_notional is not None and buying_power is not None:
+    #
+    # ``not base_notional``, NOT ``base_notional is None``. A base of exactly 0.0
+    # is a real state -- a brand-new or fully-withdrawn account -- and it is not a
+    # denominator, so ``unallocated_row`` reports ``pct_of_base=None`` for it just
+    # as ``build_label_views`` treats a 0 base as absent. The old ``is not None``
+    # guard let that one value through and the ``:.1f`` below raised on the None,
+    # 500-ing the entire page. ``buying_power`` keeps ``is not None``: 0.00 of free
+    # buying power is a fact worth drawing, and only None means "unknown".
+    if base_notional and buying_power is not None:
         reserve = unallocated_row(base_notional=base_notional,
                                   available_buying_power=buying_power,
                                   unallocated_pct=payload['unallocated_pct'])
         with ui.element('div').classes('alert-banner info w-full p-3'):
+            # "of base", SAID OUT LOUD, because the label headers below print a
+            # target too and theirs is a RELATIVE weight on what this row leaves.
+            # In identical grammar the two read as one column and sum past 100 --
+            # a 25% reserve above a single label at 100% rendered "target 25.00%"
+            # over "target 100.0%" for a book that is exactly 25 + 75.
             ui.label(f'Unallocated (free buying power) — ${reserve.current_value:,.2f} '
                      f'({reserve.pct_of_base:.1f}% of base, target '
-                     f'{reserve.target_pct:.2f}% = ${reserve.target_value:,.2f})')
+                     f'{reserve.target_pct:.2f}% of base = ${reserve.target_value:,.2f})')
             if reserve.target_pct:
                 # Said out loud, because it is the counter-intuitive half: a reserve
                 # on a fully invested book is funded by SELLING, and the dry run is
@@ -872,20 +885,32 @@ def _render_labels(account_id: int, payload: Dict[str, Any], refresh) -> None:
                          'it on a fully invested account will generate sell orders.'
                          ).classes('text-xs text-secondary-custom')
 
+    reserve_pct = payload['unallocated_pct']
     for view in views:
         # ONE denominator when there is a base to use: ``pct_of_total`` divides by
         # the managed value while ``target_pct`` is a share of buying power PLUS
         # managed value, so printing them side by side invited a comparison that is
         # false whenever buying power is non-zero. With no base, say which one was
         # used rather than inventing the other.
+        #
+        # THREE figures, not two, once a reserve exists. ``target_pct`` is the
+        # RELATIVE weight the user typed and divides what the reserve left -- so
+        # beside a holding measured against the GROSS base it is not comparable,
+        # and a label sitting at "50.0% of base" against a box reading 50 looked
+        # on target on a row the plan will trim by a tenth. The weight keeps its
+        # own denominator in words, and ``effective_target_pct`` restates it
+        # against the base so that this line, the reserve row above it and every
+        # other "% of base" on the page can be read as one column.
         if view.pct_of_base is not None:
             header = (f'{view.label} — ${view.current_value:,.2f} '
-                      f'({view.pct_of_base:.1f}% of base, target {view.target_pct:.1f}% '
-                      f'= ${view.target_value:,.2f})')
+                      f'({view.pct_of_base:.1f}% of base, target '
+                      f'{view.target_pct:.1f}% of what the reserve leaves '
+                      f'= ${view.target_value:,.2f}, i.e. '
+                      f'{effective_target_pct(view.target_pct, reserve_pct):.1f}% of base)')
         else:
             header = (f'{view.label} — ${view.current_value:,.2f} '
                       f'({view.pct_of_total:.1f}% of managed, target '
-                      f'{view.target_pct:.1f}%)')
+                      f'{view.target_pct:.1f}% of what the reserve leaves)')
         with ui.expansion(header, icon='label').classes('w-full'):
             _render_label_body(account_id, view, refresh)
 

@@ -2425,6 +2425,49 @@ def test_reserved_notional_for_is_exactly_what_investable_left_behind():
     assert pa.reserved_notional_for(10_000.0, 10.0) == pytest.approx(1_000.0)
 
 
+def test_reserved_notional_for_clamps_a_nonsense_reserve_like_its_partner_does():
+    """The same defence ``investable_notional`` carries, pinned on this side too.
+
+    Written as a SUBTRACTION from ``investable_notional`` precisely so it inherits
+    that clamp; spelled as its own ``base * pct / 100`` instead -- the obvious
+    "simplification" -- a -20 reserve would report -2,000 of money held back, which
+    is money the account does not have, and the identity above (reserved +
+    investable == base) would still hold at every legal value.
+    """
+    assert pa.reserved_notional_for(10_000.0, -20.0) == pytest.approx(0.0)
+    assert pa.reserved_notional_for(10_000.0, 175.0) == pytest.approx(10_000.0)
+
+
+def test_effective_target_pct_restates_a_relative_weight_against_the_gross_base():
+    """The two percentages this feature carries are DIFFERENT numbers with the same
+    '%' sign, and this is the only conversion between them. 50% of what a 10%
+    reserve left IS 45% of the base."""
+    assert pa.effective_target_pct(50.0, 10.0) == pytest.approx(45.0)
+    assert pa.effective_target_pct(100.0, 25.0) == pytest.approx(75.0)
+    # No reserve: the two percentages coincide, which is why the defect was
+    # invisible until a reserve was stored.
+    assert pa.effective_target_pct(50.0, 0.0) == pytest.approx(50.0)
+    # A full reserve targets nothing, whatever the weights say.
+    assert pa.effective_target_pct(100.0, 100.0) == pytest.approx(0.0)
+
+
+def test_effective_target_pct_clamps_the_reserve_like_the_rest_of_the_arithmetic():
+    """Drawn live from a box the validator has not accepted yet, so a -20 must not
+    print a target ABOVE the weight the user typed."""
+    assert pa.effective_target_pct(50.0, -20.0) == pytest.approx(50.0)
+    assert pa.effective_target_pct(50.0, 175.0) == pytest.approx(0.0)
+
+
+def test_effective_target_pct_is_the_same_share_the_solver_actually_uses():
+    """Not a second formula. What the engine gives a label is its weight applied to
+    ``investable_notional``; this must be that money as a share of the gross base,
+    or the caption and the plan disagree about the same row."""
+    base, reserve, weight = 10_000.0, 10.0, 30.0
+    money = pa.investable_notional(base, reserve) * weight / 100.0
+
+    assert pa.effective_target_pct(weight, reserve) == pytest.approx(money / base * 100.0)
+
+
 def test_the_reserve_scales_the_base_and_labels_still_total_one_hundred():
     """THE WORKED EXAMPLE. Base 10,000, reserve 10%, labels 50/30/20 -> 4,500 /
     2,700 / 1,800 of buys and 1,000 held as cash. Nothing the user typed was

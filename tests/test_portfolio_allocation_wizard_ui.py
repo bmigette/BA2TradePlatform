@@ -2005,6 +2005,79 @@ def test_step_one_shows_each_labels_current_value_against_the_same_base(nicegui_
     assert '5.00% of base' in drawn[1]
 
 
+def _fifty_fifty_labels():
+    """Two labels at 50/50, each holding exactly half of the 10,000 base."""
+    return [LabelTarget("A", 50.0, [SymbolTarget("AAA", 100.0)]),
+            LabelTarget("B", 50.0, [SymbolTarget("BBB", 100.0)])]
+
+
+def test_the_caption_states_the_target_as_a_share_of_base_not_only_as_a_weight(
+        nicegui_client):
+    """THE MISLEADING COMPARISON. Base 10,000 fully held, two labels at 50/50 each
+    holding exactly 5,000, reserve 10%.
+
+    The caption read ``now 5,000.00 (50.00% of base)`` beside a target box reading
+    ``50``, and those two 50s divide DIFFERENT denominators: the caption the gross
+    base, the box the investable remainder. So the row looked perfectly on target
+    while the plan will sell it down to 4,500. The caption now states the target in
+    the caption's OWN denominator -- 50% of what the reserve leaves IS 45% of the
+    base -- so the pair on the line is comparable without arithmetic.
+    """
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    _open_steps(nicegui_client, wiz, labels=_fifty_fifty_labels(),
+                symbol_values={'AAA': 5_000.0, 'BBB': 5_000.0}, unallocated_pct=10.0)
+    drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_LABEL_CURRENT)
+
+    assert 'now 5,000.00 (50.00% of base)' in drawn[0], drawn[0]
+    assert '45.00% of base' in drawn[0], drawn[0]
+
+
+def test_with_no_reserve_the_target_share_of_base_is_the_number_in_the_box(
+        nicegui_client):
+    """The other end of the same statement: at 0% reserve the relative weight and
+    the share of base coincide, and the caption must say so rather than going
+    quiet -- a clause that appears only under a reserve is one the user has to
+    learn about at the worst moment."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    _open_steps(nicegui_client, wiz, labels=_fifty_fifty_labels(),
+                symbol_values={'AAA': 5_000.0, 'BBB': 5_000.0})
+    drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_LABEL_CURRENT)
+
+    assert 'now 5,000.00 (50.00% of base)' in drawn[0], drawn[0]
+    assert '50.00% of base' in drawn[0].split('(50.00% of base)')[1], drawn[0]
+
+
+def test_the_target_share_of_base_follows_the_reserve_box(nicegui_client):
+    """It is derived from TWO live inputs, so a caption drawn once and never
+    refreshed is worse than none: it would keep asserting 50% of base while the
+    reserve the user just typed made it 25%."""
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    _open_steps(nicegui_client, wiz, labels=_fifty_fifty_labels(),
+                symbol_values={'AAA': 5_000.0, 'BBB': 5_000.0})
+    with nicegui_client:
+        _numbers(nicegui_client, wiz, wiz.MARKER_UNALLOCATED_PCT)[0].set_value(50.0)
+        drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_LABEL_CURRENT)
+
+    assert '25.00% of base' in drawn[0], drawn[0]
+    assert '25.00% of base' in drawn[1], drawn[1]
+
+
+def test_the_target_share_of_base_follows_the_label_box(nicegui_client):
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    _open_steps(nicegui_client, wiz, labels=_fifty_fifty_labels(),
+                symbol_values={'AAA': 5_000.0, 'BBB': 5_000.0}, unallocated_pct=10.0)
+    with nicegui_client:
+        _numbers(nicegui_client, wiz, wiz.MARKER_LABEL_PCT)[0].set_value(80.0)
+        drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_LABEL_CURRENT)
+
+    assert '72.00% of base' in drawn[0], drawn[0]      # 80% of the 90% left
+    assert '45.00% of base' in drawn[1], drawn[1]      # B did not move
+
+
 def test_step_two_offers_a_load_last_per_label(nicegui_client):
     from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
 
@@ -2081,6 +2154,42 @@ def test_the_unallocated_row_shows_its_dollar_value_beside_the_box(nicegui_clien
     assert len(drawn) == 1
     assert '1,000.00' in drawn[0]          # 10% of the 10,000 base
     assert '9,000.00' in drawn[0]          # ...leaving this to invest
+
+
+def test_the_reserve_caption_says_which_half_is_the_reserve_and_which_is_left(
+        nicegui_client):
+    """The two money halves must not be interchangeable.
+
+    Both numbers appear in one sentence, so ``'1,000.00' in caption and '9,000.00'
+    in caption`` is satisfied just as happily by a caption that has them the wrong
+    way round -- reading a 10% reserve on a 10,000 base as 9,000 held back and
+    1,000 left to invest, which is the exact inverse of the truth. The reserve is
+    named FIRST, and 1,000 != 9,000 on purpose: a fixture where the two halves
+    could be equal cannot pin an ordering at all.
+    """
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    steps, _calls = _open_steps(nicegui_client, wiz, unallocated_pct=10.0)
+    caption = _marked_texts(nicegui_client.layout, wiz.MARKER_UNALLOCATED)[0]
+
+    assert '1,000.00' in caption and '9,000.00' in caption
+    assert caption.index('1,000.00') < caption.index('9,000.00'), caption
+
+
+def test_the_reserve_caption_does_not_promise_cash_on_a_margin_account(nicegui_client):
+    """"held as cash" is not true of a reserve measured off ``base_notional``.
+
+    The base is buying power PLUS the value of the book, so reserving 10% of it
+    means 10% of the base is left UNDEPLOYED -- on a margin account that is unused
+    buying power, and the cash balance can be lower still (``estimated_cash_after``
+    is reachably negative). The sentence has to be true on both account types.
+    """
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    steps, _calls = _open_steps(nicegui_client, wiz, unallocated_pct=10.0)
+    caption = _marked_texts(nicegui_client.layout, wiz.MARKER_UNALLOCATED)[0]
+
+    assert 'cash' not in caption.lower(), caption
 
 
 def test_the_dollar_value_follows_every_keystroke_in_the_reserve_box(nicegui_client):
@@ -2309,6 +2418,29 @@ def test_the_dry_run_footer_compares_the_cash_it_expects_against_the_reserve(
     # against a 3,000 reserve.
     assert len(drawn) == 1
     assert '8,400.00' in drawn[0] and '3,000.00' in drawn[0]
+
+
+def test_the_cash_versus_reserve_line_says_the_two_are_not_the_same_measurement(
+        nicegui_client):
+    """It puts a broker CASH balance beside a reserve measured off ``base_notional``
+    -- buying power PLUS the book -- and invites the user to read the difference as
+    a shortfall to fund.
+
+    On a cash account they very nearly are the same thing. On a margin account they
+    are not: the base counts borrowing capacity the cash balance never held, and
+    ``estimated_cash_after`` is reachably NEGATIVE on a plan whose reserve is fully
+    satisfied. The line has to say which two things it is comparing.
+    """
+    from ba2_trade_platform.ui.pages import portfolio_allocation_wizard as wiz
+
+    with nicegui_client:
+        wiz.AllocationWizard(_base(), _reserved_plan(), market=_open_market(),
+                             on_refresh=lambda f: (_reserved_plan(), _open_market()),
+                             on_submit=lambda p: None).open()
+        drawn = _marked_texts(nicegui_client.layout, wiz.MARKER_CASH_VS_RESERVE)
+
+    assert len(drawn) == 1
+    assert 'not a cash balance' in drawn[0], drawn[0]
 
 
 def test_the_footer_says_nothing_about_a_reserve_of_zero(nicegui_client):

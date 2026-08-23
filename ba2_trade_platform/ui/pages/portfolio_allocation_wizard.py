@@ -46,6 +46,7 @@ from ...core.portfolio_allocation import (
     blocking_messages,
     bump_notice,
     dry_run_rows,
+    effective_target_pct,
     even_split_targets,
     filter_plan_rows,
     fractional_summary,
@@ -205,16 +206,33 @@ MARKER_CASH_VS_RESERVE = 'dry-run-cash-vs-reserve'
 
 #: The footer's arithmetic check for requirement 3. The reserve is a share of
 #: ``base_notional`` -- buying power PLUS managed value -- so on a fully invested
-#: account RAISING it generates SELL orders to free the cash. That is correct and
-#: it has to be obvious rather than inferred from two numbers on different lines.
+#: account RAISING it generates SELL orders to free it. That is correct and it has
+#: to be obvious rather than inferred from two numbers on different lines.
+#:
+#: The trailing clause is not decoration. The two figures are measured off
+#: DIFFERENT things: the left is the broker's cash balance after the plan, the
+#: right is a share of a base that counts borrowing capacity the cash balance never
+#: held. On a cash account they nearly coincide; on a margin account they need not,
+#: and ``estimated_cash_after`` is reachably negative on a plan whose reserve is
+#: fully satisfied. Without the clause the delta reads as a shortfall to fund.
 CASH_VS_RESERVE_FMT = ('Est. cash after {cash:,.2f} vs reserve {reserved:,.2f} '
-                       '({delta:+,.2f})')
+                       '({delta:+,.2f}) — the reserve is a share of the base '
+                       '(buying power + holdings), not a cash balance, so on a '
+                       'margin account these two need not meet')
 
 #: The money beside step 1's reserve box. BOTH halves, because the useful question
 #: is not "how much am I holding back" on its own but "...and what is left to
-#: divide" -- the number the label percentages below are shares of.
-UNALLOCATED_FMT = ('= {amount:,.2f} held as cash, leaving {investable:,.2f} '
-                   'for the labels below')
+#: divide" -- the number the label percentages below are shares of. The RESERVE
+#: comes first, and the tests pin that order: the sentence carries two figures that
+#: are meaningless the wrong way round and nothing in the arithmetic would object.
+#:
+#: NOT "held as cash". The reserve is a share of ``base_notional`` -- buying power
+#: PLUS the value of the book -- so what it buys is money left UNDEPLOYED, which on
+#: a margin account is unused buying power and not a cash balance. Only on a cash
+#: account are the two the same thing, and promising the wrong one is how a user
+#: ends up expecting a settled balance the broker never produces.
+UNALLOCATED_FMT = ('= {amount:,.2f} held back (not allocated), leaving '
+                   '{investable:,.2f} for the labels below')
 
 #: Step 1's live running total. The messages list is built below step 3 and can sit
 #: under the fold in a maximized dialog, so the total has to be up where the boxes
@@ -249,11 +267,22 @@ MARKER_SYMBOL_CURRENT = 'steps-symbol-current'
 #: 0.00% is a legitimate value of the second.
 NO_PREVIOUS_MARK = '-'
 
-#: Step 1's caption. The percentage is a share of BASE NOTIONAL -- the same
-#: denominator the target box divides -- and says so, because the page's own label
-#: header used to print "% of managed" immediately beside "target %" and the two
-#: are not comparable whenever buying power is non-zero.
-LABEL_CURRENT_FMT = 'now {value:,.2f} ({pct:.2f}% of base) · last {previous}'
+#: Step 1's caption. Three facts, ALL of them shares of BASE NOTIONAL, because the
+#: page's own label header used to print "% of managed" immediately beside
+#: "target %" and the two are not comparable whenever buying power is non-zero.
+#:
+#: ``target`` is the box's RELATIVE weight restated against the base
+#: (``effective_target_pct``), and it is here because the box alone was NOT
+#: comparable with ``pct``. The label percentages divide the investable remainder,
+#: so under a 10% reserve a box reading 50 targets 45% of the base -- and a caption
+#: saying "50.00% of base" beside a box saying "50" read as perfectly on target on
+#: a row the plan was about to trim by a tenth. It is drawn at EVERY reserve,
+#: including 0 where it simply equals the box: a clause that appears only once the
+#: reserve is non-zero is one the user meets for the first time in the case that
+#: matters. ``previous`` stays the raw stored weight -- it is a "what did I type
+#: last time" figure, and the reserve of that run is not recorded per label.
+LABEL_CURRENT_FMT = ('now {value:,.2f} ({pct:.2f}% of base) · target '
+                     '{target:.2f}% of base · last {previous}')
 
 #: Step 2's caption. No "% of base" here: step 2's numbers are shares of the
 #: LABEL, and mixing the two denominators in one line is the defect above.
@@ -1016,6 +1045,12 @@ class AllocationSteps:
         self._unallocated_label = None
         self._unallocated_input = None
         self._total_label = None
+        #: ``[(LabelTarget, ui.label)]`` for step 1's read-only captions, in draw
+        #: order. Kept because the caption now states a TARGET as well as a current
+        #: value, so it goes stale on a keystroke in either the label box or the
+        #: reserve box; ``_redraw_derived_row`` refreshes them in place. Empty in
+        #: the invest flow, which draws no label targets at all.
+        self._label_captions = []
         #: ``{label: column}`` for step 2, so a per-label Load last can redraw just
         #: that expansion's boxes.
         self._symbol_containers = {}
@@ -1078,22 +1113,33 @@ class AllocationSteps:
         return UNALLOCATED_FMT.format(amount=base - investable, investable=investable)
 
     def _label_current_caption(self, lt: LabelTarget) -> str:
-        """The read-only "now X (Y% of base) · last Z%" beside a label's target box.
+        """The read-only "now X (Y% of base) · target Z% of base · last W%".
 
-        The percentage is a share of ``base_notional`` -- the SAME denominator the
-        target box divides -- so the two numbers on this line are comparable. Mixing
-        "% of managed" with "% of base" is exactly the defect the page's own label
-        header carried.
+        ONE denominator for the two numbers that are meant to be compared. "Now" is
+        a share of ``base_notional``; the target box is a RELATIVE weight on the
+        investable remainder, so it is restated against the same base through the
+        engine's ``effective_target_pct`` rather than printed as typed. Both of its
+        inputs are live boxes, so ``_redraw_derived_row`` refreshes this line on
+        every keystroke in either -- see the note there.
+
+        ``last`` is deliberately NOT converted: it is the weight the previous run
+        was launched with, and that run's reserve is not stored per label, so
+        restating it would need a number nobody recorded.
         """
         value = sum(self.symbol_values.get(st.symbol, 0.0) for st in lt.symbols)
         base = float(self.base.base_notional or 0.0)
         previous = (NO_PREVIOUS_MARK if lt.previous_target_pct is None
                     else f'{float(lt.previous_target_pct):.2f}%')
         return LABEL_CURRENT_FMT.format(
-            value=value, pct=(value / base * 100.0) if base else 0.0, previous=previous)
+            value=value, pct=(value / base * 100.0) if base else 0.0,
+            target=effective_target_pct(lt.target_pct, self.unallocated_pct),
+            previous=previous)
 
     def _draw_label_targets(self):
         self._labels_container.clear()
+        # Rebuilt with the rows: the old ui.label objects have just been discarded,
+        # and writing to a detached element would update nothing on screen.
+        self._label_captions = []
         with self._labels_container:
             # FIRST, above the labels: this is the row that says how much of the
             # book is even in play, and below them it reads as a footnote. Always
@@ -1122,8 +1168,9 @@ class AllocationSteps:
                     ui.number(value=lt.target_pct, min=0, max=100, step=0.01, suffix='%',
                               on_change=lambda e, t=lt: self._set_label_pct(t, e.value)
                               ).props('dense outlined').classes('w-32').mark(MARKER_LABEL_PCT)
-                    ui.label(self._label_current_caption(lt)) \
+                    caption = ui.label(self._label_current_caption(lt)) \
                         .classes('text-xs text-secondary-custom').mark(MARKER_LABEL_CURRENT)
+                    self._label_captions.append((lt, caption))
 
     def _symbol_current_caption(self, st: SymbolTarget) -> str:
         previous = (NO_PREVIOUS_MARK if st.previous_weight_pct is None
@@ -1251,11 +1298,23 @@ class AllocationSteps:
         self._revalidate()
 
     def _redraw_derived_row(self):
+        """Every read-only number in step 1, refreshed IN PLACE.
+
+        In place, never a redraw: rebuilding the row would rebuild the
+        ``ui.number`` the change event came from, underneath the cursor.
+
+        The per-label captions are in here because they now state the target as a
+        share of the base, which moves with BOTH the label box and the reserve box.
+        A caption that lagged either would keep asserting a comparison that had
+        stopped being true -- which is the defect it was added to fix.
+        """
         if self._unallocated_label is not None:
             self._unallocated_label.set_text(self._unallocated_caption())
         if self._total_label is not None:
             self._total_label.set_text(LABEL_TOTAL_FMT.format(
                 total=sum(float(lt.target_pct or 0.0) for lt in self.labels)))
+        for lt, caption in self._label_captions:
+            caption.set_text(self._label_current_caption(lt))
 
     def _set_symbol_pct(self, target: SymbolTarget, value):
         target.weight_pct = float(value or 0.0)

@@ -1285,6 +1285,26 @@ def test_the_unallocated_row_tolerates_a_zero_base():
     assert row.pct_of_base is None
 
 
+def test_the_unallocated_row_never_reports_a_reserve_outside_zero_to_one_hundred():
+    """The row's own clamp, restored after W8 dropped the test that held it.
+
+    The wizard blocks an out-of-range reserve before a plan is ever solved, but this
+    row is also drawn on the PAGE, straight from ``portfolio_allocation_config``,
+    where a value written by an older build or by hand can be anything. A -20 that
+    reached the screen would print "target -20.00% held back" over a row whose money
+    says 0.00 -- two numbers on one line disagreeing about the same fact.
+    """
+    from ba2_trade_platform.ui.utils.portfolio_allocation_view import unallocated_row
+
+    low = unallocated_row(base_notional=10_000.0, available_buying_power=0.0,
+                          unallocated_pct=-20.0)
+    high = unallocated_row(base_notional=10_000.0, available_buying_power=0.0,
+                           unallocated_pct=140.0)
+
+    assert (low.target_pct, low.target_value) == (0.0, 0.0)
+    assert (high.target_pct, high.target_value) == (100.0, 10_000.0)
+
+
 def test_the_unallocated_row_has_no_overshoot_field_any_more():
     """``over_pct`` reported label targets summing past 100 -- a LABEL error, which
     the validator now names directly. Reporting it on the reserve row conflated two

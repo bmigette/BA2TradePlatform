@@ -1232,6 +1232,29 @@ def reserved_notional_for(base_notional: float, unallocated_pct: float) -> float
     return float(base_notional or 0.0) - investable_notional(base_notional, unallocated_pct)
 
 
+def effective_target_pct(target_pct: float, unallocated_pct: float) -> float:
+    """A label's RELATIVE weight restated as a share of the GROSS base. Pure.
+
+    The one conversion between the two percentages this feature carries, and the
+    reason it is a named function rather than an inline multiplication in two UI
+    modules: they are DIFFERENT NUMBERS printed with the same '%' sign, and the
+    screens that show them side by side have to agree on the arithmetic.
+
+    A 50% label under a 10% reserve targets 45% of the base -- it divides what the
+    reserve left, not the base. Both the wizard's per-label caption and the page's
+    label header print the current holding as a share of the GROSS base (so that
+    the column adds to 100 alongside the reserve row), so a bare "target 50%" next
+    to "50.00% of base" reads as on-target on a row the plan will trim by a tenth.
+
+    Clamped through ``clamp_unallocated_pct`` for the same reason
+    ``investable_notional`` is: this is drawn live, per keystroke, from a box the
+    validator has not necessarily accepted yet, and a negative reserve would
+    otherwise print a target ABOVE the weight the user typed.
+    """
+    return (float(target_pct or 0.0)
+            * (100.0 - clamp_unallocated_pct(unallocated_pct)) / 100.0)
+
+
 def compute_base_notional(available_buying_power: float,
                           current: Dict[str, PositionState],
                           managed_symbols: List[str],
