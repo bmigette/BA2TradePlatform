@@ -5067,7 +5067,27 @@ class TradeSettingsTab:
                 wing_width_input = None
 
                 def update_action_inputs():
+                    nonlocal value_input, reference_select, target_percent_input
+                    nonlocal strike_method_select, strike_param_input, dte_min_input
+                    nonlocal dte_max_input, sizing_input, min_oi_input, max_spread_input
+                    nonlocal wing_width_input
+
                     action_value_container.clear()
+                    # clear() deletes the widgets; these names must forget them too. The save
+                    # path reaches them through the closures stored in self.actions[action_id],
+                    # and a name left pointing at a deleted widget is not merely untidy -- it
+                    # still answers `.value`, so _save_rule writes that value onto the action
+                    # type the user switched TO. It bit wing_width_pct, the one CONDITIONALLY
+                    # created widget here (all the others are rebuilt on every pass, which is
+                    # what kept the problem hidden): picking an iron condor and then changing
+                    # your mind to a plain long call persisted a wing width onto a structure
+                    # that has no wings. Resetting all of them saves the next conditional
+                    # widget from re-learning this.
+                    value_input = reference_select = target_percent_input = None
+                    strike_method_select = strike_param_input = None
+                    dte_min_input = dte_max_input = sizing_input = None
+                    min_oi_input = max_spread_input = wing_width_input = None
+
                     selected_type = action_select.value
 
                     # Update documentation
@@ -5076,8 +5096,6 @@ class TradeSettingsTab:
                     if selected_type and is_adjustment_action(selected_type):
                         # Adjustment action - show value and reference inline
                         with action_value_container:
-                            nonlocal value_input, reference_select
-
                             value_input = ui.input(
                                 label='Value',
                                 value=str(action_config.get('value', '')) if action_config else '',
@@ -5093,8 +5111,6 @@ class TradeSettingsTab:
                     elif selected_type and is_share_adjustment_action(selected_type):
                         # Share adjustment action - show target_percent inline
                         with action_value_container:
-                            nonlocal target_percent_input
-
                             target_percent_input = ui.number(
                                 label='Target %',
                                 value=action_config.get('target_percent', 10.0) if action_config else 10.0,
@@ -5108,10 +5124,6 @@ class TradeSettingsTab:
                         # CLOSE_OPTION takes no params (it resolves the contract from the
                         # held position), so only render widgets for entry actions.
                         with action_value_container:
-                            nonlocal strike_method_select, strike_param_input, dte_min_input, \
-                                dte_max_input, sizing_input, min_oi_input, max_spread_input, \
-                                wing_width_input
-
                             is_close = selected_type == ExpertActionType.CLOSE_OPTION.value
                             if not is_close:
                                 strike_method_select = ui.select(
